@@ -1482,6 +1482,21 @@ impl WireError {
         }
     }
 
+    /// A PartiQL `INSERT`'s implicit `attribute_not_exists` condition
+    /// failed — the item's key already exists (ADR 0071, W-07 PR 3).
+    /// `dynamo::execute_statement`'s `INSERT` branch maps the underlying
+    /// `PutItem`'s `ConditionalCheckFailedException` to this AWS-faithful
+    /// PartiQL-specific code (unless `ON CONFLICT DO NOTHING` was given, in
+    /// which case the failure is swallowed as a silent no-op instead).
+    #[must_use]
+    pub fn duplicate_item(message: impl Into<String>) -> Self {
+        Self {
+            code: "DuplicateItemException",
+            message: message.into(),
+            reasons: None,
+        }
+    }
+
     /// A SigV4-authenticated caller's credential does not authorize the
     /// operation it attempted (ADR 0066 §5 — the per-key allow list denied
     /// it). Unlike ADR 0057's four SigV4 errors (which use the

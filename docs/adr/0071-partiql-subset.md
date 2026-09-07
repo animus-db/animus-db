@@ -544,3 +544,206 @@ Gate results (2026-09-07): `fmt`/`clippy -D warnings`/`build --workspace
 green; no new crate dependency added (the roadmap's own "hand-write it, no
 parser crate" instruction held). See the PR 2 commit for the exact gate
 log and the `dynamo_partiql.rs` end-to-end coverage list.
+
+## 2026-09-07 amendment — as-built, PR 3
+
+PR 3 landed `INSERT`/`UPDATE`/`DELETE`. Grammar, lowering, and error mapping
+as built — plus three deliberate departures from what PR 1 (above) pinned
+for this PR, each a conservative call made and recorded here rather than
+silently diverging from the original text.
+
+### Grammar as built
+
+```
+insert_stmt    := "INSERT" "INTO" ident "VALUE" document
+                   [ "ON" "CONFLICT" "DO" "NOTHING" ]
+document       := "{" [ pair ("," pair)* ] "}"
+pair           := string ":" value
+
+update_stmt    := "UPDATE" ident "SET" assignment ("," assignment)*
+                   where_clause [ returning_clause ]
+assignment     := ident "=" value
+
+delete_stmt    := "DELETE" "FROM" ident where_clause [ returning_clause ]
+
+returning_clause := "RETURNING" "ALL" ( "OLD" | "NEW" ) "*"
+
+value          := "?" | document | list
+list           := "[" [ value ("," value)* ] "]"
+```
+
+`where_clause`/`predicate` are unchanged from §1 (shared verbatim with
+`select_stmt`). No `REMOVE` clause on `UPDATE` — §1's own `update_stmt`
+production (pinned in PR 1, unchanged since) never had one; this PR
+implements exactly what was pinned, not the wider `UpdateExpression`
+subset (`REMOVE`/`ADD`/`DELETE` actions) real DynamoDB PartiQL's `UPDATE`
+supports. `UPDATE`'s `assignment` targets a bare top-level attribute only
+(no nested path), matching §1 and §7's "no nested document paths outside
+`INSERT`'s own document" rule.
+
+### Departure 1 — `value` is recursive (document/list *structure*), not the
+literal `"?"` §1 pinned
+
+§1's original grammar (PR 1) pinned `value := "?"` — a document pair's
+right-hand side could only ever be a bare placeholder, with any nested
+structure arriving exclusively through what that one placeholder's own
+`Parameters` entry decodes to (an `AttributeValue::M`/`L` can already be
+arbitrarily nested — `decode_attribute_value` doesn't care how many levels
+deep it's called from). Built instead: `value` is recursive —
+`"?" | document | list` — so `INSERT INTO t VALUE {'pk': ?, 'tags': [?, ?]}`
+can be written directly, with the `{..}`/`[..]` *structure* in the
+statement text and every *leaf* still a `?`. The placeholder-only
+discipline (§2) is unchanged in substance: no scalar literal (a quoted
+string, a bare number, `true`/`false`/`NULL`) is ever legal in a value
+position, checked at exactly the same point a top-level `?` was — only the
+*shape* around the placeholders can now be written in the statement. This
+is a usability call: a client with a nested item shape would otherwise
+have to pre-flatten every `M`/`L` value into a single `Parameters` entry
+computed client-side before sending the request, which defeats a large
+part of PartiQL's own appeal (writing the item shape in the statement,
+the way a real DynamoDB PartiQL client does) for no injection-safety
+benefit the stricter grammar didn't already have without it. Every leaf is
+still exactly one `Parameters` slot resolved through the identical
+positional binding §2 already established; `lower_insert`/`lower_update`
+resolve the whole tree recursively (`lower_value_ast`) rather than
+re-deriving a second decode path.
+
+### Departure 2 — `RETURNING` is implemented, not deferred
+
+§7 (PR 1) named `RETURNING` "deferred past PR 3 entirely (not attempted
+this wave)". Built instead: `RETURNING ALL OLD *` (`UPDATE`/`DELETE`) and
+`RETURNING ALL NEW *` (`UPDATE` only — `DELETE` has no new image, rejected
+at parse time with a named error) are implemented in this PR. The reason
+for shipping it now rather than honoring the original deferral: it costs
+essentially nothing beyond what this PR already has to build. `PutItem`/
+`UpdateItem`/`DeleteItem` already carry `ReturnValues`/`UpdateReturnValues`
+fields and already know how to build the `Attributes` response an echo
+needs (`wire::write_response`/`update_response`) — mapping a parsed
+`RETURNING` clause onto those pre-existing fields is a few lines of
+lowering, not a new mechanism, and the PR 3 lowering table this ADR
+already commits to (`PutItem`/`UpdateItem`/`DeleteItem`, all three of
+which already have these fields) makes the wiring close to free. Deferring
+it would have meant either shipping `INSERT`/`UPDATE`/`DELETE` with no way
+to see what a `RETURNING`-shaped real DynamoDB PartiQL client actually
+sends (a client SDK that always includes the clause would get a parse
+error on every single mutation), or silently ignoring the clause (worse —
+a client asking for the deleted item's image and silently getting nothing
+back is a correctness surprise, not a scope cut). `execute_statement`'s
+`ExecuteStatement` response reshapes the underlying op's `Attributes`
+field into `Items` (`[]` when absent, a one-element array when present) —
+mirroring a `SELECT` `ExecuteStatement`'s own always-present `Items` field,
+never omitted either way.
+
+### Departure 3 — none on the WHERE/key-vs-filter or error-mapping fronts
+
+Everything else in §5's lowering table, and §4's shared key-vs-filter
+machinery (reused here as `lower_exact_key_where`, the mutation-specific
+sibling requiring an *exact* key rather than `lower_select`'s
+partial-key-or-scan rule), landed exactly as pinned — no further
+departures to record.
+
+### Error mapping (as built)
+
+| Failure | `WireError` code | Source |
+|---|---|---|
+| `INSERT` at an existing key, no `ON CONFLICT DO NOTHING` | `DuplicateItemException` (new constructor, `wire.rs`) | `execute_statement` maps the underlying `PutItem`'s `ConditionalCheckFailedException` |
+| `INSERT` at an existing key, `ON CONFLICT DO NOTHING` given | — (silent success, empty `Items`) | same underlying failure, swallowed by `execute_statement` |
+| `UPDATE`/`DELETE` — literal value in `WHERE`/document/assignment | `ValidationException` | `partiql.rs` parse time (§2) |
+| `UPDATE`/`DELETE` — placeholder count mismatch | `ValidationException` | `lower_insert`/`lower_update`/`lower_delete` |
+| `UPDATE`/`DELETE` — `WHERE` missing the partition key, or a composite table's sort key | `ValidationException` | `lower_exact_key_where` |
+| `UPDATE`/`DELETE` — `WHERE` names a key attribute with `=` more than once | `ValidationException` | `lower_exact_key_where` |
+| `DELETE ... RETURNING ALL NEW *` | `ValidationException` | parse time (`Parser::parse_delete`) — no new image on a delete |
+| `UPDATE` of a key that doesn't exist | `ConditionalCheckFailedException` | the underlying `UpdateItem`'s implicit `attribute_exists(pk)` |
+| `UPDATE`/`DELETE` — a non-key `WHERE` term (the lowered `ConditionExpression`) evaluates false | `ConditionalCheckFailedException` | the underlying `UpdateItem`/`DeleteItem` |
+| `DELETE` of a key that doesn't exist, no other `WHERE` term | — (silent success, empty `Items`) | plain `DeleteItem` semantics — no implicit existence condition |
+| any mutation against a throttled table | `ProvisionedThroughputExceededException` | inherited unmodified from the underlying `PutItem`/`UpdateItem`/`DeleteItem` write path (ADR 0065) |
+
+### Classification (`authz`)
+
+`authz::classify`'s `Operation::ExecuteStatement` row cannot see inside
+`statement` — it is opaque, unparsed text at that layer, and `classify`
+takes only the `Operation` value, never a parser. It stays `OpClass::Read`
+unconditionally for **every** statement kind (verified directly:
+`every_operation_classifies_per_adr_0066_decision_1` now has four
+`ExecuteStatement` cases — one per statement kind — all asserting the
+identical `OpClass::Read`, including the three mutation shapes). This is
+not a security gap: `authorize_op` is a deliberate no-op for
+`ExecuteStatement` (unchanged since PR 2, for the identical "table unknown
+before parse" reason), and the real per-statement enforcement happens
+inside `execute_statement` itself once `statement` is parsed — a `SELECT`
+gets an explicit `authz::authorize(.., OpClass::Read, ..)` call (PR 2,
+unchanged); an `INSERT`/`UPDATE`/`DELETE` lowers onto a genuine
+`Operation::PutItem`/`UpdateItem`/`DeleteItem` and runs through
+`run_operation`, whose own `authorize_op` call classifies **that**
+concrete, now-parsed operation — `OpClass::Write`, the same row every
+client-built `PutItem`/`UpdateItem`/`DeleteItem` request already uses —
+before any write executes. No `authz.rs` code needed to change to make
+this correct; only its `ExecuteStatement` row's doc comment and the
+classification test's coverage were extended, to make the "why" explicit
+rather than implicit.
+
+### Write-path reuse: real `run_operation`, not a parallel path
+
+`execute_statement`'s `INSERT`/`UPDATE`/`DELETE` branches call
+`run_operation(ctx, principal, op)` directly with the lowered
+`Operation::PutItem`/`UpdateItem`/`DeleteItem` — the exact dispatcher a
+client-built request of that shape already goes through — rather than
+reimplementing any slice of the write path. This means conditions, LSI/GSI
+index maintenance, DynamoDB Streams change records, and per-table
+throttling are inherited with zero new write-path code; a bug fix to
+`PutItem`/`UpdateItem`/`DeleteItem` fixes the PartiQL path for free, and
+there is no second place index/stream/throttle logic can drift.
+`run_operation` is `async` and calls `execute_statement` for its own
+`ExecuteStatement` arm, so the reverse call from `execute_statement`'s
+mutation branches back into `run_operation` is a genuine mutual
+recursion — resolved with `Box::pin(run_operation(..)).await` at the one
+recursive call site (the standard Rust technique for breaking a
+directly/mutually recursive `async fn`'s otherwise-infinite generated
+`Future` type; `run_operation`'s own call into `execute_statement`, one
+level up, stays a plain unboxed `.await` — only one edge of the cycle
+needs boxing to make the type finite).
+
+### Testing
+
+Unit tests in `partiql.rs`: every new grammar production (`INSERT`/
+`UPDATE`/`DELETE`, `ON CONFLICT DO NOTHING`, nested document/list values,
+`RETURNING` both modes on `UPDATE`, `RETURNING ALL OLD *` on `DELETE`),
+every new rejection (literal in a document/assignment value, a
+non-quoted-string document key, `RETURNING ALL NEW *` on `DELETE`, an
+unknown `RETURNING` mode, a missing `*`), and every lowering row (`INSERT`
+simple/composite-key condition, nested document/list values, `UPDATE`
+simple/composite key, a non-key `WHERE` term folded into the condition,
+both `RETURNING` modes, `DELETE` with no implicit condition, a non-key
+`WHERE` term as `DELETE`'s own condition, `RETURNING ALL OLD *`, the
+missing-partition-key/missing-sort-key/two-equalities/placeholder-mismatch
+errors for both `UPDATE` and `DELETE`). End-to-end in
+`crates/animusd/tests/dynamo_partiql.rs` (25 tests total, up from 13):
+`INSERT` then `SELECT` sees it; a duplicate `INSERT` gives
+`DuplicateItemException` and leaves the original item unchanged; `ON
+CONFLICT DO NOTHING` swallows a duplicate silently; `UPDATE ... RETURNING
+ALL NEW *` on an existing item; `UPDATE` of a missing item fails; a
+non-key `WHERE` term as `UPDATE`'s condition, both met and unmet; `DELETE
+... RETURNING ALL OLD *` (and the item is actually gone afterward);
+`DELETE` of a missing key is a silent success; a GSI-projected attribute
+(`cat`) updated via PartiQL `UPDATE` is visible through a `SELECT` on the
+index (index maintenance inherited, not reimplemented); a
+`WHERE`-missing-partition-key `UPDATE` and a `WHERE`-missing-sort-key
+`DELETE` are both `ValidationException`; `RETURNING ALL NEW *` on `DELETE`
+is rejected; and a `PROVISIONED`-billing table throttles a PartiQL
+`INSERT` exactly like a client-built `PutItem` would (throttling
+inherited). A stream-enabled table recording a PartiQL write, and
+`BatchExecuteStatement`'s own per-statement outcome shape, are left to
+PR 4 (batch) rather than duplicated here — the throttling and index-
+maintenance tests above already establish that PR 3's writes ride the
+identical leader-evaluated funnel every other write path already has
+Streams/throttle coverage for elsewhere in this crate's own test suite,
+so a third redundant proof here was judged not worth its own fixture cost
+within this PR's scope.
+
+Gate results (2026-09-07, PR 3): `fmt`/`clippy -D warnings`/`build
+--workspace --all-targets`/`test -p animus-dynamo -p animus-item`/`test -p
+animusd --test dynamo_partiql` (×3, 25/25 each run) all green; no new crate
+dependency added. Given this sandbox's own limited disk allowance
+(~11 GB), the remaining per-crate/per-binary gates ran individually rather
+than as one `cargo test --workspace` sweep — see the PR 3 commit message
+for the exact per-crate log.

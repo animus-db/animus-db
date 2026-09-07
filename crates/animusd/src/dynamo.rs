@@ -6216,20 +6216,39 @@ async fn run_scan(
     }
 }
 
-/// `ExecuteStatement` (ADR 0071, W-07 PR 2): parse the PartiQL `statement`,
-/// resolve its target table's (or named index's) own key attribute names
-/// from the replicated catalog, lower it onto [`Operation::Query`]/
-/// [`Operation::Scan`] (`animus_dynamo::partiql::lower_select`), and run it
-/// through the exact same [`run_query`]/[`run_scan`] path a client-built
-/// `Query`/`Scan` request would take — this function's whole job is
-/// resolving what those two already do, never re-executing it.
+/// `ExecuteStatement` (ADR 0071, W-07 PR 2 `SELECT`; PR 3 `INSERT`/`UPDATE`/
+/// `DELETE`): parse `statement` into one of the four supported shapes
+/// (`animus_dynamo::partiql::parse_statement`), resolve its target table's
+/// (or, for a `SELECT`, named index's) own key attribute names from the
+/// replicated catalog, lower it onto the matching `Operation`, and run it
+/// through the exact same path a client-built request of that shape would
+/// take — this function's whole job is resolving what those already do,
+/// never re-executing it.
+///
+/// A `SELECT` lowers onto [`Operation::Query`]/[`Operation::Scan`]
+/// (`partiql::lower_select`) and dispatches to [`run_query`]/[`run_scan`]
+/// directly, unchanged from PR 2. An `INSERT`/`UPDATE`/`DELETE` lowers onto
+/// a real [`Operation::PutItem`]/[`Operation::UpdateItem`]/
+/// [`Operation::DeleteItem`] (`partiql::lower_insert`/`lower_update`/
+/// `lower_delete`) and runs through [`run_operation`] itself — the same
+/// dispatcher a client-built `PutItem`/`UpdateItem`/`DeleteItem` request
+/// goes through, so conditions, index maintenance, streams, and throttling
+/// are all inherited with no new write-path code, and `authz::authorize_op`'s
+/// own per-table check (keyed on the *real*, now-concrete operation, whose
+/// `classify` is `OpClass::Write`) is the actual enforcement point for a
+/// mutation — see this PR's own ADR 0071 amendment for why `classify`'s
+/// `Operation::ExecuteStatement` row itself stays `OpClass::Read`
+/// unconditionally (the statement's kind isn't known until it's parsed,
+/// which happens only here).
 ///
 /// The table is unknown until `statement` is parsed (`Operation::table()`
 /// returns `None` for `ExecuteStatement`, ADR 0071's own note there), so
-/// [`reject_internal_table`]/authorization happen here, once, rather than
-/// at [`run_operation`]'s shared pre-dispatch gate — mirroring
-/// `BatchGetItem`'s identical "resolved and checked inside its own
-/// handler" shape.
+/// [`reject_internal_table`] happens here, once, rather than at
+/// [`run_operation`]'s shared pre-dispatch gate — mirroring `BatchGetItem`'s
+/// identical "resolved and checked inside its own handler" shape. A
+/// `SELECT`'s authorization is likewise checked explicitly here (`run_query`/
+/// `run_scan` have no `authz` call of their own); an `INSERT`/`UPDATE`/
+/// `DELETE`'s is checked automatically by [`run_operation`] once dispatched.
 #[allow(clippy::too_many_arguments)] // one ExecuteStatement request's full decoded shape
 async fn execute_statement(
     ctx: &ClientCtx,
@@ -6241,124 +6260,209 @@ async fn execute_statement(
     next_token: Option<&str>,
     limit: Option<usize>,
 ) -> Result<String, WireError> {
-    let stmt = partiql::parse_select_statement(statement).map_err(WireError::from)?;
-    reject_internal_table(&stmt.table, false)?;
-    if !table_known(ctx, meta, &stmt.table) {
+    let stmt = partiql::parse_statement(statement).map_err(WireError::from)?;
+    let table = stmt.table().to_string();
+    reject_internal_table(&table, false)?;
+    if !table_known(ctx, meta, &table) {
         return Err(registry_error(animus_dynamo::RegistryError::NoSuchTable(
-            stmt.table.clone(),
+            table.clone(),
         )));
     }
-    authz::authorize(
-        ctx,
-        principal,
-        "ExecuteStatement",
-        animus_control::OpClass::Read,
-        Some(stmt.table.as_str()),
-    )?;
 
-    mirror_catalog_schema(ctx, meta, &stmt.table);
-
-    let (partition_key, sort_key): (String, Option<String>) = match &stmt.index {
-        Some(index_name) => {
-            let idx = meta
-                .table_indexes(&stmt.table)
-                .iter()
-                .find(|d| &d.name == index_name)
-                .cloned()
-                .ok_or_else(|| {
-                    registry_error(animus_dynamo::RegistryError::NoSuchIndex(
-                        index_name.clone(),
-                    ))
-                })?;
-            (idx.hash_attribute, idx.sort_attribute)
-        }
-        None => {
-            let base = schema_for(meta, &stmt.table);
-            (base.partition_key, base.sort_key)
-        }
-    };
-
-    let exclusive_start_key = match next_token {
-        Some(tok) => Some(partiql::decode_next_token(tok, statement).map_err(WireError::from)?),
-        None => None,
-    };
-
-    let op = partiql::lower_select(
-        &stmt,
-        parameters,
-        &partition_key,
-        sort_key.as_deref(),
-        exclusive_start_key,
-        limit,
-        consistent_read,
-    )
-    .map_err(WireError::from)?;
-
-    let raw = match op {
-        Operation::Query {
-            table,
-            index,
-            partition_attr,
-            partition_value,
-            sort_attr,
-            sort_condition,
-            limit,
-            exclusive_start_key,
-            scan_index_forward,
-            filter,
-            projection,
-            select,
-            consistent_read,
-        } => {
-            run_query(
+    match stmt {
+        partiql::Statement::Select(sel) => {
+            authz::authorize(
                 ctx,
-                meta,
-                &table,
-                index.as_deref(),
-                &partition_attr,
-                &partition_value,
-                sort_attr.as_deref(),
-                sort_condition.as_ref(),
-                limit,
+                principal,
+                "ExecuteStatement",
+                animus_control::OpClass::Read,
+                Some(table.as_str()),
+            )?;
+
+            mirror_catalog_schema(ctx, meta, &table);
+
+            let (partition_key, sort_key): (String, Option<String>) = match &sel.index {
+                Some(index_name) => {
+                    let idx = meta
+                        .table_indexes(&table)
+                        .iter()
+                        .find(|d| &d.name == index_name)
+                        .cloned()
+                        .ok_or_else(|| {
+                            registry_error(animus_dynamo::RegistryError::NoSuchIndex(
+                                index_name.clone(),
+                            ))
+                        })?;
+                    (idx.hash_attribute, idx.sort_attribute)
+                }
+                None => {
+                    let base = schema_for(meta, &table);
+                    (base.partition_key, base.sort_key)
+                }
+            };
+
+            let exclusive_start_key = match next_token {
+                Some(tok) => {
+                    Some(partiql::decode_next_token(tok, statement).map_err(WireError::from)?)
+                }
+                None => None,
+            };
+
+            let op = partiql::lower_select(
+                &sel,
+                parameters,
+                &partition_key,
+                sort_key.as_deref(),
                 exclusive_start_key,
-                scan_index_forward,
-                filter.as_ref(),
-                projection.as_ref(),
-                select,
+                limit,
                 consistent_read,
             )
-            .await?
-        }
-        Operation::Scan {
-            table,
-            index,
-            limit,
-            exclusive_start_key,
-            filter,
-            projection,
-            select,
-            segment,
-            consistent_read,
-        } => {
-            run_scan(
-                ctx,
-                meta,
-                &table,
-                index.as_deref(),
-                limit,
-                exclusive_start_key,
-                filter.as_ref(),
-                projection.as_ref(),
-                select,
-                segment,
-                consistent_read,
-            )
-            .await?
-        }
-        _ => unreachable!("partiql::lower_select only ever produces Query or Scan"),
-    };
+            .map_err(WireError::from)?;
 
-    reshape_query_scan_response_to_execute_statement(&raw, statement)
+            let raw = match op {
+                Operation::Query {
+                    table,
+                    index,
+                    partition_attr,
+                    partition_value,
+                    sort_attr,
+                    sort_condition,
+                    limit,
+                    exclusive_start_key,
+                    scan_index_forward,
+                    filter,
+                    projection,
+                    select,
+                    consistent_read,
+                } => {
+                    run_query(
+                        ctx,
+                        meta,
+                        &table,
+                        index.as_deref(),
+                        &partition_attr,
+                        &partition_value,
+                        sort_attr.as_deref(),
+                        sort_condition.as_ref(),
+                        limit,
+                        exclusive_start_key,
+                        scan_index_forward,
+                        filter.as_ref(),
+                        projection.as_ref(),
+                        select,
+                        consistent_read,
+                    )
+                    .await?
+                }
+                Operation::Scan {
+                    table,
+                    index,
+                    limit,
+                    exclusive_start_key,
+                    filter,
+                    projection,
+                    select,
+                    segment,
+                    consistent_read,
+                } => {
+                    run_scan(
+                        ctx,
+                        meta,
+                        &table,
+                        index.as_deref(),
+                        limit,
+                        exclusive_start_key,
+                        filter.as_ref(),
+                        projection.as_ref(),
+                        select,
+                        segment,
+                        consistent_read,
+                    )
+                    .await?
+                }
+                _ => unreachable!("partiql::lower_select only ever produces Query or Scan"),
+            };
+
+            reshape_query_scan_response_to_execute_statement(&raw, statement)
+        }
+        partiql::Statement::Insert(ins) => {
+            mirror_catalog_schema(ctx, meta, &table);
+            let base = schema_for(meta, &table);
+            let on_conflict_do_nothing = ins.on_conflict_do_nothing;
+            let op = partiql::lower_insert(
+                &ins,
+                parameters,
+                &base.partition_key,
+                base.sort_key.as_deref(),
+            )
+            .map_err(WireError::from)?;
+            match Box::pin(run_operation(ctx, principal, op)).await {
+                Ok(raw) => reshape_write_response_to_execute_statement(&raw),
+                Err(e) if e.code == "ConditionalCheckFailedException" => {
+                    if on_conflict_do_nothing {
+                        reshape_write_response_to_execute_statement("{}")
+                    } else {
+                        Err(WireError::duplicate_item(format!(
+                            "an item with this key already exists in table `{table}`"
+                        )))
+                    }
+                }
+                Err(e) => Err(e),
+            }
+        }
+        partiql::Statement::Update(upd) => {
+            mirror_catalog_schema(ctx, meta, &table);
+            let base = schema_for(meta, &table);
+            let op = partiql::lower_update(
+                &upd,
+                parameters,
+                &base.partition_key,
+                base.sort_key.as_deref(),
+            )
+            .map_err(WireError::from)?;
+            let raw = Box::pin(run_operation(ctx, principal, op)).await?;
+            reshape_write_response_to_execute_statement(&raw)
+        }
+        partiql::Statement::Delete(del) => {
+            mirror_catalog_schema(ctx, meta, &table);
+            let base = schema_for(meta, &table);
+            let op = partiql::lower_delete(
+                &del,
+                parameters,
+                &base.partition_key,
+                base.sort_key.as_deref(),
+            )
+            .map_err(WireError::from)?;
+            let raw = Box::pin(run_operation(ctx, principal, op)).await?;
+            reshape_write_response_to_execute_statement(&raw)
+        }
+    }
+}
+
+/// Reshape a `PutItem`/`UpdateItem`/`DeleteItem` response body
+/// (`{Attributes?, ConsumedCapacity?, ItemCollectionMetrics?}`) into
+/// `ExecuteStatement`'s own shape (`{Items}`) for a PartiQL `INSERT`/
+/// `UPDATE`/`DELETE` (ADR 0071, W-07 PR 3): a `RETURNING` echo — the
+/// underlying op's own `ReturnValues`/`UpdateReturnValues`, set by
+/// `partiql::lower_insert`/`lower_update`/`lower_delete` from the
+/// statement's `RETURNING` clause — surfaces as the response's `Attributes`
+/// field, which becomes a single-element `Items` array here; no `RETURNING`
+/// clause (the bare DynamoDB PartiQL default) means no `Attributes`, which
+/// becomes an **empty** `Items` array — never omitted, matching a `SELECT`
+/// `ExecuteStatement`'s own always-present `Items` field.
+fn reshape_write_response_to_execute_statement(raw: &str) -> Result<String, WireError> {
+    let parsed: serde_json::Value =
+        serde_json::from_str(raw).expect("write/update response is well-formed JSON");
+    let obj = parsed
+        .as_object()
+        .expect("write/update response is a JSON object");
+    let items = match obj.get("Attributes") {
+        Some(attrs) => vec![attrs.clone()],
+        None => vec![],
+    };
+    let mut out = serde_json::Map::new();
+    out.insert("Items".to_string(), serde_json::Value::Array(items));
+    Ok(serde_json::to_string(&serde_json::Value::Object(out)).expect("response serializes"))
 }
 
 /// Reshape a `Query`/`Scan` response body (`{Items, Count, ScannedCount,

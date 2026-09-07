@@ -3974,34 +3974,65 @@ route below the edge through the same `ClientCtx` CP primitives.
   constants); `dynamo::describe_endpoints` reads `ctx.admin.dynamo_addr` —
   the same field `admin.rs::config_view`'s `addrs.dynamo` already reports —
   for this node's own bound DynamoDB listen address.
-  **`ExecuteStatement` (ADR 0071, W-07 PR 2)** — `dynamo::execute_statement`
-  is a thin edge glue function, not a new execution path: it parses the
-  PartiQL `Statement` (`animus_dynamo::partiql::parse_select_statement`,
-  which has no catalog access), resolves the target's partition/sort key
-  **names** from `Metadata` (the base table's `TableSchema`, or the named
-  index's `IndexDef.hash_attribute`/`sort_attribute` when `FROM
-  "t"."index"` names one), lowers onto `Operation::Query`/`Operation::Scan`
-  (`partiql::lower_select`), and dispatches to the very same
-  `run_query`/`run_scan` a client-built `Query`/`Scan` request already
-  goes through — so `ExecuteStatement` inherits every existing behavior
-  those already have (GSI/LSI dispatch, `ConsistentRead`'s ADR 0055 path
-  selection, the leader-forwarding a non-hosting node needs) with zero new
-  data-plane code. Its own job is small: `Operation::table()` returns
-  `None` for it (the table is only known once `Statement` is parsed, same
-  as `BatchGetItem`/`BatchWriteItem`), so `reject_internal_table`/
-  `authz::authorize` run once inside `execute_statement` itself instead of
-  at `run_operation`'s shared pre-dispatch gate; and reshaping `run_query`/
-  `run_scan`'s `{Items, Count, ScannedCount, LastEvaluatedKey?}` response
-  into `ExecuteStatement`'s own `{Items, NextToken?}` shape
-  (`reshape_query_scan_response_to_execute_statement` — `LastEvaluatedKey`,
-  when present, becomes an opaque `partiql::encode_next_token`-minted
-  `NextToken`; `Count`/`ScannedCount` have no `ExecuteStatement`
-  equivalent and are dropped). **This PR supports `SELECT` only** — a
-  non-`SELECT` statement is rejected inside `parse_select_statement` before
-  an `Operation::ExecuteStatement`'s `statement` ever reaches this
-  function's parse call, so `execute_statement` itself never needs to
-  branch on statement kind. `ConsumedCapacity` is decoded/accepted but
-  never populated, mirroring `Query`/`Scan`'s own pre-existing gap (not a
+  **`ExecuteStatement` (ADR 0071, W-07 PR 2 `SELECT`; PR 3 `INSERT`/
+  `UPDATE`/`DELETE`)** — `dynamo::execute_statement` is a thin edge glue
+  function, not a new execution path: it parses the PartiQL `Statement`
+  (`animus_dynamo::partiql::parse_statement`, which has no catalog access
+  and dispatches to one of the four per-kind parsers by leading keyword),
+  resolves the target's key attribute **names** from `Metadata` (a
+  `SELECT`'s: the base table's `TableSchema`, or the named index's
+  `IndexDef.hash_attribute`/`sort_attribute` when `FROM "t"."index"` names
+  one; an `INSERT`/`UPDATE`/`DELETE`'s: always the base table's own
+  `TableSchema` — none of the three grammars carry an index `FROM`), and
+  lowers onto the matching `Operation`. A `SELECT` lowers onto
+  `Operation::Query`/`Operation::Scan` (`partiql::lower_select`) and
+  dispatches to `run_query`/`run_scan` directly, unchanged from PR 2 — so
+  it inherits every existing `Query`/`Scan` behavior (GSI/LSI dispatch,
+  `ConsistentRead`'s ADR 0055 path selection, the leader-forwarding a
+  non-hosting node needs) with zero new data-plane code. An `INSERT`/
+  `UPDATE`/`DELETE` (PR 3) lowers onto a **real** `Operation::PutItem`/
+  `UpdateItem`/`DeleteItem` (`partiql::lower_insert`/`lower_update`/
+  `lower_delete`) and runs through `run_operation` itself — the exact
+  dispatcher a client-built `PutItem`/`UpdateItem`/`DeleteItem` request
+  already goes through, so conditions, LSI/GSI index maintenance, DynamoDB
+  Streams change records, and per-table throttling (ADR 0065) are all
+  inherited with zero new write-path code, and `run_operation`'s own
+  `authz::authorize_op` call — keyed on the now-concrete, now-parsed
+  operation, whose `classify` is `OpClass::Write` — is the real
+  enforcement point for a mutation (`authz::classify`'s own
+  `Operation::ExecuteStatement` row stays `OpClass::Read` unconditionally,
+  since it can't see inside unparsed statement text; see that module's own
+  doc comment on the row). `execute_statement` calls `run_operation` from
+  inside one of `run_operation`'s own match arms — a genuine mutual async
+  recursion, resolved with `Box::pin(run_operation(..)).await` at that one
+  call site (the standard technique for a directly/mutually recursive
+  `async fn`'s otherwise-infinite generated `Future` type; only one edge
+  of the cycle needs boxing). Its own job beyond dispatch is small:
+  `Operation::table()` returns `None` for `ExecuteStatement` (the table is
+  only known once `Statement` is parsed, same as `BatchGetItem`/
+  `BatchWriteItem`), so `reject_internal_table` runs once inside
+  `execute_statement` itself instead of at `run_operation`'s shared
+  pre-dispatch gate (a `SELECT`'s `authz::authorize` call is likewise
+  explicit here, unchanged from PR 2; an `INSERT`/`UPDATE`/`DELETE`'s is
+  automatic via `run_operation`, above); and reshaping each op's own
+  response into `ExecuteStatement`'s own shape
+  (`reshape_query_scan_response_to_execute_statement` for `Query`/`Scan` —
+  `{Items, Count, ScannedCount, LastEvaluatedKey?}` → `{Items, NextToken?}`,
+  `LastEvaluatedKey` becoming an opaque `partiql::encode_next_token`-minted
+  `NextToken`, `Count`/`ScannedCount` dropped — no `ExecuteStatement`
+  equivalent; `reshape_write_response_to_execute_statement` for `PutItem`/
+  `UpdateItem`/`DeleteItem` — `{Attributes?, ConsumedCapacity?,
+  ItemCollectionMetrics?}` → `{Items}`, `Attributes` becoming a
+  single-element `Items` array when present, an **empty** one when absent,
+  never omitted). **`INSERT`'s implicit `attribute_not_exists(pk)`
+  condition failure maps to a new `WireError::duplicate_item`
+  (`DuplicateItemException`)** — or is silently swallowed (empty `Items`,
+  no error) when the statement carried `ON CONFLICT DO NOTHING`; every
+  other `ConditionalCheckFailedException` (an `UPDATE`'s implicit
+  `attribute_exists(pk)`, or a non-key `WHERE` term on `UPDATE`/`DELETE`
+  evaluating false) surfaces unchanged. `ConsumedCapacity` is decoded/
+  accepted but never populated for any statement kind, mirroring `Query`/
+  `Scan`/`PutItem`/`UpdateItem`/`DeleteItem`'s own pre-existing gap (not a
   PartiQL-specific omission — see ADR 0071 §11).
 - **Admin / debug** (`admin.rs`, `RoleAddrs.admin`, ADR 0020) — read-only
   `GET` views + gated `POST` actions + data writes; grep `admin.rs`'s route

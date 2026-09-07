@@ -65,7 +65,7 @@ the still-true paragraph after the table.
   (4) Batch; (5) ExecuteTransaction. **Size:** XL.
 - **Depends:** soft: reuse W-01's `UpdateExpression` tokenizer (landed
   2026-09-04) if it generalises.
-- **Status (2026-09-07):** PR 1 and PR 2 landed. ADR
+- **Status (2026-09-07):** PR 1, PR 2, and PR 3 landed. ADR
   [0071](adr/0071-partiql-subset.md) pins the grammar, the placeholder-only
   discipline, and the key-versus-filter lowering rule; concludes the W-01
   tokenizer does *not* generalise, a hand-written lexer instead. PR 2 adds
@@ -73,8 +73,24 @@ the still-true paragraph after the table.
   (`crates/animus-dynamo/src/partiql.rs`), lowered onto `Operation::Query`/
   `Operation::Scan` by building `animus-item::condition` types directly
   from the parsed AST (not by round-tripping through `wire.rs`'s string
-  decoders), with an opaque versioned/statement-hashed `NextToken`. PR 3
-  (`INSERT`/`UPDATE`/`DELETE`) next.
+  decoders), with an opaque versioned/statement-hashed `NextToken`. **PR 3**
+  adds `INSERT`/`UPDATE`/`DELETE`, lowered onto real `Operation::PutItem`/
+  `UpdateItem`/`DeleteItem` values and run through the exact same
+  `run_operation` dispatcher a client-built request of that shape already
+  uses (`animusd::dynamo::execute_statement`) — conditions, index
+  maintenance, streams, and throttling are all inherited with no new
+  write-path code. `INSERT`'s implicit `attribute_not_exists(pk)` maps a
+  `ConditionalCheckFailedException` to a new `DuplicateItemException` (or
+  swallows it under `ON CONFLICT DO NOTHING`); `UPDATE`'s implicit
+  `attribute_exists(pk)` fails a missing item; `DELETE` has no implicit
+  condition (matching plain `DeleteItem`'s own silent-no-op-on-missing-key
+  semantics). **A conservative widening past PR 1's own original scope**:
+  `RETURNING ALL OLD *`/`ALL NEW *` (`UPDATE`, both; `DELETE`, `ALL OLD`
+  only) is implemented in PR 3 rather than deferred, since it costs nothing
+  beyond wiring the statement's own clause onto the already-existing
+  `ReturnValues`/`UpdateReturnValues` fields — see ADR 0071's "As-built: PR
+  3" amendment. `BatchExecuteStatement` (PR 4) and `ExecuteTransaction`
+  (PR 5) remain.
 
 ---
 

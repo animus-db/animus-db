@@ -1,16 +1,21 @@
-//! End-to-end tests for `ExecuteStatement`'s PartiQL `SELECT` subset (ADR
-//! 0071, W-07 PR 2), over the real DynamoDB JSON/HTTP wire — proving the
-//! lowering onto `Query`/`Scan` this PR builds actually composes with the
-//! rest of the stack (schema resolution, GSI drain, pagination, the ADR
-//! 0063 numeric key ordering), not just the pure `partiql.rs` unit tests.
+//! End-to-end tests for `ExecuteStatement`'s PartiQL subset — `SELECT` (ADR
+//! 0071, W-07 PR 2) and `INSERT`/`UPDATE`/`DELETE` (W-07 PR 3) — over the
+//! real DynamoDB JSON/HTTP wire — proving the lowering this ADR builds
+//! actually composes with the rest of the stack (schema resolution, GSI
+//! drain, pagination, the ADR 0063 numeric key ordering, conditional
+//! writes, throttling), not just the pure `partiql.rs` unit tests.
 //!
 //! Two tables share one cluster: `events` (composite key `pk`(S)/`sk`(N),
 //! a `region` filter attribute, and a GSI `by-cat` on `cat`) covers
 //! partition-equality → `Query`, sort-key comparators/`BETWEEN`, ORDER BY,
-//! non-key `WHERE` → `Scan`-with-filter, projection, index `FROM`, and
-//! pagination/`NextToken`; `logs` (composite key `pk`(S)/`sk`(S)) covers
-//! `begins_with` as a **sort-key** condition (`events`' sort key is
-//! numeric, so it can't).
+//! non-key `WHERE` → `Scan`-with-filter, projection, index `FROM`,
+//! pagination/`NextToken`, and (PR 3) `INSERT`/`UPDATE`/`DELETE` including
+//! `RETURNING` and a GSI-projected attribute update; `logs` (composite key
+//! `pk`(S)/`sk`(S)) covers `begins_with` as a **sort-key** condition
+//! (`events`' sort key is numeric, so it can't) and PR 3's `DELETE`.
+//! A dedicated, self-contained cluster covers PR 3's throttling inheritance
+//! (a fresh `PROVISIONED`-billing table needs its own fixture, so it
+//! doesn't share `setup()`).
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -501,27 +506,6 @@ async fn order_by_desc_matches_scan_index_forward_false() {
     assert_eq!(item_sks(&resp), vec!["10", "4.5", "2", "0", "-1.5", "-5"]);
 }
 
-/// `INSERT`/`UPDATE`/`DELETE` are not supported until PR 3 (ADR 0071) — a
-/// clear, named `ValidationException`, not a generic parse failure.
-#[tokio::test(flavor = "multi_thread")]
-async fn insert_statement_is_rejected_as_not_yet_supported() {
-    let (_dir, _nodes, addr) = setup().await;
-
-    let (status, resp) = execute_statement(
-        addr,
-        r#"{"Statement":"INSERT INTO events VALUE {'pk':?}","Parameters":[{"S":"p2"}]}"#,
-    )
-    .await;
-    assert_eq!(status, 400, "{resp}");
-    assert_eq!(
-        resp["__type"],
-        "com.amazonaws.dynamodb.v20120810#ValidationException"
-    );
-    let msg = resp["message"].as_str().unwrap();
-    assert!(msg.contains("INSERT"), "{msg}");
-    assert!(msg.contains("PR 3"), "{msg}");
-}
-
 /// A literal value in `WHERE` (instead of a `?` placeholder) is rejected —
 /// ADR 0071 §2's placeholder-only discipline, enforced end to end.
 #[tokio::test(flavor = "multi_thread")]
@@ -573,5 +557,365 @@ async fn unknown_table_is_resource_not_found() {
     assert_eq!(
         resp["__type"],
         "com.amazonaws.dynamodb.v20120810#ResourceNotFoundException"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// PR 3: INSERT/UPDATE/DELETE (ADR 0071, W-07 PR 3 of 5)
+// ---------------------------------------------------------------------------
+
+/// `INSERT` then `SELECT` sees it — no `RETURNING` means an empty `Items`
+/// array on the `INSERT` itself (never omitted).
+#[tokio::test(flavor = "multi_thread")]
+async fn insert_then_select_sees_it() {
+    let (_dir, _nodes, addr) = setup().await;
+
+    let (status, resp) = execute_statement(
+        addr,
+        r#"{"Statement":"INSERT INTO events VALUE {'pk': ?, 'sk': ?, 'region': ?}",
+            "Parameters":[{"S":"p2"},{"N":"1"},{"S":"eu"}]}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "{resp}");
+    assert!(resp["Items"].as_array().unwrap().is_empty());
+
+    let (status, sel) = execute_statement(
+        addr,
+        r#"{"Statement":"SELECT * FROM events WHERE pk = ? AND sk = ?",
+            "Parameters":[{"S":"p2"},{"N":"1"}],"ConsistentRead":true}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "{sel}");
+    assert_eq!(item_sks(&sel), vec!["1"]);
+    assert_eq!(sel["Items"][0]["region"]["S"], "eu");
+}
+
+/// A second `INSERT` at the same key is `DuplicateItemException` and leaves
+/// the first item's attributes unchanged (ADR 0071's lowering table:
+/// `attribute_not_exists(pk)` maps the underlying `ConditionalCheckFailedException`).
+#[tokio::test(flavor = "multi_thread")]
+async fn duplicate_insert_gives_duplicate_item_exception_and_leaves_item_unchanged() {
+    let (_dir, _nodes, addr) = setup().await;
+
+    let (status, resp) = execute_statement(
+        addr,
+        r#"{"Statement":"INSERT INTO events VALUE {'pk': ?, 'sk': ?, 'region': ?}",
+            "Parameters":[{"S":"p3"},{"N":"1"},{"S":"eu"}]}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "{resp}");
+
+    let (status, dup) = execute_statement(
+        addr,
+        r#"{"Statement":"INSERT INTO events VALUE {'pk': ?, 'sk': ?, 'region': ?}",
+            "Parameters":[{"S":"p3"},{"N":"1"},{"S":"us"}]}"#,
+    )
+    .await;
+    assert_eq!(status, 400, "{dup}");
+    assert_eq!(
+        dup["__type"],
+        "com.amazonaws.dynamodb.v20120810#DuplicateItemException"
+    );
+
+    let (status, sel) = execute_statement(
+        addr,
+        r#"{"Statement":"SELECT region FROM events WHERE pk = ? AND sk = ?",
+            "Parameters":[{"S":"p3"},{"N":"1"}],"ConsistentRead":true}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "{sel}");
+    let items = sel["Items"].as_array().expect("Items");
+    assert_eq!(items.len(), 1);
+    assert_eq!(
+        items[0]["region"]["S"], "eu",
+        "the original item's value must survive the rejected duplicate INSERT"
+    );
+}
+
+/// `ON CONFLICT DO NOTHING` swallows the duplicate-key failure as a silent
+/// no-op instead of raising `DuplicateItemException`.
+#[tokio::test(flavor = "multi_thread")]
+async fn insert_on_conflict_do_nothing_swallows_duplicate() {
+    let (_dir, _nodes, addr) = setup().await;
+
+    let (status, _) = execute_statement(
+        addr,
+        r#"{"Statement":"INSERT INTO events VALUE {'pk': ?, 'sk': ?, 'region': ?}",
+            "Parameters":[{"S":"p4"},{"N":"1"},{"S":"eu"}]}"#,
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let (status, resp) = execute_statement(
+        addr,
+        r#"{"Statement":"INSERT INTO events VALUE {'pk': ?, 'sk': ?, 'region': ?} ON CONFLICT DO NOTHING",
+            "Parameters":[{"S":"p4"},{"N":"1"},{"S":"us"}]}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "{resp}");
+    assert!(resp["Items"].as_array().unwrap().is_empty());
+
+    // The original item's value must survive.
+    let (status, sel) = execute_statement(
+        addr,
+        r#"{"Statement":"SELECT region FROM events WHERE pk = ? AND sk = ?",
+            "Parameters":[{"S":"p4"},{"N":"1"}],"ConsistentRead":true}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "{sel}");
+    assert_eq!(sel["Items"][0]["region"]["S"], "eu");
+}
+
+/// `UPDATE ... SET ... RETURNING ALL NEW *` on an existing item echoes the
+/// post-update image.
+#[tokio::test(flavor = "multi_thread")]
+async fn update_set_on_existing_item_with_returning_all_new() {
+    let (_dir, _nodes, addr) = setup().await;
+
+    let (status, resp) = execute_statement(
+        addr,
+        r#"{"Statement":"UPDATE events SET region = ? WHERE pk = ? AND sk = ? RETURNING ALL NEW *",
+            "Parameters":[{"S":"apac"},{"S":"p1"},{"N":"0"}]}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "{resp}");
+    let items = resp["Items"].as_array().expect("Items");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["region"]["S"], "apac");
+    assert_eq!(items[0]["pk"]["S"], "p1");
+}
+
+/// `UPDATE` of a key that doesn't exist fails — the implicit
+/// `attribute_exists(pk)` condition (ADR 0071's lowering table).
+#[tokio::test(flavor = "multi_thread")]
+async fn update_of_missing_item_fails() {
+    let (_dir, _nodes, addr) = setup().await;
+
+    let (status, resp) = execute_statement(
+        addr,
+        r#"{"Statement":"UPDATE events SET region = ? WHERE pk = ? AND sk = ?",
+            "Parameters":[{"S":"apac"},{"S":"nope"},{"N":"999"}]}"#,
+    )
+    .await;
+    assert_eq!(status, 400, "{resp}");
+    assert_eq!(
+        resp["__type"],
+        "com.amazonaws.dynamodb.v20120810#ConditionalCheckFailedException"
+    );
+}
+
+/// A non-key `WHERE` term becomes the `UpdateItem`'s own `ConditionExpression`
+/// — both the met and unmet case.
+#[tokio::test(flavor = "multi_thread")]
+async fn update_with_non_key_where_term_as_condition_met_and_unmet() {
+    let (_dir, _nodes, addr) = setup().await;
+
+    // Met: sk=4.5's region is "us" per the fixture.
+    let (status, resp) = execute_statement(
+        addr,
+        r#"{"Statement":"UPDATE events SET region = ? WHERE pk = ? AND sk = ? AND region = ? RETURNING ALL OLD *",
+            "Parameters":[{"S":"apac"},{"S":"p1"},{"N":"4.5"},{"S":"us"}]}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "{resp}");
+    let items = resp["Items"].as_array().expect("Items");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["region"]["S"], "us");
+
+    // Unmet: region is now "apac", not "us" any more.
+    let (status, resp) = execute_statement(
+        addr,
+        r#"{"Statement":"UPDATE events SET region = ? WHERE pk = ? AND sk = ? AND region = ?",
+            "Parameters":[{"S":"eu"},{"S":"p1"},{"N":"4.5"},{"S":"us"}]}"#,
+    )
+    .await;
+    assert_eq!(status, 400, "{resp}");
+    assert_eq!(
+        resp["__type"],
+        "com.amazonaws.dynamodb.v20120810#ConditionalCheckFailedException"
+    );
+}
+
+/// `DELETE ... RETURNING ALL OLD *` echoes the deleted item and the item is
+/// actually gone afterward.
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_with_returning_all_old() {
+    let (_dir, _nodes, addr) = setup().await;
+
+    let (status, resp) = execute_statement(
+        addr,
+        r#"{"Statement":"DELETE FROM logs WHERE pk = ? AND sk = ? RETURNING ALL OLD *",
+            "Parameters":[{"S":"p1"},{"S":"beta"}]}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "{resp}");
+    let items = resp["Items"].as_array().expect("Items");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["sk"]["S"], "beta");
+
+    let (status, sel) = execute_statement(
+        addr,
+        r#"{"Statement":"SELECT * FROM logs WHERE pk = ? AND sk = ?",
+            "Parameters":[{"S":"p1"},{"S":"beta"}],"ConsistentRead":true}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "{sel}");
+    assert!(sel["Items"].as_array().unwrap().is_empty());
+}
+
+/// `DELETE` of a missing key is a silent success (no implicit existence
+/// condition, matching plain `DeleteItem`'s own AWS semantics) — empty
+/// `Items`, never an error.
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_of_missing_key_is_a_silent_success() {
+    let (_dir, _nodes, addr) = setup().await;
+
+    let (status, resp) = execute_statement(
+        addr,
+        r#"{"Statement":"DELETE FROM logs WHERE pk = ? AND sk = ?",
+            "Parameters":[{"S":"nope"},{"S":"nope"}]}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "{resp}");
+    assert!(resp["Items"].as_array().unwrap().is_empty());
+}
+
+/// A GSI-projected attribute (`cat`) updated via PartiQL `UPDATE` is visible
+/// through a `SELECT` on the index — index maintenance is inherited from
+/// the ordinary `UpdateItem` write path, not reimplemented.
+#[tokio::test(flavor = "multi_thread")]
+async fn gsi_projected_attribute_updated_via_partiql_is_visible_through_index_query() {
+    let (_dir, _nodes, addr) = setup().await;
+
+    let (status, resp) = execute_statement(
+        addr,
+        r#"{"Statement":"UPDATE events SET cat = ? WHERE pk = ? AND sk = ?",
+            "Parameters":[{"S":"Y"},{"S":"p1"},{"N":"2"}]}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "{resp}");
+
+    let body = r#"{"Statement":"SELECT * FROM \"events\".\"by-cat\" WHERE cat = ?",
+                   "Parameters":[{"S":"Y"}]}"#;
+    let resp = await_gsi_select(addr, body, |v| {
+        v["Items"].as_array().is_some_and(|a| a.len() == 1)
+    })
+    .await;
+    assert_eq!(item_sks(&resp), vec!["2"]);
+}
+
+/// `WHERE` missing the partition key entirely (an `UPDATE`/`DELETE` can
+/// never widen into a scan-and-mutate) is a `ValidationException`.
+#[tokio::test(flavor = "multi_thread")]
+async fn update_where_missing_partition_key_is_a_validation_exception() {
+    let (_dir, _nodes, addr) = setup().await;
+
+    let (status, resp) = execute_statement(
+        addr,
+        r#"{"Statement":"UPDATE events SET region = ? WHERE region = ?",
+            "Parameters":[{"S":"apac"},{"S":"us"}]}"#,
+    )
+    .await;
+    assert_eq!(status, 400, "{resp}");
+    assert_eq!(
+        resp["__type"],
+        "com.amazonaws.dynamodb.v20120810#ValidationException"
+    );
+    assert!(
+        resp["message"].as_str().unwrap().contains("partition key"),
+        "{resp}"
+    );
+}
+
+/// A missing sort-key term on a composite-key table is likewise rejected
+/// rather than silently narrowed to a partial-key operation.
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_where_missing_sort_key_is_a_validation_exception() {
+    let (_dir, _nodes, addr) = setup().await;
+
+    let (status, resp) = execute_statement(
+        addr,
+        r#"{"Statement":"DELETE FROM events WHERE pk = ?","Parameters":[{"S":"p1"}]}"#,
+    )
+    .await;
+    assert_eq!(status, 400, "{resp}");
+    assert_eq!(
+        resp["__type"],
+        "com.amazonaws.dynamodb.v20120810#ValidationException"
+    );
+    assert!(
+        resp["message"].as_str().unwrap().contains("sort key"),
+        "{resp}"
+    );
+}
+
+/// `RETURNING ALL NEW *` on `DELETE` is rejected at parse time — there is no
+/// new image for a delete.
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_returning_all_new_is_rejected() {
+    let (_dir, _nodes, addr) = setup().await;
+
+    let (status, resp) = execute_statement(
+        addr,
+        r#"{"Statement":"DELETE FROM logs WHERE pk = ? AND sk = ? RETURNING ALL NEW *",
+            "Parameters":[{"S":"p1"},{"S":"gamma"}]}"#,
+    )
+    .await;
+    assert_eq!(status, 400, "{resp}");
+    assert_eq!(
+        resp["__type"],
+        "com.amazonaws.dynamodb.v20120810#ValidationException"
+    );
+}
+
+/// A `PROVISIONED`-billing table's write budget throttles a PartiQL
+/// `INSERT` exactly like a client-built `PutItem` would (ADR 0065 — the
+/// throttling check lives at the leader-evaluated write funnel, which the
+/// lowered `PutItem` (an `INSERT` always carries a condition, so it always
+/// takes that path) reaches unmodified).
+#[tokio::test(flavor = "multi_thread")]
+async fn throttled_table_throttles_a_partiql_insert() {
+    let dir = support::panic_safe_tempdir();
+    let bound = bind_cluster(1, "127.0.0.1".parse().unwrap(), dir.path())
+        .await
+        .unwrap();
+    let nodes = start_cluster(bound).await.unwrap();
+    await_bootstrap(&nodes).await;
+    let addr = nodes[0].dynamo_addr();
+
+    let (status, body) = dynamo_retry(
+        addr,
+        "DynamoDB_20120810.CreateTable",
+        r#"{"TableName":"thr","AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}],
+            "KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],
+            "BillingMode":"PROVISIONED",
+            "ProvisionedThroughput":{"ReadCapacityUnits":1,"WriteCapacityUnits":1}}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "CreateTable(thr): {body}");
+
+    // A big value costs many write-capacity-units per item, so a handful of
+    // real HTTP round trips exhausts the 300-unit burst window — the same
+    // "big value, few items" shortcut `dynamo_throttling.rs` uses.
+    let big = "x".repeat(256 * 1024);
+    let mut throttled = false;
+    for i in 0..8 {
+        let stmt = format!(
+            r#"{{"Statement":"INSERT INTO thr VALUE {{'pk': ?, 'v': ?}}",
+                "Parameters":[{{"S":"k{i}"}},{{"S":"{big}"}}]}}"#
+        );
+        let (status, resp) = execute_statement(addr, &stmt).await;
+        if status == 400
+            && resp["__type"]
+                == "com.amazonaws.dynamodb.v20120810#ProvisionedThroughputExceededException"
+        {
+            throttled = true;
+            break;
+        }
+        assert_eq!(status, 200, "INSERT #{i} unexpectedly failed: {resp}");
+    }
+    assert!(
+        throttled,
+        "expected a PartiQL INSERT to be throttled once the write budget was exhausted"
     );
 }

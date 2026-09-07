@@ -79,11 +79,29 @@ pub(crate) fn classify(op: &Operation) -> (&'static str, OpClass) {
         Operation::Query { .. } => ("Query", OpClass::Read),
         Operation::Scan { .. } => ("Scan", OpClass::Read),
         Operation::TransactGetItems { .. } => ("TransactGetItems", OpClass::Read),
-        // ADR 0071 (W-07 PR 2): this PR's `ExecuteStatement` only ever
-        // carries a `SELECT` (a non-`SELECT` statement is rejected at parse
-        // time before an `Operation` is even built) — always `Read`. PR 3
-        // introduces the mutation shapes and revisits this (see that PR's
-        // own ADR 0071 amendment).
+        // ADR 0071 (W-07 PR 2/3): `Operation::ExecuteStatement` carries its
+        // PartiQL `statement` as opaque, unparsed text — the real statement
+        // kind (`SELECT` vs. `INSERT`/`UPDATE`/`DELETE`) is a fact about
+        // *content*, not about which `Operation` variant this is, and this
+        // function has no catalog/parser access to look inside the string.
+        // So this row stays `OpClass::Read` unconditionally, always has
+        // (never revisited to distinguish PR 3's mutation shapes) — it is
+        // NOT the real enforcement point for a mutation. `authorize_op`
+        // (below) is a deliberate no-op for `ExecuteStatement` for the
+        // identical reason; the actual per-statement-kind authorization
+        // happens inside `crate::dynamo::execute_statement` itself, once
+        // `statement` is parsed: a `SELECT` gets an explicit `authz::
+        // authorize(.., OpClass::Read, ..)` call there, and an `INSERT`/
+        // `UPDATE`/`DELETE` lowers onto a *real* `Operation::PutItem`/
+        // `UpdateItem`/`DeleteItem` and runs through `run_operation`, whose
+        // own `authorize_op` call classifies **that** concrete operation —
+        // `OpClass::Write`, per this table's own `PutItem`/`UpdateItem`/
+        // `DeleteItem` rows below — before any write executes. See
+        // `every_operation_classifies_per_adr_0066_decision_1`'s own
+        // `ExecuteStatement` cases (covering all four statement kinds) for
+        // why they all assert the identical `OpClass::Read` here despite
+        // three of them being mutations, and this PR's own ADR 0071
+        // amendment for the full account.
         Operation::ExecuteStatement { .. } => ("ExecuteStatement", OpClass::Read),
         Operation::DescribeTable { .. } => ("DescribeTable", OpClass::Read),
         Operation::DescribeTimeToLive { .. } => ("DescribeTimeToLive", OpClass::Read),
@@ -711,9 +729,56 @@ mod tests {
                 "ListTagsOfResource",
                 OpClass::Read,
             ),
+            // ADR 0071 (W-07 PR 2/3): `classify`'s `ExecuteStatement` row
+            // cannot see inside `statement` (it's opaque, unparsed text at
+            // this layer) — every one of the four statement kinds
+            // classifies identically here, `OpClass::Read`, **including**
+            // the three mutation shapes. That is not a gap: the real
+            // per-statement-kind enforcement happens once `dynamo::
+            // execute_statement` has parsed `statement` and lowered a
+            // mutation onto a genuine `PutItem`/`UpdateItem`/`DeleteItem`
+            // `Operation` (the `OpClass::Write` rows already covered above)
+            // — see `classify`'s own doc comment on this row for the full
+            // account.
             (
                 Operation::ExecuteStatement {
                     statement: "SELECT * FROM t".to_string(),
+                    parameters: vec![],
+                    consistent_read: false,
+                    next_token: None,
+                    limit: None,
+                    return_consumed_capacity: ReturnConsumedCapacity::None,
+                },
+                "ExecuteStatement",
+                OpClass::Read,
+            ),
+            (
+                Operation::ExecuteStatement {
+                    statement: "INSERT INTO t VALUE {'pk':?}".to_string(),
+                    parameters: vec![],
+                    consistent_read: false,
+                    next_token: None,
+                    limit: None,
+                    return_consumed_capacity: ReturnConsumedCapacity::None,
+                },
+                "ExecuteStatement",
+                OpClass::Read,
+            ),
+            (
+                Operation::ExecuteStatement {
+                    statement: "UPDATE t SET a = ? WHERE pk = ?".to_string(),
+                    parameters: vec![],
+                    consistent_read: false,
+                    next_token: None,
+                    limit: None,
+                    return_consumed_capacity: ReturnConsumedCapacity::None,
+                },
+                "ExecuteStatement",
+                OpClass::Read,
+            ),
+            (
+                Operation::ExecuteStatement {
+                    statement: "DELETE FROM t WHERE pk = ?".to_string(),
                     parameters: vec![],
                     consistent_read: false,
                     next_token: None,
