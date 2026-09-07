@@ -401,7 +401,18 @@ per-tablet CP data plane (`animus-cp-data`).
   intent's `(id, replicas)` pairs; a `Splitting` parent carrying no intent
   is structurally impossible (`BeginSplitInPlace` is the sole path into
   `Splitting`) and is rejected defensively rather than trusted with an
-  `.expect()`) atomically activates both children, **removes** the parent
+  `.expect()`. **Issue #684 defense-in-depth**: before minting either
+  child's row, this arm also rejects outright —
+  `"child tablet id already occupied — allocator invariant violated"`, plus
+  a `tracing::error!` — if either slot is already occupied, rather than the
+  unconditional `self.tablets.insert` it used to be; the `CreateTablet`
+  floor guard (below) is meant to make this structurally unreachable
+  through ordinary commands, but the insert itself no longer trusts that.
+  A rejected cutover here leaves the parent `Splitting` forever — safe, not
+  a wedge, since `animusd`'s `index_drain::inplace_split_driver_tick`
+  re-proposes `CutoverSplit` every tick regardless, idempotently, until the
+  parent vanishes — only this one already-corrupt split stays pending,
+  loudly) atomically activates both children, **removes** the parent
   (tablet + policy; the reconciler reclaims it as ordinary
   hosted-but-absent), and writes `Metadata::split_lineage[child] =
   SplitLineage {parent, parents_final_epoch, cutover_wall_ms}` — fork F9,
@@ -1506,7 +1517,18 @@ observed in any replica's tablet map, at every convergence poll AND every
 fault-schedule step (not just the final state — `Shared::sample_tablets`),
 must carry one stable identity (table + range) throughout the run, catching
 a transient double-assignment even if a later poll happens to "correct" it
-back; (5) **`RegisterNode` CAS integrity** (PR②, safety, unconditional) —
+back. **Issue #684 layer**: `AllocatorRace` also drives a THIRD phase (the
+winner repeatedly proposes `CutoverSplit` to completion, rather than
+leaving the parent `Splitting` forever) plus one dedicated extra racer
+(`allocator_race_table_b_client`) that races a `CreateTablet` for a wholly
+SEPARATE table against the same allocator counter for the whole run —
+reproducing #684's own production interleaving under fault injection.
+`check_allocator_injectivity` asserts directly over `Shared::
+confirmed_tablet_tables` (every `(id, table)` a racer's own confirm loop
+durably observed win) that an id, once confirmed holding one table, is
+never later found holding a different one in the final converged state —
+independent of (layered on top of, never instead of) the sample-based
+fingerprint check above; (5) **`RegisterNode` CAS integrity** (PR②, safety, unconditional) —
 `Workload::RegisterCas`'s `check_register_cas_integrity`, mirroring check 3's
 shape over `Metadata::node_addrs` instead of `Metadata::schemas`; (6)
 **apply-task liveness / no-permanent-stall** (PR③, safety, unconditional on
@@ -1576,7 +1598,21 @@ virtual time in this plane (no artificial per-chunk delay) — a
 fixed-`Duration` fault schedule aimed at "mid-transfer" will usually miss
 entirely; a condition-based poll (has the receiver started but not
 finished) is what actually lands inside the window regardless of a given
-seed's exact timing (`wait_for_snapshot_transfer_in_flight`).
+seed's exact timing (`wait_for_snapshot_transfer_in_flight`). (f) issue
+#684: teaching `AllocatorRace`'s winner to actually finish via
+`CutoverSplit` (rather than stopping once `BeginSplitInPlace` won) broke
+`check_durability_meta`'s own confirmed-tablet-id check — Phase 1's
+shared-parent id, previously permanent for the life of every scenario
+(nothing ever cut it over), now legitimately gets RETIRED by a completed
+cutover. The fix generalizes "still present" to also accept the id
+appearing as some child's `parent` in the final `Metadata::split_lineage`
+— a retired-by-a-split-it-itself-intended id is not a lost effect. General
+form: widening a workload to exercise a command that legitimately
+*removes* state (`CutoverSplit` removing the parent row) can turn an
+existing "confirmed effect must survive" check into a false positive if
+that check only ever checked raw presence — the fix is teaching the check
+about the specific state transition that's expected to remove it, not
+loosening the check generally.
 
 **Scope as of PR③ (final — the stack is complete)**: `Workload::SchemaRace`
 (2-3 concurrent proposers racing `CreateTableSchema`, same-table or

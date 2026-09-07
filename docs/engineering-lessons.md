@@ -20482,3 +20482,71 @@ something only our code prints (`animusd --help`'s usage line, `animus-
 operator crd`'s CRD document) before the push step, so a glibc skew, a
 missing shared library, or a wrong entrypoint fails the workflow instead
 of the first user.
+## A reservation that bumps an allocator without materializing a row means EVERY other minting command must check the floor, not just existence — and a comment claiming parity across sibling arms is not a test (issue #684, `CreateTablet`'s missing monotonic-allocator floor guard)
+
+`Metadata::next_tablet_id` (`crates/animus-control/src/meta.rs`) is a
+single, shared monotonic counter several different `MetaCommand` apply
+arms mint tablet ids from: `CreateTablet`, `BeginSplitInPlace`,
+`BeginRestore`, `BeginImport`. Three of the four correctly reject an id
+below `next_free_tablet_id()` — the "same monotonic-allocator floor" gate,
+each with a comment claiming parity with its siblings. `CreateTablet`'s
+own apply arm was the one that had actually drifted: it checked only
+`self.tablets.contains_key(tablet)` (existence) and the ADR 0023
+one-tablet-per-table rule, never the floor. That gap was invisible by
+inspection precisely because the *other* arms' comments asserted the
+parity that `CreateTablet` didn't have — reading any ONE of those arms in
+isolation looked correct and consistent with its neighbors.
+
+**Why existence-only checking is not enough**: `BeginSplitInPlace`
+reserves its two child ids by bumping `next_tablet_id` immediately at its
+own apply, but mints NO tablet-map row for either child until
+`CutoverSplit` runs later — by design, an in-place fork's children are
+materialized directly from the intent at cutover, not at `BeginSplitInPlace`
+time (ADR 0058). Between those two points, a reserved id exists in the
+allocator's own counter but has no row in `self.tablets` — `contains_key`
+returns `false` for it. A `CreateTablet` proposed for a wholly different
+table, computed from a `next_free_tablet_id()` read that predates the
+reservation, could therefore compute that exact same id, pass
+`CreateTablet`'s existence-only check, and land — its row then sat at the
+reserved id until the in-flight split's own `CutoverSplit` inserted its
+child there with an **unconditional** `self.tablets.insert(child.id, t)`,
+silently overwriting the other table's only tablet. Confirmed in CI on
+`animusd/tests/auto_split_min_tablets.rs`: table A's ADR 0067
+min-tablets-triggered split forked and reserved child ids while table B's
+`provision_tablet` (`crates/animusd/src/schema.rs`) raced a `CreateTablet`
+off a metadata read that predated the reservation — permanent, silent
+data loss of table B's only tablet.
+
+**Fix, two layers**: (1) the missing floor guard, added to `CreateTablet`'s
+apply arm, identical in shape and message (`"tablet id below the monotonic
+allocator"`) to its three siblings — this closes the actual production
+gap. (2) Defense in depth in `CutoverSplit` itself: its own child-insertion
+loop now rejects outright (`"child tablet id already occupied — allocator
+invariant violated"`, plus a `tracing::error!`) if either child slot is
+already occupied, rather than the previous unconditional overwrite — never
+trust that an upstream guard is the only thing standing between "reserved"
+and "safely materializable." A rejected `CutoverSplit` leaves the parent
+`Splitting` forever (nothing else can clear an occupied slot), but this is
+safe rather than a wedge: the `animusd` driver that proposes it
+(`index_drain::inplace_split_driver_tick`) is itself idempotent/stateless
+and already re-issues `CutoverSplit` every ~200ms tick "until the parent
+vanishes from the map," so a rejection here only ever strands the one
+already-corrupt split — loudly — never anything else in the cluster.
+
+**General form**: when several apply arms share one allocator-shaped
+counter, the floor check belongs on **every** command that can mint an id
+from it, not just the ones an author happened to think of at the time —
+"existence" and "not-below-the-floor" are two different, both-necessary
+guards, because a reservation-without-materialization design (bump the
+counter now, insert the row later) makes a window where an id is neither
+free nor yet present. And a comment on arm B asserting "same discipline as
+arm A" is not itself proof that arm A (or any other sibling) actually has
+that discipline — it's a claim that goes stale the instant a new sibling
+arm is added without updating every existing comment that named it. The
+regression test for this class of bug is not "does the guarded arm reject
+a duplicate/expired id" (that was already tested) but "does an UNRELATED
+concurrent minting command, racing the exact reservation window, get
+rejected too" — cheap to construct directly (mint the reservation, then
+attempt the unrelated command at the reserved id) and it is precisely the
+kind of cross-command interaction a single arm's own unit tests, however
+thorough, cannot catch by construction.
