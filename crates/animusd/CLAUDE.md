@@ -5237,7 +5237,22 @@ ADR itself for the full design/rationale.
   address book if the malformed guess won the race. See
   `docs/engineering-lessons.md`'s matching entry for the full account,
   including why the `node_addrs` gate fix alone (without the wait) still
-  measurably collides. **Self-removal's
+  measurably collides. **The bound-wait alone is still not sufficient
+  (issue #712, fixed)**: it's a single checkpoint, so under real host
+  contention the apply task can simply not have caught up by the time its
+  own bound timeout expires, and the fallback branch's malformed proposal
+  is then *deterministically* doomed (Raft log order guarantees the
+  target's own real self-registration applies first, so the collision this
+  produces is not a timing fluke to wait out — it already happened). Fixed
+  by letting an operator-supplied (non-minted) id retry, at the *same* id,
+  up to `MAX_CLAIM_REFRESH_ATTEMPTS` (3) on a `Collision` — a `Collision`
+  verdict is itself backed by `register_node`'s own `metadata_fresh()`
+  read, so the very next loop iteration's re-derive is provably no longer
+  stale, and a race against the target's own now-applied self-registration
+  resolves as an idempotent no-op within one extra attempt; a genuine,
+  permanent conflict still fails loudly, just after a small bounded delay.
+  See `docs/engineering-lessons.md`'s amendment on this same entry for the
+  full before/after reproduction numbers. **Self-removal's
   leadership-transfer arm is one-shot, not auto-retried (issue #405)**:
   `admin_remove_control_member`'s `node == my_id` branch calls
   `RaftCore::transfer_leadership` exactly once — if the target's
