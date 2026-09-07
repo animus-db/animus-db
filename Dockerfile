@@ -1,6 +1,6 @@
 # AnimusDB container image(s).
 #
-# Multi-stage: one `rust:1.96` builder (matching the toolchain pinned in
+# Multi-stage: one `rust:1.96-bookworm` builder (matching the toolchain pinned in
 # rust-toolchain.toml / the workspace `rust-version`) release-builds every
 # runnable binary — `animusd`, `animus` (the CLI), and `animus-operator` —
 # then two separate `debian:bookworm-slim` runtime stages each carry only
@@ -32,7 +32,17 @@
 # build use.
 ARG BASE_REGISTRY=docker.io/library
 
-FROM ${BASE_REGISTRY}/rust:1.96 AS builder
+# `-bookworm` is load-bearing, not cosmetic: both runtime stages below are
+# `debian:bookworm-slim` (glibc 2.36), and a binary links against whatever
+# glibc the builder carries. The bare `rust:1.96` tag follows Debian's
+# current stable (trixie, glibc 2.41), so a binary built there can bind a
+# symbol version bookworm does not have and then refuse to start with
+# `version GLIBC_2.39 not found` — exactly how the published
+# `animus-operator` image failed the first time anything ran it in-cluster
+# (ADR 0070's e2e-kind-webhook leg). `animusd` only escaped by not
+# happening to use such a symbol. Builder and runtime must name the same
+# Debian release; bump them together.
+FROM ${BASE_REGISTRY}/rust:1.96-bookworm AS builder
 WORKDIR /build
 
 # Cargo.lock is committed (S-07a, 2026-09-02 — see docs/adr/0060-kubernetes-
