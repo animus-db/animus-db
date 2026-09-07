@@ -258,6 +258,21 @@ async fn cluster_grown_to_five_nodes_rebalances_existing_tablets() {
 
     // Sanity: confirm the natural imbalance actually exists before asserting
     // convergence away from it (else a no-op planner would pass vacuously).
+    // This snapshot is taken *after* six commit-waited puts, each of which
+    // gives `reconcile_loop`'s own rebalance_step (REBALANCE_EVERY_N_TICKS,
+    // animus-control/src/node.rs) another chance to fire — on a loaded
+    // runner one rebalance move can already have landed before the sixth
+    // put even returns, and a transient failure-detector `Down` belief on
+    // a provisioning node (ADR 0012) can also skip it for one tablet's
+    // placement — so this precondition must not pin the exact pre-
+    // convergence layout (issue #690: CI observed exactly
+    // `{"n0": 5, "n1": 6, "n2": 6, "n3": 1, "n4": 0}` here, an early
+    // rebalance move, not a broken test). Assert only what six sequential
+    // puts under ADR 0023's first-min(N,3)-Active provisioning actually
+    // guarantee: a real starting imbalance exists, and nodes 3/4 together
+    // still trail the busiest node — a no-op planner (or one that already
+    // fully balanced everything by this point) still cannot pass either
+    // check.
     let initial = tablet_map(admin_addrs[0]).await;
     assert_eq!(initial.len(), TABLES.len(), "expected one tablet per table");
     let initial_counts = replica_counts(&initial, &raftkv_ids);
@@ -265,13 +280,11 @@ async fn cluster_grown_to_five_nodes_rebalances_existing_tablets() {
         imbalance(&initial_counts) >= 2,
         "expected a real starting imbalance, got {initial_counts:?}"
     );
-    assert_eq!(
-        initial_counts[&raftkv_ids[3]], 0,
-        "node 3 should start with no replicas: {initial_counts:?}"
-    );
-    assert_eq!(
-        initial_counts[&raftkv_ids[4]], 0,
-        "node 4 should start with no replicas: {initial_counts:?}"
+    let max_initial = initial_counts.values().copied().max().unwrap_or(0);
+    assert!(
+        initial_counts[&raftkv_ids[3]] < max_initial
+            || initial_counts[&raftkv_ids[4]] < max_initial,
+        "expected node 3 or node 4 to trail the busiest node: {initial_counts:?}"
     );
 
     // Converge: poll the replicated tablet map until every node's replica
