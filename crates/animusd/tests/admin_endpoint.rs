@@ -606,6 +606,29 @@ async fn admin_interface_surfaces_state_and_actions() {
         );
 
         // ---- /admin/status -------------------------------------------------
+        // `members` is populated by `bootstrap()`'s per-id `UpsertMember`
+        // proposals landing on the control plane one commit at a time —
+        // `await_bootstrap` only requires the registry to be non-empty, and
+        // the `put` above only needs enough `Active` members to place one
+        // tablet (`provision_tablet`'s own doc: even a fresh metadata read
+        // can observe a cluster still mid-bootstrap and mint a smaller
+        // initial replica set that self-heals later), so "all 3 data nodes
+        // registered" is an eventual property here, not something either
+        // already guarantees. Poll to convergence rather than assert in one
+        // shot under CI contention (root CLAUDE.md: an eventual property
+        // gets a converged-or-timeout poll, never a fixed-deadline assert).
+        support::poll_until_or_stalled(
+            admin_addr,
+            "control-plane member registry never reached all 3 data nodes (/admin/status members)",
+            Duration::from_millis(100),
+            || async {
+                admin_get(admin_addr, "/admin/status").await.1["members"]
+                    .as_object()
+                    .map(|m| m.len())
+                    == Some(3)
+            },
+        )
+        .await;
         let (s, status) = admin_get(admin_addr, "/admin/status").await;
         assert_eq!(s, 200);
         assert_eq!(
@@ -615,6 +638,21 @@ async fn admin_interface_surfaces_state_and_actions() {
         );
 
         // ---- /admin/raft ---------------------------------------------------
+        // Same eventual member-registry field as `/admin/status` above, read
+        // through a different view (`raft_view`'s own `meta.members`, not the
+        // Raft *voter* config) — poll it to convergence for the same reason.
+        support::poll_until_or_stalled(
+            admin_addr,
+            "control-plane member registry never reached all 3 data nodes (/admin/raft members)",
+            Duration::from_millis(100),
+            || async {
+                admin_get(admin_addr, "/admin/raft").await.1["members"]
+                    .as_array()
+                    .map(Vec::len)
+                    == Some(3)
+            },
+        )
+        .await;
         let (s, raft) = admin_get(admin_addr, "/admin/raft").await;
         assert_eq!(s, 200);
         assert!(raft["term"].as_u64().unwrap() >= 1, "raft term: {raft}");
@@ -626,6 +664,25 @@ async fn admin_interface_surfaces_state_and_actions() {
         );
 
         // ---- /admin/raftkv (one group per node in per-process mode) --------
+        // `hosts_cp` flips true only once this node's own tablet-host
+        // reconciler has observed the tablet's placement in the now-committed
+        // `Metadata` and materialized the CP group locally (`ctx.edge.
+        // hosted_groups()`, populated asynchronously by that reconciler, per
+        // the crate guide's tablet-lifecycle section) — a real cluster-wide
+        // write can succeed as soon as a QUORUM of replicas (not necessarily
+        // node 0) has hosted and elected, so node 0 catching up is a genuine
+        // eventual property, not something the `put` above guarantees by the
+        // time it returns. This was the CI-observed flake (issue: `hosts_cp
+        // == true` asserted in one shot right after bootstrap) — poll to
+        // convergence instead (root CLAUDE.md: an eventual property gets a
+        // converged-or-timeout poll, never a fixed-deadline one-shot assert).
+        support::poll_until_or_stalled(
+            admin_addr,
+            "node 0 never came to host the CP group (/admin/raftkv hosts_cp)",
+            Duration::from_millis(100),
+            || async { admin_get(admin_addr, "/admin/raftkv").await.1["hosts_cp"] == true },
+        )
+        .await;
         let (s, raftkv) = admin_get(admin_addr, "/admin/raftkv").await;
         assert_eq!(s, 200);
         assert_eq!(raftkv["hosts_cp"], true, "node 0 hosts the CP group");
