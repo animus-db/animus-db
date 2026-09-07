@@ -17723,27 +17723,6 @@ mod sim_cluster_dynamo;
 #[cfg(test)]
 mod sim_cluster_dynamo_corpus;
 
-/// Issue #734: the deterministic, real-time-free sibling of
-/// `issue_298_conflict_tests` below — the identical A-decided-but-
-/// unresolved / B-stages-and-observes-`IntentBlocked` / `push_resolution_
-/// if_decided` / B-restages-and-observes-`Staged` scenario, driven against
-/// a real `SimCluster` instead of a real-thread `ProdEnv` node. Since this
-/// fixture spawns no `txn_resolver_loop` (or any other background loop —
-/// `sim_cluster`'s own module doc), the property this scenario proves
-/// (`push_resolution_if_decided` clears a decided blocker so a fresh stage
-/// never spuriously conflicts) holds independent of real-thread timing —
-/// nothing here can race a background sweep that doesn't exist, unlike the
-/// real-thread test, which needed `Node::abort_background_tasks_for_test`
-/// to make the identical isolation claim actually true. A sibling of
-/// `sim_cluster_corpus`/`sim_cluster_dynamo`/`sim_cluster_dynamo_corpus`
-/// for the identical reason (needs `SimCluster`'s own `pub(crate)`
-/// surface, no further visibility widened). **Named `sim_cluster_txn_
-/// conflict`, not `sim_cluster_dynamo_transact`** — that name already
-/// belongs to the C-06 stack's own `TransactWriteItems`/`TransactGetItems`
-/// wire-level scenarios (a different file/PR); this module is about the
-/// raw 2PC coordinator primitives, never the DynamoDB wire.
-#[cfg(test)]
-mod sim_cluster_txn_conflict;
 /// ADR 0061 rung D3 PR 1 (C-04 D3): the first batch of "B class"
 /// `ProdEnv` DynamoDB logic tests converted to `SimCluster` — base-table
 /// tests that `dynamo::dispatch_item_op` can already drive, needing no
@@ -17780,6 +17759,27 @@ mod sim_cluster_dynamo_update_add_delete;
 mod sim_cluster_dynamo_updated_return_values;
 #[cfg(test)]
 mod sim_cluster_kind_batch_outcome;
+/// Issue #734: the deterministic, real-time-free sibling of
+/// `issue_298_conflict_tests` below — the identical A-decided-but-
+/// unresolved / B-stages-and-observes-`IntentBlocked` / `push_resolution_
+/// if_decided` / B-restages-and-observes-`Staged` scenario, driven against
+/// a real `SimCluster` instead of a real-thread `ProdEnv` node. Since this
+/// fixture spawns no `txn_resolver_loop` (or any other background loop —
+/// `sim_cluster`'s own module doc), the property this scenario proves
+/// (`push_resolution_if_decided` clears a decided blocker so a fresh stage
+/// never spuriously conflicts) holds independent of real-thread timing —
+/// nothing here can race a background sweep that doesn't exist, unlike the
+/// real-thread test, which needed `Node::abort_background_tasks_for_test`
+/// to make the identical isolation claim actually true. A sibling of
+/// `sim_cluster_corpus`/`sim_cluster_dynamo`/`sim_cluster_dynamo_corpus`
+/// for the identical reason (needs `SimCluster`'s own `pub(crate)`
+/// surface, no further visibility widened). **Named `sim_cluster_txn_
+/// conflict`, not `sim_cluster_dynamo_transact`** — that name already
+/// belongs to the C-06 stack's own `TransactWriteItems`/`TransactGetItems`
+/// wire-level scenarios (a different file/PR); this module is about the
+/// raw 2PC coordinator primitives, never the DynamoDB wire.
+#[cfg(test)]
+mod sim_cluster_txn_conflict;
 
 /// ADR 0061 rung D3 PR 2a (C-04 D3): base-table DDL over the real DynamoDB
 /// wire, driven through the new `dynamo::dispatch_table_op` generic core —
