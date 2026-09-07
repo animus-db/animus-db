@@ -71,13 +71,18 @@
 //!   caught-up engine just needs less of it. A durable (`LsmEngine`)
 //!   `SimCluster` tier is a natural follow-on (mirroring `raftkv_
 //!   linearizable.rs`'s own two-tier design) but is not built here.
-//! - **What is still `ProdEnv`-only.** `SegmentStoreHandle`/
-//!   `BackupStoreHandle`'s `Cluster` variant (this fixture only ever uses
-//!   the `Fs` placeholder, like every sibling harness — nothing this
-//!   fixture drives reads `ctx.segment_store`/`ctx.backup_store`), and
-//!   quiescence/heartbeat-batching/shared-WAL (the reconciler's own
-//!   `enable_quiescence`/`enable_heartbeat_batching`/`enable_shared_wal`
-//!   opt-ins are never called here, exactly as before this rung).
+//! - **What is still `ProdEnv`-only.** `SegmentStoreHandle`'s own `Cluster`
+//!   variant (this fixture still uses an `Fs` placeholder there — nothing
+//!   this fixture drives reads `ctx.segment_store`), and quiescence/
+//!   heartbeat-batching/shared-WAL (the reconciler's own `enable_
+//!   quiescence`/`enable_heartbeat_batching`/`enable_shared_wal` opt-ins
+//!   are never called here, exactly as before this rung). **`ctx.
+//!   backup_store` is NO LONGER a placeholder (ADR 0061 rung D4 PR 5)** —
+//!   every node's own `BackupStoreHandle::S3` wraps a clone of one real,
+//!   shared `SimSegmentStore` (see [`SimCluster::new`]'s own construction
+//!   comment), and `animus_node::backup_janitor::backup_janitor_loop`
+//!   runs on every node for real — see `sim_cluster_backup_janitor.rs`'s
+//!   own module doc.
 //!
 //! # Updated since D1 (read this before trusting the bullets above at face
 //! value)
@@ -146,7 +151,7 @@ use animus_cp_data::KIND_BASE;
 use animus_dynamo::AttributeValue;
 use animus_env::{EnvExt, nid};
 use animus_node::SimRelayClient;
-use animus_sim::{NetConfig, SimEnv, Simulator};
+use animus_sim::{NetConfig, SimEnv, SimSegmentStore, Simulator};
 
 use super::*;
 
@@ -715,6 +720,14 @@ pub(crate) struct SimCluster {
     /// dropped, mirroring how it already respawns `heartbeat_loop`/the
     /// reconciler. Set via [`SimCluster::set_auto_split_thresholds`].
     auto_split: Option<AutoSplitThresholds>,
+    /// ADR 0061 rung D4 PR 5: the ONE `SimSegmentStore` every node's own
+    /// `ClientCtx::backup_store` (`BackupStoreHandle::S3`) wraps a clone
+    /// of — see [`SimCluster::new`]'s own construction comment for why one
+    /// shared store, not a per-node local directory. Kept here (not just
+    /// inside each `ClientCtx`) so [`SimCluster::backup_store`] can hand a
+    /// test a handle for direct assertions/seeding, mirroring `engines`'
+    /// own "kept at the driver level for outside access" role above.
+    backup_store: SimSegmentStore,
 }
 
 impl SimCluster {
@@ -792,6 +805,20 @@ impl SimCluster {
             .map(|id| SimRelayClient::new(sim.env(id.clone())))
             .collect();
 
+        // ADR 0061 rung D4 PR 5: ONE shared `SimSegmentStore`, not a
+        // per-node placeholder — see the module doc's own "backup store
+        // choice" note for why `BackupStoreHandle::S3` (a single shared
+        // object store, no per-node local directory) is the right variant
+        // to wrap it in, unlike `Fs`/`Cluster`'s own per-node-local-
+        // directory shape every other `sim_cluster_*` fixture's placeholder
+        // uses. Every node's own `BackupStoreHandle::S3` below wraps its
+        // own `Arc<dyn SegmentStore>` around the SAME underlying
+        // `SimSegmentStore` (cheap to clone — its own state lives behind an
+        // `Arc<Mutex<..>>`), so every node's `list_local`/`delete_local`
+        // sees every other node's own writes, exactly like a real S3
+        // bucket would.
+        let backup_store = SimSegmentStore::new(sim.env(ids[0].clone()));
+
         let mut ctxs: Vec<SimNodeCtx> = Vec::with_capacity(nodes);
         for (i, id) in ids.iter().enumerate() {
             let admin = Arc::new(AdminInfo {
@@ -841,18 +868,21 @@ impl SimCluster {
                     change_rates: ChangeRateTracker::default(),
                     request_rates: RequestRateTracker::default(),
                 }),
-                // Neither `cp_kind_write_raw`/`cp_get`/`cp_scan` (the only
-                // methods this fixture drives) ever reads these — see the
-                // module doc's "still `ProdEnv`-only" bullet, and
-                // `simenv_client_ctx_tests::single_node_ctx`'s own doc for
-                // why the `Fs` placeholder needs no real filesystem or
-                // `ProdEnv` to satisfy the field.
+                // `cp_kind_write_raw`/`cp_get`/`cp_scan` never read this
+                // one — see the module doc's own "still `ProdEnv`-only"
+                // bullet, and `simenv_client_ctx_tests::single_node_ctx`'s
+                // own doc for why the `Fs` placeholder needs no real
+                // filesystem or `ProdEnv` to satisfy the field.
                 segment_store: SegmentStoreHandle::Fs(FsSegmentStore::new(format!(
                     "unused-segment-store-{i}"
                 ))),
-                backup_store: BackupStoreHandle::Fs(FsSegmentStore::new(format!(
-                    "unused-backup-store-{i}"
-                ))),
+                // ADR 0061 rung D4 PR 5: every node's own handle wraps the
+                // SAME shared `backup_store` built above — see that
+                // binding's own comment for why `S3` (a genuinely shared
+                // object store) is the right variant here, unlike
+                // `segment_store`'s still-placeholder `Fs` above (nothing
+                // this fixture drives reads it).
+                backup_store: BackupStoreHandle::S3(Arc::new(backup_store.clone())),
                 export_store_factory: Arc::new(Mutex::new(default_export_store_factory(None))),
                 backup_janitor_progress: Arc::new(Mutex::new(
                     animus_node::backup_janitor::JanitorProgress::default(),
@@ -932,6 +962,18 @@ impl SimCluster {
             spawn_reconciler_loop(ctxs[i].clone(), reconciler);
         }
 
+        // ADR 0061 rung D4 PR 5: one `animus_node::backup_janitor::
+        // backup_janitor_loop` per node, unconditionally — mirrors
+        // `heartbeat_loop`'s own always-on spawn above (D4 PR 1), not
+        // `auto_split_loop`'s own opt-in shape (D4 PR 2): this loop's own
+        // leader gate (`ControlLeaderHost::control_leader`) already makes
+        // it a cheap no-op idle sleep on every non-leader node, so there is
+        // no reason to gate spawning it at all.
+        for ctx in &ctxs {
+            let env = ctx.env.clone();
+            env.spawn_task(backup_janitor::backup_janitor_loop(ctx.clone()));
+        }
+
         let mut cluster = SimCluster {
             sim,
             nodes,
@@ -941,6 +983,7 @@ impl SimCluster {
             engines,
             crashed: BTreeSet::new(),
             auto_split: None,
+            backup_store,
         };
         // Let the control group elect before any caller touches it —
         // generous for up to a handful of voters under `SimEnv`'s
@@ -1286,6 +1329,54 @@ impl SimCluster {
         self.shared.hosted_tablets(node)
     }
 
+    /// ADR 0061 rung D4 PR 5: the ONE shared `SimSegmentStore` every node's
+    /// own `ClientCtx::backup_store` wraps a clone of — a cheap `Clone`
+    /// (its own state lives behind an `Arc<Mutex<..>>`), so a caller can
+    /// inspect it directly (`SimSegmentStore::stored_ids`/`get`, both
+    /// plain sync/async methods needing no simulator drive for a genuine
+    /// read of already-landed state) without going through any one node's
+    /// own `ClientCtx`.
+    pub(crate) fn backup_store(&self) -> SimSegmentStore {
+        self.backup_store.clone()
+    }
+
+    /// Durably `put` a backup object directly into this cluster's shared
+    /// `SimSegmentStore` (ADR 0061 rung D4 PR 5) — the corpus's own way to
+    /// place a real manifest/data object under a backup id before proposing
+    /// its catalog transitions on the control leader, mirroring
+    /// `backup_capture.rs`/`backup_completion.rs`'s own production `put`
+    /// call. Driven via [`SimCluster::spawn_and_capture`] on node 0's own
+    /// env — which node spawns it on is arbitrary (`SimSegmentStore` draws
+    /// off the `Simulator`'s one shared RNG stream regardless of which
+    /// node's handle is used, and `put` sends no network message), the
+    /// same "any env will do" reasoning [`SimCluster::client_env`] states
+    /// for a client-only id.
+    pub(crate) fn seed_backup_object(&mut self, id: &str, bytes: &[u8]) {
+        let store = self.backup_store.clone();
+        let (id, bytes) = (id.to_owned(), bytes.to_vec());
+        self.spawn_and_capture(0, async move {
+            use animus_env::SegmentStore;
+            store.put(&id, &bytes).await.expect("seed backup object")
+        });
+    }
+
+    /// `node`'s own live `animus_node::backup_janitor::JanitorProgress`
+    /// snapshot (ADR 0061 rung D4 PR 5, roadmap U-07) — the identical
+    /// `GET /admin/backup-store` reads back in production, a plain
+    /// synchronous lock/clone/drop (never held across an `.await`,
+    /// `client_ctx_host.rs`'s own `BackupJanitorProgressHost` impl).
+    pub(crate) fn backup_janitor_progress(
+        &self,
+        node: u64,
+    ) -> animus_node::backup_janitor::JanitorProgress {
+        self.shared
+            .ctx(node)
+            .backup_janitor_progress
+            .lock()
+            .expect("backup janitor progress poisoned")
+            .clone()
+    }
+
     /// `tablet`'s own private engine on node `node` (ADR 0050 rung 1) —
     /// get-or-create through the SAME [`MemoryTabletEngines`] registry the
     /// node's own `Reconciler` opens from (ADR 0061 rung D4 PR 1, C-04 D4
@@ -1398,6 +1489,60 @@ impl SimCluster {
             c.shared.all_have_table_throughput(table, spec.as_ref())
         });
         self.shared.recompute_any_table_throughput_all();
+    }
+
+    /// Propose `command` directly on this cluster's CURRENT control-plane
+    /// leader (ADR 0061 rung D4 PR 5) — the same `self.controls[leader]
+    /// .propose(..)` bypass every DDL helper above already uses (see the
+    /// module doc's own "DDL is a control-plane-Raft bypass" bullet),
+    /// generalized to any `MetaCommand` rather than the handful this
+    /// file's own methods build by hand. The backup-janitor corpus uses
+    /// this to drive the backup catalog's own commands
+    /// (`BeginBackup`/`RecordBackupTabletComplete`/`CompleteBackup`/
+    /// `FailBackup`/`MarkBackupDeleted`/`DeleteBackup`) the identical way
+    /// `animus-control/tests/backup_catalog.rs`'s own `propose_accepted`
+    /// helper does against a bare `RaftNode` handle — this crate's own
+    /// analogue, just resolving the leader through this fixture instead of
+    /// a caller-supplied index. Returns the raw `ProposeResult` rather than
+    /// asserting `Accepted` itself, since a corpus scenario legitimately
+    /// wants to assert a REJECTION too (e.g. proposing against an unknown
+    /// backup id).
+    pub(crate) fn propose_meta(&mut self, command: MetaCommand) -> ProposeResult {
+        let leader = self.control_leader_index();
+        self.controls[leader].propose(command)
+    }
+
+    /// Move control-plane leadership to `target` (ADR 0061 rung D4 PR 5) —
+    /// `RaftCore::transfer_leadership`'s own real handoff (ADR 0029/0037),
+    /// not a `crash`/`restart`-driven forced re-election: the current
+    /// leader freezes new proposes and hands off cleanly once `target`'s
+    /// own log has caught up. A no-op if `target` already leads. Retries
+    /// the arm attempt (bounded) since a single attempt only succeeds if
+    /// `target`'s replicated log has caught up to the leader's current
+    /// commit index at that precise instant — the identical one-shot-arm
+    /// caveat `animusd::CLAUDE.md`'s own issue #405 entry documents for
+    /// `admin_remove_control_member`'s self-removal transfer.
+    pub(crate) fn transfer_control_leadership_to(&mut self, target: u64) {
+        let mut leader = self.control_leader_index();
+        if leader == target as usize {
+            return;
+        }
+        for _ in 0..20 {
+            if self.controls[leader].transfer_leadership(nid(target)) {
+                break;
+            }
+            self.sim.run_for(Duration::from_millis(200));
+            leader = self.control_leader_index();
+            if leader == target as usize {
+                return;
+            }
+        }
+        self.sim.run_for(Duration::from_secs(2));
+        let new_leader = self.control_leader_index();
+        assert_eq!(
+            new_leader, target as usize,
+            "control leadership must move to node {target} within budget (still on {new_leader})"
+        );
     }
 
     /// Spawn `fut` onto `node`'s own env and drive the simulator for
@@ -1830,6 +1975,17 @@ impl SimCluster {
             ctx.edge.clone(),
         );
         spawn_reconciler_loop(ctx.clone(), reconciler);
+
+        // ADR 0061 rung D4 PR 5: `Simulator::stop` above dropped this
+        // node's own `backup_janitor_loop` task along with everything else
+        // it owned — respawn it unconditionally, exactly like
+        // `heartbeat_loop`/the reconciler loop above (this loop is never
+        // gated behind an opt-in the way `auto_split_loop` below is).
+        // `ctx.backup_store` is untouched by this restart (it was never
+        // reassigned above), so the respawned loop still shares the SAME
+        // underlying `SimSegmentStore` every other node writes to.
+        let janitor_env = ctx.env.clone();
+        janitor_env.spawn_task(backup_janitor::backup_janitor_loop(ctx.clone()));
 
         let ctx_for_server = ctx.clone();
         fresh_relay.serve(move |req| {

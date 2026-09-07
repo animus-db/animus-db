@@ -17863,6 +17863,24 @@ mod sim_cluster_dynamo_drop_table;
 #[cfg(test)]
 mod sim_cluster_auto_split;
 
+/// ADR 0061 rung D4 PR 5 (C-04 D4): deterministic `SimCluster` coverage for
+/// the backup janitor's own async loop (`animus_node::backup_janitor::
+/// backup_janitor_loop`) — `client_ctx_host.rs`'s four host-capability
+/// impls and `backup_janitor.rs`'s own thin wrapper widened to `<E: Env, R:
+/// RelayClient>` (previously concrete `ClientCtx` = `ClientCtx<ProdEnv,
+/// AnimusdRelayClient>`), `sim_cluster.rs`'s own `SimCluster` now building
+/// every node's `backup_store` as a `BackupStoreHandle::S3` wrapping a
+/// clone of ONE shared `SimSegmentStore` (not a per-node placeholder) and
+/// spawning `backup_janitor_loop` unconditionally on every node, mirroring
+/// `heartbeat_loop`'s own always-on D4 PR 1 spawn. See this module's own
+/// doc for the five scenarios (a deleted backup reclaimed, a failed backup
+/// reclaimed, leader gating including a real leadership-transfer handoff,
+/// a crashed-and-restarted control leader converging, and an untouched
+/// `Available` backup left alone) and `crates/animusd/CLAUDE.md`'s matching
+/// entry for the full account.
+#[cfg(test)]
+mod sim_cluster_backup_janitor;
+
 /// Regression for the issue #298 residual confirmed live under the
 /// un-pinned `SplitMode::InPlace` proof soak (ADR 0018's matching amendment,
 /// `docs/engineering-lessons.md`'s matching entry): a stage blocked by
