@@ -1,0 +1,5 @@
+# Append-only logs: a conflict here is always two PRs appending at the same tail,
+# so keep both sides in order instead of stopping the merge (see
+# docs/engineering-lessons.md on stacked-series conflicts).
+docs/engineering-lessons.md merge=union
+docs/engineering-lessons-archive.md merge=union

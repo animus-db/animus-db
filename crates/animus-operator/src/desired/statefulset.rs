@@ -1,10 +1,13 @@
 //! The `StatefulSet` builder: one pod per node ordinal, running
-//! `entrypoint.sh` off the cluster `ConfigMap`, probed on the admin port's
-//! `GET /admin/health`. The probes' scheme follows `spec.tls`: HTTP when
-//! unset, HTTPS (unverified, as the kubelet itself does not check the
-//! server certificate) when set — admin is server-only TLS (ADR 0064), so
-//! a plaintext probe against a TLS-only listener fails the handshake on
-//! the server side every probe period and the pod never goes Ready.
+//! `entrypoint.sh` off the cluster `ConfigMap`, probed on the admin port —
+//! **`readinessProbe` on `GET /admin/health`, `livenessProbe` on
+//! `GET /admin/live`, deliberately different routes since 2026-09-07
+//! (issue #710; see [`admin_probe`]'s own doc for why)**. The probes'
+//! scheme follows `spec.tls`: HTTP when unset, HTTPS (unverified, as the
+//! kubelet itself does not check the server certificate) when set — admin
+//! is server-only TLS (ADR 0064), so a plaintext probe against a TLS-only
+//! listener fails the handshake on the server side every probe period and
+//! the pod never goes Ready.
 //!
 //! **Config-hash restart annotation (S-07d groundwork, 2026-09-06)**: the
 //! pod template carries a [`CONFIG_HASH_ANNOTATION`] whose value is a
@@ -62,17 +65,31 @@ use super::{
 };
 use crate::crd::{AnimusCluster, AnimusClusterSpec};
 
-/// `readinessProbe`: `periodSeconds: 5`, `failureThreshold: 3` — fast to
-/// pull a pod out of `Endpoints` (and therefore the client `Service`'s LB
-/// rotation) once its own `/admin/health` starts reporting no known control
-/// leader.
+/// `readinessProbe`, on `GET /admin/health`: `periodSeconds: 5`,
+/// `failureThreshold: 3` — fast to pull a pod out of `Endpoints` (and
+/// therefore the client `Service`'s LB rotation) once its own
+/// `/admin/health` starts reporting no known control leader. Readiness is
+/// exactly the surface that route is *for* — a caller should not be routed
+/// to a node with no recent control leader — so gating it on that signal
+/// is correct and unchanged.
 const READINESS_PERIOD_SECS: i32 = 5;
 const READINESS_FAILURE_THRESHOLD: i32 = 3;
-/// `livenessProbe`: generous thresholds (`initialDelaySeconds: 30`,
-/// `periodSeconds: 10`, `failureThreshold: 6` — a full minute of failures)
-/// so a pod recovering from a slow Raft snapshot install or a large
-/// compaction is never killed out from under itself; a liveness restart is
-/// meant only for a genuinely wedged process.
+/// `livenessProbe`, on `GET /admin/live` (issue #710, 2026-09-07 — see
+/// [`admin_probe`]'s own doc for why this is a **different route** from
+/// readiness above, not just different thresholds): generous thresholds
+/// (`initialDelaySeconds: 30`, `periodSeconds: 10`, `failureThreshold: 6` —
+/// a full minute of failures) so a pod recovering from a slow Raft
+/// snapshot install or a large compaction is never killed out from under
+/// itself; a liveness restart is meant only for a genuinely wedged
+/// process — never for a healthy process that simply has no control
+/// leader yet. Issue #705 is the exit-0-restart-storm investigation that
+/// surfaced the symptom (a freshly-promoted combined-role pod cycling on
+/// clean `SIGTERM`-driven exits) without pinning down the SIGTERM's
+/// source; issue #710 is the root cause it left open — this `livenessProbe`
+/// pointed at `/admin/health` (identical to `readinessProbe` at the time),
+/// so a pod could sit legitimately leaderless for a full
+/// `advance_control_growth` reconcile cycle (`crate::controller`, at most
+/// once per 30s) and get killed for it.
 const LIVENESS_INITIAL_DELAY_SECS: i32 = 30;
 const LIVENESS_PERIOD_SECS: i32 = 10;
 const LIVENESS_FAILURE_THRESHOLD: i32 = 6;
@@ -242,16 +259,34 @@ const ENCRYPTION_KEY_VOLUME: &str = "encryption-key";
 /// owned `root:root` by default, and `animus` is neither.
 const ENCRYPTION_KEY_SECRET_DEFAULT_MODE: i32 = 0o444;
 
+/// Builds one `HTTPGetAction`-based probe against the admin port at
+/// `path` — `readiness_probe` and `liveness_probe` below each call this
+/// with their own path (`/admin/health` and `/admin/live` respectively,
+/// since issue #710's readiness/liveness split, 2026-09-07). Readiness
+/// legitimately depends on control-plane state (a node with no recent
+/// leader should not receive traffic); liveness must not — a distributed-
+/// consensus signal a healthy, still-joining process cannot satisfy alone
+/// is never a valid liveness gate, since the kubelet's response to a
+/// liveness failure is a hard restart, which only makes a slow-to-join
+/// node slower. See `docs/adr/0060-kubernetes-operator.md`'s 2026-09-07
+/// amendment and `docs/engineering-lessons.md` for the fuller account,
+/// and issues #705/#710 for the incident this closes.
+///
 /// `tls_enabled` mirrors `spec.tls.is_some()`: admin is server-only TLS
-/// (ADR 0064), so when it's on the probe's `GET /admin/health` must speak
-/// HTTPS too, or the kubelet's plaintext request just fails the TLS
-/// handshake on the server side every probe period. The kubelet's HTTPS
-/// probe scheme does not verify the server certificate, so this needs no
-/// CA plumbed into it — see ADR 0064 and the fix that added this.
-fn admin_probe(admin_port: i32, tls_enabled: bool, extra: impl FnOnce(&mut Probe)) -> Probe {
+/// (ADR 0064), so when it's on the probe must speak HTTPS too, or the
+/// kubelet's plaintext request just fails the TLS handshake on the server
+/// side every probe period. The kubelet's HTTPS probe scheme does not
+/// verify the server certificate, so this needs no CA plumbed into it —
+/// see ADR 0064 and the fix that added this.
+fn admin_probe(
+    admin_port: i32,
+    path: &str,
+    tls_enabled: bool,
+    extra: impl FnOnce(&mut Probe),
+) -> Probe {
     let mut probe = Probe {
         http_get: Some(HTTPGetAction {
-            path: Some("/admin/health".to_string()),
+            path: Some(path.to_string()),
             port: IntOrString::Int(admin_port),
             scheme: tls_enabled.then(|| "HTTPS".to_string()),
             ..Default::default()
@@ -445,11 +480,14 @@ pub fn build(cluster: &AnimusCluster, spec: &AnimusClusterSpec) -> StatefulSet {
             .resources
             .clone()
             .or(Some(ResourceRequirements::default())),
-        readiness_probe: Some(admin_probe(admin_port, tls_enabled, |p| {
+        readiness_probe: Some(admin_probe(admin_port, "/admin/health", tls_enabled, |p| {
             p.period_seconds = Some(READINESS_PERIOD_SECS);
             p.failure_threshold = Some(READINESS_FAILURE_THRESHOLD);
         })),
-        liveness_probe: Some(admin_probe(admin_port, tls_enabled, |p| {
+        // `/admin/live`, not `/admin/health` — issue #710: liveness must
+        // never gate on control-leader knowledge (see `admin_probe`'s own
+        // doc and the `LIVENESS_*` constants' doc above).
+        liveness_probe: Some(admin_probe(admin_port, "/admin/live", tls_enabled, |p| {
             p.initial_delay_seconds = Some(LIVENESS_INITIAL_DELAY_SECS);
             p.period_seconds = Some(LIVENESS_PERIOD_SECS);
             p.failure_threshold = Some(LIVENESS_FAILURE_THRESHOLD);
@@ -555,7 +593,7 @@ mod tests {
     }
 
     #[test]
-    fn probes_target_admin_health_on_admin_port() {
+    fn probes_target_admin_health_and_admin_live_on_admin_port() {
         let cluster = test_cluster("c", "ns", 3, None);
         let sts = build(&cluster, &cluster.spec);
         let c = container(&sts);
@@ -563,9 +601,20 @@ mod tests {
         let liveness = c.liveness_probe.unwrap();
         for probe in [&readiness, &liveness] {
             let get = probe.http_get.as_ref().unwrap();
-            assert_eq!(get.path.as_deref(), Some("/admin/health"));
             assert_eq!(get.port, IntOrString::Int(14003));
         }
+        // Issue #710: readiness and liveness must be different routes — a
+        // healthy, still-joining process can legitimately have no known
+        // control leader, so a liveness probe on the readiness route would
+        // SIGTERM it out from under an ordinary join.
+        let readiness_path = readiness.http_get.as_ref().unwrap().path.as_deref();
+        let liveness_path = liveness.http_get.as_ref().unwrap().path.as_deref();
+        assert_eq!(readiness_path, Some("/admin/health"));
+        assert_eq!(liveness_path, Some("/admin/live"));
+        assert_ne!(
+            readiness_path, liveness_path,
+            "readiness and liveness must not probe the same route (#710)"
+        );
         assert_eq!(readiness.period_seconds, Some(5));
         assert_eq!(readiness.failure_threshold, Some(3));
         assert_eq!(liveness.initial_delay_seconds, Some(30));
@@ -898,6 +947,16 @@ mod tests {
                 "kubelet probe must speak TLS to a TLS-only admin listener"
             );
         }
+        // TLS is a transport-level, whole-listener choice — the #710
+        // route split holds over TLS exactly as it does over plain HTTP.
+        assert_eq!(
+            readiness.http_get.as_ref().unwrap().path.as_deref(),
+            Some("/admin/health")
+        );
+        assert_eq!(
+            liveness.http_get.as_ref().unwrap().path.as_deref(),
+            Some("/admin/live")
+        );
     }
 
     #[test]
@@ -924,6 +983,14 @@ mod tests {
             let get = probe.http_get.as_ref().unwrap();
             assert_eq!(get.scheme.as_deref(), Some("HTTPS"));
         }
+        assert_eq!(
+            readiness.http_get.as_ref().unwrap().path.as_deref(),
+            Some("/admin/health")
+        );
+        assert_eq!(
+            liveness.http_get.as_ref().unwrap().path.as_deref(),
+            Some("/admin/live")
+        );
     }
 
     #[test]
