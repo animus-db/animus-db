@@ -242,12 +242,37 @@ the still-true paragraph after the table.
 
 ## 3. Core design items still proposed
 
-### C-03 Log-only replicas (ADR 0044 phase 3)
+### C-03 Log-only replicas (ADR 0044 phase 3) — assessed 2026-09-07: defer, not sized
 
-- C-02 (ADR 0044 phase 2, heartbeat amortization) landed 2026-09-06 —
-  investigation, batcher, and default-on cutover all shipped (see that
-  ADR's phase-2 and phase-2-cutover amendments). Whether phase 3 is still
-  needed on top of it hasn't been assessed; prerequisite only, not sized.
+- **Assessed 2026-09-07, recommendation: defer** (ADR 0044's matching
+  2026-09-07 amendment has the full evidence). C-02 (heartbeat
+  amortization) and C-05 (`SharedWal`) both landed and defaulted on
+  2026-09-06, closing two of phase 3's three named per-group costs
+  (heartbeat timers/frames, one WAL file per group) outright. The third —
+  a per-tablet storage engine's idle footprint (ADR 0050) — measured at
+  ~8.1 KB/engine this session (`cargo test -p animus-storage --test
+  idle_engine_cost --features prod-heavy -- --ignored --nocapture`),
+  under 0.4% of that test's own 2 MiB/engine gating ceiling: already
+  negligible. The one unmeasured piece (per-group `RaftCore`/`RaftKvNode`
+  in-memory bookkeeping and its one `drive` task, no RSS/CPU harness
+  exists) is sized at roughly a day (M) to build and was not built here.
+- **Not a "no," a design mismatch**: [ADR 0055](adr/0055-eventually-consistent-reads.md)
+  (2026-08-23, after this ADR's original text) depends on *every* replica
+  of a tablet carrying a full applied engine to serve `ConsistentRead:
+  false` reads locally — the fix for v1's own "no read scaling at all"
+  gap. A log-only replica, converted from an ordinary RF3 voter as phase
+  3's own "asymmetric replicas" framing implies, would shrink exactly that
+  read-scaling fan-out. If ever revisited, phase 3 needs re-scoping as
+  extra log-only voters added *beyond* a full-copy read-serving quorum
+  (RF > 3 for failure-domain spread, not a conversion of an existing
+  replica), plus an ADR 0055 amendment excluding log-only members from its
+  "any replica" read fan-out by construction.
+- **Reopens on**: (a) the unmeasured per-group `RaftCore`/task cost, once
+  measured, showing a real bite at a realistic per-node tablet density
+  (hundreds to thousands of hosted groups — untested at that scale
+  anywhere in this codebase); or (b) a deployment need for RF > 3 driven
+  by failure-domain spread rather than read scaling. Neither holds today.
+  No PRs planned.
 
 ### C-04 Testability phases D and E (ADR 0061)
 
@@ -347,7 +372,7 @@ wave are independent and can run in parallel.
 | 3 | *U-05, U-07, U-08(ii) landed 2026-09-06* | No ordering constraint remains |
 | 4 | *landed 2026-09-05* (S-02) | Highest blast radius (C-01 landed 2026-09-05 — see ADR 0054; S-01 landed 2026-09-05 — see ADR 0064; S-02 — see ADR 0066) |
 | 5 | *S-04, S-05, S-07b–d, C-02, C-05 all landed 2026-09-06* | S-05 strictly after S-04 |
-| 6 | *S-03 complete 2026-09-07 (all 3 PRs, ADR 0069)*; *S-07e/S-07 complete 2026-09-07 (ADR 0070)*; W-07, C-03 | XL or gated on earlier waves |
+| 6 | *S-03 complete 2026-09-07 (all 3 PRs, ADR 0069)*; *S-07e/S-07 complete 2026-09-07 (ADR 0070)*; *C-03 assessed 2026-09-07 — deferred, no PRs planned (see ADR 0044's matching amendment)*; W-07 | XL or gated on earlier waves |
 
 Open issues mapped: none left (#375 closed by W-01, #319 by W-05). Filed
 from wave 2's own findings: #590 (the operator still emits the deleted

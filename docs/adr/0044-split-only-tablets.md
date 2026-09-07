@@ -478,3 +478,142 @@ This closes the C-02 stack: "(1) investigation, (2) batcher behind a flag,
 batching" section for the CLI/config plumbing detail and
 `docs/design/heartbeat-send-sites.md`'s own closing note for the design
 doc's final account.
+
+## Amendment (2026-09-07): phase 3 assessment (C-03) — deferred, not built
+
+Roadmap item C-03 asked whether the cheap-groups roadmap's follow-up 3
+("Asymmetric replicas," above — DynamoDB's own "log replica" precedent, a
+quorum member holding the Raft log durably but carrying no engine state
+and never leading) is still worth building now that C-02 (heartbeat
+amortization) and C-05 (`SharedWal`, ADR 0028) have both landed and
+defaulted on. **This is an assessment only — no mechanism ships here.**
+
+### What phase 3 targeted, restated precisely
+
+Item 3's own text names the cost this ADR opened with (above, "Removing
+merge means a tablet's per-group overhead... is now genuinely permanent"):
+**"a Raft WAL file, election/heartbeat timers, a voter-set-tracking
+group"** — paid by *every* replica of every group, leader and follower
+alike, not just the leader. A log-only replica removes the "WAL file" and
+"engine" halves of that on non-leading replicas by construction (no
+materialized state to keep, so nothing to apply, compact, or serve reads
+from); it does not by itself touch the "voter-set-tracking group" half —
+the in-memory `RaftCore`/`RaftKvNode` bookkeeping and its one `drive` task
+per hosted group, which a log-only replica still needs (it is still a
+voter, still receives and acks `AppendEntries`).
+
+### What has already been closed since this ADR's own text, item by item
+
+- **Election/heartbeat timers, and the apply task's own idle poll** (the
+  larger of the two, per ADR 0048's own correction) — closed by ADR 0048
+  quiescence (phase 1), default on at 5s (`--quiesce-after`,
+  `main::DEFAULT_QUIESCE_AFTER_SECS`). Applies to every hosted replica,
+  voter or (since ADR 0058 Train 1) learner alike — see
+  `crates/animus-control/CLAUDE.md`'s learner-membership entry: "a fully-idle
+  group's learners stop ticking too."
+- **The active-load heartbeat cost** — quiescence only zeros the *idle*
+  term; a busy group still ticks `RaftCore::heartbeat_interval` on every
+  peer. C-02's `HeartbeatBatcher` (default on since its PR 3 cutover)
+  coalesces every co-hosted group's heartbeat toward the same destination
+  node into one physical frame per interval — `Metric::
+  CpHeartbeatFramesSent` stays flat in group count `G` while `Metric::
+  CpAppendEntriesSent` (the logical per-group count) keeps scaling with
+  `G`, per the phase-2-cutover amendment's own measured numbers above
+  (`frames1=238, frames5=238` vs. `logical1=238, logical5=1190`).
+- **The "one WAL file per group" cost, active-load** — C-05's `SharedWal`
+  (default on since its PR 3 cutover) replaces every hosted group's
+  private WAL file with one shared file per node. Reproduced this session,
+  same host as the committed
+  [`docs/design/shared-wal-fsync-benchmark.md`](../design/shared-wal-fsync-benchmark.md)
+  numbers (`cargo bench -p animus-cp-data --bench wal_fsync_bench`,
+  `ANIMUS_BENCH_ROUNDS=5 ANIMUS_BENCH_GROUPS=1,8,32,128`, ext4 on
+  `/dev/vda`): at `K=128` concurrently-active groups, per-group files p50
+  = 11.87ms/round (128.00 fsyncs/round) vs. `SharedWal` p50 = 1.62ms/round
+  (2.00 fsyncs/round) — a ~7.3x latency cut and a 64x fsync-count cut,
+  consistent with that document's own three-run table (10.5–11.2ms →
+  1.4–1.6ms at K=128, held across runs).
+
+That closes two of the three named per-group cost items outright, and
+both are default-on in production today — not opt-in capabilities someone
+still has to enable. What phase 3's "carries no engine state" clause
+targets is specifically the third: the per-tablet storage engine (ADR
+0050).
+
+### What remains, measured this session
+
+`cargo test -p animus-storage --test idle_engine_cost --features
+prod-heavy -- --ignored --nocapture` (same host, same session as the WAL
+bench above): **100 idle `LsmEngine` instances → 811,008 bytes RSS delta,
+~8,110 bytes/engine** — under 0.4% of the 2 MiB/engine sanity ceiling
+`idle_engine_cost.rs`'s own gating assertion uses (ADR 0050's own rung-1
+gating claim). The file's always-on structural companion test
+(`idle_engine_open_is_passive_no_files_no_tasks`) also holds: an
+unwritten engine's `open()` creates no files, spawns no task, arms no
+timer. **The one per-group cost phase 3 would remove that the first two
+closures above don't already reach is, on today's measurement, already
+negligible at idle** — there is very little idle-engine cost left for a
+log-only replica to save.
+
+### What is not measured, and is not sized here
+
+The per-group **in-memory** `RaftCore`/`RaftKvNode` bookkeeping itself
+(voter/learner sets, `next_index`/`match_index` maps, `TxnTracker`, and
+the one `drive` async task per hosted group) has no equivalent RSS/CPU
+harness — `idle_engine_cost.rs` measures only the storage layer below it.
+A comparable measurement (host `N` `RaftKvNode`s on one `ProdEnv` node
+with quiescence + heartbeat batching + `SharedWal` all enabled, diff
+RSS/CPU before and after, mirroring `idle_engine_cost.rs`'s own shape) is
+sized at roughly a day (M) and was not built in this assessment, per its
+own ~30-minute measurement budget. This is the one number that could
+still argue for phase 3's storage-engine-agnostic half (a log-only
+replica also runs a lighter-weight core than a full voter would need to,
+even leaving the engine question aside) and nobody has produced it.
+
+### The design reason not to build phase 3 as originally sketched
+
+[ADR 0055](0055-eventually-consistent-reads.md) (2026-08-23) shipped
+*after* this ADR's own text and changes the calculus more than either
+measurement above does. It depends on **every replica of a tablet**
+carrying a full applied engine, precisely so a `ConsistentRead: false`
+read can be served from *any* replica's own local state with no leader
+round trip — closing what that ADR calls, in its own words, "the single
+most conspicuous scaling gap in v1": "No read scaling at all... a read
+path that funnels a tablet's entire read volume through one node." A
+phase-3 log-only replica carries no engine by definition and so could
+never serve one of these reads. Converting any of a table's ordinary RF3
+voters into a log-only member — the natural reading of item 3's own
+"asymmetric replicas" framing — would directly shrink the read-scaling
+fan-out ADR 0055 exists to buy back. The two designs were written on
+opposite sides of that later decision and now pull against each other at
+the default replication factor.
+
+### Recommendation: defer, not size
+
+Two of phase 3's three named cost pillars are closed and default-on
+(timers, WAL); the third (idle storage-engine footprint) is measured
+negligible; and the one thing phase 3 would still uniquely buy — a
+lighter-weight per-group core, unmeasured — would come at the direct
+expense of ADR 0055's read-scaling story if built the way this ADR
+originally sketched it (an ordinary voter converted to log-only at RF3).
+That is not "no, never" — it is "not this design, not without a number
+that isn't measured yet."
+
+If phase 3 is ever revisited, it is not the same feature this ADR
+originally proposed. It would need to be re-scoped as **extra,
+narrowly-asymmetric voters added *beyond* a full-copy, read-serving
+quorum** — e.g., RF3 full copies (unchanged, still every replica
+eligible for ADR 0055's local eventual reads) plus N additional log-only
+members purely for write-durability/failure-domain spread at RF > 3 —
+never a wholesale conversion of an ordinary replica, and it would need
+ADR 0055's own `stale_read_ready()` "any replica" fan-out amended
+alongside it to exclude a log-only member by construction, not by
+convention. Two conditions would reopen it: **(a)** the unmeasured
+per-group `RaftCore`/task cost above, once actually measured, shows a
+real bite at a realistic per-node tablet density (hundreds to thousands
+of hosted groups on one node — this fleet size has not been produced or
+tested anywhere in this codebase yet); or **(b)** a deployment need for
+RF > 3 driven by failure-domain spread rather than read scaling, where
+the added replicas' storage/compute cost (not their read capacity) is
+specifically what is worth cutting. Neither condition holds today.
+
+`docs/roadmap.md`'s C-03 entry is updated to record this outcome.
