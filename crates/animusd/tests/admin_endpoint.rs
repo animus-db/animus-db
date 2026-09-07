@@ -732,6 +732,12 @@ async fn admin_interface_surfaces_state_and_actions() {
         assert_eq!(s, 200, "health 200 once a leader is known");
         assert_eq!(health["ok"], true);
 
+        // ---- /admin/live (issue #710) — a healthy node reports 200 here too,
+        // same as /admin/health, but the two are independent routes.
+        let (s, live) = admin_get(admin_addr, "/admin/live").await;
+        assert_eq!(s, 200, "live is 200 on a healthy node: {live}");
+        assert_eq!(live["ok"], true);
+
         // ---- unknown route + malformed body --------------------------------
         let (s, _) = admin_get(admin_addr, "/admin/nope").await;
         assert_eq!(s, 404, "unknown admin route is 404");
@@ -2999,6 +3005,101 @@ async fn admin_segment_store_reports_null_shards_for_the_fs_kind() {
         for node in &nodes {
             node.shutdown_graceful().await;
         }
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// Bring up ONE node out of an `n`-voter [`animusd::ClusterConfig`] (index
+/// `0`; peers `1..n` are never started) — the cheapest reproducible
+/// **genuinely leaderless** node: with fewer than a quorum of voters ever
+/// up, `0`'s control Raft can never win an election, so `leader_within`
+/// stays `None` forever, same shape as [`bring_up`] otherwise (six ports
+/// per config entry, `Both` role, retried against the same port-TOCTOU
+/// window). Used by
+/// `admin_live_is_200_while_a_genuinely_leaderless_admin_health_is_503`
+/// below (issue #710).
+async fn bring_up_lone_voter_of(n: usize, dir: &std::path::Path) -> Node {
+    for attempt in 0..16 {
+        let addrs = support::free_addrs(n * 6);
+        let nodes_cfg: Vec<animusd::RoleAddrs> = (0..n)
+            .map(|i| animusd::RoleAddrs {
+                id: animusd::config::node_id(i),
+                role: animusd::config::NodeRole::Both,
+                internal: addrs[6 * i],
+                client: addrs[6 * i + 1],
+                dynamo: addrs[6 * i + 2],
+                admin: addrs[6 * i + 3],
+                intra: addrs[6 * i + 4],
+                console: addrs[6 * i + 5],
+                advertise_host: None,
+                tls: None,
+                encryption_key_path: None,
+            })
+            .collect();
+        let config = animusd::ClusterConfig {
+            nodes: nodes_cfg,
+            dynamo_auth: None,
+            cluster_settings: None,
+        };
+        match animusd::run_node(&config, 0, dir.join(format!("lone-{attempt}-0"))).await {
+            Ok(node) => return node,
+            Err(_) => sleep(Duration::from_millis(50)).await,
+        }
+    }
+    panic!("could not bring up lone-voter node after retries (ports kept getting stolen)");
+}
+
+/// Issue #710 regression: `/admin/live` must answer `200` on a node whose
+/// control plane has NO leader — the exact condition under which
+/// `/admin/health` correctly answers `503` (issue #595's readiness
+/// hysteresis has long since expired for a node that never had a leader in
+/// the first place). A Kubernetes `livenessProbe` pointed at the readiness
+/// route would SIGTERM this node even though it is healthy and correctly
+/// still trying to join; `/admin/live` must never make that mistake.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admin_live_is_200_while_a_genuinely_leaderless_admin_health_is_503() {
+    timeout(Duration::from_secs(30), async {
+        let dir = support::panic_safe_tempdir();
+        // A 3-voter config with only node 0 ever started: peers 1 and 2
+        // never come up, so node 0 can never reach quorum and never elects
+        // (or hears of) a leader.
+        let node = bring_up_lone_voter_of(3, dir.path()).await;
+
+        // `/admin/health` must settle to 503 (poll rather than a one-shot
+        // assert: right after startup the hysteresis grace window from
+        // issue #595 may not have expired yet even with no leader ever
+        // known).
+        let (s, health) = timeout(Duration::from_secs(15), async {
+            loop {
+                let (s, health) = admin_get(node.admin_addr(), "/admin/health").await;
+                if s == 503 {
+                    return (s, health);
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("a lone voter never gains a leader; /admin/health must settle to 503");
+        assert_eq!(s, 503, "leaderless node's readiness must 503: {health}");
+        assert_eq!(health["control_leader_recent"], false, "{health}");
+        assert_eq!(health["control_leader_known"], false, "{health}");
+
+        // `/admin/live` answers 200 the whole time regardless — sample it
+        // now, with the node in the exact leaderless state just confirmed
+        // above.
+        let (s, live) = admin_get(node.admin_addr(), "/admin/live").await;
+        assert_eq!(
+            s, 200,
+            "liveness must not gate on control leadership: {live}"
+        );
+        assert_eq!(live["ok"], true, "{live}");
+        assert_eq!(
+            live["control_leader_recent"], false,
+            "the diagnostic field mirrors reality even though it never gates the status: {live}"
+        );
+
+        node.shutdown_graceful().await;
     })
     .await
     .expect("test timed out");
