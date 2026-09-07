@@ -1,6 +1,20 @@
 # ADR 0070 — Operator admission webhook
 
-- **Status:** Accepted — implemented (S-07e).
+- **Status:** Accepted — implemented (S-07e). **2026-09-07 amendment**: the
+  `E2E_WEBHOOK=1` leg's first real CI run (PR #703) did find a bug, but in
+  the leg's own script, not the in-cluster deployment shape this ADR
+  anticipated as the more likely source (see the Consequences bullet
+  below) — the rejection/acceptance assertions fired before the webhook
+  Service's Endpoints were populated and kube-proxy had programmed its
+  ClusterIP, so the API server's admission call got `connection refused`,
+  which `failurePolicy: Fail` turned into an `InternalError` the script
+  misread as "the webhook ran and didn't reject". Fixed in
+  `scripts/e2e-kind.sh` (issue #704): a converged-or-timeout wait on the
+  Service's own Endpoints before the `ValidatingWebhookConfiguration` is
+  registered, plus a bounded retry on both assertion probes scoped to that
+  same dial-failure error shape — see
+  `crates/animus-operator/CLAUDE.md`'s e2e section and
+  `docs/engineering-lessons.md`'s issue #704 entry for the full account.
 - **Date:** 2026-09-07
 - **Origin:** `docs/roadmap.md`'s S-07 item e ("Admission webhook validating
   the CRD"), the last item of ADR 0060's own deferred list.
