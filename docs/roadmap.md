@@ -99,8 +99,22 @@ the still-true paragraph after the table.
   atomicity, mirroring `BatchWriteItem`/`BatchGetItem`'s own contract, with
   a per-statement `AccessDenied` (not a whole-request rejection) on a
   denied table. See ADR 0071's "As-built: PR 4" amendment for the full
-  response shape and error-code mapping. `ExecuteTransaction` (PR 5)
-  remains.
+  response shape and error-code mapping. **PR 5** (`ExecuteTransaction`) is
+  implemented too: 1–25 statements parsed with the identical grammar, all-
+  `SELECT` lowered to one `TransactGet` per statement and run as one
+  `TransactGetItems` (each `SELECT` must be an exact-key read — no index,
+  no `ORDER BY`, no non-key `WHERE` term, since `TransactGetItems` has
+  nothing else to lower onto), all-`INSERT`/`UPDATE`/`DELETE` lowered to
+  one `TransactAction` per statement and run as one atomic
+  `TransactWriteItems` (`ClientRequestToken` idempotency and per-statement
+  `CancellationReasons` inherited unchanged from that existing machinery);
+  mixing `SELECT` with a mutation is a `ValidationException`; a
+  transaction statement's own `RETURNING`/`ON CONFLICT DO NOTHING` is
+  rejected rather than honored, since `TransactWriteItems` reports no item
+  image on a successful action and a transaction's condition failure
+  always cancels the whole transaction — see ADR 0071's "As-built: PR 5"
+  amendment. **The W-07 PartiQL train is now fully implemented and
+  complete** — PRs 1–5 all landed; this gap entry is closed.
 
 ---
 

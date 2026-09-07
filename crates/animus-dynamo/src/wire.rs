@@ -639,6 +639,31 @@ pub struct TransactGet {
     pub projection: Option<Projection>,
 }
 
+/// One entry of an `ExecuteTransaction` request (ADR 0071, W-07 PR 5) — AWS's
+/// own `ParameterizedStatement` shape: `Statement`/`Parameters` decoded
+/// exactly like a single [`Operation::ExecuteStatement`] body's own fields,
+/// plus a per-statement `ReturnValuesOnConditionCheckFailure` (real AWS
+/// carries this on `ParameterizedStatement` itself, distinct from the
+/// PartiQL `RETURNING` clause the statement text may carry — see
+/// `animus_dynamo::partiql`'s own "Lowering: ExecuteTransaction" module doc
+/// for why `RETURNING` itself is rejected inside a transaction statement).
+/// No `ConsistentRead` field — a transaction read is always the
+/// linearizable `TransactGetItems` snapshot, matching that operation's own
+/// shape, which has no such field either.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransactStatementRequest {
+    /// The raw PartiQL statement text.
+    pub statement: String,
+    /// Positionally-bound `?` values, decoded like any other
+    /// `AttributeValue` array.
+    pub parameters: Vec<AttributeValue>,
+    /// This statement's own `ReturnValuesOnConditionCheckFailure` — carried
+    /// into the lowered [`TransactAction`]'s own field for a mutation
+    /// statement (`animusd`); meaningless (decoded, ignored) for a `SELECT`
+    /// statement, which never cancels/writes anything of its own.
+    pub rvocf: ReturnValuesOnConditionCheckFailure,
+}
+
 /// `ImportTable`'s `TableCreationParameters` (ADR 0068 §6, S-05 PR 2): the
 /// same shape [`Operation::CreateTable`] decodes (`KeySchema`/
 /// `AttributeDefinitions`/`GlobalSecondaryIndexes`/`BillingMode`+
@@ -1024,6 +1049,36 @@ pub enum Operation {
         /// 0071 §11).
         return_consumed_capacity: ReturnConsumedCapacity,
     },
+    /// `ExecuteTransaction` (ADR 0071, W-07 PR 5): 1..=
+    /// [`EXECUTE_TRANSACTION_MAX_STATEMENTS`] PartiQL statements, run as one
+    /// atomic transaction — reusing ADR 0018 §2's existing 2PC machinery
+    /// unchanged, not a new primitive. An all-`SELECT` transaction lowers
+    /// each statement to one [`TransactGet`] and runs through the exact
+    /// `TransactGetItems` path (`animusd::dynamo::run_transact_get`); a
+    /// transaction of `INSERT`/`UPDATE`/`DELETE` statements lowers each to
+    /// one [`TransactAction`] and runs through the exact `TransactWriteItems`
+    /// path (`run_transact`, `ClientRequestToken` idempotency included). A
+    /// transaction mixing `SELECT` with a mutation is a `ValidationException`
+    /// (AWS: a transaction is all-reads or all-writes) — like
+    /// `ExecuteStatement`, each `statement` is opaque, unparsed text at this
+    /// layer (no catalog here to resolve `FROM "t"` against), so this joins
+    /// its "resolved inside its own handler" group at every exhaustive match
+    /// site (`Operation::table()`, `authz::classify`, `authz::authorize_op`).
+    ExecuteTransaction {
+        /// One entry per statement, in request order — the response echoes
+        /// this same order, one entry each.
+        statements: Vec<TransactStatementRequest>,
+        /// `ClientRequestToken` (ADR 0018's 2026-08-24 amendment): threaded
+        /// straight through to `run_transact`'s own idempotency protocol for
+        /// a write transaction; meaningless (accepted, unused) for an
+        /// all-`SELECT` transaction, which has nothing to deduplicate —
+        /// `TransactGetItems` itself carries no such field either.
+        token: Option<String>,
+        /// Decoded and accepted, but currently never populated (ADR 0071
+        /// §11) — mirrors `ExecuteStatement`/`Query`/`Scan`'s own
+        /// pre-existing gap.
+        return_consumed_capacity: ReturnConsumedCapacity,
+    },
     /// `UpdateTimeToLive` (ADR 0051): declare, change, or disable a table's
     /// TTL attribute. AWS requires `AttributeName` even when `enabled` is
     /// `false` — a disable call must still name the attribute being
@@ -1391,6 +1446,10 @@ impl Operation {
             // statement is individually parsed — joins `ExecuteStatement`'s
             // identical group for the identical reason (ADR 0071, W-07 PR 4).
             | Operation::BatchExecuteStatement { .. }
+            // `ExecuteTransaction` is inherently multi-table too — each of
+            // its own statements names its own table, only known once that
+            // statement is individually parsed (ADR 0071, W-07 PR 5).
+            | Operation::ExecuteTransaction { .. }
             | Operation::ListTables { .. }
             // `DescribeBackup`/`DeleteBackup` address a backup by ARN, not a
             // table name (ADR 0059 §3's own "keyed by backup identity, never
@@ -1895,6 +1954,7 @@ pub fn decode_request(target: &str, body: &[u8]) -> Result<Operation, WireError>
         "TransactGetItems" => decode_transact_get(obj),
         "ExecuteStatement" => decode_execute_statement(obj),
         "BatchExecuteStatement" => decode_batch_execute_statement(obj),
+        "ExecuteTransaction" => decode_execute_transaction(obj),
         "UpdateTimeToLive" => decode_update_time_to_live(obj),
         "DescribeTimeToLive" => Ok(Operation::DescribeTimeToLive {
             table: table_name(obj)?,
@@ -3158,6 +3218,15 @@ pub const TRANSACT_GET_MAX_ITEMS: usize = 100;
 /// rejection already uses).
 pub const BATCH_EXECUTE_STATEMENT_MAX_STATEMENTS: usize = 25;
 
+/// AWS's `ExecuteTransaction` cap: at most 25 statements in one call (ADR
+/// 0071, W-07 PR 5) — distinct from `TransactWriteItems`/`TransactGetItems`'s
+/// own 100-item cap ([`TRANSACT_WRITE_MAX_ACTIONS`]/[`TRANSACT_GET_MAX_ITEMS`]
+/// above), matching AWS's own documented `ExecuteTransaction` limit. Zero
+/// statements is also rejected — an empty `TransactStatements` array is
+/// almost always a client bug, the same reasoning `BatchGetItem`'s
+/// empty-`Keys` rejection already uses.
+pub const EXECUTE_TRANSACTION_MAX_STATEMENTS: usize = 25;
+
 /// Decode a `BatchWriteItem` body: `{"RequestItems": {table: [{PutRequest|
 /// DeleteRequest}, ..], ..}}`. Rejects more than [`BATCH_WRITE_MAX_ITEMS`]
 /// request items total across every table, matching real DynamoDB.
@@ -3507,6 +3576,78 @@ fn decode_batch_execute_statement(obj: &Map<String, Value>) -> Result<Operation,
     let return_consumed_capacity = decode_return_consumed_capacity(obj)?;
     Ok(Operation::BatchExecuteStatement {
         statements,
+        return_consumed_capacity,
+    })
+}
+
+/// Decode an `ExecuteTransaction` body (ADR 0071, W-07 PR 5):
+/// `{"TransactStatements": [{"Statement": .., "Parameters": [..]?,
+/// "ReturnValuesOnConditionCheckFailure": ..?}, ..], "ClientRequestToken":
+/// ..?, "ReturnConsumedCapacity": ..?}`. Rejects an empty `TransactStatements`
+/// array or more than [`EXECUTE_TRANSACTION_MAX_STATEMENTS`], matching real
+/// DynamoDB's own 1..=25 bound.
+fn decode_execute_transaction(obj: &Map<String, Value>) -> Result<Operation, WireError> {
+    let arr = obj
+        .get("TransactStatements")
+        .and_then(Value::as_array)
+        .ok_or_else(|| WireError::validation("missing array field `TransactStatements`"))?;
+    if arr.is_empty() {
+        return Err(WireError::validation(
+            "`TransactStatements` must not be empty",
+        ));
+    }
+    if arr.len() > EXECUTE_TRANSACTION_MAX_STATEMENTS {
+        return Err(WireError::validation(format!(
+            "too many statements in ExecuteTransaction: {} requested, at most \
+             {EXECUTE_TRANSACTION_MAX_STATEMENTS} allowed per call",
+            arr.len()
+        )));
+    }
+    let mut statements = Vec::with_capacity(arr.len());
+    for (i, entry) in arr.iter().enumerate() {
+        let e = entry.as_object().ok_or_else(|| {
+            WireError::validation(format!("`TransactStatements[{i}]` must be an object"))
+        })?;
+        let statement = e
+            .get("Statement")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                WireError::validation(format!(
+                    "`TransactStatements[{i}]` missing string field `Statement`"
+                ))
+            })?
+            .to_owned();
+        let parameters = match e.get("Parameters") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(v) => {
+                let parr = v.as_array().ok_or_else(|| {
+                    WireError::validation(format!(
+                        "`TransactStatements[{i}].Parameters` must be an array"
+                    ))
+                })?;
+                parr.iter()
+                    .enumerate()
+                    .map(|(j, v)| {
+                        decode_attribute_value(
+                            &format!("TransactStatements[{i}].Parameters[{j}]"),
+                            v,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+            }
+        };
+        let rvocf = decode_rvocf(e)?;
+        statements.push(TransactStatementRequest {
+            statement,
+            parameters,
+            rvocf,
+        });
+    }
+    let token = decode_client_request_token(obj)?;
+    let return_consumed_capacity = decode_return_consumed_capacity(obj)?;
+    Ok(Operation::ExecuteTransaction {
+        statements,
+        token,
         return_consumed_capacity,
     })
 }
@@ -5372,6 +5513,23 @@ pub fn transact_get_response(items: &[Option<Item>]) -> String {
     let mut obj = Map::new();
     obj.insert("Responses".into(), Value::Array(responses));
     serde_json::to_string(&Value::Object(obj)).expect("transact-get response serializes")
+}
+
+/// The JSON body for a successful write-shaped `ExecuteTransaction`
+/// (ADR 0071, W-07 PR 5): `{"Responses": [{}, ..]}`, `count` empty entries —
+/// `TransactWriteItems` reports no item image for a successful action (see
+/// `animus_dynamo::partiql`'s "Lowering: ExecuteTransaction" module doc for
+/// why), so unlike [`transact_get_response`] every entry is unconditionally
+/// `{}`. An all-`SELECT` `ExecuteTransaction`'s own response reuses
+/// [`transact_get_response`] verbatim instead — its shape already matches
+/// (`animusd::dynamo::execute_transaction` calls `run_transact_get`
+/// directly and returns its result unchanged).
+#[must_use]
+pub fn execute_transaction_write_response(count: usize) -> String {
+    let responses = vec![Value::Object(Map::new()); count];
+    let mut obj = Map::new();
+    obj.insert("Responses".into(), Value::Array(responses));
+    serde_json::to_string(&Value::Object(obj)).expect("execute-transaction response serializes")
 }
 
 /// The JSON body for a successful `BatchGetItem`: `{"Responses": {"<table>":
@@ -12421,5 +12579,110 @@ mod tests {
         .expect("json");
         assert_eq!(body["Attributes"]["a"]["S"], "v");
         assert_eq!(body["ConsumedCapacity"]["CapacityUnits"], 0.5);
+    }
+
+    // --- `ExecuteTransaction` (ADR 0071, W-07 PR 5) -------------------------
+
+    /// An `ExecuteTransaction` body with `n` `INSERT` statements, each its
+    /// own key.
+    fn execute_transaction_body(n: usize) -> String {
+        let statements: Vec<String> = (0..n)
+            .map(|i| {
+                format!(
+                    r#"{{"Statement":"INSERT INTO t VALUE {{'id': ?}}",
+                        "Parameters":[{{"S":"i{i}"}}]}}"#
+                )
+            })
+            .collect();
+        format!(r#"{{"TransactStatements":[{}]}}"#, statements.join(","))
+    }
+
+    #[test]
+    fn decodes_execute_transaction() {
+        let body = execute_transaction_body(2);
+        let Operation::ExecuteTransaction {
+            statements, token, ..
+        } = decode_request("DynamoDB_20120810.ExecuteTransaction", body.as_bytes()).unwrap()
+        else {
+            panic!("expected ExecuteTransaction");
+        };
+        assert_eq!(statements.len(), 2);
+        assert!(statements[0].statement.contains("INSERT INTO t"));
+        assert_eq!(statements[0].parameters, vec![s("i0")]);
+        assert_eq!(token, None);
+    }
+
+    #[test]
+    fn execute_transaction_decodes_client_request_token() {
+        let body = r#"{"ClientRequestToken":"tok-1",
+            "TransactStatements":[{"Statement":"SELECT * FROM t WHERE pk = ?",
+                                    "Parameters":[{"S":"a"}]}]}"#;
+        let Operation::ExecuteTransaction { token, .. } =
+            decode_request("DynamoDB_20120810.ExecuteTransaction", body.as_bytes()).unwrap()
+        else {
+            panic!("expected ExecuteTransaction");
+        };
+        assert_eq!(token.as_deref(), Some("tok-1"));
+    }
+
+    #[test]
+    fn execute_transaction_decodes_return_values_on_condition_check_failure_per_statement() {
+        let body = r#"{"TransactStatements":[
+            {"Statement":"INSERT INTO t VALUE {'id': ?}","Parameters":[{"S":"a"}],
+             "ReturnValuesOnConditionCheckFailure":"ALL_OLD"},
+            {"Statement":"INSERT INTO t VALUE {'id': ?}","Parameters":[{"S":"b"}]}]}"#;
+        let Operation::ExecuteTransaction { statements, .. } =
+            decode_request("DynamoDB_20120810.ExecuteTransaction", body.as_bytes()).unwrap()
+        else {
+            panic!("expected ExecuteTransaction");
+        };
+        assert_eq!(
+            statements[0].rvocf,
+            ReturnValuesOnConditionCheckFailure::AllOld
+        );
+        // Absent ⇒ NONE, matching AWS's own default.
+        assert_eq!(
+            statements[1].rvocf,
+            ReturnValuesOnConditionCheckFailure::None
+        );
+    }
+
+    #[test]
+    fn execute_transaction_rejects_empty_statements() {
+        let body = r#"{"TransactStatements":[]}"#;
+        let err = decode_request("DynamoDB_20120810.ExecuteTransaction", body.as_bytes())
+            .expect_err("zero statements is a client bug");
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    #[test]
+    fn execute_transaction_accepts_the_cap_and_rejects_one_over_it() {
+        let at_cap = execute_transaction_body(EXECUTE_TRANSACTION_MAX_STATEMENTS);
+        decode_request("DynamoDB_20120810.ExecuteTransaction", at_cap.as_bytes())
+            .expect("exactly the cap (25) is accepted");
+
+        let over_cap = execute_transaction_body(EXECUTE_TRANSACTION_MAX_STATEMENTS + 1);
+        let err = decode_request("DynamoDB_20120810.ExecuteTransaction", over_cap.as_bytes())
+            .expect_err("one over the cap is rejected");
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    #[test]
+    fn execute_transaction_table_is_none_and_write_response_shape() {
+        let body = execute_transaction_body(1);
+        let op = decode_request("DynamoDB_20120810.ExecuteTransaction", body.as_bytes()).unwrap();
+        assert_eq!(op.table(), None);
+
+        let resp = execute_transaction_write_response(3);
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        let responses = v["Responses"].as_array().expect("Responses array");
+        assert_eq!(responses.len(), 3);
+        for entry in responses {
+            assert_eq!(
+                entry.as_object().unwrap().len(),
+                0,
+                "each entry must be {{}}"
+            );
+        }
     }
 }

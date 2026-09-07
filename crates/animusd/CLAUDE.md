@@ -4069,6 +4069,58 @@ route below the edge through the same `ClientCtx` CP primitives.
   real per-statement IAM authorization; see ADR 0071's "As-built: PR 4"
   amendment for the full account and the regression test naming). See that
   amendment for the complete response-shape table and error-code mapping.
+- **`ExecuteTransaction` (ADR 0071, W-07 PR 5, closes the W-07 PartiQL
+  train)** — `dynamo::execute_transaction` is, like `execute_statement`,
+  edge glue rather than a new commit protocol: it parses every one of
+  `TransactStatements` with the identical `partiql::parse_statement`
+  `ExecuteStatement` uses (no new grammar), requires them to be **all**
+  `SELECT` or **all** `INSERT`/`UPDATE`/`DELETE` (a mixed set is a
+  `ValidationException` — AWS: a transaction is all-reads or all-writes),
+  lowers each statement to one `TransactGet`
+  (`partiql::lower_select_to_transact_get`) or one `TransactAction`
+  (`partiql::lower_insert_to_transact_action`/`lower_update_to_transact_
+  action`/`lower_delete_to_transact_action`), and hands the whole batch to
+  the **exact same functions** a client-built `TransactGetItems`/
+  `TransactWriteItems` request already goes through —
+  `run_transact_get`/`run_transact`, unmodified. This is deliberate, not
+  merely convenient: `run_transact`/`run_transact_get` already carry every
+  guarantee this PR's own scope needed (whole-set `authz::
+  authorize_each_table` before anything runs, `ClientRequestToken`
+  idempotency including its ambiguous-outcome handling, per-action
+  `CancellationReasons` correlated by index, duplicate-key-across-
+  statements rejection), so `execute_transaction` needed to write none of
+  it itself. Unlike a `SELECT`-shaped `ExecuteStatement`'s exact
+  partition-key-or-scan flexibility, a `SELECT` **inside a transaction**
+  must be an exact-key read — no named index, no `ORDER BY`, no non-key
+  `WHERE` term — since `TransactGetItems` has no filter/index/order
+  concept to lower onto at all; `lower_select_to_transact_get` reuses PR 3's
+  `lower_exact_key_where` (the same exact-match rule `UPDATE`/`DELETE`
+  already use), not `lower_select`'s partial-key-or-scan rule. A `RETURNING`
+  clause or `ON CONFLICT DO NOTHING` on a transaction statement is rejected
+  at lowering time, not honored or silently dropped — `TransactWriteItems`
+  itself reports no item image on a successful action (only
+  `ReturnValuesOnConditionCheckFailure`, and only on that action's own
+  *cancellation*), and a per-statement conflict-swallow has no meaning once
+  any statement's condition failure cancels the whole transaction anyway;
+  see ADR 0071's "As-built: PR 5" amendment for the full reasoning on both.
+  The wire-level `ReturnValuesOnConditionCheckFailure` field (real AWS
+  `ParameterizedStatement` shape, distinct from the PartiQL `RETURNING`
+  clause just rejected) **is** decoded and threaded through to each lowered
+  `TransactAction`'s own `rvocf` field, so a transaction statement's
+  condition failure can still echo an old image in `CancellationReasons`.
+  `Operation::ExecuteTransaction::table()` is `None` (multi-table, joining
+  `ExecuteStatement`'s "resolved inside its own handler" group) —
+  `execute_transaction` resolves and `reject_internal_table`/`table_known`-
+  checks every statement's table itself, before lowering anything, mirroring
+  `execute_statement`'s own order. Response shape: an all-`SELECT`
+  transaction returns `run_transact_get`'s own `{"Responses": [{"Item": ..}
+  | {}, ..]}` unmodified (it already matches AWS's documented shape); a
+  write transaction's `run_transact` call returns a bare `{}`
+  (`TransactWriteItems`'s own success shape), reshaped into
+  `wire::execute_transaction_write_response`'s `{"Responses": [{}, ..]}` —
+  one empty entry per statement. `ConsumedCapacity` is decoded/accepted but
+  never populated, the identical pre-existing gap `ExecuteStatement`/
+  `Query`/`Scan` already have.
 - **Admin / debug** (`admin.rs`, `RoleAddrs.admin`, ADR 0020) — read-only
   `GET` views + gated `POST` actions + data writes; grep `admin.rs`'s route
   table for the full endpoint inventory. Below the edge it only reads node

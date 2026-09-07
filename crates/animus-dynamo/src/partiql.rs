@@ -48,8 +48,8 @@ use sha2::{Digest, Sha256};
 use crate::capacity::{ReturnConsumedCapacity, ReturnItemCollectionMetrics};
 use crate::condition::{Comparator, ConditionExpression, SortKeyCondition};
 use crate::wire::{
-    Operation, PathSegment, Projection, ReturnValues, Select, UpdateAction, UpdateExpr,
-    UpdateReturnValues, WireError,
+    Operation, PathSegment, Projection, ReturnValues, ReturnValuesOnConditionCheckFailure, Select,
+    TransactAction, TransactGet, UpdateAction, UpdateExpr, UpdateReturnValues, WireError,
 };
 use crate::{AttributeValue, Item};
 
@@ -1561,6 +1561,244 @@ pub fn lower_delete(
 }
 
 // ---------------------------------------------------------------------------
+// Lowering: ExecuteTransaction (ADR 0071 §5's lowering table, W-07 PR 5)
+// ---------------------------------------------------------------------------
+//
+// `ExecuteTransaction` lowers each statement onto one [`TransactGet`] (an
+// all-`SELECT` transaction) or one [`TransactAction`] (an all-mutation one)
+// — never onto a plain [`Operation`], since the whole batch runs through
+// `TransactGetItems`'/`TransactWriteItems`' own existing atomic machinery
+// (`animusd::dynamo::run_transact`/`run_transact_get`), not the single-item
+// dispatcher `lower_select`/`lower_insert`/`lower_update`/`lower_delete`
+// feed. Two deliberate restrictions beyond those functions' own contract,
+// both because `TransactGetItems`/`TransactWriteItems` genuinely cannot
+// express what they'd otherwise allow:
+//
+// - A `SELECT` inside a transaction must be an **exact-key** read (the full
+//   primary key as `=` terms, nothing else) — `TransactGetItems` has no
+//   `FilterExpression`/`KeyConditionExpression` concept at all, only a bare
+//   `Key`, so [`lower_select_to_transact_get`] reuses
+//   [`lower_exact_key_where`] (the same exact-match rule `UPDATE`/`DELETE`
+//   already use) rather than `lower_select`'s partial-key-or-scan rule, and
+//   rejects a named index (`TransactGetItems` reads only a table's own base
+//   primary key) and `ORDER BY` (meaningless for a single-item read).
+// - `RETURNING`/`ON CONFLICT DO NOTHING` are rejected outright inside a
+//   transaction statement, not silently downgraded: `TransactWriteItems`
+//   actions report no item image on a **successful** commit (only
+//   [`ReturnValuesOnConditionCheckFailure`] echoes one, and only when
+//   *that* action is the one whose condition caused a *cancellation*) —
+//   there is nowhere in the whole-or-nothing commit response to put a
+//   `RETURNING ALL OLD *`/`ALL NEW *` echo, so a statement asking for one is
+//   a [`PartiqlError`] naming the reason, never a quiet no-op. Likewise
+//   `ON CONFLICT DO NOTHING`'s per-statement swallow-on-conflict semantics
+//   have no transaction-shaped analogue: a transaction's condition failure
+//   always cancels the *whole* transaction, so there is no single
+//   statement's failure left to swallow in isolation.
+
+/// Lower a parsed `SELECT` onto one [`TransactGet`] for an all-`SELECT`
+/// `ExecuteTransaction` (ADR 0071's lowering table, W-07 PR 5) — see this
+/// section's own module-level doc for why this is
+/// [`lower_exact_key_where`]-shaped rather than [`lower_select`]-shaped.
+///
+/// # Errors
+/// A [`PartiqlError`] when: the placeholder count doesn't match
+/// `parameters.len()`; the statement names an index (`FROM "t"."i"`); it
+/// carries an `ORDER BY`; or `WHERE` doesn't resolve to an exact-match key
+/// with nothing left over (see [`lower_exact_key_where`]).
+pub fn lower_select_to_transact_get(
+    stmt: &SelectStatement,
+    parameters: &[AttributeValue],
+    partition_key: &str,
+    sort_key: Option<&str>,
+) -> Result<TransactGet, PartiqlError> {
+    if stmt.placeholder_count != parameters.len() {
+        return Err(PartiqlError::new(format!(
+            "statement has {} placeholder(s) but Parameters supplied {}",
+            stmt.placeholder_count,
+            parameters.len()
+        )));
+    }
+    if stmt.index.is_some() {
+        return Err(PartiqlError::new(
+            "a SELECT inside ExecuteTransaction cannot query an index — TransactGetItems \
+             reads only a table's own base primary key",
+        ));
+    }
+    if stmt.order_by.is_some() {
+        return Err(PartiqlError::new(
+            "ORDER BY is not supported on a SELECT inside ExecuteTransaction",
+        ));
+    }
+    let (key, filter) =
+        lower_exact_key_where(&stmt.where_terms, parameters, partition_key, sort_key)?;
+    if filter.is_some() {
+        return Err(PartiqlError::new(
+            "a SELECT inside ExecuteTransaction must be an exact-key read: WHERE may only \
+             pin the partition key (and, on a composite table, the sort key) with = — \
+             TransactGetItems has no filter/range concept",
+        ));
+    }
+    Ok(TransactGet {
+        table: stmt.table.clone(),
+        key,
+        projection: build_projection(&stmt.projection),
+    })
+}
+
+/// Lower a parsed `INSERT` onto one [`TransactAction::Put`] for a write
+/// `ExecuteTransaction` (ADR 0071's lowering table, W-07 PR 5) — the same
+/// implicit `attribute_not_exists(pk)` condition [`lower_insert`] builds,
+/// with `rvocf` threaded through from the statement's own wire-level
+/// `ReturnValuesOnConditionCheckFailure` (`animusd` decodes this per
+/// statement, not from the PartiQL text itself — there is no such clause in
+/// this grammar).
+///
+/// # Errors
+/// A [`PartiqlError`] when the placeholder count doesn't match
+/// `parameters.len()`, or the statement carries `ON CONFLICT DO NOTHING`
+/// (see this section's own module doc for why that has no transaction-
+/// shaped analogue).
+pub fn lower_insert_to_transact_action(
+    stmt: &InsertStatement,
+    parameters: &[AttributeValue],
+    partition_key: &str,
+    sort_key: Option<&str>,
+    rvocf: ReturnValuesOnConditionCheckFailure,
+) -> Result<TransactAction, PartiqlError> {
+    if stmt.placeholder_count != parameters.len() {
+        return Err(PartiqlError::new(format!(
+            "statement has {} placeholder(s) but Parameters supplied {}",
+            stmt.placeholder_count,
+            parameters.len()
+        )));
+    }
+    if stmt.on_conflict_do_nothing {
+        return Err(PartiqlError::new(
+            "ON CONFLICT DO NOTHING is not supported inside ExecuteTransaction — a \
+             transaction's condition failure always cancels the whole transaction, so there \
+             is no per-statement swallow semantics to honor",
+        ));
+    }
+    let item: Item = stmt
+        .document
+        .iter()
+        .map(|(k, v)| (k.clone(), lower_value_ast(v, parameters)))
+        .collect();
+    let mut condition = ConditionExpression::AttributeNotExists(partition_key.to_string());
+    if let Some(sk) = sort_key {
+        condition = ConditionExpression::And(
+            Box::new(condition),
+            Box::new(ConditionExpression::AttributeNotExists(sk.to_string())),
+        );
+    }
+    Ok(TransactAction::Put {
+        table: stmt.table.clone(),
+        item,
+        condition: Some(condition),
+        rvocf,
+    })
+}
+
+/// Lower a parsed `UPDATE` onto one [`TransactAction::Update`] for a write
+/// `ExecuteTransaction` (ADR 0071's lowering table, W-07 PR 5) — the same
+/// exact-match key + implicit `attribute_exists(pk)` condition
+/// [`lower_update`] builds.
+///
+/// # Errors
+/// A [`PartiqlError`] when the placeholder count doesn't match
+/// `parameters.len()`, `WHERE` doesn't resolve to an exact-match key (see
+/// [`lower_exact_key_where`]), or the statement carries a `RETURNING`
+/// clause (see this section's own module doc for why that's rejected
+/// rather than silently dropped).
+pub fn lower_update_to_transact_action(
+    stmt: &UpdateStatement,
+    parameters: &[AttributeValue],
+    partition_key: &str,
+    sort_key: Option<&str>,
+    rvocf: ReturnValuesOnConditionCheckFailure,
+) -> Result<TransactAction, PartiqlError> {
+    if stmt.placeholder_count != parameters.len() {
+        return Err(PartiqlError::new(format!(
+            "statement has {} placeholder(s) but Parameters supplied {}",
+            stmt.placeholder_count,
+            parameters.len()
+        )));
+    }
+    if stmt.returning.is_some() {
+        return Err(PartiqlError::new(
+            "RETURNING is not supported inside ExecuteTransaction — TransactWriteItems \
+             reports no item image for a successful action",
+        ));
+    }
+    let (key, filter) =
+        lower_exact_key_where(&stmt.where_terms, parameters, partition_key, sort_key)?;
+
+    let mut condition = ConditionExpression::AttributeExists(partition_key.to_string());
+    if let Some(f) = filter {
+        condition = ConditionExpression::And(Box::new(condition), Box::new(f));
+    }
+
+    let actions = stmt
+        .assignments
+        .iter()
+        .map(|(attr, v)| {
+            UpdateAction::Set(
+                vec![PathSegment::Field(attr.clone())],
+                UpdateExpr::value(lower_value_ast(v, parameters)),
+            )
+        })
+        .collect();
+
+    Ok(TransactAction::Update {
+        table: stmt.table.clone(),
+        key,
+        actions,
+        condition: Some(condition),
+        rvocf,
+    })
+}
+
+/// Lower a parsed `DELETE` onto one [`TransactAction::Delete`] for a write
+/// `ExecuteTransaction` (ADR 0071's lowering table, W-07 PR 5) — the same
+/// exact-match key + no-implicit-condition shape [`lower_delete`] builds.
+///
+/// # Errors
+/// A [`PartiqlError`] when the placeholder count doesn't match
+/// `parameters.len()`, `WHERE` doesn't resolve to an exact-match key (see
+/// [`lower_exact_key_where`]), or the statement carries a `RETURNING`
+/// clause (see this section's own module doc).
+pub fn lower_delete_to_transact_action(
+    stmt: &DeleteStatement,
+    parameters: &[AttributeValue],
+    partition_key: &str,
+    sort_key: Option<&str>,
+    rvocf: ReturnValuesOnConditionCheckFailure,
+) -> Result<TransactAction, PartiqlError> {
+    if stmt.placeholder_count != parameters.len() {
+        return Err(PartiqlError::new(format!(
+            "statement has {} placeholder(s) but Parameters supplied {}",
+            stmt.placeholder_count,
+            parameters.len()
+        )));
+    }
+    if stmt.returning.is_some() {
+        return Err(PartiqlError::new(
+            "RETURNING is not supported inside ExecuteTransaction — TransactWriteItems \
+             reports no item image for a successful action",
+        ));
+    }
+    let (key, filter) =
+        lower_exact_key_where(&stmt.where_terms, parameters, partition_key, sort_key)?;
+
+    Ok(TransactAction::Delete {
+        table: stmt.table.clone(),
+        key,
+        condition: filter,
+        rvocf,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // NextToken (ADR 0071 §9)
 // ---------------------------------------------------------------------------
 
@@ -2528,5 +2766,207 @@ mod tests {
         let tok = crate::wire::base64_encode(&json);
         let err = decode_next_token(&tok, "SELECT * FROM t").unwrap_err();
         assert!(err.message.contains("version"), "{}", err.message);
+    }
+
+    // --- ExecuteTransaction lowering (ADR 0071's lowering table, W-07 PR 5) --
+
+    #[test]
+    fn lowers_select_to_transact_get_simple_key() {
+        let stmt = s("SELECT * FROM t WHERE pk = ?");
+        let params = vec![av_s("k1")];
+        let get = lower_select_to_transact_get(&stmt, &params, "pk", None).expect("lowers");
+        assert_eq!(get.table, "t");
+        assert_eq!(get.key.get("pk"), Some(&av_s("k1")));
+        assert_eq!(get.projection, None);
+    }
+
+    #[test]
+    fn lowers_select_to_transact_get_composite_key_and_projection() {
+        let stmt = s("SELECT a, b FROM t WHERE pk = ? AND sk = ?");
+        let params = vec![av_s("k1"), av_s("s1")];
+        let get = lower_select_to_transact_get(&stmt, &params, "pk", Some("sk")).expect("lowers");
+        assert_eq!(get.key.get("pk"), Some(&av_s("k1")));
+        assert_eq!(get.key.get("sk"), Some(&av_s("s1")));
+        assert!(get.projection.is_some());
+    }
+
+    #[test]
+    fn select_to_transact_get_rejects_a_named_index() {
+        let stmt = s("SELECT * FROM \"t\".\"gsi1\" WHERE pk = ?");
+        let params = vec![av_s("k1")];
+        let err = lower_select_to_transact_get(&stmt, &params, "pk", None).unwrap_err();
+        assert!(err.message.contains("index"), "{}", err.message);
+    }
+
+    #[test]
+    fn select_to_transact_get_rejects_order_by() {
+        let stmt = s("SELECT * FROM t WHERE pk = ? ORDER BY pk");
+        let params = vec![av_s("k1")];
+        let err = lower_select_to_transact_get(&stmt, &params, "pk", None).unwrap_err();
+        assert!(err.message.contains("ORDER BY"), "{}", err.message);
+    }
+
+    #[test]
+    fn select_to_transact_get_rejects_a_non_key_where_term() {
+        let stmt = s("SELECT * FROM t WHERE pk = ? AND region = ?");
+        let params = vec![av_s("k1"), av_s("us")];
+        let err = lower_select_to_transact_get(&stmt, &params, "pk", None).unwrap_err();
+        assert!(err.message.contains("exact-key"), "{}", err.message);
+    }
+
+    #[test]
+    fn select_to_transact_get_rejects_missing_sort_key() {
+        let stmt = s("SELECT * FROM t WHERE pk = ?");
+        let params = vec![av_s("k1")];
+        let err = lower_select_to_transact_get(&stmt, &params, "pk", Some("sk")).unwrap_err();
+        assert!(err.message.contains("sort key"), "{}", err.message);
+    }
+
+    #[test]
+    fn lowers_insert_to_transact_action_put() {
+        let stmt = parse_insert_statement("INSERT INTO t VALUE {'pk': ?, 'a': ?}").unwrap();
+        let params = vec![av_s("k1"), av_s("v1")];
+        let action = lower_insert_to_transact_action(
+            &stmt,
+            &params,
+            "pk",
+            None,
+            ReturnValuesOnConditionCheckFailure::AllOld,
+        )
+        .expect("lowers");
+        match action {
+            TransactAction::Put {
+                table,
+                item,
+                condition,
+                rvocf,
+            } => {
+                assert_eq!(table, "t");
+                assert_eq!(item.get("pk"), Some(&av_s("k1")));
+                assert_eq!(
+                    condition,
+                    Some(ConditionExpression::AttributeNotExists("pk".into()))
+                );
+                assert_eq!(rvocf, ReturnValuesOnConditionCheckFailure::AllOld);
+            }
+            other => panic!("expected TransactAction::Put, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn insert_to_transact_action_rejects_on_conflict_do_nothing() {
+        let stmt =
+            parse_insert_statement("INSERT INTO t VALUE {'pk': ?} ON CONFLICT DO NOTHING").unwrap();
+        let params = vec![av_s("k1")];
+        let err = lower_insert_to_transact_action(
+            &stmt,
+            &params,
+            "pk",
+            None,
+            ReturnValuesOnConditionCheckFailure::None,
+        )
+        .unwrap_err();
+        assert!(err.message.contains("ON CONFLICT"), "{}", err.message);
+    }
+
+    #[test]
+    fn lowers_update_to_transact_action() {
+        let stmt = parse_update_statement("UPDATE t SET a = ? WHERE pk = ?").unwrap();
+        let params = vec![av_s("v1"), av_s("k1")];
+        let action = lower_update_to_transact_action(
+            &stmt,
+            &params,
+            "pk",
+            None,
+            ReturnValuesOnConditionCheckFailure::None,
+        )
+        .expect("lowers");
+        match action {
+            TransactAction::Update {
+                table,
+                key,
+                actions,
+                ..
+            } => {
+                assert_eq!(table, "t");
+                assert_eq!(key.get("pk"), Some(&av_s("k1")));
+                assert_eq!(actions.len(), 1);
+            }
+            other => panic!("expected TransactAction::Update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn update_to_transact_action_rejects_returning() {
+        let stmt =
+            parse_update_statement("UPDATE t SET a = ? WHERE pk = ? RETURNING ALL NEW *").unwrap();
+        let params = vec![av_s("v1"), av_s("k1")];
+        let err = lower_update_to_transact_action(
+            &stmt,
+            &params,
+            "pk",
+            None,
+            ReturnValuesOnConditionCheckFailure::None,
+        )
+        .unwrap_err();
+        assert!(err.message.contains("RETURNING"), "{}", err.message);
+    }
+
+    #[test]
+    fn lowers_delete_to_transact_action() {
+        let stmt = parse_delete_statement("DELETE FROM t WHERE pk = ?").unwrap();
+        let params = vec![av_s("k1")];
+        let action = lower_delete_to_transact_action(
+            &stmt,
+            &params,
+            "pk",
+            None,
+            ReturnValuesOnConditionCheckFailure::None,
+        )
+        .expect("lowers");
+        match action {
+            TransactAction::Delete {
+                table,
+                key,
+                condition,
+                ..
+            } => {
+                assert_eq!(table, "t");
+                assert_eq!(key.get("pk"), Some(&av_s("k1")));
+                assert_eq!(condition, None);
+            }
+            other => panic!("expected TransactAction::Delete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delete_to_transact_action_rejects_returning() {
+        let stmt =
+            parse_delete_statement("DELETE FROM t WHERE pk = ? RETURNING ALL OLD *").unwrap();
+        let params = vec![av_s("k1")];
+        let err = lower_delete_to_transact_action(
+            &stmt,
+            &params,
+            "pk",
+            None,
+            ReturnValuesOnConditionCheckFailure::None,
+        )
+        .unwrap_err();
+        assert!(err.message.contains("RETURNING"), "{}", err.message);
+    }
+
+    #[test]
+    fn transact_action_lowering_rejects_placeholder_count_mismatch() {
+        let stmt = parse_insert_statement("INSERT INTO t VALUE {'pk': ?}").unwrap();
+        let params: Vec<AttributeValue> = vec![];
+        let err = lower_insert_to_transact_action(
+            &stmt,
+            &params,
+            "pk",
+            None,
+            ReturnValuesOnConditionCheckFailure::None,
+        )
+        .unwrap_err();
+        assert!(err.message.contains("placeholder"), "{}", err.message);
     }
 }

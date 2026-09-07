@@ -194,7 +194,8 @@ comment for its full type/method inventory.
   ADR 0057's e2e tests) can produce a real `Authorization` header without
   duplicating the HMAC chain.
 - `partiql` (ADR 0071, W-07 PR 2 `SELECT`; PR 3 `INSERT`/`UPDATE`/`DELETE`;
-  PR 4 `BatchExecuteStatement` — no new grammar, see below)
+  PR 4 `BatchExecuteStatement` — no new grammar; PR 5 `ExecuteTransaction`
+  lowering — see below, closing the W-07 train)
   — the PartiQL subset: a hand-written lexer/parser (no regex/
   parser-combinator crate; W-01's `UpdateExpression` string parser was
   judged **not** to generalise — see the ADR §3), a typed `Statement`
@@ -252,7 +253,45 @@ comment for its full type/method inventory.
   real `Query`-with-filter/`Scan`). `animusd::dynamo::
   execute_one_batch_statement` calls this to reject a range/filtered batch
   `SELECT` as a per-statement error entry without ever executing the
-  forbidden scan.
+  forbidden scan. **PR 5 (`ExecuteTransaction`) adds a second, `TransactGet`/
+  `TransactAction`-shaped lowering path** alongside PR 2/3's `Operation`-
+  shaped one, reusing the identical AST/parser — no new grammar:
+  `lower_select_to_transact_get`/`lower_insert_to_transact_action`/
+  `lower_update_to_transact_action`/`lower_delete_to_transact_action` take
+  the same `(stmt, parameters, partition_key, sort_key)` shape as their
+  `Operation`-producing siblings (plus, for the three mutation lowerers, an
+  `rvocf: ReturnValuesOnConditionCheckFailure` the caller decodes from the
+  statement's own wire-level `ReturnValuesOnConditionCheckFailure` field —
+  distinct from the PartiQL `RETURNING` clause, see below) but build
+  `wire::TransactGet`/`wire::TransactAction` directly, since
+  `ExecuteTransaction` runs the whole batch through `TransactGetItems`/
+  `TransactWriteItems`'s own atomic machinery, never the single-item
+  `Operation` dispatcher. Two restrictions beyond the `Operation`-shaped
+  lowerers' own contract, both because `TransactGetItems`/
+  `TransactWriteItems` genuinely have nothing else to lower onto: a
+  `SELECT` inside a transaction must be an **exact**-key read (reuses
+  `lower_exact_key_where`, PR 3's `UPDATE`/`DELETE` rule — not
+  `lower_select`'s partial-key-or-scan one — and rejects a named index and
+  `ORDER BY` outright); and `RETURNING`/`ON CONFLICT DO NOTHING` are
+  rejected at lowering time rather than honored, since `TransactWriteItems`
+  reports no item image for a successful action and a transaction's
+  condition failure always cancels the whole transaction (no single
+  statement's failure to swallow in isolation) — see ADR 0071's "As-built:
+  PR 5" amendment for the full account of both. `wire.rs` gained the
+  matching wire-decode half: `Operation::ExecuteTransaction`
+  (`TransactStatements`, `ClientRequestToken`, `ReturnConsumedCapacity`),
+  `TransactStatementRequest` (AWS's own `ParameterizedStatement` shape —
+  `Statement`/`Parameters`/`ReturnValuesOnConditionCheckFailure`, no
+  `ConsistentRead`), `decode_execute_transaction`, the
+  `EXECUTE_TRANSACTION_MAX_STATEMENTS` (25, AWS's own `ExecuteTransaction`
+  cap — distinct from `TransactWriteItems`/`TransactGetItems`'s own 100)
+  bound, and `execute_transaction_write_response` (the write-shaped
+  `{"Responses": [{}, ..]}` echo `run_transact`'s own bare `{}` success gets
+  reshaped into at the `animusd` edge — an all-`SELECT` transaction instead
+  reuses `transact_get_response` verbatim, since its shape already
+  matches). `Operation::table()`/`authz::classify`/`authz::authorize_op`
+  each gained one more exhaustive-match arm, joining `ExecuteStatement`'s
+  own "table only known once parsed" group in all three.
 - `ttl` (ADR 0051) — the pure DynamoDB-TTL expiry predicate: `expires_at`
   (an item's declared expiry epoch second under a table's TTL attribute, or
   `None` when the attribute is absent or not a usable `N`) and `is_expired`
@@ -735,7 +774,17 @@ touches a catalog. `wire.rs`'s own unit tests additionally cover
 `BatchExecuteStatement` (ADR 0071, W-07 PR 4): the 1..=25 statement cap,
 per-statement field decoding, `WireError::batch_statement_error_code`'s
 full mapping table, and `batch_execute_statement_response`'s exact JSON
-shape.
+shape. **PR 5** adds the `TransactGet`/`TransactAction`-shaped
+lowering functions' own unit tests alongside: `lower_select_to_transact_get`
+(simple/composite-key exact reads, projection, and its three
+transaction-specific rejections — a named index, `ORDER BY`, and any
+non-key `WHERE` term), `lower_insert_to_transact_action`/
+`lower_update_to_transact_action`/`lower_delete_to_transact_action` (the
+same condition/key shape as their `Operation`-producing siblings, plus
+`ON CONFLICT DO NOTHING`/`RETURNING` rejection and placeholder-count
+mismatch) — end-to-end `ExecuteTransaction` coverage lives in
+`crates/animusd/tests/dynamo_execute_transaction.rs`, plus one whole-set
+`AccessDenied` case in `dynamo_auth_policy.rs`.
 
 `cargo test -p animus-dynamo` — `item_api.rs` over `MemoryEngine`, plus unit
 tests for `wire`/`streams_wire`/`registry`/`schema`/`ttl`

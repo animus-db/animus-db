@@ -119,6 +119,21 @@ pub(crate) fn classify(op: &Operation) -> (&'static str, OpClass) {
         // `run_operation`'s `authorize_op` call on the real, now-concrete
         // `PutItem`/`UpdateItem`/`DeleteItem` operation.
         Operation::BatchExecuteStatement { .. } => ("BatchExecuteStatement", OpClass::Read),
+        // `ExecuteTransaction` (ADR 0071, W-07 PR 5) is the identical shape
+        // one level up: `statements` is a list of opaque, unparsed PartiQL
+        // texts, so this function can't tell an all-`SELECT` transaction
+        // from an all-mutation one any more than `ExecuteStatement` can
+        // tell `SELECT` from `INSERT`/`UPDATE`/`DELETE`. Stays
+        // `OpClass::Read` unconditionally for the same reason — the real
+        // enforcement happens inside `crate::dynamo::execute_transaction`
+        // once every statement is parsed: an all-`SELECT` transaction calls
+        // `run_transact_get` (whose own `authz::authorize_each_table` uses
+        // `OpClass::Read`), and a write transaction calls `run_transact`
+        // (whose own `authorize_each_table` uses `OpClass::Write`) — both
+        // check every named table, whole-set, before anything runs.
+        // `authorize_op` (below) is a deliberate no-op for
+        // `ExecuteTransaction` for the identical reason.
+        Operation::ExecuteTransaction { .. } => ("ExecuteTransaction", OpClass::Read),
         Operation::DescribeTable { .. } => ("DescribeTable", OpClass::Read),
         Operation::DescribeTimeToLive { .. } => ("DescribeTimeToLive", OpClass::Read),
         Operation::ListTagsOfResource { .. } => ("ListTagsOfResource", OpClass::Read),
@@ -219,6 +234,16 @@ pub(crate) fn authorize_op(
         // cross-statement atomicity" contract extends to authorization too:
         // one denied statement must not block its siblings).
         Operation::BatchExecuteStatement { .. } => Ok(()),
+
+        // `ExecuteTransaction`'s tables are only known once every one of
+        // its statements is parsed (ADR 0071, W-07 PR 5) — this function
+        // runs before that parse, so it is a deliberate no-op here too,
+        // joining `ExecuteStatement`'s group. `crate::dynamo::
+        // execute_transaction` authorizes the real target tables itself
+        // (whole-set, via `authz::authorize_each_table` inside
+        // `run_transact`/`run_transact_get`), before any read/write runs,
+        // once parsing has resolved them.
+        Operation::ExecuteTransaction { .. } => Ok(()),
 
         Operation::ListTables { .. } | Operation::DescribeLimits | Operation::DescribeEndpoints => {
             Ok(())
@@ -429,7 +454,8 @@ mod tests {
     use animus_control::OpClass;
     use animus_dynamo::capacity::{ReturnConsumedCapacity, ReturnItemCollectionMetrics};
     use animus_dynamo::wire::{
-        BackupTypeFilter, Operation, ReturnValues, Select, UpdateReturnValues,
+        BackupTypeFilter, Operation, ReturnValues, ReturnValuesOnConditionCheckFailure, Select,
+        TransactStatementRequest, UpdateReturnValues,
     };
     use animus_item::{Item, TableSchema};
 
@@ -828,6 +854,38 @@ mod tests {
                     return_consumed_capacity: ReturnConsumedCapacity::None,
                 },
                 "BatchExecuteStatement",
+                OpClass::Read,
+            ),
+            // ADR 0071 (W-07 PR 5): `ExecuteTransaction`'s own `classify`
+            // row has the identical "can't see inside opaque statement
+            // text" shape as `ExecuteStatement`'s row just above — an
+            // all-`SELECT` transaction and an all-mutation one both
+            // classify `OpClass::Read` here, real enforcement deferred to
+            // `dynamo::execute_transaction` once every statement is parsed.
+            (
+                Operation::ExecuteTransaction {
+                    statements: vec![TransactStatementRequest {
+                        statement: "SELECT * FROM t WHERE pk = ?".to_string(),
+                        parameters: vec![],
+                        rvocf: ReturnValuesOnConditionCheckFailure::None,
+                    }],
+                    token: None,
+                    return_consumed_capacity: ReturnConsumedCapacity::None,
+                },
+                "ExecuteTransaction",
+                OpClass::Read,
+            ),
+            (
+                Operation::ExecuteTransaction {
+                    statements: vec![TransactStatementRequest {
+                        statement: "INSERT INTO t VALUE {'pk':?}".to_string(),
+                        parameters: vec![],
+                        rvocf: ReturnValuesOnConditionCheckFailure::None,
+                    }],
+                    token: None,
+                    return_consumed_capacity: ReturnConsumedCapacity::None,
+                },
+                "ExecuteTransaction",
                 OpClass::Read,
             ),
             (Operation::DescribeLimits, "DescribeLimits", OpClass::Read),

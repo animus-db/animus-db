@@ -902,3 +902,173 @@ unchanged, so `cargo deny check` was not re-run (no new dependency). Given
 this sandbox's own limited disk allowance (~11 GB, PR 3's own note), gates
 ran per-crate rather than as one `cargo test --workspace` sweep, matching
 PR 2/PR 3's own precedent.
+
+## 2026-09-07 amendment — as-built, PR 5 (closing the W-07 train)
+
+PR 5 landed `ExecuteTransaction`, no new grammar — every statement is
+parsed with the existing `parse_statement` (PR 2/3's `SELECT`/`INSERT`/
+`UPDATE`/`DELETE` parsers, unchanged). This closes the W-07 PartiQL train:
+`ExecuteStatement` (PR 2/3), `BatchExecuteStatement` (PR 4), and
+`ExecuteTransaction` (this PR) are all implemented.
+
+### Request/response shape
+
+`{"TransactStatements": [{"Statement": .., "Parameters": [..]?,
+"ReturnValuesOnConditionCheckFailure": ..?}, ..], "ClientRequestToken": ..?,
+"ReturnConsumedCapacity": ..?}` — 1 to 25 statements (AWS's own
+`ExecuteTransaction` cap, distinct from `TransactWriteItems`/
+`TransactGetItems`'s own 100-item cap; `wire::EXECUTE_TRANSACTION_MAX_
+STATEMENTS`); 0 or 26+ is `ValidationException`. Each entry is AWS's own
+`ParameterizedStatement` shape (`wire::TransactStatementRequest`) — no
+`ConsistentRead` field (a transaction read is always the linearizable
+`TransactGetItems` snapshot).
+
+- **All-`SELECT`** → each statement lowers to one `TransactGet`
+  (`partiql::lower_select_to_transact_get`) and the whole set runs through
+  the existing `run_transact_get` (`TransactGetItems`'s own
+  quiescence-confirmed snapshot machinery, ADR 0018 §2/PR7, unchanged).
+  Response: `{"Responses": [{"Item": {..}} | {}, ..]}`, one entry per
+  statement in request order — `wire::transact_get_response`'s own shape,
+  returned **unmodified**, since it already matches `ExecuteTransaction`'s
+  documented response exactly.
+- **All-mutation** (`INSERT`/`UPDATE`/`DELETE`) → each statement lowers to
+  one `TransactAction` (`partiql::lower_insert_to_transact_action`/
+  `lower_update_to_transact_action`/`lower_delete_to_transact_action`) and
+  the whole set runs through the existing `run_transact`
+  (`TransactWriteItems`'s own atomic 2PC, `ClientRequestToken` idempotency
+  included, unchanged). Response: `{"Responses": [{}, ..]}` — `count` empty
+  entries (`wire::execute_transaction_write_response`), since
+  `TransactWriteItems` itself reports no item image on a successful commit.
+- **Mixed** `SELECT` + mutation → `ValidationException` (AWS: a transaction
+  is all-reads or all-writes) — checked once, after every statement is
+  parsed, before any lowering or execution.
+
+### Lowering table (statement → `TransactGet`/`TransactAction`, this PR)
+
+| Statement shape | Target | Key fields |
+|---|---|---|
+| `SELECT` with an exact-key `WHERE` (partition `=`, and sort `=` on a composite table, nothing else) | `TransactGet` | `key` from the exact-match `WHERE` ([`lower_exact_key_where`](#), reused verbatim from PR 3's `UPDATE`/`DELETE` lowering — the mutation-shaped exact-match rule, not `lower_select`'s partial-key-or-scan one); `projection` from the `SELECT` list |
+| `SELECT` naming an index (`FROM "t"."i"`), an `ORDER BY`, or any non-key `WHERE` term | — | `ValidationException` — `TransactGetItems` has no index/order/filter concept at all, only a bare `Key` |
+| `INSERT INTO "t" VALUE {..}` | `TransactAction::Put` | `item` from the document; `condition` the identical `attribute_not_exists(pk)` (`AND attribute_not_exists(sk)` for a composite key) `lower_insert` builds; `rvocf` from the statement's own wire-level `ReturnValuesOnConditionCheckFailure` |
+| `INSERT ... ON CONFLICT DO NOTHING` | — | `ValidationException` — see Deviation 2 below |
+| `UPDATE "t" SET .. WHERE ..` | `TransactAction::Update` | `key`/`actions`/`condition` identical to `lower_update`'s own output |
+| `UPDATE ... RETURNING ..` | — | `ValidationException` — see Deviation 2 |
+| `DELETE FROM "t" WHERE ..` | `TransactAction::Delete` | `key`/`condition` identical to `lower_delete`'s own output (no implicit existence condition) |
+| `DELETE ... RETURNING ..` | — | `ValidationException` — see Deviation 2 |
+
+### Authorization (whole-set, up front)
+
+`animusd::dynamo::execute_transaction` resolves every statement's table
+(`partiql::Statement::table`) and runs `reject_internal_table`/
+`table_known` (→ `ResourceNotFoundException` for an unknown table) for
+each, before lowering anything — mirroring `execute_statement`'s own
+"reject an unknown table before doing anything else" order. The real
+whole-set `AccessDeniedException` enforcement is **inherited, not
+reimplemented**: `run_transact`/`run_transact_get` already call
+`authz::authorize_each_table` (with `OpClass::Write`/`Read` respectively)
+before staging or reading anything, exactly the ADR 0066 §5 contract this
+PR's own scope asked for — `execute_transaction` needed no new
+authorization code, only to delegate to functions that already had it.
+`Operation::ExecuteTransaction::table()` is `None` (multi-table, joining
+`ExecuteStatement`'s group); `authz::classify`'s row is `OpClass::Read`
+unconditionally (the statement kind isn't known until parsed, identical
+reasoning to `ExecuteStatement`'s row); `authz::authorize_op` is a
+deliberate no-op for it, for the same reason. `reject_internal_table` for
+every table happens at the `execute_transaction` edge (`Operation::
+ExecuteTransaction::table()` is `None`) **and** again inside `run_transact`/
+`run_transact_get`'s own per-action loops — the same harmless double-check
+`TransactWriteItems`/`TransactGetItems` already have.
+
+### Deviations from this ADR's original PR 5 plan
+
+1. **A `SELECT` inside a transaction is exact-key only, not `lower_select`'s
+   partial-key-or-scan rule.** The original plan text didn't pin this
+   explicitly; built conservatively, because `TransactGetItems` genuinely
+   has nothing else to lower onto — no `FilterExpression`, no
+   `KeyConditionExpression`, no index, just a bare `Key`. A `SELECT` naming
+   an index, an `ORDER BY`, or any non-key `WHERE` term is a
+   `ValidationException` at lowering time (`lower_select_to_transact_get`),
+   never silently downgraded to a `Scan`-with-filter (which
+   `TransactGetItems` cannot express) or silently narrowed by dropping the
+   extra term.
+2. **`RETURNING`/`ON CONFLICT DO NOTHING` are rejected outright inside a
+   transaction statement**, not honored. The task's own instruction was to
+   accept `RETURNING` "only if the existing `TransactAction` can honor it
+   cheaply" — checked, and it cannot: `TransactAction`'s only per-action
+   echo field is `ReturnValuesOnConditionCheckFailure`, which fires **only
+   on cancellation** (echoing the old image of the one action whose
+   condition caused the whole transaction to cancel), never on a
+   **successful** commit — `TransactWriteItems` itself has no
+   `ReturnValues`-shaped field for a successful action, by AWS's own design
+   (this is real DynamoDB's own behavior, not an adapter gap: an
+   `ExecuteTransaction` write's `Responses` entries are unconditionally
+   empty objects on success, matching what this PR's response shape
+   builds). So a `RETURNING ALL OLD *`/`ALL NEW *` clause on a transaction's
+   `UPDATE`/`DELETE` statement has nowhere to put its answer on the success
+   path — rejected at lowering time (`lower_update_to_transact_action`/
+   `lower_delete_to_transact_action`) with a message naming the reason,
+   never silently dropped. `ON CONFLICT DO NOTHING` has the identical
+   problem one level up: it is a **per-statement** swallow-on-conflict
+   semantics, but a transaction's condition failure always cancels the
+   **whole** transaction — there is no single action's failure left to
+   swallow in isolation once every other action in the same transaction
+   would also be rolled back regardless. Both are conservative "reject
+   rather than guess" calls, consistent with §2's own posture.
+3. **The wire-level `ReturnValuesOnConditionCheckFailure` field is decoded
+   and honored per statement** (`wire::TransactStatementRequest::rvocf`,
+   reusing the existing `decode_rvocf` helper `TransactWriteItems` already
+   has) — this is real AWS `ParameterizedStatement` shape, distinct from
+   the PartiQL `RETURNING` clause Deviation 2 rejects; it feeds the lowered
+   `TransactAction`'s own `rvocf` field unchanged, so a transaction
+   statement's condition failure can still echo an old image in
+   `CancellationReasons`, exactly like a client-built `TransactWriteItems`
+   action.
+4. **No deviation on atomicity, idempotency, or cancellation-reporting** —
+   `run_transact`/`run_transact_get` are called unmodified; every guarantee
+   those functions already have (whole-or-nothing commit, `ClientRequest
+   Token` idempotency including its ambiguous-outcome handling, per-action
+   `CancellationReasons` correlated by index, dedup of a repeated key across
+   statements) applies to `ExecuteTransaction` for free.
+
+### `ConsumedCapacity`
+
+Decoded and accepted (`ReturnConsumedCapacity`), never populated — mirrors
+`ExecuteStatement`/`BatchExecuteStatement`/`Query`/`Scan`'s own
+pre-existing gap (§11), not a PartiQL-specific omission.
+
+### Testing
+
+Unit tests in `partiql.rs`: every new lowering function
+(`lower_select_to_transact_get`/`lower_insert_to_transact_action`/
+`lower_update_to_transact_action`/`lower_delete_to_transact_action`) —
+simple/composite-key `SELECT` lowering, index/`ORDER BY`/non-key-`WHERE`
+rejection, `ON CONFLICT DO NOTHING` rejection, both `UPDATE`/`DELETE`
+`RETURNING` rejections, placeholder-count mismatch. Unit tests in
+`wire.rs`: `ExecuteTransaction` decode (statement/parameter/token/rvocf
+fields, the 1..=25 cap at both ends, `Operation::table()` returning `None`,
+the write-response shape). End-to-end in a new `crates/animusd/tests/
+dynamo_execute_transaction.rs`: an all-write transaction committing
+atomically across two tables; a duplicate-`INSERT` cancelling the whole
+transaction with `CancellationReasons` naming the right index and leaving
+nothing written; an all-`SELECT` transaction returning items and misses in
+request order; mixed `SELECT`+`INSERT` and 0/26-statement
+`ValidationException`s; a `ClientRequestToken` replay returning the cached
+outcome without re-applying; and a follower-connected node executing the
+transaction. `dynamo_auth_policy.rs` gained
+`execute_transaction_spanning_denied_table_writes_nothing` — the identical
+whole-set-`AccessDenied`-writes-nothing proof `BatchWriteItem` already had,
+now for `ExecuteTransaction`.
+
+Gate results (2026-09-07, PR 5): `fmt`/`clippy -D warnings -p animus-dynamo
+-p animusd`/`test -p animus-dynamo`/`test -p animusd --lib`/`test -p
+animusd --test dynamo_execute_transaction` (×3)/`test -p animusd --test
+dynamo_partiql` (×3)/`test -p animusd --test dynamo_txn`/`test -p animusd
+--test dynamo_txn_idempotency`/`test -p animusd --test dynamo_auth_policy`
+all green; `Cargo.lock` unchanged (no new dependency), so `cargo deny check`
+was not re-run. As with PR 2/3, gates ran per-crate rather than as one
+`cargo test --workspace` sweep, given this sandbox's own limited disk
+allowance.
+
+**W-07 (PartiQL) is now complete**: `ExecuteStatement` (`SELECT`/`INSERT`/
+`UPDATE`/`DELETE`), `BatchExecuteStatement`, and `ExecuteTransaction` are
+all implemented, tested, and documented.

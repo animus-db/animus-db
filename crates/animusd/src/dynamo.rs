@@ -176,7 +176,7 @@ use animus_dynamo::capacity::{
 use animus_dynamo::partiql;
 use animus_dynamo::wire::{
     self, MAX_GSI_PER_TABLE, Operation, Projection, ReturnValues, ScanSegment, Select,
-    TransactAction, TransactGet, UpdateAction, WireError, WriteRequest,
+    TransactAction, TransactGet, TransactStatementRequest, UpdateAction, WireError, WriteRequest,
 };
 use animus_dynamo::{
     AttributeValue, ChangeRecord, Comparator, ConditionExpression, Item, SortKeyCondition,
@@ -1223,6 +1223,11 @@ async fn run_operation(
             run_transact(ctx, principal, meta, &actions, token.as_deref()).await
         }
         Operation::TransactGetItems { gets } => run_transact_get(ctx, principal, meta, &gets).await,
+        Operation::ExecuteTransaction {
+            statements,
+            token,
+            return_consumed_capacity: _,
+        } => execute_transaction(ctx, principal, meta, &statements, token.as_deref()).await,
         Operation::UpdateTimeToLive {
             table,
             attribute_name,
@@ -6440,6 +6445,157 @@ async fn execute_statement(
             let raw = Box::pin(run_operation(ctx, principal, op)).await?;
             reshape_write_response_to_execute_statement(&raw)
         }
+    }
+}
+
+/// `ExecuteTransaction` (ADR 0071, W-07 PR 5, closing the W-07 train): parse
+/// every one of `statements` (`animus_dynamo::partiql::parse_statement`,
+/// the identical entry point [`execute_statement`] uses — no new grammar),
+/// require them to be **all** `SELECT` or **all** `INSERT`/`UPDATE`/
+/// `DELETE` (AWS: a transaction is all-reads or all-writes — a mixed set is
+/// a `ValidationException`), lower each statement to one [`TransactGet`]/
+/// [`TransactAction`], and run the whole batch through the exact same
+/// atomic path a client-built `TransactGetItems`/`TransactWriteItems`
+/// request of that shape would take ([`run_transact_get`]/[`run_transact`])
+/// — reusing ADR 0018 §2's 2PC machinery unchanged, never a new commit
+/// protocol. Both of those functions already do the real work this PR's own
+/// authorization/dedup/atomicity requirements need: whole-set
+/// `authz::authorize_each_table` before anything runs, `Transaction request
+/// cannot include multiple operations on one item` for a duplicate key, and
+/// — for a write transaction — `ClientRequestToken` idempotency passed
+/// straight through and `TransactionCanceledException` with
+/// per-statement-indexed `CancellationReasons` on any condition failure.
+///
+/// Every statement's own table is resolved from its parsed `Statement`
+/// (`animus_dynamo::partiql::Statement::table`) and checked against the
+/// replicated catalog ([`table_known`]) up front, mirroring
+/// [`execute_statement`]'s identical "reject an unknown table before doing
+/// anything else" order — a table absent from the catalog is
+/// `ResourceNotFoundException`, not folded into the whole-or-nothing commit
+/// itself. [`reject_internal_table`] runs for every table too, since
+/// `Operation::ExecuteTransaction::table()` is `None` (ADR 0071's own note
+/// there) — this is the per-request check site, mirroring
+/// `BatchGetItem`/`BatchWriteItem`/`run_transact`/`run_transact_get`'s own
+/// shape.
+///
+/// **Response shape**: an all-`SELECT` transaction's response is
+/// [`run_transact_get`]'s own `{"Responses": [{"Item": ..} | {}, ..]}` —
+/// returned unchanged, since it already matches `ExecuteTransaction`'s own
+/// AWS-documented shape exactly. A write transaction's response is
+/// [`wire::execute_transaction_write_response`]: `{"Responses": [{}, ..]}`,
+/// one empty entry per statement — `run_transact`'s own successful return
+/// is a bare `{}` (`TransactWriteItems`'s own shape, ADR 0018 §2/PR7),
+/// reshaped here into the per-statement array `ExecuteTransaction` reports.
+///
+/// **Deviations from ADR 0071's original plan, both documented in the ADR's
+/// own "As-built: PR 5" amendment**: a `SELECT` inside a transaction must be
+/// an *exact*-key read (no `FROM "t"."i"`, no `ORDER BY`, no non-key
+/// `WHERE` term — `TransactGetItems` has no filter/range concept), and a
+/// `RETURNING`/`ON CONFLICT DO NOTHING` clause on a transaction statement is
+/// rejected outright rather than silently dropped or downgraded — see
+/// `animus_dynamo::partiql`'s own "Lowering: ExecuteTransaction" module doc
+/// for the full reasoning on both.
+async fn execute_transaction(
+    ctx: &ClientCtx,
+    principal: &Principal,
+    meta: &Metadata,
+    statements: &[TransactStatementRequest],
+    token: Option<&str>,
+) -> Result<String, WireError> {
+    if statements.is_empty() {
+        return Err(WireError::validation(
+            "ExecuteTransaction requires at least one statement",
+        ));
+    }
+    if statements.len() > wire::EXECUTE_TRANSACTION_MAX_STATEMENTS {
+        return Err(WireError::validation(format!(
+            "ExecuteTransaction supports at most {} statements",
+            wire::EXECUTE_TRANSACTION_MAX_STATEMENTS
+        )));
+    }
+
+    let parsed: Vec<partiql::Statement> = statements
+        .iter()
+        .map(|s| partiql::parse_statement(&s.statement).map_err(WireError::from))
+        .collect::<Result<_, _>>()?;
+
+    let all_select = parsed
+        .iter()
+        .all(|s| matches!(s, partiql::Statement::Select(_)));
+    let any_select = parsed
+        .iter()
+        .any(|s| matches!(s, partiql::Statement::Select(_)));
+    if any_select && !all_select {
+        return Err(WireError::validation(
+            "ExecuteTransaction cannot mix SELECT with INSERT/UPDATE/DELETE statements — a \
+             transaction is all-reads or all-writes",
+        ));
+    }
+
+    for stmt in &parsed {
+        let table = stmt.table();
+        reject_internal_table(table, false)?;
+        if !table_known(ctx, meta, table) {
+            return Err(registry_error(animus_dynamo::RegistryError::NoSuchTable(
+                table.to_string(),
+            )));
+        }
+        mirror_catalog_schema(ctx, meta, table);
+    }
+
+    if all_select {
+        let mut gets = Vec::with_capacity(parsed.len());
+        for (stmt, req) in parsed.iter().zip(statements.iter()) {
+            let partiql::Statement::Select(sel) = stmt else {
+                unreachable!("all_select guarantees every parsed statement is Select")
+            };
+            let base = schema_for(meta, &sel.table);
+            let get = partiql::lower_select_to_transact_get(
+                sel,
+                &req.parameters,
+                &base.partition_key,
+                base.sort_key.as_deref(),
+            )
+            .map_err(WireError::from)?;
+            gets.push(get);
+        }
+        run_transact_get(ctx, principal, meta, &gets).await
+    } else {
+        let mut actions = Vec::with_capacity(parsed.len());
+        for (stmt, req) in parsed.iter().zip(statements.iter()) {
+            let base = schema_for(meta, stmt.table());
+            let action = match stmt {
+                partiql::Statement::Select(_) => {
+                    unreachable!("any_select && !all_select was already rejected above")
+                }
+                partiql::Statement::Insert(ins) => partiql::lower_insert_to_transact_action(
+                    ins,
+                    &req.parameters,
+                    &base.partition_key,
+                    base.sort_key.as_deref(),
+                    req.rvocf,
+                ),
+                partiql::Statement::Update(upd) => partiql::lower_update_to_transact_action(
+                    upd,
+                    &req.parameters,
+                    &base.partition_key,
+                    base.sort_key.as_deref(),
+                    req.rvocf,
+                ),
+                partiql::Statement::Delete(del) => partiql::lower_delete_to_transact_action(
+                    del,
+                    &req.parameters,
+                    &base.partition_key,
+                    base.sort_key.as_deref(),
+                    req.rvocf,
+                ),
+            }
+            .map_err(WireError::from)?;
+            actions.push(action);
+        }
+        let count = actions.len();
+        run_transact(ctx, principal, meta, &actions, token).await?;
+        Ok(wire::execute_transaction_write_response(count))
     }
 }
 

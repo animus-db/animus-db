@@ -696,6 +696,96 @@ async fn batch_execute_statement_denied_table_is_a_per_statement_access_denied()
     .expect("test timed out");
 }
 
+/// (e2) `ExecuteTransaction` spanning an allowed and a denied table is
+/// rejected whole, writing nothing to either table — the identical
+/// whole-set-authorization contract `batch_write_spanning_denied_table_
+/// writes_nothing` proves for `BatchWriteItem`, now for ADR 0071's
+/// PartiQL transaction surface (W-07 PR 5): `execute_transaction` resolves
+/// every statement's table before lowering, and `run_transact`'s own
+/// `authz::authorize_each_table` checks the whole set before anything
+/// stages.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn execute_transaction_spanning_denied_table_writes_nothing() {
+    timeout(Duration::from_secs(30), async {
+        let dir = support::panic_safe_tempdir();
+        let (node, _config) = bring_up(dir.path()).await;
+        let dynamo_addr = node.dynamo_addr();
+        let admin_addr = node.admin_addr();
+
+        for table in ["xact_pol_a", "xact_pol_b"] {
+            let (status, body) = call(
+                dynamo_addr,
+                "DynamoDB_20120810.CreateTable",
+                &create_table_body(table),
+                BOOT_ACCESS_KEY,
+                BOOT_SECRET,
+            )
+            .await;
+            assert_eq!(status, 200, "seed CreateTable {table}: {body}");
+        }
+
+        // Scoped to `xact_pol_a` only, but with write access.
+        let put_body = serde_json::json!({
+            "id": "AKIDXACT",
+            "secret": "s0",
+            "policy": {
+                "tables": {"kind": "names", "names": ["xact_pol_a"]},
+                "ops": ["read", "write"],
+            },
+            "enabled": true,
+        })
+        .to_string();
+        let (status, resp) = admin(admin_addr, "POST", "/admin/credentials", Some(&put_body)).await;
+        assert_eq!(status, 200, "PutCredential: {resp}");
+
+        let txn_body = serde_json::json!({
+            "TransactStatements": [
+                {"Statement": "INSERT INTO xact_pol_a VALUE {'id': ?}",
+                 "Parameters": [{"S": "x"}]},
+                {"Statement": "INSERT INTO xact_pol_b VALUE {'id': ?}",
+                 "Parameters": [{"S": "y"}]},
+            ]
+        })
+        .to_string();
+        let (status, body) = call(
+            dynamo_addr,
+            "DynamoDB_20120810.ExecuteTransaction",
+            &txn_body,
+            "AKIDXACT",
+            "s0",
+        )
+        .await;
+        assert_eq!(status, 400, "transaction spanning a denied table: {body}");
+        let v = json(&body);
+        assert_eq!(
+            v["__type"],
+            "com.amazonaws.dynamodb.v20120810#AccessDeniedException"
+        );
+
+        // Nothing was written to the allowed table either — whole-request
+        // rejection, not partial application.
+        let (status, body) = call(
+            dynamo_addr,
+            "DynamoDB_20120810.GetItem",
+            &get_item_body("xact_pol_a", "x"),
+            BOOT_ACCESS_KEY,
+            BOOT_SECRET,
+        )
+        .await;
+        assert_eq!(status, 200, "GetItem xact_pol_a/x: {body}");
+        let v = json(&body);
+        assert_eq!(
+            v.get("Item"),
+            None,
+            "the allowed table's own item must not have been written: {body}"
+        );
+
+        node.shutdown_graceful().await;
+    })
+    .await
+    .expect("test timed out");
+}
+
 /// (f) The static bootstrap credential remains unrestricted, even with an
 /// empty replicated catalog.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
