@@ -39,6 +39,12 @@ prod = [
 async-trait.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+# Encryption at rest (ADR 0069): `encrypted.rs`'s `EncryptedDisk`/
+# `EncryptedEnv` AEAD wrapper needs these unconditionally (not gated behind
+# `prod`) so `SimEnv`-driven tests/corpora in other crates can exercise it
+# without enabling ProdEnv at all.
+chacha20poly1305.workspace = true
+zeroize.workspace = true
 # Needed only by `prod.rs` (real task spawning, OS randomness, and its
 # `tracing::debug!`/`warn!` diagnostics) — gated by the `prod` feature above
 # rather than declared unconditionally.

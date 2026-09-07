@@ -107,6 +107,7 @@ async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, ClusterConfig)
                     console: a[6 * i + 5],
                     advertise_host: None,
                     tls: None,
+                    encryption_key_path: None,
                 })
                 .collect(),
             dynamo_auth: None,

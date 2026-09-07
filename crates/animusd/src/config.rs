@@ -392,6 +392,7 @@ impl ClusterConfig {
                     console: p(5),
                     advertise_host: None,
                     tls: None,
+                    encryption_key_path: None,
                 }
             })
             .collect();
@@ -429,6 +430,7 @@ impl ClusterConfig {
                     console: p(5),
                     advertise_host: None,
                     tls: None,
+                    encryption_key_path: None,
                 }
             })
             .collect();

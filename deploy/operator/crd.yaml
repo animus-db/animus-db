@@ -78,10 +78,11 @@ spec:
                   `control/member/add` against the newly-promoted ordinals, one voter
                   at a time, resuming idempotently from `GET /admin/control/members`
                   truth across restarts (see `crate::controller`'s own growth
-                  machinery doc). A **decrease** is still rejected outright (a status
-                  condition, [`CONDITION_CONTROL_NODES_SHRINK_REJECTED`], is set; the
-                  field's last-achieved value keeps governing the cluster) since there
-                  is no admission webhook in v1 to reject the write itself and control
+                  machinery doc). A **decrease** is rejected — by the validating
+                  webhook at write time when installed (`crate::webhook`, S-07e/ADR
+                  0070), and always by the reconciler too (a status condition,
+                  [`CONDITION_CONTROL_NODES_SHRINK_REJECTED`], is set; the field's
+                  last-achieved value keeps governing the cluster) — since control
                   voters can only be removed one at a time through their own careful
                   quorum-loss checks (ADR 0037 §2), never inferred from a bare spec
                   edit. An increase above `spec.nodes` is rejected the same way a
@@ -96,6 +97,47 @@ spec:
                   ...}}`, ADR 0057). Mounted read-only at `/etc/animus/dynamo-auth/`
                   and passed as `--dynamo-auth /etc/animus/dynamo-auth/credentials.json`
                   to every pod (both roles accept the flag).
+                nullable: true
+                type: string
+              encryptionKeySecretName:
+                description: |-
+                  Name of a pre-existing `Secret` (same namespace) holding the AEAD
+                  data-at-rest encryption key (ADR 0069, S-03 PR 3) under one
+                  well-known data key,
+                  [`crate::desired::cluster_config::ENCRYPTION_KEY_SECRET_DATA_KEY`]
+                  (`"key"`) — the 64-hex-character format `animus_env::EncryptionKey::
+                  load_from_file` parses (`openssl rand -hex 32 > key.hex` generates
+                  one). **This operator never generates, inspects, or stores key
+                  material itself** — the Secret is entirely user-provisioned; see
+                  `crate::controller`'s reconcile for the live existence/data-key
+                  presence check surfaced as
+                  [`CONDITION_ENCRYPTION_KEY_SECRET_INVALID`].
+
+                  Mounted read-only, `defaultMode` restricted, at
+                  [`crate::desired::cluster_config::ENCRYPTION_KEY_MOUNT_DIR`] on
+                  every pod (one shared Secret, the same idiom `tls`/
+                  `dynamoAuthSecretName`/`s3` already use) and threaded into the
+                  generated `cluster.json`'s `RoleAddrs::encryption_key_path` for
+                  every node — mirroring `spec.tls`'s own `RoleAddrs.tls` wiring,
+                  **never** an `--encryption-key` CLI flag: ADR 0069 PR 1's flag
+                  reaches only `--config FILE --node I`/`--cluster N`, and the
+                  config-file route this field uses already reaches every role this
+                  operator's `entrypoint.sh` ever execs. `None` (default) leaves
+                  every pod's data directory plaintext, byte-for-byte pre-S-03-PR-3
+                  behavior.
+
+                  **No key rotation in v1** (ADR 0069's own stance — there is no
+                  in-place re-encryption mechanism to roll a running pod *into*):
+                  changing the Secret's own *content* under an unchanged name is
+                  invisible to this field and to the config-hash restart annotation
+                  (`desired::statefulset::RestartRelevantConfig`), so it never rolls
+                  pods — correct, not a gap. Adding, removing, or pointing this field
+                  at a *different* Secret name DOES roll every pod: the volume's own
+                  presence/`secretName` is itself a `spec.template` change the
+                  `StatefulSet` controller already diffs on its own, and this field's
+                  own presence (not the secret name) is additionally baked into the
+                  config-hash annotation so an add/remove is never missed even though
+                  nothing else about the pod template would otherwise change.
                 nullable: true
                 type: string
               image:

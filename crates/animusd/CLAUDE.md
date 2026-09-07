@@ -1822,6 +1822,63 @@ acceptor` vs `server_acceptor`) — see this file's "TLS" section below for
 the full design. Omitted (the default), every listener/dialer stays plain
 TCP, byte-identical to before this ADR.
 
+**`--encryption-key PATH` (ADR 0069, S-03 PR 1 and 2)** — this node's own data
+directory encryption key file (`animus_env::EncryptionKey::
+load_from_file`'s format: 64 hex characters, optionally a trailing
+newline; generate one with `openssl rand -hex 32 > key.hex`). Threads to
+`RoleAddrs::encryption_key_path: Option<String>` — **per-node**, mirroring
+`tls`'s own shape (not `dynamo_auth`'s cluster-wide one), since each
+node's disk is independent. `--config FILE --node I`: merged onto that
+one node's own config entry (`apply_encryption_key_flag`, the identical
+"flag and config both set it is a hard error" contract `apply_tls_flag`
+uses). `--cluster N`: the same path applied to every generated node
+(`bind_cluster_with_advertise_host_and_key`) — each still writes to its
+own distinct data directory, so one shared key just means every node's
+disk is sealed under it. **Rejected outright** (a loud `Err`, matching
+`--tls-*`'s own posture) by `--cluster-control`/`--cluster-data`. **Not
+yet accepted** by `animusd control`, `animusd data --config`, `animusd
+data --seed`, or `animusd join` — a documented reach gap, the same shape
+several other per-node flags already have on those entry points (issue
+#676's own precedent). `Node::bind`/`bind_control`/`bind_data` each load
+the key and call the new `ProdEnv::bind_with_tls_and_key` (`bind_with_
+tls`'s general form, `animus-env`) instead of `bind_with_tls` — the loud
+refusal (a key/directory mismatch in either direction) happens inside
+that call, before any listener binds. Omitted (the default), every
+node's disk stays plaintext, byte-for-byte pre-ADR-0069 behavior. See
+`docs/adr/0069-encryption-at-rest.md` for the full design and
+`crates/animus-env/CLAUDE.md`'s `encrypted.rs` entry for the wrapper
+itself; `crates/animusd/tests/encryption_at_rest_e2e.rs` is the real
+`ProdEnv`/disk/DynamoDB-wire regression.
+
+**PR 2 also seals a `SegmentStore`, not just the `Disk` seam**: the same
+`--encryption-key` (loaded once per `Node::bind*`, cloned onto
+`BoundNode`/`BoundControlNode`/`BoundDataNode::encryption_key`) is handed
+to `build_segment_store`/`build_backup_store` (both now `async`), which
+wrap a `--segment-store`/`--backup-store fs:PATH`/`s3://...` store in
+`animus_env::EncryptedSegmentStore` when a key is configured —
+`SegmentStoreHandle`/`BackupStoreHandle` each gained an `EncryptedFs`
+variant for this (the `S3` variant needed no new arm — it already boxes
+`Arc<dyn SegmentStore>`). **Key scope is cluster-wide here, not per-node**
+— unlike a `Disk` file, a backup/PITR/stream-segment object is routinely
+read by a different node than the one that wrote it, so every node
+sharing a given `fs:`/`s3://` store must be configured with the identical
+key file; see `animus_env::EncryptedSegmentStore`'s own module doc and
+the ADR's PR 2 amendment for the full decision (including what a
+mismatched-key node does: refuses loudly at its own startup, before it
+ever binds a listener — never a silent half-encrypted cluster).
+**`SegmentStoreConfig::Cluster`/`BackupStoreConfig::Cluster` (the
+default) are deliberately untouched** — their per-node local
+`FsSegmentStore` building block does raw filesystem I/O outside the
+`Disk` seam entirely, so it was never covered by PR 1 either; encrypting
+it needs widening `ClusterSegmentStore`'s own concrete type parameter, a
+separate, larger change, named as a follow-up rather than done here.
+`crates/animusd/tests/encryption_at_rest_segment_store_e2e.rs` is the
+real `ProdEnv` regression: a 2-node cluster's `CreateBackup` on node 0 →
+`RestoreTableFromBackup` on node 1 with the same key succeeds and the
+shared backup-store directory never holds the plaintext value; a
+differently-keyed node against that same directory, and a keyed node
+against an existing plaintext directory, are both refused at startup.
+
 **`--advertise-host NAME` (ADR 0060's advertise/dial split)** — this
 node's own stable dial name, when its bind address isn't itself something a
 peer can dial reliably (a Kubernetes pod's wildcard/pod-IP bind, whose IP
@@ -3917,6 +3974,66 @@ route below the edge through the same `ClientCtx` CP primitives.
   constants); `dynamo::describe_endpoints` reads `ctx.admin.dynamo_addr` —
   the same field `admin.rs::config_view`'s `addrs.dynamo` already reports —
   for this node's own bound DynamoDB listen address.
+  **`ExecuteStatement` (ADR 0071, W-07 PR 2 `SELECT`; PR 3 `INSERT`/
+  `UPDATE`/`DELETE`)** — `dynamo::execute_statement` is a thin edge glue
+  function, not a new execution path: it parses the PartiQL `Statement`
+  (`animus_dynamo::partiql::parse_statement`, which has no catalog access
+  and dispatches to one of the four per-kind parsers by leading keyword),
+  resolves the target's key attribute **names** from `Metadata` (a
+  `SELECT`'s: the base table's `TableSchema`, or the named index's
+  `IndexDef.hash_attribute`/`sort_attribute` when `FROM "t"."index"` names
+  one; an `INSERT`/`UPDATE`/`DELETE`'s: always the base table's own
+  `TableSchema` — none of the three grammars carry an index `FROM`), and
+  lowers onto the matching `Operation`. A `SELECT` lowers onto
+  `Operation::Query`/`Operation::Scan` (`partiql::lower_select`) and
+  dispatches to `run_query`/`run_scan` directly, unchanged from PR 2 — so
+  it inherits every existing `Query`/`Scan` behavior (GSI/LSI dispatch,
+  `ConsistentRead`'s ADR 0055 path selection, the leader-forwarding a
+  non-hosting node needs) with zero new data-plane code. An `INSERT`/
+  `UPDATE`/`DELETE` (PR 3) lowers onto a **real** `Operation::PutItem`/
+  `UpdateItem`/`DeleteItem` (`partiql::lower_insert`/`lower_update`/
+  `lower_delete`) and runs through `run_operation` itself — the exact
+  dispatcher a client-built `PutItem`/`UpdateItem`/`DeleteItem` request
+  already goes through, so conditions, LSI/GSI index maintenance, DynamoDB
+  Streams change records, and per-table throttling (ADR 0065) are all
+  inherited with zero new write-path code, and `run_operation`'s own
+  `authz::authorize_op` call — keyed on the now-concrete, now-parsed
+  operation, whose `classify` is `OpClass::Write` — is the real
+  enforcement point for a mutation (`authz::classify`'s own
+  `Operation::ExecuteStatement` row stays `OpClass::Read` unconditionally,
+  since it can't see inside unparsed statement text; see that module's own
+  doc comment on the row). `execute_statement` calls `run_operation` from
+  inside one of `run_operation`'s own match arms — a genuine mutual async
+  recursion, resolved with `Box::pin(run_operation(..)).await` at that one
+  call site (the standard technique for a directly/mutually recursive
+  `async fn`'s otherwise-infinite generated `Future` type; only one edge
+  of the cycle needs boxing). Its own job beyond dispatch is small:
+  `Operation::table()` returns `None` for `ExecuteStatement` (the table is
+  only known once `Statement` is parsed, same as `BatchGetItem`/
+  `BatchWriteItem`), so `reject_internal_table` runs once inside
+  `execute_statement` itself instead of at `run_operation`'s shared
+  pre-dispatch gate (a `SELECT`'s `authz::authorize` call is likewise
+  explicit here, unchanged from PR 2; an `INSERT`/`UPDATE`/`DELETE`'s is
+  automatic via `run_operation`, above); and reshaping each op's own
+  response into `ExecuteStatement`'s own shape
+  (`reshape_query_scan_response_to_execute_statement` for `Query`/`Scan` —
+  `{Items, Count, ScannedCount, LastEvaluatedKey?}` → `{Items, NextToken?}`,
+  `LastEvaluatedKey` becoming an opaque `partiql::encode_next_token`-minted
+  `NextToken`, `Count`/`ScannedCount` dropped — no `ExecuteStatement`
+  equivalent; `reshape_write_response_to_execute_statement` for `PutItem`/
+  `UpdateItem`/`DeleteItem` — `{Attributes?, ConsumedCapacity?,
+  ItemCollectionMetrics?}` → `{Items}`, `Attributes` becoming a
+  single-element `Items` array when present, an **empty** one when absent,
+  never omitted). **`INSERT`'s implicit `attribute_not_exists(pk)`
+  condition failure maps to a new `WireError::duplicate_item`
+  (`DuplicateItemException`)** — or is silently swallowed (empty `Items`,
+  no error) when the statement carried `ON CONFLICT DO NOTHING`; every
+  other `ConditionalCheckFailedException` (an `UPDATE`'s implicit
+  `attribute_exists(pk)`, or a non-key `WHERE` term on `UPDATE`/`DELETE`
+  evaluating false) surfaces unchanged. `ConsumedCapacity` is decoded/
+  accepted but never populated for any statement kind, mirroring `Query`/
+  `Scan`/`PutItem`/`UpdateItem`/`DeleteItem`'s own pre-existing gap (not a
+  PartiQL-specific omission — see ADR 0071 §11).
 - **Admin / debug** (`admin.rs`, `RoleAddrs.admin`, ADR 0020) — read-only
   `GET` views + gated `POST` actions + data writes; grep `admin.rs`'s route
   table for the full endpoint inventory. Below the edge it only reads node
@@ -4153,7 +4270,15 @@ ADR itself for the full design/rationale.
   *different* rustls crypto provider is already installed process-wide
   (never actually possible in this process — nothing else in `animusd`
   installs one — but propagated rather than `.expect()`ed, per this repo's
-  no-panic-on-a-remote-possibility discipline).
+  no-panic-on-a-remote-possibility discipline). **Both functions also
+  became `async` in ADR 0069 S-03 PR 2** — the `Fs`/`S3` arms' loud-refusal
+  marker check (`animus_env::verify_or_init_segment_store_marker`/
+  `EncryptedSegmentStore::open`) does real I/O, so this is now the
+  *expected*, not just the theoretical, way either function returns
+  `Err`: a key/store mismatch on `Fs`/`S3` refuses at node startup, before
+  any listener binds. `Cluster` is still infallible (and, since PR 2,
+  still the one variant `--encryption-key` never touches at all — see
+  that ADR's PR 2 amendment for why).
 
   **Credentials are deliberately NOT a `ClusterConfig` field** — see this
   file's own `config.rs` entry above for why a new field there means a

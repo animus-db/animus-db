@@ -1228,3 +1228,50 @@ forwarding the serving pod (the config-hash-triggered rolling restart may
 have recycled the one the script's port-forward was already attached to)
 before a final `GetItem` proves the DynamoDB wire still serves. No new CI
 job.
+
+## Amendment (2026-09-07): S-03 PR 3 — encryption-key `Secret` mount
+
+Closes `docs/roadmap.md`'s S-03 item ("operator key-secret mount"), the
+third and final PR of ADR 0069 (encryption at rest): `spec.
+encryptionKeySecretName: Option<String>` references a pre-existing,
+user-provisioned `Secret` (never one this operator creates or writes,
+mirroring `spec.tls.secretName`/`spec.s3.credentialsSecretName`'s own
+precedent) holding the raw AEAD key under one well-known data key,
+mounted read-only at a fixed path on every pod and threaded into every
+node's own generated `cluster.json` as `RoleAddrs::encryption_key_path`
+(ADR 0069 PR 1's own config-field hook) — the same "one shared `Secret`,
+one fixed mount-path-only `cluster.json` section on every node" shape
+`spec.tls` already established for `RoleAddrs.tls`. Full design, the
+data-key name, the live existence/data-key-presence check, and the
+config-hash interaction are in ADR 0069's own "As-built: PR 3" amendment
+(`docs/adr/0069-encryption-at-rest.md`) — this ADR gets only the
+one-paragraph pointer, per this file's own convention for `spec.tls`
+(ADR 0064) and `spec.s3` (ADR 0059) each getting their design written up
+in their *own* ADR and only a cross-reference here. `crates/
+animus-operator/CLAUDE.md` and `deploy/operator/README.md` carry the
+crate-local/deploy-facing detail; `docs/roadmap.md`'s S-03 section is
+marked complete, with the default `cluster` segment/backup store's own
+gap (issue #680) and ADR 0069's own per-node-flag reach gap (issue #676)
+named as the two open follow-ups, neither of which this PR's own scope
+(the operator's key-secret mount) could close on its own.
+
+## Amendment (2026-09-07): S-07e — validating admission webhook
+
+Closes `docs/roadmap.md`'s S-07 item e, the last item of this ADR's own
+deferred list (Decision, continued — every other deferred bullet landed
+across S-04/S-07b/S-07c/S-07d/S-03, each with its own amendment above):
+`animus-operator` now has an opt-in HTTPS `ValidatingWebhookConfiguration`
+that rejects an invalid `AnimusCluster` write at the API server itself,
+sharing one pure validator (`crate::validate::validate_spec`) with the
+reconciler's own pre-existing condition-based fallback — so the two can
+never disagree about which specs are valid, and a cluster running without
+the webhook (every cluster before this PR, and any that chooses not to
+install it) keeps exactly its pre-existing behavior.
+
+Full design — the shared validator, the webhook server, the two supported
+cert paths, the static-manifest decision, and the e2e leg — is written up
+in its own ADR, per this file's own convention: **[ADR 0070 — Operator
+admission webhook](0070-operator-admission-webhook.md)**. `crates/
+animus-operator/CLAUDE.md` and `deploy/operator/README.md` carry the
+crate-local/deploy-facing detail; `docs/roadmap.md`'s S-07 section is now
+fully closed (items b/c/d/e all landed).

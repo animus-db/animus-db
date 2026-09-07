@@ -519,6 +519,21 @@ to a magic number), so — unlike a corpus whose frozen cells encode a real
 regression's own literal seed — converting the pre-existing hardcoded seed
 lists to name-derived ones changed no test's outcome.
 
+**`tests/lsm_crash_encrypted.rs` (ADR 0069, S-03 PR 1) is `lsm_crash.rs`'s
+encrypted sibling** — the identical corpus doctrine over
+`LsmEngine<EncryptedEnv<SimEnv>>` (`animus_env::EncryptedEnv`, `encrypted.
+rs`), depth knob **`ANIMUS_LSM_ENCRYPTED_SEEDS`** (default 1 = 7 frozen
+cells). Proves what encryption adds beyond plain crash-safety: a torn or
+corrupted write must never partially decrypt (`DiskConfig::torn_tail_on_
+crash`/`corrupt_on_crash` cutting a frame's length prefix, ciphertext, or
+tag at any point still recovers every previously-synced write), a
+wrong/missing key on reopen is the loud refusal (not a panic, not a
+silent open), and — the property the wrapper's *positional*
+torn-tail-vs-corruption rule specifically buys — a mid-file corruption of
+an already-durable frame (`Simulator::corrupt_durable`, no crash at all)
+is a hard error, never a silent loss of the intact frames after it. See
+`animus-env/CLAUDE.md`'s `encrypted.rs` entry for the wrapper design.
+
 `lsm_concurrent.rs` is a **real multi-threaded** regression
 (`#[tokio::test(flavor = "multi_thread")]` over `ProdEnv`, timeout-guarded):
 the deterministic single-threaded `SimEnv` cannot exercise a preemptive

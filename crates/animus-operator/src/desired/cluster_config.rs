@@ -83,6 +83,12 @@ pub struct RoleAddrs {
     pub advertise_host: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<TlsSection>,
+    /// Mirrors `animusd::RoleAddrs::encryption_key_path`'s JSON shape (ADR
+    /// 0069, S-03 PR 3) — a path string, `#[serde(default)]` on the
+    /// `animusd` side. `None` (no `spec.encryptionKeySecretName`) round-trips
+    /// unchanged, byte-for-byte pre-S-03-PR-3 behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encryption_key_path: Option<String>,
 }
 
 /// Mirrors `animusd::config::ClusterSettings`'s JSON shape field-for-field
@@ -195,6 +201,15 @@ pub fn build_cluster_config(name: &str, ns: &str, spec: &AnimusClusterSpec) -> C
     // invalid `spec.tls`; this function itself only cares whether `tls` is
     // present at all.
     let tls = spec.tls.as_ref().map(|_| tls_section());
+    // ADR 0069 S-03 PR 3: every node gets the identical
+    // `encryption_key_path` (pointing at the one `Secret` mounted
+    // identically on every pod) when `spec.encryptionKeySecretName` is set
+    // — the same "one shared mount, one fixed path, baked into every
+    // node's own config entry" shape `tls` above already established.
+    let encryption_key_path = spec
+        .encryption_key_secret_name
+        .as_ref()
+        .map(|_| encryption_key_mount_path());
 
     let nodes = (0..spec.nodes)
         .map(|i| RoleAddrs {
@@ -212,6 +227,7 @@ pub fn build_cluster_config(name: &str, ns: &str, spec: &AnimusClusterSpec) -> C
             console: bind(PORT_CONSOLE),
             advertise_host: Some(super::pod_fqdn(name, ns, i)),
             tls: tls.clone(),
+            encryption_key_path: encryption_key_path.clone(),
         })
         .collect();
 
@@ -314,6 +330,29 @@ pub fn tls_section() -> TlsSection {
         key_path: format!("{TLS_MOUNT_DIR}/tls.key"),
         ca_path: Some(format!("{TLS_MOUNT_DIR}/ca.crt")),
     }
+}
+
+/// The absolute in-container path `spec.encryptionKeySecretName`'s resolved
+/// `Secret` (when set) is mounted at, read-only, `defaultMode` restricted
+/// (ADR 0069, S-03 PR 3) — the same "one shared Secret, every pod" idiom
+/// [`TLS_MOUNT_DIR`]/[`DYNAMO_AUTH_MOUNT_DIR`]/[`S3_MOUNT_DIR`] already use.
+pub const ENCRYPTION_KEY_MOUNT_DIR: &str = "/etc/animus/encryption";
+/// The single well-known data key every `spec.encryptionKeySecretName`
+/// `Secret` must carry the raw key material under (ADR 0069, S-03 PR 3) —
+/// this operator never generates or inspects the key itself, only mounts
+/// this one documented name; projected into [`ENCRYPTION_KEY_MOUNT_DIR`] as
+/// a file of the identical name.
+pub const ENCRYPTION_KEY_SECRET_DATA_KEY: &str = "key";
+
+/// The file path every node's `cluster.json` `RoleAddrs::
+/// encryption_key_path` is set to when `spec.encryptionKeySecretName` is
+/// set (ADR 0069, S-03 PR 3) — [`ENCRYPTION_KEY_MOUNT_DIR`] joined with
+/// [`ENCRYPTION_KEY_SECRET_DATA_KEY`], identical across every pod by
+/// construction, mirroring [`tls_section`]'s own fixed, mount-path-only
+/// shape.
+#[must_use]
+pub fn encryption_key_mount_path() -> String {
+    format!("{ENCRYPTION_KEY_MOUNT_DIR}/{ENCRYPTION_KEY_SECRET_DATA_KEY}")
 }
 
 /// Build the `entrypoint.sh` script every pod runs (`["/bin/sh",
@@ -1158,6 +1197,72 @@ mod tests {
         // Byte-identical across nodes: one shared Secret, not a per-pod one.
         assert_eq!(cfg.nodes[0].tls, cfg.nodes[1].tls);
         assert_eq!(cfg.nodes[1].tls, cfg.nodes[2].tls);
+    }
+
+    // --- `encryption_key_path` (ADR 0069, S-03 PR 3) ---------------------
+
+    #[test]
+    fn encryption_key_path_absent_when_secret_name_unset() {
+        let cfg = build_cluster_config("c", "ns", &spec(3));
+        assert!(cfg.nodes.iter().all(|n| n.encryption_key_path.is_none()));
+        let value: serde_json::Value = serde_json::from_str(&to_json(&cfg)).unwrap();
+        assert!(
+            value["nodes"][0].get("encryption_key_path").is_none(),
+            "expected no encryption_key_path key, got {value}"
+        );
+    }
+
+    #[test]
+    fn encryption_key_path_present_and_identical_on_every_node_when_secret_name_set() {
+        let mut s = spec(3);
+        s.encryption_key_secret_name = Some("my-encryption-key".to_string());
+        let cfg = build_cluster_config("c", "ns", &s);
+        for n in &cfg.nodes {
+            assert_eq!(
+                n.encryption_key_path.as_deref(),
+                Some("/etc/animus/encryption/key")
+            );
+        }
+        // Byte-identical across nodes: one shared Secret, not a per-pod one.
+        assert_eq!(
+            cfg.nodes[0].encryption_key_path,
+            cfg.nodes[1].encryption_key_path
+        );
+        assert_eq!(
+            cfg.nodes[1].encryption_key_path,
+            cfg.nodes[2].encryption_key_path
+        );
+    }
+
+    #[test]
+    fn encryption_key_path_is_the_same_regardless_of_which_secret_name_is_used() {
+        // The mount path is fixed — only the volume's own `secretName`
+        // varies with `spec.encryptionKeySecretName`'s value, never the
+        // in-container path `cluster.json` records (mirrors `tls_section`'s
+        // own fixed-path-only shape).
+        let mut a = spec(1);
+        a.encryption_key_secret_name = Some("secret-a".to_string());
+        let mut b = spec(1);
+        b.encryption_key_secret_name = Some("a-totally-different-secret".to_string());
+        assert_eq!(
+            build_cluster_config("c", "ns", &a).nodes[0].encryption_key_path,
+            build_cluster_config("c", "ns", &b).nodes[0].encryption_key_path
+        );
+    }
+
+    #[test]
+    fn entrypoint_never_emits_an_encryption_key_flag() {
+        // ADR 0069 PR 1's `--encryption-key` flag is never emitted by this
+        // crate: the config-file route (`RoleAddrs::encryption_key_path`)
+        // reaches every role this operator's entrypoint.sh execs, and
+        // emitting the flag on top of a config file whose own node entry
+        // already carries the field would be a hard `animusd` startup
+        // error (the same "one way, not both" contract `--dynamo-auth`
+        // documents for itself).
+        let mut s = spec(3);
+        s.encryption_key_secret_name = Some("my-encryption-key".to_string());
+        let script = entrypoint_script(&s);
+        assert!(!script.contains("--encryption-key"));
     }
 
     #[test]

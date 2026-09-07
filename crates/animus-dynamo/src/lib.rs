@@ -31,6 +31,7 @@ use animus_storage::{StorageEngine, Version};
 
 pub mod capacity;
 pub mod internal_tables;
+pub mod partiql;
 pub mod registry;
 pub mod schema;
 pub mod sigv4;

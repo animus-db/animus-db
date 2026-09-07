@@ -35,14 +35,19 @@ tracing-subscriber.workspace = true
 # the pattern already used for `animus-env`'s `Env`/`StorageEngine` seams
 # elsewhere in the workspace (see `crates/animus-operator/CLAUDE.md`).
 async-trait.workspace = true
-kube = { version = "4.2.0", default-features = false, features = ["runtime", "derive", "client", "rustls-tls"] }
+kube = { version = "4.2.0", default-features = false, features = ["runtime", "derive", "client", "rustls-tls", "admission"] }
 # kube's `rustls-tls` leaves the rustls CryptoProvider choice to the
 # application (rustls 0.23 panics at client build without exactly one
 # provider); main.rs installs ring explicitly.
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 k8s-openapi = { version = "0.28.0", features = ["latest", "schemars"] }
 schemars = "1.2.2"
-hyper = { version = "1.11.0", features = ["client", "http1"] }
+# "server" (S-07e, ADR 0070): the validating admission webhook's own HTTPS
+# listener (`crate::webhook`) needs `hyper::server::conn::http1`, alongside
+# the pre-existing "client"/"http1" this crate's admin-port client
+# (`admin_client.rs`) already used. No new HTTP framework crate — the same
+# `hyper`/`hyper-util` stack `kube::Client` already pulls in.
+hyper = { version = "1.11.0", features = ["client", "http1", "server"] }
 hyper-util = { version = "0.1.20", features = ["client", "client-legacy", "http1", "tokio"] }
 http-body-util = "0.1.5"
 serde_yaml = "0.9.34"
@@ -69,3 +74,10 @@ tower-service = "0.3"
 # but a test still needs its 120 polls x 5s to resolve without 10 minutes of
 # real wall-clock wait.
 tokio = { workspace = true, features = ["test-util"] }
+# The webhook server's own real-socket smoke test (`crate::webhook::tests`,
+# S-07e) needs a real self-signed cert/key pair to build a `TlsAcceptor`
+# over — `rcgen` is already an `[dev-dependencies]` entry elsewhere in this
+# workspace (`animus-env`'s own `prod::tests`) for the identical purpose, so
+# this is not a new dependency, only a new consumer of one already in
+# `Cargo.lock`.
+rcgen = { workspace = true }

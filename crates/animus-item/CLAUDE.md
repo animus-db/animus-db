@@ -45,7 +45,12 @@ spawn a task" — that would reopen exactly the hole ADR 0054 exists to close.
   Fully self-contained (no `crate::` dependencies of its own).
 - `condition` — `SortKeyCondition`/`ConditionExpression`/`Comparator`, the
   decimal bignum helpers (`add_numeric`/`negate_numeric`/`compare_numeric`),
-  and `ConditionError`. Unchanged from `animus-dynamo::condition`.
+  and `ConditionError`. Unchanged from `animus-dynamo::condition`. A second
+  consumer landed here (ADR 0071, W-07 PR 2, unchanged otherwise):
+  `animus-dynamo::partiql`'s `lower_select` builds `Comparator`/
+  `SortKeyCondition`/`ConditionExpression` values **directly** from its own
+  parsed PartiQL AST, never through `animus-dynamo::wire`'s string-expression
+  decoder — see that crate's `CLAUDE.md` for why.
 - `index` (ADR 0041) — the GSI/LSI row-key builders, `IndexFootprint`,
   `ChangeRecord`, and every other byte-layout primitive the write path, the
   GSI drain, and the native index read path agree on. Unchanged from

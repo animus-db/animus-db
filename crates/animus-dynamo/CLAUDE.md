@@ -87,7 +87,12 @@ comment for its full type/method inventory.
   BatchWriteItem/BatchGetItem/TransactWriteItems/TransactGetItems/UpdateTable/
   DescribeTable/DeleteTable/ListTables/UpdateTimeToLive/DescribeTimeToLive/
   TagResource/UntagResource/ListTagsOfResource/DescribeLimits/
-  DescribeEndpoints, plus the response encoders). **Resource tagging
+  DescribeEndpoints/ExecuteStatement, plus the response encoders).
+  `ExecuteStatement` (ADR 0071, W-07) is decoded here (`Statement`/
+  `Parameters`/`ConsistentRead`/`NextToken`/`Limit`/
+  `ReturnConsumedCapacity`) but its `statement` text is opaque at this
+  layer — no catalog to parse it against — so parsing/lowering happens at
+  the `animusd` edge via `partiql::parse_select_statement`/`lower_select`. **Resource tagging
   (roadmap W-06)**: `table_arn`/`parse_table_arn` are this adapter's own
   table-ARN codec (`arn:aws:dynamodb:animus:0:table/<table>`, mirroring
   `stream_arn`/`backup_arn`'s identical placeholder-region/account
@@ -168,6 +173,53 @@ comment for its full type/method inventory.
   each intermediate stage, and so a hand-rolled test signer (`animusd`,
   ADR 0057's e2e tests) can produce a real `Authorization` header without
   duplicating the HMAC chain.
+- `partiql` (ADR 0071, W-07 PR 2 `SELECT`; PR 3 `INSERT`/`UPDATE`/`DELETE`)
+  — the PartiQL subset: a hand-written lexer/parser (no regex/
+  parser-combinator crate; W-01's `UpdateExpression` string parser was
+  judged **not** to generalise — see the ADR §3), a typed `Statement`
+  (`Select`/`Insert`/`Update`/`Delete`) AST with positional `?` →
+  `Parameters` binding, and `lower_select`/`lower_insert`/`lower_update`/
+  `lower_delete` (ADR §4/§5's syntactic key-versus-filter rule), which
+  build `animus_item::condition` `Comparator`/`SortKeyCondition`/
+  `ConditionExpression` values, and `crate::wire::UpdateAction`/`Item`
+  values, **directly** from the AST — never by re-serializing to
+  `KeyConditionExpression`/`FilterExpression`/`UpdateExpression` text and
+  re-parsing through `wire.rs`'s decoders (ADR §5). `parse_statement` is
+  the dispatch entry point (leading keyword → one of the four parsers,
+  returning a `Statement`); `parse_select_statement`/
+  `parse_insert_statement`/`parse_update_statement`/`parse_delete_statement`
+  are the per-kind entry points it's built from, each independently
+  callable. `encode_next_token`/`decode_next_token` mint and verify
+  `ExecuteStatement`'s opaque, versioned, statement-hash-bound pagination
+  cursor (ADR §9, `SELECT` only) — reuses `wire::{encode_item, decode_item,
+  base64_encode, base64_decode, hex_encode_lower}`. Pure and catalog-free
+  like every other module here: every `lower_*` function takes the
+  target's partition/sort key **names** as plain `&str`, resolved by the
+  caller (`animusd`, which holds `Metadata`) — this module never reads a
+  schema. **PR 3's own value grammar is a deliberate, documented widening
+  past what ADR 0071 §1 originally pinned** (`value := "?"` only) — `value
+  := "?" | document | list` lets a nested `{..}`/`[..]` *structure* be
+  written directly in an `INSERT` document or an `UPDATE` assignment, with
+  every **leaf** still a `?` (`ValueAst`, `lower_value_ast`'s recursive
+  resolve) — see ADR 0071's "As-built: PR 3" amendment for the full
+  reasoning (usability, no injection-safety cost — the placeholder-only
+  discipline itself is unchanged). `RETURNING ALL OLD *`/`ALL NEW *`
+  (`UPDATE`, both; `DELETE`, `ALL OLD` only, `ALL NEW` rejected at parse
+  time) is likewise implemented in PR 3 rather than deferred past it, per
+  that same amendment — it maps directly onto `PutItem`/`UpdateItem`/
+  `DeleteItem`'s own pre-existing `ReturnValues`/`UpdateReturnValues`
+  fields, so it cost near nothing once those operations were already the
+  lowering target. `INSERT`'s implicit `attribute_not_exists(pk)`
+  (`AND attribute_not_exists(sk)` for a composite key) and `ON CONFLICT DO
+  NOTHING`'s swallow-on-conflict semantics, and `UPDATE`'s implicit
+  `attribute_exists(pk)`, are built directly into `lower_insert`/
+  `lower_update`'s own `condition` output — `animusd::dynamo::
+  execute_statement` maps the resulting `ConditionalCheckFailedException`
+  to `DuplicateItemException` for `INSERT` (or swallows it under `ON
+  CONFLICT DO NOTHING`) and lets it surface unchanged for `UPDATE`.
+  `DELETE` carries **no** implicit existence condition — deleting an
+  absent key is a silent success, matching plain `DeleteItem`'s own AWS
+  semantics.
 - `ttl` (ADR 0051) — the pure DynamoDB-TTL expiry predicate: `expires_at`
   (an item's declared expiry epoch second under a table's TTL attribute, or
   `None` when the attribute is absent or not a usable `N`) and `is_expired`
@@ -623,6 +675,27 @@ comment for its full type/method inventory.
 `apply_update`'s and the stored-item codec's, into `animus-item`** (they
 moved with the code they test — no assertion changed) — see that crate's
 `CLAUDE.md` Tests section. What follows here describes what stayed.
+
+`cargo test -p animus-dynamo` also covers `partiql` (ADR 0071, W-07 PR 2
+`SELECT`; PR 3 `INSERT`/`UPDATE`/`DELETE`): lexer/parser unit tests for
+every grammar production (including PR 3's document/list value nesting,
+`ON CONFLICT DO NOTHING`, and both `RETURNING` modes), every
+`ValidationException` case (literal values in a `WHERE` term or a
+document/assignment value, placeholder-count mismatch, two partition-key
+(or, PR 3, sort-key) equalities, `ORDER BY` misuse, a missing
+partition/sort-key `WHERE` term on `UPDATE`/`DELETE`, `RETURNING ALL NEW *`
+on `DELETE`, an unrecognized `RETURNING` mode), every lowering row
+(`SELECT`: partition equality → `Query`, no such term → `Scan`-with-filter,
+sort comparators/`BETWEEN`/`begins_with` consumed vs. left as filter,
+projection, index `FROM`; `INSERT`: simple/composite-key implicit
+condition, nested document/list values; `UPDATE`: simple/composite key, a
+non-key `WHERE` term folded into the condition, both `RETURNING` modes;
+`DELETE`: no implicit condition, a non-key `WHERE` term as the condition,
+`RETURNING ALL OLD *`), and `NextToken` round-trip/mismatch/malformed/
+version cases (`SELECT` only — `INSERT`/`UPDATE`/`DELETE` have no
+pagination) — end-to-end coverage against the real wire lives in
+`crates/animusd/tests/dynamo_partiql.rs` instead, since this module never
+touches a catalog.
 
 `cargo test -p animus-dynamo` — `item_api.rs` over `MemoryEngine`, plus unit
 tests for `wire`/`streams_wire`/`registry`/`schema`/`ttl`

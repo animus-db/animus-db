@@ -5,8 +5,8 @@
 //! ```text
 //! animusd gen-config --nodes N [--host H] [--base-port P]   # print a combined-mode cluster config (JSON)
 //! animusd gen-config --control-nodes N --data-nodes M [--host H] [--base-port P] # print a split-deployment config (ADR 0035)
-//! animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH] # run node I of a cluster (one process)
-//! animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH] # run an N-node cluster in one process
+//! animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH] [--encryption-key PATH] # run node I of a cluster (one process)
+//! animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH] [--encryption-key PATH] # run an N-node cluster in one process
 //! animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--dynamo-auth PATH] # run a whole split deployment in one process (ADR 0035)
 //! animusd join --seed ADDR[,ADDR...] [--id NAME] --base-port P [--dir D] [--ephemeral] # seed/join startup (ADR 0032 PR2; ADR 0040 PR4 self-minting if --id is omitted)
 //! animusd control --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] # run node I as a control-only node (ADR 0035 PR3)
@@ -289,8 +289,8 @@ fn otel_instance_label(args: &[String]) -> String {
 const USAGE: &str = "usage:\n  \
     animusd gen-config --nodes N [--host H] [--base-port P]\n  \
     animusd gen-config --control-nodes N --data-nodes M [--host H] [--base-port P]\n  \
-    animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH] [--tls-cert PATH --tls-key PATH --tls-ca PATH]\n  \
-    animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH]\n  \
+    animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH] [--tls-cert PATH --tls-key PATH --tls-ca PATH] [--encryption-key PATH]\n  \
+    animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH] [--encryption-key PATH]\n  \
     animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--dynamo-auth PATH]\n  \
     animusd join --seed ADDR[,ADDR...] [--id NAME] --base-port P [--ip A] [--dir D] [--ephemeral]\n  \
     animusd control --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3]\n  \
@@ -521,6 +521,19 @@ async fn run(args: &[String]) -> Result<(), String> {
     let mut tls_cert: Option<String> = None;
     let mut tls_key: Option<String> = None;
     let mut tls_ca: Option<String> = None;
+    // `--encryption-key PATH` (ADR 0069, S-03 PR 1) — a per-node data
+    // directory encryption key file (64 hex characters, `EncryptionKey::
+    // load_from_file`'s own format). `--config`/`--node`: applied to that
+    // one node's own config entry (`apply_encryption_key_flag`, the same
+    // "flag and config both set it is a hard error" shape `--tls-*`/
+    // `--advertise-host` use). `--cluster N`: applied to every generated
+    // node (each still writes to its own distinct data directory). Absent
+    // (the default) leaves every node's data on disk in plaintext,
+    // byte-for-byte pre-ADR-0069 behavior. **Not yet accepted** by
+    // `--cluster-control`/`--cluster-data`, `animusd control`, `animusd
+    // data`, or `animusd join` — documented reach gaps, the same shape
+    // several other flags on those entry points already have (issue #676).
+    let mut encryption_key_path: Option<String> = None;
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -600,6 +613,9 @@ async fn run(args: &[String]) -> Result<(), String> {
             "--tls-cert" => tls_cert = Some(parse_next(&mut it, "--tls-cert")?),
             "--tls-key" => tls_key = Some(parse_next(&mut it, "--tls-key")?),
             "--tls-ca" => tls_ca = Some(parse_next(&mut it, "--tls-ca")?),
+            "--encryption-key" => {
+                encryption_key_path = Some(parse_next(&mut it, "--encryption-key")?);
+            }
             other => return Err(format!("unknown argument `{other}`")),
         }
     }
@@ -674,6 +690,12 @@ async fn run(args: &[String]) -> Result<(), String> {
                  whose own node entries carry a tls section (ADR 0064)"
                 .into());
         }
+        if encryption_key_path.is_some() {
+            return Err("--encryption-key is not yet supported with \
+                 --cluster-control/--cluster-data — use --config/--node against a config file \
+                 whose own node entries carry an encryption_key_path (ADR 0069)"
+                .into());
+        }
         let control_n = cluster_control.ok_or("--cluster-data also needs --cluster-control N")?;
         let data_n = cluster_data.ok_or("--cluster-control also needs --cluster-data M")?;
         // `--quiesce-after` does not thread through the split-deployment dev
@@ -711,6 +733,7 @@ async fn run(args: &[String]) -> Result<(), String> {
                 advertise_host,
                 tls_flag,
                 export_s3_config.clone(),
+                encryption_key_path,
             )
             .await
         }
@@ -749,6 +772,7 @@ async fn run(args: &[String]) -> Result<(), String> {
                 cli_cluster_settings
                     .shared_wal
                     .unwrap_or(DEFAULT_SHARED_WAL),
+                encryption_key_path,
             )
             .await
         }
@@ -1365,6 +1389,31 @@ fn apply_tls_flag(
     }
 }
 
+/// Merge `--encryption-key PATH` (ADR 0069, S-03 PR 1) onto
+/// `config.nodes[index]`, the identical per-node "flag and config both set
+/// it is a hard error" shape [`apply_tls_flag`] uses.
+fn apply_encryption_key_flag(
+    config: &mut ClusterConfig,
+    index: usize,
+    flag: Option<String>,
+) -> Result<(), String> {
+    let entry = config
+        .nodes
+        .get_mut(index)
+        .ok_or_else(|| format!("node index {index} out of range"))?;
+    match (&entry.encryption_key_path, flag) {
+        (Some(_), Some(_)) => Err(format!(
+            "node {index}'s encryption_key_path is set both in the config file and via \
+             --encryption-key — specify it one way, not both"
+        )),
+        (None, Some(flag)) => {
+            entry.encryption_key_path = Some(flag);
+            Ok(())
+        }
+        (_, None) => Ok(()),
+    }
+}
+
 /// The URL scheme a startup banner should print for a port this node bound
 /// with (`true`) or without (`false`) TLS material (ADR 0064) — every
 /// `println!` banner below that used to hardcode `http` regardless of
@@ -1514,11 +1563,13 @@ async fn run_single(
     advertise_host: Option<String>,
     tls_flag: Option<TlsSection>,
     export_s3: Option<animusd::ExportS3Config>,
+    encryption_key_path: Option<String>,
 ) -> Result<(), String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("reading {path}: {e}"))?;
     let mut config = ClusterConfig::from_json(&text).map_err(|e| format!("parsing {path}: {e}"))?;
     apply_dynamo_auth_flag(&mut config, dynamo_auth_flag)?;
     apply_advertise_host_flag(&mut config, index, advertise_host)?;
+    apply_encryption_key_flag(&mut config, index, encryption_key_path)?;
     // Deliberately NOT re-running `ClusterConfig::validate_tls` after this
     // per-node merge: that check is the whole-file, all-nodes-or-none
     // invariant (already enforced once, above, by `from_json` against the
@@ -1940,6 +1991,10 @@ async fn run_data_join(
         // commit 2) — the flag is this node's only source, set directly
         // with no "set both ways" conflict to check.
         tls: tls_flag,
+        // No `--encryption-key`-equivalent flag on this join path either
+        // (ADR 0069, S-03 PR 1) — a documented reach gap, the same shape
+        // as every other flag this path doesn't yet accept.
+        encryption_key_path: None,
     };
     let dir_name = id
         .as_ref()
@@ -2051,6 +2106,7 @@ async fn run_join(args: &[String]) -> Result<(), String> {
         // wired here — ADR 0064, S-01 commit 2 scope; use `--config`/
         // `--node` against a config file with a `tls` section instead).
         tls: None,
+        encryption_key_path: None,
     };
     let dir_name = id
         .as_ref()
@@ -2101,14 +2157,21 @@ async fn run_in_process_cluster(
     tablet_max_read_units: Option<u64>,
     tablet_max_write_units: Option<u64>,
     shared_wal: bool,
+    encryption_key_path: Option<String>,
 ) -> Result<(), String> {
     if n == 0 {
         return Err("--cluster must be at least 1".into());
     }
     let dir = dir.unwrap_or_else(|| std::env::temp_dir().join("animusd"));
-    let bound = animusd::bind_cluster_with_advertise_host(n, ip, &dir, advertise_host)
-        .await
-        .map_err(|e| format!("failed to bind cluster: {e}"))?;
+    let bound = animusd::bind_cluster_with_advertise_host_and_key(
+        n,
+        ip,
+        &dir,
+        advertise_host,
+        encryption_key_path,
+    )
+    .await
+    .map_err(|e| format!("failed to bind cluster: {e}"))?;
     let nodes = animusd::start_cluster_with_growth_and_quiesce_after(
         bound,
         backend,
@@ -2940,6 +3003,48 @@ mod tests {
     fn apply_tls_flag_rejects_an_out_of_range_index() {
         let mut config = ClusterConfig::generate(1, "127.0.0.1".parse().unwrap(), 7000);
         let err = apply_tls_flag(&mut config, 5, Some(tls_flag_for_test("n5")))
+            .expect_err("index 5 is out of range for a 1-node config");
+        assert!(err.contains("out of range"), "{err}");
+    }
+
+    // --- `--encryption-key PATH` (ADR 0069, S-03 PR 1) ---------------------
+
+    #[test]
+    fn apply_encryption_key_flag_sets_the_named_nodes_entry_only() {
+        let mut config = ClusterConfig::generate(2, "127.0.0.1".parse().unwrap(), 7100);
+        apply_encryption_key_flag(&mut config, 0, Some("key0.hex".to_string()))
+            .expect("applies cleanly");
+        assert_eq!(
+            config.nodes[0].encryption_key_path.as_deref(),
+            Some("key0.hex")
+        );
+        assert!(
+            config.nodes[1].encryption_key_path.is_none(),
+            "only node 0 was targeted"
+        );
+    }
+
+    #[test]
+    fn apply_encryption_key_flag_none_is_a_no_op() {
+        let mut config = ClusterConfig::generate(1, "127.0.0.1".parse().unwrap(), 7100);
+        apply_encryption_key_flag(&mut config, 0, None).expect("None must be a no-op");
+        assert!(config.nodes[0].encryption_key_path.is_none());
+    }
+
+    #[test]
+    fn apply_encryption_key_flag_conflicts_with_a_config_supplied_path() {
+        let mut config = ClusterConfig::generate(1, "127.0.0.1".parse().unwrap(), 7100);
+        config.nodes[0].encryption_key_path = Some("from-config.hex".to_string());
+        let err = apply_encryption_key_flag(&mut config, 0, Some("from-flag.hex".to_string()))
+            .expect_err("config file's own path and the flag must conflict");
+        assert!(err.contains("node 0"), "{err}");
+        assert!(err.contains("one way, not both"), "{err}");
+    }
+
+    #[test]
+    fn apply_encryption_key_flag_rejects_an_out_of_range_index() {
+        let mut config = ClusterConfig::generate(1, "127.0.0.1".parse().unwrap(), 7100);
+        let err = apply_encryption_key_flag(&mut config, 5, Some("key5.hex".to_string()))
             .expect_err("index 5 is out of range for a 1-node config");
         assert!(err.contains("out of range"), "{err}");
     }

@@ -10,6 +10,7 @@ own `CLAUDE.md` for the controller's design.
 kubectl apply -f deploy/operator/crd.yaml       # AnimusCluster CRD
 kubectl apply -f deploy/operator/rbac.yaml       # namespace + ServiceAccount + ClusterRole(Binding)
 kubectl apply -f deploy/operator/deployment.yaml # the operator Deployment
+# kubectl apply -f deploy/operator/webhook.yaml  # OPTIONAL: validating admission webhook (S-07e, ADR 0070) — see its own section below before applying this
 ```
 
 `crd.yaml` is generated output — regenerate it with `animus-operator crd`
@@ -234,6 +235,68 @@ credentials, so the pod's already-mounted data volume is all that's
 involved. Reaches only **combined-role pods**, the same pre-existing
 `animusd` gap `spec.s3` documents above.
 
+## Encryption at rest (ADR 0069, S-03 PR 3)
+
+`spec.encryptionKeySecretName` names a pre-existing `Secret` (same
+namespace) holding the AEAD data-at-rest encryption key `animusd` itself
+implements (ADR 0069, S-03 PR 1/2) — this operator only ever *mounts* it,
+the same "referenced, never created" idiom `spec.tls.secretName`/
+`spec.s3.credentialsSecretName` already use:
+
+```sh
+openssl rand -hex 32 | kubectl create secret generic my-encryption-key \
+  --from-file=key=/dev/stdin
+```
+
+```yaml
+spec:
+  encryptionKeySecretName: my-encryption-key
+```
+
+The Secret must carry the raw 64-hex-character key under the single
+well-known data key **`key`** — the operator never generates, reads, or
+validates the key's own bytes, only that this data key is present. It is
+mounted read-only, `defaultMode` restricted (world-readable, no write bit
+— this pod sets no `securityContext.fsGroup`, so the non-root `animus`
+container user still needs the "other" read bit to load it), at
+`/etc/animus/encryption/` on every pod, and every generated node's
+`cluster.json` gets `RoleAddrs.encryption_key_path` pointing at
+`/etc/animus/encryption/key` — mirroring `spec.tls`'s own
+`RoleAddrs.tls` wiring exactly, never a `--encryption-key` CLI flag.
+
+**Validated live, not just by shape**: since a `Secret` *reference* can't
+be checked from the spec alone, the controller reads it back through the
+Kubernetes API on every reconcile and sets an `EncryptionKeySecretInvalid`
+status condition naming exactly what's wrong if it doesn't exist yet or
+is missing the `key` data key. Unlike `TlsSpecInvalid`/`S3SpecInvalid`/
+`StoreSpecInvalid`, this check does **not** strip the field and fall back
+to "as if unset" — doing so would regenerate a plaintext `cluster.json`
+for a cluster whose data directory may already be encrypted, which would
+roll every pod straight into `animusd`'s own loud "no key against an
+encrypted directory" startup refusal. A genuinely missing `Secret`
+instead just leaves the pod `ContainerCreating` until it's created —
+harmless and self-healing.
+
+**No key rotation in v1** (ADR 0069's own stance — there is no in-place
+re-encryption mechanism): changing the `Secret`'s own *content* under an
+unchanged name never rolls any pod, by design — rotating means standing
+up a fresh, differently-keyed replica and letting Raft catch it up, then
+decommissioning the old one, the identical story `spec.tls`'s own
+"replace the replica, don't rotate in place" cert-rotation posture
+already tells. Adding, removing, or pointing this field at a *different*
+`Secret` name **does** roll every pod (a `spec.template` change either
+way — the volume's own presence/`secretName`, and, for add/remove, this
+field's own presence baked into the config-hash restart annotation).
+
+**Only the `fs:`/`s3://` opt-in backup/segment stores and per-node
+`Disk` files (WAL/engine data) are covered — the default replicated
+`cluster` store is not** (tracked as
+[issue #680](https://github.com/animus-db/animus-db/issues/680), a
+separate, larger change to `animus-cp-data`'s own `ClusterSegmentStore`,
+not something this operator's mount can influence either way). See ADR
+0069's "As-built: PR 3" amendment for the full design and its own
+threat-model/scope-cut notes.
+
 ## PodDisruptionBudget (S-07c)
 
 Every `AnimusCluster` gets a `{name}-pdb` `PodDisruptionBudget` selecting
@@ -270,15 +333,15 @@ operator drives ADR 0037's `control/member/add` against the
 newly-promoted ordinals, one voter at a time, until the control group
 itself confirms each one (`GET /admin/control/members`), surfacing
 progress as a `ControlNodesGrowing` status condition while it's in
-flight. A **decrease** is still rejected (a status condition,
-`ControlNodesShrinkRejected`, is set) rather than applied, since v1 ships
-no admission webhook to reject the write itself and control voters can
-only be removed one at a time through their own careful quorum-loss
-checks (ADR 0037 §2), never inferred from a bare spec edit. See ADR
-0060's own "Control-voter growth (S-07d, 2026-09-06)" section for the
-full design (the live-truth-driven sequence, why role-promotion needs a
-restart, the `SocketAddr` gap this works around, and how a controller
-restart resumes).
+flight. A **decrease** is rejected — by the validating webhook at write
+time when it's installed (see "Admission webhook" below), and always by
+the reconciler too (a status condition, `ControlNodesShrinkRejected`, is
+set) — since control voters can only be removed one at a time through
+their own careful quorum-loss checks (ADR 0037 §2), never inferred from a
+bare spec edit. See ADR 0060's own "Control-voter growth (S-07d,
+2026-09-06)" section for the full design (the live-truth-driven sequence,
+why role-promotion needs a restart, the `SocketAddr` gap this works
+around, and how a controller restart resumes).
 
 **Growing `controlNodes` restarts every pod, not just the promoted
 one.** Regenerating the config that drives the role split requires a
@@ -291,15 +354,129 @@ applies to *any* config-affecting field, not just `controlNodes` —
 `spec.dynamoAuthSecretName`/`spec.quiesceAfterSecs`/`spec.autoSplitBytes`
 all now trigger a rolling restart when changed too, where they previously
 sat unapplied on already-running pods until an unrelated restart.
+`spec.encryptionKeySecretName` joins this list too (S-03 PR 3) — but only
+its own *presence* (add/remove), never a same-name content rotation; see
+the "Encryption at rest" section above.
+
+## Admission webhook (S-07e, ADR 0070)
+
+An opt-in `ValidatingWebhookConfiguration` that rejects an invalid
+`AnimusCluster` write at the API server itself, instead of admitting it and
+letting the reconciler fall back to a status condition (every rule below is
+the *identical* pure check either way — `crate::validate::validate_spec`,
+shared by the reconciler and the webhook, so the two can never disagree
+about which specs are valid):
+
+- `spec.nodes >= 1`.
+- `spec.controlNodes` (resolved against its own `min(3, nodes)` default) is
+  between `1` and `spec.nodes`.
+- `spec.controlNodes` never decreases from its previously-accepted value —
+  the grow-only rule (S-07d) above, enforced here at write time using the
+  request's own `oldObject` on an UPDATE.
+- `spec.tls` sets exactly one of `secretName`/`certManager`.
+- `spec.s3` is internally consistent (at least one store set, a non-empty
+  `credentialsSecretName`, a well-formed store URI, `insecureHttp` opted in
+  correctly).
+- `spec.backupStore`/`spec.segmentStore` are each syntactically valid and
+  don't conflict with `spec.s3`.
+
+**Not covered — and never will be**: whether a referenced `Secret` (`spec.tls
+.secretName`, `spec.s3.credentialsSecretName`, `spec.encryptionKeySecretName`,
+`spec.dynamoAuthSecretName`) actually exists. That check needs a live
+Kubernetes API call, and this webhook is deliberately fast and side-effect
+free — see `crate::webhook`'s own module doc for why a slower or less
+reliable webhook, combined with `failurePolicy: Fail` below, would turn
+directly into cluster-wide write unavailability. Those checks stay
+reconciler-only, with their own status-condition fallback, exactly as
+before this webhook existed.
+
+### Turning it on
+
+1. **Get a cert/key pair into the operator pod.** Two supported ways:
+   - **cert-manager** (what `deploy/operator/webhook.yaml` assumes by
+     default): cert-manager itself must already be installed, plus an
+     `Issuer`/`ClusterIssuer` (this operator never creates either — same
+     prerequisite as the AnimusCluster-facing TLS section above). Generate
+     the webhook's own `Certificate` with:
+     ```sh
+     cargo run -p animus-operator -- webhook-cert \
+       --namespace animus-operator \
+       --service animus-operator-webhook \
+       --issuer-name my-cluster-issuer \
+       --issuer-kind ClusterIssuer \
+       | kubectl apply -f -
+     ```
+     (this reuses the exact builder an `AnimusCluster`'s own
+     `spec.tls.certManager` uses, `crate::desired::certificate::
+     build_standalone`, generalized for a cluster-independent object — see
+     that module's own doc). `webhook.yaml`'s `ValidatingWebhookConfiguration`
+     carries a `cert-manager.io/inject-ca-from` annotation, so `cainjector`
+     fills in `caBundle` automatically once the `Certificate` is `Ready` —
+     nothing else to do.
+   - **Without cert-manager**: issue a `kubernetes.io/tls` `Secret` named
+     `animus-operator-webhook-tls` yourself (any CA — self-signed is fine,
+     since nothing but the API server ever dials this port) and place it in
+     the `animus-operator` namespace. Then, in `webhook.yaml`: delete the
+     `Certificate` object and the `cert-manager.io/inject-ca-from`
+     annotation, and set `webhooks[].clientConfig.caBundle` to your CA
+     certificate's own base64-encoded PEM bytes (`base64 -w0 ca.crt`).
+2. **Uncomment the webhook block in `deployment.yaml`** — the `args:`
+   block naming `--webhook-addr`/`--webhook-cert`/`--webhook-key`, the
+   matching `containerPort`, the `volumeMounts` entry, and the pod-level
+   `volumes` entry naming the `Secret` from step 1 (`animus-operator-
+   webhook-tls` either way — cert-manager's own `Certificate.spec.
+   secretName` writes to that same name).
+3. **Apply `webhook.yaml`** (after `deployment.yaml`, so the `Service` it
+   creates has a pod to select) and confirm the webhook is reachable:
+   ```sh
+   kubectl apply -f deploy/operator/deployment.yaml
+   kubectl apply -f deploy/operator/webhook.yaml
+   kubectl get validatingwebhookconfiguration animus-operator-validating-webhook -o yaml
+   # caBundle should be non-empty once cainjector (or your own kubectl
+   # patch, for the static-Secret path) has filled it in.
+   ```
+4. **Try an invalid write** — it should be rejected by the API server
+   itself, not merely surfaced as a status condition:
+   ```sh
+   kubectl patch animuscluster example --type merge -p '{"spec":{"nodes":0}}'
+   # error: admission webhook "validate.animuscluster.animusdb.io" denied
+   # the request: spec.nodes: spec.nodes (0) must be at least 1
+   ```
+
+### Why a static manifest, not something the operator creates itself
+
+`webhook.yaml`'s `Service`/`ValidatingWebhookConfiguration` are static,
+hand-applied objects — the operator's reconcile loop never creates,
+updates, or watches either — matching `deployment.yaml`/`rbac.yaml`'s own
+precedent (this repo ships no Kustomize/Helm layer; every manifest here is
+already applied by hand or by a deployment pipeline outside this
+operator's own control). The alternative — the operator self-registering
+its own `ValidatingWebhookConfiguration` at startup — was considered and
+rejected: it would need new RBAC on a cluster-scoped
+`admissionregistration.k8s.io` resource (a strictly larger blast radius
+than anything this operator's `ClusterRole` grants today, since a bug
+there could rewrite webhook admission rules cluster-wide, not just this
+operator's own child objects) for a one-time, rarely-changing object with
+no natural reconcile cadence — there is nothing to converge repeatedly the
+way an `AnimusCluster`'s children need to. A static manifest, applied once
+and re-applied only when this file's own contents change, is the simpler
+and more auditable choice; see ADR 0070 for the full decision record.
 
 ## Testing
 
-`cargo test -p animus-operator` is the pure `desired`-builder unit suite —
-no cluster needed. `scripts/e2e-kind.sh` (`.github/workflows/e2e-kind.yml`,
-CI-gated) is the cluster-driven end-to-end complement: a real `kind`
-cluster through create → bootstrap → scale → delete, with the DynamoDB
-wire exercised throughout — see `crates/animus-operator/CLAUDE.md`'s own
-e2e section for what it does and does not prove.
+`cargo test -p animus-operator` is the pure `desired`-builder unit suite,
+plus `crate::webhook`'s own handler tests (an `AdmissionReview` decoded and
+run through the handler in code, no socket) and one real-socket TLS smoke
+test — no cluster needed for any of it. `scripts/e2e-kind.sh`
+(`.github/workflows/e2e-kind.yml`, CI-gated) is the cluster-driven
+end-to-end complement: a real `kind` cluster through create → bootstrap →
+scale → delete, with the DynamoDB wire exercised throughout — see
+`crates/animus-operator/CLAUDE.md`'s own e2e section for what it does and
+does not prove. `E2E_WEBHOOK=1` runs an additional leg proving the webhook
+actually rejects a bad write at the API server — see that section's own
+`E2E_WEBHOOK` entry for exactly what it deploys and asserts, and why it
+runs the operator **in-cluster** rather than the plain leg's
+out-of-cluster `cargo run`.
 
 ## What the operator does not do (yet)
 

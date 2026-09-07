@@ -65,6 +65,32 @@ the still-true paragraph after the table.
   (4) Batch; (5) ExecuteTransaction. **Size:** XL.
 - **Depends:** soft: reuse W-01's `UpdateExpression` tokenizer (landed
   2026-09-04) if it generalises.
+- **Status (2026-09-07):** PR 1, PR 2, and PR 3 landed. ADR
+  [0071](adr/0071-partiql-subset.md) pins the grammar, the placeholder-only
+  discipline, and the key-versus-filter lowering rule; concludes the W-01
+  tokenizer does *not* generalise, a hand-written lexer instead. PR 2 adds
+  `ExecuteStatement` with a PartiQL `SELECT` subset
+  (`crates/animus-dynamo/src/partiql.rs`), lowered onto `Operation::Query`/
+  `Operation::Scan` by building `animus-item::condition` types directly
+  from the parsed AST (not by round-tripping through `wire.rs`'s string
+  decoders), with an opaque versioned/statement-hashed `NextToken`. **PR 3**
+  adds `INSERT`/`UPDATE`/`DELETE`, lowered onto real `Operation::PutItem`/
+  `UpdateItem`/`DeleteItem` values and run through the exact same
+  `run_operation` dispatcher a client-built request of that shape already
+  uses (`animusd::dynamo::execute_statement`) — conditions, index
+  maintenance, streams, and throttling are all inherited with no new
+  write-path code. `INSERT`'s implicit `attribute_not_exists(pk)` maps a
+  `ConditionalCheckFailedException` to a new `DuplicateItemException` (or
+  swallows it under `ON CONFLICT DO NOTHING`); `UPDATE`'s implicit
+  `attribute_exists(pk)` fails a missing item; `DELETE` has no implicit
+  condition (matching plain `DeleteItem`'s own silent-no-op-on-missing-key
+  semantics). **A conservative widening past PR 1's own original scope**:
+  `RETURNING ALL OLD *`/`ALL NEW *` (`UPDATE`, both; `DELETE`, `ALL OLD`
+  only) is implemented in PR 3 rather than deferred, since it costs nothing
+  beyond wiring the statement's own clause onto the already-existing
+  `ReturnValues`/`UpdateReturnValues` fields — see ADR 0071's "As-built: PR
+  3" amendment. `BatchExecuteStatement` (PR 4) and `ExecuteTransaction`
+  (PR 5) remain.
 
 ---
 
@@ -72,42 +98,121 @@ the still-true paragraph after the table.
 
 ### S-03 Encryption at rest
 
-- **Gap:** not mentioned anywhere in the docs.
-- **Plan:** decide `Disk`-seam byte-level AES-GCM in `ProdEnv`
-  (`animus-env/src/lib.rs:435`) versus LSM block-level in
-  `animus-storage`; per-node key file (same pattern as `--dynamo-auth
-  PATH`); `SegmentStore`/`FsSegmentStore` (`lib.rs:581`) get the same
-  treatment for backup, PITR, and stream objects.
-- **Tests:** `assert_segment_store_contract` (`animus-env/src/test_support.rs`)
-  encrypted round-trip; LSM crash corpus under `SimEnv` faults (a torn
-  write must never partially decrypt).
-- **ADR:** **yes** — new number; seam choice and key management.
-- **PRs:** (1) key loading + `Disk` wrapper for WAL/engine; (2)
-  `SegmentStore`; (3) operator key secret mount. **Size:** XL (interacts
-  with the `Disk` seam's fsync/durability contract).
-- **Depends:** was sequenced after S-02 specifically to avoid three crypto
-  ADRs in review at once; S-02 ([ADR 0066](adr/0066-sigv4-hardening.md))
-  landed 2026-09-05, so this item is unblocked.
+- **Status: complete — all 3 PRs landed** ([ADR 0069](adr/0069-encryption-at-rest.md),
+  PR 1/2 2026-09-06, PR 3 2026-09-07) — key loading + a generic AEAD `Disk`-seam wrapper
+  (`EncryptedDisk<D: Disk, R: Rng>`/`EncryptedEnv<E: Env>`,
+  `crates/animus-env/src/encrypted.rs`), a per-node `--encryption-key
+  PATH`/`RoleAddrs::encryption_key_path` key file (the `--dynamo-auth`/
+  `--tls-cert` pattern), and a marker-file loud refusal on a key/directory
+  mismatch. `ProdEnv` composes the same primitives internally rather than
+  becoming `EncryptedEnv<ProdEnv>` — see the ADR's "Crate placement"
+  section for why. **PR 2** adds the `SegmentStore`-seam sibling
+  (`EncryptedSegmentStore<S: SegmentStore, R: Rng>`,
+  `crates/animus-env/src/encrypted_segment_store.rs`), sealing each
+  object as a whole standalone frame (reusing PR 1's frame codec) rather
+  than an `EncryptedDisk`-style incremental one, wired into
+  `--backup-store`/`--segment-store fs:PATH`/`s3://...` via `animusd`'s
+  `build_segment_store`/`build_backup_store` — but under a
+  **cluster-wide, not per-node, key** (every node sharing a `fs:`/`s3://`
+  store must configure the identical key file), since a backup/PITR/
+  stream-segment object is routinely read by a *different* node than the
+  one that wrote it, unlike a `Disk` file. Both PRs reach `--config FILE
+  --node I` and `--cluster N`; `--cluster-control`/`--cluster-data`,
+  `animusd control`, `animusd data`, and `animusd join` do not yet accept
+  the flag (a documented reach gap, the same shape several other per-node
+  flags already have on those entry points).
+- **PR 3 — operator key-secret mount, landed 2026-09-07**:
+  `spec.encryptionKeySecretName: Option<String>` (`crates/animus-operator`)
+  names a pre-existing `Secret` holding the raw key under one well-known
+  data key (`"key"`), mounted read-only (`defaultMode` restricted) at
+  `/etc/animus/encryption` on every pod and threaded into every node's
+  `cluster.json` as `RoleAddrs::encryption_key_path` — mirroring
+  `spec.tls`'s own `RoleAddrs.tls` wiring. Checked live against the API
+  server (a `Secret` reference can't be validated from the spec alone,
+  unlike `spec.tls`/`spec.s3`); a missing/malformed `Secret` surfaces an
+  `EncryptionKeySecretInvalid` condition without stripping the field —
+  see ADR 0069's own "As-built: PR 3" amendment for why falling back to
+  "as if unset" here would be actively dangerous, not merely inert. No
+  key rotation support (matching ADR 0069's own v1 scope): the config-hash
+  restart annotation rolls pods on the field's *presence* changing, never
+  on the same-named `Secret`'s content changing. **S-03 is now complete.**
+- **Still open (tracked separately, neither closable from S-03's own
+  scope):**
+  - **Issue #680** — the default replicated `cluster` segment/backup store
+    is not covered by PR 2 — its per-node local building block does its
+    own raw filesystem I/O outside the `Disk` seam, so PR 1 never touched
+    it either; only the `fs:`/`s3://` opt-in stores are sealed. Encrypting
+    it would mean widening `ClusterSegmentStore`'s own concrete type
+    parameter — a separate, structurally larger change than PR 2's own
+    scope, tracked here rather than silently assumed done.
+  - **Issue #676** — `animusd join`/`data --seed`/`--cluster-control`+
+    `--cluster-data` don't thread `--encryption-key` (among several other
+    per-node knobs) through to those entry points; a real gap for a
+    hand-run cluster using them, irrelevant to the operator (which never
+    generates those invocations).
+- **Tests (PR 1):** `crates/animus-sim/tests/encrypted_disk.rs` (14 direct
+  unit tests over `SimEnv`); `crates/animus-storage/tests/
+  lsm_crash_encrypted.rs` (the crash/fault corpus sibling of
+  `lsm_crash.rs`, depth knob `ANIMUS_LSM_ENCRYPTED_SEEDS`); `crates/
+  animusd/tests/encryption_at_rest_e2e.rs` (real `ProdEnv`/disk/DynamoDB
+  wire); `crates/animus-env/src/prod.rs`'s own real-filesystem unit tests.
+- **Tests (PR 2):** the shared `SegmentStore` contract against
+  `EncryptedSegmentStore<SimSegmentStore, SimEnv>`
+  (`crates/animus-sim/src/segment_store.rs`),
+  `EncryptedSegmentStore<FsSegmentStore, DiskSaltRng>`
+  (`crates/animus-env/src/prod.rs`), and
+  `EncryptedSegmentStore<S3SegmentStore<FakeS3>, R>`
+  (`crates/animus-env/src/s3_store.rs`); a new fault-injection corpus,
+  `crates/animus-test/tests/segment_store_encrypted_fault_corpus.rs`
+  (depth knob `ANIMUS_SEGMENT_STORE_ENCRYPTED_SEEDS`, held at 20 — proves
+  the wrapper tolerates every fault the backup/PITR/export-import domain
+  corpora already inject through `SimSegmentStore`, without converting
+  those three ~2,400-line corpora themselves, a named follow-up); and
+  `crates/animusd/tests/encryption_at_rest_segment_store_e2e.rs` (real
+  `ProdEnv`, a real 2-node cluster, `CreateBackup` on node 0 →
+  `RestoreTableFromBackup` on node 1 with the same key, plus both
+  mismatch directions refused at node startup).
+- **Tests (PR 3):** unit tests over the operator's own fakes, mirroring the
+  `dynamo_auth`/`tls` precedents (`crates/animus-operator/src/desired/
+  cluster_config.rs`, `desired/statefulset.rs`, `controller.rs`); the
+  `scripts/e2e-kind.sh` `E2E_ENCRYPTION=1` leg
+  (`.github/workflows/e2e-kind.yml`'s `e2e-kind-encryption` job) — see
+  ADR 0069's "As-built: PR 3" amendment for the full list and its own
+  unverified-in-this-sandbox note.
+- **ADR:** [0069](adr/0069-encryption-at-rest.md) — seam choice, key
+  management, threat model, the positional torn-tail-vs-corruption rule,
+  (PR 2 amendment) the cluster-wide key-scope decision, and (PR 3
+  amendment) the operator's CRD field shape, mount, and failure semantics.
+- **PRs:** (1) key loading + `Disk` wrapper for WAL/engine — **landed**;
+  (2) `SegmentStore` — **landed**; (3) operator key secret mount —
+  **landed 2026-09-07**. **Size:** XL (interacts with the `Disk` seam's
+  fsync/durability contract). **S-03 is complete.**
 
-### S-07 Operator hardening (ADR 0060 deferred list)
+### S-07 Operator hardening (ADR 0060 deferred list) — landed 2026-09-07, complete
 
-- **e. Admission webhook** validating the CRD. Needs a webhook TLS cert —
-  the prerequisite this used to be sequenced behind is done: TLS on every
-  port ([ADR 0064](adr/0064-tls-on-every-port.md)) shipped in full,
-  including this crate's own cert-manager `Certificate` builder and CRD
-  shape (`spec.tls.certManager`) a webhook's own cert-issuance can reuse
-  directly. No longer blocked; open to pick up on its own schedule. Size L.
-- **ADR:** e gets its own section or a new number if the webhook design
-  grows. (Item b — `backupStore`/`segmentStore` CRD fields for the non-S3
-  `cluster`/`fs:`/`dir:` forms — landed 2026-09-06, see ADR 0060's own
-  "Amendment (2026-09-06): S-07b" section; `spec.s3` already covers the
-  `s3://...` form, ADR 0060's S-04 PR 3 amendment. Item c — quorum-derived
-  `PodDisruptionBudget` builder, no CRD field added — landed 2026-09-06,
-  see ADR 0060's own "Amendment (2026-09-06): S-07c" section. Item d —
-  `controlNodes` growth via the CRD, driving ADR 0037 `control/member/add`
-  one voter at a time and a config-hash pod-template restart mechanism —
-  landed 2026-09-06, see ADR 0060's own "Amendment (2026-09-06): S-07d"
-  section.)
+- **e. Admission webhook** validating the CRD — landed 2026-09-07: a pure,
+  shared validator (`crate::validate::validate_spec`) the reconciler's own
+  condition-based fallback and a new opt-in `ValidatingWebhookConfiguration`
+  both call, an HTTPS webhook server in the same `animus-operator` binary
+  (`--webhook-addr`/`--webhook-cert`/`--webhook-key`), and its own TLS cert
+  via a generalized cert-manager `Certificate` builder (`animus-operator
+  webhook-cert`) or a hand-issued `Secret` — see [ADR 0070](
+  adr/0070-operator-admission-webhook.md).
+- **ADR:** e got its own number, [ADR 0070](
+  adr/0070-operator-admission-webhook.md), per this section's own "or a new
+  number if the webhook design grows" allowance — a shared validator, a
+  TLS server, two cert paths, and a static manifest was more than a
+  section-in-0060 could carry cleanly. (Item b — `backupStore`/
+  `segmentStore` CRD fields for the non-S3 `cluster`/`fs:`/`dir:` forms —
+  landed 2026-09-06, see ADR 0060's own "Amendment (2026-09-06): S-07b"
+  section; `spec.s3` already covers the `s3://...` form, ADR 0060's S-04
+  PR 3 amendment. Item c — quorum-derived `PodDisruptionBudget` builder, no
+  CRD field added — landed 2026-09-06, see ADR 0060's own "Amendment
+  (2026-09-06): S-07c" section. Item d — `controlNodes` growth via the
+  CRD, driving ADR 0037 `control/member/add` one voter at a time and a
+  config-hash pod-template restart mechanism — landed 2026-09-06, see ADR
+  0060's own "Amendment (2026-09-06): S-07d" section.) **This closes
+  S-07's whole item list (b/c/d/e all landed).**
 
 ---
 
@@ -218,7 +323,7 @@ wave are independent and can run in parallel.
 | 3 | *U-05, U-07, U-08(ii) landed 2026-09-06* | No ordering constraint remains |
 | 4 | *landed 2026-09-05* (S-02) | Highest blast radius (C-01 landed 2026-09-05 — see ADR 0054; S-01 landed 2026-09-05 — see ADR 0064; S-02 — see ADR 0066) |
 | 5 | *S-04, S-05, S-07b–d, C-02, C-05 all landed 2026-09-06* | S-05 strictly after S-04 |
-| 6 | S-03, S-07e, W-07, C-03 | XL or gated on earlier waves (S-07e's webhook-TLS prerequisite is satisfied now that S-01 landed; no longer a hard gate, just unscheduled) |
+| 6 | *S-03 complete 2026-09-07 (all 3 PRs, ADR 0069)*; *S-07e/S-07 complete 2026-09-07 (ADR 0070)*; W-07, C-03 | XL or gated on earlier waves |
 
 Open issues mapped: none left (#375 closed by W-01, #319 by W-05). Filed
 from wave 2's own findings: #590 (the operator still emits the deleted

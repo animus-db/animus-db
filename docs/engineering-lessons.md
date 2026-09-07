@@ -20067,3 +20067,388 @@ find it is to read the applicability claim against the code that's
 supposed to honor it, the same "grep the code, don't trust the prose"
 discipline root `CLAUDE.md`'s own closing convention already names for a
 different kind of drift.
+
+## Composing an `Env`/`Disk` wrapper *inside* the concrete env it wraps creates a self-referential `Arc` cycle unless the wrapped-side state is deliberately kept independent (ADR 0069, encryption at rest)
+
+`ProdEnv` is `Clone`-cheap because it is one `Arc<Inner>` handle; every
+clone shares the same `Inner`. The natural way to add encryption to its
+`Disk` impl looked like: store an `EncryptedDisk<ProdEnv, ProdEnv>` (disk
++ rng both supplied by `ProdEnv` itself) as a field on `Inner`. That is a
+genuine reference cycle: `Inner` (behind `Arc`) would own an
+`EncryptedDisk` that owns a `ProdEnv` clone, which is itself another
+`Arc<Inner>` pointing at the *same* `Inner` — the strong-count never
+drops to zero, so the whole node's `Inner` (sockets, peer book, metrics,
+everything) leaks for the life of the process, invisible until a test
+loop that constructs many short-lived `ProdEnv`s (a temp-dir-per-attempt
+retry loop, a corpus, a long test suite) shows unbounded memory growth.
+
+**General form**: before storing "a wrapper over `Self`" as a field on a
+type that is itself an `Arc`-backed handle, check whether the wrapper's
+generic parameters actually need `Self` — or just a narrower capability
+`Self` happens to provide (here: real OS randomness for a per-file salt,
+not literally `ProdEnv`'s full `Disk`/`Network`/`Clock` surface). The fix
+was a minimal, purpose-scoped type (`DiskSaltRng`, a zero-sized `Rng`
+implementor drawing from the identical `OsRng` source `ProdEnv`'s own
+`Rng` impl and `PreBindRng` already use) instead of reusing `ProdEnv`
+itself — it satisfies the generic bound with no reference back to
+`Inner` at all, so no cycle is possible by construction rather than by
+discipline. The same shape generalizes: a type wrapping `Self` inside its
+own `Arc`-shared state is worth a five-second "does this actually need
+the whole handle, or just one capability off it" check before writing the
+field.
+
+## A crash-torn-tail-vs-real-corruption distinction converged independently on the same rule an existing sibling layer already uses — a signal the rule is right, not a coincidence to ignore (ADR 0069, encryption at rest)
+
+Building the AEAD frame-index scanner for encryption at rest
+(`animus-env/src/encrypted.rs`), the question was: when a frame in an
+already-marker-verified (so provably correctly-keyed) file fails to parse
+or authenticate, is that a torn tail (safe to truncate and forget) or
+real corruption of already-durable bytes (which must be a hard error, or
+silent data loss follows for every intact frame that happened to sit
+after the corrupted one)? The answer arrived at — continue scanning past
+a failure using its own still-intact length field purely to check whether
+anything *valid* follows; nothing valid after it means a genuine tear
+(truncate), something valid after it means real corruption (refuse) —
+was derived independently, before rereading `animus-storage`'s own
+hand-rolled WAL-record codec.
+
+It turned out `lsm.rs`'s own doc already states the identical rule for
+its own, unrelated CRC32-framed WAL records, in almost the same words:
+"distinguishing a legitimate crash-torn trailing record from real
+corruption is not a magnitude check on the frame — it's positional... a
+bad frame *followed* by more valid frames can only be corruption of
+previously-durable data (a crash cannot reach past the tear point)."
+Two independently-designed framing layers, at different levels of the
+stack, converged on the same rule because the rule follows directly from
+what a crash physically *can* and *cannot* do to a file (only ever tear
+the true end; never leave valid bytes downstream of where it stopped) —
+not from either format's own specifics. **General form**: when a new
+framed/chunked on-disk format needs a torn-tail recovery rule, check
+whether a sibling format in the same codebase already solved the
+identical positional question — a match is strong validation the
+answer is right, not merely convenient; a mismatch is worth understanding
+before shipping either design as the codebase's convention.
+
+## A long single-session build/test loop needs proactive disk-space discipline, not just cleanup-on-failure (this session, ADR 0069)
+
+Iterating on this crate's own encryption-at-rest work — dozens of
+`cargo build`/`cargo test` invocations across several crates, each
+producing its own debug-symbol-heavy artifacts — silently exhausted the
+sandbox's root filesystem mid-build (`rustc-LLVM ERROR: IO failure on
+output stream: No space left on device`), and the failure mode compounded:
+once the disk is fully out of space, even the *tool harness's own*
+temp-output capture for a trivial `df -h` command fails
+(`ENOSPC` writing to the session's own scratch directory), so diagnosing
+the problem requires commands that themselves avoid writing meaningful
+output until enough space is freed to unblock everything else. Deleting
+`.rmeta`/`.d` files freed a little; the real fix was sweeping
+`target/debug/deps` for **stale duplicate build artifacts** — cargo keeps
+every previous build's hash-suffixed `.rlib`/binary alongside the current
+one rather than replacing it in place, so a long session's repeated
+`cargo build -p <crate>` invocations across many crates accumulate dozens
+of superseded copies of the same dependency, several hundred MB to
+several GB total. A script keeping only the newest file per
+`(basename-without-hash, extension)` group freed over 11 GB in one pass.
+
+**General form**: in any session doing many incremental `cargo
+build`/`test` invocations, check `df -h` periodically (not just after a
+build fails with ENOSPC) and proactively prune `target/debug/deps` to the
+newest artifact per basename group well before the filesystem is full —
+recovering from a *fully* exhausted disk is materially harder than
+staying ahead of it, since the tools needed to diagnose and fix the
+problem may themselves need scratch space to run.
+
+**Addendum — a `df`-reported "Size" is not the real ceiling, and a
+crate with many integration-test files needs a batched run, not a
+one-shot `cargo test -p`.** Two more turns of the same problem, same
+session: (1) `df -h /`'s Size column (252G here) can be the raw device
+size while `resv_strict` reserved-block accounting caps what this uid can
+actually write to a small fraction of it (Avail, ~11G) — trust
+`Avail`/`stat -f`'s `Available` block count, never `Size`, when judging
+headroom. (2) `cargo test -p <crate>` **links every integration-test
+binary in `tests/*.rs` before running any of them** — a crate with 115
+separate test files (`animusd`, each linking the full dependency graph,
+~100MB apiece here) transiently needs over 11GB simultaneously just for
+that one crate's test binaries, on top of whatever `target/debug/deps`
+already holds. The fix that stayed inside an ~11-22GB headroom the whole
+time: loop `cargo test -p <crate> --test <name>` one file at a time,
+`rm`-ing that test's own binary and re-running the duplicate-artifact
+prune after each one, so at most one extra test binary exists at a time
+instead of all of them at once. The same shape generalizes to any crate
+whose `tests/` directory has grown past a couple dozen files.
+
+## A cross-node e2e test must poll the node it's about to act through, not the node that made the earlier state change (ADR 0069, S-03 PR 2)
+
+Writing `crates/animusd/tests/encryption_at_rest_segment_store_e2e.rs`'s
+flagship test — `CreateBackup` against node 0, then `RestoreTableFromBackup`
+against node 1 — the first draft polled `DescribeBackup` for `AVAILABLE`
+against node 0 (the node that issued `CreateBackup`) before immediately
+calling `RestoreTableFromBackup` against node 1. This flaked at roughly a
+1-in-4 rate: node 1 legitimately observed `BackupInUseException` ("still
+being created"), because the backup catalog is ordinary replicated
+`Metadata` and node 1's own local apply of the `AVAILABLE` transition can
+lag node 0's by a beat, independent of anything encryption-related. A
+converged-or-timeout poll against the *wrong* node proves nothing about
+what the node you're about to act through actually believes.
+
+**General form**: when a test's next step targets node B based on a
+condition it just confirmed on node A, the poll must run against B, not A
+— "converged" is only meaningful for the specific reader that matters
+next. This generalizes the root `CLAUDE.md`'s existing "eventual property
+= converged-or-timeout poll, never a fixed-deadline one-shot assert" rule
+one level further: it's not enough to poll *somewhere*, the poll has to be
+against the party whose belief the next step actually depends on.
+
+## A fault enabled before a multi-step setup sequence finishes can corrupt the setup itself, not just the operation under test (ADR 0069, S-03 PR 2)
+
+Building `crates/animus-test/tests/segment_store_encrypted_fault_corpus.rs`'s
+`round_trip_survives_put_ack_lost` cell, the first draft configured
+`SegmentFaultConfig::set_put_ack_lost_prob(1.0)` on the raw
+`SimSegmentStore` *before* calling `EncryptedSegmentStore::open` — but
+`open` itself performs a `put` (sealing the marker object,
+`verify_or_init_segment_store_marker`'s "fresh store, key given" branch),
+so every single run failed inside `open` itself, before the test ever
+reached the `put` it actually meant to fault-inject. The fix: enable the
+fault only after the multi-step setup (`open`) has genuinely finished,
+and give the setup step's own fault interaction (a marker-put ack-lost,
+recovered by retrying `open`) its own dedicated cell instead of letting it
+accidentally dominate an unrelated one.
+
+**General form**: before enabling an ambient fault for "the operation
+under test," check whether anything upstream of that operation — a
+constructor, an `open`, an initialization step — goes through the same
+fault-injected seam. A fault config that's "on" too early doesn't produce
+a wrong answer about the intended property; it silently tests a
+completely different (and less interesting) one, namely "does setup
+itself tolerate this fault" — which may be worth its own cell, but is
+never a substitute for the property the test's name promises.
+
+## Adding a field to an always-`Some`-serialized hash-input struct rolls every deployed cluster's pods, even ones that never use the new feature — give the new field `skip_serializing_if`, not its predecessors (ADR 0069, S-03 PR 3, `desired::statefulset::RestartRelevantConfig`)
+
+`desired::statefulset::RestartRelevantConfig` (S-07d) is hashed
+(`restart_relevant_config_hash`, FNV-1a 64 over its JSON encoding) into a
+pod-template annotation that triggers a `StatefulSet` rolling restart the
+moment it changes. Its existing fields (`tls: Option<TlsSection>`,
+`cluster_settings: Option<ClusterSettings>`) have no `serde(
+skip_serializing_if)` at all — `None` always serializes as an explicit
+`"tls":null`. Adding `encryption_key_path: Option<String>` (S-03 PR 3) the
+same way would have meant every spec's JSON projection gained a new key —
+`"encryption_key_path":null` on every cluster that has never heard of
+`spec.encryptionKeySecretName` — changing the hash, and therefore rolling
+every already-deployed cluster's pods on the very next operator upgrade,
+for a feature those clusters don't use and nothing about their own config
+actually changed.
+
+**Fix**: give only the *new* field `#[serde(skip_serializing_if =
+"Option::is_none")]`. A spec with the field unset then serializes
+byte-identically to the pre-PR JSON shape (verified directly: the pinned
+`config_hash_pinned_for_a_fixed_fixture` literal needed no update),
+so the blast radius of the upgrade shrinks to exactly the clusters that
+actually set the new field — which is the only population for whom a
+restart is doing real work. Retrofitting the same attribute onto the
+*existing* fields (`tls`/`cluster_settings`) would itself change their
+hash contribution and cause the identical unwanted restart, so don't —
+the fix is additive-only, applied at the moment a field is introduced,
+never backfilled onto siblings whose hash contribution is already
+load-bearing for real clusters.
+
+**General form**: before adding a field to any struct whose serialized
+form feeds a change-detection hash with real infrastructure consequences
+(a pod restart, a cache invalidation, a re-sync), ask whether the struct's
+existing shape always serializes every field (no `skip_serializing_if`)
+or only present ones. In the "always" case, a plain new field changes the
+hash for *every* input, not just inputs that use the new feature — make
+the new field itself opt out of serialization when absent, so adopting a
+feature (not merely upgrading the tool that supports it) is what triggers
+the consequence.
+
+## A live (API-server) validation check on a `Secret` reference must not strip the field the way a pure spec-shape check does — "fall back to unset" can itself cause the outage the check exists to prevent (ADR 0069, S-03 PR 3, `animus-operator`)
+
+Every pre-existing `*SpecInvalid` condition in `animus-operator`'s
+reconciler (`TlsSpecInvalid`/`S3SpecInvalid`/`StoreSpecInvalid`) follows
+the same shape: a pure, no-cluster-access check on the spec's own fields
+(both/neither of two mutually exclusive shapes set, a malformed URI, an
+empty required string) finds a problem, sets a condition, and reconciles
+the *rest* of that pass with the offending field stripped to `None` — safe
+because the field's own value was never going to be usable regardless of
+what else is in the cluster.
+
+`spec.encryptionKeySecretName`'s own check (ADR 0069, S-03 PR 3) looks
+structurally identical — read a `Secret`, find it missing or malformed,
+set a condition — but copying the "strip and fall back" shape onto it
+would have been a real, self-inflicted hazard rather than a merely inert
+one. Unlike a malformed URI, "the named `Secret` doesn't exist *yet*" (or
+temporarily failed an API read) is not evidence the field's *value* is
+wrong — it's evidence a resource hasn't shown up, which is exactly the
+kind of transient condition a reconciler runs again in 30 seconds
+expecting to self-heal. Falling back to "as if unset" for that one pass
+would regenerate a `cluster.json` with no `encryption_key_path` on any
+node; since the field's presence is baked into the config-hash restart
+annotation, that fallback is not just informational, it is itself a
+`spec.template` change that rolls every pod straight into the underlying
+system's own loud refusal (an `animusd` process finding its data
+directory already marked encrypted with no key configured) — the operator
+would have manufactured the exact `CrashLoopBackOff` its own validation
+was trying to give the operator advance warning about, worse than doing
+nothing.
+
+**Fix**: this check sets the condition and leaves the spec's own,
+still-`Secret`-name-referencing value in place either way. A genuinely
+missing `Secret` then just leaves the pod's volume unable to mount
+(`ContainerCreating`, not a crash loop) until the `Secret` shows up —
+harmless, and self-healing without the operator having changed anything
+about the desired encryption state.
+
+**General form**: "strip the field and reconcile as if unset" is only a
+safe fallback when the field's *value itself* is what's wrong (a spec-shape
+error, checkable with no cluster access, where "unset" is a value the
+field could legitimately have held). It is the wrong fallback when the
+check is actually asking "does this external resource exist/look right
+*yet*" — there, "unset" is not a neutral default, it can be an active,
+consequential state change (here: flipping an encrypted cluster's own
+generated config back to plaintext) that the reconciler must never make on
+its own initiative just because a live read came back empty this once.
+Before copying an existing validate-and-strip pattern onto a new live
+check, ask which category the check actually falls into.
+
+## An `if let` condition is not valid in a match guard — Rust's let-chains stabilization covers `if`/`while` only (S-07e, `animus-operator` controller.rs)
+
+This repo's own code already leans on let-chains heavily (`if let Some(x) =
+a && let Err(e) = x.validate() { .. }`, throughout `controller.rs`), which
+made it tempting, while wiring `crate::validate::control_nodes_regression`
+into an existing `match prior_control_nodes { Some(prior) if .. => .. }`
+arm, to reach for the identical shape as a match guard: `Some(prior) if
+let Some(violation) = validate::control_nodes_regression(prior, target) =>
+{ .. }`. That is a *different* language feature (`if_let_guard`, tracking
+issue #51114) that has never stabilized — only a plain `if`/`while`
+condition got let-chains in this edition, never a match arm's own guard
+clause. The mistake was caught by re-reading the diff before compiling,
+not by a build failure, but it is exactly the kind of "this codebase does
+this shape everywhere, so it must work everywhere" reasoning worth naming:
+a stabilized language feature's scope is per-*construct*, not a blanket
+grant to every syntactic position that resembles it. Fixed by keeping the
+match's own boolean guard (`Some(prior) if validate::
+control_nodes_regression(prior, target).is_some() =>`) and re-deriving the
+`Violation` inside the arm body via a second call (documented as
+deliberately redundant, not a bug) rather than trying to bind it in the
+guard itself. Before reaching for a let-chain in a match guard anywhere in
+this codebase, restructure into a plain `if`/`while` (or an `if`-then-
+`match` split) instead — it will not compile on this toolchain.
+
+## `rustls-pki-types`'s `PemObject::*_file` helpers need the crate's `std` feature, which this workspace's dependency graph does not enable — read the file yourself and parse with `*_slice_iter`/`from_pem_slice` (S-07e, `animus-operator::webhook`)
+
+Loading a PEM cert/key pair from disk reads, at first glance, like it
+should be `CertificateDer::pem_file_iter(path)`/`PrivateKeyDer::
+from_pem_file(path)` — `rustls-pki-types`'s own convenience methods for
+exactly this. Both are gated `#[cfg(feature = "std")]` inside the crate,
+and this workspace's `rustls`/`tokio-rustls`/`rustls-pki-types` dependency
+set only ever requests `rustls-pki-types`'s `alloc` feature (`rustls`
+itself, `Cargo.toml` shows, depends on `pki-types` with `features =
+["alloc"]` only) — Cargo feature unification means `std` is simply never
+turned on anywhere in this graph, so the `*_file` methods do not exist to
+call. `crates/animus-operator/src/admin_client.rs::build_tls_connector`
+had already worked around this for a client-side CA load
+(`CertificateDer::pem_slice_iter` over bytes read with `std::fs::read`),
+but that precedent is easy to miss when writing a *new* loader from
+scratch and reaching for the method that reads best (`*_file`) rather than
+the one this workspace's feature set actually supports (`*_slice_iter`/
+`from_pem_slice`, which need only `alloc` and take a `&[u8]` you read
+yourself). `crate::webhook::load_tls_acceptor`'s first draft used the
+`_file` variants and only failed at `cargo build` — a clean, unambiguous
+"method not found" from a private-to-the-crate `#[cfg]`, not a subtle
+runtime gap, but still a wasted round trip. **When adding any new
+`rustls-pki-types` PEM consumer in this workspace, grep for an existing
+one first** (`admin_client.rs` is the reference shape) rather than trusting
+the crate's own public API surface to all be reachable — a dependency's
+Cargo features are a property of the whole workspace's unified graph, not
+of what any one crate's docs show as available.
+
+## A "which statement kind is this" dispatch must run before the full lex, not after, when later grammar uses bytes the current lexer doesn't know (ADR 0071, W-07 PR 2, `animus-dynamo::partiql`)
+
+`parse_select_statement`'s first draft lexed the entire input, then
+inspected token 0 to decide "is this a `SELECT`, or an `INSERT`/`UPDATE`/
+`DELETE` we should reject with a named 'not supported yet' error?" That
+looked right in isolation and every `SELECT`-shaped unit test passed. It
+broke on the very first `INSERT` test case: `INSERT INTO t VALUE
+{'pk':?}` — PR 3's still-unimplemented `document` grammar uses `{`/`}`,
+bytes this PR's lexer has no token for at all, so lexing the whole
+statement failed with "unexpected character `{`" before the parser ever
+got to look at token 0. The intended, specific "`INSERT` statements are
+not supported yet (PR 3)" message never had a chance to fire. The fix was
+mechanical once seen: peek the statement's leading bare word directly off
+the raw text (skip whitespace, read one identifier-shaped run, match
+against the keyword table) *before* calling the full lexer, and only lex
+the rest once the statement is known to be a shape this PR's grammar can
+even tokenize. **The general lesson: when a parser's grammar grows in
+stages (this PR only implements a subset; a later PR's syntax is already
+named in the design but not yet lexable), any "which shape is this, and do
+we even support it" dispatch must happen on the raw input, not after a
+full tokenize** — a full lex implicitly assumes the input already belongs
+to a grammar the lexer knows, which a not-yet-supported statement kind by
+definition may not. Caught immediately by a unit test
+(`rejects_insert_update_delete_with_named_error`) that asserted the error
+*message*, not just that parsing failed — a test that only checked
+`is_err()` would have passed on the wrong error and hidden this.
+
+## A workspace-wide `cargo build --all-targets`/`clippy --all-targets --all-features` pulls in every crate's full dependency tree (kube, reqwest, opentelemetry, rustls...) even for a change confined to two crates — budget disk accordingly, and dedupe `target/debug/deps` between runs (2026-09-07, W-07 PR 2)
+
+A PartiQL change touching only `animus-dynamo`/`animusd` still requires
+the *workspace* gates (`cargo build --workspace --all-targets`, `cargo
+clippy --workspace --all-targets --all-features -- -D warnings`) before a
+PR is done — and those pull in `animus-operator`'s full `kube`/
+`k8s-openapi`/`rustls`/`reqwest`/OTLP dependency graph along with
+everything else in the workspace, regardless of which crate the actual
+diff touched. On a sandbox with a fixed (not literally-disk-sized) quota —
+`df -h /` can report a large nominal `Size` with `Avail` reflecting a much
+smaller quota boundary instead of real free bytes — a single such build
+consumed the remainder of an already-tight quota mid-run and drove `Avail`
+to effectively zero, which then broke unrelated things: the tool
+harness's own small tmp output-capture filesystem started returning
+ENOSPC on completely unrelated commands (`ls`, `rm`), because it shares
+the same quota. Recovery was: delete stale duplicate `target/debug/deps`
+binaries first (multiple hash-suffixed versions of the same crate/test
+accumulate release over release; keep only the newest per basename — a
+`(-[0-9a-f]{16})(\.\w+)?$` suffix strip gives the basename to group on),
+which alone freed double-digit GB and unblocked everything. **Lesson for
+any task that must run full-workspace gates on a large multi-crate repo
+under a disk quota**: dedupe `target/debug/deps` *before* the first
+full-workspace build, not only after hitting ENOSPC, and treat "avail
+suddenly near zero right after a `--workspace --all-targets` build" as
+the expected shape of the problem, not a mystery — the fix is almost
+always duplicate build artifacts, never a leak in the code under test.
+
+## A caller that lowers a wire operation onto a *different, already-implemented* `Operation` and re-dispatches it hits genuine mutual `async fn` recursion — one `Box::pin` at the recursive edge is the whole fix (2026-09-07, W-07 PR 3)
+
+`animusd::dynamo::execute_statement` (called from one match arm of
+`run_operation`) needed to run a lowered `Operation::PutItem`/
+`UpdateItem`/`DeleteItem` through the *exact* write path a client-built
+request of that shape already takes — the only way to genuinely inherit
+conditions/index-maintenance/streams/throttling with zero new write-path
+code, rather than re-deriving a parallel slice of it. The obvious way to
+do that is to call `run_operation(ctx, principal, op).await` from inside
+`execute_statement` — but `run_operation` itself calls `execute_statement`
+in its own `Operation::ExecuteStatement` arm, so this is a genuine mutual
+`async fn` recursion: `Future<run_operation>` embeds `Future<
+execute_statement>` embeds `Future<run_operation>` ... — an infinitely
+recursive type, `error[E0733]`, if written naively. **The fix needs no
+signature change and no separate "extract the shared body into a plain
+function" refactor** (which would have meant peeling apart three
+already-large, already-tested match arms and re-threading their bodies as
+standalone functions purely to avoid recursion — a materially bigger,
+riskier diff for the same behavior): box **one edge** of the cycle,
+`Box::pin(run_operation(ctx, principal, op)).await` at the call site
+inside `execute_statement`, and leave `run_operation`'s own call into
+`execute_statement` as a plain unboxed `.await`. `Box<T>` is
+pointer-sized regardless of `T`'s own (here, recursively-defined) size, so
+inserting it at even one point in the cycle turns the outer type from
+"infinitely recursive, unrepresentable" into "one opaque type embedding a
+heap pointer to another opaque type" — finite, and exactly the same
+technique (`Box::pin` at the recursive call) used for a plain
+self-recursive `async fn`. Verified: `cargo build -p animusd --lib`
+compiled clean with no other change. **General lesson: lowering one wire
+operation onto another already-implemented one and running it through the
+existing dispatcher (rather than duplicating that dispatcher's logic) is
+the right reuse instinct, and the mutual-recursion compile error it
+produces is not a sign the approach is wrong — box the one call site that
+closes the cycle and move on**, rather than reaching for a bigger
+refactor the compiler error doesn't actually require.

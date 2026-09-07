@@ -376,6 +376,7 @@
             <tr><td><code>UpdateItem</code></td><td><span class="pill yes">Yes</span></td><td>Update expressions with conditions</td></tr>
             <tr><td><code>Query</code></td><td><span class="pill yes">Yes</span></td><td>Key conditions, filters, index queries, pagination</td></tr>
             <tr><td><code>Scan</code></td><td><span class="pill yes">Yes</span></td><td>Filters and pagination; ordered by token</td></tr>
+            <tr><td><code>ExecuteStatement</code></td><td><span class="pill yes">Yes</span></td><td>PartiQL <code>SELECT</code>/<code>INSERT</code>/<code>UPDATE</code>/<code>DELETE</code>. <code>SELECT</code> lowers onto <code>Query</code>/<code>Scan</code>; <code>INSERT</code>/<code>UPDATE</code>/<code>DELETE</code> lower onto <code>PutItem</code>/<code>UpdateItem</code>/<code>DeleteItem</code> and inherit that path's conditions/index maintenance/streams/throttling, with <code>RETURNING ALL OLD *</code>/<code>ALL NEW *</code> support. <code>?</code> placeholders only, never literal values. <code>BatchExecuteStatement</code> and <code>ExecuteTransaction</code> not yet implemented</td></tr>
             <tr><td><code>BatchWriteItem</code></td><td><span class="pill yes">Yes</span></td><td>—</td></tr>
             <tr><td><code>TransactWriteItems</code> · <code>TransactGetItems</code></td><td><span class="pill yes">Yes</span></td><td>Put, Update, Delete and ConditionCheck actions; <code>ClientRequestToken</code> idempotency on writes</td></tr>
             <tr><td><code>UpdateTimeToLive</code> · <code>DescribeTimeToLive</code></td><td><span class="pill yes">Yes</span></td><td>—</td></tr>
@@ -505,7 +506,12 @@
         DynamoDB port from anywhere; outbound, the cluster's own pods on the Raft/RPC ports
         plus DNS by default, and — only when an S3-compatible backup/segment store is
         configured (<code>spec.s3</code>) — that store's own endpoint port, scoped to an
-        explicit, operator-set CIDR list. The <code>PodDisruptionBudget</code>'s own
+        explicit, operator-set CIDR list. <code>spec.tls</code> turns TLS on for every port
+        the cluster binds (a pre-existing <code>Secret</code>, or one the operator asks
+        cert-manager to issue) and <code>spec.encryptionKeySecretName</code> mounts a
+        pre-existing <code>Secret</code> holding an encryption-at-rest key onto every
+        pod — both off by default, and neither generated or stored by the operator
+        itself. The <code>PodDisruptionBudget</code>'s own
         <code>maxUnavailable</code> is computed from the cluster's control-voter count and its
         (currently fixed) data-plane replication factor, never a constant and never
         user-overridable — a cluster too small to safely lose even one replica gets a budget
@@ -621,11 +627,15 @@
           continuous backups (<code>RestoreTableToPointInTime</code>); a source table's backup
           history and PITR coverage both outlive the table if it's later dropped.</li>
         <li><strong>Tablets never merge</strong>, so a table that shrinks keeps its tablet count.</li>
-        <li><strong>The Kubernetes operator ships no admission webhook</strong> — an invalid spec
-          edit (e.g. shrinking <code>controlNodes</code> after creation, or a malformed
-          <code>spec.s3</code>) is caught by the controller after the fact, surfaced as a status
-          condition, not rejected up front. Growing <code>controlNodes</code> is honored: the
-          controller drives the control group's own admin API to add each new voter.</li>
+        <li><strong>The Kubernetes operator's validating admission webhook is opt-in, not
+          installed by default</strong> — without it, an invalid spec edit (e.g. shrinking
+          <code>controlNodes</code> after creation, or a malformed <code>spec.s3</code>) is caught
+          by the controller after the fact, surfaced as a status condition, not rejected up front.
+          Installing the webhook (a few extra manifests, a TLS cert either from cert-manager or
+          hand-issued) rejects the same bad writes at the API server itself, before they're ever
+          persisted — see the operator's own deploy docs. Growing <code>controlNodes</code> is
+          honored either way: the controller drives the control group's own admin API to add each
+          new voter.</li>
         <li><strong>Not benchmarked at scale.</strong> No performance claims are made here for a
           reason.</li>
       </ul>

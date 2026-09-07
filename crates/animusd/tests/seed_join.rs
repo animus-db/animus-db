@@ -377,6 +377,7 @@ async fn node_joins_via_seed_with_no_expanded_config() {
             console: raw[5],
             advertise_host: None,
             tls: None,
+            encryption_key_path: None,
         }
     };
     let collision_result = animusd::run_node_join(

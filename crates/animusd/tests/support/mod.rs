@@ -144,6 +144,7 @@ fn single_node_config() -> ClusterConfig {
             console: a[5],
             advertise_host: None,
             tls: None,
+            encryption_key_path: None,
         }],
         dynamo_auth: None,
         cluster_settings: None,
@@ -227,6 +228,7 @@ pub async fn bring_up_deadline(
                 console: addrs[6 * i + 5],
                 advertise_host: None,
                 tls: None,
+                encryption_key_path: None,
             })
             .collect();
         let config = ClusterConfig {
@@ -353,6 +355,7 @@ pub async fn bring_up_deadline_tls(
                 console: addrs[6 * i + 5],
                 advertise_host: None,
                 tls: Some(sections[i].clone()),
+                encryption_key_path: None,
             })
             .collect();
         let config = ClusterConfig {
@@ -416,6 +419,7 @@ pub async fn grow_deadline(
                 console: addrs[6 * i + 5],
                 advertise_host: None,
                 tls: None,
+                encryption_key_path: None,
             });
         }
         let expanded = ClusterConfig {
@@ -516,6 +520,7 @@ pub async fn join_fresh_deadline(
         console: raw[5],
         advertise_host: None,
         tls: None,
+        encryption_key_path: None,
     };
     loop {
         let node_dir = dir.join(format!("join-{index}-{attempt}"));
@@ -568,6 +573,7 @@ pub async fn join_data_fresh_deadline(
             console: raw[5],
             advertise_host: None,
             tls: None,
+            encryption_key_path: None,
         };
         let node_dir = dir.join(format!("data-join-{index}-{attempt}"));
         match animusd::run_node_data_join(
@@ -625,6 +631,7 @@ pub async fn join_allocated_fresh_deadline(
             console: raw[5],
             advertise_host: None,
             tls: None,
+            encryption_key_path: None,
         };
         let node_dir = dir.join(format!("join-alloc-{label}-{attempt}"));
         match animusd::run_node_join(
@@ -675,6 +682,7 @@ pub async fn join_data_allocated_fresh_deadline(
             console: raw[5],
             advertise_host: None,
             tls: None,
+            encryption_key_path: None,
         };
         let node_dir = dir.join(format!("data-join-alloc-{label}-{attempt}"));
         match animusd::run_node_data_join(
@@ -736,6 +744,7 @@ pub async fn bring_up_split(
                     console: addrs[6 * i + 5],
                     advertise_host: None,
                     tls: None,
+                    encryption_key_path: None,
                 }
             })
             .collect();

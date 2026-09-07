@@ -239,6 +239,236 @@ mod tests {
         assert!(sim.run_until_quiescent(MAX_STEPS), "must settle");
     }
 
+    // --- Encryption at rest for `SegmentStore` (ADR 0069, S-03 PR 2) -------
+
+    use animus_env::{EncryptedSegmentStore, EncryptionKey, SEGMENT_STORE_MARKER_ID};
+
+    fn test_key(byte: u8) -> EncryptionKey {
+        EncryptionKey::from_bytes([byte; 32])
+    }
+
+    /// `EncryptedSegmentStore<SimSegmentStore, SimEnv>` satisfies the same
+    /// shared contract every plaintext `SegmentStore` implementor does —
+    /// round trip, write-once (checked at the plaintext level — see the
+    /// wrapper's own module doc), delete idempotence, prefix-filtered
+    /// `list`, none of it disturbed by sealing every object underneath.
+    #[test]
+    fn encrypted_store_satisfies_the_segment_store_contract() {
+        let mut sim = Simulator::new(0x5EC0_0001);
+        let env = sim.env(nid(0));
+        let inner = SimSegmentStore::new(env.clone());
+        let env_for_task = env.clone();
+        env.spawn_task(async move {
+            let enc = EncryptedSegmentStore::open(inner, env_for_task, test_key(1))
+                .await
+                .expect("open a fresh (unencrypted) store with a key");
+            assert_segment_store_contract(&enc).await;
+        });
+        assert!(sim.run_until_quiescent(MAX_STEPS), "must settle");
+    }
+
+    /// A plain round trip through the wrapper, and proof the underlying
+    /// (unwrapped) store holds ciphertext, not the plaintext value.
+    #[test]
+    fn round_trips_and_the_underlying_bytes_are_not_plaintext() {
+        let mut sim = Simulator::new(0x5EC0_0002);
+        let env = sim.env(nid(0));
+        let raw = SimSegmentStore::new(env.clone());
+        let raw_for_asserts = raw.clone();
+        let env_for_task = env.clone();
+        env.spawn_task(async move {
+            let enc = EncryptedSegmentStore::open(raw, env_for_task, test_key(2))
+                .await
+                .expect("open");
+            enc.put("table/label/1/0", b"super-secret-value")
+                .await
+                .expect("put");
+            assert_eq!(
+                enc.get("table/label/1/0").await.expect("get"),
+                Some(b"super-secret-value".to_vec())
+            );
+            let underlying = raw_for_asserts
+                .get("table/label/1/0")
+                .await
+                .expect("get raw")
+                .expect("object present on the wrapped store");
+            assert_ne!(
+                underlying, b"super-secret-value",
+                "the wrapped store must never see the plaintext bytes"
+            );
+        });
+        assert!(sim.run_until_quiescent(MAX_STEPS), "must settle");
+    }
+
+    /// Opening the same (now-encrypted) store with the wrong key is a hard
+    /// error at open time (the marker check) — never a silent fallthrough
+    /// to plaintext.
+    #[test]
+    fn wrong_key_at_open_is_refused() {
+        let mut sim = Simulator::new(0x5EC0_0003);
+        let env = sim.env(nid(0));
+        let raw = SimSegmentStore::new(env.clone());
+        let env_for_task = env.clone();
+        env.spawn_task(async move {
+            EncryptedSegmentStore::open(raw.clone(), env_for_task.clone(), test_key(3))
+                .await
+                .expect("first open with key 3 initializes the marker");
+            let err = EncryptedSegmentStore::open(raw, env_for_task, test_key(4))
+                .await
+                .map(|_| ())
+                .expect_err("a different key must be refused");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("does not match the key"),
+                "unexpected message: {msg}"
+            );
+        });
+        assert!(sim.run_until_quiescent(MAX_STEPS), "must settle");
+    }
+
+    /// A `get` of an object written under one key, read back under a
+    /// different key that DOES authenticate the marker (impossible in
+    /// practice since `open` itself refuses first) is not reachable — but a
+    /// tampered object on an already-opened, correctly-keyed store must
+    /// still be a named, hard `get` error, never a silent `None` or garbage
+    /// plaintext.
+    #[test]
+    fn a_tampered_object_fails_loudly_and_names_the_id() {
+        let mut sim = Simulator::new(0x5EC0_0004);
+        let env = sim.env(nid(0));
+        let raw = SimSegmentStore::new(env.clone());
+        let raw_for_tamper = raw.clone();
+        let env_for_task = env.clone();
+        env.spawn_task(async move {
+            let enc = EncryptedSegmentStore::open(raw, env_for_task, test_key(5))
+                .await
+                .expect("open");
+            enc.put("t/lbl/1/0", b"hello world").await.expect("put");
+            let mut bytes = raw_for_tamper
+                .get("t/lbl/1/0")
+                .await
+                .expect("get raw")
+                .expect("present");
+            let last = bytes.len() - 1;
+            bytes[last] ^= 0xFF; // flip the AEAD tag's last byte
+            raw_for_tamper
+                .put("t/lbl/1/0", &bytes)
+                .await
+                .expect_err("SimSegmentStore write-once forbids overwriting with different bytes");
+            // Overwrite via delete+put since SimSegmentStore enforces
+            // write-once on its own raw bytes too.
+            raw_for_tamper.delete("t/lbl/1/0").await.expect("delete");
+            raw_for_tamper
+                .put("t/lbl/1/0", &bytes)
+                .await
+                .expect("re-put the tampered bytes");
+
+            let err = enc
+                .get("t/lbl/1/0")
+                .await
+                .expect_err("a tampered object must be a hard error, never a silent None");
+            let msg = err.to_string();
+            assert!(msg.contains("t/lbl/1/0"), "must name the object id: {msg}");
+            assert!(
+                msg.contains("write-once"),
+                "must explain why this can never be a torn write: {msg}"
+            );
+        });
+        assert!(sim.run_until_quiescent(MAX_STEPS), "must settle");
+    }
+
+    /// The three loud-refusal directions (mirroring `verify_or_init_marker`'s
+    /// own `Disk`-level test coverage): encrypted-no-key, wrong-key, and
+    /// key-against-plaintext.
+    #[test]
+    fn marker_refusal_in_every_direction() {
+        use animus_env::verify_or_init_segment_store_marker;
+
+        let mut sim = Simulator::new(0x5EC0_0005);
+        let env = sim.env(nid(0));
+
+        // (1) Key against an existing plaintext store (already holding an
+        // ordinary object) is refused.
+        {
+            let store = SimSegmentStore::new(env.clone());
+            let env_for_task = env.clone();
+            env.spawn_task(async move {
+                store.put("some/object", b"plaintext").await.expect("put");
+                let err =
+                    verify_or_init_segment_store_marker(&store, &env_for_task, Some(&test_key(6)))
+                        .await
+                        .expect_err("a key against a plaintext store must be refused");
+                assert!(err.to_string().contains("already holds unencrypted"));
+            });
+        }
+        assert!(sim.run_until_quiescent(MAX_STEPS), "must settle (1)");
+
+        // (2) Encrypted store, no key given: refused.
+        {
+            let store = SimSegmentStore::new(env.clone());
+            let env_for_task = env.clone();
+            env.spawn_task(async move {
+                verify_or_init_segment_store_marker(&store, &env_for_task, Some(&test_key(7)))
+                    .await
+                    .expect("initialize the marker under key 7");
+                let err = verify_or_init_segment_store_marker(&store, &env_for_task, None)
+                    .await
+                    .expect_err("no key against an encrypted store must be refused");
+                assert!(err.to_string().contains("no --encryption-key was given"));
+            });
+        }
+        assert!(sim.run_until_quiescent(MAX_STEPS), "must settle (2)");
+
+        // (3) Encrypted store, wrong key: refused.
+        {
+            let store = SimSegmentStore::new(env.clone());
+            let env_for_task = env.clone();
+            env.spawn_task(async move {
+                verify_or_init_segment_store_marker(&store, &env_for_task, Some(&test_key(8)))
+                    .await
+                    .expect("initialize the marker under key 8");
+                let err =
+                    verify_or_init_segment_store_marker(&store, &env_for_task, Some(&test_key(9)))
+                        .await
+                        .expect_err("the wrong key against an encrypted store must be refused");
+                assert!(err.to_string().contains("does not match the key"));
+            });
+        }
+        assert!(sim.run_until_quiescent(MAX_STEPS), "must settle (3)");
+
+        // (4) A fresh store with no key stays plaintext, untouched — and the
+        // marker itself is hidden from `list`.
+        {
+            let store = SimSegmentStore::new(env.clone());
+            let env_for_task = env.clone();
+            env.spawn_task(async move {
+                verify_or_init_segment_store_marker(&store, &env_for_task, None)
+                    .await
+                    .expect("no key, fresh store: proceed plaintext");
+                assert!(
+                    store.list("").await.expect("list").is_empty(),
+                    "a plaintext store with no key must remain untouched"
+                );
+
+                verify_or_init_segment_store_marker(&store, &env_for_task, Some(&test_key(10)))
+                    .await
+                    .expect("initialize the marker now");
+                let enc = EncryptedSegmentStore::open(store.clone(), env_for_task, test_key(10))
+                    .await
+                    .expect("open");
+                enc.put("x/y/1/0", b"v").await.expect("put");
+                let listed = enc.list("").await.expect("list via wrapper");
+                assert_eq!(listed, vec!["x/y/1/0".to_string()]);
+                let raw_listed = store.list("").await.expect("raw list");
+                assert!(
+                    raw_listed.contains(&SEGMENT_STORE_MARKER_ID.to_string()),
+                    "the marker really is present on the raw store: {raw_listed:?}"
+                );
+            });
+        }
+        assert!(sim.run_until_quiescent(MAX_STEPS), "must settle (4)");
+    }
+
     /// The exact ambiguity a seal step must tolerate: a `put` whose caller
     /// sees an error can still have landed the object — a subsequent `get`
     /// (even from a different clone of the same store) sees it.

@@ -362,7 +362,7 @@ mod tests {
 
     /// The load-bearing test: the shared `SegmentStore` contract holds
     /// against a real signature-verifying fake transport, with no network
-    /// at all — see `animus_env::test_support::assert_segment_store_contract`
+    /// at all — see `crate::test_support::assert_segment_store_contract`
     /// for exactly what this pins (put/get round trip, write-once semantics,
     /// delete idempotence, resurrection after delete, prefix-filtered
     /// `list`).
@@ -380,6 +380,92 @@ mod tests {
     async fn contract_holds_with_a_configured_prefix() {
         let store = test_store(Some("animus/segments"));
         crate::test_support::assert_segment_store_contract(&store).await;
+    }
+
+    /// A minimal, deterministic-enough `Rng` for a test that just needs
+    /// distinct per-object salts — not a `SimEnv`-driven corpus, so real
+    /// seed-reproducibility doesn't matter here; a plain counter-seeded
+    /// splitmix64 avoids pulling in `OsRng` (a `disallowed_types` hit) for
+    /// what is purely local test scaffolding.
+    struct CounterRng(std::sync::atomic::AtomicU64);
+
+    impl CounterRng {
+        fn new() -> Self {
+            CounterRng(std::sync::atomic::AtomicU64::new(0x9E37_79B9))
+        }
+    }
+
+    impl crate::Rng for CounterRng {
+        fn next_u64(&self) -> u64 {
+            let x = self
+                .0
+                .fetch_add(0x9E37_79B9_7F4A_7C15, std::sync::atomic::Ordering::Relaxed);
+            let mut z = x;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        fn fill_bytes(&self, dst: &mut [u8]) {
+            let mut i = 0;
+            while i < dst.len() {
+                let v = self.next_u64().to_le_bytes();
+                let n = (dst.len() - i).min(8);
+                dst[i..i + n].copy_from_slice(&v[..n]);
+                i += n;
+            }
+        }
+    }
+
+    /// `EncryptedSegmentStore<S3SegmentStore<FakeS3>, CounterRng>` satisfies
+    /// the identical shared contract (ADR 0069, S-03 PR 2) — the S3 sibling
+    /// of `prod.rs`'s own `encrypted_fs_segment_store_satisfies_the_contract`.
+    #[tokio::test]
+    async fn contract_holds_through_the_encrypted_wrapper() {
+        let raw = test_store(None);
+        let key = crate::EncryptionKey::from_bytes([0x24; 32]);
+        let store = crate::EncryptedSegmentStore::open(raw, CounterRng::new(), key)
+            .await
+            .expect("open a fresh store with a key");
+        crate::test_support::assert_segment_store_contract(&store).await;
+    }
+
+    /// The wrong key against an already-encrypted S3 store is refused at
+    /// open time, and the raw bytes actually sitting in the (fake) bucket
+    /// are not the plaintext value.
+    #[tokio::test]
+    async fn wrong_key_is_refused_and_ciphertext_never_hits_the_bucket() {
+        use crate::SegmentStore as _;
+
+        let raw = test_store(None);
+        let raw_for_asserts = raw.clone();
+        let key_a = crate::EncryptionKey::from_bytes([0x11; 32]);
+        let key_b = crate::EncryptionKey::from_bytes([0x22; 32]);
+
+        let store = crate::EncryptedSegmentStore::open(raw, CounterRng::new(), key_a)
+            .await
+            .expect("open with key A");
+        store
+            .put("t/label/1/0", b"a secret value")
+            .await
+            .expect("put");
+        let raw_bytes = raw_for_asserts
+            .get("t/label/1/0")
+            .await
+            .expect("get raw")
+            .expect("present");
+        assert!(
+            !raw_bytes
+                .windows(b"a secret value".len())
+                .any(|w| w == b"a secret value"),
+            "the plaintext value must never appear verbatim in the stored object"
+        );
+
+        let err = crate::EncryptedSegmentStore::open(raw_for_asserts, CounterRng::new(), key_b)
+            .await
+            .map(|_| ())
+            .expect_err("the wrong key must be refused");
+        assert!(err.to_string().contains("does not match the key"));
     }
 
     /// `list` must paginate across more than one page, exactly like

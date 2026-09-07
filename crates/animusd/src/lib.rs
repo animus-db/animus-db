@@ -2249,6 +2249,19 @@ pub struct RoleAddrs {
     /// all-or-none rule this field is checked against.
     #[serde(default)]
     pub tls: Option<config::TlsSection>,
+    /// This node's own local data directory encryption key (ADR 0069,
+    /// S-03 PR 1) — a path to a key file (`--encryption-key PATH`'s own
+    /// format: 64 hex characters), not the key itself. `None` (every
+    /// pre-ADR-0069 config, `#[serde(default)]`) means plaintext on disk,
+    /// byte-for-byte today's behavior. **Per-node**, mirroring `tls`'s own
+    /// shape (not `dynamo_auth`'s cluster-wide one) — each node's disk is
+    /// independent, so there is no single cluster-wide field to hold it;
+    /// `--encryption-key PATH` applies the same path to every node it
+    /// reaches (see `main.rs`'s own doc for exactly which entry points).
+    /// See `Node::bind`/`bind_control`/`bind_data` for where this is
+    /// loaded and handed to `ProdEnv::bind_with_tls_and_key`.
+    #[serde(default)]
+    pub encryption_key_path: Option<String>,
 }
 
 /// Fallback endpoint for configs written before a field existed: an ephemeral
@@ -2314,6 +2327,15 @@ pub struct BoundNode {
     /// This node's TLS material (ADR 0064, S-01 commit 2), loaded once at
     /// bind time from `RoleAddrs::tls` — `None` is plain TCP on every port.
     tls: Option<TlsMaterial>,
+    /// This node's own encryption-at-rest key (ADR 0069), loaded once at
+    /// bind time from `RoleAddrs::encryption_key_path` — `None` means this
+    /// node's disk stays plaintext. Kept here (a PR 1 field this crate
+    /// carried only long enough to hand to `ProdEnv::bind_with_tls_and_key`)
+    /// so PR 2's [`build_segment_store`]/[`build_backup_store`] can wrap a
+    /// `Fs`/`S3` segment store under the identical key, once this node's
+    /// own tail (`start_with_growth`) reaches them — see that constructor's
+    /// own doc for the cluster-wide key-scope contract this relies on.
+    encryption_key: Option<animus_env::EncryptionKey>,
 }
 
 /// A node's identity + bound addresses, captured for the admin `/admin/config`
@@ -4480,7 +4502,9 @@ impl BoundNode {
             ControlHandle::Local(raft.clone()),
             my_id.clone(),
             &segment_store_config,
-        )?;
+            self.encryption_key.as_ref(),
+        )
+        .await?;
         // This node's backup store (ADR 0059 §1) — a second, independently
         // configured handle alongside `segment_store` above; see
         // `build_backup_store`'s own doc. Plumbing only (Train 1 PR②): no
@@ -4491,7 +4515,9 @@ impl BoundNode {
             ControlHandle::Local(raft.clone()),
             my_id.clone(),
             &backup_store_config,
-        )?;
+            self.encryption_key.as_ref(),
+        )
+        .await?;
         let data_role = DataRole {
             raftkv_metrics,
             base_id: my_id.clone(),
@@ -4975,6 +5001,18 @@ pub struct Node {
     test_ctx: ClientCtx,
 }
 
+/// Load `RoleAddrs::encryption_key_path` (ADR 0069, S-03 PR 1) into a real
+/// `EncryptionKey`, or `None` if the node's own config carries no key path
+/// at all — the shared load step `Node::bind`/`bind_control`/`bind_data`
+/// each call once before binding their internal `ProdEnv`.
+fn load_encryption_key(
+    path: &Option<String>,
+) -> std::io::Result<Option<animus_env::EncryptionKey>> {
+    path.as_deref()
+        .map(|p| animus_env::EncryptionKey::load_from_file(std::path::Path::new(p)))
+        .transpose()
+}
+
 impl Node {
     /// Bind this node's listeners (the one internal env + the client TCP
     /// server + the DynamoDB HTTP endpoint) and create its data
@@ -4999,9 +5037,15 @@ impl Node {
         // byte-for-byte today's plain-TCP behavior on every port.
         let tls_config = addrs.tls.as_ref().map(config::TlsSection::to_tls_config);
         let tls = tls_config.clone().map(|c| c.load()).transpose()?;
-        let (env, internal_addr) =
-            ProdEnv::bind_with_tls(id.clone(), addrs.internal, dir.join("internal"), tls_config)
-                .await?;
+        let encryption_key = load_encryption_key(&addrs.encryption_key_path)?;
+        let (env, internal_addr) = ProdEnv::bind_with_tls_and_key(
+            id.clone(),
+            addrs.internal,
+            dir.join("internal"),
+            tls_config,
+            encryption_key.clone(),
+        )
+        .await?;
         let client_listener = TcpListener::bind(addrs.client).await?;
         let client_addr = client_listener.local_addr()?;
         let dynamo_listener = TcpListener::bind(addrs.dynamo).await?;
@@ -5029,6 +5073,7 @@ impl Node {
             console_addr,
             advertise_host: addrs.advertise_host,
             tls,
+            encryption_key,
         })
     }
 
@@ -5052,9 +5097,15 @@ impl Node {
         // own listeners below.
         let tls_config = addrs.tls.as_ref().map(config::TlsSection::to_tls_config);
         let tls = tls_config.clone().map(|c| c.load()).transpose()?;
-        let (env, internal_addr) =
-            ProdEnv::bind_with_tls(id.clone(), addrs.internal, dir.join("internal"), tls_config)
-                .await?;
+        let encryption_key = load_encryption_key(&addrs.encryption_key_path)?;
+        let (env, internal_addr) = ProdEnv::bind_with_tls_and_key(
+            id.clone(),
+            addrs.internal,
+            dir.join("internal"),
+            tls_config,
+            encryption_key.clone(),
+        )
+        .await?;
         let client_listener = TcpListener::bind(addrs.client).await?;
         let client_addr = client_listener.local_addr()?;
         let admin_listener = TcpListener::bind(addrs.admin).await?;
@@ -5074,6 +5125,7 @@ impl Node {
             intra_addr,
             advertise_host: addrs.advertise_host,
             tls,
+            encryption_key,
         })
     }
 
@@ -5098,9 +5150,15 @@ impl Node {
         // own listeners below.
         let tls_config = addrs.tls.as_ref().map(config::TlsSection::to_tls_config);
         let tls = tls_config.clone().map(|c| c.load()).transpose()?;
-        let (env, internal_addr) =
-            ProdEnv::bind_with_tls(id.clone(), addrs.internal, dir.join("internal"), tls_config)
-                .await?;
+        let encryption_key = load_encryption_key(&addrs.encryption_key_path)?;
+        let (env, internal_addr) = ProdEnv::bind_with_tls_and_key(
+            id.clone(),
+            addrs.internal,
+            dir.join("internal"),
+            tls_config,
+            encryption_key.clone(),
+        )
+        .await?;
         let client_listener = TcpListener::bind(addrs.client).await?;
         let client_addr = client_listener.local_addr()?;
         let dynamo_listener = TcpListener::bind(addrs.dynamo).await?;
@@ -5128,6 +5186,7 @@ impl Node {
             console_addr,
             advertise_host: addrs.advertise_host,
             tls,
+            encryption_key,
         })
     }
 
@@ -5446,6 +5505,8 @@ pub struct BoundControlNode {
     /// This node's TLS material (ADR 0064, S-01 commit 2), loaded once at
     /// bind time from `RoleAddrs::tls` — `None` is plain TCP on every port.
     tls: Option<TlsMaterial>,
+    /// See [`BoundNode::encryption_key`]'s doc.
+    encryption_key: Option<animus_env::EncryptionKey>,
 }
 
 impl BoundControlNode {
@@ -5676,7 +5737,9 @@ impl BoundControlNode {
             ControlHandle::Local(raft.clone()),
             self.id.clone(),
             &segment_store_config,
-        )?;
+            self.encryption_key.as_ref(),
+        )
+        .await?;
         // This node's backup store (ADR 0059 §1) — see `segment_store`'s
         // doc immediately above for why this is provisioned here too.
         let backup_store = build_backup_store(
@@ -5685,7 +5748,9 @@ impl BoundControlNode {
             ControlHandle::Local(raft.clone()),
             self.id.clone(),
             &backup_store_config,
-        )?;
+            self.encryption_key.as_ref(),
+        )
+        .await?;
 
         let (ctx, mut tasks) = spawn_common_tail(
             ControlHandle::Local(raft.clone()),
@@ -5850,6 +5915,8 @@ pub struct BoundDataNode {
     /// This node's TLS material (ADR 0064, S-01 commit 2), loaded once at
     /// bind time from `RoleAddrs::tls` — `None` is plain TCP on every port.
     tls: Option<TlsMaterial>,
+    /// See [`BoundNode::encryption_key`]'s doc.
+    encryption_key: Option<animus_env::EncryptionKey>,
 }
 
 impl BoundDataNode {
@@ -6156,7 +6223,9 @@ impl BoundDataNode {
             control.clone(),
             my_id.clone(),
             &segment_store_config,
-        )?;
+            self.encryption_key.as_ref(),
+        )
+        .await?;
         // This node's backup store (ADR 0059 §1) — see `BoundNode::
         // start_with_growth`'s identical construction; `control` here is
         // `ControlHandle::Remote`, which `ControlPlacementView` reads
@@ -6167,7 +6236,9 @@ impl BoundDataNode {
             control.clone(),
             my_id.clone(),
             &backup_store_config,
-        )?;
+            self.encryption_key.as_ref(),
+        )
+        .await?;
         let data_role = DataRole {
             raftkv_metrics,
             base_id: my_id.clone(),
@@ -6774,6 +6845,15 @@ pub const MIN_QUIESCE_AFTER: Duration = index_drain::INDEX_DRAIN_INTERVAL;
 pub(crate) enum SegmentStoreHandle {
     Cluster(animus_cp_data::cluster_segment_store::ClusterSegmentStore<ProdEnv, FsSegmentStore>),
     Fs(FsSegmentStore),
+    /// The `--encryption-key`-sealed sibling of [`Fs`](Self::Fs) (ADR 0069,
+    /// S-03 PR 2) — every object this node writes/reads through this
+    /// single-directory store is sealed under `--encryption-key`'s key
+    /// (see [`animus_env::EncryptedSegmentStore`]'s own module doc for the
+    /// cluster-wide key-scope contract this relies on: every node reading
+    /// this store must be configured with the *same* key file). Handled
+    /// identically to `Fs` in every method below — no per-node replica
+    /// concept either way.
+    EncryptedFs(animus_env::EncryptedSegmentStore<FsSegmentStore, ProdEnv>),
     /// `--segment-store s3://bucket[/prefix]?endpoint=...` (S-04 PR 2) — a
     /// `Arc<dyn SegmentStore>` rather than a concrete
     /// `animus_env::S3SegmentStore<T>` for one specific reason: it lets an
@@ -6781,10 +6861,16 @@ pub(crate) enum SegmentStoreHandle {
     /// (`s3_store_tests`, below) with no change to this enum's own shape,
     /// while production (`build_segment_store`) always constructs the
     /// concrete `S3SegmentStore<animus_s3::prod::HyperRustlsTransport>`
-    /// instance and stores it here the same way. Like `Fs`, there is no
-    /// per-node replica concept — every node reads the identical bucket —
-    /// so this variant is handled identically to `Fs` in every method
-    /// below.
+    /// instance and stores it here the same way. **Also this variant's
+    /// home for a keyed S3 store (ADR 0069, S-03 PR 2)** — `build_segment_
+    /// store` wraps the raw `S3SegmentStore` in `animus_env::
+    /// EncryptedSegmentStore` before boxing it here when `--encryption-key`
+    /// is configured, so `S3` covers both the plaintext and the encrypted
+    /// case with no separate `EncryptedS3` variant needed (unlike `Fs`,
+    /// which is a concrete, non-`dyn` type and so does need one). Like
+    /// `Fs`/`EncryptedFs`, there is no per-node replica concept — every
+    /// node reads the identical bucket — so this variant is handled
+    /// identically to them in every method below.
     S3(Arc<dyn animus_env::SegmentStore>),
 }
 
@@ -6803,6 +6889,11 @@ impl SegmentStoreHandle {
         match self {
             SegmentStoreHandle::Cluster(c) => c.put_replicated(id, bytes).await,
             SegmentStoreHandle::Fs(fs) => {
+                use animus_env::SegmentStore;
+                fs.put(id, bytes).await?;
+                Ok(Vec::new())
+            }
+            SegmentStoreHandle::EncryptedFs(fs) => {
                 use animus_env::SegmentStore;
                 fs.put(id, bytes).await?;
                 Ok(Vec::new())
@@ -6834,6 +6925,7 @@ impl SegmentStoreHandle {
         match self {
             SegmentStoreHandle::Cluster(c) => c.get_from(replicas, id).await,
             SegmentStoreHandle::Fs(fs) => fs.get(id).await,
+            SegmentStoreHandle::EncryptedFs(fs) => fs.get(id).await,
             SegmentStoreHandle::S3(s3) => s3.get(id).await,
         }
     }
@@ -6853,6 +6945,7 @@ impl SegmentStoreHandle {
         match self {
             SegmentStoreHandle::Cluster(c) => c.delete_from(replicas, id).await,
             SegmentStoreHandle::Fs(fs) => fs.delete(id).await,
+            SegmentStoreHandle::EncryptedFs(fs) => fs.delete(id).await,
             SegmentStoreHandle::S3(s3) => s3.delete(id).await,
         }
     }
@@ -6880,7 +6973,9 @@ impl SegmentStoreHandle {
     ) -> std::io::Result<Vec<NodeId>> {
         match self {
             SegmentStoreHandle::Cluster(c) => c.repair(id, bytes, surviving, target_k).await,
-            SegmentStoreHandle::Fs(_) | SegmentStoreHandle::S3(_) => Ok(surviving.to_vec()),
+            SegmentStoreHandle::Fs(_)
+            | SegmentStoreHandle::EncryptedFs(_)
+            | SegmentStoreHandle::S3(_) => Ok(surviving.to_vec()),
         }
     }
 
@@ -6899,6 +6994,7 @@ impl SegmentStoreHandle {
         match self {
             SegmentStoreHandle::Cluster(c) => c.local().list(prefix).await,
             SegmentStoreHandle::Fs(fs) => fs.list(prefix).await,
+            SegmentStoreHandle::EncryptedFs(fs) => fs.list(prefix).await,
             SegmentStoreHandle::S3(s3) => s3.list(prefix).await,
         }
     }
@@ -6912,6 +7008,7 @@ impl SegmentStoreHandle {
         match self {
             SegmentStoreHandle::Cluster(c) => c.local().get(id).await,
             SegmentStoreHandle::Fs(fs) => fs.get(id).await,
+            SegmentStoreHandle::EncryptedFs(fs) => fs.get(id).await,
             SegmentStoreHandle::S3(s3) => s3.get(id).await,
         }
     }
@@ -6927,6 +7024,7 @@ impl SegmentStoreHandle {
         match self {
             SegmentStoreHandle::Cluster(c) => c.local().delete(id).await,
             SegmentStoreHandle::Fs(fs) => fs.delete(id).await,
+            SegmentStoreHandle::EncryptedFs(fs) => fs.delete(id).await,
             SegmentStoreHandle::S3(s3) => s3.delete(id).await,
         }
     }
@@ -7297,16 +7395,36 @@ mod s3_store_handle_tests {
 /// `dir.join("segments")`, a sibling of the `internal/` subdirectory
 /// `ProdEnv::bind` already owns.
 ///
+/// **`encryption_key` (ADR 0069, S-03 PR 2)**: when `Some`, the `Fs`/`S3`
+/// variants are sealed under it (`animus_env::EncryptedSegmentStore`) —
+/// see that type's own module doc for the cluster-wide key-scope contract
+/// this relies on (every node reading a given `fs:`/`s3://` store must be
+/// configured with the *same* key file). **`Cluster` is deliberately
+/// untouched regardless of `encryption_key`** — encrypting its per-node
+/// local `FsSegmentStore` building block would mean changing
+/// `SegmentStoreHandle::Cluster`'s own concrete `ClusterSegmentStore<
+/// ProdEnv, FsSegmentStore>` type parameter, a larger, separate change; a
+/// `cluster`-backed store stays plaintext on disk under this PR, an
+/// honestly-stated scope cut (see this crate's own `docs/adr/
+/// 0069-encryption-at-rest.md` PR 2 amendment), not a claim that PR 1
+/// already covers it. Even with no key at all, the loud-refusal marker
+/// check (`animus_env::verify_or_init_segment_store_marker`) still runs on
+/// `Fs`/`S3`, so a store that already holds encrypted objects is never
+/// silently treated as plaintext.
+///
 /// # Errors
-/// Only the `S3` variant can fail (see [`s3_segment_store`]'s own doc) —
-/// `Cluster`/`Fs` are infallible today, but the whole function is `Result`
-/// so a caller doesn't need to know which variant might fail.
-fn build_segment_store(
+/// The `S3` variant can fail (see [`s3_segment_store`]'s own doc);
+/// `Fs`/`S3` can also fail the loud-refusal marker check above
+/// (a key/store mismatch); `Cluster` is infallible today, but the whole
+/// function is `Result` so a caller doesn't need to know which variant
+/// might fail.
+async fn build_segment_store(
     env: &ProdEnv,
     dir: &Path,
     control: ControlHandle,
     self_id: NodeId,
     config: &SegmentStoreConfig,
+    encryption_key: Option<&animus_env::EncryptionKey>,
 ) -> std::io::Result<SegmentStoreHandle> {
     Ok(match config {
         SegmentStoreConfig::Cluster => {
@@ -7322,8 +7440,31 @@ fn build_segment_store(
                 ),
             )
         }
-        SegmentStoreConfig::Fs(path) => SegmentStoreHandle::Fs(FsSegmentStore::new(path.clone())),
-        SegmentStoreConfig::S3(s3) => SegmentStoreHandle::S3(Arc::new(s3_segment_store(s3)?)),
+        SegmentStoreConfig::Fs(path) => {
+            let raw = FsSegmentStore::new(path.clone());
+            match encryption_key {
+                Some(key) => SegmentStoreHandle::EncryptedFs(
+                    animus_env::EncryptedSegmentStore::open(raw, env.clone(), key.clone()).await?,
+                ),
+                None => {
+                    animus_env::verify_or_init_segment_store_marker(&raw, env, None).await?;
+                    SegmentStoreHandle::Fs(raw)
+                }
+            }
+        }
+        SegmentStoreConfig::S3(s3) => {
+            let raw = s3_segment_store(s3)?;
+            let store: Arc<dyn animus_env::SegmentStore> = match encryption_key {
+                Some(key) => Arc::new(
+                    animus_env::EncryptedSegmentStore::open(raw, env.clone(), key.clone()).await?,
+                ),
+                None => {
+                    animus_env::verify_or_init_segment_store_marker(&raw, env, None).await?;
+                    Arc::new(raw)
+                }
+            };
+            SegmentStoreHandle::S3(store)
+        }
     })
 }
 
@@ -7357,9 +7498,16 @@ fn build_segment_store(
 pub(crate) enum BackupStoreHandle {
     Cluster(animus_cp_data::cluster_segment_store::ClusterSegmentStore<ProdEnv, FsSegmentStore>),
     Fs(FsSegmentStore),
+    /// The `--encryption-key`-sealed sibling of [`Fs`](Self::Fs) — see
+    /// [`SegmentStoreHandle::EncryptedFs`]'s own doc (ADR 0069, S-03 PR 2);
+    /// identical shape and cluster-wide key-scope contract, just for the
+    /// backup store's own object namespace.
+    EncryptedFs(animus_env::EncryptedSegmentStore<FsSegmentStore, ProdEnv>),
     /// `--backup-store s3://bucket[/prefix]?endpoint=...` (S-04 PR 2) — see
     /// [`SegmentStoreHandle::S3`]'s doc for why this holds a
-    /// `Arc<dyn SegmentStore>` rather than a concrete type.
+    /// `Arc<dyn SegmentStore>` rather than a concrete type, and for how a
+    /// keyed S3 store (ADR 0069, S-03 PR 2) is wrapped into this same
+    /// variant with no separate `EncryptedS3` variant needed.
     S3(Arc<dyn animus_env::SegmentStore>),
 }
 
@@ -7373,6 +7521,11 @@ impl BackupStoreHandle {
         match self {
             BackupStoreHandle::Cluster(c) => c.put_replicated(id, bytes).await,
             BackupStoreHandle::Fs(fs) => {
+                use animus_env::SegmentStore;
+                fs.put(id, bytes).await?;
+                Ok(Vec::new())
+            }
+            BackupStoreHandle::EncryptedFs(fs) => {
                 use animus_env::SegmentStore;
                 fs.put(id, bytes).await?;
                 Ok(Vec::new())
@@ -7399,6 +7552,7 @@ impl BackupStoreHandle {
         match self {
             BackupStoreHandle::Cluster(c) => c.get_from(replicas, id).await,
             BackupStoreHandle::Fs(fs) => fs.get(id).await,
+            BackupStoreHandle::EncryptedFs(fs) => fs.get(id).await,
             BackupStoreHandle::S3(s3) => s3.get(id).await,
         }
     }
@@ -7421,6 +7575,7 @@ impl BackupStoreHandle {
         match self {
             BackupStoreHandle::Cluster(c) => c.get(id).await,
             BackupStoreHandle::Fs(fs) => fs.get(id).await,
+            BackupStoreHandle::EncryptedFs(fs) => fs.get(id).await,
             BackupStoreHandle::S3(s3) => s3.get(id).await,
         }
     }
@@ -7436,6 +7591,7 @@ impl BackupStoreHandle {
         match self {
             BackupStoreHandle::Cluster(c) => c.delete_from(replicas, id).await,
             BackupStoreHandle::Fs(fs) => fs.delete(id).await,
+            BackupStoreHandle::EncryptedFs(fs) => fs.delete(id).await,
             BackupStoreHandle::S3(s3) => s3.delete(id).await,
         }
     }
@@ -7456,6 +7612,7 @@ impl BackupStoreHandle {
         match self {
             BackupStoreHandle::Cluster(c) => c.local().list(prefix).await,
             BackupStoreHandle::Fs(fs) => fs.list(prefix).await,
+            BackupStoreHandle::EncryptedFs(fs) => fs.list(prefix).await,
             BackupStoreHandle::S3(s3) => s3.list(prefix).await,
         }
     }
@@ -7469,6 +7626,7 @@ impl BackupStoreHandle {
         match self {
             BackupStoreHandle::Cluster(c) => c.local().delete(id).await,
             BackupStoreHandle::Fs(fs) => fs.delete(id).await,
+            BackupStoreHandle::EncryptedFs(fs) => fs.delete(id).await,
             BackupStoreHandle::S3(s3) => s3.delete(id).await,
         }
     }
@@ -7485,6 +7643,7 @@ impl BackupStoreHandle {
         match self {
             BackupStoreHandle::Cluster(c) => c.local().get(id).await,
             BackupStoreHandle::Fs(fs) => fs.get(id).await,
+            BackupStoreHandle::EncryptedFs(fs) => fs.get(id).await,
             BackupStoreHandle::S3(s3) => s3.get(id).await,
         }
     }
@@ -7534,14 +7693,21 @@ pub enum BackupStoreConfig {
 /// `prefix` unambiguous even if an operator pointed both stores at the same
 /// bucket) — but the same belt-and-suspenders posture applies equally.
 ///
+/// **`encryption_key` (ADR 0069, S-03 PR 2)**: identical contract to
+/// [`build_segment_store`]'s own `encryption_key` parameter — `Fs`/`S3`
+/// sealed under it when `Some`, `Cluster` deliberately untouched either
+/// way (same reasoning, see that function's own doc).
+///
 /// # Errors
-/// See [`build_segment_store`]'s own doc — only the `S3` variant can fail.
-fn build_backup_store(
+/// See [`build_segment_store`]'s own doc — the `S3` variant can fail, and
+/// `Fs`/`S3` can fail the loud-refusal marker check.
+async fn build_backup_store(
     env: &ProdEnv,
     dir: &Path,
     control: ControlHandle,
     self_id: NodeId,
     config: &BackupStoreConfig,
+    encryption_key: Option<&animus_env::EncryptionKey>,
 ) -> std::io::Result<BackupStoreHandle> {
     Ok(match config {
         BackupStoreConfig::Cluster => {
@@ -7557,8 +7723,31 @@ fn build_backup_store(
                 ),
             )
         }
-        BackupStoreConfig::Fs(path) => BackupStoreHandle::Fs(FsSegmentStore::new(path.clone())),
-        BackupStoreConfig::S3(s3) => BackupStoreHandle::S3(Arc::new(s3_segment_store(s3)?)),
+        BackupStoreConfig::Fs(path) => {
+            let raw = FsSegmentStore::new(path.clone());
+            match encryption_key {
+                Some(key) => BackupStoreHandle::EncryptedFs(
+                    animus_env::EncryptedSegmentStore::open(raw, env.clone(), key.clone()).await?,
+                ),
+                None => {
+                    animus_env::verify_or_init_segment_store_marker(&raw, env, None).await?;
+                    BackupStoreHandle::Fs(raw)
+                }
+            }
+        }
+        BackupStoreConfig::S3(s3) => {
+            let raw = s3_segment_store(s3)?;
+            let store: Arc<dyn animus_env::SegmentStore> = match encryption_key {
+                Some(key) => Arc::new(
+                    animus_env::EncryptedSegmentStore::open(raw, env.clone(), key.clone()).await?,
+                ),
+                None => {
+                    animus_env::verify_or_init_segment_store_marker(&raw, env, None).await?;
+                    Arc::new(raw)
+                }
+            };
+            BackupStoreHandle::S3(store)
+        }
     })
 }
 
@@ -11939,6 +12128,27 @@ pub async fn bind_cluster_with_advertise_host(
     dir: impl Into<PathBuf>,
     advertise_host: Option<String>,
 ) -> std::io::Result<Vec<BoundNode>> {
+    bind_cluster_with_advertise_host_and_key(n, ip, dir, advertise_host, None).await
+}
+
+/// Like [`bind_cluster_with_advertise_host`], but with `--encryption-key
+/// PATH` (ADR 0069, S-03 PR 1) explicit: the same key-file path is applied
+/// to every generated node's own [`RoleAddrs::encryption_key_path`] — each
+/// still writes to its own distinct data directory (`dir.join("node-{i}")`),
+/// so one shared key simply means every node's own disk is sealed under it.
+/// `None` (the default) is byte-for-byte pre-ADR-0069 plaintext behavior.
+///
+/// # Errors
+/// Propagates any bind / directory-creation failure, including a loud
+/// refusal (`Node::bind` → `ProdEnv::bind_with_tls_and_key`) if a node's
+/// existing data directory is incompatible with the given key.
+pub async fn bind_cluster_with_advertise_host_and_key(
+    n: usize,
+    ip: std::net::IpAddr,
+    dir: impl Into<PathBuf>,
+    advertise_host: Option<String>,
+    encryption_key_path: Option<String>,
+) -> std::io::Result<Vec<BoundNode>> {
     let dir = dir.into();
     let mut nodes = Vec::with_capacity(n);
     for i in 0..n {
@@ -11954,6 +12164,7 @@ pub async fn bind_cluster_with_advertise_host(
             console: addr(),
             advertise_host: advertise_host.clone(),
             tls: None,
+            encryption_key_path: encryption_key_path.clone(),
         };
         let node = Node::bind(config::node_id(i), addrs, dir.join(format!("node-{i}"))).await?;
         nodes.push(node);
@@ -12527,6 +12738,7 @@ pub async fn start_split_cluster_with_growth(
             console: ephemeral(),
             advertise_host: None,
             tls: None,
+            encryption_key_path: None,
         };
         control_bound.push(
             Node::bind_control(config::node_id(i), addrs, dir.join(format!("node-{i}"))).await?,
@@ -12545,6 +12757,7 @@ pub async fn start_split_cluster_with_growth(
             console: ephemeral(),
             advertise_host: None,
             tls: None,
+            encryption_key_path: None,
         };
         data_bound
             .push(Node::bind_data(config::node_id(i), addrs, dir.join(format!("node-{i}"))).await?);
@@ -14447,6 +14660,7 @@ mod confirm_futility_tests {
                 console: addrs[5],
                 advertise_host: None,
                 tls: None,
+                encryption_key_path: None,
             }],
             dynamo_auth: None,
             cluster_settings: None,
@@ -14683,6 +14897,7 @@ mod forward_transport_failure_tests {
                 console: addrs[6 * i + 5],
                 advertise_host: None,
                 tls: None,
+                encryption_key_path: None,
             })
             .collect();
         ClusterConfig {
@@ -14957,6 +15172,7 @@ mod forward_hop_timeout_tests {
                 console: addrs[6 * i + 5],
                 advertise_host: None,
                 tls: None,
+                encryption_key_path: None,
             })
             .collect();
         ClusterConfig {
@@ -15654,6 +15870,7 @@ mod client_cancellation_tests {
                 console: addrs[6 * i + 5],
                 advertise_host: None,
                 tls: None,
+                encryption_key_path: None,
             })
             .collect();
         ClusterConfig {
@@ -15983,6 +16200,7 @@ mod halted_shutdown_tests {
                 console: addrs[5],
                 advertise_host: None,
                 tls: None,
+                encryption_key_path: None,
             }],
             dynamo_auth: None,
             cluster_settings: None,
@@ -17027,6 +17245,7 @@ mod issue_298_conflict_tests {
                 intra: addrs[4],
                 advertise_host: None,
                 tls: None,
+                encryption_key_path: None,
                 console: addrs[5],
             }],
             dynamo_auth: None,

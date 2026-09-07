@@ -114,6 +114,79 @@
 #                       end to end anywhere; treat a first real CI failure
 #                       on the `e2e-kind-s3` job as this leg finding its
 #                       first real bug.
+#   E2E_ENCRYPTION   - "1" adds an ADR 0069 S-03 PR 3 leg on top of the
+#                       plain-TCP path (mutually independent of E2E_TLS/
+#                       E2E_S3 — any combination may be set): creates a
+#                       `Secret` holding a freshly generated 64-hex-character
+#                       key under the operator's one well-known data key
+#                       (`crate::desired::cluster_config::
+#                       ENCRYPTION_KEY_SECRET_DATA_KEY`, `"key"`), sets
+#                       `spec.encryptionKeySecretName` on the AnimusCluster,
+#                       then — after the ordinary PutItem below — execs into
+#                       the serving pod and greps its own data directory
+#                       recursively for the plaintext item value written
+#                       earlier (must be ABSENT) and checks `GET
+#                       /admin/config` never contains the raw key hex either
+#                       (this operator never puts key material in the
+#                       generated `ConfigMap`, so this is a belt-and-
+#                       suspenders proof, not a documented risk). Default "0"
+#                       (unset) leaves the smoke byte-for-byte unchanged.
+#                       UNVERIFIED in this sandbox, same `CAP_SYS_RESOURCE`
+#                       reason `E2E_TLS`/`E2E_S3` are above — written
+#                       carefully and `bash -n`-checked, never run end to end
+#                       anywhere; treat a first real CI failure on the
+#                       `e2e-kind-encryption` job as this leg finding its
+#                       first real bug.
+#   E2E_WEBHOOK      - "1" adds an S-07e (ADR 0070) leg on top of the
+#                       plain-TCP path (mutually independent of E2E_TLS/
+#                       E2E_S3/E2E_ENCRYPTION — any combination may be set):
+#                       proves the validating admission webhook actually
+#                       rejects a bad AnimusCluster write at the API server,
+#                       not merely as a reconciler-side status condition.
+#                       Unlike every other leg above, this one needs the
+#                       operator running IN-CLUSTER — the API server must be
+#                       able to dial the webhook, which an out-of-cluster
+#                       `cargo run` process (what every leg, this one
+#                       included, still uses for the ordinary reconcile
+#                       loop) structurally cannot serve. Rather than moving
+#                       the WHOLE operator in-cluster (a materially larger
+#                       change — real RBAC/ServiceAccount wiring against a
+#                       live API server, and a second controller instance
+#                       racing the existing out-of-cluster one over the same
+#                       objects), this leg deploys a SECOND, minimal
+#                       in-cluster Deployment running `--webhook-only`
+#                       (main.rs's own opt-in mode: no reconcile loop, no
+#                       Kubernetes client ever built at all — `validate_spec`
+#                       is pure, so the webhook itself never touches the
+#                       API) — see `crates/animus-operator/CLAUDE.md`'s e2e
+#                       section for why this is the deliberately smaller,
+#                       honest scope for this PR rather than a full
+#                       in-cluster reconciler. Builds the `animus-operator`
+#                       image from the same Dockerfile the ANIMUSD_IMAGE
+#                       build already warmed (`docker build --target
+#                       runtime-operator`, BuildKit cache-mount-shared with
+#                       the animusd build above — see the Dockerfile's own
+#                       "single cache-mounted compile" comment), generates a
+#                       self-signed webhook cert via `openssl` (the
+#                       hand-issued-`Secret` path `deploy/operator/
+#                       README.md` documents — no cert-manager dependency
+#                       for this leg, independent of whatever E2E_TLS did),
+#                       deploys it plus a `Service` and a
+#                       `ValidatingWebhookConfiguration` scoped to this
+#                       leg's own namespace via `namespaceSelector` (so a
+#                       webhook outage here can't affect anything outside
+#                       this smoke's own objects), then asserts an invalid
+#                       `spec.controlNodes` decrease is rejected by the API
+#                       server itself (not merely surfaced as a status
+#                       condition — this is the property no `cargo test`
+#                       run can prove) and a valid edit is still admitted.
+#                       Default "0" (unset) leaves the smoke byte-for-byte
+#                       unchanged. UNVERIFIED in this sandbox, same
+#                       `CAP_SYS_RESOURCE` reason every other leg above is —
+#                       written carefully and `bash -n`-checked, never run
+#                       end to end anywhere; treat a first real CI failure
+#                       on the `e2e-kind-webhook` job as this leg finding
+#                       its first real bug.
 #
 # Exit non-zero on any failure; a trap dumps cluster/operator diagnostics and
 # always tears down the kind cluster and background processes it started,
@@ -135,6 +208,14 @@ MINIO_ACCESS_KEY="e2eaccesskey"
 MINIO_SECRET_KEY="e2esecretkey123"
 S3_BUCKET="e2e-backups"
 S3_CREDS_SECRET_NAME="e2e-s3-creds"
+E2E_ENCRYPTION="${E2E_ENCRYPTION:-0}"
+ENCRYPTION_KEY_SECRET_NAME="e2e-encryption-key"
+E2E_WEBHOOK="${E2E_WEBHOOK:-0}"
+OPERATOR_IMAGE="${OPERATOR_IMAGE:-animus-operator:e2e}"
+WEBHOOK_DEPLOYMENT_NAME="e2e-operator-webhook"
+WEBHOOK_SERVICE_NAME="e2e-operator-webhook"
+WEBHOOK_SECRET_NAME="e2e-operator-webhook-tls"
+WEBHOOK_CONFIG_NAME="e2e-animuscluster-validating-webhook"
 
 CLUSTER_NAME="animus-e2e"
 NAMESPACE="animus-e2e"
@@ -382,6 +463,10 @@ phase "preflight"
 for bin in docker kind kubectl curl jq; do
     command -v "$bin" >/dev/null 2>&1 || fail "missing required tool: ${bin}"
 done
+if [ "$E2E_ENCRYPTION" = "1" ] || [ "$E2E_WEBHOOK" = "1" ]; then
+    command -v openssl >/dev/null 2>&1 ||
+        fail "missing required tool: openssl (needed by E2E_ENCRYPTION=1/E2E_WEBHOOK=1)"
+fi
 log "repo root: ${REPO_ROOT}"
 log "workdir: ${WORKDIR}"
 log "ANIMUSD_IMAGE=${ANIMUSD_IMAGE} KIND_NODE_IMAGE=${KIND_NODE_IMAGE:-<default>}"
@@ -511,6 +596,23 @@ EOF
     allowInsecureHttp: true"
 fi
 
+ENCRYPTION_SPEC_YAML=""
+if [ "$E2E_ENCRYPTION" = "1" ]; then
+    phase "create the encryption key Secret (ADR 0069, S-03 PR 3)"
+    # A fresh 64-hex-character key, the exact format `animus_env::
+    # EncryptionKey::load_from_file` parses — this operator never generates
+    # or inspects the key itself, only mounts whatever's under the one
+    # well-known data key `crate::desired::cluster_config::
+    # ENCRYPTION_KEY_SECRET_DATA_KEY` ("key") names. Never logged or echoed
+    # anywhere below.
+    ENCRYPTION_KEY_HEX="$(openssl rand -hex 32)"
+    kubectl create secret generic "$ENCRYPTION_KEY_SECRET_NAME" -n "$NAMESPACE" \
+        --from-literal=key="$ENCRYPTION_KEY_HEX" \
+        --dry-run=client -o yaml | kubectl apply -f -
+
+    ENCRYPTION_SPEC_YAML="  encryptionKeySecretName: ${ENCRYPTION_KEY_SECRET_NAME}"
+fi
+
 phase "apply AnimusCluster"
 cat >"$MANIFEST_FILE" <<EOF
 apiVersion: animusdb.io/v1alpha1
@@ -532,6 +634,7 @@ spec:
   segmentStore: "dir:${DATA_MOUNT_DIR}/segments"
 ${TLS_SPEC_YAML}
 ${S3_SPEC_YAML}
+${ENCRYPTION_SPEC_YAML}
 EOF
 kubectl apply -f "$MANIFEST_FILE"
 kubectl get animuscluster "$AC_NAME" -n "$NAMESPACE" -o wide
@@ -724,6 +827,30 @@ NOTE="$(jq -r '.Item.note.S // empty' <<<"$BODY")"
 [ "$NOTE" = "hello from e2e" ] || fail "GetItem did not round-trip the item: ${BODY}"
 log "GetItem ok — item round-tripped"
 
+if [ "$E2E_ENCRYPTION" = "1" ]; then
+    phase "check the item's plaintext value is absent from the pod's own data directory"
+    # `grep -r` over the pod's own data volume (`spec.storage.ephemeral: true`
+    # here, but the same on-disk shape as a real PersistentVolumeClaim) — a
+    # plaintext write would land the note's exact bytes in an SSTable/WAL
+    # file somewhere under here (`animus-storage`'s `LsmEngine` applies no
+    # block compression), so finding it would mean the encryption wiring did
+    # nothing; finding NOTHING is the property this leg exists to prove.
+    if kubectl exec -n "$NAMESPACE" "$DYNAMO_POD" -- \
+        sh -c "grep -r -l 'hello from e2e' ${DATA_MOUNT_DIR}" >/dev/null 2>&1; then
+        fail "found the plaintext item value under ${DATA_MOUNT_DIR} in pod ${DYNAMO_POD} even \
+though spec.encryptionKeySecretName is set — the data directory is not actually sealed"
+    fi
+    log "plaintext item value not found under ${DATA_MOUNT_DIR} in pod ${DYNAMO_POD}"
+
+    phase "check GET /admin/config never exposes the encryption key material"
+    CONFIG_BODY="$(curl -sS -m 5 "${CURL_TLS_ARGS[@]}" \
+        "${ADMIN_SCHEME}://${ADMIN_HOST}:${ADMIN_LOCAL_PORT}/admin/config")"
+    if grep -qF "$ENCRYPTION_KEY_HEX" <<<"$CONFIG_BODY"; then
+        fail "GET /admin/config response contained the raw encryption key hex material"
+    fi
+    log "GET /admin/config does not expose the encryption key"
+fi
+
 phase "scale AnimusCluster to 4 nodes"
 kubectl patch animuscluster "$AC_NAME" -n "$NAMESPACE" --type=merge -p '{"spec":{"nodes":4}}'
 wait_for "statefulset readyReplicas==4" 300 5 -- sts_ready_equals 4
@@ -841,6 +968,152 @@ if [ "$E2E_S3" = "1" ]; then
     KIND="$(jq -r '.store.kind // empty' <<<"$RESULT")"
     [ "$KIND" = "s3" ] || fail "GET /admin/backup-store did not report store.kind \"s3\": ${RESULT}"
     log "admin/backup-store reports store.kind=s3 (${RESULT})"
+fi
+
+if [ "$E2E_WEBHOOK" = "1" ]; then
+    phase "build + load the animus-operator image (S-07e)"
+    # Same Dockerfile, same builder stage the ANIMUSD_IMAGE build already
+    # ran (`cargo build --release -p animusd -p animus-cli -p
+    # animus-operator` in one pass) — BuildKit's cache mounts (`--mount=
+    # type=cache,target=/build/target`) persist across this second
+    # `docker build` invocation in the same daemon, so this is a fast
+    # cache hit, not a second from-scratch compile.
+    docker build --target runtime-operator -t "$OPERATOR_IMAGE" "$REPO_ROOT"
+    kind load docker-image "$OPERATOR_IMAGE" --name "$CLUSTER_NAME"
+
+    phase "generate a self-signed webhook TLS cert (S-07e)"
+    # The hand-issued-Secret path (`deploy/operator/README.md`'s own
+    # "Without cert-manager" alternative) — no cert-manager dependency for
+    # this leg, independent of whatever E2E_TLS did above. Self-signed is
+    # fine: the only caller is the kind cluster's own API server, dialing
+    # a Service DNS name inside the same cluster.
+    WEBHOOK_KEY_FILE="${WORKDIR}/webhook-tls.key"
+    WEBHOOK_CERT_FILE="${WORKDIR}/webhook-tls.crt"
+    WEBHOOK_SAN="DNS:${WEBHOOK_SERVICE_NAME},DNS:${WEBHOOK_SERVICE_NAME}.${NAMESPACE},DNS:${WEBHOOK_SERVICE_NAME}.${NAMESPACE}.svc,DNS:${WEBHOOK_SERVICE_NAME}.${NAMESPACE}.svc.cluster.local"
+    openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+        -keyout "$WEBHOOK_KEY_FILE" -out "$WEBHOOK_CERT_FILE" \
+        -subj "/CN=${WEBHOOK_SERVICE_NAME}.${NAMESPACE}.svc" \
+        -addext "subjectAltName=${WEBHOOK_SAN}" \
+        >/dev/null 2>&1
+    [ -s "$WEBHOOK_CERT_FILE" ] && [ -s "$WEBHOOK_KEY_FILE" ] ||
+        fail "openssl did not produce a webhook cert/key pair"
+    kubectl create secret tls "$WEBHOOK_SECRET_NAME" -n "$NAMESPACE" \
+        --cert="$WEBHOOK_CERT_FILE" --key="$WEBHOOK_KEY_FILE" \
+        --dry-run=client -o yaml | kubectl apply -f -
+    WEBHOOK_CA_BUNDLE="$(base64 -w0 "$WEBHOOK_CERT_FILE")"
+
+    phase "deploy the operator in-cluster, --webhook-only (S-07e)"
+    # A SECOND, minimal Deployment — not deploy/operator/deployment.yaml
+    # (which would start a second full reconciler racing the out-of-cluster
+    # one already running against these same objects). `--webhook-only`
+    # (main.rs) means this process builds no Kubernetes client at all, so
+    # it needs no RBAC/ServiceAccount of its own beyond the namespace's
+    # default one.
+    kubectl apply -f - <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${WEBHOOK_DEPLOYMENT_NAME}
+  namespace: ${NAMESPACE}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: ${WEBHOOK_DEPLOYMENT_NAME}}
+  template:
+    metadata:
+      labels: {app: ${WEBHOOK_DEPLOYMENT_NAME}}
+    spec:
+      containers:
+        - name: operator
+          image: ${OPERATOR_IMAGE}
+          args:
+            - "run"
+            - "--webhook-addr=0.0.0.0:9443"
+            - "--webhook-cert=/etc/animus/webhook/tls.crt"
+            - "--webhook-key=/etc/animus/webhook/tls.key"
+            - "--webhook-only"
+          ports:
+            - name: webhook
+              containerPort: 9443
+          volumeMounts:
+            - name: webhook-tls
+              mountPath: /etc/animus/webhook
+              readOnly: true
+      volumes:
+        - name: webhook-tls
+          secret:
+            secretName: ${WEBHOOK_SECRET_NAME}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${WEBHOOK_SERVICE_NAME}
+  namespace: ${NAMESPACE}
+spec:
+  selector: {app: ${WEBHOOK_DEPLOYMENT_NAME}}
+  ports:
+    - name: webhook
+      port: 443
+      targetPort: webhook
+EOF
+    kubectl -n "$NAMESPACE" rollout status "deployment/${WEBHOOK_DEPLOYMENT_NAME}" --timeout=120s
+
+    phase "register the ValidatingWebhookConfiguration (S-07e)"
+    # namespaceSelector scopes this webhook to this leg's own namespace
+    # only — a webhook outage here (or a bug in this leg's own manifest)
+    # can't affect any AnimusCluster write outside this smoke's own
+    # objects, even under failurePolicy: Fail.
+    kubectl apply -f - <<EOF
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: ${WEBHOOK_CONFIG_NAME}
+webhooks:
+  - name: validate.e2e.animuscluster.animusdb.io
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    failurePolicy: Fail
+    timeoutSeconds: 5
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: ${NAMESPACE}
+    rules:
+      - apiGroups: ["animusdb.io"]
+        apiVersions: ["v1alpha1"]
+        resources: ["animusclusters"]
+        operations: ["CREATE", "UPDATE"]
+    clientConfig:
+      service:
+        name: ${WEBHOOK_SERVICE_NAME}
+        namespace: ${NAMESPACE}
+        path: /validate
+        port: 443
+      caBundle: ${WEBHOOK_CA_BUNDLE}
+EOF
+
+    phase "assert an invalid write is rejected by the API server (S-07e)"
+    # spec.controlNodes decreasing from 3 (this manifest's own value,
+    # grown to 4 by the S-07d leg above) to 1 is the identical grow-only
+    # rule crate::validate::validate_spec enforces — a real Kubernetes
+    # API-server-level rejection, not a status condition, is exactly the
+    # property no `cargo test -p animus-operator` run can prove.
+    WEBHOOK_REJECT_LOG="${WORKDIR}/webhook-reject.log"
+    if kubectl patch animuscluster "$AC_NAME" -n "$NAMESPACE" --type merge \
+        -p '{"spec":{"controlNodes":1}}' >"$WEBHOOK_REJECT_LOG" 2>&1; then
+        fail "expected the admission webhook to reject a spec.controlNodes decrease, but the patch succeeded: $(cat "$WEBHOOK_REJECT_LOG")"
+    fi
+    grep -q "spec.controlNodes" "$WEBHOOK_REJECT_LOG" ||
+        fail "webhook rejection did not name spec.controlNodes: $(cat "$WEBHOOK_REJECT_LOG")"
+    log "invalid spec.controlNodes decrease correctly rejected by the admission webhook"
+
+    phase "assert a valid write is still admitted (S-07e)"
+    kubectl patch animuscluster "$AC_NAME" -n "$NAMESPACE" --type merge \
+        -p '{"spec":{"quiesceAfterSecs":7}}'
+    ACTUAL_QUIESCE="$(kubectl get animuscluster "$AC_NAME" -n "$NAMESPACE" \
+        -o jsonpath='{.spec.quiesceAfterSecs}')"
+    [ "$ACTUAL_QUIESCE" = "7" ] ||
+        fail "expected a valid write to be admitted and persisted, got quiesceAfterSecs=${ACTUAL_QUIESCE:-<empty>}"
+    log "valid write correctly admitted by the admission webhook"
 fi
 
 phase "delete AnimusCluster and verify GC"

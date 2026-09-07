@@ -65,9 +65,12 @@ binary for a build-time-only JSON shape. **Keeping that mirror in sync with
   - `configmap.rs`/`services.rs`/`statefulset.rs`/`networkpolicy.rs` — one
     builder module per child kind. `statefulset.rs` mounts `spec.tls`'s
     resolved `Secret` (ADR 0064 commit 3) read-only at `/etc/animus/tls`,
-    the same mount for either `TlsSpec` shape, and (S-04 PR 3)
-    `spec.s3.credentialsSecretName`'s `Secret` read-only at `/etc/animus/s3`
-    on every pod; `networkpolicy.rs` is unaffected by TLS (its own module
+    the same mount for either `TlsSpec` shape, (S-04 PR 3)
+    `spec.s3.credentialsSecretName`'s `Secret` read-only at `/etc/animus/s3`,
+    and (ADR 0069 S-03 PR 3)
+    `spec.encryptionKeySecretName`'s `Secret` read-only, `defaultMode`
+    restricted, at `ENCRYPTION_KEY_MOUNT_DIR` (`/etc/animus/encryption`),
+    all on every pod; `networkpolicy.rs` is unaffected by TLS (its own module
     doc explains why: TLS is a mode a port's listener can be configured
     into, not a change to which pods may reach which port) but **is**
     affected by `spec.s3` (S-04 PR 3) — see this file's own S3 section
@@ -365,9 +368,11 @@ binary for a build-time-only JSON shape. **Keeping that mirror in sync with
 ## TLS (ADR 0064 commit 3)
 
 `AnimusClusterSpec.tls: Option<TlsSpec>` (`crd.rs`), two mutually exclusive
-shapes validated by `TlsSpec::validate` (`crate::controller::reconcile`
-calls it — no admission webhook in v1 to reject the write itself, same
-posture as `controlNodes`' immutability check): `secretName` (a
+shapes validated by `TlsSpec::validate` — called from `crate::validate::
+validate_spec`, shared by `crate::controller::reconcile`'s own condition-
+based fallback and the validating webhook (`crate::webhook`, S-07e/ADR
+0070, which rejects the write itself at write time when installed — see
+this file's own "Admission webhook" section below): `secretName` (a
 pre-existing `kubernetes.io/tls` `Secret` an operator user issued and
 placed by hand) or `certManager` (`issuerRef` + optional
 `duration`/`renewBefore`, referencing an already-existing `Issuer`/
@@ -432,8 +437,8 @@ set); `credentialsSecretName` names a `Secret` holding `access_key_id`/
 `secret_access_key`; `allowInsecureHttp` (default `false`) must be `true`
 for either store URI to set `insecure_http=true`; `egressCidrs` (default
 `["0.0.0.0/0"]`) scopes the generated `NetworkPolicy`'s S3 egress rule.
-`S3StoreSpec::validate` (called from `crate::controller::reconcile`, same
-"no admission webhook in v1" posture as `TlsSpec::validate`) rejects:
+`S3StoreSpec::validate` (called from `crate::validate::validate_spec`, same
+shared-validator posture as `TlsSpec::validate` above) rejects:
 neither store set, an empty `credentialsSecretName`, a URI `crate::
 s3_uri::parse` can't make sense of, or `insecure_http=true` without
 `allowInsecureHttp` — a `S3SpecInvalid` status condition, `spec.s3`
@@ -498,8 +503,8 @@ are the CRD surface for the *non-S3* forms `spec.s3` above doesn't cover —
 carrying the literal `--backup-store`/`--segment-store` flag value
 verbatim (`"cluster"`, `"fs:<path>"`, `"dir:<path>"`), unlike `S3StoreSpec`
 which is a sub-object. `AnimusClusterSpec::validate_store_spec` (called
-from `crate::controller::reconcile`, same "no admission webhook in v1"
-posture as `TlsSpec`/`S3StoreSpec`'s own `validate`) accepts exactly
+from `crate::validate::validate_spec`, same shared-validator posture as
+`TlsSpec`/`S3StoreSpec`'s own `validate`) accepts exactly
 `"cluster"` or `"fs:<path>"` for `backupStore`, and only `"dir:<path>"`
 for `segmentStore` — **`animusd`'s own `--segment-store` has no `"cluster"`
 keyword at all** (`parse_segment_store`'s own doc: omitting the flag is
@@ -546,6 +551,123 @@ with `allowInsecureHttp: true`, then exercises `CreateBackup`/
 /admin/backup-store` reports `"kind":"s3"`. Written carefully and
 `bash -n`-checked, never run end to end anywhere — treat a first real CI
 failure on the `e2e-kind-s3` job as this leg finding its first real bug.
+
+## Encryption at rest (ADR 0069, S-03 PR 3, closes `docs/roadmap.md`'s
+S-03 — S-03 is now complete)
+
+`AnimusClusterSpec.encryption_key_secret_name: Option<String>` (`crd.rs`)
+mirrors `dynamo_auth_secret_name`'s own flat-field shape (not `TlsSpec`'s
+nested two-shape one — there is no second way to *obtain* this key the
+way cert-manager offers a second way to *issue* a TLS cert, so a nested
+object would only add ceremony): names a pre-existing `Secret` (same
+namespace) this operator only ever mounts, **never** generates, inspects,
+or stores. The `Secret` must carry the raw key under one well-known data
+key, `desired::cluster_config::ENCRYPTION_KEY_SECRET_DATA_KEY` (`"key"`)
+— the 64-hex-character format `animus_env::EncryptionKey::
+load_from_file` parses.
+
+Downstream wiring, all mirroring `spec.tls`'s own precedent:
+
+- `desired::statefulset::build` mounts the `Secret` read-only at
+  `desired::cluster_config::ENCRYPTION_KEY_MOUNT_DIR`
+  (`/etc/animus/encryption`) on **every** pod regardless of role, with
+  `defaultMode: 0o444` (`desired::statefulset::
+  ENCRYPTION_KEY_SECRET_DEFAULT_MODE`) — world-readable, no write bit for
+  anyone. Tighter than `0o440`/`0o400` deliberately: this pod spec sets no
+  `securityContext.fsGroup`, and a `Secret` volume's files are owned
+  `root:root` by default, so dropping the "other" read bit would make the
+  key unreadable by the non-root `animus` user the `animusd` image runs
+  as (`Dockerfile`'s `USER animus:animus`).
+- `desired::cluster_config::build_cluster_config` gives every node's
+  `RoleAddrs` the identical `encryption_key_path`
+  (`desired::cluster_config::encryption_key_mount_path()` =
+  `/etc/animus/encryption/key`) when the field is set — the exact
+  `tls_section()` precedent (a fixed, mount-path-only value, identical
+  across every node by construction). **Never a `--encryption-key` CLI
+  flag** — every pod this operator generates already runs `--config`/
+  `data --config` against a `cluster.json` whose own node entry can carry
+  the field directly (ADR 0069 PR 1's own config-field hook), so the
+  config-file route was already complete for this operator's deployment
+  shape; emitting the flag on top would in fact be a hard `animusd`
+  startup error (the config file's own section and the flag both setting
+  it is refused, not silently reconciled — the same "one way, not both"
+  contract `--dynamo-auth`/`--quiesce-after` already document).
+- `desired::statefulset::RestartRelevantConfig` gained an
+  `encryption_key_path: Option<String>` field, `#[serde(skip_
+  serializing_if = "Option::is_none")]` — deliberately **not** `tls`'s own
+  always-serialize-as-`null` shape, so a spec with the field unset
+  (every cluster that predates this PR) serializes byte-identically to
+  before the field existed and the pinned config-hash fixture test needed
+  no literal update. Only the field's *presence* participates in the
+  hash (mapped to the one fixed mount path, never the `Secret`'s own
+  name) — adding/removing it rolls every pod (a running `animusd` reads
+  `RoleAddrs::encryption_key_path` once at boot, never live); renaming the
+  referenced `Secret` under an unchanged presence state rolls pods too,
+  but through the volume's own `secretName` diff, not through this hash
+  (mirrors `spec.tls`'s own secret-name-excluded reasoning exactly);
+  rotating the `Secret`'s own *content* under an unchanged name never
+  rolls anything, at either layer — correct, since ADR 0069 has no
+  in-place re-encryption mechanism to roll a pod *into*.
+
+**Validated live, unlike every other `*SpecInvalid` check in this
+crate — and deliberately NOT stripped on failure.**
+`crate::controller::validate_encryption_key_secret` reads the named
+`Secret` back through `ClusterApi::get_secret` on every reconcile (a
+`Secret` *reference*'s only checkable property is whether it actually
+exists, which the spec alone can never say — unlike `TlsSpec::validate`/
+`S3StoreSpec::validate`, pure functions with no cluster access) and sets
+`crd::CONDITION_ENCRYPTION_KEY_SECRET_INVALID` naming exactly what's
+wrong (missing entirely, or present without the `"key"` data key). Unlike
+`TlsSpecInvalid`/`S3SpecInvalid`/`StoreSpecInvalid` — each of which
+strips its own field and reconciles the rest of the spec as if it were
+unset — this check leaves `spec.encryptionKeySecretName` in place either
+way: falling back to "as if unset" would regenerate a plaintext
+`cluster.json` for a cluster whose data directory may already be
+encrypted, which (via the config-hash annotation) would roll every pod
+straight into ADR 0069's own loud "no key against an encrypted
+directory" startup refusal — a `CrashLoopBackOff` this operator would
+have actively caused, not merely failed to prevent. Leaving the spec's
+own still-referencing desired state in place instead means a genuinely
+missing `Secret` just leaves the pod `ContainerCreating` (harmless,
+self-healing once the `Secret` exists) with the condition explaining why.
+**Removing the field from an already-encrypted cluster is the symmetric,
+equally uncovered case** — the operator applies the edit as given (volume
+gone, `cluster.json` field gone, pods roll), and each restarted `animusd`
+hits PR 1's identical refusal on its own, at its own startup, the only
+place that mismatch can correctly be caught; the operator does not, and
+structurally cannot, second-guess an operator-authored spec edit here.
+
+**A documentation/code gap found, not fixed, while landing this PR**: ADR
+0069 states `/admin/config` reports `encryption_key_path` as a path
+string. Tracing `animusd::admin::config_view`/`AdminInfo` while grounding
+this PR found that field was never actually added there — `/admin/config`
+reports nothing about encryption at all today (the safer of the two
+possible drifts, but still a stale claim, not a security bug). Not fixed
+here (out of an operator-only PR's scope — see ADR 0069's own "As-built:
+PR 3" amendment for the full note); `scripts/e2e-kind.sh`'s own
+`E2E_ENCRYPTION=1` leg checks the actual invariant instead (the raw
+`/admin/config` response body never contains the key hex material),
+which holds regardless of whether a future PR adds that field.
+
+**`scripts/e2e-kind.sh`'s `E2E_ENCRYPTION=1` leg is UNVERIFIED in this
+sandbox** — same `CAP_SYS_RESOURCE` reason `E2E_TLS`/`E2E_S3`'s own legs
+are (see the e2e section below): creates the `Secret` (a freshly
+generated key via `openssl rand -hex 32`, never logged), sets
+`spec.encryptionKeySecretName`, then — after the ordinary PutItem/GetItem
+round trip — `kubectl exec`s into the serving pod and `grep -r`s its own
+data directory for the plaintext item value (must be absent) and checks
+`GET /admin/config`'s raw response body never contains the key hex.
+Written carefully and `bash -n`-checked, never run end to end anywhere —
+treat a first real CI failure on the `e2e-kind-encryption` job as this
+leg finding its first real bug.
+
+**No CRD field or code touches the default replicated `cluster` segment/
+backup store** — that gap (issue #680) sits entirely in `animus-cp-data`,
+outside anything this operator's mount could influence either way, and
+`issue #676` (several per-node flags, `--encryption-key` among them, not
+threaded through `animusd join`/`data --seed`/`--cluster-control`+
+`--cluster-data`) is likewise irrelevant to this operator, which never
+generates those invocations.
 
 ## PodDisruptionBudget (S-07c, closes `docs/roadmap.md`'s S-07 item c and
 this crate's own ADR 0060 deferred-list bullet)
@@ -702,19 +824,126 @@ retry-a-different-voter test needs a *per-ordinal* failure, not the
 blanket `fail_drain`/`fail_remove` shape the pre-existing scale-down tests
 use.
 
+## Admission webhook (S-07e, closes `docs/roadmap.md`'s S-07 item e and
+ADR 0060's own deferred list — S-07 is now fully closed; ADR 0070)
+
+Two new modules, both `pub` at the crate root (`lib.rs`):
+
+- **`src/validate.rs`** — `validate_spec(old: Option<&AnimusClusterSpec>,
+  new: &AnimusClusterSpec) -> Result<(), Vec<Violation>>`, a pure function
+  (no cluster access, no `async`) checking every CRD-shape rule this crate
+  enforces purely from the spec: `spec.nodes >= 1` and `spec.controlNodes`
+  (resolved) `>= 1`/`<= spec.nodes` (both new — the CRD's own doc comment
+  claimed `nodes >= 1` but nothing enforced it before this PR),
+  `spec.controlNodes` never decreasing from `old`'s own resolved value
+  (`old` is `None` on a CREATE review, or when the reconciler has no
+  previously-applied `ConfigMap` yet), and `TlsSpec::validate`/
+  `S3StoreSpec::validate`/`AnimusClusterSpec::validate_store_spec` — the
+  same three methods `crd.rs` already defined, called from here rather than
+  reimplemented, so this crate has exactly one place any of these six
+  rules can be checked. Collects every violation in one pass (never stops
+  at the first). **This is the one function both `crate::controller::
+  reconcile` and `crate::webhook::handle_review` call** — see this file's
+  TLS/S3/Non-S3-stores sections above, each updated to point here instead
+  of repeating "no admission webhook in v1." `crate::controller::
+  control_nodes_regression`/`validate_control_nodes_within_nodes`
+  (moved out of `reconcile`'s own inline arithmetic into these two small
+  pure functions, still in `controller.rs` since they're reconciler-shaped
+  — reused by `validate_spec` too) are the two rules that didn't already
+  live on a `crd.rs` type. **Deliberately excludes** any *live* check (does
+  a referenced `Secret` exist) — those stay reconciler-only
+  (`validate_encryption_key_secret`'s own doc explains why a webhook must
+  never make one); a new, purely informational `CONDITION_NODES_SPEC_
+  INVALID` condition (`crd.rs`) surfaces the new `nodes >= 1` rule on a
+  cluster running without the webhook, with no fallback value to
+  strip/substitute (unlike `spec.tls`/`spec.s3`, which can safely
+  reconcile "as if unset").
+- **`src/webhook.rs`** — the HTTPS server itself: `load_tls_acceptor(cert_
+  path, key_path) -> Result<TlsAcceptor, WebhookError>` (server-only, no
+  client cert — the server-side mirror of `admin_client.rs::
+  build_tls_connector`, reading PEM bytes itself and parsing via
+  `rustls_pki_types`' `*_slice_iter`/`from_pem_slice`, not the `*_file`
+  helpers, since this workspace's dependency graph enables `rustls-
+  pki-types`'s `alloc` feature but not `std` — same choice `admin_client.rs`
+  already made), `handle_review(AdmissionReview<AnimusCluster>) ->
+  AdmissionReview<DynamicObject>` (the entire interesting logic, exposed
+  standalone over an *already-decoded* request so the handler tests need
+  no socket — decodes to an `AdmissionRequest`, checks `kind.kind ==
+  "AnimusCluster"` defense-in-depth, calls `validate::validate_spec`, and
+  builds the allowed/denied `AdmissionResponse`, joining every `Violation`'s
+  `field: message` with `"; "` on a denial), `run(addr, acceptor)` (the
+  accept loop — one task per connection, `hyper::server::conn::http1` +
+  `hyper_util::rt::TokioIo`, the identical shape `crates/animusd/src/
+  admin.rs::serve` uses, one real Kubernetes API server call away instead
+  of a kubelet probe). Uses `kube`'s `admission` Cargo feature (already
+  enabled — `Cargo.toml`) for `AdmissionReview`/`AdmissionRequest`/
+  `AdmissionResponse`; no new HTTP or TLS framework crate — `hyper` gained
+  the `"server"` feature (alongside its pre-existing `"client"`/`"http1"`)
+  for `hyper::server::conn::http1`, which pulled in exactly one new
+  transitive dependency, `httpdate` (the `Date` response header).
+
+`main.rs` gained `--webhook-addr ADDR --webhook-cert PATH --webhook-key
+PATH` on `run` (all three or none — `parse_webhook_config`; a partial set
+is a startup error) and a third subcommand, `animus-operator webhook-cert
+--namespace NS --service NAME --issuer-name NAME [--issuer-kind
+Issuer|ClusterIssuer] [--secret-name NAME] [--duration D] [--renew-before
+D]`, printing a standalone cert-manager `Certificate` YAML to stdout — the
+identical "print YAML, pipe into `kubectl apply -f -`" shape `crd` already
+established. When `run` is given the three webhook flags, `main.rs::run`
+loads the `TlsAcceptor` and `tokio::spawn`s `webhook::run` *before*
+awaiting the reconcile loop (which never returns on success) — a TLS-
+material or bind failure exits the process; a cluster whose deployment
+named these flags expects the webhook to actually be up, since
+`failurePolicy: Fail` (below) makes every `AnimusCluster` write depend on
+it. Without the three flags, nothing listens beyond the reconcile loop —
+`cargo run -p animus-operator -- run` (`scripts/e2e-kind.sh`'s plain leg)
+is byte-for-byte unchanged.
+
+**Cert issuance, two paths, mirroring `spec.tls`'s own precedent** —
+`crate::desired::certificate` gained `build_standalone(name, ns,
+secret_name, dns_names, issuer_ref, duration, renew_before) ->
+DynamicObject` (no owner reference — nothing in this crate owns the
+webhook's own cluster-independent objects) and `webhook_dns_names(service,
+ns) -> Vec<String>`, both generalized out of the existing `build`/
+`dns_names` (an `AnimusCluster`'s own TLS cert) via a new private `cert_
+spec` helper the two share — `webhook-cert` above is `build_standalone`'s
+one caller. `deploy/operator/webhook.yaml` ships a working example
+`Certificate` object (the cert-manager path) alongside the `Service`/
+`ValidatingWebhookConfiguration`; `deploy/operator/README.md`'s "Admission
+webhook" section has the exact commands for both the cert-manager path and
+the hand-issued-`Secret` alternative.
+
+**Static manifest, not operator-managed** — `deploy/operator/webhook.yaml`
+(`Service` + `ValidatingWebhookConfiguration`, `failurePolicy: Fail`,
+`sideEffects: None`, `admissionReviewVersions: [v1]`, `timeoutSeconds: 5`,
+scoped to `animusdb.io`/`animusclusters` CREATE/UPDATE) is a static,
+hand-applied manifest — the reconciler never creates, updates, or watches
+it, and no RBAC was added (the alternative, the operator self-registering
+a cluster-scoped `admissionregistration.k8s.io` object, was rejected — see
+ADR 0070's own Decision 4 for the full blast-radius/no-reconcile-cadence
+reasoning). `deployment.yaml` ships the webhook's own `args`/`ports`/
+`volumeMounts`/`volumes` as a commented-out block (mirroring `example.yaml`'s
+own commented-optional-section style) rather than active by default.
+
 ## Tests
 
 `cargo test -p animus-operator` — every `desired::*` builder module has its
-own `#[cfg(test)] mod tests` (208 tests total as of the 2026-09-06
-role-literal fix above):
+own `#[cfg(test)] mod tests` (258 lib unit tests as of S-07e, up from 234
+at S-03 PR 3 — the new `validate`/`webhook` modules and the `certificate`/
+`controller` additions this PR made, see this file's own "Admission
+webhook" section above):
 golden-JSON assertions for the `ClusterConfig`/`entrypoint.sh`
 `ConfigMap` contents (including the no-port-striding invariant, a
-scale-up byte-for-byte-preserves-existing-entries regression, and, since
-S-04 PR 3, the `--s3-credentials`-file-writing preamble/flags, and since
-S-07b, the non-S3 `backupStore`/`segmentStore` flag emission and its
-"whichever of `spec.s3` or the top-level field is set" precedence),
+scale-up byte-for-byte-preserves-existing-entries regression, since
+S-04 PR 3 the `--s3-credentials`-file-writing preamble/flags, since
+S-07b the non-S3 `backupStore`/`segmentStore` flag emission and its
+"whichever of `spec.s3` or the top-level field is set" precedence, and
+since S-03 PR 3 the `encryption_key_path` mount-path presence/identical-
+across-nodes/never-a-CLI-flag cases),
 `Service` port sets, `StatefulSet` probe paths/ports and ephemeral-vs-durable
-storage shape (plus the `spec.s3` `Secret` mount), `NetworkPolicy`
+storage shape (plus the `spec.s3` and, since S-03 PR 3, `spec.
+encryptionKeySecretName` `Secret` mounts — the latter's `defaultMode`
+restriction included), `NetworkPolicy`
 selector/ingress/egress rule structure (including the S-04 PR 3 egress
 additions: baseline intra+DNS on every cluster, an S3 rule only when
 `spec.s3` is set), and, since S-07c, `PodDisruptionBudget`
@@ -796,7 +1025,17 @@ directly.
   a new accessor this PR added), and a scale-down transition
   (`nodes: 5` → `nodes: 2, controlNodes: 2`) recomputing `maxUnavailable`
   from the new desired spec rather than inheriting the prior shape's
-  looser value.
+  looser value; and, since S-03 PR 3, `spec.encryptionKeySecretName`: a
+  valid `Secret` (present, with the `"key"` data key) wires the mount and
+  `cluster.json` field with no `EncryptionKeySecretInvalid` condition; a
+  missing `Secret`, and one present but missing the data key, each
+  surface that condition naming the problem WITHOUT stripping the field
+  (`parsed_cluster_config`, a new test helper parsing the applied
+  `ConfigMap`'s `cluster.json` back into `desired::cluster_config::
+  ClusterConfig`, asserts every node still carries `encryption_key_path`
+  either way); the condition clears once the `Secret` is fixed on a later
+  reconcile; and a cluster with the field unset touches neither the
+  mount, the `cluster.json` field, nor the condition.
   **What this harness does not prove**: real
   `kube::Api` wire behavior against an actual API server (conflicts,
   admission, watch-driven requeue, real server-side-apply field-ownership
@@ -922,6 +1161,61 @@ unchanged. Independent of `E2E_TLS` — either, both, or neither may be set.
 `CAP_SYS_RESOURCE` reason as `E2E_TLS` above — written carefully and
 `bash -n`-checked but never run end to end anywhere; the first real
 `e2e-kind-s3` CI run is this leg's first real test.
+
+**`E2E_ENCRYPTION=1` (ADR 0069 S-03 PR 3, CI's own `e2e-kind-encryption`
+job) runs the same smoke plus a `spec.encryptionKeySecretName` leg**: no
+extra in-cluster dependency (unlike MinIO for `E2E_S3`) — creates the
+`Secret` (a freshly generated 64-hex-character key via `openssl rand
+-hex 32`, never logged anywhere in the script), sets `spec.
+encryptionKeySecretName` on the manifest, then — right after the ordinary
+`PutItem`/`GetItem` round trip, before the scale-up — `kubectl exec`s
+into the serving pod and `grep -r`s its own data directory for the
+plaintext item value written by `PutItem` (must be absent: `LsmEngine`
+applies no block compression, so a plaintext write would land those
+exact bytes in an SSTable/WAL file somewhere under `DATA_MOUNT_DIR`) and
+checks `GET /admin/config`'s raw response body never contains the key
+hex; the plain-TCP path (`E2E_ENCRYPTION` unset) is byte-for-byte
+unchanged. Independent of `E2E_TLS`/`E2E_S3` — any combination may be
+set. **UNVERIFIED in this repository's sandboxed dev environment**, same
+`CAP_SYS_RESOURCE` reason as `E2E_TLS`/`E2E_S3` above — written carefully
+and `bash -n`-checked but never run end to end anywhere; the first real
+`e2e-kind-encryption` CI run is this leg's first real test.
+
+**`E2E_WEBHOOK=1` (S-07e, ADR 0070, CI's own `e2e-kind-webhook` job) runs
+the same smoke plus an in-cluster validating-admission-webhook leg** — the
+one leg here that needs the operator running **in-cluster**, since the API
+server must be able to dial the webhook, which an out-of-cluster `cargo
+run` process (what every leg, this one included, still uses for the
+ordinary reconcile loop) structurally cannot serve. Rather than moving the
+*whole* operator in-cluster (real RBAC/ServiceAccount wiring against a
+live cluster, and a second controller racing the existing out-of-cluster
+one over the same objects — a materially larger change than this leg
+needs), it builds the `animus-operator` image (`docker build --target
+runtime-operator`, BuildKit-cache-shared with the `ANIMUSD_IMAGE` build so
+this is a fast cache hit, not a second from-scratch compile — see the
+Dockerfile's own "single cache-mounted compile" comment) and deploys a
+**second, minimal** Deployment running `--webhook-only` (`main.rs`'s own
+opt-in mode — no reconcile loop, no Kubernetes client ever built at all,
+since `validate_spec` is pure and the webhook itself never touches the
+API), a hand-issued self-signed `Secret` via `openssl` (the "Without
+cert-manager" path `deploy/operator/README.md` documents — no cert-manager
+dependency for this leg, independent of whatever `E2E_TLS` did), a
+`Service`, and a `ValidatingWebhookConfiguration` scoped to this leg's own
+namespace via `namespaceSelector` (a webhook outage here can't affect
+anything outside this smoke's own objects, even under `failurePolicy:
+Fail`). Then asserts the one property no `cargo test -p animus-operator`
+run can prove: an invalid `spec.controlNodes` decrease (3 → 1, the
+identical grow-only rule `crate::validate::validate_spec` enforces) is
+rejected by the API server **itself** — `kubectl patch` fails outright,
+naming `spec.controlNodes` in its own error, not merely surfaced as a
+status condition on a persisted object — and a valid edit
+(`quiesceAfterSecs`) is still admitted and persisted. Independent of
+`E2E_TLS`/`E2E_S3`/`E2E_ENCRYPTION` — any combination may be set; the
+plain-TCP path (`E2E_WEBHOOK` unset) is byte-for-byte unchanged.
+**UNVERIFIED in this repository's sandboxed dev environment**, same
+`CAP_SYS_RESOURCE` reason as every leg above — written carefully and
+`bash -n`-checked but never run end to end anywhere; the first real
+`e2e-kind-webhook` CI run is this leg's first real test.
 
 **A sandboxed dev/build host can be structurally unable to run this at
 all — not a bug in this script or the operator.** `kind`'s own control

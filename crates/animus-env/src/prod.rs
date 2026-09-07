@@ -109,14 +109,12 @@ struct Inner {
     /// speaks the same mode: a cluster is either all-TLS or all-plain on the
     /// internal wire (config-validated one layer up, `animusd`, commit 2).
     tls: Option<TlsMaterial>,
-    data_dir: PathBuf,
-    /// Files whose *directory entry* is already durable — i.e. whose containing
-    /// directory chain has been fsynced since the file was (re)created. A file's
-    /// creation is a one-time namespace change: the first `sync` of a file pays
-    /// the directory fsync, later `sync`s (the WAL group-commit hot path) skip
-    /// it. `remove` un-memoizes (a re-created file is a new namespace change);
-    /// `replace` re-memoizes (its rename just got the chain fsynced).
-    dir_synced: StdMutex<BTreeSet<String>>,
+    /// This node's `Disk` implementation — plain (byte-identical to
+    /// pre-ADR-0069 behavior) unless an `--encryption-key` was configured at
+    /// [`bind_with_tls`](ProdEnv::bind_with_tls), in which case every file
+    /// this env reads/writes is sealed under it (ADR 0069). See
+    /// [`DiskBackend`]'s own doc.
+    disk: DiskBackend,
     /// This env's multiplexed inbox (ADR 0026): a background pump task (spawned
     /// alongside the accept loop, see `spawn_pump`) drains the accept loop's raw
     /// per-connection frames and files each into `demux.queues[frame.stream]`.
@@ -176,6 +174,37 @@ impl ProdEnv {
         data_dir: impl Into<PathBuf>,
         tls: Option<TlsConfig>,
     ) -> std::io::Result<(Self, SocketAddr)> {
+        Self::bind_with_tls_and_key(node_id, listen, data_dir, tls, None).await
+    }
+
+    /// Like [`bind_with_tls`](Self::bind_with_tls), but with encryption at
+    /// rest explicit (ADR 0069, S-03 PR 1): `None` is plaintext — byte-for-
+    /// byte the same on-disk behavior every existing caller of `bind`/
+    /// `bind_with_tls` has always had — `Some` composes every `Disk`
+    /// method this env serves with `EncryptedDisk`, sealing every file
+    /// under the given key. Verifies/initializes the data directory's
+    /// encryption marker (see `verify_or_init_marker`) **before** returning
+    /// — a wrong or missing key against an already-encrypted data
+    /// directory (or vice versa) is refused right here, before any
+    /// WAL/engine file in it is opened for use.
+    ///
+    /// This is `bind_with_tls`'s general form for the identical reason
+    /// `bind_with_tls` is `bind`'s: every existing caller of `bind`/
+    /// `bind_with_tls` — and every test — keeps compiling and behaving
+    /// identically with no change; only a caller that actually wants
+    /// encryption at rest reaches for this constructor instead.
+    ///
+    /// # Errors
+    /// Everything [`bind_with_tls`](Self::bind_with_tls) can return, plus a
+    /// loud refusal (see `verify_or_init_marker`'s own doc for the exact
+    /// text) on an `encryption_key`/data-directory mismatch.
+    pub async fn bind_with_tls_and_key(
+        node_id: NodeId,
+        listen: SocketAddr,
+        data_dir: impl Into<PathBuf>,
+        tls: Option<TlsConfig>,
+        encryption_key: Option<crate::EncryptionKey>,
+    ) -> std::io::Result<(Self, SocketAddr)> {
         let tls = tls.map(|cfg| cfg.load()).transpose()?;
         let data_dir = data_dir.into();
         tokio::fs::create_dir_all(&data_dir).await?;
@@ -185,6 +214,21 @@ impl ProdEnv {
         let demux = Arc::new(StdMutex::new(Demux::default()));
         let pump_abort = spawn_pump(raw_rx, Arc::clone(&demux));
 
+        let raw = RawFsDisk {
+            data_dir,
+            dir_synced: Arc::new(StdMutex::new(BTreeSet::new())),
+        };
+        let disk = match encryption_key {
+            None => {
+                crate::verify_or_init_marker(&raw, &DiskSaltRng, None).await?;
+                DiskBackend::Plain(raw)
+            }
+            Some(key) => {
+                crate::verify_or_init_marker(&raw, &DiskSaltRng, Some(&key)).await?;
+                DiskBackend::Encrypted(crate::EncryptedDisk::new(raw, DiskSaltRng, key))
+            }
+        };
+
         let env = Self {
             inner: Arc::new(Inner {
                 node_id,
@@ -193,8 +237,7 @@ impl ProdEnv {
                 local_addr,
                 conns: Arc::new(StdMutex::new(BTreeMap::new())),
                 tls,
-                data_dir,
-                dir_synced: StdMutex::new(BTreeSet::new()),
+                disk,
                 demux,
                 tasks: StdMutex::new(vec![accept_abort, pump_abort]),
                 metrics: MetricsHandle::recording(),
@@ -301,28 +344,6 @@ impl ProdEnv {
             h.abort();
         }
         wait_all_finished(&handles).await;
-    }
-
-    fn path(&self, file: &str) -> PathBuf {
-        self.inner.data_dir.join(file)
-    }
-
-    /// `fsync` every directory from `file`'s parent up to (and including) the
-    /// data dir, so a namespace change for `file` (creation, rename-over) is
-    /// durable. A file name carrying a subdirectory prefix (`"db/wal"`) needs
-    /// the whole chain synced: each intervening directory entry is a separate
-    /// namespace record. Bounded by the (tiny) nesting depth.
-    async fn sync_parents(&self, file: &str) -> std::io::Result<()> {
-        let path = self.path(file);
-        let mut dir = path.parent();
-        while let Some(d) = dir {
-            sync_dir(d).await?;
-            if d == self.inner.data_dir || !d.starts_with(&self.inner.data_dir) {
-                break;
-            }
-            dir = d.parent();
-        }
-        Ok(())
     }
 
     /// A point-in-time text export of this env's recorded metrics (ADR 0015):
@@ -850,8 +871,82 @@ async fn write_frame(
     Ok(())
 }
 
+/// This node's real filesystem `Disk` primitive — everything `impl Disk for
+/// ProdEnv` used to do directly, factored out so it can be composed *below*
+/// `EncryptedDisk` (ADR 0069) instead of being replaced by it. Deliberately
+/// holds only what raw file I/O needs (`data_dir` + its own `dir_synced`
+/// memo, in its own fresh `Arc` — **not** a reference back to `ProdEnv`'s
+/// `Inner`), so wrapping it in `EncryptedDisk` and storing that inside
+/// `Inner` creates no `Arc` reference cycle.
+#[derive(Clone)]
+struct RawFsDisk {
+    data_dir: PathBuf,
+    /// Files whose *directory entry* is already durable — see `Inner`'s old
+    /// field doc (moved here verbatim); semantics unchanged.
+    dir_synced: Arc<StdMutex<BTreeSet<String>>>,
+}
+
+impl RawFsDisk {
+    fn path(&self, file: &str) -> PathBuf {
+        self.data_dir.join(file)
+    }
+
+    /// `fsync` every directory from `file`'s parent up to (and including) the
+    /// data dir, so a namespace change for `file` (creation, rename-over) is
+    /// durable. A file name carrying a subdirectory prefix (`"db/wal"`) needs
+    /// the whole chain synced: each intervening directory entry is a separate
+    /// namespace record. Bounded by the (tiny) nesting depth.
+    async fn sync_parents(&self, file: &str) -> std::io::Result<()> {
+        let path = self.path(file);
+        let mut dir = path.parent();
+        while let Some(d) = dir {
+            sync_dir(d).await?;
+            if d == self.data_dir || !d.starts_with(&self.data_dir) {
+                break;
+            }
+            dir = d.parent();
+        }
+        Ok(())
+    }
+}
+
+/// This node's `Disk` implementation (ADR 0069): plain (byte-identical to
+/// pre-ADR-0069 behavior, zero overhead) unless an `--encryption-key` was
+/// configured at bind time. `ProdEnv`'s own `impl Disk` is a thin dispatch
+/// over this enum — see `bind_with_tls_and_key`'s doc for the loud-refusal
+/// check that runs before either variant is ever constructed.
+enum DiskBackend {
+    Plain(RawFsDisk),
+    Encrypted(crate::EncryptedDisk<RawFsDisk, DiskSaltRng>),
+}
+
+/// A minimal [`Rng`] drawing real OS randomness, scoped specifically to
+/// [`RawFsDisk`]'s per-file encryption salts (ADR 0069) — deliberately
+/// **not** `ProdEnv` itself, which would create an `Arc` reference cycle
+/// (`ProdEnv`'s `Inner` holding a `DiskBackend::Encrypted` that in turn
+/// held a `ProdEnv` pointing back at the same `Inner` would never be freed).
+/// Byte-for-byte the same source `ProdEnv`'s own [`Rng`] impl and
+/// [`PreBindRng`] already draw from — this is not a *third* real-randomness
+/// policy, just a differently-scoped handle onto the identical one.
+#[derive(Debug, Default, Clone, Copy)]
+struct DiskSaltRng;
+
+#[allow(
+    clippy::disallowed_types,
+    reason = "OsRng is the sanctioned real-randomness source ProdEnv's own encrypted-disk salts draw from (ADR 0069); see ADR 0061 Decision 4"
+)]
+impl Rng for DiskSaltRng {
+    fn next_u64(&self) -> u64 {
+        rand::RngCore::next_u64(&mut rand::rngs::OsRng)
+    }
+
+    fn fill_bytes(&self, dst: &mut [u8]) {
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, dst);
+    }
+}
+
 #[async_trait::async_trait]
-impl Disk for ProdEnv {
+impl Disk for RawFsDisk {
     async fn append(&self, file: &str, bytes: &[u8]) -> std::io::Result<()> {
         let path = self.path(file);
         // Fast path: the data dir was created at `bind`, so don't pay a
@@ -897,15 +992,13 @@ impl Disk for ProdEnv {
         // `sync` of a file (creation is a one-time namespace change; the
         // `dir_synced` memo keeps the group-commit hot path at one fsync).
         let already = self
-            .inner
             .dir_synced
             .lock()
             .expect("dir_synced poisoned")
             .contains(file);
         if !already {
             self.sync_parents(file).await?;
-            self.inner
-                .dir_synced
+            self.dir_synced
                 .lock()
                 .expect("dir_synced poisoned")
                 .insert(file.to_string());
@@ -960,8 +1053,7 @@ impl Disk for ProdEnv {
         // the dir fsync keeps deletes cheap. Do un-memoize the name: if the
         // file is re-created later, that is a fresh namespace change and its
         // next `sync` must fsync the directory again.
-        self.inner
-            .dir_synced
+        self.dir_synced
             .lock()
             .expect("dir_synced poisoned")
             .remove(file);
@@ -996,8 +1088,7 @@ impl Disk for ProdEnv {
         self.sync_parents(file).await?;
         // The chain is now durable for this name — a subsequent `sync` of the
         // same file need not re-fsync the directory.
-        self.inner
-            .dir_synced
+        self.dir_synced
             .lock()
             .expect("dir_synced poisoned")
             .insert(file.to_string());
@@ -1019,8 +1110,7 @@ impl Disk for ProdEnv {
         // containing directory chain or the link can be lost on power loss,
         // mirroring `replace`'s post-rename fsync.
         self.sync_parents(dst).await?;
-        self.inner
-            .dir_synced
+        self.dir_synced
             .lock()
             .expect("dir_synced poisoned")
             .insert(dst.to_string());
@@ -1031,7 +1121,7 @@ impl Disk for ProdEnv {
         // Non-recursive: a nested subdirectory is not this env's own top-level
         // disk contents. A data dir that does not exist yet reads as empty —
         // the env creates it lazily on first write.
-        let mut dir = match tokio::fs::read_dir(&self.inner.data_dir).await {
+        let mut dir = match tokio::fs::read_dir(&self.data_dir).await {
             Ok(dir) => dir,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(e),
@@ -1046,6 +1136,58 @@ impl Disk for ProdEnv {
         }
         names.sort_unstable();
         Ok(names)
+    }
+}
+
+macro_rules! dispatch_disk {
+    ($self:ident, $method:ident ( $($arg:expr),* )) => {
+        match &$self.inner.disk {
+            DiskBackend::Plain(d) => d.$method($($arg),*).await,
+            DiskBackend::Encrypted(d) => d.$method($($arg),*).await,
+        }
+    };
+}
+
+/// `ProdEnv`'s own `Disk` impl is a thin dispatch over [`DiskBackend`] (ADR
+/// 0069) — every method just routes to whichever variant `bind_with_tls_
+/// and_key` constructed, so a node with no `--encryption-key` (the default)
+/// runs the exact `RawFsDisk` code path this crate always has, unchanged.
+#[async_trait::async_trait]
+impl Disk for ProdEnv {
+    async fn append(&self, file: &str, bytes: &[u8]) -> std::io::Result<()> {
+        dispatch_disk!(self, append(file, bytes))
+    }
+
+    async fn sync(&self, file: &str) -> std::io::Result<()> {
+        dispatch_disk!(self, sync(file))
+    }
+
+    async fn read(&self, file: &str) -> std::io::Result<Vec<u8>> {
+        dispatch_disk!(self, read(file))
+    }
+
+    async fn read_at(&self, file: &str, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
+        dispatch_disk!(self, read_at(file, offset, len))
+    }
+
+    async fn size(&self, file: &str) -> std::io::Result<u64> {
+        dispatch_disk!(self, size(file))
+    }
+
+    async fn remove(&self, file: &str) -> std::io::Result<()> {
+        dispatch_disk!(self, remove(file))
+    }
+
+    async fn replace(&self, file: &str, bytes: &[u8]) -> std::io::Result<()> {
+        dispatch_disk!(self, replace(file, bytes))
+    }
+
+    async fn list(&self) -> std::io::Result<Vec<String>> {
+        dispatch_disk!(self, list())
+    }
+
+    async fn link(&self, src: &str, dst: &str) -> std::io::Result<()> {
+        dispatch_disk!(self, link(src, dst))
     }
 }
 
@@ -1862,6 +2004,95 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `EncryptedSegmentStore<FsSegmentStore, DiskSaltRng>` over a real
+    /// temp directory satisfies the identical shared contract (ADR 0069,
+    /// S-03 PR 2) — the `SegmentStore` sibling of this file's own
+    /// `FsSegmentStore` contract test above, and of `EncryptedDisk`'s own
+    /// `Disk`-seam contract coverage.
+    #[tokio::test]
+    async fn encrypted_fs_segment_store_satisfies_the_contract() {
+        let dir = unique_tmp_dir();
+        let raw = FsSegmentStore::new(&dir);
+        let key = crate::EncryptionKey::from_bytes([0x42; 32]);
+        let store = crate::EncryptedSegmentStore::open(raw, DiskSaltRng, key)
+            .await
+            .expect("open a fresh store with a key");
+        crate::test_support::assert_segment_store_contract(&store).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The real filesystem, real-disk end-to-end proof of the three loud
+    /// mismatch directions plus "the raw bytes on disk are not plaintext" —
+    /// the `SegmentStore` counterpart of `EncryptedDisk`'s own `ProdEnv`
+    /// mismatch coverage.
+    #[tokio::test]
+    async fn encrypted_fs_segment_store_marker_mismatch_and_ciphertext_on_disk() {
+        let dir = unique_tmp_dir();
+        let key_a = crate::EncryptionKey::from_bytes([0xAA; 32]);
+        let key_b = crate::EncryptionKey::from_bytes([0xBB; 32]);
+
+        // Fresh store, key A: initializes and writes real ciphertext to disk.
+        {
+            let raw = FsSegmentStore::new(&dir);
+            let store = crate::EncryptedSegmentStore::open(raw, DiskSaltRng, key_a.clone())
+                .await
+                .expect("open with key A");
+            store
+                .put(
+                    "t/label/1/0",
+                    b"a plaintext value nobody should see on disk",
+                )
+                .await
+                .expect("put");
+        }
+        let on_disk = tokio::fs::read(dir.join("t/label/1/0"))
+            .await
+            .expect("read raw file");
+        assert!(
+            !on_disk
+                .windows(b"a plaintext value".len())
+                .any(|w| w == b"a plaintext value"),
+            "the plaintext value must never appear verbatim on disk"
+        );
+
+        // Reopening with the wrong key is refused.
+        {
+            let raw = FsSegmentStore::new(&dir);
+            let err = crate::EncryptedSegmentStore::open(raw, DiskSaltRng, key_b)
+                .await
+                .map(|_| ())
+                .expect_err("the wrong key must be refused");
+            assert!(err.to_string().contains("does not match the key"));
+        }
+
+        // Reopening with no key at all is refused (encrypted store, no key).
+        {
+            let raw = FsSegmentStore::new(&dir);
+            let err = crate::verify_or_init_segment_store_marker(&raw, &DiskSaltRng, None)
+                .await
+                .expect_err("no key against an encrypted store must be refused");
+            assert!(err.to_string().contains("no --encryption-key was given"));
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // A key against a fresh, genuinely plaintext store (one real object,
+        // no marker) is refused too.
+        let dir2 = unique_tmp_dir();
+        {
+            let raw = FsSegmentStore::new(&dir2);
+            raw.put("some/object", b"plaintext")
+                .await
+                .expect("put plaintext");
+            let err = crate::EncryptedSegmentStore::open(raw, DiskSaltRng, key_a)
+                .await
+                .map(|_| ())
+                .expect_err("a key against a plaintext store must be refused");
+            assert!(err.to_string().contains("already holds unencrypted"));
+        }
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
     /// Ids map to nested subdirectories (the production shape,
     /// `{table}/{label}/{tablet}/{epoch}`), created on demand, and the bytes
     /// really land on disk at the expected nested path.
@@ -2348,5 +2579,167 @@ mod tests {
 
         accept_task.await.expect("accept task panicked");
         let _ = std::fs::remove_dir_all(&pki_dir);
+    }
+
+    // -----------------------------------------------------------------
+    // Encryption at rest (ADR 0069, S-03 PR 1) over a real filesystem.
+    // -----------------------------------------------------------------
+
+    fn test_key(byte: u8) -> crate::EncryptionKey {
+        crate::EncryptionKey::from_bytes([byte; 32])
+    }
+
+    #[tokio::test]
+    async fn encrypted_prod_env_round_trips_and_plaintext_never_hits_disk() {
+        let dir = unique_tmp_dir();
+        let (env, _addr) = ProdEnv::bind_with_tls_and_key(
+            nid(0),
+            "127.0.0.1:0".parse().unwrap(),
+            &dir,
+            None,
+            Some(test_key(1)),
+        )
+        .await
+        .expect("bind encrypted");
+
+        env.append("db-wal", b"super-secret-payload")
+            .await
+            .expect("append");
+        env.sync("db-wal").await.expect("sync");
+        assert_eq!(
+            env.read("db-wal").await.expect("read"),
+            b"super-secret-payload"
+        );
+
+        // The raw bytes on disk must never contain the plaintext.
+        let raw = std::fs::read(dir.join("db-wal")).expect("raw read");
+        assert!(
+            !raw.windows(b"super-secret".len())
+                .any(|w| w == b"super-secret"),
+            "plaintext leaked onto disk: {raw:?}"
+        );
+        // And the marker file is really there, on the real filesystem.
+        assert!(dir.join(crate::MARKER_FILE).exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn encrypted_prod_env_wrong_key_on_reopen_is_a_loud_refusal() {
+        let dir = unique_tmp_dir();
+        {
+            let (env, _addr) = ProdEnv::bind_with_tls_and_key(
+                nid(0),
+                "127.0.0.1:0".parse().unwrap(),
+                &dir,
+                None,
+                Some(test_key(2)),
+            )
+            .await
+            .expect("bind encrypted");
+            env.append("db-wal", b"x").await.expect("append");
+            env.sync("db-wal").await.expect("sync");
+        }
+
+        let err = match ProdEnv::bind_with_tls_and_key(
+            nid(0),
+            "127.0.0.1:0".parse().unwrap(),
+            &dir,
+            None,
+            Some(test_key(3)),
+        )
+        .await
+        {
+            Ok(_) => panic!("wrong key must be refused"),
+            Err(e) => e,
+        };
+        assert_eq!(
+            err.to_string(),
+            "--encryption-key does not match the key this data directory was encrypted with — \
+             refusing to start. Use the original key, or point at a fresh data directory."
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn encrypted_prod_env_missing_key_on_reopen_is_a_loud_refusal() {
+        let dir = unique_tmp_dir();
+        {
+            let (env, _addr) = ProdEnv::bind_with_tls_and_key(
+                nid(0),
+                "127.0.0.1:0".parse().unwrap(),
+                &dir,
+                None,
+                Some(test_key(4)),
+            )
+            .await
+            .expect("bind encrypted");
+            env.append("db-wal", b"x").await.expect("append");
+            env.sync("db-wal").await.expect("sync");
+        }
+
+        let err = match ProdEnv::bind(nid(0), "127.0.0.1:0".parse().unwrap(), &dir).await {
+            Ok(_) => panic!("missing key against an encrypted directory must be refused"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("no --encryption-key was given"),
+            "unexpected message: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn encrypted_prod_env_key_against_existing_plaintext_dir_is_a_loud_refusal() {
+        let dir = unique_tmp_dir();
+        {
+            let (env, _addr) = ProdEnv::bind(nid(0), "127.0.0.1:0".parse().unwrap(), &dir)
+                .await
+                .expect("bind plaintext");
+            env.append("db-wal", b"x").await.expect("append");
+            env.sync("db-wal").await.expect("sync");
+        }
+
+        let err = match ProdEnv::bind_with_tls_and_key(
+            nid(0),
+            "127.0.0.1:0".parse().unwrap(),
+            &dir,
+            None,
+            Some(test_key(5)),
+        )
+        .await
+        {
+            Ok(_) => panic!("key against an existing plaintext directory must be refused"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("already holds unencrypted files"),
+            "unexpected message: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// No key at all is byte-identical to pre-ADR-0069 `ProdEnv`: no marker
+    /// file is ever written, and nothing about the on-disk bytes changes.
+    #[tokio::test]
+    async fn no_key_writes_no_marker_and_stays_byte_identical() {
+        let dir = unique_tmp_dir();
+        let (env, _addr) = ProdEnv::bind(nid(0), "127.0.0.1:0".parse().unwrap(), &dir)
+            .await
+            .expect("bind");
+        env.append("f", b"plain-bytes").await.expect("append");
+        env.sync("f").await.expect("sync");
+
+        let raw = std::fs::read(dir.join("f")).expect("raw read");
+        assert_eq!(
+            raw, b"plain-bytes",
+            "plaintext path must write bytes verbatim"
+        );
+        assert!(!dir.join(crate::MARKER_FILE).exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
