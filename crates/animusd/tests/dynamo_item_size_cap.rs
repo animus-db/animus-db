@@ -15,6 +15,14 @@
 //! coverage of `apply_update` itself (the exact-boundary case and the
 //! mid-fold-over/nets-back-under case). This file proves the same fix
 //! through the real wire, on both operations that reach it.
+//!
+//! **`update_item_rejects_a_post_update_result_over_the_cap` (the plain
+//! `UpdateItem` half) moved to
+//! `crates/animusd/src/sim_cluster_dynamo_item_size_cap.rs`** (ADR 0061
+//! rung D3 PR 1) — base-table-only, reachable through `dynamo::
+//! dispatch_item_op`. `transact_write_items_update_action_rejects_a_post_
+//! update_result_over_the_cap` stays here: `TransactWriteItems` is not yet
+//! covered by that generic core.
 
 use std::net::SocketAddr;
 
@@ -119,61 +127,6 @@ fn large_but_legal_item(id: &str) -> String {
         r#"{{"id":{{"S":"{id}"}},"payload":{{"S":"{}"}}}}"#,
         long_string(350_000)
     )
-}
-
-/// `UpdateItem` rejects a post-update result over the cap, and leaves the
-/// original item untouched — the leader evaluates the whole action list,
-/// finds the net result over `MAX_ITEM_SIZE_BYTES`, and never proposes the
-/// write at all.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn update_item_rejects_a_post_update_result_over_the_cap() {
-    let dir = support::panic_safe_tempdir();
-    let (node, _config) = support::start_single_node(dir.path(), StorageBackend::Memory).await;
-    let addr = node.dynamo_addr();
-
-    create_table(addr, "big").await;
-    put_item(addr, "big", &large_but_legal_item("u1")).await;
-
-    // The base item is ~350_007 bytes; a further ~70_000-byte "extra"
-    // attribute pushes the post-update result well past MAX_ITEM_SIZE_BYTES
-    // (409_600).
-    let over_cap_value = long_string(70_000);
-    let (status, body) = dynamo(
-        addr,
-        "DynamoDB_20120810.UpdateItem",
-        &format!(
-            r#"{{"TableName":"big","Key":{{"id":{{"S":"u1"}}}},
-                "UpdateExpression":"SET extra = :v",
-                "ExpressionAttributeValues":{{":v":{{"S":"{over_cap_value}"}}}}}}"#
-        ),
-    )
-    .await;
-    assert_eq!(
-        status, 400,
-        "an UpdateItem whose result exceeds the 400 KB cap must be rejected: {body}"
-    );
-    assert!(
-        body.contains("ValidationException"),
-        "expected ValidationException, got: {body}"
-    );
-    assert!(
-        body.contains("Item size has exceeded the maximum allowed size"),
-        "expected the size-cap message, got: {body}"
-    );
-
-    // The rejected UpdateItem must not have landed: the pre-update item is
-    // still exactly what PutItem wrote, with no "extra" attribute.
-    let after = get_item(addr, "big", "u1").await;
-    assert!(
-        after.contains(r#""payload""#),
-        "the original item must survive the rejected update: {after}"
-    );
-    assert!(
-        !after.contains(r#""extra""#),
-        "the rejected update's attribute must not have landed: {after}"
-    );
-
-    node.shutdown_graceful().await;
 }
 
 /// The same rejection through `TransactWriteItems`'s `Update` action — the

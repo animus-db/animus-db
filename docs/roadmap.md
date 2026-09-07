@@ -314,9 +314,31 @@ the still-true paragraph after the table.
   the full design and the read-consistency modeling decision). GSI/LSI
   `Query`/`Scan`, `TransactWriteItems`/`TransactGetItems`, and PartiQL
   remain out of scope, named as D2's own residuals for whichever rung
-  generalizes those operations next. D3-D4 remain open (the `animusd`
-  integration-suite migration, and deterministic coverage for
-  auto-split/GC/join/backup-janitor).
+  generalizes those operations next. **D3 (the `animusd` integration-suite
+  migration) is in progress: PR 1 landed 2026-09-07** — a planning pass
+  classified `crates/animusd/tests/`'s 120 real-socket `ProdEnv` binaries
+  (524 tests); this PR converted the "B class" (base-table DynamoDB logic
+  reachable through `dispatch_item_op`, ~30 tests across ten
+  `tests/dynamo_*.rs` binaries plus `kind_batch_outcome.rs`) to eleven
+  `SimCluster`-driven `sim_cluster_dynamo_*`/`sim_cluster_kind_batch_
+  outcome` modules in `src/` (`SimCluster::dynamo_concurrent` is this PR's
+  own new fixture primitive, for racing several wire requests at one key —
+  see `crates/animusd/CLAUDE.md`'s Tests section for the full module list
+  and what stayed on `ProdEnv`). **The roadmap's own success criterion
+  above ("the `prod-liveness` job shrinks enough to drop its 2-attempt
+  retry") is stale and corrected here**: `.github/workflows/ci.yml`'s own
+  comments show the retry loop was already replaced by nextest sharding
+  (`prod-liveness-animusd` 4 partitions, plus `prod-liveness-hammer-pair`/
+  `prod-liveness-scattered`) before this rung started — there is no retry
+  left to drop. D3's real goal, and the one this and future PRs measure
+  against, is shrinking the real-thread tier's own test count / wall time /
+  flake surface. A parallel redundancy audit folded in two more removals
+  from `dynamo_wire.rs`/`dynamo_throttling.rs` whose tests duplicated
+  existing sim coverage outright (see those files' own doc comments). D3's
+  remaining classes (GSI/LSI-touching, DDL/wire-level `CreateTable`,
+  Transact, PartiQL, Streams, TTL, admin/console/dashboard HTTP, TLS,
+  SigV4, restart-durability, wall-clock timing) and D4 (deterministic
+  coverage for auto-split/GC/join/backup-janitor) remain open.
 - **E1 landed 2026-09-04** (`ClusterApi`/`AdminOps` seams in
   `animus-operator`, fake-driven `controller::tests`; ADR 0061's
   2026-09-04 amendment). **E2 landed 2026-09-07**: the seven pre-existing

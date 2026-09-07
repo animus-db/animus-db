@@ -3239,9 +3239,15 @@ no clean way to assert "no clone happened" directly, so this test instead
 pins the default flag/defaults state the guard's correctness rests on;
 the guard's placement as each function's first statement is a
 code-review invariant, documented on both). `tests/
-dynamo_throttling.rs` is the real-thread, real-socket regression: single-item
-write/read throttling and recovery, `ProvisionedThroughputExceededException`'s
-wire shape, `BatchGetItem`'s `UnprocessedKeys`, `BatchWriteItem`'s
+dynamo_throttling.rs` is the real-thread, real-socket regression (ADR 0061
+rung D3 moved its own single-item write/read throttling-and-recovery pair
+to `sim_cluster_throttle.rs`'s
+`write_admits_a_burst_then_refuses_then_recovers_after_a_full_refill`/
+`read_admits_a_burst_then_refuses_then_recovers_after_a_full_refill` — see
+that file's own doc — leaving this file the shapes with no sim analog):
+`ProvisionedThroughputExceededException`'s wire shape (still exercised via
+the forwarded-write and admin-metrics tests below),
+`BatchGetItem`'s `UnprocessedKeys`, `BatchWriteItem`'s
 `UnprocessedItems` (via a **streamed** table specifically, to get true
 per-item granularity rather than the marker fast-arm's per-tablet-group
 shape described above), `TransactWriteItems`' `ThrottlingError` cancellation
@@ -3818,8 +3824,11 @@ route below the edge through the same `ClientCtx` CP primitives.
   amendment for the full design, every deleted mechanism (`predict_kind_
   eval_decision`, `Metric::KindEvalSeatbeltMismatch`, `cp_kind_local`, and
   more), and the `concurrent_increments_all_land_exactly_once`/
-  `concurrent_conditional_add_all_land_exactly_once` regressions
-  (`dynamo_update_add_delete.rs`) that prove zero refusals under contention.
+  `concurrent_conditional_add_all_land_exactly_once` regressions (ADR 0061
+  rung D3 moved both to `crates/animusd/src/
+  sim_cluster_dynamo_update_add_delete.rs`, `SimCluster::dynamo_concurrent`-
+  driven; `dynamo_update_add_delete.rs` keeps only the one remaining test
+  that needs a GSI) that prove zero refusals under contention.
 
   **`TransactWriteItems` evaluates the identical way (ADR 0054 step 4a)** —
   `ClientCtx::txn_stage_local` builds a self-contained `TxnWrite::pending`
@@ -6028,8 +6037,34 @@ prefix check and both direct probes never found a violation.
 integration test that polls with timeouts, not a deterministic assertion;
 `simenv_client_ctx_tests` (above) is this crate's one `SimEnv`-driven
 exception, and lives in `lib.rs` rather than `tests/` for exactly the
-private-handle reason its own section gives. The restart tests run both
-incarnations in the same runtime,
+private-handle reason its own section gives. **ADR 0061 rung D3 (C-04)
+began converting the "B class" of `tests/` binaries — base-table
+DynamoDB logic reachable through `dynamo::dispatch_item_op`, needing no
+real-thread liveness or real-disk durability — to `SimCluster`-driven
+`#[cfg(test)] mod`s in `src/` instead**, shrinking the real-thread tier's
+size rather than any CI retry count (the roadmap's own success criterion
+was stale — see `docs/roadmap.md`'s C-04 entry and this crate's own
+`sim_cluster_dynamo`/`sim_cluster_dynamo_corpus` doc for why). PR 1 landed
+eleven sibling modules — `sim_cluster_dynamo_batch_get`,
+`sim_cluster_dynamo_boolean_composition`, `sim_cluster_dynamo_eventual_
+read`, `sim_cluster_dynamo_expression_surface`, `sim_cluster_dynamo_
+extended`, `sim_cluster_dynamo_item_size_cap`, `sim_cluster_dynamo_
+parallel_scan`, `sim_cluster_dynamo_predicate_bugs`, `sim_cluster_dynamo_
+update_add_delete`, `sim_cluster_dynamo_updated_return_values`, and
+`sim_cluster_kind_batch_outcome` — each replacing some or all of one
+`tests/dynamo_*.rs`/`tests/kind_batch_outcome.rs` binary; see each
+module's own doc for exactly which tests moved and which stayed on
+`ProdEnv` (a GSI/LSI query, a wire-level `CreateTable`, or
+`TransactWriteItems` — none reachable through `dispatch_item_op` yet).
+`SimCluster::dynamo_concurrent` (`sim_cluster.rs`) is this rung's own new
+fixture primitive, letting several wire requests race the same key/tablet
+before one shared `Simulator::run_for`, replacing the `tokio::spawn`-
+raced-writers idiom several of the converted tests used. A parallel
+redundancy audit also found two `tests/dynamo_*.rs` tests that duplicated
+existing `sim_cluster_throttle.rs`/`sim_cluster_dynamo.rs` coverage outright
+(no rewrite needed) — see `dynamo_wire.rs`'s and `dynamo_throttling.rs`'s
+own doc comments for the removed tests and their sim citations. The
+restart tests run both incarnations in the same runtime,
 calling `Node::shutdown()` between them. In-crate `#[cfg(test)] mod`s
 (`confirm_futility_tests`) live in `lib.rs` itself
 because they need private handles (a raw `CpGroup`/the `pub(crate)`

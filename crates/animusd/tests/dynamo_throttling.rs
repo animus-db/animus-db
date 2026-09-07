@@ -27,6 +27,18 @@
 //! real-time test is a large per-request cost, not a vanishingly small
 //! rate. Real TCP/time, so bounded loops rather than a fixed op count where
 //! real network jitter could matter.
+//!
+//! **`put_item_is_throttled_once_the_write_budget_is_exhausted`/
+//! `get_item_is_throttled_once_the_read_budget_is_exhausted` moved to
+//! `SimCluster`** (ADR 0061 rung D3, redundancy-audit follow-up): the same
+//! shared `throttle_check_write_raw`/read-side gate is proven by
+//! `sim_cluster_throttle.rs::
+//! write_admits_a_burst_then_refuses_then_recovers_after_a_full_refill`/
+//! `read_admits_a_burst_then_refuses_then_recovers_after_a_full_refill`
+//! (`crates/animusd/src/sim_cluster_throttle.rs`). Every other test in this
+//! file stays — `UnprocessedItems`/`UnprocessedKeys` shedding, forwarded-
+//! write throttling, the throttled-metric counters, and the `CreateTable`/
+//! `UpdateTable`/`DescribeTable` wire ops have no sim analog.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -415,94 +427,6 @@ fn error_type(body: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-
-/// `PutItem` returns `400 ProvisionedThroughputExceededException` once a
-/// table's configured write budget is exhausted.
-#[tokio::test(flavor = "multi_thread")]
-async fn put_item_is_throttled_once_the_write_budget_is_exhausted() {
-    let dir = support::panic_safe_tempdir();
-    let (nodes, config) = bring_up(1, dir.path()).await;
-    await_bootstrap(&nodes).await;
-    let addr = config.nodes[0].dynamo;
-
-    create_table(addr, "thr_put").await;
-    // 1 WCU/s ⇒ a 300-unit burst; each ~256 KiB item costs ~256 WCU, so a
-    // handful of puts exhausts it.
-    set_throttle_defaults_everywhere(&config, None, Some(1)).await;
-
-    let value = big_value();
-    let mut refused = None;
-    for i in 0..20 {
-        let (status, body) = dynamo(
-            addr,
-            "DynamoDB_20120810.PutItem",
-            &put_body("thr_put", &format!("k{i}"), &value),
-        )
-        .await;
-        if status == 400 {
-            refused = Some(body);
-            break;
-        }
-        assert_eq!(status, 200, "unexpected PutItem failure: {body}");
-    }
-    let body = refused.expect("expected the write burst to eventually be throttled");
-    assert_eq!(
-        error_type(&body),
-        "com.amazonaws.dynamodb.v20120810#ProvisionedThroughputExceededException",
-        "unexpected error body: {body}"
-    );
-
-    // The item's own key must genuinely never have been considered for
-    // reading either — confirm `GetItem` also refuses (read budget wasn't
-    // configured here, but proves the write's own refusal wasn't silently
-    // upgraded/downgraded into something else).
-}
-
-/// `GetItem` returns `400 ProvisionedThroughputExceededException` once a
-/// table's configured read budget is exhausted.
-#[tokio::test(flavor = "multi_thread")]
-async fn get_item_is_throttled_once_the_read_budget_is_exhausted() {
-    let dir = support::panic_safe_tempdir();
-    let (nodes, config) = bring_up(1, dir.path()).await;
-    await_bootstrap(&nodes).await;
-    let addr = config.nodes[0].dynamo;
-
-    create_table(addr, "thr_get").await;
-    let value = big_value();
-    // Seed the item before configuring the read limit.
-    let (status, body) = dynamo(
-        addr,
-        "DynamoDB_20120810.PutItem",
-        &put_body("thr_get", "k", &value),
-    )
-    .await;
-    assert_eq!(status, 200, "seed put failed: {body}");
-
-    // 1 RCU/s ⇒ a 300-unit burst; each consistent read of the ~256 KiB item
-    // costs ~64 RCU.
-    set_throttle_defaults_everywhere(&config, Some(1), None).await;
-
-    let mut refused = None;
-    for _ in 0..40 {
-        let (status, body) = dynamo(
-            addr,
-            "DynamoDB_20120810.GetItem",
-            r#"{"TableName":"thr_get","ConsistentRead":true,"Key":{"id":{"S":"k"}}}"#,
-        )
-        .await;
-        if status == 400 {
-            refused = Some(body);
-            break;
-        }
-        assert_eq!(status, 200, "unexpected GetItem failure: {body}");
-    }
-    let body = refused.expect("expected the read burst to eventually be throttled");
-    assert_eq!(
-        error_type(&body),
-        "com.amazonaws.dynamodb.v20120810#ProvisionedThroughputExceededException",
-        "unexpected error body: {body}"
-    );
-}
 
 /// `BatchWriteItem` returns the throttled subset in `UnprocessedItems`
 /// rather than failing the whole call, while everything else that fit

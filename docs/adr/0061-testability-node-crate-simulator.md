@@ -842,7 +842,7 @@ supply one, and isn't trying to.
 |---|---|
 | D1 | `SimCluster` harness: a multi-node cluster driven by `SimEnv`, on B1's shared corpus scaffolding. Built on `ClientCtx<SimEnv>` in `animusd`'s own tests, per the seventh 2026-08-28 amendment — not on a moved `animus-node` assembly |
 | D2 | An end-to-end DynamoDB-wire corpus — requests in at the wire edge, faults injected, resulting history checked by the existing `check_cycles`/`check_durability`/`check_convergence`. **Landed 2026-09-07 (both PRs)**: PR 1 (six item operations generic, `SimClusterHandle::dynamo`, a first small smoke) and PR 2 (the actual `Recorder`/`History` corpus over the wire, see the amendments below); GSI/LSI, transact, and PartiQL remain out of scope, named as D2's own residuals |
-| D3 | Migrate the `animusd` integration suite: **keep** the tests that genuinely prove real-thread liveness (group commit, lock contention, election timing — per the engineering-lessons rule that `SimEnv` does not prove thread liveness), convert the rest. Success is measured by the `prod-liveness` CI job shrinking enough to drop its 2-attempt retry |
+| D3 | Migrate the `animusd` integration suite: **keep** the tests that genuinely prove real-thread liveness (group commit, lock contention, election timing — per the engineering-lessons rule that `SimEnv` does not prove thread liveness), convert the rest. **Success criterion corrected 2026-09-07** (see that date's own "D3 PR 1" amendment): the `prod-liveness` job's 2-attempt retry was already replaced by nextest sharding before D3 started, so there is no retry to drop — success is measured by the real-thread tier's own shrinking test count / wall time / flake surface instead. **PR 1 landed 2026-09-07**: the base-table-only "B class" (~30 tests across ten `dynamo_*.rs` binaries plus `kind_batch_outcome.rs`) converted to `SimCluster` |
 | D4 | Deterministic coverage for the behaviours that have none today: the auto-split byte trigger (`lib.rs:14397`), the dropped-table GC reclaim loop, join/growth sequencing, and the backup-janitor async loop (its replicated state machine is already sim-tested in `animus-control/tests/backup_catalog.rs`; the loop driving it is not) |
 
 Note that the copy-based split driver (ADR 0050) is deliberately **not** on
@@ -1417,6 +1417,120 @@ SEEDS=25 cargo test -p animusd --lib sim_cluster_dynamo_corpus` (24 cells,
 green — 200 scenarios, `test result: ok. 3 passed`, `finished in 601.29s`, wall `10m2.300s`); `cargo test -p animusd --test dynamo_wire` (real-socket
 sanity, unchanged, green — proof this rung touched no production dispatch
 code, only added a new test module).
+
+#### 2026-09-07 amendment — D3 PR 1 landed: the first `ProdEnv`-to-`SimCluster` test conversion, and a corrected success criterion
+
+D3 is "keep the `crates/animusd/tests/` binaries that genuinely prove
+real-thread liveness or real-disk durability on `ProdEnv`; convert the
+rest to `SimCluster`." A planning pass classified all 120 real-socket
+integration binaries (524 tests) into classes; this PR converts only
+class **B** — base-table DynamoDB logic tests that `dynamo::
+dispatch_item_op` (D2 PR 1's own generic core) can already drive, needing
+no widening of that function or `execute_item_op_as`.
+
+**The roadmap's own stated D3 success criterion is stale, corrected
+here.** `docs/roadmap.md`'s C-04 entry (and this ADR's own Delivery-plan
+table row for D3) framed success as "the `prod-liveness` job shrinks
+enough to drop its 2-attempt retry." Checked against `.github/workflows/
+ci.yml` directly before starting this rung: there is no 2-attempt retry
+to drop — that job was already replaced by nextest sharding
+(`prod-liveness-animusd`, 4 partitions by test count, plus
+`prod-liveness-hammer-pair` and `prod-liveness-scattered` as separate
+parallel jobs) before D3 began, per that workflow's own comments on the
+sharding rationale. **D3's real, corrected goal: shrink the real-thread
+tier's own test count / wall time / flake surface** — there is no retry
+metric left to watch.
+
+**What moved.** Eleven new `#[cfg(test)]` sibling modules in
+`crates/animusd/src/` (`sim_cluster_dynamo_batch_get`, `_boolean_
+composition`, `_eventual_read`, `_expression_surface`, `_extended`,
+`_item_size_cap`, `_parallel_scan`, `_predicate_bugs`, `_update_add_
+delete`, `_updated_return_values`, and `sim_cluster_kind_batch_outcome`),
+each replacing some or all of one `tests/dynamo_*.rs`/`tests/
+kind_batch_outcome.rs` binary — ~30 tests total, driven through
+`SimCluster::dynamo`/`SimCluster::dynamo_concurrent` instead of real
+sockets/threads. Every converted test preserves its original assertions;
+where the original exercised a forwarded/non-leader path, the converted
+version keeps at least one op issued from a node that does not host the
+tablet's leader. `SimCluster::dynamo_concurrent` (new,
+`crates/animusd/src/sim_cluster.rs`) is this PR's own fixture addition —
+it spawns several DynamoDB wire requests onto their own nodes' envs
+*before* one shared `Simulator::run_for`, so two requests genuinely race
+the same key/tablet the way the original tests' `tokio::spawn`/
+`tokio::join!` pairs did, rather than resolving one at a time.
+
+**What stayed on `ProdEnv`, and why** (each noted in its own module's
+doc, not silently dropped): a wire-level `CreateTable` test
+(`dynamo_extended.rs`'s `create_table_query_and_conditional_writes` —
+`dispatch_item_op` has no `CreateTable` arm; `SimCluster::create_table`
+seeds a table by proposing `CreateTableSchema`/`CreateTablet` directly on
+the control leader, bypassing the wire); a `TransactWriteItems` test
+(`dynamo_item_size_cap.rs`'s transact half — Transact is still an
+unreached D2 residual); and a GSI-query test (`dynamo_update_add_
+delete.rs`'s `an_add_that_changes_an_indexed_attribute_reindexes` — GSI/
+LSI dispatch is likewise still an unreached D2 residual).
+
+**A second `SimCluster` capability gap found live, distinct from the D2
+residuals above**: `dynamo_extended.rs`'s `concurrent_conditional_puts_
+one_wins` relies on `dynamo::legacy_register`'s auto-registration of an
+unrecognized table on its first `PutItem`, with no `CreateTable` at all.
+`ClientCtx::provision_tablet` (the auto-provision every first write to a
+brand-new table goes through) picks the tablet's initial replica set from
+`Metadata::members` — the node-registration catalog a real deployment's
+`MetaCommand::RegisterNode` populates, which `SimCluster::new` never
+proposes (its own nodes are wired directly into `ClusterEdgeState`, never
+registered into `Metadata`). A legacy-registered table's auto-provision
+therefore mints a tablet with an **empty** replica set that nobody ever
+hosts, and the write times out waiting for a group that will never form.
+Worked around, not fixed: the converted test uses `SimCluster::
+create_table` (the fixture's own supported path, which picks replicas
+directly) instead of relying on legacy auto-registration — a fixture
+data-shape change (a real `pk`/`sk` composite schema instead of a legacy
+one), not a change to what the race itself proves. Widening
+`SimCluster::new` to also register nodes into `Metadata::members` is left
+for a future fixture PR, not attempted here.
+
+**A parallel, read-only redundancy audit** (run independently of this
+classification pass) found two more `tests/dynamo_*.rs` tests that
+duplicated existing sim coverage outright, with no rewrite needed:
+`dynamo_wire.rs::dynamo_wire_put_get_delete_round_trip` (proven by
+`sim_cluster_dynamo.rs::put_then_consistent_get_through_wire_from_a_
+non_leader_node`) and `dynamo_throttling.rs`'s
+`put_item_is_throttled_once_the_write_budget_is_exhausted`/`get_item_is_
+throttled_once_the_read_budget_is_exhausted` (proven by `sim_cluster_
+throttle.rs`'s `write_admits_a_burst_then_refuses_then_recovers_after_a_
+full_refill`/`read_admits_a_burst_then_refuses_then_recovers_after_a_
+full_refill`). Folded into this same PR's removal commit; every other
+test in both files stays (each proves something no sim test covers —
+fresh combined-mode `Status.control_voters`, `UnprocessedItems`/
+`UnprocessedKeys` shedding, forwarded-write throttling, the throttled-
+metric counters, `CreateTable`/`UpdateTable`/`DescribeTable` wire ops).
+
+**Two commits, in equivalence order**: commit 1 adds every new sim test
+with the `ProdEnv` files untouched (so a reviewer can diff the sim tests
+directly against their `ProdEnv` originals before anything is deleted);
+commit 2 deletes/trims the now-redundant `ProdEnv` tests and updates this
+ADR, `docs/roadmap.md`, and `crates/animusd/CLAUDE.md`.
+
+**Gates**: `cargo fmt --all --check`; `cargo clippy -p animusd
+--all-targets --all-features -- -D warnings` (clean); `cargo test -p
+animusd --lib` (green both before and after the removal commit, 240
+passed — the same count either side, since only test *location* moved);
+`cargo build -p animusd --all-targets` (green — proves no deleted file is
+still referenced); `cargo test -p animusd --test dynamo_extended --test
+dynamo_item_size_cap --test dynamo_update_add_delete --test dynamo_wire
+--test dynamo_throttling` (the five partially-edited `ProdEnv` binaries,
+green); a converted test replayed with an explicit `ANIMUS_SEED`,
+confirming determinism; `Cargo.lock` unchanged.
+
+**Left for the fixture PR the task named, not attempted here**: widening
+`SimCluster`/`dispatch_item_op` for GSI/LSI query dispatch, wire-level
+`CreateTable`, and `TransactWriteItems` — the three capability gaps every
+"stayed on `ProdEnv`" test above is blocked on — plus the `Metadata::
+members` registration gap this PR's own workaround sidesteps. D3's
+remaining test classes (DDL beyond plain `CreateTable`, Streams, TTL,
+admin/console/dashboard HTTP, TLS, SigV4, restart-durability, wall-clock
+timing) are unclassified-by-this-PR follow-on work.
 
 ### Phase E — the untested crates
 
