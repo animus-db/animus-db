@@ -449,10 +449,46 @@ the still-true paragraph after the table.
   animusd/CLAUDE.md`'s SimCluster/Tests sections.
   D3's remaining classes (`UpdateTable`'s stream/index changes, Transact,
   PartiQL, Streams, TTL, admin/console/dashboard HTTP, TLS, SigV4,
-  restart-durability, wall-clock timing) and D4 (deterministic coverage for
-  auto-split/GC/join/backup-janitor), plus a real `SimCluster` `Reconciler`
-  (the reconciler-hazard gap PR 2a found and left open), remain open. The
-  GSI-drain gap specifically is closed as of PR 3b.
+  restart-durability, wall-clock timing) remain open. The GSI-drain gap
+  specifically is closed as of PR 3b.
+- **D4 PR 1 landed 2026-09-07, closing issue #715**: `SimCluster` is now
+  hosted by a real per-node `animus_cp_data::host::Reconciler` — the exact
+  gap D3 PR 2a found and left open (a rebalanced-away replica's
+  `RaftKvNode` was never torn down, genuinely split-brain-shaped for
+  `node_count > MAX_REPLICATION_FACTOR`). `spawn_policy_tablet_host_loop`
+  (the add-only stand-in watcher) is deleted outright; `SimCluster::
+  create_table_with_replication` no longer builds a `RaftKvNode` by hand
+  either — both the hand-hosted and wire-provisioned paths now provision a
+  tablet (`CreateTableSchema`/`CreateTablet`/`SetTabletPolicy`) and let the
+  same real reconciler discover and host it, exactly like production.
+  `SimCluster::restart` reuses the same node's own `MemoryTabletEngines`
+  handle across a restart rather than wiping it, mirroring `reconciler_
+  corpus.rs`'s own "durable engine survives a process crash" modeling — a
+  deliberate behavior change from the pre-D4 restart. Zero production
+  signature changes were needed (`ClusterEdgeState::unregister_raftkv`
+  already existed). The former hazard test (`reconciler_hazard_fires_
+  deterministically_when_node_count_exceeds_replication`) is now `every_
+  node_hosts_exactly_its_replica_set_after_rebalance`, a convergence proof
+  run at the original pinned seed plus ten more; one existing DDL test
+  (`create_table_issued_on_a_control_follower_relays_and_converges`) was
+  bumped from 3 to 4 nodes to prove the `node_count <= 3` restriction no
+  longer applies; a general "no zombie groups" invariant was added to
+  `sim_cluster_corpus.rs`'s end-of-scenario checks. No existing scenario
+  changed behavior — every pre-existing cell's own tablet-hosting counts
+  already stayed within ADR 0029's max−min ≤ 1 balanced band, so the real
+  reconciler's own rebalance pass never had anything to move for them.
+  `cargo test -p animusd --lib`: 306 passed / 118.4s before this rung, 307
+  passed / 113.4s after (net +1: +2 new, −1 renamed, zero regressions — wall
+  time within ordinary run-to-run noise of the baseline, once the
+  reconciler's own fallback poll interval was tuned from an initial 50ms to
+  200ms after a corpus-level measurement — see the ADR amendment).
+  What remains for D4 (PRs 2-5): auto-split's own byte trigger needs
+  `auto_split_loop`'s `tokio::time` conversion to run under `SimEnv`; GC
+  reclaim is already a reconciler action, awaiting only a `drop_table`
+  driver reachable from this fixture; join/growth needs an add-node
+  capability; the backup janitor needs `client_ctx_host.rs`'s impls
+  widened. See ADR 0061's matching 2026-09-07 "D4 PR 1" amendment and
+  `crates/animusd/CLAUDE.md`'s own entry for the full account.
 - **E1 landed 2026-09-04** (`ClusterApi`/`AdminOps` seams in
   `animus-operator`, fake-driven `controller::tests`; ADR 0061's
   2026-09-04 amendment). **E2 landed 2026-09-07**: the seven pre-existing

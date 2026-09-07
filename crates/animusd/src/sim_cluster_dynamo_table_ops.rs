@@ -35,10 +35,18 @@
 //! for the first time, its genuinely-exercised non-leader relay branch)
 //! reachable under `SimEnv` at all. See `sim_cluster.rs`'s own
 //! `SimCluster::seed_members`/`ClusterEdgeState::control` doc for the full
-//! account, and that same file's `spawn_policy_tablet_host_loop` (private
-//! to it) for the third addition: a minimal per-node watcher that hosts a
-//! wire-provisioned table's tablet, since this fixture otherwise runs no
-//! reconciler at all.
+//! account.
+//!
+//! **ADR 0061 rung D4 PR 1 (2026-09-07) replaced this rung's own third
+//! addition** — a minimal per-node watcher (`spawn_policy_tablet_host_
+//! loop`, since deleted) that only ever *added* a wire-provisioned table's
+//! own newly-named replica, never tearing one down a rebalance dropped —
+//! **with a real per-node `animus_cp_data::host::Reconciler`** (`sim_
+//! cluster.rs`'s `build_reconciler`/`spawn_reconciler_loop`), closing issue
+//! #715. [`reconciler_hazard_fires_deterministically_when_node_count_
+//! exceeds_replication`] below, this rung's own characterization of the gap,
+//! is now [`every_node_hosts_exactly_its_replica_set_after_rebalance`] — a
+//! convergence proof instead of a documented hazard.
 //!
 //! **The direct proof that item 2's widening actually closes the
 //! relay-to-self loop**: [`create_table_issued_on_a_control_follower_
@@ -109,16 +117,18 @@ fn replica_ids(cluster: &SimCluster, node: u64, table: &str) -> Vec<NodeId> {
     ids
 }
 
-/// ADR 0061 rung D3 PR 2a item 5, the reconciler-hazard invariant: `table`'s
-/// tablet must still carry the exact replica set `expected` names (normally
-/// captured immediately after its `CreateTable` returned 200) — see this
-/// file's own module doc and `sim_cluster.rs`'s `spawn_policy_tablet_host_
-/// loop` doc for the full mechanism this checks. A failure here means the
-/// control group's own live `reconcile_loop`/`rebalance_placement`
-/// (`animus-control::node`, spawned unconditionally by `RaftNode::start`,
-/// not by this fixture) proposed a `MetaCommand::CasTabletReplicas` moving
-/// a wire-provisioned tablet's replica set out from under it, with nothing
-/// in this fixture to execute the physical move.
+/// `table`'s tablet must still carry the exact replica set `expected` names
+/// (normally captured immediately after its `CreateTable` returned 200) —
+/// a proof that the control group's own live `reconcile_loop`/`rebalance_
+/// placement` (`animus-control::node`, spawned unconditionally by
+/// `RaftNode::start`, not by this fixture) had nothing to move for this
+/// scenario's own node/table count (every caller below stays at
+/// `node_count <= MAX_REPLICATION_FACTOR`, where a single table's own
+/// initial placement is already balanced). Since ADR 0061 rung D4 PR 1 a
+/// genuine rebalance move is no longer a hazard either way — see
+/// [`every_node_hosts_exactly_its_replica_set_after_rebalance`] — but this
+/// check stays useful as a "nothing moved for a reason unrelated to what
+/// this test means to prove" regression.
 fn assert_replicas_unperturbed(cluster: &SimCluster, node: u64, table: &str, expected: &[NodeId]) {
     let got = replica_ids(cluster, node, table);
     assert_eq!(
@@ -269,14 +279,23 @@ fn create_table_issued_on_the_control_leader_converges() {
 /// timeout. A follower-issued call reaching a real, different leader is
 /// therefore the case this rung's fix specifically had no coverage for
 /// until now.
+///
+/// **4 nodes, not 3 (ADR 0061 rung D4 PR 1)**: this test used to stay at
+/// `node_count <= MAX_REPLICATION_FACTOR` (3) like every other real-wire
+/// `CreateTable` scenario in this module, per D3 PR 2a's own reconciler-
+/// hazard finding. Bumped as this rung's own proof that the restriction no
+/// longer applies — the fourth, initially-idle node is `follower`-eligible
+/// too now, so this also strengthens the scenario slightly (a follower that
+/// may itself host no replica of the fresh tablet at all, the same
+/// "genuine forward" shape `sim_cluster.rs`'s own scenario 2 tests).
 #[test]
 fn create_table_issued_on_a_control_follower_relays_and_converges() {
     let seed = env_seed(0xE4AB_0002);
-    let mut cluster = SimCluster::new(seed, 3, 3);
+    let mut cluster = SimCluster::new(seed, 4, 3);
     let leader = cluster.control_leader_index() as u64;
     let follower = (0..cluster.node_count() as u64)
         .find(|&n| n != leader)
-        .expect("a 3-node cluster has a non-leader node");
+        .expect("a 4-node cluster has a non-leader node");
 
     let (status, resp) = create_table(&mut cluster, follower, "followertbl");
     assert_eq!(
@@ -563,62 +582,29 @@ fn delete_table_through_a_follower_connected_node_is_relayed_to_the_leader() {
     }
 }
 
-/// ADR 0061 rung D3 PR 2a item 5, the reconciler-hazard investigation: 25
-/// seeds, each building a 4-node cluster (deliberately more nodes than the
-/// fixed `MAX_REPLICATION_FACTOR = 3` every wire-provisioned tablet gets, so
-/// one node is always left un-provisioned and every table's own initial
-/// replica pick — `Metadata::members`' first three `Active` ids in `NodeId`
-/// order, always `n0`/`n1`/`n2` here — is genuinely imbalanced across the
-/// whole member set) and three wire-created tables (all landing on the
-/// identical `n0`/`n1`/`n2` triple, stacking the imbalance three tables deep
-/// rather than leaving it at the single-table max−min ≤ 1 ADR 0029 already
-/// tolerates as balanced).
-///
-/// **Finding: the hazard is real and fires, deterministically, on every one
-/// of the 25 seeds** — the exact same two `MetaCommand::CasTabletReplicas`
-/// moves every time, none of it a race: `soak0`'s tablet moves `n0`/`n1`/
-/// `n2` → `n1`/`n2`/`n3`, `soak1`'s moves `n0`/`n1`/`n2` → `n0`/`n2`/`n3`,
-/// and `soak2` — created after the first two moves already balanced every
-/// member at 2 tablets apiece — never moves at all. This is
-/// `rebalance_placement`'s own load-balancing pass (`animus-control::meta`,
-/// spreading raw tablet *count* across every member with no `SpreadPolicy`
-/// constraint to block it, ADR 0029) doing exactly its documented job — a
-/// completely ordinary, correct control-plane decision, not a bug in
-/// `animus-control` at all. **The bug this uncovers is a `SimCluster`
-/// fixture gap**: [`spawn_policy_tablet_host_loop`](super::sim_cluster) only
-/// ever *adds* a replica newly named in `Metadata.tablets[t].replicas` — it
-/// never tears down a replica the same CAS just *dropped* — so after this
-/// rebalance, `soak0`'s tablet is left with a real, live `RaftKvNode` on
-/// `n0` (still believing it's a voter of the *old* 3-member group) *in
-/// addition to* the freshly-hosted one this watcher mints on `n3` per the
-/// *new* replica list: two different node counts (3 old-shape + 3
-/// new-shape, sharing `n1`/`n2`) simultaneously claiming to be one tablet's
-/// Raft group, an actual split-brain-shaped state this fixture can produce
-/// with a plain `CreateTable`, no fault injection at all, whenever
-/// `node_count > MAX_REPLICATION_FACTOR`.
-///
-/// **Why this stays a documented finding, not a fix landed in this PR**: a
-/// correct fix needs `SimCluster` to grow an actual `Reconciler`-shaped
-/// mechanism (remove a dropped replica's own `RaftKvNode`, not just add a
-/// newly-named one) — meaningfully more fixture machinery than "base-table
-/// DDL drivable through the wire" (this PR's own brief) asks for, and ADR
-/// 0061 rung D1's own module doc already named a reconciler-hosted
-/// `SimCluster` as "a legitimate future rung," not this one. **The practical
-/// implication for every OTHER test in this file and any future one**: keep
-/// `node_count <= MAX_REPLICATION_FACTOR` (3) for any scenario that issues a
-/// real wire `CreateTable` — every regression above this test does exactly
-/// that (1- or 3-node clusters only) and is unaffected. See `docs/
-/// engineering-lessons.md`'s matching entry and `docs/roadmap.md`'s C-04
-/// entry for the follow-up this leaves.
-///
-/// This is a **positive** regression, not a "must never happen" one — it
-/// pins the exact, fully deterministic outcome above so a future change to
-/// `rebalance_placement`'s own balancing heuristic (or to this fixture's own
-/// member/policy seeding) that silently alters it is caught, rather than
-/// asserting behavior this investigation already proved false.
-#[test]
-fn reconciler_hazard_fires_deterministically_when_node_count_exceeds_replication() {
-    let seed = 0xE4AC_0000;
+/// ADR 0061 rung D4 PR 1 (closing issue #715): the identical 4-node, three-
+/// wire-table scenario ADR 0061 rung D3 PR 2a's own reconciler-hazard
+/// investigation used (deliberately more nodes than `MAX_REPLICATION_
+/// FACTOR = 3` every wire-provisioned tablet gets, so one node is always
+/// left un-provisioned and every table's own initial replica pick —
+/// `Metadata::members`' first three `Active` ids in `NodeId` order, always
+/// `n0`/`n1`/`n2` here — is genuinely imbalanced across the whole member
+/// set), but flipped from a characterization of the hazard to a
+/// **convergence proof it's closed**: `rebalance_placement`'s own
+/// load-balancing pass (`animus-control::meta`, spreading raw tablet
+/// *count* across every member, ADR 0029 — a completely ordinary, correct
+/// control-plane decision) still moves `soak0`'s and `soak1`'s tablets onto
+/// the idle fourth node exactly as it always did (leaving `soak2` alone,
+/// already balanced by the time it's created), but now every node's own
+/// real `host::Reconciler` (`sim_cluster.rs`'s `build_reconciler`/`spawn_
+/// reconciler_loop`, ADR 0061 rung D4 PR 1) tears down the dropped replica
+/// exactly as production's own reconciler does — so this is renamed from
+/// `reconciler_hazard_fires_deterministically_when_node_count_exceeds_
+/// replication` and now asserts the **absence** of the old finding's own
+/// split-brain-shaped state, via [`assert_no_zombie_groups`]'s "every
+/// node's own hosted set equals exactly its `Metadata` replica set"
+/// invariant, at the identical pinned seed plus a loop of ten more.
+fn run_every_node_hosts_exactly_its_replica_set_after_rebalance(seed: u64) {
     let mut cluster = SimCluster::new(seed, 4, 3);
     let leader = cluster.control_leader_index() as u64;
 
@@ -642,9 +628,15 @@ fn reconciler_hazard_fires_deterministically_when_node_count_exceeds_replication
 
     // Give the control leader's own `reconcile_loop`/`rebalance_placement`
     // (unconditional, spawned by `RaftNode::start` itself — not by this
-    // fixture) several ticks' worth of virtual time to act.
+    // fixture) several ticks' worth of virtual time to act, then let every
+    // node's own reconciler converge onto whatever `Metadata` now says.
     cluster.run_for(Duration::from_secs(10));
+    assert_no_zombie_groups(&mut cluster, seed);
 
+    // The rebalance itself still happened exactly as the original
+    // investigation found — this is what makes the invariant check above
+    // meaningful (a scenario where nothing ever moved would prove nothing
+    // about teardown).
     assert_eq!(
         replica_ids(&cluster, leader, "soak0"),
         vec![nid(1), nid(2), nid(3)],
@@ -663,6 +655,73 @@ fn reconciler_hazard_fires_deterministically_when_node_count_exceeds_replication
         "seed={seed}: soak2's tablet should be left alone — by the time it's \
          created, node counts are already balanced at two tablets per member"
     );
+}
+
+/// The shared "no zombie groups" invariant (ADR 0061 rung D4 PR 1): every
+/// node's own [`SimCluster::hosted_tablets`] set equals EXACTLY the tablets
+/// whose current `Metadata` replica set names that node — no stale handle
+/// for a replica a rebalance dropped, and no missing host for one it just
+/// added. Converged-or-timeout polled, never a one-shot assert: a real
+/// reconciler's own teardown is itself async
+/// (`animus_cp_data::host::RECLAIM_STOP_TIMEOUT`-bounded on the production
+/// side), so a snapshot taken mid-teardown can legitimately still show a
+/// stale entry for one more tick.
+fn assert_no_zombie_groups(cluster: &mut SimCluster, seed: u64) {
+    const BUDGET: Duration = Duration::from_secs(10);
+    const STEP: Duration = Duration::from_millis(100);
+    let mut elapsed = Duration::ZERO;
+    loop {
+        let mut mismatch: Option<String> = None;
+        for node in 0..cluster.node_count() as u64 {
+            let meta = cluster.metadata(node);
+            let expected: std::collections::BTreeSet<_> = meta
+                .tablets
+                .iter()
+                .filter(|(_, t)| t.replicas.contains(&nid(node)))
+                .map(|(&id, _)| id)
+                .collect();
+            let got = cluster.hosted_tablets(node);
+            if got != expected {
+                mismatch = Some(format!(
+                    "node {node}: hosted={got:?} expected(from Metadata)={expected:?} \
+                     (seed={seed})"
+                ));
+                break;
+            }
+        }
+        match mismatch {
+            None => return,
+            Some(detail) => {
+                assert!(
+                    elapsed < BUDGET,
+                    "hosted-tablet sets never converged to Metadata's own \
+                     replica sets within {BUDGET:?} (seed={seed}): {detail}"
+                );
+                cluster.run_for(STEP);
+                elapsed += STEP;
+            }
+        }
+    }
+}
+
+#[test]
+fn every_node_hosts_exactly_its_replica_set_after_rebalance() {
+    run_every_node_hosts_exactly_its_replica_set_after_rebalance(0xE4AC_0000);
+}
+
+/// `docs/engineering-lessons.md`'s "a fixture that reimplements half of a
+/// production loop inherits the other half's hazards" lesson, proven across
+/// ten more seeds beyond the pinned one above — every seed reproduces the
+/// identical rebalance the original investigation found (`rebalance_
+/// placement` is deterministic given a fixed member/policy sequence), so
+/// this is really re-proving convergence under ten different Raft
+/// election/replication interleavings, not ten different rebalance
+/// outcomes.
+#[test]
+fn every_node_hosts_exactly_its_replica_set_after_rebalance_over_seeds() {
+    for i in 0..10 {
+        run_every_node_hosts_exactly_its_replica_set_after_rebalance(0xE4AC_1000 + i);
+    }
 }
 
 /// ADR 0061 rung D3 PR 3a documented a boundary here (`dispatch_item_op`'s

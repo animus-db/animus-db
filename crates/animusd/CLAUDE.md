@@ -5738,22 +5738,34 @@ fixture takes and expects the plain index.
 **Design decisions** (see the ADR's own 2026-09-05 amendment for the full
 account, including what a follow-on corpus rung still needs):
 
-- **Tablets are hand-hosted, not reconciler-hosted** — `create_table`
-  proposes `CreateTableSchema`/`CreateTablet` directly on the control
-  group's current leader, then builds a `RaftKvNode<SimEnv, MemoryEngine>`
-  on each chosen replica node directly (mirroring `animus-test::
-  raftkv_linearizable`'s `Group::start`) and registers it into that node's
-  own `ClusterEdgeState` — `Metadata`'s tablet row and the edge
-  registration are built from the identical replica list in the same
-  call, so they can never disagree.
-- **DDL is the same control-plane-Raft bypass every `SimEnv` `ClientCtx`
-  fixture in this crate uses, for hand-hosted tables** —
-  `create_table_with_replication` never calls `propose_schema` at all,
-  proposing `CreateTableSchema`/`CreateTablet` directly on the control
-  leader's own `RaftNode` handle instead. **`ClientCtx::propose_schema`'s
-  local-propose fast path was `ProdEnv`-locked through rung C3d (which
-  only made its *relay* branches reachable) — this changed in ADR 0061
-  rung D3 PR 2a**: `ClusterEdgeState<E>::control` widened from a fixed
+- **Tablets are hosted by a real per-node `animus_cp_data::host::
+  Reconciler` (ADR 0061 rung D4 PR 1, closing issue #715).** `SimCluster::
+  new` builds one `Reconciler<SimEnv, MemoryEngine>` per node (its own
+  `MemoryTabletEngines` engine registry, `on_host`/`on_teardown` hooks
+  mirroring hosting changes into that node's `ClusterEdgeState` — the
+  identical read-only-mirror discipline `animusd`'s own production node
+  assembly uses) and spawns a driving task (`spawn_reconciler_loop`) that
+  ticks it on `metadata_watch()` wakes plus a fixed fallback, mirroring
+  `animusd::tablet_host_reconciler_loop`'s own event-driven-with-fallback
+  shape. **This replaced a D1-era hand-hosting design** — `create_table`
+  used to build a `RaftKvNode<SimEnv, MemoryEngine>` directly on each
+  chosen replica node and register it by hand, and a D3 PR 2a-era stand-in
+  watcher (`spawn_policy_tablet_host_loop`) hosted a wire-provisioned
+  tablet but never tore one down (the "reconciler hazard," below) — both
+  are gone; the real reconciler is now this fixture's ONLY hosting path,
+  for both hand-hosted and wire-provisioned tables alike.
+- **DDL is still a control-plane-Raft bypass, for hand-hosted tables** —
+  `create_table_with_replication` never calls `propose_schema`, proposing
+  `CreateTableSchema`/`CreateTablet`/`MetaCommand::SetTabletPolicy`
+  directly on the control leader's own `RaftNode` handle instead (the
+  policy attachment is new since D4 PR 1 — the signal every node's real
+  reconciler hosts a tablet off of; its own recorded RF is the caller's
+  `replication` argument, not the wire path's fixed
+  `MAX_REPLICATION_FACTOR`, preserving the "exactly N replicas on nodes
+  `0..N`" contract). **`ClientCtx::propose_schema`'s local-propose fast
+  path was `ProdEnv`-locked through rung C3d (which only made its *relay*
+  branches reachable) — this changed in ADR 0061 rung D3 PR 2a**:
+  `ClusterEdgeState<E>::control` widened from a fixed
   `Vec<RaftNode<ProdEnv>>` to `Vec<RaftNode<E>>`, and `SimCluster::new`
   now registers every node's own control handle onto its own edge, so
   `propose_schema`'s real leader-local fast path (and its non-leader relay
@@ -5762,16 +5774,24 @@ account, including what a follow-on corpus rung still needs):
   `delete_table` via the new `dynamo::dispatch_table_op`, not by this
   method directly. See that rung's own `CLAUDE.md`/ADR entries, below and
   in `docs/adr/0061-*.md`, for the full account.
-- **`restart` is a true process restart on `MemoryEngine`** —
-  `Simulator::stop` then fresh `RaftNode::start`/`RaftKvNode::start_hosted`
-  calls on the same node id, each on a brand-new `MemoryEngine` (a
-  wipe-and-rejoin, recovering via peer catch-up/chunked `InstallSnapshot`
-  — never a WAL replay, since this tier has no durable engine). `crash`
-  (mute, tasks stay alive) is the separate, cheaper fault this restart is
-  not a substitute for.
+- **`restart` is a true process restart on `MemoryEngine`, no longer a
+  wipe** — `Simulator::stop` then a fresh `RaftNode::start` and a fresh
+  `Reconciler` on the same node id. **Since ADR 0061 rung D4 PR 1 the
+  fresh reconciler reuses the SAME `MemoryTabletEngines` handle** this node
+  was built with — mirroring `reconciler_corpus.rs::Cluster::
+  crash_restart`'s own "a durable engine survives a process crash"
+  modeling — so a restarted node's own tablet data is no longer wiped
+  (a deliberate behavior change from the pre-D4 restart, which always
+  built a brand-new `MemoryEngine::new()`). Recovery either way is via
+  ordinary peer catch-up/chunked `InstallSnapshot`, never a local WAL
+  replay (this tier has no durable engine to replay). `crash` (mute, tasks
+  stay alive) is the separate, cheaper fault this restart is not a
+  substitute for.
 - **Always `start_hosted` with `stream = tablet.0`, never `start_scoped`**
-  — `create_table_with_replication` can host more than one table's tablet
-  on overlapping node sets (scenario 5 does exactly this), and
+  — a real `host::Reconciler` (see `animus-cp-data/CLAUDE.md`'s own host
+  module entry) already follows this discipline in production, and this
+  fixture's `create_table_with_replication` can host more than one table's
+  tablet on overlapping node sets (scenario 5 does exactly this) —
   `start_scoped` pins every group to `PRIMARY_STREAM`, which would
   cross-talk two tablets sharing node ids (the exact bug `animus-test/
   CLAUDE.md`'s stream-corpus entry documents finding in its own harness).
@@ -6180,41 +6200,42 @@ was the first to); fixed by deriving `create_table_with_replication`'s id
 from the same live allocator instead. See `docs/engineering-lessons.md`'s
 matching entries for both.
 
-**`spawn_policy_tablet_host_loop`** (new, private to `sim_cluster.rs`): a
-minimal per-node watcher, spawned in `SimCluster::new`/`restart`, that
-hosts a `RaftKvNode` for any tablet carrying a placement **policy**
+**`spawn_policy_tablet_host_loop`** (new, private to `sim_cluster.rs` at the
+time): a minimal per-node watcher, spawned in `SimCluster::new`/`restart`,
+that hosted a `RaftKvNode` for any tablet carrying a placement **policy**
 (`Metadata::policies`) whose replica set names this node — the signal a
 wire-provisioned tablet always carries (via `SetTabletPolicy`) and a
-hand-hosted one never does, keeping the two hosting paths' tablet sets
+hand-hosted one never did, keeping the two hosting paths' tablet sets
 disjoint by construction. Without it, a wire `CreateTable`'s own
 `await_table_serveable` probe would time out waiting for a group nobody
-ever forms — this fixture runs no real `animus_cp_data::host::Reconciler`
-at all (see the module doc's "hand-hosted, not reconciler-hosted" bullet).
+ever forms — this fixture ran no real `animus_cp_data::host::Reconciler`
+at all at the time.
 
-**The reconciler-hazard investigation this PR's task named found a real,
-deterministic, and deliberately *unfixed* gap**: this watcher only ever
-*adds* a replica newly named in a tablet's `Metadata.tablets[t].replicas`
-— it never tears down one a `MetaCommand::CasTabletReplicas` just dropped.
+**This PR's own reconciler-hazard investigation found a real, deterministic
+gap, deliberately left unfixed at the time**: this watcher only ever
+*added* a replica newly named in a tablet's `Metadata.tablets[t].replicas`
+— it never tore down one a `MetaCommand::CasTabletReplicas` just dropped.
 On a cluster with `node_count > MAX_REPLICATION_FACTOR` (3), the control
-leader's own live (and entirely correct) `rebalance_placement` pass will
+leader's own live (and entirely correct) `rebalance_placement` pass would
 rebalance a wire-provisioned tablet's replica set to spread load across
-the otherwise-idle extra node(s) — `sim_cluster_dynamo_table_ops.rs::
+the otherwise-idle extra node(s), leaving a stale `RaftKvNode` running on
+the node the CAS removed — genuinely split-brain-shaped for that one
+tablet id (two different-membership groups, no fault injection needed),
+reachable with a plain `CreateTable` whenever `node_count > 3`.
+
+**Closed by ADR 0061 rung D4 PR 1 (2026-09-07, see that rung's own entry
+below, in `docs/adr/0061-*.md`, and this file's own SimCluster design-
+decisions section above)**: `spawn_policy_tablet_host_loop` is deleted
+outright, replaced by a real per-node `animus_cp_data::host::Reconciler` —
+the same mechanism that closes this exact hazard in production. The
+`node_count <= 3` restriction this gap forced on every wire-`CreateTable`
+test in this crate no longer applies; `sim_cluster_dynamo_table_ops.rs::
 reconciler_hazard_fires_deterministically_when_node_count_exceeds_
-replication` pins the exact, fully deterministic outcome (proven across
-25 seeds during the investigation, identical every time) of a 4-node
-cluster's first two wire-created tables both getting rebalanced onto the
-fourth node while a third, created after balance is already reached,
-never moves. The result: a stale `RaftKvNode` left running on the node the
-CAS removed, genuinely split-brain-shaped for that one tablet id (two
-different-membership groups, no fault injection needed) — reachable with
-a plain `CreateTable`, whenever `node_count > 3`. **Not fixed here** — a
-correct fix needs `SimCluster` to grow real `Reconciler`-shaped teardown,
-materially more fixture machinery than this PR's own brief asks for (ADR
-0061 rung D1's own module doc already named a reconciler-hosted
-`SimCluster` as a future rung, not this one). Every test in this crate
-that issues a real wire `CreateTable` stays at `node_count <= 3` to avoid
-it — keep new tests to that bound too, until a future rung closes this
-gap.
+replication` (this investigation's own characterization) is now `every_
+node_hosts_exactly_its_replica_set_after_rebalance` — a convergence proof
+that every node's own hosted-tablet set converges to exactly what
+`Metadata` says it should host, at the identical 4-node/3-wire-table shape
+plus ten more seeds.
 
 **PR 2b (ADR 0061 rung D3 PR 2b) landed 2026-09-07**: `UpdateTable`'s own
 **throughput-only** change (`BillingMode`/`ProvisionedThroughput`, ADR
@@ -6361,6 +6382,79 @@ ignored throughout; `gsi_drain_cursor_tests` stays green). See ADR 0061's
 2026-09-07 "D3 PR 3b" amendment for the full account, including the
 `ANIMUS_SEED` determinism replay and the before/after real-socket gate
 runs.
+
+**D4 PR 1 (ADR 0061 rung D4 PR 1) landed 2026-09-07, closing issue #715**:
+`SimCluster` is now hosted by a real `animus_cp_data::host::Reconciler`,
+one per node — see this file's own SimCluster "Design decisions" section
+above for the full design and this section's own reconciler-hazard entry
+for what it replaced. Summary of what changed, all in `sim_cluster.rs`:
+`spawn_policy_tablet_host_loop` (private, hosted only *newly-named*
+replicas, never tore one down) is deleted outright, replaced by
+`build_reconciler`/`spawn_reconciler_loop` — one `Reconciler<SimEnv,
+MemoryEngine>` per node, its own `MemoryTabletEngines` registry, `on_host`/
+`on_teardown` hooks mirroring hosting into `ClusterEdgeState` exactly like
+`animusd`'s own production node assembly, driven by a task racing
+`metadata_watch().changed(..)` against a fixed fallback sleep (mirroring
+`tablet_host_reconciler_loop`'s own shape, minus its `fork_wake()` arm and
+pre-recovery guard — neither is reachable here, see that function's own
+doc). `create_table_with_replication` no longer constructs a `RaftKvNode`
+by hand: it proposes `CreateTableSchema`/`CreateTablet`/`SetTabletPolicy`
+(the policy's RF is the caller's own `replication` argument, not
+`MAX_REPLICATION_FACTOR`) and waits for the reconciler to host it, the
+identical mechanism a wire `CreateTable` already used — both hosting paths
+are now literally the same code. `restart` purges every one of a node's
+own stale edge registrations (`ctx.edge.hosted_groups()`, not just this
+fixture's own hand-hosted-table bookkeeping) and builds a fresh
+`Reconciler` reusing the SAME `MemoryTabletEngines` handle — a deliberate
+behavior change from the pre-D4 restart, which always built a fresh, empty
+`MemoryEngine`: a restarted node's own tablet data is no longer wiped (see
+this file's own SimCluster restart bullet). Production-side: zero
+signature changes were needed — `ClusterEdgeState::unregister_raftkv`
+already existed next to `register_raftkv` (this rung's own read-only pass
+had flagged adding one as a possible need; the existing method was
+sufficient as-is).
+
+**No existing scenario changed behavior.** Every `SimCluster`/corpus cell
+that provisions a table keeps its own tablet-hosting count within ADR
+0029's max−min ≤ 1 balanced band (a single table's initial placement, or
+`two_tables`' identical-replica-set pair) — the real reconciler's own
+`reconcile_loop`/`rebalance_placement` genuinely never has anything to move
+for any of them, so no fixture bookkeeping (`SimClusterHandle::
+replicas_of`'s static creation-time snapshot, used by `sim_cluster_corpus.
+rs`/`sim_cluster_dynamo_corpus.rs`) went stale. `every_node_hosts_exactly_
+its_replica_set_after_rebalance` (renamed from `reconciler_hazard_fires_
+deterministically_when_node_count_exceeds_replication`, `sim_cluster_
+dynamo_table_ops.rs`) is the one scenario that *does* rebalance (by
+design — it's the former hazard's own 4-node/3-table shape), now a
+convergence proof instead of a documented gap, run at the pinned seed plus
+ten more (`every_node_hosts_exactly_its_replica_set_after_rebalance_over_
+seeds`). `create_table_issued_on_a_control_follower_relays_and_converges`
+was bumped from 3 to 4 nodes as this rung's own proof the `node_count <= 3`
+restriction is lifted for an ordinary (non-rebalancing) scenario too. A
+new `SimClusterHandle::hosted_tablets(node)`/`SimCluster::hosted_tablets`
+accessor (the tablet-id set of `ClusterEdgeState::hosted_groups()`) backs
+both the renamed test's own check and a new general "no zombie groups"
+invariant added to `sim_cluster_corpus.rs`'s end-of-scenario checks
+(`check_no_zombie_groups`, `ScenarioResult::no_zombie_groups`) — checked
+unconditionally on every cell, non-vacuous only against a future cell that
+introduces a genuine rebalance (none does today). `cargo test -p animusd
+--lib`: 306 passed / 118.4s wall before this rung, 307 passed / 113.4s wall
+after (net +1: +2 new tests, −1 renamed away — zero regressions, and wall
+time is within ordinary run-to-run noise of the baseline). **This needed
+one tuning pass**: [`RECONCILER_FALLBACK`] (`sim_cluster.rs`) started at
+50ms (matching `poll_until`'s own convergence-check step) and measured
+~3s/scenario in `sim_cluster_corpus.rs` at `ANIMUS_SIMCLUSTER_SEEDS=3`
+(vs. ~1.75s/scenario pre-D4-PR-1) — every long-running scenario (`SETTLE`/
+fault-window/`DRAIN`, several seconds of virtual time) pays for a
+reconciler tick every 50ms whether or not anything changed, since real
+convergence is driven by `metadata_watch()`'s own near-instant wake
+regardless of the fallback's own length. Widened to 200ms (still 2.5x more
+responsive than production's own 500ms `RECONCILE_FALLBACK_INTERVAL`) —
+~2.1s/scenario, and the full-suite wall time above reflects it. See ADR
+0061's matching 2026-09-07 "D4 PR 1" amendment for the full account,
+including what remains open for D4 PRs 2-5 (auto-split's own `tokio::time`
+conversion, GC's `drop_table` driver, join/growth, the backup janitor's
+`client_ctx_host.rs` widening).
 
 The restart tests run both incarnations in the same runtime,
 calling `Node::shutdown()` between them. In-crate `#[cfg(test)] mod`s

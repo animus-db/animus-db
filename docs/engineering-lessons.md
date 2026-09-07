@@ -21376,3 +21376,114 @@ any node that was never given a reason to host that tablet. When a fixture
 grows a second way to create the same kind of object, audit every helper
 that reads the *first* way's own private bookkeeping before assuming it
 still answers correctly for the second.
+
+## A fixture that reimplements half of a production loop inherits the other half's hazards — `SimCluster`'s add-only tablet-host watcher (ADR 0061 rung D4 PR 1, closing issue #715)
+
+D3 PR 2a needed *some* mechanism to host a wire-provisioned tablet under
+`SimCluster` (nothing in that fixture ran a real `animus_cp_data::host::
+Reconciler`), so it wrote the smallest thing that would make `CreateTable`
+work: a per-node loop that hosts a `RaftKvNode` for any tablet whose
+`Metadata` replica set names this node. That watcher deliberately
+implemented exactly one half of what a real reconciler does — *add* a
+missing replica's own hosting — and left the other half out: it never
+reacted to a `MetaCommand::CasTabletReplicas` that dropped a replica the
+same tablet used to have. The control plane's own `rebalance_placement`
+pass doesn't know or care whether anything is physically reconciling its
+decisions; it runs unconditionally, so the instant `node_count exceeded
+MAX_REPLICATION_FACTOR`, it rebalanced a wire-provisioned tablet's
+replica set exactly as designed — and the watcher left a stale, live
+`RaftKvNode` running on the node the CAS just removed, genuinely
+split-brain-shaped, reachable with a plain `CreateTable` and no fault
+injection at all. This was found, characterized precisely (`sim_cluster_
+dynamo_table_ops.rs::reconciler_hazard_fires_deterministically_when_
+node_count_exceeds_replication`, 25 seeds, byte-identical every time), and
+left deliberately unfixed for two whole rungs (D3 PR 2a through 3b) behind
+a documented `node_count <= 3` restriction on every test that issued a
+real wire `CreateTable` — the honest and correct call at the time, since a
+proper fix needed materially more fixture machinery than any single one
+of those PRs' own briefs asked for.
+
+**The general lesson**: a fixture that stands in for a production
+event-driven loop by hand-coding *only the code paths the fixture's
+current tests happen to exercise* will silently reproduce every hazard
+the loop's *other* code paths exist to prevent, the moment something
+else in the system (here: an entirely separate, correct, unconditional
+background process — the control plane's own rebalancer) starts
+exercising the path the stand-in never implemented. The stand-in doesn't
+need to be buggy in isolation for this to bite — `spawn_policy_tablet_
+host_loop` did exactly what its own doc said it did, correctly, forever;
+the gap was never a defect in the code that existed, only in the code
+that didn't. Two ways this generalizes: (1) when scoping a stand-in for
+a real subsystem, name explicitly which of the real thing's own
+responsibilities you are and are not implementing, and write that
+omission down as a load-bearing constraint on every caller (the
+`node_count <= 3` restriction was exactly this — a real, if narrow,
+safety net) rather than as an implicit assumption a future test can
+silently violate; (2) the actual fix, when it eventually lands (D4 PR 1,
+this same rung), is almost always cheaper than re-deriving the missing
+half by hand a second time — `animus_cp_data::host::Reconciler` already
+existed, was already `SimEnv`-generic and sim-proven
+(`reconciler_corpus.rs`), and slotting it in (one `Reconciler` per node,
+`on_host`/`on_teardown` hooks mirroring hosting into the fixture's
+existing routing registry) needed zero production signature changes at
+all — the "more machinery than this PR's own brief asks for" that
+justified deferring the fix originally was true of THAT PR's own scope,
+not a statement that the real fix was actually hard. Don't let "the
+minimal fix for today's ticket" become "the permanent shape of the
+fixture" without an explicit, re-visitable decision to that effect — a
+`node_count <= 3` comment that outlives the investigation that produced
+it is a standing invitation for the next engineer to either violate it by
+accident or avoid a whole class of otherwise-useful test shapes forever.
+
+## A background loop's fallback poll interval, copied from an unrelated caller's own convergence-check cadence, is a cost multiplied by every long `run_for` window a corpus drives (ADR 0061 rung D4 PR 1)
+
+`SimCluster`'s new per-node reconciler-driving loop (`spawn_reconciler_
+loop`) needed a fallback interval — how often to re-tick when
+`metadata_watch()` doesn't wake it. The first draft set it to 50ms,
+reasoning that it should match `SimCluster::poll_until`'s own 50ms
+convergence-check step, "so a reconciler that reacts at least that often."
+That reasoning sounds plausible and is wrong: `poll_until` polls a
+*predicate* cheaply; it never depends on the reconciler's own internal
+tick cadence to converge, because every real hosting/reconfigure decision
+is driven by `metadata_watch()`'s own wake, which resolves in near-zero
+virtual time on an actual commit **regardless of the fallback's length**.
+The fallback only bounds a missed-wake safety net — a case that, in
+practice, never fires in this fixture's own test suite.
+
+What the 50ms choice actually cost: `sim_cluster_corpus.rs`'s own
+scenarios each drive several seconds of virtual time (`SETTLE`/a fault
+window/`DRAIN`), and every node pays for a full reconciler tick
+(`gather_facts` + `plan`, non-trivial work even when nothing changed)
+every 50ms of it. Measured directly (`ANIMUS_SIMCLUSTER_SEEDS=3`,
+`--nocapture` to see per-scenario progress): ~3s/scenario, vs. ~1.75s/
+scenario before this rung — at `ANIMUS_SIMCLUSTER_SEEDS=10` that
+extrapolates to several real minutes for the corpus alone, which looked,
+mid-run, indistinguishable from a hang (steady CPU and growing memory,
+no progress markers under a captured, non-`--nocapture` test run) until
+a smaller-depth `--nocapture` probe showed it was making completely
+normal per-scenario progress, just slower than before. Widening the
+fallback to 200ms (still 2.5x more responsive than the analogous
+production constant, `RECONCILE_FALLBACK_INTERVAL` = 500ms) cut
+per-scenario time to ~2.1s and brought the whole crate's `cargo test -p
+animusd --lib` wall time back down to within noise of the pre-change
+baseline, with zero change in which scenario converges or how — proving
+the original 50ms bought no correctness or convergence-speed benefit at
+all, only cost.
+
+**The general lesson**: when a new polling/fallback constant needs a
+value and an existing, unrelated constant happens to be sitting right
+there (a caller's own convergence-check step, a sibling fixture's poll
+interval), matching it "to be safe" is not free — the new constant's own
+*actual* cost model may be completely different (here: driven once per
+long virtual-time window per node, not once per assertion), and nothing
+about "it matches the neighbor" proves it's sized correctly for where
+it's actually used. Measure the thing you're actually adding — a
+seed-depth corpus, a fault-injection loop, anything that multiplies a
+per-tick cost by scenario count × seed depth × node count — before
+shipping a plausible-sounding value, the same way a benchmark file in
+this repo measures a real I/O cost before choosing a design instead of
+reasoning about it in the abstract. And when a background test run looks
+stalled, check for actual progress (a `--nocapture` re-run at a smaller
+depth, or a process's own CPU/memory trend) before assuming either "it's
+hung" or "it's fine" — both guesses were available here and only one was
+right.
