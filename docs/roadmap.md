@@ -162,25 +162,31 @@ the still-true paragraph after the table.
   **landed 2026-09-07**. **Size:** XL (interacts with the `Disk` seam's
   fsync/durability contract). **S-03 is complete.**
 
-### S-07 Operator hardening (ADR 0060 deferred list)
+### S-07 Operator hardening (ADR 0060 deferred list) — landed 2026-09-07, complete
 
-- **e. Admission webhook** validating the CRD. Needs a webhook TLS cert —
-  the prerequisite this used to be sequenced behind is done: TLS on every
-  port ([ADR 0064](adr/0064-tls-on-every-port.md)) shipped in full,
-  including this crate's own cert-manager `Certificate` builder and CRD
-  shape (`spec.tls.certManager`) a webhook's own cert-issuance can reuse
-  directly. No longer blocked; open to pick up on its own schedule. Size L.
-- **ADR:** e gets its own section or a new number if the webhook design
-  grows. (Item b — `backupStore`/`segmentStore` CRD fields for the non-S3
-  `cluster`/`fs:`/`dir:` forms — landed 2026-09-06, see ADR 0060's own
-  "Amendment (2026-09-06): S-07b" section; `spec.s3` already covers the
-  `s3://...` form, ADR 0060's S-04 PR 3 amendment. Item c — quorum-derived
-  `PodDisruptionBudget` builder, no CRD field added — landed 2026-09-06,
-  see ADR 0060's own "Amendment (2026-09-06): S-07c" section. Item d —
-  `controlNodes` growth via the CRD, driving ADR 0037 `control/member/add`
-  one voter at a time and a config-hash pod-template restart mechanism —
-  landed 2026-09-06, see ADR 0060's own "Amendment (2026-09-06): S-07d"
-  section.)
+- **e. Admission webhook** validating the CRD — landed 2026-09-07: a pure,
+  shared validator (`crate::validate::validate_spec`) the reconciler's own
+  condition-based fallback and a new opt-in `ValidatingWebhookConfiguration`
+  both call, an HTTPS webhook server in the same `animus-operator` binary
+  (`--webhook-addr`/`--webhook-cert`/`--webhook-key`), and its own TLS cert
+  via a generalized cert-manager `Certificate` builder (`animus-operator
+  webhook-cert`) or a hand-issued `Secret` — see [ADR 0070](
+  adr/0070-operator-admission-webhook.md).
+- **ADR:** e got its own number, [ADR 0070](
+  adr/0070-operator-admission-webhook.md), per this section's own "or a new
+  number if the webhook design grows" allowance — a shared validator, a
+  TLS server, two cert paths, and a static manifest was more than a
+  section-in-0060 could carry cleanly. (Item b — `backupStore`/
+  `segmentStore` CRD fields for the non-S3 `cluster`/`fs:`/`dir:` forms —
+  landed 2026-09-06, see ADR 0060's own "Amendment (2026-09-06): S-07b"
+  section; `spec.s3` already covers the `s3://...` form, ADR 0060's S-04
+  PR 3 amendment. Item c — quorum-derived `PodDisruptionBudget` builder, no
+  CRD field added — landed 2026-09-06, see ADR 0060's own "Amendment
+  (2026-09-06): S-07c" section. Item d — `controlNodes` growth via the
+  CRD, driving ADR 0037 `control/member/add` one voter at a time and a
+  config-hash pod-template restart mechanism — landed 2026-09-06, see ADR
+  0060's own "Amendment (2026-09-06): S-07d" section.) **This closes
+  S-07's whole item list (b/c/d/e all landed).**
 
 ---
 
@@ -291,7 +297,7 @@ wave are independent and can run in parallel.
 | 3 | *U-05, U-07, U-08(ii) landed 2026-09-06* | No ordering constraint remains |
 | 4 | *landed 2026-09-05* (S-02) | Highest blast radius (C-01 landed 2026-09-05 — see ADR 0054; S-01 landed 2026-09-05 — see ADR 0064; S-02 — see ADR 0066) |
 | 5 | *S-04, S-05, S-07b–d, C-02, C-05 all landed 2026-09-06* | S-05 strictly after S-04 |
-| 6 | *S-03 complete 2026-09-07 (all 3 PRs, ADR 0069)*; S-07e, W-07, C-03 | XL or gated on earlier waves (S-07e's webhook-TLS prerequisite is satisfied now that S-01 landed; no longer a hard gate, just unscheduled) |
+| 6 | *S-03 complete 2026-09-07 (all 3 PRs, ADR 0069)*; *S-07e/S-07 complete 2026-09-07 (ADR 0070)*; W-07, C-03 | XL or gated on earlier waves |
 
 Open issues mapped: none left (#375 closed by W-01, #319 by W-05). Filed
 from wave 2's own findings: #590 (the operator still emits the deleted

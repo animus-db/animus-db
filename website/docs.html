@@ -626,11 +626,15 @@
           continuous backups (<code>RestoreTableToPointInTime</code>); a source table's backup
           history and PITR coverage both outlive the table if it's later dropped.</li>
         <li><strong>Tablets never merge</strong>, so a table that shrinks keeps its tablet count.</li>
-        <li><strong>The Kubernetes operator ships no admission webhook</strong> — an invalid spec
-          edit (e.g. shrinking <code>controlNodes</code> after creation, or a malformed
-          <code>spec.s3</code>) is caught by the controller after the fact, surfaced as a status
-          condition, not rejected up front. Growing <code>controlNodes</code> is honored: the
-          controller drives the control group's own admin API to add each new voter.</li>
+        <li><strong>The Kubernetes operator's validating admission webhook is opt-in, not
+          installed by default</strong> — without it, an invalid spec edit (e.g. shrinking
+          <code>controlNodes</code> after creation, or a malformed <code>spec.s3</code>) is caught
+          by the controller after the fact, surfaced as a status condition, not rejected up front.
+          Installing the webhook (a few extra manifests, a TLS cert either from cert-manager or
+          hand-issued) rejects the same bad writes at the API server itself, before they're ever
+          persisted — see the operator's own deploy docs. Growing <code>controlNodes</code> is
+          honored either way: the controller drives the control group's own admin API to add each
+          new voter.</li>
         <li><strong>Not benchmarked at scale.</strong> No performance claims are made here for a
           reason.</li>
       </ul>

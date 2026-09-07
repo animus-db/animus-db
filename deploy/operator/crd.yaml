@@ -78,10 +78,11 @@ spec:
                   `control/member/add` against the newly-promoted ordinals, one voter
                   at a time, resuming idempotently from `GET /admin/control/members`
                   truth across restarts (see `crate::controller`'s own growth
-                  machinery doc). A **decrease** is still rejected outright (a status
-                  condition, [`CONDITION_CONTROL_NODES_SHRINK_REJECTED`], is set; the
-                  field's last-achieved value keeps governing the cluster) since there
-                  is no admission webhook in v1 to reject the write itself and control
+                  machinery doc). A **decrease** is rejected — by the validating
+                  webhook at write time when installed (`crate::webhook`, S-07e/ADR
+                  0070), and always by the reconciler too (a status condition,
+                  [`CONDITION_CONTROL_NODES_SHRINK_REJECTED`], is set; the field's
+                  last-achieved value keeps governing the cluster) — since control
                   voters can only be removed one at a time through their own careful
                   quorum-loss checks (ADR 0037 §2), never inferred from a bare spec
                   edit. An increase above `spec.nodes` is rejected the same way a

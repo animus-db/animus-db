@@ -46,9 +46,11 @@ impl StorageSpec {
 
 /// `spec.tls` — TLS material for the cluster (ADR 0064 commit 3). Exactly
 /// one of `secretName`/`certManager` must be set; both or neither is
-/// rejected by [`TlsSpec::validate`] (called from `crate::controller`,
-/// since there is no admission webhook in v1 to reject the write itself —
-/// same posture as `controlNodes`' immutability check).
+/// rejected by [`TlsSpec::validate`] — called from `crate::validate::
+/// validate_spec`, shared by the validating webhook (`crate::webhook`,
+/// S-07e/ADR 0070, which rejects the write itself when installed) and
+/// `crate::controller::reconcile`'s own condition-based fallback for a
+/// cluster without one.
 ///
 /// Either shape resolves to the *same* `Secret` name
 /// ([`TlsSpec::secret_name_or_default`]): a pre-existing `kubernetes.io/tls`
@@ -313,10 +315,11 @@ pub struct AnimusClusterSpec {
     /// `control/member/add` against the newly-promoted ordinals, one voter
     /// at a time, resuming idempotently from `GET /admin/control/members`
     /// truth across restarts (see `crate::controller`'s own growth
-    /// machinery doc). A **decrease** is still rejected outright (a status
-    /// condition, [`CONDITION_CONTROL_NODES_SHRINK_REJECTED`], is set; the
-    /// field's last-achieved value keeps governing the cluster) since there
-    /// is no admission webhook in v1 to reject the write itself and control
+    /// machinery doc). A **decrease** is rejected — by the validating
+    /// webhook at write time when installed (`crate::webhook`, S-07e/ADR
+    /// 0070), and always by the reconciler too (a status condition,
+    /// [`CONDITION_CONTROL_NODES_SHRINK_REJECTED`], is set; the field's
+    /// last-achieved value keeps governing the cluster) — since control
     /// voters can only be removed one at a time through their own careful
     /// quorum-loss checks (ADR 0037 §2), never inferred from a bare spec
     /// edit. An increase above `spec.nodes` is rejected the same way a
@@ -642,9 +645,11 @@ pub enum ConditionStatus {
 }
 
 /// Condition type name used when a `spec.controlNodes` **decrease** is
-/// rejected (no admission webhook in v1 — see
-/// [`AnimusClusterSpec::control_nodes`]'s doc). Growth (an increase) is
-/// honored instead of rejected since S-07d — see
+/// rejected by the reconciler's own fallback check — see
+/// [`AnimusClusterSpec::control_nodes`]'s doc; the validating webhook
+/// (`crate::webhook`, S-07e/ADR 0070) rejects the same edit at write time
+/// when installed, before it ever reaches this condition. Growth (an
+/// increase) is honored instead of rejected since S-07d — see
 /// [`CONDITION_CONTROL_NODES_GROWING`].
 pub const CONDITION_CONTROL_NODES_SHRINK_REJECTED: &str = "ControlNodesShrinkRejected";
 /// Condition type name reporting an in-progress `spec.controlNodes` growth
@@ -680,9 +685,11 @@ pub const CONDITION_STORE_SPEC_INVALID: &str = "StoreSpecInvalid";
 /// key. **Checked live against the API server** (`crate::controller::
 /// validate_encryption_key_secret`) — unlike every other `*SpecInvalid`
 /// condition above, which is a pure syntactic check with no cluster access
-/// (`crd.rs`'s own "no admission webhook in v1" posture): a Secret
-/// *reference*'s only checkable shape is whether it actually exists, which
-/// the spec alone can never say.
+/// (`crate::validate::validate_spec`, shared by the reconciler and the
+/// validating webhook, S-07e/ADR 0070): a Secret *reference*'s only
+/// checkable shape is whether it actually exists, which the spec alone can
+/// never say — and a webhook must stay fast/side-effect-free, so this check
+/// stays reconciler-only, exactly as it always has.
 ///
 /// **Deliberately does NOT strip the field for the reconcile it's raised
 /// in** (unlike `TlsSpecInvalid`/`S3SpecInvalid`/`StoreSpecInvalid`, whose
@@ -700,6 +707,19 @@ pub const CONDITION_STORE_SPEC_INVALID: &str = "StoreSpecInvalid";
 /// self-healing the moment the Secret is created) rather than actively
 /// flipping the cluster to plaintext and back.
 pub const CONDITION_ENCRYPTION_KEY_SECRET_INVALID: &str = "EncryptionKeySecretInvalid";
+/// Condition type name used when `spec.nodes` is below 1 (S-07e, ADR 0070 —
+/// `crate::validate::validate_nodes`). **Purely informational, unlike every
+/// other `*SpecInvalid` condition above**: there is no sane fallback value
+/// to substitute (unlike `spec.tls`/`spec.s3`, which can safely reconcile
+/// "as if unset") and every builder already clamps to at least one node
+/// where it matters (`desired::poddisruptionbudget`'s own `safe_max_
+/// unavailable`), so the reconcile proceeds with the spec's own value
+/// unchanged — this condition exists so a cluster installed without the
+/// validating webhook (`crate::webhook`) still gets a visible signal
+/// instead of a silently useless zero-replica `StatefulSet`. A cluster with
+/// the webhook installed should never actually observe this condition,
+/// since the webhook rejects the write before it is ever persisted.
+pub const CONDITION_NODES_SPEC_INVALID: &str = "NodesSpecInvalid";
 
 #[cfg(test)]
 mod tests {

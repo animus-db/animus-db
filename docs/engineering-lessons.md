@@ -20310,3 +20310,55 @@ generated config back to plaintext) that the reconciler must never make on
 its own initiative just because a live read came back empty this once.
 Before copying an existing validate-and-strip pattern onto a new live
 check, ask which category the check actually falls into.
+
+## An `if let` condition is not valid in a match guard — Rust's let-chains stabilization covers `if`/`while` only (S-07e, `animus-operator` controller.rs)
+
+This repo's own code already leans on let-chains heavily (`if let Some(x) =
+a && let Err(e) = x.validate() { .. }`, throughout `controller.rs`), which
+made it tempting, while wiring `crate::validate::control_nodes_regression`
+into an existing `match prior_control_nodes { Some(prior) if .. => .. }`
+arm, to reach for the identical shape as a match guard: `Some(prior) if
+let Some(violation) = validate::control_nodes_regression(prior, target) =>
+{ .. }`. That is a *different* language feature (`if_let_guard`, tracking
+issue #51114) that has never stabilized — only a plain `if`/`while`
+condition got let-chains in this edition, never a match arm's own guard
+clause. The mistake was caught by re-reading the diff before compiling,
+not by a build failure, but it is exactly the kind of "this codebase does
+this shape everywhere, so it must work everywhere" reasoning worth naming:
+a stabilized language feature's scope is per-*construct*, not a blanket
+grant to every syntactic position that resembles it. Fixed by keeping the
+match's own boolean guard (`Some(prior) if validate::
+control_nodes_regression(prior, target).is_some() =>`) and re-deriving the
+`Violation` inside the arm body via a second call (documented as
+deliberately redundant, not a bug) rather than trying to bind it in the
+guard itself. Before reaching for a let-chain in a match guard anywhere in
+this codebase, restructure into a plain `if`/`while` (or an `if`-then-
+`match` split) instead — it will not compile on this toolchain.
+
+## `rustls-pki-types`'s `PemObject::*_file` helpers need the crate's `std` feature, which this workspace's dependency graph does not enable — read the file yourself and parse with `*_slice_iter`/`from_pem_slice` (S-07e, `animus-operator::webhook`)
+
+Loading a PEM cert/key pair from disk reads, at first glance, like it
+should be `CertificateDer::pem_file_iter(path)`/`PrivateKeyDer::
+from_pem_file(path)` — `rustls-pki-types`'s own convenience methods for
+exactly this. Both are gated `#[cfg(feature = "std")]` inside the crate,
+and this workspace's `rustls`/`tokio-rustls`/`rustls-pki-types` dependency
+set only ever requests `rustls-pki-types`'s `alloc` feature (`rustls`
+itself, `Cargo.toml` shows, depends on `pki-types` with `features =
+["alloc"]` only) — Cargo feature unification means `std` is simply never
+turned on anywhere in this graph, so the `*_file` methods do not exist to
+call. `crates/animus-operator/src/admin_client.rs::build_tls_connector`
+had already worked around this for a client-side CA load
+(`CertificateDer::pem_slice_iter` over bytes read with `std::fs::read`),
+but that precedent is easy to miss when writing a *new* loader from
+scratch and reaching for the method that reads best (`*_file`) rather than
+the one this workspace's feature set actually supports (`*_slice_iter`/
+`from_pem_slice`, which need only `alloc` and take a `&[u8]` you read
+yourself). `crate::webhook::load_tls_acceptor`'s first draft used the
+`_file` variants and only failed at `cargo build` — a clean, unambiguous
+"method not found" from a private-to-the-crate `#[cfg]`, not a subtle
+runtime gap, but still a wasted round trip. **When adding any new
+`rustls-pki-types` PEM consumer in this workspace, grep for an existing
+one first** (`admin_client.rs` is the reference shape) rather than trusting
+the crate's own public API surface to all be reachable — a dependency's
+Cargo features are a property of the whole workspace's unified graph, not
+of what any one crate's docs show as available.

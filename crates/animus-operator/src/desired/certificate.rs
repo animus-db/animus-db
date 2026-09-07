@@ -19,7 +19,7 @@ use kube::core::{ApiResource, DynamicObject, GroupVersionKind};
 use serde_json::json;
 
 use super::{client_service_name, common_labels, internal_service_name, owner_reference, pod_fqdn};
-use crate::crd::{AnimusCluster, AnimusClusterSpec};
+use crate::crd::{AnimusCluster, AnimusClusterSpec, IssuerRef};
 
 /// `cert-manager.io/v1` `Certificate`'s [`ApiResource`] — used both to build
 /// the [`DynamicObject`] below and, by `crate::cluster_api`, to address it
@@ -65,6 +65,42 @@ pub fn dns_names(name: &str, ns: &str, nodes: i32) -> Vec<String> {
     names
 }
 
+/// Build the `spec` object of a cert-manager `Certificate` — shared by
+/// [`build`] (an `AnimusCluster`'s own TLS cert) and
+/// [`build_standalone`] (S-07e, ADR 0070 — a cluster-independent cert, such
+/// as the admission webhook's own, which has no `AnimusCluster` to derive
+/// SANs/an owner reference from).
+fn cert_spec(
+    secret_name: &str,
+    dns_names: &[String],
+    issuer_ref: &IssuerRef,
+    duration: Option<&str>,
+    renew_before: Option<&str>,
+) -> serde_json::Value {
+    let mut issuer_ref_json = json!({
+        "name": issuer_ref.name,
+        "kind": issuer_ref.kind,
+    });
+    if let Some(group) = &issuer_ref.group {
+        issuer_ref_json["group"] = json!(group);
+    }
+    let mut spec = json!({
+        "secretName": secret_name,
+        "commonName": dns_names.first().cloned().unwrap_or_default(),
+        "dnsNames": dns_names,
+        "issuerRef": issuer_ref_json,
+        "usages": ["server auth", "client auth"],
+        "isCA": false,
+    });
+    if let Some(duration) = duration {
+        spec["duration"] = json!(duration);
+    }
+    if let Some(renew_before) = renew_before {
+        spec["renewBefore"] = json!(renew_before);
+    }
+    spec
+}
+
 /// Build the `Certificate` for `cluster`, or `None` when `spec.tls` isn't
 /// the `certManager` shape (nothing to create for a pre-existing
 /// `secretName`, or when TLS is off entirely).
@@ -83,27 +119,13 @@ pub fn build(cluster: &AnimusCluster, spec: &AnimusClusterSpec) -> Option<Dynami
         .expect("AnimusCluster read from the API server always has a namespace");
 
     let names = dns_names(name, ns, spec.nodes);
-    let mut issuer_ref = json!({
-        "name": cert_manager.issuer_ref.name,
-        "kind": cert_manager.issuer_ref.kind,
-    });
-    if let Some(group) = &cert_manager.issuer_ref.group {
-        issuer_ref["group"] = json!(group);
-    }
-    let mut cert_spec = json!({
-        "secretName": certificate_name(name),
-        "commonName": names[0],
-        "dnsNames": names,
-        "issuerRef": issuer_ref,
-        "usages": ["server auth", "client auth"],
-        "isCA": false,
-    });
-    if let Some(duration) = &cert_manager.duration {
-        cert_spec["duration"] = json!(duration);
-    }
-    if let Some(renew_before) = &cert_manager.renew_before {
-        cert_spec["renewBefore"] = json!(renew_before);
-    }
+    let cert_spec = cert_spec(
+        &certificate_name(name),
+        &names,
+        &cert_manager.issuer_ref,
+        cert_manager.duration.as_deref(),
+        cert_manager.renew_before.as_deref(),
+    );
 
     let resource = api_resource();
     let mut obj = DynamicObject::new(&certificate_name(name), &resource).data(json!({
@@ -117,6 +139,54 @@ pub fn build(cluster: &AnimusCluster, spec: &AnimusClusterSpec) -> Option<Dynami
         ..Default::default()
     };
     Some(obj)
+}
+
+/// Build a standalone cert-manager `Certificate` for `name`/`ns`, valid for
+/// `dns_names`, with no `AnimusCluster` owner (S-07e, ADR 0070) — this is
+/// what `animus-operator webhook-cert` (`main.rs`) prints, for the
+/// admission webhook's own TLS material: a single, cluster-independent
+/// object cert-manager issues once for the operator's own `Service`, not
+/// per-`AnimusCluster` the way [`build`] is. Generalizes this module's own
+/// [`cert_spec`] helper — same `Certificate.spec` shape, just no owner
+/// reference (nothing in this crate owns the webhook's own objects; they
+/// live and die with the operator's own static manifests, `deploy/
+/// operator/webhook.yaml`) and a caller-supplied name/DNS list instead of
+/// one derived from a live `AnimusCluster`.
+#[must_use]
+pub fn build_standalone(
+    name: &str,
+    ns: &str,
+    secret_name: &str,
+    dns_names: &[String],
+    issuer_ref: &IssuerRef,
+    duration: Option<&str>,
+    renew_before: Option<&str>,
+) -> DynamicObject {
+    let spec = cert_spec(secret_name, dns_names, issuer_ref, duration, renew_before);
+    let resource = api_resource();
+    let mut obj = DynamicObject::new(name, &resource).data(json!({ "spec": spec }));
+    obj.metadata = ObjectMeta {
+        name: Some(name.to_string()),
+        namespace: Some(ns.to_string()),
+        labels: Some(common_labels(name)),
+        ..Default::default()
+    };
+    obj
+}
+
+/// The DNS names a `ValidatingWebhookConfiguration`'s `clientConfig.service`
+/// target needs on the webhook's own `Certificate` (S-07e, ADR 0070) — the
+/// short and fully-qualified cluster-DNS names for `service` in `ns`, the
+/// same "short + FQDN" shape [`dns_names`] already gives each of an
+/// `AnimusCluster`'s two `Service`s.
+#[must_use]
+pub fn webhook_dns_names(service: &str, ns: &str) -> Vec<String> {
+    vec![
+        service.to_string(),
+        format!("{service}.{ns}"),
+        format!("{service}.{ns}.svc"),
+        format!("{service}.{ns}.svc.cluster.local"),
+    ]
 }
 
 #[cfg(test)]
@@ -243,5 +313,79 @@ mod tests {
             obj.data["spec"]["commonName"],
             "c-0.c-internal.ns.svc.cluster.local"
         );
+    }
+
+    // --- build_standalone / webhook_dns_names (S-07e, ADR 0070) ---
+
+    #[test]
+    fn webhook_dns_names_cover_short_and_fqdn() {
+        let names = webhook_dns_names("animus-operator-webhook", "animus-operator");
+        assert_eq!(
+            names,
+            vec![
+                "animus-operator-webhook",
+                "animus-operator-webhook.animus-operator",
+                "animus-operator-webhook.animus-operator.svc",
+                "animus-operator-webhook.animus-operator.svc.cluster.local",
+            ]
+        );
+    }
+
+    #[test]
+    fn build_standalone_has_no_owner_reference() {
+        let names = webhook_dns_names("animus-operator-webhook", "animus-operator");
+        let issuer_ref = IssuerRef {
+            name: "selfsigned".to_string(),
+            kind: "ClusterIssuer".to_string(),
+            group: None,
+        };
+        let obj = build_standalone(
+            "animus-operator-webhook-cert",
+            "animus-operator",
+            "animus-operator-webhook-tls",
+            &names,
+            &issuer_ref,
+            None,
+            None,
+        );
+        assert!(obj.metadata.owner_references.is_none());
+        assert_eq!(
+            obj.metadata.name.as_deref(),
+            Some("animus-operator-webhook-cert")
+        );
+        assert_eq!(obj.metadata.namespace.as_deref(), Some("animus-operator"));
+        assert_eq!(
+            obj.data["spec"]["secretName"],
+            "animus-operator-webhook-tls"
+        );
+        assert_eq!(obj.data["spec"]["dnsNames"], json!(names));
+        let types = obj.types.expect("DynamicObject carries TypeMeta");
+        assert_eq!(types.api_version, "cert-manager.io/v1");
+        assert_eq!(types.kind, "Certificate");
+    }
+
+    #[test]
+    fn build_standalone_passes_through_duration_and_issuer() {
+        let names = webhook_dns_names("svc", "ns");
+        let issuer_ref = IssuerRef {
+            name: "my-issuer".to_string(),
+            kind: "Issuer".to_string(),
+            group: Some("cert-manager.io".to_string()),
+        };
+        let obj = build_standalone(
+            "cert",
+            "ns",
+            "secret",
+            &names,
+            &issuer_ref,
+            Some("2160h"),
+            Some("360h"),
+        );
+        assert_eq!(
+            obj.data["spec"]["issuerRef"],
+            json!({ "name": "my-issuer", "kind": "Issuer", "group": "cert-manager.io" })
+        );
+        assert_eq!(obj.data["spec"]["duration"], "2160h");
+        assert_eq!(obj.data["spec"]["renewBefore"], "360h");
     }
 }

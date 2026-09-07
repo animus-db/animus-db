@@ -33,11 +33,13 @@ use crate::cluster_api::{ClusterApi, RealClusterApi};
 use crate::crd::{
     AnimusCluster, AnimusClusterStatus, CONDITION_CONTROL_NODES_GROWING,
     CONDITION_CONTROL_NODES_SHRINK_REJECTED, CONDITION_DRAIN_FAILED,
-    CONDITION_ENCRYPTION_KEY_SECRET_INVALID, CONDITION_S3_SPEC_INVALID,
-    CONDITION_SCALE_BELOW_CONTROL_NODES_REFUSED, CONDITION_STORE_SPEC_INVALID,
-    CONDITION_TLS_SPEC_INVALID, ClusterCondition, ClusterPhase, ConditionStatus,
+    CONDITION_ENCRYPTION_KEY_SECRET_INVALID, CONDITION_NODES_SPEC_INVALID,
+    CONDITION_S3_SPEC_INVALID, CONDITION_SCALE_BELOW_CONTROL_NODES_REFUSED,
+    CONDITION_STORE_SPEC_INVALID, CONDITION_TLS_SPEC_INVALID, ClusterCondition, ClusterPhase,
+    ConditionStatus,
 };
 use crate::desired;
+use crate::validate;
 
 /// The field manager name every server-side-apply call uses
 /// ([`crate::cluster_api::RealClusterApi`]'s own `PatchParams::apply`).
@@ -148,11 +150,15 @@ async fn apply_children<C: ClusterApi>(
 
 /// The `spec.controlNodes` value the *previous* reconcile actually applied
 /// (resolved against its own default at the time), or `None` on a fresh
-/// cluster with no applied `ConfigMap` yet. With no admission webhook in
-/// v1, the controller is the only thing that can catch a `controlNodes`
-/// edit — so it is caught here, every reconcile, by comparing against the
-/// live `StatefulSet`'s replica count is not enough (that only tells us
-/// `nodes`, not `controlNodes`); instead this reads a dedicated status
+/// cluster with no applied `ConfigMap` yet. **The reconciler keeps this
+/// check even on a cluster with the validating webhook installed (S-07e,
+/// ADR 0070)** — the webhook rejects a `controlNodes` decrease at write
+/// time using the *previous CR spec* (`crate::validate::validate_spec`'s
+/// `old` parameter), but this reconciler-side check is the only one that
+/// protects a cluster whose write predates the webhook's own installation,
+/// or one running without it at all; comparing against the live
+/// `StatefulSet`'s replica count is not enough (that only tells us
+/// `nodes`, not `controlNodes`), so this instead reads a dedicated status
 /// annotation-free signal: the `ConfigMap`'s own already-applied config,
 /// which is cheap to read back (server-side apply already wrote it) and is
 /// the actual source of truth for which ordinals were minted `Both` vs
@@ -649,11 +655,15 @@ async fn resolve_tls_ca<C: ClusterApi>(
 /// as [`ReconcileError`]).
 ///
 /// Unlike [`crate::crd::TlsSpec::validate`]/[`crate::crd::S3StoreSpec::
-/// validate`] (pure functions, no cluster access — `crd.rs`'s own "no
-/// admission webhook in v1" posture), this genuinely needs a live read: a
-/// Secret *reference*'s only checkable shape is its own presence (and, once
-/// present, its own data keys) in the cluster, neither of which the spec
-/// alone can ever say.
+/// validate`] (pure functions, no cluster access, both called from
+/// [`crate::validate::validate_spec`] — the one validator the reconciler
+/// and the validating webhook (`crate::webhook`, S-07e/ADR 0070) share),
+/// this genuinely needs a live read: a Secret *reference*'s only checkable
+/// shape is its own presence (and, once present, its own data keys) in the
+/// cluster, neither of which the spec alone can ever say — which is exactly
+/// why this check stays reconciler-only. The webhook must stay fast and
+/// side-effect free (ADR 0070); it never makes a Kubernetes API call of its
+/// own beyond reading the two objects the API server already handed it.
 async fn validate_encryption_key_secret<C: ClusterApi>(
     cluster_api: &C,
     ns: &str,
@@ -804,15 +814,31 @@ async fn reconcile<C: ClusterApi, A: AdminOps>(
     let mut status = cluster.status.clone().unwrap_or_default();
     status.observed_generation = cluster.metadata.generation;
 
-    // Validate `spec.tls` (ADR 0064 commit 3): no admission webhook in v1
-    // to reject the write itself, so — same posture as `controlNodes`'
-    // immutability check above — this is the one place that can catch a
-    // spec setting both or neither of `secretName`/`certManager`. Set a
-    // condition and reconcile the rest of the spec with TLS stripped
-    // (every other field — image, resources, scale — still deserves to
-    // converge) rather than getting stuck entirely on one bad field; the
-    // next reconcile (30s later, or sooner on a spec edit) retries the
-    // validation once the spec is fixed.
+    // Validate `spec.nodes` (S-07e, ADR 0070): purely informational — see
+    // `CONDITION_NODES_SPEC_INVALID`'s own doc for why there is no fallback
+    // to strip/substitute here, unlike every `*SpecInvalid` condition below.
+    // A cluster with the validating webhook installed never reaches this
+    // arm; one without it gets a visible signal instead of a silent
+    // zero-replica `StatefulSet`.
+    match validate::validate_nodes(&cluster.spec) {
+        Some(violation) => {
+            set_condition(&mut status, CONDITION_NODES_SPEC_INVALID, violation.message)
+        }
+        None => status
+            .conditions
+            .retain(|c| c.type_ != CONDITION_NODES_SPEC_INVALID),
+    }
+
+    // Validate `spec.tls` (ADR 0064 commit 3). **The validating webhook
+    // (`crate::webhook`, S-07e/ADR 0070) rejects this at write time when
+    // installed** — the same `TlsSpec::validate` call, reached via
+    // `crate::validate::validate_spec`. This reconcile-time check is the
+    // fallback for a cluster installed without the webhook, or a write that
+    // predates it: set a condition and reconcile the rest of the spec with
+    // TLS stripped (every other field — image, resources, scale — still
+    // deserves to converge) rather than getting stuck entirely on one bad
+    // field; the next reconcile (30s later, or sooner on a spec edit)
+    // retries the validation once the spec is fixed.
     if let Some(tls) = &cluster.spec.tls
         && let Err(e) = tls.validate()
     {
@@ -860,9 +886,10 @@ async fn reconcile<C: ClusterApi, A: AdminOps>(
             .retain(|c| c.type_ != CONDITION_ENCRYPTION_KEY_SECRET_INVALID);
     }
 
-    // Validate `spec.s3` (S-04 PR 3): same "no admission webhook in v1"
-    // posture as `spec.tls` above — set a condition and reconcile the rest
-    // of the spec with `s3` stripped rather than getting stuck entirely.
+    // Validate `spec.s3` (S-04 PR 3): same "the webhook rejects this at
+    // write time when installed, this is the fallback" posture as
+    // `spec.tls` above — set a condition and reconcile the rest of the spec
+    // with `s3` stripped rather than getting stuck entirely.
     if let Some(s3) = &cluster.spec.s3
         && let Err(e) = s3.validate()
     {
@@ -877,10 +904,11 @@ async fn reconcile<C: ClusterApi, A: AdminOps>(
         .conditions
         .retain(|c| c.type_ != CONDITION_S3_SPEC_INVALID);
 
-    // Validate `spec.backupStore`/`spec.segmentStore` (S-07b): same "no
-    // admission webhook in v1" posture as `spec.tls`/`spec.s3` above — set a
-    // condition and reconcile the rest of the spec with both fields
-    // stripped rather than getting stuck entirely. Checked *after*
+    // Validate `spec.backupStore`/`spec.segmentStore` (S-07b): same "the
+    // webhook rejects this at write time when installed, this is the
+    // fallback" posture as `spec.tls`/`spec.s3` above — set a condition and
+    // reconcile the rest of the spec with both fields stripped rather than
+    // getting stuck entirely. Checked *after*
     // `spec.s3` above (not before): an invalid `spec.s3` already returned
     // early, so by this point `cluster.spec.s3` is either `None` or valid,
     // which is what lets `validate_store_spec`'s own conflict check trust
@@ -913,7 +941,15 @@ async fn reconcile<C: ClusterApi, A: AdminOps>(
     let prior_control_nodes =
         previous_applied_control_nodes(&ctx.cluster_api, &ns, &cluster).await?;
     let pdb_control_nodes = match prior_control_nodes {
-        Some(prior) if target_control_nodes < prior => {
+        Some(prior)
+            if validate::control_nodes_regression(prior, target_control_nodes).is_some() =>
+        {
+            // The condition above is exactly `validate::control_nodes_regression(..).
+            // is_some()` — the identical pure rule the webhook enforces on an
+            // UPDATE review (`validate::validate_spec`) — so the message below,
+            // built from that same function, can never disagree with it.
+            let violation = validate::control_nodes_regression(prior, target_control_nodes)
+                .expect("guard above just proved this is Some");
             warn!(
                 cluster = %name,
                 prior_control_nodes = prior,
@@ -923,10 +959,7 @@ async fn reconcile<C: ClusterApi, A: AdminOps>(
             set_condition(
                 &mut status,
                 CONDITION_CONTROL_NODES_SHRINK_REJECTED,
-                format!(
-                    "spec.controlNodes decreased from {prior} to {target_control_nodes} — \
-                     ignored; controlNodes can grow but never shrink once a cluster is running"
-                ),
+                violation.message,
             );
             // Reconcile with the *prior* control-node count so the running
             // cluster's own role split never actually changes underneath it.
@@ -977,6 +1010,19 @@ async fn reconcile<C: ClusterApi, A: AdminOps>(
     // set); a data-only pod may always be removed.
     let control_nodes = target_control_nodes;
     if cluster.spec.nodes < control_nodes {
+        // The same pure rule the webhook enforces on every CREATE/UPDATE
+        // review (`validate::validate_spec` -> `validate_control_nodes_
+        // within_nodes`) — reused here for the message text so the two can
+        // never disagree; the `if` above is this rule's own "nodes below
+        // controlNodes" arm, so this always resolves to `Some`.
+        let message = validate::validate_control_nodes_within_nodes(&cluster.spec)
+            .map(|v| v.message)
+            .unwrap_or_else(|| {
+                format!(
+                    "spec.nodes ({}) is below spec.controlNodes ({control_nodes})",
+                    cluster.spec.nodes
+                )
+            });
         warn!(
             cluster = %name,
             nodes = cluster.spec.nodes,
@@ -986,10 +1032,7 @@ async fn reconcile<C: ClusterApi, A: AdminOps>(
         set_condition(
             &mut status,
             CONDITION_SCALE_BELOW_CONTROL_NODES_REFUSED,
-            format!(
-                "spec.nodes ({}) is below spec.controlNodes ({control_nodes}) — ignored",
-                cluster.spec.nodes
-            ),
+            message,
         );
         return finish_reconcile(&cluster, &ctx, &ns, status, pdb_control_nodes).await;
     }
@@ -2217,6 +2260,45 @@ mod tests {
                 .applies()
                 .iter()
                 .any(|(k, _)| *k == AppliedKind::Certificate)
+        );
+    }
+
+    /// S-07e (ADR 0070): the reconciler and the validating webhook
+    /// (`crate::webhook::handle_review`) share the exact same pure
+    /// validator (`crate::validate::validate_spec`) — this test calls
+    /// **both** paths on the identical invalid spec and asserts they agree:
+    /// the webhook denies it, and the reconciler surfaces the matching
+    /// condition. A cluster installed without the webhook still gets the
+    /// reconciler's own fallback; one installed with it never reaches the
+    /// reconcile loop with this spec at all — either way, the two can never
+    /// disagree about *which* specs are valid.
+    #[tokio::test]
+    async fn reconciler_and_webhook_agree_on_an_invalid_spec() {
+        let mut cluster = test_cluster("demo", "ns1", 3, None);
+        cluster.spec.tls = Some(TlsSpec {
+            secret_name: None,
+            cert_manager: None,
+        });
+
+        // The webhook's own pure validator, called directly (no socket
+        // needed — see `crate::webhook`'s own doc for why `validate_spec`
+        // is exposed standalone).
+        let violations =
+            validate::validate_spec(None, &cluster.spec).expect_err("invalid spec.tls");
+        assert!(violations.iter().any(|v| v.field == "spec.tls"));
+
+        // The reconciler's own fallback path, over the identical spec.
+        let ctx = make_ctx(FakeClusterApi::new(), FakeAdminClient::new());
+        let result = reconcile(Arc::new(cluster), Arc::clone(&ctx)).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+        let status = ctx.cluster_api.last_status().unwrap();
+        assert!(
+            status
+                .conditions
+                .iter()
+                .any(|c| c.type_ == CONDITION_TLS_SPEC_INVALID),
+            "{:?}",
+            status.conditions
         );
     }
 

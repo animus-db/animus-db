@@ -11,5 +11,7 @@ pub mod desired;
 #[cfg(test)]
 pub mod fakes;
 pub mod s3_uri;
+pub mod validate;
+pub mod webhook;
 
 pub use crd::{AnimusCluster, AnimusClusterSpec, AnimusClusterStatus};

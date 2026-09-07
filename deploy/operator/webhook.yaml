@@ -1,0 +1,104 @@
+# The AnimusCluster validating admission webhook (S-07e, ADR 0070) — opt-in,
+# applied on top of deployment.yaml/rbac.yaml. See deploy/operator/README.md's
+# "Admission webhook" section for the full picture, including:
+#   - the two supported ways to get a cert/key pair into the operator pod
+#     (cert-manager, the default this file assumes; or a hand-issued
+#     `kubernetes.io/tls` Secret — see that section for the exact edits),
+#   - the deployment.yaml edits (args/ports/volumeMounts/volumes) this
+#     manifest's own Service and ValidatingWebhookConfiguration assume are
+#     also made,
+#   - why the ValidatingWebhookConfiguration is a static manifest rather
+#     than something the operator creates itself.
+apiVersion: v1
+kind: Service
+metadata:
+  name: animus-operator-webhook
+  namespace: animus-operator
+  labels:
+    app.kubernetes.io/name: animus-operator
+spec:
+  selector:
+    app.kubernetes.io/name: animus-operator
+  ports:
+    - name: webhook
+      port: 443
+      targetPort: webhook
+---
+# cert-manager path (the default this file assumes): a Certificate for the
+# webhook Service's own DNS names, issued by a pre-existing Issuer/
+# ClusterIssuer (never created by this operator — see README.md's TLS
+# section for the identical AnimusCluster-facing precedent). Generate this
+# object rather than hand-writing it — it reuses the same builder
+# `crate::desired::certificate` uses for an AnimusCluster's own TLS cert
+# (`certificate::build_standalone`):
+#
+#   cargo run -p animus-operator -- webhook-cert \
+#     --namespace animus-operator \
+#     --service animus-operator-webhook \
+#     --issuer-name my-cluster-issuer \
+#     --issuer-kind ClusterIssuer \
+#     | kubectl apply -f -
+#
+# The example below is what that command prints for a ClusterIssuer named
+# "selfsigned" — replace --issuer-name/--issuer-kind with your own and
+# regenerate rather than hand-editing the issuerRef here.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: animus-operator-webhook-cert
+  namespace: animus-operator
+  labels:
+    app.kubernetes.io/name: animus-operator
+spec:
+  secretName: animus-operator-webhook-tls
+  commonName: animus-operator-webhook
+  dnsNames:
+    - animus-operator-webhook
+    - animus-operator-webhook.animus-operator
+    - animus-operator-webhook.animus-operator.svc
+    - animus-operator-webhook.animus-operator.svc.cluster.local
+  issuerRef:
+    name: selfsigned
+    kind: ClusterIssuer
+  usages: ["server auth", "client auth"]
+  isCA: false
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: animus-operator-validating-webhook
+  labels:
+    app.kubernetes.io/name: animus-operator
+  annotations:
+    # cert-manager's `cainjector` watches for this annotation and fills in
+    # `webhooks[].clientConfig.caBundle` below from the named Certificate's
+    # own issued CA — this is what makes the cert-manager path need no
+    # manual caBundle maintenance at all. DELETE this annotation, and fill
+    # `caBundle` by hand instead, if you're using the static-Secret path
+    # (see README.md's "Admission webhook" section, "Without cert-manager").
+    cert-manager.io/inject-ca-from: animus-operator/animus-operator-webhook-cert
+webhooks:
+  - name: validate.animuscluster.animusdb.io
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    # A webhook the API server cannot reach, or that times out, blocks
+    # every AnimusCluster write cluster-wide — deliberate (ADR 0070): a
+    # spec this validator would reject is worse to admit silently than to
+    # have the write briefly unavailable if the webhook itself is down.
+    failurePolicy: Fail
+    timeoutSeconds: 5
+    rules:
+      - apiGroups: ["animusdb.io"]
+        apiVersions: ["v1alpha1"]
+        resources: ["animusclusters"]
+        operations: ["CREATE", "UPDATE"]
+    clientConfig:
+      service:
+        name: animus-operator-webhook
+        namespace: animus-operator
+        path: /validate
+        port: 443
+      # cainjector fills this in from the Certificate above when the
+      # annotation is present; a static-Secret deployment must set this by
+      # hand instead — see README.md.
+      caBundle: ""

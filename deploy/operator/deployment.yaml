@@ -30,7 +30,28 @@ spec:
           # S-07a, 2026-09-02) on every push to main and on version tags —
           # same tag/push rules as the animusd image.
           image: ghcr.io/animus-db/animus-operator:latest
+          # The validating admission webhook (S-07e, ADR 0070) is opt-in —
+          # off by default (`args: ["run"]`, below). To turn it on, apply
+          # `deploy/operator/webhook.yaml` too, then REPLACE the `args:`
+          # line below with the commented block right under it (and
+          # uncomment the matching `ports:`/`volumeMounts:` here plus the
+          # pod-level `volumes:` at the bottom of this file). See
+          # `deploy/operator/README.md`'s "Admission webhook" section for
+          # the full picture, including the two supported ways to get a
+          # cert/key pair into /etc/animus/webhook.
           args: ["run"]
+          # args:
+          #   - "run"
+          #   - "--webhook-addr=0.0.0.0:9443"
+          #   - "--webhook-cert=/etc/animus/webhook/tls.crt"
+          #   - "--webhook-key=/etc/animus/webhook/tls.key"
+          # ports:
+          #   - name: webhook
+          #     containerPort: 9443
+          # volumeMounts:
+          #   - name: webhook-tls
+          #     mountPath: /etc/animus/webhook
+          #     readOnly: true
           resources:
             requests:
               cpu: 100m
@@ -38,3 +59,7 @@ spec:
             limits:
               cpu: 500m
               memory: 512Mi
+      # volumes:
+      #   - name: webhook-tls
+      #     secret:
+      #       secretName: animus-operator-webhook-tls
