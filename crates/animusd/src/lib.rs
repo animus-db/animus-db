@@ -17881,6 +17881,21 @@ mod sim_cluster_auto_split;
 #[cfg(test)]
 mod sim_cluster_backup_janitor;
 
+/// ADR 0061 rung D4 PR 4 (C-04 D4, closing the D4 roadmap item): deterministic
+/// `SimCluster` coverage for ADR 0030 online growth and ADR 0032 seed-join
+/// decommission — `sim_cluster.rs`'s own new `SimCluster::grow`/`drain`/
+/// `remove` fixture surface (a data-only node added after construction,
+/// `ControlHandle::Remote`'s real mirror-sync logic exercised under `SimEnv`
+/// for the first time, and the ADR 0032 drain-then-remove sequence driven
+/// through the real `admin_drain`/`admin_remove_member` primitives). See
+/// this module's own doc for the five scenarios (grow convergence, growth
+/// then placement/rebalance onto the new node, grow-then-drain-then-remove,
+/// a control-leader crash mid-registration, and mirror sync surviving a
+/// partition) and `crates/animusd/CLAUDE.md`'s matching entry for the full
+/// account, including what stayed on `ProdEnv`.
+#[cfg(test)]
+mod sim_cluster_growth;
+
 /// Regression for the issue #298 residual confirmed live under the
 /// un-pinned `SplitMode::InPlace` proof soak (ADR 0018's matching amendment,
 /// `docs/engineering-lessons.md`'s matching entry): a stage blocked by

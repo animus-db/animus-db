@@ -151,6 +151,12 @@ use animus_cp_data::KIND_BASE;
 use animus_dynamo::AttributeValue;
 use animus_env::{EnvExt, nid};
 use animus_node::SimRelayClient;
+// ADR 0061 rung D4 PR 4: the generic `RemoteControlClient<R>` — distinct
+// from this crate's own `RemoteControlClient` (a `control_handle.rs` alias
+// bound to `R = AnimusdRelayClient`, brought in by `super::*` and useless
+// here) — is what [`SimCluster::grow`] installs on a growth node, bound to
+// `R = SimRelayClient<SimEnv>` instead.
+use animus_node::control_handle::RemoteControlClient as GenericRemoteControlClient;
 use animus_sim::{NetConfig, SimEnv, SimSegmentStore, Simulator};
 
 use super::*;
@@ -272,6 +278,123 @@ fn spawn_reconciler_loop(ctx: SimNodeCtx, mut reconciler: Reconciler<SimEnv, Mem
     });
 }
 
+/// A `SimEnv`-native re-implementation of `animusd`'s own
+/// `remote_metadata_watch_loop`/`remote_metadata_sync_loop` (ADR 0061 rung
+/// D4 PR 4) — those functions are structurally unreachable under `SimEnv`:
+/// `ClientCtx`'s bare name defaults to `E = ProdEnv`/`R = AnimusdRelayClient`
+/// (so a `ClientCtx<SimEnv, SimRelayClient<SimEnv>>` doesn't even type-check
+/// as their parameter), and `remote_metadata_watch_loop`'s own retry backoff
+/// is a bare `tokio::time::sleep` — the `Env`-seam violation this fixture's
+/// whole reason for existing (`SimEnv`-driven determinism) can't route
+/// around. This is a **new, parallel implementation of the same long-poll
+/// protocol**, not a generalization of the production function (which
+/// stays untouched) — it drives the exact same wire round trip
+/// (`ClientRequest::WatchMetadata`/`Status`, `RemoteControlClient::observe`/
+/// `observe_delta`) against the exact same [`GenericRemoteControlClient`]
+/// type production's own `ControlHandle::Remote` wraps, so what's actually
+/// exercised — the mirror's real observe/delta/leader-hint logic — is
+/// identical; only the executor and the sleep primitive differ. This is
+/// the one genuinely new mechanism [`SimCluster::grow`] adds: a
+/// `ControlHandle::Remote` node's mirror-sync path had never run under
+/// `SimEnv` before this rung.
+///
+/// Spawned once per growth node, mirroring [`spawn_reconciler_loop`]'s own
+/// "spawn as its own task, never `block_on`'d" discipline — every `.await`
+/// inside only resolves while a caller elsewhere is driving
+/// `Simulator::run_for`.
+fn spawn_remote_mirror_sync_loop(
+    ctx: SimNodeCtx,
+    remote: GenericRemoteControlClient<SimRelayClient<SimEnv>>,
+    seeds: Vec<String>,
+) {
+    ctx.env.clone().spawn_task(async move {
+        loop {
+            let last_seen = remote.metadata_watch().latest();
+            let mut candidates = Vec::with_capacity(seeds.len() + 1);
+            if let Some(addr) = remote.intra_leader_addr_hint() {
+                candidates.push(addr);
+            }
+            candidates.extend(seeds.iter().cloned());
+
+            let mut synced = false;
+            for addr in candidates {
+                match remote
+                    .relay()
+                    .relay(
+                        addr,
+                        &ClientRequest::WatchMetadata { last_seen },
+                        WATCH_METADATA_CLIENT_TIMEOUT,
+                    )
+                    .await
+                {
+                    ClientResponse::Status {
+                        metadata,
+                        leader_hint,
+                        intra_leader_hint,
+                        watermark,
+                        control_voters,
+                    } => {
+                        remote.observe(
+                            metadata,
+                            leader_hint,
+                            intra_leader_hint,
+                            watermark,
+                            control_voters,
+                        );
+                        synced = true;
+                        break;
+                    }
+                    ClientResponse::MetadataDelta {
+                        writes,
+                        watermark,
+                        leader_hint,
+                        intra_leader_hint,
+                        control_voters,
+                    } => {
+                        remote.observe_delta(
+                            last_seen,
+                            &writes,
+                            leader_hint,
+                            intra_leader_hint,
+                            watermark,
+                            control_voters,
+                        );
+                        synced = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            if synced {
+                continue;
+            }
+            for addr in &seeds {
+                if let ClientResponse::Status {
+                    metadata,
+                    leader_hint,
+                    intra_leader_hint,
+                    watermark,
+                    control_voters,
+                } = remote
+                    .relay()
+                    .relay(addr.clone(), &ClientRequest::Status, CLIENT_TIMEOUT)
+                    .await
+                {
+                    remote.observe(
+                        metadata,
+                        leader_hint,
+                        intra_leader_hint,
+                        watermark,
+                        control_voters,
+                    );
+                    break;
+                }
+            }
+            ctx.env.sleep(REMOTE_WATCH_RETRY_BACKOFF).await;
+        }
+    });
+}
+
 /// This fixture's fixed key encoding: every table's items are addressed by
 /// a `(pk, sk)` pair of DynamoDB `S` (string) attributes, run through the
 /// real `dynamo::item_key` (ADR 0022/0023 token + escape) — the identical
@@ -381,6 +504,17 @@ impl SimClusterHandle {
 
     fn set_ctx(&self, node: u64, ctx: SimNodeCtx) {
         self.ctxs.lock().expect("ctxs poisoned")[node as usize] = ctx;
+    }
+
+    /// Append a freshly built node's own `ClientCtx` (ADR 0061 rung D4 PR 4,
+    /// [`SimCluster::grow`]) — unlike [`set_ctx`](Self::set_ctx), which
+    /// replaces an existing index, this grows the vec by one. The pushed
+    /// ctx's own index becomes its node id, so the caller must push at
+    /// exactly `ctxs.len()` (i.e. `SimCluster::node_count()`, read BEFORE
+    /// this call) — [`SimCluster::grow`] is this fixture's one caller and
+    /// upholds that by construction.
+    fn push_ctx(&self, ctx: SimNodeCtx) {
+        self.ctxs.lock().expect("ctxs poisoned").push(ctx);
     }
 
     fn insert_tablet(&self, tablet: TabletId, info: TabletInfo) {
@@ -1924,6 +2058,15 @@ impl SimCluster {
     /// SAME `MemoryTabletEngines` handle this node was built with**
     /// (`self.engines[node]`) — see the module doc's own restart bullet
     /// for why this node's tablet data is no longer wiped by a restart.
+    ///
+    /// **`node` must be one of the original `0..nodes` control-voter ids
+    /// this cluster was constructed with (ADR 0061 rung D4 PR 4)** — this
+    /// method indexes `self.controls[node]`, a control-voter-only `Vec`
+    /// that a [`SimCluster::grow`]n data-only node was never pushed onto
+    /// (it has no local control `RaftNode` at all — see that method's own
+    /// doc). Restarting a grown node is out of this rung's scope (no
+    /// scenario needs it); calling this with a grown node's index panics on
+    /// the `Vec` index, not gracefully.
     pub(crate) fn restart(&mut self, node: u64) {
         let id = nid(node);
         if self.crashed.remove(&node) {
@@ -2044,6 +2187,327 @@ impl SimCluster {
     /// convention).
     pub(crate) fn seed(&self) -> u64 {
         self.sim.seed()
+    }
+
+    /// **ADR 0061 rung D4 PR 4: add a node after construction** — the one
+    /// piece of ADR 0030/0032 growth/decommission machinery [`SimCluster::
+    /// new`] structurally cannot exercise (the module doc's own "the whole
+    /// node set is known at construction" note). `role` must be `"data"`
+    /// today — a `"combined"` growth node (a new control-plane voter, via
+    /// `change_membership`/`admin_add_control_member`) was scoped for this
+    /// rung and deferred: it needs a genuinely new `RaftNode<SimEnv>` joining
+    /// the **live** control quorum (`self.controls` growing, not just
+    /// `self.nodes`), which is a materially different — and separately
+    /// budgeted — piece of machinery than a data-only node's `ControlHandle::
+    /// Remote` mirror. Returns the new node's own `u64` index (always
+    /// `self.node_count()` as observed just before this call — indices are
+    /// **never reused**, even across a later [`SimCluster::remove`] of a
+    /// different node, since this fixture only ever appends).
+    ///
+    /// Mirrors `animusd::BoundDataNode::start_data_with_growth`'s real
+    /// construction (see that method's own doc) as closely as a `SimEnv`
+    /// fixture can — same `ControlHandle::Remote(RemoteControlClient::new(
+    /// ..))`, same per-node reconciler/heartbeat/backup-janitor/auto-split
+    /// spawns [`SimCluster::new`] already gives every original node — with
+    /// two deliberate departures, both documented at their own call site
+    /// below: **self-registration is the fixture's own `RegisterNode`+
+    /// `UpsertMember{Active}` control-plane bypass** (`SimCluster::
+    /// seed_members`'s idiom, not `ClientCtx::admin_add_member`'s real
+    /// relay+failure-detector-promotion dance), and **the mirror-sync loop
+    /// is [`spawn_remote_mirror_sync_loop`]**, a `SimEnv`-native
+    /// reimplementation of `remote_metadata_sync_loop` (see that function's
+    /// own doc for why the production one can't be called directly).
+    ///
+    /// **Route tables are patched, not synced** — every existing node's own
+    /// `client_route`/`intra_route` gains this node's entry via one direct
+    /// mutation of each `Arc<Mutex<..>>` map, and the new node's own routes
+    /// are seeded from the (now-patched) union. This is deliberately NOT a
+    /// `route_sync_loop`/`intra_route_sync_loop` equivalent — those loops
+    /// exist in production because a real node only ever learns of another
+    /// one incrementally, over time, from `Metadata`; this fixture already
+    /// holds every `ClientCtx` in one process, so a one-shot patch at the
+    /// instant of growth is both simpler and sufficient for every scenario
+    /// this rung's own module needs. A future rung wanting to prove the real
+    /// sync loops themselves would need to build them fresh here, not widen
+    /// this one.
+    ///
+    /// Returns once every node's own view of `Metadata::members` shows the
+    /// new node `Active` (converged-or-timeout polled, the same discipline
+    /// every other DDL-shaped method on this fixture uses) — so a caller's
+    /// very next op issued from the new node, or targeting it, can rely on
+    /// that being true.
+    pub(crate) fn grow(&mut self, role: &str) -> u64 {
+        assert_eq!(
+            role, "data",
+            "SimCluster::grow supports role=\"data\" (data-only growth) \
+             only today — a \"combined\" (new control-plane voter) growth \
+             node is deferred, see this method's own doc"
+        );
+        let new_n = self.nodes as u64;
+        let id = nid(new_n);
+        let addr = id.to_string();
+
+        // The pre-growth control quorum's own addresses — this fixture's
+        // `SimRelayClient` addressing convention (`NodeId::to_string()`) is
+        // identical to `client_route`/`intra_route`'s own entries built in
+        // `SimCluster::new`. Fixed for the life of this rung (no `"combined"`
+        // growth yet, so `self.controls` never grows).
+        let control_ids: Vec<NodeId> = (0..self.controls.len() as u64).map(nid).collect();
+        let seeds: Vec<String> = control_ids.iter().map(NodeId::to_string).collect();
+
+        // Patch every EXISTING node's own route tables with the new node's
+        // entry, then read back the union from node 0's own (now-patched)
+        // map as the new node's own initial route tables — see this
+        // method's own doc for why a one-shot patch, not a sync loop, is
+        // the right shape here.
+        for n in 0..self.nodes as u64 {
+            let existing = self.shared.ctx(n);
+            existing
+                .client_route
+                .lock()
+                .expect("client route poisoned")
+                .insert(id.clone(), addr.clone());
+            existing
+                .intra_route
+                .lock()
+                .expect("intra route poisoned")
+                .insert(id.clone(), addr.clone());
+        }
+        let route: BTreeMap<NodeId, String> = self
+            .shared
+            .ctx(0)
+            .client_route
+            .lock()
+            .expect("client route poisoned")
+            .clone();
+
+        let env = self.sim.env(id.clone());
+        let relay: SimRelayClient<SimEnv> = SimRelayClient::new(env.clone());
+        let remote = GenericRemoteControlClient::new(seeds.clone(), relay.clone(), CLIENT_TIMEOUT);
+        let control = GenericControlHandle::Remote(remote.clone());
+        let edge = ClusterEdgeState::<SimEnv>::new();
+
+        let admin = Arc::new(AdminInfo {
+            auto_split_ops_rate_threshold: None,
+            throttle_read_units: None,
+            throttle_write_units: None,
+            node_id: Some(id.clone()),
+            internal_addr: Some(placeholder_addr()),
+            client_addr: placeholder_addr(),
+            dynamo_addr: None,
+            admin_addr: placeholder_addr(),
+            role: "data",
+            control_ids: control_ids.clone(),
+            peers: BTreeMap::new(),
+            admin_addrs: vec![placeholder_addr()],
+            auto_split_bytes_threshold: None,
+            backup_store: None,
+            segment_store: None,
+            quiesce_after_ms: None,
+            auth_enabled: None,
+            auth_access_key_ids: None,
+            otlp_endpoint: None,
+        });
+
+        let ctx: SimNodeCtx = ClientCtx {
+            control,
+            edge: edge.clone(),
+            env: env.clone(),
+            data: Some(DataRole {
+                raftkv_metrics: MetricsHandle::noop(),
+                base_id: id.clone(),
+                stream_seal_knobs: StreamSealKnobs::default(),
+                change_rates: ChangeRateTracker::default(),
+                request_rates: RequestRateTracker::default(),
+            }),
+            segment_store: SegmentStoreHandle::Fs(FsSegmentStore::new(format!(
+                "unused-segment-store-{new_n}"
+            ))),
+            backup_store: BackupStoreHandle::S3(Arc::new(self.backup_store.clone())),
+            export_store_factory: Arc::new(Mutex::new(default_export_store_factory(None))),
+            backup_janitor_progress: Arc::new(Mutex::new(
+                animus_node::backup_janitor::JanitorProgress::default(),
+            )),
+            ttl_reaper_progress: Arc::new(Mutex::new(
+                animus_node::ttl_reaper::TtlReaperProgress::default(),
+            )),
+            segment_janitor_progress: Arc::new(Mutex::new(
+                segment_janitor::SegmentJanitorProgress::default(),
+            )),
+            client_route: Arc::new(Mutex::new(route.clone())),
+            intra_route: Arc::new(Mutex::new(route)),
+            admin,
+            metrics_history: Arc::new(Mutex::new(VecDeque::new())),
+            remote_metadata: Arc::new(Mutex::new(None)),
+            control_storage: None,
+            dynamo_auth: None,
+            tls: None,
+            relay: relay.clone(),
+            throttle: ThrottleTracker::new(),
+            throttle_defaults: Arc::new(ThrottleDefaults::default()),
+            any_table_throughput: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+
+        // Install the relay server, exactly like `SimCluster::new`/
+        // `restart` do for every other node.
+        let ctx_for_server = ctx.clone();
+        relay.serve(move |req| {
+            let ctx = ctx_for_server.clone();
+            async move { forwarding::handle_relayed_request(&ctx, req).await }
+        });
+
+        self.shared.push_ctx(ctx.clone());
+        self.engines.push(MemoryTabletEngines::new());
+        self.nodes += 1;
+
+        // Self-registration: `RegisterNode` + `UpsertMember{Active}`,
+        // proposed directly on the current control leader — the identical
+        // control-plane bypass idiom `SimCluster::seed_members` uses for the
+        // initial node set, deliberately not `ClientCtx::admin_add_member`'s
+        // real relay + `Down`-then-failure-detector-promotion dance (see
+        // this method's own doc).
+        let leader = self.control_leader_index();
+        let addrs = NodeAddrs {
+            internal: addr.clone(),
+            client: addr.clone(),
+            intra: addr.clone(),
+            admin: addr,
+            role: "data".to_owned(),
+        };
+        assert!(
+            matches!(
+                self.controls[leader].propose(MetaCommand::RegisterNode {
+                    node: id.clone(),
+                    addrs,
+                    labels: BTreeMap::new(),
+                }),
+                ProposeResult::Accepted { .. }
+            ),
+            "RegisterNode must be accepted by the current control leader (grow node={new_n})"
+        );
+        assert!(
+            matches!(
+                self.controls[leader].propose(MetaCommand::UpsertMember {
+                    node: id.clone(),
+                    labels: BTreeMap::new(),
+                    status: NodeStatus::Active,
+                }),
+                ProposeResult::Accepted { .. }
+            ),
+            "UpsertMember must be accepted by the current control leader (grow node={new_n})"
+        );
+
+        // Heartbeat the (pre-growth) control voter set — load-bearing, the
+        // identical `SimCluster::new`/`restart` reasoning: a member with no
+        // heartbeat loop running flips back to `Down` within
+        // `DETECT_TIMEOUT` of the control group's own failure detector.
+        let hb_env = env.clone();
+        hb_env.spawn_task(animus_control::node::heartbeat_loop(
+            hb_env.clone(),
+            control_ids,
+        ));
+
+        // The real per-node tablet-host reconciler — identical construction
+        // to `SimCluster::new`/`restart`.
+        let reconciler = build_reconciler(
+            env.clone(),
+            self.engines[new_n as usize].clone(),
+            id.clone(),
+            edge,
+        );
+        spawn_reconciler_loop(ctx.clone(), reconciler);
+
+        // The backup janitor — unconditional spawn, identical to
+        // `SimCluster::new`/`restart`.
+        let janitor_env = env.clone();
+        janitor_env.spawn_task(backup_janitor::backup_janitor_loop(ctx.clone()));
+
+        // Auto-split, if this cluster opted in — identical to
+        // `SimCluster::restart`'s own respawn.
+        if let Some(thresholds) = self.auto_split {
+            self.spawn_auto_split(new_n, thresholds);
+        }
+
+        // The one genuinely new mechanism this rung adds: a `SimEnv`-native
+        // mirror-sync loop driving `ControlHandle::Remote`'s real
+        // observe/observe_delta/leader-hint logic — see that function's own
+        // doc for why this couldn't just call `animusd`'s own
+        // `remote_metadata_sync_loop`.
+        spawn_remote_mirror_sync_loop(ctx, remote, seeds);
+
+        // Converge: every node's own view of `Metadata::members` shows the
+        // new node `Active` — including the new node's own `Remote` mirror,
+        // which only becomes true once `spawn_remote_mirror_sync_loop`'s
+        // first round trip lands.
+        let target = id;
+        let total = self.nodes as u64;
+        self.poll_until(Duration::from_secs(10), move |c| {
+            (0..total).all(|n| {
+                c.metadata(n)
+                    .members
+                    .get(&target)
+                    .is_some_and(|m| m.status == NodeStatus::Active)
+            })
+        });
+
+        new_n
+    }
+
+    /// **ADR 0061 rung D4 PR 4: drive the ADR 0032 decommission sequence's
+    /// drain half** on `node` — `ClientCtx::admin_drain`, proposed on the
+    /// CURRENT control leader's own ctx (mirroring production's own
+    /// local-leader-only, not-relayed discipline for this admin action; see
+    /// that method's own doc). Marks `node` `Leaving` so the control-plane
+    /// leader's own `reconcile_loop` (spawned unconditionally by
+    /// `RaftNode::start`, already running on every control voter this
+    /// fixture builds — no extra driving needed) excludes it from
+    /// `active_candidates` and repairs every tablet policy that named it,
+    /// same real production mechanism, not a stand-in.
+    ///
+    /// Converged-or-timeout polled on [`SimCluster::hosted_tablets`]`(node)`
+    /// going empty — the real per-node reconciler's own teardown, not a
+    /// bookkeeping flip. A node hosting nothing to begin with converges
+    /// immediately (this is a valid, if less interesting, call).
+    pub(crate) fn drain(&mut self, node: u64) {
+        let leader = self.control_leader_index();
+        let ctx = self.shared.ctx(leader as u64);
+        ctx.admin_drain(nid(node)).unwrap_or_else(|e| {
+            panic!("admin_drain(node={node}) must be accepted by the control leader: {e}")
+        });
+        self.poll_until(Duration::from_secs(20), |c| {
+            c.shared.hosted_tablets(node).is_empty()
+        });
+    }
+
+    /// **ADR 0061 rung D4 PR 4: drive the ADR 0032 decommission sequence's
+    /// finishing half** on `node` — `ClientCtx::admin_remove_member`,
+    /// proposed on the current control leader's own ctx (same not-relayed
+    /// discipline as [`SimCluster::drain`]). Panics if the control leader
+    /// rejects it — the common cause is calling this before [`SimCluster::
+    /// drain`] has converged (the member is still `Active`/`Joining`, or
+    /// still referenced by a tablet); the panic message says so.
+    ///
+    /// Converged-or-timeout polled on every node's own view of
+    /// `Metadata::members` no longer naming `node` at all. **`node`'s own
+    /// index is never reused by a later [`SimCluster::grow`]** — this
+    /// fixture only ever appends (`grow`'s own `new_n = self.node_count()`),
+    /// so a removed node's id simply becomes permanently inert bookkeeping,
+    /// mirroring production's own "ids are never reused" tablet/node
+    /// convention (root `CLAUDE.md`).
+    pub(crate) fn remove(&mut self, node: u64) {
+        let leader = self.control_leader_index();
+        let ctx = self.shared.ctx(leader as u64);
+        ctx.admin_remove_member(nid(node)).unwrap_or_else(|e| {
+            panic!(
+                "admin_remove_member(node={node}) must be accepted by the control \
+                 leader — did SimCluster::drain(node) converge first? ({e})"
+            )
+        });
+        let target = nid(node);
+        let total = self.nodes as u64;
+        self.poll_until(Duration::from_secs(10), move |c| {
+            (0..total).all(|n| !c.metadata(n).members.contains_key(&target))
+        });
     }
 }
 

@@ -666,7 +666,13 @@ fn run_every_node_hosts_exactly_its_replica_set_after_rebalance(seed: u64) {
 /// (`animus_cp_data::host::RECLAIM_STOP_TIMEOUT`-bounded on the production
 /// side), so a snapshot taken mid-teardown can legitimately still show a
 /// stale entry for one more tick.
-fn assert_no_zombie_groups(cluster: &mut SimCluster, seed: u64) {
+///
+/// `pub(crate)` since ADR 0061 rung D4 PR 4: `sim_cluster_growth.rs`'s own
+/// growth/drain/remove scenarios reuse this exact check at the end of every
+/// scenario (the corpus's own convention), rather than duplicating it — the
+/// identical "widen only what a sibling `#[cfg(test)] mod` genuinely needs"
+/// discipline this crate's own visibility lesson documents.
+pub(crate) fn assert_no_zombie_groups(cluster: &mut SimCluster, seed: u64) {
     const BUDGET: Duration = Duration::from_secs(10);
     const STEP: Duration = Duration::from_millis(100);
     let mut elapsed = Duration::ZERO;
