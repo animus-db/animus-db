@@ -65,6 +65,11 @@ the still-true paragraph after the table.
   (4) Batch; (5) ExecuteTransaction. **Size:** XL.
 - **Depends:** soft: reuse W-01's `UpdateExpression` tokenizer (landed
   2026-09-04) if it generalises.
+- **Status (2026-09-07):** ADR landed ([0071](adr/0071-partiql-subset.md) —
+  pins the grammar, the placeholder-only discipline, and the
+  key-versus-filter lowering rule; concludes the W-01 tokenizer does *not*
+  generalise, a hand-written lexer instead). PR 2 (`ExecuteStatement`
+  `SELECT` → `Query`/`Scan`) in flight.
 
 ---
 
