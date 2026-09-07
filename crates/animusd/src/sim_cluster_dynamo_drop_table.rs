@@ -511,7 +511,7 @@ fn drop_immediately_after_create_races_host_and_reclaim_over_seeds() {
 /// scenario_4_a_node_crashed_during_the_drop_and_restarted_leaks_its_engine
 /// -- --ignored`.
 #[test]
-#[ignore = "known gap (ADR 0061 rung D4 PR 3 finding): a node crashed while \
+#[ignore = "known gap, issue #722 (ADR 0061 rung D4 PR 3 finding): a node crashed while \
             hosting a table, restarted after the table's drop has already \
             converged elsewhere, never reclaims its own stale tablet engine \
             — see this test's own doc for the full mechanism (host::\
