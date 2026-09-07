@@ -6456,6 +6456,64 @@ including what remains open for D4 PRs 2-5 (auto-split's own `tokio::time`
 conversion, GC's `drop_table` driver, join/growth, the backup janitor's
 `client_ctx_host.rs` widening).
 
+**D3 closed 2026-09-07 (rung D3 PR 4, CI re-baseline + docs, no source
+change)**: the real-thread `tests/*.rs` tier and the deterministic sim
+tier now run in different CI jobs. `.github/workflows/ci.yml`'s `gates`
+job runs `cargo test -p animusd --lib` — the deterministic
+`sim_cluster*`/`SimCluster` corpus, plus a handful of pre-existing
+real-thread `#[cfg(test)] mod`s that still live inside `--lib` and ride
+along since `cargo test --lib` has no way to split one target further
+(`confirm_futility_tests`/`forward_transport_failure_tests`/
+`halted_shutdown_tests`/`issue_412_tests`/`issue_298_conflict_tests` in
+`lib.rs`, `stream_write_path_tests` in `dynamo.rs`, `gsi_drain_cursor_
+tests`/`stream_sealer_tests` in `index_drain.rs`, `orphan_reap_tests` in
+`segment_janitor.rs`, `system_table_tests` in `admin.rs` — each a small
+single-node bring-up, judged an acceptable blast radius for `gates`'s
+2-vCPU runner) — while `prod-liveness-animusd`'s 4 nextest shards now run
+`--tests` only: the 100 real-socket `tests/*.rs` integration binaries
+(down from 120 pre-D3; 418 tests, down from 521). `sim_cluster*.rs` itself
+grew from 5 to 29 modules and 35 to 140 tests across D3's five PRs. Net
+`cargo test -p animusd --lib`: 240 → 306 (307 after D4 PR 1). The CI
+shard partition count stays at 4: each shard rebuilds `-p animusd` from a
+cold cache, so a compile floor sits under every shard regardless of test
+count — fewer partitions raises the max shard wall time, it does not
+lower it (measured: 598s → 564s at the slowest shard). See ADR 0061's
+2026-09-07 "D3 closed" amendment for the full before/after numbers.
+
+**Residual `tests/*.rs` inventory (100 files / 418 tests) by class, as of
+the D3 close**: (A) real-thread liveness/timing, 10 files/13 tests —
+genuine OS-thread timing (election, group commit, lock races) `SimEnv`
+cannot prove, stays `ProdEnv` permanently; (B) real-disk durability/
+restart, 9 files/24 tests — real fsync/crash recovery, stays `ProdEnv`
+permanently; (C) real crypto/DNS/TLS/OTLP/sockets, 9 files/32 tests — TLS
+handshake, DNS resolution, SigV4, OTLP export, raw framing, stays
+`ProdEnv` permanently; (D) waiting on a `SimCluster` capability this
+fixture doesn't have yet, 65 files/317 tests, split by what's missing —
+admin/console/dashboard HTTP (10/66), PartiQL (2/37), join/growth/
+decommission (9/34), Transact (6/32), index DDL beyond plain `CreateTable`
+(9/30), backup/PITR/export/import (6/29), Streams (3/28), control/data
+role split (5/21), reconciler-driven split/rebalance/GC (7/13), TTL
+(1/9), node assembly/raw `ClientRequest` (2/8), throttle metric counters
+(1/6), auto-split loops (2/2), `--config` bring-up (2/2) —
+reconciler-driven split/rebalance/GC, auto-split, join/growth, and the
+backup janitor are D4's own scope (D4 PR 1 already supplied the real
+reconciler these need next); Transact and PartiQL are D2's own named
+residuals; admin/console/dashboard HTTP, Streams, TTL, the control/data
+role split, `--config` bring-up, index DDL beyond `CreateTable`, node
+assembly, and the throttle-metric counters are unowned by any planned
+rung as of this close; (E) frozen behind an open flake issue, 7 files/32
+tests (#298, #418, #592, #601, #610, #619/#622, #627) — out of scope for
+C-04, tracked by their own issues.
+
+**Standing rule for new `animusd` logic tests**: default to a
+`sim_cluster_*` sibling module (`SimCluster::dynamo`/`dynamo_concurrent`/
+`create_table_with_replication`, or the generic `dispatch_item_op`/
+`dispatch_table_op`/index-query cores) — deterministic, seed-replayable,
+no real socket/thread/disk. Reach for a `tests/*.rs` `ProdEnv` binary only
+when the behavior under test genuinely needs class (A), (B), or (C) above:
+real-thread liveness/timing, real-disk durability across a process
+restart, or real crypto/DNS/TLS/socket framing.
+
 The restart tests run both incarnations in the same runtime,
 calling `Node::shutdown()` between them. In-crate `#[cfg(test)] mod`s
 (`confirm_futility_tests`) live in `lib.rs` itself

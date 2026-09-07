@@ -842,7 +842,7 @@ supply one, and isn't trying to.
 |---|---|
 | D1 | `SimCluster` harness: a multi-node cluster driven by `SimEnv`, on B1's shared corpus scaffolding. Built on `ClientCtx<SimEnv>` in `animusd`'s own tests, per the seventh 2026-08-28 amendment — not on a moved `animus-node` assembly |
 | D2 | An end-to-end DynamoDB-wire corpus — requests in at the wire edge, faults injected, resulting history checked by the existing `check_cycles`/`check_durability`/`check_convergence`. **Landed 2026-09-07 (both PRs)**: PR 1 (six item operations generic, `SimClusterHandle::dynamo`, a first small smoke) and PR 2 (the actual `Recorder`/`History` corpus over the wire, see the amendments below); GSI/LSI, transact, and PartiQL remain out of scope, named as D2's own residuals |
-| D3 | Migrate the `animusd` integration suite: **keep** the tests that genuinely prove real-thread liveness (group commit, lock contention, election timing — per the engineering-lessons rule that `SimEnv` does not prove thread liveness), convert the rest. **Success criterion corrected 2026-09-07** (see that date's own "D3 PR 1" amendment): the `prod-liveness` job's 2-attempt retry was already replaced by nextest sharding before D3 started, so there is no retry to drop — success is measured by the real-thread tier's own shrinking test count / wall time / flake surface instead. **PR 1 landed 2026-09-07**: the base-table-only "B class" (~30 tests across ten `dynamo_*.rs` binaries plus `kind_batch_outcome.rs`) converted to `SimCluster`. **PR 2a landed 2026-09-07**: `Metadata::members` population + `ClusterEdgeState::control` widened to `RaftNode<E>` make base-table DDL (`CreateTable`/`DeleteTable`/`ListTables`/`DescribeTable`, via new `dynamo::dispatch_table_op`) drivable over the real wire; two real fixture bugs found and fixed (a liveness-detector heartbeat gap, a tablet-id-allocator collision) and one genuine, documented `SimCluster` gap found and left open (a rebalanced-away replica's `RaftKvNode` is never torn down — see that date's own "D3 PR 2a" amendment). **PR 2b landed 2026-09-07**: `UpdateTable`'s own throughput-only change (`BillingMode`/`ProvisionedThroughput`, ADR 0065) is now drivable too, via a widened `dynamo::update_table_throughput` and a new `UpdateTable` arm on `dispatch_table_op` — five more `dynamo_throttling.rs` tests converted, no new fixture bugs (see that date's own "D3 PR 2b" amendment). **PR 3a landed 2026-09-07**: GSI/LSI `Query`/`Scan` dispatch through `SimCluster`, plus `CreateTable` with a declared GSI/LSI — eight functions widened to `<E, R>` (`run_index_query`/`run_gsi_query`/`run_lsi_query`/`run_index_scan`/`run_gsi_scan`/`run_lsi_scan`/`paginated_kind_examine`/`paginated_kind_examine_one`), 42 tests converted across nine new sibling modules; a GSI row is still never materialized under `SimCluster` (no drain loop spawned), pinned by its own new regression, so every GSI-*data* test stays on `ProdEnv` (see that date's own "D3 PR 3a" amendment). **PR 3b landed 2026-09-07, closing D3's own GSI-drain boundary**: `index_drain::drain_tablet`/`reconcile_partition` widened to `<E, R>` and a new `SimCluster::drain_gsi` fixture helper materialize a GSI's hidden table on demand, flipping PR 3a's own boundary regression positive and converting every GSI-data test it had to leave on `ProdEnv` (12 tests across nine sibling modules, two of them new: `sim_cluster_dynamo_documents.rs`, `sim_cluster_dynamo_schema.rs`) plus a sim twin of `dynamo_indexes.rs::gsi_write_then_query` that does not replace the original; seven `tests/dynamo_*.rs` files deleted whole, one trimmed (see that date's own "D3 PR 3b" amendment). D3 is now closed for the GSI-drain gap specifically — remaining `ProdEnv` binaries are there for real-thread-liveness or not-yet-generic-operation reasons |
+| D3 | Migrate the `animusd` integration suite: **keep** the tests that genuinely prove real-thread liveness (group commit, lock contention, election timing — per the engineering-lessons rule that `SimEnv` does not prove thread liveness), convert the rest. **Success criterion corrected 2026-09-07** (see that date's own "D3 PR 1" amendment): the `prod-liveness` job's 2-attempt retry was already replaced by nextest sharding before D3 started, so there is no retry to drop — success is measured by the real-thread tier's own shrinking test count / wall time / flake surface instead. **PR 1 landed 2026-09-07**: the base-table-only "B class" (~30 tests across ten `dynamo_*.rs` binaries plus `kind_batch_outcome.rs`) converted to `SimCluster`. **PR 2a landed 2026-09-07**: `Metadata::members` population + `ClusterEdgeState::control` widened to `RaftNode<E>` make base-table DDL (`CreateTable`/`DeleteTable`/`ListTables`/`DescribeTable`, via new `dynamo::dispatch_table_op`) drivable over the real wire; two real fixture bugs found and fixed (a liveness-detector heartbeat gap, a tablet-id-allocator collision) and one genuine, documented `SimCluster` gap found and left open (a rebalanced-away replica's `RaftKvNode` is never torn down — see that date's own "D3 PR 2a" amendment). **PR 2b landed 2026-09-07**: `UpdateTable`'s own throughput-only change (`BillingMode`/`ProvisionedThroughput`, ADR 0065) is now drivable too, via a widened `dynamo::update_table_throughput` and a new `UpdateTable` arm on `dispatch_table_op` — five more `dynamo_throttling.rs` tests converted, no new fixture bugs (see that date's own "D3 PR 2b" amendment). **PR 3a landed 2026-09-07**: GSI/LSI `Query`/`Scan` dispatch through `SimCluster`, plus `CreateTable` with a declared GSI/LSI — eight functions widened to `<E, R>` (`run_index_query`/`run_gsi_query`/`run_lsi_query`/`run_index_scan`/`run_gsi_scan`/`run_lsi_scan`/`paginated_kind_examine`/`paginated_kind_examine_one`), 42 tests converted across nine new sibling modules; a GSI row is still never materialized under `SimCluster` (no drain loop spawned), pinned by its own new regression, so every GSI-*data* test stays on `ProdEnv` (see that date's own "D3 PR 3a" amendment). **PR 3b landed 2026-09-07, closing D3's own GSI-drain boundary**: `index_drain::drain_tablet`/`reconcile_partition` widened to `<E, R>` and a new `SimCluster::drain_gsi` fixture helper materialize a GSI's hidden table on demand, flipping PR 3a's own boundary regression positive and converting every GSI-data test it had to leave on `ProdEnv` (12 tests across nine sibling modules, two of them new: `sim_cluster_dynamo_documents.rs`, `sim_cluster_dynamo_schema.rs`) plus a sim twin of `dynamo_indexes.rs::gsi_write_then_query` that does not replace the original; seven `tests/dynamo_*.rs` files deleted whole, one trimmed (see that date's own "D3 PR 3b" amendment). D3 is now closed for the GSI-drain gap specifically — remaining `ProdEnv` binaries are there for real-thread-liveness or not-yet-generic-operation reasons. **D3 closed 2026-09-07 (PRs #711 #716 #717 #718 #719 + this)** — see the dated "D3 closing" amendment below for the full before/after numbers, the reframed success criterion's verdict, and the residual `tests/*.rs` inventory by class |
 | D4 | Deterministic coverage for the behaviours that have none today: the auto-split byte trigger (`lib.rs:14397`), the dropped-table GC reclaim loop, join/growth sequencing, and the backup-janitor async loop (its replicated state machine is already sim-tested in `animus-control/tests/backup_catalog.rs`; the loop driving it is not) |
 
 Note that the copy-based split driver (ADR 0050) is deliberately **not** on
@@ -2303,6 +2303,143 @@ corpus --test inplace_split_reconciler` (unchanged, green — proof this
 PR's own animusd-side wiring exercises `Reconciler`/`MetadataView`
 exactly as that crate's own corpus already does, with no drift);
 `Cargo.lock` unchanged.
+
+#### 2026-09-07 amendment — D3 closed: CI re-baseline and the residual `tests/*.rs` inventory (rung D3 PR 4)
+
+D3 PR 4 is the closing PR named by its own row above: no source change,
+CI re-baseline plus documentation. It re-measures D3 end to end (base
+2c5e6c7a pre-D3, compared against 630782b7 — D3 PR 3b's own commit, the
+last D3 PR before D4 PR 1 started touching `sim_cluster.rs` for an
+unrelated reason), moves the deterministic sim tier out of the real-thread
+CI tier it had been riding inside since PR 1, and inventories what is left
+in `tests/*.rs` by why it's still there.
+
+**Measured before/after.**
+
+| Metric | Pre-D3 (`2c5e6c7a`) | Post-D3 (`630782b7`) | Δ |
+|---|---|---|---|
+| `crates/animusd/tests/*.rs` files | 120 | 100 | −20 |
+| `crates/animusd/tests/*.rs` test fns | 521 | 418 | −103 |
+| `sim_cluster*.rs` modules (`src/`) | 5 | 29 | +24 |
+| `sim_cluster*.rs` test fns | 35 | 140 | +105 |
+| `cargo test -p animusd --lib` | 240 | 306 (307 after D4 PR 1) | +66 (+67) |
+| Net crate coverage (`--lib` + `tests/`) | 556 | 558 | +2 |
+
+**The reframed success criterion (D3 PR 1's own correction) is verified,
+not just repeated.** PR 1 corrected the roadmap's stale "drop the
+`prod-liveness` retry" criterion to "shrink the real-thread tier's own
+test count / wall time / flake surface" — checked directly against
+`.github/workflows/ci.yml` before that PR started, confirming the retry
+was already gone. The measured table above is that criterion's own
+verdict: the real-thread `tests/*.rs` tier shrank by test count (521 →
+418, −20%; 120 → 100 files, also −20%) while the deterministic tier it fed
+grew 4x by module count (5 → 29) and 4x by test count (35 → 140) — exactly
+the shape "convert real-thread ProdEnv coverage to deterministic SimCluster
+coverage" predicts, not an accident of which tests happened to move.
+
+**CI shard wall time**: `prod-liveness-animusd`'s slowest of its four
+shards went from 598s (run 34103555943, pre-D3) to 564s (run 34123273726,
+at D3 PR 3a — the closest available run to D3's midpoint) — a real but
+modest drop, because each shard rebuilds `-p animusd` from a cold cache
+(`cache-targets: false` in every job in this workflow) and that compile
+alone sits under a floor of roughly five minutes regardless of how many
+tests run afterward; per-shard spread was 231–303s across the four
+partitions. **The partition count stays at 4, stated explicitly with the
+numbers**: going to 3 or 2 partitions concentrates more of the (shrinking)
+execution time and the (fixed) compile floor onto each remaining shard —
+it raises the max shard wall time, it does not lower it. This is the same
+"measure the fixed cost before touching a matrix" lesson this PR's own
+`docs/engineering-lessons.md` entry generalizes (see below).
+
+**The sim tier moves into `gates`.** Since PR 1, `cargo test -p animusd
+--lib` ran only inside the `prod-liveness-animusd` shards
+(`--lib --tests`), meaning every one of the +66 deterministic
+`sim_cluster*` tests D3 added executed exclusively inside the real-thread
+tier — a sim regression there would report as a `prod-liveness-animusd`
+failure, indistinguishable at a glance from the real-thread flake surface
+that tier exists to isolate, and would run at `--test-threads=1` (nextest's
+`ci` profile) for no reason a deterministic test needs. This PR moves it:
+`gates` gains its own `cargo test -p animusd --lib --locked
+-- --test-threads=2` step (the `--test-threads=2` matching that job's
+existing `--exclude animusd` step, for the identical 2-vCPU-runner
+reason), and the four `prod-liveness-animusd` shards drop to
+`--tests` only. `gates`'s own test step
+(`cargo test --workspace --exclude animusd --locked
+-- --test-threads=2`) never ran this tier before — this PR is what closes
+that gap. Checked directly: nothing else in the workflow names `--lib` for
+animusd (the hammer-pair job runs one named `--test` binary; the scattered
+job never touches animusd at all), and nextest's `count:${{
+matrix.partition }}/4` recomputes its balance from whatever targets are
+passed, so dropping `--lib` from the shards' own command line needs no
+further change there.
+
+**`--lib` is not perfectly pure, and this PR says so rather than
+overclaiming.** A handful of `#[cfg(test)] mod`s inside `--lib` predate D3
+entirely and are genuine single-node `ProdEnv` bring-ups —
+`confirm_futility_tests`/`forward_transport_failure_tests`/
+`halted_shutdown_tests`/`issue_412_tests`/`issue_298_conflict_tests` in
+`lib.rs`, `stream_write_path_tests` in `dynamo.rs`,
+`gsi_drain_cursor_tests`/`stream_sealer_tests` in `index_drain.rs`,
+`orphan_reap_tests` in `segment_janitor.rs`, `system_table_tests` in
+`admin.rs`. `cargo test --lib` builds and runs one target with no way to
+split it further, so these move into `gates` alongside the sim tests
+rather than staying stranded in a shard that otherwise has nothing left to
+shard for `--lib`. Judged acceptable rather than deferred: each is a
+small, single-node bring-up (a `TcpListener`, a one-node `run_node`, no
+multi-node election timing) — a materially lighter shape than the
+multi-node cluster tests `tests/*.rs` holds, which is what `gates`
+originally excluded `animusd` over (issues #280/#286). If this step turns
+out to be a source of flakes, the fix named in `ci.yml`'s own comment is a
+nextest `-E` filter narrowing `--lib`'s real-thread residue back out, not
+a retry.
+
+**`gates` job wall time**: 474s → 499s (+25s) *before this PR's own
+`--lib` step existed* — that number reflects only clippy/build growth from
+D3's added source (more code to typecheck and compile in a job that never
+ran animusd's tests before), not this PR's own new test step, which this
+worktree has no cargo to measure; the next CI run on this PR is the first
+real number for it.
+
+**Residual `tests/*.rs` inventory (100 files / 418 tests), by class.** A
+read-only pass at 630782b7 classified every remaining file:
+
+| Class | Files/Tests | Why it's still `ProdEnv` | Owning rung |
+|---|---|---|---|
+| A: real-thread liveness/timing | 10/13 | genuine OS-thread timing (election, group commit, lock races) — `SimEnv` proves logic and ordering, not liveness (root `CLAUDE.md`'s Testing section) | stays `ProdEnv` permanently |
+| B: real-disk durability/restart | 9/24 | real fsync/crash-recovery proof on real disk | stays `ProdEnv` permanently |
+| C: real crypto/DNS/TLS/OTLP/sockets | 9/32 | TLS handshake, DNS resolution, SigV4 crypto, OTLP export, raw frame/socket boundaries | stays `ProdEnv` permanently |
+| D: waiting on a `SimCluster` capability | 65/317 | see breakdown below | mixed, see breakdown |
+| E: frozen behind an open flake issue | 7/32 | #298, #418, #592, #601, #610, #619/#622, #627 — must not be touched incidentally while those issues are open | tracked by their own issues, out of C-04's scope |
+
+Class D's own breakdown, each figure `files/tests`, with the rung that
+owns closing it: admin/console/dashboard HTTP 10/66, PartiQL 2/37,
+join/growth/decommission 9/34, Transact 6/32, index DDL beyond plain
+`CreateTable` 9/30, backup/PITR/export/import 6/29, Streams 3/28,
+control/data role split 5/21, reconciler-driven split/rebalance/GC 7/13,
+TTL 1/9, node assembly/raw `ClientRequest` 2/8, throttle metric counters
+1/6, auto-split loops 2/2, `--config` bring-up 2/2. **D4** already supplies
+the mechanism (a real per-node `Reconciler`, landed by D4 PR 1) that
+reconciler-driven split/rebalance/GC, auto-split loops,
+join/growth/decommission, and backup/PITR/export/import (the backup
+janitor's own async loop) all need next — D4 PRs 2-5's own scope, per that
+rung's table entry. **D2's own named residuals** own Transact and PartiQL
+directly — `dispatch_item_op`/`dispatch_table_op` were deliberately scoped
+around them from PR 1 onward. **Unowned as of this close**: admin/console/
+dashboard HTTP, Streams, TTL, the control/data role split, `--config`
+bring-up, index DDL beyond plain `CreateTable` (an extension of D3's own
+`dispatch_table_op`, not claimed by any planned rung), node
+assembly/raw `ClientRequest`, and the throttle metric counters (this
+fixture's `DataRole` never populates the two specific counters those tests
+check, per `sim_cluster_throttle.rs`'s own doc — a fixture gap, not a
+missing dispatch arm). None of these eight groups has a rung against it
+today; the next C-04-shaped rung that wants one should start here rather
+than re-deriving the classification.
+
+**Gates**: `cargo fmt --all --check`; `python3 -c 'import yaml,sys;
+yaml.safe_load(open(sys.argv[1]))' .github/workflows/ci.yml` (this
+worktree carries no cargo at all — see this PR's own commit message for
+why — so the actual `gates`/`prod-liveness-animusd` runs are unverified
+here; the next CI run on this PR's branch is the first real signal).
 
 ### Phase E — the untested crates
 

@@ -451,6 +451,16 @@ the still-true paragraph after the table.
   PartiQL, Streams, TTL, admin/console/dashboard HTTP, TLS, SigV4,
   restart-durability, wall-clock timing) remain open. The GSI-drain gap
   specifically is closed as of PR 3b.
+  **D3 closed 2026-09-07** (PRs #711, #716, #717, #718, #719, plus this
+  CI/docs closing PR): the real-thread `tests/*.rs` tier shrank from 120
+  files/521 tests to 100 files/418 tests while the deterministic
+  `SimCluster` sim tier it fed grew from 5 to 29 modules (35 to 140
+  tests); CI's `prod-liveness-animusd` sharding stays at 4 partitions (a
+  per-shard cold-compile floor of roughly five minutes means fewer
+  partitions would raise, not lower, the max shard wall time) and the sim
+  tier now runs inside `gates` instead of riding along in the real-thread
+  shards. See ADR 0061's 2026-09-07 "D3 closed" amendment for the full
+  before/after numbers and the residual `tests/*.rs` inventory by class.
 - **D4 PR 1 landed 2026-09-07, closing issue #715**: `SimCluster` is now
   hosted by a real per-node `animus_cp_data::host::Reconciler` — the exact
   gap D3 PR 2a found and left open (a rebalanced-away replica's
@@ -487,7 +497,8 @@ the still-true paragraph after the table.
   reclaim is already a reconciler action, awaiting only a `drop_table`
   driver reachable from this fixture; join/growth needs an add-node
   capability; the backup janitor needs `client_ctx_host.rs`'s impls
-  widened. See ADR 0061's matching 2026-09-07 "D4 PR 1" amendment and
+  widened. **PR 1 landed 2026-09-07, closing issue #715; PRs 2-5 remain
+  pending.** See ADR 0061's matching 2026-09-07 "D4 PR 1" amendment and
   `crates/animusd/CLAUDE.md`'s own entry for the full account.
 - **E1 landed 2026-09-04** (`ClusterApi`/`AdminOps` seams in
   `animus-operator`, fake-driven `controller::tests`; ADR 0061's
