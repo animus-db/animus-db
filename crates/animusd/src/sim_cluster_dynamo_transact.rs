@@ -893,7 +893,7 @@ fn run_coordinator_never_finished_past_prepare_recovers_atomically(seed: u64) {
 /// replays this scenario at a specific seed (repo convention; note the
 /// trailing `--ignored`, needed since both tests below are `#[ignore]`d).
 #[test]
-#[ignore = "FINDING (ADR 0061 rung F, C-06 PR 3): SimRelayClient::serve_loop \
+#[ignore = "FINDING, issue #731 (ADR 0061 rung F, C-06 PR 3): SimRelayClient::serve_loop \
             deadlocks on a nested outbound relay call from inside a forwarded \
             request's own handler (this scenario's foreign-intent recovery path) \
             — see this function's own doc for the full diagnosis; issue to be filed \
