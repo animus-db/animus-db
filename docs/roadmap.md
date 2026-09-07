@@ -701,3 +701,45 @@ entries). `dynamo_backup.rs`'s own janitor-convergence assertion stays on
 `ProdEnv`, fused into one long wire-shape test `SimCluster` cannot
 reach — nothing separable to move. **This closes D4 PR 5. What remains
 open for D4: PR 4 (join/growth needs an add-node capability).**
+
+---
+
+**Addendum, 2026-09-07 (C-04 D4 PR 4 landed, closing D4 and C-04)**: the
+last of the four D4 rungs — join/growth/decommission sequencing (ADR
+0030/0032) — now has deterministic `SimCluster` coverage. `SimCluster`
+gains a `grow(role)`/`drain(node)`/`remove(node)` fixture surface (five new
+signatures total, `crates/animusd/src/sim_cluster.rs`): `grow` adds a
+data-only node after construction, installing `ControlHandle::Remote`
+(a `RemoteControlClient` mirroring against the existing control quorum) for
+the first time under `SimEnv` — a new `SimEnv`-native reimplementation of
+`animusd`'s own `remote_metadata_watch_loop`'s long-poll protocol
+(`spawn_remote_mirror_sync_loop`, since the production function's own
+`ClientCtx<ProdEnv>`-bound signature and real `tokio::time::sleep` can't run
+under `SimEnv` at all) drives the identical wire round trip against the
+identical `RemoteControlClient` type production uses; `drain`/`remove` drive
+the REAL `ClientCtx::admin_drain`/`admin_remove_member` primitives, already
+`<E, R>`-generic since rung C5. `role = "combined"` (a new control-plane
+voter) was scoped and deferred — it needs `self.controls` itself to grow, a
+materially different mechanism than a data-only node's mirror; documented
+as a named follow-up, not attempted. Five scenarios in the new
+`crates/animusd/src/sim_cluster_growth.rs`, replayed at 5 seeds each: grow
+converges and serves a genuinely forwarded write/read; growth then a real
+rebalance places (and tears down the moved-away replica of) a table onto
+the new node; grow-then-drain-then-remove re-homes every replica with no
+zombie group and never reuses the removed node's id; a control-plane leader
+crash between `grow`'s own two registration proposes still converges once a
+new leader takes over; and the mirror's long-poll recovers from a full
+partition of the new node from every control voter. No product bug found —
+the `ControlHandle::Remote`-under-`SimEnv` path (new surface, and the
+likeliest place for one) held at every seed tried. See ADR 0061's "D4 PR 4"
+amendment, and ADR 0030's/ADR 0032's matching 2026-09-07 amendments, for
+the full account.
+
+**This closes D4, and with it C-04.** All four D4 rungs (auto-split byte
+trigger, dropped-table GC, the backup janitor, and this PR's join/growth/
+decommission) now have deterministic `SimCluster` coverage; issues #715 and
+#722 (found and fixed along the way) are both closed. What remains
+unowned by C-04 or any other planned rung, per the D3-closing residual
+inventory above: Transact/PartiQL (D2's own named residuals), Streams, TTL,
+admin/console/dashboard HTTP, the control/data role split, and `--config`
+bring-up — none scoped to a future C-04 rung as of this close.

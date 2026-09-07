@@ -7053,3 +7053,122 @@ regressions); `cargo build -p animusd --all-targets` (clean); `cargo test
 (before and after this change, both green — the janitor and the widened
 host impls are on their real-socket path too); `ANIMUS_SEED` replay of
 scenarios (a) and (c1). `Cargo.lock` unchanged.
+
+## Appendix — SimCluster coverage for online growth and decommission (ADR 0061 rung D4 PR 4, 2026-09-07), closing D4 and C-04
+
+Closes D4's last open item — every prior D4 PR (1, 2, 3, 5) named
+join/growth as the one thing left. Unlike those four, which each widened
+an *existing* production loop to the `Env` seam, this rung adds genuinely
+new fixture mechanism: `SimCluster::new` fixes the whole node set at
+construction (this file's own SimCluster module doc), and production's
+real growth/join constructors (`run_node_join`/`BoundDataNode::
+start_data_with_growth`) are real-socket `ProdEnv`-only entry points with
+no generic loop underneath to widen.
+
+**`SimCluster` gains `grow(role)`/`drain(node)`/`remove(node)`**
+(`sim_cluster.rs`, five new signatures total including two private
+helpers). `grow` supports `role = "data"` only — a `"combined"` growth
+node (a new **control-plane voter**, joining the live Raft quorum via
+`change_membership`) needs `self.controls` itself to grow, a materially
+different mechanism than a data-only node's `ControlHandle::Remote`
+mirror; scoped out and named as a follow-up, not attempted. `grow` builds
+a fresh node exactly like `SimCluster::new` does for the initial set
+(its own `ClientCtx`/reconciler/heartbeat/janitor/auto-split spawns), but
+with `ControlHandle::Remote` — the fixture's first non-voter node — and
+self-registers via the same `RegisterNode`+`UpsertMember{Active}`
+control-plane bypass `SimCluster::seed_members` already uses for the
+initial set (deliberately not the real relayed `admin_add_member`
+promotion dance — see `grow`'s own doc for why). Route tables
+(`client_route`/`intra_route`) are patched in one shot across every
+existing node at grow time — not a `route_sync_loop`/`intra_route_
+sync_loop` equivalent, since this fixture already holds every `ClientCtx`
+in one process (see `grow`'s own doc). `drain`/`remove`, by contrast,
+drive the REAL `ClientCtx::admin_drain`/`admin_remove_member` primitives
+(already `<E, R>`-generic since rung C5 step 3a) off the control leader's
+own `ClientCtx`, exactly like production's admin HTTP handler does — no
+fixture bypass on the decommission side.
+
+**The one genuinely new mechanism: `ControlHandle::Remote`'s real
+mirror-sync logic, under `SimEnv` for the first time.** Production's own
+`remote_metadata_watch_loop`/`remote_metadata_sync_loop` are structurally
+unreachable here (a bare `ClientCtx` defaults to `ProdEnv`/
+`AnimusdRelayClient`, and the retry backoff is a bare `tokio::time::
+sleep`) — `spawn_remote_mirror_sync_loop` (new, private to `sim_cluster.
+rs`) is a `SimEnv`-native reimplementation of the identical long-poll wire
+protocol (`ClientRequest::WatchMetadata`/`Status`, `RemoteControlClient::
+observe`/`observe_delta`) against the exact same `animus_node::
+control_handle::RemoteControlClient<R>` type production wraps — a new
+implementation of the same protocol, not a generalization of the
+production function, so what's under test is the real mirror
+observe/delta/leader-hint logic, only the executor/sleep primitive
+differ. **Naming gotcha worth knowing before touching this code**: this
+crate's own `use super::*` brings a `RemoteControlClient` type alias bound
+to `R = AnimusdRelayClient` into scope, useless here — `grow` imports the
+*generic* `animus_node::control_handle::RemoteControlClient` under a
+distinct name (`GenericRemoteControlClient`) specifically to avoid
+silently resolving to the wrong type, the identical "a bare alias resolves
+to its own default, never the enclosing generic scope" gotcha rung C5 step
+3a's own doc already records for `ControlHandle` in a different file.
+
+**Five scenarios, `crates/animusd/src/sim_cluster_growth.rs`**, each
+replayed at 5 seeds (`ANIMUS_SEED=<seed> cargo test -p animusd --lib
+<test name>` replays any one; primary seeds `0x6706_0001`(a)/
+`0x6706_0002`(b)/`0x6706_0003`(c)/`0x6706_0004`(d)/`0x6706_0005`(e)): (a)
+grow 3→4 (data-only) converges and serves a genuinely forwarded write+read
+(the new node hosts no replica of the table at all); (b) growth then
+**three** `CreateTable`s (not one — `rebalance_step`'s own max−min ≤ 1
+bound is already satisfied by a single tablet's 1,1,1,0 load, so nothing
+would ever move; a real first-draft mistake caught while building this
+scenario, recorded in `docs/engineering-lessons.md`) rebalances a replica
+onto the new node, with `assert_no_zombie_groups` proving the displaced
+replica was actually torn down; (c) grow, wait for a rebalance-placed
+replica, then `drain`+`remove` — every replica re-homes onto the three
+original survivors at the original RF, no zombie group, no node still
+naming the removed id, and a later `grow` mints a strictly higher index,
+never the removed one; (d) the control-plane leader crashes between
+`grow`'s own two `MetaCommand` proposes, reproduced by hand via
+`SimCluster::propose_meta` with virtual time advanced between the first
+propose and the crash (the propose-then-crash lesson) — the follow-up
+propose finds the new leader and still commits; (e) the new node is
+partitioned from **every** control voter (not merely the leader — the
+mirror's own `seeds` list is the whole pre-growth voter set, and its
+long-poll falls through every seed in turn) while a schema change commits,
+the partitioned mirror provably does not see it, and it catches up once
+healed.
+
+**No product bug found** — the `ControlHandle::Remote`-under-`SimEnv`
+path, new surface and the likeliest place for one, held at every seed
+tried; every scenario passed on its first full clean run.
+
+**ProdEnv conversion: none.** Every one of the eight real-socket binaries
+this rung's own scope named (`cluster_growth.rs`/`seed_join.rs`/
+`seed_join_allocated.rs`/`data_join.rs`/`decommission.rs`/`data_only.rs`/
+`tablet_rf_self_heals.rs`/`learner_reconfigure.rs`) mixes a real-socket
+concern this fixture cannot reach into every one of its tests (a real
+`--seed ADDR` join/CLI discovery, dashboard health over a real admin port,
+genuine process role assembly, `provision_tablet`'s RF self-heal, or
+learner/non-voting membership-class fault injection — a different
+membership dimension than plain active-member growth/decommission) — none
+is left whole-and-unconverted by omission; each was checked and is stated
+here. All eight stay exactly as they were, unchanged, verified by the
+real-socket sanity run in the Gates line below.
+
+**This closes D4, and with it C-04** — see `docs/roadmap.md`'s matching
+addendum and ADR 0061's "D4 PR 4" amendment for the full closing account,
+including what remains unowned by any planned rung.
+
+`cargo test -p animusd --lib`: 343 passed before, 353 passed after (+10, 0
+regressions, 3 ignored throughout both, full run 301.15s).
+
+**Gates**: `cargo fmt --all --check` (clean, after one formatting fix);
+`cargo clippy -p animusd --all-targets --all-features -- -D warnings`
+(clean; `animus-node` untouched by this rung, so its own clippy gate did
+not apply); `cargo test -p animusd --lib` (343 passed before, 353 passed
+after, 0 regressions); `cargo build -p animusd --all-targets` (clean);
+real-socket sanity on the eight named binaries — `cargo test -p animusd
+--test cluster_growth --test seed_join --test seed_join_allocated --test
+data_join --test decommission --test data_only --test tablet_rf_self_heals
+--test learner_reconfigure` (20 tests, all green); `ANIMUS_SIMCLUSTER_
+SEEDS=10 cargo test -p animusd --lib sim_cluster_corpus` (3 passed, 1
+ignored, 205.88s); `ANIMUS_SEED` replay of scenarios (a) and (c) at their
+pinned seeds (both green). `Cargo.lock` unchanged.
