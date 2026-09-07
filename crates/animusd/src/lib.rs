@@ -17648,6 +17648,75 @@ mod sim_cluster_dynamo_table_ops;
 #[cfg(test)]
 mod sim_cluster_dynamo_update_table;
 
+/// ADR 0061 rung D3 PR 3a (C-04 D3): GSI/LSI `Query`/`Scan` dispatch through
+/// `SimCluster`, plus `CreateTable` with a declared GSI/LSI — the 8-function
+/// widening (`run_index_query`/`run_gsi_query`/`run_lsi_query`/`run_index_
+/// scan`/`run_gsi_scan`/`run_lsi_scan`/`paginated_kind_examine`/`paginated_
+/// kind_examine_one`) `dynamo::dispatch_item_op`'s own doc names as PR 2/3's
+/// deferred residual. Replaces five of `crates/animusd/tests/dynamo_query_
+/// filter.rs`'s six tests; see this module's own doc for the shared "events"
+/// fixture and the GSI-materialization boundary every sibling module below
+/// also documents (a GSI row is never materialized under this fixture —
+/// see `sim_cluster_dynamo_table_ops.rs`'s own pinned regression for that
+/// exact boundary).
+#[cfg(test)]
+mod sim_cluster_dynamo_query_filter;
+
+/// ADR 0061 rung D3 PR 3a sibling: `Query` pagination (`Limit`/
+/// `ExclusiveStartKey`/`LastEvaluatedKey`) over the base table and an LSI.
+/// Replaces five of `crates/animusd/tests/dynamo_query_pagination.rs`'s six
+/// tests — see this module's own doc for why `cross_index_cursor_mismatch_
+/// is_rejected` needs no materialized GSI row despite naming one.
+#[cfg(test)]
+mod sim_cluster_dynamo_query_pagination;
+
+/// ADR 0061 rung D3 PR 3a sibling: `KeyConditionExpression` sort-key range
+/// comparators (issue #373) and `ScanIndexForward` numeric ordering (ADR
+/// 0063), over the base table and an LSI. Replaces four of `crates/animusd/
+/// tests/dynamo_query_range.rs`'s five tests.
+#[cfg(test)]
+mod sim_cluster_dynamo_query_range;
+
+/// ADR 0061 rung D3 PR 3a sibling: descending `Query`/pagination
+/// (`ScanIndexForward: false`), over the base table and an LSI. Replaces six
+/// of `crates/animusd/tests/dynamo_scan_index_forward.rs`'s eight tests.
+#[cfg(test)]
+mod sim_cluster_dynamo_scan_index_forward;
+
+/// ADR 0061 rung D3 PR 3a sibling: `ConsistentRead` fidelity on `Query`
+/// (ADR 0041 §5) — a GSI rejects it, an LSI/base table accepts it. Replaces
+/// `crates/animusd/tests/dynamo_consistent_read.rs`'s one test.
+#[cfg(test)]
+mod sim_cluster_dynamo_consistent_read;
+
+/// ADR 0061 rung D3 PR 3a sibling: `Query`/`Scan`'s `Select` (`COUNT`/
+/// `SPECIFIC_ATTRIBUTES`). Replaces six of `crates/animusd/tests/dynamo_
+/// select.rs`'s seven tests.
+#[cfg(test)]
+mod sim_cluster_dynamo_select;
+
+/// ADR 0061 rung D3 PR 3a sibling: `ReturnConsumedCapacity` — computed from
+/// the catalog's index definitions plus the written item, never from a
+/// materialized index row, so no GSI-drain boundary applies. Replaces all
+/// seven of `crates/animusd/tests/dynamo_consumed_capacity.rs`'s tests.
+#[cfg(test)]
+mod sim_cluster_dynamo_consumed_capacity;
+
+/// ADR 0061 rung D3 PR 3a sibling: `ReturnItemCollectionMetrics` — LSI-
+/// scoped and priced synchronously at the tablet leader, so no GSI-drain
+/// boundary applies. Replaces all five of `crates/animusd/tests/dynamo_
+/// item_collection_metrics.rs`'s tests.
+#[cfg(test)]
+mod sim_cluster_dynamo_item_collection_metrics;
+
+/// ADR 0061 rung D3 PR 3a sibling: base-table `Scan` (needs no new
+/// generality — a no-index `Scan` already ran through `dispatch_item_op`).
+/// Replaces two of `crates/animusd/tests/dynamo_indexes.rs`'s three tests;
+/// `gsi_write_then_query` stays in that file untouched (D2 PR 1's own
+/// real-socket proof of `run_operation`'s independent path).
+#[cfg(test)]
+mod sim_cluster_dynamo_indexes;
+
 /// Regression for the issue #298 residual confirmed live under the
 /// un-pinned `SplitMode::InPlace` proof soak (ADR 0018's matching amendment,
 /// `docs/engineering-lessons.md`'s matching entry): a stage blocked by

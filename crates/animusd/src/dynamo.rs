@@ -1002,15 +1002,21 @@ fn unsupported_by_generic_dispatch(op_name: &str) -> WireError {
 /// `SimCluster` (`sim_cluster_dynamo.rs`).
 ///
 /// **Covers exactly eight operations**: `PutItem`, `DeleteItem`, `GetItem`,
-/// `BatchGetItem`, a **base-table-only** `Query`/`Scan` (an `index` name
-/// returns [`unsupported_by_generic_dispatch`] — genericizing `run_query`/
-/// `run_scan` themselves would also require their own `run_index_query`/
-/// `run_gsi_query`/`run_lsi_query`/`run_index_scan`/`run_gsi_scan`/
-/// `run_lsi_scan`/`paginated_kind_examine`/`paginated_kind_examine_one`
-/// siblings, pushing this PR's signature count from ~23 into the mid-30s —
-/// deferred to PR 2/3, see this module's own top-of-crate `CLAUDE.md` entry
-/// for the sizing), `UpdateItem`, and `BatchWriteItem`. Every other
-/// [`Operation`] variant — `TransactWriteItems`/`TransactGetItems` (their
+/// `BatchGetItem`, `Query`/`Scan` — **since ADR 0061 rung D3 PR 3a, over a
+/// GSI/LSI as well as the base table**, dispatching to [`run_index_query`]/
+/// [`run_index_scan`] (themselves now generic, see their own docs) exactly
+/// the way the concrete [`run_query`]/[`run_scan`] already did — `UpdateItem`,
+/// and `BatchWriteItem`. **A GSI `Query`/`Scan` under `SimCluster` reads as
+/// empty** until a future rung generalizes `index_drain::change_consumer_
+/// loop` (the only thing that ever materializes a GSI's own hidden-table
+/// rows) — `SimCluster` never spawns it, so `run_gsi_query`/`run_gsi_scan`'s
+/// own "no tablet yet ⇒ empty" gate is what answers every GSI read here; an
+/// LSI is unaffected (its rows are written synchronously in the same Raft
+/// entry as the base row, ADR 0041 §2). See
+/// `sim_cluster_dynamo_table_ops.rs::gsi_query_reads_empty_under_the_
+/// fixture_until_the_drain_generalizes` for the pinned regression that
+/// documents this boundary (and should flip red the day it closes). Every
+/// other [`Operation`] variant — `TransactWriteItems`/`TransactGetItems` (their
 /// `ClientRequestToken` idempotency preflight auto-provisions the internal
 /// idempotency table via `ClientCtx::propose_schema`, whose relayed path
 /// under a genuine multi-voter `SimEnv` control quorum has never been
@@ -1282,12 +1288,31 @@ async fn dispatch_item_op<E: Env, R: RelayClient>(
             select,
             consistent_read,
         } => {
-            // ADR 0061 rung D2 PR 1: only the base-table path is generic so
-            // far — see this function's own doc.
-            if index.is_some() {
-                return Err(unsupported_by_generic_dispatch("a GSI/LSI Query"));
-            }
+            // ADR 0061 rung D3 PR 3a: `run_index_query` (and its GSI/LSI
+            // siblings) are generic now, so a named index no longer falls
+            // back to `unsupported_by_generic_dispatch` here — mirrors
+            // `run_query`'s own dispatch exactly (see that function's doc).
             mirror_catalog_schema(ctx, meta, &table);
+            if let Some(index) = index {
+                return run_index_query(
+                    ctx,
+                    meta,
+                    &table,
+                    &index,
+                    &partition_attr,
+                    &partition_value,
+                    sort_attr.as_deref(),
+                    sort_condition.as_ref(),
+                    limit,
+                    exclusive_start_key,
+                    scan_index_forward,
+                    filter.as_ref(),
+                    projection.as_ref(),
+                    select,
+                    consistent_read,
+                )
+                .await;
+            }
             let base = schema_for(meta, &table);
             validate_key_condition_names(
                 &base.partition_key,
@@ -1329,12 +1354,25 @@ async fn dispatch_item_op<E: Env, R: RelayClient>(
             segment,
             consistent_read,
         } => {
-            // See the `Query` arm above for why a named index isn't
-            // supported by this generic path yet.
-            if index.is_some() {
-                return Err(unsupported_by_generic_dispatch("a GSI/LSI Scan"));
-            }
+            // See the `Query` arm above: a named index now runs through
+            // the generic `run_index_scan` too.
             mirror_catalog_schema(ctx, meta, &table);
+            if let Some(index) = index {
+                return run_index_scan(
+                    ctx,
+                    meta,
+                    &table,
+                    &index,
+                    limit,
+                    exclusive_start_key,
+                    filter.as_ref(),
+                    projection.as_ref(),
+                    select,
+                    segment,
+                    consistent_read,
+                )
+                .await;
+            }
             run_base_scan(
                 ctx,
                 meta,
@@ -1543,12 +1581,13 @@ async fn dispatch_item_op<E: Env, R: RelayClient>(
 /// production uses, from inside `SimCluster` (`sim_cluster_dynamo.rs`), with
 /// no `ProdEnv`/real socket anywhere in the call graph.
 ///
-/// **Covers exactly five operations**: `CreateTable` (base table only — a
-/// declared GSI/LSI or a stream is rejected with
-/// [`unsupported_by_generic_dispatch`], the identical shape
-/// [`dispatch_item_op`]'s own `Query`/`Scan` arms use for a named index —
-/// genericizing the drain/backfill-seeder/sealer machinery those need is out
-/// of this PR's scope), `DeleteTable`, `ListTables`, `DescribeTable`, and
+/// **Covers exactly five operations**: `CreateTable` (a declared GSI/LSI is
+/// accepted since ADR 0061 rung D3 PR 3a — `create_table`/`index_to_control`
+/// already mint it `Active` generically, with nothing to backfill at create
+/// time; a stream is still rejected with [`unsupported_by_generic_dispatch`],
+/// the identical shape [`dispatch_item_op`]'s own excluded operations use —
+/// the stream sealer this rung doesn't generalize), `DeleteTable`,
+/// `ListTables`, `DescribeTable`, and
 /// (ADR 0061 rung D3 PR 2b) `UpdateTable`'s own **throughput-only** change —
 /// a `BillingMode`/`ProvisionedThroughput` change with no stream or index
 /// change in the same call, via [`update_table_throughput`]. `UpdateTable`
@@ -1588,15 +1627,11 @@ async fn dispatch_table_op<E: Env, R: RelayClient>(
             stream_view_type,
             throughput,
         } => {
-            // See this function's own doc: a GSI/LSI declaration or a stream
-            // needs machinery (the GSI drain, the stream sealer) this rung
-            // does not generalize — reject up front rather than silently
-            // creating a base table short of what the client asked for.
-            if !indexes.is_empty() {
-                return Err(unsupported_by_generic_dispatch(
-                    "CreateTable with a GSI/LSI declaration",
-                ));
-            }
+            // See this function's own doc: a declared GSI/LSI is fine
+            // (`create_table` mints it `Active` generically, nothing to
+            // backfill at create time) — only a stream still needs machinery
+            // (the stream sealer) this rung does not generalize, so that
+            // alone is rejected up front.
             if stream_view_type.is_some() {
                 return Err(unsupported_by_generic_dispatch(
                     "CreateTable with a stream declaration",
@@ -6210,8 +6245,8 @@ async fn run_base_query<E: Env, R: RelayClient>(
 /// ADR 0045 §6) is rejected too,
 /// beside that same `ConsistentRead` check.
 #[allow(clippy::too_many_arguments)] // mirrors `run_query`'s own full decoded shape
-async fn run_index_query(
-    ctx: &ClientCtx,
+async fn run_index_query<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     meta: &Metadata,
     table: &str,
     index: &str,
@@ -6357,8 +6392,8 @@ async fn run_index_query(
 /// sort condition rejects is skipped without consuming a `Limit` slot, same
 /// discipline as [`run_base_query`]'s own sort-condition skip.
 #[allow(clippy::too_many_arguments)] // mirrors `run_index_query`'s own full decoded shape
-async fn run_gsi_query(
-    ctx: &ClientCtx,
+async fn run_gsi_query<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     meta: &Metadata,
     table: &str,
     idx: &IndexDef,
@@ -6484,8 +6519,8 @@ async fn run_gsi_query(
 /// [`lsi_resume_key`]), and a sort-condition-rejected row is skipped without
 /// consuming a `Limit` slot, mirroring `run_base_query`'s discipline.
 #[allow(clippy::too_many_arguments)] // mirrors `run_index_query`'s own full decoded shape
-async fn run_lsi_query(
-    ctx: &ClientCtx,
+async fn run_lsi_query<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     meta: &Metadata,
     table: &str,
     idx: &IndexDef,
@@ -7360,8 +7395,8 @@ async fn run_base_scan<E: Env, R: RelayClient>(
 /// enforcement point — see that function's doc, including the non-`Active`
 /// index rejection (ADR 0045 §6).
 #[allow(clippy::too_many_arguments)] // mirrors `run_index_query`'s own full decoded shape
-async fn run_index_scan(
-    ctx: &ClientCtx,
+async fn run_index_scan<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     meta: &Metadata,
     table: &str,
     index: &str,
@@ -7449,8 +7484,8 @@ async fn run_index_scan(
 /// table's key). A hidden table with no tablet yet (nothing has drained) reads
 /// as empty, the same gate [`run_gsi_query`] uses.
 #[allow(clippy::too_many_arguments)] // mirrors `run_gsi_query`'s own full decoded shape
-async fn run_gsi_scan(
-    ctx: &ClientCtx,
+async fn run_gsi_scan<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     meta: &Metadata,
     table: &str,
     idx: &IndexDef,
@@ -7526,8 +7561,8 @@ async fn run_gsi_scan(
 /// per-tablet read path, linearizable ReadIndex when `true`, the cheap
 /// eventual replica-local one by default.
 #[allow(clippy::too_many_arguments)] // mirrors `run_lsi_query`'s own full decoded shape
-async fn run_lsi_scan(
-    ctx: &ClientCtx,
+async fn run_lsi_scan<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     meta: &Metadata,
     table: &str,
     idx: &IndexDef,
@@ -7693,8 +7728,8 @@ async fn paginated_table_examine<E: Env, R: RelayClient>(
 /// can skip an interleaved *other* index's row without consuming a `Limit`
 /// slot, the same way the table-wide variant skips a tombstone.
 #[allow(clippy::too_many_arguments)] // one LSI Scan page's full shape
-async fn paginated_kind_examine(
-    ctx: &ClientCtx,
+async fn paginated_kind_examine<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     table: &str,
     kind: u8,
     mut cursor: Vec<u8>,
@@ -7735,8 +7770,8 @@ async fn paginated_kind_examine(
 /// be a real bug (leaking into a neighboring partition's LSI rows). Same
 /// windowed-continuation discipline otherwise.
 #[allow(clippy::too_many_arguments)] // one LSI Query page's full shape
-async fn paginated_kind_examine_one(
-    ctx: &ClientCtx,
+async fn paginated_kind_examine_one<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     table: &str,
     kind: u8,
     mut cursor: Vec<u8>,

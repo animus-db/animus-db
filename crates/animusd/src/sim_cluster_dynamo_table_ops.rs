@@ -664,3 +664,67 @@ fn reconciler_hazard_fires_deterministically_when_node_count_exceeds_replication
          created, node counts are already balanced at two tablets per member"
     );
 }
+
+/// ADR 0061 rung D3 PR 3a's own documented boundary: `dispatch_item_op`'s
+/// `Query`/`Scan` arms now dispatch a named index through the generic
+/// `run_index_query`/`run_index_scan` (see that function's own doc), but a
+/// **GSI** row is materialized only by `index_drain::change_consumer_loop` —
+/// a background loop `SimCluster` never spawns (`sim_cluster.rs`'s own
+/// module doc: "hand-hosted, not reconciler-hosted", and no drain-equivalent
+/// watcher exists either). A `CreateTable`-declared GSI is accepted (this
+/// rung also lifted `dispatch_table_op`'s own `!indexes.is_empty()`
+/// rejection), and a write reaches it fine — but a `Query` against it reads
+/// as **empty**, forever, under this fixture: `run_gsi_query`'s own
+/// `!meta.has_table_tablet(&index_table)` gate answers `Ok(empty)` before
+/// ever touching a tablet that no watcher here will ever host.
+///
+/// This is a **positive** regression pinning today's boundary, not a
+/// "must never happen" one — it exists so that PR 3b (a widened
+/// `drain_tablet` plus a fixture `drain_gsi` helper, per that rung's own
+/// brief) turns this assertion **false** the day it lands: when it does,
+/// this test should be deleted (or inverted) in the same change that adds
+/// real `SimCluster` GSI coverage, not left quietly stale.
+#[test]
+fn gsi_query_reads_empty_under_the_fixture_until_the_drain_generalizes() {
+    let seed = env_seed(0xE4AD_0001);
+    let mut cluster = SimCluster::new(seed, 1, 1);
+
+    let (status, body) = cluster.dynamo(
+        0,
+        "DynamoDB_20120810.CreateTable",
+        br#"{"TableName":"users","AttributeDefinitions":[{"AttributeName":"email","AttributeType":"S"},{"AttributeName":"id","AttributeType":"S"}],
+            "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
+            "GlobalSecondaryIndexes":[
+                {"IndexName":"by-email",
+                 "KeySchema":[{"AttributeName":"email","KeyType":"HASH"}],
+                 "Projection":{"ProjectionType":"ALL"}}]}"#,
+    );
+    assert_eq!(
+        status, 200,
+        "CreateTable with a declared GSI failed: {body} (seed={seed})"
+    );
+
+    let (status, body) = cluster.dynamo(
+        0,
+        "DynamoDB_20120810.PutItem",
+        br#"{"TableName":"users","Item":{"id":{"S":"u1"},"email":{"S":"a@x"}}}"#,
+    );
+    assert_eq!(status, 200, "PutItem failed: {body} (seed={seed})");
+
+    let (status, body) = cluster.dynamo(
+        0,
+        "DynamoDB_20120810.Query",
+        br#"{"TableName":"users","IndexName":"by-email",
+            "KeyConditionExpression":"email = :e",
+            "ExpressionAttributeValues":{":e":{"S":"a@x"}}}"#,
+    );
+    assert_eq!(
+        status, 200,
+        "GSI query itself must not error: {body} (seed={seed})"
+    );
+    assert!(
+        body.contains("\"Count\":0"),
+        "GSI query must read as empty under SimCluster until PR 3b generalizes \
+         the drain — got: {body} (seed={seed})"
+    );
+}
