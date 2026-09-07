@@ -103,6 +103,22 @@ pub(crate) fn classify(op: &Operation) -> (&'static str, OpClass) {
         // three of them being mutations, and this PR's own ADR 0071
         // amendment for the full account.
         Operation::ExecuteStatement { .. } => ("ExecuteStatement", OpClass::Read),
+        // `BatchExecuteStatement` (ADR 0071, W-07 PR 4) carries a whole
+        // *array* of opaque, unparsed `statement` texts — exactly
+        // `ExecuteStatement`'s own "no catalog/parser access here" reason,
+        // just with more than one of them. This row stays `OpClass::Read`
+        // unconditionally for the identical reason (never revisited to
+        // distinguish a batch of mutations from a batch of reads) — it is
+        // NOT the real enforcement point. `authorize_op` (below) is a
+        // deliberate no-op for it too; real per-statement authorization
+        // happens inside `crate::dynamo::execute_one_batch_statement`, once
+        // each statement is individually parsed and its own table known —
+        // a `SELECT` gets an explicit `authz::authorize` call there; an
+        // `INSERT`/`UPDATE`/`DELETE` reuses `execute_statement`, whose own
+        // `INSERT`/`UPDATE`/`DELETE` branches already authorize through
+        // `run_operation`'s `authorize_op` call on the real, now-concrete
+        // `PutItem`/`UpdateItem`/`DeleteItem` operation.
+        Operation::BatchExecuteStatement { .. } => ("BatchExecuteStatement", OpClass::Read),
         Operation::DescribeTable { .. } => ("DescribeTable", OpClass::Read),
         Operation::DescribeTimeToLive { .. } => ("DescribeTimeToLive", OpClass::Read),
         Operation::ListTagsOfResource { .. } => ("ListTagsOfResource", OpClass::Read),
@@ -190,6 +206,19 @@ pub(crate) fn authorize_op(
         // `crate::dynamo::execute_statement` authorizes the real target
         // table itself, before any read runs, once parsing has resolved it.
         Operation::ExecuteStatement { .. } => Ok(()),
+
+        // `BatchExecuteStatement`'s own statements' tables are only known
+        // once each is individually parsed (ADR 0071, W-07 PR 4) — a
+        // deliberate no-op here too, joining `ExecuteStatement`'s group for
+        // the identical reason. `crate::dynamo::execute_one_batch_statement`
+        // authorizes each statement's real target table itself, once
+        // parsing has resolved it, and turns a denial into that one
+        // statement's own `AccessDenied` response entry rather than
+        // rejecting the whole batch — unlike `BatchGetItem`/`BatchWriteItem`
+        // above, which reject the whole request (ADR 0071's own "no
+        // cross-statement atomicity" contract extends to authorization too:
+        // one denied statement must not block its siblings).
+        Operation::BatchExecuteStatement { .. } => Ok(()),
 
         Operation::ListTables { .. } | Operation::DescribeLimits | Operation::DescribeEndpoints => {
             Ok(())
@@ -786,6 +815,19 @@ mod tests {
                     return_consumed_capacity: ReturnConsumedCapacity::None,
                 },
                 "ExecuteStatement",
+                OpClass::Read,
+            ),
+            // ADR 0071 (W-07 PR 4): `BatchExecuteStatement` classifies
+            // `OpClass::Read` unconditionally too, for the identical "opaque
+            // statement text, no catalog here" reason `ExecuteStatement`'s
+            // own cases above document — see `classify`'s own doc comment
+            // on this row.
+            (
+                Operation::BatchExecuteStatement {
+                    statements: vec![],
+                    return_consumed_capacity: ReturnConsumedCapacity::None,
+                },
+                "BatchExecuteStatement",
                 OpClass::Read,
             ),
             (Operation::DescribeLimits, "DescribeLimits", OpClass::Read),

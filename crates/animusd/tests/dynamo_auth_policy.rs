@@ -604,6 +604,98 @@ async fn batch_write_spanning_denied_table_writes_nothing() {
     .expect("test timed out");
 }
 
+/// (g) `BatchExecuteStatement` (ADR 0071, W-07 PR 4) with one statement
+/// against an allowed table and one against a denied table: the denied
+/// statement becomes its own per-statement `AccessDenied` response entry,
+/// while the allowed statement still succeeds — unlike `BatchWriteItem`'s
+/// whole-request rejection above, since ADR 0071's own "no cross-statement
+/// atomicity" contract extends to authorization too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn batch_execute_statement_denied_table_is_a_per_statement_access_denied() {
+    timeout(Duration::from_secs(30), async {
+        let dir = support::panic_safe_tempdir();
+        let (node, _config) = bring_up(dir.path()).await;
+        let dynamo_addr = node.dynamo_addr();
+        let admin_addr = node.admin_addr();
+
+        for table in ["pql_a", "pql_b"] {
+            let (status, body) = call(
+                dynamo_addr,
+                "DynamoDB_20120810.CreateTable",
+                &create_table_body(table),
+                BOOT_ACCESS_KEY,
+                BOOT_SECRET,
+            )
+            .await;
+            assert_eq!(status, 200, "seed CreateTable {table}: {body}");
+        }
+
+        // Scoped to `pql_a` only, but with write access.
+        let put_body = serde_json::json!({
+            "id": "AKIDPQLBATCH",
+            "secret": "s0",
+            "policy": {
+                "tables": {"kind": "names", "names": ["pql_a"]},
+                "ops": ["read", "write"],
+            },
+            "enabled": true,
+        })
+        .to_string();
+        let (status, resp) = admin(admin_addr, "POST", "/admin/credentials", Some(&put_body)).await;
+        assert_eq!(status, 200, "PutCredential: {resp}");
+
+        let batch_body = serde_json::json!({
+            "Statements": [
+                {"Statement": "INSERT INTO pql_a VALUE {'id': ?}", "Parameters": [{"S": "x"}]},
+                {"Statement": "INSERT INTO pql_b VALUE {'id': ?}", "Parameters": [{"S": "y"}]},
+            ]
+        })
+        .to_string();
+        let (status, body) = call(
+            dynamo_addr,
+            "DynamoDB_20120810.BatchExecuteStatement",
+            &batch_body,
+            "AKIDPQLBATCH",
+            "s0",
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "a per-statement AccessDenied must not fail the whole call: {body}"
+        );
+        let v = json(&body);
+        let responses = v["Responses"].as_array().expect("Responses array");
+        assert_eq!(responses.len(), 2, "{responses:?}");
+        assert!(
+            responses[0].get("Error").is_none(),
+            "the allowed table's own statement must succeed: {responses:?}"
+        );
+        assert_eq!(responses[1]["TableName"], "pql_b");
+        assert_eq!(responses[1]["Error"]["Code"], "AccessDenied");
+
+        // The allowed table's write actually landed — a per-statement
+        // denial elsewhere in the same batch must not have blocked it.
+        let (status, body) = call(
+            dynamo_addr,
+            "DynamoDB_20120810.GetItem",
+            &get_item_body("pql_a", "x"),
+            BOOT_ACCESS_KEY,
+            BOOT_SECRET,
+        )
+        .await;
+        assert_eq!(status, 200, "GetItem pql_a/x: {body}");
+        let v = json(&body);
+        assert!(
+            v.get("Item").is_some(),
+            "the allowed statement's write must have landed: {body}"
+        );
+
+        node.shutdown_graceful().await;
+    })
+    .await
+    .expect("test timed out");
+}
+
 /// (f) The static bootstrap credential remains unrestricted, even with an
 /// empty replicated catalog.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

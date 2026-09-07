@@ -1025,6 +1025,10 @@ async fn run_operation(
             )
             .await
         }
+        Operation::BatchExecuteStatement {
+            statements,
+            return_consumed_capacity: _,
+        } => run_batch_execute_statement(ctx, meta, principal, &statements).await,
         Operation::UpdateItem {
             table,
             key,
@@ -6498,6 +6502,210 @@ fn reshape_query_scan_response_to_execute_statement(
         );
     }
     Ok(serde_json::to_string(&serde_json::Value::Object(out)).expect("response serializes"))
+}
+
+/// Pull the first item (if any) out of a `{"Items": [..], ...}` JSON body —
+/// the shape both `run_query`'s own raw response and
+/// [`execute_statement`]'s mutation-reshaped response
+/// ([`reshape_write_response_to_execute_statement`]) share, so this one
+/// helper serves both of [`execute_one_batch_statement`]'s branches without
+/// caring which produced `raw`.
+fn first_item(raw: &str) -> Result<Option<Item>, WireError> {
+    let parsed: serde_json::Value =
+        serde_json::from_str(raw).expect("response is well-formed JSON");
+    let obj = parsed.as_object().expect("response is a JSON object");
+    match obj.get("Items").and_then(serde_json::Value::as_array) {
+        Some(items) if !items.is_empty() => {
+            let item_obj = items[0].as_object().expect("Items[0] is a JSON object");
+            Ok(Some(wire::decode_item(item_obj)?))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// `BatchExecuteStatement` (ADR 0071, W-07 PR 4): run every statement in
+/// `statements` independently, in request order, through
+/// [`execute_one_batch_statement`] — **no cross-statement atomicity**,
+/// mirroring `BatchWriteItem`/`BatchGetItem`'s own per-request contract
+/// (ADR 0071's lowering table). One entry per input statement, always —
+/// this function itself never fails on a per-statement problem; every such
+/// failure is that statement's own response entry.
+async fn run_batch_execute_statement(
+    ctx: &ClientCtx,
+    meta: &Metadata,
+    principal: &Principal,
+    statements: &[wire::BatchStatementRequest],
+) -> Result<String, WireError> {
+    let mut results = Vec::with_capacity(statements.len());
+    for req in statements {
+        results.push(execute_one_batch_statement(ctx, meta, principal, req).await);
+    }
+    Ok(wire::batch_execute_statement_response(&results))
+}
+
+/// One statement of a `BatchExecuteStatement` request — never propagates an
+/// `Err` to its own caller: every failure (a parse error, a denied table,
+/// an unknown table/index, a non-exact-key `SELECT`, a condition failure,
+/// ...) becomes this statement's own [`wire::BatchStatementResult`] error
+/// entry instead, so one bad statement never aborts the rest of the batch.
+///
+/// A `SELECT` runs a **restricted** version of [`execute_statement`]'s own
+/// `SELECT` path: AWS limits a batch statement to a single-item operation,
+/// so a `SELECT` here must be an exact-key read (an `=` term on the
+/// partition key, and on the sort key when the table has one, and nothing
+/// else — [`partiql::select_is_exact_key`]) rather than the arbitrary
+/// range `Query`/filtered `Scan` a standalone `ExecuteStatement` allows;
+/// anything else is a `ValidationError` entry, checked *before* running
+/// anything (this never runs a forbidden `Scan` just to reject it after the
+/// fact). An `INSERT`/`UPDATE`/`DELETE` reuses [`execute_statement`]
+/// wholesale — the exact same lowering, `DuplicateItemException` mapping,
+/// and `RETURNING` handling PR 3 already built, dispatched through
+/// [`run_operation`] exactly as it would be for a standalone
+/// `ExecuteStatement` call (including that dispatch's own real
+/// `authorize_op` check on the lowered, now-concrete `PutItem`/
+/// `UpdateItem`/`DeleteItem`).
+async fn execute_one_batch_statement(
+    ctx: &ClientCtx,
+    meta: &Metadata,
+    principal: &Principal,
+    req: &wire::BatchStatementRequest,
+) -> wire::BatchStatementResult {
+    let stmt = match partiql::parse_statement(&req.statement) {
+        Ok(s) => s,
+        Err(e) => return wire::BatchStatementResult::error(None, &WireError::from(e)),
+    };
+    let table = stmt.table().to_string();
+    if let Err(e) = reject_internal_table(&table, false) {
+        return wire::BatchStatementResult::error(Some(table), &e);
+    }
+    if !table_known(ctx, meta, &table) {
+        let e = registry_error(animus_dynamo::RegistryError::NoSuchTable(table.clone()));
+        return wire::BatchStatementResult::error(Some(table), &e);
+    }
+
+    match stmt {
+        partiql::Statement::Select(sel) => {
+            if let Err(e) = authz::authorize(
+                ctx,
+                principal,
+                "BatchExecuteStatement",
+                animus_control::OpClass::Read,
+                Some(table.as_str()),
+            ) {
+                return wire::BatchStatementResult::error(Some(table), &e);
+            }
+
+            mirror_catalog_schema(ctx, meta, &table);
+
+            let (partition_key, sort_key): (String, Option<String>) = match &sel.index {
+                Some(index_name) => match meta
+                    .table_indexes(&table)
+                    .iter()
+                    .find(|d| &d.name == index_name)
+                    .cloned()
+                {
+                    Some(idx) => (idx.hash_attribute, idx.sort_attribute),
+                    None => {
+                        let e = registry_error(animus_dynamo::RegistryError::NoSuchIndex(
+                            index_name.clone(),
+                        ));
+                        return wire::BatchStatementResult::error(Some(table), &e);
+                    }
+                },
+                None => {
+                    let base = schema_for(meta, &table);
+                    (base.partition_key, base.sort_key)
+                }
+            };
+
+            if !partiql::select_is_exact_key(&sel, &partition_key, sort_key.as_deref()) {
+                return wire::BatchStatementResult::error(
+                    Some(table),
+                    &WireError::validation(
+                        "a BatchExecuteStatement SELECT must be an exact-key read: an \
+                         equality condition on the partition key, and on the sort key \
+                         when the table has one, and nothing else",
+                    ),
+                );
+            }
+
+            let op = match partiql::lower_select(
+                &sel,
+                &req.parameters,
+                &partition_key,
+                sort_key.as_deref(),
+                None,
+                None,
+                req.consistent_read,
+            ) {
+                Ok(op) => op,
+                Err(e) => {
+                    return wire::BatchStatementResult::error(Some(table), &WireError::from(e));
+                }
+            };
+            let Operation::Query {
+                table: q_table,
+                index,
+                partition_attr,
+                partition_value,
+                sort_attr,
+                sort_condition,
+                limit,
+                exclusive_start_key,
+                scan_index_forward,
+                filter,
+                projection,
+                select,
+                consistent_read,
+            } = op
+            else {
+                unreachable!(
+                    "select_is_exact_key only accepts a WHERE shape lower_select turns into Query"
+                );
+            };
+            let raw = run_query(
+                ctx,
+                meta,
+                &q_table,
+                index.as_deref(),
+                &partition_attr,
+                &partition_value,
+                sort_attr.as_deref(),
+                sort_condition.as_ref(),
+                limit,
+                exclusive_start_key,
+                scan_index_forward,
+                filter.as_ref(),
+                projection.as_ref(),
+                select,
+                consistent_read,
+            )
+            .await;
+            match raw.and_then(|r| first_item(&r)) {
+                Ok(item) => wire::BatchStatementResult::success(table, item),
+                Err(e) => wire::BatchStatementResult::error(Some(table), &e),
+            }
+        }
+        partiql::Statement::Insert(_)
+        | partiql::Statement::Update(_)
+        | partiql::Statement::Delete(_) => {
+            let raw = execute_statement(
+                ctx,
+                meta,
+                principal,
+                &req.statement,
+                &req.parameters,
+                req.consistent_read,
+                None,
+                None,
+            )
+            .await;
+            match raw.and_then(|r| first_item(&r)) {
+                Ok(item) => wire::BatchStatementResult::success(table, item),
+                Err(e) => wire::BatchStatementResult::error(Some(table), &e),
+            }
+        }
+    }
 }
 
 /// Serve a base-table `Scan` via a **native quorum range scan** (`cp_scan`) over

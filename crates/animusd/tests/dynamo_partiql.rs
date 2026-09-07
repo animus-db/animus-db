@@ -89,6 +89,13 @@ async fn execute_statement(addr: SocketAddr, body: &str) -> (u16, Value) {
     (status, json)
 }
 
+async fn batch_execute_statement(addr: SocketAddr, body: &str) -> (u16, Value) {
+    let (status, resp) = dynamo_retry(addr, "DynamoDB_20120810.BatchExecuteStatement", body).await;
+    let json: Value =
+        serde_json::from_str(&resp).unwrap_or_else(|e| panic!("response is not JSON: {e}: {resp}"));
+    (status, json)
+}
+
 async fn query(addr: SocketAddr, body: &str) -> (u16, Value) {
     let (status, resp) = dynamo_retry(addr, "DynamoDB_20120810.Query", body).await;
     let json: Value =
@@ -918,4 +925,257 @@ async fn throttled_table_throttles_a_partiql_insert() {
         throttled,
         "expected a PartiQL INSERT to be throttled once the write budget was exhausted"
     );
+}
+
+// --- `BatchExecuteStatement` (ADR 0071, W-07 PR 4) --------------------------
+
+/// A mixed batch — `INSERT`, a `SELECT` hit, a `SELECT` miss, `UPDATE`
+/// (with `RETURNING ALL NEW *`), `DELETE` (with `RETURNING ALL OLD *`) —
+/// runs every statement and returns exactly one response entry per
+/// statement, in the request's own order, each shaped per ADR 0071's PR 4
+/// contract.
+#[tokio::test(flavor = "multi_thread")]
+async fn batch_execute_statement_mixed_batch_runs_each_statement_in_order() {
+    let (_dir, _nodes, addr) = setup().await;
+
+    let body = r#"{"Statements":[
+        {"Statement":"INSERT INTO logs VALUE {'pk': ?, 'sk': ?}","Parameters":[{"S":"p1"},{"S":"delta"}]},
+        {"Statement":"SELECT * FROM logs WHERE pk = ? AND sk = ?","Parameters":[{"S":"p1"},{"S":"alpha"}],"ConsistentRead":true},
+        {"Statement":"SELECT * FROM logs WHERE pk = ? AND sk = ?","Parameters":[{"S":"p1"},{"S":"nope"}],"ConsistentRead":true},
+        {"Statement":"UPDATE logs SET note = ? WHERE pk = ? AND sk = ? RETURNING ALL NEW *","Parameters":[{"S":"hi"},{"S":"p1"},{"S":"beta"}]},
+        {"Statement":"DELETE FROM logs WHERE pk = ? AND sk = ? RETURNING ALL OLD *","Parameters":[{"S":"p1"},{"S":"gamma"}]}
+    ]}"#;
+    let (status, resp) = batch_execute_statement(addr, body).await;
+    assert_eq!(status, 200, "{resp}");
+    let responses = resp["Responses"].as_array().expect("Responses array");
+    assert_eq!(responses.len(), 5, "{responses:?}");
+
+    // [0] INSERT: no RETURNING clause ⇒ TableName only, no Item, no Error.
+    assert_eq!(responses[0]["TableName"], "logs");
+    assert!(responses[0].get("Item").is_none(), "{responses:?}");
+    assert!(responses[0].get("Error").is_none(), "{responses:?}");
+
+    // [1] SELECT hit: TableName + Item.
+    assert_eq!(responses[1]["TableName"], "logs");
+    assert_eq!(responses[1]["Item"]["sk"]["S"], "alpha");
+    assert!(responses[1].get("Error").is_none(), "{responses:?}");
+
+    // [2] SELECT miss: TableName only, no Item, no Error.
+    assert_eq!(responses[2]["TableName"], "logs");
+    assert!(responses[2].get("Item").is_none(), "{responses:?}");
+    assert!(responses[2].get("Error").is_none(), "{responses:?}");
+
+    // [3] UPDATE ... RETURNING ALL NEW *: the post-update image.
+    assert_eq!(responses[3]["TableName"], "logs");
+    assert_eq!(responses[3]["Item"]["sk"]["S"], "beta");
+    assert_eq!(responses[3]["Item"]["note"]["S"], "hi");
+    assert!(responses[3].get("Error").is_none(), "{responses:?}");
+
+    // [4] DELETE ... RETURNING ALL OLD *: the pre-delete image.
+    assert_eq!(responses[4]["TableName"], "logs");
+    assert_eq!(responses[4]["Item"]["sk"]["S"], "gamma");
+    assert!(responses[4].get("Error").is_none(), "{responses:?}");
+
+    // The batch's own writes actually landed: the INSERT is visible, the
+    // UPDATE's note stuck, and the DELETE actually removed the item.
+    let (status, sel) = execute_statement(
+        addr,
+        r#"{"Statement":"SELECT * FROM logs WHERE pk = ? AND sk = ?",
+            "Parameters":[{"S":"p1"},{"S":"delta"}],"ConsistentRead":true}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "{sel}");
+    assert_eq!(item_sks(&sel), vec!["delta"]);
+
+    let (status, sel) = execute_statement(
+        addr,
+        r#"{"Statement":"SELECT * FROM logs WHERE pk = ? AND sk = ?",
+            "Parameters":[{"S":"p1"},{"S":"gamma"}],"ConsistentRead":true}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "{sel}");
+    assert!(
+        sel["Items"].as_array().unwrap().is_empty(),
+        "the DELETE must have actually removed the item: {sel}"
+    );
+}
+
+/// One statement in a batch failing (a duplicate `INSERT`, an unmet
+/// conditional `UPDATE`, an unknown table, a non-exact-key `SELECT`) never
+/// blocks the others — ADR 0071's own "no cross-statement atomicity"
+/// contract. Each failure's `Error.Code` matches AWS's
+/// `BatchStatementErrorCodeEnum`, and the whole call still returns `200`
+/// (a per-statement failure is not a request-level error).
+#[tokio::test(flavor = "multi_thread")]
+async fn batch_execute_statement_one_failure_does_not_block_the_others() {
+    let (_dir, _nodes, addr) = setup().await;
+
+    let body = r#"{"Statements":[
+        {"Statement":"INSERT INTO events VALUE {'pk': ?, 'sk': ?, 'region': ?, 'cat': ?}",
+         "Parameters":[{"S":"p1"},{"N":"-5"},{"S":"us"},{"S":"X"}]},
+        {"Statement":"UPDATE events SET region = ? WHERE pk = ? AND sk = ? AND region = ?",
+         "Parameters":[{"S":"zz"},{"S":"p1"},{"N":"-5"},{"S":"bogus"}]},
+        {"Statement":"SELECT * FROM does_not_exist WHERE pk = ?","Parameters":[{"S":"x"}]},
+        {"Statement":"SELECT * FROM events WHERE sk > ?","Parameters":[{"N":"0"}]},
+        {"Statement":"SELECT * FROM logs WHERE pk = ? AND sk = ?",
+         "Parameters":[{"S":"p1"},{"S":"alpha"}],"ConsistentRead":true}
+    ]}"#;
+    let (status, resp) = batch_execute_statement(addr, body).await;
+    assert_eq!(
+        status, 200,
+        "a per-statement failure must not fail the whole call: {resp}"
+    );
+    let responses = resp["Responses"].as_array().expect("Responses array");
+    assert_eq!(responses.len(), 5, "{responses:?}");
+
+    // [0] duplicate INSERT (pk=p1, sk=-5 already exists from setup()).
+    assert_eq!(responses[0]["TableName"], "events");
+    assert_eq!(responses[0]["Error"]["Code"], "DuplicateItem");
+
+    // [1] UPDATE's own non-key WHERE term (region = "bogus") doesn't match
+    // the actual stored region ("us").
+    assert_eq!(responses[1]["TableName"], "events");
+    assert_eq!(responses[1]["Error"]["Code"], "ConditionalCheckFailed");
+
+    // [2] unknown table.
+    assert_eq!(responses[2]["TableName"], "does_not_exist");
+    assert_eq!(responses[2]["Error"]["Code"], "ResourceNotFound");
+
+    // [3] no partition-key equality term ⇒ not an exact-key read.
+    assert_eq!(responses[3]["TableName"], "events");
+    assert_eq!(responses[3]["Error"]["Code"], "ValidationError");
+
+    // [4] the one statement with no problems still succeeds.
+    assert_eq!(responses[4]["TableName"], "logs");
+    assert_eq!(responses[4]["Item"]["sk"]["S"], "alpha");
+    assert!(responses[4].get("Error").is_none(), "{responses:?}");
+
+    // The failed UPDATE must not have actually changed the region.
+    let (status, sel) = execute_statement(
+        addr,
+        r#"{"Statement":"SELECT region FROM events WHERE pk = ? AND sk = ?",
+            "Parameters":[{"S":"p1"},{"N":"-5"}],"ConsistentRead":true}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "{sel}");
+    assert_eq!(
+        sel["Items"][0]["region"]["S"], "us",
+        "a failed UPDATE inside the batch must leave the item unchanged: {sel}"
+    );
+}
+
+/// A `SELECT` with a sort-key **range** condition (not an equality) is
+/// likewise a non-exact-key read, even though it would lower to a real
+/// `Query` for a standalone `ExecuteStatement` — the batch-only restriction
+/// (ADR 0071, W-07 PR 4) is stricter than `ExecuteStatement`'s own.
+#[tokio::test(flavor = "multi_thread")]
+async fn batch_execute_statement_select_rejects_a_sort_key_range() {
+    let (_dir, _nodes, addr) = setup().await;
+
+    let body = r#"{"Statements":[
+        {"Statement":"SELECT * FROM events WHERE pk = ? AND sk > ?",
+         "Parameters":[{"S":"p1"},{"N":"0"}]}
+    ]}"#;
+    let (status, resp) = batch_execute_statement(addr, body).await;
+    assert_eq!(status, 200, "{resp}");
+    let responses = resp["Responses"].as_array().expect("Responses array");
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0]["TableName"], "events");
+    assert_eq!(responses[0]["Error"]["Code"], "ValidationError");
+}
+
+/// Zero statements and one more than the 25-statement cap are both
+/// **request-level** `ValidationException`s (`400`, top-level `__type`),
+/// never a per-statement error entry — ADR 0071 pins the identical 25-cap
+/// `TransactWriteItems`/`BatchWriteItem` already enforce.
+#[tokio::test(flavor = "multi_thread")]
+async fn batch_execute_statement_zero_and_over_cap_are_top_level_validation_exceptions() {
+    let (_dir, _nodes, addr) = setup().await;
+
+    let (status, resp) = dynamo_retry(
+        addr,
+        "DynamoDB_20120810.BatchExecuteStatement",
+        r#"{"Statements":[]}"#,
+    )
+    .await;
+    assert_eq!(status, 400, "{resp}");
+    let json: Value = serde_json::from_str(&resp).expect("error body is JSON");
+    assert_eq!(
+        json["__type"],
+        "com.amazonaws.dynamodb.v20120810#ValidationException"
+    );
+
+    let one_stmt = r#"{"Statement":"SELECT * FROM logs WHERE pk = ? AND sk = ?",
+        "Parameters":[{"S":"p1"},{"S":"alpha"}]}"#;
+    let statements = vec![one_stmt; 26];
+    let over_cap_body = format!(r#"{{"Statements":[{}]}}"#, statements.join(","));
+    let (status, resp) = dynamo_retry(
+        addr,
+        "DynamoDB_20120810.BatchExecuteStatement",
+        &over_cap_body,
+    )
+    .await;
+    assert_eq!(status, 400, "{resp}");
+    let json: Value = serde_json::from_str(&resp).expect("error body is JSON");
+    assert_eq!(
+        json["__type"],
+        "com.amazonaws.dynamodb.v20120810#ValidationException"
+    );
+}
+
+/// A `BatchExecuteStatement` request issued against a control-plane
+/// **follower** node still runs correctly — the same forwarding every
+/// other data-plane operation already relies on
+/// (`docs/adr/0071-partiql-subset.md`'s PR 4 note; `dynamo_table_ops.rs`'s
+/// `delete_table_through_a_follower_connected_node_is_relayed_to_the_leader`
+/// is this file's own precedent for the pattern).
+#[tokio::test(flavor = "multi_thread")]
+async fn batch_execute_statement_through_a_follower_connected_node() {
+    let dir = support::panic_safe_tempdir();
+    let bound = bind_cluster(2, "127.0.0.1".parse().unwrap(), dir.path())
+        .await
+        .unwrap();
+    let nodes = start_cluster(bound).await.unwrap();
+    await_bootstrap(&nodes).await;
+
+    let leader = nodes.iter().position(Node::is_control_leader).unwrap();
+    let follower = (0..nodes.len()).find(|&i| i != leader).unwrap();
+
+    let (status, body) = dynamo_retry(
+        nodes[leader].dynamo_addr(),
+        "DynamoDB_20120810.CreateTable",
+        r#"{"TableName":"relay","AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}],
+            "KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}]}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "CreateTable(relay): {body}");
+
+    // Wait for the schema to replicate to every node before issuing the
+    // follower-connected batch — same reasoning as
+    // `dynamo_table_ops.rs`'s identical wait.
+    timeout(Duration::from_secs(20), async {
+        loop {
+            if nodes.iter().all(|n| n.metadata().has_table_schema("relay")) {
+                return;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("CreateTable did not replicate to every node within 20s");
+
+    let body = r#"{"Statements":[
+        {"Statement":"INSERT INTO relay VALUE {'pk': ?}","Parameters":[{"S":"a"}]},
+        {"Statement":"SELECT * FROM relay WHERE pk = ?","Parameters":[{"S":"a"}],"ConsistentRead":true}
+    ]}"#;
+    let (status, resp) = batch_execute_statement(nodes[follower].dynamo_addr(), body).await;
+    assert_eq!(
+        status, 200,
+        "follower-issued BatchExecuteStatement failed: {resp}"
+    );
+    let responses = resp["Responses"].as_array().expect("Responses array");
+    assert_eq!(responses.len(), 2, "{responses:?}");
+    assert!(responses[0].get("Error").is_none(), "{responses:?}");
+    assert!(responses[1].get("Error").is_none(), "{responses:?}");
+    assert_eq!(responses[1]["Item"]["pk"]["S"], "a");
 }

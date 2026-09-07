@@ -747,3 +747,158 @@ dependency added. Given this sandbox's own limited disk allowance
 (~11 GB), the remaining per-crate/per-binary gates ran individually rather
 than as one `cargo test --workspace` sweep — see the PR 3 commit message
 for the exact per-crate log.
+
+## 2026-09-07 amendment — as-built, PR 4
+
+PR 4 landed `BatchExecuteStatement`. **No new grammar** — every statement
+in a batch is parsed with the identical `parse_statement` PR 2/3 already
+built and lowered with the identical `lower_select`/`lower_insert`/
+`lower_update`/`lower_delete`; this PR's only new pure function is
+`partiql::select_is_exact_key`, a post-parse *restriction* (not a grammar
+change) that a batch `SELECT`'s own edge imposes on top of what
+`lower_select` alone would accept.
+
+### Request/response shape as built
+
+Request: `{"Statements": [{"Statement": "...", "Parameters": [...]?,
+"ConsistentRead": bool?}, ...], "ReturnConsumedCapacity"?: ...}` — decoded
+as `Operation::BatchExecuteStatement { statements: Vec<BatchStatementRequest>,
+return_consumed_capacity }` (`wire.rs`'s `decode_batch_execute_statement`).
+1 to 25 statements (`BATCH_EXECUTE_STATEMENT_MAX_STATEMENTS`, AWS's own
+cap — the identical shape `BATCH_WRITE_MAX_ITEMS`/`TRANSACT_WRITE_MAX_ACTIONS`
+already have in this file); 0 or 26+ is a **request-level**
+`ValidationException`, decode-time, before any statement runs. A batch
+statement carries no `Limit`/`NextToken` — AWS's own `BatchStatementRequest`
+has neither, since a batch statement stands in for a single-item operation
+with nothing to paginate.
+
+Response: `{"Responses": [ {"TableName", "Item"?} | {"TableName", "Error":
+{"Code", "Message"}}, ... ]}` (`wire::batch_execute_statement_response`,
+built from `Vec<wire::BatchStatementResult>`) — exactly one entry per input
+statement, in order, always (this function never itself fails on a
+per-statement problem):
+
+| Case | Response entry |
+|---|---|
+| `SELECT` finds the item | `{TableName, Item}` |
+| `SELECT` finds nothing | `{TableName}` — no `Item`, no `Error` |
+| mutation succeeds, no `RETURNING` | `{TableName}` |
+| mutation succeeds, carried `RETURNING ALL OLD *`/`ALL NEW *` | `{TableName, Item}` — the same `Attributes`-become-`Items[0]` reshape PR 3's own `ExecuteStatement` already does |
+| any per-statement failure | `{TableName?, Error: {Code, Message}}` — `TableName` present whenever the statement parsed far enough to name one, absent only on a total parse failure |
+| malformed JSON, 0 or 26+ statements | request-level `ValidationException` (no `Responses` array at all) |
+
+### Error-code mapping (`WireError::batch_statement_error_code`)
+
+AWS's `BatchStatementErrorCodeEnum` is a fixed, bare (no `...Exception`
+suffix) set, distinct from every other error `__type` this adapter renders
+elsewhere. `WireError::batch_statement_error_code(&self) -> &'static str`
+is the one mapping function every per-statement error entry goes through:
+
+| `WireError.code` (this crate's `__type`) | `Error.Code` (AWS bare form) | Reachable from |
+|---|---|---|
+| `ValidationException` / `SerializationException` | `ValidationError` | a parse failure; a non-exact-key `SELECT`; any other `lower_*`/decode rejection |
+| `ConditionalCheckFailedException` | `ConditionalCheckFailed` | `UPDATE`'s implicit `attribute_exists(pk)`, or a non-key `WHERE` term, evaluating false |
+| `DuplicateItemException` | `DuplicateItem` | `INSERT` at an existing key, no `ON CONFLICT DO NOTHING` |
+| `ResourceNotFoundException` | `ResourceNotFound` | an unknown table (or, for a `SELECT`, an unknown named index) |
+| `AccessDeniedException` | `AccessDenied` | a per-statement authorization denial (see below) |
+| `ProvisionedThroughputExceededException` | `ProvisionedThroughputExceeded` | a throttled table (ADR 0065), inherited from the underlying `PutItem`/`UpdateItem`/`DeleteItem`/`Query` |
+| `TransactionConflict` | `TransactionConflict` | not reachable through this PR's own paths (no `WireError` constructor outside `CancellationReason` mints it) — included for AWS-faithfulness and future-proofing, not exercised by any test here |
+| `ThrottlingError` | `ThrottlingError` | likewise not reachable today (single-item throttling here always renders `ProvisionedThroughputExceededException`, never a bare `ThrottlingError`) — kept as an identity row for the same reason |
+| anything else | `InternalServerError` | a defensive fallback; no code this crate currently mints falls through to it |
+
+Note `ValidationException` maps to `ValidationError`, not a bare
+suffix-strip of its own name — the one row in this table that doesn't
+follow the "drop `Exception`" pattern every other row does (`AWS` chose
+`ValidationError`, not `Validation`, for this one enum member).
+
+### The batch-only `SELECT` restriction
+
+AWS restricts a `BatchExecuteStatement`/`ExecuteTransaction` `SELECT` to a
+single-item operation — stricter than a standalone `ExecuteStatement`
+`SELECT`, which happily lowers a sort-key range or a non-key `WHERE` term
+onto a real `Query`-with-filter or `Scan`. `partiql::select_is_exact_key`
+checks, directly on the parsed `SelectStatement` AST (never running
+anything): exactly one `=` term on the partition key, plus — only when the
+target has a sort key — exactly one `=` term on it too, and **no other**
+`WHERE` term. This check runs *before* `lower_select` is even called, so a
+forbidden `Scan` (or a `Query`-with-filter) is never actually executed just
+to be rejected after the fact — the rejection is a pure, cheap AST
+predicate. A `SELECT` naming an index (`FROM "t"."idx"`) is allowed under
+the identical rule, checked against the index's own resolved hash/sort
+attribute names — ADR 0071 is silent on whether AWS allows an indexed
+`SELECT` inside a batch at all; this adapter allows it rather than adding
+an unstated restriction, since nothing in the grammar or the lowering
+distinguishes an index target once its key names are resolved.
+
+### Write-path and authorization reuse
+
+An `INSERT`/`UPDATE`/`DELETE` statement calls `execute_statement` (PR 3's
+own function) **wholesale** — the identical lowering, `DuplicateItemException`
+mapping, `ON CONFLICT DO NOTHING` swallow, and `RETURNING` handling, run
+through `run_operation`'s own dispatch exactly as a standalone
+`ExecuteStatement` call would. A `SELECT` runs a **restricted** copy of
+`execute_statement`'s own `SELECT` arm (duplicated rather than shared,
+since the two arms differ in the exact-key check and in never accepting
+`Limit`/`NextToken`) calling `run_query` directly once `select_is_exact_key`
+passes.
+
+**Authorization is checked per statement, not once for the whole batch** —
+a deliberate departure from `BatchGetItem`/`BatchWriteItem`'s own
+`authorize_each_table` (which rejects the *whole* request if any one of
+its tables is denied). `authz::classify`'s `Operation::BatchExecuteStatement`
+row stays `OpClass::Read` unconditionally (identical reasoning to
+`ExecuteStatement`'s own row — opaque statement text, no catalog access at
+that layer) and `authorize_op` is a deliberate no-op for it, joining
+`ExecuteStatement`'s group. The real check happens inside
+`execute_one_batch_statement`: a `SELECT` gets an explicit
+`authz::authorize(.., "BatchExecuteStatement", OpClass::Read, ..)` call; an
+`INSERT`/`UPDATE`/`DELETE`'s authorization is automatic via
+`execute_statement` → `run_operation`'s own `authorize_op` call on the
+lowered, now-concrete `PutItem`/`UpdateItem`/`DeleteItem` (`OpClass::Write`).
+Either way, a denial becomes that one statement's own `AccessDenied`
+response entry — never a whole-request `AccessDeniedException` — matching
+this PR's own "no cross-statement atomicity" contract extended to
+authorization. This is a considered deviation from
+`BatchWriteItem`/`BatchGetItem`'s whole-request-rejection precedent,
+justified by AWS's own real `BatchExecuteStatement` behavior (each
+statement is authorized independently against IAM, and a denied statement
+becomes its own error entry, never failing the batch) — regression-tested
+in `crates/animusd/tests/dynamo_auth_policy.rs`'s
+`batch_execute_statement_denied_table_is_a_per_statement_access_denied`.
+
+### Testing
+
+Unit tests in `wire.rs`: the 1..=25 cap (accepts the cap, rejects one over
+it, rejects empty), every per-statement field decoding
+(`Statement`/`Parameters`/`ConsistentRead`, the last defaulting to `false`),
+a missing-`Statement` rejection, `batch_statement_error_code`'s full mapping
+table, and the response builder's exact JSON shape (a hit, a miss/no-echo
+success, an error entry, and a table-less parse-failure entry). Unit tests
+in `partiql.rs`: `select_is_exact_key` accepts partition-only (simple
+table) and partition+sort (composite table), and rejects a missing
+partition equality, a range sort condition, a missing sort equality on a
+composite table, an extra filter term alongside the key, and a bare
+scan-shaped `SELECT`. End-to-end in `dynamo_partiql.rs` (30 tests, up from
+25): a mixed batch (`INSERT`, a `SELECT` hit, a `SELECT` miss, `UPDATE`
+with `RETURNING ALL NEW *`, `DELETE` with `RETURNING ALL OLD *`) returns
+one in-order entry each and each write actually lands; one statement
+failing (a duplicate `INSERT`, an unmet conditional `UPDATE`, an unknown
+table, a non-exact-key `SELECT`) leaves the other statements unaffected and
+the whole call still returns `200`; a sort-key-range `SELECT` is rejected
+even though it would lower to a real `Query` standalone; 0 and 26
+statements are both request-level `ValidationException`s; a
+control-plane-follower-connected node runs a batch correctly (the same
+forwarding every other data-plane operation already relies on). A
+per-statement `AccessDenied` alongside an allowed statement's own success,
+in the same batch, is covered in `dynamo_auth_policy.rs` rather than
+duplicated in `dynamo_partiql.rs` (that file already owns every other
+credential/policy fixture).
+
+Gate results (2026-09-07, PR 4): `fmt`/`clippy -D warnings -p animus-dynamo
+-p animusd --all-targets --all-features`/`test -p animus-dynamo`/`test -p
+animusd --lib`/`test -p animusd --test dynamo_partiql` (×3, 30/30 each
+run)/`test -p animusd --test dynamo_auth_policy` all green; `Cargo.lock`
+unchanged, so `cargo deny check` was not re-run (no new dependency). Given
+this sandbox's own limited disk allowance (~11 GB, PR 3's own note), gates
+ran per-crate rather than as one `cargo test --workspace` sweep, matching
+PR 2/PR 3's own precedent.

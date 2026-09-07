@@ -557,6 +557,74 @@ pub struct BatchGet {
     pub consistent_read: bool,
 }
 
+/// One entry of a `BatchExecuteStatement` request (ADR 0071, W-07 PR 4):
+/// the identical `Statement`/`Parameters`/`ConsistentRead` trio a single
+/// `ExecuteStatement` body decodes, minus `NextToken`/`Limit` — AWS's real
+/// `BatchStatementRequest` shape carries neither (a batch statement is
+/// restricted to a single-item operation, so there is nothing to
+/// paginate). `statement` is opaque, unparsed text at this layer, exactly
+/// like `Operation::ExecuteStatement`'s own field — parsing/lowering/the
+/// exact-key restriction all happen at the `animusd` edge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchStatementRequest {
+    /// The raw PartiQL statement text.
+    pub statement: String,
+    /// Positionally-bound `?` values, decoded like any other
+    /// `AttributeValue` array.
+    pub parameters: Vec<AttributeValue>,
+    /// `ConsistentRead`, exactly like `ExecuteStatement`'s own field.
+    pub consistent_read: bool,
+}
+
+/// One entry of a `BatchExecuteStatement` response (ADR 0071, W-07 PR 4) —
+/// exactly one per input statement, in the request's own order.
+/// [`batch_execute_statement_response`] renders the AWS-faithful shape:
+/// `{"TableName": .., "Item": ..}` for a `SELECT` hit or a mutation's own
+/// `RETURNING` echo, `{"TableName": ..}` alone for a `SELECT` miss or a
+/// `RETURNING`-less mutation, `{"TableName": .., "Error": {"Code": ..,
+/// "Message": ..}}` for a per-statement failure — `TableName` omitted only
+/// when the statement never parsed far enough to name one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BatchStatementResult {
+    /// The statement's own resolved table name — `None` only when the
+    /// statement failed to parse at all.
+    pub table: Option<String>,
+    /// The item a `SELECT` found, or a mutation's own `RETURNING` echo.
+    /// `None` for a `SELECT` miss, a mutation with no `RETURNING` clause,
+    /// or any error entry.
+    pub item: Option<Item>,
+    /// `Some((code, message))` for a per-statement failure — `code` is the
+    /// bare `BatchStatementErrorCodeEnum` value AWS defines (never the
+    /// `...Exception` wire code every other error here uses), from
+    /// [`WireError::batch_statement_error_code`].
+    pub error: Option<(&'static str, String)>,
+}
+
+impl BatchStatementResult {
+    /// A successful entry: `table` plus whatever item (if any) this
+    /// statement's own success carries.
+    #[must_use]
+    pub fn success(table: String, item: Option<Item>) -> Self {
+        Self {
+            table: Some(table),
+            item,
+            error: None,
+        }
+    }
+
+    /// A per-statement failure: `table` is `Some` whenever the statement
+    /// parsed far enough to name one (every rejection but a total parse
+    /// failure), `None` only for the latter.
+    #[must_use]
+    pub fn error(table: Option<String>, err: &WireError) -> Self {
+        Self {
+            table,
+            item: None,
+            error: Some((err.batch_statement_error_code(), err.message.clone())),
+        }
+    }
+}
+
 /// One item of a `TransactGetItems` request: a plain key read against `table`,
 /// with an optional per-item projection (mirrors `GetItem`'s own `key`/
 /// `projection` shape — `TransactGetItems`'s wire form is `{"Get": {TableName,
@@ -933,6 +1001,29 @@ pub enum Operation {
         /// PartiQL-specific omission.
         return_consumed_capacity: ReturnConsumedCapacity,
     },
+    /// `BatchExecuteStatement` (ADR 0071, W-07 PR 4): up to
+    /// [`BATCH_EXECUTE_STATEMENT_MAX_STATEMENTS`] independent PartiQL
+    /// statements, each decoded exactly like a single [`ExecuteStatement`]
+    /// body's own `Statement`/`Parameters`/`ConsistentRead` trio, run
+    /// **independently** — no cross-statement atomicity, mirroring
+    /// `BatchWriteItem`/`BatchGetItem`'s own per-request contract (ADR
+    /// 0071's lowering table). Each statement's own table is only known
+    /// once it is individually parsed, so this joins `BatchGetItem`/
+    /// `ExecuteStatement`'s "resolved inside its own handler" group at
+    /// every exhaustive match site (`Operation::table()`,
+    /// `authz::classify`, `authz::authorize_op`).
+    ///
+    /// [`ExecuteStatement`]: Operation::ExecuteStatement
+    BatchExecuteStatement {
+        /// One entry per statement, in request order — the response echoes
+        /// this same order, one entry each.
+        statements: Vec<BatchStatementRequest>,
+        /// How much of the `ConsumedCapacity` report the caller wants back.
+        /// Decoded and accepted, but currently never populated — mirrors
+        /// `ExecuteStatement`/`Query`/`Scan`'s own pre-existing gap (ADR
+        /// 0071 §11).
+        return_consumed_capacity: ReturnConsumedCapacity,
+    },
     /// `UpdateTimeToLive` (ADR 0051): declare, change, or disable a table's
     /// TTL attribute. AWS requires `AttributeName` even when `enabled` is
     /// `false` — a disable call must still name the attribute being
@@ -1295,6 +1386,11 @@ impl Operation {
             // group here; `animusd` resolves and authorizes the real table
             // inside its own handler, mirroring `BatchGetItem`'s shape.
             | Operation::ExecuteStatement { .. }
+            // `BatchExecuteStatement` is inherently multi-table: each of
+            // its own statements names its own table, only known once that
+            // statement is individually parsed — joins `ExecuteStatement`'s
+            // identical group for the identical reason (ADR 0071, W-07 PR 4).
+            | Operation::BatchExecuteStatement { .. }
             | Operation::ListTables { .. }
             // `DescribeBackup`/`DeleteBackup` address a backup by ARN, not a
             // table name (ADR 0059 §3's own "keyed by backup identity, never
@@ -1619,6 +1715,37 @@ impl WireError {
         };
         serde_json::to_string(&body).expect("error body serializes")
     }
+
+    /// Map this error onto AWS's `BatchStatementErrorCodeEnum` — the bare
+    /// per-statement code a `BatchExecuteStatement`/`ExecuteTransaction`
+    /// response entry's own `Error.Code` uses (ADR 0071, W-07 PR 4), never
+    /// the `...Exception` `__type` code every other error here renders.
+    /// The enum is a fixed AWS-defined set (`ConditionalCheckFailed |
+    /// DuplicateItem | ItemCollectionSizeLimitExceeded | RequestLimitExceeded
+    /// | ValidationError | ProvisionedThroughputExceeded |
+    /// TransactionConflict | ThrottlingError | InternalServerError |
+    /// ResourceNotFound | AccessDenied`) — every `code` this crate can
+    /// actually mint maps onto one of these explicitly; an error shape this
+    /// crate has no member for yet (there is none today) would fall back to
+    /// `InternalServerError` rather than inventing a code AWS doesn't
+    /// define. Note `ValidationException` maps to `ValidationError`, not a
+    /// bare suffix-strip of its own `...Exception` code — the one name in
+    /// this table that doesn't follow the "drop `Exception`" pattern every
+    /// other row does.
+    #[must_use]
+    pub fn batch_statement_error_code(&self) -> &'static str {
+        match self.code {
+            "ValidationException" | "SerializationException" => "ValidationError",
+            "ConditionalCheckFailedException" => "ConditionalCheckFailed",
+            "DuplicateItemException" => "DuplicateItem",
+            "ResourceNotFoundException" => "ResourceNotFound",
+            "AccessDeniedException" => "AccessDenied",
+            "ProvisionedThroughputExceededException" => "ProvisionedThroughputExceeded",
+            "TransactionConflict" => "TransactionConflict",
+            "ThrottlingError" => "ThrottlingError",
+            _ => "InternalServerError",
+        }
+    }
 }
 
 impl std::fmt::Display for WireError {
@@ -1767,6 +1894,7 @@ pub fn decode_request(target: &str, body: &[u8]) -> Result<Operation, WireError>
         "BatchGetItem" => decode_batch_get(obj),
         "TransactGetItems" => decode_transact_get(obj),
         "ExecuteStatement" => decode_execute_statement(obj),
+        "BatchExecuteStatement" => decode_batch_execute_statement(obj),
         "UpdateTimeToLive" => decode_update_time_to_live(obj),
         "DescribeTimeToLive" => Ok(Operation::DescribeTimeToLive {
             table: table_name(obj)?,
@@ -3023,6 +3151,13 @@ pub const TRANSACT_WRITE_MAX_ACTIONS: usize = 100;
 /// AWS's `TransactGetItems` cap: at most 100 items in one call.
 pub const TRANSACT_GET_MAX_ITEMS: usize = 100;
 
+/// AWS's `BatchExecuteStatement` cap: at most 25 statements in one call
+/// (ADR 0071, W-07 PR 4) — this adapter enforces the identical bound. Zero
+/// statements is also rejected (an empty `Statements` array is almost
+/// always a client bug, the same reasoning `BatchGetItem`'s empty-`Keys`
+/// rejection already uses).
+pub const BATCH_EXECUTE_STATEMENT_MAX_STATEMENTS: usize = 25;
+
 /// Decode a `BatchWriteItem` body: `{"RequestItems": {table: [{PutRequest|
 /// DeleteRequest}, ..], ..}}`. Rejects more than [`BATCH_WRITE_MAX_ITEMS`]
 /// request items total across every table, matching real DynamoDB.
@@ -3310,6 +3445,68 @@ fn decode_execute_statement(obj: &Map<String, Value>) -> Result<Operation, WireE
         consistent_read,
         next_token,
         limit,
+        return_consumed_capacity,
+    })
+}
+
+/// Decode a `BatchExecuteStatement` body (ADR 0071, W-07 PR 4):
+/// `{"Statements": [{"Statement": .., "Parameters": [..]?, "ConsistentRead":
+/// ..?}, ..], "ReturnConsumedCapacity": ..?}`. Rejects an empty `Statements`
+/// array or more than [`BATCH_EXECUTE_STATEMENT_MAX_STATEMENTS`], matching
+/// real DynamoDB's own 1..=25 bound.
+fn decode_batch_execute_statement(obj: &Map<String, Value>) -> Result<Operation, WireError> {
+    let arr = obj
+        .get("Statements")
+        .and_then(Value::as_array)
+        .ok_or_else(|| WireError::validation("missing array field `Statements`"))?;
+    if arr.is_empty() {
+        return Err(WireError::validation("`Statements` must not be empty"));
+    }
+    if arr.len() > BATCH_EXECUTE_STATEMENT_MAX_STATEMENTS {
+        return Err(WireError::validation(format!(
+            "too many statements in BatchExecuteStatement: {} requested, at most \
+             {BATCH_EXECUTE_STATEMENT_MAX_STATEMENTS} allowed per call",
+            arr.len()
+        )));
+    }
+    let mut statements = Vec::with_capacity(arr.len());
+    for (i, entry) in arr.iter().enumerate() {
+        let e = entry
+            .as_object()
+            .ok_or_else(|| WireError::validation(format!("`Statements[{i}]` must be an object")))?;
+        let statement = e
+            .get("Statement")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                WireError::validation(format!(
+                    "`Statements[{i}]` missing string field `Statement`"
+                ))
+            })?
+            .to_owned();
+        let parameters = match e.get("Parameters") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(v) => {
+                let parr = v.as_array().ok_or_else(|| {
+                    WireError::validation(format!("`Statements[{i}].Parameters` must be an array"))
+                })?;
+                parr.iter()
+                    .enumerate()
+                    .map(|(j, v)| {
+                        decode_attribute_value(&format!("Statements[{i}].Parameters[{j}]"), v)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+            }
+        };
+        let consistent_read = decode_consistent_read(e);
+        statements.push(BatchStatementRequest {
+            statement,
+            parameters,
+            consistent_read,
+        });
+    }
+    let return_consumed_capacity = decode_return_consumed_capacity(obj)?;
+    Ok(Operation::BatchExecuteStatement {
+        statements,
         return_consumed_capacity,
     })
 }
@@ -5216,6 +5413,39 @@ pub fn batch_get_response(
     obj.insert("Responses".into(), Value::Object(responses));
     obj.insert("UnprocessedKeys".into(), Value::Object(unprocessed_keys));
     serde_json::to_string(&Value::Object(obj)).expect("batch get response serializes")
+}
+
+/// The JSON body for a `BatchExecuteStatement` response (ADR 0071, W-07 PR
+/// 4): `{"Responses": [{"TableName": .., "Item": ..} | {"TableName": ..} |
+/// {"TableName": .., "Error": {"Code": .., "Message": ..}}, ..]}` — exactly
+/// one entry per input statement, in the request's own order. `TableName`
+/// is omitted only when a statement never parsed far enough to name one;
+/// `Item` is omitted on a `SELECT` miss, a `RETURNING`-less mutation, or any
+/// error entry; `Error` is present only on a per-statement failure.
+#[must_use]
+pub fn batch_execute_statement_response(results: &[BatchStatementResult]) -> String {
+    let responses: Vec<Value> = results
+        .iter()
+        .map(|r| {
+            let mut obj = Map::new();
+            if let Some(table) = &r.table {
+                obj.insert("TableName".into(), Value::String(table.clone()));
+            }
+            if let Some(item) = &r.item {
+                obj.insert("Item".into(), encode_item(item));
+            }
+            if let Some((code, message)) = &r.error {
+                let mut err = Map::new();
+                err.insert("Code".into(), Value::String((*code).to_string()));
+                err.insert("Message".into(), Value::String(message.clone()));
+                obj.insert("Error".into(), Value::Object(err));
+            }
+            Value::Object(obj)
+        })
+        .collect();
+    let mut out = Map::new();
+    out.insert("Responses".into(), Value::Array(responses));
+    serde_json::to_string(&Value::Object(out)).expect("batch execute statement response serializes")
 }
 
 /// The JSON body for a successful write echoing `ReturnValues`. `old` is the
@@ -9428,6 +9658,179 @@ mod tests {
         let err = decode_request("DynamoDB_20120810.BatchGetItem", over_cap.as_bytes())
             .expect_err("one over the cap is rejected");
         assert_eq!(err.code, "ValidationException");
+    }
+
+    /// A `BatchExecuteStatement` body with `n` `INSERT` statements, each its
+    /// own key.
+    fn batch_execute_statement_body(n: usize) -> String {
+        let statements: Vec<String> = (0..n)
+            .map(|i| {
+                format!(
+                    r#"{{"Statement":"INSERT INTO t VALUE {{'id':?}}","Parameters":[{{"S":"i{i}"}}]}}"#
+                )
+            })
+            .collect();
+        format!(r#"{{"Statements":[{}]}}"#, statements.join(","))
+    }
+
+    #[test]
+    fn batch_execute_statement_accepts_the_cap_and_rejects_one_over_it() {
+        let at_cap = batch_execute_statement_body(BATCH_EXECUTE_STATEMENT_MAX_STATEMENTS);
+        decode_request("DynamoDB_20120810.BatchExecuteStatement", at_cap.as_bytes())
+            .expect("exactly the cap is accepted");
+
+        let over_cap = batch_execute_statement_body(BATCH_EXECUTE_STATEMENT_MAX_STATEMENTS + 1);
+        let err = decode_request(
+            "DynamoDB_20120810.BatchExecuteStatement",
+            over_cap.as_bytes(),
+        )
+        .expect_err("one over the cap is rejected");
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    #[test]
+    fn batch_execute_statement_rejects_empty_statements() {
+        let err = decode_request(
+            "DynamoDB_20120810.BatchExecuteStatement",
+            br#"{"Statements":[]}"#,
+        )
+        .expect_err("an empty `Statements` array is rejected");
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    #[test]
+    fn batch_execute_statement_decodes_every_per_statement_field() {
+        let body = br#"{"Statements":[
+            {"Statement":"SELECT * FROM t WHERE pk = ?","Parameters":[{"S":"p1"}],"ConsistentRead":true},
+            {"Statement":"DELETE FROM t WHERE pk = ?","Parameters":[{"S":"p2"}]}
+        ]}"#;
+        let Operation::BatchExecuteStatement {
+            statements,
+            return_consumed_capacity,
+        } = decode_request("DynamoDB_20120810.BatchExecuteStatement", body).expect("decodes")
+        else {
+            panic!("expected BatchExecuteStatement");
+        };
+        assert_eq!(statements.len(), 2);
+        assert_eq!(statements[0].statement, "SELECT * FROM t WHERE pk = ?");
+        assert_eq!(statements[0].parameters, vec![s("p1")]);
+        assert!(statements[0].consistent_read);
+        assert_eq!(statements[1].statement, "DELETE FROM t WHERE pk = ?");
+        assert_eq!(statements[1].parameters, vec![s("p2")]);
+        // `ConsistentRead` defaults to `false` when absent, exactly like
+        // `ExecuteStatement`'s own field.
+        assert!(!statements[1].consistent_read);
+        assert_eq!(return_consumed_capacity, ReturnConsumedCapacity::None);
+    }
+
+    #[test]
+    fn batch_execute_statement_rejects_a_missing_statement_field() {
+        let err = decode_request(
+            "DynamoDB_20120810.BatchExecuteStatement",
+            br#"{"Statements":[{"Parameters":[]}]}"#,
+        )
+        .expect_err("a statement entry needs `Statement`");
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    #[test]
+    fn batch_execute_statement_error_code_mapping() {
+        assert_eq!(
+            WireError::validation("x").batch_statement_error_code(),
+            "ValidationError"
+        );
+        assert_eq!(
+            WireError::conditional_check_failed("x").batch_statement_error_code(),
+            "ConditionalCheckFailed"
+        );
+        assert_eq!(
+            WireError::duplicate_item("x").batch_statement_error_code(),
+            "DuplicateItem"
+        );
+        let not_found = WireError {
+            code: "ResourceNotFoundException",
+            message: "table `t` does not exist".into(),
+            reasons: None,
+        };
+        assert_eq!(not_found.batch_statement_error_code(), "ResourceNotFound");
+        assert_eq!(
+            WireError::access_denied("x").batch_statement_error_code(),
+            "AccessDenied"
+        );
+        assert_eq!(
+            WireError::provisioned_throughput_exceeded("x").batch_statement_error_code(),
+            "ProvisionedThroughputExceeded"
+        );
+        // `TransactionConflict`/`ThrottlingError` are bare-already codes
+        // (no `WireError` constructor mints them outside `CancellationReason`
+        // today — nothing on the `BatchExecuteStatement` mutation path
+        // produces either), so the mapping table's identity rows are
+        // exercised directly here rather than through a real constructor.
+        let transaction_conflict = WireError {
+            code: "TransactionConflict",
+            message: "x".into(),
+            reasons: None,
+        };
+        assert_eq!(
+            transaction_conflict.batch_statement_error_code(),
+            "TransactionConflict"
+        );
+        let throttling_error = WireError {
+            code: "ThrottlingError",
+            message: "x".into(),
+            reasons: None,
+        };
+        assert_eq!(
+            throttling_error.batch_statement_error_code(),
+            "ThrottlingError"
+        );
+        // An error shape this crate never mints falls back to
+        // `InternalServerError` rather than inventing an AWS code.
+        assert_eq!(
+            WireError::unknown_operation("x").batch_statement_error_code(),
+            "InternalServerError"
+        );
+    }
+
+    #[test]
+    fn batch_execute_statement_response_shape() {
+        let mut hit = Item::new();
+        hit.insert("id".into(), s("k1"));
+        let results = vec![
+            BatchStatementResult::success("t".into(), Some(hit)),
+            BatchStatementResult::success("t".into(), None),
+            BatchStatementResult::error(
+                Some("t".into()),
+                &WireError::conditional_check_failed("nope"),
+            ),
+            BatchStatementResult::error(None, &WireError::validation("could not parse")),
+        ];
+        let body = batch_execute_statement_response(&results);
+        let json: Value = serde_json::from_str(&body).unwrap();
+        let responses = json["Responses"].as_array().expect("Responses array");
+        assert_eq!(responses.len(), 4);
+
+        assert_eq!(responses[0]["TableName"], "t");
+        assert_eq!(responses[0]["Item"]["id"]["S"], "k1");
+        assert!(responses[0].get("Error").is_none());
+
+        assert_eq!(responses[1]["TableName"], "t");
+        assert!(
+            responses[1].get("Item").is_none(),
+            "a miss/no-echo success omits Item, never nulls it"
+        );
+        assert!(responses[1].get("Error").is_none());
+
+        assert_eq!(responses[2]["TableName"], "t");
+        assert_eq!(responses[2]["Error"]["Code"], "ConditionalCheckFailed");
+        assert_eq!(responses[2]["Error"]["Message"], "nope");
+        assert!(responses[2].get("Item").is_none());
+
+        assert!(
+            responses[3].get("TableName").is_none(),
+            "a total parse failure names no table"
+        );
+        assert_eq!(responses[3]["Error"]["Code"], "ValidationError");
     }
 
     /// A `TransactWriteItems` body with `n` `Put` actions, each its own key.

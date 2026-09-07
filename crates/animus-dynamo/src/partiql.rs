@@ -1066,6 +1066,42 @@ pub fn parse_statement(input: &str) -> Result<Statement, PartiqlError> {
 // Lowering (ADR 0071 §4, §5, §6, §8)
 // ---------------------------------------------------------------------------
 
+/// Whether a parsed `SELECT`'s `WHERE` clause is an **exact-key** read: an
+/// `=` term on `partition_key`, plus (only when `sort_key` is `Some`) an
+/// `=` term on it too, and nothing else — no extra `WHERE` term, no
+/// range/`BETWEEN`/`begins_with` sort condition. This is strictly narrower
+/// than what [`lower_select`] alone accepts (which happily lowers a sort
+/// range or a filter-bearing `WHERE` onto a real `Query`); the narrower
+/// shape is what AWS restricts a `BatchExecuteStatement`/`ExecuteTransaction`
+/// `SELECT` to (ADR 0071, W-07 PR 4/PR 5 — a batch/transaction statement
+/// stands in for a single-item `GetItem`, never a multi-item `Query`/`Scan`).
+/// `partition_key`/`sort_key` are the target's own resolved key attribute
+/// names, exactly like every other `lower_*` function's own parameters —
+/// this function reads no schema either.
+#[must_use]
+pub fn select_is_exact_key(
+    stmt: &SelectStatement,
+    partition_key: &str,
+    sort_key: Option<&str>,
+) -> bool {
+    let is_eq_on = |t: &WhereTerm, attr: &str| matches!(t, WhereTerm::Compare(a, Comparator::Eq, _) if a == attr);
+    let pk_matches = stmt
+        .where_terms
+        .iter()
+        .filter(|t| is_eq_on(t, partition_key))
+        .count();
+    if pk_matches != 1 {
+        return false;
+    }
+    match sort_key {
+        Some(sk) => {
+            let sk_matches = stmt.where_terms.iter().filter(|t| is_eq_on(t, sk)).count();
+            sk_matches == 1 && stmt.where_terms.len() == 2
+        }
+        None => stmt.where_terms.len() == 1,
+    }
+}
+
 /// Lower a parsed `SELECT` onto [`Operation::Query`] or [`Operation::Scan`]
 /// (ADR 0071 §4's key-versus-filter rule).
 ///
@@ -2277,6 +2313,50 @@ mod tests {
             }
             other => panic!("expected Scan, got {other:?}"),
         }
+    }
+
+    // --- `select_is_exact_key` (ADR 0071, W-07 PR 4/PR 5) ------------------
+
+    #[test]
+    fn exact_key_accepts_partition_only_on_a_simple_table() {
+        let stmt = s("SELECT * FROM t WHERE pk = ?");
+        assert!(select_is_exact_key(&stmt, "pk", None));
+    }
+
+    #[test]
+    fn exact_key_accepts_partition_and_sort_equality_on_a_composite_table() {
+        let stmt = s("SELECT * FROM t WHERE pk = ? AND sk = ?");
+        assert!(select_is_exact_key(&stmt, "pk", Some("sk")));
+    }
+
+    #[test]
+    fn exact_key_rejects_missing_partition_equality() {
+        let stmt = s("SELECT * FROM t WHERE other = ?");
+        assert!(!select_is_exact_key(&stmt, "pk", None));
+    }
+
+    #[test]
+    fn exact_key_rejects_a_range_sort_condition() {
+        let stmt = s("SELECT * FROM t WHERE pk = ? AND sk > ?");
+        assert!(!select_is_exact_key(&stmt, "pk", Some("sk")));
+    }
+
+    #[test]
+    fn exact_key_rejects_a_missing_sort_equality_on_a_composite_table() {
+        let stmt = s("SELECT * FROM t WHERE pk = ?");
+        assert!(!select_is_exact_key(&stmt, "pk", Some("sk")));
+    }
+
+    #[test]
+    fn exact_key_rejects_an_extra_filter_term_alongside_the_key() {
+        let stmt = s("SELECT * FROM t WHERE pk = ? AND sk = ? AND other = ?");
+        assert!(!select_is_exact_key(&stmt, "pk", Some("sk")));
+    }
+
+    #[test]
+    fn exact_key_rejects_a_bare_scan_shaped_select() {
+        let stmt = s("SELECT * FROM t");
+        assert!(!select_is_exact_key(&stmt, "pk", None));
     }
 
     #[test]

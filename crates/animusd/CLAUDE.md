@@ -4034,6 +4034,41 @@ route below the edge through the same `ClientCtx` CP primitives.
   accepted but never populated for any statement kind, mirroring `Query`/
   `Scan`/`PutItem`/`UpdateItem`/`DeleteItem`'s own pre-existing gap (not a
   PartiQL-specific omission — see ADR 0071 §11).
+  **`BatchExecuteStatement` (ADR 0071, W-07 PR 4)** — `dynamo::
+  run_batch_execute_statement`/`execute_one_batch_statement` run 1..=25
+  statements independently (no cross-statement atomicity, mirroring
+  `BatchWriteItem`/`BatchGetItem`'s own per-request contract), **reusing
+  `parse_statement`/the four `lower_*` functions with no new grammar**: an
+  `INSERT`/`UPDATE`/`DELETE` statement calls `execute_statement` wholesale
+  (the exact same lowering/`DuplicateItemException` mapping/`RETURNING`
+  handling PR 3 built, dispatched through `run_operation`); a `SELECT` runs
+  a **restricted** copy of `execute_statement`'s own `SELECT` arm that
+  additionally requires `partiql::select_is_exact_key` — AWS limits a batch
+  statement to a single-item operation, so a range/filter-bearing `SELECT`
+  is a per-statement `ValidationError` entry, checked on the parsed AST
+  *before* anything runs (never executes a forbidden `Scan` just to reject
+  it after the fact). Never propagates an `Err` up to `run_operation`:
+  every per-statement failure — parse error, denied/unknown table, a
+  non-exact-key `SELECT`, a condition failure — becomes that statement's
+  own `wire::BatchStatementResult` entry (`{TableName, Item}` on success,
+  `{TableName?, Error: {Code, Message}}` on failure, `wire::
+  WireError::batch_statement_error_code` mapping this crate's `__type`
+  codes onto AWS's bare `BatchStatementErrorCodeEnum`, e.g.
+  `ConditionalCheckFailedException` → `ConditionalCheckFailed`,
+  `ValidationException` → `ValidationError`), never a whole-request
+  failure — mirrored by `authz`: `classify`'s `BatchExecuteStatement` row
+  stays `OpClass::Read` unconditionally (same "opaque statement text, no
+  catalog here" reasoning as `ExecuteStatement`'s own row) and
+  `authorize_op` is a no-op for it, joining `ExecuteStatement`'s
+  table-unknown-until-parsed group; the real per-statement check — an
+  explicit `authz::authorize` call for a `SELECT`, `run_operation`'s own
+  `authorize_op` call for a lowered mutation — turns a denial into that
+  statement's own `AccessDenied` entry rather than rejecting the whole
+  batch, a **deliberate departure** from `BatchGetItem`/`BatchWriteItem`'s
+  `authorize_each_table` whole-request rejection (justified by AWS's own
+  real per-statement IAM authorization; see ADR 0071's "As-built: PR 4"
+  amendment for the full account and the regression test naming). See that
+  amendment for the complete response-shape table and error-code mapping.
 - **Admin / debug** (`admin.rs`, `RoleAddrs.admin`, ADR 0020) — read-only
   `GET` views + gated `POST` actions + data writes; grep `admin.rs`'s route
   table for the full endpoint inventory. Below the edge it only reads node

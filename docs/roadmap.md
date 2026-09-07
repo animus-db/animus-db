@@ -89,8 +89,18 @@ the still-true paragraph after the table.
   only) is implemented in PR 3 rather than deferred, since it costs nothing
   beyond wiring the statement's own clause onto the already-existing
   `ReturnValues`/`UpdateReturnValues` fields — see ADR 0071's "As-built: PR
-  3" amendment. `BatchExecuteStatement` (PR 4) and `ExecuteTransaction`
-  (PR 5) remain.
+  3" amendment. **PR 4** adds `BatchExecuteStatement`: 1 to 25 statements
+  (AWS's own cap), each the identical `parse_statement`/per-kind lowering
+  PR 2/3 already built, run independently through `execute_statement`
+  (`INSERT`/`UPDATE`/`DELETE`) or a restricted `SELECT` path
+  (`partiql::select_is_exact_key` — AWS limits a batch statement to a
+  single-item operation, so a range/filtered `SELECT` is a per-statement
+  error rather than lowering to a real `Query`/`Scan`) — no cross-statement
+  atomicity, mirroring `BatchWriteItem`/`BatchGetItem`'s own contract, with
+  a per-statement `AccessDenied` (not a whole-request rejection) on a
+  denied table. See ADR 0071's "As-built: PR 4" amendment for the full
+  response shape and error-code mapping. `ExecuteTransaction` (PR 5)
+  remains.
 
 ---
 
