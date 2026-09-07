@@ -3169,6 +3169,27 @@ impl Metadata {
                     // race-safe — two nodes racing with different allocated ids both
                     // propose `CreateTablet` for the table, but only the first applies.
                     ApplyOutcome::Rejected("table already has a tablet")
+                } else if tablet.0 < self.next_free_tablet_id().0 {
+                    // #684: same monotonic-allocator floor as
+                    // `BeginSplitInPlace`/`BeginRestore`/`BeginImport` (and
+                    // for the same dropped-data-resurrection reason) — this
+                    // arm was the one minting command that had DRIFTED from
+                    // that shared discipline (its sibling arms' comments
+                    // claimed parity that this arm never actually had).
+                    // `BeginSplitInPlace` reserves its two child ids by
+                    // bumping `next_tablet_id` immediately but mints no
+                    // tablet-map row for them until `CutoverSplit` runs, so
+                    // a `CreateTablet` proposed off a metadata read that
+                    // predates the reservation could still compute one of
+                    // those exact ids as its own `next_free_tablet_id()`
+                    // candidate and land here first — the new table's row
+                    // would then sit at a reserved id until the in-flight
+                    // split's `CutoverSplit` inserted its own child there,
+                    // permanently losing the other table's only tablet
+                    // (issue #684). Existence-only checking (the arm above)
+                    // cannot see a reservation with no row yet; only the
+                    // floor can.
+                    ApplyOutcome::Rejected("tablet id below the monotonic allocator")
                 } else {
                     self.tablets.insert(
                         *tablet,
@@ -3315,6 +3336,43 @@ impl Metadata {
                     // exact (immutable-since-then) range.
                     return ApplyOutcome::Rejected("split key not strictly inside range");
                 };
+                // #684 defense-in-depth: an already-occupied child slot is
+                // a structural invariant violation, not an ordinary race to
+                // shrug off. `BeginSplitInPlace` reserved both `intent.
+                // children` ids by bumping `next_tablet_id` at its own
+                // apply, and every tablet-minting arm (`CreateTablet` since
+                // its own #684 fix, `BeginRestore`, `BeginImport`, and this
+                // arm's sibling `BeginSplitInPlace` itself) enforces the
+                // monotonic-allocator floor — so nothing should be able to
+                // insert a row at either id before this exact apply does.
+                // Reject rather than silently overwrite (`self.tablets.
+                // insert` below is unconditional and would have been
+                // exactly issue #684's second silent-data-loss point) —
+                // finding this rejected is a louder, safer failure than a
+                // resurrected/overwritten table. A rejected cutover leaves
+                // the parent `Splitting` forever (nothing else can clear an
+                // occupied slot), which permanently blocks this one split —
+                // but the driver that proposes `CutoverSplit`
+                // (`animusd::index_drain::inplace_split_driver_tick`) is
+                // itself idempotent/stateless and already re-issues it
+                // every ~200ms tick "until the parent vanishes from the
+                // map" (its own doc), so a rejection here never wedges
+                // ANYTHING else — only this one already-corrupt split stays
+                // pending, loudly, instead of the corruption spreading.
+                for child in &intent.children {
+                    if self.tablets.contains_key(&child.id) {
+                        tracing::error!(
+                            parent = parent.0,
+                            child = child.id.0,
+                            "CutoverSplit: child tablet id already occupied — allocator \
+                             invariant violated (issue #684); rejecting rather than \
+                             overwriting the occupant"
+                        );
+                        return ApplyOutcome::Rejected(
+                            "child tablet id already occupied — allocator invariant violated",
+                        );
+                    }
+                }
                 let table = source.table.clone();
                 let policy = self.policies.get(parent).cloned();
                 let parents_final_epoch = self
@@ -8438,6 +8496,186 @@ mod tests {
                 cutover_wall_ms: 100,
             }),
             ApplyOutcome::Rejected("no such tablet")
+        );
+    }
+
+    /// Issue #684 regression (a)+(b): a `CreateTablet` for an unrelated
+    /// table, computed from a `next_free_tablet_id()` read that predates a
+    /// concurrent `BeginSplitInPlace`'s own id reservation, must be
+    /// rejected by the SAME monotonic-allocator floor
+    /// `BeginSplitInPlace`/`BeginRestore`/`BeginImport` already enforce —
+    /// not merely by existence, which cannot see a reservation with no row
+    /// materialized yet. This is exactly the interleaving that used to
+    /// reach production (table A's ADR 0067 min-tablets-triggered split
+    /// reserving child ids while table B's `provision_tablet` raced a
+    /// `CreateTablet` off a stale read — see this commit's own body for the
+    /// full account).
+    ///
+    /// **This test was run against the pre-fix `CreateTablet` apply arm
+    /// (existence + one-tablet-per-table checks only) and failed red**
+    /// — the id-2 `CreateTablet` below was wrongly `Applied` — **before
+    /// this fix landed**; see the commit body.
+    ///
+    /// Also proves (b): the rejection doesn't perturb the in-flight split
+    /// at all — `CutoverSplit` afterward activates both of table "a"'s own
+    /// children exactly as it would have without the race, and no tablet
+    /// ever carries table "b" at any point.
+    #[test]
+    fn create_tablet_rejects_an_id_reserved_by_an_in_flight_split_and_cutover_still_completes() {
+        let mut m = Metadata::default();
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTablet {
+                tablet: TabletId(1),
+                table: Some("a".to_owned()),
+                range: KeyRange::whole(),
+                replicas: vec![nid(1), nid(2), nid(3)],
+            }),
+            ApplyOutcome::Applied
+        );
+        let split_key = 0x8000_0000_0000_0000u64.to_be_bytes().to_vec();
+        assert_eq!(
+            m.apply(&MetaCommand::BeginSplitInPlace {
+                parent: TabletId(1),
+                expected_epoch: Epoch::INITIAL,
+                split_key: split_key.clone(),
+                children: [
+                    (TabletId(2), vec![nid(1), nid(2), nid(4)]),
+                    (TabletId(3), vec![nid(2), nid(3), nid(5)]),
+                ],
+            }),
+            ApplyOutcome::Applied
+        );
+
+        // Table "b"'s own `CreateTablet` computed `TabletId(2)` from a
+        // stale read that predates the reservation above. No row exists
+        // yet for id 2 at all — that's the whole #684 gap: existence-only
+        // checking is blind to a reservation with no materialized row —
+        // so this must be rejected by the FLOOR, not "tablet already
+        // exists".
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTablet {
+                tablet: TabletId(2),
+                table: Some("b".to_owned()),
+                range: KeyRange::whole(),
+                replicas: vec![nid(1), nid(2), nid(3)],
+            }),
+            ApplyOutcome::Rejected("tablet id below the monotonic allocator")
+        );
+        assert!(
+            !m.tablets.contains_key(&TabletId(2)),
+            "the rejected CreateTablet must not have minted a row"
+        );
+        assert!(
+            m.tablets_for_table("b").next().is_none(),
+            "table b never got a tablet"
+        );
+
+        // (b): the rejection doesn't perturb the in-flight split at all —
+        // CutoverSplit still activates both of table a's own children
+        // normally.
+        let parent_epoch = m.tablets[&TabletId(1)].epoch;
+        assert_eq!(
+            m.apply(&MetaCommand::CutoverSplit {
+                parent: TabletId(1),
+                expected_epoch: parent_epoch,
+                cutover_wall_ms: 42,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert!(!m.tablets.contains_key(&TabletId(1)), "parent retired");
+        let left = &m.tablets[&TabletId(2)];
+        assert_eq!(left.state, TabletState::Active);
+        assert_eq!(
+            left.table.as_deref(),
+            Some("a"),
+            "child 2 belongs to table a, never to table b"
+        );
+        let right = &m.tablets[&TabletId(3)];
+        assert_eq!(right.state, TabletState::Active);
+        assert_eq!(right.table.as_deref(), Some("a"));
+        assert!(
+            m.tablets.values().all(|t| t.table.as_deref() != Some("b")),
+            "no tablet ever carried table b, at any point in this run"
+        );
+    }
+
+    /// Issue #684 defense-in-depth (c): `CutoverSplit` must reject rather
+    /// than silently overwrite when a child slot is already occupied.
+    /// Normal commands can no longer reach this state after the
+    /// `CreateTablet` floor fix above, so this test constructs it directly
+    /// on `Metadata`'s own fields (this module has private access) to prove
+    /// the defense-in-depth check in `CutoverSplit`'s own apply arm holds
+    /// on its own, independent of whichever upstream command used to be
+    /// able to trigger it.
+    #[test]
+    fn cutover_split_rejects_rather_than_overwrites_an_occupied_child_slot() {
+        let (mut m, cmd) = begin_split_in_place_fixture();
+        assert_eq!(m.apply(&cmd), ApplyOutcome::Applied);
+        let parent_epoch = m.tablets[&TabletId(1)].epoch;
+
+        // Simulate a broken allocator invariant: some other command minted
+        // a row at child id 2 anyway (structurally unreachable via ordinary
+        // commands after the #684 fix above — constructed directly here).
+        let occupant = Tablet::with_table(
+            TabletId(2),
+            Some("intruder".to_owned()),
+            KeyRange::whole(),
+            vec![nid(9)],
+        );
+        m.tablets.insert(TabletId(2), occupant.clone());
+
+        assert_eq!(
+            m.apply(&MetaCommand::CutoverSplit {
+                parent: TabletId(1),
+                expected_epoch: parent_epoch,
+                cutover_wall_ms: 7,
+            }),
+            ApplyOutcome::Rejected(
+                "child tablet id already occupied — allocator invariant violated"
+            )
+        );
+
+        // The occupant is left untouched, the parent is still `Splitting`
+        // (never retired), and table a's OTHER child (3) was never minted
+        // either — an all-or-nothing rejection, not a partial cutover.
+        assert_eq!(m.tablets[&TabletId(2)], occupant, "occupant left untouched");
+        assert_eq!(
+            m.tablets[&TabletId(1)].state,
+            TabletState::Splitting,
+            "parent not retired by a rejected cutover"
+        );
+        assert!(
+            !m.tablets.contains_key(&TabletId(3)),
+            "no partial cutover — the other child was never minted either"
+        );
+    }
+
+    /// Issue #684, no-off-by-one: `next_free_tablet_id()` itself — not one
+    /// past it — must remain an ACCEPTABLE `CreateTablet` candidate. The
+    /// floor guard added above rejects strictly BELOW the floor; this
+    /// proves it doesn't accidentally reject AT the floor too.
+    #[test]
+    fn create_tablet_at_exactly_the_allocator_floor_is_accepted() {
+        let mut m = Metadata::default();
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTablet {
+                tablet: TabletId(1),
+                table: Some("a".to_owned()),
+                range: KeyRange::whole(),
+                replicas: vec![nid(1), nid(2), nid(3)],
+            }),
+            ApplyOutcome::Applied
+        );
+        let floor = m.next_free_tablet_id();
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTablet {
+                tablet: floor,
+                table: Some("b".to_owned()),
+                range: KeyRange::whole(),
+                replicas: vec![nid(1), nid(2), nid(3)],
+            }),
+            ApplyOutcome::Applied,
+            "an id exactly AT the floor (not below it) must still be accepted"
         );
     }
 

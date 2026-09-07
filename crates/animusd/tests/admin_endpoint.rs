@@ -2182,11 +2182,27 @@ async fn admin_credentials_put_on_a_follower_is_relayed_to_the_leader() {
 /// `POST /admin/control/transfer {to}` (ADR 0020/0037, roadmap U-05) moves
 /// control-plane leadership to another live voter — a standalone route
 /// alongside the leadership-transfer arm `control/member/remove`'s own
-/// self-removal path already had internally. Posts the transfer to the
-/// **current leader's** own admin address (local-control-leader-only, not
-/// relayed, mirroring every other `control/member/*` action), then polls
-/// (converged-or-timeout, per this crate's own testing discipline — never a
-/// fixed sleep) until the named target reports itself the control leader.
+/// self-removal path already had internally.
+///
+/// **Fixed contract (issue #688, 2026-09-07)**: `200` means `to` is
+/// genuinely the observed control leader, never merely "the old leader
+/// stepped down" — a *third* voter this call never named can win the
+/// election `TimeoutNow` triggers instead (root-caused in
+/// `crates/animusd/CLAUDE.md`'s matching entry: the old leader steps down
+/// on *any* higher-term Raft message, not only the target's own, and under
+/// real scheduling jitter — this test runs 3 real threads on however many
+/// cores the runner actually has — more than one follower's election timer
+/// can lapse on the same late heartbeats). So this test issues the `POST`
+/// against the **current** leader, and on either the pre-existing "not
+/// caught up yet" retryable 409 (issue #671) or the new "leadership moved
+/// to a different node" retryable 409 this fix adds, re-resolves the
+/// current leader (which may now be a different node) and retries the
+/// **whole call** against it — never a one-shot assert on the first
+/// accepted attempt, and never assuming the leader that first accepted the
+/// POST is still the leader by the time this loop notices a refusal. Only
+/// on `200` does it poll (converged-or-timeout, per this crate's own
+/// testing discipline) for the named target to report itself the control
+/// leader.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn admin_control_transfer_moves_leadership_to_the_named_node() {
     timeout(Duration::from_secs(30), async {
@@ -2200,19 +2216,30 @@ async fn admin_control_transfer_moves_leadership_to_the_named_node() {
             .expect("a control leader exists after bootstrap");
         let target = (0..nodes.len()).find(|&i| i != leader).unwrap();
         let target_id = config.nodes[target].id.clone();
-
-        // Right after bootstrap the named target may not have caught up to
-        // the leader's log yet, and the route answers that transient with a
-        // 409 whose message says "retry" — so this is a converged-or-timeout
-        // poll on the POST itself (issue #671), never a one-shot assert on
-        // the first answer. Anything other than 200 or that retryable 409
-        // is a real failure and stops the poll immediately.
         let body = serde_json::json!({"to": target_id}).to_string();
-        let leader_admin = nodes[leader].admin_addr();
-        let accepted = timeout(Duration::from_secs(10), async {
+
+        // Retry the whole call — re-resolving the current leader each time,
+        // never assuming it's still whoever it was on the previous
+        // iteration — against every retryable 409 this route can answer:
+        // the target hasn't caught up yet (issue #671), or a third voter
+        // won the election this call's own arm triggered (issue #688).
+        // Anything else (a 200, or a genuinely unexpected status) ends the
+        // loop immediately.
+        let accepted = timeout(Duration::from_secs(20), async {
             loop {
-                let (status, resp) =
-                    admin(leader_admin, "POST", "/admin/control/transfer", Some(&body)).await;
+                let Some(current_leader) = nodes.iter().position(Node::is_control_leader) else {
+                    // No stable leader observed this instant (an election
+                    // is in flight) — nothing to POST against yet.
+                    sleep(Duration::from_millis(50)).await;
+                    continue;
+                };
+                let (status, resp) = admin(
+                    nodes[current_leader].admin_addr(),
+                    "POST",
+                    "/admin/control/transfer",
+                    Some(&body),
+                )
+                .await;
                 match status {
                     200 => return resp,
                     409 if resp["error"].as_str().is_some_and(|e| e.contains("retry")) => {
@@ -2223,7 +2250,10 @@ async fn admin_control_transfer_moves_leadership_to_the_named_node() {
             }
         })
         .await
-        .expect("transfer was never accepted: the target never caught up within the bound");
+        .expect(
+            "transfer was never accepted: neither the target caught up nor did any node \
+             report the named target as the stable leader within the bound",
+        );
         assert_eq!(accepted["ok"], true, "response: {accepted}");
 
         timeout(Duration::from_secs(10), async {

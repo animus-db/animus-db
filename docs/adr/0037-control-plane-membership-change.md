@@ -441,3 +441,26 @@ the full route contract and the `AdminHost`-stack wiring (host trait
 method, dispatch match arm, `FakeHost` stub, handler) — this ADR is the
 one that owns `transfer_leadership` itself and the self-removal arm this
 route sits beside.
+
+## As-built (2026-09-07, issue #688) — success means the target, not just a step-down
+
+The route's own success criterion as described above — "this node confirmed
+stepping down" — turned out to be the wrong signal: `RaftCore::handle`'s
+generic higher-term step-down fires on *any* higher-term Raft message this
+node's own `transfer_leadership` arm doesn't control, so a *third* voter
+could win the election this arm's `TimeoutNow` triggered, and the route
+reported `200` regardless. Fixed in `ClientCtx::
+admin_transfer_control_leadership` — see ADR 0020's own matching
+2026-09-07 as-built note for the full route-level account (the corrected
+poll, the new distinct `409`, and the regression tests) and
+`crates/animus-control/CLAUDE.md`'s "Leadership transfer" entry for why
+`transfer_leadership` itself needed no change: it always stepped down on
+any higher-term contact by design (Raft §3.10 doesn't get to pick which
+higher-term voter it defers to), so this was purely a caller-side
+"what does success mean" bug in the admin route sitting on top of it, not a
+defect in the primitive this ADR owns. `crates/animus-control/tests/
+transfer_third_voter_wins.rs` is the new deterministic `SimEnv` proof that
+`transfer_leadership`'s own step-down behavior really does let a third
+voter win — driven directly against `RaftNode`, with no `animusd` route in
+the loop, confirming the race this fix has to tolerate is a real property
+of the primitive itself, not a testing artifact of the route above it.

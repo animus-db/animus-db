@@ -9909,6 +9909,31 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// - `target` is not currently a live voter (`self.control.config()`):
     ///   refused outright — there is nothing to transfer to.
     ///
+    /// **`200`/`Ok(())` means `target` genuinely leads — not merely "this
+    /// node stepped down" (issue #688, fixing a second failure mode #671
+    /// left standing after #405/#671's first fix).** Once armed, this node
+    /// keeps heartbeating every peer while the transfer is pending and steps
+    /// down on **any** higher-term vote, not only the target's own
+    /// (`RaftCore`'s own doc) — under real scheduling jitter a *third*
+    /// voter's election timer can lapse on the same late heartbeats and win
+    /// the resulting election before or instead of the named target. A bare
+    /// "this node is no longer leader" observation therefore cannot tell
+    /// "the requested transfer completed" from "a different election
+    /// superseded it," so the poll below keeps going after step-down,
+    /// reading this node's own `RaftCore::leader()` (its live, continuously-
+    /// updated consensus belief, not a one-shot snapshot) until it names
+    /// `target` specifically:
+    /// - `target` becomes the observed leader: `Ok(())`.
+    /// - this node has stepped down and observes a **different**, stable
+    ///   leader: a distinct retryable refusal naming that node, since the
+    ///   caller must retry the *whole call* against the actual leader's own
+    ///   admin port (this node no longer has a `RaftCore` capable of
+    ///   arming anything once it isn't the leader) — never conflated with
+    ///   the plain arm/timeout refusal below, which still means "retry here,
+    ///   nothing has moved."
+    /// - the poll runs out with no leader observed at all (still this node,
+    ///   or an ongoing election): the original bounded-timeout refusal.
+    ///
     /// Bounded by [`CONTROL_TRANSFER_POLL_TIMEOUT`], the identical budget
     /// `admin_remove_control_member`'s own self-removal arm polls against —
     /// a transfer that never completes in time surfaces as its own,
@@ -9940,15 +9965,44 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         }
         let deadline = tokio::time::Instant::now() + CONTROL_TRANSFER_POLL_TIMEOUT;
         loop {
-            if !leader.is_leader() {
+            // `leader.leader()` is this node's own live `RaftCore` belief,
+            // not a one-shot snapshot — it keeps updating after this node
+            // steps down (cleared to `None` the instant a higher term is
+            // observed, `Some(winner)` once a genuine `AppendEntries`/
+            // `InstallSnapshot` from that term's leader arrives), so it can
+            // name the actual election winner even once this node is no
+            // longer leader. It is only ever `Some(target)` once this node
+            // has genuinely stepped down (a leader's own core reports
+            // itself, never a peer's), so this can't fire prematurely while
+            // the transfer is still pending.
+            if leader.leader().as_ref() == Some(&target) {
                 return Ok(());
             }
             if tokio::time::Instant::now() >= deadline {
-                return Err(format!(
-                    "leadership transfer to node {target} did not complete within \
-                     {}s; retry",
-                    CONTROL_TRANSFER_POLL_TIMEOUT.as_secs()
-                ));
+                return Err(match leader.leader() {
+                    // Stepped down, and a *different* voter is the stable
+                    // leader — a third voter won the election this
+                    // transfer's own `TimeoutNow` triggered (issue #688).
+                    // The caller's only path forward is the whole call
+                    // again, against that node's own admin port — this
+                    // node no longer has a `RaftCore` capable of arming
+                    // anything once it isn't the leader.
+                    Some(other) => format!(
+                        "control leadership moved to node {other}, not the \
+                         requested target {target} — a different voter won \
+                         the election this transfer triggered; retry the \
+                         whole request against node {other}'s admin port"
+                    ),
+                    // Either still this node (the transfer never got as far
+                    // as a step-down) or a step-down with no stable winner
+                    // observed yet (an election still in flight) — the
+                    // original "did not complete" refusal covers both.
+                    None => format!(
+                        "leadership transfer to node {target} did not complete within \
+                         {}s; retry",
+                        CONTROL_TRANSFER_POLL_TIMEOUT.as_secs()
+                    ),
+                });
             }
             tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
         }
@@ -17180,6 +17234,37 @@ mod sim_cluster_corpus;
 /// `pub(crate)` surface, no further visibility widened).
 #[cfg(test)]
 mod sim_cluster_throttle;
+
+/// A first deterministic smoke over `SimClusterHandle::dynamo`/`SimCluster::
+/// dynamo` (ADR 0061 rung D2 PR 1) — the DynamoDB wire edge, decoded by
+/// `animus_dynamo::wire::decode_request` and run through `dynamo::
+/// dispatch_item_op`, the exact same generic core `dynamo::run_operation`'s
+/// own item-op arms call in production — driven against a real `SimCluster`
+/// for the first time. A sibling of `sim_cluster_corpus`/`sim_cluster_
+/// throttle` for the identical reason (needs `SimCluster`'s own
+/// `pub(crate)` surface). **Not** the full nemesis corpus (`check_cycles`/
+/// `check_durability`/`check_convergence`, a `Recorder`/`History` model, an
+/// `ANIMUS_DYNAMO_WIRE_SEEDS` depth knob, a `corpus-deep.yml` tier) — that
+/// is ADR 0061 rung D2's own PR 2, deliberately not built here (see this
+/// module's own doc for the full PR 2 plan).
+#[cfg(test)]
+mod sim_cluster_dynamo;
+
+/// The actual end-to-end DynamoDB-wire corpus (ADR 0061 rung D2 PR 2,
+/// C-04 D2 step 3) — [`sim_cluster_dynamo`]'s own "PR 2's plan" delivered:
+/// every op issued as a real DynamoDB JSON request through
+/// `SimClusterHandle::dynamo`, decoded back into the shared `animus_test::
+/// history` `Mop`/`History` model so `check_cycles`/`check_durability`/
+/// `check_convergence` run unchanged, mirroring `sim_cluster_corpus`'s own
+/// architecture exactly. A sibling of `sim_cluster_corpus`/
+/// `sim_cluster_throttle`/`sim_cluster_dynamo` for the identical reason
+/// (needs `SimCluster`'s own `pub(crate)` surface, no further visibility
+/// widened). See that module's own doc for the list-append-via-`UpdateItem`
+/// mapping, the `ConsistentRead` modeling decision, the cell list, and the
+/// `ANIMUS_DYNAMO_WIRE_SEEDS` depth knob. Run via `cargo test -p animusd
+/// --lib sim_cluster_dynamo_corpus`.
+#[cfg(test)]
+mod sim_cluster_dynamo_corpus;
 
 /// Regression for the issue #298 residual confirmed live under the
 /// un-pinned `SplitMode::InPlace` proof soak (ADR 0018's matching amendment,

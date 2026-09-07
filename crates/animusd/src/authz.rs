@@ -9,7 +9,8 @@
 
 use animus_control::{OpClass, Policy, TableMatch};
 use animus_dynamo::wire::{Operation, WireError};
-use animus_env::Metric;
+use animus_env::{Env, Metric};
+use animus_node::host::RelayClient;
 
 use crate::ClientCtx;
 
@@ -103,6 +104,37 @@ pub(crate) fn classify(op: &Operation) -> (&'static str, OpClass) {
         // three of them being mutations, and this PR's own ADR 0071
         // amendment for the full account.
         Operation::ExecuteStatement { .. } => ("ExecuteStatement", OpClass::Read),
+        // `BatchExecuteStatement` (ADR 0071, W-07 PR 4) carries a whole
+        // *array* of opaque, unparsed `statement` texts — exactly
+        // `ExecuteStatement`'s own "no catalog/parser access here" reason,
+        // just with more than one of them. This row stays `OpClass::Read`
+        // unconditionally for the identical reason (never revisited to
+        // distinguish a batch of mutations from a batch of reads) — it is
+        // NOT the real enforcement point. `authorize_op` (below) is a
+        // deliberate no-op for it too; real per-statement authorization
+        // happens inside `crate::dynamo::execute_one_batch_statement`, once
+        // each statement is individually parsed and its own table known —
+        // a `SELECT` gets an explicit `authz::authorize` call there; an
+        // `INSERT`/`UPDATE`/`DELETE` reuses `execute_statement`, whose own
+        // `INSERT`/`UPDATE`/`DELETE` branches already authorize through
+        // `run_operation`'s `authorize_op` call on the real, now-concrete
+        // `PutItem`/`UpdateItem`/`DeleteItem` operation.
+        Operation::BatchExecuteStatement { .. } => ("BatchExecuteStatement", OpClass::Read),
+        // `ExecuteTransaction` (ADR 0071, W-07 PR 5) is the identical shape
+        // one level up: `statements` is a list of opaque, unparsed PartiQL
+        // texts, so this function can't tell an all-`SELECT` transaction
+        // from an all-mutation one any more than `ExecuteStatement` can
+        // tell `SELECT` from `INSERT`/`UPDATE`/`DELETE`. Stays
+        // `OpClass::Read` unconditionally for the same reason — the real
+        // enforcement happens inside `crate::dynamo::execute_transaction`
+        // once every statement is parsed: an all-`SELECT` transaction calls
+        // `run_transact_get` (whose own `authz::authorize_each_table` uses
+        // `OpClass::Read`), and a write transaction calls `run_transact`
+        // (whose own `authorize_each_table` uses `OpClass::Write`) — both
+        // check every named table, whole-set, before anything runs.
+        // `authorize_op` (below) is a deliberate no-op for
+        // `ExecuteTransaction` for the identical reason.
+        Operation::ExecuteTransaction { .. } => ("ExecuteTransaction", OpClass::Read),
         Operation::DescribeTable { .. } => ("DescribeTable", OpClass::Read),
         Operation::DescribeTimeToLive { .. } => ("DescribeTimeToLive", OpClass::Read),
         Operation::ListTagsOfResource { .. } => ("ListTagsOfResource", OpClass::Read),
@@ -171,8 +203,8 @@ pub(crate) fn classify(op: &Operation) -> (&'static str, OpClass) {
 /// that isn't there. `ListBackups` with no `TableName` filter is an
 /// unscoped, cluster-wide read — allowed only to a credential whose own
 /// policy is `TableMatch::All` (see [`authorize_unscoped`]'s doc).
-pub(crate) fn authorize_op(
-    ctx: &ClientCtx,
+pub(crate) fn authorize_op<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     principal: &Principal,
     op: &Operation,
     meta: &animus_control::Metadata,
@@ -190,6 +222,29 @@ pub(crate) fn authorize_op(
         // `crate::dynamo::execute_statement` authorizes the real target
         // table itself, before any read runs, once parsing has resolved it.
         Operation::ExecuteStatement { .. } => Ok(()),
+
+        // `BatchExecuteStatement`'s own statements' tables are only known
+        // once each is individually parsed (ADR 0071, W-07 PR 4) — a
+        // deliberate no-op here too, joining `ExecuteStatement`'s group for
+        // the identical reason. `crate::dynamo::execute_one_batch_statement`
+        // authorizes each statement's real target table itself, once
+        // parsing has resolved it, and turns a denial into that one
+        // statement's own `AccessDenied` response entry rather than
+        // rejecting the whole batch — unlike `BatchGetItem`/`BatchWriteItem`
+        // above, which reject the whole request (ADR 0071's own "no
+        // cross-statement atomicity" contract extends to authorization too:
+        // one denied statement must not block its siblings).
+        Operation::BatchExecuteStatement { .. } => Ok(()),
+
+        // `ExecuteTransaction`'s tables are only known once every one of
+        // its statements is parsed (ADR 0071, W-07 PR 5) — this function
+        // runs before that parse, so it is a deliberate no-op here too,
+        // joining `ExecuteStatement`'s group. `crate::dynamo::
+        // execute_transaction` authorizes the real target tables itself
+        // (whole-set, via `authz::authorize_each_table` inside
+        // `run_transact`/`run_transact_get`), before any read/write runs,
+        // once parsing has resolved them.
+        Operation::ExecuteTransaction { .. } => Ok(()),
 
         Operation::ListTables { .. } | Operation::DescribeLimits | Operation::DescribeEndpoints => {
             Ok(())
@@ -297,8 +352,8 @@ pub(crate) fn authorize_op(
 /// per-table pre-checks) shares. `table: None` is a deliberate no-op (used
 /// only by [`authorize_op`]'s backup-id-keyed arms when the id doesn't
 /// resolve to a row yet) — never a security decision on its own.
-pub(crate) fn authorize(
-    ctx: &ClientCtx,
+pub(crate) fn authorize<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     principal: &Principal,
     op_name: &str,
     class: OpClass,
@@ -328,8 +383,8 @@ pub(crate) fn authorize(
 /// (`dynamo.rs`) to check **every** table a request names before any of its
 /// work runs, so a request spanning an allowed and a denied table is
 /// rejected whole rather than partially applied (ADR 0066 §5).
-pub(crate) fn authorize_each_table<'a>(
-    ctx: &ClientCtx,
+pub(crate) fn authorize_each_table<'a, E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     principal: &Principal,
     op_name: &str,
     class: OpClass,
@@ -349,8 +404,8 @@ pub(crate) fn authorize_each_table<'a>(
 /// `class`; a table-restricted policy can never safely answer "every
 /// backup of every table I might not even be allowed to see," so it is
 /// denied outright rather than silently narrowed.
-pub(crate) fn authorize_unscoped(
-    ctx: &ClientCtx,
+pub(crate) fn authorize_unscoped<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     principal: &Principal,
     op_name: &str,
     class: OpClass,
@@ -376,7 +431,7 @@ pub(crate) fn authorize_unscoped(
 /// `ClientCtx` reachable from the bound `dynamo` listener (combined/
 /// data-only nodes, ADR 0035 PR3) — the same structural guarantee
 /// `ClientCtx::describe_endpoints`'s own `ctx.data()` call relies on.
-fn record_denied(ctx: &ClientCtx) {
+fn record_denied<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>) {
     ctx.data().raftkv_metrics.incr(Metric::AuthDenied);
 }
 
@@ -400,7 +455,8 @@ mod tests {
     use animus_control::OpClass;
     use animus_dynamo::capacity::{ReturnConsumedCapacity, ReturnItemCollectionMetrics};
     use animus_dynamo::wire::{
-        BackupTypeFilter, Operation, ReturnValues, Select, UpdateReturnValues,
+        BackupTypeFilter, Operation, ReturnValues, ReturnValuesOnConditionCheckFailure, Select,
+        TransactStatementRequest, UpdateReturnValues,
     };
     use animus_item::{Item, TableSchema};
 
@@ -786,6 +842,51 @@ mod tests {
                     return_consumed_capacity: ReturnConsumedCapacity::None,
                 },
                 "ExecuteStatement",
+                OpClass::Read,
+            ),
+            // ADR 0071 (W-07 PR 4): `BatchExecuteStatement` classifies
+            // `OpClass::Read` unconditionally too, for the identical "opaque
+            // statement text, no catalog here" reason `ExecuteStatement`'s
+            // own cases above document — see `classify`'s own doc comment
+            // on this row.
+            (
+                Operation::BatchExecuteStatement {
+                    statements: vec![],
+                    return_consumed_capacity: ReturnConsumedCapacity::None,
+                },
+                "BatchExecuteStatement",
+                OpClass::Read,
+            ),
+            // ADR 0071 (W-07 PR 5): `ExecuteTransaction`'s own `classify`
+            // row has the identical "can't see inside opaque statement
+            // text" shape as `ExecuteStatement`'s row just above — an
+            // all-`SELECT` transaction and an all-mutation one both
+            // classify `OpClass::Read` here, real enforcement deferred to
+            // `dynamo::execute_transaction` once every statement is parsed.
+            (
+                Operation::ExecuteTransaction {
+                    statements: vec![TransactStatementRequest {
+                        statement: "SELECT * FROM t WHERE pk = ?".to_string(),
+                        parameters: vec![],
+                        rvocf: ReturnValuesOnConditionCheckFailure::None,
+                    }],
+                    token: None,
+                    return_consumed_capacity: ReturnConsumedCapacity::None,
+                },
+                "ExecuteTransaction",
+                OpClass::Read,
+            ),
+            (
+                Operation::ExecuteTransaction {
+                    statements: vec![TransactStatementRequest {
+                        statement: "INSERT INTO t VALUE {'pk':?}".to_string(),
+                        parameters: vec![],
+                        rvocf: ReturnValuesOnConditionCheckFailure::None,
+                    }],
+                    token: None,
+                    return_consumed_capacity: ReturnConsumedCapacity::None,
+                },
+                "ExecuteTransaction",
                 OpClass::Read,
             ),
             (Operation::DescribeLimits, "DescribeLimits", OpClass::Read),

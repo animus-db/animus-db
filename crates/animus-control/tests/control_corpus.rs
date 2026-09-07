@@ -363,8 +363,20 @@ enum Workload {
     /// shared tablet exists, every racer repeatedly proposes `BeginSplitInPlace`
     /// against it with a freshly-recomputed split key and freshly-recomputed
     /// child ids (again racing the same counter) until the parent leaves
-    /// `Active` (someone won) or the budget expires. See invariant #4
-    /// (allocator injectivity) and `check_allocator_injectivity` below.
+    /// `Active` (someone won) or the budget expires; the winner then drives
+    /// a THIRD phase (issue #684), repeatedly proposing `CutoverSplit`
+    /// until the parent vanishes from the map or the budget expires,
+    /// carrying the split all the way to completion rather than leaving it
+    /// permanently `Splitting`. Concurrently with all three phases, one
+    /// dedicated extra racer (`allocator_race_table_b_client`) races a
+    /// `CreateTablet` for a wholly SEPARATE, unrelated table against the
+    /// same allocator counter for the whole run — issue #684's own
+    /// interleaving (a fresh table's `CreateTablet` racing a concurrent
+    /// in-place fork's reserved-but-not-yet-materialized child id). See
+    /// invariant #4 (allocator injectivity) and `check_allocator_injectivity`
+    /// below, whose #684 layer asserts directly over this: an id, once
+    /// confirmed holding one table, is never later found holding a
+    /// different one.
     AllocatorRace { proposers: usize },
     /// `registrants` concurrent clients, each claiming its OWN distinct new
     /// node id via `MetaCommand::RegisterNode` (lifting
@@ -826,6 +838,15 @@ struct Shared {
     /// present, byte-identical, in `Metadata::node_addrs` in the final
     /// converged state.
     confirmed_registrations: Mutex<Vec<(NodeId, NodeAddrs)>>,
+    /// Issue #684: `(TabletId, table)` pairs a proposer's own confirm loop
+    /// actually observed win — `AllocatorRace`'s own table-A phase 1 win,
+    /// or `allocator_race_table_b_client`'s table-B win. `check_allocator_
+    /// injectivity` walks this against the final converged state to assert
+    /// the specific #684 invariant directly, in addition to (never instead
+    /// of) `tablet_fingerprints`' already-general table-inclusive
+    /// fingerprint check: an id, once confirmed holding one table, must
+    /// never later be found holding a DIFFERENT table.
+    confirmed_tablet_tables: Mutex<Vec<(TabletId, String)>>,
 }
 
 /// `(table, range.start, range.end)` — a tablet's identity for the
@@ -845,6 +866,7 @@ impl Shared {
             injectivity_violations: Mutex::new(Vec::new()),
             register_attempts: Mutex::new(Vec::new()),
             confirmed_registrations: Mutex::new(Vec::new()),
+            confirmed_tablet_tables: Mutex::new(Vec::new()),
         }
     }
 
@@ -868,6 +890,15 @@ impl Shared {
 
     fn confirm_tablet_id(&self, id: TabletId) {
         self.confirmed_tablet_ids.lock().unwrap().push(id);
+    }
+
+    /// Issue #684: record that `id` was durably confirmed holding `table` —
+    /// see `confirmed_tablet_tables`'s own doc.
+    fn confirm_tablet_table(&self, id: TabletId, table: String) {
+        self.confirmed_tablet_tables
+            .lock()
+            .unwrap()
+            .push((id, table));
     }
 
     fn record_register_attempt(&self, node: NodeId, addrs: &NodeAddrs) {
@@ -1085,8 +1116,11 @@ impl Group {
     }
 
     /// `proposers` concurrent racers, all hammering ONE shared table/tablet
-    /// — see [`Workload::AllocatorRace`]'s own doc for the two-phase shape
-    /// each `allocator_race_client` drives.
+    /// — see [`Workload::AllocatorRace`]'s own doc for the three-phase
+    /// shape each `allocator_race_client` drives — PLUS (issue #684) one
+    /// dedicated `allocator_race_table_b_client` racing a wholly separate
+    /// table's own `CreateTablet` against the SAME allocator counter for
+    /// the whole run.
     fn spawn_allocator_race_workload(&mut self, proposers: usize) {
         let group_ids: Vec<NodeId> = GROUP_IDS[..self.replicas]
             .iter()
@@ -1102,6 +1136,13 @@ impl Group {
                 allocator_race_client(env, nodes, shared, p, replicas).await;
             });
         }
+        let env = self.sim.env(nid(ALLOCATOR_RACE_TABLE_B_CLIENT_ID));
+        let nodes = Arc::clone(&self.nodes);
+        let shared = Arc::clone(&self.shared);
+        let replicas = group_ids;
+        env.clone().spawn_task(async move {
+            allocator_race_table_b_client(env, nodes, shared, replicas).await;
+        });
     }
 
     /// `registrants` concurrent clients, each on its own never-faulted
@@ -1342,6 +1383,22 @@ async fn plain_churn_client(
 /// `CreateTablet` against — see [`Workload::AllocatorRace`]'s own doc.
 const ALLOCATOR_RACE_TABLE: &str = "ks.alloc_race";
 
+/// Issue #684: the SECOND, wholly unrelated table name
+/// `allocator_race_table_b_client` races a fresh `CreateTablet` for,
+/// concurrently with `ALLOCATOR_RACE_TABLE`'s own in-flight
+/// `BeginSplitInPlace` + `CutoverSplit` — the production interleaving that
+/// caused #684 (table A's split reserving a child id well before
+/// `CutoverSplit` ever materializes a row for it, while table B's own
+/// `CreateTablet` races off a metadata read that predates the reservation).
+const ALLOCATOR_RACE_TABLE_B: &str = "ks.alloc_race_b";
+
+/// Env id `allocator_race_table_b_client` runs on. Disjoint from
+/// `CLIENT_IDS` (`AllocatorRace`'s largest cell uses 4 proposers, i.e.
+/// `CLIENT_IDS[0..4]` — index 4 is free, but a fixed id outside the array
+/// entirely costs nothing and never needs re-checking if a future cell
+/// raises the proposer count) and from `RegisterCas`'s own `950+` range.
+const ALLOCATOR_RACE_TABLE_B_CLIENT_ID: u64 = 199;
+
 /// One `AllocatorRace` proposer. Phase 1: repeatedly recomputes a candidate
 /// tablet id from the current leader's own `next_free_tablet_id()` and
 /// proposes `CreateTablet` for the ONE shared table (`ALLOCATOR_RACE_TABLE`)
@@ -1399,6 +1456,7 @@ async fn allocator_race_client(
             if let Some((&id, _)) = meta.tablets_for_table(&table).next() {
                 if id == candidate {
                     shared.confirm_tablet_id(id);
+                    shared.confirm_tablet_table(id, table.clone());
                 }
                 parent = Some(id);
             }
@@ -1410,7 +1468,8 @@ async fn allocator_race_client(
 
     // --- Phase 2: race BeginSplitInPlace against the shared parent. ---
     let phase2_deadline = env.now().0 + OP_BUDGET.as_nanos() as u64;
-    while env.now().0 < phase2_deadline {
+    let mut won: Option<(TabletId, TabletId)> = None;
+    while env.now().0 < phase2_deadline && won.is_none() {
         let Some((_, node)) = leader_slot(&nodes) else {
             env.sleep(POLL).await;
             continue;
@@ -1451,6 +1510,98 @@ async fn allocator_race_client(
             {
                 shared.confirm_tablet_id(left);
                 shared.confirm_tablet_id(right);
+                won = Some((left, right));
+            }
+        }
+    }
+    let Some((left, right)) = won else {
+        return; // never won the split race within budget
+    };
+
+    // --- Phase 3 (issue #684): the winner drives the split all the way to
+    //     completion via `CutoverSplit` — closing the loop end-to-end
+    //     rather than leaving the parent `Splitting` forever, so
+    //     `allocator_race_table_b_client`'s concurrent fresh-table
+    //     `CreateTablet` races get a genuine window where `left`/`right`
+    //     turn from a bare reservation into real, materialized tablet-map
+    //     rows — exactly the moment issue #684's `CutoverSplit` overwrite
+    //     used to strike. Re-issued every tick until the parent vanishes
+    //     from the map (or the budget expires), mirroring `animusd`'s own
+    //     `inplace_split_driver_tick` confirm-by-observation discipline —
+    //     see that function's own doc.
+    let phase3_deadline = env.now().0 + OP_BUDGET.as_nanos() as u64;
+    while env.now().0 < phase3_deadline {
+        let Some((_, node)) = leader_slot(&nodes) else {
+            env.sleep(POLL).await;
+            continue;
+        };
+        let meta = node.metadata();
+        let Some(source) = meta.tablets.get(&parent) else {
+            // Cutover landed: the parent is retired and left/right are now
+            // real, materialized rows — table-stable from here on, exactly
+            // what `check_allocator_injectivity` verifies.
+            shared.confirm_tablet_table(left, table.clone());
+            shared.confirm_tablet_table(right, table.clone());
+            return;
+        };
+        node.propose(MetaCommand::CutoverSplit {
+            parent,
+            expected_epoch: source.epoch,
+            cutover_wall_ms: env.now().0 / 1_000_000,
+        });
+        env.sleep(POLL).await;
+    }
+}
+
+/// Issue #684's own racer: repeatedly recomputes a candidate id from the
+/// current leader's own `next_free_tablet_id()` and proposes `CreateTablet`
+/// for `ALLOCATOR_RACE_TABLE_B` — a table wholly unrelated to
+/// `ALLOCATOR_RACE_TABLE` — for the FULL combined duration of
+/// `allocator_race_client`'s three phases (not gated on table A's own
+/// progress at all, unlike those racers), so it stays live throughout table
+/// A's `CreateTablet`/`BeginSplitInPlace`/`CutoverSplit` race and can
+/// genuinely compute the identical candidate id one of table A's
+/// reserved-but-not-yet-materialized children holds — exactly #684's own
+/// interleaving. Confirms by content (its own candidate actually seated as
+/// table B's tablet) and records the `(id, table)` pair
+/// `check_allocator_injectivity` asserts stays stable forever after: an id
+/// once confirmed holding one table must never later be found holding a
+/// different one.
+async fn allocator_race_table_b_client(
+    env: SimEnv,
+    nodes: Nodes,
+    shared: Arc<Shared>,
+    replicas: Vec<NodeId>,
+) {
+    let table = ALLOCATOR_RACE_TABLE_B.to_string();
+    // Table A's own race runs at most three back-to-back `OP_BUDGET`
+    // windows (Phase 1 + Phase 2 + Phase 3) — stay live for all of them so
+    // this racer's own attempts can land at any point across the whole
+    // reserve → materialize timeline, not just the earliest slice of it.
+    let deadline = env.now().0 + 3 * OP_BUDGET.as_nanos() as u64;
+    while env.now().0 < deadline {
+        let Some((_, node)) = leader_slot(&nodes) else {
+            env.sleep(POLL).await;
+            continue;
+        };
+        if node.metadata().tablets_for_table(&table).next().is_some() {
+            return; // already won earlier — nothing left to race
+        }
+        let candidate = node.metadata().next_free_tablet_id();
+        node.propose(MetaCommand::CreateTablet {
+            tablet: candidate,
+            table: Some(table.clone()),
+            range: KeyRange::whole(),
+            replicas: replicas.clone(),
+        });
+        env.sleep(POLL).await;
+        if let Some((_, node)) = leader_slot(&nodes) {
+            let meta = node.metadata();
+            if let Some((&id, _)) = meta.tablets_for_table(&table).next()
+                && id == candidate
+            {
+                shared.confirm_tablet_id(id);
+                shared.confirm_tablet_table(id, table.clone());
                 return;
             }
         }
@@ -1584,21 +1735,33 @@ fn check_durability_meta(shared: &Shared, reference: &Metadata) -> Verdict {
         }
     }
     for id in shared.confirmed_tablet_ids.lock().unwrap().iter() {
-        // Phase 1's shared-parent id always gets its own materialized
-        // tablet-map row. Phase 2's split `left`/`right` ids never do under
-        // `BeginSplitInPlace` — this workload only ever proposes
-        // `BeginSplitInPlace`, never the `CutoverSplit` that would
-        // materialize them — so "still present" for one of THOSE ids means
-        // its own parent still carries an `inplace_split` intent naming it
-        // (which, once won, is permanent for the life of this scenario: no
-        // other `BeginSplitInPlace` can land on a non-`Active` parent, and
-        // nothing here ever cuts over).
+        // Phase 1's shared-parent id gets its own materialized tablet-map
+        // row — UNTIL a completed Phase 3 (issue #684) `CutoverSplit`
+        // legitimately retires it (`Metadata::apply`'s `CutoverSplit` arm
+        // removes the parent's row once its two children are minted): a
+        // parent id consumed by a split it itself intended is not a lost
+        // effect, so `split_lineage` recording it as some child's `parent`
+        // counts as "still present" too. Phase 2's split `left`/`right` ids
+        // start out unmaterialized under `BeginSplitInPlace` alone — the
+        // winner's own Phase 3 drives a `CutoverSplit` to completion given
+        // enough budget/quorum, at which point they become ordinary
+        // materialized rows — but a scenario's fault schedule can still
+        // leave Phase 3 unfinished at drain time (a `StopRestart`/partition
+        // landing mid-Phase-3, or the budget simply expiring first), so
+        // "still present" for one of those ids also accepts its own parent
+        // still carrying an `inplace_split` intent naming it (which, once
+        // won, is permanent for the life of this scenario: no other
+        // `BeginSplitInPlace` can land on a non-`Active` parent).
         let still_present = reference.tablets.contains_key(id)
             || reference.tablets.values().any(|t| {
                 t.inplace_split
                     .as_ref()
                     .is_some_and(|intent| intent.children.iter().any(|c| c.id == *id))
-            });
+            })
+            || reference
+                .split_lineage
+                .values()
+                .any(|lineage| lineage.parent == *id);
         if !still_present {
             violations.push(format!(
                 "confirmed tablet id {id:?} (AllocatorRace) lost from final state"
@@ -1690,8 +1853,36 @@ fn check_schema_exclusivity(shared: &Shared, metas: &[Metadata]) -> Verdict {
 /// content-aware check that actually distinguishes a benign shared
 /// confirmation from a genuine same-id-different-content collision, so it
 /// alone is invariant #4's teeth.
-fn check_allocator_injectivity(shared: &Shared) -> Verdict {
-    verdict(shared.injectivity_violations.lock().unwrap().clone())
+///
+/// **Issue #684's own teeth, layered on top**: for every `(id, table)` a
+/// racer's own confirm loop durably observed win (`shared.
+/// confirmed_tablet_tables` — `AllocatorRace`'s table-A win and
+/// `allocator_race_table_b_client`'s table-B win alike), the id's table in
+/// the FINAL converged state — if the id is still present there at all —
+/// must still be that SAME table. This is deliberately a second,
+/// independent assertion over `metas` rather than relying solely on
+/// `tablet_fingerprints`' sample-based check above: a same-tick
+/// reserve-then-overwrite (exactly #684's own shape — `CutoverSplit`
+/// landing in the same apply batch a sample never gets to observe the
+/// intermediate state of) could in principle race between two
+/// `sample_tablets` calls, while this check only needs the durably
+/// confirmed fact and the final state, no sampling window to slip through
+/// at all.
+fn check_allocator_injectivity(shared: &Shared, metas: &[Metadata]) -> Verdict {
+    let mut violations = shared.injectivity_violations.lock().unwrap().clone();
+    let reference = &metas[0];
+    for (id, table) in shared.confirmed_tablet_tables.lock().unwrap().iter() {
+        if let Some(t) = reference.tablets.get(id)
+            && t.table.as_deref() != Some(table.as_str())
+        {
+            violations.push(format!(
+                "tablet id {id:?} confirmed holding table {table:?} now holds a DIFFERENT \
+                 table {:?} (issue #684: an id must never change owning table)",
+                t.table
+            ));
+        }
+    }
+    verdict(violations)
 }
 
 /// `RegisterCas` integrity, mirroring `check_schema_exclusivity`'s shape
@@ -1902,7 +2093,7 @@ fn run_scenario(scenario: &Scenario) -> ScenarioResult {
 
     let durability = check_durability_meta(&group.shared, &metas[0]);
     let exclusivity = check_schema_exclusivity(&group.shared, &metas);
-    let allocator_injectivity = check_allocator_injectivity(&group.shared);
+    let allocator_injectivity = check_allocator_injectivity(&group.shared, &metas);
     let register_cas_integrity = check_register_cas_integrity(&group.shared, &metas);
     let apply_task_progress = poll_apply_task_caught_up(&group.nodes, group.sim.clone());
     let schema_attempts = group.shared.schema_attempts.lock().unwrap().clone();

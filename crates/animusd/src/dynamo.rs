@@ -176,7 +176,7 @@ use animus_dynamo::capacity::{
 use animus_dynamo::partiql;
 use animus_dynamo::wire::{
     self, MAX_GSI_PER_TABLE, Operation, Projection, ReturnValues, ScanSegment, Select,
-    TransactAction, TransactGet, UpdateAction, WireError, WriteRequest,
+    TransactAction, TransactGet, TransactStatementRequest, UpdateAction, WireError, WriteRequest,
 };
 use animus_dynamo::{
     AttributeValue, ChangeRecord, Comparator, ConditionExpression, Item, SortKeyCondition,
@@ -253,7 +253,7 @@ const TRANSACT_GET_POLL: Duration = Duration::from_millis(20);
 /// growth node (ADR 0030) this is the difference between resolving a table's
 /// schema at all and a permanently-empty local view, since that node's own
 /// control raft never replicates.
-fn metadata(ctx: &ClientCtx) -> Metadata {
+fn metadata<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>) -> Metadata {
     ctx.effective_metadata()
 }
 
@@ -262,7 +262,7 @@ fn metadata(ctx: &ClientCtx) -> Metadata {
 /// must observe its own just-proposed command (or a concurrent writer's)
 /// landing in the authoritative state: the `CreateTable` commit-wait loops
 /// below, and [`quorum_read`]'s live re-check on a snapshot miss.
-async fn metadata_fresh(ctx: &ClientCtx) -> Metadata {
+async fn metadata_fresh<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>) -> Metadata {
     ctx.metadata_fresh().await
 }
 
@@ -287,7 +287,11 @@ pub(crate) fn schema_for(meta: &Metadata, table: &str) -> TableSchema {
 /// process-local memory. A table absent from the catalog is left untouched here
 /// (the read path then reports it unknown; the write path legacy-registers it via
 /// [`legacy_register`]).
-fn mirror_catalog_schema(ctx: &ClientCtx, meta: &Metadata, table: &str) {
+fn mirror_catalog_schema<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+    meta: &Metadata,
+    table: &str,
+) {
     if meta.has_table_schema(table) {
         let schema = schema_for(meta, table);
         let indexes = schema_bridge::indexes_to_dynamo(meta.table_indexes(table));
@@ -308,7 +312,7 @@ fn mirror_catalog_schema(ctx: &ClientCtx, meta: &Metadata, table: &str) {
 /// optional) if it is in neither the catalog nor the registry — so a
 /// pre-`CreateTable` client's writes keep working unchanged and their keys get
 /// tracked for `Query`/`Scan`.
-fn legacy_register(ctx: &ClientCtx, meta: &Metadata, table: &str) {
+fn legacy_register<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>, meta: &Metadata, table: &str) {
     if meta.has_table_schema(table) {
         return; // a real CreateTable'd table; mirror it instead
     }
@@ -327,8 +331,8 @@ fn legacy_register(ctx: &ClientCtx, meta: &Metadata, table: &str) {
 /// by the *write/point* paths (Put/Get/Delete/Update), which auto-register a
 /// legacy table — so an unknown table reads back as empty rather than erroring,
 /// matching the prior behavior.
-fn resolve_key(
-    ctx: &ClientCtx,
+fn resolve_key<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     meta: &Metadata,
     table: &str,
     item: &Item,
@@ -720,6 +724,324 @@ async fn run_operation(
             exclusive_start_table_name,
             limit,
         } => list_tables(meta, exclusive_start_table_name.as_deref(), limit),
+        // ADR 0061 rung D2 PR 1: these six operations' bodies moved to
+        // `dispatch_item_op` — the shared, generic (`ClientCtx<E, R>`) core
+        // both this concrete dispatcher and the SimEnv-capable
+        // `execute_item_op_as` call, so `run_operation`'s own production
+        // behavior for them is byte-identical (this arm's call is
+        // monomorphized at `E = ProdEnv, R = AnimusdRelayClient`, same as
+        // every other call in this function). See `dispatch_item_op`'s own
+        // doc for the full "what moved, what's still `ProdEnv`-only, why"
+        // account.
+        //
+        // `Query`/`Scan` deliberately are NOT in this set: `dispatch_item_op`
+        // covers only a *base-table* `Query`/`Scan` (see its own doc for
+        // why GSI/LSI aren't generic yet) — routing `run_operation`'s own
+        // production dispatch through it would have silently dropped GSI/
+        // LSI `Query`/`Scan` support (caught live: `index_drain.rs`'s own
+        // `gsi_drain_cursor_tests` failed on exactly this before this
+        // comment existed). `Query`/`Scan` below still call the full,
+        // unmodified, still-concrete [`run_query`]/[`run_scan`] — the ones
+        // with the real `run_index_query`/`run_gsi_query`/`run_lsi_query`/
+        // `run_index_scan`/`run_gsi_scan`/`run_lsi_scan` dispatch — exactly
+        // as before this rung.
+        op @ (Operation::PutItem { .. }
+        | Operation::DeleteItem { .. }
+        | Operation::GetItem { .. }
+        | Operation::BatchGetItem { .. }
+        | Operation::UpdateItem { .. }
+        | Operation::BatchWriteItem { .. }) => dispatch_item_op(ctx, principal, meta, op).await,
+        Operation::Query {
+            table,
+            index,
+            partition_attr,
+            partition_value,
+            sort_attr,
+            sort_condition,
+            limit,
+            exclusive_start_key,
+            scan_index_forward,
+            filter,
+            projection,
+            select,
+            consistent_read,
+        } => {
+            run_query(
+                ctx,
+                meta,
+                &table,
+                index.as_deref(),
+                &partition_attr,
+                &partition_value,
+                sort_attr.as_deref(),
+                sort_condition.as_ref(),
+                limit,
+                exclusive_start_key,
+                scan_index_forward,
+                filter.as_ref(),
+                projection.as_ref(),
+                select,
+                consistent_read,
+            )
+            .await
+        }
+        Operation::Scan {
+            table,
+            index,
+            limit,
+            exclusive_start_key,
+            filter,
+            projection,
+            select,
+            segment,
+            consistent_read,
+        } => {
+            run_scan(
+                ctx,
+                meta,
+                &table,
+                index.as_deref(),
+                limit,
+                exclusive_start_key,
+                filter.as_ref(),
+                projection.as_ref(),
+                select,
+                segment,
+                consistent_read,
+            )
+            .await
+        }
+        Operation::ExecuteStatement {
+            statement,
+            parameters,
+            consistent_read,
+            next_token,
+            limit,
+            return_consumed_capacity: _,
+        } => {
+            execute_statement(
+                ctx,
+                meta,
+                principal,
+                &statement,
+                &parameters,
+                consistent_read,
+                next_token.as_deref(),
+                limit,
+            )
+            .await
+        }
+        Operation::BatchExecuteStatement {
+            statements,
+            return_consumed_capacity: _,
+        } => run_batch_execute_statement(ctx, meta, principal, &statements).await,
+        Operation::TransactWriteItems { actions, token } => {
+            // Unlike the old serial-loop implementation, atomicity now comes
+            // from `ClientCtx::cp_txn` (a real cross-tablet 2PC), not this
+            // node's `rmw_lock` — `run_transact` still takes it across its own
+            // pre-read/evaluate pass (mirroring every other conditional write
+            // here) so two transactions on this node can't interleave their
+            // condition checks, but the lock is not what makes the *commit*
+            // atomic.
+            run_transact(ctx, principal, meta, &actions, token.as_deref()).await
+        }
+        Operation::TransactGetItems { gets } => run_transact_get(ctx, principal, meta, &gets).await,
+        Operation::ExecuteTransaction {
+            statements,
+            token,
+            return_consumed_capacity: _,
+        } => execute_transaction(ctx, principal, meta, &statements, token.as_deref()).await,
+        Operation::UpdateTimeToLive {
+            table,
+            attribute_name,
+            enabled,
+        } => update_time_to_live(ctx, &table, &attribute_name, enabled).await,
+        Operation::DescribeTimeToLive { table } => describe_time_to_live(ctx, meta, &table),
+        Operation::UpdateContinuousBackups { table, enabled } => {
+            update_continuous_backups(ctx, &table, enabled).await
+        }
+        Operation::DescribeContinuousBackups { table } => {
+            describe_continuous_backups(ctx, meta, &table)
+        }
+        Operation::CreateBackup { table, backup_name } => {
+            create_backup(ctx, &table, &backup_name).await
+        }
+        Operation::DescribeBackup { backup_arn } => describe_backup(meta, &backup_arn),
+        Operation::ListBackups {
+            table,
+            limit,
+            exclusive_start_backup_arn,
+            time_range_lower_bound_ms,
+            time_range_upper_bound_ms,
+            backup_type,
+        } => list_backups(
+            meta,
+            table.as_deref(),
+            limit,
+            exclusive_start_backup_arn.as_deref(),
+            time_range_lower_bound_ms,
+            time_range_upper_bound_ms,
+            backup_type,
+        ),
+        Operation::DeleteBackup { backup_arn } => delete_backup(ctx, &backup_arn).await,
+        Operation::ExportTableToPointInTime {
+            table,
+            table_arn,
+            s3_bucket,
+            s3_prefix,
+            export_time_ms,
+            client_token,
+        } => {
+            create_export(
+                ctx,
+                &table,
+                &table_arn,
+                &s3_bucket,
+                s3_prefix.as_deref(),
+                export_time_ms,
+                client_token.as_deref(),
+            )
+            .await
+        }
+        Operation::DescribeExport { export_arn } => describe_export(meta, &export_arn),
+        Operation::ListExports {
+            table_arn,
+            max_results,
+            next_token,
+        } => list_exports(
+            meta,
+            table_arn.as_deref(),
+            max_results,
+            next_token.as_deref(),
+        ),
+        Operation::ImportTable {
+            s3_bucket,
+            s3_prefix,
+            input_compression,
+            table_creation_params,
+            client_token,
+        } => {
+            create_import(
+                ctx,
+                &s3_bucket,
+                s3_prefix.as_deref(),
+                input_compression,
+                &table_creation_params,
+                client_token.as_deref(),
+            )
+            .await
+        }
+        Operation::DescribeImport { import_arn } => describe_import(meta, &import_arn),
+        Operation::ListImports {
+            table_arn,
+            page_size,
+            next_token,
+        } => list_imports(meta, table_arn.as_deref(), page_size, next_token.as_deref()),
+        Operation::RestoreTableFromBackup {
+            backup_arn,
+            target_table_name,
+            global_secondary_index_override,
+        } => {
+            restore_table_from_backup(
+                ctx,
+                &backup_arn,
+                &target_table_name,
+                global_secondary_index_override.as_deref(),
+            )
+            .await
+        }
+        Operation::RestoreTableToPointInTime {
+            source_table_name,
+            target_table_name,
+            restore_date_time_ms,
+            use_latest_restorable_time,
+            global_secondary_index_override,
+        } => {
+            restore_table_to_point_in_time(
+                ctx,
+                &source_table_name,
+                &target_table_name,
+                restore_date_time_ms,
+                use_latest_restorable_time,
+                global_secondary_index_override.as_deref(),
+            )
+            .await
+        }
+        Operation::TagResource { table, tags } => tag_resource(ctx, &table, &tags).await,
+        Operation::UntagResource { table, tag_keys } => {
+            untag_resource(ctx, &table, &tag_keys).await
+        }
+        Operation::ListTagsOfResource { table } => list_tags_of_resource(ctx, meta, &table),
+        Operation::DescribeLimits => describe_limits(),
+        Operation::DescribeEndpoints => describe_endpoints(ctx),
+    }
+}
+
+/// A [`WireError`] for an operation [`dispatch_item_op`] does not (yet)
+/// cover — ADR 0061 rung D2 PR 1's own deliberate scope cut, not a bug: the
+/// caller's own request is well-formed, this generic dispatch path just
+/// doesn't run it yet. `op_name` names the specific gap (e.g. `"GSI/LSI
+/// Query"`, `"TransactWriteItems"`) so the message is actionable rather than
+/// a bare "unsupported."
+fn unsupported_by_generic_dispatch(op_name: &str) -> WireError {
+    WireError {
+        code: "InternalServerError",
+        message: format!(
+            "{op_name} is not yet supported by the generic (SimEnv-capable) dispatch \
+             path — see ADR 0061 rung D2's PR 2/3 plan"
+        ),
+        reasons: None,
+    }
+}
+
+/// The item/query/write-batch operation core (ADR 0061 rung D2 PR 1),
+/// generic over `E: Env`/`R: RelayClient` so it runs against any
+/// [`ClientCtx`], including a `SimEnv`-backed one — the piece that lets a
+/// DynamoDB wire request decoded by [`wire::decode_request`] execute
+/// through the exact same handlers production uses, from inside
+/// `SimCluster` (`sim_cluster_dynamo.rs`).
+///
+/// **Covers exactly eight operations**: `PutItem`, `DeleteItem`, `GetItem`,
+/// `BatchGetItem`, a **base-table-only** `Query`/`Scan` (an `index` name
+/// returns [`unsupported_by_generic_dispatch`] — genericizing `run_query`/
+/// `run_scan` themselves would also require their own `run_index_query`/
+/// `run_gsi_query`/`run_lsi_query`/`run_index_scan`/`run_gsi_scan`/
+/// `run_lsi_scan`/`paginated_kind_examine`/`paginated_kind_examine_one`
+/// siblings, pushing this PR's signature count from ~23 into the mid-30s —
+/// deferred to PR 2/3, see this module's own top-of-crate `CLAUDE.md` entry
+/// for the sizing), `UpdateItem`, and `BatchWriteItem`. Every other
+/// [`Operation`] variant — `TransactWriteItems`/`TransactGetItems` (their
+/// `ClientRequestToken` idempotency preflight auto-provisions the internal
+/// idempotency table via `ClientCtx::propose_schema`, whose relayed path
+/// under a genuine multi-voter `SimEnv` control quorum has never been
+/// proven end-to-end — ADR 0061 rung D1's own "what remains unexercised"
+/// note), `ExecuteStatement`/`BatchExecuteStatement`/`ExecuteTransaction`
+/// (PartiQL — no new logic of their own, but they'd need every operation
+/// they can lower onto, i.e. all of the above, generic first), and every
+/// DDL/backup/export/import operation (genuinely `ProdEnv`-only: a real
+/// `TcpListener`-free control-plane relay is fine, but backup/export use
+/// `tokio::spawn` for their own async job and `ctx.env.wall_now()` alone
+/// isn't the blocker there — their own catalog rows and janitor loops are
+/// simply out of this rung's brief, "item/query/transaction operations, not
+/// export/import/backup") — all fall through to the catch-all arm's
+/// [`unsupported_by_generic_dispatch`].
+///
+/// **Called from two places**: [`run_operation`]'s own combined match arm
+/// above (already past its own `metadata`/`reject_internal_table`/
+/// `authz::authorize_op` prelude — this function does not repeat any of
+/// that, `meta` is simply threaded through) and [`execute_item_op_as`]
+/// (which runs that identical prelude itself first, since it has no
+/// `run_operation` wrapping it). Production behavior is unchanged: the
+/// `run_operation` call site is monomorphized at `E = ProdEnv, R =
+/// AnimusdRelayClient`, the same concrete instantiation the removed inline
+/// arms ran as before this rung — this is a pure move, not a rewrite.
+async fn dispatch_item_op<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+    principal: &Principal,
+    meta: &Metadata,
+    op: Operation,
+) -> Result<String, WireError> {
+    match op {
         Operation::PutItem {
             table,
             item,
@@ -960,14 +1282,31 @@ async fn run_operation(
             select,
             consistent_read,
         } => {
-            run_query(
+            // ADR 0061 rung D2 PR 1: only the base-table path is generic so
+            // far — see this function's own doc.
+            if index.is_some() {
+                return Err(unsupported_by_generic_dispatch("a GSI/LSI Query"));
+            }
+            mirror_catalog_schema(ctx, meta, &table);
+            let base = schema_for(meta, &table);
+            validate_key_condition_names(
+                &base.partition_key,
+                base.sort_key.as_deref(),
+                &partition_attr,
+                sort_attr.as_deref(),
+            )?;
+            if let Some(cond) = &sort_condition {
+                let declared = base
+                    .sort_key
+                    .as_deref()
+                    .and_then(|sk| declared_sort_key_type(meta, &table, sk));
+                validate_sort_condition_type(declared.as_deref(), cond)?;
+            }
+            run_base_query(
                 ctx,
                 meta,
                 &table,
-                index.as_deref(),
-                &partition_attr,
                 &partition_value,
-                sort_attr.as_deref(),
                 sort_condition.as_ref(),
                 limit,
                 exclusive_start_key,
@@ -975,7 +1314,7 @@ async fn run_operation(
                 filter.as_ref(),
                 projection.as_ref(),
                 select,
-                consistent_read,
+                ReadConsistency::from_consistent_read(consistent_read),
             )
             .await
         }
@@ -990,38 +1329,23 @@ async fn run_operation(
             segment,
             consistent_read,
         } => {
-            run_scan(
+            // See the `Query` arm above for why a named index isn't
+            // supported by this generic path yet.
+            if index.is_some() {
+                return Err(unsupported_by_generic_dispatch("a GSI/LSI Scan"));
+            }
+            mirror_catalog_schema(ctx, meta, &table);
+            run_base_scan(
                 ctx,
                 meta,
                 &table,
-                index.as_deref(),
                 limit,
                 exclusive_start_key,
                 filter.as_ref(),
                 projection.as_ref(),
                 select,
                 segment,
-                consistent_read,
-            )
-            .await
-        }
-        Operation::ExecuteStatement {
-            statement,
-            parameters,
-            consistent_read,
-            next_token,
-            limit,
-            return_consumed_capacity: _,
-        } => {
-            execute_statement(
-                ctx,
-                meta,
-                principal,
-                &statement,
-                &parameters,
-                consistent_read,
-                next_token.as_deref(),
-                limit,
+                ReadConsistency::from_consistent_read(consistent_read),
             )
             .await
         }
@@ -1208,140 +1532,59 @@ async fn run_operation(
             }
             Ok(wire::batch_write_response(&unprocessed))
         }
-        Operation::TransactWriteItems { actions, token } => {
-            // Unlike the old serial-loop implementation, atomicity now comes
-            // from `ClientCtx::cp_txn` (a real cross-tablet 2PC), not this
-            // node's `rmw_lock` — `run_transact` still takes it across its own
-            // pre-read/evaluate pass (mirroring every other conditional write
-            // here) so two transactions on this node can't interleave their
-            // condition checks, but the lock is not what makes the *commit*
-            // atomic.
-            run_transact(ctx, principal, meta, &actions, token.as_deref()).await
+        _ => Err(unsupported_by_generic_dispatch("this operation")),
+    }
+}
+
+/// SimEnv-capable sibling of [`execute_as`] (ADR 0061 rung D2 PR 1): decode
+/// and run a DynamoDB **item-API** operation against any `ClientCtx<E, R>`,
+/// not just the concrete `ClientCtx<ProdEnv, AnimusdRelayClient>`
+/// [`execute_as`] is hardcoded to. [`execute_as`] itself stays untouched and
+/// `ProdEnv`-only — this crate's real TCP listener (`serve`/`handle_conn`)
+/// is a genuine process boundary no `Env` seam removes — so this sibling
+/// exists for a caller that already holds a decoded target/body and a
+/// generic `ClientCtx`, never a socket. The one caller today is
+/// `sim_cluster_dynamo.rs`'s `SimClusterHandle::dynamo`, mirroring
+/// `admin.rs::action_data_dynamo`'s own unauthenticated `execute_routed`
+/// proxy shape (an unrestricted `Principal`, no SigV4 gate in front of it —
+/// this fixture has no SigV4 listener to gate through in the first place).
+///
+/// Only the eight operations [`dispatch_item_op`] covers succeed; every
+/// other well-formed operation decodes fine and fails with
+/// [`unsupported_by_generic_dispatch`]'s `InternalServerError` — see that
+/// function's own doc for the fuller "what's out of scope, why" account.
+///
+/// Only called from `sim_cluster::SimClusterHandle::dynamo` (a
+/// `#[cfg(test)] mod`) today — the `cfg_attr` below is a **precise**, not
+/// blanket, dead-code allowance (only in effect for the non-`cfg(test)`
+/// build the `tests/` binaries and the release lib link against; `cargo
+/// test -p animusd --lib`, which actually exercises it, sees no allowance
+/// at all), mirroring `RaftKvNode::local_scan_kind_bounded`'s own identical
+/// situation in this crate (`lib.rs`).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) async fn execute_item_op_as<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+    principal: &Principal,
+    target: &str,
+    body: &[u8],
+) -> (u16, String) {
+    match wire::decode_request(target, body) {
+        Ok(op) => {
+            let meta = &metadata(ctx);
+            if let Some(table) = op.table()
+                && let Err(err) = reject_internal_table(table, is_ddl_mutation(&op))
+            {
+                return (error_status(&err), err.to_json());
+            }
+            if let Err(err) = authz::authorize_op(ctx, principal, &op, meta) {
+                return (error_status(&err), err.to_json());
+            }
+            match dispatch_item_op(ctx, principal, meta, op).await {
+                Ok(body) => (200, body),
+                Err(err) => (error_status(&err), err.to_json()),
+            }
         }
-        Operation::TransactGetItems { gets } => run_transact_get(ctx, principal, meta, &gets).await,
-        Operation::UpdateTimeToLive {
-            table,
-            attribute_name,
-            enabled,
-        } => update_time_to_live(ctx, &table, &attribute_name, enabled).await,
-        Operation::DescribeTimeToLive { table } => describe_time_to_live(ctx, meta, &table),
-        Operation::UpdateContinuousBackups { table, enabled } => {
-            update_continuous_backups(ctx, &table, enabled).await
-        }
-        Operation::DescribeContinuousBackups { table } => {
-            describe_continuous_backups(ctx, meta, &table)
-        }
-        Operation::CreateBackup { table, backup_name } => {
-            create_backup(ctx, &table, &backup_name).await
-        }
-        Operation::DescribeBackup { backup_arn } => describe_backup(meta, &backup_arn),
-        Operation::ListBackups {
-            table,
-            limit,
-            exclusive_start_backup_arn,
-            time_range_lower_bound_ms,
-            time_range_upper_bound_ms,
-            backup_type,
-        } => list_backups(
-            meta,
-            table.as_deref(),
-            limit,
-            exclusive_start_backup_arn.as_deref(),
-            time_range_lower_bound_ms,
-            time_range_upper_bound_ms,
-            backup_type,
-        ),
-        Operation::DeleteBackup { backup_arn } => delete_backup(ctx, &backup_arn).await,
-        Operation::ExportTableToPointInTime {
-            table,
-            table_arn,
-            s3_bucket,
-            s3_prefix,
-            export_time_ms,
-            client_token,
-        } => {
-            create_export(
-                ctx,
-                &table,
-                &table_arn,
-                &s3_bucket,
-                s3_prefix.as_deref(),
-                export_time_ms,
-                client_token.as_deref(),
-            )
-            .await
-        }
-        Operation::DescribeExport { export_arn } => describe_export(meta, &export_arn),
-        Operation::ListExports {
-            table_arn,
-            max_results,
-            next_token,
-        } => list_exports(
-            meta,
-            table_arn.as_deref(),
-            max_results,
-            next_token.as_deref(),
-        ),
-        Operation::ImportTable {
-            s3_bucket,
-            s3_prefix,
-            input_compression,
-            table_creation_params,
-            client_token,
-        } => {
-            create_import(
-                ctx,
-                &s3_bucket,
-                s3_prefix.as_deref(),
-                input_compression,
-                &table_creation_params,
-                client_token.as_deref(),
-            )
-            .await
-        }
-        Operation::DescribeImport { import_arn } => describe_import(meta, &import_arn),
-        Operation::ListImports {
-            table_arn,
-            page_size,
-            next_token,
-        } => list_imports(meta, table_arn.as_deref(), page_size, next_token.as_deref()),
-        Operation::RestoreTableFromBackup {
-            backup_arn,
-            target_table_name,
-            global_secondary_index_override,
-        } => {
-            restore_table_from_backup(
-                ctx,
-                &backup_arn,
-                &target_table_name,
-                global_secondary_index_override.as_deref(),
-            )
-            .await
-        }
-        Operation::RestoreTableToPointInTime {
-            source_table_name,
-            target_table_name,
-            restore_date_time_ms,
-            use_latest_restorable_time,
-            global_secondary_index_override,
-        } => {
-            restore_table_to_point_in_time(
-                ctx,
-                &source_table_name,
-                &target_table_name,
-                restore_date_time_ms,
-                use_latest_restorable_time,
-                global_secondary_index_override.as_deref(),
-            )
-            .await
-        }
-        Operation::TagResource { table, tags } => tag_resource(ctx, &table, &tags).await,
-        Operation::UntagResource { table, tag_keys } => {
-            untag_resource(ctx, &table, &tag_keys).await
-        }
-        Operation::ListTagsOfResource { table } => list_tags_of_resource(ctx, meta, &table),
-        Operation::DescribeLimits => describe_limits(),
-        Operation::DescribeEndpoints => describe_endpoints(ctx),
+        Err(err) => (error_status(&err), err.to_json()),
     }
 }
 
@@ -5694,8 +5937,8 @@ fn validate_query_cursor_shape(
 /// naming a *different* partition is rejected too, since its key bytes fall
 /// outside this range as well.
 #[allow(clippy::too_many_arguments)] // mirrors `run_query`'s own full decoded shape
-async fn run_base_query(
-    ctx: &ClientCtx,
+async fn run_base_query<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     meta: &Metadata,
     table: &str,
     partition_value: &AttributeValue,
@@ -6439,6 +6682,157 @@ async fn execute_statement(
     }
 }
 
+/// `ExecuteTransaction` (ADR 0071, W-07 PR 5, closing the W-07 train): parse
+/// every one of `statements` (`animus_dynamo::partiql::parse_statement`,
+/// the identical entry point [`execute_statement`] uses — no new grammar),
+/// require them to be **all** `SELECT` or **all** `INSERT`/`UPDATE`/
+/// `DELETE` (AWS: a transaction is all-reads or all-writes — a mixed set is
+/// a `ValidationException`), lower each statement to one [`TransactGet`]/
+/// [`TransactAction`], and run the whole batch through the exact same
+/// atomic path a client-built `TransactGetItems`/`TransactWriteItems`
+/// request of that shape would take ([`run_transact_get`]/[`run_transact`])
+/// — reusing ADR 0018 §2's 2PC machinery unchanged, never a new commit
+/// protocol. Both of those functions already do the real work this PR's own
+/// authorization/dedup/atomicity requirements need: whole-set
+/// `authz::authorize_each_table` before anything runs, `Transaction request
+/// cannot include multiple operations on one item` for a duplicate key, and
+/// — for a write transaction — `ClientRequestToken` idempotency passed
+/// straight through and `TransactionCanceledException` with
+/// per-statement-indexed `CancellationReasons` on any condition failure.
+///
+/// Every statement's own table is resolved from its parsed `Statement`
+/// (`animus_dynamo::partiql::Statement::table`) and checked against the
+/// replicated catalog ([`table_known`]) up front, mirroring
+/// [`execute_statement`]'s identical "reject an unknown table before doing
+/// anything else" order — a table absent from the catalog is
+/// `ResourceNotFoundException`, not folded into the whole-or-nothing commit
+/// itself. [`reject_internal_table`] runs for every table too, since
+/// `Operation::ExecuteTransaction::table()` is `None` (ADR 0071's own note
+/// there) — this is the per-request check site, mirroring
+/// `BatchGetItem`/`BatchWriteItem`/`run_transact`/`run_transact_get`'s own
+/// shape.
+///
+/// **Response shape**: an all-`SELECT` transaction's response is
+/// [`run_transact_get`]'s own `{"Responses": [{"Item": ..} | {}, ..]}` —
+/// returned unchanged, since it already matches `ExecuteTransaction`'s own
+/// AWS-documented shape exactly. A write transaction's response is
+/// [`wire::execute_transaction_write_response`]: `{"Responses": [{}, ..]}`,
+/// one empty entry per statement — `run_transact`'s own successful return
+/// is a bare `{}` (`TransactWriteItems`'s own shape, ADR 0018 §2/PR7),
+/// reshaped here into the per-statement array `ExecuteTransaction` reports.
+///
+/// **Deviations from ADR 0071's original plan, both documented in the ADR's
+/// own "As-built: PR 5" amendment**: a `SELECT` inside a transaction must be
+/// an *exact*-key read (no `FROM "t"."i"`, no `ORDER BY`, no non-key
+/// `WHERE` term — `TransactGetItems` has no filter/range concept), and a
+/// `RETURNING`/`ON CONFLICT DO NOTHING` clause on a transaction statement is
+/// rejected outright rather than silently dropped or downgraded — see
+/// `animus_dynamo::partiql`'s own "Lowering: ExecuteTransaction" module doc
+/// for the full reasoning on both.
+async fn execute_transaction(
+    ctx: &ClientCtx,
+    principal: &Principal,
+    meta: &Metadata,
+    statements: &[TransactStatementRequest],
+    token: Option<&str>,
+) -> Result<String, WireError> {
+    if statements.is_empty() {
+        return Err(WireError::validation(
+            "ExecuteTransaction requires at least one statement",
+        ));
+    }
+    if statements.len() > wire::EXECUTE_TRANSACTION_MAX_STATEMENTS {
+        return Err(WireError::validation(format!(
+            "ExecuteTransaction supports at most {} statements",
+            wire::EXECUTE_TRANSACTION_MAX_STATEMENTS
+        )));
+    }
+
+    let parsed: Vec<partiql::Statement> = statements
+        .iter()
+        .map(|s| partiql::parse_statement(&s.statement).map_err(WireError::from))
+        .collect::<Result<_, _>>()?;
+
+    let all_select = parsed
+        .iter()
+        .all(|s| matches!(s, partiql::Statement::Select(_)));
+    let any_select = parsed
+        .iter()
+        .any(|s| matches!(s, partiql::Statement::Select(_)));
+    if any_select && !all_select {
+        return Err(WireError::validation(
+            "ExecuteTransaction cannot mix SELECT with INSERT/UPDATE/DELETE statements — a \
+             transaction is all-reads or all-writes",
+        ));
+    }
+
+    for stmt in &parsed {
+        let table = stmt.table();
+        reject_internal_table(table, false)?;
+        if !table_known(ctx, meta, table) {
+            return Err(registry_error(animus_dynamo::RegistryError::NoSuchTable(
+                table.to_string(),
+            )));
+        }
+        mirror_catalog_schema(ctx, meta, table);
+    }
+
+    if all_select {
+        let mut gets = Vec::with_capacity(parsed.len());
+        for (stmt, req) in parsed.iter().zip(statements.iter()) {
+            let partiql::Statement::Select(sel) = stmt else {
+                unreachable!("all_select guarantees every parsed statement is Select")
+            };
+            let base = schema_for(meta, &sel.table);
+            let get = partiql::lower_select_to_transact_get(
+                sel,
+                &req.parameters,
+                &base.partition_key,
+                base.sort_key.as_deref(),
+            )
+            .map_err(WireError::from)?;
+            gets.push(get);
+        }
+        run_transact_get(ctx, principal, meta, &gets).await
+    } else {
+        let mut actions = Vec::with_capacity(parsed.len());
+        for (stmt, req) in parsed.iter().zip(statements.iter()) {
+            let base = schema_for(meta, stmt.table());
+            let action = match stmt {
+                partiql::Statement::Select(_) => {
+                    unreachable!("any_select && !all_select was already rejected above")
+                }
+                partiql::Statement::Insert(ins) => partiql::lower_insert_to_transact_action(
+                    ins,
+                    &req.parameters,
+                    &base.partition_key,
+                    base.sort_key.as_deref(),
+                    req.rvocf,
+                ),
+                partiql::Statement::Update(upd) => partiql::lower_update_to_transact_action(
+                    upd,
+                    &req.parameters,
+                    &base.partition_key,
+                    base.sort_key.as_deref(),
+                    req.rvocf,
+                ),
+                partiql::Statement::Delete(del) => partiql::lower_delete_to_transact_action(
+                    del,
+                    &req.parameters,
+                    &base.partition_key,
+                    base.sort_key.as_deref(),
+                    req.rvocf,
+                ),
+            }
+            .map_err(WireError::from)?;
+            actions.push(action);
+        }
+        let count = actions.len();
+        run_transact(ctx, principal, meta, &actions, token).await?;
+        Ok(wire::execute_transaction_write_response(count))
+    }
+}
+
 /// Reshape a `PutItem`/`UpdateItem`/`DeleteItem` response body
 /// (`{Attributes?, ConsumedCapacity?, ItemCollectionMetrics?}`) into
 /// `ExecuteStatement`'s own shape (`{Items}`) for a PartiQL `INSERT`/
@@ -6500,6 +6894,210 @@ fn reshape_query_scan_response_to_execute_statement(
     Ok(serde_json::to_string(&serde_json::Value::Object(out)).expect("response serializes"))
 }
 
+/// Pull the first item (if any) out of a `{"Items": [..], ...}` JSON body —
+/// the shape both `run_query`'s own raw response and
+/// [`execute_statement`]'s mutation-reshaped response
+/// ([`reshape_write_response_to_execute_statement`]) share, so this one
+/// helper serves both of [`execute_one_batch_statement`]'s branches without
+/// caring which produced `raw`.
+fn first_item(raw: &str) -> Result<Option<Item>, WireError> {
+    let parsed: serde_json::Value =
+        serde_json::from_str(raw).expect("response is well-formed JSON");
+    let obj = parsed.as_object().expect("response is a JSON object");
+    match obj.get("Items").and_then(serde_json::Value::as_array) {
+        Some(items) if !items.is_empty() => {
+            let item_obj = items[0].as_object().expect("Items[0] is a JSON object");
+            Ok(Some(wire::decode_item(item_obj)?))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// `BatchExecuteStatement` (ADR 0071, W-07 PR 4): run every statement in
+/// `statements` independently, in request order, through
+/// [`execute_one_batch_statement`] — **no cross-statement atomicity**,
+/// mirroring `BatchWriteItem`/`BatchGetItem`'s own per-request contract
+/// (ADR 0071's lowering table). One entry per input statement, always —
+/// this function itself never fails on a per-statement problem; every such
+/// failure is that statement's own response entry.
+async fn run_batch_execute_statement(
+    ctx: &ClientCtx,
+    meta: &Metadata,
+    principal: &Principal,
+    statements: &[wire::BatchStatementRequest],
+) -> Result<String, WireError> {
+    let mut results = Vec::with_capacity(statements.len());
+    for req in statements {
+        results.push(execute_one_batch_statement(ctx, meta, principal, req).await);
+    }
+    Ok(wire::batch_execute_statement_response(&results))
+}
+
+/// One statement of a `BatchExecuteStatement` request — never propagates an
+/// `Err` to its own caller: every failure (a parse error, a denied table,
+/// an unknown table/index, a non-exact-key `SELECT`, a condition failure,
+/// ...) becomes this statement's own [`wire::BatchStatementResult`] error
+/// entry instead, so one bad statement never aborts the rest of the batch.
+///
+/// A `SELECT` runs a **restricted** version of [`execute_statement`]'s own
+/// `SELECT` path: AWS limits a batch statement to a single-item operation,
+/// so a `SELECT` here must be an exact-key read (an `=` term on the
+/// partition key, and on the sort key when the table has one, and nothing
+/// else — [`partiql::select_is_exact_key`]) rather than the arbitrary
+/// range `Query`/filtered `Scan` a standalone `ExecuteStatement` allows;
+/// anything else is a `ValidationError` entry, checked *before* running
+/// anything (this never runs a forbidden `Scan` just to reject it after the
+/// fact). An `INSERT`/`UPDATE`/`DELETE` reuses [`execute_statement`]
+/// wholesale — the exact same lowering, `DuplicateItemException` mapping,
+/// and `RETURNING` handling PR 3 already built, dispatched through
+/// [`run_operation`] exactly as it would be for a standalone
+/// `ExecuteStatement` call (including that dispatch's own real
+/// `authorize_op` check on the lowered, now-concrete `PutItem`/
+/// `UpdateItem`/`DeleteItem`).
+async fn execute_one_batch_statement(
+    ctx: &ClientCtx,
+    meta: &Metadata,
+    principal: &Principal,
+    req: &wire::BatchStatementRequest,
+) -> wire::BatchStatementResult {
+    let stmt = match partiql::parse_statement(&req.statement) {
+        Ok(s) => s,
+        Err(e) => return wire::BatchStatementResult::error(None, &WireError::from(e)),
+    };
+    let table = stmt.table().to_string();
+    if let Err(e) = reject_internal_table(&table, false) {
+        return wire::BatchStatementResult::error(Some(table), &e);
+    }
+    if !table_known(ctx, meta, &table) {
+        let e = registry_error(animus_dynamo::RegistryError::NoSuchTable(table.clone()));
+        return wire::BatchStatementResult::error(Some(table), &e);
+    }
+
+    match stmt {
+        partiql::Statement::Select(sel) => {
+            if let Err(e) = authz::authorize(
+                ctx,
+                principal,
+                "BatchExecuteStatement",
+                animus_control::OpClass::Read,
+                Some(table.as_str()),
+            ) {
+                return wire::BatchStatementResult::error(Some(table), &e);
+            }
+
+            mirror_catalog_schema(ctx, meta, &table);
+
+            let (partition_key, sort_key): (String, Option<String>) = match &sel.index {
+                Some(index_name) => match meta
+                    .table_indexes(&table)
+                    .iter()
+                    .find(|d| &d.name == index_name)
+                    .cloned()
+                {
+                    Some(idx) => (idx.hash_attribute, idx.sort_attribute),
+                    None => {
+                        let e = registry_error(animus_dynamo::RegistryError::NoSuchIndex(
+                            index_name.clone(),
+                        ));
+                        return wire::BatchStatementResult::error(Some(table), &e);
+                    }
+                },
+                None => {
+                    let base = schema_for(meta, &table);
+                    (base.partition_key, base.sort_key)
+                }
+            };
+
+            if !partiql::select_is_exact_key(&sel, &partition_key, sort_key.as_deref()) {
+                return wire::BatchStatementResult::error(
+                    Some(table),
+                    &WireError::validation(
+                        "a BatchExecuteStatement SELECT must be an exact-key read: an \
+                         equality condition on the partition key, and on the sort key \
+                         when the table has one, and nothing else",
+                    ),
+                );
+            }
+
+            let op = match partiql::lower_select(
+                &sel,
+                &req.parameters,
+                &partition_key,
+                sort_key.as_deref(),
+                None,
+                None,
+                req.consistent_read,
+            ) {
+                Ok(op) => op,
+                Err(e) => {
+                    return wire::BatchStatementResult::error(Some(table), &WireError::from(e));
+                }
+            };
+            let Operation::Query {
+                table: q_table,
+                index,
+                partition_attr,
+                partition_value,
+                sort_attr,
+                sort_condition,
+                limit,
+                exclusive_start_key,
+                scan_index_forward,
+                filter,
+                projection,
+                select,
+                consistent_read,
+            } = op
+            else {
+                unreachable!(
+                    "select_is_exact_key only accepts a WHERE shape lower_select turns into Query"
+                );
+            };
+            let raw = run_query(
+                ctx,
+                meta,
+                &q_table,
+                index.as_deref(),
+                &partition_attr,
+                &partition_value,
+                sort_attr.as_deref(),
+                sort_condition.as_ref(),
+                limit,
+                exclusive_start_key,
+                scan_index_forward,
+                filter.as_ref(),
+                projection.as_ref(),
+                select,
+                consistent_read,
+            )
+            .await;
+            match raw.and_then(|r| first_item(&r)) {
+                Ok(item) => wire::BatchStatementResult::success(table, item),
+                Err(e) => wire::BatchStatementResult::error(Some(table), &e),
+            }
+        }
+        partiql::Statement::Insert(_)
+        | partiql::Statement::Update(_)
+        | partiql::Statement::Delete(_) => {
+            let raw = execute_statement(
+                ctx,
+                meta,
+                principal,
+                &req.statement,
+                &req.parameters,
+                req.consistent_read,
+                None,
+                None,
+            )
+            .await;
+            match raw.and_then(|r| first_item(&r)) {
+                Ok(item) => wire::BatchStatementResult::success(table, item),
+                Err(e) => wire::BatchStatementResult::error(Some(table), &e),
+            }
+        }
+    }
+}
+
 /// Serve a base-table `Scan` via a **native quorum range scan** (`cp_scan`) over
 /// the whole table's data-plane key range `[escape(table), …)` — no in-memory
 /// key tracking. The scan returns live `(key, value)` pairs in key order across a
@@ -6519,8 +7117,8 @@ fn reshape_query_scan_response_to_execute_statement(
 /// scan returned — not a tracked set — so it is correct after a restart or on a
 /// follower that never saw a write.
 #[allow(clippy::too_many_arguments)] // one Scan request's full shape
-async fn run_base_scan(
-    ctx: &ClientCtx,
+async fn run_base_scan<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     meta: &Metadata,
     table: &str,
     limit: Option<usize>,
@@ -6869,8 +7467,8 @@ fn apply_filter_and_project(
 /// examined `(raw key, decoded item)` pairs and whether the underlying range
 /// is now exhausted.
 #[allow(clippy::too_many_arguments)] // one base/GSI page's full shape
-async fn paginated_table_examine(
-    ctx: &ClientCtx,
+async fn paginated_table_examine<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     table: &str,
     mut cursor: Vec<u8>,
     end: Option<&[u8]>,
@@ -7161,7 +7759,11 @@ fn lsi_resume_key(
 /// Build the key-attribute-only [`Item`] (the `LastEvaluatedKey` shape) for a
 /// full item, per `table`'s schema. `None` if the table is unknown or the item
 /// lacks a key attribute (shouldn't happen for a stored item).
-fn key_item_of(ctx: &ClientCtx, table: &str, item: &Item) -> Option<Item> {
+fn key_item_of<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+    table: &str,
+    item: &Item,
+) -> Option<Item> {
     let reg = ctx
         .edge
         .dynamo_registry()
@@ -7766,8 +8368,8 @@ pub(crate) fn projected_item(item: &Item, base: &TableSchema, idx: &IndexDef) ->
 /// always had. Anything needing evaluation (a condition, an `Update`'s RMW,
 /// an `ALL_OLD` echo, or an images-carrying table) keeps the ADR 0046 U3
 /// funnel.
-async fn fast_marker_write(
-    ctx: &ClientCtx,
+async fn fast_marker_write<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     table: &str,
     pk: &AttributeValue,
     sk: Option<&AttributeValue>,
@@ -7829,8 +8431,8 @@ async fn fast_marker_write(
 /// refused (its own tablet-group's whole write) rather than committed — see
 /// [`marker_batch_write_raw`]'s own doc for how that's distinguished from a
 /// genuine error.
-pub(crate) async fn marker_batch_write(
-    ctx: &ClientCtx,
+pub(crate) async fn marker_batch_write<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     table: &str,
     rows: Vec<(AttributeValue, Option<AttributeValue>, Vec<u8>)>,
 ) -> Result<Vec<Vec<u8>>, String> {
@@ -7868,8 +8470,8 @@ pub(crate) type MarkerRow = (Vec<u8>, Option<Vec<u8>>, (Vec<u8>, Vec<u8>));
 /// of failing the entire call; every other tablet-group in the same batch
 /// still commits normally. Any OTHER error still aborts the whole call
 /// immediately, unchanged from before this ADR.
-pub(crate) async fn marker_batch_write_raw(
-    ctx: &ClientCtx,
+pub(crate) async fn marker_batch_write_raw<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     table: &str,
     rows: Vec<MarkerRow>,
     provision_if_absent: bool,
@@ -8271,8 +8873,8 @@ fn range_end(prefix: &[u8]) -> Vec<u8> {
 /// cross-process), `Eventual` prefers any replica's applied state and falls
 /// back to that same leader path. A scan that cannot be served either way is
 /// an internal error (the scan analog of a failed read).
-async fn native_scan(
-    ctx: &ClientCtx,
+async fn native_scan<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     table: &str,
     start: &[u8],
     end: Option<&[u8]>,
@@ -8296,7 +8898,11 @@ async fn native_scan(
 /// already auto-registered locally (a legacy `pk`/`sk` client). A base-table
 /// `Query`/`Scan` rejects an unknown table (`ResourceNotFoundException`), matching
 /// what the former written-key path did via the registry.
-fn table_known(ctx: &ClientCtx, meta: &Metadata, table: &str) -> bool {
+fn table_known<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+    meta: &Metadata,
+    table: &str,
+) -> bool {
     if meta.has_table_schema(table) {
         return true;
     }
@@ -8314,8 +8920,8 @@ fn table_known(ctx: &ClientCtx, meta: &Metadata, table: &str) -> bool {
 /// precondition, `TransactGetItems`'s quiescent read), not just the decoded
 /// [`Item`]. Those two callers pass [`ReadConsistency::Strong`] and must keep
 /// doing so: a transaction's commit decision is not a client's to weaken.
-async fn raw_quorum_read(
-    ctx: &ClientCtx,
+async fn raw_quorum_read<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     meta: &Metadata,
     table: &str,
     key: &[u8],
@@ -8355,8 +8961,8 @@ async fn raw_quorum_read(
 /// The name predates ADR 0055 and is now only half accurate: a `Strong` read
 /// is the quorum-confirmed ReadIndex read it has always been, an `Eventual`
 /// one reaches no quorum at all.
-async fn quorum_read(
-    ctx: &ClientCtx,
+async fn quorum_read<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     meta: &Metadata,
     table: &str,
     key: &[u8],

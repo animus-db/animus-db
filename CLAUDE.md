@@ -159,6 +159,7 @@ assertion messages; replay with `ANIMUS_SEED=<seed> cargo test <name>`. The
 | `ANIMUS_LSM_ENCRYPTED_SEEDS=K` | 1 | `LsmEngine<EncryptedEnv<SimEnv>>` crash/fault-injection corpus depth (`animus-storage`, `tests/lsm_crash_encrypted.rs`, ADR 0069) |
 | `ANIMUS_SEGMENT_STORE_ENCRYPTED_SEEDS=K` | 1 | `EncryptedSegmentStore` fault-injection corpus depth (`animus-test`, `tests/segment_store_encrypted_fault_corpus.rs`, ADR 0069 S-03 PR 2) |
 | `ANIMUS_SIMCLUSTER_SEEDS=K` | 1 | multi-node/multi-tablet `SimCluster` cycles/durability corpus depth (`animusd`, ADR 0061 rung D1) — run via `cargo test -p animusd --lib sim_cluster_corpus` |
+| `ANIMUS_DYNAMO_WIRE_SEEDS=K` | 1 | end-to-end DynamoDB-wire cycles/durability corpus depth over `SimCluster` (`animusd`, ADR 0061 rung D2 PR 2) — run via `cargo test -p animusd --lib sim_cluster_dynamo_corpus` |
 | `ANIMUS_SHAREDWAL_SEEDS=K` | 1 | `SharedWal` cross-tablet ordering/crash-safety/GC fault-injection corpus depth (`animus-cp-data`, ADR 0028, C-05 — on by default since PR 3's cutover) — `cargo test -p animus-cp-data --test sharedwal_fault_corpus` |
 | `ANIMUS_EXPORT_IMPORT_SEEDS=K` | 1 | S3 export/import fault-injection corpus depth (`animus-test`, ADR 0068, S-05 PR 3) |
 | `ANIMUS_HEARTBEAT_SEEDS=K` | 1 | per-node heartbeat-batcher fault-injection corpus depth (`animus-cp-data`, ADR 0044 phase 2, C-02 PR 2) — run via `cargo test -p animus-cp-data --test heartbeat_batch_corpus` |

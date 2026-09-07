@@ -135,3 +135,35 @@ GSI/LSI key component) is affected directly, and `pk`'s hash-ring token
 input changes too (ADR 0022's own amendment above). No migration is
 attempted (root `CLAUDE.md`'s "No back-compat until further notice"); see
 ADR 0063 for the full decision.
+
+## Amendment (2026-09-07): the monotonic tablet-id-floor invariant, and issue #684
+
+This ADR's provision-at-create `CreateTablet` and ADR 0058's
+`BeginSplitInPlace`/`BeginRestore` (ADR 0059 §7)/`BeginImport` (ADR 0068
+S-05) all mint tablet ids off the same shared counter,
+`Metadata::next_tablet_id`. The invariant that makes sharing that counter
+safe is: **every tablet-minting apply arm rejects a candidate id below
+`Metadata::next_free_tablet_id()`, not merely an id that already has a
+row** — because `BeginSplitInPlace` reserves its two child ids (bumps the
+counter) at its own apply but mints no tablet-map row for either until
+`CutoverSplit` runs later; existence-only checking cannot see a reserved-
+but-not-yet-materialized id at all.
+
+`CreateTablet`'s own apply arm was missing this floor check (issue #684):
+it enforced only existence + this ADR's own one-tablet-per-table rule.
+Concretely, table A's in-place split (ADR 0058) could reserve a child id
+while table B's own `provision_tablet` (`animusd/src/schema.rs`) proposed
+`CreateTablet` for that exact id off a metadata read that predated the
+reservation — table B's row then sat at the reserved id until table A's
+`CutoverSplit` overwrote it, permanently losing table B's only tablet.
+Fixed by adding the identical floor guard `BeginSplitInPlace`/
+`BeginRestore`/`BeginImport` already had (`crates/animus-control/src/
+meta.rs`'s `CreateTablet` apply arm now rejects with `"tablet id below the
+monotonic allocator"`), plus defense-in-depth in `CutoverSplit` itself:
+its child-insertion loop now rejects rather than silently overwrites an
+already-occupied slot. See `docs/engineering-lessons.md`'s #684 entry for
+the full incident and the general lesson (a reservation-without-
+materialization design needs the floor check on every sibling minting
+arm, not just the ones an author happened to think of), and
+`crates/animus-control/CLAUDE.md`'s in-place split section for the
+`CutoverSplit` defense-in-depth's own doc.

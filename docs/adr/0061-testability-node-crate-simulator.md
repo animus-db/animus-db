@@ -841,7 +841,7 @@ supply one, and isn't trying to.
 | Rung | Work |
 |---|---|
 | D1 | `SimCluster` harness: a multi-node cluster driven by `SimEnv`, on B1's shared corpus scaffolding. Built on `ClientCtx<SimEnv>` in `animusd`'s own tests, per the seventh 2026-08-28 amendment — not on a moved `animus-node` assembly |
-| D2 | An end-to-end DynamoDB-wire corpus — requests in at the wire edge, faults injected, resulting history checked by the existing `check_cycles`/`check_durability`/`check_convergence` |
+| D2 | An end-to-end DynamoDB-wire corpus — requests in at the wire edge, faults injected, resulting history checked by the existing `check_cycles`/`check_durability`/`check_convergence`. **Landed 2026-09-07 (both PRs)**: PR 1 (six item operations generic, `SimClusterHandle::dynamo`, a first small smoke) and PR 2 (the actual `Recorder`/`History` corpus over the wire, see the amendments below); GSI/LSI, transact, and PartiQL remain out of scope, named as D2's own residuals |
 | D3 | Migrate the `animusd` integration suite: **keep** the tests that genuinely prove real-thread liveness (group commit, lock contention, election timing — per the engineering-lessons rule that `SimEnv` does not prove thread liveness), convert the rest. Success is measured by the `prod-liveness` CI job shrinking enough to drop its 2-attempt retry |
 | D4 | Deterministic coverage for the behaviours that have none today: the auto-split byte trigger (`lib.rs:14397`), the dropped-table GC reclaim loop, join/growth sequencing, and the backup-janitor async loop (its replicated state machine is already sim-tested in `animus-control/tests/backup_catalog.rs`; the loop driving it is not) |
 
@@ -1129,6 +1129,295 @@ scenarios, ~70s), and `cargo test -p animus-test --test raftkv_linearizable`
 (unchanged, 10 passed / 1 ignored — proof this rung touched nothing in
 the model it copied).
 
+#### 2026-09-07 amendment — D2 PR 1 landed: the DynamoDB wire path is drivable from `SimCluster`, first small smoke
+
+D2 PR 1 is done: a DynamoDB JSON request (`X-Amz-Target` + body) decoded by
+`animus_dynamo::wire::decode_request` now executes through the exact same
+generic core `dynamo::run_operation`'s own item-op arms call in production,
+reachable against a `SimEnv`-backed `ClientCtx` inside `SimCluster` for the
+first time. **Not yet the full nemesis corpus** — that is PR 2, sized below.
+
+**The genericization, scoped down from "all of `dynamo.rs`'s dispatch" to a
+reviewable slice.** `dynamo::run_operation`/`execute_as` themselves stay
+concrete (`ClientCtx<ProdEnv, AnimusdRelayClient>`) top-level entry
+points — genericizing them wholesale would have meant genericizing every
+DDL/backup/export/import/PartiQL/transact handler they also dispatch to
+(`create_table`/`update_table`/the backup family/the S3 export-import
+family/`execute_statement`/`run_transact`/`run_transact_get`, several of
+which are genuinely `ProdEnv`-only — `tokio::spawn` for the export job's own
+async task, real `TcpStream` process-boundary code), pushing the signature
+count into the 60s and well past a single reviewable PR. Instead, a new
+generic function, `dynamo::dispatch_item_op<E: Env, R: RelayClient>`,
+holds exactly the six operations that had no such entanglement — `PutItem`,
+`DeleteItem`, `GetItem`, `BatchGetItem`, `UpdateItem`, `BatchWriteItem` — as
+a **pure move** of their existing bodies (calling the exact same
+`ClientCtx::cp_kind_write_item`/`cp_get`/`cp_scan` methods, themselves
+already `E`/`R`-generic since rung C5), never a rewrite. A new sibling
+entry point, `dynamo::execute_item_op_as<E, R>`, runs that function's own
+decode/meta/reject-internal-table/authorize prelude (mirroring `execute_as`
+production runs, just against a generic `ClientCtx`) and is the one
+`SimClusterHandle::dynamo` calls. `run_operation`'s own arms for those six
+operations now delegate to `dispatch_item_op` too (`op @ (Operation::
+PutItem { .. } | ... ) => dispatch_item_op(ctx, principal, meta, op)
+.await`), monomorphized at `E = ProdEnv, R = AnimusdRelayClient` — so
+production behavior for them is byte-identical, not merely equivalent.
+
+**`Query`/`Scan` are the one operation pair with a real, deliberate
+duplication, not a delegation.** `dispatch_item_op`'s own `Query`/`Scan`
+arms cover only the **base-table** path (`index: None`) — genericizing the
+real `run_query`/`run_scan` would also require genericizing their own
+`run_index_query`/`run_gsi_query`/`run_lsi_query`/`run_index_scan`/
+`run_gsi_scan`/`run_lsi_scan`/`paginated_kind_examine`/
+`paginated_kind_examine_one` siblings (the GSI/LSI dispatch tree), which
+alone would have pushed this PR's signature count from ~23 into the
+mid-30s. **`run_operation`'s own `Query`/`Scan` arms are deliberately NOT
+in the delegated set** — they still call the full, unmodified, concrete
+`run_query`/`run_scan` (complete GSI/LSI dispatch), exactly as before this
+rung. This was found the hard way, not designed correctly the first time:
+the first cut of this PR *did* route `run_operation`'s `Query`/`Scan`
+through `dispatch_item_op`, and `cargo test -p animusd --lib` caught it
+immediately — four `index_drain::gsi_drain_cursor_tests` failures, each
+timing out on `"a GSI/LSI Query is not yet supported by the generic
+(SimEnv-capable) dispatch path"`, since those tests exercise real GSI
+queries through production's own `run_operation`. **The general lesson,
+worth restating beyond this file**: when splitting one dispatcher into "a
+generic core" plus "a concrete production entry point that also handles
+the ProdEnv-only remainder," a narrowed generic core must not become the
+sole path an *unrelated, still-full-featured* production caller uses for
+the cases the narrowing dropped — verify by running the full existing test
+suite for the touched dispatcher, not just the new corpus, before trusting
+a "the production call site is monomorphized so it's unaffected" argument
+that turns out to be more subtle than it looks (here, `run_operation`
+genuinely called the narrowed function directly, not merely the same
+generic *machinery* at a different type — the two are not the same
+guarantee).
+
+**`ClientCtx::data()`'s panic on a `None` `DataRole`** (ADR 0035 PR3's
+control-only-node guard) was the other real gap the eighth/D1 amendments'
+own "still `ProdEnv`-only" finding left unresolved for this rung:
+`write_path::kind_write_item_at_leader` (already generic since rung C5) and
+`dynamo::fast_marker_write`/`authz::record_denied` all call `ctx.data()` on
+their hot paths (`raftkv_metrics.incr`/`request_rates.observe`). Every
+`DataRole` field turned out to be a plain, `Env`-free, `Default`-able
+handle (`MetricsHandle::noop()`, `StreamSealKnobs::default()`,
+`ChangeRateTracker`/`RequestRateTracker`, both already `#[derive(Default)]`
+— none of the four touch `E` at all), so `SimCluster::new` now builds a
+real one per node (`base_id` the node's own id) instead of `data: None` —
+cheap, and needs no `ProdEnv`. This was the "construct a SimEnv-safe
+`DataRole`" branch of the two options the task brief posed, not the "gate
+the reads" one — simpler, and it means every generic item-op handler this
+rung and any future one adds can call `ctx.data()` freely without a second
+audit.
+
+**`SimClusterHandle::dynamo`/`SimCluster::dynamo`** (mirroring `put`/`get`/
+`scan`'s own two-tier async-handle/sync-wrapper split) run a decoded
+request against one node's own `ClientCtx`, exactly like `admin.rs::
+action_data_dynamo`'s own unauthenticated `execute_routed` proxy — an
+unrestricted `Principal`, since this fixture has no SigV4 listener to
+resolve a scoped one from.
+
+**The smoke** (`crates/animusd/src/sim_cluster_dynamo.rs`, `#[cfg(test)]
+mod sim_cluster_dynamo;` from `lib.rs`, a sibling of `sim_cluster`/
+`sim_cluster_corpus`/`sim_cluster_throttle` for the identical privacy
+reason): five scenarios, each seed-parameterized with an `ANIMUS_SEED`
+replay entry point on the first — PutItem → GetItem(`ConsistentRead:
+true`) through the wire on a 3-node RF3 cluster, both issued from a
+non-leader node (proving the generic dispatch path forwards over the real
+`SimRelayClient` wire); `UpdateItem` with a `ConditionExpression`, both a
+satisfied and a failing one (`ConditionalCheckFailedException`, proving
+`cp_kind_write_item`'s evaluate-at-leader path, not the unconditioned fast
+arm); `Query` over a composite `(pk, sk)` table (proving
+`dispatch_item_op`'s base-table `Query` arm returns exactly one partition's
+rows); `BatchWriteItem` (proving the `marker_batch_write` single-Raft-
+entry-per-tablet path); and one leader crash + write-through-a-survivor +
+restart, with a converged-or-timeout wire read from every node afterward.
+Run via `cargo test -p animusd --lib sim_cluster_dynamo`; example seed
+`0xD2C1_0001`.
+
+**A harness gotcha found building the crash/restart scenario**: a crashed
+(muted, not stopped) node's own `is_leader_local` read stays frozen at
+whatever it last locally believed — nothing tells a muted node its peers
+re-elected, since its inbox is cleared, not its internal Raft state — so
+calling `SimCluster::leader_index_of` again right after `crash` + an
+election window can return the **crashed** node's own id, not the new
+leader's. The fix (already the shape `sim_cluster.rs`'s own scenario 3
+uses) is to route the follow-up write through any *survivor* node index
+picked without consulting `leader_index_of` at all — `cp_kind_write_item`'s
+own `forward_to_tablet_leader` hint-chasing loop finds the real new leader
+internally. Added to `docs/engineering-lessons.md`: `leader_index_of`
+answers "who does this replica locally believe leads," which is exactly
+wrong to ask of a node you just crashed.
+
+**Gates**: `cargo fmt --all --check`; `cargo clippy -p animusd -p
+animus-dynamo --all-targets --all-features -- -D warnings` (clean —
+`execute_item_op_as`'s only caller is `#[cfg(test)]`-gated, so it carries
+the identical precise `#[cfg_attr(not(test), allow(dead_code))]`
+`RaftKvNode::local_scan_kind_bounded` already established in this crate);
+`cargo test -p animusd --lib` (198 passed, 2 ignored — the two pre-existing
+opt-in shrink-replay entry points — including `sim_cluster_corpus` at its
+default depth and all five new `sim_cluster_dynamo` scenarios); `cargo test
+-p animus-dynamo` (unchanged, proof this rung touched nothing in the wire
+codec itself); and, as the real-socket sanity check that production's
+`dynamo.rs` dispatch stayed behaviorally unchanged, `cargo test -p animusd
+--test dynamo_wire --test dynamo_txn --test dynamo_indexes --test
+dynamo_update_add_delete --test dynamo_partiql --test
+dynamo_execute_transaction` (58 tests, all green — `dynamo_indexes`' own
+`gsi_write_then_query` in particular is the real-socket proof the
+`index_drain.rs` regression above is actually fixed, not just no-longer-
+caught by a narrower rerun).
+
+**PR 2's plan** (not built here): (a) generic GSI/LSI `Query`/`Scan` —
+`run_index_query`/`run_gsi_query`/`run_lsi_query`/`run_index_scan`/
+`run_gsi_scan`/`run_lsi_scan`/`paginated_kind_examine`/
+`paginated_kind_examine_one` made `<E, R>`-generic, folded into
+`dispatch_item_op`'s own `Query`/`Scan` arms in place of today's
+`index.is_some()` rejection; (b) `TransactWriteItems`/`TransactGetItems` —
+blocked on a **new** proof this crate has never built: `ClientCtx::
+propose_schema`'s *relayed* path (the only branch reachable under `SimEnv`,
+per the eighth/D1 amendments) successfully auto-provisioning the internal
+`__animus_txn_idempotency` table against a genuine multi-voter `SimEnv`
+control quorum — `ensure_txn_idempotency_table`'s own `propose_schema` +
+commit-wait loop, first exercised by whichever scenario in PR 2 issues a
+`TransactWriteItems` with a `ClientRequestToken`; once that path is proven,
+`run_transact`/`run_transact_get`/`transact_write_idempotency_preflight`/
+`ensure_txn_idempotency_table`/`idempotency_claim_put`/
+`idempotency_record_item`/`read_idempotency_record` become generic the same
+mechanical way this PR's six operations did; (c) `ExecuteStatement`/
+`BatchExecuteStatement`/`ExecuteTransaction` — PartiQL lowers onto (a)/(b)'s
+own operations, so these need no new logic once those are generic, only
+their own thin generic wrapper; (d) **the actual corpus** — a list-append
+`Recorder`/`History` model over `SimClusterHandle::dynamo` (mirroring
+`sim_cluster_corpus.rs`'s own `Recorder` over `put`/`get` exactly), checked
+with `animus_test::check::{check_cycles, check_durability,
+check_convergence}`, the Nemesis matrix `sim_cluster_corpus.rs` already
+has (`leader_crash`/`follower_crash`/`stop_restart`/`leader_partition`/
+`split_brain`/`forward_heavy`/`two_tables`) generalized to DynamoDB-wire
+ops instead of raw `put`/`get`, an `ANIMUS_DYNAMO_WIRE_SEEDS` depth knob,
+and a `corpus-deep.yml` nightly tier entry alongside `ANIMUS_SIMCLUSTER_
+SEEDS`.
+
+**No product bug found in the six delegated operations themselves** — the
+one real bug this rung found (the `Query`/`Scan` production regression
+above) was caught before it ever reached a committed state, by the
+existing `cargo test -p animusd --lib` run this rung's own gate list
+requires anyway.
+
+#### 2026-09-07 amendment — D2 PR 2 landed: the actual end-to-end DynamoDB-wire corpus
+
+D2 PR 2 is done: `crates/animusd/src/sim_cluster_dynamo_corpus.rs`
+(`#[cfg(test)] mod sim_cluster_dynamo_corpus;` from `lib.rs`, a sibling of
+`sim_cluster_corpus`/`sim_cluster_dynamo` for the identical privacy reason
+those two already document) — a list-append `Recorder`/`History` model
+over `SimClusterHandle::dynamo` (PR 1's own generic entry point), checked
+with the identical `animus_test::check::{check_cycles, check_durability,
+check_convergence}` oracle `sim_cluster_corpus.rs` already uses, driven
+through the **real** DynamoDB JSON wire (`PutItem`/`GetItem`/`UpdateItem`/
+`DeleteItem`/`BatchWriteItem`/base-table `Query`/`Scan`) instead of the raw
+`cp_kind_write_raw`/`cp_get` primitives that corpus calls directly. Same 8
+cells, same fault matrix, same converged-or-timeout durability/convergence
+poll — the fault dimension this rung exercises was already proven by D1;
+what's new here is that every op crosses the wire codec
+(`animus_dynamo::wire::decode_request`/`dynamo::dispatch_item_op`) first.
+
+**The list-append mapping: a server-evaluated `UpdateItem`, not a
+client-tracked list.** `sim_cluster_corpus.rs`'s own write is a plain
+`put` of a client-maintained, locally-extended list — sound only because a
+raw `put` is an idempotent whole-value overwrite. This corpus's one write
+mechanism is instead
+
+```
+SET items = list_append(if_not_exists(items, :empty), :v)
+```
+
+— a **server-evaluated**, genuinely non-idempotent operation (a
+duplicated apply of the same entry would append the appended value twice,
+unlike a plain `Put`), which is exactly the `SET`-plus-`list_append`
+non-idempotent write the task brief for this rung asked for; no separate
+`ADD` op was needed to get that property, since `list_append` already has
+it by construction. `if_not_exists(items, :empty)` means the very first
+write to a key needs no separate provisioning step.
+
+**The read-consistency modeling decision (ADR 0055).** `GetItem`/`Query`/
+`Scan` all decode `ConsistentRead`, and this corpus issues both values —
+but only `ConsistentRead: true` observations feed the shared
+`Recorder`/`History` `check_cycles` runs against (a linearizable
+ReadIndex read is a real, ordered observation, the same discipline
+`sim_cluster_corpus.rs`'s own ADR 0055 testing-gotcha entry states).
+`ConsistentRead: false` reads are excluded from `check_cycles`'s history
+entirely — feeding a replica-local, un-barriered observation into the same
+`wr`/`rw` graph a linearizable read builds would manufacture false-positive
+"divergence" violations the instant a stale-but-legal read landed during a
+fault window, since `check_cycles`'s shared, cross-crate model has no
+weaker-read flag to distinguish "legitimately stale" from "actually
+forked." Every `ConsistentRead: false` observation is instead recorded
+separately and checked directly against the scenario's own **converged
+final state** once the fault schedule has healed and drained: each
+observed list must be a prefix of the converged state — sound under this
+corpus's single-writer-per-key discipline, since a lagging/un-barriered
+replica can only ever have observed an *earlier* state of the one writer's
+own strictly-ordered commit sequence. This is the same kind of exclusion
+`sim_cluster_corpus.rs` already made for `delete` (workload-shape excluded
+from a checker whose model doesn't fit, not a defect in either side),
+applied to a second dimension the wire corpus newly introduces. No
+violation was ever observed across the depth runs below — the exclusion
+is a modeling decision proven sound by this corpus's own passing runs, not
+an untested hope.
+
+**`DeleteItem`/`BatchWriteItem` are exercised but kept out of
+`check_cycles`**, for the identical reason `delete` already was in
+`sim_cluster_corpus.rs`: a tombstoning `DeleteItem` cannot satisfy the
+list-append prefix invariant, and a `BatchWriteItem` `PutRequest` is a
+whole-item overwrite, not an append. Both get their own direct correctness
+probes (`run_delete_probe`/`run_batch_write_probe`), run from every node
+in the cluster in turn after the fault schedule heals and drains, on key
+namespaces (`delete-probe-*`/`batch-probe-*`) disjoint from the
+list-append model's own keys.
+
+**Base-table `Query`/`Scan` feed the same history, as multiple `Mop::Read`s
+per transaction.** Every table's items live under exactly two fixed
+partition keys, so a `Query` (`pk = :p`) returns a real, strict subset of
+what a `Scan` returns — genuinely exercising `dispatch_item_op`'s
+base-table `Query` arm rather than a `Scan` synonym — and both decode every
+returned item into one `Mop::Read`, all recorded as one history entry
+(`Recorder::ok` already takes a `Vec<Mop>` for exactly this shape).
+
+**Depth knob**: `ANIMUS_DYNAMO_WIRE_SEEDS` (default 1 = the 8 frozen
+cells). Held green at `=25` locally — **default depth ~25s (8 scenarios);
+depth 25 ~10m2s wall / 601.29s test-binary time (200 scenarios)** — see the
+Gates section below for the exact commands and counts.
+`ANIMUS_SEED`/`ANIMUS_SHRINK`/`ANIMUS_SHRINK_REPLAY` wiring
+(`sim_cluster_dynamo_shrink_replay`) mirrors `sim_cluster_corpus.rs`'s own
+exactly. A structural `dynamo_wire_corpus_covers_the_fault_matrix` guard
+(mirroring `sim_cluster_corpus_covers_every_cell_shape`) pins the 8-cell
+set and its fault-class/forward-heavy/multi-table coverage. `corpus-deep.
+yml` gained a `dynamo_wire` tier entry at the same depth
+`ANIMUS_SIMCLUSTER_SEEDS` uses (`=25`), and root `CLAUDE.md`'s env-var
+table gained the matching row.
+
+**Residuals, named rather than silently skipped** (identical to D2 PR 1's
+own "PR 2's plan" list, now pushed one rung further out): GSI/LSI
+`Query`/`Scan`, `TransactWriteItems`/`TransactGetItems`, and PartiQL
+(`ExecuteStatement`/`BatchExecuteStatement`/`ExecuteTransaction`) are all
+still unreachable through the generic `dispatch_item_op` core this corpus
+drives (`execute_item_op_as` returns a clean `InternalServerError` for any
+of them) — see `dynamo.rs`'s own `dispatch_item_op` doc for the full
+"what's `ProdEnv`-only, why" account. Deferred to D3/D4, not attempted
+here; this rung's own scope was "the actual corpus," not widening the
+generic dispatch surface further.
+
+**No product bug found.** Every cell held green at both the frozen and
+`=25` depths on the first complete run; the `ConsistentRead: false`
+prefix check and both direct probes never found a violation either.
+
+**Gates**: `cargo fmt --all --check`; `cargo clippy -p animusd
+--all-targets --all-features -- -D warnings` (clean); `cargo test -p
+animusd --lib` (green, including `sim_cluster_corpus` and the new
+`sim_cluster_dynamo_corpus` at default depth); `ANIMUS_DYNAMO_WIRE_
+SEEDS=25 cargo test -p animusd --lib sim_cluster_dynamo_corpus` (24 cells,
+green — 200 scenarios, `test result: ok. 3 passed`, `finished in 601.29s`, wall `10m2.300s`); `cargo test -p animusd --test dynamo_wire` (real-socket
+sanity, unchanged, green — proof this rung touched no production dispatch
+code, only added a new test module).
+
 ### Phase E — the untested crates
 
 | Rung | Work |
@@ -1220,6 +1509,36 @@ complementary, not overlapping: the harness proves the reconcile *logic*
 deterministically and cheaply; the e2e smoke proves the *real* Kubernetes
 interaction once, expensively, and only where the sandbox allows it to run
 at all.
+
+#### 2026-09-07 amendment — E2 closed: `admin_request` tests for the last seven mutating arms
+
+E2 is done. U-08(i) (2026-09-04) and U-08(ii) (2026-09-06) covered the flat
+GET arms and the dynamo-proxy wrappers, but left seven pre-existing
+one-shot mutating arms — `drain`/`drain-status`/`remove`/`reconfigure`/
+`flush`/`compact`/`stream-grow` — with no `admin_request` unit tests of
+their own, so this ADR's "741 currently-untested lines" framing wasn't
+fully retired. This rung closes exactly that gap: all seven arms already
+built their `(method, path, body)` through `admin_request` (`crates/
+animus-cli/src/main.rs`), the same pure, socket-free function every other
+arm's tests already exercise, so no dispatch refactor was needed — only
+tests, same shape as every existing `admin_request` test (happy path +
+the argument-error paths the parser already has).
+
+One test pins existing, deliberately-unvalidated behavior rather than
+new behavior: `reconfigure`'s voter-list parsing (`split(',')`) does not
+reject a trailing comma — it produces a voter named `""` — and
+`reconfigure_a_trailing_comma_in_the_voter_list_produces_an_empty_voter`
+documents that as the parser's actual contract (voter-identifier
+validation is the server's job, same as every other admin route here),
+not as new client-side validation added by this rung.
+
+**Gates**: `cargo fmt --all --check`, `cargo clippy -p animus-cli
+--all-targets --all-features -- -D warnings` (clean), `cargo test -p
+animus-cli` (78 passed, up from 61). No production code changed —
+`admin_request`'s dispatch is untouched, only its `#[cfg(test)]` module
+grew.
+
+With this, both Phase E rungs (E1, E2) are closed.
 
 ## Consequences
 

@@ -89,8 +89,32 @@ the still-true paragraph after the table.
   only) is implemented in PR 3 rather than deferred, since it costs nothing
   beyond wiring the statement's own clause onto the already-existing
   `ReturnValues`/`UpdateReturnValues` fields — see ADR 0071's "As-built: PR
-  3" amendment. `BatchExecuteStatement` (PR 4) and `ExecuteTransaction`
-  (PR 5) remain.
+  3" amendment. **PR 4** adds `BatchExecuteStatement`: 1 to 25 statements
+  (AWS's own cap), each the identical `parse_statement`/per-kind lowering
+  PR 2/3 already built, run independently through `execute_statement`
+  (`INSERT`/`UPDATE`/`DELETE`) or a restricted `SELECT` path
+  (`partiql::select_is_exact_key` — AWS limits a batch statement to a
+  single-item operation, so a range/filtered `SELECT` is a per-statement
+  error rather than lowering to a real `Query`/`Scan`) — no cross-statement
+  atomicity, mirroring `BatchWriteItem`/`BatchGetItem`'s own contract, with
+  a per-statement `AccessDenied` (not a whole-request rejection) on a
+  denied table. See ADR 0071's "As-built: PR 4" amendment for the full
+  response shape and error-code mapping. **PR 5** (`ExecuteTransaction`) is
+  implemented too: 1–25 statements parsed with the identical grammar, all-
+  `SELECT` lowered to one `TransactGet` per statement and run as one
+  `TransactGetItems` (each `SELECT` must be an exact-key read — no index,
+  no `ORDER BY`, no non-key `WHERE` term, since `TransactGetItems` has
+  nothing else to lower onto), all-`INSERT`/`UPDATE`/`DELETE` lowered to
+  one `TransactAction` per statement and run as one atomic
+  `TransactWriteItems` (`ClientRequestToken` idempotency and per-statement
+  `CancellationReasons` inherited unchanged from that existing machinery);
+  mixing `SELECT` with a mutation is a `ValidationException`; a
+  transaction statement's own `RETURNING`/`ON CONFLICT DO NOTHING` is
+  rejected rather than honored, since `TransactWriteItems` reports no item
+  image on a successful action and a transaction's condition failure
+  always cancels the whole transaction — see ADR 0071's "As-built: PR 5"
+  amendment. **The W-07 PartiQL train is now fully implemented and
+  complete** — PRs 1–5 all landed; this gap entry is closed.
 
 ---
 
@@ -218,12 +242,37 @@ the still-true paragraph after the table.
 
 ## 3. Core design items still proposed
 
-### C-03 Log-only replicas (ADR 0044 phase 3)
+### C-03 Log-only replicas (ADR 0044 phase 3) — assessed 2026-09-07: defer, not sized
 
-- C-02 (ADR 0044 phase 2, heartbeat amortization) landed 2026-09-06 —
-  investigation, batcher, and default-on cutover all shipped (see that
-  ADR's phase-2 and phase-2-cutover amendments). Whether phase 3 is still
-  needed on top of it hasn't been assessed; prerequisite only, not sized.
+- **Assessed 2026-09-07, recommendation: defer** (ADR 0044's matching
+  2026-09-07 amendment has the full evidence). C-02 (heartbeat
+  amortization) and C-05 (`SharedWal`) both landed and defaulted on
+  2026-09-06, closing two of phase 3's three named per-group costs
+  (heartbeat timers/frames, one WAL file per group) outright. The third —
+  a per-tablet storage engine's idle footprint (ADR 0050) — measured at
+  ~8.1 KB/engine this session (`cargo test -p animus-storage --test
+  idle_engine_cost --features prod-heavy -- --ignored --nocapture`),
+  under 0.4% of that test's own 2 MiB/engine gating ceiling: already
+  negligible. The one unmeasured piece (per-group `RaftCore`/`RaftKvNode`
+  in-memory bookkeeping and its one `drive` task, no RSS/CPU harness
+  exists) is sized at roughly a day (M) to build and was not built here.
+- **Not a "no," a design mismatch**: [ADR 0055](adr/0055-eventually-consistent-reads.md)
+  (2026-08-23, after this ADR's original text) depends on *every* replica
+  of a tablet carrying a full applied engine to serve `ConsistentRead:
+  false` reads locally — the fix for v1's own "no read scaling at all"
+  gap. A log-only replica, converted from an ordinary RF3 voter as phase
+  3's own "asymmetric replicas" framing implies, would shrink exactly that
+  read-scaling fan-out. If ever revisited, phase 3 needs re-scoping as
+  extra log-only voters added *beyond* a full-copy read-serving quorum
+  (RF > 3 for failure-domain spread, not a conversion of an existing
+  replica), plus an ADR 0055 amendment excluding log-only members from its
+  "any replica" read fan-out by construction.
+- **Reopens on**: (a) the unmeasured per-group `RaftCore`/task cost, once
+  measured, showing a real bite at a realistic per-node tablet density
+  (hundreds to thousands of hosted groups — untested at that scale
+  anywhere in this codebase); or (b) a deployment need for RF > 3 driven
+  by failure-domain spread rather than read scaling. Neither holds today.
+  No PRs planned.
 
 ### C-04 Testability phases D and E (ADR 0061)
 
@@ -232,20 +281,41 @@ the still-true paragraph after the table.
   `sim_cluster_corpus`, its first cycles/durability corpus over
   `animus-test`'s `check_cycles`/`check_durability`/`check_convergence`
   oracle, depth knob `ANIMUS_SIMCLUSTER_SEEDS`; ADR 0061's 2026-09-05
-  amendments). D2-D4 remain open (an end-to-end DynamoDB-wire corpus, the
-  `animusd` integration-suite migration, and deterministic coverage for
+  amendments). **D2 landed 2026-09-07 (both PRs)**: PR 1 put six item
+  operations (`PutItem`/`DeleteItem`/`GetItem`/`BatchGetItem`/`UpdateItem`/
+  `BatchWriteItem`) plus a base-table-only `Query`/`Scan` through a new
+  generic `dynamo::dispatch_item_op<E, R>` core, reachable against
+  `SimCluster` via `SimClusterHandle::dynamo`/`SimCluster::dynamo`
+  (`animus_dynamo::wire::decode_request` in, the same production dispatch
+  handlers out) — proven by a first small `sim_cluster_dynamo.rs` smoke
+  (five seed-parameterized scenarios). PR 2 built the actual corpus on top:
+  `sim_cluster_dynamo_corpus.rs`, the same `Recorder`/`History`/
+  `check_cycles`/`check_durability`/`check_convergence` model
+  `sim_cluster_corpus` uses, driven entirely through the real DynamoDB JSON
+  wire (list-append via `UpdateItem`'s `list_append`, `ConsistentRead:
+  true`/`false` both exercised — only `true` feeds `check_cycles`, `false`
+  is checked as a prefix of the converged final state — `DeleteItem`/
+  `BatchWriteItem` via their own direct probes, base-table `Query`/`Scan`
+  feeding multi-key reads into the same history), an `ANIMUS_DYNAMO_
+  WIRE_SEEDS` depth knob (held green at `=25`), and a `corpus-deep.yml`
+  tier (ADR 0061's 2026-09-07 amendments — see the second amendment for
+  the full design and the read-consistency modeling decision). GSI/LSI
+  `Query`/`Scan`, `TransactWriteItems`/`TransactGetItems`, and PartiQL
+  remain out of scope, named as D2's own residuals for whichever rung
+  generalizes those operations next. D3-D4 remain open (the `animusd`
+  integration-suite migration, and deterministic coverage for
   auto-split/GC/join/backup-janitor).
 - **E1 landed 2026-09-04** (`ClusterApi`/`AdminOps` seams in
   `animus-operator`, fake-driven `controller::tests`; ADR 0061's
-  2026-09-04 amendment). **E2 not yet fully closed**, even though U-08 (its
-  own planned home) landed in full 2026-09-06: U-08(i)'s eight flat GET
-  arms and U-08(ii)'s six dynamo-proxy wrappers all now have their own
-  `admin_request` unit tests, but several pre-existing one-shot mutating
-  arms predating both — `drain`/`drain-status`/`remove`/`reconfigure`/
-  `flush`/`compact`/`stream-grow` — still have none, so ADR 0061's own
-  "741 currently-untested lines" framing isn't fully retired. A follow-up
-  PR adding `admin_request` tests for exactly those arms (same shape as
-  every test U-08 already added) would close it; not sized here.
+  2026-09-04 amendment). **E2 landed 2026-09-07**: the seven pre-existing
+  one-shot mutating arms predating both U-08(i) and U-08(ii) —
+  `drain`/`drain-status`/`remove`/`reconfigure`/`flush`/`compact`/
+  `stream-grow` — now each have their own `admin_request` unit tests
+  (happy path + the argument-error paths the parser already has, same
+  shape as every test U-08 already added); all seven already built their
+  request through `admin_request`, so no dispatch refactor was needed.
+  `cargo test -p animus-cli` went from 61 to 78 passing (ADR 0061's
+  2026-09-07 amendment).
 - **ADR:** amendment notes on 0061.
 
 ---
@@ -323,7 +393,7 @@ wave are independent and can run in parallel.
 | 3 | *U-05, U-07, U-08(ii) landed 2026-09-06* | No ordering constraint remains |
 | 4 | *landed 2026-09-05* (S-02) | Highest blast radius (C-01 landed 2026-09-05 — see ADR 0054; S-01 landed 2026-09-05 — see ADR 0064; S-02 — see ADR 0066) |
 | 5 | *S-04, S-05, S-07b–d, C-02, C-05 all landed 2026-09-06* | S-05 strictly after S-04 |
-| 6 | *S-03 complete 2026-09-07 (all 3 PRs, ADR 0069)*; *S-07e/S-07 complete 2026-09-07 (ADR 0070)*; W-07, C-03 | XL or gated on earlier waves |
+| 6 | *S-03 complete 2026-09-07 (all 3 PRs, ADR 0069)*; *S-07e/S-07 complete 2026-09-07 (ADR 0070)*; *C-03 assessed 2026-09-07 — deferred, no PRs planned (see ADR 0044's matching amendment)*; W-07 | XL or gated on earlier waves |
 
 Open issues mapped: none left (#375 closed by W-01, #319 by W-05). Filed
 from wave 2's own findings: #590 (the operator still emits the deleted

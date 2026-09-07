@@ -745,6 +745,40 @@ argument/dispatch coverage) — several pre-existing one-shot arms
 `stream-grow`) still have no `admin_request` unit test of their own; see
 `docs/roadmap.md`'s matching note.
 
+## As-built (2026-09-07, issue #688) — `200` means the target actually leads
+
+The success criterion stated in the 2026-09-05 entry above — "this node
+confirmed stepping down, not a confirmed new leader elsewhere" — was itself
+the bug. Once armed, the old leader keeps heartbeating every peer and steps
+down on **any** higher-term Raft message, not only the named target's own
+`TimeoutNow`-triggered vote; under real scheduling jitter (the reproducing
+case: 3 real threads on a CPU-starved CI runner) a *third* voter this call
+never named can win the resulting election instead. "Stepped down" is
+therefore not proof "the requested transfer completed" — it is proof only
+that *some* election happened, and the route was reporting `200`
+regardless of which voter actually won it.
+
+Fixed: the poll now keeps going after step-down, reading this node's own
+live `RaftCore::leader()` belief (which keeps updating past step-down, via
+a genuine `AppendEntries`/`InstallSnapshot` from the new term's leader)
+until it names the target specifically. `200` only once it does. If this
+node stepped down but a *different*, stable voter is observed leading
+instead, the route now returns a distinct, retryable `409` naming that
+voter — the caller must retry the *whole* `POST`, not just wait, since this
+node's `RaftCore` can arm nothing further once it isn't the leader. The
+original arm/timeout `409` ("did not complete within Ns; retry") is
+unchanged and still covers "still this node" or "an election is still in
+flight." See `crates/animusd/CLAUDE.md`'s matching entry for the exact
+refusal text and `docs/engineering-lessons.md`'s issue #688 entry for the
+general lesson (a "the old holder let go" signal is not "the new holder has
+it" — a handoff route's success criterion must be the positive end state).
+Regression: `crates/animus-control/tests/transfer_third_voter_wins.rs` (a
+deterministic `SimEnv` reproduction of the race itself, at the `RaftCore`
+level — no route in sight) plus the updated
+`tests/admin_endpoint.rs::admin_control_transfer_moves_leadership_to_the_named_node`,
+which now retries the whole call against whichever node the new `409`
+names.
+
 ### Follow-up work
 
 - Auth in front of the admin port before any non-localhost exposure.

@@ -4129,6 +4129,51 @@ debugging anything that feels like it might have happened before.
   happened" — a genuinely idle group over a multi-second window still
   ticks its Raft heartbeat and produces nonzero traffic; zero-across-the-
   board means the recording path itself never wired up.
+- **A "sanity" precondition snapshot taken after commit-waited setup steps
+  races every background convergence loop the system runs, not just the
+  one the test is about (issue #690).**
+  `crates/animusd/tests/cp_rebalance.rs::
+  cluster_grown_to_five_nodes_rebalances_existing_tablets` writes one key
+  into each of six tables sequentially, commit-waiting each `put`, then
+  reads the tablet map ONCE and asserted, as a "sanity" precondition
+  before the real convergence assertion, that two specific nodes held
+  EXACTLY zero replicas. That exact-zero snapshot is not guaranteed: each
+  of the six commit-waited puts gives the control plane's own
+  `reconcile_loop`/`rebalance_step` (`REBALANCE_EVERY_N_TICKS`,
+  `animus-control/src/node.rs`) another chance to fire, so on a loaded
+  runner one rebalance move can land before the sixth put even returns —
+  CI observed exactly `{"n0": 5, "n1": 6, "n2": 6, "n3": 1, "n4": 0}`, an
+  early rebalance move, not a broken test. A transient failure-detector
+  `Down` belief on a provisioning node (ADR 0012) can independently skip a
+  node for one tablet's initial placement. Neither cause is a bug in the
+  rebalancer under test — the test's own setup phase was never insulated
+  from the very background loops the test exists to observe. **The fix is
+  never to assert the exact pre-convergence layout a setup phase happens
+  to produce — assert only the property the setup actually guarantees**:
+  here, that a real imbalance exists (`imbalance(&initial_counts) >= 2`,
+  which six sequential first-`min(N,3)`-Active-member puts under ADR 0023
+  provisioning do reliably produce) and that the two nodes in question
+  trail the busiest node (rather than pinning them at exactly zero) — weak
+  enough to survive an early partial rebalance, still strong enough that a
+  no-op or already-fully-converged planner cannot pass vacuously. General
+  form: any "sanity, before the real assertion" snapshot taken after a
+  setup phase that itself commit-waits (each wait is a scheduling point
+  for every other tick-driven loop in the process) must be re-derived from
+  first principles — what does the setup structurally guarantee, not what
+  did one observed run happen to produce — the same discipline this file's
+  entry on "eventual properties get a converged-or-timeout poll, never a
+  fixed-deadline one-shot assert" already applies to the test's *main*
+  assertion; a precondition snapshot is exactly as exposed to this race as
+  the property under test and needs the identical scrutiny, not a pass
+  because it merely runs first. **Same bug, different costume, in issue
+  #699**: `crates/animusd/tests/shared_wal_liveness.rs`'s load phase ran
+  writers for a fixed `LOAD_DURATION` and then asserted every table
+  completed more than `COMPACT_THRESHOLD` writes as a non-vacuity check —
+  a wall-clock-window write count is the identical "eventual property
+  observed as a one-shot" shape, just measured in throughput instead of a
+  map snapshot; the fix (as here) was converge-or-timeout — keep writing
+  until the count target is met, bounded by a generous stall timeout,
+  never widen the window to move the threshold.
 
 ### Code patterns
 - **A retryable-shaped error (the house `"; retry"` suffix) surviving string
@@ -20452,6 +20497,53 @@ the right reuse instinct, and the mutual-recursion compile error it
 produces is not a sign the approach is wrong — box the one call site that
 closes the cycle and move on**, rather than reaching for a bigger
 refactor the compiler error doesn't actually require.
+## Lowering a new multi-statement wire operation onto an *existing atomic primitive* (not a per-item loop) inherits that primitive's whole-set authorization/idempotency/cancellation-reporting for free — verify by grepping for what the primitive already checks, not by re-deriving it (2026-09-07, W-07 PR 5)
+
+`ExecuteTransaction` (ADR 0071) needed: 1..=25 statements parsed and
+lowered, whole-set `AccessDeniedException` before anything runs, duplicate-
+key rejection, `ClientRequestToken` idempotency for a write transaction,
+and per-statement `CancellationReasons` on a condition failure. The
+obvious-looking way to build this is a loop over the parsed statements,
+each calling into `PutItem`/`UpdateItem`/`DeleteItem`'s single-item path
+(the same shape `BatchExecuteStatement`, PR 4, correctly uses — a *batch*
+is genuinely per-request, no cross-statement atomicity by DynamoDB's own
+design). A *transaction*, though, already had a real cross-tablet atomic
+primitive one layer down (`animusd::dynamo::run_transact`/
+`run_transact_get`, ADR 0018 §2's 2PC machinery) built for
+`TransactWriteItems`/`TransactGetItems` — and that primitive already had
+every one of the five requirements above, because ADR 0066 §5 and ADR
+0018's own idempotency/`CancellationReasons` amendments were built into it
+directly, not bolted onto the wire decode layer. So the actual
+`execute_transaction` implementation is thin: parse every statement, lower
+each to one `TransactGet`/`TransactAction` (the wire-level building blocks
+`TransactGetItems`/`TransactWriteItems` already decode to), and call
+`run_transact_get`/`run_transact` unmodified — **zero new authorization
+code, zero new idempotency code, zero new cancellation-reporting code**.
+The whole-set `AccessDeniedException` end-to-end test
+(`dynamo_auth_policy.rs::execute_transaction_spanning_denied_table_writes_
+nothing`) passed on the first run with no `execute_transaction`-side
+authz call at all, because `run_transact`'s own `authz::
+authorize_each_table` already ran before any table was touched. **General
+lesson: before writing a new multi-item/multi-statement wire operation's
+authorization, idempotency, or atomicity from scratch, grep for an
+existing lower-level primitive built for the operation's real semantic
+shape (atomic-across-N vs. independent-per-N) and check what it already
+enforces** — re-deriving those properties at the new call site is not just
+extra work, it is a second place they can silently drift apart from the
+original (the exact "grep every gating match site" lesson elsewhere in
+this log, generalized from enum-variant classification to whole-function
+reuse). The one place new code genuinely was needed — the *lowering* from
+parsed PartiQL onto `TransactGet`/`TransactAction`, and the two
+transaction-specific restrictions neither `TransactGetItems` nor
+`TransactWriteItems` can express (a `SELECT` must be an exact-key read; a
+statement's own `RETURNING`/`ON CONFLICT DO NOTHING` has no
+success-path echo or per-statement-swallow analogue once any statement's
+failure cancels the whole transaction) — is exactly the part that could
+not have been inherited from anywhere, which is a useful signal in
+itself: if a requirement *can* be satisfied by delegating to an existing
+primitive, delegate; the requirements that can't are the ones that
+actually need new code and new tests.
+
 ## A multi-stage Dockerfile's builder and runtime stages must name the same Debian release, and the publish workflow must start the image, not just build it (S-07e's e2e-kind-webhook leg, the `runtime-operator` image)
 
 **What happened.** The `runtime-operator` image had been built and
@@ -20482,3 +20574,342 @@ something only our code prints (`animusd --help`'s usage line, `animus-
 operator crd`'s CRD document) before the push step, so a glibc skew, a
 missing shared library, or a wrong entrypoint fails the workflow instead
 of the first user.
+## A reservation that bumps an allocator without materializing a row means EVERY other minting command must check the floor, not just existence — and a comment claiming parity across sibling arms is not a test (issue #684, `CreateTablet`'s missing monotonic-allocator floor guard)
+
+`Metadata::next_tablet_id` (`crates/animus-control/src/meta.rs`) is a
+single, shared monotonic counter several different `MetaCommand` apply
+arms mint tablet ids from: `CreateTablet`, `BeginSplitInPlace`,
+`BeginRestore`, `BeginImport`. Three of the four correctly reject an id
+below `next_free_tablet_id()` — the "same monotonic-allocator floor" gate,
+each with a comment claiming parity with its siblings. `CreateTablet`'s
+own apply arm was the one that had actually drifted: it checked only
+`self.tablets.contains_key(tablet)` (existence) and the ADR 0023
+one-tablet-per-table rule, never the floor. That gap was invisible by
+inspection precisely because the *other* arms' comments asserted the
+parity that `CreateTablet` didn't have — reading any ONE of those arms in
+isolation looked correct and consistent with its neighbors.
+
+**Why existence-only checking is not enough**: `BeginSplitInPlace`
+reserves its two child ids by bumping `next_tablet_id` immediately at its
+own apply, but mints NO tablet-map row for either child until
+`CutoverSplit` runs later — by design, an in-place fork's children are
+materialized directly from the intent at cutover, not at `BeginSplitInPlace`
+time (ADR 0058). Between those two points, a reserved id exists in the
+allocator's own counter but has no row in `self.tablets` — `contains_key`
+returns `false` for it. A `CreateTablet` proposed for a wholly different
+table, computed from a `next_free_tablet_id()` read that predates the
+reservation, could therefore compute that exact same id, pass
+`CreateTablet`'s existence-only check, and land — its row then sat at the
+reserved id until the in-flight split's own `CutoverSplit` inserted its
+child there with an **unconditional** `self.tablets.insert(child.id, t)`,
+silently overwriting the other table's only tablet. Confirmed in CI on
+`animusd/tests/auto_split_min_tablets.rs`: table A's ADR 0067
+min-tablets-triggered split forked and reserved child ids while table B's
+`provision_tablet` (`crates/animusd/src/schema.rs`) raced a `CreateTablet`
+off a metadata read that predated the reservation — permanent, silent
+data loss of table B's only tablet.
+
+**Fix, two layers**: (1) the missing floor guard, added to `CreateTablet`'s
+apply arm, identical in shape and message (`"tablet id below the monotonic
+allocator"`) to its three siblings — this closes the actual production
+gap. (2) Defense in depth in `CutoverSplit` itself: its own child-insertion
+loop now rejects outright (`"child tablet id already occupied — allocator
+invariant violated"`, plus a `tracing::error!`) if either child slot is
+already occupied, rather than the previous unconditional overwrite — never
+trust that an upstream guard is the only thing standing between "reserved"
+and "safely materializable." A rejected `CutoverSplit` leaves the parent
+`Splitting` forever (nothing else can clear an occupied slot), but this is
+safe rather than a wedge: the `animusd` driver that proposes it
+(`index_drain::inplace_split_driver_tick`) is itself idempotent/stateless
+and already re-issues `CutoverSplit` every ~200ms tick "until the parent
+vanishes from the map," so a rejection here only ever strands the one
+already-corrupt split — loudly — never anything else in the cluster.
+
+**General form**: when several apply arms share one allocator-shaped
+counter, the floor check belongs on **every** command that can mint an id
+from it, not just the ones an author happened to think of at the time —
+"existence" and "not-below-the-floor" are two different, both-necessary
+guards, because a reservation-without-materialization design (bump the
+counter now, insert the row later) makes a window where an id is neither
+free nor yet present. And a comment on arm B asserting "same discipline as
+arm A" is not itself proof that arm A (or any other sibling) actually has
+that discipline — it's a claim that goes stale the instant a new sibling
+arm is added without updating every existing comment that named it. The
+regression test for this class of bug is not "does the guarded arm reject
+a duplicate/expired id" (that was already tested) but "does an UNRELATED
+concurrent minting command, racing the exact reservation window, get
+rejected too" — cheap to construct directly (mint the reservation, then
+attempt the unrelated command at the reserved id) and it is precisely the
+kind of cross-command interaction a single arm's own unit tests, however
+thorough, cannot catch by construction.
+- **A handoff route's success criterion must be the positive end state, not
+  the old holder letting go — "it stepped down" and "the new holder has it"
+  are different facts, and the second one is the only one a caller can act
+  on (issue #688, 2026-09-07).** `POST /admin/control/transfer` (ADR 0037,
+  ADR 0020) armed `RaftCore::transfer_leadership(target)` and, until this
+  fix, reported `200` the instant its own node was no longer the control
+  leader — treating "this node stepped down" as proof "the named target
+  now leads." Those are not the same fact: once armed, the old leader
+  keeps heartbeating every peer and steps down on **any** higher-term Raft
+  message it receives, not only a vote triggered by the target's own
+  `TimeoutNow` (`RaftCore::handle`'s ordinary higher-term step-down is
+  generic — it has no notion of "the vote I'm stepping down for is the one
+  I meant to arm"). Under real scheduling jitter — the reproducing case was
+  `admin_endpoint.rs` running 3 real OS threads on a CI runner starved
+  enough that the leader's heartbeats to *every* peer went missing
+  together — more than one follower's election timer can lapse on the same
+  gap, and a **third** voter this call never named can win the resulting
+  pre-vote/vote round before or instead of the target. The route's own
+  `admin_remove_control_member` self-removal sibling had already been hit
+  by a *related* but distinct bug (issue #405/#671, this file's own entry
+  above and below): "an arm attempt can fail outright with no retry of its
+  own." Issue #688 is the second, independent failure mode #671's own fix
+  left standing — even a **successfully armed** transfer can still resolve
+  to the wrong winner, and nothing about retrying the arm call touches
+  that, because the arm itself genuinely succeeded; what failed was the
+  route's own belief about who won afterward.
+
+  **Fix**: read the leader's own **live** `RaftCore::leader()` belief after
+  arming, not just its own `is_leader()` flag — `leader()` keeps updating
+  after this node steps down (cleared to `None` the instant a higher term
+  is observed, set to `Some(winner)` only once a genuine `AppendEntries`/
+  `InstallSnapshot` from that term's real leader arrives — never a guess),
+  so it can name the actual election winner even once this node is no
+  longer leader itself. `200` only once it names the requested target
+  specifically. If it names a **different**, stable voter instead, the
+  route returns a distinct, retryable `409` naming that voter, rather than
+  folding it into the same "did not complete; retry" message an arm/
+  timeout refusal uses — a caller needs to know it must retry the whole
+  `POST` against a *different* admin port (this node's own `RaftCore` can
+  arm nothing further once it isn't the leader), not just wait longer here.
+
+  **General rule, generalizing past this one route**: whenever a route's
+  job is to hand something off from A to B (leadership, a lease, a lock,
+  ownership of a resource), "A no longer holds it" is necessary but never
+  sufficient proof that "B now holds it" — something else could have taken
+  it in the gap. The success check must read the **new** holder's own
+  identity from a live, continuously-updated source, not infer it from the
+  old holder's absence; and the "wrong new holder" case deserves its own
+  distinguishable error from "no new holder yet," since a caller's retry
+  strategy differs (retry the same target vs. redirect to whoever actually
+  has it now).
+
+  **Test-design note**: the deterministic regression
+  (`crates/animus-control/tests/transfer_third_voter_wins.rs`) proves the
+  race exists in `RaftCore::transfer_leadership` itself, at the `SimEnv`
+  level, with no `animusd` route anywhere in the loop — it uses
+  `Simulator::pause` (freeze a node fully, deferring every timer/send/
+  delivery to the resume instant — the real CI flake's own root cause,
+  "every peer's heartbeats go missing together," not a one-sided
+  partition) rather than `Simulator::partition`, since a partition would
+  only isolate the leader from *one* other voter, not model "both
+  followers' election timers can lapse at once." A brute-force scan over
+  seeds 0..3000 with no other fault applied found plenty of seeds where the
+  transfer's own un-named third voter wins outright — this is not a rare
+  edge case requiring exotic fault injection, just an ordinary two-follower
+  election race the transfer route's old contract never accounted for.
+  (`crates/animusd/src/lib.rs::ClientCtx::
+  admin_transfer_control_leadership`, `crates/animusd/src/admin.rs::
+  action_transfer_control_leadership`, `crates/animus-control/src/node.rs::
+  RaftNode::leader`, `crates/animus-control/tests/
+  transfer_third_voter_wins.rs`.)
+
+## A batch operation authorizes each item independently; a transaction authorizes the whole set up front — don't let the batch precedent leak into the transaction one (2026-09-07, W-07 PR 4)
+
+`BatchExecuteStatement`'s per-statement handler
+(`animusd::dynamo::execute_one_batch_statement`) authorizes each
+statement's own table with a plain `authz::authorize` call and turns a
+denial into that one statement's own `AccessDenied` response entry —
+deliberately **not** `authz::authorize_each_table`, the whole-request
+pre-check `BatchGetItem`/`BatchWriteItem` already use to reject a request
+spanning an allowed and a denied table *before any of it runs*. This is
+the right call for a batch (AWS's own `BatchExecuteStatement` authorizes
+each statement independently against IAM, exactly like
+`BatchWriteItem`/`BatchGetItem` authorize each request item — but reports
+per-item, not per-request, since a batch already has no cross-item
+atomicity to protect: partially applying it is the *normal* outcome, not
+a hazard). The general shape worth remembering before implementing W-07
+PR 5 (`ExecuteTransaction`): **a batch's "no cross-item atomicity" and a
+transaction's "everything commits or nothing does" are opposite
+authorization postures, not two applications of the same pattern.**
+`TransactWriteItems`/`TransactGetItems` (`animusd::dynamo::run_transact`/
+`run_transact_get`) already use `authorize_each_table` for exactly this
+reason — a transaction cannot discover mid-flight that action #3 of 5 is
+denied and "partially commit" the first two, so the whole set must be
+checked before anything stages. `ExecuteTransaction` lowers onto
+`TransactWriteItems`/`TransactGetItems` (ADR 0071's own lowering table),
+so its authorization should inherit that same whole-set check — copying
+`BatchExecuteStatement`'s per-statement `AccessDenied` pattern onto it
+would be a silent semantic regression (a transaction that partially
+authorizes and partially runs), not a reuse win. When implementing a new
+batch/multi-item wire operation, decide this explicitly by asking "does
+this operation have cross-item atomicity to protect?" — if yes,
+whole-set pre-check (`authorize_each_table`); if no (each item's own
+success/failure is already independently reported), per-item check
+inside the loop.
+
+## AWS's `BatchStatementErrorCodeEnum` (and similar bare per-item error-code enums) are their own naming scheme, not a mechanical `...Exception` suffix strip (2026-09-07, W-07 PR 4)
+
+Every top-level DynamoDB error this adapter renders elsewhere carries an
+`...Exception` `__type` suffix (`ConditionalCheckFailedException`,
+`ResourceNotFoundException`, ...). `BatchExecuteStatement`'s own
+per-statement `Error.Code` field uses a *different*, AWS-defined bare
+enum (`BatchStatementErrorCodeEnum`) that looks at first glance like it's
+just that same code with `Exception` stripped
+(`ConditionalCheckFailedException` → `ConditionalCheckFailed`,
+`DuplicateItemException` → `DuplicateItem`) — but one member breaks the
+pattern: `ValidationException` maps to `ValidationError`, not
+`Validation`. A mapping function that mechanically strips a
+`...Exception` suffix instead of an explicit match table would have
+silently produced a code AWS's own SDKs don't recognize for the single
+most common per-statement failure (a parse error or the batch-only
+exact-key restriction, both `ValidationException` internally). **General
+lesson: when translating this adapter's own error taxonomy into a
+*different*, AWS-defined bare-code enum for a sub-response shape (per-item
+batch errors, per-action `CancellationReasons`, ...), write an explicit
+match table and check every member against AWS's actual published enum
+values — never assume a suffix-strip transform holds for the whole set
+just because it holds for most of it.**
+
+## Assessing a proposed roadmap item requires re-checking whether *later, unrelated* work changed the design, not just whether it closed the cost (2026-09-07, C-03 assessment)
+
+ADR 0044's cheap-groups roadmap named three per-group costs a future
+"asymmetric replicas" / log-only-replica phase (C-03) was meant to
+remove: WAL file, timers, storage engine. Checking whether C-03 was still
+*needed* was the easy half — two of the three were already closed by
+follow-up work that landed in the meantime (ADR 0048 quiescence, C-02
+heartbeat batching, C-05 `SharedWal`), and the third measured negligible
+on re-check (`idle_engine_cost.rs`: ~8 KB/idle-engine, far under its own
+2 MiB gating ceiling). The easy-to-miss half was that a *design*, not
+just a cost, had gone stale: ADR 0055 ("cheap eventually-consistent
+reads," 2026-08-23) shipped after C-03's own text was written and now
+depends on every replica of a tablet carrying a full applied engine — the
+exact thing a log-only replica is defined not to have — specifically to
+fix v1's own "no read scaling" gap. Grepping for whether the *target
+cost* still existed would have missed this; only reading forward through
+every ADR that touched the same subsystem after the proposal was written
+surfaced the conflict. **General lesson: before sizing or reviving a
+long-parked roadmap item, don't just ask "is the cost it targeted still
+real" — also check what shipped *since* the proposal was written that the
+proposal's own design now has to coexist with. A follow-up ADR/PR that
+never mentions the parked item by name can still silently invalidate its
+premise.**
+
+## A narrowed generic split of a dispatcher must not become the production dispatcher's ONLY path for cases the narrowing dropped (ADR 0061 rung D2 PR 1)
+
+Splitting `dynamo::run_operation` into "a new generic core for the ops that
+had no `ProdEnv` entanglement" plus "the concrete production entry point
+for the rest" is a sound shape — but the first cut wired it wrong in a way
+that looked safe and wasn't. `dispatch_item_op<E, R>` was built to cover
+only a **base-table** `Query`/`Scan` (an `index` name deliberately returns
+"not yet supported," since genericizing the real GSI/LSI dispatch tree was
+out of this PR's scope). The first version then routed `run_operation`'s
+own `Query`/`Scan` arms through that same narrowed function — reasoning
+that "it's monomorphized at `E = ProdEnv` for production, so behavior is
+unchanged" felt true by analogy with the other six delegated operations
+(`PutItem`/`DeleteItem`/`GetItem`/`BatchGetItem`/`UpdateItem`/
+`BatchWriteItem`, which really were a byte-identical pure move). It wasn't:
+for `Query`/`Scan` specifically, the delegation replaced a call to the
+*full-featured* `run_query`/`run_scan` (real GSI/LSI dispatch) with a call
+to a function that structurally cannot serve an index query at all — a
+real behavior change, not merely the same logic at a different type
+parameter. `cargo test -p animusd --lib` caught it immediately: four
+`index_drain::gsi_drain_cursor_tests` failures, each a real GSI query
+timing out on the narrowed function's own "not yet supported" error. The
+fix was to exclude `Query`/`Scan` from the delegated set entirely and keep
+`run_operation` calling the original, unmodified `run_query`/`run_scan`
+directly — `dispatch_item_op`'s own narrower `Query`/`Scan` arms exist only
+for the new generic entry point (`execute_item_op_as`, reached by
+`SimCluster`), never for production. **General lesson: when factoring "a
+generic core covering only a subset of cases" out of an existing
+dispatcher, a production call site that used to reach the FULL behavior
+must keep reaching the full behavior — never get silently rerouted through
+the narrowed core just because the core happens to share a name/shape with
+what it replaced. "The call is monomorphized so it's unaffected" is not by
+itself proof of anything if the callee itself is a genuinely different,
+narrower function — verify by running the touched dispatcher's own full
+existing test suite (not just the new harness) before trusting that
+argument.**
+
+## `leader_index_of` answers "who does this replica locally believe leads," which is the wrong question to ask about a node you just crashed (ADR 0061 rung D2 PR 1)
+
+`SimCluster::crash` mutes a node (its tasks stay alive, its inbox is
+cleared) — it does not stop its internal Raft state, and nothing tells a
+muted node that its peers re-elected without it, since every message that
+would carry that news is exactly what got muted. `is_leader_local`
+(`leader_index_of`'s own per-node predicate) is a **local** read of that
+frozen state, so calling `leader_index_of` again right after `crash` + an
+election window can — and, on one seed, did — return the **crashed**
+node's own id, not whichever survivor actually won the new election
+(`assert_ne!(new_leader, leader)` failed with `left: 0, right: 0`). The
+existing `sim_cluster.rs` scenario 3 already avoids this by never calling
+`leader_index_of` post-crash at all: it picks any survivor node index and
+routes the write through it, relying on `cp_kind_write_item`'s/
+`cp_kind_write_raw`'s own hint-chasing `forward_to_tablet_leader` loop to
+find the real new leader internally. The new `sim_cluster_dynamo.rs`
+crash/restart scenario didn't follow that precedent on the first draft and
+hit the exact failure the precedent exists to avoid. **General lesson: a
+"who currently leads" accessor backed by one replica's own local state is
+answering "what does THIS node believe," not "what is objectively true
+right now" — it is unsafe to call on a node that was just faulted (crashed,
+partitioned) until it has had a chance to actually learn the outcome. When
+a test needs "the current leader" immediately after injecting a fault
+against the previous one, route through the system's own forwarding/
+hint-chasing instead of re-deriving the answer from a local accessor that
+has no way to have heard it yet.**
+
+## A shared list-append checker has no "weak read" flag — exclude an eventually-consistent observation from its graph and check it against convergence instead, don't teach the checker a new mode (ADR 0061 rung D2 PR 2)
+
+`sim_cluster_dynamo_corpus.rs` is the first corpus to drive `ConsistentRead:
+false` (ADR 0055's replica-local, un-barriered read path) through
+`animus_test::check::check_cycles` — every earlier corpus in this workspace
+that reuses that same shared, cross-crate checker (`raftkv_linearizable.rs`,
+`sim_cluster_corpus.rs`, `txn_serializable.rs`) only ever issues
+linearizable reads, so the question never came up. `check_cycles`'s
+`recover` requires every **observed** read of a key to be a prefix of that
+key's one recovered (longest-observed) append order — sound for a
+linearizable read (a forked/stale strong read is exactly the anomaly the
+checker exists to catch), but a legitimately-stale *weak* read is not the
+same defect class: feeding one into the same graph risks a false-positive
+"divergence" violation the instant a lagging replica answers during a fault
+window, purely an artifact of mixing a read consistency the model was never
+built to represent into a model that has no way to say "this one's allowed
+to lag." Teaching the shared checker a new "weak read" flag was rejected —
+`check_cycles`/`check_durability`/`check_convergence` are used by several
+crates' worth of corpora with a stable, well-understood contract, and
+widening it for one caller's read-consistency dimension risks changing
+behavior for every other caller silently. The fix: exclude the weak
+observation from the shared history entirely and check it directly against
+the scenario's own converged final state instead (`observed.starts_with`
+the converged list) — sound specifically because single-writer-per-key
+already guarantees a total order per key, so any replica's local snapshot
+at any time is *some* prefix of that one order, never a value out of order
+or one that never committed. This is the identical shape
+`sim_cluster_corpus.rs` already used for `delete` (a tombstoning op the
+list-append model can't represent either) — **a workload dimension the
+shared checker's model doesn't fit gets its own direct check outside that
+checker, not a checker extension.** General lesson: before adding a new
+mode/flag to a shared, multi-caller correctness oracle to accommodate one
+new corpus's workload shape, ask whether the new dimension can instead be
+excluded from the shared model and verified by a purpose-built check
+against the same converged state the shared checks already establish —
+usually cheaper, and it can't regress every other caller's contract.
+
+## A document-path update function whose operand must already exist (`list_append`) composes with `if_not_exists` for the absent-key case for free — no separate provisioning write is needed (ADR 0061 rung D2 PR 2)
+
+`UpdateExpression`'s `list_append(a, b)` requires both operands to already
+be lists — a missing `a` (the common "first write to this key" case for an
+append-workload corpus) is a validation error, not an implicit empty list.
+`sim_cluster_dynamo_corpus.rs`'s own write is `SET items =
+list_append(if_not_exists(items, :empty), :v)`: `if_not_exists`'s own
+default-value branch supplies the empty seed inline, in the same expression,
+with no separate `PutItem`/`BatchWriteItem` provisioning step needed before
+the first append — verified by this corpus's very first run (which never
+provisions a key ahead of time) landing every append correctly from a
+key's first touch onward, at every seed. Worth remembering generally: when
+building any DynamoDB-wire workload around `list_append` (or any other
+function whose grammar requires an existing operand), reach for
+`if_not_exists(path, default)` as the composed operand rather than a
+separate upsert/provisioning write — it is both fewer requests and fewer
+places for a corpus's own bookkeeping to drift from the server's actual
+state.
