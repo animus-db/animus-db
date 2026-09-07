@@ -334,8 +334,12 @@ pub trait AdminHost: Send + Sync {
     async fn metrics_history_view(&self) -> Value;
     /// `GET /admin/member/drain-status?node=`.
     async fn member_drain_status(&self, query: &str) -> (u16, Value);
-    /// `GET /admin/health`.
+    /// `GET /admin/health` — readiness.
     async fn health(&self) -> (u16, Value);
+    /// `GET /admin/live` — liveness (issue #710): unconditional `200`, no
+    /// dependency on control-leader knowledge, hosting, or role — never
+    /// gate this on the same signal [`health`](Self::health) uses.
+    async fn live(&self) -> (u16, Value);
     /// `POST /admin/tablet/split`.
     async fn action_split(&self, body: &[u8]) -> (u16, Value);
     /// `POST /admin/stream/grow`.

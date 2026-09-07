@@ -37,7 +37,8 @@
 //! - `GET  /admin/restores`            — the replicated restore catalog: id, backup id, source/target table, status, destination tablet + its live state (ADR 0059 §7, Train 2; pure observer — the DynamoDB wire surface, `RestoreTableFromBackup`, is `animusd::dynamo::restore_table_from_backup`)
 //! - `GET  /admin/metrics`             — the metrics snapshot as JSON, plus per-tablet `stream_change_rates` (ADR 0042 §14, growth PR3 Fork F) and `request_rates` (W-09, ADR 0034 amendment)
 //! - `GET  /admin/metrics/history`     — periodic snapshots, ~2h ring buffer (ADR 0021 sparklines)
-//! - `GET  /admin/health`              — liveness/readiness
+//! - `GET  /admin/health`              — readiness: 503 until the control plane has had a RECENT leader (`leader_within` hysteresis, issue #595) — the Kubernetes readiness probe (ADR 0060)
+//! - `GET  /admin/live`                — liveness: 200 whenever this admin server can answer at all, independent of control-leader knowledge, hosting, or role — the Kubernetes liveness probe (ADR 0060's 2026-09-07 amendment, issue #710; `/admin/health` must never back a liveness probe, since a healthy joining process can go a full `advance_control_growth` reconcile cycle with no known leader)
 //! - `POST /admin/tablet/split`        — `{tablet, split_key}`
 //! - `POST /admin/stream/grow`         — `{table}` — split every tablet of a streamed table at its byte-weighted median (ADR 0042 §14, growth PR3)
 //! - `POST /admin/storage/flush`       — `{tablet}`
@@ -473,6 +474,9 @@ impl AdminHost for ClientCtx {
     }
     async fn health(&self) -> (u16, Value) {
         health(self)
+    }
+    async fn live(&self) -> (u16, Value) {
+        live(self)
     }
     async fn action_split(&self, body: &[u8]) -> (u16, Value) {
         action_split(self, body).await
@@ -1905,6 +1909,40 @@ fn health(ctx: &ClientCtx) -> (u16, Value) {
     // signal, hysteresis-gated per issue #595); 200 once it does (whether
     // this node leads or follows).
     (if leader_recent { 200 } else { 503 }, body)
+}
+
+/// `GET /admin/live` (ADR 0060's 2026-09-07 amendment, issue #710): the
+/// **liveness** signal, deliberately unconditional — `200` whenever this
+/// admin server is up enough to answer at all, with **no** dependency on
+/// control-leader knowledge, tablet hosting, or node role.
+///
+/// This exists because [`health`] above must NOT double as a liveness
+/// probe: a pod recreated by the config-hash rolling restart (or joining
+/// fresh) has no control leader until `animus-operator`'s
+/// `advance_control_growth` adds it as a voter, which happens at most once
+/// per reconcile — a healthy, correctly-joining process can go well past a
+/// `livenessProbe`'s failure window with `/admin/health` legitimately
+/// `503`. Gating liveness on the same hysteresis-gated `leader_within`
+/// signal as readiness (issue #595) turned that ordinary join window into
+/// a `SIGTERM` of a healthy process, restarting the join and, in the
+/// worst case, cycling forever. See
+/// `docs/adr/0060-kubernetes-operator.md`'s 2026-09-07 amendment and
+/// `docs/engineering-lessons.md`'s matching entry for the full account.
+///
+/// `control_leader_recent` is carried in the body as a pure diagnostic
+/// (mirroring [`health`]'s own field) so an operator staring at
+/// `/admin/live` mid-incident can see readiness state at a glance — it
+/// never affects this route's own status code.
+fn live(ctx: &ClientCtx) -> (u16, Value) {
+    let r = &ctx.control;
+    let health_grace = r.election_timeout() * HEALTH_LEADER_GRACE_ELECTION_TIMEOUTS;
+    let leader_recent = r.leader_within(health_grace).is_some();
+    let body = json!({
+        "ok": true,
+        "role": node_role_str(&ctx.admin),
+        "control_leader_recent": leader_recent,
+    });
+    (200, body)
 }
 
 // ---- operator actions ---------------------------------------------------
