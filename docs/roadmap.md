@@ -419,11 +419,40 @@ the still-true paragraph after the table.
   gate fires before cursor validation and is unconditionally true here) —
   see ADR 0061's 2026-09-07 "D3 PR 3a" amendment and `crates/animusd/
   CLAUDE.md`'s Tests section.
+  **PR 3b landed 2026-09-07, closing the GSI-drain gap PR 3a left
+  open**: `index_drain::drain_tablet`/`reconcile_partition` widened to
+  `<E, R>` (a pure signature change — every callee was already generic;
+  proven behavior-identical by running the full pre-existing real-socket
+  regression net against the widened code before trimming anything), plus
+  a new `SimCluster::drain_gsi` fixture helper (`sim_cluster.rs`) that
+  materializes a GSI's hidden table on demand by replicating `change_
+  consumer_loop`'s own per-tablet guard sequence by hand (its `is_
+  quiesced()`/`Building`-child skips are structurally unreachable under
+  this fixture and are documented as such rather than replicated). Flips
+  PR 3a's own boundary regression (`gsi_query_reads_empty_under_the_
+  fixture_until_the_drain_generalizes` → `gsi_query_materializes_rows_
+  after_a_drain`) and converts every GSI-data test PR 3a had to leave on
+  `ProdEnv` — 12 tests across nine sibling modules (two new: `sim_cluster_
+  dynamo_documents.rs`, `sim_cluster_dynamo_schema.rs`), plus a sim twin of
+  `dynamo_indexes.rs::gsi_write_then_query` that does not replace the
+  original (D2 PR 1's own real-socket proof of `run_operation`'s
+  independent path). Seven `tests/dynamo_*.rs` files deleted whole
+  (`dynamo_query_filter.rs`/`dynamo_query_pagination.rs`/`dynamo_query_
+  range.rs`/`dynamo_scan_index_forward.rs`/`dynamo_select.rs`/`dynamo_
+  documents.rs`/`dynamo_update_add_delete.rs`), one trimmed (`dynamo_
+  schema.rs`, one of three tests removed). A small, unplanned fixture fix
+  was needed too: `SimClusterHandle::leader_index_of` used to scan only
+  the hand-hosted-table bookkeeping `SimCluster::create_table_with_
+  replication` populates, which every wire-created table (every table this
+  PR's own tests use) never gets an entry in — fixed to scan every node id
+  instead. See ADR 0061's 2026-09-07 "D3 PR 3b" amendment and `crates/
+  animusd/CLAUDE.md`'s SimCluster/Tests sections.
   D3's remaining classes (`UpdateTable`'s stream/index changes, Transact,
   PartiQL, Streams, TTL, admin/console/dashboard HTTP, TLS, SigV4,
   restart-durability, wall-clock timing) and D4 (deterministic coverage for
   auto-split/GC/join/backup-janitor), plus a real `SimCluster` `Reconciler`
-  and a generalized GSI drain (the gaps just above), remain open.
+  (the reconciler-hazard gap PR 2a found and left open), remain open. The
+  GSI-drain gap specifically is closed as of PR 3b.
 - **E1 landed 2026-09-04** (`ClusterApi`/`AdminOps` seams in
   `animus-operator`, fake-driven `controller::tests`; ADR 0061's
   2026-09-04 amendment). **E2 landed 2026-09-07**: the seven pre-existing

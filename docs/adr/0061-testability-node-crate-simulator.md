@@ -842,7 +842,7 @@ supply one, and isn't trying to.
 |---|---|
 | D1 | `SimCluster` harness: a multi-node cluster driven by `SimEnv`, on B1's shared corpus scaffolding. Built on `ClientCtx<SimEnv>` in `animusd`'s own tests, per the seventh 2026-08-28 amendment — not on a moved `animus-node` assembly |
 | D2 | An end-to-end DynamoDB-wire corpus — requests in at the wire edge, faults injected, resulting history checked by the existing `check_cycles`/`check_durability`/`check_convergence`. **Landed 2026-09-07 (both PRs)**: PR 1 (six item operations generic, `SimClusterHandle::dynamo`, a first small smoke) and PR 2 (the actual `Recorder`/`History` corpus over the wire, see the amendments below); GSI/LSI, transact, and PartiQL remain out of scope, named as D2's own residuals |
-| D3 | Migrate the `animusd` integration suite: **keep** the tests that genuinely prove real-thread liveness (group commit, lock contention, election timing — per the engineering-lessons rule that `SimEnv` does not prove thread liveness), convert the rest. **Success criterion corrected 2026-09-07** (see that date's own "D3 PR 1" amendment): the `prod-liveness` job's 2-attempt retry was already replaced by nextest sharding before D3 started, so there is no retry to drop — success is measured by the real-thread tier's own shrinking test count / wall time / flake surface instead. **PR 1 landed 2026-09-07**: the base-table-only "B class" (~30 tests across ten `dynamo_*.rs` binaries plus `kind_batch_outcome.rs`) converted to `SimCluster`. **PR 2a landed 2026-09-07**: `Metadata::members` population + `ClusterEdgeState::control` widened to `RaftNode<E>` make base-table DDL (`CreateTable`/`DeleteTable`/`ListTables`/`DescribeTable`, via new `dynamo::dispatch_table_op`) drivable over the real wire; two real fixture bugs found and fixed (a liveness-detector heartbeat gap, a tablet-id-allocator collision) and one genuine, documented `SimCluster` gap found and left open (a rebalanced-away replica's `RaftKvNode` is never torn down — see that date's own "D3 PR 2a" amendment). **PR 2b landed 2026-09-07**: `UpdateTable`'s own throughput-only change (`BillingMode`/`ProvisionedThroughput`, ADR 0065) is now drivable too, via a widened `dynamo::update_table_throughput` and a new `UpdateTable` arm on `dispatch_table_op` — five more `dynamo_throttling.rs` tests converted, no new fixture bugs (see that date's own "D3 PR 2b" amendment). **PR 3a landed 2026-09-07**: GSI/LSI `Query`/`Scan` dispatch through `SimCluster`, plus `CreateTable` with a declared GSI/LSI — eight functions widened to `<E, R>` (`run_index_query`/`run_gsi_query`/`run_lsi_query`/`run_index_scan`/`run_gsi_scan`/`run_lsi_scan`/`paginated_kind_examine`/`paginated_kind_examine_one`), 42 tests converted across nine new sibling modules; a GSI row is still never materialized under `SimCluster` (no drain loop spawned), pinned by its own new regression, so every GSI-*data* test stays on `ProdEnv` (see that date's own "D3 PR 3a" amendment) |
+| D3 | Migrate the `animusd` integration suite: **keep** the tests that genuinely prove real-thread liveness (group commit, lock contention, election timing — per the engineering-lessons rule that `SimEnv` does not prove thread liveness), convert the rest. **Success criterion corrected 2026-09-07** (see that date's own "D3 PR 1" amendment): the `prod-liveness` job's 2-attempt retry was already replaced by nextest sharding before D3 started, so there is no retry to drop — success is measured by the real-thread tier's own shrinking test count / wall time / flake surface instead. **PR 1 landed 2026-09-07**: the base-table-only "B class" (~30 tests across ten `dynamo_*.rs` binaries plus `kind_batch_outcome.rs`) converted to `SimCluster`. **PR 2a landed 2026-09-07**: `Metadata::members` population + `ClusterEdgeState::control` widened to `RaftNode<E>` make base-table DDL (`CreateTable`/`DeleteTable`/`ListTables`/`DescribeTable`, via new `dynamo::dispatch_table_op`) drivable over the real wire; two real fixture bugs found and fixed (a liveness-detector heartbeat gap, a tablet-id-allocator collision) and one genuine, documented `SimCluster` gap found and left open (a rebalanced-away replica's `RaftKvNode` is never torn down — see that date's own "D3 PR 2a" amendment). **PR 2b landed 2026-09-07**: `UpdateTable`'s own throughput-only change (`BillingMode`/`ProvisionedThroughput`, ADR 0065) is now drivable too, via a widened `dynamo::update_table_throughput` and a new `UpdateTable` arm on `dispatch_table_op` — five more `dynamo_throttling.rs` tests converted, no new fixture bugs (see that date's own "D3 PR 2b" amendment). **PR 3a landed 2026-09-07**: GSI/LSI `Query`/`Scan` dispatch through `SimCluster`, plus `CreateTable` with a declared GSI/LSI — eight functions widened to `<E, R>` (`run_index_query`/`run_gsi_query`/`run_lsi_query`/`run_index_scan`/`run_gsi_scan`/`run_lsi_scan`/`paginated_kind_examine`/`paginated_kind_examine_one`), 42 tests converted across nine new sibling modules; a GSI row is still never materialized under `SimCluster` (no drain loop spawned), pinned by its own new regression, so every GSI-*data* test stays on `ProdEnv` (see that date's own "D3 PR 3a" amendment). **PR 3b landed 2026-09-07, closing D3's own GSI-drain boundary**: `index_drain::drain_tablet`/`reconcile_partition` widened to `<E, R>` and a new `SimCluster::drain_gsi` fixture helper materialize a GSI's hidden table on demand, flipping PR 3a's own boundary regression positive and converting every GSI-data test it had to leave on `ProdEnv` (12 tests across nine sibling modules, two of them new: `sim_cluster_dynamo_documents.rs`, `sim_cluster_dynamo_schema.rs`) plus a sim twin of `dynamo_indexes.rs::gsi_write_then_query` that does not replace the original; seven `tests/dynamo_*.rs` files deleted whole, one trimmed (see that date's own "D3 PR 3b" amendment). D3 is now closed for the GSI-drain gap specifically — remaining `ProdEnv` binaries are there for real-thread-liveness or not-yet-generic-operation reasons |
 | D4 | Deterministic coverage for the behaviours that have none today: the auto-split byte trigger (`lib.rs:14397`), the dropped-table GC reclaim loop, join/growth sequencing, and the backup-janitor async loop (its replicated state machine is already sim-tested in `animus-control/tests/backup_catalog.rs`; the loop driving it is not) |
 
 Note that the copy-based split driver (ADR 0050) is deliberately **not** on
@@ -1973,6 +1973,149 @@ base test) confirmed deterministic; `Cargo.lock` unchanged.
 materialize a GSI's own hidden table — the boundary this PR's own new
 regression pins. `TransactWriteItems`/`TransactGetItems` and PartiQL
 remain unreached D2 residuals, untouched by this PR.
+
+#### 2026-09-07 amendment — D3 PR 3b landed: GSI rows materialize under `SimCluster` on demand, closing PR 3a's own boundary
+
+PR 3b closes the exact gap PR 3a's own amendment named: a GSI's hidden
+`<base>$<index>` table never got a tablet under `SimCluster` because
+nothing in that fixture ever ran `index_drain::change_consumer_loop`'s
+GSI-drain arm. Two changes, both minimal in scope:
+
+**Two signatures widened, no behavior change.** `index_drain::
+drain_tablet` (now `pub(crate)`, so a sibling module can call it) and its
+private helper `reconcile_partition` both go from a bare `ctx: &ClientCtx`/
+`group: &CpGroup` (the crate's `ProdEnv`/`AnimusdRelayClient` default type
+parameters, elided) to `<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>,
+.., group: &CpGroup<E>, ..)`. Neither function's body needed any change —
+every callee they use (`group.cursor_min_watermark`/`pending_changes`/
+`local_get_kind`/`local_scan_bounded`/`scope_range`,
+`ctx.provision_tablet`/`cp_kind_write_raw`/`cp_kind_write_raw_once`) was
+already `<E: Env>`/`<E: Env, R: RelayClient>`-generic, the same "only the
+concrete parameter type was `ProdEnv`-binding" shape PR 3a's own eight
+functions had. Proven behavior-identical, not just believed to be: the
+full pre-existing real-socket regression net for both functions
+(`dynamo_gsi_drain.rs`, every `tests/dynamo_*.rs` file this PR goes on to
+trim or delete, `update_table_create_index.rs`/`update_table_drop_index.rs`/
+`index_backfill.rs`) was run in full against the widened code before any
+`ProdEnv` file was touched, and passed unchanged (see Gates, below).
+`change_consumer_loop` itself is untouched — only its two callees widened;
+the loop's own five-arm structure, quiescence veto, and the other four
+arms (seal/PITR-seal/backfill-seeder/hot-trim) are out of this PR's scope,
+exactly as the brief said.
+
+**`SimCluster::drain_gsi(&mut self, node: u64, table: &str)`** (new,
+`sim_cluster.rs`) is the fixture-side half: a test-only stand-in for
+`change_consumer_loop`'s GSI-drain arm, not a second implementation of it.
+For every tablet `node`'s own `ClusterEdgeState::hosted_groups()` both
+hosts *and* leads whose `Metadata` row names `table`, it recomputes `gsis`
+the identical way the production loop does (`meta.table_indexes(table)`
+filtered to `IndexKind::Global` with status `Creating`/`Active`) and calls
+[`index_drain::drain_tablet`] once, then drives the simulator (via the
+crate's existing `spawn_and_capture` idiom, `OP_BUDGET` = 12s of virtual
+time) until every resulting `cp_kind_write_raw` call — the GSI row
+writes/deletes and the trailing cursor write — has actually committed.
+Two of the production loop's own guards are replicated by hand (the
+leader check; the hidden-index-table name skip); two are **not**, because
+they are structurally unreachable under this fixture rather than merely
+untested: `is_quiesced()` always answers `false` (`SimCluster` never calls
+`RaftKvNode::enable_quiescence`), and no tablet here is ever `Building`
+(this fixture never splits a table). Both omissions are stated in the
+method's own doc, not silently assumed — a future rung that gives
+`SimCluster` real quiescence or splitting would need to add them back.
+
+**A second, small, unplanned fixture fix was needed to make `drain_gsi`
+usable at all**: `SimClusterHandle::leader_index_of` used to resolve a
+tablet's leader by scanning only `SimCluster::create_table_with_
+replication`'s own hand-hosted-table bookkeeping (`self.tablets`, populated
+by exactly one call site) — every table `drain_gsi`'s own callers create is
+created through the real DynamoDB wire instead
+(`cluster.dynamo(0, "..CreateTable", ..)`, PR 2a/3a's own path), which
+never populates that map at all, so `leader_index_of` always answered
+`None` for one. Fixed by scanning every node id (`0..node_count`) instead
+— strictly more general, and no less correct for a hand-hosted table
+either, since `is_leader_local` already answers `false` for a node hosting
+no replica of the tablet regardless of which set the caller iterates. See
+`docs/engineering-lessons.md`'s matching entry.
+
+**The boundary test flips, as PR 3a's own doc promised it would.**
+`sim_cluster_dynamo_table_ops.rs::gsi_query_reads_empty_under_the_fixture_
+until_the_drain_generalizes` is renamed `gsi_query_materializes_rows_
+after_a_drain` and inverted: `CreateTable` with a declared GSI, `PutItem`,
+confirm the hidden index table has **no** tablet and the query reads
+`Count: 0`, then `drain_gsi`, confirm the hidden table now **has** a
+tablet, then confirm the same query returns the row. `cross_index_cursor_
+mismatch_is_rejected`'s dropped fourth sub-case ("a base cursor replayed
+against the GSI") is restored in `sim_cluster_dynamo_query_pagination.rs`
+now that a real tablet lets the cursor-shape check run before the
+empty-page gate would have masked it.
+
+**Every GSI-*data* test PR 3a's own sibling modules had to leave on
+`ProdEnv` converts**: `sim_cluster_dynamo_query_filter.rs`
+(`filter_applies_to_a_gsi_query`), `sim_cluster_dynamo_query_pagination.rs`
+(`gsi_query_paginates_with_the_scan_cursor_shape`, plus the restored
+cursor sub-case above), `sim_cluster_dynamo_query_range.rs`
+(`gsi_range_queries_over_mixed_digit_count_n_sort_keys`), `sim_cluster_
+dynamo_scan_index_forward.rs` (`descending_applies_to_a_gsi_query`,
+`gsi_scan_index_forward_orders_n_sort_keys_numerically`), `sim_cluster_
+dynamo_select.rs` (`count_select_applies_to_a_gsi_query`) — six tests
+across five existing sibling files, each now fully converted (their own
+`tests/dynamo_*.rs` source deleted). Three more conversions needed new
+homes: `dynamo_documents.rs`'s all three tests (`document_set_types_
+projection_and_return_values`, `multiple_gsis_composite_gsi_and_lsi`,
+`n_partition_key_routes_and_reads_correctly` — only the middle one
+actually touches a GSI) move to a new `sim_cluster_dynamo_documents.rs`;
+`dynamo_update_add_delete.rs`'s last remaining test
+(`an_add_that_changes_an_indexed_attribute_reindexes`) moves into the
+existing `sim_cluster_dynamo_update_add_delete.rs`, draining twice (once
+for the pre-update baseline, once after the `ADD`-driven reindex) rather
+than polling; `dynamo_schema.rs`'s `create_table_index_replicates_to_
+second_node` moves to a new `sim_cluster_dynamo_schema.rs` (that file's
+other two tests, the restart proof and `extended_surface`, stay — the
+former needs real WAL durability `SimCluster`'s `MemoryEngine` tier can't
+give, the latter drives `TransactWriteItems` and other operations
+`dispatch_item_op` doesn't reach yet). Finally, per this rung's own
+instruction, `dynamo_indexes.rs::gsi_write_then_query` — D2 PR 1's
+real-socket proof that `run_operation`'s own path works independently of
+`dispatch_item_op` — is **not** deleted; `sim_cluster_dynamo_indexes.rs`
+gains `gsi_write_then_query_sim`, a sim twin proving the identical write/
+query/delete/reject sequence through the generic core instead.
+
+**Files fully converted and deleted** (`crates/animusd/tests/`):
+`dynamo_query_filter.rs`, `dynamo_query_pagination.rs`, `dynamo_query_
+range.rs`, `dynamo_scan_index_forward.rs`, `dynamo_select.rs`, `dynamo_
+documents.rs`, `dynamo_update_add_delete.rs` — seven files. `dynamo_
+schema.rs` is trimmed (one of three tests removed); `dynamo_indexes.rs` is
+untouched.
+
+**Gates**: `cargo fmt --all --check`; `cargo clippy -p animusd
+--all-targets --all-features -- -D warnings` (clean); `cargo test -p
+animusd --lib` — 294 before this PR, 306 after (12 new: table_ops's
+boundary test flip is a rename with no count change, +1 pagination, +1
+query_filter, +1 query_range, +2 scan_index_forward, +1 select, +1
+update_add_delete, +3 documents, +1 schema, +1 indexes; zero regressions,
+~115s wall, 3 ignored throughout; `gsi_drain_cursor_tests` stays green);
+`cargo build -p animusd --all-targets` (green); `cargo test -p animusd
+--test dynamo_gsi_drain --test dynamo_indexes --test update_table_
+create_index --test update_table_drop_index --test index_backfill` plus
+every one of the eight `tests/dynamo_*.rs` files this PR trims or
+deletes — all thirteen run in full **before** commit B against the widened
+`index_drain.rs`, green (confirming production behavior is byte-identical
+after the widening), and the survivors (`dynamo_schema.rs`'s remaining
+four tests, the five unchanged binaries) re-run green after; `ANIMUS_SEED`
+replay of two converted GSI tests (`sim_cluster_dynamo_table_ops::
+gsi_query_materializes_rows_after_a_drain`, `sim_cluster_dynamo_update_
+add_delete::an_add_that_changes_an_indexed_attribute_reindexes`) at six
+seeds each, all deterministic; `Cargo.lock` unchanged.
+
+**Still deferred, unchanged from PR 3a's own residual list**:
+`TransactWriteItems`/`TransactGetItems` and PartiQL remain unreached D2
+residuals. `SimCluster`'s own reconciler-hazard gap (a rebalanced-away
+replica's `RaftKvNode` is never torn down, PR 2a's own finding) is
+likewise untouched — every test in this PR stays at `node_count <= 3`.
+This closes the D3 rung's own GSI-drain boundary in full; the remaining
+`tests/dynamo_*.rs` binaries left on `ProdEnv` are there for genuine
+real-thread-liveness or not-yet-generic-operation reasons, not the drain
+gap.
 
 ### Phase E — the untested crates
 

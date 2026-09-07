@@ -5798,23 +5798,43 @@ path (see the bullet above) and a real `DataRole` (`sim_cluster_dynamo.rs`,
 D2 PR 1, gave every node a real one — `data: None` was this rung's own
 original shape, not the current one).
 
-**A GSI's own hidden table is never materialized under this fixture, at
-any depth (ADR 0061 rung D3 PR 3a)** — `create_table` proposes a declared
-index's `CreateTableIndex` schema-catalog entry (since PR 3a, base table or
-not — see the D3 PR 3a note below), but the hidden `<base>$<index>` table's
-own tablet is minted lazily, the first time `index_drain::change_consumer_
-loop` (the GSI drain background loop) actually drains a row into it.
-`SimCluster` never spawns that loop (this section's own "hand-hosted, not
-reconciler-hosted" bullet), so `run_gsi_query`/`run_gsi_scan`'s own
-`!meta.has_table_tablet(&index_table)` gate is unconditionally true here —
-not "the rows are stale," but "the table doesn't exist yet, forever." A GSI
-`Query`/`Scan` therefore always reads back `Count: 0` under `SimCluster`,
-pinned by `sim_cluster_dynamo_table_ops.rs::gsi_query_reads_empty_under_
-the_fixture_until_the_drain_generalizes`. An LSI is unaffected — its rows
-are written synchronously in the same Raft entry as the base row (ADR 0041
-§2), so `SimCluster`'s hand-hosted/wire-provisioned tablets serve it
-immediately. Closing this gap (a widened `drain_tablet` plus a fixture
-`drain_gsi` helper) is named but not attempted as of PR 3a — a future rung.
+**A GSI's own hidden table is materialized on demand via `SimCluster::
+drain_gsi` (ADR 0061 rung D3 PR 3b) — closing the PR 3a gap this bullet
+used to describe.** `create_table` proposes a declared index's
+`CreateTableIndex` schema-catalog entry (since PR 3a, base table or not),
+but the hidden `<base>$<index>` table's own tablet is still minted
+lazily, only once something drains a row into it — in production, the
+first tick of `index_drain::change_consumer_loop`'s GSI-drain arm;
+`SimCluster` still never spawns that loop at all (this section's own
+"hand-hosted, not reconciler-hosted" bullet). PR 3b's `drain_gsi(node,
+table)` (`sim_cluster.rs`) is the fixture-side stand-in: for every tablet
+`node` both hosts and leads whose `Metadata` row names `table`, it
+recomputes `gsis` the identical way the production loop does and calls
+`index_drain::drain_tablet` directly (widened to `<E: Env, R:
+RelayClient>` for exactly this reuse — a pure signature change, no
+behavior change, since every callee it and its private helper
+`reconcile_partition` use was already generic), then drives the simulator
+until the resulting `cp_kind_write_raw` calls commit. Two of the
+production loop's own guards are replicated by hand (leader check,
+hidden-table-name skip); `is_quiesced()`/`Building`-child skips are
+**not** replicated — they are structurally unreachable here
+(`SimCluster` never calls `enable_quiescence`, and never splits a table),
+not merely untested, and a future rung that adds either capability to
+this fixture would need to add the matching guard. Before a `drain_gsi`
+call, `run_gsi_query`/`run_gsi_scan`'s own `!meta.has_table_tablet(&
+index_table)` gate is still unconditionally true (not "the rows are
+stale," "the table doesn't exist yet") — pinned by `sim_cluster_dynamo_
+table_ops.rs::gsi_query_materializes_rows_after_a_drain` (renamed from
+PR 3a's own `gsi_query_reads_empty_under_the_fixture_until_the_drain_
+generalizes`, now a positive assertion: empty before the drain, populated
+after). An LSI never needed any of this — its rows are written
+synchronously in the same Raft entry as the base row (ADR 0041 §2), so
+`SimCluster`'s hand-hosted/wire-provisioned tablets serve it immediately.
+`SimClusterHandle::leader_index_of` also had to widen from scanning only
+`create_table_with_replication`'s own hand-hosted-table bookkeeping to
+scanning every node id — every `drain_gsi` caller's table is created
+through the real wire, which never populates that bookkeeping at all; see
+`docs/engineering-lessons.md`'s matching entry.
 
 ### `sim_cluster_corpus`: the SimCluster cycles/durability corpus (ADR 0061 rung D1 step 3)
 
@@ -6288,6 +6308,59 @@ underlying reason one level earlier (the empty-page gate fires before the
 `ExclusiveStartKey`'s own shape is ever checked). **No other new fixture
 bugs found**. `cargo test -p animusd --lib`: 294 passed (252 before, +42,
 zero regressions, ~110s wall, 3 ignored throughout).
+
+**PR 3b (ADR 0061 rung D3 PR 3b) landed 2026-09-07, closing the GSI-drain
+gap PR 3a's own investigation surfaced**: `index_drain::drain_tablet`
+(now `pub(crate)`) and its private helper `reconcile_partition` widened
+to `<E: Env, R: RelayClient>` — a pure signature change (every callee
+each uses was already generic; the full pre-existing real-socket
+regression net for both, run against the widened code before any
+`ProdEnv` file was trimmed, passed unchanged) — plus a new `SimCluster::
+drain_gsi(node, table)` fixture helper (`sim_cluster.rs`, see this file's
+own `SimCluster` section above for the full design) that materializes a
+table's hidden GSI table(s) on demand. Flips `sim_cluster_dynamo_table_
+ops.rs`'s own boundary regression to a positive assertion (renamed
+`gsi_query_materializes_rows_after_a_drain`) and converts every GSI-data
+test PR 3a left on `ProdEnv`: `sim_cluster_dynamo_query_filter.rs`
+(`filter_applies_to_a_gsi_query`), `sim_cluster_dynamo_query_
+pagination.rs` (`gsi_query_paginates_with_the_scan_cursor_shape`, plus
+restoring `cross_index_cursor_mismatch_is_rejected`'s dropped fourth
+sub-case now that a real hidden-table tablet lets the cursor-shape check
+run), `sim_cluster_dynamo_query_range.rs` (`gsi_range_queries_over_
+mixed_digit_count_n_sort_keys`), `sim_cluster_dynamo_scan_index_
+forward.rs` (`descending_applies_to_a_gsi_query`, `gsi_scan_index_
+forward_orders_n_sort_keys_numerically`), `sim_cluster_dynamo_select.rs`
+(`count_select_applies_to_a_gsi_query`) — 6 tests across 5 existing
+sibling modules, each now fully converted (their own `tests/dynamo_*.rs`
+source deleted whole). Three conversions needed new homes: `dynamo_
+documents.rs`'s all three tests move to a new `sim_cluster_dynamo_
+documents.rs` (only the middle one, `multiple_gsis_composite_gsi_and_
+lsi`, actually touches a GSI); `dynamo_update_add_delete.rs`'s last test
+(`an_add_that_changes_an_indexed_attribute_reindexes`) moves into the
+existing `sim_cluster_dynamo_update_add_delete.rs`, draining twice (once
+for the pre-update baseline, once after the reindex); `dynamo_schema.rs`'s
+`create_table_index_replicates_to_second_node` moves to a new `sim_
+cluster_dynamo_schema.rs` (that file's restart proof and `extended_
+surface` stay — real WAL durability and `TransactWriteItems` respectively,
+neither reachable here). Per this rung's explicit instruction, `dynamo_
+indexes.rs::gsi_write_then_query` is **not** deleted (still D2 PR 1's
+real-socket proof of `run_operation`'s independent path); `sim_cluster_
+dynamo_indexes.rs` gains a sim twin, `gsi_write_then_query_sim`, proving
+the identical sequence through the generic core instead. **A second, small
+fixture fix was needed along the way**: `SimClusterHandle::leader_index_
+of` used to scan only `create_table_with_replication`'s own hand-hosted-
+table bookkeeping, which every wire-created table (every table this PR's
+own tests use) never populates — widened to scan every node id instead
+(strictly more general, no less correct for a hand-hosted table either).
+Seven `tests/dynamo_*.rs` files deleted whole (`dynamo_query_filter.rs`/
+`dynamo_query_pagination.rs`/`dynamo_query_range.rs`/`dynamo_scan_index_
+forward.rs`/`dynamo_select.rs`/`dynamo_documents.rs`/`dynamo_update_add_
+delete.rs`), one trimmed (`dynamo_schema.rs`). `cargo test -p animusd
+--lib`: 306 passed (294 before, +12, zero regressions, ~115s wall, 3
+ignored throughout; `gsi_drain_cursor_tests` stays green). See ADR 0061's
+2026-09-07 "D3 PR 3b" amendment for the full account, including the
+`ANIMUS_SEED` determinism replay and the before/after real-socket gate
+runs.
 
 The restart tests run both incarnations in the same runtime,
 calling `Node::shutdown()` between them. In-crate `#[cfg(test)] mod`s
