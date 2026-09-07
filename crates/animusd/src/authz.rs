@@ -79,6 +79,12 @@ pub(crate) fn classify(op: &Operation) -> (&'static str, OpClass) {
         Operation::Query { .. } => ("Query", OpClass::Read),
         Operation::Scan { .. } => ("Scan", OpClass::Read),
         Operation::TransactGetItems { .. } => ("TransactGetItems", OpClass::Read),
+        // ADR 0071 (W-07 PR 2): this PR's `ExecuteStatement` only ever
+        // carries a `SELECT` (a non-`SELECT` statement is rejected at parse
+        // time before an `Operation` is even built) — always `Read`. PR 3
+        // introduces the mutation shapes and revisits this (see that PR's
+        // own ADR 0071 amendment).
+        Operation::ExecuteStatement { .. } => ("ExecuteStatement", OpClass::Read),
         Operation::DescribeTable { .. } => ("DescribeTable", OpClass::Read),
         Operation::DescribeTimeToLive { .. } => ("DescribeTimeToLive", OpClass::Read),
         Operation::ListTagsOfResource { .. } => ("ListTagsOfResource", OpClass::Read),
@@ -159,6 +165,13 @@ pub(crate) fn authorize_op(
         | Operation::BatchWriteItem { .. }
         | Operation::TransactWriteItems { .. }
         | Operation::TransactGetItems { .. } => Ok(()),
+
+        // `ExecuteStatement`'s table is only known once its `statement` is
+        // parsed (ADR 0071) — this function runs before that parse, so it
+        // is a deliberate no-op here too, joining the group above.
+        // `crate::dynamo::execute_statement` authorizes the real target
+        // table itself, before any read runs, once parsing has resolved it.
+        Operation::ExecuteStatement { .. } => Ok(()),
 
         Operation::ListTables { .. } | Operation::DescribeLimits | Operation::DescribeEndpoints => {
             Ok(())
@@ -696,6 +709,18 @@ mod tests {
             (
                 Operation::ListTagsOfResource { table: table() },
                 "ListTagsOfResource",
+                OpClass::Read,
+            ),
+            (
+                Operation::ExecuteStatement {
+                    statement: "SELECT * FROM t".to_string(),
+                    parameters: vec![],
+                    consistent_read: false,
+                    next_token: None,
+                    limit: None,
+                    return_consumed_capacity: ReturnConsumedCapacity::None,
+                },
+                "ExecuteStatement",
                 OpClass::Read,
             ),
             (Operation::DescribeLimits, "DescribeLimits", OpClass::Read),

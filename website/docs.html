@@ -376,6 +376,7 @@
             <tr><td><code>UpdateItem</code></td><td><span class="pill yes">Yes</span></td><td>Update expressions with conditions</td></tr>
             <tr><td><code>Query</code></td><td><span class="pill yes">Yes</span></td><td>Key conditions, filters, index queries, pagination</td></tr>
             <tr><td><code>Scan</code></td><td><span class="pill yes">Yes</span></td><td>Filters and pagination; ordered by token</td></tr>
+            <tr><td><code>ExecuteStatement</code></td><td><span class="pill yes">Yes</span></td><td>PartiQL <code>SELECT</code> only, lowered onto <code>Query</code>/<code>Scan</code>; <code>?</code> placeholders only, never literal values. <code>INSERT</code>/<code>UPDATE</code>/<code>DELETE</code>, <code>BatchExecuteStatement</code>, and <code>ExecuteTransaction</code> not yet implemented</td></tr>
             <tr><td><code>BatchWriteItem</code></td><td><span class="pill yes">Yes</span></td><td>—</td></tr>
             <tr><td><code>TransactWriteItems</code> · <code>TransactGetItems</code></td><td><span class="pill yes">Yes</span></td><td>Put, Update, Delete and ConditionCheck actions; <code>ClientRequestToken</code> idempotency on writes</td></tr>
             <tr><td><code>UpdateTimeToLive</code> · <code>DescribeTimeToLive</code></td><td><span class="pill yes">Yes</span></td><td>—</td></tr>

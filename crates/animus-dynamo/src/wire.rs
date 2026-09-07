@@ -514,7 +514,7 @@ pub fn transact_write_fingerprint(actions: &[TransactAction]) -> String {
     hex_encode_lower(&Sha256::digest(bytes))
 }
 
-fn hex_encode_lower(bytes: &[u8]) -> String {
+pub(crate) fn hex_encode_lower(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {
         out.push(char::from_digit(u32::from(b >> 4), 16).expect("nibble"));
@@ -903,6 +903,36 @@ pub enum Operation {
         /// The keys to read, in request order (the response echoes this order).
         gets: Vec<TransactGet>,
     },
+    /// `ExecuteStatement` (ADR 0071, W-07): a PartiQL statement. **This PR
+    /// (PR 2 of 5) supports `SELECT` only** — `statement` is decoded
+    /// unparsed (this layer has no catalog to resolve a table/index schema
+    /// against, so PartiQL parsing + lowering happens at the `animusd`
+    /// edge, `crate::partiql::parse_select_statement` + `lower_select`); a
+    /// non-`SELECT` statement is a `ValidationException` raised there, not
+    /// here. `parameters` binds positionally against the statement's own
+    /// `?` placeholders (ADR 0071 §2 — never inline literals).
+    ExecuteStatement {
+        /// The raw PartiQL statement text.
+        statement: String,
+        /// Positionally-bound `?` values, decoded like any other
+        /// `AttributeValue` array.
+        parameters: Vec<AttributeValue>,
+        /// `ConsistentRead`, exactly like `Query`/`Scan`'s own field — only
+        /// meaningful once the statement lowers to one of them.
+        consistent_read: bool,
+        /// An opaque pagination cursor from a previous page's `NextToken`
+        /// (ADR 0071 §9) — verified against this call's own `statement` at
+        /// the `animusd` edge.
+        next_token: Option<String>,
+        /// Max items to examine this page, exactly like `Query`/`Scan`'s
+        /// own `Limit`.
+        limit: Option<usize>,
+        /// How much of the `ConsumedCapacity` report the caller wants back.
+        /// Decoded and accepted, but currently never populated — mirrors
+        /// `Query`/`Scan`'s own pre-existing gap (ADR 0071 §11), not a
+        /// PartiQL-specific omission.
+        return_consumed_capacity: ReturnConsumedCapacity,
+    },
     /// `UpdateTimeToLive` (ADR 0051): declare, change, or disable a table's
     /// TTL attribute. AWS requires `AttributeName` even when `enabled` is
     /// `false` — a disable call must still name the attribute being
@@ -1259,6 +1289,12 @@ impl Operation {
             | Operation::BatchGetItem { .. }
             | Operation::TransactWriteItems { .. }
             | Operation::TransactGetItems { .. }
+            // `ExecuteStatement`'s table is only known once its `statement`
+            // is parsed (ADR 0071) — this layer has no catalog to resolve
+            // `FROM "t"` against, so it joins the multi-table/table-late
+            // group here; `animusd` resolves and authorizes the real table
+            // inside its own handler, mirroring `BatchGetItem`'s shape.
+            | Operation::ExecuteStatement { .. }
             | Operation::ListTables { .. }
             // `DescribeBackup`/`DeleteBackup` address a backup by ARN, not a
             // table name (ADR 0059 §3's own "keyed by backup identity, never
@@ -1715,6 +1751,7 @@ pub fn decode_request(target: &str, body: &[u8]) -> Result<Operation, WireError>
         "TransactWriteItems" => decode_transact_write(obj),
         "BatchGetItem" => decode_batch_get(obj),
         "TransactGetItems" => decode_transact_get(obj),
+        "ExecuteStatement" => decode_execute_statement(obj),
         "UpdateTimeToLive" => decode_update_time_to_live(obj),
         "DescribeTimeToLive" => Ok(Operation::DescribeTimeToLive {
             table: table_name(obj)?,
@@ -3218,6 +3255,48 @@ fn decode_transact_get(obj: &Map<String, Value>) -> Result<Operation, WireError>
 /// Decode the attribute-map at `field` of a nested request object into an [`Item`].
 fn decode_sub_item(obj: &Map<String, Value>, field: &str) -> Result<Item, WireError> {
     decode_item_field(obj, field)
+}
+
+/// Decode an `ExecuteStatement` body (ADR 0071, W-07): `Statement` (raw
+/// text, parsed at the `animusd` edge — this layer has no catalog),
+/// `Parameters` (an array of `AttributeValue`s, decoded exactly like any
+/// other such array — the same `decode_attribute_value` every operation
+/// uses, matching ADR 0071 §2's placeholder-only discipline), and the same
+/// `ConsistentRead`/`Limit`/`ReturnConsumedCapacity` fields `Query`/`Scan`
+/// already decode.
+fn decode_execute_statement(obj: &Map<String, Value>) -> Result<Operation, WireError> {
+    let statement = obj
+        .get("Statement")
+        .and_then(Value::as_str)
+        .ok_or_else(|| WireError::validation("missing string field `Statement`"))?
+        .to_owned();
+    let parameters = match obj.get("Parameters") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(v) => {
+            let arr = v
+                .as_array()
+                .ok_or_else(|| WireError::validation("`Parameters` must be an array"))?;
+            arr.iter()
+                .enumerate()
+                .map(|(i, v)| decode_attribute_value(&format!("Parameters[{i}]"), v))
+                .collect::<Result<Vec<_>, _>>()?
+        }
+    };
+    let consistent_read = decode_consistent_read(obj);
+    let next_token = obj
+        .get("NextToken")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let limit = decode_limit(obj)?;
+    let return_consumed_capacity = decode_return_consumed_capacity(obj)?;
+    Ok(Operation::ExecuteStatement {
+        statement,
+        parameters,
+        consistent_read,
+        next_token,
+        limit,
+        return_consumed_capacity,
+    })
 }
 
 /// Decode a `CreateTable` body's `KeySchema` + `AttributeDefinitions` into a

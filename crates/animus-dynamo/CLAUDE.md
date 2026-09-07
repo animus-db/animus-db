@@ -87,7 +87,12 @@ comment for its full type/method inventory.
   BatchWriteItem/BatchGetItem/TransactWriteItems/TransactGetItems/UpdateTable/
   DescribeTable/DeleteTable/ListTables/UpdateTimeToLive/DescribeTimeToLive/
   TagResource/UntagResource/ListTagsOfResource/DescribeLimits/
-  DescribeEndpoints, plus the response encoders). **Resource tagging
+  DescribeEndpoints/ExecuteStatement, plus the response encoders).
+  `ExecuteStatement` (ADR 0071, W-07) is decoded here (`Statement`/
+  `Parameters`/`ConsistentRead`/`NextToken`/`Limit`/
+  `ReturnConsumedCapacity`) but its `statement` text is opaque at this
+  layer — no catalog to parse it against — so parsing/lowering happens at
+  the `animusd` edge via `partiql::parse_select_statement`/`lower_select`. **Resource tagging
   (roadmap W-06)**: `table_arn`/`parse_table_arn` are this adapter's own
   table-ARN codec (`arn:aws:dynamodb:animus:0:table/<table>`, mirroring
   `stream_arn`/`backup_arn`'s identical placeholder-region/account
@@ -168,6 +173,24 @@ comment for its full type/method inventory.
   each intermediate stage, and so a hand-rolled test signer (`animusd`,
   ADR 0057's e2e tests) can produce a real `Authorization` header without
   duplicating the HMAC chain.
+- `partiql` (ADR 0071, W-07 PR 2) — the PartiQL `SELECT` subset: a
+  hand-written lexer/parser (no regex/parser-combinator crate; W-01's
+  `UpdateExpression` string parser was judged **not** to generalise — see
+  the ADR §3), a typed `SelectStatement` AST with positional `?` →
+  `Parameters` binding, and `lower_select` (ADR §4's syntactic
+  key-versus-filter rule), which builds `animus_item::condition`
+  `Comparator`/`SortKeyCondition`/`ConditionExpression` values **directly**
+  from the AST — never by re-serializing to `KeyConditionExpression`/
+  `FilterExpression` text and re-parsing through `wire.rs`'s decoders (ADR
+  §5). `encode_next_token`/`decode_next_token` mint and verify
+  `ExecuteStatement`'s opaque, versioned, statement-hash-bound pagination
+  cursor (ADR §9) — reuses `wire::{encode_item, decode_item, base64_encode,
+  base64_decode, hex_encode_lower}`. Pure and catalog-free like every other
+  module here: `lower_select` takes the target's partition/sort key
+  **names** as plain `&str`, resolved by the caller (`animusd`, which holds
+  `Metadata`) — this module never reads a schema. `INSERT`/`UPDATE`/
+  `DELETE` are parsed only far enough to name them in a "not supported yet
+  (PR 3)" error; the ADR's lowering table covers what each future PR adds.
 - `ttl` (ADR 0051) — the pure DynamoDB-TTL expiry predicate: `expires_at`
   (an item's declared expiry epoch second under a table's TTL attribute, or
   `None` when the attribute is absent or not a usable `N`) and `is_expired`
@@ -623,6 +646,17 @@ comment for its full type/method inventory.
 `apply_update`'s and the stored-item codec's, into `animus-item`** (they
 moved with the code they test — no assertion changed) — see that crate's
 `CLAUDE.md` Tests section. What follows here describes what stayed.
+
+`cargo test -p animus-dynamo` also covers `partiql` (ADR 0071, W-07 PR 2):
+lexer/parser unit tests for every grammar production, every
+`ValidationException` case (literal values, placeholder-count mismatch,
+two partition-key equalities, `ORDER BY` misuse), every lowering row
+(partition equality → `Query`, no such term → `Scan`-with-filter, sort
+comparators/`BETWEEN`/`begins_with` consumed vs. left as filter,
+projection, index `FROM`), and `NextToken` round-trip/mismatch/malformed/
+version cases — end-to-end coverage against the real wire lives in
+`crates/animusd/tests/dynamo_partiql.rs` instead, since this module never
+touches a catalog.
 
 `cargo test -p animus-dynamo` — `item_api.rs` over `MemoryEngine`, plus unit
 tests for `wire`/`streams_wire`/`registry`/`schema`/`ttl`

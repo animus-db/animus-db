@@ -3974,6 +3974,35 @@ route below the edge through the same `ClientCtx` CP primitives.
   constants); `dynamo::describe_endpoints` reads `ctx.admin.dynamo_addr` —
   the same field `admin.rs::config_view`'s `addrs.dynamo` already reports —
   for this node's own bound DynamoDB listen address.
+  **`ExecuteStatement` (ADR 0071, W-07 PR 2)** — `dynamo::execute_statement`
+  is a thin edge glue function, not a new execution path: it parses the
+  PartiQL `Statement` (`animus_dynamo::partiql::parse_select_statement`,
+  which has no catalog access), resolves the target's partition/sort key
+  **names** from `Metadata` (the base table's `TableSchema`, or the named
+  index's `IndexDef.hash_attribute`/`sort_attribute` when `FROM
+  "t"."index"` names one), lowers onto `Operation::Query`/`Operation::Scan`
+  (`partiql::lower_select`), and dispatches to the very same
+  `run_query`/`run_scan` a client-built `Query`/`Scan` request already
+  goes through — so `ExecuteStatement` inherits every existing behavior
+  those already have (GSI/LSI dispatch, `ConsistentRead`'s ADR 0055 path
+  selection, the leader-forwarding a non-hosting node needs) with zero new
+  data-plane code. Its own job is small: `Operation::table()` returns
+  `None` for it (the table is only known once `Statement` is parsed, same
+  as `BatchGetItem`/`BatchWriteItem`), so `reject_internal_table`/
+  `authz::authorize` run once inside `execute_statement` itself instead of
+  at `run_operation`'s shared pre-dispatch gate; and reshaping `run_query`/
+  `run_scan`'s `{Items, Count, ScannedCount, LastEvaluatedKey?}` response
+  into `ExecuteStatement`'s own `{Items, NextToken?}` shape
+  (`reshape_query_scan_response_to_execute_statement` — `LastEvaluatedKey`,
+  when present, becomes an opaque `partiql::encode_next_token`-minted
+  `NextToken`; `Count`/`ScannedCount` have no `ExecuteStatement`
+  equivalent and are dropped). **This PR supports `SELECT` only** — a
+  non-`SELECT` statement is rejected inside `parse_select_statement` before
+  an `Operation::ExecuteStatement`'s `statement` ever reaches this
+  function's parse call, so `execute_statement` itself never needs to
+  branch on statement kind. `ConsumedCapacity` is decoded/accepted but
+  never populated, mirroring `Query`/`Scan`'s own pre-existing gap (not a
+  PartiQL-specific omission — see ADR 0071 §11).
 - **Admin / debug** (`admin.rs`, `RoleAddrs.admin`, ADR 0020) — read-only
   `GET` views + gated `POST` actions + data writes; grep `admin.rs`'s route
   table for the full endpoint inventory. Below the edge it only reads node

@@ -506,3 +506,41 @@ conventions (root `CLAUDE.md` Testing section).
   parsing work for no shared code, and reintroduces exactly the
   attribute-name quoting/escaping surface PartiQL's own parser already
   resolved once.
+
+## 2026-09-07 amendment — as-built, PR 2
+
+PR 2 landed as designed, with two small clarifications the grammar/design
+sections above stated as intent but are worth pinning as fact now that
+they're implemented and tested:
+
+- **The leading-keyword check runs on raw text, ahead of the full lex.**
+  `parse_select_statement` peeks the statement's first bare word (skipping
+  leading whitespace) to decide `SELECT` vs. `INSERT`/`UPDATE`/`DELETE`
+  vs. garbage **before** tokenizing the rest of the statement — not after,
+  as an earlier draft of the implementation did. The reason is mechanical,
+  not aesthetic: `INSERT`'s own PR 3 grammar (§1's `document`) uses `{`/`}`
+  bytes this PR's lexer has no token for at all, so lexing a real `INSERT`
+  statement whole (to inspect token 0 and reject it) would itself fail
+  with an unrelated "unexpected character `{`" error instead of the
+  intended "not supported yet" message. Caught by
+  `rejects_insert_update_delete_with_named_error`'s unit test on first
+  run.
+- **`lower_select`'s `partition_key`/`sort_key` parameters are exactly the
+  target's own attribute *names*, as plain `&str`** — no `IndexDef`/
+  `TableSchema` type crosses into `animus-dynamo::partiql` at all (the
+  crate does depend on `animus-control` already, for unrelated reasons,
+  but this module deliberately doesn't use it — keeping the "resolved by
+  the caller, this module reads no schema" boundary a type-level fact, not
+  just a documented convention). `animusd::dynamo::execute_statement`
+  resolves those names once — from `TableSchema` for a base-table
+  `SELECT`, from the named index's `IndexDef.hash_attribute`/
+  `sort_attribute` (with the identical `NoSuchIndex` rejection
+  `run_index_query`/`run_index_scan` already give) for an indexed one —
+  before calling `lower_select`.
+
+Gate results (2026-09-07): `fmt`/`clippy -D warnings`/`build --workspace
+--all-targets`/`test -p animus-dynamo -p animus-item`/`test -p animusd
+--test dynamo_partiql` (×3)/`test --workspace`/`cargo deny check` all
+green; no new crate dependency added (the roadmap's own "hand-write it, no
+parser crate" instruction held). See the PR 2 commit for the exact gate
+log and the `dynamo_partiql.rs` end-to-end coverage list.

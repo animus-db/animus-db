@@ -173,6 +173,7 @@ use animus_dynamo::capacity::{
     self, ConsumedCapacity, ItemCollectionMetrics, ReturnConsumedCapacity,
     ReturnItemCollectionMetrics,
 };
+use animus_dynamo::partiql;
 use animus_dynamo::wire::{
     self, MAX_GSI_PER_TABLE, Operation, Projection, ReturnValues, ScanSegment, Select,
     TransactAction, TransactGet, UpdateAction, WireError, WriteRequest,
@@ -1001,6 +1002,26 @@ async fn run_operation(
                 select,
                 segment,
                 consistent_read,
+            )
+            .await
+        }
+        Operation::ExecuteStatement {
+            statement,
+            parameters,
+            consistent_read,
+            next_token,
+            limit,
+            return_consumed_capacity: _,
+        } => {
+            execute_statement(
+                ctx,
+                meta,
+                principal,
+                &statement,
+                &parameters,
+                consistent_read,
+                next_token.as_deref(),
+                limit,
             )
             .await
         }
@@ -6193,6 +6214,186 @@ async fn run_scan(
             .await
         }
     }
+}
+
+/// `ExecuteStatement` (ADR 0071, W-07 PR 2): parse the PartiQL `statement`,
+/// resolve its target table's (or named index's) own key attribute names
+/// from the replicated catalog, lower it onto [`Operation::Query`]/
+/// [`Operation::Scan`] (`animus_dynamo::partiql::lower_select`), and run it
+/// through the exact same [`run_query`]/[`run_scan`] path a client-built
+/// `Query`/`Scan` request would take — this function's whole job is
+/// resolving what those two already do, never re-executing it.
+///
+/// The table is unknown until `statement` is parsed (`Operation::table()`
+/// returns `None` for `ExecuteStatement`, ADR 0071's own note there), so
+/// [`reject_internal_table`]/authorization happen here, once, rather than
+/// at [`run_operation`]'s shared pre-dispatch gate — mirroring
+/// `BatchGetItem`'s identical "resolved and checked inside its own
+/// handler" shape.
+#[allow(clippy::too_many_arguments)] // one ExecuteStatement request's full decoded shape
+async fn execute_statement(
+    ctx: &ClientCtx,
+    meta: &Metadata,
+    principal: &Principal,
+    statement: &str,
+    parameters: &[AttributeValue],
+    consistent_read: bool,
+    next_token: Option<&str>,
+    limit: Option<usize>,
+) -> Result<String, WireError> {
+    let stmt = partiql::parse_select_statement(statement).map_err(WireError::from)?;
+    reject_internal_table(&stmt.table, false)?;
+    if !table_known(ctx, meta, &stmt.table) {
+        return Err(registry_error(animus_dynamo::RegistryError::NoSuchTable(
+            stmt.table.clone(),
+        )));
+    }
+    authz::authorize(
+        ctx,
+        principal,
+        "ExecuteStatement",
+        animus_control::OpClass::Read,
+        Some(stmt.table.as_str()),
+    )?;
+
+    mirror_catalog_schema(ctx, meta, &stmt.table);
+
+    let (partition_key, sort_key): (String, Option<String>) = match &stmt.index {
+        Some(index_name) => {
+            let idx = meta
+                .table_indexes(&stmt.table)
+                .iter()
+                .find(|d| &d.name == index_name)
+                .cloned()
+                .ok_or_else(|| {
+                    registry_error(animus_dynamo::RegistryError::NoSuchIndex(
+                        index_name.clone(),
+                    ))
+                })?;
+            (idx.hash_attribute, idx.sort_attribute)
+        }
+        None => {
+            let base = schema_for(meta, &stmt.table);
+            (base.partition_key, base.sort_key)
+        }
+    };
+
+    let exclusive_start_key = match next_token {
+        Some(tok) => Some(partiql::decode_next_token(tok, statement).map_err(WireError::from)?),
+        None => None,
+    };
+
+    let op = partiql::lower_select(
+        &stmt,
+        parameters,
+        &partition_key,
+        sort_key.as_deref(),
+        exclusive_start_key,
+        limit,
+        consistent_read,
+    )
+    .map_err(WireError::from)?;
+
+    let raw = match op {
+        Operation::Query {
+            table,
+            index,
+            partition_attr,
+            partition_value,
+            sort_attr,
+            sort_condition,
+            limit,
+            exclusive_start_key,
+            scan_index_forward,
+            filter,
+            projection,
+            select,
+            consistent_read,
+        } => {
+            run_query(
+                ctx,
+                meta,
+                &table,
+                index.as_deref(),
+                &partition_attr,
+                &partition_value,
+                sort_attr.as_deref(),
+                sort_condition.as_ref(),
+                limit,
+                exclusive_start_key,
+                scan_index_forward,
+                filter.as_ref(),
+                projection.as_ref(),
+                select,
+                consistent_read,
+            )
+            .await?
+        }
+        Operation::Scan {
+            table,
+            index,
+            limit,
+            exclusive_start_key,
+            filter,
+            projection,
+            select,
+            segment,
+            consistent_read,
+        } => {
+            run_scan(
+                ctx,
+                meta,
+                &table,
+                index.as_deref(),
+                limit,
+                exclusive_start_key,
+                filter.as_ref(),
+                projection.as_ref(),
+                select,
+                segment,
+                consistent_read,
+            )
+            .await?
+        }
+        _ => unreachable!("partiql::lower_select only ever produces Query or Scan"),
+    };
+
+    reshape_query_scan_response_to_execute_statement(&raw, statement)
+}
+
+/// Reshape a `Query`/`Scan` response body (`{Items, Count, ScannedCount,
+/// LastEvaluatedKey?}`) into `ExecuteStatement`'s own AWS-faithful shape
+/// (`{Items, NextToken?}`) — `LastEvaluatedKey`, when present, becomes an
+/// opaque `NextToken` bound to `statement` (ADR 0071 §9,
+/// `animus_dynamo::partiql::encode_next_token`). `Count`/`ScannedCount`
+/// are `Query`/`Scan`-only fields with no `ExecuteStatement` equivalent and
+/// are dropped; `ConsumedCapacity` mirrors `Query`/`Scan`'s own pre-existing
+/// gap (ADR 0071 §11) — nothing to attach either way today.
+fn reshape_query_scan_response_to_execute_statement(
+    raw: &str,
+    statement: &str,
+) -> Result<String, WireError> {
+    let parsed: serde_json::Value =
+        serde_json::from_str(raw).expect("run_query/run_scan response is well-formed JSON");
+    let obj = parsed
+        .as_object()
+        .expect("run_query/run_scan response is a JSON object");
+    let mut out = serde_json::Map::new();
+    out.insert(
+        "Items".to_string(),
+        obj.get("Items")
+            .cloned()
+            .unwrap_or(serde_json::Value::Array(vec![])),
+    );
+    if let Some(lek) = obj.get("LastEvaluatedKey") {
+        let lek_obj = lek.as_object().expect("LastEvaluatedKey is a JSON object");
+        let lek_item = wire::decode_item(lek_obj)?;
+        out.insert(
+            "NextToken".to_string(),
+            serde_json::Value::String(partiql::encode_next_token(statement, &lek_item)),
+        );
+    }
+    Ok(serde_json::to_string(&serde_json::Value::Object(out)).expect("response serializes"))
 }
 
 /// Serve a base-table `Scan` via a **native quorum range scan** (`cp_scan`) over
