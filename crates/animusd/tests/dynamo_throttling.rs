@@ -8,25 +8,22 @@
 //! right index; a forwarded write (received by a node that does not host the
 //! tablet's leader) is throttled on the leader, not silently admitted;
 //! `/admin/metrics` reports nonzero throttled counters; and (step 4, below
-//! the step-3 tests) `CreateTable`/`UpdateTable`'s own `BillingMode`/
-//! `ProvisionedThroughput`, `DescribeTable`'s reporting of them, the
-//! follower-relay regression for `MetaCommand::SetTableThroughput`, and the
-//! cluster-wide `cluster_settings`/CLI config surface (`animusd::
-//! run_node_with_cluster_settings`) versus a per-table override.
+//! the step-3 tests) the cluster-wide `cluster_settings`/CLI config surface
+//! (`animusd::run_node_with_cluster_settings`) versus a per-table override.
 //!
 //! Most tests below still configure the cluster-wide default via
 //! `POST /admin/throttle/defaults` (a live override, kept as a genuinely
 //! useful runtime lever alongside the durable config surface — ADR 0065
 //! §5(a)) rather than the config surface itself, simply because it's the
-//! lighter-weight way to set up a step-3-shaped scenario; the step-4 section
-//! exercises the config surface (and `CreateTable`/`UpdateTable`) directly.
-//! Every item used here is deliberately large (tens of KB) so a handful of
-//! real HTTP round trips exhausts a 300-unit burst — the ADR's fixed `300 ×
-//! rate` burst window means a *small* configured rate still yields a
-//! moderate token count, and the cheapest way to drain it quickly in a
-//! real-time test is a large per-request cost, not a vanishingly small
-//! rate. Real TCP/time, so bounded loops rather than a fixed op count where
-//! real network jitter could matter.
+//! lighter-weight way to set up a step-3-shaped scenario; the step-4 test
+//! that remains here exercises the config surface directly. Every item used
+//! here is deliberately large (tens of KB) so a handful of real HTTP round
+//! trips exhausts a 300-unit burst — the ADR's fixed `300 × rate` burst
+//! window means a *small* configured rate still yields a moderate token
+//! count, and the cheapest way to drain it quickly in a real-time test is a
+//! large per-request cost, not a vanishingly small rate. Real TCP/time, so
+//! bounded loops rather than a fixed op count where real network jitter
+//! could matter.
 //!
 //! **`put_item_is_throttled_once_the_write_budget_is_exhausted`/
 //! `get_item_is_throttled_once_the_read_budget_is_exhausted` moved to
@@ -35,10 +32,23 @@
 //! `sim_cluster_throttle.rs::
 //! write_admits_a_burst_then_refuses_then_recovers_after_a_full_refill`/
 //! `read_admits_a_burst_then_refuses_then_recovers_after_a_full_refill`
-//! (`crates/animusd/src/sim_cluster_throttle.rs`). Every other test in this
-//! file stays — `UnprocessedItems`/`UnprocessedKeys` shedding, forwarded-
-//! write throttling, the throttled-metric counters, and the `CreateTable`/
-//! `UpdateTable`/`DescribeTable` wire ops have no sim analog.
+//! (`crates/animusd/src/sim_cluster_throttle.rs`).
+//!
+//! **`create_table_with_provisioned_throughput_throttles_without_any_admin_
+//! call`/`update_table_to_pay_per_request_lifts_the_limit`/`update_table_
+//! raising_units_admits_more`/`describe_table_reports_billing_mode_and_
+//! throughput`/`update_table_throughput_on_a_follower_is_relayed_to_the_
+//! leader` also moved to `SimCluster`** (ADR 0061 rung D3 PR 2b — the
+//! `CreateTable`/`UpdateTable`/`DescribeTable` throughput-config-surface
+//! tests, driven through `dynamo::dispatch_table_op`'s new `UpdateTable`
+//! arm): `crates/animusd/src/sim_cluster_dynamo_update_table.rs`.
+//!
+//! Every other test in this file stays — `UnprocessedItems`/
+//! `UnprocessedKeys` shedding, forwarded-write throttling, the
+//! throttled-metric counters, and the cluster-wide config-surface-vs-
+//! per-table-override test have no sim analog (see each remaining test's
+//! own doc, or `sim_cluster_dynamo_update_table.rs`'s own module doc, for
+//! why).
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -708,312 +718,18 @@ async fn admin_metrics_reports_nonzero_throttled_counters() {
 }
 
 // ---------------------------------------------------------------------------
-// W-08 step 4: the real config surface — `CreateTable`/`UpdateTable`'s
-// `BillingMode`/`ProvisionedThroughput`, replicated as `TableSchema.
-// throughput`, and the cluster-wide `--throttle-{read,write}-units`/
-// `cluster_settings` default. No `POST /admin/throttle/defaults` call
-// anywhere below — that hook stays reachable (a live override) but every
-// test in this section proves the durable, declarative configuration path.
+// W-08 step 4: the real config surface. `CreateTable`/`UpdateTable`'s own
+// `BillingMode`/`ProvisionedThroughput` change, `DescribeTable`'s reporting
+// of them, and the follower-relay regression for `MetaCommand::
+// SetTableThroughput` all moved to `SimCluster` (ADR 0061 rung D3 PR 2b,
+// `crates/animusd/src/sim_cluster_dynamo_update_table.rs`) — see this file's
+// own module doc. The one test left here is the one with no sim analog: the
+// cluster-wide `--throttle-{read,write}-units`/`cluster_settings` **config
+// surface** itself (`animusd::run_node_with_cluster_settings`'s own
+// `throttle_read_units`/`throttle_write_units` params, not just the live
+// `POST /admin/throttle/defaults` override every other test in this file
+// uses) versus a per-table override.
 // ---------------------------------------------------------------------------
-
-/// `CreateTable` with `BillingMode: "PROVISIONED"` and a tiny
-/// `ProvisionedThroughput` throttles a write burst with **no**
-/// `POST /admin/throttle/defaults` call at all — the per-table spec alone is
-/// enough.
-#[tokio::test(flavor = "multi_thread")]
-async fn create_table_with_provisioned_throughput_throttles_without_any_admin_call() {
-    let dir = support::panic_safe_tempdir();
-    let (nodes, config) = bring_up(1, dir.path()).await;
-    await_bootstrap(&nodes).await;
-    let addr = config.nodes[0].dynamo;
-
-    // 1 WCU/s declared directly on the table — no admin call anywhere in
-    // this test.
-    create_table_with_throughput(addr, "thr_ct_provisioned", 5, 1).await;
-
-    let value = big_value();
-    let mut refused = None;
-    for i in 0..20 {
-        let (status, body) = dynamo(
-            addr,
-            "DynamoDB_20120810.PutItem",
-            &put_body("thr_ct_provisioned", &format!("k{i}"), &value),
-        )
-        .await;
-        if status == 400 {
-            refused = Some(body);
-            break;
-        }
-        assert_eq!(status, 200, "unexpected PutItem failure: {body}");
-    }
-    let body = refused
-        .expect("expected CreateTable's own declared ProvisionedThroughput to throttle the burst");
-    assert_eq!(
-        error_type(&body),
-        "com.amazonaws.dynamodb.v20120810#ProvisionedThroughputExceededException",
-        "unexpected error body: {body}"
-    );
-
-    for n in &nodes {
-        n.shutdown_graceful().await;
-    }
-}
-
-/// `UpdateTable` with `BillingMode: "PAY_PER_REQUEST"` lifts a previously
-/// throttling per-table limit — the table goes back to unthrottled.
-#[tokio::test(flavor = "multi_thread")]
-async fn update_table_to_pay_per_request_lifts_the_limit() {
-    let dir = support::panic_safe_tempdir();
-    let (nodes, config) = bring_up(1, dir.path()).await;
-    await_bootstrap(&nodes).await;
-    let addr = config.nodes[0].dynamo;
-
-    create_table_with_throughput(addr, "thr_ct_lift", 5, 1).await;
-    let value = big_value();
-
-    // Drain the tiny burst first.
-    let mut refused = false;
-    for i in 0..20 {
-        let (status, body) = dynamo(
-            addr,
-            "DynamoDB_20120810.PutItem",
-            &put_body("thr_ct_lift", &format!("k{i}"), &value),
-        )
-        .await;
-        if status == 400 {
-            refused = true;
-            break;
-        }
-        assert_eq!(status, 200, "unexpected PutItem failure: {body}");
-    }
-    assert!(
-        refused,
-        "expected the tiny declared budget to throttle first"
-    );
-
-    // Lift it: switch back to PAY_PER_REQUEST.
-    let (status, body) = dynamo(
-        addr,
-        "DynamoDB_20120810.UpdateTable",
-        r#"{"TableName":"thr_ct_lift","BillingMode":"PAY_PER_REQUEST"}"#,
-    )
-    .await;
-    assert_eq!(status, 200, "UpdateTable to PAY_PER_REQUEST failed: {body}");
-    assert!(
-        body.contains("\"BillingMode\":\"PAY_PER_REQUEST\""),
-        "{body}"
-    );
-
-    // Every further write must now succeed — the table is unthrottled
-    // again, byte-for-byte the same as a table that was never provisioned.
-    for i in 0..10 {
-        let (status, body) = dynamo(
-            addr,
-            "DynamoDB_20120810.PutItem",
-            &put_body("thr_ct_lift", &format!("after{i}"), &value),
-        )
-        .await;
-        assert_eq!(
-            status, 200,
-            "put {i} unexpectedly refused after reverting to PAY_PER_REQUEST: {body}"
-        );
-    }
-
-    for n in &nodes {
-        n.shutdown_graceful().await;
-    }
-}
-
-/// `UpdateTable` raising a table's own `ProvisionedThroughput` admits more
-/// than the old, tighter budget would have.
-#[tokio::test(flavor = "multi_thread")]
-async fn update_table_raising_units_admits_more() {
-    let dir = support::panic_safe_tempdir();
-    let (nodes, config) = bring_up(1, dir.path()).await;
-    await_bootstrap(&nodes).await;
-    let addr = config.nodes[0].dynamo;
-
-    create_table_with_throughput(addr, "thr_ct_raise", 5, 1).await;
-    let value = big_value();
-
-    let mut refused = false;
-    for i in 0..20 {
-        let (status, body) = dynamo(
-            addr,
-            "DynamoDB_20120810.PutItem",
-            &put_body("thr_ct_raise", &format!("k{i}"), &value),
-        )
-        .await;
-        if status == 400 {
-            refused = true;
-            break;
-        }
-        assert_eq!(status, 200, "unexpected PutItem failure: {body}");
-    }
-    assert!(
-        refused,
-        "expected the tiny declared budget to throttle first"
-    );
-
-    // Raise the write budget by many orders of magnitude. `ThrottleBucket::
-    // set_rate`'s own doc: it refills at the OLD rate up to the moment of
-    // the change and only then raises the *ceiling* — the new rate governs
-    // refill only for elapsed time AFTER that reassignment. `UpdateTable`
-    // itself never touches the write bucket (only a write does), so the
-    // very first post-raise check is still the one that pays that
-    // reassignment — it refills at the old, tiny rate for whatever elapsed
-    // first — so this is a converged-or-timeout retry (root `CLAUDE.md`'s
-    // testing discipline for an eventual property), not a one-shot assert:
-    // once the new, vastly higher rate is actually driving refill between
-    // two checks, admission follows within a handful of short-sleep
-    // retries.
-    let (status, body) = dynamo(
-        addr,
-        "DynamoDB_20120810.UpdateTable",
-        r#"{"TableName":"thr_ct_raise","BillingMode":"PROVISIONED",
-            "ProvisionedThroughput":{"ReadCapacityUnits":5,"WriteCapacityUnits":1000000}}"#,
-    )
-    .await;
-    assert_eq!(status, 200, "UpdateTable raising units failed: {body}");
-    assert!(body.contains("\"WriteCapacityUnits\":1000000"), "{body}");
-
-    let mut admitted = false;
-    for _ in 0..20 {
-        let (status, body) = dynamo(
-            addr,
-            "DynamoDB_20120810.PutItem",
-            &put_body("thr_ct_raise", "after-raise", &value),
-        )
-        .await;
-        if status == 200 {
-            admitted = true;
-            break;
-        }
-        assert_eq!(
-            status, 400,
-            "unexpected PutItem failure after raising units: {body}"
-        );
-        sleep(Duration::from_millis(50)).await;
-    }
-    assert!(
-        admitted,
-        "expected a write to eventually be admitted once the table's own raised write \
-         units actually refill the bucket"
-    );
-
-    for n in &nodes {
-        n.shutdown_graceful().await;
-    }
-}
-
-/// `DescribeTable` reports `BillingModeSummary`/`ProvisionedThroughput` for
-/// both a `PROVISIONED` table (real declared units) and a `PAY_PER_REQUEST`
-/// one (0/0 units, matching real DynamoDB's own reporting for that mode).
-#[tokio::test(flavor = "multi_thread")]
-async fn describe_table_reports_billing_mode_and_throughput() {
-    let dir = support::panic_safe_tempdir();
-    let (nodes, config) = bring_up(1, dir.path()).await;
-    await_bootstrap(&nodes).await;
-    let addr = config.nodes[0].dynamo;
-
-    create_table_with_throughput(addr, "thr_describe_prov", 7, 3).await;
-    let (status, body) = dynamo(
-        addr,
-        "DynamoDB_20120810.DescribeTable",
-        r#"{"TableName":"thr_describe_prov"}"#,
-    )
-    .await;
-    assert_eq!(status, 200, "DescribeTable failed: {body}");
-    assert!(body.contains("\"BillingMode\":\"PROVISIONED\""), "{body}");
-    assert!(body.contains("\"ReadCapacityUnits\":7"), "{body}");
-    assert!(body.contains("\"WriteCapacityUnits\":3"), "{body}");
-
-    create_table(addr, "thr_describe_ppr").await;
-    let (status, body) = dynamo(
-        addr,
-        "DynamoDB_20120810.DescribeTable",
-        r#"{"TableName":"thr_describe_ppr"}"#,
-    )
-    .await;
-    assert_eq!(status, 200, "DescribeTable failed: {body}");
-    assert!(
-        body.contains("\"BillingMode\":\"PAY_PER_REQUEST\""),
-        "{body}"
-    );
-    assert!(body.contains("\"ReadCapacityUnits\":0"), "{body}");
-    assert!(body.contains("\"WriteCapacityUnits\":0"), "{body}");
-
-    for n in &nodes {
-        n.shutdown_graceful().await;
-    }
-}
-
-/// The bimodal-per-process-flake regression class root `CLAUDE.md`/
-/// `docs/engineering-lessons.md` warn about: `UpdateTable`'s
-/// `ProvisionedThroughput` change (`MetaCommand::SetTableThroughput`) issued
-/// against a node that is **not** the control-plane leader must still
-/// commit — it must be on `is_relayable_command`'s allowlist, or this times
-/// out on exactly this shape.
-#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
-async fn update_table_throughput_on_a_follower_is_relayed_to_the_leader() {
-    let dir = support::panic_safe_tempdir();
-    let (nodes, config) = bring_up(3, dir.path()).await;
-    await_bootstrap(&nodes).await;
-
-    let leader = nodes
-        .iter()
-        .position(animusd::Node::is_control_leader)
-        .expect("a control leader must exist after bootstrap");
-    let follower = (0..nodes.len()).find(|&i| i != leader).unwrap();
-
-    create_table(config.nodes[leader].dynamo, "thr_relay").await;
-
-    let follower_dynamo = config.nodes[follower].dynamo;
-    let (status, body) = tokio::time::timeout(Duration::from_secs(20), async {
-        loop {
-            let (status, body) = dynamo(
-                follower_dynamo,
-                "DynamoDB_20120810.UpdateTable",
-                r#"{"TableName":"thr_relay","BillingMode":"PROVISIONED",
-                    "ProvisionedThroughput":{"ReadCapacityUnits":5,"WriteCapacityUnits":5}}"#,
-            )
-            .await;
-            if status == 200 {
-                return (status, body);
-            }
-            sleep(Duration::from_millis(100)).await;
-        }
-    })
-    .await
-    .expect("follower-issued UpdateTable(ProvisionedThroughput) did not commit via relay in 20s");
-    assert_eq!(status, 200, "body: {body}");
-    assert!(body.contains("\"BillingMode\":\"PROVISIONED\""), "{body}");
-
-    // Replicated to every node's own catalog — converged-or-timeout, never
-    // a one-shot assert (the 200 above only proves the follower's own view
-    // committed).
-    for (i, n) in nodes.iter().enumerate() {
-        tokio::time::timeout(Duration::from_secs(20), async {
-            loop {
-                if n.metadata()
-                    .table_throughput("thr_relay")
-                    .is_some_and(|t| t.write_units == 5 && t.read_units == 5)
-                {
-                    return;
-                }
-                sleep(Duration::from_millis(100)).await;
-            }
-        })
-        .await
-        .unwrap_or_else(|_| {
-            panic!("node {i}: throughput spec missing 20s after follower-relayed UpdateTable")
-        });
-    }
-
-    for n in &nodes {
-        n.shutdown_graceful().await;
-    }
-}
 
 /// ADR 0065 §5(b): a cluster started with a cluster-wide default (the config
 /// surface, not `POST /admin/throttle/defaults`) throttles a table with no
