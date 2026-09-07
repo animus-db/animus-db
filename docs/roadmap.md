@@ -160,15 +160,23 @@ the still-true paragraph after the table.
   key rotation support (matching ADR 0069's own v1 scope): the config-hash
   restart annotation rolls pods on the field's *presence* changing, never
   on the same-named `Secret`'s content changing. **S-03 is now complete.**
+- **Issue #680 — closed 2026-09-07** (ADR 0069's "As-built: cluster
+  store" amendment): the default replicated `cluster` segment/backup
+  store — left uncovered by PR 2, since its per-node local building block
+  did its own raw filesystem I/O outside the `Disk` seam — is now sealed
+  under `--encryption-key` too, under the identical cluster-wide key PR 2
+  already established. The widening PR 2's own scope-cut paragraph
+  expected (a second generic parameter threaded through
+  `animus-cp-data`'s own `cluster_segment_store` module) turned out
+  unnecessary: `ClusterSegmentStore<E, S: SegmentStore>` was already
+  generic over its local building block, so closing this was a single new
+  `animusd`-local type (`LocalSegmentStore`) occupying that existing
+  parameter, with zero changes to `animus-cp-data`. Tests: `crates/
+  animusd/tests/encryption_at_rest_default_cluster_store_e2e.rs` (real
+  `ProdEnv`, mirroring the `fs:` store's own e2e — a restore across
+  nodes with no plaintext anywhere, and both loud-refusal directions).
 - **Still open (tracked separately, neither closable from S-03's own
   scope):**
-  - **Issue #680** — the default replicated `cluster` segment/backup store
-    is not covered by PR 2 — its per-node local building block does its
-    own raw filesystem I/O outside the `Disk` seam, so PR 1 never touched
-    it either; only the `fs:`/`s3://` opt-in stores are sealed. Encrypting
-    it would mean widening `ClusterSegmentStore`'s own concrete type
-    parameter — a separate, structurally larger change than PR 2's own
-    scope, tracked here rather than silently assumed done.
   - **Issue #676** — `animusd join`/`data --seed`/`--cluster-control`+
     `--cluster-data` don't thread `--encryption-key` (among several other
     per-node knobs) through to those entry points; a real gap for a

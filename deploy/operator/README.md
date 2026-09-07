@@ -288,13 +288,15 @@ already tells. Adding, removing, or pointing this field at a *different*
 way — the volume's own presence/`secretName`, and, for add/remove, this
 field's own presence baked into the config-hash restart annotation).
 
-**Only the `fs:`/`s3://` opt-in backup/segment stores and per-node
-`Disk` files (WAL/engine data) are covered — the default replicated
-`cluster` store is not** (tracked as
-[issue #680](https://github.com/animus-db/animus-db/issues/680), a
-separate, larger change to `animus-cp-data`'s own `ClusterSegmentStore`,
-not something this operator's mount can influence either way). See ADR
-0069's "As-built: PR 3" amendment for the full design and its own
+**Every store this key can reach is covered, including the default
+replicated `cluster` store** — the `fs:`/`s3://` opt-in backup/segment
+stores, per-node `Disk` files (WAL/engine data), and (since ADR 0069's
+"As-built: cluster store" amendment, which closed
+[issue #680](https://github.com/animus-db/animus-db/issues/680)) the
+default `cluster` store's own per-node local building block, all under
+this one mounted key file — nothing further for this operator to
+configure. See ADR 0069's "As-built: PR 3" amendment for the key-secret
+mount's own full design and its own
 threat-model/scope-cut notes.
 
 ## PodDisruptionBudget (S-07c)

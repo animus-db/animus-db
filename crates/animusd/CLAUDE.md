@@ -1850,34 +1850,66 @@ node's disk stays plaintext, byte-for-byte pre-ADR-0069 behavior. See
 itself; `crates/animusd/tests/encryption_at_rest_e2e.rs` is the real
 `ProdEnv`/disk/DynamoDB-wire regression.
 
-**PR 2 also seals a `SegmentStore`, not just the `Disk` seam**: the same
-`--encryption-key` (loaded once per `Node::bind*`, cloned onto
-`BoundNode`/`BoundControlNode`/`BoundDataNode::encryption_key`) is handed
-to `build_segment_store`/`build_backup_store` (both now `async`), which
-wrap a `--segment-store`/`--backup-store fs:PATH`/`s3://...` store in
-`animus_env::EncryptedSegmentStore` when a key is configured —
-`SegmentStoreHandle`/`BackupStoreHandle` each gained an `EncryptedFs`
-variant for this (the `S3` variant needed no new arm — it already boxes
-`Arc<dyn SegmentStore>`). **Key scope is cluster-wide here, not per-node**
-— unlike a `Disk` file, a backup/PITR/stream-segment object is routinely
-read by a different node than the one that wrote it, so every node
-sharing a given `fs:`/`s3://` store must be configured with the identical
-key file; see `animus_env::EncryptedSegmentStore`'s own module doc and
-the ADR's PR 2 amendment for the full decision (including what a
+**PR 2 also seals a `SegmentStore`, not just the `Disk` seam — and, since
+the 2026-09-07 "As-built: cluster store" amendment (closing issue #680),
+this now covers the DEFAULT `cluster` store too, not only the `fs:`/
+`s3://` opt-ins**: the same `--encryption-key` (loaded once per
+`Node::bind*`, cloned onto `BoundNode`/`BoundControlNode`/
+`BoundDataNode::encryption_key`) is handed to `build_segment_store`/
+`build_backup_store` (both `async`), which seal **every** variant —
+`Cluster` (the default) included — under `animus_env::
+EncryptedSegmentStore` when a key is configured. `Fs`/`S3` are unchanged
+from PR 2 (`SegmentStoreHandle`/`BackupStoreHandle` each carry an
+`EncryptedFs` variant; `S3` needed no new arm, since it already boxes
+`Arc<dyn SegmentStore>`). **`Cluster`'s own local building block —
+`SegmentStoreHandle::Cluster`/`BackupStoreHandle::Cluster`'s field type,
+`ClusterSegmentStore<ProdEnv, LocalSegmentStore>` — is a single new
+`pub(crate)` two-arm enum, `LocalSegmentStore { Plain(FsSegmentStore),
+Encrypted(EncryptedSegmentStore<FsSegmentStore, ProdEnv>) }`**, occupying
+`ClusterSegmentStore<E, S: SegmentStore>`'s own pre-existing generic
+parameter `S` (never concretely `FsSegmentStore` inside that type to
+begin with — the "widening" PR 2's own scope-cut paragraph worried about
+turned out to be entirely local to `animusd`, zero changes to
+`animus-cp-data`) — one variant each on `SegmentStoreHandle`/
+`BackupStoreHandle`, never a fourth `EncryptedCluster` arm, so every
+existing `match` on those two enums is untouched. `local_cluster_store
+(env, dir, encryption_key)` is the one new helper both `build_segment_
+store`/`build_backup_store`'s `Cluster` arms call — the identical
+`Fs`-arm control flow (wrap in `EncryptedSegmentStore::open` when `Some`;
+run `verify_or_init_segment_store_marker` directly and stay `Plain` when
+`None`, the "off by default still checks" rule), factored out once rather
+than duplicated a third time. **Key scope is cluster-wide for every
+variant, `Cluster` included, not per-node** — unlike a `Disk` file, a
+backup/PITR/stream-segment object is routinely read by a different node
+than the one that wrote it, so every node sharing a store must be
+configured with the identical key file; for `Cluster` this is the
+existing deployment-wide `--encryption-key` convention, now load-bearing
+for this store too (no second decision needed — see the ADR's
+"As-built: cluster store" amendment). See `animus_env::
+EncryptedSegmentStore`'s own module doc and the ADR's PR 2/"As-built:
+cluster store" amendments for the full decision (including what a
 mismatched-key node does: refuses loudly at its own startup, before it
 ever binds a listener — never a silent half-encrypted cluster).
-**`SegmentStoreConfig::Cluster`/`BackupStoreConfig::Cluster` (the
-default) are deliberately untouched** — their per-node local
-`FsSegmentStore` building block does raw filesystem I/O outside the
-`Disk` seam entirely, so it was never covered by PR 1 either; encrypting
-it needs widening `ClusterSegmentStore`'s own concrete type parameter, a
-separate, larger change, named as a follow-up rather than done here.
 `crates/animusd/tests/encryption_at_rest_segment_store_e2e.rs` is the
-real `ProdEnv` regression: a 2-node cluster's `CreateBackup` on node 0 →
-`RestoreTableFromBackup` on node 1 with the same key succeeds and the
-shared backup-store directory never holds the plaintext value; a
-differently-keyed node against that same directory, and a keyed node
-against an existing plaintext directory, are both refused at startup.
+real `ProdEnv` regression for the `fs:` opt-in store (unchanged): a
+2-node cluster's `CreateBackup` on node 0 → `RestoreTableFromBackup` on
+node 1 with the same key succeeds and the shared backup-store directory
+never holds the plaintext value; a differently-keyed node against that
+same directory, and a keyed node against an existing plaintext directory,
+are both refused at startup. `crates/animusd/tests/
+encryption_at_rest_default_cluster_store_e2e.rs` is its sibling for the
+**default** store: the identical restore-across-nodes/no-plaintext-anywhere
+proof but with every store left at its default (no `--segment-store`/
+`--backup-store` at all) and covering both `<node dir>/segments` (the
+streamed table's sealed shard) and `<node dir>/backups` (the on-demand
+backup) at once, plus both loud-refusal directions — isolated from PR 1's
+own `Disk`-seam marker (which lives at the sibling `<node dir>/internal`
+directory, never scanned by the same `Disk::list()` call that guards
+`<node dir>/segments`/`<node dir>/backups`) by constructing a target
+directory carrying only the cluster store's own local content, never a
+node's top-level marker/WAL/engine files — see that test file's own doc
+and the ADR amendment's "Marker semantics" section for why that isolation
+is needed at all.
 
 **`--advertise-host NAME` (ADR 0060's advertise/dial split)** — this
 node's own stable dial name, when its bind address isn't itself something a

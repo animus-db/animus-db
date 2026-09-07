@@ -91,12 +91,18 @@ the production implementation; the deterministic implementation lives in
   tests/corpora exercise it with no `ProdEnv` in the build. Wired into
   `animusd`'s `build_segment_store`/`build_backup_store`
   (`--segment-store`/`--backup-store fs:PATH`/`s3://...` + `--encryption-
-  key`) — `Fs`/`S3` get wrapped, the default `Cluster` store does not (its
-  per-node local building block does raw filesystem I/O outside the
-  `Disk` seam entirely, so PR 1 never covered it either; encrypting it
-  would need widening `ClusterSegmentStore`'s own concrete type parameter,
-  a separate, larger change, tracked as a follow-up rather than done
-  here). `ProdEnv` itself supplies the `Rng` these salts draw from when
+  key`) — `Fs`/`S3` get wrapped directly. **The default `Cluster` store is
+  wrapped too, since ADR 0069's 2026-09-07 "As-built: cluster store"
+  amendment (closing issue #680)** — not by widening `animus-cp-data`'s
+  `ClusterSegmentStore<E, S: SegmentStore>` itself (it was already generic
+  over its local building block `S`, never concretely `FsSegmentStore`
+  inside that type), but by giving `animusd` a new local type,
+  `LocalSegmentStore { Plain(FsSegmentStore), Encrypted(
+  EncryptedSegmentStore<FsSegmentStore, ProdEnv>) }`, occupying that
+  existing parameter — see `crates/animusd/CLAUDE.md`'s `--encryption-key`
+  entry for the wiring and `docs/adr/0069-encryption-at-rest.md`'s own
+  amendment for the full design. `ProdEnv` itself supplies the `Rng` these
+  salts draw from when
   used from `animusd` (it already implements `Rng`) — no new zero-sized
   `Rng` type was needed the way `DiskSaltRng` was for the `Disk` seam,
   since `EncryptedSegmentStore` is never nested inside `ProdEnv`'s own

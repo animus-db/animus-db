@@ -1250,10 +1250,13 @@ one-paragraph pointer, per this file's own convention for `spec.tls`
 in their *own* ADR and only a cross-reference here. `crates/
 animus-operator/CLAUDE.md` and `deploy/operator/README.md` carry the
 crate-local/deploy-facing detail; `docs/roadmap.md`'s S-03 section is
-marked complete, with the default `cluster` segment/backup store's own
-gap (issue #680) and ADR 0069's own per-node-flag reach gap (issue #676)
-named as the two open follow-ups, neither of which this PR's own scope
-(the operator's key-secret mount) could close on its own.
+marked complete. At the time this PR landed, the default `cluster`
+segment/backup store's own gap (issue #680) and ADR 0069's own
+per-node-flag reach gap (issue #676) were named as two open follow-ups,
+neither closable from this PR's own scope (the operator's key-secret
+mount) — issue #680 has since been closed in `animusd` itself (ADR
+0069's "As-built: cluster store" amendment), with no change needed here;
+issue #676 remains open.
 
 ## Amendment (2026-09-07): S-07e — validating admission webhook
 

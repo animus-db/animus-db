@@ -6829,11 +6829,103 @@ pub const DEFAULT_STREAM_RETENTION: Duration = Duration::from_secs(24 * 60 * 60)
 /// CLI (a test, or a future embedder).
 pub const MIN_QUIESCE_AFTER: Duration = index_drain::INDEX_DRAIN_INTERVAL;
 
+/// The **default** [`ClusterSegmentStore`](animus_cp_data::
+/// cluster_segment_store::ClusterSegmentStore)'s own per-node local
+/// building block (ADR 0069 "As-built: cluster store" amendment, closing
+/// issue #680) — `Plain` (a bare [`FsSegmentStore`], byte-for-byte the
+/// pre-amendment behavior) when no `--encryption-key` is configured, or
+/// `Encrypted` (the same [`animus_env::EncryptedSegmentStore`] wrapper
+/// `SegmentStoreHandle::EncryptedFs`/`BackupStoreHandle::EncryptedFs`
+/// already use for the opt-in `fs:`/`s3://` stores) when one is — sealing
+/// every object this node's own local copy holds under the same
+/// cluster-wide key PR 2 established, so replication between nodes moves
+/// ciphertext bytes end to end (every peer already shares the identical
+/// key file; a node without it can neither serve nor accept an object, and
+/// the marker check at [`build_segment_store`]/[`build_backup_store`]'s
+/// own startup call refuses a key/directory mismatch loudly before any
+/// listener binds — see those functions' own doc). `ClusterSegmentStore<E,
+/// S>` was already generic over its local building block `S: SegmentStore`
+/// (not concretely named to `FsSegmentStore`), so this is a single new
+/// local type occupying that existing type parameter — `SegmentStoreHandle
+/// ::Cluster`/`BackupStoreHandle::Cluster` keep exactly one variant each,
+/// never a fourth `EncryptedCluster` arm.
+#[derive(Clone)]
+pub(crate) enum LocalSegmentStore {
+    Plain(FsSegmentStore),
+    Encrypted(animus_env::EncryptedSegmentStore<FsSegmentStore, ProdEnv>),
+}
+
+#[async_trait::async_trait]
+impl animus_env::SegmentStore for LocalSegmentStore {
+    async fn put(&self, id: &str, bytes: &[u8]) -> std::io::Result<()> {
+        match self {
+            LocalSegmentStore::Plain(s) => s.put(id, bytes).await,
+            LocalSegmentStore::Encrypted(s) => s.put(id, bytes).await,
+        }
+    }
+
+    async fn get(&self, id: &str) -> std::io::Result<Option<Vec<u8>>> {
+        match self {
+            LocalSegmentStore::Plain(s) => s.get(id).await,
+            LocalSegmentStore::Encrypted(s) => s.get(id).await,
+        }
+    }
+
+    async fn delete(&self, id: &str) -> std::io::Result<()> {
+        match self {
+            LocalSegmentStore::Plain(s) => s.delete(id).await,
+            LocalSegmentStore::Encrypted(s) => s.delete(id).await,
+        }
+    }
+
+    async fn list(&self, prefix: &str) -> std::io::Result<Vec<String>> {
+        match self {
+            LocalSegmentStore::Plain(s) => s.list(prefix).await,
+            LocalSegmentStore::Encrypted(s) => s.list(prefix).await,
+        }
+    }
+}
+
+/// Build [`SegmentStoreConfig::Cluster`]'s own per-node local building
+/// block (ADR 0069 "As-built: cluster store" amendment): a bare
+/// [`FsSegmentStore`] rooted at `dir` when `encryption_key` is `None`
+/// (running [`animus_env::verify_or_init_segment_store_marker`]
+/// unconditionally first, mirroring the `Fs`/`S3` opt-in stores' own "off
+/// by default still checks" rule — an already-encrypted local directory is
+/// never silently treated as plaintext just because this node omitted
+/// `--encryption-key`), or an [`animus_env::EncryptedSegmentStore`]
+/// wrapping one when it's `Some` (`EncryptedSegmentStore::open` runs the
+/// identical check as part of opening). `dir` is `node_dir.join("segments"
+/// )`/`node_dir.join("backups")` — see [`build_segment_store`]/
+/// [`build_backup_store`]'s own call sites.
+///
+/// # Errors
+/// The loud-refusal marker check (a key/directory mismatch, in either
+/// direction).
+async fn local_cluster_store(
+    env: &ProdEnv,
+    dir: PathBuf,
+    encryption_key: Option<&animus_env::EncryptionKey>,
+) -> std::io::Result<LocalSegmentStore> {
+    let raw = FsSegmentStore::new(dir);
+    match encryption_key {
+        Some(key) => Ok(LocalSegmentStore::Encrypted(
+            animus_env::EncryptedSegmentStore::open(raw, env.clone(), key.clone()).await?,
+        )),
+        None => {
+            animus_env::verify_or_init_segment_store_marker(&raw, env, None).await?;
+            Ok(LocalSegmentStore::Plain(raw))
+        }
+    }
+}
+
 /// This node's stream-shard [`SegmentStore`](animus_env::SegmentStore) handle
 /// (ADR 0043 §A7b) — either the **default**
 /// [`ClusterSegmentStore`](animus_cp_data::cluster_segment_store::ClusterSegmentStore)
 /// (K-way replicated across nodes' own local segment directories, each
-/// backed by [`FsSegmentStore`]) or, opted into via `--segment-store
+/// backed by [`LocalSegmentStore`] — sealed under `--encryption-key` when
+/// one is configured, ADR 0069's "As-built: cluster store" amendment) or,
+/// opted into via `--segment-store
 /// dir:PATH`, a bare single-directory [`FsSegmentStore`] — dev use, or a
 /// genuinely shared mount every node in the cluster can reach at the
 /// identical path (the caveat `--segment-store`'s own CLI doc names: this
@@ -6843,7 +6935,7 @@ pub const MIN_QUIESCE_AFTER: Duration = index_drain::INDEX_DRAIN_INTERVAL;
 /// consistency the operator is choosing to accept).
 #[derive(Clone)]
 pub(crate) enum SegmentStoreHandle {
-    Cluster(animus_cp_data::cluster_segment_store::ClusterSegmentStore<ProdEnv, FsSegmentStore>),
+    Cluster(animus_cp_data::cluster_segment_store::ClusterSegmentStore<ProdEnv, LocalSegmentStore>),
     Fs(FsSegmentStore),
     /// The `--encryption-key`-sealed sibling of [`Fs`](Self::Fs) (ADR 0069,
     /// S-03 PR 2) — every object this node writes/reads through this
@@ -7391,33 +7483,29 @@ mod s3_store_handle_tests {
 /// Build (and, for the cluster variant, **start**) this node's
 /// [`SegmentStoreHandle`] (ADR 0043 §A7b) per `config`. `dir` is this node's
 /// own data directory ([`BoundNode::dir`]/[`BoundDataNode::dir`]) — the
-/// cluster variant's per-node local `FsSegmentStore` building block roots at
-/// `dir.join("segments")`, a sibling of the `internal/` subdirectory
-/// `ProdEnv::bind` already owns.
+/// cluster variant's per-node local [`LocalSegmentStore`] building block
+/// roots at `dir.join("segments")`, a sibling of the `internal/`
+/// subdirectory `ProdEnv::bind` already owns.
 ///
-/// **`encryption_key` (ADR 0069, S-03 PR 2)**: when `Some`, the `Fs`/`S3`
-/// variants are sealed under it (`animus_env::EncryptedSegmentStore`) —
-/// see that type's own module doc for the cluster-wide key-scope contract
-/// this relies on (every node reading a given `fs:`/`s3://` store must be
-/// configured with the *same* key file). **`Cluster` is deliberately
-/// untouched regardless of `encryption_key`** — encrypting its per-node
-/// local `FsSegmentStore` building block would mean changing
-/// `SegmentStoreHandle::Cluster`'s own concrete `ClusterSegmentStore<
-/// ProdEnv, FsSegmentStore>` type parameter, a larger, separate change; a
-/// `cluster`-backed store stays plaintext on disk under this PR, an
-/// honestly-stated scope cut (see this crate's own `docs/adr/
-/// 0069-encryption-at-rest.md` PR 2 amendment), not a claim that PR 1
-/// already covers it. Even with no key at all, the loud-refusal marker
-/// check (`animus_env::verify_or_init_segment_store_marker`) still runs on
-/// `Fs`/`S3`, so a store that already holds encrypted objects is never
+/// **`encryption_key` (ADR 0069, S-03 PR 2; extended to `Cluster` by the
+/// "As-built: cluster store" amendment closing issue #680)**: when `Some`,
+/// every variant — `Cluster` included — is sealed under it
+/// (`animus_env::EncryptedSegmentStore`, `Cluster`'s own local building
+/// block via [`local_cluster_store`]) — see that type's own module doc for
+/// the cluster-wide key-scope contract this relies on (every node reading
+/// a given store must be configured with the *same* key file — for
+/// `Cluster` this was already the deployment's own `--encryption-key`
+/// convention, PR 1's "one key file's path repeated across every node's
+/// config entry" case, now load-bearing for this store too). Even with no
+/// key at all, the loud-refusal marker check
+/// (`animus_env::verify_or_init_segment_store_marker`) still runs on every
+/// variant, so a store that already holds encrypted objects is never
 /// silently treated as plaintext.
 ///
 /// # Errors
-/// The `S3` variant can fail (see [`s3_segment_store`]'s own doc);
-/// `Fs`/`S3` can also fail the loud-refusal marker check above
-/// (a key/store mismatch); `Cluster` is infallible today, but the whole
-/// function is `Result` so a caller doesn't need to know which variant
-/// might fail.
+/// The `S3` variant can fail (see [`s3_segment_store`]'s own doc); every
+/// variant can fail the loud-refusal marker check above (a key/store
+/// mismatch).
 async fn build_segment_store(
     env: &ProdEnv,
     dir: &Path,
@@ -7428,7 +7516,7 @@ async fn build_segment_store(
 ) -> std::io::Result<SegmentStoreHandle> {
     Ok(match config {
         SegmentStoreConfig::Cluster => {
-            let local = FsSegmentStore::new(dir.join("segments"));
+            let local = local_cluster_store(env, dir.join("segments"), encryption_key).await?;
             let placement: Arc<dyn animus_cp_data::cluster_segment_store::PlacementView> =
                 Arc::new(ControlPlacementView { control, self_id });
             SegmentStoreHandle::Cluster(
@@ -7470,7 +7558,7 @@ async fn build_segment_store(
 
 /// This node's **backup** [`SegmentStore`](animus_env::SegmentStore) handle
 /// (ADR 0059 §1) — a second, backup-dedicated instance built the same way
-/// [`SegmentStoreHandle`] is (`ClusterSegmentStore<ProdEnv, FsSegmentStore>`/
+/// [`SegmentStoreHandle`] is (`ClusterSegmentStore<ProdEnv, LocalSegmentStore>`/
 /// `FsSegmentStore` — this crate has no `SimEnv` dependency at all, ADR 0043
 /// §A7b's `SimSegmentStore` variant is `animus-cp-data`'s own sim-corpus
 /// concern, never reached from here), but from its own `--backup-store` CLI
@@ -7496,7 +7584,7 @@ async fn build_segment_store(
 /// manifest object — see each module's own doc.
 #[derive(Clone)]
 pub(crate) enum BackupStoreHandle {
-    Cluster(animus_cp_data::cluster_segment_store::ClusterSegmentStore<ProdEnv, FsSegmentStore>),
+    Cluster(animus_cp_data::cluster_segment_store::ClusterSegmentStore<ProdEnv, LocalSegmentStore>),
     Fs(FsSegmentStore),
     /// The `--encryption-key`-sealed sibling of [`Fs`](Self::Fs) — see
     /// [`SegmentStoreHandle::EncryptedFs`]'s own doc (ADR 0069, S-03 PR 2);
@@ -7683,8 +7771,8 @@ pub enum BackupStoreConfig {
 /// Build (and, for the cluster variant, **start**) this node's
 /// [`BackupStoreHandle`] (ADR 0059 §1) — mirrors [`build_segment_store`]'s
 /// exact shape, rooting the cluster variant's per-node local
-/// `FsSegmentStore` building block at `dir.join("backups")` rather than
-/// `dir.join("segments")` — kept physically separate from the streams
+/// [`LocalSegmentStore`] building block at `dir.join("backups")` rather
+/// than `dir.join("segments")` — kept physically separate from the streams
 /// store's own local directory even though the two stores' object
 /// namespaces are already disjoint (`animus_cp_data::backup`'s own module
 /// doc), the same belt-and-suspenders posture ADR 0059 §1 takes for the
@@ -7693,14 +7781,15 @@ pub enum BackupStoreConfig {
 /// `prefix` unambiguous even if an operator pointed both stores at the same
 /// bucket) — but the same belt-and-suspenders posture applies equally.
 ///
-/// **`encryption_key` (ADR 0069, S-03 PR 2)**: identical contract to
-/// [`build_segment_store`]'s own `encryption_key` parameter — `Fs`/`S3`
-/// sealed under it when `Some`, `Cluster` deliberately untouched either
-/// way (same reasoning, see that function's own doc).
+/// **`encryption_key` (ADR 0069, S-03 PR 2; extended to `Cluster` by the
+/// "As-built: cluster store" amendment)**: identical contract to
+/// [`build_segment_store`]'s own `encryption_key` parameter — every
+/// variant, `Cluster` included, sealed under it when `Some` (same
+/// reasoning, see that function's own doc).
 ///
 /// # Errors
 /// See [`build_segment_store`]'s own doc — the `S3` variant can fail, and
-/// `Fs`/`S3` can fail the loud-refusal marker check.
+/// every variant can fail the loud-refusal marker check.
 async fn build_backup_store(
     env: &ProdEnv,
     dir: &Path,
@@ -7711,7 +7800,7 @@ async fn build_backup_store(
 ) -> std::io::Result<BackupStoreHandle> {
     Ok(match config {
         BackupStoreConfig::Cluster => {
-            let local = FsSegmentStore::new(dir.join("backups"));
+            let local = local_cluster_store(env, dir.join("backups"), encryption_key).await?;
             let placement: Arc<dyn animus_cp_data::cluster_segment_store::PlacementView> =
                 Arc::new(ControlPlacementView { control, self_id });
             BackupStoreHandle::Cluster(
@@ -16548,7 +16637,7 @@ mod simenv_client_ctx_tests {
     /// chains, not assumed), so a `DataRole` is not needed to prove this
     /// rung's claim. Building one for real would need `SegmentStoreHandle`/
     /// `BackupStoreHandle`, both of which hardcode `FsSegmentStore`/
-    /// `ClusterSegmentStore<ProdEnv, FsSegmentStore>` regardless of this
+    /// `ClusterSegmentStore<ProdEnv, LocalSegmentStore>` regardless of this
     /// `ClientCtx`'s own `E` — a second, separate blocker from the
     /// `propose_schema` one above, not exercised by anything this test
     /// asserts on. See `crates/animusd/CLAUDE.md`'s harness section.
