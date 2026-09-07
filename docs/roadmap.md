@@ -513,6 +513,57 @@ the still-true paragraph after the table.
   2026-09-07 amendment).
 - **ADR:** amendment notes on 0061.
 
+### C-06 Transact/PartiQL SimCluster dispatch
+
+- **Gap:** the two named D2 residuals — `TransactWriteItems`/
+  `TransactGetItems` and `ExecuteStatement`/`BatchExecuteStatement`/
+  `ExecuteTransaction` (PartiQL) — are unreachable through the generic
+  `dispatch_item_op`/`dispatch_table_op` core `SimCluster` drives, so their
+  own `crates/animusd/tests/` binaries stay real-socket `ProdEnv` forever
+  unless a future rung generalizes them. Per the D3-closing residual
+  inventory (`docs/adr/0061-*.md`), that's 6 files/32 tests for Transact
+  and 2 files/37 tests for PartiQL — the largest and third-largest of
+  Class D's thirteen unowned groups, and, unlike the other eight groups
+  D4 left open, both were named as out-of-scope *by design* from D2 PR 1
+  onward rather than newly discovered.
+- **Plan:** the identical widen-to-`<E: Env, R: RelayClient>`-then-add-a-
+  parallel-generic-entry-point template D3/D4 already validated four times
+  (D3 PR 2a/2b/3a, D4 PR 2/5), applied to Transact's handlers/idempotency
+  helpers and to new PartiQL siblings of `execute_statement`/
+  `execute_transaction`/`run_batch_execute_statement`. See
+  [ADR 0061](adr/0061-testability-node-crate-simulator.md)'s 2026-09-07
+  "Rung F" amendment for the full account, including the two real
+  wrinkles (`ensure_txn_idempotency_table`'s six wall-clock sites; the
+  PartiQL write path's recursion into concrete production dispatchers,
+  which forces new parallel `_as` siblings rather than a widening of
+  `run_operation` itself).
+- **PRs:** a seven-PR series — (1) this docs opener; (2) Transact
+  groundwork (widen nine functions, convert the six wall-clock sites);
+  (3) Transact reachable from `SimCluster` (`execute_item_op_as` routes
+  both operations; a new `sim_cluster_dynamo_transact.rs`, ~6-8 scenarios
+  including the idempotency-table bootstrap race between two first
+  callers); (4) Transact in the wire corpus (`sim_cluster_dynamo_corpus.rs`
+  gains a list-append `TransactWriteItems` op and a `TransactGetItems`
+  probe, `ANIMUS_DYNAMO_WIRE_SEEDS=25` once); (5) PartiQL siblings
+  (`execute_statement_as`/`execute_transaction_as`/
+  `run_batch_execute_statement_as` over the pure lowering + generic
+  dispatch, ~4 signatures); (6) PartiQL sim tests (~8-10 scenarios,
+  SELECT/INSERT/UPDATE/DELETE/batch/ExecuteTransaction, plus an optional
+  corpus equivalence cell); (7) docs close-out. Every production dispatch
+  path (`run_operation`, `execute_statement`, `execute_transaction`,
+  `run_batch_execute_statement`, `execute_one_batch_statement`) stays
+  byte-identical throughout — strictly additive, parallel new paths only,
+  per the D2 PR 1 lesson (`docs/engineering-lessons.md`).
+- **ADR:** [0061](adr/0061-testability-node-crate-simulator.md) — the
+  2026-09-07 "Rung F" amendment.
+- **Size:** L (seven PRs, two real production functions' worth of
+  `ProdEnv`-only surface to widen plus two new fault-injecting sim
+  suites).
+- **Depends:** C-04 (closed 2026-09-07 — D4 PR 1's real per-node
+  `Reconciler` and D3's `dispatch_item_op`/`dispatch_table_op` cores are
+  both load-bearing prerequisites this rung builds directly on).
+- **Status (2026-09-07):** open, PR 1 (this docs entry) landed.
+
 ---
 
 ## 4. Operator surfaces: admin API, dashboard, console, CLI
@@ -589,6 +640,7 @@ wave are independent and can run in parallel.
 | 4 | *landed 2026-09-05* (S-02) | Highest blast radius (C-01 landed 2026-09-05 — see ADR 0054; S-01 landed 2026-09-05 — see ADR 0064; S-02 — see ADR 0066) |
 | 5 | *S-04, S-05, S-07b–d, C-02, C-05 all landed 2026-09-06* | S-05 strictly after S-04 |
 | 6 | *S-03 complete 2026-09-07 (all 3 PRs, ADR 0069)*; *S-07e/S-07 complete 2026-09-07 (ADR 0070)*; *C-03 assessed 2026-09-07 — deferred, no PRs planned (see ADR 0044's matching amendment)*; W-07 | XL or gated on earlier waves |
+| 7 | C-06 (PR 1 landed 2026-09-07; PRs 2-7 open) | Gated on C-04 (closed 2026-09-07) — the D4 `Reconciler` and D3 generic dispatch cores it builds on |
 
 Open issues mapped: none left (#375 closed by W-01, #319 by W-05). Filed
 from wave 2's own findings: #590 (the operator still emits the deleted

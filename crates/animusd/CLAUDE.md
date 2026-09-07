@@ -6498,7 +6498,8 @@ role split (5/21), reconciler-driven split/rebalance/GC (7/13), TTL
 reconciler-driven split/rebalance/GC, auto-split, join/growth, and the
 backup janitor are D4's own scope (D4 PR 1 already supplied the real
 reconciler these need next); Transact and PartiQL are D2's own named
-residuals; admin/console/dashboard HTTP, Streams, TTL, the control/data
+residuals, now in progress as **C-06** (`docs/roadmap.md`, ADR 0061's
+"Rung F" amendment); admin/console/dashboard HTTP, Streams, TTL, the control/data
 role split, `--config` bring-up, index DDL beyond `CreateTable`, node
 assembly, and the throttle-metric counters are unowned by any planned
 rung as of this close; (E) frozen behind an open flake issue, 7 files/32

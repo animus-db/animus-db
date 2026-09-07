@@ -844,6 +844,7 @@ supply one, and isn't trying to.
 | D2 | An end-to-end DynamoDB-wire corpus — requests in at the wire edge, faults injected, resulting history checked by the existing `check_cycles`/`check_durability`/`check_convergence`. **Landed 2026-09-07 (both PRs)**: PR 1 (six item operations generic, `SimClusterHandle::dynamo`, a first small smoke) and PR 2 (the actual `Recorder`/`History` corpus over the wire, see the amendments below); GSI/LSI, transact, and PartiQL remain out of scope, named as D2's own residuals |
 | D3 | Migrate the `animusd` integration suite: **keep** the tests that genuinely prove real-thread liveness (group commit, lock contention, election timing — per the engineering-lessons rule that `SimEnv` does not prove thread liveness), convert the rest. **Success criterion corrected 2026-09-07** (see that date's own "D3 PR 1" amendment): the `prod-liveness` job's 2-attempt retry was already replaced by nextest sharding before D3 started, so there is no retry to drop — success is measured by the real-thread tier's own shrinking test count / wall time / flake surface instead. **PR 1 landed 2026-09-07**: the base-table-only "B class" (~30 tests across ten `dynamo_*.rs` binaries plus `kind_batch_outcome.rs`) converted to `SimCluster`. **PR 2a landed 2026-09-07**: `Metadata::members` population + `ClusterEdgeState::control` widened to `RaftNode<E>` make base-table DDL (`CreateTable`/`DeleteTable`/`ListTables`/`DescribeTable`, via new `dynamo::dispatch_table_op`) drivable over the real wire; two real fixture bugs found and fixed (a liveness-detector heartbeat gap, a tablet-id-allocator collision) and one genuine, documented `SimCluster` gap found and left open (a rebalanced-away replica's `RaftKvNode` is never torn down — see that date's own "D3 PR 2a" amendment). **PR 2b landed 2026-09-07**: `UpdateTable`'s own throughput-only change (`BillingMode`/`ProvisionedThroughput`, ADR 0065) is now drivable too, via a widened `dynamo::update_table_throughput` and a new `UpdateTable` arm on `dispatch_table_op` — five more `dynamo_throttling.rs` tests converted, no new fixture bugs (see that date's own "D3 PR 2b" amendment). **PR 3a landed 2026-09-07**: GSI/LSI `Query`/`Scan` dispatch through `SimCluster`, plus `CreateTable` with a declared GSI/LSI — eight functions widened to `<E, R>` (`run_index_query`/`run_gsi_query`/`run_lsi_query`/`run_index_scan`/`run_gsi_scan`/`run_lsi_scan`/`paginated_kind_examine`/`paginated_kind_examine_one`), 42 tests converted across nine new sibling modules; a GSI row is still never materialized under `SimCluster` (no drain loop spawned), pinned by its own new regression, so every GSI-*data* test stays on `ProdEnv` (see that date's own "D3 PR 3a" amendment). **PR 3b landed 2026-09-07, closing D3's own GSI-drain boundary**: `index_drain::drain_tablet`/`reconcile_partition` widened to `<E, R>` and a new `SimCluster::drain_gsi` fixture helper materialize a GSI's hidden table on demand, flipping PR 3a's own boundary regression positive and converting every GSI-data test it had to leave on `ProdEnv` (12 tests across nine sibling modules, two of them new: `sim_cluster_dynamo_documents.rs`, `sim_cluster_dynamo_schema.rs`) plus a sim twin of `dynamo_indexes.rs::gsi_write_then_query` that does not replace the original; seven `tests/dynamo_*.rs` files deleted whole, one trimmed (see that date's own "D3 PR 3b" amendment). D3 is now closed for the GSI-drain gap specifically — remaining `ProdEnv` binaries are there for real-thread-liveness or not-yet-generic-operation reasons. **D3 closed 2026-09-07 (PRs #711 #716 #717 #718 #719 + this)** — see the dated "D3 closing" amendment below for the full before/after numbers, the reframed success criterion's verdict, and the residual `tests/*.rs` inventory by class |
 | D4 | Deterministic coverage for the behaviours that have none today: the auto-split byte trigger (`lib.rs:14397`), the dropped-table GC reclaim loop, join/growth sequencing, and the backup-janitor async loop (its replicated state machine is already sim-tested in `animus-control/tests/backup_catalog.rs`; the loop driving it is not) |
+| F | Post-C-04: Transact/PartiQL `SimCluster` dispatch (C-06) — the two named D2 residuals (Transact, PartiQL), never claimed by any D3/D4 rung. **PR 1 (this amendment) landed 2026-09-07**; PRs 2-7 open — see the matching 2026-09-07 "Rung F" amendment below and `docs/roadmap.md`'s C-06 entry |
 
 Note that the copy-based split driver (ADR 0050) is deliberately **not** on
 this list: ADR 0058 rung 4's remaining layer deletes it. Writing a corpus
@@ -3223,3 +3224,186 @@ and after this PR's doc-only tail); `ANIMUS_SIMCLUSTER_SEEDS=10 cargo test
 -p animusd --lib sim_cluster_corpus` (3 passed, 1 ignored — the opt-in
 shrink-replay entry point, 205.88s); `ANIMUS_SEED` replay of scenarios (a)
 and (c) at their pinned seeds (both green). `Cargo.lock` unchanged.
+
+## 2026-09-07 amendment — Rung F (post-C-04): Transact/PartiQL `SimCluster` dispatch (C-06), PR 1 (this docs-only opener)
+
+D4 PR 4 closed D4, and with it C-04, leaving eight unowned residual groups
+(that PR's own closing text and `docs/roadmap.md`'s matching addendum).
+Two of the eight — Transact and PartiQL — are not new discoveries: they
+were named as out-of-scope from the very start of Phase D. D2 PR 1's own
+amendment scoped `dispatch_item_op` around exactly six item operations
+plus a base-table `Query`/`Scan`, closing with "GSI/LSI, transact, and
+PartiQL remain out of scope, named as D2's own residuals for whichever
+rung generalizes those operations next." The D3-closing residual inventory
+(this file's own "D3 closed" amendment, above) put numbers on the two: 6
+files/32 tests still `ProdEnv`-only for Transact, 2 files/37 tests for
+PartiQL — the largest and third-largest of Class D's thirteen groups after
+admin/console/dashboard HTTP. This rung — informally "F," since it
+continues Phase D's payoff after D4 rather than opening a new phase —
+claims both, tracked in `docs/roadmap.md` as **C-06**.
+
+**Why this is the natural continuation.** D3/D4 proved a template that
+generalizes cleanly: a production function whose only `ProdEnv`-binding is
+a concrete `&ClientCtx` parameter widens to `<E: Env, R: RelayClient>` with
+zero behavior change (D3 PR 2a/3a/3b, D4 PR 2/5 all did exactly this); a
+new, strictly additive `_as`/generic sibling function is what `SimCluster`
+actually calls, never a widening of the production dispatcher itself (the
+D2 PR 1 lesson, `docs/engineering-lessons.md`'s "A narrowed generic split
+of a dispatcher must not become the production dispatcher's ONLY path"
+entry). A read-only grep against `crates/animusd/src/dynamo.rs` at this
+commit confirms Transact and PartiQL fit the identical shape, with one
+real wrinkle each:
+
+- **Transact.** `run_transact` (~4902), `run_transact_get` (~5674),
+  `quiescent_multi_get` (~5753), `transact_write_idempotency_preflight`
+  (~5345), `idempotency_claim_put` (~5412), `read_idempotency_record`
+  (~5457), `record_transact_write_outcome` (~5508), and
+  `idempotency_record_item` (~5437) are all still concrete `&ClientCtx` —
+  the same shape every D3 rung widened. `ensure_txn_idempotency_table`
+  (~5548) is the wrinkle: it carries six real wall-clock sites — four
+  `tokio::time::Instant::now()` calls (building the two commit deadlines,
+  then checking each against `Instant::now()` a second time) and two
+  `tokio::time::sleep(SCHEMA_POLL_INTERVAL)` calls, one pair per commit
+  loop (the table's own `CreateTableSchema` propose-and-poll, then its
+  `SetTableTtl` propose-and-poll) — that would simply hang forever under
+  `SimEnv`, whose virtual clock only advances when the seam itself is
+  asked to sleep. This is exactly the `update_table_throughput`/
+  `create_table` precedent (D3 PR 2a/2b) that already converted the
+  identical `tokio::time::Instant::now() + TIMEOUT` / `tokio::time::sleep`
+  pattern to `ctx.env.now().saturating_add(..)` / `ctx.env.sleep(..)`, so
+  this is mechanical, not a new design.
+- **PartiQL.** `execute_statement` (~6697) and `execute_transaction`
+  (~6933) do not themselves touch `ClientCtx` concreteness as their
+  primary blocker — `partiql::parse_statement` and the rest of
+  `crates/animus-dynamo/src/partiql.rs`'s lowering functions are already
+  pure and `Env`-free (ADR 0071). The actual blocker is that
+  `execute_statement`'s `INSERT`/`UPDATE`/`DELETE` arms recurse into the
+  concrete production `run_operation` (ADR 0071 PR 3's own design: "run
+  through the exact same `run_operation` dispatcher a client-built request
+  of that shape already uses"), and `run_batch_execute_statement`/
+  `execute_one_batch_statement` (~7124/~7158) recurse into
+  `execute_statement` itself. Widening `run_operation` is out of the
+  question — it is the production dispatcher every real DynamoDB request
+  goes through, and the D2 lesson above is exactly the failure mode a
+  widening-in-place would risk. PartiQL's generic path therefore needs
+  **parallel generic siblings**, in the same `_as` shape
+  `execute_item_op_as` (~1716) already established for item ops, that
+  call `dispatch_item_op`/the new generic Transact functions this rung's
+  own PR 2/3 build — never a generalization of `run_operation`,
+  `execute_statement`, or `execute_transaction` themselves.
+
+**Decision.** Build `SimCluster`-reachable, deterministic coverage for
+`TransactWriteItems`/`TransactGetItems` and for
+`ExecuteStatement`/`BatchExecuteStatement`/`ExecuteTransaction`, following
+the identical widen-then-add-a-generic-entry-point template D3/D4 already
+validated four times over.
+
+**Non-goals.** Every production dispatch path stays byte-identical:
+`run_operation`, `execute_statement`, `execute_transaction`,
+`run_batch_execute_statement`, and `execute_one_batch_statement` are none
+of them touched in *shape* — only widened in *type parameter* where PR 2
+says so, with every existing real-socket regression run against the
+widened code before anything is trimmed, per the D3 PR 3b precedent. The
+new PartiQL entry points are strictly additive and parallel to the
+existing ones, never a replacement for them, per the D2 lesson this
+amendment already restates above.
+
+**The PR series**, with a per-PR signature budget so each stays reviewable
+on its own:
+
+- **PR 1 (this amendment).** Docs only: this ADR amendment, the C-06
+  roadmap entry, and this file's own D-train table row.
+- **PR 2 — Transact groundwork.** Widen nine functions to `<E: Env, R:
+  RelayClient>`: `run_transact`, `run_transact_get`,
+  `quiescent_multi_get`, `transact_write_idempotency_preflight`,
+  `ensure_txn_idempotency_table`, `idempotency_claim_put`,
+  `read_idempotency_record`, `record_transact_write_outcome`, and
+  `idempotency_record_item`. Convert `ensure_txn_idempotency_table`'s six
+  wall-clock sites to `ctx.env.now().saturating_add(..)`/`ctx.env.sleep(..)`.
+  Zero new mechanism — a pure signature-and-timer conversion, the D3
+  PR 2a/2b shape exactly.
+- **PR 3 — Transact reachable from `SimCluster`.** `execute_item_op_as`'s
+  `matches!` (~1742) gains `Operation::TransactWriteItems { .. } |
+  Operation::TransactGetItems { .. }`, routing both to the now-generic PR 2
+  functions — `run_operation`'s own arms untouched. A new
+  `sim_cluster_dynamo_transact.rs` sibling module, ~6-8 scenarios: a
+  commit that includes a `ConditionCheck` action; a condition failure
+  surfacing the right per-action `CancellationReasons`; a
+  `ClientRequestToken` idempotent retry; `TransactGetItems`'s snapshot
+  behavior against a concurrent writer; a transaction issued from a node
+  hosting no replica of any touched tablet (proving the forward path); and
+  the idempotency-table bootstrap race between two callers that are both
+  first to need it (see Risks, below).
+- **PR 4 — Transact in the wire corpus.** `sim_cluster_dynamo_corpus.rs`
+  gains a list-append `TransactWriteItems` op feeding the same
+  `Recorder`/`History`/`check_cycles`/`check_durability`/`check_convergence`
+  model the corpus's other ops already feed, and a `TransactGetItems` probe
+  following `GetItem`'s own `ConsistentRead: true`/`false` split (only
+  `true` feeds `check_cycles`, per this corpus's existing read-consistency
+  modeling decision). `ANIMUS_DYNAMO_WIRE_SEEDS=25` run once, matching the
+  bar every D2/D3 PR that touched this corpus already cleared.
+- **PR 5 — PartiQL siblings.** New parallel generic entry points —
+  `execute_statement_as`/`execute_transaction_as`/
+  `run_batch_execute_statement_as` — built over the pure
+  `crates/animus-dynamo/src/partiql.rs` lowering functions,
+  `dispatch_item_op`/PR 2's generic Transact functions, and the existing
+  pure reshapers (`reshape_write_response_to_execute_statement` ~7048,
+  `reshape_query_scan_response_to_execute_statement` ~7071, `first_item`
+  ~7104) unchanged. ~4 new signatures; `execute_statement`,
+  `execute_transaction`, `run_batch_execute_statement`, and
+  `execute_one_batch_statement` themselves stay untouched.
+- **PR 6 — PartiQL sim tests.** ~8-10 scenarios in a new
+  `sim_cluster_dynamo_partiql.rs`: `SELECT` with an exact-key WHERE and
+  with a range WHERE; `INSERT` including `ON CONFLICT DO NOTHING` and the
+  plain `DuplicateItemException` path; `UPDATE`/`DELETE` with `RETURNING`;
+  `BatchExecuteStatement` with one failing statement among several (no
+  cross-statement atomicity, mirroring `BatchWriteItem`); `ExecuteTransaction`
+  both all-`SELECT` and all-write. Plus an optional corpus equivalence cell
+  if PR 4's own corpus generalizes cheaply to a PartiQL-issued write.
+- **PR 7 — docs close-out.** Update this ADR's D-train row, the
+  `docs/roadmap.md` C-06 entry (deleted per that file's own maintenance
+  rule once landed), and `crates/animusd/CLAUDE.md`'s residual inventory.
+
+**Risks, named up front rather than discovered mid-series:**
+
+- **The idempotency-table bootstrap race has never run under a
+  fault-injecting simulator.** `ensure_txn_idempotency_table` is a
+  propose-and-poll-to-commit dance any number of concurrent first callers
+  can race into simultaneously (nothing serializes callers before the
+  schema check); production has run this path for a long time without an
+  incident report, but "no incident report" is not the same bar as "proven
+  under `SimEnv` fault injection" — budget for a real finding here, the
+  same way D3 PR 2a/3a each found one (a heartbeat gap, a tablet-id
+  collision) the moment its own generalized surface got its first
+  deterministic exercise.
+- **`quiescent_multi_get`'s per-key non-blocking snapshot semantics** (ADR
+  0018 §2) have to hold under a concurrent writer once genuinely
+  fault-injectable — PR 3's own `TransactGetItems`-vs-concurrent-writer
+  scenario is there specifically to give this a first deterministic proof,
+  not to rubber-stamp an assumption.
+- **`execute_one_batch_statement` must call the generic sibling, not the
+  concrete `execute_statement`, once PR 5 exists** — the identical
+  narrowed-split trap D2 PR 1 hit: if the widened PartiQL path is wired in
+  as a caller of the *old* concrete function by mistake (or left calling
+  it out of caution), `BatchExecuteStatement`'s `INSERT`/`UPDATE`/`DELETE`
+  arm silently stays `ProdEnv`-only forever, with nothing failing loudly to
+  say so.
+
+**Gates, per PR:** `cargo fmt --all --check`; `cargo clippy -p animusd
+--all-targets --all-features -- -D warnings`; `cargo build -p animusd
+--all-targets`; `cargo test -p animusd --lib`; real-socket sanity,
+run-only, on the `tests/*.rs` binaries this rung's own conversions are
+adjacent to. **`cp_txn.rs` and `dynamo_txn_idempotency.rs` are open-flake
+files (issue #298) and must never be edited by this series** — run them
+for sanity, do not touch their content, and do not fold their own
+conversion into this rung even if a PR's diff would make it tempting;
+that stays #298's own scope.
+
+**Website: no change needed.** `website/`'s transaction and PartiQL claims
+(`compatibility.html` et al.) describe wire-level behavior — what
+`TransactWriteItems`/`TransactGetItems`/`ExecuteStatement`/
+`BatchExecuteStatement`/`ExecuteTransaction` do against a real cluster —
+and stay true throughout this series, since every production dispatch
+path is byte-identical per this amendment's own non-goals. This rung adds
+a second, `SimEnv`-level deterministic proof underneath an already-true
+site claim; it does not change what the site claims.
