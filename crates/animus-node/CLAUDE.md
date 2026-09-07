@@ -602,6 +602,17 @@ sub-rungs below shipped.
   closes docs/roadmap.md's whole U-07 section — every one of its four
   routes has now landed.
 
+  **`AdminHost` gained a ninth method after all, `live`, for issue #710
+  (2026-09-07)**: `GET /admin/live`, the Kubernetes liveness probe route
+  split off `health` (see `crates/animusd/CLAUDE.md`'s and
+  `docs/adr/0020-admin-interface.md`'s matching entries for why `health`
+  itself must not double as liveness) — added the identical way again
+  (`impl AdminHost for ClientCtx` in `animusd::admin` delegates to that
+  file's own `live` function); `admin::tests::FakeHost` gained the new arm
+  (returning `self.record()`, not `unreachable!()`, since a routing test
+  exercises it directly — `liveness_and_readiness_routes_are_distinct_
+  paths`) and `dispatch`'s routing table needed the one new arm too.
+
   **A testing gotcha this rung's own dispatch tests needed a real fix
   for, not just a workaround**: this crate has no `tokio` dependency at
   all (not even in `[dev-dependencies]`), so `#[tokio::test]` isn't an
