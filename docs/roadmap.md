@@ -671,3 +671,33 @@ test) — see ADR 0034's and ADR 0061's matching 2026-09-07 amendments for
 the full account. What remains open for D4: PR 4 (join/growth needs an
 add-node capability) and PR 5 (the backup janitor needs `client_ctx_
 host.rs`'s impls widened).
+
+---
+
+**Addendum, 2026-09-07 (C-04 D4 PR 5 landed)**: the backup janitor's own
+async loop (`animus_node::backup_janitor::backup_janitor_loop`) now has
+deterministic `SimCluster` coverage — `client_ctx_host.rs`'s four
+`ClientCtx` host-capability impls and `backup_janitor.rs`'s own thin
+wrapper widened to `<E: Env, R: RelayClient>` (previously concrete
+`ClientCtx` = `ClientCtx<ProdEnv, AnimusdRelayClient>`), zero new
+mechanism (every field/method each impl delegates to was already
+`E`/`R`-agnostic or already generic). `SimCluster` now builds every node's
+`backup_store` as a `BackupStoreHandle::S3` wrapping a clone of ONE shared
+`SimSegmentStore` (a real S3 bucket has no per-node locality, so this is
+the faithful choice, not a placeholder) and spawns the janitor loop
+unconditionally on every node, mirroring D4 PR 1's own `heartbeat_loop`
+spawn. Five scenarios in the new `sim_cluster_backup_janitor.rs` (12 tests
+including `_over_seeds` siblings): a deleted backup reclaimed, a failed
+backup reclaimed, leader gating (a follower never touches the store) plus
+a real leadership-transfer handoff mid-reclaim converging cleanly, a
+crashed-and-restarted control leader converging via the survivors' own
+reclaim, and an untouched `Available` backup left alone. `cargo test -p
+animusd --lib`: 331 → 343 (+12, 0 regressions). No janitor bug found —
+one harness-only gotcha was found and fixed (a `propose`-then-immediate-
+`crash` scenario must let the entry replicate before crashing its own
+proposer, or the entry is stranded and lost rather than inherited by the
+survivors; see ADR 0061's and `docs/engineering-lessons.md`'s matching
+entries). `dynamo_backup.rs`'s own janitor-convergence assertion stays on
+`ProdEnv`, fused into one long wire-shape test `SimCluster` cannot
+reach — nothing separable to move. **This closes D4 PR 5. What remains
+open for D4: PR 4 (join/growth needs an add-node capability).**

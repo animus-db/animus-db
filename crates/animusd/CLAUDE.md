@@ -6918,3 +6918,138 @@ test stay (Streams remains documented `ProdEnv`-only for this fixture);
 timing + admin HTTP). `auto_split_min_tablets.rs`/`auto_split_ops_rate.rs`
 are untouched — other triggers (ADR 0067/W-09), out of this rung's own
 scope.
+
+## Appendix — SimCluster coverage for the backup janitor's own loop (ADR 0061 rung D4 PR 5, 2026-09-07)
+
+Closes D4's own "the backup janitor needs `client_ctx_host.rs`'s impls
+widened" residual, the last item D4 PR 1/2/3's own doc entries named as
+still open (D4 PR 4, join/growth, remains open — out of this PR's scope).
+
+**Widening (`client_ctx_host.rs`, `backup_janitor.rs`)**: `ClientCtx`'s
+four implementations of `animus_node::host`'s `ControlLeaderHost<E>`/
+`BackupObjectStore`/`BackupJanitorProgressHost`/`TtlScanHost` traits
+widened from `impl X for ClientCtx` (concrete `E = ProdEnv, R =
+AnimusdRelayClient`) to `impl<E: Env, R: RelayClient> X for ClientCtx<E,
+R>` — a pure signature change: every field/method each impl delegates to
+(`self.edge.leader_handle()`, `self.backup_store`, `self.backup_janitor_
+progress`, `edge.hosted_groups()`, `dynamo::kind_write_item_at_leader::<E,
+R>`) was already `E`/`R`-agnostic or already generic since earlier rungs
+(D3 PR 2a for `ClusterEdgeState::control`, C5 for `kind_write_item_at_
+leader`). `TtlReaperProgressHost` (a fifth impl in the same file, sharing
+`BackupJanitorProgressHost`'s exact shape) was deliberately left
+concrete — nothing in this rung's own scope needs it generic, and it
+coexists fine as a separate, non-overlapping impl on the same bare
+`ClientCtx` default-type-parameter alias. `animusd::backup_janitor`'s own
+thin wrapper widened the same way: `fn backup_janitor_loop<E: Env, R:
+RelayClient>(ctx: ClientCtx<E, R>)`. Production's two real spawn sites
+(`spawn_common_tail`) needed zero changes — they pass a concrete
+`ClientCtx`, so `E`/`R` infer to `ProdEnv`/`AnimusdRelayClient` exactly as
+before. `animus_node::host`'s own trait definitions needed **no** change.
+
+**Store choice: `SimCluster` now builds every node's `ClientCtx::
+backup_store` as `BackupStoreHandle::S3` wrapping a clone of ONE shared
+`animus_sim::SimSegmentStore`** — not a per-node `Fs`-shaped placeholder
+directory the way `segment_store` (still unread by anything this fixture
+drives) and every other still-untouched field stays. This is the faithful
+choice, not a simplification: `BackupStoreHandle::S3` already holds
+`Arc<dyn animus_env::SegmentStore>` specifically so a test can substitute
+a fake transport (`lib.rs`'s own `s3_store_handle_tests` does the
+identical thing over `animus_s3::fake::FakeS3`), and a real `s3://`
+bucket genuinely has no per-node locality — sharing one `SimSegmentStore`
+is what makes this rung's leader-gating scenario meaningful at all (a
+per-node-local store would make "did a follower's janitor touch the
+store" trivially true by construction, since it would have its own
+private copy to *not* touch). `SimCluster::new` builds the store once
+(`SimSegmentStore::new(sim.env(ids[0].clone()))` — which node's handle
+constructs it doesn't matter, since it draws off the `Simulator`'s one
+shared RNG stream regardless) and every node's own `ClientCtx` wraps
+`Arc::new(backup_store.clone())` around it; `SimCluster::restart` leaves
+`ctx.backup_store` untouched (only `control`/`relay`/`edge` are
+reassigned), so a restarted node's respawned janitor loop still shares
+the identical store. `SimSegmentStore`'s own fault knobs (ack-lost,
+unavailability windows) stay at their default-off — this rung's scenarios
+test the janitor's own logic, not the store's fault-injection surface.
+
+**`backup_janitor_loop` is spawned unconditionally on every node**, in
+both `SimCluster::new` and `SimCluster::restart` — mirroring
+`heartbeat_loop`'s own always-on D4 PR 1 spawn, not `auto_split_loop`'s
+opt-in `set_auto_split_thresholds` shape: this loop's own leader gate
+(`ControlLeaderHost::control_leader()` answering `None`) already makes a
+non-leader's tick a cheap idle `Idle`-phase sleep, so there is no reason
+to gate spawning it behind an opt-in the way a genuinely disruptive
+background trigger (auto-split) needs to be.
+
+**New `SimCluster` accessors** (`sim_cluster.rs`): `backup_store() ->
+SimSegmentStore` (a cheap clone of the one shared store, for direct
+assertions/seeding — `SimSegmentStore::stored_ids()` is a plain sync
+method, so a test can inspect landed state with no simulator drive at
+all); `seed_backup_object(id, bytes)` (drives a real `SegmentStore::put`
+via `spawn_and_capture` on node 0's own env — the spawning node is
+arbitrary, mirroring `client_env`'s own "any env will do" reasoning);
+`backup_janitor_progress(node) -> JanitorProgress` (the identical `GET
+/admin/backup-store` read, a plain lock/clone/drop); `propose_meta
+(command: MetaCommand) -> ProposeResult` (a new, general-purpose sibling
+of `set_table_throughput`'s own hand-rolled `self.controls[leader]
+.propose(..)` — used by the backup-janitor corpus to drive
+`BeginBackup`/`RecordBackupTabletComplete`/`CompleteBackup`/`FailBackup`/
+`MarkBackupDeleted`/`DeleteBackup` the identical way `animus-control/
+tests/backup_catalog.rs`'s own `propose_accepted` helper does against a
+bare `RaftNode`); `transfer_control_leadership_to(target)` (a real
+`RaftCore::transfer_leadership` handoff, retried — bounded — since a
+single arm attempt only succeeds if `target`'s own log has already caught
+up to the leader's current commit index at that precise instant, the
+identical one-shot-arm caveat this file's own issue #405 entry documents
+for `admin_remove_control_member`'s self-removal transfer).
+
+**Five scenarios** (`crates/animusd/src/sim_cluster_backup_janitor.rs`,
+12 tests including `_over_seeds` siblings at 5 seeds each): (a) a
+completed (`Available`) backup marked deleted is reclaimed — manifest and
+data-chunk objects gone, catalog row gone, the leader's own
+`JanitorProgress` ending `Idle` having seen the backup and reclaimed both
+objects; (b) a `Failed` backup (no `MarkBackupDeleted` involved) is
+reclaimed the identical way; (c1) a follower's own `JanitorProgress`
+never leaves `Idle` while the leader alone reclaims; (c2) a real
+leadership transfer issued immediately after `MarkBackupDeleted` commits
+still converges to exactly one reclaim with no error recorded on any
+node's own progress; (d) the control-plane leader crashes right after
+`MarkBackupDeleted` commits and is restarted only once the survivors have
+already reclaimed the backup on their own — the restarted node's own view
+converges too; (e) an `Available` backup (never marked, never failed) is
+never touched over a long window. `ANIMUS_SEED=<seed> cargo test -p
+animusd --lib <test name>` replays any one (repo convention) — scenarios
+(a) and (c1) were replayed this way as part of this PR's own gate run.
+
+**One real gotcha found and fixed building scenario (d), not a production
+bug**: the first draft called `propose_meta(MarkBackupDeleted)` then
+immediately `crash(victim)` with zero intervening virtual time —
+`propose` only appends to the leader's own local log and returns
+`Accepted` the instant that append happens, never "committed to a
+majority," so the entry was stranded unreplicated on the log the crash
+was about to mute; the two survivors never saw the backup marked at all,
+and the poll spun to its own 20s timeout every run. Fixed with a short
+`run_for` (well under the janitor's own 200ms tick, so the crash still
+lands before the about-to-crash leader's own tick could finish the whole
+reclaim itself) between the propose and the crash — see `docs/
+engineering-lessons.md`'s matching entry for the general lesson.
+
+**No janitor bug found** — all five scenarios held at every seed tried.
+`dynamo_backup.rs`'s own `create_backup_round_trip_survives_table_drop_
+and_janitor_reclaims` stays untouched: its own janitor-convergence
+assertion (the very last one in the test) is fused into one long test
+that also proves the DynamoDB wire shapes this fixture cannot reach at
+all (`SimCluster` drives no backup/restore wire operations, ADR 0061 rung
+D2's own named residual) — nothing to separate out. `cargo test -p
+animusd --lib`: 331 → 343 (+12, 0 regressions, 3 ignored throughout, same
+as every prior D4 rung).
+
+**Gates**: `cargo fmt --all --check` (clean); `cargo clippy -p animus-node
+-p animusd --all-targets --all-features -- -D warnings` (clean); `cargo
+test -p animus-node` (132 lib + 3 + 2 integration = 137 passed, proving
+the trait definitions are untouched); `cargo test -p animus-control --test
+backup_catalog` (3 passed, the state machine this loop drives, untouched);
+`cargo test -p animusd --lib` (331 passed before, 343 passed after, 0
+regressions); `cargo build -p animusd --all-targets` (clean); `cargo test
+-p animusd --test dynamo_backup --test dynamo_restore --test dynamo_pitr`
+(before and after this change, both green — the janitor and the widened
+host impls are on their real-socket path too); `ANIMUS_SEED` replay of
+scenarios (a) and (c1). `Cargo.lock` unchanged.
