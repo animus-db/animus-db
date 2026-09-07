@@ -1209,7 +1209,13 @@ identical grow-only rule `crate::validate::validate_spec` enforces) is
 rejected by the API server **itself** — `kubectl patch` fails outright,
 naming `spec.controlNodes` in its own error, not merely surfaced as a
 status condition on a persisted object — and a valid edit
-(`quiesceAfterSecs`) is still admitted and persisted. Independent of
+(`quiesceAfterSecs`) is still admitted and persisted. **Issue #704**: since
+the webhook Deployment reporting `Ready` does not prove its Service is
+routable yet, both assertions now wait for `endpoints/e2e-operator-webhook`
+to carry a routable address before the `ValidatingWebhookConfiguration` is
+registered and additionally retry their own `kubectl patch` for up to ~30s
+while the error is the dial-failure shape `failurePolicy: Fail` produces
+during any residual propagation window. Independent of
 `E2E_TLS`/`E2E_S3`/`E2E_ENCRYPTION` — any combination may be set; the
 plain-TCP path (`E2E_WEBHOOK` unset) is byte-for-byte unchanged.
 **UNVERIFIED in this repository's sandboxed dev environment**, same

@@ -394,6 +394,20 @@ has_dynamo_endpoint() {
     [ -n "$(dynamo_endpoint_pod)" ]
 }
 
+# Issue #704: the webhook Service's own Endpoints (or EndpointSlice — the
+# addresses are the same set either way; Endpoints is the older, simpler
+# API and this cluster's version has both) becoming non-empty is the
+# earliest observable signal that a webhook Service is actually routable —
+# a Deployment reporting Ready only proves the pod passed its (absent, for
+# --webhook-only) readiness probe, not that kube-proxy has programmed the
+# Service's ClusterIP rule yet. Used by the S-07e leg below.
+webhook_endpoint_ready() {
+    local ips
+    ips="$(kubectl get endpoints "$WEBHOOK_SERVICE_NAME" -n "$NAMESPACE" \
+        -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null || true)"
+    [ -n "$ips" ]
+}
+
 port_forward_ready() {
     # Any real HTTP response (even a 4xx from an unrecognized bare GET)
     # proves the forwarded port is accepting and relaying connections;
@@ -1058,6 +1072,19 @@ spec:
 EOF
     kubectl -n "$NAMESPACE" rollout status "deployment/${WEBHOOK_DEPLOYMENT_NAME}" --timeout=120s
 
+    phase "wait for the webhook Service to be routable (S-07e / issue #704)"
+    # Deliberately BEFORE registering the ValidatingWebhookConfiguration, not
+    # after: once the API server has a webhook config for this rule, ANY
+    # matching write — including the very first patch below — triggers a
+    # live dial to the Service, so the soundest ordering is to only ever
+    # point the API server at a target already known to be routable, rather
+    # than register-then-hope. Endpoints becoming non-empty is necessary but
+    # not provably sufficient (kube-proxy's own ClusterIP-rule programming
+    # trails Endpoints by a small, unbounded amount in `kind`), which is why
+    # the rejection probe below still retries through the same error class
+    # as a second, belt-and-suspenders guard.
+    wait_for "endpoints/${WEBHOOK_SERVICE_NAME} has a routable address" 30 1 -- webhook_endpoint_ready
+
     phase "register the ValidatingWebhookConfiguration (S-07e)"
     # namespaceSelector scopes this webhook to this leg's own namespace
     # only — a webhook outage here (or a bug in this leg's own manifest)
@@ -1097,18 +1124,67 @@ EOF
     # rule crate::validate::validate_spec enforces — a real Kubernetes
     # API-server-level rejection, not a status condition, is exactly the
     # property no `cargo test -p animus-operator` run can prove.
+    #
+    # Issue #704: the endpoints wait above narrows the race but does not
+    # close it (kube-proxy's ClusterIP programming can still trail Endpoints
+    # becoming non-empty), so this probe retries — bounded, ~30s total —
+    # only while the failure looks like the webhook Service not being dialable
+    # yet (`failed calling webhook` / `connection refused` / `InternalError`,
+    # the exact error shape `failurePolicy: Fail` turns a dial failure into).
+    # A response that IS an admission rejection (names spec.controlNodes) —
+    # or the final attempt once the budget is spent — is the only place the
+    # assertion below actually gets evaluated, so a genuinely missing/wrong
+    # rejection still fails the phase with the same message as before this
+    # fix.
     WEBHOOK_REJECT_LOG="${WORKDIR}/webhook-reject.log"
-    if kubectl patch animuscluster "$AC_NAME" -n "$NAMESPACE" --type merge \
-        -p '{"spec":{"controlNodes":1}}' >"$WEBHOOK_REJECT_LOG" 2>&1; then
-        fail "expected the admission webhook to reject a spec.controlNodes decrease, but the patch succeeded: $(cat "$WEBHOOK_REJECT_LOG")"
-    fi
+    WEBHOOK_PROBE_TIMEOUT=30
+    WEBHOOK_PROBE_INTERVAL=3
+    waited=0
+    while true; do
+        if kubectl patch animuscluster "$AC_NAME" -n "$NAMESPACE" --type merge \
+            -p '{"spec":{"controlNodes":1}}' >"$WEBHOOK_REJECT_LOG" 2>&1; then
+            fail "expected the admission webhook to reject a spec.controlNodes decrease, but the patch succeeded: $(cat "$WEBHOOK_REJECT_LOG")"
+        fi
+        if grep -q "spec.controlNodes" "$WEBHOOK_REJECT_LOG"; then
+            break
+        fi
+        if grep -qE "failed calling webhook|connection refused|InternalError" "$WEBHOOK_REJECT_LOG" \
+            && [ "$waited" -lt "$WEBHOOK_PROBE_TIMEOUT" ]; then
+            log "rejection probe: webhook Service not dialable yet at ${waited}s (issue #704) — retrying: $(cat "$WEBHOOK_REJECT_LOG")"
+            sleep "$WEBHOOK_PROBE_INTERVAL"
+            waited=$((waited + WEBHOOK_PROBE_INTERVAL))
+            continue
+        fi
+        break
+    done
     grep -q "spec.controlNodes" "$WEBHOOK_REJECT_LOG" ||
         fail "webhook rejection did not name spec.controlNodes: $(cat "$WEBHOOK_REJECT_LOG")"
     log "invalid spec.controlNodes decrease correctly rejected by the admission webhook"
 
     phase "assert a valid write is still admitted (S-07e)"
-    kubectl patch animuscluster "$AC_NAME" -n "$NAMESPACE" --type merge \
-        -p '{"spec":{"quiesceAfterSecs":7}}'
+    # Same dial-race guard as the rejection probe above, on the acceptance
+    # side (issue #704): a valid patch goes through the identical webhook
+    # call, so it can hit the identical "not routable yet" window. By this
+    # point the rejection probe above has already confirmed the webhook IS
+    # dialable, so this loop is expected to succeed on its first attempt in
+    # practice — kept identical anyway for soundness, not because it is
+    # expected to ever retry.
+    WEBHOOK_ACCEPT_LOG="${WORKDIR}/webhook-accept.log"
+    waited=0
+    while true; do
+        if kubectl patch animuscluster "$AC_NAME" -n "$NAMESPACE" --type merge \
+            -p '{"spec":{"quiesceAfterSecs":7}}' >"$WEBHOOK_ACCEPT_LOG" 2>&1; then
+            break
+        fi
+        if grep -qE "failed calling webhook|connection refused|InternalError" "$WEBHOOK_ACCEPT_LOG" \
+            && [ "$waited" -lt "$WEBHOOK_PROBE_TIMEOUT" ]; then
+            log "acceptance probe: webhook Service not dialable yet at ${waited}s (issue #704) — retrying: $(cat "$WEBHOOK_ACCEPT_LOG")"
+            sleep "$WEBHOOK_PROBE_INTERVAL"
+            waited=$((waited + WEBHOOK_PROBE_INTERVAL))
+            continue
+        fi
+        fail "expected a valid write to be admitted, but the patch failed: $(cat "$WEBHOOK_ACCEPT_LOG")"
+    done
     ACTUAL_QUIESCE="$(kubectl get animuscluster "$AC_NAME" -n "$NAMESPACE" \
         -o jsonpath='{.spec.quiesceAfterSecs}')"
     [ "$ACTUAL_QUIESCE" = "7" ] ||
