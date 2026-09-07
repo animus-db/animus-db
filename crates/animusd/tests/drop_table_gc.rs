@@ -14,6 +14,15 @@
 //! routing gotcha), then asserts reclamation survives a restart (no
 //! resurrection) and that the node keeps serving fresh tables. The 3-node
 //! per-process test asserts **every replica** reclaims its own WAL file.
+//!
+//! A third real-disk test (issue #722, ADR 0061 rung D4 PR 3's finding) adds
+//! the missed case: a replica stopped BEFORE the drop, restarted only AFTER
+//! the drop has already converged on the others — proving `host::
+//! Reconciler`'s second fact source (`EngineFactory::local_tablets`, backed
+//! here by the real `LsmTabletFactory`'s own directory listing) reclaims the
+//! restarted node's leftover per-tablet **engine** files
+//! (`tablet_engine_present`, distinct from `tablet_wal_present`'s Raft-log
+//! check above) within a bounded converge-or-timeout poll.
 
 mod support;
 
@@ -197,6 +206,18 @@ fn files_in(dir: &Path) -> Vec<String> {
 /// longer a per-tablet signal; the WAL file is.
 fn tablet_wal_present(dir: &Path, tablet: u64) -> bool {
     files_in(dir).contains(&animus_cp_data::wal_file(tablet))
+}
+
+/// Whether `tablet`'s own private LSM **engine** files (ADR 0050 rung 1 —
+/// distinct from the per-group Raft WAL file [`tablet_wal_present`] checks)
+/// exist in `dir`: any file carrying the `{LSM_PREFIX}t{tablet}-` prefix
+/// `animusd`'s own `LsmTabletFactory` opens/probes/destroys by (see that
+/// impl's doc, `crates/animusd/src/lib.rs`) — the physical artifact issue
+/// #722's fix reclaims for a node that missed the whole drop window while
+/// offline.
+fn tablet_engine_present(dir: &Path, tablet: u64) -> bool {
+    let prefix = format!("{}t{tablet}-", animusd::LSM_PREFIX);
+    files_in(dir).iter().any(|f| f.starts_with(&prefix))
 }
 
 /// Whether the replicated metadata (as node `n` sees it) has any tablet scoped
@@ -412,6 +433,120 @@ async fn every_replica_reclaims_a_dropped_tables_files() {
             })
             .await;
         }
+
+        for node in &nodes {
+            node.shutdown_graceful().await;
+        }
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// Real-disk regression for issue #722 (ADR 0061 rung D4 PR 3's own
+/// finding, closed by the sibling `animus-cp-data`/`animusd` PR this file's
+/// change lands alongside): a node stopped BEFORE a table drop is issued,
+/// and restarted only AFTER the drop has already fully converged on every
+/// other replica, must still reclaim its own leftover per-tablet **engine**
+/// files — not merely the metadata/hosted-set facts, which purge/re-derive
+/// on their own regardless (see `crates/animus-cp-data/src/host.rs`'s own
+/// `EngineFactory::local_tablets`/`Reconciler::tick` docs for the full
+/// mechanism, and `crates/animusd/src/sim_cluster_dynamo_drop_table.rs`'s
+/// `scenario_4_a_node_crashed_during_the_drop_and_restarted_reclaims_its_
+/// engine` for the identical scenario over the in-memory `SimCluster`
+/// tier). This is the real `LsmTabletFactory` — its `local_tablets`
+/// enumerates this exact on-disk directory by listing it and parsing each
+/// file's own `db-t{tablet}-` prefix, the identical mechanism `probe`/
+/// `destroy` already use.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_node_stopped_before_the_drop_and_restarted_after_reclaims_its_leftover_engine() {
+    timeout(Duration::from_secs(120), async {
+        let tmp = support::panic_safe_tempdir();
+        let (mut nodes, config, dirs) = bring_up(3, tmp.path()).await;
+        await_bootstrap(&nodes).await;
+
+        client_put(nodes[0].client_addr(), "ledger", b"k1", b"v1").await;
+        await_true(10, "tablet for `ledger` provisioned", || {
+            has_table_tablet(&nodes[0], "ledger")
+        })
+        .await;
+        let tablet = nodes[0]
+            .metadata()
+            .tablets
+            .iter()
+            .find(|(_, t)| t.table.as_deref() == Some("ledger"))
+            .map(|(id, _)| id.0)
+            .expect("ledger tablet exists");
+
+        // Every replica genuinely hosts real, on-disk engine content before
+        // anything stops.
+        for dir in &dirs {
+            await_true(20, "replica hosts the tablet's own engine files", || {
+                tablet_engine_present(&dir.join("internal"), tablet)
+            })
+            .await;
+        }
+
+        // Stop node 2's whole process (not a restart yet — see below) BEFORE
+        // the drop. Nothing touches its on-disk engine files while it's down.
+        nodes[2].shutdown_graceful().await;
+
+        // Drop the table from a still-live node, and let it fully converge
+        // on the two still-live replicas before node 2 ever comes back — the
+        // realistic "restart once the dust has settled" shape, not an
+        // artificially narrow race window.
+        let (s, body) = admin(
+            nodes[0].admin_addr(),
+            "POST",
+            "/admin/data/drop-table",
+            Some(r#"{"table":"ledger"}"#),
+        )
+        .await;
+        assert_eq!(s, 200, "drop-table: {body}");
+
+        for (i, node) in nodes.iter().enumerate() {
+            if i == 2 {
+                continue;
+            }
+            await_true(30, "drop visible on this live replica", || {
+                !has_table_tablet(node, "ledger")
+            })
+            .await;
+        }
+        for (i, dir) in dirs.iter().enumerate() {
+            if i == 2 {
+                continue;
+            }
+            await_true(30, "live replica reclaims its own engine files", || {
+                !tablet_engine_present(&dir.join("internal"), tablet)
+            })
+            .await;
+        }
+
+        // Node 2's own leftover engine files are still genuinely present —
+        // real data, not an already-empty engine that would trivially
+        // "converge" either way — it never saw the drop, and nothing
+        // touched its disk while it was down.
+        assert!(
+            tablet_engine_present(&dirs[2].join("internal"), tablet),
+            "node 2's own engine files must still be present before it restarts"
+        );
+
+        // Restart node 2 on the SAME dir/addresses — a real process restart.
+        // This is the exact window issue #722 is about: node 2's own first
+        // reconciler tick since restart already sees the fully-converged,
+        // table-absent replicated metadata.
+        let node2 =
+            support::restart_same_addrs(&config, 2, &dirs[2], animusd::StorageBackend::default())
+                .await;
+        nodes[2] = node2;
+        await_bootstrap(&nodes).await;
+
+        await_true(
+            30,
+            "the restarted node reclaims its own leftover engine files",
+            || !tablet_engine_present(&dirs[2].join("internal"), tablet),
+        )
+        .await;
 
         for node in &nodes {
             node.shutdown_graceful().await;

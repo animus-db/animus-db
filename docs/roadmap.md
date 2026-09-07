@@ -419,11 +419,87 @@ the still-true paragraph after the table.
   gate fires before cursor validation and is unconditionally true here) —
   see ADR 0061's 2026-09-07 "D3 PR 3a" amendment and `crates/animusd/
   CLAUDE.md`'s Tests section.
+  **PR 3b landed 2026-09-07, closing the GSI-drain gap PR 3a left
+  open**: `index_drain::drain_tablet`/`reconcile_partition` widened to
+  `<E, R>` (a pure signature change — every callee was already generic;
+  proven behavior-identical by running the full pre-existing real-socket
+  regression net against the widened code before trimming anything), plus
+  a new `SimCluster::drain_gsi` fixture helper (`sim_cluster.rs`) that
+  materializes a GSI's hidden table on demand by replicating `change_
+  consumer_loop`'s own per-tablet guard sequence by hand (its `is_
+  quiesced()`/`Building`-child skips are structurally unreachable under
+  this fixture and are documented as such rather than replicated). Flips
+  PR 3a's own boundary regression (`gsi_query_reads_empty_under_the_
+  fixture_until_the_drain_generalizes` → `gsi_query_materializes_rows_
+  after_a_drain`) and converts every GSI-data test PR 3a had to leave on
+  `ProdEnv` — 12 tests across nine sibling modules (two new: `sim_cluster_
+  dynamo_documents.rs`, `sim_cluster_dynamo_schema.rs`), plus a sim twin of
+  `dynamo_indexes.rs::gsi_write_then_query` that does not replace the
+  original (D2 PR 1's own real-socket proof of `run_operation`'s
+  independent path). Seven `tests/dynamo_*.rs` files deleted whole
+  (`dynamo_query_filter.rs`/`dynamo_query_pagination.rs`/`dynamo_query_
+  range.rs`/`dynamo_scan_index_forward.rs`/`dynamo_select.rs`/`dynamo_
+  documents.rs`/`dynamo_update_add_delete.rs`), one trimmed (`dynamo_
+  schema.rs`, one of three tests removed). A small, unplanned fixture fix
+  was needed too: `SimClusterHandle::leader_index_of` used to scan only
+  the hand-hosted-table bookkeeping `SimCluster::create_table_with_
+  replication` populates, which every wire-created table (every table this
+  PR's own tests use) never gets an entry in — fixed to scan every node id
+  instead. See ADR 0061's 2026-09-07 "D3 PR 3b" amendment and `crates/
+  animusd/CLAUDE.md`'s SimCluster/Tests sections.
   D3's remaining classes (`UpdateTable`'s stream/index changes, Transact,
   PartiQL, Streams, TTL, admin/console/dashboard HTTP, TLS, SigV4,
-  restart-durability, wall-clock timing) and D4 (deterministic coverage for
-  auto-split/GC/join/backup-janitor), plus a real `SimCluster` `Reconciler`
-  and a generalized GSI drain (the gaps just above), remain open.
+  restart-durability, wall-clock timing) remain open. The GSI-drain gap
+  specifically is closed as of PR 3b.
+  **D3 closed 2026-09-07** (PRs #711, #716, #717, #718, #719, plus this
+  CI/docs closing PR): the real-thread `tests/*.rs` tier shrank from 120
+  files/521 tests to 100 files/418 tests while the deterministic
+  `SimCluster` sim tier it fed grew from 5 to 29 modules (35 to 140
+  tests); CI's `prod-liveness-animusd` sharding stays at 4 partitions (a
+  per-shard cold-compile floor of roughly five minutes means fewer
+  partitions would raise, not lower, the max shard wall time) and the sim
+  tier now runs inside `gates` instead of riding along in the real-thread
+  shards. See ADR 0061's 2026-09-07 "D3 closed" amendment for the full
+  before/after numbers and the residual `tests/*.rs` inventory by class.
+- **D4 PR 1 landed 2026-09-07, closing issue #715**: `SimCluster` is now
+  hosted by a real per-node `animus_cp_data::host::Reconciler` — the exact
+  gap D3 PR 2a found and left open (a rebalanced-away replica's
+  `RaftKvNode` was never torn down, genuinely split-brain-shaped for
+  `node_count > MAX_REPLICATION_FACTOR`). `spawn_policy_tablet_host_loop`
+  (the add-only stand-in watcher) is deleted outright; `SimCluster::
+  create_table_with_replication` no longer builds a `RaftKvNode` by hand
+  either — both the hand-hosted and wire-provisioned paths now provision a
+  tablet (`CreateTableSchema`/`CreateTablet`/`SetTabletPolicy`) and let the
+  same real reconciler discover and host it, exactly like production.
+  `SimCluster::restart` reuses the same node's own `MemoryTabletEngines`
+  handle across a restart rather than wiping it, mirroring `reconciler_
+  corpus.rs`'s own "durable engine survives a process crash" modeling — a
+  deliberate behavior change from the pre-D4 restart. Zero production
+  signature changes were needed (`ClusterEdgeState::unregister_raftkv`
+  already existed). The former hazard test (`reconciler_hazard_fires_
+  deterministically_when_node_count_exceeds_replication`) is now `every_
+  node_hosts_exactly_its_replica_set_after_rebalance`, a convergence proof
+  run at the original pinned seed plus ten more; one existing DDL test
+  (`create_table_issued_on_a_control_follower_relays_and_converges`) was
+  bumped from 3 to 4 nodes to prove the `node_count <= 3` restriction no
+  longer applies; a general "no zombie groups" invariant was added to
+  `sim_cluster_corpus.rs`'s end-of-scenario checks. No existing scenario
+  changed behavior — every pre-existing cell's own tablet-hosting counts
+  already stayed within ADR 0029's max−min ≤ 1 balanced band, so the real
+  reconciler's own rebalance pass never had anything to move for them.
+  `cargo test -p animusd --lib`: 306 passed / 118.4s before this rung, 307
+  passed / 113.4s after (net +1: +2 new, −1 renamed, zero regressions — wall
+  time within ordinary run-to-run noise of the baseline, once the
+  reconciler's own fallback poll interval was tuned from an initial 50ms to
+  200ms after a corpus-level measurement — see the ADR amendment).
+  What remains for D4 (PRs 2-5): auto-split's own byte trigger needs
+  `auto_split_loop`'s `tokio::time` conversion to run under `SimEnv`; GC
+  reclaim is already a reconciler action, awaiting only a `drop_table`
+  driver reachable from this fixture; join/growth needs an add-node
+  capability; the backup janitor needs `client_ctx_host.rs`'s impls
+  widened. **PR 1 landed 2026-09-07, closing issue #715; PRs 2-5 remain
+  pending.** See ADR 0061's matching 2026-09-07 "D4 PR 1" amendment and
+  `crates/animusd/CLAUDE.md`'s own entry for the full account.
 - **E1 landed 2026-09-04** (`ClusterApi`/`AdminOps` seams in
   `animus-operator`, fake-driven `controller::tests`; ADR 0061's
   2026-09-04 amendment). **E2 landed 2026-09-07**: the seven pre-existing
@@ -436,6 +512,76 @@ the still-true paragraph after the table.
   `cargo test -p animus-cli` went from 61 to 78 passing (ADR 0061's
   2026-09-07 amendment).
 - **ADR:** amendment notes on 0061.
+
+### C-06 Transact/PartiQL SimCluster dispatch
+
+- **Gap:** the two named D2 residuals — `TransactWriteItems`/
+  `TransactGetItems` and `ExecuteStatement`/`BatchExecuteStatement`/
+  `ExecuteTransaction` (PartiQL) — are unreachable through the generic
+  `dispatch_item_op`/`dispatch_table_op` core `SimCluster` drives, so their
+  own `crates/animusd/tests/` binaries stay real-socket `ProdEnv` forever
+  unless a future rung generalizes them. Per the D3-closing residual
+  inventory (`docs/adr/0061-*.md`), that's 6 files/32 tests for Transact
+  and 2 files/37 tests for PartiQL — the largest and third-largest of
+  Class D's thirteen unowned groups, and, unlike the other eight groups
+  D4 left open, both were named as out-of-scope *by design* from D2 PR 1
+  onward rather than newly discovered.
+- **Plan:** the identical widen-to-`<E: Env, R: RelayClient>`-then-add-a-
+  parallel-generic-entry-point template D3/D4 already validated four times
+  (D3 PR 2a/2b/3a, D4 PR 2/5), applied to Transact's handlers/idempotency
+  helpers and to new PartiQL siblings of `execute_statement`/
+  `execute_transaction`/`run_batch_execute_statement`. See
+  [ADR 0061](adr/0061-testability-node-crate-simulator.md)'s 2026-09-07
+  "Rung F" amendment for the full account, including the two real
+  wrinkles (`ensure_txn_idempotency_table`'s six wall-clock sites; the
+  PartiQL write path's recursion into concrete production dispatchers,
+  which forces new parallel `_as` siblings rather than a widening of
+  `run_operation` itself).
+- **PRs:** a seven-PR series — (1) this docs opener; (2) Transact
+  groundwork (widen nine functions, convert the six wall-clock sites);
+  (3) Transact reachable from `SimCluster` (`execute_item_op_as` routes
+  both operations; a new `sim_cluster_dynamo_transact.rs`, ~6-8 scenarios
+  including the idempotency-table bootstrap race between two first
+  callers); (4) Transact in the wire corpus (`sim_cluster_dynamo_corpus.rs`
+  gains a list-append `TransactWriteItems` op and a `TransactGetItems`
+  probe, `ANIMUS_DYNAMO_WIRE_SEEDS=25` once); (5) PartiQL siblings
+  (`execute_statement_as`/`execute_transaction_as`/
+  `run_batch_execute_statement_as` over the pure lowering + generic
+  dispatch, ~4 signatures); (6) PartiQL sim tests (~8-10 scenarios,
+  SELECT/INSERT/UPDATE/DELETE/batch/ExecuteTransaction, plus an optional
+  corpus equivalence cell); (7) docs close-out. Every production dispatch
+  path (`run_operation`, `execute_statement`, `execute_transaction`,
+  `run_batch_execute_statement`, `execute_one_batch_statement`) stays
+  byte-identical throughout — strictly additive, parallel new paths only,
+  per the D2 PR 1 lesson (`docs/engineering-lessons.md`).
+- **Status:** PR 1 (docs) and PR 2 (Transact groundwork) landed
+  2026-09-07. **PR 3 (Transact reachable from `SimCluster`) landed
+  2026-09-07**: `dispatch_item_op` gained the two match arms, and a new
+  `sim_cluster_dynamo_transact.rs` covers 7 scenarios (12 of 14 tests
+  green — commit + `ConditionCheck` across two tables, cancellation
+  reasons, `ClientRequestToken` idempotency, a `TransactGetItems` snapshot
+  against a concurrent writer, forwarding from a non-participant node, and
+  the idempotency-table bootstrap race this section's own Plan named up
+  front, all with no product bug found). **One real finding**: the
+  scenario proving atomic recovery after a coordinator crash
+  (`coordinator_never_finished_past_prepare_recovers_atomically`) is
+  `#[ignore]`d as a characterization test — it found a structural
+  deadlock in `animus_node::sim_relay::SimRelayClient` (a shared testing
+  primitive, a different crate) when a forwarded request's own handler
+  needs a nested outbound relay call, not a bug in the Transact dispatch
+  or coordinator logic itself. See ADR 0061's matching 2026-09-07
+  "C-06 PR 3" amendment for the full diagnosis; issue to be filed against
+  `animus_node::sim_relay::SimRelayClient`. PRs 4-7 (the wire corpus,
+  PartiQL siblings, PartiQL sim tests, docs close-out) remain open.
+- **ADR:** [0061](adr/0061-testability-node-crate-simulator.md) — the
+  2026-09-07 "Rung F" amendment.
+- **Size:** L (seven PRs, two real production functions' worth of
+  `ProdEnv`-only surface to widen plus two new fault-injecting sim
+  suites).
+- **Depends:** C-04 (closed 2026-09-07 — D4 PR 1's real per-node
+  `Reconciler` and D3's `dispatch_item_op`/`dispatch_table_op` cores are
+  both load-bearing prerequisites this rung builds directly on).
+- **Status (2026-09-07):** open, PR 1 (this docs entry) landed.
 
 ---
 
@@ -513,9 +659,158 @@ wave are independent and can run in parallel.
 | 4 | *landed 2026-09-05* (S-02) | Highest blast radius (C-01 landed 2026-09-05 — see ADR 0054; S-01 landed 2026-09-05 — see ADR 0064; S-02 — see ADR 0066) |
 | 5 | *S-04, S-05, S-07b–d, C-02, C-05 all landed 2026-09-06* | S-05 strictly after S-04 |
 | 6 | *S-03 complete 2026-09-07 (all 3 PRs, ADR 0069)*; *S-07e/S-07 complete 2026-09-07 (ADR 0070)*; *C-03 assessed 2026-09-07 — deferred, no PRs planned (see ADR 0044's matching amendment)*; W-07 | XL or gated on earlier waves |
+| 7 | C-06 (PRs 1-3 landed 2026-09-07; PRs 4-7 open) | Gated on C-04 (closed 2026-09-07) — the D4 `Reconciler` and D3 generic dispatch cores it builds on |
 
 Open issues mapped: none left (#375 closed by W-01, #319 by W-05). Filed
 from wave 2's own findings: #590 (the operator still emits the deleted
 `--split-mode` flag) and #591 (a `control_only` relay-budget flake). The flaky-test issues
 (#280, #298, #418, #447, #539) are correctness work under the green
 invariant, not roadmap items, and take precedence over any wave.
+
+---
+
+**Addendum, 2026-09-07 (C-04 D4 PR 3 landed)**: dropped-table GC (ADR 0024)
+now has deterministic `SimCluster` coverage —
+`crates/animusd/src/sim_cluster_dynamo_drop_table.rs`, driven through the
+real `DeleteTable` wire operation (already `<E, R>`-generic since D3 PR 2a,
+no new widening needed). Four of five scenarios converge cleanly (base
+table, GSI cascade, create-then-immediately-drop race, drop off a
+rebalanced replica set); the fifth (a node crashed while hosting the table,
+restarted after the drop) found a real, previously-uncharacterized reclaim
+gap — `host::Reconciler::gather_facts` derives every fact solely from
+`Metadata`'s current tablet map, so a node offline across a drop's whole
+commit-and-converge window can never rediscover, and therefore never
+reclaims, its own leftover tablet engine on restart. Kept as one
+`#[ignore]`d regression rather than fixed (out of this PR's own
+driver-plus-assertions scope); see ADR 0061's matching 2026-09-07 "D4 PR 3"
+amendment for the full account and `crates/animusd/CLAUDE.md`'s SimCluster
+section for the pointer. `crates/animusd/tests/drop_table_gc.rs` and
+`drop_table_index_cascade.rs` stay whole and unconverted — every test in
+both interleaves real-disk WAL-file assertions with metadata/hosting
+convergence in one body, which this fixture's `MemoryEngine` tier cannot
+stand in for. What remains open for D4 (PRs 2, 4, 5, unchanged): auto-split
+needs `auto_split_loop`'s own `tokio::time` conversion; join/growth needs
+an add-node capability; the backup janitor needs `client_ctx_host.rs`'s
+impls widened.
+
+---
+
+**Addendum, 2026-09-07 (issue #722 closed, D4 PR 3's own finding fixed)**:
+the crashed-during-the-drop reclaim gap the addendum above reports (a node
+offline across a table drop's whole commit-and-converge window never
+rediscovering, and therefore never reclaiming, its own leftover tablet
+engine on restart) is fixed — `animus_cp_data::host::EngineFactory` gained
+`local_tablets()`, a second, restart-surviving fact source the reconciler
+consults exactly once per process lifetime (its very first tick), folded
+into `plan`'s existing reclaim path via a `known`-set safety argument (an
+engine only ever exists locally for a tablet id this node has itself
+observed as real, so an id absent from both the current tablet map and
+every live in-place-split intent's own children is always a genuine
+leftover). The formerly-`#[ignore]`d `SimCluster` regression is now a
+positive assertion, and a matching real-disk regression landed in
+`crates/animusd/tests/drop_table_gc.rs`. See ADR 0024's and ADR 0061's
+matching 2026-09-07 amendments for the full account, and
+`crates/animus-cp-data/CLAUDE.md`'s host-module entry for the mechanism as
+shipped. This closes the one open item D4 PR 3 itself deliberately left
+outstanding; D4 PRs 2, 4, 5 remain open, unchanged by this fix.
+
+---
+
+**Addendum, 2026-09-07 (C-04 D4 PR 2 landed)**: the auto-split BYTE
+trigger's own `tokio::time` residual D4 PR 1 named is closed —
+`auto_split_loop` is now `<E: Env, R: RelayClient>`-generic (`Nanos`-keyed
+cooldown/confirm maps instead of `tokio::time::Instant`), `index_drain::
+{inplace_split_driver_tick, gsi_caught_up}` widened the same way so
+`SimCluster::drive_inplace_split_cutover` can manually drive the fork's
+own `MetaCommand::CutoverSplit` (this fixture still never spawns
+`change_consumer_loop` as a background loop), and `SimCluster::
+set_auto_split_thresholds` (defaulted off, mirroring D4 PR 1's own
+`heartbeat_loop` spawn) is the new opt-in knob. Five deterministic
+scenarios in the new `sim_cluster_auto_split.rs`, replayed at 5 seeds each
+(10 tests): a byte-threshold crossing forking exactly once with every
+pre-split key still wire-readable; staying below threshold over a long
+window; a regrown child forking again after modest writes don't; a
+leadership move mid-window still yielding exactly one fork; a crashed-and-
+restarted node converging via the issue #722 fix. `cargo test -p animusd
+--lib`: 321 → 331 (+10, 0 regressions). Two `cp_plane.rs` tests removed in
+favor of the new sim scenarios (`tablet_auto_splits_when_it_grows`,
+`already_split_tablet_splits_again_once_it_regrows`); four ProdEnv
+tests/files stay for stated reasons (a skewed-value-size quantitative-
+balance claim the sim scenarios don't reproduce, the manual raw-key split
+path, two Streams-specific tests, one real-thread-paced-writer-timing
+test) — see ADR 0034's and ADR 0061's matching 2026-09-07 amendments for
+the full account. What remains open for D4: PR 4 (join/growth needs an
+add-node capability) and PR 5 (the backup janitor needs `client_ctx_
+host.rs`'s impls widened).
+
+---
+
+**Addendum, 2026-09-07 (C-04 D4 PR 5 landed)**: the backup janitor's own
+async loop (`animus_node::backup_janitor::backup_janitor_loop`) now has
+deterministic `SimCluster` coverage — `client_ctx_host.rs`'s four
+`ClientCtx` host-capability impls and `backup_janitor.rs`'s own thin
+wrapper widened to `<E: Env, R: RelayClient>` (previously concrete
+`ClientCtx` = `ClientCtx<ProdEnv, AnimusdRelayClient>`), zero new
+mechanism (every field/method each impl delegates to was already
+`E`/`R`-agnostic or already generic). `SimCluster` now builds every node's
+`backup_store` as a `BackupStoreHandle::S3` wrapping a clone of ONE shared
+`SimSegmentStore` (a real S3 bucket has no per-node locality, so this is
+the faithful choice, not a placeholder) and spawns the janitor loop
+unconditionally on every node, mirroring D4 PR 1's own `heartbeat_loop`
+spawn. Five scenarios in the new `sim_cluster_backup_janitor.rs` (12 tests
+including `_over_seeds` siblings): a deleted backup reclaimed, a failed
+backup reclaimed, leader gating (a follower never touches the store) plus
+a real leadership-transfer handoff mid-reclaim converging cleanly, a
+crashed-and-restarted control leader converging via the survivors' own
+reclaim, and an untouched `Available` backup left alone. `cargo test -p
+animusd --lib`: 331 → 343 (+12, 0 regressions). No janitor bug found —
+one harness-only gotcha was found and fixed (a `propose`-then-immediate-
+`crash` scenario must let the entry replicate before crashing its own
+proposer, or the entry is stranded and lost rather than inherited by the
+survivors; see ADR 0061's and `docs/engineering-lessons.md`'s matching
+entries). `dynamo_backup.rs`'s own janitor-convergence assertion stays on
+`ProdEnv`, fused into one long wire-shape test `SimCluster` cannot
+reach — nothing separable to move. **This closes D4 PR 5. What remains
+open for D4: PR 4 (join/growth needs an add-node capability).**
+
+---
+
+**Addendum, 2026-09-07 (C-04 D4 PR 4 landed, closing D4 and C-04)**: the
+last of the four D4 rungs — join/growth/decommission sequencing (ADR
+0030/0032) — now has deterministic `SimCluster` coverage. `SimCluster`
+gains a `grow(role)`/`drain(node)`/`remove(node)` fixture surface (five new
+signatures total, `crates/animusd/src/sim_cluster.rs`): `grow` adds a
+data-only node after construction, installing `ControlHandle::Remote`
+(a `RemoteControlClient` mirroring against the existing control quorum) for
+the first time under `SimEnv` — a new `SimEnv`-native reimplementation of
+`animusd`'s own `remote_metadata_watch_loop`'s long-poll protocol
+(`spawn_remote_mirror_sync_loop`, since the production function's own
+`ClientCtx<ProdEnv>`-bound signature and real `tokio::time::sleep` can't run
+under `SimEnv` at all) drives the identical wire round trip against the
+identical `RemoteControlClient` type production uses; `drain`/`remove` drive
+the REAL `ClientCtx::admin_drain`/`admin_remove_member` primitives, already
+`<E, R>`-generic since rung C5. `role = "combined"` (a new control-plane
+voter) was scoped and deferred — it needs `self.controls` itself to grow, a
+materially different mechanism than a data-only node's mirror; documented
+as a named follow-up, not attempted. Five scenarios in the new
+`crates/animusd/src/sim_cluster_growth.rs`, replayed at 5 seeds each: grow
+converges and serves a genuinely forwarded write/read; growth then a real
+rebalance places (and tears down the moved-away replica of) a table onto
+the new node; grow-then-drain-then-remove re-homes every replica with no
+zombie group and never reuses the removed node's id; a control-plane leader
+crash between `grow`'s own two registration proposes still converges once a
+new leader takes over; and the mirror's long-poll recovers from a full
+partition of the new node from every control voter. No product bug found —
+the `ControlHandle::Remote`-under-`SimEnv` path (new surface, and the
+likeliest place for one) held at every seed tried. See ADR 0061's "D4 PR 4"
+amendment, and ADR 0030's/ADR 0032's matching 2026-09-07 amendments, for
+the full account.
+
+**This closes D4, and with it C-04.** All four D4 rungs (auto-split byte
+trigger, dropped-table GC, the backup janitor, and this PR's join/growth/
+decommission) now have deterministic `SimCluster` coverage; issues #715 and
+#722 (found and fixed along the way) are both closed. What remains
+unowned by C-04 or any other planned rung, per the D3-closing residual
+inventory above: Transact/PartiQL (D2's own named residuals), Streams, TTL,
+admin/console/dashboard HTTP, the control/data role split, and `--config`
+bring-up — none scoped to a future C-04 rung as of this close.

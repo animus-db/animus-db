@@ -10702,6 +10702,21 @@ fn tablet_lsm_prefix(tablet: u64) -> String {
     format!("{LSM_PREFIX}t{tablet}-")
 }
 
+/// The inverse of [`tablet_lsm_prefix`] (issue #722): does `filename` carry
+/// a tablet engine's own prefix, and if so, which tablet id? Parses
+/// `{LSM_PREFIX}t{tablet}-...` — `LSM_PREFIX` itself (`db-MANIFEST`/
+/// `db-wal-*`/`db-sst-*`, the node's own control/syskv engine) never
+/// matches (no `t` immediately follows), and a malformed/non-numeric
+/// `{tablet}` segment (should be structurally unreachable — this crate is
+/// the only writer of this naming convention) is treated as "not a tablet
+/// engine file" rather than panicking on an unrecognized filename this
+/// node didn't write itself.
+fn parse_tablet_id_from_lsm_filename(filename: &str) -> Option<TabletId> {
+    let rest = filename.strip_prefix(LSM_PREFIX)?.strip_prefix('t')?;
+    let digits_end = rest.find('-')?;
+    rest[..digits_end].parse::<u64>().ok().map(TabletId)
+}
+
 /// The [`LsmEngine`] implementation of the per-tablet engine seam (ADR 0050
 /// rung 1): one private on-disk engine per hosted tablet, opened/probed/
 /// destroyed by filename prefix over this node's one `ProdEnv` disk.
@@ -10765,6 +10780,77 @@ impl animus_cp_data::host::EngineFactory<LsmEngine<ProdEnv>> for LsmTabletFactor
             .clone_to_filtered(tablet_lsm_prefix(target.0), keep)
             .await
             .map_err(|e| e.to_string())
+    }
+
+    /// Issue #722 — enumerate every tablet id this node's own data
+    /// directory currently holds durable engine files for, by listing the
+    /// directory once and parsing each filename's own prefix
+    /// ([`parse_tablet_id_from_lsm_filename`]) — the identical `env.list()`
+    /// call [`probe`](Self::probe)/[`destroy`](Self::destroy) already make,
+    /// generalized from "does THIS one tablet's prefix appear" to "which
+    /// tablet ids appear at all." A listing failure resolves the same way
+    /// `probe`/`destroy` already treat one — silently as empty, per the
+    /// trait's own doc — rather than propagate an error this method has no
+    /// channel for.
+    async fn local_tablets(&self) -> BTreeSet<TabletId> {
+        self.env
+            .list()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|f| parse_tablet_id_from_lsm_filename(f))
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod lsm_tablet_filename_tests {
+    use super::*;
+
+    #[test]
+    fn parses_a_tablet_engines_own_files() {
+        assert_eq!(
+            parse_tablet_id_from_lsm_filename("db-t5-MANIFEST"),
+            Some(TabletId(5))
+        );
+        assert_eq!(
+            parse_tablet_id_from_lsm_filename("db-t5-wal-0"),
+            Some(TabletId(5))
+        );
+        assert_eq!(
+            parse_tablet_id_from_lsm_filename("db-t5-sst-12"),
+            Some(TabletId(5))
+        );
+    }
+
+    #[test]
+    fn does_not_confuse_a_prefix_with_a_longer_tablet_id() {
+        // The trailing `-` is load-bearing (see `tablet_lsm_prefix`'s own
+        // doc): `db-t5-*` must never be read as also matching `db-t51-*`.
+        assert_eq!(
+            parse_tablet_id_from_lsm_filename("db-t51-MANIFEST"),
+            Some(TabletId(51))
+        );
+    }
+
+    #[test]
+    fn ignores_the_bare_control_syskv_engines_own_files() {
+        // No `t` immediately follows `LSM_PREFIX` on any of these — never a
+        // tablet engine file.
+        for f in ["db-MANIFEST", "db-wal-0", "db-sst-3"] {
+            assert_eq!(
+                parse_tablet_id_from_lsm_filename(f),
+                None,
+                "control/syskv file {f} must never be read as a tablet engine file"
+            );
+        }
+    }
+
+    #[test]
+    fn ignores_an_unrelated_file() {
+        assert_eq!(parse_tablet_id_from_lsm_filename("syskv-MANIFEST"), None);
+        assert_eq!(parse_tablet_id_from_lsm_filename("raft.wal.5"), None);
+        assert_eq!(parse_tablet_id_from_lsm_filename("db-tx-oops"), None);
     }
 }
 
@@ -11440,11 +11526,21 @@ const SPLIT_KEY_NOT_TOKEN_VIABLE: &str =
 /// sources such as a manual split racing this loop) — harmless: the epoch CAS
 /// lets exactly one win, and the loser just tries again (or backs off) next
 /// tick.
-async fn auto_split_loop(ctx: ClientCtx, thresholds: AutoSplitThresholds) {
-    let mut last_triggered: BTreeMap<TabletId, tokio::time::Instant> = BTreeMap::new();
+async fn auto_split_loop<E: Env, R: RelayClient>(
+    ctx: ClientCtx<E, R>,
+    thresholds: AutoSplitThresholds,
+) {
+    // ADR 0061 rung D4 PR 2: `Nanos` (the `Env` seam's own clock reading,
+    // ADR 0003), not `tokio::time::Instant` — this loop must be drivable
+    // under `SimEnv` (`SimCluster`'s own deterministic virtual clock) as
+    // well as `ProdEnv`'s real one. `Nanos` has no `Add<Duration>` (see
+    // `ceiling.rs`'s own `saturating_add`/`duration_since` shape this
+    // mirrors), so an "elapsed since" check becomes `ctx.env.now()
+    // .duration_since(recorded)` rather than `recorded.elapsed()`.
+    let mut last_triggered: BTreeMap<TabletId, Nanos> = BTreeMap::new();
     // When each tablet last had a *full* (materializing) count — the expensive
     // confirm is rate-limited per tablet, not run every tick.
-    let mut last_counted: BTreeMap<TabletId, tokio::time::Instant> = BTreeMap::new();
+    let mut last_counted: BTreeMap<TabletId, Nanos> = BTreeMap::new();
     // ADR 0067 (W-08b): the fourth arm's own ceilings are always "on" (a
     // production default, never `None`), so unlike the three fields below
     // this can't be used to decide whether the loop has anything to do at
@@ -11455,7 +11551,7 @@ async fn auto_split_loop(ctx: ClientCtx, thresholds: AutoSplitThresholds) {
         || thresholds.change_rate.is_some()
         || thresholds.ops_rate.is_some();
     loop {
-        tokio::time::sleep(AUTO_SPLIT_INTERVAL).await;
+        ctx.env.sleep(AUTO_SPLIT_INTERVAL).await;
 
         // ADR 0067 (W-08b): when NOTHING at all is configured — no byte/
         // change-rate/ops-rate threshold, and no table anywhere in this
@@ -11492,7 +11588,8 @@ async fn auto_split_loop(ctx: ClientCtx, thresholds: AutoSplitThresholds) {
             .map(|(&id, _)| id)
             .collect();
         for tablet in tablets {
-            if matches!(last_triggered.get(&tablet), Some(at) if at.elapsed() < AUTO_SPLIT_COOLDOWN)
+            if matches!(last_triggered.get(&tablet), Some(&at)
+                if ctx.env.now().duration_since(at) < AUTO_SPLIT_COOLDOWN)
             {
                 continue;
             }
@@ -11524,7 +11621,7 @@ async fn auto_split_loop(ctx: ClientCtx, thresholds: AutoSplitThresholds) {
             // have a byte estimate — `approx_bytes` works on any backend).
             let due_confirm = last_counted
                 .get(&tablet)
-                .is_none_or(|at| at.elapsed() >= AUTO_SPLIT_COOLDOWN);
+                .is_none_or(|&at| ctx.env.now().duration_since(at) >= AUTO_SPLIT_COOLDOWN);
             let byte_hot = match thresholds.bytes {
                 Some(t) => leader.approx_bytes().await > t,
                 None => false,
@@ -11552,7 +11649,7 @@ async fn auto_split_loop(ctx: ClientCtx, thresholds: AutoSplitThresholds) {
             // Materialize once: the authoritative byte total and (if over
             // threshold) the split key both come from the same snapshot.
             let pairs = leader.local_pairs().await;
-            last_counted.insert(tablet, tokio::time::Instant::now());
+            last_counted.insert(tablet, ctx.env.now());
             let key_count = pairs.len();
             let over_byte_threshold = thresholds.bytes.is_some_and(|t| {
                 let total_bytes: u64 = pairs.iter().map(|(k, v)| (k.len() + v.len()) as u64).sum();
@@ -11594,7 +11691,7 @@ async fn auto_split_loop(ctx: ClientCtx, thresholds: AutoSplitThresholds) {
             // for that expected, already-metered outcome (it would
             // otherwise fire every single cooldown, forever, for a tablet
             // that structurally cannot split).
-            last_triggered.insert(tablet, tokio::time::Instant::now());
+            last_triggered.insert(tablet, ctx.env.now());
             let span = tracing::info_span!("auto_split", tablet = tablet.0);
             let response = ctx.trigger_split(tablet, split_key).instrument(span).await;
             match &response {
@@ -11657,9 +11754,10 @@ async fn auto_split_loop(ctx: ClientCtx, thresholds: AutoSplitThresholds) {
             // wakes it (ADR 0048 fork F); the propose this trigger makes
             // if one is chosen lets the CP-data host reconciler un-quiesce
             // it exactly as any other split would.
-            let mut best: Option<(TabletId, u128, CpGroup)> = None;
+            let mut best: Option<(TabletId, u128, CpGroup<E>)> = None;
             for id in tablet_ids {
-                if matches!(last_triggered.get(&id), Some(at) if at.elapsed() < AUTO_SPLIT_COOLDOWN)
+                if matches!(last_triggered.get(&id), Some(&at)
+                    if ctx.env.now().duration_since(at) < AUTO_SPLIT_COOLDOWN)
                 {
                     continue;
                 }
@@ -11708,7 +11806,7 @@ async fn auto_split_loop(ctx: ClientCtx, thresholds: AutoSplitThresholds) {
                     None => continue,
                 }
             };
-            last_triggered.insert(tablet, tokio::time::Instant::now());
+            last_triggered.insert(tablet, ctx.env.now());
             let span = tracing::info_span!(
                 "auto_split_min_tablets",
                 tablet = tablet.0,
@@ -17713,9 +17811,108 @@ mod sim_cluster_dynamo_item_collection_metrics;
 /// generality — a no-index `Scan` already ran through `dispatch_item_op`).
 /// Replaces two of `crates/animusd/tests/dynamo_indexes.rs`'s three tests;
 /// `gsi_write_then_query` stays in that file untouched (D2 PR 1's own
-/// real-socket proof of `run_operation`'s independent path).
+/// real-socket proof of `run_operation`'s independent path) — PR 3b adds a
+/// sim twin of it here without deleting the original.
 #[cfg(test)]
 mod sim_cluster_dynamo_indexes;
+
+/// ADR 0061 rung D3 PR 3b: document/set attribute types, projection
+/// expressions, `ReturnValues`, multiple + composite GSIs alongside an LSI,
+/// and `N`-typed partition-key routing — driven through `[SimCluster::
+/// drain_gsi]` for the GSI half. Replaces all three of `crates/animusd/
+/// tests/dynamo_documents.rs`'s tests.
+#[cfg(test)]
+mod sim_cluster_dynamo_documents;
+
+/// ADR 0061 rung D3 PR 3b: a `CreateTable`-declared GSI's definition
+/// replicates cluster-wide and a second node (which never itself handled
+/// the `CreateTable`) resolves a `Query` against it once `[SimCluster::
+/// drain_gsi]` has materialized the hidden table. Replaces one of
+/// `crates/animusd/tests/dynamo_schema.rs`'s three tests; the restart proof
+/// and `extended_surface` stay on `ProdEnv`.
+#[cfg(test)]
+mod sim_cluster_dynamo_schema;
+
+/// ADR 0061 rung D4 PR 3 (C-04 D4): deterministic `SimCluster` coverage for
+/// the dropped-table GC reclaim (ADR 0024) — driven through the real
+/// `DeleteTable` wire operation (`dynamo::dispatch_table_op` →
+/// `ClientCtx::drop_table`, already `<E, R>`-generic, no new widening
+/// needed this rung) against every node's own real `host::Reconciler`
+/// (ADR 0061 rung D4 PR 1). A driver-plus-assertions PR, not new
+/// mechanism — see this module's own doc for the five scenarios, the
+/// physical-reclaim observable (`SimCluster::storage`, new this rung), and
+/// a real, previously-uncharacterized reclaim gap its own scenario-4
+/// investigation found and reports (not fixed here, out of scope).
+#[cfg(test)]
+mod sim_cluster_dynamo_drop_table;
+
+/// ADR 0061 rung D4 PR 2 (C-04 D4): deterministic `SimCluster` coverage for
+/// the auto-split BYTE trigger (ADR 0034) — `auto_split_loop` (`lib.rs`)
+/// widened to `<E: Env, R: RelayClient>`/`Nanos`-keyed (previously concrete
+/// `ProdEnv`/`tokio::time::Instant`), `SimCluster::
+/// set_auto_split_thresholds` the new opt-in knob (defaulted OFF, mirroring
+/// D4 PR 1's `heartbeat_loop` spawn), and `index_drain::{
+/// inplace_split_driver_tick, gsi_caught_up}` also widened so `SimCluster::
+/// drive_inplace_split_cutover` can manually drive the fork's own
+/// `MetaCommand::CutoverSplit` — this fixture never spawns `index_drain::
+/// change_consumer_loop` itself. See this module's own doc for the five
+/// scenarios (byte-threshold crossing, staying below it, a regrown child
+/// forking again, a leadership move mid-window, a crashed-and-restarted
+/// replica converging via the issue #722 fix) and `crates/animusd/
+/// CLAUDE.md`'s matching entry for the full account.
+#[cfg(test)]
+mod sim_cluster_auto_split;
+
+/// ADR 0061 rung D4 PR 5 (C-04 D4): deterministic `SimCluster` coverage for
+/// the backup janitor's own async loop (`animus_node::backup_janitor::
+/// backup_janitor_loop`) — `client_ctx_host.rs`'s four host-capability
+/// impls and `backup_janitor.rs`'s own thin wrapper widened to `<E: Env, R:
+/// RelayClient>` (previously concrete `ClientCtx` = `ClientCtx<ProdEnv,
+/// AnimusdRelayClient>`), `sim_cluster.rs`'s own `SimCluster` now building
+/// every node's `backup_store` as a `BackupStoreHandle::S3` wrapping a
+/// clone of ONE shared `SimSegmentStore` (not a per-node placeholder) and
+/// spawning `backup_janitor_loop` unconditionally on every node, mirroring
+/// `heartbeat_loop`'s own always-on D4 PR 1 spawn. See this module's own
+/// doc for the five scenarios (a deleted backup reclaimed, a failed backup
+/// reclaimed, leader gating including a real leadership-transfer handoff,
+/// a crashed-and-restarted control leader converging, and an untouched
+/// `Available` backup left alone) and `crates/animusd/CLAUDE.md`'s matching
+/// entry for the full account.
+#[cfg(test)]
+mod sim_cluster_backup_janitor;
+
+/// ADR 0061 rung D4 PR 4 (C-04 D4, closing the D4 roadmap item): deterministic
+/// `SimCluster` coverage for ADR 0030 online growth and ADR 0032 seed-join
+/// decommission — `sim_cluster.rs`'s own new `SimCluster::grow`/`drain`/
+/// `remove` fixture surface (a data-only node added after construction,
+/// `ControlHandle::Remote`'s real mirror-sync logic exercised under `SimEnv`
+/// for the first time, and the ADR 0032 drain-then-remove sequence driven
+/// through the real `admin_drain`/`admin_remove_member` primitives). See
+/// this module's own doc for the five scenarios (grow convergence, growth
+/// then placement/rebalance onto the new node, grow-then-drain-then-remove,
+/// a control-leader crash mid-registration, and mirror sync surviving a
+/// partition) and `crates/animusd/CLAUDE.md`'s matching entry for the full
+/// account, including what stayed on `ProdEnv`.
+#[cfg(test)]
+mod sim_cluster_growth;
+
+/// ADR 0061 rung F (C-06 PR 3): deterministic `SimCluster` coverage for
+/// `TransactWriteItems`/`TransactGetItems`, reachable through the generic
+/// dispatch core for the first time — `dynamo::dispatch_item_op` gained two
+/// match arms calling `run_transact`/`run_transact_get` (both already
+/// `<E, R>`-generic since C-06 PR 2), routing every wire transaction issued
+/// through `SimClusterHandle::dynamo` the exact way `run_operation`'s own
+/// production arms do. See this module's own doc for the seven scenarios
+/// (a commit across two tables including a `ConditionCheck`, a condition
+/// failure's `CancellationReasons`, `ClientRequestToken` idempotency, a
+/// `TransactGetItems` snapshot against a concurrent writer, forwarding from
+/// a node hosting no replica of either table, the internal idempotency-
+/// table bootstrap race between two concurrent first callers, and a
+/// coordinator that never finished past the prepare phase recovering
+/// atomically) and `crates/animusd/CLAUDE.md`'s matching entry for the full
+/// account, including what stayed on `ProdEnv` and why.
+#[cfg(test)]
+mod sim_cluster_dynamo_transact;
 
 /// Regression for the issue #298 residual confirmed live under the
 /// un-pinned `SplitMode::InPlace` proof soak (ADR 0018's matching amendment,

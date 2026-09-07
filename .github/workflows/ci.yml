@@ -108,11 +108,17 @@ jobs:
       # some overlap; if wall-time grows too much the alternative is a
       # larger (more-core) self-hosted runner rather than raising this back.
       #
-      # `--exclude animusd` drops that crate's 66 real-thread integration
-      # binaries plus its real-thread `--lib` tests (`prod-liveness` below
-      # covers all of it instead). The other 5 scattered real-thread
-      # binaries (`animus-control`/`animus-cp-data`/`animus-storage`) are
-      # excluded structurally, not by name here: each
+      # `--exclude animusd` drops that crate's 100 real-thread `tests/`
+      # integration binaries (120 pre-D3; ADR 0061 rung D3, closed
+      # 2026-09-07, converted 20 of them to deterministic `SimCluster`
+      # coverage — `prod-liveness-animusd` below covers the 100 that
+      # remain). It no longer drops animusd's `--lib` target: since D3,
+      # `--lib` is dominated by deterministic `SimCluster` sim tests
+      # (`sim_cluster*.rs`: 5 → 29 modules, 35 → 140 tests) rather than
+      # real-thread ones, so it runs as this job's own separate step below
+      # instead of riding along in a real-thread shard. The other 5
+      # scattered real-thread binaries (`animus-control`/`animus-cp-data`/
+      # `animus-storage`) are excluded structurally, not by name here: each
       # is declared as an explicit `[[test]] required-features =
       # ["prod-heavy"]` target in its crate's Cargo.toml, and this plain
       # `cargo test` (no `--features`) never turns that feature on, so Cargo
@@ -121,6 +127,40 @@ jobs:
       # tests are added (see docs/engineering-lessons.md).
       - name: test (--workspace --exclude animusd)
         run: cargo test --workspace --exclude animusd --locked -- --test-threads=2
+
+      # `animusd`'s `--lib` target, added as its own `gates` step by ADR
+      # 0061 rung D3's closing PR (2026-09-07). D3 converted five PRs'
+      # worth of `tests/*.rs` ProdEnv binaries into deterministic
+      # `SimCluster`-driven `#[cfg(test)] mod`s inside `src/`
+      # (`sim_cluster*.rs`, 5 → 29 modules, 35 → 140 tests) — the bulk of
+      # `--lib`'s own growth (240 → 306 tests, 307 after D4 PR 1). Running
+      # it here instead of inside the sharded real-thread tier below means
+      # a sim regression shows up in `gates` — this job's hard,
+      # single-attempt gate — rather than riding along inside a shard whose
+      # own real-thread tests are the ones this repo already knows are
+      # contention-sensitive on a shared runner.
+      #
+      # `--lib` is not perfectly pure, though: `cargo test --lib` builds
+      # and runs one target, with no way to split it further, and a
+      # handful of `#[cfg(test)] mod`s inside it predate D3 and are genuine
+      # single-node `ProdEnv` bring-ups, not deterministic —
+      # `confirm_futility_tests`/`forward_transport_failure_tests`/
+      # `halted_shutdown_tests`/`issue_412_tests`/`issue_298_conflict_tests`
+      # in `lib.rs`, `stream_write_path_tests` in `dynamo.rs`,
+      # `gsi_drain_cursor_tests`/`stream_sealer_tests` in `index_drain.rs`,
+      # `orphan_reap_tests` in `segment_janitor.rs`, `system_table_tests` in
+      # `admin.rs`. They ride along here too. Judged an acceptable
+      # trade-off, not an oversight: each is a small, single-node bring-up
+      # (a `TcpListener`, a one-node `run_node`, no multi-node election
+      # timing), a different shape than the heavier multi-node cluster
+      # tests `tests/*.rs` holds and that this crate was excluded from
+      # `gates` for in the first place (see the step above) — and
+      # `--test-threads=2` matches that step's own choice, for the same
+      # 2-vCPU-runner reason. If this step becomes a source of flakes,
+      # narrowing `--lib`'s own real-thread residue further (a nextest `-E`
+      # filter splitting it back out) is the fix, not a retry.
+      - name: test animusd sim tier (--lib)
+        run: cargo test -p animusd --lib --locked -- --test-threads=2
 
       # cargo-deny can't run in the local dev sandbox (not installed); CI is
       # where this gate actually executes. The pinned action installs cargo-deny
@@ -150,24 +190,52 @@ jobs:
   # with nothing else on its 2 vCPUs), not a retry sitting on top of it.
   #
   # This tier used to be one job running everything (111 binaries, 507
-  # tests) at `--test-threads=1`, ~18 min of serial test time alone. Three
-  # worker jobs below split that across parallel runners, each still
-  # single-threaded *within itself* — the whole reason this tier exists is
-  # to give each real-thread test a runner with nothing else contending for
-  # its 2 vCPUs, so intra-runner parallelism stays off, only the runner
-  # count goes up. `prod-liveness` at the bottom is a thin aggregate: GitHub
+  # tests) at `--test-threads=1`, ~18 min of serial test time alone — the
+  # pre-sharding baseline, 2026-09-02, kept here only as historical
+  # context; see below for the current (post-D3) numbers. Three worker jobs
+  # below split that across parallel runners, each still single-threaded
+  # *within itself* — the whole reason this tier exists is to give each
+  # real-thread test a runner with nothing else contending for its 2
+  # vCPUs, so intra-runner parallelism stays off, only the runner count
+  # goes up. `prod-liveness` at the bottom is a thin aggregate: GitHub
   # branch protection names one required check, "prod-liveness", and that
   # name has to keep resolving to a single job even though the work behind
   # it is now split across six runners.
   #
-  # `animusd`'s 66 real-thread integration binaries + its real-thread `--lib`
-  # tests run under cargo-nextest instead of `cargo test`, partitioned 4 ways
-  # by test count (`--partition count:N/4`) — nextest is what makes an even,
+  # `animusd`'s real-thread `tests/*.rs` integration binaries run under
+  # cargo-nextest instead of `cargo test`, partitioned 4 ways by test count
+  # (`--partition count:N/4`) — nextest is what makes an even,
   # test-granularity split possible; `cargo test` can only be split by
   # binary, and animusd's binaries are not remotely equal-sized. nextest
   # already runs every test in its own process (stricter isolation than
   # `cargo test`'s "many tests share one process" default), so this is a
   # superset of the isolation the old single job had, not a reduction of it.
+  # `--lib` no longer runs in this tier at all — see `gates`'s own step for
+  # where it moved and why (ADR 0061 rung D3's closing PR, 2026-09-07).
+  #
+  # **ADR 0061 rung D3 (closed 2026-09-07) shrank this tier's own binary
+  # and test count**: `crates/animusd/tests/*.rs` went from 120 files/521
+  # tests to 100 files/418 tests as base-table logic, DDL, and GSI/LSI
+  # query/scan coverage converted to the deterministic `SimCluster` tier
+  # instead (`gates`'s own `--lib` step above; also docs/roadmap.md's C-04
+  # entry and docs/adr/0061-*.md's matching amendment). Measured effect on
+  # this tier's own shard wall time: the slowest of the four
+  # `prod-liveness-animusd` shards went from 598s (run 34103555943,
+  # pre-D3) to 564s (run 34123273726, at D3 PR 3a) — per-shard spread
+  # 231-303s. Each shard rebuilds `-p animusd` from a cold cache
+  # (`cache-targets: false`), so a compile floor of roughly five minutes
+  # sits under every shard regardless of test count; shrinking the test
+  # count only trims the execution portion sitting on top of that floor.
+  # **The partition count deliberately stays at 4**: going to 3 or 2
+  # partitions would concentrate more execution time (and, before this PR,
+  # more compile time too) onto each remaining shard while the fixed
+  # per-shard compile floor stays exactly as fixed — it would RAISE the
+  # max shard time, not lower it. (These two measurements were taken with
+  # each shard still building `--lib --tests`, before this PR dropped
+  # `--lib` from the shards below — that only shrinks each shard's own
+  # build further, reinforcing "don't reduce partitions" rather than
+  # undermining it; the post-drop number has not been separately
+  # re-measured.)
   prod-liveness-animusd:
     name: prod-liveness-animusd (${{ matrix.partition }}/4)
     strategy:
@@ -206,20 +274,27 @@ jobs:
         with:
           cache-targets: "false"
 
-      # All of `animusd`: 66 real-thread integration test binaries plus its
-      # `--lib` tests (confirm_futility_tests, dynamo.rs, index_drain.rs,
-      # halted_shutdown_tests are real-thread too), MINUS the two
+      # All of `animusd`'s real-thread `tests/*.rs` integration binaries —
+      # 100 of them as of ADR 0061 rung D3's 2026-09-07 close (120 pre-D3;
+      # see this job group's own comment above) — MINUS the two
       # `orphan_an_lsi_row` hammer tests (see `prod-liveness-hammer-pair`
-      # below for why those run elsewhere). `--profile ci` (from
-      # .config/nextest.toml) pins test-threads=1 and fail-fast=false; see
-      # that file for why. `count:${{ matrix.partition }}/4` is nextest's
-      # own test-count-balanced partitioning — not a hand-maintained list of
-      # which binaries go in which shard, so it stays balanced as tests are
-      # added or removed. Single attempt — see this job group's own comment
-      # above for why there is no retry.
-      - name: test animusd shard ${{ matrix.partition }}/4 (--lib --tests)
+      # below for why those run elsewhere). **No longer `--lib` too**: that
+      # target is now dominated by deterministic `SimCluster` sim tests and
+      # runs inside `gates` instead (a handful of pre-existing real-thread
+      # `#[cfg(test)] mod`s inside `--lib` moved there along with it — see
+      # `gates`'s own step comment for the list and the trade-off). `--profile
+      # ci` (from .config/nextest.toml) pins test-threads=1 and
+      # fail-fast=false; see that file for why. `count:${{ matrix.partition
+      # }}/4` is nextest's own test-count-balanced partitioning — not a
+      # hand-maintained list of which binaries go in which shard, so it
+      # stays balanced as tests are added or removed; dropping `--lib` from
+      # the pool being partitioned doesn't change that — nextest computes
+      # the balance fresh from whatever targets are named on the command
+      # line. Single attempt — see this job group's own comment above for
+      # why there is no retry.
+      - name: test animusd shard ${{ matrix.partition }}/4 (--tests)
         run: |
-          cargo nextest run -p animusd --lib --tests --locked \
+          cargo nextest run -p animusd --tests --locked \
             -E 'not test(orphan_an_lsi_row)' \
             --partition count:${{ matrix.partition }}/4 \
             --profile ci
@@ -278,13 +353,16 @@ jobs:
 
   # The 5 scattered real-thread binaries outside animusd, each gated behind
   # its crate's opt-in `prod-heavy` feature (see `gates`'s test step
-  # comment). Small enough on its own (~35-50 s serial, vs. ~1080 s for all
-  # of animusd) that splitting it further would not shorten this tier's
-  # wall time — it just needs to not land stacked on top of one of the four
+  # comment). Small enough on its own (observed 64-86 s serial as of ADR
+  # 0061 rung D3's 2026-09-07 close — the "~1080 s for all of animusd"
+  # this comment used to cite is the stale pre-sharding baseline, from
+  # before `prod-liveness-animusd` existed as parallel shards at all) that
+  # splitting it further would not shorten this tier's wall time — it just
+  # needs to not land stacked on top of one of the four
   # `prod-liveness-animusd` shards, and running as its own parallel job
   # already achieves that. Left on plain `cargo test`, unchanged from
-  # before: nextest earns its keep on animusd's uneven pile of 66+ binaries,
-  # not on 5 already-comparable ones.
+  # before: nextest earns its keep on animusd's own uneven pile of 100
+  # real-thread `tests/*.rs` binaries, not on 5 already-comparable ones.
   prod-liveness-scattered:
     name: prod-liveness-scattered
     runs-on: ubuntu-latest

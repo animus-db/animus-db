@@ -13,11 +13,12 @@
 //!   restart wipes the registry, a base `Query` and a `Scan` still return the
 //!   previously-written rows (they come from the durable data plane via
 //!   `DataClient::scan`, not a tracked key set).
-//! - `create_table_index_replicates_to_second_node` proves a `CreateTable`'s GSI
-//!   **definition** replicates through the catalog (`MetaCommand::CreateTableIndex`):
-//!   it is visible in every node's `Metadata`, and a GSI `Query` resolves on a
-//!   *second* node whose registry never saw the `CreateTable` (it rebuilt the index
-//!   machinery from the replicated definition).
+//! - `create_table_index_replicates_to_second_node` moved to `SimCluster`
+//!   (ADR 0061 rung D3 PR 3b, `crates/animusd/src/
+//!   sim_cluster_dynamo_schema.rs`) — it proves a `CreateTable`'s GSI
+//!   **definition** replicates through the catalog and a *second* node
+//!   resolves a `Query` against it, neither of which needs real sockets or
+//!   restart durability.
 //! - `create_table_index_survives_node_restart` proves the GSI definition survives a
 //!   restart (Raft WAL): after the registry is wiped, a GSI `Query` still works,
 //!   recovered from the replicated catalog, not process-local memory — and returns
@@ -343,101 +344,6 @@ async fn scan_and_query_read_live_storage_after_restart() {
     );
 
     stop(node).await;
-}
-
-/// A `CreateTable` declaring a GSI replicates the **index definition** through the
-/// control plane's schema catalog (ADR 0013), so it is visible on a *second* node
-/// — proving `animusd` proposes `MetaCommand::CreateTableIndex` rather than keeping
-/// the index in process-local memory. We then query the GSI from the second node's
-/// edge after writing through the first, proving that node rebuilt its index
-/// machinery from the **replicated** definition (its registry never saw the
-/// `CreateTable`).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn create_table_index_replicates_to_second_node() {
-    let dir = support::panic_safe_tempdir();
-    let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
-        .await
-        .unwrap();
-    let nodes = start_cluster(bound).await.unwrap();
-    await_cluster_bootstrap(&nodes).await;
-    let addr0 = nodes[0].dynamo_addr();
-
-    // CreateTable with a GSI on `email`, projecting ALL.
-    let (status, body) = dynamo(
-        addr0,
-        "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"users","AttributeDefinitions":[{"AttributeName":"email","AttributeType":"S"},{"AttributeName":"id","AttributeType":"S"}],
-            "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
-            "GlobalSecondaryIndexes":[
-                {"IndexName":"by-email",
-                 "KeySchema":[{"AttributeName":"email","KeyType":"HASH"}],
-                 "Projection":{"ProjectionType":"ALL"}}]}"#,
-    )
-    .await;
-    assert_eq!(status, 200, "CreateTable failed: {body}");
-
-    // The index DEFINITION must replicate to every node's `Metadata` (cluster-wide
-    // and durable, not process-local). Poll, since replication is async.
-    let replicated = async {
-        loop {
-            let everywhere = nodes.iter().all(|n| {
-                n.metadata()
-                    .table_indexes("users")
-                    .iter()
-                    .any(|d| d.name == "by-email")
-            });
-            if everywhere {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    };
-    timeout(Duration::from_secs(10), replicated)
-        .await
-        .expect("the GSI definition did not replicate to all nodes");
-
-    // Write an item through node 0.
-    let (status, body) = dynamo(
-        addr0,
-        "DynamoDB_20120810.PutItem",
-        r#"{"TableName":"users","Item":{"id":{"S":"u1"},"email":{"S":"a@x"},"v":{"N":"7"}}}"#,
-    )
-    .await;
-    assert_eq!(status, 200, "PutItem failed: {body}");
-
-    // Query the GSI on the SECOND node's edge. That node never saw the CreateTable
-    // through its own registry — it resolves the index's *shape* from the
-    // replicated definition (mirror_catalog_schema → sync_indexes) and reads the
-    // index's hidden table natively; the row itself is materialized by whichever
-    // node's drain leads the base tablet, asynchronously (ADR 0041 §4/§5). Poll
-    // until it has propagated/converged.
-    let addr1 = nodes[1].dynamo_addr();
-    let queried = async {
-        loop {
-            let (status, body) = dynamo(
-                addr1,
-                "DynamoDB_20120810.Query",
-                r#"{"TableName":"users","IndexName":"by-email",
-                    "KeyConditionExpression":"email = :e",
-                    "ExpressionAttributeValues":{":e":{"S":"a@x"}}}"#,
-            )
-            .await;
-            // A 200 with the row means the second node knew the index (from the
-            // catalog) and resolved the GSI query against it.
-            if status == 200 && body.contains(r#""v":{"N":"7"}"#) {
-                return body;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    };
-    let body = timeout(Duration::from_secs(10), queried)
-        .await
-        .expect("GSI query on second node never returned the item");
-    assert!(body.contains(r#""id":{"S":"u1"}"#), "id missing: {body}");
-
-    for node in nodes {
-        node.shutdown_graceful().await;
-    }
 }
 
 /// A `CreateTable`'s GSI **definition** survives a node restart because it rode the

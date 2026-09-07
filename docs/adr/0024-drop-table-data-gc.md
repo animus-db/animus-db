@@ -95,7 +95,11 @@ later ticks / the next restart:
 
 - A replica that was down during the drop restarts, re-hosts the tablet from its
   marker/engine, then its GC loop reclaims it once its control replica catches up
-  past the drop.
+  past the drop. **This bullet describes the pre-`host::Reconciler` design and
+  is corrected by the 2026-09-07 amendment below** — the durable per-node
+  marker it depends on ("re-hosts the tablet from its marker/engine") was
+  removed by ADR 0050, and nothing replaced its restart-time role until that
+  amendment's fix.
 - A restarted control replica **re-applies its log from the start**, passing
   through historical map states in which the dropped tablet still exists; the
   join-host loop may briefly re-host an *empty* group for it (its files are
@@ -194,3 +198,94 @@ other step in this cascade already is — idempotently, by the ordinary
 retention sweep eventually reaping whatever the interrupted drop left
 behind, since a schema-less table's label is by definition no longer
 anyone's *current* stream.
+
+## Amendment (2026-09-07, issue #722): the restart-time guarantee this ADR
+## originally stated was silently lost, and is now restored
+
+**The gap.** "Why absence-from-the-map is a sound trigger" (above) and its
+"a replica that was down during the drop restarts, re-hosts the tablet from
+its marker/engine, then its GC loop reclaims it once its control replica
+catches up past the drop" bullet described a durable, per-node **marker**
+that forced a restarting node to re-host (and thereby re-discover) a tablet
+it used to hold, even one `Metadata` no longer names — the load-bearing
+half of "convergent, not one-shot." ADR 0031's unification of the GC/join
+loops into `animus_cp_data::host::Reconciler`, and ADR 0050's move to
+per-tablet private engines, both happened without carrying that marker (or
+an equivalent) forward — see `crates/animusd/CLAUDE.md`'s drop-table-GC
+entry, itself already amended to say "there is no more durable `cp-hosted`
+marker... a restart just re-discovers every tablet to host from replicated
+`Metadata`," without noting that this was a **regression** in the specific
+case this ADR's own restart bullet promised to handle, not a neutral
+description.
+
+**The concrete failure.** `host::Reconciler::gather_facts` derives every
+fact exclusively from tablets the current `MetadataView` names, plus this
+reconciler's own in-process `LocalState` (never persisted — a restart
+starts from `LocalState::default()`). A node that crashes while hosting a
+tablet, and restarts only after that tablet's whole table has been dropped
+and the drop has already converged everywhere else, comes back to (a) an
+empty `LocalState` and (b) a `Metadata` view that, by the time its first
+tick ever runs, already never names the dropped tablet — so `gather_facts`
+produces no fact at all for that tablet id, `plan` never places it in
+`next.hosted`, and `HostAction::Reclaim` (which only ever fires for a
+tablet `LocalState` itself currently claims) can never target it. The
+tablet's own private engine — real data, written before the crash — leaked
+permanently. Confirmed live in production terms, not just in the
+`SimCluster` fixture that found it: the identical `LsmTabletFactory` this
+fix touches is the real `LsmEngine`-backed factory `animusd` uses, so the
+leak was real-disk-reachable, not a test artifact. See ADR 0061's own D4 PR
+3 (finding) and D4 PR 4/issue-#722-fix (close) amendments in
+`docs/adr/0061-testability-node-crate-simulator.md` for the discovery and
+fix's own narrative, and `crates/animus-cp-data/CLAUDE.md`'s host-module
+entry for the mechanism as shipped.
+
+**The fix — a second, restart-surviving fact source.** `host::
+EngineFactory` gained `local_tablets(&self) -> BTreeSet<TabletId>`
+(default-empty, so a third-party implementor of the trait still compiles):
+[`MemoryTabletEngines`] answers from its own in-memory registry keys, and
+the production `LsmTabletFactory` (`animusd`) answers by listing its node's
+data directory once and parsing each file's own `db-t{tablet}-` prefix —
+the identical mechanism `probe`/`destroy` already use, generalized from
+"does this ONE tablet's prefix appear" to "which tablet ids appear at
+all." `Reconciler::tick` consults it exactly ONCE, on its very first tick
+after construction — never on a later, steady-state tick, since a local
+engine appearing after that first tick can only be this same reconciler's
+own `Host`/`MaterializeSplitChild` action, already tracked in
+`LocalState` — so the fix adds no per-tick directory-listing cost to a
+long-running process, only a one-time cost right after a restart.
+
+**Why this is sound**, restated in this ADR's own "absence is a sound
+trigger" terms: an engine only ever exists locally for a tablet id this
+exact node has, at some prior tick, observed as real — `Host`/
+`MaterializeSplitChild` are the only two actions that ever create one, and
+both fire only in reaction to observing the tablet in the current
+`MetadataView` (an ordinary entry, or — for a pre-cutover in-place split
+child, which is materialized before it has its own tablet-map entry — one
+of the two children named on its parent's own still-live `inplace_split`
+intent, itself a `MetadataView` field). Tablet ids are never reused, so a
+locally-present id that is neither an ordinary map entry nor a live split
+intent's own child is a dropped table's leftover, full stop — never "a
+tablet that hasn't appeared in `Metadata` yet." `plan`'s own doc (`host.rs`)
+states this argument in full, alongside the `known` set that encodes it.
+
+**This restores, rather than merely documents, the restart-time guarantee**
+this ADR always intended: "a replica that was down during the drop restarts
+... [and] its GC loop reclaims it once its control replica catches up past
+the drop" (the pre-marker-removal bullet above) is true again, now via
+`local_tablets` instead of a durable per-node marker.
+
+**Tests**: `crates/animus-cp-data/src/host.rs`'s own unit tests
+(`a_locally_present_tablet_absent_from_the_map_is_reclaimed_even_with_
+empty_state`, and the split-child exemption
+`a_pre_cutover_split_childs_engine_is_not_reclaimed_even_with_empty_state`);
+`crates/animus-cp-data/tests/reconciler_corpus.rs`'s
+`crash_then_drop_then_restart_reclaims_the_leftover_engine` scenario (the
+`Reconciler`-level regression, `MemoryEngine` tier); `crates/animusd/src/
+sim_cluster_dynamo_drop_table.rs`'s `scenario_4_a_node_crashed_during_the_
+drop_and_restarted_reclaims_its_engine` (formerly `..._leaks_its_engine`,
+`#[ignore]`d — now a positive, un-ignored assertion, `SimCluster`/DynamoDB-
+wire tier); `crates/animusd/tests/drop_table_gc.rs`'s
+`a_node_stopped_before_the_drop_and_restarted_after_reclaims_its_leftover_
+engine` (the real-disk, real `LsmEngine` regression — the same on-disk
+`db-t{tablet}-*` files this amendment's own "concrete failure" paragraph
+names).

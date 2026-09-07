@@ -1,30 +1,38 @@
 //! `SimCluster`-driven end-to-end tests of `Query`'s `FilterExpression`
-//! (ADR 0061 rung D3 PR 3a, C-04 D3) — driven through the now-generic
+//! (ADR 0061 rung D3 PR 3a/3b, C-04 D3) — driven through the now-generic
 //! [`crate::dynamo::run_index_query`]/[`crate::dynamo::run_index_scan`] (and
 //! their GSI/LSI siblings), reached from [`crate::dynamo::dispatch_item_op`]'s
 //! own `Query`/`Scan` arms for the first time (they used to reject any named
 //! `index` with `unsupported_by_generic_dispatch`).
 //!
-//! Replaces five of `crates/animusd/tests/dynamo_query_filter.rs`'s six
-//! tests: `filter_narrows_a_base_query_instead_of_being_ignored`,
+//! **PR 3a** replaced five of `crates/animusd/tests/dynamo_query_filter.rs`'s
+//! six tests: `filter_narrows_a_base_query_instead_of_being_ignored`,
 //! `a_filtered_page_returns_fewer_than_limit_and_still_carries_a_cursor`,
 //! `a_filter_matching_nothing_still_reports_what_it_evaluated`,
 //! `filter_applies_to_an_lsi_query`, `attribute_exists_works_as_a_query_
-//! filter`. **`filter_applies_to_a_gsi_query` stays on `ProdEnv`** — it reads
-//! a *materialized* GSI row, and `SimCluster` never spawns `index_drain::
-//! change_consumer_loop` (the only thing that ever fills a GSI's own hidden
-//! table), so a GSI `Query` here reads as empty until a future rung
-//! generalizes the drain (see `dispatch_item_op`'s own doc, and this
-//! module's sibling `sim_cluster_dynamo_table_ops.rs`'s pinned regression for
-//! that exact boundary).
+//! filter`, leaving `filter_applies_to_a_gsi_query` on `ProdEnv` — it reads a
+//! *materialized* GSI row, and `SimCluster` never spawned `index_drain::
+//! change_consumer_loop` (the only thing that ever filled a GSI's own hidden
+//! table) at the time.
 //!
-//! Every LSI/base assertion here is unaffected: an LSI row is written
-//! synchronously in the same Raft entry as its base row (ADR 0041 §2), so
-//! `SimCluster`'s hand-hosted/wire-provisioned tablets serve it immediately —
-//! no convergence poll needed, unlike the `ProdEnv` original's GSI half.
+//! **PR 3b converts the sixth and last test too**: `[SimCluster::drain_gsi]`
+//! (`sim_cluster.rs`) is a test-only stand-in for that same drain arm, so
+//! `filter_applies_to_a_gsi_query` below drains on demand instead of
+//! polling a background loop this fixture still never runs. This file (and
+//! `crates/animusd/tests/dynamo_query_filter.rs`, now empty) is therefore
+//! fully converted.
+//!
+//! Every LSI/base assertion here is unaffected by any of this: an LSI row is
+//! written synchronously in the same Raft entry as its base row (ADR 0041
+//! §2), so `SimCluster`'s hand-hosted/wire-provisioned tablets serve it
+//! immediately — no drain needed, unlike the GSI test.
 //!
 //! Seed replay (repo convention): `ANIMUS_SEED=<seed> cargo test -p animusd
 //! --lib <test name>`.
+
+use std::time::Duration;
+
+use animus_tablet::TabletId;
 
 use super::sim_cluster::SimCluster;
 
@@ -33,6 +41,41 @@ fn env_seed(default: u64) -> u64 {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(default)
+}
+
+/// `table`'s own (sole) tablet id, read off node 0's own `Metadata` — see
+/// `sim_cluster_dynamo_query_pagination.rs`'s identical helper for why this
+/// is needed instead of `SimCluster::tablet_of` (this file's `setup` creates
+/// its table through the real wire, not the hand-hosted bypass).
+fn first_tablet(cluster: &SimCluster, table: &str) -> TabletId {
+    cluster
+        .metadata(0)
+        .tablets_for_table(table)
+        .next()
+        .unwrap_or_else(|| panic!("{table} has no tablet"))
+        .0
+        .to_owned()
+}
+
+/// Poll `body`'s `Query` until `accept` holds, or panic after a bounded
+/// number of attempts — the sim analogue of `dynamo_query_filter.rs::
+/// await_gsi_query`'s real-socket converged-or-timeout poll.
+fn await_gsi_query(
+    cluster: &mut SimCluster,
+    node: u64,
+    body: &str,
+    accept: impl Fn(&str) -> bool,
+) -> String {
+    let mut last = String::new();
+    for _ in 0..80 {
+        let (status, resp) = cluster.dynamo(node, "DynamoDB_20120810.Query", body.as_bytes());
+        if status == 200 && accept(&resp) {
+            return resp;
+        }
+        last = resp;
+        cluster.run_for(Duration::from_millis(100));
+    }
+    panic!("gsi query never converged (last saw: {last})");
 }
 
 /// A 3-node cluster with table `events` (composite `pk`/`sk`), a hash-only
@@ -297,4 +340,40 @@ fn attribute_exists_works_as_a_query_filter() {
     );
     assert_eq!(status, 200, "query failed: {absent} (seed={seed})");
     assert_eq!(counts(&absent), (0, 6), "none lack parity: {absent}");
+}
+
+/// The filter reaches a **GSI** query too, once the GSI's own hidden table
+/// has been drained. Mirrors `dynamo_query_filter.rs::
+/// filter_applies_to_a_gsi_query`.
+#[test]
+fn filter_applies_to_a_gsi_query() {
+    let seed = env_seed(0xE4C1_0006);
+    let mut cluster = setup(seed);
+    let tablet = first_tablet(&cluster, "events");
+    let leader = cluster
+        .leader_index_of(tablet)
+        .expect("events tablet has a leader");
+    cluster.drain_gsi(leader, "events");
+
+    let body = await_gsi_query(
+        &mut cluster,
+        1,
+        r#"{"TableName":"events","IndexName":"by-cat",
+            "KeyConditionExpression":"cat = :c",
+            "FilterExpression":"parity = :v",
+            "ExpressionAttributeValues":{":c":{"S":"X"},":v":{"S":"even"}}}"#,
+        |got| counts(got) == (3, 6),
+    );
+    for kept in ["a0", "a2", "a4"] {
+        assert!(
+            body.contains(kept),
+            "{kept} should have matched: {body} (seed={seed})"
+        );
+    }
+    for dropped in ["a1", "a3", "a5"] {
+        assert!(
+            !body.contains(dropped),
+            "{dropped} should have been filtered out of the GSI page: {body} (seed={seed})"
+        );
+    }
 }

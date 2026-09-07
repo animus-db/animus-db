@@ -1,21 +1,27 @@
 //! `SimCluster`-driven end-to-end tests of `Query`'s `ScanIndexForward`
 //! (descending reads, and inverted pagination) over the base table and an
-//! LSI (ADR 0061 rung D3 PR 3a, C-04 D3) — driven through the now-generic
-//! [`crate::dynamo::run_index_query`]/[`crate::dynamo::run_lsi_query`].
+//! LSI (ADR 0061 rung D3 PR 3a/3b, C-04 D3) — driven through the now-generic
+//! [`crate::dynamo::run_index_query`]/[`crate::dynamo::run_lsi_query`]/
+//! [`crate::dynamo::run_gsi_query`].
 //!
-//! Replaces six of `crates/animusd/tests/dynamo_scan_index_forward.rs`'s
-//! eight tests: `descending_query_returns_the_partition_in_reverse_sort_
-//! order`, `a_descending_limit_keeps_the_highest_rows`, `descending_
-//! pagination_visits_every_item_exactly_once`, `descending_applies_to_an_
-//! lsi_query`, `descending_composes_with_a_filter`, `lsi_scan_index_forward_
-//! orders_n_sort_keys_numerically`. **`descending_applies_to_a_gsi_query`
-//! and `gsi_scan_index_forward_orders_n_sort_keys_numerically` stay on
-//! `ProdEnv`** — both read a materialized GSI row, which `SimCluster` cannot
-//! produce (see `sim_cluster_dynamo_query_filter.rs`'s own module doc for the
-//! boundary).
+//! **PR 3a** replaced six of `crates/animusd/tests/dynamo_scan_index_
+//! forward.rs`'s eight tests: `descending_query_returns_the_partition_in_
+//! reverse_sort_order`, `a_descending_limit_keeps_the_highest_rows`,
+//! `descending_pagination_visits_every_item_exactly_once`, `descending_
+//! applies_to_an_lsi_query`, `descending_composes_with_a_filter`, `lsi_
+//! scan_index_forward_orders_n_sort_keys_numerically`, leaving `descending_
+//! applies_to_a_gsi_query` and `gsi_scan_index_forward_orders_n_sort_keys_
+//! numerically` on `ProdEnv` — both read a materialized GSI row, which
+//! `SimCluster` could not produce at the time.
+//!
+//! **PR 3b converts the last two tests too**: `[SimCluster::drain_gsi]`
+//! (`sim_cluster.rs`) closes that gap. This file (and `crates/animusd/tests/
+//! dynamo_scan_index_forward.rs`, now empty) is therefore fully converted.
 //!
 //! Seed replay (repo convention): `ANIMUS_SEED=<seed> cargo test -p animusd
 //! --lib <test name>`.
+
+use std::time::Duration;
 
 use super::sim_cluster::SimCluster;
 
@@ -24,6 +30,55 @@ fn env_seed(default: u64) -> u64 {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(default)
+}
+
+/// `table`'s own (sole) tablet id, read off node 0's own `Metadata` — see
+/// `sim_cluster_dynamo_query_pagination.rs`'s identical helper for why
+/// `SimCluster::tablet_of` doesn't work here.
+fn first_tablet(cluster: &SimCluster, table: &str) -> animus_tablet::TabletId {
+    cluster
+        .metadata(0)
+        .tablets_for_table(table)
+        .next()
+        .unwrap_or_else(|| panic!("{table} has no tablet"))
+        .0
+        .to_owned()
+}
+
+/// Poll `body`'s `Query` until `accept` holds, or panic after a bounded
+/// number of attempts — mirrors `sim_cluster_dynamo_query_filter.rs`'s own
+/// `await_gsi_query`.
+fn await_gsi_query(
+    cluster: &mut SimCluster,
+    node: u64,
+    body: &str,
+    accept: impl Fn(&str) -> bool,
+) -> String {
+    let mut last = String::new();
+    for _ in 0..80 {
+        let (status, resp) = cluster.dynamo(node, "DynamoDB_20120810.Query", body.as_bytes());
+        if status == 200 && accept(&resp) {
+            return resp;
+        }
+        last = resp;
+        cluster.run_for(Duration::from_millis(100));
+    }
+    panic!("gsi query never converged (last saw: {last})");
+}
+
+/// [`n_order`], numerically sorted — the order-**independent** form for a
+/// membership assertion, mirroring `dynamo_query_range.rs`'s identical
+/// `sk_order` vs. `sk_values` split (never use this for an ordering
+/// assertion).
+fn n_values_numeric_sorted(body: &str, field: &str) -> Vec<String> {
+    let mut out = n_order(body, field);
+    out.sort_by(|a, b| {
+        a.parse::<f64>()
+            .unwrap()
+            .partial_cmp(&b.parse::<f64>().unwrap())
+            .unwrap()
+    });
+    out
 }
 
 /// A 3-node cluster with table `events` (composite `pk`/`sk`), a hash-only
@@ -442,4 +497,123 @@ fn lsi_scan_index_forward_orders_n_sort_keys_numerically() {
             .unwrap()
     });
     assert_eq!(ge, vec!["10", "100"], "LSI alt >= 10: {body}");
+}
+
+/// Descending reaches a **GSI** query too, materialized on demand via
+/// `[SimCluster::drain_gsi]`. Mirrors `dynamo_scan_index_forward.rs::
+/// descending_applies_to_a_gsi_query`.
+#[test]
+fn descending_applies_to_a_gsi_query() {
+    let seed = env_seed(0xE4C4_0007);
+    let mut cluster = setup(seed);
+    let tablet = first_tablet(&cluster, "events");
+    let leader = cluster
+        .leader_index_of(tablet)
+        .expect("events tablet has a leader");
+    cluster.drain_gsi(leader, "events");
+
+    let body = await_gsi_query(
+        &mut cluster,
+        0,
+        r#"{"TableName":"events","IndexName":"by-cat",
+            "KeyConditionExpression":"cat = :c",
+            "ExpressionAttributeValues":{":c":{"S":"X"}},
+            "ScanIndexForward":false}"#,
+        |got| sk_order(got).len() == 6,
+    );
+    let order = sk_order(&body);
+    assert_eq!(
+        order,
+        vec!["a5", "a4", "a3", "a2", "a1", "a0"],
+        "GSI descending order (seed={seed}): {body}"
+    );
+}
+
+/// **GSI `ScanIndexForward` is numeric order for an `N` sort key (ADR
+/// 0063)** — see the `ProdEnv` original's own doc for the full reasoning.
+/// Mirrors `dynamo_scan_index_forward.rs::
+/// gsi_scan_index_forward_orders_n_sort_keys_numerically`.
+#[test]
+fn gsi_scan_index_forward_orders_n_sort_keys_numerically() {
+    let seed = env_seed(0xE4C4_0008);
+    let mut cluster = setup_n_sort_keys(seed);
+    let tablet = first_tablet(&cluster, "readings");
+    let leader = cluster
+        .leader_index_of(tablet)
+        .expect("readings tablet has a leader");
+    cluster.drain_gsi(leader, "readings");
+
+    let asc = await_gsi_query(
+        &mut cluster,
+        1,
+        r#"{"TableName":"readings","IndexName":"by-device-value","ScanIndexForward":true,
+            "KeyConditionExpression":"device = :d",
+            "ExpressionAttributeValues":{":d":{"S":"d1"}}}"#,
+        |b| n_order(b, "value").len() == 7,
+    );
+    assert_eq!(
+        n_order(&asc, "value"),
+        vec!["-10", "-5", "0", "0.5", "2", "10", "100"],
+        "GSI ScanIndexForward:true ascending numeric order (seed={seed}): {asc}"
+    );
+
+    let desc = await_gsi_query(
+        &mut cluster,
+        2,
+        r#"{"TableName":"readings","IndexName":"by-device-value","ScanIndexForward":false,
+            "KeyConditionExpression":"device = :d",
+            "ExpressionAttributeValues":{":d":{"S":"d1"}}}"#,
+        |b| n_order(b, "value").len() == 7,
+    );
+    assert_eq!(
+        n_order(&desc, "value"),
+        vec!["100", "10", "2", "0.5", "0", "-5", "-10"],
+        "GSI ScanIndexForward:false descending numeric order (seed={seed}): {desc}"
+    );
+
+    // BETWEEN -5 AND 2: -5, 0, 0.5, 2 — not -10, 10, or 100.
+    let between = await_gsi_query(
+        &mut cluster,
+        0,
+        r#"{"TableName":"readings","IndexName":"by-device-value",
+            "KeyConditionExpression":"device = :d AND value BETWEEN :lo AND :hi",
+            "ExpressionAttributeValues":{":d":{"S":"d1"},":lo":{"N":"-5"},":hi":{"N":"2"}}}"#,
+        |b| n_order(b, "value").len() == 4,
+    );
+    assert_eq!(
+        n_values_numeric_sorted(&between, "value"),
+        vec!["-5", "0", "0.5", "2"],
+        "GSI value BETWEEN -5 AND 2 (seed={seed}): {between}"
+    );
+
+    // `<` 0: -10, -5 only — a byte-text compare would wrongly admit "0.5".
+    let lt = await_gsi_query(
+        &mut cluster,
+        1,
+        r#"{"TableName":"readings","IndexName":"by-device-value",
+            "KeyConditionExpression":"device = :d AND value < :v",
+            "ExpressionAttributeValues":{":d":{"S":"d1"},":v":{"N":"0"}}}"#,
+        |b| n_order(b, "value").len() == 2,
+    );
+    assert_eq!(
+        n_values_numeric_sorted(&lt, "value"),
+        vec!["-10", "-5"],
+        "GSI value < 0 (seed={seed}): {lt}"
+    );
+
+    // `>=` 10: 10, 100 — a byte-text compare would wrongly exclude "100" or
+    // admit "2".
+    let ge = await_gsi_query(
+        &mut cluster,
+        2,
+        r#"{"TableName":"readings","IndexName":"by-device-value",
+            "KeyConditionExpression":"device = :d AND value >= :v",
+            "ExpressionAttributeValues":{":d":{"S":"d1"},":v":{"N":"10"}}}"#,
+        |b| n_order(b, "value").len() == 2,
+    );
+    assert_eq!(
+        n_values_numeric_sorted(&ge, "value"),
+        vec!["10", "100"],
+        "GSI value >= 10 (seed={seed}): {ge}"
+    );
 }

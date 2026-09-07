@@ -6,9 +6,16 @@
 //!
 //! Replaces two of `crates/animusd/tests/dynamo_indexes.rs`'s three tests:
 //! `scan_paginates_a_whole_table`, `scan_skips_deleted_items_and_paginates`.
-//! **`gsi_write_then_query` stays in that file, untouched** — D2 PR 1 names
-//! it as the real-socket proof that `run_operation`'s own path works
-//! independently of `dispatch_item_op`, and it is never deleted.
+//! **`gsi_write_then_query` stays in that file, untouched, and is never
+//! deleted** — D2 PR 1 names it as the real-socket proof that
+//! `run_operation`'s own path works independently of `dispatch_item_op`.
+//! PR 3b adds `gsi_write_then_query_sim` below as its **sim twin**
+//! (proving the same write/query/delete/reject sequence through the generic
+//! `dispatch_item_op` core, via `[SimCluster::drain_gsi]`) — a twin, not a
+//! replacement, since the two tests prove genuinely different things (one
+//! real sockets and `run_operation`, one `SimCluster` and `dispatch_item_
+//! op`), matching the design's own explicit instruction not to delete the
+//! original.
 //!
 //! Seed replay (repo convention): `ANIMUS_SEED=<seed> cargo test -p animusd
 //! --lib <test name>`.
@@ -163,5 +170,115 @@ fn scan_skips_deleted_items_and_paginates() {
     assert!(
         !page2.contains(r#""id":{"S":"1"}"#),
         "deleted item paged in: {page2}"
+    );
+}
+
+/// Sim twin of `dynamo_indexes.rs::gsi_write_then_query` (ADR 0061 rung D3
+/// PR 3b) — see this file's own module doc for why the original stays
+/// alongside this one rather than being replaced. Materializes the GSI on
+/// demand via `[SimCluster::drain_gsi]` instead of polling a background
+/// loop this fixture never runs.
+#[test]
+fn gsi_write_then_query_sim() {
+    let seed = env_seed(0xE4C9_0003);
+    let mut cluster = SimCluster::new(seed, 3, 3);
+
+    // CreateTable with a GSI on the `email` attribute.
+    let (status, body) = cluster.dynamo(
+        0,
+        "DynamoDB_20120810.CreateTable",
+        br#"{"TableName":"users","AttributeDefinitions":[{"AttributeName":"email","AttributeType":"S"},{"AttributeName":"id","AttributeType":"S"}],
+            "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
+            "GlobalSecondaryIndexes":[
+                {"IndexName":"by-email",
+                 "KeySchema":[{"AttributeName":"email","KeyType":"HASH"}],
+                 "Projection":{"ProjectionType":"ALL"}}]}"#,
+    );
+    assert_eq!(status, 200, "CreateTable failed (seed={seed}): {body}");
+    assert!(
+        body.contains("\"IndexName\":\"by-email\""),
+        "seed={seed}: got: {body}"
+    );
+
+    // Three users; two share an email.
+    for (id, email) in [("u1", "a@x"), ("u2", "b@x"), ("u3", "a@x")] {
+        let (status, body) = cluster.dynamo(
+            0,
+            "DynamoDB_20120810.PutItem",
+            format!(r#"{{"TableName":"users","Item":{{"id":{{"S":"{id}"}},"email":{{"S":"{email}"}}}}}}"#)
+                .as_bytes(),
+        );
+        assert_eq!(status, 200, "PutItem({id}) failed (seed={seed}): {body}");
+    }
+
+    let meta0 = cluster.metadata(0);
+    let (tablet, _) = meta0
+        .tablets_for_table("users")
+        .next()
+        .unwrap_or_else(|| panic!("users has no tablet (seed={seed})"));
+    let tablet = *tablet;
+    drop(meta0);
+    let leader = cluster
+        .leader_index_of(tablet)
+        .expect("users tablet has a leader");
+    cluster.drain_gsi(leader, "users");
+
+    // Query the GSI for a@x (from a different node → native scan of the
+    // hidden index table): u1 and u3.
+    let (status, body) = cluster.dynamo(
+        1,
+        "DynamoDB_20120810.Query",
+        br#"{"TableName":"users","IndexName":"by-email",
+            "KeyConditionExpression":"email = :e",
+            "ExpressionAttributeValues":{":e":{"S":"a@x"}}}"#,
+    );
+    assert_eq!(status, 200, "GSI query failed (seed={seed}): {body}");
+    assert!(body.contains("\"Count\":2"), "seed={seed}: {body}");
+    assert!(body.contains(r#""id":{"S":"u1"}"#), "seed={seed}: {body}");
+    assert!(body.contains(r#""id":{"S":"u3"}"#), "seed={seed}: {body}");
+    assert!(
+        !body.contains(r#""id":{"S":"u2"}"#),
+        "seed={seed}: got: {body}"
+    );
+
+    // Deleting u3 removes it from the index, once re-drained.
+    let (status, _) = cluster.dynamo(
+        0,
+        "DynamoDB_20120810.DeleteItem",
+        br#"{"ConsistentRead":true,"TableName":"users","Key":{"id":{"S":"u3"}}}"#,
+    );
+    assert_eq!(status, 200);
+    cluster.drain_gsi(leader, "users");
+
+    let (status, body) = cluster.dynamo(
+        1,
+        "DynamoDB_20120810.Query",
+        br#"{"TableName":"users","IndexName":"by-email",
+            "KeyConditionExpression":"email = :e",
+            "ExpressionAttributeValues":{":e":{"S":"a@x"}}}"#,
+    );
+    assert_eq!(
+        status, 200,
+        "GSI query after delete failed (seed={seed}): {body}"
+    );
+    assert!(body.contains("\"Count\":1"), "seed={seed}: {body}");
+    assert!(body.contains(r#""id":{"S":"u1"}"#), "seed={seed}: {body}");
+    assert!(
+        !body.contains(r#""id":{"S":"u3"}"#),
+        "after delete (seed={seed}): {body}"
+    );
+
+    // Querying an undeclared index is a ValidationException.
+    let (status, body) = cluster.dynamo(
+        0,
+        "DynamoDB_20120810.Query",
+        br#"{"TableName":"users","IndexName":"nope",
+            "KeyConditionExpression":"email = :e",
+            "ExpressionAttributeValues":{":e":{"S":"a@x"}}}"#,
+    );
+    assert_eq!(status, 400, "seed={seed}");
+    assert!(
+        body.contains("ValidationException"),
+        "seed={seed}: got: {body}"
     );
 }
