@@ -4165,7 +4165,15 @@ debugging anything that feels like it might have happened before.
   fixed-deadline one-shot assert" already applies to the test's *main*
   assertion; a precondition snapshot is exactly as exposed to this race as
   the property under test and needs the identical scrutiny, not a pass
-  because it merely runs first.
+  because it merely runs first. **Same bug, different costume, in issue
+  #699**: `crates/animusd/tests/shared_wal_liveness.rs`'s load phase ran
+  writers for a fixed `LOAD_DURATION` and then asserted every table
+  completed more than `COMPACT_THRESHOLD` writes as a non-vacuity check —
+  a wall-clock-window write count is the identical "eventual property
+  observed as a one-shot" shape, just measured in throughput instead of a
+  map snapshot; the fix (as here) was converge-or-timeout — keep writing
+  until the count target is met, bounded by a generous stall timeout,
+  never widen the window to move the threshold.
 
 ### Code patterns
 - **A retryable-shaped error (the house `"; retry"` suffix) surviving string

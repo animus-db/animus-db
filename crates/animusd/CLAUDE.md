@@ -3665,17 +3665,30 @@ existing trailing knobs:
   real-thread `ProdEnv` liveness proof this cutover added — a multi-node
   cluster hosting several tables (several CP-data tablets sharing each
   node's own `SharedWal`) with the shared WAL on by default (no flag
-  passed) under continuous concurrent client writes for a fixed wall
-  interval, proving: every acked write is `ConsistentRead: true`-readable;
-  a leader kill/restart mid-load converges (converged-or-timeout poll,
-  never a fixed-deadline one-shot assert); and the shared WAL's segment GC
-  actually runs under sustained load without stalling writes. Mirrors
-  `heartbeat_batch_liveness.rs`'s own role for that mechanism's cutover
-  (root `CLAUDE.md`'s "`SimEnv` proves logic and ordering, not real-thread
-  liveness" lesson) — the `prod-liveness-animusd` CI shard now runs this
-  test alongside every other real-socket integration binary. Run 5x
-  locally to confirm no flake before landing any future change to this
-  path.
+  passed) under continuous concurrent client writes, proving: every acked
+  write is `ConsistentRead: true`-readable; a leader kill/restart mid-load
+  converges (converged-or-timeout poll, never a fixed-deadline one-shot
+  assert); and the shared WAL's segment GC actually runs under sustained
+  load without stalling writes. **The load phase itself is
+  converge-or-timeout, not fixed-duration** (issue #699, fixed after a
+  wall-clock-window write count flaked on a loaded runner — same shape as
+  the #690 lesson: a non-vacuity count taken over a fixed wall-clock window
+  is the "eventual property, one-shot assert" bug wearing a throughput
+  costume): each writer task keeps going until its own table has crossed
+  `TARGET_WRITES_PER_TABLE` (a margin past `COMPACT_THRESHOLD`, 64) **and**
+  at least `LOAD_DURATION` (5s) has elapsed, so a fast run still gets a
+  genuine sustained-load window and a slow run still gets every write it
+  needs; the whole load phase is additionally bounded by
+  `LOAD_PHASE_BUDGET` (120s), which fires only on a genuine stall, never on
+  ordinary runner slowness. The write-count assertion that follows is now
+  stated as the loop's own contract (guaranteed by its exit condition), not
+  a timing bet. Mirrors `heartbeat_batch_liveness.rs`'s own role for that
+  mechanism's cutover (root `CLAUDE.md`'s "`SimEnv` proves logic and
+  ordering, not real-thread liveness" lesson) — the `prod-liveness-animusd`
+  CI shard now runs this test alongside every other real-socket
+  integration binary. Run 5x locally (and once under a concurrently
+  running heavy test binary, to simulate contention) to confirm no flake
+  before landing any future change to this path.
 
 See `docs/adr/0028-shared-storage-single-command-split.md`'s C-05 PR 2
 amendment for the wiring design record, and its C-05 PR 3 amendment for

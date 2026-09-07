@@ -20,14 +20,26 @@
 //! SAME sustained-load window (never a separate, idle-then-load sequence):
 //!
 //! 1. **Durability under load**: several concurrent writer tasks (one per
-//!    table) hammer distinct keys for a fixed wall-clock interval — enough
-//!    writes per table to cross `COMPACT_THRESHOLD` (64) and trigger a real
-//!    `apply_and_compact` → `SharedWal::compact_group` rewrite mid-load, not
-//!    just append coalescing. Every acked write is verified immediately
-//!    readable via a `ConsistentRead`-equivalent get (`stale: false`, the
-//!    linearizable ReadIndex path, ADR 0055) — never a fire-and-forget
-//!    write, and never a fixed-deadline one-shot assert (root `CLAUDE.md`'s
-//!    Testing discipline: converged-or-timeout polls throughout).
+//!    table) hammer distinct keys. Each writer's own loop is
+//!    converge-or-timeout, never a fixed wall-clock cutoff (issue #699,
+//!    same shape as issue #690): it keeps going until ITS OWN table has
+//!    completed `TARGET_WRITES_PER_TABLE` writes (a margin comfortably past
+//!    `COMPACT_THRESHOLD`, 64, so a real `apply_and_compact` →
+//!    `SharedWal::compact_group` rewrite mid-load is guaranteed, not just
+//!    append coalescing) **and** at least `LOAD_DURATION` has elapsed —
+//!    both conditions, so the run stays a genuine sustained-load window on
+//!    fast hardware instead of racing to the count and stopping early. The
+//!    whole load phase is additionally bounded by `LOAD_PHASE_BUDGET`, a
+//!    generous overall timeout that fires only on a genuine stall (a
+//!    writer wedged on a broken path), never on ordinary runner slowness —
+//!    a real 2-vCPU-runner throughput dip just makes the loop run longer,
+//!    it no longer fails the test (root `CLAUDE.md`'s Testing discipline:
+//!    converged-or-timeout, never a fixed-deadline one-shot assert — and,
+//!    per the #690 lesson, a wall-clock-window write count is exactly the
+//!    same "eventual property observed as a one-shot" bug in disguise).
+//!    Every acked write is verified immediately readable via a
+//!    `ConsistentRead`-equivalent get (`stale: false`, the linearizable
+//!    ReadIndex path, ADR 0055) — never a fire-and-forget write.
 //! 2. **GC under load**: `GET /admin/metrics`'s `cp_shared_wal_gc_rewrites`
 //!    counter (summed across every node) is polled to a nonzero value
 //!    during/after the load window — proof the shared WAL's segment GC
@@ -75,11 +87,28 @@ const TABLES: [&str; 4] = ["sw_t0", "sw_t1", "sw_t2", "sw_t3"];
 /// bootstrap/settle/election poll in this file.
 const FORM_BUDGET: Duration = Duration::from_secs(30);
 const ELECTION_BUDGET: Duration = Duration::from_secs(20);
-/// The sustained-load window: long enough, at real localhost round-trip
-/// latency, for each of the four writer tasks below to comfortably clear
-/// `COMPACT_THRESHOLD` (64) writes on its own table and trigger a real
-/// `SharedWal::compact_group` rewrite mid-run, not just append coalescing.
+/// The sustained-load window: each writer task keeps going until at least
+/// this much wall time has elapsed AND its own table has crossed
+/// `TARGET_WRITES_PER_TABLE` (see below) — so this bounds how long the
+/// window runs on fast hardware, never how many writes must land on slow
+/// hardware (issue #699).
 const LOAD_DURATION: Duration = Duration::from_secs(5);
+/// Per-table write-count target: `COMPACT_THRESHOLD` (64,
+/// `animus-cp-data`'s private const of the same name) plus a margin
+/// comfortably large enough that ordinary scheduler jitter right at the
+/// threshold can't leave a table short of it — a real
+/// `apply_and_compact` → `SharedWal::compact_group` rewrite mid-load is
+/// unconditionally guaranteed once every writer task has reached this
+/// count, since each task's own loop does not exit before then (issue
+/// #699 — this is the loop's own contract, not a throughput bet).
+const TARGET_WRITES_PER_TABLE: u64 = 64 + 16;
+/// Overall bound on the whole load phase (every writer task reaching
+/// `TARGET_WRITES_PER_TABLE` and at least `LOAD_DURATION` having elapsed).
+/// Generous enough that real contention on a shared runner never trips it;
+/// tight enough that a genuine stall (a writer wedged on a broken shared
+/// WAL path) still fails fast with a clear message instead of hanging the
+/// suite.
+const LOAD_PHASE_BUDGET: Duration = Duration::from_secs(120);
 /// Poll budget for the post-load GC-metric convergence check — the janitor
 /// path runs inline on the apply task as part of ordinary compaction, so
 /// this only needs to outlast the load window's own tail, not a separate
@@ -327,7 +356,12 @@ async fn shared_wal_holds_under_sustained_load_then_reelects_after_a_real_leader
         let clients = clients.clone();
         handles.push(tokio::spawn(async move {
             let mut i: u64 = 0;
-            while tokio::time::Instant::now() < deadline {
+            // Converge-or-timeout, not fixed-duration (issue #699): keep
+            // writing until this table has crossed its own target count
+            // AND the sustained-load window has elapsed — either alone is
+            // not enough, so a fast run still sees the full LOAD_DURATION
+            // of load, and a slow run still gets every write it needs.
+            while i < TARGET_WRITES_PER_TABLE || tokio::time::Instant::now() < deadline {
                 let key = format!("k{i}").into_bytes();
                 let val = format!("v{i}").into_bytes();
                 put(&clients, &key, &val, 15, table).await;
@@ -337,18 +371,37 @@ async fn shared_wal_holds_under_sustained_load_then_reelects_after_a_real_leader
             (table, i)
         }));
     }
-    let mut written: BTreeMap<&str, u64> = BTreeMap::new();
-    for h in handles {
-        let (table, count) = h.await.expect("writer task panicked");
-        written.insert(table, count);
-    }
+    let load_phase = async {
+        let mut written: BTreeMap<&str, u64> = BTreeMap::new();
+        for h in handles {
+            let (table, count) = h.await.expect("writer task panicked");
+            written.insert(table, count);
+        }
+        written
+    };
+    let written = timeout(LOAD_PHASE_BUDGET, load_phase)
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "load phase stalled — did not converge within \
+                 {LOAD_PHASE_BUDGET:?}; at least one writer task never \
+                 reached {TARGET_WRITES_PER_TABLE} writes on its table \
+                 despite that budget being well past the {LOAD_DURATION:?} \
+                 sustained-load floor, which points at a genuine stall on \
+                 the shared WAL / write path, not ordinary runner slowness \
+                 (issue #699)"
+            )
+        });
+    // Guaranteed by the loop's own exit condition above, not a timing bet
+    // — restated here as the loop's contract, so a regression that breaks
+    // that contract (rather than just running slow) still fails loudly.
     for (table, count) in &written {
         assert!(
-            *count > 64,
-            "table {table} only completed {count} writes during the load \
-             window — too few to reliably cross COMPACT_THRESHOLD (64) and \
-             exercise the GC path this test means to prove; widen \
-             LOAD_DURATION if this becomes flaky on slower hardware"
+            *count >= TARGET_WRITES_PER_TABLE,
+            "table {table} completed only {count} writes despite the load \
+             loop's own exit condition requiring at least \
+             {TARGET_WRITES_PER_TABLE} — broken loop invariant, not a \
+             throughput shortfall"
         );
     }
 
