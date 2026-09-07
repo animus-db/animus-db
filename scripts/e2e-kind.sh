@@ -288,6 +288,35 @@ dump_diagnostics() {
             log "  logs: ${pod}"
             kubectl logs -n "$NAMESPACE" "$pod" --tail=100 2>&1 | sed 's/^/    /' || true
         done
+        # Issue #705: a container's OWN restart count/last-state, and —
+        # whenever that count is > 0 — its previous instance's own log
+        # output (`kubectl logs --previous`), which is the only place the
+        # reason a since-restarted container exited actually lives; the
+        # `--tail=100` current-instance logs above only ever show the
+        # CURRENT (already-restarted) instance's own output, never the
+        # crashed one's. Without this, a restart-storm like the one #705's
+        # own job log traced (pod e2e-3 exiting cleanly three times before
+        # stabilizing) is unrecoverable after the fact: nothing else this
+        # script captures says WHY each instance exited.
+        log "pod restart counts + previous-instance logs (per container, when restarted)"
+        for pod in $(kubectl get pods -n "$NAMESPACE" -o name 2>/dev/null || true); do
+            pod_name="${pod#pod/}"
+            for container in $(kubectl get "$pod" -n "$NAMESPACE" \
+                -o jsonpath='{.spec.containers[*].name}' 2>/dev/null || true); do
+                restart_count="$(kubectl get "$pod" -n "$NAMESPACE" \
+                    -o jsonpath="{.status.containerStatuses[?(@.name==\"${container}\")].restartCount}" \
+                    2>/dev/null || true)"
+                last_state="$(kubectl get "$pod" -n "$NAMESPACE" \
+                    -o jsonpath="{.status.containerStatuses[?(@.name==\"${container}\")].lastState}" \
+                    2>/dev/null || true)"
+                log "  ${pod_name}/${container}: restartCount=${restart_count:-0} lastState=${last_state:-<none>}"
+                if [ -n "$restart_count" ] && [ "$restart_count" -gt 0 ] 2>/dev/null; then
+                    log "  logs --previous: ${pod_name}/${container} (tail 200)"
+                    kubectl logs -n "$NAMESPACE" "$pod_name" -c "$container" --previous --tail=200 \
+                        2>&1 | sed 's/^/    /' || true
+                fi
+            done
+        done
     fi
     if [ -f "$OPERATOR_LOG" ]; then
         log "operator log (tail 200): ${OPERATOR_LOG}"
@@ -429,20 +458,165 @@ admin_health_ready() {
     [ "$code" = "200" ]
 }
 
+# Resolves whichever pod svc/${AC_NAME}-dynamo currently routes to and
+# port-forwards it directly on both the dynamo and admin ports — the exact
+# sequence the "port-forward that pod directly" and "re-resolve and
+# re-forward the serving pod" phases below each ran inline before issue
+# #705/#703, now shared so the S-07d growth wait's own self-heal (see
+# `control_voters_reading` below) can call it too.
+#
+# `fatal=1` (the two call sites below, both one-shot setups where a failure
+# genuinely means the run cannot proceed) calls `fail` and never returns on
+# an error, matching those call sites' original behavior byte-for-byte.
+# `fatal=0` (the growth wait's own self-heal) instead just returns 1 — a
+# transient miss mid-rolling-restart (the Service briefly has no endpoint,
+# or the freshly-resolved pod's port-forward isn't up yet) should not abort
+# the whole run, only this one reading.
+resolve_and_forward_dynamo_pod() {
+    local fatal="$1"
+    if [ -n "$PORT_FORWARD_PID" ]; then
+        kill "$PORT_FORWARD_PID" >/dev/null 2>&1 || true
+        wait "$PORT_FORWARD_PID" 2>/dev/null || true
+        PORT_FORWARD_PID=""
+    fi
+    if ! wait_for "svc/${AC_NAME}-dynamo has a resolved endpoint" 30 1 -- has_dynamo_endpoint; then
+        [ "$fatal" = "1" ] && fail "svc/${AC_NAME}-dynamo never resolved an endpoint"
+        return 1
+    fi
+    DYNAMO_POD="$(dynamo_endpoint_pod)"
+    if [ -z "$DYNAMO_POD" ]; then
+        [ "$fatal" = "1" ] && fail "could not resolve a pod backing svc/${AC_NAME}-dynamo"
+        return 1
+    fi
+    log "svc/${AC_NAME}-dynamo routes to pod ${DYNAMO_POD}"
+    kubectl port-forward "pod/${DYNAMO_POD}" -n "$NAMESPACE" \
+        "${DYNAMO_LOCAL_PORT}:${DYNAMO_REMOTE_PORT}" "${ADMIN_LOCAL_PORT}:${ADMIN_REMOTE_PORT}" \
+        >"$PORT_FORWARD_LOG" 2>&1 &
+    PORT_FORWARD_PID=$!
+    if ! wait_for "dynamo port-forward listening" 30 1 -- port_forward_ready; then
+        [ "$fatal" = "1" ] && fail "dynamo port-forward against pod ${DYNAMO_POD} never became ready"
+        return 1
+    fi
+    if ! wait_for "admin port-forward listening" 30 1 -- admin_port_forward_ready; then
+        [ "$fatal" = "1" ] && fail "admin port-forward against pod ${DYNAMO_POD} never became ready"
+        return 1
+    fi
+    return 0
+}
+
 # S-07d: the number of control voters the group itself currently reports —
 # `GET /admin/control/members` is served by any node (`admin.rs`'s own
 # doc), so this can be polled through whichever pod the dynamo port-forward
 # currently targets, control-role or not.
-control_voters_count() {
-    curl -sS -m 5 "${CURL_TLS_ARGS[@]}" \
-        "${ADMIN_SCHEME}://${ADMIN_HOST}:${ADMIN_LOCAL_PORT}/admin/control/members" 2>/dev/null \
-        | jq -r '(.voters // []) | length' 2>/dev/null || echo 0
+#
+# Issue #703: prints the live count on stdout, or NOTHING when the reading
+# genuinely could not be taken — callers must never treat empty output as
+# "0 voters". A first curl failure self-heals the port-forward once (the
+# S-07d rolling restart may have recycled the exact pod this script's
+# forward is pinned to — `kubectl port-forward pod/...` dies silently the
+# moment its target pod is deleted) and retries once before giving up.
+control_voters_reading() {
+    local body=""
+    body="$(curl -sS -m 5 "${CURL_TLS_ARGS[@]}" \
+        "${ADMIN_SCHEME}://${ADMIN_HOST}:${ADMIN_LOCAL_PORT}/admin/control/members" 2>/dev/null)" || body=""
+    if [ -z "$body" ]; then
+        if resolve_and_forward_dynamo_pod 0; then
+            body="$(curl -sS -m 5 "${CURL_TLS_ARGS[@]}" \
+                "${ADMIN_SCHEME}://${ADMIN_HOST}:${ADMIN_LOCAL_PORT}/admin/control/members" 2>/dev/null)" || return 1
+        else
+            return 1
+        fi
+    fi
+    [ -n "$body" ] || return 1
+    jq -r '(.voters // []) | length' <<<"$body" 2>/dev/null || return 1
 }
 
 control_voters_equals() {
     local want="$1" got
-    got="$(control_voters_count)"
+    got="$(control_voters_reading || true)"
     [ -n "$got" ] && [ "$got" -eq "$want" ]
+}
+
+# Issue #705: a small progress fingerprint for the S-07d growth wait below,
+# combining signals the pinned port-forward can never lose (the
+# statefulset's own readyReplicas, and the promoted ordinal's own restart
+# count/ready condition/phase — all read straight off the API server) with
+# the live voter count when a reading is actually obtainable
+# (`control_voters_reading`, "NA" otherwise). Any change from one poll to
+# the next — a restart count ticking up, readiness flapping, the voter
+# count moving — counts as progress and resets `wait_for_progress`'s own
+# stall clock; see that function's own doc.
+control_growth_progress_signal() {
+    local ord="$1" pod="${AC_NAME}-${1}"
+    local ready_replicas restart_count container_ready phase voters
+    ready_replicas="$(sts_ready_replicas)"
+    restart_count="$(kubectl get pod "$pod" -n "$NAMESPACE" \
+        -o jsonpath='{.status.containerStatuses[0].restartCount}' 2>/dev/null || true)"
+    container_ready="$(kubectl get pod "$pod" -n "$NAMESPACE" \
+        -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null || true)"
+    phase="$(kubectl get pod "$pod" -n "$NAMESPACE" \
+        -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+    voters="$(control_voters_reading || true)"
+    printf 'ord=%s ready=%s restarts=%s containerReady=%s phase=%s voters=%s' \
+        "$ord" "${ready_replicas:-?}" "${restart_count:-?}" "${container_ready:-?}" "${phase:-?}" \
+        "${voters:-NA}"
+}
+
+# wait_for_progress DESC HARD_CAP_SECS STALL_SECS INTERVAL_SECS \
+#   -- CONVERGED_CMD... -- PROGRESS_CMD...
+#
+# Issue #705: a converge-or-STALL wait, for a condition whose own path to
+# converging can legitimately take a while AND legitimately keep restarting
+# things along the way (the S-07d control-voter-growth wait below is the
+# one case in this script that needs this — see its own call site). Polls
+# CONVERGED_CMD every INTERVAL_SECS, succeeding the moment it does.
+# Otherwise evaluates PROGRESS_CMD each iteration (expected to print a
+# fingerprint string to stdout): any change from the previous iteration's
+# fingerprint resets the stall clock, exactly like a human watching the
+# dashboard would keep waiting as long as *something* is still visibly
+# happening. Fails only once STALL_SECS pass with an unchanged fingerprint
+# (nothing is happening any more) OR HARD_CAP_SECS pass in total, whichever
+# comes first — the hard cap is what keeps this bounded even if
+# CONVERGED_CMD never converges but PROGRESS_CMD keeps innocuously
+# fluctuating forever.
+wait_for_progress() {
+    local desc="$1" hard_cap="$2" stall_secs="$3" interval="$4"
+    shift 4
+    [ "$1" = "--" ] && shift
+    local converged_cmd=()
+    while [ "$1" != "--" ]; do
+        converged_cmd+=("$1")
+        shift
+    done
+    shift
+    local progress_cmd=("$@")
+
+    local waited=0 stalled=0 prev_progress="__wait_for_progress_unset__" cur_progress=""
+    while true; do
+        if "${converged_cmd[@]}"; then
+            log "${desc}: converged after ${waited}s"
+            return 0
+        fi
+        cur_progress="$("${progress_cmd[@]}")"
+        if [ "$cur_progress" != "$prev_progress" ]; then
+            log "${desc}: progress at ${waited}s (${cur_progress})"
+            stalled=0
+            prev_progress="$cur_progress"
+        else
+            stalled=$((stalled + interval))
+        fi
+        if [ "$waited" -ge "$hard_cap" ]; then
+            log "${desc}: TIMED OUT after ${waited}s (hard cap)"
+            return 1
+        fi
+        if [ "$stalled" -ge "$stall_secs" ]; then
+            log "${desc}: STALLED for ${stalled}s with no observable progress (${cur_progress}) — \
+giving up after ${waited}s total"
+            return 1
+        fi
+        sleep "$interval"
+        waited=$((waited + interval))
+    done
 }
 
 dynamo_call() {
@@ -726,31 +900,22 @@ if [ "$E2E_TLS" = "1" ]; then
     log "TLS e2e path: curl will dial https://${DYNAMO_HOST}:${DYNAMO_LOCAL_PORT} (dynamo) and https://${ADMIN_HOST}:${ADMIN_LOCAL_PORT} (admin) (--cacert ${CA_FILE})"
 fi
 
-phase "resolve which pod svc/${AC_NAME}-dynamo currently routes to"
+phase "resolve which pod svc/${AC_NAME}-dynamo currently routes to, and port-forward it directly"
 # `kubectl port-forward svc/...` resolves to exactly one backing pod for the
 # life of the forward — read that same resolution off the Service's own
 # Endpoints so the readiness check below and the actual wire calls are
 # guaranteed to hit the SAME pod, not merely "a" ready pod (issue #595: a
 # statefulset-wide 3/3 count says nothing about this one pod's own current
-# state a few seconds later).
-wait_for "svc/${AC_NAME}-dynamo has a resolved endpoint" 30 1 -- has_dynamo_endpoint
-DYNAMO_POD="$(dynamo_endpoint_pod)"
-[ -n "$DYNAMO_POD" ] || fail "could not resolve a pod backing svc/${AC_NAME}-dynamo"
-log "svc/${AC_NAME}-dynamo currently routes to pod ${DYNAMO_POD}"
-
-phase "port-forward that pod directly (dynamo + admin)"
-# Forwarding the POD (not the Service) on both its dynamo and admin ports in
-# one call is what lets the readiness check below and every subsequent
-# dynamo_call in this script provably hit the identical pod — every pod
-# binds the same numeric ports in the Kubernetes deployment shape (no
-# per-pod port striping, unlike the local-dev `--cluster N` shape), so this
-# is a straight substitution of `pod/${DYNAMO_POD}` for `svc/${AC_NAME}-dynamo`.
-kubectl port-forward "pod/${DYNAMO_POD}" -n "$NAMESPACE" \
-    "${DYNAMO_LOCAL_PORT}:${DYNAMO_REMOTE_PORT}" "${ADMIN_LOCAL_PORT}:${ADMIN_REMOTE_PORT}" \
-    >"$PORT_FORWARD_LOG" 2>&1 &
-PORT_FORWARD_PID=$!
-wait_for "dynamo port-forward listening" 30 1 -- port_forward_ready
-wait_for "admin port-forward listening" 30 1 -- admin_port_forward_ready
+# state a few seconds later). Forwarding the POD (not the Service) on both
+# its dynamo and admin ports in one call is what lets the readiness check
+# below and every subsequent dynamo_call in this script provably hit the
+# identical pod — every pod binds the same numeric ports in the Kubernetes
+# deployment shape (no per-pod port striping, unlike the local-dev
+# `--cluster N` shape), so this is a straight substitution of
+# `pod/${DYNAMO_POD}` for `svc/${AC_NAME}-dynamo`.
+# `fatal=1`: this one-shot setup fails the whole run if it can't resolve or
+# forward the pod (see `resolve_and_forward_dynamo_pod`'s own doc).
+resolve_and_forward_dynamo_pod 1
 
 phase "wait for that pod's own readiness (GET /admin/health == 200)"
 # Issue #595: the precondition the original one-shot CreateTable actually
@@ -892,7 +1057,57 @@ kubectl patch animuscluster "$AC_NAME" -n "$NAMESPACE" --type=merge -p '{"spec":
 # same as any other pod-template change. `GET /admin/control/members` is
 # served by any node (`admin.rs`'s own doc), so this can still be polled
 # through the pre-growth port-forward while that restart is in flight.
-wait_for "control group reports 4 voters" 300 5 -- control_voters_equals 4
+#
+# Issue #705: a flat 300s `wait_for` here previously ran into two separate
+# problems on separate real CI runs. (1) Run 34085241118 (this issue's own
+# job log): the newly-promoted ordinal-3 pod exited cleanly (exit 0) three
+# times over ~4 minutes before stabilizing — `wait_for_ctrl_c` in
+# `crates/animusd/src/main.rs` is the ONLY code path that returns `Ok(())`
+# from a running `animusd` process (every startup/runtime error instead
+# takes the `Err` path to a nonzero `ExitCode::FAILURE`), so a repeated
+# clean exit is necessarily SIGTERM-driven, not an application crash —
+# each restart genuinely delayed `advance_control_growth`'s own
+# `/admin/config` polling (REQUEUE_OK=30s cadence), landing the first
+# possible `member/add` call 2s after the flat deadline even though the
+# growth mechanism itself is healthy. (A stale-ConfigMap-volume read was
+# investigated and ruled out as the trigger: `entrypoint.sh` and
+# `cluster.json` are two keys of the SAME ConfigMap object, so they can
+# never be independently stale relative to each other, and even a
+# wholesale-stale mount would just re-run ordinal 3 in its own prior, known
+# -healthy `data` role — not explain a restart storm. The exact SIGTERM
+# source — kubelet's livenessProbe kill vs. something else — was NOT
+# pinned down; see this file's own root-cause note and part 2's diagnostics
+# additions above for what would confirm it on a recurrence.) (2) PR #703's
+# e2e-kind-encryption run (34100368447): the SAME wait_for polled through
+# the port-forward established *before* controlNodes was even patched —
+# the rolling restart recycled that pinned pod (e2e-2) at 08:33:05,
+# `kubectl port-forward pod/...` died silently, and the pre-#705
+# `control_voters_count` folded every subsequent connection failure into a
+# bare `0`, so the wait spun out its entire remaining budget reading a
+# false "0 voters" instead of noticing it had lost its connection.
+#
+# `wait_for_progress` (see its own doc above) addresses both: it keeps
+# waiting as long as ANY observable signal is still changing — the
+# promoted ordinal's own restart count/ready condition/phase (read
+# straight off the API server, so immune to problem (2)), or the live
+# voter count once reachable (`control_voters_reading` self-heals the
+# port-forward on a connection failure rather than reporting a false `0`,
+# addressing problem (2) directly) — and fails only after a genuine stall,
+# under a 600s hard ceiling so the job still cannot hang if growth is truly
+# stuck. Not applied to the earlier `nodes`/`readyReplicas` waits above (or
+# to any shrink path — this script has none; `controlNodes` decrease
+# rejection is unit-tested and, since S-07e, checked by the webhook e2e leg
+# via a rejected `kubectl patch`, never a wait_for loop): those poll purely
+# via `kubectl` (not the pinned port-forward, so problem (2) doesn't apply)
+# and don't trigger a pod-template-wide rolling restart the way a
+# `controlNodes` change does (so problem (1)'s restart-storm risk doesn't
+# apply either) — a plain `spec.nodes` scale-up only ever creates a
+# brand-new pod, never restarts an existing one (see
+# `crates/animus-operator/CLAUDE.md`'s own S-07d config-hash section).
+GROWTH_TARGET_ORDINAL=3
+wait_for_progress "control group reports 4 voters" 600 120 5 \
+    -- control_voters_equals 4 \
+    -- control_growth_progress_signal "$GROWTH_TARGET_ORDINAL"
 log "control group now reports 4 voters"
 
 phase "check the PodDisruptionBudget after controlNodes growth (S-07d)"
@@ -911,24 +1126,16 @@ log "PodDisruptionBudget ${AC_NAME}-pdb reports maxUnavailable=1 after growth"
 # script's port-forward targets (a `kubectl port-forward pod/...` dies the
 # moment that specific pod is deleted/recreated) — re-resolve and
 # re-forward the same way the original "resolve which pod .../wait for
-# readiness" phases did, rather than trusting the pre-growth forward is
-# still alive.
+# readiness" phase did, rather than trusting the pre-growth forward is
+# still alive. `control_voters_reading`'s own self-heal (issue #703) may
+# already have done this once during the wait above, but this phase's own
+# forward could just as easily have died again since — a fresh,
+# unconditional re-forward here (fatal=1: by this point growth already
+# converged, so a failure here is a real problem, not a transient miss) is
+# simpler than trying to reason about whether the self-heal's own forward
+# is still current.
 phase "re-resolve and re-forward the serving pod after controlNodes growth"
-if [ -n "$PORT_FORWARD_PID" ]; then
-    kill "$PORT_FORWARD_PID" >/dev/null 2>&1 || true
-    wait "$PORT_FORWARD_PID" 2>/dev/null || true
-    PORT_FORWARD_PID=""
-fi
-wait_for "svc/${AC_NAME}-dynamo has a resolved endpoint" 30 1 -- has_dynamo_endpoint
-DYNAMO_POD="$(dynamo_endpoint_pod)"
-[ -n "$DYNAMO_POD" ] || fail "could not resolve a pod backing svc/${AC_NAME}-dynamo after growth"
-log "svc/${AC_NAME}-dynamo now routes to pod ${DYNAMO_POD}"
-kubectl port-forward "pod/${DYNAMO_POD}" -n "$NAMESPACE" \
-    "${DYNAMO_LOCAL_PORT}:${DYNAMO_REMOTE_PORT}" "${ADMIN_LOCAL_PORT}:${ADMIN_REMOTE_PORT}" \
-    >"$PORT_FORWARD_LOG" 2>&1 &
-PORT_FORWARD_PID=$!
-wait_for "dynamo port-forward listening" 30 1 -- port_forward_ready
-wait_for "admin port-forward listening" 30 1 -- admin_port_forward_ready
+resolve_and_forward_dynamo_pod 1
 wait_for "pod ${DYNAMO_POD}'s /admin/health is 200" 60 2 -- admin_health_ready
 
 phase "GetItem still returns the item after controlNodes growth"
