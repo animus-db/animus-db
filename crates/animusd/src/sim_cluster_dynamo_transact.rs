@@ -924,7 +924,7 @@ fn run_coordinator_never_finished_past_prepare_recovers_atomically(seed: u64) {
 /// replays this scenario at a specific seed (repo convention; note the
 /// trailing `--ignored`, needed since both tests below are `#[ignore]`d).
 #[test]
-#[ignore = "FINDING (issue to be filed): ClientCtx::txn_recover's non-local grace-check \
+#[ignore = "FINDING, issue #737: ClientCtx::txn_recover's non-local grace-check \
             computes an elapsed near-zero duration instead of an absolute timestamp, so it \
             never passes and recovery declines forever when pushed from a node that is not \
             the anchor's own tablet leader — see this function's own doc for the full \
