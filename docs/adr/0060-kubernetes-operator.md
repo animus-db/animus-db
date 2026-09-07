@@ -1228,3 +1228,29 @@ forwarding the serving pod (the config-hash-triggered rolling restart may
 have recycled the one the script's port-forward was already attached to)
 before a final `GetItem` proves the DynamoDB wire still serves. No new CI
 job.
+
+## Amendment (2026-09-07): S-03 PR 3 — encryption-key `Secret` mount
+
+Closes `docs/roadmap.md`'s S-03 item ("operator key-secret mount"), the
+third and final PR of ADR 0069 (encryption at rest): `spec.
+encryptionKeySecretName: Option<String>` references a pre-existing,
+user-provisioned `Secret` (never one this operator creates or writes,
+mirroring `spec.tls.secretName`/`spec.s3.credentialsSecretName`'s own
+precedent) holding the raw AEAD key under one well-known data key,
+mounted read-only at a fixed path on every pod and threaded into every
+node's own generated `cluster.json` as `RoleAddrs::encryption_key_path`
+(ADR 0069 PR 1's own config-field hook) — the same "one shared `Secret`,
+one fixed mount-path-only `cluster.json` section on every node" shape
+`spec.tls` already established for `RoleAddrs.tls`. Full design, the
+data-key name, the live existence/data-key-presence check, and the
+config-hash interaction are in ADR 0069's own "As-built: PR 3" amendment
+(`docs/adr/0069-encryption-at-rest.md`) — this ADR gets only the
+one-paragraph pointer, per this file's own convention for `spec.tls`
+(ADR 0064) and `spec.s3` (ADR 0059) each getting their design written up
+in their *own* ADR and only a cross-reference here. `crates/
+animus-operator/CLAUDE.md` and `deploy/operator/README.md` carry the
+crate-local/deploy-facing detail; `docs/roadmap.md`'s S-03 section is
+marked complete, with the default `cluster` segment/backup store's own
+gap (issue #680) and ADR 0069's own per-node-flag reach gap (issue #676)
+named as the two open follow-ups, neither of which this PR's own scope
+(the operator's key-secret mount) could close on its own.

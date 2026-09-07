@@ -40,3 +40,12 @@ spec:
   # to persist.
   # backupStore: "fs:/var/lib/animus/backups"
   # segmentStore: "dir:/var/lib/animus/segments"
+  # Encryption at rest (ADR 0069, S-03 PR 3). Names a pre-existing Secret
+  # (same namespace) holding the raw 64-hex-character AEAD key under the
+  # single well-known data key "key" — generate one with:
+  #   openssl rand -hex 32 | kubectl create secret generic example-encryption-key \
+  #     --from-file=key=/dev/stdin
+  # This operator never generates, inspects, or stores the key itself, only
+  # mounts the named Secret read-only. No key rotation in v1: changing the
+  # Secret's own content under an unchanged name never rolls a pod.
+  # encryptionKeySecretName: example-encryption-key

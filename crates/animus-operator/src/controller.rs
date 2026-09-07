@@ -32,7 +32,8 @@ use crate::admin_client::{AdminAccessMode, AdminOps, RealAdminClient};
 use crate::cluster_api::{ClusterApi, RealClusterApi};
 use crate::crd::{
     AnimusCluster, AnimusClusterStatus, CONDITION_CONTROL_NODES_GROWING,
-    CONDITION_CONTROL_NODES_SHRINK_REJECTED, CONDITION_DRAIN_FAILED, CONDITION_S3_SPEC_INVALID,
+    CONDITION_CONTROL_NODES_SHRINK_REJECTED, CONDITION_DRAIN_FAILED,
+    CONDITION_ENCRYPTION_KEY_SECRET_INVALID, CONDITION_S3_SPEC_INVALID,
     CONDITION_SCALE_BELOW_CONTROL_NODES_REFUSED, CONDITION_STORE_SPEC_INVALID,
     CONDITION_TLS_SPEC_INVALID, ClusterCondition, ClusterPhase, ConditionStatus,
 };
@@ -639,6 +640,49 @@ async fn resolve_tls_ca<C: ClusterApi>(
     }
 }
 
+/// Live-checks `spec.encryptionKeySecretName` (ADR 0069, S-03 PR 3) against
+/// the API server: the named `Secret` must exist in `ns` and carry
+/// [`desired::cluster_config::ENCRYPTION_KEY_SECRET_DATA_KEY`] as one of its
+/// data keys. Returns `Ok(None)` when the reference is usable, `Ok(Some(
+/// message))` naming exactly what's wrong otherwise (never `Err` for a
+/// missing/malformed Secret — only a genuine API-server failure propagates
+/// as [`ReconcileError`]).
+///
+/// Unlike [`crate::crd::TlsSpec::validate`]/[`crate::crd::S3StoreSpec::
+/// validate`] (pure functions, no cluster access — `crd.rs`'s own "no
+/// admission webhook in v1" posture), this genuinely needs a live read: a
+/// Secret *reference*'s only checkable shape is its own presence (and, once
+/// present, its own data keys) in the cluster, neither of which the spec
+/// alone can ever say.
+async fn validate_encryption_key_secret<C: ClusterApi>(
+    cluster_api: &C,
+    ns: &str,
+    secret_name: &str,
+) -> Result<Option<String>, ReconcileError> {
+    let data_key = desired::cluster_config::ENCRYPTION_KEY_SECRET_DATA_KEY;
+    let secret = cluster_api.get_secret(ns, secret_name).await?;
+    Ok(match secret {
+        None => Some(format!(
+            "spec.encryptionKeySecretName names \"{secret_name}\", which does not exist in \
+             namespace \"{ns}\" — create it with a \"{data_key}\" data key holding the raw \
+             64-hex-character key (e.g. `openssl rand -hex 32 | kubectl create secret \
+             generic {secret_name} --from-file={data_key}=/dev/stdin`), or point at an \
+             existing one"
+        )),
+        Some(s) => {
+            let has_key = s.data.as_ref().is_some_and(|d| d.contains_key(data_key));
+            if has_key {
+                None
+            } else {
+                Some(format!(
+                    "Secret \"{secret_name}\" in namespace \"{ns}\" has no \"{data_key}\" data \
+                     key — the encryption key must be stored under that exact key"
+                ))
+            }
+        }
+    })
+}
+
 /// The admin base URL for pod ordinal `ordinal` of cluster `name` in
 /// namespace `ns` — the headless internal `Service`'s own per-pod DNS name.
 /// `tls`: whether the admin port speaks TLS (ADR 0064 commit 3, server-only
@@ -782,6 +826,39 @@ async fn reconcile<C: ClusterApi, A: AdminOps>(
     status
         .conditions
         .retain(|c| c.type_ != CONDITION_TLS_SPEC_INVALID);
+
+    // Validate `spec.encryptionKeySecretName` (ADR 0069, S-03 PR 3): unlike
+    // every check above, this one is LIVE (a Secret reference's only
+    // checkable shape is whether it actually exists — nothing in the spec
+    // itself can say). On failure this deliberately does NOT strip the
+    // field and reconcile the rest of the spec as if it were unset — see
+    // `CONDITION_ENCRYPTION_KEY_SECRET_INVALID`'s own doc for why that
+    // fallback would be actively dangerous here (it would regenerate a
+    // plaintext `cluster.json` for a cluster whose data directory may
+    // already be encrypted). The condition is purely informational; every
+    // other child still reconciles normally either way.
+    if let Some(secret_name) = &cluster.spec.encryption_key_secret_name {
+        match validate_encryption_key_secret(&ctx.cluster_api, &ns, secret_name).await? {
+            Some(e) => {
+                warn!(
+                    cluster = %name,
+                    secret = %secret_name,
+                    error = %e,
+                    "spec.encryptionKeySecretName is not usable yet"
+                );
+                set_condition(&mut status, CONDITION_ENCRYPTION_KEY_SECRET_INVALID, e);
+            }
+            None => {
+                status
+                    .conditions
+                    .retain(|c| c.type_ != CONDITION_ENCRYPTION_KEY_SECRET_INVALID);
+            }
+        }
+    } else {
+        status
+            .conditions
+            .retain(|c| c.type_ != CONDITION_ENCRYPTION_KEY_SECRET_INVALID);
+    }
 
     // Validate `spec.s3` (S-04 PR 3): same "no admission webhook in v1"
     // posture as `spec.tls` above — set a condition and reconcile the rest
@@ -2217,6 +2294,216 @@ mod tests {
                     .replacen("http://", "https://", 1),
             ]
         );
+    }
+
+    // --- spec.encryptionKeySecretName (ADR 0069, S-03 PR 3) ---------------
+
+    fn parsed_cluster_config(
+        cluster_api: &FakeClusterApi,
+        name: &str,
+    ) -> desired::cluster_config::ClusterConfig {
+        let cm = cluster_api
+            .configmap(&desired::config_map_name(name))
+            .expect("ConfigMap applied");
+        let json = cm
+            .data
+            .as_ref()
+            .unwrap()
+            .get(desired::cluster_config::CONFIG_FILE_NAME)
+            .unwrap();
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[tokio::test]
+    async fn reconcile_wires_encryption_key_path_when_secret_is_valid() {
+        use k8s_openapi::ByteString;
+        use k8s_openapi::api::core::v1::Secret;
+
+        let fake_cluster = FakeClusterApi::new();
+        fake_cluster.seed_secret(
+            "my-encryption-key",
+            Secret {
+                data: Some(BTreeMap::from([(
+                    desired::cluster_config::ENCRYPTION_KEY_SECRET_DATA_KEY.to_string(),
+                    ByteString(vec![0u8; 32]),
+                )])),
+                ..Default::default()
+            },
+        );
+        let ctx = make_ctx(fake_cluster, FakeAdminClient::new());
+
+        let mut cluster = test_cluster("demo", "ns1", 3, None);
+        cluster.spec.encryption_key_secret_name = Some("my-encryption-key".to_string());
+        let result = reconcile(Arc::new(cluster), Arc::clone(&ctx)).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+
+        let status = ctx.cluster_api.last_status().unwrap();
+        assert!(
+            !status
+                .conditions
+                .iter()
+                .any(|c| c.type_ == CONDITION_ENCRYPTION_KEY_SECRET_INVALID),
+            "{:?}",
+            status.conditions
+        );
+
+        let parsed = parsed_cluster_config(&ctx.cluster_api, "demo");
+        assert!(
+            parsed
+                .nodes
+                .iter()
+                .all(|n| n.encryption_key_path.as_deref() == Some("/etc/animus/encryption/key")),
+            "{parsed:?}"
+        );
+
+        // The StatefulSet's own pod template also carries the mount.
+        let sts = ctx
+            .cluster_api
+            .get_statefulset("ns1", "demo")
+            .await
+            .unwrap()
+            .expect("StatefulSet applied");
+        let pod_spec = sts.spec.unwrap().template.spec.unwrap();
+        assert!(
+            pod_spec
+                .volumes
+                .unwrap()
+                .iter()
+                .any(|v| v.name == "encryption-key"),
+            "encryption-key volume must be mounted once the secret is valid"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_sets_a_condition_when_encryption_key_secret_is_missing() {
+        let ctx = make_ctx(FakeClusterApi::new(), FakeAdminClient::new());
+
+        let mut cluster = test_cluster("demo", "ns1", 3, None);
+        cluster.spec.encryption_key_secret_name = Some("does-not-exist".to_string());
+        let result = reconcile(Arc::new(cluster), Arc::clone(&ctx)).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+
+        let status = ctx.cluster_api.last_status().unwrap();
+        let condition = status
+            .conditions
+            .iter()
+            .find(|c| c.type_ == CONDITION_ENCRYPTION_KEY_SECRET_INVALID)
+            .expect("condition set");
+        let message = condition.message.as_deref().unwrap_or_default();
+        assert!(message.contains("does-not-exist"), "{message}");
+        assert!(message.contains("does not exist"), "{message}");
+
+        // Deliberately NOT stripped: the desired state still carries the
+        // field (see the condition's own doc for why falling back to
+        // plaintext here would be actively dangerous, not merely inert).
+        let parsed = parsed_cluster_config(&ctx.cluster_api, "demo");
+        assert!(
+            parsed
+                .nodes
+                .iter()
+                .all(|n| n.encryption_key_path.as_deref() == Some("/etc/animus/encryption/key")),
+            "{parsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_sets_a_condition_when_encryption_key_secret_has_no_data_key() {
+        use k8s_openapi::api::core::v1::Secret;
+
+        let fake_cluster = FakeClusterApi::new();
+        fake_cluster.seed_secret(
+            "my-encryption-key",
+            Secret {
+                data: Some(BTreeMap::from([(
+                    "wrong-key".to_string(),
+                    k8s_openapi::ByteString(vec![0u8; 32]),
+                )])),
+                ..Default::default()
+            },
+        );
+        let ctx = make_ctx(fake_cluster, FakeAdminClient::new());
+
+        let mut cluster = test_cluster("demo", "ns1", 3, None);
+        cluster.spec.encryption_key_secret_name = Some("my-encryption-key".to_string());
+        let result = reconcile(Arc::new(cluster), Arc::clone(&ctx)).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+
+        let status = ctx.cluster_api.last_status().unwrap();
+        let condition = status
+            .conditions
+            .iter()
+            .find(|c| c.type_ == CONDITION_ENCRYPTION_KEY_SECRET_INVALID)
+            .expect("condition set");
+        let message = condition.message.as_deref().unwrap_or_default();
+        assert!(message.contains("my-encryption-key"), "{message}");
+        assert!(
+            message.contains(desired::cluster_config::ENCRYPTION_KEY_SECRET_DATA_KEY),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_clears_the_encryption_key_condition_once_the_secret_is_fixed() {
+        use k8s_openapi::ByteString;
+        use k8s_openapi::api::core::v1::Secret;
+
+        let fake_cluster = FakeClusterApi::new();
+        let ctx = make_ctx(fake_cluster, FakeAdminClient::new());
+
+        let mut cluster = test_cluster("demo", "ns1", 3, None);
+        cluster.spec.encryption_key_secret_name = Some("my-encryption-key".to_string());
+        reconcile(Arc::new(cluster.clone()), Arc::clone(&ctx))
+            .await
+            .unwrap();
+        assert!(
+            ctx.cluster_api
+                .last_status()
+                .unwrap()
+                .conditions
+                .iter()
+                .any(|c| c.type_ == CONDITION_ENCRYPTION_KEY_SECRET_INVALID)
+        );
+
+        ctx.cluster_api.seed_secret(
+            "my-encryption-key",
+            Secret {
+                data: Some(BTreeMap::from([(
+                    desired::cluster_config::ENCRYPTION_KEY_SECRET_DATA_KEY.to_string(),
+                    ByteString(vec![0u8; 32]),
+                )])),
+                ..Default::default()
+            },
+        );
+        reconcile(Arc::new(cluster), Arc::clone(&ctx))
+            .await
+            .unwrap();
+        assert!(
+            !ctx.cluster_api
+                .last_status()
+                .unwrap()
+                .conditions
+                .iter()
+                .any(|c| c.type_ == CONDITION_ENCRYPTION_KEY_SECRET_INVALID)
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_never_touches_encryption_key_when_secret_name_is_unset() {
+        let ctx = make_ctx(FakeClusterApi::new(), FakeAdminClient::new());
+        let cluster = test_cluster("demo", "ns1", 3, None);
+        let result = reconcile(Arc::new(cluster), Arc::clone(&ctx)).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+
+        assert!(
+            !ctx.cluster_api
+                .last_status()
+                .unwrap()
+                .conditions
+                .iter()
+                .any(|c| c.type_ == CONDITION_ENCRYPTION_KEY_SECRET_INVALID)
+        );
+        let parsed = parsed_cluster_config(&ctx.cluster_api, "demo");
+        assert!(parsed.nodes.iter().all(|n| n.encryption_key_path.is_none()));
     }
 
     // --- (7) spec.s3 (S-04 PR 3) ------------------------------------------

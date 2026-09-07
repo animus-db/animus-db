@@ -402,6 +402,45 @@ pub struct AnimusClusterSpec {
     /// `spec.s3.segmentStore`: set at most one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub segment_store: Option<String>,
+    /// Name of a pre-existing `Secret` (same namespace) holding the AEAD
+    /// data-at-rest encryption key (ADR 0069, S-03 PR 3) under one
+    /// well-known data key,
+    /// [`crate::desired::cluster_config::ENCRYPTION_KEY_SECRET_DATA_KEY`]
+    /// (`"key"`) — the 64-hex-character format `animus_env::EncryptionKey::
+    /// load_from_file` parses (`openssl rand -hex 32 > key.hex` generates
+    /// one). **This operator never generates, inspects, or stores key
+    /// material itself** — the Secret is entirely user-provisioned; see
+    /// `crate::controller`'s reconcile for the live existence/data-key
+    /// presence check surfaced as
+    /// [`CONDITION_ENCRYPTION_KEY_SECRET_INVALID`].
+    ///
+    /// Mounted read-only, `defaultMode` restricted, at
+    /// [`crate::desired::cluster_config::ENCRYPTION_KEY_MOUNT_DIR`] on
+    /// every pod (one shared Secret, the same idiom `tls`/
+    /// `dynamoAuthSecretName`/`s3` already use) and threaded into the
+    /// generated `cluster.json`'s `RoleAddrs::encryption_key_path` for
+    /// every node — mirroring `spec.tls`'s own `RoleAddrs.tls` wiring,
+    /// **never** an `--encryption-key` CLI flag: ADR 0069 PR 1's flag
+    /// reaches only `--config FILE --node I`/`--cluster N`, and the
+    /// config-file route this field uses already reaches every role this
+    /// operator's `entrypoint.sh` ever execs. `None` (default) leaves
+    /// every pod's data directory plaintext, byte-for-byte pre-S-03-PR-3
+    /// behavior.
+    ///
+    /// **No key rotation in v1** (ADR 0069's own stance — there is no
+    /// in-place re-encryption mechanism to roll a running pod *into*):
+    /// changing the Secret's own *content* under an unchanged name is
+    /// invisible to this field and to the config-hash restart annotation
+    /// (`desired::statefulset::RestartRelevantConfig`), so it never rolls
+    /// pods — correct, not a gap. Adding, removing, or pointing this field
+    /// at a *different* Secret name DOES roll every pod: the volume's own
+    /// presence/`secretName` is itself a `spec.template` change the
+    /// `StatefulSet` controller already diffs on its own, and this field's
+    /// own presence (not the secret name) is additionally baked into the
+    /// config-hash annotation so an add/remove is never missed even though
+    /// nothing else about the pod template would otherwise change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encryption_key_secret_name: Option<String>,
 }
 
 impl AnimusClusterSpec {
@@ -635,6 +674,32 @@ pub const CONDITION_S3_SPEC_INVALID: &str = "S3SpecInvalid";
 /// belongs in `spec.s3` instead, or a conflict with `spec.s3`'s own store
 /// field).
 pub const CONDITION_STORE_SPEC_INVALID: &str = "StoreSpecInvalid";
+/// Condition type name used when `spec.encryptionKeySecretName` (ADR 0069,
+/// S-03 PR 3) names a `Secret` that does not exist, or exists but has no
+/// [`crate::desired::cluster_config::ENCRYPTION_KEY_SECRET_DATA_KEY`] data
+/// key. **Checked live against the API server** (`crate::controller::
+/// validate_encryption_key_secret`) — unlike every other `*SpecInvalid`
+/// condition above, which is a pure syntactic check with no cluster access
+/// (`crd.rs`'s own "no admission webhook in v1" posture): a Secret
+/// *reference*'s only checkable shape is whether it actually exists, which
+/// the spec alone can never say.
+///
+/// **Deliberately does NOT strip the field for the reconcile it's raised
+/// in** (unlike `TlsSpecInvalid`/`S3SpecInvalid`/`StoreSpecInvalid`, whose
+/// own spec-*shape* errors are safe to fall back to "as if unset" — the
+/// spec itself is wrong, not a resource that merely hasn't shown up yet).
+/// Falling back to "as if unset" here would regenerate an unencrypted
+/// `cluster.json` for a cluster whose data directory may already be
+/// encrypted — which would roll every pod straight into ADR 0069's own
+/// loud "no key against an encrypted directory" startup refusal
+/// (`CrashLoopBackOff` with a clear, correct refusal in the pod's own
+/// logs — not silent data loss, but also not something this operator
+/// should ever *cause* on its own initiative). Leaving the spec's own
+/// still-Secret-name-referencing desired state in place instead means: a
+/// genuinely missing Secret leaves the pod `ContainerCreating` (harmless,
+/// self-healing the moment the Secret is created) rather than actively
+/// flipping the cluster to plaintext and back.
+pub const CONDITION_ENCRYPTION_KEY_SECRET_INVALID: &str = "EncryptionKeySecretInvalid";
 
 #[cfg(test)]
 mod tests {

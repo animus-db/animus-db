@@ -72,8 +72,8 @@ the still-true paragraph after the table.
 
 ### S-03 Encryption at rest
 
-- **Status: PR 1 and 2 of 3 landed** ([ADR 0069](adr/0069-encryption-at-rest.md),
-  2026-09-06) — key loading + a generic AEAD `Disk`-seam wrapper
+- **Status: complete — all 3 PRs landed** ([ADR 0069](adr/0069-encryption-at-rest.md),
+  PR 1/2 2026-09-06, PR 3 2026-09-07) — key loading + a generic AEAD `Disk`-seam wrapper
   (`EncryptedDisk<D: Disk, R: Rng>`/`EncryptedEnv<E: Env>`,
   `crates/animus-env/src/encrypted.rs`), a per-node `--encryption-key
   PATH`/`RoleAddrs::encryption_key_path` key file (the `--dynamo-auth`/
@@ -95,21 +95,35 @@ the still-true paragraph after the table.
   `animusd control`, `animusd data`, and `animusd join` do not yet accept
   the flag (a documented reach gap, the same shape several other per-node
   flags already have on those entry points).
-- **Still pending:**
-  - **The default replicated `cluster` segment/backup store is not covered
-    by PR 2** — its per-node local building block does its own raw
-    filesystem I/O outside the `Disk` seam, so PR 1 never touched it
-    either; only the `fs:`/`s3://` opt-in stores are sealed. Encrypting it
-    would mean widening `ClusterSegmentStore`'s own concrete type
+- **PR 3 — operator key-secret mount, landed 2026-09-07**:
+  `spec.encryptionKeySecretName: Option<String>` (`crates/animus-operator`)
+  names a pre-existing `Secret` holding the raw key under one well-known
+  data key (`"key"`), mounted read-only (`defaultMode` restricted) at
+  `/etc/animus/encryption` on every pod and threaded into every node's
+  `cluster.json` as `RoleAddrs::encryption_key_path` — mirroring
+  `spec.tls`'s own `RoleAddrs.tls` wiring. Checked live against the API
+  server (a `Secret` reference can't be validated from the spec alone,
+  unlike `spec.tls`/`spec.s3`); a missing/malformed `Secret` surfaces an
+  `EncryptionKeySecretInvalid` condition without stripping the field —
+  see ADR 0069's own "As-built: PR 3" amendment for why falling back to
+  "as if unset" here would be actively dangerous, not merely inert. No
+  key rotation support (matching ADR 0069's own v1 scope): the config-hash
+  restart annotation rolls pods on the field's *presence* changing, never
+  on the same-named `Secret`'s content changing. **S-03 is now complete.**
+- **Still open (tracked separately, neither closable from S-03's own
+  scope):**
+  - **Issue #680** — the default replicated `cluster` segment/backup store
+    is not covered by PR 2 — its per-node local building block does its
+    own raw filesystem I/O outside the `Disk` seam, so PR 1 never touched
+    it either; only the `fs:`/`s3://` opt-in stores are sealed. Encrypting
+    it would mean widening `ClusterSegmentStore`'s own concrete type
     parameter — a separate, structurally larger change than PR 2's own
     scope, tracked here rather than silently assumed done.
-  - **PR 3 — operator key-secret mount**: `crates/animus-operator` has no
-    `spec.encryptionKey`-shaped CRD field or Kubernetes `Secret` mount for
-    this key at all yet — every operator-deployed cluster runs unencrypted
-    regardless of what a hand-run `animusd` process could do with the flag.
-    `RoleAddrs::encryption_key_path` is the config-field hook this PR
-    would populate, the same way ADR 0064's `spec.tls` populates
-    `RoleAddrs::tls`.
+  - **Issue #676** — `animusd join`/`data --seed`/`--cluster-control`+
+    `--cluster-data` don't thread `--encryption-key` (among several other
+    per-node knobs) through to those entry points; a real gap for a
+    hand-run cluster using them, irrelevant to the operator (which never
+    generates those invocations).
 - **Tests (PR 1):** `crates/animus-sim/tests/encrypted_disk.rs` (14 direct
   unit tests over `SimEnv`); `crates/animus-storage/tests/
   lsm_crash_encrypted.rs` (the crash/fault corpus sibling of
@@ -132,13 +146,21 @@ the still-true paragraph after the table.
   `ProdEnv`, a real 2-node cluster, `CreateBackup` on node 0 →
   `RestoreTableFromBackup` on node 1 with the same key, plus both
   mismatch directions refused at node startup).
+- **Tests (PR 3):** unit tests over the operator's own fakes, mirroring the
+  `dynamo_auth`/`tls` precedents (`crates/animus-operator/src/desired/
+  cluster_config.rs`, `desired/statefulset.rs`, `controller.rs`); the
+  `scripts/e2e-kind.sh` `E2E_ENCRYPTION=1` leg
+  (`.github/workflows/e2e-kind.yml`'s `e2e-kind-encryption` job) — see
+  ADR 0069's "As-built: PR 3" amendment for the full list and its own
+  unverified-in-this-sandbox note.
 - **ADR:** [0069](adr/0069-encryption-at-rest.md) — seam choice, key
   management, threat model, the positional torn-tail-vs-corruption rule,
-  and (PR 2 amendment) the cluster-wide key-scope decision.
+  (PR 2 amendment) the cluster-wide key-scope decision, and (PR 3
+  amendment) the operator's CRD field shape, mount, and failure semantics.
 - **PRs:** (1) key loading + `Disk` wrapper for WAL/engine — **landed**;
   (2) `SegmentStore` — **landed**; (3) operator key secret mount —
-  pending. **Size:** XL (interacts with the `Disk` seam's fsync/durability
-  contract).
+  **landed 2026-09-07**. **Size:** XL (interacts with the `Disk` seam's
+  fsync/durability contract). **S-03 is complete.**
 
 ### S-07 Operator hardening (ADR 0060 deferred list)
 
@@ -269,7 +291,7 @@ wave are independent and can run in parallel.
 | 3 | *U-05, U-07, U-08(ii) landed 2026-09-06* | No ordering constraint remains |
 | 4 | *landed 2026-09-05* (S-02) | Highest blast radius (C-01 landed 2026-09-05 — see ADR 0054; S-01 landed 2026-09-05 — see ADR 0064; S-02 — see ADR 0066) |
 | 5 | *S-04, S-05, S-07b–d, C-02, C-05 all landed 2026-09-06* | S-05 strictly after S-04 |
-| 6 | *S-03 PR 1 and 2 landed 2026-09-06* (ADR 0069); S-03 PR 3, S-07e, W-07, C-03 | XL or gated on earlier waves (S-07e's webhook-TLS prerequisite is satisfied now that S-01 landed; no longer a hard gate, just unscheduled) |
+| 6 | *S-03 complete 2026-09-07 (all 3 PRs, ADR 0069)*; S-07e, W-07, C-03 | XL or gated on earlier waves (S-07e's webhook-TLS prerequisite is satisfied now that S-01 landed; no longer a hard gate, just unscheduled) |
 
 Open issues mapped: none left (#375 closed by W-01, #319 by W-05). Filed
 from wave 2's own findings: #590 (the operator still emits the deleted

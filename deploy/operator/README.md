@@ -234,6 +234,68 @@ credentials, so the pod's already-mounted data volume is all that's
 involved. Reaches only **combined-role pods**, the same pre-existing
 `animusd` gap `spec.s3` documents above.
 
+## Encryption at rest (ADR 0069, S-03 PR 3)
+
+`spec.encryptionKeySecretName` names a pre-existing `Secret` (same
+namespace) holding the AEAD data-at-rest encryption key `animusd` itself
+implements (ADR 0069, S-03 PR 1/2) — this operator only ever *mounts* it,
+the same "referenced, never created" idiom `spec.tls.secretName`/
+`spec.s3.credentialsSecretName` already use:
+
+```sh
+openssl rand -hex 32 | kubectl create secret generic my-encryption-key \
+  --from-file=key=/dev/stdin
+```
+
+```yaml
+spec:
+  encryptionKeySecretName: my-encryption-key
+```
+
+The Secret must carry the raw 64-hex-character key under the single
+well-known data key **`key`** — the operator never generates, reads, or
+validates the key's own bytes, only that this data key is present. It is
+mounted read-only, `defaultMode` restricted (world-readable, no write bit
+— this pod sets no `securityContext.fsGroup`, so the non-root `animus`
+container user still needs the "other" read bit to load it), at
+`/etc/animus/encryption/` on every pod, and every generated node's
+`cluster.json` gets `RoleAddrs.encryption_key_path` pointing at
+`/etc/animus/encryption/key` — mirroring `spec.tls`'s own
+`RoleAddrs.tls` wiring exactly, never a `--encryption-key` CLI flag.
+
+**Validated live, not just by shape**: since a `Secret` *reference* can't
+be checked from the spec alone, the controller reads it back through the
+Kubernetes API on every reconcile and sets an `EncryptionKeySecretInvalid`
+status condition naming exactly what's wrong if it doesn't exist yet or
+is missing the `key` data key. Unlike `TlsSpecInvalid`/`S3SpecInvalid`/
+`StoreSpecInvalid`, this check does **not** strip the field and fall back
+to "as if unset" — doing so would regenerate a plaintext `cluster.json`
+for a cluster whose data directory may already be encrypted, which would
+roll every pod straight into `animusd`'s own loud "no key against an
+encrypted directory" startup refusal. A genuinely missing `Secret`
+instead just leaves the pod `ContainerCreating` until it's created —
+harmless and self-healing.
+
+**No key rotation in v1** (ADR 0069's own stance — there is no in-place
+re-encryption mechanism): changing the `Secret`'s own *content* under an
+unchanged name never rolls any pod, by design — rotating means standing
+up a fresh, differently-keyed replica and letting Raft catch it up, then
+decommissioning the old one, the identical story `spec.tls`'s own
+"replace the replica, don't rotate in place" cert-rotation posture
+already tells. Adding, removing, or pointing this field at a *different*
+`Secret` name **does** roll every pod (a `spec.template` change either
+way — the volume's own presence/`secretName`, and, for add/remove, this
+field's own presence baked into the config-hash restart annotation).
+
+**Only the `fs:`/`s3://` opt-in backup/segment stores and per-node
+`Disk` files (WAL/engine data) are covered — the default replicated
+`cluster` store is not** (tracked as
+[issue #680](https://github.com/animus-db/animus-db/issues/680), a
+separate, larger change to `animus-cp-data`'s own `ClusterSegmentStore`,
+not something this operator's mount can influence either way). See ADR
+0069's "As-built: PR 3" amendment for the full design and its own
+threat-model/scope-cut notes.
+
 ## PodDisruptionBudget (S-07c)
 
 Every `AnimusCluster` gets a `{name}-pdb` `PodDisruptionBudget` selecting
@@ -291,6 +353,9 @@ applies to *any* config-affecting field, not just `controlNodes` —
 `spec.dynamoAuthSecretName`/`spec.quiesceAfterSecs`/`spec.autoSplitBytes`
 all now trigger a rolling restart when changed too, where they previously
 sat unapplied on already-running pods until an unrelated restart.
+`spec.encryptionKeySecretName` joins this list too (S-03 PR 3) — but only
+its own *presence* (add/remove), never a same-name content rotation; see
+the "Encryption at rest" section above.
 
 ## Testing
 

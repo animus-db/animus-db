@@ -114,6 +114,29 @@
 #                       end to end anywhere; treat a first real CI failure
 #                       on the `e2e-kind-s3` job as this leg finding its
 #                       first real bug.
+#   E2E_ENCRYPTION   - "1" adds an ADR 0069 S-03 PR 3 leg on top of the
+#                       plain-TCP path (mutually independent of E2E_TLS/
+#                       E2E_S3 — any combination may be set): creates a
+#                       `Secret` holding a freshly generated 64-hex-character
+#                       key under the operator's one well-known data key
+#                       (`crate::desired::cluster_config::
+#                       ENCRYPTION_KEY_SECRET_DATA_KEY`, `"key"`), sets
+#                       `spec.encryptionKeySecretName` on the AnimusCluster,
+#                       then — after the ordinary PutItem below — execs into
+#                       the serving pod and greps its own data directory
+#                       recursively for the plaintext item value written
+#                       earlier (must be ABSENT) and checks `GET
+#                       /admin/config` never contains the raw key hex either
+#                       (this operator never puts key material in the
+#                       generated `ConfigMap`, so this is a belt-and-
+#                       suspenders proof, not a documented risk). Default "0"
+#                       (unset) leaves the smoke byte-for-byte unchanged.
+#                       UNVERIFIED in this sandbox, same `CAP_SYS_RESOURCE`
+#                       reason `E2E_TLS`/`E2E_S3` are above — written
+#                       carefully and `bash -n`-checked, never run end to end
+#                       anywhere; treat a first real CI failure on the
+#                       `e2e-kind-encryption` job as this leg finding its
+#                       first real bug.
 #
 # Exit non-zero on any failure; a trap dumps cluster/operator diagnostics and
 # always tears down the kind cluster and background processes it started,
@@ -135,6 +158,8 @@ MINIO_ACCESS_KEY="e2eaccesskey"
 MINIO_SECRET_KEY="e2esecretkey123"
 S3_BUCKET="e2e-backups"
 S3_CREDS_SECRET_NAME="e2e-s3-creds"
+E2E_ENCRYPTION="${E2E_ENCRYPTION:-0}"
+ENCRYPTION_KEY_SECRET_NAME="e2e-encryption-key"
 
 CLUSTER_NAME="animus-e2e"
 NAMESPACE="animus-e2e"
@@ -382,6 +407,9 @@ phase "preflight"
 for bin in docker kind kubectl curl jq; do
     command -v "$bin" >/dev/null 2>&1 || fail "missing required tool: ${bin}"
 done
+if [ "$E2E_ENCRYPTION" = "1" ]; then
+    command -v openssl >/dev/null 2>&1 || fail "missing required tool: openssl (needed by E2E_ENCRYPTION=1)"
+fi
 log "repo root: ${REPO_ROOT}"
 log "workdir: ${WORKDIR}"
 log "ANIMUSD_IMAGE=${ANIMUSD_IMAGE} KIND_NODE_IMAGE=${KIND_NODE_IMAGE:-<default>}"
@@ -511,6 +539,23 @@ EOF
     allowInsecureHttp: true"
 fi
 
+ENCRYPTION_SPEC_YAML=""
+if [ "$E2E_ENCRYPTION" = "1" ]; then
+    phase "create the encryption key Secret (ADR 0069, S-03 PR 3)"
+    # A fresh 64-hex-character key, the exact format `animus_env::
+    # EncryptionKey::load_from_file` parses — this operator never generates
+    # or inspects the key itself, only mounts whatever's under the one
+    # well-known data key `crate::desired::cluster_config::
+    # ENCRYPTION_KEY_SECRET_DATA_KEY` ("key") names. Never logged or echoed
+    # anywhere below.
+    ENCRYPTION_KEY_HEX="$(openssl rand -hex 32)"
+    kubectl create secret generic "$ENCRYPTION_KEY_SECRET_NAME" -n "$NAMESPACE" \
+        --from-literal=key="$ENCRYPTION_KEY_HEX" \
+        --dry-run=client -o yaml | kubectl apply -f -
+
+    ENCRYPTION_SPEC_YAML="  encryptionKeySecretName: ${ENCRYPTION_KEY_SECRET_NAME}"
+fi
+
 phase "apply AnimusCluster"
 cat >"$MANIFEST_FILE" <<EOF
 apiVersion: animusdb.io/v1alpha1
@@ -532,6 +577,7 @@ spec:
   segmentStore: "dir:${DATA_MOUNT_DIR}/segments"
 ${TLS_SPEC_YAML}
 ${S3_SPEC_YAML}
+${ENCRYPTION_SPEC_YAML}
 EOF
 kubectl apply -f "$MANIFEST_FILE"
 kubectl get animuscluster "$AC_NAME" -n "$NAMESPACE" -o wide
@@ -723,6 +769,30 @@ BODY="$(dynamo_body "$RESULT")"
 NOTE="$(jq -r '.Item.note.S // empty' <<<"$BODY")"
 [ "$NOTE" = "hello from e2e" ] || fail "GetItem did not round-trip the item: ${BODY}"
 log "GetItem ok — item round-tripped"
+
+if [ "$E2E_ENCRYPTION" = "1" ]; then
+    phase "check the item's plaintext value is absent from the pod's own data directory"
+    # `grep -r` over the pod's own data volume (`spec.storage.ephemeral: true`
+    # here, but the same on-disk shape as a real PersistentVolumeClaim) — a
+    # plaintext write would land the note's exact bytes in an SSTable/WAL
+    # file somewhere under here (`animus-storage`'s `LsmEngine` applies no
+    # block compression), so finding it would mean the encryption wiring did
+    # nothing; finding NOTHING is the property this leg exists to prove.
+    if kubectl exec -n "$NAMESPACE" "$DYNAMO_POD" -- \
+        sh -c "grep -r -l 'hello from e2e' ${DATA_MOUNT_DIR}" >/dev/null 2>&1; then
+        fail "found the plaintext item value under ${DATA_MOUNT_DIR} in pod ${DYNAMO_POD} even \
+though spec.encryptionKeySecretName is set — the data directory is not actually sealed"
+    fi
+    log "plaintext item value not found under ${DATA_MOUNT_DIR} in pod ${DYNAMO_POD}"
+
+    phase "check GET /admin/config never exposes the encryption key material"
+    CONFIG_BODY="$(curl -sS -m 5 "${CURL_TLS_ARGS[@]}" \
+        "${ADMIN_SCHEME}://${ADMIN_HOST}:${ADMIN_LOCAL_PORT}/admin/config")"
+    if grep -qF "$ENCRYPTION_KEY_HEX" <<<"$CONFIG_BODY"; then
+        fail "GET /admin/config response contained the raw encryption key hex material"
+    fi
+    log "GET /admin/config does not expose the encryption key"
+fi
 
 phase "scale AnimusCluster to 4 nodes"
 kubectl patch animuscluster "$AC_NAME" -n "$NAMESPACE" --type=merge -p '{"spec":{"nodes":4}}'

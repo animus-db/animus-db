@@ -505,7 +505,12 @@
         DynamoDB port from anywhere; outbound, the cluster's own pods on the Raft/RPC ports
         plus DNS by default, and — only when an S3-compatible backup/segment store is
         configured (<code>spec.s3</code>) — that store's own endpoint port, scoped to an
-        explicit, operator-set CIDR list. The <code>PodDisruptionBudget</code>'s own
+        explicit, operator-set CIDR list. <code>spec.tls</code> turns TLS on for every port
+        the cluster binds (a pre-existing <code>Secret</code>, or one the operator asks
+        cert-manager to issue) and <code>spec.encryptionKeySecretName</code> mounts a
+        pre-existing <code>Secret</code> holding an encryption-at-rest key onto every
+        pod — both off by default, and neither generated or stored by the operator
+        itself. The <code>PodDisruptionBudget</code>'s own
         <code>maxUnavailable</code> is computed from the cluster's control-voter count and its
         (currently fixed) data-plane replication factor, never a constant and never
         user-overridable — a cluster too small to safely lose even one replica gets a budget

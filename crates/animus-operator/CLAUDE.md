@@ -65,9 +65,12 @@ binary for a build-time-only JSON shape. **Keeping that mirror in sync with
   - `configmap.rs`/`services.rs`/`statefulset.rs`/`networkpolicy.rs` — one
     builder module per child kind. `statefulset.rs` mounts `spec.tls`'s
     resolved `Secret` (ADR 0064 commit 3) read-only at `/etc/animus/tls`,
-    the same mount for either `TlsSpec` shape, and (S-04 PR 3)
-    `spec.s3.credentialsSecretName`'s `Secret` read-only at `/etc/animus/s3`
-    on every pod; `networkpolicy.rs` is unaffected by TLS (its own module
+    the same mount for either `TlsSpec` shape, (S-04 PR 3)
+    `spec.s3.credentialsSecretName`'s `Secret` read-only at `/etc/animus/s3`,
+    and (ADR 0069 S-03 PR 3)
+    `spec.encryptionKeySecretName`'s `Secret` read-only, `defaultMode`
+    restricted, at `ENCRYPTION_KEY_MOUNT_DIR` (`/etc/animus/encryption`),
+    all on every pod; `networkpolicy.rs` is unaffected by TLS (its own module
     doc explains why: TLS is a mode a port's listener can be configured
     into, not a change to which pods may reach which port) but **is**
     affected by `spec.s3` (S-04 PR 3) — see this file's own S3 section
@@ -547,6 +550,123 @@ with `allowInsecureHttp: true`, then exercises `CreateBackup`/
 `bash -n`-checked, never run end to end anywhere — treat a first real CI
 failure on the `e2e-kind-s3` job as this leg finding its first real bug.
 
+## Encryption at rest (ADR 0069, S-03 PR 3, closes `docs/roadmap.md`'s
+S-03 — S-03 is now complete)
+
+`AnimusClusterSpec.encryption_key_secret_name: Option<String>` (`crd.rs`)
+mirrors `dynamo_auth_secret_name`'s own flat-field shape (not `TlsSpec`'s
+nested two-shape one — there is no second way to *obtain* this key the
+way cert-manager offers a second way to *issue* a TLS cert, so a nested
+object would only add ceremony): names a pre-existing `Secret` (same
+namespace) this operator only ever mounts, **never** generates, inspects,
+or stores. The `Secret` must carry the raw key under one well-known data
+key, `desired::cluster_config::ENCRYPTION_KEY_SECRET_DATA_KEY` (`"key"`)
+— the 64-hex-character format `animus_env::EncryptionKey::
+load_from_file` parses.
+
+Downstream wiring, all mirroring `spec.tls`'s own precedent:
+
+- `desired::statefulset::build` mounts the `Secret` read-only at
+  `desired::cluster_config::ENCRYPTION_KEY_MOUNT_DIR`
+  (`/etc/animus/encryption`) on **every** pod regardless of role, with
+  `defaultMode: 0o444` (`desired::statefulset::
+  ENCRYPTION_KEY_SECRET_DEFAULT_MODE`) — world-readable, no write bit for
+  anyone. Tighter than `0o440`/`0o400` deliberately: this pod spec sets no
+  `securityContext.fsGroup`, and a `Secret` volume's files are owned
+  `root:root` by default, so dropping the "other" read bit would make the
+  key unreadable by the non-root `animus` user the `animusd` image runs
+  as (`Dockerfile`'s `USER animus:animus`).
+- `desired::cluster_config::build_cluster_config` gives every node's
+  `RoleAddrs` the identical `encryption_key_path`
+  (`desired::cluster_config::encryption_key_mount_path()` =
+  `/etc/animus/encryption/key`) when the field is set — the exact
+  `tls_section()` precedent (a fixed, mount-path-only value, identical
+  across every node by construction). **Never a `--encryption-key` CLI
+  flag** — every pod this operator generates already runs `--config`/
+  `data --config` against a `cluster.json` whose own node entry can carry
+  the field directly (ADR 0069 PR 1's own config-field hook), so the
+  config-file route was already complete for this operator's deployment
+  shape; emitting the flag on top would in fact be a hard `animusd`
+  startup error (the config file's own section and the flag both setting
+  it is refused, not silently reconciled — the same "one way, not both"
+  contract `--dynamo-auth`/`--quiesce-after` already document).
+- `desired::statefulset::RestartRelevantConfig` gained an
+  `encryption_key_path: Option<String>` field, `#[serde(skip_
+  serializing_if = "Option::is_none")]` — deliberately **not** `tls`'s own
+  always-serialize-as-`null` shape, so a spec with the field unset
+  (every cluster that predates this PR) serializes byte-identically to
+  before the field existed and the pinned config-hash fixture test needed
+  no literal update. Only the field's *presence* participates in the
+  hash (mapped to the one fixed mount path, never the `Secret`'s own
+  name) — adding/removing it rolls every pod (a running `animusd` reads
+  `RoleAddrs::encryption_key_path` once at boot, never live); renaming the
+  referenced `Secret` under an unchanged presence state rolls pods too,
+  but through the volume's own `secretName` diff, not through this hash
+  (mirrors `spec.tls`'s own secret-name-excluded reasoning exactly);
+  rotating the `Secret`'s own *content* under an unchanged name never
+  rolls anything, at either layer — correct, since ADR 0069 has no
+  in-place re-encryption mechanism to roll a pod *into*.
+
+**Validated live, unlike every other `*SpecInvalid` check in this
+crate — and deliberately NOT stripped on failure.**
+`crate::controller::validate_encryption_key_secret` reads the named
+`Secret` back through `ClusterApi::get_secret` on every reconcile (a
+`Secret` *reference*'s only checkable property is whether it actually
+exists, which the spec alone can never say — unlike `TlsSpec::validate`/
+`S3StoreSpec::validate`, pure functions with no cluster access) and sets
+`crd::CONDITION_ENCRYPTION_KEY_SECRET_INVALID` naming exactly what's
+wrong (missing entirely, or present without the `"key"` data key). Unlike
+`TlsSpecInvalid`/`S3SpecInvalid`/`StoreSpecInvalid` — each of which
+strips its own field and reconciles the rest of the spec as if it were
+unset — this check leaves `spec.encryptionKeySecretName` in place either
+way: falling back to "as if unset" would regenerate a plaintext
+`cluster.json` for a cluster whose data directory may already be
+encrypted, which (via the config-hash annotation) would roll every pod
+straight into ADR 0069's own loud "no key against an encrypted
+directory" startup refusal — a `CrashLoopBackOff` this operator would
+have actively caused, not merely failed to prevent. Leaving the spec's
+own still-referencing desired state in place instead means a genuinely
+missing `Secret` just leaves the pod `ContainerCreating` (harmless,
+self-healing once the `Secret` exists) with the condition explaining why.
+**Removing the field from an already-encrypted cluster is the symmetric,
+equally uncovered case** — the operator applies the edit as given (volume
+gone, `cluster.json` field gone, pods roll), and each restarted `animusd`
+hits PR 1's identical refusal on its own, at its own startup, the only
+place that mismatch can correctly be caught; the operator does not, and
+structurally cannot, second-guess an operator-authored spec edit here.
+
+**A documentation/code gap found, not fixed, while landing this PR**: ADR
+0069 states `/admin/config` reports `encryption_key_path` as a path
+string. Tracing `animusd::admin::config_view`/`AdminInfo` while grounding
+this PR found that field was never actually added there — `/admin/config`
+reports nothing about encryption at all today (the safer of the two
+possible drifts, but still a stale claim, not a security bug). Not fixed
+here (out of an operator-only PR's scope — see ADR 0069's own "As-built:
+PR 3" amendment for the full note); `scripts/e2e-kind.sh`'s own
+`E2E_ENCRYPTION=1` leg checks the actual invariant instead (the raw
+`/admin/config` response body never contains the key hex material),
+which holds regardless of whether a future PR adds that field.
+
+**`scripts/e2e-kind.sh`'s `E2E_ENCRYPTION=1` leg is UNVERIFIED in this
+sandbox** — same `CAP_SYS_RESOURCE` reason `E2E_TLS`/`E2E_S3`'s own legs
+are (see the e2e section below): creates the `Secret` (a freshly
+generated key via `openssl rand -hex 32`, never logged), sets
+`spec.encryptionKeySecretName`, then — after the ordinary PutItem/GetItem
+round trip — `kubectl exec`s into the serving pod and `grep -r`s its own
+data directory for the plaintext item value (must be absent) and checks
+`GET /admin/config`'s raw response body never contains the key hex.
+Written carefully and `bash -n`-checked, never run end to end anywhere —
+treat a first real CI failure on the `e2e-kind-encryption` job as this
+leg finding its first real bug.
+
+**No CRD field or code touches the default replicated `cluster` segment/
+backup store** — that gap (issue #680) sits entirely in `animus-cp-data`,
+outside anything this operator's mount could influence either way, and
+`issue #676` (several per-node flags, `--encryption-key` among them, not
+threaded through `animusd join`/`data --seed`/`--cluster-control`+
+`--cluster-data`) is likewise irrelevant to this operator, which never
+generates those invocations.
+
 ## PodDisruptionBudget (S-07c, closes `docs/roadmap.md`'s S-07 item c and
 this crate's own ADR 0060 deferred-list bullet)
 
@@ -705,16 +825,20 @@ use.
 ## Tests
 
 `cargo test -p animus-operator` — every `desired::*` builder module has its
-own `#[cfg(test)] mod tests` (208 tests total as of the 2026-09-06
-role-literal fix above):
+own `#[cfg(test)] mod tests` (234 lib unit tests as of S-03 PR 3, up from
+208 at the 2026-09-06 role-literal fix above):
 golden-JSON assertions for the `ClusterConfig`/`entrypoint.sh`
 `ConfigMap` contents (including the no-port-striding invariant, a
-scale-up byte-for-byte-preserves-existing-entries regression, and, since
-S-04 PR 3, the `--s3-credentials`-file-writing preamble/flags, and since
-S-07b, the non-S3 `backupStore`/`segmentStore` flag emission and its
-"whichever of `spec.s3` or the top-level field is set" precedence),
+scale-up byte-for-byte-preserves-existing-entries regression, since
+S-04 PR 3 the `--s3-credentials`-file-writing preamble/flags, since
+S-07b the non-S3 `backupStore`/`segmentStore` flag emission and its
+"whichever of `spec.s3` or the top-level field is set" precedence, and
+since S-03 PR 3 the `encryption_key_path` mount-path presence/identical-
+across-nodes/never-a-CLI-flag cases),
 `Service` port sets, `StatefulSet` probe paths/ports and ephemeral-vs-durable
-storage shape (plus the `spec.s3` `Secret` mount), `NetworkPolicy`
+storage shape (plus the `spec.s3` and, since S-03 PR 3, `spec.
+encryptionKeySecretName` `Secret` mounts — the latter's `defaultMode`
+restriction included), `NetworkPolicy`
 selector/ingress/egress rule structure (including the S-04 PR 3 egress
 additions: baseline intra+DNS on every cluster, an S3 rule only when
 `spec.s3` is set), and, since S-07c, `PodDisruptionBudget`
@@ -796,7 +920,17 @@ directly.
   a new accessor this PR added), and a scale-down transition
   (`nodes: 5` → `nodes: 2, controlNodes: 2`) recomputing `maxUnavailable`
   from the new desired spec rather than inheriting the prior shape's
-  looser value.
+  looser value; and, since S-03 PR 3, `spec.encryptionKeySecretName`: a
+  valid `Secret` (present, with the `"key"` data key) wires the mount and
+  `cluster.json` field with no `EncryptionKeySecretInvalid` condition; a
+  missing `Secret`, and one present but missing the data key, each
+  surface that condition naming the problem WITHOUT stripping the field
+  (`parsed_cluster_config`, a new test helper parsing the applied
+  `ConfigMap`'s `cluster.json` back into `desired::cluster_config::
+  ClusterConfig`, asserts every node still carries `encryption_key_path`
+  either way); the condition clears once the `Secret` is fixed on a later
+  reconcile; and a cluster with the field unset touches neither the
+  mount, the `cluster.json` field, nor the condition.
   **What this harness does not prove**: real
   `kube::Api` wire behavior against an actual API server (conflicts,
   admission, watch-driven requeue, real server-side-apply field-ownership
@@ -922,6 +1056,25 @@ unchanged. Independent of `E2E_TLS` — either, both, or neither may be set.
 `CAP_SYS_RESOURCE` reason as `E2E_TLS` above — written carefully and
 `bash -n`-checked but never run end to end anywhere; the first real
 `e2e-kind-s3` CI run is this leg's first real test.
+
+**`E2E_ENCRYPTION=1` (ADR 0069 S-03 PR 3, CI's own `e2e-kind-encryption`
+job) runs the same smoke plus a `spec.encryptionKeySecretName` leg**: no
+extra in-cluster dependency (unlike MinIO for `E2E_S3`) — creates the
+`Secret` (a freshly generated 64-hex-character key via `openssl rand
+-hex 32`, never logged anywhere in the script), sets `spec.
+encryptionKeySecretName` on the manifest, then — right after the ordinary
+`PutItem`/`GetItem` round trip, before the scale-up — `kubectl exec`s
+into the serving pod and `grep -r`s its own data directory for the
+plaintext item value written by `PutItem` (must be absent: `LsmEngine`
+applies no block compression, so a plaintext write would land those
+exact bytes in an SSTable/WAL file somewhere under `DATA_MOUNT_DIR`) and
+checks `GET /admin/config`'s raw response body never contains the key
+hex; the plain-TCP path (`E2E_ENCRYPTION` unset) is byte-for-byte
+unchanged. Independent of `E2E_TLS`/`E2E_S3` — any combination may be
+set. **UNVERIFIED in this repository's sandboxed dev environment**, same
+`CAP_SYS_RESOURCE` reason as `E2E_TLS`/`E2E_S3` above — written carefully
+and `bash -n`-checked but never run end to end anywhere; the first real
+`e2e-kind-encryption` CI run is this leg's first real test.
 
 **A sandboxed dev/build host can be structurally unable to run this at
 all — not a bug in this script or the operator.** `kind`'s own control

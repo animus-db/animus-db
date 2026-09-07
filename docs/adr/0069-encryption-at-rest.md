@@ -3,7 +3,8 @@
 - **Status:** Accepted — implemented (S-03 PR 1 of 3: key loading + the
   `Disk`-seam wrapper for WAL/engine files. PR 2 of 3 — `SegmentStore` —
   also implemented, see the 2026-09-06 "As-built: PR 2" amendment below.
-  PR 3 — operator key-secret mount — pending.)
+  PR 3 of 3 — operator key-secret mount — also implemented, see the
+  2026-09-07 "As-built: PR 3" amendment below. **S-03 is complete.**)
 - **Date:** 2026-09-06
 - **Origin:** `docs/roadmap.md`'s S-03 ("Encryption at rest")
 - **Depends on:** [ADR 0003](0003-deterministic-simulation.md) (the `Env`
@@ -420,9 +421,9 @@ once per node startup, never on the read/write hot path.
 - PR 2 (`SegmentStore`) is implemented (see the "As-built: PR 2" amendment
   below) for the `fs:`/`s3://` opt-in stores, under a cluster-wide (not
   per-node) key; the default replicated `cluster` store still writes
-  plaintext, a stated scope cut. PR 3 (operator key-secret mount) is not
-  yet implemented — the Kubernetes operator has no key-distribution
-  mechanism yet.
+  plaintext, a stated scope cut (tracked as issue #680). PR 3 (operator
+  key-secret mount) is implemented (see the "As-built: PR 3" amendment
+  below) — **S-03 is complete.**
 
 ## As-built: PR 2 (`SegmentStore`, 2026-09-06)
 
@@ -655,3 +656,212 @@ No key material appears in any log line, error message (every text above
 names only the mismatch, never key bytes), `/admin/config` dump (still
 only `encryption_key_path`, a path string), or operator ConfigMap. Nothing
 in this PR changes that surface.
+
+## As-built: PR 3 (operator key-secret mount, 2026-09-07)
+
+`crates/animus-operator`'s reconciler now mounts the cluster-wide key PR
+1/2 need onto every pod, closing S-03: `spec.encryptionKeySecretName:
+Option<String>` (`crd.rs`) names a pre-existing, user-provisioned
+`Secret` — the operator never generates, inspects, or stores key material
+itself, only mounts what's already there — mirroring the flat, single-
+field shape `spec.dynamoAuthSecretName` already uses (not the nested,
+two-shape `spec.tls`/`{secretName, certManager}` pattern: there is no
+second way to *obtain* this key the way cert-manager offers a second way
+to *issue* a TLS cert, so a nested object would only add ceremony).
+
+### Field shape and mount
+
+- **Data key**: exactly one well-known key, `"key"`
+  (`desired::cluster_config::ENCRYPTION_KEY_SECRET_DATA_KEY`) — the
+  `Secret` must carry the raw 64-hex-character key
+  (`animus_env::EncryptionKey::load_from_file`'s own format,
+  `openssl rand -hex 32`) under that name; any other keys in the `Secret`
+  are ignored.
+- **Mount path**: `/etc/animus/encryption`
+  (`desired::cluster_config::ENCRYPTION_KEY_MOUNT_DIR`), read-only, on
+  every pod regardless of role — both the combined and data branches of
+  `entrypoint.sh` reach a `--config`/`data --config` invocation, and
+  `RoleAddrs::encryption_key_path` is read identically by `Node::bind`/
+  `bind_control`/`bind_data` regardless of which one a given ordinal
+  execs. `defaultMode` is set to `0o444` (world-readable, no write bit
+  for anyone) rather than left at Kubernetes' own `0644` default or
+  tightened further to `0o440`/`0o400`: this pod spec sets no
+  `securityContext.fsGroup`, and a `Secret` volume's files are owned
+  `root:root` by default, so a mode that dropped the "other" read bit
+  would make the key unreadable by the non-root `animus` user the
+  `animusd` image runs as (`Dockerfile`'s `USER animus:animus`) — see
+  `desired::statefulset::ENCRYPTION_KEY_SECRET_DEFAULT_MODE`'s own doc
+  for the full reasoning.
+- **`cluster.json` wiring**: every node's `RoleAddrs` entry gets
+  `encryption_key_path: "/etc/animus/encryption/key"` when the field is
+  set — identical across every node by construction
+  (`desired::cluster_config::encryption_key_mount_path`), the exact
+  shape `spec.tls`'s own `tls_section()` already established for
+  `RoleAddrs.tls`. **Never a `--encryption-key` CLI flag**: PR 1's flag
+  reaches only `--config FILE --node I`/`--cluster N`, and every pod this
+  operator generates already runs `--config`/`data --config` against a
+  `cluster.json` whose own node entry can carry the field directly — the
+  config-file route was already the *complete* route for this operator's
+  own deployment shape, so there was never a reason to also emit the flag
+  (which would in fact be a hard `animusd` startup error on top of an
+  already-set config-file value, the identical "one way, not both"
+  contract `--dynamo-auth`/`--quiesce-after` document for themselves).
+
+### Failure semantics
+
+**A missing or malformed `Secret` is checked live, and does NOT strip the
+field.** Unlike `spec.tls`/`spec.s3`/`spec.backupStore`+`spec.
+segmentStore` — each a pure, spec-*shape* check with no cluster access,
+following this crate's own "no admission webhook in v1" posture — a
+`Secret` *reference*'s only checkable property is whether it actually
+exists, which needs a live read. `crate::controller::
+validate_encryption_key_secret` calls `ClusterApi::get_secret` on every
+reconcile and sets `EncryptionKeySecretInvalid`
+(`crd::CONDITION_ENCRYPTION_KEY_SECRET_INVALID`) naming exactly what's
+wrong (the `Secret` doesn't exist, or exists without the `"key"` data
+key) — but, deliberately, does **not** fall back to reconciling as if the
+field were unset, the way every other `*SpecInvalid` condition does.
+
+The reason is a real, not merely theoretical, hazard: falling back to
+"as if unset" would regenerate a plaintext `cluster.json` (no
+`encryption_key_path` on any node) for a cluster whose data directory may
+already be encrypted from an earlier, valid reconcile. Since the config-
+hash restart annotation rolls every pod the moment the field's own
+presence changes, that fallback would actively **cause** a rolling
+restart into PR 1's own loud "data directory is encrypted ... but no
+--encryption-key was given" refusal — a self-inflicted `CrashLoopBackOff`
+the operator itself triggered, worse than the alternative. Leaving the
+spec's own still-`Secret`-name-referencing desired state in place instead
+means: a genuinely missing `Secret` leaves the pod `ContainerCreating`
+(the volume can't mount) until it's created — harmless, and self-healing
+the moment it exists, with `EncryptionKeySecretInvalid` telling the
+operator why. A `Secret` that exists but lacks the `"key"` data key is
+the one case a live check can catch *before* it ever reaches a broken
+container (Kubernetes mounts whatever keys a `Secret` does have; a
+missing `key` file inside the mount would otherwise surface only as a
+plain "file not found" `animusd` startup error) — worth detecting up
+front even though the mount itself still isn't stripped.
+
+**Reversing the field** (removing `spec.encryptionKeySecretName` from an
+already-encrypted cluster) is symmetric and equally uncovered by any
+live check the operator can perform: the operator applies the spec as
+given — the volume disappears, `cluster.json` drops `encryption_key_path`
+on every node, the config-hash rolls every pod — and each restarted
+`animusd` process hits PR 1's identical refusal (no key against an
+already-encrypted directory) on its own, at its own startup, the correct
+and only place that mismatch can be caught. The operator does not, and
+structurally cannot, second-guess an operator-authored spec edit here;
+this is stated plainly rather than silently assumed safe.
+
+### Config-hash interaction (S-07d)
+
+`desired::statefulset::RestartRelevantConfig` gained an
+`encryption_key_path: Option<String>` field — `spec.tls`'s own precedent
+exactly: only the field's *presence* (mapped to the same fixed mount
+path every node gets, never the `Secret`'s own name) participates in the
+hash. Consequences, both deliberate:
+
+- **Adding or removing the field rolls every pod** — a running `animusd`
+  reads `RoleAddrs::encryption_key_path` once at boot and cannot pick it
+  up live, so this transition must trigger a restart, and does.
+- **Renaming the referenced `Secret` under an unchanged field-presence
+  state rolls every pod too — but not through this hash.** The mount
+  path (`/etc/animus/encryption/key`) never changes, so the hash is
+  unaffected by *which* `Secret` is named; the volume's own `secretName`
+  changing is itself already a `spec.template` diff the `StatefulSet`
+  controller catches on its own, the identical "let the thing that
+  actually changed be what triggers the diff" reasoning `spec.tls`'s own
+  hash-exclusion note gives.
+- **Rotating the `Secret`'s own content under an unchanged name never
+  rolls any pod, at either layer** — not through this hash (which never
+  reads `Secret` content, only the field's presence) and not through the
+  `StatefulSet`'s own template diff (the `Secret`'s *name* in the volume
+  spec is unchanged). This is correct, not a gap: ADR 0069 has no
+  in-place re-encryption mechanism to roll a pod *into*, so rotation
+  is out of scope in v1 and a restart-on-rotation would just be a
+  restart into a still-mismatched key.
+- The pinned config-hash regression test
+  (`desired::statefulset::tests::config_hash_pinned_for_a_fixed_
+  fixture`) is **unchanged in value** despite this field's addition —
+  `encryption_key_path` carries its own `#[serde(skip_serializing_if =
+  "Option::is_none")]`, so a spec with the field unset (every cluster
+  that predates this PR) serializes byte-identically to before the field
+  existed. This was a deliberate choice over `spec.tls`'s own
+  always-serialize-as-`null` shape: `tls`'s hash contribution was already
+  load-bearing for every deployed cluster by the time this field was
+  added, so giving the new field the identical treatment would have
+  forced a one-time upgrade-triggered restart on every cluster in
+  existence, encrypted or not, for no functional reason.
+
+### A documentation/code gap found, not fixed, while landing this PR
+
+PR 1's own "Key management and threat model" section (and this ADR's
+Consequences section) states `/admin/config` reports
+`encryption_key_path` "a path string, exactly the way `TlsSection`
+reports cert/key *paths*". **Tracing `animusd::admin::config_view`/
+`AdminInfo` while grounding this PR found that claim was never actually
+implemented** — `AdminInfo` has no `encryption_key_path` (or any
+encryption-related) field at all, so `/admin/config` reports nothing
+about encryption either way today. This is not a security regression
+(the safer direction — nothing leaks — happens to be what shipped) and
+this PR does not fix it, since doing so means touching `animusd`'s own
+`lib.rs`/`admin.rs`, outside an operator-only PR's scope; it is recorded
+here, plainly, per this repo's own discipline against a silently-stale
+claim, rather than propagated into this PR's own e2e assertions as if it
+were true. `scripts/e2e-kind.sh`'s own `E2E_ENCRYPTION=1` leg checks the
+*actual* invariant instead — that `GET /admin/config`'s response body
+never contains the raw key hex material, which holds regardless of
+whether a future PR adds the (safe, path-only) field this text describes.
+
+### e2e-kind leg
+
+`E2E_ENCRYPTION=1` (`.github/workflows/e2e-kind.yml`'s `e2e-kind-
+encryption` job) mirrors `E2E_TLS=1`/`E2E_S3=1`'s own shape: create the
+`Secret` (a freshly generated key via `openssl rand -hex 32`, never
+logged), set `spec.encryptionKeySecretName` on the manifest, drive the
+ordinary `CreateTable`/`PutItem`/`GetItem` sequence, then — the leg's own
+proof — `kubectl exec` into the serving pod and `grep -r` its data
+directory for the plaintext item value written by `PutItem` (must be
+absent) and check `GET /admin/config`'s raw response body never contains
+the key hex, before continuing into the existing scale-up/`controlNodes`-
+growth/delete phases unchanged. **UNVERIFIED in this repository's
+sandboxed dev environment**, the identical `CAP_SYS_RESOURCE` reason
+`E2E_TLS`/`E2E_S3` are — `kind` cannot come up here at all (see
+`crates/animus-operator/CLAUDE.md`'s e2e section), so this leg has been
+written carefully and `bash -n`-checked but never run end to end
+anywhere; treat a first real CI failure on the `e2e-kind-encryption` job
+as this leg finding its first real bug, not as this note being wrong.
+
+### Tests
+
+Unit, over the fakes, mirroring the `dynamo_auth`/`tls` precedents
+exactly: `desired::cluster_config::tests` (the mount path present/absent,
+identical across every node regardless of which `Secret` name is
+configured, and that `entrypoint.sh` never emits `--encryption-key`);
+`desired::statefulset::tests` (the volume/mount present/absent with the
+restricted `defaultMode`, and five config-hash cases — added, removed,
+unaffected by a rename, unaffected by an unrelated nodes-only scale, and
+the pinned fixture literal unchanged); `controller::tests` (the live
+Secret-existence/data-key check: wired correctly when valid, the
+`EncryptionKeySecretInvalid` condition set and the field NOT stripped
+when the `Secret` is missing or lacks the data key, the condition
+clearing once fixed, and the baseline "field unset touches nothing"
+case). `cargo test -p animus-operator` — 234 lib unit tests + 5 `main.rs`
+tests + the `crd_manifest_pinned` regression, all green.
+
+### What S-03 leaves open
+
+Two named, tracked follow-ups, neither closable from this PR's own
+scope:
+
+- **Issue #680** — the default replicated `cluster` segment/backup store
+  is still plaintext regardless of `spec.encryptionKeySecretName`; only
+  the `fs:`/`s3://` opt-in stores (PR 2) and per-node `Disk` files (PR 1)
+  are covered. Closing it means widening `ClusterSegmentStore`'s own
+  concrete type parameter in `animus-cp-data`, not anything this
+  operator's mount can influence.
+- **Issue #676** — `animusd join`/`data --seed`/`--cluster-control`+
+  `--cluster-data` don't thread several per-node knobs including (since
+  PR 1) `--encryption-key`; irrelevant to this operator (which never
+  generates those invocations) but a real gap for a hand-run cluster
+  using those entry points.

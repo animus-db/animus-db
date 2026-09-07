@@ -54,8 +54,8 @@ use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use serde::Serialize;
 
 use super::cluster_config::{
-    self, CONFIG_MOUNT_DIR, DATA_DIR, DYNAMO_AUTH_MOUNT_DIR, ENTRYPOINT_FILE_NAME, S3_MOUNT_DIR,
-    TLS_MOUNT_DIR,
+    self, CONFIG_MOUNT_DIR, DATA_DIR, DYNAMO_AUTH_MOUNT_DIR, ENCRYPTION_KEY_MOUNT_DIR,
+    ENTRYPOINT_FILE_NAME, S3_MOUNT_DIR, TLS_MOUNT_DIR,
 };
 use super::{
     common_labels, config_map_name, internal_service_name, owner_reference, selector_labels,
@@ -141,6 +141,18 @@ pub const CONFIG_HASH_ANNOTATION: &str = "animusdb.io/config-hash";
 ///   the readiness/liveness probe scheme via [`admin_probe`]) that the
 ///   `StatefulSet` controller diffs on its own, with no help from this
 ///   annotation needed.
+/// - `encryption_key_path`: whether `spec.encryptionKeySecretName` is set
+///   at all (ADR 0069, S-03 PR 3) — mirrors `tls` above exactly, including
+///   the same "secret *name* deliberately excluded" reasoning: renaming
+///   the referenced `Secret` already changes the volume's own `secretName`
+///   (a `spec.template` diff the `StatefulSet` controller catches on its
+///   own), while *adding or removing* the field changes whether
+///   `cluster.json` carries `RoleAddrs::encryption_key_path` at all —
+///   something a running `animusd` process reads once at boot and can
+///   never pick up live, so that transition must roll every pod. Rotating
+///   the Secret's own *content* under an unchanged name is invisible here
+///   by design: ADR 0069 has no re-encryption mechanism to roll a pod
+///   *into*, so a rotation must never trigger a restart on its own.
 ///
 /// **Out:** `spec.nodes`, and every `RoleAddrs` field
 /// [`cluster_config::build_cluster_config`] derives per-ordinal
@@ -151,6 +163,19 @@ struct RestartRelevantConfig {
     entrypoint_sh: String,
     cluster_settings: Option<cluster_config::ClusterSettings>,
     tls: Option<cluster_config::TlsSection>,
+    // `skip_serializing_if` here (unlike `tls`/`cluster_settings` above,
+    // which always serialize their `Option` as an explicit `null`) is
+    // deliberate: this field was added after `tls`'s own shape was
+    // already load-bearing for every deployed cluster's hash, so omitting
+    // it entirely when absent keeps a spec with no
+    // `encryptionKeySecretName` set producing the byte-identical JSON
+    // projection (and therefore hash) it did before this field existed —
+    // no upgrade-triggered restart for a cluster that never uses this
+    // feature. `tls`/`cluster_settings` don't get the same treatment
+    // retroactively: doing so now would itself change their hash
+    // contribution and cause the exact one-time restart this is avoiding.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    encryption_key_path: Option<String>,
 }
 
 fn restart_relevant_projection(spec: &AnimusClusterSpec) -> RestartRelevantConfig {
@@ -159,6 +184,10 @@ fn restart_relevant_projection(spec: &AnimusClusterSpec) -> RestartRelevantConfi
         entrypoint_sh: cluster_config::entrypoint_script(spec),
         cluster_settings: cluster_config::cluster_settings_or_none(spec),
         tls: spec.tls.as_ref().map(|_| cluster_config::tls_section()),
+        encryption_key_path: spec
+            .encryption_key_secret_name
+            .as_ref()
+            .map(|_| cluster_config::encryption_key_mount_path()),
     }
 }
 
@@ -201,6 +230,17 @@ const DATA_VOLUME: &str = "data";
 const DYNAMO_AUTH_VOLUME: &str = "dynamo-auth";
 const TLS_VOLUME: &str = "tls";
 const S3_VOLUME: &str = "s3";
+const ENCRYPTION_KEY_VOLUME: &str = "encryption-key";
+/// `defaultMode` for the encryption-key `Secret` volume (ADR 0069, S-03 PR
+/// 3): world-readable, no write bit for anyone — tighter than the
+/// Kubernetes default (`0644`, which grants the file owner write access
+/// nothing needs) while staying readable by the non-root `animus` user the
+/// `animusd` image runs as (see the root `Dockerfile`'s `USER animus:
+/// animus`). This pod spec sets no `securityContext.fsGroup`, so a mode
+/// that dropped the "other" read bit (e.g. `0440`) would make the file
+/// unreadable by that non-root UID — Kubernetes mounts a Secret's files
+/// owned `root:root` by default, and `animus` is neither.
+const ENCRYPTION_KEY_SECRET_DEFAULT_MODE: i32 = 0o444;
 
 /// `tls_enabled` mirrors `spec.tls.is_some()`: admin is server-only TLS
 /// (ADR 0064), so when it's on the probe's `GET /admin/health` must speak
@@ -356,6 +396,33 @@ pub fn build(cluster: &AnimusCluster, spec: &AnimusClusterSpec) -> StatefulSet {
         volume_mounts.push(VolumeMount {
             name: S3_VOLUME.to_string(),
             mount_path: S3_MOUNT_DIR.to_string(),
+            read_only: Some(true),
+            ..Default::default()
+        });
+    }
+
+    // ADR 0069 S-03 PR 3: `spec.encryptionKeySecretName`'s `Secret` — never
+    // created or written by this operator, only referenced, the same
+    // idiom `tls`/`dynamo-auth`/`s3` above already use — mounted read-only
+    // on every pod at a fixed path with a restricted `defaultMode` (see
+    // that constant's own doc). Every pod gets the mount regardless of
+    // role: both the combined and data branches of `entrypoint.sh` reach
+    // `--config`/`data --config`, and `RoleAddrs::encryption_key_path` is
+    // read the identical way by `Node::bind`/`bind_control`/`bind_data`
+    // regardless of which one a given ordinal execs.
+    if let Some(secret_name) = &spec.encryption_key_secret_name {
+        volumes.push(Volume {
+            name: ENCRYPTION_KEY_VOLUME.to_string(),
+            secret: Some(SecretVolumeSource {
+                secret_name: Some(secret_name.clone()),
+                default_mode: Some(ENCRYPTION_KEY_SECRET_DEFAULT_MODE),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        volume_mounts.push(VolumeMount {
+            name: ENCRYPTION_KEY_VOLUME.to_string(),
+            mount_path: ENCRYPTION_KEY_MOUNT_DIR.to_string(),
             read_only: Some(true),
             ..Default::default()
         });
@@ -761,6 +828,56 @@ mod tests {
         assert!(!pod_spec.volumes.unwrap().iter().any(|v| v.name == "s3"));
     }
 
+    // --- `encryptionKeySecretName` (ADR 0069, S-03 PR 3) -------------------
+
+    #[test]
+    fn encryption_key_secret_mounted_when_named() {
+        let mut cluster = test_cluster("c", "ns", 3, None);
+        cluster.spec.encryption_key_secret_name = Some("my-encryption-key".to_string());
+        let sts = build(&cluster, &cluster.spec);
+        let pod_spec = sts.spec.unwrap().template.spec.unwrap();
+        let vol = pod_spec
+            .volumes
+            .unwrap()
+            .into_iter()
+            .find(|v| v.name == "encryption-key")
+            .expect("encryption-key volume present");
+        let secret = vol
+            .secret
+            .expect("encryption-key volume is a Secret volume");
+        assert_eq!(secret.secret_name.as_deref(), Some("my-encryption-key"));
+        assert_eq!(
+            secret.default_mode,
+            Some(0o444),
+            "defaultMode must be restricted (no write bit) but still world-readable — this \
+             pod sets no securityContext.fsGroup, so the non-root `animus` container user \
+             needs the \"other\" read bit"
+        );
+        let mount = pod_spec.containers[0]
+            .volume_mounts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|m| m.name == "encryption-key")
+            .expect("encryption-key mount present");
+        assert_eq!(mount.mount_path, "/etc/animus/encryption");
+        assert_eq!(mount.read_only, Some(true));
+    }
+
+    #[test]
+    fn no_encryption_key_volume_when_secret_unset() {
+        let cluster = test_cluster("c", "ns", 3, None);
+        let sts = build(&cluster, &cluster.spec);
+        let pod_spec = sts.spec.unwrap().template.spec.unwrap();
+        assert!(
+            !pod_spec
+                .volumes
+                .unwrap()
+                .iter()
+                .any(|v| v.name == "encryption-key")
+        );
+    }
+
     #[test]
     fn probes_use_https_scheme_when_tls_set_secret_name_shape() {
         use crate::crd::TlsSpec;
@@ -967,6 +1084,55 @@ mod tests {
     }
 
     #[test]
+    fn config_hash_changes_when_encryption_key_secret_is_added() {
+        // ADR 0069 S-03 PR 3: adding the field changes whether
+        // `cluster.json` carries `RoleAddrs::encryption_key_path` at all —
+        // a running `animusd` process reads that once at boot and cannot
+        // pick it up live, so this must roll every pod.
+        let before = test_cluster("c", "ns", 3, None);
+        let mut after = before.clone();
+        after.spec.encryption_key_secret_name = Some("my-encryption-key".to_string());
+        assert_ne!(config_hash(&before), config_hash(&after));
+    }
+
+    #[test]
+    fn config_hash_changes_when_encryption_key_secret_is_removed() {
+        let mut before = test_cluster("c", "ns", 3, None);
+        before.spec.encryption_key_secret_name = Some("my-encryption-key".to_string());
+        let mut after = before.clone();
+        after.spec.encryption_key_secret_name = None;
+        assert_ne!(config_hash(&before), config_hash(&after));
+    }
+
+    #[test]
+    fn config_hash_unaffected_by_renaming_the_encryption_key_secret() {
+        // The mount path baked into cluster.json is fixed regardless of
+        // which Secret name is configured — renaming already changes the
+        // volume's own `secretName` (a `spec.template` diff the
+        // StatefulSet controller diffs on its own), so this hash need not
+        // (and must not) also change, mirroring `spec.tls`'s own secret-
+        // name-excluded precedent.
+        let mut a = test_cluster("c", "ns", 3, None);
+        a.spec.encryption_key_secret_name = Some("secret-a".to_string());
+        let mut b = a.clone();
+        b.spec.encryption_key_secret_name = Some("a-totally-different-secret-name".to_string());
+        assert_eq!(config_hash(&a), config_hash(&b));
+    }
+
+    #[test]
+    fn config_hash_is_unchanged_by_a_nodes_only_scale_up_with_encryption_key_set() {
+        // A rotation-adjacent sanity check: with the field already set, an
+        // ordinary nodes-only scale must still not roll pods — the same
+        // property `config_hash_is_unchanged_by_a_nodes_only_scale_up`
+        // proves for the baseline spec.
+        let mut before = test_cluster("c", "ns", 3, None);
+        before.spec.encryption_key_secret_name = Some("my-encryption-key".to_string());
+        let mut after = test_cluster("c", "ns", 4, None);
+        after.spec.encryption_key_secret_name = Some("my-encryption-key".to_string());
+        assert_eq!(config_hash(&before), config_hash(&after));
+    }
+
+    #[test]
     fn config_hash_pinned_for_a_fixed_fixture() {
         // Pins the hash *value*, not just its stability, so a change to the
         // hash function itself (algorithm, projection shape, or field
@@ -974,6 +1140,14 @@ mod tests {
         // silently rolling every cluster's pods on the next operator
         // release. If this test needs to change, the change is deliberate
         // — update the literal and say so in the commit body.
+        //
+        // Unchanged by ADR 0069 S-03 PR 3's `encryption_key_path` addition
+        // to `RestartRelevantConfig` — that field's own `serde(skip_
+        // serializing_if)` (see its doc) means a spec with no
+        // `encryptionKeySecretName` set (this fixture) serializes
+        // byte-identically to before the field existed, so no already-
+        // deployed cluster restarts on upgrade purely because this PR
+        // shipped.
         let cluster = test_cluster("c", "ns", 3, None);
         assert_eq!(config_hash(&cluster), "f5c65fc10dcc4e1c");
     }

@@ -20222,3 +20222,91 @@ a wrong answer about the intended property; it silently tests a
 completely different (and less interesting) one, namely "does setup
 itself tolerate this fault" — which may be worth its own cell, but is
 never a substitute for the property the test's name promises.
+
+## Adding a field to an always-`Some`-serialized hash-input struct rolls every deployed cluster's pods, even ones that never use the new feature — give the new field `skip_serializing_if`, not its predecessors (ADR 0069, S-03 PR 3, `desired::statefulset::RestartRelevantConfig`)
+
+`desired::statefulset::RestartRelevantConfig` (S-07d) is hashed
+(`restart_relevant_config_hash`, FNV-1a 64 over its JSON encoding) into a
+pod-template annotation that triggers a `StatefulSet` rolling restart the
+moment it changes. Its existing fields (`tls: Option<TlsSection>`,
+`cluster_settings: Option<ClusterSettings>`) have no `serde(
+skip_serializing_if)` at all — `None` always serializes as an explicit
+`"tls":null`. Adding `encryption_key_path: Option<String>` (S-03 PR 3) the
+same way would have meant every spec's JSON projection gained a new key —
+`"encryption_key_path":null` on every cluster that has never heard of
+`spec.encryptionKeySecretName` — changing the hash, and therefore rolling
+every already-deployed cluster's pods on the very next operator upgrade,
+for a feature those clusters don't use and nothing about their own config
+actually changed.
+
+**Fix**: give only the *new* field `#[serde(skip_serializing_if =
+"Option::is_none")]`. A spec with the field unset then serializes
+byte-identically to the pre-PR JSON shape (verified directly: the pinned
+`config_hash_pinned_for_a_fixed_fixture` literal needed no update),
+so the blast radius of the upgrade shrinks to exactly the clusters that
+actually set the new field — which is the only population for whom a
+restart is doing real work. Retrofitting the same attribute onto the
+*existing* fields (`tls`/`cluster_settings`) would itself change their
+hash contribution and cause the identical unwanted restart, so don't —
+the fix is additive-only, applied at the moment a field is introduced,
+never backfilled onto siblings whose hash contribution is already
+load-bearing for real clusters.
+
+**General form**: before adding a field to any struct whose serialized
+form feeds a change-detection hash with real infrastructure consequences
+(a pod restart, a cache invalidation, a re-sync), ask whether the struct's
+existing shape always serializes every field (no `skip_serializing_if`)
+or only present ones. In the "always" case, a plain new field changes the
+hash for *every* input, not just inputs that use the new feature — make
+the new field itself opt out of serialization when absent, so adopting a
+feature (not merely upgrading the tool that supports it) is what triggers
+the consequence.
+
+## A live (API-server) validation check on a `Secret` reference must not strip the field the way a pure spec-shape check does — "fall back to unset" can itself cause the outage the check exists to prevent (ADR 0069, S-03 PR 3, `animus-operator`)
+
+Every pre-existing `*SpecInvalid` condition in `animus-operator`'s
+reconciler (`TlsSpecInvalid`/`S3SpecInvalid`/`StoreSpecInvalid`) follows
+the same shape: a pure, no-cluster-access check on the spec's own fields
+(both/neither of two mutually exclusive shapes set, a malformed URI, an
+empty required string) finds a problem, sets a condition, and reconciles
+the *rest* of that pass with the offending field stripped to `None` — safe
+because the field's own value was never going to be usable regardless of
+what else is in the cluster.
+
+`spec.encryptionKeySecretName`'s own check (ADR 0069, S-03 PR 3) looks
+structurally identical — read a `Secret`, find it missing or malformed,
+set a condition — but copying the "strip and fall back" shape onto it
+would have been a real, self-inflicted hazard rather than a merely inert
+one. Unlike a malformed URI, "the named `Secret` doesn't exist *yet*" (or
+temporarily failed an API read) is not evidence the field's *value* is
+wrong — it's evidence a resource hasn't shown up, which is exactly the
+kind of transient condition a reconciler runs again in 30 seconds
+expecting to self-heal. Falling back to "as if unset" for that one pass
+would regenerate a `cluster.json` with no `encryption_key_path` on any
+node; since the field's presence is baked into the config-hash restart
+annotation, that fallback is not just informational, it is itself a
+`spec.template` change that rolls every pod straight into the underlying
+system's own loud refusal (an `animusd` process finding its data
+directory already marked encrypted with no key configured) — the operator
+would have manufactured the exact `CrashLoopBackOff` its own validation
+was trying to give the operator advance warning about, worse than doing
+nothing.
+
+**Fix**: this check sets the condition and leaves the spec's own,
+still-`Secret`-name-referencing value in place either way. A genuinely
+missing `Secret` then just leaves the pod's volume unable to mount
+(`ContainerCreating`, not a crash loop) until the `Secret` shows up —
+harmless, and self-healing without the operator having changed anything
+about the desired encryption state.
+
+**General form**: "strip the field and reconcile as if unset" is only a
+safe fallback when the field's *value itself* is what's wrong (a spec-shape
+error, checkable with no cluster access, where "unset" is a value the
+field could legitimately have held). It is the wrong fallback when the
+check is actually asking "does this external resource exist/look right
+*yet*" — there, "unset" is not a neutral default, it can be an active,
+consequential state change (here: flipping an encrypted cluster's own
+generated config back to plaintext) that the reconciler must never make on
+its own initiative just because a live read came back empty this once.
+Before copying an existing validate-and-strip pattern onto a new live
+check, ask which category the check actually falls into.
