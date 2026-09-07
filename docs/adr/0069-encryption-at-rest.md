@@ -1066,3 +1066,51 @@ other in-crate suite, none of which construct `SegmentStoreHandle::
 Cluster`/`BackupStoreHandle::Cluster` and so are unaffected by the type
 change, confirmed rather than assumed). `Cargo.lock` unchanged (no new
 dependency) — `cargo deny check` not required.
+
+## As-built: `--encryption-key` reach on `join`/`data --seed`/`control` (2026-09-07, issue #676)
+
+`--encryption-key PATH` was accepted only by `--config FILE --node I` and
+`--cluster N` (PR 1) — `animusd control`, `animusd join`, and `animusd
+data --seed` had no CLI flag for it at all, a documented reach gap named
+alongside several other per-node flags with the same shape at the time
+(`--tls-*`'s own precedent). Closed:
+
+- **`join`/`data --seed`**: both already build their own `RoleAddrs` ad hoc
+  (no config file on either path — the identical shape `--tls-*` already
+  has there), so the fix is purely a CLI-parser addition: `main.rs`'s
+  `run_join`/`run_data`'s `--seed` branch now parse `--encryption-key
+  PATH` and set `RoleAddrs::encryption_key_path` directly, with no "set
+  both ways" conflict to check (there is no second source on this path).
+  `Node::bind`/`Node::bind_data` already read that field unconditionally
+  (PR 1's own mechanism) — no `lib.rs` change was needed for this half at
+  all, only the CLI plumbing.
+- **`animusd control`**: gained `--encryption-key PATH`, merged onto
+  `config.nodes[index]` via `apply_encryption_key_flag` — the identical
+  per-node "flag and config both set it is a hard error" contract
+  `--config`/`--node`'s own combined-mode route already uses (the two
+  share the same helper function). `Node::bind_control` already loads
+  `RoleAddrs::encryption_key_path` into the system-keyspace engine's own
+  `ProdEnv::bind_with_tls_and_key` call (PR 1's own mechanism, unchanged) —
+  a control-only node's system-keyspace engine was always encryptable via
+  a config file's own `nodes[index].encryption_key_path` field; the gap
+  closed here is purely the CLI flag's own reach, not the mechanism.
+
+**`--cluster-control`+`--cluster-data` is unchanged, deliberately** — it
+still rejects `--encryption-key` outright (a loud `Err`), the same posture
+`--tls-*` already has on that in-process dev-only path: no per-node config
+entries exist there to apply the flag to, and silently downgrading a
+requested-encryption cluster to plaintext is a worse failure mode than an
+explicit rejection. `animusd data --config` also remains a gap — no CLI
+flag of its own yet (a config file's own `nodes[index].encryption_key_path`
+field still works there directly, unchanged).
+
+Regression: `crates/animusd/tests/join_data_seed_settings_reach.rs::
+join_threads_encryption_key` (mirrors `encryption_at_rest_e2e.rs`'s own
+plaintext-absence proof, scoped to the joined node's own directory —
+the base cluster stays unencrypted throughout, proving the key is
+genuinely per-node on this path, not cluster-wide); a parser-level unit
+test (`crates/animusd/src/main.rs`'s `tests` module,
+`run_control_parses_encryption_key_flag`) proves `control`'s parser
+recognizes the flag without needing a real bind. See
+`crates/animusd/CLAUDE.md`'s own `--encryption-key` CLI-reference entry
+for the current, complete per-entry-point enumeration.

@@ -1346,3 +1346,83 @@ async fn decommission_racing_a_tablet_split_converges_with_no_data_loss() {
     .await
     .expect("decommission_racing_a_tablet_split_converges_with_no_data_loss timed out");
 }
+
+// ---- 8. Issue #676: `--cluster-control`/`--cluster-data` threads
+// `--quiesce-after`/`--heartbeat-batch`/`--shared-wal` ----------------------
+
+/// The real-`ProdEnv` proof that `--quiesce-after` (and, by the identical
+/// wiring, `--heartbeat-batch`/`--shared-wal`) now reaches every data-role
+/// node `--cluster-control N --cluster-data M` stands up, not just
+/// `--config`/`--node` and `--cluster N` — via
+/// [`animusd::start_split_cluster_with_growth`], the exact function
+/// `main.rs`'s `run_in_process_split_cluster` calls, with the same
+/// non-default value that function's own CLI dispatch would resolve
+/// `--quiesce-after 11` to. Observed the same way
+/// `tests/admin_endpoint.rs`/`tests/dashboard_endpoint.rs` already prove it
+/// for the other two entry points: `GET /admin/config`'s `quiesce_after_ms`
+/// field on the DATA-role node (a control-only node has no data plane to
+/// quiesce at all — `quiesce_after_ms` is absent there regardless, per
+/// `animusd::config::ClusterSettings`'s own applicability table).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn cluster_control_data_threads_quiesce_after_to_admin_config() {
+    let dir = support::panic_safe_tempdir();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let nodes = loop {
+        match animusd::start_split_cluster_with_growth(
+            1,
+            1,
+            dir.path().join("attempt"),
+            "127.0.0.1".parse().unwrap(),
+            animusd::StorageBackend::Memory,
+            None,
+            animus_control::node::DEFAULT_ORPHAN_SWEEP_AFTER,
+            None,
+            None,
+            None,
+            Duration::from_secs(11),
+            animusd::DEFAULT_HEARTBEAT_BATCH,
+            animusd::DEFAULT_SHARED_WAL,
+        )
+        .await
+        {
+            Ok(nodes) => break nodes,
+            Err(e) => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "could not bring up the split cluster within the deadline: {e}"
+                );
+                sleep(Duration::from_millis(50)).await;
+            }
+        }
+    };
+    // `start_split_cluster_with_growth(1, 1, ..)`: node 0 is control-only,
+    // node 1 is data-only (see the function's own `control_n..total` split).
+    let (control_node, data_node) = (&nodes[0], &nodes[1]);
+
+    let (status, data_cfg) = admin(data_node.admin_addr(), "GET", "/admin/config", None).await;
+    assert_eq!(status, 200, "GET /admin/config (data) failed: {data_cfg}");
+    assert_eq!(
+        data_cfg["quiesce_after_ms"].as_u64(),
+        Some(11_000),
+        "quiesce_after_ms did not reflect --quiesce-after 11 threaded through \
+         --cluster-control/--cluster-data: {data_cfg}"
+    );
+
+    // A control-only node has no data plane to quiesce — the field stays
+    // structurally absent there regardless of the flag (see
+    // `animusd::config::ClusterSettings`'s own applicability table).
+    let (status, control_cfg) =
+        admin(control_node.admin_addr(), "GET", "/admin/config", None).await;
+    assert_eq!(
+        status, 200,
+        "GET /admin/config (control) failed: {control_cfg}"
+    );
+    assert!(
+        control_cfg["quiesce_after_ms"].is_null(),
+        "a control-only node's /admin/config must never report quiesce_after_ms: {control_cfg}"
+    );
+
+    for n in nodes {
+        n.shutdown_graceful().await;
+    }
+}

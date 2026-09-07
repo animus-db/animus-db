@@ -1784,9 +1784,16 @@ own Gotchas entry (grep "S-04 PR 2") for the full design. Needs
 `ClusterConfig` field) or the `ANIMUS_S3_ACCESS_KEY_ID`/
 `ANIMUS_S3_SECRET_ACCESS_KEY` environment variables; a plaintext
 `insecure_http=true` endpoint needs `--allow-insecure-s3` too unless it's
-loopback. Reaches `run` (`--config`/`--node` and `--cluster N`) and
-`run_control` — the same two entry points `--segment-store`/
-`--backup-store` themselves already reached before this PR.
+loopback. Reaches `run` (`--config`/`--node` and `--cluster N`),
+`run_control`, and — since issue #676 — `join` and `data --seed` too (the
+two real growth paths, threaded through `run_node_join_with_settings`/
+`run_node_data_join_with_settings`). **`--cluster-control`/`--cluster-data`
+and `data --config` remain a documented gap**: the former's
+`start_split_cluster_with_growth` hardcodes the default `Cluster` store for
+every data-role node it stands up (no CLI route at all on that dev-only
+path), and the latter has no `cluster_settings`-shaped route to either
+store the way it does for `quiesce_after_secs`/`heartbeat_batch`/
+`shared_wal`.
 
 **`--tls-cert PATH --tls-key PATH --tls-ca PATH` (ADR 0064, S-01 commit
 2)** — this **one process's own** TLS material: all three or none (the
@@ -1835,11 +1842,23 @@ uses). `--cluster N`: the same path applied to every generated node
 (`bind_cluster_with_advertise_host_and_key`) — each still writes to its
 own distinct data directory, so one shared key just means every node's
 disk is sealed under it. **Rejected outright** (a loud `Err`, matching
-`--tls-*`'s own posture) by `--cluster-control`/`--cluster-data`. **Not
-yet accepted** by `animusd control`, `animusd data --config`, `animusd
-data --seed`, or `animusd join` — a documented reach gap, the same shape
-several other per-node flags already have on those entry points (issue
-#676's own precedent). `Node::bind`/`bind_control`/`bind_data` each load
+`--tls-*`'s own posture) by `--cluster-control`/`--cluster-data` — that
+in-process dev path has no per-node config entries to apply the flag to,
+the same posture `--tls-*` already has there (unchanged by issue #676:
+"silently downgrading a requested-encryption cluster" is the identical
+worse-failure-mode argument that path's own TLS gate already makes).
+**Now also accepted by `animusd control`, `animusd join`, and `animusd
+data --seed` (issue #676)** — `control` merges it onto
+`config.nodes[index]` via `apply_encryption_key_flag`, identically to
+`--config`/`--node`'s own combined-mode route above; `join`/`data --seed`
+set `RoleAddrs::encryption_key_path` directly (no config file on either
+path to conflict-check against, the same shape `--tls-*` already has
+there). **`animusd data --config` remains a documented gap** — no CLI flag
+of its own for this knob yet, unlike `--quiesce-after`/`--heartbeat-batch`/
+`--shared-wal`'s S-06 `cluster_settings` route (a config file's own
+`nodes[index].encryption_key_path` field still works there directly, since
+`Node::bind_data` reads it the identical way `Node::bind`/`bind_control`
+do). `Node::bind`/`bind_control`/`bind_data` each load
 the key and call the new `ProdEnv::bind_with_tls_and_key` (`bind_with_
 tls`'s general form, `animus-env`) instead of `bind_with_tls` — the loud
 refusal (a key/directory mismatch in either direction) happens inside
@@ -3468,10 +3487,20 @@ crate's `CLAUDE.md`. This crate's own contribution:
   own doc and ADR 0048's Consequences section for the evidence behind this
   default and what was *not* separately validated (a large fleet under
   sustained mixed load with real inter-process latency) — a
-  maintainer-reviewable call, not a settled fact. Not yet wired for the
-  `--cluster-control`/`--cluster-data` split-deployment dev path or the
-  standalone `control`/`join` subcommands (documented gaps in `main.rs`'s
-  own module doc). **`animusd data --config` also reaches it now (S-06)** —
+  maintainer-reviewable call, not a settled fact. **Since issue #676, also
+  wired for `--cluster-control`/`--cluster-data`** (`run_in_process_split_
+  cluster` → `start_split_cluster_with_growth`, resolved to the identical
+  on-by-default value the two real deployment paths already used) **and for
+  `join`/`data --seed`** (`run_node_join_with_settings`/`run_node_data_
+  join_with_settings`, the widened siblings of `run_node_join`/
+  `run_node_data_join` — those two narrower functions keep their own
+  original arity and now default to the same on-by-default value
+  internally, so every existing caller, this crate's own test suite
+  included, picks up the fix with no signature change). The standalone
+  `control` subcommand still has no route to it (never a documented gap —
+  a control-only node has no data plane to quiesce at all, see
+  `animusd::config::ClusterSettings`'s own applicability table).
+  **`animusd data --config` also reaches it (S-06)** —
   `BoundDataNode::start_data_with_growth` gained its own `quiesce_after`
   parameter and `enable_quiescence` call (mirroring the combined-mode
   reconciler's), closing what used to be a hardcoded `Duration::ZERO` on
@@ -3539,26 +3568,25 @@ after `quiesce_after: Duration`:
   `false` is the opt-out). A CLI flag and the config section setting the
   same field is the identical "one way, not both" hard-error contract
   `resolve_cluster_settings` already enforces for every other knob there.
-- **Same documented gaps as `--quiesce-after`, at the identical call
-  sites, unaffected by the cutover** — these narrower wrappers hardcode
-  `false` directly rather than routing through `DEFAULT_HEARTBEAT_BATCH`,
-  the identical shape `--quiesce-after`'s own `Duration::ZERO` hardcodes at
-  these same sites (that flag's default-ON resolution lives only in
-  `quiesce_after_duration`, called at the two real deployment-path CLI
-  entry points, never at these narrower wrappers either):
-  `--cluster-control`/`--cluster-data` (the in-process split-cluster dev
-  path, `run_in_process_split_cluster` — hardcodes `false` at its
-  `start_data_with_growth` call), `join`/`data --seed` (same hardcode),
-  and every narrower test/convenience wrapper that doesn't expose every
-  knob its own widest sibling does (`run_node_with_streams_and_
-  quiesce_after`, `run_node_with_streams_and_pitr_snapshot_cadence`,
-  `run_node_with_streams_quiesce_and_backup_store`,
-  `start_cluster_with_quiesce_after`, `start_cluster_with_growth`, and
-  their own ancestors — each hardcodes `false` at its own call into a
-  batching-aware layer, with a comment pointing at the wider sibling that
-  does expose it). A test using one of these narrower wrappers gets
-  batching OFF regardless of this cutover — read the wrapper's own doc,
-  not this section, before assuming a test exercises the new default.
+- **Reaches every real deployment shape now (issue #676), same as
+  `--quiesce-after`** — `--cluster-control`/`--cluster-data`
+  (`run_in_process_split_cluster` → `start_split_cluster_with_growth`,
+  resolved to `DEFAULT_HEARTBEAT_BATCH` when the flag is omitted) and
+  `join`/`data --seed` (`run_node_join_with_settings`/`run_node_data_
+  join_with_settings`, with `run_node_join`/`run_node_data_join` keeping
+  their own arity and defaulting to `DEFAULT_HEARTBEAT_BATCH` internally —
+  the identical shape `--quiesce-after`'s own reach-gap closure uses).
+  **Every narrower test/convenience wrapper that doesn't expose every knob
+  its own widest sibling does still hardcodes `false`**, unaffected by this
+  closure (`run_node_with_streams_and_quiesce_after`, `run_node_with_
+  streams_and_pitr_snapshot_cadence`, `run_node_with_streams_quiesce_and_
+  backup_store`, `start_cluster_with_quiesce_after`,
+  `start_cluster_with_growth`, and their own ancestors — each hardcodes
+  `false` at its own call into a batching-aware layer, with a comment
+  pointing at the wider sibling that does expose it). A test using one of
+  these narrower wrappers gets batching OFF regardless of this cutover —
+  read the wrapper's own doc, not this section, before assuming a test
+  exercises the new default.
 - **No `/admin/config` field yet** (unlike `--quiesce-after`'s own
   `quiesce_after_ms`) — a deliberate scope cut, unchanged by the cutover,
   named here so it isn't mistaken for an oversight; a follow-up can add
@@ -3652,11 +3680,15 @@ existing trailing knobs:
   (`std::io::Error::other`), not a silent fallback to the per-group path —
   the flag means "use the shared file," and a node that can't open it has
   nothing safe to fall back to mid-recovery.
-- **Same documented gaps as `--heartbeat-batch`/`--quiesce-after`, at the
-  identical call sites, unaffected by the cutover**: `--cluster-control`/
-  `--cluster-data` (the in-process split-cluster dev path), `join`/`data
-  --seed`, and every narrower test/convenience wrapper that doesn't
-  expose every knob its own widest sibling does (the narrower
+- **Reaches every real deployment shape now (issue #676), same as
+  `--heartbeat-batch`/`--quiesce-after`**: `--cluster-control`/
+  `--cluster-data` (the in-process split-cluster dev path,
+  `start_split_cluster_with_growth`) and `join`/`data --seed`
+  (`run_node_join_with_settings`/`run_node_data_join_with_settings`, with
+  `run_node_join`/`run_node_data_join` keeping their own arity and
+  defaulting to `DEFAULT_SHARED_WAL` internally). **Every narrower test/
+  convenience wrapper that doesn't expose every knob its own widest sibling
+  does still hardcodes `false`**, unaffected by this closure (the narrower
   `start_cluster_with*` wrappers, `start_data_with_streams`, the narrower
   `run_node_with_streams_*` wrappers, `index_drain.rs`'s own in-crate
   bring-up helper, `run_node_data`/`run_node_data_with_streams`) all
@@ -4373,13 +4405,18 @@ ADR itself for the full design/rationale.
   `#[allow(dead_code)]`-marked — neither gained a caller in Train 2 either
   (`delete`, unlike the janitor's own `delete_local`, still has no recorded
   `replicas` list to call it with; restore never deletes anything).
-  `data --config`/`data --seed`/`join`/`--cluster-control`+`--cluster-data`
-  all default to `BackupStoreConfig::Cluster` internally — no CLI flag
-  reaches any of them, the identical documented gap `--segment-store` has
-  on those same entry points. **`animusd control` is the one exception
-  (W-10)**: `--segment-store`/`--backup-store` now thread through it
-  exactly as they do through `--config`/`--node` and `--cluster N`
-  (`main.rs`'s `run_control` → `run_node_control_with_stores`).
+  `data --config`/`--cluster-control`+`--cluster-data` still default to
+  `BackupStoreConfig::Cluster` internally — no CLI flag reaches either, the
+  identical documented gap `--segment-store` has on those same entry points
+  (`data --config` has no `cluster_settings`-shaped route to either store;
+  `--cluster-control`/`--cluster-data`'s `start_split_cluster_with_growth`
+  hardcodes the default for every data-role node it stands up). **`animusd
+  control` (W-10) and, since issue #676, `join`/`data --seed` are the
+  exceptions**: `--segment-store`/`--backup-store` now thread through all
+  three exactly as they do through `--config`/`--node` and `--cluster N`
+  (`main.rs`'s `run_control` → `run_node_control_with_stores`; `run_join`/
+  `run_data_join` → `run_node_join_with_settings`/`run_node_data_join_
+  with_settings`).
 - **Both stores gained a real S3 backend (S-04 PR 2, ADR 0059's 2026-09-06
   amendment)** — `SegmentStoreConfig`/`BackupStoreConfig` each gained an
   `S3(S3StoreConfig)` variant (`lib.rs`), selected by `--segment-store`/
@@ -4432,11 +4469,12 @@ ADR itself for the full design/rationale.
   error naming both sourcing options, never a panic; a process with
   neither store set to `s3://` never even attempts resolution's own
   fs/env reads to fail on. `--s3-credentials`/`--allow-insecure-s3` (next
-  paragraph) reach `run` (`--config`/`--node` and `--cluster N`) and
-  `run_control` — the same two entry points `--segment-store`/
-  `--backup-store` themselves reach; not `run_data`/`join`/
+  paragraph) reach `run` (`--config`/`--node` and `--cluster N`),
+  `run_control`, and — since issue #676 — `run_join`/`data --seed`'s own
+  `run_data` dispatch too, the identical set `--segment-store`/
+  `--backup-store` themselves now reach; not `data --config`/
   `--cluster-control`+`--cluster-data`, the identical documented gap those
-  two flags already have on those entry points.
+  two flags still have on those entry points.
 
   **The insecure-HTTP gate is enforced entirely inside `parse_s3_uri`,
   at parse time**: `endpoint`'s own `http://`/`https://` prefix must agree

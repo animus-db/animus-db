@@ -6829,6 +6829,38 @@ pub const DEFAULT_STREAM_RETENTION: Duration = Duration::from_secs(24 * 60 * 60)
 /// CLI (a test, or a future embedder).
 pub const MIN_QUIESCE_AFTER: Duration = index_drain::INDEX_DRAIN_INTERVAL;
 
+/// **Default ON** at 5 seconds when `--quiesce-after` (or
+/// `cluster_settings.quiesce_after_secs`) is omitted (ADR 0044 phase-1 PR7)
+/// — the single canonical value every real entry point resolves an omitted
+/// `--quiesce-after` to, `main`'s own `DEFAULT_QUIESCE_AFTER_SECS` included
+/// (a thin alias onto this constant, kept so that binary's own module doc's
+/// `main::DEFAULT_QUIESCE_AFTER_SECS`-named references stay accurate) and
+/// [`run_node_join`]/[`run_node_data_join`]'s own bare (no-settings)
+/// signatures (issue #676 — a bare `animusd join`/`animusd data --seed` now
+/// gets the identical on-by-default posture a bare `animusd --config` does).
+/// See `main.rs`'s own doc comment on its alias for the full evidence/
+/// rationale record.
+pub const DEFAULT_QUIESCE_AFTER_SECS: u64 = 5;
+
+/// **Default ON** when `--heartbeat-batch`/`--no-heartbeat-batch` (or
+/// `cluster_settings.heartbeat_batch`) is omitted (ADR 0044 phase 2's
+/// cutover, C-02 PR 3) — the single canonical value every real entry point
+/// resolves an omitted heartbeat-batch setting to, `main`'s own
+/// `DEFAULT_HEARTBEAT_BATCH` included (a thin alias onto this constant) and
+/// [`run_node_join`]/[`run_node_data_join`]'s own bare signatures (issue
+/// #676). See `main.rs`'s own doc comment on its alias for the full
+/// evidence/rationale record.
+pub const DEFAULT_HEARTBEAT_BATCH: bool = true;
+
+/// **Default ON** when `--shared-wal`/`--no-shared-wal` (or
+/// `cluster_settings.shared_wal`) is omitted (ADR 0028, C-05 PR 3's cutover)
+/// — the single canonical value every real entry point resolves an omitted
+/// shared-WAL setting to, `main`'s own `DEFAULT_SHARED_WAL` included (a thin
+/// alias onto this constant) and [`run_node_join`]/[`run_node_data_join`]'s
+/// own bare signatures (issue #676). See `main.rs`'s own doc comment on its
+/// alias for the full evidence/rationale record.
+pub const DEFAULT_SHARED_WAL: bool = true;
+
 /// The **default** [`ClusterSegmentStore`](animus_cp_data::
 /// cluster_segment_store::ClusterSegmentStore)'s own per-node local
 /// building block (ADR 0069 "As-built: cluster store" amendment, closing
@@ -12839,6 +12871,19 @@ pub async fn start_split_cluster_with_orphan_sweep_after(
         None,
         None,
         None,
+        // Kept at the pre-issue-#676 off/unbatched/per-group defaults — the
+        // same "narrower wrapper stays at its own original semantics"
+        // convention every other layered knob in this file already uses
+        // (`start_with_streams`'s identical hardcoded trio calling into
+        // `start_with_growth`). `run_in_process_split_cluster` (the real
+        // `--cluster-control`/`--cluster-data` CLI path) calls
+        // `start_split_cluster_with_growth` directly with the resolved
+        // `DEFAULT_QUIESCE_AFTER_SECS`/`DEFAULT_HEARTBEAT_BATCH`/
+        // `DEFAULT_SHARED_WAL` values instead of going through this
+        // narrower, test-facing wrapper.
+        Duration::ZERO,
+        false,
+        false,
     )
     .await
 }
@@ -12848,6 +12893,20 @@ pub async fn start_split_cluster_with_orphan_sweep_after(
 /// every data-role node — see [`BoundNode::start_with_growth`]'s doc for
 /// the full design. `--cluster-control`/`--cluster-data`'s
 /// `--auto-split-change-rate RATE` CLI flag threads through here.
+///
+/// `quiesce_after`/`heartbeat_batch`/`shared_wal` (issue #676) are the same
+/// trailing data-plane knobs `BoundDataNode::start_data_with_growth` itself
+/// takes, applied uniformly to every data-role node this split-cluster dev
+/// path stands up — `run_in_process_split_cluster` (this crate's `--cluster
+/// -control`/`--cluster-data` CLI dispatch) resolves an omitted
+/// `--quiesce-after`/`--heartbeat-batch`/`--shared-wal` to
+/// [`DEFAULT_QUIESCE_AFTER_SECS`]/[`DEFAULT_HEARTBEAT_BATCH`]/
+/// [`DEFAULT_SHARED_WAL`] before calling here, the identical on-by-default
+/// posture `--config`/`--cluster N` already have; every existing caller
+/// through [`start_split_cluster_with_orphan_sweep_after`] (this crate's own
+/// `cluster_split.rs` test suite included) keeps getting the pre-#676
+/// off/unbatched/per-group-WAL values unchanged (that narrower wrapper
+/// hardcodes them — see its own call site's doc).
 ///
 /// # Errors
 /// As [`start_split_cluster_with`].
@@ -12863,6 +12922,9 @@ pub async fn start_split_cluster_with_growth(
     auto_split_change_rate: Option<u64>,
     auto_split_ops_rate: Option<u64>,
     dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
+    quiesce_after: Duration,
+    heartbeat_batch: bool,
+    shared_wal: bool,
 ) -> std::io::Result<Vec<Node>> {
     let dir = dir.into();
     let total = control_n + data_n;
@@ -13012,21 +13074,22 @@ pub async fn start_split_cluster_with_growth(
                 SegmentStoreConfig::default(),
                 auto_split_change_rate,
                 auto_split_ops_rate,
-                // `--quiesce-after` doesn't thread through the
-                // `--cluster-control`/`--cluster-data` dev path yet — the
-                // same documented gap `run`'s own module doc names (S-06
-                // scoped only the three real deployment paths).
-                Duration::ZERO,
-                // `--heartbeat-batch` has the identical documented gap here.
-                false,
+                // `--quiesce-after`/`--heartbeat-batch`/`--shared-wal` now
+                // thread through the `--cluster-control`/`--cluster-data`
+                // dev path too (issue #676) — resolved by the caller
+                // (`run_in_process_split_cluster`) the identical
+                // `DEFAULT_QUIESCE_AFTER_SECS`/`DEFAULT_HEARTBEAT_BATCH`/
+                // `DEFAULT_SHARED_WAL` way an omitted `--config`/`--cluster
+                // N` flag already resolves.
+                quiesce_after,
+                heartbeat_batch,
                 dynamo_auth.clone(),
                 BackupStoreConfig::default(),
                 None,
                 None,
                 None,
                 None,
-                // `--shared-wal` has the identical documented gap here.
-                false,
+                shared_wal,
             )
             .await?,
         );
@@ -14157,6 +14220,64 @@ pub async fn run_node_join(
     backend: StorageBackend,
     labels: BTreeMap<String, String>,
 ) -> std::io::Result<Node> {
+    run_node_join_with_settings(
+        seeds,
+        id,
+        addrs,
+        dir,
+        backend,
+        labels,
+        Duration::from_secs(DEFAULT_QUIESCE_AFTER_SECS),
+        DEFAULT_HEARTBEAT_BATCH,
+        DEFAULT_SHARED_WAL,
+        SegmentStoreConfig::default(),
+        BackupStoreConfig::default(),
+    )
+    .await
+}
+
+/// [`run_node_join`], widened with every per-node data-plane knob
+/// `--config FILE --node I` already resolves (issue #676) — `quiesce_after`/
+/// `heartbeat_batch`/`shared_wal` (each defaulted the identical
+/// [`DEFAULT_QUIESCE_AFTER_SECS`]/[`DEFAULT_HEARTBEAT_BATCH`]/
+/// [`DEFAULT_SHARED_WAL`] way an omitted `--quiesce-after`/
+/// `--heartbeat-batch`/`--shared-wal` already does on that entry point) and
+/// `segment_store_config`/`backup_store_config` (each defaulting to the
+/// same [`SegmentStoreConfig::default`]/[`BackupStoreConfig::default`]
+/// `Cluster` store an omitted `--segment-store`/`--backup-store` already
+/// resolves to). [`run_node_join`] itself is kept at its own original arity
+/// (the layered-wrapper convention the S-06/C-02/C-05 knobs already
+/// established — see this file's own doc comment on that precedent) and is
+/// now a thin default-resolving call into this function, so every existing
+/// caller (this crate's own test suite included) keeps compiling and now
+/// observes the identical on-by-default posture `--config`/`--cluster N`
+/// already have, closing the surprise issue #676 names (a `join`ed node
+/// silently writing the per-group WAL layout while the rest of the cluster
+/// defaults to the shared one).
+///
+/// `main::run_join` (the CLI's own `join` subcommand) is this function's one
+/// real caller with non-default settings, resolving `--quiesce-after`/
+/// `--heartbeat-batch`/`--no-heartbeat-batch`/`--shared-wal`/
+/// `--no-shared-wal`/`--segment-store`/`--backup-store` exactly like `run`'s
+/// own `--config`/`--node` dispatch does — there is no config file on this
+/// join path to conflict-check a CLI flag against (S-06's "one way, not
+/// both" hard error is a `--config`/`data --config`-only concern), so every
+/// flag here simply sets the value directly, the same shape
+/// `--tls-cert`/`--encryption-key` already have on this path.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_node_join_with_settings(
+    seeds: Vec<String>,
+    id: Option<NodeId>,
+    addrs: RoleAddrs,
+    dir: &Path,
+    backend: StorageBackend,
+    labels: BTreeMap<String, String>,
+    quiesce_after: Duration,
+    heartbeat_batch: bool,
+    shared_wal: bool,
+    segment_store_config: SegmentStoreConfig,
+    backup_store_config: BackupStoreConfig,
+) -> std::io::Result<Node> {
     if seeds.is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -14192,6 +14313,11 @@ pub async fn run_node_join(
         intra_route,
         admin_addrs,
         backend,
+        quiesce_after,
+        heartbeat_batch,
+        shared_wal,
+        segment_store_config,
+        backup_store_config,
     )
     .await
 }
@@ -14221,6 +14347,11 @@ async fn finish_combined_join(
     mut intra_route: BTreeMap<NodeId, String>,
     mut admin_addrs: Vec<SocketAddr>,
     backend: StorageBackend,
+    quiesce_after: Duration,
+    heartbeat_batch: bool,
+    shared_wal: bool,
+    segment_store_config: SegmentStoreConfig,
+    backup_store_config: BackupStoreConfig,
 ) -> std::io::Result<Node> {
     for (id, addr) in bound.peer_entries() {
         peers.insert(id, addr);
@@ -14240,8 +14371,17 @@ async fn finish_combined_join(
     }
 
     let data_ids: Vec<NodeId> = original_control_ids.clone();
+    // Widened onto `start_with_growth` directly (issue #676) — the same
+    // fully-featured layer `run_single`/`run_in_process_cluster` already
+    // call, rather than the narrower `start_with` this used to hardcode
+    // through (which silently ate every knob below `orphan_sweep_after`).
+    // Every trailing knob this join path still doesn't expose a CLI flag
+    // for (`auto_split_change_rate`/`auto_split_ops_rate`, `dynamo_auth`,
+    // `pitr_snapshot_cadence`, `throttle_*`, `tablet_max_*`, `export_s3`)
+    // stays at its own byte-identical documented default — a genuinely
+    // separate, still-open gap from the one this change closes.
     bound
-        .start_with(
+        .start_with_growth(
             peers,
             original_control_ids,
             data_ids,
@@ -14252,6 +14392,23 @@ async fn finish_combined_join(
             None,
             admin_addrs,
             DEFAULT_ORPHAN_SWEEP_AFTER,
+            StreamSealKnobs::default(),
+            segment_store_config,
+            DEFAULT_STREAM_RETENTION,
+            None,
+            None,
+            quiesce_after,
+            heartbeat_batch,
+            ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
+            None,
+            backup_store_config,
+            pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
+            None,
+            None,
+            None,
+            None,
+            None,
+            shared_wal,
         )
         .await
 }
@@ -14416,6 +14573,52 @@ pub async fn run_node_data_join(
     labels: BTreeMap<String, String>,
     dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
 ) -> std::io::Result<Node> {
+    run_node_data_join_with_settings(
+        seeds,
+        id,
+        addrs,
+        dir,
+        backend,
+        labels,
+        dynamo_auth,
+        Duration::from_secs(DEFAULT_QUIESCE_AFTER_SECS),
+        DEFAULT_HEARTBEAT_BATCH,
+        DEFAULT_SHARED_WAL,
+        SegmentStoreConfig::default(),
+        BackupStoreConfig::default(),
+    )
+    .await
+}
+
+/// [`run_node_data_join`], widened with every per-node data-plane knob
+/// `--config FILE --node I` already resolves (issue #676) — see
+/// [`run_node_join_with_settings`]'s identical doc for the full rationale
+/// and the layered-wrapper convention this mirrors; [`run_node_data_join`]
+/// itself stays at its own original arity, now a thin default-resolving
+/// call into this function, so every existing caller (this crate's own test
+/// suite included) keeps compiling and now observes the identical
+/// on-by-default posture `--config`/`--cluster N` already have.
+///
+/// `main::run_data_join` (`animusd data --seed`'s own dispatch branch) is
+/// this function's one real caller with non-default settings — the
+/// data-only sibling of `run_node_join_with_settings`'s own CLI caller,
+/// resolving the identical flag set the identical "no config file, so no
+/// conflict to check" way.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_node_data_join_with_settings(
+    seeds: Vec<String>,
+    id: Option<NodeId>,
+    addrs: RoleAddrs,
+    dir: &Path,
+    backend: StorageBackend,
+    labels: BTreeMap<String, String>,
+    dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
+    quiesce_after: Duration,
+    heartbeat_batch: bool,
+    shared_wal: bool,
+    segment_store_config: SegmentStoreConfig,
+    backup_store_config: BackupStoreConfig,
+) -> std::io::Result<Node> {
     if seeds.is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -14452,6 +14655,11 @@ pub async fn run_node_data_join(
         admin_addrs,
         backend,
         dynamo_auth,
+        quiesce_after,
+        heartbeat_batch,
+        shared_wal,
+        segment_store_config,
+        backup_store_config,
     )
     .await
 }
@@ -14473,6 +14681,11 @@ async fn finish_data_join(
     mut admin_addrs: Vec<SocketAddr>,
     backend: StorageBackend,
     dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
+    quiesce_after: Duration,
+    heartbeat_batch: bool,
+    shared_wal: bool,
+    segment_store_config: SegmentStoreConfig,
+    backup_store_config: BackupStoreConfig,
 ) -> std::io::Result<Node> {
     // The data-only dual of `finish_combined_join`'s merge (a single raftkv
     // peer entry, no control id of its own to add).
@@ -14502,7 +14715,11 @@ async fn finish_data_join(
         .collect();
 
     // Calls `start_data_with_growth` directly (skipping the layered wrapper
-    // shape) — see `run_node_data`'s identical note.
+    // shape) — see `run_node_data`'s identical note. `quiesce_after`/
+    // `heartbeat_batch`/`shared_wal`/`segment_store_config`/
+    // `backup_store_config` are now threaded from the caller (issue #676)
+    // instead of hardcoded to their pre-cutover off/default values — see
+    // `run_node_data_join_with_settings`'s own doc.
     bound
         .start_data_with_growth(
             peers,
@@ -14515,27 +14732,18 @@ async fn finish_data_join(
             None,
             admin_addrs,
             StreamSealKnobs::default(),
-            SegmentStoreConfig::default(),
+            segment_store_config,
             None,
             None,
-            // `--quiesce-after` doesn't reach a seed/join startup yet — the
-            // same documented gap `animusd`'s own module doc names for
-            // `join`/`data --seed` (S-06 scoped only the three real
-            // `--config`/`--node`-shaped deployment paths).
-            Duration::ZERO,
-            // `--heartbeat-batch` has the identical documented gap here.
-            false,
+            quiesce_after,
+            heartbeat_batch,
             dynamo_auth,
-            // Same documented gap for `--backup-store` as `run_node_data`.
-            BackupStoreConfig::default(),
+            backup_store_config,
             None,
             None,
             None,
             None,
-            // `--shared-wal` has the identical documented gap here as
-            // `--heartbeat-batch` just above, unaffected by the C-05 PR 3
-            // cutover — a seed/join startup takes neither flag yet.
-            false,
+            shared_wal,
         )
         .await
 }

@@ -612,3 +612,66 @@ the identical two-step shape C-02 (heartbeat batching) used.
 
 **C-05 is now complete** (all three PRs landed 2026-09-06: the `ProdEnv`
 benchmark, the flag-gated wiring, and this cutover).
+
+## Amendment (2026-09-07, issue #676 — `join`/`data --seed`/`--cluster-control`+`--cluster-data` reach)
+
+C-05 PR 3's cutover flipped `--shared-wal`'s default ON for `--config`/
+`--node`, `--cluster N`, and `animusd data --config`, but left `join`,
+`data --seed`, and `--cluster-control`+`--cluster-data` hardcoded to the
+per-group layout regardless of any flag — a real gap, not a scope cut PR 3
+called out deliberately (its own module doc named it as unaffected, not as
+intentionally out of scope). Since the default flipped ON everywhere else,
+this meant a seed-joined node's own on-disk layout silently diverged from
+what an operator would reasonably expect — the exact surprise issue #676
+opened against.
+
+Closed by threading `shared_wal: bool` through both real growth paths and
+the split-deployment dev path:
+
+- **`join`/`data --seed`**: `animusd::run_node_join`/`run_node_data_join`
+  keep their own original arity (every existing caller — this crate's own
+  test suite included — keeps compiling unchanged) and now default
+  internally to `DEFAULT_SHARED_WAL` instead of hardcoding `false`; a new
+  widened sibling, `run_node_join_with_settings`/`run_node_data_join_
+  with_settings`, takes an explicit `shared_wal: bool` (plus
+  `quiesce_after`/`heartbeat_batch`/`segment_store_config`/
+  `backup_store_config`) for `main.rs`'s own `join`/`data --seed` CLI
+  dispatch, which gained `--shared-wal`/`--no-shared-wal` (and the sibling
+  flags) for the first time. Neither path has a config file to
+  conflict-check a CLI flag against, so there is no "one way, not both"
+  contract to add here — every flag simply sets its value directly, the
+  same shape `--tls-*`/`--encryption-key` already have on these paths.
+- **`--cluster-control`+`--cluster-data`**: `start_split_cluster_with_
+  growth` gained a trailing `shared_wal: bool` (alongside `quiesce_after`/
+  `heartbeat_batch`), threaded from `run_in_process_split_cluster`'s own
+  CLI dispatch the identical `DEFAULT_SHARED_WAL`-when-omitted way. Its
+  narrower sibling, `start_split_cluster_with_orphan_sweep_after` (used
+  directly by `tests/cluster_split.rs`), keeps hardcoding the pre-#676
+  off/per-group values — the same "narrower test wrapper stays at its own
+  original semantics" convention this ADR's own PR 2/3 amendments already
+  established for `start_with_streams` and friends.
+
+Regression: `crates/animusd/tests/join_data_seed_settings_reach.rs`'s
+`join_defaults_to_shared_wal_matching_a_bare_config_node` (the core proof —
+a bare `animusd join`, no flags at all, now writes the SAME shared-WAL
+layout a bare `--config`/`--node` does, verified the identical
+restart-with-the-flag-flipped-is-refused technique `tests/shared_wal_e2e.rs`
+uses) and `join_no_shared_wal_writes_the_per_group_layout` (the explicit
+opt-out); `tests/split_cluster.rs::cluster_control_data_threads_quiesce_
+after_to_admin_config` proves the identical wiring for `--quiesce-after` on
+the split-deployment dev path (the cheapest observable for that knob;
+`--shared-wal`/`--heartbeat-batch` have no `/admin/config` field to observe
+directly there, unchanged by this amendment — see this ADR's own "No
+`/admin/config` field yet" note).
+
+`--segment-store`/`--backup-store` (+ `--s3-credentials`/
+`--allow-insecure-s3`) also now reach `join`/`data --seed` as part of this
+same change (S-04 PR 2's own gap on these two entry points) —
+`--cluster-control`+`--cluster-data` and `data --config` remain a
+documented gap for those two knobs specifically (no CLI/`cluster_settings`
+route to either store on those two paths at all yet). `animusd control`'s
+`--encryption-key` reach (ADR 0069, not this ADR's own knob) is covered by
+that ADR's own 2026-09-07 amendment.
+
+See `crates/animusd/CLAUDE.md`'s "Shared WAL" section for the current,
+complete per-entry-point enumeration this amendment updates.

@@ -175,13 +175,17 @@ the still-true paragraph after the table.
   animusd/tests/encryption_at_rest_default_cluster_store_e2e.rs` (real
   `ProdEnv`, mirroring the `fs:` store's own e2e — a restore across
   nodes with no plaintext anywhere, and both loud-refusal directions).
-- **Still open (tracked separately, neither closable from S-03's own
-  scope):**
-  - **Issue #676** — `animusd join`/`data --seed`/`--cluster-control`+
-    `--cluster-data` don't thread `--encryption-key` (among several other
-    per-node knobs) through to those entry points; a real gap for a
-    hand-run cluster using them, irrelevant to the operator (which never
-    generates those invocations).
+- **Issue #676 — closed 2026-09-07** — `animusd join`/`data --seed` now
+  thread `--encryption-key` (plus `--shared-wal`/`--heartbeat-batch`/
+  `--quiesce-after`/`--segment-store`/`--backup-store`), and `animusd
+  control` now threads `--encryption-key` too; `--cluster-control`+
+  `--cluster-data` now threads `--quiesce-after`/`--heartbeat-batch`/
+  `--shared-wal` (still rejects `--encryption-key` outright, the same
+  posture `--tls-*` already has there — a real gap for a hand-run cluster
+  using it, irrelevant to the operator, which never generates that
+  invocation). See ADR 0028/0044/0048/0069's own 2026-09-07 amendments and
+  `crates/animusd/CLAUDE.md`'s CLI reference for the full per-entry-point
+  account.
 - **Tests (PR 1):** `crates/animus-sim/tests/encrypted_disk.rs` (14 direct
   unit tests over `SimEnv`); `crates/animus-storage/tests/
   lsm_crash_encrypted.rs` (the crash/fault corpus sibling of
