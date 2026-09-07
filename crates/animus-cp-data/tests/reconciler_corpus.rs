@@ -603,6 +603,10 @@ fn scenario_cells() -> Vec<Scenario> {
             scenario_crash_restart_follower
         ),
         scenario!(
+            "crash_then_drop_then_restart_reclaims_the_leftover_engine",
+            scenario_crash_then_drop_then_restart_reclaims_the_leftover_engine
+        ),
+        scenario!(
             "replay_epoch_flicker_mid_release_count_resets_then_releases",
             scenario_replay_epoch_flicker
         ),
@@ -1241,6 +1245,72 @@ fn scenario_crash_restart_follower(seed: u64) {
 
         assert_hosted_converged(&c, a(), [TabletId(1)]);
         assert_hosted_converged(&c, b(), [TabletId(1)]);
+        assert_idempotent(&mut c, a(), &v2).await;
+        assert_idempotent(&mut c, b(), &v2).await;
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 13b (issue #722): a node crashes while hosting a tablet, its
+// whole table is dropped and the drop fully converges everywhere else while
+// it's down, and only THEN does it restart. The second fact source
+// (`EngineFactory::local_tablets`) is what lets its own first tick after
+// restart discover and reclaim the leftover engine — a fresh, empty
+// `LocalState` (nothing survives a real process restart) plus a `Metadata`
+// view that already, by the time this first tick runs, never names the
+// dropped tablet at all would otherwise leak it permanently (the exact
+// mechanism `animusd`'s own `sim_cluster_dynamo_drop_table.rs::
+// scenario_4_a_node_crashed_during_the_drop_and_restarted_leaks_its_engine`
+// found and reports at the `SimCluster` level — this is the same gap's
+// direct `Reconciler`-level regression).
+// ---------------------------------------------------------------------------
+
+fn scenario_crash_then_drop_then_restart_reclaims_the_leftover_engine(seed: u64) {
+    run(seed, |sim| async move {
+        let env = sim.env(a());
+        let mut c = Cluster::new(sim);
+        c.add_node(a());
+        c.add_node(b());
+
+        let v1 = view([tablet(1, b"", None, vec![a(), b()])]);
+        c.tick_all(&[a(), b()], &v1).await;
+        env.sleep(Duration::from_secs(2)).await;
+
+        let ha = c.node(a()).hosted_node(TabletId(1)).unwrap().clone();
+        let hb = c.node(b()).hosted_node(TabletId(1)).unwrap().clone();
+        let leader = if ha.is_leader() { &ha } else { &hb };
+        leader.put(b"k".to_vec(), b"v".to_vec());
+        env.sleep(Duration::from_secs(1)).await;
+
+        // b() crashes and restarts NOW — a genuine process restart (fresh
+        // `Reconciler`, fresh empty `LocalState`), reusing the SAME
+        // `MemoryTabletEngines` registry, so b()'s own engine still
+        // durably holds tablet 1's data (see `crash_restart`'s own doc) —
+        // but b() never ticks again until well after the drop below.
+        c.crash_restart(b());
+
+        // The table drops; only a() (still up) ever observes it.
+        let v2 = view([]);
+        c.tick(a(), &v2).await;
+        assert_hosted_converged(&c, a(), []);
+        assert_absent(&c.storage(a(), TabletId(1)), &physical(b"k")).await;
+
+        // b()'s own leftover engine is still genuinely populated — the
+        // restart alone did not touch it, and b() never saw the drop.
+        assert_present(&c.storage(b(), TabletId(1)), &physical(b"k"), b"v").await;
+
+        // b()'s FIRST tick since the restart — already against the
+        // fully-converged, table-absent view. This is the exact window
+        // the bug lived in: pre-fix, `gather_facts` would derive no fact
+        // at all for tablet 1 here (absent from both `view.tablets` and
+        // the fresh empty `LocalState`), so `HostAction::Reclaim` would
+        // never fire and this assertion block would fail.
+        c.tick(b(), &v2).await;
+        env.sleep(Duration::from_secs(1)).await;
+
+        assert_hosted_converged(&c, b(), []);
+        assert_absent(&c.storage(b(), TabletId(1)), &physical(b"k")).await;
+
         assert_idempotent(&mut c, a(), &v2).await;
         assert_idempotent(&mut c, b(), &v2).await;
     });

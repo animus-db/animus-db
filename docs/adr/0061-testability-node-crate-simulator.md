@@ -2717,3 +2717,79 @@ reconciler_corpus` (4 passed, unchanged, untouched by this PR);
 `ANIMUS_SEED` replay confirmed deterministic for scenario 1
 (`drop_after_writes_reclaims_base_table`) and scenario 5
 (`drop_reclaims_off_the_rebalanced_replica_set`); `Cargo.lock` unchanged.
+
+#### 2026-09-07 amendment — D4 PR 3's own finding closed: `EngineFactory::local_tablets`, the reconciler's second fact source (issue #722)
+
+The gap the amendment immediately above reported — scenario 4's crashed-
+during-the-drop-and-restarted engine leak, filed for a follow-up PR rather
+than fixed there (out of that PR's own "driver plus assertions, not new
+mechanism" scope) — is now fixed, in `animus-cp-data::host` this time, not
+`animusd`.
+
+**The fix.** `host::EngineFactory` gained one new method,
+`local_tablets(&self) -> BTreeSet<TabletId>` (default-empty, so a
+third-party implementor of this now-widened trait still compiles
+unmodified): the tablet ids this node currently has DURABLE local engine
+state for, independent of replicated `Metadata`. `MemoryTabletEngines`
+answers from its own in-memory registry keys; `animusd`'s production
+`LsmTabletFactory` answers by listing its node's data directory once (the
+identical `env.list()` call `probe`/`destroy` already make) and parsing
+each filename's own `db-t{tablet}-` prefix via a new, unit-tested
+`parse_tablet_id_from_lsm_filename` (the inverse of `tablet_lsm_prefix`).
+`host::Reconciler::tick` consults it exactly **once** — this reconciler's
+very first tick after construction, never a later one, since a local
+engine appearing after that first tick can only be this same reconciler's
+own `Host`/`MaterializeSplitChild` action, already tracked in
+`LocalState` — so the fix adds no per-tick directory-listing cost in
+steady state, only a one-time cost right after a restart. `plan` gained a
+matching `local_tablets: &BTreeSet<TabletId>` parameter and a new phase,
+ahead of the pre-existing reclaim phase: any id present in `local_tablets`
+but absent from a `known` set (every current `view.tablets` key, plus
+every split child named on any tablet's own still-live `inplace_split`
+intent, since a pre-cutover child is materialized before it has a map
+entry of its own) is folded into `LocalState::hosted`, so the pre-existing,
+**unmodified** reclaim phase picks it up exactly like any other
+hosted-but-now-absent tablet — no new `HostAction` variant, no new
+teardown path. See `crates/animus-cp-data/CLAUDE.md`'s host-module entry
+for the full mechanism and the safety argument (an engine only ever exists
+locally for a tablet id this exact node has itself, at some prior tick,
+observed as real, so a locally-present id absent from `known` is never "a
+tablet that hasn't appeared in `Metadata` yet," only ever a genuine
+leftover) and `docs/adr/0024-drop-table-data-gc.md`'s own 2026-09-07
+amendment for the incident account and the restart-time guarantee this
+restores.
+
+**Scenario 4 is now a positive, un-ignored assertion**
+(`sim_cluster_dynamo_drop_table.rs`, renamed `scenario_4_a_node_crashed_
+during_the_drop_and_restarted_reclaims_its_engine`), replayed at the
+original six investigation seeds plus ten more. Delivering the positive
+assertion found and fixed two real bugs in this module's own test
+harness, neither in the fix itself — see `crates/animusd/CLAUDE.md`'s own
+appendix entry on this closure for the full account of both (a victim
+selection that could crash the control-plane leader by coincidence, and
+`assert_reclaimed`'s convergence check being unsound when split across two
+differently-timed passes for a just-restarted node specifically). A
+matching real-disk regression, `a_node_stopped_before_the_drop_and_
+restarted_after_reclaims_its_leftover_engine`, landed in `crates/animusd/
+tests/drop_table_gc.rs` — still hand-written `ProdEnv`, per that PR's own
+"a mixed metadata+real-disk test body has no `SimCluster` analog" finding,
+unchanged by this fix.
+
+**Gates**: `cargo fmt --all --check` (clean); `cargo clippy -p animus-cp-
+data -p animusd --all-targets --all-features -- -D warnings` (clean, zero
+new warnings); `cargo test -p animus-cp-data` (379 passed, 0 failed, 0
+regressions — includes the crate's own unit tests, `reconciler_corpus`,
+`inplace_split_reconciler`, `sharedwal_fault_corpus`, and every other
+integration binary in the crate); `cargo test -p animusd --lib` (321
+passed, 3 ignored, 0 failed — up from 315/4 before this fix;
+`sim_cluster_corpus`/`sim_cluster_dynamo_corpus` both stay green
+unmodified); `cargo build -p animusd --all-targets` (green); `cargo test
+-p animusd --test drop_table_gc --test drop_table_index_cascade` (4
+passed — the new real-disk regression plus the three pre-existing ones —
+run 3x locally with no flake); `ANIMUS_RECONCILER_SEEDS=25 cargo test -p
+animus-cp-data --test reconciler_corpus` (green); `ANIMUS_INPLACE_SPLIT_
+SEEDS=25 cargo test -p animus-cp-data --test inplace_split_reconciler`
+(green — the in-place split path is provably unaffected: the `known`-set
+safety argument this fix rests on is exactly what makes a pre-cutover
+split child's own eagerly-materialized engine exempt from the new
+reclaim path). `Cargo.lock` unchanged.

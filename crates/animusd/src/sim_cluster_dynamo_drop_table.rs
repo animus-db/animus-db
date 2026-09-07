@@ -41,74 +41,59 @@
 //! 4. a fresh `CreateTable` with the SAME name afterward gets a NEW tablet
 //!    id (ids are never reused, ADR 0024) and serves reads/writes.
 //!
-//! **Scenarios** (seed-parameterized, replayed at 5+ seeds each except
-//! scenario 4 — see below): (1) drop after writes, base table, 3 nodes; (2)
-//! drop with a declared GSI — the hidden index table's tablet is reclaimed
-//! too, cascading in the ADR 0041 §5 order `ClientCtx::drop_table`'s own
-//! doc states; (3) drop issued immediately after create, with no
-//! intervening `run_for` — the Host-vs-Reclaim race `assert_idempotent`'s
-//! own discipline calls for (assert *state*, never action counts — a node
-//! whose reconciler hasn't ticked even once yet simply never hosts the
-//! tablet at all, which is exactly as valid a path to "reclaimed" as
-//! hosting-then-tearing-down); (4) a node crashed while hosting the table
-//! then restarted after the drop commits — **not** a converging scenario,
-//! see below; (5) a 4-node cluster (the `node_count > MAX_REPLICATION_
-//! FACTOR` shape D4 PR 1 made safe, `sim_cluster_dynamo_table_ops.rs::
-//! every_node_hosts_exactly_its_replica_set_after_rebalance`'s own fixture)
-//! where the dropped table's tablet was rebalanced onto a *different* node
-//! set than the one `CreateTable` originally picked — proving reclaim keys
-//! off `Metadata`'s own **current** replica set, never a stale
-//! creation-time snapshot.
+//! **All three of (1)-(3) are checked TOGETHER, in the SAME poll — never a
+//! metadata/hosted-set check first, then a separate unwaited engine read**
+//! (`assert_reclaimed`'s own doc has the full account): a just-restarted
+//! node's `Metadata`/hosted-set facts can read as "already converged" from
+//! the very first poll, well before its own `Reconciler` has ticked even
+//! once — this was a real bug in this module's own harness, found and fixed
+//! delivering scenario 4's own positive assertion (issue #722), not merely
+//! a theoretical concern.
 //!
-//! **A real, previously-uncharacterized reclaim gap was found investigating
-//! scenario 4 — reported here, not fixed (out of this PR's own "driver plus
-//! assertions, not new mechanism" scope).** See
-//! [`scenario_4_a_node_crashed_during_the_drop_and_restarted_leaks_its_
-//! engine`]'s own doc for the full account: `host::Reconciler::
-//! gather_facts` derives every fact **exclusively** from the tablets
-//! currently named in `Metadata` (`view.tablets.iter()`, both for the
-//! already-hosted branch and the join-candidate branch) plus this
-//! reconciler's own in-process `LocalState`. A table dropped from
-//! `Metadata` is removed from `view.tablets` **synchronously**, so a node
-//! whose whole process is down across the drop-and-Metadata-converges
-//! window comes back with (a) a brand-new, empty `LocalState` (nothing ever
-//! persists it — see `crates/animusd/CLAUDE.md`'s drop-table-GC entry:
-//! "there is no more durable `cp-hosted` marker... a restart just
-//! re-discovers every tablet to host from replicated `Metadata`") and (b) a
-//! `Metadata` that already, synchronously, never names the dropped tablet
-//! at all by the time this node's reconciler first ticks — so
-//! `gather_facts` produces **no fact whatsoever** for that tablet id,
-//! `plan()` never places it in `next.hosted`, and `HostAction::Reclaim`
-//! (which only ever fires for a tablet this reconciler's own `LocalState`
-//! currently claims — see `plan`'s own Phase 3 doc) can never target it.
-//! The tablet's own private engine — genuinely populated with data written
-//! before the crash — is a permanent, silent leak: reachable in production
-//! too, not a `SimCluster`-fixture artifact (`gather_facts`'s scoping is
-//! unconditional, real `LsmEngine`'s `LsmTabletFactory::probe`/`destroy`
-//! included — see that impl's own doc in `lib.rs`, which scans by filename
-//! prefix, called only for tablet ids `gather_facts` already decided to ask
-//! about). `docs/adr/0024-drop-table-data-gc.md`'s own text (lines 94-99)
-//! describes the *pre-`host::Reconciler`* per-tablet-marker design's
-//! guarantee here — "a replica that was down during the drop restarts,
-//! re-hosts the tablet from its marker/engine, then its GC loop reclaims it
-//! once its control replica catches up" — which depended on a durable
-//! per-node marker surviving the restart to force a re-host attempt first;
-//! that marker is gone (ADR 0050, see `crates/animusd/CLAUDE.md`'s matching
-//! note), and nothing replaced its restart-time "ask about what I used to
-//! host, not just what `Metadata` currently says" role.
-//! `every_node_hosts_exactly_its_replica_set_after_rebalance`-style "no
-//! zombie groups" convergence (metadata + hosted-set) is **unaffected** —
-//! `ClusterEdgeState`'s own registrations are purged directly by
-//! `SimCluster::restart`'s fixture code (mirroring a real process's driver
-//! tasks simply not existing after a restart), independent of
-//! `host::Reconciler` entirely — only the **physical engine data** leaks.
-//! Confirmed empirically at 6 seeds (see that test's own doc), not just by
-//! static analysis, and kept as one `#[ignore]`d regression rather than 5
-//! passing ones — a green test pinning the current, buggy behavior would
-//! misleadingly read as an accepted contract, which this is not; scenario
-//! 4 does not get the same 5-seed replay every other scenario does, since a
-//! single reproducible ignored regression is what a future fix needs to run
-//! against, not a soak.
+//! **Scenarios** (seed-parameterized, replayed at 5+ seeds each): (1) drop
+//! after writes, base table, 3 nodes; (2) drop with a declared GSI — the
+//! hidden index table's tablet is reclaimed too, cascading in the ADR 0041
+//! §5 order `ClientCtx::drop_table`'s own doc states; (3) drop issued
+//! immediately after create, with no intervening `run_for` — the
+//! Host-vs-Reclaim race `assert_idempotent`'s own discipline calls for
+//! (assert *state*, never action counts — a node whose reconciler hasn't
+//! ticked even once yet simply never hosts the tablet at all, which is
+//! exactly as valid a path to "reclaimed" as hosting-then-tearing-down);
+//! (4) a node crashed while hosting the table then restarted only after the
+//! drop has already converged everywhere else — see below, this is the
+//! issue #722 regression, now converging; (5) a 4-node cluster (the
+//! `node_count > MAX_REPLICATION_FACTOR` shape D4 PR 1 made safe,
+//! `sim_cluster_dynamo_table_ops.rs::every_node_hosts_exactly_its_replica_
+//! set_after_rebalance`'s own fixture) where the dropped table's tablet was
+//! rebalanced onto a *different* node set than the one `CreateTable`
+//! originally picked — proving reclaim keys off `Metadata`'s own
+//! **current** replica set, never a stale creation-time snapshot.
+//!
+//! **Scenario 4 pins issue #722's own fix, closed by a sibling PR to this
+//! one** (`animus_cp_data::host`'s `EngineFactory::local_tablets` — the
+//! reconciler's second fact source, alongside replicated `Metadata`). The
+//! gap this scenario originally found and reported (not fixed, per this
+//! PR's own "driver plus assertions, not new mechanism" scope) was real:
+//! `host::Reconciler::gather_facts` used to derive every fact
+//! **exclusively** from the tablets currently named in `Metadata`
+//! (`view.tablets.iter()`) plus this reconciler's own in-process
+//! `LocalState` — never persisted, so a node whose whole process was down
+//! across the drop-and-`Metadata`-converges window came back with a
+//! brand-new, empty `LocalState` and a `Metadata` view that, by the time
+//! its first tick ever ran, already never named the dropped tablet at all;
+//! `gather_facts` then produced no fact whatsoever for that tablet id, and
+//! `HostAction::Reclaim` could never target it — a permanent, silent leak
+//! of real data, reachable in production too (`LsmTabletFactory`'s own
+//! `list()`-based enumeration is the identical mechanism, real disk
+//! included). The fix gives the reconciler a second, restart-surviving
+//! fact source: `EngineFactory::local_tablets()`, consulted exactly ONCE
+//! per reconciler lifetime (its very first tick — see that method's and
+//! `Reconciler::tick`'s own docs for why once is enough and for the
+//! per-file safety argument, including why a pre-cutover in-place split
+//! child's own already-materialized engine is never mistaken for an
+//! orphan). See `docs/adr/0024-drop-table-data-gc.md`'s dated amendment,
+//! `crates/animus-cp-data/CLAUDE.md`'s host-module entry, and
+//! `docs/engineering-lessons.md` for the full account.
 //!
 //! Seed replay (repo convention): `ANIMUS_SEED=<seed> cargo test -p animusd
 //! --lib <test name>`.
@@ -163,41 +148,27 @@ fn tablet_of(cluster: &SimCluster, node: u64, table: &str) -> TabletId {
         .0
 }
 
-/// Drive `cluster` in `step`-sized increments, calling `done` after each,
-/// until it returns `true` or `budget` is exhausted — the converged-or-
-/// timeout idiom every eventual property in this repo needs (root
-/// `CLAUDE.md`'s Testing rule); a private, file-local twin of `SimCluster`'s
-/// own (private) `poll_until`, matching every other sibling `sim_cluster_
-/// dynamo_*.rs` module's own convention of rolling its own rather than
-/// widening that method's visibility for no other reason.
-fn poll_until(
-    cluster: &mut SimCluster,
-    budget: Duration,
-    mut done: impl FnMut(&SimCluster) -> bool,
-) {
-    const STEP: Duration = Duration::from_millis(50);
-    let mut elapsed = Duration::ZERO;
-    loop {
-        if done(cluster) {
-            return;
-        }
-        assert!(
-            elapsed < budget,
-            "condition did not converge within {budget:?} (seed={})",
-            cluster.seed()
-        );
-        cluster.run_for(STEP);
-        elapsed += STEP;
-    }
-}
-
 /// The three converged-or-timeout observables this whole module is about,
-/// checked together against every id in `nodes`: `table` no longer has a
-/// tablet anywhere, no node's `ClusterEdgeState` still names `tablet`, and —
-/// once that much has converged — every one of `nodes`'s own private engine
-/// for `tablet` reads back empty (the actual physical-reclaim proof, ADR
-/// 0050 rung 1's "the engine is private, so whole-engine deletion is the
-/// erase" contract).
+/// checked TOGETHER, every poll, against every id in `nodes`: `table` no
+/// longer has a tablet anywhere, no node's `ClusterEdgeState` still names
+/// `tablet`, and every one of `nodes`'s own private engine for `tablet`
+/// reads back empty (the actual physical-reclaim proof, ADR 0050 rung 1's
+/// "the engine is private, so whole-engine deletion is the erase"
+/// contract).
+///
+/// **All three conditions must be folded into the SAME poll loop, never
+/// checked in two passes** (a metadata/hosted-set check first, then a
+/// separate post-loop engine read) — a restarted node's metadata/hosted-set
+/// facts can read as "already converged" from the very first poll (a
+/// freshly restarted control `RaftNode` starts with a genuinely blank
+/// `Metadata`, indistinguishable at that instant from "caught up to the
+/// table being dropped"), well before its own `Reconciler` has ticked even
+/// once — a separate, unwaited post-loop engine read would then observe
+/// stale, pre-crash content and fail even on fully correct behavior. This
+/// is exactly the shape of bug root `CLAUDE.md`'s "eventual properties get
+/// a converged-or-timeout poll, never a fixed-deadline one-shot assert"
+/// rule warns about, just with the "one-shot assert" split across two
+/// otherwise-correct-looking checks instead of one.
 async fn assert_reclaimed(
     cluster: &mut SimCluster,
     table: &str,
@@ -206,22 +177,43 @@ async fn assert_reclaimed(
     budget: Duration,
 ) {
     let seed = cluster.seed();
-    poll_until(cluster, budget, |c| {
-        nodes.iter().all(|&n| {
-            !c.metadata(n).has_table_tablet(table) && !c.hosted_tablets(n).contains(&tablet)
-        })
-    });
-    for &n in nodes {
-        let engine = cluster.storage(n, tablet);
-        let entries = engine
-            .entries()
-            .await
-            .expect("a MemoryEngine read never fails");
+    // A hand-rolled async poll loop (not a sync `FnMut(&SimCluster) -> bool`
+    // closure driven by a generic `poll_until` helper, this module's
+    // earlier shape) — checking the engine's own content needs a real
+    // `.await`, and a nested `futures::executor::block_on` from inside a
+    // sync poll closure panics: "cannot execute `LocalPool` executor from
+    // within another executor", confirmed empirically, not merely
+    // suspected, while building this exact fix.
+    const STEP: Duration = Duration::from_millis(50);
+    let mut elapsed = Duration::ZERO;
+    loop {
+        let mut converged = true;
+        for &n in nodes {
+            if cluster.metadata(n).has_table_tablet(table)
+                || cluster.hosted_tablets(n).contains(&tablet)
+            {
+                converged = false;
+                break;
+            }
+            let entries = cluster
+                .storage(n, tablet)
+                .entries()
+                .await
+                .expect("a MemoryEngine read never fails");
+            if !entries.is_empty() {
+                converged = false;
+                break;
+            }
+        }
+        if converged {
+            return;
+        }
         assert!(
-            entries.is_empty(),
-            "node {n}'s own private engine for reclaimed tablet {tablet:?} of table \
-             `{table}` is not empty (seed={seed}): {entries:?}"
+            elapsed < budget,
+            "condition did not converge within {budget:?} (seed={seed})"
         );
+        cluster.run_for(STEP);
+        elapsed += STEP;
     }
 }
 
@@ -440,87 +432,40 @@ fn drop_immediately_after_create_races_host_and_reclaim_over_seeds() {
 
 // ---------------------------------------------------------------------------
 // Scenario 4: a node crashed while hosting the table, then restarted after
-// the drop commits — a REAL reclaim gap, not a converging scenario.
+// the drop commits — issue #722, now a converging scenario (fixed).
 // ---------------------------------------------------------------------------
 
-/// **A real, previously-uncharacterized reclaim gap**, found investigating
-/// this exact scenario (see this module's own top-of-file doc for the full
-/// mechanism) — NOT the "converges to the same state" positive proof the
-/// scenario was meant to be. Crash one non-leader replica that is actively
+/// **Issue #722, fixed.** Crash one non-leader replica that is actively
 /// hosting the table's tablet (network-muted, its tasks — including its own
 /// reconciler loop — stay alive, per `SimCluster::crash`'s own doc), issue
-/// `DeleteTable` from a still-live node, then `SimCluster::restart` the
-/// crashed node (a true process restart: every task dropped, a fresh
-/// `RaftNode`/`Reconciler` built on the same id, reusing the same
-/// `MemoryTabletEngines` handle — see `sim_cluster.rs`'s own doc).
+/// `DeleteTable` from a still-live node, let the drop fully converge on the
+/// two live nodes, and only THEN `SimCluster::restart` the crashed node (a
+/// true process restart: every task dropped, a fresh `RaftNode`/
+/// `Reconciler` built on the same id, reusing the same `MemoryTabletEngines`
+/// handle — see `sim_cluster.rs`'s own doc). This is the exact "realistic"
+/// timing that used to leak: the restarted node's `Reconciler` starts from a
+/// brand-new, empty `LocalState`, and its very first tick already sees the
+/// fully-converged, table-absent `Metadata` — so before the fix, nothing
+/// left this node any fact at all to reclaim tablet 1 by (see this module's
+/// own top-of-file doc for the full pre-fix mechanism).
 ///
-/// **The three `assert_reclaimed` observables never converge for the
-/// restarted node's own engine.** `host::Reconciler::gather_facts` derives
-/// every fact exclusively from tablets `Metadata` *currently* names
-/// (`view.tablets.iter()`, both for the already-hosted branch and the
-/// join-candidate branch) plus this reconciler's own in-process
-/// `LocalState` — nothing persists `LocalState` across a real process
-/// restart (`crates/animusd/CLAUDE.md`'s drop-table-GC entry: "there is no
-/// more durable `cp-hosted` marker... a restart just re-discovers every
-/// tablet to host from replicated `Metadata`"). Under `SimEnv`'s
-/// effectively-instant replication, the restarted node's own control-plane
-/// `RaftNode` catches up (via ordinary peer replication) to the
-/// already-converged "table absent" state well within one
-/// `RECONCILER_FALLBACK` tick — so `gather_facts` produces **no fact at
-/// all** for the dropped tablet id on the very first tick the fresh
-/// reconciler ever runs, `plan()` never places it in `next.hosted`, and
-/// `HostAction::Reclaim` (which only ever fires for a tablet this
-/// reconciler's own `LocalState` currently claims) can never target it. The
-/// tablet's own private engine — genuinely populated with real data written
-/// before the crash — is a permanent, silent leak.
+/// **The fix**: `host::Reconciler` now consults
+/// `EngineFactory::local_tablets()` — the second fact source, alongside
+/// `Metadata` — exactly once, on this exact first tick, and folds any
+/// locally-present-but-`Metadata`-absent tablet id into `plan`'s ordinary
+/// reclaim path. The victim genuinely holds real data (asserted below,
+/// before it ever crashes) — the fix reclaims that real content, not an
+/// already-empty engine that would trivially "converge" either way — and
+/// `assert_reclaimed` (this module's own physical-reclaim proof: a fresh,
+/// empty engine read back through the SAME registry the reconciler opens
+/// from) now converges for the restarted node too, well inside the
+/// generous 15s budget this test always used (the mechanism resolves in a
+/// single tick in practice).
 ///
-/// **This is not a `SimCluster`-fixture artifact.** `gather_facts`'s
-/// scoping is unconditional, and `LsmTabletFactory::probe`/`destroy`
-/// (`lib.rs`, the real `LsmEngine` backend) is only ever called for tablet
-/// ids `gather_facts` already decided to ask about — the identical
-/// mechanism, real disk included. `docs/adr/0024-drop-table-data-gc.md`'s
-/// own text (lines 94-99) describes the *pre-`host::Reconciler`*
-/// per-tablet-marker design's guarantee here — "a replica that was down
-/// during the drop restarts, re-hosts the tablet from its marker/engine,
-/// then its GC loop reclaims it once its control replica catches up" —
-/// which depended on a durable per-node marker surviving the restart to
-/// force a re-host attempt first; that marker is gone (ADR 0050), and
-/// nothing replaced its restart-time "ask about what I used to host, not
-/// just what `Metadata` currently says" role.
-///
-/// **Confirmed empirically, not just by static analysis**: this exact
-/// scenario (crash-then-drop-then-restart, in that order, so the
-/// straightforwardly "realistic" timing) was first written as a POSITIVE
-/// convergence assertion and reliably failed — every one of 6 seeds tried
-/// (`0xE4AF_0004`, `0xE4AF_4000..=0xE4AF_4004`) reproduced the identical
-/// non-empty leftover engine on the restarted node, never once converging
-/// within a 15s virtual-time budget. `assert_reclaimed`'s metadata/hosted-
-/// set observables converge fine regardless (they're purged/re-derived by
-/// `SimCluster::restart`'s own fixture code and by `plan()`'s ordinary
-/// `Release` path respectively, independent of `gather_facts`'s scoping
-/// gap) — only the physical engine leaks, silently.
-///
-/// **`#[ignore]`d rather than asserted-passing or deleted**: this pins the
-/// CURRENT (buggy) behavior as a reproducible regression a future fix can
-/// run against, without landing a green test that would misleadingly read
-/// as "this converges" — root `CLAUDE.md`'s green-is-an-invariant rule is
-/// exactly why a genuine gap can't be asserted around here, and this PR's
-/// own scope ("a driver plus assertions, not new mechanism") is why the
-/// gap is reported rather than fixed in `animus-cp-data::host` here. Run
-/// explicitly to reproduce: `cargo test -p animusd --lib
-/// scenario_4_a_node_crashed_during_the_drop_and_restarted_leaks_its_engine
-/// -- --ignored`.
-#[test]
-#[ignore = "known gap, issue #722 (ADR 0061 rung D4 PR 3 finding): a node crashed while \
-            hosting a table, restarted after the table's drop has already \
-            converged elsewhere, never reclaims its own stale tablet engine \
-            — see this test's own doc for the full mechanism (host::\
-            Reconciler::gather_facts scopes every fact to Metadata's \
-            CURRENT tablet map, which a dropped tablet is synchronously \
-            absent from); not fixed by this PR (driver+assertions scope \
-            only)"]
-fn scenario_4_a_node_crashed_during_the_drop_and_restarted_leaks_its_engine() {
-    let seed = 0xE4AF_0004;
+/// **Seed replay (repo convention)**: `ANIMUS_SEED=<seed> cargo test -p
+/// animusd --lib scenario_4_a_node_crashed_during_the_drop_and_restarted_
+/// reclaims_its_engine`.
+fn run_scenario_4_a_node_crashed_during_the_drop_and_restarted_reclaims_its_engine(seed: u64) {
     let mut cluster = SimCluster::new(seed, 3, 3);
     let (status, body) = create_table(&mut cluster, 0, "ledger");
     assert_eq!(status, 200, "seed={seed}: CreateTable failed: {body}");
@@ -530,13 +475,26 @@ fn scenario_4_a_node_crashed_during_the_drop_and_restarted_leaks_its_engine() {
 
     let leader = cluster
         .leader_index_of(tablet)
-        .expect("seed={seed}: the fresh group elected a leader");
+        .unwrap_or_else(|| panic!("seed={seed}: the fresh group elected a leader"));
+    // The victim must be neither the tablet's own data-plane leader (the
+    // scenario is about a REPLICA crashing) NOR the control-plane's own
+    // leader — crashing the latter would force a control-plane election
+    // before `DeleteTable`'s own commit-wait could ever succeed, an
+    // entirely different (and, for a 3-node cluster, not always
+    // fast-under-SimEnv) scenario this test isn't about. A 3-node cluster
+    // always has at least one node that is neither.
+    let control_leader = cluster.control_leader_index() as u64;
     let victim = (0..cluster.node_count() as u64)
-        .find(|&n| n != leader)
-        .expect("a 3-node cluster has a non-leader node");
+        .find(|&n| n != leader && n != control_leader)
+        .unwrap_or_else(|| {
+            panic!(
+                "seed={seed}: a 3-node cluster must have a node that is neither the \
+                 tablet leader ({leader}) nor the control leader ({control_leader})"
+            )
+        });
 
     // The victim genuinely holds this tablet's own data before it goes
-    // offline — the leak below is of real content, not an empty engine
+    // offline — the reclaim below is of real content, not an empty engine
     // that would trivially "converge" either way.
     futures::executor::block_on(async {
         let entries = cluster
@@ -576,11 +534,10 @@ fn scenario_4_a_node_crashed_during_the_drop_and_restarted_leaks_its_engine() {
 
     cluster.restart(victim);
 
-    // Expected to time out and fail on the CURRENT (buggy) behavior — see
-    // this test's own doc. `budget` is generous (well past the point where
-    // every other observable in this module converges in well under 1s)
-    // specifically so a future fix's own success is unambiguous, not an
-    // artifact of a too-short poll.
+    // `budget` stays generous (well past the point where every other
+    // observable in this module converges in well under 1s) so a future
+    // regression's own timeout is unambiguous, not an artifact of a
+    // too-short poll.
     futures::executor::block_on(assert_reclaimed(
         &mut cluster,
         "ledger",
@@ -588,6 +545,36 @@ fn scenario_4_a_node_crashed_during_the_drop_and_restarted_leaks_its_engine() {
         &[victim],
         Duration::from_secs(15),
     ));
+}
+
+#[test]
+fn scenario_4_a_node_crashed_during_the_drop_and_restarted_reclaims_its_engine() {
+    run_scenario_4_a_node_crashed_during_the_drop_and_restarted_reclaims_its_engine(env_seed(
+        0xE4AF_0004,
+    ));
+}
+
+/// The six seeds issue #722's own investigation confirmed reliably
+/// reproduced the pre-fix leak (`0xE4AF_0004`, `0xE4AF_4000..=0xE4AF_4004`),
+/// plus ten more for soak — this scenario now gets the same seed-replay
+/// discipline every other scenario in this module has.
+#[test]
+fn scenario_4_a_node_crashed_during_the_drop_and_restarted_reclaims_its_engine_over_seeds() {
+    for seed in [
+        0xE4AF_0004,
+        0xE4AF_4000,
+        0xE4AF_4001,
+        0xE4AF_4002,
+        0xE4AF_4003,
+        0xE4AF_4004,
+    ] {
+        run_scenario_4_a_node_crashed_during_the_drop_and_restarted_reclaims_its_engine(seed);
+    }
+    for i in 0..10 {
+        run_scenario_4_a_node_crashed_during_the_drop_and_restarted_reclaims_its_engine(
+            0xE4AF_7000 + i,
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

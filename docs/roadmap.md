@@ -621,3 +621,24 @@ stand in for. What remains open for D4 (PRs 2, 4, 5, unchanged): auto-split
 needs `auto_split_loop`'s own `tokio::time` conversion; join/growth needs
 an add-node capability; the backup janitor needs `client_ctx_host.rs`'s
 impls widened.
+
+---
+
+**Addendum, 2026-09-07 (issue #722 closed, D4 PR 3's own finding fixed)**:
+the crashed-during-the-drop reclaim gap the addendum above reports (a node
+offline across a table drop's whole commit-and-converge window never
+rediscovering, and therefore never reclaiming, its own leftover tablet
+engine on restart) is fixed — `animus_cp_data::host::EngineFactory` gained
+`local_tablets()`, a second, restart-surviving fact source the reconciler
+consults exactly once per process lifetime (its very first tick), folded
+into `plan`'s existing reclaim path via a `known`-set safety argument (an
+engine only ever exists locally for a tablet id this node has itself
+observed as real, so an id absent from both the current tablet map and
+every live in-place-split intent's own children is always a genuine
+leftover). The formerly-`#[ignore]`d `SimCluster` regression is now a
+positive assertion, and a matching real-disk regression landed in
+`crates/animusd/tests/drop_table_gc.rs`. See ADR 0024's and ADR 0061's
+matching 2026-09-07 amendments for the full account, and
+`crates/animus-cp-data/CLAUDE.md`'s host-module entry for the mechanism as
+shipped. This closes the one open item D4 PR 3 itself deliberately left
+outstanding; D4 PRs 2, 4, 5 remain open, unchanged by this fix.

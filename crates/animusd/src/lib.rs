@@ -10702,6 +10702,21 @@ fn tablet_lsm_prefix(tablet: u64) -> String {
     format!("{LSM_PREFIX}t{tablet}-")
 }
 
+/// The inverse of [`tablet_lsm_prefix`] (issue #722): does `filename` carry
+/// a tablet engine's own prefix, and if so, which tablet id? Parses
+/// `{LSM_PREFIX}t{tablet}-...` — `LSM_PREFIX` itself (`db-MANIFEST`/
+/// `db-wal-*`/`db-sst-*`, the node's own control/syskv engine) never
+/// matches (no `t` immediately follows), and a malformed/non-numeric
+/// `{tablet}` segment (should be structurally unreachable — this crate is
+/// the only writer of this naming convention) is treated as "not a tablet
+/// engine file" rather than panicking on an unrecognized filename this
+/// node didn't write itself.
+fn parse_tablet_id_from_lsm_filename(filename: &str) -> Option<TabletId> {
+    let rest = filename.strip_prefix(LSM_PREFIX)?.strip_prefix('t')?;
+    let digits_end = rest.find('-')?;
+    rest[..digits_end].parse::<u64>().ok().map(TabletId)
+}
+
 /// The [`LsmEngine`] implementation of the per-tablet engine seam (ADR 0050
 /// rung 1): one private on-disk engine per hosted tablet, opened/probed/
 /// destroyed by filename prefix over this node's one `ProdEnv` disk.
@@ -10765,6 +10780,77 @@ impl animus_cp_data::host::EngineFactory<LsmEngine<ProdEnv>> for LsmTabletFactor
             .clone_to_filtered(tablet_lsm_prefix(target.0), keep)
             .await
             .map_err(|e| e.to_string())
+    }
+
+    /// Issue #722 — enumerate every tablet id this node's own data
+    /// directory currently holds durable engine files for, by listing the
+    /// directory once and parsing each filename's own prefix
+    /// ([`parse_tablet_id_from_lsm_filename`]) — the identical `env.list()`
+    /// call [`probe`](Self::probe)/[`destroy`](Self::destroy) already make,
+    /// generalized from "does THIS one tablet's prefix appear" to "which
+    /// tablet ids appear at all." A listing failure resolves the same way
+    /// `probe`/`destroy` already treat one — silently as empty, per the
+    /// trait's own doc — rather than propagate an error this method has no
+    /// channel for.
+    async fn local_tablets(&self) -> BTreeSet<TabletId> {
+        self.env
+            .list()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|f| parse_tablet_id_from_lsm_filename(f))
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod lsm_tablet_filename_tests {
+    use super::*;
+
+    #[test]
+    fn parses_a_tablet_engines_own_files() {
+        assert_eq!(
+            parse_tablet_id_from_lsm_filename("db-t5-MANIFEST"),
+            Some(TabletId(5))
+        );
+        assert_eq!(
+            parse_tablet_id_from_lsm_filename("db-t5-wal-0"),
+            Some(TabletId(5))
+        );
+        assert_eq!(
+            parse_tablet_id_from_lsm_filename("db-t5-sst-12"),
+            Some(TabletId(5))
+        );
+    }
+
+    #[test]
+    fn does_not_confuse_a_prefix_with_a_longer_tablet_id() {
+        // The trailing `-` is load-bearing (see `tablet_lsm_prefix`'s own
+        // doc): `db-t5-*` must never be read as also matching `db-t51-*`.
+        assert_eq!(
+            parse_tablet_id_from_lsm_filename("db-t51-MANIFEST"),
+            Some(TabletId(51))
+        );
+    }
+
+    #[test]
+    fn ignores_the_bare_control_syskv_engines_own_files() {
+        // No `t` immediately follows `LSM_PREFIX` on any of these — never a
+        // tablet engine file.
+        for f in ["db-MANIFEST", "db-wal-0", "db-sst-3"] {
+            assert_eq!(
+                parse_tablet_id_from_lsm_filename(f),
+                None,
+                "control/syskv file {f} must never be read as a tablet engine file"
+            );
+        }
+    }
+
+    #[test]
+    fn ignores_an_unrelated_file() {
+        assert_eq!(parse_tablet_id_from_lsm_filename("syskv-MANIFEST"), None);
+        assert_eq!(parse_tablet_id_from_lsm_filename("raft.wal.5"), None);
+        assert_eq!(parse_tablet_id_from_lsm_filename("db-tx-oops"), None);
     }
 }
 

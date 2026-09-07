@@ -6724,3 +6724,81 @@ cascade.rs` were left whole, unconverted — every test in both interleaves
 real-disk `LsmEngine` WAL-file assertions with metadata/hosting
 convergence in one body, a shape this fixture's `MemoryEngine` tier
 cannot stand in for.
+
+## Appendix — issue #722 fixed: the crashed-during-the-drop reclaim gap D4 PR 3 found (2026-09-07)
+
+The gap the previous appendix names — `scenario_4_a_node_crashed_during_
+the_drop_and_restarted_leaks_its_engine`, kept `#[ignore]`d as "not fixed
+by this PR (driver+assertions scope only)" — is now closed, in
+`animus-cp-data::host` (not here): `EngineFactory` gained `local_tablets(&
+self) -> BTreeSet<TabletId>`, the reconciler's second fact source
+alongside replicated `Metadata`, consulted exactly once (this node's very
+first tick after construction, never a later one). See `crates/animus-cp-
+data/CLAUDE.md`'s host-module entry for the mechanism, the `known`-set
+safety argument (an engine only ever exists locally for a tablet id this
+node has itself observed as real, so a locally-present id absent from both
+the current tablet map and every live in-place-split intent's own children
+is always a genuine leftover, never a tablet that merely hasn't appeared in
+`Metadata` yet), and `docs/adr/0024-drop-table-data-gc.md`'s 2026-09-07
+amendment for the full incident and its restored restart-time guarantee.
+
+**This crate's own contribution**: the production `EngineFactory` impl,
+`LsmTabletFactory` (`lib.rs`) — `local_tablets` lists this node's data
+directory once (the identical `env.list()` call `probe`/`destroy` already
+make) and parses each filename's own `db-t{tablet}-` prefix via the new
+`parse_tablet_id_from_lsm_filename` (the inverse of `tablet_lsm_prefix`,
+unit-tested in `lsm_tablet_filename_tests` — including the `db-t5-*`
+vs. `db-t51-*` disambiguation `tablet_lsm_prefix`'s own doc names, and that
+the bare control/syskv engine's own `db-MANIFEST`/`db-wal-*`/`db-sst-*`
+files are never misread as tablet engine files). No `animus_cp_data::
+host::plan`/`Reconciler` change was needed on this side — only the trait
+implementation.
+
+**The formerly-`#[ignore]`d scenario is now a positive, un-ignored
+assertion**, renamed `scenario_4_a_node_crashed_during_the_drop_and_
+restarted_reclaims_its_engine` (`sim_cluster_dynamo_drop_table.rs`),
+replayed at the original six investigation seeds
+(`0xE4AF_0004`, `0xE4AF_4000..=0xE4AF_4004`) plus ten more
+(`_over_seeds`). **Two real test-harness bugs, unrelated to the fix
+itself, were found and fixed delivering this positive assertion — both
+worth recording as general lessons, not just this scenario's own
+footnotes**:
+
+- **The victim node must be neither the tablet's own data-plane leader NOR
+  the control-plane's own leader.** The scenario's original victim
+  selection only excluded the data-plane leader; crashing a victim that
+  also happened to be the control-plane leader forced a control-plane
+  election before `DeleteTable`'s own 10s commit-wait could ever succeed —
+  an entirely different (and, empirically, not always fast enough under
+  this fixture's own polling) scenario the test was never trying to
+  exercise. A 200-seed scan at an unrelated fresh seed range found this
+  hit roughly half the time; fixed by excluding
+  `cluster.control_leader_index()` too — a 3-node cluster always has a
+  node that is neither.
+- **`assert_reclaimed`'s own convergence check was split across two
+  passes — a metadata/hosted-set poll, then a separate, unwaited engine
+  read — which is unsound for a just-restarted node specifically.** A
+  freshly restarted control `RaftNode` in this fixture starts from a
+  genuinely blank `Metadata` (see `sim_cluster.rs`'s own `restart` doc),
+  indistinguishable at that instant from "already caught up to the table
+  being dropped" — so the metadata/hosted-set half of the check could
+  (and, for the pinned seed, did) converge on the very first poll, well
+  before the reconciler had ticked even once, and the separate post-loop
+  engine read then observed stale, pre-crash content and failed on
+  otherwise-correct behavior. Fixed by folding all three observables
+  (metadata absence, hosted-set absence, engine-empty) into the SAME poll
+  loop — this module's own doc now states the rule directly: never split
+  one converged-or-timeout property across two differently-timed checks,
+  the same root `CLAUDE.md` lesson wearing a new shape (a two-stage check
+  where each stage looks correct in isolation).
+
+**A matching real-disk regression** landed in `tests/drop_table_gc.rs`:
+`a_node_stopped_before_the_drop_and_restarted_after_reclaims_its_leftover_
+engine` — a real 3-node, one-process-per-node cluster, node 2's whole
+process stopped (`shutdown_graceful()`) before `DROP TABLE`, the drop
+issued and fully converged on the two live nodes, only then node 2
+restarted on the same directory/addresses
+(`support::restart_same_addrs`) — its own leftover `db-t{tablet}-*` files
+(`tablet_engine_present`, a new helper alongside the file's existing
+`tablet_wal_present`) are gone within a bounded converge-or-timeout poll.
+Run 3x locally with no flake before landing.
