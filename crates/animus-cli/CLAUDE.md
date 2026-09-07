@@ -157,6 +157,15 @@ control-remove <leader-admin-addr> <node-id> [--force]               # ADR 0037 
 control-grow <leader-admin-addr> <node-id> <admin-addr> [<node-id> <admin-addr>...]
 ```
 
+- `flush`/`compact`/`reconfigure`/`drain`/`drain-status`/`remove`/
+  `stream-grow` (roadmap C-04 E2) all build their `(method, path, body)`
+  through `admin_request` too, same as every other route on this page —
+  each now has its own `admin_request` unit test covering the happy path
+  and the argument-error paths the parser already has (a missing arg, a
+  non-numeric tablet, `reconfigure`'s own unvalidated trailing-comma
+  voter list). `decommission`/`control-add`/`control-grow`/
+  `control-remove` above are excluded — real orchestration, not
+  `admin_request` arms, so nothing here covers them end to end.
 - Metrics/storage views are **per node** (a follower's leader-only counters
   are legitimately 0) — point them at the relevant node.
 - **`decommission` is real orchestration, not a one-shot passthrough**

@@ -286,15 +286,15 @@ the still-true paragraph after the table.
   auto-split/GC/join/backup-janitor).
 - **E1 landed 2026-09-04** (`ClusterApi`/`AdminOps` seams in
   `animus-operator`, fake-driven `controller::tests`; ADR 0061's
-  2026-09-04 amendment). **E2 not yet fully closed**, even though U-08 (its
-  own planned home) landed in full 2026-09-06: U-08(i)'s eight flat GET
-  arms and U-08(ii)'s six dynamo-proxy wrappers all now have their own
-  `admin_request` unit tests, but several pre-existing one-shot mutating
-  arms predating both — `drain`/`drain-status`/`remove`/`reconfigure`/
-  `flush`/`compact`/`stream-grow` — still have none, so ADR 0061's own
-  "741 currently-untested lines" framing isn't fully retired. A follow-up
-  PR adding `admin_request` tests for exactly those arms (same shape as
-  every test U-08 already added) would close it; not sized here.
+  2026-09-04 amendment). **E2 landed 2026-09-07**: the seven pre-existing
+  one-shot mutating arms predating both U-08(i) and U-08(ii) —
+  `drain`/`drain-status`/`remove`/`reconfigure`/`flush`/`compact`/
+  `stream-grow` — now each have their own `admin_request` unit tests
+  (happy path + the argument-error paths the parser already has, same
+  shape as every test U-08 already added); all seven already built their
+  request through `admin_request`, so no dispatch refactor was needed.
+  `cargo test -p animus-cli` went from 61 to 78 passing (ADR 0061's
+  2026-09-07 amendment).
 - **ADR:** amendment notes on 0061.
 
 ---

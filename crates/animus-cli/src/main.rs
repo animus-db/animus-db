@@ -1469,6 +1469,139 @@ mod tests {
         );
     }
 
+    // --- Pre-existing one-shot mutating arms (roadmap C-04 E2): these seven
+    // arms — `drain`/`drain-status`/`remove`/`reconfigure`/`flush`/`compact`/
+    // `stream-grow` — predate both U-08(i) and U-08(ii) and had no coverage
+    // of their own until now. Same shape as every other `admin_request` test
+    // in this module: happy path + the argument-error paths the parser
+    // already has, no new validation added.
+
+    #[test]
+    fn stream_grow_posts_the_table() {
+        let (method, path, body) = admin_request("stream-grow", &args(&["orders"])).unwrap();
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/admin/stream/grow");
+        assert_eq!(body, Some(r#"{"table":"orders"}"#.to_string()));
+    }
+
+    #[test]
+    fn stream_grow_needs_a_table() {
+        assert!(admin_request("stream-grow", &args(&[])).is_err());
+    }
+
+    #[test]
+    fn flush_posts_the_tablet() {
+        let (method, path, body) = admin_request("flush", &args(&["5"])).unwrap();
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/admin/storage/flush");
+        assert_eq!(body, Some(r#"{"tablet":5}"#.to_string()));
+    }
+
+    #[test]
+    fn compact_posts_the_tablet() {
+        let (method, path, body) = admin_request("compact", &args(&["5"])).unwrap();
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/admin/storage/compact");
+        assert_eq!(body, Some(r#"{"tablet":5}"#.to_string()));
+    }
+
+    #[test]
+    fn flush_and_compact_need_a_tablet() {
+        assert!(admin_request("flush", &args(&[])).is_err());
+        assert!(admin_request("compact", &args(&[])).is_err());
+    }
+
+    #[test]
+    fn flush_and_compact_reject_a_non_numeric_tablet() {
+        assert!(admin_request("flush", &args(&["not-a-number"])).is_err());
+        assert!(admin_request("compact", &args(&["not-a-number"])).is_err());
+    }
+
+    #[test]
+    fn reconfigure_posts_the_tablet_and_voter_list() {
+        let (method, path, body) = admin_request("reconfigure", &args(&["5", "n1,n2,n3"])).unwrap();
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/admin/raftkv/reconfigure");
+        assert_eq!(
+            body,
+            Some(r#"{"tablet":5,"voters":["n1","n2","n3"]}"#.to_string())
+        );
+    }
+
+    #[test]
+    fn reconfigure_trims_whitespace_around_each_voter() {
+        let (_, _, body) = admin_request("reconfigure", &args(&["5", "n1, n2 , n3"])).unwrap();
+        assert_eq!(
+            body,
+            Some(r#"{"tablet":5,"voters":["n1","n2","n3"]}"#.to_string())
+        );
+    }
+
+    #[test]
+    fn reconfigure_needs_a_tablet_and_a_voter_list() {
+        assert!(admin_request("reconfigure", &args(&[])).is_err());
+        assert!(admin_request("reconfigure", &args(&["5"])).is_err());
+    }
+
+    #[test]
+    fn reconfigure_rejects_a_non_numeric_tablet() {
+        assert!(admin_request("reconfigure", &args(&["not-a-number", "n1,n2"])).is_err());
+    }
+
+    /// A malformed voter list — here, a trailing comma — is not rejected by
+    /// this parser: `split(',')` yields a trailing empty string, which
+    /// passes straight through as a voter named `""`. Documented as a
+    /// regression pin of the parser's actual (permissive) behavior, not as
+    /// an endorsement of it — validating voter *identifiers* is the
+    /// server's job, same as every other admin route here.
+    #[test]
+    fn reconfigure_a_trailing_comma_in_the_voter_list_produces_an_empty_voter() {
+        let (_, _, body) = admin_request("reconfigure", &args(&["5", "n1,n2,"])).unwrap();
+        assert_eq!(
+            body,
+            Some(r#"{"tablet":5,"voters":["n1","n2",""]}"#.to_string())
+        );
+    }
+
+    #[test]
+    fn drain_posts_the_node() {
+        let (method, path, body) = admin_request("drain", &args(&["n5"])).unwrap();
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/admin/drain");
+        assert_eq!(body, Some(r#"{"node":"n5"}"#.to_string()));
+    }
+
+    #[test]
+    fn drain_needs_a_node_id() {
+        assert!(admin_request("drain", &args(&[])).is_err());
+    }
+
+    #[test]
+    fn drain_status_is_a_flat_get_querying_the_node() {
+        let (method, path, body) = admin_request("drain-status", &args(&["n5"])).unwrap();
+        assert_eq!(method, "GET");
+        assert_eq!(path, "/admin/member/drain-status?node=n5");
+        assert_eq!(body, None);
+    }
+
+    #[test]
+    fn drain_status_needs_a_node_id() {
+        assert!(admin_request("drain-status", &args(&[])).is_err());
+    }
+
+    #[test]
+    fn remove_posts_the_node() {
+        let (method, path, body) = admin_request("remove", &args(&["n5"])).unwrap();
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/admin/member/remove");
+        assert_eq!(body, Some(r#"{"node":"n5"}"#.to_string()));
+    }
+
+    #[test]
+    fn remove_needs_a_node_id() {
+        assert!(admin_request("remove", &args(&[])).is_err());
+    }
+
     #[test]
     fn unknown_subcommand_is_an_error() {
         assert!(admin_request("no-such-thing", &args(&[])).is_err());

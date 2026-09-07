@@ -1221,6 +1221,36 @@ deterministically and cheaply; the e2e smoke proves the *real* Kubernetes
 interaction once, expensively, and only where the sandbox allows it to run
 at all.
 
+#### 2026-09-07 amendment — E2 closed: `admin_request` tests for the last seven mutating arms
+
+E2 is done. U-08(i) (2026-09-04) and U-08(ii) (2026-09-06) covered the flat
+GET arms and the dynamo-proxy wrappers, but left seven pre-existing
+one-shot mutating arms — `drain`/`drain-status`/`remove`/`reconfigure`/
+`flush`/`compact`/`stream-grow` — with no `admin_request` unit tests of
+their own, so this ADR's "741 currently-untested lines" framing wasn't
+fully retired. This rung closes exactly that gap: all seven arms already
+built their `(method, path, body)` through `admin_request` (`crates/
+animus-cli/src/main.rs`), the same pure, socket-free function every other
+arm's tests already exercise, so no dispatch refactor was needed — only
+tests, same shape as every existing `admin_request` test (happy path +
+the argument-error paths the parser already has).
+
+One test pins existing, deliberately-unvalidated behavior rather than
+new behavior: `reconfigure`'s voter-list parsing (`split(',')`) does not
+reject a trailing comma — it produces a voter named `""` — and
+`reconfigure_a_trailing_comma_in_the_voter_list_produces_an_empty_voter`
+documents that as the parser's actual contract (voter-identifier
+validation is the server's job, same as every other admin route here),
+not as new client-side validation added by this rung.
+
+**Gates**: `cargo fmt --all --check`, `cargo clippy -p animus-cli
+--all-targets --all-features -- -D warnings` (clean), `cargo test -p
+animus-cli` (78 passed, up from 61). No production code changed —
+`admin_request`'s dispatch is untouched, only its `#[cfg(test)]` module
+grew.
+
+With this, both Phase E rungs (E1, E2) are closed.
+
 ## Consequences
 
 **Good.** The node's own logic — routing, forwarding, retry, 2PC
