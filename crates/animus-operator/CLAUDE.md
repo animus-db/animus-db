@@ -1112,6 +1112,76 @@ not a `cargo run` supervisor — `cleanup()`'s pre-existing belt-and-
 suspenders `pkill -f "animus-operator run"` is now clearly redundant
 (kept anyway, harmless).
 
+**The S-07d `controlNodes` growth wait is a converge-or-STALL wait, not a
+flat deadline (issue #705, also closes the #703 e2e-kind-encryption
+finding).** The flat `300s wait_for "control group reports 4 voters"` this
+used to be ran into two independent problems on two separate real CI runs,
+both of which land on the same wait: (1) run 34085241118 — the
+newly-promoted ordinal-3 pod exited cleanly (`Reason: Completed, Exit Code:
+0`) three times over ~4 minutes before stabilizing. Tracing
+`crates/animusd/src/main.rs` confirms `wait_for_ctrl_c` (SIGINT/SIGTERM,
+`node.shutdown_graceful().await`, then `Ok(())`) is the **only** code path
+by which a running `animusd` process — combined or data role — returns
+`Ok(())`; every startup/runtime error instead takes the `Err` path to a
+nonzero `ExitCode::FAILURE`. So a repeated clean exit is necessarily
+SIGTERM-driven, never an application-level crash — the exact SIGTERM
+source (a livenessProbe kill vs. something else) was **not** pinned down
+in this investigation, since the diagnostics dump at the time didn't
+capture `kubectl logs --previous` for the crashed instances (now fixed,
+see below) — but each restart genuinely delayed
+`advance_control_growth`'s own `/admin/config` polling (`REQUEUE_OK=30s`
+cadence in `controller.rs`), landing the first possible `member/add` call
+2s after the old flat deadline even though the growth mechanism itself was
+healthy throughout. A stale-ConfigMap-volume read (the kubelet's own
+periodic resync of a mounted `ConfigMap`) was investigated and **ruled
+out** as the trigger: `entrypoint.sh` and `cluster.json` are two keys of
+the same `ConfigMap` object, so a pod can never mount one stale and the
+other fresh, and even a wholesale-stale mount would just re-run ordinal 3
+in its own prior, already-healthy `data` role — it doesn't explain a
+restart storm either way. (2) PR #703's e2e-kind-encryption run
+(34100368447) hit the identical wait for a different reason: it polls
+`GET /admin/control/members` through the port-forward established
+*before* `controlNodes` was even patched, and the S-07d rolling restart
+recycled that pinned pod (e2e-2) mid-wait — `kubectl port-forward
+pod/...` dies silently the moment its target pod is deleted/recreated,
+and the pre-#705 `control_voters_count` folded every subsequent
+connection failure into a bare `0`, so the wait spun out its entire
+remaining budget reading a false "0 voters" instead of noticing it had
+lost its connection.
+
+`scripts/e2e-kind.sh`'s own `wait_for_progress` (a second wait primitive
+alongside the pre-existing `wait_for`, same DESC/interval style) fixes
+both: it keeps waiting as long as *any* of a small set of progress signals
+is still changing — the promoted ordinal's own restart count/ready
+condition/phase (read straight off the API server via `kubectl get pod`,
+so immune to problem (2)) and the live voter count once a reading is
+actually obtainable (`control_voters_reading`, which now self-heals the
+port-forward — `resolve_and_forward_dynamo_pod`, extracted from what used
+to be two near-duplicate inline blocks — on a connection failure rather
+than ever reporting a false `0`, closing problem (2) directly) — and fails
+only once `STALL_SECS` pass with every one of those signals unchanged, or
+a `600s` hard ceiling is hit, whichever comes first. Deliberately **not**
+applied to the earlier `nodes`/`readyReplicas` waits, or to any shrink
+path (this script has none — `controlNodes` decrease rejection is
+unit-tested in `controller.rs` and, since S-07e, checked live by the
+webhook e2e leg via a rejected `kubectl patch`, never a `wait_for` loop):
+those poll purely via `kubectl` (not the pinned port-forward, so problem
+(2) doesn't apply) and a plain `spec.nodes` scale-up only ever creates a
+brand-new pod rather than restarting an existing one (so problem (1)'s
+restart-storm risk doesn't apply either — see this file's own S-07d
+config-hash section for why only a `ConfigMap`-affecting change, like a
+`controlNodes` role-split flip, rolls already-running pods).
+
+`dump_diagnostics` also gained, per pod/per container: its current
+restart count and `lastState`, and — whenever that count is `> 0` —
+`kubectl logs --previous --tail=200` for that container (issue #705). The
+pre-existing `--tail=100` current-instance log capture only ever shows
+whichever instance is running *right now*; once a container has
+restarted, the crashed instance's own output is gone from that stream
+entirely, which is exactly what made this issue's own root cause
+unconfirmable from the original job log. A recurrence now carries the
+crashed instance's own stdout/stderr in the diagnostics dump.
+
 **Two script-side hardenings for a flake this smoke hit twice with the
 identical signature (issue #595)**, on top of the actual root-cause fix
 (ADR 0020's 2026-09-04 amendment; `animus-control`/`animusd::admin` — a
