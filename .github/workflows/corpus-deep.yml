@@ -88,6 +88,10 @@ on:
         description: "Seeds per cell (ANIMUS_SIMCLUSTER_SEEDS, ADR 0061 rung D1 SimCluster cycles/durability corpus)"
         required: false
         default: "25"
+      dynamo_wire_seeds:
+        description: "Seeds per cell (ANIMUS_DYNAMO_WIRE_SEEDS, ADR 0061 rung D2 PR 2 end-to-end DynamoDB-wire cycles/durability corpus)"
+        required: false
+        default: "25"
       export_import_seeds:
         description: "Seeds per scenario (ANIMUS_EXPORT_IMPORT_SEEDS, ADR 0068 S3 export/import fault corpus)"
         required: false
@@ -390,6 +394,21 @@ jobs:
           ANIMUS_SIMCLUSTER_SEEDS: ${{ github.event.inputs.simcluster_seeds || '25' }}
         run: cargo test -p animusd --lib sim_cluster_corpus -- --nocapture
 
+      # ADR 0061 rung D2 PR 2's own end-to-end DynamoDB-wire corpus: the
+      # identical fault matrix as the SimCluster corpus just above, but
+      # every op issued as a real DynamoDB JSON request (PutItem/GetItem
+      # at both ConsistentRead levels/UpdateItem's list_append/DeleteItem/
+      # BatchWriteItem/base-table Query and Scan) through `SimClusterHandle::
+      # dynamo`, decoded back into the same Recorder/History model. Each
+      # cell is a pure function of its seed, so a failure names one cell +
+      # seed and is replayable.
+      - name: deep DynamoDB-wire cycles/durability corpus (ADR 0061 rung D2 PR 2)
+        id: dynamo_wire
+        continue-on-error: true
+        env:
+          ANIMUS_DYNAMO_WIRE_SEEDS: ${{ github.event.inputs.dynamo_wire_seeds || '25' }}
+        run: cargo test -p animusd --lib sim_cluster_dynamo_corpus -- --nocapture
+
       # ADR 0068's S3 export/import job driver + import driver: multi-tablet
       # export content fidelity, concurrent writes racing the pin, bucket
       # faults, a crash mid-export/mid-import (the ADR's own named
@@ -467,13 +486,14 @@ jobs:
             [segment_store_encrypted]="${{ steps.segment_store_encrypted.outcome }}"
             [control]="${{ steps.control.outcome }}"
             [simcluster]="${{ steps.simcluster.outcome }}"
+            [dynamo_wire]="${{ steps.dynamo_wire.outcome }}"
             [export_import]="${{ steps.export_import.outcome }}"
             [heartbeat]="${{ steps.heartbeat.outcome }}"
             [sharedwal]="${{ steps.sharedwal.outcome }}"
           )
           failed=0
           failed_names=()
-          for name in raftkv raftkv_lsm raftkv_wal_faults txn streams backfill split reconciler quiesce learner inplace_split backup pitr lsm_crash lsm_disk_fault lsm_encrypted segment_store_encrypted control simcluster export_import heartbeat sharedwal; do
+          for name in raftkv raftkv_lsm raftkv_wal_faults txn streams backfill split reconciler quiesce learner inplace_split backup pitr lsm_crash lsm_disk_fault lsm_encrypted segment_store_encrypted control simcluster dynamo_wire export_import heartbeat sharedwal; do
             outcome="${outcomes[$name]}"
             echo "${name}: ${outcome}"
             if [ "${outcome}" != "success" ]; then

@@ -5844,17 +5844,100 @@ write through any survivor node index instead, without consulting
 the real leader internally, exactly the shape `sim_cluster.rs`'s own
 scenario 3 already uses.
 
-**PR 2's plan**: generic GSI/LSI `Query`/`Scan`; `TransactWriteItems`/
-`TransactGetItems` (blocked on a new proof — `ClientCtx::propose_schema`'s
-relayed path successfully auto-provisioning the internal idempotency table
-against a genuine multi-voter `SimEnv` control quorum, never yet exercised
-by any fixture in this crate); `ExecuteStatement`/`BatchExecuteStatement`/
-`ExecuteTransaction` (PartiQL, no new logic once the above are generic);
-and the actual corpus — a `Recorder`/`History` model over
-`SimClusterHandle::dynamo`, `check_cycles`/`check_durability`/
-`check_convergence`, `sim_cluster_corpus`'s own Nemesis matrix
-generalized to DynamoDB-wire ops, an `ANIMUS_DYNAMO_WIRE_SEEDS` depth
-knob, and a `corpus-deep.yml` tier entry.
+**PR 2's plan** (landed — see `sim_cluster_dynamo_corpus` below): generic
+GSI/LSI `Query`/`Scan`; `TransactWriteItems`/`TransactGetItems` (still
+blocked on a new proof — `ClientCtx::propose_schema`'s relayed path
+successfully auto-provisioning the internal idempotency table against a
+genuine multi-voter `SimEnv` control quorum, never yet exercised by any
+fixture in this crate); `ExecuteStatement`/`BatchExecuteStatement`/
+`ExecuteTransaction` (PartiQL, no new logic once the above are generic) —
+all three remain unbuilt, named as PR 2's own residuals rather than
+attempted; the actual corpus itself is what PR 2 delivered.
+
+### `sim_cluster_dynamo_corpus`: the actual end-to-end DynamoDB-wire corpus (ADR 0061 rung D2 PR 2)
+
+`crates/animusd/src/sim_cluster_dynamo_corpus.rs` (`#[cfg(test)] mod
+sim_cluster_dynamo_corpus;` from `lib.rs`, a sibling of `sim_cluster_
+corpus`/`sim_cluster_dynamo` for the identical privacy reason those two
+already document) is `sim_cluster_dynamo.rs`'s own "PR 2's plan" delivered:
+a list-append `Recorder`/`History` model over `SimClusterHandle::dynamo`
+— PR 1's generic entry point — checked with the identical `animus_test::
+check::{check_cycles, check_durability, check_convergence}` oracle
+`sim_cluster_corpus` already uses, but with every op crossing the real
+DynamoDB JSON wire codec (`animus_dynamo::wire::decode_request` →
+`dynamo::dispatch_item_op`) first. Reuses `sim_cluster_corpus`'s own 8
+named cells (`baseline`/`leader_crash`/`follower_crash`/`stop_restart`/
+`leader_partition`/`split_brain`/`forward_heavy`/`two_tables`) and fault
+matrix verbatim — the fault dimension is unchanged from D1, only the
+workload riding on top moved onto the wire. Run via `cargo test -p
+animusd --lib sim_cluster_dynamo_corpus`; depth knob
+`ANIMUS_DYNAMO_WIRE_SEEDS` (default 1 = the 8 frozen cells, held green at
+`=25` in ~10m2s wall (601s test-binary time, 200 scenarios) — see this module's own Gates entry in the ADR's matching
+2026-09-07 amendment for the exact commands).
+
+**The list-append mapping: a server-evaluated `UpdateItem`, not a
+client-tracked list.** `sim_cluster_corpus`'s own write is a plain `put`
+of a client-maintained, locally-extended list — sound only because a raw
+`put` is an idempotent whole-value overwrite. This corpus's one write
+mechanism is instead a real `UpdateItem` request whose
+`UpdateExpression` is `SET items = list_append(if_not_exists(items,
+:empty), :v)` — a **server-evaluated**, genuinely non-idempotent
+operation (a duplicated apply of the same entry would append the same
+value twice, unlike a plain `Put`), satisfying the "SET and list_append,
+non-idempotent" write shape with one expression; no separate `ADD` op was
+needed. `if_not_exists(items, :empty)` means the very first write to a
+key needs no separate provisioning step — the checker's `info`-not-`fail`
+discipline for an indeterminate `UpdateItem` response is what makes this
+safe under a fault.
+
+**The read-consistency modeling decision (ADR 0055).** `GetItem`/`Query`/
+`Scan` all decode `ConsistentRead`, and this corpus issues both values —
+but only `ConsistentRead: true` observations feed the shared history
+`check_cycles` runs against (the same "a read that verifies a write must
+ask for `ConsistentRead: true`" discipline this file's own ADR 0055
+testing-gotcha entry states). `ConsistentRead: false` reads are excluded
+from `check_cycles`'s history entirely (the shared, cross-crate checker
+has no weaker-read flag, and feeding a replica-local un-barriered
+observation into the same `wr`/`rw` graph a linearizable read builds would
+manufacture false-positive "divergence" violations the instant a
+stale-but-legal read landed during a fault window) — each is instead
+recorded separately and checked as a **prefix of the scenario's own
+converged final state** once the fault schedule has healed and drained,
+sound under this corpus's single-writer-per-key discipline (a
+lagging/un-barriered replica can only have observed an earlier state of
+the one writer's own strictly-ordered commit sequence). The same
+exclusion `sim_cluster_corpus` already made for `delete` (a workload shape
+the shared checker's model doesn't fit, not a defect either side), applied
+to a second dimension this corpus introduces.
+
+**`DeleteItem`/`BatchWriteItem` are exercised but kept out of
+`check_cycles`**, for the identical reason `delete` already is in
+`sim_cluster_corpus`: a tombstoning delete cannot satisfy the list-append
+prefix invariant, and a `BatchWriteItem` `PutRequest` is a whole-item
+overwrite, not an append. Both get their own direct correctness probes
+(`run_delete_probe`/`run_batch_write_probe`), run from every node in the
+cluster in turn post-heal/drain, on key namespaces (`delete-probe-*`/
+`batch-probe-*`) disjoint from the list-append model's own `part-*`/
+`item-*` keys.
+
+**Base-table `Query`/`Scan` feed the same history, as multiple
+`Mop::Read`s per transaction.** Every table's items live under exactly two
+fixed partition keys (`part-0`/`part-1`), so a `Query` (`pk = :p`) returns
+a real, strict subset of what a `Scan` returns — genuinely exercising
+`dispatch_item_op`'s base-table `Query` arm rather than a `Scan` synonym —
+and both decode every returned item into one `Mop::Read`, all recorded as
+one history entry (`Recorder::ok` already takes a `Vec<Mop>` for exactly
+this shape).
+
+**Residuals, unchanged from PR 1's own list, pushed one rung further
+out**: GSI/LSI `Query`/`Scan`, `TransactWriteItems`/`TransactGetItems`,
+and PartiQL are all still unreachable through the generic
+`dispatch_item_op` core this corpus drives — deferred to D3/D4, not
+attempted here.
+
+**No product bug found.** Every cell held green at both the frozen and
+`=25` depths on the first complete run; the `ConsistentRead: false`
+prefix check and both direct probes never found a violation.
 
 ## Tests
 

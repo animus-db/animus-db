@@ -841,7 +841,7 @@ supply one, and isn't trying to.
 | Rung | Work |
 |---|---|
 | D1 | `SimCluster` harness: a multi-node cluster driven by `SimEnv`, on B1's shared corpus scaffolding. Built on `ClientCtx<SimEnv>` in `animusd`'s own tests, per the seventh 2026-08-28 amendment — not on a moved `animus-node` assembly |
-| D2 | An end-to-end DynamoDB-wire corpus — requests in at the wire edge, faults injected, resulting history checked by the existing `check_cycles`/`check_durability`/`check_convergence`. **PR 1 landed 2026-09-07** (six item operations generic, `SimClusterHandle::dynamo`, a first small smoke — see the amendment below); **PR 2 pending** (GSI/LSI, transact, PartiQL, the actual corpus) |
+| D2 | An end-to-end DynamoDB-wire corpus — requests in at the wire edge, faults injected, resulting history checked by the existing `check_cycles`/`check_durability`/`check_convergence`. **Landed 2026-09-07 (both PRs)**: PR 1 (six item operations generic, `SimClusterHandle::dynamo`, a first small smoke) and PR 2 (the actual `Recorder`/`History` corpus over the wire, see the amendments below); GSI/LSI, transact, and PartiQL remain out of scope, named as D2's own residuals |
 | D3 | Migrate the `animusd` integration suite: **keep** the tests that genuinely prove real-thread liveness (group commit, lock contention, election timing — per the engineering-lessons rule that `SimEnv` does not prove thread liveness), convert the rest. Success is measured by the `prod-liveness` CI job shrinking enough to drop its 2-attempt retry |
 | D4 | Deterministic coverage for the behaviours that have none today: the auto-split byte trigger (`lib.rs:14397`), the dropped-table GC reclaim loop, join/growth sequencing, and the backup-janitor async loop (its replicated state machine is already sim-tested in `animus-control/tests/backup_catalog.rs`; the loop driving it is not) |
 
@@ -1301,6 +1301,122 @@ one real bug this rung found (the `Query`/`Scan` production regression
 above) was caught before it ever reached a committed state, by the
 existing `cargo test -p animusd --lib` run this rung's own gate list
 requires anyway.
+
+#### 2026-09-07 amendment — D2 PR 2 landed: the actual end-to-end DynamoDB-wire corpus
+
+D2 PR 2 is done: `crates/animusd/src/sim_cluster_dynamo_corpus.rs`
+(`#[cfg(test)] mod sim_cluster_dynamo_corpus;` from `lib.rs`, a sibling of
+`sim_cluster_corpus`/`sim_cluster_dynamo` for the identical privacy reason
+those two already document) — a list-append `Recorder`/`History` model
+over `SimClusterHandle::dynamo` (PR 1's own generic entry point), checked
+with the identical `animus_test::check::{check_cycles, check_durability,
+check_convergence}` oracle `sim_cluster_corpus.rs` already uses, driven
+through the **real** DynamoDB JSON wire (`PutItem`/`GetItem`/`UpdateItem`/
+`DeleteItem`/`BatchWriteItem`/base-table `Query`/`Scan`) instead of the raw
+`cp_kind_write_raw`/`cp_get` primitives that corpus calls directly. Same 8
+cells, same fault matrix, same converged-or-timeout durability/convergence
+poll — the fault dimension this rung exercises was already proven by D1;
+what's new here is that every op crosses the wire codec
+(`animus_dynamo::wire::decode_request`/`dynamo::dispatch_item_op`) first.
+
+**The list-append mapping: a server-evaluated `UpdateItem`, not a
+client-tracked list.** `sim_cluster_corpus.rs`'s own write is a plain
+`put` of a client-maintained, locally-extended list — sound only because a
+raw `put` is an idempotent whole-value overwrite. This corpus's one write
+mechanism is instead
+
+```
+SET items = list_append(if_not_exists(items, :empty), :v)
+```
+
+— a **server-evaluated**, genuinely non-idempotent operation (a
+duplicated apply of the same entry would append the appended value twice,
+unlike a plain `Put`), which is exactly the `SET`-plus-`list_append`
+non-idempotent write the task brief for this rung asked for; no separate
+`ADD` op was needed to get that property, since `list_append` already has
+it by construction. `if_not_exists(items, :empty)` means the very first
+write to a key needs no separate provisioning step.
+
+**The read-consistency modeling decision (ADR 0055).** `GetItem`/`Query`/
+`Scan` all decode `ConsistentRead`, and this corpus issues both values —
+but only `ConsistentRead: true` observations feed the shared
+`Recorder`/`History` `check_cycles` runs against (a linearizable
+ReadIndex read is a real, ordered observation, the same discipline
+`sim_cluster_corpus.rs`'s own ADR 0055 testing-gotcha entry states).
+`ConsistentRead: false` reads are excluded from `check_cycles`'s history
+entirely — feeding a replica-local, un-barriered observation into the same
+`wr`/`rw` graph a linearizable read builds would manufacture false-positive
+"divergence" violations the instant a stale-but-legal read landed during a
+fault window, since `check_cycles`'s shared, cross-crate model has no
+weaker-read flag to distinguish "legitimately stale" from "actually
+forked." Every `ConsistentRead: false` observation is instead recorded
+separately and checked directly against the scenario's own **converged
+final state** once the fault schedule has healed and drained: each
+observed list must be a prefix of the converged state — sound under this
+corpus's single-writer-per-key discipline, since a lagging/un-barriered
+replica can only ever have observed an *earlier* state of the one writer's
+own strictly-ordered commit sequence. This is the same kind of exclusion
+`sim_cluster_corpus.rs` already made for `delete` (workload-shape excluded
+from a checker whose model doesn't fit, not a defect in either side),
+applied to a second dimension the wire corpus newly introduces. No
+violation was ever observed across the depth runs below — the exclusion
+is a modeling decision proven sound by this corpus's own passing runs, not
+an untested hope.
+
+**`DeleteItem`/`BatchWriteItem` are exercised but kept out of
+`check_cycles`**, for the identical reason `delete` already was in
+`sim_cluster_corpus.rs`: a tombstoning `DeleteItem` cannot satisfy the
+list-append prefix invariant, and a `BatchWriteItem` `PutRequest` is a
+whole-item overwrite, not an append. Both get their own direct correctness
+probes (`run_delete_probe`/`run_batch_write_probe`), run from every node
+in the cluster in turn after the fault schedule heals and drains, on key
+namespaces (`delete-probe-*`/`batch-probe-*`) disjoint from the
+list-append model's own keys.
+
+**Base-table `Query`/`Scan` feed the same history, as multiple `Mop::Read`s
+per transaction.** Every table's items live under exactly two fixed
+partition keys, so a `Query` (`pk = :p`) returns a real, strict subset of
+what a `Scan` returns — genuinely exercising `dispatch_item_op`'s
+base-table `Query` arm rather than a `Scan` synonym — and both decode every
+returned item into one `Mop::Read`, all recorded as one history entry
+(`Recorder::ok` already takes a `Vec<Mop>` for exactly this shape).
+
+**Depth knob**: `ANIMUS_DYNAMO_WIRE_SEEDS` (default 1 = the 8 frozen
+cells). Held green at `=25` locally — **default depth ~25s (8 scenarios);
+depth 25 ~10m2s wall / 601.29s test-binary time (200 scenarios)** — see the
+Gates section below for the exact commands and counts.
+`ANIMUS_SEED`/`ANIMUS_SHRINK`/`ANIMUS_SHRINK_REPLAY` wiring
+(`sim_cluster_dynamo_shrink_replay`) mirrors `sim_cluster_corpus.rs`'s own
+exactly. A structural `dynamo_wire_corpus_covers_the_fault_matrix` guard
+(mirroring `sim_cluster_corpus_covers_every_cell_shape`) pins the 8-cell
+set and its fault-class/forward-heavy/multi-table coverage. `corpus-deep.
+yml` gained a `dynamo_wire` tier entry at the same depth
+`ANIMUS_SIMCLUSTER_SEEDS` uses (`=25`), and root `CLAUDE.md`'s env-var
+table gained the matching row.
+
+**Residuals, named rather than silently skipped** (identical to D2 PR 1's
+own "PR 2's plan" list, now pushed one rung further out): GSI/LSI
+`Query`/`Scan`, `TransactWriteItems`/`TransactGetItems`, and PartiQL
+(`ExecuteStatement`/`BatchExecuteStatement`/`ExecuteTransaction`) are all
+still unreachable through the generic `dispatch_item_op` core this corpus
+drives (`execute_item_op_as` returns a clean `InternalServerError` for any
+of them) — see `dynamo.rs`'s own `dispatch_item_op` doc for the full
+"what's `ProdEnv`-only, why" account. Deferred to D3/D4, not attempted
+here; this rung's own scope was "the actual corpus," not widening the
+generic dispatch surface further.
+
+**No product bug found.** Every cell held green at both the frozen and
+`=25` depths on the first complete run; the `ConsistentRead: false`
+prefix check and both direct probes never found a violation either.
+
+**Gates**: `cargo fmt --all --check`; `cargo clippy -p animusd
+--all-targets --all-features -- -D warnings` (clean); `cargo test -p
+animusd --lib` (green, including `sim_cluster_corpus` and the new
+`sim_cluster_dynamo_corpus` at default depth); `ANIMUS_DYNAMO_WIRE_
+SEEDS=25 cargo test -p animusd --lib sim_cluster_dynamo_corpus` (24 cells,
+green — 200 scenarios, `test result: ok. 3 passed`, `finished in 601.29s`, wall `10m2.300s`); `cargo test -p animusd --test dynamo_wire` (real-socket
+sanity, unchanged, green — proof this rung touched no production dispatch
+code, only added a new test module).
 
 ### Phase E — the untested crates
 

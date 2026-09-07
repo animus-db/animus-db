@@ -17250,6 +17250,22 @@ mod sim_cluster_throttle;
 #[cfg(test)]
 mod sim_cluster_dynamo;
 
+/// The actual end-to-end DynamoDB-wire corpus (ADR 0061 rung D2 PR 2,
+/// C-04 D2 step 3) — [`sim_cluster_dynamo`]'s own "PR 2's plan" delivered:
+/// every op issued as a real DynamoDB JSON request through
+/// `SimClusterHandle::dynamo`, decoded back into the shared `animus_test::
+/// history` `Mop`/`History` model so `check_cycles`/`check_durability`/
+/// `check_convergence` run unchanged, mirroring `sim_cluster_corpus`'s own
+/// architecture exactly. A sibling of `sim_cluster_corpus`/
+/// `sim_cluster_throttle`/`sim_cluster_dynamo` for the identical reason
+/// (needs `SimCluster`'s own `pub(crate)` surface, no further visibility
+/// widened). See that module's own doc for the list-append-via-`UpdateItem`
+/// mapping, the `ConsistentRead` modeling decision, the cell list, and the
+/// `ANIMUS_DYNAMO_WIRE_SEEDS` depth knob. Run via `cargo test -p animusd
+/// --lib sim_cluster_dynamo_corpus`.
+#[cfg(test)]
+mod sim_cluster_dynamo_corpus;
+
 /// Regression for the issue #298 residual confirmed live under the
 /// un-pinned `SplitMode::InPlace` proof soak (ADR 0018's matching amendment,
 /// `docs/engineering-lessons.md`'s matching entry): a stage blocked by
