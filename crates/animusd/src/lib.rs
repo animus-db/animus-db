@@ -9909,6 +9909,31 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// - `target` is not currently a live voter (`self.control.config()`):
     ///   refused outright — there is nothing to transfer to.
     ///
+    /// **`200`/`Ok(())` means `target` genuinely leads — not merely "this
+    /// node stepped down" (issue #688, fixing a second failure mode #671
+    /// left standing after #405/#671's first fix).** Once armed, this node
+    /// keeps heartbeating every peer while the transfer is pending and steps
+    /// down on **any** higher-term vote, not only the target's own
+    /// (`RaftCore`'s own doc) — under real scheduling jitter a *third*
+    /// voter's election timer can lapse on the same late heartbeats and win
+    /// the resulting election before or instead of the named target. A bare
+    /// "this node is no longer leader" observation therefore cannot tell
+    /// "the requested transfer completed" from "a different election
+    /// superseded it," so the poll below keeps going after step-down,
+    /// reading this node's own `RaftCore::leader()` (its live, continuously-
+    /// updated consensus belief, not a one-shot snapshot) until it names
+    /// `target` specifically:
+    /// - `target` becomes the observed leader: `Ok(())`.
+    /// - this node has stepped down and observes a **different**, stable
+    ///   leader: a distinct retryable refusal naming that node, since the
+    ///   caller must retry the *whole call* against the actual leader's own
+    ///   admin port (this node no longer has a `RaftCore` capable of
+    ///   arming anything once it isn't the leader) — never conflated with
+    ///   the plain arm/timeout refusal below, which still means "retry here,
+    ///   nothing has moved."
+    /// - the poll runs out with no leader observed at all (still this node,
+    ///   or an ongoing election): the original bounded-timeout refusal.
+    ///
     /// Bounded by [`CONTROL_TRANSFER_POLL_TIMEOUT`], the identical budget
     /// `admin_remove_control_member`'s own self-removal arm polls against —
     /// a transfer that never completes in time surfaces as its own,
@@ -9940,15 +9965,44 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         }
         let deadline = tokio::time::Instant::now() + CONTROL_TRANSFER_POLL_TIMEOUT;
         loop {
-            if !leader.is_leader() {
+            // `leader.leader()` is this node's own live `RaftCore` belief,
+            // not a one-shot snapshot — it keeps updating after this node
+            // steps down (cleared to `None` the instant a higher term is
+            // observed, `Some(winner)` once a genuine `AppendEntries`/
+            // `InstallSnapshot` from that term's leader arrives), so it can
+            // name the actual election winner even once this node is no
+            // longer leader. It is only ever `Some(target)` once this node
+            // has genuinely stepped down (a leader's own core reports
+            // itself, never a peer's), so this can't fire prematurely while
+            // the transfer is still pending.
+            if leader.leader().as_ref() == Some(&target) {
                 return Ok(());
             }
             if tokio::time::Instant::now() >= deadline {
-                return Err(format!(
-                    "leadership transfer to node {target} did not complete within \
-                     {}s; retry",
-                    CONTROL_TRANSFER_POLL_TIMEOUT.as_secs()
-                ));
+                return Err(match leader.leader() {
+                    // Stepped down, and a *different* voter is the stable
+                    // leader — a third voter won the election this
+                    // transfer's own `TimeoutNow` triggered (issue #688).
+                    // The caller's only path forward is the whole call
+                    // again, against that node's own admin port — this
+                    // node no longer has a `RaftCore` capable of arming
+                    // anything once it isn't the leader.
+                    Some(other) => format!(
+                        "control leadership moved to node {other}, not the \
+                         requested target {target} — a different voter won \
+                         the election this transfer triggered; retry the \
+                         whole request against node {other}'s admin port"
+                    ),
+                    // Either still this node (the transfer never got as far
+                    // as a step-down) or a step-down with no stable winner
+                    // observed yet (an election still in flight) — the
+                    // original "did not complete" refusal covers both.
+                    None => format!(
+                        "leadership transfer to node {target} did not complete within \
+                         {}s; retry",
+                        CONTROL_TRANSFER_POLL_TIMEOUT.as_secs()
+                    ),
+                });
             }
             tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
         }

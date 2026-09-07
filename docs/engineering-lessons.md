@@ -20550,3 +20550,74 @@ rejected too" — cheap to construct directly (mint the reservation, then
 attempt the unrelated command at the reserved id) and it is precisely the
 kind of cross-command interaction a single arm's own unit tests, however
 thorough, cannot catch by construction.
+- **A handoff route's success criterion must be the positive end state, not
+  the old holder letting go — "it stepped down" and "the new holder has it"
+  are different facts, and the second one is the only one a caller can act
+  on (issue #688, 2026-09-07).** `POST /admin/control/transfer` (ADR 0037,
+  ADR 0020) armed `RaftCore::transfer_leadership(target)` and, until this
+  fix, reported `200` the instant its own node was no longer the control
+  leader — treating "this node stepped down" as proof "the named target
+  now leads." Those are not the same fact: once armed, the old leader
+  keeps heartbeating every peer and steps down on **any** higher-term Raft
+  message it receives, not only a vote triggered by the target's own
+  `TimeoutNow` (`RaftCore::handle`'s ordinary higher-term step-down is
+  generic — it has no notion of "the vote I'm stepping down for is the one
+  I meant to arm"). Under real scheduling jitter — the reproducing case was
+  `admin_endpoint.rs` running 3 real OS threads on a CI runner starved
+  enough that the leader's heartbeats to *every* peer went missing
+  together — more than one follower's election timer can lapse on the same
+  gap, and a **third** voter this call never named can win the resulting
+  pre-vote/vote round before or instead of the target. The route's own
+  `admin_remove_control_member` self-removal sibling had already been hit
+  by a *related* but distinct bug (issue #405/#671, this file's own entry
+  above and below): "an arm attempt can fail outright with no retry of its
+  own." Issue #688 is the second, independent failure mode #671's own fix
+  left standing — even a **successfully armed** transfer can still resolve
+  to the wrong winner, and nothing about retrying the arm call touches
+  that, because the arm itself genuinely succeeded; what failed was the
+  route's own belief about who won afterward.
+
+  **Fix**: read the leader's own **live** `RaftCore::leader()` belief after
+  arming, not just its own `is_leader()` flag — `leader()` keeps updating
+  after this node steps down (cleared to `None` the instant a higher term
+  is observed, set to `Some(winner)` only once a genuine `AppendEntries`/
+  `InstallSnapshot` from that term's real leader arrives — never a guess),
+  so it can name the actual election winner even once this node is no
+  longer leader itself. `200` only once it names the requested target
+  specifically. If it names a **different**, stable voter instead, the
+  route returns a distinct, retryable `409` naming that voter, rather than
+  folding it into the same "did not complete; retry" message an arm/
+  timeout refusal uses — a caller needs to know it must retry the whole
+  `POST` against a *different* admin port (this node's own `RaftCore` can
+  arm nothing further once it isn't the leader), not just wait longer here.
+
+  **General rule, generalizing past this one route**: whenever a route's
+  job is to hand something off from A to B (leadership, a lease, a lock,
+  ownership of a resource), "A no longer holds it" is necessary but never
+  sufficient proof that "B now holds it" — something else could have taken
+  it in the gap. The success check must read the **new** holder's own
+  identity from a live, continuously-updated source, not infer it from the
+  old holder's absence; and the "wrong new holder" case deserves its own
+  distinguishable error from "no new holder yet," since a caller's retry
+  strategy differs (retry the same target vs. redirect to whoever actually
+  has it now).
+
+  **Test-design note**: the deterministic regression
+  (`crates/animus-control/tests/transfer_third_voter_wins.rs`) proves the
+  race exists in `RaftCore::transfer_leadership` itself, at the `SimEnv`
+  level, with no `animusd` route anywhere in the loop — it uses
+  `Simulator::pause` (freeze a node fully, deferring every timer/send/
+  delivery to the resume instant — the real CI flake's own root cause,
+  "every peer's heartbeats go missing together," not a one-sided
+  partition) rather than `Simulator::partition`, since a partition would
+  only isolate the leader from *one* other voter, not model "both
+  followers' election timers can lapse at once." A brute-force scan over
+  seeds 0..3000 with no other fault applied found plenty of seeds where the
+  transfer's own un-named third voter wins outright — this is not a rare
+  edge case requiring exotic fault injection, just an ordinary two-follower
+  election race the transfer route's old contract never accounted for.
+  (`crates/animusd/src/lib.rs::ClientCtx::
+  admin_transfer_control_leadership`, `crates/animusd/src/admin.rs::
+  action_transfer_control_leadership`, `crates/animus-control/src/node.rs::
+  RaftNode::leader`, `crates/animus-control/tests/
+  transfer_third_voter_wins.rs`.)

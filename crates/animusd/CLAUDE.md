@@ -5154,19 +5154,41 @@ ADR itself for the full design/rationale.
   `docs/engineering-lessons.md`'s issue #405 entry for the full mechanism
   and `tests/heartbeat_live_destinations.rs`'s fix.
 - **`POST /admin/control/transfer {"to": <node id>}` (ADR 0020/0037,
-  roadmap U-05, 2026-09-05)** — a standalone leadership-transfer route,
-  beside `admin_remove_control_member`'s own internal self-removal transfer
-  arm above: `ClientCtx::admin_transfer_control_leadership` lets an
-  operator move control-plane leadership without also removing a voter.
-  Same local-control-leader-only, not-relayed discipline as every other
+  roadmap U-05, 2026-09-05; contract fixed 2026-09-07, issue #688)** — a
+  standalone leadership-transfer route, beside
+  `admin_remove_control_member`'s own internal self-removal transfer arm
+  above: `ClientCtx::admin_transfer_control_leadership` lets an operator
+  move control-plane leadership without also removing a voter. Same
+  local-control-leader-only, not-relayed discipline as every other
   `control/member/*` action; idempotent if `to` already leads, refused if
   `to` isn't a current voter, otherwise arms `RaftCore::transfer_leadership`
   and polls (bounded by the same `CONTROL_TRANSFER_POLL_TIMEOUT` the
-  self-removal arm uses) for this node to step down. `animus admin
-  control-transfer <admin-addr> <node-id>` is the CLI form. Regression:
-  `tests/admin_endpoint.rs::
-  admin_control_transfer_moves_leadership_to_the_named_node`/
-  `admin_control_transfer_on_a_follower_is_refused`.
+  self-removal arm uses). **`200` means `to` is genuinely the observed
+  leader, not merely "this node stepped down" (issue #688, a second
+  failure mode #671 left standing)**: while a transfer is armed the old
+  leader keeps heartbeating every peer and steps down on **any**
+  higher-term vote, not only the target's — under real scheduling jitter a
+  *third* voter's own election timer can lapse on the same late heartbeats
+  and win the election before or instead of the named target, so
+  "stepped down" alone is not proof the transfer completed. The poll now
+  reads this node's own live `RaftCore::leader()` belief (which keeps
+  updating after step-down) until it names `to` specifically: `200` only
+  once it does; a **new, distinct `409`** naming the actual stable leader
+  if this node stepped down but a *different* voter is now leading (the
+  caller must retry the whole `POST` against that node's own admin port —
+  this node's `RaftCore` can arm nothing once it isn't the leader); the
+  original arm/timeout `409` ("did not complete within Ns; retry") if the
+  poll runs out with no leader observed at all. `animus admin
+  control-transfer <admin-addr> <node-id>` is the CLI form — it prints the
+  server's JSON verbatim, so the new refusal text surfaces there
+  unchanged, no CLI-side change needed. Regression: `tests/
+  admin_endpoint.rs::admin_control_transfer_moves_leadership_to_the_named_node`/
+  `admin_control_transfer_on_a_follower_is_refused` — both now retry the
+  whole `POST` (re-resolving the current leader) on the new 409, per the
+  fixed contract, rather than asserting on a single accepted attempt. See
+  `docs/engineering-lessons.md`'s issue #688 entry for the general lesson
+  (a "stepped down" signal is not "target elected"; a handoff route's
+  success criterion must be the positive end state).
 - **The CP group is durable by default** — and since ADR 0050 Train B rung
   1, **each hosted tablet gets its OWN private `LsmEngine`** (filename
   prefix `tablet_lsm_prefix(t)` = `db-t{t}-`; the trailing `-` keeps
