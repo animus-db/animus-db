@@ -577,15 +577,20 @@ the still-true paragraph after the table.
   directly: the scenario's own poll loop no longer returns the relay
   timeout text at any seed tried. **A second, distinct, pre-existing bug
   the fix itself uncovered — in `ClientCtx::txn_recover`'s non-local
-  grace-check, unrelated to and unmodified by the relay fix — still blocks
-  the scenario from converging**, so
-  `coordinator_never_finished_past_prepare_recovers_atomically` and its
-  `_over_seeds` sibling remain `#[ignore]`d, with the full two-stage
-  diagnosis in their own doc comment. See ADR 0061's "#731 closed"
-  addendum and `docs/engineering-lessons.md`'s matching entries. Issue
-  #731 itself is closed; a new issue is to be filed against
-  `txn_recover`. PRs 4-7 (the wire corpus, PartiQL siblings, PartiQL sim
-  tests, docs close-out) remain open.
+  grace-check, unrelated to and unmodified by the relay fix — used to
+  still block the scenario from converging; filed as issue #737 and fixed
+  2026-09-07**: both `txn_recover` call sites now share one clock-read
+  helper (`recovery_grace_now_ms`, `crates/animusd/src/txn_coordinator.rs`)
+  that reads an absolute `env.now()` on every route, never the near-zero
+  elapsed-duration read the non-local branch used to compute. `coordinator_
+  crash_after_prepare_recovers_atomically_to_commit` (renamed from
+  `coordinator_never_finished_past_prepare_recovers_atomically`) and its
+  `_over_seeds` sibling are un-ignored and green at the pinned seed
+  `0xC06F_0007` (= `3228499975`) and the five-seed loop. See ADR 0061's
+  "#731 closed" and "#737 closed" addenda and `docs/engineering-lessons.md`'s
+  matching entries. Both issues #731 and #737 are now closed. PRs 4-7 (the
+  wire corpus, PartiQL siblings, PartiQL sim tests, docs close-out) remain
+  open.
 - **ADR:** [0061](adr/0061-testability-node-crate-simulator.md) — the
   2026-09-07 "Rung F" amendment.
 - **Size:** L (seven PRs, two real production functions' worth of
@@ -672,7 +677,7 @@ wave are independent and can run in parallel.
 | 4 | *landed 2026-09-05* (S-02) | Highest blast radius (C-01 landed 2026-09-05 — see ADR 0054; S-01 landed 2026-09-05 — see ADR 0064; S-02 — see ADR 0066) |
 | 5 | *S-04, S-05, S-07b–d, C-02, C-05 all landed 2026-09-06* | S-05 strictly after S-04 |
 | 6 | *S-03 complete 2026-09-07 (all 3 PRs, ADR 0069)*; *S-07e/S-07 complete 2026-09-07 (ADR 0070)*; *C-03 assessed 2026-09-07 — deferred, no PRs planned (see ADR 0044's matching amendment)*; W-07 | XL or gated on earlier waves |
-| 7 | C-06 (PRs 1-3 landed 2026-09-07, issue #731 fixed 2026-09-07, a second txn_recover finding to be filed; PRs 4-7 open) | Gated on C-04 (closed 2026-09-07) — the D4 `Reconciler` and D3 generic dispatch cores it builds on |
+| 7 | C-06 (PRs 1-3 landed 2026-09-07, issues #731 and #737 both fixed 2026-09-07; PRs 4-7 open) | Gated on C-04 (closed 2026-09-07) — the D4 `Reconciler` and D3 generic dispatch cores it builds on |
 
 Open issues mapped: none left (#375 closed by W-01, #319 by W-05). Filed
 from wave 2's own findings: #590 (the operator still emits the deleted

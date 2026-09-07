@@ -3637,3 +3637,91 @@ record. `docs/roadmap.md`'s C-06 entry is updated to note issue #731's own
 closure and the new finding; PRs 4-7 of that series (the wire corpus,
 PartiQL siblings, PartiQL sim tests, docs close-out) remain open and
 unrelated to either.
+
+## 2026-09-07 amendment — #737 closed: `ClientCtx::txn_recover`'s non-local grace check now reads an absolute timestamp
+
+The second, distinct finding the #731 fix above uncovered — `ClientCtx::
+txn_recover`'s non-local grace-check branch (`crates/animusd/src/
+txn_coordinator.rs`) computing `now_ms` as the elapsed gap between two
+back-to-back `self.env.now()` reads (near-zero, forever) instead of an
+absolute timestamp — is fixed.
+
+**The fix**: both `txn_recover` call sites (the orphan-record branch and
+the ordinary decided-record branch) now share one free function,
+`recovery_grace_now_ms<E: Env>(env: &E, route: &CpRoute<E>) -> u64`, which
+reads `leader.env().now().0 / 1_000_000` on `CpRoute::Local` (unchanged —
+this branch was always correct) and `env.now().0 / 1_000_000` on every
+other route — the pusher's own absolute virtual/monotonic time, converted
+to milliseconds by the identical integer division `animus_cp_data::hlc::
+Hlc::mint` uses when it produces `wall_ms` in the first place (`Hlc::
+now_ms`, `hlc.rs`). This is the load-bearing correction: the bug was never
+about *which* clock (both the buggy and the fixed code read `env.now()`
+under `SimEnv`/`ProdEnv` alike) — it was about *what quantity* the read
+produced. `Hlc::mint`'s `wall_ms` is an absolute reading of `env.now()` at
+mint time; the grace check compares a *later* absolute reading against it
+plus `RECOVERY_GRACE`. The pre-fix non-local branch instead computed
+`t.duration_since(self.env.now())` where `t` was itself minted one
+statement earlier — the elapsed gap between two adjacent reads, not a
+comparable absolute value — which is always near-zero and so always
+`< wall_ms + RECOVERY_GRACE`, declining recovery on every single call,
+forever, once the record was more than an instant old. See `crates/
+animusd/src/txn_coordinator.rs`'s own doc on `recovery_grace_now_ms` for
+the full account, and `docs/engineering-lessons.md`'s matching entry for
+the general lesson this generalizes to (a mechanical `Instant::now().
+elapsed()` → `Env` conversion must preserve WHAT is measured, not just the
+API — the very risk rung C5 step 3b's own doc already flagged and
+deliberately deferred, see that rung's bullet above).
+
+**Sharing one helper is what makes the two call sites unable to diverge
+again** — before this fix, both sites independently duplicated the
+identical buggy `duration_since` computation (copy-pasted, per the rung
+C5 step 3b conversion notes), so a future partial fix to only one site
+would have been a real, silent risk; now there is exactly one place this
+comparison's "now" can be computed.
+
+**Verification**: a new unit test module, `txn_coordinator::
+recovery_grace_tests`, drives `recovery_grace_now_ms` directly off a bare
+`SimEnv` (no `ClientCtx`/`CpGroup` fixture needed, since the function reads
+nothing but `env`/`route`) — asserting the grace check still holds
+immediately after minting (`CpRoute::None`, the non-local shape) and
+clears once the simulator's own virtual clock has advanced past
+`RECOVERY_GRACE`, plus that the `Local` and non-local arms agree when
+driven off clocks minted from the same node. `coordinator_never_finished_
+past_prepare_recovers_atomically` and its `_over_seeds` sibling (`crates/
+animusd/src/sim_cluster_dynamo_transact.rs`, scenario (g)) are un-ignored
+and renamed to `coordinator_crash_after_prepare_recovers_atomically_to_
+commit`(`_over_seeds`) — both now converge: a strong read of the
+participant key from a different, live node triggers `confirm_or_push`/
+`txn_recover` on demand once the record has sat `Pending` past
+`RECOVERY_GRACE`, and both the participant and anchor keys converge
+together, atomically, with the restarted coordinator's own view agreeing
+too. Confirmed at the original pinned seed `0xC06F_0007` (= `3228499975`)
+and the `_over_seeds` five-seed loop, each run twice for determinism.
+`cargo test -p animusd --lib`: 365 passed / 5 ignored before this fix →
+367 passed / 3 ignored after (the two tests move from ignored to passing;
+the three remaining `#[ignore]`d tests are unrelated flake-issue
+characterizations, unmodified by this fix).
+
+**Audit of every other `env.now()`/`duration_since`/`wall_now` read in
+`txn_coordinator.rs`/`write_path.rs`/`read_path.rs`/`schema.rs`/
+`forwarding.rs`** (rung C5 step 3b's conversion targets) found no second
+instance of the same mistake: every other site is either a deadline/
+retry-loop pattern (`let deadline = self.env.now().saturating_add(TIMEOUT);
+... self.env.now() >= deadline`, or `deadline.duration_since(self.env.
+now())` to compute remaining budget) — comparing two `env.now()`-derived
+absolute values against each other, which is sound — or a throttle-bucket
+`now` parameter (`ThrottleTracker::check_read`/`check_write`/`charge_read`,
+ADR 0065) that is purely self-consistent (the bucket's own internally
+stored `last: Nanos` is always compared against a fresh `env.now()` read,
+never against an unrelated absolute value like an HLC `wall_ms`). None of
+these compare an `env.now()` reading against a *stored*, previously-minted
+absolute timestamp the way the grace check does, so none carried the same
+risk. See `crates/animusd/CLAUDE.md`'s matching account for the per-file
+breakdown.
+
+Docs updated in the same change: `docs/adr/0018-cross-tablet-transactions.
+md` (a dated amendment on `RECOVERY_GRACE`'s own clock requirement),
+`docs/roadmap.md`'s C-06 entry (issue #737's own closure, alongside #731's),
+`crates/animusd/CLAUDE.md` (the scenario-(g) account rewritten to drop the
+`#[ignore]` caveat), and `docs/engineering-lessons.md` (the general lesson).
+`Cargo.lock` unchanged.
