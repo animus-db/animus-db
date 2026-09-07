@@ -1070,6 +1070,53 @@ impl SimCluster {
         })
     }
 
+    /// Run several DynamoDB wire requests **concurrently** (ADR 0061 rung
+    /// D3 PR 1 — the shared fixture helper every converted `ProdEnv`
+    /// `tokio::spawn`-raced-writers test now uses), each `(node, target,
+    /// body)` triple spawned onto its own node's env via `env.spawn_task`
+    /// exactly like [`SimCluster::dynamo`]'s single-request form, but all
+    /// spawned *before* the one shared `Simulator::run_for(OP_BUDGET)` call
+    /// that drives every one of them at once — so two requests genuinely
+    /// race the same key/tablet the way the original real-thread
+    /// `tokio::spawn` pair did, rather than resolving one at a time the way
+    /// calling [`SimCluster::dynamo`] in a loop would. Results come back in
+    /// the same order as `requests`; a request that does not complete
+    /// within [`OP_BUDGET`] reports the same synthetic `500`/timeout body
+    /// `dynamo`'s own single-request form does, rather than panicking.
+    pub(crate) fn dynamo_concurrent(
+        &mut self,
+        requests: &[(u64, &str, &[u8])],
+    ) -> Vec<(u16, String)> {
+        type Slot = Arc<Mutex<Option<(u16, String)>>>;
+        let slots: Vec<Slot> = requests
+            .iter()
+            .map(|_| Arc::new(Mutex::new(None)))
+            .collect();
+        for ((node, target, body), slot) in requests.iter().zip(slots.iter()) {
+            let handle = self.shared.clone();
+            let env = self.shared.env(*node);
+            let (node, target, body) = (*node, (*target).to_owned(), body.to_vec());
+            let out = slot.clone();
+            env.spawn_task(async move {
+                let result = handle.dynamo(node, &target, &body).await;
+                *out.lock().expect("result slot poisoned") = Some(result);
+            });
+        }
+        self.sim.run_for(OP_BUDGET);
+        slots
+            .into_iter()
+            .zip(requests.iter())
+            .map(|(slot, (node, _, _))| {
+                slot.lock().expect("result slot poisoned").take().unwrap_or_else(|| {
+                    (
+                        500,
+                        format!("dynamo request on node {node} did not complete within {OP_BUDGET:?}"),
+                    )
+                })
+            })
+            .collect()
+    }
+
     /// Crash `node`: its tasks stay alive but muted (no sends land, its
     /// inbox is cleared) — `Simulator::crash`'s own contract. Use
     /// [`SimCluster::restart`] instead for a true process restart (a

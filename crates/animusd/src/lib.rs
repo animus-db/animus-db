@@ -17563,6 +17563,43 @@ mod sim_cluster_dynamo;
 #[cfg(test)]
 mod sim_cluster_dynamo_corpus;
 
+/// ADR 0061 rung D3 PR 1 (C-04 D3): the first batch of "B class"
+/// `ProdEnv` DynamoDB logic tests converted to `SimCluster` — base-table
+/// tests that `dynamo::dispatch_item_op` can already drive, needing no
+/// widening of that function or `execute_item_op_as`. Each of the eleven
+/// sibling modules below (`sim_cluster_dynamo_batch_get` through
+/// `sim_cluster_kind_batch_outcome`) replaces some or all of one
+/// `crates/animusd/tests/dynamo_*.rs`/`kind_batch_outcome.rs` binary — see
+/// each module's own doc for exactly which tests moved and, where
+/// applicable, which stayed on `ProdEnv` and why (a GSI/LSI query, a
+/// wire-level `CreateTable`, or `TransactWriteItems` — none reachable
+/// through `dispatch_item_op` yet). Siblings of `sim_cluster_corpus`/
+/// `sim_cluster_throttle`/`sim_cluster_dynamo` for the identical reason
+/// (needs `SimCluster`'s own `pub(crate)` surface, no further visibility
+/// widened).
+#[cfg(test)]
+mod sim_cluster_dynamo_batch_get;
+#[cfg(test)]
+mod sim_cluster_dynamo_boolean_composition;
+#[cfg(test)]
+mod sim_cluster_dynamo_eventual_read;
+#[cfg(test)]
+mod sim_cluster_dynamo_expression_surface;
+#[cfg(test)]
+mod sim_cluster_dynamo_extended;
+#[cfg(test)]
+mod sim_cluster_dynamo_item_size_cap;
+#[cfg(test)]
+mod sim_cluster_dynamo_parallel_scan;
+#[cfg(test)]
+mod sim_cluster_dynamo_predicate_bugs;
+#[cfg(test)]
+mod sim_cluster_dynamo_update_add_delete;
+#[cfg(test)]
+mod sim_cluster_dynamo_updated_return_values;
+#[cfg(test)]
+mod sim_cluster_kind_batch_outcome;
+
 /// Regression for the issue #298 residual confirmed live under the
 /// un-pinned `SplitMode::InPlace` proof soak (ADR 0018's matching amendment,
 /// `docs/engineering-lessons.md`'s matching entry): a stage blocked by
