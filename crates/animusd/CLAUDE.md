@@ -1138,6 +1138,34 @@ reusing the captured config is the point of the test.
   (`ok == true`/`200` still holds on a healthy converged cluster). See
   `docs/engineering-lessons.md`'s matching entry for the general lesson.
 
+  **`GET /admin/live` — the Kubernetes liveness probe (issue #710, ADR
+  0060's 2026-09-07 amendment) — deliberately does NOT reuse `/admin/health`
+  above.** `/admin/health`'s readiness signal is correct for readiness (a
+  node with no recent control leader shouldn't get traffic) and wrong for
+  liveness: a pod recreated by `animus-operator`'s config-hash rolling
+  restart, or a fresh growth pod, has no control leader until the operator's
+  own `advance_control_growth` adds it as a voter, which happens at most
+  once per 30s reconcile — a healthy, correctly-joining process can
+  legitimately outlast a `livenessProbe`'s failure window with
+  `/admin/health` still `503`, and the kubelet's only response to a
+  liveness failure is a `SIGTERM`-driven restart that only resets the join.
+  `live()` returns `200` unconditionally whenever this admin server can
+  answer at all — the STATUS CODE has no dependency on `ctx.control`'s
+  leader belief, on `ctx.edge.hosted_groups()`, or on node role; it does
+  still read `ctx.control.leader_within(..)` once, but purely to populate
+  `control_leader_recent` in the body as a diagnostic (mirrors
+  `/admin/health`'s own field), never to gate the status code. `animus-operator`'s
+  `desired::statefulset::admin_probe` points `readinessProbe` at
+  `/admin/health` and `livenessProbe` at `/admin/live` (previously both on
+  `/admin/health`, differing only in threshold). Regression: `admin_
+  endpoint.rs`'s `admin_live_is_200_while_a_genuinely_leaderless_admin_
+  health_is_503` (a lone voter of a 3-voter config, which can never elect,
+  proving `/admin/health` 503s while `/admin/live` stays `200`) and its
+  companion assertion on a healthy cluster. See `docs/adr/0020-admin-
+  interface.md` and `docs/adr/0060-kubernetes-operator.md`'s matching
+  2026-09-07 amendments, and `docs/engineering-lessons.md`'s entry, for the
+  full account.
+
 - **`http.rs`** — thin `TcpStream` wrapper over `animus_node::http` (ADR
   0061 rung C4a): `read_http_request` does only `stream.read()`, handing
   every parsing decision (header-block framing, `Content-Length`
