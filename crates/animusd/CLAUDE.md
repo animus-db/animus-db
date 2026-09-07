@@ -6802,3 +6802,119 @@ restarted on the same directory/addresses
 (`tablet_engine_present`, a new helper alongside the file's existing
 `tablet_wal_present`) are gone within a bounded converge-or-timeout poll.
 Run 3x locally with no flake before landing.
+
+## Appendix — SimCluster auto-split BYTE trigger coverage (ADR 0061 rung D4 PR 2, 2026-09-07)
+
+Closes the "auto-split's own `tokio::time` conversion" residual D4 PR 1's
+own entry above names. Two widenings, one new fixture knob, one new
+manual-drive method, one new scenario module — see ADR 0034's and ADR
+0061's matching 2026-09-07 amendments for the full design record; this
+entry is the crate-local pointer + the module's own gotchas.
+
+**`auto_split_loop` (`lib.rs`) is now `async fn auto_split_loop<E: Env, R:
+RelayClient>(ctx: ClientCtx<E, R>, thresholds: AutoSplitThresholds)`** —
+previously concrete `ClientCtx` (i.e. `ProdEnv`-only). Its two per-tablet
+bookkeeping maps (`last_triggered`, `last_counted`) are `BTreeMap<TabletId,
+Nanos>` now, read via `ctx.env.now().duration_since(at)` instead of
+`tokio::time::Instant::elapsed()` — `Nanos` has no `Add<Duration>`, the
+same `saturating_add`/`duration_since` shape rung C5 step 3b's own
+conversion notes already state (above). `tokio::time::sleep(AUTO_SPLIT_
+INTERVAL)` became `ctx.env.sleep(..)`. One more bare `CpGroup` (inside the
+min-tablets arm's own local `best: Option<(TabletId, u128, CpGroup)>`)
+needed widening to `CpGroup<E>` to compile generically — the one place a
+generic bound didn't automatically propagate from the function signature
+alone. Both production spawn sites (`BoundNode::start_with`'s combined and
+data-only branches, unchanged) still infer `E = ProdEnv, R =
+AnimusdRelayClient` from `ClientCtx`'s own definition-site default with
+zero call-site changes.
+
+**`index_drain::{inplace_split_driver_tick, gsi_caught_up}` were ALSO
+widened** (`<E: Env, R: RelayClient>`/`<E: Env>`, previously concrete) —
+orthogonal to `auto_split_loop` itself, but necessary for the fork's own
+control-plane cutover (`MetaCommand::CutoverSplit`) to be reachable under
+`SimEnv` at all: the CP data plane's real `host::Reconciler` (wired in
+since D4 PR 1) only *forks* an in-place split; the cutover that actually
+activates both children and retires the parent is a SEPARATE per-node
+loop, `index_drain::change_consumer_loop`, which `SimCluster` has never
+spawned as a background task (see the SimCluster "Design decisions"
+section above — it drives Streams/PITR/GSI-drain machinery this fixture
+has no general need for). `inplace_split_driver_tick`'s own callees
+(`seal_now`/`pitr_seal_now`/`drain_tablet`/`ClientCtx::propose_schema`)
+were already generic since rung C5 step 3b, so this widening needed no
+further fan-out.
+
+**`SimCluster` (`sim_cluster.rs`) gains two members, both new this rung**:
+
+- **`SimCluster::set_auto_split_thresholds(thresholds: AutoSplitThresholds)`**
+  — spawns `auto_split_loop` on EVERY node right now, mirroring D4 PR 1's
+  own `heartbeat_loop` spawn exactly, and stores `thresholds` in a new
+  `SimCluster::auto_split: Option<AutoSplitThresholds>` field so
+  `SimCluster::restart` respawns it identically on a restarted node (whose
+  `Simulator::stop` drops the task along with everything else it owned —
+  the identical reasoning `heartbeat_loop`'s own restart-respawn already
+  has). **Defaulted `None` (off)**: every scenario across every other
+  `sim_cluster_*` module never calls this, so it changed no existing
+  scenario's behavior.
+- **`SimCluster::drive_inplace_split_cutover(node: u64)`** — drives ONE
+  pass of `index_drain::inplace_split_driver_tick` for every currently-
+  `Splitting` tablet `node` leads, mirroring `SimCluster::drain_gsi`'s own
+  pre-existing manual-drive shape for `drain_tablet`. A no-op (fast) on a
+  node leading no `Splitting` tablet, so calling it on every node every
+  poll tick is cheap — every scenario below does exactly that inside its
+  own `run_for`-interleaved poll loop.
+- **`SimCluster::is_leader_local(node, tablet) -> bool`** — a thin public
+  wrapper over the pre-existing `SimClusterHandle::is_leader_local`
+  (`leader_index_of` already used it internally); exposed so a scenario
+  can assert the leader-gate's own precondition directly (a non-leader's
+  `ctx.edge.cp_leader(tablet)` answers `None` — this predicate is that same
+  fact, one layer down).
+
+**New module: `sim_cluster_auto_split.rs`** — five scenarios (byte-
+threshold crossing forks exactly once; staying below threshold never
+splits; a regrown child forks again after modest writes don't; a
+leadership move mid-window still yields exactly one fork; a crashed-and-
+restarted node converges via the issue #722 fix), each replayed at 5
+seeds. `ANIMUS_SEED=<seed> cargo test -p animusd --lib <test name>`
+replays any one, per the repo convention. `cargo test -p animusd --lib`:
+321 → 331 (+10, 0 regressions, 3 ignored throughout).
+
+**Two real-behavior gotchas the module's own build found — both fixed in
+the test harness, neither a production bug — worth recording as general
+`SimCluster`-authoring lessons, not just this module's own footnotes:**
+
+- **A write issued after `set_auto_split_thresholds` can genuinely land
+  mid-fork and must retry through the manual cutover driver, not just
+  wait.** `SimCluster::dynamo`/`put`/etc. all advance virtual time
+  internally (`spawn_and_capture`'s own `run_for`), so once the loop is
+  armed, a later write in the same scenario can find its target tablet
+  `Splitting` (frozen for cutover) and get refused with the house `"; retry"`
+  transient error (`index_drain::is_retryable_elsewhere`'s own
+  convention). Since this fixture never spawns the cutover driver as a
+  background loop, a plain "wait a bit and retry" helper spins forever —
+  the retry helper must ALSO call `SimCluster::drive_inplace_split_
+  cutover` on every node on each attempt, or the freeze never clears.
+- **A crashed-but-muted node's own stale "I am still leader" belief
+  breaks an unfiltered leader-index scan.** `SimCluster::leader_index_of`/
+  `SimClusterHandle::leader_index_of` scan every node id unconditionally —
+  a `SimCluster::crash`ed former leader's own `RaftKvNode` never receives a
+  higher-term message telling it to step down (muted, not stopped), so it
+  keeps reporting itself leader forever. A scenario that crashes a leader
+  and polls for a NEW one must scan only the live node ids directly
+  (`is_leader_local` per id), never the cluster-wide accessor, or the poll
+  spins to its own timeout finding the same (crashed) leader every pass.
+
+**ProdEnv test disposition** (`tests/cp_plane.rs`): `tablet_auto_splits_
+when_it_grows` and `already_split_tablet_splits_again_once_it_regrows`
+removed (replaced by scenarios (a) and (c) respectively).
+`tablet_auto_splits_on_bytes_with_skewed_value_sizes` stays — its
+byte-weighted-median quantitative-balance claim (correlating written keys
+against their real post-split token ranges) isn't reproduced by the new
+sim scenarios, which don't correlate a DynamoDB item's `pk` to its hashed
+token range. `cp_tablet_splits_and_both_halves_serve` stays (a different
+subject: the MANUAL raw-`ClientRequest::SplitTablet` path, not the byte
+trigger). `f11_split_alignment.rs` and `inplace_split_e2e.rs`'s Streams
+test stay (Streams remains documented `ProdEnv`-only for this fixture);
+`inplace_split_e2e.rs`'s paced-continuous-writer test stays (real-thread
+timing + admin HTTP). `auto_split_min_tablets.rs`/`auto_split_ops_rate.rs`
+are untouched — other triggers (ADR 0067/W-09), out of this rung's own
+scope.

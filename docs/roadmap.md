@@ -642,3 +642,32 @@ matching 2026-09-07 amendments for the full account, and
 `crates/animus-cp-data/CLAUDE.md`'s host-module entry for the mechanism as
 shipped. This closes the one open item D4 PR 3 itself deliberately left
 outstanding; D4 PRs 2, 4, 5 remain open, unchanged by this fix.
+
+---
+
+**Addendum, 2026-09-07 (C-04 D4 PR 2 landed)**: the auto-split BYTE
+trigger's own `tokio::time` residual D4 PR 1 named is closed —
+`auto_split_loop` is now `<E: Env, R: RelayClient>`-generic (`Nanos`-keyed
+cooldown/confirm maps instead of `tokio::time::Instant`), `index_drain::
+{inplace_split_driver_tick, gsi_caught_up}` widened the same way so
+`SimCluster::drive_inplace_split_cutover` can manually drive the fork's
+own `MetaCommand::CutoverSplit` (this fixture still never spawns
+`change_consumer_loop` as a background loop), and `SimCluster::
+set_auto_split_thresholds` (defaulted off, mirroring D4 PR 1's own
+`heartbeat_loop` spawn) is the new opt-in knob. Five deterministic
+scenarios in the new `sim_cluster_auto_split.rs`, replayed at 5 seeds each
+(10 tests): a byte-threshold crossing forking exactly once with every
+pre-split key still wire-readable; staying below threshold over a long
+window; a regrown child forking again after modest writes don't; a
+leadership move mid-window still yielding exactly one fork; a crashed-and-
+restarted node converging via the issue #722 fix. `cargo test -p animusd
+--lib`: 321 → 331 (+10, 0 regressions). Two `cp_plane.rs` tests removed in
+favor of the new sim scenarios (`tablet_auto_splits_when_it_grows`,
+`already_split_tablet_splits_again_once_it_regrows`); four ProdEnv
+tests/files stay for stated reasons (a skewed-value-size quantitative-
+balance claim the sim scenarios don't reproduce, the manual raw-key split
+path, two Streams-specific tests, one real-thread-paced-writer-timing
+test) — see ADR 0034's and ADR 0061's matching 2026-09-07 amendments for
+the full account. What remains open for D4: PR 4 (join/growth needs an
+add-node capability) and PR 5 (the backup janitor needs `client_ctx_
+host.rs`'s impls widened).

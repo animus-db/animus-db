@@ -20902,6 +20902,21 @@ against the previous one, route through the system's own forwarding/
 hint-chasing instead of re-deriving the answer from a local accessor that
 has no way to have heard it yet.**
 
+**Amendment (2026-09-07, ADR 0061 rung D4 PR 2): the crashed node's own
+stale belief is not merely a transient race window — it is PERMANENT for
+as long as that node stays crashed (muted).** A `SimCluster::crash`ed
+node's `RaftKvNode` never receives a higher-term message telling it to
+step down (nothing gets through the mute), so it keeps reporting itself
+leader forever, not just in the brief post-crash window the original
+finding above describes. A scenario that specifically needs a NEW leader's
+own id (not just "route a write correctly," which `cp_kind_write_raw`'s
+hint-chasing already handles per the original finding) must scan only the
+live node ids directly (`is_leader_local` per surviving id), never
+`leader_index_of`/`SimClusterHandle::leader_index_of` unfiltered — a poll
+loop that keeps calling the unfiltered accessor spins to its own timeout,
+finding the same crashed leader on every single pass, never converging.
+(`sim_cluster_auto_split.rs`'s own scenario d hit exactly this.)
+
 ## A shared list-append checker has no "weak read" flag — exclude an eventually-consistent observation from its graph and check it against convergence instead, don't teach the checker a new mode (ADR 0061 rung D2 PR 2)
 
 `sim_cluster_dynamo_corpus.rs` is the first corpus to drive `ConsistentRead:
@@ -21713,3 +21728,29 @@ instances of lessons this file already has in more general form
 target; a converged-or-timeout property must be checked as ONE property)
 — recorded here specifically because this exact fixture is where both
 were found, for the next person debugging this file.
+
+## A `SimCluster` scenario that arms a background trigger loop and then keeps writing must drive that loop's own downstream dependency itself, not just wait (ADR 0061 rung D4 PR 2)
+
+`sim_cluster_auto_split.rs`'s scenario (c) writes a burst of new items
+AFTER calling `SimCluster::set_auto_split_thresholds` — and `SimCluster::
+dynamo`/`put`/etc. all advance virtual time internally
+(`spawn_and_capture`'s own `run_for`), so by the time a burst of several
+writes has been issued, the auto-split loop has genuinely had ticks to
+fire. A write landing on a tablet mid-fork gets refused with the house
+`"; retry"` transient error (`index_drain::is_retryable_elsewhere`'s own
+convention) — expected, real behavior. The first draft's retry helper just
+waited (`run_for(200ms)`) and retried, which spun to its own attempt bound
+and failed every time: `SimCluster` never spawns `index_drain::
+change_consumer_loop` as a background task (it drives Streams/PITR/
+GSI-drain machinery most fixtures don't need), so nothing was EVER going
+to propose the `MetaCommand::CutoverSplit` that clears the freeze — the
+tablet would stay `Splitting` forever no matter how long the retry helper
+waited. The fix: the retry helper must itself call the fixture's own
+manual driver (`SimCluster::drive_inplace_split_cutover`) on every retry
+attempt, exactly like the poll loops that DO expect a fork to converge
+already do. **General lesson, not specific to this one loop**: when a
+`SimCluster` fixture provides a manual driver for a background mechanism
+production wires as a loop this fixture doesn't spawn, EVERY caller that
+can transitively depend on that mechanism completing — not just the ones
+explicitly polling for it — needs to drive it, including a plain retry
+helper that only looks like it's waiting out an unrelated transient.

@@ -2793,3 +2793,130 @@ SEEDS=25 cargo test -p animus-cp-data --test inplace_split_reconciler`
 safety argument this fix rests on is exactly what makes a pre-cutover
 split child's own eagerly-materialized engine exempt from the new
 reclaim path). `Cargo.lock` unchanged.
+
+## D4 PR 2 (2026-09-07): auto-split BYTE trigger widened to the `Env` seam, deterministic `SimCluster` coverage
+
+Closes the "auto-split's own `tokio::time` conversion" residual D4 PR 1's
+own amendment named. `auto_split_loop` (`crates/animusd/src/lib.rs`) —
+concrete `ClientCtx`/`tokio::time::Instant`, i.e. `ProdEnv`-only, since its
+own introduction (ADR 0034) — is now `async fn auto_split_loop<E: Env, R:
+RelayClient>(ctx: ClientCtx<E, R>, thresholds: AutoSplitThresholds)`: one
+production signature widened, plus one already-generic-elsewhere type
+reference (`CpGroup` → `CpGroup<E>` inside the min-tablets arm's own local
+`best` binding) that needed the same treatment to compile. Both per-tablet
+bookkeeping maps (`last_triggered`, `last_counted`) are now `BTreeMap
+<TabletId, animus_env::Nanos>`, read via `ctx.env.now().duration_since(..)`
+instead of `tokio::time::Instant::elapsed()` — the mechanical conversion
+is a pure seam substitution with the trigger arithmetic itself
+byte-identical, confirmed by the unchanged real-socket `ProdEnv` tests
+(`cp_plane.rs`'s survivors, `inplace_split_e2e.rs`, `f11_split_alignment.
+rs`, `auto_split_min_tablets.rs`, `auto_split_ops_rate.rs`) staying green
+before and after with zero behavior change. See ADR 0034's own matching
+2026-09-07 amendment for the full conversion account.
+
+**A second, narrower widening was needed for the fork's own cutover to be
+reachable under `SimEnv` at all**: `index_drain::{inplace_split_driver_
+tick, gsi_caught_up}` (previously `ProdEnv`-only, since the whole
+`change_consumer_loop` they belong to has never been generic) were widened
+the identical way — their own callees (`seal_now`/`pitr_seal_now`/
+`drain_tablet`/`ClientCtx::propose_schema`) were already `<E, R>`-generic
+since rung C5 step 3b. `SimCluster` still does not spawn `change_consumer_
+loop` as a background task (it drives Streams/PITR/GSI-drain machinery
+this fixture has no general need for); instead, a new `SimCluster::
+drive_inplace_split_cutover(node)` manually drives one pass of
+`inplace_split_driver_tick`, mirroring the pre-existing `SimCluster::
+drain_gsi`'s own manual-drive shape for `drain_tablet`.
+
+**The knob**: `SimCluster::set_auto_split_thresholds(thresholds:
+AutoSplitThresholds)` spawns `auto_split_loop` on every node right now
+(mirroring D4 PR 1's own `heartbeat_loop` spawn) and stores the
+configuration in a new `SimCluster::auto_split: Option<AutoSplitThresholds>`
+field so `SimCluster::restart` respawns it identically on a restarted
+node. Defaulted `None` (off) — every scenario in every other `sim_cluster_
+*` module never calls it, so this rung is a pure addition with zero effect
+on existing coverage.
+
+**Deterministic coverage**: `crates/animusd/src/sim_cluster_auto_split.rs`
+— five scenarios, each replayed at 5 seeds (10 tests total): (a) a byte
+threshold crossing forks exactly once, both children `Active`, every
+pre-split key still readable through the DynamoDB wire; (b) staying below
+the threshold over a long (past `AUTO_SPLIT_INTERVAL` + `AUTO_SPLIT_
+COOLDOWN`) window never splits; (c) after one fork, modest writes below
+threshold don't cause a second one, and a genuine burst that pushes a
+child back over the SAME threshold triggers a further, independent fork —
+proving the widened `Nanos`-keyed maps handle a tablet id minted mid-run
+(a freshly-forked child), not just one present at loop start; (d) a
+non-leader's own `ctx.edge.cp_leader(tablet)` gate structurally answers
+`None`, and a leadership move mid-window (the original leader crashed)
+still yields exactly one fork, driven by the newly elected leader's own
+loop instance; (e) a node crashed before the fork ever starts, restarted
+only after the fork fully converged elsewhere, itself converges too — no
+zombie groups, its own leftover PARENT engine reclaimed via the issue #722
+fix (`host::Reconciler`'s `EngineFactory::local_tablets` second fact
+source, D4 PR 3). `cargo test -p animusd --lib`: 321 → 331 (+10 tests, 0
+regressions, 3 ignored throughout).
+
+**Two real-behavior gotchas the scenarios' own build found, both fixed in
+the harness, neither in production code** — worth recording since they
+generalize to any future `SimCluster` scenario that mixes writes with a
+background trigger loop:
+
+- **A burst of writes issued after `set_auto_split_thresholds` can
+  genuinely land mid-fork.** `SimCluster::dynamo`/`put`/etc. all advance
+  virtual time internally (`spawn_and_capture`'s own `run_for`), so once
+  the auto-split loop is armed, a later write in the same test can find
+  its target tablet `Splitting` (frozen for cutover, ADR 0050's whole-range
+  seal discipline) and get refused with the house `"; retry"` transient
+  error. A plain wait-and-retry loop is not enough on its own, since this
+  fixture never spawns the cutover driver as a background loop (the
+  previous paragraph) — the retry helper must also drive `SimCluster::
+  drive_inplace_split_cutover` on every node on each attempt, or the
+  freeze never clears and the retry spins to its own bound and fails.
+- **A crashed-but-muted node's own stale "I am still leader" belief
+  breaks a leader-index scan that doesn't exclude it.** `SimCluster::
+  leader_index_of`/`SimClusterHandle::leader_index_of` scan every node id
+  unconditionally; a `SimCluster::crash`ed former leader's own `RaftKvNode`
+  never receives a higher-term message telling it to step down (it is
+  muted, not stopped), so it keeps reporting itself leader forever. A test
+  scenario that crashes a leader and then polls for a NEW one to be
+  elected must scan only the live node ids directly (`is_leader_local` per
+  id), never the cluster-wide accessor, or the poll spins until its own
+  timeout finding the same (crashed) leader on every pass.
+
+**ProdEnv test disposition** (`crates/animusd/tests/cp_plane.rs`): two
+tests removed, replaced by the new sim scenarios — `tablet_auto_splits_
+when_it_grows` (by scenario a) and `already_split_tablet_splits_again_
+once_it_regrows` (by scenario c). Four tests/files stay, each for a stated
+reason: `tablet_auto_splits_on_bytes_with_skewed_value_sizes` (this file's
+own sibling) keeps its specific byte-weighted-median quantitative-balance
+claim — a loose 15% floor derived from correlating written keys against
+their real post-split token ranges — which the new `SimCluster` scenarios
+don't reproduce (doing so would need correlating a DynamoDB item's `pk` to
+its hashed token range, out of this rung's own scope);
+`cp_tablet_splits_and_both_halves_serve` tests the MANUAL raw-`ClientRequest`
+split path, a different subject from the byte trigger; `f11_split_
+alignment.rs`'s one test and `inplace_split_e2e.rs`'s `inplace_split_
+stream_shard_walks_parent_to_children_without_loss_or_duplication` are both
+Streams-specific, a capability `SimCluster` still documents as `ProdEnv`-
+only (no real `SegmentStoreHandle::Cluster`); `inplace_split_e2e.rs`'s
+`inplace_split_survives_a_paced_continuous_writer_across_fork_and_cutover`
+asserts real-thread-paced (5ms) continuous-writer timing through admin
+HTTP kickoff — squarely the "keep anything asserting real-thread timing…
+or admin/console HTTP" carve-out. `auto_split_min_tablets.rs`/
+`auto_split_ops_rate.rs` are untouched (other triggers, out of this rung's
+scope by the task's own instruction). Remaining D4 residuals: PR 4
+(join/growth) and PR 5 (the backup janitor's own `client_ctx_host.rs`
+widening).
+
+**Gates**: `cargo fmt --all --check` (clean); `cargo clippy -p animusd
+--all-targets --all-features -- -D warnings` (clean); `cargo build -p
+animusd --all-targets` (clean); `cargo test -p animusd --lib` (321 → 331
+passed, 0 failed, 3 ignored throughout); `cargo test -p animusd --test
+cp_plane --test inplace_split_e2e --test f11_split_alignment --test
+auto_split_min_tablets --test auto_split_ops_rate` both BEFORE (11 passed,
+proving the widened loop behaves identically under `ProdEnv`) and AFTER
+the `cp_plane.rs` test removal (9 passed — the two removed tests gone, the
+other 9 unaffected); `cargo test -p animus-cp-data --test inplace_split_
+reconciler` (untouched, sanity, 3 passed); `ANIMUS_SEED` replay of
+scenarios (a) and (e) at their pinned seeds (both green). `Cargo.lock`
+unchanged.
