@@ -17633,6 +17633,21 @@ mod sim_cluster_kind_batch_outcome;
 #[cfg(test)]
 mod sim_cluster_dynamo_table_ops;
 
+/// ADR 0061 rung D3 PR 2b (C-04 D3): `UpdateTable`'s **throughput** change
+/// over the real DynamoDB wire, driven through `dynamo::dispatch_table_op`'s
+/// new `UpdateTable` arm (throughput-only — a stream/index change stays
+/// `unsupported_by_generic_dispatch`, unchanged from PR 2a). Replaces five
+/// of `crates/animusd/tests/dynamo_throttling.rs`'s eleven tests — see that
+/// module's own doc for exactly which five, and why the other six (batch
+/// shedding, `TransactWriteItems`, a forwarded-write throttle check, the
+/// `/admin/metrics` counter regression, and the cluster-wide config-surface
+/// test) stay on `ProdEnv`. A sibling of `sim_cluster_corpus`/
+/// `sim_cluster_throttle`/`sim_cluster_dynamo`/`sim_cluster_dynamo_table_
+/// ops` for the identical reason (needs `SimCluster`'s own `pub(crate)`
+/// surface, no further visibility widened).
+#[cfg(test)]
+mod sim_cluster_dynamo_update_table;
+
 /// Regression for the issue #298 residual confirmed live under the
 /// un-pinned `SplitMode::InPlace` proof soak (ADR 0018's matching amendment,
 /// `docs/engineering-lessons.md`'s matching entry): a stage blocked by

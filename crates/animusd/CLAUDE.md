@@ -3238,37 +3238,49 @@ nothing configured on a fresh `ClientCtx`, both `throttle_check_write_raw`/
 no clean way to assert "no clone happened" directly, so this test instead
 pins the default flag/defaults state the guard's correctness rests on;
 the guard's placement as each function's first statement is a
-code-review invariant, documented on both). `tests/
-dynamo_throttling.rs` is the real-thread, real-socket regression (ADR 0061
-rung D3 moved its own single-item write/read throttling-and-recovery pair
-to `sim_cluster_throttle.rs`'s
+code-review invariant, documented on both). `sim_cluster_dynamo_update_
+table.rs` (`#[cfg(test)] mod`, `cargo test -p animusd --lib sim_cluster_
+dynamo_update_table`, ADR 0061 rung D3 PR 2b) is `sim_cluster_throttle.rs`'s
+own sibling for the DynamoDB-wire throughput-*config-surface* shapes
+(`CreateTable`/`UpdateTable`/`DescribeTable`'s `BillingMode`/
+`ProvisionedThroughput` handling), driven through `dynamo::dispatch_table_
+op`'s `UpdateTable` arm rather than `sim_cluster_throttle.rs`'s own direct
+`set_table_throughput`/`put`/`get` fixture bypasses: `CreateTable`'s own
+declared `ProvisionedThroughput` throttling with **no** admin call at all,
+`UpdateTable` to `PAY_PER_REQUEST` lifting a limit, `UpdateTable` raising
+units eventually admitting more (a bounded loop of further `SimCluster::
+dynamo` calls, not a one-shot assert — `ThrottleBucket::set_rate` refills
+at the OLD rate through the moment of the change and only then raises the
+ceiling, so the very next check after a raise still pays that reassignment
+at the old rate; each further call already advances the cluster's own
+virtual clock by `OP_BUDGET`, so no explicit `run_for`/sleep is needed
+between attempts), `DescribeTable`'s `BillingModeSummary`/
+`ProvisionedThroughputDescription` for both billing modes, and
+`MetaCommand::SetTableThroughput`'s own follower-relay regression. `tests/
+dynamo_throttling.rs` is the real-thread, real-socket regression for
+everything that stays — `ADR 0061 rung D3` moved its own single-item
+write/read throttling-and-recovery pair to `sim_cluster_throttle.rs`'s
 `write_admits_a_burst_then_refuses_then_recovers_after_a_full_refill`/
-`read_admits_a_burst_then_refuses_then_recovers_after_a_full_refill` — see
-that file's own doc — leaving this file the shapes with no sim analog):
+`read_admits_a_burst_then_refuses_then_recovers_after_a_full_refill`, and
+PR 2b moved the five config-surface tests just described to
+`sim_cluster_dynamo_update_table.rs` above (see that module's own doc for
+the exact list) — leaving this file the shapes with no sim analog:
 `ProvisionedThroughputExceededException`'s wire shape (still exercised via
 the forwarded-write and admin-metrics tests below),
 `BatchGetItem`'s `UnprocessedKeys`, `BatchWriteItem`'s
 `UnprocessedItems` (via a **streamed** table specifically, to get true
 per-item granularity rather than the marker fast-arm's per-tablet-group
 shape described above), `TransactWriteItems`' `ThrottlingError` cancellation
-reason, the `ThrottledWrites`/`ThrottledReads` metric counters, an
-unthrottled table (the default) staying byte-for-byte unaffected, and (step
-4's own section) `CreateTable`'s `BillingMode`/`ProvisionedThroughput`
-throttling with **no** admin call at all, `UpdateTable` to
-`PAY_PER_REQUEST` lifting a limit, `UpdateTable` raising units admitting
-more (a converged-or-timeout retry, not a one-shot assert — see this file's
-own engineering-lessons entry on why: `ThrottleBucket::set_rate` refills at
-the OLD rate through the moment of the change and only then raises the
-ceiling, so the very next check after a raise still pays that reassignment
-at the old rate; the NEW rate only governs refill starting from the
-*following* check), `DescribeTable`'s `BillingModeSummary`/
-`ProvisionedThroughputDescription`, `MetaCommand::SetTableThroughput`'s own
-follower-relay regression (`update_table_throughput_on_a_follower_is_
-relayed_to_the_leader`), and a cluster started with the `cluster_settings`
-config surface (`bring_up_with_throttle_defaults`, calling
-`run_node_with_cluster_settings` directly rather than `POST /admin/
-throttle/defaults`) throttling a table with no per-table setting while a
-table with its own higher override is not.
+reason, a forwarded write throttled on the actual leader, the
+`ThrottledWrites`/`ThrottledReads` metric counters (never incrementing
+under `SimCluster` — see `sim_cluster_throttle.rs`'s own module doc for
+why), an unthrottled table (the default) staying byte-for-byte unaffected,
+and a cluster started with the `cluster_settings` config surface
+(`bring_up_with_throttle_defaults`, calling `run_node_with_cluster_
+settings` directly rather than `POST /admin/throttle/defaults`) throttling
+a table with no per-table setting while a table with its own higher
+override is not — the one step-4 test with no sim analog, since it proves
+a CLI/config-file surface no `SimCluster` fixture reaches.
 
 **Manual growth trigger (`POST /admin/stream/grow {table}`, ADR 0042 §14,
 growth PR3)**: splits *every* tablet of a streamed table at its own
@@ -6165,6 +6177,65 @@ materially more fixture machinery than this PR's own brief asks for (ADR
 that issues a real wire `CreateTable` stays at `node_count <= 3` to avoid
 it — keep new tests to that bound too, until a future rung closes this
 gap.
+
+**PR 2b (ADR 0061 rung D3 PR 2b) landed 2026-09-07**: `UpdateTable`'s own
+**throughput-only** change (`BillingMode`/`ProvisionedThroughput`, ADR
+0065) is now drivable through `SimCluster` too — the half PR 2a's own
+`dispatch_table_op` doc named as deferred. `dynamo::update_table_
+throughput` widened to `<E: Env, R: RelayClient>` (the identical
+`enable_stream`/`create_table` shape PR 2a already used — its three
+`tokio::time::Instant::now()`/`tokio::time::sleep` sites became
+`ctx.env.now().saturating_add(..)`/`ctx.env.sleep(..)`), and
+`dispatch_table_op` gained a fifth arm: `Operation::UpdateTable` proceeds
+only when `stream` and `index_update` are both `None` and
+`throughput_update` is `Some(spec)` (mirroring `update_table`'s own
+`(None, None, Some(spec))` match arm exactly), calling `update_table_
+throughput` then re-describing the table; anything else (a stream/index
+change, or no change at all) falls through to the same
+`unsupported_by_generic_dispatch` shape every other excluded operation
+uses. `update_table` itself — the full three-way dispatch, GSI/LSI/stream
+machinery included — stays completely untouched, still `ProdEnv`-only,
+still the one `run_operation` calls; `dispatch_table_op` is reached only
+from `execute_item_op_as` (its `matches!` gained `Operation::UpdateTable {
+.. }` alongside PR 2a's four operations), the `SimCluster`-facing entry
+point, mirroring PR 2a's own "never becomes the production dispatcher's
+ONLY path" discipline.
+
+`sim_cluster_dynamo_update_table.rs` (new sibling module of
+`sim_cluster_dynamo_table_ops.rs`) replaces five of `tests/dynamo_
+throttling.rs`'s eleven tests — `create_table_with_provisioned_throughput_
+throttles_without_any_admin_call`, `update_table_to_pay_per_request_lifts_
+the_limit`, `update_table_raising_units_admits_more`, `describe_table_
+reports_billing_mode_and_throughput`, `update_table_throughput_on_a_
+follower_is_relayed_to_the_leader` — every assertion carried over unchanged
+in *kind* (an admission/refusal outcome, a rendered `DescribeTable` shape,
+a converged per-table throughput spec on every node), never a metric
+counter (see `sim_cluster_throttle.rs`'s own doc for why: `ThrottledWrites`/
+`ThrottledReads` never increment under this fixture, since every
+metric-recording site gates on `self.data.as_ref()` and this fixture's
+`DataRole`, real since D2 PR 1, never populates those two specific
+counters). The `ProdEnv` original's own real-wall-clock converged-or-
+timeout retry for a raised-throughput admission becomes a bounded loop of
+further `SimCluster::dynamo` calls here — no explicit `run_for`/sleep
+needed, since each call already advances the cluster's own virtual clock
+by `OP_BUDGET` (12s). The remaining six `dynamo_throttling.rs` tests (batch
+shedding, `TransactWriteItems`, a forwarded-write throttle check, the
+`/admin/metrics` counter regression, and the cluster-wide `cluster_
+settings` config-surface test) stay on `ProdEnv` — none reachable through
+`dispatch_item_op`/`dispatch_table_op` yet. **No new `SimCluster` fixture
+bugs found this PR** — PR 2a's two fixes (the member-liveness heartbeat
+gap, the tablet-id-allocator collision) were sufficient; `UpdateTable`'s
+commit-wait shape is byte-identical to `CreateTable`'s.
+
+`crates/animusd/tests/auto_split_min_tablets.rs` was checked and
+deliberately left on `ProdEnv`: its own `UpdateTable` call raises a
+table's declared throughput to grow ADR 0067's derived minimum tablet
+count, but the test's real subject is that background trigger's
+real-thread behavior (a live per-tick auto-split loop forking a real
+CP-data tablet group) — `SimCluster` hand-hosts tablets (no real
+`animus_cp_data::host::Reconciler`, no live auto-split loop), so this test
+has no sim analog regardless of how far `dispatch_table_op` widens; a
+D4-shaped gap, not a D3 one.
 
 The restart tests run both incarnations in the same runtime,
 calling `Node::shutdown()` between them. In-crate `#[cfg(test)] mod`s

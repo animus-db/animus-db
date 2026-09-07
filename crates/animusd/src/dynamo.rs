@@ -1543,32 +1543,37 @@ async fn dispatch_item_op<E: Env, R: RelayClient>(
 /// production uses, from inside `SimCluster` (`sim_cluster_dynamo.rs`), with
 /// no `ProdEnv`/real socket anywhere in the call graph.
 ///
-/// **Covers exactly four operations**: `CreateTable` (base table only — a
+/// **Covers exactly five operations**: `CreateTable` (base table only — a
 /// declared GSI/LSI or a stream is rejected with
 /// [`unsupported_by_generic_dispatch`], the identical shape
 /// [`dispatch_item_op`]'s own `Query`/`Scan` arms use for a named index —
 /// genericizing the drain/backfill-seeder/sealer machinery those need is out
-/// of this PR's scope), `DeleteTable`, `ListTables`, `DescribeTable`.
-/// `UpdateTable`/`UpdateTimeToLive`/`CreateTableIndex`-via-`UpdateTable`/
-/// backup/export/import/PartiQL all fall through to
-/// [`unsupported_by_generic_dispatch`] — deferred to PR 2b and beyond,
-/// naming the same reasons [`dispatch_item_op`]'s own doc already gives for
-/// its own excluded operations.
+/// of this PR's scope), `DeleteTable`, `ListTables`, `DescribeTable`, and
+/// (ADR 0061 rung D3 PR 2b) `UpdateTable`'s own **throughput-only** change —
+/// a `BillingMode`/`ProvisionedThroughput` change with no stream or index
+/// change in the same call, via [`update_table_throughput`]. `UpdateTable`
+/// carrying a stream or index change instead (still needing the GSI-drain/
+/// stream-sealer machinery this rung doesn't generalize), plus
+/// `UpdateTimeToLive`/backup/export/import/PartiQL, all fall through to
+/// [`unsupported_by_generic_dispatch`] — deferred beyond this PR, naming the
+/// same reasons [`dispatch_item_op`]'s own doc already gives for its own
+/// excluded operations.
 ///
 /// **Called from two places**, mirroring [`dispatch_item_op`] exactly:
 /// [`run_operation`]'s own `CreateTable`/`DescribeTable`/`DeleteTable`/
-/// `ListTables` arms stay **unchanged**, calling [`create_table`]/
-/// [`describe_table`]/[`delete_table`]/[`list_tables`] directly — never this
-/// function — so production DDL behavior is byte-identical (those four
-/// functions are simply generic now, monomorphized at `E = ProdEnv, R =
-/// AnimusdRelayClient` at that call site, exactly as `dispatch_item_op`'s own
-/// six moved operations were). This function exists only for
-/// [`execute_item_op_as`] (below), the `SimCluster`-facing entry point — see
-/// the root `CLAUDE.md`'s "a narrowed generic split of a dispatcher must not
-/// become the production dispatcher's ONLY path" lesson (`docs/
-/// engineering-lessons.md`'s matching D2 entry): this rung deliberately
-/// repeats D2 PR 1's own shape rather than routing `run_operation` itself
-/// through the narrowed core.
+/// `ListTables`/`UpdateTable` arms stay **unchanged**, calling
+/// [`create_table`]/[`describe_table`]/[`delete_table`]/[`list_tables`]/
+/// [`update_table`] directly — never this function — so production DDL
+/// behavior is byte-identical (`update_table` itself keeps dispatching every
+/// one of its three change shapes, stream/index/throughput alike, to its own
+/// unmodified `ProdEnv`-only callees; only [`update_table_throughput`] itself
+/// was widened to `<E, R>`, the same way `create_table`'s own five callees
+/// were in PR 2a). This function exists only for [`execute_item_op_as`]
+/// (below), the `SimCluster`-facing entry point — see the root `CLAUDE.md`'s
+/// "a narrowed generic split of a dispatcher must not become the production
+/// dispatcher's ONLY path" lesson (`docs/engineering-lessons.md`'s matching
+/// D2 entry): this rung deliberately repeats D2 PR 1's own shape rather than
+/// routing `run_operation` itself through the narrowed core.
 async fn dispatch_table_op<E: Env, R: RelayClient>(
     ctx: &ClientCtx<E, R>,
     meta: &Metadata,
@@ -1614,6 +1619,34 @@ async fn dispatch_table_op<E: Env, R: RelayClient>(
             exclusive_start_table_name,
             limit,
         } => list_tables(meta, exclusive_start_table_name.as_deref(), limit),
+        // ADR 0061 rung D3 PR 2b: only the throughput-only shape of
+        // `UpdateTable` is covered — a stream or index change needs the
+        // GSI-drain/stream-sealer machinery this rung doesn't generalize
+        // (see `update_table`'s own doc for the three mutually exclusive
+        // change shapes this mirrors). `key_types` is unused here: it only
+        // ever matters for `IndexUpdate::Create`, which this arm never
+        // reaches.
+        Operation::UpdateTable {
+            table,
+            stream,
+            index_update,
+            key_types: _,
+            throughput_update,
+        } => {
+            if stream.is_some() || index_update.is_some() {
+                return Err(unsupported_by_generic_dispatch(
+                    "UpdateTable with a stream or index change",
+                ));
+            }
+            let Some(spec) = throughput_update else {
+                return Err(unsupported_by_generic_dispatch(
+                    "UpdateTable with no supported change",
+                ));
+            };
+            update_table_throughput(ctx, &table, spec).await?;
+            let meta = metadata_fresh(ctx).await;
+            describe_table(ctx, &meta, &table)
+        }
         _ => Err(unsupported_by_generic_dispatch("this table operation")),
     }
 }
@@ -1632,8 +1665,8 @@ async fn dispatch_table_op<E: Env, R: RelayClient>(
 /// this fixture has no SigV4 listener to gate through in the first place).
 ///
 /// The eight operations [`dispatch_item_op`] covers, plus (ADR 0061 rung D3
-/// PR 2a) the four base-table DDL operations [`dispatch_table_op`] covers,
-/// succeed; every other well-formed operation decodes fine and fails with
+/// PR 2a/2b) the five base-table DDL operations [`dispatch_table_op`]
+/// covers, succeed; every other well-formed operation decodes fine and fails with
 /// [`unsupported_by_generic_dispatch`]'s `InternalServerError` — see either
 /// function's own doc for the fuller "what's out of scope, why" account.
 ///
@@ -1662,18 +1695,22 @@ pub(crate) async fn execute_item_op_as<E: Env, R: RelayClient>(
             if let Err(err) = authz::authorize_op(ctx, principal, &op, meta) {
                 return (error_status(&err), err.to_json());
             }
-            // ADR 0061 rung D3 PR 2a: the four base-table DDL operations
+            // ADR 0061 rung D3 PR 2a/2b: the five base-table DDL operations
             // route to `dispatch_table_op` instead — `run_operation`'s own
             // production dispatch keeps calling `create_table`/
-            // `describe_table`/`delete_table`/`list_tables` directly (see
-            // `dispatch_table_op`'s own doc), so this split is local to this
-            // SimEnv-facing entry point only.
+            // `describe_table`/`delete_table`/`list_tables`/`update_table`
+            // directly (see `dispatch_table_op`'s own doc), so this split is
+            // local to this SimEnv-facing entry point only. `UpdateTable`
+            // itself narrows further inside `dispatch_table_op` (throughput-
+            // only; a stream/index change still falls through to
+            // `unsupported_by_generic_dispatch`).
             let result = if matches!(
                 op,
                 Operation::CreateTable { .. }
                     | Operation::DeleteTable { .. }
                     | Operation::ListTables { .. }
                     | Operation::DescribeTable { .. }
+                    | Operation::UpdateTable { .. }
             ) {
                 dispatch_table_op(ctx, meta, op).await
             } else {
@@ -4092,12 +4129,20 @@ async fn update_table(
 /// `label`, `ProvisionedThroughput` carries no identity, so re-asserting the
 /// same spec (or reverting to `PAY_PER_REQUEST`) both commit cleanly with no
 /// disable-first requirement — see that command's own doc.
-async fn update_table_throughput(
-    ctx: &ClientCtx,
+///
+/// Generic over `E: Env`/`R: RelayClient` (ADR 0061 rung D3 PR 2b), the
+/// identical `enable_stream`/`create_table` shape — its three
+/// `tokio::time::Instant::now()`/`tokio::time::sleep` sites became
+/// `ctx.env.now().saturating_add(..)`/`ctx.env.sleep(..)`. `update_table`'s
+/// own call site stays `ProdEnv`-only and unmodified, monomorphized as
+/// before; [`dispatch_table_op`]'s new `UpdateTable` arm is what reaches
+/// this generically.
+async fn update_table_throughput<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     table: &str,
     spec: Option<animus_control::ProvisionedThroughput>,
 ) -> Result<(), WireError> {
-    let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+    let deadline = ctx.env.now().saturating_add(SCHEMA_COMMIT_TIMEOUT);
     loop {
         ctx.propose_schema(&MetaCommand::SetTableThroughput {
             table: table.to_owned(),
@@ -4119,13 +4164,13 @@ async fn update_table_throughput(
             ctx.recompute_any_table_throughput(&meta);
             return Ok(());
         }
-        if tokio::time::Instant::now() >= deadline {
+        if ctx.env.now() >= deadline {
             return Err(internal(
                 "UpdateTable (ProvisionedThroughput) did not commit to the control plane in \
                  time (no leader reachable?)",
             ));
         }
-        tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+        ctx.env.sleep(SCHEMA_POLL_INTERVAL).await;
     }
 }
 

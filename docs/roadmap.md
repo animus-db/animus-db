@@ -364,11 +364,38 @@ the still-true paragraph after the table.
   `node_count > 3`. Every test added by this PR stays at `node_count <= 3`
   to avoid it; a proper fix needs `SimCluster` to grow real
   `Reconciler`-shaped teardown, named as this PR's own follow-up rather
-  than attempted here. D3's remaining classes (`UpdateTable` (PR 2b),
-  GSI/LSI-touching, Transact, PartiQL, Streams, TTL, admin/console/
-  dashboard HTTP, TLS, SigV4, restart-durability, wall-clock timing) and D4
-  (deterministic coverage for auto-split/GC/join/backup-janitor), plus a
-  real `SimCluster` `Reconciler` (the gap just above), remain open.
+  than attempted here. **PR 2b landed 2026-09-07**: `UpdateTable`'s own
+  **throughput-only** change (`BillingMode`/`ProvisionedThroughput`, ADR
+  0065) is now drivable through `SimCluster` too, via a widened
+  `dynamo::update_table_throughput<E, R>` and a new `UpdateTable` arm on
+  `dispatch_table_op` (still deliberately narrow — a stream/index change
+  stays `unsupported_by_generic_dispatch`, exactly as PR 2a left it;
+  `update_table`'s own production dispatch, and its stream/index-carrying
+  callees, are untouched). Five of `dynamo_throttling.rs`'s eleven tests
+  moved to a new `sim_cluster_dynamo_update_table.rs` (`CreateTable`/
+  `UpdateTable` provisioning and lifting a throttle limit, raising units,
+  `DescribeTable`'s `BillingMode`/`ProvisionedThroughput` rendering, and
+  the follower-relay regression for `MetaCommand::SetTableThroughput`); the
+  other six (batch shedding, `TransactWriteItems`, a forwarded-write
+  throttle check, the `/admin/metrics` counter regression, and the
+  cluster-wide `cluster_settings` config-surface test) stay on `ProdEnv` —
+  none is reachable through `dispatch_item_op`/`dispatch_table_op` yet, and
+  the metric-counter tests specifically need real counters this fixture's
+  own `sim_cluster_throttle.rs` module doc already documents as never
+  incrementing under `SimCluster` (every metric-recording site gates on
+  `self.data.as_ref()`). No new fixture bugs found this time — both
+  `SimCluster` fixes PR 2a needed (member-liveness heartbeating, the
+  tablet-id-allocator collision) were sufficient. `crates/animusd/tests/
+  auto_split_min_tablets.rs` was checked and deliberately left on `ProdEnv`
+  — its `UpdateTable` call feeds the real auto-split-min-tablets
+  background loop and tablet-forking reconciler, neither of which
+  `SimCluster` has (it hand-hosts tablets, ADR 0061 rung D1's own design
+  choice), so it is real-thread-liveness-shaped, not base-table-DDL-shaped.
+  D3's remaining classes (GSI/LSI-touching, `UpdateTable`'s stream/index
+  changes, Transact, PartiQL, Streams, TTL, admin/console/dashboard HTTP,
+  TLS, SigV4, restart-durability, wall-clock timing) and D4 (deterministic
+  coverage for auto-split/GC/join/backup-janitor), plus a real `SimCluster`
+  `Reconciler` (the gap just above), remain open.
 - **E1 landed 2026-09-04** (`ClusterApi`/`AdminOps` seams in
   `animus-operator`, fake-driven `controller::tests`; ADR 0061's
   2026-09-04 amendment). **E2 landed 2026-09-07**: the seven pre-existing

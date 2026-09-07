@@ -842,7 +842,7 @@ supply one, and isn't trying to.
 |---|---|
 | D1 | `SimCluster` harness: a multi-node cluster driven by `SimEnv`, on B1's shared corpus scaffolding. Built on `ClientCtx<SimEnv>` in `animusd`'s own tests, per the seventh 2026-08-28 amendment — not on a moved `animus-node` assembly |
 | D2 | An end-to-end DynamoDB-wire corpus — requests in at the wire edge, faults injected, resulting history checked by the existing `check_cycles`/`check_durability`/`check_convergence`. **Landed 2026-09-07 (both PRs)**: PR 1 (six item operations generic, `SimClusterHandle::dynamo`, a first small smoke) and PR 2 (the actual `Recorder`/`History` corpus over the wire, see the amendments below); GSI/LSI, transact, and PartiQL remain out of scope, named as D2's own residuals |
-| D3 | Migrate the `animusd` integration suite: **keep** the tests that genuinely prove real-thread liveness (group commit, lock contention, election timing — per the engineering-lessons rule that `SimEnv` does not prove thread liveness), convert the rest. **Success criterion corrected 2026-09-07** (see that date's own "D3 PR 1" amendment): the `prod-liveness` job's 2-attempt retry was already replaced by nextest sharding before D3 started, so there is no retry to drop — success is measured by the real-thread tier's own shrinking test count / wall time / flake surface instead. **PR 1 landed 2026-09-07**: the base-table-only "B class" (~30 tests across ten `dynamo_*.rs` binaries plus `kind_batch_outcome.rs`) converted to `SimCluster`. **PR 2a landed 2026-09-07**: `Metadata::members` population + `ClusterEdgeState::control` widened to `RaftNode<E>` make base-table DDL (`CreateTable`/`DeleteTable`/`ListTables`/`DescribeTable`, via new `dynamo::dispatch_table_op`) drivable over the real wire; two real fixture bugs found and fixed (a liveness-detector heartbeat gap, a tablet-id-allocator collision) and one genuine, documented `SimCluster` gap found and left open (a rebalanced-away replica's `RaftKvNode` is never torn down — see that date's own "D3 PR 2a" amendment) |
+| D3 | Migrate the `animusd` integration suite: **keep** the tests that genuinely prove real-thread liveness (group commit, lock contention, election timing — per the engineering-lessons rule that `SimEnv` does not prove thread liveness), convert the rest. **Success criterion corrected 2026-09-07** (see that date's own "D3 PR 1" amendment): the `prod-liveness` job's 2-attempt retry was already replaced by nextest sharding before D3 started, so there is no retry to drop — success is measured by the real-thread tier's own shrinking test count / wall time / flake surface instead. **PR 1 landed 2026-09-07**: the base-table-only "B class" (~30 tests across ten `dynamo_*.rs` binaries plus `kind_batch_outcome.rs`) converted to `SimCluster`. **PR 2a landed 2026-09-07**: `Metadata::members` population + `ClusterEdgeState::control` widened to `RaftNode<E>` make base-table DDL (`CreateTable`/`DeleteTable`/`ListTables`/`DescribeTable`, via new `dynamo::dispatch_table_op`) drivable over the real wire; two real fixture bugs found and fixed (a liveness-detector heartbeat gap, a tablet-id-allocator collision) and one genuine, documented `SimCluster` gap found and left open (a rebalanced-away replica's `RaftKvNode` is never torn down — see that date's own "D3 PR 2a" amendment). **PR 2b landed 2026-09-07**: `UpdateTable`'s own throughput-only change (`BillingMode`/`ProvisionedThroughput`, ADR 0065) is now drivable too, via a widened `dynamo::update_table_throughput` and a new `UpdateTable` arm on `dispatch_table_op` — five more `dynamo_throttling.rs` tests converted, no new fixture bugs (see that date's own "D3 PR 2b" amendment) |
 | D4 | Deterministic coverage for the behaviours that have none today: the auto-split byte trigger (`lib.rs:14397`), the dropped-table GC reclaim loop, join/growth sequencing, and the backup-janitor async loop (its replicated state machine is already sim-tested in `animus-control/tests/backup_catalog.rs`; the loop driving it is not) |
 
 Note that the copy-based split driver (ADR 0050) is deliberately **not** on
@@ -1749,6 +1749,101 @@ unchanged.
 `UpdateTable` in any shape (stream/index/throughput changes, `TagResource`/
 `UntagResource`, `UpdateTimeToLive`) — `dynamo_throttling.rs` (its own
 `UpdateTable`-provisioned-throughput coverage) is untouched.
+
+#### 2026-09-07 amendment — D3 PR 2b landed: `UpdateTable`'s throughput change drivable through `SimCluster`
+
+PR 2b is "`UpdateTable`'s **throughput-only** change (ADR 0065's
+`BillingMode`/`ProvisionedThroughput`) drivable through `SimCluster` over
+the real DynamoDB wire, and the matching `dynamo_throttling.rs` tests
+converted" — the half of `UpdateTable` PR 2a's own `dispatch_table_op`
+doc named as deferred, deliberately still without a stream or index
+change (unchanged scope cut from PR 2a — those need the GSI-drain/
+stream-sealer machinery this rung does not generalize).
+
+**`dynamo::update_table_throughput` widened to `<E: Env, R: RelayClient>`**
+— the identical `enable_stream`/`create_table` shape PR 2a already used:
+its three `tokio::time::Instant::now()`/`tokio::time::sleep` sites became
+`ctx.env.now().saturating_add(..)`/`ctx.env.sleep(..)`. `update_table`
+itself (and its other two branches' callees — `enable_stream`/
+`disable_stream`/`create_index`/`drop_index`) stays completely untouched,
+still `ProdEnv`-only, still calling `update_table_throughput` at its one
+existing call site (now simply monomorphized, exactly as `create_table`'s
+five widened callees already were in PR 2a).
+
+**`dynamo::dispatch_table_op` gained a fifth arm, `UpdateTable`** —
+narrower than `update_table`'s own three-way dispatch: it decodes
+`Operation::UpdateTable { table, stream, index_update, throughput_update,
+.. }` and only ever proceeds when both `stream` and `index_update` are
+`None` (mirroring `update_table`'s own `(None, None, Some(spec))` match
+arm exactly) and `throughput_update` is `Some(spec)`, calling
+`update_table_throughput(ctx, &table, spec)` then re-describing the table.
+A stream or index change (or no change at all — unreachable via the wire
+decoder, but handled explicitly rather than assumed, the same defensive
+posture `update_table`'s own catch-all arm already takes) returns the
+identical `unsupported_by_generic_dispatch` shape `dispatch_item_op`'s own
+excluded operations use. `execute_item_op_as`'s routing `matches!` gained
+`Operation::UpdateTable { .. }` alongside the four PR 2a operations, so
+every `UpdateTable` call reaches `dispatch_table_op` — including the ones
+that fall through to `unsupported_by_generic_dispatch` inside it, never
+`dispatch_item_op`'s own catch-all (whose message would have been
+identically worded but a layer removed from the real reason).
+
+**Tests converted** (`crates/animusd/src/sim_cluster_dynamo_update_table
+.rs`, new sibling module of `sim_cluster_dynamo_table_ops.rs`): five of
+`dynamo_throttling.rs`'s eleven tests —
+`create_table_with_provisioned_throughput_throttles_without_any_admin_
+call`, `update_table_to_pay_per_request_lifts_the_limit`, `update_table_
+raising_units_admits_more`, `describe_table_reports_billing_mode_and_
+throughput`, `update_table_throughput_on_a_follower_is_relayed_to_the_
+leader`. Every assertion carried over unchanged in *kind* (an admission/
+refusal outcome, a rendered `DescribeTable` shape, a converged per-table
+throughput spec on every node) — none references a metric counter, so
+none was blocked by `sim_cluster_throttle.rs`'s own documented gap
+(`ThrottledWrites`/`ThrottledReads` never incrementing under `SimCluster`,
+since every metric-recording site gates on `self.data.as_ref()` and this
+fixture's `DataRole` — real since D2 PR 1 — never populates the specific
+counters those two tests check). The `ProdEnv` original's own real-wall-
+clock converged-or-timeout retry in `update_table_raising_units_admits_
+more` (`ThrottleBucket::set_rate` refills at the OLD rate through the
+moment of the change, so the first post-raise check still pays that
+reassignment) becomes a bounded loop of further `SimCluster::dynamo`
+calls — no `run_for`/sleep needed between attempts, since each call
+already advances the cluster's own virtual clock by `OP_BUDGET` (12s).
+The reconciler-hazard invariant (PR 2a item 5) is checked on the one
+3-node scenario (`update_table_throughput_on_a_follower_is_relayed_to_
+the_leader`) the identical way PR 2a's own follower-relay tests check it;
+the four single-node scenarios don't need it (no second node for
+`rebalance_placement` to move a replica onto). One `ANIMUS_SEED` replay
+confirmed deterministic.
+
+**No new `SimCluster` fixture bugs found this time** — both fixes PR 2a
+needed (the member-liveness heartbeat gap, the tablet-id-allocator
+collision) were sufficient; `UpdateTable`'s own commit-wait shape is
+byte-identical to `CreateTable`'s, so nothing new was exercised structurally.
+
+**One other `ProdEnv` test grepped and deliberately left alone**:
+`crates/animusd/tests/auto_split_min_tablets.rs`'s `UpdateTable` call
+raises a table's declared throughput to grow ADR 0067's derived minimum
+tablet count — but the test's own subject is that background trigger's
+real-thread behavior (a live per-tick auto-split loop forking a real CP-
+data tablet group, `converged-or-timeout` polled against real wall time),
+not `UpdateTable`'s own wire mechanics. `SimCluster` hand-hosts tablets
+(ADR 0061 rung D1's own design choice — no real `animus_cp_data::host::
+Reconciler`, no live auto-split loop) and has no analog for either half of
+what this test actually proves, so it is out of `dispatch_table_op`'s
+reach regardless of how far this rung widens the DDL core — a D4-shaped
+gap (deterministic auto-split coverage), not a D3 one.
+
+**Gates**: `cargo fmt --all --check`; `cargo clippy -p animusd
+--all-targets --all-features -- -D warnings` (clean); `cargo test -p
+animusd --lib` — 252 passed (247 before this PR's own change, +5 new,
+zero regressions, ~68s wall, 3 ignored throughout); `cargo build -p
+animusd --all-targets` (green); `cargo test -p animusd --test dynamo_
+throttling --test schema_ddl_relay --test update_table_create_index
+--test update_table_drop_index` — run in full **before** commit B (the
+last two prove the full `update_table` dispatcher, GSI/LSI included, is
+byte-identical) and the surviving, five-test-smaller `dynamo_throttling`
+re-run green after; `Cargo.lock` unchanged.
 
 ### Phase E — the untested crates
 
