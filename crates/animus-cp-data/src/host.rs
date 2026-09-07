@@ -108,6 +108,42 @@ pub trait EngineFactory<S: StorageEngine>: Send + Sync {
         target: TabletId,
         keep: &[(Vec<u8>, Option<Vec<u8>>)],
     ) -> Result<S, String>;
+
+    /// **The reconciler's second fact source (issue #722).** Enumerate every
+    /// tablet id this node currently has DURABLE, local engine state for —
+    /// independent of, and not derived from, replicated `Metadata`.
+    ///
+    /// `gather_facts`/[`plan`] otherwise derive every fact exclusively from
+    /// `MetadataView` plus this reconciler's own in-process [`LocalState`]
+    /// (never persisted — see that type's own doc). A node that crashes
+    /// while hosting a tablet, then restarts only after that tablet's whole
+    /// table has been dropped and the drop has already converged everywhere
+    /// else, comes back with a brand-new, EMPTY `LocalState` and a
+    /// `Metadata` mirror that, by the time this node's first tick ever
+    /// runs, already never names the dropped tablet at all — `gather_facts`
+    /// then produces NO fact whatsoever for that tablet id, `plan` never
+    /// places it in `next.hosted`, and [`HostAction::Reclaim`] (which only
+    /// ever fires for a tablet [`LocalState::hosted`] itself currently
+    /// claims) can never target it: the engine — real data, written before
+    /// the crash — leaks permanently. This method is what lets the
+    /// reconciler notice it at all: [`Reconciler::tick`] calls it exactly
+    /// ONCE, on its very first tick after construction (see that method's
+    /// own doc for why once is enough), and folds the result into `plan`'s
+    /// own decision alongside `MetadataView` — see `plan`'s own doc for the
+    /// safety argument that makes reclaiming off this fact source sound.
+    ///
+    /// Default implementation returns empty — a pure no-op for this fact
+    /// source — so a third-party implementor of this trait, newly widened
+    /// by this method, still compiles unmodified; only
+    /// [`MemoryTabletEngines`] and the production `LsmTabletFactory`
+    /// (`animusd`) override it. A transient enumeration failure (e.g. a
+    /// real disk `list()` error) is expected to resolve the identical way
+    /// [`probe`](Self::probe)/[`destroy`](Self::destroy) already do —
+    /// silently as empty/no-op — rather than propagate an error this
+    /// trait's other methods have no channel for either.
+    async fn local_tablets(&self) -> BTreeSet<TabletId> {
+        BTreeSet::new()
+    }
 }
 
 /// The [`MemoryEngine`] implementation of [`EngineFactory`]: an in-memory
@@ -178,6 +214,15 @@ impl EngineFactory<MemoryEngine> for MemoryTabletEngines {
             .expect("engine registry poisoned")
             .insert(target.0, cloned.clone());
         Ok(cloned)
+    }
+
+    async fn local_tablets(&self) -> BTreeSet<TabletId> {
+        self.engines
+            .lock()
+            .expect("engine registry poisoned")
+            .keys()
+            .map(|&id| TabletId(id))
+            .collect()
     }
 }
 
@@ -475,6 +520,12 @@ pub enum HostAction {
     /// dual of [`Release`](Self::Release). No current range exists to narrow
     /// to (every same-prefix sibling still resident is dying in the same
     /// pass too), so the caller erases the group's full existing scope.
+    /// Three causes reach this action identically: a dropped table, a
+    /// cutover-retired split parent, and — since issue #722 — a locally
+    /// present engine this node's own `LocalState` only just discovered via
+    /// [`EngineFactory::local_tablets`] (a restart that missed the whole
+    /// drop window while offline); no disambiguation is needed since all
+    /// three demand the identical teardown.
     Reclaim {
         /// The tablet to reclaim.
         tablet: TabletId,
@@ -544,9 +595,10 @@ pub enum HostAction {
 
 /// The single pure decision behind every per-node tablet-host reconcile tick
 /// (ADR 0031): given one snapshot of replicated state (`view`), this node's
-/// base `raftkv` id, the caller-gathered per-tablet facts, and this node's own
-/// prior [`LocalState`], decide every action to take and the successor
-/// `LocalState` to carry into the next call.
+/// base `raftkv` id, the caller-gathered per-tablet facts, this node's own
+/// locally-present engine ids (`local_tablets`, issue #722 — see below), and
+/// this node's own prior [`LocalState`], decide every action to take and the
+/// successor `LocalState` to carry into the next call.
 ///
 /// Pure and synchronous — no `Env`, no clock, no RNG, no I/O of any kind. The
 /// caller (`animusd`, PR4) gathers `facts` from its own live registry/engine,
@@ -555,10 +607,44 @@ pub enum HostAction {
 /// [`LocalState::hosted`] only once its own async teardown for a planned
 /// `Reclaim`/`Release` has actually completed — see
 /// [`LocalState::confirm_torn_down`]).
+///
+/// **`local_tablets` (issue #722) — the second fact source, alongside
+/// `view`.** `Metadata`/`LocalState` alone can't discover a tablet whose
+/// whole table was dropped while this node was offline: `LocalState` is
+/// never persisted (a restart starts from [`LocalState::default`]), and the
+/// dropped tablet is, by construction, absent from `view.tablets` — so
+/// without this second source `plan` would never place it in `next.hosted`
+/// and [`HostAction::Reclaim`] (which only ever fires for a tablet
+/// `LocalState` itself currently claims, in Phase 3 below) could never
+/// target it. `local_tablets` is expected to be the ids
+/// [`EngineFactory::local_tablets`] reports **once**, on this reconciler's
+/// very first tick after construction, and empty on every tick after that
+/// (see that method's own doc for why once is enough) — `plan` itself does
+/// not care which tick supplied it, only that a nonempty set here means "an
+/// engine exists locally for this id, right now."
+///
+/// **Safety argument (why folding it in is sound, not merely convenient)**:
+/// an engine only ever exists locally for a tablet id this exact node has
+/// itself, at some prior tick, observed as real — [`HostAction::Host`] and
+/// [`HostAction::MaterializeSplitChild`] are the only two actions that ever
+/// create one, and both are emitted only in reaction to observing the
+/// tablet in `view.tablets` (an ordinary entry for `Host`; one of the two
+/// `children` named on its PARENT's own `inplace_split` intent — itself a
+/// `view.tablets` field — for `MaterializeSplitChild`, which is why a
+/// pre-cutover split child, materialized before it has its OWN
+/// `view.tablets` entry, must never be misread as an orphan: `known` below
+/// names it via its parent's intent instead). Tablet ids are never reused
+/// (ADR 0022/0050), so a locally-present id absent from `known` is either a
+/// dropped table's leftover engine (reclaim it) or — structurally
+/// impossible by the argument above — nothing else: it can never be "a
+/// tablet that merely hasn't appeared in `Metadata` yet," since nothing on
+/// this node ever creates an engine before first observing the tablet
+/// itself.
 #[must_use]
 pub fn plan(
     view: &MetadataView,
     facts: &BTreeMap<TabletId, TabletFacts>,
+    local_tablets: &BTreeSet<TabletId>,
     state: &LocalState,
     base_id: NodeId,
 ) -> (Vec<HostAction>, LocalState) {
@@ -681,6 +767,31 @@ pub fn plan(
                 desired: t.replicas.iter().cloned().collect(),
                 down: view.down.clone(),
             });
+        }
+    }
+
+    // --- Phase 2.7 (issue #722): fold in any locally-present engine this
+    // reconciler's own `LocalState` doesn't yet know about, so Phase 3's
+    // ordinary reclaim logic below picks it up exactly like any other
+    // hosted-but-now-absent tablet — see `plan`'s own doc for the full
+    // safety argument. `known` is every id `view` can currently account
+    // for: an ordinary tablet map entry, or a split child named on its
+    // parent's still-live `inplace_split` intent (a pre-cutover child has
+    // no entry of its own yet, but is never a stranger to `view`).
+    let known: BTreeSet<TabletId> = view
+        .tablets
+        .keys()
+        .copied()
+        .chain(
+            view.tablets
+                .values()
+                .filter_map(|t| t.inplace_split.as_ref())
+                .flat_map(|intent| intent.children.iter().map(|c| c.id)),
+        )
+        .collect();
+    for &tablet in local_tablets {
+        if !next.hosted.contains(&tablet) && !known.contains(&tablet) {
+            next.hosted.insert(tablet);
         }
     }
 
@@ -864,6 +975,18 @@ pub struct Reconciler<E: Env, S: StorageEngine> {
     /// [`new`](Self::new) is unaffected, and every group this reconciler
     /// hosts persists into its own private `wal_file(tablet)`, unchanged.
     shared_wal: Option<Arc<SharedWal<KvCommand, KvState>>>,
+    /// Issue #722: has this reconciler already consulted
+    /// [`EngineFactory::local_tablets`] once? `false` from [`new`](Self::new)
+    /// until the first [`tick`](Self::tick) call, then permanently `true` —
+    /// see `EngineFactory::local_tablets`'s own doc for why exactly one
+    /// check, ever, is both sufficient and correct (a local engine created
+    /// after the first tick can only be this SAME reconciler's own
+    /// [`host`](Self::host)/[`materialize_split_child`]
+    /// (Self::materialize_split_child), already tracked in `LocalState`
+    /// without needing to ask the factory again) — this is what keeps the
+    /// fix from adding a per-tick directory-listing cost to every tick for
+    /// the rest of this reconciler's life.
+    local_engines_checked: bool,
 }
 
 /// Fresh/re-registered-hosting mirror hook — see [`Reconciler`]'s `on_host`
@@ -905,6 +1028,7 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
             quiesce_after: None,
             heartbeat_batcher: None,
             shared_wal: None,
+            local_engines_checked: false,
         }
     }
 
@@ -1097,7 +1221,12 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
     /// The caller is responsible for the `last_applied() == 0` pre-recovery
     /// guard (a live control-plane `RaftNode` read this crate has no business
     /// taking, per [`plan`]'s own doc) — skip calling `tick` at all before
-    /// replicated `Metadata` has recovered.
+    /// replicated `Metadata` has recovered. **On THIS reconciler's very
+    /// first tick only** (issue #722), also consults
+    /// [`EngineFactory::local_tablets`] and folds the result into `plan`'s
+    /// second fact source — see that method's and `plan`'s own docs for the
+    /// full mechanism and why exactly one check is enough for this
+    /// reconciler's whole lifetime.
     pub async fn tick(&mut self, view: &MetadataView) {
         // ADR 0044 phase-1 PR4, fork H: proactively wake any hosted group
         // whose replica set intersects the failure detector's `down` set —
@@ -1115,7 +1244,23 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
         }
 
         let facts = self.gather_facts(view).await;
-        let (actions, next) = plan(view, &facts, &self.state, self.base_id.clone());
+        // Issue #722: the second fact source, gathered ONCE (see this
+        // method's own doc) — every later tick passes an empty set, since a
+        // local engine created after the first tick is always this
+        // reconciler's own doing already, tracked in `LocalState`.
+        let local_tablets = if self.local_engines_checked {
+            BTreeSet::new()
+        } else {
+            self.local_engines_checked = true;
+            self.factory.local_tablets().await
+        };
+        let (actions, next) = plan(
+            view,
+            &facts,
+            &local_tablets,
+            &self.state,
+            self.base_id.clone(),
+        );
         self.state = next;
 
         for action in actions {
@@ -2055,7 +2200,7 @@ mod tests {
         // Drive to RELEASE_CONFIRM_TICKS to force the release action too.
         let mut last = (Vec::new(), state);
         for _ in 0..RELEASE_CONFIRM_TICKS {
-            last = plan(&v, &facts, &last.1, base());
+            last = plan(&v, &facts, &BTreeSet::new(), &last.1, base());
         }
         let (actions, _next) = last;
 
@@ -2102,7 +2247,7 @@ mod tests {
         .into_iter()
         .collect();
 
-        let (actions, next) = plan(&v, &facts, &state, base());
+        let (actions, next) = plan(&v, &facts, &BTreeSet::new(), &state, base());
         assert_eq!(actions, Vec::new());
         assert_eq!(next, state);
     }
@@ -2127,7 +2272,7 @@ mod tests {
         .into_iter()
         .collect();
 
-        let (actions, _next) = plan(&v, &facts, &state, base());
+        let (actions, _next) = plan(&v, &facts, &BTreeSet::new(), &state, base());
         assert_eq!(actions, Vec::new());
     }
 
@@ -2138,7 +2283,7 @@ mod tests {
         let v = view([(1, tablet_for_table(1, "t", b"", None, vec![base()]))]);
         let state = LocalState::default();
 
-        let (actions, next) = plan(&v, &BTreeMap::new(), &state, base());
+        let (actions, next) = plan(&v, &BTreeMap::new(), &BTreeSet::new(), &state, base());
         assert_eq!(
             actions,
             vec![HostAction::Host {
@@ -2151,7 +2296,7 @@ mod tests {
 
         // A second call with the tablet now in `hosted` (and no facts,
         // meaning not-yet-actually-registered) must not re-plan a Host.
-        let (actions2, _next2) = plan(&v, &BTreeMap::new(), &next, base());
+        let (actions2, _next2) = plan(&v, &BTreeMap::new(), &BTreeSet::new(), &next, base());
         assert_eq!(actions2, Vec::new());
     }
 
@@ -2161,7 +2306,7 @@ mod tests {
         t.epoch = Epoch::INITIAL.next();
         let v = view([(1, t)]);
         let state = LocalState::default();
-        let (actions, _next) = plan(&v, &BTreeMap::new(), &state, base());
+        let (actions, _next) = plan(&v, &BTreeMap::new(), &BTreeSet::new(), &state, base());
         assert_eq!(
             actions,
             vec![HostAction::Host {
@@ -2190,7 +2335,7 @@ mod tests {
         .into_iter()
         .collect();
 
-        let (actions, _next) = plan(&v, &facts, &state, base());
+        let (actions, _next) = plan(&v, &facts, &BTreeSet::new(), &state, base());
         assert_eq!(
             actions,
             vec![HostAction::Host {
@@ -2205,7 +2350,7 @@ mod tests {
     fn plan_does_not_host_a_non_replica_tablet() {
         let v = view([(1, tablet(1, b"", None, vec![nid(301), nid(302)]))]);
         let state = LocalState::default();
-        let (actions, next) = plan(&v, &BTreeMap::new(), &state, base());
+        let (actions, next) = plan(&v, &BTreeMap::new(), &BTreeSet::new(), &state, base());
         assert_eq!(actions, Vec::new());
         assert!(next.hosted.is_empty());
     }
@@ -2244,7 +2389,7 @@ mod tests {
         .into_iter()
         .collect();
 
-        let (actions, _next) = plan(&v, &facts, &state, base());
+        let (actions, _next) = plan(&v, &facts, &BTreeSet::new(), &state, base());
         assert_eq!(
             actions,
             vec![HostAction::Reconfigure {
@@ -2271,7 +2416,7 @@ mod tests {
         )]
         .into_iter()
         .collect();
-        let (actions, _next) = plan(&v, &facts, &state, base());
+        let (actions, _next) = plan(&v, &facts, &BTreeSet::new(), &state, base());
         assert!(
             !actions
                 .iter()
@@ -2304,7 +2449,7 @@ mod tests {
 
         let mut cur = state;
         for tick in 1..RELEASE_CONFIRM_TICKS {
-            let (actions, next) = plan(&v, &facts, &cur, base());
+            let (actions, next) = plan(&v, &facts, &BTreeSet::new(), &cur, base());
             assert_eq!(
                 actions,
                 Vec::new(),
@@ -2319,7 +2464,7 @@ mod tests {
             cur = next;
         }
 
-        let (actions, next) = plan(&v, &facts, &cur, base());
+        let (actions, next) = plan(&v, &facts, &BTreeSet::new(), &cur, base());
         assert_eq!(
             actions,
             vec![HostAction::Release {
@@ -2337,7 +2482,7 @@ mod tests {
     fn an_epoch_bump_mid_count_resets_the_release_dampener() {
         let (v, state, facts) = released_tablet_setup();
 
-        let (_actions, next1) = plan(&v, &facts, &state, base());
+        let (_actions, next1) = plan(&v, &facts, &BTreeSet::new(), &state, base());
         assert_eq!(
             next1.pending_release.get(&TabletId(1)).map(|(_, t)| *t),
             Some(1)
@@ -2349,7 +2494,7 @@ mod tests {
         let t = bumped.tablets.get_mut(&TabletId(1)).expect("tablet");
         t.epoch = t.epoch.next();
 
-        let (_actions, next2) = plan(&bumped, &facts, &next1, base());
+        let (_actions, next2) = plan(&bumped, &facts, &BTreeSet::new(), &next1, base());
         assert_eq!(
             next2.pending_release.get(&TabletId(1)).map(|(_, t)| *t),
             Some(1),
@@ -2361,7 +2506,7 @@ mod tests {
     fn a_re_add_cancels_a_pending_release() {
         let (v, state, facts) = released_tablet_setup();
 
-        let (_actions, next1) = plan(&v, &facts, &state, base());
+        let (_actions, next1) = plan(&v, &facts, &BTreeSet::new(), &state, base());
         assert!(next1.pending_release.contains_key(&TabletId(1)));
 
         // The tablet's replica set gains base() back (a re-add).
@@ -2372,7 +2517,7 @@ mod tests {
             .expect("tablet")
             .replicas = vec![base(), nid(301), nid(302)];
 
-        let (actions, next2) = plan(&readded, &facts, &next1, base());
+        let (actions, next2) = plan(&readded, &facts, &BTreeSet::new(), &next1, base());
         assert!(
             !next2.pending_release.contains_key(&TabletId(1)),
             "a re-add must cancel the pending release"
@@ -2395,7 +2540,7 @@ mod tests {
         state.hosted.insert(TabletId(1));
 
         // No facts entry at all: `hosted` fact is false -> "not excluded".
-        let (actions, next) = plan(&v, &BTreeMap::new(), &state, base());
+        let (actions, next) = plan(&v, &BTreeMap::new(), &BTreeSet::new(), &state, base());
         assert_eq!(actions, Vec::new());
         assert!(!next.pending_release.contains_key(&TabletId(1)));
 
@@ -2410,7 +2555,7 @@ mod tests {
         )]
         .into_iter()
         .collect();
-        let (actions, next) = plan(&v, &facts, &state, base());
+        let (actions, next) = plan(&v, &facts, &BTreeSet::new(), &state, base());
         assert_eq!(actions, Vec::new());
         assert!(!next.pending_release.contains_key(&TabletId(1)));
     }
@@ -2438,7 +2583,13 @@ mod tests {
         // Mirrors `plan`'s own phase-1 insert: a fresh tablet is claimed
         // optimistically, before any executor has actually stood it up.
         let v = view([(1, tablet(1, b"", None, vec![base()]))]);
-        let (actions, next) = plan(&v, &BTreeMap::new(), &LocalState::default(), base());
+        let (actions, next) = plan(
+            &v,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            &LocalState::default(),
+            base(),
+        );
         assert!(matches!(actions[0], HostAction::Host { tablet, .. } if tablet == TabletId(1)));
         assert!(next.hosted.contains(&TabletId(1)));
 
@@ -2451,7 +2602,7 @@ mod tests {
         // The next `plan` call must genuinely re-emit `Host` — the whole
         // point of releasing the claim — not silently swallow it forever
         // (the bug this method exists to close).
-        let (actions2, _next2) = plan(&v, &BTreeMap::new(), &released, base());
+        let (actions2, _next2) = plan(&v, &BTreeMap::new(), &BTreeSet::new(), &released, base());
         assert_eq!(
             actions2,
             vec![HostAction::Host {
@@ -2514,7 +2665,7 @@ mod tests {
         let mut state = LocalState::default();
         state.hosted.insert(TabletId(1));
 
-        let (actions1, next1) = plan(&v, &BTreeMap::new(), &state, base());
+        let (actions1, next1) = plan(&v, &BTreeMap::new(), &BTreeSet::new(), &state, base());
         assert_eq!(
             actions1,
             vec![HostAction::Reclaim {
@@ -2525,7 +2676,7 @@ mod tests {
         assert!(next1.hosted.contains(&TabletId(1)));
 
         // Retried identically on a second call before confirmation.
-        let (actions2, next2) = plan(&v, &BTreeMap::new(), &next1, base());
+        let (actions2, next2) = plan(&v, &BTreeMap::new(), &BTreeSet::new(), &next1, base());
         assert_eq!(
             actions2,
             vec![HostAction::Reclaim {
@@ -2536,7 +2687,7 @@ mod tests {
         // Once the caller confirms the teardown, it stops being replanned.
         let mut confirmed = next2;
         confirmed.confirm_torn_down(TabletId(1));
-        let (actions3, _next3) = plan(&v, &BTreeMap::new(), &confirmed, base());
+        let (actions3, _next3) = plan(&v, &BTreeMap::new(), &BTreeSet::new(), &confirmed, base());
         assert_eq!(actions3, Vec::new());
     }
 
@@ -2552,12 +2703,101 @@ mod tests {
         let mut state = LocalState::default();
         state.hosted.insert(TabletId(2));
 
-        let (actions, _next) = plan(&v, &BTreeMap::new(), &state, base());
+        let (actions, _next) = plan(&v, &BTreeMap::new(), &BTreeSet::new(), &state, base());
         assert_eq!(
             actions,
             vec![HostAction::Reclaim {
                 tablet: TabletId(2)
             }]
         );
+    }
+
+    // === plan(): local_tablets, the second fact source (issue #722) ========
+
+    #[test]
+    fn a_locally_present_tablet_absent_from_the_map_is_reclaimed_even_with_empty_state() {
+        // The exact restart shape issue #722 is about: `state` is a FRESH
+        // `LocalState::default()` (nothing survives a real process
+        // restart), so nothing in it names `TabletId(2)` — the only reason
+        // this reconciler can discover the leftover engine at all is the
+        // new `local_tablets` fact source.
+        let v = view([]);
+        let state = LocalState::default();
+        let local_tablets: BTreeSet<TabletId> = [TabletId(2)].into_iter().collect();
+
+        let (actions, next) = plan(&v, &BTreeMap::new(), &local_tablets, &state, base());
+        assert_eq!(
+            actions,
+            vec![HostAction::Reclaim {
+                tablet: TabletId(2)
+            }],
+            "a local engine with no Metadata entry at all must be reclaimed"
+        );
+        // Mirrors the ordinary Reclaim discipline exactly: `plan` claims it
+        // into `hosted` optimistically, the caller's own teardown confirms
+        // it later via `LocalState::confirm_torn_down`.
+        assert!(next.hosted.contains(&TabletId(2)));
+    }
+
+    #[test]
+    fn a_locally_present_tablet_still_in_the_map_is_not_reclaimed() {
+        // The ordinary "this node is about to host it" case — `local_tablets`
+        // naming an id that's a perfectly live, present tablet must never be
+        // treated as an orphan.
+        let v = view([(2, tablet(2, b"", None, vec![base()]))]);
+        let state = LocalState::default();
+        let local_tablets: BTreeSet<TabletId> = [TabletId(2)].into_iter().collect();
+
+        let (actions, _next) = plan(&v, &BTreeMap::new(), &local_tablets, &state, base());
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, HostAction::Reclaim { tablet } if *tablet == TabletId(2))),
+            "a tablet local_tablets names that is still in the map must never be reclaimed: \
+             {actions:?}"
+        );
+    }
+
+    #[test]
+    fn a_pre_cutover_split_childs_engine_is_not_reclaimed_even_with_empty_state() {
+        // The safety exemption this fix's whole argument rests on: a split
+        // child's engine is materialized (`MaterializeSplitChild`) BEFORE
+        // the child ever gets its own `view.tablets` entry — only the
+        // PARENT's `inplace_split` intent names it. A restart mid-split
+        // (fresh, empty `state`, exactly like the dropped-table case above)
+        // must not treat that child's already-materialized engine as an
+        // orphan.
+        let child_a = SplitChild {
+            id: TabletId(10),
+            replicas: vec![base()],
+        };
+        let child_b = SplitChild {
+            id: TabletId(11),
+            replicas: vec![base()],
+        };
+        let mut parent = tablet(1, b"", None, vec![base()]);
+        parent.inplace_split = Some(animus_tablet::InPlaceSplitIntent {
+            split_key: b"m".to_vec(),
+            children: [child_a, child_b],
+        });
+        let v = view([(1, parent)]);
+        let state = LocalState::default();
+        // Both children already have a local engine (an earlier
+        // `MaterializeSplitChild` ran on this exact node before the crash)
+        // — neither is in the map yet, only referenced via the parent's
+        // own intent.
+        let local_tablets: BTreeSet<TabletId> = [TabletId(10), TabletId(11)].into_iter().collect();
+
+        let (actions, next) = plan(&v, &BTreeMap::new(), &local_tablets, &state, base());
+        assert!(
+            !actions.iter().any(|a| matches!(
+                a,
+                HostAction::Reclaim { tablet } if *tablet == TabletId(10) || *tablet == TabletId(11)
+            )),
+            "a pre-cutover split child named only on its parent's own inplace_split \
+             intent must never be reclaimed as an orphan: {actions:?}"
+        );
+        assert!(!next.hosted.contains(&TabletId(10)));
+        assert!(!next.hosted.contains(&TabletId(11)));
     }
 }

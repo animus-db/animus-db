@@ -453,99 +453,19 @@ async fn single_write_latency_is_low() {
     }
 }
 
-/// Phase 2.4 — **automatic size-telemetry split trigger.** With the auto-split
-/// loop enabled at a low byte threshold, writing past it causes the tablet's
-/// leader to split it at the median **with no manual trigger**; afterwards both
-/// halves serve. Closes the auto-shard loop. (The former key-count trigger
-/// this test used to exercise — `start_cluster_auto_split` — was removed;
-/// this proves the same general split-triggering behavior via bytes instead.)
-#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
-async fn tablet_auto_splits_when_it_grows() {
-    let dir = support::panic_safe_tempdir();
-    let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
-        .await
-        .unwrap();
-    // Auto-split once a tablet exceeds ~100 bytes (a test threshold; the 24
-    // `key##`/`v#` rows written below total well over that).
-    let nodes = start_cluster_with_auto_split_bytes(bound, StorageBackend::default(), Some(100))
-        .await
-        .unwrap();
-    await_bootstrap(&nodes).await;
-    let addr0 = nodes[0].client_addr();
-
-    // Write 24 distinct keys (> threshold) to the single bootstrap tablet.
-    for i in 0..24u32 {
-        let key = format!("key{i:02}").into_bytes();
-        let value = format!("v{i}").into_bytes();
-        let put = async {
-            loop {
-                match call(
-                    addr0,
-                    ClientRequest::Put {
-                        key: key.clone(),
-                        value: value.clone(),
-                        table: "kv".to_string(),
-                    },
-                )
-                .await
-                {
-                    ClientResponse::PutOk => return,
-                    ClientResponse::Error(_) => sleep(Duration::from_millis(100)).await,
-                    other => panic!("unexpected put: {other:?}"),
-                }
-            }
-        };
-        timeout(Duration::from_secs(20), put)
-            .await
-            .unwrap_or_else(|_| panic!("write key{i:02} timed out"));
-    }
-
-    // The auto-split loop (no manual trigger) splits the over-threshold tablet.
-    let auto_split = async {
-        loop {
-            if nodes.iter().all(|n| n.metadata().tablets.len() >= 2) {
-                return;
-            }
-            sleep(Duration::from_millis(200)).await;
-        }
-    };
-    timeout(Duration::from_secs(30), auto_split)
-        .await
-        .expect("tablet did not auto-split within 30s");
-
-    // Both halves serve: a low key and a high key both read back, retrying while the
-    // new (upper) group elects + its addresses propagate.
-    for (k, want) in [
-        (b"key00".to_vec(), b"v0".to_vec()),
-        (b"key23".to_vec(), b"v23".to_vec()),
-    ] {
-        let read = async {
-            loop {
-                let got = call(
-                    nodes[2].client_addr(),
-                    ClientRequest::Get {
-                        key: k.clone(),
-                        table: "kv".to_string(),
-                        stale: false,
-                    },
-                )
-                .await;
-                if got == ClientResponse::Value(Some(want.clone())) {
-                    return;
-                }
-                sleep(Duration::from_millis(150)).await;
-            }
-        };
-        timeout(Duration::from_secs(30), read)
-            .await
-            .unwrap_or_else(|_| panic!("key {k:?} not served after auto-split"));
-    }
-
-    for n in &nodes {
-        n.shutdown_graceful().await;
-    }
-}
-
+/// ADR 0061 rung D4 PR 2: `tablet_auto_splits_when_it_grows` (uniform
+/// over-threshold keys, no manual trigger, both halves serve) was removed
+/// from here — `sim_cluster_auto_split.rs`'s scenario (a),
+/// `a_byte_threshold_crossing_forks_exactly_once`, proves the identical
+/// property deterministically, through the real `auto_split_loop` (now
+/// `<E: Env, R: RelayClient>`-generic) driven under `SimEnv`. This file
+/// keeps `tablet_auto_splits_on_bytes_with_skewed_value_sizes` just below
+/// — its specific byte-weighted-median quantitative-balance claim (a loose
+/// 15% floor derived from correlating written keys against real token
+/// ranges) isn't reproduced by the new `SimCluster` scenarios, which don't
+/// correlate a DynamoDB item's `pk` to its token range — see
+/// `crates/animusd/CLAUDE.md`'s matching entry.
+///
 /// ADR 0034 — **byte-based** auto-split trigger with skewed value sizes. A
 /// tablet with only a handful of keys auto-splits purely on the **byte**
 /// threshold (the only trigger this crate has since the key-count trigger's
@@ -717,131 +637,12 @@ async fn tablet_auto_splits_on_bytes_with_skewed_value_sizes() {
     }
 }
 
-/// Regression: a tablet can be split **more than once** over its life — since
-/// split is just a metadata range-narrowing command (epoch-CAS gated, no
-/// one-shot latch anywhere), a tablet that already split once and keeps
-/// absorbing writes must split *again* once it regrows past the byte
-/// threshold, not sit frozen forever. This proves the tablet count keeps
-/// growing as the same lineage repeatedly crosses the threshold, and that
-/// every resulting tablet ends up with a real CP group (structurally
-/// guaranteed now — see the root `CLAUDE.md`).
-#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
-async fn already_split_tablet_splits_again_once_it_regrows() {
-    let dir = support::panic_safe_tempdir();
-    let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
-        .await
-        .unwrap();
-    // Same ~100-byte test threshold as `tablet_auto_splits_when_it_grows`.
-    let nodes = start_cluster_with_auto_split_bytes(bound, StorageBackend::default(), Some(100))
-        .await
-        .unwrap();
-    await_bootstrap(&nodes).await;
-    let addr0 = nodes[0].client_addr();
-
-    async fn put(addr0: std::net::SocketAddr, key: Vec<u8>, value: Vec<u8>) {
-        loop {
-            match call(
-                addr0,
-                ClientRequest::Put {
-                    key: key.clone(),
-                    value: value.clone(),
-                    table: "kv".to_string(),
-                },
-            )
-            .await
-            {
-                ClientResponse::PutOk => return,
-                ClientResponse::Error(_) => sleep(Duration::from_millis(100)).await,
-                other => panic!("unexpected put: {other:?}"),
-            }
-        }
-    }
-
-    // First 24 keys trip the threshold and the tablet auto-splits once.
-    for i in 0..24u32 {
-        let key = format!("key{i:02}").into_bytes();
-        let value = format!("v{i}").into_bytes();
-        timeout(Duration::from_secs(20), put(addr0, key, value))
-            .await
-            .unwrap_or_else(|_| panic!("write key{i:02} timed out"));
-    }
-
-    let auto_split = async {
-        loop {
-            if nodes.iter().all(|n| n.metadata().tablets.len() >= 2) {
-                return;
-            }
-            sleep(Duration::from_millis(200)).await;
-        }
-    };
-    timeout(Duration::from_secs(30), auto_split)
-        .await
-        .expect("tablet did not auto-split within 30s");
-    let tablet_count_after_first_split = nodes[0].metadata().tablets.len();
-
-    // Keep writing keys that sort *below* every `key##` key already written —
-    // the split's median falls somewhere inside `key00..key23`, so every
-    // `aaa##` key lands below it, in the original tablet's lower range (the
-    // one whose group already split once). Deliberately avoiding new keys in
-    // the *upper* range keeps this test isolated to the already-split
-    // tablet's own lineage re-splitting, not the sibling splitting for its
-    // own first time.
-    for i in 0..40u32 {
-        let key = format!("aaa{i:02}").into_bytes();
-        let value = format!("v{i}").into_bytes();
-        timeout(Duration::from_secs(20), put(addr0, key, value))
-            .await
-            .unwrap_or_else(|_| panic!("write aaa{i:02} timed out"));
-    }
-
-    // The already-split lineage must split *again* — tablet count grows past
-    // where it stopped after the first split.
-    let second_split = async {
-        loop {
-            if nodes
-                .iter()
-                .all(|n| n.metadata().tablets.len() > tablet_count_after_first_split)
-            {
-                return;
-            }
-            sleep(Duration::from_millis(200)).await;
-        }
-    };
-    timeout(Duration::from_secs(30), second_split)
-        .await
-        .expect("already-split tablet did not split again after regrowing");
-
-    // Every key written across both split rounds is still reachable — no
-    // orphans/lost routing left behind by splitting the same lineage twice.
-    for (k, want) in [
-        (b"aaa00".to_vec(), b"v0".to_vec()),
-        (b"aaa39".to_vec(), b"v39".to_vec()),
-        (b"key00".to_vec(), b"v0".to_vec()),
-        (b"key23".to_vec(), b"v23".to_vec()),
-    ] {
-        let read = async {
-            loop {
-                let got = call(
-                    addr0,
-                    ClientRequest::Get {
-                        key: k.clone(),
-                        table: "kv".to_string(),
-                        stale: false,
-                    },
-                )
-                .await;
-                if got == ClientResponse::Value(Some(want.clone())) {
-                    return;
-                }
-                sleep(Duration::from_millis(150)).await;
-            }
-        };
-        timeout(Duration::from_secs(20), read)
-            .await
-            .unwrap_or_else(|_| panic!("key {k:?} not served after repeated auto-split"));
-    }
-
-    for n in &nodes {
-        n.shutdown_graceful().await;
-    }
-}
+// ADR 0061 rung D4 PR 2: `already_split_tablet_splits_again_once_it_regrows`
+// (an already-split lineage regrows past the byte threshold and splits
+// again, every key across both rounds still reachable) was removed from
+// here — `sim_cluster_auto_split.rs`'s scenario (c),
+// `c_a_regrown_child_forks_again`, proves the identical property
+// deterministically under `SimEnv`. See this file's own doc comment just
+// above `tablet_auto_splits_on_bytes_with_skewed_value_sizes` for the one
+// sibling test that stayed and why, and `crates/animusd/CLAUDE.md`'s
+// matching entry for the full account.

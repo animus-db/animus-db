@@ -1425,6 +1425,14 @@ impl Env for ProdEnv {
     fn metrics(&self) -> MetricsHandle {
         self.inner.metrics.clone()
     }
+
+    /// Delegates to the inherent [`ProdEnv::merge_peer`] — Rust's method
+    /// resolution prefers an inherent impl over a trait impl, so this call
+    /// reaches that method directly rather than recursing into this trait
+    /// default.
+    fn merge_peer(&self, id: NodeId, addr: String) {
+        ProdEnv::merge_peer(self, id, addr);
+    }
 }
 
 #[cfg(test)]

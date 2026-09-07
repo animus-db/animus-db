@@ -1,10 +1,16 @@
 //! End-to-end test of the DynamoDB JSON wire endpoint over real TCP/HTTP.
 //!
-//! Starts a 3-node in-process cluster, then drives `PutItem` → `GetItem` →
-//! `DeleteItem` against one node's `dynamo` endpoint by speaking the actual
-//! DynamoDB JSON protocol (an `X-Amz-Target` header + AttributeValue-JSON body
-//! over hand-written HTTP/1.1). Like the other `animusd` tests this uses real
-//! time and sockets, so it polls with generous timeouts.
+//! Like the other `animusd` tests this uses real time and sockets, so it
+//! polls with generous timeouts.
+//!
+//! **`dynamo_wire_put_get_delete_round_trip` moved to `SimCluster`**
+//! (ADR 0061 rung D3, redundancy-audit follow-up) — item decode/dispatch is
+//! proven by `sim_cluster_dynamo.rs::
+//! put_then_consistent_get_through_wire_from_a_non_leader_node`
+//! (`crates/animusd/src/sim_cluster_dynamo.rs`); the HTTP framing layer it
+//! also touched stays covered by the ~60 other `dynamo_*.rs` real-socket
+//! binaries. `dynamo_wire_rejects_bad_requests` stays here: unknown-op/
+//! malformed-body rejection over the real listener has no sim analog.
 
 use std::time::Duration;
 
@@ -67,73 +73,6 @@ async fn dynamo(addr: std::net::SocketAddr, target: &str, body: &str) -> (u16, S
         .and_then(|code| code.parse().ok())
         .expect("status line");
     (status, payload.to_string())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn dynamo_wire_put_get_delete_round_trip() {
-    let dir = support::panic_safe_tempdir();
-    let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
-        .await
-        .unwrap();
-    let nodes = start_cluster(bound).await.unwrap(); // R = W = 2 over 3 replicas
-    await_bootstrap(&nodes).await;
-
-    let addr0 = nodes[0].dynamo_addr();
-    let addr1 = nodes[1].dynamo_addr();
-
-    // PutItem on node 0.
-    let (status, body) = dynamo(
-        addr0,
-        "DynamoDB_20120810.PutItem",
-        r#"{"TableName":"users","Item":{"pk":{"S":"u1"},"name":{"S":"Ada"},
-            "score":{"N":"42"},"admin":{"BOOL":true}}}"#,
-    )
-    .await;
-    assert_eq!(status, 200, "PutItem failed: {body}");
-    assert_eq!(body, "{}");
-
-    // GetItem on node 1, `ConsistentRead: true` (ADR 0055): this reads back
-    // the write just made on node 0, so it needs the linearizable path — the
-    // wire default is now a genuinely eventually-consistent read.
-    let (status, body) = dynamo(
-        addr1,
-        "DynamoDB_20120810.GetItem",
-        r#"{"ConsistentRead":true,"TableName":"users","Key":{"pk":{"S":"u1"}}}"#,
-    )
-    .await;
-    assert_eq!(status, 200, "GetItem failed: {body}");
-    assert!(body.contains(r#""name":{"S":"Ada"}"#), "got: {body}");
-    assert!(body.contains(r#""score":{"N":"42"}"#), "got: {body}");
-    assert!(body.contains(r#""admin":{"BOOL":true}"#), "got: {body}");
-
-    // A missing key returns 200 with an empty body (DynamoDB semantics).
-    let (status, body) = dynamo(
-        addr1,
-        "DynamoDB_20120810.GetItem",
-        r#"{"TableName":"users","Key":{"pk":{"S":"nobody"}}}"#,
-    )
-    .await;
-    assert_eq!(status, 200);
-    assert_eq!(body, "{}", "absent item should yield an empty body");
-
-    // DeleteItem on node 1, then GetItem on node 0 sees it gone (the delete is a
-    // tombstone in the data plane, read back as absent).
-    let (status, _) = dynamo(
-        addr1,
-        "DynamoDB_20120810.DeleteItem",
-        r#"{"TableName":"users","Key":{"pk":{"S":"u1"}}}"#,
-    )
-    .await;
-    assert_eq!(status, 200);
-
-    let (status, body) = dynamo(
-        addr0,
-        "DynamoDB_20120810.GetItem",
-        r#"{"ConsistentRead":true,"TableName":"users","Key":{"pk":{"S":"u1"}}}"#,
-    )
-    .await;
-    assert_eq!(status, 200);
-    assert_eq!(body, "{}", "deleted item should read as absent");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

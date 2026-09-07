@@ -6545,7 +6545,25 @@ pub struct ClusterEdgeState<E: Env = ProdEnv> {
     /// `intra_route` (ADR 0047; ADR 0013 originally routed this via
     /// `client_route`) — the same path every follower-connected DDL
     /// in a one-process-per-node deployment always used.
-    control: Arc<Mutex<Vec<RaftNode<ProdEnv>>>>,
+    ///
+    /// **Generic over `E: Env` since ADR 0061 rung D3 PR 2a** (was fixed to
+    /// `RaftNode<ProdEnv>`) — see that rung's own ADR amendment and this
+    /// field's `register_control`/[`leader_handle`](Self::leader_handle)
+    /// neighbors for the full account. Before this widening,
+    /// `propose_schema`'s local-propose fast path was structurally
+    /// `ProdEnv`-only regardless of the enclosing `ClientCtx<E, R>`'s own
+    /// `E`: under `SimEnv` this field was always empty, so `leader_handle()`
+    /// always answered `None` and every schema proposal — even one issued
+    /// on the node genuinely leading the control group — took the relay
+    /// branch, forwarding a `ProposeSchema` request to **itself** over
+    /// `SimRelayClient`, which `forwarding::handle_relayed_request`'s own
+    /// `ProposeSchema` arm re-resolves the same way and re-relays, recursing
+    /// until the caller's own timeout. Widening this to `RaftNode<E>` and
+    /// having `SimCluster::new` register every node's own control handle
+    /// restores the real leader-local fast path under `SimEnv` too, and
+    /// makes the non-leader one-hop relay branch genuinely exercised for
+    /// the first time (D2 called it "never yet exercised").
+    control: Arc<Mutex<Vec<RaftNode<E>>>>,
     /// The DynamoDB edge's in-memory GSI declarations + observation-built
     /// written-key index (ADR 0006). Not durable / not replicated; per-node.
     dynamo_registry: Arc<Mutex<animus_dynamo::SchemaRegistry>>,
@@ -6615,8 +6633,9 @@ impl<E: Env> ClusterEdgeState<E> {
     }
 
     /// Register a node's control handle for schema-proposal routing. Called once
-    /// per node in [`BoundNode::start_with`].
-    fn register_control(&self, raft: RaftNode<ProdEnv>) {
+    /// per node in [`BoundNode::start_with`] (and, under `SimEnv`, once per
+    /// node in `SimCluster::new` — ADR 0061 rung D3 PR 2a).
+    fn register_control(&self, raft: RaftNode<E>) {
         self.control
             .lock()
             .expect("control handles poisoned")
@@ -6761,7 +6780,7 @@ impl<E: Env> ClusterEdgeState<E> {
     }
 
     /// The control handle that currently believes it is leader, if any.
-    pub(crate) fn leader_handle(&self) -> Option<RaftNode<ProdEnv>> {
+    pub(crate) fn leader_handle(&self) -> Option<RaftNode<E>> {
         self.control
             .lock()
             .expect("control handles poisoned")
@@ -6829,11 +6848,135 @@ pub const DEFAULT_STREAM_RETENTION: Duration = Duration::from_secs(24 * 60 * 60)
 /// CLI (a test, or a future embedder).
 pub const MIN_QUIESCE_AFTER: Duration = index_drain::INDEX_DRAIN_INTERVAL;
 
+/// **Default ON** at 5 seconds when `--quiesce-after` (or
+/// `cluster_settings.quiesce_after_secs`) is omitted (ADR 0044 phase-1 PR7)
+/// — the single canonical value every real entry point resolves an omitted
+/// `--quiesce-after` to, `main`'s own `DEFAULT_QUIESCE_AFTER_SECS` included
+/// (a thin alias onto this constant, kept so that binary's own module doc's
+/// `main::DEFAULT_QUIESCE_AFTER_SECS`-named references stay accurate) and
+/// [`run_node_join`]/[`run_node_data_join`]'s own bare (no-settings)
+/// signatures (issue #676 — a bare `animusd join`/`animusd data --seed` now
+/// gets the identical on-by-default posture a bare `animusd --config` does).
+/// See `main.rs`'s own doc comment on its alias for the full evidence/
+/// rationale record.
+pub const DEFAULT_QUIESCE_AFTER_SECS: u64 = 5;
+
+/// **Default ON** when `--heartbeat-batch`/`--no-heartbeat-batch` (or
+/// `cluster_settings.heartbeat_batch`) is omitted (ADR 0044 phase 2's
+/// cutover, C-02 PR 3) — the single canonical value every real entry point
+/// resolves an omitted heartbeat-batch setting to, `main`'s own
+/// `DEFAULT_HEARTBEAT_BATCH` included (a thin alias onto this constant) and
+/// [`run_node_join`]/[`run_node_data_join`]'s own bare signatures (issue
+/// #676). See `main.rs`'s own doc comment on its alias for the full
+/// evidence/rationale record.
+pub const DEFAULT_HEARTBEAT_BATCH: bool = true;
+
+/// **Default ON** when `--shared-wal`/`--no-shared-wal` (or
+/// `cluster_settings.shared_wal`) is omitted (ADR 0028, C-05 PR 3's cutover)
+/// — the single canonical value every real entry point resolves an omitted
+/// shared-WAL setting to, `main`'s own `DEFAULT_SHARED_WAL` included (a thin
+/// alias onto this constant) and [`run_node_join`]/[`run_node_data_join`]'s
+/// own bare signatures (issue #676). See `main.rs`'s own doc comment on its
+/// alias for the full evidence/rationale record.
+pub const DEFAULT_SHARED_WAL: bool = true;
+
+/// The **default** [`ClusterSegmentStore`](animus_cp_data::
+/// cluster_segment_store::ClusterSegmentStore)'s own per-node local
+/// building block (ADR 0069 "As-built: cluster store" amendment, closing
+/// issue #680) — `Plain` (a bare [`FsSegmentStore`], byte-for-byte the
+/// pre-amendment behavior) when no `--encryption-key` is configured, or
+/// `Encrypted` (the same [`animus_env::EncryptedSegmentStore`] wrapper
+/// `SegmentStoreHandle::EncryptedFs`/`BackupStoreHandle::EncryptedFs`
+/// already use for the opt-in `fs:`/`s3://` stores) when one is — sealing
+/// every object this node's own local copy holds under the same
+/// cluster-wide key PR 2 established, so replication between nodes moves
+/// ciphertext bytes end to end (every peer already shares the identical
+/// key file; a node without it can neither serve nor accept an object, and
+/// the marker check at [`build_segment_store`]/[`build_backup_store`]'s
+/// own startup call refuses a key/directory mismatch loudly before any
+/// listener binds — see those functions' own doc). `ClusterSegmentStore<E,
+/// S>` was already generic over its local building block `S: SegmentStore`
+/// (not concretely named to `FsSegmentStore`), so this is a single new
+/// local type occupying that existing type parameter — `SegmentStoreHandle
+/// ::Cluster`/`BackupStoreHandle::Cluster` keep exactly one variant each,
+/// never a fourth `EncryptedCluster` arm.
+#[derive(Clone)]
+pub(crate) enum LocalSegmentStore {
+    Plain(FsSegmentStore),
+    Encrypted(animus_env::EncryptedSegmentStore<FsSegmentStore, ProdEnv>),
+}
+
+#[async_trait::async_trait]
+impl animus_env::SegmentStore for LocalSegmentStore {
+    async fn put(&self, id: &str, bytes: &[u8]) -> std::io::Result<()> {
+        match self {
+            LocalSegmentStore::Plain(s) => s.put(id, bytes).await,
+            LocalSegmentStore::Encrypted(s) => s.put(id, bytes).await,
+        }
+    }
+
+    async fn get(&self, id: &str) -> std::io::Result<Option<Vec<u8>>> {
+        match self {
+            LocalSegmentStore::Plain(s) => s.get(id).await,
+            LocalSegmentStore::Encrypted(s) => s.get(id).await,
+        }
+    }
+
+    async fn delete(&self, id: &str) -> std::io::Result<()> {
+        match self {
+            LocalSegmentStore::Plain(s) => s.delete(id).await,
+            LocalSegmentStore::Encrypted(s) => s.delete(id).await,
+        }
+    }
+
+    async fn list(&self, prefix: &str) -> std::io::Result<Vec<String>> {
+        match self {
+            LocalSegmentStore::Plain(s) => s.list(prefix).await,
+            LocalSegmentStore::Encrypted(s) => s.list(prefix).await,
+        }
+    }
+}
+
+/// Build [`SegmentStoreConfig::Cluster`]'s own per-node local building
+/// block (ADR 0069 "As-built: cluster store" amendment): a bare
+/// [`FsSegmentStore`] rooted at `dir` when `encryption_key` is `None`
+/// (running [`animus_env::verify_or_init_segment_store_marker`]
+/// unconditionally first, mirroring the `Fs`/`S3` opt-in stores' own "off
+/// by default still checks" rule — an already-encrypted local directory is
+/// never silently treated as plaintext just because this node omitted
+/// `--encryption-key`), or an [`animus_env::EncryptedSegmentStore`]
+/// wrapping one when it's `Some` (`EncryptedSegmentStore::open` runs the
+/// identical check as part of opening). `dir` is `node_dir.join("segments"
+/// )`/`node_dir.join("backups")` — see [`build_segment_store`]/
+/// [`build_backup_store`]'s own call sites.
+///
+/// # Errors
+/// The loud-refusal marker check (a key/directory mismatch, in either
+/// direction).
+async fn local_cluster_store(
+    env: &ProdEnv,
+    dir: PathBuf,
+    encryption_key: Option<&animus_env::EncryptionKey>,
+) -> std::io::Result<LocalSegmentStore> {
+    let raw = FsSegmentStore::new(dir);
+    match encryption_key {
+        Some(key) => Ok(LocalSegmentStore::Encrypted(
+            animus_env::EncryptedSegmentStore::open(raw, env.clone(), key.clone()).await?,
+        )),
+        None => {
+            animus_env::verify_or_init_segment_store_marker(&raw, env, None).await?;
+            Ok(LocalSegmentStore::Plain(raw))
+        }
+    }
+}
+
 /// This node's stream-shard [`SegmentStore`](animus_env::SegmentStore) handle
 /// (ADR 0043 §A7b) — either the **default**
 /// [`ClusterSegmentStore`](animus_cp_data::cluster_segment_store::ClusterSegmentStore)
 /// (K-way replicated across nodes' own local segment directories, each
-/// backed by [`FsSegmentStore`]) or, opted into via `--segment-store
+/// backed by [`LocalSegmentStore`] — sealed under `--encryption-key` when
+/// one is configured, ADR 0069's "As-built: cluster store" amendment) or,
+/// opted into via `--segment-store
 /// dir:PATH`, a bare single-directory [`FsSegmentStore`] — dev use, or a
 /// genuinely shared mount every node in the cluster can reach at the
 /// identical path (the caveat `--segment-store`'s own CLI doc names: this
@@ -6843,7 +6986,7 @@ pub const MIN_QUIESCE_AFTER: Duration = index_drain::INDEX_DRAIN_INTERVAL;
 /// consistency the operator is choosing to accept).
 #[derive(Clone)]
 pub(crate) enum SegmentStoreHandle {
-    Cluster(animus_cp_data::cluster_segment_store::ClusterSegmentStore<ProdEnv, FsSegmentStore>),
+    Cluster(animus_cp_data::cluster_segment_store::ClusterSegmentStore<ProdEnv, LocalSegmentStore>),
     Fs(FsSegmentStore),
     /// The `--encryption-key`-sealed sibling of [`Fs`](Self::Fs) (ADR 0069,
     /// S-03 PR 2) — every object this node writes/reads through this
@@ -7391,33 +7534,29 @@ mod s3_store_handle_tests {
 /// Build (and, for the cluster variant, **start**) this node's
 /// [`SegmentStoreHandle`] (ADR 0043 §A7b) per `config`. `dir` is this node's
 /// own data directory ([`BoundNode::dir`]/[`BoundDataNode::dir`]) — the
-/// cluster variant's per-node local `FsSegmentStore` building block roots at
-/// `dir.join("segments")`, a sibling of the `internal/` subdirectory
-/// `ProdEnv::bind` already owns.
+/// cluster variant's per-node local [`LocalSegmentStore`] building block
+/// roots at `dir.join("segments")`, a sibling of the `internal/`
+/// subdirectory `ProdEnv::bind` already owns.
 ///
-/// **`encryption_key` (ADR 0069, S-03 PR 2)**: when `Some`, the `Fs`/`S3`
-/// variants are sealed under it (`animus_env::EncryptedSegmentStore`) —
-/// see that type's own module doc for the cluster-wide key-scope contract
-/// this relies on (every node reading a given `fs:`/`s3://` store must be
-/// configured with the *same* key file). **`Cluster` is deliberately
-/// untouched regardless of `encryption_key`** — encrypting its per-node
-/// local `FsSegmentStore` building block would mean changing
-/// `SegmentStoreHandle::Cluster`'s own concrete `ClusterSegmentStore<
-/// ProdEnv, FsSegmentStore>` type parameter, a larger, separate change; a
-/// `cluster`-backed store stays plaintext on disk under this PR, an
-/// honestly-stated scope cut (see this crate's own `docs/adr/
-/// 0069-encryption-at-rest.md` PR 2 amendment), not a claim that PR 1
-/// already covers it. Even with no key at all, the loud-refusal marker
-/// check (`animus_env::verify_or_init_segment_store_marker`) still runs on
-/// `Fs`/`S3`, so a store that already holds encrypted objects is never
+/// **`encryption_key` (ADR 0069, S-03 PR 2; extended to `Cluster` by the
+/// "As-built: cluster store" amendment closing issue #680)**: when `Some`,
+/// every variant — `Cluster` included — is sealed under it
+/// (`animus_env::EncryptedSegmentStore`, `Cluster`'s own local building
+/// block via [`local_cluster_store`]) — see that type's own module doc for
+/// the cluster-wide key-scope contract this relies on (every node reading
+/// a given store must be configured with the *same* key file — for
+/// `Cluster` this was already the deployment's own `--encryption-key`
+/// convention, PR 1's "one key file's path repeated across every node's
+/// config entry" case, now load-bearing for this store too). Even with no
+/// key at all, the loud-refusal marker check
+/// (`animus_env::verify_or_init_segment_store_marker`) still runs on every
+/// variant, so a store that already holds encrypted objects is never
 /// silently treated as plaintext.
 ///
 /// # Errors
-/// The `S3` variant can fail (see [`s3_segment_store`]'s own doc);
-/// `Fs`/`S3` can also fail the loud-refusal marker check above
-/// (a key/store mismatch); `Cluster` is infallible today, but the whole
-/// function is `Result` so a caller doesn't need to know which variant
-/// might fail.
+/// The `S3` variant can fail (see [`s3_segment_store`]'s own doc); every
+/// variant can fail the loud-refusal marker check above (a key/store
+/// mismatch).
 async fn build_segment_store(
     env: &ProdEnv,
     dir: &Path,
@@ -7428,7 +7567,7 @@ async fn build_segment_store(
 ) -> std::io::Result<SegmentStoreHandle> {
     Ok(match config {
         SegmentStoreConfig::Cluster => {
-            let local = FsSegmentStore::new(dir.join("segments"));
+            let local = local_cluster_store(env, dir.join("segments"), encryption_key).await?;
             let placement: Arc<dyn animus_cp_data::cluster_segment_store::PlacementView> =
                 Arc::new(ControlPlacementView { control, self_id });
             SegmentStoreHandle::Cluster(
@@ -7470,7 +7609,7 @@ async fn build_segment_store(
 
 /// This node's **backup** [`SegmentStore`](animus_env::SegmentStore) handle
 /// (ADR 0059 §1) — a second, backup-dedicated instance built the same way
-/// [`SegmentStoreHandle`] is (`ClusterSegmentStore<ProdEnv, FsSegmentStore>`/
+/// [`SegmentStoreHandle`] is (`ClusterSegmentStore<ProdEnv, LocalSegmentStore>`/
 /// `FsSegmentStore` — this crate has no `SimEnv` dependency at all, ADR 0043
 /// §A7b's `SimSegmentStore` variant is `animus-cp-data`'s own sim-corpus
 /// concern, never reached from here), but from its own `--backup-store` CLI
@@ -7496,7 +7635,7 @@ async fn build_segment_store(
 /// manifest object — see each module's own doc.
 #[derive(Clone)]
 pub(crate) enum BackupStoreHandle {
-    Cluster(animus_cp_data::cluster_segment_store::ClusterSegmentStore<ProdEnv, FsSegmentStore>),
+    Cluster(animus_cp_data::cluster_segment_store::ClusterSegmentStore<ProdEnv, LocalSegmentStore>),
     Fs(FsSegmentStore),
     /// The `--encryption-key`-sealed sibling of [`Fs`](Self::Fs) — see
     /// [`SegmentStoreHandle::EncryptedFs`]'s own doc (ADR 0069, S-03 PR 2);
@@ -7683,8 +7822,8 @@ pub enum BackupStoreConfig {
 /// Build (and, for the cluster variant, **start**) this node's
 /// [`BackupStoreHandle`] (ADR 0059 §1) — mirrors [`build_segment_store`]'s
 /// exact shape, rooting the cluster variant's per-node local
-/// `FsSegmentStore` building block at `dir.join("backups")` rather than
-/// `dir.join("segments")` — kept physically separate from the streams
+/// [`LocalSegmentStore`] building block at `dir.join("backups")` rather
+/// than `dir.join("segments")` — kept physically separate from the streams
 /// store's own local directory even though the two stores' object
 /// namespaces are already disjoint (`animus_cp_data::backup`'s own module
 /// doc), the same belt-and-suspenders posture ADR 0059 §1 takes for the
@@ -7693,14 +7832,15 @@ pub enum BackupStoreConfig {
 /// `prefix` unambiguous even if an operator pointed both stores at the same
 /// bucket) — but the same belt-and-suspenders posture applies equally.
 ///
-/// **`encryption_key` (ADR 0069, S-03 PR 2)**: identical contract to
-/// [`build_segment_store`]'s own `encryption_key` parameter — `Fs`/`S3`
-/// sealed under it when `Some`, `Cluster` deliberately untouched either
-/// way (same reasoning, see that function's own doc).
+/// **`encryption_key` (ADR 0069, S-03 PR 2; extended to `Cluster` by the
+/// "As-built: cluster store" amendment)**: identical contract to
+/// [`build_segment_store`]'s own `encryption_key` parameter — every
+/// variant, `Cluster` included, sealed under it when `Some` (same
+/// reasoning, see that function's own doc).
 ///
 /// # Errors
 /// See [`build_segment_store`]'s own doc — the `S3` variant can fail, and
-/// `Fs`/`S3` can fail the loud-refusal marker check.
+/// every variant can fail the loud-refusal marker check.
 async fn build_backup_store(
     env: &ProdEnv,
     dir: &Path,
@@ -7711,7 +7851,7 @@ async fn build_backup_store(
 ) -> std::io::Result<BackupStoreHandle> {
     Ok(match config {
         BackupStoreConfig::Cluster => {
-            let local = FsSegmentStore::new(dir.join("backups"));
+            let local = local_cluster_store(env, dir.join("backups"), encryption_key).await?;
             let placement: Arc<dyn animus_cp_data::cluster_segment_store::PlacementView> =
                 Arc::new(ControlPlacementView { control, self_id });
             BackupStoreHandle::Cluster(
@@ -10562,6 +10702,21 @@ fn tablet_lsm_prefix(tablet: u64) -> String {
     format!("{LSM_PREFIX}t{tablet}-")
 }
 
+/// The inverse of [`tablet_lsm_prefix`] (issue #722): does `filename` carry
+/// a tablet engine's own prefix, and if so, which tablet id? Parses
+/// `{LSM_PREFIX}t{tablet}-...` — `LSM_PREFIX` itself (`db-MANIFEST`/
+/// `db-wal-*`/`db-sst-*`, the node's own control/syskv engine) never
+/// matches (no `t` immediately follows), and a malformed/non-numeric
+/// `{tablet}` segment (should be structurally unreachable — this crate is
+/// the only writer of this naming convention) is treated as "not a tablet
+/// engine file" rather than panicking on an unrecognized filename this
+/// node didn't write itself.
+fn parse_tablet_id_from_lsm_filename(filename: &str) -> Option<TabletId> {
+    let rest = filename.strip_prefix(LSM_PREFIX)?.strip_prefix('t')?;
+    let digits_end = rest.find('-')?;
+    rest[..digits_end].parse::<u64>().ok().map(TabletId)
+}
+
 /// The [`LsmEngine`] implementation of the per-tablet engine seam (ADR 0050
 /// rung 1): one private on-disk engine per hosted tablet, opened/probed/
 /// destroyed by filename prefix over this node's one `ProdEnv` disk.
@@ -10625,6 +10780,77 @@ impl animus_cp_data::host::EngineFactory<LsmEngine<ProdEnv>> for LsmTabletFactor
             .clone_to_filtered(tablet_lsm_prefix(target.0), keep)
             .await
             .map_err(|e| e.to_string())
+    }
+
+    /// Issue #722 — enumerate every tablet id this node's own data
+    /// directory currently holds durable engine files for, by listing the
+    /// directory once and parsing each filename's own prefix
+    /// ([`parse_tablet_id_from_lsm_filename`]) — the identical `env.list()`
+    /// call [`probe`](Self::probe)/[`destroy`](Self::destroy) already make,
+    /// generalized from "does THIS one tablet's prefix appear" to "which
+    /// tablet ids appear at all." A listing failure resolves the same way
+    /// `probe`/`destroy` already treat one — silently as empty, per the
+    /// trait's own doc — rather than propagate an error this method has no
+    /// channel for.
+    async fn local_tablets(&self) -> BTreeSet<TabletId> {
+        self.env
+            .list()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|f| parse_tablet_id_from_lsm_filename(f))
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod lsm_tablet_filename_tests {
+    use super::*;
+
+    #[test]
+    fn parses_a_tablet_engines_own_files() {
+        assert_eq!(
+            parse_tablet_id_from_lsm_filename("db-t5-MANIFEST"),
+            Some(TabletId(5))
+        );
+        assert_eq!(
+            parse_tablet_id_from_lsm_filename("db-t5-wal-0"),
+            Some(TabletId(5))
+        );
+        assert_eq!(
+            parse_tablet_id_from_lsm_filename("db-t5-sst-12"),
+            Some(TabletId(5))
+        );
+    }
+
+    #[test]
+    fn does_not_confuse_a_prefix_with_a_longer_tablet_id() {
+        // The trailing `-` is load-bearing (see `tablet_lsm_prefix`'s own
+        // doc): `db-t5-*` must never be read as also matching `db-t51-*`.
+        assert_eq!(
+            parse_tablet_id_from_lsm_filename("db-t51-MANIFEST"),
+            Some(TabletId(51))
+        );
+    }
+
+    #[test]
+    fn ignores_the_bare_control_syskv_engines_own_files() {
+        // No `t` immediately follows `LSM_PREFIX` on any of these — never a
+        // tablet engine file.
+        for f in ["db-MANIFEST", "db-wal-0", "db-sst-3"] {
+            assert_eq!(
+                parse_tablet_id_from_lsm_filename(f),
+                None,
+                "control/syskv file {f} must never be read as a tablet engine file"
+            );
+        }
+    }
+
+    #[test]
+    fn ignores_an_unrelated_file() {
+        assert_eq!(parse_tablet_id_from_lsm_filename("syskv-MANIFEST"), None);
+        assert_eq!(parse_tablet_id_from_lsm_filename("raft.wal.5"), None);
+        assert_eq!(parse_tablet_id_from_lsm_filename("db-tx-oops"), None);
     }
 }
 
@@ -11300,11 +11526,21 @@ const SPLIT_KEY_NOT_TOKEN_VIABLE: &str =
 /// sources such as a manual split racing this loop) — harmless: the epoch CAS
 /// lets exactly one win, and the loser just tries again (or backs off) next
 /// tick.
-async fn auto_split_loop(ctx: ClientCtx, thresholds: AutoSplitThresholds) {
-    let mut last_triggered: BTreeMap<TabletId, tokio::time::Instant> = BTreeMap::new();
+async fn auto_split_loop<E: Env, R: RelayClient>(
+    ctx: ClientCtx<E, R>,
+    thresholds: AutoSplitThresholds,
+) {
+    // ADR 0061 rung D4 PR 2: `Nanos` (the `Env` seam's own clock reading,
+    // ADR 0003), not `tokio::time::Instant` — this loop must be drivable
+    // under `SimEnv` (`SimCluster`'s own deterministic virtual clock) as
+    // well as `ProdEnv`'s real one. `Nanos` has no `Add<Duration>` (see
+    // `ceiling.rs`'s own `saturating_add`/`duration_since` shape this
+    // mirrors), so an "elapsed since" check becomes `ctx.env.now()
+    // .duration_since(recorded)` rather than `recorded.elapsed()`.
+    let mut last_triggered: BTreeMap<TabletId, Nanos> = BTreeMap::new();
     // When each tablet last had a *full* (materializing) count — the expensive
     // confirm is rate-limited per tablet, not run every tick.
-    let mut last_counted: BTreeMap<TabletId, tokio::time::Instant> = BTreeMap::new();
+    let mut last_counted: BTreeMap<TabletId, Nanos> = BTreeMap::new();
     // ADR 0067 (W-08b): the fourth arm's own ceilings are always "on" (a
     // production default, never `None`), so unlike the three fields below
     // this can't be used to decide whether the loop has anything to do at
@@ -11315,7 +11551,7 @@ async fn auto_split_loop(ctx: ClientCtx, thresholds: AutoSplitThresholds) {
         || thresholds.change_rate.is_some()
         || thresholds.ops_rate.is_some();
     loop {
-        tokio::time::sleep(AUTO_SPLIT_INTERVAL).await;
+        ctx.env.sleep(AUTO_SPLIT_INTERVAL).await;
 
         // ADR 0067 (W-08b): when NOTHING at all is configured — no byte/
         // change-rate/ops-rate threshold, and no table anywhere in this
@@ -11352,7 +11588,8 @@ async fn auto_split_loop(ctx: ClientCtx, thresholds: AutoSplitThresholds) {
             .map(|(&id, _)| id)
             .collect();
         for tablet in tablets {
-            if matches!(last_triggered.get(&tablet), Some(at) if at.elapsed() < AUTO_SPLIT_COOLDOWN)
+            if matches!(last_triggered.get(&tablet), Some(&at)
+                if ctx.env.now().duration_since(at) < AUTO_SPLIT_COOLDOWN)
             {
                 continue;
             }
@@ -11384,7 +11621,7 @@ async fn auto_split_loop(ctx: ClientCtx, thresholds: AutoSplitThresholds) {
             // have a byte estimate — `approx_bytes` works on any backend).
             let due_confirm = last_counted
                 .get(&tablet)
-                .is_none_or(|at| at.elapsed() >= AUTO_SPLIT_COOLDOWN);
+                .is_none_or(|&at| ctx.env.now().duration_since(at) >= AUTO_SPLIT_COOLDOWN);
             let byte_hot = match thresholds.bytes {
                 Some(t) => leader.approx_bytes().await > t,
                 None => false,
@@ -11412,7 +11649,7 @@ async fn auto_split_loop(ctx: ClientCtx, thresholds: AutoSplitThresholds) {
             // Materialize once: the authoritative byte total and (if over
             // threshold) the split key both come from the same snapshot.
             let pairs = leader.local_pairs().await;
-            last_counted.insert(tablet, tokio::time::Instant::now());
+            last_counted.insert(tablet, ctx.env.now());
             let key_count = pairs.len();
             let over_byte_threshold = thresholds.bytes.is_some_and(|t| {
                 let total_bytes: u64 = pairs.iter().map(|(k, v)| (k.len() + v.len()) as u64).sum();
@@ -11454,7 +11691,7 @@ async fn auto_split_loop(ctx: ClientCtx, thresholds: AutoSplitThresholds) {
             // for that expected, already-metered outcome (it would
             // otherwise fire every single cooldown, forever, for a tablet
             // that structurally cannot split).
-            last_triggered.insert(tablet, tokio::time::Instant::now());
+            last_triggered.insert(tablet, ctx.env.now());
             let span = tracing::info_span!("auto_split", tablet = tablet.0);
             let response = ctx.trigger_split(tablet, split_key).instrument(span).await;
             match &response {
@@ -11517,9 +11754,10 @@ async fn auto_split_loop(ctx: ClientCtx, thresholds: AutoSplitThresholds) {
             // wakes it (ADR 0048 fork F); the propose this trigger makes
             // if one is chosen lets the CP-data host reconciler un-quiesce
             // it exactly as any other split would.
-            let mut best: Option<(TabletId, u128, CpGroup)> = None;
+            let mut best: Option<(TabletId, u128, CpGroup<E>)> = None;
             for id in tablet_ids {
-                if matches!(last_triggered.get(&id), Some(at) if at.elapsed() < AUTO_SPLIT_COOLDOWN)
+                if matches!(last_triggered.get(&id), Some(&at)
+                    if ctx.env.now().duration_since(at) < AUTO_SPLIT_COOLDOWN)
                 {
                     continue;
                 }
@@ -11568,7 +11806,7 @@ async fn auto_split_loop(ctx: ClientCtx, thresholds: AutoSplitThresholds) {
                     None => continue,
                 }
             };
-            last_triggered.insert(tablet, tokio::time::Instant::now());
+            last_triggered.insert(tablet, ctx.env.now());
             let span = tracing::info_span!(
                 "auto_split_min_tablets",
                 tablet = tablet.0,
@@ -12750,6 +12988,19 @@ pub async fn start_split_cluster_with_orphan_sweep_after(
         None,
         None,
         None,
+        // Kept at the pre-issue-#676 off/unbatched/per-group defaults — the
+        // same "narrower wrapper stays at its own original semantics"
+        // convention every other layered knob in this file already uses
+        // (`start_with_streams`'s identical hardcoded trio calling into
+        // `start_with_growth`). `run_in_process_split_cluster` (the real
+        // `--cluster-control`/`--cluster-data` CLI path) calls
+        // `start_split_cluster_with_growth` directly with the resolved
+        // `DEFAULT_QUIESCE_AFTER_SECS`/`DEFAULT_HEARTBEAT_BATCH`/
+        // `DEFAULT_SHARED_WAL` values instead of going through this
+        // narrower, test-facing wrapper.
+        Duration::ZERO,
+        false,
+        false,
     )
     .await
 }
@@ -12759,6 +13010,20 @@ pub async fn start_split_cluster_with_orphan_sweep_after(
 /// every data-role node — see [`BoundNode::start_with_growth`]'s doc for
 /// the full design. `--cluster-control`/`--cluster-data`'s
 /// `--auto-split-change-rate RATE` CLI flag threads through here.
+///
+/// `quiesce_after`/`heartbeat_batch`/`shared_wal` (issue #676) are the same
+/// trailing data-plane knobs `BoundDataNode::start_data_with_growth` itself
+/// takes, applied uniformly to every data-role node this split-cluster dev
+/// path stands up — `run_in_process_split_cluster` (this crate's `--cluster
+/// -control`/`--cluster-data` CLI dispatch) resolves an omitted
+/// `--quiesce-after`/`--heartbeat-batch`/`--shared-wal` to
+/// [`DEFAULT_QUIESCE_AFTER_SECS`]/[`DEFAULT_HEARTBEAT_BATCH`]/
+/// [`DEFAULT_SHARED_WAL`] before calling here, the identical on-by-default
+/// posture `--config`/`--cluster N` already have; every existing caller
+/// through [`start_split_cluster_with_orphan_sweep_after`] (this crate's own
+/// `cluster_split.rs` test suite included) keeps getting the pre-#676
+/// off/unbatched/per-group-WAL values unchanged (that narrower wrapper
+/// hardcodes them — see its own call site's doc).
 ///
 /// # Errors
 /// As [`start_split_cluster_with`].
@@ -12774,6 +13039,9 @@ pub async fn start_split_cluster_with_growth(
     auto_split_change_rate: Option<u64>,
     auto_split_ops_rate: Option<u64>,
     dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
+    quiesce_after: Duration,
+    heartbeat_batch: bool,
+    shared_wal: bool,
 ) -> std::io::Result<Vec<Node>> {
     let dir = dir.into();
     let total = control_n + data_n;
@@ -12923,21 +13191,22 @@ pub async fn start_split_cluster_with_growth(
                 SegmentStoreConfig::default(),
                 auto_split_change_rate,
                 auto_split_ops_rate,
-                // `--quiesce-after` doesn't thread through the
-                // `--cluster-control`/`--cluster-data` dev path yet — the
-                // same documented gap `run`'s own module doc names (S-06
-                // scoped only the three real deployment paths).
-                Duration::ZERO,
-                // `--heartbeat-batch` has the identical documented gap here.
-                false,
+                // `--quiesce-after`/`--heartbeat-batch`/`--shared-wal` now
+                // thread through the `--cluster-control`/`--cluster-data`
+                // dev path too (issue #676) — resolved by the caller
+                // (`run_in_process_split_cluster`) the identical
+                // `DEFAULT_QUIESCE_AFTER_SECS`/`DEFAULT_HEARTBEAT_BATCH`/
+                // `DEFAULT_SHARED_WAL` way an omitted `--config`/`--cluster
+                // N` flag already resolves.
+                quiesce_after,
+                heartbeat_batch,
                 dynamo_auth.clone(),
                 BackupStoreConfig::default(),
                 None,
                 None,
                 None,
                 None,
-                // `--shared-wal` has the identical documented gap here.
-                false,
+                shared_wal,
             )
             .await?,
         );
@@ -14068,6 +14337,64 @@ pub async fn run_node_join(
     backend: StorageBackend,
     labels: BTreeMap<String, String>,
 ) -> std::io::Result<Node> {
+    run_node_join_with_settings(
+        seeds,
+        id,
+        addrs,
+        dir,
+        backend,
+        labels,
+        Duration::from_secs(DEFAULT_QUIESCE_AFTER_SECS),
+        DEFAULT_HEARTBEAT_BATCH,
+        DEFAULT_SHARED_WAL,
+        SegmentStoreConfig::default(),
+        BackupStoreConfig::default(),
+    )
+    .await
+}
+
+/// [`run_node_join`], widened with every per-node data-plane knob
+/// `--config FILE --node I` already resolves (issue #676) — `quiesce_after`/
+/// `heartbeat_batch`/`shared_wal` (each defaulted the identical
+/// [`DEFAULT_QUIESCE_AFTER_SECS`]/[`DEFAULT_HEARTBEAT_BATCH`]/
+/// [`DEFAULT_SHARED_WAL`] way an omitted `--quiesce-after`/
+/// `--heartbeat-batch`/`--shared-wal` already does on that entry point) and
+/// `segment_store_config`/`backup_store_config` (each defaulting to the
+/// same [`SegmentStoreConfig::default`]/[`BackupStoreConfig::default`]
+/// `Cluster` store an omitted `--segment-store`/`--backup-store` already
+/// resolves to). [`run_node_join`] itself is kept at its own original arity
+/// (the layered-wrapper convention the S-06/C-02/C-05 knobs already
+/// established — see this file's own doc comment on that precedent) and is
+/// now a thin default-resolving call into this function, so every existing
+/// caller (this crate's own test suite included) keeps compiling and now
+/// observes the identical on-by-default posture `--config`/`--cluster N`
+/// already have, closing the surprise issue #676 names (a `join`ed node
+/// silently writing the per-group WAL layout while the rest of the cluster
+/// defaults to the shared one).
+///
+/// `main::run_join` (the CLI's own `join` subcommand) is this function's one
+/// real caller with non-default settings, resolving `--quiesce-after`/
+/// `--heartbeat-batch`/`--no-heartbeat-batch`/`--shared-wal`/
+/// `--no-shared-wal`/`--segment-store`/`--backup-store` exactly like `run`'s
+/// own `--config`/`--node` dispatch does — there is no config file on this
+/// join path to conflict-check a CLI flag against (S-06's "one way, not
+/// both" hard error is a `--config`/`data --config`-only concern), so every
+/// flag here simply sets the value directly, the same shape
+/// `--tls-cert`/`--encryption-key` already have on this path.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_node_join_with_settings(
+    seeds: Vec<String>,
+    id: Option<NodeId>,
+    addrs: RoleAddrs,
+    dir: &Path,
+    backend: StorageBackend,
+    labels: BTreeMap<String, String>,
+    quiesce_after: Duration,
+    heartbeat_batch: bool,
+    shared_wal: bool,
+    segment_store_config: SegmentStoreConfig,
+    backup_store_config: BackupStoreConfig,
+) -> std::io::Result<Node> {
     if seeds.is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -14103,6 +14430,11 @@ pub async fn run_node_join(
         intra_route,
         admin_addrs,
         backend,
+        quiesce_after,
+        heartbeat_batch,
+        shared_wal,
+        segment_store_config,
+        backup_store_config,
     )
     .await
 }
@@ -14132,6 +14464,11 @@ async fn finish_combined_join(
     mut intra_route: BTreeMap<NodeId, String>,
     mut admin_addrs: Vec<SocketAddr>,
     backend: StorageBackend,
+    quiesce_after: Duration,
+    heartbeat_batch: bool,
+    shared_wal: bool,
+    segment_store_config: SegmentStoreConfig,
+    backup_store_config: BackupStoreConfig,
 ) -> std::io::Result<Node> {
     for (id, addr) in bound.peer_entries() {
         peers.insert(id, addr);
@@ -14151,8 +14488,17 @@ async fn finish_combined_join(
     }
 
     let data_ids: Vec<NodeId> = original_control_ids.clone();
+    // Widened onto `start_with_growth` directly (issue #676) — the same
+    // fully-featured layer `run_single`/`run_in_process_cluster` already
+    // call, rather than the narrower `start_with` this used to hardcode
+    // through (which silently ate every knob below `orphan_sweep_after`).
+    // Every trailing knob this join path still doesn't expose a CLI flag
+    // for (`auto_split_change_rate`/`auto_split_ops_rate`, `dynamo_auth`,
+    // `pitr_snapshot_cadence`, `throttle_*`, `tablet_max_*`, `export_s3`)
+    // stays at its own byte-identical documented default — a genuinely
+    // separate, still-open gap from the one this change closes.
     bound
-        .start_with(
+        .start_with_growth(
             peers,
             original_control_ids,
             data_ids,
@@ -14163,6 +14509,23 @@ async fn finish_combined_join(
             None,
             admin_addrs,
             DEFAULT_ORPHAN_SWEEP_AFTER,
+            StreamSealKnobs::default(),
+            segment_store_config,
+            DEFAULT_STREAM_RETENTION,
+            None,
+            None,
+            quiesce_after,
+            heartbeat_batch,
+            ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
+            None,
+            backup_store_config,
+            pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
+            None,
+            None,
+            None,
+            None,
+            None,
+            shared_wal,
         )
         .await
 }
@@ -14327,6 +14690,52 @@ pub async fn run_node_data_join(
     labels: BTreeMap<String, String>,
     dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
 ) -> std::io::Result<Node> {
+    run_node_data_join_with_settings(
+        seeds,
+        id,
+        addrs,
+        dir,
+        backend,
+        labels,
+        dynamo_auth,
+        Duration::from_secs(DEFAULT_QUIESCE_AFTER_SECS),
+        DEFAULT_HEARTBEAT_BATCH,
+        DEFAULT_SHARED_WAL,
+        SegmentStoreConfig::default(),
+        BackupStoreConfig::default(),
+    )
+    .await
+}
+
+/// [`run_node_data_join`], widened with every per-node data-plane knob
+/// `--config FILE --node I` already resolves (issue #676) — see
+/// [`run_node_join_with_settings`]'s identical doc for the full rationale
+/// and the layered-wrapper convention this mirrors; [`run_node_data_join`]
+/// itself stays at its own original arity, now a thin default-resolving
+/// call into this function, so every existing caller (this crate's own test
+/// suite included) keeps compiling and now observes the identical
+/// on-by-default posture `--config`/`--cluster N` already have.
+///
+/// `main::run_data_join` (`animusd data --seed`'s own dispatch branch) is
+/// this function's one real caller with non-default settings — the
+/// data-only sibling of `run_node_join_with_settings`'s own CLI caller,
+/// resolving the identical flag set the identical "no config file, so no
+/// conflict to check" way.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_node_data_join_with_settings(
+    seeds: Vec<String>,
+    id: Option<NodeId>,
+    addrs: RoleAddrs,
+    dir: &Path,
+    backend: StorageBackend,
+    labels: BTreeMap<String, String>,
+    dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
+    quiesce_after: Duration,
+    heartbeat_batch: bool,
+    shared_wal: bool,
+    segment_store_config: SegmentStoreConfig,
+    backup_store_config: BackupStoreConfig,
+) -> std::io::Result<Node> {
     if seeds.is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -14363,6 +14772,11 @@ pub async fn run_node_data_join(
         admin_addrs,
         backend,
         dynamo_auth,
+        quiesce_after,
+        heartbeat_batch,
+        shared_wal,
+        segment_store_config,
+        backup_store_config,
     )
     .await
 }
@@ -14384,6 +14798,11 @@ async fn finish_data_join(
     mut admin_addrs: Vec<SocketAddr>,
     backend: StorageBackend,
     dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
+    quiesce_after: Duration,
+    heartbeat_batch: bool,
+    shared_wal: bool,
+    segment_store_config: SegmentStoreConfig,
+    backup_store_config: BackupStoreConfig,
 ) -> std::io::Result<Node> {
     // The data-only dual of `finish_combined_join`'s merge (a single raftkv
     // peer entry, no control id of its own to add).
@@ -14413,7 +14832,11 @@ async fn finish_data_join(
         .collect();
 
     // Calls `start_data_with_growth` directly (skipping the layered wrapper
-    // shape) — see `run_node_data`'s identical note.
+    // shape) — see `run_node_data`'s identical note. `quiesce_after`/
+    // `heartbeat_batch`/`shared_wal`/`segment_store_config`/
+    // `backup_store_config` are now threaded from the caller (issue #676)
+    // instead of hardcoded to their pre-cutover off/default values — see
+    // `run_node_data_join_with_settings`'s own doc.
     bound
         .start_data_with_growth(
             peers,
@@ -14426,27 +14849,18 @@ async fn finish_data_join(
             None,
             admin_addrs,
             StreamSealKnobs::default(),
-            SegmentStoreConfig::default(),
+            segment_store_config,
             None,
             None,
-            // `--quiesce-after` doesn't reach a seed/join startup yet — the
-            // same documented gap `animusd`'s own module doc names for
-            // `join`/`data --seed` (S-06 scoped only the three real
-            // `--config`/`--node`-shaped deployment paths).
-            Duration::ZERO,
-            // `--heartbeat-batch` has the identical documented gap here.
-            false,
+            quiesce_after,
+            heartbeat_batch,
             dynamo_auth,
-            // Same documented gap for `--backup-store` as `run_node_data`.
-            BackupStoreConfig::default(),
+            backup_store_config,
             None,
             None,
             None,
             None,
-            // `--shared-wal` has the identical documented gap here as
-            // `--heartbeat-batch` just above, unaffected by the C-05 PR 3
-            // cutover — a seed/join startup takes neither flag yet.
-            false,
+            shared_wal,
         )
         .await
 }
@@ -16548,7 +16962,7 @@ mod simenv_client_ctx_tests {
     /// chains, not assumed), so a `DataRole` is not needed to prove this
     /// rung's claim. Building one for real would need `SegmentStoreHandle`/
     /// `BackupStoreHandle`, both of which hardcode `FsSegmentStore`/
-    /// `ClusterSegmentStore<ProdEnv, FsSegmentStore>` regardless of this
+    /// `ClusterSegmentStore<ProdEnv, LocalSegmentStore>` regardless of this
     /// `ClientCtx`'s own `E` — a second, separate blocker from the
     /// `propose_schema` one above, not exercised by anything this test
     /// asserts on. See `crates/animusd/CLAUDE.md`'s harness section.
@@ -17265,6 +17679,240 @@ mod sim_cluster_dynamo;
 /// --lib sim_cluster_dynamo_corpus`.
 #[cfg(test)]
 mod sim_cluster_dynamo_corpus;
+
+/// ADR 0061 rung D3 PR 1 (C-04 D3): the first batch of "B class"
+/// `ProdEnv` DynamoDB logic tests converted to `SimCluster` — base-table
+/// tests that `dynamo::dispatch_item_op` can already drive, needing no
+/// widening of that function or `execute_item_op_as`. Each of the eleven
+/// sibling modules below (`sim_cluster_dynamo_batch_get` through
+/// `sim_cluster_kind_batch_outcome`) replaces some or all of one
+/// `crates/animusd/tests/dynamo_*.rs`/`kind_batch_outcome.rs` binary — see
+/// each module's own doc for exactly which tests moved and, where
+/// applicable, which stayed on `ProdEnv` and why (a GSI/LSI query, a
+/// wire-level `CreateTable`, or `TransactWriteItems` — none reachable
+/// through `dispatch_item_op` yet). Siblings of `sim_cluster_corpus`/
+/// `sim_cluster_throttle`/`sim_cluster_dynamo` for the identical reason
+/// (needs `SimCluster`'s own `pub(crate)` surface, no further visibility
+/// widened).
+#[cfg(test)]
+mod sim_cluster_dynamo_batch_get;
+#[cfg(test)]
+mod sim_cluster_dynamo_boolean_composition;
+#[cfg(test)]
+mod sim_cluster_dynamo_eventual_read;
+#[cfg(test)]
+mod sim_cluster_dynamo_expression_surface;
+#[cfg(test)]
+mod sim_cluster_dynamo_extended;
+#[cfg(test)]
+mod sim_cluster_dynamo_item_size_cap;
+#[cfg(test)]
+mod sim_cluster_dynamo_parallel_scan;
+#[cfg(test)]
+mod sim_cluster_dynamo_predicate_bugs;
+#[cfg(test)]
+mod sim_cluster_dynamo_update_add_delete;
+#[cfg(test)]
+mod sim_cluster_dynamo_updated_return_values;
+#[cfg(test)]
+mod sim_cluster_kind_batch_outcome;
+
+/// ADR 0061 rung D3 PR 2a (C-04 D3): base-table DDL over the real DynamoDB
+/// wire, driven through the new `dynamo::dispatch_table_op` generic core —
+/// `CreateTable`/`DeleteTable`/`ListTables`/`DescribeTable` — for the first
+/// time. Replaces `crates/animusd/tests/dynamo_table_ops.rs` whole,
+/// `dynamo_schema.rs::create_table_rejects_reserved_namespace`, and
+/// `dynamo_extended.rs::create_table_query_and_conditional_writes` (which
+/// emptied that file). A sibling of `sim_cluster_corpus`/`sim_cluster_
+/// throttle`/`sim_cluster_dynamo` for the identical reason (needs
+/// `SimCluster`'s own `pub(crate)` surface, no further visibility
+/// widened). See that module's own doc for the full account, including the
+/// reconciler-hazard soak (item 5) and its finding.
+#[cfg(test)]
+mod sim_cluster_dynamo_table_ops;
+
+/// ADR 0061 rung D3 PR 2b (C-04 D3): `UpdateTable`'s **throughput** change
+/// over the real DynamoDB wire, driven through `dynamo::dispatch_table_op`'s
+/// new `UpdateTable` arm (throughput-only — a stream/index change stays
+/// `unsupported_by_generic_dispatch`, unchanged from PR 2a). Replaces five
+/// of `crates/animusd/tests/dynamo_throttling.rs`'s eleven tests — see that
+/// module's own doc for exactly which five, and why the other six (batch
+/// shedding, `TransactWriteItems`, a forwarded-write throttle check, the
+/// `/admin/metrics` counter regression, and the cluster-wide config-surface
+/// test) stay on `ProdEnv`. A sibling of `sim_cluster_corpus`/
+/// `sim_cluster_throttle`/`sim_cluster_dynamo`/`sim_cluster_dynamo_table_
+/// ops` for the identical reason (needs `SimCluster`'s own `pub(crate)`
+/// surface, no further visibility widened).
+#[cfg(test)]
+mod sim_cluster_dynamo_update_table;
+
+/// ADR 0061 rung D3 PR 3a (C-04 D3): GSI/LSI `Query`/`Scan` dispatch through
+/// `SimCluster`, plus `CreateTable` with a declared GSI/LSI — the 8-function
+/// widening (`run_index_query`/`run_gsi_query`/`run_lsi_query`/`run_index_
+/// scan`/`run_gsi_scan`/`run_lsi_scan`/`paginated_kind_examine`/`paginated_
+/// kind_examine_one`) `dynamo::dispatch_item_op`'s own doc names as PR 2/3's
+/// deferred residual. Replaces five of `crates/animusd/tests/dynamo_query_
+/// filter.rs`'s six tests; see this module's own doc for the shared "events"
+/// fixture and the GSI-materialization boundary every sibling module below
+/// also documents (a GSI row is never materialized under this fixture —
+/// see `sim_cluster_dynamo_table_ops.rs`'s own pinned regression for that
+/// exact boundary).
+#[cfg(test)]
+mod sim_cluster_dynamo_query_filter;
+
+/// ADR 0061 rung D3 PR 3a sibling: `Query` pagination (`Limit`/
+/// `ExclusiveStartKey`/`LastEvaluatedKey`) over the base table and an LSI.
+/// Replaces five of `crates/animusd/tests/dynamo_query_pagination.rs`'s six
+/// tests — see this module's own doc for why `cross_index_cursor_mismatch_
+/// is_rejected` needs no materialized GSI row despite naming one.
+#[cfg(test)]
+mod sim_cluster_dynamo_query_pagination;
+
+/// ADR 0061 rung D3 PR 3a sibling: `KeyConditionExpression` sort-key range
+/// comparators (issue #373) and `ScanIndexForward` numeric ordering (ADR
+/// 0063), over the base table and an LSI. Replaces four of `crates/animusd/
+/// tests/dynamo_query_range.rs`'s five tests.
+#[cfg(test)]
+mod sim_cluster_dynamo_query_range;
+
+/// ADR 0061 rung D3 PR 3a sibling: descending `Query`/pagination
+/// (`ScanIndexForward: false`), over the base table and an LSI. Replaces six
+/// of `crates/animusd/tests/dynamo_scan_index_forward.rs`'s eight tests.
+#[cfg(test)]
+mod sim_cluster_dynamo_scan_index_forward;
+
+/// ADR 0061 rung D3 PR 3a sibling: `ConsistentRead` fidelity on `Query`
+/// (ADR 0041 §5) — a GSI rejects it, an LSI/base table accepts it. Replaces
+/// `crates/animusd/tests/dynamo_consistent_read.rs`'s one test.
+#[cfg(test)]
+mod sim_cluster_dynamo_consistent_read;
+
+/// ADR 0061 rung D3 PR 3a sibling: `Query`/`Scan`'s `Select` (`COUNT`/
+/// `SPECIFIC_ATTRIBUTES`). Replaces six of `crates/animusd/tests/dynamo_
+/// select.rs`'s seven tests.
+#[cfg(test)]
+mod sim_cluster_dynamo_select;
+
+/// ADR 0061 rung D3 PR 3a sibling: `ReturnConsumedCapacity` — computed from
+/// the catalog's index definitions plus the written item, never from a
+/// materialized index row, so no GSI-drain boundary applies. Replaces all
+/// seven of `crates/animusd/tests/dynamo_consumed_capacity.rs`'s tests.
+#[cfg(test)]
+mod sim_cluster_dynamo_consumed_capacity;
+
+/// ADR 0061 rung D3 PR 3a sibling: `ReturnItemCollectionMetrics` — LSI-
+/// scoped and priced synchronously at the tablet leader, so no GSI-drain
+/// boundary applies. Replaces all five of `crates/animusd/tests/dynamo_
+/// item_collection_metrics.rs`'s tests.
+#[cfg(test)]
+mod sim_cluster_dynamo_item_collection_metrics;
+
+/// ADR 0061 rung D3 PR 3a sibling: base-table `Scan` (needs no new
+/// generality — a no-index `Scan` already ran through `dispatch_item_op`).
+/// Replaces two of `crates/animusd/tests/dynamo_indexes.rs`'s three tests;
+/// `gsi_write_then_query` stays in that file untouched (D2 PR 1's own
+/// real-socket proof of `run_operation`'s independent path) — PR 3b adds a
+/// sim twin of it here without deleting the original.
+#[cfg(test)]
+mod sim_cluster_dynamo_indexes;
+
+/// ADR 0061 rung D3 PR 3b: document/set attribute types, projection
+/// expressions, `ReturnValues`, multiple + composite GSIs alongside an LSI,
+/// and `N`-typed partition-key routing — driven through `[SimCluster::
+/// drain_gsi]` for the GSI half. Replaces all three of `crates/animusd/
+/// tests/dynamo_documents.rs`'s tests.
+#[cfg(test)]
+mod sim_cluster_dynamo_documents;
+
+/// ADR 0061 rung D3 PR 3b: a `CreateTable`-declared GSI's definition
+/// replicates cluster-wide and a second node (which never itself handled
+/// the `CreateTable`) resolves a `Query` against it once `[SimCluster::
+/// drain_gsi]` has materialized the hidden table. Replaces one of
+/// `crates/animusd/tests/dynamo_schema.rs`'s three tests; the restart proof
+/// and `extended_surface` stay on `ProdEnv`.
+#[cfg(test)]
+mod sim_cluster_dynamo_schema;
+
+/// ADR 0061 rung D4 PR 3 (C-04 D4): deterministic `SimCluster` coverage for
+/// the dropped-table GC reclaim (ADR 0024) — driven through the real
+/// `DeleteTable` wire operation (`dynamo::dispatch_table_op` →
+/// `ClientCtx::drop_table`, already `<E, R>`-generic, no new widening
+/// needed this rung) against every node's own real `host::Reconciler`
+/// (ADR 0061 rung D4 PR 1). A driver-plus-assertions PR, not new
+/// mechanism — see this module's own doc for the five scenarios, the
+/// physical-reclaim observable (`SimCluster::storage`, new this rung), and
+/// a real, previously-uncharacterized reclaim gap its own scenario-4
+/// investigation found and reports (not fixed here, out of scope).
+#[cfg(test)]
+mod sim_cluster_dynamo_drop_table;
+
+/// ADR 0061 rung D4 PR 2 (C-04 D4): deterministic `SimCluster` coverage for
+/// the auto-split BYTE trigger (ADR 0034) — `auto_split_loop` (`lib.rs`)
+/// widened to `<E: Env, R: RelayClient>`/`Nanos`-keyed (previously concrete
+/// `ProdEnv`/`tokio::time::Instant`), `SimCluster::
+/// set_auto_split_thresholds` the new opt-in knob (defaulted OFF, mirroring
+/// D4 PR 1's `heartbeat_loop` spawn), and `index_drain::{
+/// inplace_split_driver_tick, gsi_caught_up}` also widened so `SimCluster::
+/// drive_inplace_split_cutover` can manually drive the fork's own
+/// `MetaCommand::CutoverSplit` — this fixture never spawns `index_drain::
+/// change_consumer_loop` itself. See this module's own doc for the five
+/// scenarios (byte-threshold crossing, staying below it, a regrown child
+/// forking again, a leadership move mid-window, a crashed-and-restarted
+/// replica converging via the issue #722 fix) and `crates/animusd/
+/// CLAUDE.md`'s matching entry for the full account.
+#[cfg(test)]
+mod sim_cluster_auto_split;
+
+/// ADR 0061 rung D4 PR 5 (C-04 D4): deterministic `SimCluster` coverage for
+/// the backup janitor's own async loop (`animus_node::backup_janitor::
+/// backup_janitor_loop`) — `client_ctx_host.rs`'s four host-capability
+/// impls and `backup_janitor.rs`'s own thin wrapper widened to `<E: Env, R:
+/// RelayClient>` (previously concrete `ClientCtx` = `ClientCtx<ProdEnv,
+/// AnimusdRelayClient>`), `sim_cluster.rs`'s own `SimCluster` now building
+/// every node's `backup_store` as a `BackupStoreHandle::S3` wrapping a
+/// clone of ONE shared `SimSegmentStore` (not a per-node placeholder) and
+/// spawning `backup_janitor_loop` unconditionally on every node, mirroring
+/// `heartbeat_loop`'s own always-on D4 PR 1 spawn. See this module's own
+/// doc for the five scenarios (a deleted backup reclaimed, a failed backup
+/// reclaimed, leader gating including a real leadership-transfer handoff,
+/// a crashed-and-restarted control leader converging, and an untouched
+/// `Available` backup left alone) and `crates/animusd/CLAUDE.md`'s matching
+/// entry for the full account.
+#[cfg(test)]
+mod sim_cluster_backup_janitor;
+
+/// ADR 0061 rung D4 PR 4 (C-04 D4, closing the D4 roadmap item): deterministic
+/// `SimCluster` coverage for ADR 0030 online growth and ADR 0032 seed-join
+/// decommission — `sim_cluster.rs`'s own new `SimCluster::grow`/`drain`/
+/// `remove` fixture surface (a data-only node added after construction,
+/// `ControlHandle::Remote`'s real mirror-sync logic exercised under `SimEnv`
+/// for the first time, and the ADR 0032 drain-then-remove sequence driven
+/// through the real `admin_drain`/`admin_remove_member` primitives). See
+/// this module's own doc for the five scenarios (grow convergence, growth
+/// then placement/rebalance onto the new node, grow-then-drain-then-remove,
+/// a control-leader crash mid-registration, and mirror sync surviving a
+/// partition) and `crates/animusd/CLAUDE.md`'s matching entry for the full
+/// account, including what stayed on `ProdEnv`.
+#[cfg(test)]
+mod sim_cluster_growth;
+
+/// ADR 0061 rung F (C-06 PR 3): deterministic `SimCluster` coverage for
+/// `TransactWriteItems`/`TransactGetItems`, reachable through the generic
+/// dispatch core for the first time — `dynamo::dispatch_item_op` gained two
+/// match arms calling `run_transact`/`run_transact_get` (both already
+/// `<E, R>`-generic since C-06 PR 2), routing every wire transaction issued
+/// through `SimClusterHandle::dynamo` the exact way `run_operation`'s own
+/// production arms do. See this module's own doc for the seven scenarios
+/// (a commit across two tables including a `ConditionCheck`, a condition
+/// failure's `CancellationReasons`, `ClientRequestToken` idempotency, a
+/// `TransactGetItems` snapshot against a concurrent writer, forwarding from
+/// a node hosting no replica of either table, the internal idempotency-
+/// table bootstrap race between two concurrent first callers, and a
+/// coordinator that never finished past the prepare phase recovering
+/// atomically) and `crates/animusd/CLAUDE.md`'s matching entry for the full
+/// account, including what stayed on `ProdEnv` and why.
+#[cfg(test)]
+mod sim_cluster_dynamo_transact;
 
 /// Regression for the issue #298 residual confirmed live under the
 /// un-pinned `SplitMode::InPlace` proof soak (ADR 0018's matching amendment,
