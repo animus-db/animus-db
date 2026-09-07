@@ -7231,38 +7231,75 @@ advanced between the last prepare and a real `SimCluster::crash` of the
 coordinator, then a `SimCluster::restart`.
 
 **A real finding, `#[ignore]`d as a characterization test — scenario (g),
-not a `dynamo.rs`/coordinator/idempotency bug.** Diagnosed, not merely
-observed: every poll attempt after the crash returns the identical
-`SimRelayClient::relay`-native timeout text, unchanging across the full
-budget and every seed tried, while a same-cluster-state plain
-(non-transactional) forwarded `GetItem` on a different key succeeds
-immediately. Root cause: `animus_node::sim_relay::SimRelayClient::
-serve_loop` (a different crate) is one task per node processing inbound
-relay requests strictly sequentially, `.await`-ing each request's own
-handler *inline* before looping back to receive the next message.
-Recovering an in-doubt transaction from a **forwarded** read
+not a `dynamo.rs`/coordinator/idempotency bug in its FIRST stage. Issue
+#731 (that first stage) fixed 2026-09-07 — but a SECOND, distinct,
+pre-existing bug the fix itself uncovered still blocks this scenario, and
+stays `#[ignore]`d.** Diagnosed, not merely observed, at both stages:
+
+**Stage 1 (issue #731, fixed)**: every poll attempt after the crash used
+to return the identical `SimRelayClient::relay`-native timeout text,
+unchanging across the full budget and every seed tried, while a
+same-cluster-state plain (non-transactional) forwarded `GetItem` on a
+different key succeeded immediately. Root cause: `animus_node::sim_relay::
+SimRelayClient::serve_loop` (a different crate) used to be one task per
+node processing inbound relay requests strictly sequentially, `.await`-ing
+each request's own handler *inline* before looping back to receive the
+next message. Recovering an in-doubt transaction from a **forwarded** read
 (`cp_get_local_resolving_inner`'s `FastRead::Foreign` arm →
 `confirm_or_push` → `txn_status`/`txn_recover`/`txn_verify`) can need the
 *serving* node's own handler to issue a further, nested outbound `relay()`
 call to a third node (whichever leads the anchor's own tablet) before it
-can answer the first request — but that nested call's own reply can only
+can answer the first request — but that nested call's own reply could only
 ever be delivered by the same `serve_loop` task currently blocked awaiting
 the handler: a genuine self-deadlock, resolved only by the nested call's
-own timeout. This is the first `SimCluster` scenario in this crate whose
+own timeout. This was the first `SimCluster` scenario in this crate whose
 own forwarded handler needs a second hop — reachable only via a crash
 forcing re-election away from whichever node originally led every touched
-tablet, combined with a **forwarded** (not locally-served) read. Production's
-real `AnimusdRelayClient` has no analogous bottleneck (each inbound TCP
-connection is its own `tokio::spawn`ed task) — this is a
-`SimRelayClient`-only, fixture-only limitation, never reachable in a real
-cluster. Fixing it (spawning each inbound request's handler onto its own
-task, production's own shape) is a change to `animus-node`, a shared
-testing primitive every `SimCluster`-based module in this crate depends
-on, and is out of this PR's own scope. Both
+tablet, combined with a **forwarded** (not locally-served) read.
+Production's real `AnimusdRelayClient` has no analogous bottleneck (each
+inbound TCP connection is its own `tokio::spawn`ed task) — this was always
+a `SimRelayClient`-only, fixture-only limitation, never reachable in a
+real cluster.
+
+**Fixed**: `SimRelayClient::serve_loop` now dispatches each inbound
+`Request` onto its own `env.spawn_task`ed task rather than awaiting it
+inline (`crates/animus-node/src/sim_relay.rs`), mirroring production's own
+one-task-per-connection shape — see that module's own "One task per
+inbound request" doc section, `docs/adr/0061-testability-node-crate-
+simulator.md`'s "#731 closed" addendum, and `docs/engineering-lessons.md`'s
+matching entry for the full mechanism.
+
+**Confirmed directly**: with the fix applied, this scenario's own poll
+loop no longer returns the relay timeout text at any seed tried — it
+returns `Err("transaction covering this key is still pending; retry")`
+instead, unchanging across the full budget, which is
+`cp_get_local_resolving_inner`'s own `TxnDecisionStatus::Pending` arm,
+reached only once `confirm_or_push`/`txn_recover` have both run to
+completion (proof the nested relay hop now succeeds).
+
+**Stage 2 (a second, distinct, pre-existing bug — NOT fixed, unrelated to
+the relay change)**: `txn_recover` (`txn_coordinator.rs`) never gets past
+its own grace check. Traced directly: whenever `self.cp_route(record_table,
+record_key)` resolves to anything other than `CpRoute::Local` — the
+ordinary case here, since this on-demand push runs on the *reading* node's
+own leader (the participant's tablet), not necessarily the *anchor*'s —
+`now_ms` is computed as `self.env.now().duration_since(self.env.now())`:
+the elapsed gap between two back-to-back clock reads, near-zero, not an
+absolute timestamp. Checked against `now_ms < view.created_ts.wall_ms +
+RECOVERY_GRACE`, a near-zero `now_ms` makes that comparison true forever,
+so `txn_recover` declines (`Pending`) on every call, permanently — this is
+pre-existing, introduced (and knowingly left unfixed as out of scope) by
+ADR 0061 rung C5 step 3b's `tokio::time::Instant::now().elapsed()` → `Env`
+conversion (see that rung's own bullet above: "reproducing the identical
+near-zero result rather than 'fixing' what reads like a pre-existing
+latent bug — an incidental bug gets its own PR"). It was unreachable
+before this fix only because issue #731's own deadlock intercepted every
+recovery attempt before `txn_recover` was ever actually called. Both
 `coordinator_never_finished_past_prepare_recovers_atomically` and its
-`_over_seeds` sibling stay `#[ignore]`d with the full diagnosis in their
-own doc comment; **issue to be filed** against `animus_node::sim_relay::
-SimRelayClient`.
+`_over_seeds` sibling stay `#[ignore]`d, with the full two-stage diagnosis
+in their own doc comment — **issue #731 itself is closed**; a **new issue
+is to be filed** against `ClientCtx::txn_recover`'s non-local grace-check
+branch, a different subsystem than the relay fix.
 
 **ProdEnv conversion: none.** `dynamo_txn.rs`'s every test builds on
 `create_table_pre_split` (a genuinely **split** table proving cross-tablet
@@ -7297,3 +7334,18 @@ participant_spans.rs` (37 tests, all green, unchanged since nothing in
 these six files was edited); `ANIMUS_SEED` replay of scenario (a) (green)
 and scenario (g) (reproduces the finding identically). `Cargo.lock`
 unchanged.
+
+**Issue #731 fixed, 2026-09-07** (see this section's own scenario-(g)
+paragraph above for the mechanism): `SimRelayClient::serve_loop` now
+dispatches each inbound forwarded request onto its own task, closing the
+deadlock — confirmed directly, since scenario (g)'s own poll loop no
+longer returns the relay-timeout text at any seed tried. **A second,
+distinct, pre-existing bug in `ClientCtx::txn_recover`'s non-local
+grace-check (unrelated to and unmodified by this fix) still blocks the
+scenario from converging**, so `coordinator_never_finished_past_prepare_
+recovers_atomically` and its `_over_seeds` sibling remain `#[ignore]`d —
+see their own doc comment for the full two-stage diagnosis. A new issue is
+to be filed against `txn_recover`; issue #731 itself is closed.
+`cargo test -p animusd --lib`: 365 passed / 5 ignored before this fix →
+365 passed / 5 ignored after (0 regressions — the two tests stay
+`#[ignore]`d, now for the second, distinct reason).

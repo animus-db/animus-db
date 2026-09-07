@@ -646,3 +646,39 @@ sub-rungs below shipped.
   module's own `block_on` — see its doc for why that's sound here) — all of
   it reachable with **no socket and no `ClientCtx`**, which used to require
   a real multi-process cluster bring-up.
+
+## `sim_relay`'s dispatch model: one task per inbound request (issue #731, 2026-09-07)
+
+`SimRelayClient::serve_loop` no longer awaits an inbound
+`RelayWire::Request`'s installed handler inline before looping back to
+`recv_stream` for the next message — it dispatches each one onto its own
+`env.spawn_task`ed task, mirroring `AnimusdRelayClient`'s own production
+shape (one `tokio::spawn`ed task per inbound TCP connection). This closed
+a genuine self-deadlock: this loop is the *only* reader of `RELAY_STREAM`
+(single-consumer, ADR 0026) and is also where the reply to any of this
+node's own *outbound* `relay()` calls arrives (the module doc's "one
+stream, two roles" section) — so a handler that itself needed to issue a
+**nested** outbound `relay()` call (ADR 0018 transaction recovery
+resolving a foreign intent via a forwarded read is the concrete case that
+found this) used to block the loop from ever receiving that nested call's
+own reply, since only that same, currently-blocked loop could have
+delivered it. See `sim_relay.rs`'s own "One task per inbound request" doc
+section for the full mechanism, `docs/adr/0061-testability-node-crate-
+simulator.md`'s "#731 closed" addendum for the incident record, and
+`docs/engineering-lessons.md`'s matching entry for the general lesson (a
+test double that serializes what production runs concurrently hides
+deadlocks only a nested call can reveal).
+
+**Still fully deterministic**: dispatch still runs on `env.spawn_task`
+(the seeded simulator's own cooperative executor), never a raw
+`tokio::spawn` — introducing concurrency here did not introduce
+nondeterminism, it only gave the simulator's already-seeded scheduler more
+tasks to interleave among. **No new correlation mechanism was needed**:
+`RelayWire`'s `req_id` + the pre-existing `Pending`-slot `BTreeMap` already
+handle any number of concurrent in-flight requests/replies (the client
+side of this was already proven by `concurrent_outstanding_requests_
+resolve_to_the_right_callers`) — only the *handling* of a `Request` became
+concurrent; the *receiving* of messages off `RELAY_STREAM` stays strictly
+ordered by the loop's own single `recv_stream` call. No bound on
+concurrent handlers, matching production's own unbounded per-connection
+spawn.
