@@ -7173,3 +7173,127 @@ data_join --test decommission --test data_only --test tablet_rf_self_heals
 SEEDS=10 cargo test -p animusd --lib sim_cluster_corpus` (3 passed, 1
 ignored, 205.88s); `ANIMUS_SEED` replay of scenarios (a) and (c) at their
 pinned seeds (both green). `Cargo.lock` unchanged.
+
+## Appendix — SimCluster coverage for TransactWriteItems/TransactGetItems (ADR 0061 rung F, C-06 PR 3, 2026-09-07)
+
+Closes the first of D2 PR 1's two named residuals (`TransactWriteItems`/
+`TransactGetItems`; PartiQL is PRs 5-6's own scope). `dynamo::
+dispatch_item_op` — the generic item/query core `SimClusterHandle::dynamo`
+drives — gained two match arms calling `run_transact`/`run_transact_get`
+(both already `<E, R>`-generic since C-06 PR 2's own signature-and-timer
+widening, zero new mechanism) the identical call shape `run_operation`'s
+own arms already use. `run_operation`, `execute_statement`,
+`execute_transaction`, and `run_batch_execute_statement` are byte-identical
+— the D2 PR 1 lesson repeated once more: this rung deliberately does not
+route `run_operation`'s own production arms through the generic core.
+
+**Two new small `SimCluster` primitives** (`sim_cluster.rs`), used only by
+scenario (g) below: `txn_prepare_only(node, table, anchor,
+participant_spans, key, value)` stages ONE write of a raw 2PC transaction
+directly via `ClientCtx::txn_prepare` and deliberately never decides or
+resolves — this fixture's own way of expressing "the coordinator crashed
+right after prepare," mirroring `cp_txn.rs`'s own `prepare_via_any_node`
+idiom (drive prepare, then simply stop) but via a direct in-process call
+(which already resolves/forwards to the correct tablet leader) rather than
+a hand-rolled per-node wire retry loop; `raw_get(node, table, key,
+consistent)` is a routed read of an arbitrary physical key, the
+raw-plain-KV sibling of `SimClusterHandle::get`'s item-shaped (`pk`/`sk`
+`AttributeValue`-encoded) read. Every other scenario issues real DynamoDB
+wire JSON through `SimClusterHandle::dynamo`.
+
+**New module: `crates/animusd/src/sim_cluster_dynamo_transact.rs`**, 7
+scenarios (`_over_seeds` at 5 seeds each, 14 tests total): (a) a commit of
+two `Put`s plus a passing `ConditionCheck` across two different tables,
+readable afterward with `ConsistentRead: true` from a different node; (b) a
+failing `ConditionCheck` cancels the whole transaction —
+`TransactionCanceledException` with per-action `CancellationReasons` and no
+partial write, even though both `Put`s precede the failing check in list
+order; (c) `ClientRequestToken` idempotency (a same-token retry after
+commit is cached — an `ADD` counter proves no re-run; a different payload
+under the same token is `IdempotentParameterMismatchException`); (d)
+`TransactGetItems` never observes a torn pair under a concurrent writer,
+driven as genuinely racing tasks (a sequential writer + two reader loops,
+all spawned before one shared `Simulator::run_for`, mirroring `SimCluster::
+dynamo_concurrent`'s own shape but with a writer issuing several sequential
+calls from inside one task); (e) a transaction issued on a node hosting no
+replica of either table's tablet is forwarded and commits (a 7-node cluster
+with two RF-3 tables always leaves at least one idle node, found via
+`SimCluster::hosted_tablets` — never by parsing a `NodeId` back into an
+index, this file's own documented gotcha); (f) the internal
+idempotency-table bootstrap race the ADR's own Risks section named up
+front — two token-bearing transactions from two different nodes racing
+`ensure_txn_idempotency_table`'s `CreateTableSchema` propose in the same
+tick (`SimCluster::dynamo_concurrent`) — **no product bug found**: exactly
+one proposal wins (`Metadata`'s own schema-catalog first-committer-wins
+exclusivity) and both transactions commit regardless of which won; (g) the
+coordinator stages both participants and never decides, with virtual time
+advanced between the last prepare and a real `SimCluster::crash` of the
+coordinator, then a `SimCluster::restart`.
+
+**A real finding, `#[ignore]`d as a characterization test — scenario (g),
+not a `dynamo.rs`/coordinator/idempotency bug.** Diagnosed, not merely
+observed: every poll attempt after the crash returns the identical
+`SimRelayClient::relay`-native timeout text, unchanging across the full
+budget and every seed tried, while a same-cluster-state plain
+(non-transactional) forwarded `GetItem` on a different key succeeds
+immediately. Root cause: `animus_node::sim_relay::SimRelayClient::
+serve_loop` (a different crate) is one task per node processing inbound
+relay requests strictly sequentially, `.await`-ing each request's own
+handler *inline* before looping back to receive the next message.
+Recovering an in-doubt transaction from a **forwarded** read
+(`cp_get_local_resolving_inner`'s `FastRead::Foreign` arm →
+`confirm_or_push` → `txn_status`/`txn_recover`/`txn_verify`) can need the
+*serving* node's own handler to issue a further, nested outbound `relay()`
+call to a third node (whichever leads the anchor's own tablet) before it
+can answer the first request — but that nested call's own reply can only
+ever be delivered by the same `serve_loop` task currently blocked awaiting
+the handler: a genuine self-deadlock, resolved only by the nested call's
+own timeout. This is the first `SimCluster` scenario in this crate whose
+own forwarded handler needs a second hop — reachable only via a crash
+forcing re-election away from whichever node originally led every touched
+tablet, combined with a **forwarded** (not locally-served) read. Production's
+real `AnimusdRelayClient` has no analogous bottleneck (each inbound TCP
+connection is its own `tokio::spawn`ed task) — this is a
+`SimRelayClient`-only, fixture-only limitation, never reachable in a real
+cluster. Fixing it (spawning each inbound request's handler onto its own
+task, production's own shape) is a change to `animus-node`, a shared
+testing primitive every `SimCluster`-based module in this crate depends
+on, and is out of this PR's own scope. Both
+`coordinator_never_finished_past_prepare_recovers_atomically` and its
+`_over_seeds` sibling stay `#[ignore]`d with the full diagnosis in their
+own doc comment; **issue to be filed** against `animus_node::sim_relay::
+SimRelayClient`.
+
+**ProdEnv conversion: none.** `dynamo_txn.rs`'s every test builds on
+`create_table_pre_split` (a genuinely **split** table proving cross-tablet
+behavior specifically via a real split boundary) — this fixture's
+`SimCluster` never splits a hand/wire-created table at all (no scenario
+here mints more than one tablet per table), so none of that file's tests
+reproduce exactly; scenarios (a)/(b)/(d) above prove the identical
+wire-level properties over two independently-created tables instead —
+complementary coverage, not a byte-for-byte duplicate. `dynamo_txn_
+cancellation.rs`'s own tests each cover a narrower or different specific
+mechanic scenario (b) does not reach (`ReturnValuesOnConditionCheckFailure`
+echo, a *write* action's own condition failing rather than a
+`ConditionCheck` action, an all-`ConditionCheck` transaction, the
+successful-commit "no `CancellationReasons` field" negative assertion,
+`TransactionConflict`, the real split-plus-forwarding-hop case) — none is
+subsumed. `dynamo_execute_transaction.rs` stays untouched (PR 5/6
+territory). `txn_recovery_participant_spans.rs` stays: real wall-clock
+`RECOVERY_GRACE` timing over a real 3-process cluster, a distinction this
+rung's own scenario (g) inherits identically (its own recovery timing is
+virtual). `cp_txn.rs`/`dynamo_txn_idempotency.rs` (issue #298) were run for
+sanity only, never edited, per this series' own standing rule.
+
+`cargo test -p animusd --lib`: 353 passed / 3 ignored before this PR → 365
+passed / 5 ignored after (+12 passed, +2 ignored, 0 regressions).
+
+**Gates**: `cargo fmt --all --check` (clean after one auto-fix); `cargo
+clippy -p animusd --all-targets --all-features -- -D warnings` (clean);
+`cargo build -p animusd --all-targets` (clean); real-socket sanity on
+`cp_txn.rs`/`dynamo_txn.rs`/`dynamo_txn_cancellation.rs`/`dynamo_txn_
+idempotency.rs`/`dynamo_execute_transaction.rs`/`txn_recovery_
+participant_spans.rs` (37 tests, all green, unchanged since nothing in
+these six files was edited); `ANIMUS_SEED` replay of scenario (a) (green)
+and scenario (g) (reproduces the finding identically). `Cargo.lock`
+unchanged.

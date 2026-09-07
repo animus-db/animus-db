@@ -554,6 +554,25 @@ the still-true paragraph after the table.
   `run_batch_execute_statement`, `execute_one_batch_statement`) stays
   byte-identical throughout — strictly additive, parallel new paths only,
   per the D2 PR 1 lesson (`docs/engineering-lessons.md`).
+- **Status:** PR 1 (docs) and PR 2 (Transact groundwork) landed
+  2026-09-07. **PR 3 (Transact reachable from `SimCluster`) landed
+  2026-09-07**: `dispatch_item_op` gained the two match arms, and a new
+  `sim_cluster_dynamo_transact.rs` covers 7 scenarios (12 of 14 tests
+  green — commit + `ConditionCheck` across two tables, cancellation
+  reasons, `ClientRequestToken` idempotency, a `TransactGetItems` snapshot
+  against a concurrent writer, forwarding from a non-participant node, and
+  the idempotency-table bootstrap race this section's own Plan named up
+  front, all with no product bug found). **One real finding**: the
+  scenario proving atomic recovery after a coordinator crash
+  (`coordinator_never_finished_past_prepare_recovers_atomically`) is
+  `#[ignore]`d as a characterization test — it found a structural
+  deadlock in `animus_node::sim_relay::SimRelayClient` (a shared testing
+  primitive, a different crate) when a forwarded request's own handler
+  needs a nested outbound relay call, not a bug in the Transact dispatch
+  or coordinator logic itself. See ADR 0061's matching 2026-09-07
+  "C-06 PR 3" amendment for the full diagnosis; issue to be filed against
+  `animus_node::sim_relay::SimRelayClient`. PRs 4-7 (the wire corpus,
+  PartiQL siblings, PartiQL sim tests, docs close-out) remain open.
 - **ADR:** [0061](adr/0061-testability-node-crate-simulator.md) — the
   2026-09-07 "Rung F" amendment.
 - **Size:** L (seven PRs, two real production functions' worth of
@@ -640,7 +659,7 @@ wave are independent and can run in parallel.
 | 4 | *landed 2026-09-05* (S-02) | Highest blast radius (C-01 landed 2026-09-05 — see ADR 0054; S-01 landed 2026-09-05 — see ADR 0064; S-02 — see ADR 0066) |
 | 5 | *S-04, S-05, S-07b–d, C-02, C-05 all landed 2026-09-06* | S-05 strictly after S-04 |
 | 6 | *S-03 complete 2026-09-07 (all 3 PRs, ADR 0069)*; *S-07e/S-07 complete 2026-09-07 (ADR 0070)*; *C-03 assessed 2026-09-07 — deferred, no PRs planned (see ADR 0044's matching amendment)*; W-07 | XL or gated on earlier waves |
-| 7 | C-06 (PR 1 landed 2026-09-07; PRs 2-7 open) | Gated on C-04 (closed 2026-09-07) — the D4 `Reconciler` and D3 generic dispatch cores it builds on |
+| 7 | C-06 (PRs 1-3 landed 2026-09-07; PRs 4-7 open) | Gated on C-04 (closed 2026-09-07) — the D4 `Reconciler` and D3 generic dispatch cores it builds on |
 
 Open issues mapped: none left (#375 closed by W-01, #319 by W-05). Filed
 from wave 2's own findings: #590 (the operator still emits the deleted
