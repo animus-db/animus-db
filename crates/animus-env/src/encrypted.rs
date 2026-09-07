@@ -368,12 +368,52 @@ fn corruption_error(file: &str) -> std::io::Error {
     )
 }
 
-fn seal_marker<R: Rng + ?Sized>(key: &EncryptionKey, rng: &R) -> Vec<u8> {
+/// Seal `plaintext` as a whole, standalone object: a fresh header (random
+/// salt) plus exactly one frame at counter 0 — the identical shape
+/// [`Disk::replace`]'s own physical payload takes. Used both by the
+/// marker file/object (below and in `encrypted_segment_store.rs`) and by
+/// [`crate::EncryptedSegmentStore::put`] (ADR 0069 PR 2), which seals each
+/// write-once object this same way: no frame index is needed since a
+/// `SegmentStore` object, unlike a `Disk` file, is always read/written
+/// whole, never incrementally appended.
+pub(crate) fn seal_whole<R: Rng + ?Sized>(
+    key: &EncryptionKey,
+    rng: &R,
+    plaintext: &[u8],
+) -> Vec<u8> {
     let salt = random_salt(rng);
-    let framed = seal_frame(key, &salt, 0, MARKER_PLAINTEXT);
+    let framed = seal_frame(key, &salt, 0, plaintext);
     let mut out = make_header(&salt);
     out.extend_from_slice(&framed);
     out
+}
+
+/// Open a whole standalone object sealed by [`seal_whole`]. `None` on any
+/// parse/authentication failure — the caller decides what that means (a
+/// wrong key, corruption, or genuinely not-our-format bytes). Used both by
+/// the marker file/object's own authentication check and by
+/// [`crate::EncryptedSegmentStore::get`], which — unlike
+/// [`EncryptedDisk`]'s per-file frame scan — has no torn-tail case to
+/// consider at all: a `SegmentStore` object is never incrementally
+/// appended, so any failure here is either a key/store mismatch or
+/// genuine corruption, never a legitimate crash-torn write in progress.
+pub(crate) fn open_whole(key: &EncryptionKey, raw: &[u8]) -> Option<Vec<u8>> {
+    if raw.len() <= HEADER_LEN + LEN_PREFIX || raw[0..4] != MAGIC {
+        return None;
+    }
+    let mut salt = [0u8; SALT_LEN];
+    salt.copy_from_slice(&raw[5..HEADER_LEN]);
+    let ct_len =
+        u32::from_be_bytes(raw[HEADER_LEN..HEADER_LEN + LEN_PREFIX].try_into().ok()?) as usize;
+    let body = &raw[HEADER_LEN + LEN_PREFIX..];
+    if body.len() != ct_len {
+        return None;
+    }
+    open_frame(key, &salt, 0, body)
+}
+
+fn seal_marker<R: Rng + ?Sized>(key: &EncryptionKey, rng: &R) -> Vec<u8> {
+    seal_whole(key, rng, MARKER_PLAINTEXT)
 }
 
 /// A marker is written once via [`Disk::replace`], whose crash contract
@@ -382,21 +422,7 @@ fn seal_marker<R: Rng + ?Sized>(key: &EncryptionKey, rng: &R) -> Vec<u8> {
 /// file, *any* parse/authentication failure here means "wrong key or
 /// corrupted marker", never "torn tail".
 fn marker_authenticates(key: &EncryptionKey, raw: &[u8]) -> bool {
-    if raw.len() <= HEADER_LEN + LEN_PREFIX {
-        return false;
-    }
-    let mut salt = [0u8; SALT_LEN];
-    salt.copy_from_slice(&raw[5..HEADER_LEN]);
-    let ct_len = u32::from_be_bytes(
-        raw[HEADER_LEN..HEADER_LEN + LEN_PREFIX]
-            .try_into()
-            .expect("4 bytes"),
-    ) as usize;
-    let body = &raw[HEADER_LEN + LEN_PREFIX..];
-    if body.len() != ct_len {
-        return false;
-    }
-    matches!(open_frame(key, &salt, 0, body), Some(pt) if pt == MARKER_PLAINTEXT)
+    matches!(open_whole(key, raw), Some(pt) if pt == MARKER_PLAINTEXT)
 }
 
 /// The ADR 0069 loud-refusal check: decide (from a directory listing plus

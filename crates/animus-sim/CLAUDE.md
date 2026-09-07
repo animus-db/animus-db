@@ -331,3 +331,18 @@ determinism regression comparing two runs of the same seed + fault schedule
 for byte-identical outcome sequences (plus a different seed diverging), with
 a sanity check that the configured fault probability actually produces both
 outcomes over the run.
+
+**ADR 0069 S-03 PR 2** adds `EncryptedSegmentStore<SimSegmentStore, SimEnv>`
+coverage to the same test module: the shared contract; a plain round trip
+proving the wrapped `SimSegmentStore` never sees plaintext bytes; a
+wrong-key-at-open refusal; a tampered object failing loudly and naming its
+id (tampered by directly mutating the raw bytes via a second handle on the
+same underlying store, then re-`put`ting them — `SimSegmentStore`'s own
+write-once check on differing raw bytes means this goes through a
+delete-then-put, not a bare overwrite); and all three marker-mismatch
+directions, including the marker object's own exclusion from `list`. The
+cross-fault-model corpus (`SegmentFaultConfig`'s ack-lost/unavailability
+faults composed underneath the wrapper, at depth) lives in `animus-test`'s
+own `tests/segment_store_encrypted_fault_corpus.rs` instead, since it needs
+`animus_test::corpus`'s seed-scaffolding — this crate has no dependency on
+`animus-test`.

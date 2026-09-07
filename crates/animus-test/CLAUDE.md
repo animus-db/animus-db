@@ -55,6 +55,7 @@ Env knobs at a glance (details in the sections below):
 | `ANIMUS_BACKUP_SEEDS=K` | 1 | K seed variants per on-demand backup capture + restore fault-injection cell (ADR 0059 Train 1/2) |
 | `ANIMUS_PITR_SEEDS=K` | 1 | K seed variants per PITR sealing fault-injection cell (ADR 0059 Train 3) |
 | `ANIMUS_EXPORT_IMPORT_SEEDS=K` | 1 | K seed variants per S3 export/import fault-injection cell (ADR 0068, S-05 PR 3) |
+| `ANIMUS_SEGMENT_STORE_ENCRYPTED_SEEDS=K` | 1 | K seed variants per `EncryptedSegmentStore` fault-injection cell (ADR 0069, S-03 PR 2) |
 | `ANIMUS_SHRINK=1` | off | minimize a failed corpus scenario's parameters to a small reproducing case (ADR 0061 rung B4) |
 | `ANIMUS_SHRINK_MAX_CHECKS=N` | 500 | override the minimizer's check-count budget |
 | `ANIMUS_SHRINK_REPLAY=<json>` | unset | a corpus's own replay entry point (e.g. `raftkv_shrink_replay`) re-runs this minimized case and asserts it still fails |
@@ -1055,3 +1056,54 @@ retrievable from git history.)
   `animusd::import`/`animus-cp-data` themselves, caught immediately by the
   very first depth-1 run (`decode_envelope`'s own "unknown envelope tag"
   panic), never shipped as a false-negative-green corpus.
+
+### `EncryptedSegmentStore` fault-injection corpus (ADR 0069, S-03 PR 2)
+
+- `segment_store_encrypted_fault_corpus.rs` — the `SegmentStore`-seam
+  sibling of `animus-storage`'s own `lsm_crash_encrypted.rs` (the
+  `Disk`-seam corpus PR 1 shipped): proves `animus_env::
+  EncryptedSegmentStore` composes correctly with every `SegmentFaultConfig`/
+  unavailability fault the three domain corpora above already inject
+  through `SimSegmentStore`, rather than converting those three
+  ~2,400-line files themselves (each hardcodes its shared harness
+  functions to a concrete `&SimSegmentStore` parameter across dozens of
+  functions — genericizing or duplicating all three would be a materially
+  larger, separate refactor, named as a follow-up rather than attempted
+  here). Uses `for_each_seed` (the closure-driven scaffolding shape, since
+  each scenario is self-contained rather than built from a shared
+  `Vec<Scenario>`), driven via the same `spawn_task` +
+  `run_until_quiescent` idiom `animus-sim`'s own `segment_store.rs` tests
+  use.
+- **Frozen named cells**: `round_trip_survives_put_ack_lost`/
+  `round_trip_survives_delete_ack_lost` (the object lands despite the
+  caller-visible ack-lost error — checked by reopening a fresh
+  `EncryptedSegmentStore` handle over the same underlying store, proving
+  the marker/frame format round-trips independent of which handle wrote
+  it); `unavailability_window_heals_and_then_round_trips`;
+  `write_once_holds_at_the_plaintext_level_under_fault` (an
+  identical-plaintext re-put is still a safe no-op — load-bearing since a
+  fresh random salt per `put` makes the underlying store's own
+  raw-bytes write-once check see *different* ciphertext for identical
+  plaintext, which the wrapper must not let leak through as a false
+  rejection); `a_tampered_object_is_a_hard_error_naming_the_id` (a direct
+  byte-flip of the raw stored bytes, re-inserted via the underlying
+  store's own delete+put — `SimSegmentStore` enforces write-once on raw
+  bytes too, so this can't be a bare overwrite); `a_marker_put_ack_lost_
+  fault_is_recovered_by_retrying_open` (the marker object's own `put`
+  during `open()` can itself be ack-lost — the identical ambiguity every
+  other object tolerates, so a caller must retry `open`, not treat a
+  transient marker-put failure as permanent); and
+  `marker_refusal_in_every_direction_across_seeds` (the three loud-refusal
+  directions hold across many simulation seeds, mirroring `animus-sim`'s
+  own single-seed unit test). Depth knob `ANIMUS_SEGMENT_STORE_ENCRYPTED_
+  SEEDS` (default 1 = the frozen cells; held green at `=20`).
+- **A harness-only ordering bug found building this corpus, not a product
+  bug**: the first draft of `round_trip_survives_put_ack_lost` enabled the
+  put-ack-lost fault *before* calling `EncryptedSegmentStore::open`,
+  which itself `put`s the marker object — so `open` itself failed on
+  every run, before the test ever exercised the property it meant to
+  check. Fixed by enabling the fault only after `open` succeeds
+  (the marker-put-fault case has its own dedicated cell, above). See
+  `docs/engineering-lessons.md`'s matching entry for the general lesson
+  (a fault enabled before a multi-step setup sequence finishes can corrupt
+  the setup itself, not just the operation under test).

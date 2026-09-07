@@ -72,7 +72,7 @@ the still-true paragraph after the table.
 
 ### S-03 Encryption at rest
 
-- **Status: PR 1 of 3 landed** ([ADR 0069](adr/0069-encryption-at-rest.md),
+- **Status: PR 1 and 2 of 3 landed** ([ADR 0069](adr/0069-encryption-at-rest.md),
   2026-09-06) — key loading + a generic AEAD `Disk`-seam wrapper
   (`EncryptedDisk<D: Disk, R: Rng>`/`EncryptedEnv<E: Env>`,
   `crates/animus-env/src/encrypted.rs`), a per-node `--encryption-key
@@ -80,21 +80,29 @@ the still-true paragraph after the table.
   `--tls-cert` pattern), and a marker-file loud refusal on a key/directory
   mismatch. `ProdEnv` composes the same primitives internally rather than
   becoming `EncryptedEnv<ProdEnv>` — see the ADR's "Crate placement"
-  section for why. Reaches `--config FILE --node I` and `--cluster N`;
-  `--cluster-control`/`--cluster-data`, `animusd control`, `animusd data`,
-  and `animusd join` do not yet accept the flag (a documented reach gap,
-  the same shape several other per-node flags already have on those entry
-  points).
+  section for why. **PR 2** adds the `SegmentStore`-seam sibling
+  (`EncryptedSegmentStore<S: SegmentStore, R: Rng>`,
+  `crates/animus-env/src/encrypted_segment_store.rs`), sealing each
+  object as a whole standalone frame (reusing PR 1's frame codec) rather
+  than an `EncryptedDisk`-style incremental one, wired into
+  `--backup-store`/`--segment-store fs:PATH`/`s3://...` via `animusd`'s
+  `build_segment_store`/`build_backup_store` — but under a
+  **cluster-wide, not per-node, key** (every node sharing a `fs:`/`s3://`
+  store must configure the identical key file), since a backup/PITR/
+  stream-segment object is routinely read by a *different* node than the
+  one that wrote it, unlike a `Disk` file. Both PRs reach `--config FILE
+  --node I` and `--cluster N`; `--cluster-control`/`--cluster-data`,
+  `animusd control`, `animusd data`, and `animusd join` do not yet accept
+  the flag (a documented reach gap, the same shape several other per-node
+  flags already have on those entry points).
 - **Still pending:**
-  - **PR 2 — `SegmentStore`**: `FsSegmentStore`/the local `dir:`/`fs:`
-    opt-in store still write plaintext objects — backup manifests/data
-    chunks, PITR segments, and DynamoDB Streams shard objects on a local
-    disk are unencrypted even with `--encryption-key` set. The `Disk`-seam
-    wrapper's frame codec should be directly reusable (a `SegmentStore`
-    object is write-once/immutable, simpler than `Disk`'s incremental-
-    append contract), but the wiring itself — `FsSegmentStore`'s own
-    `put`/`get`/`delete`/`list` methods, and threading the key through
-    `--backup-store`/`--segment-store fs:PATH` — is unbuilt.
+  - **The default replicated `cluster` segment/backup store is not covered
+    by PR 2** — its per-node local building block does its own raw
+    filesystem I/O outside the `Disk` seam, so PR 1 never touched it
+    either; only the `fs:`/`s3://` opt-in stores are sealed. Encrypting it
+    would mean widening `ClusterSegmentStore`'s own concrete type
+    parameter — a separate, structurally larger change than PR 2's own
+    scope, tracked here rather than silently assumed done.
   - **PR 3 — operator key-secret mount**: `crates/animus-operator` has no
     `spec.encryptionKey`-shaped CRD field or Kubernetes `Secret` mount for
     this key at all yet — every operator-deployed cluster runs unencrypted
@@ -108,12 +116,29 @@ the still-true paragraph after the table.
   `lsm_crash.rs`, depth knob `ANIMUS_LSM_ENCRYPTED_SEEDS`); `crates/
   animusd/tests/encryption_at_rest_e2e.rs` (real `ProdEnv`/disk/DynamoDB
   wire); `crates/animus-env/src/prod.rs`'s own real-filesystem unit tests.
+- **Tests (PR 2):** the shared `SegmentStore` contract against
+  `EncryptedSegmentStore<SimSegmentStore, SimEnv>`
+  (`crates/animus-sim/src/segment_store.rs`),
+  `EncryptedSegmentStore<FsSegmentStore, DiskSaltRng>`
+  (`crates/animus-env/src/prod.rs`), and
+  `EncryptedSegmentStore<S3SegmentStore<FakeS3>, R>`
+  (`crates/animus-env/src/s3_store.rs`); a new fault-injection corpus,
+  `crates/animus-test/tests/segment_store_encrypted_fault_corpus.rs`
+  (depth knob `ANIMUS_SEGMENT_STORE_ENCRYPTED_SEEDS`, held at 20 — proves
+  the wrapper tolerates every fault the backup/PITR/export-import domain
+  corpora already inject through `SimSegmentStore`, without converting
+  those three ~2,400-line corpora themselves, a named follow-up); and
+  `crates/animusd/tests/encryption_at_rest_segment_store_e2e.rs` (real
+  `ProdEnv`, a real 2-node cluster, `CreateBackup` on node 0 →
+  `RestoreTableFromBackup` on node 1 with the same key, plus both
+  mismatch directions refused at node startup).
 - **ADR:** [0069](adr/0069-encryption-at-rest.md) — seam choice, key
-  management, threat model, and the positional torn-tail-vs-corruption
-  rule.
+  management, threat model, the positional torn-tail-vs-corruption rule,
+  and (PR 2 amendment) the cluster-wide key-scope decision.
 - **PRs:** (1) key loading + `Disk` wrapper for WAL/engine — **landed**;
-  (2) `SegmentStore`; (3) operator key secret mount. **Size:** XL
-  (interacts with the `Disk` seam's fsync/durability contract).
+  (2) `SegmentStore` — **landed**; (3) operator key secret mount —
+  pending. **Size:** XL (interacts with the `Disk` seam's fsync/durability
+  contract).
 
 ### S-07 Operator hardening (ADR 0060 deferred list)
 
@@ -244,7 +269,7 @@ wave are independent and can run in parallel.
 | 3 | *U-05, U-07, U-08(ii) landed 2026-09-06* | No ordering constraint remains |
 | 4 | *landed 2026-09-05* (S-02) | Highest blast radius (C-01 landed 2026-09-05 — see ADR 0054; S-01 landed 2026-09-05 — see ADR 0064; S-02 — see ADR 0066) |
 | 5 | *S-04, S-05, S-07b–d, C-02, C-05 all landed 2026-09-06* | S-05 strictly after S-04 |
-| 6 | *S-03 PR 1 landed 2026-09-06* (ADR 0069); S-03 PR 2/3, S-07e, W-07, C-03 | XL or gated on earlier waves (S-07e's webhook-TLS prerequisite is satisfied now that S-01 landed; no longer a hard gate, just unscheduled) |
+| 6 | *S-03 PR 1 and 2 landed 2026-09-06* (ADR 0069); S-03 PR 3, S-07e, W-07, C-03 | XL or gated on earlier waves (S-07e's webhook-TLS prerequisite is satisfied now that S-01 landed; no longer a hard gate, just unscheduled) |
 
 Open issues mapped: none left (#375 closed by W-01, #319 by W-05). Filed
 from wave 2's own findings: #590 (the operator still emits the deleted

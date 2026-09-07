@@ -1,8 +1,9 @@
 # ADR 0069 — Encryption at rest: AEAD `Disk`-seam wrapper, per-node key file
 
 - **Status:** Accepted — implemented (S-03 PR 1 of 3: key loading + the
-  `Disk`-seam wrapper for WAL/engine files; PR 2 — `SegmentStore` — and PR 3
-  — operator key-secret mount — pending)
+  `Disk`-seam wrapper for WAL/engine files. PR 2 of 3 — `SegmentStore` —
+  also implemented, see the 2026-09-06 "As-built: PR 2" amendment below.
+  PR 3 — operator key-secret mount — pending.)
 - **Date:** 2026-09-06
 - **Origin:** `docs/roadmap.md`'s S-03 ("Encryption at rest")
 - **Depends on:** [ADR 0003](0003-deterministic-simulation.md) (the `Env`
@@ -416,6 +417,241 @@ once per node startup, never on the read/write hot path.
   would need to design a re-encryption or key-versioning story if either
   becomes a real requirement — nothing in this design blocks that, but
   nothing in it builds toward it either.
-- PR 2 (`SegmentStore`) and PR 3 (operator key-secret mount) are not yet
-  implemented — a `dir:`/`fs:` local `SegmentStore` and the Kubernetes
-  operator's key distribution both still write plaintext.
+- PR 2 (`SegmentStore`) is implemented (see the "As-built: PR 2" amendment
+  below) for the `fs:`/`s3://` opt-in stores, under a cluster-wide (not
+  per-node) key; the default replicated `cluster` store still writes
+  plaintext, a stated scope cut. PR 3 (operator key-secret mount) is not
+  yet implemented — the Kubernetes operator has no key-distribution
+  mechanism yet.
+
+## As-built: PR 2 (`SegmentStore`, 2026-09-06)
+
+Encryption at rest for the `SegmentStore` seam (`crates/animus-env/src/
+encrypted_segment_store.rs`): `EncryptedSegmentStore<S: SegmentStore, R:
+Rng>` seals each object as a whole standalone frame — a fresh 21-byte
+header (random salt) plus exactly one AEAD frame at counter 0, reusing
+`encrypted.rs`'s own frame codec (`seal_whole`/`open_whole`, factored out
+of `seal_marker`/`marker_authenticates`, which now call them) — since a
+`SegmentStore` object, unlike a `Disk` file, is never incrementally
+appended: it is always written whole in one `put` call (the trait's own
+write-once contract) and read whole in one `get` call. No frame index is
+needed, unlike `EncryptedDisk`.
+
+### Key scope: cluster-wide, not per-node — the central decision this PR had to make
+
+PR 1's per-node key file works because a node's own `Disk` files are
+*always* read by that same node's own process — no other node ever opens
+another node's WAL. A `SegmentStore` object breaks that assumption
+structurally: a backup captured on node A is later restored by whichever
+node happens to receive the `RestoreTableFromBackup` call (routinely a
+*different* node); a PITR segment sealed by one tablet's leader is later
+replayed by whichever node drives that restore; a DynamoDB Streams shard
+object is read by whichever node happens to serve `GetRecords`. Two
+designs were considered:
+
+- **(a) One key, shared by every node that can reach the store** (chosen).
+  Every node configured with `--backup-store fs:PATH`/`--segment-store
+  s3://...` and `--encryption-key PATH` passes the *identical* key file —
+  the same "one key file's path repeated across every node's config entry"
+  pattern PR 1 already established for the common case, now load-bearing
+  rather than merely convenient. A mismatch (a node with a different key,
+  or no key, pointed at an already-marked store) is refused loudly at
+  **node startup** — `build_segment_store`/`build_backup_store` call
+  `verify_or_init_segment_store_marker`/`EncryptedSegmentStore::open`
+  unconditionally, before the node's listeners bind — never discovered
+  later as a mysterious decrypt failure deep inside a restore job.
+- **(b) A separate `--segment-store-key`/`--backup-store-key` flag**,
+  independent of `--encryption-key`. Rejected: it would let an operator
+  encrypt the `Disk` seam and the `SegmentStore` seam under two unrelated
+  keys with no structural reason to — every node in a cluster is already
+  a single trust domain for this feature (PR 1's own threat model: a
+  stolen disk, not a compromised live process), so a second key doesn't
+  buy additional isolation, only a second secret to provision and rotate
+  correctly. (b) would matter if a future requirement wanted the backup
+  store's blast radius genuinely separated from a node's live disk (e.g.
+  the backup bucket is handed to a different, less-trusted operator) — not
+  a requirement today, and easy to add later as a distinct opt-in without
+  disturbing (a)'s default.
+
+**Threat model difference from PR 1**: the same "stolen/lost disk, not a
+compromised live process" model, extended to "a stolen/lost backup bucket
+or shared filesystem mount, not a compromised live process." The
+cluster-wide key means every node that can decrypt the store is,
+definitionally, a full trust peer for that store's contents — no
+per-node compartmentalization exists (or was asked for) at this layer.
+
+**On a mixed cluster** — some nodes configured with the shared key, others
+with none or a different one, all pointed at the same `fs:`/`s3://` store —
+whichever node's own local marker check runs first (at ITS OWN startup)
+decides the store's fate: the first node to start against a fresh store
+initializes the marker under its own key (or leaves it plaintext, if it
+has none); every node started afterward with a different key or no key
+is refused at ITS OWN startup, never allowed to silently read/write the
+store as if the mismatch didn't exist. A cluster is therefore never
+*silently* half-encrypted — a misconfigured node simply never starts,
+with an error naming exactly what's wrong (see "Error texts" below). The
+practical operational rule: provision the key file identically (same
+content) on every node before ever pointing more than one node at the
+same `fs:`/`s3://` store.
+
+### `Cluster` (the default) is untouched — an honest scope cut, not a claim it's already covered
+
+The default `SegmentStoreConfig::Cluster`/`BackupStoreConfig::Cluster`
+(the K-replicated store, `ClusterSegmentStore<ProdEnv, FsSegmentStore>`)
+is **not** wrapped by this PR. Its per-node local building block
+(`FsSegmentStore`, rooted at `dir.join("segments")`/`dir.join("backups")`)
+does its own raw `tokio::fs` I/O directly — it is not layered on the
+`Disk` trait `EncryptedDisk` wraps, so PR 1's own `--encryption-key`
+mechanism never touched it and does not "already cover" it on disk,
+despite that being a plausible-sounding shorthand. Encrypting it would
+mean changing `SegmentStoreHandle::Cluster`'s own concrete
+`ClusterSegmentStore<ProdEnv, FsSegmentStore>` type parameter to
+`ClusterSegmentStore<ProdEnv, EncryptedSegmentStore<FsSegmentStore, ..>>`
+— a larger, structurally separate change (every call site that
+pattern-matches the `Cluster` variant would need to thread a second
+generic parameter through `animus-cp-data`'s own `cluster_segment_store`
+module) with no design blocker, just out of this PR's scope. Stated here
+plainly per this ADR's own discipline against silently-stale claims:
+today, only the `Fs`/`S3` opt-in stores are sealed; the default replicated
+store stays plaintext on disk. A future PR closing this gap is a named,
+tracked follow-up, not assumed.
+
+### Loud refusal — the exact texts (`SegmentStore` counterpart of PR 1's own table)
+
+`verify_or_init_segment_store_marker` mirrors `verify_or_init_marker`'s
+table exactly, swapping `Disk::list`/`read`/`replace` for
+`SegmentStore::list`/`get`/`put`, and a small marker **object**
+(`.animus_segment_store_encryption_marker`, filtered out of every `list`
+result this wrapper serves) for the marker **file**:
+
+```
+segment store is encrypted (found .animus_segment_store_encryption_marker) but no
+--encryption-key was given — refusing to start. Pass --encryption-key PATH with the
+same key this store was created with, or point at a fresh store.
+```
+
+```
+--encryption-key does not match the key this segment store was encrypted with —
+refusing to start. Use the original key, or point at a fresh store.
+```
+
+```
+--encryption-key was given but this segment store already holds unencrypted objects
+(no .animus_segment_store_encryption_marker marker) — refusing to start. Encryption
+cannot be enabled on an existing plaintext segment store; point at a fresh store
+instead.
+```
+
+A `get` (or `put`'s own write-once plaintext-comparison read) that fails
+to authenticate an *existing* object is a separate, fourth error, always a
+hard failure naming the object id — never a silent `None`/torn-tail trim,
+since a `SegmentStore` object has no partial-write window to distinguish
+from corruption in the first place (see the module's own doc):
+
+```
+{id}: failed to authenticate/decrypt this segment store object — either the
+configured --encryption-key does not match the key this object was written with, or
+the object is corrupted. Segment store objects are write-once, so this can never be a
+torn write; refusing rather than risking silent data loss.
+```
+
+### Write-once at the plaintext level, not ciphertext
+
+`SegmentStore::put`'s contract treats a same-id, same-content re-put as a
+safe no-op and a same-id, different-content re-put as a hard error. A
+fresh random salt is minted on **every** `put` (the identical
+nonce-uniqueness discipline `Disk::replace` uses), so two `put` calls
+with byte-identical plaintext produce different ciphertext —
+`EncryptedSegmentStore::put` therefore fetches and decrypts whatever
+already exists at `id` first and compares **plaintext**, exactly what
+`FsSegmentStore`/`S3SegmentStore` themselves already do one layer down
+for an unencrypted store; comparing raw (encrypted) bytes would have
+wrongly rejected a legitimate idempotent retry.
+
+### Wiring
+
+`build_segment_store`/`build_backup_store` (`animusd::lib`) gained an
+`encryption_key: Option<&EncryptionKey>` parameter and became `async`
+(the marker check does real I/O). `Fs`/`S3` wrap in `EncryptedSegmentStore`
+when a key is given; `Cluster` never does (see above). Even with **no**
+key configured, the loud-refusal marker check still runs unconditionally
+on `Fs`/`S3` (mirroring PR 1's "off by default still checks" rule) — a
+store that already holds encrypted objects is never silently treated as
+plaintext just because this particular node omitted `--encryption-key`.
+`SegmentStoreHandle`/`BackupStoreHandle` gained one new variant each,
+`EncryptedFs(EncryptedSegmentStore<FsSegmentStore, ProdEnv>)` — `ProdEnv`
+itself supplies the `Rng` these salts draw from (it already implements
+`Rng`, drawing real OS randomness), so no new zero-sized `Rng` type was
+needed the way `DiskSaltRng` was for PR 1's `Disk` seam (no `Arc`
+reference-cycle risk here — `EncryptedSegmentStore` is never nested
+inside `ProdEnv`'s own `Inner`). The `S3` variant needed no new enum
+arm — it already stores an `Arc<dyn SegmentStore>`, so the encrypted case
+is just `Arc::new(EncryptedSegmentStore::open(raw_s3, ..))` boxed the
+same way. `Node`/`BoundControlNode`/`BoundDataNode` each gained an
+`encryption_key: Option<EncryptionKey>` field (a clone of the same key
+`Node::bind*` already loads for `ProdEnv::bind_with_tls_and_key`), so PR
+2's own wiring adds no second key-loading path — same reach as PR 1
+(`--config`/`--node`, `--cluster N`); the `--cluster-control`/
+`--cluster-data`/`animusd control`/`animusd data`/`animusd join` gaps PR 1
+already named are unchanged, not widened.
+
+### Tests
+
+- `crates/animus-sim/src/segment_store.rs`'s test module: the shared
+  `assert_segment_store_contract` against
+  `EncryptedSegmentStore<SimSegmentStore, SimEnv>`; a plain round trip
+  proving the wrapped store never sees plaintext; wrong-key-at-open
+  refusal; a tampered object failing loudly and naming its id; and all
+  three marker-mismatch directions plus the marker's own exclusion from
+  `list`.
+- `crates/animus-env/src/prod.rs`: `EncryptedSegmentStore<FsSegmentStore,
+  DiskSaltRng>` against a real temp directory — the shared contract, plus
+  a real-filesystem proof of the three mismatch directions and that the
+  raw bytes on disk never contain the plaintext value.
+- `crates/animus-env/src/s3_store.rs`: the shared contract against
+  `EncryptedSegmentStore<S3SegmentStore<FakeS3>, R>` (a small deterministic
+  test-only `Rng`, not `OsRng`), plus the wrong-key-refused/no-plaintext-
+  in-the-bucket proof.
+- `crates/animus-test/tests/segment_store_encrypted_fault_corpus.rs`
+  (depth knob `ANIMUS_SEGMENT_STORE_ENCRYPTED_SEEDS`, default 1, held at
+  20 in this PR's own gate run): every `SegmentFaultConfig`/unavailability
+  fault the backup/PITR/export-import domain corpora already inject
+  through `SimSegmentStore` composes correctly underneath
+  `EncryptedSegmentStore` — an ack-lost `put`/`delete` still lands the
+  plaintext state change despite the caller-visible error; an
+  unavailability window fails every op with no state change, then heals;
+  write-once holds at the plaintext level under fault; a mid-object
+  tamper is a hard `get` error naming the id; an ack-lost fault on the
+  marker object's own `put` during `open()` is recovered by retrying
+  `open` (the marker landed despite the surfaced error, the identical
+  ambiguity every other object tolerates); and the three marker-mismatch
+  directions hold across many simulation seeds. **The three existing
+  ~2,400-line domain corpora (`backup_fault_corpus.rs`,
+  `pitr_fault_corpus.rs`, `export_import_fault_corpus.rs`) were
+  deliberately NOT converted to run through an encrypted store** — every
+  one hardcodes its shared harness functions to a concrete
+  `&SimSegmentStore` parameter across dozens of functions; genericizing or
+  duplicating all three is a materially larger, separate refactor with
+  real regression risk against already-hard-won deterministic corpora,
+  named here as an explicit follow-up rather than attempted piecemeal.
+- `crates/animusd/tests/encryption_at_rest_segment_store_e2e.rs`
+  (`ProdEnv`, real sockets/disk, real 2-node cluster): a keyed cluster's
+  `CreateBackup` issued against node 0 followed by `RestoreTableFromBackup`
+  issued against **node 1** (which never itself wrote the backup object)
+  succeeds and restores the exact backup-time value, with the shared
+  `fs:` backup-store directory never holding the plaintext item value at
+  any point; a node started with a *different* key against that same
+  (already-marked) directory is refused at its own startup, before it
+  binds a single listener; and a key configured against an existing
+  *plaintext* backup-store directory is refused the same way. (A
+  cross-node mismatch is demonstrated at the point it is actually
+  enforced — node startup — rather than by waiting out the restore
+  driver's own internal retry/stuck-timeout loop, which would only
+  observe the identical refusal indirectly and far more slowly.)
+
+### Secrets never leak (unchanged from PR 1's own posture)
+
+No key material appears in any log line, error message (every text above
+names only the mismatch, never key bytes), `/admin/config` dump (still
+only `encryption_key_path`, a path string), or operator ConfigMap. Nothing
+in this PR changes that surface.

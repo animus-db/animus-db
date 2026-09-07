@@ -55,6 +55,52 @@ the production implementation; the deterministic implementation lives in
   is usable at all. Off by default: no key configured is byte-identical to
   pre-ADR-0069 `ProdEnv` (verified directly, `prod::tests::
   no_key_writes_no_marker_and_stays_byte_identical`).
+- **`encrypted_segment_store.rs`** (ADR 0069, S-03 PR 2) — the
+  `SegmentStore` sibling of `encrypted.rs`: `EncryptedSegmentStore<S:
+  SegmentStore, R: Rng>` seals each object as a whole standalone frame
+  (one header + one AEAD frame at counter 0, reusing `encrypted.rs`'s own
+  `seal_whole`/`open_whole` — factored out of `seal_marker`/
+  `marker_authenticates`, which now call them — since a `SegmentStore`
+  object, unlike a `Disk` file, is never incrementally appended: it's
+  always written whole in one `put` and read whole in one `get`, so no
+  frame index is needed). `verify_or_init_segment_store_marker` mirrors
+  `verify_or_init_marker`'s three-way decision table exactly, over a
+  small marker **object** (`SEGMENT_STORE_MARKER_ID =
+  ".animus_segment_store_encryption_marker"`, filtered out of every
+  `EncryptedSegmentStore::list` result) instead of a marker file.
+  **Key scope is cluster-wide, not per-node** — a backup/PITR/stream-
+  segment object is routinely read by a *different* node than the one
+  that wrote it (a restore on a different node, a `GetRecords` served by
+  whichever node happens to answer), so every node reading a given
+  `fs:`/`s3://` store must be configured with the identical key file; see
+  the type's own module doc and ADR 0069's PR 2 amendment for the full
+  decision record (including the rejected `--segment-store-key`
+  alternative and what a mixed-key cluster looks like — the short version:
+  never silently half-encrypted, since each node's own marker check runs
+  independently at ITS OWN startup). **Write-once is enforced at the
+  plaintext level**, not ciphertext (`put` fetches and decrypts whatever
+  already exists at `id` first and compares plaintext) — a fresh random
+  salt per `put` means two calls with identical plaintext produce
+  different ciphertext, so a raw-bytes comparison (what the wrapped store
+  itself does) would wrongly reject a legitimate idempotent re-put. A
+  `get`/`put`-plaintext-check authentication failure is always a hard
+  error naming the object id — never a torn-tail trim, since a
+  `SegmentStore` object has no partial-write window to distinguish from
+  corruption in the first place. **Unconditional, no `prod` feature** —
+  same reasoning as `encrypted.rs` itself, so `SimSegmentStore`-driven
+  tests/corpora exercise it with no `ProdEnv` in the build. Wired into
+  `animusd`'s `build_segment_store`/`build_backup_store`
+  (`--segment-store`/`--backup-store fs:PATH`/`s3://...` + `--encryption-
+  key`) — `Fs`/`S3` get wrapped, the default `Cluster` store does not (its
+  per-node local building block does raw filesystem I/O outside the
+  `Disk` seam entirely, so PR 1 never covered it either; encrypting it
+  would need widening `ClusterSegmentStore`'s own concrete type parameter,
+  a separate, larger change, tracked as a follow-up rather than done
+  here). `ProdEnv` itself supplies the `Rng` these salts draw from when
+  used from `animusd` (it already implements `Rng`) — no new zero-sized
+  `Rng` type was needed the way `DiskSaltRng` was for the `Disk` seam,
+  since `EncryptedSegmentStore` is never nested inside `ProdEnv`'s own
+  `Inner` (no `Arc` cycle risk to design around).
 - **`prod.rs`/`tls.rs` are gated behind a default-off `prod` Cargo feature
   (ADR 0061 rung C0)**, added specifically so `ProdEnv`/`FsSegmentStore`
   can be made compiler-unreachable from a crate's manifest, not just
@@ -634,6 +680,25 @@ mirroring `animus-s3`'s own `tests/minio_real_endpoint.rs` down to the exact
 environment variables — unset, it prints a skip line and does nothing (never
 `#[ignore]`d), so this crate's own gates stay green with no MinIO/localstack
 infrastructure.
+
+**S-03 PR 2** adds `EncryptedSegmentStore` coverage in three places, all
+part of the same `cargo test -p animus-env --all-features` run:
+`prod::tests::encrypted_fs_segment_store_satisfies_the_contract`
+(`assert_segment_store_contract` against
+`EncryptedSegmentStore<FsSegmentStore, DiskSaltRng>` over a real temp
+directory) and `encrypted_fs_segment_store_marker_mismatch_and_ciphertext_
+on_disk` (all three loud-refusal directions plus a raw-file grep proving
+the plaintext value never appears on disk); `s3_store::tests::
+contract_holds_through_the_encrypted_wrapper` (the identical contract
+against `EncryptedSegmentStore<S3SegmentStore<FakeS3>, CounterRng>` — a
+small deterministic test-only `Rng`, not `OsRng`, since this file has no
+`SimEnv`/seed-reproducibility concern of its own) and `wrong_key_is_
+refused_and_ciphertext_never_hits_the_bucket`. The `SimEnv`-driven
+counterpart — `EncryptedSegmentStore<SimSegmentStore, SimEnv>` — lives in
+`animus-sim/src/segment_store.rs`'s own test module (see that crate's
+`CLAUDE.md`), and the fault-injection corpus lives in `animus-test/tests/
+segment_store_encrypted_fault_corpus.rs` (depth knob
+`ANIMUS_SEGMENT_STORE_ENCRYPTED_SEEDS`).
 
 **`send_stream` ordering after #666.** Each send is its own bounded task,
 so two back-to-back sends to the same destination may reach the pooled

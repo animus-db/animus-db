@@ -54,6 +54,18 @@ pub use encrypted::{
     EncryptedDisk, EncryptedEnv, EncryptionKey, MARKER_FILE, verify_or_init_marker,
 };
 
+/// Encryption at rest for the `SegmentStore` seam (ADR 0069, S-03 PR 2):
+/// `EncryptedSegmentStore<S: SegmentStore, R: Rng>` seals each object as a
+/// whole standalone frame, reusing `encrypted.rs`'s own frame codec.
+/// Unconditional (no `prod` feature needed), like `encrypted` itself — so
+/// `SimEnv`'s `SimSegmentStore` and the encrypted corpora can drive it
+/// deterministically. See the module doc for the cluster-wide key-scope
+/// decision (ADR 0069's PR 2 amendment).
+pub mod encrypted_segment_store;
+pub use encrypted_segment_store::{
+    EncryptedSegmentStore, SEGMENT_STORE_MARKER_ID, verify_or_init_segment_store_marker,
+};
+
 /// S3-backed [`SegmentStore`] (S-04 PR 2, `docs/adr/0059-backup-restore.md`'s
 /// 2026-09-06 amendment) — gated alongside `prod.rs` for the identical
 /// reason: it wraps `animus_s3::client::S3Client<T>`, generic over

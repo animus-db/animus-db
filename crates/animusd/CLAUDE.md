@@ -1822,7 +1822,7 @@ acceptor` vs `server_acceptor`) — see this file's "TLS" section below for
 the full design. Omitted (the default), every listener/dialer stays plain
 TCP, byte-identical to before this ADR.
 
-**`--encryption-key PATH` (ADR 0069, S-03 PR 1)** — this node's own data
+**`--encryption-key PATH` (ADR 0069, S-03 PR 1 and 2)** — this node's own data
 directory encryption key file (`animus_env::EncryptionKey::
 load_from_file`'s format: 64 hex characters, optionally a trailing
 newline; generate one with `openssl rand -hex 32 > key.hex`). Threads to
@@ -1849,6 +1849,35 @@ node's disk stays plaintext, byte-for-byte pre-ADR-0069 behavior. See
 `crates/animus-env/CLAUDE.md`'s `encrypted.rs` entry for the wrapper
 itself; `crates/animusd/tests/encryption_at_rest_e2e.rs` is the real
 `ProdEnv`/disk/DynamoDB-wire regression.
+
+**PR 2 also seals a `SegmentStore`, not just the `Disk` seam**: the same
+`--encryption-key` (loaded once per `Node::bind*`, cloned onto
+`BoundNode`/`BoundControlNode`/`BoundDataNode::encryption_key`) is handed
+to `build_segment_store`/`build_backup_store` (both now `async`), which
+wrap a `--segment-store`/`--backup-store fs:PATH`/`s3://...` store in
+`animus_env::EncryptedSegmentStore` when a key is configured —
+`SegmentStoreHandle`/`BackupStoreHandle` each gained an `EncryptedFs`
+variant for this (the `S3` variant needed no new arm — it already boxes
+`Arc<dyn SegmentStore>`). **Key scope is cluster-wide here, not per-node**
+— unlike a `Disk` file, a backup/PITR/stream-segment object is routinely
+read by a different node than the one that wrote it, so every node
+sharing a given `fs:`/`s3://` store must be configured with the identical
+key file; see `animus_env::EncryptedSegmentStore`'s own module doc and
+the ADR's PR 2 amendment for the full decision (including what a
+mismatched-key node does: refuses loudly at its own startup, before it
+ever binds a listener — never a silent half-encrypted cluster).
+**`SegmentStoreConfig::Cluster`/`BackupStoreConfig::Cluster` (the
+default) are deliberately untouched** — their per-node local
+`FsSegmentStore` building block does raw filesystem I/O outside the
+`Disk` seam entirely, so it was never covered by PR 1 either; encrypting
+it needs widening `ClusterSegmentStore`'s own concrete type parameter, a
+separate, larger change, named as a follow-up rather than done here.
+`crates/animusd/tests/encryption_at_rest_segment_store_e2e.rs` is the
+real `ProdEnv` regression: a 2-node cluster's `CreateBackup` on node 0 →
+`RestoreTableFromBackup` on node 1 with the same key succeeds and the
+shared backup-store directory never holds the plaintext value; a
+differently-keyed node against that same directory, and a keyed node
+against an existing plaintext directory, are both refused at startup.
 
 **`--advertise-host NAME` (ADR 0060's advertise/dial split)** — this
 node's own stable dial name, when its bind address isn't itself something a
@@ -4181,7 +4210,15 @@ ADR itself for the full design/rationale.
   *different* rustls crypto provider is already installed process-wide
   (never actually possible in this process — nothing else in `animusd`
   installs one — but propagated rather than `.expect()`ed, per this repo's
-  no-panic-on-a-remote-possibility discipline).
+  no-panic-on-a-remote-possibility discipline). **Both functions also
+  became `async` in ADR 0069 S-03 PR 2** — the `Fs`/`S3` arms' loud-refusal
+  marker check (`animus_env::verify_or_init_segment_store_marker`/
+  `EncryptedSegmentStore::open`) does real I/O, so this is now the
+  *expected*, not just the theoretical, way either function returns
+  `Err`: a key/store mismatch on `Fs`/`S3` refuses at node startup, before
+  any listener binds. `Cluster` is still infallible (and, since PR 2,
+  still the one variant `--encryption-key` never touches at all — see
+  that ADR's PR 2 amendment for why).
 
   **Credentials are deliberately NOT a `ClusterConfig` field** — see this
   file's own `config.rs` entry above for why a new field there means a

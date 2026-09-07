@@ -2004,6 +2004,95 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `EncryptedSegmentStore<FsSegmentStore, DiskSaltRng>` over a real
+    /// temp directory satisfies the identical shared contract (ADR 0069,
+    /// S-03 PR 2) — the `SegmentStore` sibling of this file's own
+    /// `FsSegmentStore` contract test above, and of `EncryptedDisk`'s own
+    /// `Disk`-seam contract coverage.
+    #[tokio::test]
+    async fn encrypted_fs_segment_store_satisfies_the_contract() {
+        let dir = unique_tmp_dir();
+        let raw = FsSegmentStore::new(&dir);
+        let key = crate::EncryptionKey::from_bytes([0x42; 32]);
+        let store = crate::EncryptedSegmentStore::open(raw, DiskSaltRng, key)
+            .await
+            .expect("open a fresh store with a key");
+        crate::test_support::assert_segment_store_contract(&store).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The real filesystem, real-disk end-to-end proof of the three loud
+    /// mismatch directions plus "the raw bytes on disk are not plaintext" —
+    /// the `SegmentStore` counterpart of `EncryptedDisk`'s own `ProdEnv`
+    /// mismatch coverage.
+    #[tokio::test]
+    async fn encrypted_fs_segment_store_marker_mismatch_and_ciphertext_on_disk() {
+        let dir = unique_tmp_dir();
+        let key_a = crate::EncryptionKey::from_bytes([0xAA; 32]);
+        let key_b = crate::EncryptionKey::from_bytes([0xBB; 32]);
+
+        // Fresh store, key A: initializes and writes real ciphertext to disk.
+        {
+            let raw = FsSegmentStore::new(&dir);
+            let store = crate::EncryptedSegmentStore::open(raw, DiskSaltRng, key_a.clone())
+                .await
+                .expect("open with key A");
+            store
+                .put(
+                    "t/label/1/0",
+                    b"a plaintext value nobody should see on disk",
+                )
+                .await
+                .expect("put");
+        }
+        let on_disk = tokio::fs::read(dir.join("t/label/1/0"))
+            .await
+            .expect("read raw file");
+        assert!(
+            !on_disk
+                .windows(b"a plaintext value".len())
+                .any(|w| w == b"a plaintext value"),
+            "the plaintext value must never appear verbatim on disk"
+        );
+
+        // Reopening with the wrong key is refused.
+        {
+            let raw = FsSegmentStore::new(&dir);
+            let err = crate::EncryptedSegmentStore::open(raw, DiskSaltRng, key_b)
+                .await
+                .map(|_| ())
+                .expect_err("the wrong key must be refused");
+            assert!(err.to_string().contains("does not match the key"));
+        }
+
+        // Reopening with no key at all is refused (encrypted store, no key).
+        {
+            let raw = FsSegmentStore::new(&dir);
+            let err = crate::verify_or_init_segment_store_marker(&raw, &DiskSaltRng, None)
+                .await
+                .expect_err("no key against an encrypted store must be refused");
+            assert!(err.to_string().contains("no --encryption-key was given"));
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // A key against a fresh, genuinely plaintext store (one real object,
+        // no marker) is refused too.
+        let dir2 = unique_tmp_dir();
+        {
+            let raw = FsSegmentStore::new(&dir2);
+            raw.put("some/object", b"plaintext")
+                .await
+                .expect("put plaintext");
+            let err = crate::EncryptedSegmentStore::open(raw, DiskSaltRng, key_a)
+                .await
+                .map(|_| ())
+                .expect_err("a key against a plaintext store must be refused");
+            assert!(err.to_string().contains("already holds unencrypted"));
+        }
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
     /// Ids map to nested subdirectories (the production shape,
     /// `{table}/{label}/{tablet}/{epoch}`), created on demand, and the bytes
     /// really land on disk at the expected nested path.
