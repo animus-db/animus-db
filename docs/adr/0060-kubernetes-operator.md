@@ -336,11 +336,12 @@ conventional Kubernetes controller status shape, nothing bespoke.
   bootstrap needs a quorum of pods up together, not a strict one-at-a-time
   rollout — see Bootstrap, below), `volumeClaimTemplates` for
   `/var/lib/animus`, readiness **and** liveness probes both on
-  `GET /admin/health` (ADR 0020), and
-  `terminationGracePeriodSeconds: 90` — `shutdown_graceful()` can take
-  tens of seconds on a group with in-flight work, and Part 1's SIGTERM fix
-  is only useful if Kubernetes actually waits long enough for it to
-  finish.
+  `GET /admin/health` (ADR 0020) — **amended 2026-09-07, issue #710: the
+  two probes point at different routes now, see this ADR's own amendment
+  below** — and `terminationGracePeriodSeconds: 90` —
+  `shutdown_graceful()` can take tens of seconds on a group with in-flight
+  work, and Part 1's SIGTERM fix is only useful if Kubernetes actually
+  waits long enough for it to finish.
 - A **NetworkPolicy** restricting every non-`dynamo` port to traffic from
   the cluster's own pods (plus the operator itself, for its own admin-API
   reconciliation reads) — the concrete enforcement of the trusted-network
@@ -1278,3 +1279,68 @@ admission webhook](0070-operator-admission-webhook.md)**. `crates/
 animus-operator/CLAUDE.md` and `deploy/operator/README.md` carry the
 crate-local/deploy-facing detail; `docs/roadmap.md`'s S-07 section is now
 fully closed (items b/c/d/e all landed).
+
+## Amendment (2026-09-07, issue #710) — liveness and readiness split
+
+This ADR's own Decision, above, put **both** the `readinessProbe` and the
+`livenessProbe` on `GET /admin/health` (ADR 0020) — differing only in
+threshold, never in route. That was wrong for liveness specifically:
+`/admin/health` 503s until the node's control Raft has had a leader
+recently (ADR 0020's own issue #595 hysteresis amendment), which is
+exactly the readiness signal — a caller should not be routed to a node
+with no known leader — but is not a liveness signal, since a perfectly
+healthy, still-joining process can legitimately have no known leader for a
+while.
+
+Concretely: a pod recreated by the config-hash rolling restart (S-07d
+groundwork, or any `spec.controlNodes` growth pod) has **no** control
+leader until this operator's own `advance_control_growth`
+(`controller.rs`) admits it as a voter — which happens at most once per
+30s reconcile, and only once the pod's own admin port reports `role:
+"combined"` via `GET /admin/config` (`discover_control_voters`
+deliberately reads that static, leader-independent view rather than
+`/admin/health`, for the identical reason). With both probes on
+`/admin/health`, a pod could sit past the `livenessProbe`'s failure window
+(`initialDelaySeconds: 30` + `periodSeconds: 10` × `failureThreshold: 6` —
+an 80s-and-counting window) while genuinely, correctly still joining. The
+kubelet's only response to a liveness failure is a hard restart — so a
+healthy process got `SIGTERM`'d, its join reset, and if the next attempt
+also outran the same window the pod cycled indefinitely
+(`CrashLoopBackOff`, paced by the liveness thresholds). Evidence:
+e2e-kind run 34104780977 job 101687188395 — `restarts=0→6` at ~80s
+intervals, each killed instance's own `--previous` logs reading `"node
+3/4 up (CP) ... ready"` immediately followed by a clean `shutting down` /
+exit 0 (never a crash: `wait_for_ctrl_c` is `animusd`'s only exit-0 path,
+so every one of these was `SIGTERM`-driven). Issue #705 is the prior
+investigation that surfaced this exact restart-storm symptom (three clean
+exits over ~4 minutes on a freshly-promoted combined-role pod) without
+pinning down the `SIGTERM`'s source; #710 is the root cause and this fix.
+
+**Fix**: `animusd::admin` gains `GET /admin/live` — unconditionally `200`
+whenever the admin server is up enough to answer, independent of
+control-leader knowledge, tablet hosting, or node role (`control_leader_
+recent` rides along as a pure diagnostic, mirroring `/admin/health`'s own
+field, never affecting the status code). `desired::statefulset::
+admin_probe` (`animus-operator`) now takes an explicit `path`:
+`readinessProbe` keeps `GET /admin/health`, `livenessProbe` moves to
+`GET /admin/live`. The liveness thresholds themselves are unchanged — this
+is a route fix, not a timing fix; a genuinely wedged process (one that
+stops answering the admin port at all) still fails `/admin/live` and still
+gets restarted, exactly as a liveness probe should.
+
+**General lesson** (also recorded in `docs/engineering-lessons.md`): a
+Kubernetes `livenessProbe` must never gate on a distributed-consensus
+signal that a healthy, correctly-behaving process cannot satisfy alone (an
+election, a quorum, a leader) — only `readinessProbe`/`startupProbe` may.
+Liveness exists to catch a genuinely wedged process; the kubelet's only
+response to a liveness failure is a hard restart, which cannot fix "no
+quorum yet" and actively makes it worse.
+
+See `docs/adr/0020-admin-interface.md`'s matching 2026-09-07 amendment for
+the `GET /admin/live` route's own account (route table entry, handler,
+`AdminHost` trait surface) and `crates/animus-operator/CLAUDE.md`'s
+"Probes: readiness vs. liveness" section for the crate-local detail.
+Regression: `crates/animusd/tests/admin_endpoint.rs`'s
+`admin_live_is_200_while_a_genuinely_leaderless_admin_health_is_503` and
+`crates/animus-operator/src/desired/statefulset.rs`'s
+`probes_target_admin_health_and_admin_live_on_admin_port`.
