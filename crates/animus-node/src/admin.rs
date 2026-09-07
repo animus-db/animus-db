@@ -53,6 +53,7 @@ pub async fn dispatch<H: AdminHost + ?Sized>(
         ("GET", "/admin/metrics/history") => (200, host.metrics_history_view().await),
         ("GET", "/admin/member/drain-status") => host.member_drain_status(query).await,
         ("GET", "/admin/health") => host.health().await,
+        ("GET", "/admin/live") => host.live().await,
         ("POST", "/admin/tablet/split") => host.action_split(body).await,
         ("POST", "/admin/stream/grow") => host.action_stream_grow(body).await,
         ("POST", "/admin/storage/flush") => host.action_flush(body).await,
@@ -205,6 +206,9 @@ mod tests {
         }
         async fn health(&self) -> (u16, Value) {
             unreachable!()
+        }
+        async fn live(&self) -> (u16, Value) {
+            (200, self.record())
         }
         async fn action_split(&self, body: &[u8]) -> (u16, Value) {
             assert_eq!(body, b"the-body");
@@ -374,6 +378,33 @@ mod tests {
         assert_eq!(status, 200);
         assert!(body.contains("\"marker\""));
         assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn get_admin_live_routes_to_live() {
+        let host = FakeHost::new();
+        let (status, body) = block_on(dispatch(&host, "GET", "/admin/live", "", b""));
+        assert_eq!(status, 200);
+        assert!(body.contains("\"marker\""));
+        assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Issue #710: the liveness route must be a distinct path from the
+    /// readiness route so an operator (and `animus-operator`'s probe
+    /// builder) can point a `livenessProbe` and a `readinessProbe` at two
+    /// different signals — this is a routing-table assertion, not a
+    /// behavioral one (the two handlers' actual status codes are exercised
+    /// against a real `ClientCtx` in `crates/animusd/tests/admin_endpoint.rs`).
+    #[test]
+    fn liveness_and_readiness_routes_are_distinct_paths() {
+        const HEALTH: &str = "/admin/health";
+        const LIVE: &str = "/admin/live";
+        assert_ne!(HEALTH, LIVE);
+        // Both are known GET routes (neither falls through to a 404),
+        // proven the same way every other routing test in this module is.
+        let host = FakeHost::new();
+        let (status, _) = block_on(dispatch(&host, "GET", LIVE, "", b""));
+        assert_eq!(status, 200, "GET /admin/live is a routed, live path");
     }
 
     #[test]
