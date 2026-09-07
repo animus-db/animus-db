@@ -365,6 +365,56 @@ binary for a build-time-only JSON shape. **Keeping that mirror in sync with
   see that file if `cargo deny check` ever flags it again after a `kube`
   version bump changes its dependency shape.
 
+## Probes: readiness vs. liveness (issue #710, 2026-09-07)
+
+`desired::statefulset::admin_probe` builds both probes off one shared
+`HTTPGetAction` shape (port, TLS scheme) but takes an explicit `path`
+argument — **`readinessProbe` on `GET /admin/health`, `livenessProbe` on
+`GET /admin/live`**, deliberately different routes since this date, not
+just different thresholds as before.
+
+Why they must differ: `/admin/health` (`animusd::admin`, ADR 0020) 503s
+until the node's control Raft has had a leader recently (issue #595's
+`leader_within` hysteresis) — correct for readiness (don't route traffic
+to a node with no known leader), wrong for liveness. A pod recreated in
+the combined role by the config-hash rolling restart (or a fresh
+`spec.controlNodes` growth pod) has **no** control leader until this
+operator's own `advance_control_growth` (`controller.rs`) adds it as a
+voter — which happens at most once per 30s reconcile, and only after the
+pod's own admin port reports `role: "combined"` via `GET /admin/config`
+(deliberately the static, leader-independent view — see
+`discover_control_voters`'s doc). A healthy, correctly-joining pod can
+legitimately sit past a `livenessProbe`'s failure window with
+`/admin/health` still `503`; pointing liveness at it turns an ordinary
+join into a kubelet `SIGTERM` of a healthy process, which restarts the
+join and can cycle indefinitely (`CrashLoopBackOff`, each cycle paced by
+the liveness thresholds). Evidence: e2e-kind run 34104780977 job
+101687188395 — `restarts=0→6` at ~80s intervals (the liveness
+`initialDelaySeconds`+`periodSeconds`×`failureThreshold` window), the
+`--previous` logs of each killed instance showing `"node 3/4 up (CP) ...
+ready"` immediately followed by a clean `shutting down` / exit 0 (never a
+crash — `wait_for_ctrl_c` is `animusd`'s only exit-0 path, so every one of
+these was `SIGTERM`-driven). Issue #705 is the prior investigation that
+surfaced this exact restart-storm symptom without pinning down the
+SIGTERM source; #710 is the root cause and this fix.
+
+`animusd::admin` exposes the new route as `GET /admin/live`: always `200`
+whenever the admin server can answer at all, carrying `control_leader_recent`
+purely as a diagnostic (mirrors `/admin/health`'s own field, never gates
+the status code). See `crates/animusd/CLAUDE.md`'s admin section and
+`docs/adr/0060-kubernetes-operator.md`'s 2026-09-07 amendment for the full
+account, and `crates/animus-operator/src/desired/statefulset.rs`'s own doc
+comments (`admin_probe`, the `LIVENESS_*`/`READINESS_*` constants) for the
+in-code version of this note.
+
+**General lesson** (also in `docs/engineering-lessons.md`): a Kubernetes
+`livenessProbe` must never gate on a distributed-consensus signal that a
+healthy, correctly-behaving process cannot satisfy alone (an election, a
+quorum, a leader) — only `readinessProbe`/`startupProbe` may. Liveness
+exists to catch a genuinely wedged process; the kubelet's only response to
+a liveness failure is a hard restart, which cannot fix "no quorum yet" and
+actively makes it worse.
+
 ## TLS (ADR 0064 commit 3)
 
 `AnimusClusterSpec.tls: Option<TlsSpec>` (`crd.rs`), two mutually exclusive
@@ -390,13 +440,16 @@ Either shape resolves to the same `Secret` name
 - `desired::statefulset::build` mounts the resolved `Secret` read-only at
   `/etc/animus/tls` on every pod — identical mount for either shape.
 - **2026-09-05**: `desired::statefulset::build` also switches the
-  readiness/liveness probes' `GET /admin/health` to `scheme: HTTPS` when
-  `spec.tls` is set (admin is server-only TLS, so a plaintext kubelet probe
-  against a TLS-only listener fails the handshake server-side every probe
-  period and the pod never goes Ready — the bug the `e2e-kind-tls` job's
-  first real CI run caught, run 33963360763). The kubelet's HTTPS probe
-  scheme does not verify the server certificate, so this needs no CA
-  plumbed into the kubelet itself.
+  readiness/liveness probes' `scheme` to `HTTPS` when `spec.tls` is set
+  (admin is server-only TLS, so a plaintext kubelet probe against a
+  TLS-only listener fails the handshake server-side every probe period and
+  the pod never goes Ready — the bug the `e2e-kind-tls` job's first real CI
+  run caught, run 33963360763). The kubelet's HTTPS probe scheme does not
+  verify the server certificate, so this needs no CA plumbed into the
+  kubelet itself. **Since 2026-09-07 (issue #710) the two probes no longer
+  share a route**: `readinessProbe` stays on `GET /admin/health`,
+  `livenessProbe` moved to `GET /admin/live` — see the probe section below
+  for why.
 - `desired::cluster_config::build_cluster_config` gives every node's
   `RoleAddrs` the identical `TlsSection` (`tls_section()`), pointing at
   `/etc/animus/tls/{tls.crt,tls.key,ca.crt}` — baked into the generated
