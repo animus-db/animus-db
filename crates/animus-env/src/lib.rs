@@ -672,6 +672,25 @@ pub trait Env: Clock + Rng + Network + Disk + Spawner + Clone + Send + Sync + 's
     fn metrics(&self) -> MetricsHandle {
         MetricsHandle::noop()
     }
+
+    /// Merge one peer's address into this env's own peer book (ADR 0037
+    /// PR3's incremental control-membership-growth helper) — a **no-op
+    /// default** here, overridden by [`ProdEnv`]'s real network transport
+    /// (see its own inherent `merge_peer` for the actual behavior and its
+    /// documented scope limit). Additive with a default for the identical
+    /// reason [`metrics`](Self::metrics) is: `SimEnv` (and any other
+    /// non-`ProdEnv` implementor) keeps compiling and behaving identically
+    /// without change — its `send`/`recv` route by `NodeId` directly, with
+    /// no address book of its own to maintain, so a no-op is the correct
+    /// behavior there, not merely a stand-in.
+    ///
+    /// Exists on the trait (ADR 0061 rung D3 PR 2a) so a caller reaching a
+    /// peer-book update through a **generic** `E: Env` handle — e.g.
+    /// `animusd`'s `ClientCtx<E, R>::admin_add_control_member`, once its own
+    /// `ClusterEdgeState::control` field widened from a fixed
+    /// `RaftNode<ProdEnv>` to a generic `RaftNode<E>` — still type-checks
+    /// for any `E`, not just `ProdEnv`.
+    fn merge_peer(&self, _id: NodeId, _addr: String) {}
 }
 
 /// Convenience extension for spawning an `async` block without writing

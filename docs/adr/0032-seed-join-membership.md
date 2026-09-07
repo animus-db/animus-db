@@ -424,3 +424,35 @@ id's collision fails loudly instead of racing on address equality. This is
 the same generalization ADR 0036 already argued for (server-side CAS
 allocation over a client-side guess) — ADR 0040 extends it to a client that
 can also propose its own name, which ADR 0036's design had no room for.
+
+## Amended 2026-09-07 — deterministic coverage under ADR 0061 (C-04 D4 PR 4)
+
+This ADR's own PR3 decommission sequence — drain, then `RemoveMember`, with
+placement re-homing every drained replica onto the survivors — now has
+deterministic, seed-reproducible coverage: `crates/animusd/src/
+sim_cluster.rs`'s `SimCluster::drain`/`SimCluster::remove` drive this ADR's
+own sequence through the REAL production primitives (`ClientCtx::
+admin_drain`/`admin_remove_member`, unchanged and `<E, R>`-generic since
+ADR 0061 rung C5 step 3a — not a fixture-side reimplementation), converged-
+or-timeout polled on the drained node's own hosted-tablet set going empty
+and, for `remove`, on every node's `Metadata::members` no longer naming it.
+Scenario (c) in `crates/animusd/src/sim_cluster_growth.rs` (grow, wait for a
+rebalance-placed replica, then drain+remove the same node) proves the whole
+sequence end to end: replicas re-home onto the three original survivors at
+the original replication factor, no node is left hosting a zombie group
+(`assert_no_zombie_groups`, this ADR's own convergent-GC property reused
+from `sim_cluster_dynamo_table_ops.rs`), and — the "ids are never reused"
+property this ADR's own tablet/node-id discipline names — a later `grow`
+call mints a strictly higher node index than the one just removed, never
+reusing it. See `crates/animusd/CLAUDE.md`'s matching entry and ADR 0061's
+"D4 PR 4" amendment for the full account.
+
+This closes the last of the four D4 rungs C-04 named for behaviors with no
+deterministic coverage (auto-split, GC, the backup janitor, and this ADR's
+own join/growth/decommission sequencing) — see `docs/roadmap.md`'s C-04
+entry. What stays `ProdEnv`-only, unchanged by this coverage: every
+real-socket join (`--seed ADDR[,ADDR...]` discovery, `JoinInfo` polling, TCP
+listener binding), config-file resolution, and DNS-based seed addressing
+(`crates/animusd/tests/seed_join_hostname.rs`/`advertise_host.rs`, both
+untouched) — none of those are reachable from a `SimCluster`-based fixture,
+decommission or not.

@@ -558,3 +558,54 @@ change: `AnimusClusterSpec.quiesceAfterSecs` now emits into the generated
 CLI flag on the combined branch only — closing the exact data-role gap fix
 1 above describes, for every `AnimusCluster`-managed deployment. See
 `crates/animus-operator/CLAUDE.md`'s CLI-flag-support table.
+
+## Amendment (2026-09-07, issue #676): reaches `join`/`data --seed`/`--cluster-control`+`--cluster-data` too
+
+The S-06 amendment above closed `animusd data --config`'s reach gap but
+left three other entry points hardcoded to `Duration::ZERO` (quiescence
+off) regardless of any flag: `join`, `data --seed`, and
+`--cluster-control`+`--cluster-data`'s in-process split-deployment dev
+path. Since `--quiesce-after` defaults ON at every other entry point
+(`DEFAULT_QUIESCE_AFTER_SECS`, 5s), this meant a seed-joined node or a
+`--cluster-control`+`--cluster-data` data-role node never actually
+quiesced — silently, with no flag to fix it — an inconsistency issue #676
+opened against alongside the identical gaps on `--heartbeat-batch`/
+`--shared-wal` (ADR 0044/ADR 0028's own matching 2026-09-07 amendments).
+
+Closed the same way as those two siblings, since all three knobs share one
+wrapper chain end to end:
+
+- **`join`/`data --seed`**: `animusd::run_node_join`/`run_node_data_join`
+  keep their own original arity and now default internally to
+  `Duration::from_secs(DEFAULT_QUIESCE_AFTER_SECS)` instead of hardcoding
+  `Duration::ZERO`; a new widened sibling,
+  `run_node_join_with_settings`/`run_node_data_join_with_settings`, takes
+  an explicit `quiesce_after: Duration` for `main.rs`'s own `join`/
+  `data --seed` CLI dispatch, which gained `--quiesce-after SECS` for the
+  first time (validated against `MIN_QUIESCE_AFTER`, the identical
+  issue-#302 floor check every other entry point already applies).
+- **`--cluster-control`+`--cluster-data`**: `start_split_cluster_with_
+  growth` gained a trailing `quiesce_after: Duration` parameter, threaded
+  from `run_in_process_split_cluster`'s own CLI dispatch (the `--quiesce-
+  after` flag was already parsed by `run`'s shared parser — it simply
+  wasn't threaded past that dispatch branch before this amendment).
+  `start_split_cluster_with_orphan_sweep_after` (the narrower wrapper
+  `tests/cluster_split.rs` calls directly) keeps hardcoding
+  `Duration::ZERO`, unaffected — the same "narrower test wrapper stays at
+  its own original semantics" convention this ADR's own S-06 amendment
+  already used for `run_data_config` before *its* gap closed.
+
+A control-only node still has no route to this knob at all — not a gap,
+structurally inapplicable, since it has no data plane to quiesce
+(`animusd::config::ClusterSettings`'s own applicability table already
+named this).
+
+Regression: `crates/animusd/tests/join_data_seed_settings_reach.rs::
+data_seed_join_threads_quiesce_after_to_admin_config` (`--quiesce-after`
+on `data --seed`, observed via `GET /admin/config`'s `quiesce_after_ms`)
+and `crates/animusd/tests/split_cluster.rs::cluster_control_data_threads_
+quiesce_after_to_admin_config` (the identical observable on the
+split-deployment dev path, plus confirming a control-only node's own
+`/admin/config` never reports the field). See `crates/animusd/CLAUDE.md`'s
+"Quiescence" section for the current, complete per-entry-point
+enumeration.

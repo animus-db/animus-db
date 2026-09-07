@@ -4174,6 +4174,100 @@ debugging anything that feels like it might have happened before.
   map snapshot; the fix (as here) was converge-or-timeout — keep writing
   until the count target is met, bounded by a generous stall timeout,
   never widen the window to move the threshold.
+- **A third costume of the same bug, in `animus-control` itself, issue
+  #741**: `crates/animus-control/tests/prod_liveness.rs`'s
+  `large_metadata_catch_up_stays_live` polled `node0.snapshot_index() >=
+  200 && node1.snapshot_index() >= 200` on a flat 600×50ms (30s) deadline,
+  and failed once on CI (`prod-liveness-scattered`) with `node0 snap=0,
+  node1 snap=64` — one replica's own apply task made **zero** forward
+  progress for the entire 30s window while its sibling made some (but not
+  enough). `snapshot_index()` only advances when the ADR 0038 apply task
+  (`meta_apply_and_compact`, `node.rs`) compacts — gated on **its own**
+  `engine_applied_index` crossing `SNAPSHOT_THRESHOLD` past the current
+  base, a task the consensus loop deliberately never waits on (see this
+  file's own `node.rs` doc comment: decoupling apply from `drive` is what
+  keeps a slow apply pass from stalling Raft's heartbeat/election
+  servicing). That decoupling is exactly what removes any
+  contention-independent bound on how long `snapshot_index()` takes to
+  advance — the identical DRIVER_APPLIED shape this section's own entries
+  above already name for `animusd`'s `engine_applied_index`-gated reads,
+  now confirmed in the plane that *originates* the mechanism, not just a
+  downstream consumer of it. Investigated live: 20/20 passed locally under
+  3 CPU-pinning `yes` spinners on a 4-core box, but one run finished in
+  27.5s against the 30s deadline — a genuine near-miss, not a clean
+  margin — and a from-scratch red-before attempt against the un-fixed code
+  under heavier (6-spinner) contention independently pushed the *other*
+  phase of the same test (node 2's own 12s catch-up budget) to 10.14s,
+  confirming apply/driver-loop timing in this test is measurably
+  contention-sensitive throughout, consistent with (never contradicting)
+  the CI failure's own asymmetric signature. Fixed the same way as the two
+  entries above: replaced the flat deadline with a progress-gated poll —
+  track each node's own `engine_applied_index()` (the exact counter
+  compaction is gated on) between ticks, and fail only once **both**
+  nodes' watermarks have made zero forward progress for a generous idle
+  window (`COMPACT_IDLE_STALL`, 60s, matching `animusd/tests/support::
+  IDLE_STALL_TIMEOUT`'s own convention) with the target still unmet, or a
+  much larger overall backstop (`COMPACT_OVERALL_BACKSTOP`, 150s) expires
+  — a livelock guard, not the normal exit path. The enclosing test's own
+  `timeout(..)` budget was widened from 90s to 210s to give this poll room
+  to legitimately use its new backstop; this is *not* "a longer deadline on
+  the wrong precondition" (the thing Session operating mode forbids) —
+  the precondition itself changed from "elapsed wall-clock time" to
+  "apply-task forward progress," and the poll fails fast the moment that
+  progress genuinely stops, regardless of how much of the outer budget is
+  left. No `SimEnv` regression was added: `wal_compaction.rs` and
+  `install_snapshot.rs` already prove the compaction *mechanism* (and its
+  O(chunk) `InstallSnapshot` cost) deterministically under `SimEnv`: this
+  file's own module doc states plainly that the real-thread integration
+  guard exists precisely because *scheduling contention on real threads*
+  is the one thing `SimEnv`'s virtual clock structurally cannot represent
+  — there is no interleaving to encode as a seed here, only real elapsed
+  time under real OS contention, which is this test's whole reason for
+  being a `ProdEnv` test at all.
+
+- **`SimCluster`'s hand-hosted tablets have no `Metadata::members` catalog
+  behind them — a legacy-registered (no `CreateTable`) table's
+  auto-provision silently mints an empty-replica-set tablet that can
+  never be hosted (ADR 0061 rung D3 PR 1).** Converting `crates/animusd/
+  tests/dynamo_extended.rs::concurrent_conditional_puts_one_wins` (a
+  `ProdEnv` test that never calls `CreateTable`, relying instead on
+  `dynamo::legacy_register`'s auto-registration of an unrecognized table
+  on its first `PutItem`) to `SimCluster` hung every write on "table
+  tablet did not provision in time." Root cause: `ClientCtx::
+  provision_tablet` — the auto-provision every first write to a
+  brand-new table goes through — picks the tablet's *initial replica
+  set* from `Metadata::members`, the node-registration catalog a real
+  deployment's `MetaCommand::RegisterNode` populates. `SimCluster::new`
+  never proposes that command at all — its own nodes are wired directly
+  into each node's `ClusterEdgeState`, never registered into `Metadata` —
+  so `members` is permanently empty in this fixture, and a
+  legacy-table's lazy auto-provision computes a **zero-length** replica
+  set: a `CreateTablet` nobody will ever host, so the write's own route
+  wait times out forever, deterministically, every run. This is a
+  distinct gap from the already-documented "GSI/LSI query, wire-level
+  `CreateTable`, `TransactWriteItems`" capability gaps `dispatch_item_op`
+  itself has — `provision_tablet` and `dispatch_item_op` are different
+  code paths, so a test needing neither GSI/LSI nor `CreateTable` nor
+  Transact can still hit a *third*, independent `SimCluster` fixture
+  limitation. The fix used here: route the test through `SimCluster::
+  create_table` (the fixture's own supported table-creation path, which
+  picks replicas directly rather than through `Metadata::members`)
+  instead of relying on legacy auto-registration — a fixture data-shape
+  change (a real composite `pk`/`sk` schema instead of a legacy one, so
+  every item needs an explicit `sk`), not a change to what the test's
+  own race actually proves. Widening `SimCluster::new` to also register
+  nodes into `Metadata::members` (closing the gap at its root, letting a
+  legacy-registered table's auto-provision work like it does on
+  `ProdEnv`) is a real fixture-PR candidate, deliberately not attempted
+  here — this was a test-conversion PR, not a fixture-widening one. The
+  general lesson: when converting a `ProdEnv` test that relies on an
+  *implicit* server-side behavior (auto-provisioning, auto-registration,
+  lazy anything) rather than an explicit setup call, check whether the
+  sim fixture's own construction path actually populates every piece of
+  replicated state that implicit behavior reads — a fixture can compile,
+  run, and simply hang forever rather than erroring, which makes this
+  class of gap slower to diagnose than a missing-capability compile error
+  or a clean rejection would be.
 
 ### Code patterns
 - **A retryable-shaped error (the house `"; retry"` suffix) surviving string
@@ -20858,6 +20952,21 @@ against the previous one, route through the system's own forwarding/
 hint-chasing instead of re-deriving the answer from a local accessor that
 has no way to have heard it yet.**
 
+**Amendment (2026-09-07, ADR 0061 rung D4 PR 2): the crashed node's own
+stale belief is not merely a transient race window — it is PERMANENT for
+as long as that node stays crashed (muted).** A `SimCluster::crash`ed
+node's `RaftKvNode` never receives a higher-term message telling it to
+step down (nothing gets through the mute), so it keeps reporting itself
+leader forever, not just in the brief post-crash window the original
+finding above describes. A scenario that specifically needs a NEW leader's
+own id (not just "route a write correctly," which `cp_kind_write_raw`'s
+hint-chasing already handles per the original finding) must scan only the
+live node ids directly (`is_leader_local` per surviving id), never
+`leader_index_of`/`SimClusterHandle::leader_index_of` unfiltered — a poll
+loop that keeps calling the unfiltered accessor spins to its own timeout,
+finding the same crashed leader on every single pass, never converging.
+(`sim_cluster_auto_split.rs`'s own scenario d hit exactly this.)
+
 ## A shared list-append checker has no "weak read" flag — exclude an eventually-consistent observation from its graph and check it against convergence instead, don't teach the checker a new mode (ADR 0061 rung D2 PR 2)
 
 `sim_cluster_dynamo_corpus.rs` is the first corpus to drive `ConsistentRead:
@@ -20914,6 +21023,924 @@ separate upsert/provisioning write — it is both fewer requests and fewer
 places for a corpus's own bookkeeping to drift from the server's actual
 state.
 
+## A "widen this type" scope cut turned out to already be widened — trace the type before believing an ADR's own prior estimate (ADR 0069 "As-built: cluster store", issue #680)
+
+ADR 0069's PR 2 scope-cut paragraph said encrypting the default `cluster`
+segment/backup store would mean "widening `ClusterSegmentStore`'s own
+concrete type parameter... a larger, structurally separate change (every
+call site that pattern-matches the `Cluster` variant would need to thread
+a second generic parameter through `animus-cp-data`'s own
+`cluster_segment_store` module)." That estimate was never actually
+checked against the type's own definition — `ClusterSegmentStore<E: Env,
+S: SegmentStore + Clone + Send + Sync + 'static>` was **already** generic
+over its local building block `S`; nothing inside `animus-cp-data` ever
+named it concretely to `FsSegmentStore` — only `animusd`'s own two
+construction sites (`SegmentStoreHandle::Cluster`/`BackupStoreHandle::
+Cluster`'s field type) did. Closing the gap was therefore a single new
+`animusd`-local type (`LocalSegmentStore`, a two-arm `Plain`/`Encrypted`
+enum delegating `SegmentStore`) occupying that existing parameter — zero
+changes to `animus-cp-data`, and `SegmentStoreHandle::Cluster`/
+`BackupStoreHandle::Cluster` stayed one variant each (never the
+`EncryptedCluster` fourth-variant shape the task's own design guidance
+flagged as the less-preferred fallback). General lesson: an ADR's own
+"this would be a bigger change" scope-cut reasoning is a snapshot of what
+looked true at the time it was written, not a fact to inherit uncritically
+into a follow-up — before accepting a documented "needs widening a type
+parameter across N call sites" estimate, `grep`/read the type's own
+definition first. The actual size of a widening is frequently smaller
+than a prior pass estimated, especially when (as here) the type in
+question was already built generic for an unrelated reason (here,
+`ClusterSegmentStore` being generic over `S` was originally so a `SimEnv`
+test could pair it with `SimSegmentStore` — a design decision made for
+testability that happened to also make this later encryption task cheap).
+
+A second, narrower lesson from the same change: a node's `Disk`-seam
+marker directory (`<node dir>/internal`, PR 1's own check) and its
+`SegmentStore`-seam marker directories (`<node dir>/segments`,
+`<node dir>/backups`, PR 2's) are **sibling** subdirectories of one
+`--dir`, not the same directory — `Disk::list()`'s own non-recursive
+listing never sees into a sibling, so the two loud-refusal mechanisms
+genuinely operate independently on disk even though one `--encryption-key`
+covers both. This mattered for testing the new mechanism in isolation: a
+naive attempt to build a "key against an existing plaintext cluster
+store" fixture by copying a real node's whole data directory hit the
+Disk-seam's own refusal first (a real node that has ever written any
+WAL/engine content already carries the Disk-seam's own marker the moment
+a key is first configured, since both seams share the same node
+lifecycle in the common case) — masking the very check the test meant to
+prove. The fix was to construct a target directory carrying **only** the
+`segments`/`backups` subdirectory's own content (real objects, or a
+copied marker file), with no top-level marker and no `internal/`
+content at all — which a `Disk::list()` scan of the (from its own point
+of view) genuinely fresh top-level directory sails through regardless,
+reaching the new check specifically. Worth remembering for any future
+directory-marker-based loud refusal sharing a parent `--dir` with an
+existing one: know exactly which subdirectory each check scans before
+assuming a "restart with X" test naturally isolates the mechanism you
+think it does.
+
+## Widening a `pub` function with many test callers: mint a `_with_settings` sibling instead of adding parameters directly (issue #676)
+
+The layered-wrapper convention this file already documents (mint a thin,
+original-arity wrapper above the layer you're widening, so existing
+callers keep compiling) is usually applied to *private* or *narrow*
+wrappers a few callers use. `animusd::run_node_join`/`run_node_data_join`
+were a harder case: they are the crate's own outermost `pub` entry points
+for the join/seed paths, and — unlike an internal layer — had 8+ direct
+callers spread across this crate's own `tests/*.rs` (`seed_join.rs`,
+`seed_join_allocated.rs`, `data_join.rs`, `decommission.rs`,
+`split_placing_completion.rs`, `split_placing_two_replica_diff_e2e.rs`,
+`cluster_gt_rf_split_bench.rs`, `tests/support/mod.rs`'s own shared
+helpers used by still more files transitively). The task's own briefing
+anticipated the standard move here — widen the function directly, then
+fix the resulting `error[E0063]` fan-out at every enumerated call site —
+and that would have worked, but at real cost: 8+ files touched for a
+change whose actual goal (`join`/`data --seed` resolving the same
+on-by-default knobs `--config`/`--node` already does) has nothing to do
+with any of those tests' own scope.
+
+**The cheaper move, when the widen target itself is the many-caller
+function**: keep it at its own original signature, but change what it
+does internally — resolve the new knobs to their production ON-by-default
+values (`DEFAULT_QUIESCE_AFTER_SECS`/`DEFAULT_HEARTBEAT_BATCH`/
+`DEFAULT_SHARED_WAL`) instead of the old hardcoded off-values — and mint a
+new, separate `pub` sibling (`run_node_join_with_settings`/
+`run_node_data_join_with_settings`) that takes the new parameters
+explicitly, for the one caller (`main.rs`'s own CLI dispatch) that
+actually needs to set them from a flag. This is the same "widen the
+innermost layer, default in the narrower one" shape as the standard
+layered-wrapper convention — the twist is which function plays which
+role: the widely-called function becomes the *outer*, defaulted layer
+(even though it used to be the widest-arity one), and the new function
+becomes the *inner*, fully-parameterized one CLI dispatch calls directly.
+Net result: zero test-fixture changes (confirmed by `cargo check -p
+animusd --tests` before and after — identical, no `E0063` anywhere), and
+every existing caller's behavior *improved* for free (the on-by-default
+posture bug the issue was about) without anyone having to touch those
+callers to get it.
+
+**When to reach for this over the "widen and fix every site" approach**:
+prefer minting a sibling specifically when (a) the function being widened
+is `pub` with call sites *outside* the module/crate doing the widening —
+not just narrower in-crate wrappers, where the direct-widen-and-fix
+approach is usually less code overall — and (b) there is a reasonable,
+already-established default value the existing callers should keep
+getting (here, the very `DEFAULT_*` constants the CLI itself already
+resolves an omitted flag to) rather than every caller needing to make a
+fresh decision. Reach for the standard "widen it, let the compiler
+enumerate every site" approach instead when there's no sane shared
+default (a genuinely new axis of behavior every caller must decide for
+itself) or when the type being widened is a data type (a struct literal),
+where a builder/sibling-constructor split is usually more awkward than
+just fixing the enumerated sites directly.
+
+## A "propose locally if leader" fast path keyed on a `ProdEnv`-typed handle silently degrades to relay-to-self under any other `Env` (ADR 0061 rung D3 PR 2a)
+
+`ClientCtx::propose_schema` (`animusd/src/schema.rs`) is meant to propose
+locally when this node is the control-plane leader and relay one hop to
+the leader's node otherwise. The local-propose branch reads
+`self.edge.leader_handle()`, and `ClusterEdgeState<E>::control` — before
+this rung — was hardcoded `Arc<Mutex<Vec<RaftNode<ProdEnv>>>>` **regardless
+of the enclosing `ClientCtx<E, R>`'s own generic `E`**. Under `SimEnv` that
+field was therefore always empty, `leader_handle()` always answered
+`None`, and *every* schema proposal took the relay branch — including one
+issued on the node genuinely leading the control group, which then
+relayed `ProposeSchema` to **itself**; the receiving side's own
+`ProposeSchema` handler re-resolves the leader the identical way and
+re-relays, recursing until the caller's own timeout. This produced no
+compile error and no test failure for a long time, because nothing under
+`SimEnv` had previously exercised the local-propose path at all (every
+prior `SimCluster`/`ClientCtx<SimEnv, _>` fixture in this crate bypassed
+`propose_schema` entirely, proposing directly on a raw `RaftNode` handle
+instead) — the bug was latent, not merely undiscovered, for months of
+prior rungs.
+
+**The general shape to watch for**: a "propose/act locally if I'm the
+authority, else forward" fast path that is gated on a field or handle
+whose *type* is pinned to one concrete `Env`/backend implementation,
+inside a component that is otherwise `E`-generic. The type system cannot
+catch this — the code compiles and even runs correctly under the pinned
+concrete type (`ProdEnv` in production), so nothing *fails* until a
+second, different concrete type (`SimEnv`) is actually driven through that
+exact path for the first time. Grep for this shape specifically when
+generic-izing a component that used to be concrete: a field/handle whose
+declared type names a concrete `Env` implementor (not the generic `E`)
+inside an `impl<E: Env> Foo<E>` block is the tell — even if every existing
+caller happens to only ever instantiate `E = ProdEnv` today.
+
+**The fix pattern**: widen the field's type to the generic `E` and update
+every constructor to register a real `E`-typed handle (not just the
+`ProdEnv` one). Doing this can surface further concrete-type leaks
+elsewhere that only compiled because the *old* narrow field made a call
+site's own downstream value concrete too — see the next entry.
+
+## Widening a fixed-`Env` handle to generic `E` can break a downstream call site that only compiled because the old field was concretely typed (ADR 0061 rung D3 PR 2a)
+
+Immediately after widening `ClusterEdgeState<E>::control` from `RaftNode<
+ProdEnv>` to `RaftNode<E>` (previous entry), `cargo build` failed at
+`ClientCtx::admin_add_control_member`'s `leader.env().merge_peer(node,
+addr)` call: `merge_peer` is a plain **inherent** method on `ProdEnv`
+(real network-transport peer-book bookkeeping), not a trait method any
+other `Env` implementor has. Before the widening this compiled fine —
+`admin_add_control_member` lives inside a `impl<E: Env, R: RelayClient>
+ClientCtx<E, R>` block, but `leader: RaftNode<ProdEnv>` (fetched via the
+old, concretely-typed `leader_handle()`) was concrete *regardless of the
+enclosing E*, so calling a `ProdEnv`-only inherent method on it was
+perfectly valid Rust even inside a generic function body. Widening the
+field's type made `leader: RaftNode<E>` genuinely generic, and the
+inherent-method call stopped resolving for any `E` that isn't `ProdEnv`.
+
+**The lesson**: when generic-izing a field/handle that used to be
+concretely typed, don't stop at "does the crate compile with `E =
+ProdEnv`" (the only concrete instantiation that existed before) — a
+generic function body can quietly depend on that concreteness anywhere it
+reads the field, and the type checker only reports it once something
+actually tries to monomorphize at a *different* `E`. `cargo build -p
+animusd --lib` (concrete-only, `E = ProdEnv` everywhere) stayed green
+through the whole widening; only `cargo test -p animusd --lib --no-run`
+(which compiles the `#[cfg(test)]` `SimCluster` fixture, genuinely
+instantiating `ClientCtx<SimEnv, _>`) caught it. **Fixed by adding a
+default no-op method to the `Env` trait itself** (`Env::merge_peer`,
+mirroring `Env::metrics()`'s own existing "additive default, no
+implementor has to change" precedent) rather than special-casing the one
+call site — `ProdEnv`'s own trait impl delegates to the pre-existing
+inherent method (Rust's inherent-impl priority in method resolution means
+that delegation call reaches the inherent method, not itself, so this is
+not infinite recursion), and every other `Env` implementor gets a
+behaviorally-correct no-op (they have no peer-book concept to begin with,
+so "do nothing" is the *right* answer, not a stand-in). **The general
+move**: when a generic component's only real caller of some behavior is
+one specific `Env` implementor's own real-world mechanism, and a
+*different* `Env` genuinely has nothing sensible to do there, a default
+trait method is usually the right seam — not `#[cfg]`-gating the call site
+or threading a capability flag through.
+
+## A liveness detector's own "give a fresh member a synthetic first heartbeat" hardening means "was directly marked `Active`" is not "will stay `Active`" — a design assumption that needed empirical verification, not just re-stating (ADR 0061 rung D3 PR 2a)
+
+Populating `Metadata::members` for a `SimCluster` fixture (`RegisterNode`
+then `UpsertMember{status: Active}`) was planned on the stated assumption
+that "`UpsertMember{Active}` also sets `has_activated`, so the orphan
+sweep never reclaims the id, and `liveness_transitions` only visits ids
+the detector has heartbeats for, so a directly-activated member cannot
+flip back to `Down`." The first half is correct (`has_activated` really is
+sticky and really does protect against the *orphan sweep*, a genuinely
+different mechanism). The second half is **wrong**, and would have stayed
+wrong if taken on faith: `animus-control::node::detect_loop` has its own
+"phantom-member hardening" (ADR 0030) that gives any member found
+`Active`-but-**untracked** by the failure detector exactly one *synthetic*
+`FailureDetector::observe` the very first tick it notices one — so a
+member this fixture marks `Active` directly (never having sent a real
+heartbeat) gets exactly one fabricated liveness timestamp, which then ages
+out after `DETECT_TIMEOUT` (500ms) precisely like a real one would, and
+the detector proposes `UpsertMember{Down}` for it. Confirmed live: a
+member seeded this way flipped to `Down` well before a second wire
+`CreateTable` call (each burning that fixture's own `OP_BUDGET` = 12
+virtual seconds) ever reached `ClientCtx::provision_tablet`, which then
+found zero `Active` replica candidates and spun uselessly until its own
+commit-wait deadline — a real, load-bearing production behavior this
+fixture had never previously exercised (every earlier `SimCluster` test
+either used the hand-hosted DDL bypass, which never reads `Metadata::
+members` at all, or never provisioned a second table after enough virtual
+time had elapsed for the window to matter).
+
+**The lesson, restated for reuse**: a design-pass claim about what a
+*different* subsystem's mechanism does or doesn't do is a hypothesis, not
+a fact, until traced against that subsystem's own source — "X only visits
+Y" is exactly the kind of claim that a hardening/edge-case branch (here,
+"give a cold-tracked member some initial grace") can quietly falsify,
+because the hardening's own author was solving a *different* problem
+(protecting a genuinely fresh member from a false-negative liveness
+verdict) that happens to interact badly with a *synthetic* activation that
+was never going to be followed by a real heartbeat. When a task brief
+hands you a claim like this framed as already-established, grep the
+actual mechanism it's a claim about before building on it — in this case,
+`animus_control::node::detect_loop`'s own phantom-member-hardening block,
+a maybe 10-line span, would have shown the gap in under a minute. The fix
+itself was equally small once found: spawn the real `animus_control::
+node::heartbeat_loop` (the exact loop a production deployment already
+runs) on every fixture node, keeping every member's liveness genuinely
+current rather than working around the detector's own correct behavior.
+
+## Two independent local ID allocators in the same test fixture will eventually collide once a test exercises both paths in one run — derive both from the same live source of truth (ADR 0061 rung D3 PR 2a)
+
+`SimCluster` grew two ways to create a tablet over its lifetime: a
+hand-hosted path (`create_table_with_replication`, proposing `CreateTablet`
+directly with an id from the fixture's own local counter,
+`next_tablet_id`, starting at 1 and incrementing only on that method's own
+calls) and a wire-provisioned path (`ClientCtx::provision_tablet`, reading
+`Metadata::next_free_tablet_id()` — the *replicated*, live allocator —
+fresh on every attempt). Every test before this rung used exactly one of
+the two paths per cluster, so the two counters' id spaces never had reason
+to overlap. The first test to use *both* in one cluster (three wire-created
+tables, then one hand-hosted table for an unrelated reason — seeding a
+table whose *name* needed to match a reserved shape) reproduced the
+collision immediately: the hand-hosted call proposed `TabletId(1)`, a real
+tablet id another table already held (from the three wire creates ahead of
+it), the propose was rejected ("tablet already exists"), and the
+hand-hosted method's own convergence poll timed out waiting for a tablet
+that would never appear under that name.
+
+**The general lesson**: two allocators for the "same kind of thing" in one
+fixture/system, each independently monotonic, are safe only as long as
+nothing ever exercises both in the same scope — which is exactly the kind
+of invariant that erodes silently as a fixture grows new capabilities,
+with no compiler or type-level signal that it has. The fix is never "make
+the two counters agree" (a synchronization problem with its own races) but
+"delete the second allocator and read the *one* real source of truth
+fresh, every time" — here, deriving `create_table_with_replication`'s own
+tablet id from `self.controls[leader].metadata().next_free_tablet_id()`
+instead of its own field, the identical live read `provision_tablet`
+already did. Worth grepping for on any test fixture that grows a second
+"quick and dirty" id-minting shortcut alongside an already-existing
+"ask the real system" one — the two are a latent collision waiting for the
+first test that happens to combine them.
+
+## A control plane's own correct, unconditional load-balancing pass is a real hazard for any test fixture that hand-hosts (or partially hosts) tablets without a full reconciler behind it (ADR 0061 rung D3 PR 2a)
+
+Once a test fixture (`SimCluster`) populates real cluster membership and a
+wire-provisioned tablet carries a genuine placement policy, the
+production control-plane leader's own `reconcile_loop`/`rebalance_
+placement` — unconditional, spawned by `RaftNode::start` itself, with no
+opt-out for a test harness — is live over it and will act exactly as
+designed: on a cluster with more members than a tablet's replication
+factor, `rebalance_placement`'s load-balancing pass will genuinely move a
+tablet's replica set to spread load across an otherwise-idle member,
+proven deterministic across 25 seeds in this investigation (the exact same
+two moves, every time, given the exact same starting shape). This is not
+a bug in the control plane — it is the control plane doing precisely its
+documented job. The hazard is entirely on the *fixture* side: any
+mechanism a fixture builds to physically host a tablet's replicas in
+response to `Metadata` (here, a minimal watcher standing in for the real
+per-node `Reconciler`) must handle **both directions** of a replica-set
+change — adding a newly-named replica's own hosting, *and* tearing down a
+dropped one's — or the fixture can produce a genuinely inconsistent,
+split-brain-shaped state (two different-membership consensus groups for
+one tablet id) with no fault injection at all, purely from ordinary
+placement rebalancing.
+
+**The general lesson**: when a test fixture stands up a partial,
+purpose-built substitute for a production reconciliation loop, audit it
+against every *direction* of change the real mechanism it's standing in
+for handles, not just the direction the fixture's own first use case
+happened to need (here: "host a newly-created tablet" was the need that
+motivated the watcher; "un-host a tablet whose replica set changed" was
+never on that need's own critical path, so it was never built, and the
+gap sat undiscovered until a scenario with genuine placement imbalance
+went looking for it). When the fixture's own limitation makes a class of
+otherwise-legitimate test scenario ((here: `node_count >
+MAX_REPLICATION_FACTOR`) unsafe, document the bound explicitly (in the
+fixture's own module doc and any per-crate guide) rather than leaving
+future test authors to discover it the same way this investigation did.
+
+## An empty-page short-circuit gate that runs before cursor validation makes that validation unreachable from one direction, in a fixture that can never make the gate false (ADR 0061 rung D3 PR 3a)
+
+`run_gsi_query`/`run_gsi_scan`'s own `!meta.has_table_tablet(&index_table)`
+gate — "the GSI's hidden table has no tablet yet, so answer empty rather
+than routing a read at a group that doesn't exist" — was added for
+`ProdEnv`, where it is a narrow, transient window: true only in the moment
+between `CreateTable` returning and the drain's first materialized row.
+Under `SimCluster` (ADR 0061 rung D1) that gate is not transient at all —
+`SimCluster` never spawns `index_drain::change_consumer_loop`, so a GSI's
+hidden table gets a tablet only via that loop's own lazy provisioning, and
+under this fixture that provisioning simply never happens. The gate is
+therefore **unconditionally true, forever**, for any GSI under `SimCluster`.
+
+The consequence was not just "a GSI `Query` reads back empty" (expected,
+and already documented as this rung's own scope boundary) — it also meant
+a cursor-shape check gated *behind* the same early return became
+unreachable from that one call direction specifically. Converting
+`cross_index_cursor_mismatch_is_rejected` (`dynamo_query_pagination.rs`)
+assumed, on first pass, that `validate_query_cursor_shape` — a pure
+attribute-name check with no row read at all — would need nothing but a
+syntactically well-formed `ExclusiveStartKey`, so a hand-crafted cursor
+literal (rather than one extracted from a real, materialized GSI page)
+should suffice to prove the rejection in every direction. Three of the
+four directions worked exactly that way. The fourth — a base cursor
+replayed *against the GSI* — returned `200` with an empty result instead
+of the expected `400`, because `run_gsi_query` never got as far as calling
+`validate_query_cursor_shape` at all: its own empty-page gate answered
+first.
+
+**The general lesson**: when a function has an early-return gate ahead of
+a validation step, "does this validation need real data" is the wrong
+question to ask when deciding whether a fixture without that data can
+still exercise it — the right question is "can this fixture ever make the
+*gate* false." A gate that is structurally always-true under one fixture
+makes everything behind it unreachable from that fixture, independent of
+whether the thing behind the gate itself needs the fixture's missing
+capability. Found by running the converted test and getting a genuine,
+unexpected `200` rather than by static reasoning about the code — exactly
+the kind of thing "run the test, don't just read the function" catches
+that a design pass alone would not. Fixed by narrowing the converted
+test's own scope (dropping the one unreachable sub-case, with the reason
+stated in both the test's own doc and the sibling module's) rather than by
+forcing the fixture to materialize a GSI table it fundamentally cannot yet
+create outside `ProdEnv`.
+
+## A concrete `&ClientCtx` handle inside a match arm's callee chain silently blocks widening the whole dispatcher — grep every callee before promising "the widening is mechanical" (ADR 0061 rung D3 PR 3a)
+
+Widening `run_index_query`/`run_gsi_query`/`run_lsi_query`/`run_index_
+scan`/`run_gsi_scan`/`run_lsi_scan`/`paginated_kind_examine`/`paginated_
+kind_examine_one` to `<E: Env, R: RelayClient>` (`dynamo.rs`) went exactly
+as a design pass predicted: every one of the eight functions' only
+concrete binding was its own `ctx: &ClientCtx` parameter, and every callee
+inside them (`ctx.cp_scan_kind`/`ctx.cp_scan_kind_table`, `paginated_
+table_examine`, `table_known`, `mirror_catalog_schema`) was already
+generic since rung C5/D2 PR 1 — so the whole widening was a pure
+signature-only change, zero body edits. That prediction was only safe to
+make *because* the design pass (and this PR) actually walked the callee
+chain of all eight functions before starting, the same discipline ADR
+0061's own C5-step-1 entry establishes for `CpGroup`/`CpRoute` call
+chains: a bare `&ClientCtx` (or `&CpGroup`) parameter anywhere in a chain
+a widened function calls into is a hard, silent block on genericizing the
+caller — it will not show up as "this doesn't compile yet," it shows up as
+"the widened signature compiles but is dead code because nothing generic
+can call it," or worse, compiles by accident against the wrong default
+type parameter (see the "default type parameter resolves to its default,
+never an enclosing scope's own parameter" gotcha this file's rung-C5-step-1
+entry already documents). Grepping every callee's own signature before
+starting is what turns "this widening should be mechanical" from an
+assumption into a checked fact — worth repeating explicitly here because
+this is now the *third* rung (D2 PR 1, D3 PR 2a's `create_table`/`enable_
+stream`, and this one) where that check paid off by confirming the
+prediction rather than by catching a surprise, which is exactly what a
+grep-first discipline is supposed to produce most of the time.
+
+## A fixture's own bookkeeping map can silently exclude an entire creation path — a "does this tablet have a leader" helper scoped to one map answered `None` for every wire-created table (ADR 0061 rung D3 PR 3b)
+
+`SimClusterHandle::leader_index_of` (`sim_cluster.rs`) resolved a tablet's
+current leader by scanning `Self::replicas_of(tablet)` — a lookup into
+`self.tablets`, the `BTreeMap<TabletId, TabletInfo>` that exactly one call
+site, `SimCluster::create_table_with_replication` (the fixture's own
+*hand-hosted* table path), ever inserts into. Every `SimCluster::drain_gsi`
+caller this PR added creates its table through the real DynamoDB wire
+instead (`cluster.dynamo(0, "..CreateTable", ..)`, the path PR 2a/3a
+built) — a path that never touches `self.tablets` at all, since it hosts
+tablets via `spawn_policy_tablet_host_loop`'s own `Metadata::policies`
+watcher, not this method's bookkeeping. The result was not a compile error
+or an obviously-wrong value: `leader_index_of` simply, silently, returned
+`None` for every wire-created table's tablet — `replicas_of` came back
+`Some(vec![])`-shaped empty, so `.find(..)` over an empty iterator is a
+completely unremarkable `None`, indistinguishable at the call site from
+"this tablet genuinely has no leader yet."
+
+**The general lesson**: a helper that resolves "the current state of X"
+by scanning a fixture's own bookkeeping map, rather than the live
+domain state that map is meant to summarize, silently stops working the
+moment a second creation path populates the live state without also
+updating that same map — and the failure mode is a clean, plausible-looking
+`None`/empty result, not a panic or a type error, so it will not surface
+until a *test* exercises the second path and gets an unexpected failure.
+The fix here was to stop trusting the bookkeeping shortcut and scan the
+authoritative, always-current signal instead (`ClusterEdgeState::
+local_cp(tablet).is_some_and(|g| g.is_leader())`, checked across every
+node id rather than only the subset one creation path happens to record) —
+strictly more general, and provably no less correct for the original path
+either, since the underlying per-node check already answers `false` for
+any node that was never given a reason to host that tablet. When a fixture
+grows a second way to create the same kind of object, audit every helper
+that reads the *first* way's own private bookkeeping before assuming it
+still answers correctly for the second.
+
+## A fixture that reimplements half of a production loop inherits the other half's hazards — `SimCluster`'s add-only tablet-host watcher (ADR 0061 rung D4 PR 1, closing issue #715)
+
+D3 PR 2a needed *some* mechanism to host a wire-provisioned tablet under
+`SimCluster` (nothing in that fixture ran a real `animus_cp_data::host::
+Reconciler`), so it wrote the smallest thing that would make `CreateTable`
+work: a per-node loop that hosts a `RaftKvNode` for any tablet whose
+`Metadata` replica set names this node. That watcher deliberately
+implemented exactly one half of what a real reconciler does — *add* a
+missing replica's own hosting — and left the other half out: it never
+reacted to a `MetaCommand::CasTabletReplicas` that dropped a replica the
+same tablet used to have. The control plane's own `rebalance_placement`
+pass doesn't know or care whether anything is physically reconciling its
+decisions; it runs unconditionally, so the instant `node_count exceeded
+MAX_REPLICATION_FACTOR`, it rebalanced a wire-provisioned tablet's
+replica set exactly as designed — and the watcher left a stale, live
+`RaftKvNode` running on the node the CAS just removed, genuinely
+split-brain-shaped, reachable with a plain `CreateTable` and no fault
+injection at all. This was found, characterized precisely (`sim_cluster_
+dynamo_table_ops.rs::reconciler_hazard_fires_deterministically_when_
+node_count_exceeds_replication`, 25 seeds, byte-identical every time), and
+left deliberately unfixed for two whole rungs (D3 PR 2a through 3b) behind
+a documented `node_count <= 3` restriction on every test that issued a
+real wire `CreateTable` — the honest and correct call at the time, since a
+proper fix needed materially more fixture machinery than any single one
+of those PRs' own briefs asked for.
+
+**The general lesson**: a fixture that stands in for a production
+event-driven loop by hand-coding *only the code paths the fixture's
+current tests happen to exercise* will silently reproduce every hazard
+the loop's *other* code paths exist to prevent, the moment something
+else in the system (here: an entirely separate, correct, unconditional
+background process — the control plane's own rebalancer) starts
+exercising the path the stand-in never implemented. The stand-in doesn't
+need to be buggy in isolation for this to bite — `spawn_policy_tablet_
+host_loop` did exactly what its own doc said it did, correctly, forever;
+the gap was never a defect in the code that existed, only in the code
+that didn't. Two ways this generalizes: (1) when scoping a stand-in for
+a real subsystem, name explicitly which of the real thing's own
+responsibilities you are and are not implementing, and write that
+omission down as a load-bearing constraint on every caller (the
+`node_count <= 3` restriction was exactly this — a real, if narrow,
+safety net) rather than as an implicit assumption a future test can
+silently violate; (2) the actual fix, when it eventually lands (D4 PR 1,
+this same rung), is almost always cheaper than re-deriving the missing
+half by hand a second time — `animus_cp_data::host::Reconciler` already
+existed, was already `SimEnv`-generic and sim-proven
+(`reconciler_corpus.rs`), and slotting it in (one `Reconciler` per node,
+`on_host`/`on_teardown` hooks mirroring hosting into the fixture's
+existing routing registry) needed zero production signature changes at
+all — the "more machinery than this PR's own brief asks for" that
+justified deferring the fix originally was true of THAT PR's own scope,
+not a statement that the real fix was actually hard. Don't let "the
+minimal fix for today's ticket" become "the permanent shape of the
+fixture" without an explicit, re-visitable decision to that effect — a
+`node_count <= 3` comment that outlives the investigation that produced
+it is a standing invitation for the next engineer to either violate it by
+accident or avoid a whole class of otherwise-useful test shapes forever.
+
+## A background loop's fallback poll interval, copied from an unrelated caller's own convergence-check cadence, is a cost multiplied by every long `run_for` window a corpus drives (ADR 0061 rung D4 PR 1)
+
+`SimCluster`'s new per-node reconciler-driving loop (`spawn_reconciler_
+loop`) needed a fallback interval — how often to re-tick when
+`metadata_watch()` doesn't wake it. The first draft set it to 50ms,
+reasoning that it should match `SimCluster::poll_until`'s own 50ms
+convergence-check step, "so a reconciler that reacts at least that often."
+That reasoning sounds plausible and is wrong: `poll_until` polls a
+*predicate* cheaply; it never depends on the reconciler's own internal
+tick cadence to converge, because every real hosting/reconfigure decision
+is driven by `metadata_watch()`'s own wake, which resolves in near-zero
+virtual time on an actual commit **regardless of the fallback's length**.
+The fallback only bounds a missed-wake safety net — a case that, in
+practice, never fires in this fixture's own test suite.
+
+What the 50ms choice actually cost: `sim_cluster_corpus.rs`'s own
+scenarios each drive several seconds of virtual time (`SETTLE`/a fault
+window/`DRAIN`), and every node pays for a full reconciler tick
+(`gather_facts` + `plan`, non-trivial work even when nothing changed)
+every 50ms of it. Measured directly (`ANIMUS_SIMCLUSTER_SEEDS=3`,
+`--nocapture` to see per-scenario progress): ~3s/scenario, vs. ~1.75s/
+scenario before this rung — at `ANIMUS_SIMCLUSTER_SEEDS=10` that
+extrapolates to several real minutes for the corpus alone, which looked,
+mid-run, indistinguishable from a hang (steady CPU and growing memory,
+no progress markers under a captured, non-`--nocapture` test run) until
+a smaller-depth `--nocapture` probe showed it was making completely
+normal per-scenario progress, just slower than before. Widening the
+fallback to 200ms (still 2.5x more responsive than the analogous
+production constant, `RECONCILE_FALLBACK_INTERVAL` = 500ms) cut
+per-scenario time to ~2.1s and brought the whole crate's `cargo test -p
+animusd --lib` wall time back down to within noise of the pre-change
+baseline, with zero change in which scenario converges or how — proving
+the original 50ms bought no correctness or convergence-speed benefit at
+all, only cost.
+
+**The general lesson**: when a new polling/fallback constant needs a
+value and an existing, unrelated constant happens to be sitting right
+there (a caller's own convergence-check step, a sibling fixture's poll
+interval), matching it "to be safe" is not free — the new constant's own
+*actual* cost model may be completely different (here: driven once per
+long virtual-time window per node, not once per assertion), and nothing
+about "it matches the neighbor" proves it's sized correctly for where
+it's actually used. Measure the thing you're actually adding — a
+seed-depth corpus, a fault-injection loop, anything that multiplies a
+per-tick cost by scenario count × seed depth × node count — before
+shipping a plausible-sounding value, the same way a benchmark file in
+this repo measures a real I/O cost before choosing a design instead of
+reasoning about it in the abstract. And when a background test run looks
+stalled, check for actual progress (a `--nocapture` re-run at a smaller
+depth, or a process's own CPU/memory trend) before assuming either "it's
+hung" or "it's fine" — both guesses were available here and only one was
+right.
+
+## A sharded CI tier's wall time is dominated by the per-shard cold compile, not the test count riding on top of it — measure both parts separately before touching the partition matrix (2026-09-07, ADR 0061 rung D3 PR 4)
+
+D3 converted 20 of `crates/animusd/tests/*.rs`'s 120 real-thread `ProdEnv`
+binaries (103 of its 521 tests) to deterministic `SimCluster` coverage
+instead — a 20% shrink by both files and tests in the tier
+`prod-liveness-animusd`'s four nextest shards partition. The naive
+expectation: a 20% smaller tier should tolerate fewer, or need fewer,
+shards. Measured instead: the slowest shard's own wall time dropped only
+598s → 564s (run 34103555943 → run 34123273726) — a 6% drop against a 20%
+test-count drop, and nowhere near enough to justify going from 4
+partitions to 3. The reason is structural, not a measurement fluke: every
+shard in this workflow rebuilds `-p animusd` from a cold cache
+(`cache-targets: false`, deliberate per this workflow's own comment on why
+caching `target/` isn't worth it yet), and that compile alone sits under a
+floor of roughly five minutes regardless of how many tests run afterward.
+Shrinking the test count only trims the *execution* portion sitting on
+top of that fixed floor — going to fewer partitions would concentrate more
+of both the (shrinking) execution time and the (fixed, per-shard) compile
+floor onto each remaining shard, which *raises* the max shard wall time,
+not lowers it. **General lesson**: before changing a CI matrix's shard/
+partition count in response to a test-count change (a conversion to a
+faster tier, tests deleted as redundant, a corpus depth knob lowered),
+measure actual wall time per shard and split it into its compile-time
+floor and its execution-time portion separately — "N% fewer tests" does
+not imply "N% less wall time" or "proportionally fewer shards needed"
+when a large fixed cost (a cold-cache rebuild, a fixed bring-up sequence,
+a per-shard toolchain install) sits under every shard independent of what
+runs after it. The same shape recurs anywhere a workload is partitioned
+across parallel workers with a per-worker fixed cost: the fixed cost sets
+a floor no amount of load-shrinking below it can beat, and the only way to
+find that floor is to measure it, not infer it from the load's own size.
+
+## `host::Reconciler`'s restart recovery is scoped to CURRENT `Metadata` only — a node offline across a drop leaks its own tablet engine forever (ADR 0061 rung D4 PR 3, 2026-09-07)
+
+Building deterministic `SimCluster` coverage for dropped-table GC (ADR
+0024) surfaced a real, previously-uncharacterized gap in `animus-cp-data::
+host::Reconciler` — not a fixture artifact, and not fixed in that PR (out
+of its own "driver plus assertions, not new mechanism" scope), but real
+enough to record here rather than let a green test quietly paper over it.
+
+**The mechanism.** `Reconciler::gather_facts` builds every `TabletFacts`
+entry from exactly two sources: the tablets this reconciler is *currently*
+driving (`self.hosted`, in-process state) and the tablets `Metadata`
+*currently* names (`view.tablets.iter()`, both for the already-hosted
+branch and the join-candidate/restart-upgrade branch). Nothing else ever
+seeds a fact. `DropTableTablets` removes a table's tablet rows from
+`Metadata` **synchronously** at apply (ADR 0024) — so once a drop has
+committed and propagated, a dropped tablet id is simply gone from
+`view.tablets`, permanently, with no tombstone or residual row to notice
+later. A `Reconciler` is rebuilt from scratch (`Reconciler::new`, empty
+`LocalState`) on every real process restart — nothing persists it, by
+design (see `crates/animusd/CLAUDE.md`'s drop-table-GC entry: "there is no
+more durable `cp-hosted` marker... a restart just re-discovers every
+tablet to host from replicated `Metadata`"). Put together: a node that was
+hosting a tablet, goes offline (process down, not merely network-
+partitioned) for the whole window from before a table's drop commits
+through after `Metadata` has converged everywhere else to "table absent,"
+and only then restarts, comes back with a fresh, empty `LocalState` and a
+`Metadata` that never shows the dropped tablet at all — `gather_facts`
+produces **no fact whatsoever** for that tablet id, `plan()` never places
+it in `next.hosted`, and `HostAction::Reclaim` (which only ever fires for
+a tablet this reconciler's own `LocalState` currently claims — see
+`plan`'s own Phase 3 doc in `host.rs`) can never target it. The tablet's
+own private engine — real data, written before the crash — is a
+permanent, silent leak. This is the SAME mechanism on real disk: the
+`LsmEngine` production backend's `LsmTabletFactory::probe`/`destroy`
+(`crates/animusd/src/lib.rs`) is only ever called for tablet ids
+`gather_facts` already decided to ask about, so nothing there closes the
+gap either.
+
+**This regressed a real guarantee the pre-reconciler design had.**
+`docs/adr/0024-drop-table-data-gc.md`'s own text (lines 94-99, predating
+ADR 0031/0050's reconciler rewrite) describes it explicitly: "a replica
+that was down during the drop restarts, re-hosts the tablet from its
+marker/engine, then its GC loop reclaims it once its control replica
+catches up." That guarantee depended on a durable per-node marker
+surviving the restart and forcing a re-host attempt FIRST (so the tablet
+would land in the node's own hosted-set again, from which a later-observed
+drop could then legitimately trigger `Release`/`Reclaim`) — a mechanism
+ADR 0050 removed as part of moving to the reconciler's simpler
+`Metadata`-only design, without anything replacing its restart-time "ask
+about what I used to host, not just what `Metadata` currently says" role.
+Nobody signed off on dropping that guarantee — it was an unstated,
+unnoticed casualty of an unrelated simplification, only surfaced when new
+deterministic coverage finally exercised the exact restart-across-a-drop
+combination for the first time.
+
+**Confirmed empirically, not left as a plausible-sounding static-analysis
+claim.** The test was first written as a POSITIVE convergence assertion
+(crash a non-leader replica hosting the table, issue `DeleteTable` from a
+live node, restart the crashed node once the drop has committed, poll for
+the same three observables every other scenario in the same file
+converges on) — and it reliably failed, at every one of 6 seeds tried,
+never once converging within a 15s virtual-time budget, while the
+metadata/hosted-set observables (purged/re-derived independent of
+`gather_facts` entirely — `SimCluster::restart`'s own fixture code purges
+`ClusterEdgeState` registrations directly, mirroring a real process's
+driver tasks simply ceasing to exist) converged fine every time. Only the
+physical engine — the actual GC proof, not the bookkeeping — stayed
+non-empty forever. This is the general form of a lesson this repo already
+half-states elsewhere (a fixture built to prove one property can reveal a
+completely different one it never set out to test): **new coverage of a
+crash/restart × any-other-fault combination that nothing has driven before
+is exactly where an unstated regression from an unrelated refactor hides**
+— when a "should obviously converge" test doesn't, on the first honest
+try, the right response is to trust the failure over the intuition, run it
+at a handful more seeds to rule out a one-off, and only then decide
+whether it's a real gap (record it, seed and all, as an `#[ignore]`d
+regression a future fix can run against — never assert around it, and
+never silently narrow the scenario until it happens to pass) or a fixture
+bug (fix the fixture). Landing a green test that quietly avoids the exact
+combination its own name promises to test is worse than either — it reads
+as proof of a property that was never actually checked.
+
+**A structural fix, if this is ever picked up, needs new capability, not a
+tweak.** `gather_facts` has no way to ask "what tablet ids does this node
+physically have engine data for, regardless of what `Metadata` currently
+says" — that would need a new `EngineFactory::list()`-shaped method (or
+equivalent) across the trait and both real implementors
+(`MemoryTabletEngines`, `LsmTabletFactory`), consulted once at reconciler
+start (or periodically) to seed facts for tablet ids `Metadata` doesn't
+currently name at all, with its own reclaim decision once satisfied there
+is no live claim to worry about racing. That is real new mechanism, which
+is exactly why ADR 0061 rung D4 PR 3 (a driver-plus-assertions PR) reported
+it rather than building it.
+
+**Update (2026-09-07, issue #722, closed)**: fixed almost exactly as the
+paragraph above predicted. `EngineFactory` gained `local_tablets(&self) ->
+BTreeSet<TabletId>` (default-empty, so the widened trait stays
+source-compatible for any other implementor); `Reconciler::tick` consults
+it exactly once, on its very first tick after construction. See ADR 0024's
+and ADR 0061's matching 2026-09-07 amendments, and
+`crates/animus-cp-data/CLAUDE.md`'s host-module entry, for the mechanism
+as shipped — this entry stays as the discovery record; that is where the
+fix itself is documented.
+
+## A reconciler that derives every fact from the replicated map alone has no way to remember what the map has forgotten — the node's own local namespace is a second, restart-surviving fact source (issue #722, closing ADR 0061 rung D4 PR 3's own finding)
+
+The entry immediately above this one is the *discovery*; this is the
+*general* lesson the fix generalizes to, worth stating on its own since
+the shape recurs anywhere a per-node reconciler exists.
+
+**The pattern.** A reconciler of this shape — `gather_facts` (impure,
+reads live state) → `plan` (pure, decides actions) → execute — is only as
+complete as its own fact-gathering. When every fact comes from ONE source
+(here, replicated `Metadata` plus in-process `LocalState`), the
+reconciler's own knowledge is bounded by what that source currently says,
+full stop — and a source that is itself a replicated, converging,
+eventually-consistent view (as opposed to this node's own durable,
+locally-observable reality) can, by construction, have already moved past
+a fact this node still has physical consequences of. `LocalState` here is
+the sharper case: it isn't even eventually consistent, it's simply gone on
+every restart, by design (root `CLAUDE.md`'s "a restart re-derives
+everything live" convention, correct for every OTHER fact this reconciler
+needs). The bug wasn't that `Metadata` was wrong — it was right, exactly
+as designed, the instant it converges. The bug was that NOTHING besides
+`Metadata` was ever consulted, so a fact `Metadata` had already discarded
+(this tablet used to be real) had nowhere left to be remembered from.
+
+**The fix's general shape, not just this instance's.** The node's own
+local namespace — the durable artifacts it created in direct response to
+an earlier, real fact — is itself a second fact source, independent of
+whatever the replicated view currently says, and it survives exactly the
+restart that wipes in-process state. Reading it costs something (a
+directory listing here), so the general technique is: consult it
+**once**, at the point where the gap can occur (this reconciler's first
+tick after construction — the only point where in-process state is known
+to be freshly wiped while local durable state might not be), fold its
+answer into the SAME decision path every other fact already flows through
+(here: insert into the existing `LocalState::hosted`/reclaim machinery,
+add no new action variant), and stop consulting it once the window it
+exists to cover has passed (a local artifact appearing after that first
+tick can only be this same process's own later actions, already tracked
+by the ordinary in-process bookkeeping). This is cheap because the gap is
+narrow (once per restart) and the alternative (consulting it every tick)
+is the exact "materializes the whole dataset on every poll" cost class
+`docs/adr/0061-*.md`'s own D3/D4 amendments and this file's own
+`/admin/raftkv` entry already warn against paying for no reason.
+
+**The safety argument this kind of fix always needs, stated once so it
+doesn't need re-deriving per instance**: a local artifact this node
+created only ever exists because this SAME node, at some prior point,
+itself observed the fact that justified creating it — so an artifact that
+outlives the replicated view's own record of that fact is never "created
+too early" (structurally impossible — nothing creates the artifact before
+observing the fact), only ever "the replicated view moved on without this
+node." The corollary that actually needs checking, case by case: does
+anything ELSE in the system create the same kind of local artifact
+EARLIER than the replicated view records the matching fact, for a
+DIFFERENT reason? Here, yes — an in-place split's child engine is
+materialized before the child has its own tablet-map entry, purely as a
+latency optimization (ADR 0058 Train 2 rung 4/rung 4 layer 1) — so the
+fix's own "known" set had to be widened to also recognize a fact recorded
+elsewhere in the replicated view (a parent's own still-live split intent
+naming its children) rather than only literal tablet-map keys. Skipping
+this check is exactly the kind of "worked in the simple case, silently
+wrong in the one deliberately-eager-materialization case" bug this
+codebase's own split-path history (ADR 0058's several rungs) already shows
+is easy to introduce and hard to notice without deliberately asking "what
+else legitimately creates this kind of artifact before its own map entry
+exists."
+
+**Two harness bugs, unrelated to the fix, were found delivering its
+positive regression test — both worth naming as their own small,
+general lessons.** (1) A test that crashes a random node and then depends
+on ANY OTHER cluster-wide consensus completing (here, `DeleteTable`'s own
+control-plane commit-wait) must exclude every leadership role that crash
+could plausibly hit, not just the one role the test happens to be
+about — excluding only the data-plane tablet leader left a coin-flip
+chance of also crashing the control-plane leader, an entirely different
+(and, empirically, sometimes slower-than-the-test's-own-budget) scenario
+nobody meant to test. (2) `assert_reclaimed`'s own convergence check used
+to be two passes — a metadata/hosted-set poll, then a separate, unwaited
+engine read — which is unsound specifically for a just-restarted node,
+whose metadata/hosted-set facts can read as "already converged" from the
+very first poll (a freshly restarted control replica starts genuinely
+blank, indistinguishable at that instant from "caught up"), well before
+the reconciler backing those facts has done any real work; the fix folds
+every observable of one converged-or-timeout property into the SAME poll,
+never split across passes with different implicit timing. Both are
+instances of lessons this file already has in more general form
+(seed-derived randomness needs its blast radius considered, not just its
+target; a converged-or-timeout property must be checked as ONE property)
+— recorded here specifically because this exact fixture is where both
+were found, for the next person debugging this file.
+
+## A `SimCluster` scenario that arms a background trigger loop and then keeps writing must drive that loop's own downstream dependency itself, not just wait (ADR 0061 rung D4 PR 2)
+
+`sim_cluster_auto_split.rs`'s scenario (c) writes a burst of new items
+AFTER calling `SimCluster::set_auto_split_thresholds` — and `SimCluster::
+dynamo`/`put`/etc. all advance virtual time internally
+(`spawn_and_capture`'s own `run_for`), so by the time a burst of several
+writes has been issued, the auto-split loop has genuinely had ticks to
+fire. A write landing on a tablet mid-fork gets refused with the house
+`"; retry"` transient error (`index_drain::is_retryable_elsewhere`'s own
+convention) — expected, real behavior. The first draft's retry helper just
+waited (`run_for(200ms)`) and retried, which spun to its own attempt bound
+and failed every time: `SimCluster` never spawns `index_drain::
+change_consumer_loop` as a background task (it drives Streams/PITR/
+GSI-drain machinery most fixtures don't need), so nothing was EVER going
+to propose the `MetaCommand::CutoverSplit` that clears the freeze — the
+tablet would stay `Splitting` forever no matter how long the retry helper
+waited. The fix: the retry helper must itself call the fixture's own
+manual driver (`SimCluster::drive_inplace_split_cutover`) on every retry
+attempt, exactly like the poll loops that DO expect a fork to converge
+already do. **General lesson, not specific to this one loop**: when a
+`SimCluster` fixture provides a manual driver for a background mechanism
+production wires as a loop this fixture doesn't spawn, EVERY caller that
+can transitively depend on that mechanism completing — not just the ones
+explicitly polling for it — needs to drive it, including a plain retry
+helper that only looks like it's waiting out an unrelated transient.
+
+## A `SimCluster` scenario that proposes-then-crashes-the-proposer must let the entry replicate first, or it is stranded, not merely delayed (ADR 0061 rung D4 PR 5)
+
+`sim_cluster_backup_janitor.rs`'s scenario (d) (the control-plane leader
+crashes right after `MarkBackupDeleted` commits, restarted only once the
+survivors have already reclaimed the backup on their own) first called
+`SimCluster::propose_meta(MetaCommand::MarkBackupDeleted{..})` and then
+`SimCluster::crash(victim)` immediately after, with zero intervening
+`run_for` — and hung forever waiting for the row to disappear on the two
+survivors. `RaftNode::propose` only appends to the **leader's own local
+log** and returns `ProposeResult::Accepted` the instant that append
+happens — never "committed to a majority," the exact distinction root
+`CLAUDE.md`'s durable-before-visible entry states for every proposer in
+this codebase. With no virtual time advanced between the propose and the
+crash, the entry had not yet replicated to either follower: `crash` mutes
+the leader's outbound sends, so the entry was permanently stranded on a
+now-silent log — the two survivors' own `Metadata` never saw the backup
+marked `Expired` at all, so their own `backup_janitor_loop` had nothing to
+reclaim, and the poll spun to its own 20s budget every time. **Fix**: a
+short `run_for` (well under the janitor's own tick interval, so the
+scenario still proves the *survivors* — not the about-to-crash leader
+itself — do the reclaim) between the propose and the crash, giving the
+entry time to replicate and commit to a real majority before the leader
+goes silent. **General lesson, not specific to this scenario**: any
+`SimCluster` (or `RaftNode<SimEnv>`-driven) test that proposes something
+and then immediately crashes/stops/partitions the node it proposed on must
+let at least one round of replication happen first — `ProposeResult::
+Accepted` is a promise about the *proposer's own log*, never about what
+the rest of the cluster has seen, and a fault injected in the same
+instant as the propose can turn a durable write into one that was never
+really there at all from every other replica's point of view.
+
+## A `SimCluster` scenario that wants a rebalance to fire needs more imbalance than "one extra idle node," not just more nodes than tablets (ADR 0061 rung D4 PR 4)
+
+`sim_cluster_growth.rs`'s scenario (b) (growth then a `CreateTable`
+placing and rebalancing onto the new node) first provisioned exactly ONE
+table on a cluster just grown from 3 to 4 nodes, at the wire's own fixed
+RF 3 — and the rebalance-driven move it was asserting on never happened,
+even though the fourth node was genuinely idle and every precondition
+looked satisfied. The cause: `animus-placement`'s `rebalance_step` only
+ever performs a **balance-driven** move, converging to max−min ≤ 1 load
+across nodes (`animus-placement/CLAUDE.md`) — and a single tablet held by
+3 of 4 nodes is already at loads `{1, 1, 1, 0}`, whose max−min is exactly
+1. The placement engine is correctly judging that state balanced enough
+and has nothing to improve; a scenario expecting a move needs an
+imbalance the engine actually recognizes as worth fixing. **Fix**:
+provision **three** tables instead of one (`provision_soak_tables_and_
+wait_for_replica`'s own doc has the full reasoning) — reproducing
+`sim_cluster_dynamo_table_ops.rs`'s own #715 regression setup, whose
+loads land at `{3, 3, 3, 0}` after the wire's own deterministic
+first-three-`Active`-members placement, comfortably outside the balanced
+band. **General lesson, not specific to this scenario**: "more nodes than
+replicas" and "the placement engine will move something" are NOT the same
+claim — `rebalance_step`'s own convergence bound is stated in terms of
+per-node *load*, not node count versus replication factor, and a
+single-tablet setup is the smallest case that can accidentally already sit
+inside that bound. Any test asserting a rebalance-driven move needs enough
+tablets (or enough skew) that the *starting* load spread genuinely exceeds
+max−min ≤ 1, checked against the real formula, not assumed from "there's
+an idle node."
+
+## `SimRelayClient`'s single receive loop deadlocks on a nested outbound relay call from inside a forwarded request's own handler (ADR 0061 rung F, C-06 PR 3)
+
+Found building `sim_cluster_dynamo_transact.rs`'s scenario (g): a
+transaction coordinator stages both participants of a cross-table
+transaction, never decides (simulating a crashed coordinator), the
+coordinator node is then `SimCluster::crash`ed for good measure, and a
+strong read of the participant key from a different, live node is
+expected to trigger on-demand recovery (`confirm_or_push`/`txn_recover`)
+and converge to the committed value. It never converged, at any seed,
+within a 40-second virtual-time budget — every poll attempt returned the
+identical `SimRelayClient::relay`-native timeout text
+(`"sim relay: timed out waiting for a reply to req_id=N"`), unchanging
+across the whole budget.
+
+**Root cause, confirmed by direct code reading, not guessed at**:
+`animus_node::sim_relay::SimRelayClient::serve_loop` is one task per node,
+processing `env.recv_stream(RELAY_STREAM)` messages **strictly
+sequentially** — an inbound `Request`'s installed handler is `.await`ed
+**inline**, and the loop cannot receive the *next* message (including a
+`Reply` to one of ITS OWN outbound calls) until that handler returns. A
+handler that itself needs to make a nested outbound `relay()` call — which
+happens exactly when a forwarded read hits a foreign, still-`Pending`
+transactional intent whose recovery requires querying a *different*
+tablet's leader (`ClientCtx::txn_status`/`txn_recover`/`txn_verify`, each
+potentially its own forward) — sends its request and then polls a shared
+`pending` map for a reply that only this same, currently-blocked
+`serve_loop` task could ever stash there. A genuine self-deadlock,
+resolved only by the nested call's own timeout: not a race, not a timing
+sensitivity — reproduced identically at every seed tried, with a
+same-cluster-state plain (non-transactional) forwarded `GetItem` on a
+different key succeeding immediately in the same run, isolating the
+failure to the nested-relay path specifically.
+
+**Why nothing found this earlier**: every `SimCluster`-based scenario
+built before this rung, across `sim_cluster_corpus.rs`/`sim_cluster_
+dynamo_corpus.rs`/every D3/D4 module, only ever needed a forwarded
+operation's own handler to answer locally once it reached the tablet's
+real leader — a single hop. Multi-participant transaction recovery's
+foreign-intent read path is the first mechanism in this codebase whose
+own *server-side* handling can need a second hop, and it only becomes
+reachable through a **forwarded** (not locally-served) read — which itself
+needs a node crash to force re-election away from whichever node
+originally happened to lead every tablet a test touches. A scenario that
+never crashes a node, or that only ever reads a key whose intent (if any)
+resolves locally, can never exercise this path — which is exactly why nine
+scenarios across five other `sim_cluster_dynamo_*`/`sim_cluster_corpus`-
+family modules that DO crash nodes never tripped over it: none of them
+happened to combine a crash with a *cross-tablet* transactional intent a
+survivor then has to forward a read through.
+
+**Production is unaffected** — `AnimusdRelayClient` (the real,
+`ProdEnv`-backed `RelayClient` implementor) has no analogous single-task
+bottleneck: each inbound TCP connection on the intra port is its own
+`tokio::spawn`ed task, so a nested outbound relay call from inside one
+connection's handler blocks only that one task, never a shared receive
+loop serving every other inbound request too. This is a `SimRelayClient`
+-only, fixture-only limitation.
+
+**Disposition**: kept as a `#[ignore]`d characterization test (both the
+pinned-seed and `_over_seeds` variants), not fixed, not reworked to dodge
+the mechanism (every crash-plus-cross-tablet-recovery scenario would hit
+the identical gap), and not silently dropped — the maintainer standing
+instruction on a real finding under a fixture. The fix (spawning each
+inbound request's handler onto its own task, mirroring production's own
+per-connection-task shape) belongs in `animus-node::sim_relay`, a shared
+testing primitive every `SimCluster`-based module in this crate depends
+on — out of scope for the PR that found it. **General lesson**: a
+single-task, inline-awaiting receive loop is a fine simplification for a
+request/reply protocol only as long as no handler ever needs to make its
+OWN outbound call through the identical channel — the moment one does
+(a server-side handler that is itself also a client of the same peer, or
+of a third peer sharing the same per-node loop), the design needs either
+a per-request task (production's own shape) or an explicit re-entrancy
+story; a protocol's own docs should say which guarantee holds, since the
+failure mode (a silent, seed-stable timeout with no distinguishing error)
+gives no hint that recursion, not routing, is the actual cause.
 ## A Kubernetes `livenessProbe` must never gate on a distributed-consensus signal a healthy process cannot satisfy alone (issue #705/#710, ADR 0020/0060 2026-09-07 amendments)
 
 `crates/animus-operator/src/desired/statefulset.rs` pointed both the

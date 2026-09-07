@@ -819,6 +819,18 @@ const SPLIT_DRIVER_SEAL_RETRIES: u32 = 5;
 /// (re-issued every tick until the parent vanishes from the map; the
 /// control-plane epoch/state CAS makes a duplicate reject cleanly).
 ///
+/// **`<E: Env, R: RelayClient>`-generic and `pub(crate)` since ADR 0061 rung
+/// D4 PR 2** (previously concrete `ClientCtx`/`CpGroup`, i.e. `ProdEnv`
+/// only) — every callee below (`seal_now`/`pitr_seal_now`/`drain_tablet`,
+/// `ClientCtx::propose_schema`) was already generic (rung C5 step 3b/
+/// `schema.rs`'s own widening); only this function and its private sibling
+/// [`gsi_caught_up`] still named `ProdEnv` concretely. Widened so
+/// `SimCluster` (`sim_cluster.rs`) can drive the in-place split cutover
+/// directly — this fixture never spawns [`change_consumer_loop`] itself (no
+/// behavior change to the one production caller, `change_consumer_loop`'s
+/// own concrete `ClientCtx`, which still infers `E = ProdEnv, R =
+/// AnimusdRelayClient` at its call site unchanged).
+///
 /// **Idempotent across crash/re-lead by construction, with NO driver-local
 /// state at all**: every step here is a fresh read off durable/replicated
 /// state — `pending_split()`, the change log, the GSI cursor, the backfill
@@ -826,11 +838,11 @@ const SPLIT_DRIVER_SEAL_RETRIES: u32 = 5;
 /// long-running one would have, on its very first tick. (The copy-based
 /// endgame's own `SplitBuild` driver state, which this doc used to contrast
 /// against, was deleted in the copy-split-deletion endgame's Layer B1.)
-async fn inplace_split_driver_tick(
-    ctx: &ClientCtx,
+pub(crate) async fn inplace_split_driver_tick<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     meta: &Metadata,
     tablet: TabletId,
-    group: &CpGroup,
+    group: &CpGroup<E>,
 ) -> Result<(), String> {
     let Some(parent) = meta.tablets.get(&tablet) else {
         return Ok(()); // stale view; nothing to do
@@ -1034,11 +1046,11 @@ async fn inplace_split_driver_tick(
 
 /// Reconcile every dirty item of one tablet not yet covered by the "gsi"
 /// cursor, then advance that cursor to the highest HLC this pass covers.
-async fn drain_tablet(
-    ctx: &ClientCtx,
+pub(crate) async fn drain_tablet<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     meta: &Metadata,
     table: &str,
-    group: &CpGroup,
+    group: &CpGroup<E>,
     gsis: &[IndexDef],
 ) -> Result<(), String> {
     // The ADR 0042 §7 min-over-rows watermark: `None` on a cold tablet (no
@@ -1161,7 +1173,7 @@ async fn drain_tablet(
 /// the query. `true` on no pending records at all (nothing to catch up to),
 /// matching the veto's own pre-existing "only gate when something is
 /// actually pending" rule.
-async fn gsi_caught_up(group: &CpGroup) -> bool {
+async fn gsi_caught_up<E: Env>(group: &CpGroup<E>) -> bool {
     let max_pending = group
         .pending_changes()
         .await
@@ -1235,11 +1247,11 @@ fn record_hlc(key: &[u8]) -> Option<HlcTimestamp> {
 /// original design, this no longer deletes the change records that triggered
 /// it — see the module doc and [`drain_tablet`]'s trailing cursor write for
 /// the ADR 0042 replacement, and [`trim_janitor`] for the actual deletion.
-async fn reconcile_partition(
-    ctx: &ClientCtx,
+async fn reconcile_partition<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     meta: &Metadata,
     table: &str,
-    group: &CpGroup,
+    group: &CpGroup<E>,
     gsis: &[IndexDef],
     fp_key: &[u8],
 ) -> Result<(), String> {

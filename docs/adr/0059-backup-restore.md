@@ -1599,3 +1599,96 @@ about capture, the catalog, restore, or the `S3SegmentStore`/`S3StoreConfig`
 shapes PR 2 built changed to accommodate this — the operator is a pure
 consumer of the same command-line contract every other deployment shape
 (bare-metal `--config FILE --node I`, `animusd control`) already used.
+
+## As-built amendment (2026-09-07, ADR 0061 rung D4 PR 5 — deterministic coverage for the backup janitor's own loop)
+
+The backup janitor (§3, `animus_node::backup_janitor::backup_janitor_loop`)
+now has its own deterministic, `SimEnv`-driven regression, riding on
+`animusd`'s multi-node `SimCluster` fixture (ADR 0061 Phase D) rather than
+only the primitive-level `RaftNode<SimEnv>` unit tests the loop's own
+module already carried since rung C2. Nothing about the janitor's own
+decisions changed — this closes a coverage gap, not a behavior gap.
+
+**What moved (mechanical, not a redesign)**: two things were still pinned
+to the concrete `ClientCtx` alias (`E = ProdEnv, R = AnimusdRelayClient`)
+and are now `<E: Env, R: RelayClient>`-generic — `animusd::client_ctx_
+host.rs`'s four `ClientCtx` implementations of `animus_node::host`'s
+`ControlLeaderHost`/`BackupObjectStore`/`BackupJanitorProgressHost`/
+`TtlScanHost` traits, and `animusd::backup_janitor`'s own thin wrapper
+around `animus_node::backup_janitor::backup_janitor_loop`. Every field and
+method each impl delegates to (`self.edge`, `self.backup_store`,
+`self.backup_janitor_progress`, `dynamo::kind_write_item_at_leader::<E,
+R>`) was already `E`/`R`-agnostic or already generic — this rung is a pure
+signature widening. `animus_node::host`'s own trait definitions needed no
+change at all.
+
+**Store choice**: `SimCluster` now builds every node's `ClientCtx::
+backup_store` as `BackupStoreHandle::S3` wrapping a clone of ONE shared
+`SimSegmentStore` (`animus-sim`'s own deterministic `SegmentStore` corpus
+implementor), not a per-node placeholder `Fs` directory the way every
+other `SimCluster`-driven module's own fixture still does for the fields
+nothing else reads. This is the faithful choice, not a simplification: a
+real `--backup-store s3://...` bucket has no per-node locality at all
+(`BackupStoreHandle::S3` already holds `Arc<dyn SegmentStore>` specifically
+so it can be substituted this way, the same seam `lib.rs`'s own
+`s3_store_handle_tests` uses over `animus_s3::fake::FakeS3`), and sharing
+one store is what makes the leader-gating scenario below meaningful — a
+per-node-local store would make "did a follower's janitor touch the store"
+trivially true by construction. `backup_janitor_loop` is now spawned
+unconditionally on every node (mirroring `heartbeat_loop`'s own always-on
+D4 PR 1 spawn, not `auto_split_loop`'s opt-in one — this loop's own leader
+gate already makes a non-leader tick a cheap idle no-op).
+
+**Five scenarios** (`crates/animusd/src/sim_cluster_backup_janitor.rs`,
+each replayed at 5 seeds): (a) a completed (`Available`) backup marked
+deleted is reclaimed — its manifest and data-chunk objects, seeded
+directly into the shared store, are gone, and the catalog row itself is
+gone (not merely `Expired`), with the leader's own `JanitorProgress`
+ending `Idle` having seen the backup and reclaimed both objects; (b) a
+`Failed` backup (the completion aggregator's own stuck-timeout shape) is
+reclaimed the identical way, proving the janitor's `Expired`-or-`Failed`
+admission gate rather than only the `DeleteBackup`-driven path; (c) leader
+gating in two parts — a follower's own `JanitorProgress` never leaves
+`Idle` while the leader alone reclaims a deleted backup, and a real
+`RaftCore::transfer_leadership` handoff issued immediately after
+`MarkBackupDeleted` commits still converges to exactly one reclaim with no
+error recorded on any node's own progress (the mark/reclaim/finalize
+sequence is idempotent regardless of which of the old or new leader's own
+tick actually does the work); (d) the control-plane leader itself crashes
+right after `MarkBackupDeleted` commits, and is restarted only once the
+surviving two nodes have already reclaimed the backup on their own — the
+restarted node's own view converges too, with no stale error; (e) a
+backup that stays `Available` (never marked deleted, never failed) is
+never touched over a long window — every node's own `JanitorProgress.
+backups_seen` stays 0 and the store keeps every object.
+
+**No janitor bug found.** All five scenarios (and their `_over_seeds`
+siblings) hold at every seed tried; the two real findings this rung's own
+build produced were both test-harness timing gaps, not production
+defects — see `crates/animusd/CLAUDE.md`'s matching D4 PR 5 entry and
+`docs/engineering-lessons.md` for the general lesson each generalizes to
+(a `propose` must be given time to replicate and commit before the node
+that issued it is crashed, or the entry is stranded and lost rather than
+inherited by the survivors).
+
+**What stayed on `ProdEnv`**: `crates/animusd/tests/dynamo_backup.rs`'s
+own `create_backup_round_trip_survives_table_drop_and_janitor_reclaims`
+fuses the janitor's own row-removal convergence (its very last assertion)
+into one long test that also proves the DynamoDB wire shapes
+(`CreateBackup`/`DescribeBackup`/`ListBackups`/`DeleteBackup`'s JSON
+responses, the `BackupSizeBytes` freeze across a table drop, the
+immediate-`DELETED`-then-`BackupNotFoundException` wire contract) —
+`SimCluster` drives no DynamoDB backup/restore operations at all (a named
+residual since ADR 0061 rung D2), so none of that wire-shape machinery is
+reachable through it regardless of how far this rung widens the janitor's
+own host seam. Splitting the janitor's own tail assertion out into a
+second, separate test would only duplicate the setup this one test already
+does once; nothing was removed from `dynamo_backup.rs`. What D4 PR 5 adds
+is a companion, not a replacement: the primitive-level proof
+(`animus_node::backup_janitor::tests`, single-voter `RaftNode<SimEnv>`,
+synthetic `BackupObjectStore`), the wire-level end-to-end proof
+(`dynamo_backup.rs`, real `ProdEnv`/sockets/disk), and now this
+multi-node, fault-injecting, deterministic middle tier
+(`sim_cluster_backup_janitor.rs`) that neither of the other two reaches:
+leader gating, a real leadership handoff, and a crashed-leader/restart
+recovery, all replayable from a bare seed.

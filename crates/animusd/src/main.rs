@@ -7,11 +7,11 @@
 //! animusd gen-config --control-nodes N --data-nodes M [--host H] [--base-port P] # print a split-deployment config (ADR 0035)
 //! animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH] [--encryption-key PATH] # run node I of a cluster (one process)
 //! animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH] [--encryption-key PATH] # run an N-node cluster in one process
-//! animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--dynamo-auth PATH] # run a whole split deployment in one process (ADR 0035)
-//! animusd join --seed ADDR[,ADDR...] [--id NAME] --base-port P [--dir D] [--ephemeral] # seed/join startup (ADR 0032 PR2; ADR 0040 PR4 self-minting if --id is omitted)
-//! animusd control --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] # run node I as a control-only node (ADR 0035 PR3)
+//! animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--dynamo-auth PATH] # run a whole split deployment in one process (ADR 0035)
+//! animusd join --seed ADDR[,ADDR...] [--id NAME] --base-port P [--dir D] [--ephemeral] [--advertise-host NAME] [--encryption-key PATH] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] # seed/join startup (ADR 0032 PR2; ADR 0040 PR4 self-minting if --id is omitted)
+//! animusd control --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--encryption-key PATH] # run node I as a control-only node (ADR 0035 PR3)
 //! animusd data --config FILE --node I [--dir DIR] [--ephemeral] [--dynamo-auth PATH] # run node I as a data-only node (ADR 0035 PR4)
-//! animusd data --seed ADDR[,ADDR...] [--id NAME] --base-port P [--dir D] [--ephemeral] [--dynamo-auth PATH] # data-only seed/join (ADR 0035 PR5; ADR 0040 PR4 self-minting if --id is omitted)
+//! animusd data --seed ADDR[,ADDR...] [--id NAME] --base-port P [--dir D] [--ephemeral] [--dynamo-auth PATH] [--advertise-host NAME] [--encryption-key PATH] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] # data-only seed/join (ADR 0035 PR5; ADR 0040 PR4 self-minting if --id is omitted)
 //! ```
 //!
 //! The data replica is durable by default (an on-disk LSM under the node's data
@@ -81,23 +81,26 @@
 //! the reconciler's proactive wake (a replica set member marked `Down`)
 //! touches it again. **Defaults ON at `main::DEFAULT_QUIESCE_AFTER_SECS`
 //! (5s)** — see that constant's own doc for the evidence behind this default
-//! and how to override it; `0` disables the feature entirely. The CLI flag
-//! itself threads through `--config`/`--node` and `--cluster N` only; a
-//! documented gap for a follow-up remains on two other shapes: passed to
-//! `--cluster-control`/`--cluster-data` it parses but is silently unused
-//! (that path has no growth-combination wrapper to receive it yet); the
-//! standalone `control`/`join` subcommands reject it outright as an unknown
-//! argument (each parses its own flag set independently of `run`'s), and
-//! neither runs a data-plane role that would use it anyway. **`animusd data
-//! --config FILE`, however, now reaches this knob too (S-06)** — not via a
-//! CLI flag of its own, but through the same `cluster_settings.
-//! quiesce_after_secs` config-file section `--config`/`--node` reads (see
-//! that flag's `run_single`/`run_data_config` doc and `animusd::config::
-//! ClusterSettings`'s own doc for the full per-field applicability
-//! breakdown, since a control-only node ignores this field entirely).
-//! **A nonzero value below `animusd::MIN_QUIESCE_AFTER` (200ms, the
-//! change-consumer sweep interval — issue #302 fix) is rejected at parse
-//! time**, since it can reopen the stale-veto quiescence race the fix
+//! and how to override it; `0` disables the feature entirely. **Reaches
+//! every real deployment shape now (issue #676)**: `--config`/`--node`,
+//! `--cluster N`, `--cluster-control`/`--cluster-data` (resolved to the
+//! same on-by-default value and threaded through
+//! `start_split_cluster_with_growth`), `join`, and `data --seed` (both
+//! resolved the identical way, with no config file on either path to
+//! conflict-check a CLI flag against) all accept `--quiesce-after` with the
+//! identical semantics/default. The standalone `control` subcommand still
+//! rejects it outright as an unknown argument — it never runs a data-plane
+//! role that would use it, so there is nothing to thread it to (see
+//! `animusd::config::ClusterSettings`'s own doc, "not every field applies
+//! on every deployment shape"). **`animusd data --config FILE` reaches this
+//! knob too (S-06)** — not via a CLI flag of its own, but through the same
+//! `cluster_settings.quiesce_after_secs` config-file section `--config`/
+//! `--node` reads (see that flag's `run_single`/`run_data_config` doc and
+//! `animusd::config::ClusterSettings`'s own doc for the full per-field
+//! applicability breakdown, since a control-only node ignores this field
+//! entirely). **A nonzero value below `animusd::MIN_QUIESCE_AFTER` (200ms,
+//! the change-consumer sweep interval — issue #302 fix) is rejected at
+//! parse time**, since it can reopen the stale-veto quiescence race the fix
 //! closes; see that constant's own doc.
 //!
 //! `--heartbeat-batch`/`--no-heartbeat-batch` (ADR 0044 phase 2 — C-02 PR 2
@@ -111,10 +114,9 @@
 //! default; `--no-heartbeat-batch` (or `cluster_settings.heartbeat_batch:
 //! false`) restores byte-identical pre-batcher behavior. The flag threads
 //! through the **identical** wrapper chain and reaches the **identical**
-//! set of entry points `--quiesce-after` does — same gaps
-//! (`--cluster-control`/`--cluster-data`, the standalone `control`/`join`
-//! subcommands), same `animusd data --config FILE` route via
-//! `cluster_settings.heartbeat_batch`.
+//! set of entry points `--quiesce-after` now does (issue #676) — same
+//! `control`-is-a-no-op-there exception, same `animusd data --config FILE`
+//! route via `cluster_settings.heartbeat_batch`.
 //!
 //! `--shared-wal`/`--no-shared-wal` (ADR 0028 — C-05 PR 2 shipped the
 //! mechanism off by default; PR 3, this cutover, flips the default ON)
@@ -133,11 +135,8 @@
 //! an operator who deliberately wants the old per-group layout on a node
 //! whose data directory predates this cutover must pass `--no-shared-wal`
 //! explicitly; a node started fresh needs no flag either way. Reaches the
-//! same entry points `--heartbeat-batch` does, with the identical
-//! documented gaps at the identical call sites
-//! (`--cluster-control`/`--cluster-data`, `join`/`data --seed` hardcode
-//! `false`), plus `animusd data --config FILE`'s own
-//! `cluster_settings.shared_wal` route, widened to match by this cutover.
+//! same entry points `--heartbeat-batch` now does (issue #676), plus
+//! `animusd data --config FILE`'s own `cluster_settings.shared_wal` route.
 //!
 //! **`cluster_settings` (S-06)**: a `ClusterConfig` file (`--config FILE`)
 //! may also carry a `cluster_settings` section — the same auto-split/
@@ -212,10 +211,14 @@
 //! the per-tablet capture driver (`backup_capture.rs`), the completion
 //! aggregator (`backup_completion.rs`), the backup/PITR janitors, and
 //! restore (ADR 0059 Trains 1–3, all implemented). Threads through
-//! `--config`/`--node`, `--cluster N`, **and (W-10) `animusd control`** —
-//! `--cluster-control`/`--cluster-data` and the standalone `data`/`join`
-//! subcommands remain a documented gap (each always gets the default
-//! `Cluster` store, since neither parses this flag). **A control-only node
+//! `--config`/`--node`, `--cluster N`, `animusd control` (W-10), **and now
+//! `join`/`data --seed` too (issue #676)** — `--cluster-control`/
+//! `--cluster-data` and the standalone `data --config` subcommand remain a
+//! documented gap (each always gets the default `Cluster` store, since
+//! neither parses this flag: `start_split_cluster_with_growth` hardcodes it
+//! for every data-role node it stands up, and `data --config` has no
+//! `cluster_settings`-shaped route to it the way `--quiesce-after`/
+//! `--heartbeat-batch`/`--shared-wal` do). **A control-only node
 //! now provisions a real backup store just like a combined or data-only
 //! one (W-10, ADR 0043 §A9's control-only-leader gap — closed)** — its
 //! backup/PITR janitors can physically reclaim objects for as long as it
@@ -291,11 +294,11 @@ const USAGE: &str = "usage:\n  \
     animusd gen-config --control-nodes N --data-nodes M [--host H] [--base-port P]\n  \
     animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH] [--tls-cert PATH --tls-key PATH --tls-ca PATH] [--encryption-key PATH]\n  \
     animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH] [--encryption-key PATH]\n  \
-    animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--dynamo-auth PATH]\n  \
-    animusd join --seed ADDR[,ADDR...] [--id NAME] --base-port P [--ip A] [--dir D] [--ephemeral]\n  \
-    animusd control --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3]\n  \
+    animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--dynamo-auth PATH]\n  \
+    animusd join --seed ADDR[,ADDR...] [--id NAME] --base-port P [--ip A] [--dir D] [--ephemeral] [--advertise-host NAME] [--encryption-key PATH] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3]\n  \
+    animusd control --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--encryption-key PATH]\n  \
     animusd data --config FILE --node I [--dir DIR] [--ephemeral] [--dynamo-auth PATH] [--tls-cert PATH --tls-key PATH --tls-ca PATH]\n  \
-    animusd data --seed ADDR[,ADDR...] [--id NAME] --base-port P [--ip A] [--dir D] [--ephemeral] [--dynamo-auth PATH] [--tls-cert PATH --tls-key PATH --tls-ca PATH]";
+    animusd data --seed ADDR[,ADDR...] [--id NAME] --base-port P [--ip A] [--dir D] [--ephemeral] [--dynamo-auth PATH] [--tls-cert PATH --tls-key PATH --tls-ca PATH] [--encryption-key PATH] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3]";
 
 /// `gen-config`: print a generated cluster config as JSON — either combined-mode
 /// (`--nodes N`) or the ADR 0035 split-deployment shape (`--control-nodes N
@@ -529,10 +532,16 @@ async fn run(args: &[String]) -> Result<(), String> {
     // `--advertise-host` use). `--cluster N`: applied to every generated
     // node (each still writes to its own distinct data directory). Absent
     // (the default) leaves every node's data on disk in plaintext,
-    // byte-for-byte pre-ADR-0069 behavior. **Not yet accepted** by
-    // `--cluster-control`/`--cluster-data`, `animusd control`, `animusd
-    // data`, or `animusd join` — documented reach gaps, the same shape
-    // several other flags on those entry points already have (issue #676).
+    // byte-for-byte pre-ADR-0069 behavior. **Now also accepted by `animusd
+    // join`, `animusd data --seed`, and `animusd control` (issue #676)** —
+    // `join`/`data --seed` set `RoleAddrs::encryption_key_path` directly (no
+    // config file on either path to conflict-check against, the same shape
+    // `--tls-*` already has there); `control` merges it onto
+    // `config.nodes[index]` via `apply_encryption_key_flag`, identically to
+    // this flag's own `--config`/`--node` route above. **Still rejected
+    // outright** by `--cluster-control`/`--cluster-data` (unchanged) — that
+    // dev-only path has no per-node config entries to apply the flag to,
+    // the same posture `--tls-*` has there.
     let mut encryption_key_path: Option<String> = None;
 
     let mut it = args.iter();
@@ -698,10 +707,14 @@ async fn run(args: &[String]) -> Result<(), String> {
         }
         let control_n = cluster_control.ok_or("--cluster-data also needs --cluster-control N")?;
         let data_n = cluster_data.ok_or("--cluster-control also needs --cluster-data M")?;
-        // `--quiesce-after` does not thread through the split-deployment dev
-        // path yet (`run_in_process_split_cluster` has no growth-combination
-        // wrapper to call) — a documented gap, matching this path's existing
-        // `--stream-seal-*`/`--segment-store` gap noted below.
+        // `--quiesce-after`/`--heartbeat-batch`/`--shared-wal` now thread
+        // through the split-deployment dev path too (issue #676) — the
+        // identical `DEFAULT_QUIESCE_AFTER_SECS`/`DEFAULT_HEARTBEAT_BATCH`/
+        // `DEFAULT_SHARED_WAL` resolution `--config`/`--cluster N` already
+        // apply when the flag is omitted. `--segment-store`/`--backup-store`
+        // remain a documented gap on this path (noted below/in the CLAUDE.md
+        // CLI reference) — `start_split_cluster_with_growth` hardcodes the
+        // default `Cluster` store for every data-role node it stands up.
         return run_in_process_split_cluster(
             control_n,
             data_n,
@@ -713,6 +726,13 @@ async fn run(args: &[String]) -> Result<(), String> {
             auto_split_ops_rate,
             orphan_sweep_after,
             dynamo_auth_flag.map(|c| std::sync::Arc::new(c.credentials)),
+            quiesce_after,
+            cli_cluster_settings
+                .heartbeat_batch
+                .unwrap_or(DEFAULT_HEARTBEAT_BATCH),
+            cli_cluster_settings
+                .shared_wal
+                .unwrap_or(DEFAULT_SHARED_WAL),
         )
         .await;
     }
@@ -823,7 +843,14 @@ fn quiesce_after_duration(secs: Option<u64>) -> Duration {
 /// (churning quiesce/wake cycles under light-but-steady traffic, say), the
 /// fix is lowering this constant or defaulting to `0` — never changing the
 /// mechanism itself, which is correct at any threshold `> 0`.
-const DEFAULT_QUIESCE_AFTER_SECS: u64 = 5;
+///
+/// A thin alias onto [`animusd::DEFAULT_QUIESCE_AFTER_SECS`] (issue #676) —
+/// the lib crate is now the single source of truth this binary's own CLI
+/// resolution shares with [`animusd::run_node_join`]/[`animusd::
+/// run_node_data_join`]'s own bare (no-settings) defaults, so `animusd
+/// join`/`animusd data --seed` get the identical on-by-default posture
+/// `--config`/`--cluster N` already have.
+const DEFAULT_QUIESCE_AFTER_SECS: u64 = animusd::DEFAULT_QUIESCE_AFTER_SECS;
 
 /// **Default ON** when `--heartbeat-batch`/`--no-heartbeat-batch` is
 /// omitted and `cluster_settings.heartbeat_batch` is absent from a config
@@ -851,7 +878,10 @@ const DEFAULT_QUIESCE_AFTER_SECS: u64 = 5;
 /// The whole `cargo test --workspace` / `prod-liveness-*` suite set passes
 /// unmodified with batching on by default — no destabilization was found.
 /// See ADR 0044's 2026-09-06 phase-2-cutover amendment for the full record.
-const DEFAULT_HEARTBEAT_BATCH: bool = true;
+///
+/// A thin alias onto [`animusd::DEFAULT_HEARTBEAT_BATCH`] (issue #676) — see
+/// [`DEFAULT_QUIESCE_AFTER_SECS`]'s own identical note.
+const DEFAULT_HEARTBEAT_BATCH: bool = animusd::DEFAULT_HEARTBEAT_BATCH;
 
 /// **Default ON** when `--shared-wal`/`--no-shared-wal` is omitted and
 /// `cluster_settings.shared_wal` is absent from a config file (ADR 0028,
@@ -886,7 +916,10 @@ const DEFAULT_HEARTBEAT_BATCH: bool = true;
 /// test --workspace` suite passes unmodified with the shared WAL on by
 /// default — no destabilization was found. See ADR 0028's 2026-09-06 C-05
 /// PR 3 amendment for the full record.
-const DEFAULT_SHARED_WAL: bool = true;
+///
+/// A thin alias onto [`animusd::DEFAULT_SHARED_WAL`] (issue #676) — see
+/// [`DEFAULT_QUIESCE_AFTER_SECS`]'s own identical note.
+const DEFAULT_SHARED_WAL: bool = animusd::DEFAULT_SHARED_WAL;
 
 /// [`animusd::StreamSealKnobs`] from the optional `--stream-seal-bytes`/
 /// `--stream-seal-age` CLI values — each independently defaults to
@@ -1676,6 +1709,16 @@ async fn run_control(args: &[String]) -> Result<(), String> {
     // `run`'s own doc for both.
     let mut s3_credentials_path: Option<String> = None;
     let mut allow_insecure_s3 = false;
+    // `--encryption-key PATH` (ADR 0069) — this control-only node's own
+    // system-keyspace-engine data directory encryption key file, applied to
+    // `config.nodes[index]` via `apply_encryption_key_flag`, the identical
+    // "flag and config both set it is a hard error" shape `--config`/
+    // `--node`'s combined-mode path already uses (`run_single`). Closes
+    // issue #676's reach gap for this flag — a control-only node has always
+    // been able to encrypt its own system-keyspace engine via a config
+    // file's own `nodes[index].encryption_key_path` field, but had no CLI
+    // flag of its own to set it.
+    let mut encryption_key_path: Option<String> = None;
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -1697,6 +1740,9 @@ async fn run_control(args: &[String]) -> Result<(), String> {
                 s3_credentials_path = Some(parse_next(&mut it, "--s3-credentials")?);
             }
             "--allow-insecure-s3" => allow_insecure_s3 = true,
+            "--encryption-key" => {
+                encryption_key_path = Some(parse_next(&mut it, "--encryption-key")?);
+            }
             other => return Err(format!("unknown control argument `{other}`")),
         }
     }
@@ -1714,7 +1760,8 @@ async fn run_control(args: &[String]) -> Result<(), String> {
     let path = config_path.ok_or("control requires --config FILE")?;
     let index = node.ok_or("control requires --node I")?;
     let text = std::fs::read_to_string(&path).map_err(|e| format!("reading {path}: {e}"))?;
-    let config = ClusterConfig::from_json(&text).map_err(|e| format!("parsing {path}: {e}"))?;
+    let mut config = ClusterConfig::from_json(&text).map_err(|e| format!("parsing {path}: {e}"))?;
+    apply_encryption_key_flag(&mut config, index, encryption_key_path)?;
     // S-06: `cluster_settings.orphan_sweep_after_secs` reaches a control-only
     // node too — the only field of that section a control-only node can act
     // on (no data role, so every other field is silently ignored — see
@@ -1772,6 +1819,51 @@ async fn run_control(args: &[String]) -> Result<(), String> {
 /// CLI boundary); omitted, this node self-mints one (ADR 0040 Decision B).
 /// `--base-port` is **required** with `--seed` either way — there is no
 /// index left to derive a default port range from.
+///
+/// Factored out of [`run_data`]'s `--config` dispatch arm so the "these
+/// flags are `--seed`-only" guard is a pure, synchronously testable
+/// function (issue #676) — `data --config` has its own S-06
+/// `cluster_settings` route for `quiesce_after_secs`/`heartbeat_batch`/
+/// `shared_wal` (a per-field "one way, not both" check,
+/// `resolve_cluster_settings`) and no route at all yet for
+/// `--encryption-key`/`--segment-store`/`--backup-store`; passing any of
+/// these six flags alongside `--config` is rejected outright rather than
+/// silently ignored, since none of them has a config-file-side merge point
+/// on this path to catch the ambiguity for you the way `--tls-*`/
+/// `--dynamo-auth` do.
+///
+/// # Errors
+/// If any of the six booleans is `true` (the corresponding flag was passed
+/// alongside `--config`).
+#[allow(clippy::too_many_arguments)] // one bool per seed-only flag, no natural grouping
+fn reject_data_config_seed_only_flags(
+    encryption_key: bool,
+    quiesce_after: bool,
+    heartbeat_batch: bool,
+    shared_wal: bool,
+    segment_store: bool,
+    backup_store: bool,
+) -> Result<(), String> {
+    if encryption_key
+        || quiesce_after
+        || heartbeat_batch
+        || shared_wal
+        || segment_store
+        || backup_store
+    {
+        return Err(
+            "--encryption-key/--quiesce-after/--heartbeat-batch/--no-heartbeat-batch/\
+             --shared-wal/--no-shared-wal/--segment-store/--backup-store are only \
+             accepted with `data --seed`, not `data --config` — a config file's own \
+             cluster_settings section is that path's route for quiesce-after/\
+             heartbeat-batch/shared-wal (issue #676; --encryption-key/--segment-store/\
+             --backup-store are not yet reachable there at all)"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 async fn run_data(args: &[String]) -> Result<(), String> {
     let mut config_path: Option<String> = None;
     let mut node: Option<usize> = None;
@@ -1795,6 +1887,33 @@ async fn run_data(args: &[String]) -> Result<(), String> {
     let mut tls_cert: Option<String> = None;
     let mut tls_key: Option<String> = None;
     let mut tls_ca: Option<String> = None;
+    // `--encryption-key PATH` (ADR 0069) — this node's own data directory
+    // encryption key file. Only meaningful on `--seed` (no config file to
+    // apply it onto, the same shape `--tls-*` above already has there);
+    // rejected outright if combined with `--config` (issue #676 — that
+    // route has no `apply_encryption_key_flag`-shaped merge point for a
+    // data-only node's own config entry to widen here, unlike `--tls-*`).
+    let mut encryption_key_path: Option<String> = None;
+    // `--quiesce-after SECS` / `--heartbeat-batch`/`--no-heartbeat-batch` /
+    // `--shared-wal`/`--no-shared-wal` (issue #676): threaded onto
+    // `data --seed`, the same data-plane knobs `--config`/`--node` and
+    // `--cluster N` already resolve. `data --config` keeps its own S-06
+    // route (`cluster_settings.{quiesce_after_secs,heartbeat_batch,
+    // shared_wal}`) exclusively — passing these flags alongside `--config`
+    // is rejected rather than silently ignored, since (unlike `--tls-*`/
+    // `--dynamo-auth`) there is no per-field "one way, not both" merge
+    // check on this path to catch the ambiguity for you.
+    let mut quiesce_after: Option<u64> = None;
+    let mut heartbeat_batch: Option<bool> = None;
+    let mut shared_wal: Option<bool> = None;
+    // `--segment-store`/`--backup-store` (+ `--s3-credentials`/
+    // `--allow-insecure-s3`) (issue #676) — `--seed`-only, the identical
+    // "no config file, no conflict check needed" shape as `--tls-*`; see
+    // `run`'s own doc for the full knob description.
+    let mut segment_store: Option<String> = None;
+    let mut backup_store: Option<String> = None;
+    let mut s3_credentials_path: Option<String> = None;
+    let mut allow_insecure_s3 = false;
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -1816,6 +1935,26 @@ async fn run_data(args: &[String]) -> Result<(), String> {
             "--tls-cert" => tls_cert = Some(parse_next(&mut it, "--tls-cert")?),
             "--tls-key" => tls_key = Some(parse_next(&mut it, "--tls-key")?),
             "--tls-ca" => tls_ca = Some(parse_next(&mut it, "--tls-ca")?),
+            "--encryption-key" => {
+                encryption_key_path = Some(parse_next(&mut it, "--encryption-key")?);
+            }
+            "--quiesce-after" => {
+                quiesce_after = Some(parse_next(&mut it, "--quiesce-after")?);
+            }
+            "--heartbeat-batch" => heartbeat_batch = Some(true),
+            "--no-heartbeat-batch" => heartbeat_batch = Some(false),
+            "--shared-wal" => shared_wal = Some(true),
+            "--no-shared-wal" => shared_wal = Some(false),
+            "--segment-store" => {
+                segment_store = Some(parse_next(&mut it, "--segment-store")?);
+            }
+            "--backup-store" => {
+                backup_store = Some(parse_next(&mut it, "--backup-store")?);
+            }
+            "--s3-credentials" => {
+                s3_credentials_path = Some(parse_next(&mut it, "--s3-credentials")?);
+            }
+            "--allow-insecure-s3" => allow_insecure_s3 = true,
             other => return Err(format!("unknown data argument `{other}`")),
         }
     }
@@ -1828,6 +1967,14 @@ async fn run_data(args: &[String]) -> Result<(), String> {
     match (config_path, seed_arg) {
         (Some(_), Some(_)) => Err("use either --config or --seed, not both".into()),
         (Some(path), None) => {
+            reject_data_config_seed_only_flags(
+                encryption_key_path.is_some(),
+                quiesce_after.is_some(),
+                heartbeat_batch.is_some(),
+                shared_wal.is_some(),
+                segment_store.is_some(),
+                backup_store.is_some(),
+            )?;
             let index = node.ok_or("data requires --node I")?;
             run_data_config(
                 &path,
@@ -1849,6 +1996,21 @@ async fn run_data(args: &[String]) -> Result<(), String> {
                 "data --seed requires an explicit --base-port (ADR 0040: there is no \
                  --node index left to derive a default port range from)",
             )?;
+            let quiesce_after = quiesce_after_duration(quiesce_after);
+            validate_quiesce_after(quiesce_after)?;
+            let heartbeat_batch = heartbeat_batch.unwrap_or(DEFAULT_HEARTBEAT_BATCH);
+            let shared_wal = shared_wal.unwrap_or(DEFAULT_SHARED_WAL);
+            let s3_credentials = resolve_s3_credentials(s3_credentials_path.as_deref())?;
+            let segment_store_config = parse_segment_store(
+                segment_store.as_deref(),
+                s3_credentials.as_ref(),
+                allow_insecure_s3,
+            )?;
+            let backup_store_config = parse_backup_store(
+                backup_store.as_deref(),
+                s3_credentials.as_ref(),
+                allow_insecure_s3,
+            )?;
             run_data_join(
                 &seed_arg,
                 id,
@@ -1859,6 +2021,12 @@ async fn run_data(args: &[String]) -> Result<(), String> {
                 dynamo_auth_flag.map(|c| std::sync::Arc::new(c.credentials)),
                 advertise_host,
                 tls_flag,
+                encryption_key_path,
+                quiesce_after,
+                heartbeat_batch,
+                shared_wal,
+                segment_store_config,
+                backup_store_config,
             )
             .await
         }
@@ -1966,6 +2134,12 @@ async fn run_data_join(
     dynamo_auth: Option<std::sync::Arc<BTreeMap<String, String>>>,
     advertise_host: Option<String>,
     tls_flag: Option<TlsSection>,
+    encryption_key_path: Option<String>,
+    quiesce_after: Duration,
+    heartbeat_batch: bool,
+    shared_wal: bool,
+    segment_store_config: animusd::SegmentStoreConfig,
+    backup_store_config: animusd::BackupStoreConfig,
 ) -> Result<(), String> {
     let seeds: Vec<String> = parse_seed_arg(seed_arg)?;
     if seeds.is_empty() {
@@ -1991,10 +2165,10 @@ async fn run_data_join(
         // commit 2) — the flag is this node's only source, set directly
         // with no "set both ways" conflict to check.
         tls: tls_flag,
-        // No `--encryption-key`-equivalent flag on this join path either
-        // (ADR 0069, S-03 PR 1) — a documented reach gap, the same shape
-        // as every other flag this path doesn't yet accept.
-        encryption_key_path: None,
+        // `--encryption-key` (ADR 0069, S-03 PR 1) — the identical "no
+        // config file, so no conflict to check" shape as `tls` just above.
+        // Closes issue #676's reach gap for this flag.
+        encryption_key_path,
     };
     let dir_name = id
         .as_ref()
@@ -2003,7 +2177,7 @@ async fn run_data_join(
     let dir =
         dir.unwrap_or_else(|| std::env::temp_dir().join(format!("animusd-data-join-{dir_name}")));
 
-    let node = animusd::run_node_data_join(
+    let node = animusd::run_node_data_join_with_settings(
         seeds,
         id,
         addrs,
@@ -2011,6 +2185,11 @@ async fn run_data_join(
         backend,
         BTreeMap::new(),
         dynamo_auth,
+        quiesce_after,
+        heartbeat_batch,
+        shared_wal,
+        segment_store_config,
+        backup_store_config,
     )
     .await
     .map_err(|e| format!("failed to join as a data node: {e}"))?;
@@ -2057,6 +2236,30 @@ async fn run_join(args: &[String]) -> Result<(), String> {
     // before this ADR — every self-registered address is the bind address
     // itself, stringified. See `RoleAddrs::advertise_host`'s own doc.
     let mut advertise_host: Option<String> = None;
+    // `--encryption-key PATH` (ADR 0069) — this node's own data directory
+    // encryption key file. No config file exists on this join path (unlike
+    // `--config`/`--node`'s `apply_encryption_key_flag`), so there is no
+    // "set both ways" conflict to check — the flag sets `RoleAddrs::
+    // encryption_key_path` directly, the same shape `--tls-*` already has
+    // on `data --seed`. Closes issue #676's reach gap for this flag.
+    let mut encryption_key_path: Option<String> = None;
+    // `--quiesce-after SECS` / `--heartbeat-batch`/`--no-heartbeat-batch` /
+    // `--shared-wal`/`--no-shared-wal` (issue #676): the same data-plane
+    // knobs `--config`/`--node` and `--cluster N` already resolve, threaded
+    // here for the first time — `join` has no config file to conflict-check
+    // against, so each simply resolves to its own `DEFAULT_*` the identical
+    // way an omitted CLI flag already does on those other entry points.
+    let mut quiesce_after: Option<u64> = None;
+    let mut heartbeat_batch: Option<bool> = None;
+    let mut shared_wal: Option<bool> = None;
+    // `--segment-store`/`--backup-store` (+ `--s3-credentials`/
+    // `--allow-insecure-s3`) (issue #676) — see `run`'s own doc for the
+    // full knob description; identical semantics here, no config file to
+    // conflict against.
+    let mut segment_store: Option<String> = None;
+    let mut backup_store: Option<String> = None;
+    let mut s3_credentials_path: Option<String> = None;
+    let mut allow_insecure_s3 = false;
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -2070,6 +2273,26 @@ async fn run_join(args: &[String]) -> Result<(), String> {
             "--advertise-host" => {
                 advertise_host = Some(parse_next::<String>(&mut it, "--advertise-host")?);
             }
+            "--encryption-key" => {
+                encryption_key_path = Some(parse_next(&mut it, "--encryption-key")?);
+            }
+            "--quiesce-after" => {
+                quiesce_after = Some(parse_next(&mut it, "--quiesce-after")?);
+            }
+            "--heartbeat-batch" => heartbeat_batch = Some(true),
+            "--no-heartbeat-batch" => heartbeat_batch = Some(false),
+            "--shared-wal" => shared_wal = Some(true),
+            "--no-shared-wal" => shared_wal = Some(false),
+            "--segment-store" => {
+                segment_store = Some(parse_next(&mut it, "--segment-store")?);
+            }
+            "--backup-store" => {
+                backup_store = Some(parse_next(&mut it, "--backup-store")?);
+            }
+            "--s3-credentials" => {
+                s3_credentials_path = Some(parse_next(&mut it, "--s3-credentials")?);
+            }
+            "--allow-insecure-s3" => allow_insecure_s3 = true,
             other => return Err(format!("unknown join argument `{other}`")),
         }
     }
@@ -2087,6 +2310,21 @@ async fn run_join(args: &[String]) -> Result<(), String> {
         .map(|s| s.parse::<NodeId>())
         .transpose()
         .map_err(|e| format!("invalid --id: {e}"))?;
+    let quiesce_after = quiesce_after_duration(quiesce_after);
+    validate_quiesce_after(quiesce_after)?;
+    let heartbeat_batch = heartbeat_batch.unwrap_or(DEFAULT_HEARTBEAT_BATCH);
+    let shared_wal = shared_wal.unwrap_or(DEFAULT_SHARED_WAL);
+    let s3_credentials = resolve_s3_credentials(s3_credentials_path.as_deref())?;
+    let segment_store_config = parse_segment_store(
+        segment_store.as_deref(),
+        s3_credentials.as_ref(),
+        allow_insecure_s3,
+    )?;
+    let backup_store_config = parse_backup_store(
+        backup_store.as_deref(),
+        s3_credentials.as_ref(),
+        allow_insecure_s3,
+    )?;
 
     let p = |role: u16| SocketAddr::new(ip, base_port.wrapping_add(role));
     let addrs = RoleAddrs {
@@ -2106,7 +2344,7 @@ async fn run_join(args: &[String]) -> Result<(), String> {
         // wired here — ADR 0064, S-01 commit 2 scope; use `--config`/
         // `--node` against a config file with a `tls` section instead).
         tls: None,
-        encryption_key_path: None,
+        encryption_key_path,
     };
     let dir_name = id
         .as_ref()
@@ -2114,9 +2352,21 @@ async fn run_join(args: &[String]) -> Result<(), String> {
         .unwrap_or_else(|| format!("mint-{base_port}"));
     let dir = dir.unwrap_or_else(|| std::env::temp_dir().join(format!("animusd-join-{dir_name}")));
 
-    let node = animusd::run_node_join(seeds, id, addrs, &dir, backend, BTreeMap::new())
-        .await
-        .map_err(|e| format!("failed to join: {e}"))?;
+    let node = animusd::run_node_join_with_settings(
+        seeds,
+        id,
+        addrs,
+        &dir,
+        backend,
+        BTreeMap::new(),
+        quiesce_after,
+        heartbeat_batch,
+        shared_wal,
+        segment_store_config,
+        backup_store_config,
+    )
+    .await
+    .map_err(|e| format!("failed to join: {e}"))?;
     // `join` accepts no `--tls-*` flag at all (see `addrs.tls: None` above)
     // — always plain HTTP.
     let scheme = scheme(false);
@@ -2240,7 +2490,7 @@ async fn run_in_process_cluster(
 /// `--cluster-control N --cluster-data M` dev-convenience sibling of
 /// `--cluster N` ([`run_in_process_cluster`]), backed by
 /// [`animusd::start_split_cluster_with`].
-#[allow(clippy::too_many_arguments)] // mirrors `start_split_cluster_with_orphan_sweep_after`'s own arity
+#[allow(clippy::too_many_arguments)] // mirrors `start_split_cluster_with_growth`'s own arity
 async fn run_in_process_split_cluster(
     control_n: usize,
     data_n: usize,
@@ -2252,6 +2502,9 @@ async fn run_in_process_split_cluster(
     auto_split_ops_rate: Option<u64>,
     orphan_sweep_after: Duration,
     dynamo_auth: Option<std::sync::Arc<BTreeMap<String, String>>>,
+    quiesce_after: Duration,
+    heartbeat_batch: bool,
+    shared_wal: bool,
 ) -> Result<(), String> {
     if control_n == 0 || data_n == 0 {
         return Err("--cluster-control and --cluster-data must each be at least 1".into());
@@ -2268,6 +2521,9 @@ async fn run_in_process_split_cluster(
         auto_split_change_rate,
         auto_split_ops_rate,
         dynamo_auth,
+        quiesce_after,
+        heartbeat_batch,
+        shared_wal,
     )
     .await
     .map_err(|e| format!("failed to start split cluster: {e}"))?;
@@ -3047,5 +3303,201 @@ mod tests {
         let err = apply_encryption_key_flag(&mut config, 5, Some("key5.hex".to_string()))
             .expect_err("index 5 is out of range for a 1-node config");
         assert!(err.contains("out of range"), "{err}");
+    }
+
+    // --- issue #676: per-node knob reach on `join`/`data --seed`/
+    // `--cluster-control`+`--cluster-data`/`control` ------------------------
+
+    #[test]
+    fn reject_data_config_seed_only_flags_all_false_is_a_no_op() {
+        reject_data_config_seed_only_flags(false, false, false, false, false, false)
+            .expect("no seed-only flag set must not error");
+    }
+
+    #[test]
+    fn reject_data_config_seed_only_flags_rejects_encryption_key() {
+        let err = reject_data_config_seed_only_flags(true, false, false, false, false, false)
+            .expect_err("--encryption-key alongside --config must be rejected");
+        assert!(err.contains("--encryption-key"), "{err}");
+        assert!(err.contains("data --seed"), "{err}");
+    }
+
+    #[test]
+    fn reject_data_config_seed_only_flags_rejects_quiesce_after() {
+        let err = reject_data_config_seed_only_flags(false, true, false, false, false, false)
+            .expect_err("--quiesce-after alongside --config must be rejected");
+        assert!(err.contains("--quiesce-after"), "{err}");
+    }
+
+    #[test]
+    fn reject_data_config_seed_only_flags_rejects_heartbeat_batch() {
+        let err = reject_data_config_seed_only_flags(false, false, true, false, false, false)
+            .expect_err("--heartbeat-batch alongside --config must be rejected");
+        assert!(err.contains("--heartbeat-batch"), "{err}");
+    }
+
+    #[test]
+    fn reject_data_config_seed_only_flags_rejects_shared_wal() {
+        let err = reject_data_config_seed_only_flags(false, false, false, true, false, false)
+            .expect_err("--shared-wal alongside --config must be rejected");
+        assert!(err.contains("--shared-wal"), "{err}");
+    }
+
+    #[test]
+    fn reject_data_config_seed_only_flags_rejects_segment_store() {
+        let err = reject_data_config_seed_only_flags(false, false, false, false, true, false)
+            .expect_err("--segment-store alongside --config must be rejected");
+        assert!(err.contains("--segment-store"), "{err}");
+    }
+
+    #[test]
+    fn reject_data_config_seed_only_flags_rejects_backup_store() {
+        let err = reject_data_config_seed_only_flags(false, false, false, false, false, true)
+            .expect_err("--backup-store alongside --config must be rejected");
+        assert!(err.contains("--backup-store"), "{err}");
+    }
+
+    /// `run_join`'s parser recognizes every new issue-#676 flag — proven
+    /// without any real network I/O: the full argument loop runs to
+    /// completion (an unrecognized flag would fail there with "unknown join
+    /// argument"), and only the SUBSEQUENT `--seed` presence check (deferred
+    /// past the loop) fails, since this call deliberately omits `--seed`.
+    #[tokio::test]
+    async fn run_join_parses_every_new_settings_flag() {
+        let err = run_join(&[
+            "--encryption-key".to_string(),
+            "key.hex".to_string(),
+            "--quiesce-after".to_string(),
+            "10".to_string(),
+            "--heartbeat-batch".to_string(),
+            "--no-shared-wal".to_string(),
+            "--segment-store".to_string(),
+            "cluster".to_string(),
+            "--backup-store".to_string(),
+            "cluster".to_string(),
+            "--s3-credentials".to_string(),
+            "creds.json".to_string(),
+            "--allow-insecure-s3".to_string(),
+        ])
+        .await
+        .expect_err("no --seed was given");
+        assert!(
+            err.contains("requires --seed"),
+            "expected the --seed-missing error, got: {err}"
+        );
+        assert!(
+            !err.contains("unknown join argument"),
+            "a new issue-#676 flag was not recognized by the parser: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_join_still_rejects_a_genuinely_unknown_flag() {
+        let err = run_join(&["--this-flag-does-not-exist".to_string()])
+            .await
+            .expect_err("an unrecognized flag must still be rejected");
+        assert!(err.contains("unknown join argument"), "{err}");
+    }
+
+    /// `run_data`'s `--seed` branch parser recognizes every new issue-#676
+    /// flag — the identical "run past the parse loop, fail on the next
+    /// real check" technique `run_join_parses_every_new_settings_flag` uses,
+    /// here failing on the missing `--base-port` instead.
+    #[tokio::test]
+    async fn run_data_seed_parses_every_new_settings_flag() {
+        let err = run_data(&[
+            "--seed".to_string(),
+            "127.0.0.1:1".to_string(),
+            "--encryption-key".to_string(),
+            "key.hex".to_string(),
+            "--quiesce-after".to_string(),
+            "10".to_string(),
+            "--no-heartbeat-batch".to_string(),
+            "--shared-wal".to_string(),
+            "--segment-store".to_string(),
+            "cluster".to_string(),
+            "--backup-store".to_string(),
+            "cluster".to_string(),
+        ])
+        .await
+        .expect_err("no --base-port was given");
+        assert!(
+            err.contains("requires an explicit --base-port"),
+            "expected the --base-port-missing error, got: {err}"
+        );
+        assert!(
+            !err.contains("unknown data argument"),
+            "a new issue-#676 flag was not recognized by the parser: {err}"
+        );
+    }
+
+    /// `data --config` rejects every new issue-#676 flag outright (the
+    /// [`reject_data_config_seed_only_flags`] guard, unit-tested in
+    /// isolation above) rather than silently ignoring it — exercised here
+    /// through the real `run_data` dispatch, proving the guard actually
+    /// fires on that path and not just in isolation.
+    #[tokio::test]
+    async fn run_data_config_rejects_seed_only_flags() {
+        let err = run_data(&[
+            "--config".to_string(),
+            "cluster.json".to_string(),
+            "--node".to_string(),
+            "0".to_string(),
+            "--quiesce-after".to_string(),
+            "10".to_string(),
+        ])
+        .await
+        .expect_err("--quiesce-after alongside --config must be rejected");
+        assert!(err.contains("--quiesce-after"), "{err}");
+        assert!(err.contains("only accepted with"), "{err}");
+    }
+
+    /// `run_control`'s parser recognizes `--encryption-key` — proven the
+    /// identical way: the loop runs to completion, and only the subsequent
+    /// `--config`-presence check (deferred past the loop) fails.
+    #[tokio::test]
+    async fn run_control_parses_encryption_key_flag() {
+        let err = run_control(&["--encryption-key".to_string(), "key.hex".to_string()])
+            .await
+            .expect_err("no --config was given");
+        assert!(
+            err.contains("requires --config FILE"),
+            "expected the --config-missing error, got: {err}"
+        );
+        assert!(
+            !err.contains("unknown control argument"),
+            "--encryption-key was not recognized by the control parser: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_control_still_rejects_a_genuinely_unknown_flag() {
+        let err = run_control(&["--this-flag-does-not-exist".to_string()])
+            .await
+            .expect_err("an unrecognized flag must still be rejected");
+        assert!(err.contains("unknown control argument"), "{err}");
+    }
+
+    /// `--cluster-control`/`--cluster-data` still hard-rejects
+    /// `--encryption-key` (unchanged posture, TLS's own precedent) even
+    /// though `--quiesce-after`/`--heartbeat-batch`/`--shared-wal` now
+    /// thread through it (proven for real in
+    /// `tests/split_cluster.rs::cluster_control_data_threads_quiesce_after_
+    /// to_admin_config`, since that wiring needs a genuine bring-up to
+    /// observe, not just a parse check).
+    #[tokio::test]
+    async fn cluster_control_data_still_rejects_encryption_key() {
+        let err = run(&[
+            "--cluster-control".to_string(),
+            "1".to_string(),
+            "--cluster-data".to_string(),
+            "1".to_string(),
+            "--encryption-key".to_string(),
+            "key.hex".to_string(),
+        ])
+        .await
+        .expect_err("--encryption-key must still be rejected on this dev-only path");
+        assert!(err.contains("--encryption-key"), "{err}");
+        assert!(err.contains("not yet supported"), "{err}");
     }
 }

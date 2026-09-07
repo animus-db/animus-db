@@ -65,6 +65,22 @@ fn fat_member(node: u64, n_keys: usize) -> MetaCommand {
     }
 }
 
+/// Idle-stall bound for the compaction-convergence poll below (issue #741):
+/// how long the apply task's own watermark ([`RaftNode::engine_applied_index`])
+/// may sit frozen, with the target still unmet, before that is treated as a
+/// real stall rather than `cargo test --workspace`/CI-runner-scale
+/// contention. Matches `animusd/tests/support/mod.rs::IDLE_STALL_TIMEOUT` —
+/// the same convention, for the same underlying reason (see that constant's
+/// own doc and `docs/engineering-lessons.md`'s DRIVER_APPLIED entry).
+const COMPACT_IDLE_STALL: Duration = Duration::from_secs(60);
+
+/// Outer wall-clock backstop for the compaction-convergence poll — guards
+/// against a genuine deadlock even while the watermark keeps inching
+/// forward (so [`COMPACT_IDLE_STALL`] alone never fires). Not the normal
+/// exit path; every observed run compacts in well under a second when the
+/// apply task isn't starved.
+const COMPACT_OVERALL_BACKSTOP: Duration = Duration::from_secs(150);
+
 /// A freshly-joined follower catches a large, compacted control cluster up quickly,
 /// and leadership does not run away while it does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
@@ -75,7 +91,13 @@ async fn large_metadata_catch_up_stays_live() {
     // is *prompt catch-up* below.
     const MAX_TERM_DELTA: u64 = 25;
 
-    timeout(Duration::from_secs(90), async {
+    // Outer budget: the (now progress-gated, not deadline-gated — see the
+    // compaction poll below) fat-member phase can legitimately take up to
+    // `COMPACT_OVERALL_BACKSTOP` under contention, plus room for leader
+    // election (bounded at 10s by `leader_of`'s own 200×50ms poll) and node
+    // 2's own tight 12s catch-up budget (a deliberate timing guard on a
+    // different property — see that phase's own comment — left unchanged).
+    timeout(Duration::from_secs(210), async {
         let group: Vec<NodeId> = vec![nid(0), nid(1), nid(2)];
         let dirs: Vec<_> = (0..3).map(|_| unique_tmp_dir()).collect();
         let loop0 = || "127.0.0.1:0".parse::<SocketAddr>().unwrap();
@@ -137,20 +159,58 @@ async fn large_metadata_catch_up_stays_live() {
         }
 
         // Wait until both running replicas have compacted well past the fat members.
+        //
+        // Progress-gated, not deadline-gated (issue #741): `Metadata` is
+        // `DRIVER_APPLIED` (ADR 0038) — compaction is driven by the async apply
+        // task's own watermark (`engine_applied_index`, gated against
+        // `SNAPSHOT_THRESHOLD` in `node.rs`), deliberately decoupled from the
+        // consensus loop so a slow apply pass can never stall Raft's own
+        // heartbeat/election servicing. That decoupling means the apply task's
+        // forward progress has NO contention-independent latency bound — under
+        // CI-runner-scale CPU contention (sibling jobs on a shared runner, or
+        // `cargo test --workspace`-scale load) it can sit frozen for tens of
+        // seconds with nothing wrong, then catch up fine
+        // (`docs/engineering-lessons.md`'s DRIVER_APPLIED entry has a directly
+        // measured instance of exactly this: `engine_applied_index` frozen for
+        // 60s while `commit_index`/`last_applied` had converged in under 1s).
+        // A flat wall-clock deadline here (the pre-#741 shape) treats that
+        // legitimate lag as a failure. This loop instead fails only once
+        // BOTH nodes' own apply watermarks have made zero forward progress for
+        // `COMPACT_IDLE_STALL` with the target still unmet — a real stall, not
+        // contention — or `COMPACT_OVERALL_BACKSTOP` expires (a livelock guard,
+        // not the normal exit path).
         let mut compacted = false;
-        for _ in 0..600 {
+        let mut last_progress = std::time::Instant::now();
+        let mut last_seen = (node0.engine_applied_index(), node1.engine_applied_index());
+        let compact_deadline = std::time::Instant::now() + COMPACT_OVERALL_BACKSTOP;
+        loop {
             leader.flush().await;
             if node0.snapshot_index() >= 200 && node1.snapshot_index() >= 200 {
                 compacted = true;
+                break;
+            }
+            let seen_now = (node0.engine_applied_index(), node1.engine_applied_index());
+            if seen_now != last_seen {
+                last_seen = seen_now;
+                last_progress = std::time::Instant::now();
+            } else if last_progress.elapsed() >= COMPACT_IDLE_STALL {
+                break;
+            }
+            if std::time::Instant::now() >= compact_deadline {
                 break;
             }
             sleep(Duration::from_millis(50)).await;
         }
         assert!(
             compacted,
-            "replicas did not compact past the fat members (node0 snap={}, node1 snap={})",
+            "replicas did not compact past the fat members (node0 snap={} applied={}, node1 \
+             snap={} applied={}) — the apply-task watermark made no forward progress for \
+             {COMPACT_IDLE_STALL:?} with the target unmet, or the {COMPACT_OVERALL_BACKSTOP:?} \
+             overall backstop expired",
             node0.snapshot_index(),
-            node1.snapshot_index()
+            node0.engine_applied_index(),
+            node1.snapshot_index(),
+            node1.engine_applied_index(),
         );
 
         // Re-resolve the current leader (leadership may have moved during setup).

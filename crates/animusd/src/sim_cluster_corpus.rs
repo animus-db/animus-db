@@ -122,7 +122,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use animus_env::{Clock, EnvExt, Rng};
+use animus_env::{Clock, EnvExt, Rng, nid};
 use animus_sim::SimEnv;
 use animus_test::corpus::{self, SeedVariant};
 use animus_test::history::{Key, Mop, Process};
@@ -627,6 +627,62 @@ fn run_delete_probe(
     Ok(node_count)
 }
 
+/// ADR 0061 rung D4 PR 1's "no zombie groups" invariant, generalized to any
+/// `SimCluster` scenario (not just `sim_cluster_dynamo_table_ops.rs`'s own
+/// rebalance-specific one): every node's own [`SimCluster::hosted_tablets`]
+/// set must equal EXACTLY the tablets whose current `Metadata` replica set
+/// names that node — no stale handle for a replica this scenario's own
+/// fault schedule (or, in principle, an ordinary rebalance) moved off, and
+/// no missing host for one just added. Converged-or-timeout polled — a
+/// real reconciler's own teardown is itself async
+/// (`animus_cp_data::host::RECLAIM_STOP_TIMEOUT`-bounded on the production
+/// side), so a snapshot taken mid-teardown can legitimately still show a
+/// stale entry for one more tick.
+///
+/// None of this corpus's own scenario shapes actually drive a rebalance
+/// today (every cell's own `nodes`/`replication`/`tables` combination keeps
+/// every node's own hosted-tablet count within the ADR 0029 max−min ≤ 1
+/// balanced band — see `base_workload`'s own call sites), so this check is
+/// a non-vacuous regression only against a FUTURE cell that changes that;
+/// it is checked unconditionally anyway, the same "safety property, fault
+/// or not" discipline `animus-control`'s own corpus doc states for its
+/// schema-catalog-exclusivity check.
+fn check_no_zombie_groups(cluster: &mut SimCluster, seed: u64, nodes: usize) -> Result<(), String> {
+    const BUDGET: Duration = Duration::from_secs(10);
+    const STEP: Duration = Duration::from_millis(100);
+    let mut elapsed = Duration::ZERO;
+    loop {
+        let mut mismatch: Option<String> = None;
+        for node in 0..nodes as u64 {
+            let meta = cluster.metadata(node);
+            let expected: BTreeSet<TabletId> = meta
+                .tablets
+                .iter()
+                .filter(|(_, t)| t.replicas.contains(&nid(node)))
+                .map(|(&id, _)| id)
+                .collect();
+            let got = cluster.hosted_tablets(node);
+            if got != expected {
+                mismatch = Some(format!(
+                    "node {node}: hosted={got:?} expected(from Metadata)={expected:?} \
+                     (seed={seed})"
+                ));
+                break;
+            }
+        }
+        match mismatch {
+            None => return Ok(()),
+            Some(detail) => {
+                if elapsed >= BUDGET {
+                    return Err(detail);
+                }
+                cluster.run_for(STEP);
+                elapsed += STEP;
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The scenario runner.
 // ---------------------------------------------------------------------------
@@ -642,6 +698,8 @@ struct ScenarioResult {
     non_hosting_ok_writes: usize,
     /// `Ok(node_count)` (every node proved) from [`run_delete_probe`].
     delete_probe: Result<usize, String>,
+    /// `Ok(())` from [`check_no_zombie_groups`] (ADR 0061 rung D4 PR 1).
+    no_zombie_groups: Result<(), String>,
 }
 
 fn combine_reports(seed: u64, reports: impl Iterator<Item = CheckReport>) -> CheckReport {
@@ -811,6 +869,7 @@ fn run_scenario(s: &Scenario) -> ScenarioResult {
         .sum();
 
     let delete_probe = run_delete_probe(&mut cluster, &table_names[0], s.nodes);
+    let no_zombie_groups = check_no_zombie_groups(&mut cluster, s.seed, s.nodes);
 
     ScenarioResult {
         cycles,
@@ -820,6 +879,7 @@ fn run_scenario(s: &Scenario) -> ScenarioResult {
         nonempty_reads,
         non_hosting_ok_writes,
         delete_probe,
+        no_zombie_groups,
     }
 }
 
@@ -843,7 +903,11 @@ fn run_scenario_identified(s: &Scenario) -> ScenarioResult {
 }
 
 fn scenario_failed(r: &ScenarioResult) -> bool {
-    !r.cycles.ok || !r.durability.ok || !r.convergence.ok || r.delete_probe.is_err()
+    !r.cycles.ok
+        || !r.durability.ok
+        || !r.convergence.ok
+        || r.delete_probe.is_err()
+        || r.no_zombie_groups.is_err()
 }
 
 fn assert_scenario_ok(s: &Scenario, r: &ScenarioResult) {
@@ -867,6 +931,13 @@ fn assert_scenario_ok(s: &Scenario, r: &ScenarioResult) {
         "scenario {} delete probe failed: {:?} (seed={})",
         s.name,
         r.delete_probe,
+        s.seed
+    );
+    assert!(
+        r.no_zombie_groups.is_ok(),
+        "scenario {} left a zombie group: {:?} (seed={})",
+        s.name,
+        r.no_zombie_groups,
         s.seed
     );
 }

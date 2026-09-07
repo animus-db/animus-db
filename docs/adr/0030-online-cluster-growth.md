@@ -332,3 +332,37 @@ growth node now self-mints its own `NodeId` (or proposes an explicit one)
 and the replicated CAS — not a pre-bind address check — is what makes a
 collision structurally unreachable. This ADR's growth model (data-plane-only
 elasticity, a static control core) is otherwise untouched by ADR 0040.
+
+## Amended 2026-09-07 — deterministic coverage under ADR 0061 (C-04 D4 PR 4)
+
+This ADR's own §1 self-registration/promotion sequence — a growth node
+claiming its identity, being inserted `Down`, and promoting to `Active`
+once a real heartbeat is observed — now has deterministic, seed-reproducible
+coverage: `crates/animusd/src/sim_cluster.rs`'s `SimCluster::grow` drives
+the identical `MetaCommand::RegisterNode`/`UpsertMember{Active}` pair this
+ADR's §1 describes (the fixture's own control-plane-bypass idiom, not the
+real relayed `admin_add_member` dance — see that method's own doc), and
+proves a data-only growth node's `ControlHandle::Remote` mirror (the ADR
+0035 generalization this ADR's own "Amended by ADR 0035" section already
+anticipates) converges under `SimEnv` for the first time — previously only
+provable over real sockets (`crates/animusd/tests/cluster_growth.rs`,
+`seed_join.rs`, `seed_join_allocated.rs`, `data_join.rs`). Five scenarios in
+`crates/animusd/src/sim_cluster_growth.rs`: ordinary grow-and-serve, growth
+followed by a real rebalance-driven placement onto the new node, grow-then-
+decommission, a control-plane leader crash between the two registration
+proposes, and the mirror's long-poll recovering from a full partition. See
+`crates/animusd/CLAUDE.md`'s matching entry and ADR 0061's "D4 PR 4"
+amendment for the full account, including the fixture's own
+`ControlHandle::Remote`-under-`SimEnv` mirror-sync loop
+(`spawn_remote_mirror_sync_loop`) and what still requires `ProdEnv` (every
+real-socket join, `--seed` discovery, config-file resolution, DNS-based
+seed addressing).
+
+This deterministic coverage is a genuine second proof of this ADR's own
+model, not a replacement for the `ProdEnv` regressions above — a `SimCluster`
+node is always data-only-role-shaped and the fixture's growth is a
+one-shot route-table patch (see `SimCluster::grow`'s own doc), not the real
+`route_sync_loop`/`intra_route_sync_loop` incremental-discovery machinery
+this ADR's own `Metadata.node_addrs` design describes; that machinery, and
+a `"combined"` (new control-plane-voter) growth node, remain `ProdEnv`-only
+and un-sim-tested.

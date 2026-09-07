@@ -617,3 +617,44 @@ the added replicas' storage/compute cost (not their read capacity) is
 specifically what is worth cutting. Neither condition holds today.
 
 `docs/roadmap.md`'s C-03 entry is updated to record this outcome.
+
+## Amendment (2026-09-07): issue #676 — `--heartbeat-batch` reach on `join`/`data --seed`/`--cluster-control`+`--cluster-data`
+
+The phase-2-cutover amendment above named the follow-up precisely: "a
+follow-up closing one of `--quiesce-after`'s own documented gaps should
+close the matching `--heartbeat-batch` one in the same change." This is
+that follow-up (paired with ADR 0048's own identical amendment for
+`--quiesce-after` itself, and ADR 0028's for `--shared-wal` — all three
+knobs share one wrapper chain, so all three closed together).
+
+`--heartbeat-batch`/`--no-heartbeat-batch` now reach `join` and
+`data --seed` (via `animusd::run_node_join_with_settings`/`run_node_data_
+join_with_settings`, new widened siblings of `run_node_join`/
+`run_node_data_join` — the two narrower, original-arity functions keep
+compiling unchanged for every existing caller and now default internally
+to `DEFAULT_HEARTBEAT_BATCH` instead of hardcoding `false`) and
+`--cluster-control`+`--cluster-data` (via `start_split_cluster_with_
+growth`'s new trailing `heartbeat_batch: bool` parameter, threaded from
+`run_in_process_split_cluster`'s own CLI dispatch). `start_split_cluster_
+with_orphan_sweep_after` (the narrower wrapper `tests/cluster_split.rs`
+calls directly) keeps hardcoding `false`, unaffected.
+
+**No new observable exists for this specific knob** — `--heartbeat-batch`
+still has no `/admin/config` field (a deliberate, pre-existing scope cut,
+unchanged by this amendment). The real regression proof for this reach
+closure rides on `--quiesce-after`'s own `quiesce_after_ms` field instead
+(`crates/animusd/tests/join_data_seed_settings_reach.rs`,
+`tests/split_cluster.rs::cluster_control_data_threads_quiesce_after_to_
+admin_config`) — both knobs are threaded through the identical wrapper
+chain at the identical call sites, so a passing `--quiesce-after`
+regression on a given entry point is direct evidence the same commit's
+`--heartbeat-batch` wiring at that same call site compiles and threads
+correctly too (the compiler enforces the argument, at the identical
+position, in the identical function signature). A dedicated
+`--heartbeat-batch` observable is still open work, tracked the same way
+the pre-existing gap was — see `crates/animusd/CLAUDE.md`'s "Heartbeat
+batching" section.
+
+See ADR 0048's own 2026-09-07 amendment for `--quiesce-after`'s identical
+closure and `crates/animusd/CLAUDE.md`'s "Heartbeat batching"/"Quiescence"
+sections for the current, complete per-entry-point enumeration.

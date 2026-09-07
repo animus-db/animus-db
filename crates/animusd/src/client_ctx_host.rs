@@ -9,24 +9,43 @@
 //! around. If a future change needs new *logic* here, it almost certainly
 //! belongs in the loop itself (`animus-node`) or in the method being
 //! delegated to, not in this file.
+//!
+//! **Widened to `impl<E: Env, R: RelayClient> .. for ClientCtx<E, R>` (ADR
+//! 0061 rung D4 PR 5)** — previously each impl here was pinned to the
+//! concrete `ClientCtx` alias (`E = ProdEnv, R = AnimusdRelayClient`), the
+//! one thing left stopping `animus_node::backup_janitor::
+//! backup_janitor_loop` from being drivable under `SimEnv` at all (every
+//! field each method reads — `self.edge`, `self.backup_store`,
+//! `self.backup_janitor_progress`, `self.effective_metadata()`
+//! — was already `E`/`R`-agnostic or already generic; only the four `impl`
+//! headers themselves were concrete). No method body changed: `self.edge.
+//! leader_handle()` already returns `Option<RaftNode<E>>` for the enclosing
+//! `ClientCtx<E, R>`'s own `E` (`ClusterEdgeState<E>`, widened by rung D3 PR
+//! 2a), and every other delegated-to method (`BackupStoreHandle::put`/
+//! `list_local`/`delete_local`/`delete`, `Mutex::lock`, `edge.hosted_
+//! groups()`, `dynamo::kind_write_item_at_leader::<E, R>`) was already
+//! `E`/`R`-generic since rung C5. This is a pure signature widening, the
+//! same "everything each method reads was already generic, only the impl
+//! header wasn't" shape `sim_cluster_auto_split.rs`'s own `auto_split_loop`
+//! widening found for its own two per-tablet bookkeeping maps.
 
 use animus_control::{Metadata, RaftNode};
 use animus_dynamo::AttributeValue;
-use animus_env::{NodeId, ProdEnv};
+use animus_env::{Env, NodeId};
 use animus_node::backup_janitor::JanitorProgress;
 use animus_node::host::{
-    BackupJanitorProgressHost, BackupObjectStore, ControlLeaderHost, TtlReaperProgressHost,
-    TtlScanHost,
+    BackupJanitorProgressHost, BackupObjectStore, ControlLeaderHost, RelayClient,
+    TtlReaperProgressHost, TtlScanHost,
 };
 use animus_node::ttl_reaper::TtlReaperProgress;
 use animus_tablet::TabletId;
 use async_trait::async_trait;
 
 use crate::dynamo::{self, KindWriteOutcome};
-use crate::{AnimusdRelayClient, ClientCtx, KindWriteOp};
+use crate::{ClientCtx, KindWriteOp};
 
-impl ControlLeaderHost<ProdEnv> for ClientCtx {
-    fn control_leader(&self) -> Option<RaftNode<ProdEnv>> {
+impl<E: Env, R: RelayClient> ControlLeaderHost<E> for ClientCtx<E, R> {
+    fn control_leader(&self) -> Option<RaftNode<E>> {
         self.edge.leader_handle()
     }
 }
@@ -40,7 +59,7 @@ impl ControlLeaderHost<ProdEnv> for ClientCtx {
 /// `ControlOnlyStore` test double), this impl just never exercises the
 /// `None` arm any more.
 #[async_trait]
-impl BackupObjectStore for ClientCtx {
+impl<E: Env, R: RelayClient> BackupObjectStore for ClientCtx<E, R> {
     async fn backup_put(&self, id: &str, bytes: &[u8]) -> Option<std::io::Result<Vec<NodeId>>> {
         Some(self.backup_store.put(id, bytes).await)
     }
@@ -62,7 +81,7 @@ impl BackupObjectStore for ClientCtx {
 /// `Arc<Mutex<JanitorProgress>>` `animus_node::backup_janitor::
 /// backup_janitor_loop` publishes into via this trait, and `GET
 /// /admin/backup-store` reads back out — see that field's own doc.
-impl BackupJanitorProgressHost for ClientCtx {
+impl<E: Env, R: RelayClient> BackupJanitorProgressHost for ClientCtx<E, R> {
     fn update_backup_janitor_progress(&self, update: &mut dyn FnMut(&mut JanitorProgress)) {
         let mut guard = self.backup_janitor_progress.lock().unwrap();
         update(&mut guard);
@@ -84,7 +103,7 @@ impl TtlReaperProgressHost for ClientCtx {
 }
 
 #[async_trait]
-impl TtlScanHost for ClientCtx {
+impl<E: Env, R: RelayClient> TtlScanHost for ClientCtx<E, R> {
     fn ttl_metadata(&self) -> Metadata {
         self.effective_metadata()
     }
@@ -145,7 +164,7 @@ impl TtlScanHost for ClientCtx {
             animus_dynamo::Comparator::Eq,
             expected,
         );
-        match dynamo::kind_write_item_at_leader::<ProdEnv, AnimusdRelayClient>(
+        match dynamo::kind_write_item_at_leader::<E, R>(
             self,
             &group,
             &meta,

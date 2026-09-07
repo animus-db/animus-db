@@ -1153,6 +1153,62 @@ split lifecycle (`NarrowScope`/`ProposeSeal`/`parent_seal_observed`, the
 `erase_bound` field, and their corpus scenarios) was **deleted** in the
 ADR 0050 Train B rung-7 sweep.
 
+**`EngineFactory::local_tablets` — the reconciler's second fact source
+(issue #722).** `gather_facts`/`plan` otherwise derive every fact
+exclusively from replicated `Metadata` (`MetadataView`) plus this
+reconciler's own in-process `LocalState` — never persisted, so a restart
+starts from `LocalState::default()`. That is a real gap for one case: a
+node that crashes while hosting a tablet, then restarts only after that
+tablet's whole table has been dropped and the drop has already converged
+everywhere else, comes back with an empty `LocalState` and a `Metadata`
+view that, by the time its first tick ever runs, already never names the
+dropped tablet at all — `gather_facts` then produces no fact whatsoever for
+that tablet id, and `HostAction::Reclaim` (which only ever fires for a
+tablet `LocalState` itself currently claims) can never target it: the
+tablet's own private engine — real data, written before the crash — leaks
+permanently. ADR 0024's own restart-convergence guarantee ("a replica that
+was down during the drop restarts, re-hosts the tablet from its
+marker/engine, then its GC loop reclaims it") depended on a durable
+per-node marker that no longer exists (ADR 0050) and was never replaced —
+see that ADR's 2026-09-07 amendment for the full incident.
+`EngineFactory::local_tablets(&self) -> BTreeSet<TabletId>` closes it: a
+second, restart-surviving fact source, listing every tablet id this node
+currently has DURABLE local engine state for, independent of `Metadata`.
+Default implementation returns empty (so a third-party trait implementor
+still compiles); `MemoryTabletEngines` answers from its own registry keys,
+`animusd`'s `LsmTabletFactory` by listing its data directory once and
+parsing each file's own `db-t{tablet}-` prefix (the identical mechanism
+`probe`/`destroy` already use, generalized from "does this one tablet's
+prefix appear" to "which ids appear at all"). `Reconciler::tick` consults
+it exactly **once**, on its very first tick after construction — never on
+a later tick, since a local engine appearing after that first tick can
+only be this same reconciler's own `Host`/`MaterializeSplitChild` action,
+already tracked in `LocalState` — so the fix costs nothing in steady
+state, only a one-time directory listing right after a restart.
+`plan` gained a matching `local_tablets: &BTreeSet<TabletId>` parameter: a
+new phase, before the pre-existing reclaim phase, folds any id present in
+`local_tablets` but absent from a `known` set (every current
+`view.tablets` key, **plus** every split child named on any tablet's own
+still-live `inplace_split` intent — a pre-cutover child is materialized,
+by design, before it has a map entry of its own, see
+`MaterializeSplitChild`'s doc) into `LocalState::hosted`, so the
+pre-existing, unmodified reclaim phase picks it up exactly like any other
+hosted-but-now-absent tablet. **Safety argument**: an engine only ever
+exists locally for a tablet id this exact node has, at some prior tick,
+itself observed as real — `Host`/`MaterializeSplitChild` are the only two
+actions that ever create one, and both fire only in reaction to observing
+the tablet in `view.tablets` or a live split intent's own children — so a
+locally-present id absent from `known` is never "a tablet that hasn't
+appeared in `Metadata` yet" (structurally impossible by that argument),
+only ever a genuine leftover. `plan`'s own doc has this argument stated in
+full. Tests: `host.rs`'s own unit tests
+(`a_locally_present_tablet_absent_from_the_map_is_reclaimed_even_with_
+empty_state`, `a_pre_cutover_split_childs_engine_is_not_reclaimed_even_
+with_empty_state`) and `tests/reconciler_corpus.rs`'s
+`crash_then_drop_then_restart_reclaims_the_leftover_engine` scenario; see
+`animusd/CLAUDE.md`'s own drop-table-GC entry for the `SimCluster`/
+DynamoDB-wire and real-`LsmEngine` regressions this fix also carries.
+
 - **`plan` never removes a tablet from `LocalState::hosted` on its own**
   when emitting a fallible teardown (`Reclaim`/`Release`) — real teardown
   is async and can time out. The caller calls

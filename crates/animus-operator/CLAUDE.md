@@ -714,13 +714,17 @@ Written carefully and `bash -n`-checked, never run end to end anywhere —
 treat a first real CI failure on the `e2e-kind-encryption` job as this
 leg finding its first real bug.
 
-**No CRD field or code touches the default replicated `cluster` segment/
-backup store** — that gap (issue #680) sits entirely in `animus-cp-data`,
-outside anything this operator's mount could influence either way, and
-`issue #676` (several per-node flags, `--encryption-key` among them, not
-threaded through `animusd join`/`data --seed`/`--cluster-control`+
-`--cluster-data`) is likewise irrelevant to this operator, which never
-generates those invocations.
+**No CRD field or code in this crate touches the default replicated
+`cluster` segment/backup store, and none was needed** — that gap (issue
+#680) was closed entirely in `animusd` (ADR 0069's "As-built: cluster
+store" amendment, `crates/animusd/CLAUDE.md`'s `--encryption-key` entry),
+with no change to `animus-cp-data`/`ClusterSegmentStore` and nothing for
+this operator's own mount to do differently — the same `Secret`/mount
+this section already describes now seals every store the key reaches,
+`cluster` included. `issue #676` (several per-node flags,
+`--encryption-key` among them, not threaded through `animusd join`/
+`data --seed`/`--cluster-control`+`--cluster-data`) remains irrelevant
+to this operator, which never generates those invocations.
 
 ## PodDisruptionBudget (S-07c, closes `docs/roadmap.md`'s S-07 item c and
 this crate's own ADR 0060 deferred-list bullet)

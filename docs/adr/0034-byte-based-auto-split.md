@@ -429,3 +429,94 @@ unprovisioned cluster's added cost stays one atomic load per interval. See
 ADR 0067 for the full design, including how it reaches a legal split key
 on a just-provisioned, still-empty tablet (a case the three triggers above
 structurally never encounter).
+
+## Amendment (2026-09-07, ADR 0061 rung D4 PR 2): `auto_split_loop` on the `Env` seam, deterministic coverage
+
+`auto_split_loop` (`animusd::lib.rs`) was concrete `ClientCtx`/`tokio::
+time::Instant` — i.e. `ProdEnv` only — since its own introduction: every
+production spawn site monomorphized it at `ProdEnv` implicitly, and its two
+per-tablet bookkeeping maps (`last_triggered`, gating the cooldown;
+`last_counted`, gating the materializing-confirm cadence) were keyed by
+`tokio::time::Instant`, read via `.elapsed()`. That made it, alongside the
+other three triggers' shared machinery, one of the handful of named D4
+residuals `crates/animusd/CLAUDE.md`'s own D4 PR 1 entry lists as
+unstarted ("auto-split's own `tokio::time` conversion").
+
+**Widened to `async fn auto_split_loop<E: Env, R: RelayClient>(ctx:
+ClientCtx<E, R>, thresholds: AutoSplitThresholds)`** — one signature, plus
+one already-generic-elsewhere helper type reference (`Option<(TabletId,
+u128, CpGroup<E>)>` inside the fourth, min-tablets arm, previously bare
+`CpGroup` i.e. `CpGroup<ProdEnv>`) needed widening to compile generically.
+The mechanical conversion: `tokio::time::sleep(AUTO_SPLIT_INTERVAL).await`
+→ `ctx.env.sleep(AUTO_SPLIT_INTERVAL).await`; both maps re-typed
+`BTreeMap<TabletId, animus_env::Nanos>`; every `.elapsed() < / >=
+AUTO_SPLIT_COOLDOWN` comparison became `ctx.env.now().duration_since(at) <
+/ >= AUTO_SPLIT_COOLDOWN` (`Nanos` has no `Add<Duration>`/`elapsed()` —
+this is the identical `saturating_add`/`duration_since` shape ADR 0061
+rung C5 step 3b's own conversion notes already established, see `crates/
+animusd/CLAUDE.md`); every `tokio::time::Instant::now()` insert became
+`ctx.env.now()`. The trigger arithmetic itself (`approx_bytes`,
+`byte_weighted_median`, the cooldown/confirm gating logic, the four-arm
+structure) is byte-identical — a pure seam substitution, confirmed by the
+unchanged real-socket `ProdEnv` tests listed below staying green
+byte-for-byte before and after. The two production spawn sites
+(`BoundNode::start_with`'s combined and data-only branches) are unchanged
+— `ClientCtx`'s own definition-site default (`E = ProdEnv, R =
+AnimusdRelayClient`) means `tokio::spawn(auto_split_loop(ctx.clone(),
+..))` still infers the identical concrete instantiation with zero call-site
+changes.
+
+**A second, smaller widening was needed to make the fork's own control-
+plane cutover reachable under `SimEnv` at all** — orthogonal to
+`auto_split_loop` itself, but load-bearing for deterministic coverage to
+exist: since ADR 0058, the CP data plane's real `host::Reconciler` (wired
+into `SimCluster` since D4 PR 1) only *forks* an in-place split (proposes
+`KvCommand::SplitTablet`, materializes both children's engines) — the
+control-plane `MetaCommand::CutoverSplit` that actually activates both
+children and retires the parent is proposed by a separate per-node loop,
+`index_drain::change_consumer_loop` (specifically its
+`inplace_split_driver_tick` arm), which was ALSO concrete `ClientCtx`
+(`gsi_caught_up`, its own private helper, concrete `CpGroup` too) and which
+`SimCluster` has never spawned as a background loop (it also drives
+Streams/PITR/GSI-drain machinery this fixture has no general need to
+exercise — see `crates/animusd/CLAUDE.md`'s own `SimCluster` doc for why).
+Rather than widen and spawn the whole loop, `inplace_split_driver_tick`
+and `gsi_caught_up` were widened the identical way (their own callees —
+`seal_now`/`pitr_seal_now`/`drain_tablet`/`ClientCtx::propose_schema` —
+were already `<E, R>`-generic since rung C5 step 3b), and a new
+`SimCluster::drive_inplace_split_cutover(node)` manually drives ONE pass of
+it per call, mirroring `SimCluster::drain_gsi`'s own pre-existing
+manual-drive shape for the identical reason.
+
+**The knob**: `SimCluster::set_auto_split_thresholds(thresholds)` — spawns
+`auto_split_loop` on every node right now, mirroring D4 PR 1's own
+`heartbeat_loop` spawn exactly, and stores the configuration so
+`SimCluster::restart` respawns it identically on a restarted node (whose
+`Simulator::stop` drops the task along with everything else it owned).
+**Defaulted off**: every scenario across every other `sim_cluster_*` module
+never calls it, so this rung changed no existing scenario's behavior.
+
+**Deterministic coverage**: `crates/animusd/src/sim_cluster_auto_split.rs`,
+five scenarios (a byte-threshold crossing forking exactly once with every
+pre-split key still readable through the wire; staying below threshold
+over a long window; a regrown child forking again after modest writes
+don't; a leadership move mid-window still yielding exactly one fork,
+driven by the newly elected leader; a crashed-and-restarted replica
+converging via the issue #722 `EngineFactory::local_tablets` fix), each
+replayed at 5 seeds. `cargo test -p animusd --lib`: 321 → 331 (+10, zero
+regressions). See `crates/animusd/CLAUDE.md`'s matching appendix for the
+module's own design notes, the two real-behavior gotchas its own build
+found (a burst of writes issued after the loop is armed can land mid-fork
+and needs the manual cutover driver threaded through the retry, and a
+crashed leader's own frozen "I am still leader" belief means a "wait for
+the new leader" poll must scan only live nodes, never `SimCluster::
+leader_index_of`, which scans every node unconditionally), and the ProdEnv
+test disposition (`crates/animusd/tests/cp_plane.rs`'s two byte-trigger
+tests removed in favor of the new sim scenarios; the skewed-value-size
+byte-weighted-median balance test, the manual-raw-key split test,
+`f11_split_alignment.rs`'s streamed-table alignment test, and
+`inplace_split_e2e.rs`'s both tests — one Streams-specific, one asserting
+real-thread-paced-writer timing under a real fork — all stay, since none
+of their specific claims are reproduced by the new deterministic
+scenarios). Remaining D4 residuals: PR 4 (join/growth) and PR 5 (the
+backup janitor's own `client_ctx_host.rs` widening).

@@ -4,7 +4,9 @@
   `Disk`-seam wrapper for WAL/engine files. PR 2 of 3 — `SegmentStore` —
   also implemented, see the 2026-09-06 "As-built: PR 2" amendment below.
   PR 3 of 3 — operator key-secret mount — also implemented, see the
-  2026-09-07 "As-built: PR 3" amendment below. **S-03 is complete.**)
+  2026-09-07 "As-built: PR 3" amendment below. **S-03 is complete.** The
+  default `cluster` segment/backup store PR 2 left untouched — issue #680
+  — is closed by the 2026-09-07 "As-built: cluster store" amendment below.)
 - **Date:** 2026-09-06
 - **Origin:** `docs/roadmap.md`'s S-03 ("Encryption at rest")
 - **Depends on:** [ADR 0003](0003-deterministic-simulation.md) (the `Env`
@@ -420,10 +422,12 @@ once per node startup, never on the read/write hot path.
   nothing in it builds toward it either.
 - PR 2 (`SegmentStore`) is implemented (see the "As-built: PR 2" amendment
   below) for the `fs:`/`s3://` opt-in stores, under a cluster-wide (not
-  per-node) key; the default replicated `cluster` store still writes
-  plaintext, a stated scope cut (tracked as issue #680). PR 3 (operator
-  key-secret mount) is implemented (see the "As-built: PR 3" amendment
-  below) — **S-03 is complete.**
+  per-node) key. PR 3 (operator key-secret mount) is implemented (see the
+  "As-built: PR 3" amendment below) — **S-03 is complete.** The default
+  replicated `cluster` store (`SegmentStoreConfig::Cluster`/
+  `BackupStoreConfig::Cluster`) — PR 2's own stated scope cut, tracked as
+  issue #680 — is closed by the 2026-09-07 "As-built: cluster store"
+  amendment below, under the identical cluster-wide key.
 
 ## As-built: PR 2 (`SegmentStore`, 2026-09-06)
 
@@ -514,8 +518,13 @@ generic parameter through `animus-cp-data`'s own `cluster_segment_store`
 module) with no design blocker, just out of this PR's scope. Stated here
 plainly per this ADR's own discipline against silently-stale claims:
 today, only the `Fs`/`S3` opt-in stores are sealed; the default replicated
-store stays plaintext on disk. A future PR closing this gap is a named,
-tracked follow-up, not assumed.
+store stays plaintext on disk. **Closed by the 2026-09-07 "As-built:
+cluster store" amendment below (issue #680)** — the "larger, structurally
+separate change" this paragraph anticipated turned out to be a single new
+local-store type occupying `ClusterSegmentStore`'s own pre-existing
+generic parameter, not a second generic threaded through every call site;
+see that amendment for what actually landed and why the type-parameter
+widening this paragraph worried about was smaller than expected.
 
 ### Loud refusal — the exact texts (`SegmentStore` counterpart of PR 1's own table)
 
@@ -851,17 +860,257 @@ tests + the `crd_manifest_pinned` regression, all green.
 
 ### What S-03 leaves open
 
-Two named, tracked follow-ups, neither closable from this PR's own
-scope:
+One named, tracked follow-up, not closable from this PR's own scope
+(**issue #680**, the default replicated `cluster` segment/backup store,
+was open at the time this PR landed — since closed, see the 2026-09-07
+"As-built: cluster store" amendment below):
 
-- **Issue #680** — the default replicated `cluster` segment/backup store
-  is still plaintext regardless of `spec.encryptionKeySecretName`; only
-  the `fs:`/`s3://` opt-in stores (PR 2) and per-node `Disk` files (PR 1)
-  are covered. Closing it means widening `ClusterSegmentStore`'s own
-  concrete type parameter in `animus-cp-data`, not anything this
-  operator's mount can influence.
 - **Issue #676** — `animusd join`/`data --seed`/`--cluster-control`+
   `--cluster-data` don't thread several per-node knobs including (since
   PR 1) `--encryption-key`; irrelevant to this operator (which never
   generates those invocations) but a real gap for a hand-run cluster
   using those entry points.
+
+## As-built: cluster store (2026-09-07, closes issue #680)
+
+The default `SegmentStoreConfig::Cluster`/`BackupStoreConfig::Cluster`
+store — the one every node runs unless `--segment-store`/`--backup-store`
+is explicitly overridden — is now sealed under `--encryption-key` too,
+closing the gap PR 2's own "`Cluster` (the default) is untouched" section
+(above) named and this ADR's Consequences/"What S-03 leaves open" sections
+tracked as issue #680.
+
+### The widening turned out smaller than PR 2 anticipated
+
+PR 2's own scope-cut paragraph worried that encrypting `Cluster` would
+mean "widening `ClusterSegmentStore`'s own concrete type parameter... a
+larger, structurally separate change... every call site that
+pattern-matches the `Cluster` variant would need to thread a second
+generic parameter through `animus-cp-data`'s own `cluster_segment_store`
+module." Tracing `ClusterSegmentStore<E: Env, S: SegmentStore + Clone +
+Send + Sync + 'static>`'s own definition (`animus-cp-data::
+cluster_segment_store`) found that concern was already moot: the type was
+**already generic** over its local building block `S` — never named
+concretely to `FsSegmentStore` inside the type itself, only at
+`animusd`'s own two construction sites
+(`SegmentStoreHandle::Cluster`/`BackupStoreHandle::Cluster`'s own field
+type). Closing the gap was therefore a single new local-store type
+occupying that pre-existing type parameter, entirely inside `animusd`,
+with **zero changes to `animus-cp-data`** — no second generic threaded
+through `cluster_segment_store.rs`, no call site there touched at all.
+
+### `LocalSegmentStore` — the new per-node local building block
+
+`animusd::LocalSegmentStore` (`lib.rs`, `pub(crate)`) is a small two-arm
+enum implementing `SegmentStore` by delegation:
+
+```rust
+enum LocalSegmentStore {
+    Plain(FsSegmentStore),
+    Encrypted(EncryptedSegmentStore<FsSegmentStore, ProdEnv>),
+}
+```
+
+`SegmentStoreHandle::Cluster`/`BackupStoreHandle::Cluster` changed from
+`ClusterSegmentStore<ProdEnv, FsSegmentStore>` to `ClusterSegmentStore<
+ProdEnv, LocalSegmentStore>` — **one variant each, never a fourth
+`EncryptedCluster` arm** (the preferred shape this ADR's own follow-up
+task named, over adding a sibling variant): every existing match arm
+handling `SegmentStoreHandle::Cluster`/`BackupStoreHandle::Cluster` is
+untouched, since the variant's own shape (one `ClusterSegmentStore`
+value) didn't change, only what its type parameter now is.
+
+`build_segment_store`/`build_backup_store`'s own `Cluster` arms both now
+call a small new helper, `local_cluster_store(env, dir, encryption_key)`
+— `dir` is `node_dir.join("segments")`/`node_dir.join("backups")`,
+identical to before this change — which runs the **identical**
+`Fs`/`S3`-arm logic these two functions already had, just factored out
+once rather than duplicated a third time: `encryption_key: Some(key)`
+wraps the raw `FsSegmentStore` in `EncryptedSegmentStore::open` (which
+itself runs the marker check as part of opening); `None` runs
+`verify_or_init_segment_store_marker` directly first (the "off by default
+still checks" rule PR 2 already established for `Fs`/`S3` — an
+already-encrypted local directory is never silently treated as plaintext
+just because this node omitted `--encryption-key`), then returns the
+plain `FsSegmentStore` unwrapped. This is the identical control flow the
+`Fs` arm has always had, now shared by three arms instead of two.
+
+### Key scope — the existing cluster-wide convention, now load-bearing for this store too
+
+**No new decision was needed here** — PR 2's own cluster-wide key-scope
+argument already covers `Cluster` by construction, more directly than it
+covers `fs:`/`s3://`: every node in a deployment already shares the
+identical `--encryption-key` file (the same "one key file's path repeated
+across every node's config entry" convention PR 1 established), and
+`ClusterSegmentStore`'s own replication (`put_replicated`/`get_from`)
+moves **only bytes** between nodes over the wire (`SegmentWire::Store`/
+`Fetch`, `animus-cp-data::cluster_segment_store`) — a target node's own
+`local.put(id, bytes)` call receives whatever bytes the sender's own
+`SegmentStore::put` produced, with no reinterpretation in between. Since
+every node's own `local` is now a `LocalSegmentStore::Encrypted` sealing
+under the identical cluster-wide key, the bytes crossing the wire between
+any two nodes are **ciphertext end to end** — ADR 0069's PR 1 threat
+model (a stolen/lost disk) extends unmodified to "a stolen/lost disk on
+*any* node holding a replica," and a node configured with no key, or a
+different key, can neither serve an object to a peer's `Fetch` (its own
+`local.get` would fail to authenticate, or — for a genuinely mismatched
+node — never even reach that point, since its own `local_cluster_store`
+call refused at startup) nor accept one from a peer's `Store` (same
+refusal, before it can host anything at all). A cluster mixing keyed and
+unkeyed/differently-keyed nodes is never silently half-encrypted, for the
+identical reason PR 2 already documented for `fs:`/`s3://`: each node's
+own marker check runs independently at **its own** startup, before it
+binds a single listener, so a misconfigured node simply never joins the
+replica set that store's objects flow through — the marker mismatch
+refusal texts are byte-identical to PR 2's own (below), since both paths
+call the identical `verify_or_init_segment_store_marker`.
+
+### Marker semantics — the identical function, two more directories
+
+No new refusal text, and no new marker mechanism: `local_cluster_store`
+calls the same `verify_or_init_segment_store_marker`/
+`EncryptedSegmentStore::open` PR 2 already built, against `<node
+dir>/segments`/`<node dir>/backups` — two more directories the existing
+three-way decision table (PR 2's own, reproduced in this file above)
+already covers correctly, with no changes to that function itself. One
+structural property worth naming plainly, since it shapes how the
+mismatch scenarios below had to be tested in isolation: `<node
+dir>/segments`/`<node dir>/backups` are **siblings** of `<node
+dir>/internal` (the directory PR 1's own `Disk`-seam marker check
+scans — `Node::bind`'s `ProdEnv::bind_with_tls_and_key(.., dir.join(
+"internal"), ..)` call), not the same directory, and `Disk::list()`'s own
+non-recursive listing never descends into a sibling subdirectory. The two
+seams therefore genuinely operate independently on disk, even though a
+real operator's `--encryption-key` covers both at once — a directory that
+is fresh from PR 1's own `Disk`-seam point of view (nothing under
+`<node dir>/internal` yet) can still hold pre-existing, differently-keyed
+or plaintext content under `<node dir>/segments`/`<node dir>/backups`,
+and vice versa. This is what lets the loud-refusal tests below prove the
+NEW `LocalSegmentStore` marker check specifically, rather than only ever
+observing PR 1's own pre-existing `Disk`-seam refusal (which — in the
+common, non-contrived case of one node's directory that has always been
+managed as a whole — usually fires first regardless, since a node that
+has ever written any WAL/engine content already carries PR 1's own
+marker the instant a key is first configured).
+
+### Tests
+
+`crates/animusd/tests/encryption_at_rest_default_cluster_store_e2e.rs`
+(`ProdEnv`, real sockets/disk, mirroring `encryption_at_rest_segment_
+store_e2e.rs`'s own shape for the `fs:` backup store, generalized to the
+**default** store and to both the segment AND backup halves at once):
+
+- A 2-node cluster, **every store left at its default** (no
+  `--segment-store`/`--backup-store` at all), started with
+  `--encryption-key`: a streamed table's `PutItem` seals a shard object
+  under `<node dir>/segments` on both replicas; `CreateBackup` issued
+  against node 0 converges to `AVAILABLE`; `RestoreTableFromBackup`
+  issued against **node 1** — which never captured the backup itself —
+  succeeds and reads back the exact backup-time value, proving the
+  cluster-wide key lets a peer decrypt what it never wrote (the identical
+  property PR 2's own `fs:` e2e proves, now for the default store). The
+  raw bytes under every node's own `segments`/`backups` directories are
+  grepped for the plaintext value at three points (after the seal, after
+  the backup, after the restore) and never contain it.
+- **Both loud-refusal directions**, each isolated from PR 1's own
+  `Disk`-seam marker per the "Marker semantics" section above (a
+  hand-constructed target node directory carrying only the cluster
+  store's own `segments` subdirectory content — never a top-level
+  marker or WAL/engine files — so PR 1's own check takes its
+  fresh-directory branch regardless, and the assertion is genuinely on
+  the NEW check): a node started with no key against an already-marked
+  local `segments` directory is refused with `"segment store is
+  encrypted (found .animus_segment_store_encryption_marker) but no
+  --encryption-key was given — refusing to start"`; a node started with
+  a key against a `segments` directory already holding real (unmarked)
+  plaintext objects is refused with `"--encryption-key was given but
+  this segment store already holds unencrypted objects (no .
+  animus_segment_store_encryption_marker marker) — refusing to
+  start"`. Both texts are byte-identical to PR 2's own table, confirmed
+  by construction (no new error text was written).
+
+**Not attempted, stated plainly**: an `ANIMUS_SEGMENT_STORE_ENCRYPTED_
+SEEDS` corpus cell in `crates/animus-test/tests/
+segment_store_encrypted_fault_corpus.rs` was considered per this ADR's
+own follow-up task and declined — that file's own harness is single-node
+and has no `Network`/placement/serving-task wiring at all (it drives
+`EncryptedSegmentStore` directly over a bare `SimSegmentStore`, exactly
+the shape its own module doc states), so hosting a genuine
+`ClusterSegmentStore` there would mean building materially new
+multi-node plumbing, not a cheap addition to the existing fixture — the
+identical "real regression risk, out of proportion to what's needed"
+reasoning that file's own module doc already gives for not converting
+the backup/PITR/export-import domain corpora. A cheaper future home
+exists and is worth naming: `crates/animus-cp-data/tests/
+cluster_segment_store.rs` already carries a `ClusterSegmentStore<SimEnv,
+S>`-generic-shaped multi-node harness (`build_cluster`, `StaticPlacementView`,
+a serving task per node) that could plausibly host `ClusterSegmentStore<
+SimEnv, EncryptedSegmentStore<SimSegmentStore, SimEnv>>` at comparatively
+low cost — named here as a candidate follow-up, not attempted in this
+change.
+
+### Gates
+
+`cargo fmt --all --check`; `cargo clippy -p animus-env -p animus-cp-data
+-p animusd --all-targets --all-features -- -D warnings` (zero warnings —
+`animus-cp-data` needed no code change at all, only the clippy run to
+confirm it); `cargo test -p animus-env`; `cargo test -p animus-cp-data
+--test sharedwal_fault_corpus` and `--test cluster_segment_store` (both
+green, unmodified — `ClusterSegmentStore` itself is untouched); `cargo
+test -p animusd --test encryption_at_rest_default_cluster_store_e2e
+--test encryption_at_rest_segment_store_e2e --test encryption_at_rest_e2e
+--test streams_e2e --test dynamo_backup --test stream_janitor` (all
+green); `cargo test -p animusd --lib` (201 passed, 0 failed — the
+`SimEnv`-driven `ClientCtx` harnesses, `sim_cluster*` corpora, and every
+other in-crate suite, none of which construct `SegmentStoreHandle::
+Cluster`/`BackupStoreHandle::Cluster` and so are unaffected by the type
+change, confirmed rather than assumed). `Cargo.lock` unchanged (no new
+dependency) — `cargo deny check` not required.
+
+## As-built: `--encryption-key` reach on `join`/`data --seed`/`control` (2026-09-07, issue #676)
+
+`--encryption-key PATH` was accepted only by `--config FILE --node I` and
+`--cluster N` (PR 1) — `animusd control`, `animusd join`, and `animusd
+data --seed` had no CLI flag for it at all, a documented reach gap named
+alongside several other per-node flags with the same shape at the time
+(`--tls-*`'s own precedent). Closed:
+
+- **`join`/`data --seed`**: both already build their own `RoleAddrs` ad hoc
+  (no config file on either path — the identical shape `--tls-*` already
+  has there), so the fix is purely a CLI-parser addition: `main.rs`'s
+  `run_join`/`run_data`'s `--seed` branch now parse `--encryption-key
+  PATH` and set `RoleAddrs::encryption_key_path` directly, with no "set
+  both ways" conflict to check (there is no second source on this path).
+  `Node::bind`/`Node::bind_data` already read that field unconditionally
+  (PR 1's own mechanism) — no `lib.rs` change was needed for this half at
+  all, only the CLI plumbing.
+- **`animusd control`**: gained `--encryption-key PATH`, merged onto
+  `config.nodes[index]` via `apply_encryption_key_flag` — the identical
+  per-node "flag and config both set it is a hard error" contract
+  `--config`/`--node`'s own combined-mode route already uses (the two
+  share the same helper function). `Node::bind_control` already loads
+  `RoleAddrs::encryption_key_path` into the system-keyspace engine's own
+  `ProdEnv::bind_with_tls_and_key` call (PR 1's own mechanism, unchanged) —
+  a control-only node's system-keyspace engine was always encryptable via
+  a config file's own `nodes[index].encryption_key_path` field; the gap
+  closed here is purely the CLI flag's own reach, not the mechanism.
+
+**`--cluster-control`+`--cluster-data` is unchanged, deliberately** — it
+still rejects `--encryption-key` outright (a loud `Err`), the same posture
+`--tls-*` already has on that in-process dev-only path: no per-node config
+entries exist there to apply the flag to, and silently downgrading a
+requested-encryption cluster to plaintext is a worse failure mode than an
+explicit rejection. `animusd data --config` also remains a gap — no CLI
+flag of its own yet (a config file's own `nodes[index].encryption_key_path`
+field still works there directly, unchanged).
+
+Regression: `crates/animusd/tests/join_data_seed_settings_reach.rs::
+join_threads_encryption_key` (mirrors `encryption_at_rest_e2e.rs`'s own
+plaintext-absence proof, scoped to the joined node's own directory —
+the base cluster stays unencrypted throughout, proving the key is
+genuinely per-node on this path, not cluster-wide); a parser-level unit
+test (`crates/animusd/src/main.rs`'s `tests` module,
+`run_control_parses_encryption_key_flag`) proves `control`'s parser
+recognizes the flag without needing a real bind. See
+`crates/animusd/CLAUDE.md`'s own `--encryption-key` CLI-reference entry
+for the current, complete per-entry-point enumeration.
