@@ -17235,6 +17235,21 @@ mod sim_cluster_corpus;
 #[cfg(test)]
 mod sim_cluster_throttle;
 
+/// A first deterministic smoke over `SimClusterHandle::dynamo`/`SimCluster::
+/// dynamo` (ADR 0061 rung D2 PR 1) — the DynamoDB wire edge, decoded by
+/// `animus_dynamo::wire::decode_request` and run through `dynamo::
+/// dispatch_item_op`, the exact same generic core `dynamo::run_operation`'s
+/// own item-op arms call in production — driven against a real `SimCluster`
+/// for the first time. A sibling of `sim_cluster_corpus`/`sim_cluster_
+/// throttle` for the identical reason (needs `SimCluster`'s own
+/// `pub(crate)` surface). **Not** the full nemesis corpus (`check_cycles`/
+/// `check_durability`/`check_convergence`, a `Recorder`/`History` model, an
+/// `ANIMUS_DYNAMO_WIRE_SEEDS` depth knob, a `corpus-deep.yml` tier) — that
+/// is ADR 0061 rung D2's own PR 2, deliberately not built here (see this
+/// module's own doc for the full PR 2 plan).
+#[cfg(test)]
+mod sim_cluster_dynamo;
+
 /// Regression for the issue #298 residual confirmed live under the
 /// un-pinned `SplitMode::InPlace` proof soak (ADR 0018's matching amendment,
 /// `docs/engineering-lessons.md`'s matching entry): a stage blocked by

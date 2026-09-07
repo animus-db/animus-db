@@ -9,7 +9,8 @@
 
 use animus_control::{OpClass, Policy, TableMatch};
 use animus_dynamo::wire::{Operation, WireError};
-use animus_env::Metric;
+use animus_env::{Env, Metric};
+use animus_node::host::RelayClient;
 
 use crate::ClientCtx;
 
@@ -202,8 +203,8 @@ pub(crate) fn classify(op: &Operation) -> (&'static str, OpClass) {
 /// that isn't there. `ListBackups` with no `TableName` filter is an
 /// unscoped, cluster-wide read — allowed only to a credential whose own
 /// policy is `TableMatch::All` (see [`authorize_unscoped`]'s doc).
-pub(crate) fn authorize_op(
-    ctx: &ClientCtx,
+pub(crate) fn authorize_op<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     principal: &Principal,
     op: &Operation,
     meta: &animus_control::Metadata,
@@ -351,8 +352,8 @@ pub(crate) fn authorize_op(
 /// per-table pre-checks) shares. `table: None` is a deliberate no-op (used
 /// only by [`authorize_op`]'s backup-id-keyed arms when the id doesn't
 /// resolve to a row yet) — never a security decision on its own.
-pub(crate) fn authorize(
-    ctx: &ClientCtx,
+pub(crate) fn authorize<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     principal: &Principal,
     op_name: &str,
     class: OpClass,
@@ -382,8 +383,8 @@ pub(crate) fn authorize(
 /// (`dynamo.rs`) to check **every** table a request names before any of its
 /// work runs, so a request spanning an allowed and a denied table is
 /// rejected whole rather than partially applied (ADR 0066 §5).
-pub(crate) fn authorize_each_table<'a>(
-    ctx: &ClientCtx,
+pub(crate) fn authorize_each_table<'a, E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     principal: &Principal,
     op_name: &str,
     class: OpClass,
@@ -403,8 +404,8 @@ pub(crate) fn authorize_each_table<'a>(
 /// `class`; a table-restricted policy can never safely answer "every
 /// backup of every table I might not even be allowed to see," so it is
 /// denied outright rather than silently narrowed.
-pub(crate) fn authorize_unscoped(
-    ctx: &ClientCtx,
+pub(crate) fn authorize_unscoped<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     principal: &Principal,
     op_name: &str,
     class: OpClass,
@@ -430,7 +431,7 @@ pub(crate) fn authorize_unscoped(
 /// `ClientCtx` reachable from the bound `dynamo` listener (combined/
 /// data-only nodes, ADR 0035 PR3) — the same structural guarantee
 /// `ClientCtx::describe_endpoints`'s own `ctx.data()` call relies on.
-fn record_denied(ctx: &ClientCtx) {
+fn record_denied<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>) {
     ctx.data().raftkv_metrics.incr(Metric::AuthDenied);
 }
 

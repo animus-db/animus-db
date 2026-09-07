@@ -428,6 +428,33 @@ impl SimClusterHandle {
         let group = ctx.edge.local_cp(tablet)?;
         group.local_get(&item_key(pk, sk)).await
     }
+
+    /// Run a decoded DynamoDB wire request (`X-Amz-Target` + JSON body)
+    /// against `node`'s own `ClientCtx`, through the exact same
+    /// `dynamo::execute_item_op_as` production's TCP listener calls
+    /// (ADR 0061 rung D2 PR 1) — never a bespoke test-only reimplementation.
+    /// An unrestricted [`crate::authz::Principal`], mirroring `admin.rs::
+    /// action_data_dynamo`'s own unauthenticated proxy: this fixture has no
+    /// SigV4 listener in front of it to resolve a scoped one from (see the
+    /// module doc's own "still `ProdEnv`-only" bullet — `ctx.dynamo_auth` is
+    /// `None` on every node here, exactly like every sibling `SimEnv`
+    /// harness). Only the eight operations `dispatch_item_op` covers today
+    /// succeed; everything else decodes fine and comes back a clean
+    /// `InternalServerError` — see that function's own doc for the list.
+    /// Self-bounded like every other op method here (`ClientCtx::
+    /// cp_kind_write_item`/`cp_read`/`cp_scan`'s own internal
+    /// `CLIENT_TIMEOUT` budgets), so callable directly inside an
+    /// `env.spawn_task`-ed future with no wrapper needed.
+    pub(crate) async fn dynamo(&self, node: u64, target: &str, body: &[u8]) -> (u16, String) {
+        let ctx = self.ctx(node);
+        crate::dynamo::execute_item_op_as(
+            &ctx,
+            &crate::authz::Principal::unrestricted(),
+            target,
+            body,
+        )
+        .await
+    }
 }
 
 /// See the module doc for the full design. Every node id is `0..nodes`; a
@@ -540,7 +567,26 @@ impl SimCluster {
                 control: GenericControlHandle::Local(controls[i].clone()),
                 edge: ClusterEdgeState::<SimEnv>::new(),
                 env: sim.env(id.clone()),
-                data: None,
+                // ADR 0061 rung D2 PR 1: a real `DataRole`, not `None` — the
+                // generic `dynamo::dispatch_item_op`/`write_path::
+                // kind_write_item_at_leader` paths this rung wires up call
+                // `ctx.data()` (a panic on `None`, ADR 0035 PR3's own
+                // control-only-node guard) on their hot paths
+                // (`raftkv_metrics.incr`/`request_rates.observe`). Every
+                // `DataRole` field is a plain, `Env`-free `Default`-able
+                // handle (`MetricsHandle`/`StreamSealKnobs`/
+                // `ChangeRateTracker`/`RequestRateTracker`, none of them
+                // touch `E` at all) — see that struct's own doc — so
+                // constructing a real one costs nothing and needs no
+                // `ProdEnv`. `base_id` is this node's own id, `DataRole`'s
+                // real-cluster meaning (ADR 0023's replica-set identity).
+                data: Some(DataRole {
+                    raftkv_metrics: MetricsHandle::noop(),
+                    base_id: id.clone(),
+                    stream_seal_knobs: StreamSealKnobs::default(),
+                    change_rates: ChangeRateTracker::default(),
+                    request_rates: RequestRateTracker::default(),
+                }),
                 // Neither `cp_kind_write_raw`/`cp_get`/`cp_scan` (the only
                 // methods this fixture drives) ever reads these — see the
                 // module doc's "still `ProdEnv`-only" bullet, and
@@ -999,6 +1045,28 @@ impl SimCluster {
             Err(format!(
                 "scan on node {node} did not complete within {OP_BUDGET:?}"
             ))
+        })
+    }
+
+    /// Run a decoded DynamoDB wire request against `node`'s own `ClientCtx`
+    /// (ADR 0061 rung D2 PR 1) — [`SimClusterHandle::dynamo`]'s synchronous
+    /// sibling, driven from a test's own `&mut self` call exactly like
+    /// [`SimCluster::put`]/`get`/`scan` above (never panics on a timeout;
+    /// returns a synthetic `500`/timeout-message body instead, so a caller
+    /// asserting on the returned status code sees a real, if unlikely,
+    /// failure mode rather than a panic).
+    pub(crate) fn dynamo(&mut self, node: u64, target: &str, body: &[u8]) -> (u16, String) {
+        let handle = self.shared.clone();
+        let (target, body) = (target.to_owned(), body.to_vec());
+        self.spawn_and_capture(
+            node,
+            async move { handle.dynamo(node, &target, &body).await },
+        )
+        .unwrap_or_else(|| {
+            (
+                500,
+                format!("dynamo request on node {node} did not complete within {OP_BUDGET:?}"),
+            )
         })
     }
 

@@ -281,9 +281,22 @@ the still-true paragraph after the table.
   `sim_cluster_corpus`, its first cycles/durability corpus over
   `animus-test`'s `check_cycles`/`check_durability`/`check_convergence`
   oracle, depth knob `ANIMUS_SIMCLUSTER_SEEDS`; ADR 0061's 2026-09-05
-  amendments). D2-D4 remain open (an end-to-end DynamoDB-wire corpus, the
-  `animusd` integration-suite migration, and deterministic coverage for
-  auto-split/GC/join/backup-janitor).
+  amendments). **D2 PR 1 landed 2026-09-07 / PR 2 pending**: six item
+  operations (`PutItem`/`DeleteItem`/`GetItem`/`BatchGetItem`/`UpdateItem`/
+  `BatchWriteItem`) plus a base-table-only `Query`/`Scan` now run through a
+  new generic `dynamo::dispatch_item_op<E, R>` core, reachable against
+  `SimCluster` via `SimClusterHandle::dynamo`/`SimCluster::dynamo`
+  (`animus_dynamo::wire::decode_request` in, the same production dispatch
+  handlers out) — proven by a first small `sim_cluster_dynamo.rs` smoke
+  (five seed-parameterized scenarios), not yet the full nemesis corpus.
+  PR 2: GSI/LSI `Query`/`Scan`, `TransactWriteItems`/`TransactGetItems`
+  (blocked on a new proof of `ClientCtx::propose_schema`'s relayed path
+  against a multi-voter `SimEnv` quorum), PartiQL, and the actual
+  `Recorder`/`History`/`check_cycles` corpus with an `ANIMUS_DYNAMO_
+  WIRE_SEEDS` depth knob and a `corpus-deep.yml` tier (ADR 0061's
+  2026-09-07 amendment). D3-D4 remain open (the `animusd` integration-suite
+  migration, and deterministic coverage for auto-split/GC/join/backup-
+  janitor).
 - **E1 landed 2026-09-04** (`ClusterApi`/`AdminOps` seams in
   `animus-operator`, fake-driven `controller::tests`; ADR 0061's
   2026-09-04 amendment). **E2 landed 2026-09-07**: the seven pre-existing

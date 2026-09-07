@@ -20786,3 +20786,66 @@ real" — also check what shipped *since* the proposal was written that the
 proposal's own design now has to coexist with. A follow-up ADR/PR that
 never mentions the parked item by name can still silently invalidate its
 premise.**
+
+## A narrowed generic split of a dispatcher must not become the production dispatcher's ONLY path for cases the narrowing dropped (ADR 0061 rung D2 PR 1)
+
+Splitting `dynamo::run_operation` into "a new generic core for the ops that
+had no `ProdEnv` entanglement" plus "the concrete production entry point
+for the rest" is a sound shape — but the first cut wired it wrong in a way
+that looked safe and wasn't. `dispatch_item_op<E, R>` was built to cover
+only a **base-table** `Query`/`Scan` (an `index` name deliberately returns
+"not yet supported," since genericizing the real GSI/LSI dispatch tree was
+out of this PR's scope). The first version then routed `run_operation`'s
+own `Query`/`Scan` arms through that same narrowed function — reasoning
+that "it's monomorphized at `E = ProdEnv` for production, so behavior is
+unchanged" felt true by analogy with the other six delegated operations
+(`PutItem`/`DeleteItem`/`GetItem`/`BatchGetItem`/`UpdateItem`/
+`BatchWriteItem`, which really were a byte-identical pure move). It wasn't:
+for `Query`/`Scan` specifically, the delegation replaced a call to the
+*full-featured* `run_query`/`run_scan` (real GSI/LSI dispatch) with a call
+to a function that structurally cannot serve an index query at all — a
+real behavior change, not merely the same logic at a different type
+parameter. `cargo test -p animusd --lib` caught it immediately: four
+`index_drain::gsi_drain_cursor_tests` failures, each a real GSI query
+timing out on the narrowed function's own "not yet supported" error. The
+fix was to exclude `Query`/`Scan` from the delegated set entirely and keep
+`run_operation` calling the original, unmodified `run_query`/`run_scan`
+directly — `dispatch_item_op`'s own narrower `Query`/`Scan` arms exist only
+for the new generic entry point (`execute_item_op_as`, reached by
+`SimCluster`), never for production. **General lesson: when factoring "a
+generic core covering only a subset of cases" out of an existing
+dispatcher, a production call site that used to reach the FULL behavior
+must keep reaching the full behavior — never get silently rerouted through
+the narrowed core just because the core happens to share a name/shape with
+what it replaced. "The call is monomorphized so it's unaffected" is not by
+itself proof of anything if the callee itself is a genuinely different,
+narrower function — verify by running the touched dispatcher's own full
+existing test suite (not just the new harness) before trusting that
+argument.**
+
+## `leader_index_of` answers "who does this replica locally believe leads," which is the wrong question to ask about a node you just crashed (ADR 0061 rung D2 PR 1)
+
+`SimCluster::crash` mutes a node (its tasks stay alive, its inbox is
+cleared) — it does not stop its internal Raft state, and nothing tells a
+muted node that its peers re-elected without it, since every message that
+would carry that news is exactly what got muted. `is_leader_local`
+(`leader_index_of`'s own per-node predicate) is a **local** read of that
+frozen state, so calling `leader_index_of` again right after `crash` + an
+election window can — and, on one seed, did — return the **crashed**
+node's own id, not whichever survivor actually won the new election
+(`assert_ne!(new_leader, leader)` failed with `left: 0, right: 0`). The
+existing `sim_cluster.rs` scenario 3 already avoids this by never calling
+`leader_index_of` post-crash at all: it picks any survivor node index and
+routes the write through it, relying on `cp_kind_write_item`'s/
+`cp_kind_write_raw`'s own hint-chasing `forward_to_tablet_leader` loop to
+find the real new leader internally. The new `sim_cluster_dynamo.rs`
+crash/restart scenario didn't follow that precedent on the first draft and
+hit the exact failure the precedent exists to avoid. **General lesson: a
+"who currently leads" accessor backed by one replica's own local state is
+answering "what does THIS node believe," not "what is objectively true
+right now" — it is unsafe to call on a node that was just faulted (crashed,
+partitioned) until it has had a chance to actually learn the outcome. When
+a test needs "the current leader" immediately after injecting a fault
+against the previous one, route through the system's own forwarding/
+hint-chasing instead of re-deriving the answer from a local accessor that
+has no way to have heard it yet.**

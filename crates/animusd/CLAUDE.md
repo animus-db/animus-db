@@ -5756,6 +5756,106 @@ per-issuing-node); `delete_probe.is_ok()` every cell. Shrink wiring
 (`ANIMUS_SHRINK=1`, `sim_cluster_shrink_replay`) mirrors
 `raftkv_linearizable.rs`'s own exactly. No product bug found.
 
+### `sim_cluster_dynamo`: the DynamoDB wire edge, driven against SimCluster (ADR 0061 rung D2 PR 1)
+
+`crates/animusd/src/sim_cluster_dynamo.rs` (`#[cfg(test)] mod
+sim_cluster_dynamo;` from `lib.rs`, a sibling of `sim_cluster`/`sim_cluster_
+corpus`/`sim_cluster_throttle` for the identical privacy reason) is the
+first proof that a DynamoDB JSON request decoded by `animus_dynamo::
+wire::decode_request` executes through the **same** generic core
+`dynamo::run_operation`'s own production item-op arms call, reachable
+against a `SimEnv`-backed `ClientCtx` for the first time. Run via `cargo
+test -p animusd --lib sim_cluster_dynamo`. **Not yet the full nemesis
+corpus** — five hand-picked, seed-parameterized scenarios today; PR 2's
+plan (below) is the actual `Recorder`/`History`/`check_cycles` corpus.
+
+**What's generic now, and how it's reached.** `dynamo::run_operation`/
+`execute_as` themselves stay concrete (`ClientCtx<ProdEnv,
+AnimusdRelayClient>`) — the DDL/backup/export/import/PartiQL/transact
+handlers they also dispatch to are either genuinely `ProdEnv`-only or would
+have pushed the signature count well past a reviewable PR (see the ADR's
+own 2026-09-07 amendment for the full sizing). Instead a new function,
+`dynamo::dispatch_item_op<E: Env, R: RelayClient>`, holds **six**
+operations moved verbatim from `run_operation`'s own match arms — `PutItem`,
+`DeleteItem`, `GetItem`, `BatchGetItem`, `UpdateItem`, `BatchWriteItem` —
+calling the same `ClientCtx::cp_kind_write_item`/`cp_get`/`cp_scan` methods
+those arms always called (already `E`/`R`-generic since rung C5, so no
+change there at all). `run_operation`'s own arms for those six now delegate
+to it (`dispatch_item_op(ctx, principal, meta, op).await`), monomorphized
+at `E = ProdEnv` for production — a pure move, not a rewrite, so production
+behavior is byte-identical. A new sibling entry point, `dynamo::
+execute_item_op_as<E, R>`, runs `execute_as`'s own decode/prelude and is
+the one `SimClusterHandle::dynamo` calls (mirroring `admin.rs::
+action_data_dynamo`'s own unauthenticated `execute_routed` proxy — an
+unrestricted `Principal`, since this fixture has no SigV4 listener to
+resolve a scoped one from).
+
+**`Query`/`Scan` are covered by `dispatch_item_op` for the *base-table*
+case only** (`index: None` — an `index` name returns a clean
+`InternalServerError` naming the gap). Genericizing the real, full
+`run_query`/`run_scan` needs their own `run_index_query`/`run_gsi_query`/
+`run_lsi_query`/`run_index_scan`/`run_gsi_scan`/`run_lsi_scan`/
+`paginated_kind_examine`/`paginated_kind_examine_one` made generic too,
+deferred to PR 2. **`run_operation`'s own `Query`/`Scan` arms are NOT in
+the delegated set** — they still call the full, unmodified, concrete
+`run_query`/`run_scan` with the complete GSI/LSI dispatch tree, exactly as
+before this rung. This mattered live: the first cut of this PR *did* route
+`run_operation`'s own `Query`/`Scan` through the narrowed
+`dispatch_item_op`, and `cargo test -p animusd --lib` caught it as four
+real `index_drain::gsi_drain_cursor_tests` failures (production GSI
+queries returning "not yet supported") before it ever reached a committed
+state. See the ADR amendment's own restatement of the general lesson: a
+narrowed generic core must not become the *sole* path an unrelated,
+still-full-featured production caller uses for the cases the narrowing
+dropped, and the way to catch that is running the dispatcher's full
+existing test suite, not just the new corpus.
+
+**`SimCluster::new` now gives every node a real `DataRole`**, not `data:
+None` — `write_path::kind_write_item_at_leader` (already generic) and
+`dynamo::fast_marker_write`/`authz::record_denied` all call `ctx.data()`
+(a panic on `None`, ADR 0035 PR3's guard) on their hot paths. Every
+`DataRole` field is a plain, `Env`-free, `Default`-able handle
+(`MetricsHandle::noop()`, `StreamSealKnobs::default()`,
+`ChangeRateTracker`/`RequestRateTracker`, both `#[derive(Default)]`), so
+building a real one costs nothing and needs no `ProdEnv` — this was the
+"construct a SimEnv-safe `DataRole`" branch, not "gate the reads."
+
+**`SimClusterHandle::dynamo`/`SimCluster::dynamo`** mirror `put`/`get`/
+`scan`'s own async-handle/sync-wrapper split, running a decoded request
+against one node's own `ClientCtx`.
+
+**Five scenarios**: PutItem → GetItem(`ConsistentRead: true`) through the
+wire on a 3-node RF3 cluster, both from a non-leader node (proves the
+generic path forwards over the real `SimRelayClient` wire); `UpdateItem`
+with a satisfied and a failing `ConditionExpression` (proves the
+evaluate-at-leader `cp_kind_write_item` path, not the fast arm); `Query`
+over a composite `(pk, sk)` table (proves `dispatch_item_op`'s base-table
+arm returns exactly one partition); `BatchWriteItem`; and one leader crash
++ write-through-a-survivor + restart with a converged-or-timeout wire read
+from every node afterward.
+
+**Harness gotcha found building the crash/restart scenario**: a crashed
+(muted) node's own `is_leader_local` stays frozen at its last local
+belief — calling `leader_index_of` again right after `crash` + an election
+window can return the **crashed** node's own id, not the new leader's
+(nothing tells a muted node its peers re-elected). Route the follow-up
+write through any survivor node index instead, without consulting
+`leader_index_of` — `cp_kind_write_item`'s own hint-chasing forward finds
+the real leader internally, exactly the shape `sim_cluster.rs`'s own
+scenario 3 already uses.
+
+**PR 2's plan**: generic GSI/LSI `Query`/`Scan`; `TransactWriteItems`/
+`TransactGetItems` (blocked on a new proof — `ClientCtx::propose_schema`'s
+relayed path successfully auto-provisioning the internal idempotency table
+against a genuine multi-voter `SimEnv` control quorum, never yet exercised
+by any fixture in this crate); `ExecuteStatement`/`BatchExecuteStatement`/
+`ExecuteTransaction` (PartiQL, no new logic once the above are generic);
+and the actual corpus — a `Recorder`/`History` model over
+`SimClusterHandle::dynamo`, `check_cycles`/`check_durability`/
+`check_convergence`, `sim_cluster_corpus`'s own Nemesis matrix
+generalized to DynamoDB-wire ops, an `ANIMUS_DYNAMO_WIRE_SEEDS` depth
+knob, and a `corpus-deep.yml` tier entry.
+
 ## Tests
 
 `cargo test -p animusd` — every test in `tests/` is a real-socket `ProdEnv`
