@@ -21068,3 +21068,201 @@ default (a genuinely new axis of behavior every caller must decide for
 itself) or when the type being widened is a data type (a struct literal),
 where a builder/sibling-constructor split is usually more awkward than
 just fixing the enumerated sites directly.
+
+## A "propose locally if leader" fast path keyed on a `ProdEnv`-typed handle silently degrades to relay-to-self under any other `Env` (ADR 0061 rung D3 PR 2a)
+
+`ClientCtx::propose_schema` (`animusd/src/schema.rs`) is meant to propose
+locally when this node is the control-plane leader and relay one hop to
+the leader's node otherwise. The local-propose branch reads
+`self.edge.leader_handle()`, and `ClusterEdgeState<E>::control` — before
+this rung — was hardcoded `Arc<Mutex<Vec<RaftNode<ProdEnv>>>>` **regardless
+of the enclosing `ClientCtx<E, R>`'s own generic `E`**. Under `SimEnv` that
+field was therefore always empty, `leader_handle()` always answered
+`None`, and *every* schema proposal took the relay branch — including one
+issued on the node genuinely leading the control group, which then
+relayed `ProposeSchema` to **itself**; the receiving side's own
+`ProposeSchema` handler re-resolves the leader the identical way and
+re-relays, recursing until the caller's own timeout. This produced no
+compile error and no test failure for a long time, because nothing under
+`SimEnv` had previously exercised the local-propose path at all (every
+prior `SimCluster`/`ClientCtx<SimEnv, _>` fixture in this crate bypassed
+`propose_schema` entirely, proposing directly on a raw `RaftNode` handle
+instead) — the bug was latent, not merely undiscovered, for months of
+prior rungs.
+
+**The general shape to watch for**: a "propose/act locally if I'm the
+authority, else forward" fast path that is gated on a field or handle
+whose *type* is pinned to one concrete `Env`/backend implementation,
+inside a component that is otherwise `E`-generic. The type system cannot
+catch this — the code compiles and even runs correctly under the pinned
+concrete type (`ProdEnv` in production), so nothing *fails* until a
+second, different concrete type (`SimEnv`) is actually driven through that
+exact path for the first time. Grep for this shape specifically when
+generic-izing a component that used to be concrete: a field/handle whose
+declared type names a concrete `Env` implementor (not the generic `E`)
+inside an `impl<E: Env> Foo<E>` block is the tell — even if every existing
+caller happens to only ever instantiate `E = ProdEnv` today.
+
+**The fix pattern**: widen the field's type to the generic `E` and update
+every constructor to register a real `E`-typed handle (not just the
+`ProdEnv` one). Doing this can surface further concrete-type leaks
+elsewhere that only compiled because the *old* narrow field made a call
+site's own downstream value concrete too — see the next entry.
+
+## Widening a fixed-`Env` handle to generic `E` can break a downstream call site that only compiled because the old field was concretely typed (ADR 0061 rung D3 PR 2a)
+
+Immediately after widening `ClusterEdgeState<E>::control` from `RaftNode<
+ProdEnv>` to `RaftNode<E>` (previous entry), `cargo build` failed at
+`ClientCtx::admin_add_control_member`'s `leader.env().merge_peer(node,
+addr)` call: `merge_peer` is a plain **inherent** method on `ProdEnv`
+(real network-transport peer-book bookkeeping), not a trait method any
+other `Env` implementor has. Before the widening this compiled fine —
+`admin_add_control_member` lives inside a `impl<E: Env, R: RelayClient>
+ClientCtx<E, R>` block, but `leader: RaftNode<ProdEnv>` (fetched via the
+old, concretely-typed `leader_handle()`) was concrete *regardless of the
+enclosing E*, so calling a `ProdEnv`-only inherent method on it was
+perfectly valid Rust even inside a generic function body. Widening the
+field's type made `leader: RaftNode<E>` genuinely generic, and the
+inherent-method call stopped resolving for any `E` that isn't `ProdEnv`.
+
+**The lesson**: when generic-izing a field/handle that used to be
+concretely typed, don't stop at "does the crate compile with `E =
+ProdEnv`" (the only concrete instantiation that existed before) — a
+generic function body can quietly depend on that concreteness anywhere it
+reads the field, and the type checker only reports it once something
+actually tries to monomorphize at a *different* `E`. `cargo build -p
+animusd --lib` (concrete-only, `E = ProdEnv` everywhere) stayed green
+through the whole widening; only `cargo test -p animusd --lib --no-run`
+(which compiles the `#[cfg(test)]` `SimCluster` fixture, genuinely
+instantiating `ClientCtx<SimEnv, _>`) caught it. **Fixed by adding a
+default no-op method to the `Env` trait itself** (`Env::merge_peer`,
+mirroring `Env::metrics()`'s own existing "additive default, no
+implementor has to change" precedent) rather than special-casing the one
+call site — `ProdEnv`'s own trait impl delegates to the pre-existing
+inherent method (Rust's inherent-impl priority in method resolution means
+that delegation call reaches the inherent method, not itself, so this is
+not infinite recursion), and every other `Env` implementor gets a
+behaviorally-correct no-op (they have no peer-book concept to begin with,
+so "do nothing" is the *right* answer, not a stand-in). **The general
+move**: when a generic component's only real caller of some behavior is
+one specific `Env` implementor's own real-world mechanism, and a
+*different* `Env` genuinely has nothing sensible to do there, a default
+trait method is usually the right seam — not `#[cfg]`-gating the call site
+or threading a capability flag through.
+
+## A liveness detector's own "give a fresh member a synthetic first heartbeat" hardening means "was directly marked `Active`" is not "will stay `Active`" — a design assumption that needed empirical verification, not just re-stating (ADR 0061 rung D3 PR 2a)
+
+Populating `Metadata::members` for a `SimCluster` fixture (`RegisterNode`
+then `UpsertMember{status: Active}`) was planned on the stated assumption
+that "`UpsertMember{Active}` also sets `has_activated`, so the orphan
+sweep never reclaims the id, and `liveness_transitions` only visits ids
+the detector has heartbeats for, so a directly-activated member cannot
+flip back to `Down`." The first half is correct (`has_activated` really is
+sticky and really does protect against the *orphan sweep*, a genuinely
+different mechanism). The second half is **wrong**, and would have stayed
+wrong if taken on faith: `animus-control::node::detect_loop` has its own
+"phantom-member hardening" (ADR 0030) that gives any member found
+`Active`-but-**untracked** by the failure detector exactly one *synthetic*
+`FailureDetector::observe` the very first tick it notices one — so a
+member this fixture marks `Active` directly (never having sent a real
+heartbeat) gets exactly one fabricated liveness timestamp, which then ages
+out after `DETECT_TIMEOUT` (500ms) precisely like a real one would, and
+the detector proposes `UpsertMember{Down}` for it. Confirmed live: a
+member seeded this way flipped to `Down` well before a second wire
+`CreateTable` call (each burning that fixture's own `OP_BUDGET` = 12
+virtual seconds) ever reached `ClientCtx::provision_tablet`, which then
+found zero `Active` replica candidates and spun uselessly until its own
+commit-wait deadline — a real, load-bearing production behavior this
+fixture had never previously exercised (every earlier `SimCluster` test
+either used the hand-hosted DDL bypass, which never reads `Metadata::
+members` at all, or never provisioned a second table after enough virtual
+time had elapsed for the window to matter).
+
+**The lesson, restated for reuse**: a design-pass claim about what a
+*different* subsystem's mechanism does or doesn't do is a hypothesis, not
+a fact, until traced against that subsystem's own source — "X only visits
+Y" is exactly the kind of claim that a hardening/edge-case branch (here,
+"give a cold-tracked member some initial grace") can quietly falsify,
+because the hardening's own author was solving a *different* problem
+(protecting a genuinely fresh member from a false-negative liveness
+verdict) that happens to interact badly with a *synthetic* activation that
+was never going to be followed by a real heartbeat. When a task brief
+hands you a claim like this framed as already-established, grep the
+actual mechanism it's a claim about before building on it — in this case,
+`animus_control::node::detect_loop`'s own phantom-member-hardening block,
+a maybe 10-line span, would have shown the gap in under a minute. The fix
+itself was equally small once found: spawn the real `animus_control::
+node::heartbeat_loop` (the exact loop a production deployment already
+runs) on every fixture node, keeping every member's liveness genuinely
+current rather than working around the detector's own correct behavior.
+
+## Two independent local ID allocators in the same test fixture will eventually collide once a test exercises both paths in one run — derive both from the same live source of truth (ADR 0061 rung D3 PR 2a)
+
+`SimCluster` grew two ways to create a tablet over its lifetime: a
+hand-hosted path (`create_table_with_replication`, proposing `CreateTablet`
+directly with an id from the fixture's own local counter,
+`next_tablet_id`, starting at 1 and incrementing only on that method's own
+calls) and a wire-provisioned path (`ClientCtx::provision_tablet`, reading
+`Metadata::next_free_tablet_id()` — the *replicated*, live allocator —
+fresh on every attempt). Every test before this rung used exactly one of
+the two paths per cluster, so the two counters' id spaces never had reason
+to overlap. The first test to use *both* in one cluster (three wire-created
+tables, then one hand-hosted table for an unrelated reason — seeding a
+table whose *name* needed to match a reserved shape) reproduced the
+collision immediately: the hand-hosted call proposed `TabletId(1)`, a real
+tablet id another table already held (from the three wire creates ahead of
+it), the propose was rejected ("tablet already exists"), and the
+hand-hosted method's own convergence poll timed out waiting for a tablet
+that would never appear under that name.
+
+**The general lesson**: two allocators for the "same kind of thing" in one
+fixture/system, each independently monotonic, are safe only as long as
+nothing ever exercises both in the same scope — which is exactly the kind
+of invariant that erodes silently as a fixture grows new capabilities,
+with no compiler or type-level signal that it has. The fix is never "make
+the two counters agree" (a synchronization problem with its own races) but
+"delete the second allocator and read the *one* real source of truth
+fresh, every time" — here, deriving `create_table_with_replication`'s own
+tablet id from `self.controls[leader].metadata().next_free_tablet_id()`
+instead of its own field, the identical live read `provision_tablet`
+already did. Worth grepping for on any test fixture that grows a second
+"quick and dirty" id-minting shortcut alongside an already-existing
+"ask the real system" one — the two are a latent collision waiting for the
+first test that happens to combine them.
+
+## A control plane's own correct, unconditional load-balancing pass is a real hazard for any test fixture that hand-hosts (or partially hosts) tablets without a full reconciler behind it (ADR 0061 rung D3 PR 2a)
+
+Once a test fixture (`SimCluster`) populates real cluster membership and a
+wire-provisioned tablet carries a genuine placement policy, the
+production control-plane leader's own `reconcile_loop`/`rebalance_
+placement` — unconditional, spawned by `RaftNode::start` itself, with no
+opt-out for a test harness — is live over it and will act exactly as
+designed: on a cluster with more members than a tablet's replication
+factor, `rebalance_placement`'s load-balancing pass will genuinely move a
+tablet's replica set to spread load across an otherwise-idle member,
+proven deterministic across 25 seeds in this investigation (the exact same
+two moves, every time, given the exact same starting shape). This is not
+a bug in the control plane — it is the control plane doing precisely its
+documented job. The hazard is entirely on the *fixture* side: any
+mechanism a fixture builds to physically host a tablet's replicas in
+response to `Metadata` (here, a minimal watcher standing in for the real
+per-node `Reconciler`) must handle **both directions** of a replica-set
+change — adding a newly-named replica's own hosting, *and* tearing down a
+dropped one's — or the fixture can produce a genuinely inconsistent,
+split-brain-shaped state (two different-membership consensus groups for
+one tablet id) with no fault injection at all, purely from ordinary
+placement rebalancing.
+
+**The general lesson**: when a test fixture stands up a partial,
+purpose-built substitute for a production reconciliation loop, audit it
+against every *direction* of change the real mechanism it's standing in
+for handles, not just the direction the fixture's own first use case
+happened to need (here: "host a newly-created tablet" was the need that
+motivated the watcher; "un-host a tablet whose replica set changed" was
+never on that need's own critical path, so it was never built, and the
+gap sat undiscovered until a scenario with genuine placement imbalance
+went looking for it). When the fixture's own limitation makes a class of
+otherwise-legitimate test scenario ((here: `node_count >
+MAX_REPLICATION_FACTOR`) unsafe, document the bound explicitly (in the
+fixture's own module doc and any per-crate guide) rather than leaving
+future test authors to discover it the same way this investigation did.

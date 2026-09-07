@@ -1536,6 +1536,88 @@ async fn dispatch_item_op<E: Env, R: RelayClient>(
     }
 }
 
+/// The base-table DDL core (ADR 0061 rung D3 PR 2a), generic over `E: Env`/
+/// `R: RelayClient` exactly like [`dispatch_item_op`] above and for the
+/// identical reason: it lets a decoded `CreateTable`/`DeleteTable`/
+/// `ListTables`/`DescribeTable` request run through the exact same handlers
+/// production uses, from inside `SimCluster` (`sim_cluster_dynamo.rs`), with
+/// no `ProdEnv`/real socket anywhere in the call graph.
+///
+/// **Covers exactly four operations**: `CreateTable` (base table only — a
+/// declared GSI/LSI or a stream is rejected with
+/// [`unsupported_by_generic_dispatch`], the identical shape
+/// [`dispatch_item_op`]'s own `Query`/`Scan` arms use for a named index —
+/// genericizing the drain/backfill-seeder/sealer machinery those need is out
+/// of this PR's scope), `DeleteTable`, `ListTables`, `DescribeTable`.
+/// `UpdateTable`/`UpdateTimeToLive`/`CreateTableIndex`-via-`UpdateTable`/
+/// backup/export/import/PartiQL all fall through to
+/// [`unsupported_by_generic_dispatch`] — deferred to PR 2b and beyond,
+/// naming the same reasons [`dispatch_item_op`]'s own doc already gives for
+/// its own excluded operations.
+///
+/// **Called from two places**, mirroring [`dispatch_item_op`] exactly:
+/// [`run_operation`]'s own `CreateTable`/`DescribeTable`/`DeleteTable`/
+/// `ListTables` arms stay **unchanged**, calling [`create_table`]/
+/// [`describe_table`]/[`delete_table`]/[`list_tables`] directly — never this
+/// function — so production DDL behavior is byte-identical (those four
+/// functions are simply generic now, monomorphized at `E = ProdEnv, R =
+/// AnimusdRelayClient` at that call site, exactly as `dispatch_item_op`'s own
+/// six moved operations were). This function exists only for
+/// [`execute_item_op_as`] (below), the `SimCluster`-facing entry point — see
+/// the root `CLAUDE.md`'s "a narrowed generic split of a dispatcher must not
+/// become the production dispatcher's ONLY path" lesson (`docs/
+/// engineering-lessons.md`'s matching D2 entry): this rung deliberately
+/// repeats D2 PR 1's own shape rather than routing `run_operation` itself
+/// through the narrowed core.
+async fn dispatch_table_op<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+    meta: &Metadata,
+    op: Operation,
+) -> Result<String, WireError> {
+    match op {
+        Operation::CreateTable {
+            table,
+            schema,
+            key_types,
+            indexes,
+            stream_view_type,
+            throughput,
+        } => {
+            // See this function's own doc: a GSI/LSI declaration or a stream
+            // needs machinery (the GSI drain, the stream sealer) this rung
+            // does not generalize — reject up front rather than silently
+            // creating a base table short of what the client asked for.
+            if !indexes.is_empty() {
+                return Err(unsupported_by_generic_dispatch(
+                    "CreateTable with a GSI/LSI declaration",
+                ));
+            }
+            if stream_view_type.is_some() {
+                return Err(unsupported_by_generic_dispatch(
+                    "CreateTable with a stream declaration",
+                ));
+            }
+            create_table(
+                ctx,
+                &table,
+                &schema,
+                &key_types,
+                &indexes,
+                stream_view_type,
+                throughput,
+            )
+            .await
+        }
+        Operation::DescribeTable { table } => describe_table(ctx, meta, &table),
+        Operation::DeleteTable { table } => delete_table(ctx, &table).await,
+        Operation::ListTables {
+            exclusive_start_table_name,
+            limit,
+        } => list_tables(meta, exclusive_start_table_name.as_deref(), limit),
+        _ => Err(unsupported_by_generic_dispatch("this table operation")),
+    }
+}
+
 /// SimEnv-capable sibling of [`execute_as`] (ADR 0061 rung D2 PR 1): decode
 /// and run a DynamoDB **item-API** operation against any `ClientCtx<E, R>`,
 /// not just the concrete `ClientCtx<ProdEnv, AnimusdRelayClient>`
@@ -1549,9 +1631,10 @@ async fn dispatch_item_op<E: Env, R: RelayClient>(
 /// proxy shape (an unrestricted `Principal`, no SigV4 gate in front of it —
 /// this fixture has no SigV4 listener to gate through in the first place).
 ///
-/// Only the eight operations [`dispatch_item_op`] covers succeed; every
-/// other well-formed operation decodes fine and fails with
-/// [`unsupported_by_generic_dispatch`]'s `InternalServerError` — see that
+/// The eight operations [`dispatch_item_op`] covers, plus (ADR 0061 rung D3
+/// PR 2a) the four base-table DDL operations [`dispatch_table_op`] covers,
+/// succeed; every other well-formed operation decodes fine and fails with
+/// [`unsupported_by_generic_dispatch`]'s `InternalServerError` — see either
 /// function's own doc for the fuller "what's out of scope, why" account.
 ///
 /// Only called from `sim_cluster::SimClusterHandle::dynamo` (a
@@ -1579,7 +1662,24 @@ pub(crate) async fn execute_item_op_as<E: Env, R: RelayClient>(
             if let Err(err) = authz::authorize_op(ctx, principal, &op, meta) {
                 return (error_status(&err), err.to_json());
             }
-            match dispatch_item_op(ctx, principal, meta, op).await {
+            // ADR 0061 rung D3 PR 2a: the four base-table DDL operations
+            // route to `dispatch_table_op` instead — `run_operation`'s own
+            // production dispatch keeps calling `create_table`/
+            // `describe_table`/`delete_table`/`list_tables` directly (see
+            // `dispatch_table_op`'s own doc), so this split is local to this
+            // SimEnv-facing entry point only.
+            let result = if matches!(
+                op,
+                Operation::CreateTable { .. }
+                    | Operation::DeleteTable { .. }
+                    | Operation::ListTables { .. }
+                    | Operation::DescribeTable { .. }
+            ) {
+                dispatch_table_op(ctx, meta, op).await
+            } else {
+                dispatch_item_op(ctx, principal, meta, op).await
+            };
+            match result {
                 Ok(body) => (200, body),
                 Err(err) => (error_status(&err), err.to_json()),
             }
@@ -3673,8 +3773,14 @@ async fn restore_table_to_point_in_time(
 /// committed schema + index definitions are durable and cluster-agreed, so they
 /// survive a restart and are visible on every node — the edge no longer holds the
 /// index *definitions* in process-local memory.
-async fn create_table(
-    ctx: &ClientCtx,
+///
+/// Generic over `E: Env`/`R: RelayClient` (ADR 0061 rung D3 PR 2a) so it runs
+/// against any `ClientCtx`, including a `SimEnv`-backed one from
+/// `dispatch_table_op`/`SimCluster::dynamo` — production behavior is
+/// unchanged, `run_operation`'s own `CreateTable` arm keeps calling this
+/// exact function, monomorphized at `E = ProdEnv, R = AnimusdRelayClient`.
+async fn create_table<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     table: &str,
     schema: &TableSchema,
     key_types: &[(String, String)],
@@ -3710,7 +3816,7 @@ async fn create_table(
     // separate `SetTableThroughput` proposal needed, since there is nothing
     // to change in place yet.
     control_schema.throughput = throughput;
-    let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+    let deadline = ctx.env.now().saturating_add(SCHEMA_COMMIT_TIMEOUT);
     loop {
         // Propose against this cluster's current leader (idempotent: the create is
         // rejected as a no-op if already present, which our success check catches).
@@ -3722,13 +3828,13 @@ async fn create_table(
         if metadata_fresh(ctx).await.has_table_schema(table) {
             break;
         }
-        if tokio::time::Instant::now() >= deadline {
+        if ctx.env.now() >= deadline {
             return Err(internal(
                 "CreateTable did not commit to the control plane in time \
                  (no leader reachable?)",
             ));
         }
-        tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+        ctx.env.sleep(SCHEMA_POLL_INTERVAL).await;
     }
     // Now that the table schema exists in the catalog, propose each declared
     // secondary-index *definition* (`CreateTableIndex` is rejected unless the table
@@ -3741,7 +3847,7 @@ async fn create_table(
     // committed.
     for index in indexes {
         let def = schema_bridge::index_to_control(index, &schema.partition_key, key_types);
-        let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+        let deadline = ctx.env.now().saturating_add(SCHEMA_COMMIT_TIMEOUT);
         loop {
             ctx.propose_schema(&MetaCommand::CreateTableIndex {
                 table: table.to_owned(),
@@ -3756,13 +3862,13 @@ async fn create_table(
             {
                 break;
             }
-            if tokio::time::Instant::now() >= deadline {
+            if ctx.env.now() >= deadline {
                 return Err(internal(
                     "CreateTable index definition did not commit to the control \
                      plane in time (no leader reachable?)",
                 ));
             }
-            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+            ctx.env.sleep(SCHEMA_POLL_INTERVAL).await;
         }
     }
     // Enable the stream, if requested, the same commit-wait shape as the
@@ -3823,8 +3929,16 @@ async fn create_table(
 /// Callers must have already established that no stream is currently
 /// enabled for `table` (the apply-time guard rejects otherwise) — used by
 /// both `create_table`'s first-enable and `update_table`'s enable path.
-async fn enable_stream(
-    ctx: &ClientCtx,
+///
+/// Generic over `E: Env`/`R: RelayClient` (ADR 0061 rung D3 PR 2a), so it
+/// compiles as one of `create_table`'s own callees — unexercised via the
+/// generic `dispatch_table_op` path today (a `CreateTable` carrying a
+/// stream declaration is rejected before this is ever called generically —
+/// see `dispatch_table_op`'s own doc), but must still type-check for any
+/// `E`/`R`, and `update_table`'s own (unmodified, `ProdEnv`-only) call site
+/// keeps compiling unchanged, monomorphized as before.
+async fn enable_stream<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     table: &str,
     view_type: animus_control::StreamViewType,
 ) -> Result<animus_control::StreamSpec, WireError> {
@@ -3832,7 +3946,7 @@ async fn enable_stream(
         view_type,
         label: mint_stream_label(ctx),
     };
-    let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+    let deadline = ctx.env.now().saturating_add(SCHEMA_COMMIT_TIMEOUT);
     loop {
         ctx.propose_schema(&MetaCommand::SetTableStream {
             table: table.to_owned(),
@@ -3846,13 +3960,13 @@ async fn enable_stream(
         {
             return Ok(spec);
         }
-        if tokio::time::Instant::now() >= deadline {
+        if ctx.env.now() >= deadline {
             return Err(internal(
                 "stream enable did not commit to the control plane in time \
                  (no leader reachable?)",
             ));
         }
-        tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+        ctx.env.sleep(SCHEMA_POLL_INTERVAL).await;
     }
 }
 
@@ -4330,7 +4444,11 @@ fn table_status(meta: &Metadata, table: &str) -> &'static str {
 /// from `meta`) but kept for signature symmetry with the other operation
 /// handlers.
 #[allow(clippy::unnecessary_wraps)] // matches every other operation handler's `Result` shape
-fn describe_table(_ctx: &ClientCtx, meta: &Metadata, table: &str) -> Result<String, WireError> {
+fn describe_table<E: Env, R: RelayClient>(
+    _ctx: &ClientCtx<E, R>,
+    meta: &Metadata,
+    table: &str,
+) -> Result<String, WireError> {
     let Some(control_schema) = meta.table_schema(table) else {
         return Err(registry_error(animus_dynamo::RegistryError::NoSuchTable(
             table.to_owned(),
@@ -4384,7 +4502,10 @@ fn describe_table(_ctx: &ClientCtx, meta: &Metadata, table: &str) -> Result<Stri
 /// [`wire::delete_table_response`] — the same shared table-description
 /// builder [`describe_table`] wraps under `Table`, here wrapped under
 /// `TableDescription` with `TableStatus` overridden to `DELETING`.
-async fn delete_table(ctx: &ClientCtx, table: &str) -> Result<String, WireError> {
+async fn delete_table<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+    table: &str,
+) -> Result<String, WireError> {
     let meta = metadata_fresh(ctx).await;
     let Some(control_schema) = meta.table_schema(table) else {
         return Err(registry_error(animus_dynamo::RegistryError::NoSuchTable(
@@ -4462,7 +4583,7 @@ fn list_tables(
 /// `DescribeStream`/`GetRecords`/`GetShardIterator` (ADR 0042 §4) validate
 /// the *current* label byte-for-byte, never parse it as a date; the ISO8601
 /// shape only matters for fidelity with real DynamoDB's own label format.
-fn mint_stream_label(ctx: &ClientCtx) -> String {
+fn mint_stream_label<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>) -> String {
     format!("{}-{}", iso8601_ish(ctx.env.now().0), ctx.env.node_id())
 }
 

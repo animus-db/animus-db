@@ -252,6 +252,21 @@ the production implementation; the deterministic implementation lives in
   address itself or an operator-supplied advertised host) — this seam
   itself has no opinion on *which* string it's handed, only that it's a
   dialable one.
+- **`Env::merge_peer(id, addr)` has a default no-op on the trait itself
+  since ADR 0061 rung D3 PR 2a** (`animusd`) — added so a caller reaching
+  a peer-book update through a *generic* `E: Env` handle (`ClientCtx<E,
+  R>::admin_add_control_member`, once `ClusterEdgeState::control` widened
+  from a fixed `RaftNode<ProdEnv>` to a generic `RaftNode<E>`) still
+  type-checks for any `E`, not just `ProdEnv` — the identical "additive
+  default, no existing implementor has to change" shape `Env::metrics()`
+  already established. `ProdEnv`'s own trait impl delegates to the
+  pre-existing inherent method below (Rust's inherent-impl priority in
+  method resolution means the delegation call reaches the inherent method,
+  not itself, so this is not infinite recursion); `SimEnv` and every other
+  non-`ProdEnv` implementor gets the no-op, which is the *correct* behavior
+  for them — they have no peer-book concept to begin with, not merely an
+  unimplemented one. See `crates/animusd/CLAUDE.md`'s matching entry for
+  the call site this was added for.
 - **`ProdEnv::merge_peer(id, addr)` (ADR 0037 PR3) adds/replaces a single peer
   entry without disturbing the rest of the book** — the incremental dual of
   `set_peers`'s full replace, with no `get_peers` to read-modify-write around

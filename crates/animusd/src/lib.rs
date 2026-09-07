@@ -6545,7 +6545,25 @@ pub struct ClusterEdgeState<E: Env = ProdEnv> {
     /// `intra_route` (ADR 0047; ADR 0013 originally routed this via
     /// `client_route`) — the same path every follower-connected DDL
     /// in a one-process-per-node deployment always used.
-    control: Arc<Mutex<Vec<RaftNode<ProdEnv>>>>,
+    ///
+    /// **Generic over `E: Env` since ADR 0061 rung D3 PR 2a** (was fixed to
+    /// `RaftNode<ProdEnv>`) — see that rung's own ADR amendment and this
+    /// field's `register_control`/[`leader_handle`](Self::leader_handle)
+    /// neighbors for the full account. Before this widening,
+    /// `propose_schema`'s local-propose fast path was structurally
+    /// `ProdEnv`-only regardless of the enclosing `ClientCtx<E, R>`'s own
+    /// `E`: under `SimEnv` this field was always empty, so `leader_handle()`
+    /// always answered `None` and every schema proposal — even one issued
+    /// on the node genuinely leading the control group — took the relay
+    /// branch, forwarding a `ProposeSchema` request to **itself** over
+    /// `SimRelayClient`, which `forwarding::handle_relayed_request`'s own
+    /// `ProposeSchema` arm re-resolves the same way and re-relays, recursing
+    /// until the caller's own timeout. Widening this to `RaftNode<E>` and
+    /// having `SimCluster::new` register every node's own control handle
+    /// restores the real leader-local fast path under `SimEnv` too, and
+    /// makes the non-leader one-hop relay branch genuinely exercised for
+    /// the first time (D2 called it "never yet exercised").
+    control: Arc<Mutex<Vec<RaftNode<E>>>>,
     /// The DynamoDB edge's in-memory GSI declarations + observation-built
     /// written-key index (ADR 0006). Not durable / not replicated; per-node.
     dynamo_registry: Arc<Mutex<animus_dynamo::SchemaRegistry>>,
@@ -6615,8 +6633,9 @@ impl<E: Env> ClusterEdgeState<E> {
     }
 
     /// Register a node's control handle for schema-proposal routing. Called once
-    /// per node in [`BoundNode::start_with`].
-    fn register_control(&self, raft: RaftNode<ProdEnv>) {
+    /// per node in [`BoundNode::start_with`] (and, under `SimEnv`, once per
+    /// node in `SimCluster::new` — ADR 0061 rung D3 PR 2a).
+    fn register_control(&self, raft: RaftNode<E>) {
         self.control
             .lock()
             .expect("control handles poisoned")
@@ -6761,7 +6780,7 @@ impl<E: Env> ClusterEdgeState<E> {
     }
 
     /// The control handle that currently believes it is leader, if any.
-    pub(crate) fn leader_handle(&self) -> Option<RaftNode<ProdEnv>> {
+    pub(crate) fn leader_handle(&self) -> Option<RaftNode<E>> {
         self.control
             .lock()
             .expect("control handles poisoned")
@@ -17599,6 +17618,20 @@ mod sim_cluster_dynamo_update_add_delete;
 mod sim_cluster_dynamo_updated_return_values;
 #[cfg(test)]
 mod sim_cluster_kind_batch_outcome;
+
+/// ADR 0061 rung D3 PR 2a (C-04 D3): base-table DDL over the real DynamoDB
+/// wire, driven through the new `dynamo::dispatch_table_op` generic core —
+/// `CreateTable`/`DeleteTable`/`ListTables`/`DescribeTable` — for the first
+/// time. Replaces `crates/animusd/tests/dynamo_table_ops.rs` whole,
+/// `dynamo_schema.rs::create_table_rejects_reserved_namespace`, and
+/// `dynamo_extended.rs::create_table_query_and_conditional_writes` (which
+/// emptied that file). A sibling of `sim_cluster_corpus`/`sim_cluster_
+/// throttle`/`sim_cluster_dynamo` for the identical reason (needs
+/// `SimCluster`'s own `pub(crate)` surface, no further visibility
+/// widened). See that module's own doc for the full account, including the
+/// reconciler-hazard soak (item 5) and its finding.
+#[cfg(test)]
+mod sim_cluster_dynamo_table_ops;
 
 /// Regression for the issue #298 residual confirmed live under the
 /// un-pinned `SplitMode::InPlace` proof soak (ADR 0018's matching amendment,

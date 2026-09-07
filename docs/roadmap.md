@@ -334,11 +334,41 @@ the still-true paragraph after the table.
   against, is shrinking the real-thread tier's own test count / wall time /
   flake surface. A parallel redundancy audit folded in two more removals
   from `dynamo_wire.rs`/`dynamo_throttling.rs` whose tests duplicated
-  existing sim coverage outright (see those files' own doc comments). D3's
-  remaining classes (GSI/LSI-touching, DDL/wire-level `CreateTable`,
-  Transact, PartiQL, Streams, TTL, admin/console/dashboard HTTP, TLS,
-  SigV4, restart-durability, wall-clock timing) and D4 (deterministic
-  coverage for auto-split/GC/join/backup-janitor) remain open.
+  existing sim coverage outright (see those files' own doc comments).
+  **PR 2a landed 2026-09-07**: base-table DDL (`CreateTable`/`DeleteTable`/
+  `ListTables`/`DescribeTable`, still without `UpdateTable` — PR 2b) is now
+  drivable through `SimCluster` over the real wire, via a new `dynamo::
+  dispatch_table_op<E, R>` generic core (`dispatch_item_op`'s DDL sibling)
+  and two `SimCluster` fixes this PR needed to make it actually work:
+  `Metadata::members` population (`SimCluster::seed_members`, closing the
+  gap PR 1's own amendment named) and `ClusterEdgeState::control` widened
+  from a fixed `RaftNode<ProdEnv>` to `RaftNode<E>` (restoring
+  `propose_schema`'s real leader-local fast path, and for the first time
+  genuinely exercising its non-leader relay branch — see `animus-env`'s new
+  `Env::merge_peer` default method, added to keep one existing `animusd`
+  call site compiling generically). Two real, previously-unreachable fixture
+  bugs were found and fixed along the way (a member seeded `Active` was
+  flipping back to `Down` within 500ms with no heartbeat loop running; two
+  independent tablet-id allocators could collide once both the hand-hosted
+  and wire-provisioned paths were used in the same cluster) — see ADR
+  0061's 2026-09-07 "D3 PR 2a" amendment for both incidents and `docs/
+  engineering-lessons.md`'s matching entries. The reconciler-hazard
+  investigation this PR's own task named found a **real, deterministic,
+  documented gap**, left open rather than fixed: on a cluster with more
+  nodes than `MAX_REPLICATION_FACTOR` (3), the control plane's own
+  (correct) `rebalance_placement` can move a wire-provisioned tablet's
+  replica set out from under `SimCluster`'s own minimal tablet-hosting
+  watcher, which only ever adds a newly-named replica's own hosting and
+  never tears down one a rebalance dropped — genuinely split-brain-shaped,
+  reachable with a plain `CreateTable`, no fault injection needed, whenever
+  `node_count > 3`. Every test added by this PR stays at `node_count <= 3`
+  to avoid it; a proper fix needs `SimCluster` to grow real
+  `Reconciler`-shaped teardown, named as this PR's own follow-up rather
+  than attempted here. D3's remaining classes (`UpdateTable` (PR 2b),
+  GSI/LSI-touching, Transact, PartiQL, Streams, TTL, admin/console/
+  dashboard HTTP, TLS, SigV4, restart-durability, wall-clock timing) and D4
+  (deterministic coverage for auto-split/GC/join/backup-janitor), plus a
+  real `SimCluster` `Reconciler` (the gap just above), remain open.
 - **E1 landed 2026-09-04** (`ClusterApi`/`AdminOps` seams in
   `animus-operator`, fake-driven `controller::tests`; ADR 0061's
   2026-09-04 amendment). **E2 landed 2026-09-07**: the seven pre-existing

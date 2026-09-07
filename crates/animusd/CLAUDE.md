@@ -5735,10 +5735,21 @@ account, including what a follow-on corpus rung still needs):
   registration are built from the identical replica list in the same
   call, so they can never disagree.
 - **DDL is the same control-plane-Raft bypass every `SimEnv` `ClientCtx`
-  fixture in this crate uses** — `ClientCtx::propose_schema`'s local-propose
-  fast path is still `ProdEnv`-locked (unchanged by rung C3d, which only
-  made its *relay* branches reachable). `SimCluster` never calls
-  `propose_schema` at all.
+  fixture in this crate uses, for hand-hosted tables** —
+  `create_table_with_replication` never calls `propose_schema` at all,
+  proposing `CreateTableSchema`/`CreateTablet` directly on the control
+  leader's own `RaftNode` handle instead. **`ClientCtx::propose_schema`'s
+  local-propose fast path was `ProdEnv`-locked through rung C3d (which
+  only made its *relay* branches reachable) — this changed in ADR 0061
+  rung D3 PR 2a**: `ClusterEdgeState<E>::control` widened from a fixed
+  `Vec<RaftNode<ProdEnv>>` to `Vec<RaftNode<E>>`, and `SimCluster::new`
+  now registers every node's own control handle onto its own edge, so
+  `propose_schema`'s real leader-local fast path (and its non-leader relay
+  branch, now genuinely exercised rather than a leader relaying to itself)
+  both work under `SimEnv` — reached by `dynamo::create_table`/
+  `delete_table` via the new `dynamo::dispatch_table_op`, not by this
+  method directly. See that rung's own `CLAUDE.md`/ADR entries, below and
+  in `docs/adr/0061-*.md`, for the full account.
 - **`restart` is a true process restart on `MemoryEngine`** —
   `Simulator::stop` then fresh `RaftNode::start`/`RaftKvNode::start_hosted`
   calls on the same node id, each on a brand-new `MemoryEngine` (a
@@ -5767,12 +5778,13 @@ partitioned off cannot ack, the majority side still succeeds, and the
 minority catches up after `heal_all`; and a second `create_table` after
 the first, with both tables independently writable/readable.
 
-**Still `ProdEnv`-only, unchanged from every prior rung's findings**:
-`ClientCtx::propose_schema`'s local-propose fast path (above);
-`SegmentStoreHandle`/`BackupStoreHandle`'s `Cluster` variant (this fixture
-only ever uses the `Fs` placeholder — nothing it drives reads either
-field); and a `DataRole` (`data: None` on every node — no DynamoDB wire
-edge, no TTL reaper, no stream/backup loops).
+**Still `ProdEnv`-only**: `SegmentStoreHandle`/`BackupStoreHandle`'s
+`Cluster` variant (this fixture only ever uses the `Fs` placeholder —
+nothing it drives reads either field). **No longer `ProdEnv`-only, since
+ADR 0061 rung D3 PR 2a**: `ClientCtx::propose_schema`'s local-propose fast
+path (see the bullet above) and a real `DataRole` (`sim_cluster_dynamo.rs`,
+D2 PR 1, gave every node a real one — `data: None` was this rung's own
+original shape, not the current one).
 
 ### `sim_cluster_corpus`: the SimCluster cycles/durability corpus (ADR 0061 rung D1 step 3)
 
@@ -6063,8 +6075,98 @@ raced-writers idiom several of the converted tests used. A parallel
 redundancy audit also found two `tests/dynamo_*.rs` tests that duplicated
 existing `sim_cluster_throttle.rs`/`sim_cluster_dynamo.rs` coverage outright
 (no rewrite needed) — see `dynamo_wire.rs`'s and `dynamo_throttling.rs`'s
-own doc comments for the removed tests and their sim citations. The
-restart tests run both incarnations in the same runtime,
+own doc comments for the removed tests and their sim citations.
+
+**PR 2a (ADR 0061 rung D3 PR 2a) landed 2026-09-07**: base-table DDL —
+`CreateTable`/`DeleteTable`/`ListTables`/`DescribeTable`, deliberately
+**without** `UpdateTable` (PR 2b) — is now drivable through `SimCluster`
+over the real wire, via a new `dynamo::dispatch_table_op<E, R>` (the DDL
+sibling of `dispatch_item_op`; see that function's own doc for what it
+covers and why `CreateTable` rejects a declared GSI/LSI or a stream).
+`sim_cluster_dynamo_table_ops.rs` (new sibling module) replaces `tests/
+dynamo_table_ops.rs` whole, `dynamo_schema.rs::
+create_table_rejects_reserved_namespace`, and `dynamo_extended.rs::
+create_table_query_and_conditional_writes` (emptying that file, since its
+own sibling test had already moved in PR 1 — deleted rather than left as
+an empty shell). This PR needed two `SimCluster` fixes to make wire DDL
+work **at all**, both real findings from this rung's own investigation, not
+part of the original design:
+
+- **`SimCluster::seed_members`** (new): populates `Metadata::members` for
+  every node (`RegisterNode{role: "combined"}` then
+  `UpsertMember{status: Active}`) — closing the gap PR 1's own amendment
+  left open. Confirmed harmless to every hand-hosted scenario:
+  `reconcile_placement`/`rebalance_placement` iterate `Metadata::policies`,
+  never `tablets` directly, and `create_table_with_replication`'s
+  hand-hosted tablets never attach one.
+- **`ClusterEdgeState<E>::control` widened** `Arc<Mutex<Vec<RaftNode<
+  ProdEnv>>>>` → `Arc<Mutex<Vec<RaftNode<E>>>>` (`register_control`/
+  `leader_handle` widened to match), with `SimCluster::new` now calling
+  `register_control` for every node. Before this, `ClientCtx::
+  propose_schema`'s local-propose fast path was structurally `ProdEnv`-only
+  regardless of the enclosing `E`, so under `SimEnv` **every** schema
+  proposal — even a leader-issued one — took the relay branch, which meant
+  relaying to **itself** and recursing until timeout (D2 called this
+  branch "never yet exercised"). One existing production call site
+  (`ClientCtx::admin_add_control_member`'s `leader.env().merge_peer(..)`)
+  needed a new `animus_env::Env::merge_peer` default no-op method (`ProdEnv`
+  overrides it to delegate to the pre-existing inherent method) to keep
+  compiling generically — see `animus-env/CLAUDE.md`'s own entry.
+
+Two more real, previously-unreachable `SimCluster` bugs were found and
+fixed getting these two changes to actually work end to end: (1) a member
+seeded `Active` flipped back to `Down` within `DETECT_TIMEOUT` (500ms) —
+`RaftNode::start`'s own `detect_loop` gives a freshly-`Active`-but-
+untracked member exactly one **synthetic** liveness observation
+(ADR 0030's "phantom-member hardening"), and with no *real* heartbeat ever
+following (this fixture ran none), that timestamp ages out like any
+other; fixed by spawning `animus_control::node::heartbeat_loop` on every
+node (`SimCluster::new` and `SimCluster::restart` both); (2)
+`create_table_with_replication`'s own fixture-local tablet-id counter
+(`next_tablet_id`, now deleted) could collide with `Metadata::
+next_free_tablet_id()` — the wire path's own live allocator — the moment
+a test used both paths in one cluster (this PR's own `list_tables_*` test
+was the first to); fixed by deriving `create_table_with_replication`'s id
+from the same live allocator instead. See `docs/engineering-lessons.md`'s
+matching entries for both.
+
+**`spawn_policy_tablet_host_loop`** (new, private to `sim_cluster.rs`): a
+minimal per-node watcher, spawned in `SimCluster::new`/`restart`, that
+hosts a `RaftKvNode` for any tablet carrying a placement **policy**
+(`Metadata::policies`) whose replica set names this node — the signal a
+wire-provisioned tablet always carries (via `SetTabletPolicy`) and a
+hand-hosted one never does, keeping the two hosting paths' tablet sets
+disjoint by construction. Without it, a wire `CreateTable`'s own
+`await_table_serveable` probe would time out waiting for a group nobody
+ever forms — this fixture runs no real `animus_cp_data::host::Reconciler`
+at all (see the module doc's "hand-hosted, not reconciler-hosted" bullet).
+
+**The reconciler-hazard investigation this PR's task named found a real,
+deterministic, and deliberately *unfixed* gap**: this watcher only ever
+*adds* a replica newly named in a tablet's `Metadata.tablets[t].replicas`
+— it never tears down one a `MetaCommand::CasTabletReplicas` just dropped.
+On a cluster with `node_count > MAX_REPLICATION_FACTOR` (3), the control
+leader's own live (and entirely correct) `rebalance_placement` pass will
+rebalance a wire-provisioned tablet's replica set to spread load across
+the otherwise-idle extra node(s) — `sim_cluster_dynamo_table_ops.rs::
+reconciler_hazard_fires_deterministically_when_node_count_exceeds_
+replication` pins the exact, fully deterministic outcome (proven across
+25 seeds during the investigation, identical every time) of a 4-node
+cluster's first two wire-created tables both getting rebalanced onto the
+fourth node while a third, created after balance is already reached,
+never moves. The result: a stale `RaftKvNode` left running on the node the
+CAS removed, genuinely split-brain-shaped for that one tablet id (two
+different-membership groups, no fault injection needed) — reachable with
+a plain `CreateTable`, whenever `node_count > 3`. **Not fixed here** — a
+correct fix needs `SimCluster` to grow real `Reconciler`-shaped teardown,
+materially more fixture machinery than this PR's own brief asks for (ADR
+0061 rung D1's own module doc already named a reconciler-hosted
+`SimCluster` as a future rung, not this one). Every test in this crate
+that issues a real wire `CreateTable` stays at `node_count <= 3` to avoid
+it — keep new tests to that bound too, until a future rung closes this
+gap.
+
+The restart tests run both incarnations in the same runtime,
 calling `Node::shutdown()` between them. In-crate `#[cfg(test)] mod`s
 (`confirm_futility_tests`) live in `lib.rs` itself
 because they need private handles (a raw `CpGroup`/the `pub(crate)`

@@ -66,14 +66,51 @@
 //!   `InstallSnapshot`, never local WAL replay. A durable (`LsmEngine`)
 //!   `SimCluster` tier is a natural follow-on (mirroring
 //!   `raftkv_linearizable.rs`'s own two-tier design) but is not built here.
-//! - **What is still `ProdEnv`-only.** `ClientCtx::propose_schema`'s
-//!   local-propose fast path (as above); `SegmentStoreHandle`/
+//! - **What is still `ProdEnv`-only.** `SegmentStoreHandle`/
 //!   `BackupStoreHandle`'s `Cluster` variant (this fixture only ever uses
 //!   the `Fs` placeholder, like every sibling harness — nothing this
-//!   fixture drives reads `ctx.segment_store`/`ctx.backup_store`); and a
-//!   `DataRole` (`data: None` on every node — no DynamoDB wire edge, no TTL
-//!   reaper, no stream/backup loops; this fixture drives the plain
-//!   `cp_kind_write_raw`/`cp_get`/`cp_scan` client-protocol methods only).
+//!   fixture drives reads `ctx.segment_store`/`ctx.backup_store`).
+//!
+//! # Updated since D1 (read this before trusting the two bullets above at
+//! face value)
+//!
+//! **ADR 0061 rung D3 PR 2a** closed the gap the "DDL is a control-plane-
+//! Raft bypass" bullet above describes for `create_table_with_replication`
+//! specifically (that bypass is still exactly how *this fixture's own*
+//! hand-hosted tables are seeded — the bullet is accurate for that one
+//! method) but is no longer true of `ClientCtx::propose_schema` in
+//! general: [`ClusterEdgeState::control`] widened from a fixed
+//! `Arc<Mutex<Vec<RaftNode<ProdEnv>>>>` to `Arc<Mutex<Vec<RaftNode<E>>>>`,
+//! and [`SimCluster::new`] now calls `register_control` for every node —
+//! `propose_schema`'s real leader-local fast path (and its non-leader
+//! relay branch, now genuinely exercised for the first time rather than a
+//! leader relaying `ProposeSchema` to itself and recursing to timeout)
+//! both work under `SimEnv`. Reached today via `dynamo::create_table`/
+//! `delete_table` (through `dynamo::dispatch_table_op`, `SimClusterHandle::
+//! dynamo`'s own new DDL arm) — see `dynamo.rs`'s own doc.
+//!
+//! Three more additions this same rung needed to make that actually work
+//! end to end, all in this file: [`SimCluster::seed_members`] (populates
+//! `Metadata::members` — `SimCluster::new` used to leave it permanently
+//! empty), a per-node `animus_control::node::heartbeat_loop` spawned in
+//! both [`SimCluster::new`] and [`SimCluster::restart`] (a real,
+//! previously-unreachable bug: a member seeded `Active` flipped back to
+//! `Down` within `DETECT_TIMEOUT` with no heartbeat loop running — see
+//! `docs/engineering-lessons.md`), and [`spawn_policy_tablet_host_loop`] (a
+//! minimal per-node watcher standing in for the real `animus_cp_data::
+//! host::Reconciler` this fixture still doesn't run — see that function's
+//! own doc, including the real, deliberately-unfixed gap its own
+//! "reconciler-hazard" investigation found: it never tears down a replica
+//! a rebalance dropped, so keep `node_count <= MAX_REPLICATION_FACTOR` (3)
+//! for any scenario issuing a real wire `CreateTable`).
+//! `create_table_with_replication`'s own tablet-id minting also changed —
+//! it used to keep its own fixture-local counter (`next_tablet_id`, now
+//! deleted), which could and did collide with `Metadata::
+//! next_free_tablet_id()` (the wire path's own live allocator) the moment
+//! a test used both paths in one cluster; it now reads that same live
+//! allocator instead. See `crates/animusd/CLAUDE.md`'s own D3 PR 2a entry
+//! and ADR 0061's matching 2026-09-07 amendment for the full account of
+//! all of the above.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::SocketAddr;
@@ -100,6 +137,74 @@ use super::*;
 /// can legitimately need the whole `CLIENT_TIMEOUT` window to either
 /// converge or fail cleanly.
 const OP_BUDGET: Duration = Duration::from_secs(12);
+
+/// How often each node's [`spawn_policy_tablet_host_loop`] watcher rechecks
+/// `Metadata` for a newly-provisioned tablet it should host — see that
+/// function's own doc.
+const POLICY_TABLET_HOST_POLL: Duration = Duration::from_millis(50);
+
+/// Auto-host any tablet carrying a placement **policy**
+/// (`Metadata::policies`) whose replica set names `node_id`, on `node_id`'s
+/// own env (ADR 0061 rung D3 PR 2a) — a minimal, `SimCluster`-only stand-in
+/// for what a real node's `animus_cp_data::host::Reconciler` does in
+/// production (ADR 0031). This fixture otherwise runs no reconciler at all
+/// (see the module doc's own "hand-hosted, not reconciler-hosted" bullet):
+/// `SimCluster::create_table_with_replication`'s own hand-hosted tables host
+/// their `RaftKvNode`s directly and synchronously, in the same call that
+/// creates the tablet, and (deliberately) never attach a placement policy —
+/// but a **wire-issued** `CreateTable` (`dispatch_table_op` →
+/// `ClientCtx::create_table` → `provision_tablet`) always attaches one via
+/// `MetaCommand::SetTabletPolicy`, and its own `await_table_serveable` probe
+/// would otherwise time out waiting for a group nobody ever forms.
+///
+/// **Policy-presence is the load-bearing signal that keeps this watcher and
+/// `create_table_with_replication`'s own explicit hosting from ever racing
+/// for the same tablet** — a hand-hosted tablet never appears in
+/// `Metadata::policies` at all in this fixture, so the two hosting paths'
+/// tablet sets are always disjoint; `ClusterEdgeState::local_cp(tablet).
+/// is_none()` is still checked before hosting as the immediate idempotency
+/// guard (this watcher's own poll-to-poll idempotency, and safety against
+/// `SimCluster::restart` spawning a fresh watcher for a tablet an
+/// **un-restarted** replica already hosts).
+///
+/// **What this watcher does NOT do** — and the reason ADR 0061 rung D3
+/// PR 2a's own "reconciler hazard" investigation exists: it only ever
+/// *adds* a missing replica's own hosting, never reacts to a
+/// `MetaCommand::CasTabletReplicas` that moves a tablet's *target* replica
+/// set away from what it was first hosted with (learner catch-up,
+/// leadership handoff, releasing a dropped replica's engine — the real
+/// `Reconciler`'s whole job, ADR 0031/0029). The control group's own
+/// `reconcile_loop`/`rebalance_placement` (`animus-control::node`) is a
+/// live, unconditional background task on whichever node leads the control
+/// group (spawned by `RaftNode::start` itself, not by this fixture) — it
+/// runs over every tablet with a policy regardless of who (if anyone) is
+/// physically reconciling the result, so a wire-provisioned tablet's
+/// `Metadata.tablets[t].replicas` is, in principle, live territory for it
+/// to CAS the instant a policy exists. See `sim_cluster_dynamo_table_ops.rs`'s
+/// own `reconciler_hazard_soak` for the empirical check and its finding.
+fn spawn_policy_tablet_host_loop(ctx: SimNodeCtx, node_id: NodeId) {
+    ctx.env.clone().spawn_task(async move {
+        loop {
+            let meta = ctx.effective_metadata();
+            for (&tablet, t) in &meta.tablets {
+                if meta.policies.contains_key(&tablet)
+                    && t.replicas.contains(&node_id)
+                    && ctx.edge.local_cp(tablet).is_none()
+                {
+                    let kv: RaftKvNode<SimEnv, MemoryEngine> = RaftKvNode::start_hosted(
+                        ctx.env.clone(),
+                        t.replicas.clone(),
+                        MemoryEngine::new(),
+                        StorageScope::new(t.range.clone()),
+                        tablet.0,
+                    );
+                    ctx.edge.register_raftkv(tablet, CpGroup::Mem(kv));
+                }
+            }
+            ctx.env.sleep(POLICY_TABLET_HOST_POLL).await;
+        }
+    });
+}
 
 /// This fixture's fixed key encoding: every table's items are addressed by
 /// a `(pk, sk)` pair of DynamoDB `S` (string) attributes, run through the
@@ -239,6 +344,25 @@ impl SimClusterHandle {
             .expect("ctxs poisoned")
             .iter()
             .all(|ctx| ctx.effective_metadata().has_table_tablet(table))
+    }
+
+    /// ADR 0061 rung D3 PR 2a: every node's own view of `Metadata::members`
+    /// shows every node id (`0..node_count`, derived from `ctxs.len()`
+    /// rather than taking a parameter — this handle already knows the
+    /// cluster's whole node set) `Active` — the convergence check
+    /// [`SimCluster::seed_members`] polls on, mirroring
+    /// [`all_have_table_tablet`]'s own shape.
+    fn all_members_active(&self) -> bool {
+        let ctxs = self.ctxs.lock().expect("ctxs poisoned");
+        let count = ctxs.len() as u64;
+        ctxs.iter().all(|ctx| {
+            let meta = ctx.effective_metadata();
+            (0..count).all(|n| {
+                meta.members
+                    .get(&nid(n))
+                    .is_some_and(|m| m.status == NodeStatus::Active)
+            })
+        })
     }
 
     /// ADR 0065 §5(b): every node's own view of `table`'s per-table
@@ -487,7 +611,6 @@ pub(crate) struct SimCluster {
     /// there is exactly one copy of this bookkeeping, shared identically by
     /// the driver and by any handle a corpus holds.
     shared: SimClusterHandle,
-    next_tablet_id: u64,
     /// Node ids currently [`SimCluster::crash`]ed (muted, tasks still
     /// alive) — tracked so [`SimCluster::heal_all`] knows which ones need
     /// `Simulator::restart` (the un-mute call, unrelated to this struct's
@@ -532,6 +655,39 @@ impl SimCluster {
             .iter()
             .map(|id| RaftNode::start(sim.env(id.clone()), ids.clone(), MemoryEngine::new()))
             .collect();
+
+        // ADR 0061 rung D3 PR 2a — real finding, not part of the original
+        // design pass: every node heartbeats every control voter
+        // (`animus_control::node::heartbeat_loop`, the identical loop a
+        // real deployment's `BoundNode::start_with` spawns per member),
+        // load-bearing for `Metadata::members` to stay `Active` at all.
+        // Without this, `RaftNode`'s own `detect_loop` — spawned
+        // unconditionally by `RaftNode::start` itself, not by this fixture
+        // — flips every seeded member back to `Down` within `DETECT_TIMEOUT`
+        // (500ms) of `SimCluster::new` returning: `detect_loop`'s "phantom-
+        // member hardening" (ADR 0030, `node.rs`) gives an `Active`-but-
+        // untracked member exactly one **synthetic** observation the first
+        // tick it sees one, and with no further *real* heartbeat ever
+        // arriving, that synthetic timestamp ages out like any other and
+        // the member is judged dead — the opposite of the design pass's own
+        // claim that "a directly-activated member cannot flip back to
+        // `Down`" (that claim covers only the *orphan sweep*, a different
+        // mechanism gated on `has_activated`, not the liveness detector
+        // gated on `FailureDetector::tracks`). Confirmed empirically before
+        // this fix landed: a `provision_tablet` call issued more than
+        // ~500ms of virtual time after `SimCluster::new` (i.e. essentially
+        // every real one, since a single `SimCluster::dynamo` call alone
+        // burns `OP_BUDGET` = 12s) found every member `Down` and could never
+        // pick a non-empty replica set, hanging until its own commit-wait
+        // deadline. See `docs/engineering-lessons.md`'s matching entry.
+        for id in &ids {
+            let env = sim.env(id.clone());
+            let control_ids = ids.clone();
+            env.spawn_task(animus_control::node::heartbeat_loop(
+                env.clone(),
+                control_ids,
+            ));
+        }
 
         let relays: Vec<SimRelayClient<SimEnv>> = ids
             .iter()
@@ -638,20 +794,124 @@ impl SimCluster {
             });
         }
 
+        // ADR 0061 rung D3 PR 2a: register each node's own control handle
+        // onto its own edge — restores `ClientCtx::propose_schema`'s real
+        // leader-local fast path under `SimEnv` (see `ClusterEdgeState::
+        // control`'s own doc for the full account). Before this,
+        // `leader_handle()` always answered `None` regardless of which node
+        // actually led the control group, so every schema proposal —
+        // including one issued on the leader itself — took the relay
+        // branch, which under `SimEnv` meant relaying to **itself**;
+        // `forwarding::handle_relayed_request`'s own `ProposeSchema` arm
+        // re-resolves the leader the identical way and re-relays, recursing
+        // until the caller's own timeout. `SimCluster::new` is the one
+        // place this fixture builds its `RaftNode<SimEnv>` handles, so this
+        // is the natural home for the registration — mirrors `BoundNode::
+        // start_with`'s own `edge.register_control(raft.clone())` call in
+        // production.
+        for (i, control) in controls.iter().enumerate() {
+            ctxs[i].edge.register_control(control.clone());
+        }
+
+        // ADR 0061 rung D3 PR 2a: one policy-tablet auto-host watcher per
+        // node — see `spawn_policy_tablet_host_loop`'s own doc.
+        for (i, id) in ids.iter().enumerate() {
+            spawn_policy_tablet_host_loop(ctxs[i].clone(), id.clone());
+        }
+
         let mut cluster = SimCluster {
             sim,
             nodes,
             replication,
             controls,
             shared: SimClusterHandle::new(ctxs),
-            next_tablet_id: 1,
             crashed: BTreeSet::new(),
         };
         // Let the control group elect before any caller touches it —
         // generous for up to a handful of voters under `SimEnv`'s
         // near-instant elections.
         cluster.sim.run_for(Duration::from_secs(2));
+        // ADR 0061 rung D3 PR 2a: populate `Metadata::members` — see
+        // `SimCluster::seed_members`'s own doc.
+        cluster.seed_members();
         cluster
+    }
+
+    /// Populate `Metadata::members` for every node in this cluster (ADR
+    /// 0061 rung D3 PR 2a). `SimCluster` used to leave `members`
+    /// permanently empty — harmless to every hand-hosted DDL scenario this
+    /// module's own tests drive (see the confirmation below), but it blocks
+    /// the real, wire-driven `dynamo::create_table` path this rung adds:
+    /// `ClientCtx::provision_tablet` reads `meta.members` to size a fresh
+    /// table's initial replica set, and would otherwise always come up
+    /// empty, so a wire `CreateTable` issued against this fixture could
+    /// never actually provision a tablet.
+    ///
+    /// For every node: `RegisterNode` with `role: "combined"` — **not**
+    /// `"control"`, since `RegisterNode`'s own `claims_membership` gate
+    /// (`animus_control::meta`) never inserts into `members` at all for a
+    /// control-only registration (a control-only node can never host a
+    /// tablet, so appearing in `members` would make it a placement
+    /// candidate and silently corrupt placement the moment it's picked) —
+    /// then `UpsertMember { status: Active }`. `RegisterNode` alone inserts
+    /// the member `Down`; this fixture runs no heartbeat loop
+    /// (`heartbeat_loop_live`/the control leader's `detect_loop`) to ever
+    /// promote it the way a real cluster's failure detector would, so a
+    /// direct `UpsertMember{Active}` is the only way this fixture's members
+    /// ever become `Active` at all. It also sets `Member::has_activated`
+    /// (`UpsertMember`'s apply arm, sticky once true), so the orphan-member
+    /// sweep — not that this fixture runs one either — could never reclaim
+    /// the id even if it did. Converged-or-timeout polled, the same shape
+    /// `create_table_with_replication`'s own tail uses.
+    ///
+    /// **Confirmed harmless to every hand-hosted scenario** (verified
+    /// against `animus-control`'s own source, not assumed): `reconcile_
+    /// placement`/`rebalance_placement` iterate `Metadata::policies`, never
+    /// `members` directly, and this fixture never proposes
+    /// `SetTabletPolicy` for a hand-hosted table (only `ClientCtx::
+    /// provision_tablet`'s own real wire path does) — so populating
+    /// `members` here cannot make the reconciler (which this fixture never
+    /// runs in the first place — DDL is a direct `RaftNode::propose` bypass,
+    /// see the module doc) touch a hand-hosted table's tablet. `cargo test
+    /// -p animusd --lib` keeps its identical pass count before and after
+    /// this change (240 both before and after, at the time this rung
+    /// landed).
+    fn seed_members(&mut self) {
+        let leader = self.control_leader_index();
+        for n in 0..self.nodes as u64 {
+            let id = nid(n);
+            let addr = id.to_string();
+            let addrs = NodeAddrs {
+                internal: addr.clone(),
+                client: addr.clone(),
+                intra: addr.clone(),
+                admin: addr,
+                role: "combined".to_owned(),
+            };
+            assert!(
+                matches!(
+                    self.controls[leader].propose(MetaCommand::RegisterNode {
+                        node: id.clone(),
+                        addrs,
+                        labels: BTreeMap::new(),
+                    }),
+                    ProposeResult::Accepted { .. }
+                ),
+                "RegisterNode must be accepted by the current control leader (node={id})"
+            );
+            assert!(
+                matches!(
+                    self.controls[leader].propose(MetaCommand::UpsertMember {
+                        node: id.clone(),
+                        labels: BTreeMap::new(),
+                        status: NodeStatus::Active,
+                    }),
+                    ProposeResult::Accepted { .. }
+                ),
+                "UpsertMember must be accepted by the current control leader (node={id})"
+            );
+        }
+        self.poll_until(Duration::from_secs(5), |c| c.shared.all_members_active());
     }
 
     /// The number of nodes this cluster was built with.
@@ -690,7 +950,15 @@ impl SimCluster {
     /// scenario this fixture drives keeps the control group itself
     /// healthy (it is never a fault target), so a failure here means the
     /// cluster is broken, not that the caller should retry.
-    fn control_leader_index(&mut self) -> usize {
+    ///
+    /// `pub(crate)` since ADR 0061 rung D3 PR 2a: `sim_cluster_dynamo_
+    /// table_ops.rs`'s own control-leader-vs-follower `CreateTable`/
+    /// `DeleteTable` regressions need to pick a leader-issued and a
+    /// follower-issued target node — the identical "widen only what a
+    /// sibling `#[cfg(test)] mod` genuinely needs, nothing else" discipline
+    /// this crate's own visibility lesson (`docs/engineering-lessons.md`)
+    /// documents.
+    pub(crate) fn control_leader_index(&mut self) -> usize {
         for _ in 0..40 {
             if let Some(i) = self.controls.iter().position(RaftNode::is_leader) {
                 return i;
@@ -750,12 +1018,28 @@ impl SimCluster {
             (1..=self.nodes).contains(&replication),
             "replication must be between 1 and the node count"
         );
-        let tablet = TabletId(self.next_tablet_id);
-        self.next_tablet_id += 1;
         let replicas: Vec<u64> = (0..replication as u64).collect();
         let replica_ids: Vec<NodeId> = replicas.iter().copied().map(nid).collect();
 
         let leader = self.control_leader_index();
+        // ADR 0061 rung D3 PR 2a fix: derive the fresh id from this leader's
+        // own **live** `Metadata` (`next_free_tablet_id`), never a
+        // fixture-local counter — a real finding from this rung's own work,
+        // not a pre-existing concern: before this rung, every `SimCluster`
+        // test used *either* this hand-hosted path *or* the wire-provisioned
+        // path (`ClientCtx::provision_tablet`, which already reads
+        // `Metadata::next_free_tablet_id()` fresh), never both in the same
+        // cluster. This module's own `list_tables_sorts_paginates_and_
+        // excludes_gsi_hidden_tables` test is the first to mix them (three
+        // wire-created tables, then one hand-hosted one) and is what
+        // surfaced the bug: a fixture-local counter starting at 1 and
+        // incrementing only on THIS method's own calls collided with
+        // `TabletId(1)` already minted by the first wire-created table,
+        // silently wedging the hand-hosted `CreateTablet` propose behind a
+        // "tablet already exists" rejection until this method's own
+        // `poll_until` timed out. See `docs/engineering-lessons.md`'s
+        // matching entry.
+        let tablet = self.controls[leader].metadata().next_free_tablet_id();
         let schema = TableSchema::composite("pk", ColumnType::String, "sk", ColumnType::String);
         assert!(
             matches!(
@@ -1145,9 +1429,22 @@ impl SimCluster {
         self.sim.stop(id.clone());
 
         let all_ids: Vec<NodeId> = (0..self.nodes as u64).map(nid).collect();
-        let fresh_control: RaftNode<SimEnv> =
-            RaftNode::start(self.sim.env(id.clone()), all_ids, MemoryEngine::new());
+        let fresh_control: RaftNode<SimEnv> = RaftNode::start(
+            self.sim.env(id.clone()),
+            all_ids.clone(),
+            MemoryEngine::new(),
+        );
         let fresh_relay: SimRelayClient<SimEnv> = SimRelayClient::new(self.sim.env(id.clone()));
+
+        // A restarted node's own `Simulator::stop` dropped its previous
+        // `heartbeat_loop` task along with everything else it owned — see
+        // `SimCluster::new`'s own comment on why this is load-bearing, not
+        // optional.
+        let heartbeat_env = self.sim.env(id.clone());
+        heartbeat_env.spawn_task(animus_control::node::heartbeat_loop(
+            heartbeat_env.clone(),
+            all_ids,
+        ));
 
         let mut ctx = self.shared.ctx(node);
         ctx.control = GenericControlHandle::Local(fresh_control.clone());
@@ -1168,6 +1465,14 @@ impl SimCluster {
             );
             ctx.edge.register_raftkv(tablet, CpGroup::Mem(fresh_kv));
         }
+
+        // ADR 0061 rung D3 PR 2a: a restarted node's own `Simulator::stop`
+        // dropped its previous `spawn_policy_tablet_host_loop` watcher task
+        // along with everything else it owned — a fresh one is needed so a
+        // wire-provisioned (policy-carrying) tablet this node also replicates
+        // still gets re-hosted here, exactly like the hand-hosted tablets the
+        // loop just above already re-hosts explicitly.
+        spawn_policy_tablet_host_loop(ctx.clone(), id.clone());
 
         let ctx_for_server = ctx.clone();
         fresh_relay.serve(move |req| {
