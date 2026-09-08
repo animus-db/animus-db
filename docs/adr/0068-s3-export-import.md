@@ -580,7 +580,10 @@ per-tablet snapshot-scan + intent-resolution primitive
 (`local_scan_kind_snapshot`); export's own no-retry design under a bucket
 fault either converges to a fully correct `COMPLETED` or a cleanly `FAILED`
 row with its never-set counts still at their defaults — never a torn
-`COMPLETED`; import's own uniform "every store fault is retryable" design
+`COMPLETED` (see this ADR's 2026-09-08 as-built amendment below for the one
+correction this claim needed: the terminal `manifest-summary.json` write is
+no longer plain no-retry `?`, precisely so this stays true at every seed);
+import's own uniform "every store fault is retryable" design
 converges to byte-identical final table content whether or not a transient
 bucket-unavailability window ever fired, for the same seed; a real
 `MAX_MALFORMED_ITEMS` overrun fails the import and rolls back the
@@ -626,3 +629,61 @@ No CLAUDE.md-documented production API needed any visibility change for
 this corpus — every symbol it calls into production `animus-control`/
 `animus-item`/`animus-dynamo`/`animus-cp-data` code with was already
 `pub`.
+
+## As-built amendment (2026-09-08 — resolving an ambiguous ack on the terminal completion marker, issue #707)
+
+The PR 3 amendment's own claim above — export's no-retry design "either
+converges to a fully correct `COMPLETED` or a cleanly `FAILED` row ...
+never a torn `COMPLETED`" — was **false at one seed**: the nightly corpus
+run (`ANIMUS_EXPORT_IMPORT_SEEDS=40`) drew `SimSegmentStore`'s put
+ack-lost fault (`crates/animus-sim/src/segment_store.rs`, "object written,
+ack dropped") on the **terminal** `manifest-summary.json` write itself.
+`run_export_job_inner` (`crates/animusd/src/dynamo.rs`) and its corpus
+mirror `run_export_job_mirror` (`crates/animus-test/tests/
+export_import_fault_corpus.rs`) both `?`-propagated that error uniformly
+with every other write, so the object was physically present in the bucket
+while the job reported failure and the catalog row went `Failed` — a torn
+`COMPLETED` by this ADR's own definition (a reader trusts
+`manifest-summary.json` to mean everything before it is complete), caught
+by `export_with_bucket_faults_converges_or_fails_cleanly`'s own assertion
+at seed `12365148609929809193` (variant 25).
+
+**The mechanism, and why it is safe to special-case just this one write**:
+`SegmentStore::put`'s documented contract (`crates/animus-env/src/
+lib.rs`) is write-once — an error on an id that already holds the bytes
+just attempted means nothing but a lost ack, never a real failure to
+persist. Every *interior* write (`_started`, each `data/NNNN.json.gz`,
+`manifest-files.json`) keeps plain no-retry `?` exactly as before — an
+interior write's ambiguity is already covered by §9 residual #3 ("no
+S3-object reclaim on export failure": a `Failed` export's partial objects
+are left for the customer's own cleanup regardless). Only the terminal
+`manifest-summary.json` write — the one object whose mere presence *means*
+"completed" to any reader — now resolves an error by reading the object
+back through the same `SegmentStore` handle: present with the exact bytes
+this job just tried to write means the put landed despite the error, so
+the job returns `Ok` as if it had never errored; absent (or the readback
+itself errors) means it is genuinely not written, so the original error
+still propagates to `FailExport` unchanged. This is a **readback
+verification, not a retry** — nothing is written a second time, and no new
+fault-injection surface is added to the store.
+
+**Fixed identically in both places**, per this file's own doctrine that
+`run_export_job_mirror` tracks production's algorithm exactly: `crates/
+animusd/src/dynamo.rs`'s `run_export_job_inner` and `crates/animus-test/
+tests/export_import_fault_corpus.rs`'s `run_export_job_mirror`. Two pinned
+regressions were added to the corpus file (both at cell 3's location):
+`export_bucket_fault_on_terminal_write_resolves_to_completed_pinned_seed`
+(the exact seed above, asserting `Completed` with the marker present) and
+`export_bucket_fault_on_interior_write_fails_cleanly_with_no_marker` (the
+ack-lost probability forced to `1.0` so the fault deterministically lands
+on the `_started` marker instead — the *interior*-write half of the fix,
+proving it still fails cleanly with no manifest ever attempted). The
+existing depth-40 cell (`export_with_bucket_faults_converges_or_fails_
+cleanly`) is unchanged and stays the general sweep.
+
+**General lesson** (also recorded in `docs/engineering-lessons.md`): an
+ambiguous ack on any completion/commit marker — the one object whose mere
+presence a reader trusts as "done" — must be resolved by reading it back
+through the same store, never by treating the error as "not written". A
+deliberately-injected ack-lost fault exists in the sim precisely to catch
+a caller that gets this wrong; this is the failure mode it caught.
