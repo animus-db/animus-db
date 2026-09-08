@@ -1907,9 +1907,7 @@ fn run_execute_transaction_mixed_select_and_insert_is_validation_exception(seed:
 
 #[test]
 fn execute_transaction_mixed_select_and_insert_is_validation_exception() {
-    run_execute_transaction_mixed_select_and_insert_is_validation_exception(env_seed(
-        0xC06F_6018,
-    ));
+    run_execute_transaction_mixed_select_and_insert_is_validation_exception(env_seed(0xC06F_6018));
 }
 
 #[test]
