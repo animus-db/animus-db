@@ -2195,6 +2195,47 @@ impl SimCluster {
         ctx.control = GenericControlHandle::Local(fresh_control.clone());
         ctx.relay = fresh_relay.clone();
 
+        // C-06 PR 4 (2026-09-08, issue found investigating
+        // `dynamowire_stop_restart`): `SimCluster::new` registers every
+        // node's own control handle onto `ClusterEdgeState::control` via
+        // `edge.register_control(control.clone())` (see this file's own
+        // module-doc pointer above), because `ClientCtx::propose_schema`'s
+        // LOCAL-propose fast path reads `ctx.edge`'s registry, not
+        // `ctx.control` — the two are different fields with different
+        // lifecycles (`animus-node/CLAUDE.md`'s `ControlHandle` entry).
+        // This `restart` rebuilds `ctx.control` above but, before this fix,
+        // never told the edge about the fresh handle at all — so a
+        // restarted node's `ClusterEdgeState::control` entry kept pointing
+        // at the OLD, `Simulator::stop`ped (dead) `RaftNode` forever after.
+        // Reads still worked (they go through `ctx.control` directly), but
+        // any NEW schema proposal issued through this node's own fast path
+        // (e.g. `ensure_txn_idempotency_table`'s `CreateTableSchema`, which
+        // `TransactWriteItems`'s `ClientRequestToken` bootstrap needs) spun
+        // until `SCHEMA_COMMIT_TIMEOUT`, even with a real, reachable,
+        // healthy leader elsewhere — reproduced deterministically via
+        // `dynamowire_stop_restart_s02` (an ordinary, non-transactional
+        // `CreateTable` from the restarted node reproduced the identical
+        // failure, proving this was general control-plane-restart
+        // infrastructure, not anything transact-specific).
+        //
+        // **`register_control` itself is the wrong call here — it only
+        // APPENDS** (its own doc: "called once per node," true in
+        // production, where a restart always gets a brand-new
+        // `ClusterEdgeState`; this fixture instead reuses the SAME `Arc<
+        // ClusterEdgeState>` across a restart). A first fix that called
+        // `register_control` here left `dynamowire_stop_restart_s02`
+        // failing identically — the edge's `control` vec now held BOTH the
+        // stale, stopped handle and the fresh one, and `leader_handle()`'s
+        // `find` could return the stale one first (frozen at whatever
+        // leadership belief it held the instant it was stopped), silently
+        // reintroducing the exact bug the append was meant to fix. Use
+        // [`ClusterEdgeState::replace_control`] instead — it clears the
+        // vec before pushing, so this restarted node's edge holds exactly
+        // one control handle at all times, the same invariant
+        // `SimCluster::new` establishes and every other node in the
+        // cluster maintains for its own entire lifetime.
+        ctx.edge.replace_control(fresh_control.clone());
+
         // ADR 0061 rung D4 PR 1: every `RaftKvNode` driver task this node
         // owned — for ANY tablet, hand-hosted or wire-provisioned — was
         // just dropped by `Simulator::stop` above, so every one of this

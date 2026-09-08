@@ -7390,3 +7390,130 @@ determinism. Both issues are closed. `cargo test -p animusd --lib`: 365
 passed / 5 ignored before this fix → 367 passed / 3 ignored after (the two
 tests move from ignored to passing; the three remaining `#[ignore]`d tests
 are unrelated flake-issue characterizations, unmodified by this fix).
+
+## Appendix — SimCluster coverage for Transact ops in the wire-corpus (ADR 0061 rung F, C-06 PR 4, 2026-09-08)
+
+Closes the first of D2 PR 1's two named residuals for the actual
+`Recorder`/`History`/`check_cycles` **corpus** specifically (C-06 PR 3
+above closed it for the plain `SimCluster` smoke tier — this PR is the
+fault-injecting corpus's own turn). `sim_cluster_dynamo_corpus.rs`'s
+randomized op mix gains `TransactWriteItems` (two owned keys drawn from
+the same client's own `owned` set — preserving the single-writer-per-key
+discipline across both write mechanisms — two `SET items =
+list_append(if_not_exists(items,:empty),:v)` `Update` actions plus an
+always-passing `ConditionCheck` against a per-table `__guard__` marker,
+sometimes carrying a fresh, call-unique `ClientRequestToken`) and
+`TransactGetItems` (any two keys from the full modeled keyspace, always
+feeding the shared history — real DynamoDB gives this op no
+`ConsistentRead` parameter at all), riding the identical 8-cell fault
+matrix every other op in this corpus already does. Atomicity is checked
+by construction: both of a transact write's appends enter the shared
+history as ONE `invoke`/`ok` entry, so `check_cycles` cannot observe one
+half landing without the other. Isolation with respect to every other op
+falls out for free, since a `TransactGetItems` observation lands in the
+exact same `wr`/`rw` graph a plain `UpdateItem`/`GetItem(ConsistentRead:
+true)`/`Query`/`Scan` already feeds. A dedicated deterministic probe,
+`run_transact_probe` (run from every node in turn post-heal/drain,
+mirroring `run_delete_probe`/`run_batch_write_probe`'s own placement),
+proves the two shapes the randomized workload cannot safely produce: (1)
+a genuinely failing `ConditionCheck` — asserts `TransactionCanceledException`
+with correct per-action `CancellationReasons` and that NEITHER of the
+transaction's other two actions landed; (2)/(3)/(4) a committed
+`Put`+`Delete`+`Update`+passing-`ConditionCheck` transaction spanning both
+tables with a `ClientRequestToken`, an identical retry under the same
+token (cached outcome, no re-run), and the same token with a mismatched
+payload (`IdempotentParameterMismatchException`).
+
+**Residuals, named explicitly, not silently skipped**: a `Delete` action
+inside a random transact write (would tombstone one of the same two owned
+keys the list-append model tracks — the identical reason plain
+`DeleteItem`/`BatchWriteItem` already stay out of `check_cycles`) and a
+genuinely *reused* `ClientRequestToken` (a non-repeatable workload shape
+no per-round random draw can safely produce without either undercounting
+`ok_writes` on a cache hit or manufacturing a value-reuse hazard this
+corpus's own global-uniqueness discipline forbids) — both proven instead,
+deterministically, by `run_transact_probe`. GSI/LSI `Query`/`Scan` and
+PartiQL remain out of scope (PRs 5-7's own territory), unchanged.
+
+**Three real `SimCluster`/`ClientCtx` fixture bugs found and fixed, all
+classified (b) per the task's own found-bug protocol** — a fixture/model
+staleness gap, never a defect in the transact protocol itself:
+
+- **Finding A**: a tokened `TransactWriteItems` auto-provisions the
+  internal `__animus_txn_idempotency` table, shifting every node's total
+  hosted-tablet count enough to trigger a real `rebalance_placement` move
+  of this corpus's own modeled table on the `dynamowire_forward_heavy`
+  cell (4 nodes, RF 2) — a move `SimClusterHandle::replicas_of`'s
+  creation-time-frozen snapshot never reflects, so `run_scenario`'s
+  durability check read an empty, no-longer-a-replica engine and reported
+  every acknowledged write against it as lost. Fixed by a new
+  `live_replicas` helper (a live `SimCluster::hosted_tablets` query),
+  wired into every durability-check call site that used to read the stale
+  snapshot, plus the analogous fix to `Nemesis::FollowerCrash`'s own
+  victim selection.
+- **Finding B**: `SimCluster` never spawns `animusd::txn_resolver_loop`,
+  and the plain-`GetItem` local-read path (`cp_get_local_resolving_inner`)
+  never calls `confirm_or_push` for a LOCAL (same-tablet) `Pending`
+  intent — only a foreign one does. A `TransactWriteItems` whose anchor
+  and sole participant land on the SAME tablet ("self-transaction"),
+  abandoned mid-flight by a fault, therefore had no path to resolution in
+  this fixture at all — `RaftKvNode::local_get`'s own documented
+  "`Pending`-covered reads as absent" contract permanently masked the true
+  committed value from this file's raw-`local_get`-based durability
+  oracle, reported as a lost write. Fixed by issuing one covering
+  `TransactGetItems` after drain (`force_resolve_all_keys`) —
+  `TransactGetItems`'s own read primitive resolves a local intent exactly
+  like a foreign one, so a covering read pushes any outstanding
+  transaction toward its real decision as a side effect. Confirmed at
+  seed `13022590114329469744` (`dynamowire_leader_crash_s22`).
+- **Finding C**: `SimCluster::restart` rebuilds a restarted node's own
+  `ctx.control` handle but never told that node's `ClusterEdgeState`
+  about it — `ClientCtx::propose_schema`'s local-propose fast path reads
+  `ctx.edge`'s own `control` registry, a *different* field with a
+  different lifecycle than `ctx.control`. A restarted node's edge kept
+  pointing at the OLD, `Simulator::stop`ped (dead) `RaftNode` for the rest
+  of the scenario, so any NEW schema proposal issued through that node's
+  fast path (`ensure_txn_idempotency_table`'s `CreateTableSchema`, needed
+  by any tokened `TransactWriteItems`) spun until `SCHEMA_COMMIT_TIMEOUT`
+  even with a real, healthy, reachable leader elsewhere — reproduced
+  deterministically at seed `6659558302105598543`
+  (`dynamowire_stop_restart_s02`), and shown to be general
+  control-plane-restart infrastructure, not anything transact-specific (a
+  plain, non-transactional `CreateTable` from the restarted node
+  reproduced the identical failure). **A first attempt — calling the
+  pre-existing, append-only `register_control` from `restart` — left the
+  identical scenario failing**: the edge's registry then held BOTH the
+  stale and the fresh handle, and `leader_handle()`'s `find` could return
+  the stale one first, silently reproducing the exact bug the append was
+  meant to fix. The real fix is a new `ClusterEdgeState::replace_control`
+  (`lib.rs`, `#[cfg(test)]`-only — no production restart path reuses a
+  `ClusterEdgeState` this way), which clears the registry before pushing.
+
+**A resource-scale finding filed, not fixed**: peak process RSS for
+`ANIMUS_DYNAMO_WIRE_SEEDS=25` (200 scenarios) grows with depth and was
+observed OOM-killed on this rung's own 4 vCPU / 15 GiB / no-swap
+development sandbox — RSS plateaued near ~13.8 GiB at both `=12` (96
+scenarios) and `=25` before the kill; `=4` (32 scenarios, 460s wall) and
+the default depth (8 scenarios, ~114s) both complete cleanly on the same
+sandbox. `MALLOC_ARENA_MAX=1` did not visibly change the trajectory. This
+is consistent with ordinary glibc allocator high-water-mark behavior
+(freed memory not returned to the OS) rather than confirmed proof of a
+true per-scenario leak, but was not root-caused further per this task's
+own explicit scope — see `sim_cluster_dynamo_corpus.rs`'s own module-doc
+"resource-scale finding" section for the full numbers. This does not
+contradict the D2 PR 2 entry's own established "`=25` in ~10m2s wall"
+figure — that figure predates this PR's Transact addition and was
+presumably measured on a materially better-resourced CI runner.
+
+**Gates**: `cargo test -p animusd --lib sim_cluster_dynamo_corpus --
+--test-threads=2` at the default depth (3 passed, 1 ignored, ~114s, run
+twice — before and after the Finding C fix, both green — the pre-fix run
+failed at `dynamowire_stop_restart_s02` exactly as Finding C describes);
+`ANIMUS_DYNAMO_WIRE_SEEDS=4` (3 passed, 1 ignored, 32 scenarios, 460s
+wall); `cargo test -p animusd --lib -- --test-threads=2` (370 passed, 0
+failed, 3 ignored — matches the established baseline); `cargo fmt --all
+--check` (clean); `cargo clippy -p animusd --all-targets --all-features
+-- -D warnings` (clean); `cargo build -p animusd --all-targets` (clean).
+`ANIMUS_DYNAMO_WIRE_SEEDS=25` was attempted and OOM-killed on this
+sandbox both before and after the Finding C fix (the resource-scale
+finding above, not a correctness failure). `Cargo.lock` unchanged.

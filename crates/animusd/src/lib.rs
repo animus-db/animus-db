@@ -6642,6 +6642,39 @@ impl<E: Env> ClusterEdgeState<E> {
             .push(raft);
     }
 
+    /// Replace this edge's own registered control handle in place —
+    /// `SimCluster::restart`'s own need (ADR 0061 rung F, C-06 PR 4), not a
+    /// second way to do what `register_control` already does.
+    /// `register_control` assumes exactly one call over a node's whole
+    /// lifetime (true in production, where a restarted process always
+    /// builds a brand-new `ClusterEdgeState` from scratch) — but
+    /// `SimCluster::restart` deliberately reuses the SAME `Arc<
+    /// ClusterEdgeState>` across a restart (ADR 0061 rung D4 PR 1's
+    /// design, so a restarted node's other registrations — hosted CP
+    /// groups, etc. — survive the swap), so a second `register_control`
+    /// call there would silently *append* a second entry rather than
+    /// replace the first: `leader_handle()`'s `find` would then be able to
+    /// return the OLD, `Simulator::stop`ped (dead, frozen-at-its-last-
+    /// belief) `RaftNode` ahead of the fresh one, permanently breaking
+    /// `ClientCtx::propose_schema`'s local-propose fast path for this node
+    /// for the rest of the scenario regardless of which is actually
+    /// leading. Found live via `dynamowire_stop_restart_s02` (a restarted
+    /// node's own `TransactWriteItems` call could never bootstrap the
+    /// internal idempotency table's schema) even after `SimCluster::
+    /// restart` was given its own `register_control` call — the stale
+    /// entry, not a missing one, was the real remaining defect.
+    ///
+    /// `#[cfg(test)]`-only: no production code path ever restarts a node
+    /// in place onto a reused `ClusterEdgeState` — a real process restart
+    /// always builds a brand-new one — so this method's only caller is
+    /// `SimCluster::restart`.
+    #[cfg(test)]
+    fn replace_control(&self, raft: RaftNode<E>) {
+        let mut guard = self.control.lock().expect("control handles poisoned");
+        guard.clear();
+        guard.push(raft);
+    }
+
     /// Register a node's CP group handle for `tablet` (ADR 0017 #3a / Phase 2).
     /// Called on each node that hosts a replica of `tablet`.
     fn register_raftkv(&self, tablet: TabletId, cp: CpGroup<E>) {
