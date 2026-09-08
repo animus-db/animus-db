@@ -811,6 +811,34 @@ impl SimClusterHandle {
         .await
     }
 
+    /// Run a decoded DynamoDB **Streams** wire request
+    /// (`DynamoDBStreams_20120810.<Op>` + JSON body) against `node`'s own
+    /// `ClientCtx`, through the exact same
+    /// `dynamo_streams::execute_streams_op_as` production's TCP listener
+    /// calls (ADR 0061 rung G, C-07 PR 3) — [`SimClusterHandle::dynamo`]'s
+    /// Streams sibling, identical shape (an unrestricted [`crate::authz::
+    /// Principal`], self-bounded like every op method here). Covers all
+    /// four Streams operations — `ListStreams`/`DescribeStream`/
+    /// `GetShardIterator`/`GetRecords`, both the sealed and open-tail serve
+    /// paths — since `dynamo_streams::execute_streams_op_as` has no
+    /// `unsupported_by_generic_dispatch` gap the way the item API's
+    /// `dispatch_item_op` still does.
+    pub(crate) async fn dynamo_streams(
+        &self,
+        node: u64,
+        target: &str,
+        body: &[u8],
+    ) -> (u16, String) {
+        let ctx = self.ctx(node);
+        crate::dynamo_streams::execute_streams_op_as(
+            &ctx,
+            &crate::authz::Principal::unrestricted(),
+            target,
+            body,
+        )
+        .await
+    }
+
     /// Stage a **fresh anchor** transaction writing `value` at `key` on
     /// `table`, retrying through a decided-but-still-unresolved blocker via
     /// `push_resolution_if_decided` exactly like production — issue #734's
@@ -2134,6 +2162,28 @@ impl SimCluster {
             (
                 500,
                 format!("dynamo request on node {node} did not complete within {OP_BUDGET:?}"),
+            )
+        })
+    }
+
+    /// Run a decoded DynamoDB **Streams** wire request against `node`'s own
+    /// `ClientCtx` (ADR 0061 rung G, C-07 PR 3) — [`SimClusterHandle::
+    /// dynamo_streams`]'s synchronous sibling, driven from a test's own
+    /// `&mut self` call exactly like [`SimCluster::dynamo`] above (never
+    /// panics on a timeout; returns a synthetic `500`/timeout-message body
+    /// instead).
+    pub(crate) fn dynamo_streams(&mut self, node: u64, target: &str, body: &[u8]) -> (u16, String) {
+        let handle = self.shared.clone();
+        let (target, body) = (target.to_owned(), body.to_vec());
+        self.spawn_and_capture(node, async move {
+            handle.dynamo_streams(node, &target, &body).await
+        })
+        .unwrap_or_else(|| {
+            (
+                500,
+                format!(
+                    "dynamo_streams request on node {node} did not complete within {OP_BUDGET:?}"
+                ),
             )
         })
     }

@@ -39,6 +39,8 @@ use animus_dynamo::streams_wire::{
     self, ShardDescriptor, ShardIteratorType, StreamDescription, StreamSummary, StreamsOperation,
 };
 use animus_dynamo::wire::WireError;
+use animus_env::Env;
+use animus_node::host::RelayClient;
 use animus_tablet::TabletId;
 
 use crate::ClientCtx;
@@ -58,8 +60,46 @@ const MAX_GET_RECORDS_LIMIT: usize = 1000;
 /// and JSON body, returning `(http status, json body)` — the Streams
 /// service's own [`crate::dynamo::execute_as`] sibling. `principal` is the
 /// caller's SigV4-resolved authorization scope (ADR 0066 §5).
+///
+/// Thin production wrapper (ADR 0061 rung G, C-07 PR 3) over
+/// [`execute_streams_op_as`], monomorphized at `E = ProdEnv, R =
+/// AnimusdRelayClient` (this function's own concrete `&ClientCtx` — a pure
+/// move, not a rewrite: every callee this module's read path uses
+/// (`ctx.effective_metadata()`, `authz::authorize*`, `ClientCtx::
+/// read_stream_hot_records`, `ctx.segment_store` — a plain, non-`E`-typed
+/// enum) was already `<E, R>`-generic before this rung, so widening the
+/// whole read path needed no new mechanism, mirroring `dynamo.rs`'s
+/// `disable_stream`/`update_table_throughput` precedent (D3 PR 2b, rung G
+/// PR 2). Production behavior is byte-identical to before this rung.
 pub(crate) async fn execute_as(
     ctx: &ClientCtx,
+    principal: &Principal,
+    target: &str,
+    body: &[u8],
+) -> (u16, String) {
+    execute_streams_op_as(ctx, principal, target, body).await
+}
+
+/// SimEnv-capable sibling of [`execute_as`] (ADR 0061 rung G, C-07 PR 3):
+/// decode and run a DynamoDB Streams operation against any `ClientCtx<E,
+/// R>`, not just the concrete `ClientCtx<ProdEnv, AnimusdRelayClient>`
+/// [`execute_as`] is hardcoded to — mirroring [`crate::dynamo::
+/// execute_item_op_as`]'s own role for the item API exactly (ADR 0061 rung
+/// D2 PR 1). The one caller today is `sim_cluster.rs`'s
+/// `SimClusterHandle::dynamo_streams`, the Streams sibling of
+/// `SimClusterHandle::dynamo`.
+///
+/// Covers all four DynamoDB Streams operations
+/// (`ListStreams`/`DescribeStream`/`GetShardIterator`/`GetRecords`,
+/// including both the sealed and the open-tail `GetRecords` serve paths) —
+/// unlike [`crate::dynamo::dispatch_item_op`], this module has no
+/// genuinely `ProdEnv`-bound handler to leave concrete and route through
+/// `unsupported_by_generic_dispatch`: every operation's own real work
+/// bottoms out in generic `ClientCtx<E, R>` methods or pure functions of
+/// `Metadata`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) async fn execute_streams_op_as<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     principal: &Principal,
     target: &str,
     body: &[u8],
@@ -103,8 +143,8 @@ fn stream_table_for_get_records(meta: &Metadata, shard_iterator: &str) -> Option
     meta.tablets.get(&tablet).and_then(|t| t.table.clone())
 }
 
-async fn run_operation(
-    ctx: &ClientCtx,
+async fn run_operation<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     principal: &Principal,
     op: StreamsOperation,
 ) -> Result<String, WireError> {
@@ -239,8 +279,8 @@ fn record_hlc_suffix(key: &[u8]) -> Option<u64> {
 /// `ListStreams` (ADR 0042 §3): a pure function of the replicated catalog +
 /// schema (F7) — enumerates the table's *current* enabled labels plus every
 /// `DISABLED`-but-unreaped label with at least one catalog row (F12-b).
-fn list_streams(
-    ctx: &ClientCtx,
+fn list_streams<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     table_name: Option<&str>,
     limit: Option<usize>,
     exclusive_start_stream_arn: Option<&str>,
@@ -295,8 +335,8 @@ fn list_streams(
 /// `DescribeStream` (ADR 0042 §3): a pure function of `Metadata` (F7) —
 /// sealed shards from the catalog, plus the one open shard per live tablet
 /// while the label is currently enabled.
-fn describe_stream(
-    ctx: &ClientCtx,
+fn describe_stream<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     stream_arn: &str,
     limit: Option<usize>,
     exclusive_start_shard_id: Option<&str>,
@@ -407,8 +447,8 @@ fn describe_stream(
 /// `GetShardIterator` (ADR 0042 §5/§6): mints a stateless position token —
 /// no barrier, no store/leader round trip except `LATEST` on a genuinely
 /// open shard (which needs one hot read to find the current max).
-async fn get_shard_iterator(
-    ctx: &ClientCtx,
+async fn get_shard_iterator<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     stream_arn: &str,
     shard_id: &str,
     iterator_type: ShardIteratorType,
@@ -473,8 +513,8 @@ fn parse_seq(sequence_number: Option<&str>) -> Result<u64, WireError> {
 /// `GetRecords` (ADR 0042 §7/§9/§10): resolves the shard id against the
 /// catalog **fresh at serve time** — see the module doc's "The two
 /// `GetRecords` serve paths" for the sealed/open split this enables.
-async fn get_records(
-    ctx: &ClientCtx,
+async fn get_records<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     shard_iterator: &str,
     limit: Option<usize>,
 ) -> Result<String, WireError> {
@@ -529,8 +569,8 @@ fn consumer_hidden(record: &ChangeRecord) -> bool {
 /// and nulls `NextShardIterator` only once the sliced content is truly
 /// exhausted.
 #[allow(clippy::too_many_arguments)]
-async fn get_records_sealed(
-    ctx: &ClientCtx,
+async fn get_records_sealed<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     meta: &Metadata,
     shard_id: &str,
     row: &StreamShardRow,
@@ -597,8 +637,8 @@ async fn get_records_sealed(
 /// barrier) and never nulls the iterator — an empty poll returns the
 /// **same** position (F4/§7: "not there yet, poll again").
 #[allow(clippy::too_many_arguments)]
-async fn get_records_open(
-    ctx: &ClientCtx,
+async fn get_records_open<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     meta: &Metadata,
     table: &str,
     label: &str,
