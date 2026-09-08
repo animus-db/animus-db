@@ -844,7 +844,7 @@ supply one, and isn't trying to.
 | D2 | An end-to-end DynamoDB-wire corpus — requests in at the wire edge, faults injected, resulting history checked by the existing `check_cycles`/`check_durability`/`check_convergence`. **Landed 2026-09-07 (both PRs)**: PR 1 (six item operations generic, `SimClusterHandle::dynamo`, a first small smoke) and PR 2 (the actual `Recorder`/`History` corpus over the wire, see the amendments below); GSI/LSI, transact, and PartiQL remain out of scope, named as D2's own residuals |
 | D3 | Migrate the `animusd` integration suite: **keep** the tests that genuinely prove real-thread liveness (group commit, lock contention, election timing — per the engineering-lessons rule that `SimEnv` does not prove thread liveness), convert the rest. **Success criterion corrected 2026-09-07** (see that date's own "D3 PR 1" amendment): the `prod-liveness` job's 2-attempt retry was already replaced by nextest sharding before D3 started, so there is no retry to drop — success is measured by the real-thread tier's own shrinking test count / wall time / flake surface instead. **PR 1 landed 2026-09-07**: the base-table-only "B class" (~30 tests across ten `dynamo_*.rs` binaries plus `kind_batch_outcome.rs`) converted to `SimCluster`. **PR 2a landed 2026-09-07**: `Metadata::members` population + `ClusterEdgeState::control` widened to `RaftNode<E>` make base-table DDL (`CreateTable`/`DeleteTable`/`ListTables`/`DescribeTable`, via new `dynamo::dispatch_table_op`) drivable over the real wire; two real fixture bugs found and fixed (a liveness-detector heartbeat gap, a tablet-id-allocator collision) and one genuine, documented `SimCluster` gap found and left open (a rebalanced-away replica's `RaftKvNode` is never torn down — see that date's own "D3 PR 2a" amendment). **PR 2b landed 2026-09-07**: `UpdateTable`'s own throughput-only change (`BillingMode`/`ProvisionedThroughput`, ADR 0065) is now drivable too, via a widened `dynamo::update_table_throughput` and a new `UpdateTable` arm on `dispatch_table_op` — five more `dynamo_throttling.rs` tests converted, no new fixture bugs (see that date's own "D3 PR 2b" amendment). **PR 3a landed 2026-09-07**: GSI/LSI `Query`/`Scan` dispatch through `SimCluster`, plus `CreateTable` with a declared GSI/LSI — eight functions widened to `<E, R>` (`run_index_query`/`run_gsi_query`/`run_lsi_query`/`run_index_scan`/`run_gsi_scan`/`run_lsi_scan`/`paginated_kind_examine`/`paginated_kind_examine_one`), 42 tests converted across nine new sibling modules; a GSI row is still never materialized under `SimCluster` (no drain loop spawned), pinned by its own new regression, so every GSI-*data* test stays on `ProdEnv` (see that date's own "D3 PR 3a" amendment). **PR 3b landed 2026-09-07, closing D3's own GSI-drain boundary**: `index_drain::drain_tablet`/`reconcile_partition` widened to `<E, R>` and a new `SimCluster::drain_gsi` fixture helper materialize a GSI's hidden table on demand, flipping PR 3a's own boundary regression positive and converting every GSI-data test it had to leave on `ProdEnv` (12 tests across nine sibling modules, two of them new: `sim_cluster_dynamo_documents.rs`, `sim_cluster_dynamo_schema.rs`) plus a sim twin of `dynamo_indexes.rs::gsi_write_then_query` that does not replace the original; seven `tests/dynamo_*.rs` files deleted whole, one trimmed (see that date's own "D3 PR 3b" amendment). D3 is now closed for the GSI-drain gap specifically — remaining `ProdEnv` binaries are there for real-thread-liveness or not-yet-generic-operation reasons. **D3 closed 2026-09-07 (PRs #711 #716 #717 #718 #719 + this)** — see the dated "D3 closing" amendment below for the full before/after numbers, the reframed success criterion's verdict, and the residual `tests/*.rs` inventory by class |
 | D4 | Deterministic coverage for the behaviours that have none today: the auto-split byte trigger (`lib.rs:14397`), the dropped-table GC reclaim loop, join/growth sequencing, and the backup-janitor async loop (its replicated state machine is already sim-tested in `animus-control/tests/backup_catalog.rs`; the loop driving it is not) |
-| F | Post-C-04: Transact/PartiQL `SimCluster` dispatch (C-06) — the two named D2 residuals (Transact, PartiQL), never claimed by any D3/D4 rung. **PRs 1-4 landed** (PR 4 on 2026-09-08 — Transact in the wire corpus, three fixture bugs found and fixed, see the matching 2026-09-08 "Rung F, PR 4" amendment below); PRs 5-7 open — see the 2026-09-07 "Rung F" amendment below and `docs/roadmap.md`'s C-06 entry |
+| F | Post-C-04: Transact/PartiQL `SimCluster` dispatch (C-06) — the two named D2 residuals (Transact, PartiQL), never claimed by any D3/D4 rung. **PRs 1-5 landed** (PR 5 on 2026-09-08 — the PartiQL handlers themselves reachable, four new generic siblings + a second mutual-recursion cycle closed, see the matching 2026-09-08 "Rung F, PR 5" amendment below); PRs 6-7 open — see the 2026-09-07 "Rung F" amendment below and `docs/roadmap.md`'s C-06 entry |
 
 Note that the copy-based split driver (ADR 0050) is deliberately **not** on
 this list: ADR 0058 rung 4's remaining layer deletes it. Writing a corpus
@@ -3881,3 +3881,112 @@ own correctness. `git diff --name-only` against the branch point excludes
 and the three findings); `sim_cluster_dynamo_corpus.rs`'s own new
 "Corpus-fixture findings" and resource-scale module-doc sections carry the
 full per-finding account, cross-referenced from all three.
+
+## 2026-09-08 amendment — Rung F, PR 5 landed: the PartiQL handlers themselves reachable from `SimCluster`
+
+Closes the second of D2 PR 1's two named residuals — `ExecuteStatement`/
+`BatchExecuteStatement`/`ExecuteTransaction` (PartiQL, ADR 0071) — the
+generic-dispatch analogue of what PR 3 did for `TransactWriteItems`/
+`TransactGetItems`. This rung's own PR-series amendment above named the
+real wrinkle up front: `execute_statement`'s `INSERT`/`UPDATE`/`DELETE`
+arms recurse into the concrete, production-only `run_operation`
+(`Box::pin(run_operation(ctx, principal, op)).await`, needed because
+`run_operation` itself calls back into `execute_statement` for its own
+`ExecuteStatement` arm — a pre-existing cycle, left untouched), ruling out
+widening `execute_statement` in place, per this rung's own repeated D2 PR 1
+lesson.
+
+**What's now reachable.** Four new, strictly additive,
+`<E: Env, R: RelayClient>`-generic siblings in `dynamo.rs` (a new "SimEnv-
+capable PartiQL siblings" section header carries the full design):
+`execute_statement_as` (copies `execute_statement`'s body verbatim; its
+`SELECT` branch needed only `run_query`/`run_scan` themselves widened —
+every one of their own callees was already generic or `Metadata`-only — and
+its `INSERT`/`UPDATE`/`DELETE` branches call a new `dispatch_lowered_
+write_as` helper, the identical `reject_internal_table`/`authz::
+authorize_op` prelude `run_operation` runs ahead of its own dispatch to
+`dispatch_item_op` for these three operations, then `dispatch_item_op`
+directly); `execute_transaction_as` (a pure signature widening — every
+callee was already generic or `Metadata`-only, so unlike
+`execute_statement_as` this needed no dispatch change at all);
+`run_batch_execute_statement_as`/`execute_one_batch_statement_as` (the
+identical pair, with the one load-bearing substitution this rung's own
+Risks section named up front: the `INSERT`/`UPDATE`/`DELETE` arm calls
+`execute_statement_as`, never the concrete `execute_statement`).
+`dynamo::dispatch_item_op` gained three more match arms —
+`Operation::ExecuteStatement`/`Operation::BatchExecuteStatement`/
+`Operation::ExecuteTransaction` — calling these new siblings the identical
+call shape `run_operation`'s own arms already use.
+
+**The byte-identical guarantee.** `run_operation`, `execute_statement`,
+`execute_transaction`, `run_batch_execute_statement`, and
+`execute_one_batch_statement` are every one of them untouched in shape —
+zero lines changed in any of their own bodies (`run_query`/`run_scan`
+gained a type parameter, called identically by both the old concrete
+callers and the new generic ones). The full 37-test real-socket suite
+(`dynamo_partiql.rs`, `dynamo_execute_transaction.rs`) ran unmodified
+against the widened code and stayed green, confirming it — the same
+"convert nothing, run the existing suite, watch it pass" proof PR 3 used
+for Transact.
+
+**A second mutual-recursion cycle, distinct from `execute_statement`'s own,
+found by the compiler (`E0733`) rather than anticipated in this rung's own
+PR-series amendment above.** That amendment's own PR 5 description
+predicted `execute_statement_as` would need no `Box::pin` ("`dispatch_
+item_op` never calls back into `execute_statement_as`, so ... this needs
+no `Box::pin`") — true in isolation, but wrong once combined with this
+same PR's own `dispatch_item_op` change: `dispatch_item_op`'s new
+`ExecuteStatement` arm calls `execute_statement_as`, whose `INSERT`/
+`UPDATE`/`DELETE` arms call `dispatch_lowered_write_as`, which calls back
+into `dispatch_item_op` — a genuine cycle one level up from the one the
+first draft reasoned about. `cargo build` refused to compile with
+`E0733: recursion in an async fn requires boxing`, naming the exact three
+functions in the cycle. Closed by boxing `dispatch_lowered_write_as`'s own
+call (`Box::pin(dispatch_item_op(ctx, principal, meta, op)).await`) — one
+`Box::pin`, not three at `execute_statement_as`'s own call sites, since the
+cycle has exactly one edge that needs breaking regardless of how many
+paths lead into it. See `docs/engineering-lessons.md`'s matching entry for
+the general lesson this generalizes to: whenever a new generic sibling is
+added specifically so a dispatcher can route to it, check whether that
+sibling (or anything it calls) can call back into the SAME dispatcher —
+the recursion is invisible from either function's own local reasoning and
+only checked by the compiler once both halves of the cycle exist in the
+same build.
+
+**New module: `crates/animusd/src/sim_cluster_dynamo_partiql.rs`**, 5
+scenarios (`_over_seeds` at 5 seeds each, 10 tests total), each issued from
+a non-leader node of a 3-node RF3 `SimCluster`: (a) `INSERT` then `SELECT`
+sees it; (b) `UPDATE ... RETURNING ALL NEW *` then `DELETE ... RETURNING
+ALL OLD *`; (c) a mixed `BatchExecuteStatement` (`INSERT`/`SELECT`/`UPDATE
+... RETURNING`/`DELETE ... RETURNING`, the `DELETE` targeting the SAME
+batch's own just-inserted key to prove in-batch sequential ordering) runs
+every statement in request order with no cross-statement atomicity; (d) an
+all-`INSERT` `ExecuteTransaction` commits atomically across two tables; (e)
+a duplicate `INSERT` inside a transaction cancels the WHOLE transaction
+with correct per-action `CancellationReasons`. See
+`crates/animusd/CLAUDE.md`'s matching new appendix for the full scenario
+account, including a small fixture gotcha found while writing it
+(`SimCluster::tablet_of` only tracks tablets its own in-process
+`create_table` minted, not one created over the real wire — a wire-created
+table's tablet is looked up via `Metadata::tablets_for_table` instead,
+mirroring `sim_cluster_dynamo_transact.rs`'s own identical lookup).
+
+**No product bug found.** Deeper PartiQL fault-injection coverage (GSI/LSI
+`SELECT`, a corpus equivalence cell) remains PR 6's own scope, unchanged
+from this rung's own PR-series amendment above — this PR is reachability
+smoke only, following PR 3's own precedent for Transact.
+
+**Gates**: `cargo test -p animusd --lib sim_cluster_dynamo_partiql --
+--test-threads=2` (10 passed); `cargo test -p animusd --lib --
+--test-threads=2` (380 passed, 0 failed, 3 ignored — 370 baseline + this
+PR's 10 new tests); `cargo test -p animusd --test dynamo_partiql --test
+dynamo_execute_transaction` (37 passed, 0 failed); `cargo fmt --all
+--check` (clean after one auto-fix); `cargo clippy -p animusd
+--all-targets --all-features -- -D warnings` (clean); `cargo build -p
+animusd --all-targets` (clean). `git diff --name-only` against the branch
+point excludes `Cargo.lock`.
+
+**Docs**: this amendment; `docs/roadmap.md`'s C-06 entry (PR 5 landed);
+`crates/animusd/CLAUDE.md`'s new appendix (the full scenario account and
+the `tablet_of` fixture gotcha); `docs/engineering-lessons.md`'s new entry
+on the second mutual-recursion cycle.

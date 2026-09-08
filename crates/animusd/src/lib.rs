@@ -17947,6 +17947,22 @@ mod sim_cluster_growth;
 #[cfg(test)]
 mod sim_cluster_dynamo_transact;
 
+/// ADR 0061 rung F (C-06 PR 5): deterministic `SimCluster` reachability
+/// smoke for `ExecuteStatement`/`BatchExecuteStatement`/`ExecuteTransaction`
+/// (PartiQL, ADR 0071) — `dynamo::dispatch_item_op` gained three match arms
+/// calling new parallel generic siblings (`execute_statement_as`/
+/// `run_batch_execute_statement_as`/`execute_transaction_as`), routing
+/// every wire PartiQL request issued through `SimClusterHandle::dynamo` the
+/// exact way `run_operation`'s own production arms do. See this module's
+/// own doc for the five scenarios (`INSERT` then `SELECT`, `UPDATE`/
+/// `DELETE` with `RETURNING`, a mixed `BatchExecuteStatement`, an
+/// `ExecuteTransaction` commit across two tables, and a condition-failed
+/// cancel) and `crates/animusd/CLAUDE.md`'s matching entry for the full
+/// account, including the two mutual-recursion cycles this rung closes.
+/// Deeper PartiQL fault-injection coverage is PR 6's own scope.
+#[cfg(test)]
+mod sim_cluster_dynamo_partiql;
+
 /// Regression for the issue #298 residual confirmed live under the
 /// un-pinned `SplitMode::InPlace` proof soak (ADR 0018's matching amendment,
 /// `docs/engineering-lessons.md`'s matching entry): a stage blocked by

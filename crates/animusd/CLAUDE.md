@@ -7517,3 +7517,127 @@ failed, 3 ignored — matches the established baseline); `cargo fmt --all
 `ANIMUS_DYNAMO_WIRE_SEEDS=25` was attempted and OOM-killed on this
 sandbox both before and after the Finding C fix (the resource-scale
 finding above, not a correctness failure). `Cargo.lock` unchanged.
+
+## Appendix — SimCluster coverage for the PartiQL handlers themselves (ADR 0061 rung F, C-06 PR 5, 2026-09-08)
+
+Closes the second of D2 PR 1's two named residuals — `ExecuteStatement`/
+`BatchExecuteStatement`/`ExecuteTransaction` (PartiQL, ADR 0071) — the
+generic-dispatch analogue of what C-06 PR 3 did for `TransactWriteItems`/
+`TransactGetItems`. Unlike Transact (PR 2's own signature-and-timer
+widening, zero new mechanism), PartiQL's own blocker was structural:
+`execute_statement`'s `INSERT`/`UPDATE`/`DELETE` arms recurse into the
+concrete, production-only `run_operation` (`Box::pin(run_operation(ctx,
+principal, op)).await`, needed because `run_operation` itself calls back
+into `execute_statement` for its own `ExecuteStatement` arm — this
+pre-existing cycle is untouched), so widening `execute_statement` itself
+was never on the table (the D2 PR 1 lesson: a narrowed generic core must
+never become the production dispatcher's only path). This PR instead adds
+four new, strictly additive, `<E: Env, R: RelayClient>`-generic siblings in
+`dynamo.rs`, all under a new "SimEnv-capable PartiQL siblings" section
+header (that header carries the full design account; this appendix
+summarizes it):
+
+- **`execute_statement_as`** — copies `execute_statement`'s body verbatim.
+  Its `SELECT` branch needed no new mechanism at all: `run_query`/
+  `run_scan` (this PR's own pure signature widening — every one of their
+  callees, `run_index_query`/`run_base_query`/`schema_for`/
+  `validate_key_condition_names`/etc., was already generic or
+  `Metadata`-only) call through exactly like `execute_statement`'s own
+  `SELECT` branch does. Its `INSERT`/`UPDATE`/`DELETE` branches instead
+  call a new helper, **`dispatch_lowered_write_as`** — the identical
+  `reject_internal_table`/`authz::authorize_op` prelude `run_operation`
+  runs ahead of its own dispatch to `dispatch_item_op` for these three
+  operations, then `dispatch_item_op` directly.
+- **`execute_transaction_as`** — a pure signature widening of
+  `execute_transaction`'s identical body: every callee (`table_known`,
+  `mirror_catalog_schema`, `schema_for`, `run_transact_get`, `run_transact`)
+  was already generic or `Metadata`-only, so — unlike `execute_statement_as`
+  — this needed no dispatch change at all.
+- **`run_batch_execute_statement_as`**/**`execute_one_batch_statement_as`**
+  — the identical pair, with the one load-bearing substitution the ADR's
+  own Risks section named up front: `execute_one_batch_statement_as`'s
+  `INSERT`/`UPDATE`/`DELETE` arm calls `execute_statement_as`, **never**
+  the concrete `execute_statement` — the exact narrowed-split trap that
+  would have silently kept `BatchExecuteStatement`'s own mutation arm
+  `ProdEnv`-only forever under `SimCluster`, with nothing failing loudly to
+  say so.
+
+`dispatch_item_op` (the generic item/query/transact core C-06 PR 3 already
+routes Transact through) gained three more match arms —
+`Operation::ExecuteStatement`/`Operation::BatchExecuteStatement`/
+`Operation::ExecuteTransaction` — calling `execute_statement_as`/
+`run_batch_execute_statement_as`/`execute_transaction_as` the identical
+call shape `run_operation`'s own arms already use. `run_operation`,
+`execute_statement`, `execute_transaction`, `run_batch_execute_statement`,
+and `execute_one_batch_statement` are every one of them byte-identical —
+zero lines touched in any of their own bodies; `dynamo_partiql.rs`/
+`dynamo_execute_transaction.rs`'s full 37-test real-socket suite ran
+unchanged against the widened code and stayed green, confirming it.
+
+**A second mutual-recursion cycle, distinct from `execute_statement`'s own,
+found live by the compiler (`E0733`) rather than anticipated up front.**
+`dispatch_item_op`'s own new `ExecuteStatement` arm calls
+`execute_statement_as`, whose `INSERT`/`UPDATE`/`DELETE` arms call
+`dispatch_lowered_write_as`, which calls back into `dispatch_item_op` — a
+genuine cycle the first draft's own doc claimed didn't exist (reasoning
+correctly that `execute_statement_as` itself doesn't recurse, but missing
+that `dispatch_item_op` gaining the `ExecuteStatement` arm closes a cycle
+one level up). Closed by boxing `dispatch_lowered_write_as`'s own call
+(`Box::pin(dispatch_item_op(ctx, principal, meta, op)).await`), not
+`execute_statement_as`'s three call sites — one `Box::pin`, not three,
+since the cycle has exactly one edge that needs breaking. See
+`docs/engineering-lessons.md`'s matching entry for the general lesson: a
+new generic sibling that calls back into the SAME dispatcher its own
+caller added a match arm to is a mutual-recursion cycle regardless of
+whether either function *looks* recursive in isolation — checked by the
+compiler, not by inspection.
+
+**New module: `crates/animusd/src/sim_cluster_dynamo_partiql.rs`**, 5
+scenarios (`_over_seeds` at 5 seeds each, 10 tests total), each issued from
+a **non-leader** node of a 3-node RF3 `SimCluster` (mirroring
+`sim_cluster_dynamo.rs`'s own non-leader precedent) so the forwarding path
+is exercised, not just the local leader-served one: (a)
+`insert_then_select_sees_it` — an `INSERT` (no `RETURNING`, empty `Items`)
+then a `SELECT` with an exact-key `WHERE` sees it; (b)
+`update_and_delete_with_returning` — `UPDATE ... RETURNING ALL NEW *`
+echoes the post-update image, `DELETE ... RETURNING ALL OLD *` echoes the
+pre-delete image and the item is gone afterward; (c)
+`batch_execute_statement_mixed_batch_runs_in_order` — a mixed
+`BatchExecuteStatement` (`INSERT`, `SELECT` hit, `UPDATE ... RETURNING`,
+`DELETE ... RETURNING` on the SAME batch's own just-inserted item) runs
+every statement in request order with no cross-statement atomicity — the
+`DELETE`'s own `RETURNING` echoes a value only the batch's own earlier
+`INSERT` could have written, proving genuinely sequential in-batch
+execution rather than merely "eventually all ran"; (d)
+`execute_transaction_commits_across_two_tables` — an all-`INSERT`
+`ExecuteTransaction` commits atomically across two tables; (e)
+`execute_transaction_condition_failure_cancels` — a duplicate `INSERT`
+inside a transaction cancels the WHOLE transaction, with the correct
+per-action `CancellationReasons` and the transaction's other statement not
+landing even though it precedes the failing one in list order. Tables are
+created over the real DynamoDB wire (`CreateTable`, mirroring
+`sim_cluster_dynamo_transact.rs`'s own `create_table` helper), not
+`SimCluster::create_table` itself — so a scenario's own `non_leader` helper
+looks the tablet up via `Metadata::tablets_for_table` (the replicated
+catalog), not `SimCluster::tablet_of` (which only tracks tablets its own
+in-process `create_table` minted and would panic on a wire-created table —
+found live while first writing this module, not anticipated: `tablet_of`'s
+own doc comment says exactly this, but is easy to miss until the `expect`
+actually fires).
+
+**No product bug found.** Deeper PartiQL fault-injection coverage (GSI/LSI
+`SELECT` under `SimCluster`'s own documented GSI-drain gap, a corpus
+equivalence cell) is PR 6's own scope — this PR is reachability smoke
+only, following C-06 PR 3's own precedent for Transact.
+
+**Gates**: `cargo test -p animusd --lib sim_cluster_dynamo_partiql --
+--test-threads=2` (10 passed); `cargo test -p animusd --lib --
+--test-threads=2` (380 passed, 0 failed, 3 ignored — 370 baseline + this
+PR's 10 new tests, matching the established baseline exactly); `cargo test
+-p animusd --test dynamo_partiql --test dynamo_execute_transaction` (37
+passed, 0 failed — the real-socket regression proving `execute_statement`/
+`execute_transaction`/`run_batch_execute_statement`/
+`execute_one_batch_statement` stayed byte-identical); `cargo fmt --all
+--check` (clean after one auto-fix); `cargo clippy -p animusd
+--all-targets --all-features -- -D warnings` (clean); `cargo build -p
+animusd --all-targets` (clean). `Cargo.lock` unchanged.
