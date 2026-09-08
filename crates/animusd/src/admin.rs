@@ -71,11 +71,11 @@ use animus_control::MetaCommand;
 use animus_control::syskv;
 use animus_dynamo::wire::{base64url_decode, base64url_encode};
 use animus_dynamo::{AttributeValue, Item};
-use animus_env::Clock;
 use animus_env::Env;
 use animus_env::MaybeTlsStream;
 use animus_env::NodeId;
 use animus_node::host::AdminHost;
+use animus_node::host::RelayClient;
 use animus_storage::{StorageError, WalRecordView};
 use animus_tablet::{TOKEN_BYTES, TabletId};
 use async_trait::async_trait;
@@ -411,6 +411,21 @@ async fn dispatch(ctx: &ClientCtx, request: &http::HttpRequest) -> (u16, String)
 /// don't reimplement" discipline), kept in this file instead since these
 /// handlers are `admin.rs`-private and there's nothing else in the crate
 /// that would want to call `AdminHost` on `ClientCtx`.
+///
+/// **This is the PRODUCTION impl (ADR 0061 rung H, C-08 PR 2 rework)** —
+/// concrete `ClientCtx` (`E = ProdEnv, R = AnimusdRelayClient`), observably
+/// byte-identical to this impl before this rung: every method still calls
+/// the same (now `<E, R>`-generic, for reuse) handler function this file
+/// already had, and [`action_data_dynamo`]'s own dispatch call stays the
+/// concrete [`crate::dynamo::execute_routed`] via
+/// [`action_data_dynamo_concrete`] — never
+/// [`crate::dynamo::execute_routed_as_generic`], which would silently
+/// narrow `/admin/data/dynamo` (an any-operation proxy, ADR 0021) to
+/// whatever [`crate::dynamo::dispatch_item_op`] happens to cover. See
+/// [`GenericAdminHost`]'s own doc for the `SimCluster`-facing sibling that
+/// *does* go through the generic dispatch, and
+/// `docs/engineering-lessons.md`'s matching 2026-09-08 entry for why the
+/// two must stay genuinely separate impls rather than one generic one.
 #[async_trait]
 impl AdminHost for ClientCtx {
     async fn config_view(&self) -> Value {
@@ -515,7 +530,7 @@ impl AdminHost for ClientCtx {
         action_transfer_control_leadership(self, body).await
     }
     async fn action_data_dynamo(&self, body: &[u8]) -> (u16, Value) {
-        action_data_dynamo(self, body).await
+        action_data_dynamo_concrete(self, body).await
     }
     async fn action_drop_table(&self, body: &[u8]) -> (u16, Value) {
         action_drop_table(self, body).await
@@ -552,6 +567,170 @@ impl AdminHost for ClientCtx {
     }
 }
 
+/// **The `SimCluster`-facing GENERIC sibling of the impl above** (ADR
+/// 0061 rung H, C-08 PR 2 rework) — a thin newtype, `GenericAdminHost<E,
+/// R>(pub(crate) ClientCtx<E, R>)`, so a second `impl AdminHost` can exist
+/// alongside the concrete one above without violating coherence (Rust
+/// forbids two overlapping `impl AdminHost for ClientCtx<..>`s). Every
+/// method here calls the exact same (already `<E, R>`-generic) handler
+/// function the concrete impl calls, over `&self.0` instead of `self` —
+/// the **only** behavioral difference anywhere in this file is
+/// [`action_data_dynamo`]'s own dispatch call, which goes through
+/// [`crate::dynamo::execute_routed_as_generic`] (whatever
+/// [`crate::dynamo::dispatch_item_op`] covers) rather than the concrete
+/// impl's [`crate::dynamo::execute_routed`] (every operation) — a
+/// deliberate, documented narrowing that is safe here specifically
+/// because nothing in production ever constructs a `GenericAdminHost`;
+/// only `SimCluster::admin` (`sim_cluster.rs`) does, purely for
+/// deterministic test coverage. See `docs/engineering-lessons.md`'s
+/// matching 2026-09-08 entry for the general lesson (a widened blanket
+/// impl silently narrows production dispatch to whatever the generic
+/// sibling covers; a newtype keeps the production impl's own dispatch
+/// concrete and byte-identical while the sim gets the generic one).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct GenericAdminHost<E: Env, R: RelayClient>(pub(crate) ClientCtx<E, R>);
+
+#[async_trait]
+impl<E: Env, R: RelayClient> AdminHost for GenericAdminHost<E, R> {
+    async fn config_view(&self) -> Value {
+        config_view(&self.0)
+    }
+    async fn peers_view(&self) -> Value {
+        peers_view(&self.0)
+    }
+    async fn status_json(&self) -> Value {
+        // `effective_metadata`, not `self.raft.metadata()` directly: on a
+        // control-plane-follower-less growth node (ADR 0030) the local raft
+        // never replicates, so this view would otherwise show an empty
+        // cluster forever on exactly the node an operator most wants to
+        // inspect.
+        serde_json::to_value(self.0.effective_metadata()).unwrap_or(Value::Null)
+    }
+    async fn raft_view(&self) -> Value {
+        raft_view(&self.0)
+    }
+    async fn raftkv_view(&self, query: &str) -> Value {
+        raftkv_view(&self.0, query).await
+    }
+    async fn txns_view(&self) -> Value {
+        txns_view(&self.0).await
+    }
+    async fn storage_lsm(&self, query: &str) -> (u16, Value) {
+        storage_lsm(&self.0, query).await
+    }
+    async fn storage_control(&self) -> (u16, Value) {
+        storage_control(&self.0).await
+    }
+    async fn storage_wal(&self, query: &str) -> (u16, Value) {
+        storage_wal(&self.0, query).await
+    }
+    async fn storage_wal_segment(&self, query: &str) -> (u16, Value) {
+        storage_wal_segment(&self.0, query).await
+    }
+    async fn storage_key(&self, query: &str) -> (u16, Value) {
+        storage_key(&self.0, query).await
+    }
+    async fn storage_scan(&self, query: &str) -> (u16, Value) {
+        storage_scan(&self.0, query).await
+    }
+    async fn system_table(&self, query: &str) -> (u16, Value) {
+        system_table(&self.0, query).await
+    }
+    async fn backups_view(&self) -> Value {
+        backups_view(&self.0)
+    }
+    async fn restores_view(&self) -> Value {
+        restores_view(&self.0)
+    }
+    async fn metrics_view(&self) -> Value {
+        metrics_view(&self.0)
+    }
+    async fn metrics_history_view(&self) -> Value {
+        metrics_history_view(&self.0)
+    }
+    async fn member_drain_status(&self, query: &str) -> (u16, Value) {
+        member_drain_status(&self.0, query)
+    }
+    async fn health(&self) -> (u16, Value) {
+        health(&self.0)
+    }
+    async fn live(&self) -> (u16, Value) {
+        live(&self.0)
+    }
+    async fn action_split(&self, body: &[u8]) -> (u16, Value) {
+        action_split(&self.0, body).await
+    }
+    async fn action_stream_grow(&self, body: &[u8]) -> (u16, Value) {
+        action_stream_grow(&self.0, body).await
+    }
+    async fn action_flush(&self, body: &[u8]) -> (u16, Value) {
+        action_flush(&self.0, body).await
+    }
+    async fn action_compact(&self, body: &[u8]) -> (u16, Value) {
+        action_compact(&self.0, body).await
+    }
+    async fn action_reconfigure(&self, body: &[u8]) -> (u16, Value) {
+        action_reconfigure(&self.0, body)
+    }
+    async fn action_drain(&self, body: &[u8]) -> (u16, Value) {
+        action_drain(&self.0, body)
+    }
+    async fn action_add_member(&self, body: &[u8]) -> (u16, Value) {
+        action_add_member(&self.0, body).await
+    }
+    async fn action_remove_member(&self, body: &[u8]) -> (u16, Value) {
+        action_remove_member(&self.0, body)
+    }
+    async fn control_members_view(&self) -> Value {
+        control_members_view(&self.0)
+    }
+    async fn action_add_control_member(&self, body: &[u8]) -> (u16, Value) {
+        action_add_control_member(&self.0, body).await
+    }
+    async fn action_remove_control_member(&self, body: &[u8]) -> (u16, Value) {
+        action_remove_control_member(&self.0, body).await
+    }
+    async fn action_transfer_control_leadership(&self, body: &[u8]) -> (u16, Value) {
+        action_transfer_control_leadership(&self.0, body).await
+    }
+    async fn action_data_dynamo(&self, body: &[u8]) -> (u16, Value) {
+        action_data_dynamo(&self.0, body).await
+    }
+    async fn action_drop_table(&self, body: &[u8]) -> (u16, Value) {
+        action_drop_table(&self.0, body).await
+    }
+    async fn action_data_seed(&self, body: &[u8]) -> (u16, Value) {
+        action_data_seed(&self.0, body).await
+    }
+    async fn action_set_throttle_defaults(&self, body: &[u8]) -> (u16, Value) {
+        action_set_throttle_defaults(&self.0, body).await
+    }
+    async fn credentials_view(&self) -> Value {
+        credentials_view(&self.0)
+    }
+    async fn action_put_credential(&self, body: &[u8]) -> (u16, Value) {
+        action_put_credential(&self.0, body).await
+    }
+    async fn action_rotate_credential(&self, body: &[u8]) -> (u16, Value) {
+        action_rotate_credential(&self.0, body).await
+    }
+    async fn action_revoke_credential(&self, body: &[u8]) -> (u16, Value) {
+        action_revoke_credential(&self.0, body).await
+    }
+    async fn backup_store_view(&self) -> Value {
+        backup_store_view(&self.0).await
+    }
+    async fn ttl_view(&self) -> Value {
+        ttl_view(&self.0)
+    }
+    async fn gc_view(&self) -> Value {
+        gc_view(&self.0)
+    }
+    async fn segment_store_view(&self) -> Value {
+        segment_store_view(&self.0).await
+    }
+}
+
 // ---- read-only views ----------------------------------------------------
 
 /// This node's own deployment role — stamped literally at assembly time
@@ -565,7 +744,7 @@ fn node_role_str(a: &AdminInfo) -> &'static str {
     a.role
 }
 
-fn config_view(ctx: &ClientCtx) -> Value {
+fn config_view<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>) -> Value {
     let a = &ctx.admin;
     // `effective_metadata()`, not `ctx.control.metadata_cached()` directly
     // (ADR 0035 PR5 staleness-audit fix, matching `/admin/status`/
@@ -654,7 +833,7 @@ fn config_view(ctx: &ClientCtx) -> Value {
 /// yet observed that node's self-registration commit) has no role yet, so it
 /// is reported `"unknown"` — a transient startup state, not a permanent one.
 /// `admin_addrs` is kept byte-for-byte as before for any older consumer.
-fn peers_view(ctx: &ClientCtx) -> Value {
+fn peers_view<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>) -> Value {
     let a = &ctx.admin;
     let meta = ctx.effective_metadata();
     let mut admin_addrs: std::collections::BTreeSet<String> =
@@ -685,7 +864,7 @@ fn peers_view(ctx: &ClientCtx) -> Value {
     })
 }
 
-fn raft_view(ctx: &ClientCtx) -> Value {
+fn raft_view<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>) -> Value {
     let r = &ctx.control;
     // Deliberately `metadata_cached()`, NOT `effective_metadata()` (ADR 0035
     // PR5 staleness audit, documented rather than "fixed"): `/admin/raft` is
@@ -775,7 +954,7 @@ fn raft_view(ctx: &ClientCtx) -> Value {
 /// `CpGroup::raft_view`'s own doc for why the polled default must not
 /// materialize (this route is fetched from every node every 5s by the
 /// Console, and the exact path costs O(dataset) per node per poll).
-async fn raftkv_view(ctx: &ClientCtx, q: &str) -> Value {
+async fn raftkv_view<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>, q: &str) -> Value {
     let exact = matches!(
         http::query_param(q, "exact").as_deref(),
         Some("1") | Some("true")
@@ -795,7 +974,7 @@ async fn raftkv_view(ctx: &ClientCtx, q: &str) -> Value {
 /// client-side fan-out over every node's own `/admin/txns`, exactly like
 /// `/admin/raftkv` (see that route's own doc). Pure observer, no gated
 /// action: manual transaction resolution is deferred (see `CpTxnView`'s doc).
-async fn txns_view(ctx: &ClientCtx) -> Value {
+async fn txns_view<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>) -> Value {
     let mut groups: Vec<CpTxnView> = Vec::new();
     for (t, g) in ctx.edge.hosted_groups() {
         groups.push(g.txn_view(t).await);
@@ -803,7 +982,7 @@ async fn txns_view(ctx: &ClientCtx) -> Value {
     json!({ "hosts_cp": !groups.is_empty(), "groups": groups })
 }
 
-async fn storage_lsm(ctx: &ClientCtx, q: &str) -> (u16, Value) {
+async fn storage_lsm<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>, q: &str) -> (u16, Value) {
     let tablet = tablet_param(q);
     let Some(g) = ctx.edge.local_cp(tablet) else {
         return not_hosted(tablet);
@@ -868,7 +1047,7 @@ async fn storage_lsm(ctx: &ClientCtx, q: &str) -> (u16, Value) {
 /// the numbers legitimately coincide; on a **control-only** node it is this
 /// node's own small dedicated engine, otherwise invisible to any
 /// `/admin/storage/*` route.
-async fn storage_control(ctx: &ClientCtx) -> (u16, Value) {
+async fn storage_control<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>) -> (u16, Value) {
     let Some(engine) = &ctx.control_storage else {
         return (200, json!({"available": false}));
     };
@@ -928,7 +1107,7 @@ async fn storage_control(ctx: &ClientCtx) -> (u16, Value) {
     )
 }
 
-async fn storage_wal(ctx: &ClientCtx, q: &str) -> (u16, Value) {
+async fn storage_wal<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>, q: &str) -> (u16, Value) {
     let tablet = tablet_param(q);
     let Some(g) = ctx.edge.local_cp(tablet) else {
         return not_hosted(tablet);
@@ -956,7 +1135,10 @@ async fn storage_wal(ctx: &ClientCtx, q: &str) -> (u16, Value) {
     )
 }
 
-async fn storage_wal_segment(ctx: &ClientCtx, q: &str) -> (u16, Value) {
+async fn storage_wal_segment<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+    q: &str,
+) -> (u16, Value) {
     let tablet = tablet_param(q);
     let Some(seg) = http::query_param(q, "seg").and_then(|s| s.parse::<u64>().ok()) else {
         return (
@@ -980,7 +1162,7 @@ async fn storage_wal_segment(ctx: &ClientCtx, q: &str) -> (u16, Value) {
     )
 }
 
-async fn storage_key(ctx: &ClientCtx, q: &str) -> (u16, Value) {
+async fn storage_key<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>, q: &str) -> (u16, Value) {
     let tablet = tablet_param(q);
     let Some(key) = http::query_param(q, "key") else {
         return (400, json!({"error": "missing `key` query parameter"}));
@@ -1024,7 +1206,7 @@ async fn storage_key(ctx: &ClientCtx, q: &str) -> (u16, Value) {
 /// engine (the dashboard "browse keys" view, ADR 0021). `start` defaults to the
 /// beginning, `limit` to 50 (capped at 1000). Node-local, like the other storage
 /// routes — scrape the leader for its committed state.
-async fn storage_scan(ctx: &ClientCtx, q: &str) -> (u16, Value) {
+async fn storage_scan<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>, q: &str) -> (u16, Value) {
     let tablet = tablet_param(q);
     // Decode the dashboard's `<token-base64>:<remainder>` display form (so paging by
     // pasting the last displayed key works), falling back to a raw plain prefix.
@@ -1109,7 +1291,7 @@ async fn storage_scan(ctx: &ClientCtx, q: &str) -> (u16, Value) {
 /// is handled as a clean 400 (see the scan call below), not a panic. (The
 /// `applied_index` watermark read just above is a fixed, non-`after`-derived
 /// key, so it carries no equivalent client-input exposure.)
-async fn system_table(ctx: &ClientCtx, q: &str) -> (u16, Value) {
+async fn system_table<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>, q: &str) -> (u16, Value) {
     let Some(engine) = &ctx.control_storage else {
         return (200, json!({"available": false}));
     };
@@ -1403,7 +1585,7 @@ fn system_table_item(kind: syskv::EntityKind, id: &[u8], value: &[u8], version: 
 /// (this pinned tablet id is no longer live) and `capturing` (every one of
 /// its current live descendants — one entry, itself, for a tablet that
 /// never split).
-fn backups_view(ctx: &ClientCtx) -> Value {
+fn backups_view<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>) -> Value {
     let meta = ctx.effective_metadata();
     let backups: Vec<Value> = meta
         .backups
@@ -1490,7 +1672,7 @@ fn backups_view(ctx: &ClientCtx) -> Value {
 /// `CompleteRestore` has landed — the same tablet-state derivation
 /// `dynamo::table_status` uses for `DescribeTable`'s `TableStatus`). Pure
 /// observer, like every other `GET` here (ADR 0020).
-fn restores_view(ctx: &ClientCtx) -> Value {
+fn restores_view<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>) -> Value {
     let meta = ctx.effective_metadata();
     let restores: Vec<Value> = meta
         .restores
@@ -1565,7 +1747,7 @@ fn restores_view(ctx: &ClientCtx) -> Value {
 /// exact condition the janitor loop itself gates its whole tick on.
 const BACKUP_STORE_OBJECT_BYTES_SCAN_CAP: usize = 200;
 
-async fn backup_store_view(ctx: &ClientCtx) -> Value {
+async fn backup_store_view<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>) -> Value {
     let store = ctx.admin.backup_store.as_ref().map_or(Value::Null, |v| {
         json!({
             "kind": v.kind,
@@ -1626,7 +1808,7 @@ async fn backup_store_view(ctx: &ClientCtx) -> Value {
 /// leader and (b) belong to a TTL-enabled table — the tablets this node's
 /// reaper is actually reaping right now, distinct from control-plane
 /// leadership (which the backup janitor's own `leader` field reports).
-fn ttl_view(ctx: &ClientCtx) -> Value {
+fn ttl_view<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>) -> Value {
     let meta = ctx.effective_metadata();
     let tables: Vec<Value> = meta
         .schemas
@@ -1694,7 +1876,7 @@ fn ttl_view(ctx: &ClientCtx) -> Value {
 /// every node in the cluster. See ADR 0024's own doc for that mechanism;
 /// it is a different subsystem from the segment janitor this route
 /// reports on, despite both being colloquially "garbage collection."
-fn gc_view(ctx: &ClientCtx) -> Value {
+fn gc_view<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>) -> Value {
     let janitor = ctx.segment_janitor_progress.lock().unwrap().clone();
     json!({
         "janitor": janitor,
@@ -1743,7 +1925,7 @@ fn gc_view(ctx: &ClientCtx) -> Value {
 /// mixing the two stores' objects.
 const SEGMENT_STORE_OBJECT_BYTES_SCAN_CAP: usize = 200;
 
-async fn segment_store_view(ctx: &ClientCtx) -> Value {
+async fn segment_store_view<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>) -> Value {
     let store = ctx.admin.segment_store.as_ref().map_or(Value::Null, |v| {
         json!({
             "kind": v.kind,
@@ -1797,7 +1979,7 @@ async fn segment_store_view(ctx: &ClientCtx) -> Value {
     })
 }
 
-fn metrics_view(ctx: &ClientCtx) -> Value {
+fn metrics_view<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>) -> Value {
     let (counters, is_leader) = ctx.metrics_json();
     // Growth PR3 Fork F (ADR 0042 §14): this node's own per-tablet
     // change-append-rate estimates (bytes/sec) — the signal an operator
@@ -1858,7 +2040,7 @@ fn metrics_view(ctx: &ClientCtx) -> Value {
 /// tab's read-path sparklines (docs/roadmap.md U-01) — a real live snapshot
 /// each `/admin/metrics` sample, not a cluster-wide aggregate (the same
 /// "per-node sink" caveat `/admin/metrics` itself carries).
-fn metrics_history_view(ctx: &ClientCtx) -> Value {
+fn metrics_history_view<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>) -> Value {
     json!({ "samples": ctx.metrics_history() })
 }
 
@@ -1879,7 +2061,7 @@ fn metrics_history_view(ctx: &ClientCtx) -> Value {
 /// default 150ms election base, not tens of seconds.
 const HEALTH_LEADER_GRACE_ELECTION_TIMEOUTS: u32 = 3;
 
-fn health(ctx: &ClientCtx) -> (u16, Value) {
+fn health<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>) -> (u16, Value) {
     let r = &ctx.control;
     // The raw, pre-vote-driven consensus belief (see `RaftCore::leader`'s
     // own doc) — kept in the body, unchanged, as an honest diagnostic:
@@ -1933,7 +2115,7 @@ fn health(ctx: &ClientCtx) -> (u16, Value) {
 /// (mirroring [`health`]'s own field) so an operator staring at
 /// `/admin/live` mid-incident can see readiness state at a glance — it
 /// never affects this route's own status code.
-fn live(ctx: &ClientCtx) -> (u16, Value) {
+fn live<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>) -> (u16, Value) {
     let r = &ctx.control;
     let health_grace = r.election_timeout() * HEALTH_LEADER_GRACE_ELECTION_TIMEOUTS;
     let leader_recent = r.leader_within(health_grace).is_some();
@@ -2031,7 +2213,7 @@ struct TransferControlLeadershipReq {
     to: NodeId,
 }
 
-async fn action_split(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
+async fn action_split<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>, body: &[u8]) -> (u16, Value) {
     let req: SplitReq = match parse_body(body) {
         Ok(r) => r,
         Err(e) => return e,
@@ -2061,7 +2243,10 @@ struct ThrottleDefaultsReq {
 /// cluster's real-thread throttle test sets this on the node the client
 /// actually dials, which for a leader-hosted write is sufficient since the
 /// check runs where the write is served.
-async fn action_set_throttle_defaults(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
+async fn action_set_throttle_defaults<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+    body: &[u8],
+) -> (u16, Value) {
     let req: ThrottleDefaultsReq = match parse_body(body) {
         Ok(r) => r,
         Err(e) => return e,
@@ -2089,7 +2274,10 @@ struct StreamGrowReq {
 /// limit, or an empty/singleton tablet) is reported as `"skipped"` in that
 /// tablet's own entry, never escalated into an overall failure — only a
 /// request-shaped problem (unknown/unstreamed table) is a `400`.
-async fn action_stream_grow(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
+async fn action_stream_grow<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+    body: &[u8],
+) -> (u16, Value) {
     let req: StreamGrowReq = match parse_body(body) {
         Ok(r) => r,
         Err(e) => return e,
@@ -2142,7 +2330,7 @@ async fn action_stream_grow(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
     )
 }
 
-async fn action_flush(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
+async fn action_flush<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>, body: &[u8]) -> (u16, Value) {
     let req: TabletReq = match parse_body(body) {
         Ok(r) => r,
         Err(e) => return e,
@@ -2164,7 +2352,10 @@ async fn action_flush(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
     }
 }
 
-async fn action_compact(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
+async fn action_compact<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+    body: &[u8],
+) -> (u16, Value) {
     let req: TabletReq = match parse_body(body) {
         Ok(r) => r,
         Err(e) => return e,
@@ -2186,7 +2377,7 @@ async fn action_compact(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
     }
 }
 
-fn action_reconfigure(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
+fn action_reconfigure<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>, body: &[u8]) -> (u16, Value) {
     let req: ReconfigureReq = match parse_body(body) {
         Ok(r) => r,
         Err(e) => return e,
@@ -2220,7 +2411,7 @@ fn action_reconfigure(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
     }
 }
 
-fn action_drain(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
+fn action_drain<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>, body: &[u8]) -> (u16, Value) {
     let req: DrainReq = match parse_body(body) {
         Ok(r) => r,
         Err(e) => return e,
@@ -2245,7 +2436,7 @@ fn action_drain(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
 /// member's current status string (`"Active"`/`"Joining"`/`"Leaving"`/
 /// `"Down"`) — the operator (or `animus admin decommission`) polls until
 /// `tablets_remaining == 0` and `status` is not `"Active"`.
-fn member_drain_status(ctx: &ClientCtx, q: &str) -> (u16, Value) {
+fn member_drain_status<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>, q: &str) -> (u16, Value) {
     let Some(node) = http::query_param(q, "node").and_then(|s| s.parse::<NodeId>().ok()) else {
         return (
             400,
@@ -2271,7 +2462,10 @@ fn member_drain_status(ctx: &ClientCtx, q: &str) -> (u16, Value) {
 /// off the relay path). An operator drains first (`/admin/drain`), polls
 /// `/admin/member/drain-status` to completion, then calls this — exactly the
 /// sequence `animus admin decommission` automates.
-fn action_remove_member(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
+fn action_remove_member<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+    body: &[u8],
+) -> (u16, Value) {
     let req: RemoveMemberReq = match parse_body(body) {
         Ok(r) => r,
         Err(e) => return e,
@@ -2287,7 +2481,10 @@ fn action_remove_member(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
 /// first heartbeat. Relayed (unlike `/admin/drain`), so it works from any
 /// reachable admin port — including the new node's own, whose control role is
 /// never a real control-group voter (see `ClientCtx::admin_add_member`'s doc).
-async fn action_add_member(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
+async fn action_add_member<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+    body: &[u8],
+) -> (u16, Value) {
     let req: AddMemberReq = match parse_body(body) {
         Ok(r) => r,
         Err(e) => return e,
@@ -2312,7 +2509,7 @@ async fn action_add_member(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
 /// `control/member/add` committed / caught up" — `animus admin control-add`
 /// polls this (via `ControlHandle::config` observed on the **new node's own**
 /// admin port) until it reports itself a voter.
-fn control_members_view(ctx: &ClientCtx) -> Value {
+fn control_members_view<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>) -> Value {
     let addrs = ctx.effective_metadata().node_addrs;
     json!({
         "voters": ctx.control.config().map(|v| v.into_iter().collect::<Vec<_>>()),
@@ -2332,7 +2529,10 @@ fn control_members_view(ctx: &ClientCtx) -> Value {
 /// when operator-supplied, or the freshly-minted one when `node` was omitted
 /// — the caller (the CLI, an operator) needs this to know what id the new
 /// process should actually come up as.
-async fn action_add_control_member(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
+async fn action_add_control_member<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+    body: &[u8],
+) -> (u16, Value) {
     let req: AddControlMemberReq = match parse_body(body) {
         Ok(r) => r,
         Err(e) => return e,
@@ -2354,7 +2554,10 @@ async fn action_add_control_member(ctx: &ClientCtx, body: &[u8]) -> (u16, Value)
 /// string for the deliberately-allowed-but-risky quorum-loss cases (ADR 0037
 /// §2) — surfaced here, never swallowed, so `animus admin control-remove`
 /// can print it.
-async fn action_remove_control_member(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
+async fn action_remove_control_member<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+    body: &[u8],
+) -> (u16, Value) {
     let req: RemoveControlMemberReq = match parse_body(body) {
         Ok(r) => r,
         Err(e) => return e,
@@ -2380,7 +2583,10 @@ async fn action_remove_control_member(ctx: &ClientCtx, body: &[u8]) -> (u16, Val
 /// success, `409 {"error": ...}` on any refusal, including a timed-out
 /// transfer) for the same reason every other control-member action here
 /// does — a uniform shape for the dashboard/CLI to render.
-async fn action_transfer_control_leadership(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
+async fn action_transfer_control_leadership<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+    body: &[u8],
+) -> (u16, Value) {
     let req: TransferControlLeadershipReq = match parse_body(body) {
         Ok(r) => r,
         Err(e) => return e,
@@ -2413,22 +2619,12 @@ const STREAMS_OPS: &[&str] = &[
     "GetRecords",
 ];
 
-/// `POST /admin/data/dynamo` — run a DynamoDB operation from the dashboard, by
-/// reusing the DynamoDB edge's decode + execute path in-process (ADR 0021).
-/// Reaches **both** services on that edge (ADR 0042 §3's same-listener fork):
-/// a fully-qualified `op` (containing a `.`) passes through unchanged and is
-/// routed by its own prefix; a bare `op` is resolved by name — one of
-/// [`STREAMS_OPS`] gets the `DynamoDBStreams_20120810.` prefix, anything else
-/// the item API's `DynamoDB_20120810.` prefix (the pre-existing default) —
-/// then both go through [`crate::dynamo::execute_routed`], the identical fork
-/// the real edge's `dispatch` uses, so a dashboard client and a genuine wire
-/// client resolve a target the same way. The response is the operation's own
-/// JSON (or a DynamoDB error object), with the edge's status code.
-async fn action_data_dynamo(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
-    let req: DynamoDataReq = match parse_body(body) {
-        Ok(r) => r,
-        Err(e) => return e,
-    };
+/// Resolve a `POST /admin/data/dynamo` request's bare-or-qualified `op` into
+/// the full `X-Amz-Target` string, and its JSON `payload` into wire bytes —
+/// the pure, dispatch-free half of [`action_data_dynamo`]/
+/// [`action_data_dynamo_concrete`], factored out so the two dispatch-call
+/// variants below can share it byte-for-byte rather than risk drifting.
+fn resolve_dynamo_data_request(req: &DynamoDataReq) -> (String, Vec<u8>) {
     let target = if req.op.contains('.') {
         req.op.clone()
     } else if STREAMS_OPS.contains(&req.op.as_str()) {
@@ -2437,9 +2633,82 @@ async fn action_data_dynamo(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
         format!("DynamoDB_20120810.{}", req.op)
     };
     let payload = serde_json::to_vec(&req.payload).unwrap_or_default();
-    let (status, json_body) = crate::dynamo::execute_routed(ctx, &target, &payload).await;
+    (target, payload)
+}
+
+/// Reshape a dispatch call's raw `(status, json-string)` result into the
+/// `(status, Value)` shape [`action_data_dynamo`]/
+/// [`action_data_dynamo_concrete`] both return.
+fn dynamo_data_response(status: u16, json_body: String) -> (u16, Value) {
     let value = serde_json::from_str::<Value>(&json_body).unwrap_or(Value::String(json_body));
     (status, value)
+}
+
+/// `POST /admin/data/dynamo` — run a DynamoDB operation from the dashboard, by
+/// reusing the DynamoDB edge's decode + execute path in-process (ADR 0021).
+/// Reaches **both** services on that edge (ADR 0042 §3's same-listener fork):
+/// a fully-qualified `op` (containing a `.`) passes through unchanged and is
+/// routed by its own prefix; a bare `op` is resolved by name — one of
+/// [`STREAMS_OPS`] gets the `DynamoDBStreams_20120810.` prefix, anything else
+/// the item API's `DynamoDB_20120810.` prefix (the pre-existing default) —
+/// then both go through [`crate::dynamo::execute_routed_as_generic`].
+///
+/// **This is the GENERIC variant — [`GenericAdminHost`]'s own `SimCluster`-
+/// facing sibling, not production's** (ADR 0061 rung H, C-08 PR 2 rework):
+/// `execute_routed_as_generic` only covers whatever
+/// [`crate::dynamo::dispatch_item_op`] does, narrower than the full
+/// DynamoDB operation set. The concrete `impl AdminHost for ClientCtx`
+/// production actually serves `/admin/data/dynamo` through calls
+/// [`action_data_dynamo_concrete`] instead, which reaches the full,
+/// unmodified [`crate::dynamo::execute_routed`] — see that function's own
+/// doc, and `docs/engineering-lessons.md`'s matching 2026-09-08 entry, for
+/// why the two must stay genuinely separate rather than one generic
+/// function used everywhere. Only called from [`GenericAdminHost`], itself
+/// constructed solely by `SimCluster::admin` — the `cfg_attr` below mirrors
+/// `crate::dynamo::execute_item_op_as`'s own dead-code allowance.
+#[cfg_attr(not(test), allow(dead_code))]
+async fn action_data_dynamo<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+    body: &[u8],
+) -> (u16, Value) {
+    let req: DynamoDataReq = match parse_body(body) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    let (target, payload) = resolve_dynamo_data_request(&req);
+    let (status, json_body) = crate::dynamo::execute_routed_as_generic(
+        ctx,
+        &crate::authz::Principal::unrestricted(),
+        &target,
+        &payload,
+    )
+    .await;
+    dynamo_data_response(status, json_body)
+}
+
+/// `POST /admin/data/dynamo`'s PRODUCTION dispatch — the concrete
+/// `impl AdminHost for ClientCtx`'s own `action_data_dynamo` method calls
+/// this, not the generic [`action_data_dynamo`] above. Same request
+/// resolution ([`resolve_dynamo_data_request`], shared byte-for-byte with
+/// the generic sibling so the two variants cannot silently drift apart),
+/// but dispatches through the concrete, unmodified
+/// [`crate::dynamo::execute_routed`] — every DynamoDB operation, not just
+/// [`crate::dynamo::dispatch_item_op`]'s subset — exactly as this route
+/// behaved before ADR 0061 rung H's `AdminHost` widening (and its rework:
+/// see `docs/engineering-lessons.md`'s matching 2026-09-08 entry for why a
+/// second, general-purpose "run whatever operation a client asks for"
+/// proxy like this one is a materially different situation from every
+/// other generic-dispatch widening in this crate's own `SimCluster`
+/// series, which only ever paralleled the primary DynamoDB wire edge's own
+/// caller).
+async fn action_data_dynamo_concrete(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
+    let req: DynamoDataReq = match parse_body(body) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    let (target, payload) = resolve_dynamo_data_request(&req);
+    let (status, json_body) = crate::dynamo::execute_routed(ctx, &target, &payload).await;
+    dynamo_data_response(status, json_body)
 }
 
 #[derive(Deserialize)]
@@ -2453,7 +2722,10 @@ struct DropTableReq {
 /// table's data on disk (ADR 0024). Same sink as the
 /// DynamoDB wire's own `DeleteTable` (`dynamo.rs::delete_table`); idempotent.
 /// This is the dashboard's delete primitive.
-async fn action_drop_table(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
+async fn action_drop_table<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+    body: &[u8],
+) -> (u16, Value) {
     let req: DropTableReq = match parse_body(body) {
         Ok(r) => r,
         Err(e) => return e,
@@ -2562,7 +2834,10 @@ fn seed_key_attr(ty: ColumnType, prefix: &str, index_text: &str) -> AttributeVal
 /// observable on the table's change log/stream like any client write. With
 /// `--auto-split-bytes` enabled, crossing the split threshold splits the
 /// tablet — visible live in the Tablets view.
-async fn action_data_seed(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
+async fn action_data_seed<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+    body: &[u8],
+) -> (u16, Value) {
     let req: SeedReq = match parse_body(body) {
         Ok(r) => r,
         Err(e) => return e,
@@ -2689,7 +2964,7 @@ async fn action_data_seed(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
                 let mut last = Ok(());
                 for attempt in 0..SEED_WRITE_ATTEMPTS {
                     if attempt > 0 {
-                        tokio::time::sleep(SEED_RETRY_BACKOFF).await;
+                        ctx.env.sleep(SEED_RETRY_BACKOFF).await;
                     }
                     let meta = ctx.effective_metadata();
                     last = if crate::dynamo::table_change_records_carry_images(&meta, &table) {
@@ -3028,7 +3303,7 @@ fn parse_policy(body: PolicyBody) -> Result<animus_control::Policy, (u16, Value)
 /// catalog row, redacted. **Never a secret** — see
 /// [`credential_row_redacted`]'s own doc; regression:
 /// `tests/admin_endpoint.rs::admin_credentials_view_never_serves_a_secret`.
-fn credentials_view(ctx: &ClientCtx) -> Value {
+fn credentials_view<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>) -> Value {
     let meta = ctx.effective_metadata();
     let rows: Vec<Value> = meta
         .credentials
@@ -3064,7 +3339,10 @@ fn default_credential_enabled() -> bool {
 /// leader when this node isn't one — and commit-waits before answering, so
 /// a `200` means the row is genuinely durable and replicated, not merely
 /// accepted locally.
-async fn action_put_credential(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
+async fn action_put_credential<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+    body: &[u8],
+) -> (u16, Value) {
     let req: PutCredentialReq = match parse_body(body) {
         Ok(r) => r,
         Err(e) => return e,
@@ -3089,7 +3367,10 @@ async fn action_put_credential(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
         enabled: req.enabled,
         now,
     };
-    let deadline = tokio::time::Instant::now() + crate::dynamo::SCHEMA_COMMIT_TIMEOUT;
+    let deadline = ctx
+        .env
+        .now()
+        .saturating_add(crate::dynamo::SCHEMA_COMMIT_TIMEOUT);
     loop {
         ctx.propose_schema(&command).await;
         let meta = ctx.metadata_fresh().await;
@@ -3118,14 +3399,14 @@ async fn action_put_credential(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
             ctx.refresh_catalog_credentials_flag(&meta);
             return (200, v);
         }
-        if tokio::time::Instant::now() >= deadline {
+        if ctx.env.now() >= deadline {
             return (
                 500,
                 json!({"error": "PutCredential did not commit to the control plane in time \
                      (no leader reachable?)"}),
             );
         }
-        tokio::time::sleep(crate::dynamo::SCHEMA_POLL_INTERVAL).await;
+        ctx.env.sleep(crate::dynamo::SCHEMA_POLL_INTERVAL).await;
     }
 }
 
@@ -3142,7 +3423,10 @@ struct RotateCredentialReq {
 /// [`action_put_credential`]. Rejected (`404`) against an unknown id —
 /// there is nothing to rotate, mirroring `MetaCommand::RotateCredential`'s
 /// own apply-time rejection.
-async fn action_rotate_credential(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
+async fn action_rotate_credential<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+    body: &[u8],
+) -> (u16, Value) {
     let req: RotateCredentialReq = match parse_body(body) {
         Ok(r) => r,
         Err(e) => return e,
@@ -3161,7 +3445,10 @@ async fn action_rotate_credential(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) 
         grace_secs: req.grace_secs,
         now,
     };
-    let deadline = tokio::time::Instant::now() + crate::dynamo::SCHEMA_COMMIT_TIMEOUT;
+    let deadline = ctx
+        .env
+        .now()
+        .saturating_add(crate::dynamo::SCHEMA_COMMIT_TIMEOUT);
     loop {
         ctx.propose_schema(&command).await;
         let meta = ctx.metadata_fresh().await;
@@ -3176,14 +3463,14 @@ async fn action_rotate_credential(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) 
             v["id"] = json!(req.id);
             return (200, v);
         }
-        if tokio::time::Instant::now() >= deadline {
+        if ctx.env.now() >= deadline {
             return (
                 500,
                 json!({"error": "RotateCredential did not commit to the control plane in time \
                      (no leader reachable?)"}),
             );
         }
-        tokio::time::sleep(crate::dynamo::SCHEMA_POLL_INTERVAL).await;
+        ctx.env.sleep(crate::dynamo::SCHEMA_POLL_INTERVAL).await;
     }
 }
 
@@ -3197,13 +3484,19 @@ struct RevokeCredentialReq {
 /// [`action_put_credential`]. Idempotent — revoking an already-absent id
 /// is a `200`, not an error, mirroring `MetaCommand::RevokeCredential`'s
 /// own no-op-on-repeat semantics.
-async fn action_revoke_credential(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
+async fn action_revoke_credential<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+    body: &[u8],
+) -> (u16, Value) {
     let req: RevokeCredentialReq = match parse_body(body) {
         Ok(r) => r,
         Err(e) => return e,
     };
     let command = MetaCommand::RevokeCredential { id: req.id.clone() };
-    let deadline = tokio::time::Instant::now() + crate::dynamo::SCHEMA_COMMIT_TIMEOUT;
+    let deadline = ctx
+        .env
+        .now()
+        .saturating_add(crate::dynamo::SCHEMA_COMMIT_TIMEOUT);
     loop {
         ctx.propose_schema(&command).await;
         let meta = ctx.metadata_fresh().await;
@@ -3214,14 +3507,14 @@ async fn action_revoke_credential(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) 
             ctx.refresh_catalog_credentials_flag(&meta);
             return (200, json!({"ok": true, "id": req.id}));
         }
-        if tokio::time::Instant::now() >= deadline {
+        if ctx.env.now() >= deadline {
             return (
                 500,
                 json!({"error": "RevokeCredential did not commit to the control plane in time \
                      (no leader reachable?)"}),
             );
         }
-        tokio::time::sleep(crate::dynamo::SCHEMA_POLL_INTERVAL).await;
+        ctx.env.sleep(crate::dynamo::SCHEMA_POLL_INTERVAL).await;
     }
 }
 

@@ -619,14 +619,16 @@ the still-true paragraph after the table.
   identical scenario failing with a stale handle shadowing the fresh one).
   See `sim_cluster_dynamo_corpus.rs`'s own new "Corpus-fixture findings"
   module-doc section for the full account of each, including the exact
-  seeds. **A resource-scale finding filed, not fixed**: peak process RSS
-  for `ANIMUS_DYNAMO_WIRE_SEEDS=25` (200 scenarios) grows with depth and
-  was observed OOM-killed on this rung's 15 GiB development sandbox
-  (plateauing near ~13.8 GiB at both `=12` and `=25`); `=12`/`=4` complete
-  cleanly on the same sandbox, and CI's own previously-established green
-  `=25` figure implies its runners simply have more RAM. See that same
-  module-doc section for the measured numbers — not investigated further
-  per this PR's own scope. **PR 5 (PartiQL siblings) landed 2026-09-08**:
+  seeds. **A resource-scale finding was filed here as "not fixed, not
+  investigated further"; it has since been root-caused and fixed by PR
+  #753, outside this PR's own scope at the time.** The OOM was never
+  glibc allocator retention (this PR's own original framing) — it was a
+  genuine per-test reference-cycle leak in `animus-sim`'s task queue plus a
+  second, independent one in `animus-node`'s `SimRelayClient` handler slot,
+  both fixed 2026-09-08 (PR #753) ahead of PR 6's own full-suite gate,
+  which depended on them. See ADR 0061's two 2026-09-08 leak-fix
+  amendments and this section's own PR 7 close-out below for the fix and
+  its measured numbers. **PR 5 (PartiQL siblings) landed 2026-09-08**:
   four new `<E: Env, R: RelayClient>`-generic siblings —
   `execute_statement_as`/`execute_transaction_as`/
   `run_batch_execute_statement_as`/`execute_one_batch_statement_as` — plus
@@ -646,18 +648,240 @@ the still-true paragraph after the table.
   running in order, an `ExecuteTransaction` commit across two tables, and
   a condition-failed cancel — each issued from a non-leader node. No
   product bug found. See ADR 0061's matching 2026-09-08 "Rung F, PR 5"
-  amendment for the full account. PRs 6-7 (PartiQL sim tests, docs
-  close-out) remain open.
+  amendment for the full account. **PR 6 (PartiQL sim tests) landed
+  2026-09-08**: 27 more `SimCluster` siblings, one per named real-socket
+  LOGIC test in `dynamo_partiql.rs`/`dynamo_execute_transaction.rs`
+  (statement semantics, error mapping, pagination shape, index routing,
+  cancellation reasons), each issued from a non-leader node of a 3-node
+  RF3 `SimCluster` with an `_over_seeds` sibling at 5 seeds (54 tests
+  total) — pure test authorship over PR 5's own dispatch, no new
+  `dynamo.rs` mechanism. No product bug found; the real-socket 37-test
+  suite stays untouched and green throughout. Deliberately not converted:
+  `throttled_table_throttles_a_partiql_insert` (throttle-window timing),
+  two tests already subsumed by PR 5's own scenarios (`insert_then_
+  select_sees_it`, `delete_with_returning_all_old`), and every
+  `batch_execute_statement_*`/`delete_*` test beyond PR 5's own scenario
+  (c) — not named in this PR's own candidate list, left for a future pass.
+  See ADR 0061's matching 2026-09-08 "Rung F, PR 6" amendment for the full
+  account.
+
+  **PR 7 (this docs close-out) landed 2026-09-08, closing C-06.** The full
+  seven-PR series: PR 1 docs opener (#728); PR 2 Transact groundwork
+  (#729); PR 3 Transact reachable from `SimCluster` (#732), which surfaced
+  and closed two issues of its own — the `SimRelayClient` nested-relay
+  deadlock (#731, fixed by #738) and `txn_recover`'s non-local grace-check
+  wall-clock bug (#737, fixed by #740); PR 4 Transact in the wire corpus
+  (#748); PR 5 PartiQL siblings (#750); PR 6 PartiQL sim tests (#756); PR 7
+  this close-out. Across PRs 3-6, `cargo test -p animusd --lib` grew from
+  353 passed (pre-PR-3 baseline) to 438 passed / 3 ignored (post-PR-6),
+  entirely additive `SimCluster` coverage with zero regressions at any
+  step. Every production dispatch path (`run_operation`, `execute_
+  statement`, `execute_transaction`, `run_batch_execute_statement`,
+  `execute_one_batch_statement`) stayed byte-identical throughout, per this
+  section's own non-goals — confirmed the whole way by running the
+  unmodified real-socket suites against the widened code.
+
+  **`crates/animusd/tests/dynamo_partiql.rs` and `dynamo_execute_
+  transaction.rs` are kept in full, not trimmed or deleted.** They remain
+  the `ProdEnv` proof that `run_operation`'s own production dispatch path —
+  never replaced, only paralleled by the new generic siblings — actually
+  matches what the generic `SimCluster` siblings exercise; deleting them
+  would leave the byte-identical claim above unverifiable on every future
+  change. This mirrors D3 PR 3b's own decision to keep `dynamo_indexes.
+  rs::gsi_write_then_query` whole rather than convert or delete it. See ADR
+  0061's "Rung F closed" amendment for the full account.
+
+  **What remains unowned after C-06**, per the D3-closing residual
+  inventory (`crates/animusd/CLAUDE.md`'s Tests section) with Transact and
+  PartiQL now removed from it: admin/console/dashboard HTTP, Streams
+  (closed in turn by C-07, 2026-09-08 — see that entry below), TTL, the
+  control/data role split, `--config` bring-up, index DDL beyond plain
+  `CreateTable`, node assembly/raw `ClientRequest`, and the throttle-metric
+  counters. None of the other seven groups has a rung against it today.
 - **ADR:** [0061](adr/0061-testability-node-crate-simulator.md) — the
   2026-09-07 "Rung F" amendment (see its 2026-09-08 "Rung F, PR 4"/"Rung F,
-  PR 5" addenda for PR 4/5's own accounts).
+  PR 5"/"Rung F, PR 6" addenda for PR 4/5/6's own accounts, and its "Rung F
+  closed" amendment for PR 7's own close-out).
 - **Size:** L (seven PRs, two real production functions' worth of
   `ProdEnv`-only surface to widen plus two new fault-injecting sim
   suites).
 - **Depends:** C-04 (closed 2026-09-07 — D4 PR 1's real per-node
   `Reconciler` and D3's `dispatch_item_op`/`dispatch_table_op` cores are
   both load-bearing prerequisites this rung builds directly on).
-- **Status (2026-09-08):** open — PRs 1-5 landed; PRs 6-7 remain open.
+- **Status (2026-09-08):** closed. All seven PRs landed; see the PR 7
+  close-out above for the full accounting.
+
+### C-07 Streams SimCluster dispatch
+
+- **Gap:** Streams is the residual the D3-closing inventory and the C-06
+  close-out both name as next in line — the largest remaining unowned
+  group after admin/console/dashboard HTTP. A read-only pass over this
+  tree finds four real-socket `crates/animusd/tests/*.rs` files touching
+  it: `dynamo_streams.rs` (15 tests), `stream_janitor.rs` (11 tests),
+  `console_stream.rs` (4 tests), and `stream_backfill_seed_filter.rs` (2
+  tests). The D3-closing inventory's own "Streams (3/28)" figure is three
+  of these four (`dynamo_streams.rs` + `stream_janitor.rs` +
+  `stream_backfill_seed_filter.rs` = 28); `console_stream.rs`'s 4 tests
+  are already filed under the separate admin/console/dashboard HTTP
+  group. `tests/streams_e2e.rs` (12 tests) is explicitly out of scope
+  throughout — frozen behind the open flake issue #298 (joined by #745
+  for this file), owned by whichever agent/issue closes those, never this
+  series.
+- **Plan:** the identical widen-to-`<E: Env, R: RelayClient>`-then-add-a-
+  parallel-generic-entry-point template D3/D4/C-06 already validated five
+  times, applied to `dynamo_streams.rs`'s eight read-path functions, the
+  stream-only `UpdateTable` sub-arm of `dispatch_table_op`, on-demand
+  shard sealing, and the segment janitor's tick/loop. The key reachability
+  finding: `dynamo.rs::execute_routed_as` forks on the `X-Amz-Target`
+  prefix *before* decoding into an `Operation` at all, so the generic
+  `execute_item_op_as`/`dispatch_item_op` core `SimCluster` already drives
+  can never reach a `DynamoDBStreams_20120810.*` target — a parallel
+  `dynamo_streams::execute_streams_op_as`/`SimClusterHandle::
+  dynamo_streams` pair is needed, mirroring the existing
+  `SimClusterHandle::dynamo`. See
+  [ADR 0061](adr/0061-testability-node-crate-simulator.md)'s 2026-09-08
+  "Rung G" amendment for the full account, including the precise
+  file/function blockers and the per-file scenario disposition (what
+  converts, what stays `ProdEnv` and why).
+- **PRs:** a six-PR series — (1) this docs opener; (2) groundwork (widen
+  `disable_stream`, a stream-only `UpdateTable` arm on
+  `dispatch_table_op`, `SegmentStoreHandle::S3` over a shared
+  `SimSegmentStore` in `SimCluster`, a new `SimCluster::
+  drive_stream_seal(node)`); (3) the Streams read API reachable (widen
+  `dynamo_streams.rs`'s eight functions, `execute_streams_op_as` +
+  `SimClusterHandle::dynamo_streams`, a new `sim_cluster_dynamo_
+  streams.rs` with ~8 scenarios); (4) `dynamo_streams.rs`'s 12
+  sim-convertible tests converted to `sim_cluster_dynamo_streams*.rs`
+  siblings, source trimmed to the two that stay `ProdEnv`; (5) the
+  segment janitor widened to `<E, R>` and spawned unconditionally under
+  `SimCluster` (the D4 PR 5 backup-janitor shape), covered by
+  `SimCluster`'s own `Drop`/`restart` shutdown path per issue #753, a new
+  `sim_cluster_stream_janitor.rs` with ~9 scenarios; (6) docs close-out.
+  Every production dispatch path (`execute_routed_as`, `execute_as`,
+  `run_operation`, `dynamo_streams::execute_as`) stays byte-identical
+  throughout — strictly additive, parallel new paths only, per the D2
+  PR 1 lesson (`docs/engineering-lessons.md`).
+- **Size:** M (six PRs, one real production dispatcher's worth of
+  `ProdEnv`-only surface to widen plus two new fault-injecting sim
+  suites).
+- **Depends:** C-04 (closed), C-06 (closed) — the D3/D4 generic dispatch
+  cores this rung builds directly on, plus C-06's own Transact widening,
+  which is what makes `dynamo_streams.rs`'s Transact-on-a-streamed-table
+  pair convertible at all.
+- **Status (2026-09-08):** closed. All six PRs landed (#758-#762, plus
+  PR 6). `dynamo_streams.rs` (15 tests: 12 converted, 3 kept `ProdEnv`)
+  and `stream_janitor.rs` (11 tests: 9 converted, 2 kept `ProdEnv`) are
+  both closed — the Streams read API, stream enable/disable, on-demand
+  shard sealing, and the segment janitor's two-phase retention sweep are
+  all `SimCluster`-reachable, 26 tests converted across two new modules
+  (`sim_cluster_dynamo_streams.rs`, `sim_cluster_stream_janitor.rs`).
+  `stream_backfill_seed_filter.rs` (2 tests, filed under the separate
+  "index DDL beyond plain `CreateTable`" residual) and `console_stream.rs`
+  (4 tests, filed under admin/console/dashboard HTTP) were never this
+  rung's to claim and stay `ProdEnv`, unaffected; `tests/streams_e2e.rs`
+  (12 tests) stayed untouched throughout, frozen behind #298/#745. Two
+  in-scope findings along the way, both scenario/fixture-local (not
+  product bugs beyond the first, and both already recorded in
+  `docs/engineering-lessons.md`): `index_drain::seal_now`'s commit-wait
+  poll read the real wall clock despite an already-`<E, R>`-generic
+  signature (fixed, `pitr_seal_now`'s identical twin left as a documented
+  open gap for a future rung); and a `SimCluster` op call's fixed 12s
+  `OP_BUDGET` advance can retire a short-retention row before an
+  immediately-after-the-call assertion runs (fixed scenario-locally by
+  widening retention past the budget). What remains unowned after C-07:
+  admin/console/dashboard HTTP (now owned by C-08, opened 2026-09-08 — see
+  that entry below), TTL, the control/data role split, `--config`
+  bring-up, index DDL beyond plain `CreateTable`, node assembly/raw
+  `ClientRequest`, and the throttle-metric counters — five groups, none
+  with a rung against it today. See ADR 0061's "Rung G closed" amendment
+  for the full account.
+
+---
+
+### C-08 admin/console/dashboard HTTP SimCluster dispatch
+
+- **Gap:** admin/console/dashboard HTTP is the residual every rung back
+  through the D3-closing inventory has named as "the largest remaining
+  unowned group" without claiming it — C-07's own close-out names it next
+  in line. A read-only pass over this tree finds ten real-socket
+  `crates/animusd/tests/*.rs` files touching it: `admin_endpoint.rs` (23
+  tests), `dashboard_endpoint.rs` (16), `console_endpoint.rs` (3),
+  `console_create_table.rs` (4), `console_items.rs` (4), `console_
+  stream.rs` (4), `console_table_config.rs` (9), `console_tables.rs` (1),
+  `metrics_endpoint.rs` (1), `system_table.rs` (2) — 67 tests total,
+  counts taken directly with `grep -c '#\[tokio::test' <file>`. This
+  matches the D3-closing residual inventory's own "admin/console/dashboard
+  HTTP (10/66)" figure to within one test — a pre-existing minor staleness
+  in that older count, not something this entry's own grep-verified
+  numbers propagate. `console_stream.rs`'s four tests are counted here,
+  not under Streams, per C-07's own opener. `control_membership_admin.rs`
+  (12 tests) is a genuine control-plane role-split bring-up and is filed
+  under the separate "control/data role split" residual, not this group.
+- **Plan:** the identical widen-to-`<E: Env, R: RelayClient>`-then-add-a-
+  parallel-generic-entry-point template D3/D4/C-06/C-07 already validated
+  six times, applied to `impl AdminHost for ClientCtx`'s ~30 handlers and
+  `impl ConsoleBackend for ClientCtx`'s 14 methods. The key finding: both
+  impls are already mostly pure signature widening — `ClientCtx<E, R>`'s
+  own field types (`ClusterEdgeState<E>`, `ControlHandle<E, R>`,
+  `SharedEngine<E>`) and most of the methods they call have been generic
+  since ADR 0061 rung C5, so `crates/animus-node/CLAUDE.md`'s "hardcoded
+  to `ProdEnv`" note describing an earlier rung is now stale (corrected by
+  this entry's own PR 1). The remaining gaps: three `tokio::time`
+  commit-wait loops in the credential handlers plus one in the seed
+  handler (convert to `ctx.env`); no generic sibling of `execute_routed_
+  as` exists yet, since `ConsoleBackend` calls the concrete `execute_
+  routed` (add `execute_routed_as_generic`); and `dispatch_table_op`'s
+  `UpdateTable` arm has no sub-arm for an index change (out of scope,
+  filed under "index DDL beyond plain `CreateTable`", the same call C-07
+  made for `stream_backfill_seed_filter.rs`). See
+  [ADR 0061](adr/0061-testability-node-crate-simulator.md)'s 2026-09-08
+  "Rung H" amendment for the full account, including the precise
+  file/line blockers and the per-PR gate lines.
+- **PRs:** an eight-PR series — (1) this docs opener; (2) groundwork
+  (widen `AdminHost`/`ConsoleBackend` impls, fix the four `tokio::time`
+  sites, add `execute_routed_as_generic`, add `SimCluster::admin`/
+  `console`); (3) console reachable + first siblings (`console_tables.rs`,
+  `console_create_table.rs`, `console_items.rs`, part of `console_
+  endpoint.rs`); (4) `console_stream.rs` + 6 of `console_table_config.
+  rs`'s 9 siblings; (5) admin dispatch pure observers (`sim_cluster_
+  admin.rs`, `system_table.rs`, `metrics_endpoint.rs`); (6) admin mutating
+  actions + the remaining 11 `admin_*` tests; (7) `dashboard_endpoint.rs`
+  + `console_endpoint.rs` close-out; (8) docs close-out. Every production
+  dispatch path (`admin::dispatch`, `console::route`, `execute_routed`,
+  `execute_routed_as`, `execute_as`) stays byte-identical throughout —
+  strictly additive, parallel new paths only, per the D2 PR 1 lesson
+  (`docs/engineering-lessons.md`).
+- **Size:** L (eight PRs, two production dispatch implementations' worth
+  of `ProdEnv`-only surface to widen plus new fault-injecting sim suites
+  across admin and console).
+- **Depends:** C-04 (closed), C-06 (closed), C-07 (closed) — the D3/D4
+  generic dispatch cores this rung builds directly on, plus rung C5's own
+  widening of `ClientCtx`'s field types, which is what makes this rung
+  mostly signature widening rather than new mechanism.
+- **Status (2026-09-08):** open — PR 1 (this docs opener) and PR 2
+  (groundwork) both landed, PR 2 corrected the same day in review; PRs
+  3–8 to follow. PR 2 widened both impls (43 `AdminHost` handlers, not
+  merely "~30"), fixed blockers (a)/(b)/(c), and found (via this rung's
+  own required untrimmed gate) that swapping `admin.rs::action_data_
+  dynamo`/`impl ConsoleBackend`'s dispatch target is a real production
+  regression for operations the generic dispatch doesn't cover yet, not
+  merely a `SimCluster`-only gap. Six of the nine failing tests were
+  closed correctly, by genuinely widening `UpdateTimeToLive`/
+  `CreateBackup`/`DeleteBackup`. The other two (blocker (d), the GSI
+  index-change gap) were first "fixed" by widening `impl AdminHost for
+  ClientCtx`/`impl ConsoleBackend for ClientCtx` **in place** — which
+  silently narrowed *every* production caller of those traits, not just
+  the two GSI routes, to whatever the generic dispatch core covers — and
+  a follow-on concrete-interception layer inside `console.rs::serve`/
+  `handle_conn` compounded the mistake by editing a file this rung's own
+  non-goals treat as off-limits. **Corrected in review**: the two impls
+  stay concrete and production-only; a `GenericAdminHost<E, R>`/
+  `GenericConsoleBackend<E, R>` newtype pair carries the generic dispatch
+  instead, constructed only by `SimCluster::admin`/`console`. See ADR
+  0061's "Rung H, PR 2 landed" amendment (now the corrected account) and
+  `docs/engineering-lessons.md`'s two matching 2026-09-08 entries (the
+  second rewritten to describe the newtype fix, not the interception
+  mistake) for the full account.
 
 ---
 
@@ -735,7 +959,9 @@ wave are independent and can run in parallel.
 | 4 | *landed 2026-09-05* (S-02) | Highest blast radius (C-01 landed 2026-09-05 — see ADR 0054; S-01 landed 2026-09-05 — see ADR 0064; S-02 — see ADR 0066) |
 | 5 | *S-04, S-05, S-07b–d, C-02, C-05 all landed 2026-09-06* | S-05 strictly after S-04 |
 | 6 | *S-03 complete 2026-09-07 (all 3 PRs, ADR 0069)*; *S-07e/S-07 complete 2026-09-07 (ADR 0070)*; *C-03 assessed 2026-09-07 — deferred, no PRs planned (see ADR 0044's matching amendment)*; W-07 | XL or gated on earlier waves |
-| 7 | C-06 (PRs 1-5 landed, PR 5 on 2026-09-08; issues #731 and #737 both fixed 2026-09-07; PRs 6-7 open) | Gated on C-04 (closed 2026-09-07) — the D4 `Reconciler` and D3 generic dispatch cores it builds on |
+| 7 | C-06 (closed 2026-09-08 — all seven PRs landed: #728, #729, #732, #748, #750, #756, plus this PR; issues #731 and #737 both fixed 2026-09-07) | Gated on C-04 (closed 2026-09-07) — the D4 `Reconciler` and D3 generic dispatch cores it builds on |
+| 8 | C-07 (closed 2026-09-08 — all six PRs landed: #758, #759, #760, #761, #762, plus PR 6) | Gated on C-04 (closed) and C-06 (closed) — the same generic dispatch cores, plus C-06's own Transact widening |
+| 9 | C-08 (open 2026-09-08 — PR 1, this docs opener, and PR 2, groundwork, both landed; PRs 3–8 to follow) | Gated on C-04 (closed), C-06 (closed), and C-07 (closed) — the same generic dispatch cores, plus rung C5's own widening of `ClientCtx`'s field types |
 
 Open issues mapped: none left (#375 closed by W-01, #319 by W-05). Filed
 from wave 2's own findings: #590 (the operator still emits the deleted

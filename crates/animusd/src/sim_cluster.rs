@@ -195,6 +195,33 @@ const OP_BUDGET: Duration = Duration::from_secs(12);
 /// still 2.5x more responsive than production's own fallback.
 const RECONCILER_FALLBACK: Duration = Duration::from_millis(200);
 
+/// Bounded retry budget for [`SimCluster::drive_stream_seal`]'s own
+/// `seal_now` exhaustion loop, mirroring `index_drain::
+/// SPLIT_DRIVER_SEAL_RETRIES` (private to that module, so not reused
+/// directly) — a losing `seal_now` call races a dueling seal for the same
+/// `(tablet, next_epoch)` slot (`index_drain::is_retryable_elsewhere`'s own
+/// doc) and is worth a bounded number of in-place retries rather than an
+/// unconditional loop with no wall-clock deadline to fall back on.
+const STREAM_SEAL_RETRIES: u32 = 5;
+
+/// [`SimCluster::new`]'s own default segment-janitor retention window (ADR
+/// 0061 rung G, C-07 PR 5) — generous enough that no scenario's own virtual-
+/// time budget crosses it by accident (every scenario's own `run_for`/`put`/
+/// `get`/`dynamo` calls together stay comfortably under an hour of virtual
+/// time), so a caller that never asks for a shorter one gets, in effect,
+/// "the janitor's retention phase never fires." A scenario that DOES want
+/// retention to actually elapse (this rung's own `sim_cluster_stream_
+/// janitor.rs` expiry/repair/metrics scenarios) calls [`SimCluster::
+/// new_with_segment_janitor_retention`] instead, mirroring `create_table`/
+/// `create_table_with_replication`'s own "default constructor + a sibling
+/// exposing one more knob" shape — not a live setter, since the loop's own
+/// `retention: Duration` parameter is captured by value at spawn time
+/// (identical to production's own `segment_janitor_loop` signature, which
+/// this rung's own widening deliberately left byte-identical), so changing
+/// it after the fact would mean spawning a second, concurrent loop rather
+/// than reconfiguring the first one.
+const DEFAULT_SIM_SEGMENT_JANITOR_RETENTION: Duration = Duration::from_secs(3600);
+
 /// Build a fresh per-node `Reconciler<SimEnv, MemoryEngine>` (ADR 0061 rung
 /// D4 PR 1) — mirrors `animusd`'s own production node assembly exactly
 /// (`BoundNode::start_with`'s `on_host`/`on_teardown` closures): a fresh
@@ -802,6 +829,129 @@ impl SimClusterHandle {
         .await
     }
 
+    /// Run a decoded DynamoDB **Streams** wire request
+    /// (`DynamoDBStreams_20120810.<Op>` + JSON body) against `node`'s own
+    /// `ClientCtx`, through the exact same
+    /// `dynamo_streams::execute_streams_op_as` production's TCP listener
+    /// calls (ADR 0061 rung G, C-07 PR 3) — [`SimClusterHandle::dynamo`]'s
+    /// Streams sibling, identical shape (an unrestricted [`crate::authz::
+    /// Principal`], self-bounded like every op method here). Covers all
+    /// four Streams operations — `ListStreams`/`DescribeStream`/
+    /// `GetShardIterator`/`GetRecords`, both the sealed and open-tail serve
+    /// paths — since `dynamo_streams::execute_streams_op_as` has no
+    /// `unsupported_by_generic_dispatch` gap the way the item API's
+    /// `dispatch_item_op` still does.
+    pub(crate) async fn dynamo_streams(
+        &self,
+        node: u64,
+        target: &str,
+        body: &[u8],
+    ) -> (u16, String) {
+        let ctx = self.ctx(node);
+        crate::dynamo_streams::execute_streams_op_as(
+            &ctx,
+            &crate::authz::Principal::unrestricted(),
+            target,
+            body,
+        )
+        .await
+    }
+
+    /// Run an admin HTTP-JSON request (`GET`/`POST`, `/admin/*`) against
+    /// `node`'s own `ClientCtx`, through the exact same `animus_node::
+    /// admin::dispatch` production's admin TCP listener calls (ADR 0061
+    /// rung H, C-08 PR 2 — the groundwork step, no scenario coverage of its
+    /// own yet, see `sim_cluster_admin.rs`/PR 5-6 for that) — never a
+    /// bespoke test-only reimplementation. `dispatch` never sees HTTP
+    /// framing (headers, keep-alive, the `Content-Length`/CORS-preflight
+    /// dance `admin.rs::handle_conn` does before ever reaching `dispatch`)
+    /// — only `(method, path, query, body)` — so this mirrors
+    /// [`SimClusterHandle::dynamo`]'s own shape exactly: no framing to
+    /// build, self-bounded by whichever `AdminHost` method the route maps
+    /// to (every one of which is itself already `CLIENT_TIMEOUT`-bounded
+    /// through the ordinary `ClientCtx` primitives it calls), so callable
+    /// directly inside an `env.spawn_task`-ed future with no wrapper
+    /// needed.
+    ///
+    /// **Goes through [`crate::admin::GenericAdminHost`], not `node`'s bare
+    /// `ClientCtx` directly** (ADR 0061 rung H, C-08 PR 2 rework): the
+    /// concrete `impl AdminHost for ClientCtx` is production's own impl,
+    /// whose `action_data_dynamo` reaches the full, unmodified
+    /// `crate::dynamo::execute_routed` — a `ClientCtx<SimEnv, ..>` can
+    /// never satisfy that concrete impl at all, so this fixture reaches
+    /// `AdminHost` only through the generic sibling, whose own
+    /// `action_data_dynamo` goes through `execute_routed_as_generic`
+    /// instead (whatever `dispatch_item_op` covers) — see that struct's own
+    /// doc, and `docs/engineering-lessons.md`'s matching 2026-09-08 entry,
+    /// for why the two must stay genuinely separate.
+    pub(crate) async fn admin(
+        &self,
+        node: u64,
+        method: &str,
+        path: &str,
+        query: &str,
+        body: &[u8],
+    ) -> (u16, String) {
+        let ctx = self.ctx(node);
+        let host = crate::admin::GenericAdminHost(ctx);
+        animus_node::admin::dispatch(&host, method, path, query, body).await
+    }
+
+    /// Run a console HTTP request (`/console/api/*`/`/console/ui/*`)
+    /// against `node`'s own `ClientCtx`, through the exact same
+    /// `animus_node::console::route` production's console TCP listener
+    /// calls (ADR 0061 rung H, C-08 PR 2). Builds a minimal
+    /// [`crate::http::HttpRequest`] itself (`target`/`headers`/
+    /// `keep_alive` are unused by `route`'s own JSON-API paths — this
+    /// fixture never exercises the shell/CORS-preflight machinery
+    /// `console.rs::handle_conn` layers in front of `route`, mirroring
+    /// [`SimClusterHandle::admin`]'s own "no framing to build" note
+    /// above) and passes `""` for the HTML/CSS/JS shell content `route`'s
+    /// static-asset arms would otherwise serve — this fixture has no
+    /// reason to duplicate `console.rs`'s own `include_str!`'d assets, and
+    /// every scenario this primitive backs exercises the JSON API, never
+    /// a shell/static-asset path. `tables` is built fresh on every call
+    /// from this node's own live `effective_metadata()` (via the same
+    /// `console_table_summaries` production's own `spawn_common_tail`
+    /// closure calls) — never a snapshot taken once at construction, per
+    /// this crate's own accessor-staleness discipline (C-06 PR 4
+    /// appendix's Finding A, `docs/engineering-lessons.md`).
+    ///
+    /// **Goes through [`crate::GenericConsoleBackend`], not `node`'s bare
+    /// `ClientCtx` directly** — the identical reasoning
+    /// [`SimClusterHandle::admin`] states for `GenericAdminHost` just
+    /// above: the concrete `impl ConsoleBackend for ClientCtx` is
+    /// production's own, unreachable for a `ClientCtx<SimEnv, ..>`, so
+    /// `add_gsi`/`drop_gsi` here return whatever the generic dispatch's own
+    /// blocker-(d) gap produces (an `UpdateTable` index change has no
+    /// `dispatch_table_op` sub-arm) — a real, documented residual, not a
+    /// bug — while every other mutation reaches the identical DynamoDB wire
+    /// operation production does.
+    pub(crate) async fn console(
+        &self,
+        node: u64,
+        method: &str,
+        path: &str,
+        query: &str,
+        body: &[u8],
+    ) -> (u16, &'static str, String) {
+        let ctx = self.ctx(node);
+        let request = crate::http::HttpRequest {
+            method: method.to_string(),
+            path: path.to_string(),
+            query: query.to_string(),
+            target: String::new(),
+            headers: BTreeMap::new(),
+            body: body.to_vec(),
+            keep_alive: false,
+        };
+        let table_ctx = ctx.clone();
+        let tables: crate::console::TableSnapshotFn =
+            Arc::new(move || crate::console_table_summaries(&table_ctx.effective_metadata()));
+        let backend = crate::GenericConsoleBackend(ctx);
+        animus_node::console::route(&request, &tables, &backend, "", "", "").await
+    }
+
     /// Stage a **fresh anchor** transaction writing `value` at `key` on
     /// `table`, retrying through a decided-but-still-unresolved blocker via
     /// `push_resolution_if_decided` exactly like production — issue #734's
@@ -980,6 +1130,77 @@ pub(crate) struct SimCluster {
     /// test a handle for direct assertions/seeding, mirroring `engines`'
     /// own "kept at the driver level for outside access" role above.
     backup_store: SimSegmentStore,
+    /// ADR 0061 rung G (C-07 PR 2): the ONE `SimSegmentStore` every node's
+    /// own `ClientCtx::segment_store` (`SegmentStoreHandle::S3`) wraps a
+    /// clone of — the identical D4 PR 5 trick `backup_store` above already
+    /// validated, applied to the DynamoDB Streams segment store instead of
+    /// the on-demand backup store (two independently configured stores in
+    /// production, ADR 0059 §1's own "deliberately parallel, not shared"
+    /// design — kept as two distinct `SimSegmentStore` instances here for
+    /// the same reason, not one shared object wearing two hats). Kept here
+    /// so [`SimCluster::segment_store`] can hand a test a handle for direct
+    /// assertions, mirroring `backup_store`'s own role.
+    segment_store: SimSegmentStore,
+    /// ADR 0061 rung G (C-07 PR 5): the retention window every node's own
+    /// `segment_janitor::segment_janitor_loop` was spawned with — see
+    /// [`DEFAULT_SIM_SEGMENT_JANITOR_RETENTION`]'s own doc for why this is
+    /// a constructor knob rather than a live setter. Stored so
+    /// [`SimCluster::restart`] can respawn a restarted node's own loop with
+    /// the SAME retention its `Simulator::stop` just dropped, mirroring how
+    /// it already respawns `heartbeat_loop`/the reconciler/the backup
+    /// janitor.
+    segment_janitor_retention: Duration,
+}
+
+/// Breaks the `Simulator`/`SimEnv` reference cycle (`animus_sim::Simulator::
+/// shutdown`'s own doc has the full mechanism) once a test is done with its
+/// `SimCluster`, so the simulated world this fixture built — every node's
+/// `ClientCtx`, every hosted CP group, the whole task queue behind every
+/// perpetual driver loop this module spawns (heartbeat, reconciler,
+/// auto-split, the backup janitor, …) — is actually freed instead of
+/// leaking for the rest of the test **process**' lifetime.
+///
+/// **This is the root cause of the animusd `sim_cluster_*` test tier's
+/// per-test RSS growth** (evidence: `cargo test -p animusd --lib` climbing
+/// linearly, ~10 MB/s once the `sim_cluster_*` modules start, no drop
+/// between tests): every one of `SimCluster::new`/`restart`'s own spawned
+/// loops (`animus_control::node::heartbeat_loop`, `spawn_reconciler_loop`,
+/// `auto_split_loop` when opted in, `backup_janitor_loop`, …) is a `loop {
+/// .. env.sleep(..).await .. }` that never resolves, and every one of them
+/// captures a `SimEnv` — so the previous state of affairs (a bare `let _ =
+/// SimCluster::new(..)` going out of scope at the end of each `#[test]` fn,
+/// with nothing draining the task queue) left every one of those tasks'
+/// own captured `Arc<Shared>` alive, keeping the *entire* simulated
+/// world reachable for as long as the test **process** ran — one whole
+/// leaked cluster per test, monotonically, matching the observed growth
+/// exactly. `Simulator` itself cannot fix this via its own `Drop` (it is
+/// deliberately `Clone` — several handles legitimately share one world, so
+/// no single clone's own drop can tell whether it's the "last" one); a
+/// `SimCluster`, by contrast, is not `Clone` and is the one type every
+/// `sim_cluster_*` test scenario already owns for its whole duration, so
+/// its own `Drop` is exactly the point every scenario already reaches
+/// automatically, success or `panic!` (unwind) alike, with zero change to
+/// any of the ~30 sibling `sim_cluster_*` modules that construct one.
+impl Drop for SimCluster {
+    fn drop(&mut self) {
+        // Break every node's own relay-handler self-cycle FIRST (see
+        // `SimRelayClient::shutdown`'s own doc): the closure installed by
+        // `serve()` captured a `ClientCtx` clone that itself holds another
+        // clone of the same relay, so — independent of the simulator's own
+        // task queue — nothing frees this on its own. `SimCluster::restart`
+        // already clears each OLD relay generation as it's superseded (see
+        // that method's own comment); this covers the FINAL generation for
+        // every node, grown ones included, since `self.shared`'s own `ctxs`
+        // vec is kept current by both `new`/`restart`/`grow`.
+        for ctx in self.shared.ctxs.lock().expect("ctxs poisoned").iter() {
+            ctx.relay.shutdown();
+        }
+        // Then drain the simulator's own still-pending tasks, breaking the
+        // SEPARATE Simulator/SimEnv task-queue cycle a perpetual background
+        // loop (heartbeat, the reconciler, auto-split, the backup janitor,
+        // …) forms — see `Simulator::shutdown`'s own doc in `animus-sim`.
+        self.sim.shutdown();
+    }
 }
 
 impl SimCluster {
@@ -996,7 +1217,34 @@ impl SimCluster {
     /// returning, so a caller's very first [`SimCluster::create_table`]
     /// call finds a leader immediately rather than needing its own
     /// warm-up wait.
+    ///
+    /// Uses [`DEFAULT_SIM_SEGMENT_JANITOR_RETENTION`] for every node's own
+    /// segment-janitor loop (ADR 0061 rung G, C-07 PR 5) — a scenario that
+    /// needs retention to actually elapse within its own virtual-time
+    /// budget calls [`SimCluster::new_with_segment_janitor_retention`]
+    /// instead.
     pub(crate) fn new(seed: u64, nodes: usize, replication: usize) -> Self {
+        Self::new_with_segment_janitor_retention(
+            seed,
+            nodes,
+            replication,
+            DEFAULT_SIM_SEGMENT_JANITOR_RETENTION,
+        )
+    }
+
+    /// [`SimCluster::new`]'s own sibling exposing one more knob — this
+    /// cluster's own segment-janitor retention window (ADR 0061 rung G,
+    /// C-07 PR 5), mirroring [`SimCluster::create_table`]/[`SimCluster::
+    /// create_table_with_replication`]'s own "default constructor + a
+    /// sibling with one extra parameter" shape. See
+    /// [`DEFAULT_SIM_SEGMENT_JANITOR_RETENTION`]'s own doc for why this is
+    /// a constructor knob rather than a live setter.
+    pub(crate) fn new_with_segment_janitor_retention(
+        seed: u64,
+        nodes: usize,
+        replication: usize,
+        segment_janitor_retention: Duration,
+    ) -> Self {
         assert!(nodes >= 1, "a cluster needs at least one node");
         assert!(
             (1..=nodes).contains(&replication),
@@ -1070,6 +1318,12 @@ impl SimCluster {
         // sees every other node's own writes, exactly like a real S3
         // bucket would.
         let backup_store = SimSegmentStore::new(sim.env(ids[0].clone()));
+        // ADR 0061 rung G (C-07 PR 2): a SECOND, independent shared
+        // `SimSegmentStore` for the DynamoDB Streams segment store — see
+        // `SimCluster::segment_store`'s own field doc for why this is a
+        // distinct object from `backup_store` above, not a second wrapper
+        // around the same one.
+        let segment_store = SimSegmentStore::new(sim.env(ids[0].clone()));
 
         let mut ctxs: Vec<SimNodeCtx> = Vec::with_capacity(nodes);
         for (i, id) in ids.iter().enumerate() {
@@ -1120,20 +1374,23 @@ impl SimCluster {
                     change_rates: ChangeRateTracker::default(),
                     request_rates: RequestRateTracker::default(),
                 }),
-                // `cp_kind_write_raw`/`cp_get`/`cp_scan` never read this
-                // one — see the module doc's own "still `ProdEnv`-only"
-                // bullet, and `simenv_client_ctx_tests::single_node_ctx`'s
-                // own doc for why the `Fs` placeholder needs no real
-                // filesystem or `ProdEnv` to satisfy the field.
-                segment_store: SegmentStoreHandle::Fs(FsSegmentStore::new(format!(
-                    "unused-segment-store-{i}"
-                ))),
+                // ADR 0061 rung G (C-07 PR 2): every node's own handle
+                // wraps the SAME shared `segment_store` built above — the
+                // identical D4 PR 5 trick `backup_store` immediately below
+                // already validated (`SimSegmentStore::clone` is cheap,
+                // `Arc<Mutex<..>>`-backed, so every node's own
+                // `list_local`/`put`/`get` sees every other node's writes,
+                // exactly like a real S3 bucket would). `cp_kind_write_raw`/
+                // `cp_get`/`cp_scan` still never read this field — only
+                // `index_drain::seal_now` (via `SimCluster::
+                // drive_stream_seal`) and, once PR 5 lands, the stream
+                // segment janitor do.
+                segment_store: SegmentStoreHandle::S3(Arc::new(segment_store.clone())),
                 // ADR 0061 rung D4 PR 5: every node's own handle wraps the
                 // SAME shared `backup_store` built above — see that
                 // binding's own comment for why `S3` (a genuinely shared
-                // object store) is the right variant here, unlike
-                // `segment_store`'s still-placeholder `Fs` above (nothing
-                // this fixture drives reads it).
+                // object store) is the right variant here, matching
+                // `segment_store`'s own `S3` shape immediately above.
                 backup_store: BackupStoreHandle::S3(Arc::new(backup_store.clone())),
                 export_store_factory: Arc::new(Mutex::new(default_export_store_factory(None))),
                 backup_janitor_progress: Arc::new(Mutex::new(
@@ -1226,6 +1483,21 @@ impl SimCluster {
             env.spawn_task(backup_janitor::backup_janitor_loop(ctx.clone()));
         }
 
+        // ADR 0061 rung G (C-07 PR 5): one `segment_janitor::
+        // segment_janitor_loop` per node, unconditionally — mirrors the
+        // backup janitor's own always-on spawn immediately above exactly:
+        // this loop's own leader gate (`ctx.edge.leader_handle()` answering
+        // `None`) already makes a non-leader's own tick a cheap idle sleep,
+        // so there is no reason to gate spawning it behind an opt-in the
+        // way `auto_split_loop` is.
+        for ctx in &ctxs {
+            let env = ctx.env.clone();
+            env.spawn_task(segment_janitor::segment_janitor_loop(
+                ctx.clone(),
+                segment_janitor_retention,
+            ));
+        }
+
         let mut cluster = SimCluster {
             sim,
             nodes,
@@ -1236,6 +1508,8 @@ impl SimCluster {
             crashed: BTreeSet::new(),
             auto_split: None,
             backup_store,
+            segment_store,
+            segment_janitor_retention,
         };
         // Let the control group elect before any caller touches it —
         // generous for up to a handful of voters under `SimEnv`'s
@@ -1592,6 +1866,18 @@ impl SimCluster {
         self.backup_store.clone()
     }
 
+    /// ADR 0061 rung G (C-07 PR 2): the ONE shared `SimSegmentStore` every
+    /// node's own `ClientCtx::segment_store` wraps a clone of — mirrors
+    /// [`SimCluster::backup_store`] exactly, for the DynamoDB Streams
+    /// segment store instead of the on-demand backup store. A cheap
+    /// `Clone` (`Arc<Mutex<..>>`-backed), so a caller can inspect it
+    /// directly (`SimSegmentStore::stored_ids`/`get`) to confirm a sealed
+    /// shard's own segment object actually landed, without going through
+    /// any one node's own `ClientCtx`.
+    pub(crate) fn segment_store(&self) -> SimSegmentStore {
+        self.segment_store.clone()
+    }
+
     /// Durably `put` a backup object directly into this cluster's shared
     /// `SimSegmentStore` (ADR 0061 rung D4 PR 5) — the corpus's own way to
     /// place a real manifest/data object under a backup id before proposing
@@ -1626,6 +1912,24 @@ impl SimCluster {
             .backup_janitor_progress
             .lock()
             .expect("backup janitor progress poisoned")
+            .clone()
+    }
+
+    /// `node`'s own live `segment_janitor::SegmentJanitorProgress` snapshot
+    /// (ADR 0061 rung G, C-07 PR 5) — mirrors [`SimCluster::backup_janitor_
+    /// progress`] exactly (the identical `GET /admin/gc` read in
+    /// production, a plain synchronous lock/clone/drop — never held across
+    /// an `.await`, `segment_janitor.rs`'s own `update_segment_janitor_
+    /// progress`).
+    pub(crate) fn segment_janitor_progress(
+        &self,
+        node: u64,
+    ) -> segment_janitor::SegmentJanitorProgress {
+        self.shared
+            .ctx(node)
+            .segment_janitor_progress
+            .lock()
+            .expect("segment janitor progress poisoned")
             .clone()
     }
 
@@ -2045,6 +2349,91 @@ impl SimCluster {
         })
     }
 
+    /// Run a decoded DynamoDB **Streams** wire request against `node`'s own
+    /// `ClientCtx` (ADR 0061 rung G, C-07 PR 3) — [`SimClusterHandle::
+    /// dynamo_streams`]'s synchronous sibling, driven from a test's own
+    /// `&mut self` call exactly like [`SimCluster::dynamo`] above (never
+    /// panics on a timeout; returns a synthetic `500`/timeout-message body
+    /// instead).
+    pub(crate) fn dynamo_streams(&mut self, node: u64, target: &str, body: &[u8]) -> (u16, String) {
+        let handle = self.shared.clone();
+        let (target, body) = (target.to_owned(), body.to_vec());
+        self.spawn_and_capture(node, async move {
+            handle.dynamo_streams(node, &target, &body).await
+        })
+        .unwrap_or_else(|| {
+            (
+                500,
+                format!(
+                    "dynamo_streams request on node {node} did not complete within {OP_BUDGET:?}"
+                ),
+            )
+        })
+    }
+
+    /// Run an admin HTTP-JSON request against `node`'s own `ClientCtx` (ADR
+    /// 0061 rung H, C-08 PR 2) — [`SimClusterHandle::admin`]'s synchronous
+    /// sibling, driven from a test's own `&mut self` call exactly like
+    /// [`SimCluster::dynamo`] above (never panics on a timeout; returns a
+    /// synthetic `500`/timeout-message body instead).
+    pub(crate) fn admin(
+        &mut self,
+        node: u64,
+        method: &str,
+        path: &str,
+        query: &str,
+        body: &[u8],
+    ) -> (u16, String) {
+        let handle = self.shared.clone();
+        let (method, path, query, body) = (
+            method.to_owned(),
+            path.to_owned(),
+            query.to_owned(),
+            body.to_vec(),
+        );
+        self.spawn_and_capture(node, async move {
+            handle.admin(node, &method, &path, &query, &body).await
+        })
+        .unwrap_or_else(|| {
+            (
+                500,
+                format!("admin request on node {node} did not complete within {OP_BUDGET:?}"),
+            )
+        })
+    }
+
+    /// Run a console HTTP request against `node`'s own `ClientCtx` (ADR
+    /// 0061 rung H, C-08 PR 2) — [`SimClusterHandle::console`]'s
+    /// synchronous sibling, driven from a test's own `&mut self` call
+    /// exactly like [`SimCluster::admin`] above (never panics on a
+    /// timeout; returns a synthetic `500`/timeout-message body instead).
+    pub(crate) fn console(
+        &mut self,
+        node: u64,
+        method: &str,
+        path: &str,
+        query: &str,
+        body: &[u8],
+    ) -> (u16, &'static str, String) {
+        let handle = self.shared.clone();
+        let (method, path, query, body) = (
+            method.to_owned(),
+            path.to_owned(),
+            query.to_owned(),
+            body.to_vec(),
+        );
+        self.spawn_and_capture(node, async move {
+            handle.console(node, &method, &path, &query, &body).await
+        })
+        .unwrap_or_else(|| {
+            (
+                500,
+                "application/json",
+                format!("console request on node {node} did not complete within {OP_BUDGET:?}"),
+            )
+        })
+    }
+
     /// [`SimClusterHandle::txn_prepare_pushing`], driven from a test's own
     /// `&mut self` call exactly like [`SimCluster::put`] above.
     pub(crate) fn txn_prepare_pushing(
@@ -2323,6 +2712,81 @@ impl SimCluster {
         }
     }
 
+    /// Drive on-demand shard sealing for every led, streamed tablet
+    /// [`node`] hosts (ADR 0061 rung G, C-07 PR 2) — a test-only stand-in
+    /// for `index_drain::change_consumer_loop`'s stream-seal arm
+    /// (`seal_tick`), which this fixture never spawns at all (see the
+    /// module doc's own "hand-hosted, not reconciler-hosted" bullet and
+    /// [`SimCluster::drain_gsi`]'s own doc for the identical reasoning).
+    ///
+    /// Rather than replicating `seal_tick`'s own size/age trigger check
+    /// (`ctx.data().stream_seal_knobs` — populated on every node's
+    /// `DataRole` here since ADR 0061 rung D2 PR 1, so there is nothing to
+    /// plumb, only nothing this method's own unconditional call needs to
+    /// consult), this method calls the trigger-free
+    /// [`index_drain::seal_now`] directly and unconditionally, looped to
+    /// exhaustion — mirroring `index_drain::inplace_split_driver_tick`'s
+    /// own streams final-seal loop exactly, including its bounded retry on
+    /// a losing dueling-seal race (`index_drain::is_retryable_elsewhere`,
+    /// `"; retry"`-suffixed transient errors only — any other error is a
+    /// genuine failure and panics, matching [`SimCluster::drain_gsi`]'s own
+    /// panic-on-genuine-failure contract).
+    ///
+    /// - **Leader check**: only a tablet `node` both hosts and currently
+    ///   leads is sealed (`group.is_leader()`), mirroring `seal_tick`'s/
+    ///   `inplace_split_driver_tick`'s own guard and [`SimCluster::
+    ///   drain_gsi`]'s identical precedent.
+    /// - **`is_quiesced()`/`Building`-child guards are NOT replicated
+    ///   here — they are unreachable under this fixture**, the identical
+    ///   reasoning [`SimCluster::drain_gsi`]'s own doc gives: `SimCluster`
+    ///   never calls `RaftKvNode::enable_quiescence` (every group this
+    ///   fixture hosts answers `is_quiesced() == false` permanently) and
+    ///   never splits a hand/wire-created table's own tablet into a
+    ///   `Building` child through this driver's own on-demand path. A
+    ///   future rung that gives `SimCluster` real quiescence or splitting
+    ///   would need to add both guards back here too.
+    ///
+    /// Loops `seal_now` per matching tablet until it returns `Ok(None)`
+    /// (nothing left pending to seal), driving the simulator up to
+    /// [`OP_BUDGET`] so every resulting `SealStreamShard` propose actually
+    /// commits before this call returns — [`SimCluster::spawn_and_capture`]'s
+    /// own bounded-wait shape, not a fixed sleep.
+    pub(crate) fn drive_stream_seal(&mut self, node: u64) {
+        let handle = self.shared.clone();
+        let outcome: Option<Result<(), String>> = self.spawn_and_capture(node, async move {
+            let ctx = handle.ctx(node);
+            let meta = ctx.effective_metadata();
+            for (tablet, group) in ctx.edge.hosted_groups() {
+                if !group.is_leader() {
+                    continue;
+                }
+                let Some(table) = meta.tablets.get(&tablet).and_then(|t| t.table.as_deref()) else {
+                    continue;
+                };
+                if meta.table_stream(table).is_none() {
+                    continue;
+                }
+                let mut retries_left = STREAM_SEAL_RETRIES;
+                loop {
+                    match index_drain::seal_now(&ctx, table, tablet, &group).await {
+                        Ok(Some(_)) => {}  // sealed a segment; more may remain
+                        Ok(None) => break, // nothing left pending; done
+                        Err(e) if retries_left > 0 && index_drain::is_retryable_elsewhere(&e) => {
+                            retries_left -= 1; // dueling seal; retry
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+            Ok(())
+        });
+        match outcome {
+            Some(Ok(())) => {}
+            Some(Err(e)) => panic!("drive_stream_seal(node={node}) failed: {e}"),
+            None => panic!("drive_stream_seal(node={node}) did not complete within {OP_BUDGET:?}"),
+        }
+    }
+
     /// ADR 0061 rung D4 PR 2: drive one pass of `index_drain::
     /// inplace_split_driver_tick` — the propose of `MetaCommand::
     /// CutoverSplit` — for every currently-`Splitting` tablet `node`
@@ -2367,6 +2831,46 @@ impl SimCluster {
             Some(Err(e)) => panic!("drive_inplace_split_cutover(node={node}) failed: {e}"),
             None => panic!(
                 "drive_inplace_split_cutover(node={node}) did not complete within {OP_BUDGET:?}"
+            ),
+        }
+    }
+
+    /// `POST /admin/stream/grow`'s own primitive (`ClientCtx::grow_stream`,
+    /// ADR 0042 §14's growth PR3 manual trigger), issued from `node`'s own
+    /// `ClientCtx` (ADR 0061 rung G, C-07 PR 5) — this fixture has no admin
+    /// HTTP surface to reach the real route through, so this is a direct
+    /// driver call, mirroring [`SimCluster::drain_gsi`]/[`SimCluster::
+    /// drive_stream_seal`]'s own "call the production `ClientCtx` method
+    /// directly, drive the simulator, return the result" shape. Splits
+    /// EVERY tablet of `table` at its own byte-weighted median (never a
+    /// `Splitting`/`Building` mid-split one, which classifies as a skip, not
+    /// a failure) — kickoff only; the fork/cutover itself still needs
+    /// [`SimCluster::drive_inplace_split_cutover`] polled afterward, exactly
+    /// like every other split this fixture drives (see `sim_cluster_auto_
+    /// split.rs`'s own `poll_split_converged` for the shape). Used by
+    /// `sim_cluster_stream_janitor.rs`'s own retired-tablet scenarios —
+    /// every other `sim_cluster_*` module reaches a split via the
+    /// byte/rate auto-split triggers instead ([`SimCluster::
+    /// set_auto_split_thresholds`]'s own opt-in loop), which a Streams
+    /// disable/retention scenario has no reason to arm; a stream-triggered
+    /// split needs `grow_stream`'s own byte-weighted-median kickoff
+    /// specifically. Panics on a genuine driver error or a timeout, exactly
+    /// like `drain_gsi`/`drive_stream_seal` — a caller wanting a per-tablet
+    /// skip/error inspects the returned `Vec` itself.
+    pub(crate) fn grow_stream(
+        &mut self,
+        node: u64,
+        table: &str,
+    ) -> Vec<(TabletId, ClientResponse)> {
+        let ctx = self.shared.ctx(node);
+        let table_owned = table.to_owned();
+        let outcome: Option<Result<Vec<(TabletId, ClientResponse)>, String>> =
+            self.spawn_and_capture(node, async move { ctx.grow_stream(&table_owned).await });
+        match outcome {
+            Some(Ok(results)) => results,
+            Some(Err(e)) => panic!("grow_stream(node={node}, table={table}) failed: {e}"),
+            None => panic!(
+                "grow_stream(node={node}, table={table}) did not complete within {OP_BUDGET:?}"
             ),
         }
     }
@@ -2429,6 +2933,24 @@ impl SimCluster {
         ));
 
         let mut ctx = self.shared.ctx(node);
+        // Break the OLD relay's own installed-handler self-cycle (see
+        // `SimRelayClient::shutdown`'s own doc for the mechanism) before
+        // superseding it below — the closure `SimCluster::new`/a prior
+        // `restart` installed on it captured a clone of the ClientCtx this
+        // node had *then*, which itself held a clone of this same relay,
+        // so nothing outside an explicit clear ever frees that generation:
+        // `ctx.relay = fresh_relay.clone()` only drops this ONE reference
+        // to it (the field on the ctx local to this call), never the
+        // closure's own captured one sitting inside the relay's own
+        // handler slot. Without this, every restart in a scenario leaks
+        // one more whole node-generation's worth of state (edge/backup/
+        // segment handles, the control handle at that point, …) — found
+        // investigating the animusd `sim_cluster_*` tier's per-test RSS
+        // growth persisting after `Simulator::shutdown` alone (that fix
+        // breaks the *separate* Simulator-task-queue cycle a perpetual
+        // background loop forms, not this one) — see `docs/engineering-
+        // lessons.md`'s matching entry.
+        ctx.relay.shutdown();
         ctx.control = GenericControlHandle::Local(fresh_control.clone());
         ctx.relay = fresh_relay.clone();
 
@@ -2506,6 +3028,20 @@ impl SimCluster {
         // underlying `SimSegmentStore` every other node writes to.
         let janitor_env = ctx.env.clone();
         janitor_env.spawn_task(backup_janitor::backup_janitor_loop(ctx.clone()));
+
+        // ADR 0061 rung G (C-07 PR 5): `Simulator::stop` above also dropped
+        // this node's own `segment_janitor_loop` task — respawn it
+        // unconditionally with the SAME retention this cluster was built
+        // (or last had its retention set) with, mirroring the backup
+        // janitor's own respawn immediately above exactly. `ctx.
+        // segment_store` is untouched by this restart (never reassigned
+        // above), so the respawned loop still shares the SAME underlying
+        // `SimSegmentStore` every other node writes to.
+        let segment_janitor_env = ctx.env.clone();
+        segment_janitor_env.spawn_task(segment_janitor::segment_janitor_loop(
+            ctx.clone(),
+            self.segment_janitor_retention,
+        ));
 
         let ctx_for_server = ctx.clone();
         fresh_relay.serve(move |req| {
@@ -3199,6 +3735,171 @@ mod tests {
                 Duration::from_secs(5),
             );
         }
+    }
+
+    /// Regression for the reference-cycle leak `Drop for SimCluster`/
+    /// `SimCluster::restart` exist to break — proved with `Weak` handles,
+    /// never RSS (root `CLAUDE.md`'s own rule: an RSS assertion is flaky,
+    /// and "memory didn't shrink" doesn't by itself distinguish a true
+    /// leak from ordinary allocator retention).
+    ///
+    /// **The mechanism this catches**: `SimRelayClient::serve`'s installed
+    /// handler closure (installed in `SimCluster::new`/`restart`/`grow`)
+    /// captures a `ClientCtx` clone that itself holds another clone of the
+    /// very `SimRelayClient` it's installed on (`ctx.relay`) — a self-cycle
+    /// entirely internal to that one `Arc`-backed handler slot, no help
+    /// from the simulator's own task queue needed at all. It is a
+    /// *separate* cycle from the `Simulator`/`SimEnv` task-queue one
+    /// `animus_sim::Simulator::shutdown` breaks (found and fixed first,
+    /// same investigation): fixing only that one left this fixture's
+    /// per-test RSS growth completely unchanged, because every node's own
+    /// `ClientCtx` — and everything it reaches (`edge`'s `control`/
+    /// `raftkv` registries, `backup_store`, …) — stayed reachable through
+    /// this second cycle regardless. See `SimRelayClient::shutdown`'s own
+    /// doc (`animus-node`) for the full mechanism and `docs/engineering-
+    /// lessons.md`'s matching entry for the incident.
+    ///
+    /// Two things are proved here, not just the final state: (1) a
+    /// `restart` breaks the OLD relay generation's cycle immediately, not
+    /// only at the cluster's own eventual `Drop` — checked right after
+    /// restarting node 0, before the cluster itself ever drops; (2) `Drop
+    /// for SimCluster` frees every node's *current* generation — checked
+    /// after dropping the whole cluster, for the relay handler slot and
+    /// both of `ClusterEdgeState`'s own `Arc`-backed registries.
+    #[test]
+    fn dropping_the_cluster_frees_every_nodes_relay_and_edge_state() {
+        let seed = 0xC1EA_5E17u64;
+        let mut cluster = SimCluster::new(seed, 2, 2);
+        cluster.create_table("orders");
+        let tablet = cluster.tablet_of("orders").expect("just created");
+        let leader = cluster
+            .leader_index_of(tablet)
+            .expect("the fresh group elected a leader");
+        cluster
+            .put(leader, "orders", "cust-1", "order-1", b"v")
+            .expect("write succeeds");
+
+        // (1) A restart's own OLD-generation cycle break, checked
+        // immediately — not deferred to the cluster's eventual `Drop`.
+        let old_relay_weak = cluster.shared.ctx(0).relay.downgrade_handler();
+        assert!(
+            old_relay_weak.is_alive(),
+            "sanity: node 0's pre-restart relay handler must still be alive"
+        );
+        cluster.restart(0);
+        assert!(
+            !old_relay_weak.is_alive(),
+            "node 0's PRE-restart relay handler slot is still alive right after \
+             `SimCluster::restart` — the old generation's cycle was not broken at \
+             restart time (see `SimCluster::restart`'s own `ctx.relay.shutdown()` call)"
+        );
+
+        cluster.poll_until_get_eq(
+            leader,
+            "orders",
+            "cust-1",
+            "order-1",
+            true,
+            Some(b"v".to_vec()),
+            Duration::from_secs(5),
+        );
+
+        // (2) `Drop for SimCluster` frees every node's own CURRENT
+        // generation. `Weak` handles taken while the cluster is still
+        // fully alive, checked only after it drops.
+        let mut relay_weaks = Vec::new();
+        let mut control_weaks = Vec::new();
+        let mut raftkv_weaks = Vec::new();
+        for node in 0..cluster.node_count() as u64 {
+            let ctx = cluster.shared.ctx(node);
+            assert!(
+                ctx.relay.downgrade_handler().is_alive(),
+                "sanity: node {node}'s relay handler must still be alive before drop"
+            );
+            relay_weaks.push(ctx.relay.downgrade_handler());
+            control_weaks.push(ctx.edge.downgrade_control());
+            raftkv_weaks.push(ctx.edge.downgrade_raftkv());
+        }
+
+        drop(cluster);
+
+        for (node, w) in relay_weaks.iter().enumerate() {
+            assert!(
+                !w.is_alive(),
+                "node {node}'s relay handler slot is still alive after the cluster \
+                 dropped — the SimRelayClient handler-closure cycle is not fully broken"
+            );
+        }
+        for (node, w) in control_weaks.iter().enumerate() {
+            assert!(
+                w.strong_count() == 0,
+                "node {node}'s edge.control registry is still alive after the cluster \
+                 dropped"
+            );
+        }
+        for (node, w) in raftkv_weaks.iter().enumerate() {
+            assert!(
+                w.strong_count() == 0,
+                "node {node}'s edge.raftkv registry is still alive after the cluster \
+                 dropped"
+            );
+        }
+    }
+
+    /// ADR 0061 rung H (C-08 PR 2) groundwork smoke: `SimCluster::admin`
+    /// actually reaches `animus_node::admin::dispatch` against a real
+    /// `SimCluster` node and reports live replicated state — the bigger
+    /// admin scenario files (pure observers, mutating actions) are PRs
+    /// 5-6's own scope, per this rung's plan; this is only proof the new
+    /// primitive itself works end to end.
+    #[test]
+    fn admin_status_is_reachable_from_sim_cluster() {
+        let mut cluster = SimCluster::new(0x4841_0001, 3, 3);
+        cluster.create_table("orders");
+
+        let (status, body) = cluster.admin(0, "GET", "/admin/status", "", &[]);
+        assert_eq!(status, 200, "body: {body}");
+        let value: serde_json::Value =
+            serde_json::from_str(&body).unwrap_or_else(|e| panic!("malformed JSON: {e}\n{body}"));
+        assert!(
+            value["schemas"]["tables"].get("orders").is_some(),
+            "/admin/status must report the table this scenario just created: {value}"
+        );
+
+        // `/admin/live` is the unconditional-200 liveness probe (issue
+        // #710) — a second, even-cheaper reachability proof from a
+        // different node.
+        let (status, body) = cluster.admin(1, "GET", "/admin/live", "", &[]);
+        assert_eq!(status, 200, "body: {body}");
+    }
+
+    /// ADR 0061 rung H (C-08 PR 2) groundwork smoke: `SimCluster::console`
+    /// actually reaches `animus_node::console::route` against a real
+    /// `SimCluster` node and its own `TableSnapshotFn`/`ConsoleBackend`
+    /// closures built off live replicated state — the bigger console
+    /// scenario file (`sim_cluster_console.rs`) is PR 3's own scope; this
+    /// is only proof the new primitive itself works end to end.
+    #[test]
+    fn console_tables_lists_a_created_table() {
+        let mut cluster = SimCluster::new(0x434F_0001, 3, 3);
+        cluster.create_table("orders");
+
+        let (status, content_type, body) =
+            cluster.console(0, "GET", "/console/api/tables", "", &[]);
+        assert_eq!(status, 200, "body: {body}");
+        assert_eq!(content_type, "application/json");
+        let value: serde_json::Value =
+            serde_json::from_str(&body).unwrap_or_else(|e| panic!("malformed JSON: {e}\n{body}"));
+        let names: Vec<&str> = value["tables"]
+            .as_array()
+            .unwrap_or_else(|| panic!("`tables` must be an array: {value}"))
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        assert!(
+            names.contains(&"orders"),
+            "the console tables list must include the table this scenario just created: {value}"
+        );
     }
 
     impl SimCluster {

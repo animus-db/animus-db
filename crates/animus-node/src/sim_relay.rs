@@ -125,7 +125,7 @@
 
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use animus_env::{BoxFuture, Env, EnvExt, NodeId};
@@ -334,6 +334,66 @@ impl<E: Env> SimRelayClient<E> {
     {
         let boxed: Arc<Handler> = Arc::new(move |req| Box::pin(handler(req)));
         *self.handler.lock().expect("sim relay handler poisoned") = Some(boxed);
+    }
+
+    /// Clear the installed handler, dropping whatever it captured.
+    ///
+    /// **Why this exists at all**: [`serve`](Self::serve)'s own doc names
+    /// its handler as "typically a cloned `ClientCtx<E, R>`" — and in every
+    /// real caller (`animusd`'s `forwarding::handle_relayed_request`
+    /// closure), that `ClientCtx` itself owns a clone of *this very*
+    /// `SimRelayClient` (its own `relay` field). Since `SimRelayClient` is
+    /// `Clone`-over-`Arc`, that clone shares the identical `handler: Arc<
+    /// Mutex<Option<Arc<Handler>>>>` the closure is installed into — so the
+    /// installed closure holds a strong reference back to the very `Arc`
+    /// storing it, a self-cycle no ordinary drop can ever unwind: the
+    /// `Arc`'s strong count can never reach zero while the closure sitting
+    /// *inside* it is itself one of the counted references. Every external
+    /// handle (every `ClientCtx::relay` clone, every task that held one)
+    /// can drop and the closure — and everything it captured, transitively
+    /// a whole node's `ClientCtx` graph — still never frees.
+    ///
+    /// Call this once a `serve`-installed handler is no longer needed (a
+    /// test fixture's own teardown, or immediately before installing a
+    /// *replacement* handler on the same client — see
+    /// [`downgrade_handler`](Self::downgrade_handler)'s doc for how to
+    /// prove this in a test). Idempotent: clearing an already-empty (or
+    /// already-cleared) handler is a no-op. After this call an inbound
+    /// request answers with [`no_handler_installed`]'s fixed refusal
+    /// exactly as it would have before [`serve`](Self::serve) was ever
+    /// called — this is a genuinely terminal call for this client's own
+    /// serving role, not a pause (the receive loop itself, spawned by
+    /// [`new`](Self::new), keeps running; only what it dispatches to
+    /// changes).
+    pub fn shutdown(&self) {
+        *self.handler.lock().expect("sim relay handler poisoned") = None;
+    }
+
+    /// A weak handle onto this client's own installed-handler slot, for
+    /// proving (in a test) whether [`shutdown`](Self::shutdown) — or
+    /// dropping every external handle onto this `SimRelayClient` — actually
+    /// freed the installed handler and everything it captured. See
+    /// [`shutdown`](Self::shutdown)'s own doc for the reference-cycle
+    /// mechanism this exists to let a caller observe from outside; holding
+    /// a [`WeakHandlerSlot`] never keeps anything alive by itself.
+    #[must_use]
+    pub fn downgrade_handler(&self) -> WeakHandlerSlot {
+        WeakHandlerSlot(Arc::downgrade(&self.handler))
+    }
+}
+
+/// See [`SimRelayClient::downgrade_handler`].
+#[derive(Clone)]
+pub struct WeakHandlerSlot(Weak<Mutex<Option<Arc<Handler>>>>);
+
+impl WeakHandlerSlot {
+    /// Whether the handler slot this was downgraded from is still alive
+    /// (reachable through at least one strong reference somewhere — most
+    /// often the installed handler closure holding itself alive, see
+    /// [`SimRelayClient::shutdown`]'s doc).
+    #[must_use]
+    pub fn is_alive(&self) -> bool {
+        self.0.strong_count() > 0
     }
 }
 

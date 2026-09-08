@@ -22775,3 +22775,540 @@ not retroactively harden a structurally identical assertion in a test
 that simply hadn't drawn the short straw yet. "The mechanism was already
 fixed for this file" is not evidence a specific assertion in that file was
 covered by the fix; check the assertion itself.
+
+## An executor whose own task queue lives inside the state its tasks hold an `Arc` back to is a reference cycle no external `Drop` can ever observe — and it was the real cause of the `sim_cluster_*` tier's per-test RSS growth, not glibc allocator retention (2026-09-08)
+
+**Symptom**: `cargo test -p animusd --lib -- --test-threads=1` climbed
+monotonically in resident memory — flat ~60 MB through the non-sim tests,
+then ~10 MB/s of growth the instant the `sim_cluster_*` modules started,
+2.1 GB by `sim_cluster_auto_split`, 8.4 GB entering `sim_cluster_dynamo_
+partiql`, 12.7 GB after 307 tests — with **no drop between tests**. A
+two-thread run of the same suite reached 13.9 GB and page-fault-thrashed
+for 87 minutes. `sim_cluster_dynamo_corpus.rs`'s own module doc (see this
+crate's own `CLAUDE.md`, "SimCluster coverage for Transact ops") had
+already noticed the shape at `ANIMUS_DYNAMO_WIRE_SEEDS=12`/`=25` and filed
+it as "consistent with ordinary glibc allocator high-water-mark behavior
+(freed memory not returned to the OS) rather than confirmed proof of a
+true per-scenario leak" — a reasonable guess given the tooling available
+at the time, and wrong: this **was** a true per-scenario leak, one whole
+simulated cluster's worth of memory abandoned per test, for the rest of
+the process's life.
+
+**Root cause, proven with a `Weak`, not assumed**: `animus_sim::Simulator`
+holds one `Arc<Shared>` (`Shared` wraps the whole `SimState` — tasks,
+timeline, inboxes, disks, trace); every `Simulator::env(id)`/`SimEnv`
+handle clones that same `Arc`. `SimState.tasks: BTreeMap<TaskId,
+Option<BoxFuture<'static, ()>>>` is what `Spawner::spawn` inserts a task's
+future into — and it lives **inside** `SimState`, i.e. inside the very
+`Shared` every `SimEnv`/`Simulator` handle holds a strong reference to. A
+task that never resolves on its own (a Raft heartbeat loop, a reconciler
+tick loop, `auto_split_loop`, the backup janitor — every one of them a
+`loop { .. env.sleep(..).await .. }` with no terminating condition, and
+`SimCluster::new` spawns several per node) almost always captures a
+`SimEnv` (sometimes a whole `Simulator` clone, per this crate's own
+"`Simulator` is `Clone`" design) to do its job. So the chain is:
+`Arc<Shared>` → `SimState.tasks` → a perpetual task's `BoxFuture` →
+captures `SimEnv{shared: Arc<Shared>}` → the **same** `Arc<Shared>`. A
+genuine strong reference cycle, entirely internal to one crate's own
+executor state — no external code needs to hold anything for it to leak.
+
+Proved directly (`crates/animus-sim/tests/executor_leak.rs`), not
+inferred from RSS (RSS assertions are inherently flaky — this repo's own
+standing rule): spawn one perpetual task, drive it briefly, take a `Weak`
+handle (`Simulator::downgrade`) **while everything is still alive**, then
+drop every external `Simulator`/`SimEnv` handle the test holds, and assert
+the `Weak` still upgrades. It does — proving the cycle, not merely
+asserting memory didn't shrink. A sibling test proves the fix breaks it:
+call `Simulator::shutdown()` (new — drains `SimState.tasks`/`task_owner`,
+the *only* fields that can hold a strong `Arc<Shared>` back-reference; every
+other field — `timeline`, `timer_wakers`/`recv_wakers` via `Waker`'s own
+`Arc<TaskWaker>` — already uses `Weak` or holds no `Arc` at all, confirmed
+by reading every field, not assumed) before dropping the external handles,
+and the same `Weak` no longer upgrades.
+
+**Why `Simulator`'s own `Drop` can't fix this on its own, and why a
+per-fixture `Drop` is the right root-level fix anyway**: `Simulator` is
+deliberately `Clone` (many call sites hand a clone into a spawned driver
+task specifically so it can call `&self` fault-injection methods from
+*inside* an async scenario script) — no single clone's own `Drop` can
+know whether it's the "last" one, and `Drop` for `Shared` itself can never
+run at all while the cycle exists (a type's `Drop` only fires once its
+strong count reaches zero, and this cycle is exactly what prevents that).
+`Simulator::shutdown()` sidesteps this by not relying on refcounting at
+all — it clears the task map directly, from any handle, at any time,
+idempotently. What still needs to *call* it is whatever code in a
+consuming crate owns the "this scenario is over" moment; `animusd`'s
+`SimCluster` (not `Clone`, and the one type every `sim_cluster_*` test
+already owns for its whole duration) gets an `impl Drop for SimCluster {
+fn drop(&mut self) { self.sim.shutdown(); } }` for exactly this reason —
+zero changes needed to any of the ~30 `sim_cluster_*` sibling modules,
+since every one of them already lets its `SimCluster` value go out of
+scope, success or `panic!` (unwind) alike, at the end of each `#[test]` fn.
+
+**Measured effect** (foreground `/proc/<pid>/status` `VmRSS` sampling of
+the animusd test binary itself, never a background process): `cargo test
+-p animusd --lib sim_cluster_dynamo_partiql -- --test-threads=1` — peak
+322 MB across the module's 10 tests, no per-test growth (the pre-fix
+trajectory, measured on the 64-test PR 6 version of the same module, had
+climbed to ~3.7 GB at ~58 MB per test); `cargo test -p animusd --lib --
+--test-threads=2` — the whole 383-test suite completes in 643s (was
+13.9 GB and thrashing without ever finishing, at one thread or two);
+`ANIMUS_DYNAMO_WIRE_SEEDS=4 cargo test -p animusd --lib
+sim_cluster_dynamo_corpus -- --test-threads=1` — 3 passed in 454s. This
+closes the "resource-scale finding" `sim_cluster_dynamo_corpus.rs`'s own
+doc filed — see that crate's `CLAUDE.md`, that same section, and
+`docs/adr/0061-testability-node-crate-simulator.md`'s matching amendment
+for the correction.
+
+**General lesson**: an executor design where the task queue lives inside
+the same shared state a spawned task's own environment handle points
+back to is a latent reference cycle the moment any task can run forever —
+which is the *normal* shape for a distributed system's own background
+loops (heartbeats, reconcilers, janitors never terminate by design). RSS
+climbing monotonically with no drop between otherwise-independent test
+cases, specifically once a fixture that spawns perpetual loops enters
+the suite, is the fingerprint — don't reach for "glibc doesn't return
+freed pages to the OS" as the explanation until a `Weak` taken before the
+suspected drop point still upgrades afterward; that one assertion
+distinguishes a true leak from ordinary allocator retention in a way no
+RSS number by itself can. When you find one, look for the executor's own
+`Drop` story first — if the type holding the cycle is deliberately
+`Clone`/multi-handle (so its own `Drop` structurally can't detect "last
+owner"), the fix is an explicit, idempotent `shutdown()`-style drain
+called from whatever single-owner type sits one layer up in every
+consumer (a test fixture's own struct, here), not a change to the
+`Clone`-able handle's own lifecycle.
+
+## Correction, same day: fixing ONE reference cycle does not mean it was the ONLY one — two independent cycles were keeping the `sim_cluster_*` tier's memory alive, and a correctly-scoped process sampler is what told them apart
+
+The entry immediately above fixed a real cycle (`Simulator`/`SimEnv`'s own
+task queue) and was believed, from a 383/384-test full-suite completion
+with RSS staying flat, to have closed the `sim_cluster_*` tier's whole
+leak. It hadn't — a follow-up measurement on a fresh session, sampling
+correctly (see below), found the exact same linear RSS growth, at the
+same rate, completely unchanged by that fix: 2.4 GB at 189s in
+`sim_cluster_auto_split`, 10.8 GB at 656s, killed at 12.6 GB after 304
+tests. **The apparent "~6 MB flat" success in the entry above was not a
+measurement of the test binary at all** — the sampler's own `pgrep -f
+'target/debug/deps/animusd-'` pattern also matches the *shell* whose
+command line happens to contain that same string (the `cargo test ...`
+invocation itself, echoed into the process's own argv) — and a shell
+process is never resident at more than a few MB, so the reported "peak"
+was reading the wrong process the entire time. **A real `animusd` test
+binary is never 6 MB resident** — that number alone should have been the
+tell. The fix: anchor the pattern to the actual binary's absolute path
+(`pgrep -f '^/path/to/target/debug/deps/animusd-'`, the caret pinning it
+to the start of the command line, which a shell's own multi-word `cargo
+test -p animusd ...` invocation can never match), and sanity-check the
+very first sample lands in the hundreds of MB — a real test binary's
+baseline RSS with this many statics/generics linked in — before trusting
+anything the sampler reports afterward.
+
+**Root cause, found once measurement was fixed**: a *second*, entirely
+separate reference cycle, this one in `animus-node`'s `SimRelayClient`
+(not `animus-sim`'s `Simulator` at all). `SimRelayClient::serve(handler)`
+installs `handler` into `self.handler: Arc<Mutex<Option<Arc<Handler>>>>`;
+every real caller's `handler` closure is `move |req| { let ctx =
+ctx.clone(); async move { .. } }`, where `ctx: ClientCtx<E, R>` itself
+owns a clone of the *same* `SimRelayClient` (its own `relay: R` field,
+`R = SimRelayClient<SimEnv>` under this fixture). Since `SimRelayClient`
+is `Clone`-over-`Arc`, that captured `ctx.relay` shares the identical
+`handler` `Arc` the closure is *installed into* — a closure sitting
+inside an `Arc`'s own `Mutex` that itself holds a strong reference back to
+that same `Arc`. This is a pure, self-contained cycle: it needs no help
+from `Simulator`'s own task queue (the mechanism the entry above fixed)
+to stay alive, and — critically — it is **entirely independent** of that
+first fix, which is exactly why fixing the first cycle alone left the
+leak's measured trajectory completely unchanged.
+
+**Proved with the identical `Weak` discipline, extended**: a new
+`SimRelayClient::downgrade_handler() -> WeakHandlerSlot` (mirroring
+`Simulator::downgrade`'s own shape) lets a test take a `Weak` onto the
+handler slot before drop and assert it no longer upgrades after —
+`crates/animusd/src/sim_cluster.rs`'s
+`dropping_the_cluster_frees_every_nodes_relay_and_edge_state` proves both
+halves: (1) that a mid-scenario `SimCluster::restart` breaks the *old*
+relay generation's cycle immediately (checked right after the restart
+call, not deferred to the cluster's own eventual drop — a restart
+installs a *fresh* closure on a *fresh* relay without ever clearing the
+one it's replacing, so every restart in a scenario used to leak one more
+whole node-generation on its own, independent of the fixture's final
+`Drop`), and (2) that dropping the whole `SimCluster` frees every node's
+*current* generation, including two more `Weak`-checked `Arc`s
+(`ClusterEdgeState`'s own `control`/`raftkv` registries) that this closure
+transitively keeps alive. Confirmed red-before/green-after by temporarily
+reverting the fix and rerunning the same test: it fails deterministically
+without the fix, passes with it.
+
+**Fix**: `SimRelayClient::shutdown()` (new, `animus-node`) clears the
+handler slot, breaking the cycle — called from `SimCluster::restart`
+(on the OLD relay, before superseding it) and from `impl Drop for
+SimCluster` (on every node's CURRENT relay, alongside the pre-existing
+`Simulator::shutdown()` call from the first fix — the two calls address
+two unrelated cycles and both are needed).
+
+**Measured after both fixes, with the corrected anchored sampler**: `cargo
+test -p animusd --lib sim_cluster_dynamo_ -- --test-threads=1` (the 140
+dynamo-tier tests) — RSS fluctuates with individual tests (roughly
+100–650 MB) but never climbs monotonically and never approaches the
+2 GB bound, `140 passed; 0 failed; 1 ignored`, ~469s. The FULL `cargo
+test -p animusd --lib -- --test-threads=2` suite — peak ~960 MB across
+the whole run (well under the 3 GB bound), `384 passed; 0 failed; 3
+ignored`, ~618s — a complete pass at every test the suite has, not a
+truncated one that merely fit under a memory ceiling before something
+else killed it.
+
+**General lesson, on top of the one above**: fixing one proven reference
+cycle is proof that *cycle* is fixed, never proof that it was the *only*
+one keeping a symptom alive — re-measure the actual symptom (here, RSS
+over the whole affected test tier) after every fix, with a sampler
+whose own target-selection is itself verified sound (a `pgrep -f`
+pattern against a *substring* can match the shell that's driving the
+test as readily as the test binary itself; anchor it, and sanity-check
+the first sample against what a real instance of the thing being
+measured should actually cost). Two independent `Arc` cycles coexisting
+in the same small fixture, each fully capable of explaining the entire
+observed symptom on its own, is not a coincidence to be surprised by —
+`SimCluster::new` installs a `.serve()` handler on every node
+unconditionally, so this second cycle fired on literally every scenario
+this whole tier runs, the identical "affects everything, from the first
+test that touches the fixture" shape the first cycle had. A single
+`Weak`-based regression, once written, generalizes cheaply to prove a
+*second* cycle in a structurally similar spot (an `Arc`-backed handle
+installed as a closure's own captured state, where that closure is
+reachable through the very handle it closes over) — it is the same
+proof technique, not a new one, applied to a different `Arc`.
+
+## A checkpoint commit whose full-suite gate can't run yet because of a pre-existing environment leak is not a signal to go bisect the new tests for a bug (ADR 0061 rung F, C-06 PR 6, 2026-09-08)
+
+C-06 PR 6 (`crates/animusd/src/sim_cluster_dynamo_partiql.rs`, 27 new
+scenarios / 54 new tests on top of PR 5's 10) was checkpoint-committed with
+its module verified correct in isolation (`cargo test -p animusd --lib
+sim_cluster_dynamo_partiql -- --test-threads=1`: 64 passed) but its
+full-suite gate explicitly deferred: the module's own 54 extra `sim_
+cluster_*` tests, riding on top of the tier's existing ~30 modules, were
+enough additional per-test leakage (the two independent reference cycles
+the two amendments immediately above this entry's own ADR counterparts
+fixed) to push a full `cargo test -p animusd --lib` run's resident memory
+past the sandbox ceiling before completion — a symptom that looks, from
+the outside, exactly like "the new tests are the problem." They were not:
+once the leak was fixed (in two unrelated PRs, entirely outside this PR's
+own diff), the full suite completed clean on the first try with the new
+module's 54 tests unchanged from the checkpoint.
+
+**The generalizable lesson**: when a checkpoint commit's own message says
+a gate is blocked on a *named, external, already-diagnosed* cause (here:
+"blocked on a pre-existing per-test memory leak in the SimCluster tier...
+that leak gets its own PR first," not "this module's tests are failing" or
+"unverified"), the finishing pass's first move should be confirming that
+blocker is actually resolved (check the fix landed, re-run the module
+alone if it's cheap) — not re-deriving from scratch whether the new code
+itself has a problem the checkpoint author already ruled out. Conflating
+"a resource ceiling was hit while running N new tests" with "one of the N
+new tests has a bug" wastes a bisection pass on code that was never the
+cause; the actual fix, both times here, landed in a completely different
+crate (`animus-sim`, `animus-node`) with zero lines touched in the test
+module that merely tripped over it. The tell that the checkpoint's own
+diagnosis was trustworthy: it named the specific mechanism ("resident
+memory grows monotonically across the whole lib suite, ~40 MB per test")
+rather than a vague "flaky" or "times out," which is exactly the kind of
+root-caused claim that generalizes correctly once verified rather than
+needing to be re-investigated.
+
+## When a generic sibling is introduced beside a concrete production dispatcher, keep the original `ProdEnv` suite as the permanent equivalence regression — don't trim it once the sim twin passes (ADR 0061 rung F, C-06 close-out, 2026-09-08)
+
+C-06's whole shape — widen `run_transact`/`run_transact_get` and add
+`execute_statement_as`/`execute_transaction_as`/`run_batch_execute_
+statement_as`/`execute_one_batch_statement_as` as new, strictly additive,
+`<E: Env, R: RelayClient>`-generic siblings, never touching
+`run_operation`/`execute_statement`/`execute_transaction`/`run_batch_
+execute_statement` themselves — is D3/D4's own template applied a fifth and
+sixth time. Every prior application of that template (D3 PR 2a/3a/3b, D4
+PR 2/5) faced the same fork in the road once its own sim twin existed and
+passed: trim the original real-socket file down to whatever the sim tier
+can't yet reach, or keep it whole. D3 PR 3b took the "keep it whole"
+option once, deliberately, for exactly one file
+(`dynamo_indexes.rs::gsi_write_then_query`) while trimming everything else
+around it that PR converted — and C-06 generalizes that single decision
+into a standing rule, made explicit rather than left implicit: **when the
+new generic path is a parallel sibling of a concrete production function,
+not a replacement for it, the original real-socket suite proving that
+production function's own behavior stays in the repo, unedited, forever**
+— `crates/animusd/tests/dynamo_partiql.rs`/`dynamo_execute_transaction.rs`
+(37 tests) were run, never trimmed, at every one of C-06's six PRs. The
+reason is not nostalgia for the old file: it is the *only* thing that
+keeps the "the two paths are byte-identical" claim checked on every future
+change to either one, rather than true only at the moment the sim twin was
+first written and silently rottable afterward. A sim twin proves the
+generic path is *correct*; it says nothing about whether the *concrete*
+path a real client's request actually goes through still matches it six
+months and a dozen unrelated refactors later — only a live regression
+still exercising the concrete path can say that. **General lesson:**
+finishing a "make X reachable from `SimCluster` via a new generic sibling"
+task is not the same task as "delete X's old real-socket test file" —
+those are two different, independently-justified decisions, and the
+default for the second one, absent a specific reason to trim (the
+function itself was widened in place with zero behavior change, the D3
+PR 2a/2b/5 shape, where the *same* code now serves both), is to keep the
+original suite whole and say so explicitly, so a later contributor doesn't
+read an unconverted real-socket file as an oversight and "clean it up."
+
+## A function's own generic `<E: Env, R: RelayClient>` signature proves nothing about whether its body still calls the real clock/timer — only running it under `SimEnv` does (ADR 0061 rung G, C-07 PR 2, 2026-09-08)
+
+`docs/adr/0061-*.md`'s rung G opener stated, as a fact from a read-only
+tree pass: "`seal_now<E, R> (proposes `SealStreamShard`, writes
+`ctx.segment_store`) is already generic — a fact from the tree." True, and
+still misleading: `seal_now`'s own commit-wait poll read the wall clock
+via bare `tokio::time::Instant::now()`/`tokio::time::sleep` internally,
+despite the function's signature being `<E: Env, R: RelayClient>` for
+years. Nothing under `SimEnv` had ever actually called `seal_now` before
+this PR (`change_consumer_loop`'s real periodic seal arm is the only
+production caller, and `SimCluster` never spawns that loop), so a
+read-only investigation had no way to see the gap — it only manifests at
+runtime, and only under an environment with no real Tokio reactor
+(`SimEnv`), where `tokio::time::sleep` panics outright ("there is no
+reactor running") the instant the loop's first poll iteration is reached.
+The new `SimCluster::drive_stream_seal` smoke test hit this immediately
+and unambiguously — a hard panic with a full backtrace naming the exact
+line, not a subtle behavioral divergence.
+
+**General lesson**: a "this function is already generic over `E`" claim in
+a blocker/investigation writeup is a claim about the *signature*, checked
+by `cargo build`/reading the `fn` line — it says nothing about whether the
+*body* still reaches through to the real clock/timer rather than the `Env`
+seam, which can only be confirmed by actually driving the function under
+`SimEnv` (or by grepping its own body for `tokio::time`/`std::time`/
+`Instant::now`/`SystemTime::now`, which a read-only investigation pass
+should do for any function it plans to lean on generically, not just check
+the signature). This is the same root distinction ADR 0061 rung C5 step
+3b's own mechanical-conversion pass already discovered once (see that
+rung's "A subtler bug this rung's own mechanical pass introduced" entry in
+`crates/animusd/CLAUDE.md`) — a function can be `E`-generic in name while
+still being `ProdEnv`-only in practice, and the only thing that actually
+proves otherwise is a real `SimEnv`-driven caller reaching every line.
+
+The fix followed the established rung C5 step 3b conversion exactly:
+`tokio::time::Instant::now() + X` → `ctx.env.now().saturating_add(X)`
+(`Nanos` has no `Add<Duration>`), `tokio::time::sleep(D)` → `ctx.env.
+sleep(D)`. `ProdEnv` behavior is unchanged (its own `env.now()`/`env.sleep`
+are the real clock/timer). `index_drain::pitr_seal_now` — `seal_now`'s
+structural twin (`SealPitrSegment` in place of `SealStreamShard`) — was
+confirmed (by direct inspection, not just pattern-matching the function
+name) to carry the identical bug, and was deliberately left unfixed: it is
+not reachable from anything this PR wires up, so fixing it would be a
+drive-by change outside this PR's own stated scope; a future rung driving
+PITR sealing under `SimCluster` will need to make the identical
+`ctx.env.now()`/`ctx.env.sleep(..)` conversion before its own first
+`SimEnv`-driven caller can reach it. `index_drain.rs` is one of the
+crate's `#[allow(clippy::disallowed_methods)]`-covered modules (not one of
+the ten narrower `#[deny(...)]` modules ADR 0061's own closing rung named
+— see root `CLAUDE.md`'s determinism section), which is exactly why
+`cargo clippy -p animusd --all-targets --all-features -- -D warnings`
+never caught this gap on its own: the lint that would have flagged a raw
+`tokio::time` call is switched off for this file by design (the
+`animusd`-wide process-boundary carve-out), so a function that happens to
+be `E`-generic but still reaches for the real clock only reveals itself by
+actually being driven under `SimEnv` once.
+
+## `DescribeStream` always appends a tablet's still-open successor epoch behind a just-sealed one while the stream stays enabled — a shard-count assertion after a seal must account for it (ADR 0061 rung G, C-07 PR 3, 2026-09-08)
+
+Building `sim_cluster_dynamo_streams.rs`'s new post-seal scenarios (a
+sealed-shard `GetRecords` read, `Limit` pagination, the `AT`/
+`AFTER_SEQUENCE_NUMBER` iterator types, and a cross-node identical-token
+read — four of the eight new scenarios), every one's first draft asserted
+`DescribeStream`'s `Shards` array had exactly **one** entry after calling
+`SimCluster::drive_stream_seal` once over a small, fully-drained backlog —
+mirroring the module's own PR 2 scenario, which checks `Metadata::
+stream_shards` (the sealed-rows-only catalog map) directly, never
+`DescribeStream`'s own JSON response. All four failed identically: the
+response actually carried **two** shards — the sealed epoch 0 (with a
+`SequenceNumberRange.EndingSequenceNumber`) and a second, still-open epoch
+1 with none. This is not a fixture bug or a `drive_stream_seal` quirk —
+it's `dynamo_streams::describe_stream`'s own, entirely correct, documented
+behavior (`current_open_epoch`, `resolve_label`): whenever a stream is
+`enabled`, the response unconditionally appends one open-shard entry per
+routable tablet at that tablet's *current* epoch, on top of however many
+sealed rows the catalog already holds for it — a seal always advances the
+open epoch counter, so the very next `DescribeStream` call after any seal
+sees a fresh, empty successor shard it must still report (a real client
+polls it and correctly sees nothing new yet).
+
+**General lesson**: `Metadata::stream_shards`-based assertions (only
+sealed rows exist there) and `DescribeStream`'s own JSON `Shards` array
+(sealed rows **plus** the current open tail, while enabled) are answering
+two different questions, and a test that seals once and then asserts an
+exact `Shards.len()` must count the open tail too — the sealed shard is
+always `shards[0]` (the array sorts ascending by epoch), never
+`shards.last()` or the array's sole element, the moment more than zero
+epochs have ever sealed. This generalizes past this one PR: any future
+Streams scenario that seals a tablet and then inspects `DescribeStream`
+needs the identical `+1` accounted for, and the fix here (assert `len ==
+sealed_count + 1`, always index the sealed entries from the front) is the
+reusable shape.
+
+## An op call's virtual-time budget keeps running past its own future's completion — an "X still exists right after this call" assertion is unsound against a background reclaim loop unless the retention window comfortably clears the whole budget (ADR 0061 rung G, C-07 PR 5, 2026-09-08)
+
+`SimCluster::spawn_and_capture` (the helper every op call — `dynamo`/
+`put`/`drive_stream_seal`/`drive_inplace_split_cutover`/… — goes through)
+always advances the simulator's virtual clock by the *full* `OP_BUDGET`
+(12s) before returning, via an unconditional `self.sim.run_for(OP_BUDGET)`
+— regardless of how quickly the call's own spawned future actually
+resolves. An earlier lesson (this file's "sizing a per-op cost against the
+per-call refill" entry) already covers what this means for a rate-based
+throttle assertion; this is a different, second consequence of the
+identical mechanism.
+
+`two_phase_expiry_removes_the_row_and_every_replicas_object`
+(`sim_cluster_stream_janitor.rs`) asserts a just-sealed segment object
+still exists **immediately** after `drive_stream_seal` returns. With the
+scenario's original `retention = 2s`, the seal itself typically lands
+early inside `drive_stream_seal`'s own 12-second window — but the call
+does not return the instant the seal commits, it keeps running the
+simulator for the *rest* of that 12-second budget regardless, and the
+segment janitor's 200ms tick has ample room in that leftover window to
+mark-and-physically-delete the just-sealed object (phase 1b deletes the
+object as soon as it's marked, independent of any later-epoch pin — see
+`segment_janitor.rs`'s own doc) well before the assertion ever runs. The
+result was a reproducible failure at every seed (`the segment object must
+exist right after its own seal: []`), not a flake — this fixture is fully
+deterministic, so a wrong retention/`OP_BUDGET` relationship fails every
+single time, the same way a wrong assertion would.
+
+**General form**: any scenario asserting "a thing this call just produced
+is still present/absent right after the call returns" is implicitly
+assuming nothing else advanced virtual time between the producing action
+and the observation — but a `SimCluster` op call's own fixed-budget
+`run_for` is exactly such an advance, hidden inside the call the scenario
+already trusted. Where a background reclaim/expiry mechanism is also
+running (this fixture spawns every production background loop
+unconditionally on every node), a retention/timeout window shorter than
+`OP_BUDGET` cannot be trusted to still be "not yet due" by the time
+control returns to the test — size it to comfortably clear `OP_BUDGET`
+whenever the scenario's own assertion depends on that immediacy, exactly
+as the mid-sweep-catching scenarios in this same module already do
+deliberately. A scenario that only needs *eventual* convergence (poll to
+convergence afterward) has no such constraint and can keep a short
+retention — the two existing strategies documented in `sim_cluster_
+stream_janitor.rs`'s own module doc are the reusable shape.
+
+## A generic dispatch's own coverage gaps are a real production regression the moment a NON-primary but still-production-reachable proxy is switched to it — "SimCluster-only gap" and "production gap" are not automatically the same claim (ADR 0061 rung H, C-08 PR 2, 2026-09-08)
+
+Every prior rung in this series (D2/D3/D4/F/G) widened a dispatcher whose
+*only* production caller was the real wire edge (`dynamo.rs::dispatch`),
+which never changed target — the generic sibling was purely additive, and
+"production stays byte-identical" held by construction. C-08 PR 2 widened
+two DIFFERENT production entry points instead — `admin.rs::
+action_data_dynamo` (`/admin/data/dynamo`, the dashboard's own DynamoDB
+proxy, ADR 0021) and `impl console::ConsoleBackend for ClientCtx` (the
+animusd console's own mutating endpoints) — because `AdminHost`/
+`ConsoleBackend`'s trait requirements force EVERY method to be
+`<E: Env, R: RelayClient>`-generic once the surrounding `impl` is widened,
+with no way to keep one method concrete while its siblings go generic (see
+the archive-bound entry below for exactly why). Both are genuinely
+**production-reachable** — real operators use the dashboard's Data Browser
+and the console app — but neither is the primary wire edge, and it was
+tempting to reason "the generic dispatch already covers most DynamoDB
+operations, so this is basically the same swap the prior rungs made
+safely." It is not: unlike the wire edge, these two callers can be asked
+to run **any** operation a client chooses, including ones the generic core
+never claimed to cover (`UpdateTimeToLive`, `CreateBackup`/`DeleteBackup`,
+and `UpdateTable` with an index change — the last a *named, accepted*
+scope cut, "blocker (d)," not an oversight). Swapping their dispatch target
+to the narrower `execute_routed_as_generic` without first widening those
+specific operations turned nine real-socket tests red
+(`admin_endpoint.rs`/`console_create_table.rs`/`console_table_config.rs`/
+`dashboard_endpoint.rs`) — a genuine regression in shipped functionality,
+not a SimCluster-only coverage gap, caught only because this rung's own
+gate explicitly requires running the untrimmed suite **before** trusting
+the swap (the D2 PR 1 lesson's own prescribed check). Six of the nine
+closed cheaply: `update_time_to_live`/`create_backup`/`delete_backup` had
+no `tokio::spawn` blocking them, just the same `tokio::time` → `ctx.env`
+conversion this whole series already does mechanically, so widening them
+and adding three `dispatch_item_op` arms was the *correct* fix, not a
+workaround. The remaining two (`add_gsi`/`drop_gsi`, genuinely blocked on
+GSI backfill machinery this rung was never going to build) needed a
+different, structural answer — see the sibling entry just below.
+
+**The general form**: before assuming a trait-forced widening's dispatch
+swap is "the same shape as last time," ask whether the caller being
+widened is a **narrow, single-purpose edge** (always the same handful of
+operations) or a **general-purpose proxy** (can be asked to run anything a
+client sends) — only the former's coverage gap is automatically confined
+to the new generic-only caller (SimCluster); the latter's gap is visible
+to every existing caller the moment the switch lands, so the untrimmed
+gate isn't a formality for it, it's the only thing separating "found a
+groundwork residual" from "shipped a functional regression."
+
+## A blanket generic `impl Trait for ClientCtx<E, R>` silently narrows production's own dispatch to whatever the generic sibling covers — a newtype keeps the production impl concrete, not an interception layer inside the off-limits accept loop (ADR 0061 rung H, C-08 PR 2, 2026-09-08 — corrected same day, in review)
+
+A first cut of this rung widened `impl AdminHost for ClientCtx`/
+`impl console::ConsoleBackend for ClientCtx` **in place** to `impl<E: Env,
+R: RelayClient> .. for ClientCtx<E, R>` — the same shape every earlier
+generic-dispatch rung (D2/D3/D4/F/G) used for a *free function*. The
+difference a blanket trait impl introduces, missed at first: `ClientCtx`
+(the bare, default-type-parameter alias) is production's own concrete
+type, so widening its *one* `impl` block doesn't add a second, parallel
+path the way widening a free function does — it **replaces** the only
+`AdminHost`/`ConsoleBackend` implementation `ClientCtx` has, for every
+monomorphization including `E = ProdEnv, R = AnimusdRelayClient`. Once
+`action_data_dynamo`/`add_gsi`/`drop_gsi`'s shared body was forced to call
+the narrower `execute_routed_as_generic` (the only way the body can
+compile for a generic `E, R` at all), **every** caller of the trait —
+including production's own dashboard proxy and real console clients —
+silently lost whatever the generic dispatch core doesn't cover, with no
+way to get it back by editing the trait impl alone: there is no way to
+keep both a generic `impl Trait for ClientCtx<E, R>` and a separate,
+more-capable `impl Trait for ClientCtx` (the concrete default) coexisting
+— Rust's coherence rules forbid two impls of the same trait for
+overlapping type parameters, and `animus_node::console::route`'s own
+`&dyn ConsoleBackend` **trait-object** dispatch has no inherent-method-
+priority escape hatch to prefer one impl over the other for a single
+concrete type either. A first attempted fix reached for a concrete
+interception layer inside `console.rs::serve`/`handle_conn` (special-case
+two routes ahead of `route`'s own dispatch) — this compiled, passed every
+test, and was still wrong: it edited a file no reviewer read as
+off-limits, gave `console.rs` its own duplicated route-parsing/JSON-helper
+logic that would silently drift from `animus_node::console`'s own the
+moment that crate's route shapes changed, and threaded a concrete
+`ClientCtx` into `serve`/`handle_conn`'s own signatures — a real change to
+the production console path this rung's own non-goals explicitly forbade,
+just one file removed from the trait impl itself.
+
+**The actual fix, applied in review**: keep the concrete
+`impl AdminHost for ClientCtx`/`impl console::ConsoleBackend for
+ClientCtx` as the **production** impls, observably byte-identical to
+before this rung (every dispatch call site stays the concrete
+`execute_routed`/`execute_routed_as`, never `execute_routed_as_generic`),
+and add a **second type**, `GenericAdminHost<E, R>(pub ClientCtx<E, R>)`/
+`GenericConsoleBackend<E, R>(pub ClientCtx<E, R>)` — a one-field newtype,
+not a new mechanism — with its own `impl<E: Env, R: RelayClient> Trait for
+Generic*<E, R>` reaching the generic dispatch core instead. Coherence
+allows this because the two impls target genuinely different types
+(`ClientCtx<E, R>` vs. `Generic*Host<E, R>`), even though one always wraps
+the other. `SimCluster::admin`/`console` (`sim_cluster.rs`) wrap
+`self.ctx(node)` in the newtype before calling `animus_node::admin::
+dispatch`/`console::route`; production's own `spawn_common_tail` keeps
+passing a bare `Arc<ClientCtx>` as `Arc<dyn ConsoleBackend>`/handing a bare
+`&ClientCtx` to `animus_node::admin::dispatch<H: AdminHost>`, completely
+unaware the newtype exists. Both impls share every byte of request-
+building/response-parsing logic (factored into small, `<E, R>`-generic or
+plain free functions called by both `self`/`&self.0`) — only the one
+dispatch-call line differs — so the two paths cannot quietly drift apart.
+`console.rs`/`animus_node::admin::dispatch`/`animus_node::console::route`
+are untouched, verified via `git diff` against the pre-rework baseline,
+not merely asserted.
+
+**The general form**: when a trait-bound widening is about to touch a
+**blanket `impl Trait for ConcreteType`** — not a free function, not an
+impl on a type the caller already constructs generically — stop and ask
+whether `ConcreteType` is itself production's own default-instantiated
+type (a struct with default type parameters, e.g. `ClientCtx<E: Env =
+ProdEnv, ..>`). If so, widening that one `impl` block in place doesn't add
+a parallel path the way widening a free function does; it *replaces*
+production's own implementation for every trait method at once, including
+whichever ones the generic dispatch core doesn't yet cover. The fix is a
+newtype wrapper with its own separate `impl`, not an edit inside the
+off-limits call chain the trait's own dispatcher (`route`/`dispatch`)
+sits behind — even a "thin, logic-free" interception one file upstream of
+that dispatcher is still a change to the production path this class of
+rung's own non-goals exist to forbid.

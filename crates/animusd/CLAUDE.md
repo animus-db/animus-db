@@ -6551,22 +6551,97 @@ permanently; (C) real crypto/DNS/TLS/OTLP/sockets, 9 files/32 tests — TLS
 handshake, DNS resolution, SigV4, OTLP export, raw framing, stays
 `ProdEnv` permanently; (D) waiting on a `SimCluster` capability this
 fixture doesn't have yet, 65 files/317 tests, split by what's missing —
-admin/console/dashboard HTTP (10/66), PartiQL (2/37), join/growth/
+admin/console/dashboard HTTP (10/66 — 67 by an exact `grep -c
+'#\[tokio::test'` recount, owned by C-08 (ADR 0061 rung H) as of
+2026-09-08), PartiQL (2/37), join/growth/
 decommission (9/34), Transact (6/32), index DDL beyond plain `CreateTable`
-(9/30), backup/PITR/export/import (6/29), Streams (3/28), control/data
+(9/30), backup/PITR/export/import (6/29), Streams (3/28, owned by C-07
+(ADR 0061 rung G) as of 2026-09-08), control/data
 role split (5/21), reconciler-driven split/rebalance/GC (7/13), TTL
 (1/9), node assembly/raw `ClientRequest` (2/8), throttle metric counters
 (1/6), auto-split loops (2/2), `--config` bring-up (2/2) —
 reconciler-driven split/rebalance/GC, auto-split, join/growth, and the
 backup janitor are D4's own scope (D4 PR 1 already supplied the real
-reconciler these need next); Transact and PartiQL are D2's own named
-residuals, now in progress as **C-06** (`docs/roadmap.md`, ADR 0061's
-"Rung F" amendment); admin/console/dashboard HTTP, Streams, TTL, the control/data
-role split, `--config` bring-up, index DDL beyond `CreateTable`, node
-assembly, and the throttle-metric counters are unowned by any planned
-rung as of this close; (E) frozen behind an open flake issue, 7 files/32
-tests (#298, #418, #592, #601, #610, #619/#622, #627) — out of scope for
-C-04, tracked by their own issues.
+reconciler these need next); Streams and admin/console/dashboard HTTP are
+now owned (C-07, C-08); TTL,
+the control/data role split, `--config` bring-up, index DDL beyond
+`CreateTable`, node assembly, and the throttle-metric counters are unowned
+by any planned rung as of this close; (E) frozen behind an open flake
+issue, 7 files/32 tests (#298, #418, #592, #601, #610, #619/#622, #627) —
+out of scope for C-04, tracked by their own issues.
+
+**Transact and PartiQL — D2's own named residuals — are closed by C-06
+(landed 2026-09-08, ADR 0061's "Rung F"/"Rung F closed" amendments,
+`docs/roadmap.md`).** Both are now reachable through `dynamo::
+dispatch_item_op<E, R>`: `TransactWriteItems`/`TransactGetItems` (C-06
+PRs 2/3/4 — `sim_cluster_dynamo_transact.rs` plus the wire-corpus op mix)
+and `ExecuteStatement`/`BatchExecuteStatement`/`ExecuteTransaction` (C-06
+PRs 5/6 — four new `_as` generic siblings, `sim_cluster_dynamo_
+partiql.rs`). `crates/animusd/tests/dynamo_partiql.rs` and `dynamo_
+execute_transaction.rs` (37 tests) stay in the `tests/*.rs` tree
+**deliberately, kept in full rather than trimmed or deleted**: they are the
+`ProdEnv` proof that `run_operation`'s own production dispatch — never
+widened or replaced, only paralleled by C-06's new generic siblings —
+still matches what the generic `SimCluster` path exercises, the same
+"keep the real-socket original as the equivalence regression" call D3 PR
+3b already made for `dynamo_indexes.rs::gsi_write_then_query`. Two issues
+this series surfaced and fixed along the way, both general control-plane
+infrastructure rather than Transact-specific: #731 (`SimRelayClient`'s
+nested-relay deadlock, fixed by #738) and #737 (`txn_recover`'s non-local
+grace-check wall-clock bug, fixed by #740). `cargo test -p animusd --lib`
+grew from 353 passed immediately before C-06 PR 3 to 438 passed / 3
+ignored after PR 6 — see ADR 0061's "Rung F closed" amendment for the
+full per-PR accounting, including PR #753's fix for the two
+`animus-sim`/`animus-node` reference-cycle leaks the series' own gating
+surfaced (previously filed, in this file's C-06 PR 4 appendix below, as
+an unfixed "resource-scale finding" — now root-caused and closed).
+
+**Streams — the residual C-06's own close-out named next in line — is
+closed by C-07 (landed 2026-09-08, ADR 0061's "Rung G"/"Rung G closed"
+amendments, `docs/roadmap.md`).** `dynamo_streams.rs`'s eight functions
+and the segment janitor's tick/loop are now `<E, R>`-generic, reachable
+through a new parallel entry point (`dynamo_streams::execute_streams_
+op_as`, since `execute_routed_as` forks on the wire target prefix one
+layer above `dispatch_item_op` and could never reach it otherwise) plus
+`SimCluster::drive_stream_seal`/an unconditional per-node janitor spawn
+(C-07 PRs 2/3/5 — `sim_cluster_dynamo_streams.rs`,
+`sim_cluster_stream_janitor.rs`). `crates/animusd/tests/dynamo_
+streams.rs` (2 of 15 tests) and `tests/stream_janitor.rs` (2 of 11 tests)
+stay in the `tests/*.rs` tree **deliberately, trimmed rather than
+deleted whole** — each remaining test needs a genuine `ProdEnv` property
+(real-WAL restart durability, the real periodic seal timer's own race,
+the production port guard, a real control-only/data-only role split) —
+per the same "keep the real-socket residual, don't force-convert or
+delete it" call this file's Transact/PartiQL paragraph above already
+made. `stream_backfill_seed_filter.rs` (2 tests) and `console_stream.rs`
+(4 tests) were never this rung's to claim and are unaffected, filed under
+"index DDL beyond plain `CreateTable`" and admin/console/dashboard HTTP
+respectively; `streams_e2e.rs` (12 tests) stayed untouched throughout,
+frozen behind #298/#745. Two findings this series surfaced and fixed
+along the way, both scenario/fixture-local rather than product bugs
+(the second) or a product bug fixed in place (the first): `index_
+drain::seal_now`'s commit-wait poll read the real wall clock despite an
+already-`<E, R>`-generic signature (fixed; `pitr_seal_now`'s identical
+twin deliberately left as a documented open gap), and a `SimCluster` op
+call's fixed 12s `OP_BUDGET` advance can retire a short-retention row
+before an immediately-after-the-call assertion runs (fixed
+scenario-locally). `cargo test -p animusd --lib` reached 315 passed / 2
+ignored at the sim tier after PR 5, no leak trajectory — see ADR 0061's
+"Rung G closed" amendment for the full per-PR accounting.
+
+**C-08 (open)** — admin/console/dashboard HTTP, the group C-07's own
+close-out named next in line, is opened 2026-09-08 (ADR 0061's "Rung H"
+amendment, `docs/roadmap.md`'s C-08 entry). PR 1 (this docs opener) and PR
+2 (groundwork, corrected the same day in review — see this file's own
+appendix, below, for the full account, including the `GenericAdminHost`/
+`GenericConsoleBackend` newtype fix) have landed; PRs 3-8 are not yet
+done. The ten files now owned by this
+rung: `admin_endpoint.rs`, `dashboard_endpoint.rs`, `console_endpoint.rs`,
+`console_create_table.rs`, `console_items.rs`, `console_stream.rs`,
+`console_table_config.rs`, `console_tables.rs`, `metrics_endpoint.rs`,
+`system_table.rs` (67 tests total, per an exact recount — see that
+amendment's own Gap section for the per-file breakdown and why it differs
+by one from this section's older "(10/66)" figure above).
 
 **Standing rule for new `animusd` logic tests**: default to a
 `sim_cluster_*` sibling module (`SimCluster::dynamo`/`dynamo_concurrent`/
@@ -7729,3 +7804,792 @@ passed, 0 failed — the real-socket regression proving `execute_statement`/
 --check` (clean after one auto-fix); `cargo clippy -p animusd
 --all-targets --all-features -- -D warnings` (clean); `cargo build -p
 animusd --all-targets` (clean). `Cargo.lock` unchanged.
+
+## Appendix — SimCluster coverage for the PartiQL logic suites (ADR 0061 rung F, C-06 PR 6, 2026-09-08)
+
+PR 5 (above) got the generic PartiQL dispatch path (`execute_statement_
+as`/`execute_transaction_as`/`run_batch_execute_statement_as`/
+`execute_one_batch_statement_as`) reachable from `SimCluster` at all, with
+five smoke scenarios. This PR is pure test authorship on top of that
+unchanged dispatch — no `dynamo.rs` edit of any kind — adding one
+`SimCluster` sibling per named real-socket LOGIC test in `crates/animusd/
+tests/dynamo_partiql.rs`/`dynamo_execute_transaction.rs`: **27 more
+scenarios**, each with its own `_over_seeds` sibling at 5 seeds (54 more
+tests), bringing `crates/animusd/src/sim_cluster_dynamo_partiql.rs` to 32
+scenarios / 64 tests total. Every scenario is issued from a **non-leader**
+node of a 3-node RF3 `SimCluster`, exercising the forwarding path, per this
+module's own PR 5 precedent.
+
+**Converted, from `tests/dynamo_partiql.rs` (20)** — `SELECT` semantics:
+`select_partition_equality_matches_query`, `select_begins_with_sort_key_
+matches_query`, `select_sort_comparator_and_between_match_query_numeric_
+ordering`, `select_non_key_where_matches_scan_with_filter`, `select_
+projection_narrows_returned_attributes`, `select_from_table_dot_index_
+queries_the_gsi`, `gsi_projected_attribute_updated_via_partiql_is_visible_
+through_index_query`, `order_by_desc_matches_scan_index_forward_false`,
+`pagination_next_token_matches_query_last_evaluated_key_walk`, `next_
+token_rejected_when_replayed_against_a_different_statement`; `INSERT`/
+`UPDATE`/`DELETE` semantics and error mapping: `insert_on_conflict_do_
+nothing_swallows_duplicate`, `duplicate_insert_gives_duplicate_item_
+exception_and_leaves_item_unchanged`, `update_set_on_existing_item_with_
+returning_all_new`, `update_of_missing_item_fails`, `update_with_non_key_
+where_term_as_condition_met_and_unmet`, `update_where_missing_partition_
+key_is_a_validation_exception`, `delete_where_missing_sort_key_is_a_
+validation_exception`, `unknown_table_is_resource_not_found`, `malformed_
+statement_is_a_validation_exception`, `literal_value_in_where_is_
+rejected`.
+
+**Converted, from `tests/dynamo_execute_transaction.rs` (7)** —
+`execute_transaction_write_commits_atomically_across_two_tables` (a fresh
+sibling matching the real test's own name/shape — kept alongside PR 5's
+own similarly-shaped but differently-named `execute_transaction_commits_
+across_two_tables`, per this PR's instruction not to touch PR 5's
+scenarios), `execute_transaction_write_cancels_whole_on_duplicate_insert`,
+`execute_transaction_rejects_zero_and_too_many_statements`,
+`execute_transaction_mixed_select_and_insert_is_validation_exception`,
+`execute_transaction_client_request_token_replay_is_cached`,
+`execute_transaction_all_select_returns_items_and_misses_in_order`,
+`execute_transaction_over_a_follower_connected_node` (already issued from
+a non-leader node by this module's own standing construction, so no
+special fixture beyond every other scenario here).
+
+`setup_events_logs` reproduces `dynamo_partiql.rs::setup()`'s own
+two-table fixture verbatim (`events`: composite `pk`(S)/`sk`(N) + `region`
++ `cat` with a `by-cat` GSI; `logs`: composite `pk`(S)/`sk`(S)), minus the
+GSI backfill itself — this fixture spawns no background drain loop (this
+file's own SimCluster "Design decisions" section), so a GSI-touching
+scenario calls `SimCluster::drain_gsi` explicitly instead of the
+real-socket suite's own `await_gsi_select` poll.
+
+**Deliberately not converted, real-socket-only, and why**: `throttled_
+table_throttles_a_partiql_insert` — throttle-window timing, out-of-scope
+per this rung's own PR-series ADR amendment; `sim_cluster_throttle.rs`
+already owns `SimCluster`'s `ThrottleBucket` corpus with nothing
+PartiQL-specific to add. `insert_then_select_sees_it` and `delete_with_
+returning_all_old` (`dynamo_partiql.rs`) — already covered by PR 5's own
+scenarios (a)/(b) respectively. `delete_of_missing_key_is_a_silent_
+success`, `delete_returning_all_new_is_rejected`, and every `batch_
+execute_statement_*` test beyond PR 5's own scenario (c) (`one_failure_
+does_not_block_the_others`, `select_rejects_a_sort_key_range`, `zero_and_
+over_cap_are_top_level_validation_exceptions`, `through_a_follower_
+connected_node`) — genuine distinct LOGIC tests, not blocked by any
+`SimCluster` gap, simply outside this PR's own coordinator-provided
+candidate list; left for a future pass. `crates/animusd/tests/dynamo_
+partiql.rs`/`dynamo_execute_transaction.rs` stay byte-identical to `main`
+throughout (`git diff` against the branch point is empty for both files).
+
+**No product bug found.** Every converted scenario passed at its pinned
+seed and at every `_over_seeds` seed on the first clean run — the generic
+dispatch path PR 5 wired behaves identically to the concrete, real-socket-
+only path for all 27 scenarios this PR adds.
+
+**This PR's own full-suite gate was blocked on, and only became runnable
+once, the `sim_cluster_*`-tier reference-cycle leak (ADR 0061's two
+2026-09-08 amendments immediately preceding this rung's own PR 5
+amendment) was fixed** — this module's 54 additional `sim_cluster_*` tests
+were, before that fix, enough extra per-test leakage on top of the tier's
+existing ~30 modules to push a full `cargo test -p animusd --lib` run's
+resident memory past the sandbox ceiling before completion. A checkpoint
+run of this module alone (`cargo test -p animusd --lib sim_cluster_dynamo_
+partiql -- --test-threads=1`: 64 passed, 423s) proved correctness in
+isolation well before the full-suite gate was runnable at all.
+
+**Gates**: `cargo fmt --all --check` (clean); `cargo clippy -p animusd
+--all-targets --all-features -- -D warnings` (clean); `cargo build -p
+animusd --all-targets` (clean); `cargo test -p animusd --lib --
+--test-threads=2` (438 passed, 0 failed, 3 ignored, 811.16s; peak resident
+memory ~968 MB, sampled from the test binary's own `/proc/<pid>/status`
+`VmRSS` with an anchored `pgrep -f '^<abs-path>/target/debug/deps/
+animusd-'` pattern — see the leak-fix amendments' own sampler-bug lesson
+for why an unanchored pattern is wrong); `cargo test -p animusd --test
+dynamo_partiql --test dynamo_execute_transaction` (37 passed, 0 failed —
+30 + 7, 11.38s + 2.36s — the real-socket suites stayed byte-identical).
+`Cargo.lock` unchanged. A determinism replay (`ANIMUS_SEED=3228520449` on
+`insert_then_select_sees_it`, run twice) gave identical output both times.
+
+**C-06 closed 2026-09-08 (PR 7, docs only).** See the "Standing rule for
+new `animusd` logic tests" and residual-inventory paragraphs above (Tests
+section) for the closing accounting — Transact and PartiQL are no longer
+D2 residuals in progress, and `dynamo_partiql.rs`/`dynamo_execute_
+transaction.rs` are kept in full as the standing `ProdEnv` equivalence
+regression, not a temporary artifact of the series. ADR 0061's "Rung F
+closed" amendment and `docs/roadmap.md`'s C-06 entry carry the full
+seven-PR account.
+
+## Appendix — SimCluster groundwork for DynamoDB Streams dispatch (ADR 0061 rung G, C-07 PR 2, 2026-09-08)
+
+Opens the Streams `SimCluster` series (rung G/C-07) Rung F's own close-out
+named next in line. **Groundwork only** — no read API (`ListStreams`/
+`DescribeStream`/`GetShardIterator`/`GetRecords`) is reachable yet (PR 3's
+own scope); this PR is the four blockers (c)/(d)/(e) the rung's opener
+named, plus a first end-to-end smoke.
+
+**`dynamo.rs`**: `disable_stream` widened from `&ClientCtx` to `<E: Env, R:
+RelayClient>` — its two `tokio::time` sites became `ctx.env.now()`/
+`ctx.env.sleep(..)` (`Nanos` has no `Add<Duration>`, hence
+`saturating_add`), the identical `enable_stream`/`update_table_throughput`
+precedent (D3 PR 2b). `dispatch_table_op` gained a stream-only `UpdateTable`
+sub-arm — `stream: Some(..)`, `throughput_update: None` (an index change is
+still rejected) — calling `enable_stream`/`disable_stream` the exact shape
+`update_table`'s own concrete arm already uses, then re-describing the
+table. `CreateTable`'s own arm also stopped rejecting a declared stream:
+`create_table`'s stream branch already called the (already-generic)
+`enable_stream`, so there was nothing left to reject — a check that turned
+out to be pure removal, no new mechanism, once actually traced (the rung's
+own opener had left this an open question, "check, and if that needs more
+than the rejection removal, leave it rejected"). `update_table`/
+`run_operation` stay byte-identical — the D2 PR 1 lesson applied a sixth
+time in this series: the generic dispatcher never becomes the production
+path's only route.
+
+**A real gap the rung's own blocker analysis missed, found running the new
+smoke test, not by inspection**: `index_drain::seal_now` — the primitive
+`SimCluster::drive_stream_seal` (below) calls — is `<E: Env, R:
+RelayClient>`-generic in its *signature*, but its commit-wait poll still
+read the wall clock via bare `tokio::time::Instant::now()`/`tokio::time::
+sleep` internally. A generic signature does not imply a seam-clean body;
+nothing under `SimEnv` had ever actually called `seal_now` before this PR,
+so the gap was invisible to a read-only pass. `SimEnv` has no real Tokio
+reactor, so `tokio::time::sleep` panics ("there is no reactor running")
+the instant the commit-wait loop's first poll iteration is reached — this
+PR's own new smoke test hit it immediately. Fixed with the identical
+conversion `disable_stream` above got: `ctx.env.now()`/`ctx.env.sleep(..)`,
+`saturating_add` for the deadline math. `ProdEnv` behavior is byte-
+identical (its `env.now()`/`env.sleep` are themselves the real clock/timer).
+**`pitr_seal_now` carries the identical bug, unfixed** — it is `seal_now`'s
+structural twin (`SealPitrSegment` instead of `SealStreamShard`) but is not
+reachable from anything this PR wires up; a future rung driving PITR
+sealing under `SimCluster` will hit the identical panic and needs the
+identical fix. See `docs/engineering-lessons.md`'s matching entry for the
+general lesson (a function's own generic type parameters prove nothing
+about whether its body actually avoids the real clock/timer — only running
+it under `SimEnv` does).
+
+**`sim_cluster.rs`**: `SimCluster::new` now builds a SECOND shared
+`animus_sim::SimSegmentStore` — independent from the backup store D4 PR 5
+already wired (ADR 0059 §1's own "deliberately parallel, not shared"
+design for the two stores in production, kept as two distinct
+`SimSegmentStore` instances here for the same reason) — and every node's
+own `ClientCtx::segment_store` wraps `SegmentStoreHandle::S3` around a
+clone of it, replacing the inert `SegmentStoreHandle::Fs` placeholder every
+`sim_cluster_*` module used to carry. `SimCluster::restart` leaves it
+untouched (never reassigned there), the identical `backup_store`
+precedent. `SimCluster::segment_store()` hands a test a handle for direct
+assertions (`stored_ids()`/`get`), mirroring `SimCluster::backup_store()`.
+`SimCluster::grow` (D4 PR 4's growth-node constructor) still builds its own
+`Fs` placeholder for `segment_store` — out of this PR's own scope (nothing
+here needs a streamed table on a grown node), a documented gap for a
+future PR that does.
+
+**`SimCluster::drive_stream_seal(node)`** (new) — for every tablet `node`
+both hosts and currently leads whose table has a stream enabled
+(`meta.table_stream(table).is_some()`), calls the now-`SimEnv`-safe
+`index_drain::seal_now` directly and unconditionally, looped to exhaustion
+(`Ok(Some(_))` ⇒ more may remain, `Ok(None)` ⇒ done, a retryable
+`index_drain::is_retryable_elsewhere` error ⇒ retry up to a bounded
+budget, any other error ⇒ panic) — mirroring `index_drain::
+inplace_split_driver_tick`'s own streams final-seal loop exactly, and
+`SimCluster::drain_gsi`'s own on-demand-invocation shape for the identical
+reason: this fixture never spawns `index_drain::change_consumer_loop`
+(the real periodic seal arm, `seal_tick`) as a background loop at all.
+**Does NOT replicate `seal_tick`'s own size/age trigger check**
+(`ctx.data().stream_seal_knobs`) — `seal_now` itself is trigger-free (the
+caller decides *whether*, the function only knows *how*), so an
+unconditional call needs no knob. **Does NOT replicate the `is_quiesced()`/
+`Building`-child guards** `change_consumer_loop` carries — both are
+structurally unreachable under this fixture (`SimCluster` never calls
+`RaftKvNode::enable_quiescence`, and never splits a hand/wire-created
+table's own tablet through this driver's own path), the identical
+documented gap `drain_gsi`'s own doc states. A future rung giving
+`SimCluster` real quiescence or splitting would need to add both guards
+back to this method too. No new per-node loop or closure was added —
+`drive_stream_seal` is an on-demand call driven via `SimCluster::
+spawn_and_capture`, exactly like `drain_gsi`/`drive_inplace_split_cutover`
+— so issue #753's Drop-coverage requirement doesn't apply here; the
+existing `Drop for SimCluster`/`SimCluster::restart` teardown (`Simulator::
+shutdown`, `SimRelayClient::shutdown`) already covers everything this PR
+holds per node, and `dropping_the_cluster_frees_every_nodes_relay_and_
+edge_state` needed no `Weak`-handle extension (the new `segment_store`
+field is plain `Arc<Mutex<..>>`-backed data with no captured `Env`/task
+handle of its own, the identical reasoning `backup_store` — added by D4
+PR 5, also with no `Weak` extension — already established).
+
+**New module: `crates/animusd/src/sim_cluster_dynamo_streams.rs`**, one
+scenario (`create_enable_write_seal_disable`, `_over_seeds` at 5 seeds):
+create a table over the wire, `UpdateTable` to enable a stream through
+`SimClusterHandle::dynamo` (proving the new sub-arm), write three items
+from a non-leader node (`ConsistentRead: true` on the verifying read, ADR
+0055), call `SimCluster::drive_stream_seal` on the tablet's leader, assert
+exactly one `Metadata::stream_shards` row exists for the tablet with the
+expected record count and that `segment_store().stored_ids()` is
+non-empty, then disable the stream through the same sub-arm (from a
+*different* node than the one that enabled it) and assert every node's
+own catalog reflects it. **No product bug found beyond the `seal_now`
+clock conversion above.**
+
+**Gates**: `cargo fmt --all --check` (clean); `cargo clippy -p animusd
+--all-targets --all-features -- -D warnings` (clean); `cargo build -p
+animusd --all-targets` (clean); `cargo test -p animusd --lib -- --test-
+threads=2` (440 passed, 0 failed, 3 ignored, 831.76s — 438 baseline + this
+PR's 2 new tests, matching the established C-06-close baseline exactly;
+peak resident memory ~958 MB, sampled from the test binary's own
+`/proc/<pid>/status` `VmRSS` with the anchored `pgrep -f '^<abs-path>/
+target/debug/deps/animusd-'` pattern); `cargo test -p animusd --test
+dynamo_streams` (15 passed, 0 failed, 14.86s — the real-socket regression
+proving `update_table`/`disable_stream`'s concrete path stayed
+byte-identical; `--test dynamo_table_ops` no longer exists as a separate
+binary, folded into `sim_cluster_dynamo_table_ops.rs` by D3 PR 2a, so the
+fallback form ran). `Cargo.lock` unchanged.
+
+## Appendix — SimCluster coverage for the Streams read API (ADR 0061 rung G, C-07 PR 3, 2026-09-08)
+
+Closes the read-API half PR 2's own scope note left open: `ListStreams`/
+`DescribeStream`/`GetShardIterator`/`GetRecords` are now reachable from
+`SimCluster`, over both the sealed and open-tail serve paths.
+
+**`dynamo_streams.rs`**: `execute_as`, `run_operation`, `list_streams`,
+`describe_stream`, `get_shard_iterator`, `get_records`,
+`get_records_sealed`, `get_records_open` — all eight functions the rung's
+opener named — widened from `&ClientCtx` to `<E: Env, R: RelayClient>`.
+Every one was already calling only generic callees
+(`ctx.effective_metadata()`, `authz::authorize`/`authorize_unscoped`,
+`ClientCtx::read_stream_hot_records` (`schema.rs`, already generic since
+rung C5), `ctx.segment_store.get_sealed(..)` — a plain, non-`E`-typed
+`SegmentStoreHandle` enum), so this was a genuine pure move, not a
+rewrite — the D2 PR 1/D3 PR 2a-2b/rung G PR 2 precedent, applied once
+more. `execute_as` — the production entry `dynamo.rs::execute_routed_as`
+still calls — is now a thin wrapper over a new generic core,
+`dynamo_streams::execute_streams_op_as<E, R>`, monomorphized at `E =
+ProdEnv, R = AnimusdRelayClient` by its own concrete `&ClientCtx`
+signature; `execute_streams_op_as` itself covers all four Streams
+operations with **no** `unsupported_by_generic_dispatch` gap — unlike
+`dispatch_item_op`, nothing in this module turned out to be genuinely
+`ProdEnv`-bound (no direct socket dial, no `tokio::spawn`). `run_operation`/
+`list_streams`/`describe_stream`/`get_shard_iterator`/`get_records`/
+`get_records_sealed`/`get_records_open` are unchanged in body, only in
+signature (`ClientCtx<E, R>` in place of the bare `ClientCtx` alias) —
+production behavior is byte-identical, confirmed by the unmodified
+`tests/dynamo_streams.rs` real-socket suite staying green (below).
+
+**`sim_cluster.rs`**: `SimClusterHandle::dynamo_streams(node, target, body)
+-> (u16, String)` mirrors `SimClusterHandle::dynamo` exactly — an
+unrestricted `Principal` (this fixture has no SigV4 listener to gate
+through), calling `dynamo_streams::execute_streams_op_as` directly rather
+than through the `dynamo.rs::execute_routed_as` target-prefix fork, since a
+caller here already knows the target is Streams-shaped (the identical
+"call the narrower entry point directly" precedent `SimClusterHandle::
+dynamo` already set for `execute_item_op_as`). `SimCluster::dynamo_streams`
+is its synchronous `&mut self` wrapper, driven through `spawn_and_capture`
+exactly like `SimCluster::dynamo`. No new per-node loop or closure — both
+are plain async methods called on demand, so issue #753's Drop-coverage
+requirement doesn't apply (the existing `Drop for SimCluster`/`SimCluster::
+restart` teardown already covers everything this PR touches).
+
+**New module content: `crates/animusd/src/sim_cluster_dynamo_streams.rs`
+grows from 1 scenario (PR 2) to 9**, 8 new scenarios added this PR, each
+with a pinned seed and a `_over_seeds` sibling at 5 seeds, every one issued
+from a **non-leader** node of a 3-node RF3 `SimCluster` wherever the
+operation has a leader to forward to (the identical `sim_cluster_dynamo.rs`/
+`sim_cluster_dynamo_partiql.rs` forwarding-path precedent):
+
+- `list_streams_and_describe_stream_after_enable` — `ListStreams`
+  names the table/label; `DescribeStream` shows the one still-open
+  epoch-0 shard.
+- `get_records_over_the_open_tail_before_any_seal` — `GetShardIterator
+  (TRIM_HORIZON)` + `GetRecords` over the OPEN tail with no
+  `stream_shards` catalog row for the tablet at all — proves
+  `get_records_open` → `ClientCtx::read_stream_hot_records` →
+  `index_drain::hot_read`, forwarded to the tablet's own leader (ADR
+  0042 §7/§8, no `ReadIndex` barrier).
+- `get_records_over_the_sealed_shard_from_the_shared_store` —
+  `SimCluster::drive_stream_seal` then `GetRecords` over the resulting
+  SEALED shard — proves `get_records_sealed` genuinely reads
+  `SegmentStoreHandle::S3` (`SimCluster::segment_store()`'s shared
+  `SimSegmentStore`), asserting `stored_ids()` is non-empty afterward.
+- `iterator_obtained_before_a_seal_continues_correctly_across_the_seal`
+  — the sealed-vs-open handoff (ADR 0042 §2): mint against the
+  still-empty open shard, write + seal underneath it with no re-mint,
+  the SAME token then resolves through the sealed path with the correct
+  record.
+- `next_shard_iterator_pagination_with_small_limit_visits_each_record_once`
+  — a `Limit: 2` walk of a 5-record sealed shard visits every record
+  exactly once, no gaps or duplicates.
+- `iterator_types_latest_at_and_after_sequence_number` — `LATEST` on a
+  genuinely open shard (one hot read finds the current max; an empty
+  poll returns the identical token; a later write becomes visible
+  through it unchanged), then `AT_SEQUENCE_NUMBER`/
+  `AFTER_SEQUENCE_NUMBER` on that same content once sealed (inclusive
+  vs. exclusive of the named sequence number).
+- `cross_node_reads_answer_the_same_records_for_the_same_iterator` — the
+  identical iterator token, replayed through every node of the cluster
+  in turn, answers byte-identical `(records, NextShardIterator)` every
+  time.
+- `disable_then_grace_window_describe_and_get_records` — F12-b's
+  disable grace window (ADR 0042 §11, `docs/streams-notes.md`):
+  `ListStreams` still names the `DISABLED` label, `DescribeStream`
+  reports it with no open shard, its already-sealed reads keep
+  working, and a genuinely never-existed label is
+  `ResourceNotFoundException`.
+
+**A real fixture gotcha found building four of the eight scenarios above
+(the sealed-shard read, pagination, the AT/AFTER iterator types, and
+cross-node reads), documented in `docs/engineering-lessons.md`'s matching
+entry**: `DescribeStream` always appends a tablet's still-open successor
+epoch behind a just-sealed one while the stream stays `enabled` — so after
+a single `drive_stream_seal` call over a small backlog, `Shards.len()` is
+**2** (the sealed epoch plus its fresh, empty open successor), never 1;
+the sealed entry is always `shards[0]` (sorted ascending by epoch), never
+the array's sole element. Every affected scenario's assertion now counts
+`sealed_count + 1` and indexes the sealed entry from the front — no
+`src/dynamo_streams.rs` change, this is correct, pre-existing production
+behavior the module's first draft simply hadn't accounted for.
+
+**The ninth item this PR's own brief named — a bare (non-`Forwarded`)
+`ClientRequest::StreamHotRead` refusal — was deliberately skipped, not
+built; the reasoning is recorded in full in `sim_cluster_dynamo_streams.
+rs`'s own module doc.** In short: `animus_node::sim_relay::SimRelayClient`'s
+inbound dispatch (`forwarding::handle_relayed_request`) is not the
+mechanism the real regression (`tests/dynamo_streams.rs::
+bare_stream_hot_read_is_refused`) proves — that test exercises
+`handle_request`'s `Surface::Intra` port guard and `cp_serve_forwarded`'s
+own bare-refusal match arm, neither of which exists under this fixture's
+relay path at all. `handle_relayed_request`'s own match is a three-arm
+allowlist (`Status`/`Forwarded`/`ProposeSchema`) with a blanket `_ =>
+"not relayable under sim"` catch-all, so a bare `StreamHotRead` sent
+through it would be refused for a reason that has nothing to do with the
+real mechanism — proving that would be a materially different claim than
+the one this PR's brief asked for, and `sim_cluster.rs` exposes no
+raw-relay-send primitive to any sibling module today besides. The real
+mechanism stays covered, unmodified, by the real-socket regression this
+PR's own gate run re-verifies.
+
+**No product bug found in this module's own PR-3 scope** (the
+`DescribeStream` shape above is correct production behavior, not a bug).
+
+**Gates**: `cargo fmt --all --check` (clean, after one auto-fix); `cargo
+clippy -p animusd --all-targets --all-features -- -D warnings` (clean);
+`cargo build -p animusd --all-targets` (clean); `cargo test -p animusd
+--lib sim_cluster_dynamo_streams` (18 passed, 0 failed); `cargo test -p
+animusd --lib -- --test-threads=2` (456 passed, 0 failed, 3 ignored,
+862.19s — 438 baseline + this PR's 18 new tests, matching the established
+C-06-close baseline exactly; resident memory sampled every 10s from the
+test binary's own `/proc/<pid>/status` `VmRSS` via the anchored `pgrep -f
+'^<abs-path>/target/debug/deps/animusd-'` pattern: first ~116 MB, peak
+~844 MB, last ~181 MB); `cargo test -p animusd --test dynamo_streams` (15
+passed, 0 failed, 14.71s — the real-socket regression proving
+`execute_as`/`run_operation`'s concrete path stayed byte-identical).
+`Cargo.lock` unchanged.
+
+## Appendix — `tests/dynamo_streams.rs` siblings (ADR 0061 rung G, C-07 PR 4, 2026-09-08)
+
+Closes the plan's own PR 4 scope: every sim-convertible test in
+`tests/dynamo_streams.rs` now has a deterministic sibling in
+`crates/animusd/src/sim_cluster_dynamo_streams.rs`, and that real-socket
+file is trimmed to exactly the tests that must stay `ProdEnv` — mirroring
+D3 PR 3b's own precedent for `dynamo_query_filter.rs` and friends. **No
+`dynamo.rs`/`dynamo_streams.rs`/`sim_cluster.rs` change was needed** — PR 2
+(the dispatch groundwork: `dispatch_table_op`'s stream sub-arm,
+`SimCluster::drive_stream_seal`) and PR 3 (`execute_streams_op_as`, the
+Streams read API) already built every primitive this PR reuses; PR 4 is
+pure test authorship.
+
+**Test-by-test disposition (12 converted, 3 kept `ProdEnv`)**:
+
+| Real-socket test | Disposition |
+|---|---|
+| `set_table_stream_enable_propagates_and_survives_restart` | **KEPT** — real control-plane WAL restart (ADR 0038's durable mirror); `SimCluster` never crosses a genuine process restart with a real on-disk WAL |
+| `disable_survives_concurrent_periodic_seal_on_local_route` | **KEPT** — races the real periodic `change_consumer_loop`'s own timer-driven seal arm (issue #572); `SimCluster` never spawns that loop, sealing there is always test-driven via `drive_stream_seal` |
+| `bare_stream_hot_read_is_refused` | **KEPT** — the production `Surface::Intra` port guard; `SimCluster`'s relay dispatch has no port concept to reproduce it against (PR 3's own doc already stated this — PR 4 changed nothing here) |
+| `update_table_stream_enable_and_disable_through_every_node` | Converted → `run_update_table_stream_enable_and_disable_through_every_node` (new scenario) |
+| `describe_table_returns_stream_spec_and_arn_reenable_mints_new_label` | Converted → `run_describe_table_returns_stream_spec_and_arn_reenable_mints_new_label` (new scenario) |
+| `transact_write_items_on_a_streamed_table_delivers_correct_events` | Converted → `run_transact_write_items_on_a_streamed_table_delivers_correct_events` (new scenario, reuses the C-06 PR 3 Transact dispatch) |
+| `transact_write_items_abort_leaves_no_stream_event` | Converted → `run_transact_write_items_abort_leaves_no_stream_event` (new scenario) |
+| `get_records_walks_the_shard_chain_and_drains_the_open_tail` | Converted → `run_get_records_walks_the_shard_chain_and_drains_the_open_tail` (new scenario, two `drive_stream_seal` calls stand in for `tiny_seal_knobs`) |
+| `open_shard_iterator_survives_a_seal_and_keeps_working` | Converted, **not duplicated** — identical in kind to PR 3's own scenario (d), `iterator_obtained_before_a_seal_continues_correctly_across_the_seal` |
+| `limit_pagination_drains_a_sealed_shard_exactly_once` | Converted, **not duplicated** — identical in kind to PR 3's own scenario (e), `next_shard_iterator_pagination_with_small_limit_visits_each_record_once` |
+| `get_records_on_a_sealed_shard_works_from_every_node` | Converted, **not duplicated** — identical in kind to PR 3's own scenario (g), `cross_node_reads_answer_the_same_records_for_the_same_iterator` |
+| `get_records_on_an_open_shard_forwards_correctly_from_every_node` | Converted → `run_get_records_on_an_open_shard_forwards_correctly_from_every_node` (new scenario — PR 3 had no every-node OPEN-shard read) |
+| `disabled_stream_grace_window_lists_and_serves_sealed_reads_with_no_open_shard` | Converted, **not duplicated** — identical in kind to PR 3's own scenario (h), `disable_then_grace_window_describe_and_get_records` |
+| `pre_enable_marker_records_never_surface_on_the_stream` | Converted → `run_pre_enable_marker_records_never_surface_on_the_stream` (new scenario) |
+| `stream_keys_carry_n_sort_key_values_across_mixed_magnitudes_and_signs` | Converted → `run_stream_keys_carry_n_sort_key_values_across_mixed_magnitudes_and_signs` (new scenario) |
+
+For each of the four "not duplicated" rows, every assertion the real-socket
+original makes was checked line-by-line against its PR 3 counterpart before
+relying on it (same shard-count/open-vs-sealed shape, same event/iterator-
+exhaustion assertions, same grace-window `ListStreams`/`DescribeStream`/
+bogus-ARN behavior) — `sim_cluster_dynamo_streams.rs`'s own module doc has
+the full cross-reference. The eight new scenarios were each written to
+carry every assertion its real-socket original made, adapted to this
+fixture's own idiom (a `_over_seeds` sibling at 5 seeds, issued from a
+non-leader node wherever the operation has a leader to forward to, every
+verifying read asking for `ConsistentRead: true`).
+
+**Knobs → `drive_stream_seal` mapping (stated once here, and in the sim
+module's own doc)**: the real-socket file's `tiny_seal_knobs`/
+`age_seal_knobs`/`never_seals_knobs` steer the *periodic* seal arm
+(`change_consumer_loop`'s `seal_tick`), which `SimCluster` never spawns at
+all (PR 2's own finding). A converted scenario instead calls
+`SimCluster::drive_stream_seal(leader)` explicitly, which seals whatever is
+currently pending into one epoch, unconditionally (trigger-free — the
+caller decides *whether*, the function only knows *how*): a scenario that
+relied on `tiny_seal_knobs`'s "seal almost immediately" to produce a chain
+of several small closed shards calls `drive_stream_seal` once per desired
+shard; one that relied on `never_seals_knobs`'s "don't race the periodic
+arm" simply never calls it; one that relied on `age_seal_knobs`'s "sweep
+the whole backlog together" gets the identical shape for free from a
+single `drive_stream_seal` call over the whole pending backlog (already
+proven by PR 3's own scenario (e), hence no new scenario needed for
+`limit_pagination_drains_a_sealed_shard_exactly_once`).
+
+**`Transact` reuses the C-06 PR 3 dispatch unmodified** — `Operation::
+TransactWriteItems` already routes through `dispatch_item_op` (generic
+since C-06 PR 2/3), so `run_transact_write_items_on_a_streamed_table_
+delivers_correct_events`/`_abort_leaves_no_stream_event` needed no new
+`dynamo.rs` mechanism, only the wire JSON bodies and the existing
+`describe_stream_via_wire`/`get_shard_iterator_via_wire`/
+`get_records_via_wire` helpers from PR 3. Both scenarios prove the change
+record materializes on the OPEN-tail read path with no seal needed — a
+streamed table's transactional write resolves before `cp_txn` acks (ADR
+0046 A1), so the record is already visible.
+
+**Before/after `--test dynamo_streams` counts**: 15 passed (untrimmed, the
+D3 discipline — proved green against this branch before removing anything)
+→ 3 passed (trimmed). `cargo test -p animusd --lib sim_cluster_dynamo_
+streams -- --test-threads=2`: 34 passed (18 from PR 2/3 + 16 new from this
+PR — 8 scenarios × {pinned seed, `_over_seeds`}).
+
+**No product bug found.** Every converted scenario passed at its pinned
+seed and every `_over_seeds` seed on the first clean run once the wire
+JSON shapes matched the fixtures already established by this module's
+earlier PRs.
+
+**Gates, in the required order**: `cargo test -p animusd --test dynamo_
+streams` on the untrimmed file (15 passed, 14.44s); `cargo test -p animusd
+--lib sim_cluster_dynamo_streams -- --test-threads=2` (34 passed, 86.92s);
+trim, then `cargo test -p animusd --test dynamo_streams` again (3 passed,
+14.11s); `cargo fmt --all --check` (one auto-fix applied, then clean);
+`cargo clippy -p animusd --all-targets --all-features -- -D warnings`
+(clean); `cargo build -p animusd --all-targets` (clean); `cargo test -p
+animusd --lib -- --test-threads=2` (472 passed, 0 failed, 3 ignored,
+901.75s — 456 baseline + this PR's 16 new tests; resident memory sampled
+every 10s from the test binary's own `/proc/<pid>/status` `VmRSS` via the
+anchored `pgrep -f '^<abs-path>/target/debug/deps/animusd-'` pattern:
+first ~129 MB, peak ~902 MB, last ~180 MB — consistent with PR 3's own
+figures). `Cargo.lock` unchanged.
+
+## Appendix — SimCluster coverage for the DynamoDB Streams segment janitor (ADR 0061 rung G, C-07 PR 5, 2026-09-08)
+
+Closes rung G/C-07's PR 5: the segment janitor's own async loop
+(`segment_janitor::segment_janitor_loop`, ADR 0043 §A9 — two-phase
+retention reclaim, replica repair, the drop-table convergent cascade) is
+now spawned unconditionally on every `SimCluster` node, and 9 of the 11
+`tests/stream_janitor.rs` real-socket scenarios have deterministic,
+seed-replayable siblings in `crates/animusd/src/sim_cluster_stream_
+janitor.rs`.
+
+**The widening (`segment_janitor.rs`)**: `segment_janitor_loop`/
+`segment_janitor_tick` and their shared private helper,
+`update_segment_janitor_progress`, widened from `&ClientCtx` (`E =
+ProdEnv`) to `<E: Env, R: RelayClient>` — a pure signature change,
+mirroring `backup_janitor_loop`'s own D4 PR 5 widening exactly. `reap_
+orphans` needed no change at all (it already took only a
+`&SegmentStoreHandle` and a `&Metadata`). The loop's one real-clock site
+(`tokio::time::sleep(SEGMENT_JANITOR_INTERVAL)`) became `ctx.env.
+sleep(..)`; every other site already read `ctx.env.now()`/`ctx.env.
+metrics()` through the `E: Env` bound, so the `Clock` import became
+unused and was dropped. Both production spawn sites (`spawn_common_
+tail`) still hand this a concrete `ClientCtx` with zero call-site
+changes — `cargo test -p animusd --test stream_janitor` on the
+untrimmed 11-test file (11/11 passed) is this rung's own proof
+production behavior is byte-identical.
+
+**The spawn (`sim_cluster.rs`)**: `SimCluster::new`/`restart` spawn
+`segment_janitor_loop` unconditionally on every node — mirroring
+`backup_janitor_loop`'s own always-on D4 PR 5 shape, not `auto_split_
+loop`'s opt-in one, since the loop's own leader gate already makes a
+non-leader's tick a cheap idle sleep. The retention window is a
+**constructor knob** (`SimCluster::new_with_segment_janitor_retention`,
+default 3600s via `DEFAULT_SIM_SEGMENT_JANITOR_RETENTION`), not a live
+setter — the production loop's own `retention: Duration` is captured by
+value at spawn time, so reconfiguring after the fact would mean spawning
+a second, concurrent loop rather than changing the first one's. `SimCluster::
+segment_janitor_progress(node)` mirrors `backup_janitor_progress` exactly
+(`GET /admin/gc`'s own read, a plain lock/clone/drop). **No `Drop for
+SimCluster`/`restart` extension was needed** (issue #753's own discipline):
+the spawned loop captures a plain `ClientCtx` clone, the identical shape
+`backup_janitor_loop` already captures — no new `Weak`-tracked handle.
+
+**A real, load-bearing timing gotcha, documented in the new module's own
+doc and worth restating here**: every `SimCluster` op call (`dynamo`/
+`put`/`drive_stream_seal`/`drive_inplace_split_cutover`/…) unconditionally
+burns a full `OP_BUDGET` (12s) of virtual time via `spawn_and_capture`'s
+own `self.sim.run_for(OP_BUDGET)`, regardless of how quickly the
+underlying work finishes. This makes the real-socket file's own 2s `TINY_
+RETENTION` unusable for **catching a row mid-sweep** through an op call —
+by the time any op call that could observe the row's state *returns*,
+retention has almost always already elapsed silently inside that same
+opaque 12s window. Two strategies, chosen per scenario: (a) a short
+retention plus a converged-or-timeout poll for scenarios that only care
+about eventual convergence, and (b) for the one scenario needing to catch
+the row genuinely mid-sweep (`expiry_survives_a_control_leader_kill_mid_
+sweep`), a retention deliberately larger than the setup phase's own
+computable cumulative op-budget cost, then a manual, small-step `run_for`
+poll loop (never another op call) to observe the marked-but-not-removed
+state precisely.
+
+**A second instance of the identical gotcha, found and fixed during this
+PR's own gate-8 pass**: `two_phase_expiry_removes_the_row_and_every_
+replicas_object` asserts the segment OBJECT still exists **immediately**
+after `drive_stream_seal` returns — but that call's own `spawn_and_
+capture` burns the full `OP_BUDGET` (12s) regardless of how quickly the
+seal itself lands, so with the original `retention = 2s` the janitor's
+200ms tick had ample opportunity to mark-and-delete the just-sealed object
+during that same call's own leftover budget, before the test ever read
+`stored` back out. Fixed by raising this one scenario's own retention to
+20s (comfortably clearing the 12s `OP_BUDGET` margin, still converging
+well inside the scenario's own 60s final poll) — a scenario-local fix, no
+change to `segment_janitor.rs`/`sim_cluster.rs`.
+
+**Scenario-by-scenario disposition (11 real-socket tests → 9 moved, 2
+kept `ProdEnv`, each with its own one-line reason in both files)**:
+
+| Real-socket test | Disposition |
+|---|---|
+| `two_phase_expiry_removes_the_row_and_every_replicas_object` | Moved (adapted to this fixture's shared `S3` store — proves the empty-replicas branch, not the cataloged-replicas one) |
+| `expiry_survives_a_control_leader_kill_mid_sweep` | Moved (the manual `run_for`-only poll strategy above) |
+| `reader_never_sees_an_empty_success_gap_across_expiry` | Moved |
+| `repair_re_replicates_to_a_fresh_target_after_a_replica_node_dies` | **KEPT** — needs a genuinely dead replica; this fixture's shared `S3` store has no per-node replica concept at all (`row.replicas` is always empty) |
+| `disable_grace_lifecycle_end_to_end_with_reenable_coexistence` | Moved |
+| `drop_table_cascade_converges_via_the_janitor` | Moved |
+| `mid_grace_drop_removes_both_coexisting_labels` | Moved |
+| `metrics_reflect_a_completed_retention_cycle` | Moved (asserts on `segment_janitor_progress`, since `Metric::*` counters are structurally unreachable from `SimCluster` — no recording `MetricsHandle` is ever threaded in) |
+| `retired_parents_shards_are_not_reaped_early` | Moved (via `SimCluster::grow_stream` + `drive_inplace_split_cutover`, this rung's own new in-place-split-cutover driving) |
+| `retired_parents_final_shard_expires_by_retention` | Moved |
+| `segment_janitor_reclaims_objects_from_a_genuinely_control_only_leader` | **KEPT** — needs a genuine control-only/data-only process split; `SimCluster` has no notion of node role at all |
+
+**New `SimCluster` primitive: `grow_stream(node, table)`** — wraps
+`ClientCtx::grow_stream` (the production primitive behind `POST /admin/
+stream/grow`), since `SimCluster` has no admin HTTP surface to drive that
+route through directly.
+
+**Before/after `--test stream_janitor` counts**: 11 passed (untrimmed) →
+2 passed (trimmed). `cargo test -p animusd --lib sim_cluster_stream_
+janitor -- --test-threads=2`: 18 passed, 0 failed.
+
+**Gates, in the required order**: `cargo test -p animusd --test stream_
+janitor` on the untrimmed file (11 passed); `cargo test -p animusd --lib
+sim_cluster_stream_janitor -- --test-threads=2` (18 passed, one scenario-
+local retention fix applied along the way, described above); trim, then
+`cargo test -p animusd --test stream_janitor` again (2 passed); `cargo
+fmt --all --check` (clean after `cargo fmt --all` — the two files this
+PR's own earlier turns had already edited, `sim_cluster.rs` and `sim_
+cluster_stream_janitor.rs`, carried pre-existing unformatted code from
+those turns; no file outside this PR's own change set was touched);
+`cargo clippy -p animusd --all-targets --all-features -- -D warnings`
+(clean); `cargo build -p animusd --all-targets` (clean); `cargo test -p
+animusd --lib sim_cluster -- --test-threads=2` (315 passed, 0 failed, 2
+ignored, 919.49s; resident memory sampled every 10s from the test
+binary's own `/proc/<pid>/status` `VmRSS` via the anchored `pgrep -f
+'^<abs-path>/target/debug/deps/animusd-'` pattern: first ~139 MB, peak
+~880 MB, last ~166 MB — consistent with every prior rung's own
+no-leak trajectory); `cargo test -p animusd --test dynamo_streams --test
+stream_janitor` (5 passed, 0 failed — the real-socket regression proving
+`segment_janitor_loop`/`segment_janitor_tick`'s widened signature stayed
+byte-identical, and the two kept `stream_janitor.rs` tests still pass).
+`Cargo.lock` unchanged.
+
+## Appendix — C-07 closed, docs-only close-out (ADR 0061 rung G, C-07 PR 6, 2026-09-08)
+
+No source, test, or `Cargo` change — this appendix, this file's own
+"Streams — closed by C-07" residual-inventory paragraph above (Tests
+section), ADR 0061's "Rung G closed" amendment, and `docs/roadmap.md`'s
+C-07 entry are the entire PR. Streams is no longer a D3-closing-inventory
+residual in progress: `dynamo_streams.rs` (12 of 15 converted) and
+`stream_janitor.rs` (9 of 11 converted) are both closed, `stream_backfill_
+seed_filter.rs`/`console_stream.rs` were never this rung's to claim and
+are unaffected, and `streams_e2e.rs` stayed untouched throughout, frozen
+behind #298/#745. See ADR 0061's "Rung G closed" amendment for the full
+PR-by-PR account, the complete per-test `ProdEnv` residue with reasons,
+and the two in-scope findings (the `seal_now` real-clock body bug fixed
+in PR 2, the `OP_BUDGET`-vs-retention timing lesson from PR 5).
+
+## Appendix — admin/console `SimCluster` dispatch groundwork (ADR 0061 rung H, C-08 PR 2, 2026-09-08, corrected same day in review)
+
+`impl AdminHost for ClientCtx` (`admin.rs`, 43 handler functions — the
+exact count once `config_view` through `action_revoke_credential` were
+all enumerated, not the opener's own "~30" estimate) and `impl
+console::ConsoleBackend for ClientCtx` (`lib.rs`, 14 methods) both needed
+a `<E: Env, R: RelayClient>`-generic sibling reachable from `SimCluster`.
+Blockers (a) (the three credential handlers' `tokio::time::Instant::
+now()`/`sleep` commit-wait loops) and (b) (`action_data_seed`'s retry
+sleep) converted to `ctx.env.now()`/`ctx.env.sleep(..)`, mirroring
+`disable_stream`'s own precedent. `dynamo.rs::execute_routed_as_generic
+<E: Env, R: RelayClient>` (blocker (c)) forks on the `X-Amz-Target`
+prefix exactly like the concrete `execute_routed_as`, to `execute_item_
+op_as`/`dynamo_streams::execute_streams_op_as`. `SimCluster::admin`/
+`console` (`sim_cluster.rs`) call `animus_node::admin::dispatch`/
+`animus_node::console::route` directly — no HTTP framing to build —
+mirroring `SimClusterHandle::dynamo`'s own shape; two pinned-seed smoke
+tests (`admin_status_is_reachable_from_sim_cluster`, `console_tables_
+lists_a_created_table`) prove both reach live replicated state end to
+end.
+
+**A real production regression found by this rung's own required gate,
+not by inspection.** A first cut widened `impl AdminHost for ClientCtx`/
+`impl ConsoleBackend for ClientCtx` **in place** to `<E: Env, R:
+RelayClient>` — the same shape every prior D2/D3/D4/F/G rung used for a
+*free function*. Once `action_data_dynamo`/`add_gsi`/`drop_gsi`'s shared
+body was forced to call the narrower `execute_routed_as_generic` (the
+only way a `<E, R>`-generic body compiles at all), the untrimmed `admin_
+endpoint.rs`/`console_create_table.rs`/`console_table_config.rs`/
+`dashboard_endpoint.rs` suites turned up nine real failures:
+`UpdateTimeToLive`/`CreateBackup`/`DeleteBackup` and `UpdateTable`-with-
+an-index-change are all reachable through `/admin/data/dynamo` and the
+console's own mutating endpoints, and none of the three was in
+`dispatch_item_op`'s coverage — a genuine regression in shipped
+functionality, not a `SimCluster`-only gap, since widening a *blanket
+impl on `ClientCtx` itself* (production's own default-instantiated
+concrete type) doesn't add a parallel path the way widening a free
+function does — it replaces the only implementation `ClientCtx` has, for
+every caller including production's own. See `docs/engineering-
+lessons.md`'s two matching 2026-09-08 entries (the second rewritten in
+review, see below) for the full diagnosis and the general lesson.
+
+**Six of the nine closed correctly, by genuinely widening the underlying
+operations**: `update_time_to_live`/`create_backup`/`delete_backup`
+(`dynamo.rs`) had no `tokio::spawn` blocking them — only the identical
+`tokio::time` → `ctx.env` conversion this whole series already does
+mechanically — so widening all three to `<E: Env, R: RelayClient>` and
+adding three new `Operation::UpdateTimeToLive`/`CreateBackup`/
+`DeleteBackup` arms to `dispatch_item_op` was the correct fix, not a
+workaround; `run_operation`'s own arms for all three are byte-for-byte
+unchanged, confirmed by the untrimmed real-socket suites for backup/TTL
+staying green throughout. This half of the PR was never revisited by the
+review correction below.
+
+**The remaining two (`console_table_config.rs`'s `add_gsi_records_a_
+declared_attribute_type`/`add_and_drop_gsi_round_trip`) are genuinely
+blocker (d)** — `UpdateTable` with an index change has no `dispatch_
+table_op` sub-arm, and closing that for real needs the GSI backfill
+machinery generalized too, out of this PR's scope exactly as the opener
+named it. **The PR's own first fix for this compounded the original
+mistake rather than correcting it**: since Rust's coherence rules forbid
+a second `impl ConsoleBackend for ClientCtx` alongside the now-widened
+generic one, and `route`'s own `&dyn ConsoleBackend` trait-object
+dispatch has no inherent-method-priority escape hatch, the first attempt
+added a concrete interception layer inside `console.rs::serve`/
+`handle_conn` — special-casing the two GSI routes ahead of `route`'s own
+dispatch, routing them to new concrete-only functions that called the
+unmodified `execute_routed`. This compiled and passed every test, and was
+still wrong: `serve`/`handle_conn` sit directly upstream of `route` in
+the same production console path, so threading a concrete `ClientCtx`
+into their signatures and duplicating `animus_node::console`'s own
+route-parsing logic was itself a change to the production console path —
+exactly what this rung's own non-goals forbid, one file removed from the
+trait impl itself.
+
+**Corrected in review**: `impl AdminHost for ClientCtx`/`impl
+console::ConsoleBackend for ClientCtx` are reverted to concrete —
+production, observably byte-identical to before this rung, every
+dispatch call site the concrete `execute_routed`/`execute_routed_as`. A
+new one-field newtype pair, `GenericAdminHost<E, R>(pub ClientCtx<E,
+R>)`/`GenericConsoleBackend<E, R>(pub ClientCtx<E, R>)` (`admin.rs`/
+`lib.rs`), carries its own separate `impl<E: Env, R: RelayClient> Trait
+for Generic*<E, R>` reaching the generic dispatch instead — coherence
+allows this because the two impls target genuinely different types, even
+though one always wraps the other. `SimCluster::admin`/`console`
+(`sim_cluster.rs`) wrap `self.ctx(node)` in the newtype before calling
+`animus_node::admin::dispatch`/`console::route`; production's own
+`spawn_common_tail` is unaware the newtype exists at all. `console.rs`
+reverted to byte-identical with `git checkout HEAD~1 --
+crates/animusd/src/console.rs` — `git diff` against that baseline is
+empty; `console_add_gsi_concrete`/`console_drop_gsi_concrete` (the
+now-dead concrete-interception functions) were deleted from `lib.rs`
+along with the `spawn_common_tail` call site's extra `ctx.clone()`
+argument `console::serve` never needed. Both `Generic*` impls share every
+byte of request-building/response-parsing logic with their concrete
+siblings (small `<E, R>`-generic or plain free functions, called via
+`self`/`&self.0`) — only the dispatch-call line differs — so the two
+paths cannot drift apart; `add_gsi`/`drop_gsi` on `GenericConsoleBackend`
+return blocker (d)'s own `unsupported_by_generic_dispatch` error
+naturally, via the unmodified `execute_routed_as_generic` →
+`dispatch_table_op` fallthrough, needing no bespoke handling.
+`dispatch_table_op`/`execute_item_op_as`/`execute_routed_as_generic`
+(`dynamo.rs`) and the generic `action_data_dynamo` (`admin.rs`) —
+reachable only through the two `Generic*` types, themselves constructed
+only by `SimCluster::admin`/`console` — regained the `#[cfg_attr(not
+(test), allow(dead_code))]` treatment they carried before this rung ever
+gave them a real (if mistaken) production caller, mirroring
+`execute_statement_as`'s own precedent for the identical shape.
+
+**`admin.rs::action_data_dynamo` needed the identical newtype split, not
+a narrower fix** — Finding A's own widening closed every *coverage* gap
+`/admin/data/dynamo`'s own tests exercise, but the concrete `impl
+AdminHost for ClientCtx`'s `action_data_dynamo` method still needed to
+keep calling the full, unmodified `execute_routed` (via a new
+concrete-only sibling, `action_data_dynamo_concrete`) rather than
+`execute_routed_as_generic` — the identical reasoning as `ConsoleBackend`'s
+own `add_gsi`/`drop_gsi`, since `/admin/data/dynamo` can be asked to run
+**any** DynamoDB operation, not just the six Finding A widened.
+
+**Non-goals held throughout, verified via `git diff`, not merely
+asserted**: `animus_node::admin::dispatch`, `animus_node::console::route`,
+`execute_routed`, `execute_routed_as`, and `execute_as` are byte-identical
+— zero changed lines inside any of the three `dynamo.rs` function bodies
+(only `execute_routed`'s own doc comment changed, describing its actual
+remaining callers), and `crates/animus-node/` has no changes in this PR's
+diff at all — confirmed both before and after the review correction.
+`crates/animusd/src/console.rs` is byte-identical to this rung's own
+starting point. `dynamo.rs::dispatch` (the real DynamoDB wire listener) is
+untouched and still calls `execute_routed_as` directly — `execute_routed_
+as_generic` never becomes its path.
+
+**The first cut's own gate report also cited an unverified flake
+attribution, corrected here.** A single transient failure of
+`admin_backups_view_reflects_the_catalog` (observed once, immediately
+after a `cargo build`) was attributed to "this crate's own documented
+sandbox-contention flake class for `admin_endpoint.rs`, issue #585's
+entries" — a citation that was never actually checked: `grep -n 585
+crates/animusd/tests/admin_endpoint.rs` finds nothing. The failing run's
+own output was not preserved and cannot be reproduced from this vantage
+point. Post-correction, that one test was run 6 times total across two
+full gate passes plus a dedicated 3x check and passed every time — see
+the Gates line below. Treat this as an unattributed, unreproduced single
+transient failure, not a known flake; a future recurrence should be
+filed as its own issue with the full assertion output and seed, not
+folded into a prior, unverified citation.
+
+**Gates, in the required order, all foreground, run against the
+corrected (newtype) code**: `cargo build -p animusd --all-targets`
+(clean, no warnings — the six `dead_code` warnings the first cut's own
+build had not surfaced, closed by restoring the `#[cfg_attr(not(test),
+allow(dead_code))]` attributes named above); `cargo test -p animusd
+--test admin_endpoint --test console_endpoint --test dashboard_endpoint
+--test console_tables --test console_create_table --test console_items
+--test console_stream --test console_table_config --test metrics_endpoint
+--test system_table` (67 passed, 0 failed, run twice post-correction,
+both clean — the 22-file untrimmed-suite discipline this rung's own
+design already required); `admin_backups_view_reflects_the_catalog`
+alone, 3 consecutive runs, 3/3 passed, run twice (6/6 total); `cargo test
+-p animusd --lib sim_cluster -- --test-threads=2` (317 passed, 0 failed,
+2 ignored, run twice post-correction — 900.80s and 904.10s;
+anchored-sampler RSS first ~62-111 MB, peak ~826-862 MB, last ~128-132 MB
+across the two runs, consistent with every prior rung's own no-leak
+trajectory); `cargo fmt --all --check` (clean); `cargo clippy -p animusd
+--all-targets --all-features -- -D warnings` (clean). `Cargo.lock`
+unchanged throughout. `git diff --stat` against the pre-PR-2 baseline: 5
+files changed (`admin.rs`, `console.rs` — net zero, reverted to the
+identical content — `dynamo.rs`, `lib.rs`, `sim_cluster.rs`).
+
+See ADR 0061's "Rung H, PR 2 landed" amendment (now the corrected
+account) and `docs/roadmap.md`'s C-08 entry for the full record;
+`docs/engineering-lessons.md`'s two matching 2026-09-08 entries for the
+general lessons — why a trait-forced dispatch widening's coverage gap is
+not automatically confined to `SimCluster` when the caller being widened
+is a general-purpose proxy rather than the primary wire edge, and why a
+**blanket generic `impl Trait for ClientCtx<E, R>`** is a materially
+different move than widening a free function: it silently replaces
+production's own concrete implementation rather than adding a parallel
+path, and the fix is a newtype wrapper carrying its own separate impl —
+never an edit inside the off-limits dispatcher's own call chain, however
+"thin" or "logic-free" that edit looks.

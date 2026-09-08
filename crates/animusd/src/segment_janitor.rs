@@ -153,7 +153,8 @@ use std::time::Duration;
 
 use animus_control::RaftNode;
 use animus_cp_data::segment;
-use animus_env::{Clock, Env, Metric, NodeId, ProdEnv};
+use animus_env::{Env, Metric, NodeId};
+use animus_node::host::RelayClient;
 use animus_tablet::TabletId;
 
 use crate::ClientCtx;
@@ -244,7 +245,10 @@ pub(crate) struct SegmentJanitorProgress {
 /// janitor_progress`, `ttl_reaper_progress`), simplified to a plain
 /// `FnOnce` since, unlike those two, this loop already holds a real
 /// `&ClientCtx` and needs no cross-crate capability trait to reach it.
-fn update_segment_janitor_progress(ctx: &ClientCtx, f: impl FnOnce(&mut SegmentJanitorProgress)) {
+fn update_segment_janitor_progress<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+    f: impl FnOnce(&mut SegmentJanitorProgress),
+) {
     let mut guard = ctx.segment_janitor_progress.lock().unwrap();
     f(&mut guard);
 }
@@ -253,10 +257,21 @@ fn update_segment_janitor_progress(ctx: &ClientCtx, f: impl FnOnce(&mut SegmentJ
 /// module doc for who spawns this, why it self-gates every tick rather than
 /// being spawned only on whichever node happens to lead right now, and the
 /// documented control-only-leader scope gap.
-pub(crate) async fn segment_janitor_loop(ctx: ClientCtx, retention: Duration) {
+///
+/// **`<E: Env, R: RelayClient>`-generic since ADR 0061 rung G, C-07 PR 5** —
+/// mirrors `backup_janitor_loop`'s own D4 PR 5 widening exactly: every
+/// production spawn site (`spawn_common_tail`) still hands this a concrete
+/// `ClientCtx` (`E = ProdEnv, R = AnimusdRelayClient`, `ClientCtx`'s own
+/// definition-site default), so production behavior is byte-identical, and
+/// `SimCluster` can now spawn this loop for real over a `SimEnv`-backed
+/// `ClientCtx` too (`sim_cluster.rs`'s own `SimCluster::new`/`restart`).
+pub(crate) async fn segment_janitor_loop<E: Env, R: RelayClient>(
+    ctx: ClientCtx<E, R>,
+    retention: Duration,
+) {
     let retention_ms = u64::try_from(retention.as_millis()).unwrap_or(u64::MAX);
     loop {
-        tokio::time::sleep(SEGMENT_JANITOR_INTERVAL).await;
+        ctx.env.sleep(SEGMENT_JANITOR_INTERVAL).await;
         let Some(leader) = ctx.edge.leader_handle() else {
             // Not (or no longer) the control leader — report idle rather
             // than leaving a stale, possibly-mid-tick phase behind (the
@@ -275,7 +290,14 @@ pub(crate) async fn segment_janitor_loop(ctx: ClientCtx, retention: Duration) {
 }
 
 /// One tick's whole decision — see the module doc's "The phases" section.
-async fn segment_janitor_tick(ctx: &ClientCtx, leader: &RaftNode<ProdEnv>, retention: Duration) {
+///
+/// `<E: Env, R: RelayClient>`-generic alongside [`segment_janitor_loop`] —
+/// see that function's own doc for why.
+async fn segment_janitor_tick<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+    leader: &RaftNode<E>,
+    retention: Duration,
+) {
     let meta = leader.metadata();
     let now_ms = ctx.env.now().0 / 1_000_000;
     let retention_ms = u64::try_from(retention.as_millis()).unwrap_or(u64::MAX);
