@@ -147,7 +147,8 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use animus_cp_data::KIND_BASE;
+use animus_cp_data::hlc::HlcTimestamp;
+use animus_cp_data::{KIND_BASE, ResolveOutcome, StageOutcome, TxnId, TxnOutcome};
 use animus_dynamo::AttributeValue;
 use animus_env::{EnvExt, nid};
 use animus_node::SimRelayClient;
@@ -799,6 +800,123 @@ impl SimClusterHandle {
             body,
         )
         .await
+    }
+
+    /// Stage a **fresh anchor** transaction writing `value` at `key` on
+    /// `table`, retrying through a decided-but-still-unresolved blocker via
+    /// `push_resolution_if_decided` exactly like production — issue #734's
+    /// `ClientCtx::txn_prepare_pushing`, issued from `node`'s own
+    /// `ClientCtx`. This fixture spawns no `txn_resolver_loop`
+    /// (`SimCluster`'s own module doc — no background loops at all), so
+    /// unlike the real-thread `issue_298_conflict_tests` regression this is
+    /// immune to that loop's real-time race by construction: nothing but a
+    /// scenario's own explicit calls can ever touch an intent here.
+    pub(crate) async fn txn_prepare_pushing(
+        &self,
+        node: u64,
+        table: &str,
+        key: Vec<u8>,
+        value: Option<Vec<u8>>,
+    ) -> Result<(TxnId, Vec<u8>, String, HlcTimestamp), TxnAbortReason> {
+        let ctx = self.ctx(node);
+        ctx.txn_prepare_pushing(
+            table,
+            None,
+            vec![TxnWrite::plain(key, value)],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// A single, direct anchor stage attempt for `value` at `key` on
+    /// `table` — never [`txn_prepare_pushing`](Self::txn_prepare_pushing)'s
+    /// own retry loop, so a caller can observe exactly what ONE stage
+    /// attempt reports (`StageOutcome::IntentBlocked`/`Staged`/...),
+    /// issued from `node`'s own `ClientCtx`.
+    pub(crate) async fn txn_prepare_once(
+        &self,
+        node: u64,
+        table: &str,
+        key: Vec<u8>,
+        value: Option<Vec<u8>>,
+    ) -> Result<(TxnId, Vec<u8>, String, HlcTimestamp, StageOutcome), TxnAbortReason> {
+        let ctx = self.ctx(node);
+        ctx.txn_prepare(
+            table,
+            None,
+            vec![TxnWrite::plain(key, value)],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// Decide `txn_id`'s anchor record `commit`/abort — `ClientCtx::
+    /// txn_decide_anchor`, issued from `node`'s own `ClientCtx`. Never
+    /// resolves the transaction's own intents (matching production: decide
+    /// and resolve are always two separate calls) — see
+    /// [`push_resolution_if_decided`](Self::push_resolution_if_decided)/
+    /// [`txn_resolve_participant`](Self::txn_resolve_participant) for that.
+    pub(crate) async fn txn_decide_anchor(
+        &self,
+        node: u64,
+        table: &str,
+        txn_id: TxnId,
+        record_key: Vec<u8>,
+        commit: bool,
+        min_commit_ts: HlcTimestamp,
+    ) -> Result<TxnOutcome, String> {
+        let ctx = self.ctx(node);
+        ctx.txn_decide_anchor(table, txn_id, record_key, commit, min_commit_ts, None)
+            .await
+    }
+
+    /// `ClientCtx::push_resolution_if_decided` (issue #298 residual fix,
+    /// this fixture's regression for the mechanism issue #734's `Node::
+    /// abort_background_tasks_for_test` had to isolate on the real-thread
+    /// side) — if `blocker`'s own record already decided, pushes its
+    /// resolution before returning; a no-op otherwise. Issued from `node`'s
+    /// own `ClientCtx`.
+    pub(crate) async fn push_resolution_if_decided(
+        &self,
+        node: u64,
+        table: &str,
+        blocked_key: Vec<u8>,
+        blocker: TxnId,
+        blocker_record_table: String,
+        blocker_record_key: Vec<u8>,
+    ) {
+        let ctx = self.ctx(node);
+        ctx.push_resolution_if_decided(
+            table,
+            &blocked_key,
+            blocker,
+            blocker_record_table,
+            blocker_record_key,
+            0,
+        )
+        .await
+    }
+
+    /// `ClientCtx::txn_resolve_participant` — a single, one-shot resolve of
+    /// `keys` per `outcome`, issued from `node`'s own `ClientCtx`. See that
+    /// method's own doc for why `Ok(ResolveOutcome::Fenced)` means "retry
+    /// with fresh routing," never "done."
+    pub(crate) async fn txn_resolve_participant(
+        &self,
+        node: u64,
+        table: &str,
+        txn_id: TxnId,
+        record_key: Vec<u8>,
+        keys: Vec<Vec<u8>>,
+        outcome: TxnOutcome,
+    ) -> Result<ResolveOutcome, String> {
+        let ctx = self.ctx(node);
+        ctx.txn_resolve_participant(table, txn_id, record_key, keys, outcome)
+            .await
     }
 }
 
@@ -1924,6 +2042,125 @@ impl SimCluster {
                 500,
                 format!("dynamo request on node {node} did not complete within {OP_BUDGET:?}"),
             )
+        })
+    }
+
+    /// [`SimClusterHandle::txn_prepare_pushing`], driven from a test's own
+    /// `&mut self` call exactly like [`SimCluster::put`] above.
+    pub(crate) fn txn_prepare_pushing(
+        &mut self,
+        node: u64,
+        table: &str,
+        key: Vec<u8>,
+        value: Option<Vec<u8>>,
+    ) -> Result<(TxnId, Vec<u8>, String, HlcTimestamp), TxnAbortReason> {
+        let handle = self.shared.clone();
+        let table = table.to_owned();
+        self.spawn_and_capture(node, async move {
+            handle.txn_prepare_pushing(node, &table, key, value).await
+        })
+        .unwrap_or_else(|| {
+            Err(TxnAbortReason::Other(format!(
+                "txn_prepare_pushing on node {node} did not complete within {OP_BUDGET:?}"
+            )))
+        })
+    }
+
+    /// [`SimClusterHandle::txn_prepare_once`], driven from a test's own
+    /// `&mut self` call exactly like [`SimCluster::put`] above.
+    pub(crate) fn txn_prepare_once(
+        &mut self,
+        node: u64,
+        table: &str,
+        key: Vec<u8>,
+        value: Option<Vec<u8>>,
+    ) -> Result<(TxnId, Vec<u8>, String, HlcTimestamp, StageOutcome), TxnAbortReason> {
+        let handle = self.shared.clone();
+        let table = table.to_owned();
+        self.spawn_and_capture(node, async move {
+            handle.txn_prepare_once(node, &table, key, value).await
+        })
+        .unwrap_or_else(|| {
+            Err(TxnAbortReason::Other(format!(
+                "txn_prepare_once on node {node} did not complete within {OP_BUDGET:?}"
+            )))
+        })
+    }
+
+    /// [`SimClusterHandle::txn_decide_anchor`], driven from a test's own
+    /// `&mut self` call exactly like [`SimCluster::put`] above.
+    pub(crate) fn txn_decide_anchor(
+        &mut self,
+        node: u64,
+        table: &str,
+        txn_id: TxnId,
+        record_key: Vec<u8>,
+        commit: bool,
+        min_commit_ts: HlcTimestamp,
+    ) -> Result<TxnOutcome, String> {
+        let handle = self.shared.clone();
+        let table = table.to_owned();
+        self.spawn_and_capture(node, async move {
+            handle
+                .txn_decide_anchor(node, &table, txn_id, record_key, commit, min_commit_ts)
+                .await
+        })
+        .unwrap_or_else(|| {
+            Err(format!(
+                "txn_decide_anchor on node {node} did not complete within {OP_BUDGET:?}"
+            ))
+        })
+    }
+
+    /// [`SimClusterHandle::push_resolution_if_decided`], driven from a
+    /// test's own `&mut self` call exactly like [`SimCluster::put`] above.
+    pub(crate) fn push_resolution_if_decided(
+        &mut self,
+        node: u64,
+        table: &str,
+        blocked_key: Vec<u8>,
+        blocker: TxnId,
+        blocker_record_table: String,
+        blocker_record_key: Vec<u8>,
+    ) {
+        let handle = self.shared.clone();
+        let table = table.to_owned();
+        self.spawn_and_capture(node, async move {
+            handle
+                .push_resolution_if_decided(
+                    node,
+                    &table,
+                    blocked_key,
+                    blocker,
+                    blocker_record_table,
+                    blocker_record_key,
+                )
+                .await
+        });
+    }
+
+    /// [`SimClusterHandle::txn_resolve_participant`], driven from a test's
+    /// own `&mut self` call exactly like [`SimCluster::put`] above.
+    pub(crate) fn txn_resolve_participant(
+        &mut self,
+        node: u64,
+        table: &str,
+        txn_id: TxnId,
+        record_key: Vec<u8>,
+        keys: Vec<Vec<u8>>,
+        outcome: TxnOutcome,
+    ) -> Result<ResolveOutcome, String> {
+        let handle = self.shared.clone();
+        let table = table.to_owned();
+        self.spawn_and_capture(node, async move {
+            handle
+                .txn_resolve_participant(node, &table, txn_id, record_key, keys, outcome)
+                .await
+        })
+        .unwrap_or_else(|| {
+            Err(format!(
+                "txn_resolve_participant on node {node} did not complete within {OP_BUDGET:?}"
+            ))
         })
     }
 

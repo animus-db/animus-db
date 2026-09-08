@@ -6737,6 +6737,60 @@ also failed to reach `done` within a 240s budget in 2/3 runs under the
 same load, despite one of those two already having live replicas matching
 its target.
 
+## `Node::abort_background_tasks_for_test` (issue #734) — isolating a mechanism from a node's own background loops in a real-thread test
+
+`issue_298_conflict_tests` (this crate's own module map bullet above) tests
+`ClientCtx::push_resolution_if_decided` by deliberately leaving a decided
+transaction's intent unresolved and asserting a fresh stage observes
+`StageOutcome::IntentBlocked` before the fix, `Staged` after. Its own claimed
+isolation — "no dependency on `txn_resolver_loop`'s own background sweep" —
+used to be a speed bet, not a guarantee: `single_node()`/`run_node()` spawns
+`txn_resolver_loop` (and every other background loop) on the same node this
+test drives via `ctx_for_test()`, and that loop resolves every
+decided-but-unresolved anchor unconditionally, once a second, for as long as
+it runs. Under real CI/sandbox contention the elapsed wall-clock time between
+deciding A and probing B's stage can exceed a second, letting the sweep
+resolve A's intent first — a genuine, low-probability real-time race, not a
+production bug (see `docs/engineering-lessons.md`'s matching 2026-09-07
+entry for the full incident, including how it was concretely reproduced with
+temporary instrumentation before being fixed).
+
+**`Node::abort_background_tasks_for_test()`** (`#[cfg(test)]`, `lib.rs`,
+beside `ctx_for_test`) is the fix and the reusable pattern: it aborts every
+task in `Node.tasks` (every background maintenance loop plus the client/
+dynamo/admin/console listeners) while leaving every hosted CP group and this
+node's own `ProdEnv`s fully live and **un-halted** — deliberately NOT
+`shutdown()`/`shutdown_and_wait()`, which also call `halt_hosted_cp_groups()`
+and would change how the group's own I/O-error tolerance behaves for the
+rest of the test. Safe to call from any in-crate `#[cfg(test)] mod` fixture
+that talks to the node purely through `ctx_for_test()`'s in-process
+`ClientCtx` (never a socket) once whatever tablet the test needs is already
+hosted/leader-elected (the CP group's own driver task is spawned internally
+by `animus-cp-data`, never a member of `Node.tasks`, so it is untouched).
+**Reach for this whenever a real-thread `#[cfg(test)] mod` fixture needs to
+isolate one mechanism from a node's own periodic background sweep** — a
+"this usually finishes before the sweep's own interval" comment is not an
+isolation guarantee, it is exactly the real-time race the root `CLAUDE.md`'s
+"a flaky test is a bug" rule exists to catch, however rarely it loses.
+
+**`sim_cluster_txn_conflict.rs`** (a sibling of `sim_cluster_corpus`/
+`sim_cluster_dynamo`/`sim_cluster_dynamo_corpus` — needs `SimCluster`'s own
+`pub(crate)` surface, no further visibility widened; **not** named
+`sim_cluster_dynamo_transact`, which the C-06 stack's own `TransactWriteItems`/
+`TransactGetItems` wire-level scenarios already claim) is the deterministic
+sibling of `issue_298_conflict_tests` this same fix added: the identical
+scenario driven against a real `SimCluster`, which spawns no background
+loops whatsoever (`sim_cluster.rs`'s own module doc), so the property holds
+with zero real-time dependency — no `abort_background_tasks_for_test`
+equivalent needed there, because there is nothing to abort. Needed five new
+small `pub(crate)` wrapper methods on `SimCluster`/`SimClusterHandle`
+(`txn_prepare_pushing`/`txn_prepare_once`/`txn_decide_anchor`/
+`push_resolution_if_decided`/`txn_resolve_participant`), mirroring the
+existing `put`/`get`/`delete`/`scan` wrapper shape exactly. When a real-
+thread test's isolation claim turns out to be a race against a background
+loop and a `SimCluster`/`SimEnv` fixture could express the same scenario,
+prefer adding that deterministic sibling over trying to make the real-thread
+test airtight against a process it cannot fully control.
 ## Appendix — SimCluster drop-table GC coverage (ADR 0061 rung D4 PR 3, 2026-09-07)
 
 `sim_cluster_dynamo_drop_table.rs` is the deterministic `SimCluster`
