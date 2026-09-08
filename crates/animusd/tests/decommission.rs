@@ -546,6 +546,123 @@ async fn raftkv_groups(admin_addr: SocketAddr) -> Vec<(u64, animus_env::NodeId, 
         .unwrap_or_default()
 }
 
+/// One converged-or-stalled snapshot of the three health predicates
+/// [`dashboard_health_recovers_after_decommission_shrink`] waits on:
+/// `/admin/status`'s member statuses + tablet replica counts, and
+/// `/admin/raftkv`'s group membership fanned out across every survivor —
+/// the same shape `dashboard_core.js`'s `computeHealth()`/`tabletStatus()`
+/// read.
+struct ClusterHealth {
+    member_statuses: std::collections::BTreeMap<String, String>,
+    tablets: std::collections::BTreeMap<u64, usize>,
+    groups_by_tablet: std::collections::BTreeMap<u64, Vec<(animus_env::NodeId, bool)>>,
+    down_count: usize,
+    leaderless: usize,
+    under_replicated: usize,
+}
+
+impl ClusterHealth {
+    fn converged(&self) -> bool {
+        self.down_count == 0 && self.leaderless == 0 && self.under_replicated == 0
+    }
+
+    fn print(&self) {
+        println!("member_statuses: {:?}", self.member_statuses);
+        println!("tablets: {:?}", self.tablets);
+        println!("groups_by_tablet: {:?}", self.groups_by_tablet);
+        for (tablet, replicas) in &self.tablets {
+            let gs = self
+                .groups_by_tablet
+                .get(tablet)
+                .cloned()
+                .unwrap_or_default();
+            let has_leader = gs.iter().any(|(_, l)| *l);
+            if !has_leader {
+                println!("tablet {tablet} is LEADERLESS: gs={gs:?}");
+            } else if *replicas > 0 && gs.len() < *replicas {
+                println!(
+                    "tablet {tablet} is UNDER-REPLICATED: configured={replicas} gs.len()={} gs={gs:?}",
+                    gs.len()
+                );
+            }
+        }
+        println!(
+            "down_count={} leaderless={} under_replicated={}",
+            self.down_count, self.leaderless, self.under_replicated
+        );
+    }
+}
+
+/// Fetch one fresh [`ClusterHealth`] snapshot from `survivor_admin`
+/// (`/admin/status` from the first entry, `/admin/raftkv` fanned out across
+/// every entry) — the read half of the convergence poll below, factored out
+/// so it can be called both inside that poll's loop and once more after it
+/// converges.
+async fn cluster_health(survivor_admin: &[SocketAddr]) -> ClusterHealth {
+    let (_status, status_body) = admin(survivor_admin[0], "GET", "/admin/status", None).await;
+    // Member ids are `NodeId` strings now (ADR 0040 PR3) — only the *values*
+    // (status strings / replica counts) matter below, so the key type just
+    // needs to parse without panicking, not carry real `NodeId` semantics.
+    let member_statuses: std::collections::BTreeMap<String, String> = status_body["members"]
+        .as_object()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|(id, m)| {
+            (
+                id.clone(),
+                m["status"].as_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect();
+    let tablets: std::collections::BTreeMap<u64, usize> = status_body["tablets"]
+        .as_object()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|(id, t)| {
+            (
+                id.parse().unwrap(),
+                t["replicas"].as_array().map(Vec::len).unwrap_or(0),
+            )
+        })
+        .collect();
+
+    let mut groups_by_tablet: std::collections::BTreeMap<u64, Vec<(animus_env::NodeId, bool)>> =
+        std::collections::BTreeMap::new();
+    for &addr in survivor_admin {
+        for (tablet, node, is_leader) in raftkv_groups(addr).await {
+            let seen = groups_by_tablet.entry(tablet).or_default();
+            if !seen.iter().any(|(n, _)| *n == node) {
+                seen.push((node, is_leader));
+            }
+        }
+    }
+
+    let down_count = member_statuses.values().filter(|s| *s == "Down").count();
+    let mut leaderless = 0usize;
+    let mut under_replicated = 0usize;
+    for (tablet, replicas) in &tablets {
+        let gs = groups_by_tablet.get(tablet).cloned().unwrap_or_default();
+        let has_leader = gs.iter().any(|(_, l)| *l);
+        let configured = *replicas;
+        if !has_leader {
+            leaderless += 1;
+        } else if configured > 0 && gs.len() < configured {
+            under_replicated += 1;
+        }
+    }
+
+    ClusterHealth {
+        member_statuses,
+        tablets,
+        groups_by_tablet,
+        down_count,
+        leaderless,
+        under_replicated,
+    }
+}
+
 /// Regression for the dashboard health rollup (`dashboard_core.js`'s
 /// `computeHealth()`): 3 -> join 2 (5) -> drain + remove one joined node (4,
 /// a real decommission-driven shrink, not a crash). Reproduces
@@ -650,77 +767,83 @@ async fn dashboard_health_recovers_after_decommission_shrink() {
         .await
         .unwrap_or_else(|_| panic!("removed node never disappeared from /admin/status"));
 
-    // Give the survivors' reconcilers a further beat to settle.
-    sleep(Duration::from_secs(3)).await;
-
     joined_nodes[0].shutdown_graceful().await;
 
     let mut survivor_admin: Vec<SocketAddr> = core_admin.clone();
     survivor_admin.push(joined_ids[1].1.admin);
 
-    let (_status, status_body) = admin(survivor_admin[0], "GET", "/admin/status", None).await;
-    // Member ids are `NodeId` strings now (ADR 0040 PR3) — only the *values*
-    // (status strings / replica counts) matter below, so the key type just
-    // needs to parse without panicking, not carry real `NodeId` semantics.
-    let member_statuses: std::collections::BTreeMap<String, String> = status_body["members"]
-        .as_object()
-        .unwrap()
-        .iter()
-        .map(|(id, m)| (id.clone(), m["status"].as_str().unwrap().to_owned()))
-        .collect();
-    let tablets: std::collections::BTreeMap<u64, usize> = status_body["tablets"]
-        .as_object()
-        .unwrap()
-        .iter()
-        .map(|(id, t)| (id.parse().unwrap(), t["replicas"].as_array().unwrap().len()))
-        .collect();
-    println!("member_statuses: {member_statuses:?}");
-    println!("tablets: {tablets:?}");
+    // Converged-or-stalled poll over the three health predicates below,
+    // rather than a fixed settle sleep followed by a one-shot snapshot
+    // (issue #749): `/admin/status`/`/admin/raftkv` are both views of the
+    // ADR 0038 async apply-task cache, which carries no
+    // contention-independent latency bound (see
+    // `support::poll_until_or_stalled`'s doc and
+    // `docs/engineering-lessons.md`'s DRIVER_APPLIED entry) — the fixed 3s
+    // settle beat this replaced could (and, per issue #749, did) observe
+    // the replacement's membership-change commit before the election that
+    // follows it had finished, the same "fixed-deadline one-shot assert on
+    // an eventual property" mistake documented for issues #730/#742.
+    // Hand-rolled (mirroring `decommission_drains_removes_and_allows_id_
+    // reuse`'s own step 9 above) rather than routed through
+    // `support::poll_until_or_stalled` directly: this poll needs the rich
+    // per-tablet/per-member diagnostics printed on every non-converged
+    // tick, which the shared helper's generic stall message doesn't carry.
+    const IDLE_STALL_TIMEOUT: Duration = Duration::from_secs(60);
+    const OVERALL_BACKSTOP: Duration = Duration::from_secs(300);
+    let overall_deadline = tokio::time::Instant::now() + OVERALL_BACKSTOP;
+    let mut last_progress_at = tokio::time::Instant::now();
+    let mut last_engine_applied: Option<u64> = None;
+    let health = loop {
+        let health = cluster_health(&survivor_admin).await;
+        if health.converged() {
+            break health;
+        }
+        health.print();
 
-    let mut groups_by_tablet: std::collections::BTreeMap<u64, Vec<(animus_env::NodeId, bool)>> =
-        std::collections::BTreeMap::new();
-    for &addr in &survivor_admin {
-        for (tablet, node, is_leader) in raftkv_groups(addr).await {
-            let seen = groups_by_tablet.entry(tablet).or_default();
-            if !seen.iter().any(|(n, _)| *n == node) {
-                seen.push((node, is_leader));
+        let (raft_status, raft_body) = admin(survivor_admin[0], "GET", "/admin/raft", None).await;
+        if raft_status == 200
+            && let Some(engine_applied) = raft_body["engine_applied_index"].as_u64()
+        {
+            if last_engine_applied != Some(engine_applied) {
+                last_engine_applied = Some(engine_applied);
+                last_progress_at = tokio::time::Instant::now();
+            } else if last_progress_at.elapsed() >= IDLE_STALL_TIMEOUT {
+                panic!(
+                    "cluster never became healthy after decommission shrink, and the apply \
+                     task's engine_applied_index has been stuck at {engine_applied} for \
+                     {IDLE_STALL_TIMEOUT:?} — this is no longer contention-driven lag, \
+                     something is actually stuck: down_count={} leaderless={} \
+                     under_replicated={}",
+                    health.down_count, health.leaderless, health.under_replicated
+                );
             }
         }
-    }
-    println!("groups_by_tablet: {groups_by_tablet:?}");
-
-    let down_count = member_statuses.values().filter(|s| *s == "Down").count();
-    let mut leaderless = 0usize;
-    let mut under_replicated = 0usize;
-    for (tablet, replicas) in &tablets {
-        let gs = groups_by_tablet.get(tablet).cloned().unwrap_or_default();
-        let has_leader = gs.iter().any(|(_, l)| *l);
-        let configured = *replicas;
-        if !has_leader {
-            leaderless += 1;
-            println!("tablet {tablet} is LEADERLESS: gs={gs:?}");
-        } else if configured > 0 && gs.len() < configured {
-            under_replicated += 1;
-            println!(
-                "tablet {tablet} is UNDER-REPLICATED: configured={configured} gs.len()={} gs={gs:?}",
-                gs.len()
+        if tokio::time::Instant::now() >= overall_deadline {
+            panic!(
+                "cluster never became healthy within the {OVERALL_BACKSTOP:?} backstop, \
+                 despite apply-task progress (last engine_applied_index={last_engine_applied:?}): \
+                 down_count={} leaderless={} under_replicated={}",
+                health.down_count, health.leaderless, health.under_replicated
             );
         }
-    }
-    println!("down_count={down_count} leaderless={leaderless} under_replicated={under_replicated}");
+        sleep(Duration::from_millis(200)).await;
+    };
+    health.print();
 
     // A cleanly-decommissioned node is gone from `members` entirely (not
-    // lingering `Down`), and every tablet should already be repaired.
+    // lingering `Down`), and every tablet is repaired — asserted once more
+    // here, after convergence, so a regression reads as one of these three
+    // specific messages rather than the poll loop's own generic stall text.
     assert_eq!(
-        down_count, 0,
+        health.down_count, 0,
         "a decommissioned node should be fully removed, not left Down"
     );
     assert_eq!(
-        leaderless, 0,
+        health.leaderless, 0,
         "every tablet should have re-elected a leader by now"
     );
     assert_eq!(
-        under_replicated, 0,
+        health.under_replicated, 0,
         "every tablet should be repaired back to its configured replica count"
     );
 
