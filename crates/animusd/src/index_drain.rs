@@ -4919,6 +4919,22 @@ mod stream_sealer_tests {
     /// 3. the same burst's change-log backlog must still get sealed —
     ///    proving `change_consumer_loop`'s identical skip-gate doesn't
     ///    strand the seal/trim arms either.
+    ///
+    /// **`quiesce_after` here must stay comfortably above
+    /// `AUTO_SPLIT_INTERVAL`** (2s) — a fixture gotcha this test's own
+    /// scenario 2 hit once the write-confirm path (`ClientCtx::
+    /// cp_kind_eval_local`) stopped paying a flat 50ms poll floor per
+    /// write: the whole 40-item burst below now completes in well under a
+    /// quiesce window that used to take ~2s (the old floor's own
+    /// `40 * 50ms`), so a `quiesce_after` shorter than `AUTO_SPLIT_INTERVAL`
+    /// lets the tablet re-quiesce before `auto_split_loop`'s own periodic
+    /// (not event-driven) tick ever gets a chance to observe it
+    /// non-quiesced — `leader.is_quiesced()` then skips it forever, exactly
+    /// as this test's own doc says it must NOT. Production's own default
+    /// (`--quiesce-after`, 5s) already sits above `AUTO_SPLIT_INTERVAL` for
+    /// this reason; this fixture's old 300ms value never actually proved
+    /// the claim above, it only happened to work by accident of the write
+    /// path being slow. See `docs/engineering-lessons.md`'s matching entry.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_rewoken_tablet_is_picked_back_up_by_every_sweeper_within_one_interval() {
         timeout(Duration::from_secs(60), async {
@@ -4930,7 +4946,7 @@ mod stream_sealer_tests {
                     seal_age: Duration::from_secs(3600),
                 },
                 Some(2_000), // tiny byte auto-split threshold
-                Duration::from_millis(300),
+                Duration::from_secs(3),
             )
             .await;
             let table = "rewoken";

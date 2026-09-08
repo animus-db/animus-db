@@ -529,6 +529,19 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 other => return Err(format!("kind eval not accepted: {other:?}")),
             };
         let deadline = leader.env().now().saturating_add(CLIENT_TIMEOUT);
+        // The same exponential confirm back-off `cp_put_local`/`cp_batch_local`
+        // use — NOT a flat `SCHEMA_POLL_INTERVAL` (50ms) sleep, which this loop
+        // used to carry over from the schema-DDL poll it was modeled on. This is
+        // THE client hot path for every single-item write since ADR 0054 step 3
+        // (`PutItem`/`UpdateItem`/`DeleteItem` via `dynamo::
+        // kind_write_item_at_leader`, the TTL reaper, and the admin seeder's
+        // per-item images arm) — a flat 50ms floor caps it at ~20 ops/s
+        // regardless of how fast the underlying Raft group actually commits,
+        // since the very first poll right after `propose_kind_eval` is almost
+        // always `Inconclusive` (apply hasn't run yet). Paired with the cp-data
+        // wake-on-propose, a write that commits+applies in a few ms now returns
+        // in well under a millisecond instead of eating the fixed floor.
+        let mut poll = CP_CONFIRM_POLL_INIT;
         loop {
             let effects_readable = leader.engine_applied_index() >= accepted_index;
             let outcome = leader.kind_batch_outcome(accepted_index);
@@ -579,7 +592,8 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             if leader.env().now() >= deadline {
                 return Err(KIND_EVAL_CONFIRM_AMBIGUOUS.into());
             }
-            leader.env().sleep(SCHEMA_POLL_INTERVAL).await;
+            leader.env().sleep(poll).await;
+            poll = (poll * 2).min(CP_CONFIRM_POLL_MAX);
         }
     }
 
@@ -1306,6 +1320,182 @@ mod poll_probe_identity_tests {
             Some(ProbeWait::Superseded),
             "entry B's own Sealed outcome should resolve the wait once \
              applied (seed={seed}): {result:?}"
+        );
+    }
+}
+
+/// Regression for the 50ms flat-poll floor regression this file's own
+/// `cp_kind_eval_local` doc/comment above names: since ADR 0054 step 3 this
+/// method is the confirm loop for **every** single-item write
+/// (`PutItem`/`UpdateItem`/`DeleteItem` via `dynamo::
+/// kind_write_item_at_leader`, the TTL reaper, and the admin seeder's
+/// per-item images arm) — a flat `SCHEMA_POLL_INTERVAL` (50ms) sleep
+/// between confirm checks caps sequential single-item write throughput at
+/// ~20 ops/s, since the very first poll right after `propose_kind_eval` is
+/// almost always `Inconclusive` (apply hasn't run yet), so *every* write
+/// pays at least one full poll interval. Fixed by reusing the same
+/// exponential back-off (`CP_CONFIRM_POLL_INIT` doubling to
+/// `CP_CONFIRM_POLL_MAX`) every sibling confirm loop in this file already
+/// uses (`cp_batch_local`, `cp_put_local`/`cp_delete_local`).
+///
+/// This is a timing floor, so it is asserted in **virtual** `SimEnv` time
+/// (root `CLAUDE.md`'s "Testing" rule: a timing property is best proven
+/// where it can never flake) — mirrors `poll_probe_identity_tests`' own
+/// harness style (a single-voter `RaftKvNode<SimEnv, MemoryEngine>`, no
+/// sockets, no `ProdEnv`) one file section up, reused nearly verbatim.
+///
+/// **Confirmed to fail on the old code**: reverting this file's fix (the
+/// exponential `poll`/`poll = (poll * 2).min(CP_CONFIRM_POLL_MAX)` back to
+/// a bare `leader.env().sleep(SCHEMA_POLL_INTERVAL).await`) makes
+/// `a_single_item_write_confirms_in_well_under_the_old_50ms_poll_floor`
+/// fail deterministically — `WRITE_COUNT` (20) sequential writes then take
+/// `WRITE_COUNT * SCHEMA_POLL_INTERVAL` = 1s of virtual time (each write's
+/// first, and only, poll is `Inconclusive`, so each pays the full 50ms
+/// floor exactly once), comfortably over this test's own `BOUND` (200ms) —
+/// verified by hand before landing this test, not merely reasoned about.
+#[cfg(test)]
+mod kind_eval_confirm_backoff_tests {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use animus_cp_data::RaftKvNode;
+    use animus_env::{Clock, EnvExt, nid};
+    use animus_item::{TableSchema, WriteSchema};
+    use animus_sim::{SimEnv, Simulator};
+    use animus_storage::MemoryEngine;
+
+    use super::*;
+
+    #[derive(Clone, Copy, Debug, Default)]
+    struct NeverRelay;
+
+    #[async_trait::async_trait]
+    impl RelayClient for NeverRelay {
+        async fn relay(
+            &self,
+            addr: String,
+            _request: &ClientRequest,
+            _timeout: Duration,
+        ) -> ClientResponse {
+            ClientResponse::Error(format!(
+                "NeverRelay: this single-node harness never relays (addr={addr})"
+            ))
+        }
+    }
+
+    /// A one-voter `RaftKvNode<SimEnv, MemoryEngine>` wrapped as a
+    /// `CpGroup<SimEnv>` — mirrors `poll_probe_identity_tests::
+    /// single_voter_group` exactly.
+    fn single_voter_group(seed: u64) -> (Simulator, CpGroup<SimEnv>) {
+        let sim = Simulator::new(seed);
+        let kv: RaftKvNode<SimEnv, MemoryEngine> =
+            RaftKvNode::start(sim.env(nid(0)), vec![nid(0)], MemoryEngine::new());
+        (sim, CpGroup::Mem(kv))
+    }
+
+    /// Spawn `fut` on `env` and drive `sim` until it resolves — mirrors
+    /// `poll_probe_identity_tests::spawn_and_capture` exactly.
+    fn spawn_and_capture<T, F>(sim: &mut Simulator, env: &SimEnv, fut: F) -> Option<T>
+    where
+        T: Send + 'static,
+        F: std::future::Future<Output = T> + Send + 'static,
+    {
+        let slot: Arc<Mutex<Option<T>>> = Arc::new(Mutex::new(None));
+        let out = slot.clone();
+        env.spawn_task(async move {
+            let result = fut.await;
+            *out.lock().expect("result slot poisoned") = Some(result);
+        });
+        sim.run_for(Duration::from_secs(5));
+        slot.lock().expect("result slot poisoned").take()
+    }
+
+    /// Sequential single-item writes driven through this test — enough to
+    /// make a per-write poll-floor regression add up to something a wide
+    /// bound still catches cleanly.
+    const WRITE_COUNT: u64 = 20;
+
+    /// The bound the fixed exponential back-off must clear comfortably —
+    /// `WRITE_COUNT * 10ms`, a fifth of the old flat-floor total
+    /// (`WRITE_COUNT * SCHEMA_POLL_INTERVAL` = 1s) and with wide margin
+    /// over what the fix actually needs (each write pays at worst a
+    /// handful of sub-5ms polls, not one 10ms poll).
+    const BOUND: Duration = Duration::from_millis(WRITE_COUNT * 10);
+
+    #[test]
+    fn a_single_item_write_confirms_in_well_under_the_old_50ms_poll_floor() {
+        run(0x0C0F_0001);
+    }
+
+    #[test]
+    fn a_single_item_write_confirms_in_well_under_the_old_50ms_poll_floor_seed2() {
+        run(0x0C0F_0002);
+    }
+
+    /// Replay proof (repo convention): `ANIMUS_SEED=<seed> cargo test -p
+    /// animusd --lib replays_the_confirm_backoff_bound_from_an_explicit_env_seed`
+    /// reruns this exact scenario from a printed seed.
+    #[test]
+    fn replays_the_confirm_backoff_bound_from_an_explicit_env_seed() {
+        let seed = std::env::var("ANIMUS_SEED")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0x0C0F_0003);
+        run(seed);
+    }
+
+    fn run(seed: u64) {
+        let (mut sim, leader) = single_voter_group(seed);
+        sim.run_for(Duration::from_millis(500));
+        assert!(
+            leader.is_leader(),
+            "the sole voter must be its own leader (seed={seed})"
+        );
+
+        let env = leader.env().clone();
+        let elapsed = spawn_and_capture(&mut sim, &env, async move {
+            let start = leader.env().now();
+            for i in 0..WRITE_COUNT {
+                let pk = AttributeValue::S(format!("item-{i}"));
+                let base_key = dynamo::item_key(&pk, None);
+                let mut item = Item::new();
+                item.insert("pk".to_string(), pk.clone());
+                let schema = WriteSchema {
+                    key: TableSchema::simple("pk"),
+                    lsis: Vec::new(),
+                    change_records_carry_images: false,
+                };
+                let outcome = ClientCtx::<SimEnv, NeverRelay>::cp_kind_eval_local(
+                    &leader,
+                    schema,
+                    pk,
+                    None,
+                    KindEvalOp::Put(item),
+                    None,
+                    false,
+                    &base_key,
+                    ProbeIdentity::ValueProves,
+                )
+                .await;
+                assert!(
+                    outcome.is_ok(),
+                    "write {i} failed (seed={seed}): {:?}",
+                    outcome.err()
+                );
+            }
+            leader.env().now().duration_since(start)
+        });
+
+        let elapsed = elapsed.unwrap_or_else(|| {
+            panic!(
+                "the {WRITE_COUNT} writes did not complete within the drive budget (seed={seed})"
+            )
+        });
+        assert!(
+            elapsed <= BOUND,
+            "seed={seed}: {WRITE_COUNT} sequential single-item writes took \
+             {elapsed:?} of virtual time, expected <= {BOUND:?} — the confirm \
+             loop has regressed back toward the old flat 50ms poll floor"
         );
     }
 }

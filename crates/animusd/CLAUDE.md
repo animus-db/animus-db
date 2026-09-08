@@ -2222,6 +2222,25 @@ regardless of whose entry occupies the index). See
 `animus-cp-data/tests/kind_batch_outcome_identity.rs` for the seed-
 reproducible truncation regression that proves it end to end.
 
+**`cp_kind_eval_local`'s own confirm loop polls with the same exponential
+back-off (`CP_CONFIRM_POLL_INIT`/`CP_CONFIRM_POLL_MAX`) `cp_batch_local`/
+`cp_put_local`/`cp_delete_local` use, not the flat `SCHEMA_POLL_INTERVAL`
+(50ms) it regressed to with ADR 0054 step 3 (2026-09-05, fixed 2026-09-08).** This is
+THE confirm loop for every single-item write since ADR 0054 step 3
+(`PutItem`/`UpdateItem`/`DeleteItem`, the TTL reaper, the admin seeder's
+per-item images arm) — a flat 50ms poll floor there caps sequential
+single-item write throughput at ~20 ops/s regardless of how fast the
+underlying Raft group actually commits, since the first poll right after
+`propose_kind_eval` is almost always `Inconclusive`. Regression test:
+`write_path::kind_eval_confirm_backoff_tests`, a virtual-time `SimEnv`
+bound (never wall-clock, so the assertion can't flake) proving 20
+sequential writes finish in well under the old flat-floor total. See
+`docs/engineering-lessons.md`'s matching 2026-09-08 entry for the
+copy-the-wrong-sibling root cause, and its very next entry for a *second*,
+latent bug this same fix exposed (a fixture's `quiesce_after` shorter than
+`auto_split_loop`'s own sweep period) — a caution for anyone else speeding
+up a write-confirm path here.
+
 **`poll_probe`'s value-equality fallback is idempotency-gated (issue #469).**
 When `classify_kind_batch_outcome` is `Inconclusive` (not yet applied, aged
 out of the bounded outcome map, or applied-but-not-yet-readable), `poll_probe`

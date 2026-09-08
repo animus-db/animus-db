@@ -4270,6 +4270,90 @@ debugging anything that feels like it might have happened before.
   or a clean rejection would be.
 
 ### Code patterns
+- **A new confirm loop copied from a sibling's shape but the wrong sibling's
+  constant is a silent ~50ms-per-call throughput regression, and no test
+  guarded the latency floor (2026-09-08).** `ClientCtx::cp_kind_eval_local`
+  (`write_path.rs`) — the confirm loop for *every* single-item write since
+  ADR 0054 step 3 (`PutItem`/`UpdateItem`/`DeleteItem` via `dynamo::
+  kind_write_item_at_leader`, the TTL reaper, the admin seeder's per-item
+  images arm) — polled with a flat `leader.env().sleep(SCHEMA_POLL_
+  INTERVAL).await` (50ms) instead of the exponential back-off
+  (`CP_CONFIRM_POLL_INIT` 200µs doubling to `CP_CONFIRM_POLL_MAX` 5ms) every
+  sibling write-confirm loop in the same file uses (`cp_batch_local`,
+  `cp_put_local`/`cp_delete_local`). The first poll right after
+  `propose_kind_eval` is *always* `Inconclusive` (apply hasn't run yet), so
+  every single-item write paid the full 50ms floor once — capping
+  sequential single-item write throughput at ~20 ops/s, a ~40x
+  degradation from what the underlying Raft group can actually commit at.
+  Root cause: this loop's own doc comment shows it was modeled on the
+  *schema-DDL* commit-wait shape (`SCHEMA_POLL_INTERVAL`/
+  `SCHEMA_COMMIT_TIMEOUT`, a rare, human-latency-tolerant operation) rather
+  than on its true sibling, the ordinary per-write confirm loop — copying
+  the wrong nearby pattern rather than the one actually analogous in
+  *frequency*. **Nothing caught this for the whole ADR 0054/step-3
+  lifetime** because every existing test asserts write *correctness*
+  (does the value read back, does the condition apply), never write
+  *latency* — a 50ms-per-write floor makes every test slower but not
+  wrong, so it hid in plain sight until a maintainer noticed the
+  measured throughput collapse (~700 keys/s to ~17 keys/s on a
+  Stream-enabled table) directly. **The fix, and the general lesson**:
+  whenever a new confirm/commit-wait loop is added, grep the same file
+  for every existing loop of the same *shape* (propose → poll-until-
+  applied) and match the poll cadence of the one with the same call
+  frequency, not the one that happens to be textually nearest or most
+  recently read. **The test, and the general lesson for guarding a
+  latency floor**: a poll-interval regression is a timing property, so it
+  is asserted in **virtual** `SimEnv` time, never wall-clock — a bound
+  that would flake under real-thread contention is unusable here.
+  `write_path::kind_eval_confirm_backoff_tests` drives a single-voter
+  `RaftKvNode<SimEnv, MemoryEngine>` (mirroring `poll_probe_identity_
+  tests`' pre-existing harness) through 20 sequential `cp_kind_eval_local`
+  calls and asserts the total virtual elapsed time is `<= 200ms`
+  (`WRITE_COUNT * 10ms`) — a bound the fixed exponential back-off clears
+  with wide margin and the old flat 50ms floor fails deterministically
+  (confirmed by hand: reverting the fix reproduces exactly `WRITE_COUNT *
+  50ms` = 1s of virtual time, every run, no variance — the flat floor
+  makes the bug not just detectable but bit-for-bit reproducible).
+- **Speeding up a confirm loop can expose a LATENT race between
+  quiescence's "skip forever once quiesced" optimization and a periodic
+  (non-event-driven) sweeper — found landing the fix immediately above
+  (2026-09-08).** `auto_split_loop` sleeps a fixed `AUTO_SPLIT_INTERVAL`
+  (2s) between ticks and skips a tablet outright once `leader.
+  is_quiesced()` is true, trusting that "whatever this tablet's last
+  pre-quiescence tick already checked still holds" (ADR 0044 phase-1
+  PR6's own doc). That trust is sound only if the loop got at least ONE
+  tick while the tablet was genuinely non-quiesced — i.e. only if
+  `quiesce_after` (how long a tablet must be idle before it re-quiesces)
+  is comfortably *longer* than `AUTO_SPLIT_INTERVAL`. Production's own
+  default (`--quiesce-after`, 5s) safely clears `AUTO_SPLIT_INTERVAL`
+  (2s), but `index_drain.rs`'s own
+  `a_rewoken_tablet_is_picked_back_up_by_every_sweeper_within_one_
+  interval` test configured `quiesce_after` to a *test-convenience* 300ms
+  — far below 2s — purely so its own "an idle table quiesces" negative
+  control would resolve quickly. That mismatch was invisible for as long
+  as `cp_kind_eval_local`'s own write-confirm loop paid the 50ms flat-poll
+  floor above: a 40-item write burst then took ~2s of real time (`40 ×
+  50ms`), which reliably straddled at least one `AUTO_SPLIT_INTERVAL`
+  tick before the tablet could re-quiesce. The moment that floor was
+  fixed, the identical 40-item burst completed in well under 300ms,
+  letting the tablet re-quiesce *before* `auto_split_loop`'s next 2s tick
+  ever observed it non-quiesced — the loop then skipped it forever (no
+  further writes ever arrived to re-wake it), and the test timed out
+  deterministically, every run. **The lesson generalizes past this one
+  test**: a fixture that sets a "how long until X becomes idle" knob
+  shorter than the period of a periodic (not event-driven) background
+  loop that is supposed to observe X while active is not actually testing
+  what its own doc claims — it was passing by accident of unrelated
+  timing elsewhere, and any change that legitimately speeds up the
+  activity being observed can silently break it. Fixed by raising this
+  one test's `quiesce_after` to 3s (safely above `AUTO_SPLIT_INTERVAL`),
+  with a comment stating the invariant explicitly so a future reader
+  doesn't reintroduce it. When touching *any* loop whose speed a test's
+  own quiescence/timeout knobs were implicitly calibrated against, grep
+  for other fixtures using the same short-quiesce-plus-periodic-sweeper
+  shape before assuming "the assertions still pass" is the whole story —
+  a green run can still be resting on a timing coincidence the change
+  just removed.
 - **A retryable-shaped error (the house `"; retry"` suffix) surviving string
   formatting into a caller's own error type is not the same guarantee as
   something in that caller's *call chain* actually checking for it — audit
