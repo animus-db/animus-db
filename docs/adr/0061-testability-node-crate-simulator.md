@@ -3538,3 +3538,190 @@ after — unchanged since nothing in these six files was edited);
 `ANIMUS_SEED` replay of scenario (a) (green at seed `1`, `3228499975`,
 and the default) and scenario (g) (reproduces the finding identically at
 seed `3228499975` and the default). `Cargo.lock` unchanged.
+
+## 2026-09-07 amendment — #731 closed: `SimRelayClient::serve_loop` dispatches each inbound request onto its own task
+
+The finding this file's "C-06 PR 3" amendment recorded above —
+`animus_node::sim_relay::SimRelayClient::serve_loop`'s single-task, inline
+dispatch deadlocking on a nested outbound `relay()` call from inside a
+forwarded request's own handler (issue #731) — is fixed.
+
+**The fix**: `serve_loop` no longer `.await`s an inbound
+`RelayWire::Request`'s installed handler inline before looping back to
+`recv_stream` for the next message. It now dispatches each `Request` onto
+its own `env.spawn_task`ed task, mirroring `AnimusdRelayClient`'s own
+production shape (one `tokio::spawn`ed task per inbound TCP connection —
+the exact precedent this module's own doc already cited as the reason
+production has no analogous bottleneck). This loop stays the sole reader
+of `RELAY_STREAM` (single-consumer, ADR 0026 — that invariant did not need
+relaxing, only the *handling* of what it reads became concurrent, never
+the *receiving*), and also still delivers the reply to any of this node's
+own outbound `relay()` calls (the module doc's "one stream, two roles"
+section, unaffected). A `RelayWire::Reply` is still stashed inline,
+synchronously, in the loop itself — only `RelayWire::Request` dispatch
+moved onto a spawned task, since a reply-stash is cheap and non-blocking
+and gains nothing from spawning.
+
+**No new correlation mechanism was needed.** `RelayWire`'s `req_id` +
+the pre-existing `Pending`-slot `BTreeMap` already handle an arbitrary
+number of concurrent in-flight requests/replies — the *client* side of
+exactly this concurrency was already proven by the pre-existing
+`concurrent_outstanding_requests_resolve_to_the_right_callers` unit test.
+The deadlock was purely a server-side sequencing bug: the correlation
+story was already sound for concurrent use, it just couldn't be reached
+because the receive loop itself was the bottleneck.
+
+**Still fully deterministic and seed-reproducible.** Dispatch runs on
+`env.spawn_task` — the seeded `Simulator`'s own single-threaded
+cooperative executor, never a raw `tokio::spawn` (this crate has no
+`tokio` dependency at all) — so introducing concurrency here did not
+introduce nondeterminism; it only gave the already-seeded scheduler more
+tasks to interleave among, per `animus-sim/CLAUDE.md`'s own account of how
+that scheduler orders ready tasks and timeline events.
+
+**Verification, and a second, deeper finding the fix itself uncovered.**
+`cargo test -p animus-node`: 137 passed (unchanged — the fix touches no
+public contract, only `serve_loop`'s own internal dispatch shape). An
+ordinary forwarded read (no nested relay involved) was re-confirmed
+unaffected. `ANIMUS_SIMCLUSTER_SEEDS=10 cargo test -p animusd --lib
+sim_cluster_corpus` and `ANIMUS_DYNAMO_WIRE_SEEDS=10 cargo test -p animusd
+--lib sim_cluster_dynamo_corpus` both stayed green — the relay is on every
+forwarded op's path in both corpora, so this is the ordering/determinism
+regression net for the concurrency change itself, confirming nothing
+regressed.
+
+`coordinator_never_finished_past_prepare_recovers_atomically` and its
+`_over_seeds` sibling (`crates/animusd/src/sim_cluster_dynamo_transact.rs`,
+scenario (g)) were un-ignored and re-run to directly confirm the deadlock
+itself is gone: at both the original pinned seed and the first
+`_over_seeds` seed, the poll loop no longer returns `SimRelayClient::
+relay`'s timeout text at all — proof the nested relay hop this scenario
+needs now succeeds. **But the scenario still does not converge**, for a
+second, distinct, pre-existing reason this fix's own removal of the
+deadlock made reachable for the first time: `ClientCtx::txn_recover`
+(`crates/animusd/src/txn_coordinator.rs`) computes its own grace-check
+`now_ms` as an *elapsed near-zero duration* (`self.env.now().
+duration_since(self.env.now())`), not an absolute timestamp, whenever
+`cp_route` resolves to anything other than `Local` — the ordinary case for
+this scenario's own on-demand recovery push, which runs on the
+*participant*'s tablet leader, not necessarily the *anchor*'s. A near-zero
+`now_ms` makes the grace check's `now_ms < view.created_ts.wall_ms +
+RECOVERY_GRACE` comparison true forever, so recovery declines
+(`Pending`) on every call, permanently. This is pre-existing — introduced,
+and knowingly left unfixed as out of scope, by rung C5 step 3b's `tokio::
+time::Instant::now().elapsed()` → `Env` conversion above (see that rung's
+own bullet: "reproducing the identical near-zero result rather than
+'fixing' what reads like a pre-existing latent bug — an incidental bug
+gets its own PR") — unrelated to and unmodified by this rung's relay fix.
+It was unreachable before this rung only because issue #731's own deadlock
+intercepted every recovery attempt before `txn_recover` was ever actually
+called. Both tests are kept `#[ignore]`d, with the full diagnosis in their
+own doc comment (`coordinator_never_finished_past_prepare_recovers_
+atomically`'s own doc has the complete two-stage account); **issue #731
+itself is closed** (the relay deadlock, this rung's own scope), and **a
+new issue is to be filed** against `ClientCtx::txn_recover`'s non-local
+grace-check branch, a different subsystem entirely.
+
+`cargo test -p animusd --lib`: 365 passed / 5 ignored before this fix →
+365 passed / 5 ignored after (0 regressions — the two tests stayed
+`#[ignore]`d, now for the second, distinct reason above instead of the
+first).
+
+See `crates/animus-node/CLAUDE.md`'s matching "`sim_relay`'s dispatch
+model" entry, `crates/animusd/CLAUDE.md`'s updated scenario-(g) account,
+and `docs/engineering-lessons.md`'s matching entries (the general lesson
+on a test double that serializes what production runs concurrently hiding
+deadlocks only nested calls reveal, and the follow-up on how fixing one
+such deadlock can unmask an independent bug underneath it) for the full
+record. `docs/roadmap.md`'s C-06 entry is updated to note issue #731's own
+closure and the new finding; PRs 4-7 of that series (the wire corpus,
+PartiQL siblings, PartiQL sim tests, docs close-out) remain open and
+unrelated to either.
+
+## 2026-09-07 amendment — #737 closed: `ClientCtx::txn_recover`'s non-local grace check now reads an absolute timestamp
+
+The second, distinct finding the #731 fix above uncovered — `ClientCtx::
+txn_recover`'s non-local grace-check branch (`crates/animusd/src/
+txn_coordinator.rs`) computing `now_ms` as the elapsed gap between two
+back-to-back `self.env.now()` reads (near-zero, forever) instead of an
+absolute timestamp — is fixed.
+
+**The fix**: both `txn_recover` call sites (the orphan-record branch and
+the ordinary decided-record branch) now share one free function,
+`recovery_grace_now_ms<E: Env>(env: &E, route: &CpRoute<E>) -> u64`, which
+reads `leader.env().now().0 / 1_000_000` on `CpRoute::Local` (unchanged —
+this branch was always correct) and `env.now().0 / 1_000_000` on every
+other route — the pusher's own absolute virtual/monotonic time, converted
+to milliseconds by the identical integer division `animus_cp_data::hlc::
+Hlc::mint` uses when it produces `wall_ms` in the first place (`Hlc::
+now_ms`, `hlc.rs`). This is the load-bearing correction: the bug was never
+about *which* clock (both the buggy and the fixed code read `env.now()`
+under `SimEnv`/`ProdEnv` alike) — it was about *what quantity* the read
+produced. `Hlc::mint`'s `wall_ms` is an absolute reading of `env.now()` at
+mint time; the grace check compares a *later* absolute reading against it
+plus `RECOVERY_GRACE`. The pre-fix non-local branch instead computed
+`t.duration_since(self.env.now())` where `t` was itself minted one
+statement earlier — the elapsed gap between two adjacent reads, not a
+comparable absolute value — which is always near-zero and so always
+`< wall_ms + RECOVERY_GRACE`, declining recovery on every single call,
+forever, once the record was more than an instant old. See `crates/
+animusd/src/txn_coordinator.rs`'s own doc on `recovery_grace_now_ms` for
+the full account, and `docs/engineering-lessons.md`'s matching entry for
+the general lesson this generalizes to (a mechanical `Instant::now().
+elapsed()` → `Env` conversion must preserve WHAT is measured, not just the
+API — the very risk rung C5 step 3b's own doc already flagged and
+deliberately deferred, see that rung's bullet above).
+
+**Sharing one helper is what makes the two call sites unable to diverge
+again** — before this fix, both sites independently duplicated the
+identical buggy `duration_since` computation (copy-pasted, per the rung
+C5 step 3b conversion notes), so a future partial fix to only one site
+would have been a real, silent risk; now there is exactly one place this
+comparison's "now" can be computed.
+
+**Verification**: a new unit test module, `txn_coordinator::
+recovery_grace_tests`, drives `recovery_grace_now_ms` directly off a bare
+`SimEnv` (no `ClientCtx`/`CpGroup` fixture needed, since the function reads
+nothing but `env`/`route`) — asserting the grace check still holds
+immediately after minting (`CpRoute::None`, the non-local shape) and
+clears once the simulator's own virtual clock has advanced past
+`RECOVERY_GRACE`, plus that the `Local` and non-local arms agree when
+driven off clocks minted from the same node. `coordinator_never_finished_
+past_prepare_recovers_atomically` and its `_over_seeds` sibling (`crates/
+animusd/src/sim_cluster_dynamo_transact.rs`, scenario (g)) are un-ignored
+and renamed to `coordinator_crash_after_prepare_recovers_atomically_to_
+commit`(`_over_seeds`) — both now converge: a strong read of the
+participant key from a different, live node triggers `confirm_or_push`/
+`txn_recover` on demand once the record has sat `Pending` past
+`RECOVERY_GRACE`, and both the participant and anchor keys converge
+together, atomically, with the restarted coordinator's own view agreeing
+too. Confirmed at the original pinned seed `0xC06F_0007` (= `3228499975`)
+and the `_over_seeds` five-seed loop, each run twice for determinism.
+`cargo test -p animusd --lib`: 365 passed / 5 ignored before this fix →
+367 passed / 3 ignored after (the two tests move from ignored to passing;
+the three remaining `#[ignore]`d tests are unrelated flake-issue
+characterizations, unmodified by this fix).
+
+**Audit of every other `env.now()`/`duration_since`/`wall_now` read in
+`txn_coordinator.rs`/`write_path.rs`/`read_path.rs`/`schema.rs`/
+`forwarding.rs`** (rung C5 step 3b's conversion targets) found no second
+instance of the same mistake: every other site is either a deadline/
+retry-loop pattern (`let deadline = self.env.now().saturating_add(TIMEOUT);
+... self.env.now() >= deadline`, or `deadline.duration_since(self.env.
+now())` to compute remaining budget) — comparing two `env.now()`-derived
+absolute values against each other, which is sound — or a throttle-bucket
+`now` parameter (`ThrottleTracker::check_read`/`check_write`/`charge_read`,
+ADR 0065) that is purely self-consistent (the bucket's own internally
+stored `last: Nanos` is always compared against a fresh `env.now()` read,
+never against an unrelated absolute value like an HLC `wall_ms`). None of
+these compare an `env.now()` reading against a *stored*, previously-minted
+absolute timestamp the way the grace check does, so none carried the same
+risk. See `crates/animusd/CLAUDE.md`'s matching account for the per-file
+breakdown.
+
+Docs updated in the same change: `docs/adr/0018-cross-tablet-transactions.
+md` (a dated amendment on `RECOVERY_GRACE`'s own clock requirement),
+`docs/roadmap.md`'s C-06 entry (issue #737's own closure, alongside #731's),
+`crates/animusd/CLAUDE.md` (the scenario-(g) account rewritten to drop the
+`#[ignore]` caveat), and `docs/engineering-lessons.md` (the general lesson).
+`Cargo.lock` unchanged.

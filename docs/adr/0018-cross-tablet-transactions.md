@@ -3813,3 +3813,58 @@ previously-silent contributor to the write-loss symptom (the unconditional
 keeps the pin" mandate, only a fresh, clean 30-run un-pinned soak (ADR
 0058's own gate) can actually move the pin, and that soak was not run this
 round. See ADR 0058's matching note.
+
+## Amendment (2026-09-07, issue #737: the grace check's own clock, stated explicitly)
+
+§3 step 2's grace check — `Pending` and `now < created_ts.wall_ms +
+RECOVERY_GRACE` — says "now" without naming which clock produces it. This
+was implicit but load-bearing, and a real bug (issue #737) shipped by
+under-specifying it: `created_ts.wall_ms` is always minted by
+`animus_cp_data::hlc::Hlc::mint`, which takes the caller-sampled `Nanos`
+from `env.now()` — the `Env` `Clock` seam's virtual/monotonic time (ADR
+0003), **never** [`Env::wall_now`](../../crates/animus-env/src/lib.rs)
+(the ADR 0051 calendar-time accessor reserved for interpreting an
+externally-supplied absolute timestamp, e.g. a DynamoDB TTL attribute —
+`created_ts.wall_ms` is not one of those; it is this cluster's own minted
+value, and every deadline/liveness computation in this repo keeps using
+`env.now()`, which cannot step backwards, per the root `CLAUDE.md`'s
+determinism section). **The rule this amendment states explicitly: every
+reader of "now" in this grace check — wherever it runs, on whichever node
+— must read `env.now()` (converted to milliseconds the same way `Hlc::
+mint`'s own `now_ms` helper does, plain integer division, `hlc.rs`) and
+never `Env::wall_now`, and never a value derived by any means other than
+directly sampling the clock at the moment of comparison.**
+
+That last clause is precisely what `animusd::ClientCtx::txn_recover`'s
+non-local branch got wrong (ADR 0061's matching 2026-09-07 "#737 closed"
+amendment has the full account): it computed `now` as the elapsed gap
+between two back-to-back `env.now()` reads (`t.duration_since(env.now())`,
+`t` minted one statement earlier) rather than an absolute reading of
+`env.now()` itself — a near-zero value forever, regardless of how much
+real (virtual or wall) time had actually elapsed since `created_ts` was
+minted. Since the comparison is `now_ms < created_ts.wall_ms +
+RECOVERY_GRACE`, a near-zero `now_ms` satisfied it on every call, so
+recovery declined permanently for any push that ran on a node other than
+the record's own anchor tablet leader — a genuine, previously-latent
+liveness regression: on-demand recovery of a foreign in-doubt intent
+(§4's own reader-triggered push, the *only* recovery path `SimCluster`-
+driven fixtures exercise, since they spawn no `txn_resolver_loop`
+background sweep — see `crates/animusd/CLAUDE.md`'s `SimCluster` section)
+never converged at all, though the equally-important background-sweep
+path (§5, which always runs on the anchor's own tablet leader and so
+always took the correct `CpRoute::Local` branch) was unaffected and had
+been masking the bug in every `ProdEnv` integration test that also
+exercises `txn_resolver_loop`.
+
+**Fixed** by giving both `txn_recover` call sites one shared clock-read
+helper (`recovery_grace_now_ms`, `crates/animusd/src/txn_coordinator.rs`)
+that always reads an absolute `env.now()` — the `CpRoute::Local` arm off
+the hosting leader's own `env` (an equivalent reading under every real
+deployment shape), every other arm off the pusher's own `env` — so the two
+call sites cannot diverge on this again. This amendment exists so the next
+implementer of a grace-style liveness check in this ADR's territory reads
+the rule stated once here rather than re-deriving it (or re-breaking it)
+from the surrounding code's own shape. See the matching ADR 0061 amendment
+and `docs/engineering-lessons.md`'s entry for the fuller incident account
+and the general lesson (a mechanical `Instant::now().elapsed()` → `Env`
+conversion must preserve WHAT is measured, not just the API).

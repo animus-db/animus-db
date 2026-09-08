@@ -23,6 +23,45 @@ use crate::{
     outcome_to_status,
 };
 
+/// The [`RECOVERY_GRACE`](animus_cp_data::RECOVERY_GRACE) check's "now", in
+/// the exact same units and off the exact same clock that minted
+/// `created_ts`/`hint_ts.wall_ms` — [`animus_cp_data::hlc::Hlc::mint`] always
+/// takes `env.now()` (virtual/monotonic time under every `Env`, **not**
+/// [`Env::wall_now`](animus_env::Env::wall_now) — a `wall_ms`-named field
+/// despite the name, see that type's own doc) and converts nanoseconds to
+/// milliseconds by plain integer division, so this does the identical
+/// conversion: `env.now().0 / 1_000_000`.
+///
+/// **Both [`ClientCtx::txn_recover`] call sites share this exact clock read
+/// through this one free function, so they cannot diverge again** (issue
+/// #737 — the non-local branch used to compute the gap between two
+/// back-to-back `self.env.now()` reads instead, near-zero forever, which
+/// made the grace check's `now_ms < wall_ms + RECOVERY_GRACE` comparison true
+/// on every call and declined on-demand recovery of a foreign in-doubt
+/// intent permanently; see `docs/engineering-lessons.md`'s matching entry).
+///
+/// A free function, not a `ClientCtx` method — it reads nothing but `env`/
+/// `route`, so it needs no `&self` at all, and staying free-standing lets
+/// `recovery_grace_tests` below unit-test the comparison directly off a bare
+/// `SimEnv`, with no `ClientCtx`/`CpGroup` fixture to build.
+///
+/// `route`'s `CpRoute::Local` arm reads the hosting leader's own `env`
+/// (identical to the pusher's own `env` under every real deployment shape —
+/// a node forwards *to* a leader, it never receives a route naming a
+/// *different* node's env) purely so a caller that already resolved a route
+/// doesn't need a second lookup; every other arm (forwarded, no leader
+/// reachable) falls back to the pusher's own `env`, which is the only clock
+/// a forwarded pusher has — the grace window is generous (seconds) and
+/// liveness-only, so modest cross-node clock skew here is harmless (it can
+/// only shift *when* a push is attempted, never whether a decision is
+/// safe).
+fn recovery_grace_now_ms<E: Env>(env: &E, route: &CpRoute<E>) -> u64 {
+    match route {
+        CpRoute::Local(leader) => leader.env().now().0 / 1_000_000,
+        _ => env.now().0 / 1_000_000,
+    }
+}
+
 impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// **The one place a stage actually executes on the leader's own node**
     /// (ADR 0046 U3, `TxnStage` kind-writes stack PR2) — shared by
@@ -1134,20 +1173,8 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 let Some(hint_ts) = intent_ts_hint else {
                     return Ok(TxnDecisionStatus::Pending);
                 };
-                let now_ms = match self.cp_route(record_table, record_key).await {
-                    CpRoute::Local(leader) => leader.env().now().0 / 1_000_000,
-                    // `Nanos` has no `elapsed()` (`tokio::time::Instant::
-                    // elapsed` is a tokio-only convenience) — two
-                    // back-to-back `now()` reads and a saturating diff
-                    // reproduce the identical near-zero duration the
-                    // original `tokio::time::Instant::now().elapsed()`
-                    // always measured here (the gap between minting and
-                    // reading its own instant, not any real wait).
-                    _ => {
-                        let t = self.env.now();
-                        t.duration_since(self.env.now()).as_millis() as u64
-                    }
-                };
+                let route = self.cp_route(record_table, record_key).await;
+                let now_ms = recovery_grace_now_ms(&self.env, &route);
                 if now_ms < hint_ts.wall_ms + animus_cp_data::RECOVERY_GRACE.as_millis() as u64 {
                     return Ok(TxnDecisionStatus::Pending);
                 }
@@ -1203,22 +1230,8 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         // always resolves *some* local or forwarded leader for `record_key`
         // itself, so re-route here rather than plumb a fresh `Env` handle
         // through just for a clock read.
-        let now_ms = match self.cp_route(record_table, record_key).await {
-            CpRoute::Local(leader) => leader.env().now().0 / 1_000_000,
-            // A forwarded caller has no local env to read; approximate with
-            // this node's own — the grace window is generous (seconds) and
-            // liveness-only, so modest cross-node clock skew here is
-            // harmless (it can only shift *when* a push is attempted).
-            // `Nanos` has no `elapsed()` (`tokio::time::Instant::elapsed` is
-            // a tokio-only convenience) — two back-to-back `now()` reads and
-            // a saturating diff reproduce the identical near-zero duration
-            // the original `tokio::time::Instant::now().elapsed()` always
-            // measured here.
-            _ => {
-                let t = self.env.now();
-                t.duration_since(self.env.now()).as_millis() as u64
-            }
-        };
+        let route = self.cp_route(record_table, record_key).await;
+        let now_ms = recovery_grace_now_ms(&self.env, &route);
         if now_ms < view.created_ts.wall_ms + animus_cp_data::RECOVERY_GRACE.as_millis() as u64 {
             return Ok(TxnDecisionStatus::Pending);
         }
@@ -1931,5 +1944,114 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             observed.push((table.clone(), key.clone(), actual));
         }
         Ok(observed)
+    }
+}
+
+/// [`recovery_grace_now_ms`]'s own regression (issue #737): the `txn_recover`
+/// grace check must decline inside `RECOVERY_GRACE` of the record's own
+/// `created_ts`/`hint_ts.wall_ms` and let recovery proceed once it has
+/// elapsed — off a `CpRoute` that is deliberately **not** `Local` (`CpRoute::
+/// None`), the exact shape both real call sites hit for a pusher that
+/// doesn't host the record's tablet, which is precisely the branch that used
+/// to compute a near-zero elapsed gap forever instead of an absolute
+/// timestamp. Needs no `ClientCtx`/`CpGroup` fixture at all — the function
+/// under test reads only `env`/`route`.
+#[cfg(test)]
+mod recovery_grace_tests {
+    use std::time::Duration;
+
+    use animus_cp_data::{RaftKvNode, StorageScope};
+    use animus_env::nid;
+    use animus_sim::{SimEnv, Simulator};
+    use animus_storage::MemoryEngine;
+
+    use super::*;
+
+    fn grace_ms() -> u64 {
+        u64::try_from(animus_cp_data::RECOVERY_GRACE.as_millis())
+            .expect("RECOVERY_GRACE fits in a u64 of milliseconds")
+    }
+
+    /// Mirrors the real comparison at both `txn_recover` call sites:
+    /// `now_ms < wall_ms + RECOVERY_GRACE`.
+    fn still_inside_grace(now_ms: u64, wall_ms: u64) -> bool {
+        now_ms < wall_ms + grace_ms()
+    }
+
+    #[test]
+    fn declines_immediately_after_the_record_was_created() {
+        let sim = Simulator::new(0x7EC0_0001);
+        let env: SimEnv = sim.env(nid(0));
+
+        let created_wall_ms = recovery_grace_now_ms(&env, &CpRoute::None);
+        let now_ms = recovery_grace_now_ms(&env, &CpRoute::None);
+
+        // Before the fix this always held too — but only because `now_ms`
+        // was a near-zero elapsed gap, not because the grace window was
+        // genuinely still open. `_over_seeds`-style corroboration: pin the
+        // absolute value too, not just the comparison, so a regression back
+        // to `duration_since(self.env.now())` (which would also read
+        // "small") is caught by the exact-equality check, not only by the
+        // looser inequality every one of these asserts also states.
+        assert_eq!(
+            now_ms, created_wall_ms,
+            "two back-to-back reads with no elapsed virtual time must read the \
+             identical absolute wall_ms, not a near-zero elapsed duration"
+        );
+        assert!(
+            still_inside_grace(now_ms, created_wall_ms),
+            "must still be inside RECOVERY_GRACE right after minting: \
+             now={now_ms} created={created_wall_ms}"
+        );
+    }
+
+    #[test]
+    fn proceeds_once_recovery_grace_has_genuinely_elapsed() {
+        let mut sim = Simulator::new(0x7EC0_0002);
+        let env: SimEnv = sim.env(nid(0));
+
+        let created_wall_ms = recovery_grace_now_ms(&env, &CpRoute::None);
+
+        // Advance the simulator's own virtual clock well past RECOVERY_GRACE
+        // -- the same clock `Hlc::mint` draws `wall_ms` from at every real
+        // call site, so this is exactly the passage of time the grace check
+        // is meant to observe.
+        sim.run_for(Duration::from_millis(grace_ms() + 1_000));
+
+        let later_ms = recovery_grace_now_ms(&env, &CpRoute::None);
+        assert!(
+            later_ms > created_wall_ms,
+            "the simulator's virtual clock must have actually advanced: \
+             created={created_wall_ms} later={later_ms}"
+        );
+        assert!(
+            !still_inside_grace(later_ms, created_wall_ms),
+            "must have cleared RECOVERY_GRACE once it has genuinely elapsed: \
+             later={later_ms} created={created_wall_ms}"
+        );
+    }
+
+    /// The `CpRoute::Local` arm reads the SAME clock through a different
+    /// spelling (`leader.env().now()` rather than the pusher's own `env`) --
+    /// confirm the two arms agree when they're driven off clocks minted from
+    /// the same simulator, exactly like the real single-process pusher.
+    #[test]
+    fn local_and_non_local_routes_agree_on_now_ms() {
+        let sim = Simulator::new(0x7EC0_0003);
+        let env: SimEnv = sim.env(nid(1));
+        let kv: RaftKvNode<SimEnv, MemoryEngine> = RaftKvNode::start_scoped(
+            sim.env(nid(1)),
+            vec![nid(1)],
+            MemoryEngine::new(),
+            StorageScope::new(KeyRange::whole()),
+        );
+
+        let via_none = recovery_grace_now_ms(&env, &CpRoute::None);
+        let via_local = recovery_grace_now_ms(&env, &CpRoute::Local(CpGroup::Mem(kv)));
+        assert_eq!(
+            via_none, via_local,
+            "the Local and non-local arms must read the identical now_ms when \
+             both clocks come from the same node's own env"
+        );
     }
 }

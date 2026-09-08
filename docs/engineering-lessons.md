@@ -15152,6 +15152,84 @@ artificial load, but a condition-based search polling `GET /admin/raft`'s
 where commit has advanced but apply hasn't, then firing the racing call at
 exactly that reading.
 
+**Amendment (issue #712, 2026-09-07): the bound-wait alone still measurably
+collides under real CI contention — a single stale read at one checkpoint
+should never be allowed to lock in a doomed, deterministic failure.** The
+regression test above (`control_membership_split.rs::
+admin_add_control_member_races_a_control_only_self_registration_and_still_
+converges`) started failing intermittently in CI (`prod-liveness-animusd`
+shard, ~1 run in 2-3 under real nextest-partition contention; reproduced
+locally at 2/30-2/70 under a 4-core host loaded with `yes`/other `animusd`
+integration binaries, 0 flake with `cargo test --workspace` off) with the
+exact `409`/"already claimed by a different registration" body the test
+guards against — proof the fix above narrows but does not close the
+window. Root cause: the fix's own read-your-writes barrier
+(`engine_applied_index() >= commit_index()`, bound-waited once, for up to
+`SCHEMA_COMMIT_TIMEOUT`) is a **single checkpoint** — if the apply task
+hasn't caught up by the time that one bound-wait's own timeout expires
+(plausible, not exotic, under real host contention: the apply task is an
+ordinary spawned task competing for the same CPU/disk every other
+concurrently-running test binary is hammering), the call falls through to
+read the still-stale cache exactly once, decides "genuinely unclaimed," and
+proposes a malformed `RegisterNode` (empty `client`/`admin`/`intra`) that
+is now doomed: Raft log order guarantees the target's own real
+self-registration (already committed before this call ever started
+waiting) applies *before* this malformed entry does, so the malformed
+entry's own apply-time CAS check is a **deterministic** collision, not a
+transient one — no amount of extra waiting inside that one proposal fixes
+it, because the wrong bytes were already sent. This is case (a) from the
+prompt (the wait can time out) compounding into case (c) (the racing
+self-registration legitimately, permanently owns the slot the malformed
+guess collides against) — widening `SCHEMA_COMMIT_TIMEOUT` would only
+raise the contention bar at which this reappears, not remove the
+determinism trap, so it was rejected as the fix.
+
+**The actual fix doesn't try to make the *first* read reliably fresh —
+it makes a stale first read recoverable.** `ClientCtx::register_node`'s own
+`Collision` verdict is *itself* backed by a `metadata_fresh()` read (see
+that method's own doc) — so the instant a caller observes `Collision`, its
+local cache is *guaranteed* to already hold whatever entry caused it
+(`ControlHandle::Local`'s `metadata_fresh()` and `metadata_cached()` are
+the same read). `admin_add_control_member`'s "genuinely unclaimed" branch
+used to retry-with-a-different-id only for a **minted** id and fail
+immediately on the very first `Collision` for an **operator-supplied** one
+— exactly the shape this admin action exists to serve (promoting an
+already-self-registering growth node by its own known id). Fixed by also
+retrying an operator-supplied id, **at the same id**, up to a small bound
+(`MAX_CLAIM_REFRESH_ATTEMPTS = 3`, `animusd::lib`) — each retry re-derives
+`addrs` from a fresh `metadata_cached()` read (the loop already did this
+per-iteration; the only change is *letting it loop* for this id shape). A
+stale-merge collision against the target's own now-applied self-
+registration re-merges to an *identical* `addrs` on the very next
+iteration, so the retry's own `register_node` call resolves as an
+idempotent no-op (`Registered`), typically within one extra attempt,
+independent of how long the apply task took to catch up. A **genuine**,
+permanent conflict (a real different registration holding the id) re-
+derives the identical conflicting `addrs` every time and still fails
+loudly — just after up to 3 bounded retries instead of the first one, a
+deliberate small latency cost on a rare admin path, never a correctness
+compromise (verified: `add_control_member_collision_shapes` and the wider
+`control_membership_admin.rs`/`admin_endpoint.rs` suites stay green).
+
+**General lesson, sharpened**: a read-your-writes barrier gated on a
+single bound-wait is a *timing* fix, not a *correctness* fix, whenever the
+decision it unblocks is otherwise irrevocable (here: proposing a
+byte-committed guess that will deterministically collide once racing state
+lands) — the barrier reduces how *often* the stale-read window is hit, it
+does not change what happens when it's hit anyway. Pair a bound-wait with
+a **retry that re-derives from a still-fresher signal the failure itself
+proves is now available** (a `Collision`/`Rejected` outcome from a
+`metadata_fresh()`-backed call is exactly such a signal) so a caller that
+loses the timing race the first time gets a second, now-unstale attempt
+instead of a deterministic failure. Reproduction discipline worth naming
+too: this bug needed *real* multi-process CPU contention to surface at any
+useful rate (a bare `yes`-loop on an otherwise idle host barely reproduces
+it; running several other heavy `animusd` `ProdEnv` integration binaries
+concurrently roughly doubled the observed rate on the same host) —
+matching CI's own nextest-partition shape (many real test processes
+sharing a runner) is what a flaky-under-load `ProdEnv` test's own repro
+loop should mirror, not just added CPU spin.
+
 ## Sourcing a real Google Fonts variable-font `.woff2` for embedding (ADR 0056's 2026-08-31 amendment, the Space Grotesk/Martian Mono → Work Sans/JetBrains Mono font swap)
 
 The Google Fonts CSS2 API (`https://fonts.googleapis.com/css2?family=...`)
@@ -21941,6 +22019,207 @@ a per-request task (production's own shape) or an explicit re-entrancy
 story; a protocol's own docs should say which guarantee holds, since the
 failure mode (a silent, seed-stable timeout with no distinguishing error)
 gives no hint that recursion, not routing, is the actual cause.
+
+## A test double that serializes what production runs concurrently hides deadlocks that only nested calls reveal — fix by mirroring production's concurrency shape, keep determinism through the seeded spawner (issue #731, closing the finding above)
+
+The finding immediately above (`SimRelayClient`'s single receive loop
+deadlocking on a nested outbound relay call) is now fixed, not merely
+characterized. `animus_node::sim_relay::SimRelayClient::serve_loop`
+dispatches each inbound `RelayWire::Request` onto its own task
+(`env.spawn_task`) instead of `.await`-ing the installed handler inline
+before looping back to `recv_stream` — the identical "one task per inbound
+unit of work" shape production's real `AnimusdRelayClient` already has
+(one `tokio::spawn`ed task per accepted TCP connection). No new
+correlation bookkeeping was needed: `RelayWire`'s `req_id` + the existing
+`Pending`-slot `BTreeMap` already handle an arbitrary number of concurrent
+in-flight requests/replies (proven by the pre-existing
+`concurrent_outstanding_requests_resolve_to_the_right_callers` unit test,
+which covers the *client* side of exactly this concurrency) — the deadlock
+was purely a *server*-side sequencing bug, dispatch never actually needed
+a new correlation mechanism, only to stop serializing itself out of the
+`Pending` map's own reach.
+
+**The general lesson, stated once for the next test double this shape
+bites**: a simulator-side stand-in for a real, concurrent transport
+(`SimRelayClient` for `AnimusdRelayClient`; more generally, any
+single-task inline-dispatch receive loop standing in for
+"one task per connection/request" production code) that *serializes*
+what production genuinely runs *concurrently* is not merely a performance
+simplification — it changes the double's own reachable state space.
+Ordinary request/reply traffic never notices, because a request handler
+that only ever *answers* (never itself calls back out through the same
+channel) has no way to observe the difference. The gap only opens once
+some handler is **also a client of the identical channel** — a nested
+outbound call whose own reply can only arrive through the very loop
+currently blocked awaiting that handler. This is exactly the shape ADR
+0018 transaction recovery's foreign-intent path has (a forwarded read's
+own server-side handling can itself need to forward again), and the first
+scenario to combine a crash (forcing the recursion-triggering re-election)
+with a cross-tablet transactional intent (forcing the second hop) is what
+finally exercised it — nine earlier crash-driven scenarios across five
+other `sim_cluster_*` modules never happened to combine both, so the bug
+sat latent through every one of them.
+
+**The fix pattern, worth reusing verbatim for the next such double**: keep
+the receive loop as the sole, ordered *reader* of the shared inbox (ADR
+0026's single-consumer invariant is not what needed relaxing — only one
+task ever calls `recv_stream`), but hand off the *handling* of whatever it
+receives to a freshly spawned task through the environment's own seeded
+spawner (`env.spawn_task`, never a raw `tokio::spawn` — this crate has no
+`tokio` dependency at all, and even where one exists the `Env` seam is the
+one sanctioned nondeterminism boundary, root `CLAUDE.md`). Concurrency
+introduced this way stays fully deterministic and seed-reproducible: the
+simulator's own single-threaded cooperative executor still decides,
+seeded, which of several ready tasks runs next and in what order their
+`send`/`recv` calls interleave — spawning more tasks does not reach
+outside that scheduler, it only gives the scheduler more tasks to
+interleave among. Verify a fix built this way the way this one was:
+confirm an ordinary (non-nested) request/reply round trip is unaffected
+(a concurrency fix to a shared receive loop is exactly the kind of change
+that can silently reorder or drop an unrelated message if the correlation
+story it relies on — `req_id` here — isn't already sound for concurrent
+use), and confirm the specific symptom that diagnosed the deadlock is
+actually gone at the scenario that found it — but **don't assume "the
+symptom is gone" means "the scenario now converges."** It doesn't, here:
+see the follow-up entry immediately below.
+
+## Fixing a deadlock that was masking a second, independent bug does not mean the scenario it hid now passes — verify the NEW failure text, not just the absence of the old one (issue #731's own follow-up, same day)
+
+Landing the fix above and re-running its own motivating scenario
+(`coordinator_never_finished_past_prepare_recovers_atomically`,
+`sim_cluster_dynamo_transact.rs`) did **not** turn it green. The
+deadlock's own symptom — `SimRelayClient::relay`'s timeout text, repeating
+unchanged for the full poll budget — was gone, confirming the fix genuinely
+worked: the nested relay hop this scenario needs now completes. But the
+scenario still failed, with a *different*, equally unchanging error:
+`Err("transaction covering this key is still pending; retry")`. Tracing
+that text to its source (`cp_get_local_resolving_inner`'s
+`TxnDecisionStatus::Pending` arm, reached only once `confirm_or_push`/
+`txn_recover` both run to completion) led straight to a second, wholly
+unrelated bug: `ClientCtx::txn_recover`'s own grace-check computes
+`now_ms` as `self.env.now().duration_since(self.env.now())` — the elapsed
+gap between two back-to-back clock reads, always near-zero — instead of
+an absolute timestamp, whenever the recovery push runs on a node that
+isn't the record's own local leader (the ordinary case for an on-demand
+push triggered by a foreign read, as opposed to a background sweep that
+only ever recovers tablets it itself leads). A near-zero `now_ms` can
+never exceed `created_ts.wall_ms + RECOVERY_GRACE`, so the grace check
+never passes and recovery declines forever, regardless of how much
+virtual time has genuinely elapsed. This bug is pre-existing — introduced,
+and *knowingly* left unfixed as out of scope, by an earlier `tokio::time::
+Instant::now().elapsed()` → `Env` conversion rung, whose own commit
+message said as much ("reproducing the identical near-zero result rather
+than 'fixing' what reads like a pre-existing latent bug") — and it was
+never reachable before this fix because the relay deadlock intercepted
+every recovery attempt earlier in the same call chain.
+
+**The general lesson**: when a fix removes a deadlock (or any other
+"nothing ever gets far enough to fail informatively" bug) from a call
+chain, re-running the scenario that found it can uncover a *second* bug
+sitting immediately downstream — one the first bug was accidentally
+shielding from ever being exercised at all. A green re-run is real
+evidence the first bug is fixed; a **still-red** re-run needs the same
+scrutiny as a brand-new failure, not a shrug of "the fix didn't work" —
+diagnose the *current* error text on its own merits (here, tracing one
+short string straight to its one source line) before concluding anything
+about the original fix. The two bugs are almost always in different
+subsystems (a testing primitive's dispatch shape vs. a distributed
+recovery protocol's clock-comparison logic, in this case) and belong in
+different fixes/PRs/issues — closing the first issue and filing a fresh
+one for the second is the correct disposition, not stretching one fix to
+cover both or declaring the original finding "not actually fixed."
+
+## A mechanical `Instant::now().elapsed()` → `Env` conversion must preserve WHAT is measured, not just the API — an absolute timestamp compared against a stored wall time is not an elapsed duration (issue #737, closing the finding above)
+
+The bug the previous entry traced to its source line is now fixed —
+worth its own entry because the *general* lesson is about the conversion
+technique itself, not just this one call site, and generalizes past this
+one rung.
+
+**What went wrong.** ADR 0061 rung C5 step 3b mechanically converted every
+`tokio::time::Instant::now()`/`.elapsed()` call in five `animusd` modules
+to the `Env` seam. Most of those calls fit a clean pattern —
+`let deadline = Instant::now() + TIMEOUT; ... while Instant::now() <
+deadline { .. }` — and converted cleanly to `env.now().saturating_add(..)`
+/`env.now() < deadline`, because in every one of those the *quantity*
+being measured (elapsed wall time toward a locally-scoped deadline) has an
+exact `Env`-seam equivalent. Two sites in `ClientCtx::txn_recover`
+(`crates/animusd/src/txn_coordinator.rs`) did not fit that pattern at all:
+they used `tokio::time::Instant::now().elapsed()` to produce a **near-zero
+duration, immediately discarded except for a comparison** — a
+`now_ms`-shaped local the surrounding code then compared against a
+**stored, previously-minted absolute timestamp** (`created_ts.wall_ms`,
+an `HlcTimestamp`'s own wall-clock component) plus a grace window. The
+conversion rung noticed the shape didn't fit cleanly (`Nanos` has no
+`elapsed()`), correctly diagnosed that the *pre-existing* code was
+computing a near-zero elapsed gap rather than anything meaningful for the
+comparison it fed, and — deliberately, and documented as such at the time
+— reproduced that identical near-zero value with two back-to-back
+`env.now()` reads plus `duration_since`, rather than "fixing" what looked
+like a pre-existing latent bug during an unrelated testability rung. That
+call was defensible in isolation (an incidental bug does get its own PR,
+not a drive-by fix bundled into a different rung's scope) — but the
+underlying defect it preserved was real, not cosmetic: it made
+`ClientCtx::txn_recover`'s non-local grace check compare a manufactured
+near-zero value against `wall_ms + RECOVERY_GRACE` forever, so recovery of
+a foreign in-doubt intent declined permanently instead of proceeding once
+`RECOVERY_GRACE` had genuinely elapsed — invisible in every `ProdEnv`
+integration test (which also exercises `txn_resolver_loop`'s background
+sweep, which always runs on the record's own anchor leader and so always
+took the *correct*, unaffected `CpRoute::Local` branch) and unreachable
+under `SimEnv` until an unrelated fix (issue #731, the entry above) first
+cleared a deadlock that had been intercepting every recovery attempt
+before `txn_recover` was ever actually called.
+
+**The fix**: give the grace check its own single, absolute-timestamp-
+producing helper (`recovery_grace_now_ms`, shared by both `txn_recover`
+call sites so they cannot diverge on this again) that reads `env.now()`
+directly and converts nanoseconds to milliseconds the same way
+`animus_cp_data::hlc::Hlc::mint` does when it produces `wall_ms` in the
+first place — never a duration between two adjacent reads.
+
+**The general lesson**: a mechanical `Instant::now().elapsed()` → `Env`
+seam conversion must ask, at every call site, not just "does this compile
+against the new API" but "what quantity did the old code actually
+produce, and does the new code produce the *comparable* quantity." Two
+shapes look superficially identical (`instant.elapsed()`, `Nanos::
+duration_since`) but answer completely different questions:
+
+- **An elapsed-duration measurement** ("how long did this operation take,"
+  "has this deadline passed") wants exactly what `tokio::time::Instant::
+  elapsed()`/the deadline-comparison pattern already gives — a genuinely
+  fresh reading compared against an earlier reading or a computed
+  deadline, both from the *same* clock, both meaningful as a *duration*.
+- **An absolute-timestamp comparison** ("is `now` past `stored_value +
+  grace`") wants the raw clock reading itself, at the moment of
+  comparison, compared against another absolute reading (however it was
+  produced) — never a duration between two reads of the *same* moment,
+  which by construction is always near-zero regardless of how much real
+  time has passed since the *stored* value was minted.
+
+Reproducing a pre-existing computation's literal shape during a mechanical
+conversion is the right call when the shape is sound (preserves
+behavior, defers a genuinely separate concern to its own fix) — but it is
+only actually behavior-preserving when the *quantity* the old shape
+produced was correct for what the surrounding logic needed in the first
+place. When a conversion rung's own investigation flags a call site as
+"doesn't fit the clean pattern" (as this one explicitly did, in both the
+commit and the crate's own `CLAUDE.md`), that flag is exactly the signal
+to ask the harder question — what is this value actually being compared
+against, and in what units/clock — rather than only asking "does this
+byte-for-byte reproduce what the old code computed." The old code's own
+computation can itself be the bug the conversion is inadvertently
+preserving. **Audit every converted clock read for the quantity it
+produces, not just the API it now compiles against** — the check that
+would have caught this one directly: for every `env.now()` read feeding a
+comparison, ask what the *other* side of that comparison is (a locally-
+scoped deadline built the same tick? sound as a duration. A value stored
+elsewhere, minted at a different time, by a possibly different clock read?
+needs an absolute reading, not a duration) — see `crates/animusd/CLAUDE.md`
+'s txn_coordinator.rs entry and `docs/adr/0018-cross-tablet-transactions.
+md`'s matching 2026-09-07 amendment (which states the grace check's own
+clock requirement explicitly, for exactly this reason) for the concrete
+instance this generalizes from.
 ## A Kubernetes `livenessProbe` must never gate on a distributed-consensus signal a healthy process cannot satisfy alone (issue #705/#710, ADR 0020/0060 2026-09-07 amendments)
 
 `crates/animus-operator/src/desired/statefulset.rs` pointed both the
@@ -22129,3 +22408,72 @@ to it; the queue is shared with the maintainer's own merges. (3) When a
 workflow's trigger says `crates/**`, ask what it proves and carve out the
 paths that cannot change that, each with a one-line reason a reader can
 verify in the tree.
+## A hardened test's own final assertion, added after the assertion that failed the last time, can carry the identical one-shot-on-an-eventual-property bug the hardening pass was meant to eliminate (issue #742, `split_placing_completion.rs`)
+
+**The failure**: `prod-liveness-animusd` on PR #717 (head 4d23cba0, unrelated
+to split/placing — it only lifted `update_table_throughput` into
+`dispatch_table_op`) failed
+`mark_split_placing_done_tolerates_a_stale_or_duplicate_relayed_propose`
+with `sibling child 3 unexpectedly not done` at the test's very last
+assertion, after the test's own `left`/`child` convergence poll and the
+duplicate-propose check both passed. The run took 5.4s, well inside its
+120s guard — not a timeout, not a stuck completion loop.
+
+**Root cause: (A), a test race, not a completion-loop defect.** The
+earlier "settle window" hardening pass documented above (see this file's
+"A 'just compare live state to the target' convergence check races the
+very proposer that sets the target" entry) fixed exactly this failure
+shape in this same file's *sibling* test
+(`placing_relocates_a_child_off_the_parents_original_nodes_and_the_
+completion_loop_marks_it_done`) — its own final section polls **both**
+children's `replicas`/`done` to convergence before ever asserting on
+either. But `mark_split_placing_done_tolerates_a_stale_or_duplicate_
+relayed_propose`'s closing assertion —
+
+```rust
+assert!(
+    split_placing_entry(&final_status, right).is_some_and(|(_, d)| d),
+    "sibling child {right} unexpectedly not done"
+);
+```
+
+— was a bare, unread one-shot check on `right`'s own `split_placing[..]
+.done`, an independently-converging value the completion loop marks per
+tablet, per tick, with no synchronization to this test's own poll
+granularity — the *exact* mistake the sibling test's own hardening pass
+named and fixed, just never applied to this second test in the same file.
+`right` was never polled anywhere in this test; only `left`/`child` had a
+bounded convergence loop, and by the time execution reached the final
+assert `right` had almost always (but, per this issue, not provably
+always) already converged too.
+
+**Evidence, not just reasoning**: 20/20 reproduction-loop runs under three
+`yes` spinners did not reproduce the failure directly (the race window is
+narrow here — both children fork under one `CutoverSplit` and are
+processed by the same per-tick completion loop, so by the time `left`'s
+own bounded poll, the duplicate-propose round trip, and a 500ms settle
+sleep have all elapsed, `right` has almost always caught up too).
+Temporary instrumentation (a non-assertion-affecting side poll logging
+`right`'s convergence latency at the point of the final assert) confirmed
+`right` was already `done` at that point in every one of 15 additional
+runs, converging in under 5ms once observed — consistent with "usually
+already converged, occasionally not" rather than "stuck": exactly the (A)
+signature, not (B) (a genuinely stuck completion loop would show `right`
+converging slowly or never across repeated observation, not converging in
+microseconds the moment it's checked).
+
+**The fix**: replaced the one-shot assert with a bounded
+converged-or-timeout poll for `right`, mirroring `child`'s own convergence
+loop earlier in the same test (same 60s deadline shape, same failure
+message convention naming the tablet and its current `split_placing`
+entry) — never a wider timeout, never `#[ignore]`, never a retry loop.
+Validated 20/20 under the identical spinner contention post-fix.
+
+**General lesson**: when a hardening pass fixes a one-shot-assert-on-an-
+eventual-property bug in one test, grep every *sibling* test in the same
+file (and file family) for the identical shape before considering the
+class closed — a fix applied to the test that happened to fail first does
+not retroactively harden a structurally identical assertion in a test
+that simply hadn't drawn the short straw yet. "The mechanism was already
+fixed for this file" is not evidence a specific assertion in that file was
+covered by the fix; check the assertion itself.

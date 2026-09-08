@@ -68,43 +68,56 @@
 //!     — exactly one proposal wins (first-committer-wins,
 //!     `Metadata`'s own schema-catalog exclusivity), and both transactions
 //!     commit regardless of which one won.
-//! (g) [`coordinator_never_finished_past_prepare_recovers_atomically`] — the
-//!     coordinator stages (prepares) both participants of a cross-table
+//! (g) [`coordinator_crash_after_prepare_recovers_atomically_to_commit`] —
+//!     the coordinator stages (prepares) both participants of a cross-table
 //!     transaction and never decides — the shape a coordinator process
 //!     crashing right after `cp_txn`'s prepare phase takes (ADR 0018 §2
 //!     recovery) — with virtual time advanced between the last prepare and
 //!     a real `SimCluster::crash` of the coordinator node, then a
-//!     `SimCluster::restart`. Intended to prove a strong read of the
-//!     **participant** key from a different, live node (a genuinely
-//!     foreign intent) triggers `confirm_or_push`/`txn_recover` on demand
-//!     once the record has sat `Pending` past `RECOVERY_GRACE` (5s), with
-//!     both keys converging together, never partially.
+//!     `SimCluster::restart`. Proves a strong read of the **participant**
+//!     key from a different, live node (a genuinely foreign intent)
+//!     triggers `confirm_or_push`/`txn_recover` on demand once the record
+//!     has sat `Pending` past `RECOVERY_GRACE` (5s), with both keys
+//!     converging together, never partially, and the restarted
+//!     coordinator's own view converging too.
 //!
-//!     **`#[ignore]`d — a real FINDING, not a `dynamo.rs`/coordinator/
-//!     idempotency bug.** See that function's own doc for the full
-//!     diagnosis: a **structural deadlock in `animus_node::sim_relay::
-//!     SimRelayClient`** (this fixture's `RelayClient` implementor, a
-//!     different crate) — its single per-node `serve_loop` awaits each
-//!     inbound forwarded request's handler *inline*, so a handler that
-//!     itself needs a nested outbound `relay()` call (exactly what
-//!     `confirm_or_push`'s foreign-intent recovery needs once the read
-//!     itself had to be forwarded) can never receive that call's own
-//!     reply — only that same, currently-blocked `serve_loop` could ever
-//!     deliver it. Confirmed structural (unchanging across every seed
-//!     tried, and a same-state plain non-transactional read succeeds
-//!     immediately), not a timing/flake artifact. Out of scope for this PR
-//!     (a fix belongs in `animus-node`, a shared testing primitive every
-//!     `SimCluster` module depends on) — kept as a characterization test
-//!     per this rung's own gate, not reworked or dropped. Issue to be
-//!     filed against `animus_node::sim_relay::SimRelayClient`.
+//!     **Two findings surfaced getting this scenario to converge, both now
+//!     fixed.** First, issue #731: `animus_node::sim_relay::
+//!     SimRelayClient::serve_loop`'s single-task inline dispatch deadlocked
+//!     a forwarded read that itself needed a second, nested outbound relay
+//!     hop (this scenario's `FastRead::Foreign` push, which forwards once to
+//!     the participant's own leader and then, from there, forwards again to
+//!     query the anchor) — fixed by dispatching each inbound request onto
+//!     its own task (`crates/animus-node/src/sim_relay.rs`'s own "One task
+//!     per inbound request" doc section, ADR 0061's "#731 closed"
+//!     addendum) — always fixture-only, never reachable in a real cluster
+//!     (production's `AnimusdRelayClient` already spawns one task per
+//!     inbound TCP connection). Second, issue #737: with #731 fixed, every
+//!     recovery push reached `ClientCtx::txn_recover`'s own grace check for
+//!     the first time — and its **non-local** branch (`crates/animusd/src/
+//!     txn_coordinator.rs`, the branch this scenario's own on-demand push
+//!     always takes, since it runs on the participant's tablet leader, not
+//!     necessarily the anchor's) computed `now_ms` as the elapsed gap
+//!     between two back-to-back clock reads instead of an absolute
+//!     timestamp — near-zero forever, so the grace check never passed and
+//!     recovery declined permanently. Fixed by sharing one clock-read
+//!     helper (`recovery_grace_now_ms`) between both `txn_recover` call
+//!     sites, off the identical `env.now()`-derived clock
+//!     `animus_cp_data::hlc::Hlc::mint` uses to produce `wall_ms` in the
+//!     first place — see `txn_coordinator.rs`'s own doc on that helper and
+//!     `docs/engineering-lessons.md`'s matching entry for the general
+//!     lesson (a mechanical `Instant::now().elapsed()` → `Env` conversion
+//!     must preserve WHAT is measured, not just the API).
 //!
 //! Replays (a) with `ANIMUS_SEED` per the repo convention:
 //! `ANIMUS_SEED=<seed> cargo test -p animusd --lib
 //! commit_across_two_tables_with_condition_check`. Scenario (g) replays the
-//! same way but needs `-- --ignored` appended (see its own doc). Handle
-//! recorded from this PR's own gate run: seed `0xC06F_0001` (scenario a,
-//! green) and `0xC06F_0007` (scenario g, the finding above — reproduces
-//! identically at every `_over_seeds` seed too).
+//! same way (no longer `#[ignore]`d): `ANIMUS_SEED=<seed> cargo test -p
+//! animusd --lib coordinator_crash_after_prepare_recovers_atomically_to_commit`.
+//! Handle recorded from this rung's own gate run: seed `0xC06F_0001`
+//! (scenario a, green) and `0xC06F_0007` = `3228499975` (scenario g, both
+//! findings above now fixed and confirmed green — reproduces identically at
+//! every `_over_seeds` seed tried too).
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -688,7 +701,7 @@ fn idempotency_table_bootstrap_race_between_two_first_callers_over_seeds() {
 }
 
 // ---------------------------------------------------------------------------
-// (g) The coordinator never finished past the prepare phase — ADR 0018 §2
+// (g) The coordinator crashed after the prepare phase — ADR 0018 §2
 // recovery, atomic commit on every replica.
 // ---------------------------------------------------------------------------
 
@@ -718,7 +731,17 @@ fn idempotency_table_bootstrap_race_between_two_first_callers_over_seeds() {
 /// **Atomicity**: once the participant key is observed committed, the
 /// anchor's own key must ALSO already be committed — never a partial
 /// outcome. The restarted coordinator's own view is polled to agree too.
-fn run_coordinator_never_finished_past_prepare_recovers_atomically(seed: u64) {
+///
+/// **Closes two findings this scenario itself surfaced (issues #731 and
+/// #737 — see the module's own doc for the full two-stage account)**:
+/// `SimRelayClient::serve_loop`'s inline single-task dispatch used to
+/// deadlock the nested forwarded hop `confirm_or_push` needs here, and,
+/// once that was fixed, `ClientCtx::txn_recover`'s non-local grace-check
+/// branch used to compute an elapsed near-zero duration instead of an
+/// absolute timestamp and so never let recovery proceed. Both are fixed;
+/// this scenario is the regression for the second (the first has its own
+/// dedicated coverage in `animus-node`).
+fn run_coordinator_crash_after_prepare_recovers_atomically_to_commit(seed: u64) {
     let mut cluster = SimCluster::new(seed, 3, 3);
     let (status, body) = create_table(&mut cluster, 0, "rcg_a");
     assert_eq!(
@@ -818,96 +841,91 @@ fn run_coordinator_never_finished_past_prepare_recovers_atomically(seed: u64) {
     );
 }
 
-/// **FINDING (ADR 0061 rung F, C-06 PR 3), not a `dynamo.rs`/coordinator/
-/// idempotency bug — a structural gap in `animus_node::sim_relay::
-/// SimRelayClient` itself, this fixture's `RelayClient` implementor.**
+/// **Both findings this scenario surfaced are now fixed — diagnosed, and
+/// confirmed fixed, at both stages.**
 ///
-/// Diagnosed, not merely observed: at the pinned seed, every attempt to
-/// read the participant key after the crash returns the identical
+/// **Stage 1 (issue #731, fixed)**: at the pinned seed, every attempt to
+/// read the participant key after the crash used to return the identical
 /// `Err("sim relay: timed out waiting for a reply to req_id=N")` —
 /// `SimRelayClient::relay`'s own timeout text — repeated, unchanging,
-/// across the full 40s poll budget (well past `RECOVERY_GRACE`). A control
-/// probe (a plain, non-transactional `PutItem`/`GetItem` on a fresh key of
-/// the SAME table, through the SAME reader node, in the SAME post-crash
-/// cluster state) succeeds immediately — ordinary one-hop forwarding to
-/// the live new leader is fine. The failure is specific to a **forwarded**
-/// read that lands on a `FastRead::Foreign` intent: the request is
-/// forwarded once (node1 → node2, tablet `rcg_b`'s new leader) exactly
-/// like the successful probe, but node2's own `cp_serve_forwarded` handler
-/// — still running *inside* `SimRelayClient::serve_loop`'s single receive
-/// task for node2 — then needs a SECOND, nested outbound relay call of its
-/// own (`confirm_or_push` → `ClientCtx::txn_status`, forwarding to
-/// whichever node leads the anchor's tablet `rcg_a`) before it can finish
-/// answering the first.
+/// across the full 40s poll budget, while a control probe (a plain,
+/// non-transactional `PutItem`/`GetItem` on a fresh key of the SAME table,
+/// through the SAME reader node, in the SAME post-crash cluster state)
+/// succeeded immediately — ordinary one-hop forwarding to the live new
+/// leader was fine. The failure was specific to a **forwarded** read that
+/// lands on a `FastRead::Foreign` intent: the request is forwarded once
+/// (node1 → node2, tablet `rcg_b`'s new leader) exactly like the
+/// successful probe, but node2's own `cp_serve_forwarded` handler then
+/// needed a SECOND, nested outbound relay call of its own (`confirm_or_push`
+/// → `ClientCtx::txn_status`, forwarding to whichever node leads the
+/// anchor's tablet `rcg_a`) before it could finish answering the first —
+/// and `SimRelayClient::serve_loop` (`crates/animus-node/src/sim_relay.rs`)
+/// used to be one task per node processing `env.recv_stream(RELAY_STREAM)`
+/// messages **strictly sequentially**, `.await`-ing each inbound request's
+/// handler **inline**, so that nested call's own reply could only ever be
+/// delivered by the same, currently-blocked `serve_loop` task: a genuine
+/// self-deadlock, broken only by the nested call's own timeout — the
+/// repeating, never-changing failure that was observed.
 ///
-/// `SimRelayClient::serve_loop` (`crates/animus-node/src/sim_relay.rs`) is
-/// one task per node processing `env.recv_stream(RELAY_STREAM)` messages
-/// **strictly sequentially**, `.await`-ing each inbound request's handler
-/// **inline** before looping back to receive the next message — it is
-/// never spawned per-request. A handler that itself calls `relay()` again
-/// (the nested case above) sends its own outbound request and then polls a
-/// shared `pending` map for a reply that only THIS SAME serve_loop task
-/// could ever stash there (`stash_reply`, on a `RelayWire::Reply` arriving
-/// via that same `recv_stream` call) — but the loop cannot reach that
-/// `recv_stream` call again until the handler it is currently awaiting
-/// returns, and the handler cannot return until its own nested `relay()`
-/// call resolves. A genuine self-deadlock, broken only by the nested
-/// call's own timeout — exactly the repeating, never-changing failure
-/// observed. Production's real `AnimusdRelayClient` has no analogous
-/// bottleneck (each inbound TCP connection is its own `tokio::spawn`ed
-/// task, so a nested outbound call blocks only that one connection's
-/// task, never a shared receive loop) — this is a `SimRelayClient`-only,
-/// fixture-only limitation, confirmed structural rather than timing-
-/// sensitive (unchanging across every seed tried).
+/// **Fixed**: `serve_loop` now dispatches each inbound `Request` onto its
+/// own `env.spawn_task`ed task instead of awaiting it inline — see
+/// `sim_relay.rs`'s own "One task per inbound request" doc section and ADR
+/// 0061's "#731 closed" addendum for the full mechanism. Mirrors
+/// production's own `AnimusdRelayClient` shape (one `tokio::spawn`ed task
+/// per inbound TCP connection) — the bug was always `SimRelayClient`-only,
+/// fixture-only, never reachable in a real cluster.
 ///
-/// **Why this is the first scenario to find it**: every other scenario in
-/// this module (and, per this crate's own `sim_cluster_corpus.rs`/`sim_
-/// cluster_dynamo_corpus.rs` docs, apparently every fault-injection cell
-/// built before this rung) never needed a forwarded request's own handler
-/// to make a further outbound relay call — an ordinary forwarded read/
-/// write answers locally once it reaches the right leader.
-/// Multi-participant transaction recovery's foreign-intent read path
-/// (`cp_get_local_resolving_inner`'s `FastRead::Foreign` arm →
-/// `confirm_or_push` → `txn_status`/`txn_recover` → `txn_verify`, each
-/// potentially a forward to a *different* tablet's leader) is the first
-/// mechanism in this codebase whose own server-side handling can need a
-/// second hop — and only becomes reachable via a **forwarded** (not
-/// locally-served) read, which itself requires a node crash to force
-/// re-election away from whichever node originally happened to lead every
-/// tablet touched.
+/// **Confirmed directly, not assumed**: with the #731 fix applied alone,
+/// this scenario's own poll loop no longer returned the relay timeout text
+/// at all — it returned `Err("transaction covering this key is still
+/// pending; retry")` instead, unchanging across the full 40s budget. That
+/// text is `cp_get_local_resolving_inner`'s own `TxnDecisionStatus::Pending`
+/// arm, reached only *after* `confirm_or_push`/`txn_recover` have both run
+/// to completion — proof the nested relay hop(s) succeed, but also proof of
+/// a SECOND, distinct, pre-existing bug the fixed deadlock had been masking.
 ///
-/// **Scope**: fixing `SimRelayClient` (spawning each inbound request's
-/// handler onto its own task rather than awaiting it inline — the same
-/// "one task per connection" shape production's `AnimusdRelayClient`
-/// already has) is a change to `animus-node`, a different crate, and a
-/// structural change to a shared testing primitive every `SimCluster`-based
-/// module in this crate depends on — squarely out of C-06 PR 3's own scope
-/// (the `dynamo.rs` dispatch routing + this module's coverage). Recorded
-/// here as a finding, per this rung's own gate: kept as a characterization
-/// test rather than reworked to avoid the mechanism (every crash+cross-
-/// tablet-recovery scenario hits the identical gap) or silently dropped.
-/// **Issue to be filed** against `animus-node::sim_relay::SimRelayClient`.
+/// **Stage 2 (issue #737, fixed)**: `txn_recover`
+/// (`crates/animusd/src/txn_coordinator.rs`) never got past its own grace
+/// check. Traced directly: whenever `self.cp_route(record_table,
+/// record_key)` resolves to anything other than `CpRoute::Local` — the
+/// ordinary case here, since this on-demand push runs on the *reading*
+/// node's own leader (the participant's tablet, `rcg_b`), not necessarily
+/// the *anchor*'s tablet leader (`rcg_a`) — `now_ms` used to be computed as
+/// `self.env.now().duration_since(self.env.now())`: the elapsed gap
+/// between two back-to-back clock reads, near-zero, not an absolute
+/// timestamp. Checked against `now_ms < view.created_ts.wall_ms +
+/// RECOVERY_GRACE`, a near-zero `now_ms` made that comparison true
+/// forever, so the grace check never passed and `txn_recover` declined
+/// (`Pending`) on every call, permanently — regardless of how much virtual
+/// time had actually elapsed. This was pre-existing, unrelated to and
+/// unmodified by the relay-dispatch fix: introduced (knowingly, and
+/// deliberately left unfixed at the time) by ADR 0061 rung C5 step 3b's
+/// `tokio::time::Instant::now().elapsed()` → `Env` conversion, and
+/// unreachable before the #731 fix landed, since that deadlock intercepted
+/// every recovery attempt before `txn_recover` was ever actually called.
+///
+/// **Fixed** by sharing one clock-read helper
+/// (`txn_coordinator::recovery_grace_now_ms`) between both `txn_recover`
+/// call sites, reading the pusher's own `env.now()` on every non-local
+/// route — the same clock, and the same units, `animus_cp_data::hlc::
+/// Hlc::mint` uses to produce `created_ts`/`hint_ts.wall_ms` in the first
+/// place — instead of the elapsed-duration computation above. See
+/// `txn_coordinator.rs`'s own doc on that helper (including its dedicated
+/// `recovery_grace_tests` unit coverage) and `docs/engineering-lessons.md`'s
+/// matching entry for the general lesson.
 ///
 /// `ANIMUS_SEED=<seed> cargo test -p animusd --lib
-/// coordinator_never_finished_past_prepare_recovers_atomically -- --ignored`
-/// replays this scenario at a specific seed (repo convention; note the
-/// trailing `--ignored`, needed since both tests below are `#[ignore]`d).
+/// coordinator_crash_after_prepare_recovers_atomically_to_commit`
+/// replays this scenario at a specific seed (repo convention). Pinned seed
+/// `0xC06F_0007` = `3228499975`.
 #[test]
-#[ignore = "FINDING, issue #731 (ADR 0061 rung F, C-06 PR 3): SimRelayClient::serve_loop \
-            deadlocks on a nested outbound relay call from inside a forwarded \
-            request's own handler (this scenario's foreign-intent recovery path) \
-            — see this function's own doc for the full diagnosis; issue to be filed \
-            against animus-node::sim_relay::SimRelayClient"]
-fn coordinator_never_finished_past_prepare_recovers_atomically() {
-    run_coordinator_never_finished_past_prepare_recovers_atomically(env_seed(0xC06F_0007));
+fn coordinator_crash_after_prepare_recovers_atomically_to_commit() {
+    run_coordinator_crash_after_prepare_recovers_atomically_to_commit(env_seed(0xC06F_0007));
 }
 
 #[test]
-#[ignore = "FINDING (ADR 0061 rung F, C-06 PR 3): see coordinator_never_finished_past_\
-            prepare_recovers_atomically's own doc — SimRelayClient::serve_loop deadlocks \
-            on a nested outbound relay call from inside a forwarded request's own handler"]
-fn coordinator_never_finished_past_prepare_recovers_atomically_over_seeds() {
+fn coordinator_crash_after_prepare_recovers_atomically_to_commit_over_seeds() {
     for i in 0..5 {
-        run_coordinator_never_finished_past_prepare_recovers_atomically(0xC06F_7000 + i);
+        run_coordinator_crash_after_prepare_recovers_atomically_to_commit(0xC06F_7000 + i);
     }
 }
