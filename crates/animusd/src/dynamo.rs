@@ -1001,23 +1001,34 @@ fn unsupported_by_generic_dispatch(op_name: &str) -> WireError {
 /// through the exact same handlers production uses, from inside
 /// `SimCluster` (`sim_cluster_dynamo.rs`).
 ///
-/// **Covers exactly ten operations**: `PutItem`, `DeleteItem`, `GetItem`,
+/// **Covers exactly thirteen operations**: `PutItem`, `DeleteItem`, `GetItem`,
 /// `BatchGetItem`, `Query`/`Scan` — **since ADR 0061 rung D3 PR 3a, over a
 /// GSI/LSI as well as the base table**, dispatching to [`run_index_query`]/
 /// [`run_index_scan`] (themselves now generic, see their own docs) exactly
 /// the way the concrete [`run_query`]/[`run_scan`] already did — `UpdateItem`,
-/// `BatchWriteItem`, and — **since ADR 0061 rung F, C-06 PR 3** —
-/// `TransactWriteItems`/`TransactGetItems`, calling the identical
-/// [`run_transact`]/[`run_transact_get`] `run_operation`'s own arms call
-/// (both already `<E, R>`-generic since C-06 PR 2; this rung is purely the
-/// routing half — see either function's own doc). **A GSI `Query`/`Scan`
-/// under `SimCluster` reads as empty** until a future rung generalizes
-/// `index_drain::change_consumer_loop` (the only thing that ever
-/// materializes a GSI's own hidden-table rows) — `SimCluster` never spawns
-/// it, so `run_gsi_query`/`run_gsi_scan`'s own "no tablet yet ⇒ empty" gate
-/// is what answers every GSI read here; an LSI is unaffected (its rows are
-/// written synchronously in the same Raft entry as the base row, ADR 0041
-/// §2). See `sim_cluster_dynamo_table_ops.rs::gsi_query_reads_empty_under_
+/// `BatchWriteItem`, `TransactWriteItems`/`TransactGetItems` (ADR 0061 rung
+/// F, C-06 PR 3), calling the identical [`run_transact`]/[`run_transact_get`]
+/// `run_operation`'s own arms call (both already `<E, R>`-generic since
+/// C-06 PR 2), and — **since ADR 0061 rung F, C-06 PR 5** —
+/// `ExecuteStatement`/`BatchExecuteStatement`/`ExecuteTransaction` (PartiQL,
+/// ADR 0071), calling their own new generic siblings
+/// [`execute_statement_as`]/[`run_batch_execute_statement_as`]/
+/// [`execute_transaction_as`] rather than the concrete production
+/// [`execute_statement`]/[`run_batch_execute_statement`]/
+/// [`execute_transaction`] — see those siblings' own doc, and this file's
+/// "SimEnv-capable PartiQL siblings" section header, for the full account
+/// (in particular why `ExecuteStatement`'s `INSERT`/`UPDATE`/`DELETE` arm
+/// needed a new `dispatch_lowered_write_as` helper rather than reusing
+/// `execute_statement`'s own `Box::pin(run_operation(..))` recursion). **A
+/// GSI `Query`/`Scan` under `SimCluster` reads as empty** until a future
+/// rung generalizes `index_drain::change_consumer_loop` (the only thing
+/// that ever materializes a GSI's own hidden-table rows) — `SimCluster`
+/// never spawns it, so `run_gsi_query`/`run_gsi_scan`'s own "no tablet yet
+/// ⇒ empty" gate is what answers every GSI read here (a PartiQL `SELECT`
+/// against a GSI inherits the identical gap, since it dispatches through
+/// the same `run_query`); an LSI is unaffected (its rows are written
+/// synchronously in the same Raft entry as the base row, ADR 0041 §2). See
+/// `sim_cluster_dynamo_table_ops.rs::gsi_query_reads_empty_under_
 /// the_fixture_until_the_drain_generalizes` for the pinned regression that
 /// documents this boundary (and should flip red the day it closes). The
 /// internal idempotency table `TransactWriteItems`' `ClientRequestToken`
@@ -1025,16 +1036,13 @@ fn unsupported_by_generic_dispatch(op_name: &str) -> WireError {
 /// now genuinely exercised under `SimCluster` too, including the two-
 /// concurrent-first-callers bootstrap race — see
 /// `sim_cluster_dynamo_transact.rs`'s own doc for what this rung proved.
-/// Every other [`Operation`] variant —
-/// `ExecuteStatement`/`BatchExecuteStatement`/`ExecuteTransaction`
-/// (PartiQL — no new logic of their own, but they'd need every operation
-/// they can lower onto, i.e. all of the above, generic first), and every
-/// DDL/backup/export/import operation (genuinely `ProdEnv`-only: a real
-/// `TcpListener`-free control-plane relay is fine, but backup/export use
-/// `tokio::spawn` for their own async job and `ctx.env.wall_now()` alone
-/// isn't the blocker there — their own catalog rows and janitor loops are
-/// simply out of this rung's brief, "item/query/transaction operations, not
-/// export/import/backup") — all fall through to the catch-all arm's
+/// Every other [`Operation`] variant — every DDL/backup/export/import
+/// operation (genuinely `ProdEnv`-only: a real `TcpListener`-free
+/// control-plane relay is fine, but backup/export use `tokio::spawn` for
+/// their own async job and `ctx.env.wall_now()` alone isn't the blocker
+/// there — their own catalog rows and janitor loops are simply out of this
+/// rung's brief, "item/query/transaction/PartiQL operations, not
+/// export/import/backup") — falls through to the catch-all arm's
 /// [`unsupported_by_generic_dispatch`].
 ///
 /// **Called from two places**: [`run_operation`]'s own combined match arm
@@ -1588,6 +1596,42 @@ async fn dispatch_item_op<E: Env, R: RelayClient>(
             run_transact(ctx, principal, meta, &actions, token.as_deref()).await
         }
         Operation::TransactGetItems { gets } => run_transact_get(ctx, principal, meta, &gets).await,
+        // ADR 0061 rung F, C-06 PR 5: PartiQL's own generic siblings — see
+        // this file's own "SimEnv-capable PartiQL siblings" section header,
+        // and `execute_statement_as`'s own doc, for the full account.
+        // `run_operation` itself is untouched: it still calls
+        // `execute_statement`/`run_batch_execute_statement`/
+        // `execute_transaction` directly, monomorphized at `E = ProdEnv, R
+        // = AnimusdRelayClient`, so production behavior is unchanged.
+        Operation::ExecuteStatement {
+            statement,
+            parameters,
+            consistent_read,
+            next_token,
+            limit,
+            return_consumed_capacity: _,
+        } => {
+            execute_statement_as(
+                ctx,
+                meta,
+                principal,
+                &statement,
+                &parameters,
+                consistent_read,
+                next_token.as_deref(),
+                limit,
+            )
+            .await
+        }
+        Operation::BatchExecuteStatement {
+            statements,
+            return_consumed_capacity: _,
+        } => run_batch_execute_statement_as(ctx, meta, principal, &statements).await,
+        Operation::ExecuteTransaction {
+            statements,
+            token,
+            return_consumed_capacity: _,
+        } => execute_transaction_as(ctx, principal, meta, &statements, token.as_deref()).await,
         _ => Err(unsupported_by_generic_dispatch("this operation")),
     }
 }
@@ -1717,8 +1761,8 @@ async fn dispatch_table_op<E: Env, R: RelayClient>(
 /// proxy shape (an unrestricted `Principal`, no SigV4 gate in front of it —
 /// this fixture has no SigV4 listener to gate through in the first place).
 ///
-/// The ten operations [`dispatch_item_op`] covers, plus (ADR 0061 rung D3
-/// PR 2a/2b) the five base-table DDL operations [`dispatch_table_op`]
+/// The thirteen operations [`dispatch_item_op`] covers, plus (ADR 0061 rung
+/// D3 PR 2a/2b) the five base-table DDL operations [`dispatch_table_op`]
 /// covers, succeed; every other well-formed operation decodes fine and fails with
 /// [`unsupported_by_generic_dispatch`]'s `InternalServerError` — see either
 /// function's own doc for the fuller "what's out of scope, why" account.
@@ -5886,9 +5930,24 @@ async fn quiescent_multi_get<E: Env, R: RelayClient>(
 /// actually serves the read — see each of their docs for the exact
 /// pushdown/cursor-shape/bound-checking discipline, which mirrors the
 /// base/GSI/LSI `Scan` pagination this crate already had.
+///
+/// Generic over `E: Env`/`R: RelayClient` (ADR 0061 rung F, C-06 PR 5) — a
+/// pure signature widening, no logic change: every callee below
+/// ([`mirror_catalog_schema`], [`run_index_query`], [`schema_for`],
+/// [`validate_key_condition_names`], [`declared_sort_key_type`]/
+/// [`validate_sort_condition_type`], [`run_base_query`]) was already generic
+/// or `Metadata`-only, and this function's own body is byte-for-byte the
+/// same [`dispatch_item_op`]'s own `Query` arm already duplicates — see
+/// that arm's own comment. `run_operation`'s `Query` arm keeps calling this
+/// exact function, monomorphized at `E = ProdEnv, R = AnimusdRelayClient`,
+/// so production behavior is unchanged; the new call site is
+/// [`execute_statement_as`], which needs a generic `SELECT` path rather
+/// than recursing into the concrete [`run_operation`] the way
+/// [`execute_statement`] does for its own `INSERT`/`UPDATE`/`DELETE`
+/// branches.
 #[allow(clippy::too_many_arguments)] // one `Query`'s full decoded shape, no natural grouping
-async fn run_query(
-    ctx: &ClientCtx,
+async fn run_query<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     meta: &Metadata,
     table: &str,
     index: Option<&str>,
@@ -6671,9 +6730,13 @@ async fn run_lsi_query<E: Env, R: RelayClient>(
 /// is set. `mirror_catalog_schema` is hoisted here (rather than duplicated in
 /// each of the three bodies below) so both the base and index paths see an
 /// up-to-date registry mirror before resolving anything.
+///
+/// Generic over `E: Env`/`R: RelayClient` (ADR 0061 rung F, C-06 PR 5) for
+/// the identical reason [`run_query`] just above was widened — see that
+/// function's own doc.
 #[allow(clippy::too_many_arguments)] // mirrors `run_query`'s own full decoded shape
-async fn run_scan(
-    ctx: &ClientCtx,
+async fn run_scan<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     meta: &Metadata,
     table: &str,
     index: Option<&str>,
@@ -7342,6 +7405,570 @@ async fn execute_one_batch_statement(
         | partiql::Statement::Update(_)
         | partiql::Statement::Delete(_) => {
             let raw = execute_statement(
+                ctx,
+                meta,
+                principal,
+                &req.statement,
+                &req.parameters,
+                req.consistent_read,
+                None,
+                None,
+            )
+            .await;
+            match raw.and_then(|r| first_item(&r)) {
+                Ok(item) => wire::BatchStatementResult::success(table, item),
+                Err(e) => wire::BatchStatementResult::error(Some(table), &e),
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SimEnv-capable PartiQL siblings (ADR 0061 rung F, C-06 PR 5)
+// ---------------------------------------------------------------------------
+//
+// `execute_statement_as`/`execute_transaction_as`/
+// `run_batch_execute_statement_as`/`execute_one_batch_statement_as` are the
+// PartiQL analogue of `execute_item_op_as` (above): new, `<E: Env, R:
+// RelayClient>`-generic siblings of `execute_statement`/`execute_transaction`/
+// `run_batch_execute_statement`/`execute_one_batch_statement` that let
+// `SimCluster` drive a real `ExecuteStatement`/`ExecuteTransaction`/
+// `BatchExecuteStatement` request the identical way production does, never a
+// widening of those four functions themselves (this rung's own ADR
+// amendment, and the D2 PR 1 lesson: a narrowed generic split of a
+// dispatcher must not become the production dispatcher's ONLY path,
+// `docs/engineering-lessons.md`). Every one of `execute_statement`/
+// `execute_transaction`/`run_batch_execute_statement`/
+// `execute_one_batch_statement` above stays byte-identical — zero lines
+// touched in any of their own bodies.
+//
+// `run_query`/`run_scan` (above) and `run_transact`/`run_transact_get`
+// (widened by C-06 PR 2) were already `<E, R>`-generic, so `execute_
+// transaction_as` and `execute_statement_as`'s own `SELECT` branch need no
+// new mechanism at all — a pure signature-and-plumbing widening. The one
+// real wrinkle, named by this rung's own ADR amendment up front, is
+// `execute_statement`'s `INSERT`/`UPDATE`/`DELETE` branches: they recurse
+// into the concrete, production-only `run_operation` via `Box::pin(
+// run_operation(ctx, principal, op)).await` (needed there because
+// `run_operation` itself calls back into `execute_statement` for its own
+// `ExecuteStatement` arm — a genuine mutual recursion). `execute_statement_as`
+// cannot call `run_operation` at all (it only accepts a concrete `&ClientCtx`),
+// so its own `INSERT`/`UPDATE`/`DELETE` branches instead run
+// `dispatch_lowered_write_as` — the identical `reject_internal_table`/
+// `authz::authorize_op` prelude `run_operation` runs ahead of its own
+// dispatch to `dispatch_item_op` for these three operations (see
+// `run_operation`'s own prelude, and `dispatch_item_op`'s own doc), then
+// `dispatch_item_op` directly. This closes a SECOND mutual-recursion cycle,
+// distinct from `run_operation`'s own: `dispatch_item_op`'s own new
+// `ExecuteStatement` arm (below) calls `execute_statement_as`, whose
+// `INSERT`/`UPDATE`/`DELETE` arms call `dispatch_lowered_write_as`, which
+// calls back into `dispatch_item_op` — so `dispatch_lowered_write_as`
+// itself needs the `Box::pin`, not `execute_statement_as`'s own call sites
+// (the compiler's `E0733` on the actual cycle is what caught this — the
+// header comment's own first draft claimed no boxing was needed, wrongly,
+// before `dispatch_item_op` gained its `ExecuteStatement` arm).
+
+/// Run one already-lowered `PutItem`/`UpdateItem`/`DeleteItem` [`Operation`]
+/// through the exact prelude+dispatch [`run_operation`] runs for these three
+/// operations — [`reject_internal_table`], `authz::authorize_op`, then
+/// [`dispatch_item_op`] — over any `ClientCtx<E, R>`. The one caller is
+/// [`execute_statement_as`]'s own `INSERT`/`UPDATE`/`DELETE` branches; see
+/// this section's own header doc for the full account, including why the
+/// `Box::pin` below (not present in `run_operation`'s own analogous prelude,
+/// which never recurses) is load-bearing: `dispatch_item_op` → (its own
+/// `ExecuteStatement` arm) → `execute_statement_as` → `dispatch_lowered_
+/// write_as` → `dispatch_item_op` is a genuine cycle, distinct from
+/// `execute_statement`'s own `Box::pin(run_operation(..))` cycle.
+async fn dispatch_lowered_write_as<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+    principal: &Principal,
+    meta: &Metadata,
+    op: Operation,
+) -> Result<String, WireError> {
+    if let Some(table) = op.table() {
+        reject_internal_table(table, is_ddl_mutation(&op))?;
+    }
+    authz::authorize_op(ctx, principal, &op, meta)?;
+    Box::pin(dispatch_item_op(ctx, principal, meta, op)).await
+}
+
+/// `SimEnv`-capable sibling of [`execute_statement`] — see this file's own
+/// "SimEnv-capable PartiQL siblings" section header for the full account of
+/// what changed and why. `SELECT` lowers and dispatches exactly like
+/// `execute_statement`'s own `SELECT` branch (`run_query`/`run_scan` are
+/// generic already); `INSERT`/`UPDATE`/`DELETE` route through
+/// [`dispatch_lowered_write_as`] instead of `execute_statement`'s own
+/// `Box::pin(run_operation(..))`. Every other line — parsing, key
+/// resolution, `authz::authorize`, response reshaping, `DuplicateItemException`/
+/// `ON CONFLICT DO NOTHING` handling — is copied verbatim from
+/// `execute_statement`, monomorphized differently.
+///
+/// Only called from `sim_cluster_dynamo_partiql.rs` today — the `cfg_attr`
+/// below mirrors [`execute_item_op_as`]'s own precise, not blanket,
+/// dead-code allowance.
+#[cfg_attr(not(test), allow(dead_code))]
+#[allow(clippy::too_many_arguments)] // mirrors `execute_statement`'s own full decoded shape
+pub(crate) async fn execute_statement_as<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+    meta: &Metadata,
+    principal: &Principal,
+    statement: &str,
+    parameters: &[AttributeValue],
+    consistent_read: bool,
+    next_token: Option<&str>,
+    limit: Option<usize>,
+) -> Result<String, WireError> {
+    let stmt = partiql::parse_statement(statement).map_err(WireError::from)?;
+    let table = stmt.table().to_string();
+    reject_internal_table(&table, false)?;
+    if !table_known(ctx, meta, &table) {
+        return Err(registry_error(animus_dynamo::RegistryError::NoSuchTable(
+            table.clone(),
+        )));
+    }
+
+    match stmt {
+        partiql::Statement::Select(sel) => {
+            authz::authorize(
+                ctx,
+                principal,
+                "ExecuteStatement",
+                animus_control::OpClass::Read,
+                Some(table.as_str()),
+            )?;
+
+            mirror_catalog_schema(ctx, meta, &table);
+
+            let (partition_key, sort_key): (String, Option<String>) = match &sel.index {
+                Some(index_name) => {
+                    let idx = meta
+                        .table_indexes(&table)
+                        .iter()
+                        .find(|d| &d.name == index_name)
+                        .cloned()
+                        .ok_or_else(|| {
+                            registry_error(animus_dynamo::RegistryError::NoSuchIndex(
+                                index_name.clone(),
+                            ))
+                        })?;
+                    (idx.hash_attribute, idx.sort_attribute)
+                }
+                None => {
+                    let base = schema_for(meta, &table);
+                    (base.partition_key, base.sort_key)
+                }
+            };
+
+            let exclusive_start_key = match next_token {
+                Some(tok) => {
+                    Some(partiql::decode_next_token(tok, statement).map_err(WireError::from)?)
+                }
+                None => None,
+            };
+
+            let op = partiql::lower_select(
+                &sel,
+                parameters,
+                &partition_key,
+                sort_key.as_deref(),
+                exclusive_start_key,
+                limit,
+                consistent_read,
+            )
+            .map_err(WireError::from)?;
+
+            let raw = match op {
+                Operation::Query {
+                    table,
+                    index,
+                    partition_attr,
+                    partition_value,
+                    sort_attr,
+                    sort_condition,
+                    limit,
+                    exclusive_start_key,
+                    scan_index_forward,
+                    filter,
+                    projection,
+                    select,
+                    consistent_read,
+                } => {
+                    run_query(
+                        ctx,
+                        meta,
+                        &table,
+                        index.as_deref(),
+                        &partition_attr,
+                        &partition_value,
+                        sort_attr.as_deref(),
+                        sort_condition.as_ref(),
+                        limit,
+                        exclusive_start_key,
+                        scan_index_forward,
+                        filter.as_ref(),
+                        projection.as_ref(),
+                        select,
+                        consistent_read,
+                    )
+                    .await?
+                }
+                Operation::Scan {
+                    table,
+                    index,
+                    limit,
+                    exclusive_start_key,
+                    filter,
+                    projection,
+                    select,
+                    segment,
+                    consistent_read,
+                } => {
+                    run_scan(
+                        ctx,
+                        meta,
+                        &table,
+                        index.as_deref(),
+                        limit,
+                        exclusive_start_key,
+                        filter.as_ref(),
+                        projection.as_ref(),
+                        select,
+                        segment,
+                        consistent_read,
+                    )
+                    .await?
+                }
+                _ => unreachable!("partiql::lower_select only ever produces Query or Scan"),
+            };
+
+            reshape_query_scan_response_to_execute_statement(&raw, statement)
+        }
+        partiql::Statement::Insert(ins) => {
+            mirror_catalog_schema(ctx, meta, &table);
+            let base = schema_for(meta, &table);
+            let on_conflict_do_nothing = ins.on_conflict_do_nothing;
+            let op = partiql::lower_insert(
+                &ins,
+                parameters,
+                &base.partition_key,
+                base.sort_key.as_deref(),
+            )
+            .map_err(WireError::from)?;
+            match dispatch_lowered_write_as(ctx, principal, meta, op).await {
+                Ok(raw) => reshape_write_response_to_execute_statement(&raw),
+                Err(e) if e.code == "ConditionalCheckFailedException" => {
+                    if on_conflict_do_nothing {
+                        reshape_write_response_to_execute_statement("{}")
+                    } else {
+                        Err(WireError::duplicate_item(format!(
+                            "an item with this key already exists in table `{table}`"
+                        )))
+                    }
+                }
+                Err(e) => Err(e),
+            }
+        }
+        partiql::Statement::Update(upd) => {
+            mirror_catalog_schema(ctx, meta, &table);
+            let base = schema_for(meta, &table);
+            let op = partiql::lower_update(
+                &upd,
+                parameters,
+                &base.partition_key,
+                base.sort_key.as_deref(),
+            )
+            .map_err(WireError::from)?;
+            let raw = dispatch_lowered_write_as(ctx, principal, meta, op).await?;
+            reshape_write_response_to_execute_statement(&raw)
+        }
+        partiql::Statement::Delete(del) => {
+            mirror_catalog_schema(ctx, meta, &table);
+            let base = schema_for(meta, &table);
+            let op = partiql::lower_delete(
+                &del,
+                parameters,
+                &base.partition_key,
+                base.sort_key.as_deref(),
+            )
+            .map_err(WireError::from)?;
+            let raw = dispatch_lowered_write_as(ctx, principal, meta, op).await?;
+            reshape_write_response_to_execute_statement(&raw)
+        }
+    }
+}
+
+/// `SimEnv`-capable sibling of [`execute_transaction`] — a pure signature
+/// widening to `<E: Env, R: RelayClient>` of the identical body (see this
+/// file's own "SimEnv-capable PartiQL siblings" section header). Unlike
+/// [`execute_statement_as`], `ExecuteTransaction` never recurses into a
+/// concrete production dispatcher — every callee ([`table_known`],
+/// [`mirror_catalog_schema`], [`schema_for`], [`run_transact_get`],
+/// [`run_transact`]) was already generic or `Metadata`-only — so this needed
+/// no dispatch change at all, just the type parameters.
+///
+/// Only called from `sim_cluster_dynamo_partiql.rs` today; the `cfg_attr`
+/// below mirrors [`execute_item_op_as`]'s own precise dead-code allowance.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) async fn execute_transaction_as<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+    principal: &Principal,
+    meta: &Metadata,
+    statements: &[TransactStatementRequest],
+    token: Option<&str>,
+) -> Result<String, WireError> {
+    if statements.is_empty() {
+        return Err(WireError::validation(
+            "ExecuteTransaction requires at least one statement",
+        ));
+    }
+    if statements.len() > wire::EXECUTE_TRANSACTION_MAX_STATEMENTS {
+        return Err(WireError::validation(format!(
+            "ExecuteTransaction supports at most {} statements",
+            wire::EXECUTE_TRANSACTION_MAX_STATEMENTS
+        )));
+    }
+
+    let parsed: Vec<partiql::Statement> = statements
+        .iter()
+        .map(|s| partiql::parse_statement(&s.statement).map_err(WireError::from))
+        .collect::<Result<_, _>>()?;
+
+    let all_select = parsed
+        .iter()
+        .all(|s| matches!(s, partiql::Statement::Select(_)));
+    let any_select = parsed
+        .iter()
+        .any(|s| matches!(s, partiql::Statement::Select(_)));
+    if any_select && !all_select {
+        return Err(WireError::validation(
+            "ExecuteTransaction cannot mix SELECT with INSERT/UPDATE/DELETE statements — a \
+             transaction is all-reads or all-writes",
+        ));
+    }
+
+    for stmt in &parsed {
+        let table = stmt.table();
+        reject_internal_table(table, false)?;
+        if !table_known(ctx, meta, table) {
+            return Err(registry_error(animus_dynamo::RegistryError::NoSuchTable(
+                table.to_string(),
+            )));
+        }
+        mirror_catalog_schema(ctx, meta, table);
+    }
+
+    if all_select {
+        let mut gets = Vec::with_capacity(parsed.len());
+        for (stmt, req) in parsed.iter().zip(statements.iter()) {
+            let partiql::Statement::Select(sel) = stmt else {
+                unreachable!("all_select guarantees every parsed statement is Select")
+            };
+            let base = schema_for(meta, &sel.table);
+            let get = partiql::lower_select_to_transact_get(
+                sel,
+                &req.parameters,
+                &base.partition_key,
+                base.sort_key.as_deref(),
+            )
+            .map_err(WireError::from)?;
+            gets.push(get);
+        }
+        run_transact_get(ctx, principal, meta, &gets).await
+    } else {
+        let mut actions = Vec::with_capacity(parsed.len());
+        for (stmt, req) in parsed.iter().zip(statements.iter()) {
+            let base = schema_for(meta, stmt.table());
+            let action = match stmt {
+                partiql::Statement::Select(_) => {
+                    unreachable!("any_select && !all_select was already rejected above")
+                }
+                partiql::Statement::Insert(ins) => partiql::lower_insert_to_transact_action(
+                    ins,
+                    &req.parameters,
+                    &base.partition_key,
+                    base.sort_key.as_deref(),
+                    req.rvocf,
+                ),
+                partiql::Statement::Update(upd) => partiql::lower_update_to_transact_action(
+                    upd,
+                    &req.parameters,
+                    &base.partition_key,
+                    base.sort_key.as_deref(),
+                    req.rvocf,
+                ),
+                partiql::Statement::Delete(del) => partiql::lower_delete_to_transact_action(
+                    del,
+                    &req.parameters,
+                    &base.partition_key,
+                    base.sort_key.as_deref(),
+                    req.rvocf,
+                ),
+            }
+            .map_err(WireError::from)?;
+            actions.push(action);
+        }
+        let count = actions.len();
+        run_transact(ctx, principal, meta, &actions, token).await?;
+        Ok(wire::execute_transaction_write_response(count))
+    }
+}
+
+/// `SimEnv`-capable sibling of [`run_batch_execute_statement`] — see this
+/// file's own "SimEnv-capable PartiQL siblings" section header. Calls
+/// [`execute_one_batch_statement_as`], never the concrete
+/// [`execute_one_batch_statement`] — the identical "the narrowed split must
+/// call its own generic sibling, never the concrete one" risk this rung's
+/// own ADR amendment names up front (the D2 PR 1 lesson once more): were
+/// this to call the concrete function by mistake, `BatchExecuteStatement`'s
+/// `INSERT`/`UPDATE`/`DELETE` arm would silently stay `ProdEnv`-only forever
+/// under `SimCluster`, with nothing failing loudly to say so.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) async fn run_batch_execute_statement_as<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+    meta: &Metadata,
+    principal: &Principal,
+    statements: &[wire::BatchStatementRequest],
+) -> Result<String, WireError> {
+    let mut results = Vec::with_capacity(statements.len());
+    for req in statements {
+        results.push(execute_one_batch_statement_as(ctx, meta, principal, req).await);
+    }
+    Ok(wire::batch_execute_statement_response(&results))
+}
+
+/// `SimEnv`-capable sibling of [`execute_one_batch_statement`] — see this
+/// file's own "SimEnv-capable PartiQL siblings" section header. Identical
+/// body, except the `INSERT`/`UPDATE`/`DELETE` arm calls
+/// [`execute_statement_as`] rather than the concrete [`execute_statement`]
+/// — the one substitution [`run_batch_execute_statement_as`]'s own doc names
+/// as load-bearing.
+#[cfg_attr(not(test), allow(dead_code))]
+async fn execute_one_batch_statement_as<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+    meta: &Metadata,
+    principal: &Principal,
+    req: &wire::BatchStatementRequest,
+) -> wire::BatchStatementResult {
+    let stmt = match partiql::parse_statement(&req.statement) {
+        Ok(s) => s,
+        Err(e) => return wire::BatchStatementResult::error(None, &WireError::from(e)),
+    };
+    let table = stmt.table().to_string();
+    if let Err(e) = reject_internal_table(&table, false) {
+        return wire::BatchStatementResult::error(Some(table), &e);
+    }
+    if !table_known(ctx, meta, &table) {
+        let e = registry_error(animus_dynamo::RegistryError::NoSuchTable(table.clone()));
+        return wire::BatchStatementResult::error(Some(table), &e);
+    }
+
+    match stmt {
+        partiql::Statement::Select(sel) => {
+            if let Err(e) = authz::authorize(
+                ctx,
+                principal,
+                "BatchExecuteStatement",
+                animus_control::OpClass::Read,
+                Some(table.as_str()),
+            ) {
+                return wire::BatchStatementResult::error(Some(table), &e);
+            }
+
+            mirror_catalog_schema(ctx, meta, &table);
+
+            let (partition_key, sort_key): (String, Option<String>) = match &sel.index {
+                Some(index_name) => match meta
+                    .table_indexes(&table)
+                    .iter()
+                    .find(|d| &d.name == index_name)
+                    .cloned()
+                {
+                    Some(idx) => (idx.hash_attribute, idx.sort_attribute),
+                    None => {
+                        let e = registry_error(animus_dynamo::RegistryError::NoSuchIndex(
+                            index_name.clone(),
+                        ));
+                        return wire::BatchStatementResult::error(Some(table), &e);
+                    }
+                },
+                None => {
+                    let base = schema_for(meta, &table);
+                    (base.partition_key, base.sort_key)
+                }
+            };
+
+            if !partiql::select_is_exact_key(&sel, &partition_key, sort_key.as_deref()) {
+                return wire::BatchStatementResult::error(
+                    Some(table),
+                    &WireError::validation(
+                        "a BatchExecuteStatement SELECT must be an exact-key read: an \
+                         equality condition on the partition key, and on the sort key \
+                         when the table has one, and nothing else",
+                    ),
+                );
+            }
+
+            let op = match partiql::lower_select(
+                &sel,
+                &req.parameters,
+                &partition_key,
+                sort_key.as_deref(),
+                None,
+                None,
+                req.consistent_read,
+            ) {
+                Ok(op) => op,
+                Err(e) => {
+                    return wire::BatchStatementResult::error(Some(table), &WireError::from(e));
+                }
+            };
+            let Operation::Query {
+                table: q_table,
+                index,
+                partition_attr,
+                partition_value,
+                sort_attr,
+                sort_condition,
+                limit,
+                exclusive_start_key,
+                scan_index_forward,
+                filter,
+                projection,
+                select,
+                consistent_read,
+            } = op
+            else {
+                unreachable!(
+                    "select_is_exact_key only accepts a WHERE shape lower_select turns into Query"
+                );
+            };
+            let raw = run_query(
+                ctx,
+                meta,
+                &q_table,
+                index.as_deref(),
+                &partition_attr,
+                &partition_value,
+                sort_attr.as_deref(),
+                sort_condition.as_ref(),
+                limit,
+                exclusive_start_key,
+                scan_index_forward,
+                filter.as_ref(),
+                projection.as_ref(),
+                select,
+                consistent_read,
+            )
+            .await;
+            match raw.and_then(|r| first_item(&r)) {
+                Ok(item) => wire::BatchStatementResult::success(table, item),
+                Err(e) => wire::BatchStatementResult::error(Some(table), &e),
+            }
+        }
+        partiql::Statement::Insert(_)
+        | partiql::Statement::Update(_)
+        | partiql::Statement::Delete(_) => {
+            let raw = execute_statement_as(
                 ctx,
                 meta,
                 principal,

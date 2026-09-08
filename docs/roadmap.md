@@ -588,18 +588,76 @@ the still-true paragraph after the table.
   `_over_seeds` sibling are un-ignored and green at the pinned seed
   `0xC06F_0007` (= `3228499975`) and the five-seed loop. See ADR 0061's
   "#731 closed" and "#737 closed" addenda and `docs/engineering-lessons.md`'s
-  matching entries. Both issues #731 and #737 are now closed. PRs 4-7 (the
-  wire corpus, PartiQL siblings, PartiQL sim tests, docs close-out) remain
-  open.
+  matching entries. Both issues #731 and #737 are now closed. **PR 4
+  (Transact in the wire corpus) landed 2026-09-08**: `sim_cluster_dynamo_
+  corpus.rs`'s randomized op mix gained `TransactWriteItems` (two owned
+  keys, `Update`+`list_append`, plus an always-passing `ConditionCheck`,
+  sometimes tokened) and `TransactGetItems` (any two keys, always feeding
+  the shared history — real DynamoDB gives it no `ConsistentRead`), riding
+  the identical 8-cell fault matrix every other op already does; atomicity
+  is checked by construction (both appends enter history as one atomic
+  entry) and isolation with single-item ops falls out of the shared
+  history for free. A dedicated deterministic probe
+  (`run_transact_probe`) proves the two shapes the randomized workload
+  can't safely produce: a genuinely failing `ConditionCheck` (all-or-
+  nothing) and `ClientRequestToken` idempotency/mismatch. **Three real
+  `SimCluster`/`ClientCtx` fixture bugs found and fixed, all classified
+  (b) — a fixture/model gap, never a defect in the transact protocol**:
+  (A) a stale `SimClusterHandle::replicas_of` snapshot going stale the
+  moment a tokened transact write's idempotency-table bootstrap shifts
+  global tablet rebalance, fixed via a live `hosted_tablets`-backed
+  `live_replicas` query; (B) a same-tablet ("self-transaction") abandoned
+  transact write permanently masked under `local_get`'s raw-peek
+  semantics with no resolver loop in this fixture, fixed by issuing one
+  covering `TransactGetItems` after drain (`force_resolve_all_keys`,
+  which resolves a local intent the same way `TransactGetItems`'s own
+  read path resolves a foreign one); (C) `SimCluster::restart` never
+  updating a restarted node's own `ClusterEdgeState::control` registry,
+  permanently breaking that node's `propose_schema` fast path for any
+  *new* schema after a restart — fixed via a new `replace_control` (not
+  `register_control`, which only appends and, tried first, left the
+  identical scenario failing with a stale handle shadowing the fresh one).
+  See `sim_cluster_dynamo_corpus.rs`'s own new "Corpus-fixture findings"
+  module-doc section for the full account of each, including the exact
+  seeds. **A resource-scale finding filed, not fixed**: peak process RSS
+  for `ANIMUS_DYNAMO_WIRE_SEEDS=25` (200 scenarios) grows with depth and
+  was observed OOM-killed on this rung's 15 GiB development sandbox
+  (plateauing near ~13.8 GiB at both `=12` and `=25`); `=12`/`=4` complete
+  cleanly on the same sandbox, and CI's own previously-established green
+  `=25` figure implies its runners simply have more RAM. See that same
+  module-doc section for the measured numbers — not investigated further
+  per this PR's own scope. **PR 5 (PartiQL siblings) landed 2026-09-08**:
+  four new `<E: Env, R: RelayClient>`-generic siblings —
+  `execute_statement_as`/`execute_transaction_as`/
+  `run_batch_execute_statement_as`/`execute_one_batch_statement_as` — plus
+  three new `dispatch_item_op` match arms routing
+  `ExecuteStatement`/`BatchExecuteStatement`/`ExecuteTransaction` to them.
+  `run_operation`, `execute_statement`, `execute_transaction`,
+  `run_batch_execute_statement`, and `execute_one_batch_statement` stayed
+  byte-identical throughout (confirmed by the unmodified 37-test
+  `dynamo_partiql.rs`/`dynamo_execute_transaction.rs` real-socket suite
+  staying green against the widened code). A second mutual-recursion
+  cycle, distinct from `execute_statement`'s own pre-existing one, was
+  found by the compiler once `dispatch_item_op` gained its new
+  `ExecuteStatement` arm — closed with one `Box::pin` in the new
+  `dispatch_lowered_write_as` helper. A new `sim_cluster_dynamo_partiql.rs`
+  covers 5 reachability scenarios (10 tests): `INSERT` then `SELECT`,
+  `UPDATE`/`DELETE` with `RETURNING`, a mixed `BatchExecuteStatement`
+  running in order, an `ExecuteTransaction` commit across two tables, and
+  a condition-failed cancel — each issued from a non-leader node. No
+  product bug found. See ADR 0061's matching 2026-09-08 "Rung F, PR 5"
+  amendment for the full account. PRs 6-7 (PartiQL sim tests, docs
+  close-out) remain open.
 - **ADR:** [0061](adr/0061-testability-node-crate-simulator.md) — the
-  2026-09-07 "Rung F" amendment.
+  2026-09-07 "Rung F" amendment (see its 2026-09-08 "Rung F, PR 4"/"Rung F,
+  PR 5" addenda for PR 4/5's own accounts).
 - **Size:** L (seven PRs, two real production functions' worth of
   `ProdEnv`-only surface to widen plus two new fault-injecting sim
   suites).
 - **Depends:** C-04 (closed 2026-09-07 — D4 PR 1's real per-node
   `Reconciler` and D3's `dispatch_item_op`/`dispatch_table_op` cores are
   both load-bearing prerequisites this rung builds directly on).
-- **Status (2026-09-07):** open, PR 1 (this docs entry) landed.
+- **Status (2026-09-08):** open — PRs 1-5 landed; PRs 6-7 remain open.
 
 ---
 
@@ -677,7 +735,7 @@ wave are independent and can run in parallel.
 | 4 | *landed 2026-09-05* (S-02) | Highest blast radius (C-01 landed 2026-09-05 — see ADR 0054; S-01 landed 2026-09-05 — see ADR 0064; S-02 — see ADR 0066) |
 | 5 | *S-04, S-05, S-07b–d, C-02, C-05 all landed 2026-09-06* | S-05 strictly after S-04 |
 | 6 | *S-03 complete 2026-09-07 (all 3 PRs, ADR 0069)*; *S-07e/S-07 complete 2026-09-07 (ADR 0070)*; *C-03 assessed 2026-09-07 — deferred, no PRs planned (see ADR 0044's matching amendment)*; W-07 | XL or gated on earlier waves |
-| 7 | C-06 (PRs 1-3 landed 2026-09-07, issues #731 and #737 both fixed 2026-09-07; PRs 4-7 open) | Gated on C-04 (closed 2026-09-07) — the D4 `Reconciler` and D3 generic dispatch cores it builds on |
+| 7 | C-06 (PRs 1-5 landed, PR 5 on 2026-09-08; issues #731 and #737 both fixed 2026-09-07; PRs 6-7 open) | Gated on C-04 (closed 2026-09-07) — the D4 `Reconciler` and D3 generic dispatch cores it builds on |
 
 Open issues mapped: none left (#375 closed by W-01, #319 by W-05). Filed
 from wave 2's own findings: #590 (the operator still emits the deleted

@@ -108,6 +108,203 @@
 //! multi-key read exactly as they do for `raftkv_linearizable.rs`'s own
 //! transactional workloads.
 //!
+//! # `TransactWriteItems`/`TransactGetItems` (ADR 0061 rung F, C-06 PR 4)
+//!
+//! `execute_item_op_as`'s `Operation::TransactWriteItems`/
+//! `Operation::TransactGetItems` arms (wired in by C-06 PR 3,
+//! `sim_cluster_dynamo_transact.rs`'s own module doc) mean this corpus's
+//! `client_loop` can now issue both through the real wire, folding them into
+//! the SAME fault-injecting cell matrix every other op already rides —
+//! `sim_cluster_dynamo_transact.rs`'s own 7 scenarios prove Transact
+//! correctness on a clean or single-crash cluster; this corpus proves it
+//! survives the identical `leader_crash`/`follower_crash`/`stop_restart`/
+//! `leader_partition`/`split_brain`/`forward_heavy`/`two_tables` matrix every
+//! other operation in this file already does, including a cross-table
+//! transaction racing a fault that only touches ONE of its two participant
+//! tablets (`two_tables`'s own `Nemesis::apply` still only ever targets
+//! `primary_tablet` — table 0's — so a transact op spanning t0+t1 during that
+//! cell's fault window is a genuine partial-participant-crash exercise
+//! `sim_cluster_dynamo_transact.rs` never constructs).
+//!
+//! **`TransactWriteItems`: two owned keys, `Update`+`list_append`, plus an
+//! always-passing `ConditionCheck`.** [`run_transact_write`] draws its two
+//! write keys from the SAME client's own `owned` set (never a second
+//! client's key — the single-writer-per-key discipline this file's own
+//! module doc already establishes for [`run_write`], preserved here across
+//! BOTH write mechanisms) via [`distinct_pair`], so a transact write's two
+//! `Update` actions are exactly two more `SET items = list_append(..)`
+//! calls — the identical genuinely-non-idempotent expression [`run_write`]
+//! uses — each contributing one [`Mop::Append`], recorded as ONE
+//! `invoke`/`ok` pair (`Recorder::ok` already takes a `Vec<Mop>` for exactly
+//! this shape, the same technique [`run_query`]/[`run_scan`] already use for
+//! a multi-key read). **Atomicity is therefore checked by construction**: a
+//! transaction's two appends only ever enter the shared history TOGETHER, as
+//! one atomic entry — there is no way for `check_cycles` to observe one half
+//! landing without the other. A third action, `ConditionCheck` against a
+//! table-scoped `__guard__` marker item (seeded once per table, before the
+//! workload starts, and never modified again —
+//! `attribute_exists(pk)`, always true), exercises `ConditionCheck` in every
+//! random transact write without EVER cancelling one — a deliberate choice
+//! (see Residuals below for why the FAILING case needs its own dedicated,
+//! deterministic proof instead). Roughly a third of writes from a client
+//! with at least 2 owned keys go through this path rather than plain
+//! `UpdateItem`; about half of those also carry a fresh,
+//! call-unique `ClientRequestToken` (never reused within the randomized
+//! workload — a genuine reuse is a distinct workload shape, covered by
+//! [`run_transact_probe`] below), exercising the token-preflight code path
+//! under this cell's own fault schedule without changing the write's
+//! observable semantics.
+//!
+//! **`TransactGetItems`: two keys from the FULL keyspace (any table, any
+//! client's key), always feeding the shared history.** Unlike `GetItem`,
+//! real DynamoDB gives `TransactGetItems` no `ConsistentRead` parameter — it
+//! is unconditionally the strong, quiescence-confirmed snapshot
+//! (`dynamo.rs::run_transact_get`'s own doc) — so, unlike [`run_get`]'s
+//! true/false split, EVERY `TransactGetItems` observation feeds
+//! `check_cycles`, decoded into two [`Mop::Read`]s recorded as one atomic
+//! entry via [`run_transact_get`]/[`distinct_pair`]. **Isolation with
+//! respect to every other op in this file is checked for free**: a
+//! `TransactGetItems` entry lands in the exact same `Recorder`/`History`
+//! every `UpdateItem`/plain `GetItem(ConsistentRead: true)`/`Query`/`Scan`
+//! op already feeds, so `check_cycles`'s wr/ww/rw graph reasons about all of
+//! them together — a transact read observing a torn or stale pair relative
+//! to a concurrent single-item write would surface as an ordinary cycle,
+//! exactly like a plain multi-key `Query`/`Scan` already would (this file's
+//! own "Multi-key reads" section above). A non-200 response (including the
+//! retryable `TransactionCanceledException` a snapshot that never quiesces
+//! under contention can return) is recorded `info`, mirroring [`run_get`]'s
+//! own "an op that returns no observation carries no information either
+//! way" discipline — never `fail`.
+//!
+//! **[`run_transact_probe`]: the deterministic, dedicated proof for what the
+//! randomized workload above cannot safely produce.** Run from every node in
+//! the cluster in turn, after each scenario's fault schedule has healed and
+//! drained (mirroring [`run_delete_probe`]/[`run_batch_write_probe`]'s own
+//! placement and per-node loop exactly), on a `transact-probe-{node}-*` key
+//! namespace disjoint from every other key this file's probes/model use:
+//! (1) a transaction whose `ConditionCheck` genuinely FAILS (a per-node
+//! guard item seeded to exist, checked with `attribute_not_exists`) —
+//! asserts `TransactionCanceledException` with per-action
+//! `CancellationReasons` and, critically, that NEITHER of the transaction's
+//! `Put`/`Update` actions landed, proving the all-or-nothing half of
+//! atomicity the randomized workload's always-passing guard can never
+//! exercise; (2) a transaction mixing `Put`+`Delete`+`Update` (spanning
+//! BOTH tables when the cell has two) with a passing `ConditionCheck` and a
+//! `ClientRequestToken` — asserts all three actions landed together; (3) an
+//! identical retry of (2)'s exact request under the SAME token — asserts
+//! the cached outcome (no double `ADD`, the `Delete`d key stays deleted, not
+//! resurrected) — the idempotency property the randomized workload's
+//! always-fresh tokens never test; (4) the SAME token with a genuinely
+//! different payload — asserts `IdempotentParameterMismatchException`.
+//!
+//! **Residuals specific to Transact (why these are dedicated-probe-only,
+//! not part of the randomized Elle-model workload)**: a `Delete` action
+//! inside a random transact write would tombstone one of the SAME two owned
+//! keys the corpus's list-append model tracks, breaking the prefix
+//! invariant [`check_eventual_reads_are_prefixes`] and every plain
+//! `DeleteItem`/`BatchWriteItem` already stays out of `check_cycles` for
+//! (this file's own "`DeleteItem`/`BatchWriteItem`" section above) — the
+//! identical exclusion, extended to a third write shape; and a genuinely
+//! REUSED `ClientRequestToken` (as opposed to the randomized workload's
+//! always-fresh ones) is a fundamentally different, non-repeatable workload
+//! shape no per-round random draw can safely produce without either
+//! silently skipping the transaction's own effects on a cache hit
+//! (undercounting `ok_writes`) or manufacturing a value-reuse hazard
+//! `animus-test/CLAUDE.md`'s own "every appended element must be globally
+//! unique" rule forbids. Both are instead proven deterministically by
+//! [`run_transact_probe`] above, under the identical per-scenario fault
+//! schedule and post-heal/drain placement as every other probe in this
+//! file — not a weaker proof, a differently-shaped one, exactly like
+//! `DeleteItem`/`BatchWriteItem`'s own existing probes.
+//!
+//! # Corpus-fixture findings from this rung (all fixed; none is a product bug)
+//!
+//! Extending the workload with Transact ops surfaced three real,
+//! deterministic `SimCluster`/`ClientCtx` fixture defects — every one
+//! classified (a)/(b) per the task's own found-bug protocol as **(b)**: a
+//! corpus/fixture staleness or model gap, never a defect in the transact
+//! protocol itself (each was root-caused to a specific fixture mechanism,
+//! not left as an unexplained flake).
+//!
+//! **Finding A — a stale `SimClusterHandle::replicas_of` snapshot
+//! (fixed via [`live_replicas`]).** A tokened `TransactWriteItems`
+//! auto-provisions the internal `__animus_txn_idempotency` table, which
+//! shifts every node's total hosted-tablet count enough to trigger a real
+//! `rebalance_placement` move of this corpus's own modeled table on the
+//! `dynamowire_forward_heavy` cell (4 nodes, RF 2) — a move
+//! `SimClusterHandle::replicas_of`'s creation-time-frozen snapshot never
+//! reflects. `run_scenario`'s durability check was reading an empty,
+//! no-longer-a-replica engine and reporting every acknowledged write
+//! against it as lost. Fixed by replacing every `replicas_of` read this
+//! file's own checks depend on with [`live_replicas`], a live
+//! `SimCluster::hosted_tablets` query. See that function's own doc for the
+//! full incident.
+//!
+//! **Finding B — a same-tablet ("self-transaction") abandoned
+//! `TransactWriteItems` permanently masked under `local_get`'s raw-peek
+//! semantics (fixed via [`force_resolve_all_keys`]).** `SimCluster` never
+//! spawns `animusd::txn_resolver_loop`, and the plain-`GetItem` local-read
+//! path never calls `confirm_or_push` for a LOCAL (same-tablet) `Pending`
+//! intent — only a foreign one — so a transaction abandoned mid-flight by
+//! a fault landing on its own single tablet had no path to resolution in
+//! this fixture at all, and this file's own raw-`local_get`-based
+//! durability oracle read the masked, pre-intent value as "lost." Fixed by
+//! issuing one covering `TransactGetItems` after drain
+//! ([`force_resolve_all_keys`]) — `TransactGetItems`'s own read primitive
+//! resolves a local intent exactly like a foreign one, so it pushes any
+//! outstanding transaction to its real decision as a side effect. See that
+//! function's own doc for the full incident (seed `13022590114329469744`,
+//! `dynamowire_leader_crash_s22`).
+//!
+//! **Finding C — `SimCluster::restart` never told a restarted node's own
+//! `ClusterEdgeState` about its fresh control handle (fixed via
+//! `ClusterEdgeState::replace_control`, `lib.rs`).** `ClientCtx::
+//! propose_schema`'s local-propose fast path reads `ctx.edge`'s own
+//! `control` registry, not `ctx.control` directly — two different fields
+//! with different lifecycles (`animusd/CLAUDE.md`'s `ControlHandle`
+//! entry). `restart` rebuilt `ctx.control` but never updated the edge, so
+//! a restarted node's own `ClusterEdgeState::control` entry pointed at the
+//! OLD, `Simulator::stop`ped (dead) `RaftNode` for the rest of the
+//! scenario — any NEW schema proposal issued through that node's fast path
+//! (e.g. `ensure_txn_idempotency_table`'s `CreateTableSchema`, which a
+//! tokened `TransactWriteItems` needs) spun until `SCHEMA_COMMIT_TIMEOUT`
+//! even with a real, healthy, reachable leader elsewhere — reproduced
+//! deterministically via `dynamowire_stop_restart_s02`, and shown to be
+//! general control-plane-restart infrastructure, not anything
+//! transact-specific (an ordinary, non-transactional `CreateTable` from
+//! the restarted node reproduced the identical failure). A first fix
+//! (calling the existing, append-only `register_control` from `restart`)
+//! left the exact same scenario failing: the edge's registry then held
+//! BOTH the stale and the fresh handle, and `leader_handle()`'s `find`
+//! could return the stale one first. `ClusterEdgeState::replace_control`
+//! (clears before pushing) is the real fix — see its own doc in `lib.rs`.
+//!
+//! # A resource-scale finding filed, not fixed: peak memory grows with
+//! `ANIMUS_DYNAMO_WIRE_SEEDS` depth
+//!
+//! Measured on this rung's own development sandbox (4 vCPU / 15 GiB RAM,
+//! no swap): `sim_cluster_dynamo_corpus_is_consistent` at the default
+//! depth (8 scenarios) completes in ~114s with modest RSS; at
+//! `ANIMUS_DYNAMO_WIRE_SEEDS=4` (32 scenarios) it completed cleanly in
+//! ~460s; at `=12` (96 scenarios) process RSS was observed climbing
+//! through ~6.3 GiB at the ~10-minute mark and on to a ~13.8 GiB plateau
+//! by ~30-37 minutes, matching (not exceeding) the plateau independently
+//! observed at `=25` (200 scenarios) before the OS OOM-killed that run on
+//! this same sandbox. The plateau, not a strictly-monotonic per-scenario
+//! climb, and its rough independence from total scenario count once
+//! depth is large enough, are both consistent with ordinary glibc
+//! allocator high-water-mark behavior (freed memory not returned to the
+//! OS) rather than a true per-scenario leak — but this was not run to a
+//! confirmed root cause, only measured and reported per this task's own
+//! explicit instruction not to keep investigating it here. Filed as a
+//! resource-scale characteristic of the fixture worth a maintainer look
+//! (e.g. under a memory profiler, or with `MALLOC_ARENA_MAX=1`, which did
+//! not visibly change the trajectory in this sandbox), not a correctness
+//! defect and not fixed in this PR — CI's own already-established green
+//! `=25` figure (`~10m2s wall`, see the D2 PR 2 entry this file's own doc
+//! history references) implies CI's runners simply have materially more
+//! RAM than this 15 GiB sandbox.
+//!
 //! # The cells
 //!
 //! Identical to `sim_cluster_corpus.rs`'s own 8 (`baseline`,
@@ -138,13 +335,18 @@
 //! # Residuals (out of scope for this rung — see `dynamo.rs`'s own
 //! `dispatch_item_op` doc for the full "what's ProdEnv-only, why" account)
 //!
-//! GSI/LSI `Query`/`Scan`, `TransactWriteItems`/`TransactGetItems`, and
-//! PartiQL (`ExecuteStatement`/`BatchExecuteStatement`/
-//! `ExecuteTransaction`) are all still unreachable through the generic
-//! `dispatch_item_op` core this corpus drives — `execute_item_op_as`
-//! returns a clean `InternalServerError` for any of them, so this corpus
-//! never issues one. Deferred to whichever rung generalizes those
-//! operations next (D3/D4 per the ADR's own roadmap), not attempted here.
+//! GSI/LSI `Query`/`Scan` and PartiQL (`ExecuteStatement`/
+//! `BatchExecuteStatement`/`ExecuteTransaction`) are still unreachable
+//! through the generic `dispatch_item_op` core this corpus drives —
+//! `execute_item_op_as` returns a clean `InternalServerError` for any of
+//! them, so this corpus never issues one. Deferred to C-06 PRs 5/6 (PartiQL
+//! siblings + sim tests), not attempted here. **`TransactWriteItems`/
+//! `TransactGetItems` are no longer a residual as of this PR** — see the
+//! dedicated module-doc section above for exactly what's in the randomized
+//! workload versus [`run_transact_probe`]'s own dedicated coverage, and
+//! exactly why (never a silent gap: a `Delete` action inside a transact
+//! write, and a genuinely reused `ClientRequestToken`, are both
+//! deliberately probe-only, not randomized-workload material).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -302,8 +504,16 @@ impl Nemesis {
             }
             Nemesis::FollowerCrash => {
                 if let Some(leader) = cluster.leader_index_of(tablet) {
-                    let replicas = cluster.handle().replicas_of(tablet);
-                    if let Some(&follower) = replicas.iter().find(|&&n| n != leader) {
+                    // A live lookup, not `SimClusterHandle::replicas_of`'s
+                    // stale creation-time snapshot (see `live_replicas`'s
+                    // own doc) — a follower this nemesis picked off a stale
+                    // replica set could crash a node that no longer hosts
+                    // the tablet at all, silently downgrading this cell to
+                    // a no-op fault.
+                    let node_count = cluster.node_count() as u64;
+                    let follower = (0..node_count)
+                        .find(|&n| n != leader && cluster.hosted_tablets(n).contains(&tablet));
+                    if let Some(follower) = follower {
                         cluster.crash(follower);
                     }
                 }
@@ -380,7 +590,15 @@ fn base_workload(
         tables,
         clients: 3,
         rounds: 6,
-        keyspace: 3,
+        // 6, not 3 (as of C-06 PR 4): a `TransactWriteItems` draws its two
+        // write keys from the SAME client's own `owned` set (never a second
+        // client's — the single-writer-per-key discipline this file's
+        // module doc establishes), so each client needs at least 2 owned
+        // keys per table. With `clients: 3` a keyspace of 3 gave exactly 1
+        // owned key per client per table; 6 gives exactly 2 — see this
+        // file's own "TransactWriteItems/TransactGetItems" module-doc
+        // section.
+        keyspace: 6,
         read_pct: 40,
         faults,
         window,
@@ -462,6 +680,12 @@ struct Shared {
     /// the module doc's "read-consistency modeling decision"), never fed
     /// into the shared `Recorder`/`check_cycles` history.
     eventual_reads: Mutex<Vec<(Key, Vec<u64>)>>,
+    /// Successful `TransactWriteItems`/`TransactGetItems` counts — the
+    /// non-vacuity signal for the new op mix (ADR 0061 rung F, C-06 PR 4),
+    /// mirroring `eventual_reads`'s own role for the pre-existing
+    /// `ConsistentRead: false` dimension.
+    transact_write_oks: Mutex<usize>,
+    transact_get_oks: Mutex<usize>,
 }
 
 impl Shared {
@@ -486,6 +710,20 @@ impl Shared {
             .expect("eventual_reads poisoned")
             .push((key, observed));
     }
+
+    fn record_transact_write_ok(&self) {
+        *self
+            .transact_write_oks
+            .lock()
+            .expect("transact_write_oks poisoned") += 1;
+    }
+
+    fn record_transact_get_ok(&self) {
+        *self
+            .transact_get_oks
+            .lock()
+            .expect("transact_get_oks poisoned") += 1;
+    }
 }
 
 /// Which flavor of read a round picked — see the module doc's "read-
@@ -497,6 +735,26 @@ enum ReadKind {
     EventualGet,
     Query,
     Scan,
+    /// `TransactGetItems` over two keys — always strongly consistent (real
+    /// DynamoDB gives it no `ConsistentRead` parameter at all), so unlike
+    /// [`ReadKind::ConsistentGet`]/[`ReadKind::EventualGet`] there is no
+    /// weaker variant to split out.
+    TransactGet,
+}
+
+/// Pick two DISTINCT indices in `0..n`, or `None` if `n < 2` — the shared
+/// technique [`run_transact_write`] (over a client's own `owned` keys) and
+/// [`ReadKind::TransactGet`]'s selection (over the whole keyspace) both use.
+/// `i1 = (i0 + 1 + gen_below(n - 1)) % n` ranges over every value except
+/// `i0` exactly once as the inner draw varies, guaranteeing `i1 != i0`
+/// without a retry loop.
+fn distinct_pair(env: &SimEnv, n: u64) -> Option<(u64, u64)> {
+    if n < 2 {
+        return None;
+    }
+    let i0 = env.gen_below(n);
+    let i1 = (i0 + 1 + env.gen_below(n - 1)) % n;
+    Some((i0, i1))
 }
 
 /// Append `value` to `key`'s list via a real `UpdateItem` wire request —
@@ -719,9 +977,180 @@ async fn run_scan(
     }
 }
 
+/// A two-item `TransactWriteItems` — `Update`+`list_append` on TWO of this
+/// client's own owned keys plus an always-passing `ConditionCheck` against
+/// the target table's `__guard__` marker (seeded once, before the workload
+/// starts, in [`run_scenario`]) — see the module doc's own
+/// "`TransactWriteItems`/`TransactGetItems`" section for why the guard is
+/// always-passing and why atomicity is checked by construction here (both
+/// appends are recorded as ONE `invoke`/`ok` entry, never separately).
+/// `with_token` optionally attaches a fresh, call-unique `ClientRequestToken`
+/// — exercising the token-preflight path without ever actually retrying one
+/// (a genuine retry is [`run_transact_probe`]'s own job).
+#[allow(clippy::too_many_arguments)]
+async fn run_transact_write(
+    env: &SimEnv,
+    handle: &SimClusterHandle,
+    shared: &Arc<Shared>,
+    proc: Process,
+    keys: [Key; 2],
+    with_token: bool,
+    node: u64,
+) {
+    let v0 = shared.fresh_value();
+    let v1 = shared.fresh_value();
+    let (table0, pk0, sk0) = table_pk_sk(keys[0]);
+    let (table1, pk1, sk1) = table_pk_sk(keys[1]);
+    let mops = vec![
+        Mop::Append {
+            key: keys[0],
+            value: v0,
+        },
+        Mop::Append {
+            key: keys[1],
+            value: v1,
+        },
+    ];
+    shared
+        .rec
+        .lock()
+        .expect("recorder poisoned")
+        .invoke(proc, env.now().0, mops.clone());
+
+    let mut body = json!({
+        "TransactItems": [
+            {"Update": {
+                "TableName": table0,
+                "Key": {"pk": {"S": pk0}, "sk": {"S": sk0}},
+                "UpdateExpression": "SET items = list_append(if_not_exists(items, :empty), :v)",
+                "ExpressionAttributeValues": {":empty": {"L": []}, ":v": one_element_list(v0)},
+            }},
+            {"Update": {
+                "TableName": table1,
+                "Key": {"pk": {"S": pk1}, "sk": {"S": sk1}},
+                "UpdateExpression": "SET items = list_append(if_not_exists(items, :empty), :v)",
+                "ExpressionAttributeValues": {":empty": {"L": []}, ":v": one_element_list(v1)},
+            }},
+            {"ConditionCheck": {
+                "TableName": table0,
+                "Key": {"pk": {"S": "__guard__"}, "sk": {"S": "__guard__"}},
+                "ConditionExpression": "attribute_exists(pk)",
+            }},
+        ],
+    });
+    if with_token {
+        body["ClientRequestToken"] = json!(format!("corpus-tw-{proc}-{v0}-{v1}"));
+    }
+    let (status, _body) = handle
+        .dynamo(
+            node,
+            "DynamoDB_20120810.TransactWriteItems",
+            body.to_string().as_bytes(),
+        )
+        .await;
+
+    let mut rec = shared.rec.lock().expect("recorder poisoned");
+    if status == 200 {
+        rec.ok(proc, env.now().0, mops);
+        drop(rec);
+        shared.record_ok_write(node);
+        shared.record_transact_write_ok();
+    } else {
+        rec.info(proc, env.now().0, mops);
+    }
+}
+
+/// Decode a `TransactGetItems` response's `Responses` array (`{}` for an
+/// absent item, `{"Item": {..}}` for a present one — `wire::
+/// transact_get_response`'s own shape) into one [`Mop::Read`] per requested
+/// key, in request order — the `TransactGetItems` sibling of
+/// [`read_mops_from_items_response`].
+fn read_mops_from_transact_get(keys: [Key; 2], body: &str) -> Option<Vec<Mop>> {
+    let responses = serde_json::from_str::<Value>(body)
+        .ok()?
+        .get("Responses")?
+        .as_array()?
+        .clone();
+    if responses.len() != 2 {
+        return None;
+    }
+    Some(
+        keys.into_iter()
+            .zip(responses.iter())
+            .map(|(key, resp)| Mop::Read {
+                key,
+                observed: Some(resp.get("Item").map(decode_items_attr).unwrap_or_default()),
+            })
+            .collect(),
+    )
+}
+
+/// A two-key `TransactGetItems`, always strongly consistent (real DynamoDB
+/// gives this operation no `ConsistentRead` parameter — see the module
+/// doc's own section) — feeds the shared history as ONE atomic entry of two
+/// [`Mop::Read`]s, exactly like [`run_query`]/[`run_scan`]'s own multi-key
+/// reads. A non-200 response (including the retryable
+/// `TransactionCanceledException` an un-quiesced snapshot can return) is
+/// `info`, never `fail` — mirrors [`run_get`]'s own discipline for a read
+/// that carries no observation.
+async fn run_transact_get(
+    env: &SimEnv,
+    handle: &SimClusterHandle,
+    shared: &Arc<Shared>,
+    proc: Process,
+    keys: [Key; 2],
+    node: u64,
+) {
+    shared.rec.lock().expect("recorder poisoned").invoke(
+        proc,
+        env.now().0,
+        keys.into_iter()
+            .map(|key| Mop::Read {
+                key,
+                observed: None,
+            })
+            .collect(),
+    );
+
+    let (table0, pk0, sk0) = table_pk_sk(keys[0]);
+    let (table1, pk1, sk1) = table_pk_sk(keys[1]);
+    let body = json!({
+        "TransactItems": [
+            {"Get": {"TableName": table0, "Key": {"pk": {"S": pk0}, "sk": {"S": sk0}}}},
+            {"Get": {"TableName": table1, "Key": {"pk": {"S": pk1}, "sk": {"S": sk1}}}},
+        ],
+    })
+    .to_string();
+    let (status, body) = handle
+        .dynamo(node, "DynamoDB_20120810.TransactGetItems", body.as_bytes())
+        .await;
+
+    let mut rec = shared.rec.lock().expect("recorder poisoned");
+    match (status, read_mops_from_transact_get(keys, &body)) {
+        (200, Some(mops)) => {
+            rec.ok(proc, env.now().0, mops);
+            drop(rec);
+            shared.record_transact_get_ok();
+        }
+        _ => {
+            rec.info(
+                proc,
+                env.now().0,
+                keys.into_iter()
+                    .map(|key| Mop::Read {
+                        key,
+                        observed: None,
+                    })
+                    .collect(),
+            );
+        }
+    }
+}
+
 /// One client's loop: each round, draw a fresh issuing node from the
 /// scenario's own seed, then run one op — a write (single-writer, its own
-/// owned keys only) or one of four read shapes across the whole keyspace.
+/// owned keys only, sometimes a multi-key `TransactWriteItems`) or one of
+/// five read shapes across the whole keyspace.
 #[allow(clippy::too_many_arguments)]
 async fn client_loop(
     env: SimEnv,
@@ -739,17 +1168,23 @@ async fn client_loop(
         .flat_map(|t| (0..keyspace).map(move |k| t * TABLE_KEY_STRIDE + k))
         .filter(|&k| k % clients as u64 == proc)
         .collect();
+    let total_keys = tables as u64 * keyspace;
     for _round in 0..rounds {
         let node = env.gen_below(node_count as u64);
         let is_read = env.gen_below(100) < read_pct;
         if is_read {
             let t = env.gen_below(tables as u64);
             let table = format!("t{t}");
-            let kind = match env.gen_below(10) {
+            let kind = match env.gen_below(12) {
                 0..=4 => ReadKind::ConsistentGet,
                 5..=7 => ReadKind::EventualGet,
                 8 => ReadKind::Query,
-                _ => ReadKind::Scan,
+                9 => ReadKind::Scan,
+                _ if total_keys >= 2 => ReadKind::TransactGet,
+                // `distinct_pair` needs 2+ keys — a shrunk `keyspace`
+                // candidate (ADR 0061 rung B4) can legally drop below that;
+                // fall back to a plain read rather than skip the round.
+                _ => ReadKind::ConsistentGet,
             };
             match kind {
                 ReadKind::ConsistentGet | ReadKind::EventualGet => {
@@ -759,7 +1194,28 @@ async fn client_loop(
                 }
                 ReadKind::Query => run_query(&env, &handle, &shared, proc, t, &table, node).await,
                 ReadKind::Scan => run_scan(&env, &handle, &shared, proc, t, &table, node).await,
+                ReadKind::TransactGet => {
+                    let (i0, i1) =
+                        distinct_pair(&env, total_keys).expect("checked total_keys >= 2 above");
+                    let key_of = |idx: u64| (idx / keyspace) * TABLE_KEY_STRIDE + (idx % keyspace);
+                    run_transact_get(&env, &handle, &shared, proc, [key_of(i0), key_of(i1)], node)
+                        .await;
+                }
             }
+        } else if owned.len() >= 2 && env.gen_below(3) == 0 {
+            let (i0, i1) =
+                distinct_pair(&env, owned.len() as u64).expect("checked owned.len() >= 2 above");
+            let with_token = env.gen_below(2) == 0;
+            run_transact_write(
+                &env,
+                &handle,
+                &shared,
+                proc,
+                [owned[i0 as usize], owned[i1 as usize]],
+                with_token,
+                node,
+            )
+            .await;
         } else if !owned.is_empty() {
             let key = owned[env.gen_below(owned.len() as u64) as usize];
             run_write(&env, &handle, &shared, proc, key, node).await;
@@ -893,6 +1349,227 @@ fn run_batch_write_probe(
     Ok(node_count)
 }
 
+/// A consistent `GetItem` for `hits`/`N` (an `ADD`-counter probe read) — the
+/// idempotency proof [`run_transact_probe`] uses: a re-run would double it,
+/// a cached retry leaves it unchanged. Mirrors `sim_cluster_dynamo_
+/// transact.rs`'s own `read_counter` helper.
+fn read_hits_counter(cluster: &mut SimCluster, table: &str, pk: &str) -> Result<i64, String> {
+    let body = json!({
+        "ConsistentRead": true,
+        "TableName": table,
+        "Key": {"pk": {"S": pk}, "sk": {"S": "v"}},
+    })
+    .to_string();
+    let (status, resp) = cluster.dynamo(0, "DynamoDB_20120810.GetItem", body.as_bytes());
+    if status != 200 {
+        return Err(format!(
+            "GetItem({table}/{pk}) failed: status={status} body={resp}"
+        ));
+    }
+    let v: Value = serde_json::from_str(&resp).map_err(|e| format!("invalid JSON: {e}"))?;
+    Ok(v["Item"]["hits"]["N"]
+        .as_str()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0))
+}
+
+/// The deterministic, dedicated proof for what [`client_loop`]'s randomized
+/// `TransactWriteItems` mix cannot safely produce itself — see this file's
+/// own "`TransactWriteItems`/`TransactGetItems`" module-doc section for the
+/// full account of why each of the four steps below needs to be here rather
+/// than in the shared Elle-model workload. Run from every node in the
+/// cluster in turn, on a `transact-probe-{node}-*` key namespace disjoint
+/// from every other key this file's probes/model use, reusing the scenario's
+/// own `__guard__` marker item (seeded once per table in [`run_scenario`],
+/// before the workload starts, and never touched by anything else) for both
+/// the failing and the passing `ConditionCheck` below.
+fn run_transact_probe(
+    cluster: &mut SimCluster,
+    table_names: &[String],
+    node_count: usize,
+) -> Result<usize, String> {
+    let table0 = table_names[0].as_str();
+    let table1 = table_names.get(1).map_or(table0, String::as_str);
+
+    for node in 0..node_count as u64 {
+        // --- (1) A genuinely FAILING ConditionCheck (the pre-existing
+        // `__guard__` item DOES exist, so `attribute_not_exists` is false)
+        // cancels the whole transaction — neither `Put` nor `Update` lands.
+        let a_pk = format!("transact-probe-{node}-a");
+        let b_pk = format!("transact-probe-{node}-b");
+        let cancel_body = json!({
+            "TransactItems": [
+                {"Put": {"TableName": table0,
+                    "Item": {"pk": {"S": a_pk}, "sk": {"S": "v"}, "items": one_element_list(1)}}},
+                {"Update": {"TableName": table0, "Key": {"pk": {"S": b_pk}, "sk": {"S": "v"}},
+                    "UpdateExpression": "ADD hits :one",
+                    "ExpressionAttributeValues": {":one": {"N": "1"}}}},
+                {"ConditionCheck": {"TableName": table0,
+                    "Key": {"pk": {"S": "__guard__"}, "sk": {"S": "__guard__"}},
+                    "ConditionExpression": "attribute_not_exists(pk)"}},
+            ],
+        })
+        .to_string();
+        let (status, resp) = cluster.dynamo(
+            node,
+            "DynamoDB_20120810.TransactWriteItems",
+            cancel_body.as_bytes(),
+        );
+        if status != 400 || !resp.contains("TransactionCanceledException") {
+            return Err(format!(
+                "node {node}: expected the guard check to cancel: status={status} body={resp}"
+            ));
+        }
+        let reasons = serde_json::from_str::<Value>(&resp)
+            .ok()
+            .and_then(|v| v["CancellationReasons"].as_array().cloned())
+            .unwrap_or_default();
+        if reasons.len() != 3 || reasons[2]["Code"] != "ConditionalCheckFailed" {
+            return Err(format!(
+                "node {node}: unexpected CancellationReasons for the cancel case: {reasons:?}"
+            ));
+        }
+        for pk in [&a_pk, &b_pk] {
+            let get_body = json!({
+                "ConsistentRead": true,
+                "TableName": table0,
+                "Key": {"pk": {"S": pk}, "sk": {"S": "v"}},
+            })
+            .to_string();
+            let (status, body) =
+                cluster.dynamo(node, "DynamoDB_20120810.GetItem", get_body.as_bytes());
+            if status != 200 || body.contains("\"Item\"") {
+                return Err(format!(
+                    "node {node}: a cancelled transaction still wrote {pk}: \
+                     status={status} body={body}"
+                ));
+            }
+        }
+
+        // --- (2)/(3)/(4): a committed transaction mixing `Put`+`Delete`+
+        // `Update` (spanning BOTH tables when the cell has two) with a
+        // passing `ConditionCheck` and a `ClientRequestToken` — the commit
+        // case, then an identical retry (idempotency: cached, no re-run),
+        // then a mismatched retry (rejected).
+        let to_delete_pk = format!("transact-probe-{node}-todelete");
+        let seed_delete = json!({
+            "TableName": table0,
+            "Item": {"pk": {"S": to_delete_pk}, "sk": {"S": "v"}, "items": one_element_list(0)},
+        })
+        .to_string();
+        let (status, resp) =
+            cluster.dynamo(node, "DynamoDB_20120810.PutItem", seed_delete.as_bytes());
+        if status != 200 {
+            return Err(format!(
+                "node {node}: transact-probe delete-seed failed: status={status} body={resp}"
+            ));
+        }
+
+        let put_pk = format!("transact-probe-{node}-put");
+        let counter_pk = format!("transact-probe-{node}-counter");
+        let token = format!("transact-probe-tok-{node}");
+        let commit_body = |put_val: u64| {
+            json!({
+                "ClientRequestToken": token,
+                "TransactItems": [
+                    {"Put": {"TableName": table0,
+                        "Item": {"pk": {"S": put_pk}, "sk": {"S": "v"},
+                                 "items": one_element_list(put_val)}}},
+                    {"Delete": {"TableName": table0,
+                        "Key": {"pk": {"S": to_delete_pk}, "sk": {"S": "v"}}}},
+                    {"Update": {"TableName": table1,
+                        "Key": {"pk": {"S": counter_pk}, "sk": {"S": "v"}},
+                        "UpdateExpression": "ADD hits :one",
+                        "ExpressionAttributeValues": {":one": {"N": "1"}}}},
+                    {"ConditionCheck": {"TableName": table1,
+                        "Key": {"pk": {"S": "__guard__"}, "sk": {"S": "__guard__"}},
+                        "ConditionExpression": "attribute_exists(pk)"}},
+                ],
+            })
+            .to_string()
+        };
+
+        let (status, resp) = cluster.dynamo(
+            node,
+            "DynamoDB_20120810.TransactWriteItems",
+            commit_body(11).as_bytes(),
+        );
+        if status != 200 {
+            return Err(format!(
+                "node {node}: the mixed Put+Delete+Update commit failed: status={status} body={resp}"
+            ));
+        }
+        let put_get = json!({
+            "ConsistentRead": true,
+            "TableName": table0,
+            "Key": {"pk": {"S": put_pk}, "sk": {"S": "v"}},
+        })
+        .to_string();
+        let (status, body) = cluster.dynamo(node, "DynamoDB_20120810.GetItem", put_get.as_bytes());
+        let seen = serde_json::from_str::<Value>(&body)
+            .ok()
+            .and_then(|v| v.get("Item").map(decode_items_attr))
+            .unwrap_or_default();
+        if status != 200 || seen != vec![11] {
+            return Err(format!(
+                "node {node}: committed Put not visible: status={status} body={body}"
+            ));
+        }
+        let del_get = json!({
+            "ConsistentRead": true,
+            "TableName": table0,
+            "Key": {"pk": {"S": to_delete_pk}, "sk": {"S": "v"}},
+        })
+        .to_string();
+        let (status, body) = cluster.dynamo(node, "DynamoDB_20120810.GetItem", del_get.as_bytes());
+        if status != 200 || body.contains("\"Item\"") {
+            return Err(format!(
+                "node {node}: committed Delete left the item present: status={status} body={body}"
+            ));
+        }
+        let hits = read_hits_counter(cluster, table1, &counter_pk)?;
+        if hits != 1 {
+            return Err(format!(
+                "node {node}: committed Update counter is {hits}, expected 1"
+            ));
+        }
+
+        // (3) an identical retry, same token: cached — 200, no re-run (the
+        // counter must stay 1, not 2).
+        let (status, resp) = cluster.dynamo(
+            node,
+            "DynamoDB_20120810.TransactWriteItems",
+            commit_body(11).as_bytes(),
+        );
+        if status != 200 {
+            return Err(format!(
+                "node {node}: the same-token retry failed: status={status} body={resp}"
+            ));
+        }
+        let hits = read_hits_counter(cluster, table1, &counter_pk)?;
+        if hits != 1 {
+            return Err(format!(
+                "node {node}: a same-token retry re-ran the transaction — counter is {hits}, \
+                 expected 1"
+            ));
+        }
+
+        // (4) the same token, a genuinely DIFFERENT payload: rejected.
+        let (status, resp) = cluster.dynamo(
+            node,
+            "DynamoDB_20120810.TransactWriteItems",
+            commit_body(12).as_bytes(),
+        );
+        if status != 400 || !resp.contains("IdempotentParameterMismatchException") {
+            return Err(format!(
+                "node {node}: a mismatched same-token retry should be rejected: \
+                 status={status} body={resp}"
+            ));
+        }
+    }
+    Ok(node_count)
+}
+
 // ---------------------------------------------------------------------------
 // The scenario runner.
 // ---------------------------------------------------------------------------
@@ -911,6 +1588,9 @@ struct ScenarioResult {
     eventual_reads: usize,
     delete_probe: Result<usize, String>,
     batch_probe: Result<usize, String>,
+    transact_probe: Result<usize, String>,
+    transact_write_oks: usize,
+    transact_get_oks: usize,
 }
 
 fn combine_reports(seed: u64, reports: impl Iterator<Item = CheckReport>) -> CheckReport {
@@ -954,6 +1634,36 @@ fn final_state(
     map
 }
 
+/// `tablet`'s CURRENTLY, ACTUALLY hosting node set — a live query via
+/// [`SimCluster::hosted_tablets`], never [`SimClusterHandle::replicas_of`]'s
+/// own creation-time snapshot (`SimCluster::create_table_with_replication`'s
+/// own bookkeeping, frozen the instant the table is created and never
+/// refreshed afterward — see that method's own doc for why it's a
+/// deliberately static convenience, not a live read). **Found necessary by
+/// this file's own C-06 PR 4 investigation**: a tokened `TransactWriteItems`
+/// auto-provisions the internal `__animus_txn_idempotency` table
+/// (`dynamo.rs::ensure_txn_idempotency_table`) at its own default RF, which
+/// shifts every node's own TOTAL hosted-tablet count — on `dynamowire_
+/// forward_heavy` (4 nodes, RF 2) this was enough to push the fixture's
+/// real per-node `Reconciler`/`rebalance_placement` (ADR 0029's max−min ≤ 1
+/// policy, evaluated per-node across ALL of that node's hosted tablets, not
+/// per-table) into moving the corpus's OWN modeled table off the node the
+/// static snapshot still named, onto a different one — a real, correct
+/// rebalance the D4 PR1 entry's own "no existing cell ever triggers one"
+/// claim never anticipated, since no cell before this PR ever provisioned a
+/// second table via anything but its own explicit `create_table_with_
+/// replication` call. Checking `final_state` against the STALE node left
+/// [`run_scenario`] reading an empty, no-longer-a-replica engine and
+/// reporting every acknowledged write against it as "lost" — a corpus-side
+/// staleness bug, not a real durability violation (see this module's own
+/// "TransactWriteItems/TransactGetItems" section's closing note, and
+/// `docs/engineering-lessons.md`'s matching entry, for the full incident).
+fn live_replicas(cluster: &SimCluster, node_count: usize, tablet: TabletId) -> Vec<u64> {
+    (0..node_count as u64)
+        .filter(|&n| cluster.hosted_tablets(n).contains(&tablet))
+        .collect()
+}
+
 fn check_eventual_reads_are_prefixes(
     seed: u64,
     observations: &[(Key, Vec<u64>)],
@@ -984,6 +1694,80 @@ fn check_eventual_reads_are_prefixes(
     }
 }
 
+/// Force any outstanding transaction intent, on any key this scenario's
+/// workload could have touched, toward resolution — a **model-only**
+/// diagnostic/repair pass (never fed into `shared`'s own history, exactly
+/// like [`run_delete_probe`]/[`run_batch_write_probe`]/
+/// [`run_transact_probe`]) that has to run before this file's own raw
+/// `local_get`-based [`final_state`] can be trusted at all once
+/// `TransactWriteItems` is part of the workload.
+///
+/// **Why this exists — a real finding from this file's own C-06 PR 4
+/// investigation, resolved as a corpus-model gap, not a product bug.**
+/// `RaftKvNode::local_get`'s OWN documented contract (`animus-cp-data::
+/// lib.rs`) is that a key currently covered by a `Pending` transaction
+/// intent reads as **absent**, not as whatever value was committed
+/// *before* that intent was staged — a deliberate, correct design for its
+/// stated job (observing genuinely-applied state), but exactly wrong for
+/// `final_state`'s own "is the acknowledged value durably present"
+/// question the instant a workload can leave an intent Pending for a long
+/// time. And this corpus's own random `TransactWriteItems` mix (drawing
+/// its two keys from a client's own already-written `owned` set) can do
+/// exactly that: a `LeaderCrash`/`FollowerCrash`/`StopRestart`/
+/// `LeaderPartition`/`SplitBrain` fault landing on the SAME tablet a
+/// transact write's own coordinator call is mid-flight against can leave
+/// that transaction genuinely in-doubt — and, for every single-table cell
+/// in this corpus, BOTH of that transaction's own actions land on the
+/// SAME tablet (a "self-transaction": the anchor and its one participant
+/// coincide). That combination has no path to resolution in THIS fixture
+/// specifically: `SimCluster` never spawns `animusd::txn_resolver_loop`
+/// (production's own background sweep, which would eventually resolve
+/// ANY abandoned transaction regardless of who reads what), and the
+/// on-demand recovery-via-read path (`ClientCtx::confirm_or_push`,
+/// `read_path.rs`) is reached from the **plain** single-key `GetItem` path
+/// (`cp_get_local_resolving_inner`) only for a **foreign** intent (a
+/// different tablet than the reader's own) — a local (same-tablet) Pending
+/// intent instead takes `linearizable_get_served`'s bounded *blocking*
+/// chase, which never calls `confirm_or_push`/`txn_recover` at all, so a
+/// same-tablet self-transaction's own local intent never gets pushed by an
+/// ordinary read no matter how many are issued or how long this corpus
+/// waits (confirmed directly: extending this scenario's own convergence
+/// window from 15s to 120s changed nothing). **`TransactGetItems`'s own
+/// read primitive is the one path that resolves a LOCAL intent exactly
+/// like a foreign one** (`ClientCtx::cp_get_local_snapshot`'s shared
+/// `FastRead::Pending(info) | FastRead::Foreign(info)` arm, `read_path.rs`
+/// — both call `confirm_or_push` identically), so one `TransactGetItems`
+/// covering every key this scenario could have written pushes any
+/// outstanding intent toward its real decision as a side effect,
+/// regardless of whether the read itself ever reports a clean quiesced
+/// answer. Issued once, after `DRAIN`, from node 0 — a genuine, resolving
+/// side effect the underlying transaction protocol already guarantees is
+/// safe to invoke any number of times on an already-decided key. See this
+/// module's own "TransactWriteItems/TransactGetItems" doc section's
+/// closing note and `docs/engineering-lessons.md`'s matching entry for the
+/// full incident (seed `13022590114329469744`,
+/// `dynamowire_leader_crash_s22`).
+fn force_resolve_all_keys(cluster: &mut SimCluster, table_names: &[String], keyspace: u64) {
+    let mut gets: Vec<Value> = Vec::new();
+    for (t, table) in table_names.iter().enumerate() {
+        for k in 0..keyspace {
+            let (_, pk, sk) = table_pk_sk(t as u64 * TABLE_KEY_STRIDE + k);
+            gets.push(json!({
+                "Get": {"TableName": table, "Key": {"pk": {"S": pk}, "sk": {"S": sk}}},
+            }));
+            if gets.len() == 100 {
+                let body = json!({"TransactItems": gets}).to_string();
+                let _ = cluster.dynamo(0, "DynamoDB_20120810.TransactGetItems", body.as_bytes());
+                gets = Vec::new();
+            }
+        }
+    }
+    if !gets.is_empty() {
+        let body = json!({"TransactItems": gets}).to_string();
+        let _ = cluster.dynamo(0, "DynamoDB_20120810.TransactGetItems", body.as_bytes());
+    }
+}
+
 fn run_scenario(s: &Scenario) -> ScenarioResult {
     let mut cluster = SimCluster::new(s.seed, s.nodes, s.replication);
     let table_names: Vec<String> = (0..s.tables).map(|t| format!("t{t}")).collect();
@@ -997,11 +1781,35 @@ fn run_scenario(s: &Scenario) -> ScenarioResult {
         .cloned()
         .expect("table 0 must exist — every scenario creates at least one table");
 
+    // A `__guard__` marker item on every table, seeded once, before the
+    // workload starts, and never touched again — the always-present target
+    // every `ConditionCheck` in this file's own randomized `TransactWriteItems`
+    // mix and in `run_transact_probe` checks against (see the module doc's
+    // own "TransactWriteItems/TransactGetItems" section). Its own `sk`
+    // ("__guard__") never parses as `key_from_table_and_sk`'s `item-{n}`
+    // shape, so it is invisible to `Query`/`Scan`'s own `Mop::Read`
+    // derivation, exactly like every other probe's own disjoint namespace.
+    for name in &table_names {
+        let body = json!({
+            "TableName": name,
+            "Item": {"pk": {"S": "__guard__"}, "sk": {"S": "__guard__"}, "seeded": {"BOOL": true}},
+        })
+        .to_string();
+        let (status, resp) = cluster.dynamo(0, "DynamoDB_20120810.PutItem", body.as_bytes());
+        assert_eq!(
+            status, 200,
+            "seed={}: __guard__ seed on {name} failed: {resp}",
+            s.seed
+        );
+    }
+
     let shared = Arc::new(Shared {
         rec: Mutex::new(Recorder::new(s.seed)),
         next_value: Mutex::new(0),
         ok_writes_by_node: Mutex::new(BTreeMap::new()),
         eventual_reads: Mutex::new(Vec::new()),
+        transact_write_oks: Mutex::new(0),
+        transact_get_oks: Mutex::new(0),
     });
 
     let handle = cluster.handle();
@@ -1036,6 +1844,7 @@ fn run_scenario(s: &Scenario) -> ScenarioResult {
     }
     cluster.heal_all();
     cluster.run_for(DRAIN);
+    force_resolve_all_keys(&mut cluster, &table_names, s.keyspace);
 
     let history = shared
         .rec
@@ -1045,10 +1854,9 @@ fn run_scenario(s: &Scenario) -> ScenarioResult {
         .clone();
     let cycles = check_cycles(&history);
 
-    let replicas = handle.replicas_of(primary_tablet);
     let all_states = |c: &SimCluster| -> Vec<BTreeMap<Key, Vec<u64>>> {
         let h = c.handle();
-        replicas
+        live_replicas(c, s.nodes, primary_tablet)
             .iter()
             .map(|&n| final_state(&h, &tablets, n, s.tables, s.keyspace))
             .collect()
@@ -1108,13 +1916,15 @@ fn run_scenario(s: &Scenario) -> ScenarioResult {
         .lock()
         .expect("ok_writes_by_node poisoned")
         .clone();
+    let final_replicas = live_replicas(&cluster, s.nodes, primary_tablet);
     let non_hosting_ok_writes: usize = (0..s.nodes as u64)
-        .filter(|n| !replicas.contains(n))
+        .filter(|n| !final_replicas.contains(n))
         .map(|n| ok_writes_by_node.get(&n).copied().unwrap_or(0))
         .sum();
 
     let delete_probe = run_delete_probe(&mut cluster, &table_names[0], s.nodes);
     let batch_probe = run_batch_write_probe(&mut cluster, &table_names[0], s.nodes);
+    let transact_probe = run_transact_probe(&mut cluster, &table_names, s.nodes);
 
     ScenarioResult {
         cycles,
@@ -1127,6 +1937,15 @@ fn run_scenario(s: &Scenario) -> ScenarioResult {
         eventual_reads: eventual_observations.len(),
         delete_probe,
         batch_probe,
+        transact_probe,
+        transact_write_oks: *shared
+            .transact_write_oks
+            .lock()
+            .expect("transact_write_oks poisoned"),
+        transact_get_oks: *shared
+            .transact_get_oks
+            .lock()
+            .expect("transact_get_oks poisoned"),
     }
 }
 
@@ -1152,6 +1971,7 @@ fn scenario_failed(r: &ScenarioResult) -> bool {
         || !r.eventual_prefix.ok
         || r.delete_probe.is_err()
         || r.batch_probe.is_err()
+        || r.transact_probe.is_err()
 }
 
 fn assert_scenario_ok(s: &Scenario, r: &ScenarioResult) {
@@ -1187,6 +2007,13 @@ fn assert_scenario_ok(s: &Scenario, r: &ScenarioResult) {
         "scenario {} batch-write probe failed: {:?} (seed={})",
         s.name,
         r.batch_probe,
+        s.seed
+    );
+    assert!(
+        r.transact_probe.is_ok(),
+        "scenario {} transact probe failed: {:?} (seed={})",
+        s.name,
+        r.transact_probe,
         s.seed
     );
 }
@@ -1274,6 +2101,8 @@ fn sim_cluster_dynamo_corpus_is_consistent() {
     let scenarios = corpus();
     let mut total_ok_writes = 0usize;
     let mut total_eventual_reads = 0usize;
+    let mut total_transact_write_oks = 0usize;
+    let mut total_transact_get_oks = 0usize;
     for s in &scenarios {
         let r = run_scenario_identified(s);
         if scenario_failed(&r) && shrink::shrink_enabled() {
@@ -1298,11 +2127,25 @@ fn sim_cluster_dynamo_corpus_is_consistent() {
         }
         total_ok_writes += r.ok_writes;
         total_eventual_reads += r.eventual_reads;
+        total_transact_write_oks += r.transact_write_oks;
+        total_transact_get_oks += r.transact_get_oks;
     }
     assert!(
         total_ok_writes > scenarios.len(),
         "corpus too vacuous: only {total_ok_writes} acked writes across {} scenarios",
         scenarios.len()
+    );
+    assert!(
+        total_transact_write_oks > 0,
+        "corpus never issued a successful randomized TransactWriteItems — the atomicity/\
+         isolation coverage this PR adds has nothing to prove (the dedicated \
+         run_transact_probe still ran on every scenario regardless — this is about the \
+         RANDOM op mix specifically)"
+    );
+    assert!(
+        total_transact_get_oks > 0,
+        "corpus never issued a successful randomized TransactGetItems — the isolation \
+         coverage this PR adds has nothing to prove"
     );
     assert!(
         total_eventual_reads > 0,
@@ -1363,7 +2206,8 @@ fn sim_cluster_dynamo_shrink_replay() {
     let r = run_scenario(&scenario);
     eprintln!(
         "replayed '{}' (seed={}): cycles.ok={} durability.ok={} convergence.ok={} \
-         eventual_prefix.ok={} delete_probe={:?} batch_probe={:?} ok_writes={}",
+         eventual_prefix.ok={} delete_probe={:?} batch_probe={:?} transact_probe={:?} \
+         ok_writes={} transact_write_oks={} transact_get_oks={}",
         scenario.name,
         scenario.seed,
         r.cycles.ok,
@@ -1372,7 +2216,10 @@ fn sim_cluster_dynamo_shrink_replay() {
         r.eventual_prefix.ok,
         r.delete_probe,
         r.batch_probe,
-        r.ok_writes
+        r.transact_probe,
+        r.ok_writes,
+        r.transact_write_oks,
+        r.transact_get_oks,
     );
     assert!(
         scenario_failed(&r),
