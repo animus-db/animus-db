@@ -81,15 +81,47 @@
 //! wire enum ([`RelayWire`]) carrying both request and reply variants, one
 //! receive loop ([`serve_loop`]) that dispatches on which variant arrived —
 //! a `Request` gets handed to whatever handler [`SimRelayClient::serve`]
-//! has installed (or a fixed "no handler installed" error if none has) and
-//! answered in place; a `Reply` gets stashed into this node's own
-//! [`Pending`] map for whichever earlier `relay()` call is still waiting on
-//! that `req_id`. [`SimRelayClient::new`] therefore spawns this loop
-//! unconditionally — [`serve`](SimRelayClient::serve) only ever *installs
-//! a handler* into it, never starts or stops it, so it may be called at any
-//! point after construction (including never, for a node that only ever
-//! calls out and is fine answering every inbound request with that fixed
-//! error).
+//! has installed (or a fixed "no handler installed" error if none has),
+//! run on its own [`spawn_task`](animus_env::EnvExt::spawn_task)ed task
+//! (issue #731 — see below) and answered from there; a `Reply` gets
+//! stashed inline into this node's own [`Pending`] map for whichever
+//! earlier `relay()` call is still waiting on that `req_id`.
+//! [`SimRelayClient::new`] therefore spawns this loop unconditionally —
+//! [`serve`](SimRelayClient::serve) only ever *installs a handler* into it,
+//! never starts or stops it, so it may be called at any point after
+//! construction (including never, for a node that only ever calls out and
+//! is fine answering every inbound request with that fixed error).
+//!
+//! # One task per inbound request (issue #731)
+//!
+//! [`serve_loop`] dispatches each inbound [`RelayWire::Request`] onto its
+//! own task via `env.spawn_task` — still driven by the seeded simulator,
+//! so this stays fully reproducible — rather than awaiting the installed
+//! handler inline before looping back to `recv_stream` for the next
+//! message. This loop is the **only** reader of [`RELAY_STREAM`]
+//! (single-consumer, ADR 0026), and per the "one stream, two roles"
+//! section above it is also where the reply to any of this node's *own*
+//! outbound [`relay()`](RelayClient::relay) calls arrives — so a handler
+//! that itself needs a **nested** outbound `relay()` call (recovering an
+//! in-doubt ADR 0018 transaction from a *forwarded* read, which needs the
+//! serving node's own handler to relay to a third node before it can
+//! answer the first request, is the concrete case that surfaced this) used
+//! to deadlock the whole node: the nested call's own reply could only ever
+//! be delivered by the very `serve_loop` task currently blocked awaiting
+//! the outer handler, resolved only by the nested call's own timeout.
+//! Spawning keeps the receive loop free to keep draining the stream —
+//! several concurrent inbound requests, and any reply — while arbitrarily
+//! many handlers run in the background, mirroring `AnimusdRelayClient`'s
+//! own production shape (one `tokio::spawn`ed task per inbound TCP
+//! connection, ADR 0061 rung C3d's own account of why this module can't be
+//! literally the same wire). No new correlation bookkeeping was needed:
+//! [`RelayWire`]'s `req_id` already correlates a reply to its own caller's
+//! [`Pending`] slot regardless of how many requests are in flight or the
+//! order their replies arrive in (see that type's own doc) — only the
+//! *handling* of a `Request` becomes concurrent, never the *receiving* of
+//! messages off the stream, which stays strictly ordered by this loop's
+//! single `recv_stream` call. No bound on concurrent handlers, matching
+//! production's own unbounded per-connection spawn.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -321,20 +353,51 @@ async fn serve_loop<E: Env>(
         };
         match msg {
             RelayWire::Request { req_id, request } => {
+                // Dispatch onto its own task (`env.spawn_task`, still driven
+                // by the seeded simulator — reproducible, not a source of
+                // new nondeterminism) rather than awaiting the handler
+                // inline here, mirroring `AnimusdRelayClient`'s own
+                // production shape (one `tokio::spawn`ed task per inbound
+                // TCP connection). This loop is the ONLY reader of
+                // `RELAY_STREAM` (single-consumer, ADR 0026) and also
+                // carries the reply to any of this node's own outbound
+                // `relay()` calls (the module doc's "one stream, two
+                // roles") — a handler that itself issues a nested outbound
+                // `relay()` (ADR 0018 transaction recovery resolving a
+                // foreign intent via a forwarded read is the concrete case
+                // that surfaced this, issue #731) must never block this
+                // loop from receiving that nested call's own reply, or the
+                // two calls deadlock each other until the nested call's own
+                // timeout. Spawning keeps this loop free to keep draining
+                // the stream — including a burst of several inbound
+                // requests, and any reply — while arbitrarily many handlers
+                // run concurrently. Reply routing needs no new bookkeeping:
+                // `req_id` already correlates a reply to its own caller's
+                // `Pending` slot (see that type's own doc) regardless of
+                // how many requests are in flight or the order their
+                // replies arrive in, so this loop's single-consumer
+                // ordering guarantee (ADR 0026) is preserved for *received*
+                // messages — only the handling of a `Request`, never the
+                // receive itself, becomes concurrent.
+                //
                 // Clone the installed handler (if any) out from under the
-                // lock before awaiting it — never hold a `std::sync::Mutex`
-                // guard across an `.await` (this crate's own convention,
-                // mirrored throughout `animusd`).
+                // lock before awaiting it inside the spawned task — never
+                // hold a `std::sync::Mutex` guard across an `.await` (this
+                // crate's own convention, mirrored throughout `animusd`).
                 let installed = handler.lock().expect("sim relay handler poisoned").clone();
-                let response = match installed {
-                    Some(h) => h(*request).await,
-                    None => no_handler_installed(&env.node_id()),
-                };
-                let reply = encode(&RelayWire::Reply {
-                    req_id,
-                    response: Box::new(response),
+                let task_env = env.clone();
+                let from = envelope.from;
+                env.spawn_task(async move {
+                    let response = match installed {
+                        Some(h) => h(*request).await,
+                        None => no_handler_installed(&task_env.node_id()),
+                    };
+                    let reply = encode(&RelayWire::Reply {
+                        req_id,
+                        response: Box::new(response),
+                    });
+                    task_env.send_stream(from, RELAY_STREAM, reply).await;
                 });
-                env.send_stream(envelope.from, RELAY_STREAM, reply).await;
             }
             RelayWire::Reply { req_id, response } => {
                 stash_reply(&pending, req_id, *response);

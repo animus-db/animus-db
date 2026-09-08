@@ -5356,7 +5356,22 @@ ADR itself for the full design/rationale.
   address book if the malformed guess won the race. See
   `docs/engineering-lessons.md`'s matching entry for the full account,
   including why the `node_addrs` gate fix alone (without the wait) still
-  measurably collides. **Self-removal's
+  measurably collides. **The bound-wait alone is still not sufficient
+  (issue #712, fixed)**: it's a single checkpoint, so under real host
+  contention the apply task can simply not have caught up by the time its
+  own bound timeout expires, and the fallback branch's malformed proposal
+  is then *deterministically* doomed (Raft log order guarantees the
+  target's own real self-registration applies first, so the collision this
+  produces is not a timing fluke to wait out — it already happened). Fixed
+  by letting an operator-supplied (non-minted) id retry, at the *same* id,
+  up to `MAX_CLAIM_REFRESH_ATTEMPTS` (3) on a `Collision` — a `Collision`
+  verdict is itself backed by `register_node`'s own `metadata_fresh()`
+  read, so the very next loop iteration's re-derive is provably no longer
+  stale, and a race against the target's own now-applied self-registration
+  resolves as an idempotent no-op within one extra attempt; a genuine,
+  permanent conflict still fails loudly, just after a small bounded delay.
+  See `docs/engineering-lessons.md`'s amendment on this same entry for the
+  full before/after reproduction numbers. **Self-removal's
   leadership-transfer arm is one-shot, not auto-retried (issue #405)**:
   `admin_remove_control_member`'s `node == my_id` branch calls
   `RaftCore::transfer_leadership` exactly once — if the target's
@@ -7312,39 +7327,86 @@ coordinator stages both participants and never decides, with virtual time
 advanced between the last prepare and a real `SimCluster::crash` of the
 coordinator, then a `SimCluster::restart`.
 
-**A real finding, `#[ignore]`d as a characterization test — scenario (g),
-not a `dynamo.rs`/coordinator/idempotency bug.** Diagnosed, not merely
-observed: every poll attempt after the crash returns the identical
-`SimRelayClient::relay`-native timeout text, unchanging across the full
-budget and every seed tried, while a same-cluster-state plain
-(non-transactional) forwarded `GetItem` on a different key succeeds
-immediately. Root cause: `animus_node::sim_relay::SimRelayClient::
-serve_loop` (a different crate) is one task per node processing inbound
-relay requests strictly sequentially, `.await`-ing each request's own
-handler *inline* before looping back to receive the next message.
-Recovering an in-doubt transaction from a **forwarded** read
+**Two real findings, both now fixed — scenario (g) is green, not a
+`dynamo.rs`/coordinator/idempotency bug at either stage.** Diagnosed, and
+confirmed fixed, at both stages:
+
+**Stage 1 (issue #731, fixed)**: every poll attempt after the crash used
+to return the identical `SimRelayClient::relay`-native timeout text,
+unchanging across the full budget and every seed tried, while a
+same-cluster-state plain (non-transactional) forwarded `GetItem` on a
+different key succeeded immediately. Root cause: `animus_node::sim_relay::
+SimRelayClient::serve_loop` (a different crate) used to be one task per
+node processing inbound relay requests strictly sequentially, `.await`-ing
+each request's own handler *inline* before looping back to receive the
+next message. Recovering an in-doubt transaction from a **forwarded** read
 (`cp_get_local_resolving_inner`'s `FastRead::Foreign` arm →
 `confirm_or_push` → `txn_status`/`txn_recover`/`txn_verify`) can need the
 *serving* node's own handler to issue a further, nested outbound `relay()`
 call to a third node (whichever leads the anchor's own tablet) before it
-can answer the first request — but that nested call's own reply can only
+can answer the first request — but that nested call's own reply could only
 ever be delivered by the same `serve_loop` task currently blocked awaiting
 the handler: a genuine self-deadlock, resolved only by the nested call's
-own timeout. This is the first `SimCluster` scenario in this crate whose
+own timeout. This was the first `SimCluster` scenario in this crate whose
 own forwarded handler needs a second hop — reachable only via a crash
 forcing re-election away from whichever node originally led every touched
-tablet, combined with a **forwarded** (not locally-served) read. Production's
-real `AnimusdRelayClient` has no analogous bottleneck (each inbound TCP
-connection is its own `tokio::spawn`ed task) — this is a
-`SimRelayClient`-only, fixture-only limitation, never reachable in a real
-cluster. Fixing it (spawning each inbound request's handler onto its own
-task, production's own shape) is a change to `animus-node`, a shared
-testing primitive every `SimCluster`-based module in this crate depends
-on, and is out of this PR's own scope. Both
-`coordinator_never_finished_past_prepare_recovers_atomically` and its
-`_over_seeds` sibling stay `#[ignore]`d with the full diagnosis in their
-own doc comment; **issue to be filed** against `animus_node::sim_relay::
-SimRelayClient`.
+tablet, combined with a **forwarded** (not locally-served) read.
+Production's real `AnimusdRelayClient` has no analogous bottleneck (each
+inbound TCP connection is its own `tokio::spawn`ed task) — this was always
+a `SimRelayClient`-only, fixture-only limitation, never reachable in a
+real cluster.
+
+**Fixed**: `SimRelayClient::serve_loop` now dispatches each inbound
+`Request` onto its own `env.spawn_task`ed task rather than awaiting it
+inline (`crates/animus-node/src/sim_relay.rs`), mirroring production's own
+one-task-per-connection shape — see that module's own "One task per
+inbound request" doc section, `docs/adr/0061-testability-node-crate-
+simulator.md`'s "#731 closed" addendum, and `docs/engineering-lessons.md`'s
+matching entry for the full mechanism.
+
+**Confirmed directly**: with the fix applied, this scenario's own poll
+loop no longer returns the relay timeout text at any seed tried — it
+returns `Err("transaction covering this key is still pending; retry")`
+instead, unchanging across the full budget, which is
+`cp_get_local_resolving_inner`'s own `TxnDecisionStatus::Pending` arm,
+reached only once `confirm_or_push`/`txn_recover` have both run to
+completion (proof the nested relay hop now succeeds).
+
+**Stage 2 (issue #737, fixed 2026-09-07)**: `txn_recover`
+(`txn_coordinator.rs`) never used to get past its own grace check. Traced
+directly: whenever `self.cp_route(record_table, record_key)` resolves to
+anything other than `CpRoute::Local` — the ordinary case here, since this
+on-demand push runs on the *reading* node's own leader (the participant's
+tablet), not necessarily the *anchor*'s — `now_ms` used to be computed as
+`self.env.now().duration_since(self.env.now())`: the elapsed gap between
+two back-to-back clock reads, near-zero, not an absolute timestamp.
+Checked against `now_ms < view.created_ts.wall_ms + RECOVERY_GRACE`, a
+near-zero `now_ms` made that comparison true forever, so `txn_recover`
+declined (`Pending`) on every call, permanently — pre-existing, introduced
+by ADR 0061 rung C5 step 3b's `tokio::time::Instant::now().elapsed()` →
+`Env` conversion (see that rung's own bullet above: "reproducing the
+identical near-zero result rather than 'fixing' what reads like a
+pre-existing latent bug — an incidental bug gets its own PR"). It was
+unreachable before the #731 fix only because that deadlock intercepted
+every recovery attempt before `txn_recover` was ever actually called.
+
+**Fixed**: both `txn_recover` call sites now share one clock-read helper,
+`recovery_grace_now_ms` (`txn_coordinator.rs`) — an absolute `env.now()`
+read on every non-`Local` route (the pusher's own `env`), matching the
+`Local` arm's existing `leader.env().now()` read and the identical
+conversion `animus_cp_data::hlc::Hlc::mint` uses to produce `wall_ms` in
+the first place — instead of the elapsed-duration computation above. See
+that helper's own doc, its `recovery_grace_tests` unit coverage (a bare
+`SimEnv`, no `ClientCtx`/`CpGroup` needed), `docs/adr/0018-cross-tablet-
+transactions.md`'s matching 2026-09-07 amendment (the grace check's own
+clock, stated explicitly), `docs/adr/0061-testability-node-crate-
+simulator.md`'s "#737 closed" addendum, and `docs/engineering-lessons.md`'s
+matching entry for the general lesson. `coordinator_never_finished_past_
+prepare_recovers_atomically` and its `_over_seeds` sibling are renamed to
+`coordinator_crash_after_prepare_recovers_atomically_to_commit`(`_over_
+seeds`), un-ignored, and green at the pinned seed `0xC06F_0007` (=
+`3228499975`) and every `_over_seeds` seed — **both issue #731 and issue
+#737 are now closed**.
 
 **ProdEnv conversion: none.** `dynamo_txn.rs`'s every test builds on
 `create_table_pre_split` (a genuinely **split** table proving cross-tablet
@@ -7379,3 +7441,21 @@ participant_spans.rs` (37 tests, all green, unchanged since nothing in
 these six files was edited); `ANIMUS_SEED` replay of scenario (a) (green)
 and scenario (g) (reproduces the finding identically). `Cargo.lock`
 unchanged.
+
+**Issues #731 and #737 both fixed, 2026-09-07** (see this section's own
+scenario-(g) paragraph above for both mechanisms): `SimRelayClient::
+serve_loop` now dispatches each inbound forwarded request onto its own
+task, closing the deadlock — confirmed directly, since scenario (g)'s own
+poll loop no longer returns the relay-timeout text at any seed tried.
+`ClientCtx::txn_recover`'s non-local grace-check now shares one clock-read
+helper (`recovery_grace_now_ms`) with its `Local` branch, reading an
+absolute `env.now()` on every route instead of the elapsed-duration
+computation that used to decline recovery forever — `coordinator_crash_
+after_prepare_recovers_atomically_to_commit` (renamed from `coordinator_
+never_finished_past_prepare_recovers_atomically`) and its `_over_seeds`
+sibling are un-ignored and green at the pinned seed `0xC06F_0007` (=
+`3228499975`) and every `_over_seeds` seed, each replayed twice for
+determinism. Both issues are closed. `cargo test -p animusd --lib`: 365
+passed / 5 ignored before this fix → 367 passed / 3 ignored after (the two
+tests move from ignored to passing; the three remaining `#[ignore]`d tests
+are unrelated flake-issue characterizations, unmodified by this fix).
