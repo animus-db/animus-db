@@ -6,6 +6,31 @@ name: image
 # credentials are available to a `pull_request` event anyway); pushes to
 # `main` and version tags additionally push to GHCR so `main` and tagged
 # releases always have a corresponding image for both.
+#
+# The path filter below is deliberately narrower than "anything under
+# `crates/`": the Dockerfile's builder stage runs `cargo build --release
+# -p animusd -p animus-cli -p animus-operator`, so a change that cannot
+# reach those three release binaries cannot change the images either, and
+# building two images for it (two full release compiles on a shared
+# runner) only lengthens the CI queue every other PR waits in. Excluded on
+# that basis, each verifiable from the workspace itself:
+#   - `crates/**/tests/**` and `crates/**/benches/**` — integration-test and
+#     `[[bench]]` targets, never part of a `cargo build -p` of a bin/lib.
+#   - `crates/animus-sim/**` and `crates/animus-test/**` — the deterministic
+#     simulator and the corpus/model crates; both are `[dev-dependencies]`
+#     of every crate that uses them (grep the workspace `Cargo.toml`s), so
+#     they are absent from the release dependency graph.
+#   - `crates/animusd/src/sim_cluster*.rs` — `animusd`'s `SimCluster`
+#     fixture and its scenario modules, every one declared `#[cfg(test)]`
+#     in `lib.rs` (ADR 0061), so `--release` never compiles them.
+#   - `crates/*/CLAUDE.md` — per-crate agent guides, not compiled.
+# A compile break confined to one of those paths is still caught, by the
+# `gates` job's own `cargo build --workspace --all-targets`; this workflow
+# only ever proved the *images* build, and none of these paths reach them.
+# A `#[cfg(test)]` module living anywhere else under `src/` still triggers
+# a build — the filter is by path, not by cfg, so it stays conservative.
+# Both event blocks must list identical patterns (GitHub applies them per
+# event and negations only take effect against an earlier positive match).
 on:
   push:
     branches: [main]
@@ -16,6 +41,12 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "crates/**"
+      - "!crates/**/tests/**"
+      - "!crates/**/benches/**"
+      - "!crates/animus-sim/**"
+      - "!crates/animus-test/**"
+      - "!crates/animusd/src/sim_cluster*.rs"
+      - "!crates/*/CLAUDE.md"
       - ".github/workflows/image.yml"
   pull_request:
     paths:
@@ -24,6 +55,12 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "crates/**"
+      - "!crates/**/tests/**"
+      - "!crates/**/benches/**"
+      - "!crates/animus-sim/**"
+      - "!crates/animus-test/**"
+      - "!crates/animusd/src/sim_cluster*.rs"
+      - "!crates/*/CLAUDE.md"
       - ".github/workflows/image.yml"
 
 concurrency:
