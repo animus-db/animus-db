@@ -736,6 +736,36 @@ impl SimClusterHandle {
         .await
     }
 
+    /// Write `value` at the **literal, un-encoded** `key` in `table` —
+    /// [`SimClusterHandle::put`]'s raw sibling, mirroring `ClientRequest::
+    /// Put`'s own wire contract exactly (`lib.rs`'s own doc: "a raw key has
+    /// no pk/sk decomposition") rather than [`item_key`]'s DynamoDB
+    /// composite-key (hash-token-prefixed) encoding `put` uses. Needed
+    /// wherever a scenario's own split-key argument must be a literal,
+    /// human-readable byte string — [`ClientCtx::trigger_split`]'s
+    /// `split_key: Vec<u8>` is compared directly against each stored key's
+    /// own raw bytes, with no decoding step, and `POST /admin/tablet/split`'s
+    /// own request body carries it as a plain JSON string (so it must be
+    /// valid UTF-8 too) — `put`'s own `item_key`-encoded keys (a Murmur3
+    /// hash token prefix, ADR 0022/0023) are neither ordered by `pk`'s own
+    /// literal bytes nor generally valid UTF-8, making them impractical to
+    /// pick a meaningful split boundary from inside a test.
+    pub(crate) async fn put_raw(
+        &self,
+        node: u64,
+        table: &str,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<(), String> {
+        let ctx = self.ctx(node);
+        ctx.cp_kind_write_raw(
+            table,
+            vec![(KIND_BASE, key.to_vec(), Some(value.to_vec()))],
+            Vec::new(),
+        )
+        .await
+    }
+
     /// Delete the item at `(pk, sk)` in `table`, issued from `node`'s own
     /// `ClientCtx` — [`SimClusterHandle::put`]'s sibling.
     pub(crate) async fn delete(
@@ -1262,9 +1292,46 @@ impl SimCluster {
         let route: BTreeMap<NodeId, String> =
             ids.iter().map(|id| (id.clone(), id.to_string())).collect();
 
+        // One private `MetricsHandle::recording()` sink per node (ADR 0061
+        // rung H, C-08 PR 5 fix, a real latent bug this rung's own gate
+        // surfaced — see `ClientCtx::data`'s own construction below, in
+        // this function's tail, for the full account): `RaftNode::start`'s
+        // own default (`env.metrics()`) resolves through `Env::metrics`'s
+        // trait-default method, which unconditionally returns
+        // `MetricsHandle::noop()` — ONE process-wide `static` shared sink
+        // — for any `Env` that doesn't override it, and `SimEnv` doesn't.
+        // Every node's control `RaftNode` would then share the identical
+        // mutable `is_leader` gauge (and every counter) with every OTHER
+        // node's control raft **and every other `SimCluster` instance in
+        // the same test binary process**. `start_with_metrics` opts out of
+        // that default explicitly. This node's own `DataRole::
+        // raftkv_metrics` reuses the SAME handle (built once, cloned
+        // below), matching production's own "a combined node's control
+        // Raft and CP group record into the same sink" contract
+        // (`ClientCtx::metrics_json`'s own doc) — not two separate private
+        // sinks, which would silently double-count every shared counter
+        // relative to what `is_same_sink`'s own skip-if-identical guard
+        // assumes. (A hosted `RaftKvNode`'s own INTERNAL metrics — as
+        // opposed to this `DataRole::raftkv_metrics` bookkeeping handle,
+        // a separate `ClientCtx`-level field no `RaftKvNode` constructor
+        // ever receives — still default via the identical `env.metrics()`
+        // path inside `Reconciler::host` (`animus-cp-data/src/host.rs`);
+        // harmless today only because nothing under this fixture reads
+        // that internal handle at all, `/admin/metrics` included — not
+        // fixed here, out of this rung's own scope.)
+        let node_metrics: Vec<MetricsHandle> =
+            ids.iter().map(|_| MetricsHandle::recording()).collect();
         let controls: Vec<RaftNode<SimEnv>> = ids
             .iter()
-            .map(|id| RaftNode::start(sim.env(id.clone()), ids.clone(), MemoryEngine::new()))
+            .zip(node_metrics.iter())
+            .map(|(id, metrics)| {
+                RaftNode::start_with_metrics(
+                    sim.env(id.clone()),
+                    ids.clone(),
+                    metrics.clone(),
+                    MemoryEngine::new(),
+                )
+            })
             .collect();
 
         // ADR 0061 rung D3 PR 2a — real finding, not part of the original
@@ -1367,8 +1434,15 @@ impl SimCluster {
                 // constructing a real one costs nothing and needs no
                 // `ProdEnv`. `base_id` is this node's own id, `DataRole`'s
                 // real-cluster meaning (ADR 0023's replica-set identity).
+                // `raftkv_metrics` reuses `node_metrics[i]` — the SAME
+                // handle this node's own `controls[i]` was built with above
+                // — matching production's own "a combined node's control
+                // Raft and CP group record into the same sink" contract
+                // (`ClientCtx::metrics_json`'s own doc, and `node_metrics`'s
+                // own doc above for the real bug this whole node-local
+                // sink discipline fixes).
                 data: Some(DataRole {
-                    raftkv_metrics: MetricsHandle::noop(),
+                    raftkv_metrics: node_metrics[i].clone(),
                     base_id: id.clone(),
                     stream_seal_knobs: StreamSealKnobs::default(),
                     change_rates: ChangeRateTracker::default(),
@@ -2251,6 +2325,27 @@ impl SimCluster {
         .unwrap_or_else(|| {
             Err(format!(
                 "put on node {node} did not complete within {OP_BUDGET:?}"
+            ))
+        })
+    }
+
+    /// [`SimClusterHandle::put_raw`], driven from a test's own `&mut self`
+    /// call exactly like [`SimCluster::put`] above.
+    pub(crate) fn put_raw(
+        &mut self,
+        node: u64,
+        table: &str,
+        key: Vec<u8>,
+        value: Vec<u8>,
+    ) -> Result<(), String> {
+        let handle = self.shared.clone();
+        let table = table.to_owned();
+        self.spawn_and_capture(node, async move {
+            handle.put_raw(node, &table, &key, &value).await
+        })
+        .unwrap_or_else(|| {
+            Err(format!(
+                "put_raw on node {node} did not complete within {OP_BUDGET:?}"
             ))
         })
     }
@@ -3226,8 +3321,14 @@ impl SimCluster {
             control,
             edge: edge.clone(),
             env: env.clone(),
+            // `MetricsHandle::recording()`, not `::noop()` — see the
+            // identical fix's own doc comment in `SimCluster::new` above
+            // (ADR 0061 rung H, C-08 PR 5): `noop()` is one process-wide
+            // shared sink, which corrupts the `is_leader` gauge across
+            // every node/tablet/`SimCluster` instance in the same test
+            // binary process the moment any `RaftKvNode` transitions role.
             data: Some(DataRole {
-                raftkv_metrics: MetricsHandle::noop(),
+                raftkv_metrics: MetricsHandle::recording(),
                 base_id: id.clone(),
                 stream_seal_knobs: StreamSealKnobs::default(),
                 change_rates: ChangeRateTracker::default(),

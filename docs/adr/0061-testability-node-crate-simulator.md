@@ -846,7 +846,7 @@ supply one, and isn't trying to.
 | D4 | Deterministic coverage for the behaviours that have none today: the auto-split byte trigger (`lib.rs:14397`), the dropped-table GC reclaim loop, join/growth sequencing, and the backup-janitor async loop (its replicated state machine is already sim-tested in `animus-control/tests/backup_catalog.rs`; the loop driving it is not) |
 | F | Post-C-04: Transact/PartiQL `SimCluster` dispatch (C-06) — the two named D2 residuals (Transact, PartiQL), never claimed by any D3/D4 rung. **Closed 2026-09-08 (PRs #728, #729, #732, #748, #750, #756, plus PR 7)** — both residuals now reachable through `dispatch_item_op`, the real-socket `dynamo_partiql.rs`/`dynamo_execute_transaction.rs` kept in full as the `ProdEnv` equivalence proof, `cargo test -p animusd --lib` 353 → 438 passed across PRs 3-6. See the 2026-09-07 "Rung F" amendment and the "Rung F closed" amendment below, and `docs/roadmap.md`'s C-06 entry |
 | G | Post-C-06: Streams `SimCluster` dispatch (C-07) — the largest remaining unowned residual group named by Rung F's own close-out (`dynamo_streams.rs`/`stream_janitor.rs`/`stream_backfill_seed_filter.rs`, 3 files/28 tests, plus `console_stream.rs`'s own 4 tests filed under the console/dashboard group). **Closed 2026-09-08 (PRs #758, #759, #760, #761, #762, plus PR 6)** — `dynamo_streams.rs` (15 tests: 12 converted, 3 kept `ProdEnv`) and `stream_janitor.rs` (11 tests: 9 converted, 2 kept `ProdEnv`) both closed; the read API, stream enable/disable, on-demand sealing, and the segment janitor's two-phase retention sweep are all `SimCluster`-reachable. `stream_backfill_seed_filter.rs` (2 tests) stays `ProdEnv`, filed under the separate "index DDL beyond plain `CreateTable`" residual, per the rung's own plan. `console_stream.rs` (4 tests) stays filed under admin/console/dashboard HTTP. `tests/streams_e2e.rs` stayed out of scope throughout, frozen behind #298/#745. `cargo test -p animusd --lib` 315 passed / 2 ignored at the sim tier after PR 5, no leak trajectory. See the 2026-09-08 "Rung G" amendments below (including the "Rung G closed" amendment) and `docs/roadmap.md`'s C-07 entry |
-| H | Post-C-07: admin/console/dashboard HTTP `SimCluster` dispatch (C-08) — the group Rung G's own close-out named as what remains unowned, 10 files/67 tests (`admin_endpoint.rs` 23, `dashboard_endpoint.rs` 16, `console_endpoint.rs` 3, `console_create_table.rs` 4, `console_items.rs` 4, `console_stream.rs` 4, `console_table_config.rs` 9, `console_tables.rs` 1, `metrics_endpoint.rs` 1, `system_table.rs` 2). **Open, PR 1 (docs) landed 2026-09-08; PR 2 (groundwork) landed 2026-09-08, corrected the same day in review (a blanket `impl Trait for ClientCtx` mistake, fixed with a `GenericAdminHost`/`GenericConsoleBackend` newtype pair — see that amendment's own account); PR 3 (console reachable + first siblings) landed 2026-09-08 — `console_tables.rs`/`console_create_table.rs`/`console_items.rs` (9 tests) converted whole into a new `sim_cluster_console.rs` (10 scenarios, 20 tests with `_over_seeds`), all three files deleted; `console_endpoint.rs`'s own 3 tests stay `ProdEnv` (real HTTP framing/static assets, and a genuine role split), with a tenth new scenario covering its JSON-routing/error-mapping tail; PR 4 (`console_stream.rs`/`console_table_config.rs` siblings) landed 2026-09-08 — 3 of `console_stream.rs`'s 4 tests and 5 of `console_table_config.rs`'s 9 converted into two new modules, `sim_cluster_console_stream.rs`/`sim_cluster_console_table_config.rs` (16 tests with `_over_seeds`), reusing PR 3's own shared helpers (widened to `pub(crate)`); kept `ProdEnv`: `console_stream.rs`'s TTL-reaper-identity test (no reaper-loop primitive under `SimEnv`, deliberately not built this PR), `console_table_config.rs`'s three GSI-DDL tests (blocker (d)) and its PITR-present test (`UpdateContinuousBackups` has no generic dispatch arm).** See the 2026-09-08 "Rung H" amendments below (including "Rung H, PR 2 landed", "Rung H, PR 3 landed", and "Rung H, PR 4 landed") and `docs/roadmap.md`'s C-08 entry |
+| H | Post-C-07: admin/console/dashboard HTTP `SimCluster` dispatch (C-08) — the group Rung G's own close-out named as what remains unowned, 10 files/67 tests (`admin_endpoint.rs` 23, `dashboard_endpoint.rs` 16, `console_endpoint.rs` 3, `console_create_table.rs` 4, `console_items.rs` 4, `console_stream.rs` 4, `console_table_config.rs` 9, `console_tables.rs` 1, `metrics_endpoint.rs` 1, `system_table.rs` 2). **Open, PR 1 (docs) landed 2026-09-08; PR 2 (groundwork) landed 2026-09-08, corrected the same day in review (a blanket `impl Trait for ClientCtx` mistake, fixed with a `GenericAdminHost`/`GenericConsoleBackend` newtype pair — see that amendment's own account); PR 3 (console reachable + first siblings) landed 2026-09-08 — `console_tables.rs`/`console_create_table.rs`/`console_items.rs` (9 tests) converted whole into a new `sim_cluster_console.rs` (10 scenarios, 20 tests with `_over_seeds`), all three files deleted; `console_endpoint.rs`'s own 3 tests stay `ProdEnv` (real HTTP framing/static assets, and a genuine role split), with a tenth new scenario covering its JSON-routing/error-mapping tail; PR 4 (`console_stream.rs`/`console_table_config.rs` siblings) landed 2026-09-08 — 3 of `console_stream.rs`'s 4 tests and 5 of `console_table_config.rs`'s 9 converted into two new modules, `sim_cluster_console_stream.rs`/`sim_cluster_console_table_config.rs` (16 tests with `_over_seeds`), reusing PR 3's own shared helpers (widened to `pub(crate)`); kept `ProdEnv`: `console_stream.rs`'s TTL-reaper-identity test (no reaper-loop primitive under `SimEnv`, deliberately not built this PR), `console_table_config.rs`'s three GSI-DDL tests (blocker (d)) and its PITR-present test (`UpdateContinuousBackups` has no generic dispatch arm); PR 5 (admin dispatch pure observers) landed 2026-09-08 — 5 of `admin_endpoint.rs`'s 23 tests plus the "tables" half of a sixth converted into a new `sim_cluster_admin.rs` (7 scenarios, 14 tests with `_over_seeds`); `tests/system_table.rs` (2 tests) and `tests/metrics_endpoint.rs` (1 test) both stay `ProdEnv` whole — genuine `SimCluster` capability gaps (`ctx.control_storage` always `None`; the real-text `/metrics` listener has no `SimCluster` analog) — and this PR's own required gate found and fixed a real, previously-latent `SimCluster` fixture bug: every node's control `RaftNode` shared one process-wide static `MetricsHandle::noop()` sink, corrupting `/admin/metrics`'s `is_leader` gauge cluster-wide (harmless for counters, which merely inflated) — fixed via `RaftNode::start_with_metrics` with a private per-node sink.** See the 2026-09-08 "Rung H" amendments below (including "Rung H, PR 2 landed", "Rung H, PR 3 landed", "Rung H, PR 4 landed", and "Rung H, PR 5 landed") and `docs/roadmap.md`'s C-08 entry |
 
 Note that the copy-based split driver (ADR 0050) is deliberately **not** on
 this list: ADR 0058 rung 4's remaining layer deletes it. Writing a corpus
@@ -5889,3 +5889,167 @@ console_stream.rs` (-253 net, three tests removed plus a module-doc note
 and one reason comment), `tests/console_table_config.rs` (-297 net, five
 tests removed plus a module-doc note and four reason comments), plus the
 two new sibling modules themselves (398 lines each).
+
+## 2026-09-08 amendment — Rung H, PR 5 landed (admin dispatch pure observers)
+
+Closes PR 5's own scope: the admin HTTP-JSON interface's **observer**
+routes (every mutation-free `GET`) plus a JSON-route analog of the
+metrics suite. Converts 5 of `tests/admin_endpoint.rs`'s 23 tests
+(`admin_credentials_view_never_serves_a_secret`, `admin_raftkv_key_
+count_is_scoped_per_tablet_after_split`, `admin_backups_view_reflects_
+the_catalog`, `admin_backup_store_reports_reclaim_progress_and_leader_
+state`, `admin_gc_reports_segment_janitor_progress_and_leader_state`)
+plus the "tables" half of `admin_ttl_reports_reaper_progress_and_ttl_
+tables` (a new scenario; that test itself stays whole) into a new
+`crates/animusd/src/sim_cluster_admin.rs` (7 scenarios × pinned-seed +
+5-seed `_over_seeds` = 14 tests). **`tests/system_table.rs`'s two tests
+and `tests/metrics_endpoint.rs`'s one test stay `ProdEnv` whole** — see
+below. **No `admin.rs`/`console.rs`/`dynamo.rs` dispatch change was
+needed** — PR 2 already built `SimCluster::admin` (through
+`GenericAdminHost`) and every generic handler this module's scenarios
+reach.
+
+**Three genuinely new `sim_cluster.rs` fixture changes were needed**,
+surfaced by this rung's own required gate, not part of the original
+design pass:
+
+1. `SimCluster::put_raw`/`SimClusterHandle::put_raw` (new, test-only) —
+   a literal-key write, unlike `SimCluster::put`'s `item_key`-encoded
+   (DynamoDB composite-key, hash-token-prefixed) keys, which made
+   choosing a literal, human-readable `POST /admin/tablet/split` split
+   boundary impractical from a test the way the real-socket original's
+   raw `ClientRequest::Put` keys made trivial.
+
+2. **A real, previously-latent `SimCluster` fixture bug, found and
+   fixed.** `SimCluster::new`/`SimCluster::grow` built every control
+   `RaftNode<SimEnv>` via the plain `RaftNode::start(env, ids, engine)`
+   constructor, which defaults its own metrics sink to `env.metrics()`.
+   `SimEnv` does not override `Env::metrics`'s trait-default method,
+   which unconditionally returns `MetricsHandle::noop()` — **one
+   process-wide `static` shared sink** (already documented,
+   `docs/engineering-lessons.md`'s "Observe a multi-group-per-node
+   metric under `SimEnv`..." entry, ADR 0044 phase 2 C-02 PR 1). Every
+   node's control `RaftNode`, on every `SimCluster` instance in the same
+   test binary process, therefore shared the identical mutable
+   `is_leader` gauge: the first control raft anywhere to become leader
+   (during `SimCluster::new`'s own bootstrap) stamped `is_leader: 1`
+   onto `GET /admin/metrics` for every node, permanently, regardless of
+   that node's real role. A summed *counter* under the same sharing is
+   merely inflated (harmless unless a test asserts an exact value, and
+   none did) — only the gauge was corrupted outright, which is why this
+   went unnoticed through five rungs' worth of `SimCluster` corpora:
+   none of them read `/admin/metrics`'s `is_leader` field specifically
+   (`ctx.control.is_leader()` — a direct `RaftCore` role check, used
+   everywhere else this fixture reports leadership — is untouched by any
+   of this). Caught only because this PR's own metrics scenario is the
+   first `SimCluster` test ever to read it: every node in a fresh,
+   otherwise-healthy 3-node cluster reported `is_leader: 1`, at every
+   seed, reproducibly. **Fixed**: both node-construction sites now build
+   one private `MetricsHandle::recording()` per node and call
+   `RaftNode::start_with_metrics` (the API `start_with_metrics` was
+   already built for, just never reached from this construction site);
+   `DataRole::raftkv_metrics` reuses the SAME per-node handle, matching
+   production's own "a combined node's control Raft and CP group record
+   into the same sink" contract. See `docs/engineering-lessons.md`'s
+   matching new entry for the general lesson.
+
+3. `admin.rs::system_table` reads `ctx.control_storage` (the per-node
+   system-keyspace mirror engine ADR 0038's `DRIVER_APPLIED` apply task
+   durably writes) — `SimCluster`'s own node construction always sets it
+   `None`, so `GET /admin/system-table` unconditionally answers
+   `{"available": false}` under this fixture regardless of what's
+   seeded. **Not fixed** — building that apply-task mirror is a new
+   background-loop driver, explicitly out of this PR's scope; both
+   `tests/system_table.rs` tests stay `ProdEnv` whole, with a reason
+   comment.
+
+**Two scenario-authoring bugs found and fixed along the way, neither a
+product bug**: a first draft of the backup-store/gc scenarios issued a
+WIRE `CreateBackup` and expected it to reach `AVAILABLE` — it never can
+under this fixture, since `dynamo.rs::create_backup`'s own commit-wait
+depends on the real per-tablet `backup_capture` driver actually
+completing each tablet's capture, and no `SimCluster` primitive spawns
+it (unlike the always-on heartbeat/reconciler/backup-janitor/segment-
+janitor loops). Redesigned around direct `MetaCommand` proposals
+(`BeginBackup`/`RecordBackupTabletComplete`/`CompleteBackup`/
+`MarkBackupDeleted`) plus `SimCluster::seed_backup_object`, mirroring
+`sim_cluster_backup_janitor.rs`'s own `complete_a_backup`/`seed_backup_
+object` idiom exactly, since that module hit and solved the identical
+gap first. Separately, the GC scenario's first draft called
+`SimCluster::drive_stream_seal` on the CONTROL-plane leader — that
+method only acts on tablets its own argument node leads at the
+DATA-plane level, a generally different node, so the call silently
+no-op'd and the test's own "a sealed row exists before the drop"
+premise assertion failed; fixed to resolve the table's own data-plane
+leader (`leader_of_table`) instead.
+
+**Test-by-test disposition**:
+
+| Real-socket test (file) | Disposition |
+|---|---|
+| `admin_credentials_view_never_serves_a_secret` (`admin_endpoint.rs`) | Converted → `sim_cluster_admin.rs::credentials_view_never_serves_a_secret` |
+| `admin_raftkv_key_count_is_scoped_per_tablet_after_split` (`admin_endpoint.rs`) | Converted → `sim_cluster_admin.rs::raftkv_key_count_is_scoped_per_tablet_after_split` (via the fixture's own split + `SimCluster::put_raw`) |
+| `admin_backups_view_reflects_the_catalog` (`admin_endpoint.rs`) | Converted → `sim_cluster_admin.rs::backups_view_reflects_the_catalog` (direct `MetaCommand`s via `SimCluster::propose_meta`, mirroring the original's own harness-level idiom) |
+| `admin_backup_store_reports_reclaim_progress_and_leader_state` (`admin_endpoint.rs`) | Converted → `sim_cluster_admin.rs::backup_store_reports_reclaim_progress_and_leader_state` — redesigned around direct `MetaCommand`s + `seed_backup_object` (finding above); asserts `leader`/`janitor`/`objects.count` only, never `store` (`AdminInfo.backup_store` is always `None` under this fixture) |
+| `admin_gc_reports_segment_janitor_progress_and_leader_state` (`admin_endpoint.rs`) | Converted → `sim_cluster_admin.rs::gc_reports_segment_janitor_progress_and_leader_state` — fixed to seal on the table's own data-plane leader (finding above) |
+| `admin_ttl_reports_reaper_progress_and_ttl_tables` (`admin_endpoint.rs`) | **KEPT** `ProdEnv` whole — no primitive drives `ttl_reaper_loop` under `SimEnv`; its "tables" half alone gets a new sibling, `sim_cluster_admin.rs::ttl_tables_lists_a_ttl_enabled_table` |
+| `admin_config_reports_auth_state_and_never_serves_the_secret` (`admin_endpoint.rs`) | **KEPT** — no `SimCluster` constructor knob configures `dynamo_auth` |
+| `admin_raftkv_default_does_not_materialize_the_dataset` (`admin_endpoint.rs`) | **KEPT** — `SimCluster`'s engine is `MemoryEngine`, not `LsmEngine`: no SSTable/block-read counter exists under `SimEnv` |
+| `admin_segment_store_reports_shard_placement_and_local_objects` (`admin_endpoint.rs`) | **KEPT** — `SimCluster`'s shared segment store is `S3`-kind, never `Cluster`-kind; no `ClusterSegmentStore` per-node replica-placement primitive exists under `SimEnv` |
+| `admin_segment_store_reports_null_shards_for_the_fs_kind` (`admin_endpoint.rs`) | **KEPT** — identical store-kind gap; genuinely `fs`-kind-specific |
+| `admin_live_is_200_while_a_genuinely_leaderless_admin_health_is_503` (`admin_endpoint.rs`) | **KEPT** — `SimCluster::new` unconditionally settles the control group's first election before returning; no constructor for a node that never completes bootstrap |
+| `system_table_lists_every_seeded_entity_kind`, `system_table_pagination_is_gapless_and_duplicate_free` (`system_table.rs`) | **KEPT `ProdEnv` whole** — `ctx.control_storage` is always `None` under `SimCluster` (finding 3 above) |
+| `metrics_endpoint_surfaces_control_plane_counters` (`metrics_endpoint.rs`) | **KEPT `ProdEnv` whole** — its real subject is the raw-text `/metrics` listener on the dynamo port, not the JSON `AdminHost` route table; a JSON-route analog exists instead: `sim_cluster_admin.rs::admin_metrics_surfaces_control_plane_counters` (the scenario that found finding 2 above) |
+
+12 tests untouched (PR 6's own mutating-action territory, not even a
+reason comment, per this rung's own scope): `admin_interface_surfaces_
+state_and_actions`, `admin_data_write_dynamo`, `admin_table_management_
+create_and_drop`, `seed_load_does_not_storm_cp_elections`, `admin_seed_
+writes_synthetic_keys`, `admin_split_in_place_children_inherit_the_
+parents_own_replicas`, `admin_system_table_split_lineage_after_a_real_
+split`, `admin_credentials_put_rotate_revoke_round_trip`, `admin_
+credentials_put_on_a_follower_is_relayed_to_the_leader`, `admin_control_
+transfer_moves_leadership_to_the_named_node`, `admin_control_transfer_
+on_a_follower_is_refused`, `admin_storage_compact_action`.
+
+**Before/after counts**: `admin_endpoint.rs`: 23 → 18 (5 removed; one
+now-dead bring-up helper, `bring_up_with_fs_backup_store`, whose one
+caller was the removed backup-store test, deleted alongside it).
+`system_table.rs`: 2 → 2 (kept whole). `metrics_endpoint.rs`: 1 → 1
+(kept whole). `sim_cluster_admin.rs`: 14 new tests (7 scenarios).
+
+**No product bug found in the widened dispatch code itself** (`admin.rs`/
+`dynamo.rs`) — see above for the one real, previously-latent `SimCluster`
+fixture bug found and fixed, and the two scenario-authoring issues found
+and fixed. Every scenario passed at its pinned seed and every
+`_over_seeds` seed once these were fixed.
+
+**Gates, in the required order**: `cargo test -p animusd --test admin_
+endpoint --test system_table --test metrics_endpoint` on the untrimmed
+files (26 passed, 15.5s); `cargo test -p animusd --lib sim_cluster_
+admin -- --test-threads=2` (14 passed, 0 failed — after fixing the two
+scenario-authoring bugs and the fixture bug above); trim, then `cargo
+test -p animusd --test admin_endpoint --test system_table --test
+metrics_endpoint` again (21 passed — 18 + 2 + 1, clean build with no
+dead-code warnings after deleting `bring_up_with_fs_backup_store`);
+`cargo test -p animusd --lib sim_cluster -- --test-threads=2` (367
+passed, 0 failed, 2 ignored, 1005.43s — 353 baseline + this PR's 14 new
+tests; anchored-sampler RSS: first ~62 MB, peak ~891 MB, last ~167 MB,
+consistent with every prior rung's own no-leak trajectory, well under
+the 6 GB/30 min budget); `cargo fmt --all --check` (one pass needed —
+`sim_cluster_admin.rs`'s own long call sites, applied via `cargo fmt
+--all`, then clean); `cargo clippy -p animusd --all-targets
+--all-features -- -D warnings` (clean). `Cargo.lock` unchanged. `git
+diff --stat` against the PR 4 baseline: `lib.rs` (+27, the new module's
+doc-comment registration), `sim_cluster.rs` (+107/-6, `put_raw` plus the
+`MetricsHandle` fix), `admin_endpoint.rs` (-769 net, five tests removed
+plus six reason comments plus one dead helper deleted), `metrics_
+endpoint.rs`/`system_table.rs` (+14 each, a reason-comment doc block
+each), `CLAUDE.md` (+16, two stale-reference corrections),
+`engineering-lessons.md` (+58, the new lesson entry), plus the new
+`sim_cluster_admin.rs` itself (937 lines).
+
+See `docs/roadmap.md`'s C-08 entry for the full record; `docs/
+engineering-lessons.md`'s new entry for the general lesson on shared
+`MetricsHandle::noop()` sinks corrupting a gauge while leaving a counter
+merely inflated.

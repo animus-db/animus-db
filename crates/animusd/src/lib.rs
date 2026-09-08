@@ -18938,6 +18938,33 @@ mod sim_cluster_console_stream;
 #[cfg(test)]
 mod sim_cluster_console_table_config;
 
+/// ADR 0061 rung H (post-C-07): admin/console/dashboard `SimCluster`
+/// dispatch (C-08), PR 5 — the admin HTTP-JSON interface's own
+/// **observer** routes (every mutation-free `GET`), plus a JSON-route
+/// analog of `tests/metrics_endpoint.rs`'s own test (which stays `ProdEnv`
+/// whole — its real subject is the raw-text `/metrics` listener on the
+/// dynamo port, not reachable through the `AdminHost` route table this
+/// rung's `SimCluster::admin` primitive dispatches into). Converts the
+/// matching read-only `admin_*` tests from `tests/admin_endpoint.rs`
+/// (credentials view, the split-scoped raftkv key count, the backups
+/// catalog, the backup-store/gc reclaim-progress-and-leader-state pair,
+/// and the "tables" half of the TTL route). **`tests/system_table.rs`'s
+/// two tests stay `ProdEnv` whole** — a genuine `SimCluster` capability
+/// gap this PR's own investigation surfaced: `ctx.control_storage` (the
+/// per-node system-keyspace mirror engine ADR 0038's `DRIVER_APPLIED`
+/// apply task durably writes) is always `None` under this fixture, so
+/// `GET /admin/system-table` unconditionally answers `{"available":
+/// false}` regardless of what's seeded — building that apply-task mirror
+/// is a new background-loop driver, out of this PR's scope. See this
+/// module's own doc for the full scenario list, what stays `ProdEnv` in
+/// `admin_endpoint.rs` and why (segment-store shard placement/fs-kind,
+/// raftkv's default-vs-exact SSTable cost differential, auth config, the
+/// genuinely-leaderless-node case, and the TTL reaper's own progress
+/// half), and `crates/animusd/CLAUDE.md`'s matching appendix for the
+/// per-test conversion mapping and gate numbers.
+#[cfg(test)]
+mod sim_cluster_admin;
+
 /// Regression for the issue #298 residual confirmed live under the
 /// un-pinned `SplitMode::InPlace` proof soak (ADR 0018's matching amendment,
 /// `docs/engineering-lessons.md`'s matching entry): a stage blocked by

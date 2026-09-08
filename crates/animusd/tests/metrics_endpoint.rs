@@ -9,6 +9,20 @@
 //! (`name value` lines) and that the expected control-plane counters appear with
 //! the values a real election implies. Like the other `animusd` tests this uses
 //! real time and sockets, so it polls with generous timeouts.
+//!
+//! **KEPT `ProdEnv` whole (ADR 0061 rung H, C-08 PR 5)**: this test's real
+//! subject is the raw-text `GET /metrics` listener on the dynamo port —
+//! real HTTP/1.1 framing (headers, `Content-Type: text/plain`) `SimCluster`
+//! has no listener for at all, entirely separate from the JSON `AdminHost`
+//! route table `SimCluster::admin` dispatches into. The identical
+//! underlying claim (a real control-plane election moves the same named
+//! counters, a follower reports `is_leader: 0`) has its own analog through
+//! the JSON `GET /admin/metrics` route instead:
+//! `sim_cluster_admin.rs::admin_metrics_surfaces_control_plane_counters`
+//! — which is also where this rung's own gate found and fixed a real,
+//! previously-latent `SimCluster` fixture bug (a shared, process-wide
+//! no-op metrics sink corrupting the `is_leader` gauge); see that module's
+//! own doc for the full account.
 
 use std::time::Duration;
 
