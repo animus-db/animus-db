@@ -646,18 +646,32 @@ the still-true paragraph after the table.
   running in order, an `ExecuteTransaction` commit across two tables, and
   a condition-failed cancel — each issued from a non-leader node. No
   product bug found. See ADR 0061's matching 2026-09-08 "Rung F, PR 5"
-  amendment for the full account. PRs 6-7 (PartiQL sim tests, docs
-  close-out) remain open.
+  amendment for the full account. **PR 6 (PartiQL sim tests) landed
+  2026-09-08**: 27 more `SimCluster` siblings, one per named real-socket
+  LOGIC test in `dynamo_partiql.rs`/`dynamo_execute_transaction.rs`
+  (statement semantics, error mapping, pagination shape, index routing,
+  cancellation reasons), each issued from a non-leader node of a 3-node
+  RF3 `SimCluster` with an `_over_seeds` sibling at 5 seeds (54 tests
+  total) — pure test authorship over PR 5's own dispatch, no new
+  `dynamo.rs` mechanism. No product bug found; the real-socket 37-test
+  suite stays untouched and green throughout. Deliberately not converted:
+  `throttled_table_throttles_a_partiql_insert` (throttle-window timing),
+  two tests already subsumed by PR 5's own scenarios (`insert_then_
+  select_sees_it`, `delete_with_returning_all_old`), and every
+  `batch_execute_statement_*`/`delete_*` test beyond PR 5's own scenario
+  (c) — not named in this PR's own candidate list, left for a future pass.
+  See ADR 0061's matching 2026-09-08 "Rung F, PR 6" amendment for the full
+  account. PR 7 (docs close-out) remains open.
 - **ADR:** [0061](adr/0061-testability-node-crate-simulator.md) — the
   2026-09-07 "Rung F" amendment (see its 2026-09-08 "Rung F, PR 4"/"Rung F,
-  PR 5" addenda for PR 4/5's own accounts).
+  PR 5"/"Rung F, PR 6" addenda for PR 4/5/6's own accounts).
 - **Size:** L (seven PRs, two real production functions' worth of
   `ProdEnv`-only surface to widen plus two new fault-injecting sim
   suites).
 - **Depends:** C-04 (closed 2026-09-07 — D4 PR 1's real per-node
   `Reconciler` and D3's `dispatch_item_op`/`dispatch_table_op` cores are
   both load-bearing prerequisites this rung builds directly on).
-- **Status (2026-09-08):** open — PRs 1-5 landed; PRs 6-7 remain open.
+- **Status (2026-09-08):** open — PRs 1-6 landed; PR 7 remains open.
 
 ---
 
@@ -735,7 +749,7 @@ wave are independent and can run in parallel.
 | 4 | *landed 2026-09-05* (S-02) | Highest blast radius (C-01 landed 2026-09-05 — see ADR 0054; S-01 landed 2026-09-05 — see ADR 0064; S-02 — see ADR 0066) |
 | 5 | *S-04, S-05, S-07b–d, C-02, C-05 all landed 2026-09-06* | S-05 strictly after S-04 |
 | 6 | *S-03 complete 2026-09-07 (all 3 PRs, ADR 0069)*; *S-07e/S-07 complete 2026-09-07 (ADR 0070)*; *C-03 assessed 2026-09-07 — deferred, no PRs planned (see ADR 0044's matching amendment)*; W-07 | XL or gated on earlier waves |
-| 7 | C-06 (PRs 1-5 landed, PR 5 on 2026-09-08; issues #731 and #737 both fixed 2026-09-07; PRs 6-7 open) | Gated on C-04 (closed 2026-09-07) — the D4 `Reconciler` and D3 generic dispatch cores it builds on |
+| 7 | C-06 (PRs 1-6 landed, PR 6 on 2026-09-08; issues #731 and #737 both fixed 2026-09-07; PR 7 open) | Gated on C-04 (closed 2026-09-07) — the D4 `Reconciler` and D3 generic dispatch cores it builds on |
 
 Open issues mapped: none left (#375 closed by W-01, #319 by W-05). Filed
 from wave 2's own findings: #590 (the operator still emits the deleted
