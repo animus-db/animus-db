@@ -982,6 +982,41 @@ pub(crate) struct SimCluster {
     backup_store: SimSegmentStore,
 }
 
+/// Breaks the `Simulator`/`SimEnv` reference cycle (`animus_sim::Simulator::
+/// shutdown`'s own doc has the full mechanism) once a test is done with its
+/// `SimCluster`, so the simulated world this fixture built — every node's
+/// `ClientCtx`, every hosted CP group, the whole task queue behind every
+/// perpetual driver loop this module spawns (heartbeat, reconciler,
+/// auto-split, the backup janitor, …) — is actually freed instead of
+/// leaking for the rest of the test **process**' lifetime.
+///
+/// **This is the root cause of the animusd `sim_cluster_*` test tier's
+/// per-test RSS growth** (evidence: `cargo test -p animusd --lib` climbing
+/// linearly, ~10 MB/s once the `sim_cluster_*` modules start, no drop
+/// between tests): every one of `SimCluster::new`/`restart`'s own spawned
+/// loops (`animus_control::node::heartbeat_loop`, `spawn_reconciler_loop`,
+/// `auto_split_loop` when opted in, `backup_janitor_loop`, …) is a `loop {
+/// .. env.sleep(..).await .. }` that never resolves, and every one of them
+/// captures a `SimEnv` — so the previous state of affairs (a bare `let _ =
+/// SimCluster::new(..)` going out of scope at the end of each `#[test]` fn,
+/// with nothing draining the task queue) left every one of those tasks'
+/// own captured `Arc<Shared>` alive, keeping the *entire* simulated
+/// world reachable for as long as the test **process** ran — one whole
+/// leaked cluster per test, monotonically, matching the observed growth
+/// exactly. `Simulator` itself cannot fix this via its own `Drop` (it is
+/// deliberately `Clone` — several handles legitimately share one world, so
+/// no single clone's own drop can tell whether it's the "last" one); a
+/// `SimCluster`, by contrast, is not `Clone` and is the one type every
+/// `sim_cluster_*` test scenario already owns for its whole duration, so
+/// its own `Drop` is exactly the point every scenario already reaches
+/// automatically, success or `panic!` (unwind) alike, with zero change to
+/// any of the ~30 sibling `sim_cluster_*` modules that construct one.
+impl Drop for SimCluster {
+    fn drop(&mut self) {
+        self.sim.shutdown();
+    }
+}
+
 impl SimCluster {
     /// Build a fresh `nodes`-node cluster: one `Simulator::new(seed)`, a
     /// real `nodes`-voter control `RaftNode<SimEnv>` quorum, a

@@ -3990,3 +3990,97 @@ point excludes `Cargo.lock`.
 `crates/animusd/CLAUDE.md`'s new appendix (the full scenario account and
 the `tablet_of` fixture gotcha); `docs/engineering-lessons.md`'s new entry
 on the second mutual-recursion cycle.
+
+## 2026-09-08 amendment — correcting the PR 4 "resource-scale finding": the OOM was a real per-test `Simulator`/`SimEnv` leak, not glibc allocator retention
+
+PR 4's own amendment above (and `sim_cluster_dynamo_corpus.rs`'s matching
+module doc) filed the `ANIMUS_DYNAMO_WIRE_SEEDS=12`/`=25` OOM as
+"consistent with ordinary glibc allocator high-water-mark behavior... not
+confirmed proof of a true per-scenario leak," explicitly not root-caused
+further at the time. It has now been root-caused, in a dedicated
+follow-up session, and the "glibc retention" explanation was **wrong** —
+this was a genuine, provable per-test reference-cycle leak in
+`animus-sim`'s own executor, unrelated to allocator behavior, that
+happened to affect every `sim_cluster_*`-driven test in this crate (not
+only the wire corpus), scaling with how many tests a single process runs
+before exiting.
+
+**Root cause**: `animus_sim::Simulator` holds one `Arc<Shared>`, and every
+`SimEnv`/`Simulator` handle clones it. `Shared`'s own `SimState.tasks`
+map — where every `Spawner::spawn`ed task's future lives — is stored
+*inside* that same `Shared`. A perpetual task (any `loop { ..
+env.sleep(..).await .. }` with no terminating condition — a Raft
+heartbeat loop, a reconciler tick loop, `auto_split_loop`, the backup
+janitor, every one of which `SimCluster::new` spawns per node) never
+resolves, so its future is never removed from `tasks` — and that future
+almost always captures a `SimEnv` (or a whole `Simulator` clone, per this
+crate's own documented "`Simulator` is `Clone`" precedent), a strong
+`Arc<Shared>` pointing right back at the state holding it. A genuine
+reference cycle, entirely internal to the executor: dropping every
+*external* `Simulator`/`SimEnv` handle a test held (the whole
+`SimCluster` value going out of scope at the end of each `#[test]` fn, the
+normal case) never frees anything once a single perpetual task has ever
+been spawned on it, which is every `sim_cluster_*` scenario without
+exception. One whole simulated cluster's worth of memory — every node's
+metadata, every hosted CP group, the full accumulated trace — leaked per
+test, for the remaining lifetime of the test **process**, which is
+exactly the "no drop between tests, ~10 MB/s once `sim_cluster_*` starts"
+shape observed both in PR 4's own investigation and, independently, in
+the dedicated follow-up session that root-caused it.
+
+**Proved with a `Weak`, not inferred from RSS** (this crate's own standing
+rule: RSS assertions are flaky, and "memory didn't shrink" doesn't by
+itself distinguish a true leak from allocator retention) —
+`crates/animus-sim/tests/executor_leak.rs`: take a `Simulator::downgrade()`
+`Weak` handle while a scenario with a spawned perpetual task is still
+fully alive, drop every external handle, and the `Weak` still upgrades.
+A sibling test proves the fix: call the new `Simulator::shutdown()`
+(drains `SimState.tasks`/`task_owner` — the only two fields able to hold
+a strong `Arc<Shared>` back-reference) before dropping the external
+handles, and the same `Weak` no longer upgrades.
+
+**Fix**: `animus-sim` gained `Simulator::shutdown()` (an explicit,
+idempotent, callable-from-any-clone drain — not a `Drop` impl on
+`Simulator` itself, which is deliberately `Clone` and so has no single
+"last owner" moment to hook) and `Simulator::downgrade() -> WeakSimulator`
+(the proof primitive above). `animusd`'s `SimCluster` (not `Clone`, and
+the one type every `sim_cluster_*` scenario already owns for its whole
+duration) gained `impl Drop for SimCluster { fn drop(&mut self) {
+self.sim.shutdown(); } }` — zero changes to any of the ~30
+`sim_cluster_*` sibling modules, since every one of them already lets its
+`SimCluster` value drop naturally, success or panic-unwind alike, at the
+end of each test.
+
+**Measured effect** (foreground `/proc/<pid>/status` `VmRSS` sampling of
+the animusd test binary itself, never a background process): `cargo test
+-p animusd --lib sim_cluster_dynamo_partiql -- --test-threads=1` — peak
+322 MB across the module's 10 tests, no per-test growth (the pre-fix
+trajectory, measured on the 64-test PR 6 version of this same module,
+climbed to ~3.7 GB at ~58 MB per test); `cargo test -p animusd --lib --
+--test-threads=2` — the whole 383-test suite completes in 643s (a
+two-thread run of this same suite had previously reached 13.9 GB and
+page-fault-thrashed for 87 minutes, and a one-thread run was killed at
+13.9 GB after 342 tests, both without finishing);
+`ANIMUS_DYNAMO_WIRE_SEEDS=4 cargo test -p animusd --lib
+sim_cluster_dynamo_corpus -- --test-threads=1` — 3 passed in 454s, where
+the pre-fix trajectory (this amendment's own subject) was climbing toward
+the same ~13.8 GiB plateau this correction addresses.
+`ANIMUS_DYNAMO_WIRE_SEEDS=25` was not re-attempted in the follow-up
+session (out of that session's own explicit scope, `=4` being sufficient
+proof) but is now expected to hold flat too, since the fix is structural
+(the task queue itself, not depth-dependent) rather than a
+
+**`sim_cluster_dynamo_corpus.rs`'s own module doc, and PR 4's amendment
+above, both need their "glibc allocator high-water-mark" framing read as
+superseded by this correction** — left in place (this ADR is append-only)
+rather than edited in place, per this repo's own convention for a finding
+that turns out to be wrong: correct it forward, don't rewrite history.
+
+See `docs/engineering-lessons.md`'s matching entry (filed the same day)
+for the general lesson — an executor whose own task queue lives inside
+the state a task's environment handle points back to is a reference cycle
+the moment any task can run forever, which is the ordinary shape for a
+distributed system's background loops; a `Weak`-based proof, not an RSS
+number, is what actually distinguishes that from ordinary allocator
+retention — and `crates/animus-sim/CLAUDE.md`'s "What's non-obvious"
+section for the mechanism itself.

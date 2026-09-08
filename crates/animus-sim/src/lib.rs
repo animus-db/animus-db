@@ -660,6 +660,24 @@ pub struct Simulator {
     seed: u64,
 }
 
+/// A weak handle onto a [`Simulator`]'s shared state — never keeps the
+/// simulation alive, so it exists to answer one question from outside: is
+/// this simulated world still reachable through some strong reference
+/// (typically a still-pending task's own captured [`SimEnv`]/`Simulator`
+/// handle — see [`Simulator::shutdown`]'s doc), or has it genuinely been
+/// freed? Obtain one via [`Simulator::downgrade`].
+#[derive(Clone)]
+pub struct WeakSimulator(Weak<Shared>);
+
+impl WeakSimulator {
+    /// Whether the simulation's shared state is still alive (reachable
+    /// through at least one strong reference somewhere).
+    #[must_use]
+    pub fn is_alive(&self) -> bool {
+        self.0.strong_count() > 0
+    }
+}
+
 impl Simulator {
     /// Create a simulator driven by `seed`.
     #[must_use]
@@ -1105,6 +1123,70 @@ impl Simulator {
         let until = t.saturating_add(dur_nanos(dur));
         st.paused_until.insert(node.clone(), until);
         st.trace.push(TraceEvent::Pause { t, node, until });
+    }
+
+    /// Tear down this simulation's still-pending tasks, breaking the
+    /// reference cycle a spawned task's own captured `Env`/`Simulator`
+    /// handle forms with the simulator's own shared state.
+    ///
+    /// **The mechanism**: every task [`spawn`](Spawner::spawn) hands in is
+    /// stored inside `SimState.tasks`, which lives inside this simulator's
+    /// own `Shared` behind the one `Arc` every [`SimEnv`]/`Simulator` handle
+    /// clones. A task that never resolves on its own — a Raft heartbeat
+    /// loop, a reconciler tick loop, any perpetual `loop { env.sleep(..)
+    /// .await; .. }` shape a real component's driver takes — stays parked
+    /// in that map for as long as the simulator exists, and almost always
+    /// captures a `SimEnv` (or, per this crate's own "Simulator is Clone"
+    /// precedent, a whole `Simulator` handle) to do its job — which holds
+    /// its own strong `Arc` right back to the same `Shared`. So the last
+    /// *external* `Simulator`/`SimEnv` handle a caller drops is never
+    /// actually the last **strong** one: an internal one, sitting inside
+    /// the very state being decremented, keeps the whole simulated world
+    /// (every hosted node's metadata, every open connection's inbox, the
+    /// full accumulated [`trace`](Self::trace)) alive for the rest of the
+    /// process — nothing short of dropping the task queue itself ever lets
+    /// the count reach zero.
+    ///
+    /// Call this once a scenario is done with its `Simulator` — a
+    /// `SimCluster`-shaped test fixture's own `Drop` impl is the usual
+    /// place — to let that memory actually be reclaimed instead of leaking
+    /// for the process's remaining lifetime (the shape behind the animusd
+    /// `sim_cluster_*` test tier's per-test RSS growth this method was
+    /// added to fix; see `docs/engineering-lessons.md`).
+    ///
+    /// `&self`, not `&mut self`: `Simulator` is deliberately `Clone` (see
+    /// this type's own doc) so several handles can point at one shared
+    /// world, and this drains the task queue **all of them** share — safe
+    /// to call from any one of them, any number of times (idempotent: a
+    /// second call finds nothing left to drop). A task mid-poll at the
+    /// instant this is called is unaffected (it has already been checked
+    /// out of `tasks` for the poll, per [`poll_task`](Self::poll_task) —
+    /// this drains what's left, not what's in flight); do not call this
+    /// while another thread might still be driving the same simulator
+    /// (this crate's whole design is single-threaded cooperative
+    /// scheduling, so that is already true of every other method here).
+    ///
+    /// After this call, no spawned task will ever run again — `run`/
+    /// `run_for`/`run_until`/`run_until_quiescent` on any handle sharing
+    /// this state simply find nothing ready and nothing scheduled (a
+    /// pending timer's own `Sleep`/`Recv` future was owned by the task that
+    /// held it, now dropped too), so this is a genuinely terminal call, not
+    /// a pause.
+    pub fn shutdown(&self) {
+        let mut st = self.shared.lock();
+        st.tasks.clear();
+        st.task_owner.clear();
+    }
+
+    /// A weak handle onto this simulation's shared state, for proving (in a
+    /// test) whether dropping every `Simulator`/`SimEnv` handle a caller
+    /// held actually freed the simulated world — see [`shutdown`](Self::
+    /// shutdown)'s own doc for the reference-cycle mechanism this exists to
+    /// let a caller observe from outside. Holding a [`WeakSimulator`] never
+    /// keeps the simulation alive by itself.
+    #[must_use]
+    pub fn downgrade(&self) -> WeakSimulator {
+        WeakSimulator(Arc::downgrade(&self.shared))
     }
 
     /// The recorded history of this run.

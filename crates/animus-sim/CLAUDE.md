@@ -45,6 +45,13 @@ function of one seed. This is the substrate every distributed test runs on.
   and `corrupt_durable(node, file, offset)` (flip one durable byte —
   at-rest corruption of synced data, e.g. to hit an SSTable's per-block CRC).
 - Observability: `trace()` / `trace_lines()`, `now()`, `seed()`.
+- Teardown: `shutdown()` — drains still-pending tasks, breaking the
+  `Simulator`/`SimEnv` reference cycle a perpetual task's own captured
+  handle forms with the simulator's own shared state (see "What's
+  non-obvious" below) — and `downgrade() -> WeakSimulator` /
+  `WeakSimulator::is_alive()`, for proving from outside whether a
+  simulated world is still reachable after every external handle a caller
+  held has been dropped.
 - Clock skew (ADR 0018 §2 sim support): `set_clock_skew_for(node, skew_nanos)`
   — a per-node signed-nanosecond offset applied only to that node's own
   `Clock::now()` reads (mirrors the `set_disk_config_for` per-node-override
@@ -137,6 +144,47 @@ function of one seed. This is the substrate every distributed test runs on.
 - A future is *checked out* of the task map while polled so it can re-enter the
   state lock (e.g. via `env.send`) without deadlocking. Wakers hold a `Weak` to
   avoid a reference cycle.
+- **The task futures themselves do NOT avoid that cycle — only the waker
+  does — and that is a real, load-bearing leak every long-lived consumer
+  must break explicitly (found 2026-09-08, see `docs/engineering-
+  lessons.md`'s matching entry for the full incident).** `SimState.tasks:
+  BTreeMap<TaskId, Option<BoxFuture<'static, ()>>>` lives inside `Shared`,
+  the same struct every `Simulator`/`SimEnv` handle holds a strong `Arc`
+  to. A spawned task's future almost always captures a `SimEnv` (or, per
+  `Simulator`'s own `Clone` precedent above, a whole `Simulator` handle) to
+  do its job — a strong `Arc<Shared>`, stored inside the very `Shared`
+  being reference-counted. For a task that resolves on its own this is
+  harmless (`poll_task` removes it from `tasks` on `Poll::Ready`, dropping
+  its captured handles with it) — but a **perpetual** task (any `loop {
+  .. env.sleep(..).await .. }` shape with no terminating condition — a
+  Raft heartbeat loop, a reconciler tick loop, any real background driver
+  this workspace tests under simulation) never reaches that point, so its
+  captured `Arc<Shared>` sits in `tasks` forever. The consequence: dropping
+  every *external* `Simulator`/`SimEnv` handle a caller holds does **not**
+  free the simulated world if even one perpetual task was ever spawned on
+  it — an internal, self-referential strong reference remains, and nothing
+  short of an explicit drain of `tasks` (never `Drop` — a cycle's own
+  `Drop` can't run while the cycle holds it alive) ever breaks it.
+  **`Simulator::shutdown(&self)`** is that explicit drain (clears `tasks`/
+  `task_owner` — the only two fields that can hold a strong `Arc<Shared>`
+  back-reference; every other field either holds no `Arc` at all or, like
+  a `Waker`'s own `Arc<TaskWaker>`, already uses `Weak`), safe to call from
+  any handle sharing the world, any number of times, at any point. It does
+  **not** run automatically on any `Drop` (`Simulator` is deliberately
+  `Clone`, so no single clone's own drop can know it's the "last" one) —
+  a long-lived consumer (a `SimCluster`-shaped test fixture that spawns
+  perpetual loops) must call it itself, typically from its own `Drop` impl
+  once it owns the "this scenario is over" moment (see `crates/animusd/
+  src/sim_cluster.rs`'s `impl Drop for SimCluster`). **To detect this
+  class of bug (in this crate or a future one shaped like it), don't trust
+  an RSS number** (flaky, and "memory didn't shrink" doesn't distinguish a
+  true leak from ordinary allocator high-water-mark retention) — take a
+  `Weak` handle (`Simulator::downgrade` → `WeakSimulator::is_alive`) while
+  everything is provably still alive, drop every external handle, and
+  assert whether it still upgrades. `tests/executor_leak.rs` is this
+  proof, both directions (the bug present without `shutdown()`, gone with
+  it), plus the negative case (a task that resolves on its own never needed
+  `shutdown()` in the first place).
 - `crash(node)` drops un-synced disk + the inbox **and mutes the node's
   outbound sends** (a dead node emits nothing); deliveries to a crashed node are
   dropped until `restart`.
@@ -264,7 +312,15 @@ function of one seed. This is the substrate every distributed test runs on.
 
 ## Tests
 
-`cargo test -p animus-sim` — `tests/determinism.rs` asserts byte-identical
+`cargo test -p animus-sim` — `tests/executor_leak.rs` proves the
+`Simulator`/`SimEnv` task-queue reference cycle directly (`Simulator::
+downgrade`'s `Weak` still upgrades after every external handle is dropped,
+for a scenario that spawned a perpetual task, and no longer does once
+`shutdown()` is called first — plus the idempotent-from-any-clone case and
+the negative case, a task that resolves on its own never leaking) — see
+"What's non-obvious" above and `docs/engineering-lessons.md`'s matching
+entry for the full incident this was written to catch. `tests/
+determinism.rs` asserts byte-identical
 traces across runs, reproducible partitions, and the crash/disk model;
 `tests/disk_faults.rs` asserts the opt-in disk fault model is default-off
 byte-identical and seed-reproducible when enabled, including `link`
