@@ -6532,7 +6532,9 @@ permanently; (C) real crypto/DNS/TLS/OTLP/sockets, 9 files/32 tests — TLS
 handshake, DNS resolution, SigV4, OTLP export, raw framing, stays
 `ProdEnv` permanently; (D) waiting on a `SimCluster` capability this
 fixture doesn't have yet, 65 files/317 tests, split by what's missing —
-admin/console/dashboard HTTP (10/66), PartiQL (2/37), join/growth/
+admin/console/dashboard HTTP (10/66 — 67 by an exact `grep -c
+'#\[tokio::test'` recount, owned by C-08 (ADR 0061 rung H) as of
+2026-09-08), PartiQL (2/37), join/growth/
 decommission (9/34), Transact (6/32), index DDL beyond plain `CreateTable`
 (9/30), backup/PITR/export/import (6/29), Streams (3/28, owned by C-07
 (ADR 0061 rung G) as of 2026-09-08), control/data
@@ -6541,7 +6543,8 @@ role split (5/21), reconciler-driven split/rebalance/GC (7/13), TTL
 (1/6), auto-split loops (2/2), `--config` bring-up (2/2) —
 reconciler-driven split/rebalance/GC, auto-split, join/growth, and the
 backup janitor are D4's own scope (D4 PR 1 already supplied the real
-reconciler these need next); admin/console/dashboard HTTP, Streams, TTL,
+reconciler these need next); Streams and admin/console/dashboard HTTP are
+now owned (C-07, C-08); TTL,
 the control/data role split, `--config` bring-up, index DDL beyond
 `CreateTable`, node assembly, and the throttle-metric counters are unowned
 by any planned rung as of this close; (E) frozen behind an open flake
@@ -6606,6 +6609,17 @@ before an immediately-after-the-call assertion runs (fixed
 scenario-locally). `cargo test -p animusd --lib` reached 315 passed / 2
 ignored at the sim tier after PR 5, no leak trajectory — see ADR 0061's
 "Rung G closed" amendment for the full per-PR accounting.
+
+**C-08 (open)** — admin/console/dashboard HTTP, the group C-07's own
+close-out named next in line, is opened 2026-09-08 (ADR 0061's "Rung H"
+amendment, `docs/roadmap.md`'s C-08 entry). PR 1 (this docs opener) has
+landed; PRs 2-8 are not yet done. The ten files now owned by this rung:
+`admin_endpoint.rs`, `dashboard_endpoint.rs`, `console_endpoint.rs`,
+`console_create_table.rs`, `console_items.rs`, `console_stream.rs`,
+`console_table_config.rs`, `console_tables.rs`, `metrics_endpoint.rs`,
+`system_table.rs` (67 tests total, per an exact recount — see that
+amendment's own Gap section for the per-file breakdown and why it differs
+by one from this section's older "(10/66)" figure above).
 
 **Standing rule for new `animusd` logic tests**: default to a
 `sim_cluster_*` sibling module (`SimCluster::dynamo`/`dynamo_concurrent`/

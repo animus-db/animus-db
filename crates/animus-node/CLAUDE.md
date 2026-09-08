@@ -476,7 +476,12 @@ sub-rungs below shipped.
   `metrics_json`, `raft`, `stream_change_rates`, `trigger_split`) — and
   three of those (`edge`/`control`/`control_storage`) are handles
   (`ClusterEdgeState`/`ControlHandle`/`SharedEngine`) hardcoded to
-  `ProdEnv` in `animusd` today, whose *own* further methods
+  `ProdEnv` in `animusd` **at this rung (C4d)** — corrected by rung C5,
+  which made all three generic over `E: Env` (`ClusterEdgeState<E>`,
+  `ControlHandle<E, R>`, `SharedEngine<E>`, the last two defaulting to
+  `ProdEnv`/`AnimusdRelayClient` rather than naming them outright; see the
+  C-08 opener, ADR 0061's 2026-09-08 "Rung H" amendment, which found this
+  paragraph stale while scoping that rung) — whose *own* further methods
   (`hosted_groups`, `local_cp`, `lsm_sstables`, `wal_stats`, raw
   engine/WAL scans, …) are what most handler bodies actually call. Naming
   each of those as a narrower capability would mean rebuilding `ClientCtx`
@@ -497,7 +502,10 @@ sub-rungs below shipped.
   is a thin, logic-free delegation to the file's own **unmoved** handler
   functions (`config_view`, `raft_view`, `storage_lsm`, `action_split`,
   …) — every one of those, and the full `ClientCtx` surface + the deeper
-  `ProdEnv`-hardcoded handle types they reach, stays exactly where it is.
+  handle types they reach (generic since rung C5, per the correction
+  above — only `impl AdminHost for ClientCtx`/`impl ConsoleBackend for
+  ClientCtx` themselves stay bound to the concrete default as of this
+  writing), stays exactly where it is.
   `action_data_dynamo` still reaches `dynamo::execute_routed` and
   `action_data_seed` still reaches the kind-write path, both unmoved and
   unmodified — matching this rung's exclusion of `dynamo.rs`'s own

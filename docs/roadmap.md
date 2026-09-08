@@ -789,11 +789,77 @@ the still-true paragraph after the table.
   `OP_BUDGET` advance can retire a short-retention row before an
   immediately-after-the-call assertion runs (fixed scenario-locally by
   widening retention past the budget). What remains unowned after C-07:
-  admin/console/dashboard HTTP, TTL, the control/data role split,
-  `--config` bring-up, index DDL beyond plain `CreateTable`, node
-  assembly/raw `ClientRequest`, and the throttle-metric counters — six
-  groups, none with a rung against it today. See ADR 0061's "Rung G
-  closed" amendment for the full account.
+  admin/console/dashboard HTTP (now owned by C-08, opened 2026-09-08 — see
+  that entry below), TTL, the control/data role split, `--config`
+  bring-up, index DDL beyond plain `CreateTable`, node assembly/raw
+  `ClientRequest`, and the throttle-metric counters — five groups, none
+  with a rung against it today. See ADR 0061's "Rung G closed" amendment
+  for the full account.
+
+---
+
+### C-08 admin/console/dashboard HTTP SimCluster dispatch
+
+- **Gap:** admin/console/dashboard HTTP is the residual every rung back
+  through the D3-closing inventory has named as "the largest remaining
+  unowned group" without claiming it — C-07's own close-out names it next
+  in line. A read-only pass over this tree finds ten real-socket
+  `crates/animusd/tests/*.rs` files touching it: `admin_endpoint.rs` (23
+  tests), `dashboard_endpoint.rs` (16), `console_endpoint.rs` (3),
+  `console_create_table.rs` (4), `console_items.rs` (4), `console_
+  stream.rs` (4), `console_table_config.rs` (9), `console_tables.rs` (1),
+  `metrics_endpoint.rs` (1), `system_table.rs` (2) — 67 tests total,
+  counts taken directly with `grep -c '#\[tokio::test' <file>`. This
+  matches the D3-closing residual inventory's own "admin/console/dashboard
+  HTTP (10/66)" figure to within one test — a pre-existing minor staleness
+  in that older count, not something this entry's own grep-verified
+  numbers propagate. `console_stream.rs`'s four tests are counted here,
+  not under Streams, per C-07's own opener. `control_membership_admin.rs`
+  (12 tests) is a genuine control-plane role-split bring-up and is filed
+  under the separate "control/data role split" residual, not this group.
+- **Plan:** the identical widen-to-`<E: Env, R: RelayClient>`-then-add-a-
+  parallel-generic-entry-point template D3/D4/C-06/C-07 already validated
+  six times, applied to `impl AdminHost for ClientCtx`'s ~30 handlers and
+  `impl ConsoleBackend for ClientCtx`'s 14 methods. The key finding: both
+  impls are already mostly pure signature widening — `ClientCtx<E, R>`'s
+  own field types (`ClusterEdgeState<E>`, `ControlHandle<E, R>`,
+  `SharedEngine<E>`) and most of the methods they call have been generic
+  since ADR 0061 rung C5, so `crates/animus-node/CLAUDE.md`'s "hardcoded
+  to `ProdEnv`" note describing an earlier rung is now stale (corrected by
+  this entry's own PR 1). The remaining gaps: three `tokio::time`
+  commit-wait loops in the credential handlers plus one in the seed
+  handler (convert to `ctx.env`); no generic sibling of `execute_routed_
+  as` exists yet, since `ConsoleBackend` calls the concrete `execute_
+  routed` (add `execute_routed_as_generic`); and `dispatch_table_op`'s
+  `UpdateTable` arm has no sub-arm for an index change (out of scope,
+  filed under "index DDL beyond plain `CreateTable`", the same call C-07
+  made for `stream_backfill_seed_filter.rs`). See
+  [ADR 0061](adr/0061-testability-node-crate-simulator.md)'s 2026-09-08
+  "Rung H" amendment for the full account, including the precise
+  file/line blockers and the per-PR gate lines.
+- **PRs:** an eight-PR series — (1) this docs opener; (2) groundwork
+  (widen `AdminHost`/`ConsoleBackend` impls, fix the four `tokio::time`
+  sites, add `execute_routed_as_generic`, add `SimCluster::admin`/
+  `console`); (3) console reachable + first siblings (`console_tables.rs`,
+  `console_create_table.rs`, `console_items.rs`, part of `console_
+  endpoint.rs`); (4) `console_stream.rs` + 6 of `console_table_config.
+  rs`'s 9 siblings; (5) admin dispatch pure observers (`sim_cluster_
+  admin.rs`, `system_table.rs`, `metrics_endpoint.rs`); (6) admin mutating
+  actions + the remaining 11 `admin_*` tests; (7) `dashboard_endpoint.rs`
+  + `console_endpoint.rs` close-out; (8) docs close-out. Every production
+  dispatch path (`admin::dispatch`, `console::route`, `execute_routed`,
+  `execute_routed_as`, `execute_as`) stays byte-identical throughout —
+  strictly additive, parallel new paths only, per the D2 PR 1 lesson
+  (`docs/engineering-lessons.md`).
+- **Size:** L (eight PRs, two production dispatch implementations' worth
+  of `ProdEnv`-only surface to widen plus new fault-injecting sim suites
+  across admin and console).
+- **Depends:** C-04 (closed), C-06 (closed), C-07 (closed) — the D3/D4
+  generic dispatch cores this rung builds directly on, plus rung C5's own
+  widening of `ClientCtx`'s field types, which is what makes this rung
+  mostly signature widening rather than new mechanism.
+- **Status (2026-09-08):** open — PR 1 (this docs opener) landed; PRs 2–8
+  to follow.
 
 ---
 
@@ -873,6 +939,7 @@ wave are independent and can run in parallel.
 | 6 | *S-03 complete 2026-09-07 (all 3 PRs, ADR 0069)*; *S-07e/S-07 complete 2026-09-07 (ADR 0070)*; *C-03 assessed 2026-09-07 — deferred, no PRs planned (see ADR 0044's matching amendment)*; W-07 | XL or gated on earlier waves |
 | 7 | C-06 (closed 2026-09-08 — all seven PRs landed: #728, #729, #732, #748, #750, #756, plus this PR; issues #731 and #737 both fixed 2026-09-07) | Gated on C-04 (closed 2026-09-07) — the D4 `Reconciler` and D3 generic dispatch cores it builds on |
 | 8 | C-07 (closed 2026-09-08 — all six PRs landed: #758, #759, #760, #761, #762, plus PR 6) | Gated on C-04 (closed) and C-06 (closed) — the same generic dispatch cores, plus C-06's own Transact widening |
+| 9 | C-08 (open 2026-09-08 — PR 1, this docs opener, landed; PRs 2–8 to follow) | Gated on C-04 (closed), C-06 (closed), and C-07 (closed) — the same generic dispatch cores, plus rung C5's own widening of `ClientCtx`'s field types |
 
 Open issues mapped: none left (#375 closed by W-01, #319 by W-05). Filed
 from wave 2's own findings: #590 (the operator still emits the deleted
