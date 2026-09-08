@@ -6718,6 +6718,30 @@ impl<E: Env> ClusterEdgeState<E> {
         guard.push(raft);
     }
 
+    /// A `Weak` handle onto this edge's own `control` registry — for
+    /// proving (in a test) whether dropping every strong handle into a
+    /// `SimCluster`/`ClientCtx` graph actually frees this node's state, or
+    /// whether some other reference cycle is still keeping it alive. See
+    /// `sim_cluster.rs`'s own leak-regression test for the full account of
+    /// the investigation this was added for (the `SimRelayClient` handler-
+    /// slot cycle, found and fixed the same day) and `docs/engineering-
+    /// lessons.md`'s matching entry. `#[cfg(test)]`-only: a pure diagnostic
+    /// with no production caller.
+    #[cfg(test)]
+    pub(crate) fn downgrade_control(&self) -> std::sync::Weak<Mutex<Vec<RaftNode<E>>>> {
+        Arc::downgrade(&self.control)
+    }
+
+    /// The `raftkv` registry's own twin of
+    /// [`downgrade_control`](Self::downgrade_control) — see that method's
+    /// doc.
+    #[cfg(test)]
+    pub(crate) fn downgrade_raftkv(
+        &self,
+    ) -> std::sync::Weak<Mutex<BTreeMap<TabletId, Vec<CpGroup<E>>>>> {
+        Arc::downgrade(&self.raftkv)
+    }
+
     /// Register a node's CP group handle for `tablet` (ADR 0017 #3a / Phase 2).
     /// Called on each node that hosts a replica of `tablet`.
     fn register_raftkv(&self, tablet: TabletId, cp: CpGroup<E>) {
