@@ -148,7 +148,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use animus_cp_data::hlc::HlcTimestamp;
-use animus_cp_data::{KIND_BASE, ResolveOutcome, StageOutcome, StorageScope, TxnId, TxnOutcome};
+use animus_cp_data::{KIND_BASE, ResolveOutcome, StageOutcome, TxnId, TxnOutcome};
 use animus_dynamo::AttributeValue;
 use animus_env::{EnvExt, nid};
 use animus_node::SimRelayClient;
