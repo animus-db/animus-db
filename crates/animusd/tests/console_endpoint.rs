@@ -8,13 +8,30 @@
 //! deliberate non-goal this ADR calls out) a **control-only** node never
 //! binds one at all. The tables-list **JSON endpoint's own projection
 //! correctness** (key shapes, GSI/LSI counts, stream/TTL, hidden-table
-//! exclusion, the no-cluster-shape property) is a separate concern, covered
-//! end to end in the sibling `tests/console_tables.rs` — this file only
-//! proves the endpoint exists and serves valid JSON.
+//! exclusion, the no-cluster-shape property) is a separate concern, now
+//! covered by `sim_cluster_console.rs::
+//! tables_endpoint_projects_the_schema_catalog_correctly` (ADR 0061 rung H,
+//! C-08 PR 3 — the real-socket original, `tests/console_tables.rs`, was
+//! deleted whole once that sibling landed) — this file only proves the
+//! endpoint exists and serves valid JSON.
 //!
 //! Real time + sockets, so it brings the cluster up with the documented
 //! port-TOCTOU bounded retry (`support::bring_up_split`/`support::
 //! start_single_node`) rather than a fixed-port config.
+//!
+//! **ADR 0061 rung H, C-08 PR 3**: every test in this file stays `ProdEnv` —
+//! each is fundamentally about real HTTP framing (status line, headers,
+//! content-type, static-asset bytes) or a genuine process role split,
+//! neither of which `SimCluster::console` can reproduce (it builds a bare
+//! `HttpRequest` with no framing at all, and has no node-role concept). The
+//! first test's own tail (`GET /console/api/tables` on a freshly-booted
+//! node returns an empty array; an unrecognized path 404s) is genuinely
+//! JSON-routing, not framing — that slice now has its own sibling,
+//! `sim_cluster_console.rs::console_error_mapping_and_json_routing_
+//! assertions`, extended with the console's error-mapping contract
+//! (missing table -> 404, malformed body -> 400) — but the rest of this
+//! test (the shell/static-asset/deep-link assertions) keeps this whole
+//! test on `ProdEnv`, so nothing was removed from this file.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -54,6 +71,12 @@ async fn raw(addr: SocketAddr, path: &str) -> (u16, String, String) {
 /// 200s with a valid `{"tables": [...]}` body, and the bound port is exactly
 /// the one `RoleAddrs::console` named in the config — on a **combined**
 /// node.
+///
+/// **KEPT `ProdEnv`** (ADR 0061 rung H, C-08 PR 3): real HTTP framing —
+/// status line, `Content-Type` headers, static-asset bytes, deep-link
+/// routing — none of which `SimCluster::console` can reproduce (no framing
+/// at all). Its own JSON-routing tail has a sim sibling; see this file's
+/// own module doc.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn console_serves_shell_assets_and_deep_links_on_combined_node() {
     timeout(Duration::from_secs(30), async {
@@ -143,6 +166,9 @@ async fn console_serves_shell_assets_and_deep_links_on_combined_node() {
 /// The console listener is bound on a **data-only** node too (it hosts real
 /// CP-data tablets, the console's subject matter) — verified against a
 /// genuine split deployment, not assumed from the combined-node case above.
+///
+/// **KEPT `ProdEnv`** (ADR 0061 rung H, C-08 PR 3): a genuine control-only/
+/// data-only process split — `SimCluster` has no node-role concept at all.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn console_serves_shell_on_data_only_node() {
     timeout(Duration::from_secs(60), async {
@@ -183,6 +209,10 @@ async fn console_serves_shell_on_data_only_node() {
 /// **control-only** node hosts no CP-data tablet, so it binds no console
 /// listener at all — `Node::console_addr()` panics there, the identical
 /// contract `dynamo_addr()` already carries for the same shape.
+///
+/// **KEPT `ProdEnv`** (ADR 0061 rung H, C-08 PR 3): the identical
+/// control-only/data-only process-split reason as
+/// `console_serves_shell_on_data_only_node` above.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[should_panic(expected = "this node has no data role")]
 async fn console_addr_panics_on_control_only_node() {

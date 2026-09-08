@@ -18899,6 +18899,21 @@ mod sim_cluster_dynamo_streams;
 #[cfg(test)]
 mod sim_cluster_stream_janitor;
 
+/// ADR 0061 rung H (post-C-07): admin/console/dashboard `SimCluster`
+/// dispatch (C-08), PR 3 — the first real scenario coverage of
+/// `SimCluster::console` (PR 2's own two smoke tests only proved the
+/// primitive reaches live state at all): the tables-list projection, the
+/// create-table form's full declaration + validation, the Items tab's
+/// Scan/Query/GetItem/PutItem/DeleteItem round trip (base table and, via
+/// `SimCluster::drain_gsi`, a named GSI), and the console's own JSON-
+/// routing/error-mapping contract (`tests/console_endpoint.rs`'s non-
+/// framing tail). See this module's own doc for the full scenario list and
+/// `crates/animusd/CLAUDE.md`'s matching appendix for the per-test
+/// conversion mapping and what stays `ProdEnv` (real HTTP framing/static
+/// assets/CORS, and the two control-only/data-only role-split tests).
+#[cfg(test)]
+mod sim_cluster_console;
+
 /// Regression for the issue #298 residual confirmed live under the
 /// un-pinned `SplitMode::InPlace` proof soak (ADR 0018's matching amendment,
 /// `docs/engineering-lessons.md`'s matching entry): a stage blocked by

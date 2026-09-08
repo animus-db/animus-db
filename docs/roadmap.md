@@ -840,9 +840,12 @@ the still-true paragraph after the table.
 - **PRs:** an eight-PR series — (1) this docs opener; (2) groundwork
   (widen `AdminHost`/`ConsoleBackend` impls, fix the four `tokio::time`
   sites, add `execute_routed_as_generic`, add `SimCluster::admin`/
-  `console`); (3) console reachable + first siblings (`console_tables.rs`,
-  `console_create_table.rs`, `console_items.rs`, part of `console_
-  endpoint.rs`); (4) `console_stream.rs` + 6 of `console_table_config.
+  `console`); **(3) console reachable + first siblings — landed
+  2026-09-08** (`console_tables.rs`,
+  `console_create_table.rs`, `console_items.rs` converted whole and
+  deleted; `console_endpoint.rs`'s own three tests stay `ProdEnv`, with a
+  new tenth scenario covering its JSON-routing/error-mapping tail); (4)
+  `console_stream.rs` + 6 of `console_table_config.
   rs`'s 9 siblings; (5) admin dispatch pure observers (`sim_cluster_
   admin.rs`, `system_table.rs`, `metrics_endpoint.rs`); (6) admin mutating
   actions + the remaining 11 `admin_*` tests; (7) `dashboard_endpoint.rs`
@@ -858,9 +861,21 @@ the still-true paragraph after the table.
   generic dispatch cores this rung builds directly on, plus rung C5's own
   widening of `ClientCtx`'s field types, which is what makes this rung
   mostly signature widening rather than new mechanism.
-- **Status (2026-09-08):** open — PR 1 (this docs opener) and PR 2
-  (groundwork) both landed, PR 2 corrected the same day in review; PRs
-  3–8 to follow. PR 2 widened both impls (43 `AdminHost` handlers, not
+- **Status (2026-09-08):** open — PR 1 (this docs opener), PR 2
+  (groundwork), and PR 3 (console reachable + first siblings) all landed,
+  PR 2 corrected the same day in review; PRs 4–8 to follow. PR 3 gave
+  every sim-convertible test in `console_tables.rs` (1), `console_create_
+  table.rs` (4), and `console_items.rs` (4) a deterministic `SimCluster`
+  sibling in a new `sim_cluster_console.rs` (9 scenarios + a 10th new one
+  covering `console_endpoint.rs`'s own JSON-routing/error-mapping tail,
+  each at a pinned seed + a 5-seed `_over_seeds` sibling — 20 tests, all
+  green on the first clean run, no product bug found), deleted the first
+  three files whole, and left `console_endpoint.rs`'s own three tests on
+  `ProdEnv` with one-line reasons (real HTTP framing/static assets, and a
+  genuine control-only/data-only role split — neither reachable from
+  `SimCluster`). See `crates/animusd/CLAUDE.md`'s matching C-08 PR 3
+  appendix for the full per-test mapping and gate numbers. PR 2 widened
+  both impls (43 `AdminHost` handlers, not
   merely "~30"), fixed blockers (a)/(b)/(c), and found (via this rung's
   own required untrimmed gate) that swapping `admin.rs::action_data_
   dynamo`/`impl ConsoleBackend`'s dispatch target is a real production
@@ -961,7 +976,7 @@ wave are independent and can run in parallel.
 | 6 | *S-03 complete 2026-09-07 (all 3 PRs, ADR 0069)*; *S-07e/S-07 complete 2026-09-07 (ADR 0070)*; *C-03 assessed 2026-09-07 — deferred, no PRs planned (see ADR 0044's matching amendment)*; W-07 | XL or gated on earlier waves |
 | 7 | C-06 (closed 2026-09-08 — all seven PRs landed: #728, #729, #732, #748, #750, #756, plus this PR; issues #731 and #737 both fixed 2026-09-07) | Gated on C-04 (closed 2026-09-07) — the D4 `Reconciler` and D3 generic dispatch cores it builds on |
 | 8 | C-07 (closed 2026-09-08 — all six PRs landed: #758, #759, #760, #761, #762, plus PR 6) | Gated on C-04 (closed) and C-06 (closed) — the same generic dispatch cores, plus C-06's own Transact widening |
-| 9 | C-08 (open 2026-09-08 — PR 1, this docs opener, and PR 2, groundwork, both landed; PRs 3–8 to follow) | Gated on C-04 (closed), C-06 (closed), and C-07 (closed) — the same generic dispatch cores, plus rung C5's own widening of `ClientCtx`'s field types |
+| 9 | C-08 (open 2026-09-08 — PR 1 docs opener, PR 2 groundwork, and PR 3 console-siblings all landed; PRs 4–8 to follow) | Gated on C-04 (closed), C-06 (closed), and C-07 (closed) — the same generic dispatch cores, plus rung C5's own widening of `ClientCtx`'s field types |
 
 Open issues mapped: none left (#375 closed by W-01, #319 by W-05). Filed
 from wave 2's own findings: #590 (the operator still emits the deleted

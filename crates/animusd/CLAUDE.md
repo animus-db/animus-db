@@ -8593,3 +8593,87 @@ production's own concrete implementation rather than adding a parallel
 path, and the fix is a newtype wrapper carrying its own separate impl —
 never an edit inside the off-limits dispatcher's own call chain, however
 "thin" or "logic-free" that edit looks.
+
+## Appendix — `sim_cluster_console.rs` siblings (ADR 0061 rung H, C-08 PR 3, 2026-09-08)
+
+Closes PR 3's own scope: every sim-convertible test in `tests/console_
+tables.rs` (1), `tests/console_create_table.rs` (4), and `tests/console_
+items.rs` (4) — 9 real-socket tests total — now has a deterministic
+sibling in a new `crates/animusd/src/sim_cluster_console.rs`, and all
+three source files are deleted whole. `tests/console_endpoint.rs` keeps
+its own three tests unconverted (each now carrying a one-line `ProdEnv`
+reason comment), plus a tenth new scenario in the sim module proving its
+JSON-routing/error-mapping tail. **No `console.rs`/`dynamo.rs`/`sim_
+cluster.rs` change was needed** — PR 2 already built every primitive this
+PR reuses (`SimCluster::console` through `GenericConsoleBackend`,
+`SimCluster::dynamo` for wire fixture setup, `SimCluster::drain_gsi` for
+the one GSI-reading scenario) — pure test authorship, mirroring C-07 PR
+4's own "no dispatch change needed" precedent for `dynamo_streams.rs`.
+
+**Test-by-test disposition (9 converted, 3 kept `ProdEnv`, all in
+`console_endpoint.rs`)**:
+
+| Real-socket test (file) | Disposition |
+|---|---|
+| `tables_endpoint_projects_the_schema_catalog_correctly` (`console_tables.rs`) | Converted → `run_tables_endpoint_projects_the_schema_catalog_correctly` |
+| `create_minimal_table_appears_in_tables_list` (`console_create_table.rs`) | Converted → `run_create_minimal_table_appears_in_tables_list` |
+| `create_full_table_declares_everything_exactly` (`console_create_table.rs`) | Converted → `run_create_full_table_declares_everything_exactly` |
+| `create_table_rejects_a_duplicate_name` (`console_create_table.rs`) | Converted → `run_create_table_rejects_a_duplicate_name` |
+| `create_table_rejects_an_lsi_with_no_sort_key` (`console_create_table.rs`) | Converted → `run_create_table_rejects_an_lsi_with_no_sort_key` |
+| `scan_paginates_and_visits_every_item_exactly_once` (`console_items.rs`) | Converted → `run_scan_paginates_and_visits_every_item_exactly_once` |
+| `query_by_partition_key_and_sort_condition` (`console_items.rs`) | Converted → `run_query_by_partition_key_and_sort_condition` |
+| `put_get_delete_item_round_trip` (`console_items.rs`) | Converted → `run_put_get_delete_item_round_trip` |
+| `scan_and_query_a_gsi_by_name` (`console_items.rs`) | Converted → `run_scan_and_query_a_gsi_by_name` (via `SimCluster::drain_gsi`) |
+| `console_serves_shell_assets_and_deep_links_on_combined_node` (`console_endpoint.rs`) | **KEPT** whole — mostly real HTTP framing `SimCluster::console` cannot reproduce; its own JSON-routing tail is covered by the new scenario below instead of trimming this test |
+| `console_serves_shell_on_data_only_node` (`console_endpoint.rs`) | **KEPT** — a genuine control-only/data-only process split |
+| `console_addr_panics_on_control_only_node` (`console_endpoint.rs`) | **KEPT** — the identical role-split reason |
+
+A tenth scenario, `console_error_mapping_and_json_routing_assertions`, has
+no real-socket original of its own: a freshly-booted node's tables list is
+a valid, empty JSON array and an unrecognized console path 404s (the
+JSON-routing slice of `console_serves_shell_assets_and_deep_links_on_
+combined_node`'s own tail), extended with the console's error-mapping
+contract this rung's brief named by name — a missing table's detail 404s
+with a real error body, and a malformed JSON body on a mutating endpoint
+is a 400 — neither a 500 either way.
+
+**Issuing discipline**: every scenario issues a control-plane mutation
+(wire `CreateTable`, the console's own `POST /console/api/tables`) from a
+control follower node wherever one is picked at all
+(`control_leader_and_follower`, mirroring `sim_cluster_dynamo_table_
+ops.rs::create_table_issued_on_a_control_follower_relays_and_converges`'s
+own idiom), and a tablet-scoped read/write from a tablet non-leader
+(`non_leader_of_table`, the `sim_cluster_dynamo_streams.rs` idiom) —
+except the tables-LIST endpoint itself, a pure local read off
+`effective_metadata()` with no leader/forwarding concept, which uses a
+fixed node. Every read that verifies a write asks for `ConsistentRead:
+true` (ADR 0055).
+
+**No product bug found.** Every scenario passed at its pinned seed and
+every `_over_seeds` seed (5 per scenario) on the first clean run.
+
+**Before/after counts**: `--test console_tables --test console_create_
+table --test console_items --test console_endpoint`: 12 passed (untrimmed)
+→ 3 passed (trimmed, `console_endpoint` only — the other three binaries no
+longer exist). `cargo test -p animusd --lib sim_cluster_console --
+--test-threads=2`: 20 passed, 0 failed.
+
+**Gates, in the required order**: `cargo test -p animusd --test console_
+tables --test console_create_table --test console_items --test console_
+endpoint` on the untrimmed files (12 passed, 41.4s); `cargo test -p
+animusd --lib sim_cluster_console -- --test-threads=2` (20 passed, 0
+failed, 36.78s); trim (delete the three files, add reason comments to
+`console_endpoint.rs`), then `cargo test -p animusd --test console_
+endpoint` (3 passed, 1.8s); `cargo test -p animusd --lib sim_cluster --
+--test-threads=2` (337 passed, 0 failed, 2 ignored, 938.11s — 317 baseline
++ this PR's 20 new tests; resident memory sampled every 10s from the test
+binary's own `/proc/<pid>/status` `VmRSS` via the anchored `pgrep -f
+'^<abs-path>/target/debug/deps/animusd-'` pattern: first ~62 MB, peak ~848
+MB, last ~136 MB — consistent with every prior rung's own no-leak
+trajectory); `cargo fmt --all --check` (one pass needed for the new file's
+own long call sites, applied via `cargo fmt --all`, then clean); `cargo
+clippy -p animusd --all-targets --all-features -- -D warnings` (clean).
+`Cargo.lock` unchanged.
+
+See ADR 0061's "Rung H, PR 3 landed" amendment and `docs/roadmap.md`'s
+C-08 entry for the full record.
