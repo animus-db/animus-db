@@ -864,9 +864,40 @@ the still-true paragraph after the table.
   widening of `ClientCtx`'s field types, which is what makes this rung
   mostly signature widening rather than new mechanism.
 - **Status (2026-09-08):** open — PR 1 (this docs opener), PR 2
-  (groundwork), PR 3 (console reachable + first siblings), and PR 4
-  (`console_stream.rs`/`console_table_config.rs` siblings) all landed, PR
-  2 corrected the same day in review; PRs 5–8 to follow. PR 4 gave 3 of
+  (groundwork), PR 3 (console reachable + first siblings), PR 4
+  (`console_stream.rs`/`console_table_config.rs` siblings), and PR 5
+  (admin dispatch pure observers) all landed, PR 2 corrected the same day
+  in review; PRs 6–8 to follow. PR 5 gave 5 of `admin_endpoint.rs`'s 23
+  tests, plus the "tables" half of a sixth, a deterministic `SimCluster`
+  sibling in a new `sim_cluster_admin.rs` (7 scenarios, 14 tests with
+  `_over_seeds`, all green once two scenario-authoring bugs and one real
+  `SimCluster` fixture bug this PR's own required gate surfaced were
+  fixed — see below). `tests/system_table.rs` (2 tests) and `tests/
+  metrics_endpoint.rs` (1 test) both stay `ProdEnv` whole: `admin.rs::
+  system_table` reads `ctx.control_storage`, which `SimCluster`'s own
+  node construction always leaves `None` (no ADR 0038 `DRIVER_APPLIED`
+  apply-task mirror under `SimEnv` — a new background-loop driver, out of
+  scope), and `metrics_endpoint.rs`'s own subject is the raw-text
+  `/metrics` listener on the dynamo port, unreachable through the JSON
+  `AdminHost` route table `SimCluster::admin` dispatches into (a JSON
+  analog exists instead). **A real, previously-latent `SimCluster`
+  fixture bug found and fixed**: `SimCluster::new`/`SimCluster::grow`
+  built every node's control `RaftNode` via the plain `RaftNode::start`
+  constructor, which defaults its own metrics to `env.metrics()` —
+  `SimEnv` doesn't override `Env::metrics`'s trait-default, so this
+  resolved to `MetricsHandle::noop()`, one process-wide `static` shared
+  sink; every node's control raft, on every `SimCluster` in the same test
+  binary process, therefore shared one mutable `is_leader` gauge (a
+  summed counter is merely inflated by the same sharing, harmless unless
+  a test asserts an exact value — only the gauge was corrupted outright),
+  caught only because this PR's own metrics scenario is the first
+  `SimCluster` test ever to read `/admin/metrics`'s `is_leader` field.
+  Fixed via `RaftNode::start_with_metrics` with a private per-node sink,
+  shared with that node's `DataRole::raftkv_metrics` (matching
+  production's own "one sink per combined node" contract). See `crates/
+  animusd/CLAUDE.md`'s matching C-08 PR 5 appendix for the full per-test
+  mapping and gate numbers, and `docs/engineering-lessons.md`'s new entry
+  for the general lesson. PR 4 gave 3 of
   `console_stream.rs`'s 4 tests and 5 of `console_table_config.rs`'s 9 a
   deterministic `SimCluster` sibling in two new modules,
   `sim_cluster_console_stream.rs` and `sim_cluster_console_table_

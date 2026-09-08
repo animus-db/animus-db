@@ -6051,10 +6051,16 @@ None` — `write_path::kind_write_item_at_leader` (already generic) and
 `dynamo::fast_marker_write`/`authz::record_denied` all call `ctx.data()`
 (a panic on `None`, ADR 0035 PR3's guard) on their hot paths. Every
 `DataRole` field is a plain, `Env`-free, `Default`-able handle
-(`MetricsHandle::noop()`, `StreamSealKnobs::default()`,
-`ChangeRateTracker`/`RequestRateTracker`, both `#[derive(Default)]`), so
-building a real one costs nothing and needs no `ProdEnv` — this was the
-"construct a SimEnv-safe `DataRole`" branch, not "gate the reads."
+(`StreamSealKnobs::default()`, `ChangeRateTracker`/`RequestRateTracker`,
+both `#[derive(Default)]`), so building a real one costs nothing and needs
+no `ProdEnv` — this was the "construct a SimEnv-safe `DataRole`" branch,
+not "gate the reads." **`raftkv_metrics` was `MetricsHandle::noop()` at
+the time this landed; ADR 0061 rung H, C-08 PR 5 found that a real, if
+latent, bug and fixed it to a private per-node `MetricsHandle::
+recording()`, shared with that node's own control `RaftNode`** — see this
+file's own C-08 PR 5 appendix and `docs/engineering-lessons.md`'s matching
+entry for the full account (a shared `noop()` sink silently corrupts a
+gauge like `is_leader`, unlike a merely-inflated-but-harmless counter).
 
 **`SimClusterHandle::dynamo`/`SimCluster::dynamo`** mirror `put`/`get`/
 `scan`'s own async-handle/sync-wrapper split, running a decoded request
@@ -8362,7 +8368,7 @@ kept `ProdEnv`, each with its own one-line reason in both files)**:
 | `disable_grace_lifecycle_end_to_end_with_reenable_coexistence` | Moved |
 | `drop_table_cascade_converges_via_the_janitor` | Moved |
 | `mid_grace_drop_removes_both_coexisting_labels` | Moved |
-| `metrics_reflect_a_completed_retention_cycle` | Moved (asserts on `segment_janitor_progress`, since `Metric::*` counters are structurally unreachable from `SimCluster` — no recording `MetricsHandle` is ever threaded in) |
+| `metrics_reflect_a_completed_retention_cycle` | Moved (asserts on `segment_janitor_progress`, since `Metric::*` counters were structurally unreachable from `SimCluster` at the time — no recording `MetricsHandle` was threaded in yet; ADR 0061 rung H, C-08 PR 5 later fixed `SimCluster::new`'s own control `RaftNode`s to use one, see this file's own C-08 PR 5 appendix, but this scenario's own assertion was never revisited to use it) |
 | `retired_parents_shards_are_not_reaped_early` | Moved (via `SimCluster::grow_stream` + `drive_inplace_split_cutover`, this rung's own new in-place-split-cutover driving) |
 | `retired_parents_final_shard_expires_by_retention` | Moved |
 | `segment_janitor_reclaims_objects_from_a_genuinely_control_only_leader` | **KEPT** — needs a genuine control-only/data-only process split; `SimCluster` has no notion of node role at all |
@@ -8747,4 +8753,99 @@ clippy -p animusd --all-targets --all-features -- -D warnings` (clean).
 `Cargo.lock` unchanged.
 
 See ADR 0061's "Rung H, PR 4 landed" amendment and `docs/roadmap.md`'s
+C-08 entry for the full record.
+
+## Appendix — `sim_cluster_admin.rs` observer-route siblings (ADR 0061 rung H, C-08 PR 5, 2026-09-08)
+
+Closes PR 5's own scope: the admin HTTP-JSON interface's **observer**
+routes (every mutation-free `GET`) plus a JSON-route analog of the
+metrics suite. Converts 5 of `tests/admin_endpoint.rs`'s 23 tests
+(`admin_credentials_view_never_serves_a_secret`, `admin_raftkv_key_
+count_is_scoped_per_tablet_after_split`, `admin_backups_view_reflects_
+the_catalog`, `admin_backup_store_reports_reclaim_progress_and_leader_
+state`, `admin_gc_reports_segment_janitor_progress_and_leader_state`)
+plus the "tables" half of `admin_ttl_reports_reaper_progress_and_ttl_
+tables` (a new scenario; that test itself stays whole) into a new
+`crates/animusd/src/sim_cluster_admin.rs` (7 scenarios × pinned-seed +
+5-seed `_over_seeds` = 14 tests). `tests/system_table.rs`'s two tests
+and `tests/metrics_endpoint.rs`'s one test stay `ProdEnv` whole — genuine
+`SimCluster` capability gaps, not scenario-design difficulties. **No
+`admin.rs`/`console.rs`/`dynamo.rs` dispatch change was needed** — PR 2
+already built `SimCluster::admin` (through `GenericAdminHost`) and every
+generic handler this module's scenarios reach.
+
+**Three genuinely new `sim_cluster.rs` fixture changes were needed**,
+surfaced by this rung's own required gate:
+
+1. `SimCluster::put_raw`/`SimClusterHandle::put_raw` (new, test-only) —
+   a literal-key write, since `SimCluster::put`'s `item_key`-encoded
+   (DynamoDB composite-key, hash-token-prefixed) keys make choosing a
+   literal, human-readable `POST /admin/tablet/split` split boundary
+   impractical from a test.
+2. **A real, previously-latent `SimCluster` fixture bug, found and
+   fixed**: `SimCluster::new`/`SimCluster::grow` built every control
+   `RaftNode<SimEnv>` via the plain `RaftNode::start(env, ids, engine)`
+   constructor, which defaults its own metrics to `env.metrics()` —
+   `SimEnv` doesn't override `Env::metrics`'s trait-default, so this
+   resolved to `MetricsHandle::noop()`, **one process-wide `static`
+   shared sink**. Every node's control `RaftNode`, on every `SimCluster`
+   instance in the same test binary process, therefore shared one
+   mutable `is_leader` gauge — the first control raft anywhere to become
+   leader stamped `is_leader: 1` onto `GET /admin/metrics` for every
+   node, permanently, regardless of that node's real role. A summed
+   *counter* under the same sharing is merely inflated (harmless unless
+   a test asserts an exact value, and none did) — only the gauge was
+   corrupted outright, unnoticed through five prior rungs since none of
+   them read `/admin/metrics`'s `is_leader` field specifically. Caught
+   only because this PR's own metrics scenario is the first `SimCluster`
+   test ever to read it. **Fixed**: both node-construction sites now
+   build one private `MetricsHandle::recording()` per node and call
+   `RaftNode::start_with_metrics`; `DataRole::raftkv_metrics` reuses the
+   SAME per-node handle, matching production's own "one sink per
+   combined node" contract. See `docs/engineering-lessons.md`'s matching
+   new entry for the general lesson.
+3. `admin.rs::system_table` reads `ctx.control_storage` (the per-node
+   system-keyspace mirror engine ADR 0038's `DRIVER_APPLIED` apply task
+   writes) — always `None` under `SimCluster`, so `GET /admin/
+   system-table` unconditionally answers `{"available": false}` there.
+   **Not fixed** — a new background-loop driver, out of scope.
+
+**Two scenario-authoring bugs found and fixed, neither a product bug**:
+a first draft issued a WIRE `CreateBackup` and expected `AVAILABLE` —
+impossible under this fixture, since the real per-tablet
+`backup_capture` driver never runs; redesigned around direct
+`MetaCommand`s + `SimCluster::seed_backup_object`, mirroring
+`sim_cluster_backup_janitor.rs`'s own `complete_a_backup` idiom. The GC
+scenario's first draft called `drive_stream_seal` on the CONTROL-plane
+leader rather than the table's own DATA-plane leader, so it silently
+no-op'd; fixed via `leader_of_table`.
+
+**Test-by-test disposition**: see ADR 0061's "Rung H, PR 5 landed"
+amendment for the full table (5 converted, 1 partial-conversion +
+kept-whole, 5 more kept `ProdEnv` in `admin_endpoint.rs`, both `system_
+table.rs` tests and the one `metrics_endpoint.rs` test kept `ProdEnv`
+whole, 12 tests untouched as PR 6's own territory).
+
+**Before/after counts**: `admin_endpoint.rs`: 23 → 18 (5 removed; the
+now-dead `bring_up_with_fs_backup_store` helper deleted alongside its
+one caller). `system_table.rs`: 2 → 2. `metrics_endpoint.rs`: 1 → 1.
+`sim_cluster_admin.rs`: 14 new tests (7 scenarios).
+
+**No product bug found in the widened dispatch code itself.**
+
+**Gates, in the required order**: `cargo test -p animusd --test admin_
+endpoint --test system_table --test metrics_endpoint` on the untrimmed
+files (26 passed, 15.5s); `cargo test -p animusd --lib sim_cluster_
+admin -- --test-threads=2` (14 passed, 0 failed — after fixing the two
+scenario-authoring bugs and the fixture bug above); trim, then the same
+three-file gate again (21 passed — 18 + 2 + 1, clean build, no dead-code
+warnings); `cargo test -p animusd --lib sim_cluster -- --test-threads=2`
+(367 passed, 0 failed, 2 ignored, 1005.43s — 353 baseline + this PR's 14
+new tests; anchored-sampler RSS: first ~62 MB, peak ~891 MB, last ~167
+MB, consistent with every prior rung's own no-leak trajectory); `cargo
+fmt --all --check` (one pass needed, applied via `cargo fmt --all`, then
+clean); `cargo clippy -p animusd --all-targets --all-features -- -D
+warnings` (clean). `Cargo.lock` unchanged.
+
+See ADR 0061's "Rung H, PR 5 landed" amendment and `docs/roadmap.md`'s
 C-08 entry for the full record.

@@ -142,74 +142,6 @@ async fn bring_up_with_streams_quiesce(
     panic!("could not bring up cluster after retries (ports kept getting stolen)");
 }
 
-/// Like [`bring_up_with_streams_quiesce`], but pins an explicit `fs:PATH`
-/// [`animusd::BackupStoreConfig`] (roadmap U-07's
-/// `admin_backup_store_reports_reclaim_progress_and_leader_state` needs a
-/// deterministic, per-node-local store to assert object counts against —
-/// the default `Cluster` variant's K-way replication would otherwise spread
-/// a backup's objects across nodes unpredictably for a 3-node test).
-async fn bring_up_with_fs_backup_store(
-    n: usize,
-    dir: &std::path::Path,
-    backup_store_dir: &std::path::Path,
-) -> (Vec<Node>, animusd::ClusterConfig) {
-    for attempt in 0..16 {
-        let addrs = support::free_addrs(n * 6);
-        let nodes_cfg: Vec<animusd::RoleAddrs> = (0..n)
-            .map(|i| animusd::RoleAddrs {
-                id: animusd::config::node_id(i),
-                role: animusd::config::NodeRole::Both,
-                internal: addrs[6 * i],
-                client: addrs[6 * i + 1],
-                dynamo: addrs[6 * i + 2],
-                admin: addrs[6 * i + 3],
-                intra: addrs[6 * i + 4],
-                console: addrs[6 * i + 5],
-                advertise_host: None,
-                tls: None,
-                encryption_key_path: None,
-            })
-            .collect();
-        let config = animusd::ClusterConfig {
-            nodes: nodes_cfg,
-            dynamo_auth: None,
-            cluster_settings: None,
-        };
-        let mut nodes = Vec::new();
-        let mut failed = false;
-        for i in 0..n {
-            match animusd::run_node_with_streams_quiesce_and_backup_store(
-                &config,
-                i,
-                dir.join(format!("node-{attempt}-{i}")),
-                animusd::StorageBackend::default(),
-                animus_control::node::DEFAULT_ORPHAN_SWEEP_AFTER,
-                animusd::StreamSealKnobs::default(),
-                animusd::SegmentStoreConfig::default(),
-                animusd::DEFAULT_STREAM_RETENTION,
-                Duration::ZERO,
-                animusd::BackupStoreConfig::Fs(backup_store_dir.join(format!("attempt-{attempt}"))),
-            )
-            .await
-            {
-                Ok(node) => nodes.push(node),
-                Err(_) => {
-                    failed = true;
-                    break;
-                }
-            }
-        }
-        if !failed {
-            return (nodes, config);
-        }
-        for node in &nodes {
-            node.shutdown_graceful().await;
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
-    panic!("could not bring up cluster after retries (ports kept getting stolen)");
-}
-
 /// Like [`bring_up`], but pins a fast TTL reaper sweep interval (roadmap
 /// U-07's `admin_ttl_reports_reaper_progress_and_ttl_tables` needs the
 /// reaper to actually reap an already-expired item within the test's own
@@ -217,9 +149,8 @@ async fn bring_up_with_fs_backup_store(
 /// real production sweep interval, `ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL`,
 /// on the order of a minute; mirrors `tests/dynamo_ttl.rs`'s own
 /// `TEST_TTL_SWEEP_INTERVAL`/`start_single_node_fast_ttl`, generalized to
-/// an `n`-node cluster via `run_node_with_ttl_sweep_interval`, which — like
-/// `bring_up_with_fs_backup_store`'s own `run_node_with_streams_quiesce_
-/// and_backup_store` — already takes a full multi-node `config` + `index`).
+/// an `n`-node cluster via `run_node_with_ttl_sweep_interval`, which already
+/// takes a full multi-node `config` + `index`).
 async fn bring_up_with_fast_ttl(
     n: usize,
     dir: &std::path::Path,
@@ -971,168 +902,11 @@ async fn admin_table_management_create_and_drop() {
     .expect("test timed out");
 }
 
-/// `GET /admin/backups` (ADR 0059 §3): a pure observer over the replicated
-/// backup catalog. No wire API/capture driver exists yet in this train, so
-/// this drives the catalog directly via `Node::propose_meta` (mirroring
-/// `system_table.rs`'s own harness-level `MetaCommand` proposals) — a
-/// real-cluster proof that the admin view reflects `Metadata::backups`/
-/// `backup_tablet_progress` end to end, including the status transition to
-/// `AVAILABLE`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
-async fn admin_backups_view_reflects_the_catalog() {
-    timeout(Duration::from_secs(60), async {
-        let dir = support::panic_safe_tempdir();
-        let (nodes, _config) = bring_up(3, dir.path()).await;
-        await_bootstrap(&nodes).await;
-        let a = nodes[0].admin_addr();
-
-        // A real table (also provisions its first tablet, via the ordinary
-        // DynamoDB `CreateTable` path).
-        let (s, body) = admin(
-            a,
-            "POST",
-            "/admin/data/dynamo",
-            Some(
-                r#"{"op":"CreateTable","payload":{"TableName":"widgets","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}]}}"#,
-            ),
-        )
-        .await;
-        assert_eq!(s, 200, "CreateTable via admin proxy: {body}");
-        timeout(Duration::from_secs(10), async {
-            loop {
-                let (_, status) = admin_get(a, "/admin/status").await;
-                if status["schemas"]["tables"]
-                    .get("widgets")
-                    .is_some_and(|v| !v.is_null())
-                {
-                    return;
-                }
-                sleep(Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .expect("table did not appear in the catalog");
-
-        // Starts empty.
-        let (s, empty) = admin_get(a, "/admin/backups").await;
-        assert_eq!(s, 200);
-        assert_eq!(
-            empty["backups"].as_array().unwrap().len(),
-            0,
-            "no backups yet: {empty}"
-        );
-
-        // `BeginBackup`, proposed directly (this test predates the Train 1
-        // PR④ wire surface and stays scoped to the admin observer alone —
-        // `dynamo_backup.rs` covers the real `CreateBackup` wire path) —
-        // retried across nodes since only the control leader accepts it.
-        let begin = animus_control::MetaCommand::BeginBackup {
-            backup_id: "backup-1".to_string(),
-            table: "widgets".to_string(),
-            created_wall_ms: 1_000,
-            backup_name: "backup".to_string(),
-            pitr_base: false,
-        };
-        timeout(Duration::from_secs(10), async {
-            loop {
-                if nodes.iter().any(|n| n.propose_meta(begin.clone())) {
-                    return;
-                }
-                sleep(Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .expect("BeginBackup never accepted by a leader");
-
-        let backups = timeout(Duration::from_secs(10), async {
-            loop {
-                let (s, body) = admin_get(a, "/admin/backups").await;
-                assert_eq!(s, 200);
-                let arr = body["backups"].as_array().cloned().unwrap_or_default();
-                if arr.iter().any(|b| b["backup_id"] == "backup-1") {
-                    return body;
-                }
-                sleep(Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .expect("backup row did not appear in /admin/backups");
-
-        let tablet_ids: Vec<u64> = {
-            let row = backups["backups"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|b| b["backup_id"] == "backup-1")
-                .expect("backup-1 present");
-            assert_eq!(row["table"], "widgets");
-            assert_eq!(row["status"]["state"], "CREATING");
-            assert_eq!(row["created_wall_ms"], 1000);
-            let tablets = row["tablets"].as_array().expect("tablets array");
-            assert!(!tablets.is_empty(), "at least one pinned tablet: {row}");
-            assert!(
-                tablets.iter().all(|t| t["reported"] == false),
-                "nothing reported yet: {row}"
-            );
-            tablets
-                .iter()
-                .map(|t| t["tablet"].as_str().unwrap().parse().unwrap())
-                .collect()
-        };
-
-        // Report every pinned tablet complete, then complete the backup —
-        // proposed on the same leader in order, so Raft's log order alone
-        // guarantees `CompleteBackup` applies after every report.
-        for tablet in &tablet_ids {
-            let record = animus_control::MetaCommand::RecordBackupTabletComplete {
-                backup_id: "backup-1".to_string(),
-                tablet: animus_tablet::TabletId(*tablet),
-                cut_version: 42,
-                bytes: 4_096,
-            };
-            assert!(
-                nodes.iter().any(|n| n.propose_meta(record.clone())),
-                "RecordBackupTabletComplete never accepted by a leader"
-            );
-        }
-        let complete = animus_control::MetaCommand::CompleteBackup {
-            backup_id: "backup-1".to_string(),
-        };
-        assert!(
-            nodes.iter().any(|n| n.propose_meta(complete.clone())),
-            "CompleteBackup never accepted by a leader"
-        );
-
-        let expected_total = 4_096 * tablet_ids.len() as u64;
-        timeout(Duration::from_secs(10), async {
-            loop {
-                let (_, body) = admin_get(a, "/admin/backups").await;
-                let row = body["backups"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .find(|b| b["backup_id"] == "backup-1")
-                    .cloned();
-                if let Some(row) = row
-                    && row["status"]["state"] == "AVAILABLE"
-                {
-                    assert_eq!(row["total_bytes"].as_u64().unwrap(), expected_total);
-                    assert!(row["tablets"].as_array().unwrap().iter().all(|t| t["reported"] == true));
-                    return;
-                }
-                sleep(Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .expect("backup never reached AVAILABLE in /admin/backups");
-
-        for node in &nodes {
-            node.shutdown_graceful().await;
-        }
-    })
-    .await
-    .expect("test timed out");
-}
+// `admin_backups_view_reflects_the_catalog` converted → ADR 0061 rung H,
+// C-08 PR 5's `sim_cluster_admin.rs::backups_view_reflects_the_catalog`
+// (`BeginBackup`/`RecordBackupTabletComplete`/`CompleteBackup` proposed
+// directly via `SimCluster::propose_meta`, mirroring this test's own
+// harness-level `MetaCommand` idiom) — deleted from this file.
 
 /// The CP data plane's per-tablet Raft group must hold **stable leadership under
 /// sustained write load** — the driver-liveness guarantee (ADR 0017). Before engine
@@ -1418,6 +1192,12 @@ async fn admin_seed_writes_synthetic_keys() {
 /// shape and duration, so whatever background work the node's own loops do
 /// lands in both and cancels out of the comparison; only the route's own
 /// cost differs.
+///
+/// **KEPT `ProdEnv` (ADR 0061 rung H, C-08 PR 5)**: `SimCluster`'s engine
+/// is `MemoryEngine`, not `LsmEngine` — there is no SSTable/block-read
+/// counter at all under `SimEnv`, so the cost differential this test
+/// measures (`storage_sstable_block_reads` between the cheap and
+/// `?exact=1` paths) cannot exist under that fixture.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn admin_raftkv_default_does_not_materialize_the_dataset() {
     /// Enough rows that one materializing scan is unmistakable in block
@@ -1628,117 +1408,10 @@ async fn admin_raftkv_default_does_not_materialize_the_dataset() {
     .expect("test timed out");
 }
 
-/// Regression: `/admin/raftkv?exact=1`'s `key_count` must be scoped to each
-/// tablet's own range, not the node's combined total. A node hosts more than
-/// one tablet as soon as it hosts a split's parent + child (ADR 0028); before
-/// the fix, `key_count` read the whole shared engine
-/// (`CpGroup::approx_key_count`), so both halves' rows showed the *node's*
-/// combined total rather than their own subset.
-///
-/// Asks for `?exact=1` explicitly: the polled default is now the cheap
-/// estimate (see `admin_raftkv_default_does_not_materialize_the_dataset`),
-/// and this test's exact-total assertion is precisely what the exact path
-/// exists to answer.
-#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
-async fn admin_raftkv_key_count_is_scoped_per_tablet_after_split() {
-    timeout(Duration::from_secs(60), async {
-        let dir = support::panic_safe_tempdir();
-        let (nodes, _config) = bring_up(3, dir.path()).await;
-        await_bootstrap(&nodes).await;
-
-        // Write 10 distinct keys to the single bootstrap tablet through the
-        // client API (forwarded to the CP leader as needed).
-        let mut stream = TcpStream::connect(nodes[0].client_addr())
-            .await
-            .expect("connect");
-        for i in 0..10u32 {
-            let key = format!("key{i:02}").into_bytes();
-            let value = format!("v{i}").into_bytes();
-            put(&mut stream, "kv", key, value).await;
-        }
-
-        // Manually split the bootstrap tablet at the midpoint key (ADR 0028: a
-        // single atomic control-plane command, no separate data-plane step).
-        let admin_addr = nodes[0].admin_addr();
-        let (s, split) = admin(
-            admin_addr,
-            "POST",
-            "/admin/tablet/split",
-            Some(r#"{"tablet":1,"split_key":"key05"}"#),
-        )
-        .await;
-        assert_eq!(s, 200, "split committed: {split}");
-
-        // Wait for both halves to appear in the replicated tablet map.
-        timeout(Duration::from_secs(15), async {
-            loop {
-                if nodes.iter().all(|n| n.metadata().tablets.len() >= 2) {
-                    return;
-                }
-                sleep(Duration::from_millis(100)).await;
-            }
-        })
-        .await
-        .expect("split did not produce two tablets");
-
-        // Node 0 hosts both halves (RF == cluster size here). Poll
-        // `/admin/raftkv` until both groups report a `key_count`.
-        let counts: std::collections::BTreeMap<u64, u64> =
-            timeout(Duration::from_secs(15), async {
-                loop {
-                    let (_, raftkv) = admin_get(admin_addr, "/admin/raftkv?exact=1").await;
-                    let groups = raftkv["groups"].as_array().cloned().unwrap_or_default();
-                    // Post-cutover + reclaim (ADR 0050 rung 5): exactly the
-                    // two children remain — the parent's group (tablet 1)
-                    // must be GONE, not merely outnumbered (a mid-workflow
-                    // poll sees parent + two seeding children = 3 groups).
-                    if groups.len() == 2
-                        && groups.iter().all(|g| {
-                            g["tablet"].as_u64() != Some(1) && g["key_count"].as_u64().is_some()
-                        })
-                    {
-                        return groups
-                            .into_iter()
-                            .map(|g| {
-                                (
-                                    g["tablet"].as_u64().unwrap(),
-                                    g["key_count"].as_u64().unwrap(),
-                                )
-                            })
-                            .collect();
-                    }
-                    sleep(Duration::from_millis(100)).await;
-                }
-            })
-            .await
-            .expect("node 0 hosts both split halves with a key_count");
-
-        assert_eq!(
-            counts.len(),
-            2,
-            "node 0 hosts two distinct tablets after the split: {counts:?}"
-        );
-        let total: u64 = counts.values().sum();
-        assert_eq!(
-            total, 10,
-            "combined key_count across both tablets equals the 10 written keys: {counts:?}"
-        );
-        for (tablet, count) in &counts {
-            assert!(
-                *count < 10,
-                "tablet {tablet}'s key_count ({count}) must be its own scoped subset, \
-                 not the node's combined total of 10 keys across both co-resident tablets \
-                 (the regression this test guards against)"
-            );
-        }
-
-        for node in &nodes {
-            node.shutdown_graceful().await;
-        }
-    })
-    .await
-    .expect("test timed out");
-}
+// `admin_raftkv_key_count_is_scoped_per_tablet_after_split` converted
+// → ADR 0061 rung H, C-08 PR 5's `sim_cluster_admin.rs::raftkv_key_
+// count_is_scoped_per_tablet_after_split` (the fixture's own split +
+// `GET /admin/raftkv?exact=1`) — deleted from this file.
 
 /// ADR 0062 rung 4 ("fork first, always local") teeth: `trigger_split`'s
 /// `InPlace` arm no longer calls `split_child_placement` — both children's
@@ -1977,6 +1650,10 @@ async fn bring_up_with_auth(
 /// anywhere in the served JSON, however it's rendered. Asserted against the
 /// raw response body text, not just the parsed `auth_access_key_ids` field,
 /// so this would catch the secret leaking through some other field too.
+///
+/// **KEPT `ProdEnv` (ADR 0061 rung H, C-08 PR 5)**: no `SimCluster`
+/// constructor knob configures `dynamo_auth` — every node's own
+/// `ClientCtx::dynamo_auth` is `None` in that fixture, unconditionally.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn admin_config_reports_auth_state_and_never_serves_the_secret() {
     timeout(Duration::from_secs(30), async {
@@ -2018,56 +1695,11 @@ async fn admin_config_reports_auth_state_and_never_serves_the_secret() {
 }
 
 // --- ADR 0066: the replicated credential catalog's admin CRUD -------------
-
-/// `POST /admin/credentials` → `GET /admin/credentials`: the row commits and
-/// is visible, redacted, with no secret anywhere in the raw response —
-/// mirroring `admin_config_reports_auth_state_and_never_serves_the_secret`'s
-/// own load-bearing assertion.
-#[tokio::test(flavor = "multi_thread")]
-async fn admin_credentials_view_never_serves_a_secret() {
-    timeout(Duration::from_secs(30), async {
-        const ACCESS_KEY_ID: &str = "AKIDEXAMPLE";
-        const SECRET: &str = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
-
-        let dir = support::panic_safe_tempdir();
-        let (nodes, _config) = bring_up(1, dir.path()).await;
-        let admin_addr = nodes[0].admin_addr();
-
-        let put_body =
-            serde_json::json!({"id": ACCESS_KEY_ID, "secret": SECRET, "enabled": true}).to_string();
-        let (status, put_resp) =
-            admin(admin_addr, "POST", "/admin/credentials", Some(&put_body)).await;
-        assert_eq!(status, 200, "PutCredential: {put_resp}");
-        assert_eq!(put_resp["id"], ACCESS_KEY_ID);
-        assert_eq!(put_resp["enabled"], true);
-        assert_eq!(put_resp["rotation"], Value::Null);
-
-        let (status, view) = admin_get(admin_addr, "/admin/credentials").await;
-        assert_eq!(status, 200, "credentials view: {view}");
-        let rows = view["credentials"].as_array().expect("credentials array");
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0]["id"], ACCESS_KEY_ID);
-
-        // The load-bearing assertion: the secret never leaves this node's
-        // admin surface, in this field or any other, on either response.
-        let raw_put = serde_json::to_string(&put_resp).expect("put_resp serializes");
-        let raw_view = serde_json::to_string(&view).expect("view serializes");
-        assert!(
-            !raw_put.contains(SECRET),
-            "PutCredential's own response must never echo the secret: {raw_put}"
-        );
-        assert!(
-            !raw_view.contains(SECRET),
-            "GET /admin/credentials must never serve a secret: {raw_view}"
-        );
-
-        for node in &nodes {
-            node.shutdown_graceful().await;
-        }
-    })
-    .await
-    .expect("test timed out");
-}
+//
+// `admin_credentials_view_never_serves_a_secret` converted → ADR 0061 rung
+// H, C-08 PR 5's `sim_cluster_admin.rs::credentials_view_never_serves_a_
+// secret` (`PutCredential` then `GET /admin/credentials`, redacted, no
+// secret anywhere in either response) — deleted from this file.
 
 /// The full `Put`/`Rotate`/`Revoke` life cycle through the admin API,
 /// including the redacted rotation-grace-window fields.
@@ -2463,156 +2095,12 @@ async fn admin_storage_compact_action() {
     .expect("test timed out");
 }
 
-/// `GET /admin/backup-store` (ADR 0059 §1/§3, roadmap U-07) end to end on a
-/// real cluster with an `fs:` backup store: create a table, create an
-/// on-demand backup, delete it, and poll (converged-or-timeout) until the
-/// control-plane leader's own route shows the backup janitor having
-/// reclaimed every local object — plus a follower reports `leader: false`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
-async fn admin_backup_store_reports_reclaim_progress_and_leader_state() {
-    timeout(Duration::from_secs(90), async {
-        let dir = support::panic_safe_tempdir();
-        let backup_store_dir = dir.path().join("fs-backup-store");
-        let (nodes, _config) =
-            bring_up_with_fs_backup_store(3, dir.path(), &backup_store_dir).await;
-        await_bootstrap(&nodes).await;
-
-        let leader_idx = nodes
-            .iter()
-            .position(Node::is_control_leader)
-            .expect("a control leader exists after bootstrap");
-        let leader_addr = nodes[leader_idx].admin_addr();
-        let follower_addr = nodes
-            .iter()
-            .enumerate()
-            .find(|(i, _)| *i != leader_idx)
-            .map(|(_, n)| n.admin_addr())
-            .expect("a follower exists in a 3-node cluster");
-
-        // ---- baseline: an unconfigured/no-backups-yet leader is honestly
-        //      idle, and reports itself the control leader -------------------
-        let (s, baseline) = admin_get(leader_addr, "/admin/backup-store").await;
-        assert_eq!(s, 200, "GET /admin/backup-store on the leader: {baseline}");
-        assert_eq!(baseline["leader"], true, "the leader reports itself: {baseline}");
-        assert_eq!(baseline["store"]["kind"], "fs", "the configured fs: store: {baseline}");
-        assert!(
-            baseline["objects"]["count"].as_u64().is_some(),
-            "objects.count is always present (even zero): {baseline}"
-        );
-        let baseline_count = baseline["objects"]["count"].as_u64().unwrap();
-
-        // ---- a follower never runs the janitor, and says so ----------------
-        let (s, follower_view) = admin_get(follower_addr, "/admin/backup-store").await;
-        assert_eq!(s, 200, "GET /admin/backup-store on a follower: {follower_view}");
-        assert_eq!(
-            follower_view["leader"], false,
-            "a follower reports leader: false: {follower_view}"
-        );
-        assert_eq!(
-            follower_view["janitor"]["phase"], "idle",
-            "a follower's own janitor never advances past idle: {follower_view}"
-        );
-
-        // ---- create a table, write a row, and take an on-demand backup
-        //      through the leader's own admin dynamo proxy -------------------
-        let (s, ct_body) = admin(
-            leader_addr,
-            "POST",
-            "/admin/data/dynamo",
-            Some(
-                r#"{"op":"CreateTable","payload":{"TableName":"widgets","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}]}}"#,
-            ),
-        )
-        .await;
-        assert_eq!(s, 200, "CreateTable: {ct_body}");
-        let (s, put_body) = admin(
-            leader_addr,
-            "POST",
-            "/admin/data/dynamo",
-            Some(r#"{"op":"PutItem","payload":{"TableName":"widgets","Item":{"id":{"S":"w1"}}}}"#),
-        )
-        .await;
-        assert_eq!(s, 200, "PutItem: {put_body}");
-
-        let (s, created) = admin(
-            leader_addr,
-            "POST",
-            "/admin/data/dynamo",
-            Some(r#"{"op":"CreateBackup","payload":{"TableName":"widgets","BackupName":"nightly"}}"#),
-        )
-        .await;
-        assert_eq!(s, 200, "CreateBackup: {created}");
-        let backup_arn = created["BackupDetails"]["BackupArn"]
-            .as_str()
-            .expect("BackupArn")
-            .to_owned();
-
-        // ---- poll to AVAILABLE ----------------------------------------------
-        timeout(Duration::from_secs(20), async {
-            loop {
-                let (s, view) = admin_get(leader_addr, "/admin/backups").await;
-                assert_eq!(s, 200);
-                let row = view["backups"]
-                    .as_array()
-                    .and_then(|rows| rows.iter().find(|r| r["backup_id"] == backup_arn));
-                if row.is_some_and(|r| r["status"]["state"] == "AVAILABLE") {
-                    return;
-                }
-                sleep(Duration::from_millis(100)).await;
-            }
-        })
-        .await
-        .expect("backup did not become AVAILABLE in 20s");
-
-        // ---- object count on the leader has grown past the baseline --------
-        timeout(Duration::from_secs(10), async {
-            loop {
-                let (_, v) = admin_get(leader_addr, "/admin/backup-store").await;
-                if v["objects"]["count"].as_u64().unwrap_or(0) > baseline_count {
-                    return;
-                }
-                sleep(Duration::from_millis(100)).await;
-            }
-        })
-        .await
-        .expect("the leader's own object count never grew past baseline after CreateBackup");
-
-        // ---- delete it, then poll converged-or-timeout until the janitor
-        //      has reclaimed it: object count back at baseline (or
-        //      objects_reclaimed > 0), on the LEADER's own route -------------
-        let (s, deleted) = admin(
-            leader_addr,
-            "POST",
-            "/admin/data/dynamo",
-            Some(&format!(
-                r#"{{"op":"DeleteBackup","payload":{{"BackupArn":"{backup_arn}"}}}}"#
-            )),
-        )
-        .await;
-        assert_eq!(s, 200, "DeleteBackup: {deleted}");
-
-        timeout(Duration::from_secs(20), async {
-            loop {
-                let (s, v) = admin_get(leader_addr, "/admin/backup-store").await;
-                assert_eq!(s, 200, "GET /admin/backup-store: {v}");
-                let count = v["objects"]["count"].as_u64().unwrap_or(u64::MAX);
-                let reclaimed = v["janitor"]["objects_reclaimed"].as_u64().unwrap_or(0);
-                if count <= baseline_count && reclaimed > 0 {
-                    return v;
-                }
-                sleep(Duration::from_millis(100)).await;
-            }
-        })
-        .await
-        .expect("the backup janitor never reclaimed the deleted backup's objects in 20s");
-
-        for node in &nodes {
-            node.shutdown_graceful().await;
-        }
-    })
-    .await
-    .expect("test timed out");
-}
+// `admin_backup_store_reports_reclaim_progress_and_leader_state`
+// converted → ADR 0061 rung H, C-08 PR 5's `sim_cluster_admin.rs::
+// backup_store_reports_reclaim_progress_and_leader_state` (a backup
+// driven to `Available` via direct `MetaCommand`s, the sim's always-on
+// backup janitor reclaiming its seeded objects after `MarkBackup
+// Deleted`) — deleted from this file.
 
 /// `GET /admin/ttl` (ADR 0051, roadmap U-07) end to end on a real cluster:
 /// `UpdateTimeToLive` on a table, `PutItem` an already-expired item, and
@@ -2621,6 +2109,17 @@ async fn admin_backup_store_reports_reclaim_progress_and_leader_state() {
 /// table (the replicated catalog is identical everywhere), and a node
 /// leading none of that table's tablets still answers about its own
 /// (honestly idle) counters rather than erroring.
+///
+/// **KEPT `ProdEnv` whole (ADR 0061 rung H, C-08 PR 5)**: no primitive
+/// drives `animusd::ttl_reaper::ttl_reaper_loop` under `SimEnv`
+/// (`SimCluster::new`/`restart` never spawn it, unlike the heartbeat/
+/// reconciler/backup-janitor/segment-janitor loops, all always-on since
+/// D4/rung G), so nothing in that fixture would ever reap the expired item
+/// this test's own reaper-progress half depends on — the TTL reaper is its
+/// own unowned residual group, deliberately not built this PR. The
+/// "tables" half alone (`UpdateTimeToLive` + `GET /admin/ttl` converging
+/// on every node) has its own sibling instead:
+/// `sim_cluster_admin.rs::ttl_tables_lists_a_ttl_enabled_table`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn admin_ttl_reports_reaper_progress_and_ttl_tables() {
     timeout(Duration::from_secs(90), async {
@@ -2751,159 +2250,12 @@ async fn admin_ttl_reports_reaper_progress_and_ttl_tables() {
     .expect("test timed out");
 }
 
-/// `GET /admin/gc` (ADR 0042 §10/ADR 0043 §A9, roadmap U-07): a real 3-node
-/// cluster with DynamoDB Streams enabled and a generous retention (600s —
-/// see [`bring_up_with_streams`]'s own doc for why: this test's own
-/// reclaim must be driven by the segment janitor's drop-table cascade, not
-/// by retention itself elapsing, or a passing run would prove nothing).
-/// Creates a streamed table, writes one item, waits for it to seal, drops
-/// the table (the janitor's own "table_dropped" rule reclaims a dropped
-/// table's stream-shard rows immediately, regardless of retention — the
-/// same mechanism `tests/stream_janitor.rs::
-/// drop_table_cascade_converges_via_the_janitor` exercises), then polls
-/// converged-or-timeout until the control-plane leader's own route shows
-/// `orphans_deleted_total >= 1`. A follower reports `leader: false` and
-/// stays `idle` throughout, mirroring `admin_backup_store_reports_
-/// reclaim_progress_and_leader_state`'s own follower assertion — this
-/// janitor is control-plane-leader-only exactly like the backup janitor.
-#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
-async fn admin_gc_reports_segment_janitor_progress_and_leader_state() {
-    timeout(Duration::from_secs(90), async {
-        let dir = support::panic_safe_tempdir();
-        let (nodes, _config) = bring_up_with_streams(3, dir.path()).await;
-        await_bootstrap(&nodes).await;
-
-        let leader_idx = nodes
-            .iter()
-            .position(Node::is_control_leader)
-            .expect("a control leader exists after bootstrap");
-        let leader_addr = nodes[leader_idx].admin_addr();
-        let follower_addr = nodes
-            .iter()
-            .enumerate()
-            .find(|(i, _)| *i != leader_idx)
-            .map(|(_, n)| n.admin_addr())
-            .expect("a follower exists in a 3-node cluster");
-
-        // ---- baseline: an unconfigured/no-drops-yet leader is honestly
-        //      idle, and reports itself the control leader -----------------
-        let (s, baseline) = admin_get(leader_addr, "/admin/gc").await;
-        assert_eq!(s, 200, "GET /admin/gc on the leader: {baseline}");
-        assert_eq!(baseline["leader"], true, "the leader reports itself: {baseline}");
-        assert!(
-            baseline["janitor"]["phase"].is_string(),
-            "janitor.phase is always present: {baseline}"
-        );
-
-        // ---- a follower never runs the janitor, and says so ----------------
-        let (s, follower_view) = admin_get(follower_addr, "/admin/gc").await;
-        assert_eq!(s, 200, "GET /admin/gc on a follower: {follower_view}");
-        assert_eq!(
-            follower_view["leader"], false,
-            "a follower reports leader: false: {follower_view}"
-        );
-        assert_eq!(
-            follower_view["janitor"]["phase"], "idle",
-            "a follower's own janitor never advances past idle: {follower_view}"
-        );
-
-        // ---- create a streamed table and write one item through the admin
-        //      dynamo proxy on any node (it forwards internally) ------------
-        let any_addr = nodes[0].admin_addr();
-        let (s, ct) = admin(
-            any_addr,
-            "POST",
-            "/admin/data/dynamo",
-            Some(
-                r#"{"op":"CreateTable","payload":{"TableName":"t","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"StreamSpecification":{"StreamEnabled":true,"StreamViewType":"KEYS_ONLY"}}}"#,
-            ),
-        )
-        .await;
-        assert_eq!(s, 200, "CreateTable: {ct}");
-        let (s, put) = admin(
-            any_addr,
-            "POST",
-            "/admin/data/dynamo",
-            Some(r#"{"op":"PutItem","payload":{"TableName":"t","Item":{"id":{"S":"p1"}}}}"#),
-        )
-        .await;
-        assert_eq!(s, 200, "PutItem: {put}");
-
-        // ---- wait for the write to seal into a catalog row (seal_bytes: 1
-        //      means this should be near-immediate) ---------------------------
-        timeout(Duration::from_secs(20), async {
-            loop {
-                if !nodes[leader_idx].metadata().stream_shards.is_empty() {
-                    return;
-                }
-                sleep(Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .expect("no sealed stream-shard row appeared within 20s");
-        assert!(
-            !nodes[leader_idx].metadata().stream_shards.is_empty(),
-            "test premise: at least one live catalog row exists before the drop"
-        );
-
-        // ---- drop the table: the janitor's own drop-table rule reclaims
-        //      its stream-shard row(s) immediately, regardless of retention --
-        let (s, drop_body) = admin(
-            any_addr,
-            "POST",
-            "/admin/data/drop-table",
-            Some(r#"{"table":"t"}"#),
-        )
-        .await;
-        assert_eq!(s, 200, "drop-table: {drop_body}");
-
-        // ---- poll converged-or-timeout: the leader's own route shows the
-        //      janitor has actually deleted at least one segment object -----
-        timeout(Duration::from_secs(20), async {
-            loop {
-                let (s, v) = admin_get(leader_addr, "/admin/gc").await;
-                assert_eq!(s, 200, "GET /admin/gc: {v}");
-                if v["janitor"]["orphans_deleted_total"].as_u64().unwrap_or(0) >= 1 {
-                    return;
-                }
-                sleep(Duration::from_millis(100)).await;
-            }
-        })
-        .await
-        .expect(
-            "the control leader's own /admin/gc never reported orphans_deleted_total >= 1 \
-             within 20s",
-        );
-
-        // ---- and the dropped table's own catalog rows are actually gone,
-        //      the same convergence `tests/stream_janitor.rs`'s own
-        //      drop-table-cascade test asserts -------------------------------
-        timeout(Duration::from_secs(20), async {
-            loop {
-                if nodes[leader_idx].metadata().stream_shards.is_empty() {
-                    return;
-                }
-                sleep(Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .expect("stream-shard catalog rows were never cleared after the table drop");
-
-        // ---- a follower still reports leader: false throughout -------------
-        let (s, follower_after) = admin_get(follower_addr, "/admin/gc").await;
-        assert_eq!(s, 200, "GET /admin/gc on a follower: {follower_after}");
-        assert_eq!(
-            follower_after["leader"], false,
-            "a follower still reports leader: false after the drop: {follower_after}"
-        );
-
-        for node in &nodes {
-            node.shutdown_graceful().await;
-        }
-    })
-    .await
-    .expect("test timed out");
-}
+// `admin_gc_reports_segment_janitor_progress_and_leader_state`
+// converted → ADR 0061 rung H, C-08 PR 5's `sim_cluster_admin.rs::
+// gc_reports_segment_janitor_progress_and_leader_state` (a streamed
+// table, a seal on the table's own data-plane leader, `POST /admin/
+// data/drop-table`, the sim's always-on segment janitor converging
+// `orphans_deleted_total >= 1`) — deleted from this file.
 
 /// `GET /admin/segment-store` (ADR 0043 §A7b, roadmap U-07's fourth and
 /// last route): a real 3-node cluster with DynamoDB Streams enabled and the
@@ -2918,6 +2270,16 @@ async fn admin_gc_reports_segment_janitor_progress_and_leader_state() {
 /// single-node cluster configured with the `fs` opt-in reports
 /// `shards: null` (no per-node replica concept for a single shared
 /// directory every node already reads).
+///
+/// **KEPT `ProdEnv` (ADR 0061 rung H, C-08 PR 5)**: `SimCluster`'s shared
+/// stream segment store is `SegmentStoreHandle::S3` (one shared object
+/// store), never `Cluster`; `AdminInfo.segment_store` is always `None`
+/// (JSON `null`) under that fixture, so `/admin/segment-store`'s
+/// `is_cluster` shard-placement rendering (gated on a `kind == "cluster"`
+/// display label the fixture never sets) would need faking a display
+/// string rather than exercising the real `ClusterSegmentStore` per-node
+/// replica-placement mechanism this test's own subject is — no primitive
+/// for that exists under `SimEnv`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn admin_segment_store_reports_shard_placement_and_local_objects() {
     timeout(Duration::from_secs(90), async {
@@ -3038,6 +2400,11 @@ async fn admin_segment_store_reports_shard_placement_and_local_objects() {
 /// replica concept to report when every node already reads the identical
 /// directory (see `SegmentStoreHandle::put_sealed`'s own doc for the
 /// empty-`replicas`/"ask any node" convention this mirrors).
+///
+/// **KEPT `ProdEnv` (ADR 0061 rung H, C-08 PR 5)**: `SimCluster`'s shared
+/// segment store is `S3`-kind, never `fs`-kind, and this test is
+/// genuinely `fs`-kind-specific — the identical store-kind gap the
+/// `shard_placement_and_local_objects` test above stays `ProdEnv` for.
 #[tokio::test(flavor = "multi_thread")]
 async fn admin_segment_store_reports_null_shards_for_the_fs_kind() {
     timeout(Duration::from_secs(60), async {
@@ -3114,6 +2481,14 @@ async fn bring_up_lone_voter_of(n: usize, dir: &std::path::Path) -> Node {
 /// the first place). A Kubernetes `livenessProbe` pointed at the readiness
 /// route would SIGTERM this node even though it is healthy and correctly
 /// still trying to join; `/admin/live` must never make that mistake.
+///
+/// **KEPT `ProdEnv` (ADR 0061 rung H, C-08 PR 5)**: `SimCluster::new`'s
+/// own doc: "Settles the control group (drives past its first election)
+/// before returning" — there is no constructor for a node that boots
+/// without ever completing bootstrap, so a genuinely-leaderless-from-the-
+/// start node (this test's own subject) cannot be produced under that
+/// fixture; crashing peers afterward would test leadership LOSS after a
+/// known leader, a materially different condition.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn admin_live_is_200_while_a_genuinely_leaderless_admin_health_is_503() {
     timeout(Duration::from_secs(30), async {

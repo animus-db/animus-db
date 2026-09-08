@@ -24,6 +24,20 @@
 //!   `tablet` rows (one plain `Put` per distinct table auto-provisions one),
 //!   then walks the forward-only pager at a small `limit` and diffs the
 //!   concatenated pages against one unlimited fetch.
+//!
+//! **Both tests stay `ProdEnv` (ADR 0061 rung H, C-08 PR 5)**: a genuine
+//! `SimCluster` capability gap this rung's own investigation surfaced, not
+//! merely a scenario-design difficulty. `admin.rs::system_table` reads
+//! `ctx.control_storage` — the per-node system-keyspace mirror engine ADR
+//! 0038's `DRIVER_APPLIED` apply task durably writes — and `SimCluster`'s
+//! own node construction (`sim_cluster.rs`) always sets `control_storage:
+//! None`: no apply task mirrors `Metadata` into a system-keyspace
+//! `StorageEngine` under `SimEnv` at all, so `GET /admin/system-table`
+//! unconditionally answers `{"available": false}` there regardless of what
+//! a scenario seeds. Building that apply-task mirror is a new
+//! background-loop driver, explicitly out of this PR's scope. See
+//! `crates/animusd/src/sim_cluster_admin.rs`'s own module doc for the full
+//! account.
 
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
