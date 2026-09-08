@@ -204,6 +204,24 @@ const RECONCILER_FALLBACK: Duration = Duration::from_millis(200);
 /// unconditional loop with no wall-clock deadline to fall back on.
 const STREAM_SEAL_RETRIES: u32 = 5;
 
+/// [`SimCluster::new`]'s own default segment-janitor retention window (ADR
+/// 0061 rung G, C-07 PR 5) — generous enough that no scenario's own virtual-
+/// time budget crosses it by accident (every scenario's own `run_for`/`put`/
+/// `get`/`dynamo` calls together stay comfortably under an hour of virtual
+/// time), so a caller that never asks for a shorter one gets, in effect,
+/// "the janitor's retention phase never fires." A scenario that DOES want
+/// retention to actually elapse (this rung's own `sim_cluster_stream_
+/// janitor.rs` expiry/repair/metrics scenarios) calls [`SimCluster::
+/// new_with_segment_janitor_retention`] instead, mirroring `create_table`/
+/// `create_table_with_replication`'s own "default constructor + a sibling
+/// exposing one more knob" shape — not a live setter, since the loop's own
+/// `retention: Duration` parameter is captured by value at spawn time
+/// (identical to production's own `segment_janitor_loop` signature, which
+/// this rung's own widening deliberately left byte-identical), so changing
+/// it after the fact would mean spawning a second, concurrent loop rather
+/// than reconfiguring the first one.
+const DEFAULT_SIM_SEGMENT_JANITOR_RETENTION: Duration = Duration::from_secs(3600);
+
 /// Build a fresh per-node `Reconciler<SimEnv, MemoryEngine>` (ADR 0061 rung
 /// D4 PR 1) — mirrors `animusd`'s own production node assembly exactly
 /// (`BoundNode::start_with`'s `on_host`/`on_teardown` closures): a fresh
@@ -1028,6 +1046,15 @@ pub(crate) struct SimCluster {
     /// so [`SimCluster::segment_store`] can hand a test a handle for direct
     /// assertions, mirroring `backup_store`'s own role.
     segment_store: SimSegmentStore,
+    /// ADR 0061 rung G (C-07 PR 5): the retention window every node's own
+    /// `segment_janitor::segment_janitor_loop` was spawned with — see
+    /// [`DEFAULT_SIM_SEGMENT_JANITOR_RETENTION`]'s own doc for why this is
+    /// a constructor knob rather than a live setter. Stored so
+    /// [`SimCluster::restart`] can respawn a restarted node's own loop with
+    /// the SAME retention its `Simulator::stop` just dropped, mirroring how
+    /// it already respawns `heartbeat_loop`/the reconciler/the backup
+    /// janitor.
+    segment_janitor_retention: Duration,
 }
 
 /// Breaks the `Simulator`/`SimEnv` reference cycle (`animus_sim::Simulator::
@@ -1095,7 +1122,34 @@ impl SimCluster {
     /// returning, so a caller's very first [`SimCluster::create_table`]
     /// call finds a leader immediately rather than needing its own
     /// warm-up wait.
+    ///
+    /// Uses [`DEFAULT_SIM_SEGMENT_JANITOR_RETENTION`] for every node's own
+    /// segment-janitor loop (ADR 0061 rung G, C-07 PR 5) — a scenario that
+    /// needs retention to actually elapse within its own virtual-time
+    /// budget calls [`SimCluster::new_with_segment_janitor_retention`]
+    /// instead.
     pub(crate) fn new(seed: u64, nodes: usize, replication: usize) -> Self {
+        Self::new_with_segment_janitor_retention(
+            seed,
+            nodes,
+            replication,
+            DEFAULT_SIM_SEGMENT_JANITOR_RETENTION,
+        )
+    }
+
+    /// [`SimCluster::new`]'s own sibling exposing one more knob — this
+    /// cluster's own segment-janitor retention window (ADR 0061 rung G,
+    /// C-07 PR 5), mirroring [`SimCluster::create_table`]/[`SimCluster::
+    /// create_table_with_replication`]'s own "default constructor + a
+    /// sibling with one extra parameter" shape. See
+    /// [`DEFAULT_SIM_SEGMENT_JANITOR_RETENTION`]'s own doc for why this is
+    /// a constructor knob rather than a live setter.
+    pub(crate) fn new_with_segment_janitor_retention(
+        seed: u64,
+        nodes: usize,
+        replication: usize,
+        segment_janitor_retention: Duration,
+    ) -> Self {
         assert!(nodes >= 1, "a cluster needs at least one node");
         assert!(
             (1..=nodes).contains(&replication),
@@ -1334,6 +1388,21 @@ impl SimCluster {
             env.spawn_task(backup_janitor::backup_janitor_loop(ctx.clone()));
         }
 
+        // ADR 0061 rung G (C-07 PR 5): one `segment_janitor::
+        // segment_janitor_loop` per node, unconditionally — mirrors the
+        // backup janitor's own always-on spawn immediately above exactly:
+        // this loop's own leader gate (`ctx.edge.leader_handle()` answering
+        // `None`) already makes a non-leader's own tick a cheap idle sleep,
+        // so there is no reason to gate spawning it behind an opt-in the
+        // way `auto_split_loop` is.
+        for ctx in &ctxs {
+            let env = ctx.env.clone();
+            env.spawn_task(segment_janitor::segment_janitor_loop(
+                ctx.clone(),
+                segment_janitor_retention,
+            ));
+        }
+
         let mut cluster = SimCluster {
             sim,
             nodes,
@@ -1345,6 +1414,7 @@ impl SimCluster {
             auto_split: None,
             backup_store,
             segment_store,
+            segment_janitor_retention,
         };
         // Let the control group elect before any caller touches it —
         // generous for up to a handful of voters under `SimEnv`'s
@@ -1747,6 +1817,24 @@ impl SimCluster {
             .backup_janitor_progress
             .lock()
             .expect("backup janitor progress poisoned")
+            .clone()
+    }
+
+    /// `node`'s own live `segment_janitor::SegmentJanitorProgress` snapshot
+    /// (ADR 0061 rung G, C-07 PR 5) — mirrors [`SimCluster::backup_janitor_
+    /// progress`] exactly (the identical `GET /admin/gc` read in
+    /// production, a plain synchronous lock/clone/drop — never held across
+    /// an `.await`, `segment_janitor.rs`'s own `update_segment_janitor_
+    /// progress`).
+    pub(crate) fn segment_janitor_progress(
+        &self,
+        node: u64,
+    ) -> segment_janitor::SegmentJanitorProgress {
+        self.shared
+            .ctx(node)
+            .segment_janitor_progress
+            .lock()
+            .expect("segment janitor progress poisoned")
             .clone()
     }
 
@@ -2589,6 +2677,46 @@ impl SimCluster {
         }
     }
 
+    /// `POST /admin/stream/grow`'s own primitive (`ClientCtx::grow_stream`,
+    /// ADR 0042 §14's growth PR3 manual trigger), issued from `node`'s own
+    /// `ClientCtx` (ADR 0061 rung G, C-07 PR 5) — this fixture has no admin
+    /// HTTP surface to reach the real route through, so this is a direct
+    /// driver call, mirroring [`SimCluster::drain_gsi`]/[`SimCluster::
+    /// drive_stream_seal`]'s own "call the production `ClientCtx` method
+    /// directly, drive the simulator, return the result" shape. Splits
+    /// EVERY tablet of `table` at its own byte-weighted median (never a
+    /// `Splitting`/`Building` mid-split one, which classifies as a skip, not
+    /// a failure) — kickoff only; the fork/cutover itself still needs
+    /// [`SimCluster::drive_inplace_split_cutover`] polled afterward, exactly
+    /// like every other split this fixture drives (see `sim_cluster_auto_
+    /// split.rs`'s own `poll_split_converged` for the shape). Used by
+    /// `sim_cluster_stream_janitor.rs`'s own retired-tablet scenarios —
+    /// every other `sim_cluster_*` module reaches a split via the
+    /// byte/rate auto-split triggers instead ([`SimCluster::
+    /// set_auto_split_thresholds`]'s own opt-in loop), which a Streams
+    /// disable/retention scenario has no reason to arm; a stream-triggered
+    /// split needs `grow_stream`'s own byte-weighted-median kickoff
+    /// specifically. Panics on a genuine driver error or a timeout, exactly
+    /// like `drain_gsi`/`drive_stream_seal` — a caller wanting a per-tablet
+    /// skip/error inspects the returned `Vec` itself.
+    pub(crate) fn grow_stream(
+        &mut self,
+        node: u64,
+        table: &str,
+    ) -> Vec<(TabletId, ClientResponse)> {
+        let ctx = self.shared.ctx(node);
+        let table_owned = table.to_owned();
+        let outcome: Option<Result<Vec<(TabletId, ClientResponse)>, String>> =
+            self.spawn_and_capture(node, async move { ctx.grow_stream(&table_owned).await });
+        match outcome {
+            Some(Ok(results)) => results,
+            Some(Err(e)) => panic!("grow_stream(node={node}, table={table}) failed: {e}"),
+            None => panic!(
+                "grow_stream(node={node}, table={table}) did not complete within {OP_BUDGET:?}"
+            ),
+        }
+    }
+
     /// Crash `node`: its tasks stay alive but muted (no sends land, its
     /// inbox is cleared) — `Simulator::crash`'s own contract. Use
     /// [`SimCluster::restart`] instead for a true process restart (a
@@ -2742,6 +2870,20 @@ impl SimCluster {
         // underlying `SimSegmentStore` every other node writes to.
         let janitor_env = ctx.env.clone();
         janitor_env.spawn_task(backup_janitor::backup_janitor_loop(ctx.clone()));
+
+        // ADR 0061 rung G (C-07 PR 5): `Simulator::stop` above also dropped
+        // this node's own `segment_janitor_loop` task — respawn it
+        // unconditionally with the SAME retention this cluster was built
+        // (or last had its retention set) with, mirroring the backup
+        // janitor's own respawn immediately above exactly. `ctx.
+        // segment_store` is untouched by this restart (never reassigned
+        // above), so the respawned loop still shares the SAME underlying
+        // `SimSegmentStore` every other node writes to.
+        let segment_janitor_env = ctx.env.clone();
+        segment_janitor_env.spawn_task(segment_janitor::segment_janitor_loop(
+            ctx.clone(),
+            self.segment_janitor_retention,
+        ));
 
         let ctx_for_server = ctx.clone();
         fresh_relay.serve(move |req| {

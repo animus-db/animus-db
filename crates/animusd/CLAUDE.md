@@ -8207,3 +8207,124 @@ every 10s from the test binary's own `/proc/<pid>/status` `VmRSS` via the
 anchored `pgrep -f '^<abs-path>/target/debug/deps/animusd-'` pattern:
 first ~129 MB, peak ~902 MB, last ~180 MB — consistent with PR 3's own
 figures). `Cargo.lock` unchanged.
+
+## Appendix — SimCluster coverage for the DynamoDB Streams segment janitor (ADR 0061 rung G, C-07 PR 5, 2026-09-08)
+
+Closes rung G/C-07's PR 5: the segment janitor's own async loop
+(`segment_janitor::segment_janitor_loop`, ADR 0043 §A9 — two-phase
+retention reclaim, replica repair, the drop-table convergent cascade) is
+now spawned unconditionally on every `SimCluster` node, and 9 of the 11
+`tests/stream_janitor.rs` real-socket scenarios have deterministic,
+seed-replayable siblings in `crates/animusd/src/sim_cluster_stream_
+janitor.rs`.
+
+**The widening (`segment_janitor.rs`)**: `segment_janitor_loop`/
+`segment_janitor_tick` and their shared private helper,
+`update_segment_janitor_progress`, widened from `&ClientCtx` (`E =
+ProdEnv`) to `<E: Env, R: RelayClient>` — a pure signature change,
+mirroring `backup_janitor_loop`'s own D4 PR 5 widening exactly. `reap_
+orphans` needed no change at all (it already took only a
+`&SegmentStoreHandle` and a `&Metadata`). The loop's one real-clock site
+(`tokio::time::sleep(SEGMENT_JANITOR_INTERVAL)`) became `ctx.env.
+sleep(..)`; every other site already read `ctx.env.now()`/`ctx.env.
+metrics()` through the `E: Env` bound, so the `Clock` import became
+unused and was dropped. Both production spawn sites (`spawn_common_
+tail`) still hand this a concrete `ClientCtx` with zero call-site
+changes — `cargo test -p animusd --test stream_janitor` on the
+untrimmed 11-test file (11/11 passed) is this rung's own proof
+production behavior is byte-identical.
+
+**The spawn (`sim_cluster.rs`)**: `SimCluster::new`/`restart` spawn
+`segment_janitor_loop` unconditionally on every node — mirroring
+`backup_janitor_loop`'s own always-on D4 PR 5 shape, not `auto_split_
+loop`'s opt-in one, since the loop's own leader gate already makes a
+non-leader's tick a cheap idle sleep. The retention window is a
+**constructor knob** (`SimCluster::new_with_segment_janitor_retention`,
+default 3600s via `DEFAULT_SIM_SEGMENT_JANITOR_RETENTION`), not a live
+setter — the production loop's own `retention: Duration` is captured by
+value at spawn time, so reconfiguring after the fact would mean spawning
+a second, concurrent loop rather than changing the first one's. `SimCluster::
+segment_janitor_progress(node)` mirrors `backup_janitor_progress` exactly
+(`GET /admin/gc`'s own read, a plain lock/clone/drop). **No `Drop for
+SimCluster`/`restart` extension was needed** (issue #753's own discipline):
+the spawned loop captures a plain `ClientCtx` clone, the identical shape
+`backup_janitor_loop` already captures — no new `Weak`-tracked handle.
+
+**A real, load-bearing timing gotcha, documented in the new module's own
+doc and worth restating here**: every `SimCluster` op call (`dynamo`/
+`put`/`drive_stream_seal`/`drive_inplace_split_cutover`/…) unconditionally
+burns a full `OP_BUDGET` (12s) of virtual time via `spawn_and_capture`'s
+own `self.sim.run_for(OP_BUDGET)`, regardless of how quickly the
+underlying work finishes. This makes the real-socket file's own 2s `TINY_
+RETENTION` unusable for **catching a row mid-sweep** through an op call —
+by the time any op call that could observe the row's state *returns*,
+retention has almost always already elapsed silently inside that same
+opaque 12s window. Two strategies, chosen per scenario: (a) a short
+retention plus a converged-or-timeout poll for scenarios that only care
+about eventual convergence, and (b) for the one scenario needing to catch
+the row genuinely mid-sweep (`expiry_survives_a_control_leader_kill_mid_
+sweep`), a retention deliberately larger than the setup phase's own
+computable cumulative op-budget cost, then a manual, small-step `run_for`
+poll loop (never another op call) to observe the marked-but-not-removed
+state precisely.
+
+**A second instance of the identical gotcha, found and fixed during this
+PR's own gate-8 pass**: `two_phase_expiry_removes_the_row_and_every_
+replicas_object` asserts the segment OBJECT still exists **immediately**
+after `drive_stream_seal` returns — but that call's own `spawn_and_
+capture` burns the full `OP_BUDGET` (12s) regardless of how quickly the
+seal itself lands, so with the original `retention = 2s` the janitor's
+200ms tick had ample opportunity to mark-and-delete the just-sealed object
+during that same call's own leftover budget, before the test ever read
+`stored` back out. Fixed by raising this one scenario's own retention to
+20s (comfortably clearing the 12s `OP_BUDGET` margin, still converging
+well inside the scenario's own 60s final poll) — a scenario-local fix, no
+change to `segment_janitor.rs`/`sim_cluster.rs`.
+
+**Scenario-by-scenario disposition (11 real-socket tests → 9 moved, 2
+kept `ProdEnv`, each with its own one-line reason in both files)**:
+
+| Real-socket test | Disposition |
+|---|---|
+| `two_phase_expiry_removes_the_row_and_every_replicas_object` | Moved (adapted to this fixture's shared `S3` store — proves the empty-replicas branch, not the cataloged-replicas one) |
+| `expiry_survives_a_control_leader_kill_mid_sweep` | Moved (the manual `run_for`-only poll strategy above) |
+| `reader_never_sees_an_empty_success_gap_across_expiry` | Moved |
+| `repair_re_replicates_to_a_fresh_target_after_a_replica_node_dies` | **KEPT** — needs a genuinely dead replica; this fixture's shared `S3` store has no per-node replica concept at all (`row.replicas` is always empty) |
+| `disable_grace_lifecycle_end_to_end_with_reenable_coexistence` | Moved |
+| `drop_table_cascade_converges_via_the_janitor` | Moved |
+| `mid_grace_drop_removes_both_coexisting_labels` | Moved |
+| `metrics_reflect_a_completed_retention_cycle` | Moved (asserts on `segment_janitor_progress`, since `Metric::*` counters are structurally unreachable from `SimCluster` — no recording `MetricsHandle` is ever threaded in) |
+| `retired_parents_shards_are_not_reaped_early` | Moved (via `SimCluster::grow_stream` + `drive_inplace_split_cutover`, this rung's own new in-place-split-cutover driving) |
+| `retired_parents_final_shard_expires_by_retention` | Moved |
+| `segment_janitor_reclaims_objects_from_a_genuinely_control_only_leader` | **KEPT** — needs a genuine control-only/data-only process split; `SimCluster` has no notion of node role at all |
+
+**New `SimCluster` primitive: `grow_stream(node, table)`** — wraps
+`ClientCtx::grow_stream` (the production primitive behind `POST /admin/
+stream/grow`), since `SimCluster` has no admin HTTP surface to drive that
+route through directly.
+
+**Before/after `--test stream_janitor` counts**: 11 passed (untrimmed) →
+2 passed (trimmed). `cargo test -p animusd --lib sim_cluster_stream_
+janitor -- --test-threads=2`: 18 passed, 0 failed.
+
+**Gates, in the required order**: `cargo test -p animusd --test stream_
+janitor` on the untrimmed file (11 passed); `cargo test -p animusd --lib
+sim_cluster_stream_janitor -- --test-threads=2` (18 passed, one scenario-
+local retention fix applied along the way, described above); trim, then
+`cargo test -p animusd --test stream_janitor` again (2 passed); `cargo
+fmt --all --check` (clean after `cargo fmt --all` — the two files this
+PR's own earlier turns had already edited, `sim_cluster.rs` and `sim_
+cluster_stream_janitor.rs`, carried pre-existing unformatted code from
+those turns; no file outside this PR's own change set was touched);
+`cargo clippy -p animusd --all-targets --all-features -- -D warnings`
+(clean); `cargo build -p animusd --all-targets` (clean); `cargo test -p
+animusd --lib sim_cluster -- --test-threads=2` (315 passed, 0 failed, 2
+ignored, 919.49s; resident memory sampled every 10s from the test
+binary's own `/proc/<pid>/status` `VmRSS` via the anchored `pgrep -f
+'^<abs-path>/target/debug/deps/animusd-'` pattern: first ~139 MB, peak
+~880 MB, last ~166 MB — consistent with every prior rung's own
+no-leak trajectory); `cargo test -p animusd --test dynamo_streams --test
+stream_janitor` (5 passed, 0 failed — the real-socket regression proving
+`segment_janitor_loop`/`segment_janitor_tick`'s widened signature stayed
+byte-identical, and the two kept `stream_janitor.rs` tests still pass).
+`Cargo.lock` unchanged.

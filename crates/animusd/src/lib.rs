@@ -18109,6 +18109,21 @@ mod sim_cluster_dynamo_partiql;
 #[cfg(test)]
 mod sim_cluster_dynamo_streams;
 
+/// ADR 0061 rung G (post-C-06): Streams `SimCluster` dispatch (C-07), PR 5
+/// — deterministic `SimCluster` coverage for the stream segment janitor's
+/// own async loop (`segment_janitor::segment_janitor_loop`), mirroring
+/// `sim_cluster_backup_janitor.rs`'s own shape: `segment_janitor_loop`/
+/// `segment_janitor_tick` widened to `<E: Env, R: RelayClient>`, spawned
+/// unconditionally on every node in `SimCluster::new`/`restart` over the
+/// shared `SimSegmentStore` PR 2 wired in. See this module's own doc for
+/// the scenario-by-scenario account (two-phase expiry, leader-kill-mid-
+/// sweep, the no-empty-gap reader contract, the disable-grace lifecycle,
+/// the drop-table cascade, and the retired-tablet rule) and
+/// `crates/animusd/CLAUDE.md`'s matching entry for what stays `ProdEnv`
+/// and why.
+#[cfg(test)]
+mod sim_cluster_stream_janitor;
+
 /// Regression for the issue #298 residual confirmed live under the
 /// un-pinned `SplitMode::InPlace` proof soak (ADR 0018's matching amendment,
 /// `docs/engineering-lessons.md`'s matching entry): a stage blocked by

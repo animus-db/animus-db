@@ -769,7 +769,13 @@ the still-true paragraph after the table.
   cores this rung builds directly on, plus C-06's own Transact widening,
   which is what makes `dynamo_streams.rs`'s Transact-on-a-streamed-table
   pair convertible at all.
-- **Status:** open 2026-09-08, PR 1 (this opener).
+- **Status:** open 2026-09-08. PR 1 (this opener), PR 2 (groundwork),
+  PR 3 (the Streams read API), and PR 4 (`dynamo_streams.rs` siblings —
+  12 converted, 3 kept `ProdEnv`, that file closed) have landed. PR 5
+  (the segment janitor widened + `stream_janitor.rs` siblings — 9
+  converted, 2 kept `ProdEnv`, that file closed) has landed — see ADR
+  0061's matching 2026-09-08 "Rung G, PR 5" amendment. PR 6 (docs
+  close-out) remains.
 
 ---
 
