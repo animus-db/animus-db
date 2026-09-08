@@ -846,7 +846,7 @@ supply one, and isn't trying to.
 | D4 | Deterministic coverage for the behaviours that have none today: the auto-split byte trigger (`lib.rs:14397`), the dropped-table GC reclaim loop, join/growth sequencing, and the backup-janitor async loop (its replicated state machine is already sim-tested in `animus-control/tests/backup_catalog.rs`; the loop driving it is not) |
 | F | Post-C-04: Transact/PartiQL `SimCluster` dispatch (C-06) — the two named D2 residuals (Transact, PartiQL), never claimed by any D3/D4 rung. **Closed 2026-09-08 (PRs #728, #729, #732, #748, #750, #756, plus PR 7)** — both residuals now reachable through `dispatch_item_op`, the real-socket `dynamo_partiql.rs`/`dynamo_execute_transaction.rs` kept in full as the `ProdEnv` equivalence proof, `cargo test -p animusd --lib` 353 → 438 passed across PRs 3-6. See the 2026-09-07 "Rung F" amendment and the "Rung F closed" amendment below, and `docs/roadmap.md`'s C-06 entry |
 | G | Post-C-06: Streams `SimCluster` dispatch (C-07) — the largest remaining unowned residual group named by Rung F's own close-out (`dynamo_streams.rs`/`stream_janitor.rs`/`stream_backfill_seed_filter.rs`, 3 files/28 tests, plus `console_stream.rs`'s own 4 tests filed under the console/dashboard group). **Closed 2026-09-08 (PRs #758, #759, #760, #761, #762, plus PR 6)** — `dynamo_streams.rs` (15 tests: 12 converted, 3 kept `ProdEnv`) and `stream_janitor.rs` (11 tests: 9 converted, 2 kept `ProdEnv`) both closed; the read API, stream enable/disable, on-demand sealing, and the segment janitor's two-phase retention sweep are all `SimCluster`-reachable. `stream_backfill_seed_filter.rs` (2 tests) stays `ProdEnv`, filed under the separate "index DDL beyond plain `CreateTable`" residual, per the rung's own plan. `console_stream.rs` (4 tests) stays filed under admin/console/dashboard HTTP. `tests/streams_e2e.rs` stayed out of scope throughout, frozen behind #298/#745. `cargo test -p animusd --lib` 315 passed / 2 ignored at the sim tier after PR 5, no leak trajectory. See the 2026-09-08 "Rung G" amendments below (including the "Rung G closed" amendment) and `docs/roadmap.md`'s C-07 entry |
-| H | Post-C-07: admin/console/dashboard HTTP `SimCluster` dispatch (C-08) — the group Rung G's own close-out named as what remains unowned, 10 files/67 tests (`admin_endpoint.rs` 23, `dashboard_endpoint.rs` 16, `console_endpoint.rs` 3, `console_create_table.rs` 4, `console_items.rs` 4, `console_stream.rs` 4, `console_table_config.rs` 9, `console_tables.rs` 1, `metrics_endpoint.rs` 1, `system_table.rs` 2). **Open, PR 1 (docs) landed 2026-09-08; PR 2 (groundwork) landed 2026-09-08, corrected the same day in review (a blanket `impl Trait for ClientCtx` mistake, fixed with a `GenericAdminHost`/`GenericConsoleBackend` newtype pair — see that amendment's own account); PR 3 (console reachable + first siblings) landed 2026-09-08 — `console_tables.rs`/`console_create_table.rs`/`console_items.rs` (9 tests) converted whole into a new `sim_cluster_console.rs` (10 scenarios, 20 tests with `_over_seeds`), all three files deleted; `console_endpoint.rs`'s own 3 tests stay `ProdEnv` (real HTTP framing/static assets, and a genuine role split), with a tenth new scenario covering its JSON-routing/error-mapping tail.** See the 2026-09-08 "Rung H" amendments below (including "Rung H, PR 2 landed" and "Rung H, PR 3 landed") and `docs/roadmap.md`'s C-08 entry |
+| H | Post-C-07: admin/console/dashboard HTTP `SimCluster` dispatch (C-08) — the group Rung G's own close-out named as what remains unowned, 10 files/67 tests (`admin_endpoint.rs` 23, `dashboard_endpoint.rs` 16, `console_endpoint.rs` 3, `console_create_table.rs` 4, `console_items.rs` 4, `console_stream.rs` 4, `console_table_config.rs` 9, `console_tables.rs` 1, `metrics_endpoint.rs` 1, `system_table.rs` 2). **Open, PR 1 (docs) landed 2026-09-08; PR 2 (groundwork) landed 2026-09-08, corrected the same day in review (a blanket `impl Trait for ClientCtx` mistake, fixed with a `GenericAdminHost`/`GenericConsoleBackend` newtype pair — see that amendment's own account); PR 3 (console reachable + first siblings) landed 2026-09-08 — `console_tables.rs`/`console_create_table.rs`/`console_items.rs` (9 tests) converted whole into a new `sim_cluster_console.rs` (10 scenarios, 20 tests with `_over_seeds`), all three files deleted; `console_endpoint.rs`'s own 3 tests stay `ProdEnv` (real HTTP framing/static assets, and a genuine role split), with a tenth new scenario covering its JSON-routing/error-mapping tail; PR 4 (`console_stream.rs`/`console_table_config.rs` siblings) landed 2026-09-08 — 3 of `console_stream.rs`'s 4 tests and 5 of `console_table_config.rs`'s 9 converted into two new modules, `sim_cluster_console_stream.rs`/`sim_cluster_console_table_config.rs` (16 tests with `_over_seeds`), reusing PR 3's own shared helpers (widened to `pub(crate)`); kept `ProdEnv`: `console_stream.rs`'s TTL-reaper-identity test (no reaper-loop primitive under `SimEnv`, deliberately not built this PR), `console_table_config.rs`'s three GSI-DDL tests (blocker (d)) and its PITR-present test (`UpdateContinuousBackups` has no generic dispatch arm).** See the 2026-09-08 "Rung H" amendments below (including "Rung H, PR 2 landed", "Rung H, PR 3 landed", and "Rung H, PR 4 landed") and `docs/roadmap.md`'s C-08 entry |
 
 Note that the copy-based split driver (ADR 0050) is deliberately **not** on
 this list: ADR 0058 rung 4's remaining layer deletes it. Writing a corpus
@@ -5804,3 +5804,88 @@ new module's doc-comment registration), `tests/console_create_table.rs`/
 `tests/console_endpoint.rs` (+33/-3, the module doc + three per-test
 reason comments), plus the new `sim_cluster_console.rs` itself (1,123
 lines).
+
+## 2026-09-08 amendment — Rung H, PR 4 landed (`console_stream.rs` + `console_table_config.rs` siblings)
+
+Closes PR 4's own scope: `tests/console_stream.rs` (3 of 4 tests) and
+`tests/console_table_config.rs` (5 of 9 tests) — 8 real-socket tests total
+— now each have a deterministic sibling in two new modules,
+`crates/animusd/src/sim_cluster_console_stream.rs` and `crates/animusd/
+src/sim_cluster_console_table_config.rs` (named `sim_cluster_console_*` so
+PR 3's own `cargo test -p animusd --lib sim_cluster_console` gate
+substring continues to reach them, with no gate-command change needed).
+**No `console.rs`/`dynamo.rs`/`sim_cluster.rs` change was needed** — every
+primitive both modules call (`SimCluster::console` through
+`GenericConsoleBackend`, `SimCluster::dynamo` for wire fixture setup,
+`SimCluster::drive_stream_seal` for the one bounded-pagination scenario)
+was already generic before this PR — pure test authorship, mirroring PR
+3's own "no dispatch change needed" precedent. The shared helpers PR 3
+built in `sim_cluster_console.rs` (`env_seed`/`json`/`assert_no_cluster_
+shape`/`create_table_via_wire`/`put_item_via_wire`/`get_item_via_wire`/
+`tablet_of_table`/`leader_of_table`/`non_leader_of_table`/`control_
+leader_and_follower`) were widened from module-private to `pub(crate)`
+and reused by both new modules rather than duplicated, per this rung's
+own "put shared helpers where PR 3 put them" discipline.
+
+**Test-by-test disposition (8 converted, 5 kept `ProdEnv`)**:
+
+| Real-socket test (file) | Disposition |
+|---|---|
+| `table_with_no_stream_reports_the_honest_disabled_answer` (`console_stream.rs`) | Converted → `run_table_with_no_stream_reports_the_honest_disabled_answer` |
+| `stream_enabled_lists_shards_and_records_reflect_real_writes` (`console_stream.rs`) | Converted → `run_stream_enabled_lists_shards_and_records_reflect_real_writes` (a single `GetRecords` call, not a converged-or-timeout poll — every write is already committed before this open-tail read runs, mirroring `sim_cluster_dynamo_streams.rs::get_records_over_the_open_tail_before_any_seal`'s own shape) |
+| `walking_a_shard_with_next_shard_iterator_visits_every_record_exactly_once` (`console_stream.rs`) | Converted → `run_walking_a_shard_with_next_shard_iterator_visits_every_record_exactly_once` — **deviates from a literal conversion**: seals the tablet first via `SimCluster::drive_stream_seal` rather than walking the still-open tail, since an open tail returns every already-committed record in one page under this fixture (no periodic seal ever narrows it), so a genuine multi-page `Limit`-bounded walk needs a sealed shard's own bounded record range — the identical reasoning `sim_cluster_dynamo_streams.rs::next_shard_iterator_pagination_with_small_limit_visits_each_record_once` already established |
+| `ttl_deletion_carries_the_service_user_identity_through_the_console` (`console_stream.rs`) | **KEPT** `ProdEnv` — no primitive drives `animusd::ttl_reaper::ttl_reaper_loop` under `SimEnv`: `SimCluster::new`/`restart` never spawn it (unlike `heartbeat_loop`/the reconciler/the backup janitor/the segment janitor, all always-on since D4/rung G), so nothing in this fixture would ever reap the expired item this test depends on. The TTL reaper is its own unowned residual group; this rung's own brief was explicit that building a reaper driver is out of scope for this PR |
+| `table_detail_projects_full_configuration` (`console_table_config.rs`) | Converted → `run_table_detail_projects_full_configuration` |
+| `add_and_drop_gsi_round_trip` (`console_table_config.rs`) | **KEPT** `ProdEnv` — blocker (d): `UpdateTable` with an index change has no `dispatch_table_op` sub-arm (`add_gsi`/`drop_gsi` both route through it and would hit `unsupported_by_generic_dispatch`); the index-DDL residual this whole rung's opener named out of scope |
+| `add_gsi_records_a_declared_attribute_type` (`console_table_config.rs`) | **KEPT** `ProdEnv` — identical blocker (d) |
+| `add_gsi_rejects_an_unknown_attribute_type` (`console_table_config.rs`) | **KEPT** `ProdEnv` — identical blocker (d) |
+| `stream_toggle_round_trips` (`console_table_config.rs`) | Converted → `run_stream_toggle_round_trips` |
+| `ttl_set_and_clear_round_trips` (`console_table_config.rs`) | Converted → `run_ttl_set_and_clear_round_trips` |
+| `delete_table_works` (`console_table_config.rs`) | Converted → `run_delete_table_works` |
+| `table_detail_with_no_pitr_or_backups_is_null_and_empty` (`console_table_config.rs`) | Converted → `run_table_detail_with_no_pitr_or_backups_is_null_and_empty` |
+| `table_detail_shows_pitr_status_and_backups` (`console_table_config.rs`) | **KEPT** `ProdEnv` — **deviates from the opener's own "6 convert" estimate**: the opener's brief allowed converting this one only if the PITR data it reads is producible under `SimCluster` via a generic `UpdateContinuousBackups` path; checked against the code and there isn't one — `Operation::UpdateContinuousBackups` is absent from both `dispatch_item_op`'s and `dispatch_table_op`'s `match` arms (`dynamo.rs`), so it falls to `unsupported_by_generic_dispatch`, unlike `CreateBackup`/`DeleteBackup`/`UpdateTimeToLive`, which PR 2 did widen. Backup/PITR data stays a separate residual, per the opener's own fallback reason |
+
+**Issuing discipline**, mirroring PR 3's own: every table is created over
+the real DynamoDB wire from node 0 (the wire path already does its own
+internal routing regardless of which node issues it — PR 3's own
+convention for its item-CRUD/Streams-adjacent scenarios); every write and
+every Stream-tab read from a **non-leader** of the table's own tablet
+(`console_stream.rs` siblings); every Config-tab mutation (`set_stream`/
+`set_ttl`/`delete_table`, all `propose_schema`-shaped control-plane
+mutations) and the `table_detail` read that follows it from the same
+**control follower** (`console_table_config.rs` siblings) — `table_
+detail` is itself a pure local `effective_metadata()` read with no leader
+concept, so reusing the mutation's own follower keeps each scenario to
+one node rather than introducing a second, arbitrary one with nothing to
+prove by being different.
+
+**No product bug found.** Every scenario passed at its pinned seed and
+every `_over_seeds` seed (5 per scenario) on the first clean run.
+
+**Gates, in the required order**: `cargo test -p animusd --test console_
+stream --test console_table_config` on the untrimmed files (13 passed,
+34.2s, including the initial build); `cargo test -p animusd --lib sim_
+cluster_console -- --test-threads=2` (36 passed, 0 failed, 63.5s — 20 PR
+3 baseline + this PR's 16 new tests, reached by the unchanged gate command
+since both new modules are named `sim_cluster_console_*`); trim (remove
+the 8 converted tests from both files, add reason comments to every kept
+test), then `cargo test -p animusd --test console_stream --test console_
+table_config` (5 passed, 8.7s — 1 kept in `console_stream.rs`, 4 kept in
+`console_table_config.rs`); `cargo test -p animusd --lib sim_cluster --
+--test-threads=2` (353 passed, 0 failed, 2 ignored, 962.08s — 337 PR 3
+baseline + this PR's 16 new tests; anchored-sampler RSS across the
+sampled window: first ~776 MB, peak ~776 MB, last ~132 MB — sampling
+began several minutes into the run, so the true from-launch first sample
+was not captured, but the observed trajectory is consistent with every
+prior rung's own no-leak pattern and stayed well under the 6 GB/30 min
+budget throughout); `cargo fmt --all --check` (one pass needed — the two
+new files' own long `assert_eq!` call sites needed rustfmt's own reflow,
+applied via `cargo fmt --all`, then clean); `cargo clippy -p animusd
+--all-targets --all-features -- -D warnings` (clean). `Cargo.lock`
+unchanged. `git diff --stat` against the PR 3 baseline: `lib.rs` (+24, the
+two new modules' doc-comment registrations), `sim_cluster_console.rs`
+(+39/-16, ten helpers widened to `pub(crate)` plus a doc note), `tests/
+console_stream.rs` (-253 net, three tests removed plus a module-doc note
+and one reason comment), `tests/console_table_config.rs` (-297 net, five
+tests removed plus a module-doc note and four reason comments), plus the
+two new sibling modules themselves (398 lines each).

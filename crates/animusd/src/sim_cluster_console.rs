@@ -109,26 +109,41 @@
 //!
 //! Replays (repo convention): `ANIMUS_SEED=<seed> cargo test -p animusd
 //! --lib <scenario name>`.
+//!
+//! ## ADR 0061 rung H, C-08 PR 4: shared-helper home for the `console_
+//! stream.rs`/`console_table_config.rs` siblings
+//!
+//! `sim_cluster_console_stream.rs` and `sim_cluster_console_table_
+//! config.rs` (new sibling modules, named `sim_cluster_console_*` so the
+//! `cargo test -p animusd --lib sim_cluster_console` substring filter this
+//! PR's own gate already used for PR 3 continues to reach them) reuse every
+//! helper below (`env_seed`/`json`/`assert_no_cluster_shape`/`create_
+//! table_via_wire`/`put_item_via_wire`/`get_item_via_wire`/`tablet_of_
+//! table`/`leader_of_table`/`non_leader_of_table`/`control_leader_and_
+//! follower`, all widened from module-private to `pub(crate)` for exactly
+//! this reuse) rather than duplicating them, per this rung's own "put
+//! shared helpers where PR 3 put them" discipline. See each sibling
+//! module's own doc for its own scenario list and conversion mapping.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::sim_cluster::SimCluster;
 
-fn env_seed(default: u64) -> u64 {
+pub(crate) fn env_seed(default: u64) -> u64 {
     std::env::var("ANIMUS_SEED")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(default)
 }
 
-fn json(body: &str) -> serde_json::Value {
+pub(crate) fn json(body: &str) -> serde_json::Value {
     serde_json::from_str(body).unwrap_or_else(|e| panic!("invalid JSON ({e}): {body}"))
 }
 
 /// No node/tablet/replica/raft/leader/quorum/placement/health/epoch-shaped
 /// key anywhere in `body` — the same forbidden-substring list every
 /// `console_*.rs` real-socket file checks its own responses against.
-fn assert_no_cluster_shape(body: &str) {
+pub(crate) fn assert_no_cluster_shape(body: &str) {
     let lower = body.to_ascii_lowercase();
     for forbidden in [
         "\"node",
@@ -153,15 +168,19 @@ fn assert_no_cluster_shape(body: &str) {
 /// caller-supplied body since this module's own fixtures need several
 /// distinct table shapes (unlike `sim_cluster_dynamo_streams.rs`'s fixed
 /// single-key shape).
-fn create_table_via_wire(cluster: &mut SimCluster, node: u64, body: &str) -> (u16, String) {
+pub(crate) fn create_table_via_wire(
+    cluster: &mut SimCluster,
+    node: u64,
+    body: &str,
+) -> (u16, String) {
     cluster.dynamo(node, "DynamoDB_20120810.CreateTable", body.as_bytes())
 }
 
-fn put_item_via_wire(cluster: &mut SimCluster, node: u64, body: &str) -> (u16, String) {
+pub(crate) fn put_item_via_wire(cluster: &mut SimCluster, node: u64, body: &str) -> (u16, String) {
     cluster.dynamo(node, "DynamoDB_20120810.PutItem", body.as_bytes())
 }
 
-fn get_item_via_wire(cluster: &mut SimCluster, node: u64, body: &str) -> (u16, String) {
+pub(crate) fn get_item_via_wire(cluster: &mut SimCluster, node: u64, body: &str) -> (u16, String) {
     cluster.dynamo(node, "DynamoDB_20120810.GetItem", body.as_bytes())
 }
 
@@ -169,7 +188,7 @@ fn get_item_via_wire(cluster: &mut SimCluster, node: u64, body: &str) -> (u16, S
 /// table in this module is created over the real wire, never via
 /// `SimCluster::create_table`'s own hand-hosted-only bookkeeping, mirroring
 /// `sim_cluster_dynamo_streams.rs`'s identical helper.
-fn tablet_of_table(cluster: &SimCluster, table: &str) -> animus_tablet::TabletId {
+pub(crate) fn tablet_of_table(cluster: &SimCluster, table: &str) -> animus_tablet::TabletId {
     *cluster
         .metadata(0)
         .tablets_for_table(table)
@@ -178,7 +197,7 @@ fn tablet_of_table(cluster: &SimCluster, table: &str) -> animus_tablet::TabletId
         .0
 }
 
-fn leader_of_table(cluster: &SimCluster, table: &str) -> u64 {
+pub(crate) fn leader_of_table(cluster: &SimCluster, table: &str) -> u64 {
     let tablet = tablet_of_table(cluster, table);
     cluster
         .leader_index_of(tablet)
@@ -186,7 +205,7 @@ fn leader_of_table(cluster: &SimCluster, table: &str) -> u64 {
 }
 
 /// A node id that does **not** lead `table`'s own tablet.
-fn non_leader_of_table(cluster: &SimCluster, table: &str) -> u64 {
+pub(crate) fn non_leader_of_table(cluster: &SimCluster, table: &str) -> u64 {
     let leader = leader_of_table(cluster, table);
     (0..cluster.node_count() as u64)
         .find(|&n| n != leader)
@@ -198,7 +217,7 @@ fn non_leader_of_table(cluster: &SimCluster, table: &str) -> u64 {
 /// idiom, used here for every console call that mutates the schema catalog
 /// (`POST /console/api/tables`), proving the identical control-plane relay
 /// path a follower-issued wire `CreateTable` already covers.
-fn control_leader_and_follower(cluster: &mut SimCluster) -> (u64, u64) {
+pub(crate) fn control_leader_and_follower(cluster: &mut SimCluster) -> (u64, u64) {
     let leader = cluster.control_leader_index() as u64;
     let follower = (0..cluster.node_count() as u64)
         .find(|&n| n != leader)

@@ -8677,3 +8677,74 @@ clippy -p animusd --all-targets --all-features -- -D warnings` (clean).
 
 See ADR 0061's "Rung H, PR 3 landed" amendment and `docs/roadmap.md`'s
 C-08 entry for the full record.
+
+## Appendix — `sim_cluster_console_stream.rs`/`sim_cluster_console_table_config.rs` siblings (ADR 0061 rung H, C-08 PR 4, 2026-09-08)
+
+Closes PR 4's own scope: `tests/console_stream.rs` (3 of 4 tests) and
+`tests/console_table_config.rs` (5 of 9 tests) — 8 real-socket tests total
+— now each have a deterministic sibling in two new modules,
+`crates/animusd/src/sim_cluster_console_stream.rs` and `crates/animusd/
+src/sim_cluster_console_table_config.rs` (named `sim_cluster_console_*` so
+PR 3's own `cargo test -p animusd --lib sim_cluster_console` gate
+substring reaches them with no command change). **No `console.rs`/
+`dynamo.rs`/`sim_cluster.rs` change was needed** — every primitive both
+modules call (`SimCluster::console` through `GenericConsoleBackend`,
+`SimCluster::dynamo` for wire fixture setup, `SimCluster::drive_stream_
+seal` for one bounded-pagination scenario) was already generic before
+this PR — pure test authorship, mirroring PR 3's own "no dispatch change
+needed" precedent. PR 3's own shared helpers in `sim_cluster_console.rs`
+(`env_seed`/`json`/`assert_no_cluster_shape`/`create_table_via_wire`/
+`put_item_via_wire`/`get_item_via_wire`/`tablet_of_table`/`leader_of_
+table`/`non_leader_of_table`/`control_leader_and_follower`) were widened
+from module-private to `pub(crate)` and reused, not duplicated.
+
+**Test-by-test disposition (8 converted, 5 kept `ProdEnv`)**:
+
+| Real-socket test (file) | Disposition |
+|---|---|
+| `table_with_no_stream_reports_the_honest_disabled_answer` (`console_stream.rs`) | Converted → `run_table_with_no_stream_reports_the_honest_disabled_answer` |
+| `stream_enabled_lists_shards_and_records_reflect_real_writes` (`console_stream.rs`) | Converted → `run_stream_enabled_lists_shards_and_records_reflect_real_writes` (a single `GetRecords` call, not a converged-or-timeout poll — every write is already committed before this open-tail read runs, mirroring `sim_cluster_dynamo_streams.rs::get_records_over_the_open_tail_before_any_seal`'s own shape) |
+| `walking_a_shard_with_next_shard_iterator_visits_every_record_exactly_once` (`console_stream.rs`) | Converted → `run_walking_a_shard_with_next_shard_iterator_visits_every_record_exactly_once` — seals the tablet first via `SimCluster::drive_stream_seal` rather than walking the still-open tail (an open tail returns every already-committed record in one page under this fixture, so a genuine multi-page `Limit`-bounded walk needs a sealed shard's own bounded record range — `sim_cluster_dynamo_streams.rs::next_shard_iterator_pagination_with_small_limit_visits_each_record_once`'s own reasoning) |
+| `ttl_deletion_carries_the_service_user_identity_through_the_console` (`console_stream.rs`) | **KEPT** `ProdEnv` — no primitive drives `animusd::ttl_reaper::ttl_reaper_loop` under `SimEnv` (`SimCluster::new`/`restart` never spawn it), so nothing in this fixture would ever reap the item this test depends on; the TTL reaper is its own unowned residual group, deliberately not built this PR |
+| `table_detail_projects_full_configuration` (`console_table_config.rs`) | Converted → `run_table_detail_projects_full_configuration` |
+| `add_and_drop_gsi_round_trip` (`console_table_config.rs`) | **KEPT** `ProdEnv` — blocker (d): `UpdateTable` with an index change has no `dispatch_table_op` sub-arm |
+| `add_gsi_records_a_declared_attribute_type` (`console_table_config.rs`) | **KEPT** `ProdEnv` — identical blocker (d) |
+| `add_gsi_rejects_an_unknown_attribute_type` (`console_table_config.rs`) | **KEPT** `ProdEnv` — identical blocker (d) |
+| `stream_toggle_round_trips` (`console_table_config.rs`) | Converted → `run_stream_toggle_round_trips` |
+| `ttl_set_and_clear_round_trips` (`console_table_config.rs`) | Converted → `run_ttl_set_and_clear_round_trips` |
+| `delete_table_works` (`console_table_config.rs`) | Converted → `run_delete_table_works` |
+| `table_detail_with_no_pitr_or_backups_is_null_and_empty` (`console_table_config.rs`) | Converted → `run_table_detail_with_no_pitr_or_backups_is_null_and_empty` |
+| `table_detail_shows_pitr_status_and_backups` (`console_table_config.rs`) | **KEPT** `ProdEnv` — deviates from the opener's own "6 convert" estimate: `Operation::UpdateContinuousBackups` has no arm in either `dispatch_item_op` or `dispatch_table_op`, so PITR-present data stays a separate residual, per the opener's own fallback reason |
+
+**Issuing discipline**: every table is created over the real DynamoDB wire
+from node 0; every write and every Stream-tab read from a **non-leader**
+of the table's own tablet (`console_stream.rs` siblings); every
+Config-tab mutation and the `table_detail` read that follows it from the
+same **control follower** (`console_table_config.rs` siblings) —
+`table_detail` is itself a pure local `effective_metadata()` read with no
+leader concept, so reusing the mutation's own follower keeps each
+scenario to one node.
+
+**No product bug found.** Every scenario passed at its pinned seed and
+every `_over_seeds` seed on the first clean run.
+
+**Gates, in the required order**: `cargo test -p animusd --test console_
+stream --test console_table_config` on the untrimmed files (13 passed,
+34.2s); `cargo test -p animusd --lib sim_cluster_console --
+--test-threads=2` (36 passed, 0 failed, 63.5s — 20 PR 3 baseline + 16 new,
+reached by the unchanged gate command); trim, then `cargo test -p animusd
+--test console_stream --test console_table_config` (5 passed, 8.7s — 1
+kept in `console_stream.rs`, 4 kept in `console_table_config.rs`);
+`cargo test -p animusd --lib sim_cluster -- --test-threads=2` (353
+passed, 0 failed, 2 ignored, 962.08s — 337 baseline + this PR's 16 new
+tests; anchored-sampler RSS across the sampled window: first ~776 MB,
+peak ~776 MB, last ~132 MB — sampling began several minutes into the run
+so the true from-launch first sample was not captured, but the observed
+trajectory stayed well under the 6 GB/30 min budget throughout, consistent
+with every prior rung's own no-leak pattern); `cargo fmt --all --check`
+(one pass needed, applied via `cargo fmt --all`, then clean); `cargo
+clippy -p animusd --all-targets --all-features -- -D warnings` (clean).
+`Cargo.lock` unchanged.
+
+See ADR 0061's "Rung H, PR 4 landed" amendment and `docs/roadmap.md`'s
+C-08 entry for the full record.
