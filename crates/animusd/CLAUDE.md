@@ -6540,14 +6540,38 @@ role split (5/21), reconciler-driven split/rebalance/GC (7/13), TTL
 (1/6), auto-split loops (2/2), `--config` bring-up (2/2) —
 reconciler-driven split/rebalance/GC, auto-split, join/growth, and the
 backup janitor are D4's own scope (D4 PR 1 already supplied the real
-reconciler these need next); Transact and PartiQL are D2's own named
-residuals, now in progress as **C-06** (`docs/roadmap.md`, ADR 0061's
-"Rung F" amendment); admin/console/dashboard HTTP, Streams, TTL, the control/data
-role split, `--config` bring-up, index DDL beyond `CreateTable`, node
-assembly, and the throttle-metric counters are unowned by any planned
-rung as of this close; (E) frozen behind an open flake issue, 7 files/32
-tests (#298, #418, #592, #601, #610, #619/#622, #627) — out of scope for
-C-04, tracked by their own issues.
+reconciler these need next); admin/console/dashboard HTTP, Streams, TTL,
+the control/data role split, `--config` bring-up, index DDL beyond
+`CreateTable`, node assembly, and the throttle-metric counters are unowned
+by any planned rung as of this close; (E) frozen behind an open flake
+issue, 7 files/32 tests (#298, #418, #592, #601, #610, #619/#622, #627) —
+out of scope for C-04, tracked by their own issues.
+
+**Transact and PartiQL — D2's own named residuals — are closed by C-06
+(landed 2026-09-08, ADR 0061's "Rung F"/"Rung F closed" amendments,
+`docs/roadmap.md`).** Both are now reachable through `dynamo::
+dispatch_item_op<E, R>`: `TransactWriteItems`/`TransactGetItems` (C-06
+PRs 2/3/4 — `sim_cluster_dynamo_transact.rs` plus the wire-corpus op mix)
+and `ExecuteStatement`/`BatchExecuteStatement`/`ExecuteTransaction` (C-06
+PRs 5/6 — four new `_as` generic siblings, `sim_cluster_dynamo_
+partiql.rs`). `crates/animusd/tests/dynamo_partiql.rs` and `dynamo_
+execute_transaction.rs` (37 tests) stay in the `tests/*.rs` tree
+**deliberately, kept in full rather than trimmed or deleted**: they are the
+`ProdEnv` proof that `run_operation`'s own production dispatch — never
+widened or replaced, only paralleled by C-06's new generic siblings —
+still matches what the generic `SimCluster` path exercises, the same
+"keep the real-socket original as the equivalence regression" call D3 PR
+3b already made for `dynamo_indexes.rs::gsi_write_then_query`. Two issues
+this series surfaced and fixed along the way, both general control-plane
+infrastructure rather than Transact-specific: #731 (`SimRelayClient`'s
+nested-relay deadlock, fixed by #738) and #737 (`txn_recover`'s non-local
+grace-check wall-clock bug, fixed by #740). `cargo test -p animusd --lib`
+grew from 353 passed immediately before C-06 PR 3 to 438 passed / 3
+ignored after PR 6 — see ADR 0061's "Rung F closed" amendment for the
+full per-PR accounting, including PR #753's fix for the two
+`animus-sim`/`animus-node` reference-cycle leaks the series' own gating
+surfaced (previously filed, in this file's C-06 PR 4 appendix below, as
+an unfixed "resource-scale finding" — now root-caused and closed).
 
 **Standing rule for new `animusd` logic tests**: default to a
 `sim_cluster_*` sibling module (`SimCluster::dynamo`/`dynamo_concurrent`/
@@ -7812,3 +7836,12 @@ dynamo_partiql --test dynamo_execute_transaction` (37 passed, 0 failed —
 30 + 7, 11.38s + 2.36s — the real-socket suites stayed byte-identical).
 `Cargo.lock` unchanged. A determinism replay (`ANIMUS_SEED=3228520449` on
 `insert_then_select_sees_it`, run twice) gave identical output both times.
+
+**C-06 closed 2026-09-08 (PR 7, docs only).** See the "Standing rule for
+new `animusd` logic tests" and residual-inventory paragraphs above (Tests
+section) for the closing accounting — Transact and PartiQL are no longer
+D2 residuals in progress, and `dynamo_partiql.rs`/`dynamo_execute_
+transaction.rs` are kept in full as the standing `ProdEnv` equivalence
+regression, not a temporary artifact of the series. ADR 0061's "Rung F
+closed" amendment and `docs/roadmap.md`'s C-06 entry carry the full
+seven-PR account.

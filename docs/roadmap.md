@@ -619,14 +619,16 @@ the still-true paragraph after the table.
   identical scenario failing with a stale handle shadowing the fresh one).
   See `sim_cluster_dynamo_corpus.rs`'s own new "Corpus-fixture findings"
   module-doc section for the full account of each, including the exact
-  seeds. **A resource-scale finding filed, not fixed**: peak process RSS
-  for `ANIMUS_DYNAMO_WIRE_SEEDS=25` (200 scenarios) grows with depth and
-  was observed OOM-killed on this rung's 15 GiB development sandbox
-  (plateauing near ~13.8 GiB at both `=12` and `=25`); `=12`/`=4` complete
-  cleanly on the same sandbox, and CI's own previously-established green
-  `=25` figure implies its runners simply have more RAM. See that same
-  module-doc section for the measured numbers — not investigated further
-  per this PR's own scope. **PR 5 (PartiQL siblings) landed 2026-09-08**:
+  seeds. **A resource-scale finding was filed here as "not fixed, not
+  investigated further"; it has since been root-caused and fixed by PR
+  #753, outside this PR's own scope at the time.** The OOM was never
+  glibc allocator retention (this PR's own original framing) — it was a
+  genuine per-test reference-cycle leak in `animus-sim`'s task queue plus a
+  second, independent one in `animus-node`'s `SimRelayClient` handler slot,
+  both fixed 2026-09-08 (PR #753) ahead of PR 6's own full-suite gate,
+  which depended on them. See ADR 0061's two 2026-09-08 leak-fix
+  amendments and this section's own PR 7 close-out below for the fix and
+  its measured numbers. **PR 5 (PartiQL siblings) landed 2026-09-08**:
   four new `<E: Env, R: RelayClient>`-generic siblings —
   `execute_statement_as`/`execute_transaction_as`/
   `run_batch_execute_statement_as`/`execute_one_batch_statement_as` — plus
@@ -661,17 +663,53 @@ the still-true paragraph after the table.
   `batch_execute_statement_*`/`delete_*` test beyond PR 5's own scenario
   (c) — not named in this PR's own candidate list, left for a future pass.
   See ADR 0061's matching 2026-09-08 "Rung F, PR 6" amendment for the full
-  account. PR 7 (docs close-out) remains open.
+  account.
+
+  **PR 7 (this docs close-out) landed 2026-09-08, closing C-06.** The full
+  seven-PR series: PR 1 docs opener (#728); PR 2 Transact groundwork
+  (#729); PR 3 Transact reachable from `SimCluster` (#732), which surfaced
+  and closed two issues of its own — the `SimRelayClient` nested-relay
+  deadlock (#731, fixed by #738) and `txn_recover`'s non-local grace-check
+  wall-clock bug (#737, fixed by #740); PR 4 Transact in the wire corpus
+  (#748); PR 5 PartiQL siblings (#750); PR 6 PartiQL sim tests (#756); PR 7
+  this close-out. Across PRs 3-6, `cargo test -p animusd --lib` grew from
+  353 passed (pre-PR-3 baseline) to 438 passed / 3 ignored (post-PR-6),
+  entirely additive `SimCluster` coverage with zero regressions at any
+  step. Every production dispatch path (`run_operation`, `execute_
+  statement`, `execute_transaction`, `run_batch_execute_statement`,
+  `execute_one_batch_statement`) stayed byte-identical throughout, per this
+  section's own non-goals — confirmed the whole way by running the
+  unmodified real-socket suites against the widened code.
+
+  **`crates/animusd/tests/dynamo_partiql.rs` and `dynamo_execute_
+  transaction.rs` are kept in full, not trimmed or deleted.** They remain
+  the `ProdEnv` proof that `run_operation`'s own production dispatch path —
+  never replaced, only paralleled by the new generic siblings — actually
+  matches what the generic `SimCluster` siblings exercise; deleting them
+  would leave the byte-identical claim above unverifiable on every future
+  change. This mirrors D3 PR 3b's own decision to keep `dynamo_indexes.
+  rs::gsi_write_then_query` whole rather than convert or delete it. See ADR
+  0061's "Rung F closed" amendment for the full account.
+
+  **What remains unowned after C-06**, per the D3-closing residual
+  inventory (`crates/animusd/CLAUDE.md`'s Tests section) with Transact and
+  PartiQL now removed from it: admin/console/dashboard HTTP, **Streams
+  (next in line)**, TTL, the control/data role split, `--config` bring-up,
+  index DDL beyond plain `CreateTable`, node assembly/raw `ClientRequest`,
+  and the throttle-metric counters. None of these eight groups has a rung
+  against it today.
 - **ADR:** [0061](adr/0061-testability-node-crate-simulator.md) — the
   2026-09-07 "Rung F" amendment (see its 2026-09-08 "Rung F, PR 4"/"Rung F,
-  PR 5"/"Rung F, PR 6" addenda for PR 4/5/6's own accounts).
+  PR 5"/"Rung F, PR 6" addenda for PR 4/5/6's own accounts, and its "Rung F
+  closed" amendment for PR 7's own close-out).
 - **Size:** L (seven PRs, two real production functions' worth of
   `ProdEnv`-only surface to widen plus two new fault-injecting sim
   suites).
 - **Depends:** C-04 (closed 2026-09-07 — D4 PR 1's real per-node
   `Reconciler` and D3's `dispatch_item_op`/`dispatch_table_op` cores are
   both load-bearing prerequisites this rung builds directly on).
-- **Status (2026-09-08):** open — PRs 1-6 landed; PR 7 remains open.
+- **Status (2026-09-08):** closed. All seven PRs landed; see the PR 7
+  close-out above for the full accounting.
 
 ---
 
@@ -749,7 +787,7 @@ wave are independent and can run in parallel.
 | 4 | *landed 2026-09-05* (S-02) | Highest blast radius (C-01 landed 2026-09-05 — see ADR 0054; S-01 landed 2026-09-05 — see ADR 0064; S-02 — see ADR 0066) |
 | 5 | *S-04, S-05, S-07b–d, C-02, C-05 all landed 2026-09-06* | S-05 strictly after S-04 |
 | 6 | *S-03 complete 2026-09-07 (all 3 PRs, ADR 0069)*; *S-07e/S-07 complete 2026-09-07 (ADR 0070)*; *C-03 assessed 2026-09-07 — deferred, no PRs planned (see ADR 0044's matching amendment)*; W-07 | XL or gated on earlier waves |
-| 7 | C-06 (PRs 1-6 landed, PR 6 on 2026-09-08; issues #731 and #737 both fixed 2026-09-07; PR 7 open) | Gated on C-04 (closed 2026-09-07) — the D4 `Reconciler` and D3 generic dispatch cores it builds on |
+| 7 | C-06 (closed 2026-09-08 — all seven PRs landed: #728, #729, #732, #748, #750, #756, plus this PR; issues #731 and #737 both fixed 2026-09-07) | Gated on C-04 (closed 2026-09-07) — the D4 `Reconciler` and D3 generic dispatch cores it builds on |
 
 Open issues mapped: none left (#375 closed by W-01, #319 by W-05). Filed
 from wave 2's own findings: #590 (the operator still emits the deleted
