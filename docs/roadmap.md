@@ -922,6 +922,43 @@ the still-true paragraph after the table.
 
 ---
 
+### C-09 TTL reaper SimCluster dispatch
+
+- **Problem:** the DynamoDB-style TTL reaper (ADR 0051) is only provable
+  over `ProdEnv`'s real wall clock today — `tests/dynamo_ttl.rs`'s 9
+  real-socket tests, plus one residue test apiece in `admin_endpoint.rs`
+  and `console_stream.rs` whose own doc comments already say why: "no
+  primitive drives `animusd::ttl_reaper::ttl_reaper_loop` under `SimEnv`."
+  This is the `TTL (1/9)` entry in C-08's own "what remains unowned"
+  residual list, and the one Rung H's own close-out recommended tackling
+  first of the six groups it left behind.
+- **What:** the identical widen-then-add-a-generic-entry-point template
+  D3/D4/C-06/C-07/C-08 have already validated, applied to the smallest
+  remaining surface in the sequence: `animus_node::ttl_reaper::
+  ttl_reaper_loop` is **already** `<E: Env, H: TtlScanHost +
+  TtlReaperProgressHost>`-generic (rung C2); the one concrete surface left
+  to widen is `crates/animusd/src/ttl_reaper.rs`'s thin wrapper plus
+  `impl TtlReaperProgressHost for ClientCtx` in `client_ctx_host.rs:98`
+  (`TtlScanHost` is already `<E, R>`-generic there, D4 PR 5). `SimCluster`
+  gets an always-on per-node TTL-reaper spawn at a 200ms sim interval,
+  beside the segment/backup janitors it already spawns the same way, plus
+  a `drive_ttl_sweep` convenience mirroring `drive_stream_seal`. See
+  [ADR 0061](adr/0061-testability-node-crate-simulator.md)'s 2026-09-08
+  "Rung I (post-C-08)" amendment for the full grep-verified ground truth,
+  the file/line anchors, the 11-test unlock table, and the per-PR gates.
+- **ADR:** [0061](adr/0061-testability-node-crate-simulator.md) (rung I,
+  open), [0051](adr/0051-dynamodb-ttl.md) (the reaper itself).
+- **Size:** S, 4-5 PRs — the smallest rung in the F-through-I sequence, no
+  new capability trait/newtype/store concept, since the reaper loop is
+  already generic.
+- **Depends:** C-08 (closed) — this rung is C-08's own close-out
+  recommendation, stacked directly on it.
+- **Status (2026-09-08):** open — PR 1 (this docs opener) landed; PRs 2–5
+  (groundwork, `sim_cluster_ttl.rs`, admin/console residue, docs
+  close-out) to follow.
+
+---
+
 ## 4. Operator surfaces: admin API, dashboard, console, CLI
 
 Conventions (verified): a new admin route needs a match arm in
@@ -999,6 +1036,8 @@ wave are independent and can run in parallel.
 | 7 | C-06 (closed 2026-09-08 — all seven PRs landed: #728, #729, #732, #748, #750, #756, plus this PR; issues #731 and #737 both fixed 2026-09-07) | Gated on C-04 (closed 2026-09-07) — the D4 `Reconciler` and D3 generic dispatch cores it builds on |
 | 8 | C-07 (closed 2026-09-08 — all six PRs landed: #758, #759, #760, #761, #762, plus PR 6) | Gated on C-04 (closed) and C-06 (closed) — the same generic dispatch cores, plus C-06's own Transact widening |
 | 9 | C-08 (closed 2026-09-08 — all eight PRs landed: #764, #765, #766, #767, #773, #776, #777, PR 8) | Gated on C-04 (closed), C-06 (closed), and C-07 (closed) — the same generic dispatch cores, plus rung C5's own widening of `ClientCtx`'s field types |
+| 10 | C-09 (open 2026-09-08 — PR 1, this docs opener, landed; PRs 2–5 to follow) | Gated on C-08 (closed) — C-08's own close-out recommendation, stacked directly on it |
+| 11 | C-10 (candidate: index DDL beyond plain `CreateTable`, sequenced after C-09 by the maintainer 2026-09-08; not yet planned) | Gated on C-09 — the next unowned residual group per Rung H's own close-out |
 
 Open issues mapped: none left (#375 closed by W-01, #319 by W-05). Filed
 from wave 2's own findings: #590 (the operator still emits the deleted

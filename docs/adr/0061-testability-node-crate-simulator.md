@@ -847,6 +847,7 @@ supply one, and isn't trying to.
 | F | Post-C-04: Transact/PartiQL `SimCluster` dispatch (C-06) — the two named D2 residuals (Transact, PartiQL), never claimed by any D3/D4 rung. **Closed 2026-09-08 (PRs #728, #729, #732, #748, #750, #756, plus PR 7)** — both residuals now reachable through `dispatch_item_op`, the real-socket `dynamo_partiql.rs`/`dynamo_execute_transaction.rs` kept in full as the `ProdEnv` equivalence proof, `cargo test -p animusd --lib` 353 → 438 passed across PRs 3-6. See the 2026-09-07 "Rung F" amendment and the "Rung F closed" amendment below, and `docs/roadmap.md`'s C-06 entry |
 | G | Post-C-06: Streams `SimCluster` dispatch (C-07) — the largest remaining unowned residual group named by Rung F's own close-out (`dynamo_streams.rs`/`stream_janitor.rs`/`stream_backfill_seed_filter.rs`, 3 files/28 tests, plus `console_stream.rs`'s own 4 tests filed under the console/dashboard group). **Closed 2026-09-08 (PRs #758, #759, #760, #761, #762, plus PR 6)** — `dynamo_streams.rs` (15 tests: 12 converted, 3 kept `ProdEnv`) and `stream_janitor.rs` (11 tests: 9 converted, 2 kept `ProdEnv`) both closed; the read API, stream enable/disable, on-demand sealing, and the segment janitor's two-phase retention sweep are all `SimCluster`-reachable. `stream_backfill_seed_filter.rs` (2 tests) stays `ProdEnv`, filed under the separate "index DDL beyond plain `CreateTable`" residual, per the rung's own plan. `console_stream.rs` (4 tests) stays filed under admin/console/dashboard HTTP. `tests/streams_e2e.rs` stayed out of scope throughout, frozen behind #298/#745. `cargo test -p animusd --lib` 315 passed / 2 ignored at the sim tier after PR 5, no leak trajectory. See the 2026-09-08 "Rung G" amendments below (including the "Rung G closed" amendment) and `docs/roadmap.md`'s C-07 entry |
 | H | Post-C-07: admin/console/dashboard HTTP `SimCluster` dispatch (C-08) — the group Rung G's own close-out named as what remains unowned, 10 files/67 tests (`admin_endpoint.rs` 23, `dashboard_endpoint.rs` 16, `console_endpoint.rs` 3, `console_create_table.rs` 4, `console_items.rs` 4, `console_stream.rs` 4, `console_table_config.rs` 9, `console_tables.rs` 1, `metrics_endpoint.rs` 1, `system_table.rs` 2). **Closed 2026-09-08 (PRs #764, #765, #766, #767, #773, #776, #777, plus this PR 8)** — 42 of the 67 tests now have a deterministic `SimCluster` sibling across six new modules (`sim_cluster_console.rs`, `sim_cluster_console_stream.rs`, `sim_cluster_console_table_config.rs`, `sim_cluster_admin.rs`, `sim_cluster_admin_actions.rs`, `sim_cluster_dashboard.rs`; 89 tests with `_over_seeds`), `console_tables.rs`/`console_create_table.rs`/`console_items.rs` deleted whole; 25 tests stay `ProdEnv` with a documented reason each (`admin_endpoint.rs` 10, `dashboard_endpoint.rs` 4, `console_endpoint.rs` 3, `console_stream.rs` 1, `console_table_config.rs` 4, `metrics_endpoint.rs` 1, `system_table.rs` 2). Two real, previously-latent seam bugs found and fixed (a shared `MetricsHandle::noop()` corrupting `/admin/metrics`'s `is_leader` gauge cluster-wide, PR 5; `ClientCtx::admin_transfer_control_leadership`'s commit-wait loop still reading the real clock despite an already-generic signature, PR 6, the third recorded recurrence of that lesson), plus one same-day-corrected design mistake (PR 2's blanket `impl Trait for ClientCtx` narrowing production, fixed with the `GenericAdminHost`/`GenericConsoleBackend` newtype pair). `cargo test -p animusd --lib sim_cluster` ran 317 → 337 → 353 → 367 → 383 → **406 passed, 0 failed, 2 ignored** (#777's own real gate run, 752.46s, anchored-sampler RSS first ~99 MB / peak ~816 MB / last ~133 MB). See the 2026-09-08 "Rung H" amendments below (including "Rung H, PR 2 landed" through "Rung H, PR 7 landed", and "Rung H closed") and `docs/roadmap.md`'s C-08 entry |
+| I | **Open**, opened 2026-09-08. Post-C-07: TTL reaper `SimCluster` dispatch (C-09) — the `TTL (1/9)` residual Rung H's own close-out named and recommended first, of the six groups left unowned after C-08. `animus_node::ttl_reaper::{ttl_reaper_loop, ttl_sweep_one_tablet}` is already `<E: Env, H: TtlScanHost + TtlReaperProgressHost>`-generic (rung C2); the one remaining concrete surface is `crates/animusd/src/ttl_reaper.rs`'s thin wrapper plus `impl TtlReaperProgressHost for ClientCtx` (bare defaults) in `client_ctx_host.rs:98` — `TtlScanHost` is already `<E, R>`-generic there (D4 PR5). No primitive drives the loop under `SimEnv` today (`SimCluster::new`/`restart` never spawn it), so `tests/dynamo_ttl.rs`'s 9 tests plus one residue test apiece in `admin_endpoint.rs` and `console_stream.rs` all stay `ProdEnv`. **PR 1, this docs-only opener, landed** — see the 2026-09-08 "Rung I" amendment below and `docs/roadmap.md`'s C-09 entry. PRs 2-5 (groundwork, `sim_cluster_ttl.rs`, admin/console residue, close-out) are queued to follow |
 
 Note that the copy-based split driver (ADR 0050) is deliberately **not** on
 this list: ADR 0058 rung 4's remaining layer deletes it. Writing a corpus
@@ -6699,3 +6700,251 @@ after the PR 7 appendix; `crates/animus-node/CLAUDE.md`'s dated PR 1
 correction re-pointed at this closed rung; `docs/engineering-lessons.md`
 already carries every finding this rung's own PRs made — no new entry
 needed at this close.
+
+## 2026-09-08 amendment — Rung I (post-C-08): TTL reaper under `SimCluster` (C-09), PR 1 (this docs-only opener)
+
+**The maintainer approved the C-08 close-out's recommendation on
+2026-09-08.** Rung H's own close-out named six groups left unowned after
+C-08 (TTL, the control/data role split, `--config` bring-up, index DDL
+beyond plain `CreateTable`, node assembly/raw `ClientRequest`,
+throttle-metric counters) and recommended TTL first, "but this is the
+maintainer's call, not one this docs-only PR makes." This amendment is
+that recommendation turned into a concrete, grep-verified plan — tracked
+in `docs/roadmap.md` as **C-09** — and on 2026-09-08 the maintainer
+approved it, sequencing index DDL beyond plain `CreateTable` as the rung
+after this one (the C-10 candidate, not yet planned). PR 1 (docs only) is
+built; PRs 2-5 below follow.
+
+**Goal.** Make the DynamoDB-style TTL reaper (ADR 0051) — currently
+provable only over `ProdEnv`'s real wall clock via `tests/dynamo_ttl.rs`'s
+9 real-socket tests, plus one residue test apiece in `admin_endpoint.rs`
+and `console_stream.rs` — deterministically fault-injectable and
+seed-replayable under `SimCluster`/`SimEnv`, closing the smallest of the
+six residual groups Rung H left behind.
+
+**Ground truth**, from a read-only grep of the current tree, not a plan
+expectation:
+
+- `crates/animus-node/src/ttl_reaper.rs:188`'s `pub async fn
+  ttl_reaper_loop<E, H>(env: E, host: H, interval: Duration) where E: Env,
+  H: TtlScanHost + TtlReaperProgressHost` is **already fully generic**
+  (rung C2) — reads `TtlSpec` via `host.ttl_metadata()`, compares against
+  `env.wall_now()` (ADR 0051 §1), deletes through
+  `host.ttl_delete_if_attribute_equals` → `dynamo::
+  kind_write_item_at_leader` (ADR 0049's kind-write path, so index/stream/
+  change-log maintenance is inherited, never reimplemented), and publishes
+  a `TtlReaperProgress` per phase transition. `crates/animus-node/src/
+  host.rs:121`'s `TtlScanHost` and `:185`'s `TtlReaperProgressHost` are the
+  two traits it is generic over.
+- `crates/animusd/src/ttl_reaper.rs` is a **concrete** (`ClientCtx`
+  default type params) thin delegation, its entire body: `pub(crate) async
+  fn ttl_reaper_loop(ctx: crate::ClientCtx, interval: Duration) { let env =
+  ctx.env.clone(); animus_node::ttl_reaper::ttl_reaper_loop(env, ctx,
+  interval).await; }`. This is the cheapest widening shape in the whole
+  series (the D2/D3/D4/G free-function precedent), not the riskier
+  trait-impl-on-`ClientCtx` shape C-08 PR 2's own same-day correction
+  warns against (see that PR's `GenericAdminHost`/`GenericConsoleBackend`
+  newtype fix).
+- `crates/animusd/src/client_ctx_host.rs:106`'s `impl<E: Env, R:
+  RelayClient> TtlScanHost for ClientCtx<E, R>` is **already generic**
+  (D4 PR 5's own widening pass). `client_ctx_host.rs:98`'s `impl
+  TtlReaperProgressHost for ClientCtx` (bare defaults — `ClientCtx<E:
+  Env = ProdEnv, R: RelayClient = AnimusdRelayClient>`, `lib.rs:9710`) is
+  the **one remaining concrete impl** in this whole surface — a two-line
+  mutex-update body, safe to widen the same low-risk way
+  `BackupJanitorProgressHost` already was, immediately above it in the
+  same file.
+- `crates/animus-sim/src/lib.rs:1418`'s `Clock::wall_now` — `UnixMillis(
+  SIM_WALL_EPOCH_MS.saturating_add(self.now().0 / 1_000_000))`
+  (`SIM_WALL_EPOCH_MS = 1_577_836_800_000`, line 1875) — is a **pure
+  function of virtual time**: a `PutItem` at `wall_now_secs + delta`, then
+  `run_for`/`drive_*` advancing virtual time past `delta`, deterministically
+  expires an item with no real-clock dependency at all. This is the same
+  "wall-clock seam: none" finding every TTL-touching test in this codebase
+  already relies on.
+- Production's own default sweep cadence is `DEFAULT_TTL_SWEEP_INTERVAL =
+  Duration::from_secs(60)` (`ttl_reaper.rs:90`), unchanged by this rung —
+  `crates/animusd/src/lib.rs`'s ~10 production spawn/construction sites all
+  keep passing it verbatim to the (widened) wrapper. The segment janitor
+  (C-07 PR 5, `crates/animusd/src/segment_janitor.rs:169`) and the backup
+  janitor (D4 PR 5, `crates/animus-node/src/backup_janitor.rs:54`) both
+  already spawn unconditionally in `SimCluster::new`/`::restart` at a
+  hardcoded `Duration::from_millis(200)` sim interval, not gated behind an
+  opt-in the way `auto_split_loop` is — the direct precedent for this
+  rung's own always-on TTL spawn.
+- The TTL reaper self-gates purely per-tablet: `client_ctx_host.rs`'s
+  `TtlScanHost::led_tablets` filters `self.edge.hosted_groups()` on
+  `group.is_leader()` — the identical primitive `segment_janitor`/
+  `drain_gsi` already use, with **no control-plane-leader dependency** —
+  the same low-risk "leader gating" shape every prior always-on loop in
+  this series already has.
+- `SimCluster`'s `Drop` (issue #753) already breaks every node's relay
+  self-cycle and drains `self.sim` (every perpetual task, TTL's new one
+  included) unconditionally — `sim_cluster.rs:1214`'s `impl Drop for
+  SimCluster` needs **no new code** for this rung's spawn, the same "no
+  new Drop-coverage obligation" finding Rung H's own opener already made
+  for its own new (non-loop) primitives, restated here because this rung's
+  primitive genuinely *is* a new perpetual loop, unlike Rung H's.
+
+**Tests unlocked (11 total)**, verified by reading each test body and its
+surrounding doc comment, not assumed from the file's test count:
+
+| Test | File | Reaper-driven? |
+|---|---|---|
+| `update_time_to_live_enable_and_disable_round_trip` | `dynamo_ttl.rs` | No — pure DDL (`UpdateTimeToLive`/`DescribeTimeToLive`, already reachable via `dispatch_item_op`, C-08 PR 2) |
+| `disable_with_a_mismatched_attribute_name_is_rejected` | `dynamo_ttl.rs` | No — pure DDL |
+| `expired_item_is_still_readable_immediately` | `dynamo_ttl.rs` | No — needs `wall_now` past expiry only, not the loop ticking (proves AWS-faithful "expired but not yet reaped" visibility) |
+| `expired_item_is_eventually_reaped` | `dynamo_ttl.rs` | Yes |
+| `future_ttl_item_is_never_deleted` | `dynamo_ttl.rs` | Yes |
+| `wrong_type_ttl_attribute_is_never_deleted` | `dynamo_ttl.rs` | Yes |
+| `absurdly_past_ttl_is_never_deleted_the_five_year_safety_window` | `dynamo_ttl.rs` | Yes |
+| `refreshed_ttl_survives_the_reaper` | `dynamo_ttl.rs` | Yes |
+| `ttl_deletion_is_visible_in_the_stream_with_a_service_user_identity` | `dynamo_ttl.rs` | Yes |
+| `admin_ttl_reports_reaper_progress_and_ttl_tables` | `admin_endpoint.rs` | Yes for its reaper-progress half; the "tables" half (`UpdateTimeToLive` + `GET /admin/ttl` convergence) is **already** covered by `sim_cluster_admin.rs::ttl_tables_lists_a_ttl_enabled_table` (C-08 PR 5) — this rung only needs to add the reaper-progress half |
+| `ttl_deletion_carries_the_service_user_identity_through_the_console` | `console_stream.rs` | Yes |
+
+2 pure-DDL + 1 wall-now-only + 6 reaper-driven (`dynamo_ttl.rs`) + 2
+reaper-driven residue tests (`admin_endpoint.rs`, `console_stream.rs`) =
+11. Both residue tests' own doc comments already say, verbatim, why they
+stay `ProdEnv` today: "no primitive drives `animusd::ttl_reaper::
+ttl_reaper_loop` under `SimEnv`" — exactly the gap this rung closes.
+**No dashboard residue**: `dashboard_u07_ttl_reaper_card` already
+converted in C-08 PR 7 (route/card rendering only, no reaper behavior
+asserted). **Expected residue after this rung: none** — the first rung in
+this whole sequence (F through I) with a clean sweep of its own named
+group.
+
+**The PR series** (5 PRs, stacked on the C-08 close-out — the smallest
+rung yet, no new capability trait/newtype/store concept, since the reaper
+loop is already generic):
+
+- **PR 1 (this amendment).** Docs only: this ADR amendment, the C-09
+  roadmap entry (and wave-10 sequencing row), this file's own rung-table
+  row, and `crates/animusd/CLAUDE.md`'s residual-inventory pointer.
+  **Gates:** none — documentation only, no `cargo` command run.
+- **PR 2 — Groundwork.** Widen `impl TtlReaperProgressHost for ClientCtx`
+  to `<E: Env, R: RelayClient>` (mirrors `BackupJanitorProgressHost`
+  immediately above it). Widen `crates/animusd/src/ttl_reaper.rs::
+  ttl_reaper_loop` to `<E: Env, R: RelayClient>` — every production spawn
+  site keeps passing a bare `ClientCtx` + `DEFAULT_TTL_SWEEP_INTERVAL`
+  unchanged, so `#[deny(clippy::disallowed_methods)]` on `lib.rs`'s five
+  client-path modules stays satisfied and every call site stays
+  byte-identical. In `sim_cluster.rs`: add `SIM_TTL_SWEEP_INTERVAL =
+  Duration::from_millis(200)`, spawn `ttl_reaper::ttl_reaper_loop`
+  unconditionally per node in both `SimCluster::new` and `::restart`,
+  beside the segment-janitor/backup-janitor spawns (identical shape, same
+  comment pattern); add `SimCluster::drive_ttl_sweep(node)` mirroring
+  `drive_stream_seal` — a convenience for precisely-timed sweep assertions,
+  not a strict necessity given `OP_BUDGET` (12s) is 60× the 200ms
+  interval. **Gate:** untrimmed `cargo test -p animusd --test dynamo_ttl`
+  (9 passed) first, to confirm nothing about the new always-on spawn
+  perturbs the existing real-socket suite; then `cargo test -p animusd
+  --lib`; `cargo clippy -p animusd --all-targets --all-features -- -D
+  warnings`; `cargo fmt --all --check`.
+- **PR 3 — `sim_cluster_ttl.rs`.** Converts `dynamo_ttl.rs`'s 9 tests into
+  ~9 scenarios (`_over_seeds` ×5 ≈ 18 tests): wire `CreateTable`/
+  `UpdateTimeToLive`, writes from a non-leader, virtual time advanced past
+  expiry, reap/no-reap asserted with `ConsistentRead: true`; the
+  stream-identity scenario reuses C-07 PR 3's `get_records` primitives.
+  Delete `dynamo_ttl.rs` whole once its untrimmed run and the new sim
+  suite both stay green — nothing in it needs `ProdEnv`. **Gate:** the sim
+  suite green before the trim; a clean `cargo test -p animusd --lib`
+  after.
+- **PR 4 — Admin/console residue.** Add the reaper-progress half to a
+  `sim_cluster_admin.rs` scenario asserting both the tables-list and the
+  reaper-progress reports together (or extend the existing
+  `ttl_tables_lists_a_ttl_enabled_table` scenario, whichever reads
+  cleaner once written); delete `admin_endpoint.rs::admin_ttl_reports_
+  reaper_progress_and_ttl_tables`. Add a scenario to `sim_cluster_
+  console_stream.rs` via `GenericConsoleBackend`; delete `console_
+  stream.rs::ttl_deletion_carries_the_service_user_identity_through_the_
+  console`. **Gate:** untrimmed `admin_endpoint`/`console_stream` before,
+  trimmed after, `cargo test -p animusd --lib` in between.
+- **PR 5 — Docs close-out.** This rung marked "closed," a "Rung I closed"
+  amendment with the PR-by-PR account, before/after `sim_cluster` test
+  counts, the residue table (expected **none**, the first clean sweep in
+  the F-through-I sequence), the gate transcript, and `docs/roadmap.md`/
+  `crates/animusd/CLAUDE.md` updated to match — the same shape every prior
+  rung's own PR 8/6/5/7 close-out already used. **Gates:** none —
+  documentation only.
+
+**Gates, in order, for each test-touching PR** (PR 2-4): untrimmed
+file(s) green → `cargo test -p animusd --lib sim_cluster_ttl --
+--test-threads=2` green → trim → re-run the untrimmed file(s) (until
+deleted) → `cargo test -p animusd --lib sim_cluster -- --test-threads=2`
+(whole tier, ~382 tests expected going in, growing by this rung's own
+conversions; RSS via the anchored sampler — `pgrep -f
+'^/home/user/animus-db/target/debug/deps/animusd-'`, per the #753
+postmortem, never an unanchored substring match — watched for the same
+no-leak shape every prior rung confirmed) → `cargo fmt --all --check` →
+`cargo clippy -p animusd --all-targets --all-features -- -D warnings`.
+
+**Binding rules restated.** Production paths stay byte-identical
+throughout: a free function plus a trivial trait impl widened on
+`ClientCtx<E, R>`'s own generic defaults — no `Generic*` newtype needed
+here, unlike C-08 PR 2's `GenericAdminHost`/`GenericConsoleBackend`,
+because neither `ttl_reaper_loop` nor `TtlReaperProgressHost` is ever
+called through a `dyn`/trait-object production dispatch table the way
+`AdminHost`/`ConsoleBackend` are — both stay concrete free functions/impls
+callable exactly as they are today, so widening their type parameters in
+place cannot silently narrow any production caller (the D2 PR 1 lesson
+does not engage here). No `HashMap`/`tokio::time` may appear in the
+now-generic loop body (it already has none — `ttl_reaper_loop` is
+`animus-node` code, subject to the workspace-wide
+`disallowed-methods`/`disallowed-types` lints, not `animusd`'s
+package-level carve-out). `OP_BUDGET` (12s) vs the new 200ms sim interval:
+a plain op call's fixed budget clears 60 sweep ticks, so any assertion
+that depends on catching an *intermediate* sweep state (mid-cursor,
+one-tick-before-reap) must use `drive_ttl_sweep`/a short `run_for`, never
+an ordinary op call — the same `OP_BUDGET`-vs-short-interval caution
+Rung G's own close-out recorded for its short-retention segment-janitor
+scenario. Off-limits files, confirmed out of scope by this investigation
+and untouched by this series: `streams_e2e.rs`, `dynamo_index_scan.rs`,
+`index_backfill.rs`, `batch_write.rs`, `dynamo_index_writes.rs`,
+`split_placing_two_replica_diff_e2e.rs`, `cp_cross_process.rs`,
+`cp_txn.rs`, `dynamo_txn_idempotency.rs`, `shared_wal_liveness.rs`. Only
+`dynamo_ttl.rs`, `admin_endpoint.rs`, `console_stream.rs`, `ttl_reaper.rs`,
+`client_ctx_host.rs`, `sim_cluster.rs`, and the new `sim_cluster_ttl.rs`
+are touched across PRs 2-4.
+
+**Risks.** Wall-clock seam: none — `wall_now()` is a pure function of
+virtual time; the only real risk is a scenario author reasoning in real
+seconds instead of the sim's own virtual clock, the same caution every
+prior TTL-touching test in this codebase already carries. Leader gating:
+low — data-tablet leadership via `hosted_groups()`, the same primitive
+`segment_janitor`/`drain_gsi` already use, with no control-plane
+dependency to fake. Real LSM state: none — `scan_base_capped` is the same
+generic engine scan every already-converted path already proves; nothing
+TTL-specific touches storage beyond it. New-loop Drop coverage: covered by
+#753's existing contract, confirmed above — the one genuine "is this
+covered" question this rung's own primitive raises, and it resolves
+without new code.
+
+**Alternative considered: index DDL beyond plain `CreateTable`** (the
+other blocker Rung H's own close-out named, "(d)"). It would unlock 9/30
+of the class-D residual (3 `console_table_config.rs` tests — add/drop-GSI,
+declared-attribute-type, reject-unknown-type — plus `dynamo_index_
+scan.rs`/`index_backfill.rs`/`dynamo_index_writes.rs`, the last three
+frozen behind the open flake issues #298/#418/#592/#601/#610/#619/#622/
+#627). It needs the GSI backfill machinery itself generalized — genuinely
+more new mechanism than any rung since D3 PR 3b's own GSI-drain work — and
+is gated on someone else's open flake investigation before even an
+untrimmed baseline could be established safely. TTL pays off two
+already-closed rungs (its own tests plus the `console_stream.rs`/
+`admin_endpoint.rs` residue those rungs left behind) for near-zero new
+risk, with no capability gap and no open external blocker; index DDL is
+the larger rung to take on once those flake issues resolve. This is why
+this amendment recommends TTL first, per Rung H's own advisory note above
+— but, again, the choice is the maintainer's, not this PR's.
+
+**Website:** no change needed — this rung touches no wire-observable
+behavior; every production dispatch path stays byte-identical per this
+amendment's own binding rules, the same reasoning every prior rung's
+opener already applied.
+
+**Docs:** this amendment (opening Rung I, open); `docs/roadmap.md`'s
+new C-09 entry and its wave-10 sequencing row; `crates/animusd/
+CLAUDE.md`'s residual-inventory `TTL (1/9)` mention annotated with a
+pointer to this open rung. **Gates:** none — documentation only, no
+`cargo` command run, `git diff --stat` shows only the three docs files
+this PR touches.

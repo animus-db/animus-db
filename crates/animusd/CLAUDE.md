@@ -6570,14 +6570,17 @@ decommission (9/34), Transact (6/32), index DDL beyond plain `CreateTable`
 (9/30), backup/PITR/export/import (6/29), Streams (3/28, owned by C-07
 (ADR 0061 rung G) as of 2026-09-08), control/data
 role split (5/21), reconciler-driven split/rebalance/GC (7/13), TTL
-(1/9), node assembly/raw `ClientRequest` (2/8), throttle metric counters
+(1/9, **owned** by C-09/ADR 0061 rung I, **open** as of 2026-09-08 — see
+`docs/roadmap.md`'s C-09 entry), node
+assembly/raw `ClientRequest` (2/8), throttle metric counters
 (1/6), auto-split loops (2/2), `--config` bring-up (2/2) —
 reconciler-driven split/rebalance/GC, auto-split, join/growth, and the
 backup janitor are D4's own scope (D4 PR 1 already supplied the real
 reconciler these need next); Streams and admin/console/dashboard HTTP are
-now owned (C-07, C-08); TTL,
-the control/data role split, `--config` bring-up, index DDL beyond
-`CreateTable`, node assembly, and the throttle-metric counters are unowned
+now owned (C-07, C-08), and TTL is now owned too (C-09, open);
+index DDL beyond plain `CreateTable` is queued as C-10 (not yet planned);
+the control/data role split, `--config` bring-up, node assembly, and the
+throttle-metric counters are unowned
 by any planned rung as of this close; (E) frozen behind an open flake
 issue, 7 files/32 tests (#298, #418, #592, #601, #610, #619/#622, #627) —
 out of scope for C-04, tracked by their own issues.
