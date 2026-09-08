@@ -3057,15 +3057,36 @@ async fn run_export_job_inner(
         "outputFormat": "DYNAMODB_JSON",
     });
     let summary_key = format!("{root}/manifest-summary.json");
-    store
-        .put(
-            &summary_key,
-            serde_json::to_string(&summary)
-                .expect("json serializes")
-                .as_bytes(),
-        )
-        .await
-        .map_err(|e| format!("writing manifest-summary.json: {e}"))?;
+    let summary_bytes = serde_json::to_string(&summary)
+        .expect("json serializes")
+        .into_bytes();
+    if let Err(put_err) = store.put(&summary_key, &summary_bytes).await {
+        // Ambiguous ack (mirrors `SegmentStore::put`'s own documented
+        // contract, ADR 0068's as-built amendment on issue #707): a real S3
+        // `PutObject` — and this crate's own `SimSegmentStore` ack-lost
+        // fault, deliberately — can persist the object and still surface a
+        // client-side error. Every OTHER write in this job stays plain
+        // no-retry `?` (a failed interior write is already covered by the
+        // "no S3-object reclaim on failure" residual, ADR 0068 §9 residual
+        // #3): only this terminal completion marker gets resolved, by
+        // reading it back through this same store handle rather than
+        // assuming "not written" and torn-completing the export. Present
+        // with the exact bytes this job just tried to write: the put did
+        // land, so the export completed. Absent, or read-back itself
+        // fails: genuinely not written (or unverifiable), so the original
+        // error still propagates and the row goes `Failed`.
+        match store.get(&summary_key).await {
+            Ok(Some(existing)) if existing == summary_bytes => {
+                // Landed despite the ack loss — fall through to `Ok` below.
+            }
+            Ok(_) => return Err(format!("writing manifest-summary.json: {put_err}")),
+            Err(get_err) => {
+                return Err(format!(
+                    "writing manifest-summary.json: {put_err} (readback failed: {get_err})"
+                ));
+            }
+        }
+    }
 
     Ok((item_count, billed_size_bytes, summary_key))
 }

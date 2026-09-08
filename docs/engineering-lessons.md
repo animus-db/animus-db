@@ -14228,6 +14228,28 @@ silently substitutes for a genuine result. Worth checking any other
 multi-step job in this repo's CI for the same pattern before assuming its
 "only some things are failing" read of a red run is complete.
 
+## `continue-on-error` only routes around a step that *fails* — an unbounded step that hangs and loses its runner still takes the whole job down with it (`corpus-deep.yml`, issue #772)
+
+The fix above (`continue-on-error: true` + per-step `id:` + `if: always()`
+aggregation) assumes every step eventually *returns*, pass or fail. It says
+nothing about a step that never does. On 2026-09-08 (run 34202959222) the
+DynamoDB-wire corpus thrashed for 36 minutes (its usual passing time is
+~7), the hosted runner was lost mid-step, and the whole job died with
+neither "Report corpus results" nor the red-nightly-issue step ever
+running — no report, no issue, the exact silent gap `continue-on-error`
+was built to prevent (issue #554 above), just from a different cause: a
+step with no upper bound on its own runtime, rather than a step that fails
+fast. The fix is a per-step `timeout-minutes` on every `continue-on-error`
+step, sized from observed passing durations (generous enough that a real
+2-3x slowdown still passes, tight enough to cut a hang well short of the
+job's default 6-hour ceiling): a step that times out is recorded
+`cancelled` — a non-"success" outcome, same as any other failure for the
+aggregation step — so the job proceeds to the remaining steps and the
+report/issue-filing machinery gets to run and name the stuck corpus,
+instead of the run just disappearing. Any `continue-on-error` step list
+needs both halves — the outcome aggregation *and* a bound on each step's
+own runtime — to actually guarantee every member gets a chance to report.
+
 ## An untrusted length-prefix pre-sizing a `Vec` is a distinct DoS class from an unbounded-panic one — bounds-checked reads don't close it (`animus-cp-data::codec`, `animus-storage::lsm`)
 
 `codec.rs`'s own doc comment claimed decoding untrusted wire input was
@@ -23413,3 +23435,49 @@ but-PR-less branch is a free checkpoint in any repo with this same
 PR-gated CI posture; treat "did I push yet" as a standing question after
 every commit on a long task, the same reflex as checking `git status`
 before a destructive command.
+## An ambiguous ack on a completion marker must be resolved by reading it back, never treated as "not written" (issue #707, ADR 0068)
+
+`SimSegmentStore`'s put ack-lost fault (`crates/animus-sim/src/
+segment_store.rs`) models something a real S3 client genuinely does: the
+object is written to the store, and the caller still gets an `io::Error`
+back — an intentionally ambiguous ack, the object-storage counterpart of
+`ProposeResult::Accepted` meaning "appended locally", never "committed" (see
+this file's own "Durable-before-visible" rule in the root `CLAUDE.md`). The
+S3 export job (`animusd::dynamo::run_export_job_inner`) writes several
+objects in a fixed, durable-before-visible order and `?`-propagates the
+first error uniformly — correct for every *interior* write (`_started`,
+each data chunk, `manifest-files.json`): a genuine failure there really
+should fail the whole job, and ADR 0068 §9's own residual #3 already
+accepts that a failed export's partial objects are not cleaned up. It is
+**wrong** for the one **terminal** write whose mere presence a reader
+trusts to mean "done" (`manifest-summary.json` here; a backup's own
+completion marker, or any other single-object commit point, is the same
+shape): treating that write's ambiguous error as "not written" produces a
+torn completion — the object physically present while the catalog row
+says `Failed` — exactly the invariant ADR 0068 as-built ("never a torn
+`COMPLETED`") had already claimed to hold, and did not, until the nightly
+corpus's depth-40 sweep drew the fault on that exact write
+(`export_with_bucket_faults_converges_or_fails_cleanly`, seed
+`12365148609929809193`).
+
+**The fix is a readback, not a retry**: on an error from the terminal
+write, `get` the same id back through the same `SegmentStore` handle.
+Present with the exact bytes just attempted means the put landed despite
+the error — treat the job as succeeded. Absent (or the readback itself
+errors) means it is genuinely unwritten — propagate the original error
+unchanged. Nothing is written a second time, so `SegmentStore::put`'s
+write-once contract is never exercised twice for the same id, and no new
+fault-injection surface is added.
+
+**General lesson**: any store or RPC whose ack can be lost after the
+underlying effect lands (this repo's own `Env` seams routinely model this
+exactly to catch it) needs its callers to know which of their own writes
+are "just data" — safe to fail outright and let the caller retry/fail the
+whole operation — versus "the fact of my having happened is the whole
+point" — a completion marker, a commit record, an idempotency-cache row.
+Only the latter needs ambiguity resolved before trusting an error; wiring
+the same resolution onto every write is unnecessary work, and wiring it
+onto none of them (the bug here) silently breaks the one invariant the
+marker exists to provide. When adding a new terminal/completion write to
+any job that writes multiple objects/records in sequence, ask this
+question explicitly rather than defaulting to uniform `?`-propagation.
