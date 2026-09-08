@@ -848,13 +848,18 @@ the still-true paragraph after the table.
   **(4) `console_stream.rs` + `console_table_config.rs` siblings — landed
   2026-09-08** (3 of `console_stream.rs`'s 4 tests, 5 of `console_table_
   config.rs`'s 9 — see the Status bullet below for the full disposition);
-  (5) admin dispatch pure observers (`sim_cluster_
-  admin.rs`, `system_table.rs`, `metrics_endpoint.rs`); **(6) admin
+  **(5) admin dispatch pure observers — landed 2026-09-08** (`sim_cluster_
+  admin.rs`, 7 scenarios/14 tests; `system_table.rs`/`metrics_endpoint.rs`
+  stay `ProdEnv` whole); **(6) admin
   mutating actions — landed 2026-09-08** (8 of `admin_endpoint.rs`'s
   remaining 12 tests converted into a new `sim_cluster_admin_actions.rs`;
   the other 4 stay `ProdEnv` — see the Status bullet below for the full
-  disposition); (7) `dashboard_endpoint.rs`
-  + `console_endpoint.rs` close-out; (8) docs close-out. Every production
+  disposition); **(7) `dashboard_endpoint.rs`
+  siblings + `console_endpoint.rs` close-out — landed** (12 of `dashboard_
+  endpoint.rs`'s 16 tests converted into a new `sim_cluster_dashboard.rs`,
+  12 scenarios/23 tests; `console_endpoint.rs` needed no change — its own
+  three tests already reached their final `ProdEnv` disposition in PR 3 —
+  see the Status bullet below for the full account); (8) docs close-out. Every production
   dispatch path (`admin::dispatch`, `console::route`, `execute_routed`,
   `execute_routed_as`, `execute_as`) stays byte-identical throughout —
   strictly additive, parallel new paths only, per the D2 PR 1 lesson
@@ -869,9 +874,13 @@ the still-true paragraph after the table.
 - **Status (2026-09-08):** open — PR 1 (this docs opener), PR 2
   (groundwork), PR 3 (console reachable + first siblings), PR 4
   (`console_stream.rs`/`console_table_config.rs` siblings), PR 5
-  (admin dispatch pure observers), and PR 6 (admin dispatch mutating
-  actions) all landed, PR 2 corrected the same day in review; PRs 7–8 to
-  follow. PR 6 gave 8 of `admin_endpoint.rs`'s remaining 12 tests a
+  (admin dispatch pure observers), PR 6 (admin dispatch mutating
+  actions), and PR 7 (`dashboard_endpoint.rs` siblings) all landed, PR 2
+  corrected the same day in review; PR 8 to follow (PR 7 landed out of
+  the series' own numeric order, ahead of PR 6, since it depends only on
+  PR 2's groundwork — the admin mutating-action widening PR 6 covers was
+  independent surface; PR 6 has since landed too). PR 6 gave 8 of
+  `admin_endpoint.rs`'s remaining 12 tests a
   deterministic `SimCluster` sibling in a new `sim_cluster_admin_
   actions.rs` (8 scenarios × pinned-seed + 5-seed `_over_seeds` = 16
   tests, all green on the first full run, no product bug found beyond one
@@ -891,7 +900,32 @@ the still-true paragraph after the table.
   now()`/`self.env.sleep(..)` conversion every prior recurrence used. See
   `crates/animusd/CLAUDE.md`'s matching C-08 PR 6 appendix for the full
   per-test mapping and gate numbers, and `docs/engineering-lessons.md`'s
-  matching dated note. PR 5 gave 5 of `admin_endpoint.rs`'s 23
+  matching dated note. **PR 7 gave 12 of `dashboard_endpoint.rs`'s 16
+  tests a deterministic `SimCluster` sibling in a new `sim_cluster_
+  dashboard.rs`** (12 scenarios, 23 tests with `_over_seeds` — 11 at
+  pinned-seed + 5-seed, one — `u05_tablet_actions`, a pure marker check
+  against the served `TABLETS_JS` constant — touching no `SimCluster` at
+  all, so it carries no seed). Every converted test's render-marker half
+  reads the served assets' own compile-time constants directly
+  (`crate::dashboard::{HTML, CORE_JS, ...}`) rather than fetching them
+  over a socket — `animus_node::admin`'s own module doc says the
+  dashboard's static assets are served from `handle_conn` *before* its
+  dispatch table is ever reached, so `SimCluster::admin` cannot fetch
+  `/admin/ui/*` at all, and since each asset is a plain `include_str!`
+  constant with no request-time computation, reading it directly is not a
+  narrower proof than a socket fetch would have been. Kept `ProdEnv`:
+  `dashboard_serves_spa_with_cors_and_peers`/`dashboard_role_gating_split_
+  deployment`/`control_node_streams_read_path_is_ground_truth` (real HTTP
+  framing or a genuine control-only/data-only role split) and `dashboard_
+  u05_lineage_panel` (`GET /admin/system-table` gated on `ctx.control_
+  storage`, always `None` under `SimCluster` — the identical gap PR 5's
+  own `system_table.rs` disposition documents). `console_endpoint.rs`
+  needed no change. **No `admin.rs`/`console.rs`/`dynamo.rs`/`sim_
+  cluster.rs` change was needed** — every generic handler these scenarios
+  reach was already built by PR 2 and widened by PR 2/2a/2b/3a. See
+  `crates/animusd/CLAUDE.md`'s matching C-08 PR 7 appendix for the full
+  per-test mapping, and ADR 0061's "Rung H, PR 7 landed" amendment for the
+  full account. PR 5 gave 5 of `admin_endpoint.rs`'s 23
   tests, plus the "tables" half of a sixth, a deterministic `SimCluster`
   sibling in a new `sim_cluster_admin.rs` (7 scenarios, 14 tests with
   `_over_seeds`, all green once two scenario-authoring bugs and one real
@@ -1051,7 +1085,7 @@ wave are independent and can run in parallel.
 | 6 | *S-03 complete 2026-09-07 (all 3 PRs, ADR 0069)*; *S-07e/S-07 complete 2026-09-07 (ADR 0070)*; *C-03 assessed 2026-09-07 — deferred, no PRs planned (see ADR 0044's matching amendment)*; W-07 | XL or gated on earlier waves |
 | 7 | C-06 (closed 2026-09-08 — all seven PRs landed: #728, #729, #732, #748, #750, #756, plus this PR; issues #731 and #737 both fixed 2026-09-07) | Gated on C-04 (closed 2026-09-07) — the D4 `Reconciler` and D3 generic dispatch cores it builds on |
 | 8 | C-07 (closed 2026-09-08 — all six PRs landed: #758, #759, #760, #761, #762, plus PR 6) | Gated on C-04 (closed) and C-06 (closed) — the same generic dispatch cores, plus C-06's own Transact widening |
-| 9 | C-08 (open 2026-09-08 — PR 1 docs opener, PR 2 groundwork, PR 3 console-siblings, and PR 4 console-stream/table-config siblings all landed; PRs 5–8 to follow) | Gated on C-04 (closed), C-06 (closed), and C-07 (closed) — the same generic dispatch cores, plus rung C5's own widening of `ClientCtx`'s field types |
+| 9 | C-08 (open 2026-09-08 — PR 1 docs opener, PR 2 groundwork, PR 3 console-siblings, PR 4 console-stream/table-config siblings, PR 5 admin-observer siblings, and PR 7 dashboard-endpoint siblings all landed; PRs 6 and 8 to follow) | Gated on C-04 (closed), C-06 (closed), and C-07 (closed) — the same generic dispatch cores, plus rung C5's own widening of `ClientCtx`'s field types |
 
 Open issues mapped: none left (#375 closed by W-01, #319 by W-05). Filed
 from wave 2's own findings: #590 (the operator still emits the deleted
