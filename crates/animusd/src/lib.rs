@@ -18097,6 +18097,18 @@ mod sim_cluster_dynamo_transact;
 #[cfg(test)]
 mod sim_cluster_dynamo_partiql;
 
+/// ADR 0061 rung G (post-C-06): Streams `SimCluster` dispatch (C-07), PR 2
+/// — deterministic `SimCluster` smoke for DynamoDB Streams enable/disable
+/// via `UpdateTable` (a new stream-only sub-arm on `dynamo::
+/// dispatch_table_op`) plus on-demand shard sealing (`SimCluster::
+/// drive_stream_seal`, driving the now-generic `index_drain::seal_now`
+/// directly). See this module's own doc for the full scenario and
+/// `crates/animusd/CLAUDE.md`'s matching entry for the groundwork this PR
+/// landed (`disable_stream` widened to `<E, R>`, a shared `SimSegmentStore`
+/// wired into `ClientCtx::segment_store`).
+#[cfg(test)]
+mod sim_cluster_dynamo_streams;
+
 /// Regression for the issue #298 residual confirmed live under the
 /// un-pinned `SplitMode::InPlace` proof soak (ADR 0018's matching amendment,
 /// `docs/engineering-lessons.md`'s matching entry): a stage blocked by

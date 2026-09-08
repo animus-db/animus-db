@@ -1643,22 +1643,25 @@ async fn dispatch_item_op<E: Env, R: RelayClient>(
 /// production uses, from inside `SimCluster` (`sim_cluster_dynamo.rs`), with
 /// no `ProdEnv`/real socket anywhere in the call graph.
 ///
-/// **Covers exactly five operations**: `CreateTable` (a declared GSI/LSI is
+/// **Covers exactly six operations**: `CreateTable` (a declared GSI/LSI is
 /// accepted since ADR 0061 rung D3 PR 3a — `create_table`/`index_to_control`
 /// already mint it `Active` generically, with nothing to backfill at create
-/// time; a stream is still rejected with [`unsupported_by_generic_dispatch`],
-/// the identical shape [`dispatch_item_op`]'s own excluded operations use —
-/// the stream sealer this rung doesn't generalize), `DeleteTable`,
-/// `ListTables`, `DescribeTable`, and
-/// (ADR 0061 rung D3 PR 2b) `UpdateTable`'s own **throughput-only** change —
-/// a `BillingMode`/`ProvisionedThroughput` change with no stream or index
-/// change in the same call, via [`update_table_throughput`]. `UpdateTable`
-/// carrying a stream or index change instead (still needing the GSI-drain/
-/// stream-sealer machinery this rung doesn't generalize), plus
-/// `UpdateTimeToLive`/backup/export/import/PartiQL, all fall through to
-/// [`unsupported_by_generic_dispatch`] — deferred beyond this PR, naming the
-/// same reasons [`dispatch_item_op`]'s own doc already gives for its own
-/// excluded operations.
+/// time; **a declared stream is accepted too, since ADR 0061 rung G (C-07
+/// PR 2)** — `create_table`'s own stream branch just calls the already-
+/// generic `enable_stream`, so there was nothing left to backfill there
+/// either, unlike a GSI's drain), `DeleteTable`, `ListTables`,
+/// `DescribeTable`, (ADR 0061 rung D3 PR 2b) `UpdateTable`'s own
+/// **throughput-only** change — a `BillingMode`/`ProvisionedThroughput`
+/// change with no stream or index change in the same call, via
+/// [`update_table_throughput`] — and (ADR 0061 rung G, C-07 PR 2)
+/// `UpdateTable`'s own **stream-only** change — enable or disable, with no
+/// throughput or index change in the same call, via [`enable_stream`]/
+/// [`disable_stream`]. `UpdateTable` carrying an index change instead
+/// (still needing the GSI-drain machinery this rung doesn't generalize),
+/// plus `UpdateTimeToLive`/backup/export/import/PartiQL, all fall through
+/// to [`unsupported_by_generic_dispatch`] — deferred beyond this PR, naming
+/// the same reasons [`dispatch_item_op`]'s own doc already gives for its
+/// own excluded operations.
 ///
 /// **Called from two places**, mirroring [`dispatch_item_op`] exactly:
 /// [`run_operation`]'s own `CreateTable`/`DescribeTable`/`DeleteTable`/
@@ -1691,14 +1694,10 @@ async fn dispatch_table_op<E: Env, R: RelayClient>(
         } => {
             // See this function's own doc: a declared GSI/LSI is fine
             // (`create_table` mints it `Active` generically, nothing to
-            // backfill at create time) — only a stream still needs machinery
-            // (the stream sealer) this rung does not generalize, so that
-            // alone is rejected up front.
-            if stream_view_type.is_some() {
-                return Err(unsupported_by_generic_dispatch(
-                    "CreateTable with a stream declaration",
-                ));
-            }
+            // backfill at create time), and since ADR 0061 rung G (C-07
+            // PR 2) a declared stream is fine too — `create_table`'s own
+            // stream branch calls the already-generic `enable_stream`, so
+            // there is nothing left here that needs rejecting.
             create_table(
                 ctx,
                 &table,
@@ -1716,13 +1715,13 @@ async fn dispatch_table_op<E: Env, R: RelayClient>(
             exclusive_start_table_name,
             limit,
         } => list_tables(meta, exclusive_start_table_name.as_deref(), limit),
-        // ADR 0061 rung D3 PR 2b: only the throughput-only shape of
-        // `UpdateTable` is covered — a stream or index change needs the
-        // GSI-drain/stream-sealer machinery this rung doesn't generalize
-        // (see `update_table`'s own doc for the three mutually exclusive
-        // change shapes this mirrors). `key_types` is unused here: it only
-        // ever matters for `IndexUpdate::Create`, which this arm never
-        // reaches.
+        // ADR 0061 rung D3 PR 2b + rung G (C-07 PR 2): the throughput-only
+        // and stream-only shapes of `UpdateTable` are covered — an index
+        // change still needs the GSI-drain machinery this rung doesn't
+        // generalize (see `update_table`'s own doc for the three mutually
+        // exclusive change shapes this mirrors). `key_types` is unused
+        // here: it only ever matters for `IndexUpdate::Create`, which this
+        // arm never reaches.
         Operation::UpdateTable {
             table,
             stream,
@@ -1730,17 +1729,45 @@ async fn dispatch_table_op<E: Env, R: RelayClient>(
             key_types: _,
             throughput_update,
         } => {
-            if stream.is_some() || index_update.is_some() {
+            if index_update.is_some() {
                 return Err(unsupported_by_generic_dispatch(
-                    "UpdateTable with a stream or index change",
+                    "UpdateTable with an index change",
                 ));
             }
-            let Some(spec) = throughput_update else {
-                return Err(unsupported_by_generic_dispatch(
-                    "UpdateTable with no supported change",
-                ));
-            };
-            update_table_throughput(ctx, &table, spec).await?;
+            match (stream, throughput_update) {
+                (Some(stream), None) => match stream {
+                    wire::StreamUpdate::Enable(view_type) => {
+                        if metadata_fresh(ctx).await.table_stream(&table).is_some() {
+                            return Err(WireError::validation(format!(
+                                "table `{table}` already has a stream enabled — disable it \
+                                     before re-enabling (ADR 0042 §9: re-enable always mints a \
+                                     fresh, empty stream)"
+                            )));
+                        }
+                        enable_stream(ctx, &table, view_type).await?;
+                    }
+                    wire::StreamUpdate::Disable => disable_stream(ctx, &table).await?,
+                },
+                (None, Some(spec)) => {
+                    update_table_throughput(ctx, &table, spec).await?;
+                }
+                (None, None) => {
+                    return Err(unsupported_by_generic_dispatch(
+                        "UpdateTable with no supported change",
+                    ));
+                }
+                (Some(_), Some(_)) => {
+                    // Unreachable via the wire decoder (it always sets at
+                    // most one of `stream`/`throughput_update`), but handled
+                    // explicitly rather than assumed — mirrors `update_table`'s
+                    // own identical wildcard arm.
+                    return Err(WireError::validation(
+                        "UpdateTable requires exactly one of a StreamSpecification, a \
+                         GlobalSecondaryIndexUpdates, or a BillingMode/ProvisionedThroughput \
+                         change",
+                    ));
+                }
+            }
             let meta = metadata_fresh(ctx).await;
             describe_table(ctx, &meta, &table)
         }
@@ -4122,7 +4149,17 @@ async fn enable_stream<E: Env, R: RelayClient>(
 /// re-seals (idempotent: a repeat seal of an already-fully-sealed hot tail
 /// finds nothing pending and is a no-op) rather than risk disabling with an
 /// un-sealed tail.
-async fn disable_stream(ctx: &ClientCtx, table: &str) -> Result<(), WireError> {
+///
+/// Generic over `E: Env`/`R: RelayClient` (ADR 0061 rung G, C-07 PR 2) —
+/// the identical `enable_stream`/`update_table_throughput` widening
+/// precedent: every `tokio::time::Instant::now()`/`tokio::time::sleep` site
+/// becomes `ctx.env.now()`/`ctx.env.sleep(..)` (`Nanos` has no
+/// `Add<Duration>`, hence `saturating_add`). `update_table`'s own call site
+/// keeps compiling unchanged, monomorphized as before.
+async fn disable_stream<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+    table: &str,
+) -> Result<(), WireError> {
     let tablets: Vec<TabletId> = metadata_fresh(ctx)
         .await
         .tablets_for_table(table)
@@ -4136,7 +4173,7 @@ async fn disable_stream(ctx: &ClientCtx, table: &str) -> Result<(), WireError> {
             ))
         })?;
     }
-    let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+    let deadline = ctx.env.now().saturating_add(SCHEMA_COMMIT_TIMEOUT);
     loop {
         ctx.propose_schema(&MetaCommand::SetTableStream {
             table: table.to_owned(),
@@ -4146,13 +4183,13 @@ async fn disable_stream(ctx: &ClientCtx, table: &str) -> Result<(), WireError> {
         if metadata_fresh(ctx).await.table_stream(table).is_none() {
             return Ok(());
         }
-        if tokio::time::Instant::now() >= deadline {
+        if ctx.env.now() >= deadline {
             return Err(internal(
                 "stream disable did not commit to the control plane in time \
                  (no leader reachable?)",
             ));
         }
-        tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+        ctx.env.sleep(SCHEMA_POLL_INTERVAL).await;
     }
 }
 

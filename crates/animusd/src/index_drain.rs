@@ -2332,8 +2332,21 @@ pub(crate) async fn seal_now<E: Env, R: RelayClient>(
     // residual gap, once, under a new epoch number. This attempt's own
     // now-uncataloged object is a permanent orphan either way, reclaimed
     // by the segment janitor's sweep.
-    let deadline = tokio::time::Instant::now() + SEAL_COMMIT_TIMEOUT;
-    let mut next_propose_at = tokio::time::Instant::now();
+    // ADR 0061 rung G (C-07 PR 2): the commit-wait poll below used to read
+    // the wall clock via `tokio::time::Instant::now()`/`tokio::time::sleep`
+    // directly, despite this function's own `<E: Env, R: RelayClient>`
+    // signature already being generic — a real gap the blocker analysis
+    // that opened this rung missed (a generic *signature* doesn't imply a
+    // seam-clean *body*): under `SimEnv` there is no real Tokio reactor, so
+    // `tokio::time::sleep` panics ("there is no reactor running") the
+    // instant `SimCluster::drive_stream_seal` (this function's first
+    // `SimEnv`-driven caller) ever reached this loop. Converted to
+    // `ctx.env.now()`/`ctx.env.sleep(..)` per the rung C5 step 3b precedent
+    // (`Nanos` has no `Add<Duration>`, hence `saturating_add`) — behavior
+    // under `ProdEnv` is unchanged, since `ctx.env.now()`/`ctx.env.sleep`
+    // are themselves backed by the real clock/timer there.
+    let deadline = ctx.env.now().saturating_add(SEAL_COMMIT_TIMEOUT);
+    let mut next_propose_at = ctx.env.now();
     loop {
         match ctx
             .metadata_fresh()
@@ -2357,7 +2370,7 @@ pub(crate) async fn seal_now<E: Env, R: RelayClient>(
             }
             None => {}
         }
-        let now = tokio::time::Instant::now();
+        let now = ctx.env.now();
         if now >= deadline {
             ctx.data()
                 .raftkv_metrics
@@ -2369,14 +2382,13 @@ pub(crate) async fn seal_now<E: Env, R: RelayClient>(
         }
         if now >= next_propose_at {
             let sent = ctx.propose_schema(&cmd).await;
-            next_propose_at = now
-                + if sent {
-                    Duration::from_secs(1)
-                } else {
-                    Duration::ZERO
-                };
+            next_propose_at = now.saturating_add(if sent {
+                Duration::from_secs(1)
+            } else {
+                Duration::ZERO
+            });
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        ctx.env.sleep(Duration::from_millis(50)).await;
     }
 }
 

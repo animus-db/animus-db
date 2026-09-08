@@ -195,6 +195,15 @@ const OP_BUDGET: Duration = Duration::from_secs(12);
 /// still 2.5x more responsive than production's own fallback.
 const RECONCILER_FALLBACK: Duration = Duration::from_millis(200);
 
+/// Bounded retry budget for [`SimCluster::drive_stream_seal`]'s own
+/// `seal_now` exhaustion loop, mirroring `index_drain::
+/// SPLIT_DRIVER_SEAL_RETRIES` (private to that module, so not reused
+/// directly) — a losing `seal_now` call races a dueling seal for the same
+/// `(tablet, next_epoch)` slot (`index_drain::is_retryable_elsewhere`'s own
+/// doc) and is worth a bounded number of in-place retries rather than an
+/// unconditional loop with no wall-clock deadline to fall back on.
+const STREAM_SEAL_RETRIES: u32 = 5;
+
 /// Build a fresh per-node `Reconciler<SimEnv, MemoryEngine>` (ADR 0061 rung
 /// D4 PR 1) — mirrors `animusd`'s own production node assembly exactly
 /// (`BoundNode::start_with`'s `on_host`/`on_teardown` closures): a fresh
@@ -980,6 +989,17 @@ pub(crate) struct SimCluster {
     /// test a handle for direct assertions/seeding, mirroring `engines`'
     /// own "kept at the driver level for outside access" role above.
     backup_store: SimSegmentStore,
+    /// ADR 0061 rung G (C-07 PR 2): the ONE `SimSegmentStore` every node's
+    /// own `ClientCtx::segment_store` (`SegmentStoreHandle::S3`) wraps a
+    /// clone of — the identical D4 PR 5 trick `backup_store` above already
+    /// validated, applied to the DynamoDB Streams segment store instead of
+    /// the on-demand backup store (two independently configured stores in
+    /// production, ADR 0059 §1's own "deliberately parallel, not shared"
+    /// design — kept as two distinct `SimSegmentStore` instances here for
+    /// the same reason, not one shared object wearing two hats). Kept here
+    /// so [`SimCluster::segment_store`] can hand a test a handle for direct
+    /// assertions, mirroring `backup_store`'s own role.
+    segment_store: SimSegmentStore,
 }
 
 /// Breaks the `Simulator`/`SimEnv` reference cycle (`animus_sim::Simulator::
@@ -1121,6 +1141,12 @@ impl SimCluster {
         // sees every other node's own writes, exactly like a real S3
         // bucket would.
         let backup_store = SimSegmentStore::new(sim.env(ids[0].clone()));
+        // ADR 0061 rung G (C-07 PR 2): a SECOND, independent shared
+        // `SimSegmentStore` for the DynamoDB Streams segment store — see
+        // `SimCluster::segment_store`'s own field doc for why this is a
+        // distinct object from `backup_store` above, not a second wrapper
+        // around the same one.
+        let segment_store = SimSegmentStore::new(sim.env(ids[0].clone()));
 
         let mut ctxs: Vec<SimNodeCtx> = Vec::with_capacity(nodes);
         for (i, id) in ids.iter().enumerate() {
@@ -1171,20 +1197,23 @@ impl SimCluster {
                     change_rates: ChangeRateTracker::default(),
                     request_rates: RequestRateTracker::default(),
                 }),
-                // `cp_kind_write_raw`/`cp_get`/`cp_scan` never read this
-                // one — see the module doc's own "still `ProdEnv`-only"
-                // bullet, and `simenv_client_ctx_tests::single_node_ctx`'s
-                // own doc for why the `Fs` placeholder needs no real
-                // filesystem or `ProdEnv` to satisfy the field.
-                segment_store: SegmentStoreHandle::Fs(FsSegmentStore::new(format!(
-                    "unused-segment-store-{i}"
-                ))),
+                // ADR 0061 rung G (C-07 PR 2): every node's own handle
+                // wraps the SAME shared `segment_store` built above — the
+                // identical D4 PR 5 trick `backup_store` immediately below
+                // already validated (`SimSegmentStore::clone` is cheap,
+                // `Arc<Mutex<..>>`-backed, so every node's own
+                // `list_local`/`put`/`get` sees every other node's writes,
+                // exactly like a real S3 bucket would). `cp_kind_write_raw`/
+                // `cp_get`/`cp_scan` still never read this field — only
+                // `index_drain::seal_now` (via `SimCluster::
+                // drive_stream_seal`) and, once PR 5 lands, the stream
+                // segment janitor do.
+                segment_store: SegmentStoreHandle::S3(Arc::new(segment_store.clone())),
                 // ADR 0061 rung D4 PR 5: every node's own handle wraps the
                 // SAME shared `backup_store` built above — see that
                 // binding's own comment for why `S3` (a genuinely shared
-                // object store) is the right variant here, unlike
-                // `segment_store`'s still-placeholder `Fs` above (nothing
-                // this fixture drives reads it).
+                // object store) is the right variant here, matching
+                // `segment_store`'s own `S3` shape immediately above.
                 backup_store: BackupStoreHandle::S3(Arc::new(backup_store.clone())),
                 export_store_factory: Arc::new(Mutex::new(default_export_store_factory(None))),
                 backup_janitor_progress: Arc::new(Mutex::new(
@@ -1287,6 +1316,7 @@ impl SimCluster {
             crashed: BTreeSet::new(),
             auto_split: None,
             backup_store,
+            segment_store,
         };
         // Let the control group elect before any caller touches it —
         // generous for up to a handful of voters under `SimEnv`'s
@@ -1641,6 +1671,18 @@ impl SimCluster {
     /// own `ClientCtx`.
     pub(crate) fn backup_store(&self) -> SimSegmentStore {
         self.backup_store.clone()
+    }
+
+    /// ADR 0061 rung G (C-07 PR 2): the ONE shared `SimSegmentStore` every
+    /// node's own `ClientCtx::segment_store` wraps a clone of — mirrors
+    /// [`SimCluster::backup_store`] exactly, for the DynamoDB Streams
+    /// segment store instead of the on-demand backup store. A cheap
+    /// `Clone` (`Arc<Mutex<..>>`-backed), so a caller can inspect it
+    /// directly (`SimSegmentStore::stored_ids`/`get`) to confirm a sealed
+    /// shard's own segment object actually landed, without going through
+    /// any one node's own `ClientCtx`.
+    pub(crate) fn segment_store(&self) -> SimSegmentStore {
+        self.segment_store.clone()
     }
 
     /// Durably `put` a backup object directly into this cluster's shared
@@ -2371,6 +2413,81 @@ impl SimCluster {
             None => panic!(
                 "drain_gsi(node={node}, table={table}) did not complete within {OP_BUDGET:?}"
             ),
+        }
+    }
+
+    /// Drive on-demand shard sealing for every led, streamed tablet
+    /// [`node`] hosts (ADR 0061 rung G, C-07 PR 2) — a test-only stand-in
+    /// for `index_drain::change_consumer_loop`'s stream-seal arm
+    /// (`seal_tick`), which this fixture never spawns at all (see the
+    /// module doc's own "hand-hosted, not reconciler-hosted" bullet and
+    /// [`SimCluster::drain_gsi`]'s own doc for the identical reasoning).
+    ///
+    /// Rather than replicating `seal_tick`'s own size/age trigger check
+    /// (`ctx.data().stream_seal_knobs` — populated on every node's
+    /// `DataRole` here since ADR 0061 rung D2 PR 1, so there is nothing to
+    /// plumb, only nothing this method's own unconditional call needs to
+    /// consult), this method calls the trigger-free
+    /// [`index_drain::seal_now`] directly and unconditionally, looped to
+    /// exhaustion — mirroring `index_drain::inplace_split_driver_tick`'s
+    /// own streams final-seal loop exactly, including its bounded retry on
+    /// a losing dueling-seal race (`index_drain::is_retryable_elsewhere`,
+    /// `"; retry"`-suffixed transient errors only — any other error is a
+    /// genuine failure and panics, matching [`SimCluster::drain_gsi`]'s own
+    /// panic-on-genuine-failure contract).
+    ///
+    /// - **Leader check**: only a tablet `node` both hosts and currently
+    ///   leads is sealed (`group.is_leader()`), mirroring `seal_tick`'s/
+    ///   `inplace_split_driver_tick`'s own guard and [`SimCluster::
+    ///   drain_gsi`]'s identical precedent.
+    /// - **`is_quiesced()`/`Building`-child guards are NOT replicated
+    ///   here — they are unreachable under this fixture**, the identical
+    ///   reasoning [`SimCluster::drain_gsi`]'s own doc gives: `SimCluster`
+    ///   never calls `RaftKvNode::enable_quiescence` (every group this
+    ///   fixture hosts answers `is_quiesced() == false` permanently) and
+    ///   never splits a hand/wire-created table's own tablet into a
+    ///   `Building` child through this driver's own on-demand path. A
+    ///   future rung that gives `SimCluster` real quiescence or splitting
+    ///   would need to add both guards back here too.
+    ///
+    /// Loops `seal_now` per matching tablet until it returns `Ok(None)`
+    /// (nothing left pending to seal), driving the simulator up to
+    /// [`OP_BUDGET`] so every resulting `SealStreamShard` propose actually
+    /// commits before this call returns — [`SimCluster::spawn_and_capture`]'s
+    /// own bounded-wait shape, not a fixed sleep.
+    pub(crate) fn drive_stream_seal(&mut self, node: u64) {
+        let handle = self.shared.clone();
+        let outcome: Option<Result<(), String>> = self.spawn_and_capture(node, async move {
+            let ctx = handle.ctx(node);
+            let meta = ctx.effective_metadata();
+            for (tablet, group) in ctx.edge.hosted_groups() {
+                if !group.is_leader() {
+                    continue;
+                }
+                let Some(table) = meta.tablets.get(&tablet).and_then(|t| t.table.as_deref()) else {
+                    continue;
+                };
+                if meta.table_stream(table).is_none() {
+                    continue;
+                }
+                let mut retries_left = STREAM_SEAL_RETRIES;
+                loop {
+                    match index_drain::seal_now(&ctx, table, tablet, &group).await {
+                        Ok(Some(_)) => {}  // sealed a segment; more may remain
+                        Ok(None) => break, // nothing left pending; done
+                        Err(e) if retries_left > 0 && index_drain::is_retryable_elsewhere(&e) => {
+                            retries_left -= 1; // dueling seal; retry
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+            Ok(())
+        });
+        match outcome {
+            Some(Ok(())) => {}
+            Some(Err(e)) => panic!("drive_stream_seal(node={node}) failed: {e}"),
+            None => panic!("drive_stream_seal(node={node}) did not complete within {OP_BUDGET:?}"),
         }
     }
 

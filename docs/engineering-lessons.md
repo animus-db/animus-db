@@ -22968,3 +22968,60 @@ function itself was widened in place with zero behavior change, the D3
 PR 2a/2b/5 shape, where the *same* code now serves both), is to keep the
 original suite whole and say so explicitly, so a later contributor doesn't
 read an unconverted real-socket file as an oversight and "clean it up."
+
+## A function's own generic `<E: Env, R: RelayClient>` signature proves nothing about whether its body still calls the real clock/timer — only running it under `SimEnv` does (ADR 0061 rung G, C-07 PR 2, 2026-09-08)
+
+`docs/adr/0061-*.md`'s rung G opener stated, as a fact from a read-only
+tree pass: "`seal_now<E, R> (proposes `SealStreamShard`, writes
+`ctx.segment_store`) is already generic — a fact from the tree." True, and
+still misleading: `seal_now`'s own commit-wait poll read the wall clock
+via bare `tokio::time::Instant::now()`/`tokio::time::sleep` internally,
+despite the function's signature being `<E: Env, R: RelayClient>` for
+years. Nothing under `SimEnv` had ever actually called `seal_now` before
+this PR (`change_consumer_loop`'s real periodic seal arm is the only
+production caller, and `SimCluster` never spawns that loop), so a
+read-only investigation had no way to see the gap — it only manifests at
+runtime, and only under an environment with no real Tokio reactor
+(`SimEnv`), where `tokio::time::sleep` panics outright ("there is no
+reactor running") the instant the loop's first poll iteration is reached.
+The new `SimCluster::drive_stream_seal` smoke test hit this immediately
+and unambiguously — a hard panic with a full backtrace naming the exact
+line, not a subtle behavioral divergence.
+
+**General lesson**: a "this function is already generic over `E`" claim in
+a blocker/investigation writeup is a claim about the *signature*, checked
+by `cargo build`/reading the `fn` line — it says nothing about whether the
+*body* still reaches through to the real clock/timer rather than the `Env`
+seam, which can only be confirmed by actually driving the function under
+`SimEnv` (or by grepping its own body for `tokio::time`/`std::time`/
+`Instant::now`/`SystemTime::now`, which a read-only investigation pass
+should do for any function it plans to lean on generically, not just check
+the signature). This is the same root distinction ADR 0061 rung C5 step
+3b's own mechanical-conversion pass already discovered once (see that
+rung's "A subtler bug this rung's own mechanical pass introduced" entry in
+`crates/animusd/CLAUDE.md`) — a function can be `E`-generic in name while
+still being `ProdEnv`-only in practice, and the only thing that actually
+proves otherwise is a real `SimEnv`-driven caller reaching every line.
+
+The fix followed the established rung C5 step 3b conversion exactly:
+`tokio::time::Instant::now() + X` → `ctx.env.now().saturating_add(X)`
+(`Nanos` has no `Add<Duration>`), `tokio::time::sleep(D)` → `ctx.env.
+sleep(D)`. `ProdEnv` behavior is unchanged (its own `env.now()`/`env.sleep`
+are the real clock/timer). `index_drain::pitr_seal_now` — `seal_now`'s
+structural twin (`SealPitrSegment` in place of `SealStreamShard`) — was
+confirmed (by direct inspection, not just pattern-matching the function
+name) to carry the identical bug, and was deliberately left unfixed: it is
+not reachable from anything this PR wires up, so fixing it would be a
+drive-by change outside this PR's own stated scope; a future rung driving
+PITR sealing under `SimCluster` will need to make the identical
+`ctx.env.now()`/`ctx.env.sleep(..)` conversion before its own first
+`SimEnv`-driven caller can reach it. `index_drain.rs` is one of the
+crate's `#[allow(clippy::disallowed_methods)]`-covered modules (not one of
+the ten narrower `#[deny(...)]` modules ADR 0061's own closing rung named
+— see root `CLAUDE.md`'s determinism section), which is exactly why
+`cargo clippy -p animusd --all-targets --all-features -- -D warnings`
+never caught this gap on its own: the lint that would have flagged a raw
+`tokio::time` call is switched off for this file by design (the
+`animusd`-wide process-boundary carve-out), so a function that happens to
+be `E`-generic but still reaches for the real clock only reveals itself by
+actually being driven under `SimEnv` once.

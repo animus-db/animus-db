@@ -7846,3 +7846,128 @@ transaction.rs` are kept in full as the standing `ProdEnv` equivalence
 regression, not a temporary artifact of the series. ADR 0061's "Rung F
 closed" amendment and `docs/roadmap.md`'s C-06 entry carry the full
 seven-PR account.
+
+## Appendix — SimCluster groundwork for DynamoDB Streams dispatch (ADR 0061 rung G, C-07 PR 2, 2026-09-08)
+
+Opens the Streams `SimCluster` series (rung G/C-07) Rung F's own close-out
+named next in line. **Groundwork only** — no read API (`ListStreams`/
+`DescribeStream`/`GetShardIterator`/`GetRecords`) is reachable yet (PR 3's
+own scope); this PR is the four blockers (c)/(d)/(e) the rung's opener
+named, plus a first end-to-end smoke.
+
+**`dynamo.rs`**: `disable_stream` widened from `&ClientCtx` to `<E: Env, R:
+RelayClient>` — its two `tokio::time` sites became `ctx.env.now()`/
+`ctx.env.sleep(..)` (`Nanos` has no `Add<Duration>`, hence
+`saturating_add`), the identical `enable_stream`/`update_table_throughput`
+precedent (D3 PR 2b). `dispatch_table_op` gained a stream-only `UpdateTable`
+sub-arm — `stream: Some(..)`, `throughput_update: None` (an index change is
+still rejected) — calling `enable_stream`/`disable_stream` the exact shape
+`update_table`'s own concrete arm already uses, then re-describing the
+table. `CreateTable`'s own arm also stopped rejecting a declared stream:
+`create_table`'s stream branch already called the (already-generic)
+`enable_stream`, so there was nothing left to reject — a check that turned
+out to be pure removal, no new mechanism, once actually traced (the rung's
+own opener had left this an open question, "check, and if that needs more
+than the rejection removal, leave it rejected"). `update_table`/
+`run_operation` stay byte-identical — the D2 PR 1 lesson applied a sixth
+time in this series: the generic dispatcher never becomes the production
+path's only route.
+
+**A real gap the rung's own blocker analysis missed, found running the new
+smoke test, not by inspection**: `index_drain::seal_now` — the primitive
+`SimCluster::drive_stream_seal` (below) calls — is `<E: Env, R:
+RelayClient>`-generic in its *signature*, but its commit-wait poll still
+read the wall clock via bare `tokio::time::Instant::now()`/`tokio::time::
+sleep` internally. A generic signature does not imply a seam-clean body;
+nothing under `SimEnv` had ever actually called `seal_now` before this PR,
+so the gap was invisible to a read-only pass. `SimEnv` has no real Tokio
+reactor, so `tokio::time::sleep` panics ("there is no reactor running")
+the instant the commit-wait loop's first poll iteration is reached — this
+PR's own new smoke test hit it immediately. Fixed with the identical
+conversion `disable_stream` above got: `ctx.env.now()`/`ctx.env.sleep(..)`,
+`saturating_add` for the deadline math. `ProdEnv` behavior is byte-
+identical (its `env.now()`/`env.sleep` are themselves the real clock/timer).
+**`pitr_seal_now` carries the identical bug, unfixed** — it is `seal_now`'s
+structural twin (`SealPitrSegment` instead of `SealStreamShard`) but is not
+reachable from anything this PR wires up; a future rung driving PITR
+sealing under `SimCluster` will hit the identical panic and needs the
+identical fix. See `docs/engineering-lessons.md`'s matching entry for the
+general lesson (a function's own generic type parameters prove nothing
+about whether its body actually avoids the real clock/timer — only running
+it under `SimEnv` does).
+
+**`sim_cluster.rs`**: `SimCluster::new` now builds a SECOND shared
+`animus_sim::SimSegmentStore` — independent from the backup store D4 PR 5
+already wired (ADR 0059 §1's own "deliberately parallel, not shared"
+design for the two stores in production, kept as two distinct
+`SimSegmentStore` instances here for the same reason) — and every node's
+own `ClientCtx::segment_store` wraps `SegmentStoreHandle::S3` around a
+clone of it, replacing the inert `SegmentStoreHandle::Fs` placeholder every
+`sim_cluster_*` module used to carry. `SimCluster::restart` leaves it
+untouched (never reassigned there), the identical `backup_store`
+precedent. `SimCluster::segment_store()` hands a test a handle for direct
+assertions (`stored_ids()`/`get`), mirroring `SimCluster::backup_store()`.
+`SimCluster::grow` (D4 PR 4's growth-node constructor) still builds its own
+`Fs` placeholder for `segment_store` — out of this PR's own scope (nothing
+here needs a streamed table on a grown node), a documented gap for a
+future PR that does.
+
+**`SimCluster::drive_stream_seal(node)`** (new) — for every tablet `node`
+both hosts and currently leads whose table has a stream enabled
+(`meta.table_stream(table).is_some()`), calls the now-`SimEnv`-safe
+`index_drain::seal_now` directly and unconditionally, looped to exhaustion
+(`Ok(Some(_))` ⇒ more may remain, `Ok(None)` ⇒ done, a retryable
+`index_drain::is_retryable_elsewhere` error ⇒ retry up to a bounded
+budget, any other error ⇒ panic) — mirroring `index_drain::
+inplace_split_driver_tick`'s own streams final-seal loop exactly, and
+`SimCluster::drain_gsi`'s own on-demand-invocation shape for the identical
+reason: this fixture never spawns `index_drain::change_consumer_loop`
+(the real periodic seal arm, `seal_tick`) as a background loop at all.
+**Does NOT replicate `seal_tick`'s own size/age trigger check**
+(`ctx.data().stream_seal_knobs`) — `seal_now` itself is trigger-free (the
+caller decides *whether*, the function only knows *how*), so an
+unconditional call needs no knob. **Does NOT replicate the `is_quiesced()`/
+`Building`-child guards** `change_consumer_loop` carries — both are
+structurally unreachable under this fixture (`SimCluster` never calls
+`RaftKvNode::enable_quiescence`, and never splits a hand/wire-created
+table's own tablet through this driver's own path), the identical
+documented gap `drain_gsi`'s own doc states. A future rung giving
+`SimCluster` real quiescence or splitting would need to add both guards
+back to this method too. No new per-node loop or closure was added —
+`drive_stream_seal` is an on-demand call driven via `SimCluster::
+spawn_and_capture`, exactly like `drain_gsi`/`drive_inplace_split_cutover`
+— so issue #753's Drop-coverage requirement doesn't apply here; the
+existing `Drop for SimCluster`/`SimCluster::restart` teardown (`Simulator::
+shutdown`, `SimRelayClient::shutdown`) already covers everything this PR
+holds per node, and `dropping_the_cluster_frees_every_nodes_relay_and_
+edge_state` needed no `Weak`-handle extension (the new `segment_store`
+field is plain `Arc<Mutex<..>>`-backed data with no captured `Env`/task
+handle of its own, the identical reasoning `backup_store` — added by D4
+PR 5, also with no `Weak` extension — already established).
+
+**New module: `crates/animusd/src/sim_cluster_dynamo_streams.rs`**, one
+scenario (`create_enable_write_seal_disable`, `_over_seeds` at 5 seeds):
+create a table over the wire, `UpdateTable` to enable a stream through
+`SimClusterHandle::dynamo` (proving the new sub-arm), write three items
+from a non-leader node (`ConsistentRead: true` on the verifying read, ADR
+0055), call `SimCluster::drive_stream_seal` on the tablet's leader, assert
+exactly one `Metadata::stream_shards` row exists for the tablet with the
+expected record count and that `segment_store().stored_ids()` is
+non-empty, then disable the stream through the same sub-arm (from a
+*different* node than the one that enabled it) and assert every node's
+own catalog reflects it. **No product bug found beyond the `seal_now`
+clock conversion above.**
+
+**Gates**: `cargo fmt --all --check` (clean); `cargo clippy -p animusd
+--all-targets --all-features -- -D warnings` (clean); `cargo build -p
+animusd --all-targets` (clean); `cargo test -p animusd --lib -- --test-
+threads=2` (440 passed, 0 failed, 3 ignored, 831.76s — 438 baseline + this
+PR's 2 new tests, matching the established C-06-close baseline exactly;
+peak resident memory ~958 MB, sampled from the test binary's own
+`/proc/<pid>/status` `VmRSS` with the anchored `pgrep -f '^<abs-path>/
+target/debug/deps/animusd-'` pattern); `cargo test -p animusd --test
+dynamo_streams` (15 passed, 0 failed, 14.86s — the real-socket regression
+proving `update_table`/`disable_stream`'s concrete path stayed
+byte-identical; `--test dynamo_table_ops` no longer exists as a separate
+binary, folded into `sim_cluster_dynamo_table_ops.rs` by D3 PR 2a, so the
+fallback form ran). `Cargo.lock` unchanged.
