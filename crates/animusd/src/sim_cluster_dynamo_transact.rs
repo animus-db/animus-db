@@ -68,62 +68,56 @@
 //!     — exactly one proposal wins (first-committer-wins,
 //!     `Metadata`'s own schema-catalog exclusivity), and both transactions
 //!     commit regardless of which one won.
-//! (g) [`coordinator_never_finished_past_prepare_recovers_atomically`] — the
-//!     coordinator stages (prepares) both participants of a cross-table
+//! (g) [`coordinator_crash_after_prepare_recovers_atomically_to_commit`] —
+//!     the coordinator stages (prepares) both participants of a cross-table
 //!     transaction and never decides — the shape a coordinator process
 //!     crashing right after `cp_txn`'s prepare phase takes (ADR 0018 §2
 //!     recovery) — with virtual time advanced between the last prepare and
 //!     a real `SimCluster::crash` of the coordinator node, then a
-//!     `SimCluster::restart`. Intended to prove a strong read of the
-//!     **participant** key from a different, live node (a genuinely
-//!     foreign intent) triggers `confirm_or_push`/`txn_recover` on demand
-//!     once the record has sat `Pending` past `RECOVERY_GRACE` (5s), with
-//!     both keys converging together, never partially.
+//!     `SimCluster::restart`. Proves a strong read of the **participant**
+//!     key from a different, live node (a genuinely foreign intent)
+//!     triggers `confirm_or_push`/`txn_recover` on demand once the record
+//!     has sat `Pending` past `RECOVERY_GRACE` (5s), with both keys
+//!     converging together, never partially, and the restarted
+//!     coordinator's own view converging too.
 //!
-//!     **`#[ignore]`d — a SECOND, deeper finding, issue #731's own fix
-//!     applied and confirmed but not sufficient.** `animus_node::sim_relay::
-//!     SimRelayClient::serve_loop`'s single-task inline dispatch (issue
-//!     #731) is fixed — see `crates/animus-node/src/sim_relay.rs`'s own
-//!     "One task per inbound request" doc section and ADR 0061's "#731
-//!     closed" addendum — and the fix is directly confirmed here: every
-//!     poll no longer returns `SimRelayClient::relay`'s timeout text at
-//!     all; it returns `Err("transaction covering this key is still
-//!     pending; retry")` instead, unchanging across the full 40s budget at
-//!     every seed tried. That text is `cp_get_local_resolving_inner`'s own
-//!     `TxnDecisionStatus::Pending` arm — `confirm_or_push`/`txn_recover`
-//!     run to completion every time (no more deadlock), but `txn_recover`
-//!     itself never gets past its own grace check. Root cause, traced in
-//!     `txn_coordinator.rs::txn_recover`: whenever `self.cp_route(record_table,
-//!     record_key)` resolves to anything **other than** `CpRoute::Local` —
-//!     the ordinary case for this scenario's own on-demand push, since it
-//!     runs on the *reading* node's own leader (the participant's tablet),
-//!     not necessarily the *anchor*'s tablet leader — `now_ms` is computed
-//!     as `self.env.now().duration_since(self.env.now())`, the elapsed gap
-//!     between two back-to-back clock reads (near-zero), not an absolute
-//!     timestamp. Checked against `now_ms < view.created_ts.wall_ms +
-//!     RECOVERY_GRACE`, a near-zero `now_ms` makes this comparison true
-//!     forever, so the grace check never passes and `txn_recover` declines
-//!     (`Pending`) on every single call, permanently. This is a genuine,
-//!     pre-existing bug — unrelated to and unmodified by the relay-dispatch
-//!     fix — introduced (and knowingly, deliberately left unfixed as
-//!     out-of-scope) by ADR 0061 rung C5 step 3b's `tokio::time::Instant::
-//!     now().elapsed()` → `Env` conversion; see that rung's own `CLAUDE.md`
-//!     entry ("Two `tokio::time::Instant::now().elapsed()` reads... had no
-//!     literal translation... reproducing the identical near-zero result
-//!     rather than 'fixing' what reads like a pre-existing latent bug — an
-//!     incidental bug gets its own PR"). It was unreachable before this PR
-//!     because the relay deadlock (issue #731) intercepted every recovery
-//!     attempt before `txn_recover` was ever called at all. **Issue to be
-//!     filed** against `ClientCtx::txn_recover`'s non-local grace-check
-//!     branch (`crates/animusd/src/txn_coordinator.rs`).
+//!     **Two findings surfaced getting this scenario to converge, both now
+//!     fixed.** First, issue #731: `animus_node::sim_relay::
+//!     SimRelayClient::serve_loop`'s single-task inline dispatch deadlocked
+//!     a forwarded read that itself needed a second, nested outbound relay
+//!     hop (this scenario's `FastRead::Foreign` push, which forwards once to
+//!     the participant's own leader and then, from there, forwards again to
+//!     query the anchor) — fixed by dispatching each inbound request onto
+//!     its own task (`crates/animus-node/src/sim_relay.rs`'s own "One task
+//!     per inbound request" doc section, ADR 0061's "#731 closed"
+//!     addendum) — always fixture-only, never reachable in a real cluster
+//!     (production's `AnimusdRelayClient` already spawns one task per
+//!     inbound TCP connection). Second, issue #737: with #731 fixed, every
+//!     recovery push reached `ClientCtx::txn_recover`'s own grace check for
+//!     the first time — and its **non-local** branch (`crates/animusd/src/
+//!     txn_coordinator.rs`, the branch this scenario's own on-demand push
+//!     always takes, since it runs on the participant's tablet leader, not
+//!     necessarily the anchor's) computed `now_ms` as the elapsed gap
+//!     between two back-to-back clock reads instead of an absolute
+//!     timestamp — near-zero forever, so the grace check never passed and
+//!     recovery declined permanently. Fixed by sharing one clock-read
+//!     helper (`recovery_grace_now_ms`) between both `txn_recover` call
+//!     sites, off the identical `env.now()`-derived clock
+//!     `animus_cp_data::hlc::Hlc::mint` uses to produce `wall_ms` in the
+//!     first place — see `txn_coordinator.rs`'s own doc on that helper and
+//!     `docs/engineering-lessons.md`'s matching entry for the general
+//!     lesson (a mechanical `Instant::now().elapsed()` → `Env` conversion
+//!     must preserve WHAT is measured, not just the API).
 //!
 //! Replays (a) with `ANIMUS_SEED` per the repo convention:
 //! `ANIMUS_SEED=<seed> cargo test -p animusd --lib
 //! commit_across_two_tables_with_condition_check`. Scenario (g) replays the
-//! same way but needs `-- --ignored` appended (see its own doc). Handle
-//! recorded from this rung's own gate run: seed `0xC06F_0001` (scenario a,
-//! green) and `0xC06F_0007` (scenario g, the second finding above —
-//! reproduces identically at every `_over_seeds` seed tried too).
+//! same way (no longer `#[ignore]`d): `ANIMUS_SEED=<seed> cargo test -p
+//! animusd --lib coordinator_crash_after_prepare_recovers_atomically_to_commit`.
+//! Handle recorded from this rung's own gate run: seed `0xC06F_0001`
+//! (scenario a, green) and `0xC06F_0007` = `3228499975` (scenario g, both
+//! findings above now fixed and confirmed green — reproduces identically at
+//! every `_over_seeds` seed tried too).
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -707,7 +701,7 @@ fn idempotency_table_bootstrap_race_between_two_first_callers_over_seeds() {
 }
 
 // ---------------------------------------------------------------------------
-// (g) The coordinator never finished past the prepare phase — ADR 0018 §2
+// (g) The coordinator crashed after the prepare phase — ADR 0018 §2
 // recovery, atomic commit on every replica.
 // ---------------------------------------------------------------------------
 
@@ -737,7 +731,17 @@ fn idempotency_table_bootstrap_race_between_two_first_callers_over_seeds() {
 /// **Atomicity**: once the participant key is observed committed, the
 /// anchor's own key must ALSO already be committed — never a partial
 /// outcome. The restarted coordinator's own view is polled to agree too.
-fn run_coordinator_never_finished_past_prepare_recovers_atomically(seed: u64) {
+///
+/// **Closes two findings this scenario itself surfaced (issues #731 and
+/// #737 — see the module's own doc for the full two-stage account)**:
+/// `SimRelayClient::serve_loop`'s inline single-task dispatch used to
+/// deadlock the nested forwarded hop `confirm_or_push` needs here, and,
+/// once that was fixed, `ClientCtx::txn_recover`'s non-local grace-check
+/// branch used to compute an elapsed near-zero duration instead of an
+/// absolute timestamp and so never let recovery proceed. Both are fixed;
+/// this scenario is the regression for the second (the first has its own
+/// dedicated coverage in `animus-node`).
+fn run_coordinator_crash_after_prepare_recovers_atomically_to_commit(seed: u64) {
     let mut cluster = SimCluster::new(seed, 3, 3);
     let (status, body) = create_table(&mut cluster, 0, "rcg_a");
     assert_eq!(
@@ -837,11 +841,8 @@ fn run_coordinator_never_finished_past_prepare_recovers_atomically(seed: u64) {
     );
 }
 
-/// **Issue #731 (`SimRelayClient`'s deadlock) is fixed and directly
-/// confirmed here — but a SECOND, distinct bug in `txn_recover` itself now
-/// blocks this scenario, and that one is out of scope for this PR.**
-///
-/// Diagnosed, not merely observed, at both stages:
+/// **Both findings this scenario surfaced are now fixed — diagnosed, and
+/// confirmed fixed, at both stages.**
 ///
 /// **Stage 1 (issue #731, fixed)**: at the pinned seed, every attempt to
 /// read the participant key after the crash used to return the identical
@@ -874,73 +875,57 @@ fn run_coordinator_never_finished_past_prepare_recovers_atomically(seed: u64) {
 /// per inbound TCP connection) — the bug was always `SimRelayClient`-only,
 /// fixture-only, never reachable in a real cluster.
 ///
-/// **Confirmed directly, not assumed**: with the fix applied, this
-/// scenario's own poll loop no longer returns the relay timeout text at
-/// all, at either seed tried — it returns `Err("transaction covering this
-/// key is still pending; retry")` instead, unchanging across the full 40s
-/// budget. That text is `cp_get_local_resolving_inner`'s own
-/// `TxnDecisionStatus::Pending` arm, reached only *after*
-/// `confirm_or_push`/`txn_recover` have both run to completion — proof the
-/// nested relay hop(s) now succeed.
+/// **Confirmed directly, not assumed**: with the #731 fix applied alone,
+/// this scenario's own poll loop no longer returned the relay timeout text
+/// at all — it returned `Err("transaction covering this key is still
+/// pending; retry")` instead, unchanging across the full 40s budget. That
+/// text is `cp_get_local_resolving_inner`'s own `TxnDecisionStatus::Pending`
+/// arm, reached only *after* `confirm_or_push`/`txn_recover` have both run
+/// to completion — proof the nested relay hop(s) succeed, but also proof of
+/// a SECOND, distinct, pre-existing bug the fixed deadlock had been masking.
 ///
-/// **Stage 2 (a second, distinct, pre-existing bug — NOT fixed by this
-/// PR, and NOT caused by the relay change)**: `txn_recover`
-/// (`crates/animusd/src/txn_coordinator.rs`) never gets past its own grace
+/// **Stage 2 (issue #737, fixed)**: `txn_recover`
+/// (`crates/animusd/src/txn_coordinator.rs`) never got past its own grace
 /// check. Traced directly: whenever `self.cp_route(record_table,
 /// record_key)` resolves to anything other than `CpRoute::Local` — the
 /// ordinary case here, since this on-demand push runs on the *reading*
 /// node's own leader (the participant's tablet, `rcg_b`), not necessarily
-/// the *anchor*'s tablet leader (`rcg_a`) — `now_ms` is computed as
+/// the *anchor*'s tablet leader (`rcg_a`) — `now_ms` used to be computed as
 /// `self.env.now().duration_since(self.env.now())`: the elapsed gap
 /// between two back-to-back clock reads, near-zero, not an absolute
 /// timestamp. Checked against `now_ms < view.created_ts.wall_ms +
-/// RECOVERY_GRACE`, a near-zero `now_ms` makes that comparison true
-/// forever, so the grace check never passes and `txn_recover` declines
+/// RECOVERY_GRACE`, a near-zero `now_ms` made that comparison true
+/// forever, so the grace check never passed and `txn_recover` declined
 /// (`Pending`) on every call, permanently — regardless of how much virtual
-/// time has actually elapsed. This is pre-existing, unrelated to and
-/// unmodified by the relay-dispatch fix: it was introduced (knowingly, and
-/// deliberately left unfixed as out of scope) by ADR 0061 rung C5 step
-/// 3b's `tokio::time::Instant::now().elapsed()` → `Env` conversion — see
-/// that rung's own `crates/animusd/CLAUDE.md` entry ("Two
-/// `tokio::time::Instant::now().elapsed()` reads... had no literal
-/// translation... reproducing the identical near-zero result rather than
-/// 'fixing' what reads like a pre-existing latent bug — an incidental bug
-/// gets its own PR"). It was unreachable before this PR only because issue
-/// #731's deadlock intercepted every recovery attempt before
-/// `txn_recover` was ever actually called.
+/// time had actually elapsed. This was pre-existing, unrelated to and
+/// unmodified by the relay-dispatch fix: introduced (knowingly, and
+/// deliberately left unfixed at the time) by ADR 0061 rung C5 step 3b's
+/// `tokio::time::Instant::now().elapsed()` → `Env` conversion, and
+/// unreachable before the #731 fix landed, since that deadlock intercepted
+/// every recovery attempt before `txn_recover` was ever actually called.
 ///
-/// **Scope**: fixing `txn_recover`'s grace-check (an absolute
-/// virtual-time read is needed on the non-local branch too, not an
-/// elapsed-duration one) is a change to a different subsystem (2PC
-/// recovery, `txn_coordinator.rs`) than this PR's own scope (the
-/// `SimRelayClient` dispatch fix). Kept `#[ignore]`d as a characterization
-/// test with the full diagnosis in this doc comment, per the maintainer
-/// standing instruction on a real finding — not silently dropped, not
-/// worked around. **Issue to be filed** against `ClientCtx::txn_recover`'s
-/// non-local grace-check branch.
+/// **Fixed** by sharing one clock-read helper
+/// (`txn_coordinator::recovery_grace_now_ms`) between both `txn_recover`
+/// call sites, reading the pusher's own `env.now()` on every non-local
+/// route — the same clock, and the same units, `animus_cp_data::hlc::
+/// Hlc::mint` uses to produce `created_ts`/`hint_ts.wall_ms` in the first
+/// place — instead of the elapsed-duration computation above. See
+/// `txn_coordinator.rs`'s own doc on that helper (including its dedicated
+/// `recovery_grace_tests` unit coverage) and `docs/engineering-lessons.md`'s
+/// matching entry for the general lesson.
 ///
 /// `ANIMUS_SEED=<seed> cargo test -p animusd --lib
-/// coordinator_never_finished_past_prepare_recovers_atomically -- --ignored`
-/// replays this scenario at a specific seed (repo convention; note the
-/// trailing `--ignored`, needed since both tests below are `#[ignore]`d).
+/// coordinator_crash_after_prepare_recovers_atomically_to_commit`
+/// replays this scenario at a specific seed (repo convention). Pinned seed
+/// `0xC06F_0007` = `3228499975`.
 #[test]
-#[ignore = "FINDING, issue #737: ClientCtx::txn_recover's non-local grace-check \
-            computes an elapsed near-zero duration instead of an absolute timestamp, so it \
-            never passes and recovery declines forever when pushed from a node that is not \
-            the anchor's own tablet leader — see this function's own doc for the full \
-            diagnosis. Issue #731 (SimRelayClient's deadlock) IS fixed and confirmed here; \
-            this is a second, distinct, pre-existing bug it uncovered, out of scope for the \
-            #731 fix."]
-fn coordinator_never_finished_past_prepare_recovers_atomically() {
-    run_coordinator_never_finished_past_prepare_recovers_atomically(env_seed(0xC06F_0007));
+fn coordinator_crash_after_prepare_recovers_atomically_to_commit() {
+    run_coordinator_crash_after_prepare_recovers_atomically_to_commit(env_seed(0xC06F_0007));
 }
 
 #[test]
-#[ignore = "FINDING (issue to be filed): see coordinator_never_finished_past_prepare_\
-            recovers_atomically's own doc — ClientCtx::txn_recover's non-local grace-check \
-            never passes, a second bug issue #731's own fix uncovered but does not cause"]
-fn coordinator_never_finished_past_prepare_recovers_atomically_over_seeds() {
+fn coordinator_crash_after_prepare_recovers_atomically_to_commit_over_seeds() {
     for i in 0..5 {
-        run_coordinator_never_finished_past_prepare_recovers_atomically(0xC06F_7000 + i);
+        run_coordinator_crash_after_prepare_recovers_atomically_to_commit(0xC06F_7000 + i);
     }
 }
