@@ -9781,25 +9781,44 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             // the gate above): the sole claim path (ADR 0040 Decision C).
             // A **minted** id re-mints and retries on collision
             // (astronomically unlikely, but structurally possible — nothing
-            // needs rebinding, since ports are never derived from ids); a
-            // **proposed** id fails loudly on the first collision instead —
-            // an operator/config conflict is a real problem to report, not
-            // to paper over by silently trying something else. **Residual
-            // #406/#450 window, now much narrower**: the read-your-writes
-            // barrier above closes the race for anything already committed
-            // to *this leader's own* Raft log at call time — which is the
-            // dominant #406/#450 shape (a target's self-registration
-            // relayed to, or proposed on, this exact leader moments
-            // earlier). What remains is genuinely irreducible without
-            // waiting on information this leader hasn't received at all
-            // yet: a self-registration proposed on/relayed to a *different*
-            // node (e.g. mid-leadership-change) that has not yet reached
-            // this leader's log by the time this call's own barrier above
-            // finished waiting. A caller that first confirms the target's
-            // own self-registration is visible on *this exact* leader
-            // before calling (the documented ADR 0037 §7 runbook) does not
-            // hit this window in practice.
-            let mut attempts_left = if minted { MAX_MINT_ATTEMPTS } else { 1 };
+            // needs rebinding, since ports are never derived from ids); an
+            // **operator-supplied** id retries the *same* id with a freshly
+            // re-derived `addrs` instead (bounded by
+            // [`MAX_CLAIM_REFRESH_ATTEMPTS`]) before ever failing loudly.
+            // **Residual #406/#450 window, now structurally closed, not just
+            // narrowed**: the read-your-writes barrier above closes the race
+            // for anything already committed to *this leader's own* Raft log
+            // by the time this call started waiting — the dominant #406/#450
+            // shape. What used to remain — the barrier itself timing out
+            // under real host contention, or a self-registration proposed
+            // on/relayed to a *different* node that reached this leader's
+            // log only *after* the barrier finished waiting — no longer
+            // needs the barrier to have won that race at all: a `Collision`
+            // verdict here is [`ClientCtx::register_node`]'s own
+            // `metadata_fresh()`-backed observation, so the instant it's
+            // seen, this leader's cache is *guaranteed* to already hold
+            // whatever entry caused it (`Local`'s `metadata_fresh()` and
+            // `metadata_cached()` are the same read — see `ControlHandle`'s
+            // own doc). The next loop iteration's re-derive is therefore
+            // never a stale guess: a collision against the target's own
+            // just-applied self-registration re-merges to the identical
+            // `addrs` that registration already claimed, so the retry's own
+            // `register_node` call resolves as an idempotent no-op
+            // (`RegisterOutcome::Registered`) rather than colliding again. A
+            // genuinely different, permanent registration re-derives the
+            // same conflicting `addrs` every time and still fails loudly —
+            // just after up to [`MAX_CLAIM_REFRESH_ATTEMPTS`] bounded
+            // retries instead of the very first one, a deliberate small
+            // latency cost on this rare admin path, never a correctness
+            // compromise. See `docs/engineering-lessons.md`'s matching entry
+            // for the full account, including why the barrier alone (a
+            // single bound-wait, no retry) could still measurably collide
+            // under real CI contention.
+            let mut attempts_left = if minted {
+                MAX_MINT_ATTEMPTS
+            } else {
+                MAX_CLAIM_REFRESH_ATTEMPTS
+            };
             loop {
                 // Merge into whatever address-book entry this id's own
                 // self-registration may already have made (e.g. a
@@ -9809,7 +9828,10 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 // empty one — `RegisterNode`'s CAS would otherwise see this
                 // call's empty `client`/`admin` as a *different* entry and
                 // reject it as a collision against its own node's earlier
-                // self-registration.
+                // self-registration. Read fresh on **every** iteration
+                // (never hoisted above the loop): a retry's whole point is
+                // to observe whatever this leader's cache has caught up to
+                // since the previous attempt's own `Collision`.
                 let mut addrs = self
                     .control
                     .metadata_cached()
@@ -9829,9 +9851,12 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     .await
                 {
                     Ok(RegisterOutcome::Registered) => break,
-                    Ok(RegisterOutcome::Collision) if minted && attempts_left > 1 => {
+                    Ok(RegisterOutcome::Collision) if attempts_left > 1 => {
                         attempts_left -= 1;
-                        node = NodeId::mint(leader.env());
+                        if minted {
+                            node = NodeId::mint(leader.env());
+                        }
+                        // else: retry this *same* id — see the doc above.
                     }
                     Ok(RegisterOutcome::Collision) => {
                         return Err(format!(
@@ -10172,6 +10197,27 @@ pub(crate) struct ControlRemoveOutcome {
 /// against a genuine bug (e.g. a broken `Rng`) looping forever rather than
 /// ever expecting to be exhausted in practice.
 const MAX_MINT_ATTEMPTS: u32 = 8;
+
+/// How many times an **operator-supplied** (non-minted) [`NodeId`] is
+/// allowed to retry a fresh `node_addrs` re-derive-and-reclaim after a
+/// [`RegisterOutcome::Collision`] in [`ClientCtx::admin_add_control_
+/// member`]'s "genuinely unclaimed" branch, before treating the collision
+/// as a real, permanent conflict — issues #406/#450's own documented
+/// residual (see `docs/engineering-lessons.md`): a `Collision` verdict
+/// comes from [`ClientCtx::register_node`]'s own `metadata_fresh()`-backed
+/// read, so by the time it's observed, this leader's cache is *guaranteed*
+/// to hold whatever entry caused it — the next loop iteration's own
+/// `metadata_cached()` re-read (identical to `metadata_fresh()` on a
+/// `Local` handle) is therefore no longer a stale guess, and a collision
+/// against the target's own just-applied self-registration resolves
+/// (the re-merged `addrs` now matches exactly, turning the retry's own
+/// `register_node` call into an idempotent no-op) typically within one
+/// extra attempt. A genuine, stable conflict (a different registration
+/// permanently holding this id) re-derives the identical `addrs` every
+/// time and so still fails loudly, just after this many bounded retries
+/// rather than the first one — a small, deliberate latency cost on a rare
+/// admin path, not a correctness compromise.
+const MAX_CLAIM_REFRESH_ATTEMPTS: u32 = 3;
 
 /// The observable outcome of [`ClientCtx::register_node`]'s propose-then-poll
 /// registration CAS (ADR 0040 Decision C) — see that method's own doc for
