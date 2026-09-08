@@ -4186,3 +4186,137 @@ unchanged and still correct, it just wasn't the whole story); and
 `crates/animus-node/CLAUDE.md`'s new `SimRelayClient::shutdown`/
 `downgrade_handler` section for the mechanism itself. `git diff
 --name-only` against the branch point excludes `Cargo.lock`.
+
+## 2026-09-08 amendment — Rung F, PR 6 landed: deeper deterministic PartiQL coverage, one `SimCluster` sibling per named real-socket LOGIC test
+
+PR 5 (above) proved the generic PartiQL dispatch path — `execute_statement_
+as`/`execute_transaction_as`/`run_batch_execute_statement_as`/
+`execute_one_batch_statement_as` — exists and is reachable at all, with
+five reachability-smoke scenarios. This PR is pure test authorship on top
+of that dispatch, unchanged: **27 more `SimCluster` scenarios**, each named
+identically to, and mirroring the exact wire request/assertion shape of,
+one specific real-socket LOGIC test in `crates/animusd/tests/dynamo_
+partiql.rs`/`dynamo_execute_transaction.rs` — statement semantics, error
+mapping, pagination shape, index routing, and transaction cancellation
+reasons. Every scenario carries a `_over_seeds` sibling at 5 seeds (27 × 2
+= 54 tests), added to PR 5's own 10, for **64 tests total** in
+`crates/animusd/src/sim_cluster_dynamo_partiql.rs`. No `dynamo.rs` change
+of any kind — this PR touches no production dispatch code, only the new
+test module and these docs.
+
+**Scenario-by-scenario account** (grouped by the real-socket source file
+each mirrors; the module's own top-of-file `//!` doc carries the identical
+listing, kept in sync with this one by construction since both were
+authored from the same coordinator-provided candidate list):
+
+*From `tests/dynamo_partiql.rs` (20 scenarios)* — `SELECT` semantics:
+`select_partition_equality_matches_query`, `select_begins_with_sort_key_
+matches_query`, `select_sort_comparator_and_between_match_query_numeric_
+ordering` (numeric `BETWEEN`/comparator ordering, not lexicographic),
+`select_non_key_where_matches_scan_with_filter` (falls back to a filtered
+`Scan` when the `WHERE` isn't a key condition), `select_projection_
+narrows_returned_attributes`, `select_from_table_dot_index_queries_the_gsi`
+(the `"table"."index"` PartiQL syntax routes to the GSI, exercising
+`SimCluster::drain_gsi` since this fixture has no background drain loop),
+`gsi_projected_attribute_updated_via_partiql_is_visible_through_index_
+query` (an `UPDATE` through PartiQL keeps a GSI's projected attribute
+current), `order_by_desc_matches_scan_index_forward_false` (`ORDER BY ...
+DESC` lowers to `ScanIndexForward: false`), `pagination_next_token_
+matches_query_last_evaluated_key_walk` (a PartiQL page token round-trips
+through the same `LastEvaluatedKey` walk `Query` itself uses), `next_
+token_rejected_when_replayed_against_a_different_statement` (a token
+minted for one statement is rejected against another); `INSERT`/`UPDATE`/
+`DELETE` semantics and error mapping: `insert_on_conflict_do_nothing_
+swallows_duplicate`, `duplicate_insert_gives_duplicate_item_exception_and_
+leaves_item_unchanged` (the two `ON CONFLICT` outcomes for the identical
+duplicate-key case), `update_set_on_existing_item_with_returning_all_new`,
+`update_of_missing_item_fails`, `update_with_non_key_where_term_as_
+condition_met_and_unmet` (a non-key `WHERE` term lowers to a conditional
+update, both the pass and fail side), `update_where_missing_partition_
+key_is_a_validation_exception`, `delete_where_missing_sort_key_is_a_
+validation_exception`, `unknown_table_is_resource_not_found`, `malformed_
+statement_is_a_validation_exception` (a parse failure, not a semantic
+one), `literal_value_in_where_is_rejected` (PartiQL literal comparisons
+outside a key condition are out of scope and rejected, not silently
+ignored).
+
+*From `tests/dynamo_execute_transaction.rs` (7 scenarios)* —
+`execute_transaction_write_commits_atomically_across_two_tables` (a fresh
+sibling matching the real test's own name/shape; kept alongside PR 5's
+similarly-shaped but differently-named `execute_transaction_commits_
+across_two_tables` per this PR's instruction not to delete or rename PR
+5's own scenarios), `execute_transaction_write_cancels_whole_on_duplicate_
+insert`, `execute_transaction_rejects_zero_and_too_many_statements`,
+`execute_transaction_mixed_select_and_insert_is_validation_exception`
+(mixing a `SELECT` with a write statement in the same transaction's
+statement list is rejected up front), `execute_transaction_client_request_
+token_replay_is_cached` (idempotent replay under the identical
+`ClientRequestToken` returns the cached result rather than re-executing),
+`execute_transaction_all_select_returns_items_and_misses_in_order` (the
+other legal shape — every statement a `SELECT` — is a genuine read
+transaction, returning both hits and misses in list order rather than
+rejecting the request), `execute_transaction_over_a_follower_connected_
+node` (issued from a non-leader node by this module's own standing
+construction already, so no special-cased fixture was needed beyond what
+every other scenario here already does).
+
+**Deliberately not converted, real-socket-only, and why**: `throttled_
+table_throttles_a_partiql_insert` — throttle-window timing, named
+out-of-scope in this rung's own PR-series amendment above; `SimCluster`'s
+own `ThrottleBucket` corpus already lives in `sim_cluster_throttle.rs` with
+no PartiQL-specific angle worth duplicating. `insert_then_select_sees_it`
+and `delete_with_returning_all_old` (`dynamo_partiql.rs`) — already
+subsumed by PR 5's own scenarios (a) and (b) respectively (the latter's
+`DELETE ... RETURNING ALL OLD *` half is the identical assertion shape).
+`delete_of_missing_key_is_a_silent_success`, `delete_returning_all_new_is_
+rejected`, and every `batch_execute_statement_*` test beyond PR 5's own
+scenario (c) (`one_failure_does_not_block_the_others`, `select_rejects_a_
+sort_key_range`, `zero_and_over_cap_are_top_level_validation_exceptions`,
+`through_a_follower_connected_node`) — genuine, distinct LOGIC tests with
+no `SimCluster` blocker, simply not named in this PR's own coordinator-
+provided candidate list; left for a future pass rather than converted
+here. All of the above stay `ProdEnv`-only in `crates/animusd/tests/
+dynamo_partiql.rs`/`dynamo_execute_transaction.rs`, both of which this PR
+leaves byte-identical to `main` (confirmed by `git diff` against the
+branch point printing nothing for either file).
+
+**No product bug found.** Every converted scenario passed at its pinned
+seed and every `_over_seeds` seed on first clean run — the generic
+dispatch path PR 5 wired behaves identically to the concrete, real-socket-
+only path for all 27 scenarios this PR adds, exactly as PR 5's own 5
+scenarios already established for the smaller reachability slice.
+
+**This PR's own gate was blocked on, and only became runnable once, the
+two-cycle `sim_cluster_*` leak fix (the two amendments immediately above:
+`Simulator`/`SimEnv`'s task-queue cycle, then the independent
+`SimRelayClient` handler-slot cycle) landed.** A first checkpoint pass
+(`cargo test -p animusd --lib sim_cluster_dynamo_partiql -- --test-
+threads=1`: 64 passed, 423s) proved the module correct in isolation, but
+the full `cargo test -p animusd --lib` run — needed to confirm this PR's
+54 new tests don't regress anything else and to get a real peak-RSS number
+across the whole suite — was not runnable at all before both leak fixes:
+this module's own 54 extra `sim_cluster_*` tests were enough additional
+per-test leakage to push the full-suite run's RSS past the sandbox's
+ceiling before completion, the identical failure shape the leak-fix
+amendments above document independently. With both fixes in place:
+
+**Gates** (`ANIMUS_SEED=3228520449` on `insert_then_select_sees_it`, run
+twice, gave identical output beforehand, confirming this module's own
+determinism holds under replay): `cargo fmt --all --check` (clean); `cargo
+clippy -p animusd --all-targets --all-features -- -D warnings` (clean);
+`cargo build -p animusd --all-targets` (clean); `cargo test -p animusd
+--lib -- --test-threads=2` (438 passed, 0 failed, 3 ignored, 811.16s; peak
+resident memory ~968 MB across the run, sampled from the test binary's own
+`/proc/<pid>/status` `VmRSS` — anchored `pgrep -f '^<abs-path>/target/
+debug/deps/animusd-'`, per the sampler-bug lesson the leak-fix amendments
+above record); `cargo test -p animusd --test dynamo_partiql --test dynamo_
+execute_transaction` (37 passed, 0 failed — 30 + 7, 11.38s + 2.36s — the
+real-socket regression proving `execute_statement`/`execute_transaction`/
+`run_batch_execute_statement`/`execute_one_batch_statement` stayed
+byte-identical throughout this PR, as they did through PR 5). `Cargo.lock`
+unchanged.
+
+**Docs**: this amendment; `docs/roadmap.md`'s C-06 entry (PR 6 landed, PR
+7 — docs close-out — the sole remaining item); `crates/animusd/CLAUDE.md`'s
+new matching appendix (the full scenario account, mirroring PR 5's own
+appendix shape).
