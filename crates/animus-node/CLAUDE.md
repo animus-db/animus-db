@@ -479,9 +479,10 @@ sub-rungs below shipped.
   `ProdEnv` in `animusd` **at this rung (C4d)** — corrected by rung C5,
   which made all three generic over `E: Env` (`ClusterEdgeState<E>`,
   `ControlHandle<E, R>`, `SharedEngine<E>`, the last two defaulting to
-  `ProdEnv`/`AnimusdRelayClient` rather than naming them outright; see the
-  C-08 opener, ADR 0061's 2026-09-08 "Rung H" amendment, which found this
-  paragraph stale while scoping that rung) — whose *own* further methods
+  `ProdEnv`/`AnimusdRelayClient` rather than naming them outright; see ADR
+  0061's 2026-09-08 "Rung H" amendment, which found this paragraph stale
+  while scoping that rung, now closed (C-08 complete, ADR 0061's "Rung H
+  closed" amendment) — whose *own* further methods
   (`hosted_groups`, `local_cp`, `lsm_sstables`, `wal_stats`, raw
   engine/WAL scans, …) are what most handler bodies actually call. Naming
   each of those as a narrower capability would mean rebuilding `ClientCtx`
@@ -503,9 +504,13 @@ sub-rungs below shipped.
   functions (`config_view`, `raft_view`, `storage_lsm`, `action_split`,
   …) — every one of those, and the full `ClientCtx` surface + the deeper
   handle types they reach (generic since rung C5, per the correction
-  above — only `impl AdminHost for ClientCtx`/`impl ConsoleBackend for
-  ClientCtx` themselves stay bound to the concrete default as of this
-  writing), stays exactly where it is.
+  above — `impl AdminHost for ClientCtx`/`impl ConsoleBackend for
+  ClientCtx` themselves stay bound to the concrete default **by design,
+  not by gap**, since C-08 PR 2's own `GenericAdminHost<E, R>`/
+  `GenericConsoleBackend<E, R>` newtype pair (`crates/animusd/src/
+  admin.rs`/`lib.rs`) carries a separate generic path alongside them —
+  see `crates/animusd/CLAUDE.md`'s "C-08 closed" appendix and ADR 0061's
+  "Rung H closed" amendment), stays exactly where it is.
   `action_data_dynamo` still reaches `dynamo::execute_routed` and
   `action_data_seed` still reaches the kind-write path, both unmoved and
   unmodified — matching this rung's exclusion of `dynamo.rs`'s own

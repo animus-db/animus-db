@@ -6641,25 +6641,43 @@ scenario-locally). `cargo test -p animusd --lib` reached 315 passed / 2
 ignored at the sim tier after PR 5, no leak trajectory — see ADR 0061's
 "Rung G closed" amendment for the full per-PR accounting.
 
-**C-08 (open)** — admin/console/dashboard HTTP, the group C-07's own
-close-out named next in line, is opened 2026-09-08 (ADR 0061's "Rung H"
-amendment, `docs/roadmap.md`'s C-08 entry). PR 1 (this docs opener), PR 2
-(groundwork, corrected the same day in review — see this file's own
-appendix, below, for the full account, including the `GenericAdminHost`/
-`GenericConsoleBackend` newtype fix), PR 3 (console reachable + first
-siblings), PR 4 (`console_stream.rs`/`console_table_config.rs` siblings),
-PR 5 (admin dispatch pure observers), and PR 7 (`dashboard_endpoint.rs`
-siblings + `console_endpoint.rs` close-out — landed ahead of PR 6 in the
-series' own numeric order, since it depends only on PR 2's groundwork)
-have landed; PRs 6 and 8 are not yet done. The ten files now owned by this
-rung: `admin_endpoint.rs`, `dashboard_endpoint.rs`, `console_endpoint.rs`,
-`console_create_table.rs`, `console_items.rs`, `console_stream.rs`,
-`console_table_config.rs`, `console_tables.rs`, `metrics_endpoint.rs`,
-`system_table.rs` (67 tests total, per an exact recount — see that
-amendment's own Gap section for the per-file breakdown and why it differs
-by one from this section's older "(10/66)" figure above). See this file's
-own appendices, below, for each landed PR's full account (mapping table,
-kept reasons, gate numbers).
+**admin/console/dashboard HTTP — the group C-07's own close-out named next
+in line — is closed by C-08 (landed 2026-09-08, ADR 0061's "Rung H"/"Rung
+H closed" amendments, `docs/roadmap.md`).** All eight PRs landed (#764,
+#765, #766, #767, #773, #776, #777, PR 8). The admin dispatch table's pure
+observers and mutating actions, the console backend's table/item/stream/
+config surface, and the dashboard's card/panel/action surface are all
+`SimCluster`-reachable through six new sibling modules, each named here
+exactly once as this rung's own module map: `sim_cluster_console.rs`
+(table/item/create-table siblings, PR 3), `sim_cluster_console_stream.rs`
+(stream-tab siblings, PR 4), `sim_cluster_console_table_config.rs`
+(table-config-tab siblings, PR 4), `sim_cluster_admin.rs` (admin
+observer-route siblings, PR 5), `sim_cluster_admin_actions.rs` (admin
+mutating-action siblings, PR 6), `sim_cluster_dashboard.rs` (dashboard
+card/panel/action siblings, PR 7) — 42 of the ten files' 67 real-socket
+tests converted (89 new tests with `_over_seeds`); `console_tables.rs`,
+`console_create_table.rs`, and `console_items.rs` deleted whole (each
+left with zero tests once its sole/all tests converted). The remaining 25
+tests stay `ProdEnv` for documented reasons spread across seven files
+(`admin_endpoint.rs` 10, `dashboard_endpoint.rs` 4, `console_endpoint.rs`
+3, `console_stream.rs` 1, `console_table_config.rs` 4, `metrics_
+endpoint.rs` 1, `system_table.rs` 2), none silently dropped — see this
+file's own appendices, below, for each PR's mapping table and gate
+numbers, and ADR 0061's "Rung H closed" amendment for the complete final
+residue table with reasons, the in-scope findings (the shared `Metrics
+Handle::noop()` gauge-corruption bug, the `admin_transfer_control_
+leadership` seam bug, the PITR/`UpdateContinuousBackups` gap, blocker
+(d)'s GSI/LSI index-DDL gap), and the six residual groups that remain
+unowned after this close. **Two real, previously-latent seam bugs were
+found and fixed along the way** (PR 5's metrics sink, PR 6's clock body —
+see this file's own appendices) **and one same-day-corrected design
+mistake** (PR 2's blanket `impl Trait for ClientCtx` narrowing production,
+fixed with the `GenericAdminHost`/`GenericConsoleBackend` newtype pair).
+`cargo test -p animusd --lib sim_cluster` ran 317 → 337 → 353 → 367 → 383
+→ **406 passed, 0 failed, 2 ignored** (#777's own real gate run, 752.46s,
+anchored-sampler RSS first ~99 MB / peak ~816 MB / last ~133 MB — see the
+"C-08 closed" appendix below and ADR 0061's matching amendment). See
+`docs/roadmap.md`'s C-08 entry for the full record.
 
 **Standing rule for new `animusd` logic tests**: default to a
 `sim_cluster_*` sibling module (`SimCluster::dynamo`/`dynamo_concurrent`/
@@ -9093,3 +9111,40 @@ touched).
 
 See ADR 0061's "Rung H, PR 7 landed" amendment and `docs/roadmap.md`'s
 C-08 entry for the full record.
+
+## Appendix — C-08 closed, docs-only close-out (ADR 0061 rung H, C-08 PR 8, 2026-09-08)
+
+No source, test, or `Cargo` change — this appendix, this file's own
+"admin/console/dashboard HTTP — ... closed by C-08" residual-inventory
+paragraph above (Tests section), ADR 0061's "Rung H closed" amendment,
+and `docs/roadmap.md`'s C-08 entry are the entire PR. Admin/console/
+dashboard HTTP is no longer a D3-closing-inventory residual in progress:
+`admin_endpoint.rs` (23 tests: 13 converted across PRs 5/6, 10 kept
+`ProdEnv`), `dashboard_endpoint.rs` (16 tests: 12 converted, 4 kept),
+`console_tables.rs`/`console_create_table.rs`/`console_items.rs` (9
+tests, converted whole and deleted), `console_stream.rs` (4 tests: 3
+converted, 1 kept), and `console_table_config.rs` (9 tests: 5 converted,
+4 kept) are all closed — the admin dispatch table, the console backend,
+and the dashboard are all `SimCluster`-reachable through the six new
+sibling modules named in the residual-inventory paragraph above.
+`console_endpoint.rs` (3 tests), `metrics_endpoint.rs` (1 test), and
+`system_table.rs` (2 tests) stay `ProdEnv` whole, each with a documented
+reason, unaffected by this close. See ADR 0061's "Rung H closed"
+amendment for the full PR-by-PR account, the complete final `ProdEnv`
+residue table with reasons, the in-scope findings (the shared `Metrics
+Handle::noop()` gauge-corruption bug, the `admin_transfer_control_
+leadership` seam bug, the PITR/`UpdateContinuousBackups` gap, blocker
+(d)'s GSI/LSI index-DDL gap), the six residual groups that remain unowned
+after this close with exactly which of this rung's own kept tests each
+would unlock, and an advisory recommendation for the next rung ("C-09")
+weighing TTL against index DDL beyond plain `CreateTable`. **#777's own
+gate confirmation is real and green**: `cargo test -p animusd --lib
+sim_cluster` reached **406 passed, 0 failed, 2 ignored** (752.46s,
+anchored-sampler RSS first ~99 MB / peak ~816 MB / last ~133 MB) — its
+own Phase A (design/implementation, an earlier attempt having been lost
+to a container rebuild) was rebuilt source-only with no `cargo`
+invocation available in that phase, but Phase B then rebased it onto PR
+6's own landed commit and ran every gate for real, in the main tree, with
+no product or scenario-authoring bug found. See this file's own PR 7
+appendix, above, and ADR 0061's "Rung H, PR 7 landed" amendment for the
+full gate account.
