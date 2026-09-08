@@ -72,75 +72,11 @@ async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, animusd::Clust
     panic!("could not bring up cluster after retries (ports kept getting stolen)");
 }
 
-/// Like [`bring_up`], but goes through `run_node_with_streams_quiesce_and_
-/// backup_store` directly (production streams/segment-store/backup-store
-/// defaults, quiescence explicitly disabled) instead of [`bring_up`]'s
-/// plain [`animusd::run_node`] — used by
-/// `admin_split_in_place_children_inherit_the_parents_own_replicas` below.
-/// (Originally also pinned an explicit `SplitMode`, back when the crate had
-/// two split workflows to choose between; the copy-based one and the
-/// `SplitMode` selector were deleted in the copy-split-deletion endgame's
-/// Layer B1 — every split is in-place unconditionally now.)
-async fn bring_up_with_streams_quiesce(
-    n: usize,
-    dir: &std::path::Path,
-) -> (Vec<Node>, animusd::ClusterConfig) {
-    for attempt in 0..16 {
-        let addrs = support::free_addrs(n * 6);
-        let nodes_cfg: Vec<animusd::RoleAddrs> = (0..n)
-            .map(|i| animusd::RoleAddrs {
-                id: animusd::config::node_id(i),
-                role: animusd::config::NodeRole::Both,
-                internal: addrs[6 * i],
-                client: addrs[6 * i + 1],
-                dynamo: addrs[6 * i + 2],
-                admin: addrs[6 * i + 3],
-                intra: addrs[6 * i + 4],
-                console: addrs[6 * i + 5],
-                advertise_host: None,
-                tls: None,
-                encryption_key_path: None,
-            })
-            .collect();
-        let config = animusd::ClusterConfig {
-            nodes: nodes_cfg,
-            dynamo_auth: None,
-            cluster_settings: None,
-        };
-        let mut nodes = Vec::new();
-        let mut failed = false;
-        for i in 0..n {
-            match animusd::run_node_with_streams_quiesce_and_backup_store(
-                &config,
-                i,
-                dir.join(format!("node-{attempt}-{i}")),
-                animusd::StorageBackend::default(),
-                animus_control::node::DEFAULT_ORPHAN_SWEEP_AFTER,
-                animusd::StreamSealKnobs::default(),
-                animusd::SegmentStoreConfig::default(),
-                animusd::DEFAULT_STREAM_RETENTION,
-                Duration::ZERO,
-                animusd::BackupStoreConfig::default(),
-            )
-            .await
-            {
-                Ok(node) => nodes.push(node),
-                Err(_) => {
-                    failed = true;
-                    break;
-                }
-            }
-        }
-        if !failed {
-            return (nodes, config);
-        }
-        for node in &nodes {
-            node.shutdown_graceful().await;
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
-    panic!("could not bring up cluster after retries (ports kept getting stolen)");
-}
+// `bring_up_with_streams_quiesce` lost its last caller — ADR 0061 rung H,
+// C-08 PR 6 converted `admin_split_in_place_children_inherit_the_parents_
+// own_replicas` (its one caller) to
+// `sim_cluster_admin_actions.rs::split_in_place_children_inherit_the_
+// parents_own_replicas` — deleted from this file.
 
 /// Like [`bring_up`], but pins a fast TTL reaper sweep interval (roadmap
 /// U-07's `admin_ttl_reports_reaper_progress_and_ttl_tables` needs the
@@ -448,20 +384,19 @@ async fn put(stream: &mut TcpStream, table: &str, key: Vec<u8>, value: Vec<u8>) 
     }
 }
 
-/// Encode a query-param value the way the browser's `encodeURIComponent` does
-/// (everything but unreserved characters becomes `%NN`), so a test drives the
-/// same bytes the dashboard would.
-fn percent_encode(s: &str) -> String {
-    s.bytes()
-        .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                (b as char).to_string()
-            }
-            _ => format!("%{b:02X}"),
-        })
-        .collect()
-}
+// `percent_encode` lost its last caller — ADR 0061 rung H, C-08 PR 6
+// converted `admin_seed_writes_synthetic_keys` (its one caller) to
+// `sim_cluster_admin_actions.rs::seed_writes_synthetic_keys` (a local copy
+// lives there) — deleted from this file.
 
+/// **KEPT `ProdEnv` (ADR 0061 rung H, C-08 PR 6)**: the one action this
+/// sweep exercises beyond what's covered elsewhere, `POST
+/// /admin/storage/flush`, has the same `flush_now`/`compact_now` gap
+/// `admin_storage_compact_action`'s own KEPT reason names below —
+/// `MemoryEngine` (`SimCluster`'s only backend) has no LSM/SSTable concept
+/// for a forced flush to act on — so this stays whole as this crate's one
+/// remaining real-socket admin observer sweep, rather than trimmed to
+/// nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn admin_interface_surfaces_state_and_actions() {
     timeout(Duration::from_secs(60), async {
@@ -781,126 +716,15 @@ async fn admin_interface_surfaces_state_and_actions() {
     .expect("test timed out");
 }
 
-/// The dashboard's write proxy (ADR 0021): run a DynamoDB CRUD round-trip
-/// through the admin port, asserting data flows back.
-#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
-async fn admin_data_write_dynamo() {
-    timeout(Duration::from_secs(60), async {
-        let dir = support::panic_safe_tempdir();
-        let (nodes, _config) = bring_up(3, dir.path()).await;
-        await_bootstrap(&nodes).await;
-        let a = nodes[0].admin_addr();
+// `admin_data_write_dynamo` converted → ADR 0061 rung H, C-08 PR 6's
+// `sim_cluster_admin_actions.rs::data_write_dynamo` (PutItem/GetItem via
+// `/admin/data/dynamo`, issued from a node hosting no replica of the
+// table's own tablet) — deleted from this file.
 
-        // ---- DynamoDB: PutItem then GetItem via /admin/data/dynamo ----------
-        let (s, put) = admin(
-            a,
-            "POST",
-            "/admin/data/dynamo",
-            Some(r#"{"op":"PutItem","payload":{"TableName":"t","Item":{"pk":{"S":"alice"},"v":{"N":"7"}}}}"#),
-        )
-        .await;
-        assert_eq!(s, 200, "PutItem via admin proxy: {put}");
-
-        let (s, got) = admin(
-            a,
-            "POST",
-            "/admin/data/dynamo",
-            // `ConsistentRead: true` (ADR 0055): this reads back a write it
-            // just made, and the wire default is now a genuinely
-            // eventually-consistent read that may not reflect it yet.
-            Some(
-                r#"{"op":"GetItem","payload":{"TableName":"t",
-                    "Key":{"pk":{"S":"alice"}},"ConsistentRead":true}}"#,
-            ),
-        )
-        .await;
-        assert_eq!(s, 200, "GetItem via admin proxy: {got}");
-        assert_eq!(
-            got["Item"]["v"]["N"].as_str(),
-            Some("7"),
-            "GetItem reads back the written value: {got}"
-        );
-
-        for node in &nodes {
-            node.shutdown_graceful().await;
-        }
-    })
-    .await
-    .expect("test timed out");
-}
-
-/// Table management (ADR 0021): a DynamoDB `CreateTable` via the write proxy shows
-/// up in the replicated catalog (`/admin/status`), then `/admin/data/drop-table`
-/// removes it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
-async fn admin_table_management_create_and_drop() {
-    timeout(Duration::from_secs(60), async {
-        let dir = support::panic_safe_tempdir();
-        let (nodes, _config) = bring_up(3, dir.path()).await;
-        await_bootstrap(&nodes).await;
-        let a = nodes[0].admin_addr();
-
-        let has_widgets = || async {
-            let (_, status) = admin_get(a, "/admin/status").await;
-            status["schemas"]["tables"]
-                .get("widgets")
-                .is_some_and(|v| !v.is_null())
-        };
-
-        // Create a composite table (string partition key + **numeric** sort key).
-        let (s, body) = admin(
-            a,
-            "POST",
-            "/admin/data/dynamo",
-            Some(
-                r#"{"op":"CreateTable","payload":{"TableName":"widgets","KeySchema":[{"AttributeName":"id","KeyType":"HASH"},{"AttributeName":"seq","KeyType":"RANGE"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"},{"AttributeName":"seq","AttributeType":"N"}]}}"#,
-            ),
-        )
-        .await;
-        assert_eq!(s, 200, "CreateTable via admin proxy: {body}");
-        timeout(Duration::from_secs(10), async {
-            while !has_widgets().await {
-                sleep(Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .expect("created table did not appear in the catalog");
-
-        // The catalog records the key columns with their declared types — this is the
-        // contract the dashboard's key prefill reads (partition key + sort key, typed).
-        let (_, status) = admin_get(a, "/admin/status").await;
-        let schema = &status["schemas"]["tables"]["widgets"];
-        assert_eq!(schema["partition_key"], "id", "partition key recorded: {schema}");
-        assert_eq!(schema["clustering_keys"][0], "seq", "sort key recorded: {schema}");
-        let seq_ty = schema["columns"]
-            .as_array()
-            .and_then(|cols| cols.iter().find(|c| c["name"] == "seq"))
-            .map(|c| c["ty"].clone());
-        assert_eq!(
-            seq_ty,
-            Some(serde_json::json!("Number")),
-            "the numeric sort key's type reaches the catalog (not defaulted to String): {schema}"
-        );
-
-        // Drop.
-        let (s, body) =
-            admin(a, "POST", "/admin/data/drop-table", Some(r#"{"table":"widgets"}"#)).await;
-        assert_eq!(s, 200, "drop-table: {body}");
-        timeout(Duration::from_secs(10), async {
-            while has_widgets().await {
-                sleep(Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .expect("dropped table still in the catalog");
-
-        for node in &nodes {
-            node.shutdown_graceful().await;
-        }
-    })
-    .await
-    .expect("test timed out");
-}
+// `admin_table_management_create_and_drop` converted → ADR 0061 rung H,
+// C-08 PR 6's `sim_cluster_admin_actions.rs::table_management_create_and_
+// drop` (a composite `CreateTable`/`drop-table` via the same proxy, issued
+// from a control follower) — deleted from this file.
 
 // `admin_backups_view_reflects_the_catalog` converted → ADR 0061 rung H,
 // C-08 PR 5's `sim_cluster_admin.rs::backups_view_reflects_the_catalog`
@@ -920,6 +744,9 @@ async fn admin_table_management_create_and_drop() {
 /// This is a **real-time `ProdEnv` liveness assertion** — the class `SimEnv` cannot
 /// catch (virtual time never trips the wall-clock election timeout). We seed 2000
 /// keys through the CP leader and require the group's term to barely move.
+///
+/// **KEPT `ProdEnv` (ADR 0061 rung H, C-08 PR 6)**: real-thread
+/// election-timing liveness.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn seed_load_does_not_storm_cp_elections() {
     // The CP term may legitimately advance a little (an initial election retry, a
@@ -997,184 +824,12 @@ async fn seed_load_does_not_storm_cp_elections() {
     .expect("seed-load election-stability test timed out");
 }
 
-/// The bulk-seed endpoint (ADR 0021) writes the requested number of synthetic
-/// **DynamoDB items** to the CP plane: they land durably (visible in the CP
-/// leader's storage) and read back through the DynamoDB edge by their catalog
-/// key attributes (`GetItem`), for simple and composite tables alike.
-#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
-async fn admin_seed_writes_synthetic_keys() {
-    timeout(Duration::from_secs(60), async {
-        let dir = support::panic_safe_tempdir();
-        let (nodes, _config) = bring_up(3, dir.path()).await;
-        await_bootstrap(&nodes).await;
-        let a = nodes[0].admin_addr();
-
-        // Seeding writes into an **existing** table (ADR 0023) — create it first.
-        let (s, ct) = admin(
-            a,
-            "POST",
-            "/admin/data/dynamo",
-            Some(
-                r#"{"op":"CreateTable","payload":{"TableName":"seedt",
-                    "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
-                    "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}]}}"#,
-            ),
-        )
-        .await;
-        assert_eq!(s, 200, "CreateTable seedt: {ct}");
-
-        // Seeding a table that does not exist is a 404 (no implicit create).
-        let (s, missing) = admin(
-            a,
-            "POST",
-            "/admin/data/seed",
-            Some(r#"{"table":"nope","count":1}"#),
-        )
-        .await;
-        assert_eq!(
-            s, 404,
-            "seeding a non-existent table is rejected: {missing}"
-        );
-
-        let (s, body) = admin(
-            a,
-            "POST",
-            "/admin/data/seed",
-            Some(r#"{"table":"seedt","count":60,"key_prefix":"seed:","value_bytes":8}"#),
-        )
-        .await;
-        assert_eq!(s, 200, "seed returns 200: {body}");
-        assert_eq!(body["written"], 60, "seed wrote all requested keys: {body}");
-
-        // The seeded keys are durably in the CP leader's local storage.
-        let mut leader_admin = None;
-        for node in &nodes {
-            let (_, rk) = admin_get(node.admin_addr(), "/admin/raftkv").await;
-            if rk["groups"][0]["is_leader"].as_bool() == Some(true) {
-                leader_admin = Some(node.admin_addr());
-                break;
-            }
-        }
-        let leader_admin = leader_admin.expect("a CP group leader exists");
-        let (s, scan) = admin_get(leader_admin, "/admin/storage/scan?tablet=1&limit=200").await;
-        assert_eq!(s, 200);
-        // A seeded key is token-prefixed (ADR 0022: `partition_token || escape(pk)`),
-        // so the readable pk follows 8 hash bytes — `contains`, not `starts_with`.
-        let seeded = scan["items"]
-            .as_array()
-            .map(|items| {
-                items
-                    .iter()
-                    .filter(|it| it["key"].as_str().is_some_and(|k| k.contains("seed:")))
-                    .count()
-            })
-            .unwrap_or(0);
-        assert!(
-            seeded >= 60,
-            "all seeded keys are in the leader's storage: {scan}"
-        );
-
-        // A seeded row is a real DynamoDB item — the exact key/value bytes
-        // `PutItem` would store — so it reads back through the DynamoDB edge by
-        // its catalog key attribute (`id`, not the legacy `pk`), filler
-        // `payload` included.
-        let (s, got) = admin(
-            a,
-            "POST",
-            "/admin/data/dynamo",
-            Some(
-                // `ConsistentRead: true` (ADR 0055), like the composite-table
-                // read below: this reads back the seeder's own writes.
-                r#"{"op":"GetItem","payload":{"TableName":"seedt",
-                    "Key":{"id":{"S":"seed:000000000007"}},"ConsistentRead":true}}"#,
-            ),
-        )
-        .await;
-        assert_eq!(s, 200, "GetItem on a seeded row: {got}");
-        assert_eq!(
-            got["Item"]["id"]["S"], "seed:000000000007",
-            "seeded item carries its schema partition key: {got}"
-        );
-        assert!(
-            got["Item"]["payload"]["S"].is_string(),
-            "seeded item carries the filler payload attribute: {got}"
-        );
-
-        // A composite table seeds items with **both** key attributes (the sort
-        // key gets the same zero-padded index), addressable by the full key.
-        let (s, ct) = admin(
-            a,
-            "POST",
-            "/admin/data/dynamo",
-            Some(
-                r#"{"op":"CreateTable","payload":{"TableName":"seedc",
-                    "KeySchema":[{"AttributeName":"id","KeyType":"HASH"},
-                                 {"AttributeName":"rk","KeyType":"RANGE"}],
-                    "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"},
-                                            {"AttributeName":"rk","AttributeType":"S"}]}}"#,
-            ),
-        )
-        .await;
-        assert_eq!(s, 200, "CreateTable seedc: {ct}");
-        let (s, body) = admin(
-            a,
-            "POST",
-            "/admin/data/seed",
-            Some(r#"{"table":"seedc","count":5,"key_prefix":"seed:","value_bytes":32}"#),
-        )
-        .await;
-        assert_eq!(s, 200, "seed seedc returns 200: {body}");
-        assert_eq!(body["written"], 5, "seed wrote all requested keys: {body}");
-        let (s, got) = admin(
-            a,
-            "POST",
-            "/admin/data/dynamo",
-            Some(
-                // `ConsistentRead: true` (ADR 0055): reads back the seeder's
-                // own writes.
-                r#"{"op":"GetItem","payload":{"TableName":"seedc",
-                    "Key":{"id":{"S":"seed:000000000003"},"rk":{"S":"000000000003"}},
-                    "ConsistentRead":true}}"#,
-            ),
-        )
-        .await;
-        assert_eq!(s, 200, "GetItem on a seeded composite row: {got}");
-        assert_eq!(
-            got["Item"]["rk"]["S"], "000000000003",
-            "seeded composite item carries its sort key: {got}"
-        );
-
-        // A displayed key (`<token-base64>:<pk>`) round-trips through the
-        // inspector URL exactly as the dashboard sends it (percent-encoded):
-        // the server must reverse the display back to the raw token-prefixed
-        // key, or `live` comes back null.
-        let shown = scan["items"]
-            .as_array()
-            .and_then(|items| {
-                items
-                    .iter()
-                    .find_map(|it| it["key"].as_str().filter(|k| k.contains("seed:")))
-            })
-            .expect("a seeded key is listed")
-            .to_owned();
-        let (s, inspect) = admin_get(
-            leader_admin,
-            &format!("/admin/storage/key?tablet=1&key={}", percent_encode(&shown)),
-        )
-        .await;
-        assert_eq!(s, 200);
-        assert!(
-            inspect["live"].is_string(),
-            "displayed key `{shown}` resolves to its live value: {inspect}"
-        );
-
-        for node in &nodes {
-            node.shutdown_graceful().await;
-        }
-    })
-    .await
-    .expect("test timed out");
-}
+// `admin_seed_writes_synthetic_keys` converted → ADR 0061 rung H, C-08
+// PR 6's `sim_cluster_admin_actions.rs::seed_writes_synthetic_keys`
+// (the bulk-seed endpoint's full contract: a 404 on a nonexistent table,
+// written-count/raw-scan/DynamoDB-readback checks for both a simple and a
+// composite table, and the displayed-key round trip through
+// `/admin/storage/key`) — deleted from this file.
 
 /// Regression (2026-08-19): `/admin/raftkv` is **polled** — the Console
 /// fetches it from every node on its auto-refresh interval (5s by default) —
@@ -1413,107 +1068,13 @@ async fn admin_raftkv_default_does_not_materialize_the_dataset() {
 // count_is_scoped_per_tablet_after_split` (the fixture's own split +
 // `GET /admin/raftkv?exact=1`) — deleted from this file.
 
-/// ADR 0062 rung 4 ("fork first, always local") teeth: `trigger_split`'s
-/// `InPlace` arm no longer calls `split_child_placement` — both children's
-/// recorded replicas must be exactly the parent's own current replicas,
-/// never a placement-recomputed set. A 4-node cluster with `RF = 3`
-/// (`MAX_REPLICATION_FACTOR`) is the deliberate setup: node `n3` is never
-/// one of the table's tablet's replicas, so it is exactly the kind of
-/// currently-idle, would-balance-the-load candidate the OLD `split_
-/// child_placement`/fork F5 path would have been drawn to recruit for at
-/// least one child (a genuine differentiator, not just "the only replica
-/// set available"). This asserts the pre-fork `MetaCommand::
-/// BeginSplitInPlace` intent recorded on the STILL-`Splitting` parent
-/// (`Tablet::inplace_split`, visible on `/admin/status` before Stage 3's
-/// fork ever runs) — the proposer-side computation this rung changed —
-/// without needing the fork/cutover to actually complete.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn admin_split_in_place_children_inherit_the_parents_own_replicas() {
-    timeout(Duration::from_secs(60), async {
-        let dir = support::panic_safe_tempdir();
-        let (nodes, _config) = bring_up_with_streams_quiesce(4, dir.path()).await;
-        await_bootstrap(&nodes).await;
-
-        // Provision the table's bootstrap tablet through the ordinary
-        // client write path — `provision_tablet` picks the first
-        // `min(N, MAX_REPLICATION_FACTOR)` = 3 of the 4 `Active` members in
-        // `NodeId` order (n0, n1, n2), leaving n3 unhosted and idle.
-        let mut stream = TcpStream::connect(nodes[0].client_addr())
-            .await
-            .expect("connect client port");
-        put(&mut stream, "t", b"k".to_vec(), b"v".to_vec()).await;
-
-        let (_, before) = admin(nodes[0].admin_addr(), "GET", "/admin/status", None).await;
-        let parent_replicas: Vec<String> = before["tablets"]["1"]["replicas"]
-            .as_array()
-            .expect("parent has a replica list")
-            .iter()
-            .map(|v| v.as_str().unwrap().to_owned())
-            .collect();
-        assert_eq!(
-            parent_replicas.len(),
-            3,
-            "the bootstrap tablet's RF must be MAX_REPLICATION_FACTOR (3): {before}"
-        );
-        assert!(
-            !parent_replicas.iter().any(|n| n == "n3"),
-            "n3 must be idle (not one of the parent's replicas) for this test to \
-             distinguish fork-first from placement-chosen homes: {parent_replicas:?}"
-        );
-
-        let (status, body) = admin(
-            nodes[0].admin_addr(),
-            "POST",
-            "/admin/tablet/split",
-            Some(r#"{"tablet":1,"split_key":"k"}"#),
-        )
-        .await;
-        assert_eq!(status, 200, "kickoff must succeed, got: {body}");
-
-        // Poll for the parent reading `Splitting` with its `inplace_split`
-        // intent recorded — the in-place workflow mints no `Building` rows,
-        // so (unlike the copy-based test above) the intent's own `children`
-        // array, not the tablet map, is what carries each child's replicas.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-        let intent = loop {
-            let (_, status_body) = admin(nodes[0].admin_addr(), "GET", "/admin/status", None).await;
-            let parent = &status_body["tablets"]["1"];
-            if parent["state"].as_str() == Some("Splitting") && !parent["inplace_split"].is_null() {
-                break parent["inplace_split"].clone();
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "parent never recorded an in-place split intent; status: {status_body:?}"
-            );
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        };
-
-        let children = intent["children"]
-            .as_array()
-            .expect("intent carries exactly two children");
-        assert_eq!(children.len(), 2, "intent must carry exactly two children");
-        for (i, child) in children.iter().enumerate() {
-            let child_replicas: Vec<String> = child["replicas"]
-                .as_array()
-                .unwrap_or_else(|| panic!("child {i} has a replica list: {child}"))
-                .iter()
-                .map(|v| v.as_str().unwrap().to_owned())
-                .collect();
-            assert_eq!(
-                child_replicas, parent_replicas,
-                "child {i}'s replicas must be exactly the parent's own current \
-                 replicas (ADR 0062 rung 4), got {child_replicas:?} vs parent \
-                 {parent_replicas:?}"
-            );
-        }
-
-        for node in &nodes {
-            node.shutdown_graceful().await;
-        }
-    })
-    .await
-    .expect("test timed out");
-}
+// `admin_split_in_place_children_inherit_the_parents_own_replicas`
+// converted → ADR 0061 rung H, C-08 PR 6's `sim_cluster_admin_actions.rs::
+// split_in_place_children_inherit_the_parents_own_replicas` (a 4-node/RF-3
+// `SimCluster`, the identical ADR 0062 rung 4 teeth: both children's
+// pre-fork intent replicas must be exactly the parent's own current
+// replicas, never a placement-recomputed set that would have recruited
+// the deliberately-idle 4th node) — deleted from this file.
 
 /// docs/roadmap.md U-05's lineage panel on the Tablets tab
 /// (`dashboard_tablets.js`) reads `GET /admin/system-table?kind=
@@ -1530,6 +1091,11 @@ async fn admin_split_in_place_children_inherit_the_parents_own_replicas() {
 /// Rides the identical split recipe
 /// `admin_raftkv_key_count_is_scoped_per_tablet_after_split` above already
 /// proves end to end for a different surface.
+///
+/// **KEPT `ProdEnv` (ADR 0061 rung H, C-08 PR 6)**: `ctx.control_storage`
+/// is always `None` under `SimCluster`, so `GET /admin/system-table`
+/// unconditionally answers `{"available": false}` there regardless of
+/// what actually split.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn admin_system_table_split_lineage_after_a_real_split() {
     timeout(Duration::from_secs(60), async {
@@ -1701,312 +1267,27 @@ async fn admin_config_reports_auth_state_and_never_serves_the_secret() {
 // secret` (`PutCredential` then `GET /admin/credentials`, redacted, no
 // secret anywhere in either response) — deleted from this file.
 
-/// The full `Put`/`Rotate`/`Revoke` life cycle through the admin API,
-/// including the redacted rotation-grace-window fields.
-#[tokio::test(flavor = "multi_thread")]
-async fn admin_credentials_put_rotate_revoke_round_trip() {
-    timeout(Duration::from_secs(30), async {
-        let dir = support::panic_safe_tempdir();
-        let (nodes, _config) = bring_up(1, dir.path()).await;
-        let admin_addr = nodes[0].admin_addr();
+// `admin_credentials_put_rotate_revoke_round_trip` converted → ADR 0061
+// rung H, C-08 PR 6's `sim_cluster_admin_actions.rs::credentials_put_
+// rotate_revoke_round_trip` (the full Put/Rotate/Revoke life cycle,
+// including the redacted rotation-grace-window fields and the unknown-id/
+// idempotent-revoke error shapes) — deleted from this file.
 
-        // Put — a scoped policy, not allow_all, to prove policy round-trips.
-        let put_body = serde_json::json!({
-            "id": "AKID1",
-            "secret": "s0",
-            "policy": {
-                "tables": {"kind": "names", "names": ["orders"]},
-                "ops": ["read", "write"],
-            },
-            "enabled": true,
-        })
-        .to_string();
-        let (status, put_resp) =
-            admin(admin_addr, "POST", "/admin/credentials", Some(&put_body)).await;
-        assert_eq!(status, 200, "PutCredential: {put_resp}");
-        assert_eq!(
-            put_resp["policy"]["tables"],
-            serde_json::json!({"kind": "names", "names": ["orders"]})
-        );
-        assert_eq!(
-            put_resp["policy"]["ops"],
-            serde_json::json!(["read", "write"])
-        );
+// `admin_credentials_put_on_a_follower_is_relayed_to_the_leader`
+// converted → ADR 0061 rung H, C-08 PR 6's `sim_cluster_admin_actions.rs::
+// credentials_put_on_a_follower_is_relayed_to_the_leader` (the identical
+// `is_relayable_command` allowlist regression, issued from a control
+// follower and converged on every node) — deleted from this file.
 
-        // Rotate — a grace window opens; `rotation` is non-null.
-        let rotate_body =
-            serde_json::json!({"id": "AKID1", "new_secret": "s1", "grace_secs": 3600}).to_string();
-        let (status, rotate_resp) = admin(
-            admin_addr,
-            "POST",
-            "/admin/credentials/rotate",
-            Some(&rotate_body),
-        )
-        .await;
-        assert_eq!(status, 200, "RotateCredential: {rotate_resp}");
-        assert!(
-            !rotate_resp["rotation"].is_null(),
-            "a grace window should be open right after rotating: {rotate_resp}"
-        );
-        assert!(rotate_resp["rotation"]["previous_valid_until"].is_u64());
+// `admin_control_transfer_moves_leadership_to_the_named_node` converted
+// → ADR 0061 rung H, C-08 PR 6's `sim_cluster_admin_actions.rs::
+// control_transfer_moves_leadership_to_the_named_node` (the identical
+// whole-call retry discipline against every retryable 409, converging on
+// the named target) — deleted from this file.
 
-        // Rotating an unknown id is rejected.
-        let (status, err) = admin(
-            admin_addr,
-            "POST",
-            "/admin/credentials/rotate",
-            Some(
-                &serde_json::json!({"id": "no-such-id", "new_secret": "x", "grace_secs": 1})
-                    .to_string(),
-            ),
-        )
-        .await;
-        assert_eq!(status, 404, "unknown id rotate: {err}");
-
-        // Revoke — the row disappears; revoking again is idempotent (still
-        // 200).
-        let revoke_body = serde_json::json!({"id": "AKID1"}).to_string();
-        let (status, revoke_resp) = admin(
-            admin_addr,
-            "POST",
-            "/admin/credentials/revoke",
-            Some(&revoke_body),
-        )
-        .await;
-        assert_eq!(status, 200, "RevokeCredential: {revoke_resp}");
-        let (status, view) = admin_get(admin_addr, "/admin/credentials").await;
-        assert_eq!(status, 200);
-        assert_eq!(
-            view["credentials"].as_array().map(Vec::len),
-            Some(0),
-            "revoked credential should be gone: {view}"
-        );
-        let (status, revoke_again) = admin(
-            admin_addr,
-            "POST",
-            "/admin/credentials/revoke",
-            Some(&revoke_body),
-        )
-        .await;
-        assert_eq!(
-            status, 200,
-            "repeated revoke should be idempotent, not an error: {revoke_again}"
-        );
-
-        for node in &nodes {
-            node.shutdown_graceful().await;
-        }
-    })
-    .await
-    .expect("test timed out");
-}
-
-/// A `PutCredential` issued against a **follower's** admin port relays to
-/// the control-plane leader and replicates to every node — the
-/// `is_relayable_command` allowlist regression this catalog's own commands
-/// need, mirroring `schema_ddl_relay.rs`'s precedent (the bimodal
-/// per-process flake the root `CLAUDE.md` warns a missed allowlist entry
-/// causes).
-#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
-async fn admin_credentials_put_on_a_follower_is_relayed_to_the_leader() {
-    timeout(Duration::from_secs(30), async {
-        let dir = support::panic_safe_tempdir();
-        let (nodes, _config) = bring_up(3, dir.path()).await;
-        await_bootstrap(&nodes).await;
-
-        let leader = nodes.iter().position(Node::is_control_leader).unwrap();
-        let follower = (0..nodes.len()).find(|&i| i != leader).unwrap();
-        let follower_admin = nodes[follower].admin_addr();
-
-        let put_body =
-            serde_json::json!({"id": "AKID-FOLLOWER", "secret": "s0", "enabled": true}).to_string();
-        // Retry while a leader settles/moves, exactly like the DDL relay
-        // regression this mirrors.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-        loop {
-            let (status, resp) = admin(
-                follower_admin,
-                "POST",
-                "/admin/credentials",
-                Some(&put_body),
-            )
-            .await;
-            if status == 200 {
-                break;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "PutCredential via a follower-connected admin port never committed: {resp}"
-            );
-            sleep(Duration::from_millis(100)).await;
-        }
-
-        // Every node — leader and followers alike — converges on the same
-        // catalog.
-        timeout(Duration::from_secs(10), async {
-            loop {
-                let mut all_present = true;
-                for node in &nodes {
-                    let (status, view) = admin_get(node.admin_addr(), "/admin/credentials").await;
-                    let has_it = status == 200
-                        && view["credentials"]
-                            .as_array()
-                            .is_some_and(|rows| rows.iter().any(|r| r["id"] == "AKID-FOLLOWER"));
-                    if !has_it {
-                        all_present = false;
-                        break;
-                    }
-                }
-                if all_present {
-                    return;
-                }
-                sleep(Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .expect("credential relayed via a follower did not replicate to every node in time");
-
-        for node in &nodes {
-            node.shutdown_graceful().await;
-        }
-    })
-    .await
-    .expect("test timed out");
-}
-
-/// `POST /admin/control/transfer {to}` (ADR 0020/0037, roadmap U-05) moves
-/// control-plane leadership to another live voter — a standalone route
-/// alongside the leadership-transfer arm `control/member/remove`'s own
-/// self-removal path already had internally.
-///
-/// **Fixed contract (issue #688, 2026-09-07)**: `200` means `to` is
-/// genuinely the observed control leader, never merely "the old leader
-/// stepped down" — a *third* voter this call never named can win the
-/// election `TimeoutNow` triggers instead (root-caused in
-/// `crates/animusd/CLAUDE.md`'s matching entry: the old leader steps down
-/// on *any* higher-term Raft message, not only the target's own, and under
-/// real scheduling jitter — this test runs 3 real threads on however many
-/// cores the runner actually has — more than one follower's election timer
-/// can lapse on the same late heartbeats). So this test issues the `POST`
-/// against the **current** leader, and on either the pre-existing "not
-/// caught up yet" retryable 409 (issue #671) or the new "leadership moved
-/// to a different node" retryable 409 this fix adds, re-resolves the
-/// current leader (which may now be a different node) and retries the
-/// **whole call** against it — never a one-shot assert on the first
-/// accepted attempt, and never assuming the leader that first accepted the
-/// POST is still the leader by the time this loop notices a refusal. Only
-/// on `200` does it poll (converged-or-timeout, per this crate's own
-/// testing discipline) for the named target to report itself the control
-/// leader.
-#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
-async fn admin_control_transfer_moves_leadership_to_the_named_node() {
-    timeout(Duration::from_secs(30), async {
-        let dir = support::panic_safe_tempdir();
-        let (nodes, config) = bring_up(3, dir.path()).await;
-        await_bootstrap(&nodes).await;
-
-        let leader = nodes
-            .iter()
-            .position(Node::is_control_leader)
-            .expect("a control leader exists after bootstrap");
-        let target = (0..nodes.len()).find(|&i| i != leader).unwrap();
-        let target_id = config.nodes[target].id.clone();
-        let body = serde_json::json!({"to": target_id}).to_string();
-
-        // Retry the whole call — re-resolving the current leader each time,
-        // never assuming it's still whoever it was on the previous
-        // iteration — against every retryable 409 this route can answer:
-        // the target hasn't caught up yet (issue #671), or a third voter
-        // won the election this call's own arm triggered (issue #688).
-        // Anything else (a 200, or a genuinely unexpected status) ends the
-        // loop immediately.
-        let accepted = timeout(Duration::from_secs(20), async {
-            loop {
-                let Some(current_leader) = nodes.iter().position(Node::is_control_leader) else {
-                    // No stable leader observed this instant (an election
-                    // is in flight) — nothing to POST against yet.
-                    sleep(Duration::from_millis(50)).await;
-                    continue;
-                };
-                let (status, resp) = admin(
-                    nodes[current_leader].admin_addr(),
-                    "POST",
-                    "/admin/control/transfer",
-                    Some(&body),
-                )
-                .await;
-                match status {
-                    200 => return resp,
-                    409 if resp["error"].as_str().is_some_and(|e| e.contains("retry")) => {
-                        sleep(Duration::from_millis(50)).await;
-                    }
-                    _ => panic!("transfer should be accepted or retryable: {status} {resp}"),
-                }
-            }
-        })
-        .await
-        .expect(
-            "transfer was never accepted: neither the target caught up nor did any node \
-             report the named target as the stable leader within the bound",
-        );
-        assert_eq!(accepted["ok"], true, "response: {accepted}");
-
-        timeout(Duration::from_secs(10), async {
-            loop {
-                if nodes[target].is_control_leader() {
-                    return;
-                }
-                sleep(Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .expect("control leadership never moved to the named target");
-
-        for node in &nodes {
-            node.shutdown_graceful().await;
-        }
-    })
-    .await
-    .expect("test timed out");
-}
-
-/// A follower's admin port refuses the transfer (not the control leader) —
-/// mirroring every other `control/member/*` action's own not-relayed,
-/// local-leader-only discipline.
-#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
-async fn admin_control_transfer_on_a_follower_is_refused() {
-    timeout(Duration::from_secs(30), async {
-        let dir = support::panic_safe_tempdir();
-        let (nodes, config) = bring_up(3, dir.path()).await;
-        await_bootstrap(&nodes).await;
-
-        let leader = nodes
-            .iter()
-            .position(Node::is_control_leader)
-            .expect("a control leader exists after bootstrap");
-        let follower = (0..nodes.len()).find(|&i| i != leader).unwrap();
-        let other = (0..nodes.len())
-            .find(|&i| i != leader && i != follower)
-            .unwrap();
-        let target_id = config.nodes[other].id.clone();
-
-        let body = serde_json::json!({"to": target_id}).to_string();
-        let (status, resp) = admin(
-            nodes[follower].admin_addr(),
-            "POST",
-            "/admin/control/transfer",
-            Some(&body),
-        )
-        .await;
-        assert_ne!(status, 200, "a follower should refuse the transfer: {resp}");
-
-        for node in &nodes {
-            node.shutdown_graceful().await;
-        }
-    })
-    .await
-    .expect("test timed out");
-}
+// `admin_control_transfer_on_a_follower_is_refused` converted → ADR 0061
+// rung H, C-08 PR 6's `sim_cluster_admin_actions.rs::control_transfer_on_
+// a_follower_is_refused` — deleted from this file.
 
 /// `POST /admin/storage/compact` (docs/roadmap.md U-05, tablet action
 /// family) had no integration coverage anywhere in this crate before this
@@ -2017,6 +1298,10 @@ async fn admin_control_transfer_on_a_follower_is_refused() {
 /// trivial empty-engine no-op), compact, and confirm the written pair
 /// still reads back afterward. Also proves the `not_hosted` refusal shape
 /// for a tablet id this node doesn't host.
+///
+/// **KEPT `ProdEnv` (ADR 0061 rung H, C-08 PR 6)**: `CpGroup::
+/// compact_now()` is `None` for `SimCluster`'s `MemoryEngine` backend —
+/// no LSM/SSTable concept to compact.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn admin_storage_compact_action() {
     timeout(Duration::from_secs(60), async {
