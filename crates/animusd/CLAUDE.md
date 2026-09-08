@@ -4935,6 +4935,12 @@ ADR itself for the full design/rationale.
   correctness claim), and `manifest-summary.json` written **last** (after
   every data file — durable-before-visible discipline: a reader should
   never see a summary pointing at data files that might not exist yet).
+  **That terminal write's own error path is not plain `?`** (issue #707,
+  ADR 0068's 2026-09-08 as-built amendment): a `put` error there is
+  resolved by reading the object back through the same store handle first
+  — present with the expected bytes means the ack alone was lost, so the
+  job still succeeds; absent means it genuinely failed. Every earlier
+  write in this function keeps the plain no-retry `?`.
   `gzip_bytes` uses `flate2`'s pure-Rust `rust_backend`/miniz_oxide feature
   (new workspace dependency, `Cargo.toml`'s own comment explains the
   no-C-FFI choice mirrors the `lz4_flex` precedent for this workspace's
