@@ -858,8 +858,30 @@ the still-true paragraph after the table.
   generic dispatch cores this rung builds directly on, plus rung C5's own
   widening of `ClientCtx`'s field types, which is what makes this rung
   mostly signature widening rather than new mechanism.
-- **Status (2026-09-08):** open — PR 1 (this docs opener) landed; PRs 2–8
-  to follow.
+- **Status (2026-09-08):** open — PR 1 (this docs opener) and PR 2
+  (groundwork) both landed, PR 2 corrected the same day in review; PRs
+  3–8 to follow. PR 2 widened both impls (43 `AdminHost` handlers, not
+  merely "~30"), fixed blockers (a)/(b)/(c), and found (via this rung's
+  own required untrimmed gate) that swapping `admin.rs::action_data_
+  dynamo`/`impl ConsoleBackend`'s dispatch target is a real production
+  regression for operations the generic dispatch doesn't cover yet, not
+  merely a `SimCluster`-only gap. Six of the nine failing tests were
+  closed correctly, by genuinely widening `UpdateTimeToLive`/
+  `CreateBackup`/`DeleteBackup`. The other two (blocker (d), the GSI
+  index-change gap) were first "fixed" by widening `impl AdminHost for
+  ClientCtx`/`impl ConsoleBackend for ClientCtx` **in place** — which
+  silently narrowed *every* production caller of those traits, not just
+  the two GSI routes, to whatever the generic dispatch core covers — and
+  a follow-on concrete-interception layer inside `console.rs::serve`/
+  `handle_conn` compounded the mistake by editing a file this rung's own
+  non-goals treat as off-limits. **Corrected in review**: the two impls
+  stay concrete and production-only; a `GenericAdminHost<E, R>`/
+  `GenericConsoleBackend<E, R>` newtype pair carries the generic dispatch
+  instead, constructed only by `SimCluster::admin`/`console`. See ADR
+  0061's "Rung H, PR 2 landed" amendment (now the corrected account) and
+  `docs/engineering-lessons.md`'s two matching 2026-09-08 entries (the
+  second rewritten to describe the newtype fix, not the interception
+  mistake) for the full account.
 
 ---
 
@@ -939,7 +961,7 @@ wave are independent and can run in parallel.
 | 6 | *S-03 complete 2026-09-07 (all 3 PRs, ADR 0069)*; *S-07e/S-07 complete 2026-09-07 (ADR 0070)*; *C-03 assessed 2026-09-07 — deferred, no PRs planned (see ADR 0044's matching amendment)*; W-07 | XL or gated on earlier waves |
 | 7 | C-06 (closed 2026-09-08 — all seven PRs landed: #728, #729, #732, #748, #750, #756, plus this PR; issues #731 and #737 both fixed 2026-09-07) | Gated on C-04 (closed 2026-09-07) — the D4 `Reconciler` and D3 generic dispatch cores it builds on |
 | 8 | C-07 (closed 2026-09-08 — all six PRs landed: #758, #759, #760, #761, #762, plus PR 6) | Gated on C-04 (closed) and C-06 (closed) — the same generic dispatch cores, plus C-06's own Transact widening |
-| 9 | C-08 (open 2026-09-08 — PR 1, this docs opener, landed; PRs 2–8 to follow) | Gated on C-04 (closed), C-06 (closed), and C-07 (closed) — the same generic dispatch cores, plus rung C5's own widening of `ClientCtx`'s field types |
+| 9 | C-08 (open 2026-09-08 — PR 1, this docs opener, and PR 2, groundwork, both landed; PRs 3–8 to follow) | Gated on C-04 (closed), C-06 (closed), and C-07 (closed) — the same generic dispatch cores, plus rung C5's own widening of `ClientCtx`'s field types |
 
 Open issues mapped: none left (#375 closed by W-01, #319 by W-05). Filed
 from wave 2's own findings: #590 (the operator still emits the deleted

@@ -23106,3 +23106,125 @@ deliberately. A scenario that only needs *eventual* convergence (poll to
 convergence afterward) has no such constraint and can keep a short
 retention — the two existing strategies documented in `sim_cluster_
 stream_janitor.rs`'s own module doc are the reusable shape.
+
+## A generic dispatch's own coverage gaps are a real production regression the moment a NON-primary but still-production-reachable proxy is switched to it — "SimCluster-only gap" and "production gap" are not automatically the same claim (ADR 0061 rung H, C-08 PR 2, 2026-09-08)
+
+Every prior rung in this series (D2/D3/D4/F/G) widened a dispatcher whose
+*only* production caller was the real wire edge (`dynamo.rs::dispatch`),
+which never changed target — the generic sibling was purely additive, and
+"production stays byte-identical" held by construction. C-08 PR 2 widened
+two DIFFERENT production entry points instead — `admin.rs::
+action_data_dynamo` (`/admin/data/dynamo`, the dashboard's own DynamoDB
+proxy, ADR 0021) and `impl console::ConsoleBackend for ClientCtx` (the
+animusd console's own mutating endpoints) — because `AdminHost`/
+`ConsoleBackend`'s trait requirements force EVERY method to be
+`<E: Env, R: RelayClient>`-generic once the surrounding `impl` is widened,
+with no way to keep one method concrete while its siblings go generic (see
+the archive-bound entry below for exactly why). Both are genuinely
+**production-reachable** — real operators use the dashboard's Data Browser
+and the console app — but neither is the primary wire edge, and it was
+tempting to reason "the generic dispatch already covers most DynamoDB
+operations, so this is basically the same swap the prior rungs made
+safely." It is not: unlike the wire edge, these two callers can be asked
+to run **any** operation a client chooses, including ones the generic core
+never claimed to cover (`UpdateTimeToLive`, `CreateBackup`/`DeleteBackup`,
+and `UpdateTable` with an index change — the last a *named, accepted*
+scope cut, "blocker (d)," not an oversight). Swapping their dispatch target
+to the narrower `execute_routed_as_generic` without first widening those
+specific operations turned nine real-socket tests red
+(`admin_endpoint.rs`/`console_create_table.rs`/`console_table_config.rs`/
+`dashboard_endpoint.rs`) — a genuine regression in shipped functionality,
+not a SimCluster-only coverage gap, caught only because this rung's own
+gate explicitly requires running the untrimmed suite **before** trusting
+the swap (the D2 PR 1 lesson's own prescribed check). Six of the nine
+closed cheaply: `update_time_to_live`/`create_backup`/`delete_backup` had
+no `tokio::spawn` blocking them, just the same `tokio::time` → `ctx.env`
+conversion this whole series already does mechanically, so widening them
+and adding three `dispatch_item_op` arms was the *correct* fix, not a
+workaround. The remaining two (`add_gsi`/`drop_gsi`, genuinely blocked on
+GSI backfill machinery this rung was never going to build) needed a
+different, structural answer — see the sibling entry just below.
+
+**The general form**: before assuming a trait-forced widening's dispatch
+swap is "the same shape as last time," ask whether the caller being
+widened is a **narrow, single-purpose edge** (always the same handful of
+operations) or a **general-purpose proxy** (can be asked to run anything a
+client sends) — only the former's coverage gap is automatically confined
+to the new generic-only caller (SimCluster); the latter's gap is visible
+to every existing caller the moment the switch lands, so the untrimmed
+gate isn't a formality for it, it's the only thing separating "found a
+groundwork residual" from "shipped a functional regression."
+
+## A blanket generic `impl Trait for ClientCtx<E, R>` silently narrows production's own dispatch to whatever the generic sibling covers — a newtype keeps the production impl concrete, not an interception layer inside the off-limits accept loop (ADR 0061 rung H, C-08 PR 2, 2026-09-08 — corrected same day, in review)
+
+A first cut of this rung widened `impl AdminHost for ClientCtx`/
+`impl console::ConsoleBackend for ClientCtx` **in place** to `impl<E: Env,
+R: RelayClient> .. for ClientCtx<E, R>` — the same shape every earlier
+generic-dispatch rung (D2/D3/D4/F/G) used for a *free function*. The
+difference a blanket trait impl introduces, missed at first: `ClientCtx`
+(the bare, default-type-parameter alias) is production's own concrete
+type, so widening its *one* `impl` block doesn't add a second, parallel
+path the way widening a free function does — it **replaces** the only
+`AdminHost`/`ConsoleBackend` implementation `ClientCtx` has, for every
+monomorphization including `E = ProdEnv, R = AnimusdRelayClient`. Once
+`action_data_dynamo`/`add_gsi`/`drop_gsi`'s shared body was forced to call
+the narrower `execute_routed_as_generic` (the only way the body can
+compile for a generic `E, R` at all), **every** caller of the trait —
+including production's own dashboard proxy and real console clients —
+silently lost whatever the generic dispatch core doesn't cover, with no
+way to get it back by editing the trait impl alone: there is no way to
+keep both a generic `impl Trait for ClientCtx<E, R>` and a separate,
+more-capable `impl Trait for ClientCtx` (the concrete default) coexisting
+— Rust's coherence rules forbid two impls of the same trait for
+overlapping type parameters, and `animus_node::console::route`'s own
+`&dyn ConsoleBackend` **trait-object** dispatch has no inherent-method-
+priority escape hatch to prefer one impl over the other for a single
+concrete type either. A first attempted fix reached for a concrete
+interception layer inside `console.rs::serve`/`handle_conn` (special-case
+two routes ahead of `route`'s own dispatch) — this compiled, passed every
+test, and was still wrong: it edited a file no reviewer read as
+off-limits, gave `console.rs` its own duplicated route-parsing/JSON-helper
+logic that would silently drift from `animus_node::console`'s own the
+moment that crate's route shapes changed, and threaded a concrete
+`ClientCtx` into `serve`/`handle_conn`'s own signatures — a real change to
+the production console path this rung's own non-goals explicitly forbade,
+just one file removed from the trait impl itself.
+
+**The actual fix, applied in review**: keep the concrete
+`impl AdminHost for ClientCtx`/`impl console::ConsoleBackend for
+ClientCtx` as the **production** impls, observably byte-identical to
+before this rung (every dispatch call site stays the concrete
+`execute_routed`/`execute_routed_as`, never `execute_routed_as_generic`),
+and add a **second type**, `GenericAdminHost<E, R>(pub ClientCtx<E, R>)`/
+`GenericConsoleBackend<E, R>(pub ClientCtx<E, R>)` — a one-field newtype,
+not a new mechanism — with its own `impl<E: Env, R: RelayClient> Trait for
+Generic*<E, R>` reaching the generic dispatch core instead. Coherence
+allows this because the two impls target genuinely different types
+(`ClientCtx<E, R>` vs. `Generic*Host<E, R>`), even though one always wraps
+the other. `SimCluster::admin`/`console` (`sim_cluster.rs`) wrap
+`self.ctx(node)` in the newtype before calling `animus_node::admin::
+dispatch`/`console::route`; production's own `spawn_common_tail` keeps
+passing a bare `Arc<ClientCtx>` as `Arc<dyn ConsoleBackend>`/handing a bare
+`&ClientCtx` to `animus_node::admin::dispatch<H: AdminHost>`, completely
+unaware the newtype exists. Both impls share every byte of request-
+building/response-parsing logic (factored into small, `<E, R>`-generic or
+plain free functions called by both `self`/`&self.0`) — only the one
+dispatch-call line differs — so the two paths cannot quietly drift apart.
+`console.rs`/`animus_node::admin::dispatch`/`animus_node::console::route`
+are untouched, verified via `git diff` against the pre-rework baseline,
+not merely asserted.
+
+**The general form**: when a trait-bound widening is about to touch a
+**blanket `impl Trait for ConcreteType`** — not a free function, not an
+impl on a type the caller already constructs generically — stop and ask
+whether `ConcreteType` is itself production's own default-instantiated
+type (a struct with default type parameters, e.g. `ClientCtx<E: Env =
+ProdEnv, ..>`). If so, widening that one `impl` block in place doesn't add
+a parallel path the way widening a free function does; it *replaces*
+production's own implementation for every trait method at once, including
+whichever ones the generic dispatch core doesn't yet cover. The fix is a
+newtype wrapper with its own separate `impl`, not an edit inside the
+off-limits call chain the trait's own dispatcher (`route`/`dispatch`)
+sits behind — even a "thin, logic-free" interception one file upstream of
+that dispatcher is still a change to the production path this class of
+rung's own non-goals exist to forbid.

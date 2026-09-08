@@ -529,11 +529,23 @@ async fn dispatch(
 
 /// [`execute_routed_as`], defaulted to [`Principal::unrestricted`] — every
 /// caller that runs a request with **no SigV4 gate in front of it at all**
-/// (the admin dashboard's `POST /admin/data/dynamo` proxy, ADR 0021; the
-/// animusd console; the internal admin seeder) calls this unchanged form,
-/// matching pre-S-02 behaviour exactly. The real DynamoDB wire edge
-/// (`dispatch`, above) is the only caller that resolves and passes a real
-/// [`Principal`].
+/// (the admin dashboard's `POST /admin/data/dynamo` proxy, ADR 0021, via
+/// `admin.rs::action_data_dynamo_concrete`; the animusd console, via the
+/// concrete `impl console::ConsoleBackend for ClientCtx`; the internal
+/// admin seeder) calls this unchanged form, matching pre-S-02 behaviour
+/// exactly. The real DynamoDB wire edge (`dispatch`, above) is the only
+/// caller that resolves and passes a real [`Principal`].
+///
+/// **Unchanged by ADR 0061 rung H, C-08 PR 2** — both production callers
+/// above stay concrete (`ClientCtx`, `E = ProdEnv, R = AnimusdRelayClient`)
+/// and keep calling this function exactly as before that rung; only a
+/// *second*, `SimCluster`-only pair of callers exists alongside them —
+/// `admin.rs`'s generic `action_data_dynamo` and `GenericConsoleBackend`'s
+/// own methods (`lib.rs`), both reaching [`execute_routed_as_generic`]
+/// instead, never this function — see `docs/engineering-lessons.md`'s
+/// matching 2026-09-08 entry for why a second, general-purpose "run
+/// whatever operation a client asks for" proxy needed a genuine newtype
+/// split rather than a single widened impl.
 pub(crate) async fn execute_routed(ctx: &ClientCtx, target: &str, body: &[u8]) -> (u16, String) {
     execute_routed_as(ctx, &Principal::unrestricted(), target, body).await
 }
@@ -1632,6 +1644,26 @@ async fn dispatch_item_op<E: Env, R: RelayClient>(
             token,
             return_consumed_capacity: _,
         } => execute_transaction_as(ctx, principal, meta, &statements, token.as_deref()).await,
+        // ADR 0061 rung H (C-08 PR 2): found necessary, not merely
+        // convenient — `admin.rs::action_data_dynamo` and `impl console::
+        // ConsoleBackend for ClientCtx<E, R>` both widened to `<E, R>` and
+        // now reach every item op through this function; without these
+        // three arms the untrimmed real-socket gate showed real production
+        // regressions (TTL/backup management via the admin dashboard proxy
+        // and the animusd console losing coverage they had before this
+        // rung), not just a SimCluster-only gap. `update_time_to_live`/
+        // `create_backup`/`delete_backup` were widened alongside (pure
+        // `tokio::time` → `ctx.env` conversions, see each one's own doc) —
+        // `run_operation`'s own arms for all three are untouched.
+        Operation::UpdateTimeToLive {
+            table,
+            attribute_name,
+            enabled,
+        } => update_time_to_live(ctx, &table, &attribute_name, enabled).await,
+        Operation::CreateBackup { table, backup_name } => {
+            create_backup(ctx, &table, &backup_name).await
+        }
+        Operation::DeleteBackup { backup_arn } => delete_backup(ctx, &backup_arn).await,
         _ => Err(unsupported_by_generic_dispatch("this operation")),
     }
 }
@@ -1678,6 +1710,14 @@ async fn dispatch_item_op<E: Env, R: RelayClient>(
 /// dispatcher's ONLY path" lesson (`docs/engineering-lessons.md`'s matching
 /// D2 entry): this rung deliberately repeats D2 PR 1's own shape rather than
 /// routing `run_operation` itself through the narrowed core.
+///
+/// Only called from [`execute_item_op_as`] — the `cfg_attr` below mirrors
+/// that function's own dead-code allowance (ADR 0061 rung H, C-08 PR 2
+/// rework: the concrete `impl AdminHost for ClientCtx`/`impl ConsoleBackend
+/// for ClientCtx` production impls never reach this function at all — only
+/// `GenericAdminHost`/`GenericConsoleBackend`, constructed solely by
+/// `SimCluster::admin`/`console`, do).
+#[cfg_attr(not(test), allow(dead_code))]
 async fn dispatch_table_op<E: Env, R: RelayClient>(
     ctx: &ClientCtx<E, R>,
     meta: &Metadata,
@@ -1782,25 +1822,24 @@ async fn dispatch_table_op<E: Env, R: RelayClient>(
 /// `ProdEnv`-only — this crate's real TCP listener (`serve`/`handle_conn`)
 /// is a genuine process boundary no `Env` seam removes — so this sibling
 /// exists for a caller that already holds a decoded target/body and a
-/// generic `ClientCtx`, never a socket. The one caller today is
-/// `sim_cluster_dynamo.rs`'s `SimClusterHandle::dynamo`, mirroring
-/// `admin.rs::action_data_dynamo`'s own unauthenticated `execute_routed`
-/// proxy shape (an unrestricted `Principal`, no SigV4 gate in front of it —
-/// this fixture has no SigV4 listener to gate through in the first place).
+/// generic `ClientCtx`, never a socket. `sim_cluster_dynamo.rs`'s
+/// `SimClusterHandle::dynamo` was the first caller; [`execute_routed_as_
+/// generic`]'s item-API fork is a second, reached (ADR 0061 rung H, C-08 PR
+/// 2's own `GenericAdminHost`/`GenericConsoleBackend`) only from
+/// `SimCluster::admin`/`console` — **never from production**: the concrete
+/// `impl AdminHost for ClientCtx`/`impl console::ConsoleBackend for
+/// ClientCtx` reach the full, unmodified `crate::dynamo::execute_routed`
+/// instead (see `docs/engineering-lessons.md`'s matching 2026-09-08 entry
+/// for why a second, general-purpose "run whatever operation a client
+/// asks for" proxy like `/admin/data/dynamo` can't safely be narrowed to
+/// this generic core the way the primary DynamoDB wire edge's own caller
+/// already was in every earlier rung).
 ///
 /// The thirteen operations [`dispatch_item_op`] covers, plus (ADR 0061 rung
 /// D3 PR 2a/2b) the five base-table DDL operations [`dispatch_table_op`]
 /// covers, succeed; every other well-formed operation decodes fine and fails with
 /// [`unsupported_by_generic_dispatch`]'s `InternalServerError` — see either
 /// function's own doc for the fuller "what's out of scope, why" account.
-///
-/// Only called from `sim_cluster::SimClusterHandle::dynamo` (a
-/// `#[cfg(test)] mod`) today — the `cfg_attr` below is a **precise**, not
-/// blanket, dead-code allowance (only in effect for the non-`cfg(test)`
-/// build the `tests/` binaries and the release lib link against; `cargo
-/// test -p animusd --lib`, which actually exercises it, sees no allowance
-/// at all), mirroring `RaftKvNode::local_scan_kind_bounded`'s own identical
-/// situation in this crate (`lib.rs`).
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn execute_item_op_as<E: Env, R: RelayClient>(
     ctx: &ClientCtx<E, R>,
@@ -1849,6 +1888,48 @@ pub(crate) async fn execute_item_op_as<E: Env, R: RelayClient>(
     }
 }
 
+/// SimEnv-capable sibling of [`execute_routed_as`] (ADR 0061 rung H, C-08 PR
+/// 2): the identical `X-Amz-Target` prefix fork — a `DynamoDBStreams_
+/// 20120810.*` target goes to [`crate::dynamo_streams::execute_streams_op_as`]
+/// (the Streams read API), everything else to [`execute_item_op_as`] (the
+/// item API, which as of ADR 0061 rung D3/D4/F also covers base-table DDL,
+/// GSI/LSI query/scan, `Transact*`, and PartiQL) — over any `ClientCtx<E,
+/// R>` rather than the concrete `ClientCtx<ProdEnv, AnimusdRelayClient>`
+/// [`execute_routed_as`] is hardcoded to. Mirrors `admin.rs::
+/// action_data_dynamo`'s own unauthenticated `execute_routed` proxy shape:
+/// the caller supplies whatever `Principal` it has (typically `Principal::
+/// unrestricted()` for an internal, no-SigV4-gate-in-front-of-it caller).
+///
+/// **Never becomes production's path to the console/admin-proxy backend**
+/// (ADR 0061 rung H, C-08 PR 2 rework) — `execute_routed`/
+/// `execute_routed_as`/`execute_as` keep dispatching exactly as before this
+/// rung, and so do the *concrete* `impl AdminHost for ClientCtx`/
+/// `impl console::ConsoleBackend for ClientCtx` (the D2 PR 1 generic-sibling
+/// lesson, restated by every rung since — see `docs/engineering-lessons.md`'s
+/// matching 2026-09-08 entry for why this particular caller pair needed a
+/// genuine newtype split, not just the usual "don't route production
+/// through the narrowed core" discipline). This function's only callers are
+/// `GenericAdminHost`/`GenericConsoleBackend` (`admin.rs`/`lib.rs`),
+/// themselves constructed solely by `SimCluster::admin`/`console` — a
+/// purely additive, `SimCluster`-only entry point. Whatever
+/// `execute_item_op_as`/`execute_streams_op_as` don't yet cover surfaces
+/// the identical `unsupported_by_generic_dispatch` `InternalServerError`
+/// those two functions' own docs describe — never a panic, never a
+/// silently wrong answer.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) async fn execute_routed_as_generic<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+    principal: &Principal,
+    target: &str,
+    body: &[u8],
+) -> (u16, String) {
+    if target.starts_with(animus_dynamo::streams_wire::TARGET_PREFIX) {
+        crate::dynamo_streams::execute_streams_op_as(ctx, principal, target, body).await
+    } else {
+        execute_item_op_as(ctx, principal, target, body).await
+    }
+}
+
 /// `UpdateTimeToLive` (ADR 0051): declare, change, or disable a table's TTL
 /// attribute — the same commit-wait shape [`enable_stream`]/
 /// [`disable_stream`] already use, just against `MetaCommand::SetTableTtl`
@@ -1863,8 +1944,22 @@ pub(crate) async fn execute_item_op_as<E: Env, R: RelayClient>(
 /// otherwise, and disabling an already-disabled table is always a catalog
 /// no-op regardless of the supplied name (`MetaCommand::SetTableTtl`'s own
 /// apply-time rule).
-async fn update_time_to_live(
-    ctx: &ClientCtx,
+///
+/// `<E: Env, R: RelayClient>` (ADR 0061 rung H, C-08 PR 2): widened so
+/// [`dispatch_item_op`] can reach it too, from `execute_item_op_as` —
+/// found necessary only once the untrimmed real-socket gate proved the
+/// alternative (`admin.rs::action_data_dynamo`/`impl console::
+/// ConsoleBackend`'s own `UpdateTimeToLive` follow-up calls losing
+/// coverage under the narrower generic dispatch) is a real production
+/// regression, not an acceptable groundwork gap — see this crate's own
+/// `CLAUDE.md` C-08 PR 2 entry for the full account. A pure signature
+/// change: every `tokio::time` site below became `ctx.env`, mirroring
+/// `enable_stream`/`disable_stream`'s own precedent; `run_operation`'s own
+/// `UpdateTimeToLive` arm keeps calling this exact function, monomorphized
+/// at `E = ProdEnv, R = AnimusdRelayClient` — production behavior is
+/// unchanged.
+async fn update_time_to_live<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     table: &str,
     attribute_name: &str,
     enabled: bool,
@@ -1888,7 +1983,7 @@ async fn update_time_to_live(
     let spec = enabled.then(|| TtlSpec {
         attribute_name: attribute_name.to_owned(),
     });
-    let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+    let deadline = ctx.env.now().saturating_add(SCHEMA_COMMIT_TIMEOUT);
     loop {
         ctx.propose_schema(&MetaCommand::SetTableTtl {
             table: table.to_owned(),
@@ -1898,13 +1993,13 @@ async fn update_time_to_live(
         if metadata_fresh(ctx).await.table_ttl(table) == spec.as_ref() {
             break;
         }
-        if tokio::time::Instant::now() >= deadline {
+        if ctx.env.now() >= deadline {
             return Err(internal(
                 "UpdateTimeToLive did not commit to the control plane in time \
                  (no leader reachable?)",
             ));
         }
-        tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+        ctx.env.sleep(SCHEMA_POLL_INTERVAL).await;
     }
     Ok(wire::update_time_to_live_response(attribute_name, enabled))
 }
@@ -2085,9 +2180,12 @@ fn describe_endpoints(ctx: &ClientCtx) -> Result<String, WireError> {
 ///
 /// `pub(crate)`: `console_table_detail` (U-03, `lib.rs`) calls this same
 /// function for the table detail page's `pitr` field rather than
-/// re-deriving the restore window a second way.
-pub(crate) fn pitr_description(
-    ctx: &ClientCtx,
+/// re-deriving the restore window a second way. `<E: Env, R: RelayClient>`
+/// since ADR 0061 rung H (C-08 PR 2) widened `console_table_detail`'s own
+/// call chain — a pure signature change, `ctx.env.wall_now()` is the only
+/// `ctx` read here and was already `Env`-generic.
+pub(crate) fn pitr_description<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     meta: &Metadata,
     table: &str,
 ) -> wire::PitrDescription {
@@ -2221,8 +2319,13 @@ const CREATE_BACKUP_ID_ATTEMPTS: u32 = 3;
 /// `AVAILABLE`. Capture proceeds asynchronously from here via the capture
 /// driver (`animusd::backup_capture`) and the completion aggregator
 /// (`animusd::backup_completion`).
-async fn create_backup(
-    ctx: &ClientCtx,
+///
+/// `<E: Env, R: RelayClient>` (ADR 0061 rung H, C-08 PR 2), for the
+/// identical reason [`update_time_to_live`]'s own doc gives — a pure
+/// signature/`tokio::time`-site change, `run_operation`'s own `CreateBackup`
+/// arm unaffected.
+async fn create_backup<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     table: &str,
     backup_name: &str,
 ) -> Result<String, WireError> {
@@ -2247,7 +2350,7 @@ async fn create_backup(
             pitr_base: false,
         })
         .await;
-        let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+        let deadline = ctx.env.now().saturating_add(SCHEMA_COMMIT_TIMEOUT);
         loop {
             if let Some(row) = metadata_fresh(ctx).await.backup(&backup_arn) {
                 return Ok(wire::create_backup_response(&wire::BackupDetails {
@@ -2258,7 +2361,7 @@ async fn create_backup(
                     size_bytes: 0,
                 }));
             }
-            if tokio::time::Instant::now() >= deadline {
+            if ctx.env.now() >= deadline {
                 // Either a (vanishingly unlikely) id collision rejected this
                 // attempt outright, or the propose itself never reached a
                 // leader — either way, mint a fresh id and retry rather than
@@ -2267,7 +2370,7 @@ async fn create_backup(
                 // machine accepted it").
                 break;
             }
-            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+            ctx.env.sleep(SCHEMA_POLL_INTERVAL).await;
         }
     }
     Err(timeout_err)
@@ -2477,7 +2580,15 @@ fn list_backups(
 /// exactly as much a success as finding it `Expired` (both mean the mark
 /// landed), and once gone there is nothing left to re-read the manifest
 /// from anyway. Found live via a genuinely fast-reclaiming single-node test.
-async fn delete_backup(ctx: &ClientCtx, backup_arn: &str) -> Result<String, WireError> {
+///
+/// `<E: Env, R: RelayClient>` (ADR 0061 rung H, C-08 PR 2), for the
+/// identical reason [`update_time_to_live`]'s own doc gives — a pure
+/// signature/`tokio::time`-site change, `run_operation`'s own `DeleteBackup`
+/// arm unaffected.
+async fn delete_backup<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+    backup_arn: &str,
+) -> Result<String, WireError> {
     let meta = metadata_fresh(ctx).await;
     let row = visible_backup(&meta, backup_arn)?.clone();
     if matches!(row.status, animus_control::BackupStatus::Creating) {
@@ -2487,7 +2598,7 @@ async fn delete_backup(ctx: &ClientCtx, backup_arn: &str) -> Result<String, Wire
             reasons: None,
         });
     }
-    let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+    let deadline = ctx.env.now().saturating_add(SCHEMA_COMMIT_TIMEOUT);
     loop {
         ctx.propose_schema(&MetaCommand::MarkBackupDeleted {
             backup_id: backup_arn.to_owned(),
@@ -2508,12 +2619,12 @@ async fn delete_backup(ctx: &ClientCtx, backup_arn: &str) -> Result<String, Wire
             }
             _ => {}
         }
-        if tokio::time::Instant::now() >= deadline {
+        if ctx.env.now() >= deadline {
             return Err(internal(
                 "DeleteBackup did not commit to the control plane in time (no leader reachable?)",
             ));
         }
-        tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+        ctx.env.sleep(SCHEMA_POLL_INTERVAL).await;
     }
 }
 

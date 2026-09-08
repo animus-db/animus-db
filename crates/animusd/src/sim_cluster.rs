@@ -857,6 +857,101 @@ impl SimClusterHandle {
         .await
     }
 
+    /// Run an admin HTTP-JSON request (`GET`/`POST`, `/admin/*`) against
+    /// `node`'s own `ClientCtx`, through the exact same `animus_node::
+    /// admin::dispatch` production's admin TCP listener calls (ADR 0061
+    /// rung H, C-08 PR 2 — the groundwork step, no scenario coverage of its
+    /// own yet, see `sim_cluster_admin.rs`/PR 5-6 for that) — never a
+    /// bespoke test-only reimplementation. `dispatch` never sees HTTP
+    /// framing (headers, keep-alive, the `Content-Length`/CORS-preflight
+    /// dance `admin.rs::handle_conn` does before ever reaching `dispatch`)
+    /// — only `(method, path, query, body)` — so this mirrors
+    /// [`SimClusterHandle::dynamo`]'s own shape exactly: no framing to
+    /// build, self-bounded by whichever `AdminHost` method the route maps
+    /// to (every one of which is itself already `CLIENT_TIMEOUT`-bounded
+    /// through the ordinary `ClientCtx` primitives it calls), so callable
+    /// directly inside an `env.spawn_task`-ed future with no wrapper
+    /// needed.
+    ///
+    /// **Goes through [`crate::admin::GenericAdminHost`], not `node`'s bare
+    /// `ClientCtx` directly** (ADR 0061 rung H, C-08 PR 2 rework): the
+    /// concrete `impl AdminHost for ClientCtx` is production's own impl,
+    /// whose `action_data_dynamo` reaches the full, unmodified
+    /// `crate::dynamo::execute_routed` — a `ClientCtx<SimEnv, ..>` can
+    /// never satisfy that concrete impl at all, so this fixture reaches
+    /// `AdminHost` only through the generic sibling, whose own
+    /// `action_data_dynamo` goes through `execute_routed_as_generic`
+    /// instead (whatever `dispatch_item_op` covers) — see that struct's own
+    /// doc, and `docs/engineering-lessons.md`'s matching 2026-09-08 entry,
+    /// for why the two must stay genuinely separate.
+    pub(crate) async fn admin(
+        &self,
+        node: u64,
+        method: &str,
+        path: &str,
+        query: &str,
+        body: &[u8],
+    ) -> (u16, String) {
+        let ctx = self.ctx(node);
+        let host = crate::admin::GenericAdminHost(ctx);
+        animus_node::admin::dispatch(&host, method, path, query, body).await
+    }
+
+    /// Run a console HTTP request (`/console/api/*`/`/console/ui/*`)
+    /// against `node`'s own `ClientCtx`, through the exact same
+    /// `animus_node::console::route` production's console TCP listener
+    /// calls (ADR 0061 rung H, C-08 PR 2). Builds a minimal
+    /// [`crate::http::HttpRequest`] itself (`target`/`headers`/
+    /// `keep_alive` are unused by `route`'s own JSON-API paths — this
+    /// fixture never exercises the shell/CORS-preflight machinery
+    /// `console.rs::handle_conn` layers in front of `route`, mirroring
+    /// [`SimClusterHandle::admin`]'s own "no framing to build" note
+    /// above) and passes `""` for the HTML/CSS/JS shell content `route`'s
+    /// static-asset arms would otherwise serve — this fixture has no
+    /// reason to duplicate `console.rs`'s own `include_str!`'d assets, and
+    /// every scenario this primitive backs exercises the JSON API, never
+    /// a shell/static-asset path. `tables` is built fresh on every call
+    /// from this node's own live `effective_metadata()` (via the same
+    /// `console_table_summaries` production's own `spawn_common_tail`
+    /// closure calls) — never a snapshot taken once at construction, per
+    /// this crate's own accessor-staleness discipline (C-06 PR 4
+    /// appendix's Finding A, `docs/engineering-lessons.md`).
+    ///
+    /// **Goes through [`crate::GenericConsoleBackend`], not `node`'s bare
+    /// `ClientCtx` directly** — the identical reasoning
+    /// [`SimClusterHandle::admin`] states for `GenericAdminHost` just
+    /// above: the concrete `impl ConsoleBackend for ClientCtx` is
+    /// production's own, unreachable for a `ClientCtx<SimEnv, ..>`, so
+    /// `add_gsi`/`drop_gsi` here return whatever the generic dispatch's own
+    /// blocker-(d) gap produces (an `UpdateTable` index change has no
+    /// `dispatch_table_op` sub-arm) — a real, documented residual, not a
+    /// bug — while every other mutation reaches the identical DynamoDB wire
+    /// operation production does.
+    pub(crate) async fn console(
+        &self,
+        node: u64,
+        method: &str,
+        path: &str,
+        query: &str,
+        body: &[u8],
+    ) -> (u16, &'static str, String) {
+        let ctx = self.ctx(node);
+        let request = crate::http::HttpRequest {
+            method: method.to_string(),
+            path: path.to_string(),
+            query: query.to_string(),
+            target: String::new(),
+            headers: BTreeMap::new(),
+            body: body.to_vec(),
+            keep_alive: false,
+        };
+        let table_ctx = ctx.clone();
+        let tables: crate::console::TableSnapshotFn =
+            Arc::new(move || crate::console_table_summaries(&table_ctx.effective_metadata()));
+        let backend = crate::GenericConsoleBackend(ctx);
+        animus_node::console::route(&request, &tables, &backend, "", "", "").await
+    }
+
     /// Stage a **fresh anchor** transaction writing `value` at `key` on
     /// `table`, retrying through a decided-but-still-unresolved blocker via
     /// `push_resolution_if_decided` exactly like production — issue #734's
@@ -2276,6 +2371,69 @@ impl SimCluster {
         })
     }
 
+    /// Run an admin HTTP-JSON request against `node`'s own `ClientCtx` (ADR
+    /// 0061 rung H, C-08 PR 2) — [`SimClusterHandle::admin`]'s synchronous
+    /// sibling, driven from a test's own `&mut self` call exactly like
+    /// [`SimCluster::dynamo`] above (never panics on a timeout; returns a
+    /// synthetic `500`/timeout-message body instead).
+    pub(crate) fn admin(
+        &mut self,
+        node: u64,
+        method: &str,
+        path: &str,
+        query: &str,
+        body: &[u8],
+    ) -> (u16, String) {
+        let handle = self.shared.clone();
+        let (method, path, query, body) = (
+            method.to_owned(),
+            path.to_owned(),
+            query.to_owned(),
+            body.to_vec(),
+        );
+        self.spawn_and_capture(node, async move {
+            handle.admin(node, &method, &path, &query, &body).await
+        })
+        .unwrap_or_else(|| {
+            (
+                500,
+                format!("admin request on node {node} did not complete within {OP_BUDGET:?}"),
+            )
+        })
+    }
+
+    /// Run a console HTTP request against `node`'s own `ClientCtx` (ADR
+    /// 0061 rung H, C-08 PR 2) — [`SimClusterHandle::console`]'s
+    /// synchronous sibling, driven from a test's own `&mut self` call
+    /// exactly like [`SimCluster::admin`] above (never panics on a
+    /// timeout; returns a synthetic `500`/timeout-message body instead).
+    pub(crate) fn console(
+        &mut self,
+        node: u64,
+        method: &str,
+        path: &str,
+        query: &str,
+        body: &[u8],
+    ) -> (u16, &'static str, String) {
+        let handle = self.shared.clone();
+        let (method, path, query, body) = (
+            method.to_owned(),
+            path.to_owned(),
+            query.to_owned(),
+            body.to_vec(),
+        );
+        self.spawn_and_capture(node, async move {
+            handle.console(node, &method, &path, &query, &body).await
+        })
+        .unwrap_or_else(|| {
+            (
+                500,
+                "application/json",
+                format!("console request on node {node} did not complete within {OP_BUDGET:?}"),
+            )
+        })
+    }
+
     /// [`SimClusterHandle::txn_prepare_pushing`], driven from a test's own
     /// `&mut self` call exactly like [`SimCluster::put`] above.
     pub(crate) fn txn_prepare_pushing(
@@ -3686,6 +3844,62 @@ mod tests {
                  dropped"
             );
         }
+    }
+
+    /// ADR 0061 rung H (C-08 PR 2) groundwork smoke: `SimCluster::admin`
+    /// actually reaches `animus_node::admin::dispatch` against a real
+    /// `SimCluster` node and reports live replicated state — the bigger
+    /// admin scenario files (pure observers, mutating actions) are PRs
+    /// 5-6's own scope, per this rung's plan; this is only proof the new
+    /// primitive itself works end to end.
+    #[test]
+    fn admin_status_is_reachable_from_sim_cluster() {
+        let mut cluster = SimCluster::new(0x4841_0001, 3, 3);
+        cluster.create_table("orders");
+
+        let (status, body) = cluster.admin(0, "GET", "/admin/status", "", &[]);
+        assert_eq!(status, 200, "body: {body}");
+        let value: serde_json::Value =
+            serde_json::from_str(&body).unwrap_or_else(|e| panic!("malformed JSON: {e}\n{body}"));
+        assert!(
+            value["schemas"]["tables"].get("orders").is_some(),
+            "/admin/status must report the table this scenario just created: {value}"
+        );
+
+        // `/admin/live` is the unconditional-200 liveness probe (issue
+        // #710) — a second, even-cheaper reachability proof from a
+        // different node.
+        let (status, body) = cluster.admin(1, "GET", "/admin/live", "", &[]);
+        assert_eq!(status, 200, "body: {body}");
+    }
+
+    /// ADR 0061 rung H (C-08 PR 2) groundwork smoke: `SimCluster::console`
+    /// actually reaches `animus_node::console::route` against a real
+    /// `SimCluster` node and its own `TableSnapshotFn`/`ConsoleBackend`
+    /// closures built off live replicated state — the bigger console
+    /// scenario file (`sim_cluster_console.rs`) is PR 3's own scope; this
+    /// is only proof the new primitive itself works end to end.
+    #[test]
+    fn console_tables_lists_a_created_table() {
+        let mut cluster = SimCluster::new(0x434F_0001, 3, 3);
+        cluster.create_table("orders");
+
+        let (status, content_type, body) =
+            cluster.console(0, "GET", "/console/api/tables", "", &[]);
+        assert_eq!(status, 200, "body: {body}");
+        assert_eq!(content_type, "application/json");
+        let value: serde_json::Value =
+            serde_json::from_str(&body).unwrap_or_else(|e| panic!("malformed JSON: {e}\n{body}"));
+        let names: Vec<&str> = value["tables"]
+            .as_array()
+            .unwrap_or_else(|| panic!("`tables` must be an array: {value}"))
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        assert!(
+            names.contains(&"orders"),
+            "the console tables list must include the table this scenario just created: {value}"
+        );
     }
 
     impl SimCluster {

@@ -6612,9 +6612,12 @@ ignored at the sim tier after PR 5, no leak trajectory — see ADR 0061's
 
 **C-08 (open)** — admin/console/dashboard HTTP, the group C-07's own
 close-out named next in line, is opened 2026-09-08 (ADR 0061's "Rung H"
-amendment, `docs/roadmap.md`'s C-08 entry). PR 1 (this docs opener) has
-landed; PRs 2-8 are not yet done. The ten files now owned by this rung:
-`admin_endpoint.rs`, `dashboard_endpoint.rs`, `console_endpoint.rs`,
+amendment, `docs/roadmap.md`'s C-08 entry). PR 1 (this docs opener) and PR
+2 (groundwork, corrected the same day in review — see this file's own
+appendix, below, for the full account, including the `GenericAdminHost`/
+`GenericConsoleBackend` newtype fix) have landed; PRs 3-8 are not yet
+done. The ten files now owned by this
+rung: `admin_endpoint.rs`, `dashboard_endpoint.rs`, `console_endpoint.rs`,
 `console_create_table.rs`, `console_items.rs`, `console_stream.rs`,
 `console_table_config.rs`, `console_tables.rs`, `metrics_endpoint.rs`,
 `system_table.rs` (67 tests total, per an exact recount — see that
@@ -8390,3 +8393,184 @@ behind #298/#745. See ADR 0061's "Rung G closed" amendment for the full
 PR-by-PR account, the complete per-test `ProdEnv` residue with reasons,
 and the two in-scope findings (the `seal_now` real-clock body bug fixed
 in PR 2, the `OP_BUDGET`-vs-retention timing lesson from PR 5).
+
+## Appendix — admin/console `SimCluster` dispatch groundwork (ADR 0061 rung H, C-08 PR 2, 2026-09-08, corrected same day in review)
+
+`impl AdminHost for ClientCtx` (`admin.rs`, 43 handler functions — the
+exact count once `config_view` through `action_revoke_credential` were
+all enumerated, not the opener's own "~30" estimate) and `impl
+console::ConsoleBackend for ClientCtx` (`lib.rs`, 14 methods) both needed
+a `<E: Env, R: RelayClient>`-generic sibling reachable from `SimCluster`.
+Blockers (a) (the three credential handlers' `tokio::time::Instant::
+now()`/`sleep` commit-wait loops) and (b) (`action_data_seed`'s retry
+sleep) converted to `ctx.env.now()`/`ctx.env.sleep(..)`, mirroring
+`disable_stream`'s own precedent. `dynamo.rs::execute_routed_as_generic
+<E: Env, R: RelayClient>` (blocker (c)) forks on the `X-Amz-Target`
+prefix exactly like the concrete `execute_routed_as`, to `execute_item_
+op_as`/`dynamo_streams::execute_streams_op_as`. `SimCluster::admin`/
+`console` (`sim_cluster.rs`) call `animus_node::admin::dispatch`/
+`animus_node::console::route` directly — no HTTP framing to build —
+mirroring `SimClusterHandle::dynamo`'s own shape; two pinned-seed smoke
+tests (`admin_status_is_reachable_from_sim_cluster`, `console_tables_
+lists_a_created_table`) prove both reach live replicated state end to
+end.
+
+**A real production regression found by this rung's own required gate,
+not by inspection.** A first cut widened `impl AdminHost for ClientCtx`/
+`impl ConsoleBackend for ClientCtx` **in place** to `<E: Env, R:
+RelayClient>` — the same shape every prior D2/D3/D4/F/G rung used for a
+*free function*. Once `action_data_dynamo`/`add_gsi`/`drop_gsi`'s shared
+body was forced to call the narrower `execute_routed_as_generic` (the
+only way a `<E, R>`-generic body compiles at all), the untrimmed `admin_
+endpoint.rs`/`console_create_table.rs`/`console_table_config.rs`/
+`dashboard_endpoint.rs` suites turned up nine real failures:
+`UpdateTimeToLive`/`CreateBackup`/`DeleteBackup` and `UpdateTable`-with-
+an-index-change are all reachable through `/admin/data/dynamo` and the
+console's own mutating endpoints, and none of the three was in
+`dispatch_item_op`'s coverage — a genuine regression in shipped
+functionality, not a `SimCluster`-only gap, since widening a *blanket
+impl on `ClientCtx` itself* (production's own default-instantiated
+concrete type) doesn't add a parallel path the way widening a free
+function does — it replaces the only implementation `ClientCtx` has, for
+every caller including production's own. See `docs/engineering-
+lessons.md`'s two matching 2026-09-08 entries (the second rewritten in
+review, see below) for the full diagnosis and the general lesson.
+
+**Six of the nine closed correctly, by genuinely widening the underlying
+operations**: `update_time_to_live`/`create_backup`/`delete_backup`
+(`dynamo.rs`) had no `tokio::spawn` blocking them — only the identical
+`tokio::time` → `ctx.env` conversion this whole series already does
+mechanically — so widening all three to `<E: Env, R: RelayClient>` and
+adding three new `Operation::UpdateTimeToLive`/`CreateBackup`/
+`DeleteBackup` arms to `dispatch_item_op` was the correct fix, not a
+workaround; `run_operation`'s own arms for all three are byte-for-byte
+unchanged, confirmed by the untrimmed real-socket suites for backup/TTL
+staying green throughout. This half of the PR was never revisited by the
+review correction below.
+
+**The remaining two (`console_table_config.rs`'s `add_gsi_records_a_
+declared_attribute_type`/`add_and_drop_gsi_round_trip`) are genuinely
+blocker (d)** — `UpdateTable` with an index change has no `dispatch_
+table_op` sub-arm, and closing that for real needs the GSI backfill
+machinery generalized too, out of this PR's scope exactly as the opener
+named it. **The PR's own first fix for this compounded the original
+mistake rather than correcting it**: since Rust's coherence rules forbid
+a second `impl ConsoleBackend for ClientCtx` alongside the now-widened
+generic one, and `route`'s own `&dyn ConsoleBackend` trait-object
+dispatch has no inherent-method-priority escape hatch, the first attempt
+added a concrete interception layer inside `console.rs::serve`/
+`handle_conn` — special-casing the two GSI routes ahead of `route`'s own
+dispatch, routing them to new concrete-only functions that called the
+unmodified `execute_routed`. This compiled and passed every test, and was
+still wrong: `serve`/`handle_conn` sit directly upstream of `route` in
+the same production console path, so threading a concrete `ClientCtx`
+into their signatures and duplicating `animus_node::console`'s own
+route-parsing logic was itself a change to the production console path —
+exactly what this rung's own non-goals forbid, one file removed from the
+trait impl itself.
+
+**Corrected in review**: `impl AdminHost for ClientCtx`/`impl
+console::ConsoleBackend for ClientCtx` are reverted to concrete —
+production, observably byte-identical to before this rung, every
+dispatch call site the concrete `execute_routed`/`execute_routed_as`. A
+new one-field newtype pair, `GenericAdminHost<E, R>(pub ClientCtx<E,
+R>)`/`GenericConsoleBackend<E, R>(pub ClientCtx<E, R>)` (`admin.rs`/
+`lib.rs`), carries its own separate `impl<E: Env, R: RelayClient> Trait
+for Generic*<E, R>` reaching the generic dispatch instead — coherence
+allows this because the two impls target genuinely different types, even
+though one always wraps the other. `SimCluster::admin`/`console`
+(`sim_cluster.rs`) wrap `self.ctx(node)` in the newtype before calling
+`animus_node::admin::dispatch`/`console::route`; production's own
+`spawn_common_tail` is unaware the newtype exists at all. `console.rs`
+reverted to byte-identical with `git checkout HEAD~1 --
+crates/animusd/src/console.rs` — `git diff` against that baseline is
+empty; `console_add_gsi_concrete`/`console_drop_gsi_concrete` (the
+now-dead concrete-interception functions) were deleted from `lib.rs`
+along with the `spawn_common_tail` call site's extra `ctx.clone()`
+argument `console::serve` never needed. Both `Generic*` impls share every
+byte of request-building/response-parsing logic with their concrete
+siblings (small `<E, R>`-generic or plain free functions, called via
+`self`/`&self.0`) — only the dispatch-call line differs — so the two
+paths cannot drift apart; `add_gsi`/`drop_gsi` on `GenericConsoleBackend`
+return blocker (d)'s own `unsupported_by_generic_dispatch` error
+naturally, via the unmodified `execute_routed_as_generic` →
+`dispatch_table_op` fallthrough, needing no bespoke handling.
+`dispatch_table_op`/`execute_item_op_as`/`execute_routed_as_generic`
+(`dynamo.rs`) and the generic `action_data_dynamo` (`admin.rs`) —
+reachable only through the two `Generic*` types, themselves constructed
+only by `SimCluster::admin`/`console` — regained the `#[cfg_attr(not
+(test), allow(dead_code))]` treatment they carried before this rung ever
+gave them a real (if mistaken) production caller, mirroring
+`execute_statement_as`'s own precedent for the identical shape.
+
+**`admin.rs::action_data_dynamo` needed the identical newtype split, not
+a narrower fix** — Finding A's own widening closed every *coverage* gap
+`/admin/data/dynamo`'s own tests exercise, but the concrete `impl
+AdminHost for ClientCtx`'s `action_data_dynamo` method still needed to
+keep calling the full, unmodified `execute_routed` (via a new
+concrete-only sibling, `action_data_dynamo_concrete`) rather than
+`execute_routed_as_generic` — the identical reasoning as `ConsoleBackend`'s
+own `add_gsi`/`drop_gsi`, since `/admin/data/dynamo` can be asked to run
+**any** DynamoDB operation, not just the six Finding A widened.
+
+**Non-goals held throughout, verified via `git diff`, not merely
+asserted**: `animus_node::admin::dispatch`, `animus_node::console::route`,
+`execute_routed`, `execute_routed_as`, and `execute_as` are byte-identical
+— zero changed lines inside any of the three `dynamo.rs` function bodies
+(only `execute_routed`'s own doc comment changed, describing its actual
+remaining callers), and `crates/animus-node/` has no changes in this PR's
+diff at all — confirmed both before and after the review correction.
+`crates/animusd/src/console.rs` is byte-identical to this rung's own
+starting point. `dynamo.rs::dispatch` (the real DynamoDB wire listener) is
+untouched and still calls `execute_routed_as` directly — `execute_routed_
+as_generic` never becomes its path.
+
+**The first cut's own gate report also cited an unverified flake
+attribution, corrected here.** A single transient failure of
+`admin_backups_view_reflects_the_catalog` (observed once, immediately
+after a `cargo build`) was attributed to "this crate's own documented
+sandbox-contention flake class for `admin_endpoint.rs`, issue #585's
+entries" — a citation that was never actually checked: `grep -n 585
+crates/animusd/tests/admin_endpoint.rs` finds nothing. The failing run's
+own output was not preserved and cannot be reproduced from this vantage
+point. Post-correction, that one test was run 6 times total across two
+full gate passes plus a dedicated 3x check and passed every time — see
+the Gates line below. Treat this as an unattributed, unreproduced single
+transient failure, not a known flake; a future recurrence should be
+filed as its own issue with the full assertion output and seed, not
+folded into a prior, unverified citation.
+
+**Gates, in the required order, all foreground, run against the
+corrected (newtype) code**: `cargo build -p animusd --all-targets`
+(clean, no warnings — the six `dead_code` warnings the first cut's own
+build had not surfaced, closed by restoring the `#[cfg_attr(not(test),
+allow(dead_code))]` attributes named above); `cargo test -p animusd
+--test admin_endpoint --test console_endpoint --test dashboard_endpoint
+--test console_tables --test console_create_table --test console_items
+--test console_stream --test console_table_config --test metrics_endpoint
+--test system_table` (67 passed, 0 failed, run twice post-correction,
+both clean — the 22-file untrimmed-suite discipline this rung's own
+design already required); `admin_backups_view_reflects_the_catalog`
+alone, 3 consecutive runs, 3/3 passed, run twice (6/6 total); `cargo test
+-p animusd --lib sim_cluster -- --test-threads=2` (317 passed, 0 failed,
+2 ignored, run twice post-correction — 900.80s and 904.10s;
+anchored-sampler RSS first ~62-111 MB, peak ~826-862 MB, last ~128-132 MB
+across the two runs, consistent with every prior rung's own no-leak
+trajectory); `cargo fmt --all --check` (clean); `cargo clippy -p animusd
+--all-targets --all-features -- -D warnings` (clean). `Cargo.lock`
+unchanged throughout. `git diff --stat` against the pre-PR-2 baseline: 5
+files changed (`admin.rs`, `console.rs` — net zero, reverted to the
+identical content — `dynamo.rs`, `lib.rs`, `sim_cluster.rs`).
+
+See ADR 0061's "Rung H, PR 2 landed" amendment (now the corrected
+account) and `docs/roadmap.md`'s C-08 entry for the full record;
+`docs/engineering-lessons.md`'s two matching 2026-09-08 entries for the
+general lessons — why a trait-forced dispatch widening's coverage gap is
+not automatically confined to `SimCluster` when the caller being widened
+is a general-purpose proxy rather than the primary wire edge, and why a
+**blanket generic `impl Trait for ClientCtx<E, R>`** is a materially
+different move than widening a free function: it silently replaces
+production's own concrete implementation rather than adding a parallel
+path, and the fix is a newtype wrapper carrying its own separate impl —
+never an edit inside the off-limits dispatcher's own call chain, however
+"thin" or "logic-free" that edit looks.
