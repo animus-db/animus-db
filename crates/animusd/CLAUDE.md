@@ -8110,3 +8110,100 @@ test binary's own `/proc/<pid>/status` `VmRSS` via the anchored `pgrep -f
 passed, 0 failed, 14.71s — the real-socket regression proving
 `execute_as`/`run_operation`'s concrete path stayed byte-identical).
 `Cargo.lock` unchanged.
+
+## Appendix — `tests/dynamo_streams.rs` siblings (ADR 0061 rung G, C-07 PR 4, 2026-09-08)
+
+Closes the plan's own PR 4 scope: every sim-convertible test in
+`tests/dynamo_streams.rs` now has a deterministic sibling in
+`crates/animusd/src/sim_cluster_dynamo_streams.rs`, and that real-socket
+file is trimmed to exactly the tests that must stay `ProdEnv` — mirroring
+D3 PR 3b's own precedent for `dynamo_query_filter.rs` and friends. **No
+`dynamo.rs`/`dynamo_streams.rs`/`sim_cluster.rs` change was needed** — PR 2
+(the dispatch groundwork: `dispatch_table_op`'s stream sub-arm,
+`SimCluster::drive_stream_seal`) and PR 3 (`execute_streams_op_as`, the
+Streams read API) already built every primitive this PR reuses; PR 4 is
+pure test authorship.
+
+**Test-by-test disposition (12 converted, 3 kept `ProdEnv`)**:
+
+| Real-socket test | Disposition |
+|---|---|
+| `set_table_stream_enable_propagates_and_survives_restart` | **KEPT** — real control-plane WAL restart (ADR 0038's durable mirror); `SimCluster` never crosses a genuine process restart with a real on-disk WAL |
+| `disable_survives_concurrent_periodic_seal_on_local_route` | **KEPT** — races the real periodic `change_consumer_loop`'s own timer-driven seal arm (issue #572); `SimCluster` never spawns that loop, sealing there is always test-driven via `drive_stream_seal` |
+| `bare_stream_hot_read_is_refused` | **KEPT** — the production `Surface::Intra` port guard; `SimCluster`'s relay dispatch has no port concept to reproduce it against (PR 3's own doc already stated this — PR 4 changed nothing here) |
+| `update_table_stream_enable_and_disable_through_every_node` | Converted → `run_update_table_stream_enable_and_disable_through_every_node` (new scenario) |
+| `describe_table_returns_stream_spec_and_arn_reenable_mints_new_label` | Converted → `run_describe_table_returns_stream_spec_and_arn_reenable_mints_new_label` (new scenario) |
+| `transact_write_items_on_a_streamed_table_delivers_correct_events` | Converted → `run_transact_write_items_on_a_streamed_table_delivers_correct_events` (new scenario, reuses the C-06 PR 3 Transact dispatch) |
+| `transact_write_items_abort_leaves_no_stream_event` | Converted → `run_transact_write_items_abort_leaves_no_stream_event` (new scenario) |
+| `get_records_walks_the_shard_chain_and_drains_the_open_tail` | Converted → `run_get_records_walks_the_shard_chain_and_drains_the_open_tail` (new scenario, two `drive_stream_seal` calls stand in for `tiny_seal_knobs`) |
+| `open_shard_iterator_survives_a_seal_and_keeps_working` | Converted, **not duplicated** — identical in kind to PR 3's own scenario (d), `iterator_obtained_before_a_seal_continues_correctly_across_the_seal` |
+| `limit_pagination_drains_a_sealed_shard_exactly_once` | Converted, **not duplicated** — identical in kind to PR 3's own scenario (e), `next_shard_iterator_pagination_with_small_limit_visits_each_record_once` |
+| `get_records_on_a_sealed_shard_works_from_every_node` | Converted, **not duplicated** — identical in kind to PR 3's own scenario (g), `cross_node_reads_answer_the_same_records_for_the_same_iterator` |
+| `get_records_on_an_open_shard_forwards_correctly_from_every_node` | Converted → `run_get_records_on_an_open_shard_forwards_correctly_from_every_node` (new scenario — PR 3 had no every-node OPEN-shard read) |
+| `disabled_stream_grace_window_lists_and_serves_sealed_reads_with_no_open_shard` | Converted, **not duplicated** — identical in kind to PR 3's own scenario (h), `disable_then_grace_window_describe_and_get_records` |
+| `pre_enable_marker_records_never_surface_on_the_stream` | Converted → `run_pre_enable_marker_records_never_surface_on_the_stream` (new scenario) |
+| `stream_keys_carry_n_sort_key_values_across_mixed_magnitudes_and_signs` | Converted → `run_stream_keys_carry_n_sort_key_values_across_mixed_magnitudes_and_signs` (new scenario) |
+
+For each of the four "not duplicated" rows, every assertion the real-socket
+original makes was checked line-by-line against its PR 3 counterpart before
+relying on it (same shard-count/open-vs-sealed shape, same event/iterator-
+exhaustion assertions, same grace-window `ListStreams`/`DescribeStream`/
+bogus-ARN behavior) — `sim_cluster_dynamo_streams.rs`'s own module doc has
+the full cross-reference. The eight new scenarios were each written to
+carry every assertion its real-socket original made, adapted to this
+fixture's own idiom (a `_over_seeds` sibling at 5 seeds, issued from a
+non-leader node wherever the operation has a leader to forward to, every
+verifying read asking for `ConsistentRead: true`).
+
+**Knobs → `drive_stream_seal` mapping (stated once here, and in the sim
+module's own doc)**: the real-socket file's `tiny_seal_knobs`/
+`age_seal_knobs`/`never_seals_knobs` steer the *periodic* seal arm
+(`change_consumer_loop`'s `seal_tick`), which `SimCluster` never spawns at
+all (PR 2's own finding). A converted scenario instead calls
+`SimCluster::drive_stream_seal(leader)` explicitly, which seals whatever is
+currently pending into one epoch, unconditionally (trigger-free — the
+caller decides *whether*, the function only knows *how*): a scenario that
+relied on `tiny_seal_knobs`'s "seal almost immediately" to produce a chain
+of several small closed shards calls `drive_stream_seal` once per desired
+shard; one that relied on `never_seals_knobs`'s "don't race the periodic
+arm" simply never calls it; one that relied on `age_seal_knobs`'s "sweep
+the whole backlog together" gets the identical shape for free from a
+single `drive_stream_seal` call over the whole pending backlog (already
+proven by PR 3's own scenario (e), hence no new scenario needed for
+`limit_pagination_drains_a_sealed_shard_exactly_once`).
+
+**`Transact` reuses the C-06 PR 3 dispatch unmodified** — `Operation::
+TransactWriteItems` already routes through `dispatch_item_op` (generic
+since C-06 PR 2/3), so `run_transact_write_items_on_a_streamed_table_
+delivers_correct_events`/`_abort_leaves_no_stream_event` needed no new
+`dynamo.rs` mechanism, only the wire JSON bodies and the existing
+`describe_stream_via_wire`/`get_shard_iterator_via_wire`/
+`get_records_via_wire` helpers from PR 3. Both scenarios prove the change
+record materializes on the OPEN-tail read path with no seal needed — a
+streamed table's transactional write resolves before `cp_txn` acks (ADR
+0046 A1), so the record is already visible.
+
+**Before/after `--test dynamo_streams` counts**: 15 passed (untrimmed, the
+D3 discipline — proved green against this branch before removing anything)
+→ 3 passed (trimmed). `cargo test -p animusd --lib sim_cluster_dynamo_
+streams -- --test-threads=2`: 34 passed (18 from PR 2/3 + 16 new from this
+PR — 8 scenarios × {pinned seed, `_over_seeds`}).
+
+**No product bug found.** Every converted scenario passed at its pinned
+seed and every `_over_seeds` seed on the first clean run once the wire
+JSON shapes matched the fixtures already established by this module's
+earlier PRs.
+
+**Gates, in the required order**: `cargo test -p animusd --test dynamo_
+streams` on the untrimmed file (15 passed, 14.44s); `cargo test -p animusd
+--lib sim_cluster_dynamo_streams -- --test-threads=2` (34 passed, 86.92s);
+trim, then `cargo test -p animusd --test dynamo_streams` again (3 passed,
+14.11s); `cargo fmt --all --check` (one auto-fix applied, then clean);
+`cargo clippy -p animusd --all-targets --all-features -- -D warnings`
+(clean); `cargo build -p animusd --all-targets` (clean); `cargo test -p
+animusd --lib -- --test-threads=2` (472 passed, 0 failed, 3 ignored,
+901.75s — 456 baseline + this PR's 16 new tests; resident memory sampled
+every 10s from the test binary's own `/proc/<pid>/status` `VmRSS` via the
+anchored `pgrep -f '^<abs-path>/target/debug/deps/animusd-'` pattern:
+first ~129 MB, peak ~902 MB, last ~180 MB — consistent with PR 3's own
+figures). `Cargo.lock` unchanged.

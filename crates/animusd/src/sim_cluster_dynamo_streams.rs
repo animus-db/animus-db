@@ -182,6 +182,76 @@
 //!
 //! Replays (repo convention): `ANIMUS_SEED=<seed> cargo test -p animusd
 //! --lib list_streams_and_describe_stream_after_enable`.
+//!
+//! ## ADR 0061 rung G, C-07 PR 4: `tests/dynamo_streams.rs` siblings
+//!
+//! Gives every sim-convertible test in `tests/dynamo_streams.rs` a
+//! deterministic sibling here, then trims that file to the 3 tests that
+//! genuinely need `ProdEnv` (see that file's own updated doc comment for
+//! which and why). No `dynamo.rs`/`dynamo_streams.rs`/`sim_cluster.rs`
+//! change was needed — PR 2/3 already built every dispatch/fixture
+//! primitive this PR reuses (`dispatch_table_op`'s stream sub-arm,
+//! `execute_streams_op_as`, `SimCluster::drive_stream_seal`, the C-06 PR 3
+//! Transact dispatch through `dispatch_item_op`).
+//!
+//! **Four of the twelve converted tests are already proven by PR 3's own
+//! scenarios above, in kind — not duplicated here, only cross-referenced**:
+//! `open_shard_iterator_survives_a_seal_and_keeps_working` is scenario (d)
+//! (`iterator_obtained_before_a_seal_continues_correctly_across_the_seal`);
+//! `limit_pagination_drains_a_sealed_shard_exactly_once` is scenario (e)
+//! (`next_shard_iterator_pagination_with_small_limit_visits_each_record_once`);
+//! `get_records_on_a_sealed_shard_works_from_every_node` is scenario (g)
+//! (`cross_node_reads_answer_the_same_records_for_the_same_iterator`); and
+//! `disabled_stream_grace_window_lists_and_serves_sealed_reads_with_no_open_shard`
+//! is scenario (h) (`disable_then_grace_window_describe_and_get_records`).
+//! Each real-socket original's own assertions were checked line-by-line
+//! against its PR 3 counterpart before relying on this: same shard-count/
+//! open-vs-sealed shape, same event/iterator-exhaustion assertions, same
+//! grace-window `ListStreams`/`DescribeStream`/bogus-ARN behavior.
+//!
+//! **The remaining eight get a new scenario each, all below**:
+//! [`run_update_table_stream_enable_and_disable_through_every_node`],
+//! [`run_describe_table_returns_stream_spec_and_arn_reenable_mints_new_label`],
+//! [`run_transact_write_items_on_a_streamed_table_delivers_correct_events`],
+//! [`run_transact_write_items_abort_leaves_no_stream_event`],
+//! [`run_get_records_walks_the_shard_chain_and_drains_the_open_tail`],
+//! [`run_get_records_on_an_open_shard_forwards_correctly_from_every_node`],
+//! [`run_pre_enable_marker_records_never_surface_on_the_stream`], and
+//! [`run_stream_keys_carry_n_sort_key_values_across_mixed_magnitudes_and_signs`].
+//! The two Transact scenarios reuse the C-06 PR 3 dispatch
+//! (`Operation::TransactWriteItems` through `dispatch_item_op`, unchanged by
+//! this PR) rather than any Streams-specific mechanism — a streamed table's
+//! transactional write materializes its change record through the ordinary
+//! `TxnResolve` path, so no `seal` is needed to observe it (the open-tail
+//! serve path already reads it).
+//!
+//! **The `tiny_seal_knobs`/`age_seal_knobs`/`never_seals_knobs` real-socket
+//! knobs have no sim analogue and need none**: this fixture never spawns
+//! `index_drain::change_consumer_loop`'s periodic seal arm at all (PR 2's
+//! own doc), so a table's tablet simply stays open — with everything still
+//! pending in the hot tail — until a scenario explicitly calls
+//! [`SimCluster::drive_stream_seal`]. A real-socket scenario that relied on
+//! `tiny_seal_knobs`'s "seal almost immediately" behavior to produce a chain
+//! of several small closed shards instead calls `drive_stream_seal` once per
+//! desired shard (see
+//! [`run_get_records_walks_the_shard_chain_and_drains_the_open_tail`]); one
+//! that relied on `never_seals_knobs`'s "don't race the periodic arm" simply
+//! never calls it at all (see
+//! [`run_stream_keys_carry_n_sort_key_values_across_mixed_magnitudes_and_signs`]);
+//! and one that relied on `age_seal_knobs`'s "sweep the whole backlog
+//! together once the age trigger elapses" gets the identical shape for free
+//! from `drive_stream_seal`'s own unconditional "seal everything currently
+//! pending" behavior, called once (see
+//! [`run_next_shard_iterator_pagination_with_small_limit_visits_each_record_once`]
+//! above, PR 3's own scenario (e), which this PR's own converted sibling of
+//! the same real-socket test needed no new scenario for — see the
+//! already-covered list above).
+//!
+//! Every scenario below is issued from a **non-leader** node wherever the
+//! operation has a leader to forward to, matching every sibling scenario
+//! above; every read that verifies a write asks for `ConsistentRead: true`
+//! (ADR 0055). Replays (repo convention): `ANIMUS_SEED=<seed> cargo test -p
+//! animusd --lib update_table_stream_enable_and_disable_through_every_node`.
 
 use super::sim_cluster::SimCluster;
 
@@ -1230,5 +1300,900 @@ fn disable_then_grace_window_describe_and_get_records() {
 fn disable_then_grace_window_describe_and_get_records_over_seeds() {
     for i in 0..5 {
         run_disable_then_grace_window_describe_and_get_records(0xC07E_9100 + i);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// C-07 PR 4: `tests/dynamo_streams.rs` siblings (see this module's own doc
+// for the full mapping, including the four tests already proven by PR 3's
+// own scenarios above).
+// ---------------------------------------------------------------------------
+
+/// The stream label currently recorded for `table` on `node`'s own replica
+/// of the catalog — panics if none, the same shape every other lookup
+/// helper in this module uses.
+fn stream_label(cluster: &SimCluster, node: u64, table: &str) -> String {
+    cluster
+        .metadata(node)
+        .table_stream(table)
+        .map(|s| s.label.clone())
+        .unwrap_or_else(|| panic!("no stream label recorded for `{table}` on node {node}"))
+}
+
+/// `CreateTable` for a plain single-key (`pk`, string) table with a declared
+/// `StreamSpecification` (`dispatch_table_op`'s `CreateTable` arm has
+/// accepted one unconditionally since PR 2) — the sibling of this module's
+/// own [`create_table`] plus [`enable_stream_via_wire`] in one call, needed
+/// wherever a scenario wants the very first write already covered by a
+/// stream.
+fn create_table_with_stream(
+    cluster: &mut SimCluster,
+    node: u64,
+    table: &str,
+    view_type: &str,
+) -> (u16, String) {
+    let body = format!(
+        r#"{{"TableName":"{table}",
+            "KeySchema":[{{"AttributeName":"pk","KeyType":"HASH"}}],
+            "AttributeDefinitions":[{{"AttributeName":"pk","AttributeType":"S"}}],
+            "StreamSpecification":{{"StreamEnabled":true,"StreamViewType":"{view_type}"}}}}"#
+    );
+    cluster.dynamo(node, "DynamoDB_20120810.CreateTable", body.as_bytes())
+}
+
+/// `CreateTable` for a composite `(pk: S, sk: N)` table with a declared
+/// stream — the fixture for
+/// [`run_stream_keys_carry_n_sort_key_values_across_mixed_magnitudes_and_signs`].
+fn create_table_composite_n_sort_key(
+    cluster: &mut SimCluster,
+    node: u64,
+    table: &str,
+) -> (u16, String) {
+    let body = format!(
+        r#"{{"TableName":"{table}",
+            "KeySchema":[{{"AttributeName":"pk","KeyType":"HASH"}},
+                         {{"AttributeName":"sk","KeyType":"RANGE"}}],
+            "AttributeDefinitions":[{{"AttributeName":"pk","AttributeType":"S"}},
+                                     {{"AttributeName":"sk","AttributeType":"N"}}],
+            "StreamSpecification":{{"StreamEnabled":true,
+                "StreamViewType":"NEW_AND_OLD_IMAGES"}}}}"#
+    );
+    cluster.dynamo(node, "DynamoDB_20120810.CreateTable", body.as_bytes())
+}
+
+fn put_item_n_sort(
+    cluster: &mut SimCluster,
+    node: u64,
+    table: &str,
+    pk: &str,
+    sk: &str,
+) -> (u16, String) {
+    let body =
+        format!(r#"{{"TableName":"{table}","Item":{{"pk":{{"S":"{pk}"}},"sk":{{"N":"{sk}"}}}}}}"#);
+    cluster.dynamo(node, "DynamoDB_20120810.PutItem", body.as_bytes())
+}
+
+/// `UpdateTable` enabling a stream with an explicit `view_type`, issued from
+/// `node` — the parametrized sibling of this module's own
+/// [`enable_stream_via_wire`] (fixed at `NEW_AND_OLD_IMAGES`), needed by
+/// [`run_describe_table_returns_stream_spec_and_arn_reenable_mints_new_label`]
+/// to prove a re-enable's `StreamViewType` is genuinely whatever the caller
+/// asked for, not just a fresh label.
+fn enable_stream_via_wire_view(
+    cluster: &mut SimCluster,
+    node: u64,
+    table: &str,
+    view_type: &str,
+) -> (u16, String) {
+    let body = format!(
+        r#"{{"TableName":"{table}","StreamSpecification":
+            {{"StreamEnabled":true,"StreamViewType":"{view_type}"}}}}"#
+    );
+    cluster.dynamo(node, "DynamoDB_20120810.UpdateTable", body.as_bytes())
+}
+
+fn delete_item(cluster: &mut SimCluster, node: u64, table: &str, pk: &str) -> (u16, String) {
+    let body = format!(r#"{{"TableName":"{table}","Key":{{"pk":{{"S":"{pk}"}}}}}}"#);
+    cluster.dynamo(node, "DynamoDB_20120810.DeleteItem", body.as_bytes())
+}
+
+fn transact_write_items(cluster: &mut SimCluster, node: u64, body: &str) -> (u16, String) {
+    cluster.dynamo(
+        node,
+        "DynamoDB_20120810.TransactWriteItems",
+        body.as_bytes(),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Converted: update_table_stream_enable_and_disable_through_every_node
+// ---------------------------------------------------------------------------
+
+/// Converted from `tests/dynamo_streams.rs::
+/// update_table_stream_enable_and_disable_through_every_node` — the
+/// relay-allowlist regression for `SetTableStream` (`MetaCommand::
+/// SetTableStream` must carry `is_relayable_command`, mirroring every other
+/// schema-catalog command's identical follower-connected test), driven
+/// through every node of the cluster in turn: each enable must mint a
+/// genuinely fresh label (ADR 0042 §9), and every node's own catalog must
+/// converge on both the enable and the disable.
+fn run_update_table_stream_enable_and_disable_through_every_node(seed: u64) {
+    let mut cluster = SimCluster::new(seed, 3, 3);
+    let table = "t";
+    let (status, body) = create_table(&mut cluster, 0, table);
+    assert_eq!(status, 200, "seed={seed}: CreateTable failed: {body}");
+
+    let mut last_label = String::new();
+    for i in 0..cluster.node_count() as u64 {
+        let (status, body) = enable_stream_via_wire(&mut cluster, i, table);
+        assert_eq!(
+            status, 200,
+            "seed={seed}: enable via node {i} failed: {body}"
+        );
+        let label = stream_label(&cluster, i, table);
+        assert_ne!(
+            label, last_label,
+            "seed={seed}: node {i}: re-enable must mint a fresh label (ADR 0042 §9)"
+        );
+        last_label = label.clone();
+        for n in 0..cluster.node_count() as u64 {
+            assert_eq!(
+                stream_label(&cluster, n, table),
+                label,
+                "seed={seed}: node {n} disagrees on the label enabled via node {i}"
+            );
+        }
+
+        let (status, body) = disable_stream_via_wire(&mut cluster, i, table);
+        assert_eq!(
+            status, 200,
+            "seed={seed}: disable via node {i} failed: {body}"
+        );
+        assert!(
+            !body.contains("StreamSpecification"),
+            "seed={seed}: disable response still names a StreamSpecification: {body}"
+        );
+        for n in 0..cluster.node_count() as u64 {
+            assert!(
+                cluster.metadata(n).table_stream(table).is_none(),
+                "seed={seed}: node {n} still reports an enabled stream after disable via \
+                 node {i}"
+            );
+        }
+    }
+}
+
+#[test]
+fn update_table_stream_enable_and_disable_through_every_node() {
+    run_update_table_stream_enable_and_disable_through_every_node(env_seed(0xC07E_A001));
+}
+
+#[test]
+fn update_table_stream_enable_and_disable_through_every_node_over_seeds() {
+    for i in 0..5 {
+        run_update_table_stream_enable_and_disable_through_every_node(0xC07E_A100 + i);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Converted: describe_table_returns_stream_spec_and_arn_reenable_mints_new_label
+// ---------------------------------------------------------------------------
+
+/// Converted from `tests/dynamo_streams.rs::
+/// describe_table_returns_stream_spec_and_arn_reenable_mints_new_label` —
+/// `DescribeTable` returns the stream's spec + ARN once enabled; a
+/// disable-then-re-enable mints a genuinely different label (ADR 0042
+/// §4/§9).
+fn run_describe_table_returns_stream_spec_and_arn_reenable_mints_new_label(seed: u64) {
+    let mut cluster = SimCluster::new(seed, 3, 3);
+    let table = "t";
+    let (status, body) = create_table_with_stream(&mut cluster, 0, table, "NEW_IMAGE");
+    assert_eq!(status, 200, "seed={seed}: CreateTable failed: {body}");
+    let first_label = stream_label(&cluster, 0, table);
+
+    let reader = non_leader_of_table(&cluster, table);
+    let describe_body = format!(r#"{{"TableName":"{table}"}}"#);
+    let (status, resp) = cluster.dynamo(
+        reader,
+        "DynamoDB_20120810.DescribeTable",
+        describe_body.as_bytes(),
+    );
+    assert_eq!(status, 200, "seed={seed}: DescribeTable failed: {resp}");
+    let v = json(&resp);
+    assert!(v["Table"].is_object(), "seed={seed}: {resp}");
+    assert_eq!(
+        v["Table"]["StreamSpecification"]["StreamEnabled"], true,
+        "seed={seed}: {resp}"
+    );
+    assert_eq!(
+        v["Table"]["StreamSpecification"]["StreamViewType"], "NEW_IMAGE",
+        "seed={seed}: {resp}"
+    );
+    let expected_arn = format!("arn:aws:dynamodb:animus:0:table/{table}/stream/{first_label}");
+    assert_eq!(
+        v["Table"]["LatestStreamArn"], expected_arn,
+        "seed={seed}: {resp}"
+    );
+    assert_eq!(
+        v["Table"]["LatestStreamLabel"], first_label,
+        "seed={seed}: {resp}"
+    );
+
+    // Disable, then re-enable with a DIFFERENT view type: a fresh, distinct
+    // label (a genuinely new, empty stream — ADR 0042 §9).
+    let (status, body) = disable_stream_via_wire(&mut cluster, 0, table);
+    assert_eq!(status, 200, "seed={seed}: disable failed: {body}");
+    for n in 0..cluster.node_count() as u64 {
+        assert!(
+            cluster.metadata(n).table_stream(table).is_none(),
+            "seed={seed}: node {n} still reports the stream enabled after disable"
+        );
+    }
+
+    let (status, body) = enable_stream_via_wire_view(&mut cluster, 0, table, "OLD_IMAGE");
+    assert_eq!(status, 200, "seed={seed}: re-enable failed: {body}");
+    let second_label = stream_label(&cluster, 0, table);
+    assert_ne!(
+        first_label, second_label,
+        "seed={seed}: re-enable must mint a fresh label, never reuse the old one"
+    );
+
+    let (status, resp) = cluster.dynamo(
+        reader,
+        "DynamoDB_20120810.DescribeTable",
+        describe_body.as_bytes(),
+    );
+    assert_eq!(status, 200, "seed={seed}: {resp}");
+    let v = json(&resp);
+    assert_eq!(
+        v["Table"]["LatestStreamLabel"], second_label,
+        "seed={seed}: {resp}"
+    );
+    assert_eq!(
+        v["Table"]["StreamSpecification"]["StreamViewType"], "OLD_IMAGE",
+        "seed={seed}: {resp}"
+    );
+}
+
+#[test]
+fn describe_table_returns_stream_spec_and_arn_reenable_mints_new_label() {
+    run_describe_table_returns_stream_spec_and_arn_reenable_mints_new_label(env_seed(0xC07E_B001));
+}
+
+#[test]
+fn describe_table_returns_stream_spec_and_arn_reenable_mints_new_label_over_seeds() {
+    for i in 0..5 {
+        run_describe_table_returns_stream_spec_and_arn_reenable_mints_new_label(0xC07E_B100 + i);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Converted: transact_write_items_on_a_streamed_table_delivers_correct_events
+// ---------------------------------------------------------------------------
+
+/// Converted from `tests/dynamo_streams.rs::
+/// transact_write_items_on_a_streamed_table_delivers_correct_events` (ADR
+/// 0046 A1/U3, `TxnStage` kind-writes stack): two `Put`s on a streamed
+/// table, staged in one `TransactWriteItems`, each produce exactly one
+/// change record, correctly imaged, with a numeric
+/// `ApproximateCreationDateTime` — reusing the C-06 PR 3 Transact dispatch
+/// (`Operation::TransactWriteItems` through `dispatch_item_op`, unchanged
+/// by this PR) and this module's own open-tail read machinery: no seal is
+/// needed, since `TransactWriteItems`'s resolve materializes the change
+/// record before `cp_txn` acks (ADR 0046 A1).
+fn run_transact_write_items_on_a_streamed_table_delivers_correct_events(seed: u64) {
+    let mut cluster = SimCluster::new(seed, 3, 3);
+    let table = "streamed";
+    let (status, body) = create_table_with_stream(&mut cluster, 0, table, "NEW_AND_OLD_IMAGES");
+    assert_eq!(status, 200, "seed={seed}: CreateTable failed: {body}");
+    let label = stream_label(&cluster, 0, table);
+    let stream_arn = format!("arn:aws:dynamodb:animus:0:table/{table}/stream/{label}");
+
+    // A plain (unstreamed) table's own transaction still works unaffected.
+    let (status, body) = create_table(&mut cluster, 0, "plain");
+    assert_eq!(
+        status, 200,
+        "seed={seed}: CreateTable(plain) failed: {body}"
+    );
+    let plain_writer = non_leader_of_table(&cluster, "plain");
+    let plain_body = r#"{"TransactItems":[{"Put":{"TableName":"plain","Item":{"pk":{"S":"a"}}}}]}"#;
+    let (status, body) = transact_write_items(&mut cluster, plain_writer, plain_body);
+    assert_eq!(
+        status, 200,
+        "seed={seed}: plain-table transaction should succeed: {body}"
+    );
+
+    // The transaction under test: two Puts on the streamed table, one
+    // participant each — each must produce exactly one change record.
+    let writer = non_leader_of_table(&cluster, table);
+    let txn_body = format!(
+        r#"{{"TransactItems":[
+            {{"Put":{{"TableName":"{table}","Item":{{"pk":{{"S":"x1"}},"v":{{"N":"1"}}}}}}}},
+            {{"Put":{{"TableName":"{table}","Item":{{"pk":{{"S":"x2"}},"v":{{"N":"2"}}}}}}}}]}}"#
+    );
+    let (status, body) = transact_write_items(&mut cluster, writer, &txn_body);
+    assert_eq!(
+        status, 200,
+        "seed={seed}: streamed-table transaction failed: {body}"
+    );
+
+    let reader = non_leader_of_table(&cluster, table);
+    let (status, v) = describe_stream_via_wire(&mut cluster, reader, &stream_arn);
+    assert_eq!(status, 200, "seed={seed}: DescribeStream failed: {v}");
+    let shards = v["StreamDescription"]["Shards"].as_array().unwrap();
+    let shard_id = shards
+        .last()
+        .unwrap_or_else(|| panic!("seed={seed}: at least one shard: {v}"))["ShardId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let token = get_shard_iterator_via_wire(
+        &mut cluster,
+        reader,
+        &stream_arn,
+        &shard_id,
+        "TRIM_HORIZON",
+        None,
+    );
+    let (records, _next) = get_records_via_wire(&mut cluster, reader, &token, None);
+    assert_eq!(
+        records.len(),
+        2,
+        "seed={seed}: expected exactly one change record per transactional write: {records:?}"
+    );
+    let mut seen_ids: Vec<String> = Vec::new();
+    for record in &records {
+        assert_eq!(record["eventName"], "INSERT", "seed={seed}: {record:?}");
+        let new_image = &record["dynamodb"]["NewImage"];
+        let id = new_image["pk"]["S"]
+            .as_str()
+            .unwrap_or_else(|| panic!("seed={seed}: no pk in {record:?}"))
+            .to_owned();
+        assert!(
+            id == "x1" || id == "x2",
+            "seed={seed}: unexpected id in transactional stream record: {record:?}"
+        );
+        seen_ids.push(id);
+        // Present and numeric — this test's own real-socket original
+        // states why the exact value (whether it reports the true commit
+        // instant) is deliberately out of scope here.
+        record["dynamodb"]["ApproximateCreationDateTime"]
+            .as_f64()
+            .unwrap_or_else(|| {
+                panic!("seed={seed}: ApproximateCreationDateTime missing/non-numeric: {record:?}")
+            });
+    }
+    seen_ids.sort();
+    assert_eq!(seen_ids, vec!["x1".to_string(), "x2".to_string()]);
+}
+
+#[test]
+fn transact_write_items_on_a_streamed_table_delivers_correct_events() {
+    run_transact_write_items_on_a_streamed_table_delivers_correct_events(env_seed(0xC07E_C001));
+}
+
+#[test]
+fn transact_write_items_on_a_streamed_table_delivers_correct_events_over_seeds() {
+    for i in 0..5 {
+        run_transact_write_items_on_a_streamed_table_delivers_correct_events(0xC07E_C100 + i);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Converted: transact_write_items_abort_leaves_no_stream_event
+// ---------------------------------------------------------------------------
+
+/// Converted from `tests/dynamo_streams.rs::
+/// transact_write_items_abort_leaves_no_stream_event` — a
+/// `TransactWriteItems` that fails a `ConditionCheck` leaves no stream event
+/// (ADR 0046 A1's "abort discards the kind-writes payload entirely" at the
+/// wire level), proven through the real `GetRecords` read path: a genuine,
+/// immediately-following write must be the FIRST event this shard ever
+/// serves, with no phantom event ahead of it.
+fn run_transact_write_items_abort_leaves_no_stream_event(seed: u64) {
+    let mut cluster = SimCluster::new(seed, 3, 3);
+    let table = "streamed";
+    let (status, body) = create_table_with_stream(&mut cluster, 0, table, "NEW_AND_OLD_IMAGES");
+    assert_eq!(status, 200, "seed={seed}: CreateTable failed: {body}");
+    let label = stream_label(&cluster, 0, table);
+    let stream_arn = format!("arn:aws:dynamodb:animus:0:table/{table}/stream/{label}");
+
+    // The ConditionCheck targets a key that does not exist — the whole
+    // transaction, including the Put on the streamed table, must abort.
+    let writer = non_leader_of_table(&cluster, table);
+    let abort_body = format!(
+        r#"{{"TransactItems":[
+            {{"ConditionCheck":{{"TableName":"{table}","Key":{{"pk":{{"S":"missing"}}}},
+                               "ConditionExpression":"attribute_exists(pk)"}}}},
+            {{"Put":{{"TableName":"{table}","Item":{{"pk":{{"S":"x1"}}}}}}}}]}}"#
+    );
+    let (status, body) = transact_write_items(&mut cluster, writer, &abort_body);
+    assert_eq!(
+        status, 400,
+        "seed={seed}: expected TransactionCanceledException: {body}"
+    );
+    assert!(
+        body.contains("TransactionCanceledException"),
+        "seed={seed}: {body}"
+    );
+
+    let (status, body) = get_item(&mut cluster, writer, table, "x1", true);
+    assert_eq!(status, 200, "seed={seed}: {body}");
+    assert_eq!(
+        body, "{}",
+        "seed={seed}: x1 must not have committed: {body}"
+    );
+
+    // A genuine, immediately-following write proves the stream is still
+    // alive and correctly ordered — its own event must be the FIRST one
+    // this shard ever serves, with no phantom event from the aborted
+    // transaction ahead of it.
+    let (status, body) = put_item(&mut cluster, writer, table, "x2", "1");
+    assert_eq!(status, 200, "seed={seed}: PutItem(x2) failed: {body}");
+
+    let reader = non_leader_of_table(&cluster, table);
+    let (status, v) = describe_stream_via_wire(&mut cluster, reader, &stream_arn);
+    assert_eq!(status, 200, "seed={seed}: DescribeStream failed: {v}");
+    let shards = v["StreamDescription"]["Shards"].as_array().unwrap();
+    let shard_id = shards
+        .last()
+        .unwrap_or_else(|| panic!("seed={seed}: at least one shard: {v}"))["ShardId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let token = get_shard_iterator_via_wire(
+        &mut cluster,
+        reader,
+        &stream_arn,
+        &shard_id,
+        "TRIM_HORIZON",
+        None,
+    );
+    let (records, _next) = get_records_via_wire(&mut cluster, reader, &token, None);
+    assert_eq!(
+        records.len(),
+        1,
+        "seed={seed}: the aborted transaction must not surface any event; only x2's genuine \
+         write should appear: {records:?}"
+    );
+    assert_eq!(
+        records[0]["dynamodb"]["NewImage"]["pk"]["S"], "x2",
+        "seed={seed}: {records:?}"
+    );
+}
+
+#[test]
+fn transact_write_items_abort_leaves_no_stream_event() {
+    run_transact_write_items_abort_leaves_no_stream_event(env_seed(0xC07E_D001));
+}
+
+#[test]
+fn transact_write_items_abort_leaves_no_stream_event_over_seeds() {
+    for i in 0..5 {
+        run_transact_write_items_abort_leaves_no_stream_event(0xC07E_D100 + i);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Converted: get_records_walks_the_shard_chain_and_drains_the_open_tail
+// ---------------------------------------------------------------------------
+
+/// Converted from `tests/dynamo_streams.rs::
+/// get_records_walks_the_shard_chain_and_drains_the_open_tail` — the full
+/// read-path walk: `ListStreams`/`DescribeStream` show a chain of two
+/// closed shards followed by one open one (ADR 0042 §2/§3, ADR 0043 §A4's
+/// parent-before-child lineage), each closed shard drains to a null
+/// `NextShardIterator`, and the open shard never nulls — an empty poll
+/// returns the identical iterator (F4/§7). Two explicit
+/// [`SimCluster::drive_stream_seal`] calls stand in for
+/// `tiny_seal_knobs`'s "seal almost immediately" real-socket knob (this
+/// module's own doc has the general mapping).
+fn run_get_records_walks_the_shard_chain_and_drains_the_open_tail(seed: u64) {
+    let mut cluster = SimCluster::new(seed, 3, 3);
+    let table = "t";
+    let (status, body) = create_table_with_stream(&mut cluster, 0, table, "NEW_AND_OLD_IMAGES");
+    assert_eq!(status, 200, "seed={seed}: CreateTable failed: {body}");
+    let label = stream_label(&cluster, 0, table);
+    let stream_arn = format!("arn:aws:dynamodb:animus:0:table/{table}/stream/{label}");
+
+    // Shard 0: one INSERT, sealed on its own.
+    let writer = non_leader_of_table(&cluster, table);
+    let (status, body) = put_item(&mut cluster, writer, table, "p1", "1");
+    assert_eq!(status, 200, "seed={seed}: {body}");
+    let leader = leader_of_table(&cluster, table);
+    cluster.drive_stream_seal(leader);
+
+    // Shard 1: one MODIFY, sealed on its own.
+    let (status, body) = put_item(&mut cluster, writer, table, "p1", "2");
+    assert_eq!(status, 200, "seed={seed}: {body}");
+    cluster.drive_stream_seal(leader);
+
+    // The open tail: one REMOVE, deliberately left unsealed.
+    let (status, body) = delete_item(&mut cluster, writer, table, "p1");
+    assert_eq!(status, 200, "seed={seed}: {body}");
+
+    let reader = non_leader_of_table(&cluster, table);
+    let (status, v) = list_streams_via_wire(&mut cluster, reader);
+    assert_eq!(status, 200, "seed={seed}: {v}");
+    assert!(
+        v["Streams"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["TableName"] == table && s["StreamLabel"] == label),
+        "seed={seed}: {v}"
+    );
+
+    let (status, v) = describe_stream_via_wire(&mut cluster, reader, &stream_arn);
+    assert_eq!(status, 200, "seed={seed}: {v}");
+    assert_eq!(
+        v["StreamDescription"]["StreamStatus"], "ENABLED",
+        "seed={seed}: {v}"
+    );
+    let shards = v["StreamDescription"]["Shards"].as_array().unwrap();
+    assert_eq!(
+        shards.len(),
+        3,
+        "seed={seed}: expected 2 closed + 1 open: {v}"
+    );
+    assert!(
+        shards[0]["SequenceNumberRange"]["EndingSequenceNumber"].is_string(),
+        "seed={seed}: {v}"
+    );
+    assert!(
+        shards[1]["SequenceNumberRange"]["EndingSequenceNumber"].is_string(),
+        "seed={seed}: {v}"
+    );
+    assert!(
+        shards[2]["SequenceNumberRange"]["EndingSequenceNumber"].is_null(),
+        "seed={seed}: the tail shard must still be open: {v}"
+    );
+    assert_eq!(
+        shards[1]["ParentShardId"], shards[0]["ShardId"],
+        "seed={seed}: shard 1 must name shard 0 as its parent"
+    );
+    assert_eq!(
+        shards[2]["ParentShardId"], shards[1]["ShardId"],
+        "seed={seed}: the open shard must name the last sealed shard as its parent"
+    );
+    let shard0 = shards[0]["ShardId"].as_str().unwrap().to_owned();
+    let shard1 = shards[1]["ShardId"].as_str().unwrap().to_owned();
+    let shard2 = shards[2]["ShardId"].as_str().unwrap().to_owned();
+
+    let it0 = get_shard_iterator_via_wire(
+        &mut cluster,
+        reader,
+        &stream_arn,
+        &shard0,
+        "TRIM_HORIZON",
+        None,
+    );
+    let (records, next) = get_records_via_wire(&mut cluster, reader, &it0, None);
+    assert_eq!(records.len(), 1, "seed={seed}: {records:?}");
+    assert_eq!(
+        records[0]["eventName"], "INSERT",
+        "seed={seed}: {records:?}"
+    );
+    assert!(
+        next.is_none(),
+        "seed={seed}: shard 0 must exhaust to a null iterator"
+    );
+
+    let it1 = get_shard_iterator_via_wire(
+        &mut cluster,
+        reader,
+        &stream_arn,
+        &shard1,
+        "TRIM_HORIZON",
+        None,
+    );
+    let (records, next) = get_records_via_wire(&mut cluster, reader, &it1, None);
+    assert_eq!(records.len(), 1, "seed={seed}: {records:?}");
+    assert_eq!(
+        records[0]["eventName"], "MODIFY",
+        "seed={seed}: {records:?}"
+    );
+    assert!(
+        next.is_none(),
+        "seed={seed}: shard 1 must exhaust to a null iterator"
+    );
+
+    let it2 = get_shard_iterator_via_wire(
+        &mut cluster,
+        reader,
+        &stream_arn,
+        &shard2,
+        "TRIM_HORIZON",
+        None,
+    );
+    let (records, next) = get_records_via_wire(&mut cluster, reader, &it2, None);
+    assert_eq!(records.len(), 1, "seed={seed}: {records:?}");
+    assert_eq!(
+        records[0]["eventName"], "REMOVE",
+        "seed={seed}: {records:?}"
+    );
+    let it2b =
+        next.unwrap_or_else(|| panic!("seed={seed}: an open shard's iterator must never null"));
+    let (records2, next2) = get_records_via_wire(&mut cluster, reader, &it2b, None);
+    assert!(records2.is_empty(), "seed={seed}: {records2:?}");
+    assert_eq!(
+        next2.as_deref(),
+        Some(it2b.as_str()),
+        "seed={seed}: an empty poll on an open shard must return the SAME iterator"
+    );
+}
+
+#[test]
+fn get_records_walks_the_shard_chain_and_drains_the_open_tail() {
+    run_get_records_walks_the_shard_chain_and_drains_the_open_tail(env_seed(0xC07E_E001));
+}
+
+#[test]
+fn get_records_walks_the_shard_chain_and_drains_the_open_tail_over_seeds() {
+    for i in 0..5 {
+        run_get_records_walks_the_shard_chain_and_drains_the_open_tail(0xC07E_E100 + i);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Converted: get_records_on_an_open_shard_forwards_correctly_from_every_node
+// ---------------------------------------------------------------------------
+
+/// Converted from `tests/dynamo_streams.rs::
+/// get_records_on_an_open_shard_forwards_correctly_from_every_node` — an
+/// open shard's `GetRecords` is served by whichever node leads the tablet,
+/// **forwarded** from any other node it's issued through — the
+/// `ClientRequest::StreamHotRead` allowlist regression, exercised from
+/// every node of a 3-node cluster in turn.
+fn run_get_records_on_an_open_shard_forwards_correctly_from_every_node(seed: u64) {
+    let mut cluster = SimCluster::new(seed, 3, 3);
+    let table = "t";
+    let (status, body) = create_table_with_stream(&mut cluster, 0, table, "KEYS_ONLY");
+    assert_eq!(status, 200, "seed={seed}: CreateTable failed: {body}");
+    let label = stream_label(&cluster, 0, table);
+    let stream_arn = format!("arn:aws:dynamodb:animus:0:table/{table}/stream/{label}");
+
+    let writer = non_leader_of_table(&cluster, table);
+    let (status, body) = put_item(&mut cluster, writer, table, "p1", "1");
+    assert_eq!(status, 200, "seed={seed}: {body}");
+
+    let (status, v) = describe_stream_via_wire(&mut cluster, writer, &stream_arn);
+    assert_eq!(status, 200, "seed={seed}: {v}");
+    let shards = v["StreamDescription"]["Shards"].as_array().unwrap();
+    assert_eq!(
+        shards.len(),
+        1,
+        "seed={seed}: must still be the one open shard: {v}"
+    );
+    let shard0 = shards[0]["ShardId"].as_str().unwrap().to_owned();
+    assert!(
+        shards[0]["SequenceNumberRange"]["EndingSequenceNumber"].is_null(),
+        "seed={seed}: {v}"
+    );
+
+    for node in 0..cluster.node_count() as u64 {
+        let it = get_shard_iterator_via_wire(
+            &mut cluster,
+            node,
+            &stream_arn,
+            &shard0,
+            "TRIM_HORIZON",
+            None,
+        );
+        let (records, next) = get_records_via_wire(&mut cluster, node, &it, None);
+        assert_eq!(records.len(), 1, "seed={seed}: node {node}: {records:?}");
+        assert_eq!(
+            records[0]["eventName"], "INSERT",
+            "seed={seed}: node {node}"
+        );
+        assert!(
+            next.is_some(),
+            "seed={seed}: node {node}: an open shard must never null"
+        );
+    }
+}
+
+#[test]
+fn get_records_on_an_open_shard_forwards_correctly_from_every_node() {
+    run_get_records_on_an_open_shard_forwards_correctly_from_every_node(env_seed(0xC07E_F001));
+}
+
+#[test]
+fn get_records_on_an_open_shard_forwards_correctly_from_every_node_over_seeds() {
+    for i in 0..5 {
+        run_get_records_on_an_open_shard_forwards_correctly_from_every_node(0xC07E_F100 + i);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Converted: pre_enable_marker_records_never_surface_on_the_stream
+// ---------------------------------------------------------------------------
+
+/// Converted from `tests/dynamo_streams.rs::
+/// pre_enable_marker_records_never_surface_on_the_stream` (ADR 0049 §1): a
+/// table written to **before** its stream was enabled holds image-less
+/// marker records in its change log; once a stream is enabled and the
+/// sealer sweeps the whole hot scope (markers included, by design) into a
+/// sealed segment, those markers must never surface as stream events — a
+/// stream begins at enable, never retroactively, so the walk below must
+/// deliver exactly the one post-enable write.
+fn run_pre_enable_marker_records_never_surface_on_the_stream(seed: u64) {
+    let mut cluster = SimCluster::new(seed, 3, 3);
+    let table = "mk";
+    let (status, body) = create_table(&mut cluster, 0, table);
+    assert_eq!(status, 200, "seed={seed}: CreateTable failed: {body}");
+
+    // A plain table: these two writes leave marker records, no stream
+    // exists yet.
+    let writer = non_leader_of_table(&cluster, table);
+    for pk in ["m1", "m2"] {
+        let (status, body) = put_item(&mut cluster, writer, table, pk, "1");
+        assert_eq!(status, 200, "seed={seed}: PutItem({pk}) failed: {body}");
+    }
+
+    // Enable the stream, then one real write.
+    let (status, body) = enable_stream_via_wire(&mut cluster, 0, table);
+    assert_eq!(status, 200, "seed={seed}: enable failed: {body}");
+    let label = stream_label(&cluster, 0, table);
+    let stream_arn = format!("arn:aws:dynamodb:animus:0:table/{table}/stream/{label}");
+
+    let (status, body) = put_item(&mut cluster, writer, table, "real", "2");
+    assert_eq!(status, 200, "seed={seed}: PutItem(real) failed: {body}");
+
+    // Seal the whole hot backlog — markers and the real write together —
+    // into one segment, exercising the SEALED serve path over content that
+    // physically contains the markers.
+    let leader = leader_of_table(&cluster, table);
+    cluster.drive_stream_seal(leader);
+
+    // Walk every shard of the chain from TRIM_HORIZON, sealed and open
+    // alike, collecting every delivered event.
+    let reader = non_leader_of_table(&cluster, table);
+    let (status, v) = describe_stream_via_wire(&mut cluster, reader, &stream_arn);
+    assert_eq!(status, 200, "seed={seed}: DescribeStream failed: {v}");
+    let shards = v["StreamDescription"]["Shards"].as_array().unwrap().clone();
+    assert!(
+        !shards.is_empty(),
+        "seed={seed}: expected at least one shard: {v}"
+    );
+
+    let mut events: Vec<serde_json::Value> = Vec::new();
+    for shard in &shards {
+        let shard_id = shard["ShardId"].as_str().unwrap();
+        let mut it = Some(get_shard_iterator_via_wire(
+            &mut cluster,
+            reader,
+            &stream_arn,
+            shard_id,
+            "TRIM_HORIZON",
+            None,
+        ));
+        // A sealed shard drains to a null iterator; an open shard returns
+        // the same position on an empty poll — one empty poll ends it.
+        while let Some(iterator) = it {
+            let (records, next) = get_records_via_wire(&mut cluster, reader, &iterator, None);
+            let drained = records.is_empty();
+            events.extend(records);
+            it = if drained { None } else { next };
+        }
+    }
+
+    assert_eq!(
+        events.len(),
+        1,
+        "seed={seed}: exactly the one post-enable write may surface — a marker record leaking \
+         through either serve path shows up here as extra events: {events:?}"
+    );
+    assert_eq!(events[0]["eventName"], "INSERT", "seed={seed}: {events:?}");
+    assert_eq!(
+        events[0]["dynamodb"]["Keys"]["pk"]["S"], "real",
+        "seed={seed}: the delivered event must be the post-enable write: {events:?}"
+    );
+}
+
+#[test]
+fn pre_enable_marker_records_never_surface_on_the_stream() {
+    run_pre_enable_marker_records_never_surface_on_the_stream(env_seed(0xC07E_1A01));
+}
+
+#[test]
+fn pre_enable_marker_records_never_surface_on_the_stream_over_seeds() {
+    for i in 0..5 {
+        run_pre_enable_marker_records_never_surface_on_the_stream(0xC07E_1B00 + i);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Converted: stream_keys_carry_n_sort_key_values_across_mixed_magnitudes_and_signs
+// ---------------------------------------------------------------------------
+
+/// Converted from `tests/dynamo_streams.rs::
+/// stream_keys_carry_n_sort_key_values_across_mixed_magnitudes_and_signs`
+/// (ADR 0063): a record's `Keys` reports the exact DynamoDB `N` sort-key
+/// text each item was written with, across mixed digit counts and a
+/// negative value, and every record for the same partition arrives carrying
+/// the value it was written with, in write order. No seal is driven —
+/// `never_seals_knobs`'s real-socket role ("don't race the periodic seal
+/// arm") is unnecessary here, since this fixture only ever seals when a
+/// scenario explicitly asks it to.
+fn run_stream_keys_carry_n_sort_key_values_across_mixed_magnitudes_and_signs(seed: u64) {
+    let mut cluster = SimCluster::new(seed, 3, 3);
+    let table = "readings";
+    let (status, body) = create_table_composite_n_sort_key(&mut cluster, 0, table);
+    assert_eq!(status, 200, "seed={seed}: CreateTable failed: {body}");
+    let label = stream_label(&cluster, 0, table);
+    let stream_arn = format!("arn:aws:dynamodb:animus:0:table/{table}/stream/{label}");
+
+    // Mixed digit counts and a negative — the exact shape a raw byte-text
+    // encoding would have gotten wrong for ordering, and a real risk for
+    // record *positioning* now that `base_sk` carries the `numkey` bytes
+    // instead of decimal text.
+    let writer = non_leader_of_table(&cluster, table);
+    let sks = ["-12", "0", "5", "9", "100"];
+    for sk in sks {
+        let (status, body) = put_item_n_sort(&mut cluster, writer, table, "p1", sk);
+        assert_eq!(status, 200, "seed={seed}: PutItem(sk={sk}) failed: {body}");
+    }
+
+    let reader = non_leader_of_table(&cluster, table);
+    let (status, v) = describe_stream_via_wire(&mut cluster, reader, &stream_arn);
+    assert_eq!(status, 200, "seed={seed}: DescribeStream failed: {v}");
+    let shards = v["StreamDescription"]["Shards"].as_array().unwrap();
+    assert_eq!(
+        shards.len(),
+        1,
+        "seed={seed}: no seal was driven, so everything stays in the one open epoch-0 shard: \
+         {v}"
+    );
+    let shard_id = shards[0]["ShardId"].as_str().unwrap().to_owned();
+
+    let token = get_shard_iterator_via_wire(
+        &mut cluster,
+        reader,
+        &stream_arn,
+        &shard_id,
+        "TRIM_HORIZON",
+        None,
+    );
+    let (records, _next) = get_records_via_wire(&mut cluster, reader, &token, None);
+    assert_eq!(
+        records.len(),
+        sks.len(),
+        "seed={seed}: expected exactly one record per write: {records:?}"
+    );
+
+    let mut seen: Vec<String> = Vec::new();
+    for record in &records {
+        assert_eq!(
+            record["dynamodb"]["Keys"]["pk"]["S"], "p1",
+            "seed={seed}: wrong partition in Keys: {record:?}"
+        );
+        let sk = record["dynamodb"]["Keys"]["sk"]["N"]
+            .as_str()
+            .unwrap_or_else(|| panic!("seed={seed}: no N-typed sk in Keys: {record:?}"))
+            .to_owned();
+        seen.push(sk);
+    }
+    assert_eq!(
+        seen,
+        sks.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        "seed={seed}: records for partition p1 must carry the exact N values they were \
+         written with, in write order: {records:?}"
+    );
+}
+
+#[test]
+fn stream_keys_carry_n_sort_key_values_across_mixed_magnitudes_and_signs() {
+    run_stream_keys_carry_n_sort_key_values_across_mixed_magnitudes_and_signs(env_seed(
+        0xC07E_1C01,
+    ));
+}
+
+#[test]
+fn stream_keys_carry_n_sort_key_values_across_mixed_magnitudes_and_signs_over_seeds() {
+    for i in 0..5 {
+        run_stream_keys_carry_n_sort_key_values_across_mixed_magnitudes_and_signs(0xC07E_1D00 + i);
     }
 }

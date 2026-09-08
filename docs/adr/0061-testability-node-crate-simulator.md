@@ -845,7 +845,7 @@ supply one, and isn't trying to.
 | D3 | Migrate the `animusd` integration suite: **keep** the tests that genuinely prove real-thread liveness (group commit, lock contention, election timing — per the engineering-lessons rule that `SimEnv` does not prove thread liveness), convert the rest. **Success criterion corrected 2026-09-07** (see that date's own "D3 PR 1" amendment): the `prod-liveness` job's 2-attempt retry was already replaced by nextest sharding before D3 started, so there is no retry to drop — success is measured by the real-thread tier's own shrinking test count / wall time / flake surface instead. **PR 1 landed 2026-09-07**: the base-table-only "B class" (~30 tests across ten `dynamo_*.rs` binaries plus `kind_batch_outcome.rs`) converted to `SimCluster`. **PR 2a landed 2026-09-07**: `Metadata::members` population + `ClusterEdgeState::control` widened to `RaftNode<E>` make base-table DDL (`CreateTable`/`DeleteTable`/`ListTables`/`DescribeTable`, via new `dynamo::dispatch_table_op`) drivable over the real wire; two real fixture bugs found and fixed (a liveness-detector heartbeat gap, a tablet-id-allocator collision) and one genuine, documented `SimCluster` gap found and left open (a rebalanced-away replica's `RaftKvNode` is never torn down — see that date's own "D3 PR 2a" amendment). **PR 2b landed 2026-09-07**: `UpdateTable`'s own throughput-only change (`BillingMode`/`ProvisionedThroughput`, ADR 0065) is now drivable too, via a widened `dynamo::update_table_throughput` and a new `UpdateTable` arm on `dispatch_table_op` — five more `dynamo_throttling.rs` tests converted, no new fixture bugs (see that date's own "D3 PR 2b" amendment). **PR 3a landed 2026-09-07**: GSI/LSI `Query`/`Scan` dispatch through `SimCluster`, plus `CreateTable` with a declared GSI/LSI — eight functions widened to `<E, R>` (`run_index_query`/`run_gsi_query`/`run_lsi_query`/`run_index_scan`/`run_gsi_scan`/`run_lsi_scan`/`paginated_kind_examine`/`paginated_kind_examine_one`), 42 tests converted across nine new sibling modules; a GSI row is still never materialized under `SimCluster` (no drain loop spawned), pinned by its own new regression, so every GSI-*data* test stays on `ProdEnv` (see that date's own "D3 PR 3a" amendment). **PR 3b landed 2026-09-07, closing D3's own GSI-drain boundary**: `index_drain::drain_tablet`/`reconcile_partition` widened to `<E, R>` and a new `SimCluster::drain_gsi` fixture helper materialize a GSI's hidden table on demand, flipping PR 3a's own boundary regression positive and converting every GSI-data test it had to leave on `ProdEnv` (12 tests across nine sibling modules, two of them new: `sim_cluster_dynamo_documents.rs`, `sim_cluster_dynamo_schema.rs`) plus a sim twin of `dynamo_indexes.rs::gsi_write_then_query` that does not replace the original; seven `tests/dynamo_*.rs` files deleted whole, one trimmed (see that date's own "D3 PR 3b" amendment). D3 is now closed for the GSI-drain gap specifically — remaining `ProdEnv` binaries are there for real-thread-liveness or not-yet-generic-operation reasons. **D3 closed 2026-09-07 (PRs #711 #716 #717 #718 #719 + this)** — see the dated "D3 closing" amendment below for the full before/after numbers, the reframed success criterion's verdict, and the residual `tests/*.rs` inventory by class |
 | D4 | Deterministic coverage for the behaviours that have none today: the auto-split byte trigger (`lib.rs:14397`), the dropped-table GC reclaim loop, join/growth sequencing, and the backup-janitor async loop (its replicated state machine is already sim-tested in `animus-control/tests/backup_catalog.rs`; the loop driving it is not) |
 | F | Post-C-04: Transact/PartiQL `SimCluster` dispatch (C-06) — the two named D2 residuals (Transact, PartiQL), never claimed by any D3/D4 rung. **Closed 2026-09-08 (PRs #728, #729, #732, #748, #750, #756, plus PR 7)** — both residuals now reachable through `dispatch_item_op`, the real-socket `dynamo_partiql.rs`/`dynamo_execute_transaction.rs` kept in full as the `ProdEnv` equivalence proof, `cargo test -p animusd --lib` 353 → 438 passed across PRs 3-6. See the 2026-09-07 "Rung F" amendment and the "Rung F closed" amendment below, and `docs/roadmap.md`'s C-06 entry |
-| G | Post-C-06: Streams `SimCluster` dispatch (C-07) — the largest remaining unowned residual group named by Rung F's own close-out (`dynamo_streams.rs`/`stream_janitor.rs`/`stream_backfill_seed_filter.rs`, 3 files/28 tests, plus `console_stream.rs`'s own 4 tests filed under the console/dashboard group). **Open, PR 3 (the Streams read API) landed 2026-09-08.** `tests/streams_e2e.rs` stays out of scope throughout, frozen behind #298/#745. See the 2026-09-08 "Rung G" amendments below and `docs/roadmap.md`'s C-07 entry |
+| G | Post-C-06: Streams `SimCluster` dispatch (C-07) — the largest remaining unowned residual group named by Rung F's own close-out (`dynamo_streams.rs`/`stream_janitor.rs`/`stream_backfill_seed_filter.rs`, 3 files/28 tests, plus `console_stream.rs`'s own 4 tests filed under the console/dashboard group). **Open, PR 4 (`dynamo_streams.rs` siblings — 12 converted, 3 kept `ProdEnv`) landed 2026-09-08; `dynamo_streams.rs` itself is closed.** `tests/streams_e2e.rs` stays out of scope throughout, frozen behind #298/#745. See the 2026-09-08 "Rung G" amendments below and `docs/roadmap.md`'s C-07 entry |
 
 Note that the copy-based split driver (ADR 0050) is deliberately **not** on
 this list: ADR 0058 rung 4's remaining layer deletes it. Writing a corpus
@@ -4891,3 +4891,81 @@ dynamo_streams`: 18 passed, 0 failed; `cargo test -p animusd --lib --
 ~844 MB, last ~181 MB; `cargo test -p animusd --test dynamo_streams`: 15
 passed, 0 failed — the real-socket equivalence regression for
 `execute_as`/`run_operation`'s concrete path. `Cargo.lock` unchanged.
+
+## 2026-09-08 amendment — Rung G, PR 4 landed (`tests/dynamo_streams.rs` siblings)
+
+PR 4's own scope — give every sim-convertible test in `tests/dynamo_
+streams.rs` a deterministic sibling, then trim that file to the genuine
+`ProdEnv` residual — landed. No `dynamo.rs`/`dynamo_streams.rs`/
+`sim_cluster.rs` change was needed: PR 2's dispatch groundwork
+(`dispatch_table_op`'s stream sub-arm, `SimCluster::drive_stream_seal`)
+and PR 3's read API (`execute_streams_op_as`) already supplied every
+primitive this PR needed; PR 4 is pure test authorship in
+`sim_cluster_dynamo_streams.rs` (crate `animusd`, `src/`) plus the trim of
+`tests/dynamo_streams.rs` itself.
+
+**Disposition, 12 converted / 3 kept `ProdEnv`** (matching the plan
+exactly, adjusted for PR 3's own finding that PR 2's list already had): of
+the twelve, four are proven **in kind**, not duplicated, by scenarios PR 3
+already built — `open_shard_iterator_survives_a_seal_and_keeps_working`
+(scenario (d)), `limit_pagination_drains_a_sealed_shard_exactly_once`
+(scenario (e)), `get_records_on_a_sealed_shard_works_from_every_node`
+(scenario (g)), and `disabled_stream_grace_window_lists_and_serves_
+sealed_reads_with_no_open_shard` (scenario (h)) — each cross-checked
+assertion-by-assertion against its real-socket original before relying on
+the equivalence. The remaining eight each got a genuinely new scenario:
+`update_table_stream_enable_and_disable_through_every_node`, `describe_
+table_returns_stream_spec_and_arn_reenable_mints_new_label`,
+`transact_write_items_on_a_streamed_table_delivers_correct_events`,
+`transact_write_items_abort_leaves_no_stream_event`, `get_records_walks_
+the_shard_chain_and_drains_the_open_tail`, `get_records_on_an_open_shard_
+forwards_correctly_from_every_node` (PR 3 had no every-node OPEN-shard
+read — only every-node SEALED, scenario (g)), `pre_enable_marker_records_
+never_surface_on_the_stream`, and `stream_keys_carry_n_sort_key_values_
+across_mixed_magnitudes_and_signs`. Kept `ProdEnv`, exactly as the plan's
+own disposition named, each with a one-line reason on the test itself and
+in `tests/dynamo_streams.rs`'s own updated doc comment: `set_table_stream_
+enable_propagates_and_survives_restart` (real WAL/restart durability),
+`disable_survives_concurrent_periodic_seal_on_local_route` (races the real
+periodic change-consumer loop's own timer, which `SimCluster` never
+spawns), and `bare_stream_hot_read_is_refused` (the production port guard,
+which PR 3 already found the simulated relay path cannot meaningfully
+reproduce).
+
+**The `tiny_seal_knobs`/`age_seal_knobs`/`never_seals_knobs` → `drive_
+stream_seal` mapping** (documented once, in both `sim_cluster_dynamo_
+streams.rs`'s own module doc and `crates/animusd/CLAUDE.md`'s matching
+appendix, per this PR's own instruction): the real-socket knobs steer the
+*periodic* seal arm, which `SimCluster` never spawns (PR 2's own finding).
+A converted scenario instead calls `SimCluster::drive_stream_seal(leader)`
+explicitly — trigger-free, sealing whatever is currently pending into one
+epoch — once per desired shard for a `tiny_seal_knobs`-shaped chain, not
+at all for a `never_seals_knobs`-shaped "stay open," and once over the
+whole pending backlog for an `age_seal_knobs`-shaped "sweep it all
+together" (already proven by PR 3's own scenario (e), which is exactly why
+`limit_pagination_drains_a_sealed_shard_exactly_once` needed no new
+scenario of its own).
+
+**Two Transact scenarios reuse the C-06 PR 3 dispatch unmodified** —
+`Operation::TransactWriteItems` already routes through `dispatch_item_op`
+(generic since C-06 PR 2/3), so nothing in `dynamo.rs` needed touching;
+both scenarios prove the change record materializes on the OPEN-tail read
+path with no seal at all, since a streamed table's transactional write
+resolves before `cp_txn` acks (ADR 0046 A1).
+
+**No product bug found.** Every converted scenario passed at its pinned
+seed and every `_over_seeds` seed on the first clean run.
+
+**Gates, in the required order**: `cargo test -p animusd --test dynamo_
+streams` on the untrimmed file — 15 passed (proving this branch's baseline
+before removing anything, the D3 discipline); `cargo test -p animusd
+--lib sim_cluster_dynamo_streams -- --test-threads=2` — 34 passed (18 from
+PR 2/3 + 16 new); trim, then `cargo test -p animusd --test dynamo_streams`
+again — 3 passed; `cargo fmt --all --check` (one auto-fix, then clean);
+`cargo clippy -p animusd --all-targets --all-features -- -D warnings`
+(clean); `cargo build -p animusd --all-targets` (clean); `cargo test -p
+animusd --lib -- --test-threads=2` — 472 passed, 0 failed, 3 ignored,
+901.75s (456 baseline + 16 new), resident memory sampled every 10s via the
+anchored `pgrep -f '^<abs-path>/target/debug/deps/animusd-'` pattern —
+first ~129 MB, peak ~902 MB, last ~180 MB, consistent with PR 3's own
+figures. `Cargo.lock` unchanged.
