@@ -150,6 +150,7 @@ assertion messages; replay with `ANIMUS_SEED=<seed> cargo test <name>`. The
 | `ANIMUS_QUIESCE_SEEDS=K` | 1 | idle-tablet-group quiescence corpus depth (`animus-cp-data`, ADR 0044 phase 1) |
 | `ANIMUS_SPLIT_SEEDS=K` | 1 | `KvCommand::SeedBatch` corpus depth (`animus-cp-data`) — the version-carrying row-merge command originally built for the now-deleted copy-based split driver (ADR 0050 Train B), its sole surviving consumer is the restore driver (ADR 0059 §7) |
 | `ANIMUS_LEARNER_SEEDS=K` | 1 | learner (non-voting) membership-class fault-injection corpus depth (`animus-control`, ADR 0058 Train 1) |
+| `ANIMUS_RECONFIGURE_DROP_SEEDS=K` | 1 | healthy-voter-drop reconfigure corpus depth (`animus-cp-data`, issue #781) — a live follower, and separately the leader, dropped via a direct `CasTabletReplicas` through the real `spawn_reconfigure_loop`/`reconfigure_step` |
 | `ANIMUS_CONTROL_SEEDS=K` | 1 | control-plane machinery (apply task, schema-catalog exclusivity) fault-injection corpus depth (`animus-control`) |
 | `ANIMUS_INPLACE_SPLIT_SEEDS=K` | 1 | in-place split group-mint-at-apply fault-injection corpus depth (`animus-cp-data`, ADR 0058 Train 2 rung 3) |
 | `ANIMUS_BACKUP_SEEDS=K` | 1 | on-demand backup capture fault-injection corpus depth (`animus-test`, ADR 0059 Train 1) |
