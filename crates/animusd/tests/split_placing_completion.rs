@@ -704,11 +704,30 @@ async fn mark_split_placing_done_tolerates_a_stale_or_duplicate_relayed_propose(
             "the entry must still read done after the duplicate propose"
         );
 
-        // The sibling child is unaffected throughout.
-        assert!(
-            split_placing_entry(&final_status, right).is_some_and(|(_, d)| d),
-            "sibling child {right} unexpectedly not done"
-        );
+        // The sibling child is unaffected throughout — but its own
+        // `split_placing[right].done` is an eventually-converging value the
+        // same as `child`'s own (the completion loop marks every led
+        // tablet's entry independently, one per tick), and this test never
+        // polled it the way it polls `child`'s above: a bare one-shot read
+        // here is exactly the "fixed-deadline one-shot assert on an
+        // eventual property" mistake (see this crate's own root CLAUDE.md
+        // Testing discipline, and `docs/engineering-lessons.md`'s matching
+        // entry on this exact file, where the sibling test above was fixed
+        // the same way). Bounded converged-or-timeout poll, mirroring
+        // `child`'s own convergence loop above.
+        let right_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let (_, status) = admin(nodes[0].admin_addr(), "GET", "/admin/status", None).await;
+            if split_placing_entry(&status, right).is_some_and(|(_, d)| d) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < right_deadline,
+                "sibling child {right} never converged to done: {:?}",
+                split_placing_entry(&status, right)
+            );
+            sleep(Duration::from_millis(200)).await;
+        }
 
         for node in &nodes {
             node.shutdown_graceful().await;
