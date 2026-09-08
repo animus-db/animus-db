@@ -276,8 +276,9 @@ async fn cp_group_follows_tablet_replica_set() {
         .await
         .expect("replica-set change did not replicate within 20s");
 
-    // The reconfigure loop on the leader's node steps the group's Raft config to the
-    // new set: the leader now reports two voters, and the dropped id is gone.
+    // The reconfigure loop on whichever node currently leads the group steps its
+    // Raft config to the new set: some node now reports two voters, and the
+    // dropped id is gone.
     //
     // ADR 0029: removing a *healthy* extra voter (this is a plain drop, not a
     // failure repair — nothing here is `Down`) is now gated on the surviving
@@ -285,22 +286,46 @@ async fn cp_group_follows_tablet_replica_set() {
     // take one extra heartbeat round trip versus the old unconditional removal
     // — a wider, 60s timeout (matching this file's spare-replacement test
     // below) absorbs that under real `cargo test --workspace` contention.
+    //
+    // #781: poll EVERY node, not the `leader_idx` captured once at group
+    // formation. A mid-test re-election is legitimate here — e.g. the dropped
+    // node keeps campaigning once it stops receiving heartbeats from the group
+    // it was just removed from, and can win a term against a momentarily slow
+    // leader before this test's own reconfigure commits — and moves leadership
+    // to the *other kept node*. The group still converges, just under a
+    // different node than `leader_idx`; a poll pinned to the stale leader index
+    // never observes that convergence and spins to a false 60s timeout
+    // indistinguishable from a genuine stuck reconfigure. Track the last
+    // observed view per node so a real stall is diagnosable from the CI log.
     let dropped = raftkv_ids[drop_idx].clone();
+    let mut last: Vec<Option<(bool, Vec<NodeId>)>> = vec![None; nodes.len()];
     let reconfigured = async {
         loop {
-            if let Some((is_leader, voters)) = group_view(nodes[leader_idx].admin_addr()).await
-                && is_leader
-                && voters.len() == 2
-                && !voters.contains(&dropped)
-            {
-                return;
+            for (i, node) in nodes.iter().enumerate() {
+                let view = group_view(node.admin_addr()).await;
+                if let Some((is_leader, voters)) = &view
+                    && *is_leader
+                    && voters.len() == 2
+                    && !voters.contains(&dropped)
+                {
+                    eprintln!(
+                        "#781 characterization: converged on node index {i} (original leader_idx={leader_idx})"
+                    );
+                    return;
+                }
+                last[i] = view;
             }
             sleep(Duration::from_millis(150)).await;
         }
     };
-    timeout(Duration::from_secs(60), reconfigured)
-        .await
-        .expect("CP group did not reconfigure to the new replica set within 60s");
+    match timeout(Duration::from_secs(60), reconfigured).await {
+        Ok(()) => {}
+        Err(_) => panic!(
+            "CP group did not reconfigure to the new replica set within 60s; \
+             last observed (node index, is_leader, voters) per node: {:?}",
+            last.iter().enumerate().collect::<Vec<_>>()
+        ),
+    }
 
     for node in nodes {
         node.shutdown_graceful().await;
