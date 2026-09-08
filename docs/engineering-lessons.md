@@ -23110,6 +23110,20 @@ never caught this gap on its own: the lint that would have flagged a raw
 be `E`-generic but still reaches for the real clock only reveals itself by
 actually being driven under `SimEnv` once.
 
+**2026-09-08, third recurrence (ADR 0061 rung H, C-08 PR 6)**: `ClientCtx::
+admin_transfer_control_leadership` (`lib.rs`) — already `<E: Env, R:
+RelayClient>`-generic since rung C5 — had the identical gap: its own
+commit-wait loop read `tokio::time::Instant::now()`/called `tokio::time::
+sleep(..)` directly. Found the same way, by the same signal: `SimCluster`'s
+own `control_transfer_moves_leadership_to_the_named_node` scenario, this
+method's first-ever `SimEnv`-driven caller, panicked immediately with "no
+reactor running." Fixed with the identical `self.env.now()`/`self.env.
+sleep(..)` conversion. Three occurrences of the same root cause in one
+crate is a pattern, not a coincidence — when widening any `ClientCtx`
+method's signature to `E`-generic without also driving it under `SimEnv`
+in the same change, grep the body for `tokio::time`/`Instant::now`/
+`SystemTime::now` before declaring it done, per the general lesson above.
+
 ## `DescribeStream` always appends a tablet's still-open successor epoch behind a just-sealed one while the stream stays enabled — a shard-count assertion after a seal must account for it (ADR 0061 rung G, C-07 PR 3, 2026-09-08)
 
 Building `sim_cluster_dynamo_streams.rs`'s new post-seal scenarios (a
@@ -23370,3 +23384,32 @@ incremented," check which constructor built each `RaftNode`/`RaftKvNode`
 it hosts — `start`'s own default silently opts every caller into one
 process-wide shared sink, correct-looking for counters and wrong for any
 gauge, until something finally reads the gauge.
+
+## A pushed branch with no open PR costs nothing and survives a container loss — push implementation commits before the long gates, not after (2026-09-08)
+
+A container rebuild between sessions lost two fully-written, fully-tested,
+never-pushed branches' worth of work outright — the branch, its commits,
+and everything in it existed only in the rebuilt-away container's local
+`.git`. Re-implementing ADR 0061 rung H, C-08 PR 6 from scratch after this
+loss is what this entry itself documents having to do.
+
+**The fix is procedural, not technical, and it was already available**:
+CI in this repo runs only on pull requests and on pushes to `main` (root
+`CLAUDE.md`'s Commands section) — a branch pushed to `origin` with no PR
+opened against it triggers no workflow, costs no CI minutes, and is
+invisible to anyone not looking for it, while being fully durable against
+exactly this failure mode. There is no reason to hold a working-tree-only
+implementation commit back until every gate is green before pushing it
+once — the commit already exists locally; getting it onto `origin` costs
+one `git push -u origin <branch>` and loses nothing if a later gate finds
+a bug (amend and `--force-with-lease` the same branch, same as any other
+fixup).
+
+**General rule**: on any task producing a implementation commit worth more
+than a few minutes of re-typing, push the branch to `origin` as soon as it
+exists and compiles — *before* running the long test/lint gate sequence,
+not after. Open the actual PR only once those gates are green. A pushed-
+but-PR-less branch is a free checkpoint in any repo with this same
+PR-gated CI posture; treat "did I push yet" as a standing question after
+every commit on a long task, the same reflex as checking `git status`
+before a destructive command.

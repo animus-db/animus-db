@@ -849,8 +849,11 @@ the still-true paragraph after the table.
   2026-09-08** (3 of `console_stream.rs`'s 4 tests, 5 of `console_table_
   config.rs`'s 9 — see the Status bullet below for the full disposition);
   (5) admin dispatch pure observers (`sim_cluster_
-  admin.rs`, `system_table.rs`, `metrics_endpoint.rs`); (6) admin mutating
-  actions + the remaining 11 `admin_*` tests; (7) `dashboard_endpoint.rs`
+  admin.rs`, `system_table.rs`, `metrics_endpoint.rs`); **(6) admin
+  mutating actions — landed 2026-09-08** (8 of `admin_endpoint.rs`'s
+  remaining 12 tests converted into a new `sim_cluster_admin_actions.rs`;
+  the other 4 stay `ProdEnv` — see the Status bullet below for the full
+  disposition); (7) `dashboard_endpoint.rs`
   + `console_endpoint.rs` close-out; (8) docs close-out. Every production
   dispatch path (`admin::dispatch`, `console::route`, `execute_routed`,
   `execute_routed_as`, `execute_as`) stays byte-identical throughout —
@@ -865,9 +868,30 @@ the still-true paragraph after the table.
   mostly signature widening rather than new mechanism.
 - **Status (2026-09-08):** open — PR 1 (this docs opener), PR 2
   (groundwork), PR 3 (console reachable + first siblings), PR 4
-  (`console_stream.rs`/`console_table_config.rs` siblings), and PR 5
-  (admin dispatch pure observers) all landed, PR 2 corrected the same day
-  in review; PRs 6–8 to follow. PR 5 gave 5 of `admin_endpoint.rs`'s 23
+  (`console_stream.rs`/`console_table_config.rs` siblings), PR 5
+  (admin dispatch pure observers), and PR 6 (admin dispatch mutating
+  actions) all landed, PR 2 corrected the same day in review; PRs 7–8 to
+  follow. PR 6 gave 8 of `admin_endpoint.rs`'s remaining 12 tests a
+  deterministic `SimCluster` sibling in a new `sim_cluster_admin_
+  actions.rs` (8 scenarios × pinned-seed + 5-seed `_over_seeds` = 16
+  tests, all green on the first full run, no product bug found beyond one
+  real seam bug — below). The other 4 (`admin_interface_surfaces_state_
+  and_actions`, `seed_load_does_not_storm_cp_elections`, `admin_system_
+  table_split_lineage_after_a_real_split`, `admin_storage_compact_
+  action`) stay `ProdEnv`, each with a one-line reason (a `MemoryEngine`-
+  has-no-LSM-concept gap shared by two of them, real-thread
+  election-timing liveness, and `ctx.control_storage` always `None` under
+  `SimCluster`). **A second real, previously-latent seam bug found and
+  fixed** (PR 5's own metrics-sink finding was the first): `ClientCtx::
+  admin_transfer_control_leadership` had an already-generic `<E, R>`
+  signature but its own commit-wait loop still read the real clock
+  directly instead of `self.env`, panicking under `SimEnv` (no reactor) —
+  the third recorded recurrence of "a generic signature does not imply a
+  seam-clean body" in this crate. Fixed with the identical `self.env.
+  now()`/`self.env.sleep(..)` conversion every prior recurrence used. See
+  `crates/animusd/CLAUDE.md`'s matching C-08 PR 6 appendix for the full
+  per-test mapping and gate numbers, and `docs/engineering-lessons.md`'s
+  matching dated note. PR 5 gave 5 of `admin_endpoint.rs`'s 23
   tests, plus the "tables" half of a sixth, a deterministic `SimCluster`
   sibling in a new `sim_cluster_admin.rs` (7 scenarios, 14 tests with
   `_over_seeds`, all green once two scenario-authoring bugs and one real

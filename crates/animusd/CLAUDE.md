@@ -8849,3 +8849,93 @@ warnings` (clean). `Cargo.lock` unchanged.
 
 See ADR 0061's "Rung H, PR 5 landed" amendment and `docs/roadmap.md`'s
 C-08 entry for the full record.
+
+## Appendix — `sim_cluster_admin_actions.rs` siblings (ADR 0061 rung H, C-08 PR 6, 2026-09-08)
+
+Closes PR 6's own scope: the admin HTTP-JSON interface's **mutating**
+actions, `sim_cluster_admin.rs` (PR 5)'s sibling for `POST /admin/
+data/dynamo`, `/admin/data/drop-table`, `/admin/data/seed`, `/admin/
+tablet/split`, `/admin/credentials`(`/rotate`/`/revoke`), and `/admin/
+control/transfer`. Converts 8 of `admin_endpoint.rs`'s remaining 12
+tests into a new `crates/animusd/src/sim_cluster_admin_actions.rs` (8
+scenarios × pinned-seed + 5-seed `_over_seeds` = 16 tests). **No
+`admin.rs`/`dynamo.rs` dispatch change was needed** — every route this
+PR drives was already reachable through `GenericAdminHost` (PR 2's own
+newtype), the identical seam PR 5 already established.
+
+**One real, previously-latent seam bug found and fixed, this rung's
+second (PR 5's own shared `MetricsHandle::noop()` finding was the
+first)**: `ClientCtx::admin_transfer_control_leadership` (`lib.rs`)
+already had a fully generic `<E: Env, R: RelayClient>` signature (rung
+C5) — its own commit-wait loop, though, still read `tokio::time::
+Instant::now()`/called `tokio::time::sleep(..)` directly instead of
+`self.env.now()`/`self.env.sleep(..)`. A generic *signature* proves
+nothing about whether a function's *body* actually avoids the real
+clock/timer — the identical lesson ADR 0061 rung G, C-07 PR 2's `index_
+drain::seal_now` finding already recorded, and rung F/G's own `recovery_
+grace_now_ms`/`txn_recover` findings before that; this is that lesson's
+**third** recurrence in this crate, recorded as such (not a new entry)
+in `docs/engineering-lessons.md`. `SimEnv` has no real Tokio reactor, so
+`tokio::time::sleep` panics ("there is no reactor running") the instant
+this loop's first poll iteration is reached whenever the initial arm
+attempt doesn't resolve on its very first pass — found immediately by
+this PR's own `control_transfer_moves_leadership_to_the_named_node`
+scenario, its first real exercise of the route. Fixed with the same
+`self.env.now().saturating_add(..)`/`self.env.now() >= deadline`/
+`self.env.sleep(..)` conversion every prior rung's own `tokio::time`
+finding used — the method's documented behavioral contract (issue
+#688's fixed target-must-be-the-observed-leader semantics) is unchanged.
+
+**Test-by-test disposition**:
+
+| Real-socket test (`admin_endpoint.rs`) | Disposition |
+|---|---|
+| `admin_data_write_dynamo` | Converted → `sim_cluster_admin_actions.rs::data_write_dynamo` — issued from a node hosting no replica of the table's own tablet |
+| `admin_table_management_create_and_drop` | Converted → `sim_cluster_admin_actions.rs::table_management_create_and_drop` — issued from a control follower |
+| `admin_seed_writes_synthetic_keys` | Converted → `sim_cluster_admin_actions.rs::seed_writes_synthetic_keys` — the full bulk-seed contract; `percent_encode` moved with its last caller |
+| `admin_split_in_place_children_inherit_the_parents_own_replicas` | Converted → `sim_cluster_admin_actions.rs::split_in_place_children_inherit_the_parents_own_replicas` — a 4-node/RF-3 `SimCluster` (`create_table_with_replication`'s own deterministic `0..replication` replica set reproduces the real fixture's "n3 stays idle" premise exactly); `bring_up_with_streams_quiesce` moved with its last caller |
+| `admin_credentials_put_rotate_revoke_round_trip` | Converted → `sim_cluster_admin_actions.rs::credentials_put_rotate_revoke_round_trip` |
+| `admin_credentials_put_on_a_follower_is_relayed_to_the_leader` | Converted → `sim_cluster_admin_actions.rs::credentials_put_on_a_follower_is_relayed_to_the_leader` |
+| `admin_control_transfer_moves_leadership_to_the_named_node` | Converted → `sim_cluster_admin_actions.rs::control_transfer_moves_leadership_to_the_named_node` — the scenario that found the seam bug above |
+| `admin_control_transfer_on_a_follower_is_refused` | Converted → `sim_cluster_admin_actions.rs::control_transfer_on_a_follower_is_refused` |
+| `admin_interface_surfaces_state_and_actions` | **KEPT** — its one remaining action, `/admin/storage/flush`, has the identical `MemoryEngine`-has-no-LSM-concept gap PR 5's own `admin_raftkv_default_does_not_materialize_the_dataset` KEPT reason already names; kept whole as this crate's sole remaining real-socket admin observer sweep |
+| `seed_load_does_not_storm_cp_elections` | **KEPT** — real-thread election-timing liveness |
+| `admin_system_table_split_lineage_after_a_real_split` | **KEPT** — `ctx.control_storage` is always `None` under `SimCluster` |
+| `admin_storage_compact_action` | **KEPT** — `CpGroup::compact_now()` is `None` for the `MemoryEngine` backend |
+
+**Before/after counts**: `admin_endpoint.rs`: 18 → 10 (8 removed, plus
+two now-dead helpers deleted — `bring_up_with_streams_quiesce`,
+`percent_encode`, both losing their last caller). `sim_cluster_admin_
+actions.rs`: 16 new tests (8 scenarios).
+
+**No product bug found beyond the `admin_transfer_control_leadership`
+clock-conversion finding above.** Every scenario passed at its pinned
+seed and every `_over_seeds` seed on the first full run once that fix
+landed — no scenario-authoring bug needed a redesign this PR.
+
+**Gates, in the required order**: `cargo build -p animusd --all-targets`
+(clean; checkpoint push before the gates below); `cargo test -p animusd
+--test admin_endpoint` on the untrimmed file (18 passed, 10.64s); `cargo
+test -p animusd --lib sim_cluster_admin -- --test-threads=2` (30 passed,
+0 failed — 14 from PR 5 + 16 from this PR, both reached by the unchanged
+`sim_cluster_admin` substring filter, since this module is named `sim_
+cluster_admin_actions`); trim, then `cargo test -p animusd --test admin_
+endpoint` again (10 passed, 10.33s, clean build with no dead-code
+warnings); `cargo test -p animusd --lib sim_cluster -- --test-threads=2`
+(383 passed, 0 failed, 2 ignored, 753.07s — 367 baseline + this PR's 16
+new tests; anchored-sampler RSS, sampled every 10s from the test
+binary's own `/proc/<pid>/status` `VmRSS`: first ~66 MB, peak ~894 MB,
+last ~171 MB, well under the 6 GB/30 min budget and consistent with
+every prior rung's own no-leak trajectory); `cargo test -p animusd
+--test dashboard_endpoint dashboard_u05_control_member_actions` (1
+passed, 0.37s — the one other real caller of `/admin/control/transfer`
+found by grepping `tests/` for "transfer"; no dedicated `admin_control_
+transfer.rs` file exists); `cargo fmt --all --check` (one pass needed —
+`sim_cluster_admin_actions.rs`'s own long call sites, applied via
+`cargo fmt --all`, then clean); `cargo clippy -p animusd --all-targets
+--all-features -- -D warnings` (one fix needed — a `nonminimal_bool`
+lint on the drop-table convergence predicate, rewritten per clippy's own
+suggestion; clean after). `Cargo.lock` unchanged.
+
+See ADR 0061's "Rung H, PR 6 landed" amendment and `docs/roadmap.md`'s
+C-08 entry for the full record.

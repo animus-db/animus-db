@@ -11003,7 +11003,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                  mid-transfer, or {target} has not caught up); retry"
             ));
         }
-        let deadline = tokio::time::Instant::now() + CONTROL_TRANSFER_POLL_TIMEOUT;
+        let deadline = self.env.now().saturating_add(CONTROL_TRANSFER_POLL_TIMEOUT);
         loop {
             // `leader.leader()` is this node's own live `RaftCore` belief,
             // not a one-shot snapshot — it keeps updating after this node
@@ -11018,7 +11018,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             if leader.leader().as_ref() == Some(&target) {
                 return Ok(());
             }
-            if tokio::time::Instant::now() >= deadline {
+            if self.env.now() >= deadline {
                 return Err(match leader.leader() {
                     // Stepped down, and a *different* voter is the stable
                     // leader — a third voter won the election this
@@ -11044,7 +11044,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     ),
                 });
             }
-            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+            self.env.sleep(SCHEMA_POLL_INTERVAL).await;
         }
     }
 }
@@ -18964,6 +18964,24 @@ mod sim_cluster_console_table_config;
 /// per-test conversion mapping and gate numbers.
 #[cfg(test)]
 mod sim_cluster_admin;
+
+/// `SimCluster`-driven deterministic siblings for the admin HTTP-JSON
+/// interface's **mutating** actions (ADR 0061 rung H, C-08 PR 6) —
+/// `sim_cluster_admin.rs` (PR 5)'s sibling for `POST /admin/data/dynamo`,
+/// `/admin/data/drop-table`, `/admin/data/seed`, `/admin/tablet/split`,
+/// `/admin/credentials`(`/rotate`/`/revoke`), and
+/// `/admin/control/transfer`. Found and fixed one real, previously-latent
+/// seam bug along the way: `ClientCtx::admin_transfer_control_leadership`'s
+/// commit-wait loop still read the real clock (`tokio::time::Instant::
+/// now()`/`tokio::time::sleep`) despite an already-generic `<E: Env, R:
+/// RelayClient>` signature — the third recurrence of this exact lesson in
+/// this crate (see `docs/engineering-lessons.md`'s matching dated note).
+/// See this module's own doc for the full scenario list, what stays
+/// `ProdEnv` in `admin_endpoint.rs` and why, and
+/// `crates/animusd/CLAUDE.md`'s matching appendix for the per-test
+/// conversion mapping and gate numbers.
+#[cfg(test)]
+mod sim_cluster_admin_actions;
 
 /// Regression for the issue #298 residual confirmed live under the
 /// un-pinned `SplitMode::InPlace` proof soak (ADR 0018's matching amendment,
