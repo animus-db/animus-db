@@ -185,6 +185,30 @@ function of one seed. This is the substrate every distributed test runs on.
   proof, both directions (the bug present without `shutdown()`, gone with
   it), plus the negative case (a task that resolves on its own never needed
   `shutdown()` in the first place).
+  **Correction, same day: this fix alone did NOT close the leak it was
+  written for.** A follow-up measurement — with a *correctly targeted*
+  process sampler; the first round's own `pgrep -f` pattern had been
+  matching the invoking shell, not the test binary, so its "flat ~6 MB"
+  readings never measured anything real — found the `animusd`
+  `sim_cluster_*` test tier's RSS growth completely unchanged after this
+  fix landed, because a *second*, fully independent `Arc` cycle was also
+  keeping every scenario's whole state graph alive: `animus-node`'s
+  `SimRelayClient::serve` installs a handler closure that (in every real
+  caller) captures a `ClientCtx` holding another clone of the very
+  `SimRelayClient` the closure is installed on — a self-cycle inside that
+  one `Arc<Mutex<Option<Arc<Handler>>>>` handler slot, needing no help
+  from this crate's own task queue to stay alive. Fixed in `animus-node`
+  (`SimRelayClient::shutdown`) and `animusd` (`SimCluster::restart`/
+  `Drop for SimCluster`), **not** here — this crate's own `Simulator::
+  shutdown`/`downgrade` mechanism above is correct and complete for the
+  cycle it targets; it was simply not the only cycle in the fixture. See
+  `docs/engineering-lessons.md`'s matching "Correction, same day" entry
+  for the full incident, including the sampler bug and how it was found —
+  the general lesson for this crate: fixing one proven `Weak`-verified
+  cycle is not proof it was the only one keeping a symptom alive in a
+  consumer built on top of it; re-measure the actual symptom, with a
+  sampler whose own target selection is itself verified sound, before
+  declaring a leak closed.
 - `crash(node)` drops un-synced disk + the inbox **and mutes the node's
   outbound sends** (a dead node emits nothing); deliveries to a crashed node are
   dropped until `restart`.

@@ -4084,3 +4084,105 @@ distributed system's background loops; a `Weak`-based proof, not an RSS
 number, is what actually distinguishes that from ordinary allocator
 retention — and `crates/animus-sim/CLAUDE.md`'s "What's non-obvious"
 section for the mechanism itself.
+
+## 2026-09-08 amendment — the `Simulator` fix above was real but incomplete: a SECOND, independent reference cycle (`SimRelayClient`) was closed, found only after fixing a broken measurement
+
+The amendment immediately above fixed a genuine cycle and reported it as
+having closed the `sim_cluster_*` tier's leak — its own "Measured effect"
+numbers (a 322 MB peak for `sim_cluster_dynamo_partiql`, a completing
+383-test full-suite run) were real cargo output, but **the process
+sampler that produced them was reading the wrong process**: its `pgrep -f
+'target/debug/deps/animusd-'` pattern also matches the *invoking shell*
+(the `cargo test -p animusd ...` command line itself, which contains that
+same substring as plain text) as readily as the actual test binary, and
+which one it happened to catch on a given poll was unstable — sometimes
+the shell (a few MB, explaining figures like "~6 MB flat" from an earlier
+draft of that measurement pass), sometimes an early, not-yet-representative
+moment of the real binary (322 MB, closer to plausible but still not a
+genuine peak-of-the-whole-run figure). **A real `animusd` test binary is
+never a few MB resident** — that mismatch alone should have been (and, on
+a later rerun, was) the tell.
+
+A follow-up session, sampling correctly (anchored to the binary's own
+absolute path — `pgrep -f '^/path/to/target/debug/deps/animusd-'`, which
+a shell's own multi-word invocation can never match — with the first
+sample sanity-checked to land in the hundreds of MB before trusting
+anything after it), found the exact same monotonic RSS growth this whole
+ADR section exists to fix, at the same rate, **completely unaffected** by
+the `Simulator::shutdown()` fix above: 2.4 GB at 189s into
+`sim_cluster_auto_split`, 10.8 GB at 656s, the run killed at 12.6 GB after
+304 tests. The `Simulator`/`SimEnv` task-queue cycle fix was not wrong —
+it is real, `tests/executor_leak.rs` still proves it — it was simply not
+the *only* cycle keeping this tier's memory alive, and the broken sampler
+never gave anyone a true reading to notice that against.
+
+**The second cycle, root-caused once measurement was fixed**: `animus-
+node`'s `SimRelayClient::serve(handler)` installs `handler` into `self.
+handler: Arc<Mutex<Option<Arc<Handler>>>>`. Every real caller's handler
+closure (`forwarding::handle_relayed_request`, closed over a cloned
+`ClientCtx<E, R>`) captures a `ClientCtx` that itself owns a clone of the
+*same* `SimRelayClient` (its own `relay: R` field) — and since
+`SimRelayClient` is `Clone`-over-`Arc`, that captured `ctx.relay` shares
+the identical `handler` `Arc` the closure is installed *into*. A closure
+sitting inside an `Arc`'s own `Mutex`, itself holding a strong reference
+back to that same `Arc`, is a self-contained cycle needing no help from
+`animus-sim`'s task queue at all — entirely independent of the first
+cycle, which is exactly why fixing only that one left this tier's
+measured trajectory unchanged. `SimCluster::new` installs a `.serve()`
+handler on every node unconditionally, so — like the first cycle — this
+one fired on literally every `sim_cluster_*` scenario, from the very
+first test that touches the fixture. A second, smaller instance of the
+identical shape compounds it further: `SimCluster::restart` installs a
+*fresh* handler on a *fresh* relay without ever clearing the one it
+replaces, so every restart mid-scenario leaked one more whole
+node-generation on its own, independent of the fixture's eventual `Drop`.
+
+**Proved with the identical discipline, extended to a second `Arc`**: a
+new `SimRelayClient::downgrade_handler() -> WeakHandlerSlot` (mirroring
+`Simulator::downgrade`'s own shape) lets a test take a `Weak` onto the
+handler slot before drop and assert it no longer upgrades after.
+`crates/animusd/src/sim_cluster.rs::dropping_the_cluster_frees_every_
+nodes_relay_and_edge_state` proves both the restart-time case (checked
+immediately after a mid-scenario `SimCluster::restart`, not deferred to
+the cluster's own eventual drop) and the final-drop case (every node's
+current relay handler slot, plus two more `Weak`-checked `Arc`s —
+`ClusterEdgeState`'s own `control`/`raftkv` registries — this cycle
+transitively kept alive), confirmed red-before/green-after by temporarily
+reverting the fix and rerunning.
+
+**Fix**: `SimRelayClient::shutdown()` (new, `animus-node`) clears the
+handler slot, dropping the closure and breaking the cycle. Called from
+`SimCluster::restart` (on the OLD relay, before installing the fresh
+one) and from `impl Drop for SimCluster` (on every node's CURRENT relay,
+alongside the existing `Simulator::shutdown()` call — the two calls
+address two unrelated cycles and both remain necessary).
+
+**Measured, this time with the corrected anchored sampler**: `cargo test
+-p animusd --lib sim_cluster_dynamo_ -- --test-threads=1` (the 140
+dynamo-tier tests, ~150 modules matched) — RSS fluctuates per-test
+(roughly 100–650 MB, driven by which scenario is running, never a
+monotonic climb) and stays well under the 2 GB bound throughout, `140
+passed; 0 failed; 1 ignored`, ~469s. The FULL `cargo test -p animusd
+--lib -- --test-threads=2` suite — peak ~960 MB across the entire run
+(under the 3 GB bound, and roughly 3x below it), `384 passed; 0 failed; 3
+ignored` (the one additional test versus the prior amendment's 383 is
+this fix's own new regression), a complete, un-truncated run — not one
+that merely finished before something else killed it, the shape every
+earlier "success" in this ADR section turned out to be measuring.
+
+**This is not the first time this investigation's own measurement tooling
+was the actual defect, not the subject under test** — see the "Correction"
+framing of this amendment's own title, and treat any future "the leak is
+fixed" claim in this area as provisional until the sampler itself has been
+checked against a known-good baseline (a real test binary's own
+documented minimum resident footprint), not just against whether the
+number it reports happens to look plausible.
+
+**Docs**: this amendment; `docs/engineering-lessons.md`'s matching
+"Correction, same day" entry (the full sampler-bug account, alongside the
+general lesson); `crates/animus-sim/CLAUDE.md`'s own correction note on
+its `Simulator::shutdown` entry (pointing here — that crate's own fix is
+unchanged and still correct, it just wasn't the whole story); and
+`crates/animus-node/CLAUDE.md`'s new `SimRelayClient::shutdown`/
+`downgrade_handler` section for the mechanism itself. `git diff
+--name-only` against the branch point excludes `Cargo.lock`.

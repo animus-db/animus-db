@@ -693,3 +693,55 @@ concurrent; the *receiving* of messages off `RELAY_STREAM` stays strictly
 ordered by the loop's own single `recv_stream` call. No bound on
 concurrent handlers, matching production's own unbounded per-connection
 spawn.
+
+## `SimRelayClient::shutdown`/`downgrade_handler` — the installed-handler self-cycle (2026-09-08)
+
+`serve(handler)`'s own doc already named its typical shape: "a plain
+closure over whatever state the caller needs (typically a cloned
+`ClientCtx<E, R>`)." What that doc didn't spell out, and what an
+`animusd` `sim_cluster_*` per-test RSS-growth investigation found: in
+every real caller (`forwarding::handle_relayed_request`, closed over
+`ctx.clone()`), that captured `ClientCtx` itself owns a clone of the very
+`SimRelayClient` the closure is installed on (`ctx.relay`) — and since
+`SimRelayClient` is `Clone`-over-`Arc`, that clone shares the identical
+`handler: Arc<Mutex<Option<Arc<Handler>>>>` slot the closure sits inside.
+A closure stored inside an `Arc`'s own `Mutex`, itself holding a strong
+reference back to that same `Arc`, is a self-contained reference cycle —
+no help needed from anything outside this one field (not `animus-sim`'s
+own `Simulator`/`SimEnv` task queue, a *separate* cycle a different fix
+addresses — see `crates/animus-sim/CLAUDE.md`'s matching correction and
+`docs/engineering-lessons.md`'s "Correction, same day" entry for the full
+two-cycle account). Every external handle onto the client (every
+`ClientCtx::relay` clone, every task that ever held one) can drop and the
+handler slot's own strong count never reaches zero, because the closure
+sitting inside it is itself one of the counted references — keeping that
+one `ClientCtx` (and everything it transitively reaches: `edge`'s
+`control`/`raftkv` registries, store handles, …) alive for the rest of
+the process.
+
+**`SimRelayClient::shutdown()`** clears the handler slot (`*self.handler
+.lock() = None`), dropping the closure and breaking the cycle —
+idempotent, safe from any clone, at any point; after it, an inbound
+request gets `no_handler_installed`'s ordinary refusal exactly as if
+`serve` had never been called (the receive loop itself keeps running,
+only what it dispatches to changes). **`SimRelayClient::
+downgrade_handler() -> WeakHandlerSlot`** is the matching proof primitive
+(`WeakHandlerSlot::is_alive()`), mirroring `animus_sim::Simulator::
+downgrade`'s own shape exactly — the same "prove with a `Weak`, not RSS"
+discipline this workspace already uses for the sibling cycle.
+
+**A caller that *replaces* an already-served handler must call
+`shutdown()` on the OLD client first, not just stop referencing it** —
+overwriting a `ClientCtx.relay` field (or dropping the `SimRelayClient`
+value that had `.serve()` called on it) only drops the ONE reference the
+caller itself held; the closure's own captured copy, sitting inside the
+handler slot, is untouched by that and keeps the whole old generation
+alive regardless. `animusd`'s `SimCluster::restart` does this on every
+restart (installing a fresh handler on a fresh relay without clearing the
+one it replaces used to leak one more whole node-generation per restart,
+independent of the fixture's own eventual teardown); `impl Drop for
+SimCluster` does it for every node's final generation. See that crate's
+own `CLAUDE.md`/`sim_cluster.rs`'s `dropping_the_cluster_frees_every_
+nodes_relay_and_edge_state` for the full regression (both the mid-
+scenario restart case and the final-drop case, each `Weak`-verified,
+each confirmed red-before/green-after by temporarily reverting the fix).

@@ -1013,6 +1013,22 @@ pub(crate) struct SimCluster {
 /// any of the ~30 sibling `sim_cluster_*` modules that construct one.
 impl Drop for SimCluster {
     fn drop(&mut self) {
+        // Break every node's own relay-handler self-cycle FIRST (see
+        // `SimRelayClient::shutdown`'s own doc): the closure installed by
+        // `serve()` captured a `ClientCtx` clone that itself holds another
+        // clone of the same relay, so — independent of the simulator's own
+        // task queue — nothing frees this on its own. `SimCluster::restart`
+        // already clears each OLD relay generation as it's superseded (see
+        // that method's own comment); this covers the FINAL generation for
+        // every node, grown ones included, since `self.shared`'s own `ctxs`
+        // vec is kept current by both `new`/`restart`/`grow`.
+        for ctx in self.shared.ctxs.lock().expect("ctxs poisoned").iter() {
+            ctx.relay.shutdown();
+        }
+        // Then drain the simulator's own still-pending tasks, breaking the
+        // SEPARATE Simulator/SimEnv task-queue cycle a perpetual background
+        // loop (heartbeat, the reconciler, auto-split, the backup janitor,
+        // …) forms — see `Simulator::shutdown`'s own doc in `animus-sim`.
         self.sim.shutdown();
     }
 }
@@ -2464,6 +2480,24 @@ impl SimCluster {
         ));
 
         let mut ctx = self.shared.ctx(node);
+        // Break the OLD relay's own installed-handler self-cycle (see
+        // `SimRelayClient::shutdown`'s own doc for the mechanism) before
+        // superseding it below — the closure `SimCluster::new`/a prior
+        // `restart` installed on it captured a clone of the ClientCtx this
+        // node had *then*, which itself held a clone of this same relay,
+        // so nothing outside an explicit clear ever frees that generation:
+        // `ctx.relay = fresh_relay.clone()` only drops this ONE reference
+        // to it (the field on the ctx local to this call), never the
+        // closure's own captured one sitting inside the relay's own
+        // handler slot. Without this, every restart in a scenario leaks
+        // one more whole node-generation's worth of state (edge/backup/
+        // segment handles, the control handle at that point, …) — found
+        // investigating the animusd `sim_cluster_*` tier's per-test RSS
+        // growth persisting after `Simulator::shutdown` alone (that fix
+        // breaks the *separate* Simulator-task-queue cycle a perpetual
+        // background loop forms, not this one) — see `docs/engineering-
+        // lessons.md`'s matching entry.
+        ctx.relay.shutdown();
         ctx.control = GenericControlHandle::Local(fresh_control.clone());
         ctx.relay = fresh_relay.clone();
 
@@ -3232,6 +3266,115 @@ mod tests {
                 true,
                 Some(b"customers row".to_vec()),
                 Duration::from_secs(5),
+            );
+        }
+    }
+
+    /// Regression for the reference-cycle leak `Drop for SimCluster`/
+    /// `SimCluster::restart` exist to break — proved with `Weak` handles,
+    /// never RSS (root `CLAUDE.md`'s own rule: an RSS assertion is flaky,
+    /// and "memory didn't shrink" doesn't by itself distinguish a true
+    /// leak from ordinary allocator retention).
+    ///
+    /// **The mechanism this catches**: `SimRelayClient::serve`'s installed
+    /// handler closure (installed in `SimCluster::new`/`restart`/`grow`)
+    /// captures a `ClientCtx` clone that itself holds another clone of the
+    /// very `SimRelayClient` it's installed on (`ctx.relay`) — a self-cycle
+    /// entirely internal to that one `Arc`-backed handler slot, no help
+    /// from the simulator's own task queue needed at all. It is a
+    /// *separate* cycle from the `Simulator`/`SimEnv` task-queue one
+    /// `animus_sim::Simulator::shutdown` breaks (found and fixed first,
+    /// same investigation): fixing only that one left this fixture's
+    /// per-test RSS growth completely unchanged, because every node's own
+    /// `ClientCtx` — and everything it reaches (`edge`'s `control`/
+    /// `raftkv` registries, `backup_store`, …) — stayed reachable through
+    /// this second cycle regardless. See `SimRelayClient::shutdown`'s own
+    /// doc (`animus-node`) for the full mechanism and `docs/engineering-
+    /// lessons.md`'s matching entry for the incident.
+    ///
+    /// Two things are proved here, not just the final state: (1) a
+    /// `restart` breaks the OLD relay generation's cycle immediately, not
+    /// only at the cluster's own eventual `Drop` — checked right after
+    /// restarting node 0, before the cluster itself ever drops; (2) `Drop
+    /// for SimCluster` frees every node's *current* generation — checked
+    /// after dropping the whole cluster, for the relay handler slot and
+    /// both of `ClusterEdgeState`'s own `Arc`-backed registries.
+    #[test]
+    fn dropping_the_cluster_frees_every_nodes_relay_and_edge_state() {
+        let seed = 0xC1EA_5E17u64;
+        let mut cluster = SimCluster::new(seed, 2, 2);
+        cluster.create_table("orders");
+        let tablet = cluster.tablet_of("orders").expect("just created");
+        let leader = cluster
+            .leader_index_of(tablet)
+            .expect("the fresh group elected a leader");
+        cluster
+            .put(leader, "orders", "cust-1", "order-1", b"v")
+            .expect("write succeeds");
+
+        // (1) A restart's own OLD-generation cycle break, checked
+        // immediately — not deferred to the cluster's eventual `Drop`.
+        let old_relay_weak = cluster.shared.ctx(0).relay.downgrade_handler();
+        assert!(
+            old_relay_weak.is_alive(),
+            "sanity: node 0's pre-restart relay handler must still be alive"
+        );
+        cluster.restart(0);
+        assert!(
+            !old_relay_weak.is_alive(),
+            "node 0's PRE-restart relay handler slot is still alive right after \
+             `SimCluster::restart` — the old generation's cycle was not broken at \
+             restart time (see `SimCluster::restart`'s own `ctx.relay.shutdown()` call)"
+        );
+
+        cluster.poll_until_get_eq(
+            leader,
+            "orders",
+            "cust-1",
+            "order-1",
+            true,
+            Some(b"v".to_vec()),
+            Duration::from_secs(5),
+        );
+
+        // (2) `Drop for SimCluster` frees every node's own CURRENT
+        // generation. `Weak` handles taken while the cluster is still
+        // fully alive, checked only after it drops.
+        let mut relay_weaks = Vec::new();
+        let mut control_weaks = Vec::new();
+        let mut raftkv_weaks = Vec::new();
+        for node in 0..cluster.node_count() as u64 {
+            let ctx = cluster.shared.ctx(node);
+            assert!(
+                ctx.relay.downgrade_handler().is_alive(),
+                "sanity: node {node}'s relay handler must still be alive before drop"
+            );
+            relay_weaks.push(ctx.relay.downgrade_handler());
+            control_weaks.push(ctx.edge.downgrade_control());
+            raftkv_weaks.push(ctx.edge.downgrade_raftkv());
+        }
+
+        drop(cluster);
+
+        for (node, w) in relay_weaks.iter().enumerate() {
+            assert!(
+                !w.is_alive(),
+                "node {node}'s relay handler slot is still alive after the cluster \
+                 dropped — the SimRelayClient handler-closure cycle is not fully broken"
+            );
+        }
+        for (node, w) in control_weaks.iter().enumerate() {
+            assert!(
+                w.strong_count() == 0,
+                "node {node}'s edge.control registry is still alive after the cluster \
+                 dropped"
+            );
+        }
+        for (node, w) in raftkv_weaks.iter().enumerate() {
+            assert!(
+                w.strong_count() == 0,
+                "node {node}'s edge.raftkv registry is still alive after the cluster \
+                 dropped"
             );
         }
     }
