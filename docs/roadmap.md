@@ -953,15 +953,23 @@ the still-true paragraph after the table.
   already generic.
 - **Depends:** C-08 (closed) — this rung is C-08's own close-out
   recommendation, stacked directly on it.
-- **Status (2026-09-08):** open — PR 1 (docs opener) and PR 2 (groundwork:
+- **Status (2026-09-08):** open — PR 1 (docs opener), PR 2 (groundwork:
   `TtlReaperProgressHost`/the `ttl_reaper.rs` wrapper widened to `<E: Env,
   R: RelayClient>`, `SimCluster`'s always-on per-node reaper spawn at a
   200ms sim interval, `SimCluster::drive_ttl_sweep`, and the first
-  `sim_cluster_ttl.rs` smoke pair) landed; PRs 3–5 (extending `sim_
-  cluster_ttl.rs` with the rest of `tests/dynamo_ttl.rs`'s scenarios,
-  admin/console residue, docs close-out) to follow. See ADR 0061's "Rung
-  I, PR 2 landed" amendment and `crates/animusd/CLAUDE.md`'s matching
-  appendix for the full record.
+  `sim_cluster_ttl.rs` smoke pair), and PR 3 (`sim_cluster_ttl.rs` extended
+  with 5 more scenarios, 5/8 of the remaining `tests/dynamo_ttl.rs` tests —
+  three stay real-socket: `expired_item_is_still_readable_immediately`
+  (the fixture's `OP_BUDGET`-per-call granularity cannot suppress the
+  always-on reaper for even one wire round trip), and
+  `update_time_to_live_enable_and_disable_round_trip`/`disable_with_a_
+  mismatched_attribute_name_is_rejected` (both need `DescribeTimeToLive`,
+  which has no arm in `dynamo::dispatch_item_op` yet — a
+  `crates/animusd/src/dynamo.rs` gap outside this PR's edit scope, not a
+  scenario-design defect) landed, 420 `sim_cluster` tests green; PRs 4–5
+  (admin/console residue, docs close-out) to follow. See ADR 0061's "Rung
+  I, PR 3" amendment and `crates/animusd/CLAUDE.md`'s matching appendix
+  for the full record.
 
 ---
 

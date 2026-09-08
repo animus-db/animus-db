@@ -7049,3 +7049,101 @@ visibility change) are untouched.
 
 See `crates/animusd/CLAUDE.md`'s matching "C-09 PR 2" appendix and
 `docs/roadmap.md`'s C-09 entry for the crate-level pointer and status.
+
+## 2026-09-08 amendment — Rung I, PR 3 (`sim_cluster_ttl.rs` extended)
+
+PR 3's own scope — converting the remaining 8 of `tests/dynamo_ttl.rs`'s 9
+tests — is 5/8 done: `sim_cluster_ttl.rs` gained 5 new scenarios (e)-(i)
+(the three always-on-loop "never deleted" negatives — future expiry,
+wrong-type attribute, the five-year safety window; the refreshed-TTL-
+survives outcome; and the stream `userIdentity` scenario, reusing C-07
+PR 3's wire shapes as module-private local copies since the originals
+aren't exported across modules), plus the `_over_seeds` sibling PR 2's own
+two scenarios had not yet gained. **Two more scenarios were attempted,
+written, then reverted** — see the next paragraph. See
+`crates/animusd/CLAUDE.md`'s matching "C-09 PR 3" appendix for the full
+9-test mapping table.
+
+**Three tests do not convert, and this amendment corrects PR 1's own "no
+residue expected" plan text.** `expired_item_is_still_readable_
+immediately` stays in a trimmed `tests/dynamo_ttl.rs` for the reason PR 1's
+own plan text failed to anticipate: every `SimCluster` wire call's
+`spawn_and_capture` drives `self.sim.run_for(OP_BUDGET)` (12s)
+unconditionally, and `animus_sim::Simulator::run_until` always drains every
+scheduled event up to that deadline before returning — it does not stop
+early once the awaited future itself resolves. With the always-on TTL
+reaper ticking every `SIM_TTL_SWEEP_INTERVAL` (200ms), a single wire call
+already spans 60 sweep opportunities, so by the time a `PutItem` writing an
+already-expired attribute returns, the reaper has already had dozens of
+chances to reap it — there is no way to issue a subsequent `GetItem` and
+reliably observe the pre-reap state. This is the mirror image of the
+caution PR 1's plan text stated ("any assertion that depends on catching an
+intermediate sweep state... must use `drive_ttl_sweep`/a short `run_for`,
+never an ordinary op call"): that caution protects an assertion that needs
+to *force* an intermediate state, not one that needs to *suppress* one, and
+no "hold the reaper back between two wire calls" primitive exists
+(`drive_ttl_sweep` only ever adds sweeps, on top of whatever the always-on
+loop already ran). The refreshed-TTL scenario (h) looked similarly fragile
+at first read but isn't: the original real-socket test's own doc already
+scopes its claim to the *observable outcome* (item present, correct
+refreshed value), not the tighter scan-vs-propose timing (explicitly
+disclaimed as covered elsewhere, by `animus-cp-data`'s own OCC seatbelt
+tests) — and DynamoDB's own upsert-on-missing `UpdateItem` semantics mean
+that outcome holds whether the reaper's conditional delete was skipped or
+the item was deleted then recreated, so it converts cleanly despite the
+same `OP_BUDGET` granularity.
+
+`update_time_to_live_enable_and_disable_round_trip` and `disable_with_a_
+mismatched_attribute_name_is_rejected` (the original suite's own (c) and
+(d)) were written as `sim_cluster_ttl.rs` scenarios but reverted once
+actually run: both depend on `DescribeTimeToLive`, and `dynamo::
+dispatch_item_op` — the generic (`SimEnv`-capable) dispatch path
+`SimClusterHandle::dynamo` calls through — has no arm for it. Every
+`DescribeTimeToLive` call under `SimCluster` fails with a `500`
+("this operation is not yet supported by the generic (SimEnv-capable)
+dispatch path"), even though its write-side sibling, `UpdateTimeToLive`,
+was widened onto this exact path in ADR 0061 rung H (C-08 PR 2) — the two
+operations are asymmetric in what's already wired. Closing this needs a
+`crates/animusd/src/dynamo.rs` change: widening `describe_time_to_live` to
+`<E: Env, R: RelayClient>` (it already takes `_ctx: &ClientCtx` unused, so
+this is a pure signature change) and adding an `Operation::
+DescribeTimeToLive` arm to `dispatch_item_op`, mirroring `UpdateTimeToLive`
+'s own precedent exactly — both scenarios (and their `describe_ttl_via_wire`
+helper) were reverted out of `sim_cluster_ttl.rs` rather than landed against
+a 500, and both original tests were kept in `tests/dynamo_ttl.rs` with this
+reasoning stated inline. A future PR that widens `dynamo.rs` this way can
+convert both in a few lines.
+
+**One deviation from this rung's own template, recorded rather than
+silently applied**: no `ANIMUS_TTL_SEEDS` env var was added, and
+`corpus-deep.yml` was left untouched. PR 3's own task brief asked for both,
+modeled on the two dedicated multi-cell corpus files
+(`sim_cluster_corpus.rs`/`sim_cluster_dynamo_corpus.rs`, the only two
+`sim_cluster*` files `corpus-deep.yml` actually wires up). Grepping every
+other converted-suite `sim_cluster_*.rs` module in the crate
+(`sim_cluster_console_stream.rs`, `sim_cluster_backup_janitor.rs`,
+`sim_cluster_dynamo_streams.rs`, and the rest) shows their own `_over_seeds`
+siblings all use a fixed `for i in 0..5 { .. }` loop with no env var at
+all — an env-var depth knob is a corpus-file-only convention, not a
+per-scenario-module one. `sim_cluster_ttl.rs` follows the verified
+majority (fixed 5-seed loop) instead of inventing an unused knob, per this
+codebase's own "grep the code before implementing a documented gap" habit
+(root `CLAUDE.md`'s Engineering practices section) — the same habit this
+correction itself is an instance of.
+
+**Gates**: run and green. `cargo fmt --all --check`, `cargo clippy -p
+animusd --all-targets --all-features -- -D warnings`, and `cargo build -p
+animusd --tests` all clean; `cargo test -p animusd --lib sim_cluster_ttl --
+--test-threads=2` (14 passed, 0 failed); the trimmed `cargo test -p animusd
+--test dynamo_ttl` (3 passed, 0 failed — down from 9, up from the originally
+planned 1, per the two reverted scenarios above); `cargo test -p animusd
+--lib sim_cluster -- --test-threads=2` (**420 passed, 0 failed, 2 ignored**,
+1113.93s test time — PR 2's own 408-test baseline plus this PR's net 12 new
+`#[test]` functions: 16 written (7 new scenarios × 2 each, pinned +
+`_over_seeds`, plus the 2 `_over_seeds` added to PR 2's existing (a)/(b))
+minus the 4 reverted with scenarios (c)/(d); peak resident memory 962204 kB
+(~940 MB) per `/usr/bin/time -v`'s "Maximum resident set size", in line with
+every prior rung's own no-leak trajectory). `Cargo.lock` unchanged.
+
+See `crates/animusd/CLAUDE.md`'s matching "C-09 PR 3" appendix and
+`docs/roadmap.md`'s C-09 entry for the crate-level pointer and status.

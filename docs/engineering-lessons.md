@@ -57,6 +57,53 @@ debugging anything that feels like it might have happened before.
   without its fix) and issue #298 (a flake carried across five shapes
   before a root cause): both got expensive precisely because red was
   tolerated for a while.
+- **`SimCluster`'s per-op `OP_BUDGET` always fully drains the shared virtual
+  clock, so a "not yet happened" assertion against a fast always-on
+  background loop cannot be expressed the way it can under a real, slow
+  interval (2026-09-08, ADR 0061 rung I C-09 PR 3).** `SimCluster::dynamo`/
+  `put`/etc. all go through `spawn_and_capture`, which calls
+  `self.sim.run_for(OP_BUDGET)` (12s) unconditionally; `animus_sim::
+  Simulator::run_until` always drains every scheduled event up to that
+  deadline before returning, regardless of how quickly the awaited future
+  itself resolved. Any background loop with a period well under `OP_BUDGET`
+  (the always-on TTL reaper's 200ms `SIM_TTL_SWEEP_INTERVAL` is 60x
+  shorter) therefore gets dozens of ticks *inside* a single ordinary wire
+  call, not just between separate calls. That makes "write a
+  should-already-be-actionable state, then immediately check it hasn't
+  been acted on yet" scenarios structurally unreachable through the wire
+  entry point — the original real-socket test this pattern converts from
+  (`dynamo_ttl.rs::expired_item_is_still_readable_immediately`) relies on
+  a *slow* production-scale interval specifically to keep that window
+  open, and `SimCluster` has no "hold a background loop back for N calls"
+  primitive to substitute (a `drive_*` helper only ever forces extra
+  ticks, never suppresses the always-on ones). Before assuming a
+  `SimCluster` conversion of a "still in the pre-action state" test is
+  just a matter of picking the right helper, check whether the assertion
+  needs the always-on loop to have had *zero* chances, not just to have
+  had no reason to act — if so, it may be a genuine, well-reasoned residual
+  to leave on `ProdEnv`, not a gap in fixture coverage. A "never acts on
+  this input" assertion (the opposite: many ticks are fine because none of
+  them should do anything) has no such problem and converts cleanly.
+- **A `SimCluster` conversion is blocked at the wire-operation level, not
+  just the scenario-design level, whenever the underlying `dynamo::
+  dispatch_item_op` has no arm for the operation a test needs — and that
+  gap can be narrower than a whole operation family (2026-09-08, ADR 0061
+  rung I C-09 PR 3).** `UpdateTimeToLive` was widened onto the generic
+  (`SimEnv`-capable) dispatch path in ADR 0061 rung H (C-08 PR 2), but its
+  read-side sibling, `DescribeTimeToLive`, was not — `dispatch_item_op` has
+  no `Operation::DescribeTimeToLive` arm at all, so any `SimCluster`
+  scenario that calls it 500s with "this operation is not yet supported by
+  the generic... dispatch path." A test converted before actually running
+  it under `SimEnv` (this rung's own PR 3 was authored without compiling,
+  per its own task brief) can look complete and still be blocked on a gap
+  one operation away from a sibling that already works — always run the
+  new scenario before trusting the design doc's own "converts cleanly"
+  claim. When the fix needs a source file outside the task's own edit
+  scope (here, `crates/animusd/src/dynamo.rs`), the right move is not to
+  paper over it by asserting a different status code or skipping the
+  assertion — it is to leave the original real-socket test in place with a
+  one-line reason naming the missing dispatch arm, exactly as if the
+  fixture itself couldn't express the scenario at all.
 - **A `dynamo_retry`+`CreateTable` fixture helper must tolerate
   `ResourceInUseException` on the retry, not just retry 500s (2026-08-31,
   issue #461).** `create_table` (`crates/animusd/src/schema.rs`) calls the
