@@ -13,6 +13,15 @@
 //!
 //! Real time + sockets, so it brings the cluster up with the documented
 //! port-TOCTOU bounded retry (`support::start_single_node`).
+//!
+//! **ADR 0061 rung H, C-08 PR 4**: five of this file's original nine tests
+//! converted to deterministic `SimCluster` siblings in
+//! `crates/animusd/src/sim_cluster_console_table_config.rs`
+//! (`table_detail_projects_full_configuration`, `stream_toggle_round_
+//! trips`, `ttl_set_and_clear_round_trips`, `delete_table_works`,
+//! `table_detail_with_no_pitr_or_backups_is_null_and_empty`) and were
+//! removed from here. The four remaining tests below stay `ProdEnv`, each
+//! with its own reason comment.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -125,115 +134,15 @@ fn assert_no_cluster_shape(body: &str) {
     }
 }
 
-/// `GET /console/api/tables/{name}` projects a table's full configuration
-/// correctly across the dimensions that vary: with/without a sort key, a
-/// GSI (with its lifecycle status), an LSI (which must NOT carry a
-/// `status`/hash-attribute field — it isn't a GSI), a stream, and TTL.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn table_detail_projects_full_configuration() {
-    timeout(Duration::from_secs(30), async {
-        let dir = support::panic_safe_tempdir();
-        let (node, _config) =
-            support::start_single_node(dir.path(), animusd::StorageBackend::Memory).await;
-        let dynamo_addr = node.dynamo_addr();
-        let console_addr = node.console_addr();
-
-        // ---- a hash-only table, no sort key --------------------------
-        let (status, body) = dynamo(
-            dynamo_addr,
-            "DynamoDB_20120810.CreateTable",
-            r#"{"TableName":"simple","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
-                "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
-        )
-        .await;
-        assert_eq!(status, 200, "CreateTable(simple) failed: {body}");
-
-        let (status, body) = console(console_addr, "GET", "/console/api/tables/simple", "").await;
-        assert_eq!(status, 200, "table detail failed: {body}");
-        let d = json(&body);
-        assert_eq!(d["name"], "simple");
-        assert_eq!(d["partition_key"]["name"], "id");
-        assert!(d["sort_key"].is_null());
-        assert!(d["gsis"].as_array().unwrap().is_empty());
-        assert!(d["lsis"].as_array().unwrap().is_empty());
-        assert_eq!(d["stream"]["enabled"], false);
-        assert_eq!(d["ttl"]["enabled"], false);
-        assert_no_cluster_shape(&body);
-
-        // ---- a full-featured table: sort key + GSI + LSI + stream ----
-        let (status, body) = dynamo(
-            dynamo_addr,
-            "DynamoDB_20120810.CreateTable",
-            r#"{"TableName":"full",
-                "AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"},
-                                         {"AttributeName":"sk","AttributeType":"S"},
-                                         {"AttributeName":"cat","AttributeType":"S"},
-                                         {"AttributeName":"score","AttributeType":"N"}],
-                "KeySchema":[{"AttributeName":"pk","KeyType":"HASH"},
-                             {"AttributeName":"sk","KeyType":"RANGE"}],
-                "GlobalSecondaryIndexes":[
-                    {"IndexName":"by-cat",
-                     "KeySchema":[{"AttributeName":"cat","KeyType":"HASH"}],
-                     "Projection":{"ProjectionType":"ALL"}}],
-                "LocalSecondaryIndexes":[
-                    {"IndexName":"by-score",
-                     "KeySchema":[{"AttributeName":"pk","KeyType":"HASH"},
-                                  {"AttributeName":"score","KeyType":"RANGE"}]}],
-                "StreamSpecification":{"StreamEnabled":true,"StreamViewType":"NEW_AND_OLD_IMAGES"}}"#,
-        )
-        .await;
-        assert_eq!(status, 200, "CreateTable(full) failed: {body}");
-        let (status, body) = dynamo(
-            dynamo_addr,
-            "DynamoDB_20120810.UpdateTimeToLive",
-            r#"{"TableName":"full",
-                "TimeToLiveSpecification":{"Enabled":true,"AttributeName":"expiresAt"}}"#,
-        )
-        .await;
-        assert_eq!(status, 200, "UpdateTimeToLive(full) failed: {body}");
-
-        let (status, body) = console(console_addr, "GET", "/console/api/tables/full", "").await;
-        assert_eq!(status, 200, "table detail failed: {body}");
-        let d = json(&body);
-        assert_eq!(d["sort_key"]["name"], "sk");
-        let gsis = d["gsis"].as_array().unwrap();
-        assert_eq!(gsis.len(), 1);
-        assert_eq!(gsis[0]["name"], "by-cat");
-        assert_eq!(gsis[0]["hash_attribute"]["name"], "cat");
-        assert!(gsis[0]["sort_attribute"].is_null());
-        assert_eq!(
-            gsis[0]["status"], "ACTIVE",
-            "a table created non-empty gets its GSIs Active immediately (ADR 0041 §5)"
-        );
-        let lsis = d["lsis"].as_array().unwrap();
-        assert_eq!(lsis.len(), 1);
-        assert_eq!(lsis[0]["name"], "by-score");
-        assert_eq!(lsis[0]["sort_attribute"]["name"], "score");
-        assert!(
-            lsis[0].get("status").is_none(),
-            "an LSI row carries no lifecycle status field: {body}"
-        );
-        assert_eq!(d["stream"]["enabled"], true);
-        assert_eq!(d["stream"]["view_type"], "NEW_AND_OLD_IMAGES");
-        assert_eq!(d["ttl"]["enabled"], true);
-        assert_eq!(d["ttl"]["attribute_name"], "expiresAt");
-        assert_no_cluster_shape(&body);
-
-        // ---- an unknown table 404s -------------------------------------
-        let (status, body) =
-            console(console_addr, "GET", "/console/api/tables/nope", "").await;
-        assert_eq!(status, 404, "unknown table: {body}");
-        assert_eq!(json(&body)["error"], "no such table");
-
-        node.shutdown_graceful().await;
-    })
-    .await
-    .expect("test timed out");
-}
-
 /// Adding a GSI through the console shows it `CREATING` (a populated table's
 /// added index backfills, ADR 0045 §2) and it later converges to `ACTIVE`;
 /// dropping it removes it from the detail response.
+///
+/// **KEPT `ProdEnv` (ADR 0061 rung H, C-08 PR 4)**: blocker (d) —
+/// `UpdateTable` with an index change has no `dispatch_table_op` sub-arm
+/// (`add_gsi`/`drop_gsi` both route through it and would hit
+/// `unsupported_by_generic_dispatch`); the index-DDL residual this whole
+/// rung's opener named out of scope.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn add_and_drop_gsi_round_trip() {
     timeout(Duration::from_secs(30), async {
@@ -353,6 +262,9 @@ async fn add_and_drop_gsi_round_trip() {
 /// fresh `GET /console/api/tables/{name}` afterward (a real replicated-
 /// catalog round trip, not just an echo of the request). Companion to
 /// `add_and_drop_gsi_round_trip`'s own no-type case just above.
+///
+/// **KEPT `ProdEnv` (ADR 0061 rung H, C-08 PR 4)**: identical blocker (d)
+/// as `add_and_drop_gsi_round_trip` above.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn add_gsi_records_a_declared_attribute_type() {
     timeout(Duration::from_secs(30), async {
@@ -424,6 +336,9 @@ async fn add_gsi_records_a_declared_attribute_type() {
 /// `S`/`N`/`B`, case-insensitively) is a client error, matching real
 /// DynamoDB's own rejection of an unknown `AttributeType` — never silently
 /// dropped or defaulted.
+///
+/// **KEPT `ProdEnv` (ADR 0061 rung H, C-08 PR 4)**: identical blocker (d)
+/// as `add_and_drop_gsi_round_trip` above.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn add_gsi_rejects_an_unknown_attribute_type() {
     timeout(Duration::from_secs(30), async {
@@ -457,230 +372,22 @@ async fn add_gsi_rejects_an_unknown_attribute_type() {
     .expect("test timed out");
 }
 
-/// The stream toggle round-trips: enable with a view type, then disable.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn stream_toggle_round_trips() {
-    timeout(Duration::from_secs(30), async {
-        let dir = support::panic_safe_tempdir();
-        let (node, _config) =
-            support::start_single_node(dir.path(), animusd::StorageBackend::Memory).await;
-        let dynamo_addr = node.dynamo_addr();
-        let console_addr = node.console_addr();
-
-        let (status, body) = dynamo(
-            dynamo_addr,
-            "DynamoDB_20120810.CreateTable",
-            r#"{"TableName":"events","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
-                "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
-        )
-        .await;
-        assert_eq!(status, 200, "CreateTable failed: {body}");
-
-        // ---- enable --------------------------------------------------
-        let (status, body) = console(
-            console_addr,
-            "POST",
-            "/console/api/tables/events/stream",
-            r#"{"enabled":true,"view_type":"NEW_IMAGE"}"#,
-        )
-        .await;
-        assert_eq!(status, 200, "enable stream failed: {body}");
-        let resp = json(&body);
-        assert_eq!(resp["stream"]["enabled"], true);
-        assert_eq!(resp["stream"]["view_type"], "NEW_IMAGE");
-        assert_no_cluster_shape(&body);
-
-        let (status, body) = console(console_addr, "GET", "/console/api/tables/events", "").await;
-        assert_eq!(status, 200);
-        let d = json(&body);
-        assert_eq!(d["stream"]["enabled"], true);
-        assert_eq!(d["stream"]["view_type"], "NEW_IMAGE");
-
-        // ---- disable ---------------------------------------------------
-        let (status, body) = console(
-            console_addr,
-            "POST",
-            "/console/api/tables/events/stream",
-            r#"{"enabled":false}"#,
-        )
-        .await;
-        assert_eq!(status, 200, "disable stream failed: {body}");
-        let resp = json(&body);
-        assert_eq!(resp["stream"]["enabled"], false);
-        assert!(resp["stream"]["view_type"].is_null());
-
-        let (status, body) = console(console_addr, "GET", "/console/api/tables/events", "").await;
-        assert_eq!(status, 200);
-        assert_eq!(json(&body)["stream"]["enabled"], false);
-
-        node.shutdown_graceful().await;
-    })
-    .await
-    .expect("test timed out");
-}
-
-/// TTL set/clear round-trips (ADR 0051).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn ttl_set_and_clear_round_trips() {
-    timeout(Duration::from_secs(30), async {
-        let dir = support::panic_safe_tempdir();
-        let (node, _config) =
-            support::start_single_node(dir.path(), animusd::StorageBackend::Memory).await;
-        let dynamo_addr = node.dynamo_addr();
-        let console_addr = node.console_addr();
-
-        let (status, body) = dynamo(
-            dynamo_addr,
-            "DynamoDB_20120810.CreateTable",
-            r#"{"TableName":"sessions","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
-                "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
-        )
-        .await;
-        assert_eq!(status, 200, "CreateTable failed: {body}");
-
-        // ---- set ---------------------------------------------------------
-        let (status, body) = console(
-            console_addr,
-            "POST",
-            "/console/api/tables/sessions/ttl",
-            r#"{"enabled":true,"attribute_name":"expiresAt"}"#,
-        )
-        .await;
-        assert_eq!(status, 200, "set ttl failed: {body}");
-        let resp = json(&body);
-        assert_eq!(resp["ttl"]["enabled"], true);
-        assert_eq!(resp["ttl"]["attribute_name"], "expiresAt");
-        assert_no_cluster_shape(&body);
-
-        let (status, body) = console(console_addr, "GET", "/console/api/tables/sessions", "").await;
-        assert_eq!(status, 200);
-        let d = json(&body);
-        assert_eq!(d["ttl"]["enabled"], true);
-        assert_eq!(d["ttl"]["attribute_name"], "expiresAt");
-
-        // ---- clear (disable) ----------------------------------------------
-        let (status, body) = console(
-            console_addr,
-            "POST",
-            "/console/api/tables/sessions/ttl",
-            r#"{"enabled":false,"attribute_name":"expiresAt"}"#,
-        )
-        .await;
-        assert_eq!(status, 200, "clear ttl failed: {body}");
-        let resp = json(&body);
-        assert_eq!(resp["ttl"]["enabled"], false);
-
-        let (status, body) = console(console_addr, "GET", "/console/api/tables/sessions", "").await;
-        assert_eq!(status, 200);
-        assert_eq!(json(&body)["ttl"]["enabled"], false);
-
-        node.shutdown_graceful().await;
-    })
-    .await
-    .expect("test timed out");
-}
-
-/// Deleting a table through the console removes it from the tables list and
-/// its own detail endpoint 404s afterward.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn delete_table_works() {
-    timeout(Duration::from_secs(30), async {
-        let dir = support::panic_safe_tempdir();
-        let (node, _config) =
-            support::start_single_node(dir.path(), animusd::StorageBackend::Memory).await;
-        let dynamo_addr = node.dynamo_addr();
-        let console_addr = node.console_addr();
-
-        let (status, body) = dynamo(
-            dynamo_addr,
-            "DynamoDB_20120810.CreateTable",
-            r#"{"TableName":"scratch","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
-                "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
-        )
-        .await;
-        assert_eq!(status, 200, "CreateTable failed: {body}");
-
-        let (status, body) = console(console_addr, "GET", "/console/api/tables/scratch", "").await;
-        assert_eq!(status, 200, "table exists before delete: {body}");
-
-        let (status, body) =
-            console(console_addr, "DELETE", "/console/api/tables/scratch", "").await;
-        assert_eq!(status, 200, "delete_table failed: {body}");
-        assert_eq!(json(&body)["ok"], true);
-        assert_no_cluster_shape(&body);
-
-        let (status, body) = console(console_addr, "GET", "/console/api/tables/scratch", "").await;
-        assert_eq!(status, 404, "table gone after delete: {body}");
-
-        let (status, body) = console(console_addr, "GET", "/console/api/tables", "").await;
-        assert_eq!(status, 200);
-        let names: Vec<String> = json(&body)["tables"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|t| t["name"].as_str().unwrap().to_string())
-            .collect();
-        assert!(
-            !names.contains(&"scratch".to_string()),
-            "dropped table absent from the tables list: {names:?}"
-        );
-
-        // Deleting an already-gone table 404s rather than pretending success.
-        let (status, body) =
-            console(console_addr, "DELETE", "/console/api/tables/scratch", "").await;
-        assert_eq!(status, 404, "double-delete: {body}");
-
-        node.shutdown_graceful().await;
-    })
-    .await
-    .expect("test timed out");
-}
-
-/// U-03: `GET /console/api/tables/{name}` gains `pitr` and `backups`. A
-/// table with neither enabled/created shows `pitr: null` and an empty
-/// `backups` array — never an omitted field, and never a fabricated
-/// non-empty answer.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn table_detail_with_no_pitr_or_backups_is_null_and_empty() {
-    timeout(Duration::from_secs(30), async {
-        let dir = support::panic_safe_tempdir();
-        let (node, _config) =
-            support::start_single_node(dir.path(), animusd::StorageBackend::Memory).await;
-        let dynamo_addr = node.dynamo_addr();
-        let console_addr = node.console_addr();
-
-        let (status, body) = dynamo(
-            dynamo_addr,
-            "DynamoDB_20120810.CreateTable",
-            r#"{"TableName":"plain",
-                "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
-                "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
-        )
-        .await;
-        assert_eq!(status, 200, "CreateTable failed: {body}");
-
-        let (status, body) = console(console_addr, "GET", "/console/api/tables/plain", "").await;
-        assert_eq!(status, 200, "table detail failed: {body}");
-        let d = json(&body);
-        assert!(d["pitr"].is_null(), "no PITR enabled: {body}");
-        assert!(
-            d["backups"].as_array().unwrap().is_empty(),
-            "no backups created: {body}"
-        );
-        assert_no_cluster_shape(&body);
-
-        node.shutdown_graceful().await;
-    })
-    .await
-    .expect("test timed out");
-}
-
 /// U-03's round trip: enable continuous backups (PITR) and create an
 /// on-demand backup, then confirm the table detail page reports both — the
 /// exact fields `DescribeContinuousBackups`/`ListBackups` themselves would
 /// report, sourced from the same catalog reads (`animusd::dynamo::
 /// pitr_description`/`backup_wire_status`), never re-derived — and nothing
 /// cluster-shaped alongside them.
+///
+/// **KEPT `ProdEnv` (ADR 0061 rung H, C-08 PR 4)**: this rung's brief
+/// allowed converting this test only if the PITR data it reads is
+/// producible under `SimCluster` via a generic `UpdateContinuousBackups`
+/// path — checked against the code and there isn't one:
+/// `Operation::UpdateContinuousBackups` is absent from both `dispatch_
+/// item_op`'s and `dispatch_table_op`'s `match` arms (`dynamo.rs`), so it
+/// falls to `unsupported_by_generic_dispatch`, unlike `CreateBackup`/
+/// `DeleteBackup`/`UpdateTimeToLive`, which PR 2 did widen. Backup/PITR
+/// data stays a separate residual, per the brief's own fallback reason.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn table_detail_shows_pitr_status_and_backups() {
     timeout(Duration::from_secs(30), async {

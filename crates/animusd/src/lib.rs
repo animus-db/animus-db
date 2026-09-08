@@ -18899,6 +18899,45 @@ mod sim_cluster_dynamo_streams;
 #[cfg(test)]
 mod sim_cluster_stream_janitor;
 
+/// ADR 0061 rung H (post-C-07): admin/console/dashboard `SimCluster`
+/// dispatch (C-08), PR 3 — the first real scenario coverage of
+/// `SimCluster::console` (PR 2's own two smoke tests only proved the
+/// primitive reaches live state at all): the tables-list projection, the
+/// create-table form's full declaration + validation, the Items tab's
+/// Scan/Query/GetItem/PutItem/DeleteItem round trip (base table and, via
+/// `SimCluster::drain_gsi`, a named GSI), and the console's own JSON-
+/// routing/error-mapping contract (`tests/console_endpoint.rs`'s non-
+/// framing tail). See this module's own doc for the full scenario list and
+/// `crates/animusd/CLAUDE.md`'s matching appendix for the per-test
+/// conversion mapping and what stays `ProdEnv` (real HTTP framing/static
+/// assets/CORS, and the two control-only/data-only role-split tests).
+#[cfg(test)]
+mod sim_cluster_console;
+
+/// ADR 0061 rung H (post-C-07): admin/console/dashboard `SimCluster`
+/// dispatch (C-08), PR 4 — the console table page's Stream data tab
+/// (`tests/console_stream.rs`): the honest disabled answer for a stream-
+/// less table, the shard list/iterator/records read path reflecting real
+/// writes, and a bounded multi-page walk over a sealed shard (via
+/// `SimCluster::drive_stream_seal`). The one TTL-reaper-identity test in
+/// that file stays `ProdEnv` — this fixture never spawns `animusd::ttl_
+/// reaper::ttl_reaper_loop`, so there is nothing that would ever reap the
+/// item this test's own assertion depends on; see this module's own doc
+/// for the full disposition table.
+#[cfg(test)]
+mod sim_cluster_console_stream;
+
+/// ADR 0061 rung H (post-C-07): admin/console/dashboard `SimCluster`
+/// dispatch (C-08), PR 4 — the console table page's Config tab
+/// (`tests/console_table_config.rs`): full-configuration projection, the
+/// stream/TTL toggles, table deletion, and the PITR/backups-absent shape.
+/// Three GSI-DDL tests and the PITR-present test stay `ProdEnv` — see this
+/// module's own doc for the full disposition table and why (blocker (d):
+/// `UpdateTable` with an index change, and `UpdateContinuousBackups`,
+/// neither has a generic dispatch arm).
+#[cfg(test)]
+mod sim_cluster_console_table_config;
+
 /// Regression for the issue #298 residual confirmed live under the
 /// un-pinned `SplitMode::InPlace` proof soak (ADR 0018's matching amendment,
 /// `docs/engineering-lessons.md`'s matching entry): a stage blocked by
