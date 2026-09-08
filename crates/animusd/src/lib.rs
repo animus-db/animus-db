@@ -19031,6 +19031,18 @@ mod sim_cluster_dashboard;
 /// under real-thread contention.
 #[cfg(test)]
 mod sim_cluster_seed_latency;
+/// ADR 0061 rung I (C-09 PR 2): two pinned-seed smoke tests proving the
+/// always-on `ttl_reaper::ttl_reaper_loop` spawn (`SimCluster::new`/
+/// `restart`) and `SimCluster::drive_ttl_sweep` both work end to end
+/// against real replicated `Metadata` and a real `SimEnv` wall clock
+/// (`animus_sim::SimEnv::wall_now`) — a `PutItem` with a TTL attribute a
+/// few virtual seconds in the past is reaped by the always-on loop within
+/// one `run_for` past `SIM_TTL_SWEEP_INTERVAL`; a future-expiry item
+/// survives a `drive_ttl_sweep` on its leader. PR 3 extends this module
+/// with the remainder of `tests/dynamo_ttl.rs`'s own scenarios — see
+/// `crates/animusd/CLAUDE.md`'s matching C-09 appendix.
+#[cfg(test)]
+mod sim_cluster_ttl;
 
 /// Regression for the issue #298 residual confirmed live under the
 /// un-pinned `SplitMode::InPlace` proof soak (ADR 0018's matching amendment,

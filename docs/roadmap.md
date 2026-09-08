@@ -953,9 +953,15 @@ the still-true paragraph after the table.
   already generic.
 - **Depends:** C-08 (closed) — this rung is C-08's own close-out
   recommendation, stacked directly on it.
-- **Status (2026-09-08):** open — PR 1 (this docs opener) landed; PRs 2–5
-  (groundwork, `sim_cluster_ttl.rs`, admin/console residue, docs
-  close-out) to follow.
+- **Status (2026-09-08):** open — PR 1 (docs opener) and PR 2 (groundwork:
+  `TtlReaperProgressHost`/the `ttl_reaper.rs` wrapper widened to `<E: Env,
+  R: RelayClient>`, `SimCluster`'s always-on per-node reaper spawn at a
+  200ms sim interval, `SimCluster::drive_ttl_sweep`, and the first
+  `sim_cluster_ttl.rs` smoke pair) landed; PRs 3–5 (extending `sim_
+  cluster_ttl.rs` with the rest of `tests/dynamo_ttl.rs`'s scenarios,
+  admin/console residue, docs close-out) to follow. See ADR 0061's "Rung
+  I, PR 2 landed" amendment and `crates/animusd/CLAUDE.md`'s matching
+  appendix for the full record.
 
 ---
 

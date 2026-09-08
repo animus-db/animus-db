@@ -95,7 +95,15 @@ impl<E: Env, R: RelayClient> BackupJanitorProgressHost for ClientCtx<E, R> {
 /// `BackupJanitorProgressHost` above, every node's own copy is a genuine
 /// live answer (the reaper runs everywhere, self-gated per tablet), never
 /// a stand-in for "not the leader."
-impl TtlReaperProgressHost for ClientCtx {
+///
+/// **Widened to `impl<E: Env, R: RelayClient> .. for ClientCtx<E, R>` (ADR
+/// 0061 rung I, C-09 PR 2)** — previously pinned to the concrete
+/// `ClientCtx` alias, the one remaining concrete impl this module's own
+/// doc comment (above) used to call out. `self.ttl_reaper_progress` is
+/// already `E`/`R`-agnostic (a plain `Arc<Mutex<..>>`), so this is a pure
+/// signature widening, the same shape `BackupJanitorProgressHost`
+/// immediately above it was already widened to.
+impl<E: Env, R: RelayClient> TtlReaperProgressHost for ClientCtx<E, R> {
     fn update_ttl_reaper_progress(&self, update: &mut dyn FnMut(&mut TtlReaperProgress)) {
         let mut guard = self.ttl_reaper_progress.lock().unwrap();
         update(&mut guard);

@@ -9151,3 +9151,93 @@ invocation available in that phase, but Phase B then rebased it onto PR
 no product or scenario-authoring bug found. See this file's own PR 7
 appendix, above, and ADR 0061's "Rung H, PR 7 landed" amendment for the
 full gate account.
+
+## Appendix — TTL reaper widened to the Env seam, running under SimCluster (ADR 0061 rung I, C-09 PR 2, 2026-09-08)
+
+Closes PR 2's own scope: `impl TtlReaperProgressHost for ClientCtx`
+(`client_ctx_host.rs`) widened from the bare concrete alias to `impl<E:
+Env, R: RelayClient> TtlReaperProgressHost for ClientCtx<E, R>` —
+mirroring `BackupJanitorProgressHost` immediately above it in the same
+file (`TtlScanHost` was already generic there, D4 PR 5) — and
+`animusd::ttl_reaper`'s thin wrapper widened to `<E: Env, R:
+RelayClient>` the identical way. Every production spawn site (`lib.rs`'s
+five `tokio::spawn(ttl_reaper::ttl_reaper_loop(ctx.clone(), ..))` call
+sites) passes a bare `ctx.clone()` (a `ClientCtx` with no explicit type
+arguments), so all five keep inferring `E = ProdEnv, R =
+AnimusdRelayClient` from `ClientCtx`'s own definition-site default with
+zero call-site changes — confirmed by `tests/dynamo_ttl.rs`'s untrimmed
+9-test suite staying green both before and after this widening (5.22s
+and 5.28s). `animus_node::ttl_reaper::ttl_sweep_one_tablet` widened from
+private to `pub` (a pure visibility change, no behavior change) so
+`SimCluster::drive_ttl_sweep` can drive the exact per-tablet sweep
+function the always-on loop already calls every tick, rather than
+reimplementing the scan/expire/delete control flow a second time —
+`animus_node::host::{TtlScanHost, TtlReaperProgressHost}` themselves
+needed no change at all.
+
+**`sim_cluster.rs`**: `SIM_TTL_SWEEP_INTERVAL` (200ms) joins the
+janitors' own interval constants; `ttl_reaper::ttl_reaper_loop` is
+spawned unconditionally on every node in both `SimCluster::new` and
+`::restart`, mirroring the backup/segment janitors' own always-on spawns
+exactly — this loop's own per-tablet leader gate (`TtlScanHost::
+led_tablets`) already makes a node leading nothing this tick a cheap
+idle sleep, so there is no reason to gate the spawn behind an opt-in the
+way `auto_split_loop` is. Two new accessors: `drive_ttl_sweep(node)` runs
+one full sweep to exhaustion over `node`'s own led tablets, through
+`ttl_sweep_one_tablet` with its own driver-local cursor (entirely
+separate from the always-on loop's own), for a scenario that must assert
+an intermediate, pre-cadence reaper state without waiting out the 200ms
+cadence — not a strict necessity given `OP_BUDGET` (12s) is 60x the sim
+interval, but useful for a single deterministic sweep with no leftover
+cadence noise; `ttl_reaper_progress(node)` mirrors `backup_janitor_
+progress`/`segment_janitor_progress` exactly (a plain lock/clone/drop,
+never held across an `.await`).
+
+**No `HashMap`/`Instant::now`/`tokio::spawn`/`tokio::time` found in
+either widened body** — `ttl_reaper_loop`/`ttl_sweep_one_tablet` already
+read `env.wall_now()`/`env.sleep()`/`env.now()` exclusively (ADR 0051 TTL
+is the one documented `wall_now()` use case), unlike a few `tokio::time`-
+body findings this same PR template has caught in sibling rungs
+(`index_drain::seal_now`, C-07 PR 2; `ClientCtx::
+admin_transfer_control_leadership`, C-08 PR 6) — confirmed by this PR's
+own scenario (a), the first thing to actually exercise the loop under
+`SimEnv`, not just by reading the source.
+
+**New module: `sim_cluster_ttl.rs`**, two pinned-seed smoke tests: (a) a
+`PutItem` with a TTL attribute a few virtual seconds in the past is
+reaped by the always-on loop within one `run_for` past
+`SIM_TTL_SWEEP_INTERVAL`, read back absent with `ConsistentRead: true`
+(ADR 0055), with the reaping node's own `TtlReaperProgress.deleted_total`
+confirmed `>= 1`; (b) an item with a future expiry survives a
+`drive_ttl_sweep` call on its own tablet leader. Both issue `PutItem`/
+`GetItem` from a **non-leader** of the table's tablet, mirroring every
+`sim_cluster_dynamo_*` sibling's own forwarding-path convention.
+`CreateTable`/`UpdateTimeToLive` are issued from node 0 (a schema-catalog
+mutation, no tablet leader to route around). PR 3 extends this module
+with the remainder of `tests/dynamo_ttl.rs`'s own 9 scenarios.
+
+**No product bug found.** Both scenarios passed on the first clean run.
+
+**Gates, in the required order**: `cargo test -p animusd --test
+dynamo_ttl` on the untouched file, both before this PR's changes and
+after (9 passed both times, 5.22s and 5.28s); `cargo build -p animusd
+--all-targets` (clean, no warnings — the checkpoint push happened here,
+before the gates below); `cargo test -p animusd --lib sim_cluster_ttl --
+--test-threads=2` (2 passed, 1.01s); `cargo test -p animusd --lib
+sim_cluster -- --test-threads=2` (**408 passed, 0 failed, 2 ignored,
+1078.10s** — 406 baseline + this PR's 2 new tests; RSS via the anchored
+sampler, `pgrep -f '^/home/user/animus-db/target/debug/deps/animusd-'`,
+every 10s: first ~70 MB, peak ~861 MB, last ~119 MB, consistent with
+every prior rung's own no-leak trajectory — the always-on reaper now
+runs inside every existing `SimCluster` test with no regression); `cargo
+test -p animus-node ttl` (1 passed via substring match; a full run of
+`--test ttl_reaper_sim` separately confirms both of that file's own
+tests still pass, since their names don't happen to contain the literal
+substring "ttl"); `cargo fmt --all --check` (one reformat needed —
+long call/format-string lines in the new file plus one method signature
+in `sim_cluster.rs`, applied via `cargo fmt --all`, then clean); `cargo
+clippy -p animusd --all-targets --all-features -- -D warnings` (clean).
+`Cargo.lock` unchanged.
+
+See ADR 0061's "Rung I, PR 2 landed" amendment and `docs/roadmap.md`'s
+C-09 entry for the full record.

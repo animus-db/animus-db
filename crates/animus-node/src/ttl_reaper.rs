@@ -230,7 +230,20 @@ where
 /// the tick's own last observed delete error (see the module doc's
 /// "Progress reporting" section) — mirrored on the caller's loop after
 /// every tablet in the tick has been visited.
-async fn ttl_sweep_one_tablet<E, H>(
+///
+/// **`pub` since ADR 0061 rung I (C-09 PR 2)** — previously private to
+/// this module. `animusd::SimCluster::drive_ttl_sweep` (a test-only
+/// convenience for a scenario that needs to assert an intermediate,
+/// pre-cadence reaper state without waiting out the always-on loop's own
+/// [`DEFAULT_TTL_SWEEP_INTERVAL`]-scale cadence) calls this directly,
+/// looping it to exhaustion over its own driver-local cursor, rather than
+/// reimplementing the per-tablet scan/expire/delete control flow a second
+/// time — the same "drive the real per-op primitive on demand" shape
+/// `index_drain::seal_now`/`drain_tablet` already have for
+/// `SimCluster::drive_stream_seal`/`drain_gsi`. No behavior change: this
+/// is a pure visibility widening, the exact function every tick of
+/// [`ttl_reaper_loop`] already calls.
+pub async fn ttl_sweep_one_tablet<E, H>(
     env: &E,
     host: &H,
     meta: &Metadata,
