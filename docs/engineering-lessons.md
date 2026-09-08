@@ -4174,6 +4174,56 @@ debugging anything that feels like it might have happened before.
   map snapshot; the fix (as here) was converge-or-timeout — keep writing
   until the count target is met, bounded by a generous stall timeout,
   never widen the window to move the threshold.
+- **A third costume of the same bug, in `animus-control` itself, issue
+  #741**: `crates/animus-control/tests/prod_liveness.rs`'s
+  `large_metadata_catch_up_stays_live` polled `node0.snapshot_index() >=
+  200 && node1.snapshot_index() >= 200` on a flat 600×50ms (30s) deadline,
+  and failed once on CI (`prod-liveness-scattered`) with `node0 snap=0,
+  node1 snap=64` — one replica's own apply task made **zero** forward
+  progress for the entire 30s window while its sibling made some (but not
+  enough). `snapshot_index()` only advances when the ADR 0038 apply task
+  (`meta_apply_and_compact`, `node.rs`) compacts — gated on **its own**
+  `engine_applied_index` crossing `SNAPSHOT_THRESHOLD` past the current
+  base, a task the consensus loop deliberately never waits on (see this
+  file's own `node.rs` doc comment: decoupling apply from `drive` is what
+  keeps a slow apply pass from stalling Raft's heartbeat/election
+  servicing). That decoupling is exactly what removes any
+  contention-independent bound on how long `snapshot_index()` takes to
+  advance — the identical DRIVER_APPLIED shape this section's own entries
+  above already name for `animusd`'s `engine_applied_index`-gated reads,
+  now confirmed in the plane that *originates* the mechanism, not just a
+  downstream consumer of it. Investigated live: 20/20 passed locally under
+  3 CPU-pinning `yes` spinners on a 4-core box, but one run finished in
+  27.5s against the 30s deadline — a genuine near-miss, not a clean
+  margin — and a from-scratch red-before attempt against the un-fixed code
+  under heavier (6-spinner) contention independently pushed the *other*
+  phase of the same test (node 2's own 12s catch-up budget) to 10.14s,
+  confirming apply/driver-loop timing in this test is measurably
+  contention-sensitive throughout, consistent with (never contradicting)
+  the CI failure's own asymmetric signature. Fixed the same way as the two
+  entries above: replaced the flat deadline with a progress-gated poll —
+  track each node's own `engine_applied_index()` (the exact counter
+  compaction is gated on) between ticks, and fail only once **both**
+  nodes' watermarks have made zero forward progress for a generous idle
+  window (`COMPACT_IDLE_STALL`, 60s, matching `animusd/tests/support::
+  IDLE_STALL_TIMEOUT`'s own convention) with the target still unmet, or a
+  much larger overall backstop (`COMPACT_OVERALL_BACKSTOP`, 150s) expires
+  — a livelock guard, not the normal exit path. The enclosing test's own
+  `timeout(..)` budget was widened from 90s to 210s to give this poll room
+  to legitimately use its new backstop; this is *not* "a longer deadline on
+  the wrong precondition" (the thing Session operating mode forbids) —
+  the precondition itself changed from "elapsed wall-clock time" to
+  "apply-task forward progress," and the poll fails fast the moment that
+  progress genuinely stops, regardless of how much of the outer budget is
+  left. No `SimEnv` regression was added: `wal_compaction.rs` and
+  `install_snapshot.rs` already prove the compaction *mechanism* (and its
+  O(chunk) `InstallSnapshot` cost) deterministically under `SimEnv`: this
+  file's own module doc states plainly that the real-thread integration
+  guard exists precisely because *scheduling contention on real threads*
+  is the one thing `SimEnv`'s virtual clock structurally cannot represent
+  — there is no interleaving to encode as a seed here, only real elapsed
+  time under real OS contention, which is this test's whole reason for
+  being a `ProdEnv` test at all.
 
 - **`SimCluster`'s hand-hosted tablets have no `Metadata::members` catalog
   behind them — a legacy-registered (no `CreateTable`) table's
@@ -15102,6 +15152,84 @@ artificial load, but a condition-based search polling `GET /admin/raft`'s
 where commit has advanced but apply hasn't, then firing the racing call at
 exactly that reading.
 
+**Amendment (issue #712, 2026-09-07): the bound-wait alone still measurably
+collides under real CI contention — a single stale read at one checkpoint
+should never be allowed to lock in a doomed, deterministic failure.** The
+regression test above (`control_membership_split.rs::
+admin_add_control_member_races_a_control_only_self_registration_and_still_
+converges`) started failing intermittently in CI (`prod-liveness-animusd`
+shard, ~1 run in 2-3 under real nextest-partition contention; reproduced
+locally at 2/30-2/70 under a 4-core host loaded with `yes`/other `animusd`
+integration binaries, 0 flake with `cargo test --workspace` off) with the
+exact `409`/"already claimed by a different registration" body the test
+guards against — proof the fix above narrows but does not close the
+window. Root cause: the fix's own read-your-writes barrier
+(`engine_applied_index() >= commit_index()`, bound-waited once, for up to
+`SCHEMA_COMMIT_TIMEOUT`) is a **single checkpoint** — if the apply task
+hasn't caught up by the time that one bound-wait's own timeout expires
+(plausible, not exotic, under real host contention: the apply task is an
+ordinary spawned task competing for the same CPU/disk every other
+concurrently-running test binary is hammering), the call falls through to
+read the still-stale cache exactly once, decides "genuinely unclaimed," and
+proposes a malformed `RegisterNode` (empty `client`/`admin`/`intra`) that
+is now doomed: Raft log order guarantees the target's own real
+self-registration (already committed before this call ever started
+waiting) applies *before* this malformed entry does, so the malformed
+entry's own apply-time CAS check is a **deterministic** collision, not a
+transient one — no amount of extra waiting inside that one proposal fixes
+it, because the wrong bytes were already sent. This is case (a) from the
+prompt (the wait can time out) compounding into case (c) (the racing
+self-registration legitimately, permanently owns the slot the malformed
+guess collides against) — widening `SCHEMA_COMMIT_TIMEOUT` would only
+raise the contention bar at which this reappears, not remove the
+determinism trap, so it was rejected as the fix.
+
+**The actual fix doesn't try to make the *first* read reliably fresh —
+it makes a stale first read recoverable.** `ClientCtx::register_node`'s own
+`Collision` verdict is *itself* backed by a `metadata_fresh()` read (see
+that method's own doc) — so the instant a caller observes `Collision`, its
+local cache is *guaranteed* to already hold whatever entry caused it
+(`ControlHandle::Local`'s `metadata_fresh()` and `metadata_cached()` are
+the same read). `admin_add_control_member`'s "genuinely unclaimed" branch
+used to retry-with-a-different-id only for a **minted** id and fail
+immediately on the very first `Collision` for an **operator-supplied** one
+— exactly the shape this admin action exists to serve (promoting an
+already-self-registering growth node by its own known id). Fixed by also
+retrying an operator-supplied id, **at the same id**, up to a small bound
+(`MAX_CLAIM_REFRESH_ATTEMPTS = 3`, `animusd::lib`) — each retry re-derives
+`addrs` from a fresh `metadata_cached()` read (the loop already did this
+per-iteration; the only change is *letting it loop* for this id shape). A
+stale-merge collision against the target's own now-applied self-
+registration re-merges to an *identical* `addrs` on the very next
+iteration, so the retry's own `register_node` call resolves as an
+idempotent no-op (`Registered`), typically within one extra attempt,
+independent of how long the apply task took to catch up. A **genuine**,
+permanent conflict (a real different registration holding the id) re-
+derives the identical conflicting `addrs` every time and still fails
+loudly — just after up to 3 bounded retries instead of the first one, a
+deliberate small latency cost on a rare admin path, never a correctness
+compromise (verified: `add_control_member_collision_shapes` and the wider
+`control_membership_admin.rs`/`admin_endpoint.rs` suites stay green).
+
+**General lesson, sharpened**: a read-your-writes barrier gated on a
+single bound-wait is a *timing* fix, not a *correctness* fix, whenever the
+decision it unblocks is otherwise irrevocable (here: proposing a
+byte-committed guess that will deterministically collide once racing state
+lands) — the barrier reduces how *often* the stale-read window is hit, it
+does not change what happens when it's hit anyway. Pair a bound-wait with
+a **retry that re-derives from a still-fresher signal the failure itself
+proves is now available** (a `Collision`/`Rejected` outcome from a
+`metadata_fresh()`-backed call is exactly such a signal) so a caller that
+loses the timing race the first time gets a second, now-unstale attempt
+instead of a deterministic failure. Reproduction discipline worth naming
+too: this bug needed *real* multi-process CPU contention to surface at any
+useful rate (a bare `yes`-loop on an otherwise idle host barely reproduces
+it; running several other heavy `animusd` `ProdEnv` integration binaries
+concurrently roughly doubled the observed rate on the same host) —
+matching CI's own nextest-partition shape (many real test processes
+sharing a runner) is what a flaky-under-load `ProdEnv` test's own repro
+loop should mirror, not just added CPU spin.
+
 ## Sourcing a real Google Fonts variable-font `.woff2` for embedding (ADR 0056's 2026-08-31 amendment, the Space Grotesk/Martian Mono → Work Sans/JetBrains Mono font swap)
 
 The Google Fonts CSS2 API (`https://fonts.googleapis.com/css2?family=...`)
@@ -22335,3 +22463,72 @@ groups), so the formatter has nothing to move. (4) When one side's `use`
 line is a superset of the other's, check that every name it carries is
 still used on the merged tree; `main` may have removed a use the branch
 never had.
+## A hardened test's own final assertion, added after the assertion that failed the last time, can carry the identical one-shot-on-an-eventual-property bug the hardening pass was meant to eliminate (issue #742, `split_placing_completion.rs`)
+
+**The failure**: `prod-liveness-animusd` on PR #717 (head 4d23cba0, unrelated
+to split/placing — it only lifted `update_table_throughput` into
+`dispatch_table_op`) failed
+`mark_split_placing_done_tolerates_a_stale_or_duplicate_relayed_propose`
+with `sibling child 3 unexpectedly not done` at the test's very last
+assertion, after the test's own `left`/`child` convergence poll and the
+duplicate-propose check both passed. The run took 5.4s, well inside its
+120s guard — not a timeout, not a stuck completion loop.
+
+**Root cause: (A), a test race, not a completion-loop defect.** The
+earlier "settle window" hardening pass documented above (see this file's
+"A 'just compare live state to the target' convergence check races the
+very proposer that sets the target" entry) fixed exactly this failure
+shape in this same file's *sibling* test
+(`placing_relocates_a_child_off_the_parents_original_nodes_and_the_
+completion_loop_marks_it_done`) — its own final section polls **both**
+children's `replicas`/`done` to convergence before ever asserting on
+either. But `mark_split_placing_done_tolerates_a_stale_or_duplicate_
+relayed_propose`'s closing assertion —
+
+```rust
+assert!(
+    split_placing_entry(&final_status, right).is_some_and(|(_, d)| d),
+    "sibling child {right} unexpectedly not done"
+);
+```
+
+— was a bare, unread one-shot check on `right`'s own `split_placing[..]
+.done`, an independently-converging value the completion loop marks per
+tablet, per tick, with no synchronization to this test's own poll
+granularity — the *exact* mistake the sibling test's own hardening pass
+named and fixed, just never applied to this second test in the same file.
+`right` was never polled anywhere in this test; only `left`/`child` had a
+bounded convergence loop, and by the time execution reached the final
+assert `right` had almost always (but, per this issue, not provably
+always) already converged too.
+
+**Evidence, not just reasoning**: 20/20 reproduction-loop runs under three
+`yes` spinners did not reproduce the failure directly (the race window is
+narrow here — both children fork under one `CutoverSplit` and are
+processed by the same per-tick completion loop, so by the time `left`'s
+own bounded poll, the duplicate-propose round trip, and a 500ms settle
+sleep have all elapsed, `right` has almost always caught up too).
+Temporary instrumentation (a non-assertion-affecting side poll logging
+`right`'s convergence latency at the point of the final assert) confirmed
+`right` was already `done` at that point in every one of 15 additional
+runs, converging in under 5ms once observed — consistent with "usually
+already converged, occasionally not" rather than "stuck": exactly the (A)
+signature, not (B) (a genuinely stuck completion loop would show `right`
+converging slowly or never across repeated observation, not converging in
+microseconds the moment it's checked).
+
+**The fix**: replaced the one-shot assert with a bounded
+converged-or-timeout poll for `right`, mirroring `child`'s own convergence
+loop earlier in the same test (same 60s deadline shape, same failure
+message convention naming the tablet and its current `split_placing`
+entry) — never a wider timeout, never `#[ignore]`, never a retry loop.
+Validated 20/20 under the identical spinner contention post-fix.
+
+**General lesson**: when a hardening pass fixes a one-shot-assert-on-an-
+eventual-property bug in one test, grep every *sibling* test in the same
+file (and file family) for the identical shape before considering the
+class closed — a fix applied to the test that happened to fail first does
+not retroactively harden a structurally identical assertion in a test
+that simply hadn't drawn the short straw yet. "The mechanism was already
+fixed for this file" is not evidence a specific assertion in that file was
+covered by the fix; check the assertion itself.
