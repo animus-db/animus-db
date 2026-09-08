@@ -3538,3 +3538,102 @@ after — unchanged since nothing in these six files was edited);
 `ANIMUS_SEED` replay of scenario (a) (green at seed `1`, `3228499975`,
 and the default) and scenario (g) (reproduces the finding identically at
 seed `3228499975` and the default). `Cargo.lock` unchanged.
+
+## 2026-09-07 amendment — #731 closed: `SimRelayClient::serve_loop` dispatches each inbound request onto its own task
+
+The finding this file's "C-06 PR 3" amendment recorded above —
+`animus_node::sim_relay::SimRelayClient::serve_loop`'s single-task, inline
+dispatch deadlocking on a nested outbound `relay()` call from inside a
+forwarded request's own handler (issue #731) — is fixed.
+
+**The fix**: `serve_loop` no longer `.await`s an inbound
+`RelayWire::Request`'s installed handler inline before looping back to
+`recv_stream` for the next message. It now dispatches each `Request` onto
+its own `env.spawn_task`ed task, mirroring `AnimusdRelayClient`'s own
+production shape (one `tokio::spawn`ed task per inbound TCP connection —
+the exact precedent this module's own doc already cited as the reason
+production has no analogous bottleneck). This loop stays the sole reader
+of `RELAY_STREAM` (single-consumer, ADR 0026 — that invariant did not need
+relaxing, only the *handling* of what it reads became concurrent, never
+the *receiving*), and also still delivers the reply to any of this node's
+own outbound `relay()` calls (the module doc's "one stream, two roles"
+section, unaffected). A `RelayWire::Reply` is still stashed inline,
+synchronously, in the loop itself — only `RelayWire::Request` dispatch
+moved onto a spawned task, since a reply-stash is cheap and non-blocking
+and gains nothing from spawning.
+
+**No new correlation mechanism was needed.** `RelayWire`'s `req_id` +
+the pre-existing `Pending`-slot `BTreeMap` already handle an arbitrary
+number of concurrent in-flight requests/replies — the *client* side of
+exactly this concurrency was already proven by the pre-existing
+`concurrent_outstanding_requests_resolve_to_the_right_callers` unit test.
+The deadlock was purely a server-side sequencing bug: the correlation
+story was already sound for concurrent use, it just couldn't be reached
+because the receive loop itself was the bottleneck.
+
+**Still fully deterministic and seed-reproducible.** Dispatch runs on
+`env.spawn_task` — the seeded `Simulator`'s own single-threaded
+cooperative executor, never a raw `tokio::spawn` (this crate has no
+`tokio` dependency at all) — so introducing concurrency here did not
+introduce nondeterminism; it only gave the already-seeded scheduler more
+tasks to interleave among, per `animus-sim/CLAUDE.md`'s own account of how
+that scheduler orders ready tasks and timeline events.
+
+**Verification, and a second, deeper finding the fix itself uncovered.**
+`cargo test -p animus-node`: 137 passed (unchanged — the fix touches no
+public contract, only `serve_loop`'s own internal dispatch shape). An
+ordinary forwarded read (no nested relay involved) was re-confirmed
+unaffected. `ANIMUS_SIMCLUSTER_SEEDS=10 cargo test -p animusd --lib
+sim_cluster_corpus` and `ANIMUS_DYNAMO_WIRE_SEEDS=10 cargo test -p animusd
+--lib sim_cluster_dynamo_corpus` both stayed green — the relay is on every
+forwarded op's path in both corpora, so this is the ordering/determinism
+regression net for the concurrency change itself, confirming nothing
+regressed.
+
+`coordinator_never_finished_past_prepare_recovers_atomically` and its
+`_over_seeds` sibling (`crates/animusd/src/sim_cluster_dynamo_transact.rs`,
+scenario (g)) were un-ignored and re-run to directly confirm the deadlock
+itself is gone: at both the original pinned seed and the first
+`_over_seeds` seed, the poll loop no longer returns `SimRelayClient::
+relay`'s timeout text at all — proof the nested relay hop this scenario
+needs now succeeds. **But the scenario still does not converge**, for a
+second, distinct, pre-existing reason this fix's own removal of the
+deadlock made reachable for the first time: `ClientCtx::txn_recover`
+(`crates/animusd/src/txn_coordinator.rs`) computes its own grace-check
+`now_ms` as an *elapsed near-zero duration* (`self.env.now().
+duration_since(self.env.now())`), not an absolute timestamp, whenever
+`cp_route` resolves to anything other than `Local` — the ordinary case for
+this scenario's own on-demand recovery push, which runs on the
+*participant*'s tablet leader, not necessarily the *anchor*'s. A near-zero
+`now_ms` makes the grace check's `now_ms < view.created_ts.wall_ms +
+RECOVERY_GRACE` comparison true forever, so recovery declines
+(`Pending`) on every call, permanently. This is pre-existing — introduced,
+and knowingly left unfixed as out of scope, by rung C5 step 3b's `tokio::
+time::Instant::now().elapsed()` → `Env` conversion above (see that rung's
+own bullet: "reproducing the identical near-zero result rather than
+'fixing' what reads like a pre-existing latent bug — an incidental bug
+gets its own PR") — unrelated to and unmodified by this rung's relay fix.
+It was unreachable before this rung only because issue #731's own deadlock
+intercepted every recovery attempt before `txn_recover` was ever actually
+called. Both tests are kept `#[ignore]`d, with the full diagnosis in their
+own doc comment (`coordinator_never_finished_past_prepare_recovers_
+atomically`'s own doc has the complete two-stage account); **issue #731
+itself is closed** (the relay deadlock, this rung's own scope), and **a
+new issue is to be filed** against `ClientCtx::txn_recover`'s non-local
+grace-check branch, a different subsystem entirely.
+
+`cargo test -p animusd --lib`: 365 passed / 5 ignored before this fix →
+365 passed / 5 ignored after (0 regressions — the two tests stayed
+`#[ignore]`d, now for the second, distinct reason above instead of the
+first).
+
+See `crates/animus-node/CLAUDE.md`'s matching "`sim_relay`'s dispatch
+model" entry, `crates/animusd/CLAUDE.md`'s updated scenario-(g) account,
+and `docs/engineering-lessons.md`'s matching entries (the general lesson
+on a test double that serializes what production runs concurrently hiding
+deadlocks only nested calls reveal, and the follow-up on how fixing one
+such deadlock can unmask an independent bug underneath it) for the full
+record. `docs/roadmap.md`'s C-06 entry is updated to note issue #731's own
+closure and the new finding; PRs 4-7 of that series (the wire corpus,
+PartiQL siblings, PartiQL sim tests, docs close-out) remain open and
+unrelated to either.
