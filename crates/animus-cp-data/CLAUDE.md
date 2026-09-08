@@ -1961,7 +1961,14 @@ already-known `txn_id`" scenario the public API (which always mints a
 
 One binary per behavior; the file names describe them (`ls
 crates/animus-cp-data/tests/`) — covering single-tablet Raft mechanics,
-automatic reconfiguration/leadership-transfer, the ADR 0026/0041/0042/0043
+automatic reconfiguration/leadership-transfer (`tests/reconfigure_trigger.rs`
+— the full failure cascade: a node crashes, is marked `Down`, and the
+reconciler auto-replaces it onto a spare; `tests/reconfigure_healthy_drop.rs`
+is its "drop a healthy voter" sibling, issue #781 — a direct
+`CasTabletReplicas` drop of a live follower, and separately the leader
+itself, through the real `spawn_reconfigure_loop`/`reconfigure_step`,
+asserting the removed replica does not go on to disrupt the converged group;
+depth knob `ANIMUS_RECONFIGURE_DROP_SEEDS`), the ADR 0026/0041/0042/0043
 stream-addressing/`KindBatch`/`KIND_CURSOR`/`ClusterSegmentStore` suites,
 the ADR 0018 HLC/MVCC/range-seal/transaction suites, the `host.rs`
 reconciler end to end, the ADR 0044 phase-2 heartbeat-batcher baseline
