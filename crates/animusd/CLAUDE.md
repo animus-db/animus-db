@@ -6574,6 +6574,39 @@ full per-PR accounting, including PR #753's fix for the two
 surfaced (previously filed, in this file's C-06 PR 4 appendix below, as
 an unfixed "resource-scale finding" — now root-caused and closed).
 
+**Streams — the residual C-06's own close-out named next in line — is
+closed by C-07 (landed 2026-09-08, ADR 0061's "Rung G"/"Rung G closed"
+amendments, `docs/roadmap.md`).** `dynamo_streams.rs`'s eight functions
+and the segment janitor's tick/loop are now `<E, R>`-generic, reachable
+through a new parallel entry point (`dynamo_streams::execute_streams_
+op_as`, since `execute_routed_as` forks on the wire target prefix one
+layer above `dispatch_item_op` and could never reach it otherwise) plus
+`SimCluster::drive_stream_seal`/an unconditional per-node janitor spawn
+(C-07 PRs 2/3/5 — `sim_cluster_dynamo_streams.rs`,
+`sim_cluster_stream_janitor.rs`). `crates/animusd/tests/dynamo_
+streams.rs` (2 of 15 tests) and `tests/stream_janitor.rs` (2 of 11 tests)
+stay in the `tests/*.rs` tree **deliberately, trimmed rather than
+deleted whole** — each remaining test needs a genuine `ProdEnv` property
+(real-WAL restart durability, the real periodic seal timer's own race,
+the production port guard, a real control-only/data-only role split) —
+per the same "keep the real-socket residual, don't force-convert or
+delete it" call this file's Transact/PartiQL paragraph above already
+made. `stream_backfill_seed_filter.rs` (2 tests) and `console_stream.rs`
+(4 tests) were never this rung's to claim and are unaffected, filed under
+"index DDL beyond plain `CreateTable`" and admin/console/dashboard HTTP
+respectively; `streams_e2e.rs` (12 tests) stayed untouched throughout,
+frozen behind #298/#745. Two findings this series surfaced and fixed
+along the way, both scenario/fixture-local rather than product bugs
+(the second) or a product bug fixed in place (the first): `index_
+drain::seal_now`'s commit-wait poll read the real wall clock despite an
+already-`<E, R>`-generic signature (fixed; `pitr_seal_now`'s identical
+twin deliberately left as a documented open gap), and a `SimCluster` op
+call's fixed 12s `OP_BUDGET` advance can retire a short-retention row
+before an immediately-after-the-call assertion runs (fixed
+scenario-locally). `cargo test -p animusd --lib` reached 315 passed / 2
+ignored at the sim tier after PR 5, no leak trajectory — see ADR 0061's
+"Rung G closed" amendment for the full per-PR accounting.
+
 **Standing rule for new `animusd` logic tests**: default to a
 `sim_cluster_*` sibling module (`SimCluster::dynamo`/`dynamo_concurrent`/
 `create_table_with_replication`, or the generic `dispatch_item_op`/
@@ -8328,3 +8361,18 @@ stream_janitor` (5 passed, 0 failed — the real-socket regression proving
 `segment_janitor_loop`/`segment_janitor_tick`'s widened signature stayed
 byte-identical, and the two kept `stream_janitor.rs` tests still pass).
 `Cargo.lock` unchanged.
+
+## Appendix — C-07 closed, docs-only close-out (ADR 0061 rung G, C-07 PR 6, 2026-09-08)
+
+No source, test, or `Cargo` change — this appendix, this file's own
+"Streams — closed by C-07" residual-inventory paragraph above (Tests
+section), ADR 0061's "Rung G closed" amendment, and `docs/roadmap.md`'s
+C-07 entry are the entire PR. Streams is no longer a D3-closing-inventory
+residual in progress: `dynamo_streams.rs` (12 of 15 converted) and
+`stream_janitor.rs` (9 of 11 converted) are both closed, `stream_backfill_
+seed_filter.rs`/`console_stream.rs` were never this rung's to claim and
+are unaffected, and `streams_e2e.rs` stayed untouched throughout, frozen
+behind #298/#745. See ADR 0061's "Rung G closed" amendment for the full
+PR-by-PR account, the complete per-test `ProdEnv` residue with reasons,
+and the two in-scope findings (the `seal_now` real-clock body bug fixed
+in PR 2, the `OP_BUDGET`-vs-retention timing lesson from PR 5).

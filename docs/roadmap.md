@@ -693,12 +693,11 @@ the still-true paragraph after the table.
 
   **What remains unowned after C-06**, per the D3-closing residual
   inventory (`crates/animusd/CLAUDE.md`'s Tests section) with Transact and
-  PartiQL now removed from it: admin/console/dashboard HTTP, **Streams
-  (now owned by C-07, opened 2026-09-08 — see that entry below)**, TTL,
-  the control/data role split, `--config` bring-up, index DDL beyond
-  plain `CreateTable`, node assembly/raw `ClientRequest`, and the
-  throttle-metric counters. None of the other seven groups has a rung
-  against it today.
+  PartiQL now removed from it: admin/console/dashboard HTTP, Streams
+  (closed in turn by C-07, 2026-09-08 — see that entry below), TTL, the
+  control/data role split, `--config` bring-up, index DDL beyond plain
+  `CreateTable`, node assembly/raw `ClientRequest`, and the throttle-metric
+  counters. None of the other seven groups has a rung against it today.
 - **ADR:** [0061](adr/0061-testability-node-crate-simulator.md) — the
   2026-09-07 "Rung F" amendment (see its 2026-09-08 "Rung F, PR 4"/"Rung F,
   PR 5"/"Rung F, PR 6" addenda for PR 4/5/6's own accounts, and its "Rung F
@@ -769,13 +768,32 @@ the still-true paragraph after the table.
   cores this rung builds directly on, plus C-06's own Transact widening,
   which is what makes `dynamo_streams.rs`'s Transact-on-a-streamed-table
   pair convertible at all.
-- **Status:** open 2026-09-08. PR 1 (this opener), PR 2 (groundwork),
-  PR 3 (the Streams read API), and PR 4 (`dynamo_streams.rs` siblings —
-  12 converted, 3 kept `ProdEnv`, that file closed) have landed. PR 5
-  (the segment janitor widened + `stream_janitor.rs` siblings — 9
-  converted, 2 kept `ProdEnv`, that file closed) has landed — see ADR
-  0061's matching 2026-09-08 "Rung G, PR 5" amendment. PR 6 (docs
-  close-out) remains.
+- **Status (2026-09-08):** closed. All six PRs landed (#758-#762, plus
+  PR 6). `dynamo_streams.rs` (15 tests: 12 converted, 3 kept `ProdEnv`)
+  and `stream_janitor.rs` (11 tests: 9 converted, 2 kept `ProdEnv`) are
+  both closed — the Streams read API, stream enable/disable, on-demand
+  shard sealing, and the segment janitor's two-phase retention sweep are
+  all `SimCluster`-reachable, 26 tests converted across two new modules
+  (`sim_cluster_dynamo_streams.rs`, `sim_cluster_stream_janitor.rs`).
+  `stream_backfill_seed_filter.rs` (2 tests, filed under the separate
+  "index DDL beyond plain `CreateTable`" residual) and `console_stream.rs`
+  (4 tests, filed under admin/console/dashboard HTTP) were never this
+  rung's to claim and stay `ProdEnv`, unaffected; `tests/streams_e2e.rs`
+  (12 tests) stayed untouched throughout, frozen behind #298/#745. Two
+  in-scope findings along the way, both scenario/fixture-local (not
+  product bugs beyond the first, and both already recorded in
+  `docs/engineering-lessons.md`): `index_drain::seal_now`'s commit-wait
+  poll read the real wall clock despite an already-`<E, R>`-generic
+  signature (fixed, `pitr_seal_now`'s identical twin left as a documented
+  open gap for a future rung); and a `SimCluster` op call's fixed 12s
+  `OP_BUDGET` advance can retire a short-retention row before an
+  immediately-after-the-call assertion runs (fixed scenario-locally by
+  widening retention past the budget). What remains unowned after C-07:
+  admin/console/dashboard HTTP, TTL, the control/data role split,
+  `--config` bring-up, index DDL beyond plain `CreateTable`, node
+  assembly/raw `ClientRequest`, and the throttle-metric counters — six
+  groups, none with a rung against it today. See ADR 0061's "Rung G
+  closed" amendment for the full account.
 
 ---
 
@@ -854,7 +872,7 @@ wave are independent and can run in parallel.
 | 5 | *S-04, S-05, S-07b–d, C-02, C-05 all landed 2026-09-06* | S-05 strictly after S-04 |
 | 6 | *S-03 complete 2026-09-07 (all 3 PRs, ADR 0069)*; *S-07e/S-07 complete 2026-09-07 (ADR 0070)*; *C-03 assessed 2026-09-07 — deferred, no PRs planned (see ADR 0044's matching amendment)*; W-07 | XL or gated on earlier waves |
 | 7 | C-06 (closed 2026-09-08 — all seven PRs landed: #728, #729, #732, #748, #750, #756, plus this PR; issues #731 and #737 both fixed 2026-09-07) | Gated on C-04 (closed 2026-09-07) — the D4 `Reconciler` and D3 generic dispatch cores it builds on |
-| 8 | C-07 (open 2026-09-08 — PR 1, this docs opener, landed) | Gated on C-04 (closed) and C-06 (closed) — the same generic dispatch cores, plus C-06's own Transact widening |
+| 8 | C-07 (closed 2026-09-08 — all six PRs landed: #758, #759, #760, #761, #762, plus PR 6) | Gated on C-04 (closed) and C-06 (closed) — the same generic dispatch cores, plus C-06's own Transact widening |
 
 Open issues mapped: none left (#375 closed by W-01, #319 by W-05). Filed
 from wave 2's own findings: #590 (the operator still emits the deleted
