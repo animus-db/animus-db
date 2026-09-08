@@ -6534,7 +6534,8 @@ handshake, DNS resolution, SigV4, OTLP export, raw framing, stays
 fixture doesn't have yet, 65 files/317 tests, split by what's missing —
 admin/console/dashboard HTTP (10/66), PartiQL (2/37), join/growth/
 decommission (9/34), Transact (6/32), index DDL beyond plain `CreateTable`
-(9/30), backup/PITR/export/import (6/29), Streams (3/28), control/data
+(9/30), backup/PITR/export/import (6/29), Streams (3/28, owned by C-07
+(ADR 0061 rung G) as of 2026-09-08), control/data
 role split (5/21), reconciler-driven split/rebalance/GC (7/13), TTL
 (1/9), node assembly/raw `ClientRequest` (2/8), throttle metric counters
 (1/6), auto-split loops (2/2), `--config` bring-up (2/2) —

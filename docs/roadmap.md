@@ -694,9 +694,10 @@ the still-true paragraph after the table.
   **What remains unowned after C-06**, per the D3-closing residual
   inventory (`crates/animusd/CLAUDE.md`'s Tests section) with Transact and
   PartiQL now removed from it: admin/console/dashboard HTTP, **Streams
-  (next in line)**, TTL, the control/data role split, `--config` bring-up,
-  index DDL beyond plain `CreateTable`, node assembly/raw `ClientRequest`,
-  and the throttle-metric counters. None of these eight groups has a rung
+  (now owned by C-07, opened 2026-09-08 — see that entry below)**, TTL,
+  the control/data role split, `--config` bring-up, index DDL beyond
+  plain `CreateTable`, node assembly/raw `ClientRequest`, and the
+  throttle-metric counters. None of the other seven groups has a rung
   against it today.
 - **ADR:** [0061](adr/0061-testability-node-crate-simulator.md) — the
   2026-09-07 "Rung F" amendment (see its 2026-09-08 "Rung F, PR 4"/"Rung F,
@@ -710,6 +711,65 @@ the still-true paragraph after the table.
   both load-bearing prerequisites this rung builds directly on).
 - **Status (2026-09-08):** closed. All seven PRs landed; see the PR 7
   close-out above for the full accounting.
+
+### C-07 Streams SimCluster dispatch
+
+- **Gap:** Streams is the residual the D3-closing inventory and the C-06
+  close-out both name as next in line — the largest remaining unowned
+  group after admin/console/dashboard HTTP. A read-only pass over this
+  tree finds four real-socket `crates/animusd/tests/*.rs` files touching
+  it: `dynamo_streams.rs` (15 tests), `stream_janitor.rs` (11 tests),
+  `console_stream.rs` (4 tests), and `stream_backfill_seed_filter.rs` (2
+  tests). The D3-closing inventory's own "Streams (3/28)" figure is three
+  of these four (`dynamo_streams.rs` + `stream_janitor.rs` +
+  `stream_backfill_seed_filter.rs` = 28); `console_stream.rs`'s 4 tests
+  are already filed under the separate admin/console/dashboard HTTP
+  group. `tests/streams_e2e.rs` (12 tests) is explicitly out of scope
+  throughout — frozen behind the open flake issue #298 (joined by #745
+  for this file), owned by whichever agent/issue closes those, never this
+  series.
+- **Plan:** the identical widen-to-`<E: Env, R: RelayClient>`-then-add-a-
+  parallel-generic-entry-point template D3/D4/C-06 already validated five
+  times, applied to `dynamo_streams.rs`'s eight read-path functions, the
+  stream-only `UpdateTable` sub-arm of `dispatch_table_op`, on-demand
+  shard sealing, and the segment janitor's tick/loop. The key reachability
+  finding: `dynamo.rs::execute_routed_as` forks on the `X-Amz-Target`
+  prefix *before* decoding into an `Operation` at all, so the generic
+  `execute_item_op_as`/`dispatch_item_op` core `SimCluster` already drives
+  can never reach a `DynamoDBStreams_20120810.*` target — a parallel
+  `dynamo_streams::execute_streams_op_as`/`SimClusterHandle::
+  dynamo_streams` pair is needed, mirroring the existing
+  `SimClusterHandle::dynamo`. See
+  [ADR 0061](adr/0061-testability-node-crate-simulator.md)'s 2026-09-08
+  "Rung G" amendment for the full account, including the precise
+  file/function blockers and the per-file scenario disposition (what
+  converts, what stays `ProdEnv` and why).
+- **PRs:** a six-PR series — (1) this docs opener; (2) groundwork (widen
+  `disable_stream`, a stream-only `UpdateTable` arm on
+  `dispatch_table_op`, `SegmentStoreHandle::S3` over a shared
+  `SimSegmentStore` in `SimCluster`, a new `SimCluster::
+  drive_stream_seal(node)`); (3) the Streams read API reachable (widen
+  `dynamo_streams.rs`'s eight functions, `execute_streams_op_as` +
+  `SimClusterHandle::dynamo_streams`, a new `sim_cluster_dynamo_
+  streams.rs` with ~8 scenarios); (4) `dynamo_streams.rs`'s 12
+  sim-convertible tests converted to `sim_cluster_dynamo_streams*.rs`
+  siblings, source trimmed to the two that stay `ProdEnv`; (5) the
+  segment janitor widened to `<E, R>` and spawned unconditionally under
+  `SimCluster` (the D4 PR 5 backup-janitor shape), covered by
+  `SimCluster`'s own `Drop`/`restart` shutdown path per issue #753, a new
+  `sim_cluster_stream_janitor.rs` with ~9 scenarios; (6) docs close-out.
+  Every production dispatch path (`execute_routed_as`, `execute_as`,
+  `run_operation`, `dynamo_streams::execute_as`) stays byte-identical
+  throughout — strictly additive, parallel new paths only, per the D2
+  PR 1 lesson (`docs/engineering-lessons.md`).
+- **Size:** M (six PRs, one real production dispatcher's worth of
+  `ProdEnv`-only surface to widen plus two new fault-injecting sim
+  suites).
+- **Depends:** C-04 (closed), C-06 (closed) — the D3/D4 generic dispatch
+  cores this rung builds directly on, plus C-06's own Transact widening,
+  which is what makes `dynamo_streams.rs`'s Transact-on-a-streamed-table
+  pair convertible at all.
+- **Status:** open 2026-09-08, PR 1 (this opener).
 
 ---
 
@@ -788,6 +848,7 @@ wave are independent and can run in parallel.
 | 5 | *S-04, S-05, S-07b–d, C-02, C-05 all landed 2026-09-06* | S-05 strictly after S-04 |
 | 6 | *S-03 complete 2026-09-07 (all 3 PRs, ADR 0069)*; *S-07e/S-07 complete 2026-09-07 (ADR 0070)*; *C-03 assessed 2026-09-07 — deferred, no PRs planned (see ADR 0044's matching amendment)*; W-07 | XL or gated on earlier waves |
 | 7 | C-06 (closed 2026-09-08 — all seven PRs landed: #728, #729, #732, #748, #750, #756, plus this PR; issues #731 and #737 both fixed 2026-09-07) | Gated on C-04 (closed 2026-09-07) — the D4 `Reconciler` and D3 generic dispatch cores it builds on |
+| 8 | C-07 (open 2026-09-08 — PR 1, this docs opener, landed) | Gated on C-04 (closed) and C-06 (closed) — the same generic dispatch cores, plus C-06's own Transact widening |
 
 Open issues mapped: none left (#375 closed by W-01, #319 by W-05). Filed
 from wave 2's own findings: #590 (the operator still emits the deleted
