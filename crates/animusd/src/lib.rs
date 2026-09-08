@@ -5249,6 +5249,49 @@ impl Node {
         self.test_ctx.clone()
     }
 
+    /// Test-only (issue #734): abort every background maintenance task this
+    /// node spawned — route/intra-route sync, metrics sampling, the
+    /// failure-detection heartbeat, the tablet-host reconciler, the txn
+    /// resolver, the GSI drain/TTL reaper/backup/PITR/auto-split loops, and
+    /// the client/dynamo/admin/console listeners — while leaving every
+    /// hosted CP group and this node's own `ProdEnv`s fully live and
+    /// **un-halted**. Unlike [`shutdown`](Self::shutdown)/
+    /// [`shutdown_and_wait`](Self::shutdown_and_wait), this does NOT call
+    /// `halt_hosted_cp_groups()` and does NOT touch `self.envs` — a hosted
+    /// CP group keeps proposing/applying exactly as before, and its own
+    /// driver task (spawned internally by `animus-cp-data`, never a member
+    /// of `self.tasks`) is untouched.
+    ///
+    /// Exists so a test that talks to this node purely through
+    /// [`ctx_for_test`](Self::ctx_for_test)'s in-process `ClientCtx` (never
+    /// dialing any of the listeners this aborts) can deterministically
+    /// isolate one mechanism from every periodic background sweep that
+    /// would otherwise race it on real wall-clock time. Concretely:
+    /// `txn_resolver_loop`'s once-a-second sweep resolves a decided-but-
+    /// unresolved transaction's intent(s) unconditionally, on every tick,
+    /// for every anchor this node leads — a scenario that deliberately
+    /// leaves such an intent unresolved to observe `StageOutcome::
+    /// IntentBlocked` is racing that sweep on genuine, unbounded real
+    /// time, not a bug in the sweep itself. Under CI/sandbox CPU
+    /// contention that race is occasionally lost (`gates` job, run
+    /// 34155303366): the whole point of a background safety-net sweep is
+    /// that it can fire whenever real time allows, so no amount of test
+    /// speed makes winning against it a real guarantee. Calling this
+    /// after bring-up (and after any table provisioning the test still
+    /// needs a listener-free wait for) makes the isolation an
+    /// **invariant** instead of a race the test usually, but not always,
+    /// wins.
+    ///
+    /// Never call this on a node any test still reaches over a socket, and
+    /// never call it expecting further hosting/reconfiguration/GC to
+    /// happen — nothing spawned here runs again once aborted.
+    #[cfg(test)]
+    pub(crate) fn abort_background_tasks_for_test(&self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+
     /// Test hook (ADR 0068 §2, S-05): replace this node's S3 export
     /// customer-bucket store factory — e.g. with one built over
     /// `animus_s3::fake::FakeS3` instead of a real S3 endpoint, with no
@@ -17762,6 +17805,27 @@ mod sim_cluster_dynamo_update_add_delete;
 mod sim_cluster_dynamo_updated_return_values;
 #[cfg(test)]
 mod sim_cluster_kind_batch_outcome;
+/// Issue #734: the deterministic, real-time-free sibling of
+/// `issue_298_conflict_tests` below — the identical A-decided-but-
+/// unresolved / B-stages-and-observes-`IntentBlocked` / `push_resolution_
+/// if_decided` / B-restages-and-observes-`Staged` scenario, driven against
+/// a real `SimCluster` instead of a real-thread `ProdEnv` node. Since this
+/// fixture spawns no `txn_resolver_loop` (or any other background loop —
+/// `sim_cluster`'s own module doc), the property this scenario proves
+/// (`push_resolution_if_decided` clears a decided blocker so a fresh stage
+/// never spuriously conflicts) holds independent of real-thread timing —
+/// nothing here can race a background sweep that doesn't exist, unlike the
+/// real-thread test, which needed `Node::abort_background_tasks_for_test`
+/// to make the identical isolation claim actually true. A sibling of
+/// `sim_cluster_corpus`/`sim_cluster_dynamo`/`sim_cluster_dynamo_corpus`
+/// for the identical reason (needs `SimCluster`'s own `pub(crate)`
+/// surface, no further visibility widened). **Named `sim_cluster_txn_
+/// conflict`, not `sim_cluster_dynamo_transact`** — that name already
+/// belongs to the C-06 stack's own `TransactWriteItems`/`TransactGetItems`
+/// wire-level scenarios (a different file/PR); this module is about the
+/// raw 2PC coordinator primitives, never the DynamoDB wire.
+#[cfg(test)]
+mod sim_cluster_txn_conflict;
 
 /// ADR 0061 rung D3 PR 2a (C-04 D3): base-table DDL over the real DynamoDB
 /// wire, driven through the new `dynamo::dispatch_table_op` generic core —
@@ -18082,12 +18146,44 @@ mod issue_298_conflict_tests {
     /// investigation): asserts a fresh transaction's stage on a key
     /// blocked by an ALREADY-DECIDED-but-unresolved intent converges to
     /// success, never a spurious `TransactionConflict`.
+    ///
+    /// **Issue #734 (fixed): this test's own isolation claim used to be
+    /// aspirational, not real.** The whole scenario depends on `key`
+    /// holding a still-live `Intent(txn_a)` at the moment B's very first
+    /// `txn_prepare` call applies — but this node's own `txn_resolver_loop`
+    /// (spawned by `run_node`/`single_node` like every other background
+    /// loop) sweeps every decided-but-unresolved anchor **unconditionally,
+    /// once a second**, for as long as it runs, and A's own decide (just
+    /// above) is exactly what that sweep is designed to notice and resolve
+    /// on its own. Under ordinary fast execution the whole A/B dance
+    /// finishes in well under a second, so the sweep never gets a chance —
+    /// but that is a *speed* bet, not a guarantee, and a CI run under
+    /// `--test-threads=2` contention (`gates` job, run 34155303366) lost it
+    /// once: the sweep resolved A's intent first, so B's first stage
+    /// legitimately observed `Staged` instead of `IntentBlocked`
+    /// (`push_resolution_if_decided`'s own mechanism was never exercised
+    /// that run — not because it's broken, but because nothing was left
+    /// for it to push). `Node::abort_background_tasks_for_test` (below)
+    /// makes the isolation this test's own doc always claimed genuinely
+    /// true: every background sweep, `txn_resolver_loop` included, is
+    /// aborted right after the tablet is hosted/leader-elected and before
+    /// anything transaction-shaped happens, so nothing but this test's own
+    /// calls can ever touch `key`'s intent from here on.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_fresh_stage_pushes_a_decided_blockers_resolution_instead_of_conflicting() {
         let dir = tempfile::tempdir().unwrap();
         let node = single_node(dir.path()).await;
         let ctx = node.ctx_for_test();
         provision_and_await_leader(&node, &ctx, "issue298_conflict").await;
+        // Issue #734: stop every periodic background sweep (most
+        // importantly `txn_resolver_loop`, which would otherwise be free to
+        // resolve A's decided-but-unresolved intent on its own once-a-
+        // second cadence, racing this test's own deliberately-unresolved
+        // setup on real wall-clock time) now that the tablet is hosted and
+        // its leader is elected — everything from here on is a direct
+        // in-process `ClientCtx` call (`ctx_for_test`), never a socket, so
+        // none of the aborted listeners/loops are needed again.
+        node.abort_background_tasks_for_test();
 
         let key = dynamo::item_key(&AttributeValue::S("k1".to_string()), None);
 
@@ -18119,9 +18215,10 @@ mod issue_298_conflict_tests {
 
         // A single, direct `txn_prepare` attempt for B (never
         // `txn_prepare_pushing`'s own retry loop — this test asserts what
-        // ONE push accomplishes, deterministically, with no dependency on
-        // `txn_resolver_loop`'s independent per-second passive sweep also
-        // being capable of clearing this given enough wall-clock time).
+        // ONE push accomplishes). Deterministic since issue #734's fix:
+        // `txn_resolver_loop`'s own background sweep was aborted above, so
+        // there is no longer any real-time race it could win to clear this
+        // first — `key` is guaranteed to still hold `Intent(txn_a)`.
         let (_, _, _, _, outcome) = ctx
             .txn_prepare(
                 "issue298_conflict",
