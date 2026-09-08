@@ -310,7 +310,15 @@ struct ExportDataFile {
 /// `_started` marker first, then every `data/NNNN.json.gz` file, then
 /// `manifest-files.json`, then `manifest-summary.json` **last** — a reader
 /// (or this file's own [`read_all_exported_items`]) that finds the summary
-/// present can trust every earlier object is already fully written.
+/// present can trust every earlier object is already fully written. Also
+/// mirrors production's ambiguous-ack resolution on that terminal write
+/// (issue #707, ADR 0068's as-built amendment): a `SegmentStore::put`
+/// error on `manifest-summary.json` is not trusted at face value, since
+/// the store may have persisted the object and only lost the ack (exactly
+/// what `SimSegmentStore`'s own ack-lost fault models) — this function
+/// reads the object back and only propagates the error if it is genuinely
+/// absent. Every OTHER write here keeps the plain no-retry `?` production
+/// uses.
 ///
 /// **The one structural difference from production**: `run_export_job_
 /// inner` sweeps the whole table via ONE coordinator-level `cp_scan` (which
@@ -430,15 +438,27 @@ fn run_export_job_mirror(
         "outputFormat": "DYNAMODB_JSON",
     });
     let summary_key = format!("{root}/manifest-summary.json");
-    block_on(
-        store.put(
-            &summary_key,
-            serde_json::to_string(&summary)
-                .expect("json serializes")
-                .as_bytes(),
-        ),
-    )
-    .map_err(|e| format!("writing manifest-summary.json: {e}"))?;
+    let summary_bytes = serde_json::to_string(&summary)
+        .expect("json serializes")
+        .into_bytes();
+    if let Err(put_err) = block_on(store.put(&summary_key, &summary_bytes)) {
+        // Mirrors `run_export_job_inner`'s own ambiguous-ack resolution
+        // (ADR 0068's as-built amendment on issue #707) exactly, per this
+        // file's own doctrine of tracking production's algorithm — every
+        // OTHER write here stays plain no-retry `?`; only the terminal
+        // completion marker is read back before trusting the error.
+        match block_on(store.get(&summary_key)) {
+            Ok(Some(existing)) if existing == summary_bytes => {
+                // Landed despite the ack loss — fall through to `Ok` below.
+            }
+            Ok(_) => return Err(format!("writing manifest-summary.json: {put_err}")),
+            Err(get_err) => {
+                return Err(format!(
+                    "writing manifest-summary.json: {put_err} (readback failed: {get_err})"
+                ));
+            }
+        }
+    }
 
     Ok((item_count, billed_size_bytes, summary_key))
 }
@@ -1346,12 +1366,19 @@ fn scenario_export_with_bucket_faults_converges_or_fails_cleanly(seed: u64) {
 
     let groups = [group];
     // Unlike the on-demand backup capture driver, production's export job
-    // has NO retry of its own (`run_export_job_inner` propagates the FIRST
-    // store error straight to `FailExport`) — this mirror deliberately does
-    // the same, so this cell proves the real, documented consequence: under
-    // bucket faults the job either converges to a fully correct COMPLETED
-    // (the fault never fired) or cleanly FAILED with its counts frozen at
-    // their never-set defaults — never a torn COMPLETED.
+    // has NO retry of its own for an interior write (`run_export_job_inner`
+    // propagates the FIRST such store error straight to `FailExport`) —
+    // this mirror deliberately does the same. The one exception, added for
+    // issue #707, is the terminal `manifest-summary.json` write: an
+    // ambiguous ack there is resolved by reading the object back rather
+    // than assumed lost (see `run_export_job_mirror`'s own doc). So this
+    // cell proves the real, documented consequence: under bucket faults the
+    // job either converges to a fully correct COMPLETED (the fault never
+    // fired, or it fired only on the now-resolved terminal write) or
+    // cleanly FAILED with its counts frozen at their never-set defaults —
+    // never a torn COMPLETED. `export_bucket_fault_on_terminal_write_
+    // resolves_to_completed_pinned_seed` below pins the exact seed that
+    // used to violate this before the fix.
     match run_export_to_completion(
         &mut sim, &mut meta, &groups, &live, &store, &export_id, None, seed,
     ) {
@@ -1404,6 +1431,149 @@ fn export_with_bucket_faults_converges_or_fails_cleanly() {
     for_each_seed(
         "export_with_bucket_faults_converges_or_fails_cleanly",
         scenario_export_with_bucket_faults_converges_or_fails_cleanly,
+    );
+}
+
+// --- issue #707 pinned regressions: an ambiguous ack on the terminal
+// completion marker must be resolved by reading it back, never treated as
+// "not written" (a torn COMPLETED) or silently retried the way an interior
+// write is not. See ADR 0068's as-built amendment and
+// `docs/engineering-lessons.md`'s matching entry. --------------------------
+
+/// Pins the exact seed the nightly corpus (`ANIMUS_EXPORT_IMPORT_SEEDS=40`)
+/// caught in issue #707: `export_with_bucket_faults_converges_or_fails_
+/// cleanly`'s own variant 25 (`corpus::odd_name_seed(
+/// "export_with_bucket_faults_converges_or_fails_cleanly_s25")` ==
+/// `12_365_148_609_929_809_193`). At this seed every interior fault draw
+/// misses, but the fault fires on the terminal `manifest-summary.json`
+/// put: the object lands in the store and `put` still returns the injected
+/// ack-lost error. Before the fix this propagated straight to
+/// `FailExport` — a `Failed` row with the marker physically present, a
+/// torn `COMPLETED` ADR 0068 says never happens — because the generic
+/// `export_with_bucket_faults_converges_or_fails_cleanly` cell above
+/// accepts either outcome as valid at every seed and so cannot catch a
+/// wrong outcome at one specific seed on its own. This test pins the one
+/// known-bad seed and demands the only outcome the fix allows: `Completed`,
+/// with the marker actually present and byte-identical to what the job
+/// wrote.
+#[test]
+fn export_bucket_fault_on_terminal_write_resolves_to_completed_pinned_seed() {
+    const SEED: u64 = 12_365_148_609_929_809_193;
+    let mut sim = Simulator::new(SEED);
+    let engines = engines();
+    let group = start_group(&sim, &engines, TabletId(1), KeyRange::whole());
+    let live = [0, 1, 2];
+    sim.run_for(Duration::from_secs(2));
+
+    let mut model = BTreeMap::new();
+    let leader = elect(&mut sim, &group, &live, SEED);
+    for i in 0..10 {
+        let pk = format!("f{i:03}");
+        let item = write_item(&mut sim, &group.nodes[leader], &pk, SEED);
+        model.insert(pk, item);
+    }
+
+    let store = SimSegmentStore::new(sim.env(nid(NODES[0])));
+    let mut fault = SegmentFaultConfig::default();
+    fault.set_put_ack_lost_prob(0.35);
+    store.set_fault_config(fault);
+
+    let mut meta = base_meta();
+    let export_id = dynamo_wire::export_arn(SRC_TABLE, "e0000000000003");
+    begin_export(&mut meta, &export_id, SRC_TABLE, "customer-bucket");
+
+    let groups = [group];
+    let result = run_export_to_completion(
+        &mut sim, &mut meta, &groups, &live, &store, &export_id, None, SEED,
+    );
+    assert_eq!(
+        result,
+        Ok(()),
+        "[seed={SEED}] pinned regression for #707: the terminal write's ack-lost fault must be \
+         resolved by reading the object back, not treated as a failure"
+    );
+    assert_eq!(
+        meta.export(&export_id).map(|r| r.status.clone()),
+        Some(ExportStatus::Completed)
+    );
+    let root = format!("{EXPORT_MANIFEST_ROOT}/{}", export_id_suffix(&export_id));
+    let marker =
+        block_on(store.get(&format!("{root}/manifest-summary.json"))).expect("store get ok");
+    assert!(
+        marker.is_some(),
+        "[seed={SEED}] a Completed export must have its manifest-summary.json actually present"
+    );
+    let exported = read_all_exported_items(&store, &export_id, SEED);
+    assert_eq!(
+        exported, model,
+        "[seed={SEED}] a completed export under bucket faults must still match the model exactly"
+    );
+}
+
+/// Second pinned regression, for the OTHER half of the fix: the ambiguous-
+/// ack readback must stay special-cased to the terminal write only — an
+/// interior write's ack-lost fault must still fail the job cleanly, with no
+/// `manifest-summary.json` ever attempted (ADR 0068 §9 residual #3, "no
+/// S3-object reclaim on failure", stays in force for everything before the
+/// terminal write). Forcing the ack-lost probability to `1.0` makes the
+/// very FIRST store write — the `_started` marker, the earliest interior
+/// write the job makes — draw the fault deterministically regardless of
+/// seed, so no seed search is needed for this half.
+#[test]
+fn export_bucket_fault_on_interior_write_fails_cleanly_with_no_marker() {
+    let seed =
+        corpus::odd_name_seed("export_bucket_fault_on_interior_write_fails_cleanly_with_no_marker");
+    let mut sim = Simulator::new(seed);
+    let engines = engines();
+    let group = start_group(&sim, &engines, TabletId(1), KeyRange::whole());
+    let live = [0, 1, 2];
+    sim.run_for(Duration::from_secs(2));
+
+    let leader = elect(&mut sim, &group, &live, seed);
+    for i in 0..10 {
+        let pk = format!("f{i:03}");
+        write_item(&mut sim, &group.nodes[leader], &pk, seed);
+    }
+
+    let store = SimSegmentStore::new(sim.env(nid(NODES[0])));
+    let mut fault = SegmentFaultConfig::default();
+    fault.set_put_ack_lost_prob(1.0); // fires on the very first put, deterministically
+    store.set_fault_config(fault);
+
+    let mut meta = base_meta();
+    let export_id = dynamo_wire::export_arn(SRC_TABLE, "e0000000000004");
+    begin_export(&mut meta, &export_id, SRC_TABLE, "customer-bucket");
+
+    let groups = [group];
+    let result = run_export_to_completion(
+        &mut sim, &mut meta, &groups, &live, &store, &export_id, None, seed,
+    );
+    assert!(
+        result.is_err(),
+        "[seed={seed}] an interior write's ack-lost fault (forced deterministic here) must \
+         still fail the job — only the terminal write is resolved"
+    );
+    let row = meta.export(&export_id).expect("row present");
+    assert!(
+        matches!(row.status, ExportStatus::Failed { .. }),
+        "[seed={seed}] expected Failed, got {:?}",
+        row.status
+    );
+    let root = format!("{EXPORT_MANIFEST_ROOT}/{}", export_id_suffix(&export_id));
+    assert!(
+        block_on(store.get(&format!("{root}/manifest-summary.json")))
+            .expect("store get ok")
+            .is_none(),
+        "[seed={seed}] a failed export must never leave a manifest-summary.json behind"
+    );
+    // The `_started` marker itself DID land — the ack-lost fault's own
+    // "object written, ack dropped" contract — confirming this really is
+    // the ack-lost path and not some other failure.
+    assert!(
+        block_on(store.get(&format!("{root}/_started")))
+            .expect("store get ok")
+            .is_some(),
+        "[seed={seed}] the ack-lost fault should still have written the _started marker"
     );
 }
 
