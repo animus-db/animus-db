@@ -70,6 +70,7 @@ pub mod cursor;
 pub mod heartbeat_batch;
 pub mod hlc;
 pub mod host;
+mod hwm;
 mod seal;
 pub mod segment;
 mod split;
@@ -1918,6 +1919,15 @@ pub struct RaftKvNode<E: Env, S: StorageEngine> {
     /// construction performs — at group start, off this tablet's own
     /// engine's `latest_version()`) plus, for the residual in-flight-write
     /// race witnessing alone can't close, the **range seal** (`seal.rs`).
+    /// **Issue #804 amendment**: `latest_version()` alone only reflects the
+    /// highest MVCC version some entry actually WROTE, which a committed
+    /// entry whose apply wrote no row (a failed `Cas`, an aborted txn, ...)
+    /// never advances — a durable per-tablet marker (`hwm.rs`) now backs
+    /// both `latest_version()`-reading witness points once compaction would
+    /// otherwise drop such an entry from WAL replay, and `InstallSnapshot`'s
+    /// own image additionally carries the sender's own high-water mark in
+    /// its header, folded in at install alongside `latest_version()` (see
+    /// `engine_image`/`install_engine_image`'s docs).
     hlc: Arc<Hlc>,
     /// The per-tablet **read-timestamp cache** (ADR 0018 §2/PR2b,
     /// `ts_cache.rs`): leader-local, in-memory, best-effort write-conflict
@@ -2354,6 +2364,20 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         // restart, a co-hosted sibling already present). `latest_version()`
         // is engine-global and cheap/synchronous (`animus-storage`'s trait
         // doc), so this needs no async step here.
+        //
+        // **Issue #804 fix**: this read alone used to structurally
+        // undercount — a committed, applied entry whose outcome wrote no
+        // row (a failed `Cas`, a condition-failed write, an aborted txn)
+        // never advanced `latest_version()`, so once compaction dropped
+        // such an entry out of the WAL, a restart's `latest_version()` read
+        // silently forgot its `ts`. This call itself is unchanged; what
+        // changed is that `latest_version()` can no longer lag that far
+        // behind, because `apply_and_compact`'s compaction path now durably
+        // `merge`s a dedicated per-tablet high-water-mark marker
+        // (`hwm.rs`) at `hlc::pack(max_applied_ts)` whenever it truncates
+        // the WAL — so this read picks that mark up automatically, with no
+        // further change needed here. See `hwm.rs`'s module doc for the
+        // full account.
         let hlc = Arc::new(Hlc::new(env.node_id(), HLC_MAX_OFFSET));
         hlc.witness(hlc::unpack(storage.latest_version()), env.now());
         let ts_cache = Arc::new(Mutex::new(TsCache::new()));
@@ -6930,7 +6954,8 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
         // the data it attests to are crash-consistent: a torn write here can
         // only ever understate progress (this node re-detects `state_machine_
         // behind` and re-requests), never overstate it.
-        install_engine_image(storage, kind_scopes, &bytes, tablet, last_index).await;
+        let install_max_ts =
+            install_engine_image(storage, kind_scopes, &bytes, tablet, last_index).await;
         engine_applied.fetch_max(last_index, Ordering::SeqCst);
         // Belt, not the buckle: the consensus loop's own per-iteration live
         // feed (`engine_applied.load() < c.snapshot_index()`, see `drive`'s
@@ -6950,7 +6975,25 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
         // Witnessing point (ADR 0018 §2 amendment): a snapshot can carry
         // versions this node has never seen minted, so fold in the engine's
         // new high-water mark before this node ever mints/compares again.
+        //
+        // **Issue #804 fix**: `storage.latest_version()` alone only reflects
+        // the highest MVCC version some entry actually WROTE — a committed,
+        // applied entry whose outcome wrote no row (a failed `Cas`, an
+        // aborted txn, a sealed/condition-failed `KindBatch`/`KindEval`, ...)
+        // carries a `ts` (`assert_ts_monotonic` runs on it) that never moves
+        // `latest_version()`, and the sender's own `entries_with_tombstones`
+        // scan `engine_image` builds this image from can't see it either —
+        // there is no row to see. `install_max_ts` is the sender's own
+        // `max_applied_ts` at image-build time, carried in the image's
+        // header (`codec::encode_image`/`decode_image`, version `29`)
+        // instead of as a scanned row, so this fold covers exactly the case
+        // `latest_version()` structurally cannot: witnessing every entry the
+        // sender ever committed for this tablet, not just the ones that
+        // happened to write something.
         hlc.witness(hlc::unpack(storage.latest_version()), env.now());
+        if let Some(ts) = install_max_ts {
+            hlc.witness(ts, env.now());
+        }
         // ADR 0018 §2/PR6 corrective note: the `TxnTracker` must be rebuilt
         // from the freshly-installed image, exactly like `start_inner`
         // already does at group start, and for the identical reason
@@ -8668,7 +8711,32 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
         // and only when a follower is actually waiting on a snapshot.
         let image = if image_needed {
             metrics.incr(Metric::CpSnapshotImageBuilds);
-            Some(engine_image(storage, kind_scopes).await)
+            // Issue #804: carry this apply task's own running `max_applied_ts`
+            // in the image header, so a receiver that installs it witnesses
+            // every entry this tablet has ever committed — including one
+            // whose apply wrote no row — not just `latest_version()`.
+            //
+            // **Folded with the engine's own durable mark, not used alone**:
+            // `max_applied_ts` resets to `None` every time this apply task
+            // starts (including after a restart, see `start_inner`'s doc a
+            // few lines above this task's own spawn) until the first
+            // qualifying entry it processes *this lifetime* runs
+            // `assert_ts_monotonic`. A sender that has applied nothing since
+            // its last compaction — restarted, then immediately asked for a
+            // snapshot by a peer that only just caught up to it — would ship
+            // `None` even though its own `hwm.rs` marker (written durably at
+            // that last compaction) has already raised `latest_version()` to
+            // the true mark. `storage.latest_version()` is exactly as cheap/
+            // synchronous here as at the two other witness points (`start_
+            // inner`'s own doc), so folding it in costs nothing and closes
+            // this restart gap without weakening the entry-level witness the
+            // header exists for.
+            let engine_mark = hlc::unpack(storage.latest_version());
+            let header_ts = Some(match *max_applied_ts {
+                Some(ts) => ts.max(engine_mark),
+                None => engine_mark,
+            });
+            Some(engine_image(storage, kind_scopes, header_ts).await)
         } else {
             None
         };
@@ -8778,6 +8846,27 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 )
                 .await
                 .expect("raftkv applied watermark marker (compaction)");
+            // Issue #804 (ADR 0018 §2 amendment): durably raise
+            // `storage.latest_version()` to cover the highest `ts` ANY
+            // entry through this compaction's own base has committed —
+            // including one whose apply wrote no row at all, which never
+            // moves `latest_version()` on its own. Written in the same
+            // before-the-WAL-rewrite slot as the applied-watermark marker
+            // just above, for the identical crash-direction reason (see
+            // `hwm.rs`'s module doc for the full account of why this marker
+            // exists and why compaction time, not every apply, is the right
+            // cadence). `None` only for a tablet that has never applied a
+            // single ts-bearing entry — nothing to raise the mark to yet.
+            if let Some(ts) = *max_applied_ts {
+                storage
+                    .merge(
+                        &hwm::hwm_marker_key(tablet),
+                        &hwm::encode_hwm_value(ts),
+                        hlc::pack(ts),
+                    )
+                    .await
+                    .expect("raftkv hlc high-water-mark marker (compaction)");
+            }
             let write_result = if let Some(shared) = shared {
                 shared
                     .compact_group(env, wal, TabletId(tablet), records)
@@ -8899,9 +8988,22 @@ async fn raw_scoped_keys<S: StorageEngine>(storage: &S, scope: &StorageScope) ->
     }
 }
 
+/// `max_applied_ts` (issue #804, ADR 0018 §2 amendment) is this apply task's
+/// own running high-water mark (the same variable `assert_ts_monotonic`
+/// maintains) at image-build time — an upper bound on every `ts` any entry
+/// has ever committed for this tablet, whether or not that entry's apply
+/// wrote a row. It rides in the image's own header (`codec::encode_image`,
+/// version `29`), NOT as a scanned row: `KIND_BASE`/`KIND_LSI`/`KIND_CHANGE`/
+/// `KIND_FOOTPRINT`/`KIND_CURSOR` are the only row kinds this scan classifies
+/// — the engine-global reserved-namespace markers (`ceiling.rs`/`seal.rs`/
+/// `split.rs`, leading `0x5F`, matching no kind) are deliberately excluded
+/// from it, so a marker row alone could never cross via this path. Passing
+/// the timestamp explicitly, rather than trying to make it look like a row,
+/// keeps that exclusion intact for every other reserved-namespace marker.
 async fn engine_image<S: StorageEngine>(
     storage: &S,
     kind_scopes: &[StorageScope; ALL_KINDS.len()],
+    max_applied_ts: Option<HlcTimestamp>,
 ) -> Vec<u8> {
     // One pass over the engine, classified by kind (ADR 0041 §3): a tablet's
     // scopes are disjoint, so each physical key is claimed by at most one of
@@ -8921,14 +9023,18 @@ async fn engine_image<S: StorageEngine>(
             entries.push((kind, logical, v, version));
         }
     }
-    codec::encode_image(&entries)
+    codec::encode_image(&entries, max_applied_ts)
 }
 
 /// Write a received snapshot image into the engine (a follower catching up),
 /// versioned so per-key LWW keeps it consistent with the log tail merged on top.
 /// The wire image carries *logical* keys (stripped by the sender's
 /// `engine_image`); each is re-prefixed to *this* replica's own `scope`
-/// before writing into the (possibly shared) engine.
+/// before writing into the (possibly shared) engine. Returns the sender's own
+/// `max_ts` header (issue #804), for the caller to *additionally* fold into
+/// its own in-memory `Hlc` alongside the existing `storage.latest_version()`
+/// witness — see the call site's doc. That in-memory witness alone is not
+/// this fix: see the issue #804 paragraph below for the durable half.
 ///
 /// **Issue #554**: every row plus the durable applied-watermark marker
 /// (`applied.rs`, at `last_index` — the snapshot's own index) land in ONE
@@ -8940,20 +9046,35 @@ async fn engine_image<S: StorageEngine>(
 /// mid-install could durably hold some rows with no watermark yet — safe on
 /// its own re-detection (this node just requests another snapshot), but
 /// needlessly so when batching the whole install is no more work.
+///
+/// **Issue #804**: the header's `max_ts`, when present, ALSO durably `merge`s
+/// this receiver's own `hwm.rs` marker, in that same batch — not just an
+/// in-memory `hlc.witness` at the call site. Without this, a crash-restart of
+/// *this* replica before its own next compaction would fall back to the
+/// group-start witness's `storage.latest_version()` read over rows alone,
+/// silently forgetting exactly the no-row-writing entries the header exists
+/// to carry — this replica's own WAL never had them to replay (it only just
+/// installed this image; it did not apply those entries itself), so nothing
+/// else here could re-derive the mark after such a restart. Batching it into
+/// the same `merge_batch` as the rows and the applied-watermark marker keeps
+/// the identical crash-atomicity property the issue #554 paragraph above
+/// already establishes for those two: rows, watermark, and this mark all land
+/// together or not at all.
 async fn install_engine_image<S: StorageEngine>(
     storage: &S,
     kind_scopes: &[StorageScope; ALL_KINDS.len()],
     bytes: &[u8],
     tablet: u64,
     last_index: u64,
-) {
-    let entries: Vec<ImageEntry> = match codec::decode_image(bytes) {
-        Ok(e) => e,
-        Err(err) => {
-            tracing::warn!(?err, "undecodable raftkv snapshot image dropped");
-            return;
-        }
-    };
+) -> Option<HlcTimestamp> {
+    let (max_ts, entries): (Option<HlcTimestamp>, Vec<ImageEntry>) =
+        match codec::decode_image(bytes) {
+            Ok(e) => e,
+            Err(err) => {
+                tracing::warn!(?err, "undecodable raftkv snapshot image dropped");
+                return None;
+            }
+        };
     let mut ops: Vec<MergeOp> = Vec::with_capacity(entries.len() + 1);
     for (kind, key, value, version) in entries {
         // An unknown kind can only come from a peer that knows a row kind this
@@ -8975,10 +9096,28 @@ async fn install_engine_image<S: StorageEngine>(
         applied::encode_applied_value(last_index),
         last_index,
     ));
+    // Issue #804 fix: durably write the receiver's OWN `hwm.rs` marker in the
+    // same batch as the rows, not just `hlc.witness(...)` the header value in
+    // memory at the call site. In-memory-only witnessing loses the fact the
+    // instant this apply task restarts before its own next compaction: the
+    // group-start witness then falls back to `storage.latest_version()` over
+    // rows alone, which is exactly the gap this header exists to close (see
+    // `hwm.rs`'s module doc). Batched with the row/applied-marker ops for the
+    // identical reason the issue #554 doc above already gives for those two:
+    // one atomic `merge_batch` means a crash mid-install can never durably
+    // hold the rows without this mark (or vice versa).
+    if let Some(ts) = max_ts {
+        ops.push(MergeOp::put(
+            hwm::hwm_marker_key(tablet),
+            hwm::encode_hwm_value(ts),
+            hlc::pack(ts),
+        ));
+    }
     storage
         .merge_batch(ops)
         .await
         .expect("raftkv install snapshot image");
+    max_ts
 }
 
 /// The shared-state bundle handed to the driver tasks, built once in
@@ -10090,13 +10229,21 @@ mod kind_scope_tests {
                 }
             }
 
-            let image = engine_image(&src, &src_scopes).await;
+            // Issue #804: the image header carries the sender's own
+            // `max_applied_ts`, distinct from any row's own MVCC version —
+            // proving install returns it rather than silently dropping it.
+            let max_ts = HlcTimestamp {
+                wall_ms: 4300,
+                logical: 101,
+            };
+            let image = engine_image(&src, &src_scopes, Some(max_ts)).await;
             let dst = MemoryEngine::new();
             let dst_scopes = kind_scopes(&StorageScope::new(KeyRange::new(
                 Vec::new(),
                 Some(b"zzzz".to_vec()),
             )));
-            install_engine_image(&dst, &dst_scopes, &image, 1, 42).await;
+            let installed_max_ts = install_engine_image(&dst, &dst_scopes, &image, 1, 42).await;
+            assert_eq!(installed_max_ts, Some(max_ts));
 
             let mut src_rows = src.entries_with_tombstones().await.unwrap();
             // Issue #554: the install also writes the durable applied-watermark
@@ -10105,12 +10252,18 @@ mod kind_scope_tests {
             // it is excluded here rather than expected to match `src` (which
             // never had one written at all).
             let marker_key = applied::applied_marker_key(1);
+            // Issue #804 fix (1): the install ALSO writes `dst`'s own durable
+            // `hwm.rs` marker (from the header's `max_ts`) in that same batch —
+            // the identical "real row in `dst`, no counterpart in `src`" shape
+            // as the applied-watermark marker just above, excluded here for the
+            // identical reason.
+            let hwm_key = hwm::hwm_marker_key(1);
             let mut dst_rows: Vec<_> = dst
                 .entries_with_tombstones()
                 .await
                 .unwrap()
                 .into_iter()
-                .filter(|(k, ..)| k != &marker_key)
+                .filter(|(k, ..)| k != &marker_key && k != &hwm_key)
                 .collect();
             src_rows.sort();
             dst_rows.sort();
@@ -10122,6 +10275,11 @@ mod kind_scope_tests {
                 dst.get(&marker_key).await.unwrap().map(|v| v.value),
                 Some(applied::encode_applied_value(42)),
                 "the installed applied watermark must reflect the snapshot's own index"
+            );
+            assert_eq!(
+                dst.get(&hwm_key).await.unwrap().map(|v| v.value),
+                Some(hwm::encode_hwm_value(max_ts)),
+                "the installed hwm marker must reflect the image header's own max_ts"
             );
         });
     }

@@ -576,7 +576,45 @@ State once here; cross-referenced from the sections below.
     accepted or not, since a redundant witness is always safe), snapshot
     install, and group start (off the tablet's own engine's
     `latest_version()`, which alone covers a restart's already-present
-    data).
+    data). **Issue #804 amendment (2026-09-09):** the two engine-state
+    reads (`latest_version()` at snapshot install and at group start) are
+    structurally weaker than the other two, which scan committed *log*
+    entries directly — they read back what the engine's apply *wrote*,
+    which a committed-and-applied entry whose outcome writes no row (a
+    `Cas` whose `expected` never matched, a condition-failed `KindBatch`/
+    `KindEval`, an aborted txn, ...) never advances, even though such an
+    entry still carries a real `ts` (`assert_ts_monotonic` runs on it).
+    Once compaction truncates such an entry out of the WAL, neither engine
+    read can see its `ts` any more. Closed two ways, one per read site:
+    (1) **snapshot install** — `engine_image`/`install_engine_image`
+    (`lib.rs`, codec version `29`) carry the sender's own running
+    `max_applied_ts` in the image's header (not as a row: `engine_image`'s
+    per-kind scan deliberately excludes every `RESERVED_NAMESPACE` marker,
+    seal/ceiling/split's own included, so a marker row alone could never
+    have crossed this way), and the install site folds it into `hlc`
+    alongside the pre-existing `latest_version()` witness; (2) **group
+    start** — `apply_and_compact`'s compaction path now durably `merge`s a
+    dedicated per-tablet marker (`hwm.rs`, mirroring `ceiling.rs`'s own
+    marker but generalized to every ts-bearing entry) at
+    `hlc::pack(max_applied_ts)` whenever it truncates the WAL, which
+    unconditionally raises the engine's own global MVCC high-water mark —
+    so the existing `latest_version()` read at group start needs no change
+    at all, it just stops undercounting. See `hwm.rs`'s and `lib.rs`'s
+    `engine_image`/`install_engine_image` module docs, and
+    `tests/hlc_differential_skew.rs`, for the full account and the
+    differential-per-replica-clock-skew mechanism needed to reproduce the
+    bug at all (a clock-skew fault applied *uniformly* across a replica
+    group cannot expose it). **Same-day correction**: the fold above
+    covers the sender's own header only when its `max_applied_ts` is
+    populated — that resets to `None` on every restart of the sending
+    apply task, so it is additionally `max`ed against `hlc::unpack(storage.
+    latest_version())` at image-build time; and the receiving replica now
+    ALSO durably `merge`s its own `hwm.rs` marker at install (same
+    `merge_batch` as the rows), not just an in-memory `hlc.witness` of the
+    header — a receiver that itself restarts before its own next
+    compaction had nothing else to re-derive the mark from. See `hwm.rs`'s
+    module doc ("Why the `InstallSnapshot`... half needs its own path") and
+    ADR 0018's matching 2026-09-09 correction for the full account.
   - **The freeze** (`seal.rs`, `KvCommand::Freeze`) closes the one residual
     witnessing alone cannot: an in-flight write from the parent's own
     leader, still in its commit pipeline when the split cutover happens. The
