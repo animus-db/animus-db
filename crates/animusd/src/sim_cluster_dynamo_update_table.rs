@@ -24,14 +24,15 @@
 //! generic `BatchWriteItem`/`TransactWriteItems`/admin-metrics path), and
 //! `set_throttle_defaults_everywhere`/`admin_metrics_reports_nonzero_
 //! throttled_counters` specifically need the real `/admin/metrics`
-//! `ThrottledWrites`/`ThrottledReads` counters this fixture's own module doc
-//! (`sim_cluster_throttle.rs`) already documents never incrementing here
-//! (every metric-recording site gates on `self.data.as_ref()`, and
-//! `SimCluster`'s nodes carry a real `DataRole` since D2 PR 1 — but the
-//! counters themselves were never this rung's concern; see that file's own
-//! doc for the full account). **These five tests therefore assert admission
-//! behavior (a burst throttles/doesn't/recovers) and `DescribeTable`'s own
-//! rendered shape — never a metric counter.**
+//! `ThrottledWrites`/`ThrottledReads` counters — `SimCluster`'s nodes
+//! carry a real `DataRole` since D2 PR 1, with a real per-node metrics
+//! sink, so these counters **do** increment under this fixture
+//! (`sim_cluster_throttle.rs`'s own module doc now confirms this); they
+//! were simply never this rung's own concern. ADR 0061 rung K (post-C-10)
+//! is what adds the counter-asserting coverage; see that rung's opener
+//! amendment for the full account. **These five tests therefore assert
+//! admission behavior (a burst throttles/doesn't/recovers) and
+//! `DescribeTable`'s own rendered shape — never a metric counter.**
 //!
 //! Seed replay (repo convention): `ANIMUS_SEED=<seed> cargo test -p animusd
 //! --lib <test name>`.

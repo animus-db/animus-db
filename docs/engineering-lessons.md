@@ -4418,6 +4418,71 @@ debugging anything that feels like it might have happened before.
   converges` (a real single-node crash/restart test) — the fix was simply
   running the equivalent `SimCluster` scenario at `(seed, 3, 3)` instead of
   `(seed, 1, 1)`, not a fixture change.
+- **A "blocker (d)" residual can close itself the moment the product PR that
+  fixes it lands — don't assume the residual needs its own product change
+  too** (2026-09-09, ADR 0061 rung J, C-10 PR 6). C-08 PR 2 left `console_
+  table_config.rs`'s three GSI-DDL tests `ProdEnv` because `GenericConsole
+  Backend::add_gsi`/`drop_gsi` (already generic) fell through `dispatch_
+  table_op`'s `UpdateTable` arm into `unsupported_by_generic_dispatch` —
+  the console methods themselves were never the blocker, the dispatch gap
+  they routed through was. C-10 PR 2, two rungs later and written for an
+  unrelated set of `tests/update_table_*.rs`/`dynamo_gsi_drain.rs` files,
+  closed that exact dispatch gap as groundwork. By the time PR 6 picked up
+  the `console_table_config.rs` residual, converting it needed **zero**
+  `lib.rs`/`console.rs`/`dynamo.rs` change — pure test authorship reusing a
+  product fix two PRs old. The general lesson: when a kept-`ProdEnv` test's
+  own doc comment names a specific blocker ("blocker (d)", "no dispatch
+  arm for X", "falls to `unsupported_by_generic_dispatch`"), re-check
+  whether a *later, unrelated-looking* PR already closed that exact named
+  blocker before assuming the residual still needs product work — grep the
+  blocker's own symptom (the dispatch function's `match` arms, the error
+  string) rather than trusting the kept test's own stale-by-now framing of
+  "this needs X built first."
+- **Verifying a new `SimCluster` fixture scenario without a compiler**: when
+  a task's own worktree constraints forbid running `cargo` (concurrent
+  writers gating elsewhere), the substitute for "compile it and see" is
+  reading the exact production functions the fixture calls end to end —
+  every dispatch method's real signature, the wire/JSON shape it returns
+  (response wrapper keys, field names, status codes), and any helper's
+  actual `pub(crate)` visibility and parameter order — rather than
+  reasoning from a sibling scenario's shape alone (2026-09-09, ADR 0061
+  rung J, C-10 PR 6). Concretely: `console_add_gsi_payload`'s validation-
+  before-dispatch order (confirms a malformed attribute type never reaches
+  `dispatch_table_op` at all), `GsiDetail`'s plain (non-renamed) field
+  names, and `table_api_response`'s `wrap_json("gsi", ...)`/`ok_json()`
+  response shapes were all read directly from `animus-node/src/console.rs`
+  and `animusd/src/lib.rs` before being asserted against in the new tests,
+  rather than assumed from the sibling module's own already-converted
+  scenarios. List every such API read as "uncertain, verify on the next
+  compile" in the handoff report so the compiling session checks them
+  first if anything fails.
+- **A module doc's "this never happens under this fixture" claim needs its
+  own expiry check whenever the fixture it describes gains a capability —
+  not just when a scenario finally exercises it** (2026-09-09, ADR 0061
+  rung K, C-11 PR 2). `sim_cluster_throttle.rs`'s own module doc asserted,
+  from ADR 0061 rung D2 PR 1 onward, that `ThrottledWrites`/`ThrottledReads`
+  "never increment under `SimCluster`" because every node's `data` field
+  was `None`. That was true when written — but D2 PR 1, landing in the
+  *same* rung, gave every `SimCluster` node a real `DataRole` (`data:
+  Some(DataRole { raftkv_metrics: node_metrics[i].clone(), .. })`) so the
+  metric-recording sites' `self.data.as_ref()` gate resolved to `Some`
+  from that point on. The claim silently went stale the moment the
+  capability landed, three rungs before any scenario tried to prove it —
+  and a second file (`sim_cluster_dynamo_update_table.rs`, D3 PR 2b) later
+  cited the same stale claim as its own justification for staying
+  `ProdEnv`-only, propagating the error instead of catching it. The
+  general fix: when a PR removes a fixture's limitation (a `None` becomes
+  `Some`, a stubbed loop becomes real, a `pub(crate)` surface widens),
+  grep every sibling module's doc comments for the specific claim the
+  limitation justified — not just update the one file whose own scenario
+  now depends on the fix — before treating the rung as closed. A "why this
+  stays `ProdEnv`-only" doc comment is a claim with a truth condition, not
+  decoration; it needs the same staleness suspicion as a comment describing
+  code, per this log's existing "verify a documented gap by grepping the
+  code" convention (root `CLAUDE.md`'s own "Before implementing a
+  'close this documented gap' task, grep the code" rule) — the difference
+  here is the gap being described is in a *test fixture's own capability*,
+  not the product code the fixture exercises.
 
 ### Code patterns
 - **A new confirm loop copied from a sibling's shape but the wrong sibling's
@@ -23945,3 +24010,49 @@ convergence the leader's term and identity hold for several more virtual
 seconds with no further fault injected — a term change there would be a
 genuine production finding (a removed voter deposing the leader), not a
 test artifact. Both stayed green through this investigation.
+
+## A long foreground gate run can let a sibling stacked branch move underneath you — verify against the base sha you actually rebased onto, not just the branch name (C-11 PR 3, ADR 0061 rung K)
+
+Rebasing `-118` (C-11 PR 3) onto `-117` at its documented tip (`bb801bd4`,
+PR 2 landed) and then running the required gates — including a ~22-minute
+foreground `cargo test -p animusd --lib sim_cluster` — left a wide enough
+window that another process force-pushed `-117` to a new tip (`cbee4b81`)
+mid-run (the whole stacked series was being rebased onto a moved `main`,
+which brought an unrelated admin seed-latency change in underneath). The tier run itself was unaffected (it
+runs against the checked-out worktree, not the branch ref), but the final
+verification step (`git diff --stat -117..HEAD`) silently picked up the
+moved ref and reported a much larger, wrong-looking diff — files this PR
+never touched showing as pure deletions, because `HEAD` (built on the old
+`bb801bd4`) simply lacked what the new `-117` tip had added. Diffing a
+branch *name* for a "what did my PR change" check is only safe if you can
+guarantee nothing else writes to that name for the whole session; on a
+shared main tree across a long foreground command, that guarantee doesn't
+hold. **Fix/discipline**: record the exact base sha immediately after the
+rebase (not just the branch name), and use *that* sha for the "is my diff
+what I think it is" check (`git diff --stat <recorded-sha>..HEAD` and
+`<recorded-sha>..HEAD -- Cargo.lock`) — it stays correct regardless of
+what the branch name points to later. If the branch name's tip really has
+moved by the time you're done, that's a separate, real finding to report
+to the maintainer (the stack's base changed after you built on it, a
+stacked-PR management question), not something to silently "fix" by
+re-rebasing a commit whose own file scope was never in question — re-check
+first whether the new tip conflicts with or duplicates your own change
+before touching anything.
+- **A stacked PR whose parent PR has already merged into `main` must be
+  retargeted to `main` before it too is merged — `gh-stack merge` does this
+  automatically, a hand merge through the GitHub UI does not (2026-09-09,
+  PRs #794/#795/#796/#797/#799/#800).** Six PRs (C-10 PR 6-7, C-11 PRs 1-4)
+  were each merged this morning into their own stacked *parent branch*,
+  after the parent PR (#793) had already landed on `main` — so every merge
+  target was a branch that had already stopped feeding `main`. GitHub
+  reported all six "Merged," CI stayed green, and each head branch was
+  auto-deleted on merge, leaving the six commits reachable only through
+  whatever clone still held a remote-tracking ref to the deleted branch.
+  The symptom is the same shape as issue #279, one layer up the stack: a
+  merge commit for the parent PR sits in `main`'s log, while
+  `git merge-base --is-ancestor <child-head-sha> origin/main` returns false
+  for every child. **Detection rule**: after any stack merge, don't trust
+  the PRs' merged badges — verify every PR head is an ancestor of
+  `origin/main` before calling the stack landed. **Recovery**: re-land the
+  stranded heads as one flat PR rebased onto the current `main`, from
+  whatever ref still holds them.
