@@ -2227,8 +2227,10 @@ back-off (`CP_CONFIRM_POLL_INIT`/`CP_CONFIRM_POLL_MAX`) `cp_batch_local`/
 `cp_put_local`/`cp_delete_local` use, not the flat `SCHEMA_POLL_INTERVAL`
 (50ms) it regressed to with ADR 0054 step 3 (2026-09-05, fixed 2026-09-08).** This is
 THE confirm loop for every single-item write since ADR 0054 step 3
-(`PutItem`/`UpdateItem`/`DeleteItem`, the TTL reaper, the admin seeder's
-per-item images arm) — a flat 50ms poll floor there caps sequential
+(`PutItem`/`UpdateItem`/`DeleteItem`, the TTL reaper, `BatchWriteItem`'s own
+per-item images arm — which the admin seeder rides unchanged since ADR
+0021's 2026-09-09 amendment, no longer having a per-item arm of its own) —
+a flat 50ms poll floor there caps sequential
 single-item write throughput at ~20 ops/s regardless of how fast the
 underlying Raft group actually commits, since the first poll right after
 `propose_kind_eval` is almost always `Inconclusive`. Regression test:

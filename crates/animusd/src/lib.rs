@@ -15794,8 +15794,14 @@ async fn finish_data_join(
 /// - a single client/forwarded `Put` — its value enters via the HTTP edges,
 ///   whose bodies cap at 1 MiB (`http::MAX_BODY`), and JSON-encodes a `Vec<u8>`
 ///   at ≤ 4 chars per byte → ~4 MiB;
-/// - a forwarded `PutBatch` from the admin bulk seeder — bounded to
-///   `SEED_BATCH_MAX_BYTES` (4 MiB) of raw entry bytes per batch → ~17 MiB JSON;
+/// - a forwarded `BatchWriteItem` marker-table batch (`dynamo::
+///   marker_batch_write`) — DynamoDB's own 25-item-per-call cap, each item
+///   capped at `animus_item::MAX_ITEM_SIZE_BYTES` (400 KB) → ~10 MiB raw
+///   before JSON escaping, comfortably under half this cap. The admin
+///   seeder (ADR 0021's 2026-09-09 amendment) rides this identical path —
+///   it no longer has a byte cap of its own (the deleted `SEED_BATCH_
+///   MAX_BYTES`), since it now issues ordinary `BatchWriteItem` calls
+///   through the same generic dispatcher a real client's calls take;
 /// - everything else (`Get`/`Scan`/`ProposeSchema`/split triggers) is tiny.
 ///
 /// An over-cap length prefix is rejected with a clean `InvalidData` error (the
@@ -19025,19 +19031,24 @@ mod sim_cluster_admin_actions;
 #[cfg(test)]
 mod sim_cluster_dashboard;
 
-/// Deterministic, seed-reproducible regression for the admin seeder's
-/// images-arm pipelining (`admin::action_data_seed`, `SEED_IMAGES_
-/// CONCURRENCY`): seeds a Stream-enabled table through `POST
-/// /admin/data/seed` (reachable via `SimCluster::admin_timed`, the same
-/// `GenericAdminHost` seam `sim_cluster_admin_actions.rs`'s own
-/// `seed_writes_synthetic_keys` already proves reaches this route) and
-/// asserts the virtual elapsed time for a 96-row seed is well under a
-/// quarter of 96x an 8-row seed's own per-row virtual cost — a bound the
-/// bounded-concurrency fix clears with wide margin and the old strictly-
-/// sequential loop fails deterministically (confirmed red on the
-/// pre-fix code, restored — see this module's own doc for the exact
-/// numbers). All in virtual `SimEnv` time, so the assertion cannot flake
-/// under real-thread contention.
+/// Deterministic, seed-reproducible regression for `POST /admin/data/seed`'s
+/// throughput on a Stream-enabled table (ADR 0021's 2026-09-09 amendment:
+/// the route is now a thin proxy over the real `BatchWriteItem` operation,
+/// chunked at `admin::SEED_BATCH_WRITE_CAP` (25) items with up to
+/// `admin::SEED_CONCURRENCY` (8) chunks concurrently): seeds a Stream-enabled
+/// table through `POST /admin/data/seed` (reachable via
+/// `SimCluster::admin_timed`, the same `GenericAdminHost` seam
+/// `sim_cluster_admin_actions.rs`'s own `seed_writes_synthetic_keys` already
+/// proves reaches this route) and asserts the virtual elapsed time for a
+/// 200-row seed (8 concurrent 25-item chunks — one full wave) is well under
+/// a quarter of 200x an 8-row seed's own per-row virtual cost — a bound the
+/// chunk-level concurrency clears with real margin and a strictly
+/// sequential chunk dispatch fails deterministically (confirmed red on the
+/// pre-fix code, restored — see this module's own doc for the exact numbers
+/// and for why 200, not the pre-rewrite design's 96, is the smallest row
+/// count that gives this bound genuine margin under the new per-chunk,
+/// not per-item, concurrency shape). All in virtual `SimEnv` time, so the
+/// assertion cannot flake under real-thread contention.
 #[cfg(test)]
 mod sim_cluster_seed_latency;
 /// ADR 0061 rung I (C-09 PR 2): two pinned-seed smoke tests proving the
