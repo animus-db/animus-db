@@ -1107,12 +1107,12 @@ the still-true paragraph after the table.
   (`BatchWriteItem`/`BatchGetItem` shedding, `TransactWriteItems`
   cancellation, a forwarded-write throttle check), each calling
   `SimCluster::set_throttle_defaults_all` before the burst that trips the
-  limit — `tests/dynamo_throttling.rs` stays untrimmed until PR 3; PR 3
-  `admin_metrics_reports_nonzero_throttled_counters` into
+  limit — `tests/dynamo_throttling.rs` stayed untrimmed until PR 3; PR 3
+  (landed) added `admin_metrics_reports_nonzero_throttled_counters` into
   `sim_cluster_admin.rs`, trimming `dynamo_throttling.rs` to its one
   residual (`cluster_wide_throttle_default_is_overridden_by_a_tables_own_
   throughput`, a `run_node_with_cluster_settings`-only config-parse test
-  expected to stay permanent); PR 4 docs close-out. **Not yet sequenced by
+  that stays permanent); PR 4 docs close-out still pending. **Not yet sequenced by
   the maintainer explicitly** — this PR proceeds on Rung J's own close-out
   recommendation as a stated assumption; two decisions stay open: whether
   C-11 is next at all, and whether `--config` bring-up/node
@@ -1212,7 +1212,7 @@ wave are independent and can run in parallel.
 | 9 | C-08 (closed 2026-09-08 — all eight PRs landed: #764, #765, #766, #767, #773, #776, #777, PR 8) | Gated on C-04 (closed), C-06 (closed), and C-07 (closed) — the same generic dispatch cores, plus rung C5's own widening of `ClientCtx`'s field types |
 | 10 | C-09 (closed 2026-09-09 — all six PRs landed: #780, #782, #785, #786, #787, plus PR 6) | Gated on C-08 (closed) — C-08's own close-out recommendation, stacked directly on it |
 | 11 | C-10 (closed 2026-09-09 — all seven PRs landed: #789, #790, #791, #792, #793, #794, plus PR 7) | Gated on C-09 (closed) — the next unowned residual group per C-08's and C-09's own close-outs |
-| 12 | C-11 (open 2026-09-09 — PR 1 docs opener and PR 2 (`sim_cluster_dynamo_throttle.rs`) landed; PRs 3-4 planned) | Gated on C-10 (closed) — the next unowned residual group per C-08's, C-09's, and C-10's own close-outs; not yet explicitly sequenced by the maintainer (see the C-11 entry's own note) |
+| 12 | C-11 (open 2026-09-09 — PR 1 docs opener, PR 2 (`sim_cluster_dynamo_throttle.rs`), and PR 3 (`sim_cluster_admin.rs` scenario (9), `dynamo_throttling.rs` trimmed to its one residual) landed; PR 4 docs close-out planned) | Gated on C-10 (closed) — the next unowned residual group per C-08's, C-09's, and C-10's own close-outs; not yet explicitly sequenced by the maintainer (see the C-11 entry's own note) |
 
 Open issues mapped: none left (#375 closed by W-01, #319 by W-05). Filed
 from wave 2's own findings: #590 (the operator still emits the deleted
