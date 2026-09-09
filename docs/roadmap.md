@@ -999,6 +999,65 @@ the still-true paragraph after the table.
 
 ---
 
+### C-10 index DDL beyond plain `CreateTable` SimCluster dispatch
+
+- **Problem:** `dispatch_table_op`'s `UpdateTable` arm rejects any call
+  carrying an index change (`unsupported_by_generic_dispatch`), so adding
+  or dropping a GSI on an already-populated table is provable only over
+  `ProdEnv`'s real wire today. This is blocker (d) named by both C-08's
+  and C-09's own close-outs — the largest of the five groups left unowned
+  after C-09 (TTL closed), and the only one of the five with a rung
+  against it as of this entry.
+- **What:** the same widen-then-add-a-generic-entry-point template every
+  rung since D3 has already validated, applied to `dispatch_table_op`'s
+  one remaining gap. `create_index`/`drop_index`/`set_index_status`/
+  `drop_table_index` (`crates/animusd/src/dynamo.rs`) widen to `<E: Env,
+  R: RelayClient>` — every `ClientCtx` method they call is already
+  generic, so this is pure signature/clock-call surgery, no new
+  capability. `index_drain::drain_tablet`/`reconcile_partition`/
+  `gsi_caught_up` (the GSI **drain** side) are already generic since D3 PR
+  3b; `animus_node::index_backfill::index_backfill_loop` (the backfill
+  **completion aggregator**) is already fully generic and its host trait
+  (`ControlLeaderHost`) is already implemented generically for
+  `ClientCtx` — only its 18-line `animusd` wrapper is concrete, the
+  smallest lift in the whole series. The backfill **seeder**
+  (`index_drain::backfill_seed_tick`/`advance_backfill_cursor`/
+  `seed_change_log_record`) stays concrete and needs its own new
+  `SimCluster::drive_backfill_seed(node, table)` primitive, mirroring
+  `drain_gsi`'s existing shape, since `SimCluster` never spawns
+  `change_consumer_loop` (the real loop these three run inside). The
+  console's `add_gsi`/`drop_gsi` already route through
+  `execute_routed_as_generic`, so no console/`lib.rs` change is needed
+  once the `UpdateTable` index sub-arm lands. Three files
+  (`dynamo_index_scan.rs`, `index_backfill.rs`, `dynamo_index_writes.rs`)
+  stay frozen behind open flake issues #418/#592/#610 and are untouched
+  by this series; `console_table_config.rs`'s PITR test is a separate,
+  out-of-scope residual. See [ADR 0061](adr/0061-testability-node-crate-simulator.md)'s
+  2026-09-09 "Rung J (post-C-09)" amendment for the full grep-verified
+  ground truth, the file/line anchors, the per-file test-unlock table,
+  and the 7-PR plan with gates.
+- **ADR:** [0061](adr/0061-testability-node-crate-simulator.md) (rung J,
+  open), [0045](adr/0045-updatetable-gsi-backfill.md) (the GSI
+  add/drop-on-populated-table lifecycle and backfill mechanism itself).
+- **Size:** M, 7 PRs — PR 1 this docs opener; PR 2 groundwork (the four
+  `dynamo.rs` functions, the `dispatch_table_op` sub-arm, the
+  `index_backfill` wrapper, the three `index_drain` seeder functions, the
+  always-on `SimCluster` `index_backfill_loop` spawn, and
+  `drive_backfill_seed`); PR 3
+  `sim_cluster_dynamo_update_table_index.rs` (9 tests, 3 files deleted);
+  PR 4 `sim_cluster_backfill_seeder.rs` (5 tests, split-during-backfill
+  licensed to stay `ProdEnv` if it doesn't converge cleanly); PR 5
+  `sim_cluster_stream_backfill_seed_filter.rs` (2 tests); PR 6 console
+  residue into `sim_cluster_console_table_config.rs` (3 tests,
+  `console_table_config.rs` trimmed to its 1 out-of-scope PITR test); PR
+  7 docs close-out.
+- **Depends:** C-09 (closed) — the next unowned residual group per C-08's
+  and C-09's own close-outs, sequenced by the maintainer 2026-09-08.
+- **Status (2026-09-09):** open — PR 1 (this docs opener) landed. PRs 2-7
+  planned, not yet started.
+
+---
+
 ## 4. Operator surfaces: admin API, dashboard, console, CLI
 
 Conventions (verified): a new admin route needs a match arm in
@@ -1077,7 +1136,7 @@ wave are independent and can run in parallel.
 | 8 | C-07 (closed 2026-09-08 — all six PRs landed: #758, #759, #760, #761, #762, plus PR 6) | Gated on C-04 (closed) and C-06 (closed) — the same generic dispatch cores, plus C-06's own Transact widening |
 | 9 | C-08 (closed 2026-09-08 — all eight PRs landed: #764, #765, #766, #767, #773, #776, #777, PR 8) | Gated on C-04 (closed), C-06 (closed), and C-07 (closed) — the same generic dispatch cores, plus rung C5's own widening of `ClientCtx`'s field types |
 | 10 | C-09 (closed 2026-09-09 — all six PRs landed: #780, #782, #785, #786, #787, plus PR 6) | Gated on C-08 (closed) — C-08's own close-out recommendation, stacked directly on it |
-| 11 | C-10 (next, plan drafted: index DDL beyond plain `CreateTable`, sequenced after C-09 by the maintainer 2026-09-08) | Gated on C-09 (closed) — the next unowned residual group per Rung H's own close-out |
+| 11 | C-10 (open, PR 1 docs opener landed 2026-09-09: index DDL beyond plain `CreateTable`, sequenced after C-09 by the maintainer 2026-09-08) | Gated on C-09 (closed) — the next unowned residual group per C-08's and C-09's own close-outs |
 
 Open issues mapped: none left (#375 closed by W-01, #319 by W-05). Filed
 from wave 2's own findings: #590 (the operator still emits the deleted

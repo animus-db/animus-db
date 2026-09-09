@@ -6578,8 +6578,10 @@ reconciler-driven split/rebalance/GC, auto-split, join/growth, and the
 backup janitor are D4's own scope (D4 PR 1 already supplied the real
 reconciler these need next); Streams, admin/console/dashboard HTTP, and
 TTL are now owned and closed (C-07, C-08, C-09);
-index DDL beyond plain `CreateTable` is queued as C-10, sequenced next
-(plan drafted, not yet planned in full);
+index DDL beyond plain `CreateTable` is queued as C-10, **open** as of
+2026-09-09 (PR 1 docs opener landed — see ADR 0061's "Rung J (post-C-09)"
+amendment and `docs/roadmap.md`'s C-10 entry for the grep-verified
+ground truth, file/line anchors, and the 7-PR plan);
 the control/data role split, `--config` bring-up, node assembly, and the
 throttle-metric counters are unowned
 by any planned rung as of this close; (E) frozen behind an open flake
