@@ -8595,3 +8595,61 @@ same two-open-decisions note; `crates/animusd/CLAUDE.md`'s residual-
 inventory pointer from the throttling residual to this amendment; the two
 stale module-doc corrections (`sim_cluster_throttle.rs`,
 `sim_cluster_dynamo_update_table.rs`).
+## 2026-09-09 amendment — Rung K, PR 2 landed (throttle-metric counters under `SimCluster`, C-11)
+
+Minimal as-built note; the rung's own opener (PR 1, a docs-only PR
+authored separately) rebases above this paragraph and supplies the full
+ground-truth/motivation/plan account — see it for that once it lands.
+
+**What landed**: `crates/animusd/src/sim_cluster_dynamo_throttle.rs`
+(`#[cfg(test)] mod`, registered in `lib.rs` beside `sim_cluster_throttle`)
+converts four of `crates/animusd/tests/dynamo_throttling.rs`'s six
+remaining sim-reachable scenarios, same names, each with a pinned-seed
+test plus its `_over_seeds` sibling: `batch_write_item_sheds_throttled_
+rows_into_unprocessed_items`, `batch_get_item_sheds_throttled_keys_into_
+unprocessed_keys`, `transact_write_items_cancels_with_throttling_error`,
+`a_forwarded_write_is_throttled_on_the_leader`. **No product code
+change** — `dynamo::dispatch_item_op` already routes `BatchWriteItem`/
+`BatchGetItem`/`TransactWriteItems` (the last via `run_transact`, generic
+since C-06 PR 2) through the identical generic core production uses; this
+PR is pure test authorship.
+
+**Corrects a stale claim**: `sim_cluster_throttle.rs`'s own module doc has
+asserted, since ADR 0061 rung D2 PR 1 landed, that `ThrottledWrites`/
+`ThrottledReads` never increment under `SimCluster` (true only while every
+node built `data: None`). Since D2 PR 1, `SimCluster::new` gives every
+node a real `DataRole` (`raftkv_metrics: node_metrics[i].clone()`) — the
+claim has been false for three rungs, simply unexercised until this PR
+issues a real refusal against it. This PR's new module doc corrects the
+claim in place; sweeping every other copy of it (`sim_cluster_throttle.rs`
+itself, `sim_cluster_dynamo_update_table.rs`) is left to the rung opener
+(PR 1) now that a fixture has proven it false, per this PR's own
+worktree scope (one new module plus a one-line `lib.rs` registration).
+
+`crates/animusd/tests/dynamo_throttling.rs` stays byte-identical and
+untrimmed in this PR (the D3 discipline — prove the untrimmed baseline
+green before removing anything); trimming it to its two remaining
+genuinely sim-unreachable tests is PR 3's own job. See `crates/animusd/
+CLAUDE.md`'s matching "Rung K, PR 2" appendix for the full per-scenario
+account, including the one deliberate behavioral difference from the
+real-socket original (`a_forwarded_write_is_throttled_on_the_leader`
+issues from one fixed non-leader node rather than round-robinning across
+all three).
+
+**Gates**: not run by this PR's own agent — its worktree constraints
+forbid `cargo` entirely (verified instead by reading the production
+dispatch path this module drives and cross-checking every call signature
+against its sibling `sim_cluster_dynamo_*.rs` modules, per this crate's
+own engineering-lessons entry on that discipline). **Run in the main tree
+after rebase onto the landed 8868aee8**: `cargo build -p animusd --tests`,
+`cargo fmt --all`, and `cargo clippy -p animusd --all-targets
+--all-features -- -D warnings` all clean, no fixes needed against this
+module as authored (`cargo fmt` only reordered the new `mod` line and this
+module's own formatting). The untrimmed `cargo test -p animusd --test
+dynamo_throttling` baseline was 6 passed both before and after this
+module landed. All 8 new tests passed on the first full run — no scenario
+sizing bug, no wire-shape deviation from the real-socket originals. The
+whole `cargo test -p animusd --lib sim_cluster -- --test-threads=2` tier
+passed 476/476 (2 ignored, 0 failed — the expected 468 + 8), peak RSS
+~983 MB (`/usr/bin/time -v`, `Maximum resident set size` 982728 KB).
+`Cargo.lock` unchanged.
