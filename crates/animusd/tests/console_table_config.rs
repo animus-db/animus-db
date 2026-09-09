@@ -19,9 +19,16 @@
 //! `crates/animusd/src/sim_cluster_console_table_config.rs`
 //! (`table_detail_projects_full_configuration`, `stream_toggle_round_
 //! trips`, `ttl_set_and_clear_round_trips`, `delete_table_works`,
-//! `table_detail_with_no_pitr_or_backups_is_null_and_empty`) and were
-//! removed from here. The four remaining tests below stay `ProdEnv`, each
-//! with its own reason comment.
+//! `table_detail_with_no_pitr_or_backups_is_null_and_empty`); **C-10 PR 6**
+//! (ADR 0061 rung J) converted three more — `add_and_drop_gsi_round_trip`,
+//! `add_gsi_records_a_declared_attribute_type`, `add_gsi_rejects_an_
+//! unknown_attribute_type` — once PR 2 closed blocker (d)
+//! (`dispatch_table_op`'s missing index-change sub-arm). The one test left
+//! below, `table_detail_shows_pitr_status_and_backups`, stays `ProdEnv`: its
+//! own reason comment explains why (`UpdateContinuousBackups` has no
+//! generic-dispatch arm, and this test also needs the real `pitr_snapshot_
+//! loop`'s wall-clock-timed capture driver, which `SimCluster` does not
+//! run).
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -134,244 +141,6 @@ fn assert_no_cluster_shape(body: &str) {
     }
 }
 
-/// Adding a GSI through the console shows it `CREATING` (a populated table's
-/// added index backfills, ADR 0045 §2) and it later converges to `ACTIVE`;
-/// dropping it removes it from the detail response.
-///
-/// **KEPT `ProdEnv` (ADR 0061 rung H, C-08 PR 4)**: blocker (d) —
-/// `UpdateTable` with an index change has no `dispatch_table_op` sub-arm
-/// (`add_gsi`/`drop_gsi` both route through it and would hit
-/// `unsupported_by_generic_dispatch`); the index-DDL residual this whole
-/// rung's opener named out of scope.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn add_and_drop_gsi_round_trip() {
-    timeout(Duration::from_secs(30), async {
-        let dir = support::panic_safe_tempdir();
-        let (node, _config) =
-            support::start_single_node(dir.path(), animusd::StorageBackend::Memory).await;
-        let dynamo_addr = node.dynamo_addr();
-        let console_addr = node.console_addr();
-
-        let (status, body) = dynamo(
-            dynamo_addr,
-            "DynamoDB_20120810.CreateTable",
-            r#"{"TableName":"orders","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
-                "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
-        )
-        .await;
-        assert_eq!(status, 200, "CreateTable failed: {body}");
-        // Populate the table so the added GSI actually needs a backfill —
-        // an empty table's index would go straight to Active, which would
-        // not distinguish this test from the create-time GSI case above.
-        let (status, body) = dynamo(
-            dynamo_addr,
-            "DynamoDB_20120810.PutItem",
-            r#"{"TableName":"orders","Item":{"id":{"S":"o1"},"status":{"S":"open"}}}"#,
-        )
-        .await;
-        assert_eq!(status, 200, "PutItem failed: {body}");
-
-        let (status, body) = console(
-            console_addr,
-            "POST",
-            "/console/api/tables/orders/gsi",
-            r#"{"index_name":"by-status","hash_attribute":"status"}"#,
-        )
-        .await;
-        assert_eq!(status, 200, "add_gsi failed: {body}");
-        let resp = json(&body);
-        assert_eq!(resp["gsi"]["name"], "by-status");
-        assert_eq!(resp["gsi"]["hash_attribute"]["name"], "status");
-        // No declared type: this request gave no `hash_attribute_type`
-        // (issue #319's fields are optional). Roadmap W-11: `AttributeDefinitions`
-        // must now cover every key attribute a request's `KeySchema` names, so
-        // `add_gsi` defaults an omitted type to `"S"` rather than sending no
-        // entry at all (`wire::decode_update_table` would otherwise reject the
-        // `GlobalSecondaryIndexUpdates` `Create` outright) — see
-        // `add_gsi_records_a_declared_attribute_type` below for the case where a
-        // genuinely different type round-trips instead of this default.
-        assert_eq!(
-            resp["gsi"]["hash_attribute"]["attribute_type"], "S",
-            "an added GSI's key attribute defaults to a declared S type: {body}"
-        );
-        assert!(resp["gsi"]["sort_attribute"].is_null());
-        assert_eq!(
-            resp["gsi"]["status"], "CREATING",
-            "a populated table's added GSI starts backfilling: {body}"
-        );
-        assert_no_cluster_shape(&body);
-
-        let (status, body) = console(console_addr, "GET", "/console/api/tables/orders", "").await;
-        assert_eq!(status, 200);
-        let gsis = json(&body)["gsis"].as_array().unwrap().clone();
-        assert_eq!(gsis.len(), 1);
-        assert_eq!(gsis[0]["name"], "by-status");
-
-        // ---- converges to Active ---------------------------------------
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            let (status, body) =
-                console(console_addr, "GET", "/console/api/tables/orders", "").await;
-            assert_eq!(status, 200);
-            let d = json(&body);
-            if d["gsis"][0]["status"] == "ACTIVE" {
-                break;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "GSI never reached Active: {body}"
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-
-        // ---- drop it -----------------------------------------------------
-        let (status, body) = console(
-            console_addr,
-            "DELETE",
-            "/console/api/tables/orders/gsi/by-status",
-            "",
-        )
-        .await;
-        assert_eq!(status, 200, "drop_gsi failed: {body}");
-        assert_eq!(json(&body)["ok"], true);
-
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            let (status, body) =
-                console(console_addr, "GET", "/console/api/tables/orders", "").await;
-            assert_eq!(status, 200);
-            if json(&body)["gsis"].as_array().unwrap().is_empty() {
-                break;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "GSI never disappeared after drop: {body}"
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-
-        node.shutdown_graceful().await;
-    })
-    .await
-    .expect("test timed out");
-}
-
-/// Issue #319: an Add-GSI call that *does* supply `hash_attribute_type`/
-/// `sort_attribute_type` gets a real declared type recorded — the console
-/// response echoes it back immediately, and it still reads that way off a
-/// fresh `GET /console/api/tables/{name}` afterward (a real replicated-
-/// catalog round trip, not just an echo of the request). Companion to
-/// `add_and_drop_gsi_round_trip`'s own no-type case just above.
-///
-/// **KEPT `ProdEnv` (ADR 0061 rung H, C-08 PR 4)**: identical blocker (d)
-/// as `add_and_drop_gsi_round_trip` above.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn add_gsi_records_a_declared_attribute_type() {
-    timeout(Duration::from_secs(30), async {
-        let dir = support::panic_safe_tempdir();
-        let (node, _config) =
-            support::start_single_node(dir.path(), animusd::StorageBackend::Memory).await;
-        let dynamo_addr = node.dynamo_addr();
-        let console_addr = node.console_addr();
-
-        let (status, body) = dynamo(
-            dynamo_addr,
-            "DynamoDB_20120810.CreateTable",
-            r#"{"TableName":"readings","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
-                "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
-        )
-        .await;
-        assert_eq!(status, 200, "CreateTable failed: {body}");
-
-        let (status, body) = console(
-            console_addr,
-            "POST",
-            "/console/api/tables/readings/gsi",
-            r#"{"index_name":"by-score","hash_attribute":"score",
-                "hash_attribute_type":"N","sort_attribute":"rank",
-                "sort_attribute_type":"B"}"#,
-        )
-        .await;
-        assert_eq!(status, 200, "add_gsi failed: {body}");
-        let resp = json(&body);
-        assert_eq!(resp["gsi"]["hash_attribute"]["name"], "score");
-        assert_eq!(resp["gsi"]["hash_attribute"]["attribute_type"], "N");
-        assert_eq!(resp["gsi"]["sort_attribute"]["name"], "rank");
-        assert_eq!(resp["gsi"]["sort_attribute"]["attribute_type"], "B");
-        assert_no_cluster_shape(&body);
-
-        // Re-read the table detail fresh — the type is durably in the
-        // replicated catalog, not merely echoed off the request.
-        let (status, body) = console(console_addr, "GET", "/console/api/tables/readings", "").await;
-        assert_eq!(status, 200);
-        let d = json(&body);
-        assert_eq!(d["gsis"][0]["hash_attribute"]["attribute_type"], "N");
-        assert_eq!(d["gsis"][0]["sort_attribute"]["attribute_type"], "B");
-
-        // And `DescribeTable`'s own `AttributeDefinitions` — the original
-        // issue #319 complaint — covers both, for real, not `"S"`.
-        let (status, body) = dynamo(
-            dynamo_addr,
-            "DynamoDB_20120810.DescribeTable",
-            r#"{"TableName":"readings"}"#,
-        )
-        .await;
-        assert_eq!(status, 200, "DescribeTable failed: {body}");
-        assert!(
-            body.contains(r#"{"AttributeName":"score","AttributeType":"N"}"#),
-            "score's declared N type missing from AttributeDefinitions: {body}"
-        );
-        assert!(
-            body.contains(r#"{"AttributeName":"rank","AttributeType":"B"}"#),
-            "rank's declared B type missing from AttributeDefinitions: {body}"
-        );
-
-        node.shutdown_graceful().await;
-    })
-    .await
-    .expect("test timed out");
-}
-
-/// A malformed `hash_attribute_type`/`sort_attribute_type` (anything but
-/// `S`/`N`/`B`, case-insensitively) is a client error, matching real
-/// DynamoDB's own rejection of an unknown `AttributeType` — never silently
-/// dropped or defaulted.
-///
-/// **KEPT `ProdEnv` (ADR 0061 rung H, C-08 PR 4)**: identical blocker (d)
-/// as `add_and_drop_gsi_round_trip` above.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn add_gsi_rejects_an_unknown_attribute_type() {
-    timeout(Duration::from_secs(30), async {
-        let dir = support::panic_safe_tempdir();
-        let (node, _config) =
-            support::start_single_node(dir.path(), animusd::StorageBackend::Memory).await;
-        let dynamo_addr = node.dynamo_addr();
-        let console_addr = node.console_addr();
-
-        let (status, body) = dynamo(
-            dynamo_addr,
-            "DynamoDB_20120810.CreateTable",
-            r#"{"TableName":"orders","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
-                "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
-        )
-        .await;
-        assert_eq!(status, 200, "CreateTable failed: {body}");
-
-        let (status, body) = console(
-            console_addr,
-            "POST",
-            "/console/api/tables/orders/gsi",
-            r#"{"index_name":"by-status","hash_attribute":"status","hash_attribute_type":"X"}"#,
-        )
-        .await;
-        assert_eq!(status, 400, "expected a client error: {body}");
-
-        node.shutdown_graceful().await;
-    })
-    .await
-    .expect("test timed out");
-}
-
 /// U-03's round trip: enable continuous backups (PITR) and create an
 /// on-demand backup, then confirm the table detail page reports both — the
 /// exact fields `DescribeContinuousBackups`/`ListBackups` themselves would
@@ -379,15 +148,19 @@ async fn add_gsi_rejects_an_unknown_attribute_type() {
 /// pitr_description`/`backup_wire_status`), never re-derived — and nothing
 /// cluster-shaped alongside them.
 ///
-/// **KEPT `ProdEnv` (ADR 0061 rung H, C-08 PR 4)**: this rung's brief
+/// **KEPT `ProdEnv` — the sole test left in this file.** This rung's brief
 /// allowed converting this test only if the PITR data it reads is
 /// producible under `SimCluster` via a generic `UpdateContinuousBackups`
 /// path — checked against the code and there isn't one:
 /// `Operation::UpdateContinuousBackups` is absent from both `dispatch_
 /// item_op`'s and `dispatch_table_op`'s `match` arms (`dynamo.rs`), so it
 /// falls to `unsupported_by_generic_dispatch`, unlike `CreateBackup`/
-/// `DeleteBackup`/`UpdateTimeToLive`, which PR 2 did widen. Backup/PITR
-/// data stays a separate residual, per the brief's own fallback reason.
+/// `DeleteBackup`/`UpdateTimeToLive` (C-08 PR 2) and the GSI-DDL
+/// `UpdateTable` sub-arm (C-10 PR 2) which did widen. This test also needs
+/// the real `pitr_snapshot_loop`'s own wall-clock-timed capture driver
+/// (issue #593's own race, guarded against by the poll below), which
+/// `SimCluster` does not run. Backup/PITR data stays a separate residual,
+/// per the brief's own fallback reason.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn table_detail_shows_pitr_status_and_backups() {
     timeout(Duration::from_secs(30), async {
