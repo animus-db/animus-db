@@ -18919,11 +18919,13 @@ mod sim_cluster_console;
 /// (`tests/console_stream.rs`): the honest disabled answer for a stream-
 /// less table, the shard list/iterator/records read path reflecting real
 /// writes, and a bounded multi-page walk over a sealed shard (via
-/// `SimCluster::drive_stream_seal`). The one TTL-reaper-identity test in
-/// that file stays `ProdEnv` — this fixture never spawns `animusd::ttl_
-/// reaper::ttl_reaper_loop`, so there is nothing that would ever reap the
-/// item this test's own assertion depends on; see this module's own doc
-/// for the full disposition table.
+/// `SimCluster::drive_stream_seal`). The TTL-reaper-identity test that
+/// file's own doc used to keep `ProdEnv` was converted here too, by ADR
+/// 0061 rung I (C-09 PR 4): this fixture has spawned `animusd::ttl_
+/// reaper::ttl_reaper_loop` on every node, always-on, since C-09 PR 2, so
+/// the console's own stream/shards → stream/iterator → stream/records walk
+/// can now observe a real reap; `tests/console_stream.rs` is deleted
+/// whole. See this module's own doc for the full disposition table.
 #[cfg(test)]
 mod sim_cluster_console_stream;
 
@@ -19031,6 +19033,64 @@ mod sim_cluster_dashboard;
 /// under real-thread contention.
 #[cfg(test)]
 mod sim_cluster_seed_latency;
+/// ADR 0061 rung I (C-09 PR 2): two pinned-seed smoke tests proving the
+/// always-on `ttl_reaper::ttl_reaper_loop` spawn (`SimCluster::new`/
+/// `restart`) and `SimCluster::drive_ttl_sweep` both work end to end
+/// against real replicated `Metadata` and a real `SimEnv` wall clock
+/// (`animus_sim::SimEnv::wall_now`) — a `PutItem` with a TTL attribute a
+/// few virtual seconds in the past is reaped by the always-on loop within
+/// one `run_for` past `SIM_TTL_SWEEP_INTERVAL`; a future-expiry item
+/// survives a `drive_ttl_sweep` on its leader. PR 3 extends this module
+/// with the remainder of `tests/dynamo_ttl.rs`'s own scenarios — see
+/// `crates/animusd/CLAUDE.md`'s matching C-09 appendix.
+#[cfg(test)]
+mod sim_cluster_ttl;
+
+/// ADR 0061 rung J (C-10 PR 2): the groundwork for index DDL beyond plain
+/// `CreateTable` under `SimCluster` — `UpdateTable` adding/dropping a GSI on
+/// a populated table, driven through `dynamo::dispatch_table_op`'s new
+/// index-change sub-arm and the now-generic `dynamo::create_index`/
+/// `drop_index`/`index_drain::backfill_seed_tick`. Two scenarios
+/// (`_over_seeds` at 5 seeds each) — see `crates/animusd/CLAUDE.md`'s
+/// matching C-10 entry.
+#[cfg(test)]
+mod sim_cluster_index_ddl;
+
+/// ADR 0061 rung J (C-10 PR 3): converts `tests/update_table_create_
+/// index.rs` (4), `tests/update_table_drop_index.rs` (4), and `tests/
+/// dynamo_gsi_drain.rs` (1) — 9 tests total, all three files deleted whole.
+/// Every scenario asserts the same observable behaviour the original
+/// asserted, through `SimCluster::dynamo`; two scenarios substitute a
+/// deterministic sequenced analogue for the original's own real-thread
+/// concurrency (an abandoned in-flight request interrupted by
+/// `SimCluster::restart`, and a drop racing exactly one partial backfill
+/// tick) — see the module's own top-of-file doc for the full account. Nine
+/// pinned-seed smokes plus `_over_seeds` siblings (5 seeds each) — see
+/// `crates/animusd/CLAUDE.md`'s matching C-10 entry.
+#[cfg(test)]
+mod sim_cluster_dynamo_update_table_index;
+
+/// ADR 0061 rung J (C-10 PR 4): the secondary-index backfill seeder (ADR
+/// 0045 §2) end to end under `SimCluster` — 4 of the 5 scenarios in
+/// `tests/backfill_seeder.rs` converted (materialize-then-flip-Active, live
+/// writes racing the sweep, two independently-converging indexes, and a
+/// crash/restart resuming from the persisted backfill cursor); the fifth
+/// (split during backfill) stays on `ProdEnv` — see this module's own doc
+/// for exactly why. Five `_over_seeds`-paired scenarios — see
+/// `crates/animusd/CLAUDE.md`'s matching C-10 entry.
+#[cfg(test)]
+mod sim_cluster_backfill_seeder;
+
+/// ADR 0061 rung J (C-10 PR 5): conversion of
+/// `tests/stream_backfill_seed_filter.rs` — the backfill seeder's own
+/// synthetic change-log markers must never surface as phantom `GetRecords`
+/// events, over both the open-tail and sealed serve paths. Two scenarios
+/// (`_over_seeds` at 5 seeds each), driven with
+/// [`sim_cluster::SimCluster::drive_backfill_seed`] (C-10 PR 2) and
+/// [`sim_cluster::SimCluster::drive_stream_seal`] (C-07 PR 2) together — see
+/// `crates/animusd/CLAUDE.md`'s matching C-10 entry.
+#[cfg(test)]
+mod sim_cluster_stream_backfill_seed_filter;
 
 /// Regression for the issue #298 residual confirmed live under the
 /// un-pinned `SplitMode::InPlace` proof soak (ADR 0018's matching amendment,

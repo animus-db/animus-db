@@ -57,6 +57,84 @@ debugging anything that feels like it might have happened before.
   without its fix) and issue #298 (a flake carried across five shapes
   before a root cause): both got expensive precisely because red was
   tolerated for a while.
+- **`SimCluster`'s per-op `OP_BUDGET` always fully drains the shared virtual
+  clock, so a "not yet happened" assertion against a fast always-on
+  background loop cannot be expressed the way it can under a real, slow
+  interval (2026-09-08, ADR 0061 rung I C-09 PR 3).** `SimCluster::dynamo`/
+  `put`/etc. all go through `spawn_and_capture`, which calls
+  `self.sim.run_for(OP_BUDGET)` (12s) unconditionally; `animus_sim::
+  Simulator::run_until` always drains every scheduled event up to that
+  deadline before returning, regardless of how quickly the awaited future
+  itself resolved. Any background loop with a period well under `OP_BUDGET`
+  (the always-on TTL reaper's 200ms `SIM_TTL_SWEEP_INTERVAL` is 60x
+  shorter) therefore gets dozens of ticks *inside* a single ordinary wire
+  call, not just between separate calls. That makes "write a
+  should-already-be-actionable state, then immediately check it hasn't
+  been acted on yet" scenarios structurally unreachable through the wire
+  entry point — the original real-socket test this pattern converts from
+  (`dynamo_ttl.rs::expired_item_is_still_readable_immediately`) relies on
+  a *slow* production-scale interval specifically to keep that window
+  open, and `SimCluster` has no "hold a background loop back for N calls"
+  primitive to substitute (a `drive_*` helper only ever forces extra
+  ticks, never suppresses the always-on ones). Before assuming a
+  `SimCluster` conversion of a "still in the pre-action state" test is
+  just a matter of picking the right helper, check whether the assertion
+  needs the always-on loop to have had *zero* chances, not just to have
+  had no reason to act — if so, it may be a genuine, well-reasoned residual
+  to leave on `ProdEnv`, not a gap in fixture coverage. A "never acts on
+  this input" assertion (the opposite: many ticks are fine because none of
+  them should do anything) has no such problem and converts cleanly.
+- **A `SimCluster` conversion is blocked at the wire-operation level, not
+  just the scenario-design level, whenever the underlying `dynamo::
+  dispatch_item_op` has no arm for the operation a test needs — and that
+  gap can be narrower than a whole operation family (2026-09-08, ADR 0061
+  rung I C-09 PR 3).** `UpdateTimeToLive` was widened onto the generic
+  (`SimEnv`-capable) dispatch path in ADR 0061 rung H (C-08 PR 2), but its
+  read-side sibling, `DescribeTimeToLive`, was not — `dispatch_item_op` has
+  no `Operation::DescribeTimeToLive` arm at all, so any `SimCluster`
+  scenario that calls it 500s with "this operation is not yet supported by
+  the generic... dispatch path." A test converted before actually running
+  it under `SimEnv` (this rung's own PR 3 was authored without compiling,
+  per its own task brief) can look complete and still be blocked on a gap
+  one operation away from a sibling that already works — always run the
+  new scenario before trusting the design doc's own "converts cleanly"
+  claim. When the fix needs a source file outside the task's own edit
+  scope (here, `crates/animusd/src/dynamo.rs`), the right move is not to
+  paper over it by asserting a different status code or skipping the
+  assertion — it is to leave the original real-socket test in place with a
+  one-line reason naming the missing dispatch arm, exactly as if the
+  fixture itself couldn't express the scenario at all. **Closed 2026-09-08
+  (C-09 PR 5)**: the fix was exactly as narrow as predicted —
+  `describe_time_to_live` widened to `<E: Env, R: RelayClient>` (a pure
+  signature change; it already took an unused `_ctx: &ClientCtx` and isn't
+  even `async`, so there was no `tokio::time` body to convert at all) plus
+  one new `Operation::DescribeTimeToLive` arm on `dispatch_item_op`,
+  mirroring `UpdateTimeToLive`'s own arm immediately above it. The two
+  reverted scenarios moved back into `sim_cluster_ttl.rs` unchanged from
+  this PR's own reverted draft, `tests/dynamo_ttl.rs` dropped to its one
+  true residual. The generalizable lesson stands regardless: a narrowed
+  generic dispatcher can be missing just the read-side or write-side half
+  of an otherwise-symmetric operation pair, worth checking for
+  specifically — not just "is the operation covered at all" — before
+  either reverting a scenario or writing a wider fix than the gap needs.
+- **A doc appendix/amendment written and gated against one commit, then
+  rebased onto a sibling PR that landed in between, carries stale
+  "expected N passed" baselines that a clean rebase won't catch
+  (2026-09-09, ADR 0061 rung I C-09 PR 5).** PR 5 was authored and its own
+  gate numbers predicted on top of PR 3's tip (420 `sim_cluster` tests),
+  under a hard no-`cargo` constraint; PR 4 (admin/console residue) landed
+  in the meantime and moved the real baseline to 424. Rebasing PR 5 onto
+  PR 4's tip only conflicts where both PRs' prose literally collides
+  (here: three doc files' appended sections) — it does **not** flag that
+  PR 5's own "424 total = PR 3's 420 + my 4" arithmetic, quoted in prose
+  untouched by the conflict, now needs to read "428 = PR 4's 424 + my 4".
+  A merge that keeps both sides' text in order is necessary but not
+  sufficient: after resolving structural conflicts, grep the merged
+  doc(s) for every predicted/expected count that names a baseline
+  ("PR 3's own N", "up from N", "N passed") and recompute it against the
+  new base before trusting the doc — then confirm by actually running the
+  gate, which is what caught this one (428 passed, matching the corrected
+  prediction, not the stale 424 the unedited prose would have kept).
 - **A `dynamo_retry`+`CreateTable` fixture helper must tolerate
   `ResourceInUseException` on the retry, not just retry 500s (2026-08-31,
   issue #461).** `create_table` (`crates/animusd/src/schema.rs`) calls the
@@ -4268,6 +4346,78 @@ debugging anything that feels like it might have happened before.
   run, and simply hang forever rather than erroring, which makes this
   class of gap slower to diagnose than a missing-capability compile error
   or a clean rejection would be.
+- **Wiring a background loop into a shared fixture retroactively stales
+  every doc comment that was written when the loop didn't exist yet** (ADR
+  0061 rung I, C-09 PR 4). C-08's `sim_cluster_admin.rs::ttl_tables_
+  lists_a_ttl_enabled_table` (rung H) carried a doc comment explaining
+  that `reaper.deleted_total` stays 0 "because the reaper never actually
+  runs under `SimEnv`" — true when it was written. C-09 PR 2 then spawned
+  the TTL reaper unconditionally in `SimCluster::new`/`restart`, making
+  that claim false, but the scenario's own *observable behavior* didn't
+  change (it still never writes an expired item, so the counter still
+  reads 0) — nothing failed, nothing flagged it, and the stale reasoning
+  would have sat there indefinitely if a later PR touching the same file
+  for an unrelated reason hadn't reread it. The general lesson: when a PR
+  makes a previously-absent primitive (a loop, a driver, a capability)
+  real under a shared test fixture, grep that fixture's own sibling
+  modules for doc comments/scenario docs that assert or lean on its
+  *absence* — "no primitive drives X", "X never runs here", "this stays 0
+  because Y is unbuilt" — and fix the ones your own PR's tree touches even
+  when the assertion they explain doesn't need to change, because a
+  correct assertion with an now-incorrect justification is exactly the
+  kind of thing a future reader trusts and gets misled by. A parallel
+  finding from the same PR: keeping a real-socket test's exact name across
+  a `SimCluster` conversion (rather than folding its assertions into an
+  existing, differently-named sibling scenario) is what made this stale
+  comment discoverable at all — a literal `grep` for the original test
+  name landed directly on the doc comment that needed fixing.
+- **`SimCluster`'s own op methods (`dynamo`/`put`/`get`/`scan`/...) always
+  run a request to completion in one synchronous call, so there is no
+  window from a test's own code to interleave a second action mid-flight
+  the way a real-socket test's `tokio::join!`/fire-and-forget-then-sleep
+  can** (ADR 0061 rung J, C-10 PR 3). Every one of these methods is
+  `spawn_and_capture`: spawn the future, then `self.sim.run_for(OP_BUDGET)`
+  drains the simulator to completion (or timeout) before returning — there
+  is no intermediate point a caller can observe or act on. A real-socket
+  test that races a background poll against a live request, or fires a
+  request and abandons it after a brief sleep to simulate a crash
+  mid-cascade, has no literal equivalent under this fixture. The fixture's
+  own established workaround, used consistently across every "crash during
+  X" scenario (`sim_cluster_dynamo_drop_table.rs::run_scenario_4_a_node_
+  crashed_during_the_drop_and_restarted_reclaims_its_engine` and this PR's
+  own `a_crash_and_retry_mid_cascade_still_converges`): spawn the request
+  by hand on the target node's own `SimEnv` (`SimCluster::handle().env(
+  node)`, the identical primitive the D1-step-3 corpus's own concurrent
+  client tasks use), optionally drive the simulator a little via
+  `SimCluster::run_for` to let it make partial progress, then interrupt
+  with `SimCluster::crash`/`restart` before ever calling `dynamo`/`put`/etc.
+  (which would run it to completion instead). A scenario that needs the
+  interleaving itself (not just "abandon and check the end state
+  converges") — e.g. a live poll racing a live write to prove a property
+  never transiently holds — has no fixture-level equivalent at all; the
+  honest move is a deterministic sequenced substitute that proves the same
+  property a different way (documented inline, per this crate's own "note
+  where a scenario doesn't literally reproduce concurrency" convention),
+  not a strained attempt to force real concurrency out of a
+  single-threaded discrete-event simulator.
+- **`SimCluster::restart` rebuilds the restarted node's own control-plane
+  Raft log from scratch (`RaftNode::start(.., MemoryEngine::new())`) and
+  relies on ordinary peer catch-up to repopulate it — a 1-node cluster has
+  no peer to catch up from, so restarting node 0 on a `SimCluster::new(
+  seed, 1, 1)` cluster loses ALL replicated `Metadata`, including every
+  table's own schema** (ADR 0061 rung J, C-10 PR 3). Only the DATA-plane
+  tablet engines survive a restart (`self.engines[node]`, reused
+  deliberately, per that method's own doc); the control-plane log is not
+  durable across a restart the way a real `ProdEnv` node's on-disk WAL is.
+  A real-socket test converted to this fixture that crashes-and-restarts a
+  **single** node and expects its own prior schema/catalog state to still
+  be there afterward needs a multi-node cluster instead (so the restarted
+  node recovers via replication, exactly like production), even when the
+  original test used one real process. Found converting `tests/
+  update_table_drop_index.rs::a_crash_and_retry_mid_cascade_still_
+  converges` (a real single-node crash/restart test) — the fix was simply
+  running the equivalent `SimCluster` scenario at `(seed, 3, 3)` instead of
+  `(seed, 1, 1)`, not a fixture change.
 
 ### Code patterns
 - **A new confirm loop copied from a sibling's shape but the wrong sibling's
@@ -23186,6 +23336,28 @@ method's signature to `E`-generic without also driving it under `SimEnv`
 in the same change, grep the body for `tokio::time`/`Instant::now`/
 `SystemTime::now` before declaring it done, per the general lesson above.
 
+**2026-09-09, fourth recurrence (ADR 0061 rung J, C-10 PR 2)**:
+`index_drain::clear_backfill_cursor<E: Env>` — already generic (its two
+sibling functions, `advance_backfill_cursor`/`seed_change_log_record`,
+needed the identical widening in the very same change, so this one's own
+still-bare `tokio::time::Instant::now()`/`tokio::time::sleep` body was
+easy to miss by pattern-matching "this file's own backfill functions all
+look alike") had the identical gap. Found the same way, by the same
+signal: the very first `sim_cluster_index_ddl.rs` smoke run (scenario
+(b), `UpdateTable` dropping a GSI, whose `drop_index` cascade calls
+`ClientCtx::clear_backfill_cursor_for_table` → this function) panicked
+immediately with "no reactor running." Fixed with the identical
+`group.env().now()`/`group.env().sleep(..)` conversion (this function
+takes `group: &CpGroup<E>` with no `&self`, so it reads the clock off
+`group.env()` rather than `ctx.env`/`self.env` — the same accessor
+`advance_backfill_cursor`/`seed_change_log_record` right beside it
+already use for the identical reason). Four occurrences now — when
+widening a *group* of sibling functions together, grep every one of
+them individually for `tokio::time`/`Instant::now`/`SystemTime::now`,
+not just the ones whose diff you're already looking at; a function that
+"already looks generic" next to freshly-converted siblings is exactly
+the one most likely to get skipped.
+
 ## `DescribeStream` always appends a tablet's still-open successor epoch behind a just-sealed one while the stream stays enabled — a shard-count assertion after a seal must account for it (ADR 0061 rung G, C-07 PR 3, 2026-09-08)
 
 Building `sim_cluster_dynamo_streams.rs`'s new post-seal scenarios (a
@@ -23567,3 +23739,94 @@ onto none of them (the bug here) silently breaks the one invariant the
 marker exists to provide. When adding a new terminal/completion write to
 any job that writes multiple objects/records in sequence, ask this
 question explicitly rather than defaulting to uniform `?`-propagation.
+
+## When a scenario needs three independently-timed on-demand primitives to race correctly, and you can't run it, use the license — don't guess (ADR 0061 rung J, C-10 PR 4)
+
+Converting `tests/backfill_seeder.rs`'s `split_during_backfill_converges_
+with_correct_final_gsi` to `SimCluster` would have meant hand-interleaving
+three separately-timed on-demand primitives every round —
+`drive_backfill_seed`/`drain_gsi` (the pre-cutover vetoes `index_drain::
+inplace_split_driver_tick` checks) and `drive_inplace_split_cutover`
+itself (the cutover propose) — across every node, in a fixture that
+spawns no `index_drain::change_consumer_loop` at all (every per-tick arm
+that loop would normally run is instead something a test drives by hand).
+The session converting it had no `cargo` access in its worktree, so
+nothing about the resulting round-loop's actual convergence — whether the
+always-on completion aggregator can flip the index `Active` while the
+parent is still un-cut-over (it watches "every tablet *currently* in the
+table's live map has reported," which the still-`Splitting` parent alone
+can already satisfy, independent of whether cutover ever committed), or
+whether the post-cutover Fork-A per-child resweep converges within any
+round budget picked blind — could be checked before landing it.
+
+The ADR's own rung-opener text had already licensed exactly this case
+("licensed to stay `ProdEnv` if it does not converge cleanly under the
+fixture"), anticipating that a scenario combining several of a rung's own
+newly-built on-demand primitives at once is a materially different
+verification problem than any one of them alone, each already proven
+individually by a sibling scenario. **The lesson generalizes past this one
+test**: when a conversion's own correctness rests on the *interaction* of
+several independently-timed driver calls rather than on any single call's
+already-proven behavior, and the session doing the conversion cannot
+compile or run what it writes, use the license to keep the scenario on
+its original substrate rather than ship an unverified sequencing that
+might hang, flake, or silently pass for the wrong reason. A named,
+reasoned residual with a one-line "why" is worth more than an unverified
+conversion — the next session with build access can attempt it with a
+real pass/fail signal instead of guessing twice.
+
+**A second, smaller finding from the same investigation, fixed in a later
+pass of this same PR**: `SimCluster::restart` respawned `heartbeat_loop`/
+`backup_janitor_loop`/`segment_janitor_loop`/`ttl_reaper_loop`/
+(conditionally) `auto_split_loop` — every perpetual background task
+`Simulator::stop` drops for the restarted node — but not `index_backfill::
+index_backfill_loop` (added to `SimCluster::new` by this rung's own PR 2).
+Not a correctness bug on its own: the completion aggregator is
+control-plane-**leader**-only and self-gated, and every *other* node's own
+instance (spawned once at `SimCluster::new`, never touched by a different
+node's restart) keeps running regardless — so a scenario that
+crashes/restarts a tablet leader who happens to have also been the control
+leader still converges once some survivor takes over control leadership,
+since that survivor's own aggregator instance was never stopped. It only
+mattered for a scenario that would restart *every* node in sequence, or
+that inspects the restarted node's own `index_backfill_loop` liveness
+directly. **Fixed**: `SimCluster::restart` now respawns `index_backfill::
+index_backfill_loop` unconditionally, in the same place and the same shape
+as the `ttl_reaper_loop` respawn immediately above it — a plain
+mirror-the-pattern fix, no new mechanism.
+## A real-socket test's converged-or-timeout loop can hide a genuine real-time race, not just an eventual property — check which before collapsing it in a `SimCluster` conversion (ADR 0061 rung J, C-10 PR 5)
+
+Converting `tests/stream_backfill_seed_filter.rs`'s sealed-path scenario to
+`sim_cluster_stream_backfill_seed_filter.rs` required deciding what to do
+with its own 60s converged-or-timeout poll (this log already has many
+entries insisting an eventual property gets one, never a fixed one-shot
+assert). Reading *why* that poll existed mattered before deciding: the
+original raced a genuinely concurrent real-time writer against a live
+periodic sealer — two independent real threads whose relative order across
+polls was not otherwise controlled — so the loop's job was to wait out an
+actual race, not just to observe a value settle. Under `SimCluster`, that
+race does not exist: every op call (`dynamo`/`drive_backfill_seed`/
+`drive_stream_seal`/…) fully drains the shared virtual clock before
+returning (an existing, already-recorded property of this fixture), so by
+the time the scenario issues its one `drive_stream_seal` call every write
+that precedes it in program order is already committed, and the call's own
+documented contract (`seal_now` looped to `Ok(None)`) already seals
+everything currently pending in one shot. Collapsing the poll to a single
+direct call-then-assert is therefore correct here, not a violation of the
+converged-or-timeout rule — the rule is about eventual properties this
+fixture's own deterministic, turn-based execution has *already* made
+non-eventual, not about eventual properties in general. The general
+takeaway: when converting a real-socket regression's own polling loop to a
+`SimCluster` sibling, read what the loop was waiting *on* — a value that
+settles because of a real concurrent process (safe to collapse once
+`SimCluster`'s single-threaded, fully-draining-per-call model removes that
+concurrency) versus a value that settles because of a still-eventual
+in-process mechanism (keep the loop). Getting this backwards either
+reintroduces a flake `SimCluster` was supposed to make deterministic
+(keeping an unnecessary loop is harmless, just misleading) or, worse,
+silently assumes away a race the conversion never actually eliminated
+(collapsing a loop that was doing real work). This conversion's own
+open-path scenario kept a bounded stable-poll shape anyway, defensively and
+at zero cost, rather than asserting off the very first `GetRecords` call —
+worth doing whenever the original's own discipline costs nothing to
+preserve, even once its original reason no longer strictly applies.

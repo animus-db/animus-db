@@ -222,6 +222,22 @@ const STREAM_SEAL_RETRIES: u32 = 5;
 /// than reconfiguring the first one.
 const DEFAULT_SIM_SEGMENT_JANITOR_RETENTION: Duration = Duration::from_secs(3600);
 
+/// The TTL reaper's own sim sweep interval (ADR 0061 rung I, C-09 PR 2) —
+/// mirrors the segment janitor's (`DEFAULT_SIM_SEGMENT_JANITOR_RETENTION`'s
+/// neighbor, `segment_janitor_loop`) and backup janitor's own hardcoded
+/// 200ms `SimCluster` interval exactly (D4 PR 5, C-07 PR 5): the reaper
+/// (`animus_node::ttl_reaper::ttl_reaper_loop`) is spawned unconditionally,
+/// always-on, on every node, its own leader gate (`TtlScanHost::
+/// led_tablets`) already making a non-leading node's own tick a cheap idle
+/// scan-nothing sleep — no reason to gate spawning it behind an opt-in the
+/// way `auto_split_loop`'s `set_auto_split_thresholds` is. Unlike the
+/// segment janitor's retention window, this has no per-scenario override —
+/// the reaper's own interval is not something a scenario needs to widen to
+/// avoid a premature reap (a scenario that must assert an *intermediate*
+/// pre-sweep state instead calls [`SimCluster::drive_ttl_sweep`], never
+/// waits out this cadence).
+const SIM_TTL_SWEEP_INTERVAL: Duration = Duration::from_millis(200);
+
 /// Build a fresh per-node `Reconciler<SimEnv, MemoryEngine>` (ADR 0061 rung
 /// D4 PR 1) — mirrors `animusd`'s own production node assembly exactly
 /// (`BoundNode::start_with`'s `on_host`/`on_teardown` closures): a fresh
@@ -1572,6 +1588,38 @@ impl SimCluster {
             ));
         }
 
+        // ADR 0061 rung I (C-09 PR 2): one `ttl_reaper::ttl_reaper_loop` per
+        // node, unconditionally — mirrors the backup/segment janitors' own
+        // always-on spawns immediately above exactly: this loop's own
+        // leader gate (`TtlScanHost::led_tablets`, per-tablet not
+        // per-node) already makes a node leading nothing this tick a cheap
+        // idle scan-nothing sleep, so there is no reason to gate spawning
+        // it behind an opt-in the way `auto_split_loop` is.
+        for ctx in &ctxs {
+            let env = ctx.env.clone();
+            env.spawn_task(ttl_reaper::ttl_reaper_loop(
+                ctx.clone(),
+                SIM_TTL_SWEEP_INTERVAL,
+            ));
+        }
+
+        // ADR 0061 rung J (C-10 PR 2): one `index_backfill::
+        // index_backfill_loop` per node, unconditionally — mirrors the
+        // backup/segment/TTL janitors' own always-on spawns immediately
+        // above exactly: this loop's own leader gate
+        // (`ControlLeaderHost::control_leader`, the identical gate the
+        // backup janitor uses) already makes a non-leader's own tick a
+        // cheap idle sleep, so there is no reason to gate spawning it
+        // behind an opt-in the way `auto_split_loop` is. Needs no new
+        // `Drop`/`restart` handling beyond what every other always-on loop
+        // here already gets (issue #753's own discipline) — it captures a
+        // plain `ClientCtx` clone, the identical shape every janitor above
+        // already captures.
+        for ctx in &ctxs {
+            let env = ctx.env.clone();
+            env.spawn_task(index_backfill::index_backfill_loop(ctx.clone()));
+        }
+
         let mut cluster = SimCluster {
             sim,
             nodes,
@@ -2863,6 +2911,80 @@ impl SimCluster {
         }
     }
 
+    /// Drive one backfill-seeder tick (ADR 0045 §2, `index_drain::
+    /// backfill_seed_tick`) for every `Creating` GSI of `table`, over every
+    /// tablet [`node`] both hosts and currently leads — a test-only
+    /// stand-in for `index_drain::change_consumer_loop`'s own backfill-seeder
+    /// arm, which this fixture never spawns at all (see
+    /// [`SimCluster::drain_gsi`]'s own doc for the identical
+    /// hand-hosted-not-reconciler-hosted reasoning; the always-on
+    /// `index_backfill_loop` — ADR 0061 rung J, C-10 PR 2 — is the *separate*
+    /// control-plane-leader-only aggregator that flips a fully-backfilled
+    /// index `Active` once every tablet has reported, and IS spawned
+    /// unconditionally by [`SimCluster::new`]/[`SimCluster::restart`]; this
+    /// method drives only the per-tablet seeding half feeding it).
+    ///
+    /// Mirrors [`SimCluster::drain_gsi`]'s exact shape: the same leader
+    /// check (`group.is_leader()`), the same `is_quiesced()`/`Building`-child
+    /// skip omission (unreachable under this fixture, identical reasoning),
+    /// and the same [`SimCluster::spawn_and_capture`]-driven-to-[`OP_BUDGET`]
+    /// bounded wait rather than a fixed sleep. `gsis` is filtered to
+    /// `IndexStatus::Creating` only (never `Active` — an already-backfilled
+    /// index has nothing left to seed, unlike `drain_gsi`'s own
+    /// `Creating | Active` filter, since ordinary live writes keep draining
+    /// an `Active` index forever but a one-shot seed tick has no reason to
+    /// touch one).
+    ///
+    /// **One call seeds at most [`index_drain::BACKFILL_SEED_BATCH`] newly
+    /// discovered partitions per `(tablet, index)` pair — never assume one
+    /// call finishes backfilling a populated table.** A table with more
+    /// partitions than that needs several calls (poll `DescribeTable`'s own
+    /// per-index `Backfilling`/status field, or just call this in a loop
+    /// until the index flips `Active`), the same "several ticks, not one"
+    /// contract the real per-node loop has in production.
+    ///
+    /// Panics on a genuine seed failure or on not completing within
+    /// [`OP_BUDGET`] — both are fixture-setup bugs, mirroring
+    /// [`SimCluster::drain_gsi`]'s identical panic contract.
+    pub(crate) fn drive_backfill_seed(&mut self, node: u64, table: &str) {
+        let table_owned = table.to_owned();
+        let handle = self.shared.clone();
+        let outcome: Option<Result<(), String>> = self.spawn_and_capture(node, async move {
+            let ctx = handle.ctx(node);
+            let meta = ctx.effective_metadata();
+            let gsis: Vec<animus_control::IndexDef> = meta
+                .table_indexes(&table_owned)
+                .iter()
+                .filter(|i| {
+                    i.kind == animus_control::IndexKind::Global && i.status == IndexStatus::Creating
+                })
+                .cloned()
+                .collect();
+            for (tablet, group) in ctx.edge.hosted_groups() {
+                let led_here = meta
+                    .tablets
+                    .get(&tablet)
+                    .is_some_and(|t| t.table.as_deref() == Some(table_owned.as_str()));
+                if !led_here || !group.is_leader() {
+                    continue;
+                }
+                for idx in &gsis {
+                    index_drain::backfill_seed_tick(&ctx, &group, tablet, &table_owned, idx)
+                        .await?;
+                }
+            }
+            Ok(())
+        });
+        match outcome {
+            Some(Ok(())) => {}
+            Some(Err(e)) => panic!("drive_backfill_seed(node={node}, table={table}) failed: {e}"),
+            None => panic!(
+                "drive_backfill_seed(node={node}, table={table}) did not complete within \
+                 {OP_BUDGET:?}"
+            ),
+        }
+    }
+
     /// Drive on-demand shard sealing for every led, streamed tablet
     /// [`node`] hosts (ADR 0061 rung G, C-07 PR 2) — a test-only stand-in
     /// for `index_drain::change_consumer_loop`'s stream-seal arm
@@ -2936,6 +3058,74 @@ impl SimCluster {
             Some(Err(e)) => panic!("drive_stream_seal(node={node}) failed: {e}"),
             None => panic!("drive_stream_seal(node={node}) did not complete within {OP_BUDGET:?}"),
         }
+    }
+
+    /// ADR 0061 rung I (C-09 PR 2): drive one full TTL-reaper sweep, to
+    /// exhaustion, over every tablet `node` currently leads — through the
+    /// SAME per-tablet sweep function
+    /// (`animus_node::ttl_reaper::ttl_sweep_one_tablet`, widened to `pub`
+    /// for this reuse) the always-on loop [`SimCluster::new`]/`restart`
+    /// spawn on every node already calls every [`SIM_TTL_SWEEP_INTERVAL`]
+    /// tick — for a scenario that must assert an INTERMEDIATE (pre-cadence)
+    /// reaper state without waiting out that cadence, mirroring
+    /// [`SimCluster::drive_stream_seal`]'s own on-demand-drive shape
+    /// exactly. Not a strict necessity given `OP_BUDGET` (12s) is 60x
+    /// [`SIM_TTL_SWEEP_INTERVAL`] — an ordinary op call already advances
+    /// virtual time past dozens of ticks — but useful for a single,
+    /// deterministic sweep with no leftover cadence noise. Uses its own
+    /// driver-local resume cursor, entirely separate from the always-on
+    /// loop's own — calling this does not perturb that loop's own
+    /// progress or cursor state. A tablet whose table has no TTL enabled
+    /// (or that isn't currently led) is a cheap no-op via the sweep
+    /// function's own self-gating — see that function's own doc.
+    pub(crate) fn drive_ttl_sweep(&mut self, node: u64) {
+        let handle = self.shared.clone();
+        let outcome: Option<()> = self.spawn_and_capture(node, async move {
+            let ctx = handle.ctx(node);
+            let env = ctx.env.clone();
+            let meta = ctx.effective_metadata();
+            let led = animus_node::host::TtlScanHost::led_tablets(&ctx);
+            let mut cursors: BTreeMap<TabletId, Vec<u8>> = BTreeMap::new();
+            for tablet in led {
+                loop {
+                    let mut tick_error: Option<String> = None;
+                    animus_node::ttl_reaper::ttl_sweep_one_tablet(
+                        &env,
+                        &ctx,
+                        &meta,
+                        tablet,
+                        &mut cursors,
+                        &mut tick_error,
+                    )
+                    .await;
+                    if !cursors.contains_key(&tablet) {
+                        break;
+                    }
+                }
+            }
+        });
+        if outcome.is_none() {
+            panic!("drive_ttl_sweep(node={node}) did not complete within {OP_BUDGET:?}");
+        }
+    }
+
+    /// ADR 0061 rung I (C-09 PR 2): `node`'s own live
+    /// `animus_node::ttl_reaper::TtlReaperProgress` snapshot — the
+    /// identical `GET /admin/ttl` read production serves, a plain
+    /// synchronous lock/clone/drop (never held across an `.await`,
+    /// `client_ctx_host.rs`'s own `TtlReaperProgressHost` impl), mirroring
+    /// [`SimCluster::backup_janitor_progress`]/[`SimCluster::
+    /// segment_janitor_progress`] exactly.
+    pub(crate) fn ttl_reaper_progress(
+        &self,
+        node: u64,
+    ) -> animus_node::ttl_reaper::TtlReaperProgress {
+        self.shared
+            .ctx(node)
+            .ttl_reaper_progress
+            .lock()
+            .expect("ttl reaper progress poisoned")
+            .clone()
     }
 
     /// ADR 0061 rung D4 PR 2: drive one pass of `index_drain::
@@ -3194,6 +3384,29 @@ impl SimCluster {
             self.segment_janitor_retention,
         ));
 
+        // ADR 0061 rung I (C-09 PR 2): `Simulator::stop` above also dropped
+        // this node's own `ttl_reaper_loop` task — respawn it
+        // unconditionally at the same [`SIM_TTL_SWEEP_INTERVAL`], mirroring
+        // the backup/segment janitors' own respawns immediately above.
+        let ttl_reaper_env = ctx.env.clone();
+        ttl_reaper_env.spawn_task(ttl_reaper::ttl_reaper_loop(
+            ctx.clone(),
+            SIM_TTL_SWEEP_INTERVAL,
+        ));
+
+        // ADR 0061 rung J (C-10 PR 4): `Simulator::stop` above also dropped
+        // this node's own `index_backfill_loop` task — respawn it
+        // unconditionally, exactly like `new` spawns it (see that
+        // constructor's own ADR 0061 rung J / C-10 PR 2 comment above) and
+        // mirroring the backup/segment/TTL janitors' own respawns
+        // immediately above. Without this a node's own index-backfill
+        // completion aggregator never runs again after a restart, so a
+        // `Creating` GSI whose backfill happens to finish only after this
+        // node has restarted would never observe the completion this loop
+        // is the one thing that flips it to `Active`.
+        let index_backfill_env = ctx.env.clone();
+        index_backfill_env.spawn_task(index_backfill::index_backfill_loop(ctx.clone()));
+
         let ctx_for_server = ctx.clone();
         fresh_relay.serve(move |req| {
             let ctx = ctx_for_server.clone();
@@ -3251,6 +3464,20 @@ impl SimCluster {
     /// convention).
     pub(crate) fn seed(&self) -> u64 {
         self.sim.seed()
+    }
+
+    /// `node`'s own current wall-clock epoch second (ADR 0061 rung I,
+    /// C-09 PR 2) — `animus_env::Clock::wall_now`, a pure function of
+    /// virtual time (`animus_sim::SimEnv::wall_now`'s own doc: `UnixMillis(
+    /// SIM_WALL_EPOCH_MS + self.now().0 / 1_000_000)`), so this is
+    /// deterministic and seed-reproducible like everything else here — no
+    /// real clock read anywhere. Every node shares the same simulator, so
+    /// this reads identically regardless of which `node` is asked; a test
+    /// picks whichever node it already has in hand. Used to mint a TTL
+    /// attribute a few virtual seconds in the past/future without ever
+    /// touching `SystemTime`.
+    pub(crate) fn wall_now_secs(&self, node: u64) -> u64 {
+        self.shared.env(node).wall_now().as_secs()
     }
 
     /// **ADR 0061 rung D4 PR 4: add a node after construction** — the one

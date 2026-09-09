@@ -6570,14 +6570,26 @@ decommission (9/34), Transact (6/32), index DDL beyond plain `CreateTable`
 (9/30), backup/PITR/export/import (6/29), Streams (3/28, owned by C-07
 (ADR 0061 rung G) as of 2026-09-08), control/data
 role split (5/21), reconciler-driven split/rebalance/GC (7/13), TTL
-(1/9), node assembly/raw `ClientRequest` (2/8), throttle metric counters
+(1/9, **owned and closed** by C-09/ADR 0061 rung I as of 2026-09-09 — see
+`docs/roadmap.md`'s C-09 entry), node
+assembly/raw `ClientRequest` (2/8), throttle metric counters
 (1/6), auto-split loops (2/2), `--config` bring-up (2/2) —
 reconciler-driven split/rebalance/GC, auto-split, join/growth, and the
 backup janitor are D4's own scope (D4 PR 1 already supplied the real
-reconciler these need next); Streams and admin/console/dashboard HTTP are
-now owned (C-07, C-08); TTL,
-the control/data role split, `--config` bring-up, index DDL beyond
-`CreateTable`, node assembly, and the throttle-metric counters are unowned
+reconciler these need next); Streams, admin/console/dashboard HTTP, and
+TTL are now owned and closed (C-07, C-08, C-09);
+index DDL beyond plain `CreateTable` is queued as C-10, **open** as of
+2026-09-09 (PRs 1-5 landed — groundwork plus `sim_cluster_dynamo_update_
+table_index.rs`, converting `update_table_create_index.rs`/`update_table_
+drop_index.rs`/`dynamo_gsi_drain.rs` (9 tests), all three deleted whole;
+`sim_cluster_backfill_seeder.rs`, converting 4 of `backfill_seeder.rs`'s
+5 scenarios; and `sim_cluster_stream_backfill_seed_filter.rs`, converting
+`stream_backfill_seed_filter.rs` (2 tests, +2 scenarios, file deleted)
+whole; PR 6 in progress, PR 7 close-out pending — see ADR 0061's "Rung J
+(post-C-09)" amendment and `docs/roadmap.md`'s C-10 entry for the
+grep-verified ground truth, file/line anchors, and the 7-PR plan);
+the control/data role split, `--config` bring-up, node assembly, and the
+throttle-metric counters are unowned
 by any planned rung as of this close; (E) frozen behind an open flake
 issue, 7 files/32 tests (#298, #418, #592, #601, #610, #619/#622, #627) —
 out of scope for C-04, tracked by their own issues.
@@ -6658,10 +6670,15 @@ card/panel/action siblings, PR 7) — 42 of the ten files' 67 real-socket
 tests converted (89 new tests with `_over_seeds`); `console_tables.rs`,
 `console_create_table.rs`, and `console_items.rs` deleted whole (each
 left with zero tests once its sole/all tests converted). The remaining 25
-tests stay `ProdEnv` for documented reasons spread across seven files
-(`admin_endpoint.rs` 10, `dashboard_endpoint.rs` 4, `console_endpoint.rs`
+tests stayed `ProdEnv` for documented reasons spread across seven files, as
+of this rung's own close (`admin_endpoint.rs` 10, `dashboard_endpoint.rs`
+4, `console_endpoint.rs`
 3, `console_stream.rs` 1, `console_table_config.rs` 4, `metrics_
-endpoint.rs` 1, `system_table.rs` 2), none silently dropped — see this
+endpoint.rs` 1, `system_table.rs` 2), none silently dropped — **two of
+those 25 no longer exist**: C-09 (ADR 0061 rung I) later converted
+`admin_endpoint.rs`'s TTL reaper-progress test (down to 9) and
+`console_stream.rs`'s sole test (the file is now deleted), per the
+consolidated TTL section below. See this
 file's own appendices, below, for each PR's mapping table and gate
 numbers, and ADR 0061's "Rung H closed" amendment for the complete final
 residue table with reasons, the in-scope findings (the shared `Metrics
@@ -6678,6 +6695,24 @@ fixed with the `GenericAdminHost`/`GenericConsoleBackend` newtype pair).
 anchored-sampler RSS first ~99 MB / peak ~816 MB / last ~133 MB — see the
 "C-08 closed" appendix below and ADR 0061's matching amendment). See
 `docs/roadmap.md`'s C-08 entry for the full record.
+
+**TTL — the smallest group, and the one C-08's own close-out recommended
+first — is closed by C-09 (landed 2026-09-08/09, ADR 0061's "Rung I"/"Rung
+I closed" amendments, `docs/roadmap.md`).** See the "TTL reaper under
+`SimCluster`" appendix below for the full mechanism and residual account;
+in short, `animusd::ttl_reaper::ttl_reaper_loop`'s thin
+wrapper and `impl TtlReaperProgressHost for ClientCtx` were widened to
+`<E: Env, R: RelayClient>`, `SimCluster` gained an always-on per-node
+reaper spawn (200ms sim interval, mirroring the backup/segment janitors'
+own precedent) plus `drive_ttl_sweep`, and `dynamo::dispatch_item_op`
+gained a `DescribeTimeToLive` arm to close the one dispatch gap the
+conversion surfaced. `tests/dynamo_ttl.rs` went from 9 tests to 1
+(`expired_item_is_still_readable_immediately`, permanently `ProdEnv` — the
+fixture's fixed 12s per-op budget outruns even a single wire call against
+the always-on 200ms reaper); `admin_endpoint.rs`'s TTL reaper-progress
+test converted (9 tests remain, none TTL-related); `console_stream.rs`'s
+sole test converted and the file deleted whole. `cargo test -p animusd
+--lib sim_cluster` ran 406 → 428 passed across the rung's five PRs.
 
 **Standing rule for new `animusd` logic tests**: default to a
 `sim_cluster_*` sibling module (`SimCluster::dynamo`/`dynamo_concurrent`/
@@ -9148,3 +9183,445 @@ invocation available in that phase, but Phase B then rebased it onto PR
 no product or scenario-authoring bug found. See this file's own PR 7
 appendix, above, and ADR 0061's "Rung H, PR 7 landed" amendment for the
 full gate account.
+
+
+## Appendix — TTL reaper under SimCluster, C-09 closed (ADR 0061 rung I, PRs 1-6, 2026-09-08/09)
+
+Folds the rung's own five PR-by-PR accounts (previously five separate
+appendices) into one coherent record now that the rung is closed — the
+mechanism facts and the final residual state, not a chronological replay
+of every intermediate revert. See ADR 0061's "Rung I" amendments (PR 2
+through "Rung I closed") for the full PR-by-PR narrative, including the
+two scenarios PR 3 wrote then reverted before PR 5 restored them.
+
+**Goal.** Make the DynamoDB-style TTL reaper (ADR 0051) — previously
+provable only over `ProdEnv`'s real wall clock via `tests/dynamo_ttl.rs`'s
+9 real-socket tests, plus one residue test apiece in `admin_endpoint.rs`
+and `console_stream.rs` — deterministically fault-injectable and
+seed-replayable under `SimCluster`/`SimEnv`.
+
+**Mechanism, as it stands after the rung.**
+
+- `animus_node::ttl_reaper::{ttl_reaper_loop, ttl_sweep_one_tablet}`
+  (`crates/animus-node/src/ttl_reaper.rs`) was already `<E: Env, H:
+  TtlScanHost + TtlReaperProgressHost>`-generic before this rung (rung
+  C2) — it reads `TtlSpec` via `host.ttl_metadata()`, compares against
+  `env.wall_now()` (ADR 0051 §1, the one place `wall_now()` exists for),
+  deletes through `host.ttl_delete_if_attribute_equals` →
+  `dynamo::kind_write_item_at_leader` (ADR 0049's kind-write path, so
+  index/stream/change-log maintenance is inherited, never reimplemented),
+  and publishes a `TtlReaperProgress` per phase transition.
+  `ttl_sweep_one_tablet` was widened from private to `pub` (PR 2, a pure
+  visibility change) so `SimCluster::drive_ttl_sweep` can drive the exact
+  per-tablet sweep function the always-on loop calls every tick, rather
+  than reimplementing the scan/expire/delete control flow a second time.
+- The one remaining concrete surface, `crates/animusd/src/ttl_reaper.rs`'s
+  thin wrapper (`pub(crate) async fn ttl_reaper_loop(ctx: ClientCtx,
+  interval: Duration)`) and `client_ctx_host.rs`'s `impl
+  TtlReaperProgressHost for ClientCtx` (a two-line mutex-update body),
+  were widened to `<E: Env, R: RelayClient>` (PR 2) — a pure free-function/
+  trait-impl widening, not the riskier trait-impl-on-`ClientCtx` shape C-08
+  PR 2 warns against, since neither is ever called through a `dyn`
+  production dispatch table. Every production spawn site (`lib.rs`'s five
+  `tokio::spawn(ttl_reaper::ttl_reaper_loop(ctx.clone(), ..))` calls) keeps
+  passing a bare `ctx.clone()` with zero call-site changes, inferring `E =
+  ProdEnv, R = AnimusdRelayClient` from `ClientCtx`'s own definition-site
+  default — confirmed, not assumed, by `tests/dynamo_ttl.rs`'s untrimmed
+  suite staying green before and after (PR 2). Production's own default
+  sweep cadence, `DEFAULT_TTL_SWEEP_INTERVAL` (60s), is unchanged.
+- **`SimCluster` spawns the reaper always-on, on every node, unconditionally**
+  (`sim_cluster.rs`, PR 2): `SIM_TTL_SWEEP_INTERVAL` (`Duration::
+  from_millis(200)`) joins the janitors' own interval constants;
+  `ttl_reaper::ttl_reaper_loop` is spawned in both `SimCluster::new` and
+  `::restart`, mirroring the backup/segment janitors' own always-on spawns
+  exactly — the loop's own per-tablet leader gate (`TtlScanHost::
+  led_tablets`) already makes a node leading nothing this tick a cheap
+  idle sleep, so there is no reason to gate the spawn behind an opt-in the
+  way `auto_split_loop` is. `SimCluster`'s existing `Drop` (issue #753)
+  needed no new code to cover this new perpetual loop — the same
+  no-new-Drop-coverage finding Rung H's own opener made, restated here
+  because this rung's primitive genuinely is a new perpetual loop.
+- **`SimCluster::drive_ttl_sweep(node)`** (PR 2) runs one full sweep to
+  exhaustion over `node`'s own led tablets, through `ttl_sweep_one_tablet`,
+  with its own driver-local cursor entirely separate from the always-on
+  loop's — for a scenario that must assert an intermediate, pre-cadence
+  reaper state without waiting out the 200ms cadence. **`ttl_reaper_
+  progress(node)`** mirrors `backup_janitor_progress`/`segment_janitor_
+  progress` exactly (a plain lock/clone/drop, never held across an
+  `.await`).
+- **`SimEnv::wall_now()` determinism**: `Clock::wall_now` in `animus-sim`
+  (`UnixMillis(SIM_WALL_EPOCH_MS.saturating_add(self.now().0 /
+  1_000_000))`) is a pure function of virtual time — a `PutItem` at
+  `wall_now_secs + delta`, then `run_for`/`drive_*` advancing virtual time
+  past `delta`, deterministically expires an item with no real-clock
+  dependency at all. No `HashMap`/`Instant::now`/`tokio::spawn`/
+  `tokio::time` was found in either widened body (PR 2) — unlike a few
+  `tokio::time`-body findings this same template caught in sibling rungs
+  (`index_drain::seal_now`, C-07 PR 2; `ClientCtx::
+  admin_transfer_control_leadership`, C-08 PR 6), confirmed by actually
+  running the loop under `SimEnv`, not just by reading the source.
+- **The 12s `OP_BUDGET` caveat.** Every `SimCluster` wire call's
+  `spawn_and_capture` drives `self.sim.run_for(OP_BUDGET)` (12s)
+  unconditionally, and `Simulator::run_until` always drains every
+  scheduled event up to that deadline before returning, regardless of how
+  quickly the awaited future itself resolved. With the always-on reaper
+  ticking every 200ms, a single wire call already spans 60 sweep
+  opportunities — so any assertion that needs to *force* an intermediate
+  sweep state (mid-cursor, one-tick-before-reap) must use `drive_ttl_
+  sweep`/a short `run_for`, never an ordinary op call (this rung's own
+  scenario (b) in `sim_cluster_ttl.rs`), and any assertion that needs to
+  *suppress* the reaper for even one wire round trip cannot be reproduced
+  through this fixture at all — no "hold the reaper back between two wire
+  calls" primitive exists (`drive_ttl_sweep` only ever adds sweeps on top
+  of whatever the always-on loop already ran). The latter is exactly
+  `expired_item_is_still_readable_immediately`'s own residual reason,
+  below.
+- **The `DescribeTimeToLive` dispatch gap (PR 3 found, PR 5 closed).**
+  `dynamo::dispatch_item_op` — the generic (`SimEnv`-capable) dispatch
+  path `SimClusterHandle::dynamo` calls through — had an arm for
+  `UpdateTimeToLive` (since ADR 0061 rung H, C-08 PR 2) but none for its
+  read-side sibling `DescribeTimeToLive`, so every `DescribeTimeToLive`
+  call under `SimCluster` answered `500` ("this operation is not yet
+  supported by the generic dispatch path") regardless of request
+  validity — an asymmetry invisible from either function's own signature
+  (both looked equally "already generic"), surfaced only once PR 3
+  actually issued the call. PR 5 widened `dynamo::describe_time_to_live`
+  to `<E: Env, R: RelayClient>` (a pure signature change — it already took
+  an unused `_ctx: &ClientCtx` and isn't even `async`) and added `Operation::
+  DescribeTimeToLive { table } => describe_time_to_live(ctx, meta, &table)`
+  to `dispatch_item_op`, mirroring `UpdateTimeToLive`'s own precedent
+  exactly. `run_operation`'s own arm is untouched, keeping production
+  dispatch byte-identical (the D2 PR 1 lesson applied once more).
+
+**New module**: `sim_cluster_ttl.rs` — 9 scenarios (a)-(i) (`_over_seeds`
+×5 each), converting all 9 of `tests/dynamo_ttl.rs`'s original tests
+except the one permanent residual below: `PutItem`/`UpdateTimeToLive`
+issued from node 0 (a schema-catalog mutation, no tablet leader to route
+around) or from a **non-leader** of the table's tablet for item writes
+(mirroring every `sim_cluster_dynamo_*` sibling's own forwarding-path
+convention), reap/no-reap asserted with `ConsistentRead: true` (ADR 0055).
+Scenario (i) reuses C-07 PR 3's stream wire shapes as module-private local
+copies (not exported across modules). `sim_cluster_admin.rs` gained
+scenario (8) (the reaper-progress half of the admin residue, kept separate
+from scenario (6)'s narrower tables-only regression). `sim_cluster_
+console_stream.rs` gained scenario (4) (the console-side identity walk,
+`console_stream.rs` deleted whole — it was the file's only test).
+
+**The final `ProdEnv` residue — exactly one test, one file:**
+
+| File | Kept test | Reason |
+|---|---|---|
+| `dynamo_ttl.rs` | `expired_item_is_still_readable_immediately` | The `OP_BUDGET`-vs-always-on-reaper gap above: no primitive can suppress the reaper for even one wire round trip, so the "expired but not yet reaped" state (ADR 0051's AWS-faithful visibility — expired items stay readable until reaped, deliberately not filtered) can never be observed through this fixture |
+
+`admin_endpoint.rs` keeps its other 9 tests (none TTL-related — the TTL
+reaper-progress test converted). `console_stream.rs` is **deleted**
+(nothing left to keep `ProdEnv` for). This is the first rung in the whole
+F-through-I sequence to leave only a single genuinely-permanent residual
+test, not a whole class.
+
+**Test-count trajectory** (`cargo test -p animusd --lib sim_cluster --
+--test-threads=2`, whole tier): 406 (C-08 baseline) → 408 (PR 2, +2) → 420
+(PR 3, +12 net — 16 written, 4 reverted with the `DescribeTimeToLive`-
+blocked scenarios) → 424 (PR 4, +4) → **428 passed, 0 failed, 2 ignored**
+(PR 5, +4). No leak trajectory across any PR (anchored-sampler/`/usr/bin/
+time -v` RSS stayed within the same envelope every prior rung confirmed).
+`Cargo.lock` unchanged throughout the rung.
+
+**No product bug found** in any PR — the rung's only findings were the
+two narrow, already-generic-signature gaps named above (the `OP_BUDGET`
+caveat is a fixture-capability boundary, not a bug; the `DescribeTimeToLive`
+gap was a real, narrow dispatch-table omission, fixed in PR 5). See ADR
+0061's "Rung I closed" amendment for the cross-cutting mechanism lessons
+this rung's own findings generalize into.
+
+See ADR 0061's "Rung I" amendments (PR 2 through "Rung I closed") and
+`docs/roadmap.md`'s C-09 entry for the full per-PR record.
+
+## Appendix — index DDL beyond plain `CreateTable` under `SimCluster`, groundwork (ADR 0061 rung J, C-10 PR 2, 2026-09-09)
+
+Opens the C-10 series (the next unowned residual group per Rung H's own
+close-out): `UpdateTable`'s GSI add/drop half — `dynamo.rs`'s
+`create_index`/`drop_index`/`set_index_status`/`drop_table_index`, and
+`index_drain.rs`'s backfill-seeder trio (`backfill_seed_tick`/
+`advance_backfill_cursor`/`seed_change_log_record`, plus
+`clear_backfill_cursor` — see this crate's own engineering-lessons entry
+for the `tokio::time` body this last one still carried despite an
+already-generic signature) — all widened to `<E: Env, R: RelayClient>`/
+`<E: Env>`, mirroring every prior D3/G/H/I rung's own `tokio::time` →
+`ctx.env`/`group.env()` conversion. `dispatch_table_op`'s `UpdateTable`
+arm gained a fourth sub-arm, `(None, Some(update), None)`, mirroring its
+stream/throughput siblings exactly: `wire::IndexUpdate::Create` →
+`create_index`, `Delete` → `drop_index`, then the same
+re-describe-on-success every sibling arm already does. `update_table`/
+`run_operation`/`execute_routed` are byte-identical — verified by `git
+diff` (only signatures, `tokio::time` → `ctx.env` conversions, and the new
+sub-arm) and by the untrimmed real-socket suites
+(`update_table_create_index.rs`/`update_table_drop_index.rs`/
+`dynamo_gsi_drain.rs`/`backfill_seeder.rs`/
+`stream_backfill_seed_filter.rs`/`console_table_config.rs`, 20 tests
+total) staying identical before and after.
+
+**`index_backfill.rs`'s thin wrapper widened the same way** (a pure
+signature change — production's spawn sites in `lib.rs` are unaffected,
+still inferring `ProdEnv`/`AnimusdRelayClient`) so `SimCluster::new`/
+`::restart` can spawn `index_backfill::index_backfill_loop`
+unconditionally on every node, mirroring the backup/segment/TTL janitors'
+own always-on spawns exactly — its own leader gate
+(`ControlLeaderHost::control_leader`) already makes a non-leader's own
+tick a cheap no-op, so no opt-in gate is warranted the way
+`auto_split_loop`'s is. This is the **control-plane-leader-only
+completion aggregator** — the separate loop that flips a fully-reported
+index from `Creating` to `Active`, distinct from the per-tablet
+**backfill-seeder** half below.
+
+**`SimCluster::drive_backfill_seed(node, table)`** (new, mirroring
+`drain_gsi`'s exact shape: the same leader check, the same
+`is_quiesced()`/`Building`-child skip omission — unreachable under this
+fixture, identical reasoning — and the same `spawn_and_capture`-driven-
+to-`OP_BUDGET` bounded wait) drives one `index_drain::backfill_seed_tick`
+per `Creating` GSI (never `Active` — an already-backfilled index has
+nothing left to seed) over every tablet `node` both hosts and leads. This
+is the per-tablet **seeder** half `index_backfill_loop`'s own aggregator
+depends on: a call seeds up to `BACKFILL_SEED_BATCH` (256) newly
+discovered partitions per `(tablet, index)` pair and, only once the sweep
+reaches the tablet's current range end, reports via
+`MetaCommand::MarkIndexBackfilled` — **a populated table with more
+partitions than that needs several calls**, never one call assumed to
+finish everything; poll `DescribeTable`'s own per-index `Backfilling`/
+`IndexStatus` field (or just call `drive_backfill_seed` in a loop) until
+the index flips `Active`, the same "several ticks, not one" contract the
+real per-node loop has in production.
+
+Two new `sim_cluster_index_ddl.rs` scenarios (`_over_seeds` at 5 seeds
+each): (a) `UpdateTable` adding a GSI to a populated table returns it
+`CREATING`/`Backfilling: true`, rejects a `Query` against it while
+backfilling (`ValidationException`, the ordinary `NoSuchIndex`-shaped
+rejection a not-yet-`Active` index gets), and converges to `ACTIVE` via
+`drive_backfill_seed` + `drain_gsi` (a bounded loop of further
+`DescribeTable` calls — each a real op call, which is what actually gives
+the always-on `index_backfill_loop` a chance to observe the freshly-
+reported tablet) with the expected rows queryable through the now-`ACTIVE`
+index; (b) `UpdateTable` deleting that GSI leaves it absent from
+`DescribeTable` and rejects a `Query` against the now-gone index name the
+identical `ValidationException` way.
+
+`cargo test -p animusd --lib sim_cluster -- --test-threads=2`: 428 → 432
+passed (+4, 0 regressions, 2 ignored throughout), peak RSS ~958 MB
+(`/usr/bin/time -v`), consistent with every prior rung's own no-leak
+trajectory.
+
+See ADR 0061's "Rung J, PR 2 landed" amendment and `docs/roadmap.md`'s
+C-10 entry for the full record.
+
+## Appendix — index DDL beyond plain `CreateTable` under `SimCluster`, `sim_cluster_dynamo_update_table_index.rs` (ADR 0061 rung J, C-10 PR 3, 2026-09-09)
+
+Converts `tests/update_table_create_index.rs` (4), `tests/update_table_
+drop_index.rs` (4), and `tests/dynamo_gsi_drain.rs` (1) — 9 tests total —
+into `crates/animusd/src/sim_cluster_dynamo_update_table_index.rs`
+(`#[cfg(test)] mod sim_cluster_dynamo_update_table_index;` from `lib.rs`,
+sibling of `sim_cluster_index_ddl`), all nine at a pinned seed plus a
+5-seed `_over_seeds` sibling (18 `#[test]` functions), and deletes all
+three real-socket files whole. Every scenario asserts the identical
+observable behaviour the original asserted, through `SimCluster::dynamo`
+— duplicate/reserved/`$`-containing/nonexistent-table validation
+rejections, the `MAX_GSI_PER_TABLE` cap, a non-leader-issued `UpdateTable`
+converging on every node, a populated-table drop's catalog + physical
+reclaim, a drop racing an in-flight backfill, a create-drop-recreate cycle
+proving the backfill cursor is genuinely cleared (not stale-resumed), and
+the GSI drain itself (materialize, move on overwrite, prune on delete).
+
+**Two scenarios substitute a deterministic sequenced analogue for the
+originals' own real-thread concurrency** (the module's own top-of-file
+doc has the full account): `in_flight_backfill_is_cancelled_by_a_
+concurrent_drop` issues the drop immediately after exactly one partial
+`drive_backfill_seed` tick (300 rows, past the seeder's own per-tick cap,
+so the index is provably still `Creating`) rather than racing a live
+`tokio::join!`; `a_crash_and_retry_mid_cascade_still_converges` spawns the
+`Delete` by hand on the target node's own `SimEnv` (`SimCluster::handle`),
+drives the simulator a few milliseconds, then interrupts with `SimCluster
+::restart` (a true process stop dropping the still in-flight task) —
+runs on a 3-node cluster rather than the original's 1-node, since
+`SimCluster::restart` rebuilds the restarted node's own control-plane log
+from scratch and relies on peer catch-up to repopulate it (a lone node
+has no peer to catch up from, unlike the original's real single process,
+which recovered from its own on-disk WAL — see `docs/engineering-lessons.md`'s
+matching entry). One scenario substitutes a stronger physical-reclaim
+proof for a disk-specific one: `drop_of_an_active_index_on_a_populated_
+table_reclaims_everything`'s original checked a real WAL file's absence
+on disk; `SimCluster` hosts every tablet on `MemoryEngine`, so the
+substitute checks `Metadata`/`hosted_tablets` absence **and** the hidden
+table's own tablet id reading back an empty engine, together in one
+converged-or-timeout poll — mirroring `sim_cluster_dynamo_drop_table.rs::
+assert_reclaimed`'s own discipline, generalized to an index's own hidden
+table.
+
+No `dynamo.rs`/`index_drain.rs`/`sim_cluster.rs` change was needed for
+this PR — every primitive it drives (`SimCluster::dynamo`/`drive_
+backfill_seed`/`drain_gsi`/`propose_meta`/`handle`/`crash`/`restart`/
+`run_for`/`storage`/`hosted_tablets`/`metadata`) already existed after PR
+2's groundwork; this PR is driver-plus-assertions only, the same shape
+`sim_cluster_dynamo_drop_table.rs`'s own doc claims for its module.
+
+**Residual `tests/*.rs` index-DDL count, updated**: of the rung J
+opener's own nine named files (33 tests by its grep-verified recount),
+three are now gone (`update_table_create_index.rs`, `update_table_drop_
+index.rs`, `dynamo_gsi_drain.rs` — 9 tests, deleted whole); the remaining
+six are `backfill_seeder.rs` (5, PR 4), `stream_backfill_seed_filter.rs`
+(2, PR 5), `console_table_config.rs` (4, 3 in scope for PR 6, 1 stays
+`ProdEnv` under the separate PITR residual), and the three frozen files
+this series does not touch (`dynamo_index_scan.rs` #418, `index_backfill.rs`
+#592, `dynamo_index_writes.rs` #610).
+
+**Gates**: this PR's own conversion could not be run against `cargo` from
+this worktree (delegated to the maintainer's own gate run in the main
+tree, per this session's own constraints); the untrimmed-baseline-first
+discipline the ADR's own PR 3 gate list calls for (`update_table_create_
+index`/`update_table_drop_index`/`dynamo_gsi_drain` green before the sim
+module, sim module green before the trim, whole `sim_cluster` tier +
+RSS sampler + fmt + clippy after) is the maintainer's own next step, not
+yet recorded here — do not treat this appendix as a stand-in for that
+run. Every API this module calls was individually cross-checked against
+its declared signature in `sim_cluster.rs` (see this PR's own report for
+the list of anything left uncertain).
+
+See ADR 0061's "Rung J, PR 3 landed" amendment and `docs/roadmap.md`'s
+C-10 entry for the full record.
+
+## Appendix — the backfill seeder under `SimCluster` (ADR 0061 rung J, C-10 PR 4, 2026-09-09)
+
+Converts 4 of the 5 scenarios in `tests/backfill_seeder.rs` (ADR 0045 §2 —
+the secondary-index **backfill seeder**) into a new `crates/animusd/src/
+sim_cluster_backfill_seeder.rs`, driven entirely through PR 2's own
+primitives (`SimCluster::drive_backfill_seed`/`drain_gsi`, the always-on
+`index_backfill::index_backfill_loop` completion aggregator) — no
+`dynamo.rs`/`index_drain.rs`/`sim_cluster.rs` change was needed or made;
+this PR is pure test authorship, mirroring D3 PR 3b's/rung G PR 4's own
+"no dispatch change needed" precedent.
+
+**Mapping** (see the new module's own doc for the full per-scenario
+account): `backfill_seeder_materializes_every_pre_existing_row_then_
+flips_active`, `live_writes_during_backfill_converge_to_the_correct_
+final_gsi` (sequenced, not raced — see below), `two_indexes_creating_
+simultaneously_converge_independently`, and `a_crash_and_restart_mid_
+backfill_still_converges` (a `SimCluster::crash`/`restart` of the
+tablet's own leader mid-sweep — 300 rows, exceeding the production
+`BACKFILL_SEED_BATCH` of 256, so one seed round provably cannot finish;
+resumes from the durable `KIND_CURSOR` row, committed via the tablet's
+own Raft group before the crash and unaffected by it) each gained a
+deterministic, `_over_seeds`-paired (5 seeds) sibling.
+
+**`split_during_backfill_converges_with_correct_final_gsi` is the ADR
+0061 rung J opener's own explicitly-licensed fallback case and stays on
+`ProdEnv`, unmodified, alone in the trimmed `tests/backfill_seeder.rs`** —
+`SimCluster` spawns no `index_drain::change_consumer_loop` at all, so
+proving it would mean hand-interleaving three separately-timed on-demand
+primitives (`drive_backfill_seed`/`drain_gsi`/`drive_inplace_split_
+cutover`) every round with no way, in this session, to verify offline
+that the always-on completion aggregator can't race the cutover propose,
+or that the post-cutover Fork-A per-child resweep (ADR 0045 §5 — "no
+split-lineage cursor inheritance") converges within a round budget that
+was never actually run.
+
+**A real deviation from the original scenario, stated plainly**: the
+converted `live_writes_...` scenario issues its five-new/one-moved/
+one-deleted race writes *sequenced* — immediately after the index
+commits `Creating` and before any `drive_backfill_seed` round has run at
+all — rather than raced via a second concurrent task the way the real
+`tokio::spawn` writer does, since this fixture drives everything from one
+thread with no automatic background sweep to race against. What it
+proves is the property the original test's own doc names as the actual
+load-bearing claim ("the final materialized GSI matches the final
+base-table state regardless of how the sweep and these writes actually
+interleaved," ADR 0045 §2), not the literal concurrency.
+
+**This PR was originally written with no `cargo` access** (a
+worktree-isolation constraint of the session that authored it) — every API
+this module calls (`SimCluster::propose_meta`/`drive_backfill_seed`/
+`drain_gsi`/`scan`/`dynamo`/`metadata`/`crash`/`restart`/`node_count`/
+`leader_index_of`, `animus_control::{IndexDef, IndexKind, IndexProjection,
+IndexStatus, MetaCommand, ProposeResult}`, `animus_dynamo::wire::
+{BATCH_WRITE_MAX_ITEMS, decode_stored_item}`) was confirmed by reading its
+current signature and doc comment directly in the tree, matching
+`sim_cluster_index_ddl.rs`'s (PR 2) own established call shapes wherever a
+precedent already existed. **A real gate run in the main tree found one
+genuine fixture gap, not a bug in this module's own scenarios**:
+`SimCluster::restart` respawned `heartbeat_loop`/`backup_janitor_loop`/
+`segment_janitor_loop`/`ttl_reaper_loop`/(conditionally) `auto_split_loop`
+— every perpetual background task `Simulator::stop` drops for the
+restarted node — but not `index_backfill::index_backfill_loop` (spawned by
+`SimCluster::new` since PR 2). Fixed by mirroring the `ttl_reaper_loop`
+respawn immediately above it in `SimCluster::restart` — a plain,
+pattern-matching addition, no new mechanism (see `docs/
+engineering-lessons.md`'s matching entry, updated in place rather than
+duplicated). All 8 tests in this module (4 scenarios × pinned-seed +
+`_over_seeds`) passed on the first full run after that fix, including
+`a_crash_and_restart_mid_backfill_still_converges`(`_over_seeds`), which
+exercises the fixed respawn path directly. The trimmed `tests/
+backfill_seeder.rs` (the one residual `split_during_backfill_converges_
+with_correct_final_gsi` test) passed unchanged. The whole `sim_cluster`
+tier (`cargo test -p animusd --lib sim_cluster -- --test-threads=2`)
+passed 458/458 (2 ignored, 0 failed), including `sim_cluster_index_ddl`
+and `sim_cluster_dynamo_update_table_index` (C-10 PR 2/PR 3's own tests),
+confirming the `restart` change didn't disturb anything upstream. `cargo
+fmt --all --check` and `cargo clippy -p animusd --all-targets
+--all-features -- -D warnings` are both clean.
+
+See `docs/roadmap.md`'s C-10 entry for the residual-inventory update.
+
+## Appendix — index DDL beyond plain `CreateTable` under `SimCluster`, `sim_cluster_stream_backfill_seed_filter.rs` (ADR 0061 rung J, C-10 PR 5, 2026-09-09)
+
+Converts `tests/stream_backfill_seed_filter.rs`'s two tests 1:1 into
+`sim_cluster_stream_backfill_seed_filter.rs` (registered in `lib.rs` beside
+`sim_cluster_index_ddl`); the original file is deleted whole. Both scenarios
+prove the backfill seeder's own synthetic, image-less change-log marker
+(`index_drain::seed_change_log_record`, `seeded: true`) never surfaces as a
+phantom `GetRecords` event — one over the open-tail serve path, one over the
+sealed-shard path (`get_records_sealed`'s segment decode) — the "both serve
+paths get their own test" discipline issue #267 asked for, since a shared
+filter predicate only proves the two paths *agree*, not that each is
+actually reached with a seed record in hand.
+
+**No new `SimCluster` mechanism needed** — both scenarios are built entirely
+from primitives two earlier rungs already supplied:
+[`sim_cluster::SimCluster::drive_backfill_seed`] (C-10 PR 2) ticks the
+seeder for every `Creating` GSI of a led tablet, and
+[`sim_cluster::SimCluster::drive_stream_seal`] (C-07 PR 2) seals whatever is
+currently pending on demand. `converge_gsi_active` (a bounded
+`drive_backfill_seed` + `drain_gsi` + `DescribeTable`-poll loop) is
+duplicated locally from `sim_cluster_index_ddl.rs`, per this crate's own
+per-file-fixture convention.
+
+**Knob mapping** (restated from `sim_cluster_dynamo_streams.rs`'s own doc,
+applied here): the original's `no_seal_knobs` (tuned to never fire) is
+simply "never call `drive_stream_seal`" — this fixture never spawns the
+periodic seal arm those knobs tune at all, so a table's tablet just stays
+open. `tiny_seal_knobs` (seals on any pending byte, sweeping seed markers
+into sealed segments alongside real records, deliberately —
+`docs/streams-notes.md`'s "hiding is a serve-time decision") is one
+`drive_stream_seal` call after the backfill converges — the method already
+loops `seal_now` to exhaustion of whatever is pending at the moment it's
+called, so one call suffices.
+
+**The original's own real-time convergence loops are simplified, not
+carried over verbatim.** The sealed-path scenario's 60s
+converged-or-timeout poll existed to race a genuinely concurrent real-time
+writer against a periodic sealer — neither exists under `SimCluster`
+(every write below is already committed, deterministically, before the
+single seal call and the single lineage walk that follows it), so the sim
+sibling asserts directly off one `walk_lineage` call. The open-path
+scenario keeps a bounded stable-poll loop (`drain_open_shard`) purely
+defensively — nothing in this fixture produces new records after the
+scenario's own writes complete, but the original's own "don't assume one
+poll sees everything" discipline costs nothing to keep and generalizes if
+a future rung ever gives this fixture a background writer.
+
+Both tests convert with no residual — this file was fully convertible,
+matching the group's other fully-convertible files.
+
+This PR's own diff: the new module, its `lib.rs` registration, the deleted
+`tests/stream_backfill_seed_filter.rs`, and these three docs files
+(`crates/animusd/CLAUDE.md`,
+`docs/adr/0061-testability-node-crate-simulator.md`, `docs/roadmap.md`).
+
+See ADR 0061's "Rung J, PR 5" amendment and `docs/roadmap.md`'s C-10 entry
+for the full record.

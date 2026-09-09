@@ -6,10 +6,29 @@
 //! flips the index `Creating` → `Active` once every tablet has swept to its
 //! own end.
 //!
-//! `UpdateTable`'s wire path for adding an index to a populated table doesn't
-//! exist yet (a later PR) — every test here creates an **unindexed** table,
-//! populates it over the real DynamoDB wire, then hand-drives
-//! `MetaCommand::CreateTableIndex{status: Creating}` via
+//! **ADR 0061 rung J, C-10 PR 4**: 4 of this file's original 5 scenarios
+//! converted to deterministic, `SimCluster`-driven siblings in
+//! `crates/animusd/src/sim_cluster_backfill_seeder.rs` (see that module's
+//! own doc for the full mapping). This file is trimmed to the one scenario
+//! that stays on `ProdEnv`:
+//!
+//! **`split_during_backfill_converges_with_correct_final_gsi` is kept here,
+//! unconverted, on purpose** — `SimCluster` spawns no
+//! `index_drain::change_consumer_loop` at all, so proving this scenario
+//! there would mean hand-interleaving three separately-timed on-demand
+//! primitives every round (the backfill seeder, the GSI drain, and the
+//! in-place split cutover driver) with no way, in the session that
+//! attempted this conversion, to verify offline (no `cargo` access) that
+//! the resulting sequencing doesn't race the always-on completion
+//! aggregator against the cutover propose, or that the post-cutover Fork-A
+//! per-child resweep converges within any round budget that was never
+//! actually run. See `sim_cluster_backfill_seeder.rs`'s own module doc for
+//! the full reasoning — this is the ADR 0061 rung J opener's own licensed
+//! fallback for exactly this case.
+//!
+//! `UpdateTable`'s wire path for adding an index to a populated table
+//! didn't exist yet when this scenario was first written — it still
+//! hand-drives `MetaCommand::CreateTableIndex{status: Creating}` via
 //! `ClientRequest::ProposeSchema`, exactly like `tests/index_backfill.rs`
 //! does for its own aggregator-only scenarios. Every eventual property here
 //! is a converged-or-timeout poll, never a fixed sleep followed by one
@@ -135,28 +154,6 @@ async fn create_table_no_index(addr: SocketAddr, table: &str) {
     )
     .await;
     assert_eq!(status, 200, "CreateTable failed: {body}");
-}
-
-async fn put_item(addr: SocketAddr, table: &str, id: &str, attr: &str, value: &str) {
-    let (status, body) = dynamo(
-        addr,
-        "DynamoDB_20120810.PutItem",
-        &format!(
-            r#"{{"TableName":"{table}","Item":{{"id":{{"S":"{id}"}},"{attr}":{{"S":"{value}"}}}}}}"#
-        ),
-    )
-    .await;
-    assert_eq!(status, 200, "PutItem({id}) failed: {body}");
-}
-
-async fn delete_item(addr: SocketAddr, table: &str, id: &str) {
-    let (status, body) = dynamo(
-        addr,
-        "DynamoDB_20120810.DeleteItem",
-        &format!(r#"{{"TableName":"{table}","Key":{{"id":{{"S":"{id}"}}}}}}"#),
-    )
-    .await;
-    assert_eq!(status, 200, "DeleteItem({id}) failed: {body}");
 }
 
 /// A `Creating` GSI definition hashing on `hash_attribute`.
@@ -311,358 +308,6 @@ async fn await_gsi_hit(
         |b| b.contains("\"Count\":1") && b.contains(&format!(r#""id":{{"S":"{id}"}}"#)),
     )
     .await;
-}
-
-async fn await_gsi_miss(addr: SocketAddr, table: &str, index: &str, hash: &str, value: &str) {
-    await_gsi_query(
-        addr,
-        &format!(
-            r#"{{"TableName":"{table}","IndexName":"{index}",
-                "KeyConditionExpression":"{hash} = :v",
-                "ExpressionAttributeValues":{{":v":{{"S":"{value}"}}}}}}"#
-        ),
-        |b| b.contains("\"Count\":0"),
-    )
-    .await;
-}
-
-/// The plan's own PR3 acceptance test: pre-populate a table with items across
-/// several partitions, hand-drive `CreateTableIndex{status: Creating}`, and
-/// assert converged-or-timeout that (a) the GSI's hidden table materializes
-/// every pre-existing row and (b) the index flips `Active` via the PR2
-/// aggregator — proving the seeder, not just the aggregator in isolation,
-/// since nothing in this test ever proposes `MarkIndexBackfilled` by hand.
-#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
-async fn backfill_seeder_materializes_every_pre_existing_row_then_flips_active() {
-    let dir = support::panic_safe_tempdir();
-    let (nodes, config) = bring_up(3, dir.path()).await;
-    let leader = nodes.iter().position(Node::is_control_leader).unwrap();
-    // ADR 0047: `ProposeSchema` is intra-only (intra also serves the
-    // occasional `SplitTablet` call in this file — a superset, not a
-    // conflict).
-    let client = config.nodes[leader].intra;
-    let dynamo_addr = nodes[0].dynamo_addr();
-    let client_addr = nodes[0].client_addr();
-    let table = "bf_seed";
-    let index_table = "bf_seed$by-email";
-
-    create_table_no_index(dynamo_addr, table).await;
-    let ids: Vec<String> = (0..12).map(|i| format!("p{i}")).collect();
-    for id in &ids {
-        put_item(dynamo_addr, table, id, "email", &format!("{id}@x")).await;
-    }
-
-    call(
-        client,
-        ClientRequest::ProposeSchema(MetaCommand::CreateTableIndex {
-            table: table.into(),
-            index: creating_index("by-email", "email"),
-        }),
-    )
-    .await;
-
-    await_index_status(&nodes, table, "by-email", IndexStatus::Active, 60).await;
-    await_row_count(
-        client_addr,
-        index_table,
-        ids.len(),
-        "after backfill converges",
-    )
-    .await;
-    for id in &ids {
-        await_gsi_hit(
-            dynamo_addr,
-            table,
-            "by-email",
-            "email",
-            &format!("{id}@x"),
-            id,
-        )
-        .await;
-    }
-
-    for n in &nodes {
-        n.shutdown_graceful().await;
-    }
-}
-
-/// Live writes racing the backfill sweep: new inserts, an update that moves
-/// an existing item's indexed attribute, and a delete, all issued while the
-/// index is still `Creating`. The load-bearing property (ADR 0045 §2's own
-/// "no record is lost or double-applied" argument) is that the *final*
-/// materialized GSI matches the *final* base-table state regardless of how
-/// the seeder's sweep and these writes actually interleaved — every live
-/// write already leaves a genuine change-log record unconditional on the
-/// index's status, so there is nothing for the seeder to race incorrectly
-/// against.
-#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
-async fn live_writes_during_backfill_converge_to_the_correct_final_gsi() {
-    let dir = support::panic_safe_tempdir();
-    let (nodes, config) = bring_up(3, dir.path()).await;
-    let leader = nodes.iter().position(Node::is_control_leader).unwrap();
-    // ADR 0047: `ProposeSchema` is intra-only (intra also serves the
-    // occasional `SplitTablet` call in this file — a superset, not a
-    // conflict).
-    let client = config.nodes[leader].intra;
-    let dynamo_addr = nodes[0].dynamo_addr();
-    let client_addr = nodes[0].client_addr();
-    let table = "bf_live";
-    let index_table = "bf_live$by-g";
-
-    create_table_no_index(dynamo_addr, table).await;
-    let pre_existing: Vec<String> = (0..20).map(|i| format!("p{i}")).collect();
-    for id in &pre_existing {
-        put_item(dynamo_addr, table, id, "g", &format!("g-{id}")).await;
-    }
-
-    call(
-        client,
-        ClientRequest::ProposeSchema(MetaCommand::CreateTableIndex {
-            table: table.into(),
-            index: creating_index("by-g", "g"),
-        }),
-    )
-    .await;
-
-    // Concurrent with the backfill sweep, not sequenced against it: five new
-    // items, one moved attribute (p0), one deletion (p1).
-    let race_addr = dynamo_addr;
-    let race = tokio::spawn(async move {
-        for i in 0..5 {
-            put_item(race_addr, table, &format!("n{i}"), "g", &format!("g-n{i}")).await;
-        }
-        put_item(race_addr, table, "p0", "g", "g-p0-moved").await;
-        delete_item(race_addr, table, "p1").await;
-    });
-    race.await.expect("concurrent writer task panicked");
-
-    await_index_status(&nodes, table, "by-g", IndexStatus::Active, 60).await;
-    // 20 pre-existing - 1 deleted (p1) + 5 new = 24; p0 still counts once, at
-    // its moved key.
-    await_row_count(
-        client_addr,
-        index_table,
-        24,
-        "after backfill + concurrent writes",
-    )
-    .await;
-
-    for i in 0..5 {
-        await_gsi_hit(
-            dynamo_addr,
-            table,
-            "by-g",
-            "g",
-            &format!("g-n{i}"),
-            &format!("n{i}"),
-        )
-        .await;
-    }
-    await_gsi_hit(dynamo_addr, table, "by-g", "g", "g-p0-moved", "p0").await;
-    await_gsi_miss(dynamo_addr, table, "by-g", "g", "g-p0").await; // the old key is gone
-    await_gsi_miss(dynamo_addr, table, "by-g", "g", "g-p1").await; // deleted
-    // An untouched pre-existing item is unaffected.
-    await_gsi_hit(dynamo_addr, table, "by-g", "g", "g-p10", "p10").await;
-
-    for n in &nodes {
-        n.shutdown_graceful().await;
-    }
-}
-
-/// Two indexes `Creating` on the same table at once: each runs its own
-/// independent backfill cursor (ADR 0045 §2's "per-index cursor" choice —
-/// see `index_drain.rs`'s module doc) and converges to `Active` with
-/// correct, independent content.
-#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
-async fn two_indexes_creating_simultaneously_converge_independently() {
-    let dir = support::panic_safe_tempdir();
-    let (nodes, config) = bring_up(3, dir.path()).await;
-    let leader = nodes.iter().position(Node::is_control_leader).unwrap();
-    // ADR 0047: `ProposeSchema` is intra-only (intra also serves the
-    // occasional `SplitTablet` call in this file — a superset, not a
-    // conflict).
-    let client = config.nodes[leader].intra;
-    let dynamo_addr = nodes[0].dynamo_addr();
-    let client_addr = nodes[0].client_addr();
-    let table = "bf_multi";
-    let idx1_table = "bf_multi$by-g1";
-    let idx2_table = "bf_multi$by-g2";
-
-    create_table_no_index(dynamo_addr, table).await;
-    let ids: Vec<String> = (0..10).map(|i| format!("m{i}")).collect();
-    for id in &ids {
-        let (status, body) = dynamo(
-            dynamo_addr,
-            "DynamoDB_20120810.PutItem",
-            &format!(
-                r#"{{"TableName":"{table}","Item":{{"id":{{"S":"{id}"}},
-                    "g1":{{"S":"g1-{id}"}},"g2":{{"S":"g2-{id}"}}}}}}"#
-            ),
-        )
-        .await;
-        assert_eq!(status, 200, "PutItem({id}) failed: {body}");
-    }
-
-    call(
-        client,
-        ClientRequest::ProposeSchema(MetaCommand::CreateTableIndex {
-            table: table.into(),
-            index: creating_index("by-g1", "g1"),
-        }),
-    )
-    .await;
-    call(
-        client,
-        ClientRequest::ProposeSchema(MetaCommand::CreateTableIndex {
-            table: table.into(),
-            index: creating_index("by-g2", "g2"),
-        }),
-    )
-    .await;
-
-    await_index_status(&nodes, table, "by-g1", IndexStatus::Active, 60).await;
-    await_index_status(&nodes, table, "by-g2", IndexStatus::Active, 60).await;
-    await_row_count(
-        client_addr,
-        idx1_table,
-        ids.len(),
-        "by-g1 after convergence",
-    )
-    .await;
-    await_row_count(
-        client_addr,
-        idx2_table,
-        ids.len(),
-        "by-g2 after convergence",
-    )
-    .await;
-    for id in &ids {
-        await_gsi_hit(dynamo_addr, table, "by-g1", "g1", &format!("g1-{id}"), id).await;
-        await_gsi_hit(dynamo_addr, table, "by-g2", "g2", &format!("g2-{id}"), id).await;
-    }
-
-    for n in &nodes {
-        n.shutdown_graceful().await;
-    }
-}
-
-/// Cursor resumability, the cheapest available restart pattern in this
-/// codebase's own test style (mirroring `index_drain.rs`'s in-crate
-/// `crash_mid_reconcile_recovers_without_skipping_or_corrupting_the_gsi`):
-/// a real process crash + restart shortly after the backfill starts must
-/// still converge to the complete, correct GSI, because the backfill
-/// cursor is a durable `KIND_CURSOR` row a fresh leader (here: a fresh
-/// process on the same tablet) resumes from rather than any in-memory
-/// state. A genuinely *fault-injected* version of this (interleaved with a
-/// concurrent split, seed-reproducible at depth) is named as PR4's own
-/// corpus scope, not duplicated here.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_crash_and_restart_mid_backfill_still_converges() {
-    let dir = support::panic_safe_tempdir();
-    let node_dir = dir.path().join("node-0");
-    let config = animusd::ClusterConfig {
-        nodes: vec![{
-            let addrs = support::free_addrs(6);
-            animusd::RoleAddrs {
-                id: animusd::config::node_id(0),
-                role: animusd::config::NodeRole::Both,
-                internal: addrs[0],
-                client: addrs[1],
-                dynamo: addrs[2],
-                admin: addrs[3],
-                intra: addrs[4],
-                console: addrs[5],
-                advertise_host: None,
-                tls: None,
-                encryption_key_path: None,
-            }
-        }],
-        dynamo_auth: None,
-        cluster_settings: None,
-    };
-    let node = animusd::run_node(&config, 0, &node_dir)
-        .await
-        .expect("bring up");
-    timeout(Duration::from_secs(10), async {
-        loop {
-            if node.is_control_leader() {
-                return;
-            }
-            sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("did not become control leader in time");
-
-    let table = "bf_restart";
-    let index_table = "bf_restart$by-email";
-    create_table_no_index(node.dynamo_addr(), table).await;
-    let ids: Vec<String> = (0..15).map(|i| format!("r{i}")).collect();
-    for id in &ids {
-        put_item(node.dynamo_addr(), table, id, "email", &format!("{id}@x")).await;
-    }
-
-    call(
-        // ADR 0047: `ProposeSchema` is intra-only.
-        node.intra_addr(),
-        ClientRequest::ProposeSchema(MetaCommand::CreateTableIndex {
-            table: table.into(),
-            index: creating_index("by-email", "email"),
-        }),
-    )
-    .await;
-    sleep(Duration::from_millis(20)).await;
-    node.shutdown_graceful().await;
-
-    let node2 = animusd::run_node(&config, 0, &node_dir)
-        .await
-        .expect("restart on the same dir");
-    timeout(Duration::from_secs(10), async {
-        loop {
-            if node2.is_control_leader() {
-                return;
-            }
-            sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("did not become control leader in time after restart");
-
-    timeout(Duration::from_secs(60), async {
-        loop {
-            if node2
-                .metadata()
-                .table_indexes(table)
-                .iter()
-                .any(|i| i.name == "by-email" && i.status == IndexStatus::Active)
-            {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("index did not reach Active within 60s after restart");
-    await_row_count(
-        node2.client_addr(),
-        index_table,
-        ids.len(),
-        "after restart recovery",
-    )
-    .await;
-    for id in &ids {
-        await_gsi_hit(
-            node2.dynamo_addr(),
-            table,
-            "by-email",
-            "email",
-            &format!("{id}@x"),
-            id,
-        )
-        .await;
-    }
-
-    node2.shutdown_graceful().await;
 }
 
 /// The data-plane key `dynamo.rs::item_key` computes for a simple

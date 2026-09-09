@@ -1409,9 +1409,9 @@ fn backfill_tag(index_name: &str) -> String {
 /// keeps calling this until `idx`'s status itself flips away from
 /// `Creating` (this loop's own `gsis` filter stops selecting it the moment
 /// `animusd::index_backfill_loop` flips it `Active`).
-async fn backfill_seed_tick(
-    ctx: &ClientCtx,
-    group: &CpGroup,
+pub(crate) async fn backfill_seed_tick<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+    group: &CpGroup<E>,
     tablet: TabletId,
     table: &str,
     idx: &IndexDef,
@@ -1536,8 +1536,8 @@ async fn backfill_seed_tick(
 /// `ClientCtx`'s key-based routing at all) the same reasoning `seal.rs`/
 /// `ceiling.rs`'s engine-global markers already rely on for a *different*
 /// flavor of range-independent bookkeeping key.
-async fn advance_backfill_cursor(
-    group: &CpGroup,
+async fn advance_backfill_cursor<E: Env>(
+    group: &CpGroup<E>,
     cursor_key_bytes: Vec<u8>,
     prefix: &[u8],
 ) -> Result<(), String> {
@@ -1552,12 +1552,12 @@ async fn advance_backfill_cursor(
         ProposeResult::Accepted { index, .. } => index,
         other => return Err(format!("backfill cursor advance not accepted: {other:?}")),
     };
-    let deadline = tokio::time::Instant::now() + BACKFILL_SEED_TIMEOUT;
-    while tokio::time::Instant::now() < deadline {
+    let deadline = group.env().now().saturating_add(BACKFILL_SEED_TIMEOUT);
+    while group.env().now() < deadline {
         if group.engine_applied_index() >= index {
             return Ok(());
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        group.env().sleep(Duration::from_millis(10)).await;
     }
     Err("backfill cursor advance did not apply in time".into())
 }
@@ -1595,12 +1595,12 @@ pub(crate) async fn clear_backfill_cursor<E: Env>(
             ProposeResult::Accepted { index, .. } => index,
             other => return Err(format!("backfill cursor clear not accepted: {other:?}")),
         };
-    let deadline = tokio::time::Instant::now() + BACKFILL_SEED_TIMEOUT;
-    while tokio::time::Instant::now() < deadline {
+    let deadline = group.env().now().saturating_add(BACKFILL_SEED_TIMEOUT);
+    while group.env().now() < deadline {
         if group.engine_applied_index() >= propose_index {
             return Ok(());
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        group.env().sleep(Duration::from_millis(10)).await;
     }
     Err("backfill cursor clear did not apply in time".into())
 }
@@ -1648,8 +1648,8 @@ fn base_partition_prefix_end(key: &[u8]) -> Option<usize> {
 /// construct it ahead of time to look for. Confirms by index instead
 /// (`engine_applied_index() >= index`) — the same confirm-by-index primitive
 /// linearizable reads themselves gate on.
-async fn seed_change_log_record(
-    group: &CpGroup,
+async fn seed_change_log_record<E: Env>(
+    group: &CpGroup<E>,
     change_log_prefix: Vec<u8>,
     record: Vec<u8>,
 ) -> Result<(), String> {
@@ -1661,12 +1661,12 @@ async fn seed_change_log_record(
         ProposeResult::Accepted { index, .. } => index,
         other => return Err(format!("backfill seed not accepted: {other:?}")),
     };
-    let deadline = tokio::time::Instant::now() + BACKFILL_SEED_TIMEOUT;
-    while tokio::time::Instant::now() < deadline {
+    let deadline = group.env().now().saturating_add(BACKFILL_SEED_TIMEOUT);
+    while group.env().now() < deadline {
         if group.engine_applied_index() >= index {
             return Ok(());
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        group.env().sleep(Duration::from_millis(10)).await;
     }
     Err("backfill seed batch did not apply in time".into())
 }

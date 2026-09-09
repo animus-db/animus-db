@@ -922,6 +922,151 @@ the still-true paragraph after the table.
 
 ---
 
+### C-09 TTL reaper SimCluster dispatch
+
+- **Problem:** the DynamoDB-style TTL reaper (ADR 0051) is only provable
+  over `ProdEnv`'s real wall clock today — `tests/dynamo_ttl.rs`'s 9
+  real-socket tests, plus one residue test apiece in `admin_endpoint.rs`
+  and `console_stream.rs` whose own doc comments already say why: "no
+  primitive drives `animusd::ttl_reaper::ttl_reaper_loop` under `SimEnv`."
+  This is the `TTL (1/9)` entry in C-08's own "what remains unowned"
+  residual list, and the one Rung H's own close-out recommended tackling
+  first of the six groups it left behind.
+- **What:** the identical widen-then-add-a-generic-entry-point template
+  D3/D4/C-06/C-07/C-08 have already validated, applied to the smallest
+  remaining surface in the sequence: `animus_node::ttl_reaper::
+  ttl_reaper_loop` is **already** `<E: Env, H: TtlScanHost +
+  TtlReaperProgressHost>`-generic (rung C2); the one concrete surface left
+  to widen is `crates/animusd/src/ttl_reaper.rs`'s thin wrapper plus
+  `impl TtlReaperProgressHost for ClientCtx` in `client_ctx_host.rs:98`
+  (`TtlScanHost` is already `<E, R>`-generic there, D4 PR 5). `SimCluster`
+  gets an always-on per-node TTL-reaper spawn at a 200ms sim interval,
+  beside the segment/backup janitors it already spawns the same way, plus
+  a `drive_ttl_sweep` convenience mirroring `drive_stream_seal`. See
+  [ADR 0061](adr/0061-testability-node-crate-simulator.md)'s 2026-09-08
+  "Rung I (post-C-08)" amendment for the full grep-verified ground truth,
+  the file/line anchors, the 11-test unlock table, and the per-PR gates.
+- **ADR:** [0061](adr/0061-testability-node-crate-simulator.md) (rung I,
+  open), [0051](adr/0051-dynamodb-ttl.md) (the reaper itself).
+- **Size:** S, 4-5 PRs — the smallest rung in the F-through-I sequence, no
+  new capability trait/newtype/store concept, since the reaper loop is
+  already generic.
+- **Depends:** C-08 (closed) — this rung is C-08's own close-out
+  recommendation, stacked directly on it.
+- **Status (2026-09-09):** closed — PR 1 (docs opener), PR 2 (groundwork:
+  `TtlReaperProgressHost`/the `ttl_reaper.rs` wrapper widened to `<E: Env,
+  R: RelayClient>`, `SimCluster`'s always-on per-node reaper spawn at a
+  200ms sim interval, `SimCluster::drive_ttl_sweep`, and the first
+  `sim_cluster_ttl.rs` smoke pair), and PR 3 (`sim_cluster_ttl.rs` extended
+  with 5 more scenarios, 5/8 of the remaining `tests/dynamo_ttl.rs` tests —
+  three stay real-socket: `expired_item_is_still_readable_immediately`
+  (the fixture's `OP_BUDGET`-per-call granularity cannot suppress the
+  always-on reaper for even one wire round trip), and
+  `update_time_to_live_enable_and_disable_round_trip`/`disable_with_a_
+  mismatched_attribute_name_is_rejected` (both need `DescribeTimeToLive`,
+  which has no arm in `dynamo::dispatch_item_op` yet — a
+  `crates/animusd/src/dynamo.rs` gap outside this PR's edit scope, not a
+  scenario-design defect) landed, 420 `sim_cluster` tests green, then PR 4
+  (admin/console residue: `sim_cluster_admin.rs::admin_ttl_reports_reaper_
+  progress_and_ttl_tables` and `sim_cluster_console_stream.rs::ttl_
+  deletion_carries_the_service_user_identity_through_the_console`,
+  replacing their real-socket originals — `tests/admin_endpoint.rs` down
+  to 9 tests, `tests/console_stream.rs` deleted whole) landed, 424
+  `sim_cluster` tests green, and finally PR 5 (`crates/animusd/src/
+  dynamo.rs` widened — `describe_time_to_live` to `<E: Env, R:
+  RelayClient>`, plus a `DescribeTimeToLive` arm on `dispatch_item_op` —
+  closing that exact gap; `sim_cluster_ttl.rs` gains scenarios (c)/(d)
+  restored from PR 3's own reverted first draft; `tests/dynamo_ttl.rs`
+  trimmed to its one true residual, `expired_item_is_still_readable_
+  immediately`) landed — a code PR rather than the docs-only close-out
+  PR 1's own plan had originally named for this slot (see ADR 0061's "Rung
+  I, PR 5" amendment's own scope note). This rung's own `Tests unlocked`
+  table predicted **zero** residue after this rung, and both PR 4 and PR 5
+  confirm it: nothing TTL-related is left in `tests/*.rs`, and
+  `DescribeTimeToLive` now dispatches under `SimCluster` the same as every
+  other TTL operation. **Closed 2026-09-09** by PR 6, the docs-only
+  close-out PR 5 displaced (this ADR's own scope note above) — no source,
+  test, or `Cargo` change; `cargo test -p animusd --lib sim_cluster` ran
+  406 → 408 → 420 → 424 → **428 passed, 0 failed, 2 ignored** across the
+  rung, with exactly one permanent residual left anywhere in `tests/*.rs`:
+  `dynamo_ttl.rs::expired_item_is_still_readable_immediately` (the
+  fixture's fixed 12s per-op budget outruns even a single wire call
+  against the always-on 200ms reaper, so the "expired but not yet reaped"
+  state this test asserts can never be observed through it). See ADR
+  0061's "Rung I, PR 3", "Rung I, PR 4", "Rung I, PR 5", and "Rung I
+  closed" amendments and `crates/animusd/CLAUDE.md`'s matching
+  consolidated TTL section for the full record.
+
+---
+
+### C-10 index DDL beyond plain `CreateTable` SimCluster dispatch
+
+- **Problem:** `dispatch_table_op`'s `UpdateTable` arm rejects any call
+  carrying an index change (`unsupported_by_generic_dispatch`), so adding
+  or dropping a GSI on an already-populated table is provable only over
+  `ProdEnv`'s real wire today. This is blocker (d) named by both C-08's
+  and C-09's own close-outs — the largest of the five groups left unowned
+  after C-09 (TTL closed), and the only one of the five with a rung
+  against it as of this entry.
+- **What:** the same widen-then-add-a-generic-entry-point template every
+  rung since D3 has already validated, applied to `dispatch_table_op`'s
+  one remaining gap. `create_index`/`drop_index`/`set_index_status`/
+  `drop_table_index` (`crates/animusd/src/dynamo.rs`) widen to `<E: Env,
+  R: RelayClient>` — every `ClientCtx` method they call is already
+  generic, so this is pure signature/clock-call surgery, no new
+  capability. `index_drain::drain_tablet`/`reconcile_partition`/
+  `gsi_caught_up` (the GSI **drain** side) are already generic since D3 PR
+  3b; `animus_node::index_backfill::index_backfill_loop` (the backfill
+  **completion aggregator**) is already fully generic and its host trait
+  (`ControlLeaderHost`) is already implemented generically for
+  `ClientCtx` — only its 18-line `animusd` wrapper is concrete, the
+  smallest lift in the whole series. The backfill **seeder**
+  (`index_drain::backfill_seed_tick`/`advance_backfill_cursor`/
+  `seed_change_log_record`) stays concrete and needs its own new
+  `SimCluster::drive_backfill_seed(node, table)` primitive, mirroring
+  `drain_gsi`'s existing shape, since `SimCluster` never spawns
+  `change_consumer_loop` (the real loop these three run inside). The
+  console's `add_gsi`/`drop_gsi` already route through
+  `execute_routed_as_generic`, so no console/`lib.rs` change is needed
+  once the `UpdateTable` index sub-arm lands. Three files
+  (`dynamo_index_scan.rs`, `index_backfill.rs`, `dynamo_index_writes.rs`)
+  stay frozen behind open flake issues #418/#592/#610 and are untouched
+  by this series; `console_table_config.rs`'s PITR test is a separate,
+  out-of-scope residual. See [ADR 0061](adr/0061-testability-node-crate-simulator.md)'s
+  2026-09-09 "Rung J (post-C-09)" amendment for the full grep-verified
+  ground truth, the file/line anchors, the per-file test-unlock table,
+  and the 7-PR plan with gates.
+- **ADR:** [0061](adr/0061-testability-node-crate-simulator.md) (rung J,
+  open), [0045](adr/0045-updatetable-gsi-backfill.md) (the GSI
+  add/drop-on-populated-table lifecycle and backfill mechanism itself).
+- **Size:** M, 7 PRs — PR 1 this docs opener; PR 2 groundwork (the four
+  `dynamo.rs` functions, the `dispatch_table_op` sub-arm, the
+  `index_backfill` wrapper, the three `index_drain` seeder functions, the
+  always-on `SimCluster` `index_backfill_loop` spawn, and
+  `drive_backfill_seed`); PR 3
+  `sim_cluster_dynamo_update_table_index.rs` (9 tests, 3 files deleted);
+  PR 4 `sim_cluster_backfill_seeder.rs` (4 of 5 scenarios converted, 8
+  tests with their `_over_seeds` siblings; `split_during_backfill_
+  converges_with_correct_final_gsi` licensed to stay `ProdEnv` and did —
+  `SimCluster` has no per-tick driver loop to hand-interleave three
+  primitives against with no way, offline, to verify convergence); PR 5
+  `sim_cluster_stream_backfill_seed_filter.rs` (2 tests); PR 6 console
+  residue into `sim_cluster_console_table_config.rs` (3 tests,
+  `console_table_config.rs` trimmed to its 1 out-of-scope PITR test); PR
+  7 docs close-out.
+- **Depends:** C-09 (closed) — the next unowned residual group per C-08's
+  and C-09's own close-outs, sequenced by the maintainer 2026-09-08.
+- **Status (2026-09-09):** open — PRs 1-5 landed (docs opener; groundwork;
+  `sim_cluster_dynamo_update_table_index.rs`, 9 tests, 3 files deleted
+  whole; `sim_cluster_backfill_seeder.rs`, 4 of `tests/backfill_seeder.rs`'s
+  5 scenarios converted, `split_during_backfill_converges_with_correct_
+  final_gsi` kept `ProdEnv` per its own license, `restart` now respawns
+  `index_backfill::index_backfill_loop`; `sim_cluster_stream_backfill_
+  seed_filter.rs`, 2 tests, 1 file deleted whole). PR 6 (console residue)
+  in progress; PR 7 close-out pending.
+
+---
+
 ## 4. Operator surfaces: admin API, dashboard, console, CLI
 
 Conventions (verified): a new admin route needs a match arm in
@@ -999,6 +1144,8 @@ wave are independent and can run in parallel.
 | 7 | C-06 (closed 2026-09-08 — all seven PRs landed: #728, #729, #732, #748, #750, #756, plus this PR; issues #731 and #737 both fixed 2026-09-07) | Gated on C-04 (closed 2026-09-07) — the D4 `Reconciler` and D3 generic dispatch cores it builds on |
 | 8 | C-07 (closed 2026-09-08 — all six PRs landed: #758, #759, #760, #761, #762, plus PR 6) | Gated on C-04 (closed) and C-06 (closed) — the same generic dispatch cores, plus C-06's own Transact widening |
 | 9 | C-08 (closed 2026-09-08 — all eight PRs landed: #764, #765, #766, #767, #773, #776, #777, PR 8) | Gated on C-04 (closed), C-06 (closed), and C-07 (closed) — the same generic dispatch cores, plus rung C5's own widening of `ClientCtx`'s field types |
+| 10 | C-09 (closed 2026-09-09 — all six PRs landed: #780, #782, #785, #786, #787, plus PR 6) | Gated on C-08 (closed) — C-08's own close-out recommendation, stacked directly on it |
+| 11 | C-10 (open, PRs 1-4 landed 2026-09-09 — docs opener; groundwork generalizing `UpdateTable`'s GSI add/drop sub-arm under `SimCluster`; `sim_cluster_dynamo_update_table_index.rs` converting `update_table_create_index.rs`/`update_table_drop_index.rs`/`dynamo_gsi_drain.rs` (9 tests), all three deleted whole; `sim_cluster_backfill_seeder.rs`, 4 of `tests/backfill_seeder.rs`'s 5 scenarios converted, `split_during_backfill_converges_with_correct_final_gsi` kept `ProdEnv` per its own license: index DDL beyond plain `CreateTable`, sequenced after C-09 by the maintainer 2026-09-08) | Gated on C-09 (closed) — the next unowned residual group per C-08's and C-09's own close-outs |
 
 Open issues mapped: none left (#375 closed by W-01, #319 by W-05). Filed
 from wave 2's own findings: #590 (the operator still emits the deleted
