@@ -3304,30 +3304,36 @@ virtual clock by `OP_BUDGET`, so no explicit `run_for`/sleep is needed
 between attempts), `DescribeTable`'s `BillingModeSummary`/
 `ProvisionedThroughputDescription` for both billing modes, and
 `MetaCommand::SetTableThroughput`'s own follower-relay regression. `tests/
-dynamo_throttling.rs` is the real-thread, real-socket regression for
-everything that stays — `ADR 0061 rung D3` moved its own single-item
-write/read throttling-and-recovery pair to `sim_cluster_throttle.rs`'s
-`write_admits_a_burst_then_refuses_then_recovers_after_a_full_refill`/
-`read_admits_a_burst_then_refuses_then_recovers_after_a_full_refill`, and
-PR 2b moved the five config-surface tests just described to
-`sim_cluster_dynamo_update_table.rs` above (see that module's own doc for
-the exact list) — leaving this file the shapes with no sim analog:
-`ProvisionedThroughputExceededException`'s wire shape (still exercised via
-the forwarded-write and admin-metrics tests below),
-`BatchGetItem`'s `UnprocessedKeys`, `BatchWriteItem`'s
-`UnprocessedItems` (via a **streamed** table specifically, to get true
-per-item granularity rather than the marker fast-arm's per-tablet-group
-shape described above), `TransactWriteItems`' `ThrottlingError` cancellation
-reason, a forwarded write throttled on the actual leader, the
-`ThrottledWrites`/`ThrottledReads` metric counters (never incrementing
-under `SimCluster` — see `sim_cluster_throttle.rs`'s own module doc for
-why), an unthrottled table (the default) staying byte-for-byte unaffected,
-and a cluster started with the `cluster_settings` config surface
+dynamo_throttling.rs` is now down to its **one** genuinely sim-unreachable
+residual, `cluster_wide_throttle_default_is_overridden_by_a_tables_own_
+throughput` — a cluster started with the `cluster_settings` config surface
 (`bring_up_with_throttle_defaults`, calling `run_node_with_cluster_
 settings` directly rather than `POST /admin/throttle/defaults`) throttling
 a table with no per-table setting while a table with its own higher
-override is not — the one step-4 test with no sim analog, since it proves
-a CLI/config-file surface no `SimCluster` fixture reaches.
+override is not. It stays `ProdEnv` because its own subject is
+`run_node_with_cluster_settings`'s **config-parse** path itself (a
+node-bring-up/process-boundary shape), not a throttle-bucket check the
+generic dispatch core reaches — `SimCluster::new` builds every node
+in-process from its own fixed constructor, never from a `ClusterConfig` a
+real `animusd` binary would parse, so there is no sim analog. Every other
+test this file used to hold has moved to `SimCluster`: `ADR 0061 rung D3`
+moved the single-item write/read throttling-and-recovery pair to
+`sim_cluster_throttle.rs`'s `write_admits_a_burst_then_refuses_then_
+recovers_after_a_full_refill`/`read_admits_a_burst_then_refuses_then_
+recovers_after_a_full_refill`; PR 2b moved the five config-surface tests
+just described to `sim_cluster_dynamo_update_table.rs` above (see that
+module's own doc for the exact list); rung K (C-11, closed) moved
+`BatchWriteItem`/`BatchGetItem` shedding, `TransactWriteItems`'
+`ThrottlingError` cancellation reason, and the forwarded-write check to
+`sim_cluster_dynamo_throttle.rs`, and the counter-assertion test itself,
+`admin_metrics_reports_nonzero_throttled_counters`, to
+`sim_cluster_admin.rs`'s own scenario (9) — `ThrottledWrites`/
+`ThrottledReads`, which this file's and `sim_cluster_dynamo_update_
+table.rs`'s own module docs used to claim never increment under
+`SimCluster`, a claim stale since D2 PR 1 gave every node a real
+`DataRole`, simply unexercised by any fixture until rung K proved it
+false. See this file's own consolidated "throttle-metric counters under
+SimCluster" appendix below for the full account.
 
 **Manual growth trigger (`POST /admin/stream/grow {table}`, ADR 0042 §14,
 growth PR3)**: splits *every* tablet of a streamed table at its own
@@ -6573,24 +6579,38 @@ role split (5/21), reconciler-driven split/rebalance/GC (7/13), TTL
 (1/9, **owned and closed** by C-09/ADR 0061 rung I as of 2026-09-09 — see
 `docs/roadmap.md`'s C-09 entry), node
 assembly/raw `ClientRequest` (2/8), throttle metric counters
-(1/6), auto-split loops (2/2), `--config` bring-up (2/2) —
+(1/6, **owned and closed** by C-11/ADR 0061 rung K as of 2026-09-09 — one
+file, `tests/dynamo_throttling.rs`, down to its one permanent `ProdEnv`
+residual, `cluster_wide_throttle_default_is_overridden_by_a_tables_own_
+throughput`, a config-parse-path/process-boundary test with no
+`SimCluster` analog; the other five moved to `sim_cluster_dynamo_
+throttle.rs`/`sim_cluster_admin.rs` — see this file's own consolidated
+"throttle-metric counters under SimCluster" appendix), auto-split loops
+(2/2), `--config` bring-up (2/2) —
 reconciler-driven split/rebalance/GC, auto-split, join/growth, and the
 backup janitor are D4's own scope (D4 PR 1 already supplied the real
-reconciler these need next); Streams, admin/console/dashboard HTTP, and
-TTL are now owned and closed (C-07, C-08, C-09);
-index DDL beyond plain `CreateTable` is queued as C-10, **open** as of
-2026-09-09 (PRs 1-5 landed — groundwork plus `sim_cluster_dynamo_update_
-table_index.rs`, converting `update_table_create_index.rs`/`update_table_
-drop_index.rs`/`dynamo_gsi_drain.rs` (9 tests), all three deleted whole;
-`sim_cluster_backfill_seeder.rs`, converting 4 of `backfill_seeder.rs`'s
-5 scenarios; and `sim_cluster_stream_backfill_seed_filter.rs`, converting
-`stream_backfill_seed_filter.rs` (2 tests, +2 scenarios, file deleted)
-whole; PR 6 in progress, PR 7 close-out pending — see ADR 0061's "Rung J
-(post-C-09)" amendment and `docs/roadmap.md`'s C-10 entry for the
-grep-verified ground truth, file/line anchors, and the 7-PR plan);
-the control/data role split, `--config` bring-up, node assembly, and the
-throttle-metric counters are unowned
-by any planned rung as of this close; (E) frozen behind an open flake
+reconciler these need next); Streams, admin/console/dashboard HTTP, TTL,
+and throttle metric counters are now owned and closed (C-07, C-08, C-09,
+C-11 — see `docs/roadmap.md`'s C-11 entry and this file's own consolidated
+"throttle-metric counters under SimCluster" appendix above);
+index DDL beyond plain `CreateTable` is **owned and closed** by C-10/ADR
+0061 rung J as of 2026-09-09 (PRs 1-7 — docs opener; groundwork; `sim_
+cluster_dynamo_update_table_index.rs` converting `update_table_create_
+index.rs`/`update_table_drop_index.rs`/`dynamo_gsi_drain.rs` (9 tests, all
+three deleted whole); `sim_cluster_backfill_seeder.rs` converting 4 of
+`backfill_seeder.rs`'s 5 scenarios; `sim_cluster_stream_backfill_seed_
+filter.rs` converting `stream_backfill_seed_filter.rs`'s 2 tests, file
+deleted whole; `sim_cluster_console_table_config.rs`'s 3 GSI-DDL scenarios
+converted from `console_table_config.rs`, file trimmed to its 1 out-of-scope
+PITR test; docs close-out — see `docs/roadmap.md`'s C-10 entry and this
+file's own "index DDL beyond plain `CreateTable` under SimCluster" appendix
+below for the grep-verified ground truth and the full per-PR record);
+the control/data role split is C-12's own scope (candidate as of
+2026-09-09, per this file's own consolidated "throttle-metric counters
+under SimCluster" appendix — plan drafted, awaiting the maintainer's
+sequencing, not yet opened); `--config` bring-up and node assembly remain
+unowned by any planned rung, flagged for an assess-and-close decision
+rather than a rung, per the same appendix; (E) frozen behind an open flake
 issue, 7 files/32 tests (#298, #418, #592, #601, #610, #619/#622, #627) —
 out of scope for C-04, tracked by their own issues.
 
@@ -6674,11 +6694,15 @@ tests stayed `ProdEnv` for documented reasons spread across seven files, as
 of this rung's own close (`admin_endpoint.rs` 10, `dashboard_endpoint.rs`
 4, `console_endpoint.rs`
 3, `console_stream.rs` 1, `console_table_config.rs` 4, `metrics_
-endpoint.rs` 1, `system_table.rs` 2), none silently dropped — **two of
+endpoint.rs` 1, `system_table.rs` 2), none silently dropped — **five of
 those 25 no longer exist**: C-09 (ADR 0061 rung I) later converted
 `admin_endpoint.rs`'s TTL reaper-progress test (down to 9) and
-`console_stream.rs`'s sole test (the file is now deleted), per the
-consolidated TTL section below. See this
+`console_stream.rs`'s sole test (the file is now deleted); C-10 PR 6 (ADR
+0061 rung J) later converted three of `console_table_config.rs`'s own four
+— `add_and_drop_gsi_round_trip`, `add_gsi_records_a_declared_attribute_
+type`, `add_gsi_rejects_an_unknown_attribute_type` (down to 1,
+`table_detail_shows_pitr_status_and_backups`, once PR 2 closed blocker (d)
+— see the "index DDL beyond plain `CreateTable`" appendix below). See this
 file's own appendices, below, for each PR's mapping table and gate
 numbers, and ADR 0061's "Rung H closed" amendment for the complete final
 residue table with reasons, the in-scope findings (the shared `Metrics
@@ -9337,291 +9361,341 @@ this rung's own findings generalize into.
 See ADR 0061's "Rung I" amendments (PR 2 through "Rung I closed") and
 `docs/roadmap.md`'s C-09 entry for the full per-PR record.
 
-## Appendix — index DDL beyond plain `CreateTable` under `SimCluster`, groundwork (ADR 0061 rung J, C-10 PR 2, 2026-09-09)
 
-Opens the C-10 series (the next unowned residual group per Rung H's own
-close-out): `UpdateTable`'s GSI add/drop half — `dynamo.rs`'s
-`create_index`/`drop_index`/`set_index_status`/`drop_table_index`, and
-`index_drain.rs`'s backfill-seeder trio (`backfill_seed_tick`/
-`advance_backfill_cursor`/`seed_change_log_record`, plus
-`clear_backfill_cursor` — see this crate's own engineering-lessons entry
-for the `tokio::time` body this last one still carried despite an
-already-generic signature) — all widened to `<E: Env, R: RelayClient>`/
-`<E: Env>`, mirroring every prior D3/G/H/I rung's own `tokio::time` →
-`ctx.env`/`group.env()` conversion. `dispatch_table_op`'s `UpdateTable`
-arm gained a fourth sub-arm, `(None, Some(update), None)`, mirroring its
-stream/throughput siblings exactly: `wire::IndexUpdate::Create` →
-`create_index`, `Delete` → `drop_index`, then the same
-re-describe-on-success every sibling arm already does. `update_table`/
-`run_operation`/`execute_routed` are byte-identical — verified by `git
-diff` (only signatures, `tokio::time` → `ctx.env` conversions, and the new
-sub-arm) and by the untrimmed real-socket suites
-(`update_table_create_index.rs`/`update_table_drop_index.rs`/
-`dynamo_gsi_drain.rs`/`backfill_seeder.rs`/
-`stream_backfill_seed_filter.rs`/`console_table_config.rs`, 20 tests
-total) staying identical before and after.
+## Appendix — index DDL beyond plain `CreateTable` under SimCluster, C-10 closed (ADR 0061 rung J, PRs 1-7, 2026-09-09)
 
-**`index_backfill.rs`'s thin wrapper widened the same way** (a pure
-signature change — production's spawn sites in `lib.rs` are unaffected,
-still inferring `ProdEnv`/`AnimusdRelayClient`) so `SimCluster::new`/
-`::restart` can spawn `index_backfill::index_backfill_loop`
-unconditionally on every node, mirroring the backup/segment/TTL janitors'
-own always-on spawns exactly — its own leader gate
-(`ControlLeaderHost::control_leader`) already makes a non-leader's own
-tick a cheap no-op, so no opt-in gate is warranted the way
-`auto_split_loop`'s is. This is the **control-plane-leader-only
-completion aggregator** — the separate loop that flips a fully-reported
-index from `Creating` to `Active`, distinct from the per-tablet
-**backfill-seeder** half below.
+Folds the rung's own five PR-by-PR accounts (previously five separate
+appendices) into one coherent record now that the rung is closed — the
+mechanism facts and the final residual state, not a chronological replay
+of every intermediate revert. See ADR 0061's "Rung J" amendments (PR 2
+through "Rung J closed") for the full PR-by-PR narrative, including the
+two documented sequenced-analogue substitutions in PR 3 and the fixture
+gap PR 4 found and fixed.
 
-**`SimCluster::drive_backfill_seed(node, table)`** (new, mirroring
-`drain_gsi`'s exact shape: the same leader check, the same
-`is_quiesced()`/`Building`-child skip omission — unreachable under this
-fixture, identical reasoning — and the same `spawn_and_capture`-driven-
-to-`OP_BUDGET` bounded wait) drives one `index_drain::backfill_seed_tick`
-per `Creating` GSI (never `Active` — an already-backfilled index has
-nothing left to seed) over every tablet `node` both hosts and leads. This
-is the per-tablet **seeder** half `index_backfill_loop`'s own aggregator
-depends on: a call seeds up to `BACKFILL_SEED_BATCH` (256) newly
-discovered partitions per `(tablet, index)` pair and, only once the sweep
-reaches the tablet's current range end, reports via
-`MetaCommand::MarkIndexBackfilled` — **a populated table with more
-partitions than that needs several calls**, never one call assumed to
-finish everything; poll `DescribeTable`'s own per-index `Backfilling`/
-`IndexStatus` field (or just call `drive_backfill_seed` in a loop) until
-the index flips `Active`, the same "several ticks, not one" contract the
-real per-node loop has in production.
+**Goal.** Make `UpdateTable`'s GSI add/drop half — previously provable only
+over `ProdEnv`'s real wire via nine `tests/*.rs` files/33 tests — deterministically
+fault-injectable and seed-replayable under `SimCluster`/`SimEnv`.
+`dispatch_table_op`'s `UpdateTable` arm rejected any call carrying an index
+change outright (`unsupported_by_generic_dispatch`); this was blocker (d),
+named by both C-08's and C-09's own close-outs, the largest of the five
+groups Rung H's close-out left unowned and the only one of those five with
+a rung against it.
 
-Two new `sim_cluster_index_ddl.rs` scenarios (`_over_seeds` at 5 seeds
-each): (a) `UpdateTable` adding a GSI to a populated table returns it
-`CREATING`/`Backfilling: true`, rejects a `Query` against it while
-backfilling (`ValidationException`, the ordinary `NoSuchIndex`-shaped
-rejection a not-yet-`Active` index gets), and converges to `ACTIVE` via
-`drive_backfill_seed` + `drain_gsi` (a bounded loop of further
-`DescribeTable` calls — each a real op call, which is what actually gives
-the always-on `index_backfill_loop` a chance to observe the freshly-
-reported tablet) with the expected rows queryable through the now-`ACTIVE`
-index; (b) `UpdateTable` deleting that GSI leaves it absent from
-`DescribeTable` and rejects a `Query` against the now-gone index name the
-identical `ValidationException` way.
+**Mechanism, as it stands after the rung.**
 
-`cargo test -p animusd --lib sim_cluster -- --test-threads=2`: 428 → 432
-passed (+4, 0 regressions, 2 ignored throughout), peak RSS ~958 MB
-(`/usr/bin/time -v`), consistent with every prior rung's own no-leak
-trajectory.
+- `dynamo.rs`'s `create_index`/`drop_index`/`set_index_status`/
+  `drop_table_index` widened to `<E: Env, R: RelayClient>` (`tokio::time::
+  Instant::now()`/`sleep` → `ctx.env.now()`/`ctx.env.sleep(..)`) — every
+  `ClientCtx` method they call (`propose_schema`/`drop_table_tablets`/
+  `clear_backfill_cursor_for_table`) was already generic, so this was pure
+  signature/clock-call surgery mirroring `update_table_throughput`'s own
+  already-landed conversion, no new capability (PR 2). `dispatch_table_op`'s
+  `UpdateTable` arm gained a fourth sub-arm, `(None, Some(update), None)`,
+  mirroring its stream/throughput siblings exactly: `wire::IndexUpdate::
+  Create` → `create_index`, `Delete` → `drop_index`, then the same
+  re-describe-on-success every sibling arm already does. `update_table`/
+  `run_operation`/`execute_routed` stayed byte-identical throughout — verified
+  by `git diff` and by the untrimmed real-socket suites (20 tests across six
+  files) staying identical before conversion.
+- `index_drain::drain_tablet`/`reconcile_partition`/`gsi_caught_up` (the GSI
+  **drain** side) were already `<E, R>`/`<E, R>`/`<E>`-generic since D3 PR
+  3b, unchanged by this rung. `animus_node::index_backfill::
+  index_backfill_loop` (the **control-plane-leader-only completion
+  aggregator** — flips a fully-reported index from `Creating` to `Active`,
+  distinct from the per-tablet seeder below) was already fully generic
+  (rung C2) and its host trait (`ControlLeaderHost`) already implemented
+  generically for `ClientCtx` — only `crates/animusd/src/index_backfill.rs`'s
+  18-line thin wrapper was concrete, the smallest lift in the whole rung
+  (PR 2).
+- `index_drain::backfill_seed_tick`/`advance_backfill_cursor`/
+  `seed_change_log_record` (the per-tablet **backfill seeder**, populating
+  `Metadata::index_backfill` by scanning a led tablet's own base rows —
+  a distinct loop from the completion aggregator, called only from
+  `index_drain::change_consumer_loop`, which `SimCluster` never spawns)
+  widened to the `Env` seam the same way (`&CpGroup` → `&CpGroup<E>` via
+  `group.env()`, `seal_now`'s own established pattern) (PR 2). **A fourth
+  recurrence of the generic-signature-does-not-imply-seam-clean-body
+  lesson**: `clear_backfill_cursor<E: Env>` (used by `drop_index`'s cascade)
+  already carried a generic signature but its commit-wait loop still called
+  bare `tokio::time::Instant::now()`/`tokio::time::sleep`, found by the
+  first sim smoke run and fixed with the identical `group.env()` conversion
+  — see `docs/engineering-lessons.md`'s matching entry (this crate's fourth
+  recurrence of that lesson).
+- **`SimCluster::new`/`::restart` spawn `index_backfill::index_backfill_loop`
+  unconditionally on every node** (PR 2), mirroring the backup/segment/TTL
+  janitors' own always-on spawns — its own leader gate
+  (`ControlLeaderHost::control_leader`) already makes a non-leader's tick a
+  cheap no-op, so no opt-in gate is warranted. **A real fixture gap found by
+  a real gate run, not by inspection** (PR 4): `SimCluster::restart`
+  respawned `heartbeat_loop`/`backup_janitor_loop`/`segment_janitor_loop`/
+  `ttl_reaper_loop`/(conditionally) `auto_split_loop` — every perpetual
+  background task `Simulator::stop` drops for the restarted node — but not
+  `index_backfill_loop`, spawned unconditionally since PR 2. Fixed by
+  mirroring the `ttl_reaper_loop` respawn immediately above it; a fixture
+  `restart` that respawns only *some* of a process's always-on loops
+  silently weakens every crash scenario depending on the missing one (see
+  Mechanism lessons below).
+- **`SimCluster::drive_backfill_seed(node, table)`** (PR 2, new, mirroring
+  `drain_gsi`'s exact shape) drives one `index_drain::backfill_seed_tick`
+  per `Creating` GSI (never `Active`) over every tablet `node` both hosts
+  and leads. A call seeds up to `BACKFILL_SEED_BATCH` (256) newly discovered
+  partitions per `(tablet, index)` pair and, only once the sweep reaches the
+  tablet's current range end, reports via `MetaCommand::MarkIndexBackfilled`
+  — **a populated table with more partitions than that needs several
+  calls**, never one call assumed to finish everything; a scenario asserting
+  full backfill completion loops `drive_backfill_seed` (plus `drain_gsi` and
+  a `DescribeTable`/console poll) to exhaustion, the same "several ticks, not
+  one" contract the real per-node loop has in production.
+- **The console's `add_gsi`/`drop_gsi` needed zero change.**
+  `GenericConsoleBackend::add_gsi`/`drop_gsi` were already generic since
+  C-08 PR 2, already routing through `execute_routed_as_generic` into
+  `dispatch_table_op` — previously dead-ending in
+  `unsupported_by_generic_dispatch`, they now fall through to PR 2's own
+  index-change sub-arm and the real `create_index`/`drop_index` with **no
+  `lib.rs`/`console.rs`/`dynamo.rs` change at all** (PR 6).
 
-See ADR 0061's "Rung J, PR 2 landed" amendment and `docs/roadmap.md`'s
-C-10 entry for the full record.
+**New modules and mapping.**
 
-## Appendix — index DDL beyond plain `CreateTable` under `SimCluster`, `sim_cluster_dynamo_update_table_index.rs` (ADR 0061 rung J, C-10 PR 3, 2026-09-09)
+- `sim_cluster_index_ddl.rs` (PR 2): 2 scenarios — `UpdateTable` adding a
+  GSI to a populated table returns it `CREATING`/`Backfilling: true`,
+  rejects a `Query` against it while backfilling, and converges to `ACTIVE`
+  via `drive_backfill_seed` + `drain_gsi` (a bounded loop of further
+  `DescribeTable` calls, never one call assumed to finish) with the
+  expected rows queryable; deleting that GSI leaves it absent from
+  `DescribeTable` and rejects a `Query` against the now-gone name.
+  `converge_gsi_active`, this module's own bounded-poll helper, is the
+  shape every later module's own `converge_gsi_active`-family helper
+  duplicates locally (this crate's per-file-fixture convention).
+- `sim_cluster_dynamo_update_table_index.rs` (PR 3): converts `tests/
+  update_table_create_index.rs` (4), `tests/update_table_drop_index.rs`
+  (4), and `tests/dynamo_gsi_drain.rs` (1) — 9 tests, 18 `#[test]` fns
+  (pinned seed + `_over_seeds` per scenario), all three real-socket files
+  deleted whole. No `dynamo.rs`/`index_drain.rs`/`sim_cluster.rs` change —
+  driver-plus-assertions only, using primitives PR 2 already supplied.
+  Client-side validation rejections, the `MAX_GSI_PER_TABLE` cap, a
+  non-leader-issued `UpdateTable` converging on every node, a
+  populated-table drop's catalog + physical reclaim, a drop racing an
+  in-flight backfill, a create-drop-recreate cycle proving the backfill
+  cursor is genuinely cleared, and the GSI drain itself all convert.
+  **Three documented substitutions** (the module's own top-of-file doc
+  has the full account): `in_flight_backfill_is_cancelled_by_a_concurrent_
+  drop` issues the drop immediately after exactly one partial `drive_
+  backfill_seed` tick (300 rows, past the seeder's per-tick cap, so the
+  index is provably still `Creating`) rather than racing a live
+  `tokio::join!`; `a_crash_and_retry_mid_cascade_still_converges` spawns
+  the `Delete` by hand, drives the simulator a few milliseconds, then
+  interrupts with `SimCluster::restart` — on a 3-node cluster rather than
+  the original's 1-node, since `restart` rebuilds the restarted node's own
+  control-plane log from scratch and relies on peer catch-up (a lone node
+  has no peer to catch up from); `drop_of_an_active_index_on_a_populated_
+  table_reclaims_everything` substitutes a stronger `Metadata`/
+  `hosted_tablets`-absence-plus-empty-engine converged-or-timeout poll for
+  the original's real-WAL-file-absence check (`MemoryEngine` has no file).
+- `sim_cluster_backfill_seeder.rs` (PR 4): converts 4 of `tests/
+  backfill_seeder.rs`'s 5 scenarios (ADR 0045 §2) — materializing every
+  pre-existing row then flipping `Active`; live writes during backfill
+  converging to the correct final GSI (issued *sequenced*, not raced — no
+  automatic background sweep to race against in this fixture, proving the
+  load-bearing property, not the literal concurrency); two indexes
+  creating simultaneously converging independently; a crash-and-restart
+  mid-backfill (300 rows exceeding `BACKFILL_SEED_BATCH`, resuming from the
+  durable `KIND_CURSOR` row) — each with an `_over_seeds` sibling.
+  `split_during_backfill_converges_with_correct_final_gsi` stayed `ProdEnv`,
+  exercising the rung opener's own explicit license (see the residue table
+  below).
+- `sim_cluster_stream_backfill_seed_filter.rs` (PR 5): converts `tests/
+  stream_backfill_seed_filter.rs`'s two tests 1:1 (open-tail serve path,
+  sealed-shard path), file deleted whole, no residual. No new `SimCluster`
+  mechanism needed — built entirely from `drive_backfill_seed` (PR 2) and
+  C-07 PR 2's `drive_stream_seal` together. The original's `no_seal_knobs`/
+  `tiny_seal_knobs` pair has no sim analogue and needs none (this fixture
+  never spawns the periodic seal arm those knobs tune); the original's
+  60s real-time convergence loops simplified to direct assertions off one
+  deterministic call, since every write is already committed before the
+  single seal/lineage-walk call that follows it.
+- `sim_cluster_console_table_config.rs` (PR 6): converts the 3 GSI-related
+  `console_table_config.rs` scenarios (`add_gsi_rejects_an_unknown_
+  attribute_type`, `add_gsi_records_a_declared_attribute_type`,
+  `add_and_drop_gsi_round_trip`) as (6)/(7)/(8), each pinned-seed plus
+  `_over_seeds` (6 new `#[test]` fns). The first is pure client-side
+  validation (never reaches dispatch); the second needs no convergence
+  loop; only the third round-trips a populated table's GSI through
+  `CREATING` → `ACTIVE`, gaining its own `converge_gsi_active_via_console`
+  helper (mirrors `sim_cluster_index_ddl.rs`'s shape, polling the console's
+  own `GET /console/api/tables/{name}` rather than `DescribeTable`). No
+  `lib.rs`/`console.rs`/`dynamo.rs`/`sim_cluster.rs` change needed — pure
+  test authorship on top of PR 2's own product change.
 
-Converts `tests/update_table_create_index.rs` (4), `tests/update_table_
-drop_index.rs` (4), and `tests/dynamo_gsi_drain.rs` (1) — 9 tests total —
-into `crates/animusd/src/sim_cluster_dynamo_update_table_index.rs`
-(`#[cfg(test)] mod sim_cluster_dynamo_update_table_index;` from `lib.rs`,
-sibling of `sim_cluster_index_ddl`), all nine at a pinned seed plus a
-5-seed `_over_seeds` sibling (18 `#[test]` functions), and deletes all
-three real-socket files whole. Every scenario asserts the identical
-observable behaviour the original asserted, through `SimCluster::dynamo`
-— duplicate/reserved/`$`-containing/nonexistent-table validation
-rejections, the `MAX_GSI_PER_TABLE` cap, a non-leader-issued `UpdateTable`
-converging on every node, a populated-table drop's catalog + physical
-reclaim, a drop racing an in-flight backfill, a create-drop-recreate cycle
-proving the backfill cursor is genuinely cleared (not stale-resumed), and
-the GSI drain itself (materialize, move on overwrite, prune on delete).
+**The final `ProdEnv` residue, in full** (from the rung's own nine-file/
+33-test scope; `schema_ddl_relay.rs`'s 7 tests are a separate, deliberately
+unclaimed piece of work never in this scope — a real-thread bring-up
+proving the aggregator loop directly via `ClientRequest::ProposeSchema`,
+not through the DynamoDB wire):
 
-**Two scenarios substitute a deterministic sequenced analogue for the
-originals' own real-thread concurrency** (the module's own top-of-file
-doc has the full account): `in_flight_backfill_is_cancelled_by_a_
-concurrent_drop` issues the drop immediately after exactly one partial
-`drive_backfill_seed` tick (300 rows, past the seeder's own per-tick cap,
-so the index is provably still `Creating`) rather than racing a live
-`tokio::join!`; `a_crash_and_retry_mid_cascade_still_converges` spawns the
-`Delete` by hand on the target node's own `SimEnv` (`SimCluster::handle`),
-drives the simulator a few milliseconds, then interrupts with `SimCluster
-::restart` (a true process stop dropping the still in-flight task) —
-runs on a 3-node cluster rather than the original's 1-node, since
-`SimCluster::restart` rebuilds the restarted node's own control-plane log
-from scratch and relies on peer catch-up to repopulate it (a lone node
-has no peer to catch up from, unlike the original's real single process,
-which recovered from its own on-disk WAL — see `docs/engineering-lessons.md`'s
-matching entry). One scenario substitutes a stronger physical-reclaim
-proof for a disk-specific one: `drop_of_an_active_index_on_a_populated_
-table_reclaims_everything`'s original checked a real WAL file's absence
-on disk; `SimCluster` hosts every tablet on `MemoryEngine`, so the
-substitute checks `Metadata`/`hosted_tablets` absence **and** the hidden
-table's own tablet id reading back an empty engine, together in one
-converged-or-timeout poll — mirroring `sim_cluster_dynamo_drop_table.rs::
-assert_reclaimed`'s own discipline, generalized to an index's own hidden
-table.
+| File | Kept tests | Reason |
+|---|---|---|
+| `dynamo_index_scan.rs` | 5 (all) | Frozen behind open flake issue #418, untouched throughout |
+| `index_backfill.rs` | 3 (all) | Frozen behind open flake issue #592, untouched throughout |
+| `dynamo_index_writes.rs` | 6 (all) | Frozen behind open flake issue #610, untouched throughout |
+| `backfill_seeder.rs` | `split_during_backfill_converges_with_correct_final_gsi` | `SimCluster` spawns no `index_drain::change_consumer_loop`; proving it needs hand-interleaving three separately-timed on-demand primitives with no offline way to verify the aggregator can't race the cutover or that the post-cutover resweep converges — explicitly licensed by the rung's own opener |
+| `console_table_config.rs` | `table_detail_shows_pitr_status_and_backups` | `UpdateContinuousBackups` has no generic-dispatch arm and the test needs the real wall-clock-timed `pitr_snapshot_loop` — a separate, pre-existing PITR residual never in this rung's own scope |
 
-No `dynamo.rs`/`index_drain.rs`/`sim_cluster.rs` change was needed for
-this PR — every primitive it drives (`SimCluster::dynamo`/`drive_
-backfill_seed`/`drain_gsi`/`propose_meta`/`handle`/`crash`/`restart`/
-`run_for`/`storage`/`hosted_tablets`/`metadata`) already existed after PR
-2's groundwork; this PR is driver-plus-assertions only, the same shape
-`sim_cluster_dynamo_drop_table.rs`'s own doc claims for its module.
+16 tests total — one more than the opener's own 15-test prediction, a
+stated, pre-licensed deviation (`backfill_seeder.rs`'s own per-file table
+already flagged this outcome as possible), not a new blocker. 18 tests
+converted across PRs 3-6.
 
-**Residual `tests/*.rs` index-DDL count, updated**: of the rung J
-opener's own nine named files (33 tests by its grep-verified recount),
-three are now gone (`update_table_create_index.rs`, `update_table_drop_
-index.rs`, `dynamo_gsi_drain.rs` — 9 tests, deleted whole); the remaining
-six are `backfill_seeder.rs` (5, PR 4), `stream_backfill_seed_filter.rs`
-(2, PR 5), `console_table_config.rs` (4, 3 in scope for PR 6, 1 stays
-`ProdEnv` under the separate PITR residual), and the three frozen files
-this series does not touch (`dynamo_index_scan.rs` #418, `index_backfill.rs`
-#592, `dynamo_index_writes.rs` #610).
+**Test-count trajectory** (`cargo test -p animusd --lib sim_cluster --
+--test-threads=2`, whole tier): 428 (C-09 baseline) → 432 (PR 2, +4) → 450
+(PR 3, +18) → 458 (PR 4, +8) → 462 (PR 5, +4) → **468 passed, 0 failed, 2
+ignored** (PR 6, +6). No leak trajectory across any PR (peak RSS ~958 MB
+→ ~970 MB, `/usr/bin/time -v`, consistent with every prior rung's own
+envelope). `Cargo.lock` unchanged throughout the rung.
 
-**Gates**: this PR's own conversion could not be run against `cargo` from
-this worktree (delegated to the maintainer's own gate run in the main
-tree, per this session's own constraints); the untrimmed-baseline-first
-discipline the ADR's own PR 3 gate list calls for (`update_table_create_
-index`/`update_table_drop_index`/`dynamo_gsi_drain` green before the sim
-module, sim module green before the trim, whole `sim_cluster` tier +
-RSS sampler + fmt + clippy after) is the maintainer's own next step, not
-yet recorded here — do not treat this appendix as a stand-in for that
-run. Every API this module calls was individually cross-checked against
-its declared signature in `sim_cluster.rs` (see this PR's own report for
-the list of anything left uncertain).
+**No product bug found** beyond the two fixed in place (the `clear_
+backfill_cursor` clock-body finding, PR 2; the `SimCluster::restart`
+missing-respawn finding, PR 4) — both narrow, generalizable fixture/seam
+findings, not product defects reachable in production. See ADR 0061's
+"Rung J closed" amendment for the cross-cutting mechanism lessons this
+rung's own findings generalize into.
 
-See ADR 0061's "Rung J, PR 3 landed" amendment and `docs/roadmap.md`'s
-C-10 entry for the full record.
+See ADR 0061's "Rung J" amendments (PR 2 through "Rung J closed") and
+`docs/roadmap.md`'s C-10 entry for the full per-PR record.
 
-## Appendix — the backfill seeder under `SimCluster` (ADR 0061 rung J, C-10 PR 4, 2026-09-09)
+## Appendix — throttle-metric counters under SimCluster, C-11 closed (ADR 0061 rung K, PRs 1-4, 2026-09-09)
 
-Converts 4 of the 5 scenarios in `tests/backfill_seeder.rs` (ADR 0045 §2 —
-the secondary-index **backfill seeder**) into a new `crates/animusd/src/
-sim_cluster_backfill_seeder.rs`, driven entirely through PR 2's own
-primitives (`SimCluster::drive_backfill_seed`/`drain_gsi`, the always-on
-`index_backfill::index_backfill_loop` completion aggregator) — no
-`dynamo.rs`/`index_drain.rs`/`sim_cluster.rs` change was needed or made;
-this PR is pure test authorship, mirroring D3 PR 3b's/rung G PR 4's own
-"no dispatch change needed" precedent.
+Folds the rung's own two PR-by-PR accounts (previously two separate
+appendices) into one coherent record now that the rung is closed — the
+mechanism facts and the final residual state, not a chronological replay.
+See ADR 0061's "Rung K (post-C-10)" opener amendment through "Rung K
+closed" for the full PR-by-PR narrative, including the exact line-number
+corrections PR 1's own grep made against its plan draft.
 
-**Mapping** (see the new module's own doc for the full per-scenario
-account): `backfill_seeder_materializes_every_pre_existing_row_then_
-flips_active`, `live_writes_during_backfill_converge_to_the_correct_
-final_gsi` (sequenced, not raced — see below), `two_indexes_creating_
-simultaneously_converge_independently`, and `a_crash_and_restart_mid_
-backfill_still_converges` (a `SimCluster::crash`/`restart` of the
-tablet's own leader mid-sweep — 300 rows, exceeding the production
-`BACKFILL_SEED_BATCH` of 256, so one seed round provably cannot finish;
-resumes from the durable `KIND_CURSOR` row, committed via the tablet's
-own Raft group before the crash and unaffected by it) each gained a
-deterministic, `_over_seeds`-paired (5 seeds) sibling.
+**Goal.** Make `ThrottledWrites`/`ThrottledReads` (ADR 0065's own
+throttling mechanism's observability surface) — previously provable only
+over `ProdEnv`'s real wire via one file/6 tests — deterministically
+fault-injectable and seed-replayable under `SimCluster`/`SimEnv`. This was
+the smallest of the four groups Rung J's own close-out left unowned, and
+the group's own documented blocker (the claim that `SimCluster`'s nodes
+carry no metrics sink) turned out stale on inspection.
 
-**`split_during_backfill_converges_with_correct_final_gsi` is the ADR
-0061 rung J opener's own explicitly-licensed fallback case and stays on
-`ProdEnv`, unmodified, alone in the trimmed `tests/backfill_seeder.rs`** —
-`SimCluster` spawns no `index_drain::change_consumer_loop` at all, so
-proving it would mean hand-interleaving three separately-timed on-demand
-primitives (`drive_backfill_seed`/`drain_gsi`/`drive_inplace_split_
-cutover`) every round with no way, in this session, to verify offline
-that the always-on completion aggregator can't race the cutover propose,
-or that the post-cutover Fork-A per-child resweep (ADR 0045 §5 — "no
-split-lineage cursor inheritance") converges within a round budget that
-was never actually run.
+**Mechanism, as it stands after the rung.**
 
-**A real deviation from the original scenario, stated plainly**: the
-converted `live_writes_...` scenario issues its five-new/one-moved/
-one-deleted race writes *sequenced* — immediately after the index
-commits `Creating` and before any `drive_backfill_seed` round has run at
-all — rather than raced via a second concurrent task the way the real
-`tokio::spawn` writer does, since this fixture drives everything from one
-thread with no automatic background sweep to race against. What it
-proves is the property the original test's own doc names as the actual
-load-bearing claim ("the final materialized GSI matches the final
-base-table state regardless of how the sweep and these writes actually
-interleaved," ADR 0045 §2), not the literal concurrency.
+- **Zero production signature changes — this rung's own distinguishing
+  property.** Every call site `ThrottledWrites`/`ThrottledReads` pass
+  through was already `<E: Env>`/`<E: Env, R: RelayClient>` generic before
+  this rung began: `dynamo::kind_write_item_at_leader` (`dynamo.rs:9069`),
+  `write_path.rs`'s ADR 0049 fast marker arm (`:327`),
+  `txn_coordinator.rs`'s per-action check (`:134`) on the write side; the
+  read-path precharge site (`read_path.rs:99`, inside `ClientCtx::
+  throttle_precharge_read`); and `dynamo::dispatch_item_op`, which already
+  routed `BatchWriteItem`/`BatchGetItem`/`TransactWriteItems` (the last via
+  `run_transact`, generic since C-06 PR 2) through the identical generic
+  core production uses. This rung was pure test-fixture authorship
+  throughout — no `dynamo.rs`/`lib.rs`/`admin.rs` production code touched
+  by any PR.
+- **The counters *do* increment under `SimCluster`, and have since rung
+  D2 PR 1** — `SimCluster::new`/`::restart` build every node with a real
+  `DataRole` (`data: Some(DataRole { raftkv_metrics: node_metrics[i].
+  clone(), .. })`, `sim_cluster.rs:1460`) and a `ThrottleTracker`
+  (`:1504`), so the metric-recording sites' `ctx.data()`/
+  `self.data.as_ref()` accesses have resolved to a real sink for three
+  rungs. `SimCluster::set_throttle_defaults`/`::set_throttle_defaults_all`
+  (`:2121`/`:2134`) and `SimCluster::admin` (`:933`) already existed and
+  already drove `GET /admin/metrics`; `metrics_view<E, R>` (`admin.rs:
+  1982`) is generic, dispatched from `animus-node/src/admin.rs:52`. The
+  counters simply had no `SimCluster` scenario that ever issued a real
+  refusal against them until this rung wrote one.
+- **The stale claim had three copies; this rung corrected all three.**
+  `sim_cluster_throttle.rs`'s and `sim_cluster_dynamo_update_table.rs`'s
+  own module docs both asserted the counters "never increment under
+  `SimCluster`" because nodes carried `data: None` — corrected in PR 1
+  (the opener), once PR 2's own scenario had proven the claim false. A
+  third copy of the identical claim, `sim_cluster.rs:1427`'s own
+  `AdminInfo` comment ("No `DataRole` on any node in this fixture (`data:
+  None` below)"), survived two more PRs because `sim_cluster.rs` sat
+  outside PRs 1-3's own allowed-edits list — corrected in PR 4 (this
+  close-out), comment-only, no code change.
 
-**This PR was originally written with no `cargo` access** (a
-worktree-isolation constraint of the session that authored it) — every API
-this module calls (`SimCluster::propose_meta`/`drive_backfill_seed`/
-`drain_gsi`/`scan`/`dynamo`/`metadata`/`crash`/`restart`/`node_count`/
-`leader_index_of`, `animus_control::{IndexDef, IndexKind, IndexProjection,
-IndexStatus, MetaCommand, ProposeResult}`, `animus_dynamo::wire::
-{BATCH_WRITE_MAX_ITEMS, decode_stored_item}`) was confirmed by reading its
-current signature and doc comment directly in the tree, matching
-`sim_cluster_index_ddl.rs`'s (PR 2) own established call shapes wherever a
-precedent already existed. **A real gate run in the main tree found one
-genuine fixture gap, not a bug in this module's own scenarios**:
-`SimCluster::restart` respawned `heartbeat_loop`/`backup_janitor_loop`/
-`segment_janitor_loop`/`ttl_reaper_loop`/(conditionally) `auto_split_loop`
-— every perpetual background task `Simulator::stop` drops for the
-restarted node — but not `index_backfill::index_backfill_loop` (spawned by
-`SimCluster::new` since PR 2). Fixed by mirroring the `ttl_reaper_loop`
-respawn immediately above it in `SimCluster::restart` — a plain,
-pattern-matching addition, no new mechanism (see `docs/
-engineering-lessons.md`'s matching entry, updated in place rather than
-duplicated). All 8 tests in this module (4 scenarios × pinned-seed +
-`_over_seeds`) passed on the first full run after that fix, including
-`a_crash_and_restart_mid_backfill_still_converges`(`_over_seeds`), which
-exercises the fixed respawn path directly. The trimmed `tests/
-backfill_seeder.rs` (the one residual `split_during_backfill_converges_
-with_correct_final_gsi` test) passed unchanged. The whole `sim_cluster`
-tier (`cargo test -p animusd --lib sim_cluster -- --test-threads=2`)
-passed 458/458 (2 ignored, 0 failed), including `sim_cluster_index_ddl`
-and `sim_cluster_dynamo_update_table_index` (C-10 PR 2/PR 3's own tests),
-confirming the `restart` change didn't disturb anything upstream. `cargo
-fmt --all --check` and `cargo clippy -p animusd --all-targets
---all-features -- -D warnings` are both clean.
+**New modules and mapping.**
 
-See `docs/roadmap.md`'s C-10 entry for the residual-inventory update.
+- `sim_cluster_dynamo_throttle.rs` (PR 2, `#[cfg(test)] mod`, registered
+  in `lib.rs` beside `sim_cluster_throttle`): converts four of `tests/
+  dynamo_throttling.rs`'s six scenarios, same names, each with a
+  pinned-seed test plus its `_over_seeds` sibling (8 `#[test]` fns):
+  `batch_write_item_sheds_throttled_rows_into_unprocessed_items`,
+  `batch_get_item_sheds_throttled_keys_into_unprocessed_keys`,
+  `transact_write_items_cancels_with_throttling_error`,
+  `a_forwarded_write_is_throttled_on_the_leader`. Every scenario mirrors
+  its original's request shapes, table schema, and assertions verbatim
+  (`UnprocessedItems`/`UnprocessedKeys` array contents,
+  `TransactionCanceledException`'s `ThrottlingError` cancellation reason,
+  `ProvisionedThroughputExceededException`'s full `__type` string).
+  `batch_write_item_sheds_throttled_rows_into_unprocessed_items` keeps the
+  original's **streamed**-table requirement (a plain marker table's
+  `BatchWriteItem` commits one `KindBatch` entry per tablet, so only a
+  streamed table's per-item evaluate-at-leader funnel gives genuinely
+  partial shedding to observe). **One deliberate behavioral difference**:
+  `a_forwarded_write_is_throttled_on_the_leader` issues every write from
+  ONE fixed non-leader node (via `SimCluster::leader_index_of`) rather
+  than the original's round-robin across all three dynamo listeners — a
+  more direct proof of the same claim, that the leader's own bucket is
+  what refuses regardless of which node the client dialed. `tests/
+  dynamo_throttling.rs` stayed byte-identical and untrimmed after this PR
+  (the D3 discipline — prove the untrimmed baseline green before removing
+  anything).
+- `sim_cluster_admin.rs` scenario (9) (PR 3): adds `admin_metrics_
+  reports_nonzero_throttled_counters` (pinned-seed plus `_over_seeds`,
+  seed prefix `0xC085_0009`/`0xC085_0900`) — the fifth and final
+  conversion, the one scenario PR 2 deliberately left unconverted since it
+  asserts the counter directly rather than proving the sink is merely
+  live. A single-node `SimCluster` (mirroring the original's own
+  `bring_up(1, ..)`): `CreateTable`, a seed `PutItem`,
+  `SimCluster::set_throttle_defaults_all(Some(1), Some(1))`, a bounded
+  (20-iteration) `PutItem` loop draining the write bucket and a bounded
+  (40-iteration) `GetItem` loop draining the read bucket, then `GET
+  /admin/metrics` on the table's own tablet leader — asserting
+  `counters.throttled_writes > 0`, `counters.throttled_reads > 0`, and a
+  nonempty per-tablet `throttle` array, verbatim the original's own three
+  assertions. Single-node, not three, matching the original's own
+  `bring_up(1, ..)` shape (with exactly one node there is exactly one
+  candidate bucket to refuse) rather than reaching for the multi-node
+  shape PR 2's forwarded-write scenario needed. Adds two small local
+  helpers (`big_value`/`put_body`) mirroring `dynamo_throttling.rs`'s/
+  `sim_cluster_dynamo_throttle.rs`'s own identically-named copies rather
+  than reaching into either sibling module's `pub(crate)` surface — this
+  crate's per-file-fixture convention.
 
-## Appendix — index DDL beyond plain `CreateTable` under `SimCluster`, `sim_cluster_stream_backfill_seed_filter.rs` (ADR 0061 rung J, C-10 PR 5, 2026-09-09)
+**`tests/dynamo_throttling.rs` trimmed in PR 3** to its one remaining
+residual — removing the five converted tests and the helpers only they
+used (the plain single-node `bring_up`, the raw HTTP/1.0 `admin` client,
+`set_throttle_defaults_everywhere`, `create_streamed_table`, `error_type`,
+and the now-unused `use serde_json::Value;`). `create_table`,
+`create_table_with_throughput`, `big_value`, `put_body`, `dynamo`, and
+`await_bootstrap` all stayed — the remaining test uses every one of them.
 
-Converts `tests/stream_backfill_seed_filter.rs`'s two tests 1:1 into
-`sim_cluster_stream_backfill_seed_filter.rs` (registered in `lib.rs` beside
-`sim_cluster_index_ddl`); the original file is deleted whole. Both scenarios
-prove the backfill seeder's own synthetic, image-less change-log marker
-(`index_drain::seed_change_log_record`, `seeded: true`) never surfaces as a
-phantom `GetRecords` event — one over the open-tail serve path, one over the
-sealed-shard path (`get_records_sealed`'s segment decode) — the "both serve
-paths get their own test" discipline issue #267 asked for, since a shared
-filter predicate only proves the two paths *agree*, not that each is
-actually reached with a seed record in hand.
+**The final `ProdEnv` residue, in full:**
 
-**No new `SimCluster` mechanism needed** — both scenarios are built entirely
-from primitives two earlier rungs already supplied:
-[`sim_cluster::SimCluster::drive_backfill_seed`] (C-10 PR 2) ticks the
-seeder for every `Creating` GSI of a led tablet, and
-[`sim_cluster::SimCluster::drive_stream_seal`] (C-07 PR 2) seals whatever is
-currently pending on demand. `converge_gsi_active` (a bounded
-`drive_backfill_seed` + `drain_gsi` + `DescribeTable`-poll loop) is
-duplicated locally from `sim_cluster_index_ddl.rs`, per this crate's own
-per-file-fixture convention.
+| File | Kept tests | Reason |
+|---|---|---|
+| `dynamo_throttling.rs` | `cluster_wide_throttle_default_is_overridden_by_a_tables_own_throughput` | Targets `run_node_with_cluster_settings`'s **config-parse** path (a node-bring-up/process-boundary shape — `ClusterSettings` read at construction time), not a throttle-bucket check the generic dispatch core reaches; `SimCluster::new` builds every node in-process from its own fixed constructor, never from a `ClusterConfig` a real `animusd` binary would parse, so there is no `SimCluster` analog |
 
-**Knob mapping** (restated from `sim_cluster_dynamo_streams.rs`'s own doc,
-applied here): the original's `no_seal_knobs` (tuned to never fire) is
-simply "never call `drive_stream_seal`" — this fixture never spawns the
-periodic seal arm those knobs tune at all, so a table's tablet just stays
-open. `tiny_seal_knobs` (seals on any pending byte, sweeping seed markers
-into sealed segments alongside real records, deliberately —
-`docs/streams-notes.md`'s "hiding is a serve-time decision") is one
-`drive_stream_seal` call after the backfill converges — the method already
-loops `seal_now` to exhaustion of whatever is pending at the moment it's
-called, so one call suffices.
+One test — a permanent residual, not a gap, matching PR 1's own
+disposition table exactly.
 
-**The original's own real-time convergence loops are simplified, not
-carried over verbatim.** The sealed-path scenario's 60s
-converged-or-timeout poll existed to race a genuinely concurrent real-time
-writer against a periodic sealer — neither exists under `SimCluster`
-(every write below is already committed, deterministically, before the
-single seal call and the single lineage walk that follows it), so the sim
-sibling asserts directly off one `walk_lineage` call. The open-path
-scenario keeps a bounded stable-poll loop (`drain_open_shard`) purely
-defensively — nothing in this fixture produces new records after the
-scenario's own writes complete, but the original's own "don't assume one
-poll sees everything" discipline costs nothing to keep and generalizes if
-a future rung ever gives this fixture a background writer.
+**Test-count trajectory** (`cargo test -p animusd --lib sim_cluster --
+--test-threads=2`, whole tier): 468 (C-10 baseline) → 476 (PR 2, +8) →
+**478 passed, 0 failed, 2 ignored** (PR 3, +2). No leak trajectory across
+either PR (peak RSS ~983 MB → ~950 MB, `/usr/bin/time -v`, consistent with
+every prior rung's own envelope). `Cargo.lock` unchanged throughout.
 
-Both tests convert with no residual — this file was fully convertible,
-matching the group's other fully-convertible files.
+**No product bug found** — every PR's own gate run (PR 2/PR 3 authored
+with no `cargo` access, per this crate's own engineering-lessons entry on
+verifying `SimCluster` fixture code by reading the production dispatch
+path directly; gated in the main tree after rebase) required no fixes
+against either module as authored. See ADR 0061's "Rung K closed"
+amendment for the cross-cutting mechanism lessons this rung's own
+findings generalize into.
 
-This PR's own diff: the new module, its `lib.rs` registration, the deleted
-`tests/stream_backfill_seed_filter.rs`, and these three docs files
-(`crates/animusd/CLAUDE.md`,
-`docs/adr/0061-testability-node-crate-simulator.md`, `docs/roadmap.md`).
-
-See ADR 0061's "Rung J, PR 5" amendment and `docs/roadmap.md`'s C-10 entry
-for the full record.
+See ADR 0061's "Rung K" amendments (opener through "Rung K closed") and
+`docs/roadmap.md`'s C-11 entry for the full per-PR record.
