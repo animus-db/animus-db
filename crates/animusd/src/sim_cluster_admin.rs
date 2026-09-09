@@ -119,17 +119,18 @@
 //!     catalog row actually gone, a follower staying honestly `idle`/
 //!     `leader: false` throughout.
 //! (6) [`run_ttl_tables_lists_a_ttl_enabled_table`] — **the "tables" half
-//!     only** of `admin_ttl_reports_reaper_progress_and_ttl_tables`
-//!     (per this rung's own brief): `UpdateTimeToLive`, then every node's
-//!     own `GET /admin/ttl` converges to listing the table
-//!     `{name, attribute, enabled: true}`, carries a `reaper` snapshot,
-//!     and a numeric `leader_tablets`. The real-socket original's OTHER
-//!     half — an expired item actually getting reaped — needs
-//!     `animusd::ttl_reaper::ttl_reaper_loop`, which no `SimCluster`
-//!     primitive drives (`SimCluster::new`/`restart` never spawn it,
-//!     unlike the heartbeat/reconciler/backup-janitor/segment-janitor
-//!     loops, all always-on since D4/rung G) — that whole test stays
-//!     `ProdEnv`, kept in `tests/admin_endpoint.rs` with a reason comment.
+//!     only** of `admin_ttl_reports_reaper_progress_and_ttl_tables` (C-08
+//!     rung H's own brief, when no primitive drove the reaper under
+//!     `SimEnv` at all): `UpdateTimeToLive`, then every node's own `GET
+//!     /admin/ttl` converges to listing the table `{name, attribute,
+//!     enabled: true}`, carries a `reaper` snapshot, and a numeric
+//!     `leader_tablets`. **Still deliberately asserts nothing about
+//!     `reaper.deleted_total`** even though C-09 PR 2 (ADR 0061 rung I)
+//!     later made the always-on loop real under this fixture too — this
+//!     scenario never writes an expired item, so `deleted_total` stays
+//!     honestly 0 for an ordinary reason now (nothing to reap), not the
+//!     "no driver exists" reason this comment used to give; scenario (8)
+//!     below is the one that actually exercises a reap.
 //! (7) [`run_admin_metrics_surfaces_control_plane_counters`] — **not a
 //!     literal conversion of `tests/metrics_endpoint.rs`**, whose own
 //!     subject is the raw-text `GET /metrics` listener on the dynamo port
@@ -148,6 +149,23 @@
 //!     observed for the CONTROL plane specifically, only for the corrupted
 //!     metrics gauge). `tests/metrics_endpoint.rs`'s own test stays
 //!     `ProdEnv` whole, with a reason comment.
+//! (8) [`run_admin_ttl_reports_reaper_progress_and_ttl_tables`] (ADR 0061
+//!     rung I, C-09 PR 4) — the reaper-progress half `admin_ttl_reports_
+//!     reaper_progress_and_ttl_tables` needed and scenario (6) above
+//!     deliberately never provided: `UpdateTimeToLive`, a converged poll on
+//!     every node's own `GET /admin/ttl` for the tables-list half (same
+//!     shape as (6)) plus a captured `leader_tablets` per node (at least
+//!     one node leads none of the table's single tablet on a 3-node, RF-3
+//!     cluster), then an already-expired item written through the admin
+//!     `POST /admin/data/dynamo` proxy from a **non-leader** of the
+//!     table's tablet (mirrors every other `sim_cluster_admin*.rs`
+//!     scenario's own forwarding-path convention, and PR 2/3's `SimCluster::
+//!     dynamo` siblings), and a converged-or-timeout poll across every node
+//!     until SOME node's own `GET /admin/ttl` reports `reaper.deleted_total
+//!     >= 1` — riding the always-on loop the same way the real-socket
+//!     original's `sleep`-based poll did, no [`SimCluster::drive_ttl_sweep`]
+//!     needed since nothing here depends on an intermediate, pre-cadence
+//!     state (only "eventually reaped").
 //!
 //! ## Kept `ProdEnv`, in `tests/admin_endpoint.rs` (each with its own
 //! reason comment; PR 6's own mutating-action tests are untouched here,
@@ -163,9 +181,6 @@
 //!   SSTable/block-read counter at all under `SimEnv`, so the cost
 //!   differential this test measures (`storage_sstable_block_reads`
 //!   between the cheap and `?exact=1` paths) cannot exist here.
-//! - `admin_ttl_reports_reaper_progress_and_ttl_tables` — see scenario (6)
-//!   above; kept whole (its reaper-progress half has no driver), the
-//!   tables half gets its own new scenario instead of a literal trim.
 //! - `admin_segment_store_reports_shard_placement_and_local_objects` —
 //!   this fixture's segment store is `SegmentStoreHandle::S3` (a single
 //!   shared object store), never `Cluster`; `AdminInfo.segment_store` is
@@ -223,7 +238,7 @@ use serde_json::Value;
 use super::sim_cluster::SimCluster;
 use super::sim_cluster_console::{
     control_leader_and_follower, create_table_via_wire, env_seed, json, leader_of_table,
-    tablet_of_table,
+    non_leader_of_table, tablet_of_table,
 };
 
 fn accepted(r: ProposeResult) -> bool {
@@ -933,5 +948,116 @@ fn admin_metrics_surfaces_control_plane_counters() {
 fn admin_metrics_surfaces_control_plane_counters_over_seeds() {
     for i in 0..5 {
         run_admin_metrics_surfaces_control_plane_counters(0xC085_0700 + i);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// (8) admin_ttl_reports_reaper_progress_and_ttl_tables (ADR 0061 rung I,
+//     C-09 PR 4) — converted from `tests/admin_endpoint.rs`'s test of the
+//     same name, now that the always-on TTL reaper actually runs under
+//     `SimEnv` (C-09 PR 2).
+// ---------------------------------------------------------------------------
+
+fn run_admin_ttl_reports_reaper_progress_and_ttl_tables(seed: u64) {
+    let mut cluster = SimCluster::new(seed, 3, 3);
+
+    let (status, ct) = create_table_via_wire(
+        &mut cluster,
+        0,
+        r#"{"TableName":"widgets","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
+            "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}]}"#,
+    );
+    assert_eq!(status, 200, "seed={seed}: CreateTable: {ct}");
+
+    let (status, upd) = cluster.dynamo(
+        0,
+        "DynamoDB_20120810.UpdateTimeToLive",
+        br#"{"TableName":"widgets",
+            "TimeToLiveSpecification":{"Enabled":true,"AttributeName":"expiresAt"}}"#,
+    );
+    assert_eq!(status, 200, "seed={seed}: UpdateTimeToLive: {upd}");
+
+    // ---- poll converged-or-timeout: every node's own catalog view lists
+    //      `widgets` as TTL-enabled, carries a `reaper` snapshot, and a
+    //      numeric `leader_tablets` — capture the latter for the "at least
+    //      one node leads none of it" check below, mirroring the
+    //      real-socket original's own two-part poll+capture. ----
+    let mut leader_tablets_by_node: Vec<u64> = Vec::new();
+    for node in 0..cluster.node_count() as u64 {
+        let v = poll_admin(&mut cluster, node, "/admin/ttl", "", seed, 20, |v| {
+            v.get("reaper").is_some()
+                && v["tables"].as_array().is_some_and(|tables| {
+                    tables.iter().any(|t| {
+                        t["name"] == "widgets"
+                            && t["attribute"] == "expiresAt"
+                            && t["enabled"] == true
+                    })
+                })
+        });
+        leader_tablets_by_node.push(v["leader_tablets"].as_u64().unwrap_or_else(|| {
+            panic!("seed={seed}: node {node} carries a numeric leader_tablets: {v}")
+        }));
+    }
+    assert!(
+        leader_tablets_by_node.contains(&0),
+        "seed={seed}: a 3-node, RF-3 cluster's single tablet has exactly one \
+         leader — at least one other node should lead none of it: \
+         {leader_tablets_by_node:?}"
+    );
+
+    // ---- put an already-expired item through the admin data proxy, from a
+    //      non-leader of the table's own tablet — the same forwarding-path
+    //      convention every other `sim_cluster_admin*.rs` scenario and
+    //      `sim_cluster_ttl.rs`'s own wire scenarios already use. ----
+    let writer = non_leader_of_table(&cluster, "widgets");
+    let past = cluster.wall_now_secs(writer).saturating_sub(3600);
+    let (status, put) = cluster.admin(
+        writer,
+        "POST",
+        "/admin/data/dynamo",
+        "",
+        format!(
+            r#"{{"op":"PutItem","payload":{{"TableName":"widgets","Item":{{"id":{{"S":"w1"}},"expiresAt":{{"N":"{past}"}}}}}}}}"#
+        )
+        .as_bytes(),
+    );
+    assert_eq!(status, 200, "seed={seed}: PutItem: {put}");
+
+    // ---- poll converged-or-timeout: SOME node's own reaper eventually
+    //      deletes it and reports so on its own GET /admin/ttl — riding the
+    //      always-on loop the same way the real-socket original's
+    //      `sleep`-based poll did (this scenario asserts no intermediate,
+    //      pre-cadence state, so no `SimCluster::drive_ttl_sweep` is
+    //      needed: each `cluster.admin` call already burns a full
+    //      `OP_BUDGET`, 60x the 200ms sweep interval, so the loop below
+    //      converges within a couple of iterations in practice). ----
+    const MAX_POLLS: usize = 20;
+    let mut converged = false;
+    'poll: for _ in 0..MAX_POLLS {
+        for node in 0..cluster.node_count() as u64 {
+            let (status, body) = cluster.admin(node, "GET", "/admin/ttl", "", &[]);
+            assert_eq!(status, 200, "seed={seed}: GET /admin/ttl: {body}");
+            if json(&body)["reaper"]["deleted_total"].as_u64().unwrap_or(0) >= 1 {
+                converged = true;
+                break 'poll;
+            }
+        }
+    }
+    assert!(
+        converged,
+        "seed={seed}: no node's TTL reaper ever reported a delete within \
+         {MAX_POLLS} polls ({MAX_POLLS} x OP_BUDGET of virtual time)"
+    );
+}
+
+#[test]
+fn admin_ttl_reports_reaper_progress_and_ttl_tables() {
+    run_admin_ttl_reports_reaper_progress_and_ttl_tables(env_seed(0xC085_0008));
+}
+
+#[test]
+fn admin_ttl_reports_reaper_progress_and_ttl_tables_over_seeds() {
+    for i in 0..5 {
+        run_admin_ttl_reports_reaper_progress_and_ttl_tables(0xC085_0800 + i);
     }
 }

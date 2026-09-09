@@ -20,14 +20,14 @@
 //! this PR — pure test authorship, mirroring PR 3's own "no dispatch
 //! change needed" precedent.
 //!
-//! ## Test-by-test disposition (3 converted, 1 kept `ProdEnv`)
+//! ## Test-by-test disposition (4 converted, 0 kept `ProdEnv`)
 //!
 //! | Real-socket test | Disposition |
 //! |---|---|
 //! | `table_with_no_stream_reports_the_honest_disabled_answer` | Converted → [`run_table_with_no_stream_reports_the_honest_disabled_answer`] |
 //! | `stream_enabled_lists_shards_and_records_reflect_real_writes` | Converted → [`run_stream_enabled_lists_shards_and_records_reflect_real_writes`] |
 //! | `walking_a_shard_with_next_shard_iterator_visits_every_record_exactly_once` | Converted → [`run_walking_a_shard_with_next_shard_iterator_visits_every_record_exactly_once`] |
-//! | `ttl_deletion_carries_the_service_user_identity_through_the_console` | **KEPT** `ProdEnv` — no primitive drives `animusd::ttl_reaper::ttl_reaper_loop` under `SimEnv`: `SimCluster::new`/`restart` never spawn it (unlike `heartbeat_loop`/the reconciler/the backup janitor/the segment janitor, all always-on since D4/rung G), so there is nothing in this fixture that would ever reap the expired item and mint the REMOVE record this test reads. The TTL reaper is its own unowned residual group (this rung's own brief: "do NOT build a reaper driver in this PR") |
+//! | `ttl_deletion_carries_the_service_user_identity_through_the_console` | Converted → [`run_ttl_deletion_carries_the_service_user_identity_through_the_console`] (ADR 0061 rung I, C-09 PR 4 — the always-on TTL reaper is now real under `SimEnv`, C-09 PR 2; `tests/console_stream.rs` deleted whole, this was its only test) |
 //!
 //! **Issuing discipline**, mirroring `sim_cluster_console.rs`'s own: every
 //! table is created over the real DynamoDB wire from node 0 (the wire path
@@ -43,11 +43,12 @@
 //! --lib <scenario name>`.
 
 use std::collections::BTreeSet;
+use std::time::Duration;
 
 use super::sim_cluster::SimCluster;
 use super::sim_cluster_console::{
-    assert_no_cluster_shape, create_table_via_wire, env_seed, json, leader_of_table,
-    non_leader_of_table, put_item_via_wire,
+    assert_no_cluster_shape, create_table_via_wire, env_seed, get_item_via_wire, json,
+    leader_of_table, non_leader_of_table, put_item_via_wire,
 };
 
 // ---------------------------------------------------------------------------
@@ -394,5 +395,180 @@ fn walking_a_shard_with_next_shard_iterator_visits_every_record_exactly_once_ove
         run_walking_a_shard_with_next_shard_iterator_visits_every_record_exactly_once(
             0xC084_2100 + i,
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// (4) ttl_deletion_carries_the_service_user_identity_through_the_console
+//     (ADR 0061 rung I, C-09 PR 4)
+// ---------------------------------------------------------------------------
+
+/// Bounded converged-or-timeout poll for the always-on TTL reaper — mirrors
+/// `sim_cluster_ttl.rs`'s own private `poll_until_reaped` (not importable
+/// across modules, an independent copy of the identical shape, the same
+/// convention this module's own module doc already follows for `describe_
+/// stream_via_wire`-shaped helpers) for the absence case (a bare `GetItem`
+/// response with no `"Item"` key at all).
+fn poll_until_reaped(cluster: &mut SimCluster, node: u64, get_body: &str, seed: u64) {
+    const ATTEMPTS: usize = 20;
+    const STEP: Duration = Duration::from_millis(400);
+    let mut last = String::new();
+    for _ in 0..ATTEMPTS {
+        let (status, body) = get_item_via_wire(cluster, node, get_body);
+        if status == 200 && !body.contains("\"Item\"") {
+            return;
+        }
+        last = format!("status={status} body={body}");
+        cluster.run_for(STEP);
+    }
+    panic!(
+        "seed={seed}: item was never reaped by the always-on TTL loop within \
+         {ATTEMPTS} attempts (last={last})"
+    );
+}
+
+/// ADR 0051 §7: a TTL-reaper delete's stream record carries `userIdentity`
+/// (`{"PrincipalId": "dynamodb.amazonaws.com", "Type": "Service"}`) when
+/// read through the console's own `stream/records` endpoint, exactly as it
+/// does over the raw DynamoDB Streams wire — the console passes the wire
+/// `Record` shape straight through (`console::StreamRecordsPage`'s own
+/// doc), so this is the console-side half of the regression `sim_cluster_
+/// ttl.rs::run_ttl_deletion_is_visible_in_the_stream_with_a_service_user_
+/// identity` already proves over the raw wire (C-09 PR 3).
+///
+/// Converted from `tests/console_stream.rs`'s only test (ADR 0061 rung I,
+/// C-09 PR 4), now that the always-on TTL reaper actually runs under
+/// `SimEnv` (C-09 PR 2) — `tests/console_stream.rs` deleted whole, since
+/// this was its sole remaining test.
+fn run_ttl_deletion_carries_the_service_user_identity_through_the_console(seed: u64) {
+    let mut cluster = SimCluster::new(seed, 3, 3);
+    let table = "sessions";
+
+    let (status, body) = create_table_via_wire(
+        &mut cluster,
+        0,
+        &format!(
+            r#"{{"TableName":"{table}",
+                "AttributeDefinitions":[{{"AttributeName":"id","AttributeType":"S"}}],
+                "KeySchema":[{{"AttributeName":"id","KeyType":"HASH"}}],
+                "StreamSpecification":{{"StreamEnabled":true,"StreamViewType":"NEW_AND_OLD_IMAGES"}}}}"#
+        ),
+    );
+    assert_eq!(status, 200, "seed={seed}: CreateTable failed: {body}");
+
+    let (status, body) = cluster.dynamo(
+        0,
+        "DynamoDB_20120810.UpdateTimeToLive",
+        format!(
+            r#"{{"TableName":"{table}","TimeToLiveSpecification":{{"Enabled":true,"AttributeName":"expiresAt"}}}}"#
+        )
+        .as_bytes(),
+    );
+    assert_eq!(status, 200, "seed={seed}: UpdateTimeToLive failed: {body}");
+
+    let non_leader = non_leader_of_table(&cluster, table);
+    let past = cluster.wall_now_secs(non_leader).saturating_sub(3600);
+    let (status, body) = put_item_via_wire(
+        &mut cluster,
+        non_leader,
+        &format!(
+            r#"{{"TableName":"{table}","Item":{{"id":{{"S":"s1"}},"expiresAt":{{"N":"{past}"}}}}}}"#
+        ),
+    );
+    assert_eq!(status, 200, "seed={seed}: PutItem failed: {body}");
+
+    // Wait for the reaper to actually delete it (its own independent
+    // asynchronous path) before looking for the stream record — rides the
+    // always-on loop the same way the real-socket original's own
+    // converged-or-timeout `GetItem` poll rode out the real (fast) sweep
+    // interval, never a real `sleep`.
+    let get_body =
+        format!(r#"{{"ConsistentRead":true,"TableName":"{table}","Key":{{"id":{{"S":"s1"}}}}}}"#);
+    poll_until_reaped(&mut cluster, non_leader, &get_body, seed);
+
+    let reader = non_leader_of_table(&cluster, table);
+    let (status, _ct, body) = cluster.console(
+        reader,
+        "GET",
+        &format!("/console/api/tables/{table}/stream/shards"),
+        "",
+        &[],
+    );
+    assert_eq!(status, 200, "seed={seed}: stream/shards failed: {body}");
+    assert_no_cluster_shape(&body);
+    let shard_id = json(&body)["shards"][0]["shard_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("seed={seed}: no shard_id: {body}"))
+        .to_string();
+
+    let (status, _ct, body) = cluster.console(
+        reader,
+        "POST",
+        &format!("/console/api/tables/{table}/stream/iterator"),
+        "",
+        format!(r#"{{"shard_id":"{shard_id}","iterator_type":"TRIM_HORIZON"}}"#).as_bytes(),
+    );
+    assert_eq!(status, 200, "seed={seed}: stream/iterator failed: {body}");
+    assert_no_cluster_shape(&body);
+    let mut iterator = json(&body)["shard_iterator"]
+        .as_str()
+        .unwrap_or_else(|| panic!("seed={seed}: no shard_iterator: {body}"))
+        .to_string();
+
+    // Both the TTL delete and the poll above are already committed by this
+    // point (the poll only returns once `s1` is gone) — this is a bounded
+    // pagination walk, not a further convergence wait, mirroring
+    // `sim_cluster_ttl.rs`'s own scenario (i).
+    let mut ttl_record = None;
+    for _ in 0..10 {
+        if ttl_record.is_some() {
+            break;
+        }
+        let (status, _ct, body) = cluster.console(
+            reader,
+            "POST",
+            &format!("/console/api/tables/{table}/stream/records"),
+            "",
+            format!(r#"{{"shard_iterator":"{iterator}"}}"#).as_bytes(),
+        );
+        assert_eq!(status, 200, "seed={seed}: stream/records failed: {body}");
+        assert_no_cluster_shape(&body);
+        let v = json(&body);
+        for record in v["records"].as_array().cloned().unwrap_or_default() {
+            if record["eventName"] == "REMOVE" {
+                ttl_record = Some(record);
+            }
+        }
+        match v["next_shard_iterator"].as_str() {
+            Some(next) => iterator = next.to_string(),
+            None => break,
+        }
+    }
+    let ttl_record = ttl_record.unwrap_or_else(|| {
+        panic!(
+            "seed={seed}: the TTL delete's REMOVE record never appeared through \
+             the console"
+        )
+    });
+    assert_eq!(
+        ttl_record["userIdentity"]["PrincipalId"], "dynamodb.amazonaws.com",
+        "seed={seed}: a TTL delete read through the console must carry the \
+         service userIdentity: {ttl_record}"
+    );
+    assert_eq!(
+        ttl_record["userIdentity"]["Type"], "Service",
+        "seed={seed}: {ttl_record}"
+    );
+}
+
+#[test]
+fn ttl_deletion_carries_the_service_user_identity_through_the_console() {
+    run_ttl_deletion_carries_the_service_user_identity_through_the_console(env_seed(0xC084_4001));
+}
+
+#[test]
+fn ttl_deletion_carries_the_service_user_identity_through_the_console_over_seeds() {
+    for i in 0..5 {
+        run_ttl_deletion_carries_the_service_user_identity_through_the_console(0xC084_4100 + i);
     }
 }

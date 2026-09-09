@@ -9332,3 +9332,89 @@ PR's net 12 new `#[test]` functions: 16 written minus the 4 reverted with
 scenarios (c)/(d); peak resident memory 962204 kB (~940 MB) per
 `/usr/bin/time -v`'s "Maximum resident set size", in line with every
 prior rung's own no-leak trajectory). `Cargo.lock` unchanged.
+
+## Appendix — Admin/console residue converted (ADR 0061 rung I, C-09 PR 4, 2026-09-09)
+
+Closes PR 4's own scope — the two named residue tests C-08/rung H's own
+close-out left behind, both blocked purely on the always-on reaper PR 2
+already built. No `sim_cluster.rs`/`admin.rs`/`console.rs`/`dynamo.rs`
+change needed (the same "pure test authorship" shape PR 3 already
+established); no product bug found.
+
+**`sim_cluster_admin.rs`** gains scenario (8),
+`admin_ttl_reports_reaper_progress_and_ttl_tables` — the exact name of
+`tests/admin_endpoint.rs`'s test it replaces (kept as a **separate**
+scenario from (6)'s `ttl_tables_lists_a_ttl_enabled_table`, the rung
+plan's own "whichever reads cleaner" alternative to folding the two
+together — separate keeps (6) the narrower tables-only regression it
+already was and makes (8) a literal, easy-to-audit one-to-one
+conversion). Same steps as the original: `CreateTable` + `UpdateTimeToLive`
+over the wire; a converged poll on every node's own `GET /admin/ttl` for
+the tables-list half plus a captured `leader_tablets` per node (at least
+one node leads none of the table's single tablet on a 3-node, RF-3
+cluster); an already-expired item written through the `POST /admin/data/
+dynamo` admin proxy from a **non-leader** of the table's tablet (this
+rung's own forwarding-path convention); a converged-or-timeout poll across
+every node until SOME node's own `GET /admin/ttl` reports `reaper.
+deleted_total >= 1`, riding the always-on loop the same way the
+real-socket original's `sleep`-based poll did. **No `SimCluster::
+drive_ttl_sweep` needed** — unlike `sim_cluster_ttl.rs` scenario (b),
+nothing here needs an intermediate, pre-cadence state, only "eventually
+reaped". Scenario (6)'s own doc comment is corrected in place: it used to
+say `deleted_total` stays 0 because "the reaper never actually runs under
+`SimEnv`" — no longer true since PR 2 — it now explains that scenario (6)
+simply never writes an expired item, and points to (8) as the one that
+actually exercises a reap.
+
+**`sim_cluster_console_stream.rs`** gains scenario (4),
+`ttl_deletion_carries_the_service_user_identity_through_the_console` —
+the exact name of `tests/console_stream.rs`'s sole test, and that file is
+**deleted whole** (nothing left to trim). Same steps as the original: a
+streamed table (`NEW_AND_OLD_IMAGES`), `UpdateTimeToLive`, an
+already-expired `PutItem` from a non-leader, a bounded
+converged-or-timeout poll (a module-private `poll_until_reaped` — an
+independent copy of `sim_cluster_ttl.rs`'s own private helper of the same
+name/shape, not importable across modules) riding the always-on loop, then
+the console's own `stream/shards` → `stream/iterator` → `stream/records`
+walk (through [`SimCluster::console`], never the raw `DynamoDBStreams_
+20120810.*` wire `sim_cluster_ttl.rs` scenario (i) uses) until the
+TTL-deleted key's REMOVE record appears, asserting `userIdentity ==
+{"PrincipalId": "dynamodb.amazonaws.com", "Type": "Service"}` (ADR 0051
+§7) — the console-side half of the identical regression `sim_cluster_
+ttl.rs` scenario (i) already proves over the raw wire (PR 3).
+
+**Residual inventory, updated**: `tests/admin_endpoint.rs` now carries 9
+tests (was 10 — only the TTL reaper-progress test converted, the other 9
+untouched, none renamed); `tests/console_stream.rs` is **deleted**. TTL's
+own residual group (rung H's "TTL (1/9)" line) now has **zero** tests left
+in `tests/*.rs` anywhere — `dynamo_ttl.rs` is already gone (PR 3) and both
+of this PR's own targets are now gone or empty — confirming ADR 0061's own
+"expected residue after this rung: none" prediction from the opener's
+Tests-unlocked table. Only PR 5 (docs close-out) remains to mark the rung
+closed.
+
+**Known residual outside this PR's own file scope**: `lib.rs:18917`'s doc
+comment on `mod sim_cluster_console_stream;` still says the TTL-identity
+test "stays `ProdEnv`" — stale as of this PR, left uncorrected because
+`lib.rs` was outside this PR's constrained edit allowlist; a follow-up
+already touching `lib.rs` (PR 5, or any later change) should fix it in
+passing.
+
+**Gates, run and green** (in the main tree, after rebasing onto PR 3's
+final tip): `cargo build -p animusd --tests` clean; `cargo fmt --all`
+clean (one line-width wrap in `sim_cluster_console_stream.rs`, no logic
+change); `cargo clippy -p animusd --all-targets --all-features -- -D
+warnings` clean; `cargo test -p animusd --lib sim_cluster_admin --
+--test-threads=2` (32 passed, 0 failed); `cargo test -p animusd --lib
+sim_cluster_console_stream -- --test-threads=2` (8 passed, 0 failed);
+`cargo test -p animusd --test admin_endpoint` (**9 passed**, 0 failed —
+`console_stream.rs` has no binary left to run); `cargo test -p animusd
+--lib sim_cluster -- --test-threads=2` (**424 passed, 0 failed, 2
+ignored**, 1120.26s test time — PR 3's own 420 plus this PR's 4 new
+`#[test]` functions: 2 new scenarios × 2 each, pinned + `_over_seeds`;
+peak resident memory 977644 kB (~955 MB) per `/usr/bin/time -v`'s
+"Maximum resident set size", in line with every prior rung's own no-leak
+trajectory). `Cargo.lock` untouched by this PR.
+
+See ADR 0061's "Rung I, PR 4" amendment and `docs/roadmap.md`'s C-09 entry
+for the full record.

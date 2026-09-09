@@ -7147,3 +7147,98 @@ every prior rung's own no-leak trajectory). `Cargo.lock` unchanged.
 
 See `crates/animusd/CLAUDE.md`'s matching "C-09 PR 3" appendix and
 `docs/roadmap.md`'s C-09 entry for the crate-level pointer and status.
+
+## 2026-09-09 amendment — Rung I, PR 4 (admin/console residue)
+
+PR 4's own scope — this rung's plan's own "reaper-progress half" and
+"console residue" items — landed, no product bug found, no `sim_cluster.rs`/
+`admin.rs`/`console.rs`/`dynamo.rs` change needed (the same "pure test
+authorship" shape PR 3 already established).
+
+**`sim_cluster_admin.rs`** gains a new scenario (8),
+`admin_ttl_reports_reaper_progress_and_ttl_tables` — the exact name of the
+real-socket original it replaces, per this rung's own plan text ("delete
+`admin_endpoint.rs::admin_ttl_reports_reaper_progress_and_ttl_tables`"),
+rather than folding its reaper-progress half into scenario (6)'s
+`ttl_tables_lists_a_ttl_enabled_table` (the plan's own "whichever reads
+cleaner" alternative) — keeping them separate means scenario (6) stays the
+narrower "tables projection only" regression it already was, and scenario
+(8) is the literal one-to-one conversion, easier to audit against its
+real-socket original line for line. Same shape as that original: `Create
+Table` + `UpdateTimeToLive` over the wire, a converged poll on every
+node's own `GET /admin/ttl` for the tables-list half plus a captured
+`leader_tablets` per node (at least one node leads none of the table's
+single tablet on a 3-node, RF-3 cluster — the same assertion the original
+made), an already-expired item written through the `POST /admin/data/
+dynamo` admin proxy from a **non-leader** of the table's tablet (this
+rung's own forwarding-path convention), then a converged-or-timeout poll
+across every node until SOME node's own `GET /admin/ttl` reports `reaper.
+deleted_total >= 1` — riding the always-on loop exactly the way the
+real-socket original's `sleep`-based poll rode out its own fast interval.
+**No `SimCluster::drive_ttl_sweep` needed**: unlike `sim_cluster_ttl.rs`'s
+own scenario (b), nothing here depends on an intermediate, pre-cadence
+state — only "eventually reaped" — so the plan's own caution about
+`OP_BUDGET` vs. the 200ms sweep interval doesn't bite the way it did for
+`dynamo_ttl.rs`'s kept residual (PR 3's own finding). Scenario (6)'s own
+doc comment is corrected in place: it used to say `deleted_total` stays 0
+because "the reaper never actually runs under `SimEnv`" — no longer true
+since PR 2 — it now says so because that scenario simply never writes an
+expired item, pointing to scenario (8) as the one that actually exercises
+a reap.
+
+**`sim_cluster_console_stream.rs`** gains a new scenario (4),
+`ttl_deletion_carries_the_service_user_identity_through_the_console` — the
+exact name of `tests/console_stream.rs`'s sole remaining test, which is
+deleted whole (it was the file's only test — nothing left to trim). Same
+shape as the original: a streamed table with `NEW_AND_OLD_IMAGES`,
+`UpdateTimeToLive`, an already-expired `PutItem` from a non-leader, a
+bounded converged-or-timeout poll (a module-private `poll_until_reaped`,
+an independent copy of `sim_cluster_ttl.rs`'s own private helper of the
+same name and shape — not importable across modules) riding the always-on
+loop, then the console's own `stream/shards` → `stream/iterator` →
+`stream/records` walk (through [`SimCluster::console`], never the raw
+`DynamoDBStreams_20120810.*` wire `sim_cluster_ttl.rs`'s own scenario (i)
+uses) until the REMOVE record for the TTL-deleted key appears, asserting
+its `userIdentity` is `{"PrincipalId": "dynamodb.amazonaws.com", "Type":
+"Service"}` (ADR 0051 §7) — the console-side half of the identical
+regression `sim_cluster_ttl.rs`'s scenario (i) already proves over the raw
+wire (PR 3).
+
+**Residual inventory, updated**: `tests/admin_endpoint.rs` now carries 9
+tests (down from 10 — the TTL reaper-progress test converted, the other 9
+untouched); `tests/console_stream.rs` is **deleted** (its sole remaining
+test converted, nothing left to keep `ProdEnv` for) — TTL's own residual
+group (ADR 0061 rung H's "TTL (1/9)" line) now has **zero** tests left in
+`tests/*.rs` anywhere: `dynamo_ttl.rs` is already deleted (PR 3, one
+residual test moved into it from nowhere — see that PR's own note), and
+both of this PR's own targets are now gone or trimmed to nothing. This
+rung reaches ADR 0061's own "expected residue after this rung: none"
+prediction (the opener's own Tests-unlocked table) — the first clean
+sweep in the whole F-through-I sequence, confirmed rather than assumed.
+
+**Gates**: not run in this session — this PR's own working constraints
+route compilation and test execution through the main tree, not this
+worktree (`/home/user/wt-ttl4`). Remain to confirm there, in order: the
+untrimmed `cargo test -p animusd --test admin_endpoint`/`--test
+console_stream` (10 and 1 passed respectively) before this PR's edits;
+after: `cargo test -p animusd --lib sim_cluster_admin`/`sim_cluster_
+console_stream -- --test-threads=2`; the trimmed `cargo test -p animusd
+--test admin_endpoint` (expected: 9 passed) with `console_stream.rs`
+deleted (no binary to run at all); `cargo test -p animusd --lib
+sim_cluster -- --test-threads=2` (expected 428 — PR 3's own 424 plus this
+PR's 4 new `#[test]` functions: 2 new scenarios × 2 each, pinned +
+`_over_seeds`); `cargo fmt --all --check`; `cargo clippy -p animusd
+--all-targets --all-features -- -D warnings`. `Cargo.lock` untouched by
+this PR.
+
+**Known residual outside this PR's own file allowlist**: `crates/animusd/
+src/lib.rs:18917`'s own doc comment on `mod sim_cluster_console_stream;`
+still says the TTL-identity test "stays `ProdEnv`" — now stale, since PR 4
+converts it — left uncorrected here because `lib.rs` is outside this PR's
+constrained edit scope (`sim_cluster_admin.rs`/`sim_cluster_console_
+stream.rs`/`admin_endpoint.rs`/`console_stream.rs`/docs only); a follow-up
+touching `lib.rs` (this rung's own PR 5 close-out, or any later change
+that already needs to touch that file) should fix it in passing.
+
+See `crates/animusd/CLAUDE.md`'s matching "C-09 PR 4" appendix and
+`docs/roadmap.md`'s C-09 entry for the crate-level pointer and status.

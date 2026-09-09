@@ -953,7 +953,7 @@ the still-true paragraph after the table.
   already generic.
 - **Depends:** C-08 (closed) — this rung is C-08's own close-out
   recommendation, stacked directly on it.
-- **Status (2026-09-08):** open — PR 1 (docs opener), PR 2 (groundwork:
+- **Status (2026-09-09):** open — PR 1 (docs opener), PR 2 (groundwork:
   `TtlReaperProgressHost`/the `ttl_reaper.rs` wrapper widened to `<E: Env,
   R: RelayClient>`, `SimCluster`'s always-on per-node reaper spawn at a
   200ms sim interval, `SimCluster::drive_ttl_sweep`, and the first
@@ -966,10 +966,17 @@ the still-true paragraph after the table.
   mismatched_attribute_name_is_rejected` (both need `DescribeTimeToLive`,
   which has no arm in `dynamo::dispatch_item_op` yet — a
   `crates/animusd/src/dynamo.rs` gap outside this PR's edit scope, not a
-  scenario-design defect) landed, 420 `sim_cluster` tests green; PRs 4–5
-  (admin/console residue, docs close-out) to follow. See ADR 0061's "Rung
-  I, PR 3" amendment and `crates/animusd/CLAUDE.md`'s matching appendix
-  for the full record.
+  scenario-design defect) landed, 420 `sim_cluster` tests green, and PR 4
+  (admin/console residue: `sim_cluster_admin.rs::admin_ttl_reports_reaper_
+  progress_and_ttl_tables` and `sim_cluster_console_stream.rs::ttl_
+  deletion_carries_the_service_user_identity_through_the_console`,
+  replacing their real-socket originals — `tests/admin_endpoint.rs` down
+  to 9 tests, `tests/console_stream.rs` deleted whole) landed; PR 5 (docs
+  close-out) to follow. This rung's own `Tests unlocked` table predicted
+  **zero** residue after this rung — PR 4 confirms it: nothing TTL-related
+  is left in `tests/*.rs`. See ADR 0061's "Rung I, PR 3" and "Rung I, PR 4"
+  amendments and `crates/animusd/CLAUDE.md`'s matching appendices for the
+  full record.
 
 ---
 
