@@ -7,14 +7,17 @@
 //! `SimCluster`'s own `pub(crate)` surface (`set_throttle_defaults`,
 //! `put`/`get`), no further visibility widened.
 //!
-//! `SimCluster`'s every node runs with `data: None` (see its own module
-//! doc's "What is still `ProdEnv`-only" bullet) — `ThrottledWrites`/
-//! `ThrottledReads` therefore never increment here (the metric-recording
-//! sites all gate on `self.data.as_ref()`), which is a deliberate, harmless
-//! gap for this fixture: the metric itself has no `SimEnv` coverage need
-//! beyond what this file proves about the bucket it counts refusals from.
-//! The real-thread `tests/dynamo_throttling.rs` asserts the metric's own
-//! value.
+//! `SimCluster`'s every node carries a real `DataRole` (ADR 0061 rung D2
+//! PR 1), with its own per-node `MetricsHandle` sink — `ThrottledWrites`/
+//! `ThrottledReads` **do** increment here today on every refusal this
+//! file's writes/reads trigger, the identical `ctx.data().raftkv_
+//! metrics.incr(..)`/`data.raftkv_metrics.incr(..)` call the real
+//! `ProdEnv` wire runs. This file's own scenarios still assert on the
+//! bucket's admit/refuse/recover behavior directly, not the counter — ADR
+//! 0061 rung K (post-C-10) is what adds the counter-asserting coverage,
+//! into the DynamoDB-wire-level `sim_cluster_dynamo_throttle.rs`/
+//! `sim_cluster_admin.rs`, not here; see that rung's opener amendment for
+//! the full account.
 
 use std::time::Duration;
 

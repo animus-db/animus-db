@@ -6590,10 +6590,12 @@ converted from `console_table_config.rs`, file trimmed to its 1 out-of-scope
 PITR test; docs close-out — see `docs/roadmap.md`'s C-10 entry and this
 file's own "index DDL beyond plain `CreateTable` under SimCluster" appendix
 below for the grep-verified ground truth and the full per-PR record);
-the control/data role split, `--config` bring-up, node assembly, and the
-throttle-metric counters are unowned
-by any planned rung as of this close (the throttle-metric counters are the
-smallest of the four and the recommended next rung, queued as C-11); (E) frozen behind an open flake
+the control/data role split, `--config` bring-up, and node assembly are
+unowned by any planned rung as of this close; the throttle-metric counters
+are **opened** by C-11/ADR 0061 rung K as of 2026-09-09 (PR 1, docs
+opener — see `docs/roadmap.md`'s C-11 entry and ADR 0061's "Rung K
+(post-C-10)" opener amendment for the grep-verified ground truth and the
+per-PR plan; PRs 2-4 still pending); (E) frozen behind an open flake
 issue, 7 files/32 tests (#298, #418, #592, #601, #610, #619/#622, #627) —
 out of scope for C-04, tracked by their own issues.
 
