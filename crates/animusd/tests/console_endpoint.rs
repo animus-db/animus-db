@@ -19,19 +19,34 @@
 //! port-TOCTOU bounded retry (`support::bring_up_split`/`support::
 //! start_single_node`) rather than a fixed-port config.
 //!
-//! **ADR 0061 rung H, C-08 PR 3**: every test in this file stays `ProdEnv` —
-//! each is fundamentally about real HTTP framing (status line, headers,
-//! content-type, static-asset bytes) or a genuine process role split,
-//! neither of which `SimCluster::console` can reproduce (it builds a bare
-//! `HttpRequest` with no framing at all, and has no node-role concept). The
-//! first test's own tail (`GET /console/api/tables` on a freshly-booted
-//! node returns an empty array; an unrecognized path 404s) is genuinely
-//! JSON-routing, not framing — that slice now has its own sibling,
-//! `sim_cluster_console.rs::console_error_mapping_and_json_routing_
-//! assertions`, extended with the console's error-mapping contract
-//! (missing table -> 404, malformed body -> 400) — but the rest of this
-//! test (the shell/static-asset/deep-link assertions) keeps this whole
-//! test on `ProdEnv`, so nothing was removed from this file.
+//! **ADR 0061 rung H, C-08 PR 3**: every test in this file stayed `ProdEnv`
+//! at the time — each is fundamentally about real HTTP framing (status
+//! line, headers, content-type, static-asset bytes) or a genuine process
+//! role split, neither of which `SimCluster::console` can reproduce (it
+//! builds a bare `HttpRequest` with no framing at all). The first test's
+//! own tail (`GET /console/api/tables` on a freshly-booted node returns an
+//! empty array; an unrecognized path 404s) is genuinely JSON-routing, not
+//! framing — that slice now has its own sibling, `sim_cluster_console.rs::
+//! console_error_mapping_and_json_routing_assertions`, extended with the
+//! console's error-mapping contract (missing table -> 404, malformed body
+//! -> 400) — but the rest of that test (the shell/static-asset/deep-link
+//! assertions) keeps it whole on `ProdEnv`.
+//!
+//! **ADR 0061 rung L, C-12 PR 4c**: `SimCluster` gained per-node `NodeRole`
+//! in C-12 PRs 2/3 — the "has no node-role concept" half of PR 3's own
+//! reasoning above no longer holds. Both of this file's remaining two
+//! tests now have deterministic siblings in `sim_cluster_console.rs`
+//! (`console_reachable_on_a_data_only_node`/`console_dispatch_from_a_
+//! control_only_node_forwards_to_the_data_node`) proving the underlying,
+//! role-driven `ClientCtx`/dispatch behavior — but **both stay whole,
+//! real-socket, here too**: each test's own defining assertion is a
+//! genuine `Node`-level listener-binding/HTTP-framing fact (the console
+//! port is bound at all on a data-only node; `Node::console_addr()`
+//! panics with "this node has no data role" on a control-only node) that
+//! `SimCluster` cannot reproduce regardless of role support — it has no
+//! `Node` struct and binds no real listener for any role. See each test's
+//! own doc comment, and the sim module's own "PR 4c" doc section, for the
+//! exact classification.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -167,8 +182,14 @@ async fn console_serves_shell_assets_and_deep_links_on_combined_node() {
 /// CP-data tablets, the console's subject matter) — verified against a
 /// genuine split deployment, not assumed from the combined-node case above.
 ///
-/// **KEPT `ProdEnv`** (ADR 0061 rung H, C-08 PR 3): a genuine control-only/
-/// data-only process split — `SimCluster` has no node-role concept at all.
+/// **KEPT `ProdEnv`** (ADR 0061 rung L, C-12 PR 4c): the literal listener-
+/// binding/HTTP-framing proof (a real port is bound, `GET /` 200s as
+/// `text/html`) is a `Node`-level fact `SimCluster` cannot reproduce — it
+/// binds no real listener for any role. The underlying JSON-dispatch half
+/// — the console backend genuinely answers real, converged cluster state
+/// once driven from a data-only node's own `ClientCtx` — now has a
+/// deterministic sibling: `sim_cluster_console.rs::
+/// console_reachable_on_a_data_only_node`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn console_serves_shell_on_data_only_node() {
     timeout(Duration::from_secs(60), async {
@@ -210,9 +231,20 @@ async fn console_serves_shell_on_data_only_node() {
 /// listener at all — `Node::console_addr()` panics there, the identical
 /// contract `dynamo_addr()` already carries for the same shape.
 ///
-/// **KEPT `ProdEnv`** (ADR 0061 rung H, C-08 PR 3): the identical
-/// control-only/data-only process-split reason as
-/// `console_serves_shell_on_data_only_node` above.
+/// **KEPT `ProdEnv`** (ADR 0061 rung L, C-12 PR 4c): this assertion is
+/// purely a `Node`-level listener-binding fact (`self.data.as_ref().
+/// expect(..)` on a plain `Option<SocketAddr>` field) — it has nothing to
+/// do with `ClientCtx`/`DataRole` and no `SimCluster` analog exists for
+/// it, since the fixture has no `Node` struct and binds no real listener
+/// for any role (unaffected by `SimCluster` gaining per-node `NodeRole` in
+/// C-12 PRs 2/3). What DOES carry over — the underlying invariant this
+/// panic exists to enforce, that a control-only node structurally has no
+/// data role, plus a genuine, stronger-than-expected live consequence (a
+/// console item mutation dispatched directly against that node's own
+/// `ClientCtx` panics too, deep inside `ClientCtx::data()` — a real
+/// finding, not a product bug, see that sibling's own doc comment) — is
+/// proven by `sim_cluster_console.rs::
+/// console_item_write_from_a_control_only_node_panics`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[should_panic(expected = "this node has no data role")]
 async fn console_addr_panics_on_control_only_node() {

@@ -19,6 +19,10 @@ path = "src/main.rs"
 animusd.workspace = true
 tokio.workspace = true
 serde_json.workspace = true
+# Bounded-concurrency fan-out for `seed`'s `BatchWriteItem` chunks
+# (`buffer_unordered`) — the same idiom `animusd::admin`'s own seeder used
+# before this command replaced it (ADR 0021 amendment).
+futures.workspace = true
 # TLS on the client-protocol and admin dials (ADR 0064, S-01 commit 2):
 # `--tls-ca PATH` verifies the node this CLI talks to (server-only TLS on
 # both ports it speaks — this CLI never presents a client certificate of

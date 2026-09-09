@@ -79,13 +79,14 @@ use animus_node::host::RelayClient;
 use animus_storage::{StorageError, WalRecordView};
 use animus_tablet::{TOKEN_BYTES, TabletId};
 use async_trait::async_trait;
-use futures::TryStreamExt;
+use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tracing::Instrument;
 
+use crate::authz;
 use crate::http;
 use crate::{AdminInfo, ClientCtx, ClientResponse};
 
@@ -2743,48 +2744,38 @@ async fn action_drop_table<E: Env, R: RelayClient>(
 const SEED_MAX_PER_REQUEST: u64 = 200_000;
 /// Cap on a synthetic value's size.
 const SEED_MAX_VALUE_BYTES: usize = 1 << 20;
-/// Keys committed as **one `KindBatch` Raft entry per tablet** (ADR 0049 —
-/// `dynamo::marker_batch_write` groups a chunk by tablet): a seed chunk of
-/// this many keys is proposed as a single consensus round per tablet instead
-/// of one round per key, the bulk-seed throughput win. (An images-carrying
-/// table's seed instead routes per item through the evaluate-at-leader
-/// funnel, pipelined up to [`SEED_IMAGES_CONCURRENCY`] rows in flight at
-/// once — see that constant's own doc for why this is still correctness
-/// over the marker arm's per-tablet-entry throughput, not a second version
-/// of it.)
-const SEED_BATCH_SIZE: u64 = 500;
-/// Cap on a seed batch's **raw entry bytes** (keys + values). `SEED_BATCH_SIZE`
-/// alone lets a large-`value_bytes` seed build a 500 × 1 MiB batch, whose
-/// cross-process forwarding frame (`ClientRequest::KindWrite`, JSON at ≤ 4 chars
-/// per byte) would blow past the client protocol's [`crate::MAX_FRAME_LEN`].
-/// Bounding the batch by bytes keeps the largest legitimate frame well under the
-/// cap (~4 MiB raw → ~17 MiB JSON); default-sized (64 B) seeds still batch the
-/// full 500 keys.
-const SEED_BATCH_MAX_BYTES: usize = 4 << 20;
-/// Whole-chunk attempts, to absorb transient failures while a tablet is
-/// **splitting** (writes racing the split point are truncated/tombstoned and
-/// re-route to the new child on retry — re-proposing is value-idempotent by
-/// per-key LWW; a duplicate *marker* record is harmless by design). Each
-/// attempt is bounded by the data path's own `CLIENT_TIMEOUT`.
-const SEED_WRITE_ATTEMPTS: usize = 4;
-/// Backoff between seed write attempts — long enough for a freshly-split child
-/// group to elect a leader / the tablet map to settle.
-const SEED_RETRY_BACKOFF: Duration = Duration::from_millis(150);
-/// Bound on in-flight `cp_kind_write_item` calls for an images-carrying
-/// table's seed chunk (the per-item evaluate-at-leader arm below). Each such
-/// write is dominated by *waiting*, not CPU — the confirm-poll round-up
-/// (`write_path::cp_kind_eval_local`'s exponential back-off), the forward hop
-/// to the tablet leader when the seeder isn't running on it, and one fsync —
-/// measured at ~5-7ms/row on a healthy local cluster, so a strictly
-/// sequential loop caps throughput at roughly `1000 / 7 ≈ 140` keys/s
-/// regardless of how fast the leader's own Raft group can actually commit.
-/// 32 is enough concurrency to overlap that per-row wait many times over
-/// (a fully-utilized leader should be issuing/confirming dozens of writes
-/// within one row's own round-trip latency) while keeping the leader's
-/// in-flight write set small relative to `SEED_BATCH_SIZE` — comfortably
-/// below the kind of fan-out that would itself start queueing at the
-/// leader's own apply task or its network stack.
-const SEED_IMAGES_CONCURRENCY: usize = 32;
+/// DynamoDB's own per-call cap on a `BatchWriteItem` request's items — the
+/// unit this route batches at (ADR 0021 amendment, 2026-09-09): seeding now
+/// rides the same real `BatchWriteItem` wire operation a client would call
+/// (`crate::dynamo::execute_routed_as_generic`, the identical generic
+/// dispatcher [`action_data_dynamo`]/`GenericAdminHost` use for `POST
+/// /admin/data/dynamo`), so it inherits the wire operation's own item cap
+/// rather than the old internal marker-batch arm's own tuned
+/// `SEED_BATCH_SIZE`/`SEED_BATCH_MAX_BYTES` constants (now deleted — see
+/// `docs/adr/0021-web-dashboard.md`'s matching amendment for why a
+/// server-side seeder duplicating `PutItem`'s own byte shapes was the wrong
+/// design in the first place, and `crates/animus-cli/CLAUDE.md`'s `seed`
+/// entry for the client-side tool this route now mirrors byte-for-byte).
+const SEED_BATCH_WRITE_CAP: u64 = 25;
+/// Bound on in-flight `BatchWriteItem` chunks — mirrors `animus-cli seed`'s
+/// own `--concurrency` default (see that command's own doc for why: each
+/// chunk is dominated by *waiting* on the tablet leader's confirm loop, not
+/// CPU, so several chunks in flight at once overlaps that latency instead
+/// of paying it once per chunk sequentially).
+const SEED_CONCURRENCY: usize = 8;
+/// Bounded whole-chunk retry attempts for a chunk's own `UnprocessedItems`
+/// (ADR 0065 §6 throttling, or a transient tablet-split refusal) before
+/// giving up and reporting the remainder unwritten — the real wire
+/// operation's own `UnprocessedItems` contract replaces the old seeder's
+/// silent-drop behavior with something a caller can actually act on.
+const SEED_MAX_RETRY_ATTEMPTS: usize = 6;
+/// Backoff before a chunk's first retry; doubled (capped) each further
+/// attempt. Clocked on `ctx.env.sleep` (never `tokio::time::sleep`), since
+/// this route is `<E: Env, R: RelayClient>`-generic and reachable under
+/// `SimEnv` (`SimCluster::admin`, via `GenericAdminHost`).
+const SEED_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(200);
+/// Ceiling on the doubling backoff between retry attempts.
+const SEED_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(5);
 
 #[derive(Deserialize)]
 struct SeedReq {
@@ -2798,7 +2789,7 @@ struct SeedReq {
     /// like any edge write (ADR 0022), so sequential indices still spread evenly
     /// across the table's hash ring. Ignored when the table declares a
     /// Number-typed partition key (the value must stay numeric — see
-    /// [`seed_key_attr`]).
+    /// [`seed_attr_value`]).
     #[serde(default)]
     key_prefix: Option<String>,
     /// Approximate serialized size of each seeded item in bytes (default 64),
@@ -2821,8 +2812,10 @@ struct SeedReq {
 /// not be numeric); `Binary` gets the prefixed text's bytes; everything else —
 /// including types that are not valid DynamoDB keys (`Bool`/`Uuid`) — falls
 /// back to a string, mirroring `animus_dynamo::schema::column_type_for`'s
-/// permissive default.
-fn seed_key_attr(ty: ColumnType, prefix: &str, index_text: &str) -> AttributeValue {
+/// permissive default. The exact typing convention `animus-cli seed`'s own
+/// `seed_attr_value` mirrors client-side, so a row this route seeds and a row
+/// the CLI seeds are byte-identical for the same `(table, index)`.
+fn seed_attr_value(ty: ColumnType, prefix: &str, index_text: &str) -> AttributeValue {
     match ty {
         ColumnType::Number | ColumnType::Int | ColumnType::BigInt => {
             AttributeValue::N(index_text.to_string())
@@ -2832,27 +2825,121 @@ fn seed_key_attr(ty: ColumnType, prefix: &str, index_text: &str) -> AttributeVal
     }
 }
 
+/// Split `count` rows starting at `start` into `(chunk_start, chunk_len)`
+/// pairs of at most `batch` rows each — pure so the boundary math (a shorter
+/// last chunk, zero chunks for `count == 0`) is unit-testable without a
+/// cluster. Mirrors `animus-cli`'s own `seed_chunk_bounds` (deliberately not
+/// shared across the crate boundary — see this route's own doc).
+fn seed_chunk_bounds(start: u64, count: u64, batch: u64) -> Vec<(u64, u64)> {
+    let mut chunks = Vec::new();
+    let mut i = 0u64;
+    while i < count {
+        let len = batch.min(count - i);
+        chunks.push((start + i, len));
+        i += len;
+    }
+    chunks
+}
+
+/// Recover the `PutRequest.Item` values a `BatchWriteItem` response's own
+/// `UnprocessedItems.<table>` array names for `table` — the rows a chunk
+/// needs to retry (ADR 0065 §6: a throttled or transiently-refused row is
+/// echoed here, never silently dropped, unlike the deleted internal seeder
+/// arms which had no such contract to report through at all).
+fn seed_unprocessed_items(response: &Value, table: &str) -> Vec<Item> {
+    response
+        .get("UnprocessedItems")
+        .and_then(|v| v.get(table))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|req| req.get("PutRequest")?.get("Item")?.as_object())
+        .filter_map(|obj| animus_dynamo::wire::decode_item(obj).ok())
+        .collect()
+}
+
+/// Submit one `BatchWriteItem` chunk through the **same generic dispatcher**
+/// `POST /admin/data/dynamo` itself uses
+/// (`crate::dynamo::execute_routed_as_generic`, `Principal::unrestricted()`
+/// — this route has always been an unauthenticated internal proxy, ADR
+/// 0020's trusted-operator-network posture, so there is no caller identity
+/// to scope a policy to), retrying its own `UnprocessedItems` with a
+/// bounded exponential backoff. `<E: Env, R: RelayClient>` so `SimCluster`
+/// covers this route too (`GenericAdminHost`). Returns `(written,
+/// unprocessed, first_error)` — `unprocessed` is nonzero only once every
+/// retry attempt is exhausted.
+async fn submit_seed_chunk<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+    table: &str,
+    mut items: Vec<Item>,
+) -> (u64, u64, Option<String>) {
+    let total = items.len() as u64;
+    let mut backoff = SEED_RETRY_INITIAL_BACKOFF;
+    let mut last_error = None;
+    for attempt in 0..SEED_MAX_RETRY_ATTEMPTS {
+        if items.is_empty() {
+            return (total, 0, None);
+        }
+        if attempt > 0 {
+            ctx.env.sleep(backoff).await;
+            backoff = (backoff * 2).min(SEED_RETRY_MAX_BACKOFF);
+        }
+        let requests: Vec<Value> = items
+            .iter()
+            .map(|item| json!({"PutRequest": {"Item": animus_dynamo::wire::encode_item(item)}}))
+            .collect();
+        let payload = json!({"RequestItems": {table: requests}});
+        let body = serde_json::to_vec(&payload).unwrap_or_default();
+        let (status, resp) = crate::dynamo::execute_routed_as_generic(
+            ctx,
+            &authz::Principal::unrestricted(),
+            "DynamoDB_20120810.BatchWriteItem",
+            &body,
+        )
+        .await;
+        if (200..300).contains(&status) {
+            let resp_json: Value = serde_json::from_str(&resp).unwrap_or(Value::Null);
+            let remaining = seed_unprocessed_items(&resp_json, table);
+            if remaining.is_empty() {
+                return (total, 0, None);
+            }
+            items = remaining;
+        } else {
+            last_error = Some(format!("BatchWriteItem failed (HTTP {status}): {resp}"));
+        }
+    }
+    let remaining = items.len() as u64;
+    (total - remaining, remaining, last_error)
+}
+
 /// `POST /admin/data/seed {table, count, start?, key_prefix?, value_bytes?}` —
 /// bulk-write synthetic **DynamoDB items** to the CP plane to drive sharding
 /// tests (ADR 0021). `table` is **required** and must **already exist** (ADR
 /// 0023: seeding writes into a table, it does not create one — a non-existent
-/// table is a `404`). Each row is a real item — the exact key
-/// ([`crate::dynamo::item_key`]) and value
-/// ([`animus_dynamo::wire::encode_stored_item`]'s envelope) bytes `PutItem`
-/// would store — so seeded data reads back through the DynamoDB
-/// edge's `GetItem`/`Query`/`Scan`, not just the raw storage views. The key
-/// attributes come from the table's replicated catalog schema (ADR 0013):
-/// partition key `key_prefix + zero-padded (start..start+count)` (typed per the
-/// declared column, [`seed_key_attr`]), plus the sort key (same index) when the
-/// table is composite; a table with no catalog schema follows the legacy
-/// hash-only `pk` convention. A filler `payload` attribute pads each item to
-/// ~`value_bytes`. Writes go through the ADR 0049 kind-write path (routed to
-/// the leader) exactly like the DynamoDB edge's own: per-tablet single-entry
-/// marker batches for a plain table, the per-item evaluate-at-leader funnel
-/// for an images-carrying (streamed/GSI'd) one — so a seeded row is
-/// observable on the table's change log/stream like any client write. With
-/// `--auto-split-bytes` enabled, crossing the split threshold splits the
-/// tablet — visible live in the Tablets view.
+/// table is a `404`). Each row is a real item — the exact key/value shape
+/// `animus-cli seed`'s own client-side generator produces — so seeded data
+/// reads back through the DynamoDB edge's `GetItem`/`Query`/`Scan`, not just
+/// the raw storage views. The key attributes come from the table's replicated
+/// catalog schema (ADR 0013): partition key `key_prefix + zero-padded
+/// (start..start+count)` (typed per the declared column, [`seed_attr_value`]),
+/// plus the sort key (same index) when the table is composite; a table with
+/// no catalog schema follows the legacy hash-only `pk` convention. A filler
+/// `payload` attribute pads each item to ~`value_bytes`.
+///
+/// **This is a thin proxy over the real `BatchWriteItem` wire operation
+/// (ADR 0021 amendment, 2026-09-09)** — the same operation, and the same
+/// generic dispatcher, `POST /admin/data/dynamo` itself uses: every seeded
+/// row is chunked at DynamoDB's own [`SEED_BATCH_WRITE_CAP`]-item
+/// `BatchWriteItem` cap, issued with up to [`SEED_CONCURRENCY`] chunks in
+/// flight, retrying a chunk's own `UnprocessedItems` ([`submit_seed_chunk`])
+/// rather than silently dropping a throttled or transiently-refused row —
+/// closing the drift hazard (re-deriving `PutItem`'s exact byte shapes by
+/// hand) and the throttling-fidelity gap the old internal marker-batch/
+/// per-item-funnel seeder arms both had. See `docs/adr/0021-web-dashboard.md`'s
+/// matching amendment and `crates/animus-cli/CLAUDE.md`'s `seed` entry for
+/// the full account, including why a server-side route still exists at all
+/// (the dashboard's own bulk-seed form has no way to shell out to a
+/// separate process).
 async fn action_data_seed<E: Env, R: RelayClient>(
     ctx: &ClientCtx<E, R>,
     body: &[u8],
@@ -2900,193 +2987,96 @@ async fn action_data_seed<E: Env, R: RelayClient>(
         }
         None => ("pk".to_string(), ColumnType::String, None),
     };
-    // One seeded row: the exact item (and pk/sk attributes) the DynamoDB
-    // edge's `PutItem` would store. The filler `payload` attribute pads the
-    // serialized item toward `value_bytes` (skipped in the corner case
-    // where the schema claims that name for a key attribute).
-    type SeedRow = (AttributeValue, Option<AttributeValue>, Item);
-    let seed_row = |index: u64, fill: usize| -> SeedRow {
+    // One seeded row: the exact item the DynamoDB edge's `PutItem` would
+    // store, built the identical way `animus-cli seed` builds it
+    // client-side. The filler `payload` attribute pads the serialized item
+    // toward `value_bytes` (skipped in the corner case where the schema
+    // claims that name for a key attribute).
+    let seed_row = |index: u64, fill: usize| -> Item {
         let index_text = format!("{index:012}");
-        let pk = seed_key_attr(pk_ty, &prefix, &index_text);
-        let sk = sort
-            .as_ref()
-            .map(|(_, ty)| seed_key_attr(*ty, "", &index_text));
         let mut item = Item::new();
-        item.insert(pk_name.clone(), pk.clone());
-        if let (Some((sk_name, _)), Some(sk_val)) = (&sort, &sk) {
-            item.insert(sk_name.clone(), sk_val.clone());
+        item.insert(
+            pk_name.clone(),
+            seed_attr_value(pk_ty, &prefix, &index_text),
+        );
+        if let Some((sk_name, sk_ty)) = &sort {
+            item.insert(sk_name.clone(), seed_attr_value(*sk_ty, "", &index_text));
         }
         item.entry("payload".to_string())
             .or_insert_with(|| AttributeValue::S("x".repeat(fill)));
-        (pk, sk, item)
+        item
     };
     // Every row serializes to the same length (the index is fixed-width), so
-    // measure the zero-filler envelope once and derive the padding that lands
-    // the item at ~`value_bytes` (floored at the unpadded item).
-    let envelope = animus_dynamo::wire::encode_stored_item(&seed_row(req.start, 0).2).len();
+    // measure the zero-filler envelope once — via the real wire item
+    // encoding, the same JSON a `BatchWriteItem` request actually carries —
+    // and derive the padding that lands the item at ~`value_bytes` (floored
+    // at the unpadded item).
+    let envelope =
+        serde_json::to_string(&animus_dynamo::wire::encode_item(&seed_row(req.start, 0)))
+            .unwrap_or_default()
+            .len();
     let fill = value_bytes.saturating_sub(envelope);
     let row_bytes = envelope + fill;
 
-    // ADR 0027: the seeder emulates a client issuing many `PutBatch` requests,
-    // but calls `cp_batch_write` directly rather than going through
-    // `handle_connection` — so without a span here, `cp_forward`'s
-    // `otel::current_traceparent()` has no active context to inject when a
-    // batch forwards to another node, and the seed is invisible in a trace
-    // backend no matter how much data it writes. One root span per request
-    // (not per batch) mirrors a `client_request` span's granularity.
+    // ADR 0027: the seeder emulates a client issuing many `BatchWriteItem`
+    // requests — one root span per request (not per chunk) mirrors a
+    // `client_request` span's granularity.
     let span = tracing::info_span!("admin_seed", table = %table, count, start = req.start);
-    let seed_result: (u64, Option<String>) = async {
-        let mut written = 0u64;
-        let mut first_err: Option<String> = None;
-        let mut i = 0u64;
-        // Bound each batch by entry count *and* raw bytes (see `SEED_BATCH_MAX_BYTES`:
-        // the forwarded `KindWrite` frame must stay under `MAX_FRAME_LEN`). ~192 B
-        // of overhead per entry: token + escaped pk on the base key, plus the
-        // ADR 0049 marker record's own `(prefix, record)` pair riding the same
-        // entry (a marker is a fixed few tens of bytes — image-less by
-        // definition); at least one entry per batch.
-        let per_entry = row_bytes + 192;
-        let max_by_bytes = (SEED_BATCH_MAX_BYTES / per_entry).max(1) as u64;
-        while i < count {
-            let chunk = (count - i).min(SEED_BATCH_SIZE).min(max_by_bytes);
-            let rows: Vec<_> = (0..chunk)
-                .map(|j| seed_row(req.start + i + j, fill))
-                .collect();
-            // One child span per chunk (covering all its retry attempts) — gives a
-            // trace backend per-batch visibility into forwarding/retries, the same
-            // way a real client's individual write requests would.
-            let batch_span =
-                tracing::info_span!("admin_seed_batch", start_index = req.start + i, len = chunk);
-            // **The seeder writes through the same ADR 0049 kind-write path as
-            // the DynamoDB edge itself** (Train A rung 4's entry-point
-            // completeness): before it, seeded rows went through the plain
-            // `cp_batch_write` — no change record at all, which on a
-            // *streamed* table silently lost every seeded row from its stream
-            // (the same drifted-gate class as `BatchWriteItem`'s own
-            // streamed-but-unindexed bug), and on a plain table violated ADR
-            // 0049 §1's "every mutation leaves a record" invariant that ADR
-            // 0050's split-build tail will depend on. Marker tables commit
-            // per-tablet single-entry batches via the one shared
-            // `dynamo::marker_batch_write`; an images table (streamed/GSI'd)
-            // routes each item through the same evaluate-at-leader funnel
-            // `BatchWriteItem` uses.
-            //
-            // **The images arm is pipelined, up to `SEED_IMAGES_CONCURRENCY`
-            // rows in flight at once (issue: a Stream-enabled seed target
-            // measured ~140 keys/s strictly sequential, vs. >10,000 keys/s
-            // for the marker arm — almost entirely waiting, not CPU).**
-            // Concurrency is sound here for reasons specific to this write
-            // shape, not a general license to fan out any write loop:
-            // - Every row in a seed chunk has a **distinct** key (`seed_row`
-            //   derives it from a unique index), so no two concurrent calls
-            //   ever contend on the same item.
-            // - Per-item evaluation happens **at the tablet leader, at apply
-            //   time** (ADR 0054) — each `KvCommand::KindEval` reads its own
-            //   key's current value and evaluates independently of every
-            //   other key's entry, the same "per-item evaluation is
-            //   independent per key" property `BatchWriteItem`'s own images
-            //   arm already relies on for *its* per-item loop (that arm
-            //   stays sequential today — the seeder's own throughput
-            //   pressure never applied to a single `BatchWriteItem` call's
-            //   ≤25-item cap — but nothing about the primitive requires
-            //   sequencing, only that arm's own scope never needed to relax
-            //   it).
-            // - A `Put` is value-idempotent on retry (per-key LWW, same
-            //   bytes) — this chunk's own whole-chunk retry loop below
-            //   already depends on that; concurrency changes nothing about
-            //   which rows might get retried, only how many are in flight
-            //   at once.
-            // - Each row's own stream/GSI/change-log record is per-item —
-            //   nothing here claims cross-row atomicity (the funnel never
-            //   did, sequential or not): nothing downstream observes or
-            //   depends on the commit order of two different keys' entries.
-            // The first error stops issuing new rows and surfaces as the
-            // chunk's error exactly as before (`try_for_each_concurrent`
-            // returns on the first `Err`, dropping any still-in-flight
-            // futures) — the outer whole-chunk retry loop is unchanged.
-            //
-            // Retries are a bounded whole-chunk loop now (`cp_batch_write_
-            // patient`'s poll-not-repropose nuance does not transfer to the
-            // kind path): re-proposing is value-idempotent for the base rows
-            // (per-key LWW, same bytes), and a confirm-timeout retry can at
-            // worst duplicate a chunk's *marker* records — harmless by
-            // design (markers are consumer-hidden dirty-key hints, promptly
-            // trimmed; a duplicate says "this key changed" twice).
-            let last = async {
-                let mut last = Ok(());
-                for attempt in 0..SEED_WRITE_ATTEMPTS {
-                    if attempt > 0 {
-                        ctx.env.sleep(SEED_RETRY_BACKOFF).await;
-                    }
-                    let meta = ctx.effective_metadata();
-                    last = if crate::dynamo::table_change_records_carry_images(&meta, &table) {
-                        futures::stream::iter(rows.iter().map(Ok::<_, String>))
-                            .try_for_each_concurrent(
-                                SEED_IMAGES_CONCURRENCY,
-                                |(pk, sk, item)| async {
-                                    ctx.cp_kind_write_item(
-                                        &meta,
-                                        &table,
-                                        pk,
-                                        sk.as_ref(),
-                                        crate::KindWriteOp::Put(item.clone()),
-                                        None,
-                                    )
-                                    .await
-                                    .map(|_outcome| ())
-                                    .map_err(|e| format!("{e:?}"))
-                                },
-                            )
-                            .await
-                    } else {
-                        let batch_rows = rows
-                            .iter()
-                            .map(|(pk, sk, item)| {
-                                (
-                                    pk.clone(),
-                                    sk.clone(),
-                                    animus_dynamo::wire::encode_stored_item(item),
-                                )
-                            })
-                            .collect();
-                        // ADR 0065 §6: this admin seeder is not a real
-                        // DynamoDB client — a throttled row is silently
-                        // dropped rather than echoed under
-                        // `UnprocessedItems` (there is no such wire
-                        // response here); the whole-chunk retry loop above
-                        // is this endpoint's only recovery path.
-                        crate::dynamo::marker_batch_write(ctx, &table, batch_rows)
-                            .await
-                            .map(|_shed| ())
-                    };
-                    if last.is_ok() {
-                        break;
+    let (written, unprocessed, first_err) = async {
+        let written = std::sync::atomic::AtomicU64::new(0);
+        let unprocessed_total = std::sync::atomic::AtomicU64::new(0);
+        let first_err: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+        let chunks = seed_chunk_bounds(req.start, count, SEED_BATCH_WRITE_CAP);
+        futures::stream::iter(chunks.into_iter().map(|(chunk_start, chunk_len)| {
+            let table = &table;
+            let written = &written;
+            let unprocessed_total = &unprocessed_total;
+            let first_err = &first_err;
+            async move {
+                let items: Vec<Item> = (0..chunk_len)
+                    .map(|j| seed_row(chunk_start + j, fill))
+                    .collect();
+                let batch_span = tracing::info_span!(
+                    "admin_seed_batch",
+                    start_index = chunk_start,
+                    len = chunk_len
+                );
+                let (w, u, err) = submit_seed_chunk(ctx, table, items)
+                    .instrument(batch_span)
+                    .await;
+                written.fetch_add(w, std::sync::atomic::Ordering::Relaxed);
+                unprocessed_total.fetch_add(u, std::sync::atomic::Ordering::Relaxed);
+                if let Some(e) = err {
+                    let mut fe = first_err.lock().unwrap();
+                    if fe.is_none() {
+                        *fe = Some(e);
                     }
                 }
-                last
             }
-            .instrument(batch_span)
-            .await;
-            match last {
-                Ok(()) => written += chunk,
-                Err(e) => {
-                    first_err.get_or_insert(e);
-                }
-            }
-            i += chunk;
-        }
-        (written, first_err)
+        }))
+        .buffer_unordered(SEED_CONCURRENCY)
+        .for_each(|()| async {})
+        .await;
+        (
+            written.load(std::sync::atomic::Ordering::Relaxed),
+            unprocessed_total.load(std::sync::atomic::Ordering::Relaxed),
+            first_err.into_inner().unwrap_or(None),
+        )
     }
     .instrument(span)
     .await;
-    let (written, first_err) = seed_result;
 
     // All writes failing is a server error; a partial failure still reports what
-    // landed (so the dashboard can surface it without losing the count).
-    let status = if written == 0 && first_err.is_some() {
-        500
+    // landed (so the dashboard can surface it without losing the count) — rows
+    // still unprocessed after every retry attempt are named in `unprocessed`
+    // and folded into `error` rather than silently dropped (ADR 0065 §6).
+    let status = if written == 0 && count > 0 { 500 } else { 200 };
+    let error = if unprocessed > 0 {
+        Some(first_err.unwrap_or_else(|| {
+            format!("{unprocessed} row(s) left unprocessed after {SEED_MAX_RETRY_ATTEMPTS} retry attempts")
+        }))
     } else {
-        200
+        first_err
     };
     (
         status,
@@ -3099,7 +3089,8 @@ async fn action_data_seed<E: Env, R: RelayClient>(
             // What each row actually serialized to (≥ `value_bytes` only when
             // the unpadded item alone is bigger).
             "item_bytes": row_bytes,
-            "error": first_err,
+            "unprocessed": unprocessed,
+            "error": error,
         }),
     )
 }

@@ -850,6 +850,7 @@ supply one, and isn't trying to.
 | I | Post-C-07: TTL reaper `SimCluster` dispatch (C-09) — the `TTL (1/9)` residual Rung H's own close-out named and recommended first, of the six groups left unowned after C-08. `animus_node::ttl_reaper::{ttl_reaper_loop, ttl_sweep_one_tablet}` was already `<E: Env, H: TtlScanHost + TtlReaperProgressHost>`-generic (rung C2); the one remaining concrete surface was `crates/animusd/src/ttl_reaper.rs`'s thin wrapper plus `impl TtlReaperProgressHost for ClientCtx` (bare defaults) in `client_ctx_host.rs:98` — `TtlScanHost` was already `<E, R>`-generic there (D4 PR5). No primitive drove the loop under `SimEnv` before this rung (`SimCluster::new`/`restart` never spawned it), so `tests/dynamo_ttl.rs`'s 9 tests plus one residue test apiece in `admin_endpoint.rs` and `console_stream.rs` all stayed `ProdEnv`. **Closed 2026-09-09 (PRs #780, #782, #785, #786, #787, plus this PR 6)** — PR 2 (groundwork: `TtlReaperProgressHost`/the `ttl_reaper.rs` wrapper widened, `SimCluster`'s always-on per-node reaper spawn at a 200ms sim interval, `drive_ttl_sweep`), PR 3 (`sim_cluster_ttl.rs` extended with 5 more scenarios, 5/8 of the remaining tests converted), PR 4 (admin/console residue: `sim_cluster_admin.rs`'s reaper-progress scenario, `sim_cluster_console_stream.rs`'s TTL-identity scenario replacing `console_stream.rs`, which is deleted whole), and PR 5 (the `DescribeTimeToLive` dispatch gap PR 3 found, closed, restoring its own two reverted scenarios) all landed. `cargo test -p animusd --lib sim_cluster` ran 406 → 408 → 420 → 424 → **428 passed, 0 failed, 2 ignored**. Final residue: exactly one test, `tests/dynamo_ttl.rs::expired_item_is_still_readable_immediately` (every `SimCluster` wire call drains the fixed 12s `OP_BUDGET` while the always-on 200ms reaper ticks, so an already-expired item can never be observed pre-reap through this fixture) — `admin_endpoint.rs` keeps 9 tests, `console_stream.rs` is gone. See the matching 2026-09-08/09 "Rung I" amendments below (including "Rung I closed") and `docs/roadmap.md`'s C-09 entry |
 | J | Post-C-09: index DDL beyond plain `CreateTable` `SimCluster` dispatch (C-10) — blocker (d) named by both Rung H's and Rung I's own close-outs, the largest remaining `SimCluster`-dispatch group (9 files/30 tests in the D3-closing class-D breakdown). `dynamo.rs:1725-1774`'s `dispatch_table_op`'s `UpdateTable` arm rejects any call with `index_update.is_some()` via `unsupported_by_generic_dispatch`; `create_index`/`drop_index`/`set_index_status`/`drop_table_index` (`dynamo.rs:4509/4627/4680/4716`) are concrete (`&ClientCtx`, `tokio::time::Instant::now()`/`sleep`) even though every `ClientCtx` method they call (`propose_schema`/`drop_table_tablets`/`clear_backfill_cursor_for_table`, `schema.rs`'s own `impl<E: Env, R: RelayClient> ClientCtx<E, R>` block) is already generic — pure signature/clock-call widening, no new capability. `index_drain::drain_tablet`/`reconcile_partition`/`gsi_caught_up` are already `<E, R>`/`<E, R>`/`<E>`-generic (D3 PR 3b); `animus_node::index_backfill::index_backfill_loop<E, H: ControlLeaderHost<E>>` is already fully generic and `ControlLeaderHost` is already implemented generically for `ClientCtx<E, R>` (`client_ctx_host.rs:47`) — only `crates/animusd/src/index_backfill.rs`'s 18-line wrapper is concrete. `index_drain::backfill_seed_tick`/`advance_backfill_cursor`/`seed_change_log_record` (`index_drain.rs:1412/1539/1651`) stay concrete (`&ClientCtx`/`&CpGroup`, one `tokio::time::Instant`), called only from `change_consumer_loop`, which `SimCluster` never spawns (`sim_cluster.rs:2987`'s own doc). `SimCluster::drain_gsi` (`sim_cluster.rs:2802`) already exists and hand-drives `drain_tablet` directly; no primitive drives `backfill_seed_tick`. `GenericConsoleBackend::add_gsi`/`drop_gsi` (`lib.rs:4107/4123`) already route through `execute_routed_as_generic` — zero console/`lib.rs` change needed once the dispatch sub-arm exists. `CreateTableIndex`/`DropTableIndex`/`SetIndexStatus`/`MarkIndexBackfilled` are already on `is_relayable_command`'s allowlist (`wire.rs:764-781`). **Closed 2026-09-09 (PRs #789, #790, #791, #792, #793, #794, plus this PR 7)** — PR 2 (groundwork: the four `dynamo.rs` functions plus the `index_drain` seeder trio widened, the `UpdateTable` index sub-arm, the always-on `index_backfill_loop` spawn, `drive_backfill_seed`), PR 3 (`sim_cluster_dynamo_update_table_index.rs`, 9 tests from `update_table_create_index.rs`/`update_table_drop_index.rs`/`dynamo_gsi_drain.rs`, all three deleted whole), PR 4 (`sim_cluster_backfill_seeder.rs`, 4 of `backfill_seeder.rs`'s 5 scenarios, `split_during_backfill_converges_with_correct_final_gsi` kept `ProdEnv` per its own license, `SimCluster::restart` now respawns `index_backfill_loop`), PR 5 (`sim_cluster_stream_backfill_seed_filter.rs`, 2 tests, file deleted whole), and PR 6 (3 GSI-DDL `console_table_config.rs` scenarios into `sim_cluster_console_table_config.rs`, file trimmed to its 1 out-of-scope PITR test) all landed. `cargo test -p animusd --lib sim_cluster` ran 428 → 432 → 458 → 462 → **468 passed, 0 failed, 2 ignored**. Final residue: the three frozen files (`dynamo_index_scan.rs` #418, `index_backfill.rs` #592, `dynamo_index_writes.rs` #610, 14 tests, untouched throughout), `backfill_seeder.rs`'s one licensed `ProdEnv` residual, and `console_table_config.rs`'s one PITR residual — 16 tests total, `schema_ddl_relay.rs`'s 7 tests untouched by design. See the 2026-09-09 "Rung J (post-C-09)" through "Rung J, PR 6 landed" amendments below (including "Rung J closed") and `docs/roadmap.md`'s C-10 entry |
 | K | Post-C-10: throttle-metric counters `SimCluster` dispatch (C-11, closed) — the smallest of the four groups Rung J's own close-out left unowned (`ThrottledWrites`/`ThrottledReads`, 1 file/6 tests in the D3-closing class-D breakdown, unchanged since). `tests/dynamo_throttling.rs` held all 6: `batch_write_item_sheds_throttled_rows_into_unprocessed_items` (:445), `batch_get_item_sheds_throttled_keys_into_unprocessed_keys` (:492), `transact_write_items_cancels_with_throttling_error` (:538), `a_forwarded_write_is_throttled_on_the_leader` (:605), `admin_metrics_reports_nonzero_throttled_counters` (:652), and `cluster_wide_throttle_default_is_overridden_by_a_tables_own_throughput` (:740, a `run_node_with_cluster_settings`-only config-parse test expected to stay a permanent residual — and the one that did). `dynamo::kind_write_item_at_leader<E: Env, R: RelayClient>` and `dynamo::run_transact<E, R>` are already generic and already increment `Metric::ThrottledWrites` via `ctx.data().raftkv_metrics.incr(..)` (`dynamo.rs:9069`, `write_path.rs:327`, `txn_coordinator.rs:134`); the read-path `ThrottledReads` site (`read_path.rs:99`) is generic too. `dispatch_item_op` already routes `BatchGetItem`/`BatchWriteItem`/`TransactWriteItems`. **The rung's own distinguishing finding, corrected from two stale module docs, plus a third copy found the same day**: `SimCluster::new`/`::restart` build every node with a real `DataRole` (`data: Some(DataRole { raftkv_metrics: node_metrics[i].clone(), .. })`, `sim_cluster.rs:1460`, since rung D2 PR 1) and a `ThrottleTracker` (`:1504`) — `ThrottledWrites`/`ThrottledReads` **do** increment under `SimCluster` today, contradicting `sim_cluster_throttle.rs`'s and `sim_cluster_dynamo_update_table.rs`'s own module docs (both corrected by PR 1) and a third copy of the identical claim in `sim_cluster.rs:1427`'s own `AdminInfo` comment (corrected by this rung's own PR 4, since `sim_cluster.rs` was off this rung's earlier PRs' allowed-edits list). `SimCluster::set_throttle_defaults`/`::set_throttle_defaults_all` (`sim_cluster.rs:2121`/`:2134`) and `SimCluster::admin` (`:933`) already exist and already drive `GET /admin/metrics` in `sim_cluster_admin.rs`; `metrics_view<E, R>` (`admin.rs:1982`) is generic, dispatched from `animus-node/src/admin.rs:52`. Wire-level sim siblings already exist for the same operation family (`sim_cluster_dynamo_batch_get.rs`, `sim_cluster_kind_batch_outcome.rs`, `sim_cluster_dynamo_transact.rs`). **Closed 2026-09-09 (PRs #796, #797, #799, plus this PR 4)**: PR 2 converted the four wire-shape scenarios into `sim_cluster_dynamo_throttle.rs`; PR 3 converted `admin_metrics_reports_nonzero_throttled_counters` into `sim_cluster_admin.rs` and trimmed `dynamo_throttling.rs` to its one residual; PR 4 (this PR) is the docs close-out — no source, test, or `Cargo` change. `cargo test -p animusd --lib sim_cluster` ran 468 → 476 → **478 passed, 0 failed, 2 ignored**. Final residue: one test (`cluster_wide_throttle_default_is_overridden_by_a_tables_own_throughput`), a config-parse/process-boundary test with no `SimCluster` analog. **Zero production signature changes across the whole rung — its own distinguishing property.** The opener's own "not yet sequenced by the maintainer" question is answered only by this rung having proceeded on Rung J's own recommendation as a stated assumption, never an explicit instruction — restated, not resolved, by this close-out. **Size S.** See the 2026-09-09 "Rung K (post-C-10)" opener amendment through "Rung K closed" below and `docs/roadmap.md`'s C-11 entry |
+| L | Post-C-11: control/data role split under `SimCluster` (C-12, closed) — the one residual group named but never claimed since Rung H's own close-out (Rung H/I/J's own "what remains unowned" lists each repeat it, `crates/animusd/CLAUDE.md`'s residual inventory's "control/data role split (5/21)" entry); Rung K's own close-out, having landed and closed C-11, names it again, explicitly, as the one remaining group needing a genuinely new `SimCluster` deployment-shape fixture. Every animusd role assembly already exists in **production**: `NodeRole::{Control,Data,Both}` (`config.rs:74`), the three real assemblies — combined `Node::start_with` (`lib.rs:4886`), control-only `BoundControlNode::start_control_with` (`lib.rs:6421`, `data: None`), data-only `BoundDataNode::start_data_with` (`lib.rs:6814`, `control: ControlHandle::Remote(RemoteControlClient::new(..))` at `lib.rs:6977`) — and `ControlHandle<E, R>::{Local, Remote}` plus `RemoteControlClient<R>` (`animus-node/src/control_handle.rs:92/146`) are already `<E, R>`/`<R>`-generic, needing zero production widening. `SimCluster` already has a **data-only** growth primitive in miniature — `SimCluster::grow("data")` (`sim_cluster.rs:3530`): a real `GenericControlHandle::Remote`, a real reconciler, and a `SimEnv`-native `spawn_remote_mirror_sync_loop` (`sim_cluster.rs:349`) driving `ControlHandle::Remote`'s real observe/leader-hint logic — though it self-registers directly on the control leader rather than exercising the ADR 0030/0032 join dance. What's actually missing: a **control-only** node variant in `SimCluster` (no `DataRole`, no reconciler/janitors/mirror loop) and per-node role-tracking through `SimCluster::new`/`restart`/`crash` — `restart` (`sim_cluster.rs:3251`) unconditionally rebuilds a fresh `Local` `RaftNode` (`:3295`) for every node and, by its own doc comment, is already documented as out of scope for a grown node (`self.controls[node as usize]` at `:3416` indexes a `Vec` a grown node was never pushed onto — "calling this with a grown node's index panics on the `Vec` index, not gracefully," a pre-existing, self-documented D4 PR 4 limitation this rung lifts, not a newly discovered bug). **Closed 2026-09-09 (PRs #806, #808, #822, #823, #824, #825, #826, #827, plus this PR 5)**: PR 2 gave `SimCluster` a control-only node variant and role-aware `restart`/`crash`; PR 3 made `NodeRole::Data` first-class at construction and fixed two real, previously-latent gaps in `SimCluster::grow`; PR 4a converted `control_only.rs`/`data_only.rs`/`cluster_split.rs` (11 → 2 real-socket, `cluster_split.rs` deleted whole); PR 4b converted 6 of `split_cluster.rs`'s 8 tests (2 genuine class-B residuals kept, file trimmed not deleted — the opener's own "8, deleted whole" estimate was corrected here); PR 4c converted the four role-named `console_endpoint.rs`/`dashboard_endpoint.rs` tests (one converted whole, three stay mixed); PR 4d converted `stream_janitor.rs`'s control-only-leader scenario (2 → 1 real-socket); PR 4e (#827) converted 11 of `control_membership_admin.rs`'s 12 tests (2 → 1 real-socket — `runtime_added_voter_survives_leadership_change_to_a_different_original_voter` kept permanently, pinning `ProdEnv::merge_peer`'s scope-limit behaviour, structurally invisible under `SimEnv`), and found and fixed one real production bug along the way (`ClientCtx::admin_remove_control_member`'s leader-self-removal transfer-wait loop read `tokio::time::Instant::now()`/`tokio::time::sleep` directly despite an already-generic `<E, R>` signature — this crate's fifth recorded recurrence of the "generic signature ≠ seam-clean body" lesson — converted to `self.env.now()`/`self.env.sleep`). **This close-out's own per-file re-verification, in its first draft before PR 4e existed, found the opener's real-socket inventory below was wrong in two respects**: (1) `control_membership_admin.rs` — named above as "11 of 12 convert" and counted into the opener's own "35 tests across 8 files" total — had not been touched by any of PRs 2 through 4d; it remained at all 12 tests, entirely `ProdEnv`. This was a genuine shortfall against the plan, not a permanent residual — the mechanism it needed (`new_with_roles`, control-prefixed roles) already existed — and PR 4e closed it as the rung's own final conversion PR rather than being left as a follow-up. (2) Of its 12 tests, the one the opener called permanent `--config`-bring-up residue — `admin_config_reports_the_internal_addr_the_cli_resolves_control_add_through` — reading it showed it builds its `ClusterConfig` in-process via `bring_up_combined` (`animusd::run_node`, no `--config FILE` parse anywhere) and asserts only a `GET /admin/config` JSON-shape fact (`addrs.internal` present, the legacy `control` key gone) that `SimCluster::admin`'s existing generic dispatch already reaches for a sibling assertion (`sim_cluster_admin.rs::admin_config_reports_auth_state_and_never_serves_the_secret`) — also convertible, not permanent, and PR 4e converted it too. The actual converted total is **22 scenarios / 43 new sim tests across 7 real-socket files by PRs 4a-4d** (one, `cluster_split.rs`, deleted whole), plus **11 scenarios / 22 new sim tests from `control_membership_admin.rs` by PR 4e** — 65 tests total across 8 files, not the opener's estimated 35/8. Deferred to a follow-on rung (needs the real ADR 0030/0032 seed/join dance, not just a role split): `data_join.rs` (1), `seed_join.rs` (1), `seed_join_allocated.rs` (5), `control_membership_split.rs` (2) — 9 tests across 4 files, confirmed unchanged. **Genuinely permanent**, assessed and closed by this PR (read against the actual test body, not the inherited label — see the amendment below): `control_mirror_restart.rs`/`control_metadata_restart.rs` (2 + 2, a real second `LsmEngine` handle opened against real on-disk bytes after process shutdown), `seed_join_hostname.rs` (1, real `TcpStream::connect`/`ToSocketAddrs` DNS resolution), `config_node_identity.rs` (1, the real `Node::bind`/`bind_control`/`bind_data` identity-derivation path — `SimCluster` never calls `Node::bind` at all), `control_membership_admin.rs` (1, `ProdEnv::merge_peer`'s scope-limit behaviour, kept by PR 4e) — 5 files/7 tests. See the 2026-09-09 "Rung L (post-C-11)" opener amendment through "Rung L closed" below for the full grep-verified ground truth, file/line anchors, the PR-by-PR test disposition, and the closing assess-and-close record. **Size L.** |
 
 Note that the copy-based split driver (ADR 0050) is deliberately **not** on
 this list: ADR 0058 rung 4's remaining layer deletes it. Writing a corpus
@@ -8877,3 +8878,743 @@ no code change); `docs/engineering-lessons.md` already carries this rung's
 own generalizable finding (the "re-verify a never-happens claim against the
 constructor" lesson, PR 1/PR 2's own doc corrections) — no new entry
 needed at this close.
+
+
+## 2026-09-09 amendment — Rung L (post-C-11): control/data role split under `SimCluster` (C-12), PR 1 (this docs-only opener)
+
+**Why this group.** The control/data role split is the single group named,
+unclaimed, in every "what remains unowned" list since Rung H's own
+close-out — Rung H, Rung I, and Rung J all repeat it verbatim
+(`crates/animusd/CLAUDE.md`'s residual inventory carries the same
+"control/data role split (5/21)" line unchanged through three closes).
+Rung K's (C-11, throttle-metric counters) own opener amendment names it
+again, explicitly this time, as "the one remaining group needing a
+genuinely new `SimCluster` deployment-shape fixture" — distinguishing it
+from `--config` bring-up and node assembly/raw `ClientRequest`, the other
+two residuals that opener flagged as more likely permanent `ProdEnv`
+process-boundary residue than a `SimCluster`-dispatch gap. This opener
+takes up that recommendation.
+
+**Ground truth**, from a read-only grep of the current tree (not the task
+brief that proposed this rung — every line-number claim below was
+independently re-checked; three were off by the small margins later
+insertions in the same files always produce, noted where it matters):
+
+**Production already has the whole role split — this rung only extends
+`SimCluster`, no `dynamo.rs`/`lib.rs` production-signature change is
+needed.**
+
+- `NodeRole` (`crates/animusd/src/config.rs:74`) is `{Control, Data,
+  Both}`, `Both` the `#[default]` — already shipped, ADR 0035's own
+  design.
+- Three real assemblies in `crates/animusd/src/lib.rs`: combined
+  `Node::start_with` (`:4886`, `ControlHandle::Local`, `data: Some(..)`);
+  control-only `BoundControlNode::start_control_with` (`:6421`, `data:
+  None`, `control_storage: Some(..)`); data-only `BoundDataNode::
+  start_data_with` (`:6814`, plus `start_data_with_streams` at `:6847`
+  and `start_data_with_growth` at `:6927`) — `control: ControlHandle::
+  Remote(RemoteControlClient::new(control_seeds.clone(), AnimusdRelayClient
+  { tls: self.tls.clone() }, CLIENT_TIMEOUT))` at `:6977`, confirmed by
+  direct read. Entry points: `run_node_control`/`run_node_control_with_
+  orphan_sweep_after`/`run_node_control_with_stores` (`:14676`/`:14699`/
+  `:14732`); `run_node_data` through `run_node_data_join_with_settings`
+  (`:14820`-`:15646`, six functions).
+- `ClientCtx<E, R>` (`:9710`) carries `control: GenericControlHandle<E,
+  R>`, `data: Option<DataRole>` (`:9724`), and `control_storage`.
+  `ClientCtx::data(&self) -> &DataRole` (`:9985`) panics with
+  `"ClientCtx::data called on a control-only node (ADR 0035 PR3)"` when
+  `None` — a control-only node's own dispatch paths (`resolve_cp_route`)
+  handle the `None` case explicitly instead of ever calling this, per
+  that method's own doc comment.
+- `crates/animus-node/src/control_handle.rs`: `ControlHandle<E: Env, R:
+  RelayClient>` (`:92`) is `{Local(RaftNode<E>), Remote(RemoteControlClient
+  <R>)}`; `RemoteControlClient<R: RelayClient>` (`:146`) with `::new`
+  (`:214`) and `::with_mirror` (`:234`) — both already generic over
+  `R: RelayClient`, no production widening needed anywhere in this file
+  for this rung.
+
+**`SimCluster` already has a data-only growth primitive in miniature —
+the template this rung's PR 3 extends, not a from-scratch mechanism.**
+
+- `SimCluster::new`/`new_with_segment_janitor_retention` (`sim_cluster.rs:
+  1272`/`:1288`) build every node **combined**: `control:
+  GenericControlHandle::Local(controls[i].clone())` (`:1437`), `data:
+  Some(DataRole { raftkv_metrics: node_metrics[i].clone(), .. })`
+  (`:1460`) — `grep -n 'data: None' sim_cluster.rs` returns zero hits in
+  either constructor.
+- `SimCluster::grow(&mut self, role: &str)` (`:3530`) asserts `role ==
+  "data"` and already builds a genuine data-only node: `GenericControlHandle
+  ::Remote(GenericRemoteControlClient::new(seeds, relay, CLIENT_TIMEOUT))`,
+  a real per-node reconciler (`build_reconciler` + `spawn_reconciler_loop`,
+  identical construction to `new`/`restart`), the backup janitor, and —
+  the one genuinely new mechanism this fixture didn't have before rung D2
+  — `spawn_remote_mirror_sync_loop(ctx, remote, seeds)` (`:349`, called at
+  `:3733`), a `SimEnv`-native long-poll mirror driving `ControlHandle::
+  Remote`'s real `observe`/`observe_delta`/leader-hint logic over
+  `SimRelayClient`, verified by its own doc pointer at `:3508`. **This
+  already IS the data-only half in miniature**, exactly as the task brief
+  claimed.
+- `grow` **bypasses the ADR 0030/0032 join dance**, confirmed by direct
+  read (`:3660`-`:3695`): it proposes `MetaCommand::RegisterNode` +
+  `MetaCommand::UpsertMember{Active}` directly on the current control
+  leader — "the identical control-plane bypass idiom `SimCluster::
+  seed_members` uses for the initial node set, deliberately not
+  `ClientCtx::admin_add_member`'s real relay + `Down`-then-failure-
+  detector-promotion dance" (the method's own doc, quoted verbatim). This
+  is exactly why `data_join.rs`/`seed_join.rs`/`seed_join_allocated.rs`/
+  `control_membership_split.rs` are **deferred**, not folded into this
+  rung: `grow` proves a data-only node's control/data split works, but not
+  the seed/join discovery path a real `animusd data --seed` node uses to
+  find that split in the first place.
+
+**What `SimCluster` is missing — this rung's actual scope.**
+
+- No **control-only** node variant: `SimCluster` has no constructor path
+  that builds a node with `data: None`, no reconciler, no janitors, no
+  mirror loop — the shape `BoundControlNode::start_control_with` builds in
+  production. `sim_cluster_dashboard.rs`'s own module doc (`:121`-`:123`)
+  says this in as many words, for two tests it keeps `ProdEnv` for exactly
+  this reason: `dashboard_role_gating_split_deployment` — "a genuine
+  control-only/data-only process split; `SimCluster` has no node-role
+  concept" — and `control_node_streams_read_path_is_ground_truth` — "the
+  identical role-split reason, plus two documented backend gaps (a
+  control-only node's `GetRecords`/open-tail stall) this test pins down
+  over real sockets." `console_endpoint.rs:218`'s `console_addr_panics_
+  on_control_only_node` and `stream_janitor.rs:451`'s `segment_janitor_
+  reclaims_objects_from_a_genuinely_control_only_leader` are the same gap
+  from two more angles.
+- No per-node **role tracking**: `SimCluster` has exactly one node shape
+  today (`new`'s combined constructor) plus one hand-built data-only
+  exception (`grow`) — nothing records "this node id is control-only" for
+  `restart`/`crash` (or any future assertion helper) to consult.
+- `restart` (`sim_cluster.rs:3251`) unconditionally rebuilds a **fresh
+  `Local` `RaftNode`** (`RaftNode::start(..)`, `:3259`, installed at
+  `ctx.control = GenericControlHandle::Local(fresh_control.clone())`,
+  `:3295`) for whichever node id it's given, and writes it into
+  `self.controls[node as usize]` (`:3416`). **This is already
+  self-documented, not a new finding**: the method's own doc comment
+  (`:3243`-`:3249`, landed by rung D4 PR 4) states plainly — "`node` must
+  be one of the original `0..nodes` control-voter ids this cluster was
+  constructed with... Restarting a grown node is out of this rung's scope
+  (no scenario needs it); calling this with a grown node's index panics on
+  the `Vec` index, not gracefully." `crash` (`:3223`) has no such
+  restriction — it only calls `self.sim.crash(nid(node))` and records the
+  id in `self.crashed`, touching no per-role state, so it already works
+  uniformly across every node shape; only `restart` needs role-awareness.
+
+**Real-socket test inventory** (every count a direct `grep -c
+'tokio::test'`/named-function recount against the current tree, not an
+estimate carried over from an earlier draft):
+
+| File | Tests | Disposition |
+|---|---|---|
+| `control_only.rs` | 3 | Converts (PR 4a) — bare control-only cluster election/status/quiescence, control-node DDL relay, mixed control+combined routing |
+| `data_only.rs` | 5 | Converts (PR 4a) — `ControlHandle::Remote`, no local `RaftCore` |
+| `cluster_split.rs` | 3 | Converts (PR 4a) — in-process `--cluster-control N --cluster-data M` |
+| `split_cluster.rs` | 8 (6 convert, 2 stay) | **PR 4b landed 2026-09-09**: 6 convert — failover, split, replica repair, decommission, simultaneous control+data failure, decommission-vs-split race; `full_split_cluster_restart_recovers_metadata_and_data` (real on-disk `StorageBackend::Lsm` full-outage restart) and `cluster_control_data_threads_quiesce_after_to_admin_config` (the real `start_split_cluster_with_growth` config-parse/process-boundary path) both stay — the plan row above's "8, file deleted whole" was a pre-grep estimate, corrected here per this crate's own "PR 1's own grep made against its plan draft" precedent (rung K) |
+| `control_membership_admin.rs` | 12 (11 convert, 1 stays) | 11 convert (PR 4a/4b, membership growth/removal/collision scenarios over a split deployment); `admin_config_reports_the_internal_addr_the_cli_resolves_control_add_through` stays — `--config` bring-up, a real process-boundary surface, permanent |
+| `stream_janitor.rs` | 2 (1 relevant) | `segment_janitor_reclaims_objects_from_a_genuinely_control_only_leader` converts (PR 4d); `repair_re_replicates_to_a_fresh_target_after_a_replica_node_dies` is an unrelated C-07-assessed permanent residual (shared S3 store has no per-node replica concept), not this rung's to touch |
+| `console_endpoint.rs` | 3 (2 relevant) | `console_serves_shell_on_data_only_node`/`console_addr_panics_on_control_only_node` convert (PR 4c); `console_serves_shell_assets_and_deep_links_on_combined_node` already has a `sim_cluster_console.rs` sibling from C-08 and stays as the equivalence-regression original, untouched |
+| `dashboard_endpoint.rs` | 4 (2 relevant) | `dashboard_role_gating_split_deployment`/`control_node_streams_read_path_is_ground_truth` convert (PR 4c); `dashboard_serves_spa_with_cors_and_peers` (real HTTP framing) and `dashboard_u05_lineage_panel` (`control_storage` gap) stay for unrelated reasons |
+
+**Converts total: 35 tests across 8 files** (PRs 4a-4d).
+
+**Deferred** to a follow-on rung — the real ADR 0030/0032 seed/join
+discovery dance, which `SimCluster::grow` deliberately bypasses (see
+above), not just the role split itself:
+
+| File | Tests | Why deferred |
+|---|---|---|
+| `data_join.rs` | 1 | Data-only `--seed` discovery of a pre-existing split deployment |
+| `seed_join.rs` | 1 | Combined-mode `--seed` discovery (ADR 0032 PR2) |
+| `seed_join_allocated.rs` | 5 | Self-minted member ids over `--seed` (ADR 0040) |
+| `control_membership_split.rs` | 2 | Runtime control-quorum growth/voter-replace over a genuine split deployment, driven through the real admin HTTP surface rather than `SimCluster`'s direct-propose bypass |
+
+**Permanent** — assessed and closed (not converted) in this rung's own
+close-out PR:
+
+| File | Tests | Why permanent |
+|---|---|---|
+| `control_mirror_restart.rs` | 2 | Real-disk system-keyspace-engine restart survival |
+| `control_metadata_restart.rs` | 2 | Real-disk `Metadata` crash/restart matrix (combined + control-only + data-only legs) |
+| `seed_join_hostname.rs` | 1 | Real DNS hostname resolution at dial time |
+| `control_membership_admin.rs` (residue) | 1 | `--config` bring-up (already counted above) |
+| `config_node_identity.rs` | 1 | Operator-style id `--config` bring-up over real TCP — 1 test (`a_cluster_with_operator_style_ids_elects_a_leader`), confirmed by a direct `grep -n 'tokio::test' config_node_identity.rs` recount |
+| (separately tracked) node assembly/raw `ClientRequest` | 2 files / 8 tests | Already its own named residual in `crates/animusd/CLAUDE.md`'s class-D breakdown, independent of the role split; out of this rung's scope by name, carried forward unchanged, assessed in the same close-out PR alongside the five files above rather than opening a ninth rung for it |
+
+Everything above sums to what the task brief called roughly "5 files/21
+tests" only in the oldest, coarsest class-D accounting
+(`crates/animusd/CLAUDE.md`'s residual-inventory paragraph, unchanged
+since the D3 close) — that figure predates C-07/C-08's own conversions,
+which pulled `console_endpoint.rs`/`dashboard_endpoint.rs`/
+`stream_janitor.rs`'s role-specific residuals out of the (now closed)
+Streams and admin/console/dashboard groups and left them here, unclaimed,
+the whole time. This rung's own inventory (16 distinct files, 35
+converting + 9 deferred + 6 permanent-here, plus the 2/8 permanent
+elsewhere) is the current, grep-verified replacement for that stale
+figure — `crates/animusd/CLAUDE.md`'s own pointer is updated in this PR
+to match (see "Docs" below).
+
+**The PR series** (6-7 PRs):
+
+- **PR 1 (this amendment).** Docs only: the rung-table row L above, this
+  amendment, `docs/roadmap.md`'s C-12 entry, and `crates/animusd/
+  CLAUDE.md`'s residual-inventory pointer. **Gates:** none — documentation
+  only, no `cargo` command run.
+- **PR 2 — control-only nodes + role-aware `restart`/`crash`.** Add a
+  `NodeRole`-shaped per-node marker to `SimCluster` (tracking which of
+  `Control`/`Data`/`Both` each node id was built as); a new constructor
+  path (or a `grow`-style opt-in on `new`) building a **control-only**
+  node — `data: None`, no reconciler, no backup/segment/TTL/index-backfill
+  janitor spawns, no `spawn_remote_mirror_sync_loop` — mirroring
+  `BoundControlNode::start_control_with`'s production shape; widen
+  `restart` to consult the marker and rebuild the node in its own original
+  shape (control-only stays control-only, data-only rebuilds a `Remote`
+  handle + reconciler instead of a fresh `Local` `RaftNode`, combined
+  stays as today) rather than unconditionally forcing `Local`; extend
+  `restart` to work for a grown node at all (today's documented panic,
+  lifted). `crash` needs no change (already role-agnostic, confirmed
+  above). **Gate:** whole `sim_cluster` tier green before and after, plus
+  a new smoke pair (one control-only, one data-only, exercised through
+  `restart`) — fmt, clippy.
+- **PR 3 — data-only nodes first-class at `new()`.** `grow("data")`
+  proves a data-only node works when *added*; this PR makes data-only
+  nodes constructible directly in `SimCluster::new`'s own initial node
+  set (a role-per-node-index parameter or a builder), so a scenario can
+  start a cluster already split rather than always growing into it, and
+  confirms `restart`'s PR 2 widening handles a data-only node present
+  from construction (not only one that arrived via `grow`) identically.
+  **Gate:** whole `sim_cluster` tier, fmt, clippy.
+- **PR 4a — `sim_cluster_control_data_split.rs`.** New sibling module
+  converting `control_only.rs` (3), `data_only.rs` (5), `cluster_split.rs`
+  (3), and `control_membership_admin.rs`'s 11 convertible tests — 22
+  tests, the two smallest whole files deleted (`control_only.rs`,
+  `data_only.rs`, `cluster_split.rs`), `control_membership_admin.rs`
+  trimmed to its 1 `--config` residual. **Discipline (D3):** untrimmed
+  real-socket file green first, new sim module green, untrimmed file
+  re-run unchanged, then trim, then whole `sim_cluster` tier + fmt +
+  clippy — the same sequencing every prior rung's own gate list used.
+- **PR 4b — `split_cluster.rs`.** Its own sibling module (or folded into
+  4a's, sized at implementation time), 8 tests, file deleted whole.
+  **Gate:** identical shape to PR 4a's. **Landed 2026-09-09** as its own
+  sibling module, `sim_cluster_split_cluster.rs` (a first attempt folding
+  it into `sim_cluster_control_data_split.rs` grew that file to 1881
+  lines, over this rung's own ~1800-line guidance, and was reverted) — 6
+  of the 8 converted (12 tests: 6 scenarios × pinned-seed + `_over_seeds`),
+  not all 8 as this plan bullet originally estimated: `full_split_cluster_
+  restart_recovers_metadata_and_data` (real on-disk WAL crash recovery)
+  and `cluster_control_data_threads_quiesce_after_to_admin_config` (the
+  real config-parse/process-boundary path) are genuine class-B residuals,
+  kept whole — `tests/split_cluster.rs` trimmed to those two, not deleted.
+  Three of the six converted scenarios needed a retry helper apiece
+  (`create_table_after_recovery`/`put_retry`/`put_raw_retry`) for a
+  post-fault race each first draft's own single-shot call missed — see
+  `crates/animusd/CLAUDE.md`'s own PR 4b appendix for the full account.
+  Full gate green: `sim_cluster`-filtered tier 534 passed/0 failed/2
+  ignored (1324.88s, 522 baseline + 12); full unfiltered `--lib` 712
+  passed/0 failed/3 ignored (750.52s, 700 baseline + 12).
+- **PR 4c — the four role-named console/dashboard tests.** `sim_cluster_
+  console.rs` gains `console_serves_shell_on_data_only_node`/
+  `console_addr_panics_on_control_only_node` (`console_endpoint.rs`
+  trimmed to its 1 already-converted-elsewhere residual);
+  `sim_cluster_dashboard.rs` gains `dashboard_role_gating_split_
+  deployment`/`control_node_streams_read_path_is_ground_truth`
+  (`dashboard_endpoint.rs` trimmed to its 2 unrelated residuals). **Risk
+  flagged in advance:** `control_node_streams_read_path_is_ground_truth`'s
+  own doc names "two documented backend gaps (a control-only node's
+  `GetRecords`/open-tail stall)" beyond the role-split gap alone — this PR
+  may find it needs a further backend widening (or may license this one
+  test to stay `ProdEnv` a while longer, moved to the permanent table
+  instead) rather than convert cleanly; not assumed away here. **Gate:**
+  identical shape.
+- **PR 4d — the stream-janitor role test.** `sim_cluster_stream_
+  janitor.rs` gains `segment_janitor_reclaims_objects_from_a_genuinely_
+  control_only_leader`; `stream_janitor.rs` trimmed to its 1 unrelated
+  C-07 residual. **Gate:** identical shape.
+- **PR 5 — close-out.** A "Rung L closed" amendment with the full
+  per-PR account, before/after `sim_cluster` test counts, and the
+  assess-and-close disposition for the five permanent-here files plus the
+  separately-tracked node-assembly/raw-`ClientRequest` group (confirming
+  each stays `ProdEnv` for the reason already on record, not silently
+  dropped); `docs/roadmap.md`/`crates/animusd/CLAUDE.md` updated to match.
+  **Gates:** none — documentation only.
+
+**Binding rules.** **Discipline (D3), restated**: every conversion PR
+(4a-4d) keeps the untrimmed real-socket file green as its own baseline
+gate before the sim sibling is even written, adds the sim sibling and
+gates it green, re-confirms the untrimmed file unchanged, *then* trims —
+never trim-then-prove. **Pinned-seed tests plus fixed 5-seed `_over_seeds`
+siblings**, the convention every prior rung's own sim modules use.
+**Production code paths byte-identical** — PRs 2-3 add fixture-only
+`SimCluster` construction/restart logic; they widen no `dynamo.rs`/
+`lib.rs`/`admin.rs` production signature, since (per the Ground truth
+section) `NodeRole`, the three assemblies, `ControlHandle`, and
+`RemoteControlClient` are all already production-shipped and already
+`<E, R>`-generic where `SimCluster` needs them to be. **Generic siblings
+`<E: Env, R: RelayClient>` never replace a production arm** — same rule
+every prior rung followed. **Frozen/off-limits files untouched**:
+`streams_e2e.rs` (#298), `dynamo_index_scan.rs` (#418), `index_
+backfill.rs` (#592), `batch_write.rs` (#601), `dynamo_index_writes.rs`
+(#610), `operator`/`website` doc-drift (#615), `split_placing_two_
+replica_diff_e2e.rs` (#619, #622, #670), `dynamo_streams.rs`'s
+periodic-seal flake (#626), `cp_cross_process.rs` (#627), `client_
+cancellation_tests` (#638), the admin DNS-name issue (#662), and the Raft
+`voted_for` durability issue (#667) — none names a file this rung reads
+or converts; confirmed by direct title comparison against the eight
+converting files, the four deferred files, and the six permanent-here
+files listed above.
+
+**Risks.** The role-aware `restart` in PR 2 is the rung's real design
+risk, not the control-only node construction itself (a subtractive
+variant of what `new` already builds): `restart` today is a single code
+path shared by every node, landed incrementally over four separate rungs
+(D4 PR 1/2/5, rung G, rung I, rung J each added one more unconditional
+respawn to it) — widening it to branch on role without breaking any of
+those five existing respawns, or silently skipping one for the wrong
+role, needs care and a scenario that actually restarts one of each shape.
+PR 4c's `control_node_streams_read_path_is_ground_truth` may not convert
+cleanly on the first attempt (flagged above) — that is an accepted
+possible outcome of this plan, not a plan failure if it lands one test
+short with a documented reason instead of a clean conversion. Low risk
+otherwise: no capability trait/newtype invented, `grow`'s own shape is the
+proven template for the data-only half, and `crash` needs no change at
+all.
+
+**Website:** no change needed — this rung touches no wire-observable
+behavior; every production dispatch path stays byte-identical (see
+"Binding rules" above). Verified by `grep -rn "SimCluster\|real-socket\|
+rung" website/`: **zero matches** — the website makes no claim this rung's
+own subject (a test-fixture capability, not a product-visible feature)
+could contradict or need to track.
+
+**Docs:** this amendment (opening Rung L, open); `docs/roadmap.md`'s C-12
+entry (new, open, PR 1 landed); `crates/animusd/CLAUDE.md`'s residual-
+inventory paragraph, whose "control/data role split (5/21)" mention is
+annotated **owned** by C-12/rung L, pointing here, and removed from that
+paragraph's own "unowned as of this close" list.
+
+## 2026-09-09 amendment — Rung L closed (C-12 complete)
+
+PR 5 is documentation only: the rung-table row L above, this amendment,
+`docs/roadmap.md`'s C-12 entry (closed) plus a new C-13 candidate entry,
+and `crates/animusd/CLAUDE.md`'s residual inventory and consolidated
+appendix. No `cargo` command was run authoring this PR (no cargo access in
+this worktree, per this PR's own instructions) — every figure below is
+either carried forward verbatim from a landed PR's own attested gate run
+(cited by PR), or derived by direct inspection of the branch's current
+source (grep counts, `git show --stat`, reading the test files
+themselves), never invented. Rung L (C-12) is now **closed**, with every
+one of the eight files the opener's own plan named actually converted or
+assessed: this close-out's own first draft, authored before PR 4e
+existed, found that `control_membership_admin.rs` had not been touched by
+any landed PR and reported it as a named, readily-actionable follow-up
+rather than papering over the gap; PR 4e (#827) then closed that follow-up
+as the rung's own fifth and final conversion PR, converting 11 of the
+file's 12 tests and correcting the 12th's inherited "permanent" label
+along the way. "Closed" here means both "every PR the series set out to
+run has landed" and "every test the opener's plan named was converted or
+assessed on its own merits" — the shortfall this close-out first found is
+now resolved, not merely reported. See "A shortfall against the plan,
+found by this close-out" below for the full account (including its
+resolution), and "What was deferred" for where the rung's remaining,
+genuinely out-of-scope work goes next.
+
+### Per-PR record
+
+- **PR 1 (#806, docs opener).** The rung-table row L, the "Rung L
+  (post-C-11)" amendment above, `docs/roadmap.md`'s C-12 entry, and
+  `crates/animusd/CLAUDE.md`'s residual-inventory pointer. No source
+  change. Grep-verified ground truth against the then-current tree; three
+  of its own line-number claims were later confirmed (see that
+  amendment's own "three were off by the small margins later insertions
+  ... always produce" note) rather than re-litigated here.
+- **PR 2 (#808).** `SimCluster::new_with_roles` (a thin
+  `new_with_segment_janitor_retention` wrapper preserved byte-identical
+  for all-combined callers), building a `NodeRole::Control` node the way
+  `BoundControlNode::start_control_with` does in production — `data:
+  None`, no `host::Reconciler`, no `ttl_reaper_loop`, no fixture-only
+  `heartbeat_loop` — while `backup_janitor_loop`/`segment_janitor_loop`/
+  `index_backfill_loop` and the control `RaftNode` itself still run
+  (control-plane-leader-gated, not data-role-gated, matching production).
+  `SimCluster::restart` made role-aware. New module `sim_cluster_
+  control_only.rs`, 5 scenarios/10 tests. Two test-side bugs found and
+  fixed in the same PR (a crashed node's own stale `is_leader()` belief
+  routed through a guaranteed survivor instead; the no-data-plane-loops
+  scenario issues its item write through a fixed combined node, since a
+  control-only node has no DynamoDB listener and `ClientCtx::data()`
+  panics there). No production signature change.
+- **PR 3 (#822).** `NodeRole::Data` first-class at `SimCluster::new_
+  with_roles` (not only via `grow`) — `roles` must be **control-prefixed**
+  (every `Control`/`Both` entry before every `Data` one, at least one
+  control-bearing node), keeping the control voter set a contiguous
+  `0..control_count` node-id prefix. `restart` now dispatches purely on
+  `node < self.controls.len()` instead of panicking above that boundary.
+  Two real, previously-latent gaps in `SimCluster::grow` fixed while
+  factoring the shared construction path (`backup_janitor_loop` used to
+  spawn unconditionally on a grown node, a harmless but production-
+  inaccurate no-op; `ttl_reaper_loop` never spawned at all on a grown
+  node, a real gap — production spawns one on every data-only node). A
+  real, previously-latent bug found and fixed in `restart` itself: a
+  restarted control-bearing node's fresh `RaftNode` now takes
+  `control_ids` as its own membership, not `0..self.nodes` — safe only as
+  long as every node ran the control plane, which stopped being
+  guaranteed the instant any `NodeRole::Data` node exists. New module
+  `sim_cluster_data_only.rs`, 5 scenarios/10 tests. No production
+  signature change — `resolve_cp_route`, `propose_schema`, and
+  `dynamo::create_table` all needed zero widening, verified by tracing
+  each, not merely asserted (see the "Mechanism" section below).
+- **PR 4a (#823).** Converts `control_only.rs` (3), `data_only.rs` (5),
+  `cluster_split.rs` (3) — 11 real-socket tests — into `sim_cluster_
+  control_data_split.rs` (11 scenarios × pinned-seed + `_over_seeds` = 22
+  tests). Trims the three real-socket files to what only real sockets
+  prove (one bring-up smoke each in `control_only.rs`/`data_only.rs`;
+  `cluster_split.rs` deleted whole, zero residual). One new `SimCluster`
+  accessor, `control_voters`. Two scenario-authoring bugs found and fixed
+  (a bare 3-control-only cluster can never provision a wire `CreateTable`
+  at all — no data-capable member, `await_table_serveable` spins forever
+  — fixed by widening to `[Control, Control, Control, Data]`; a crash+put
+  scenario omitted the `create_table` call `SimCluster::put`'s non-
+  auto-provisioning `cp_kind_write_raw` needs, unlike production's
+  auto-provisioning plain-protocol `Put`). Gate-confirmed: baseline `cargo
+  test -p animusd --lib -- sim_cluster` 500 passed/2 ignored before this
+  PR; 22 new tests, zero regressions; full unfiltered `--lib` 700
+  passed/0 failed/3 ignored.
+- **PR 4b (#824).** Converts 6 of `split_cluster.rs`'s 8 tests into
+  `sim_cluster_split_cluster.rs` (6 scenarios × pinned-seed +
+  `_over_seeds` = 12 tests) — kept as its own module rather than folded
+  into PR 4a's (a first attempt grew that file past this rung's own
+  ~1800-line guidance and was reverted). Trims `tests/split_cluster.rs`
+  to its two genuine class-B residuals, kept whole, not deleted:
+  `full_split_cluster_restart_recovers_metadata_and_data` (a real
+  on-disk `StorageBackend::Lsm` full-outage restart) and `cluster_
+  control_data_threads_quiesce_after_to_admin_config` (the real
+  `start_split_cluster_with_growth` config-parse/process-boundary path)
+  — correcting the PR 1 opener's own pre-grep "8, deleted whole"
+  estimate, per this crate's own "grep the plan draft against the tree"
+  precedent (rung K). One new accessor, `control_leader_index_
+  excluding`, and three scenario-local retry helpers
+  (`create_table_after_recovery`/`put_retry`/`put_raw_retry`) for
+  post-fault races a converted scenario's own single-shot call surfaced
+  that the original's real-time buffer had papered over. Gate-confirmed:
+  `sim_cluster`-filtered tier 534 passed/0 failed/2 ignored (522 baseline
+  + 12); full unfiltered `--lib` 712 passed/0 failed/3 ignored.
+- **PR 4c (#825).** Converts the two role-named tests in `console_
+  endpoint.rs` and the two in `dashboard_endpoint.rs`, extending the
+  existing `sim_cluster_console.rs`/`sim_cluster_dashboard.rs` modules (7
+  new tests: one scenario pair each for the console tests, one scenario
+  pair converting `control_node_streams_read_path_is_ground_truth`
+  whole, plus the `#[should_panic]` `console_item_write_from_a_control_
+  only_node_panics`, which carries no `_over_seeds` sibling since a
+  panicking test only ever exercises its first seed). **A real finding,
+  confirmed by running the scenario, not by inspection**: a console item
+  mutation dispatched against a control-only node's own `ClientCtx`
+  genuinely panics too, inside `dynamo::fast_marker_write`'s
+  unconditional `ctx.data().request_rates.observe(..)` read on the
+  issuing node before any routing decision — the exact mechanism `Node::
+  console_addr()`'s own panic keeps structurally unreachable in
+  production (a control-only node never binds the console listener at
+  all), not a product bug. `console_endpoint.rs` stays at 3 tests (both
+  role-named tests kept whole, mixed classification, now pointing at
+  their sim siblings instead of the stale "no node-role concept"
+  reason); `dashboard_endpoint.rs` goes 4 → 3 (`control_node_streams_
+  read_path_is_ground_truth` removed, fully converted, no real HTTP
+  framing in it at all). Gate-confirmed: `sim_cluster` tier 541 passed/0
+  failed/2 ignored (534 baseline + 7). **This PR's own appendix flagged
+  that it made no ADR/roadmap edit and that a future doc-only PR should
+  reconcile the rung-L disposition tables with its findings — this PR is
+  that reconciliation** (see the corrected row-L text above).
+- **PR 4d (#826).** Converts `stream_janitor.rs`'s last role-named
+  residual, `segment_janitor_reclaims_objects_from_a_genuinely_control_
+  only_leader` (kept `ProdEnv` by C-07 PR 5, back when `SimCluster` had
+  no role concept at all), extending `sim_cluster_stream_janitor.rs` (2
+  new tests). `stream_janitor.rs` goes 2 → 1 — its other test,
+  `repair_re_replicates_to_a_fresh_target_after_a_replica_node_dies`,
+  is not role-relevant (the shared `S3`-backed segment store has no
+  per-node replica concept at all, a C-07-assessed permanent residual
+  untouched by this rung). No new fixture primitive needed; every
+  primitive the new scenario uses already existed from earlier C-07/C-12
+  PRs. Gate-confirmed: `sim_cluster` tier **543 passed, 0 failed, 2
+  ignored** (541 baseline + 2).
+- **PR 4e (#827).** Converts 11 of `tests/control_membership_admin.rs`'s
+  12 tests — the rung's own distinguishing shortfall, requested as a
+  direct follow-up once this close-out's own first draft found no landed
+  PR had touched the file — into a new `sim_cluster_control_membership_
+  admin.rs` (11 scenarios × pinned-seed + `_over_seeds` = 22 tests). Also
+  re-classifies the file's 12th test on its own merits rather than the
+  opener's inherited label: `admin_config_reports_the_internal_addr_the_
+  cli_resolves_control_add_through` never parses a `--config` file at all
+  (`bring_up_combined` builds its `ClusterConfig` in-process) and only
+  asserts a `GET /admin/config` JSON-shape fact `SimCluster::admin`
+  already reaches — convertible, not permanent, and converted. The one
+  test that stays real-socket for good, `runtime_added_voter_survives_
+  leadership_change_to_a_different_original_voter`, pins `ProdEnv::
+  merge_peer`'s own known scope limit (a runtime-added voter's dial
+  address is only ever merged into whichever node happened to be leader
+  at add time, until the replicated `NodeAddrs.control` field +
+  `control_peer_sync_loop` catch every other voter up) — structurally
+  invisible under `SimEnv`, whose `Env::merge_peer` is a documented no-op
+  and whose route table is fully seeded at construction.
+  `grow_control_group_converges_everywhere` converts as a weakened
+  substitute (remove-then-re-add an existing control-bearing node, since
+  `SimCluster::grow` supports data-only growth only). Found and fixed one
+  real, previously-latent production bug along the way — this crate's
+  fifth recorded recurrence of the "generic signature ≠ seam-clean body"
+  lesson: `ClientCtx::admin_remove_control_member`'s leader-self-removal
+  transfer-wait loop read `tokio::time::Instant::now()`/`tokio::time::
+  sleep` directly despite an already-generic `<E, R>` signature, panicking
+  under `SimEnv` with no real Tokio reactor; fixed with `self.env.now()`/
+  `self.env.sleep(..)`, re-verified behavior-preserving under `ProdEnv` by
+  re-running every other real-socket caller of the method/route (15
+  passed). No generic admin dispatch arm was needed — every route the
+  module drives was already a trait method on both `AdminHost` impls.
+  Gate-confirmed: `sim_cluster` tier **565 passed, 0 failed, 2 ignored**
+  (543 baseline + 22), confirmed via four module-filter-grouped runs
+  covering all 567 tests the `sim_cluster` filter lists at least once,
+  zero failures.
+- **PR 5 (this PR).** The close-out — this amendment, `docs/roadmap.md`'s
+  C-12 close plus a new C-13 candidate entry, and `crates/animusd/
+  CLAUDE.md`'s consolidated appendix. No source, test, or `Cargo` change.
+
+### Mechanism, as it stands after the rung
+
+`SimCluster` tracks one `NodeRole` per node index (`roles: Vec<NodeRole>`
+— the production `NodeRole` from `config.rs`, not a new fixture-local
+type). `new`/`new_with_segment_janitor_retention` are unchanged thin
+wrappers over `new_with_roles`/`new_with_roles_and_segment_janitor_
+retention`, passing `vec![NodeRole::Both; nodes]`.
+
+- **A `NodeRole::Control` node**: `data: None`, no `host::Reconciler`, no
+  `ttl_reaper_loop` (nothing to host, no engine to scan), no fixture-only
+  `heartbeat_loop` (never registered into `Metadata::members`, so nothing
+  to heartbeat about — mirrors production's own doc verbatim);
+  `backup_janitor_loop`/`segment_janitor_loop`/`index_backfill_loop` and
+  the control `RaftNode` itself still run, exactly as on a combined node
+  (control-plane-leader-gated, not data-role-gated — W-10/ADR 0043 §A9).
+- **A `NodeRole::Data` node**: built exactly like `SimCluster::grow`
+  already built its own grown one — `ControlHandle::Remote(RemoteControl
+  Client::new(control_seeds, ..))` dialing the control-bearing node ids, a
+  real `host::Reconciler`, a `heartbeat_loop` targeting the control-
+  bearing prefix (never the whole node set), a `ttl_reaper_loop`, and
+  `spawn_remote_mirror_sync_loop`. Deliberately never spawned:
+  `backup_janitor_loop`/`segment_janitor_loop`/`index_backfill_loop` —
+  control-plane-leader-only, and a `Remote` handle can structurally never
+  become control-plane leader (verified directly against `BoundDataNode::
+  start_data_with_growth`, which spawns none of the three either).
+- **The control-prefixed rule**: `roles` must place every `Control`/
+  `Both` entry before every `Data` entry, with at least one control-
+  bearing node — so the control voter set is always node ids
+  `0..control_count`, keeping `self.controls` (one local `RaftNode
+  <SimEnv>` per control-bearing node) a contiguous, index-aligned prefix
+  for the cluster's whole lifetime. This is the load-bearing invariant
+  `restart`'s role dispatch (`node < self.controls.len()`) and every
+  other per-role accessor added this rung depend on.
+- **`restart` semantics**: dispatches purely on `node < self.controls.
+  len()` — below it, control-bearing (`Local` handle, unchanged apart
+  from the `control_ids`-not-`0..self.nodes` membership fix); at or above
+  it, data-only (`Remote` handle, mirror-sync loop, and every data-role
+  loop it actually owns), whether the node was minted `NodeRole::Data` at
+  construction or added later via `grow` — the two are indistinguishable
+  to `restart`. `crash` needed no change anywhere in this rung — already
+  fully role-agnostic (`self.sim.crash(nid(node))` mutes by node id,
+  independent of role or `self.controls`' own bounds), and `Drop for
+  SimCluster`/`Simulator::shutdown` already tear down every node's tasks,
+  mirror-sync loop included, uniformly regardless of role.
+- **Routing and DDL needed zero new production code, verified by tracing
+  each call site, not merely asserted**: `ClientCtx::resolve_cp_route`
+  depends only on the issuing node's own edge state, never on whether
+  `self.control` is `Local` or `Remote`; `ClientCtx::propose_schema`'s
+  `Remote`-handle fallback (leader hint, then bounded broadcast) already
+  reaches a control-bearing node's relay server the way a real join
+  would; `dynamo::create_table` never calls `ctx.data()` at all.
+
+### What was deferred — the seed-join rung, the next candidate (C-13)
+
+`SimCluster::grow` — the template PR 3 extended into first-class `NodeRole
+::Data` construction — deliberately **bypasses the ADR 0030/0032 join
+dance**: it proposes `MetaCommand::RegisterNode` + `MetaCommand::
+UpsertMember{Active}` directly on the current control leader, the
+identical control-plane-Raft-bypass idiom `SimCluster::seed_members`
+already uses for the initial node set, never `ClientCtx::admin_add_
+member`'s real relay + `Down`-then-failure-detector-promotion dance. This
+rung's own role-split mechanism proves a data-only (or control-only)
+node's control/data split works once it exists; it does not prove how a
+real `animusd data --seed ADDR` process finds that split in the first
+place. Four files/9 tests, confirmed unchanged by this rung: `data_
+join.rs` (1, data-only `--seed` discovery of a pre-existing split
+deployment), `seed_join.rs` (1, combined-mode `--seed` discovery, ADR
+0032 PR2), `seed_join_allocated.rs` (5, self-minted member ids over
+`--seed`, ADR 0040), `control_membership_split.rs` (2, runtime control-
+quorum growth/voter-replace over a genuine split deployment, driven
+through the real admin HTTP surface rather than `SimCluster`'s direct-
+propose bypass). This is the natural next rung — see `docs/roadmap.md`'s
+new C-13 entry for the inventory; not opened, no PRs, no plan drafted
+beyond this pointer.
+
+### The assess-and-close verdict on the permanent groups
+
+Rung K's own close-out recommended assessing, not converting, five named
+residuals: `control_mirror_restart.rs`/`control_metadata_restart.rs`
+(real-disk restart), `seed_join_hostname.rs` (real DNS), `config_node_
+identity.rs`, and `control_membership_admin.rs`'s own `--config` residue.
+This close-out reads each of the first four (the fifth is addressed under
+"A shortfall against the plan" below, since reading it changed its
+disposition, and again once PR 4e's own actual conversion work landed)
+against the actual current test body, per this PR's own instruction to
+state precisely what each needs rather than propagate the inherited label
+unread — the same discipline rung K's own close-out applied to the "no
+`DataRole`" claim, turned here on a different family of inherited claims
+(residual permanence, not fixture capability). PR 4e's own conversion
+work found a sixth, genuinely permanent test in `control_membership_
+admin.rs` — not part of rung K's original five, since rung K's list named
+only the whole-file "--config" residue, not this test specifically —
+added to the table below.
+
+| File | Tests | What it actually needs (read directly, not inferred from the file name) | Verdict |
+|---|---|---|---|
+| `control_mirror_restart.rs` | 2 | A control-only node's dedicated system-keyspace `LsmEngine` survives a real `ProdEnv` process restart — the test opens an **entirely separate `LsmEngine` handle** (`read_mirror_from_disk`) against the same on-disk directory *after* the node that wrote it has been shut down, proving real bytes on real disk, independent of any node's in-memory state | **Permanent.** `SimCluster` has no real disk, no process boundary, no second reader over the same bytes — genuine |
+| `control_metadata_restart.rs` | 2 | The same real-disk crash/restart proof for the other two legs: a combined node's `Metadata` recovered via the shared CP-data engine, and an `--ephemeral` control-only node's restart *not* inheriting its previous `Metadata` | **Permanent.** Identical reason |
+| `seed_join_hostname.rs` | 1 | A `localhost:<port>` seed resolves via the real `TcpStream::connect`'s `ToSocketAddrs` machinery at dial time — genuine OS-level DNS resolution, no pre-resolution step to fake | **Permanent.** `SimCluster`'s `SimRelayClient` dials by node id, not by resolving a hostname string; no DNS stack under `SimEnv` |
+| `config_node_identity.rs` | 1 | Regression-pins `Node::bind`/`bind_control`/`bind_data`'s identity derivation (a real bug: these functions used to bind under `config::node_id(index)` instead of the loaded config's own `RoleAddrs::id`) — `SimCluster::new_with_roles` never calls `Node::bind` anywhere; it builds `RaftNode<SimEnv>`/`ClientCtx` directly through its own fixture-specific construction | **Permanent**, but re-labeled: the prior "operator-style id `--config` bring-up" reason named the wrong mechanism (this test never parses a `--config FILE`; it calls `animusd::run_node` with an in-process `ClusterConfig` like dozens of other tests in this crate). The genuine reason is that it pins **`Node::bind`'s own identity-derivation code**, a real-assembly-layer surface `SimCluster` structurally bypasses — same permanence, corrected reason |
+| `control_membership_admin.rs` (`runtime_added_voter_survives_leadership_change_to_a_different_original_voter`) | 1 | Pins `ProdEnv::merge_peer`'s own known scope limit — a runtime-added voter's dial address is only ever merged into whichever node happened to be leader at add time, until the replicated `NodeAddrs.control` field + `control_peer_sync_loop` catch every other voter up | **Permanent** (found by PR 4e, not inherited). `Env::merge_peer` has a no-op default `SimEnv` never overrides, and `SimCluster` seeds every node's full route table at construction, so every `SimEnv` node already knows how to dial every other one regardless of which node added it or when — nothing for a `SimCluster` scenario to observe going wrong before the fix, or right after it |
+
+### A shortfall against the plan, found by this close-out — and resolved
+
+The opener's own real-socket inventory named `control_membership_
+admin.rs` as "11 of 12 convert" (in PR 4a/4b), with the 12th —
+`admin_config_reports_the_internal_addr_the_cli_resolves_control_add_
+through` — as a permanent `--config`-bring-up residue. **Neither had
+happened as of this close-out's own first draft.** `git show --stat` on
+every PR landed through PR 4d (#808, #822, #823, #824, #825, #826)
+confirmed none touched `tests/control_membership_admin.rs` at all;
+`grep -c '#\[tokio::test' tests/control_membership_admin.rs` on the
+branch tip still read **12**, unchanged from the opener's own count.
+This close-out treated that as a finding to report, not a fact to
+quietly absorb into "converted":
+
+1. **The 11 planned conversions had never been attempted.** The
+   mechanism they needed — `new_with_roles`, control-prefixed roles —
+   already existed in full from PR 2/3. This was not a capability gap
+   like the seed-join files above; it was an execution gap in this
+   rung's own PR series, caught only because this close-out re-grepped
+   every named file instead of trusting the opener's plan and the
+   PR-by-PR narrative at face value. **Resolved**: PR 4e (#827),
+   requested as the immediate next follow-up once this gap was found,
+   converted 11 of the 12 tests into a new `sim_cluster_control_
+   membership_admin.rs` (kept as its own module rather than folded into
+   `sim_cluster_control_data_split.rs`, per this rung's own
+   ~1800-line-per-module guidance).
+2. **Reading the 12th test (the one the opener called permanent)
+   overturned that classification too.** Its own bring-up helper
+   (`bring_up_combined`) constructs a `ClusterConfig` in-process and
+   calls `animusd::run_node` directly — no `--config FILE`, no CLI
+   parse, anywhere in the test. Its only assertions are a `GET /admin/
+   config` JSON-shape check (`addrs.internal` present and parseable, the
+   pre-ADR-0040 legacy `control` key gone) — a fact `SimCluster::admin`'s
+   existing generic dispatch already reaches for a sibling assertion
+   elsewhere in the same file family (`sim_cluster_admin.rs::admin_
+   config_reports_auth_state_and_never_serves_the_secret`, added C-08 PR
+   5). **Also convertible, also not permanent** — and PR 4e converted it
+   too, confirming the re-classification by construction rather than
+   leaving it as a recommendation.
+
+Net effect: **`control_membership_admin.rs`'s 12 tests are now fully
+resolved — 11 converted by PR 4e, 1 (`runtime_added_voter_survives_
+leadership_change_to_a_different_original_voter`) kept permanently for a
+newly-found, genuinely structural reason** (`ProdEnv::merge_peer`'s
+scope-limit behaviour, invisible under `SimEnv` — see the assess-and-
+close verdict table above). The "`--config` bring-up (2/2)" class-D label
+this file's 12th test inherited from the D3 close (and every rung's
+residual inventory repeated unquestioned since) turns out to describe
+only `config_node_identity.rs` correctly; `crates/animusd/CLAUDE.md`'s
+residual inventory is corrected in this same PR to stop citing
+`control_membership_admin.rs`'s residue under that label, and now cites
+its actual permanent test under its actual reason instead. This is the
+second time in two consecutive rungs a residual's own inherited "why it
+stays `ProdEnv`" claim, echoed across multiple close-outs without being
+re-read against the current test body, turned out wrong on inspection
+(rung K found the same shape for "no `DataRole` under `SimCluster`") —
+and the first time in this rung's own history that finding such a gap
+led to a follow-up PR closing it within the same rung, rather than being
+carried forward past the rung's own close. See `docs/engineering-
+lessons.md`'s C-12 close-out entry for the generalized lesson, now with
+this resolution.
+
+### Test-count trajectory
+
+`cargo test -p animusd --lib -- sim_cluster --test-threads=2`, whole
+tier, from each PR's own attested gate run (PR 2/3 authored without a
+recorded gate run — no `cargo` access at the time — so their combined
+contribution is the difference between C-11's own close (478) and PR
+4a's own attested baseline): **478 (C-11 close) → 500 (PR 2 + PR 3
+combined, confirmed by PR 4a's own baseline gate run, +22) → 522 (after
+PR 4a's own 22 new tests) → 534 (PR 4b, +12) → 541 (PR 4c, +7) → 543
+(PR 4d, +2) → 565 passed, 0 failed, 2 ignored (PR 4e, +22)**. Every PR's
+own gate run reported 0 failed, 2 ignored throughout (the two
+pre-existing ignored tests, unchanged) — **567 total** — and the crate's
+full unfiltered `--lib` suite (run twice, PR 4a and PR 4b) stayed green
+with zero regressions (700 passed/0 failed/3 ignored; 712 passed/0
+failed/3 ignored); PR 4e's own gate re-confirmed the 567 total via a
+`--list sim_cluster` cross-check against four module-filter-grouped runs
+covering every `sim_cluster_*` module at least once, zero failures.
+
+### Real-socket counts, before rung L and after
+
+| File | Before | After | Real-socket tests removed |
+|---|---|---|---|
+| `control_only.rs` | 3 | 1 | 2 |
+| `data_only.rs` | 5 | 1 | 4 |
+| `cluster_split.rs` | 3 | 0 (deleted) | 3 |
+| `split_cluster.rs` | 8 | 2 | 6 |
+| `console_endpoint.rs` | 3 | 3 | 0 (both role-named tests kept, mixed) |
+| `dashboard_endpoint.rs` | 4 | 3 | 1 |
+| `stream_janitor.rs` | 2 | 1 | 1 |
+| `control_membership_admin.rs` | 12 | 1 | 11 (PR 4e) |
+| **Total (8 files)** | **40** | **12** | **28** |
+
+The rung's own class-B residuals kept (each doc-commented in place with
+its own reason, quoted from the file):
+
+| Test (file) | One-line reason |
+|---|---|
+| `control_only_cluster_elects_leader_and_serves_status` (`control_only.rs`) | Real TCP accept loops, real HTTP/1.0 responses, a real on-disk system-keyspace engine |
+| `split_cluster_serves_reads_and_writes_across_data_nodes` (`data_only.rs`) | The `/admin/storage/control`/`/admin/system-table` availability contract — `ctx.control_storage` is always `None` under `SimCluster` regardless of role |
+| `full_split_cluster_restart_recovers_metadata_and_data` (`split_cluster.rs`) | A real on-disk `StorageBackend::Lsm` full-outage restart across every control and data process |
+| `cluster_control_data_threads_quiesce_after_to_admin_config` (`split_cluster.rs`) | The real `start_split_cluster_with_growth` config-parse/process-boundary path |
+| `console_serves_shell_assets_and_deep_links_on_combined_node` (`console_endpoint.rs`) | Real HTTP framing — status line, `Content-Type` headers, static-asset bytes, deep-link routing; already has a `sim_cluster_console.rs` sibling from C-08 |
+| `console_serves_shell_on_data_only_node` (`console_endpoint.rs`) | Real listener-binding/HTTP-framing half is a `Node`-level fact — no `Node` struct, no listener, under `SimCluster` for any role |
+| `console_addr_panics_on_control_only_node` (`console_endpoint.rs`) | The panic is a plain `Option<SocketAddr>` field fact on `Node`, not `ClientCtx`/`DataRole` — no `SimCluster` analog |
+| `dashboard_serves_spa_with_cors_and_peers` (`dashboard_endpoint.rs`) | Real HTTP framing — status line, `Content-Type`/CORS headers, `OPTIONS` preflight, static-asset bytes |
+| `dashboard_role_gating_split_deployment` (`dashboard_endpoint.rs`) | The literal shell/JS-asset `GET /` HTTP-framing check on both roles' admin ports, unrelated to role support itself |
+| `dashboard_u05_lineage_panel` (`dashboard_endpoint.rs`) | `GET /admin/system-table` reads `ctx.control_storage`, always `None` under `SimCluster` — the same C-08 PR 5 gap `system_table.rs` documents |
+| `repair_re_replicates_to_a_fresh_target_after_a_replica_node_dies` (`stream_janitor.rs`) | Needs a genuinely dead replica node; the shared `S3`-backed segment store has no per-node replica concept at all — a C-07-assessed permanent residual, unrelated to role |
+| `runtime_added_voter_survives_leadership_change_to_a_different_original_voter` (`control_membership_admin.rs`) | Pins `ProdEnv::merge_peer`'s own known scope limit — structurally invisible under `SimEnv`, whose `Env::merge_peer` is a documented no-op and whose route table is fully seeded at construction |
+
+### Website: no change needed, verified again at this close
+
+`grep -rn "SimCluster\|real-socket\|rung\|control-only\|data-only"
+website/` finds three files (`install.html`, `docs.html`, `how-it-
+works.html`) — every hit is a product-level claim about the
+control-only/data-only/combined **deployment shapes** themselves (already
+true in production, unchanged by this rung, which added test-fixture
+capability only — zero production signature changes across the whole
+rung's PR 2/3/4a-4d). None names `SimCluster`, testing, or this rung's
+own subject. No stale claim found, no edit needed.
+
+**Gates**: none — documentation only, no `cargo` command run. `git diff
+--stat` against the tip of PR 4d (#826) shows only the docs files this PR
+touches.
+
+**Docs**: this amendment (closing Rung L); `docs/roadmap.md`'s C-12 entry
+closed with its full PR list, its wave-13 sequencing row updated, and a
+new C-13 (seed-join rung) candidate entry added, not opened;
+`crates/animusd/CLAUDE.md`'s per-node-roles section and residual inventory
+updated to reflect closure, the corrected `control_membership_admin.rs`
+disposition, and the reclassified `config_node_identity.rs` reason; the
+four PR 4a-4d appendices folded into one consolidated appendix in the
+same shape rung K's own close-out used;
+`docs/engineering-lessons.md` gets one new close-out entry generalizing
+the "read the inherited residual label against the current test body, not
+against the accumulated citation trail" finding above — the same failure
+mode rung K found for fixture-capability claims, recurring here for
+residual-permanence claims and, worse, for whether a planned PR actually
+landed at all.
