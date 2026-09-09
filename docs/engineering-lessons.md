@@ -23992,6 +23992,63 @@ multi-thread runtime test can be completely wrong when the true bottleneck
 is disk fsync latency instead, and tuning the wrong knob (thread counts,
 sleeps, timeout) would have left the flake exactly as likely to recur.
 (`crates/animus-storage/tests/lsm_concurrent.rs`.)
+
+- **A poll with exponential back-off has an average overshoot of half a
+  step — when the producer already has a natural wake point, a
+  multi-waiter watch removes that overshoot for free, and reaching for a
+  single-`AtomicWaker` shortcut to build it is the wrong call the moment a
+  second waiter can exist** (cluster-performance follow-up to ADR 0049 §5
+  and issue #276). Every CP write confirm loop in `animusd::write_path`
+  (`cp_put_local`/`cp_delete_local`/`cp_kind_raw_local`/
+  `cp_kind_eval_local`/`poll_probe`) waited for its own accepted Raft entry
+  to apply via `sleep(poll); poll = (poll * 2).min(CP_CONFIRM_POLL_MAX)`,
+  `CP_CONFIRM_POLL_INIT` 200µs doubling to a 5ms cap. Real apply latency is
+  a few ms, so the doubling schedule's own checkpoints (0.2/0.6/1.4/3.0/
+  6.2ms) rounded every write up to whichever one came next — an average
+  half-a-step overshoot on top of the real latency, the generic cost of
+  *any* poll-based wait regardless of how well-tuned its interval is.
+  The fix is not a shorter initial interval or a gentler back-off curve —
+  both are still guessing at a cadence — but recognizing that the apply
+  task **already knows the instant it makes progress** (it is the thing
+  advancing `engine_applied`), so the wait belongs on a wake, not a timer.
+  `animus-cp-data` grew `AppliedWatch`, a multi-waiter watch bumped at
+  every site `engine_applied` advances, and every confirm loop's poll tail
+  became one shared `wait_applied_past` helper parked on it — a single
+  seed-driven measurement (`write_path::kind_eval_confirm_wake_tests`)
+  showed 20 sequential single-item writes drop from 4ms of virtual time
+  (the old scheme's `WRITE_COUNT * CP_CONFIRM_POLL_INIT` floor) to
+  **0ns**, because under `SimEnv`'s zero-latency network the apply task
+  simply gets its turn before the confirm task is polled again — no timer
+  needed at all. **The single-`AtomicWaker` shortcut (issue #276) was
+  wrong here for the identical reason it was wrong for `MetadataWatch`**:
+  a single-tablet leader routinely has many concurrent single-item writes
+  each confirming a distinct index at once, so `AppliedWatch` was built
+  multi-waiter (a `Mutex<BTreeMap<slot, Waker>>` registry, register-
+  before-check, `bump` drains and wakes every registered slot) from the
+  very first line, rather than starting single-waiter "because today there
+  is only one caller" and waiting for a second consumer to silently break
+  it the way `MetadataWatch` did. The one thing a pure wake-on-progress
+  wait cannot provide on its own is a **forced re-check**: if the awaited
+  index never applies at all (a lost leadership before commit), nothing
+  ever bumps the watch, so a bare `watch.changed(seen).await` with no
+  timeout would hang forever even though the surrounding loop's own
+  `confirm_wait_is_futile`/deadline logic is sitting right there ready to
+  catch it — the wait just never returns control to let it run. Proven
+  directly (`write_path::wait_applied_past_futility_tests`): a genuine
+  three-voter leadership change, engineered with `Simulator::partition`/
+  `heal` rather than `RaftKvNode::transfer_leadership` — an armed transfer
+  only freezes *new* proposes, it does not stop an already-accepted entry
+  from replicating and committing on a healthy zero-latency `SimEnv` link,
+  so a first draft using it always observed `Confirmed`, never the
+  `Superseded` the test needs; only fully isolating the leader before it
+  ever proposes guarantees the entry can never commit at all. So
+  `wait_applied_past` races its watch against a plain bounded sleep
+  (reusing the old scheme's own cap, `CP_CONFIRM_POLL_MAX`, repurposed
+  from an interval into a forced-recheck ceiling) — a wake-on-progress
+  primitive that removes a *poll's* timer still needs its own timeout the
+  moment "progress never happens" is a real, reachable state, not merely
+  "progress happens late." (`crates/animus-cp-data/src/lib.rs`,
+  `crates/animusd/src/write_path.rs`, `crates/animusd/src/lib.rs`.)
 ## A real-thread convergence poll pinned to a captured leader index is unsound the moment the mechanism it drives can legitimately re-elect (issue #781)
 
 `crates/animusd/tests/cp_reconfigure.rs::cp_group_follows_tablet_replica_set`

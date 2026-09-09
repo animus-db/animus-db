@@ -303,6 +303,27 @@ expectation. The general lesson (a helper promoted from a background path
 to a client hot path carries its background-tuned cadence with it — bench
 the promoted path) is recorded in `docs/engineering-lessons.md`.
 
+**Further amendment: the exponential confirm poll itself is gone
+(cluster-performance follow-up).** `CP_CONFIRM_POLL_INIT`/`_MAX`'s doubling
+schedule still rounded every write up to its own next checkpoint (0.2 /
+0.6 / 1.4 / 3.0 / 6.2ms) — an average half-a-step overshoot on top of real
+apply latency, on every confirm loop in `write_path.rs`, not just this
+one. Replaced by wake-on-apply: `animus-cp-data` grew a multi-waiter
+`AppliedWatch` (mirroring `animus-control`'s `MetadataWatch`, ADR 0031 —
+and, like it, deliberately never a lone `AtomicWaker`, since many
+concurrent single-item writes routinely wait on one leader's applied index
+at once; see the `docs/engineering-lessons.md` entry on issue #276's
+single-waiter lost-wakeup) bumped at every site the apply task's
+`engine_applied` watermark advances, and every confirm loop's poll/back-off
+tail became one shared `wait_applied_past` helper that parks on it —
+racing that park against a bounded `CP_CONFIRM_POLL_MAX` sleep so the
+loop's own `confirm_wait_is_futile`/deadline checks still fire on schedule
+even when the awaited index never applies at all (a lost leadership,
+`docs/engineering-lessons.md`'s issue #268 continuation). Semantics
+unchanged — same outcome classification, same futility/deadline logic,
+same `ProbeIdentity` gating (ADR 0018 §2 / issue #469) — only the sleep
+itself is gone.
+
 **Testing-plan deltas.** The corpus item ("a new corpus dimension for
 plain-table marker load") is deliberately **not** built: `animusd` has no
 `SimEnv` (it is the assembly layer over two sim-tested crates), the
