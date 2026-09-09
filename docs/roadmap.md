@@ -1056,15 +1056,56 @@ the still-true paragraph after the table.
   7 docs close-out.
 - **Depends:** C-09 (closed) — the next unowned residual group per C-08's
   and C-09's own close-outs, sequenced by the maintainer 2026-09-08.
-- **Status (2026-09-09):** open — PRs 1-6 landed (docs opener; groundwork;
-  `sim_cluster_dynamo_update_table_index.rs`, 9 tests, 3 files deleted
-  whole; `sim_cluster_backfill_seeder.rs`, 4 of `tests/backfill_seeder.rs`'s
-  5 scenarios converted, `split_during_backfill_converges_with_correct_
+- **Status (2026-09-09):** closed — PR 1 (docs opener), PR 2 (groundwork:
+  the four `dynamo.rs` functions and the `index_drain` seeder trio widened,
+  the `UpdateTable` index sub-arm, the always-on `index_backfill_loop`
+  spawn, `drive_backfill_seed`, a fourth `tokio::time`-body-in-an-already-
+  generic-signature fix in `clear_backfill_cursor`), PR 3
+  (`sim_cluster_dynamo_update_table_index.rs`, 9 tests from
+  `update_table_create_index.rs`/`update_table_drop_index.rs`/
+  `dynamo_gsi_drain.rs`, all three files deleted whole), PR 4
+  (`sim_cluster_backfill_seeder.rs`, 4 of `tests/backfill_seeder.rs`'s 5
+  scenarios converted, `split_during_backfill_converges_with_correct_
   final_gsi` kept `ProdEnv` per its own license, `restart` now respawns
-  `index_backfill::index_backfill_loop`; `sim_cluster_stream_backfill_
-  seed_filter.rs`, 2 tests, 1 file deleted whole; `sim_cluster_console_
-  table_config.rs`, 3 GSI-DDL scenarios converted, `console_table_config.rs`
-  trimmed to its 1 out-of-scope PITR test). PR 7 (docs close-out) pending.
+  `index_backfill::index_backfill_loop`), PR 5
+  (`sim_cluster_stream_backfill_seed_filter.rs`, 2 tests, 1 file deleted
+  whole), PR 6 (`sim_cluster_console_table_config.rs`, 3 GSI-DDL scenarios
+  converted, `console_table_config.rs` trimmed to its 1 out-of-scope PITR
+  test) all landed. `cargo test -p animusd --lib sim_cluster` ran 428 → 432
+  → 450 → 458 → 462 → **468 passed, 0 failed, 2 ignored**. **Closed
+  2026-09-09** by PR 7, the docs-only close-out — no source, test, or
+  `Cargo` change. Final residue: 16 tests (the three frozen files'
+  14 tests — `dynamo_index_scan.rs` #418, `index_backfill.rs` #592,
+  `dynamo_index_writes.rs` #610, untouched throughout — plus
+  `backfill_seeder.rs`'s one licensed residual and `console_table_config.rs`'s
+  one pre-excluded PITR residual), one more than the opener's own 15-test
+  prediction — a stated, pre-licensed deviation (the opener's own per-file
+  table already flagged `split_during_backfill`'s possible non-convergence),
+  not a new blocker. See ADR 0061's "Rung J" amendments (PR 2 through "Rung
+  J closed") and `crates/animusd/CLAUDE.md`'s matching consolidated index-DDL
+  section for the full record.
+
+---
+
+### C-11 throttle-metric counters `SimCluster` dispatch
+
+- **Problem:** per-table throttle-metric counters (ADR 0065's throttling
+  mechanism's own observability surface) are provable only over `ProdEnv`
+  today — the smallest of the four groups left unowned after C-10 (1
+  file/6 tests per the D3-closing class-D breakdown, unchanged since).
+- **What:** plan drafted, awaiting the maintainer's sequencing — see ADR
+  0061's "Rung J closed" amendment's own "what remains unowned after C-10"
+  paragraph for the candidate list and why this one is recommended first
+  (smallest, no new deployment-shape fixture needed, unlike the
+  control/data role split or `--config` bring-up).
+- **ADR:** [0061](adr/0061-testability-node-crate-simulator.md) (rung K,
+  not yet opened), [0065](adr/0065-per-table-throttling.md) (the throttling
+  mechanism itself).
+- **Size:** unassessed — plan drafted, not yet sized PR-by-PR.
+- **Depends:** C-10 (closed) — the next unowned residual group per C-08's,
+  C-09's, and C-10's own close-outs.
+- **Status (2026-09-09):** not started — plan drafted, awaiting the
+  maintainer's sequencing.
 
 ---
 
@@ -1146,7 +1187,7 @@ wave are independent and can run in parallel.
 | 8 | C-07 (closed 2026-09-08 — all six PRs landed: #758, #759, #760, #761, #762, plus PR 6) | Gated on C-04 (closed) and C-06 (closed) — the same generic dispatch cores, plus C-06's own Transact widening |
 | 9 | C-08 (closed 2026-09-08 — all eight PRs landed: #764, #765, #766, #767, #773, #776, #777, PR 8) | Gated on C-04 (closed), C-06 (closed), and C-07 (closed) — the same generic dispatch cores, plus rung C5's own widening of `ClientCtx`'s field types |
 | 10 | C-09 (closed 2026-09-09 — all six PRs landed: #780, #782, #785, #786, #787, plus PR 6) | Gated on C-08 (closed) — C-08's own close-out recommendation, stacked directly on it |
-| 11 | C-10 (open, PRs 1-6 landed 2026-09-09 — docs opener; groundwork generalizing `UpdateTable`'s GSI add/drop sub-arm under `SimCluster`; `sim_cluster_dynamo_update_table_index.rs` converting `update_table_create_index.rs`/`update_table_drop_index.rs`/`dynamo_gsi_drain.rs` (9 tests), all three deleted whole; `sim_cluster_backfill_seeder.rs`, 4 of `tests/backfill_seeder.rs`'s 5 scenarios converted, `split_during_backfill_converges_with_correct_final_gsi` kept `ProdEnv` per its own license; `sim_cluster_stream_backfill_seed_filter.rs` converting `stream_backfill_seed_filter.rs`'s 2 tests, file deleted whole; `sim_cluster_console_table_config.rs`'s 3 GSI-DDL scenarios converted from `console_table_config.rs`, file trimmed to its 1 out-of-scope PITR test: index DDL beyond plain `CreateTable`, sequenced after C-09 by the maintainer 2026-09-08; PR 7 close-out pending) | Gated on C-09 (closed) — the next unowned residual group per C-08's and C-09's own close-outs |
+| 11 | C-10 (closed 2026-09-09 — all seven PRs landed: #789, #790, #791, #792, #793, #794, plus PR 7) | Gated on C-09 (closed) — the next unowned residual group per C-08's and C-09's own close-outs |
 
 Open issues mapped: none left (#375 closed by W-01, #319 by W-05). Filed
 from wave 2's own findings: #590 (the operator still emits the deleted
