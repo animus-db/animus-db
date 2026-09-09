@@ -166,6 +166,34 @@
 //!     original's `sleep`-based poll did, no [`SimCluster::drive_ttl_sweep`]
 //!     needed since nothing here depends on an intermediate, pre-cadence
 //!     state (only "eventually reaped").
+//! (9) [`run_admin_metrics_reports_nonzero_throttled_counters`] (ADR 0061
+//!     rung K, C-11 PR 3) — the one scenario added to this module outside
+//!     its own original C-08/rung H scope: converts `tests/dynamo_
+//!     throttling.rs::admin_metrics_reports_nonzero_throttled_counters`,
+//!     the one of `dynamo_throttling.rs`'s six remaining sim-reachable
+//!     scenarios C-11 PR 2's own `sim_cluster_dynamo_throttle.rs`
+//!     deliberately left unconverted (see that module's own doc: its
+//!     forwarded-write scenario proves the `ThrottledWrites`/
+//!     `ThrottledReads` sink is live under `SimCluster` but does not itself
+//!     assert the counter, naming this test as the follow-up). A
+//!     single-node `SimCluster` (mirrors the real-socket original's own
+//!     `bring_up(1, ..)`): seed a `PutItem`, `SimCluster::
+//!     set_throttle_defaults_all` to `Some(1)`/`Some(1)`, drain the write
+//!     bucket with a bounded `PutItem` loop and the read bucket with a
+//!     bounded `GetItem` loop (the original's own 20/40 iteration caps),
+//!     then `GET /admin/metrics` on the table's own tablet leader
+//!     ([`leader_of_table`] — with a single node this always resolves to
+//!     node 0, but is looked up rather than assumed, the same per-node-
+//!     metrics-sink discipline `sim_cluster_dynamo_throttle.rs`'s own
+//!     forwarded-write scenario established: the counter increments on
+//!     whichever node's own bucket actually refused, never a fixed node).
+//!     Asserts `counters.throttled_writes > 0`, `counters.throttled_reads >
+//!     0`, and a nonempty per-tablet `throttle` array — verbatim the
+//!     original's own three assertions. No product code change needed,
+//!     the same "widen once, already-generic" shape every scenario in this
+//!     rung has used. `crates/animusd/tests/dynamo_throttling.rs` is
+//!     trimmed to its one remaining residual in this same PR — see that
+//!     file's own module doc.
 //!
 //! ## Kept `ProdEnv`, in `tests/admin_endpoint.rs` (each with its own
 //! reason comment; PR 6's own mutating-action tests are untouched here,
@@ -1059,5 +1087,117 @@ fn admin_ttl_reports_reaper_progress_and_ttl_tables() {
 fn admin_ttl_reports_reaper_progress_and_ttl_tables_over_seeds() {
     for i in 0..5 {
         run_admin_ttl_reports_reaper_progress_and_ttl_tables(0xC085_0800 + i);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// (9) admin_metrics_reports_nonzero_throttled_counters (ADR 0061 rung K,
+//     C-11 PR 3) — converted from `tests/dynamo_throttling.rs`'s test of
+//     the same name.
+// ---------------------------------------------------------------------------
+
+/// A large (~256 KiB), JSON-safe attribute value — mirrors `dynamo_
+/// throttling.rs::big_value`/`sim_cluster_dynamo_throttle.rs`'s own copy:
+/// big enough that a single `PutItem`/`GetItem` costs many capacity units,
+/// clearing `SimCluster::dynamo`'s own per-call `OP_BUDGET` (12s of
+/// virtual-clock refill) by a wide margin. Redeclared here rather than
+/// reused from `sim_cluster_dynamo_throttle.rs`, per this crate's own
+/// per-file-fixture convention (that module's own doc: favors a literal
+/// re-declaration over reaching into a sibling module's `pub(crate)`
+/// helper).
+fn big_value() -> String {
+    "x".repeat(256 * 1024)
+}
+
+fn put_body(table: &str, id: &str, value: &str) -> String {
+    format!(r#"{{"TableName":"{table}","Item":{{"id":{{"S":"{id}"}},"v":{{"S":"{value}"}}}}}}"#)
+}
+
+fn run_admin_metrics_reports_nonzero_throttled_counters(seed: u64) {
+    let mut cluster = SimCluster::new(seed, 1, 1);
+
+    let (status, body) = create_table_via_wire(
+        &mut cluster,
+        0,
+        r#"{"TableName":"thr_metrics","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
+            "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}]}"#,
+    );
+    assert_eq!(
+        status, 200,
+        "seed={seed}: CreateTable(thr_metrics) failed: {body}"
+    );
+
+    let value = big_value();
+    let (status, body) = cluster.dynamo(
+        0,
+        "DynamoDB_20120810.PutItem",
+        put_body("thr_metrics", "seed", &value).as_bytes(),
+    );
+    assert_eq!(status, 200, "seed={seed}: seed put failed: {body}");
+
+    cluster.set_throttle_defaults_all(Some(1), Some(1));
+
+    // Drain the write bucket.
+    for i in 0..20 {
+        let (status, _) = cluster.dynamo(
+            0,
+            "DynamoDB_20120810.PutItem",
+            put_body("thr_metrics", &format!("w{i}"), &value).as_bytes(),
+        );
+        if status == 400 {
+            break;
+        }
+    }
+    // Drain the read bucket.
+    for _ in 0..40 {
+        let (status, _) = cluster.dynamo(
+            0,
+            "DynamoDB_20120810.GetItem",
+            br#"{"TableName":"thr_metrics","ConsistentRead":true,"Key":{"id":{"S":"seed"}}}"#,
+        );
+        if status == 400 {
+            break;
+        }
+    }
+
+    // The per-node metrics sink: the counter increments on whichever node's
+    // own bucket actually refused. With this scenario's single-node
+    // cluster there is only ever one candidate, but it is looked up via
+    // the table's own tablet leader ([`leader_of_table`]) rather than
+    // assumed to be node 0 — the same discipline `sim_cluster_dynamo_
+    // throttle.rs`'s own forwarded-write scenario established for the
+    // multi-node case.
+    let leader = leader_of_table(&cluster, "thr_metrics");
+    let (status, metrics) = cluster.admin(leader, "GET", "/admin/metrics", "", &[]);
+    assert_eq!(status, 200, "seed={seed}: {metrics}");
+    let v = json(&metrics);
+    let throttled_writes = v["counters"]["throttled_writes"].as_u64().unwrap_or(0);
+    let throttled_reads = v["counters"]["throttled_reads"].as_u64().unwrap_or(0);
+    assert!(
+        throttled_writes > 0,
+        "seed={seed}: expected a nonzero throttled_writes counter: {v}"
+    );
+    assert!(
+        throttled_reads > 0,
+        "seed={seed}: expected a nonzero throttled_reads counter: {v}"
+    );
+    let throttle_array = v["throttle"]
+        .as_array()
+        .unwrap_or_else(|| panic!("seed={seed}: no throttle array in: {v}"));
+    assert!(
+        !throttle_array.is_empty(),
+        "seed={seed}: expected at least one tracked tablet in the throttle array: {v}"
+    );
+}
+
+#[test]
+fn admin_metrics_reports_nonzero_throttled_counters() {
+    run_admin_metrics_reports_nonzero_throttled_counters(env_seed(0xC085_0009));
+}
+
+#[test]
+fn admin_metrics_reports_nonzero_throttled_counters_over_seeds() {
+    for i in 0..5 {
+        run_admin_metrics_reports_nonzero_throttled_counters(0xC085_0900 + i);
     }
 }

@@ -1056,14 +1056,121 @@ the still-true paragraph after the table.
   7 docs close-out.
 - **Depends:** C-09 (closed) — the next unowned residual group per C-08's
   and C-09's own close-outs, sequenced by the maintainer 2026-09-08.
-- **Status (2026-09-09):** open — PRs 1-5 landed (docs opener; groundwork;
-  `sim_cluster_dynamo_update_table_index.rs`, 9 tests, 3 files deleted
-  whole; `sim_cluster_backfill_seeder.rs`, 4 of `tests/backfill_seeder.rs`'s
-  5 scenarios converted, `split_during_backfill_converges_with_correct_
+- **Status (2026-09-09):** closed — PR 1 (docs opener), PR 2 (groundwork:
+  the four `dynamo.rs` functions and the `index_drain` seeder trio widened,
+  the `UpdateTable` index sub-arm, the always-on `index_backfill_loop`
+  spawn, `drive_backfill_seed`, a fourth `tokio::time`-body-in-an-already-
+  generic-signature fix in `clear_backfill_cursor`), PR 3
+  (`sim_cluster_dynamo_update_table_index.rs`, 9 tests from
+  `update_table_create_index.rs`/`update_table_drop_index.rs`/
+  `dynamo_gsi_drain.rs`, all three files deleted whole), PR 4
+  (`sim_cluster_backfill_seeder.rs`, 4 of `tests/backfill_seeder.rs`'s 5
+  scenarios converted, `split_during_backfill_converges_with_correct_
   final_gsi` kept `ProdEnv` per its own license, `restart` now respawns
-  `index_backfill::index_backfill_loop`; `sim_cluster_stream_backfill_
-  seed_filter.rs`, 2 tests, 1 file deleted whole). PR 6 (console residue)
-  in progress; PR 7 close-out pending.
+  `index_backfill::index_backfill_loop`), PR 5
+  (`sim_cluster_stream_backfill_seed_filter.rs`, 2 tests, 1 file deleted
+  whole), PR 6 (`sim_cluster_console_table_config.rs`, 3 GSI-DDL scenarios
+  converted, `console_table_config.rs` trimmed to its 1 out-of-scope PITR
+  test) all landed. `cargo test -p animusd --lib sim_cluster` ran 428 → 432
+  → 450 → 458 → 462 → **468 passed, 0 failed, 2 ignored**. **Closed
+  2026-09-09** by PR 7, the docs-only close-out — no source, test, or
+  `Cargo` change. Final residue: 16 tests (the three frozen files'
+  14 tests — `dynamo_index_scan.rs` #418, `index_backfill.rs` #592,
+  `dynamo_index_writes.rs` #610, untouched throughout — plus
+  `backfill_seeder.rs`'s one licensed residual and `console_table_config.rs`'s
+  one pre-excluded PITR residual), one more than the opener's own 15-test
+  prediction — a stated, pre-licensed deviation (the opener's own per-file
+  table already flagged `split_during_backfill`'s possible non-convergence),
+  not a new blocker. See ADR 0061's "Rung J" amendments (PR 2 through "Rung
+  J closed") and `crates/animusd/CLAUDE.md`'s matching consolidated index-DDL
+  section for the full record.
+
+---
+
+### C-11 throttle-metric counters `SimCluster` dispatch
+
+- **Problem:** per-table throttle-metric counters (ADR 0065's throttling
+  mechanism's own observability surface) are provable only over `ProdEnv`
+  today — the smallest of the four groups left unowned after C-10 (1
+  file/6 tests per the D3-closing class-D breakdown, unchanged since). The
+  group's own documented blocker (the claim that `SimCluster`'s nodes
+  carry no metrics sink) turned out stale on inspection: they have carried
+  a real one since rung D2 PR 1.
+- **What:** `dynamo::kind_write_item_at_leader`/`run_transact`/
+  `dispatch_item_op` and the read-path precharge site are all already
+  generic and already increment `Metric::ThrottledWrites`/`ThrottledReads`
+  via `ctx.data().raftkv_metrics`/`data.raftkv_metrics` — zero production
+  signature changes needed, this rung's own distinguishing property.
+  4 PRs: PR 1 the docs opener (also corrects the first two of the stale
+  claim's three copies — the module docs saying the counters never
+  increment under `SimCluster`); PR 2 `sim_cluster_dynamo_throttle.rs`
+  converting the four wire-shape tests (`BatchWriteItem`/`BatchGetItem`
+  shedding, `TransactWriteItems` cancellation, a forwarded-write throttle
+  check), each calling `SimCluster::set_throttle_defaults_all` before the
+  burst that trips the limit — `tests/dynamo_throttling.rs` stayed
+  untrimmed until PR 3; PR 3 added `admin_metrics_reports_nonzero_
+  throttled_counters` into `sim_cluster_admin.rs`, trimming
+  `dynamo_throttling.rs` to its one residual
+  (`cluster_wide_throttle_default_is_overridden_by_a_tables_own_
+  throughput`, a `run_node_with_cluster_settings`-only config-parse test
+  that stays permanent); PR 4 the docs close-out, plus the third copy of
+  the stale claim (`sim_cluster.rs:1427`'s own `AdminInfo` comment,
+  comment-only). This rung proceeded without an explicit maintainer
+  sequencing instruction — it followed Rung J's own close-out
+  recommendation as a stated assumption, restated rather than resolved by
+  this close-out. See ADR 0061's 2026-09-09 "Rung K (post-C-10)" opener
+  amendment through "Rung K closed" for the full grep-verified ground
+  truth, the per-PR gates, and the binding rules.
+- **ADR:** [0061](adr/0061-testability-node-crate-simulator.md) (rung K,
+  closed), [0065](adr/0065-per-table-throttling.md) (the throttling
+  mechanism itself).
+- **Size:** S, 4 PRs.
+- **Depends:** C-10 (closed) — the next unowned residual group per C-08's,
+  C-09's, and C-10's own close-outs.
+- **Status (2026-09-09):** closed — all four PRs landed (#796, #797, #799,
+  plus PR 4, the docs close-out). `cargo test -p animusd --lib
+  sim_cluster` ran 468 → 476 → **478 passed, 0 failed, 2 ignored**. Final
+  residue: one test (`cluster_wide_throttle_default_is_overridden_by_a_
+  tables_own_throughput`), a permanent `ProdEnv` config-parse/process-
+  boundary residual with no `SimCluster` analog. Zero production signature
+  changes across the whole rung. See ADR 0061's "Rung K closed" amendment
+  and `crates/animusd/CLAUDE.md`'s consolidated throttle-metric-counters
+  appendix for the full record, including the recommendations (not
+  decisions) this close-out carries forward to the maintainer: C-12 below
+  as the next candidate, the seed-join-dependent tests as a possible
+  follow-on once C-12 lands, and an assess-and-close pass on `--config`
+  bring-up/node assembly/the named real-disk restart tests/
+  `seed_join_hostname.rs` as likely-permanent process-boundary residue.
+
+---
+
+### C-12 control/data role split `SimCluster` dispatch
+
+- **Problem:** `SimCluster` builds every node identically — both control
+  and data roles on each — so the deployment shapes `animusd` actually
+  supports in production (control-only, data-only, and a mix of the two
+  per ADR 0035) have no in-process fixture analog. This is the one
+  remaining post-C-10 unowned group with a genuine `SimCluster` capability
+  gap behind it (as opposed to a process-boundary residue): 5 files/21
+  tests per the D3-closing class-D breakdown, unchanged since. Rung K's
+  own close-out (ADR 0061) names it the natural next candidate.
+- **What:** not yet scoped in detail — a plan has been informally drafted
+  during rung K's own residual-inventory work (control/data role split as
+  a per-node fixture concept), noting that `SimCluster::grow("data")`
+  already carries a data-only-node primitive with its own sim
+  metadata-mirror loop, which may be reusable groundwork rather than a
+  from-scratch build. No `dynamo.rs`/`sim_cluster.rs` grep-verified ground
+  truth has been produced yet — that is this candidate's own opener PR's
+  job, following the same widen-then-scope template every rung since D3
+  has used.
+- **ADR:** [0061](adr/0061-testability-node-crate-simulator.md) (rung K's
+  own close-out names this candidate; no rung opened for it yet).
+- **Size:** not yet sized — likely M or L given the new fixture primitive
+  needed, larger than any of C-09/C-10/C-11.
+- **Depends:** C-11 (closed) — the next unowned residual group per C-08's,
+  C-09's, C-10's, and C-11's own close-outs.
+- **Status (2026-09-09):** candidate — plan drafted, awaiting the
+  maintainer's sequencing. Not opened; no PRs.
 
 ---
 
@@ -1145,7 +1252,8 @@ wave are independent and can run in parallel.
 | 8 | C-07 (closed 2026-09-08 — all six PRs landed: #758, #759, #760, #761, #762, plus PR 6) | Gated on C-04 (closed) and C-06 (closed) — the same generic dispatch cores, plus C-06's own Transact widening |
 | 9 | C-08 (closed 2026-09-08 — all eight PRs landed: #764, #765, #766, #767, #773, #776, #777, PR 8) | Gated on C-04 (closed), C-06 (closed), and C-07 (closed) — the same generic dispatch cores, plus rung C5's own widening of `ClientCtx`'s field types |
 | 10 | C-09 (closed 2026-09-09 — all six PRs landed: #780, #782, #785, #786, #787, plus PR 6) | Gated on C-08 (closed) — C-08's own close-out recommendation, stacked directly on it |
-| 11 | C-10 (open, PRs 1-4 landed 2026-09-09 — docs opener; groundwork generalizing `UpdateTable`'s GSI add/drop sub-arm under `SimCluster`; `sim_cluster_dynamo_update_table_index.rs` converting `update_table_create_index.rs`/`update_table_drop_index.rs`/`dynamo_gsi_drain.rs` (9 tests), all three deleted whole; `sim_cluster_backfill_seeder.rs`, 4 of `tests/backfill_seeder.rs`'s 5 scenarios converted, `split_during_backfill_converges_with_correct_final_gsi` kept `ProdEnv` per its own license: index DDL beyond plain `CreateTable`, sequenced after C-09 by the maintainer 2026-09-08) | Gated on C-09 (closed) — the next unowned residual group per C-08's and C-09's own close-outs |
+| 11 | C-10 (closed 2026-09-09 — all seven PRs landed: #789, #790, #791, #792, #793, #794, plus PR 7) | Gated on C-09 (closed) — the next unowned residual group per C-08's and C-09's own close-outs |
+| 12 | C-11 (closed 2026-09-09 — all four PRs landed: #796, #797, #799, plus PR 4) | Gated on C-10 (closed) — the next unowned residual group per C-08's, C-09's, and C-10's own close-outs; proceeded without an explicit maintainer sequencing instruction, per Rung J's own close-out recommendation (see the C-11 entry's own note) |
 
 Open issues mapped: none left (#375 closed by W-01, #319 by W-05). Filed
 from wave 2's own findings: #590 (the operator still emits the deleted

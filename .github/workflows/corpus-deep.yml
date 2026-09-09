@@ -52,6 +52,10 @@ on:
         description: "Seeds per scenario (ANIMUS_LEARNER_SEEDS, ADR 0058 Train 1 learner-membership corpus)"
         required: false
         default: "40"
+      reconfigure_drop_seeds:
+        description: "Seeds per scenario (ANIMUS_RECONFIGURE_DROP_SEEDS, issue #781 healthy-voter-drop reconfigure corpus)"
+        required: false
+        default: "40"
       inplace_split_seeds:
         description: "Seeds per scenario (ANIMUS_INPLACE_SPLIT_SEEDS, ADR 0058 Train 2 rung 3 in-place split corpus)"
         required: false
@@ -305,6 +309,20 @@ jobs:
           ANIMUS_LEARNER_SEEDS: ${{ github.event.inputs.learner_seeds || '40' }}
         run: cargo test -p animus-control --test learner_corpus -- --nocapture
 
+      # Issue #781's healthy-voter-drop corpus: a live follower, and
+      # separately the leader itself, dropped via a direct
+      # `CasTabletReplicas` through the real `spawn_reconfigure_loop`/
+      # `reconfigure_step`, scaled to depth. Each scenario is a pure
+      # function of its seed, so a failure names one scenario + seed and is
+      # replayable.
+      - name: deep healthy-voter-drop reconfigure corpus (issue #781)
+        id: reconfigure_drop
+        continue-on-error: true
+        timeout-minutes: 10
+        env:
+          ANIMUS_RECONFIGURE_DROP_SEEDS: ${{ github.event.inputs.reconfigure_drop_seeds || '40' }}
+        run: cargo test -p animus-cp-data --test reconfigure_healthy_drop -- --nocapture
+
       # ADR 0058 Train 2 rung 3's in-place split group-mint-at-apply corpus:
       # the full happy path, a leader crash mid-catch-up, the G4 crash
       # window (engine committed, group not yet started), and a concurrent
@@ -519,6 +537,7 @@ jobs:
             [reconciler]="${{ steps.reconciler.outcome }}"
             [quiesce]="${{ steps.quiesce.outcome }}"
             [learner]="${{ steps.learner.outcome }}"
+            [reconfigure_drop]="${{ steps.reconfigure_drop.outcome }}"
             [inplace_split]="${{ steps.inplace_split.outcome }}"
             [backup]="${{ steps.backup.outcome }}"
             [pitr]="${{ steps.pitr.outcome }}"
@@ -535,7 +554,7 @@ jobs:
           )
           failed=0
           failed_names=()
-          for name in raftkv raftkv_lsm raftkv_wal_faults txn streams backfill split reconciler quiesce learner inplace_split backup pitr lsm_crash lsm_disk_fault lsm_encrypted segment_store_encrypted control simcluster dynamo_wire export_import heartbeat sharedwal; do
+          for name in raftkv raftkv_lsm raftkv_wal_faults txn streams backfill split reconciler quiesce learner reconfigure_drop inplace_split backup pitr lsm_crash lsm_disk_fault lsm_encrypted segment_store_encrypted control simcluster dynamo_wire export_import heartbeat sharedwal; do
             outcome="${outcomes[$name]}"
             echo "${name}: ${outcome}"
             if [ "${outcome}" != "success" ]; then

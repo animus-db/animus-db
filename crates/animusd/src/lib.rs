@@ -18584,6 +18584,13 @@ mod sim_cluster;
 /// private fields stay reachable with no further visibility widened.
 #[cfg(test)]
 mod sim_cluster_corpus;
+/// ADR 0061 rung K (C-11) PR 2: the `BatchWriteItem`/`BatchGetItem`/
+/// `TransactWriteItems`/forwarded-write conversion of `tests/dynamo_
+/// throttling.rs`'s four sim-reachable throttle scenarios — a sibling of
+/// `sim_cluster_throttle`, for the identical reason (needs `SimCluster`'s
+/// own `pub(crate)` surface, no further visibility widened).
+#[cfg(test)]
+mod sim_cluster_dynamo_throttle;
 /// ADR 0065's own `SimEnv`-driven, virtual-time-only throttle-enforcement
 /// coverage, over the real `SimCluster` fixture — a sibling of
 /// `sim_cluster_corpus`, for the identical reason (needs `SimCluster`'s own
