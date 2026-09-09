@@ -8838,8 +8838,8 @@ the one GSI-reading scenario) — pure test authorship, mirroring C-07 PR
 | `put_get_delete_item_round_trip` (`console_items.rs`) | Converted → `run_put_get_delete_item_round_trip` |
 | `scan_and_query_a_gsi_by_name` (`console_items.rs`) | Converted → `run_scan_and_query_a_gsi_by_name` (via `SimCluster::drain_gsi`) |
 | `console_serves_shell_assets_and_deep_links_on_combined_node` (`console_endpoint.rs`) | **KEPT** whole — mostly real HTTP framing `SimCluster::console` cannot reproduce; its own JSON-routing tail is covered by the new scenario below instead of trimming this test |
-| `console_serves_shell_on_data_only_node` (`console_endpoint.rs`) | **KEPT** — a genuine control-only/data-only process split |
-| `console_addr_panics_on_control_only_node` (`console_endpoint.rs`) | **KEPT** — the identical role-split reason |
+| `console_serves_shell_on_data_only_node` (`console_endpoint.rs`) | **KEPT** at the time — a genuine control-only/data-only process split; **ADR 0061 rung L, C-12 PR 4c** later gave `SimCluster` per-node `NodeRole` and added `sim_cluster_console.rs::console_reachable_on_a_data_only_node` for the JSON-dispatch half — the test itself stays whole, its own listener-binding/HTTP-framing half still unreachable |
+| `console_addr_panics_on_control_only_node` (`console_endpoint.rs`) | **KEPT** at the time — the identical role-split reason; **ADR 0061 rung L, C-12 PR 4c** added `sim_cluster_console.rs::console_item_write_from_a_control_only_node_panics` (`#[should_panic]`, mirroring this test's own shape) for the underlying structural invariant, and found along the way that a console item mutation genuinely does panic when dispatched against a control-only node's own `ClientCtx` (`dynamo::fast_marker_write`'s unconditional `ctx.data()` read) — the test itself stays whole, its own `Node`-level listener-panic proof having no `SimCluster` analog regardless of role support |
 
 A tenth scenario, `console_error_mapping_and_json_routing_assertions`, has
 no real-socket original of its own: a freshly-booted node's tables list is
@@ -9210,13 +9210,17 @@ config.rs` already do, rather than duplicating them.
 | `dashboard_u05_node_actions` | Converted → `u05_node_actions` — button/route markers plus a live "not 404" probe of all three routes from a control follower |
 | `dashboard_u05_control_member_actions` | Converted → `u05_control_member_actions` — the identical marker-plus-"not 404" shape for the three control-member routes |
 | `dashboard_serves_spa_with_cors_and_peers` | **KEPT** `ProdEnv` — real HTTP framing (status line, `Content-Type`/CORS headers, `OPTIONS` preflight) `SimCluster::admin` cannot reproduce (a bare `(status, body)` pair, no framing at all) |
-| `dashboard_role_gating_split_deployment` | **KEPT** — a genuine control-only/data-only process split; `SimCluster` has no node-role concept |
-| `control_node_streams_read_path_is_ground_truth` | **KEPT** — the identical role-split reason |
+| `dashboard_role_gating_split_deployment` | **KEPT** at the time — a genuine control-only/data-only process split; `SimCluster` had no node-role concept. **ADR 0061 rung L, C-12 PR 4c** later added it (`NodeRole`, C-12 PRs 2/3) and a `sim_cluster_dashboard.rs` sibling of the same name for the JSON/asset-marker half — the test itself stays whole for its own literal shell/JS-asset HTTP-framing half |
+| `control_node_streams_read_path_is_ground_truth` | **KEPT** at the time — the identical stale role-split reason. **ADR 0061 rung L, C-12 PR 4c** converted it whole (no real HTTP framing in it at all) — see `sim_cluster_dashboard.rs::control_node_streams_read_path_is_ground_truth`; removed from `tests/dashboard_endpoint.rs` |
 | `dashboard_u05_lineage_panel` | **KEPT** — `GET /admin/system-table` reads `ctx.control_storage`, always `None` under `SimCluster` (the identical gap PR 5's own `tests/system_table.rs` disposition documents) |
 
-**Before/after counts**: `dashboard_endpoint.rs`: 16 → 4 (12 converted).
-`console_endpoint.rs`: 3 → 3 (unchanged). `sim_cluster_dashboard.rs`: 23
-new tests (12 scenarios).
+**Before/after counts (as of this PR)**: `dashboard_endpoint.rs`: 16 → 4 (12
+converted). `console_endpoint.rs`: 3 → 3 (unchanged). `sim_cluster_
+dashboard.rs`: 23 new tests (12 scenarios). **ADR 0061 rung L, C-12 PR 4c
+later took `dashboard_endpoint.rs` to 4 → 3** (one more full conversion)
+and added two more `sim_cluster_dashboard.rs`/`sim_cluster_console.rs`
+scenarios covering the JSON/structural half of the file's other three
+role-named tests — see that rung's own appendix, below.
 
 **Full `ProdEnv` residue of the rung so far (PRs 3–7)** — collected so
 PR 8's close-out can copy it: PR 3's `console_endpoint.rs` (3, real
@@ -10025,3 +10029,109 @@ PR 4a residual suites, unaffected — 1 + 1 passed); a full, unfiltered
 See `docs/adr/0061-testability-node-crate-simulator.md`'s rung L PR 4b
 amendment and `docs/roadmap.md`'s C-12 entry for the closing record; this
 appendix is the crate-local pointer.
+
+## Appendix — console_endpoint.rs/dashboard_endpoint.rs's role-named tests converted to SimCluster (ADR 0061 rung L, C-12 PR 4c, 2026-09-09)
+
+Closes the third conversion PR of C-12 (rung L): the two role-named tests
+each in `tests/console_endpoint.rs` (3 tests total) and `tests/dashboard_
+endpoint.rs` (4 tests total) named by the rung's own PR 4a/4b appendices
+and the ADR's "Rung L (post-C-11)" amendment — both files' doc comments,
+and `sim_cluster_console.rs`'s/`sim_cluster_dashboard.rs`'s own PR 3/PR 7
+doc sections, previously stated a now-**stale** reason ("`SimCluster` has
+no node-role concept") for keeping these four tests `ProdEnv` whole; PR 2/3
+of this rung gave `SimCluster` per-node `NodeRole` (`new_with_roles`,
+`role_of`, role-aware `restart`/`crash`), so this PR revisits all four,
+adding sim siblings in the existing `sim_cluster_console.rs`/`sim_cluster_
+dashboard.rs` modules (per the task's own "extend the module that already
+covers that endpoint" instruction) rather than a new file, and corrects
+every stale "no node-role concept" claim found by grepping the crate for
+it (`sim_cluster_console.rs`, `sim_cluster_dashboard.rs`, both real-socket
+files, and the two disposition-table rows in this file's own PR 3/PR 7
+appendices above).
+
+**Classification (D3 discipline)** — every scenario uses a `[NodeRole::
+Control, NodeRole::Data]` `SimCluster::new_with_roles` cluster, mirroring
+the real tests' own `support::bring_up_split(1, 1, ..)` shape:
+
+| Original test (file) | A/B | Disposition |
+|---|---|---|
+| `console_serves_shell_on_data_only_node` (`console_endpoint.rs`) | mixed | **KEPT** whole (its own listener-binding/HTTP-framing half is a `Node`-level fact `SimCluster` cannot reproduce — no `Node` struct, no listener for any role); `sim_cluster_console.rs::console_reachable_on_a_data_only_node` covers the (A) half — the console backend genuinely answers real, converged cluster state (`GET /console/api/tables`) once driven from a data-only node's own `ClientCtx` |
+| `console_addr_panics_on_control_only_node` (`console_endpoint.rs`) | B, with a stronger-than-planned (A)-sibling found along the way | **KEPT** whole (the real assertion — `Node::console_addr()` panics — is purely `self.data.as_ref().expect(..)` on a plain `Option<SocketAddr>` field, no `SimCluster` analog); `sim_cluster_console.rs::console_item_write_from_a_control_only_node_panics` (`#[should_panic]`) proves the underlying invariant instead — **and found, by running it, that the analog is stronger than the "forwards cleanly" shape this rung's own PR 4a precedent (`mixed_cluster_put_via_control_node_forwards_to_data_node`) suggested**: a console item mutation dispatched against a control-only node's own `ClientCtx` genuinely panics too, inside `dynamo::fast_marker_write`'s unconditional `ctx.data().request_rates.observe(..)` read on the ISSUING node — see that scenario's own doc comment for the full account. This is not a product bug; it is the exact mechanism `console_addr()`'s own panic exists to keep structurally unreachable in production (a control-only node never binds the console listener at all) |
+| `dashboard_role_gating_split_deployment` (`dashboard_endpoint.rs`) | mixed | **KEPT** whole (the literal `GET /` shell/JS-asset HTTP-framing check on both roles' admin ports is a `SimCluster::admin`-cannot-reproduce fact, unrelated to role support); `sim_cluster_dashboard.rs::dashboard_role_gating_split_deployment` covers the (A) half — the `ROLE_TABS`/`applyRoleGating` gating logic and `dashboard_node.js`'s own render markers (read directly from the served assets' compile-time constants, this file's own established idiom), `/admin/config`'s per-role `role` field, and `/admin/raft`'s `control_mirror` converging on the data-only node while the control-bearing node's stays honestly "never synced". **Not reproduced**: every OTHER per-role `/admin/config` field the real test also checks (`backup_store`/`segment_store`/`quiesce_after_ms`/`auth_enabled`/`auth_access_key_ids`) is `null` for every node regardless of role under `SimCluster`'s own `AdminInfo` construction — a pre-existing fixture limitation, not a role-support gap this rung closes; `/admin/peers`'s own per-node `role` field is unreproducible for the identical reason (`AdminInfo.peers` is always an empty map here) |
+| `control_node_streams_read_path_is_ground_truth` (`dashboard_endpoint.rs`) | A | Converted whole → `sim_cluster_dashboard.rs::control_node_streams_read_path_is_ground_truth` — no real HTTP framing anywhere in the original (every assertion is DynamoDB-wire/admin-JSON: an open + a force-sealed stream created over the wire from the data node, `/admin/status`'s converged replicated catalog and `ListStreams`/`DescribeStream` through the `/admin/data/dynamo` proxy read from the control-only node), so it needed no real-socket residual and is removed from `tests/dashboard_endpoint.rs` outright, along with its own now-dead `raw_post` helper |
+
+**A real finding, confirmed by running the scenario, not by inspection**:
+see the classification table's own second row. The first draft of
+`console_item_write_from_a_control_only_node_panics` assumed (following
+this rung's own PR 4a precedent for the plain client protocol) that a
+console item write issued from a control-only node's `ClientCtx` would
+forward cleanly to the data node — `resolve_cp_route` never touches
+`ctx.data()` on the issuing node, only `write_path.rs`'s functions do, and
+those run at the LEADER. That assumption was wrong for the DynamoDB-shaped
+item-write path the console reuses: `dynamo::fast_marker_write` (the ADR
+0049 fast arm an unconditioned `PutItem` takes) reads `ctx.data().
+request_rates` unconditionally, on the calling node's own `ctx`, before
+any routing decision — caught by the very first `cargo test` of this
+scenario (a full panic backtrace through `console.rs` → `dynamo.rs:9502` →
+`ClientCtx::data`), not assumed. The scenario was rewritten to assert the
+panic directly (`#[should_panic(expected = "ClientCtx::data called on a
+control-only node")]`), the honest `SimCluster` analog of the real test's
+own `#[should_panic]` shape — and, being a panicking test, carries no
+`_over_seeds` sibling (a seed-looping variant would only ever exercise its
+first seed, since `#[should_panic]` stops at the function's first panic).
+
+**No other new fixture or production bug found.** Every non-panicking
+scenario passed at its pinned seed and every `_over_seeds` seed on the
+first clean run once the wire/console/admin JSON shapes matched this
+crate's own established fixtures.
+
+**Real-socket counts before/after this PR**: `console_endpoint.rs`: 3 → 3
+(both role-named tests stay whole — mixed classification, per the table
+above — but each now carries an updated doc comment pointing at its own
+sim sibling instead of the stale "no node-role concept" reason).
+`dashboard_endpoint.rs`: 4 → 3 (one full conversion removed;
+`dashboard_role_gating_split_deployment` stays whole, mixed, with an
+updated doc comment). **Baseline vs. new sim counts**: baseline `cargo
+test -p animusd --lib -- sim_cluster --test-threads=2` was 534 passed / 2
+ignored (PR 4b's own closing figure); this PR's own additions are 7 new
+tests (`sim_cluster_console.rs`: `console_reachable_on_a_data_only_node` +
+`_over_seeds` + `console_item_write_from_a_control_only_node_panics` = 3;
+`sim_cluster_dashboard.rs`: `dashboard_role_gating_split_deployment` +
+`_over_seeds` + `control_node_streams_read_path_is_ground_truth` +
+`_over_seeds` = 4), all passing, zero regressions — confirmed via a
+seed-partitioned full run (the whole tier split into four non-timing-out
+chunks by module-name filter groups, together covering every `sim_
+cluster_*` module at least once, no chunk excluded): 287 + 138 + 104 + 12 =
+541 passed, 0 failed, 2 ignored total, matching 534 + 7 exactly.
+
+**No production code changed apart from doc-comment corrections inside the
+two existing test-fixture modules** (`sim_cluster_console.rs`/`sim_
+cluster_dashboard.rs`, both `#[cfg(test)] mod`s) — no `lib.rs` mod-
+declaration line was needed (both sim siblings extend already-declared
+modules), and no new `SimCluster` accessor was added; every primitive
+these six new scenarios use (`new_with_roles`, `role_of`, `hosted_
+tablets`, `console`, `dynamo`, `admin`) already existed from earlier C-12/
+C-08 PRs.
+
+**Gates, in the required order, all foreground**: `cargo check -p animusd
+--all-targets` (clean, checkpoint pushed); `cargo test -p animusd --lib
+sim_cluster_console -- --test-threads=2` (47 passed, 0 failed, 61.67s —
+including the should-panic fix); `cargo test -p animusd --lib sim_cluster_
+dashboard -- --test-threads=2` (27 passed, 0 failed, 10.08s); `cargo test
+-p animusd --test console_endpoint --test dashboard_endpoint` on the
+trimmed files (3 + 3 passed); `cargo fmt --all --check` (one pass needed,
+applied via `cargo fmt --all`, then clean); `cargo clippy -p animusd
+--all-targets --all-features -- -D warnings` (clean, no fix needed); the
+full `sim_cluster` tier, split into four module-filter-grouped `cargo test
+-p animusd --lib -- --test-threads=2 <filters..>` runs to stay under the
+10-minute-per-call budget (287 passed/479.25s test-time; 138
+passed/131.09s; 104 passed/387.09s; 12 passed/252.78s — 541 passed, 0
+failed, 2 ignored total, ~1250s test-time summed across the four calls).
+`Cargo.lock` unchanged (confirmed via `git diff` — no dependency touched).
+
+See `docs/adr/0061-testability-node-crate-simulator.md`'s rung L
+amendment and `docs/roadmap.md`'s C-12 entry for the closing record; this
+appendix is the crate-local pointer. **No ADR/roadmap edits were made by
+this PR** — both files' rung-L disposition tables still name the stale
+"no node-role concept" reason for these four tests; a future doc-only PR
+should reconcile them with this appendix.
