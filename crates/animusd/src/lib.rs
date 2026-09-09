@@ -10890,7 +10890,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                      mid-transfer, or {target} has not caught up); retry"
                 ));
             }
-            let deadline = tokio::time::Instant::now() + CONTROL_TRANSFER_POLL_TIMEOUT;
+            let deadline = self.env.now().saturating_add(CONTROL_TRANSFER_POLL_TIMEOUT);
             loop {
                 if !leader.is_leader() {
                     return Err(format!(
@@ -10898,14 +10898,14 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                          node can complete the removal itself; retry on the leader"
                     ));
                 }
-                if tokio::time::Instant::now() >= deadline {
+                if self.env.now() >= deadline {
                     return Err(format!(
                         "leadership transfer to node {target} did not complete within \
                          {}s; retry",
                         CONTROL_TRANSFER_POLL_TIMEOUT.as_secs()
                     ));
                 }
-                tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+                self.env.sleep(SCHEMA_POLL_INTERVAL).await;
             }
         }
         let warning = if remaining.len() == 1 {
@@ -15814,8 +15814,14 @@ async fn finish_data_join(
 /// - a single client/forwarded `Put` — its value enters via the HTTP edges,
 ///   whose bodies cap at 1 MiB (`http::MAX_BODY`), and JSON-encodes a `Vec<u8>`
 ///   at ≤ 4 chars per byte → ~4 MiB;
-/// - a forwarded `PutBatch` from the admin bulk seeder — bounded to
-///   `SEED_BATCH_MAX_BYTES` (4 MiB) of raw entry bytes per batch → ~17 MiB JSON;
+/// - a forwarded `BatchWriteItem` marker-table batch (`dynamo::
+///   marker_batch_write`) — DynamoDB's own 25-item-per-call cap, each item
+///   capped at `animus_item::MAX_ITEM_SIZE_BYTES` (400 KB) → ~10 MiB raw
+///   before JSON escaping, comfortably under half this cap. The admin
+///   seeder (ADR 0021's 2026-09-09 amendment) rides this identical path —
+///   it no longer has a byte cap of its own (the deleted `SEED_BATCH_
+///   MAX_BYTES`), since it now issues ordinary `BatchWriteItem` calls
+///   through the same generic dispatcher a real client's calls take;
 /// - everything else (`Get`/`Scan`/`ProposeSchema`/split triggers) is tiny.
 ///
 /// An over-cap length prefix is rejected with a clean `InvalidData` error (the
@@ -19046,19 +19052,24 @@ mod sim_cluster_admin_actions;
 #[cfg(test)]
 mod sim_cluster_dashboard;
 
-/// Deterministic, seed-reproducible regression for the admin seeder's
-/// images-arm pipelining (`admin::action_data_seed`, `SEED_IMAGES_
-/// CONCURRENCY`): seeds a Stream-enabled table through `POST
-/// /admin/data/seed` (reachable via `SimCluster::admin_timed`, the same
-/// `GenericAdminHost` seam `sim_cluster_admin_actions.rs`'s own
-/// `seed_writes_synthetic_keys` already proves reaches this route) and
-/// asserts the virtual elapsed time for a 96-row seed is well under a
-/// quarter of 96x an 8-row seed's own per-row virtual cost — a bound the
-/// bounded-concurrency fix clears with wide margin and the old strictly-
-/// sequential loop fails deterministically (confirmed red on the
-/// pre-fix code, restored — see this module's own doc for the exact
-/// numbers). All in virtual `SimEnv` time, so the assertion cannot flake
-/// under real-thread contention.
+/// Deterministic, seed-reproducible regression for `POST /admin/data/seed`'s
+/// throughput on a Stream-enabled table (ADR 0021's 2026-09-09 amendment:
+/// the route is now a thin proxy over the real `BatchWriteItem` operation,
+/// chunked at `admin::SEED_BATCH_WRITE_CAP` (25) items with up to
+/// `admin::SEED_CONCURRENCY` (8) chunks concurrently): seeds a Stream-enabled
+/// table through `POST /admin/data/seed` (reachable via
+/// `SimCluster::admin_timed`, the same `GenericAdminHost` seam
+/// `sim_cluster_admin_actions.rs`'s own `seed_writes_synthetic_keys` already
+/// proves reaches this route) and asserts the virtual elapsed time for a
+/// 200-row seed (8 concurrent 25-item chunks — one full wave) is well under
+/// a quarter of 200x an 8-row seed's own per-row virtual cost — a bound the
+/// chunk-level concurrency clears with real margin and a strictly
+/// sequential chunk dispatch fails deterministically (confirmed red on the
+/// pre-fix code, restored — see this module's own doc for the exact numbers
+/// and for why 200, not the pre-rewrite design's 96, is the smallest row
+/// count that gives this bound genuine margin under the new per-chunk,
+/// not per-item, concurrency shape). All in virtual `SimEnv` time, so the
+/// assertion cannot flake under real-thread contention.
 #[cfg(test)]
 mod sim_cluster_seed_latency;
 /// ADR 0061 rung I (C-09 PR 2): two pinned-seed smoke tests proving the
@@ -19119,6 +19130,77 @@ mod sim_cluster_backfill_seeder;
 /// `crates/animusd/CLAUDE.md`'s matching C-10 entry.
 #[cfg(test)]
 mod sim_cluster_stream_backfill_seed_filter;
+
+/// ADR 0061 rung L (C-12 PR 2): control-only nodes under `SimCluster` — the
+/// mechanism PR (per-node roles, role-aware `restart`) plus five
+/// seed-parameterized scenarios proving a mixed control-only/combined
+/// cluster boots, elects, restarts, and crash-recovers correctly, and that
+/// a control-only node runs no data-plane loop at all. See `sim_cluster_
+/// control_only.rs`'s own module doc for the full account and
+/// `crates/animusd/CLAUDE.md`'s matching SimCluster-roles entry.
+#[cfg(test)]
+mod sim_cluster_control_only;
+
+/// ADR 0061 rung L (C-12 PR 3): data-only nodes under `SimCluster` —
+/// `NodeRole::Data` first-class at construction (`SimCluster::new_with_
+/// roles`, previously `SimCluster::grow("data")`-only), role-aware `crash`/
+/// `restart` for a data-only node whether constructed or grown, and five
+/// seed-parameterized scenarios proving a mixed control-only/data-only
+/// cluster boots and serves, a data-only node's own restart/crash-then-
+/// restart both catch up and re-serve, a mixed combined+data-only cluster
+/// behaves identically, and DDL issued at a data-only node (through its own
+/// `ControlHandle::Remote`) succeeds and replicates cluster-wide. See
+/// `sim_cluster_data_only.rs`'s own module doc for the full account and
+/// `crates/animusd/CLAUDE.md`'s matching SimCluster-roles entry.
+#[cfg(test)]
+mod sim_cluster_data_only;
+
+/// ADR 0061 rung L (C-12 PR 4a): the first conversion PR built on top of the
+/// PR 2/3 mechanism — `tests/control_only.rs` (3 tests), `tests/
+/// data_only.rs` (5 tests), and `tests/cluster_split.rs` (3 tests), pure
+/// test authorship, no `dynamo.rs`/`lib.rs` production change. See
+/// `sim_cluster_control_data_split.rs`'s own module doc for the full
+/// classification table (which of the 11 converted whole, which left a
+/// real-socket residual and why) and `crates/animusd/CLAUDE.md`'s matching
+/// residual-inventory entry.
+#[cfg(test)]
+mod sim_cluster_control_data_split;
+
+/// ADR 0061 rung L (C-12 PR 4b): converts `tests/split_cluster.rs`'s own 8
+/// real-socket tests (control-leader failover under live data traffic, a
+/// split over a split deployment, failure-driven replica repair onto a
+/// spare, decommission via the control leader, a full-cluster stop/
+/// restart, a simultaneous control-leader + data-node failure, a
+/// decommission racing a split crossover, and the `--cluster-control`/
+/// `--cluster-data` `--quiesce-after` CLI-wiring proof) — a **separate**
+/// module from `sim_cluster_control_data_split.rs` (PR 4a) purely to stay
+/// under this rung's own ~1800-line-per-module guidance; builds on that
+/// module's own PR 2/3 mechanism, no `dynamo.rs`/`lib.rs` production
+/// change beyond one small `sim_cluster.rs` accessor
+/// (`SimCluster::control_leader_index_excluding`). See `sim_cluster_
+/// split_cluster.rs`'s own module doc for the full classification table
+/// and `crates/animusd/CLAUDE.md`'s matching residual-inventory entry.
+#[cfg(test)]
+mod sim_cluster_split_cluster;
+
+/// ADR 0061 rung L (C-12 PR 4e): converts `tests/control_membership_
+/// admin.rs`'s own 12 real-socket tests (runtime control-group membership
+/// changes via `POST /admin/control/member/{add,remove}`, `GET /admin/
+/// control/members`, and `GET /admin/config`, ADR 0037) — 11 of the 12
+/// convert; the twelfth (`runtime_added_voter_survives_leadership_change_
+/// to_a_different_original_voter`) stays real-socket whole, since the
+/// `ProdEnv::merge_peer` peer-book-scope-limit regression it proves is
+/// structurally invisible under `SimEnv` (a documented no-op there, with
+/// every node's route table already fully seeded at construction). Pure
+/// test authorship — no `admin.rs`/`sim_cluster.rs` production-shaped
+/// change was needed at all, every route this module drives having
+/// already been a trait method on both `AdminHost` impls. See `sim_
+/// cluster_control_membership_admin.rs`'s own module doc for the full
+/// classification table (including what `SimCluster::grow`'s "data-only
+/// growth only" scope does and does not let a scenario reproduce) and
+/// `crates/animusd/CLAUDE.md`'s matching residual-inventory entry.
+#[cfg(test)]
+mod sim_cluster_control_membership_admin;
 
 /// Regression for the issue #298 residual confirmed live under the
 /// un-pinned `SplitMode::InPlace` proof soak (ADR 0018's matching amendment,
