@@ -76,6 +76,62 @@
 //! (real WAL/SSTable recovery through the deterministic disk seam). A
 //! representative LSM subset runs by default; `ANIMUS_RAFTKV_LSM=1` runs the whole
 //! corpus over the LSM engine (the deep/nightly tier).
+//!
+//! **Per-replica differential clock skew (issue #804).** Every scenario's
+//! group gets its own seed-derived clock skew (and a small drift), one value
+//! *per replica*, applied before any node starts — `replica_skew_ns`/
+//! `replica_drift_ppm` below. This is deliberately unlike this crate's only
+//! prior clock-skew caller (`txn_serializable.rs`'s `ClockSkewWithin`/
+//! `ClockSkewBeyond`, which set the SAME skew for every replica of a group):
+//! a *uniform* skew can only ever model a group's clock running fast/slow
+//! relative to the wall clock, never one replica's clock reading low
+//! *relative to what the group itself has committed* — exactly the shape
+//! issue #804 needed (a real `ProdEnv` node samples its own `Instant::now()`
+//! base independently at bind, so a real cluster sees sub-2-second
+//! *differential* skew between nodes routinely; see `docs/engineering-
+//! lessons.md`'s issue #804 entry, lesson (b)). Applying it to every
+//! scenario, not a dedicated cell, means every leader change, `StopRestart`,
+//! and snapshot-catch-up cell already in this corpus now also runs under
+//! asymmetric per-node clocks for free. Derived from a small seed-mixing
+//! hash (`splitmix64`), never the `Simulator`'s own RNG stream (which also
+//! drives every other fault's draw order) — so this changes nothing about
+//! any *other* draw any scenario makes, and is a pure function of `(seed,
+//! replica index)`: the same seed always reproduces the same skews (printed
+//! alongside `scenario=.. seed=..` by `run_scenario_identified`, and
+//! trivially recomputable from an `ANIMUS_SHRINK` replay handle's own
+//! `seed`/`replicas`, both of which `scenario_candidates` never touches).
+//! About 1 in 4 replicas draws exactly zero skew, so the un-skewed baseline
+//! this corpus has always run stays covered by construction, not just by
+//! chance. **The client/checker clock is unaffected by design**: clients run
+//! on `CLIENT_IDS`, disjoint from `GROUP_IDS` and never skewed (see
+//! `CLIENT_IDS`'s own doc) — every recorded invocation/response timestamp
+//! (`env.now()` in `run_write`/`run_read`) reads the single global virtual
+//! clock, so `check_cycles`' real-time-ordering assumption holds regardless
+//! of what any replica's own clock reads.
+//!
+//! **Why the workload also needed `poison_cas`.** Skew alone has nothing to
+//! expose: issue #804's witnessing gap only bites a **committed entry whose
+//! apply wrote no row** (a failed `Cas`, in production terms), and this
+//! workload's own commands (`put`/`linearizable_get`) always succeed — so
+//! the log-scanning and engine-reading witness points always agreed for
+//! them regardless of clock skew, fix present or not. `poison_cas` (below)
+//! fires a guaranteed-miss CAS ahead of every real write for exactly this
+//! reason — entirely outside the Elle model, since a no-op neither reads
+//! nor writes anything the history could observe. **Confirmed to still not
+//! reproduce issue #804's own narrower same-day-correction gap** (the
+//! sender/receiver-restart-with-nothing-applied-since edge, see that fix's
+//! own doc in `animus-cp-data/src/lib.rs`) at `ANIMUS_RAFTKV_SEEDS=50` via
+//! this corpus's organic, single/compound-fault schedule — that gap needs
+//! the exact node that just restarted to *also* be the one asked to build
+//! or receive a snapshot before it applies anything else, which single-
+//! fault-per-scenario cells essentially never line up by chance (Raft
+//! election dynamics mean the just-restarted node is rarely who wins the
+//! next election either). The dedicated, hand-choreographed regression
+//! (`animus-cp-data/tests/hlc_differential_skew.rs`) remains that gap's own
+//! proof; this corpus's job is the BROAD, organic coverage — every leader
+//! change/restart/snapshot-catch-up cell already here, now also under
+//! asymmetric clocks, with the log actually containing the entry class the
+//! bug needs. See `docs/engineering-lessons.md`'s matching entry.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -128,6 +184,73 @@ const DRAIN: Duration = Duration::from_secs(40);
 /// properties get a generous bounded poll rather than a fixed-drain snapshot.
 const CONVERGENCE_POLL_STEP: Duration = Duration::from_secs(2);
 const CONVERGENCE_BUDGET: Duration = Duration::from_secs(120);
+
+// ---------------------------------------------------------------------------
+// Per-replica differential clock skew (issue #804) — a seed-derived, per-run
+// parameter every scenario's `Group::start` applies, never a new cell/nemesis
+// of its own. See the module doc above for the full rationale.
+// ---------------------------------------------------------------------------
+
+/// A small, fixed-quality mixing hash (splitmix64) — deliberately NOT the
+/// `Simulator`'s own seeded RNG, so drawing a skew/drift value here never
+/// consumes (and so never shifts) the draw sequence any other fault in this
+/// corpus relies on.
+fn splitmix64(mut x: u64) -> u64 {
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    x ^= x >> 33;
+    x
+}
+
+/// This replica's own static clock skew, in signed nanoseconds — a pure
+/// function of `(seed, idx)`: about 1 in 4 replicas draws exactly zero (the
+/// un-skewed baseline stays covered), the rest draw uniformly in ±2s (a real
+/// `ProdEnv` cluster's own documented differential — see the module doc's
+/// issue #804 paragraph).
+fn replica_skew_ns(seed: u64, idx: usize) -> i64 {
+    let zero_roll = splitmix64(
+        seed ^ (idx as u64)
+            .wrapping_add(1)
+            .wrapping_mul(0xA24B_AED4_963E_E407),
+    );
+    if zero_roll.is_multiple_of(4) {
+        return 0;
+    }
+    let magnitude_roll = splitmix64(zero_roll);
+    (magnitude_roll % 4_000_000_001) as i64 - 2_000_000_000
+}
+
+/// Every replica's own skew for a `replicas`-sized group, in `GROUP_IDS`
+/// order — what [`Group::start`] applies and what [`run_scenario_identified`]
+/// prints alongside `scenario=.. seed=..` for a failing run's handle.
+fn replica_skews(seed: u64, replicas: usize) -> Vec<i64> {
+    (0..replicas)
+        .map(|idx| replica_skew_ns(seed, idx))
+        .collect()
+}
+
+/// This replica's own small clock **drift** rate, in ppm — cheap extra
+/// coverage for "a clock keeps slipping," layered on top of the static skew
+/// above. About half the replicas draw exactly zero; the rest drift within
+/// ±1000 ppm (0.1%), small enough that even the corpus's longest `DRAIN`
+/// window adds only a few tens of milliseconds beyond the static skew —
+/// unlike `txn_serializable.rs`'s own `AnchorClockDrift` (400,000 ppm), this
+/// isn't probing a drift-crosses-a-threshold liveness boundary, just adding
+/// a second, independent clock-imperfection shape at near-zero cost.
+fn replica_drift_ppm(seed: u64, idx: usize) -> i64 {
+    let zero_roll = splitmix64(
+        seed ^ (idx as u64)
+            .wrapping_add(1)
+            .wrapping_mul(0xD6E8_FEB8_6659_FD93),
+    );
+    if zero_roll.is_multiple_of(2) {
+        return 0;
+    }
+    let magnitude_roll = splitmix64(zero_roll);
+    (magnitude_roll % 2001) as i64 - 1000
+}
 
 // ---------------------------------------------------------------------------
 // Declarative scenario model (focused on this plane's fault vocabulary, with the
@@ -798,6 +921,38 @@ fn leader_slot<S: StorageEngine + 'static>(nodes: &Nodes<S>) -> Option<(usize, A
         .map(|i| (i, Arc::clone(&guard[i])))
 }
 
+/// Sentinel `expected` for [`poison_cas`] below — 1 byte, so it can never
+/// equal a real encoded list: `encode_list`'s output is always a (nonzero)
+/// multiple of 8 bytes, since every real write here pushes at least one
+/// element before encoding.
+const POISON_CAS_EXPECTED: &[u8] = &[0xFF];
+
+/// Issue a **guaranteed-miss** CAS on `key` — fire-and-forget, never
+/// awaited/retried/recorded. Exists purely so this corpus's own Raft log
+/// contains the "committed, but this entry's own apply wrote no row" class
+/// issue #804's fix targets (a failed `Cas`, in production terms): the
+/// workload's only other commands (`put`/`linearizable_get`) always
+/// succeed, so `latest_version()` (the engine-read witness) and a log scan
+/// (the log-scanning witness) always agree for them regardless of clock
+/// skew — see the module doc's "Per-replica differential clock skew"
+/// paragraph and `docs/engineering-lessons.md`'s matching entry: without
+/// this, the skew above has nothing to expose, no matter how it's drawn.
+/// Deliberately outside the Elle model entirely — no `Recorder` call of any
+/// kind, since a guaranteed-miss CAS neither reads nor writes anything the
+/// list-append history could observe. Proposed on whoever currently looks
+/// like the leader, best effort: a proposal that lands on a stale/
+/// partitioned node is simply dropped by Raft, exactly like a real client's
+/// own misrouted request, and costs nothing further here.
+fn poison_cas<S: StorageEngine + 'static>(nodes: &Nodes<S>, key: Key) {
+    if let Some((_, node)) = leader_slot(nodes) {
+        let _ = node.cas(
+            key_bytes(key),
+            Some(POISON_CAS_EXPECTED.to_vec()),
+            Vec::new(),
+        );
+    }
+}
+
 struct Group<S: StorageEngine + 'static> {
     sim: Simulator,
     nodes: Nodes<S>,
@@ -814,6 +969,21 @@ impl<S: StorageEngine + 'static> Group<S> {
         assert!((3..=5).contains(&replicas));
         let sim = Simulator::new(seed);
         let ids: Vec<u64> = GROUP_IDS[..replicas].to_vec();
+        // Issue #804: give every replica its own seed-derived clock skew (and
+        // a small drift) BEFORE any node starts, so the very first `Hlc`
+        // mint already reads a differential clock — see the module doc's
+        // "Per-replica differential clock skew" paragraph. `CLIENT_IDS`
+        // (the history's own reference clock) are never touched.
+        for (idx, &id) in ids.iter().enumerate() {
+            let skew = replica_skew_ns(seed, idx);
+            if skew != 0 {
+                sim.set_clock_skew_for(nid(id), skew);
+            }
+            let drift = replica_drift_ppm(seed, idx);
+            if drift != 0 {
+                sim.set_clock_drift_for(nid(id), drift);
+            }
+        }
         let nodes: Vec<Arc<Node<S>>> = ids
             .iter()
             .map(|&id| {
@@ -1034,6 +1204,12 @@ async fn run_write<S: StorageEngine + 'static>(
     key: Key,
     my_lists: &mut BTreeMap<Key, Vec<u64>>,
 ) {
+    // Issue #804 corpus ingredient: a guaranteed-miss CAS ahead of the real
+    // write, so this scenario's log actually contains a "committed, wrote no
+    // row" entry for the differential clock skew above to have anything to
+    // expose — see `poison_cas`'s own doc. Outside the Elle model entirely.
+    poison_cas(nodes, key);
+
     let value = shared.fresh_value();
     let list = my_lists.entry(key).or_default();
     list.push(value);
@@ -1340,7 +1516,8 @@ fn run_scenario_identified<F>(s: &Scenario, run: F) -> ScenarioResult
 where
     F: FnOnce() -> ScenarioResult + std::panic::UnwindSafe,
 {
-    eprintln!("scenario={} seed={}", s.name, s.seed);
+    let skew_ns = replica_skews(s.seed, s.replicas);
+    eprintln!("scenario={} seed={} skew_ns={skew_ns:?}", s.name, s.seed);
     match std::panic::catch_unwind(run) {
         Ok(r) => r,
         Err(payload) => {
@@ -1349,7 +1526,10 @@ where
                 .map(|m| m.to_string())
                 .or_else(|| payload.downcast_ref::<String>().cloned())
                 .unwrap_or_else(|| "<non-string panic payload>".to_string());
-            panic!("scenario={} seed={}: {msg}", s.name, s.seed);
+            panic!(
+                "scenario={} seed={} skew_ns={skew_ns:?}: {msg}",
+                s.name, s.seed
+            );
         }
     }
 }
@@ -1368,19 +1548,20 @@ fn run_scenario_wal_faults(scenario: &Scenario) -> ScenarioResult {
 /// any depth); durability + convergence already sat behind the converged-or-
 /// timeout poll, so a failure here means the budget was genuinely exhausted.
 fn assert_scenario_ok(tier: &str, s: &Scenario, r: &ScenarioResult) {
+    let skew_ns = replica_skews(s.seed, s.replicas);
     assert!(
         r.cycles.ok,
-        "[{tier}] scenario {} not serializable: {:?} (seed={})",
+        "[{tier}] scenario {} not serializable: {:?} (seed={} skew_ns={skew_ns:?})",
         s.name, r.cycles.violations, s.seed
     );
     assert!(
         r.durability.ok,
-        "[{tier}] scenario {} lost an acked append: {:?} (seed={})",
+        "[{tier}] scenario {} lost an acked append: {:?} (seed={} skew_ns={skew_ns:?})",
         s.name, r.durability.violations, s.seed
     );
     assert!(
         r.convergence.ok,
-        "[{tier}] scenario {} did not converge: {:?} (seed={})",
+        "[{tier}] scenario {} did not converge: {:?} (seed={} skew_ns={skew_ns:?})",
         s.name, r.convergence.violations, s.seed
     );
 }
@@ -1468,6 +1649,17 @@ fn shrink_and_report(s: &Scenario) -> ShrinkReport<Scenario> {
         shrink::budget_from_env(),
     );
     eprintln!("{}", shrink::describe(&s.name, &report));
+    // Skew/drift are a pure function of `(seed, replicas)` — neither field
+    // `scenario_candidates` ever touches (see its own doc) — so they stay
+    // identical across the whole minimization; print the minimized case's
+    // own skews explicitly (issue #804) so a maintainer reading this report
+    // doesn't have to recompute them by hand.
+    eprintln!(
+        "  skew_ns (seed={}, replicas={}): {:?}",
+        report.minimized.seed,
+        report.minimized.replicas,
+        replica_skews(report.minimized.seed, report.minimized.replicas)
+    );
     match shrink::replay_json(&report) {
         Ok(json) => {
             eprintln!("  replay handle (JSON): {json}");
