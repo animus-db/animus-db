@@ -10251,3 +10251,115 @@ See `docs/adr/0061-testability-node-crate-simulator.md`'s rung L
 amendment and `docs/roadmap.md`'s C-12 entry for the closing record; this
 appendix is the crate-local pointer. No ADR/roadmap edits were made by
 this PR, per its own scope.
+
+## Appendix — control_membership_admin.rs converted to SimCluster (ADR 0061 rung L, C-12 PR 4e, 2026-09-09)
+
+Closes the fifth conversion PR of C-12 (rung L): `tests/control_
+membership_admin.rs` (12 tests — runtime control-group membership changes
+via `POST /admin/control/member/{add,remove}`, `GET /admin/control/
+members`, and `GET /admin/config`, ADR 0037). This file was named in the
+rung's own opener plan ("11 of 12 convert") but no PR had touched it
+before this one; this PR's own brief also asked for its 12th test
+(`admin_config_reports_the_internal_addr_the_cli_resolves_control_add_
+through`, previously labelled a permanent `--config` bring-up residual)
+to be reclassified on its merits rather than taken on faith — it never
+parses a config file at all (`bring_up_combined` builds a `ClusterConfig`
+in-process, no file on disk) and only asserts a `GET /admin/config`
+JSON-shape fact `SimCluster::admin` already reaches, so it converts too.
+11 of the 12 convert into a new `crates/animusd/src/sim_cluster_control_
+membership_admin.rs` (11 scenarios × pinned-seed + 5-seed `_over_seeds` =
+22 tests); one stays real-socket for good, not merely for now.
+
+**Classification (D3 discipline)**:
+
+| Original test | Class | Disposition |
+|---|---|---|
+| `grow_control_group_converges_everywhere` | A (weakened) | Converted → `run_grow_control_group_converges_everywhere` — converts the *shape* (`POST /admin/control/member/add` grows the live voter set, converging everywhere including a `NodeRole::Data` node's own `ControlHandle::Remote` mirror) but not the real test's own "genuinely fresh, previously-nonexistent process starts life as a quiet non-voter" premise: `SimCluster::grow`'s own doc says combined (new-control-voter) growth is deferred — every control-bearing node in a `new_with_roles` roster is a voter from construction, so there is no `SimCluster` primitive that brings up a fresh control-capable process and lets it sit out the voter set. Substitutes removing, then re-adding, one of 4 already-running control-bearing nodes: the ADD mechanism itself (mint/register/`change_membership`, converging everywhere) is exercised identically either way; only the growth-node process bring-up specifics (address resolution, self-registration-landed wait) go unreproduced, and those are inherently `ProdEnv`/real-socket concerns |
+| `add_control_member_collision_shapes` | A | Converted → `run_add_control_member_collision_shapes` |
+| `remove_control_voter_refusals_transfer_and_quorum_warnings` | A | Converted → `run_remove_control_voter_refusals_transfer_and_quorum_warnings` — the leader-self-removal transfer-then-retry dance uses a bounded retry against whichever control node currently reports itself leader, mirroring `sim_cluster_split_cluster.rs`'s own `put_retry`/`put_raw_retry` bounded-budget shape (ADR 0061 rung L PR 4b) |
+| `runtime_added_voter_survives_leadership_change_to_a_different_original_voter` | B | **KEPT** whole, permanently — not a scenario-design difficulty but a fact `SimEnv` cannot model at all: the mechanism under test is `ProdEnv::merge_peer`'s own "known scope limit" (a runtime-added voter's dial address is only ever merged into whichever node happened to be leader at add time, until the replicated `NodeAddrs.control` field + `control_peer_sync_loop` catch every other voter up) — `Env::merge_peer` has a no-op default on the trait itself that `SimEnv` never overrides, and `SimCluster` seeds every node's full route table at construction, so every `SimEnv` node already knows how to dial every other one regardless of which node added it or when. There is nothing for a `SimCluster` scenario to observe going wrong before the fix, or right after it |
+| `removing_a_live_voter_while_another_is_already_dead_is_refused_without_force` | A | Converted → `run_removing_a_live_voter_while_another_is_already_dead_is_refused_without_force`, via `SimCluster::crash` of a non-leader follower plus a deterministic `run_for(CONTROL_PEER_LIVENESS_TIMEOUT * 3)` advance |
+| `removing_a_live_voter_while_another_is_already_dead_succeeds_with_force` | A | Converted → `run_removing_a_live_voter_while_another_is_already_dead_succeeds_with_force` |
+| `removing_the_actually_dead_voter_itself_needs_no_force` | A | Converted → `run_removing_the_actually_dead_voter_itself_needs_no_force` |
+| `removing_a_voter_when_every_remaining_voter_is_alive_is_never_refused` | A | Converted → `run_removing_a_voter_when_every_remaining_voter_is_alive_is_never_refused` |
+| `concurrent_control_add_surfaces_in_flight_as_a_clean_retryable_error` | A | Converted → `run_concurrent_control_add_surfaces_in_flight_as_a_clean_retryable_error`, via a new module-local `admin_join2` helper (two `SimClusterHandle::admin` futures spawned onto the SAME leader env in the same virtual instant, no intervening `run_for` between the two spawns, drained together — generalizes `sim_cluster_split_cluster.rs`'s own dual-`SimCluster::crash` "same discrete-event instant" idiom, PR 4b, from two faults to two mutating admin calls racing the leader's shared `Mutex<RaftCore>`) |
+| `omitted_node_add_mints_an_id_and_converges_to_a_live_voter` | A | Converted → `run_omitted_node_add_mints_an_id_and_converges_to_a_live_voter` |
+| `concurrent_omitted_node_adds_mint_distinct_ids_and_both_become_voters` | A | Converted → `run_concurrent_omitted_node_adds_mint_distinct_ids_and_both_become_voters`, via `admin_join2` |
+| `admin_config_reports_the_internal_addr_the_cli_resolves_control_add_through` | A | Converted → `run_admin_config_reports_the_internal_addr_the_cli_resolves_control_add_through` — see this appendix's own opening paragraph for why the opener plan's "permanent residual" label was wrong: the test never parses a config file at all |
+
+**One real, previously-latent seam bug found and fixed by this rung's own
+required gate — this crate's fourth recorded recurrence of the identical
+lesson** (`index_drain::seal_now`, C-07 PR 2; `admin_transfer_control_
+leadership`, C-08 PR 6; a third named in that PR 6 appendix; now this
+one): `ClientCtx::admin_remove_control_member` (`lib.rs`) already carried
+a fully generic `<E: Env, R: RelayClient>` signature, but its own
+leader-self-removal transfer-wait loop still called `tokio::time::
+Instant::now()`/`tokio::time::sleep(SCHEMA_POLL_INTERVAL)` directly
+instead of `self.env.now()`/`self.env.sleep(..)`. `SimEnv` has no real
+Tokio reactor, so the very first poll of that loop that doesn't resolve
+on its first pass panics ("there is no reactor running") — found
+immediately by this PR's own `remove_control_voter_refusals_transfer_
+and_quorum_warnings` scenario, its first real exercise of the
+self-removal transfer arm under `SimCluster`. Fixed with the same
+`self.env.now().saturating_add(..)`/`self.env.now() >= deadline`/
+`self.env.sleep(..)` conversion every prior recurrence used — production
+behavior under `ProdEnv` is unchanged (same timeout/retry semantics,
+just reading the clock through the seam); re-verified by re-running
+`admin_endpoint.rs`, `decommission.rs`, `control_membership_split.rs`,
+and `heartbeat_live_destinations.rs` (every other real-socket caller of
+this method or its own `/admin/control/member/remove` route), all green.
+
+**No scenario-authoring bug found beyond the seam fix above.** Every
+scenario passed at its pinned seed and every `_over_seeds` seed once that
+fix landed.
+
+**Real-socket counts before/after this PR**: 12 → 1 (only the `merge_peer`
+regression test stays, for the structural `SimEnv` reason above — not a
+scenario-design difficulty this rung could design around).
+
+**No generic admin dispatch arm was needed** — every route this module
+drives (`control_members_view`, `action_add_control_member`,
+`action_remove_control_member`, `config_view`, `action_add_member`) was
+already a trait method on both the concrete and generic `AdminHost` impls
+before this PR, confirmed by reading `admin.rs`'s two impl blocks side by
+side before writing a single scenario.
+
+**Gates, in the required order, all foreground**: `cargo test -p animusd
+--test control_membership_admin` on the untrimmed file (1 test run
+individually to confirm baseline collection; full-file baseline recorded
+before the trim); `cargo check -p animusd --all-targets` (clean —
+checkpoint commit/push before the gates below); `cargo test -p animusd
+--lib sim_cluster_control_membership_admin -- --test-threads=2` (22
+passed, 0 failed, ~78s — after the seam fix; the initial cut, before that
+fix, had 2 of 22 failing); `cargo test -p animusd --test control_
+membership_admin` on the trimmed file (1 passed); `cargo fmt --all --check`
+(one pass needed, applied via `cargo fmt --all`, then clean); `cargo
+clippy -p animusd --all-targets --all-features -- -D warnings` (one fix
+needed — `iter_overeager_cloned` on the shrunk-voter-set computation,
+rewritten per clippy's own suggestion; clean after); `cargo test -p
+animusd --test admin_endpoint --test decommission --test control_
+membership_split --test heartbeat_live_destinations` (every other
+real-socket caller of `admin_remove_control_member`/`/admin/control/
+member/remove`, 15 passed, 0 failed — confirming the seam fix is
+behavior-preserving); `cargo build -p animusd --all-targets` (clean); the
+full `sim_cluster` tier, split into four module-filter-grouped `cargo test
+-p animusd --lib -- --test-threads=2 <filters..>` calls (the identical
+discipline PR 4c/4d's own appendices established) to stay under the
+10-minute-per-call budget: 141 passed/1 ignored/228.14s; 175 passed/1
+ignored/436.63s (this group's own filter list included an unanchored
+`sim_cluster_dynamo_update_table` substring that also matched `sim_
+cluster_dynamo_update_table_index`'s own tests — a harmless double-run,
+not a gap, fixed for the remaining two groups by anchoring every filter
+with a trailing `::`); 142 passed/0 ignored/214.78s; 141 passed/0
+ignored/379.64s — every one of the 567 tests the `sim_cluster` filter
+lists (`cargo test -p animusd --lib -- --list sim_cluster`, confirmed
+separately) was exercised at least once, zero failures anywhere, 2
+ignored total matching the 543-passed/2-ignored PR 4d baseline plus this
+PR's own 22 new tests (543 + 22 = 565 passed + 2 ignored = 567). `Cargo.
+lock` unchanged (confirmed via `git diff`).
+
+See `docs/adr/0061-testability-node-crate-simulator.md`'s rung L
+amendment and `docs/roadmap.md`'s C-12 entry for the closing record; this
+appendix is the crate-local pointer. No ADR/roadmap edits were made by
+this PR, per its own scope — the orchestrator's own close-out PR
+(branch `-132`) carries the rung's final numbers.

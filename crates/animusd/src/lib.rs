@@ -10879,7 +10879,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                      mid-transfer, or {target} has not caught up); retry"
                 ));
             }
-            let deadline = tokio::time::Instant::now() + CONTROL_TRANSFER_POLL_TIMEOUT;
+            let deadline = self.env.now().saturating_add(CONTROL_TRANSFER_POLL_TIMEOUT);
             loop {
                 if !leader.is_leader() {
                     return Err(format!(
@@ -10887,14 +10887,14 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                          node can complete the removal itself; retry on the leader"
                     ));
                 }
-                if tokio::time::Instant::now() >= deadline {
+                if self.env.now() >= deadline {
                     return Err(format!(
                         "leadership transfer to node {target} did not complete within \
                          {}s; retry",
                         CONTROL_TRANSFER_POLL_TIMEOUT.as_secs()
                     ));
                 }
-                tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+                self.env.sleep(SCHEMA_POLL_INTERVAL).await;
             }
         }
         let warning = if remaining.len() == 1 {
@@ -19150,6 +19150,25 @@ mod sim_cluster_control_data_split;
 /// and `crates/animusd/CLAUDE.md`'s matching residual-inventory entry.
 #[cfg(test)]
 mod sim_cluster_split_cluster;
+
+/// ADR 0061 rung L (C-12 PR 4e): converts `tests/control_membership_
+/// admin.rs`'s own 12 real-socket tests (runtime control-group membership
+/// changes via `POST /admin/control/member/{add,remove}`, `GET /admin/
+/// control/members`, and `GET /admin/config`, ADR 0037) — 11 of the 12
+/// convert; the twelfth (`runtime_added_voter_survives_leadership_change_
+/// to_a_different_original_voter`) stays real-socket whole, since the
+/// `ProdEnv::merge_peer` peer-book-scope-limit regression it proves is
+/// structurally invisible under `SimEnv` (a documented no-op there, with
+/// every node's route table already fully seeded at construction). Pure
+/// test authorship — no `admin.rs`/`sim_cluster.rs` production-shaped
+/// change was needed at all, every route this module drives having
+/// already been a trait method on both `AdminHost` impls. See `sim_
+/// cluster_control_membership_admin.rs`'s own module doc for the full
+/// classification table (including what `SimCluster::grow`'s "data-only
+/// growth only" scope does and does not let a scenario reproduce) and
+/// `crates/animusd/CLAUDE.md`'s matching residual-inventory entry.
+#[cfg(test)]
+mod sim_cluster_control_membership_admin;
 
 /// Regression for the issue #298 residual confirmed live under the
 /// un-pinned `SplitMode::InPlace` proof soak (ADR 0018's matching amendment,

@@ -23423,6 +23423,36 @@ not just the ones whose diff you're already looking at; a function that
 "already looks generic" next to freshly-converted siblings is exactly
 the one most likely to get skipped.
 
+**2026-09-09, fifth recurrence (ADR 0061 rung L, C-12 PR 4e)**:
+`ClientCtx::admin_remove_control_member` (`lib.rs`) — already `<E: Env, R:
+RelayClient>`-generic, and sitting in the very same file, right next to
+`admin_transfer_control_leadership` (the third recurrence's own site) —
+had the identical gap: its own leader-self-removal transfer-wait loop
+read `tokio::time::Instant::now()`/called `tokio::time::sleep(SCHEMA_
+POLL_INTERVAL)` directly. Found the same way, by the same signal: `sim_
+cluster_control_membership_admin.rs`'s own `remove_control_voter_
+refusals_transfer_and_quorum_warnings` scenario — this loop's first-ever
+`SimEnv`-driven caller, since `SimCluster` had no route to the leader-
+self-removal arm before this PR gave `/admin/control/member/remove` a sim
+sibling at all — panicked immediately with "no reactor running." Fixed
+with the identical `self.env.now().saturating_add(..)`/`self.env.now() >=
+deadline`/`self.env.sleep(..)` conversion; re-verified byte-for-byte
+behavior-preserving under `ProdEnv` by re-running every other real-socket
+caller of this method (`admin_endpoint.rs`, `decommission.rs`,
+`control_membership_split.rs`, `heartbeat_live_destinations.rs`), all
+green. Five occurrences now, in one crate, and the third and fifth sit in
+the SAME function's own file, a few hundred lines apart — proximity to an
+already-fixed sibling is no protection at all: `admin_add_control_member`,
+right beside both, was separately checked by hand for this same PR and
+found already seam-clean (it already used `self.env`/no bare
+`tokio::time` anywhere). **The generalizable takeaway sharpens with each
+recurrence**: don't grep only the function this PR's own diff touches —
+before treating any `ClientCtx`/`CpGroup` method as usable from a new
+`SimCluster` scenario, grep *that specific function's own body* (not just
+its neighbors, not just its signature) for `tokio::time`/`Instant::now`/
+`SystemTime::now`, every time, even when a sibling two functions up was
+already fixed in an earlier rung.
+
 ## `DescribeStream` always appends a tablet's still-open successor epoch behind a just-sealed one while the stream stays enabled — a shard-count assertion after a seal must account for it (ADR 0061 rung G, C-07 PR 3, 2026-09-08)
 
 Building `sim_cluster_dynamo_streams.rs`'s new post-seal scenarios (a
