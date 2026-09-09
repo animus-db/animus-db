@@ -984,9 +984,18 @@ the still-true paragraph after the table.
   table predicted **zero** residue after this rung, and both PR 4 and PR 5
   confirm it: nothing TTL-related is left in `tests/*.rs`, and
   `DescribeTimeToLive` now dispatches under `SimCluster` the same as every
-  other TTL operation. See ADR 0061's "Rung I, PR 3", "Rung I, PR 4", and
-  "Rung I, PR 5" amendments and `crates/animusd/CLAUDE.md`'s matching
-  appendices for the full record.
+  other TTL operation. **Closed 2026-09-09** by PR 6, the docs-only
+  close-out PR 5 displaced (this ADR's own scope note above) — no source,
+  test, or `Cargo` change; `cargo test -p animusd --lib sim_cluster` ran
+  406 → 408 → 420 → 424 → **428 passed, 0 failed, 2 ignored** across the
+  rung, with exactly one permanent residual left anywhere in `tests/*.rs`:
+  `dynamo_ttl.rs::expired_item_is_still_readable_immediately` (the
+  fixture's fixed 12s per-op budget outruns even a single wire call
+  against the always-on 200ms reaper, so the "expired but not yet reaped"
+  state this test asserts can never be observed through it). See ADR
+  0061's "Rung I, PR 3", "Rung I, PR 4", "Rung I, PR 5", and "Rung I
+  closed" amendments and `crates/animusd/CLAUDE.md`'s matching
+  consolidated TTL section for the full record.
 
 ---
 
@@ -1067,8 +1076,8 @@ wave are independent and can run in parallel.
 | 7 | C-06 (closed 2026-09-08 — all seven PRs landed: #728, #729, #732, #748, #750, #756, plus this PR; issues #731 and #737 both fixed 2026-09-07) | Gated on C-04 (closed 2026-09-07) — the D4 `Reconciler` and D3 generic dispatch cores it builds on |
 | 8 | C-07 (closed 2026-09-08 — all six PRs landed: #758, #759, #760, #761, #762, plus PR 6) | Gated on C-04 (closed) and C-06 (closed) — the same generic dispatch cores, plus C-06's own Transact widening |
 | 9 | C-08 (closed 2026-09-08 — all eight PRs landed: #764, #765, #766, #767, #773, #776, #777, PR 8) | Gated on C-04 (closed), C-06 (closed), and C-07 (closed) — the same generic dispatch cores, plus rung C5's own widening of `ClientCtx`'s field types |
-| 10 | C-09 (open 2026-09-08 — PR 1, this docs opener, landed; PRs 2–5 to follow) | Gated on C-08 (closed) — C-08's own close-out recommendation, stacked directly on it |
-| 11 | C-10 (candidate: index DDL beyond plain `CreateTable`, sequenced after C-09 by the maintainer 2026-09-08; not yet planned) | Gated on C-09 — the next unowned residual group per Rung H's own close-out |
+| 10 | C-09 (closed 2026-09-09 — all six PRs landed: #780, #782, #785, #786, #787, plus PR 6) | Gated on C-08 (closed) — C-08's own close-out recommendation, stacked directly on it |
+| 11 | C-10 (next, plan drafted: index DDL beyond plain `CreateTable`, sequenced after C-09 by the maintainer 2026-09-08) | Gated on C-09 (closed) — the next unowned residual group per Rung H's own close-out |
 
 Open issues mapped: none left (#375 closed by W-01, #319 by W-05). Filed
 from wave 2's own findings: #590 (the operator still emits the deleted

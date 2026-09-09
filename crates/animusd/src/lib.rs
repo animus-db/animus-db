@@ -18919,11 +18919,13 @@ mod sim_cluster_console;
 /// (`tests/console_stream.rs`): the honest disabled answer for a stream-
 /// less table, the shard list/iterator/records read path reflecting real
 /// writes, and a bounded multi-page walk over a sealed shard (via
-/// `SimCluster::drive_stream_seal`). The one TTL-reaper-identity test in
-/// that file stays `ProdEnv` — this fixture never spawns `animusd::ttl_
-/// reaper::ttl_reaper_loop`, so there is nothing that would ever reap the
-/// item this test's own assertion depends on; see this module's own doc
-/// for the full disposition table.
+/// `SimCluster::drive_stream_seal`). The TTL-reaper-identity test that
+/// file's own doc used to keep `ProdEnv` was converted here too, by ADR
+/// 0061 rung I (C-09 PR 4): this fixture has spawned `animusd::ttl_
+/// reaper::ttl_reaper_loop` on every node, always-on, since C-09 PR 2, so
+/// the console's own stream/shards → stream/iterator → stream/records walk
+/// can now observe a real reap; `tests/console_stream.rs` is deleted
+/// whole. See this module's own doc for the full disposition table.
 #[cfg(test)]
 mod sim_cluster_console_stream;
 
