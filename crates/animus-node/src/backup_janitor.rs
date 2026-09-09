@@ -50,7 +50,14 @@ use animus_env::Env;
 
 use crate::host::{BackupJanitorProgressHost, BackupObjectStore, ControlLeaderHost};
 
-/// This loop's tick cadence.
+/// This loop's production tick cadence — every real spawn site
+/// (`animusd::backup_janitor::backup_janitor_loop`'s two `spawn_common_tail`
+/// callers) passes this explicitly. [`backup_janitor_loop`] itself takes
+/// `interval` as a parameter (ADR 0061 rung I C-09 PR 3's follow-on,
+/// 2026-09-09 — mirrors [`ttl_reaper_loop`](crate::ttl_reaper::ttl_reaper_loop)'s
+/// own shape) so a fixture with its own cadence needs (a `SimCluster`-shaped
+/// harness driving many nodes over compressed virtual time) can pass a
+/// coarser one without this constant's own production value ever changing.
 pub const BACKUP_JANITOR_INTERVAL: Duration = Duration::from_millis(200);
 
 /// One phase of the backup janitor's own tick (roadmap U-07) — rendered on
@@ -100,13 +107,18 @@ pub struct JanitorProgress {
 /// The control-plane-leader-only background loop (ADR 0059 §3) — see the
 /// module doc for the documented control-only-leader / local-only-reclaim
 /// scope gaps.
-pub async fn backup_janitor_loop<E, H>(env: E, host: H)
+///
+/// `interval` is this loop's own tick cadence — every real production spawn
+/// site passes [`BACKUP_JANITOR_INTERVAL`] explicitly (ADR 0061 rung I C-09
+/// PR 3's follow-on, 2026-09-09); a fixture with its own cadence needs may
+/// pass something else.
+pub async fn backup_janitor_loop<E, H>(env: E, host: H, interval: Duration)
 where
     E: Env,
     H: ControlLeaderHost<E> + BackupObjectStore + BackupJanitorProgressHost,
 {
     loop {
-        env.sleep(BACKUP_JANITOR_INTERVAL).await;
+        env.sleep(interval).await;
         let now_ms = env.now().0 / 1_000_000;
         let Some(leader) = host.control_leader() else {
             // Not (or no longer) the control leader — report idle rather

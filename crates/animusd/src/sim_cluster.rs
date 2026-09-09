@@ -179,6 +179,50 @@ use crate::config::NodeRole;
 /// converge or fail cleanly.
 const OP_BUDGET: Duration = Duration::from_secs(12);
 
+/// The cadence of every `SimCluster`-only periodic fallback tick: the
+/// reconciler's own missed-`metadata_watch`-wake safety net
+/// ([`RECONCILER_FALLBACK`]), and the always-on backup/segment/TTL/
+/// index-backfill janitor loops' own poll interval (`SimCluster::new`/
+/// `restart`'s spawn sites) — every one of these is a background loop that
+/// exists *only* in this fixture (or, for the reconciler/TTL/backup/
+/// segment/index-backfill janitors, is production infrastructure whose
+/// *production* cadence is a completely separate, much coarser constant —
+/// `RECONCILE_FALLBACK_INTERVAL`/`BACKUP_JANITOR_INTERVAL`/
+/// `SEGMENT_JANITOR_INTERVAL`/`DEFAULT_TTL_SWEEP_INTERVAL`/
+/// `INDEX_BACKFILL_LOOP_INTERVAL_MS`, none of which this constant touches).
+///
+/// **Must comfortably clear [`OP_BUDGET`] (12s virtual) several times per
+/// op** — every scenario's own `run_for`/`put`/`get`/`dynamo`/`drive_*`
+/// call burns a full `OP_BUDGET` window of virtual time regardless of how
+/// quickly the awaited future itself resolves
+/// (`spawn_and_capture`'s own doc), so this tick's real cost is measured
+/// against how many times each of these loops fires inside ONE such
+/// window, **times the node count**, not against how "responsive" it
+/// feels judged against a single scenario in isolation.
+///
+/// **This constant's own value must be picked by measurement against
+/// `ANIMUS_DYNAMO_WIRE_SEEDS=25` (the 25-seed corpus depth held in the
+/// nightly `corpus-deep` tier — `crates/animusd/src/
+/// sim_cluster_dynamo_corpus.rs`), never against this crate's own depth-1
+/// `sim_cluster` lib tier alone.** Every rung that ever added one of these
+/// loops (D4 PR 1's reconciler fallback; D4 PR 5's backup janitor; C-07
+/// PR 5's segment janitor; C-09's TTL reaper; C-10's index backfill)
+/// validated its own tick only at depth 1 (a handful of scenarios, ~seconds
+/// each) — reasonable in isolation, but each rung's own cost, compounded
+/// across five rungs and up to `MAX_REPLICATION_FACTOR`-plus-growth-node
+/// nodes, went unnoticed until it pushed the 25-seed nightly tier from its
+/// ADR 0061 rung D2 PR 2 baseline (~601s) to a 30-minute CI timeout
+/// (2026-09-09, 181/200 scenarios complete when it fired — see
+/// `docs/engineering-lessons.md`'s matching entry: a background loop's own
+/// cheap-when-idle self-assessment is per-loop, not per-fixture, and the
+/// tier to measure a NEW always-on `SimCluster` loop's added cost against
+/// is `ANIMUS_DYNAMO_WIRE_SEEDS=25`'s wall time, not this crate's own
+/// depth-1 default). One shared constant — rather than five independently
+/// "reasonable-looking" 200ms ones — is what makes that total cost
+/// auditable in one place: change this one value, and the aggregate cost
+/// of every always-on loop this fixture spawns moves with it.
+const SIM_FALLBACK_TICK: Duration = Duration::from_millis(1000);
+
 /// The fallback poll interval each node's own [`spawn_reconciler_loop`]
 /// falls back to when no `metadata_watch()` wake fires — mirrors
 /// `animusd::RECONCILE_FALLBACK_INTERVAL`'s event-driven-with-fallback
@@ -194,10 +238,15 @@ const OP_BUDGET: Duration = Duration::from_secs(12);
 /// running scenario (the corpus's own multi-second `SETTLE`/fault-window/
 /// `DRAIN`) pays for every fallback tick whether or not anything changed.
 /// A first draft at 50ms measured ~3s/scenario in `sim_cluster_corpus.rs`
-/// at `ANIMUS_SIMCLUSTER_SEEDS=3` (vs. ~1.75s/scenario pre-D4-PR-1);
-/// 200ms cut that back down with no change in which scenario passes —
-/// still 2.5x more responsive than production's own fallback.
-const RECONCILER_FALLBACK: Duration = Duration::from_millis(200);
+/// at `ANIMUS_SIMCLUSTER_SEEDS=3` (vs. ~1.75s/scenario pre-D4-PR-1); 200ms
+/// cut that back down with no change in which scenario passes — still
+/// 2.5x more responsive than production's own fallback. **Now an alias of
+/// [`SIM_FALLBACK_TICK`] (2026-09-09)**, not an independently-chosen value
+/// — see that constant's own doc for why every one of this fixture's
+/// always-on fallback ticks now shares one cadence, picked by measurement
+/// against the 25-seed nightly corpus rather than this file's own depth-1
+/// default.
+const RECONCILER_FALLBACK: Duration = SIM_FALLBACK_TICK;
 
 /// Bounded retry budget for [`SimCluster::drive_stream_seal`]'s own
 /// `seal_now` exhaustion loop, mirroring `index_drain::
@@ -239,8 +288,10 @@ const DEFAULT_SIM_SEGMENT_JANITOR_RETENTION: Duration = Duration::from_secs(3600
 /// the reaper's own interval is not something a scenario needs to widen to
 /// avoid a premature reap (a scenario that must assert an *intermediate*
 /// pre-sweep state instead calls [`SimCluster::drive_ttl_sweep`], never
-/// waits out this cadence).
-const SIM_TTL_SWEEP_INTERVAL: Duration = Duration::from_millis(200);
+/// waits out this cadence). **Now an alias of [`SIM_FALLBACK_TICK`]
+/// (2026-09-09)**, not an independently-chosen 200ms value — see that
+/// constant's own doc for why.
+const SIM_TTL_SWEEP_INTERVAL: Duration = SIM_FALLBACK_TICK;
 
 /// Build a fresh per-node `Reconciler<SimEnv, MemoryEngine>` (ADR 0061 rung
 /// D4 PR 1) — mirrors `animusd`'s own production node assembly exactly
@@ -1807,7 +1858,10 @@ impl SimCluster {
                 continue;
             }
             let env = ctx.env.clone();
-            env.spawn_task(backup_janitor::backup_janitor_loop(ctx.clone()));
+            env.spawn_task(backup_janitor::backup_janitor_loop(
+                ctx.clone(),
+                SIM_FALLBACK_TICK,
+            ));
         }
 
         // ADR 0061 rung G (C-07 PR 5): one `segment_janitor::
@@ -1826,6 +1880,7 @@ impl SimCluster {
             env.spawn_task(segment_janitor::segment_janitor_loop(
                 ctx.clone(),
                 segment_janitor_retention,
+                SIM_FALLBACK_TICK,
             ));
         }
 
@@ -1872,7 +1927,10 @@ impl SimCluster {
                 continue;
             }
             let env = ctx.env.clone();
-            env.spawn_task(index_backfill::index_backfill_loop(ctx.clone()));
+            env.spawn_task(index_backfill::index_backfill_loop(
+                ctx.clone(),
+                SIM_FALLBACK_TICK,
+            ));
         }
 
         // ADR 0061 rung L, C-12 PR 3: one `SimEnv`-native mirror-sync loop
@@ -3780,12 +3838,16 @@ impl SimCluster {
             // `SimSegmentStore` every other node writes to.
             if role.has_control() {
                 let janitor_env = ctx.env.clone();
-                janitor_env.spawn_task(backup_janitor::backup_janitor_loop(ctx.clone()));
+                janitor_env.spawn_task(backup_janitor::backup_janitor_loop(
+                    ctx.clone(),
+                    SIM_FALLBACK_TICK,
+                ));
 
                 let segment_janitor_env = ctx.env.clone();
                 segment_janitor_env.spawn_task(segment_janitor::segment_janitor_loop(
                     ctx.clone(),
                     self.segment_janitor_retention,
+                    SIM_FALLBACK_TICK,
                 ));
 
                 // ADR 0061 rung J (C-10 PR 4): without this a node's own
@@ -3795,7 +3857,10 @@ impl SimCluster {
                 // would never observe the completion this loop is the one
                 // thing that flips it to `Active`.
                 let index_backfill_env = ctx.env.clone();
-                index_backfill_env.spawn_task(index_backfill::index_backfill_loop(ctx.clone()));
+                index_backfill_env.spawn_task(index_backfill::index_backfill_loop(
+                    ctx.clone(),
+                    SIM_FALLBACK_TICK,
+                ));
             }
 
             // ADR 0061 rung I (C-09 PR 2): respawn at the same
@@ -3951,6 +4016,20 @@ impl SimCluster {
     /// convention).
     pub(crate) fn seed(&self) -> u64 {
         self.sim.seed()
+    }
+
+    /// A pure, additive, seed-reproducible snapshot of how much executor
+    /// work this cluster's underlying `Simulator` has done so far
+    /// (`animus_sim::SimStats` — `task_polls`/`timer_fires`, ADR 0061 rung
+    /// I C-09 PR 3's follow-on, 2026-09-09). Read once before and once
+    /// after a scenario, then subtract, to get a per-scenario executor-cost
+    /// delta — the primitive `sim_cluster_dynamo_corpus.rs::run_scenario`
+    /// uses to pin each scenario's own cost deterministically, independent
+    /// of real wall-clock noise. See that constant's own doc for why this
+    /// exists: the cost of every always-on `SimCluster` fallback loop
+    /// compounds silently across scenarios unless something measures it.
+    pub(crate) fn sim_stats(&self) -> animus_sim::SimStats {
+        self.sim.stats()
     }
 
     /// `node`'s own current wall-clock epoch second (ADR 0061 rung I,

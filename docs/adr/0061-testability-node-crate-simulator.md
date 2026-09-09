@@ -8879,7 +8879,6 @@ own generalizable finding (the "re-verify a never-happens claim against the
 constructor" lesson, PR 1/PR 2's own doc corrections) — no new entry
 needed at this close.
 
-
 ## 2026-09-09 amendment — Rung L (post-C-11): control/data role split under `SimCluster` (C-12), PR 1 (this docs-only opener)
 
 **Why this group.** The control/data role split is the single group named,
@@ -9618,3 +9617,107 @@ against the accumulated citation trail" finding above — the same failure
 mode rung K found for fixture-capability claims, recurring here for
 residual-permanence claims and, worse, for whether a planned PR actually
 landed at all.
+
+#### 2026-09-09 amendment — a red nightly closed: `SIM_FALLBACK_TICK`, and the D2 PR 2 baseline was already stale before this fix
+
+Nightly `corpus-deep` run 34327875460 (`main` @ `57073da0`) hit its
+30-minute `dynamo_wire` step timeout at scenario 181/200
+(`dynamowire_two_tables_s05`), steady progress, no hang — the first time
+`ANIMUS_DYNAMO_WIRE_SEEDS=25` had actually gone red since the D2 PR 2
+entry above's own last-green run (34100363876, `601.29s`). Root cause,
+confirmed by direct measurement, not assumed from the five rungs' own
+timing: `SimCluster::new`/`restart` spawn five always-on per-node
+background loops (the tablet-host reconciler's own `metadata_watch`
+fallback, and the backup/segment/TTL/index-backfill janitors — D4 PR 1's
+own real-`Reconciler` cutover, D4 PR 5, C-07 PR 5, C-09, and C-10
+respectively), each independently hardcoded to a 200ms tick, added by
+five separate rungs each validated only at this crate's own depth-1
+`sim_cluster` tier — never against `ANIMUS_DYNAMO_WIRE_SEEDS=25`, the
+tier the nightly actually runs.
+
+**Fix**: one shared `SIM_FALLBACK_TICK` constant (`sim_cluster.rs`,
+1000ms) replaces all five independent 200ms constants at every always-on
+spawn site in `SimCluster::new`/`restart`/`grow` — `RECONCILER_FALLBACK`/
+`SIM_TTL_SWEEP_INTERVAL` are now aliases of it (kept as named constants
+rather than deleted, so every existing doc reference/rustdoc link stays
+valid) and the backup-janitor/segment-janitor/index-backfill loops, which
+used to hardcode their own tick internally with no way to override it,
+each gained an explicit `interval: Duration` parameter — mirroring
+`ttl_reaper_loop`'s own pre-existing shape — with **every real production
+spawn site** (`lib.rs`'s `spawn_common_tail`) passing its own unchanged
+constant (`BACKUP_JANITOR_INTERVAL`/`SEGMENT_JANITOR_INTERVAL`/
+`INDEX_BACKFILL_LOOP_INTERVAL_MS`) explicitly, so production cadence is
+byte-identical. `heartbeat_loop` (`animus_control::node`) was
+deliberately **not** touched — its `HEARTBEAT_INTERVAL` (100ms) is a real,
+shared production/fixture constant with no per-loop override at all, not
+a `SimCluster`-only fallback tick, and it is the actual liveness mechanism
+(failure detection), not a safety net.
+
+**A finding this fix's own measurement surfaced, worth recording plainly:
+the five loops turned out to be a real but SMALL contributor to a
+scenario's total executor cost, not the dominant one the "compounded
+executor work is ~3.3x" framing implied.** A direct A/B measurement (the
+new `animus_sim::Simulator::stats()` counter, below) on the corpus's
+cheapest cell (`baseline`, no faults) at `SIM_FALLBACK_TICK` = 200ms
+(pre-fix) vs. 1s vs. 60s showed task-poll counts of 948,525 → 907,806 →
+897,804 — a ~5.6% spread across a 300x range of tick coarseness. The
+dominant driver of a scenario's ~900K-1.6M total timer fires is real
+per-tablet/control-plane Raft consensus traffic (heartbeats, AppendEntries,
+confirm-poll retries) accumulated across the large cumulative virtual
+time this corpus's own `SimCluster::spawn_and_capture` design burns: every
+synchronous `SimCluster::put`/`get`/`delete`/`dynamo` call (including
+every one of `run_delete_probe`/`run_batch_write_probe`/
+`run_transact_probe`'s many calls per scenario) unconditionally drives
+`Simulator::run_for(OP_BUDGET)` (12s virtual) regardless of how quickly
+the call itself resolves (`sim_cluster.rs`'s own doc on this). The corpus
+has also genuinely grown heavier since the D2 PR 2 baseline was measured
+— `run_transact_probe` alone (added by C-06 PR 4, after that baseline)
+issues on the order of ten-plus such 12s-per-call round trips per node —
+so the `601.29s`/`~3s-per-scenario` figure the D2 PR 2 entry above
+records was already a stale comparison point for the corpus as it exists
+today, independent of anything this fix changed.
+
+**Measured result**: `ANIMUS_DYNAMO_WIRE_SEEDS=25 cargo test -p animusd
+--lib sim_cluster_dynamo_corpus -- --nocapture` — `test result: ok. 3
+passed; 0 failed; 1 ignored`, all 200 scenarios completed (none timed
+out, none tripped the new per-scenario cost regression), test-binary time
+`1608.67s`, wall clock `26:56.59` (`/usr/bin/time -v`, this session's own
+sandbox) — under the 30-minute CI timeout, but not "near 600s": the
+finding above is why, and a further increase to `SIM_FALLBACK_TICK`
+measurably does not help (the 200ms-vs-60s A/B above already shows
+diminishing returns well before 1s). A fuller fix — closing the gap all
+the way back to ~600s — would need to address the corpus's own
+`OP_BUDGET`-per-call probe design and/or its growth since the D2 PR 2
+baseline, both out of this fix's scope (see `docs/engineering-
+lessons.md`'s matching entry for the general lesson this leaves behind).
+The depth-1 default tier (`cargo test -p animusd --lib
+sim_cluster_dynamo_corpus`) and the full `sim_cluster` lib tier (`cargo
+test -p animusd --lib sim_cluster -- --test-threads=2`, **480 passed, 0
+failed, 2 ignored** — unchanged from the pre-fix baseline count, 727.61s,
+peak RSS ~966 MB) both stayed green throughout.
+
+**Regression added, not just a manual re-measurement**: `animus_sim::
+Simulator` gained a purely additive `stats() -> SimStats { task_polls,
+timer_fires }` accessor (two `Relaxed` `AtomicU64` counters, incremented
+in `poll_task`/`fire_event` — never read by any decision this crate
+makes) — see `crates/animus-sim/CLAUDE.md`'s matching entry. `sim_cluster_
+dynamo_corpus.rs::run_scenario` reads it once right after `SimCluster::
+new` returns and once right before returning, and asserts the delta's
+`timer_fires` stays under `SCENARIO_TIMER_FIRES_BUDGET` (3,300,000 — ~2x
+headroom over the heaviest cell's observed maximum, `forward_heavy` at
+~1.60M across 5 seeds) — a deterministic, seed-reproducible per-scenario
+executor-cost ceiling, immune to the real-wall-clock noise a shared CI
+runner's own contention would otherwise inject into any such gate. This
+runs at both the depth-1 default tier and the 25-seed depth (both green,
+above); a future rung that reintroduces a fast per-loop tick, or adds a
+sixth always-on `SimCluster` loop, fails this assertion loudly, by name
+and seed, long before it could compound into another 30-minute timeout.
+
+**Production behavior unchanged, verified by grep and by test**: every
+real spawn site (`lib.rs`'s `spawn_common_tail`, two call sites each for
+`ttl_reaper`/`segment_janitor`/`backup_janitor`/`index_backfill`) passes
+its own unchanged interval constant explicitly; `cargo test -p animus-node`
+(139 passed — 134 lib + 3 + 2 integration, unchanged) and `cargo test -p
+animusd --test index_backfill --test dynamo_ttl` (4 passed, real-socket,
+untouched by this fix's own scope) both stayed green. `Cargo.lock`
+unchanged.

@@ -160,13 +160,20 @@ use animus_tablet::TabletId;
 use crate::ClientCtx;
 use crate::{MetaCommand, Metadata, NodeStatus};
 
-/// How often this loop wakes to re-derive its whole decision from a fresh
-/// `Metadata` snapshot — matches `index_drain.rs`'s own
-/// `INDEX_DRAIN_INTERVAL` cadence: cheap per-tick work, and this codebase's
-/// own testing discipline (tiny `--stream-retention` values, never the
-/// production default) needs a fast tick so a converged-or-timeout test
-/// doesn't itself become the slow part of the corpus.
-const SEGMENT_JANITOR_INTERVAL: Duration = Duration::from_millis(200);
+/// This loop's production tick cadence — how often it wakes to re-derive its
+/// whole decision from a fresh `Metadata` snapshot — matches
+/// `index_drain.rs`'s own `INDEX_DRAIN_INTERVAL` cadence: cheap per-tick
+/// work, and this codebase's own testing discipline (tiny
+/// `--stream-retention` values, never the production default) needs a fast
+/// tick so a converged-or-timeout test doesn't itself become the slow part
+/// of the corpus. Both real production spawn sites
+/// ([`segment_janitor_loop`]'s two `spawn_common_tail` callers in `lib.rs`)
+/// pass this explicitly (ADR 0061 rung I C-09 PR 3's follow-on,
+/// 2026-09-09) — `segment_janitor_loop` itself takes `interval` as a
+/// parameter now, mirroring `ttl_reaper_loop`'s own shape, so a fixture
+/// with its own cadence needs (`SimCluster`) can pass a coarser one without
+/// this constant's own production value ever changing.
+pub(crate) const SEGMENT_JANITOR_INTERVAL: Duration = Duration::from_millis(200);
 
 /// How long an **unsealed** epoch's own orphan candidate must sit before
 /// [`reap_orphans`]'s open-epoch sub-case considers it abandoned rather than
@@ -265,13 +272,19 @@ fn update_segment_janitor_progress<E: Env, R: RelayClient>(
 /// definition-site default), so production behavior is byte-identical, and
 /// `SimCluster` can now spawn this loop for real over a `SimEnv`-backed
 /// `ClientCtx` too (`sim_cluster.rs`'s own `SimCluster::new`/`restart`).
+///
+/// **`interval` is a parameter, not hardcoded, since ADR 0061 rung I C-09
+/// PR 3's follow-on (2026-09-09)** — both real production spawn sites pass
+/// [`SEGMENT_JANITOR_INTERVAL`] explicitly; `SimCluster` passes its own
+/// shared fallback-tick constant instead.
 pub(crate) async fn segment_janitor_loop<E: Env, R: RelayClient>(
     ctx: ClientCtx<E, R>,
     retention: Duration,
+    interval: Duration,
 ) {
     let retention_ms = u64::try_from(retention.as_millis()).unwrap_or(u64::MAX);
     loop {
-        ctx.env.sleep(SEGMENT_JANITOR_INTERVAL).await;
+        ctx.env.sleep(interval).await;
         let Some(leader) = ctx.edge.leader_handle() else {
             // Not (or no longer) the control leader — report idle rather
             // than leaving a stale, possibly-mid-tick phase behind (the

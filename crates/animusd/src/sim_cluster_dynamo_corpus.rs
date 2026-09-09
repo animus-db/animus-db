@@ -383,6 +383,55 @@ const DRAIN: Duration = Duration::from_secs(6);
 const CONVERGENCE_POLL_STEP: Duration = Duration::from_secs(1);
 const CONVERGENCE_BUDGET: Duration = Duration::from_secs(15);
 
+/// Deterministic per-scenario executor-cost ceiling (ADR 0061 rung I C-09
+/// PR 3's follow-on, 2026-09-09) — `run_scenario`'s own regression against
+/// the corpus-deep `dynamo_wire` CI timeout this fix closes: at
+/// `ANIMUS_DYNAMO_WIRE_SEEDS=25` on nightly run 34327875460 (main @
+/// `57073da0`), the 30-minute `.github/workflows/corpus-deep.yml` timeout
+/// fired at scenario 181/200, ~9-11s/scenario, no hang, root-caused to six
+/// always-on per-node `SimCluster` background loops each ticking every
+/// 200ms — see `sim_cluster.rs`'s own `SIM_FALLBACK_TICK` doc for the full
+/// root-cause account and `docs/engineering-lessons.md`'s matching entry
+/// for the general lesson (a background loop's own cheap-when-idle
+/// self-assessment is per-loop, not per-fixture).
+///
+/// `animus_sim::Simulator::stats()`'s `timer_fires` — the unified
+/// `(time, seq)` timeline's own fired-entry count, covering every
+/// `env.sleep()` tick **and** every message delivery (ADR 0003's one
+/// shared queue) — is a pure, seed-reproducible proxy for wall-clock
+/// executor cost, so `run_scenario` bounds it directly rather than a real
+/// wall-clock ceiling, which a shared, contended CI runner's own noise
+/// floor would make an unreliable gate (root `CLAUDE.md`'s "a flaky test
+/// is a real bug" rule — a wall-clock assert in a sim test is exactly the
+/// flake source that rule warns against). Read once right after
+/// `SimCluster::new` returns and once right before `run_scenario` returns;
+/// the delta is this one scenario's own executor cost, independent of
+/// whatever bring-up cost the cluster's own control-plane election paid
+/// during construction.
+///
+/// **Value, and how it was picked**: measured post-fix
+/// (`SIM_FALLBACK_TICK` = 1s) at `ANIMUS_DYNAMO_WIRE_SEEDS=5` (40
+/// scenarios across all 8 cells) — the heaviest cell, `forward_heavy`
+/// (RF2 over 4 nodes, so most ops route through a node hosting no local
+/// replica), peaked at ~1.60M timer fires per scenario across its 5
+/// seeds; every other cell stayed under ~1.12M. **A diagnostic finding
+/// worth recording here, not just in the report**: an A/B measurement at
+/// `SIM_FALLBACK_TICK` = 200ms (the pre-fix value) vs. 1s vs. 60s on the
+/// cheapest cell (`baseline`, no faults) showed these five loops'
+/// **own** contribution to total executor cost is real but small — task
+/// polls moved 948,525 → 907,806 → 897,804 across that range, a ~5.6%
+/// spread — so most of a scenario's ~900K-1.6M timer fires come from
+/// something this fix does not touch (real per-tablet/control Raft
+/// consensus machinery ticking across the large cumulative virtual time
+/// this corpus's own `OP_BUDGET`-per-call probe design burns, `sim_
+/// cluster.rs`'s own `spawn_and_capture` doc). This budget carries ~2x
+/// headroom over the observed `forward_heavy` maximum specifically so it
+/// still catches a genuine regression in what this fix DOES control
+/// (reintroducing a fast per-loop tick, or a sixth always-on loop) without
+/// being sensitive to the larger, out-of-this-fix's-scope cost the A/B
+/// measurement above attributes elsewhere.
+const SCENARIO_TIMER_FIRES_BUDGET: u64 = 3_300_000;
+
 /// A `Key`'s high-order digits name which table it belongs to — see
 /// `sim_cluster_corpus.rs`'s own identical constant/note for why (multiple
 /// tables sharing one `Key` space without conflating their histories).
@@ -1770,6 +1819,12 @@ fn force_resolve_all_keys(cluster: &mut SimCluster, table_names: &[String], keys
 
 fn run_scenario(s: &Scenario) -> ScenarioResult {
     let mut cluster = SimCluster::new(s.seed, s.nodes, s.replication);
+    // Deterministic per-scenario executor-cost regression — see
+    // `SCENARIO_TIMER_FIRES_BUDGET`'s own doc for the full account. Read
+    // right after construction (excluding the cluster's own bring-up cost)
+    // and again right before returning; asserted at the bottom of this
+    // function, once every table/probe cost this scenario paid is in.
+    let cost_before = cluster.sim_stats();
     let table_names: Vec<String> = (0..s.tables).map(|t| format!("t{t}")).collect();
     let mut tablets: BTreeMap<u64, TabletId> = BTreeMap::new();
     for (i, name) in table_names.iter().enumerate() {
@@ -1925,6 +1980,22 @@ fn run_scenario(s: &Scenario) -> ScenarioResult {
     let delete_probe = run_delete_probe(&mut cluster, &table_names[0], s.nodes);
     let batch_probe = run_batch_write_probe(&mut cluster, &table_names[0], s.nodes);
     let transact_probe = run_transact_probe(&mut cluster, &table_names, s.nodes);
+
+    let cost_after = cluster.sim_stats();
+    let timer_fires = cost_after
+        .timer_fires
+        .saturating_sub(cost_before.timer_fires);
+    assert!(
+        timer_fires <= SCENARIO_TIMER_FIRES_BUDGET,
+        "scenario={} seed={}: executor cost regression — this scenario fired \
+         {timer_fires} sim timeline entries (timers + message deliveries), \
+         budget is {SCENARIO_TIMER_FIRES_BUDGET} (task_polls delta: {}); see \
+         `SCENARIO_TIMER_FIRES_BUDGET`'s own doc for what this catches and \
+         how the budget was picked",
+        s.name,
+        s.seed,
+        cost_after.task_polls.saturating_sub(cost_before.task_polls),
+    );
 
     ScenarioResult {
         cycles,
