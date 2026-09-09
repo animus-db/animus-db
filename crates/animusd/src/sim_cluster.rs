@@ -1424,8 +1424,12 @@ impl SimCluster {
                 peers: BTreeMap::new(),
                 admin_addrs: vec![placeholder_addr()],
                 auto_split_bytes_threshold: None,
-                // No `DataRole` on any node in this fixture (`data: None`
-                // below) — see the module doc's "still `ProdEnv`-only" bullet.
+                // Every node in this fixture carries a real `DataRole` with
+                // a per-node metrics sink since ADR 0061 rung D2 PR 1 (`data:
+                // Some(DataRole { .. })` below) — throttled reads/writes
+                // increment under this fixture, asserted by ADR 0061 rung K's
+                // `sim_cluster_dynamo_throttle.rs`/`sim_cluster_admin.rs`
+                // scenarios.
                 backup_store: None,
                 segment_store: None,
                 quiesce_after_ms: None,
