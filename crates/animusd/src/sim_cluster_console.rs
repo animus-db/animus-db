@@ -94,14 +94,18 @@
 //! to nothing (both deleted, per this crate's own "a file left with zero
 //! tests is deleted, `Cargo.toml` checked for a stale `[[test]]` entry"
 //! discipline — neither file had one, `tests/*.rs` binaries are implicit).
-//! `tests/console_endpoint.rs` keeps its own three tests (real HTTP framing/
-//! CORS/static-asset/role-split — none of it reachable from `SimCluster`,
-//! whose console primitive builds a bare `HttpRequest` with no framing at
-//! all and has no node-role concept), each now carrying a one-line reason
-//! naming why, plus scenario `(10)` above as this rung's own new coverage
-//! of that file's JSON-routing/error-mapping assertions — not a literal
-//! conversion (nothing was removed from that file), since scenario `(10)`
-//! only reaches a slice of one three-part real-socket test.
+//! `tests/console_endpoint.rs` keeps its own three tests at the time of
+//! this PR (real HTTP framing/CORS/static-asset/role-split — none of it
+//! reachable from `SimCluster`, whose console primitive builds a bare
+//! `HttpRequest` with no framing at all; **the "no node-role concept" half
+//! of that reason is corrected by ADR 0061 rung L, C-12 PR 4c, below** —
+//! `SimCluster` gained per-node `NodeRole` in C-12 PRs 2/3, and PR 4c
+//! converts the file's other two role-named tests using it), each now
+//! carrying a one-line reason naming why, plus scenario `(10)` above as
+//! this rung's own new coverage of that file's JSON-routing/error-mapping
+//! assertions — not a literal conversion (nothing was removed from that
+//! file), since scenario `(10)` only reaches a slice of one three-part
+//! real-socket test.
 //!
 //! **No product bug found.** Every scenario passed at its pinned seed and
 //! every `_over_seeds` seed on the first clean run once the wire/console
@@ -124,10 +128,56 @@
 //! this reuse) rather than duplicating them, per this rung's own "put
 //! shared helpers where PR 3 put them" discipline. See each sibling
 //! module's own doc for its own scenario list and conversion mapping.
+//!
+//! ## ADR 0061 rung L, C-12 PR 4c: `console_endpoint.rs`'s two role-named
+//! tests
+//!
+//! `SimCluster` gained per-node [`NodeRole`] in C-12 PRs 2/3 — the "has no
+//! node-role concept" half of PR 3's own reason above no longer holds, and
+//! this PR converts the two `console_endpoint.rs` tests it names for
+//! exactly that reason. Both use `SimCluster::new_with_roles` with a
+//! `[NodeRole::Control, NodeRole::Data]` cluster (mirroring the real
+//! tests' own `support::bring_up_split(1, 1, ..)` shape).
+//!
+//! (11) [`run_console_reachable_on_a_data_only_node`] —
+//!     `console_serves_shell_on_data_only_node`'s JSON-dispatch half: the
+//!     console backend answers real, converged cluster state
+//!     (`GET /console/api/tables`) once driven from a **data-only** node's
+//!     own `ClientCtx`. What stays real-socket-only, kept whole in
+//!     `tests/console_endpoint.rs`: the literal shell/HTTP-framing check
+//!     (status line, `Content-Type: text/html`) proving the console
+//!     listener itself is bound there — `SimCluster` has no listener/port
+//!     concept for any role.
+//! (12) [`run_console_item_write_from_a_control_only_node_panics`] —
+//!     `console_addr_panics_on_control_only_node`'s structural half,
+//!     weakened (mirroring `sim_cluster_control_data_split.rs`'s own
+//!     `single_shot_first_write_through_control_node_succeeds` precedent
+//!     for a conversion that keeps the *shape*, not the literal
+//!     mechanism): the real test's own assertion — `Node::console_addr()`
+//!     panics with "this node has no data role" — is a `Node`-level
+//!     listener-binding fact `SimCluster` cannot reproduce at all (no
+//!     `Node` struct, no listener binding for any role — this is NOT the
+//!     "no node-role concept" gap; it is a separate, permanent "no
+//!     listener-binding concept" gap that persists even now that roles
+//!     exist). What DOES carry over, and turned out to be a genuine,
+//!     stronger match than first assumed (see the scenario's own doc
+//!     comment for the finding): dispatching a console item mutation
+//!     directly against a control-only node's own `ClientCtx` panics too
+//!     — `dynamo::fast_marker_write`'s unconditional `ctx.data()` read for
+//!     its own rate bookkeeping, the exact mechanism `console_addr()`'s
+//!     panic keeps structurally unreachable in production. `#[should_
+//!     panic]`, mirroring the real test's own shape; kept whole in `tests/
+//!     console_endpoint.rs` for the literal `Node`-level panic/listener-
+//!     absence proof.
+//!
+//! Replays (repo convention): `ANIMUS_SEED=<seed> cargo test -p animusd
+//! --lib <scenario name>`.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
 
 use super::sim_cluster::SimCluster;
+use crate::config::NodeRole;
 
 pub(crate) fn env_seed(default: u64) -> u64 {
     std::env::var("ANIMUS_SEED")
@@ -1139,4 +1189,174 @@ fn console_error_mapping_and_json_routing_assertions_over_seeds() {
     for i in 0..5 {
         run_console_error_mapping_and_json_routing_assertions(0xC083_9100 + i);
     }
+}
+
+// ---------------------------------------------------------------------------
+// PR 4c: role split — tests/console_endpoint.rs's two role-named tests
+// ---------------------------------------------------------------------------
+
+/// Converged-or-timeout poll on `cond(cluster)` — the shared shape every
+/// `sim_cluster_*` module's own scenario-local convergence checks use
+/// (duplicated, not reached into, per this crate's own convention —
+/// `sim_cluster_control_data_split.rs` carries the identical copy).
+fn poll_until(
+    cluster: &mut SimCluster,
+    budget: Duration,
+    seed: u64,
+    what: &str,
+    mut cond: impl FnMut(&mut SimCluster) -> bool,
+) {
+    const STEP: Duration = Duration::from_millis(100);
+    let mut elapsed = Duration::ZERO;
+    loop {
+        if cond(cluster) {
+            return;
+        }
+        assert!(
+            elapsed < budget,
+            "seed={seed}: {what} never converged within {budget:?}"
+        );
+        cluster.run_for(STEP);
+        elapsed += STEP;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// (11) console_endpoint.rs::console_serves_shell_on_data_only_node
+//      — the JSON-dispatch half only; the original stays whole for its
+//      real-HTTP-framing half.
+// ---------------------------------------------------------------------------
+
+fn run_console_reachable_on_a_data_only_node(seed: u64) {
+    let roles = [NodeRole::Control, NodeRole::Data];
+    let mut cluster = SimCluster::new_with_roles(seed, &roles, 1);
+    assert_eq!(
+        cluster.role_of(1),
+        NodeRole::Data,
+        "seed={seed}: node 1 is the data-only node"
+    );
+
+    let (status, body) = create_table_via_wire(
+        &mut cluster,
+        0,
+        r#"{"TableName":"console_data_only_t",
+            "AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}],
+            "KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}]}"#,
+    );
+    assert_eq!(status, 200, "seed={seed}: CreateTable failed: {body}");
+
+    // The data-only node's own control mirror needs a beat to converge —
+    // bounded poll, not a one-shot assert, mirroring `sim_cluster_control_
+    // data_split.rs`'s own split-deployment scenarios.
+    poll_until(
+        &mut cluster,
+        Duration::from_secs(10),
+        seed,
+        "the data-only node's own console tables list observing the just-created table",
+        |c| {
+            let (status, _ct, body) = c.console(1, "GET", "/console/api/tables", "", &[]);
+            status == 200
+                && json(&body)["tables"]
+                    .as_array()
+                    .is_some_and(|ts| ts.iter().any(|t| t["name"] == "console_data_only_t"))
+        },
+    );
+
+    // The console's `TableSnapshotFn` reads the identical replicated
+    // catalog every node sees — the data-only node's own answer carries no
+    // cluster-shaped key, exactly like `assert_no_cluster_shape` checks on
+    // the combined-node fixture above.
+    let (_, _ct, body) = cluster.console(1, "GET", "/console/api/tables", "", &[]);
+    assert_no_cluster_shape(&body);
+}
+
+#[test]
+fn console_reachable_on_a_data_only_node() {
+    run_console_reachable_on_a_data_only_node(env_seed(0xC12C_0001));
+}
+
+#[test]
+fn console_reachable_on_a_data_only_node_over_seeds() {
+    for i in 0..5 {
+        run_console_reachable_on_a_data_only_node(0xC12C_1000 + i);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// (12) console_endpoint.rs::console_addr_panics_on_control_only_node
+//      — the structural half only, weakened; the original stays whole for
+//      the literal `Node::console_addr()` panic/listener-absence proof.
+// ---------------------------------------------------------------------------
+
+/// **A real finding, not a product bug** (see this file's own PR 4c doc
+/// section): an item mutation dispatched through the console's own route
+/// against a control-only node's own `ClientCtx` genuinely panics — the
+/// FIRST draft of this scenario assumed it would forward cleanly (the
+/// plain client protocol's `cp_kind_write_raw`/`resolve_cp_route` never
+/// touches `ctx.data()` on the issuing node, per `sim_cluster_control_
+/// data_split.rs::mixed_cluster_put_via_control_node_forwards_to_data_
+/// node`'s own proof), and that assumption was WRONG for the DynamoDB-
+/// shaped item-write path the console reuses: `dynamo::fast_marker_write`
+/// (the ADR 0049 fast arm an unconditioned `PutItem` takes)
+/// unconditionally reads `ctx.data().request_rates` for its own per-
+/// tablet rate bookkeeping, on the ISSUING node's own `ctx`, before any
+/// routing/forwarding decision — confirmed by running this scenario, not
+/// by inspection (`git blame`-free: caught on the very first `cargo test`
+/// of this file). This is the **exact** mechanism `Node::console_addr()`'s
+/// panic exists to make structurally unreachable in production: a
+/// control-only node never binds the console listener at all, so this
+/// call path is never actually reached there — proven here by triggering
+/// it directly against a control-only node's own in-process `ClientCtx`,
+/// the honest `SimCluster` analog of the real test's own `#[should_
+/// panic]` shape.
+fn run_console_item_write_from_a_control_only_node_panics(seed: u64) {
+    let roles = [NodeRole::Control, NodeRole::Data];
+    let mut cluster = SimCluster::new_with_roles(seed, &roles, 1);
+    assert_eq!(
+        cluster.role_of(0),
+        NodeRole::Control,
+        "seed={seed}: node 0 has no data role — the exact structural fact \
+         `Node::console_addr()`'s panic enforces at the process level"
+    );
+    assert_eq!(
+        cluster.role_of(1),
+        NodeRole::Data,
+        "seed={seed}: node 1 is the sole data-capable node"
+    );
+
+    let (status, body) = create_table_via_wire(
+        &mut cluster,
+        0,
+        r#"{"TableName":"console_control_only_t",
+            "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
+            "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
+    );
+    assert_eq!(status, 200, "seed={seed}: CreateTable failed: {body}");
+    poll_until(
+        &mut cluster,
+        Duration::from_secs(10),
+        seed,
+        "the data-only node hosting the table's own tablet",
+        |c| !c.hosted_tablets(1).is_empty(),
+    );
+
+    // Panics here — the assertion under test (mirrors the real test's own
+    // `#[should_panic]` shape).
+    let _ = cluster.console(
+        0,
+        "POST",
+        "/console/api/tables/console_control_only_t/items/put",
+        "",
+        br#"{"item":{"id":{"S":"k1"},"v":{"S":"first"}}}"#,
+    );
+}
+
+// No `_over_seeds` sibling: `#[should_panic]` stops at the function's own
+// first panic, so a seed-looping variant would only ever exercise its
+// first seed — not meaningful here, unlike every non-panicking scenario
+// above. A single pinned seed mirrors the real test's own seedless shape.
+#[test]
+#[should_panic(expected = "ClientCtx::data called on a control-only node")]
+fn console_item_write_from_a_control_only_node_panics() {
+    run_console_item_write_from_a_control_only_node_panics(env_seed(0xC12C_0002));
 }
