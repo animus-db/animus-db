@@ -118,12 +118,21 @@
 //!   (status line, `Content-Type`, CORS headers, `OPTIONS` preflight)
 //!   [`SimCluster::admin`]/`console` cannot reproduce (they build a bare
 //!   `(status, body)` pair, no framing at all).
-//! - `dashboard_role_gating_split_deployment` — a genuine control-only/
-//!   data-only process split; `SimCluster` has no node-role concept.
-//! - `control_node_streams_read_path_is_ground_truth` — the identical
-//!   role-split reason, plus two documented backend gaps (a control-only
-//!   node's `GetRecords`/open-tail stall) this test pins down over real
-//!   sockets.
+//! - `dashboard_role_gating_split_deployment` — kept at the time of this
+//!   PR for lack of a node-role concept; **corrected by ADR 0061 rung L,
+//!   C-12 PR 4c**, which converts its JSON/asset-marker half using
+//!   `SimCluster`'s own per-node `NodeRole` (added in C-12 PRs 2/3) —
+//!   see this file's own PR 4c section, below, for what stays real-socket
+//!   (the literal shell/HTTP-framing check on both roles' admin ports).
+//! - `control_node_streams_read_path_is_ground_truth` — kept at the time
+//!   of this PR for the identical stale role-split reason; **fully
+//!   converted by C-12 PR 4c** (no real HTTP framing at all in this test —
+//!   every assertion is DynamoDB-wire/admin-JSON — so it needed no
+//!   real-socket residual, and PR 4c removes it from `tests/dashboard_
+//!   endpoint.rs` outright). Its own two documented backend gaps (a
+//!   control-only node's `GetRecords`/open-tail stall) were never
+//!   exercised by this test to begin with (its own doc names them as
+//!   deliberately NOT called) — nothing is lost by the conversion.
 //! - `dashboard_u05_lineage_panel` — `GET /admin/system-table` reads
 //!   `ctx.control_storage` (the per-node system-keyspace mirror engine ADR
 //!   0038's `DRIVER_APPLIED` apply task durably writes), always `None`
@@ -131,6 +140,49 @@
 //!   `tests/system_table.rs` disposition already documents — so `GET
 //!   /admin/system-table` unconditionally answers `{"available": false}`
 //!   here regardless of what's seeded; kept whole.
+//!
+//! ## ADR 0061 rung L, C-12 PR 4c: this file's two role-named tests
+//!
+//! `SimCluster` gained per-node [`NodeRole`](crate::config::NodeRole) in
+//! C-12 PRs 2/3 — the "no node-role concept" reason above no longer holds,
+//! corrected in place rather than left stale. Both new scenarios use
+//! `SimCluster::new_with_roles` with a `[NodeRole::Control, NodeRole::
+//! Data]` cluster, mirroring the real tests' own `support::bring_up_
+//! split(1, 1, ..)` shape.
+//!
+//! (13) [`run_dashboard_role_gating_split_deployment`] —
+//!     `dashboard_role_gating_split_deployment`'s JSON/asset-marker half:
+//!     the shell/`dashboard_node.js` render markers and the `ROLE_TABS`/
+//!     `applyRoleGating` gating logic itself, read from the served assets'
+//!     own compile-time constants directly (this file's own top-of-module
+//!     note on why that's not a narrower proof); `/admin/config`'s `role`
+//!     field differing across the split (`"control"` vs `"data"` — every
+//!     other per-role field `dashboard_role_gating_split_deployment`
+//!     checks, `backup_store`/`segment_store`/`quiesce_after_ms`/
+//!     `auth_enabled`, is `null` for **every** node regardless of role
+//!     under `SimCluster`'s own `AdminInfo` construction, a pre-existing
+//!     fixture limitation unrelated to this rung — not reproduced here);
+//!     and `/admin/raft`'s `control_mirror` converging on the data-only
+//!     node while the control-bearing node's own mirror stays honestly
+//!     "never synced". What stays real-socket-only, kept whole in
+//!     `tests/dashboard_endpoint.rs`: the literal `GET /` shell/JS-asset
+//!     HTTP framing check on both roles' admin ports (`SimCluster::admin`
+//!     builds a bare `(status, body)` pair, no framing at all), and
+//!     `/admin/peers`'s own per-node `role` field (`AdminInfo.peers` is
+//!     always an empty map under `SimCluster`, regardless of role — the
+//!     identical `backup_store`/`segment_store`-style fixture limitation,
+//!     not something this rung's role split could close).
+//! (14) [`run_control_node_streams_read_path_is_ground_truth`] —
+//!     `control_node_streams_read_path_is_ground_truth`, in full: an open
+//!     stream and a force-sealed one (via `UpdateTable{StreamEnabled:
+//!     false}`, F12-b's synchronous final seal — no periodic seal loop or
+//!     `SimCluster::drive_stream_seal` needed) created over the wire from
+//!     the DATA node, then `/admin/status`'s converged replicated catalog
+//!     and `ListStreams`/`DescribeStream` through the `/admin/data/dynamo`
+//!     proxy read from the CONTROL-ONLY node's own admin port — every
+//!     assertion in the original is DynamoDB-wire/admin-JSON, no HTTP
+//!     framing at all, so this converts whole and is removed from `tests/
+//!     dashboard_endpoint.rs` outright.
 //!
 //! Replays (repo convention): `ANIMUS_SEED=<seed> cargo test -p animusd
 //! --lib <scenario name>`.
@@ -144,6 +196,7 @@ use super::sim_cluster::SimCluster;
 use super::sim_cluster_console::{
     control_leader_and_follower, env_seed, json, non_leader_of_table,
 };
+use crate::config::NodeRole;
 use crate::dashboard::{
     BACKUPS_JS, BROWSER_JS, CORE_JS, HTML, NODE_JS, OVERVIEW_JS, STORAGE_JS, TABLETS_JS, TXNS_JS,
 };
@@ -1126,5 +1179,327 @@ fn u05_control_member_actions() {
 fn u05_control_member_actions_over_seeds() {
     for i in 0..5 {
         run_u05_control_member_actions(0xC087_0B00 + i);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PR 4c: role split — tests/dashboard_endpoint.rs's two role-named tests
+// ---------------------------------------------------------------------------
+
+/// Local `poll_until` for both scenarios below (this file's own convention
+/// has no shared one — every other convergence check here polls inline).
+fn poll_until_dashboard_role(
+    cluster: &mut SimCluster,
+    budget: Duration,
+    seed: u64,
+    what: &str,
+    mut cond: impl FnMut(&mut SimCluster) -> bool,
+) {
+    const STEP: Duration = Duration::from_millis(100);
+    let mut elapsed = Duration::ZERO;
+    loop {
+        if cond(cluster) {
+            return;
+        }
+        assert!(
+            elapsed < budget,
+            "seed={seed}: {what} never converged within {budget:?}"
+        );
+        cluster.run_for(STEP);
+        elapsed += STEP;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// (13) dashboard_role_gating_split_deployment
+//      — the JSON/asset-marker half only; the original stays whole for its
+//      real-HTTP-framing half.
+// ---------------------------------------------------------------------------
+
+fn run_dashboard_role_gating_split_deployment(seed: u64) {
+    let roles = [NodeRole::Control, NodeRole::Data];
+    let mut cluster = SimCluster::new_with_roles(seed, &roles, 1);
+
+    // ---- both roles serve the same shell + JS assets (render-only) -----
+    // Read directly from the served assets' own compile-time constants
+    // (this file's own top-of-module note explains why that's not a
+    // narrower proof than fetching them over a socket) — the real assets
+    // are the same bytes regardless of which role's admin port would have
+    // served them, so no per-role dispatch is needed for this half.
+    assert!(
+        HTML.contains("animusd admin") && HTML.contains("dashboard_node.js"),
+        "the shell references the Node view's script asset"
+    );
+    assert!(
+        NODE_JS.contains("function renderNode")
+            && NODE_JS.contains("control_mirror")
+            && NODE_JS.contains("nd-tablet-sel"),
+        "dashboard_node.js carries the Node view's rendering + storage-debug markers"
+    );
+
+    // ---- the gating logic itself lives in CORE_JS -----------------------
+    assert!(
+        CORE_JS.contains("ROLE_TABS")
+            && CORE_JS.contains("applyRoleGating")
+            && CORE_JS.contains(r#"data: ["node", "browser", "streams"]"#),
+        "dashboard_core.js defines the per-role tab gating, including the \
+         data role's node-first tab list (now with Streams, ADR 0042/0043)"
+    );
+    assert!(
+        CORE_JS.contains(
+            r#"control: ["overview", "placement", "tablets", "txns", "browser", "streams", "storage", "backups"]"#
+        ),
+        "the control role's own tab list includes Streams, Transactions, and Backups too"
+    );
+
+    // ---- /admin/config's role differs across the split -------------------
+    // Only `role` itself differs per role under `SimCluster` — every other
+    // per-role field the real test also checks (`backup_store`/
+    // `segment_store`/`quiesce_after_ms`/`auth_enabled`/`auth_access_key_
+    // ids`) is `null` for EVERY node here regardless of role (`AdminInfo`'s
+    // own construction in `SimCluster::new_with_roles`, this file's own
+    // module doc), so those aren't asserted per-role here.
+    let (status, body) = cluster.admin(0, "GET", "/admin/config", "", &[]);
+    assert_eq!(
+        status, 200,
+        "seed={seed}: /admin/config on the control node: {body}"
+    );
+    assert_eq!(
+        json(&body)["role"],
+        "control",
+        "seed={seed}: a control-only node's own /admin/config reports its role: {body}"
+    );
+
+    let (status, body) = cluster.admin(1, "GET", "/admin/config", "", &[]);
+    assert_eq!(
+        status, 200,
+        "seed={seed}: /admin/config on the data node: {body}"
+    );
+    assert_eq!(
+        json(&body)["role"],
+        "data",
+        "seed={seed}: a data-only node's own /admin/config reports its role: {body}"
+    );
+
+    // ---- the data-only node's control-plane mirror actually syncs -----
+    // Bounded poll — the mirror needs at least one sync/long-poll round
+    // trip against the control deployment.
+    poll_until_dashboard_role(
+        &mut cluster,
+        Duration::from_secs(20),
+        seed,
+        "the data-only node's own control_mirror syncing",
+        |c| {
+            let (status, body) = c.admin(1, "GET", "/admin/raft", "", &[]);
+            assert_eq!(
+                status, 200,
+                "seed={seed}: /admin/raft on the data node: {body}"
+            );
+            let v = json(&body);
+            let cm = &v["control_mirror"];
+            assert!(
+                cm.is_object(),
+                "seed={seed}: control_mirror is present: {v}"
+            );
+            assert!(
+                cm["watermark"].is_u64(),
+                "seed={seed}: watermark is a number: {cm}"
+            );
+            assert!(
+                cm["leader_hint"].is_null() || cm["leader_hint"].is_string(),
+                "seed={seed}: leader_hint is null or a string: {cm}"
+            );
+            cm["has_synced"] == Value::Bool(true)
+        },
+    );
+
+    // A control-bearing node IS a control-plane voter, so its own
+    // `/admin/raft` reports the honest degenerate mirror (never "synced"
+    // via a mirror — its own Raft state is already the ground truth).
+    let (status, body) = cluster.admin(0, "GET", "/admin/raft", "", &[]);
+    assert_eq!(
+        status, 200,
+        "seed={seed}: /admin/raft on the control node: {body}"
+    );
+    assert_eq!(
+        json(&body)["control_mirror"]["has_synced"],
+        Value::Bool(false),
+        "seed={seed}: a control-plane voter's own mirror is never 'synced' (no mirror \
+         involved): {body}"
+    );
+}
+
+#[test]
+fn dashboard_role_gating_split_deployment() {
+    run_dashboard_role_gating_split_deployment(env_seed(0xC12C_0003));
+}
+
+#[test]
+fn dashboard_role_gating_split_deployment_over_seeds() {
+    for i in 0..5 {
+        run_dashboard_role_gating_split_deployment(0xC12C_3000 + i);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// (14) control_node_streams_read_path_is_ground_truth — full convert
+// ---------------------------------------------------------------------------
+
+fn run_control_node_streams_read_path_is_ground_truth(seed: u64) {
+    let roles = [NodeRole::Control, NodeRole::Data];
+    let mut cluster = SimCluster::new_with_roles(seed, &roles, 1);
+
+    // An ENABLED stream (stays open — no seal).
+    let (status, body) = cluster.dynamo(
+        1,
+        "DynamoDB_20120810.CreateTable",
+        br#"{"TableName":"OpenT","KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],
+            "AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}],
+            "StreamSpecification":{"StreamEnabled":true,"StreamViewType":"NEW_AND_OLD_IMAGES"}}"#,
+    );
+    assert_eq!(status, 200, "seed={seed}: {body}");
+    let (status, body) = cluster.dynamo(
+        1,
+        "DynamoDB_20120810.PutItem",
+        br#"{"TableName":"OpenT","Item":{"pk":{"S":"k1"}}}"#,
+    );
+    assert_eq!(status, 200, "seed={seed}: {body}");
+
+    // A stream forced sealed via disable (F12-b's final seal, synchronous
+    // — `dynamo::disable_stream` calls `force_seal_tablet` directly, so no
+    // periodic loop or `SimCluster::drive_stream_seal` is needed).
+    let (status, body) = cluster.dynamo(
+        1,
+        "DynamoDB_20120810.CreateTable",
+        br#"{"TableName":"SealedT","KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],
+            "AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}],
+            "StreamSpecification":{"StreamEnabled":true,"StreamViewType":"NEW_AND_OLD_IMAGES"}}"#,
+    );
+    assert_eq!(status, 200, "seed={seed}: {body}");
+    let (status, body) = cluster.dynamo(
+        1,
+        "DynamoDB_20120810.PutItem",
+        br#"{"TableName":"SealedT","Item":{"pk":{"S":"k1"}}}"#,
+    );
+    assert_eq!(status, 200, "seed={seed}: {body}");
+    let (status, body) = cluster.dynamo(
+        1,
+        "DynamoDB_20120810.UpdateTable",
+        br#"{"TableName":"SealedT","StreamSpecification":{"StreamEnabled":false}}"#,
+    );
+    assert_eq!(status, 200, "seed={seed}: {body}");
+
+    // ---- ground truth on the CONTROL-ONLY node's own admin port -------
+
+    // `/admin/status` mirrors the full replicated catalog: both streams'
+    // specs/rows, converged-or-timeout (the data-only node's writes need a
+    // beat to reach the control-only node's own mirror).
+    poll_until_dashboard_role(
+        &mut cluster,
+        Duration::from_secs(20),
+        seed,
+        "the control node's /admin/status converging to the sealed row",
+        |c| {
+            let (status, body) = c.admin(0, "GET", "/admin/status", "", &[]);
+            assert_eq!(status, 200, "seed={seed}: {body}");
+            let v = json(&body);
+            let open_ok = v["schemas"]["tables"]["OpenT"]["stream"]["label"].is_string();
+            let sealed_row_present = v["stream_shards"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|r| {
+                    r["table"].as_str() == Some("SealedT")
+                        && !r["expired"].as_bool().unwrap_or(true)
+                });
+            open_ok && sealed_row_present
+        },
+    );
+
+    // `ListStreams` through the admin proxy (`/admin/data/dynamo`) —
+    // metadata-only, so it must be exact, not eventually-consistent.
+    let (status, body) = cluster.admin(
+        0,
+        "POST",
+        "/admin/data/dynamo",
+        "",
+        br#"{"op":"ListStreams","payload":{}}"#,
+    );
+    assert_eq!(status, 200, "seed={seed}: {body}");
+    let list = json(&body);
+    let streams = list["Streams"].as_array().expect("Streams array");
+    let names: Vec<&str> = streams
+        .iter()
+        .filter_map(|s| s["TableName"].as_str())
+        .collect();
+    assert!(
+        names.contains(&"OpenT") && names.contains(&"SealedT"),
+        "seed={seed}: ListStreams from the control-only node's admin proxy lists both \
+         streams: {body}"
+    );
+
+    // `DescribeStream` on each — open stream has exactly one shard with no
+    // `EndingSequenceNumber`; the sealed one has exactly one shard WITH an
+    // `EndingSequenceNumber` and `StreamStatus: DISABLED`.
+    let open_arn = streams
+        .iter()
+        .find(|s| s["TableName"].as_str() == Some("OpenT"))
+        .and_then(|s| s["StreamArn"].as_str())
+        .expect("OpenT's stream ARN")
+        .to_string();
+    let sealed_arn = streams
+        .iter()
+        .find(|s| s["TableName"].as_str() == Some("SealedT"))
+        .and_then(|s| s["StreamArn"].as_str())
+        .expect("SealedT's stream ARN")
+        .to_string();
+
+    let (status, body) = cluster.admin(
+        0,
+        "POST",
+        "/admin/data/dynamo",
+        "",
+        format!(r#"{{"op":"DescribeStream","payload":{{"StreamArn":"{open_arn}"}}}}"#).as_bytes(),
+    );
+    assert_eq!(status, 200, "seed={seed}: {body}");
+    let desc = json(&body);
+    let sd = &desc["StreamDescription"];
+    assert_eq!(sd["StreamStatus"], "ENABLED", "seed={seed}: {body}");
+    let shards = sd["Shards"].as_array().expect("Shards array");
+    assert_eq!(shards.len(), 1, "seed={seed}: {body}");
+    assert!(
+        shards[0]["SequenceNumberRange"]["EndingSequenceNumber"].is_null(),
+        "seed={seed}: OpenT's own shard is genuinely open (no EndingSequenceNumber): {body}"
+    );
+
+    let (status, body) = cluster.admin(
+        0,
+        "POST",
+        "/admin/data/dynamo",
+        "",
+        format!(r#"{{"op":"DescribeStream","payload":{{"StreamArn":"{sealed_arn}"}}}}"#).as_bytes(),
+    );
+    assert_eq!(status, 200, "seed={seed}: {body}");
+    let desc = json(&body);
+    let sd = &desc["StreamDescription"];
+    assert_eq!(sd["StreamStatus"], "DISABLED", "seed={seed}: {body}");
+    let shards = sd["Shards"].as_array().expect("Shards array");
+    assert_eq!(shards.len(), 1, "seed={seed}: {body}");
+    assert!(
+        shards[0]["SequenceNumberRange"]["EndingSequenceNumber"].is_string(),
+        "seed={seed}: SealedT's own shard is genuinely sealed (has an EndingSequenceNumber): \
+         {body}"
+    );
+}
+
+#[test]
+fn control_node_streams_read_path_is_ground_truth() {
+    run_control_node_streams_read_path_is_ground_truth(env_seed(0xC12C_0004));
+}
+
+#[test]
+fn control_node_streams_read_path_is_ground_truth_over_seeds() {
+    for i in 0..5 {
+        run_control_node_streams_read_path_is_ground_truth(0xC12C_4000 + i);
     }
 }

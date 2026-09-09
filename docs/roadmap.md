@@ -1144,35 +1144,117 @@ the still-true paragraph after the table.
 
 ---
 
-### C-12 control/data role split `SimCluster` dispatch
+### C-12 control/data role split SimCluster dispatch
 
-- **Problem:** `SimCluster` builds every node identically — both control
-  and data roles on each — so the deployment shapes `animusd` actually
-  supports in production (control-only, data-only, and a mix of the two
-  per ADR 0035) have no in-process fixture analog. This is the one
-  remaining post-C-10 unowned group with a genuine `SimCluster` capability
-  gap behind it (as opposed to a process-boundary residue): 5 files/21
-  tests per the D3-closing class-D breakdown, unchanged since. Rung K's
-  own close-out (ADR 0061) names it the natural next candidate.
-- **What:** not yet scoped in detail — a plan has been informally drafted
-  during rung K's own residual-inventory work (control/data role split as
-  a per-node fixture concept), noting that `SimCluster::grow("data")`
-  already carries a data-only-node primitive with its own sim
-  metadata-mirror loop, which may be reusable groundwork rather than a
-  from-scratch build. No `dynamo.rs`/`sim_cluster.rs` grep-verified ground
-  truth has been produced yet — that is this candidate's own opener PR's
-  job, following the same widen-then-scope template every rung since D3
-  has used.
-- **ADR:** [0061](adr/0061-testability-node-crate-simulator.md) (rung K's
-  own close-out names this candidate; no rung opened for it yet).
-- **Size:** not yet sized — likely M or L given the new fixture primitive
-  needed, larger than any of C-09/C-10/C-11.
+- **Problem:** the control/data role split (ADR 0035 — `NodeRole::
+  {Control, Data, Both}`) is the one group named, unclaimed, in every
+  "what remains unowned" list since C-08's own close-out; C-11's own
+  opener names it again, explicitly, as the one remaining group needing a
+  genuinely new `SimCluster` deployment-shape fixture rather than a
+  dispatch-arm widening.
+- **What:** production already had the whole role split —
+  `NodeRole::{Control, Data, Both}` (`config.rs:74`), the three real
+  assemblies (`Node::start_with`/`BoundControlNode::start_control_with`/
+  `BoundDataNode::start_data_with`, `lib.rs:4886`/`:6421`/`:6814`), and
+  `ControlHandle<E, R>::{Local, Remote}` + `RemoteControlClient<R>`
+  (`animus-node/src/control_handle.rs:92`/`:146`) — all already generic,
+  so this rung needed zero production widening throughout. PR 2 gave
+  `SimCluster` a control-only node variant (`data: None`, no reconciler/
+  janitors/mirror loop) and role-aware `restart`/`crash`; PR 3 made
+  `NodeRole::Data` first-class at construction (control-prefixed roles,
+  not only via `SimCluster::grow`), fixing two real latent gaps in `grow`
+  itself along the way. PR 4a-4d converted 22 scenarios (43 tests) across
+  7 real-socket files (one, `cluster_split.rs`, deleted whole); PR 4e
+  converted a further 11 scenarios (22 tests) from `control_membership_
+  admin.rs`, the rung's own distinguishing finding — this close-out's own
+  first draft found the file's "11 of 12 convert" plan had never been
+  attempted by any landed PR, and PR 4e both closed that gap and
+  corrected the opener's "permanent `--config` residue" label for the
+  file's 12th test (also convertible, also converted). See
+  [ADR 0061](adr/0061-testability-node-crate-simulator.md)'s 2026-09-09
+  "Rung L closed" amendment for the full per-PR record, the mechanism as
+  it stands, and the assess-and-close verdict on every permanent residual.
+- **ADR:** [0061](adr/0061-testability-node-crate-simulator.md) (rung L,
+  closed), [0035](adr/0035-control-plane-separate-deployment.md) (the
+  role-split deployment shapes themselves).
+- **Size:** L, 9 PRs (two more than the 6-7 planned — PR 4b landed as its
+  own module rather than folding into PR 4a's, per that PR's own line-
+  budget finding, and PR 4e closed a shortfall this close-out's own first
+  draft found against the opener's plan).
 - **Depends:** C-11 (closed) — the next unowned residual group per C-08's,
   C-09's, C-10's, and C-11's own close-outs.
-- **Status (2026-09-09):** candidate — plan drafted, awaiting the
-  maintainer's sequencing. Not opened; no PRs.
+- **Status (2026-09-09):** closed — all nine PRs landed (#806, #808,
+  #822, #823, #824, #825, #826, #827, plus PR 5, the docs close-out).
+  `cargo test -p animusd --lib -- sim_cluster --test-threads=2` ran 478
+  (C-11 close) → 500 (PR 2+3 combined) → 522 (PR 4a) → 534 (PR 4b) → 541
+  (PR 4c) → 543 (PR 4d) → **565 passed, 0 failed, 2 ignored (567 total)**
+  (PR 4e). Real-socket tests across all 8 files this rung's own plan
+  named: 40 → 12 (28 removed; `cluster_split.rs` deleted whole). Zero
+  production signature changes across the whole rung except one real,
+  previously-latent bug PR 4e's own gate found and fixed:
+  `ClientCtx::admin_remove_control_member`'s leader-self-removal
+  transfer-wait loop read `tokio::time::Instant::now()`/`tokio::time::
+  sleep` directly despite an already-generic `<E, R>` signature — this
+  crate's fifth recorded recurrence of the "generic signature ≠
+  seam-clean body" lesson, fixed with `self.env.now()`/`self.env.sleep`.
+  Every other real-socket conversion was pure test-fixture authorship
+  over an already-generic production surface, the identical
+  distinguishing property C-11 established for its own group. Deferred
+  to a follow-on rung (the real ADR 0030/0032 seed/join dance
+  `SimCluster::grow` itself bypasses): `data_join.rs` (1), `seed_join.rs`
+  (1), `seed_join_allocated.rs` (5), `control_membership_split.rs` (2) —
+  9 tests across 4 files, see C-13 below. Genuinely permanent, assessed
+  against each test's own body rather than its inherited label:
+  `control_mirror_restart.rs`/`control_metadata_restart.rs` (2+2,
+  real-disk restart), `seed_join_hostname.rs` (1, real DNS), `config_
+  node_identity.rs` (1, the real `Node::bind` identity path — re-labeled
+  from "`--config` bring-up," which named the wrong mechanism),
+  `control_membership_admin.rs` (1, `runtime_added_voter_survives_
+  leadership_change_to_a_different_original_voter`, `ProdEnv::merge_
+  peer`'s scope-limit behaviour — invisible under `SimEnv`, found by PR
+  4e). See ADR 0061's "Rung L closed" amendment and `crates/animusd/
+  CLAUDE.md`'s consolidated appendix for the full record.
 
 ---
+
+### C-13 seed/join discovery SimCluster dispatch (candidate, not opened)
+
+- **Problem:** `SimCluster::grow` and C-12's own `NodeRole::Data`-at-
+  construction path both self-register a node directly against the
+  control leader (`MetaCommand::RegisterNode` + `MetaCommand::
+  UpsertMember{Active}`), bypassing the real ADR 0030/0032 `--seed`
+  discovery dance every genuine `animusd data --seed`/`animusd join`
+  deployment uses. C-12's own close-out names this as the next candidate
+  — a real capability gap, not process-boundary residue, but one that
+  needs its own new fixture primitive (a `SimCluster`-native seed/join
+  dial + the failure-detector promotion path), not just the role-split
+  machinery C-12 already built.
+- **Inventory** (confirmed unchanged by C-12, real-socket tests): `data_
+  join.rs` (1, data-only `--seed` discovery of a pre-existing split
+  deployment), `seed_join.rs` (1, combined-mode `--seed` discovery, ADR
+  0032 PR2), `seed_join_allocated.rs` (5, self-minted member ids over
+  `--seed`, ADR 0040), `control_membership_split.rs` (2, runtime control-
+  quorum growth/voter-replace over a genuine split deployment, through
+  the real admin HTTP surface rather than a direct-propose bypass) — 4
+  files/9 tests. (`control_membership_admin.rs`'s own 12 tests, once also
+  outstanding from C-12, were resolved within C-12 itself by that rung's
+  PR 4e — 11 converted, 1 kept permanently for a genuinely structural
+  `SimEnv` reason — so this candidate's own scope is only the four
+  seed/join-discovery files above.)
+- **What:** not yet scoped — no `SimCluster`/`animus-node` grep-verified
+  ground truth has been produced for the seed/join dial mechanism itself.
+  That is this candidate's own opener PR's job, following the same
+  widen-then-scope template every rung since D3 has used.
+- **ADR:** [0061](adr/0061-testability-node-crate-simulator.md) (C-12's
+  own close-out names this candidate; no rung opened for it yet),
+  [0030](adr/0030-online-cluster-growth.md)/[0032](adr/0032-decommission-and-join.md)
+  (the join dance itself).
+- **Size:** not yet sized — likely M or L given the new discovery-dial
+  primitive needed.
+- **Depends:** C-12 (closed) — the next unowned residual group per C-08's
+  through C-12's own close-outs.
+- **Status (2026-09-09):** candidate — not opened, no PRs, no plan
+  drafted beyond the inventory above.
 
 ## 4. Operator surfaces: admin API, dashboard, console, CLI
 
@@ -1254,6 +1336,8 @@ wave are independent and can run in parallel.
 | 10 | C-09 (closed 2026-09-09 — all six PRs landed: #780, #782, #785, #786, #787, plus PR 6) | Gated on C-08 (closed) — C-08's own close-out recommendation, stacked directly on it |
 | 11 | C-10 (closed 2026-09-09 — all seven PRs landed: #789, #790, #791, #792, #793, #794, plus PR 7) | Gated on C-09 (closed) — the next unowned residual group per C-08's and C-09's own close-outs |
 | 12 | C-11 (closed 2026-09-09 — all four PRs landed: #796, #797, #799, plus PR 4) | Gated on C-10 (closed) — the next unowned residual group per C-08's, C-09's, and C-10's own close-outs; proceeded without an explicit maintainer sequencing instruction, per Rung J's own close-out recommendation (see the C-11 entry's own note) |
+| 13 | C-12 (closed 2026-09-09 — all nine PRs landed: #806, #808, #822, #823, #824, #825, #826, #827, plus PR 5) | Gated on C-11 (closed) — the next unowned residual group per C-08's, C-09's, C-10's, and C-11's own close-outs; taken up per Rung K's own close-out recommendation |
+| 14 | C-13 (candidate, not opened — seed/join discovery under `SimCluster`) | Gated on C-12 (closed) — the next unowned residual group per C-08's through C-12's own close-outs |
 
 Open issues mapped: none left (#375 closed by W-01, #319 by W-05). Filed
 from wave 2's own findings: #590 (the operator still emits the deleted
