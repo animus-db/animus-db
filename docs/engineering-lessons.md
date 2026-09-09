@@ -23423,6 +23423,36 @@ not just the ones whose diff you're already looking at; a function that
 "already looks generic" next to freshly-converted siblings is exactly
 the one most likely to get skipped.
 
+**2026-09-09, fifth recurrence (ADR 0061 rung L, C-12 PR 4e)**:
+`ClientCtx::admin_remove_control_member` (`lib.rs`) — already `<E: Env, R:
+RelayClient>`-generic, and sitting in the very same file, right next to
+`admin_transfer_control_leadership` (the third recurrence's own site) —
+had the identical gap: its own leader-self-removal transfer-wait loop
+read `tokio::time::Instant::now()`/called `tokio::time::sleep(SCHEMA_
+POLL_INTERVAL)` directly. Found the same way, by the same signal: `sim_
+cluster_control_membership_admin.rs`'s own `remove_control_voter_
+refusals_transfer_and_quorum_warnings` scenario — this loop's first-ever
+`SimEnv`-driven caller, since `SimCluster` had no route to the leader-
+self-removal arm before this PR gave `/admin/control/member/remove` a sim
+sibling at all — panicked immediately with "no reactor running." Fixed
+with the identical `self.env.now().saturating_add(..)`/`self.env.now() >=
+deadline`/`self.env.sleep(..)` conversion; re-verified byte-for-byte
+behavior-preserving under `ProdEnv` by re-running every other real-socket
+caller of this method (`admin_endpoint.rs`, `decommission.rs`,
+`control_membership_split.rs`, `heartbeat_live_destinations.rs`), all
+green. Five occurrences now, in one crate, and the third and fifth sit in
+the SAME function's own file, a few hundred lines apart — proximity to an
+already-fixed sibling is no protection at all: `admin_add_control_member`,
+right beside both, was separately checked by hand for this same PR and
+found already seam-clean (it already used `self.env`/no bare
+`tokio::time` anywhere). **The generalizable takeaway sharpens with each
+recurrence**: don't grep only the function this PR's own diff touches —
+before treating any `ClientCtx`/`CpGroup` method as usable from a new
+`SimCluster` scenario, grep *that specific function's own body* (not just
+its neighbors, not just its signature) for `tokio::time`/`Instant::now`/
+`SystemTime::now`, every time, even when a sibling two functions up was
+already fixed in an earlier rung.
+
 ## `DescribeStream` always appends a tablet's still-open successor epoch behind a just-sealed one while the stream stays enabled — a shard-count assertion after a seal must account for it (ADR 0061 rung G, C-07 PR 3, 2026-09-08)
 
 Building `sim_cluster_dynamo_streams.rs`'s new post-seal scenarios (a
@@ -24129,3 +24159,235 @@ matches design expectations either way.
    preferred conclusion. A clean re-measurement, if ever needed, wants a
    quiescent host (or `nice`/cgroup isolation) and more than 3 samples per
    cell before either accepting or re-closing this gap with confidence.
+## A fixture whose node ids used to ALL share one role has implicit "every id is a control voter" assumptions baked into loop targets and membership lists — heterogeneous roles surface every one (ADR 0061 rung L, C-12 PR 3)
+
+`SimCluster::restart`'s control-bearing branch rebuilt a restarted node's
+fresh `RaftNode<SimEnv>` with `all_ids = (0..self.nodes as u64).map(nid)
+.collect()` as its own membership — correct for every scenario that ever
+exercised it, because until this PR every node in `self.roles` genuinely
+was a control voter, so `self.nodes` and the control voter count were
+always equal. The instant `NodeRole::Data` became reachable (at
+construction, this PR; or via a pre-existing `SimCluster::grow` call,
+already possible before it) that equality silently stopped holding: `all_
+ids` would list a non-voter data-only node as a Raft member on the very
+next restart of an *original* node. Nothing caught this in review or by
+`cargo check` — the bug is a value, not a type error, and no existing
+`sim_cluster_growth.rs` scenario had ever combined `grow` with a `restart`
+of an original (non-grown) node, so it was a real, previously-latent gap
+with zero test coverage on either side of it. Found only by deliberately
+re-deriving every "list of node ids" binding in the function from first
+principles while widening it for a second role, not by symptom.
+
+**The general form, worth checking whenever a fixture that used to have one
+uniform node shape gains a second one**: grep every place the fixture binds
+"every node" / "all ids" / "the whole node set" as a stand-in for "every
+control voter" (or any other role-scoped subset) — a heartbeat target list,
+a Raft membership list, an admin-info field, anything a helper's own doc
+comment describes as "the control group" without actually deriving it from
+the role array. Before the split these two sets were the same list by
+construction, so using either name was harmless; the moment they diverge,
+the wrong one silently starts including (or excluding) members it
+shouldn't, and the failure mode is not a compile error or even a hang — a
+membership-list-with-an-extra-non-voter can commit and elect just fine
+under `SimEnv`'s forgiving virtual-time scheduler, it just isn't the group
+production would ever actually form.
+
+**A second instance of the identical shape, same PR**: `SimCluster::grow`
+— which predates per-node roles and was itself the FIRST place a genuinely
+heterogeneous node ever existed in this fixture — had its own two bugs from
+exactly this class, just never named as such: it spawned `backup_janitor_
+loop` unconditionally on its own grown data-only node (a control-plane-
+leader-only loop that can never do anything useful there, since a `Remote`
+control handle can never become control-plane leader — harmless in
+practice, since the loop's own leader gate makes it a permanent no-op, but
+production-inaccurate) and never spawned `ttl_reaper_loop` at all (a real
+gap — production spawns one on every data-only node). Both were written
+once, by hand, before there was a second, symmetric construction path
+(`new_with_roles`'s own `NodeRole::Data` case) to cross-check against —
+the cross-check is what surfaced both: factoring the two constructors'
+shared loop-spawning logic together forced an explicit "which of these
+loops does THIS role actually get, checked against production's own
+`start_data_with_growth`" pass, rather than "copy whatever `grow`
+happened to spawn last time." **Lesson**: when a second, symmetric
+construction path for the same conceptual thing (a data-only node, here)
+is about to exist, use building it as the forcing function to re-derive
+the first one's own loop/membership set from production ground truth
+directly, rather than copying it forward unexamined — a solo, uncross-
+checked implementation is exactly where this class of bug hides.
+
+## A `SimCluster` scenario mixing `NodeRole::Control` with a wire-issued `CreateTable` needs at least one `NodeRole::Data`/`Both` node, or `await_table_serveable` spins forever (ADR 0061 rung L, C-12 PR 4a)
+
+`create_table_via_wire` (this crate's own `sim_cluster_console.rs` helper,
+reused by every `sim_cluster_*` module that issues a real DynamoDB
+`CreateTable` request) does the full production sequence: propose the
+schema, provision the tablet, then block on `ClientCtx::
+await_table_serveable` until the freshly-minted tablet's own Raft group has
+actually elected and can serve a read. A bare `NodeRole::Control`-only
+`SimCluster` has zero nodes eligible to become a replica of anything — the
+tablet can never elect, so the wait never resolves, and the call spins
+until its own timeout ("table tablet did not provision in time") rather
+than failing fast or erroring cleanly. This is structurally different from
+`SimCluster::create_table`/`create_table_with_replication`'s own
+hand-hosted path (which bypasses the wire and mints replicas directly on
+whichever node indices the caller names) — only the WIRE path
+(`create_table_via_wire`, and by extension `SimClusterHandle::dynamo`
+issuing a real `CreateTable`) has this requirement.
+
+**The general form**: any `SimCluster` scenario that mixes `NodeRole::
+Control`-only nodes with a real wire `CreateTable` needs at least one
+`NodeRole::Data`/`Both` node in its role array, even if the scenario's own
+subject has nothing to do with the data plane (e.g. proving a schema
+proposal commits and relays correctly among CONTROL-only nodes) — the
+DDL call itself, not the property under test, is what needs somewhere to
+land. When a scenario's own subject is genuinely control-plane-only,
+prefer widening the role array by one `Data` node with a comment
+explaining why (as `schema_ddl_via_control_node_commits_and_relays` now
+does) over trying to prove the property some other way — the DDL call is
+otherwise unavoidable groundwork, not part of what's being asserted.
+
+## A crashed-but-muted `SimCluster` node's own stale "I still lead" belief generalizes past the CP-data tablet leader it was first found for — check EVERY leader-index accessor a fault scenario calls after a crash (ADR 0061 rung L, C-12 PR 4b)
+
+`sim_cluster_auto_split.rs`'s own module doc already records this for a
+CP-data tablet leader's `SimCluster::leader_index_of`: `SimCluster::crash`
+**mutes** a node (its tasks keep running, nothing is delivered to or from
+it) rather than stopping it, so a crashed former leader's own `RaftCore`
+never receives the higher-term vote that would tell it to step down from a
+term it already won — its `is_leader()` keeps answering `true` forever,
+and an unfiltered leader-index scan that includes the crashed node's own
+id can keep returning that same crashed node, never noticing the
+survivors' real election.
+
+Writing `sim_cluster_split_cluster.rs`'s own control-leader-failover
+scenarios found the **identical** gotcha one layer up, for the
+**control-plane** leader: `SimCluster::control_leader_index()` (unfiltered)
+has the exact same failure mode after `cluster.crash(leader)`, for the
+exact same reason — nothing control-plane-specific about the mechanism,
+it's a property of `SimCluster::crash` itself, and applies to *any*
+leader-shaped accessor scanning node state after a crash of the node it
+would have returned. The fix generalizes identically too: a new sibling
+accessor, `SimCluster::control_leader_index_excluding(exclude)`, mirrors
+`leader_index_of`'s own filtered-scan shape (skip `exclude` on every poll
+iteration) rather than trying to make the crashed node's own belief
+correct.
+
+**The general rule, stated once so it doesn't need re-discovering a third
+time**: any `SimCluster` fault scenario that (a) crashes a leader and (b)
+then needs to find out who leads *now* must use a filtered accessor that
+excludes the crashed node's own id — never the plain, unfiltered
+leader-index accessor, for the control plane, a CP-data tablet, or any
+future leader-shaped state this fixture grows. Check for this the moment
+a scenario's own shape is "crash the leader, then ask who leads."
+
+## A scenario converted from a real-socket test needs its own retry discipline for a race the original's real network timing happened to paper over (ADR 0061 rung L, C-12 PR 4b)
+
+Three of `sim_cluster_split_cluster.rs`'s six converted scenarios passed
+on the first `cargo test` run for the tests that didn't touch a fault at
+all, then failed the moment the scenario chained real disruption
+(a crash, a dual crash, a split) immediately followed by a single-shot
+call with no settle buffer — a shape the original real-socket test never
+hit because a real process crash/election/relay round trip costs enough
+real wall-clock time on its own that the next client call, issued from a
+fresh thread a moment later, effectively always lands after things have
+settled. `SimCluster`'s own event-driven `spawn_and_capture` has no such
+implicit buffer — a `put`/`create_table` call issued the very next line
+after `cluster.crash(..)` races the recovery at exactly the granularity
+the scenario code controls, and a converted scenario's own single-shot
+`.unwrap_or_else(|e| panic!(..))` call (copied straight from the original
+test, which never needed to retry) is therefore the first thing to
+surface each of three distinct, legitimate transient races: `CreateTable`
+racing `await_table_serveable`'s own bounded wait against a
+just-recovered control plane/reconciler that hasn't settled yet; a plain
+write racing a dual (control+data) fault that genuinely needs more than
+one relay attempt to route around; and a write landing in a tablet's own
+split-cutover-freeze window (ADR 0050's `"; retry"` transient), which this
+fixture can only clear by manually driving `SimCluster::
+drive_inplace_split_cutover` since it spawns no periodic cutover loop.
+
+**The general rule**: when converting a real-socket scenario that chains
+a fault directly into a write/DDL call with no explicit wait between them,
+do not assume the original's own single-shot call proves the converted
+call needs none either — the original's implicit real-time buffer was
+doing real work. Give the post-fault call its own bounded retry (with the
+fixture's fault-clearing side effect, like `drive_inplace_split_cutover`,
+re-run on every attempt where relevant), matching `sim_cluster_auto_
+split.rs`'s own `put_item_retry` precedent, rather than discovering the
+race as a flaky-looking test failure and reaching for a longer timeout.
+
+## A "weakened" sim conversion's own assumption about which mechanism still holds must be run, not inferred from a sibling test's precedent (ADR 0061 rung L, C-12 PR 4c)
+
+`tests/console_endpoint.rs::console_addr_panics_on_control_only_node`
+asserts a `Node`-level fact (`Node::console_addr()` panics, since a
+control-only node never binds the console listener) that has no
+`SimCluster` analog at all — no `Node` struct, no listener binding for any
+role. The natural "weakened conversion" move (this rung's own established
+pattern — keep the *shape* of a real-socket test's invariant even when the
+literal mechanism can't be reproduced) was to prove the underlying reason
+the panic exists: a control-only node structurally has no data role. The
+first draft assumed — by analogy by to this same rung's own PR 4a
+precedent, `mixed_cluster_put_via_control_node_forwards_to_data_node`,
+which proves a **plain-client-protocol** write issued from a control-only
+node's `ClientCtx` forwards cleanly to the data node with no panic
+anywhere — that a **console item write** issued the same way would behave
+identically. It does not: `dynamo::fast_marker_write` (the ADR 0049 fast
+arm the console's own unconditioned `PutItem` route takes) reads
+`ctx.data().request_rates` unconditionally, on the ISSUING node's own
+`ctx`, before any routing/forwarding decision — a real panic, caught
+immediately by the very first `cargo test` run of the scenario (a full
+backtrace through `console.rs` → `dynamo.rs`'s `fast_marker_write` →
+`ClientCtx::data`), not something inspection of the code would have
+obviously predicted from the plain-protocol precedent alone. The two
+paths look interchangeable from the outside (both are "a write, forwarded
+to wherever the tablet actually lives") but differ in exactly the
+dimension that mattered: `cp_kind_write_raw`/`resolve_cp_route` never
+touch `ctx.data()` on the issuing node (only `write_path.rs`'s functions
+do, at the LEADER); the DynamoDB-shaped fast arm does, unconditionally, on
+whichever node's `ClientCtx` originates the call. Once found, the fixed
+scenario asserts the panic directly (`#[should_panic(expected = ..)]`,
+mirroring the real test's own shape) — a *better*, more faithful analog of
+the original invariant than "forwards cleanly" would have been, since it
+is exactly the mechanism `console_addr()`'s own panic keeps structurally
+unreachable in production.
+
+**The general rule**: when a "weakened conversion" leans on a *different*
+test's precedent for "this mechanism behaves safely regardless of role,"
+don't assume the precedent transfers to a superficially similar but
+structurally different code path (a different write primitive, a
+different edge) — run the new scenario and let a real panic/failure
+correct the assumption, the same way this rung's own auto-split/split-
+cluster appendices already document for post-fault timing assumptions. A
+scenario that "should" pass by analogy is not proven until it actually
+runs.
+
+## A rung's own plan is a prediction, not evidence — a close-out must re-grep every named file against the landed PRs before citing the plan's outcome as fact (ADR 0061 rung L, C-12 close-out)
+
+C-12's own opener (PR 1) named `control_membership_admin.rs` as an
+11-of-12 conversion for PR 4a/4b, and every PR-by-PR appendix through PR
+4d repeated that disposition without anyone re-checking it. The rung's
+own close-out (PR 5) found, by running `git show --stat` on every landed
+PR and `grep -c '#\[tokio::test' tests/control_membership_admin.rs`
+against the branch tip, that **no landed PR ever touched the file** — it
+sat at all 12 tests, entirely `ProdEnv`, the whole time. Nothing in any
+PR's own commit message claimed otherwise; the gap existed only in the
+difference between what the plan said would happen across the series and
+what the individual PRs actually did, and closed the rung without
+anyone comparing the two directly until the close-out did.
+
+This is the same failure shape rung K's own close-out found for a
+different kind of claim — a "why this stays `ProdEnv`" reason echoed
+across multiple close-outs without being re-read against the current
+test body (there, the stale "`SimCluster` has no metrics sink" doc
+comment, copied three times; here, reading the same file's 12th test
+overturned its own "permanent `--config` bring-up" label too, since the
+test never parses a `--config FILE` at all). The generalized rule from
+both: **a rung's own PR-by-PR plan, and every inherited reason a residual
+"stays `ProdEnv`," are predictions and citations respectively — neither
+is evidence.** A close-out (or any later rung that inherits a residual
+figure) must independently re-verify, per file: (1) that a PR claiming to
+convert or assess a file actually touched it (`git show --stat`, not the
+commit message's own prose), and (2) that a residual's stated reason
+still describes what the test's own current body actually does and needs
+(read the test, not the label). Both checks are cheap — a `git show
+--stat` and a file read per named item — and this rung is the second
+consecutive one where skipping them would have closed with a materially
+wrong record: one entire file silently mis-declared "converted," and one
+of its own tests mis-declared "permanent" for the wrong reason.
