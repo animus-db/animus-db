@@ -5930,7 +5930,7 @@ scanning every node id — every `drain_gsi` caller's table is created
 through the real wire, which never populates that bookkeeping at all; see
 `docs/engineering-lessons.md`'s matching entry.
 
-**Per-node roles (ADR 0061 rung L, C-12 PR 2).** `SimCluster` has one node
+**Per-node roles (ADR 0061 rung L, C-12 PR 2/3).** `SimCluster` has one node
 shape per index, tracked in a `roles: Vec<NodeRole>` field (`NodeRole` —
 `crates/animusd/src/config.rs`, already production-shipped by ADR 0035, not
 a new fixture-local type). [`SimCluster::new`]/`new_with_segment_janitor_
@@ -5946,30 +5946,103 @@ heartbeat about — mirrors production's own doc for skipping that loop
 verbatim). `backup_janitor_loop`/`segment_janitor_loop`/`index_backfill_
 loop` and the control `RaftNode` itself still run exactly as on a combined
 node, matching production (those three are control-plane-leader-gated, not
-data-role-gated — W-10/ADR 0043 §A9). Every node in `roles` must run the
-control plane today (`Control`/`Both`) — a `NodeRole::Data` node present
-from construction is C-12 PR 3's own scope, not yet implemented;
-`SimCluster::grow("data")` remains the only way to add a data-only node.
-**`SimCluster::restart` is role-aware**: it looks up `self.roles[node]` and
-respawns only the loops that role owns (skipping the reconciler/
-`ttl_reaper_loop` for a `Control` node exactly as construction does),
-rather than unconditionally rebuilding every restarted node combined the
-way it did before this rung. Restarting a **grown** (data-only, via `grow`)
-node stays out of scope (C-12 PR 3) — `restart` now asserts this
-explicitly, naming that PR, instead of relying on an out-of-bounds `Vec`
-index to fail for the right reason by accident. **Routing needed no new
-code**: `ClientCtx::resolve_cp_route` (`forwarding.rs`) already treats
-`self.data == None` as the limit case of "hosts no local replica" — a
-`SimCluster` op issued from a control-only node's index just forwards over
-the real `SimRelayClient` wire, the identical path any other
-non-replica-hosting node's op already takes. `crates/animusd/src/
-sim_cluster_control_only.rs` is this rung's own test module (5 scenarios,
-pinned-seed + `_over_seeds`) — see its module doc for the full account,
-including the deterministic "force a control-only node into the
-control-leader seat" trick scenario (c) needs (a bounded crash/heal loop,
-since which node the control group happens to elect first is seed-
-dependent). `SimCluster::role_of(node)` is the new test-reachable
-accessor.
+data-role-gated — W-10/ADR 0043 §A9).
+
+**`NodeRole::Data` is first-class at construction since C-12 PR 3** —
+`new_with_roles`'s own blanket "every node must run the control plane"
+assert is gone, replaced by two narrower ones: at least one node must be
+control-bearing (`Control`/`Both`), and `roles` must be **control-prefixed**
+— every `Control`/`Both` entry before every `Data` one, so the control
+voter set is always node ids `0..control_count` and `self.controls` (one
+local `RaftNode<SimEnv>` per control-bearing node) stays a contiguous
+prefix. A `NodeRole::Data` node is built exactly like [`SimCluster::grow`]
+already builds its own grown one — the two constructors share the same
+per-node loop set, factored so grow's own janitor gating stays correct
+without duplicating it: `ControlHandle::Remote(RemoteControlClient::new(
+control_seeds, ..))` dialing the cluster's own control-bearing node ids, a
+real `host::Reconciler`, a `heartbeat_loop` targeting the control-bearing
+prefix (never the whole node set — see the `all_ids`→`control_ids` fix
+below), a `ttl_reaper_loop`, and `spawn_remote_mirror_sync_loop` (`SimCluster
+::grow`'s own `SimEnv`-native long-poll mirror, unchanged). **Deliberately
+never spawned on a `NodeRole::Data` node**: `backup_janitor_loop`/
+`segment_janitor_loop`/`index_backfill_loop` — control-plane-leader-only,
+and a `Remote` control handle can structurally never become control-plane
+leader; verified directly against `BoundDataNode::start_data_with_growth`
+(`lib.rs`), which spawns none of the three either. **This also fixed two
+real, previously-latent gaps in `SimCluster::grow` itself**, found and
+closed while factoring the shared construction path: `grow` used to spawn
+`backup_janitor_loop` unconditionally on its own grown node (a harmless but
+production-inaccurate permanent no-op) and never spawned `ttl_reaper_loop`
+at all (production does, on every data-only node) — both fixed to match
+`new_with_roles`'s own `NodeRole::Data` construction exactly; `grow`'s own
+`segment_store` also switched from an inert per-node `Fs` placeholder to
+the same shared `SimSegmentStore` every other node's `ClientCtx::
+segment_store` already wraps.
+
+**`SimCluster::restart` now dispatches purely on `node < self.controls.
+len()`** (the control-bearing prefix's own length) instead of panicking
+above that boundary: a node below it restarts control-bearing (`Local`
+handle, unchanged from PR 2 apart from one fix below); a node at or above
+it restarts data-only — whether it was minted `NodeRole::Data` at
+construction or added later via `SimCluster::grow`, the two are
+indistinguishable to this method, and both get a fresh `ControlHandle::
+Remote`, a fresh mirror-sync loop, and every data-role loop it actually
+owns (reconciler, `heartbeat_loop`, `ttl_reaper_loop` — never the three
+control-plane-leader-only janitors, for the identical reason construction
+skips them). **A real, previously-latent bug found and fixed along the
+way**: a restarted control-bearing node's fresh `RaftNode` now takes
+`control_ids` (the real control voter set) as its own membership, not
+`0..self.nodes` — the old `all_ids` binding was harmless only as long as
+every node ran the control plane, which stopped being guaranteed the
+instant any `NodeRole::Data` node exists (at construction, since PR 3, or
+via a pre-existing `grow` call); never previously exercised (no
+`sim_cluster_growth.rs` scenario ever combined `grow` with a `restart` of
+an original node). `SimCluster::crash` needed **no** change at all — it was
+already fully role-agnostic (`self.sim.crash(nid(node))` mutes by node id,
+independent of `self.controls`' own bounds or what tasks that id runs), and
+`Drop for SimCluster`/`Simulator::shutdown` already tear down every node's
+tasks — mirror-sync loop included — uniformly regardless of role; no new
+`Weak`-handle/Drop-coverage extension was needed.
+
+**Routing and DDL at a data-only node both needed no new code — verified by
+tracing, not merely asserted.** `ClientCtx::resolve_cp_route`
+(`forwarding.rs:162`) reads only `self.edge` and, on its fallback path,
+`Metadata` — neither depends on `self.control` being `Local` or `Remote` —
+so a `SimCluster` op issued from a data-only node's index forwards over the
+real `SimRelayClient` wire exactly like any other non-replica-hosting
+node's op already does, the identical "zero new rejection code" degrade
+control-only nodes already established. `ClientCtx::propose_schema`
+(`schema.rs:133`) is already fully `<E: Env, R: RelayClient>`-generic, and
+its `Remote`-handle fallback tiers (an intra leader-address hint, then a
+bounded broadcast over every known intra address) reach a control-bearing
+node's own relay server the same way a genuine data-only deployment's join
+dance would; `dynamo::create_table` (`dynamo.rs:4099`) never calls
+`ctx.data()` at all, so DDL issued at a data-only node's own index commits
+through its `Remote` handle with no widening needed either.
+
+**`crates/animusd/src/sim_cluster_data_only.rs` is this PR's own test
+module** (5 scenarios, pinned-seed + `_over_seeds`) — see its module doc
+for the full account, including the two production ground-truth
+corrections its own doc records against this rung's original plan
+(`backup_janitor_loop`/`segment_janitor_loop`/`index_backfill_loop` do
+**not** respawn on a data-only node's restart — verified against
+`BoundDataNode::start_data_with_growth`, which spawns none of the three
+either). **Still deferred, deliberately, by this PR**: the real ADR 0030/
+0032 join dance — every data-only node here, constructed or grown, still
+self-registers via the same direct control-plane-Raft-bypass propose
+`SimCluster::seed_members`/`SimCluster::grow` already use, never
+`ClientCtx::admin_add_member`'s real relay + failure-detector-promotion
+dance; and a `"combined"` (new control-plane voter) growth shape, which
+would need `self.controls` itself to grow — `SimCluster::grow` still
+supports `role = "data"` only.
+
+`crates/animusd/src/sim_cluster_control_only.rs` is C-12 PR 2's own test
+module (5 scenarios, pinned-seed + `_over_seeds`) — see its module doc for
+the full account, including the deterministic "force a control-only node
+into the control-leader seat" trick scenario (c) needs (a bounded
+crash/heal loop, since which node the control group happens to elect first
+is seed-dependent). `SimCluster::role_of(node)` is the test-reachable
+accessor both PRs' scenarios use.
 
 ### `sim_cluster_corpus`: the SimCluster cycles/durability corpus (ADR 0061 rung D1 step 3)
 

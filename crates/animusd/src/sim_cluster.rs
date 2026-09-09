@@ -1324,16 +1324,29 @@ impl SimCluster {
         )
     }
 
-    /// **ADR 0061 rung L, C-12 PR 2**: [`SimCluster::new`]'s role-aware
+    /// **ADR 0061 rung L, C-12 PR 2/3**: [`SimCluster::new`]'s role-aware
     /// sibling — `roles[i]` is node `i`'s own [`NodeRole`], so a caller can
-    /// build a mix of control-only (`NodeRole::Control`) and combined
-    /// (`NodeRole::Both`) nodes from construction, rather than only ever
-    /// getting an all-`Both` cluster the way [`SimCluster::new`] does. Every
-    /// node in `roles` must run the control plane today
-    /// (`NodeRole::Control`/`NodeRole::Both`) — a `NodeRole::Data` node
-    /// present from construction is C-12 PR 3's own scope (ADR 0061 rung L),
-    /// not yet implemented here; [`SimCluster::grow`]`("data")` remains the
-    /// only way to add a data-only node to this fixture. Uses
+    /// build a mix of control-only (`NodeRole::Control`), combined
+    /// (`NodeRole::Both`), and — since C-12 PR 3 — data-only
+    /// (`NodeRole::Data`) nodes from construction, rather than only ever
+    /// getting an all-`Both` cluster the way [`SimCluster::new`] does.
+    /// **`roles` must be control-prefixed**: every `Control`/`Both` entry
+    /// must sort before every `Data` entry (control-bearing node ids are
+    /// always `0..control_count`, `Data` node ids always
+    /// `control_count..nodes`) — the same append-only shape
+    /// [`SimCluster::grow`] already established for a *post*-construction
+    /// data-only node, generalized to construction time. At least one node
+    /// must run the control plane (`Control`/`Both`) — a cluster with no
+    /// control-bearing node cannot function at all. A `NodeRole::Data`
+    /// node built here is constructed via the identical `ControlHandle::
+    /// Remote`/reconciler/mirror-sync-loop shape [`SimCluster::grow`]
+    /// itself uses (factored into this method's own tail, alongside
+    /// `grow`'s), dialing the cluster's own control-bearing node ids as its
+    /// `WatchMetadata` seeds — see this file's own "Per-node roles" module
+    /// doc entry for the full account, including what stays deferred (the
+    /// real ADR 0030/0032 join dance — every node here still self-registers
+    /// via a direct control-plane-Raft-bypass propose, exactly like
+    /// [`SimCluster::grow`]/[`SimCluster::seed_members`] already do). Uses
     /// [`DEFAULT_SIM_SEGMENT_JANITOR_RETENTION`], mirroring [`SimCluster::
     /// new`]'s own default.
     pub(crate) fn new_with_roles(seed: u64, roles: &[NodeRole], replication: usize) -> Self {
@@ -1367,14 +1380,52 @@ impl SimCluster {
             "replication must be between 1 and the node count"
         );
         assert!(
-            roles.iter().all(|r| r.has_control()),
-            "SimCluster::new_with_roles: every node must run the control plane today \
-             (NodeRole::Control or NodeRole::Both) — a NodeRole::Data node present from \
-             construction is C-12 PR 3's own scope (ADR 0061 rung L), not yet implemented; \
-             SimCluster::grow(\"data\") remains the only way to add a data-only node"
+            roles.iter().any(|r| r.has_control()),
+            "SimCluster::new_with_roles: at least one node must run the control plane \
+             (NodeRole::Control or NodeRole::Both) — a cluster with no control-bearing node \
+             cannot function"
         );
+        // ADR 0061 rung L, C-12 PR 3: `roles` must be control-prefixed — every
+        // control-bearing (`Control`/`Both`) entry before every `NodeRole::Data`
+        // one — so that `self.controls` (built below, one `RaftNode<SimEnv>` per
+        // control-bearing node) stays index-aligned with node ids `0..
+        // control_count` for the whole lifetime of this cluster, the same
+        // invariant `SimCluster::grow` already relies on (a grown data-only
+        // node is always appended past every existing id, never spliced in).
+        // `SimCluster::restart` depends on this too — it dispatches purely on
+        // `node < self.controls.len()`.
+        assert!(
+            {
+                let mut seen_data = false;
+                roles.iter().all(|r| {
+                    if matches!(r, NodeRole::Data) {
+                        seen_data = true;
+                        true
+                    } else {
+                        !seen_data
+                    }
+                })
+            },
+            "SimCluster::new_with_roles: `roles` must be control-prefixed — every \
+             NodeRole::Control/NodeRole::Both entry must come before every NodeRole::Data \
+             entry, so control-bearing node ids stay a contiguous 0..control_count prefix \
+             (the same shape SimCluster::grow's own append-only NodeRole::Data node already \
+             establishes)"
+        );
+        // The control-bearing prefix's own length — every node id in
+        // `0..control_count` runs a real local `RaftNode<SimEnv>`
+        // (`self.controls[i]`); every id in `control_count..nodes` is a
+        // `NodeRole::Data` node reaching the control plane only through a
+        // `ControlHandle::Remote` mirror (ADR 0061 rung L, C-12 PR 3).
+        let control_count = roles.iter().filter(|r| r.has_control()).count();
         let sim = Simulator::new(seed);
         let ids: Vec<NodeId> = (0..nodes as u64).map(nid).collect();
+        // The control-bearing node ids, by construction always `ids[..
+        // control_count]` — this is both the real control `RaftNode` quorum's
+        // own membership list and every `NodeRole::Data` node's `WatchMetadata`
+        // seed list (`ControlHandle::Remote`'s own `seeds`).
+        let control_ids: Vec<NodeId> = ids[..control_count].to_vec();
+        let control_seeds: Vec<String> = control_ids.iter().map(NodeId::to_string).collect();
 
         // ADR 0061 rung C3d's own convention: a `SimRelayClient` address
         // IS `NodeId::to_string()`. Every node's whole address book is
@@ -1414,13 +1465,20 @@ impl SimCluster {
         // fixed here, out of this rung's own scope.)
         let node_metrics: Vec<MetricsHandle> =
             ids.iter().map(|_| MetricsHandle::recording()).collect();
-        let controls: Vec<RaftNode<SimEnv>> = ids
+        // ADR 0061 rung L, C-12 PR 3: only the control-bearing prefix
+        // (`ids[..control_count]`) gets a local `RaftNode<SimEnv>` at all — a
+        // `NodeRole::Data` node has no local control Raft (`ControlHandle::
+        // Remote` instead, built in this function's own tail below) — and
+        // that `RaftNode`'s own membership is `control_ids`, never the whole
+        // node set: a `NodeRole::Data` id is not, and never becomes, a
+        // control-plane Raft voter.
+        let controls: Vec<RaftNode<SimEnv>> = ids[..control_count]
             .iter()
-            .zip(node_metrics.iter())
+            .zip(node_metrics[..control_count].iter())
             .map(|(id, metrics)| {
                 RaftNode::start_with_metrics(
                     sim.env(id.clone()),
-                    ids.clone(),
+                    control_ids.clone(),
                     metrics.clone(),
                     MemoryEngine::new(),
                 )
@@ -1461,16 +1519,20 @@ impl SimCluster {
         // (`seed_members`'s own doc, below); a control-only node is never
         // registered into `members` at all (`seed_members` only proposes
         // `UpsertMember` for a `has_data()` node), so it has nothing here
-        // to heartbeat about.
+        // to heartbeat about. Applies to every `has_data()` node uniformly
+        // — `NodeRole::Both` **and**, since C-12 PR 3, `NodeRole::Data` —
+        // heartbeating the real control-bearing prefix (`control_ids`),
+        // never the whole node set (a `NodeRole::Data` id is not a control
+        // voter to heartbeat *at*, only a heartbeater keeping its own row
+        // alive).
         for (i, id) in ids.iter().enumerate() {
             if !roles[i].has_data() {
                 continue;
             }
             let env = sim.env(id.clone());
-            let control_ids = ids.clone();
             env.spawn_task(animus_control::node::heartbeat_loop(
                 env.clone(),
-                control_ids,
+                control_ids.clone(),
             ));
         }
 
@@ -1500,14 +1562,20 @@ impl SimCluster {
         let segment_store = SimSegmentStore::new(sim.env(ids[0].clone()));
 
         let mut ctxs: Vec<SimNodeCtx> = Vec::with_capacity(nodes);
+        // ADR 0061 rung L, C-12 PR 3: `(node index, its own GenericRemoteControlClient)`
+        // for every `NodeRole::Data` node, collected while building `ctxs`
+        // below and drained by this function's own tail to spawn each one's
+        // mirror-sync loop (`spawn_remote_mirror_sync_loop`) once every
+        // `ClientCtx` in `ctxs` exists.
+        let mut data_remotes: Vec<(usize, GenericRemoteControlClient<SimRelayClient<SimEnv>>)> =
+            Vec::new();
         for (i, id) in ids.iter().enumerate() {
-            // ADR 0061 rung L, C-12 PR 2: `AdminInfo::role` mirrors
+            // ADR 0061 rung L, C-12 PR 2/3: `AdminInfo::role` mirrors
             // production's own per-shape string (`BoundNode::start_with`'s
             // `"combined"`, `BoundControlNode::start_control_with`'s
-            // `"control"`) — a `NodeRole::Data` node from construction is
-            // out of this rung's own scope (the assert above already
-            // rejects it), so the only two shapes reachable here are
-            // `Both`/`Control`.
+            // `"control"`, `BoundDataNode::start_data_with_growth`'s
+            // `"data"` — since C-12 PR 3 all three shapes are reachable
+            // here).
             let role_str = match roles[i] {
                 NodeRole::Both => "combined",
                 NodeRole::Control => "control",
@@ -1523,7 +1591,10 @@ impl SimCluster {
                 dynamo_addr: None,
                 admin_addr: placeholder_addr(),
                 role: role_str,
-                control_ids: ids.clone(),
+                // The real control-bearing voter set, never the whole node
+                // set (ADR 0061 rung L, C-12 PR 3) — matches
+                // `SimCluster::grow`'s own `AdminInfo::control_ids` choice.
+                control_ids: control_ids.clone(),
                 peers: BTreeMap::new(),
                 admin_addrs: vec![placeholder_addr()],
                 auto_split_bytes_threshold: None,
@@ -1540,8 +1611,28 @@ impl SimCluster {
                 auth_access_key_ids: None,
                 otlp_endpoint: None,
             });
+            // ADR 0061 rung L, C-12 PR 3: `Local` for a control-bearing node
+            // (`i < control_count`, so `controls[i]` is a valid index — the
+            // control-prefix assert above is what makes this safe); `Remote`
+            // for a `NodeRole::Data` node, dialing the control-bearing prefix
+            // (`control_seeds`) — the identical `ControlHandle::Remote`
+            // construction `SimCluster::grow` already uses for a
+            // post-construction data-only node. Recorded into `data_remotes`
+            // so this function's own tail can spawn each `NodeRole::Data`
+            // node's mirror-sync loop once every `ClientCtx` exists.
+            let control = if roles[i].has_control() {
+                GenericControlHandle::Local(controls[i].clone())
+            } else {
+                let remote = GenericRemoteControlClient::new(
+                    control_seeds.clone(),
+                    relays[i].clone(),
+                    CLIENT_TIMEOUT,
+                );
+                data_remotes.push((i, remote.clone()));
+                GenericControlHandle::Remote(remote)
+            };
             let ctx: SimNodeCtx = ClientCtx {
-                control: GenericControlHandle::Local(controls[i].clone()),
+                control,
                 edge: ClusterEdgeState::<SimEnv>::new(),
                 env: sim.env(id.clone()),
                 // ADR 0061 rung D2 PR 1: a real `DataRole`, not `None` — the
@@ -1694,25 +1785,43 @@ impl SimCluster {
         }
 
         // ADR 0061 rung D4 PR 5: one `animus_node::backup_janitor::
-        // backup_janitor_loop` per node, unconditionally — mirrors
+        // backup_janitor_loop` per **control-bearing** node — mirrors
         // `heartbeat_loop`'s own always-on spawn above (D4 PR 1), not
         // `auto_split_loop`'s own opt-in shape (D4 PR 2): this loop's own
         // leader gate (`ControlLeaderHost::control_leader`) already makes
         // it a cheap no-op idle sleep on every non-leader node, so there is
-        // no reason to gate spawning it at all.
-        for ctx in &ctxs {
+        // no reason to gate spawning it behind an opt-in — but it IS gated
+        // on `has_control()` (ADR 0061 rung L, C-12 PR 3): a `NodeRole::
+        // Data` node's control handle is `ControlHandle::Remote`, which
+        // structurally can never become control-plane leader (`is_leader()`
+        // is an inert `false`), so spawning this control-plane-leader-only
+        // loop there would be permanent dead weight — production's
+        // `BoundDataNode::start_data_with_growth` never spawns it either
+        // (verified: `crates/animusd/src/lib.rs`'s data-only bring-up has
+        // no `backup_janitor_loop`/`segment_janitor_loop`/`index_backfill_
+        // loop` call at all, only `backup_capture`/`backup_restore`/
+        // `change_consumer_loop`/`ttl_reaper_loop`/`auto_split_loop`, all
+        // data-role- not control-plane-leader-gated).
+        for (i, ctx) in ctxs.iter().enumerate() {
+            if !roles[i].has_control() {
+                continue;
+            }
             let env = ctx.env.clone();
             env.spawn_task(backup_janitor::backup_janitor_loop(ctx.clone()));
         }
 
         // ADR 0061 rung G (C-07 PR 5): one `segment_janitor::
-        // segment_janitor_loop` per node, unconditionally — mirrors the
+        // segment_janitor_loop` per **control-bearing** node — mirrors the
         // backup janitor's own always-on spawn immediately above exactly:
         // this loop's own leader gate (`ctx.edge.leader_handle()` answering
         // `None`) already makes a non-leader's own tick a cheap idle sleep,
-        // so there is no reason to gate spawning it behind an opt-in the
-        // way `auto_split_loop` is.
-        for ctx in &ctxs {
+        // so there is no reason to gate spawning it behind an opt-in — but
+        // it IS gated on `has_control()` (ADR 0061 rung L, C-12 PR 3), the
+        // identical reasoning the backup janitor's own gate above states.
+        for (i, ctx) in ctxs.iter().enumerate() {
+            if !roles[i].has_control() {
+                continue;
+            }
             let env = ctx.env.clone();
             env.spawn_task(segment_janitor::segment_janitor_loop(
                 ctx.clone(),
@@ -1744,20 +1853,40 @@ impl SimCluster {
         }
 
         // ADR 0061 rung J (C-10 PR 2): one `index_backfill::
-        // index_backfill_loop` per node, unconditionally — mirrors the
-        // backup/segment/TTL janitors' own always-on spawns immediately
-        // above exactly: this loop's own leader gate
-        // (`ControlLeaderHost::control_leader`, the identical gate the
-        // backup janitor uses) already makes a non-leader's own tick a
-        // cheap idle sleep, so there is no reason to gate spawning it
-        // behind an opt-in the way `auto_split_loop` is. Needs no new
-        // `Drop`/`restart` handling beyond what every other always-on loop
-        // here already gets (issue #753's own discipline) — it captures a
-        // plain `ClientCtx` clone, the identical shape every janitor above
+        // index_backfill_loop` per **control-bearing** node — mirrors the
+        // backup/segment janitors' own always-on spawns immediately above
+        // exactly: this loop's own leader gate (`ControlLeaderHost::
+        // control_leader`, the identical gate the backup janitor uses)
+        // already makes a non-leader's own tick a cheap idle sleep, so
+        // there is no reason to gate spawning it behind an opt-in — but it
+        // IS gated on `has_control()` (ADR 0061 rung L, C-12 PR 3), the
+        // identical reasoning the backup/segment janitors' own gates above
+        // state (production's `start_data_with_growth` never spawns this
+        // loop on a data-only node either). Needs no new `Drop`/`restart`
+        // handling beyond what every other always-on loop here already
+        // gets (issue #753's own discipline) — it captures a plain
+        // `ClientCtx` clone, the identical shape every janitor above
         // already captures.
-        for ctx in &ctxs {
+        for (i, ctx) in ctxs.iter().enumerate() {
+            if !roles[i].has_control() {
+                continue;
+            }
             let env = ctx.env.clone();
             env.spawn_task(index_backfill::index_backfill_loop(ctx.clone()));
+        }
+
+        // ADR 0061 rung L, C-12 PR 3: one `SimEnv`-native mirror-sync loop
+        // per `NodeRole::Data` node (`spawn_remote_mirror_sync_loop`,
+        // `SimCluster::grow`'s own new mechanism, ADR 0061 rung D4 PR 4 —
+        // see that function's own doc for why this can't just call
+        // `animusd`'s own `remote_metadata_sync_loop`) — every `NodeRole::
+        // Data` node's *only* way to see `Metadata` at all, exactly like a
+        // real data-only node's own `ControlHandle::Remote` mirror. Drains
+        // `data_remotes` (populated while building `ctxs` above, one entry
+        // per `NodeRole::Data` node) now that every `ClientCtx` in `ctxs`
+        // exists.
+        for (i, remote) in data_remotes {
+            spawn_remote_mirror_sync_loop(ctxs[i].clone(), remote, control_seeds.clone());
         }
 
         let mut cluster = SimCluster {
@@ -1841,13 +1970,29 @@ impl SimCluster {
         for n in 0..self.nodes as u64 {
             let id = nid(n);
             let addr = id.to_string();
-            let has_data = self.roles[n as usize].has_data();
+            let role = self.roles[n as usize];
+            let has_data = role.has_data();
+            // ADR 0061 rung L, C-12 PR 3: the same 3-way role string
+            // `SimCluster::new_with_roles_and_segment_janitor_retention`'s
+            // own per-node `role_str` uses (`"combined"`/`"control"`/
+            // `"data"`) — previously a 2-way `has_data`-derived choice
+            // (`"combined"`/`"control"`) that predates `NodeRole::Data`
+            // ever reaching this method; `claims_membership`
+            // (`animus_control::meta`) only ever special-cases the literal
+            // `"control"`, so this was functionally harmless for `Both` vs.
+            // `Control`, but would have mislabeled a `NodeRole::Data`
+            // node's own `Metadata::node_addrs` row as `"combined"`.
+            let role_str = match role {
+                NodeRole::Both => "combined",
+                NodeRole::Control => "control",
+                NodeRole::Data => "data",
+            };
             let addrs = NodeAddrs {
                 internal: addr.clone(),
                 client: addr.clone(),
                 intra: addr.clone(),
                 admin: addr,
-                role: if has_data { "combined" } else { "control" }.to_owned(),
+                role: role_str.to_owned(),
             };
             assert!(
                 matches!(
@@ -1886,10 +2031,11 @@ impl SimCluster {
         self.nodes
     }
 
-    /// ADR 0061 rung L, C-12 PR 2: `node`'s own [`NodeRole`], as recorded at
-    /// construction ([`SimCluster::new`]/[`SimCluster::new_with_roles`]) or
-    /// growth ([`SimCluster::grow`]) — the test-reachable observable behind
-    /// "this node runs no data plane at all."
+    /// ADR 0061 rung L, C-12 PR 2/3: `node`'s own [`NodeRole`], as recorded
+    /// at construction ([`SimCluster::new`]/[`SimCluster::new_with_roles`],
+    /// which since PR 3 can mint a `NodeRole::Data` node directly) or growth
+    /// ([`SimCluster::grow`]) — the test-reachable observable behind "this
+    /// node runs no control/data plane at all."
     pub(crate) fn role_of(&self, node: u64) -> NodeRole {
         self.roles[node as usize]
     }
@@ -3395,42 +3541,51 @@ impl SimCluster {
     }
 
     /// A true process restart of `node`: every task it owns is dropped
-    /// (`Simulator::stop` — its control `RaftNode` driver, every hosted
-    /// `RaftKvNode` driver, its reconciler-loop task, its relay receive
-    /// loop), then a fresh control `RaftNode` and a fresh `Reconciler` are
-    /// built on the same id. If `node` was `crash`ed (not merely alive),
-    /// it is first un-muted (`Simulator::restart`, animus-sim's own
-    /// required un-crash-before-stop sequencing — see that method's
-    /// crate's own `CLAUDE.md` gotcha) so the following `stop` actually
-    /// removes live tasks rather than muted ones.
+    /// (`Simulator::stop` — its control `RaftNode` driver (a control-bearing
+    /// node) or its `ControlHandle::Remote` mirror-sync loop (a `NodeRole::
+    /// Data` node), every hosted `RaftKvNode` driver, its reconciler-loop
+    /// task, its relay receive loop), then rebuilt fresh on the same id. If
+    /// `node` was `crash`ed (not merely alive), it is first un-muted
+    /// (`Simulator::restart`, animus-sim's own required un-crash-before-stop
+    /// sequencing — see that method's crate's own `CLAUDE.md` gotcha) so the
+    /// following `stop` actually removes live tasks rather than muted ones.
     ///
-    /// **Since ADR 0061 rung D4 PR 1, the fresh `Reconciler` reuses the
-    /// SAME `MemoryTabletEngines` handle this node was built with**
-    /// (`self.engines[node]`) — see the module doc's own restart bullet
-    /// for why this node's tablet data is no longer wiped by a restart.
-    /// **ADR 0061 rung L, C-12 PR 2**: this node's own [`NodeRole`]
-    /// (`self.roles[node]`) is consulted throughout, so a `NodeRole::
-    /// Control` node comes back control-only (no reconciler, no
-    /// `ttl_reaper_loop`, no self-heartbeat — mirroring [`SimCluster::
-    /// new_with_roles`]'s own construction exactly) rather than
-    /// unconditionally forcing every restarted node combined.
+    /// **Since ADR 0061 rung D4 PR 1, a data-capable node's fresh
+    /// `Reconciler` reuses the SAME `MemoryTabletEngines` handle this node
+    /// was built with** (`self.engines[node]`) — see the module doc's own
+    /// restart bullet for why this node's tablet data is no longer wiped by
+    /// a restart. **ADR 0061 rung L, C-12 PR 2/3**: this node's own
+    /// [`NodeRole`] (`self.roles[node]`) is consulted throughout, so a
+    /// `NodeRole::Control` node comes back control-only (no reconciler, no
+    /// `ttl_reaper_loop`, no self-heartbeat) and — since PR 3 — a
+    /// `NodeRole::Data` node comes back data-only (`ControlHandle::Remote`,
+    /// its own mirror-sync loop, no local control `RaftNode`, no
+    /// control-plane-leader-only janitor), rather than unconditionally
+    /// forcing every restarted node combined.
     ///
-    /// **`node` must be one of the original `0..nodes` control-voter ids
-    /// this cluster was constructed with (ADR 0061 rung D4 PR 4)** — this
-    /// method indexes `self.controls[node]`, a control-voter-only `Vec`
-    /// that a [`SimCluster::grow`]n data-only node was never pushed onto
-    /// (it has no local control `RaftNode` at all — see that method's own
-    /// doc). **Restarting a grown node remains out of scope in this rung
-    /// too (C-12 PR 3, ADR 0061 rung L)** — the guard below now panics with
-    /// an explicit message naming that, rather than relying on an
-    /// out-of-bounds `Vec` index to fail for the right reason by accident.
+    /// **Dispatches purely on `node < self.controls.len()`**: `self.controls`
+    /// is exactly the control-bearing prefix ([`SimCluster::new_with_roles`]'s
+    /// own control-prefix invariant — a `NodeRole::Data` node id is always
+    /// `self.controls.len()..self.nodes`, whether minted directly at
+    /// construction or appended later via [`SimCluster::grow`]). A node
+    /// below that boundary is restarted control-bearing (`Local` handle,
+    /// indexing `self.controls[node]`); a node at or above it is restarted
+    /// data-only (`Remote` handle, dialing `self.controls`'s own ids as its
+    /// `WatchMetadata` seeds — the identical shape [`SimCluster::grow`]
+    /// already establishes for a post-construction data-only node).
+    ///
+    /// **A real, latent bug this rung found and fixed**: a restarted
+    /// control-bearing node's fresh `RaftNode` now takes `control_ids`
+    /// (only the real control voters) as its own membership, not
+    /// `0..self.nodes` — the pre-PR-3 `all_ids` binding, harmless only as
+    /// long as every node ran the control plane. The instant any
+    /// `NodeRole::Data` node exists (at construction, since this PR, or via
+    /// a pre-existing [`SimCluster::grow`] call), `self.nodes` no longer
+    /// equals the control voter count, so `all_ids` would have silently
+    /// listed a non-voter as a Raft member on every restart of an original
+    /// node — never previously exercised (no `sim_cluster_growth.rs`
+    /// scenario ever combined `grow` with a `restart` of an original node).
     pub(crate) fn restart(&mut self, node: u64) {
-        assert!(
-            (node as usize) < self.controls.len(),
-            "SimCluster::restart(node={node}): restarting a grown (data-only) node is \
-             deferred to C-12 PR 3 (ADR 0061 rung L) — only original 0..nodes control-voter \
-             ids can be restarted today"
-        );
         let role = self.roles[node as usize];
         let id = nid(node);
         if self.crashed.remove(&node) {
@@ -3438,110 +3593,219 @@ impl SimCluster {
         }
         self.sim.stop(id.clone());
 
-        let all_ids: Vec<NodeId> = (0..self.nodes as u64).map(nid).collect();
-        let fresh_control: RaftNode<SimEnv> = RaftNode::start(
-            self.sim.env(id.clone()),
-            all_ids.clone(),
-            MemoryEngine::new(),
-        );
-        let fresh_relay: SimRelayClient<SimEnv> = SimRelayClient::new(self.sim.env(id.clone()));
+        // ADR 0061 rung L, C-12 PR 3: the real control-bearing voter set —
+        // always `0..self.controls.len()` (`SimCluster::new_with_roles`'s
+        // own control-prefix invariant) — never `0..self.nodes`, which the
+        // instant this cluster carries any `NodeRole::Data` node no longer
+        // names only real control voters (see this method's own doc).
+        let control_ids: Vec<NodeId> = (0..self.controls.len() as u64).map(nid).collect();
 
-        // A restarted node's own `Simulator::stop` dropped its previous
-        // `heartbeat_loop` task along with everything else it owned — see
-        // `SimCluster::new`'s own comment on why this is load-bearing, not
-        // optional. ADR 0061 rung L, C-12 PR 2: skipped for a `NodeRole::
-        // Control` node, mirroring `new_with_roles`'s own construction (see
-        // that method's identical gate for why).
-        if role.has_data() {
-            let heartbeat_env = self.sim.env(id.clone());
-            heartbeat_env.spawn_task(animus_control::node::heartbeat_loop(
-                heartbeat_env.clone(),
-                all_ids,
-            ));
-        }
+        if (node as usize) < self.controls.len() {
+            // ---- control-bearing node (NodeRole::Both / NodeRole::Control) ----
+            let fresh_control: RaftNode<SimEnv> = RaftNode::start(
+                self.sim.env(id.clone()),
+                control_ids.clone(),
+                MemoryEngine::new(),
+            );
+            let fresh_relay: SimRelayClient<SimEnv> = SimRelayClient::new(self.sim.env(id.clone()));
 
-        let mut ctx = self.shared.ctx(node);
-        // Break the OLD relay's own installed-handler self-cycle (see
-        // `SimRelayClient::shutdown`'s own doc for the mechanism) before
-        // superseding it below — the closure `SimCluster::new`/a prior
-        // `restart` installed on it captured a clone of the ClientCtx this
-        // node had *then*, which itself held a clone of this same relay,
-        // so nothing outside an explicit clear ever frees that generation:
-        // `ctx.relay = fresh_relay.clone()` only drops this ONE reference
-        // to it (the field on the ctx local to this call), never the
-        // closure's own captured one sitting inside the relay's own
-        // handler slot. Without this, every restart in a scenario leaks
-        // one more whole node-generation's worth of state (edge/backup/
-        // segment handles, the control handle at that point, …) — found
-        // investigating the animusd `sim_cluster_*` tier's per-test RSS
-        // growth persisting after `Simulator::shutdown` alone (that fix
-        // breaks the *separate* Simulator-task-queue cycle a perpetual
-        // background loop forms, not this one) — see `docs/engineering-
-        // lessons.md`'s matching entry.
-        ctx.relay.shutdown();
-        ctx.control = GenericControlHandle::Local(fresh_control.clone());
-        ctx.relay = fresh_relay.clone();
+            // A restarted node's own `Simulator::stop` dropped its previous
+            // `heartbeat_loop` task along with everything else it owned —
+            // see `SimCluster::new`'s own comment on why this is
+            // load-bearing, not optional. ADR 0061 rung L, C-12 PR 2:
+            // skipped for a `NodeRole::Control` node, mirroring
+            // `new_with_roles`'s own construction (see that method's
+            // identical gate for why).
+            if role.has_data() {
+                let heartbeat_env = self.sim.env(id.clone());
+                heartbeat_env.spawn_task(animus_control::node::heartbeat_loop(
+                    heartbeat_env.clone(),
+                    control_ids.clone(),
+                ));
+            }
 
-        // C-06 PR 4 (2026-09-08, issue found investigating
-        // `dynamowire_stop_restart`): `SimCluster::new` registers every
-        // node's own control handle onto `ClusterEdgeState::control` via
-        // `edge.register_control(control.clone())` (see this file's own
-        // module-doc pointer above), because `ClientCtx::propose_schema`'s
-        // LOCAL-propose fast path reads `ctx.edge`'s registry, not
-        // `ctx.control` — the two are different fields with different
-        // lifecycles (`animus-node/CLAUDE.md`'s `ControlHandle` entry).
-        // This `restart` rebuilds `ctx.control` above but, before this fix,
-        // never told the edge about the fresh handle at all — so a
-        // restarted node's `ClusterEdgeState::control` entry kept pointing
-        // at the OLD, `Simulator::stop`ped (dead) `RaftNode` forever after.
-        // Reads still worked (they go through `ctx.control` directly), but
-        // any NEW schema proposal issued through this node's own fast path
-        // (e.g. `ensure_txn_idempotency_table`'s `CreateTableSchema`, which
-        // `TransactWriteItems`'s `ClientRequestToken` bootstrap needs) spun
-        // until `SCHEMA_COMMIT_TIMEOUT`, even with a real, reachable,
-        // healthy leader elsewhere — reproduced deterministically via
-        // `dynamowire_stop_restart_s02` (an ordinary, non-transactional
-        // `CreateTable` from the restarted node reproduced the identical
-        // failure, proving this was general control-plane-restart
-        // infrastructure, not anything transact-specific).
-        //
-        // **`register_control` itself is the wrong call here — it only
-        // APPENDS** (its own doc: "called once per node," true in
-        // production, where a restart always gets a brand-new
-        // `ClusterEdgeState`; this fixture instead reuses the SAME `Arc<
-        // ClusterEdgeState>` across a restart). A first fix that called
-        // `register_control` here left `dynamowire_stop_restart_s02`
-        // failing identically — the edge's `control` vec now held BOTH the
-        // stale, stopped handle and the fresh one, and `leader_handle()`'s
-        // `find` could return the stale one first (frozen at whatever
-        // leadership belief it held the instant it was stopped), silently
-        // reintroducing the exact bug the append was meant to fix. Use
-        // [`ClusterEdgeState::replace_control`] instead — it clears the
-        // vec before pushing, so this restarted node's edge holds exactly
-        // one control handle at all times, the same invariant
-        // `SimCluster::new` establishes and every other node in the
-        // cluster maintains for its own entire lifetime.
-        ctx.edge.replace_control(fresh_control.clone());
+            let mut ctx = self.shared.ctx(node);
+            // Break the OLD relay's own installed-handler self-cycle (see
+            // `SimRelayClient::shutdown`'s own doc for the mechanism) before
+            // superseding it below — the closure `SimCluster::new`/a prior
+            // `restart` installed on it captured a clone of the ClientCtx
+            // this node had *then*, which itself held a clone of this same
+            // relay, so nothing outside an explicit clear ever frees that
+            // generation: `ctx.relay = fresh_relay.clone()` only drops this
+            // ONE reference to it (the field on the ctx local to this
+            // call), never the closure's own captured one sitting inside
+            // the relay's own handler slot. Without this, every restart in
+            // a scenario leaks one more whole node-generation's worth of
+            // state (edge/backup/segment handles, the control handle at
+            // that point, …) — found investigating the animusd
+            // `sim_cluster_*` tier's per-test RSS growth persisting after
+            // `Simulator::shutdown` alone (that fix breaks the *separate*
+            // Simulator-task-queue cycle a perpetual background loop forms,
+            // not this one) — see `docs/engineering-lessons.md`'s matching
+            // entry.
+            ctx.relay.shutdown();
+            ctx.control = GenericControlHandle::Local(fresh_control.clone());
+            ctx.relay = fresh_relay.clone();
 
-        // ADR 0061 rung D4 PR 1: every `RaftKvNode` driver task this node
-        // owned — for ANY tablet, hand-hosted or wire-provisioned — was
-        // just dropped by `Simulator::stop` above, so every one of this
-        // node's own edge registrations is now stale (a live handle for a
-        // driver task that no longer exists). Purge them all — scanning
-        // `ctx.edge.hosted_groups()` directly rather than this fixture's
-        // own `tablets_snapshot()` bookkeeping, which (like `TabletInfo`
-        // generally) only ever knows about a table `create_table_with_
-        // replication` itself provisioned, never a wire-created one — the
-        // fresh reconciler built below re-hosts every one of them fresh
-        // from `Metadata`.
-        for (tablet, _group) in ctx.edge.hosted_groups() {
-            ctx.edge.unregister_raftkv(tablet, id.clone());
-        }
+            // C-06 PR 4 (2026-09-08, issue found investigating
+            // `dynamowire_stop_restart`): `SimCluster::new` registers every
+            // control-bearing node's own control handle onto
+            // `ClusterEdgeState::control` via `edge.register_control(
+            // control.clone())`, because `ClientCtx::propose_schema`'s
+            // LOCAL-propose fast path reads `ctx.edge`'s registry, not
+            // `ctx.control` — the two are different fields with different
+            // lifecycles (`animus-node/CLAUDE.md`'s `ControlHandle` entry).
+            // This `restart` rebuilds `ctx.control` above but, before this
+            // fix, never told the edge about the fresh handle at all — so a
+            // restarted node's `ClusterEdgeState::control` entry kept
+            // pointing at the OLD, `Simulator::stop`ped (dead) `RaftNode`
+            // forever after. Reads still worked (they go through
+            // `ctx.control` directly), but any NEW schema proposal issued
+            // through this node's own fast path (e.g.
+            // `ensure_txn_idempotency_table`'s `CreateTableSchema`, which
+            // `TransactWriteItems`'s `ClientRequestToken` bootstrap needs)
+            // spun until `SCHEMA_COMMIT_TIMEOUT`, even with a real,
+            // reachable, healthy leader elsewhere — reproduced
+            // deterministically via `dynamowire_stop_restart_s02` (an
+            // ordinary, non-transactional `CreateTable` from the restarted
+            // node reproduced the identical failure, proving this was
+            // general control-plane-restart infrastructure, not anything
+            // transact-specific).
+            //
+            // **`register_control` itself is the wrong call here — it only
+            // APPENDS** (its own doc: "called once per node," true in
+            // production, where a restart always gets a brand-new
+            // `ClusterEdgeState`; this fixture instead reuses the SAME
+            // `Arc<ClusterEdgeState>` across a restart). A first fix that
+            // called `register_control` here left `dynamowire_stop_
+            // restart_s02` failing identically — the edge's `control` vec
+            // now held BOTH the stale, stopped handle and the fresh one,
+            // and `leader_handle()`'s `find` could return the stale one
+            // first (frozen at whatever leadership belief it held the
+            // instant it was stopped), silently reintroducing the exact
+            // bug the append was meant to fix. Use
+            // [`ClusterEdgeState::replace_control`] instead — it clears
+            // the vec before pushing, so this restarted node's edge holds
+            // exactly one control handle at all times, the same invariant
+            // `SimCluster::new` establishes and every other control-bearing
+            // node in the cluster maintains for its own entire lifetime.
+            ctx.edge.replace_control(fresh_control.clone());
 
-        // ADR 0061 rung L, C-12 PR 2: skipped for a `NodeRole::Control`
-        // node — mirroring `new_with_roles`'s own construction-time gate
-        // (see that method's identical comment for why).
-        if role.has_data() {
+            // ADR 0061 rung D4 PR 1: every `RaftKvNode` driver task this
+            // node owned — for ANY tablet, hand-hosted or wire-provisioned
+            // — was just dropped by `Simulator::stop` above, so every one
+            // of this node's own edge registrations is now stale (a live
+            // handle for a driver task that no longer exists). Purge them
+            // all — scanning `ctx.edge.hosted_groups()` directly rather
+            // than this fixture's own `tablets_snapshot()` bookkeeping,
+            // which (like `TabletInfo` generally) only ever knows about a
+            // table `create_table_with_replication` itself provisioned,
+            // never a wire-created one — the fresh reconciler built below
+            // re-hosts every one of them fresh from `Metadata`.
+            for (tablet, _group) in ctx.edge.hosted_groups() {
+                ctx.edge.unregister_raftkv(tablet, id.clone());
+            }
+
+            // ADR 0061 rung L, C-12 PR 2: skipped for a `NodeRole::Control`
+            // node — mirroring `new_with_roles`'s own construction-time
+            // gate (see that method's identical comment for why).
+            if role.has_data() {
+                let reconciler = build_reconciler(
+                    ctx.env.clone(),
+                    self.engines[node as usize].clone(),
+                    id.clone(),
+                    ctx.edge.clone(),
+                );
+                spawn_reconciler_loop(ctx.clone(), reconciler);
+            }
+
+            // ADR 0061 rung L, C-12 PR 3: `backup_janitor_loop`/
+            // `segment_janitor_loop`/`index_backfill_loop` are
+            // control-plane-leader-only (never data-role-gated, W-10/ADR
+            // 0043 §A9) — respawned here only for a `has_control()` node,
+            // mirroring `new_with_roles`'s own construction-time gate (see
+            // that method's identical comment for the production
+            // cross-check). `ctx.backup_store`/`ctx.segment_store` are
+            // untouched by this restart (never reassigned above), so each
+            // respawned loop still shares the SAME underlying
+            // `SimSegmentStore` every other node writes to.
+            if role.has_control() {
+                let janitor_env = ctx.env.clone();
+                janitor_env.spawn_task(backup_janitor::backup_janitor_loop(ctx.clone()));
+
+                let segment_janitor_env = ctx.env.clone();
+                segment_janitor_env.spawn_task(segment_janitor::segment_janitor_loop(
+                    ctx.clone(),
+                    self.segment_janitor_retention,
+                ));
+
+                // ADR 0061 rung J (C-10 PR 4): without this a node's own
+                // index-backfill completion aggregator never runs again
+                // after a restart, so a `Creating` GSI whose backfill
+                // happens to finish only after this node has restarted
+                // would never observe the completion this loop is the one
+                // thing that flips it to `Active`.
+                let index_backfill_env = ctx.env.clone();
+                index_backfill_env.spawn_task(index_backfill::index_backfill_loop(ctx.clone()));
+            }
+
+            // ADR 0061 rung I (C-09 PR 2): respawn at the same
+            // [`SIM_TTL_SWEEP_INTERVAL`], gated on `has_data()` (ADR 0061
+            // rung L, C-12 PR 2) — the identical `new_with_roles`-time
+            // gate, see that method's own comment.
+            if role.has_data() {
+                let ttl_reaper_env = ctx.env.clone();
+                ttl_reaper_env.spawn_task(ttl_reaper::ttl_reaper_loop(
+                    ctx.clone(),
+                    SIM_TTL_SWEEP_INTERVAL,
+                ));
+            }
+
+            let ctx_for_server = ctx.clone();
+            fresh_relay.serve(move |req| {
+                let ctx = ctx_for_server.clone();
+                async move { forwarding::handle_relayed_request(&ctx, req).await }
+            });
+
+            self.controls[node as usize] = fresh_control;
+            self.shared.set_ctx(node, ctx);
+        } else {
+            // ---- data-only node (NodeRole::Data), constructed or grown (ADR 0061 rung L, C-12 PR 3) ----
+            assert_eq!(
+                role,
+                NodeRole::Data,
+                "SimCluster::restart(node={node}): a node index at or beyond the \
+                 control-voter prefix (self.controls.len()={}) must be NodeRole::Data — got \
+                 {role:?}; this invariant is established by SimCluster::new_with_roles's own \
+                 control-prefix requirement and SimCluster::grow's own append-only \
+                 NodeRole::Data shape",
+                self.controls.len()
+            );
+
+            let seeds: Vec<String> = control_ids.iter().map(NodeId::to_string).collect();
+            let fresh_relay: SimRelayClient<SimEnv> = SimRelayClient::new(self.sim.env(id.clone()));
+            let fresh_remote =
+                GenericRemoteControlClient::new(seeds.clone(), fresh_relay.clone(), CLIENT_TIMEOUT);
+
+            let mut ctx = self.shared.ctx(node);
+            // Identical relay-handler-self-cycle break as the
+            // control-bearing branch above — see that branch's own comment
+            // for the full mechanism.
+            ctx.relay.shutdown();
+            ctx.control = GenericControlHandle::Remote(fresh_remote.clone());
+            ctx.relay = fresh_relay.clone();
+
+            // A `NodeRole::Data` node's edge never had `register_control`
+            // called on it in the first place (only a control-bearing
+            // node's `Local` handle is ever registered there — see
+            // `SimCluster::new_with_roles`'s own construction-time
+            // register_control loop) — so, unlike the control-bearing
+            // branch above, there is no stale `Local` registration to
+            // `replace_control` here.
+            for (tablet, _group) in ctx.edge.hosted_groups() {
+                ctx.edge.unregister_raftkv(tablet, id.clone());
+            }
+
             let reconciler = build_reconciler(
                 ctx.env.clone(),
                 self.engines[node as usize].clone(),
@@ -3549,75 +3813,53 @@ impl SimCluster {
                 ctx.edge.clone(),
             );
             spawn_reconciler_loop(ctx.clone(), reconciler);
-        }
 
-        // ADR 0061 rung D4 PR 5: `Simulator::stop` above dropped this
-        // node's own `backup_janitor_loop` task along with everything else
-        // it owned — respawn it unconditionally, exactly like
-        // `heartbeat_loop`/the reconciler loop above (this loop is never
-        // gated behind an opt-in the way `auto_split_loop` below is).
-        // `ctx.backup_store` is untouched by this restart (it was never
-        // reassigned above), so the respawned loop still shares the SAME
-        // underlying `SimSegmentStore` every other node writes to.
-        let janitor_env = ctx.env.clone();
-        janitor_env.spawn_task(backup_janitor::backup_janitor_loop(ctx.clone()));
+            let heartbeat_env = self.sim.env(id.clone());
+            heartbeat_env.spawn_task(animus_control::node::heartbeat_loop(
+                heartbeat_env.clone(),
+                control_ids.clone(),
+            ));
 
-        // ADR 0061 rung G (C-07 PR 5): `Simulator::stop` above also dropped
-        // this node's own `segment_janitor_loop` task — respawn it
-        // unconditionally with the SAME retention this cluster was built
-        // (or last had its retention set) with, mirroring the backup
-        // janitor's own respawn immediately above exactly. `ctx.
-        // segment_store` is untouched by this restart (never reassigned
-        // above), so the respawned loop still shares the SAME underlying
-        // `SimSegmentStore` every other node writes to.
-        let segment_janitor_env = ctx.env.clone();
-        segment_janitor_env.spawn_task(segment_janitor::segment_janitor_loop(
-            ctx.clone(),
-            self.segment_janitor_retention,
-        ));
-
-        // ADR 0061 rung I (C-09 PR 2): `Simulator::stop` above also dropped
-        // this node's own `ttl_reaper_loop` task — respawn it at the same
-        // [`SIM_TTL_SWEEP_INTERVAL`], mirroring the backup/segment
-        // janitors' own respawns immediately above, except gated on
-        // `has_data()` (ADR 0061 rung L, C-12 PR 2) — the identical
-        // `new_with_roles`-time gate, see that method's own comment.
-        if role.has_data() {
             let ttl_reaper_env = ctx.env.clone();
             ttl_reaper_env.spawn_task(ttl_reaper::ttl_reaper_loop(
                 ctx.clone(),
                 SIM_TTL_SWEEP_INTERVAL,
             ));
+
+            // Deliberately NOT respawned here — control-plane-leader-only,
+            // and a `NodeRole::Data` node's `ControlHandle::Remote` can
+            // structurally never become control-plane leader (verified
+            // against production: `BoundDataNode::start_data_with_growth`
+            // never spawns `backup_janitor_loop`/`segment_janitor_loop`/
+            // `index_backfill_loop` either, `crates/animusd/src/lib.rs`).
+
+            let ctx_for_server = ctx.clone();
+            fresh_relay.serve(move |req| {
+                let ctx = ctx_for_server.clone();
+                async move { forwarding::handle_relayed_request(&ctx, req).await }
+            });
+
+            self.shared.set_ctx(node, ctx.clone());
+
+            // The one genuinely new mechanism a `NodeRole::Data` node's
+            // restart needs — a fresh `SimEnv`-native mirror-sync loop over
+            // the fresh `ControlHandle::Remote` above (`SimCluster::grow`'s
+            // own established primitive; see that function's own doc for
+            // why this can't just call `animusd`'s own
+            // `remote_metadata_sync_loop`).
+            spawn_remote_mirror_sync_loop(ctx, fresh_remote, seeds);
         }
-
-        // ADR 0061 rung J (C-10 PR 4): `Simulator::stop` above also dropped
-        // this node's own `index_backfill_loop` task — respawn it
-        // unconditionally, exactly like `new` spawns it (see that
-        // constructor's own ADR 0061 rung J / C-10 PR 2 comment above) and
-        // mirroring the backup/segment/TTL janitors' own respawns
-        // immediately above. Without this a node's own index-backfill
-        // completion aggregator never runs again after a restart, so a
-        // `Creating` GSI whose backfill happens to finish only after this
-        // node has restarted would never observe the completion this loop
-        // is the one thing that flips it to `Active`.
-        let index_backfill_env = ctx.env.clone();
-        index_backfill_env.spawn_task(index_backfill::index_backfill_loop(ctx.clone()));
-
-        let ctx_for_server = ctx.clone();
-        fresh_relay.serve(move |req| {
-            let ctx = ctx_for_server.clone();
-            async move { forwarding::handle_relayed_request(&ctx, req).await }
-        });
-
-        self.controls[node as usize] = fresh_control;
-        self.shared.set_ctx(node, ctx);
 
         // ADR 0061 rung D4 PR 2: `Simulator::stop` above dropped this
         // node's own `auto_split_loop` task along with everything else it
         // owned, exactly like `heartbeat_loop` — respawn it with the SAME
         // configuration if this cluster ever opted in (`self.auto_split`
         // is `None` for every scenario that never called
-        // `set_auto_split_thresholds`, so this is a no-op there).
+        // `set_auto_split_thresholds`, so this is a no-op there). Applies
+        // uniformly to both branches above (ADR 0061 rung L, C-12 PR 3) —
+        // production spawns `auto_split_loop` on a data-only node too
+        // (`BoundDataNode::start_data_with_growth`), never control-plane-
+        // leader-gated (it self-gates per tablet it leads, not per node).
         if let Some(thresholds) = self.auto_split {
             self.spawn_auto_split(node, thresholds);
         }
@@ -3694,10 +3936,14 @@ impl SimCluster {
     /// Mirrors `animusd::BoundDataNode::start_data_with_growth`'s real
     /// construction (see that method's own doc) as closely as a `SimEnv`
     /// fixture can — same `ControlHandle::Remote(RemoteControlClient::new(
-    /// ..))`, same per-node reconciler/heartbeat/backup-janitor/auto-split
-    /// spawns [`SimCluster::new`] already gives every original node — with
-    /// two deliberate departures, both documented at their own call site
-    /// below: **self-registration is the fixture's own `RegisterNode`+
+    /// ..))`, same per-node reconciler/heartbeat/TTL-reaper/auto-split
+    /// spawns a [`NodeRole::Data`] node built by [`SimCluster::
+    /// new_with_roles`] already gets, deliberately excluding the
+    /// control-plane-leader-only `backup_janitor_loop`/`segment_janitor_
+    /// loop`/`index_backfill_loop` trio (ADR 0061 rung L, C-12 PR 3 — see
+    /// this method's own inline comment at its janitor-spawn site) — with
+    /// two further deliberate departures, both documented at their own call
+    /// site below: **self-registration is the fixture's own `RegisterNode`+
     /// `UpsertMember{Active}` control-plane bypass** (`SimCluster::
     /// seed_members`'s idiom, not `ClientCtx::admin_add_member`'s real
     /// relay+failure-detector-promotion dance), and **the mirror-sync loop
@@ -3813,9 +4059,16 @@ impl SimCluster {
                 change_rates: ChangeRateTracker::default(),
                 request_rates: RequestRateTracker::default(),
             }),
-            segment_store: SegmentStoreHandle::Fs(FsSegmentStore::new(format!(
-                "unused-segment-store-{new_n}"
-            ))),
+            // ADR 0061 rung L, C-12 PR 3: the SAME shared `SimSegmentStore`
+            // every other node's own `ClientCtx::segment_store` wraps
+            // (`SimCluster::segment_store`, ADR 0061 rung G C-07 PR 2) —
+            // previously an inert per-node `Fs` placeholder, unlike
+            // `backup_store`'s own shared-store treatment immediately
+            // below; a grown node's own stream-segment reads/writes
+            // (`index_drain::seal_now` via `SimCluster::drive_stream_seal`)
+            // now see every other node's writes too, exactly like a real S3
+            // bucket would.
+            segment_store: SegmentStoreHandle::S3(Arc::new(self.segment_store.clone())),
             backup_store: BackupStoreHandle::S3(Arc::new(self.backup_store.clone())),
             export_store_factory: Arc::new(Mutex::new(default_export_store_factory(None))),
             backup_janitor_progress: Arc::new(Mutex::new(
@@ -3915,10 +4168,34 @@ impl SimCluster {
         );
         spawn_reconciler_loop(ctx.clone(), reconciler);
 
-        // The backup janitor — unconditional spawn, identical to
-        // `SimCluster::new`/`restart`.
-        let janitor_env = env.clone();
-        janitor_env.spawn_task(backup_janitor::backup_janitor_loop(ctx.clone()));
+        // The TTL reaper (ADR 0061 rung I, C-09) — data-role-gated, not
+        // control-plane-leader-gated, so a data-only grown node needs one
+        // exactly like a combined node does (`ClientCtx::data()` is
+        // `Some` here). ADR 0061 rung L, C-12 PR 3: this was a real,
+        // previously-latent gap — this node never got a TTL reaper at all
+        // before this fix, even though production's own `BoundDataNode::
+        // start_data_with_growth` spawns one on every data-only node
+        // (`crates/animusd/src/lib.rs`).
+        let ttl_reaper_env = env.clone();
+        ttl_reaper_env.spawn_task(ttl_reaper::ttl_reaper_loop(
+            ctx.clone(),
+            SIM_TTL_SWEEP_INTERVAL,
+        ));
+
+        // Deliberately NOT spawned here — `backup_janitor_loop`/
+        // `segment_janitor_loop`/`index_backfill_loop` are control-plane-
+        // leader-only (never data-role-gated, W-10/ADR 0043 §A9), and this
+        // node's `ControlHandle::Remote` can structurally never become
+        // control-plane leader (verified against production:
+        // `BoundDataNode::start_data_with_growth` spawns none of the
+        // three either). ADR 0061 rung L, C-12 PR 3: a real,
+        // previously-latent divergence from production — this method used
+        // to spawn `backup_janitor_loop` unconditionally, a permanent,
+        // harmless (`control_leader()` answering `None` forever) but
+        // production-inaccurate no-op; removed rather than left in place,
+        // matching [`SimCluster::new_with_roles_and_segment_janitor_
+        // retention`]'s own `has_control()` gate for the identical three
+        // loops, and [`SimCluster::restart`]'s matching data-only branch.
 
         // Auto-split, if this cluster opted in — identical to
         // `SimCluster::restart`'s own respawn.

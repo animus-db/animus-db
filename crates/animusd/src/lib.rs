@@ -19109,6 +19109,20 @@ mod sim_cluster_stream_backfill_seed_filter;
 #[cfg(test)]
 mod sim_cluster_control_only;
 
+/// ADR 0061 rung L (C-12 PR 3): data-only nodes under `SimCluster` —
+/// `NodeRole::Data` first-class at construction (`SimCluster::new_with_
+/// roles`, previously `SimCluster::grow("data")`-only), role-aware `crash`/
+/// `restart` for a data-only node whether constructed or grown, and five
+/// seed-parameterized scenarios proving a mixed control-only/data-only
+/// cluster boots and serves, a data-only node's own restart/crash-then-
+/// restart both catch up and re-serve, a mixed combined+data-only cluster
+/// behaves identically, and DDL issued at a data-only node (through its own
+/// `ControlHandle::Remote`) succeeds and replicates cluster-wide. See
+/// `sim_cluster_data_only.rs`'s own module doc for the full account and
+/// `crates/animusd/CLAUDE.md`'s matching SimCluster-roles entry.
+#[cfg(test)]
+mod sim_cluster_data_only;
+
 /// Regression for the issue #298 residual confirmed live under the
 /// un-pinned `SplitMode::InPlace` proof soak (ADR 0018's matching amendment,
 /// `docs/engineering-lessons.md`'s matching entry): a stage blocked by
