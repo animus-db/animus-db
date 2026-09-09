@@ -24056,3 +24056,69 @@ before touching anything.
   `origin/main` before calling the stack landed. **Recovery**: re-land the
   stranded heads as one flat PR rebased onto the current `main`, from
   whatever ref still holds them.
+
+## `--ephemeral` swapping the storage backend is not the same claim as "this run's directory default is safe to reuse" — `animusd`'s `--cluster N` shared a fixed default `--dir` across runs regardless (2026-09-09)
+
+`animusd --cluster N`/`--cluster-control N --cluster-data M` (the in-process
+dev-convenience commands) defaulted `--dir` to one fixed path
+(`$TMPDIR/animusd`) whenever it was omitted — `--ephemeral` only swaps the
+CP-data `StorageBackend` to `MemoryEngine`; it never touches the
+control-plane `ProdEnv`'s on-disk WAL (`Node::bind` always writes
+`dir.join("internal")` on real disk, backend-independent). So two
+back-to-back runs with no `--dir` silently rehydrated the first run's
+control-plane WAL, and — confirmed by hand while building the regression
+test below — a **different-sized** second run (e.g. `--cluster 3` then
+`--cluster 5`) can leave some nodes permanently `control_leader_known:
+false` (majority-quorum expectations from a membership that no longer
+exists), while a **same-sized** restart re-elects fine (every node keeps
+the same deterministic id and the whole group's on-disk state stays
+mutually consistent across a same-process kill) — so the CLI-level fix
+(`main.rs::resolve_cluster_data_dir`) makes both commands' default a fresh
+directory unique to the process (`$TMPDIR/animusd-{cluster,ephemeral}-
+<pid>`) **regardless of `--ephemeral`**: unlike `--config FILE --node I`'s
+per-index default (a genuine "resume this same logical node" feature),
+these two commands re-mint every node's OS-assigned port on every
+invocation, so there is no stable prior state for a fixed default to
+legitimately let a second run resume in the first place. **Lesson**: when
+a flag *sounds* like it should make a whole run's footprint disappear
+("ephemeral"), verify what it actually covers against every subsystem that
+persists state, not just the one the flag's own doc sentence names — the
+crate guide already had a hand-written note about this exact gap
+(`crates/animusd/CLAUDE.md`), but it took two separate investigations
+losing time to a rehydrated stale WAL before anyone acted on it.
+
+## A real-subprocess regression for a crash-recovery race can be reproducible-by-hand yet still be the wrong thing to gate CI on — assert the deterministic root cause instead of the racy symptom (same 2026-09-09 fix)
+
+While writing the real-binary regression test for the `--cluster N`
+default-`--dir` fix above, the literal "second cluster comes up stuck and
+never elects" symptom the bug report described turned out to be
+**timing-sensitive**: a `--cluster 3` run followed by a reused-directory,
+different-sized `--cluster 5` run left 2 of 5 nodes permanently unelected
+in 3 of 4 manual trials, but occasionally (the 4th) re-converged within a
+second instead — a genuine race in the crash-recovery path, not a test
+bug. Per this repo's own standing rule (`CLAUDE.md`'s "Session operating
+mode" item 4 — a flaky test is a bug, never something to retry or widen a
+timeout around), a test that gates on that election outcome would
+sometimes give a false "healthy" reading against the very code it exists
+to catch. The fix: assert the fully deterministic mechanism that *causes*
+the race instead of the race itself — "the second back-to-back run must
+create its own brand-new directory under `$TMPDIR`, never reuse whatever
+the first run already created there" (`animusd_temp_entries()`'s
+before/after directory-listing diff, see `crates/animusd/tests/
+cluster_ephemeral_default_dir.rs`). That assertion is both necessary and
+sufficient to prevent the downstream stall and never flakes, because it
+depends on nothing but which directories exist on disk. Two smaller traps
+hit along the way, worth naming for the next real-subprocess test: (1) a
+bare `std::process::Child` does **not** kill its process on drop (only an
+explicit `Drop` impl does) — wrapping the spawned child in an RAII guard
+*after* some fallible/panicking setup work leaks an orphaned real
+`animusd` process on that panic path, which then silently shares/corrupts
+a later run's reused directory and confounds the very investigation that
+spawned it; construct the guard immediately after `spawn()`, before
+anything else can panic. (2) `timeout <secs> cargo test ...` from the
+shell kills the `cargo test` process on expiry but does not reach its
+already-spawned grandchildren, which likewise survive as orphans holding
+stale on-disk state — prefer a timeout expressed inside the test itself
+(`tokio::time::timeout` wrapping a body whose `Run::drop` reaps its own
+children) over an external `timeout` wrapper for any test that spawns real
+subprocesses.

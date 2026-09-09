@@ -18,6 +18,18 @@
 //! dir, so values survive a restart); `--ephemeral` selects a volatile
 //! in-memory engine instead.
 //!
+//! **`--cluster N` and `--cluster-control N --cluster-data M` default `--dir`
+//! to a fresh, unique-per-process directory** (`$TMPDIR/animusd-cluster-<pid>`,
+//! or `animusd-ephemeral-<pid>` under `--ephemeral`) when it is omitted,
+//! regardless of `--ephemeral` — these two in-process dev-convenience
+//! commands mint a brand new cluster (and new OS-assigned ports) on every
+//! invocation, so a shared fixed default could only rehydrate a previous
+//! run's now-stale control-plane WAL and get stuck rather than elect. Pass
+//! `--dir` explicitly to reuse a specific directory on purpose. The other
+//! modes (`--config FILE --node I`, `control`, `data`, `join`) keep their
+//! existing per-index/per-id default, which *is* meant to persist across a
+//! restart of that same logical node.
+//!
 //! Per-process deployment: generate a config once, copy it to each host, and run
 //! `animusd --config cluster.json --node I` with a distinct `I` per process. A
 //! node that has no expanded config at all — just the **intra-cluster**
@@ -2382,6 +2394,33 @@ async fn run_join(args: &[String]) -> Result<(), String> {
     node.shutdown_graceful().await;
     Ok(())
 }
+/// Resolve the default data directory for the in-process dev-convenience
+/// cluster commands (`--cluster N` and `--cluster-control N --cluster-data
+/// M`) when the caller did not pass `--dir` explicitly.
+///
+/// Unlike `--config FILE --node I`/`control`/`data`/`join` — where the
+/// per-index or per-id default (`animusd-node-{index}` etc.) is a
+/// deliberate persistence feature, letting the *same* logical node restart
+/// and rehydrate its own prior state — these two commands mint a brand new
+/// cluster on every invocation: every node binds `ip:0`, an OS-assigned
+/// ephemeral port, so there is no stable address for a second run to
+/// legitimately "resume" even if it wanted to. A fixed shared default
+/// therefore only lets a second invocation load the first run's
+/// control-plane WAL (stale membership/term state for a *different* node
+/// set and different addresses), which can leave it stuck and never
+/// electing. So — regardless of `--ephemeral` — the default here is always
+/// a fresh, unique-per-process directory; `--dir` still opts back into a
+/// fixed, reusable location for anyone who wants one on purpose.
+fn resolve_cluster_data_dir(
+    cli_dir: Option<std::path::PathBuf>,
+    ephemeral: bool,
+    pid: u32,
+) -> std::path::PathBuf {
+    cli_dir.unwrap_or_else(|| {
+        let label = if ephemeral { "ephemeral" } else { "cluster" };
+        std::env::temp_dir().join(format!("animusd-{label}-{pid}"))
+    })
+}
 
 /// In-process: run an `n`-node cluster (dev convenience).
 #[allow(clippy::too_many_arguments)]
@@ -2412,7 +2451,12 @@ async fn run_in_process_cluster(
     if n == 0 {
         return Err("--cluster must be at least 1".into());
     }
-    let dir = dir.unwrap_or_else(|| std::env::temp_dir().join("animusd"));
+    let dir = resolve_cluster_data_dir(
+        dir,
+        backend == animusd::StorageBackend::Memory,
+        std::process::id(),
+    );
+    println!("animusd: data dir {}", dir.display());
     let bound = animusd::bind_cluster_with_advertise_host_and_key(
         n,
         ip,
@@ -2509,7 +2553,12 @@ async fn run_in_process_split_cluster(
     if control_n == 0 || data_n == 0 {
         return Err("--cluster-control and --cluster-data must each be at least 1".into());
     }
-    let dir = dir.unwrap_or_else(|| std::env::temp_dir().join("animusd"));
+    let dir = resolve_cluster_data_dir(
+        dir,
+        backend == animusd::StorageBackend::Memory,
+        std::process::id(),
+    );
+    println!("animusd: data dir {}", dir.display());
     let nodes = animusd::start_split_cluster_with_growth(
         control_n,
         data_n,
@@ -2635,6 +2684,68 @@ fn orphan_sweep_after_duration(secs: Option<u64>) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- `resolve_cluster_data_dir` (this fix) --------------------------
+
+    #[test]
+    fn resolve_cluster_data_dir_explicit_dir_always_wins() {
+        let explicit = std::path::PathBuf::from("/tmp/whatever-the-caller-chose");
+        assert_eq!(
+            resolve_cluster_data_dir(Some(explicit.clone()), true, 111),
+            explicit
+        );
+        assert_eq!(
+            resolve_cluster_data_dir(Some(explicit.clone()), false, 222),
+            explicit
+        );
+    }
+
+    #[test]
+    fn resolve_cluster_data_dir_ephemeral_differs_across_pids() {
+        let a = resolve_cluster_data_dir(None, true, 111);
+        let b = resolve_cluster_data_dir(None, true, 222);
+        assert_ne!(a, b, "two ephemeral runs must never share a default dir");
+    }
+
+    #[test]
+    fn resolve_cluster_data_dir_non_ephemeral_also_differs_across_pids() {
+        // Decision: the fixed shared default (`$TMPDIR/animusd`) was never a
+        // legitimate "resume this cluster" feature for `--cluster N`/
+        // `--cluster-control`/`--cluster-data` — every node re-binds `ip:0`
+        // (a new OS-assigned port) on every invocation, so there is no
+        // stable prior state for a second run to actually resume. A fixed
+        // default only let a second run rehydrate the first run's stale
+        // control-plane WAL (this ticket's bug). So non-ephemeral gets a
+        // unique-per-process default too, same as ephemeral; only an
+        // explicit `--dir` opts back into a fixed, reusable location.
+        let a = resolve_cluster_data_dir(None, false, 111);
+        let b = resolve_cluster_data_dir(None, false, 222);
+        assert_ne!(
+            a, b,
+            "two non-ephemeral runs must never share a default dir"
+        );
+    }
+
+    #[test]
+    fn resolve_cluster_data_dir_same_pid_is_deterministic() {
+        // Same process (same pid, same flag) resolves to the same path —
+        // this is a pure function of its inputs, not a hidden counter.
+        assert_eq!(
+            resolve_cluster_data_dir(None, true, 42),
+            resolve_cluster_data_dir(None, true, 42)
+        );
+    }
+
+    #[test]
+    fn resolve_cluster_data_dir_ephemeral_and_non_ephemeral_dont_collide() {
+        // Within the same pid, an ephemeral and a non-ephemeral default
+        // shouldn't alias to the same path either (defensive; the two would
+        // never run in the same process, but a distinct label costs nothing
+        // and makes `ps`/`ls $TMPDIR` output self-explanatory).
+        let ephemeral = resolve_cluster_data_dir(None, true, 42);
+        let durable = resolve_cluster_data_dir(None, false, 42);
+        assert_ne!(ephemeral, durable);
+    }
 
     // --- `--backup-store` (ADR 0059 §1) ---------------------------------
 

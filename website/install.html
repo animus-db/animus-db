@@ -178,9 +178,11 @@
       <div class="callout">
         <span class="label">Keep the data, or don't</span>
         <p>
-          State is written under a temporary directory by default. Pass <code>--dir ./cluster-data</code>
-          to keep it somewhere you choose, or <code>--ephemeral</code> to keep everything in memory
-          and discard it on exit.
+          State is written under a fresh, unique-per-process temporary directory by
+          default, so running this command again never picks up the previous run's
+          state. Pass <code>--dir ./cluster-data</code> to reuse a directory of your
+          choosing, or <code>--ephemeral</code> to also swap the tablet-data engine for
+          a volatile in-memory one.
         </p>
       </div>
       <p>
@@ -412,7 +414,7 @@ table.put_item(Item={<span class="s">"id"</span>: <span class="s">"a-2"</span>, 
             <tr><td><code>--config FILE --node I</code></td><td>Run node <code>I</code> of a generated cluster config. The normal production invocation.</td></tr>
             <tr><td><code>--cluster N</code></td><td>Run an <code>N</code>-node cluster in a single process. Development convenience.</td></tr>
             <tr><td><code>--dir DIR</code></td><td>Where this node keeps its write-ahead logs, SSTables and snapshots.</td></tr>
-            <tr><td><code>--ephemeral</code></td><td>Keep all state in memory; nothing survives a restart.</td></tr>
+            <tr><td><code>--ephemeral</code></td><td>Use a volatile in-memory engine for tablet data instead of the on-disk default. Control-plane state still lives under <code>--dir</code> for that run, but <code>--cluster N</code>/<code>--cluster-control</code>/<code>--cluster-data</code> default <code>--dir</code> to a fresh directory per process either way, so back-to-back runs never rehydrate a previous one.</td></tr>
             <tr><td><code>--auto-split-bytes B</code></td><td>Split a tablet once it exceeds <code>B</code> bytes.</td></tr>
             <tr><td><code>--quiesce-after SECS</code></td><td>How long a tablet group must be idle before it stops ticking. On by default.</td></tr>
             <tr><td><code>--no-heartbeat-batch</code></td><td>Turn off per-destination heartbeat batching (coalescing every co-hosted tablet group's heartbeat toward the same peer into one wire frame). On by default.</td></tr>
