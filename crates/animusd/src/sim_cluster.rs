@@ -2280,6 +2280,24 @@ impl SimCluster {
         self.shared.is_leader_local(node, tablet)
     }
 
+    /// `node`'s own live-voter belief (`ClientCtx::control.config()`,
+    /// `animus_node::control_handle::ControlHandle::config`) — ADR 0061
+    /// rung L, C-12 PR 4a: the fixture-side primitive
+    /// `data_node_observes_live_control_voters_after_a_fresh_fetch`
+    /// (`tests/data_only.rs`) needs, which no other `SimCluster` accessor
+    /// exposes. For a control-bearing (`Local`) node this is always
+    /// `Some(raft.config())` — this node's own real, always-current Raft
+    /// config. For a `NodeRole::Data` node's `Remote` handle it is `None`
+    /// until at least one `Status`/`WatchMetadata` round trip has landed
+    /// (`RemoteControlClient::control_voters`, populated by
+    /// `spawn_remote_mirror_sync_loop`'s own `observe`/`observe_delta`
+    /// calls), then the last-observed live voter set — the wire-fetched
+    /// fact, never a local belief, which is exactly what that test's own
+    /// name means by "a fresh fetch."
+    pub(crate) fn control_voters(&self, node: u64) -> Option<BTreeSet<NodeId>> {
+        self.shared.ctx(node).control.config()
+    }
+
     /// `node`'s own view of the replicated control-plane `Metadata` —
     /// `ClientCtx::effective_metadata`'s exact read, so a caller can
     /// assert on tablet placement / schema visibility per node.

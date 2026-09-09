@@ -19123,6 +19123,17 @@ mod sim_cluster_control_only;
 #[cfg(test)]
 mod sim_cluster_data_only;
 
+/// ADR 0061 rung L (C-12 PR 4a): the first conversion PR built on top of the
+/// PR 2/3 mechanism — `tests/control_only.rs` (3 tests), `tests/
+/// data_only.rs` (5 tests), and `tests/cluster_split.rs` (3 tests), pure
+/// test authorship, no `dynamo.rs`/`lib.rs` production change. See
+/// `sim_cluster_control_data_split.rs`'s own module doc for the full
+/// classification table (which of the 11 converted whole, which left a
+/// real-socket residual and why) and `crates/animusd/CLAUDE.md`'s matching
+/// residual-inventory entry.
+#[cfg(test)]
+mod sim_cluster_control_data_split;
+
 /// Regression for the issue #298 residual confirmed live under the
 /// un-pinned `SplitMode::InPlace` proof soak (ADR 0018's matching amendment,
 /// `docs/engineering-lessons.md`'s matching entry): a stage blocked by
