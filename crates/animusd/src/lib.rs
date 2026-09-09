@@ -19056,6 +19056,20 @@ mod sim_cluster_ttl;
 #[cfg(test)]
 mod sim_cluster_index_ddl;
 
+/// ADR 0061 rung J (C-10 PR 3): converts `tests/update_table_create_
+/// index.rs` (4), `tests/update_table_drop_index.rs` (4), and `tests/
+/// dynamo_gsi_drain.rs` (1) — 9 tests total, all three files deleted whole.
+/// Every scenario asserts the same observable behaviour the original
+/// asserted, through `SimCluster::dynamo`; two scenarios substitute a
+/// deterministic sequenced analogue for the original's own real-thread
+/// concurrency (an abandoned in-flight request interrupted by
+/// `SimCluster::restart`, and a drop racing exactly one partial backfill
+/// tick) — see the module's own top-of-file doc for the full account. Nine
+/// pinned-seed smokes plus `_over_seeds` siblings (5 seeds each) — see
+/// `crates/animusd/CLAUDE.md`'s matching C-10 entry.
+#[cfg(test)]
+mod sim_cluster_dynamo_update_table_index;
+
 /// Regression for the issue #298 residual confirmed live under the
 /// un-pinned `SplitMode::InPlace` proof soak (ADR 0018's matching amendment,
 /// `docs/engineering-lessons.md`'s matching entry): a stage blocked by

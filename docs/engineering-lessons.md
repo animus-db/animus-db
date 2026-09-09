@@ -4371,6 +4371,53 @@ debugging anything that feels like it might have happened before.
   existing, differently-named sibling scenario) is what made this stale
   comment discoverable at all — a literal `grep` for the original test
   name landed directly on the doc comment that needed fixing.
+- **`SimCluster`'s own op methods (`dynamo`/`put`/`get`/`scan`/...) always
+  run a request to completion in one synchronous call, so there is no
+  window from a test's own code to interleave a second action mid-flight
+  the way a real-socket test's `tokio::join!`/fire-and-forget-then-sleep
+  can** (ADR 0061 rung J, C-10 PR 3). Every one of these methods is
+  `spawn_and_capture`: spawn the future, then `self.sim.run_for(OP_BUDGET)`
+  drains the simulator to completion (or timeout) before returning — there
+  is no intermediate point a caller can observe or act on. A real-socket
+  test that races a background poll against a live request, or fires a
+  request and abandons it after a brief sleep to simulate a crash
+  mid-cascade, has no literal equivalent under this fixture. The fixture's
+  own established workaround, used consistently across every "crash during
+  X" scenario (`sim_cluster_dynamo_drop_table.rs::run_scenario_4_a_node_
+  crashed_during_the_drop_and_restarted_reclaims_its_engine` and this PR's
+  own `a_crash_and_retry_mid_cascade_still_converges`): spawn the request
+  by hand on the target node's own `SimEnv` (`SimCluster::handle().env(
+  node)`, the identical primitive the D1-step-3 corpus's own concurrent
+  client tasks use), optionally drive the simulator a little via
+  `SimCluster::run_for` to let it make partial progress, then interrupt
+  with `SimCluster::crash`/`restart` before ever calling `dynamo`/`put`/etc.
+  (which would run it to completion instead). A scenario that needs the
+  interleaving itself (not just "abandon and check the end state
+  converges") — e.g. a live poll racing a live write to prove a property
+  never transiently holds — has no fixture-level equivalent at all; the
+  honest move is a deterministic sequenced substitute that proves the same
+  property a different way (documented inline, per this crate's own "note
+  where a scenario doesn't literally reproduce concurrency" convention),
+  not a strained attempt to force real concurrency out of a
+  single-threaded discrete-event simulator.
+- **`SimCluster::restart` rebuilds the restarted node's own control-plane
+  Raft log from scratch (`RaftNode::start(.., MemoryEngine::new())`) and
+  relies on ordinary peer catch-up to repopulate it — a 1-node cluster has
+  no peer to catch up from, so restarting node 0 on a `SimCluster::new(
+  seed, 1, 1)` cluster loses ALL replicated `Metadata`, including every
+  table's own schema** (ADR 0061 rung J, C-10 PR 3). Only the DATA-plane
+  tablet engines survive a restart (`self.engines[node]`, reused
+  deliberately, per that method's own doc); the control-plane log is not
+  durable across a restart the way a real `ProdEnv` node's on-disk WAL is.
+  A real-socket test converted to this fixture that crashes-and-restarts a
+  **single** node and expects its own prior schema/catalog state to still
+  be there afterward needs a multi-node cluster instead (so the restarted
+  node recovers via replication, exactly like production), even when the
+  original test used one real process. Found converting `tests/
+  update_table_drop_index.rs::a_crash_and_retry_mid_cascade_still_
+  converges` (a real single-node crash/restart test) — the fix was simply
+  running the equivalent `SimCluster` scenario at `(seed, 3, 3)` instead of
+  `(seed, 1, 1)`, not a fixture change.
 
 ### Code patterns
 - **A new confirm loop copied from a sibling's shape but the wrong sibling's

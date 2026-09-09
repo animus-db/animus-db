@@ -6579,9 +6579,12 @@ backup janitor are D4's own scope (D4 PR 1 already supplied the real
 reconciler these need next); Streams, admin/console/dashboard HTTP, and
 TTL are now owned and closed (C-07, C-08, C-09);
 index DDL beyond plain `CreateTable` is queued as C-10, **open** as of
-2026-09-09 (PR 1 docs opener landed — see ADR 0061's "Rung J (post-C-09)"
-amendment and `docs/roadmap.md`'s C-10 entry for the grep-verified
-ground truth, file/line anchors, and the 7-PR plan);
+2026-09-09 (PRs 1-3 landed — groundwork plus `sim_cluster_dynamo_update_
+table_index.rs`, converting `update_table_create_index.rs`/`update_table_
+drop_index.rs`/`dynamo_gsi_drain.rs` (9 tests), all three deleted whole; see
+ADR 0061's "Rung J (post-C-09)" amendment and `docs/roadmap.md`'s C-10
+entry for the grep-verified ground truth, file/line anchors, and the
+7-PR plan);
 the control/data role split, `--config` bring-up, node assembly, and the
 throttle-metric counters are unowned
 by any planned rung as of this close; (E) frozen behind an open flake
@@ -9405,4 +9408,78 @@ passed (+4, 0 regressions, 2 ignored throughout), peak RSS ~958 MB
 trajectory.
 
 See ADR 0061's "Rung J, PR 2 landed" amendment and `docs/roadmap.md`'s
+C-10 entry for the full record.
+
+## Appendix — index DDL beyond plain `CreateTable` under `SimCluster`, `sim_cluster_dynamo_update_table_index.rs` (ADR 0061 rung J, C-10 PR 3, 2026-09-09)
+
+Converts `tests/update_table_create_index.rs` (4), `tests/update_table_
+drop_index.rs` (4), and `tests/dynamo_gsi_drain.rs` (1) — 9 tests total —
+into `crates/animusd/src/sim_cluster_dynamo_update_table_index.rs`
+(`#[cfg(test)] mod sim_cluster_dynamo_update_table_index;` from `lib.rs`,
+sibling of `sim_cluster_index_ddl`), all nine at a pinned seed plus a
+5-seed `_over_seeds` sibling (18 `#[test]` functions), and deletes all
+three real-socket files whole. Every scenario asserts the identical
+observable behaviour the original asserted, through `SimCluster::dynamo`
+— duplicate/reserved/`$`-containing/nonexistent-table validation
+rejections, the `MAX_GSI_PER_TABLE` cap, a non-leader-issued `UpdateTable`
+converging on every node, a populated-table drop's catalog + physical
+reclaim, a drop racing an in-flight backfill, a create-drop-recreate cycle
+proving the backfill cursor is genuinely cleared (not stale-resumed), and
+the GSI drain itself (materialize, move on overwrite, prune on delete).
+
+**Two scenarios substitute a deterministic sequenced analogue for the
+originals' own real-thread concurrency** (the module's own top-of-file
+doc has the full account): `in_flight_backfill_is_cancelled_by_a_
+concurrent_drop` issues the drop immediately after exactly one partial
+`drive_backfill_seed` tick (300 rows, past the seeder's own per-tick cap,
+so the index is provably still `Creating`) rather than racing a live
+`tokio::join!`; `a_crash_and_retry_mid_cascade_still_converges` spawns the
+`Delete` by hand on the target node's own `SimEnv` (`SimCluster::handle`),
+drives the simulator a few milliseconds, then interrupts with `SimCluster
+::restart` (a true process stop dropping the still in-flight task) —
+runs on a 3-node cluster rather than the original's 1-node, since
+`SimCluster::restart` rebuilds the restarted node's own control-plane log
+from scratch and relies on peer catch-up to repopulate it (a lone node
+has no peer to catch up from, unlike the original's real single process,
+which recovered from its own on-disk WAL — see `docs/engineering-lessons.md`'s
+matching entry). One scenario substitutes a stronger physical-reclaim
+proof for a disk-specific one: `drop_of_an_active_index_on_a_populated_
+table_reclaims_everything`'s original checked a real WAL file's absence
+on disk; `SimCluster` hosts every tablet on `MemoryEngine`, so the
+substitute checks `Metadata`/`hosted_tablets` absence **and** the hidden
+table's own tablet id reading back an empty engine, together in one
+converged-or-timeout poll — mirroring `sim_cluster_dynamo_drop_table.rs::
+assert_reclaimed`'s own discipline, generalized to an index's own hidden
+table.
+
+No `dynamo.rs`/`index_drain.rs`/`sim_cluster.rs` change was needed for
+this PR — every primitive it drives (`SimCluster::dynamo`/`drive_
+backfill_seed`/`drain_gsi`/`propose_meta`/`handle`/`crash`/`restart`/
+`run_for`/`storage`/`hosted_tablets`/`metadata`) already existed after PR
+2's groundwork; this PR is driver-plus-assertions only, the same shape
+`sim_cluster_dynamo_drop_table.rs`'s own doc claims for its module.
+
+**Residual `tests/*.rs` index-DDL count, updated**: of the rung J
+opener's own nine named files (33 tests by its grep-verified recount),
+three are now gone (`update_table_create_index.rs`, `update_table_drop_
+index.rs`, `dynamo_gsi_drain.rs` — 9 tests, deleted whole); the remaining
+six are `backfill_seeder.rs` (5, PR 4), `stream_backfill_seed_filter.rs`
+(2, PR 5), `console_table_config.rs` (4, 3 in scope for PR 6, 1 stays
+`ProdEnv` under the separate PITR residual), and the three frozen files
+this series does not touch (`dynamo_index_scan.rs` #418, `index_backfill.rs`
+#592, `dynamo_index_writes.rs` #610).
+
+**Gates**: this PR's own conversion could not be run against `cargo` from
+this worktree (delegated to the maintainer's own gate run in the main
+tree, per this session's own constraints); the untrimmed-baseline-first
+discipline the ADR's own PR 3 gate list calls for (`update_table_create_
+index`/`update_table_drop_index`/`dynamo_gsi_drain` green before the sim
+module, sim module green before the trim, whole `sim_cluster` tier +
+RSS sampler + fmt + clippy after) is the maintainer's own next step, not
+yet recorded here — do not treat this appendix as a stand-in for that
+run. Every API this module calls was individually cross-checked against
+its declared signature in `sim_cluster.rs` (see this PR's own report for
+the list of anything left uncertain).
+
+See ADR 0061's "Rung J, PR 3 landed" amendment and `docs/roadmap.md`'s
 C-10 entry for the full record.
