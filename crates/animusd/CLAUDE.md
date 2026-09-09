@@ -6674,11 +6674,15 @@ tests stayed `ProdEnv` for documented reasons spread across seven files, as
 of this rung's own close (`admin_endpoint.rs` 10, `dashboard_endpoint.rs`
 4, `console_endpoint.rs`
 3, `console_stream.rs` 1, `console_table_config.rs` 4, `metrics_
-endpoint.rs` 1, `system_table.rs` 2), none silently dropped — **two of
+endpoint.rs` 1, `system_table.rs` 2), none silently dropped — **five of
 those 25 no longer exist**: C-09 (ADR 0061 rung I) later converted
 `admin_endpoint.rs`'s TTL reaper-progress test (down to 9) and
-`console_stream.rs`'s sole test (the file is now deleted), per the
-consolidated TTL section below. See this
+`console_stream.rs`'s sole test (the file is now deleted); C-10 PR 6 (ADR
+0061 rung J) later converted three of `console_table_config.rs`'s own four
+— `add_and_drop_gsi_round_trip`, `add_gsi_records_a_declared_attribute_
+type`, `add_gsi_rejects_an_unknown_attribute_type` (down to 1,
+`table_detail_shows_pitr_status_and_backups`, once PR 2 closed blocker (d)
+— see the "index DDL beyond plain `CreateTable`" appendix below). See this
 file's own appendices, below, for each PR's mapping table and gate
 numbers, and ADR 0061's "Rung H closed" amendment for the complete final
 residue table with reasons, the in-scope findings (the shared `Metrics
@@ -9462,15 +9466,20 @@ backfill_seed`/`drain_gsi`/`propose_meta`/`handle`/`crash`/`restart`/
 2's groundwork; this PR is driver-plus-assertions only, the same shape
 `sim_cluster_dynamo_drop_table.rs`'s own doc claims for its module.
 
-**Residual `tests/*.rs` index-DDL count, updated**: of the rung J
-opener's own nine named files (33 tests by its grep-verified recount),
-three are now gone (`update_table_create_index.rs`, `update_table_drop_
-index.rs`, `dynamo_gsi_drain.rs` — 9 tests, deleted whole); the remaining
-six are `backfill_seeder.rs` (5, PR 4), `stream_backfill_seed_filter.rs`
-(2, PR 5), `console_table_config.rs` (4, 3 in scope for PR 6, 1 stays
-`ProdEnv` under the separate PITR residual), and the three frozen files
-this series does not touch (`dynamo_index_scan.rs` #418, `index_backfill.rs`
-#592, `dynamo_index_writes.rs` #610).
+**Residual `tests/*.rs` index-DDL count, updated as of PR 6 (final for this
+series' `tests/*.rs` trims)**: of the rung J opener's own nine named files
+(33 tests by its grep-verified recount), five are now gone whole
+(`update_table_create_index.rs`, `update_table_drop_index.rs`,
+`dynamo_gsi_drain.rs` — 9 tests, PR 3; `stream_backfill_seed_filter.rs` — 2
+tests, PR 5, no residual); `backfill_seeder.rs` is trimmed to its one
+`ProdEnv` residual (`split_during_backfill_converges_with_correct_final_gsi`,
+PR 4's own explicitly-licensed fallback); `console_table_config.rs` is
+trimmed to its one `ProdEnv` residual (`table_detail_shows_pitr_status_and_
+backups`, PR 6 — `UpdateContinuousBackups` has no generic-dispatch arm and
+the test needs the real wall-clock-timed `pitr_snapshot_loop`); and the
+three frozen files this series does not touch remain untouched
+(`dynamo_index_scan.rs` #418, `index_backfill.rs` #592, `dynamo_index_
+writes.rs` #610). PR 7 (close-out) is the only step left in this rung.
 
 **Gates**: this PR's own conversion could not be run against `cargo` from
 this worktree (delegated to the maintainer's own gate run in the main
@@ -9625,3 +9634,59 @@ This PR's own diff: the new module, its `lib.rs` registration, the deleted
 
 See ADR 0061's "Rung J, PR 5" amendment and `docs/roadmap.md`'s C-10 entry
 for the full record.
+
+## Appendix — `tests/console_table_config.rs`'s GSI-DDL residue closed (ADR 0061 rung J, C-10 PR 6, 2026-09-09)
+
+Closes the three-test residue PR 2's own groundwork left behind in
+`console_table_config.rs` — blocker (d) (`UpdateTable` with an index change
+had no `dispatch_table_op` sub-arm) was already closed by PR 2's `(None,
+Some(update), None)` arm, so `GenericConsoleBackend::add_gsi`/`drop_gsi`
+(generic since C-08 PR 2, previously dead-ending in `unsupported_by_generic_
+dispatch`) now reach the real `create_index`/`drop_index` path with **no
+`lib.rs`/`console.rs`/`dynamo.rs` change at all** — pure test authorship on
+top of a product change two PRs prior. `add_gsi_rejects_an_unknown_
+attribute_type`, `add_gsi_records_a_declared_attribute_type`, and
+`add_and_drop_gsi_round_trip` converted one-to-one (same names) into
+`sim_cluster_console_table_config.rs`'s (6), (7), (8), each pinned-seed plus
+its `_over_seeds` sibling (6 new `#[test]` fns total). The first is pure
+client-side validation (`console_add_gsi_payload`'s own type check fails
+before any `UpdateTable` is built, so it never reaches dispatch and needs no
+backfill machinery); the second needs no convergence either (its assertions
+never read a `status`/`Backfilling` field). Only the third round-trips a
+populated table's GSI through `CREATING` → `ACTIVE`, so it gained a small
+`converge_gsi_active_via_console` helper — `sim_cluster_index_ddl.rs::
+converge_gsi_active`'s own shape, duplicated per this crate's per-file-
+fixture convention rather than shared, driving `SimCluster::drive_backfill_
+seed`/`drain_gsi` on the table's tablet leader (`sim_cluster_console.rs::
+leader_of_table`) in a bounded loop of further console `GET`s (never a
+single call assumed to finish a populated table's backfill in one pass) —
+through the console's own `GET /console/api/tables/{name}` rather than
+`DescribeTable`, since the console surface is what this module tests.
+`tests/console_table_config.rs` trimmed to its one remaining test,
+`table_detail_shows_pitr_status_and_backups` (`UpdateContinuousBackups` has
+no generic-dispatch arm, and the test also needs the real `pitr_snapshot_
+loop`'s wall-clock-timed capture driver) — no helper removed, since all four
+(`dynamo`/`console`/`json`/`assert_no_cluster_shape`) are still used by that
+one test.
+
+**No product bug found; no `console.rs`/`dynamo.rs`/`sim_cluster.rs` change
+needed.** Every scenario's wire-level shape (response JSON keys, status
+codes, the `{"gsi": ...}`/`{"ok": true}` wrapping) was cross-checked against
+`animus-node/src/console.rs`'s `table_api_response`/`wrap_json`/`ok_json`
+and `GsiDetail`'s field list before being written, matching the original
+`tests/console_table_config.rs` bodies verbatim (this PR could not itself
+run `cargo test` — see this crate's own engineering-lessons entry on
+verifying `SimCluster` fixture code by reading the production dispatch path
+it drives rather than by compiling it). `docs/roadmap.md`'s C-10 entry and
+this file's own residual-inventory paragraph above are updated to match:
+`console_table_config.rs` is down to 1 kept test (was 4).
+
+**Gates, run in the main tree after rebase**: `cargo build -p animusd
+--tests`, `cargo fmt --all --check`, and `cargo clippy -p animusd
+--all-targets --all-features -- -D warnings` all clean with no fixes
+needed against this module as authored. `sim_cluster_console_table_
+config`'s own 16 tests (10 pre-existing + these 6 new) and the trimmed
+`console_table_config.rs`'s 1 residual test both passed. The whole
+`sim_cluster` tier passed 468/468 (2 ignored, 0 failed — the expected
+462 + 6), peak RSS ~970 MB. See ADR 0061's matching "Rung J, PR 6
+landed" amendment for the full gate record.
