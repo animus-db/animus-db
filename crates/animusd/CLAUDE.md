@@ -6575,7 +6575,11 @@ admin/console/dashboard HTTP (10/66 — 67 by an exact `grep -c
 decommission (9/34), Transact (6/32), index DDL beyond plain `CreateTable`
 (9/30), backup/PITR/export/import (6/29), Streams (3/28, owned by C-07
 (ADR 0061 rung G) as of 2026-09-08), control/data
-role split (5/21), reconciler-driven split/rebalance/GC (7/13), TTL
+role split (5/21, **owned** by C-12/ADR 0061 rung L, **open** as of
+2026-09-09 — this figure is superseded there by a fuller grep-verified
+inventory, 16 files across converts/deferred/permanent; see
+`docs/roadmap.md`'s C-12 entry), reconciler-driven split/rebalance/GC
+(7/13), TTL
 (1/9, **owned and closed** by C-09/ADR 0061 rung I as of 2026-09-09 — see
 `docs/roadmap.md`'s C-09 entry), node
 assembly/raw `ClientRequest` (2/8), throttle metric counters
@@ -6605,10 +6609,10 @@ converted from `console_table_config.rs`, file trimmed to its 1 out-of-scope
 PITR test; docs close-out — see `docs/roadmap.md`'s C-10 entry and this
 file's own "index DDL beyond plain `CreateTable` under SimCluster" appendix
 below for the grep-verified ground truth and the full per-PR record);
-the control/data role split is C-12's own scope (candidate as of
-2026-09-09, per this file's own consolidated "throttle-metric counters
-under SimCluster" appendix — plan drafted, awaiting the maintainer's
-sequencing, not yet opened); `--config` bring-up and node assembly remain
+the control/data role split is C-12's own scope, **open** as of 2026-09-09
+under ADR 0061's "Rung L (post-C-11)" amendment — see `docs/roadmap.md`'s
+C-12 entry and this file's own consolidated "throttle-metric counters
+under SimCluster" appendix; `--config` bring-up and node assembly remain
 unowned by any planned rung, flagged for an assess-and-close decision
 rather than a rung, per the same appendix; (E) frozen behind an open flake
 issue, 7 files/32 tests (#298, #418, #592, #601, #610, #619/#622, #627) —

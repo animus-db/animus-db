@@ -1144,35 +1144,59 @@ the still-true paragraph after the table.
 
 ---
 
-### C-12 control/data role split `SimCluster` dispatch
+### C-12 control/data role split SimCluster dispatch
 
-- **Problem:** `SimCluster` builds every node identically — both control
-  and data roles on each — so the deployment shapes `animusd` actually
-  supports in production (control-only, data-only, and a mix of the two
-  per ADR 0035) have no in-process fixture analog. This is the one
-  remaining post-C-10 unowned group with a genuine `SimCluster` capability
-  gap behind it (as opposed to a process-boundary residue): 5 files/21
-  tests per the D3-closing class-D breakdown, unchanged since. Rung K's
-  own close-out (ADR 0061) names it the natural next candidate.
-- **What:** not yet scoped in detail — a plan has been informally drafted
-  during rung K's own residual-inventory work (control/data role split as
-  a per-node fixture concept), noting that `SimCluster::grow("data")`
-  already carries a data-only-node primitive with its own sim
-  metadata-mirror loop, which may be reusable groundwork rather than a
-  from-scratch build. No `dynamo.rs`/`sim_cluster.rs` grep-verified ground
-  truth has been produced yet — that is this candidate's own opener PR's
-  job, following the same widen-then-scope template every rung since D3
-  has used.
-- **ADR:** [0061](adr/0061-testability-node-crate-simulator.md) (rung K's
-  own close-out names this candidate; no rung opened for it yet).
-- **Size:** not yet sized — likely M or L given the new fixture primitive
-  needed, larger than any of C-09/C-10/C-11.
+- **Problem:** the control/data role split (ADR 0035 — `NodeRole::
+  {Control, Data, Both}`) is the one group named, unclaimed, in every
+  "what remains unowned" list since C-08's own close-out; C-11's own
+  opener names it again, explicitly, as the one remaining group needing a
+  genuinely new `SimCluster` deployment-shape fixture rather than a
+  dispatch-arm widening. 16 real-socket files touch it: 8 convert here
+  (35 tests), 4 defer to a follow-on seed/join rung (9 tests), and 4 plus
+  a separately-tracked group are assessed and closed as permanent
+  `ProdEnv` residue in this rung's own close-out (6 tests here, plus the
+  already-named 2-file/8-test node-assembly/raw-`ClientRequest` group).
+- **What:** production already has the whole role split —
+  `NodeRole::{Control, Data, Both}` (`config.rs:74`), the three real
+  assemblies (`Node::start_with`/`BoundControlNode::start_control_with`/
+  `BoundDataNode::start_data_with`, `lib.rs:4886`/`:6421`/`:6814`), and
+  `ControlHandle<E, R>::{Local, Remote}` + `RemoteControlClient<R>`
+  (`animus-node/src/control_handle.rs:92`/`:146`) — all already generic,
+  zero production widening needed. `SimCluster::grow("data")`
+  (`sim_cluster.rs:3530`) already builds a genuine data-only node (a real
+  `ControlHandle::Remote`, a real reconciler, and a `SimEnv`-native
+  `spawn_remote_mirror_sync_loop`, `:349`) — the data-only half in
+  miniature, though it bypasses the ADR 0030/0032 join dance via direct
+  self-registration, which is why the seed/join files defer. What's
+  missing is a **control-only** node variant in `SimCluster` (no
+  `DataRole`, no reconciler/janitors/mirror loop) and per-node role
+  tracking through `restart`/`crash` — `restart` (`sim_cluster.rs:3251`)
+  unconditionally rebuilds a fresh `Local` `RaftNode` and, by its own
+  pre-existing doc comment (rung D4 PR 4), is already documented as
+  panicking on a grown node's index rather than restarting it; `crash`
+  needs no change (already role-agnostic). See
+  [ADR 0061](adr/0061-testability-node-crate-simulator.md)'s 2026-09-09
+  "Rung L (post-C-11)" amendment for the full grep-verified ground truth,
+  file/line anchors, the per-file test-disposition tables, and the
+  6-7 PR plan with gates.
+- **ADR:** [0061](adr/0061-testability-node-crate-simulator.md) (rung L,
+  open), [0035](adr/0035-control-plane-separate-deployment.md) (the role-split deployment
+  shapes themselves).
+- **Size:** L, 6-7 PRs — PR 1 this docs opener; PR 2 control-only nodes +
+  role-aware `restart`/`crash` in `SimCluster`; PR 3 data-only nodes
+  first-class at `SimCluster::new` (not only via `grow`), `restart`
+  rebuilding the `Remote` handle + mirror loop for one; PR 4a
+  `sim_cluster_control_data_split.rs` (`control_only.rs`/`data_only.rs`/
+  `cluster_split.rs`/`control_membership_admin.rs`'s 11 convertible
+  tests, 22 tests, three files deleted whole); PR 4b `split_cluster.rs`
+  (8 tests, deleted whole); PR 4c the four role-named console/dashboard
+  tests (`console_endpoint.rs`/`dashboard_endpoint.rs`, 2 each); PR 4d
+  the stream-janitor role test (`stream_janitor.rs`, 1 test); PR 5 docs
+  close-out.
 - **Depends:** C-11 (closed) — the next unowned residual group per C-08's,
   C-09's, C-10's, and C-11's own close-outs.
-- **Status (2026-09-09):** candidate — plan drafted, awaiting the
-  maintainer's sequencing. Not opened; no PRs.
-
----
+- **Status (2026-09-09):** open — PR 1 (this docs opener) landed. PRs 2-5
+  not yet started.
 
 ## 4. Operator surfaces: admin API, dashboard, console, CLI
 
@@ -1254,6 +1278,7 @@ wave are independent and can run in parallel.
 | 10 | C-09 (closed 2026-09-09 — all six PRs landed: #780, #782, #785, #786, #787, plus PR 6) | Gated on C-08 (closed) — C-08's own close-out recommendation, stacked directly on it |
 | 11 | C-10 (closed 2026-09-09 — all seven PRs landed: #789, #790, #791, #792, #793, #794, plus PR 7) | Gated on C-09 (closed) — the next unowned residual group per C-08's and C-09's own close-outs |
 | 12 | C-11 (closed 2026-09-09 — all four PRs landed: #796, #797, #799, plus PR 4) | Gated on C-10 (closed) — the next unowned residual group per C-08's, C-09's, and C-10's own close-outs; proceeded without an explicit maintainer sequencing instruction, per Rung J's own close-out recommendation (see the C-11 entry's own note) |
+| 13 | C-12 (open, PR 1 landed 2026-09-09 — this docs opener: the rung-table row L and its amendment, this roadmap entry, and `crates/animusd/CLAUDE.md`'s residual-inventory pointer; PRs 2-5 not yet started): control/data role split under `SimCluster`, taken up per Rung K's own close-out recommendation | Gated on C-11 (closed) — the next unowned residual group per C-08's, C-09's, C-10's, and C-11's own close-outs |
 
 Open issues mapped: none left (#375 closed by W-01, #319 by W-05). Filed
 from wave 2's own findings: #590 (the operator still emits the deleted
