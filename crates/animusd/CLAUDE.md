@@ -10217,3 +10217,144 @@ not "well under" with a wide margin given the finding above; a slower CI
 runner narrows that margin further, a residual risk this fix does not
 fully close); `cargo test -p animusd --test index_backfill --test
 dynamo_ttl` (4 passed). `Cargo.lock` unchanged throughout.
+
+## Appendix — issue #772 closed: the dominant cost (an unquiesced CP-data group + a fixed-budget probe helper) found and fixed, `ANIMUS_DYNAMO_WIRE_SEEDS=25` from 26:56 to 77.6s (2026-09-09, PR 2/2)
+
+The appendix above closed the acute symptom and explicitly declined to
+chase the stale ~601s D2 PR 2 baseline, naming the real cost ("real
+per-tablet/control-plane Raft consensus traffic accumulated across the
+large cumulative virtual time this fixture's own `spawn_and_capture`
+design burns") but leaving it as out of scope. This PR closes that gap.
+
+**Bisect.** Depth-1 wall time (`ANIMUS_DYNAMO_WIRE_SEEDS` unset, 8
+scenarios) at each candidate commit between the stale `12e46df5` baseline
+and this PR's own base found ONE commit responsible for essentially the
+whole regression: `eef8a102` (C-06 PR 4, "Transact ops in the corpus"),
+22.77s → 71.52s — a jump bigger than every other candidate's own
+contribution combined. `5d80de25` (D4 PR 1's real-`Reconciler` hosting
+cutover — the single biggest architectural change in the whole range)
+moved depth-1 wall time by under 4% on its own, ruled out by direct
+measurement rather than by the "surely the bigger rewrite is the culprit"
+intuition that motivated checking it first. See `docs/adr/0061-
+testability-node-crate-simulator.md`'s matching amendment for the full
+per-commit table.
+
+**Mechanism, counter-verified (`Simulator::stats()`, not read-and-
+assumed).** `run_transact_probe` (added by `eef8a102`) issues ~11
+sequential `SimCluster::dynamo` calls per node; a tokened
+`TransactWriteItems` among them auto-provisions the internal
+`__animus_txn_idempotency` table — a brand-new CP-data tablet group that,
+since `SimCluster` never called `RaftKvNode::enable_quiescence` at all
+before this PR, keeps ticking its own Raft heartbeat/election-timeout
+machinery for the rest of the scenario's virtual-time span, on top of
+every *pre-existing* group paying the identical cost for the full 12s
+(`OP_BUDGET`) of every one of this corpus's dozens of synchronous probe
+calls per scenario, whether or not that call ever touches it. Per-phase
+`Simulator::stats()` deltas on `dynamowire_baseline` pinned the shape
+directly: `run_delete_probe` alone (4 calls/node) added ~13.8K task_polls
+even with quiescence already active and `quiesce_after` narrowed to 1s —
+proving the floor cost per call comes from something quiescence cannot
+touch (the control plane's own 50ms `RaftCore::heartbeat_interval`,
+"the control plane never quiesces," ADR 0044 phase-1 fork G), not from
+the quiesce-after window's own length; narrowing that window from 5s to
+1s moved total cost by only ~5.6%, a second measured confirmation before
+committing to the real fix.
+
+**Two independent, additive fixes, entirely inside the `#[cfg(test)]`
+`SimCluster` fixture — zero production code changed (verified: both
+edited files, `sim_cluster.rs`/`sim_cluster_dynamo_corpus.rs`, are
+`#[cfg(test)] mod`s in `lib.rs`; `git diff` touches only these two files
+plus documentation):**
+
+1. **`SimCluster::new_with_cp_quiescence`** — a new constructor sibling of
+   `new`/`new_with_segment_janitor_retention`, opting every node's
+   `Reconciler` into ADR 0048 quiescence (`enable_quiescence(after)`)
+   right after construction, before any tablet is hosted — the only point
+   this fixture can call it at all, since by the time `SimCluster::new`
+   returns every reconciler has already been moved into its own driving
+   task. `run_scenario` opts in at production's own default,
+   `DEFAULT_QUIESCE_AFTER_SECS` (5s). Threaded through `restart`/`grow`
+   too (a new `cp_quiesce_after: Option<Duration>` field, mirroring
+   `segment_janitor_retention`'s own "stored so a restarted node's fresh
+   loop gets re-opted-in" precedent) — a restarted node's freshly built
+   `Reconciler` needs the identical opt-in its `Simulator::stop`-dropped
+   predecessor had, or it silently reverts to permanently unquiesced.
+   Isolated contribution: ~24% of `dynamowire_baseline`'s own cost.
+2. **`SimCluster::spawn_and_capture_fast`/`SimCluster::dynamo_fast`** —
+   returns the instant its op resolves instead of always burning the full
+   `OP_BUDGET` (12s), polling in 100ms (`SPAWN_CAPTURE_FAST_STEP`)
+   increments. Used ONLY by this corpus's own `run_delete_probe`/`run_
+   batch_write_probe`/`run_transact_probe`/`force_resolve_all_keys` —
+   **never** the shared `SimCluster::dynamo`/`put`/`get`/`scan` every
+   other `sim_cluster_*` module in this crate still calls unchanged. This
+   is the dominant lever: combined with quiescence, `dynamowire_baseline`
+   fell from 785,745 → 34,681 task_polls, a ~22.7x reduction.
+
+**Why not change `spawn_and_capture` itself — a real, checked dependency,
+not a hypothetical one.** `sim_cluster_dynamo_update_table.rs`'s own
+`update_table_raising_units_admits_more` relies on every `SimCluster::
+dynamo` call unconditionally advancing virtual time by `OP_BUDGET` so a
+`ThrottleBucket` has genuinely refilled by the next retry attempt, with no
+explicit sleep between attempts (that test's own doc comment states this
+explicitly). Changing the shared method would have silently broken that
+(and possibly other, unaudited) reliance across the ~30 sibling
+`sim_cluster_*` modules built on it. The fix is additive instead — a
+second, narrower mechanism, opt-in per call site, touching only the four
+functions that genuinely have no dependency on the shared method's own
+timing contract.
+
+**A second, independent bug this fix's own gate run surfaced — a corpus
+measurement race, not a system defect.** At `ANIMUS_DYNAMO_WIRE_SEEDS=25`,
+`dynamowire_forward_heavy`'s own `non_hosting_ok_writes > 0` non-vacuity
+check failed at a specific seed, deterministically, reproducing under
+`--test-threads=1` and with quiescence fully disabled — ruling out
+cross-test-thread interference and quiescence's own timing before looking
+anywhere else. Root cause: this cell's own randomized workload can draw a
+tokened `TransactWriteItems`, auto-provisioning the idempotency table and
+— via ADR 0029's own add-then-remove migration sequence — leaving the
+corpus's modeled tablet's `live_replicas()` snapshot showing one MORE
+member than its configured replication factor for as long as that
+migration is still converging. Reading that snapshot mid-migration
+narrows the "non-hosting" node set from 2-of-4 down to 1-of-4, which for
+one seed's own random draws undercounted a write the sole remaining
+non-hosting node had genuinely already gotten acknowledged — a
+measurement race in the corpus's own checking methodology (`dynamo_fast`'s
+own speed-up removed several seconds of incidental "grace time" this
+snapshot used to get for free from the old `dynamo`'s unconditional
+`OP_BUDGET` burn), not a forwarding defect. Fixed by polling (bounded,
+converged-or-timeout — the identical `CONVERGENCE_POLL_STEP`/
+`CONVERGENCE_BUDGET` idiom this same function already uses for its
+durability/convergence checks, never a fixed-deadline one-shot read) until
+the replica count genuinely settles back to the tablet's own configured
+replication factor before computing `non_hosting_ok_writes`. See `docs/
+engineering-lessons.md`'s matching entry for the general lesson.
+
+**Result**: `SCENARIO_TIMER_FIRES_BUDGET` tightened from 3,300,000 to
+110,000 (~2.1x headroom over the new measured maximum, `two_tables` at
+52,273 timer fires/scenario — every other cell at or below `forward_
+heavy`'s own 50,378; see that constant's own doc for the full per-cell
+table). `ANIMUS_DYNAMO_WIRE_SEEDS=25 cargo test -p animusd --lib
+sim_cluster_dynamo_corpus -- --nocapture`: **200/200 scenarios, test
+result: ok, 3 passed, 0 failed, 1 ignored, 77.6s wall** — down from 26:56
+(a ~21x reduction) and well under the stale ~601s D2 PR 2 baseline the
+prior appendix declined to chase (~5.2x faster than that baseline too).
+`cargo test -p animusd --lib sim_cluster -- --test-threads=2`: **480
+passed, 0 failed, 2 ignored** — the exact pre-fix baseline count, zero
+coverage change.
+
+**Production behavior unchanged**: every edit is inside `crates/animusd/
+src/sim_cluster.rs`/`sim_cluster_dynamo_corpus.rs`, both declared
+`#[cfg(test)]` in `lib.rs` — no production code path exists in either
+file. `SimCluster::new`/`new_with_segment_janitor_retention` (the
+constructors every other `sim_cluster_*` module calls) are byte-for-byte
+behaviorally unchanged — `new_with_cp_quiescence` is a new, additive
+sibling reaching the identical inner constructor with `cp_quiesce_after:
+None` on every other call path.
+
+**Gates**: `cargo check -p animusd --all-targets` (clean, checkpoint
+commit/push); `cargo fmt --all --check` (clean); `cargo clippy --workspace
+--all-targets --all-features -- -D warnings` (clean); `cargo test -p
+animusd --lib sim_cluster -- --test-threads=2` (480 passed, 0 failed, 2
+ignored, unchanged baseline); `ANIMUS_DYNAMO_WIRE_SEEDS=25 cargo test -p
+animusd --lib sim_cluster_dynamo_corpus -- --nocapture` (200/200, 77.6s
+wall, run twice for determinism); `Cargo.lock` unchanged.

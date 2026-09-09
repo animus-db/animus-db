@@ -223,6 +223,18 @@ const OP_BUDGET: Duration = Duration::from_secs(12);
 /// of every always-on loop this fixture spawns moves with it.
 const SIM_FALLBACK_TICK: Duration = Duration::from_millis(1000);
 
+/// The poll granularity [`SimCluster::spawn_and_capture_fast`] steps
+/// virtual time in while waiting for its future to resolve — small enough
+/// that a genuinely fast op (the overwhelming common case: no fault
+/// active, one small write/read) is detected and returned well before any
+/// meaningful amount of control-plane heartbeat traffic accumulates
+/// (`RaftCore::heartbeat_interval` = 50ms, `animus-control/src/raft.rs`),
+/// large enough that a call which genuinely needs the whole `OP_BUDGET`
+/// (a real timeout) doesn't pay excessive polling-loop overhead getting
+/// there (`OP_BUDGET / SPAWN_CAPTURE_FAST_STEP` = 120 iterations, worst
+/// case).
+const SPAWN_CAPTURE_FAST_STEP: Duration = Duration::from_millis(100);
+
 /// The fallback poll interval each node's own [`spawn_reconciler_loop`]
 /// falls back to when no `metadata_watch()` wake fires — mirrors
 /// `animusd::RECONCILE_FALLBACK_INTERVAL`'s event-driven-with-fallback
@@ -1267,6 +1279,17 @@ pub(crate) struct SimCluster {
     /// original shape rather than unconditionally forcing a combined one —
     /// see that method's own doc.
     roles: Vec<NodeRole>,
+    /// The CP-data quiescence (ADR 0048) threshold every node's own
+    /// `Reconciler` was opted into at construction, if any — see
+    /// [`SimCluster::new_with_cp_quiescence`]'s own doc for why this is a
+    /// constructor-only knob (unlike `auto_split`'s own post-construction
+    /// setter) and [`SimCluster::restart`]/[`SimCluster::grow`] for why it
+    /// still needs to be stored: a restarted/grown node's fresh
+    /// `Reconciler` must be opted in again with the SAME threshold, exactly
+    /// like `segment_janitor_retention` above. `None` (every caller except
+    /// `new_with_cp_quiescence`) means every CP-data group in this cluster
+    /// stays permanently unquiesced — today's behavior, unchanged.
+    cp_quiesce_after: Option<Duration>,
 }
 
 /// Breaks the `Simulator`/`SimEnv` reference cycle (`animus_sim::Simulator::
@@ -1409,10 +1432,44 @@ impl SimCluster {
         )
     }
 
+    /// [`SimCluster::new`]'s own sibling for a scenario that needs CP-data
+    /// tablet-group quiescence (ADR 0048) opted in from the very first
+    /// tick. This has to be a constructor-time knob rather than a post-
+    /// construction setter the way [`SimCluster::set_auto_split_thresholds`]
+    /// is: by the time `SimCluster::new` returns, every node's own
+    /// `Reconciler` has already been moved into its driving task
+    /// ([`spawn_reconciler_loop`]), so there is no live `&mut Reconciler`
+    /// left to call `enable_quiescence` on afterward. Builds every node
+    /// `NodeRole::Both`, mirroring [`SimCluster::new`]'s own default — a
+    /// scenario that needs both a non-`Both` role mix AND quiescence calls
+    /// [`SimCluster::new_with_roles_and_segment_janitor_retention_and_cp_quiescence`]
+    /// directly. `cp_quiesce_after: None` (every existing caller, via
+    /// [`SimCluster::new`]/[`SimCluster::new_with_segment_janitor_retention`]/
+    /// [`SimCluster::new_with_roles`]) is byte-for-byte today's behavior —
+    /// every CP-data group stays permanently unquiesced, exactly as before
+    /// this knob existed.
+    pub(crate) fn new_with_cp_quiescence(
+        seed: u64,
+        nodes: usize,
+        replication: usize,
+        cp_quiesce_after: Option<Duration>,
+    ) -> Self {
+        Self::new_with_roles_and_segment_janitor_retention_and_cp_quiescence(
+            seed,
+            &vec![NodeRole::Both; nodes],
+            replication,
+            DEFAULT_SIM_SEGMENT_JANITOR_RETENTION,
+            cp_quiesce_after,
+        )
+    }
+
     /// [`SimCluster::new_with_roles`]'s own sibling exposing the segment-
-    /// janitor retention knob — the actual constructor every other `new*`
-    /// method above delegates to. See each field/role-conditional's own
-    /// comment below for what a [`NodeRole::Control`] node does and does not
+    /// janitor retention knob — a thin, behavior-preserving wrapper
+    /// (`cp_quiesce_after: None`) over [`SimCluster::new_with_roles_and_
+    /// segment_janitor_retention_and_cp_quiescence`], the actual constructor
+    /// every other `new*` method above ultimately delegates to. See that
+    /// method's own doc, and each field/role-conditional's own comment
+    /// below it, for what a [`NodeRole::Control`] node does and does not
     /// get, mirroring `BoundControlNode::start_control_with`'s production
     /// shape (`crates/animusd/src/lib.rs`) as closely as this fixture's
     /// existing per-node loop set allows — see `crates/animusd/CLAUDE.md`'s
@@ -1423,6 +1480,34 @@ impl SimCluster {
         roles: &[NodeRole],
         replication: usize,
         segment_janitor_retention: Duration,
+    ) -> Self {
+        Self::new_with_roles_and_segment_janitor_retention_and_cp_quiescence(
+            seed,
+            roles,
+            replication,
+            segment_janitor_retention,
+            None,
+        )
+    }
+
+    /// The actual constructor every other `new*` method above delegates to
+    /// (directly or through [`SimCluster::new_with_roles_and_segment_
+    /// janitor_retention`]) — [`SimCluster::new_with_cp_quiescence`]'s own
+    /// CP-data quiescence (ADR 0048) opt-in (ADR 0061 rung I C-09 PR 3's
+    /// follow-on, #772 2/2, 2026-09-09) threaded through the SAME
+    /// role-aware workhorse [`SimCluster::new_with_roles`] already builds
+    /// every node's `Reconciler` at, rather than two independently-forking
+    /// constructor trees (role mix vs. quiescence opt-in) that would need
+    /// to be kept in sync by hand. `cp_quiesce_after: None` (every caller
+    /// except `new_with_cp_quiescence`) is a no-op, byte-for-byte today's
+    /// behavior. See each field/role-conditional's own comment below for
+    /// what a [`NodeRole::Control`] node does and does not get.
+    pub(crate) fn new_with_roles_and_segment_janitor_retention_and_cp_quiescence(
+        seed: u64,
+        roles: &[NodeRole],
+        replication: usize,
+        segment_janitor_retention: Duration,
+        cp_quiesce_after: Option<Duration>,
     ) -> Self {
         let nodes = roles.len();
         assert!(nodes >= 1, "a cluster needs at least one node");
@@ -1826,12 +1911,24 @@ impl SimCluster {
             if !roles[i].has_data() {
                 continue;
             }
-            let reconciler = build_reconciler(
+            let mut reconciler = build_reconciler(
                 ctxs[i].env.clone(),
                 engines[i].clone(),
                 id.clone(),
                 ctxs[i].edge.clone(),
             );
+            // Opt into CP-data quiescence (ADR 0048) BEFORE this node's
+            // reconciler ever hosts anything — see `enable_quiescence`'s own
+            // doc (`animus-cp-data::host::Reconciler`) for why this has to
+            // happen before the first tablet is hosted, and
+            // `SimCluster::new_with_cp_quiescence`'s own doc for why this
+            // constructor-time call site is the only place this fixture can
+            // make it. `cp_quiesce_after: None` (every caller except
+            // `new_with_cp_quiescence`) makes this a no-op, byte-for-byte
+            // today's behavior.
+            if let Some(after) = cp_quiesce_after {
+                reconciler.enable_quiescence(after);
+            }
             spawn_reconciler_loop(ctxs[i].clone(), reconciler);
         }
 
@@ -1960,6 +2057,7 @@ impl SimCluster {
             segment_store,
             segment_janitor_retention,
             roles: roles.to_vec(),
+            cp_quiesce_after,
         };
         // Let the control group elect before any caller touches it —
         // generous for up to a handful of voters under `SimEnv`'s
@@ -2767,6 +2865,89 @@ impl SimCluster {
         slot.lock().expect("result slot poisoned").take()
     }
 
+    /// [`SimCluster::spawn_and_capture`]'s early-returning sibling — same
+    /// spawn/capture shape, same `Some(T)`-once-resolved/`None`-on-timeout
+    /// contract, but polls in [`SPAWN_CAPTURE_FAST_STEP`] increments and
+    /// stops the INSTANT the result slot is populated, rather than always
+    /// burning the full [`OP_BUDGET`] window regardless of how quickly `fut`
+    /// resolved.
+    ///
+    /// **Why this exists, and why it is a SEPARATE method rather than a
+    /// change to `spawn_and_capture` itself (this corpus's own C-06 PR 4
+    /// investigation, see `SCENARIO_TIMER_FIRES_BUDGET`'s own doc in
+    /// `sim_cluster_dynamo_corpus.rs`).** `spawn_and_capture`'s own "always
+    /// burn the full budget" shape is load-bearing for at least one other
+    /// consumer: `sim_cluster_dynamo_update_table.rs`'s own
+    /// `update_table_raising_units_admits_more` relies on every
+    /// `SimCluster::dynamo` call unconditionally advancing the cluster's
+    /// virtual clock by `OP_BUDGET` so a `ThrottleBucket` has genuinely
+    /// refilled by the time the next retry attempt runs, with no explicit
+    /// `run_for`/sleep of its own between attempts — changing
+    /// `spawn_and_capture` itself would silently break that (and
+    /// potentially other, unaudited) reliance across the ~30 sibling
+    /// `sim_cluster_*` modules built on it. This method is instead
+    /// **additive** — every existing `SimCluster::dynamo`/`put`/`get`/
+    /// `scan`/… caller is completely unaffected, byte-for-byte — and is
+    /// used only by [`SimCluster::dynamo_fast`], which only this corpus's
+    /// own probe/verification helpers
+    /// (`run_delete_probe`/`run_batch_write_probe`/`run_transact_probe`/
+    /// `force_resolve_all_keys`) call: each issues MANY sequential ops back
+    /// to back with no dependency on the full-budget virtual-time advance
+    /// (nothing in any of those four functions relies on OP_BUDGET as an
+    /// implicit clock — every wait they need is either the op's own
+    /// resolution or an explicit assertion against its response).
+    ///
+    /// **Why this is the real root cause of this corpus's own executor-cost
+    /// regression, not a workaround.** `SimCluster::new_with_cp_quiescence`
+    /// (`SimCluster::new`'s own doc) closes the "an idle CP-data tablet
+    /// group keeps ticking its own Raft heartbeat/election-timeout
+    /// machinery for the group's whole remaining lifetime" waste, but does
+    /// NOT touch the CONTROL plane's own `RaftCore` (ADR 0044 phase-1 fork
+    /// G: "the control plane never quiesces," by design — `animus-control`'s
+    /// `heartbeat_loop` and every control voter's own consensus loop keep
+    /// ticking at `RaftCore::heartbeat_interval` = 50ms regardless). A
+    /// `spawn_and_capture`-driven call that blindly runs the full 12s
+    /// `OP_BUDGET` after its own op already resolved (typically within a
+    /// small fraction of a second of virtual time for an ordinary
+    /// successful op) pays ~240 rounds of control-plane heartbeat traffic
+    /// it has no reason to pay — measured directly (`Simulator::stats()`)
+    /// on `dynamowire_baseline`: quiescence alone cut this corpus's own
+    /// executor cost by ~24%, and narrowing `quiesce_after` from
+    /// production's 5s default down toward the floor barely moved it
+    /// further (~5%) — proving the REMAINING cost was never really about
+    /// CP-data quiescence timing at all, but about every probe call
+    /// continuing to burn virtual time it had already stopped needing.
+    /// `dynamo_fast` closes that: measured together with quiescence, the
+    /// combination cuts this corpus's own `dynamowire_baseline` executor
+    /// cost by well over half relative to the pre-fix (`SimCluster::new`)
+    /// baseline — see `SCENARIO_TIMER_FIRES_BUDGET`'s own doc for the exact
+    /// before/after numbers this fix was measured against.
+    fn spawn_and_capture_fast<T, F>(&mut self, node: u64, fut: F) -> Option<T>
+    where
+        T: Send + 'static,
+        F: std::future::Future<Output = T> + Send + 'static,
+    {
+        let env = self.shared.env(node);
+        let slot: Arc<Mutex<Option<T>>> = Arc::new(Mutex::new(None));
+        let out = slot.clone();
+        env.spawn_task(async move {
+            let result = fut.await;
+            *out.lock().expect("result slot poisoned") = Some(result);
+        });
+        let mut remaining = OP_BUDGET;
+        loop {
+            let step = remaining.min(SPAWN_CAPTURE_FAST_STEP);
+            self.sim.run_for(step);
+            if let Some(result) = slot.lock().expect("result slot poisoned").take() {
+                return Some(result);
+            }
+            remaining = remaining.saturating_sub(step);
+            if remaining.is_zero() {
+                return None;
+            }
+        }
+    }
+
     /// Write `value` at `(pk, sk)` in `table`, issued from `node`'s own
     /// `ClientCtx` — the real `cp_kind_write_raw` route → propose →
     /// confirm loop, forwarded over the real `SimRelayClient` wire when
@@ -2903,6 +3084,29 @@ impl SimCluster {
         let handle = self.shared.clone();
         let (target, body) = (target.to_owned(), body.to_vec());
         self.spawn_and_capture(
+            node,
+            async move { handle.dynamo(node, &target, &body).await },
+        )
+        .unwrap_or_else(|| {
+            (
+                500,
+                format!("dynamo request on node {node} did not complete within {OP_BUDGET:?}"),
+            )
+        })
+    }
+
+    /// [`SimCluster::dynamo`]'s early-returning sibling — same request/
+    /// response shape, same timeout contract, but driven through
+    /// [`SimCluster::spawn_and_capture_fast`] instead of
+    /// [`SimCluster::spawn_and_capture`] — see that method's own doc for
+    /// why this exists as a separate method and who calls it (this
+    /// corpus's own `run_delete_probe`/`run_batch_write_probe`/
+    /// `run_transact_probe`/`force_resolve_all_keys`, never anything
+    /// outside `sim_cluster_dynamo_corpus.rs`).
+    pub(crate) fn dynamo_fast(&mut self, node: u64, target: &str, body: &[u8]) -> (u16, String) {
+        let handle = self.shared.clone();
+        let (target, body) = (target.to_owned(), body.to_vec());
+        self.spawn_and_capture_fast(
             node,
             async move { handle.dynamo(node, &target, &body).await },
         )
@@ -3817,12 +4021,21 @@ impl SimCluster {
             // node — mirroring `new_with_roles`'s own construction-time
             // gate (see that method's identical comment for why).
             if role.has_data() {
-                let reconciler = build_reconciler(
+                let mut reconciler = build_reconciler(
                     ctx.env.clone(),
                     self.engines[node as usize].clone(),
                     id.clone(),
                     ctx.edge.clone(),
                 );
+                // Respawned after `Simulator::stop` dropped the old one —
+                // re-opt into CP-data quiescence with the SAME threshold
+                // this cluster was built with, mirroring
+                // `segment_janitor_retention`'s own respawn below. A no-op
+                // when this cluster never called `new_with_cp_quiescence`
+                // (`self.cp_quiesce_after` is `None`).
+                if let Some(after) = self.cp_quiesce_after {
+                    reconciler.enable_quiescence(after);
+                }
                 spawn_reconciler_loop(ctx.clone(), reconciler);
             }
 
@@ -3920,12 +4133,20 @@ impl SimCluster {
                 ctx.edge.unregister_raftkv(tablet, id.clone());
             }
 
-            let reconciler = build_reconciler(
+            let mut reconciler = build_reconciler(
                 ctx.env.clone(),
                 self.engines[node as usize].clone(),
                 id.clone(),
                 ctx.edge.clone(),
             );
+            // Re-opt into CP-data quiescence with the SAME threshold this
+            // cluster was built with — mirroring the control-bearing
+            // branch's own identical respawn above (`self.cp_quiesce_after`
+            // is `None`, a no-op, unless this cluster called
+            // `new_with_cp_quiescence`).
+            if let Some(after) = self.cp_quiesce_after {
+                reconciler.enable_quiescence(after);
+            }
             spawn_reconciler_loop(ctx.clone(), reconciler);
 
             let heartbeat_env = self.sim.env(id.clone());
@@ -4287,13 +4508,18 @@ impl SimCluster {
         ));
 
         // The real per-node tablet-host reconciler — identical construction
-        // to `SimCluster::new`/`restart`.
-        let reconciler = build_reconciler(
+        // to `SimCluster::new`/`restart`, including the same CP-data
+        // quiescence opt-in (`self.cp_quiesce_after`) if this cluster was
+        // built with `new_with_cp_quiescence`.
+        let mut reconciler = build_reconciler(
             env.clone(),
             self.engines[new_n as usize].clone(),
             id.clone(),
             edge,
         );
+        if let Some(after) = self.cp_quiesce_after {
+            reconciler.enable_quiescence(after);
+        }
         spawn_reconciler_loop(ctx.clone(), reconciler);
 
         // The TTL reaper (ADR 0061 rung I, C-09) — data-role-gated, not

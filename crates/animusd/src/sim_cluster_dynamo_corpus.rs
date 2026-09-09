@@ -409,28 +409,43 @@ const CONVERGENCE_BUDGET: Duration = Duration::from_secs(15);
 /// whatever bring-up cost the cluster's own control-plane election paid
 /// during construction.
 ///
-/// **Value, and how it was picked**: measured post-fix
-/// (`SIM_FALLBACK_TICK` = 1s) at `ANIMUS_DYNAMO_WIRE_SEEDS=5` (40
-/// scenarios across all 8 cells) — the heaviest cell, `forward_heavy`
-/// (RF2 over 4 nodes, so most ops route through a node hosting no local
-/// replica), peaked at ~1.60M timer fires per scenario across its 5
-/// seeds; every other cell stayed under ~1.12M. **A diagnostic finding
-/// worth recording here, not just in the report**: an A/B measurement at
-/// `SIM_FALLBACK_TICK` = 200ms (the pre-fix value) vs. 1s vs. 60s on the
-/// cheapest cell (`baseline`, no faults) showed these five loops'
-/// **own** contribution to total executor cost is real but small — task
-/// polls moved 948,525 → 907,806 → 897,804 across that range, a ~5.6%
-/// spread — so most of a scenario's ~900K-1.6M timer fires come from
-/// something this fix does not touch (real per-tablet/control Raft
-/// consensus machinery ticking across the large cumulative virtual time
-/// this corpus's own `OP_BUDGET`-per-call probe design burns, `sim_
-/// cluster.rs`'s own `spawn_and_capture` doc). This budget carries ~2x
-/// headroom over the observed `forward_heavy` maximum specifically so it
-/// still catches a genuine regression in what this fix DOES control
-/// (reintroducing a fast per-loop tick, or a sixth always-on loop) without
-/// being sensitive to the larger, out-of-this-fix's-scope cost the A/B
-/// measurement above attributes elsewhere.
-const SCENARIO_TIMER_FIRES_BUDGET: u64 = 3_300_000;
+/// **Value, and how it was picked (revised 2026-09-09, issue #772 PR 2/2 —
+/// the root cause behind the entry directly above, finally closed).** The
+/// entry above closed the ACUTE symptom (the five always-on loops' own
+/// tick rate) but explicitly left the DOMINANT cost unaddressed: every
+/// synchronous `SimCluster::dynamo`/probe call was unconditionally burning
+/// a full `OP_BUDGET` (12s) window of virtual time regardless of how
+/// quickly it resolved, feeding real per-tablet/control-plane Raft
+/// consensus traffic that a permanently-unquiesced CP-data group keeps
+/// paying for the rest of a scenario's own life. Two fixes closed that,
+/// entirely inside this fixture (`sim_cluster.rs`), production code
+/// untouched: (1) `SimCluster::new_with_cp_quiescence` opts every CP-data
+/// tablet group into ADR 0048 quiescence at production's own default
+/// threshold (`DEFAULT_QUIESCE_AFTER_SECS` = 5s), so an idle group stops
+/// ticking its own heartbeat/election-timeout machinery instead of paying
+/// for it for the rest of the scenario; (2) `SimCluster::dynamo_fast`
+/// (used ONLY by this file's own `run_delete_probe`/`run_batch_write_
+/// probe`/`run_transact_probe`/`force_resolve_all_keys` — never the shared
+/// `SimCluster::dynamo`/`put`/`get`/`scan` every other `sim_cluster_*`
+/// module depends on for its own OP_BUDGET-as-implicit-clock timing)
+/// returns the instant its op resolves instead of always burning the full
+/// 12s. Measured together on `ANIMUS_DYNAMO_WIRE_SEEDS=25` (200 scenarios,
+/// all 8 cells): `dynamowire_baseline`'s own `Simulator::stats()` delta
+/// fell from ~786K task_polls (pre-fix) to ~35K (post-fix), a ~22x
+/// reduction; the corpus's own heaviest cell, `two_tables` (two
+/// independently-provisioned tables, so the most standing CP-data groups
+/// of any cell), peaked at 52,273 timer fires per scenario across all 25
+/// seeds — every other cell stayed at or below `forward_heavy`'s own
+/// 50,378. This budget (~2.1x headroom over that observed maximum,
+/// mirroring the original constant's own sizing discipline) is what
+/// replaces the stale, ~65x-oversized 3,300,000 the prior fix picked
+/// against a ~900K-1.6M-timer-fire world that no longer exists — see
+/// `docs/engineering-lessons.md`'s matching follow-up entry and
+/// `docs/adr/0061-testability-node-crate-simulator.md`'s matching
+/// amendment for the full bisect (which commit multiplied the cost, and
+/// why) and before/after wall-clock numbers
+/// (`ANIMUS_DYNAMO_WIRE_SEEDS=25` fell from 26:56 to well under a minute).
+const SCENARIO_TIMER_FIRES_BUDGET: u64 = 110_000;
 
 /// A `Key`'s high-order digits name which table it belongs to — see
 /// `sim_cluster_corpus.rs`'s own identical constant/note for why (multiple
@@ -1296,7 +1311,8 @@ fn run_delete_probe(
             "Item": {"pk": {"S": pk}, "sk": {"S": sk}, "items": one_element_list(9)},
         })
         .to_string();
-        let (status, resp) = cluster.dynamo(node, "DynamoDB_20120810.PutItem", put_body.as_bytes());
+        let (status, resp) =
+            cluster.dynamo_fast(node, "DynamoDB_20120810.PutItem", put_body.as_bytes());
         if status != 200 {
             return Err(format!(
                 "node {node}: put failed: status={status} body={resp}"
@@ -1309,7 +1325,8 @@ fn run_delete_probe(
             "Key": {"pk": {"S": pk}, "sk": {"S": sk}},
         })
         .to_string();
-        let (status, body) = cluster.dynamo(node, "DynamoDB_20120810.GetItem", get_body.as_bytes());
+        let (status, body) =
+            cluster.dynamo_fast(node, "DynamoDB_20120810.GetItem", get_body.as_bytes());
         if status != 200 || !body.contains(r#""N":"9""#) {
             return Err(format!(
                 "node {node}: put not visible via a consistent get (status={status} body={body})"
@@ -1322,14 +1339,15 @@ fn run_delete_probe(
         })
         .to_string();
         let (status, resp) =
-            cluster.dynamo(node, "DynamoDB_20120810.DeleteItem", del_body.as_bytes());
+            cluster.dynamo_fast(node, "DynamoDB_20120810.DeleteItem", del_body.as_bytes());
         if status != 200 {
             return Err(format!(
                 "node {node}: delete failed: status={status} body={resp}"
             ));
         }
 
-        let (status, body) = cluster.dynamo(node, "DynamoDB_20120810.GetItem", get_body.as_bytes());
+        let (status, body) =
+            cluster.dynamo_fast(node, "DynamoDB_20120810.GetItem", get_body.as_bytes());
         if status != 200 {
             return Err(format!(
                 "node {node}: get after delete failed: status={status} body={body}"
@@ -1367,7 +1385,7 @@ fn run_batch_write_probe(
         })
         .to_string();
         let (status, resp) =
-            cluster.dynamo(node, "DynamoDB_20120810.BatchWriteItem", body.as_bytes());
+            cluster.dynamo_fast(node, "DynamoDB_20120810.BatchWriteItem", body.as_bytes());
         if status != 200 {
             return Err(format!(
                 "node {node}: BatchWriteItem failed: status={status} body={resp}"
@@ -1382,7 +1400,7 @@ fn run_batch_write_probe(
             })
             .to_string();
             let (status, body) =
-                cluster.dynamo(node, "DynamoDB_20120810.GetItem", get_body.as_bytes());
+                cluster.dynamo_fast(node, "DynamoDB_20120810.GetItem", get_body.as_bytes());
             let seen = serde_json::from_str::<Value>(&body)
                 .ok()
                 .and_then(|v| v.get("Item").map(decode_items_attr))
@@ -1409,7 +1427,7 @@ fn read_hits_counter(cluster: &mut SimCluster, table: &str, pk: &str) -> Result<
         "Key": {"pk": {"S": pk}, "sk": {"S": "v"}},
     })
     .to_string();
-    let (status, resp) = cluster.dynamo(0, "DynamoDB_20120810.GetItem", body.as_bytes());
+    let (status, resp) = cluster.dynamo_fast(0, "DynamoDB_20120810.GetItem", body.as_bytes());
     if status != 200 {
         return Err(format!(
             "GetItem({table}/{pk}) failed: status={status} body={resp}"
@@ -1459,7 +1477,7 @@ fn run_transact_probe(
             ],
         })
         .to_string();
-        let (status, resp) = cluster.dynamo(
+        let (status, resp) = cluster.dynamo_fast(
             node,
             "DynamoDB_20120810.TransactWriteItems",
             cancel_body.as_bytes(),
@@ -1486,7 +1504,7 @@ fn run_transact_probe(
             })
             .to_string();
             let (status, body) =
-                cluster.dynamo(node, "DynamoDB_20120810.GetItem", get_body.as_bytes());
+                cluster.dynamo_fast(node, "DynamoDB_20120810.GetItem", get_body.as_bytes());
             if status != 200 || body.contains("\"Item\"") {
                 return Err(format!(
                     "node {node}: a cancelled transaction still wrote {pk}: \
@@ -1507,7 +1525,7 @@ fn run_transact_probe(
         })
         .to_string();
         let (status, resp) =
-            cluster.dynamo(node, "DynamoDB_20120810.PutItem", seed_delete.as_bytes());
+            cluster.dynamo_fast(node, "DynamoDB_20120810.PutItem", seed_delete.as_bytes());
         if status != 200 {
             return Err(format!(
                 "node {node}: transact-probe delete-seed failed: status={status} body={resp}"
@@ -1538,7 +1556,7 @@ fn run_transact_probe(
             .to_string()
         };
 
-        let (status, resp) = cluster.dynamo(
+        let (status, resp) = cluster.dynamo_fast(
             node,
             "DynamoDB_20120810.TransactWriteItems",
             commit_body(11).as_bytes(),
@@ -1554,7 +1572,8 @@ fn run_transact_probe(
             "Key": {"pk": {"S": put_pk}, "sk": {"S": "v"}},
         })
         .to_string();
-        let (status, body) = cluster.dynamo(node, "DynamoDB_20120810.GetItem", put_get.as_bytes());
+        let (status, body) =
+            cluster.dynamo_fast(node, "DynamoDB_20120810.GetItem", put_get.as_bytes());
         let seen = serde_json::from_str::<Value>(&body)
             .ok()
             .and_then(|v| v.get("Item").map(decode_items_attr))
@@ -1570,7 +1589,8 @@ fn run_transact_probe(
             "Key": {"pk": {"S": to_delete_pk}, "sk": {"S": "v"}},
         })
         .to_string();
-        let (status, body) = cluster.dynamo(node, "DynamoDB_20120810.GetItem", del_get.as_bytes());
+        let (status, body) =
+            cluster.dynamo_fast(node, "DynamoDB_20120810.GetItem", del_get.as_bytes());
         if status != 200 || body.contains("\"Item\"") {
             return Err(format!(
                 "node {node}: committed Delete left the item present: status={status} body={body}"
@@ -1585,7 +1605,7 @@ fn run_transact_probe(
 
         // (3) an identical retry, same token: cached — 200, no re-run (the
         // counter must stay 1, not 2).
-        let (status, resp) = cluster.dynamo(
+        let (status, resp) = cluster.dynamo_fast(
             node,
             "DynamoDB_20120810.TransactWriteItems",
             commit_body(11).as_bytes(),
@@ -1604,7 +1624,7 @@ fn run_transact_probe(
         }
 
         // (4) the same token, a genuinely DIFFERENT payload: rejected.
-        let (status, resp) = cluster.dynamo(
+        let (status, resp) = cluster.dynamo_fast(
             node,
             "DynamoDB_20120810.TransactWriteItems",
             commit_body(12).as_bytes(),
@@ -1806,19 +1826,56 @@ fn force_resolve_all_keys(cluster: &mut SimCluster, table_names: &[String], keys
             }));
             if gets.len() == 100 {
                 let body = json!({"TransactItems": gets}).to_string();
-                let _ = cluster.dynamo(0, "DynamoDB_20120810.TransactGetItems", body.as_bytes());
+                let _ =
+                    cluster.dynamo_fast(0, "DynamoDB_20120810.TransactGetItems", body.as_bytes());
                 gets = Vec::new();
             }
         }
     }
     if !gets.is_empty() {
         let body = json!({"TransactItems": gets}).to_string();
-        let _ = cluster.dynamo(0, "DynamoDB_20120810.TransactGetItems", body.as_bytes());
+        let _ = cluster.dynamo_fast(0, "DynamoDB_20120810.TransactGetItems", body.as_bytes());
     }
 }
 
 fn run_scenario(s: &Scenario) -> ScenarioResult {
-    let mut cluster = SimCluster::new(s.seed, s.nodes, s.replication);
+    // Opt every CP-data tablet group into quiescence (ADR 0048) at
+    // production's own default threshold, `DEFAULT_QUIESCE_AFTER_SECS` (5s)
+    // — the real root cause of this corpus's own executor-cost regression
+    // (see `SCENARIO_TIMER_FIRES_BUDGET`'s own doc for the measured
+    // before/after). Every `SimCluster` sync op call
+    // (`dynamo`/`put`/`get`/…) unconditionally burns a full `OP_BUDGET`
+    // (12s) window of virtual time regardless of how quickly the op itself
+    // resolves (`spawn_and_capture`'s own doc, `sim_cluster.rs`) — that
+    // design is load-bearing elsewhere (e.g. `ThrottleBucket` refill
+    // between retries) and is NOT changed here. What quiescence fixes is
+    // the OTHER half: every CP-data Raft group left un-quiesced keeps
+    // ticking its own heartbeat/election-timeout/apply-poll machinery for
+    // the ENTIRE 12s of every such call, for the group's whole remaining
+    // lifetime, whether or not that call ever touches it. As this corpus's
+    // own workload grew (more tables — the internal
+    // `__animus_txn_idempotency` table `run_transact_probe`'s tokened
+    // `TransactWriteItems` auto-provisions, GSI hidden tables — plus more
+    // probe op calls per scenario), the number of such permanently-idle-
+    // but-ticking groups accumulated, multiplying real executor cost
+    // roughly `(idle groups) × (virtual time remaining) / (heartbeat
+    // interval)` — exactly the "an op burns OP_BUDGET full of heartbeats/
+    // Raft ticks" shape. Quiescence is real, tested production
+    // infrastructure (ADR 0048, on by default in every real deployment)
+    // that stops a group's own timer machinery once idle for `after` —
+    // transparent to correctness (`resolve_cp_route` wakes a quiesced
+    // group on demand before any linearizable op; an eventually-consistent
+    // read never needs to) — so this closes the real waste without
+    // touching `spawn_and_capture`'s own virtual-time semantics or
+    // dropping anything this corpus checks. See `SimCluster::
+    // new_with_cp_quiescence`'s own doc for why this has to be a
+    // constructor-time knob.
+    let mut cluster = SimCluster::new_with_cp_quiescence(
+        s.seed,
+        s.nodes,
+        s.replication,
+        Some(Duration::from_secs(DEFAULT_QUIESCE_AFTER_SECS)),
+    );
     // Deterministic per-scenario executor-cost regression — see
     // `SCENARIO_TIMER_FIRES_BUDGET`'s own doc for the full account. Read
     // right after construction (excluding the cluster's own bring-up cost)
@@ -1899,6 +1956,56 @@ fn run_scenario(s: &Scenario) -> ScenarioResult {
     }
     cluster.heal_all();
     cluster.run_for(DRAIN);
+
+    // `non_hosting_ok_writes` (the `forward_heavy` non-vacuity signal) —
+    // captured from a replica-set snapshot that has genuinely SETTLED back
+    // to this tablet's own configured replication factor, not a mid-
+    // migration transient. `live_replicas` is a LIVE snapshot of *current*
+    // hosting, and this cell's own tokened-`TransactWriteItems` auto-
+    // provisioning of the internal idempotency table (this file's own
+    // "TransactWriteItems/TransactGetItems" module-doc section) routinely
+    // triggers a real, correct rebalance mid-scenario — the SAME mechanism
+    // `live_replicas`'s own doc already names for the durability check.
+    // ADR 0029's own add-then-remove migration sequence means a snapshot
+    // taken WHILE a rebalance is still in flight can show one MORE member
+    // than the tablet's actual replication factor (an old replica not yet
+    // released alongside the new one already added) — narrowing the
+    // "non-hosting" set from 2-of-4 nodes down to 1-of-4 for however long
+    // that transient lasts, which silently promotes the one remaining
+    // non-hosting node's own already-acknowledged write to "now hosting" by
+    // the time it's counted — undercounting a write a non-hosting node
+    // genuinely issued and got acknowledged, a false failure of this
+    // assertion rather than a real forwarding defect. Found investigating
+    // issue #772's PR 2/2 (`dynamo_fast`'s own virtual-time-budget fix
+    // removed several seconds of incidental "grace time" a migration used
+    // to get for free from the old `dynamo`'s unconditional `OP_BUDGET`
+    // burn — plenty of slack for it to finish settling before this used to
+    // be read). Poll (bounded, converged-or-timeout — never a fixed-
+    // deadline one-shot read, root `CLAUDE.md`'s own rule) until the
+    // replica count is back to `s.replication` or the budget runs out; a
+    // scenario whose own migration genuinely never settles within budget
+    // still gets counted from whatever `live_replicas` last reported,
+    // exactly as before this fix.
+    let ok_writes_by_node = shared
+        .ok_writes_by_node
+        .lock()
+        .expect("ok_writes_by_node poisoned")
+        .clone();
+    let mut final_replicas_at_workload_end = live_replicas(&cluster, s.nodes, primary_tablet);
+    let settle_deadline_steps = CONVERGENCE_BUDGET.as_millis() / CONVERGENCE_POLL_STEP.as_millis();
+    let mut settle_polled: u128 = 0;
+    while final_replicas_at_workload_end.len() != s.replication
+        && settle_polled < settle_deadline_steps
+    {
+        cluster.run_for(CONVERGENCE_POLL_STEP);
+        final_replicas_at_workload_end = live_replicas(&cluster, s.nodes, primary_tablet);
+        settle_polled += 1;
+    }
+    let non_hosting_ok_writes: usize = (0..s.nodes as u64)
+        .filter(|n| !final_replicas_at_workload_end.contains(n))
+        .map(|n| ok_writes_by_node.get(&n).copied().unwrap_or(0))
+        .sum();
+
     force_resolve_all_keys(&mut cluster, &table_names, s.keyspace);
 
     let history = shared
@@ -1966,17 +2073,6 @@ fn run_scenario(s: &Scenario) -> ScenarioResult {
                 .any(|m| matches!(m, Mop::Read { observed: Some(l), .. } if !l.is_empty()))
         })
         .count();
-    let ok_writes_by_node = shared
-        .ok_writes_by_node
-        .lock()
-        .expect("ok_writes_by_node poisoned")
-        .clone();
-    let final_replicas = live_replicas(&cluster, s.nodes, primary_tablet);
-    let non_hosting_ok_writes: usize = (0..s.nodes as u64)
-        .filter(|n| !final_replicas.contains(n))
-        .map(|n| ok_writes_by_node.get(&n).copied().unwrap_or(0))
-        .sum();
-
     let delete_probe = run_delete_probe(&mut cluster, &table_names[0], s.nodes);
     let batch_probe = run_batch_write_probe(&mut cluster, &table_names[0], s.nodes);
     let transact_probe = run_transact_probe(&mut cluster, &table_names, s.nodes);
