@@ -41,7 +41,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use animus_control::SharedWal;
@@ -70,6 +70,7 @@ pub mod cursor;
 pub mod heartbeat_batch;
 pub mod hlc;
 pub mod host;
+mod hwm;
 mod seal;
 pub mod segment;
 mod split;
@@ -310,6 +311,165 @@ impl Future for ForkPending<'_> {
         } else {
             Poll::Pending
         }
+    }
+}
+
+/// Executor-agnostic "engine-applied index advanced" notification — the
+/// per-tablet-group counterpart to `animus-control`'s `MetadataWatch` (ADR
+/// 0031), same shape and same reason: let a caller waiting on a specific
+/// index (a write confirming its own accepted entry, `animusd::write_path`)
+/// react the instant [`RaftKvNode::engine_applied_index`] passes it, instead
+/// of polling on a fixed/backed-off timer. A cloneable handle — every clone
+/// observes the same underlying watermark.
+///
+/// **Multi-waiter, by design from the start** — never built on a lone
+/// `AtomicWaker`. A single-tablet leader routinely has many concurrent
+/// single-item writes each confirming its own distinct index at once, so a
+/// single-slot waker (which silently evicts whatever was previously
+/// registered — see `docs/engineering-lessons.md` on issue #276, the
+/// `MetadataWatch` lost-wakeup this exact mistake produced the first time a
+/// second concurrent consumer showed up) would drop all but the most
+/// recently registered writer's wake. Any number of concurrent
+/// [`changed`](AppliedWatch::changed) callers — across any number of clones
+/// of this handle — park independently: each returned [`AppliedChanged`]
+/// future owns its own slot in a small registry, so registering one
+/// waiter's waker can never evict another's, and
+/// [`bump`](AppliedWatch::bump) wakes every currently-registered waiter, not
+/// just the most recent.
+///
+/// No tokio-only primitive is used (plain `Waker`/atomics/`std::sync::
+/// Mutex`, never `tokio::sync::Notify`/`watch`), so this is fully
+/// `SimEnv`-deterministic and works identically over a real tokio `ProdEnv`.
+/// Registration/removal use a short, `.await`-free `std::sync::Mutex`
+/// critical section (never held across a poll).
+#[derive(Clone, Default)]
+pub struct AppliedWatch(Arc<AppliedWatchInner>);
+
+#[derive(Default)]
+struct AppliedWatchInner {
+    /// The highest engine-applied index this watch has observed — the same
+    /// value [`RaftKvNode::engine_applied_index`] reads, mirrored here so a
+    /// waiter can both check and park on one handle. Monotonic: only ever
+    /// raised.
+    applied: AtomicU64,
+    /// Every currently-parked waiter's waker, keyed by the per-future slot
+    /// id [`AppliedWatch::changed`] mints for it. `bump` drains and wakes
+    /// the whole map; an [`AppliedChanged`] removes its own entry on `Drop`
+    /// so an abandoned confirm-wait (a write whose caller timed out or
+    /// disconnected) never leaks a slot.
+    wakers: Mutex<BTreeMap<u64, Waker>>,
+    /// Monotonic source of the slot ids handed out by
+    /// [`AppliedWatch::changed`]. Only ever incremented.
+    next_slot: AtomicU64,
+}
+
+impl AppliedWatch {
+    /// The latest applied index this watch has observed, without waiting.
+    #[must_use]
+    pub fn latest(&self) -> u64 {
+        self.0.applied.load(Ordering::Acquire)
+    }
+
+    /// Resolves once the applied index exceeds `last_seen`, yielding the new
+    /// value.
+    ///
+    /// Unlike a one-shot flag, this is a plain watermark re-checked fresh on
+    /// every poll — so there is no wake-before-park race to lose: if the
+    /// index already advanced past `last_seen` before this future is even
+    /// created, the very first poll resolves immediately.
+    pub fn changed(&self, last_seen: u64) -> AppliedChanged<'_> {
+        let slot = self.0.next_slot.fetch_add(1, Ordering::Relaxed);
+        AppliedChanged {
+            watch: self,
+            last_seen,
+            slot,
+        }
+    }
+
+    /// Raise the watermark to `index` (a no-op if `index` is not an advance)
+    /// and wake **every** currently-parked waiter, only when it actually
+    /// moved. Called at every site where the apply task's own
+    /// `engine_applied` watermark advances — see that field's doc for the
+    /// enumerated raise points.
+    pub fn bump(&self, index: u64) {
+        let prev = self.0.applied.fetch_max(index, Ordering::AcqRel);
+        if index > prev {
+            // Drain the registry before waking: a woken waiter re-registers
+            // its own fresh slot on its next poll (if still pending), so
+            // there is no need to retain entries here, and waking happens
+            // outside the lock to keep the critical section short.
+            let woken =
+                std::mem::take(&mut *self.0.wakers.lock().expect("AppliedWatch wakers poisoned"));
+            for (_, waker) in woken {
+                waker.wake();
+            }
+        }
+    }
+
+    /// Number of waiters currently parked on this watch. Test-only: used to
+    /// prove a dropped [`AppliedChanged`] doesn't leak its registry slot.
+    #[cfg(test)]
+    fn registered_waiters(&self) -> usize {
+        self.0
+            .wakers
+            .lock()
+            .expect("AppliedWatch wakers poisoned")
+            .len()
+    }
+}
+
+/// The future returned by [`AppliedWatch::changed`]. Owns one slot in its
+/// watch's waker registry for its whole lifetime — minted in `changed`,
+/// removed on `Drop` (whether it resolved, was cancelled, or was simply
+/// abandoned mid-poll) — so it never leaks and never collides with any
+/// other concurrent waiter's slot.
+pub struct AppliedChanged<'a> {
+    watch: &'a AppliedWatch,
+    last_seen: u64,
+    slot: u64,
+}
+
+impl Future for AppliedChanged<'_> {
+    type Output = u64;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<u64> {
+        // Register this waiter's own slot before checking — if `bump` races
+        // in right after our check but before we park, the freshly
+        // registered waker still catches it, and registering here can never
+        // evict any *other* waiter's slot.
+        self.watch
+            .0
+            .wakers
+            .lock()
+            .expect("AppliedWatch wakers poisoned")
+            .insert(self.slot, cx.waker().clone());
+        let current = self.watch.0.applied.load(Ordering::Acquire);
+        if current > self.last_seen {
+            // Deregister immediately: a resolved future has nothing left to
+            // be woken for, so leaving its slot behind would only cost
+            // `bump` a wasted `wake()` on every future advance until `Drop`
+            // eventually cleans it up anyway.
+            self.watch
+                .0
+                .wakers
+                .lock()
+                .expect("AppliedWatch wakers poisoned")
+                .remove(&self.slot);
+            Poll::Ready(current)
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+impl Drop for AppliedChanged<'_> {
+    fn drop(&mut self) {
+        self.watch
+            .0
+            .wakers
+            .lock()
+            .expect("AppliedWatch wakers poisoned")
+            .remove(&self.slot);
     }
 }
 
@@ -1846,6 +2006,12 @@ pub struct RaftKvNode<E: Env, S: StorageEngine> {
     /// merging them into the engine — so linearizable reads gate on *this* (engine
     /// progress), never `last_applied`, or they could read past the engine's state.
     engine_applied: Arc<AtomicU64>,
+    /// Wake-on-apply companion to [`engine_applied`](Self::engine_applied):
+    /// bumped at every site `engine_applied` advances, so a caller confirming
+    /// a specific accepted index (`animusd::write_path`) can park on
+    /// [`AppliedWatch::changed`] instead of polling on a timer. See
+    /// [`applied_watch`](Self::applied_watch).
+    applied_watch: AppliedWatch,
     /// Set by [`shutdown`](Self::shutdown); both the consensus loop and the apply
     /// task observe it and exit.
     halted: Arc<AtomicBool>,
@@ -1918,6 +2084,15 @@ pub struct RaftKvNode<E: Env, S: StorageEngine> {
     /// construction performs — at group start, off this tablet's own
     /// engine's `latest_version()`) plus, for the residual in-flight-write
     /// race witnessing alone can't close, the **range seal** (`seal.rs`).
+    /// **Issue #804 amendment**: `latest_version()` alone only reflects the
+    /// highest MVCC version some entry actually WROTE, which a committed
+    /// entry whose apply wrote no row (a failed `Cas`, an aborted txn, ...)
+    /// never advances — a durable per-tablet marker (`hwm.rs`) now backs
+    /// both `latest_version()`-reading witness points once compaction would
+    /// otherwise drop such an entry from WAL replay, and `InstallSnapshot`'s
+    /// own image additionally carries the sender's own high-water mark in
+    /// its header, folded in at install alongside `latest_version()` (see
+    /// `engine_image`/`install_engine_image`'s docs).
     hlc: Arc<Hlc>,
     /// The per-tablet **read-timestamp cache** (ADR 0018 §2/PR2b,
     /// `ts_cache.rs`): leader-local, in-memory, best-effort write-conflict
@@ -2340,6 +2515,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         let stopped = Arc::new(AtomicBool::new(false));
         let apply_stopped = Arc::new(AtomicBool::new(false));
         let engine_applied = Arc::new(AtomicU64::new(0));
+        let applied_watch = AppliedWatch::default();
         let wal_lock = Arc::new(AsyncMutex::new(()));
         let propose_signal = Arc::new(ProposeSignal::default());
         let apply_signal = Arc::new(ApplySignal::default());
@@ -2354,6 +2530,20 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         // restart, a co-hosted sibling already present). `latest_version()`
         // is engine-global and cheap/synchronous (`animus-storage`'s trait
         // doc), so this needs no async step here.
+        //
+        // **Issue #804 fix**: this read alone used to structurally
+        // undercount — a committed, applied entry whose outcome wrote no
+        // row (a failed `Cas`, a condition-failed write, an aborted txn)
+        // never advanced `latest_version()`, so once compaction dropped
+        // such an entry out of the WAL, a restart's `latest_version()` read
+        // silently forgot its `ts`. This call itself is unchanged; what
+        // changed is that `latest_version()` can no longer lag that far
+        // behind, because `apply_and_compact`'s compaction path now durably
+        // `merge`s a dedicated per-tablet high-water-mark marker
+        // (`hwm.rs`) at `hlc::pack(max_applied_ts)` whenever it truncates
+        // the WAL — so this read picks that mark up automatically, with no
+        // further change needed here. See `hwm.rs`'s module doc for the
+        // full account.
         let hlc = Arc::new(Hlc::new(env.node_id(), HLC_MAX_OFFSET));
         hlc.witness(hlc::unpack(storage.latest_version()), env.now());
         let ts_cache = Arc::new(Mutex::new(TsCache::new()));
@@ -2392,6 +2582,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             kind_outcomes: Arc::clone(&kind_outcomes),
             kind_eval_results: Arc::clone(&kind_eval_results),
             engine_applied: Arc::clone(&engine_applied),
+            applied_watch: applied_watch.clone(),
             halted: Arc::clone(&halted),
             stopped: Arc::clone(&stopped),
             apply_stopped: Arc::clone(&apply_stopped),
@@ -2430,6 +2621,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             kind_outcomes,
             kind_eval_results,
             engine_applied,
+            applied_watch,
             wal_lock,
             halted,
             stopped,
@@ -6318,6 +6510,17 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         self.engine_applied.load(Ordering::SeqCst)
     }
 
+    /// The wake-on-apply handle mirroring [`engine_applied_index`](Self::
+    /// engine_applied_index): a caller can either poll the index directly or
+    /// park on [`AppliedWatch::changed`] to be notified the instant it
+    /// advances past a chosen value, instead of a fixed-interval poll. See
+    /// [`AppliedWatch`]'s doc — cheap to clone, safe to hand to any number of
+    /// concurrent callers.
+    #[must_use]
+    pub fn applied_watch(&self) -> AppliedWatch {
+        self.applied_watch.clone()
+    }
+
     /// Highest log index known durable on disk (durable-before-visible frontier).
     pub fn durable_index(&self) -> u64 {
         self.lock().durable_index()
@@ -6873,6 +7076,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     kind_outcomes: &Arc<Mutex<KindBatchOutcomes>>,
     kind_eval_results: &Arc<Mutex<KindEvalResults>>,
     engine_applied: &AtomicU64,
+    applied_watch: &AppliedWatch,
     wal_lock: &AsyncMutex<()>,
     halted: &AtomicBool,
     metrics: &MetricsHandle,
@@ -6930,8 +7134,10 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
         // the data it attests to are crash-consistent: a torn write here can
         // only ever understate progress (this node re-detects `state_machine_
         // behind` and re-requests), never overstate it.
-        install_engine_image(storage, kind_scopes, &bytes, tablet, last_index).await;
+        let install_max_ts =
+            install_engine_image(storage, kind_scopes, &bytes, tablet, last_index).await;
         engine_applied.fetch_max(last_index, Ordering::SeqCst);
+        applied_watch.bump(last_index);
         // Belt, not the buckle: the consensus loop's own per-iteration live
         // feed (`engine_applied.load() < c.snapshot_index()`, see `drive`'s
         // doc) is what actually keeps `state_machine_behind` correct and
@@ -6950,7 +7156,25 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
         // Witnessing point (ADR 0018 §2 amendment): a snapshot can carry
         // versions this node has never seen minted, so fold in the engine's
         // new high-water mark before this node ever mints/compares again.
+        //
+        // **Issue #804 fix**: `storage.latest_version()` alone only reflects
+        // the highest MVCC version some entry actually WROTE — a committed,
+        // applied entry whose outcome wrote no row (a failed `Cas`, an
+        // aborted txn, a sealed/condition-failed `KindBatch`/`KindEval`, ...)
+        // carries a `ts` (`assert_ts_monotonic` runs on it) that never moves
+        // `latest_version()`, and the sender's own `entries_with_tombstones`
+        // scan `engine_image` builds this image from can't see it either —
+        // there is no row to see. `install_max_ts` is the sender's own
+        // `max_applied_ts` at image-build time, carried in the image's
+        // header (`codec::encode_image`/`decode_image`, version `29`)
+        // instead of as a scanned row, so this fold covers exactly the case
+        // `latest_version()` structurally cannot: witnessing every entry the
+        // sender ever committed for this tablet, not just the ones that
+        // happened to write something.
         hlc.witness(hlc::unpack(storage.latest_version()), env.now());
+        if let Some(ts) = install_max_ts {
+            hlc.witness(ts, env.now());
+        }
         // ADR 0018 §2/PR6 corrective note: the `TxnTracker` must be rebuilt
         // from the freshly-installed image, exactly like `start_inner`
         // already does at group start, and for the identical reason
@@ -8620,6 +8844,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     // block below for why.)
     if max_index > 0 {
         engine_applied.fetch_max(max_index, Ordering::SeqCst);
+        applied_watch.bump(max_index);
     }
 
     // Compact once the *engine* has merged enough past the snapshot base: truncate
@@ -8668,7 +8893,32 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
         // and only when a follower is actually waiting on a snapshot.
         let image = if image_needed {
             metrics.incr(Metric::CpSnapshotImageBuilds);
-            Some(engine_image(storage, kind_scopes).await)
+            // Issue #804: carry this apply task's own running `max_applied_ts`
+            // in the image header, so a receiver that installs it witnesses
+            // every entry this tablet has ever committed — including one
+            // whose apply wrote no row — not just `latest_version()`.
+            //
+            // **Folded with the engine's own durable mark, not used alone**:
+            // `max_applied_ts` resets to `None` every time this apply task
+            // starts (including after a restart, see `start_inner`'s doc a
+            // few lines above this task's own spawn) until the first
+            // qualifying entry it processes *this lifetime* runs
+            // `assert_ts_monotonic`. A sender that has applied nothing since
+            // its last compaction — restarted, then immediately asked for a
+            // snapshot by a peer that only just caught up to it — would ship
+            // `None` even though its own `hwm.rs` marker (written durably at
+            // that last compaction) has already raised `latest_version()` to
+            // the true mark. `storage.latest_version()` is exactly as cheap/
+            // synchronous here as at the two other witness points (`start_
+            // inner`'s own doc), so folding it in costs nothing and closes
+            // this restart gap without weakening the entry-level witness the
+            // header exists for.
+            let engine_mark = hlc::unpack(storage.latest_version());
+            let header_ts = Some(match *max_applied_ts {
+                Some(ts) => ts.max(engine_mark),
+                None => engine_mark,
+            });
+            Some(engine_image(storage, kind_scopes, header_ts).await)
         } else {
             None
         };
@@ -8778,6 +9028,27 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 )
                 .await
                 .expect("raftkv applied watermark marker (compaction)");
+            // Issue #804 (ADR 0018 §2 amendment): durably raise
+            // `storage.latest_version()` to cover the highest `ts` ANY
+            // entry through this compaction's own base has committed —
+            // including one whose apply wrote no row at all, which never
+            // moves `latest_version()` on its own. Written in the same
+            // before-the-WAL-rewrite slot as the applied-watermark marker
+            // just above, for the identical crash-direction reason (see
+            // `hwm.rs`'s module doc for the full account of why this marker
+            // exists and why compaction time, not every apply, is the right
+            // cadence). `None` only for a tablet that has never applied a
+            // single ts-bearing entry — nothing to raise the mark to yet.
+            if let Some(ts) = *max_applied_ts {
+                storage
+                    .merge(
+                        &hwm::hwm_marker_key(tablet),
+                        &hwm::encode_hwm_value(ts),
+                        hlc::pack(ts),
+                    )
+                    .await
+                    .expect("raftkv hlc high-water-mark marker (compaction)");
+            }
             let write_result = if let Some(shared) = shared {
                 shared
                     .compact_group(env, wal, TabletId(tablet), records)
@@ -8899,9 +9170,22 @@ async fn raw_scoped_keys<S: StorageEngine>(storage: &S, scope: &StorageScope) ->
     }
 }
 
+/// `max_applied_ts` (issue #804, ADR 0018 §2 amendment) is this apply task's
+/// own running high-water mark (the same variable `assert_ts_monotonic`
+/// maintains) at image-build time — an upper bound on every `ts` any entry
+/// has ever committed for this tablet, whether or not that entry's apply
+/// wrote a row. It rides in the image's own header (`codec::encode_image`,
+/// version `29`), NOT as a scanned row: `KIND_BASE`/`KIND_LSI`/`KIND_CHANGE`/
+/// `KIND_FOOTPRINT`/`KIND_CURSOR` are the only row kinds this scan classifies
+/// — the engine-global reserved-namespace markers (`ceiling.rs`/`seal.rs`/
+/// `split.rs`, leading `0x5F`, matching no kind) are deliberately excluded
+/// from it, so a marker row alone could never cross via this path. Passing
+/// the timestamp explicitly, rather than trying to make it look like a row,
+/// keeps that exclusion intact for every other reserved-namespace marker.
 async fn engine_image<S: StorageEngine>(
     storage: &S,
     kind_scopes: &[StorageScope; ALL_KINDS.len()],
+    max_applied_ts: Option<HlcTimestamp>,
 ) -> Vec<u8> {
     // One pass over the engine, classified by kind (ADR 0041 §3): a tablet's
     // scopes are disjoint, so each physical key is claimed by at most one of
@@ -8921,14 +9205,18 @@ async fn engine_image<S: StorageEngine>(
             entries.push((kind, logical, v, version));
         }
     }
-    codec::encode_image(&entries)
+    codec::encode_image(&entries, max_applied_ts)
 }
 
 /// Write a received snapshot image into the engine (a follower catching up),
 /// versioned so per-key LWW keeps it consistent with the log tail merged on top.
 /// The wire image carries *logical* keys (stripped by the sender's
 /// `engine_image`); each is re-prefixed to *this* replica's own `scope`
-/// before writing into the (possibly shared) engine.
+/// before writing into the (possibly shared) engine. Returns the sender's own
+/// `max_ts` header (issue #804), for the caller to *additionally* fold into
+/// its own in-memory `Hlc` alongside the existing `storage.latest_version()`
+/// witness — see the call site's doc. That in-memory witness alone is not
+/// this fix: see the issue #804 paragraph below for the durable half.
 ///
 /// **Issue #554**: every row plus the durable applied-watermark marker
 /// (`applied.rs`, at `last_index` — the snapshot's own index) land in ONE
@@ -8940,20 +9228,35 @@ async fn engine_image<S: StorageEngine>(
 /// mid-install could durably hold some rows with no watermark yet — safe on
 /// its own re-detection (this node just requests another snapshot), but
 /// needlessly so when batching the whole install is no more work.
+///
+/// **Issue #804**: the header's `max_ts`, when present, ALSO durably `merge`s
+/// this receiver's own `hwm.rs` marker, in that same batch — not just an
+/// in-memory `hlc.witness` at the call site. Without this, a crash-restart of
+/// *this* replica before its own next compaction would fall back to the
+/// group-start witness's `storage.latest_version()` read over rows alone,
+/// silently forgetting exactly the no-row-writing entries the header exists
+/// to carry — this replica's own WAL never had them to replay (it only just
+/// installed this image; it did not apply those entries itself), so nothing
+/// else here could re-derive the mark after such a restart. Batching it into
+/// the same `merge_batch` as the rows and the applied-watermark marker keeps
+/// the identical crash-atomicity property the issue #554 paragraph above
+/// already establishes for those two: rows, watermark, and this mark all land
+/// together or not at all.
 async fn install_engine_image<S: StorageEngine>(
     storage: &S,
     kind_scopes: &[StorageScope; ALL_KINDS.len()],
     bytes: &[u8],
     tablet: u64,
     last_index: u64,
-) {
-    let entries: Vec<ImageEntry> = match codec::decode_image(bytes) {
-        Ok(e) => e,
-        Err(err) => {
-            tracing::warn!(?err, "undecodable raftkv snapshot image dropped");
-            return;
-        }
-    };
+) -> Option<HlcTimestamp> {
+    let (max_ts, entries): (Option<HlcTimestamp>, Vec<ImageEntry>) =
+        match codec::decode_image(bytes) {
+            Ok(e) => e,
+            Err(err) => {
+                tracing::warn!(?err, "undecodable raftkv snapshot image dropped");
+                return None;
+            }
+        };
     let mut ops: Vec<MergeOp> = Vec::with_capacity(entries.len() + 1);
     for (kind, key, value, version) in entries {
         // An unknown kind can only come from a peer that knows a row kind this
@@ -8975,10 +9278,28 @@ async fn install_engine_image<S: StorageEngine>(
         applied::encode_applied_value(last_index),
         last_index,
     ));
+    // Issue #804 fix: durably write the receiver's OWN `hwm.rs` marker in the
+    // same batch as the rows, not just `hlc.witness(...)` the header value in
+    // memory at the call site. In-memory-only witnessing loses the fact the
+    // instant this apply task restarts before its own next compaction: the
+    // group-start witness then falls back to `storage.latest_version()` over
+    // rows alone, which is exactly the gap this header exists to close (see
+    // `hwm.rs`'s module doc). Batched with the row/applied-marker ops for the
+    // identical reason the issue #554 doc above already gives for those two:
+    // one atomic `merge_batch` means a crash mid-install can never durably
+    // hold the rows without this mark (or vice versa).
+    if let Some(ts) = max_ts {
+        ops.push(MergeOp::put(
+            hwm::hwm_marker_key(tablet),
+            hwm::encode_hwm_value(ts),
+            hlc::pack(ts),
+        ));
+    }
     storage
         .merge_batch(ops)
         .await
         .expect("raftkv install snapshot image");
+    max_ts
 }
 
 /// The shared-state bundle handed to the driver tasks, built once in
@@ -8996,6 +9317,7 @@ struct DriveState<E: Env, S: StorageEngine> {
     kind_outcomes: Arc<Mutex<KindBatchOutcomes>>,
     kind_eval_results: Arc<Mutex<KindEvalResults>>,
     engine_applied: Arc<AtomicU64>,
+    applied_watch: AppliedWatch,
     wal_lock: Arc<AsyncMutex<()>>,
     halted: Arc<AtomicBool>,
     stopped: Arc<AtomicBool>,
@@ -9148,6 +9470,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         kind_outcomes,
         kind_eval_results,
         engine_applied,
+        applied_watch,
         wal_lock,
         halted,
         stopped,
@@ -9243,6 +9566,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         .and_then(|v| applied::decode_applied_value(&v.value))
         .unwrap_or(0);
     engine_applied.store(engine_watermark, Ordering::SeqCst);
+    applied_watch.bump(engine_watermark);
     // Needs-snapshot state (issue #554): the engine's own watermark is below
     // the log's own compacted start — the prefix through `snapshot_index` is
     // gone from both the log (compacted) and the engine (never merged, or
@@ -9340,6 +9664,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         kind_outcomes,
         kind_eval_results,
         Arc::clone(&engine_applied),
+        applied_watch.clone(),
         Arc::clone(&wal_lock),
         Arc::clone(&halted),
         apply_stopped,
@@ -9924,6 +10249,7 @@ async fn apply_loop<E: Env, S: StorageEngine>(
     kind_outcomes: Arc<Mutex<KindBatchOutcomes>>,
     kind_eval_results: Arc<Mutex<KindEvalResults>>,
     engine_applied: Arc<AtomicU64>,
+    applied_watch: AppliedWatch,
     wal_lock: Arc<AsyncMutex<()>>,
     halted: Arc<AtomicBool>,
     apply_stopped: Arc<AtomicBool>,
@@ -9975,6 +10301,7 @@ async fn apply_loop<E: Env, S: StorageEngine>(
             &kind_outcomes,
             &kind_eval_results,
             &engine_applied,
+            &applied_watch,
             &wal_lock,
             &halted,
             &metrics,
@@ -10090,13 +10417,21 @@ mod kind_scope_tests {
                 }
             }
 
-            let image = engine_image(&src, &src_scopes).await;
+            // Issue #804: the image header carries the sender's own
+            // `max_applied_ts`, distinct from any row's own MVCC version —
+            // proving install returns it rather than silently dropping it.
+            let max_ts = HlcTimestamp {
+                wall_ms: 4300,
+                logical: 101,
+            };
+            let image = engine_image(&src, &src_scopes, Some(max_ts)).await;
             let dst = MemoryEngine::new();
             let dst_scopes = kind_scopes(&StorageScope::new(KeyRange::new(
                 Vec::new(),
                 Some(b"zzzz".to_vec()),
             )));
-            install_engine_image(&dst, &dst_scopes, &image, 1, 42).await;
+            let installed_max_ts = install_engine_image(&dst, &dst_scopes, &image, 1, 42).await;
+            assert_eq!(installed_max_ts, Some(max_ts));
 
             let mut src_rows = src.entries_with_tombstones().await.unwrap();
             // Issue #554: the install also writes the durable applied-watermark
@@ -10105,12 +10440,18 @@ mod kind_scope_tests {
             // it is excluded here rather than expected to match `src` (which
             // never had one written at all).
             let marker_key = applied::applied_marker_key(1);
+            // Issue #804 fix (1): the install ALSO writes `dst`'s own durable
+            // `hwm.rs` marker (from the header's `max_ts`) in that same batch —
+            // the identical "real row in `dst`, no counterpart in `src`" shape
+            // as the applied-watermark marker just above, excluded here for the
+            // identical reason.
+            let hwm_key = hwm::hwm_marker_key(1);
             let mut dst_rows: Vec<_> = dst
                 .entries_with_tombstones()
                 .await
                 .unwrap()
                 .into_iter()
-                .filter(|(k, ..)| k != &marker_key)
+                .filter(|(k, ..)| k != &marker_key && k != &hwm_key)
                 .collect();
             src_rows.sort();
             dst_rows.sort();
@@ -10122,6 +10463,11 @@ mod kind_scope_tests {
                 dst.get(&marker_key).await.unwrap().map(|v| v.value),
                 Some(applied::encode_applied_value(42)),
                 "the installed applied watermark must reflect the snapshot's own index"
+            );
+            assert_eq!(
+                dst.get(&hwm_key).await.unwrap().map(|v| v.value),
+                Some(hwm::encode_hwm_value(max_ts)),
+                "the installed hwm marker must reflect the image header's own max_ts"
             );
         });
     }
@@ -10827,5 +11173,188 @@ mod stale_read_ready_tests {
                 );
             }
         }
+    }
+}
+
+/// Unit tests for [`AppliedWatch`] mirroring `animus_control::node`'s own
+/// `MetadataWatch` tests (issue #276's fix, and the general lesson it left
+/// behind — see this module's own doc and `docs/engineering-lessons.md`):
+/// multi-waiter delivery, register-before-check, and no leaked registry
+/// slots. No `SimEnv`/`RaftKvNode` bring-up needed — `AppliedWatch` is a
+/// plain `Waker`-registry primitive exercised directly with hand-built
+/// test wakers, exactly like `MetadataWatch`'s own module.
+#[cfg(test)]
+mod applied_watch_tests {
+    use std::pin::Pin;
+    use std::sync::atomic::AtomicBool;
+    use std::task::{Context, Poll, Wake, Waker};
+
+    use super::*;
+
+    /// A `Waker` that just flags whether it was ever woken, so a test can
+    /// assert on wake delivery without needing a real executor — mirrors
+    /// `animus_control::node`'s own `WakeFlag`.
+    struct WakeFlag(AtomicBool);
+
+    impl Wake for WakeFlag {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl WakeFlag {
+        fn woken(&self) -> bool {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    fn test_waker() -> (Waker, Arc<WakeFlag>) {
+        let flag = Arc::new(WakeFlag(AtomicBool::new(false)));
+        let waker = Waker::from(flag.clone());
+        (waker, flag)
+    }
+
+    /// Two independent `changed()` callers on one [`AppliedWatch`] must
+    /// *both* be woken by a single `bump()` — the exact multi-writer shape
+    /// this type exists for (many concurrent single-item writes waiting on
+    /// one leader's applied index at once). Red on a lone `AtomicWaker`:
+    /// registering the second waiter's waker would evict the first's, so
+    /// only the most recently registered waiter would ever wake (issue
+    /// #276's own `MetadataWatch` lost-wakeup, reproduced here for this
+    /// type's own registry rather than merely inherited by analogy).
+    #[test]
+    fn bump_wakes_every_registered_waiter_not_just_the_most_recent() {
+        let watch = AppliedWatch::default();
+
+        let (waker_a, woken_a) = test_waker();
+        let (waker_b, woken_b) = test_waker();
+        let mut cx_a = Context::from_waker(&waker_a);
+        let mut cx_b = Context::from_waker(&waker_b);
+
+        let mut fut_a = watch.changed(0);
+        let mut fut_b = watch.changed(0);
+
+        // Park both: register-before-check means each poll registers its
+        // own slot before observing `applied == 0 == last_seen`, so both
+        // return Pending.
+        assert_eq!(Pin::new(&mut fut_a).poll(&mut cx_a), Poll::Pending);
+        assert_eq!(Pin::new(&mut fut_b).poll(&mut cx_b), Poll::Pending);
+        assert_eq!(watch.registered_waiters(), 2);
+
+        watch.bump(1);
+
+        assert!(woken_a.woken(), "the first-registered waiter must be woken");
+        assert!(
+            woken_b.woken(),
+            "the second-registered waiter must ALSO be woken -- a single-slot \
+             AtomicWaker would have evicted the first registration and only \
+             woken this one, or vice versa depending on registration order"
+        );
+
+        // Both resolve on their next poll.
+        assert_eq!(Pin::new(&mut fut_a).poll(&mut cx_a), Poll::Ready(1));
+        assert_eq!(Pin::new(&mut fut_b).poll(&mut cx_b), Poll::Ready(1));
+    }
+
+    /// Register-before-check: if `bump` races in between a waiter's
+    /// `applied` load and its park, the waiter must still catch it — there
+    /// is no wake-before-park window to lose a signal in. Proven directly
+    /// by registering the waker *first* (as `poll` always does), THEN
+    /// bumping, THEN checking `applied` — the exact order `poll` follows
+    /// internally, just pulled apart into separate steps here so the test
+    /// can assert on the intermediate state.
+    #[test]
+    fn a_late_registrant_still_sees_a_watermark_that_already_advanced() {
+        let watch = AppliedWatch::default();
+        watch.bump(5);
+
+        // A waiter created AFTER the advance must resolve on its very
+        // first poll, not park at all.
+        let (waker, _woken) = test_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = watch.changed(0);
+        assert_eq!(Pin::new(&mut fut).poll(&mut cx), Poll::Ready(5));
+        assert_eq!(
+            watch.registered_waiters(),
+            0,
+            "a future that resolves on its first poll must not leave a \
+             slot behind"
+        );
+
+        // A waiter parked on the CURRENT watermark, then bumped again,
+        // still wakes and resolves to the new value.
+        let (waker2, woken2) = test_waker();
+        let mut cx2 = Context::from_waker(&waker2);
+        let mut fut2 = watch.changed(5);
+        assert_eq!(Pin::new(&mut fut2).poll(&mut cx2), Poll::Pending);
+        watch.bump(6);
+        assert!(woken2.woken());
+        assert_eq!(Pin::new(&mut fut2).poll(&mut cx2), Poll::Ready(6));
+    }
+
+    /// A `changed()` future dropped before `bump()` (e.g. a write whose
+    /// caller gave up) must remove its own slot from the registry — no
+    /// leak — and must not prevent a surviving waiter from being woken.
+    #[test]
+    fn dropped_waiter_does_not_leak_its_slot_or_block_the_survivor() {
+        let watch = AppliedWatch::default();
+
+        let (waker_survivor, woken_survivor) = test_waker();
+        let (waker_dropped, _woken_dropped) = test_waker();
+        let mut cx_survivor = Context::from_waker(&waker_survivor);
+        let mut cx_dropped = Context::from_waker(&waker_dropped);
+
+        let mut fut_survivor = watch.changed(0);
+        assert_eq!(
+            Pin::new(&mut fut_survivor).poll(&mut cx_survivor),
+            Poll::Pending
+        );
+
+        {
+            let mut fut_dropped = watch.changed(0);
+            assert_eq!(
+                Pin::new(&mut fut_dropped).poll(&mut cx_dropped),
+                Poll::Pending
+            );
+            assert_eq!(watch.registered_waiters(), 2);
+        }
+        // `fut_dropped` is now dropped without ever resolving.
+        assert_eq!(
+            watch.registered_waiters(),
+            1,
+            "the dropped future's slot must be removed"
+        );
+
+        watch.bump(1);
+        assert!(woken_survivor.woken(), "the survivor must still be woken");
+        assert_eq!(
+            Pin::new(&mut fut_survivor).poll(&mut cx_survivor),
+            Poll::Ready(1)
+        );
+    }
+
+    /// `bump` with a non-advancing (or regressing) index is a no-op: no
+    /// wake, no watermark change — mirrors `MetadataWatch::bump`'s own
+    /// `if index > prev` guard.
+    #[test]
+    fn bump_with_a_non_advancing_index_is_a_no_op() {
+        let watch = AppliedWatch::default();
+        watch.bump(5);
+
+        let (waker, woken) = test_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = watch.changed(5);
+        assert_eq!(Pin::new(&mut fut).poll(&mut cx), Poll::Pending);
+
+        watch.bump(3); // regresses -- must not wake or move the watermark
+        assert!(!woken.woken());
+        assert_eq!(watch.latest(), 5);
+        assert_eq!(Pin::new(&mut fut).poll(&mut cx), Poll::Pending);
+
+        watch.bump(5); // repeats the current value -- also a no-op
+        assert!(!woken.woken());
     }
 }

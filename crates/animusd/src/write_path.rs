@@ -17,9 +17,9 @@ use animus_env::{Env, Metric, Nanos};
 use animus_node::host::RelayClient;
 
 use crate::{
-    CLIENT_TIMEOUT, CP_CONFIRM_POLL_INIT, CP_CONFIRM_POLL_MAX, ClientCtx, ClientRequest,
-    ClientResponse, CpGroup, CpRoute, KindBatchSignal, KindWriteOp, KvPair, ProbeIdentity,
-    ProbeWait, SCHEMA_POLL_INTERVAL, classify_kind_batch_outcome, decide, dynamo,
+    CLIENT_TIMEOUT, CP_CONFIRM_POLL_MAX, ClientCtx, ClientRequest, ClientResponse, CpGroup,
+    CpRoute, KindBatchSignal, KindWriteOp, KvPair, ProbeIdentity, ProbeWait, SCHEMA_POLL_INTERVAL,
+    classify_kind_batch_outcome, decide, dynamo,
 };
 
 /// The message [`ClientCtx::cp_kind_eval_local`] returns for a confirmed-
@@ -399,6 +399,53 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         }
     }
 
+    /// **Wake-on-apply confirm wait**: park until `leader`'s own
+    /// `engine_applied_index()` passes `index`, instead of a fixed/backed-off
+    /// poll. Every confirm loop in this file shares this one primitive so
+    /// their outer shape (outcome classification, futility check, deadline,
+    /// the probe-vs-apply re-check, `ProbeIdentity` gating) stays exactly as
+    /// written — only the old `sleep(poll); poll = (poll *
+    /// 2).min(CP_CONFIRM_POLL_MAX)` tail is replaced.
+    ///
+    /// Returns immediately if `index` is already applied (including the
+    /// instant this call is first made — no wake-before-park race, since
+    /// `AppliedWatch::changed` re-checks the watermark fresh on every poll).
+    /// Otherwise parks on the group's `AppliedWatch`, woken the moment the
+    /// apply task advances past `index` — but that park races against a
+    /// plain `CP_CONFIRM_POLL_MAX` sleep, so this **always** returns at
+    /// least that often even if nothing ever applies again (the group loses
+    /// its leader, a quorum is lost, the entry gets superseded). That forced
+    /// re-check is what lets every caller's own
+    /// `confirm_wait_is_futile`/deadline logic — which this helper never
+    /// evaluates itself — keep firing on schedule instead of hanging until a
+    /// wake that may never come.
+    async fn wait_applied_past(leader: &CpGroup<E>, index: u64) {
+        let watch = leader.applied_watch();
+        loop {
+            // Ordering invariant: read the watch's cursor BEFORE checking
+            // `engine_applied_index`, never after. `changed(seen)` only
+            // wakes on a bump that lands *after* `seen` was captured — read
+            // `seen` after the check and a bump landing in the gap between
+            // the two reads is already folded into `seen`, so `changed`
+            // then waits for a further bump that may never come and this
+            // wait overshoots all the way to the `CP_CONFIRM_POLL_MAX`
+            // fallback on every such race, exactly the overshoot this
+            // helper exists to remove. Reading first is race-free: `changed`
+            // re-registers and re-checks fresh on every poll (see its own
+            // doc), so a bump between this `latest()` and the index check
+            // below is still caught the instant this future is polled.
+            let seen = watch.latest();
+            if leader.engine_applied_index() >= index {
+                return;
+            }
+            let _ = futures::future::select(
+                watch.changed(seen),
+                leader.env().sleep(CP_CONFIRM_POLL_MAX),
+            )
+            .await;
+        }
+    }
+
     /// The **known-leader** local half of [`cp_kind_write_raw`](Self::
     /// cp_kind_write_raw): fence pre-check, propose, then confirm on the
     /// batch's **last** write — `Some(value)` for a put, `None` for a
@@ -442,13 +489,17 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             other => return Err(format!("kind write not accepted: {other:?}")),
         };
         let deadline = leader.env().now().saturating_add(CLIENT_TIMEOUT);
-        // The same exponential confirm back-off `cp_put_local` uses — NOT the
-        // drain's old flat 10ms sleep. This is a client hot path since ADR
-        // 0049 routed every plain Dynamo/raw-protocol write through it,
-        // and a flat 10ms floor put one whole tick under nearly every
-        // sequential write (measured on the ADR 0049 §5 bench: ~13.6 ms/op
-        // vs the pre-train ~4.7 — the poll cadence, not the marker bytes).
-        let mut poll = CP_CONFIRM_POLL_INIT;
+        // Wake-on-apply confirm wait (`wait_applied_past`) — NOT the drain's
+        // old flat 10ms sleep, nor the exponential poll that replaced it and
+        // this loop shared with `cp_put_local` before it. This is a client
+        // hot path since ADR 0049 routed every plain Dynamo/raw-protocol
+        // write through it, and a flat 10ms floor put one whole tick under
+        // nearly every sequential write (measured on the ADR 0049 §5 bench:
+        // ~13.6 ms/op vs the pre-train ~4.7 — the poll cadence, not the
+        // marker bytes); the exponential poll it was replaced with then
+        // rounded every write up to its own next checkpoint (an average
+        // half-a-step overshoot). Waking exactly when the apply task
+        // advances removes that rounding entirely.
         while leader.env().now() < deadline {
             if leader.local_get_kind(probe_kind, &probe_key).await == probe_value {
                 return Ok(());
@@ -469,8 +520,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                         .into(),
                 );
             }
-            leader.env().sleep(poll).await;
-            poll = (poll * 2).min(CP_CONFIRM_POLL_MAX);
+            Self::wait_applied_past(leader, accepted_index).await;
         }
         Err("kind batch did not apply in time".into())
     }
@@ -529,19 +579,21 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 other => return Err(format!("kind eval not accepted: {other:?}")),
             };
         let deadline = leader.env().now().saturating_add(CLIENT_TIMEOUT);
-        // The same exponential confirm back-off `cp_put_local`/`cp_batch_local`
-        // use — NOT a flat `SCHEMA_POLL_INTERVAL` (50ms) sleep, which this loop
-        // used to carry over from the schema-DDL poll it was modeled on. This is
-        // THE client hot path for every single-item write since ADR 0054 step 3
-        // (`PutItem`/`UpdateItem`/`DeleteItem` via `dynamo::
-        // kind_write_item_at_leader`, the TTL reaper, and the admin seeder's
-        // per-item images arm) — a flat 50ms floor caps it at ~20 ops/s
-        // regardless of how fast the underlying Raft group actually commits,
-        // since the very first poll right after `propose_kind_eval` is almost
-        // always `Inconclusive` (apply hasn't run yet). Paired with the cp-data
-        // wake-on-propose, a write that commits+applies in a few ms now returns
-        // in well under a millisecond instead of eating the fixed floor.
-        let mut poll = CP_CONFIRM_POLL_INIT;
+        // Wake-on-apply confirm wait (`wait_applied_past`) — NOT a flat
+        // `SCHEMA_POLL_INTERVAL` (50ms) sleep, which this loop used to carry
+        // over from the schema-DDL poll it was modeled on, nor the
+        // exponential poll that replaced it and this loop shared with
+        // `cp_put_local`/`cp_batch_local`. This is THE client hot path for
+        // every single-item write since ADR 0054 step 3 (`PutItem`/
+        // `UpdateItem`/`DeleteItem` via `dynamo::kind_write_item_at_leader`,
+        // the TTL reaper, and the admin seeder's per-item images arm) — a
+        // flat 50ms floor caps it at ~20 ops/s regardless of how fast the
+        // underlying Raft group actually commits, and an exponential poll's
+        // own doubling schedule still rounds every write up to its next
+        // checkpoint. Waking exactly when the apply task advances removes
+        // that rounding entirely: paired with the cp-data wake-on-propose, a
+        // write that commits+applies in a few ms now returns in well under a
+        // millisecond instead of eating either fixed floor.
         loop {
             let effects_readable = leader.engine_applied_index() >= accepted_index;
             let outcome = leader.kind_batch_outcome(accepted_index);
@@ -592,8 +644,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             if leader.env().now() >= deadline {
                 return Err(KIND_EVAL_CONFIRM_AMBIGUOUS.into());
             }
-            leader.env().sleep(poll).await;
-            poll = (poll * 2).min(CP_CONFIRM_POLL_MAX);
+            Self::wait_applied_past(leader, accepted_index).await;
         }
     }
 
@@ -880,7 +931,12 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             if leader.env().now() >= deadline {
                 return ProbeWait::TimedOut;
             }
-            leader.env().sleep(SCHEMA_POLL_INTERVAL).await;
+            // Wake-on-apply confirm wait (`wait_applied_past`) — was a flat
+            // `SCHEMA_POLL_INTERVAL` (50ms) sleep; every iteration of this
+            // loop that reached here (`Inconclusive`, no value match yet)
+            // used to eat that whole floor even when the entry applied a
+            // moment later.
+            Self::wait_applied_past(leader, accepted_index).await;
         }
     }
 
@@ -985,7 +1041,6 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         match leader.put(key.clone(), value.clone()) {
             ProposeResult::Accepted { index, .. } => {
                 let deadline = leader.env().now().saturating_add(CLIENT_TIMEOUT);
-                let mut poll = CP_CONFIRM_POLL_INIT;
                 loop {
                     if leader.local_get(&key).await.as_deref() == Some(value.as_slice()) {
                         return Ok(());
@@ -1008,8 +1063,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     if leader.env().now() >= deadline {
                         return Err("CP write did not commit in time".into());
                     }
-                    leader.env().sleep(poll).await;
-                    poll = (poll * 2).min(CP_CONFIRM_POLL_MAX);
+                    Self::wait_applied_past(leader, index).await;
                 }
             }
             ProposeResult::NotLeader { .. } => Err("CP group leader moved; retry".into()),
@@ -1039,7 +1093,6 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         match leader.delete(key.clone()) {
             ProposeResult::Accepted { index, .. } => {
                 let deadline = leader.env().now().saturating_add(CLIENT_TIMEOUT);
-                let mut poll = CP_CONFIRM_POLL_INIT;
                 loop {
                     if leader.local_get(&key).await.is_none() {
                         return Ok(());
@@ -1062,8 +1115,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     if leader.env().now() >= deadline {
                         return Err("CP delete did not commit in time".into());
                     }
-                    leader.env().sleep(poll).await;
-                    poll = (poll * 2).min(CP_CONFIRM_POLL_MAX);
+                    Self::wait_applied_past(leader, index).await;
                 }
             }
             ProposeResult::NotLeader { .. } => Err("CP group leader moved; retry".into()),
@@ -1324,19 +1376,25 @@ mod poll_probe_identity_tests {
     }
 }
 
-/// Regression for the 50ms flat-poll floor regression this file's own
+/// Regression for the confirm-wait poll floor this file's own
 /// `cp_kind_eval_local` doc/comment above names: since ADR 0054 step 3 this
 /// method is the confirm loop for **every** single-item write
 /// (`PutItem`/`UpdateItem`/`DeleteItem` via `dynamo::
 /// kind_write_item_at_leader`, the TTL reaper, and the admin seeder's
-/// per-item images arm) — a flat `SCHEMA_POLL_INTERVAL` (50ms) sleep
-/// between confirm checks caps sequential single-item write throughput at
-/// ~20 ops/s, since the very first poll right after `propose_kind_eval` is
+/// per-item images arm), and any fixed sleep between confirm checks caps
+/// sequential single-item write throughput at however many of that sleep
+/// fit in a second — the very first poll right after `propose_kind_eval` is
 /// almost always `Inconclusive` (apply hasn't run yet), so *every* write
-/// pays at least one full poll interval. Fixed by reusing the same
-/// exponential back-off (`CP_CONFIRM_POLL_INIT` doubling to
-/// `CP_CONFIRM_POLL_MAX`) every sibling confirm loop in this file already
-/// uses (`cp_batch_local`, `cp_put_local`/`cp_delete_local`).
+/// used to pay at least one poll interval no matter how small. Fixed by
+/// `wait_applied_past`, which wakes the instant the tablet group's own
+/// apply task advances past this write's accepted index instead of
+/// sleeping for any fixed interval at all — including the exponential
+/// `poll`/`poll = (poll * 2).min(CP_CONFIRM_POLL_MAX)` back-off this loop
+/// (and every sibling confirm loop in this file: `cp_kind_raw_local`,
+/// `cp_put_local`/`cp_delete_local`, `poll_probe`) used before that: that
+/// scheme's own doubling checkpoints (0.2/0.6/1.4/3.0/6.2ms) rounded every
+/// write up to its next step, an average half-a-step overshoot on top of
+/// real apply latency.
 ///
 /// This is a timing floor, so it is asserted in **virtual** `SimEnv` time
 /// (root `CLAUDE.md`'s "Testing" rule: a timing property is best proven
@@ -1344,17 +1402,22 @@ mod poll_probe_identity_tests {
 /// harness style (a single-voter `RaftKvNode<SimEnv, MemoryEngine>`, no
 /// sockets, no `ProdEnv`) one file section up, reused nearly verbatim.
 ///
-/// **Confirmed to fail on the old code**: reverting this file's fix (the
-/// exponential `poll`/`poll = (poll * 2).min(CP_CONFIRM_POLL_MAX)` back to
-/// a bare `leader.env().sleep(SCHEMA_POLL_INTERVAL).await`) makes
-/// `a_single_item_write_confirms_in_well_under_the_old_50ms_poll_floor`
-/// fail deterministically — `WRITE_COUNT` (20) sequential writes then take
-/// `WRITE_COUNT * SCHEMA_POLL_INTERVAL` = 1s of virtual time (each write's
-/// first, and only, poll is `Inconclusive`, so each pays the full 50ms
-/// floor exactly once), comfortably over this test's own `BOUND` (200ms) —
-/// verified by hand before landing this test, not merely reasoned about.
+/// **Confirmed to fail on the old code, measured by hand, not merely
+/// reasoned about**: a single voter's apply task runs as a plain scheduled
+/// task under `SimEnv` with no simulated network/disk latency of its own,
+/// so `wait_applied_past` never needs to advance virtual time at all here —
+/// the apply task simply gets its turn (still at the same virtual instant)
+/// before the confirm task is polled again, and `WRITE_COUNT` (20)
+/// sequential writes measure **0ns** of virtual time end to end. Reverting
+/// this file's fix back to the exponential `poll`/`poll = (poll *
+/// 2).min(CP_CONFIRM_POLL_MAX)` back-off it replaced instead measures
+/// `WRITE_COUNT * CP_CONFIRM_POLL_INIT` = 4ms (every write's first, and
+/// only, poll is `Inconclusive`, so each pays exactly one `CP_CONFIRM_
+/// POLL_INIT` sleep) — comfortably over this test's own `BOUND` (1ms, wide
+/// margin above the fixed code's 0ns and decisively under the old scheme's
+/// 4ms floor).
 #[cfg(test)]
-mod kind_eval_confirm_backoff_tests {
+mod kind_eval_confirm_wake_tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -1411,32 +1474,35 @@ mod kind_eval_confirm_backoff_tests {
     }
 
     /// Sequential single-item writes driven through this test — enough to
-    /// make a per-write poll-floor regression add up to something a wide
+    /// make a per-write poll-floor regression add up to something a tight
     /// bound still catches cleanly.
     const WRITE_COUNT: u64 = 20;
 
-    /// The bound the fixed exponential back-off must clear comfortably —
-    /// `WRITE_COUNT * 10ms`, a fifth of the old flat-floor total
-    /// (`WRITE_COUNT * SCHEMA_POLL_INTERVAL` = 1s) and with wide margin
-    /// over what the fix actually needs (each write pays at worst a
-    /// handful of sub-5ms polls, not one 10ms poll).
-    const BOUND: Duration = Duration::from_millis(WRITE_COUNT * 10);
+    /// The bound wake-on-apply must clear comfortably: `WRITE_COUNT`
+    /// sequential single-item writes measure **0ns** of virtual time on the
+    /// fixed code (see this module's own doc for how, and the by-hand
+    /// measurement) — this leaves 1ms of headroom for that, while staying
+    /// decisively under the exponential back-off's own 4ms floor
+    /// (`WRITE_COUNT * CP_CONFIRM_POLL_INIT`) it replaced, so a regression
+    /// back toward *any* fixed per-write sleep — the old exponential
+    /// back-off included — fails this bound.
+    const BOUND: Duration = Duration::from_millis(1);
 
     #[test]
-    fn a_single_item_write_confirms_in_well_under_the_old_50ms_poll_floor() {
+    fn a_single_item_write_confirms_with_no_poll_delay_at_all() {
         run(0x0C0F_0001);
     }
 
     #[test]
-    fn a_single_item_write_confirms_in_well_under_the_old_50ms_poll_floor_seed2() {
+    fn a_single_item_write_confirms_with_no_poll_delay_at_all_seed2() {
         run(0x0C0F_0002);
     }
 
     /// Replay proof (repo convention): `ANIMUS_SEED=<seed> cargo test -p
-    /// animusd --lib replays_the_confirm_backoff_bound_from_an_explicit_env_seed`
+    /// animusd --lib replays_the_confirm_wake_bound_from_an_explicit_env_seed`
     /// reruns this exact scenario from a printed seed.
     #[test]
-    fn replays_the_confirm_backoff_bound_from_an_explicit_env_seed() {
+    fn replays_the_confirm_wake_bound_from_an_explicit_env_seed() {
         let seed = std::env::var("ANIMUS_SEED")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -1495,7 +1561,259 @@ mod kind_eval_confirm_backoff_tests {
             elapsed <= BOUND,
             "seed={seed}: {WRITE_COUNT} sequential single-item writes took \
              {elapsed:?} of virtual time, expected <= {BOUND:?} — the confirm \
-             loop has regressed back toward the old flat 50ms poll floor"
+             loop has regressed back toward a fixed per-write poll delay"
+        );
+    }
+}
+
+/// Regression proving `wait_applied_past`'s **forced re-check**
+/// (`CP_CONFIRM_POLL_MAX`) actually fires. Without it, a confirm loop
+/// parked on `AppliedWatch::changed` for an index that will **never**
+/// apply — because the accepted entry gets superseded by a leadership
+/// change before it ever commits — would hang forever: nothing ever bumps
+/// the watermark past that index, so a pure `watch.changed(seen).await`
+/// with no timeout races alongside it would never resolve either. The
+/// surrounding loop's own `decide::confirm_wait_is_futile` check only gets
+/// a chance to re-fire once `wait_applied_past` itself returns, so this
+/// also exercises the real end-to-end property: the confirm resolves
+/// `Superseded`, not a hang and not the full `CLIENT_TIMEOUT` deadline.
+///
+/// Driven like `poll_probe_identity_tests`: propose manually (so the exact
+/// accepted `(index, term)` is in hand) and call `poll_probe` directly on
+/// it, skipping the propose-inside-the-primitive public wrappers — every
+/// caller-facing wrapper (`cp_put_local`/`cp_kind_raw_local`/
+/// `cp_kind_eval_local`) maps this same `ProbeWait::Superseded`/
+/// `KindBatchSignal` outcome into its own "...superseded before its effect
+/// appeared (leadership churn or an apply-time no-op); retry" string —
+/// `poll_probe` is the one shared primitive underneath all of them.
+///
+/// The scenario is a genuine leadership change, engineered with
+/// `Simulator::partition`/`heal` rather than `transfer_leadership`: an
+/// armed transfer only *freezes new proposes*, it does not stop the
+/// already-accepted entry from replicating and committing in the same
+/// virtual instant on a healthy link (measured — that first draft always
+/// observed `Confirmed`, never `Superseded`, since a two-node group's
+/// second voter acks near-instantly under `SimEnv`'s zero-latency
+/// network). So instead: a **three**-voter group, with the eventual leader
+/// fully isolated (both directions) from its peers *before* the propose —
+/// the entry is accepted locally but can never replicate, hence never
+/// commit — while the other two, cut off from its heartbeats, elect a new
+/// leader among themselves (still a majority of three). The confirm task
+/// is spawned and parks on its **first** `wait_applied_past` wait while
+/// the old leader still (falsely) reports itself leader; only *after* that
+/// park does this test heal the partition and let the old leader learn
+/// the new term and step down — so the futility this test pins is
+/// discovered strictly through `wait_applied_past`'s forced re-check
+/// noticing the state change on a later wake, never on the confirm loop's
+/// very first, pre-partition-heal check.
+#[cfg(test)]
+mod wait_applied_past_futility_tests {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use animus_cp_data::{KIND_BASE, RaftKvNode};
+    use animus_env::{Clock, EnvExt, nid};
+    use animus_sim::{SimEnv, Simulator};
+    use animus_storage::MemoryEngine;
+
+    use super::*;
+
+    #[derive(Clone, Copy, Debug, Default)]
+    struct NeverRelay;
+
+    #[async_trait::async_trait]
+    impl RelayClient for NeverRelay {
+        async fn relay(
+            &self,
+            addr: String,
+            _request: &ClientRequest,
+            _timeout: Duration,
+        ) -> ClientResponse {
+            ClientResponse::Error(format!(
+                "NeverRelay: this three-node harness never relays (addr={addr})"
+            ))
+        }
+    }
+
+    /// A three-voter `RaftKvNode<SimEnv, MemoryEngine>` cluster — every node
+    /// shares `sim`'s own network, so no manual message pump is needed
+    /// (mirrors `leader_transfer_reconfigure.rs`'s bring-up).
+    fn three_voter_cluster(seed: u64) -> (Simulator, Vec<RaftKvNode<SimEnv, MemoryEngine>>) {
+        let sim = Simulator::new(seed);
+        let ids = [nid(0), nid(1), nid(2)];
+        let nodes: Vec<_> = ids
+            .iter()
+            .map(|id| RaftKvNode::start(sim.env(id.clone()), ids.to_vec(), MemoryEngine::new()))
+            .collect();
+        (sim, nodes)
+    }
+
+    /// The current leader among `nodes`, if exactly one reports it — mirrors
+    /// `leader_transfer_reconfigure.rs::leader_among`.
+    fn leader_index(nodes: &[RaftKvNode<SimEnv, MemoryEngine>]) -> Option<usize> {
+        let ls: Vec<usize> = (0..nodes.len()).filter(|&i| nodes[i].is_leader()).collect();
+        if ls.len() == 1 { Some(ls[0]) } else { None }
+    }
+
+    #[test]
+    fn a_superseded_confirm_wait_resolves_via_futility_not_a_hang() {
+        run(0x0F0F_0001);
+    }
+
+    #[test]
+    fn a_superseded_confirm_wait_resolves_via_futility_not_a_hang_seed2() {
+        run(0x0F0F_0002);
+    }
+
+    /// Replay proof (repo convention): `ANIMUS_SEED=<seed> cargo test -p
+    /// animusd --lib replays_the_superseded_confirm_wait_from_an_explicit_env_seed`
+    /// reruns this exact scenario from a printed seed.
+    #[test]
+    fn replays_the_superseded_confirm_wait_from_an_explicit_env_seed() {
+        let seed = std::env::var("ANIMUS_SEED")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0x0F0F_0003);
+        run(seed);
+    }
+
+    fn run(seed: u64) {
+        let (mut sim, nodes) = three_voter_cluster(seed);
+        sim.run_for(Duration::from_secs(2));
+        let l = leader_index(&nodes)
+            .unwrap_or_else(|| panic!("a three-voter cluster must elect a leader (seed={seed})"));
+        let l_id = nid(l as u64);
+        let followers: Vec<usize> = (0..nodes.len()).filter(|&i| i != l).collect();
+        let follower_ids: Vec<_> = followers.iter().map(|&i| nid(i as u64)).collect();
+
+        // Isolate the leader in BOTH directions before it ever proposes:
+        // the entry it is about to accept must never reach either peer.
+        for f in &follower_ids {
+            sim.partition_pair(l_id.clone(), f.clone());
+        }
+
+        let leader = nodes[l].clone();
+        let key = b"item".to_vec();
+        let value = b"will-never-land".to_vec();
+        let (accepted_index, accepted_term) = match leader.put_kind_batch(
+            vec![(KIND_BASE, key.clone(), Some(value.clone()))],
+            Vec::new(),
+        ) {
+            ProposeResult::Accepted { index, term } => (index, term),
+            other => panic!("propose not accepted (seed={seed}): {other:?}"),
+        };
+
+        // Spawn the confirm task now, while the (isolated) old leader still
+        // reports itself as leader — `poll_probe`'s very first check must
+        // see `Inconclusive`/not-yet-futile here.
+        let deadline = leader.env().now().saturating_add(Duration::from_secs(10));
+        let env = leader.env().clone();
+        let group = CpGroup::Mem(leader.clone());
+        let slot: Arc<Mutex<Option<ProbeWait>>> = Arc::new(Mutex::new(None));
+        let out = slot.clone();
+        {
+            let key = key.clone();
+            let value = value.clone();
+            env.spawn_task(async move {
+                let result = ClientCtx::<SimEnv, NeverRelay>::poll_probe(
+                    &group,
+                    accepted_index,
+                    accepted_term,
+                    &key,
+                    &value,
+                    ProbeIdentity::ValueProves,
+                    deadline,
+                )
+                .await;
+                *out.lock().expect("result slot poisoned") = Some(result);
+            });
+        }
+
+        // Let the confirm task take its first poll and settle into its
+        // `wait_applied_past` park — still not futile, since the isolated
+        // leader has not yet learned it no longer leads.
+        sim.run_for(Duration::from_millis(50));
+        assert!(
+            slot.lock().expect("result slot poisoned").is_none(),
+            "the confirm must still be waiting at this point, or this run \
+             doesn't exercise the accepted-but-unapplied window this test \
+             exists to pin (seed={seed})"
+        );
+        assert!(
+            leader.is_leader(),
+            "the isolated leader must not have noticed anything is wrong \
+             yet — it has received no message at all (seed={seed})"
+        );
+
+        // Let the two followers, cut off from the isolated leader's
+        // heartbeats, elect a new leader among themselves — a majority of
+        // three. Converged-or-timeout (root `CLAUDE.md`'s "Testing" rule).
+        let mut new_leader = None;
+        for _ in 0..40 {
+            sim.run_for(Duration::from_millis(100));
+            new_leader = followers
+                .iter()
+                .copied()
+                .find(|&i| nodes[i].is_leader() && nodes[i].term() > accepted_term);
+            if new_leader.is_some() {
+                break;
+            }
+        }
+        assert!(
+            new_leader.is_some(),
+            "the two followers never elected a new leader while isolated \
+             from the old one (seed={seed})"
+        );
+
+        // Heal: let the stale leader learn of the new term and step down.
+        for f in &follower_ids {
+            sim.heal(l_id.clone(), f.clone());
+        }
+        let mut stepped_down = false;
+        for _ in 0..40 {
+            sim.run_for(Duration::from_millis(100));
+            if !leader.is_leader() {
+                stepped_down = true;
+                break;
+            }
+        }
+        assert!(
+            stepped_down,
+            "the old leader never learned of the new term and stepped down \
+             after healing (seed={seed})"
+        );
+
+        // Drive the confirm task the rest of the way to completion.
+        let mut result = None;
+        for _ in 0..100 {
+            sim.run_for(Duration::from_millis(100));
+            result = slot.lock().expect("result slot poisoned").take();
+            if result.is_some() {
+                break;
+            }
+        }
+
+        assert_eq!(
+            result,
+            Some(ProbeWait::Superseded),
+            "a confirm wait for an entry superseded by a leadership change \
+             must resolve Superseded, not hang and not merely exhaust its \
+             own 10s deadline (seed={seed}): {result:?}"
+        );
+        // The accepted entry's own bytes must never have landed: once
+        // healed, the new leader's log (which never held this entry)
+        // overwrites this node's log tail at the same index, so
+        // `engine_applied_index` alone can legitimately reach or pass
+        // `accepted_index` again — just via a DIFFERENT entry (the new
+        // leader's own post-election no-op), which is exactly why
+        // `classify_kind_batch_outcome`'s term check (not index alone) is
+        // load-bearing, and why this confirms via the value never
+        // appearing rather than via engine_applied staying behind.
+        assert_eq!(
+            futures::executor::block_on(leader.local_get_kind(KIND_BASE, &key)),
+            None,
+            "the superseded entry's write must never have applied under \
+             any term (seed={seed})"
         );
     }
 }

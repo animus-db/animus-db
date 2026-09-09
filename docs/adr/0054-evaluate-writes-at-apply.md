@@ -751,6 +751,23 @@ per-attempt burn that used to let brief leadership churn on a starved CI
 runner stack two 10s stalls into one 25s client budget (the historical
 `cp_txn.rs` seed-put flake this regression was written against).
 
+**Later amendment (cluster-performance follow-up): "notices ... almost
+immediately" no longer means a fast poll tick — it means a wake.**
+`cp_kind_eval_local`'s (and every sibling confirm loop's, including
+`poll_probe`'s own value-equality fallback path above) `Inconclusive`
+retry tail no longer sleeps at all: it awaits `write_path::
+wait_applied_past`, which parks on the tablet group's `AppliedWatch`
+(`animus-cp-data`, mirroring `animus-control`'s `MetadataWatch`) and
+resolves the instant the apply task advances — bounded only by a forced
+`CP_CONFIRM_POLL_MAX` re-check so the loop's own futility/deadline logic
+still fires on schedule if the awaited index never applies at all (a lost
+leadership). The `NoOp`/`ConditionFailed` fast path this section describes
+is unchanged either way, since it never reached the poll/wait tail to
+begin with — this amendment only changes what happens in the
+`Inconclusive` case, replacing the exponential `CP_CONFIRM_POLL_INIT`/
+`_MAX` back-off ADR 0049 §5 measured in as its own confirm-poll cadence
+fix.
+
 **No unsafe 2PC protocol change was needed to complete step 4a/4b** — the
 task brief's own contingency ("if 4a reveals it needs an unsafe protocol
 change, stop and document the obstacle") did not trigger. The only design

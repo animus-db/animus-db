@@ -475,6 +475,16 @@
 <span class="p">$</span> <span class="k">animus admin import-describe &lt;admin-addr&gt; &lt;import-arn&gt;</span>
 <span class="p">$</span> <span class="k">animus admin import-list &lt;admin-addr&gt; [table-arn]</span></pre>
       </div>
+      <p>
+        Bulk-loading synthetic data is a client tool, not a server action: <code>animus seed</code>
+        generates items and writes them through real <code>BatchWriteItem</code> calls (proxied
+        through the same admin interface) rather than an internal write primitive — one write path,
+        with throttled rows retried and reported instead of silently dropped.
+      </p>
+      <div class="code">
+        <div class="code-head"><span class="lights"><i></i><i></i><i></i></span><span class="title">animus seed</span></div>
+<pre><span class="p">$</span> <span class="k">animus seed &lt;admin-addr&gt; &lt;table&gt; &lt;count&gt; [--start N] [--key-prefix P] [--value-bytes B] [--concurrency C] [--batch N]</span></pre>
+      </div>
     </section>
 
     <section id="deployments">
