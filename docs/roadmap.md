@@ -1092,20 +1092,43 @@ the still-true paragraph after the table.
 - **Problem:** per-table throttle-metric counters (ADR 0065's throttling
   mechanism's own observability surface) are provable only over `ProdEnv`
   today — the smallest of the four groups left unowned after C-10 (1
-  file/6 tests per the D3-closing class-D breakdown, unchanged since).
-- **What:** plan drafted, awaiting the maintainer's sequencing — see ADR
-  0061's "Rung J closed" amendment's own "what remains unowned after C-10"
-  paragraph for the candidate list and why this one is recommended first
-  (smallest, no new deployment-shape fixture needed, unlike the
-  control/data role split or `--config` bring-up).
+  file/6 tests per the D3-closing class-D breakdown, unchanged since). The
+  group's own documented blocker (the claim that `SimCluster`'s nodes
+  carry no metrics sink) turned out stale on inspection: they have carried
+  a real one since rung D2 PR 1.
+- **What:** `dynamo::kind_write_item_at_leader`/`run_transact`/
+  `dispatch_item_op` and the read-path precharge site are all already
+  generic and already increment `Metric::ThrottledWrites`/`ThrottledReads`
+  via `ctx.data().raftkv_metrics`/`data.raftkv_metrics` — zero production
+  signature changes needed, this rung's own distinguishing property.
+  4 PRs: PR 1 this docs opener (also corrects the two stale module docs
+  that said the counters never increment under `SimCluster`); PR 2
+  `sim_cluster_dynamo_throttle.rs` converting the four wire-shape tests
+  (`BatchWriteItem`/`BatchGetItem` shedding, `TransactWriteItems`
+  cancellation, a forwarded-write throttle check), each calling
+  `SimCluster::set_throttle_defaults_all` before the burst that trips the
+  limit — `tests/dynamo_throttling.rs` stays untrimmed until PR 3; PR 3
+  `admin_metrics_reports_nonzero_throttled_counters` into
+  `sim_cluster_admin.rs`, trimming `dynamo_throttling.rs` to its one
+  residual (`cluster_wide_throttle_default_is_overridden_by_a_tables_own_
+  throughput`, a `run_node_with_cluster_settings`-only config-parse test
+  expected to stay permanent); PR 4 docs close-out. **Not yet sequenced by
+  the maintainer explicitly** — this PR proceeds on Rung J's own close-out
+  recommendation as a stated assumption; two decisions stay open: whether
+  C-11 is next at all, and whether `--config` bring-up/node
+  assembly-raw-`ClientRequest` are assessed-and-closed as permanent
+  `ProdEnv` residue (with the control/data role split deferred to a later
+  rung) versus opened as their own rungs. See ADR 0061's 2026-09-09
+  "Rung K (post-C-10)" opener amendment for the full grep-verified ground
+  truth, the per-PR gates, and the binding rules.
 - **ADR:** [0061](adr/0061-testability-node-crate-simulator.md) (rung K,
-  not yet opened), [0065](adr/0065-per-table-throttling.md) (the throttling
+  open), [0065](adr/0065-per-table-throttling.md) (the throttling
   mechanism itself).
-- **Size:** unassessed — plan drafted, not yet sized PR-by-PR.
+- **Size:** S, 4 PRs.
 - **Depends:** C-10 (closed) — the next unowned residual group per C-08's,
   C-09's, and C-10's own close-outs.
-- **Status (2026-09-09):** not started — plan drafted, awaiting the
-  maintainer's sequencing.
+- **Status (2026-09-09):** open — PR 1 (this docs opener) landed; PRs 2-4
+  planned.
 
 ---
 
@@ -1188,6 +1211,7 @@ wave are independent and can run in parallel.
 | 9 | C-08 (closed 2026-09-08 — all eight PRs landed: #764, #765, #766, #767, #773, #776, #777, PR 8) | Gated on C-04 (closed), C-06 (closed), and C-07 (closed) — the same generic dispatch cores, plus rung C5's own widening of `ClientCtx`'s field types |
 | 10 | C-09 (closed 2026-09-09 — all six PRs landed: #780, #782, #785, #786, #787, plus PR 6) | Gated on C-08 (closed) — C-08's own close-out recommendation, stacked directly on it |
 | 11 | C-10 (closed 2026-09-09 — all seven PRs landed: #789, #790, #791, #792, #793, #794, plus PR 7) | Gated on C-09 (closed) — the next unowned residual group per C-08's and C-09's own close-outs |
+| 12 | C-11 (open 2026-09-09 — PR 1, this docs opener, landed; PRs 2-4 planned) | Gated on C-10 (closed) — the next unowned residual group per C-08's, C-09's, and C-10's own close-outs; not yet explicitly sequenced by the maintainer (see the C-11 entry's own note) |
 
 Open issues mapped: none left (#375 closed by W-01, #319 by W-05). Filed
 from wave 2's own findings: #590 (the operator still emits the deleted
