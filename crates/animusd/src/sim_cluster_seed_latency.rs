@@ -1,34 +1,54 @@
-//! Deterministic, seed-reproducible regression for the admin seeder's
-//! images-arm pipelining (`admin::action_data_seed`'s `SEED_IMAGES_
-//! CONCURRENCY`, `docs/engineering-lessons.md`'s matching 2026-09-08
-//! entry) — see `lib.rs`'s own `mod sim_cluster_seed_latency` doc comment
-//! for the one-paragraph summary; this is the detailed account.
+//! Deterministic, seed-reproducible regression for `POST /admin/data/seed`'s
+//! throughput on a Stream/GSI/LSI-carrying (images) table — see `lib.rs`'s
+//! own `mod sim_cluster_seed_latency` doc comment for the one-paragraph
+//! summary; this is the detailed account.
 //!
-//! ## Why the baseline is eight single-row calls, not one eight-row call
+//! **Rewritten for ADR 0021's 2026-09-09 amendment**: `POST /admin/data/seed`
+//! is now a thin proxy over the real `BatchWriteItem` wire operation
+//! (`admin::action_data_seed`/`admin::submit_seed_chunk`), chunked at
+//! DynamoDB's own 25-item `BatchWriteItem` cap (`SEED_BATCH_WRITE_CAP`) with
+//! up to 8 chunks in flight at once (`SEED_CONCURRENCY`) — replacing the
+//! deleted per-item `SEED_IMAGES_CONCURRENCY`-pipelined arm this module used
+//! to measure. The mechanism this test now proves is different in kind, not
+//! just in constant: concurrency is **per-chunk**, not per-item — an
+//! images-carrying table's own `BatchWriteItem` handler
+//! (`dynamo.rs`'s `Operation::BatchWriteItem` arm) still evaluates each
+//! chunk's items **sequentially** (one `cp_kind_write_item` at a time, no
+//! pipelining within a chunk — see that arm's own doc), so the speedup this
+//! route can produce is now bounded by how many *chunks* run concurrently,
+//! not by how many *items* do.
 //!
-//! The admin seeder's images-carrying-table arm (any table with a
-//! Stream/GSI/LSI/PITR) pipelines up to `SEED_IMAGES_CONCURRENCY` (32)
-//! `cp_kind_write_item` calls at once. A red-before/green-after
-//! sequential-vs-concurrent comparison needs a **sequential** baseline
-//! that the fixed (concurrent) code cannot itself distort — but seeding
-//! N > 1 rows in one `/admin/data/seed` call always dispatches up to
-//! `SEED_IMAGES_CONCURRENCY` of them at once under the current code, so
-//! measuring (say) an eight-row seed directly would measure the
-//! *pipelined* cost of eight rows (all in one wave, since 8 < 32), not
-//! the per-row cost a strictly sequential loop would pay. Seeding exactly
-//! **one** row per call sidesteps this: concurrency is irrelevant when
-//! there is only one item to write, so eight separate single-row
-//! (`count:1`) seed calls give a true per-row baseline regardless of
-//! which arm — sequential or pipelined — is actually live in the binary
-//! under test.
+//! ## Why the baseline is still eight single-row calls
 //!
-//! The 96-row scenario then seeds all 96 rows in **one** call (three
-//! waves of up to 32 at `SEED_IMAGES_CONCURRENCY = 32`) and asserts its
-//! own virtual elapsed time is under 25% of the naive `96 x baseline`
-//! sequential extrapolation — comfortably above what three concurrent
-//! waves cost (plus per-call overhead) while being far below what 96
-//! fully sequential round trips would cost, so the bound cannot flake on
-//! ordinary scheduling noise in either direction.
+//! A single-row (`count:1`) seed call is one chunk of length one — sequential
+//! or concurrent chunk dispatch makes no difference when there's only one
+//! item in flight — so eight separate single-row calls still give a true
+//! per-row baseline regardless of how many chunks a larger call fans out to,
+//! identical reasoning to before this rewrite.
+//!
+//! ## Why the scenario seeds exactly `SEED_CONCURRENCY x SEED_BATCH_WRITE_CAP` rows
+//!
+//! Seeding exactly 8 x 25 = **200** rows produces exactly 8 chunks of 25
+//! items each — one full "wave" that exactly saturates `SEED_CONCURRENCY`
+//! with no leftover serialized second wave. Under that shape, the expected
+//! virtual elapsed time is dominated by **one chunk's own fully-sequential
+//! 25-item cost** (every chunk runs concurrently with every other, but each
+//! chunk's own 25 items are still paid one at a time) — i.e. elapsed ≈
+//! `SEED_BATCH_WRITE_CAP` per-row-costs, against a sequential extrapolation
+//! of `count` (200) per-row-costs. That predicts a ratio of `25 / 200 =
+//! 12.5%`, comfortably under the same 25%-of-sequential bound the pre-rewrite
+//! test used (which, for the old 32-way *item*-level pipelining over 96 rows
+//! in 3 waves, had a far larger margin — ~3% of sequential, not ~12.5%). A
+//! smaller row count would not leave that margin: 96 rows split into 4
+//! chunks of 25/25/25/21 is still one wave (4 ≤ 8), so the expected ratio
+//! there is `25 / 96 ≈ 26%` — **over** the 25% bound purely from the
+//! chunking-boundary shape, before any real overhead is even counted (a
+//! quick manual check confirmed a 96-row call does sit right at that
+//! boundary and is not a reliable regression signal under this new
+//! mechanism). 200 rows is the smallest row count that is both an exact
+//! multiple of `SEED_BATCH_WRITE_CAP` *and* uses exactly (not fewer than)
+//! `SEED_CONCURRENCY` chunks, which is what gives this bound real margin
+//! rather than sitting on its own boundary.
 //!
 //! All timing is virtual `SimEnv` time (via [`SimCluster::admin_timed`],
 //! which steps the simulator forward in small increments and reports back
@@ -36,13 +56,14 @@
 //! `OP_BUDGET` jump) — this assertion cannot flake under real-thread
 //! contention, sandbox load, or CI noise.
 //!
-//! **Confirmed red-before/green-after by hand**: temporarily reverting the
-//! images arm (`admin.rs::action_data_seed`) to a strictly sequential `for
-//! (pk, sk, item) in &rows { ctx.cp_kind_write_item(..).await?; }` loop
-//! makes [`pipelined_seed_is_well_under_the_sequential_extrapolation`]
-//! fail deterministically (the 96-row seed then costs ~96x a single row's
-//! own cost, not the ~3x the pipelined code costs — both comfortably on
-//! their own side of the 24x bound) — restored before landing.
+//! **Confirmed red-before/green-after by hand**: temporarily reverting
+//! `admin::submit_seed_chunk`'s chunk dispatch to a strictly sequential
+//! `for chunk in chunks { submit_seed_chunk(..).await; }` (no
+//! `buffer_unordered`) makes
+//! [`pipelined_seed_is_well_under_the_sequential_extrapolation`] fail
+//! deterministically (the 200-row seed then costs ~200x a single row's own
+//! cost, not the ~8x concurrent chunking costs — both comfortably on their
+//! own side of the 4x bound) — restored before landing.
 
 use std::time::Duration;
 
@@ -55,11 +76,12 @@ use super::sim_cluster_console::{
 /// enough to resolve a single write's own virtual cost precisely without
 /// needing an implausibly large `max_steps`.
 const STEP: Duration = Duration::from_millis(20);
-/// 2000 x 20ms = 40s of virtual time — comfortably above `OP_BUDGET`
-/// (12s, [`SimCluster::admin`]'s own fixed jump), since a 96-row pipelined
-/// seed plus its eight single-row baseline calls all share one cluster's
-/// worth of Raft/network activity.
-const MAX_STEPS: usize = 2000;
+/// 4000 x 20ms = 80s of virtual time — comfortably above `OP_BUDGET` (12s,
+/// [`SimCluster::admin`]'s own fixed jump). Wider than the pre-rewrite
+/// budget (2000 steps): a 200-row seed's dominant cost is one chunk's own
+/// 25 *sequential* item writes (see this module's own doc), materially more
+/// virtual time than the old design's ~3 pipelined waves ever needed.
+const MAX_STEPS: usize = 4000;
 
 /// A Stream-enabled (`NEW_AND_OLD_IMAGES`) table with a single string
 /// partition key `pk` — the images-carrying shape `action_data_seed`'s
@@ -163,13 +185,18 @@ fn drain_all_records(cluster: &mut SimCluster, node: u64, mut iterator: String) 
     total
 }
 
+/// Rows for the pipelined scenario: exactly `SEED_CONCURRENCY (8) x
+/// SEED_BATCH_WRITE_CAP (25)` — see this module's own doc for why this
+/// exact count, not the pre-rewrite design's 96.
+const PIPELINED_ROWS: u64 = 200;
+
 fn run_pipelined_seed_is_well_under_the_sequential_extrapolation(seed: u64) {
     let mut cluster = SimCluster::new(seed, 3, 3);
 
     // (a) Sequential per-row baseline: eight single-row seed calls into
     // their own table — see this module's own doc for why one row per
-    // call is the only way to measure this without the pipelined code
-    // itself distorting the measurement.
+    // call is the only way to measure this without the chunk-level
+    // concurrency itself distorting the measurement.
     create_streamed_table(&mut cluster, 0, "lat_baseline");
     let baseline_node = non_leader_of_table(&cluster, "lat_baseline");
     let mut baseline_total = Duration::ZERO;
@@ -183,47 +210,60 @@ fn run_pipelined_seed_is_well_under_the_sequential_extrapolation(seed: u64) {
          (baseline_total={baseline_total:?})"
     );
 
-    // The scenario itself: 96 rows into a *different*, fresh table, one
-    // `/admin/data/seed` call, so its stream carries exactly this seed's
-    // own 96 records and nothing from the baseline calls above.
-    let created = create_streamed_table(&mut cluster, 0, "lat96");
+    // The scenario itself: PIPELINED_ROWS rows into a *different*, fresh
+    // table, one `/admin/data/seed` call, so its stream carries exactly
+    // this seed's own records and nothing from the baseline calls above.
+    let created = create_streamed_table(&mut cluster, 0, "lat200");
     let stream_arn = created["TableDescription"]["LatestStreamArn"]
         .as_str()
-        .unwrap_or_else(|| panic!("lat96 has no LatestStreamArn: {created}"))
+        .unwrap_or_else(|| panic!("lat200 has no LatestStreamArn: {created}"))
         .to_owned();
-    let node96 = non_leader_of_table(&cluster, "lat96");
-    let elapsed96 = seed_timed(&mut cluster, node96, "lat96", 96, 0, seed);
+    let node200 = non_leader_of_table(&cluster, "lat200");
+    let elapsed200 = seed_timed(&mut cluster, node200, "lat200", PIPELINED_ROWS, 0, seed);
 
-    let sequential_extrapolation = per_row * 96;
+    let sequential_extrapolation = per_row * PIPELINED_ROWS as u32;
     let bound = sequential_extrapolation / 4;
     assert!(
-        elapsed96 < bound,
-        "seed={seed}: a pipelined 96-row seed took {elapsed96:?} virtual time, which is not \
-         under 25% of the sequential extrapolation ({sequential_extrapolation:?}, derived from \
-         a {per_row:?} per-row baseline over 8 single-row calls) — the images arm may have \
-         regressed to a strictly sequential loop"
+        elapsed200 < bound,
+        "seed={seed}: a {PIPELINED_ROWS}-row seed (8 concurrent 25-item chunks) took \
+         {elapsed200:?} virtual time, which is not under 25% of the sequential extrapolation \
+         ({sequential_extrapolation:?}, derived from a {per_row:?} per-row baseline over 8 \
+         single-row calls) — chunk-level concurrency may have regressed to a strictly \
+         sequential loop"
     );
 
-    // (b) every one of the 96 rows is readable...
+    // (b) every one of the PIPELINED_ROWS rows is readable... **from a
+    // linearizable read** (`ConsistentRead: true`) — `node200` does not
+    // lead this tablet (ADR 0055's wire default, `false`, is served from
+    // any replica's own applied state with no read barrier), so an
+    // unqualified Scan immediately after a write can race replication and
+    // undercount even though every write itself already confirmed durable
+    // before `seed_timed` returned (found live: 1 of 5 `_over_seeds` seeds
+    // reproduced a 199/200 undercount with this field omitted, the exact
+    // "a read that verifies a write must ask for `ConsistentRead: true`"
+    // gotcha `animusd/CLAUDE.md`'s ADR 0055 section documents — a test bug
+    // in this file's own pre-rewrite Scan call too, carried forward
+    // unnoticed until this rewrite's own wider seed sweep caught it).
     let (status, scan) = cluster.dynamo(
-        node96,
+        node200,
         "DynamoDB_20120810.Scan",
-        br#"{"TableName":"lat96","Select":"COUNT"}"#,
+        br#"{"TableName":"lat200","Select":"COUNT","ConsistentRead":true}"#,
     );
-    assert_eq!(status, 200, "seed={seed}: Scan lat96: {scan}");
+    assert_eq!(status, 200, "seed={seed}: Scan lat200: {scan}");
     assert_eq!(
         json(&scan)["Count"],
-        96,
+        PIPELINED_ROWS,
         "seed={seed}: every seeded row is readable via Scan: {scan}"
     );
 
-    // ...and the stream delivered EXACTLY 96 records — no loss, no
-    // duplicate, under 32-way concurrent writes to 96 distinct keys.
-    let leader96 = leader_of_table(&cluster, "lat96");
-    let iterator = open_tail_iterator(&mut cluster, leader96, &stream_arn);
-    let record_count = drain_all_records(&mut cluster, leader96, iterator);
+    // ...and the stream delivered EXACTLY PIPELINED_ROWS records — no loss,
+    // no duplicate, across 8 concurrent `BatchWriteItem` chunks each
+    // writing 25 distinct keys sequentially.
+    let leader200 = leader_of_table(&cluster, "lat200");
+    let iterator = open_tail_iterator(&mut cluster, leader200, &stream_arn);
+    let record_count = drain_all_records(&mut cluster, leader200, iterator);
     assert_eq!(
-        record_count, 96,
+        record_count, PIPELINED_ROWS as usize,
         "seed={seed}: the stream delivers exactly one record per seeded row, exactly once, \
          under concurrency"
     );

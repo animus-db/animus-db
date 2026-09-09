@@ -125,8 +125,8 @@ use animus_control::{PlacementPolicy, ProposeResult, RaftNode, SharedWal};
 use animus_cp_data::hlc::HlcTimestamp;
 use animus_cp_data::host::{MemoryTabletEngines, MetadataView, Reconciler, check_wal_layout};
 use animus_cp_data::{
-    FastRead, KindBatchOutcome, KvCommand, KvState, RaftKvNode, ResolveOutcome, SHARED_WAL,
-    StageOutcome, TxnDecisionStatus, TxnId, TxnOutcome, TxnRecordView,
+    AppliedWatch, FastRead, KindBatchOutcome, KvCommand, KvState, RaftKvNode, ResolveOutcome,
+    SHARED_WAL, StageOutcome, TxnDecisionStatus, TxnId, TxnOutcome, TxnRecordView,
 };
 use animus_env::{
     Clock, Disk, Env, FsSegmentStore, MaybeTlsStream, Metric, MetricsHandle, Nanos, NodeId,
@@ -989,6 +989,17 @@ impl<E: Env> CpGroup<E> {
         match self {
             CpGroup::Lsm(n) => n.engine_applied_index(),
             CpGroup::Mem(n) => n.engine_applied_index(),
+        }
+    }
+
+    /// The wake-on-apply companion to [`engine_applied_index`](Self::
+    /// engine_applied_index) — see [`AppliedWatch`]'s doc. `write_path`'s
+    /// confirm loops park on this instead of polling on a fixed/backed-off
+    /// timer to notice their own accepted entry has applied.
+    pub(crate) fn applied_watch(&self) -> AppliedWatch {
+        match self {
+            CpGroup::Lsm(n) => n.applied_watch(),
+            CpGroup::Mem(n) => n.applied_watch(),
         }
     }
 
@@ -13299,16 +13310,25 @@ const SCHEMA_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// every tick regardless, since that costs nothing.
 const SCHEMA_PROPOSE_PATIENCE: Duration = Duration::from_secs(1);
 
-/// Initial poll granularity while a CP **write/delete** waits for its value to
-/// become locally durable+applied on the leader (the durable-before-ack confirm in
-/// [`ClientCtx::cp_put_local`]/[`cp_delete_local`](ClientCtx::cp_delete_local)).
-/// Far finer than [`SCHEMA_POLL_INTERVAL`]: paired with the cp-data
-/// wake-on-propose, a write that commits+applies in a few ms now returns in ~1ms
-/// instead of eating a fixed 50ms poll floor.
-const CP_CONFIRM_POLL_INIT: Duration = Duration::from_micros(200);
-/// Cap for the CP-confirm poll's exponential back-off: a fast write returns after a
-/// sub-ms poll, but a slow/contended write backs off to this ceiling rather than
-/// busy-spinning the CPU while it waits.
+/// Every CP **write/delete/kind-write/kind-eval** confirm loop
+/// (`write_path::wait_applied_past`, shared by `cp_put_local`/
+/// `cp_delete_local`/`cp_kind_raw_local`/`cp_kind_eval_local`/`poll_probe`)
+/// waits for its own accepted entry to become locally durable+applied on the
+/// leader by parking on the tablet group's `AppliedWatch` — woken the
+/// instant the apply task advances past the entry's index, not by polling on
+/// a timer. This constant is no longer a poll granularity: it only bounds
+/// how long that park can go without a **forced** re-check, so a caller's
+/// own `confirm_wait_is_futile`/deadline logic still fires on schedule even
+/// when the watched index never applies at all (the group loses its leader,
+/// a quorum is lost, the entry gets superseded) — `AppliedWatch::bump` never
+/// wakes for that outcome, since nothing ever advances. A write that
+/// genuinely commits+applies returns as soon as the wake arrives, typically
+/// well under a millisecond, regardless of this value; this ceiling was
+/// itself the exponential back-off's cap before `wait_applied_past` replaced
+/// the whole doubling schedule (`CP_CONFIRM_POLL_INIT` doubling to this) —
+/// each step of that schedule rounded every write up to its own next
+/// checkpoint (an average half-a-step overshoot on top of real apply
+/// latency), which waking on the actual apply event removes entirely.
 const CP_CONFIRM_POLL_MAX: Duration = Duration::from_millis(5);
 
 /// Bind an `n`-node cluster on `ip` with ephemeral ports and the conventional
@@ -15794,8 +15814,14 @@ async fn finish_data_join(
 /// - a single client/forwarded `Put` — its value enters via the HTTP edges,
 ///   whose bodies cap at 1 MiB (`http::MAX_BODY`), and JSON-encodes a `Vec<u8>`
 ///   at ≤ 4 chars per byte → ~4 MiB;
-/// - a forwarded `PutBatch` from the admin bulk seeder — bounded to
-///   `SEED_BATCH_MAX_BYTES` (4 MiB) of raw entry bytes per batch → ~17 MiB JSON;
+/// - a forwarded `BatchWriteItem` marker-table batch (`dynamo::
+///   marker_batch_write`) — DynamoDB's own 25-item-per-call cap, each item
+///   capped at `animus_item::MAX_ITEM_SIZE_BYTES` (400 KB) → ~10 MiB raw
+///   before JSON escaping, comfortably under half this cap. The admin
+///   seeder (ADR 0021's 2026-09-09 amendment) rides this identical path —
+///   it no longer has a byte cap of its own (the deleted `SEED_BATCH_
+///   MAX_BYTES`), since it now issues ordinary `BatchWriteItem` calls
+///   through the same generic dispatcher a real client's calls take;
 /// - everything else (`Get`/`Scan`/`ProposeSchema`/split triggers) is tiny.
 ///
 /// An over-cap length prefix is rejected with a clean `InvalidData` error (the
@@ -18171,10 +18197,11 @@ mod simenv_client_ctx_tests {
         // `ClientRequest::Put` arm drives (via `dynamo::
         // marker_batch_write_raw`, which this call inlines minus the
         // change-log marker — nothing here asserts on Streams). Not a
-        // reimplementation: this exercises the real exponential
-        // confirm-poll backoff (`CP_CONFIRM_POLL_INIT`/`_MAX`) under a
-        // virtual clock, spawned so the sim's own executor can actually
-        // drive any `env.sleep()` inside it forward.
+        // reimplementation: this exercises the real wake-on-apply confirm
+        // wait (`write_path::wait_applied_past`, `CP_CONFIRM_POLL_MAX`'s
+        // forced-recheck cap) under a virtual clock, spawned so the sim's
+        // own executor can actually drive any `env.sleep()` inside it
+        // forward.
         let write_result = spawn_and_capture(&mut sim, &ctx.env, {
             let ctx = ctx.clone();
             let table = table.to_owned();
@@ -19025,19 +19052,24 @@ mod sim_cluster_admin_actions;
 #[cfg(test)]
 mod sim_cluster_dashboard;
 
-/// Deterministic, seed-reproducible regression for the admin seeder's
-/// images-arm pipelining (`admin::action_data_seed`, `SEED_IMAGES_
-/// CONCURRENCY`): seeds a Stream-enabled table through `POST
-/// /admin/data/seed` (reachable via `SimCluster::admin_timed`, the same
-/// `GenericAdminHost` seam `sim_cluster_admin_actions.rs`'s own
-/// `seed_writes_synthetic_keys` already proves reaches this route) and
-/// asserts the virtual elapsed time for a 96-row seed is well under a
-/// quarter of 96x an 8-row seed's own per-row virtual cost — a bound the
-/// bounded-concurrency fix clears with wide margin and the old strictly-
-/// sequential loop fails deterministically (confirmed red on the
-/// pre-fix code, restored — see this module's own doc for the exact
-/// numbers). All in virtual `SimEnv` time, so the assertion cannot flake
-/// under real-thread contention.
+/// Deterministic, seed-reproducible regression for `POST /admin/data/seed`'s
+/// throughput on a Stream-enabled table (ADR 0021's 2026-09-09 amendment:
+/// the route is now a thin proxy over the real `BatchWriteItem` operation,
+/// chunked at `admin::SEED_BATCH_WRITE_CAP` (25) items with up to
+/// `admin::SEED_CONCURRENCY` (8) chunks concurrently): seeds a Stream-enabled
+/// table through `POST /admin/data/seed` (reachable via
+/// `SimCluster::admin_timed`, the same `GenericAdminHost` seam
+/// `sim_cluster_admin_actions.rs`'s own `seed_writes_synthetic_keys` already
+/// proves reaches this route) and asserts the virtual elapsed time for a
+/// 200-row seed (8 concurrent 25-item chunks — one full wave) is well under
+/// a quarter of 200x an 8-row seed's own per-row virtual cost — a bound the
+/// chunk-level concurrency clears with real margin and a strictly
+/// sequential chunk dispatch fails deterministically (confirmed red on the
+/// pre-fix code, restored — see this module's own doc for the exact numbers
+/// and for why 200, not the pre-rewrite design's 96, is the smallest row
+/// count that gives this bound genuine margin under the new per-chunk,
+/// not per-item, concurrency shape). All in virtual `SimEnv` time, so the
+/// assertion cannot flake under real-thread contention.
 #[cfg(test)]
 mod sim_cluster_seed_latency;
 /// ADR 0061 rung I (C-09 PR 2): two pinned-seed smoke tests proving the

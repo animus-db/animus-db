@@ -72,6 +72,65 @@ animus get    <node-addr> <table> <key>
   `animusd`'s own `is_relayable_command`/`ClientRequest` dispatch; both need
   checking whenever either enum grows.
 
+## Bulk seeding (`seed`, ADR 0021 amendment)
+
+```
+animus seed <admin-addr> <table> <count> [--start N] [--key-prefix P] \
+    [--value-bytes B] [--concurrency C] [--batch N]
+```
+
+The maintainer-decided home for synthetic bulk data generation: **seeding
+is a client concern, not a server use case** (ADR 0021's 2026-09-09
+amendment) — `POST /admin/data/seed` used to generate rows *inside* the
+node and write them through internal primitives, re-deriving `PutItem`'s
+exact byte shapes by hand and silently dropping any ADR 0065-throttled
+row. `seed` instead:
+
+1. `DescribeTable`s the target through the admin proxy
+   (`POST /admin/data/dynamo {op:"DescribeTable", ...}`, ADR 0021 — this
+   CLI has no SigV4 client and never dials the DynamoDB port directly) to
+   learn the key schema (`KeySchema` + `AttributeDefinitions`): the
+   partition key's name/type, and an optional sort key's.
+2. Generates items **client-side**, byte-identical in shape to the old
+   server-side seeder's own convention (so an existing dashboard/test
+   reading `seed:000000000042` keeps working): `pk = key_prefix +
+   zero-padded-12-digit index`, typed per the declared `AttributeType`
+   (`S` → string, `N` → the bare index text, `B` → base64 of the prefixed
+   text — this crate's own small standard-base64 codec,
+   `base64_encode_standard`, since it has no `animus-dynamo` dependency to
+   reuse `wire::base64_encode` from); `sk` (composite tables only) = the
+   same index, typed the same way, but with **no** `key_prefix` (mirrors
+   the deleted `admin.rs::seed_key_attr`'s exact convention); plus a
+   filler `payload: {"S": ...}` attribute padded so the serialized item is
+   ~`value_bytes` (default 64).
+3. Issues real `BatchWriteItem` calls (`POST /admin/data/dynamo
+   {op:"BatchWriteItem", ...}`), chunked at `--batch` (default/cap 25 —
+   DynamoDB's own per-call limit), with up to `--concurrency` (default 8)
+   chunks in flight at once (`futures::stream::buffer_unordered`).
+4. Retries a chunk's own `UnprocessedItems` with a bounded exponential
+   backoff (`SEED_MAX_RETRY_ATTEMPTS`/`SEED_RETRY_INITIAL_BACKOFF`/
+   `SEED_RETRY_MAX_BACKOFF`) rather than reporting it lost immediately — a
+   throttled or transiently-refused (mid-split) row gets several chances
+   before this command gives up on it.
+5. Prints a progress line per completed chunk (running written/unprocessed
+   totals) and a final summary (`written`/`unprocessed`/`elapsed`/`keys/s`).
+   Returns a nonzero exit only when **nothing** was written at all — a
+   partial success (some rows unprocessed) is reported, not a failure.
+
+Unlike every other subcommand's `<node-addr>`, `seed`'s first argument is
+an **admin** address (it talks the admin HTTP proxy, never the plain
+client protocol) — the same convention every `animus admin <sub>
+<admin-addr>` subcommand uses, even though `seed` is a top-level command,
+not nested under `admin`, since it is genuinely multi-step orchestration
+(chunking, concurrency, retry) rather than a one-shot `(method, path,
+body)` dispatch.
+
+`/admin/data/seed` itself is now a thin proxy over this identical
+`BatchWriteItem` operation (`animusd::admin::action_data_seed`) — kept
+only because the dashboard's own "Seed data" form depends on its existing
+request/response contract; see that crate's own `CLAUDE.md` and ADR
+0021's amendment for the server-side half.
+
 ## Admin subcommand group
 
 `animus admin <sub> <admin-addr> [args]` — see `ADMIN_USAGE` in `main.rs` for
@@ -339,3 +398,26 @@ value) and `build_tls_connector` (rejects a missing file and a file with
 no certificates) — pure/local-filesystem-only, no socket, no live TLS
 handshake; `animusd`'s `tests/tls_e2e.rs` is the real end-to-end
 regression net for a genuine `--tls-ca` dial against a live node.
+
+**`seed`'s own request-shaping/item-generation logic** (ADR 0021
+amendment) is unit-tested the same pure, socket-free way: `seed_item` for
+an `S`/`N`/`B`-typed hash key and a composite key (the sort key gets no
+`key_prefix`), `parse_key_schema` (`DescribeTable`'s `KeySchema`/
+`AttributeDefinitions` decoded into `(pk name, pk type, sort)`, including
+the undeclared-attribute-type default and the missing-`KeySchema` error),
+`seed_chunk_bounds` (splitting at the batch cap, including the
+under-one-batch and zero-row edges), `describe_table_request_body`/
+`batch_write_request_body` (the exact `/admin/data/dynamo` body shape),
+`unprocessed_items` (recovering a chunk's own retry set from a
+`BatchWriteItem` response's `UnprocessedItems`), and
+`base64_encode_standard` (RFC 4648 §10's own test vectors). No integration
+test exercises `run_seed`/`submit_seed_chunk` end to end against a real
+cluster — this crate has no `tests/` integration-test tree at all (see
+this file's own note above), and `animusd` has no dependency on
+`animus-cli` to drive one from that side either; the underlying
+`BatchWriteItem`/`DescribeTable` wire operations `seed` itself calls
+through the admin proxy have their own end-to-end coverage in `animusd`'s
+DynamoDB wire suites, and `/admin/data/seed`'s own server-side proxy
+behavior (the same operation, driven from the dashboard instead of this
+CLI) is covered by `animusd`'s `tests/admin_endpoint.rs`/
+`sim_cluster_admin_actions.rs`.
