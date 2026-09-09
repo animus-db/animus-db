@@ -41,7 +41,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use animus_control::SharedWal;
@@ -311,6 +311,165 @@ impl Future for ForkPending<'_> {
         } else {
             Poll::Pending
         }
+    }
+}
+
+/// Executor-agnostic "engine-applied index advanced" notification — the
+/// per-tablet-group counterpart to `animus-control`'s `MetadataWatch` (ADR
+/// 0031), same shape and same reason: let a caller waiting on a specific
+/// index (a write confirming its own accepted entry, `animusd::write_path`)
+/// react the instant [`RaftKvNode::engine_applied_index`] passes it, instead
+/// of polling on a fixed/backed-off timer. A cloneable handle — every clone
+/// observes the same underlying watermark.
+///
+/// **Multi-waiter, by design from the start** — never built on a lone
+/// `AtomicWaker`. A single-tablet leader routinely has many concurrent
+/// single-item writes each confirming its own distinct index at once, so a
+/// single-slot waker (which silently evicts whatever was previously
+/// registered — see `docs/engineering-lessons.md` on issue #276, the
+/// `MetadataWatch` lost-wakeup this exact mistake produced the first time a
+/// second concurrent consumer showed up) would drop all but the most
+/// recently registered writer's wake. Any number of concurrent
+/// [`changed`](AppliedWatch::changed) callers — across any number of clones
+/// of this handle — park independently: each returned [`AppliedChanged`]
+/// future owns its own slot in a small registry, so registering one
+/// waiter's waker can never evict another's, and
+/// [`bump`](AppliedWatch::bump) wakes every currently-registered waiter, not
+/// just the most recent.
+///
+/// No tokio-only primitive is used (plain `Waker`/atomics/`std::sync::
+/// Mutex`, never `tokio::sync::Notify`/`watch`), so this is fully
+/// `SimEnv`-deterministic and works identically over a real tokio `ProdEnv`.
+/// Registration/removal use a short, `.await`-free `std::sync::Mutex`
+/// critical section (never held across a poll).
+#[derive(Clone, Default)]
+pub struct AppliedWatch(Arc<AppliedWatchInner>);
+
+#[derive(Default)]
+struct AppliedWatchInner {
+    /// The highest engine-applied index this watch has observed — the same
+    /// value [`RaftKvNode::engine_applied_index`] reads, mirrored here so a
+    /// waiter can both check and park on one handle. Monotonic: only ever
+    /// raised.
+    applied: AtomicU64,
+    /// Every currently-parked waiter's waker, keyed by the per-future slot
+    /// id [`AppliedWatch::changed`] mints for it. `bump` drains and wakes
+    /// the whole map; an [`AppliedChanged`] removes its own entry on `Drop`
+    /// so an abandoned confirm-wait (a write whose caller timed out or
+    /// disconnected) never leaks a slot.
+    wakers: Mutex<BTreeMap<u64, Waker>>,
+    /// Monotonic source of the slot ids handed out by
+    /// [`AppliedWatch::changed`]. Only ever incremented.
+    next_slot: AtomicU64,
+}
+
+impl AppliedWatch {
+    /// The latest applied index this watch has observed, without waiting.
+    #[must_use]
+    pub fn latest(&self) -> u64 {
+        self.0.applied.load(Ordering::Acquire)
+    }
+
+    /// Resolves once the applied index exceeds `last_seen`, yielding the new
+    /// value.
+    ///
+    /// Unlike a one-shot flag, this is a plain watermark re-checked fresh on
+    /// every poll — so there is no wake-before-park race to lose: if the
+    /// index already advanced past `last_seen` before this future is even
+    /// created, the very first poll resolves immediately.
+    pub fn changed(&self, last_seen: u64) -> AppliedChanged<'_> {
+        let slot = self.0.next_slot.fetch_add(1, Ordering::Relaxed);
+        AppliedChanged {
+            watch: self,
+            last_seen,
+            slot,
+        }
+    }
+
+    /// Raise the watermark to `index` (a no-op if `index` is not an advance)
+    /// and wake **every** currently-parked waiter, only when it actually
+    /// moved. Called at every site where the apply task's own
+    /// `engine_applied` watermark advances — see that field's doc for the
+    /// enumerated raise points.
+    pub fn bump(&self, index: u64) {
+        let prev = self.0.applied.fetch_max(index, Ordering::AcqRel);
+        if index > prev {
+            // Drain the registry before waking: a woken waiter re-registers
+            // its own fresh slot on its next poll (if still pending), so
+            // there is no need to retain entries here, and waking happens
+            // outside the lock to keep the critical section short.
+            let woken =
+                std::mem::take(&mut *self.0.wakers.lock().expect("AppliedWatch wakers poisoned"));
+            for (_, waker) in woken {
+                waker.wake();
+            }
+        }
+    }
+
+    /// Number of waiters currently parked on this watch. Test-only: used to
+    /// prove a dropped [`AppliedChanged`] doesn't leak its registry slot.
+    #[cfg(test)]
+    fn registered_waiters(&self) -> usize {
+        self.0
+            .wakers
+            .lock()
+            .expect("AppliedWatch wakers poisoned")
+            .len()
+    }
+}
+
+/// The future returned by [`AppliedWatch::changed`]. Owns one slot in its
+/// watch's waker registry for its whole lifetime — minted in `changed`,
+/// removed on `Drop` (whether it resolved, was cancelled, or was simply
+/// abandoned mid-poll) — so it never leaks and never collides with any
+/// other concurrent waiter's slot.
+pub struct AppliedChanged<'a> {
+    watch: &'a AppliedWatch,
+    last_seen: u64,
+    slot: u64,
+}
+
+impl Future for AppliedChanged<'_> {
+    type Output = u64;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<u64> {
+        // Register this waiter's own slot before checking — if `bump` races
+        // in right after our check but before we park, the freshly
+        // registered waker still catches it, and registering here can never
+        // evict any *other* waiter's slot.
+        self.watch
+            .0
+            .wakers
+            .lock()
+            .expect("AppliedWatch wakers poisoned")
+            .insert(self.slot, cx.waker().clone());
+        let current = self.watch.0.applied.load(Ordering::Acquire);
+        if current > self.last_seen {
+            // Deregister immediately: a resolved future has nothing left to
+            // be woken for, so leaving its slot behind would only cost
+            // `bump` a wasted `wake()` on every future advance until `Drop`
+            // eventually cleans it up anyway.
+            self.watch
+                .0
+                .wakers
+                .lock()
+                .expect("AppliedWatch wakers poisoned")
+                .remove(&self.slot);
+            Poll::Ready(current)
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+impl Drop for AppliedChanged<'_> {
+    fn drop(&mut self) {
+        self.watch
+            .0
+            .wakers
+            .lock()
+            .expect("AppliedWatch wakers poisoned")
+            .remove(&self.slot);
     }
 }
 
@@ -1847,6 +2006,12 @@ pub struct RaftKvNode<E: Env, S: StorageEngine> {
     /// merging them into the engine — so linearizable reads gate on *this* (engine
     /// progress), never `last_applied`, or they could read past the engine's state.
     engine_applied: Arc<AtomicU64>,
+    /// Wake-on-apply companion to [`engine_applied`](Self::engine_applied):
+    /// bumped at every site `engine_applied` advances, so a caller confirming
+    /// a specific accepted index (`animusd::write_path`) can park on
+    /// [`AppliedWatch::changed`] instead of polling on a timer. See
+    /// [`applied_watch`](Self::applied_watch).
+    applied_watch: AppliedWatch,
     /// Set by [`shutdown`](Self::shutdown); both the consensus loop and the apply
     /// task observe it and exit.
     halted: Arc<AtomicBool>,
@@ -2350,6 +2515,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         let stopped = Arc::new(AtomicBool::new(false));
         let apply_stopped = Arc::new(AtomicBool::new(false));
         let engine_applied = Arc::new(AtomicU64::new(0));
+        let applied_watch = AppliedWatch::default();
         let wal_lock = Arc::new(AsyncMutex::new(()));
         let propose_signal = Arc::new(ProposeSignal::default());
         let apply_signal = Arc::new(ApplySignal::default());
@@ -2416,6 +2582,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             kind_outcomes: Arc::clone(&kind_outcomes),
             kind_eval_results: Arc::clone(&kind_eval_results),
             engine_applied: Arc::clone(&engine_applied),
+            applied_watch: applied_watch.clone(),
             halted: Arc::clone(&halted),
             stopped: Arc::clone(&stopped),
             apply_stopped: Arc::clone(&apply_stopped),
@@ -2454,6 +2621,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             kind_outcomes,
             kind_eval_results,
             engine_applied,
+            applied_watch,
             wal_lock,
             halted,
             stopped,
@@ -6342,6 +6510,17 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         self.engine_applied.load(Ordering::SeqCst)
     }
 
+    /// The wake-on-apply handle mirroring [`engine_applied_index`](Self::
+    /// engine_applied_index): a caller can either poll the index directly or
+    /// park on [`AppliedWatch::changed`] to be notified the instant it
+    /// advances past a chosen value, instead of a fixed-interval poll. See
+    /// [`AppliedWatch`]'s doc — cheap to clone, safe to hand to any number of
+    /// concurrent callers.
+    #[must_use]
+    pub fn applied_watch(&self) -> AppliedWatch {
+        self.applied_watch.clone()
+    }
+
     /// Highest log index known durable on disk (durable-before-visible frontier).
     pub fn durable_index(&self) -> u64 {
         self.lock().durable_index()
@@ -6897,6 +7076,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     kind_outcomes: &Arc<Mutex<KindBatchOutcomes>>,
     kind_eval_results: &Arc<Mutex<KindEvalResults>>,
     engine_applied: &AtomicU64,
+    applied_watch: &AppliedWatch,
     wal_lock: &AsyncMutex<()>,
     halted: &AtomicBool,
     metrics: &MetricsHandle,
@@ -6957,6 +7137,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
         let install_max_ts =
             install_engine_image(storage, kind_scopes, &bytes, tablet, last_index).await;
         engine_applied.fetch_max(last_index, Ordering::SeqCst);
+        applied_watch.bump(last_index);
         // Belt, not the buckle: the consensus loop's own per-iteration live
         // feed (`engine_applied.load() < c.snapshot_index()`, see `drive`'s
         // doc) is what actually keeps `state_machine_behind` correct and
@@ -8663,6 +8844,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     // block below for why.)
     if max_index > 0 {
         engine_applied.fetch_max(max_index, Ordering::SeqCst);
+        applied_watch.bump(max_index);
     }
 
     // Compact once the *engine* has merged enough past the snapshot base: truncate
@@ -9135,6 +9317,7 @@ struct DriveState<E: Env, S: StorageEngine> {
     kind_outcomes: Arc<Mutex<KindBatchOutcomes>>,
     kind_eval_results: Arc<Mutex<KindEvalResults>>,
     engine_applied: Arc<AtomicU64>,
+    applied_watch: AppliedWatch,
     wal_lock: Arc<AsyncMutex<()>>,
     halted: Arc<AtomicBool>,
     stopped: Arc<AtomicBool>,
@@ -9287,6 +9470,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         kind_outcomes,
         kind_eval_results,
         engine_applied,
+        applied_watch,
         wal_lock,
         halted,
         stopped,
@@ -9382,6 +9566,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         .and_then(|v| applied::decode_applied_value(&v.value))
         .unwrap_or(0);
     engine_applied.store(engine_watermark, Ordering::SeqCst);
+    applied_watch.bump(engine_watermark);
     // Needs-snapshot state (issue #554): the engine's own watermark is below
     // the log's own compacted start — the prefix through `snapshot_index` is
     // gone from both the log (compacted) and the engine (never merged, or
@@ -9479,6 +9664,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         kind_outcomes,
         kind_eval_results,
         Arc::clone(&engine_applied),
+        applied_watch.clone(),
         Arc::clone(&wal_lock),
         Arc::clone(&halted),
         apply_stopped,
@@ -10063,6 +10249,7 @@ async fn apply_loop<E: Env, S: StorageEngine>(
     kind_outcomes: Arc<Mutex<KindBatchOutcomes>>,
     kind_eval_results: Arc<Mutex<KindEvalResults>>,
     engine_applied: Arc<AtomicU64>,
+    applied_watch: AppliedWatch,
     wal_lock: Arc<AsyncMutex<()>>,
     halted: Arc<AtomicBool>,
     apply_stopped: Arc<AtomicBool>,
@@ -10114,6 +10301,7 @@ async fn apply_loop<E: Env, S: StorageEngine>(
             &kind_outcomes,
             &kind_eval_results,
             &engine_applied,
+            &applied_watch,
             &wal_lock,
             &halted,
             &metrics,
@@ -10985,5 +11173,188 @@ mod stale_read_ready_tests {
                 );
             }
         }
+    }
+}
+
+/// Unit tests for [`AppliedWatch`] mirroring `animus_control::node`'s own
+/// `MetadataWatch` tests (issue #276's fix, and the general lesson it left
+/// behind — see this module's own doc and `docs/engineering-lessons.md`):
+/// multi-waiter delivery, register-before-check, and no leaked registry
+/// slots. No `SimEnv`/`RaftKvNode` bring-up needed — `AppliedWatch` is a
+/// plain `Waker`-registry primitive exercised directly with hand-built
+/// test wakers, exactly like `MetadataWatch`'s own module.
+#[cfg(test)]
+mod applied_watch_tests {
+    use std::pin::Pin;
+    use std::sync::atomic::AtomicBool;
+    use std::task::{Context, Poll, Wake, Waker};
+
+    use super::*;
+
+    /// A `Waker` that just flags whether it was ever woken, so a test can
+    /// assert on wake delivery without needing a real executor — mirrors
+    /// `animus_control::node`'s own `WakeFlag`.
+    struct WakeFlag(AtomicBool);
+
+    impl Wake for WakeFlag {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl WakeFlag {
+        fn woken(&self) -> bool {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    fn test_waker() -> (Waker, Arc<WakeFlag>) {
+        let flag = Arc::new(WakeFlag(AtomicBool::new(false)));
+        let waker = Waker::from(flag.clone());
+        (waker, flag)
+    }
+
+    /// Two independent `changed()` callers on one [`AppliedWatch`] must
+    /// *both* be woken by a single `bump()` — the exact multi-writer shape
+    /// this type exists for (many concurrent single-item writes waiting on
+    /// one leader's applied index at once). Red on a lone `AtomicWaker`:
+    /// registering the second waiter's waker would evict the first's, so
+    /// only the most recently registered waiter would ever wake (issue
+    /// #276's own `MetadataWatch` lost-wakeup, reproduced here for this
+    /// type's own registry rather than merely inherited by analogy).
+    #[test]
+    fn bump_wakes_every_registered_waiter_not_just_the_most_recent() {
+        let watch = AppliedWatch::default();
+
+        let (waker_a, woken_a) = test_waker();
+        let (waker_b, woken_b) = test_waker();
+        let mut cx_a = Context::from_waker(&waker_a);
+        let mut cx_b = Context::from_waker(&waker_b);
+
+        let mut fut_a = watch.changed(0);
+        let mut fut_b = watch.changed(0);
+
+        // Park both: register-before-check means each poll registers its
+        // own slot before observing `applied == 0 == last_seen`, so both
+        // return Pending.
+        assert_eq!(Pin::new(&mut fut_a).poll(&mut cx_a), Poll::Pending);
+        assert_eq!(Pin::new(&mut fut_b).poll(&mut cx_b), Poll::Pending);
+        assert_eq!(watch.registered_waiters(), 2);
+
+        watch.bump(1);
+
+        assert!(woken_a.woken(), "the first-registered waiter must be woken");
+        assert!(
+            woken_b.woken(),
+            "the second-registered waiter must ALSO be woken -- a single-slot \
+             AtomicWaker would have evicted the first registration and only \
+             woken this one, or vice versa depending on registration order"
+        );
+
+        // Both resolve on their next poll.
+        assert_eq!(Pin::new(&mut fut_a).poll(&mut cx_a), Poll::Ready(1));
+        assert_eq!(Pin::new(&mut fut_b).poll(&mut cx_b), Poll::Ready(1));
+    }
+
+    /// Register-before-check: if `bump` races in between a waiter's
+    /// `applied` load and its park, the waiter must still catch it — there
+    /// is no wake-before-park window to lose a signal in. Proven directly
+    /// by registering the waker *first* (as `poll` always does), THEN
+    /// bumping, THEN checking `applied` — the exact order `poll` follows
+    /// internally, just pulled apart into separate steps here so the test
+    /// can assert on the intermediate state.
+    #[test]
+    fn a_late_registrant_still_sees_a_watermark_that_already_advanced() {
+        let watch = AppliedWatch::default();
+        watch.bump(5);
+
+        // A waiter created AFTER the advance must resolve on its very
+        // first poll, not park at all.
+        let (waker, _woken) = test_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = watch.changed(0);
+        assert_eq!(Pin::new(&mut fut).poll(&mut cx), Poll::Ready(5));
+        assert_eq!(
+            watch.registered_waiters(),
+            0,
+            "a future that resolves on its first poll must not leave a \
+             slot behind"
+        );
+
+        // A waiter parked on the CURRENT watermark, then bumped again,
+        // still wakes and resolves to the new value.
+        let (waker2, woken2) = test_waker();
+        let mut cx2 = Context::from_waker(&waker2);
+        let mut fut2 = watch.changed(5);
+        assert_eq!(Pin::new(&mut fut2).poll(&mut cx2), Poll::Pending);
+        watch.bump(6);
+        assert!(woken2.woken());
+        assert_eq!(Pin::new(&mut fut2).poll(&mut cx2), Poll::Ready(6));
+    }
+
+    /// A `changed()` future dropped before `bump()` (e.g. a write whose
+    /// caller gave up) must remove its own slot from the registry — no
+    /// leak — and must not prevent a surviving waiter from being woken.
+    #[test]
+    fn dropped_waiter_does_not_leak_its_slot_or_block_the_survivor() {
+        let watch = AppliedWatch::default();
+
+        let (waker_survivor, woken_survivor) = test_waker();
+        let (waker_dropped, _woken_dropped) = test_waker();
+        let mut cx_survivor = Context::from_waker(&waker_survivor);
+        let mut cx_dropped = Context::from_waker(&waker_dropped);
+
+        let mut fut_survivor = watch.changed(0);
+        assert_eq!(
+            Pin::new(&mut fut_survivor).poll(&mut cx_survivor),
+            Poll::Pending
+        );
+
+        {
+            let mut fut_dropped = watch.changed(0);
+            assert_eq!(
+                Pin::new(&mut fut_dropped).poll(&mut cx_dropped),
+                Poll::Pending
+            );
+            assert_eq!(watch.registered_waiters(), 2);
+        }
+        // `fut_dropped` is now dropped without ever resolving.
+        assert_eq!(
+            watch.registered_waiters(),
+            1,
+            "the dropped future's slot must be removed"
+        );
+
+        watch.bump(1);
+        assert!(woken_survivor.woken(), "the survivor must still be woken");
+        assert_eq!(
+            Pin::new(&mut fut_survivor).poll(&mut cx_survivor),
+            Poll::Ready(1)
+        );
+    }
+
+    /// `bump` with a non-advancing (or regressing) index is a no-op: no
+    /// wake, no watermark change — mirrors `MetadataWatch::bump`'s own
+    /// `if index > prev` guard.
+    #[test]
+    fn bump_with_a_non_advancing_index_is_a_no_op() {
+        let watch = AppliedWatch::default();
+        watch.bump(5);
+
+        let (waker, woken) = test_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = watch.changed(5);
+        assert_eq!(Pin::new(&mut fut).poll(&mut cx), Poll::Pending);
+
+        watch.bump(3); // regresses -- must not wake or move the watermark
+        assert!(!woken.woken());
+        assert_eq!(watch.latest(), 5);
+        assert_eq!(Pin::new(&mut fut).poll(&mut cx), Poll::Pending);
+
+        watch.bump(5); // repeats the current value -- also a no-op
+        assert!(!woken.woken());
     }
 }

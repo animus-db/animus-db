@@ -550,3 +550,51 @@ statement and the pre-existing `animus-cli` bug this slice found (but did
 not fix) while confirming the Add route's wire shape, and
 `crates/animusd/CLAUDE.md`'s `dashboard_node.js` entry for the full
 mechanism.
+
+## Amendment (2026-09-09) — seeding is a client concern, not a server use case
+
+`POST /admin/data/seed` used to generate synthetic DynamoDB rows **inside
+the node** and write them through internal write primitives
+(`dynamo::marker_batch_write`/a per-item evaluate-at-leader loop) rather
+than the real DynamoDB wire operation a client uses — a drift hazard (it
+had to re-derive `PutItem`'s exact key/value byte shapes by hand,
+`seed_key_attr`/`encode_stored_item`) and a fidelity gap (a throttled row
+was silently dropped, with no `UnprocessedItems` to echo it in, since the
+route had no wire-level batch contract to report through).
+
+**`animus-cli seed <admin-addr> <table> <count> […]` is now the primary,
+maintained bulk-loading tool** (see `crates/animus-cli/CLAUDE.md`'s own
+entry): it generates the identical item shape client-side — partition key
+`key_prefix + zero-padded 12-digit index` typed per the table's declared
+`AttributeDefinitions`, the same index (no prefix) as the sort key when
+composite, a filler `payload` attribute — and writes it through **real**
+`BatchWriteItem` calls, proxied through the pre-existing `POST /admin/
+data/dynamo` (this ADR's own generic DynamoDB-operation proxy; the CLI has
+no SigV4 client and never dials the DynamoDB port directly). Chunked at
+DynamoDB's own 25-item `BatchWriteItem` cap, issued with bounded
+concurrency, retrying `UnprocessedItems` with a bounded backoff rather
+than silently dropping a throttled row.
+
+**`/admin/data/seed` itself is now a thin proxy over the same real
+`BatchWriteItem` operation** (`animusd::admin::action_data_seed`) —
+generating the identical item shape and executing it through the same
+generic dispatcher `/admin/data/dynamo` already uses
+(`crate::dynamo::execute_routed_as_generic`), with bounded concurrency and
+the same `UnprocessedItems` retry-then-report discipline, rather than the
+deleted internal marker/per-item-funnel arms. The dashboard's own bulk-seed
+tool (the Data Browser's "Seed data" form) keeps calling this route
+unchanged — its own UI/contract is unaffected, only what happens behind
+it.
+
+Why keep a server-side route at all, rather than deleting it and pointing
+the dashboard at the CLI: the dashboard has no way to shell out to a
+separate process, and `/admin/data/seed`'s existing request/response
+contract (`{table, count, start?, key_prefix?, value_bytes?} → {written,
+requested, start, key_prefix, value_bytes, item_bytes, error?}`) is a small
+surface worth preserving as a thin proxy rather than removing a feature the
+dashboard depends on. What changed is that it is now, structurally, the
+*same write path* as a real client's own `BatchWriteItem` — one write path,
+per-table throttling (ADR 0065) honored and reported rather than silently
+swallowed, the admin plane staying a pure proxy rather than a second
+implementation of `PutItem`'s byte shapes, and no server-side seeder logic
+left to drift from the wire edge it was always trying to imitate.

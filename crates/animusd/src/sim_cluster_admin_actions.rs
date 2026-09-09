@@ -57,6 +57,11 @@
 //!     `payload` attribute), a composite table's seeded rows carry both
 //!     key attributes, and a scanned key's own displayed (percent-encoded)
 //!     form round-trips through `/admin/storage/key`.
+//! (3b) [`run_seed_reports_unprocessed_rows_when_throttled`] — ADR 0021's
+//!     2026-09-09 amendment: seeding into a table with a tiny provisioned
+//!     write capacity leaves rows `unprocessed` (named in the response,
+//!     `written + unprocessed == requested`) rather than the deleted
+//!     internal seeder's own silent-drop behavior.
 //! (4) [`run_split_in_place_children_inherit_the_parents_own_replicas`] —
 //!     ADR 0062 rung 4's "fork first, always local" teeth: a 4-node
 //!     cluster with RF 3 leaves one node genuinely idle (never one of the
@@ -487,6 +492,103 @@ fn seed_writes_synthetic_keys() {
 fn seed_writes_synthetic_keys_over_seeds() {
     for i in 0..5 {
         run_seed_writes_synthetic_keys(0xC086_0300 + i);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// (3b) seed_reports_unprocessed_rows_when_throttled (ADR 0021 amendment)
+// ---------------------------------------------------------------------------
+//
+// `POST /admin/data/seed` is now a thin proxy over the real `BatchWriteItem`
+// wire operation (`admin::action_data_seed`), so a per-table throttle
+// (ADR 0065) refuses a seed chunk the identical way it refuses any other
+// client's `BatchWriteItem` — reported back as `unprocessed`/`error`, never
+// silently dropped the way the deleted internal marker-batch arm's own
+// `UnprocessedItems`-free write path used to. A tiny provisioned write
+// capacity (well under what 500 rows of ~64-byte items demand) proves this
+// end to end: some rows land, some are left `unprocessed`, and
+// `written + unprocessed == requested` — the seeder's own accounting
+// invariant, not a silently-lossy count.
+
+fn run_seed_reports_unprocessed_rows_when_throttled(seed: u64) {
+    let mut cluster = SimCluster::new(seed, 3, 3);
+    let (status, ct) = create_table_via_wire(
+        &mut cluster,
+        0,
+        r#"{"TableName":"seedthrottled","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
+            "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}]}"#,
+    );
+    assert_eq!(status, 200, "seed={seed}: CreateTable seedthrottled: {ct}");
+
+    // A tiny write budget (1 WCU/s, 300 WCU burst capacity — `ThrottleBucket`'s
+    // own `capacity = 300 x rate`, `animusd::CLAUDE.md`'s ADR 0065 entry).
+    // A **marker** (plain, unindexed/unstreamed) table's `BatchWriteItem`
+    // chunk commits as ONE `KindBatch` Raft entry, charged ONCE for the
+    // whole chunk's summed value bytes (`capacity::write_units`, 1 WCU per
+    // 1 KiB) — not once per item — so a small per-item `value_bytes` (as
+    // `seed_writes_synthetic_keys` uses) would barely register: 25 items x
+    // 64 bytes is ~2 WCU/chunk, nowhere near enough to exhaust a 300-WCU
+    // budget. A large `value_bytes` (4000 B) makes each 25-item chunk cost
+    // ~98 WCU, so the 300-WCU budget admits only the first ~3 of a wave's
+    // worth of concurrent chunks before refusing the rest outright.
+    //
+    // Exactly `SEED_CONCURRENCY (8) x SEED_BATCH_WRITE_CAP (25) = 200` rows
+    // — one full wave, no serialized second wave — keeps every refused
+    // chunk's own bounded retry sequence (six attempts, backoff doubling
+    // 200ms→5s, ~6.2s of sleep total) running **concurrently** with its
+    // siblings rather than queued behind them, so the whole call finishes
+    // in ~6.2s of virtual time — comfortably inside `SimCluster::admin`'s
+    // fixed 12s `OP_BUDGET` (`SimCluster::spawn_and_capture`'s own doc). A
+    // bigger row count would need a second wave once the first 8 chunks'
+    // own futures resolve, pushing the total past `OP_BUDGET` and timing
+    // out the call itself rather than proving anything about throttling.
+    cluster.set_table_throughput(
+        "seedthrottled",
+        Some(animus_control::ProvisionedThroughput {
+            read_units: 1,
+            write_units: 1,
+        }),
+    );
+
+    let (status, body) = cluster.admin(
+        0,
+        "POST",
+        "/admin/data/seed",
+        "",
+        br#"{"table":"seedthrottled","count":200,"key_prefix":"seed:","value_bytes":4000}"#,
+    );
+    assert_eq!(
+        status, 200,
+        "seed={seed}: a partial seed is still a 200 (some rows landed): {body}"
+    );
+    let v = json(&body);
+    let written = v["written"].as_u64().expect("written is a number");
+    let unprocessed = v["unprocessed"].as_u64().expect("unprocessed is a number");
+    assert_eq!(
+        written + unprocessed,
+        200,
+        "seed={seed}: every requested row is accounted for, written or unprocessed: {v}"
+    );
+    assert!(
+        unprocessed > 0,
+        "seed={seed}: a throttled table must leave rows unprocessed, not silently \
+         drop or force through the whole request: {v}"
+    );
+    assert!(
+        v["error"].is_string(),
+        "seed={seed}: a partial seed names the shortfall in `error`, not just a bare count: {v}"
+    );
+}
+
+#[test]
+fn seed_reports_unprocessed_rows_when_throttled() {
+    run_seed_reports_unprocessed_rows_when_throttled(env_seed(0xC086_0009));
+}
+
+#[test]
+fn seed_reports_unprocessed_rows_when_throttled_over_seeds() {
+    for i in 0..5 {
+        run_seed_reports_unprocessed_rows_when_throttled(0xC086_0900 + i);
     }
 }
 
