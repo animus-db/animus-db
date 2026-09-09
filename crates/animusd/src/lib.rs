@@ -19081,6 +19081,17 @@ mod sim_cluster_dynamo_update_table_index;
 #[cfg(test)]
 mod sim_cluster_backfill_seeder;
 
+/// ADR 0061 rung J (C-10 PR 5): conversion of
+/// `tests/stream_backfill_seed_filter.rs` — the backfill seeder's own
+/// synthetic change-log markers must never surface as phantom `GetRecords`
+/// events, over both the open-tail and sealed serve paths. Two scenarios
+/// (`_over_seeds` at 5 seeds each), driven with
+/// [`sim_cluster::SimCluster::drive_backfill_seed`] (C-10 PR 2) and
+/// [`sim_cluster::SimCluster::drive_stream_seal`] (C-07 PR 2) together — see
+/// `crates/animusd/CLAUDE.md`'s matching C-10 entry.
+#[cfg(test)]
+mod sim_cluster_stream_backfill_seed_filter;
+
 /// Regression for the issue #298 residual confirmed live under the
 /// un-pinned `SplitMode::InPlace` proof soak (ADR 0018's matching amendment,
 /// `docs/engineering-lessons.md`'s matching entry): a stage blocked by

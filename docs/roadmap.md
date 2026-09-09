@@ -1056,12 +1056,14 @@ the still-true paragraph after the table.
   7 docs close-out.
 - **Depends:** C-09 (closed) — the next unowned residual group per C-08's
   and C-09's own close-outs, sequenced by the maintainer 2026-09-08.
-- **Status (2026-09-09):** open — PRs 1-4 landed (docs opener; groundwork;
+- **Status (2026-09-09):** open — PRs 1-5 landed (docs opener; groundwork;
   `sim_cluster_dynamo_update_table_index.rs`, 9 tests, 3 files deleted
   whole; `sim_cluster_backfill_seeder.rs`, 4 of `tests/backfill_seeder.rs`'s
   5 scenarios converted, `split_during_backfill_converges_with_correct_
   final_gsi` kept `ProdEnv` per its own license, `restart` now respawns
-  `index_backfill::index_backfill_loop`). PRs 5-7 planned, not yet started.
+  `index_backfill::index_backfill_loop`; `sim_cluster_stream_backfill_
+  seed_filter.rs`, 2 tests, 1 file deleted whole). PR 6 (console residue)
+  in progress; PR 7 close-out pending.
 
 ---
 

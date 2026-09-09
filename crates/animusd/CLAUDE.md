@@ -6579,12 +6579,15 @@ backup janitor are D4's own scope (D4 PR 1 already supplied the real
 reconciler these need next); Streams, admin/console/dashboard HTTP, and
 TTL are now owned and closed (C-07, C-08, C-09);
 index DDL beyond plain `CreateTable` is queued as C-10, **open** as of
-2026-09-09 (PRs 1-3 landed — groundwork plus `sim_cluster_dynamo_update_
+2026-09-09 (PRs 1-5 landed — groundwork plus `sim_cluster_dynamo_update_
 table_index.rs`, converting `update_table_create_index.rs`/`update_table_
-drop_index.rs`/`dynamo_gsi_drain.rs` (9 tests), all three deleted whole; see
-ADR 0061's "Rung J (post-C-09)" amendment and `docs/roadmap.md`'s C-10
-entry for the grep-verified ground truth, file/line anchors, and the
-7-PR plan);
+drop_index.rs`/`dynamo_gsi_drain.rs` (9 tests), all three deleted whole;
+`sim_cluster_backfill_seeder.rs`, converting 4 of `backfill_seeder.rs`'s
+5 scenarios; and `sim_cluster_stream_backfill_seed_filter.rs`, converting
+`stream_backfill_seed_filter.rs` (2 tests, +2 scenarios, file deleted)
+whole; PR 6 in progress, PR 7 close-out pending — see ADR 0061's "Rung J
+(post-C-09)" amendment and `docs/roadmap.md`'s C-10 entry for the
+grep-verified ground truth, file/line anchors, and the 7-PR plan);
 the control/data role split, `--config` bring-up, node assembly, and the
 throttle-metric counters are unowned
 by any planned rung as of this close; (E) frozen behind an open flake
@@ -9564,3 +9567,61 @@ fmt --all --check` and `cargo clippy -p animusd --all-targets
 --all-features -- -D warnings` are both clean.
 
 See `docs/roadmap.md`'s C-10 entry for the residual-inventory update.
+
+## Appendix — index DDL beyond plain `CreateTable` under `SimCluster`, `sim_cluster_stream_backfill_seed_filter.rs` (ADR 0061 rung J, C-10 PR 5, 2026-09-09)
+
+Converts `tests/stream_backfill_seed_filter.rs`'s two tests 1:1 into
+`sim_cluster_stream_backfill_seed_filter.rs` (registered in `lib.rs` beside
+`sim_cluster_index_ddl`); the original file is deleted whole. Both scenarios
+prove the backfill seeder's own synthetic, image-less change-log marker
+(`index_drain::seed_change_log_record`, `seeded: true`) never surfaces as a
+phantom `GetRecords` event — one over the open-tail serve path, one over the
+sealed-shard path (`get_records_sealed`'s segment decode) — the "both serve
+paths get their own test" discipline issue #267 asked for, since a shared
+filter predicate only proves the two paths *agree*, not that each is
+actually reached with a seed record in hand.
+
+**No new `SimCluster` mechanism needed** — both scenarios are built entirely
+from primitives two earlier rungs already supplied:
+[`sim_cluster::SimCluster::drive_backfill_seed`] (C-10 PR 2) ticks the
+seeder for every `Creating` GSI of a led tablet, and
+[`sim_cluster::SimCluster::drive_stream_seal`] (C-07 PR 2) seals whatever is
+currently pending on demand. `converge_gsi_active` (a bounded
+`drive_backfill_seed` + `drain_gsi` + `DescribeTable`-poll loop) is
+duplicated locally from `sim_cluster_index_ddl.rs`, per this crate's own
+per-file-fixture convention.
+
+**Knob mapping** (restated from `sim_cluster_dynamo_streams.rs`'s own doc,
+applied here): the original's `no_seal_knobs` (tuned to never fire) is
+simply "never call `drive_stream_seal`" — this fixture never spawns the
+periodic seal arm those knobs tune at all, so a table's tablet just stays
+open. `tiny_seal_knobs` (seals on any pending byte, sweeping seed markers
+into sealed segments alongside real records, deliberately —
+`docs/streams-notes.md`'s "hiding is a serve-time decision") is one
+`drive_stream_seal` call after the backfill converges — the method already
+loops `seal_now` to exhaustion of whatever is pending at the moment it's
+called, so one call suffices.
+
+**The original's own real-time convergence loops are simplified, not
+carried over verbatim.** The sealed-path scenario's 60s
+converged-or-timeout poll existed to race a genuinely concurrent real-time
+writer against a periodic sealer — neither exists under `SimCluster`
+(every write below is already committed, deterministically, before the
+single seal call and the single lineage walk that follows it), so the sim
+sibling asserts directly off one `walk_lineage` call. The open-path
+scenario keeps a bounded stable-poll loop (`drain_open_shard`) purely
+defensively — nothing in this fixture produces new records after the
+scenario's own writes complete, but the original's own "don't assume one
+poll sees everything" discipline costs nothing to keep and generalizes if
+a future rung ever gives this fixture a background writer.
+
+Both tests convert with no residual — this file was fully convertible,
+matching the group's other fully-convertible files.
+
+This PR's own diff: the new module, its `lib.rs` registration, the deleted
+`tests/stream_backfill_seed_filter.rs`, and these three docs files
+(`crates/animusd/CLAUDE.md`,
+`docs/adr/0061-testability-node-crate-simulator.md`, `docs/roadmap.md`).
+
+See ADR 0061's "Rung J, PR 5" amendment and `docs/roadmap.md`'s C-10 entry
+for the full record.
