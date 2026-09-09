@@ -23289,6 +23289,28 @@ method's signature to `E`-generic without also driving it under `SimEnv`
 in the same change, grep the body for `tokio::time`/`Instant::now`/
 `SystemTime::now` before declaring it done, per the general lesson above.
 
+**2026-09-09, fourth recurrence (ADR 0061 rung J, C-10 PR 2)**:
+`index_drain::clear_backfill_cursor<E: Env>` — already generic (its two
+sibling functions, `advance_backfill_cursor`/`seed_change_log_record`,
+needed the identical widening in the very same change, so this one's own
+still-bare `tokio::time::Instant::now()`/`tokio::time::sleep` body was
+easy to miss by pattern-matching "this file's own backfill functions all
+look alike") had the identical gap. Found the same way, by the same
+signal: the very first `sim_cluster_index_ddl.rs` smoke run (scenario
+(b), `UpdateTable` dropping a GSI, whose `drop_index` cascade calls
+`ClientCtx::clear_backfill_cursor_for_table` → this function) panicked
+immediately with "no reactor running." Fixed with the identical
+`group.env().now()`/`group.env().sleep(..)` conversion (this function
+takes `group: &CpGroup<E>` with no `&self`, so it reads the clock off
+`group.env()` rather than `ctx.env`/`self.env` — the same accessor
+`advance_backfill_cursor`/`seed_change_log_record` right beside it
+already use for the identical reason). Four occurrences now — when
+widening a *group* of sibling functions together, grep every one of
+them individually for `tokio::time`/`Instant::now`/`SystemTime::now`,
+not just the ones whose diff you're already looking at; a function that
+"already looks generic" next to freshly-converted siblings is exactly
+the one most likely to get skipped.
+
 ## `DescribeStream` always appends a tablet's still-open successor epoch behind a just-sealed one while the stream stays enabled — a shard-count assertion after a seal must account for it (ADR 0061 rung G, C-07 PR 3, 2026-09-08)
 
 Building `sim_cluster_dynamo_streams.rs`'s new post-seal scenarios (a

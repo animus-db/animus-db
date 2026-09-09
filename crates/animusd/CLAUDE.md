@@ -9330,3 +9330,79 @@ this rung's own findings generalize into.
 
 See ADR 0061's "Rung I" amendments (PR 2 through "Rung I closed") and
 `docs/roadmap.md`'s C-09 entry for the full per-PR record.
+
+## Appendix — index DDL beyond plain `CreateTable` under `SimCluster`, groundwork (ADR 0061 rung J, C-10 PR 2, 2026-09-09)
+
+Opens the C-10 series (the next unowned residual group per Rung H's own
+close-out): `UpdateTable`'s GSI add/drop half — `dynamo.rs`'s
+`create_index`/`drop_index`/`set_index_status`/`drop_table_index`, and
+`index_drain.rs`'s backfill-seeder trio (`backfill_seed_tick`/
+`advance_backfill_cursor`/`seed_change_log_record`, plus
+`clear_backfill_cursor` — see this crate's own engineering-lessons entry
+for the `tokio::time` body this last one still carried despite an
+already-generic signature) — all widened to `<E: Env, R: RelayClient>`/
+`<E: Env>`, mirroring every prior D3/G/H/I rung's own `tokio::time` →
+`ctx.env`/`group.env()` conversion. `dispatch_table_op`'s `UpdateTable`
+arm gained a fourth sub-arm, `(None, Some(update), None)`, mirroring its
+stream/throughput siblings exactly: `wire::IndexUpdate::Create` →
+`create_index`, `Delete` → `drop_index`, then the same
+re-describe-on-success every sibling arm already does. `update_table`/
+`run_operation`/`execute_routed` are byte-identical — verified by `git
+diff` (only signatures, `tokio::time` → `ctx.env` conversions, and the new
+sub-arm) and by the untrimmed real-socket suites
+(`update_table_create_index.rs`/`update_table_drop_index.rs`/
+`dynamo_gsi_drain.rs`/`backfill_seeder.rs`/
+`stream_backfill_seed_filter.rs`/`console_table_config.rs`, 20 tests
+total) staying identical before and after.
+
+**`index_backfill.rs`'s thin wrapper widened the same way** (a pure
+signature change — production's spawn sites in `lib.rs` are unaffected,
+still inferring `ProdEnv`/`AnimusdRelayClient`) so `SimCluster::new`/
+`::restart` can spawn `index_backfill::index_backfill_loop`
+unconditionally on every node, mirroring the backup/segment/TTL janitors'
+own always-on spawns exactly — its own leader gate
+(`ControlLeaderHost::control_leader`) already makes a non-leader's own
+tick a cheap no-op, so no opt-in gate is warranted the way
+`auto_split_loop`'s is. This is the **control-plane-leader-only
+completion aggregator** — the separate loop that flips a fully-reported
+index from `Creating` to `Active`, distinct from the per-tablet
+**backfill-seeder** half below.
+
+**`SimCluster::drive_backfill_seed(node, table)`** (new, mirroring
+`drain_gsi`'s exact shape: the same leader check, the same
+`is_quiesced()`/`Building`-child skip omission — unreachable under this
+fixture, identical reasoning — and the same `spawn_and_capture`-driven-
+to-`OP_BUDGET` bounded wait) drives one `index_drain::backfill_seed_tick`
+per `Creating` GSI (never `Active` — an already-backfilled index has
+nothing left to seed) over every tablet `node` both hosts and leads. This
+is the per-tablet **seeder** half `index_backfill_loop`'s own aggregator
+depends on: a call seeds up to `BACKFILL_SEED_BATCH` (256) newly
+discovered partitions per `(tablet, index)` pair and, only once the sweep
+reaches the tablet's current range end, reports via
+`MetaCommand::MarkIndexBackfilled` — **a populated table with more
+partitions than that needs several calls**, never one call assumed to
+finish everything; poll `DescribeTable`'s own per-index `Backfilling`/
+`IndexStatus` field (or just call `drive_backfill_seed` in a loop) until
+the index flips `Active`, the same "several ticks, not one" contract the
+real per-node loop has in production.
+
+Two new `sim_cluster_index_ddl.rs` scenarios (`_over_seeds` at 5 seeds
+each): (a) `UpdateTable` adding a GSI to a populated table returns it
+`CREATING`/`Backfilling: true`, rejects a `Query` against it while
+backfilling (`ValidationException`, the ordinary `NoSuchIndex`-shaped
+rejection a not-yet-`Active` index gets), and converges to `ACTIVE` via
+`drive_backfill_seed` + `drain_gsi` (a bounded loop of further
+`DescribeTable` calls — each a real op call, which is what actually gives
+the always-on `index_backfill_loop` a chance to observe the freshly-
+reported tablet) with the expected rows queryable through the now-`ACTIVE`
+index; (b) `UpdateTable` deleting that GSI leaves it absent from
+`DescribeTable` and rejects a `Query` against the now-gone index name the
+identical `ValidationException` way.
+
+`cargo test -p animusd --lib sim_cluster -- --test-threads=2`: 428 → 432
+passed (+4, 0 regressions, 2 ignored throughout), peak RSS ~958 MB
+(`/usr/bin/time -v`), consistent with every prior rung's own no-leak
+trajectory.
+
+See ADR 0061's "Rung J, PR 2 landed" amendment and `docs/roadmap.md`'s
+C-10 entry for the full record.

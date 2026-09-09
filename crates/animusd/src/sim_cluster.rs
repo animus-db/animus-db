@@ -1603,6 +1603,23 @@ impl SimCluster {
             ));
         }
 
+        // ADR 0061 rung J (C-10 PR 2): one `index_backfill::
+        // index_backfill_loop` per node, unconditionally — mirrors the
+        // backup/segment/TTL janitors' own always-on spawns immediately
+        // above exactly: this loop's own leader gate
+        // (`ControlLeaderHost::control_leader`, the identical gate the
+        // backup janitor uses) already makes a non-leader's own tick a
+        // cheap idle sleep, so there is no reason to gate spawning it
+        // behind an opt-in the way `auto_split_loop` is. Needs no new
+        // `Drop`/`restart` handling beyond what every other always-on loop
+        // here already gets (issue #753's own discipline) — it captures a
+        // plain `ClientCtx` clone, the identical shape every janitor above
+        // already captures.
+        for ctx in &ctxs {
+            let env = ctx.env.clone();
+            env.spawn_task(index_backfill::index_backfill_loop(ctx.clone()));
+        }
+
         let mut cluster = SimCluster {
             sim,
             nodes,
@@ -2890,6 +2907,80 @@ impl SimCluster {
             Some(Err(e)) => panic!("drain_gsi(node={node}, table={table}) failed: {e}"),
             None => panic!(
                 "drain_gsi(node={node}, table={table}) did not complete within {OP_BUDGET:?}"
+            ),
+        }
+    }
+
+    /// Drive one backfill-seeder tick (ADR 0045 §2, `index_drain::
+    /// backfill_seed_tick`) for every `Creating` GSI of `table`, over every
+    /// tablet [`node`] both hosts and currently leads — a test-only
+    /// stand-in for `index_drain::change_consumer_loop`'s own backfill-seeder
+    /// arm, which this fixture never spawns at all (see
+    /// [`SimCluster::drain_gsi`]'s own doc for the identical
+    /// hand-hosted-not-reconciler-hosted reasoning; the always-on
+    /// `index_backfill_loop` — ADR 0061 rung J, C-10 PR 2 — is the *separate*
+    /// control-plane-leader-only aggregator that flips a fully-backfilled
+    /// index `Active` once every tablet has reported, and IS spawned
+    /// unconditionally by [`SimCluster::new`]/[`SimCluster::restart`]; this
+    /// method drives only the per-tablet seeding half feeding it).
+    ///
+    /// Mirrors [`SimCluster::drain_gsi`]'s exact shape: the same leader
+    /// check (`group.is_leader()`), the same `is_quiesced()`/`Building`-child
+    /// skip omission (unreachable under this fixture, identical reasoning),
+    /// and the same [`SimCluster::spawn_and_capture`]-driven-to-[`OP_BUDGET`]
+    /// bounded wait rather than a fixed sleep. `gsis` is filtered to
+    /// `IndexStatus::Creating` only (never `Active` — an already-backfilled
+    /// index has nothing left to seed, unlike `drain_gsi`'s own
+    /// `Creating | Active` filter, since ordinary live writes keep draining
+    /// an `Active` index forever but a one-shot seed tick has no reason to
+    /// touch one).
+    ///
+    /// **One call seeds at most [`index_drain::BACKFILL_SEED_BATCH`] newly
+    /// discovered partitions per `(tablet, index)` pair — never assume one
+    /// call finishes backfilling a populated table.** A table with more
+    /// partitions than that needs several calls (poll `DescribeTable`'s own
+    /// per-index `Backfilling`/status field, or just call this in a loop
+    /// until the index flips `Active`), the same "several ticks, not one"
+    /// contract the real per-node loop has in production.
+    ///
+    /// Panics on a genuine seed failure or on not completing within
+    /// [`OP_BUDGET`] — both are fixture-setup bugs, mirroring
+    /// [`SimCluster::drain_gsi`]'s identical panic contract.
+    pub(crate) fn drive_backfill_seed(&mut self, node: u64, table: &str) {
+        let table_owned = table.to_owned();
+        let handle = self.shared.clone();
+        let outcome: Option<Result<(), String>> = self.spawn_and_capture(node, async move {
+            let ctx = handle.ctx(node);
+            let meta = ctx.effective_metadata();
+            let gsis: Vec<animus_control::IndexDef> = meta
+                .table_indexes(&table_owned)
+                .iter()
+                .filter(|i| {
+                    i.kind == animus_control::IndexKind::Global && i.status == IndexStatus::Creating
+                })
+                .cloned()
+                .collect();
+            for (tablet, group) in ctx.edge.hosted_groups() {
+                let led_here = meta
+                    .tablets
+                    .get(&tablet)
+                    .is_some_and(|t| t.table.as_deref() == Some(table_owned.as_str()));
+                if !led_here || !group.is_leader() {
+                    continue;
+                }
+                for idx in &gsis {
+                    index_drain::backfill_seed_tick(&ctx, &group, tablet, &table_owned, idx)
+                        .await?;
+                }
+            }
+            Ok(())
+        });
+        match outcome {
+            Some(Ok(())) => {}
+            Some(Err(e)) => panic!("drive_backfill_seed(node={node}, table={table}) failed: {e}"),
+            None => panic!(
+                "drive_backfill_seed(node={node}, table={table}) did not complete within \
+                 {OP_BUDGET:?}"
             ),
         }
     }

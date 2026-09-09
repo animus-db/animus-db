@@ -1687,18 +1687,25 @@ async fn dispatch_item_op<E: Env, R: RelayClient>(
 /// PR 2)** — `create_table`'s own stream branch just calls the already-
 /// generic `enable_stream`, so there was nothing left to backfill there
 /// either, unlike a GSI's drain), `DeleteTable`, `ListTables`,
-/// `DescribeTable`, (ADR 0061 rung D3 PR 2b) `UpdateTable`'s own
-/// **throughput-only** change — a `BillingMode`/`ProvisionedThroughput`
-/// change with no stream or index change in the same call, via
-/// [`update_table_throughput`] — and (ADR 0061 rung G, C-07 PR 2)
-/// `UpdateTable`'s own **stream-only** change — enable or disable, with no
-/// throughput or index change in the same call, via [`enable_stream`]/
-/// [`disable_stream`]. `UpdateTable` carrying an index change instead
-/// (still needing the GSI-drain machinery this rung doesn't generalize),
-/// plus `UpdateTimeToLive`/backup/export/import/PartiQL, all fall through
-/// to [`unsupported_by_generic_dispatch`] — deferred beyond this PR, naming
-/// the same reasons [`dispatch_item_op`]'s own doc already gives for its
-/// own excluded operations.
+/// `DescribeTable`, and `UpdateTable`'s own three mutually exclusive change
+/// shapes: (ADR 0061 rung D3 PR 2b) **throughput-only** — a
+/// `BillingMode`/`ProvisionedThroughput` change with no stream or index
+/// change in the same call, via [`update_table_throughput`]; (ADR 0061 rung
+/// G, C-07 PR 2) **stream-only** — enable or disable, with no throughput or
+/// index change in the same call, via [`enable_stream`]/[`disable_stream`];
+/// and (ADR 0061 rung J, C-10 PR 2) **index-only** — add or drop a GSI, with
+/// no stream or throughput change in the same call, via [`create_index`]/
+/// [`drop_index`] (both now `<E, R>`-generic — a pure signature widening,
+/// their bodies' `tokio::time` sites converted to `ctx.env`, mirroring
+/// [`update_table_throughput`]'s own precedent; the populated-table GSI
+/// backfill itself — the drain/seeder/completion-aggregator machinery
+/// `create_index`'s own doc describes — is untouched by this widening, so a
+/// `SimCluster`-driven `CreateTable`-with-a-later-`UpdateTable`-add-index
+/// still needs `SimCluster::drive_backfill_seed`/`drain_gsi` exactly as a
+/// `CreateTable`-time GSI already does). `UpdateTimeToLive`/backup/export/
+/// import/PartiQL all fall through to [`unsupported_by_generic_dispatch`] —
+/// out of scope, naming the same reasons [`dispatch_item_op`]'s own doc
+/// already gives for its own excluded operations.
 ///
 /// **Called from two places**, mirroring [`dispatch_item_op`] exactly:
 /// [`run_operation`]'s own `CreateTable`/`DescribeTable`/`DeleteTable`/
@@ -1707,9 +1714,8 @@ async fn dispatch_item_op<E: Env, R: RelayClient>(
 /// [`update_table`] directly — never this function — so production DDL
 /// behavior is byte-identical (`update_table` itself keeps dispatching every
 /// one of its three change shapes, stream/index/throughput alike, to its own
-/// unmodified `ProdEnv`-only callees; only [`update_table_throughput`] itself
-/// was widened to `<E, R>`, the same way `create_table`'s own five callees
-/// were in PR 2a). This function exists only for [`execute_item_op_as`]
+/// callees directly, unaffected by any of them separately gaining a generic
+/// signature). This function exists only for [`execute_item_op_as`]
 /// (below), the `SimCluster`-facing entry point — see the root `CLAUDE.md`'s
 /// "a narrowed generic split of a dispatcher must not become the production
 /// dispatcher's ONLY path" lesson (`docs/engineering-lessons.md`'s matching
@@ -1760,27 +1766,20 @@ async fn dispatch_table_op<E: Env, R: RelayClient>(
             exclusive_start_table_name,
             limit,
         } => list_tables(meta, exclusive_start_table_name.as_deref(), limit),
-        // ADR 0061 rung D3 PR 2b + rung G (C-07 PR 2): the throughput-only
-        // and stream-only shapes of `UpdateTable` are covered — an index
-        // change still needs the GSI-drain machinery this rung doesn't
-        // generalize (see `update_table`'s own doc for the three mutually
-        // exclusive change shapes this mirrors). `key_types` is unused
-        // here: it only ever matters for `IndexUpdate::Create`, which this
-        // arm never reaches.
+        // ADR 0061 rung D3 PR 2b + rung G (C-07 PR 2) + rung J (C-10 PR 2):
+        // the throughput-only, stream-only, and (since rung J) index-change
+        // shapes of `UpdateTable` are all covered now — see `update_table`'s
+        // own doc for the three mutually exclusive change shapes this
+        // mirrors.
         Operation::UpdateTable {
             table,
             stream,
             index_update,
-            key_types: _,
+            key_types,
             throughput_update,
         } => {
-            if index_update.is_some() {
-                return Err(unsupported_by_generic_dispatch(
-                    "UpdateTable with an index change",
-                ));
-            }
-            match (stream, throughput_update) {
-                (Some(stream), None) => match stream {
+            match (stream, index_update, throughput_update) {
+                (Some(stream), None, None) => match stream {
                     wire::StreamUpdate::Enable(view_type) => {
                         if metadata_fresh(ctx).await.table_stream(&table).is_some() {
                             return Err(WireError::validation(format!(
@@ -1793,19 +1792,29 @@ async fn dispatch_table_op<E: Env, R: RelayClient>(
                     }
                     wire::StreamUpdate::Disable => disable_stream(ctx, &table).await?,
                 },
-                (None, Some(spec)) => {
+                // ADR 0061 rung J (C-10 PR 2): the index-change shape of
+                // `UpdateTable`, mirroring `update_table`'s own
+                // `(None, Some(update), None)` arm — `create_index`/
+                // `drop_index` are both now `<E, R>`-generic.
+                (None, Some(update), None) => match update {
+                    wire::IndexUpdate::Create(index) => {
+                        create_index(ctx, &table, &index, &key_types).await?
+                    }
+                    wire::IndexUpdate::Delete(index) => drop_index(ctx, &table, &index).await?,
+                },
+                (None, None, Some(spec)) => {
                     update_table_throughput(ctx, &table, spec).await?;
                 }
-                (None, None) => {
+                (None, None, None) => {
                     return Err(unsupported_by_generic_dispatch(
                         "UpdateTable with no supported change",
                     ));
                 }
-                (Some(_), Some(_)) => {
+                _ => {
                     // Unreachable via the wire decoder (it always sets at
-                    // most one of `stream`/`throughput_update`), but handled
-                    // explicitly rather than assumed — mirrors `update_table`'s
-                    // own identical wildcard arm.
+                    // most one of `stream`/`index_update`/`throughput_update`),
+                    // but handled explicitly rather than assumed — mirrors
+                    // `update_table`'s own identical wildcard arm.
                     return Err(WireError::validation(
                         "UpdateTable requires exactly one of a StreamSpecification, a \
                          GlobalSecondaryIndexUpdates, or a BillingMode/ProvisionedThroughput \
@@ -4506,8 +4515,8 @@ async fn update_table_throughput<E: Env, R: RelayClient>(
 /// seeder + completion aggregator (PR1-4 of this stack) cover every
 /// pre-existing row and flip the index to `Active` with no further action
 /// here.
-async fn create_index(
-    ctx: &ClientCtx,
+async fn create_index<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     table: &str,
     index: &animus_dynamo::SecondaryIndex,
     key_types: &[(String, String)],
@@ -4552,7 +4561,7 @@ async fn create_index(
     }
     let mut def = schema_bridge::index_to_control(index, &control_schema.partition_key, key_types);
     def.status = IndexStatus::Creating;
-    let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+    let deadline = ctx.env.now().saturating_add(SCHEMA_COMMIT_TIMEOUT);
     loop {
         ctx.propose_schema(&MetaCommand::CreateTableIndex {
             table: table.to_owned(),
@@ -4567,13 +4576,13 @@ async fn create_index(
         {
             return Ok(());
         }
-        if tokio::time::Instant::now() >= deadline {
+        if ctx.env.now() >= deadline {
             return Err(internal(&format!(
                 "index `{name}` creation did not commit to the control plane in time \
                  (no leader reachable?)"
             )));
         }
-        tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+        ctx.env.sleep(SCHEMA_POLL_INTERVAL).await;
     }
 }
 
@@ -4624,7 +4633,11 @@ async fn create_index(
 /// a moment *before* the `Deleting` transition landed, finishing its own
 /// write after the first clear). Both passes are plain idempotent
 /// tombstone writes; running twice costs nothing.
-async fn drop_index(ctx: &ClientCtx, table: &str, index: &str) -> Result<(), WireError> {
+async fn drop_index<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+    table: &str,
+    index: &str,
+) -> Result<(), WireError> {
     let meta = metadata_fresh(ctx).await;
     let Some(def) = meta
         .table_indexes(table)
@@ -4677,13 +4690,13 @@ async fn drop_index(ctx: &ClientCtx, table: &str, index: &str) -> Result<(), Wir
 /// Idempotent: returns `Ok(())` immediately (on the first poll) if `index`
 /// is already at `status`, whether from an earlier attempt at this same
 /// call or a genuinely-concurrent transition.
-async fn set_index_status(
-    ctx: &ClientCtx,
+async fn set_index_status<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     table: &str,
     index: &str,
     status: IndexStatus,
 ) -> Result<(), WireError> {
-    let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+    let deadline = ctx.env.now().saturating_add(SCHEMA_COMMIT_TIMEOUT);
     loop {
         ctx.propose_schema(&MetaCommand::SetIndexStatus {
             table: table.to_owned(),
@@ -4699,13 +4712,13 @@ async fn set_index_status(
         {
             return Ok(());
         }
-        if tokio::time::Instant::now() >= deadline {
+        if ctx.env.now() >= deadline {
             return Err(internal(&format!(
                 "index `{index}` status change to {status:?} did not commit to the control \
                  plane in time (no leader reachable?)"
             )));
         }
-        tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+        ctx.env.sleep(SCHEMA_POLL_INTERVAL).await;
     }
 }
 
@@ -4713,8 +4726,12 @@ async fn set_index_status(
 /// index definition to disappear from the replicated catalog. Idempotent:
 /// returns `Ok(())` immediately if `index` is already absent (a retry after
 /// a prior attempt's proposal already committed).
-async fn drop_table_index(ctx: &ClientCtx, table: &str, index: &str) -> Result<(), WireError> {
-    let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+async fn drop_table_index<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+    table: &str,
+    index: &str,
+) -> Result<(), WireError> {
+    let deadline = ctx.env.now().saturating_add(SCHEMA_COMMIT_TIMEOUT);
     loop {
         ctx.propose_schema(&MetaCommand::DropTableIndex {
             table: table.to_owned(),
@@ -4729,13 +4746,13 @@ async fn drop_table_index(ctx: &ClientCtx, table: &str, index: &str) -> Result<(
         {
             return Ok(());
         }
-        if tokio::time::Instant::now() >= deadline {
+        if ctx.env.now() >= deadline {
             return Err(internal(&format!(
                 "index `{index}` definition did not drop from the control plane in time \
                  (no leader reachable?)"
             )));
         }
-        tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+        ctx.env.sleep(SCHEMA_POLL_INTERVAL).await;
     }
 }
 

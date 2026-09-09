@@ -19046,6 +19046,16 @@ mod sim_cluster_seed_latency;
 #[cfg(test)]
 mod sim_cluster_ttl;
 
+/// ADR 0061 rung J (C-10 PR 2): the groundwork for index DDL beyond plain
+/// `CreateTable` under `SimCluster` — `UpdateTable` adding/dropping a GSI on
+/// a populated table, driven through `dynamo::dispatch_table_op`'s new
+/// index-change sub-arm and the now-generic `dynamo::create_index`/
+/// `drop_index`/`index_drain::backfill_seed_tick`. Two scenarios
+/// (`_over_seeds` at 5 seeds each) — see `crates/animusd/CLAUDE.md`'s
+/// matching C-10 entry.
+#[cfg(test)]
+mod sim_cluster_index_ddl;
+
 /// Regression for the issue #298 residual confirmed live under the
 /// un-pinned `SplitMode::InPlace` proof soak (ADR 0018's matching amendment,
 /// `docs/engineering-lessons.md`'s matching entry): a stage blocked by

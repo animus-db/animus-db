@@ -7822,3 +7822,60 @@ CLAUDE.md`'s residual-inventory index-DDL mention annotated with a
 pointer to this open rung. **Gates:** none — documentation only, no
 `cargo` command run, `git diff --stat` shows only the three docs files
 this PR touches.
+
+## 2026-09-09 amendment — Rung J, PR 2 landed (groundwork)
+
+Brief as-built note; the opener's own plan (this docs-only PR, landed
+alongside on `-109`) carries the full plan and grep-verified ground truth.
+
+Widened `dynamo.rs`'s `create_index`/`drop_index`/`set_index_status`/
+`drop_table_index` to `<E: Env, R: RelayClient>` (`tokio::time::
+Instant::now()`/`sleep` → `ctx.env.now()`/`ctx.env.sleep(..)`, the
+established rung-wide precedent), added a mirroring index-change sub-arm
+to `dispatch_table_op`'s `UpdateTable` match (`(None, Some(update), None)`
+→ `create_index`/`drop_index`, same shape as its stream/throughput
+siblings), widened `index_backfill.rs`'s thin wrapper the same way, and
+widened `index_drain.rs`'s `backfill_seed_tick`/`advance_backfill_cursor`/
+`seed_change_log_record` (the last two take `group: &CpGroup<E>` with no
+`&self` — converted via `group.env()`, the documented pattern `seal_now`
+already established for this exact shape).
+
+**A `tokio::time` body found in an already-generic-signature function,
+the same recurring pattern this rung's own predecessors (`seal_now`,
+`admin_transfer_control_leadership`, `recovery_grace_now_ms`) already
+recorded**: `clear_backfill_cursor<E: Env>` (used by `drop_index`'s own
+cascade via `ClientCtx::clear_backfill_cursor_for_table`) already carried
+a generic signature but its commit-wait loop still called bare
+`tokio::time::Instant::now()`/`tokio::time::sleep` — found immediately by
+the first sim smoke run (`SimEnv` has no real Tokio reactor, so the call
+panics "there is no reactor running" the instant it's reached), fixed
+with the identical `group.env()` conversion. See `docs/engineering-
+lessons.md`'s matching entry (this is that lesson's fourth recurrence in
+this crate).
+
+`SimCluster::new`/`::restart` spawn `index_backfill::index_backfill_loop`
+unconditionally on every node (mirroring the backup/segment/TTL janitors'
+own always-on spawns — its own leader gate already makes a non-leader's
+tick a cheap no-op, so no opt-in gate is warranted); a new
+`SimCluster::drive_backfill_seed(node, table)` mirrors `drain_gsi`'s exact
+shape, driving one `backfill_seed_tick` per `Creating` GSI over every
+tablet `node` leads, documented as needing several calls for a table with
+more than `BACKFILL_SEED_BATCH` partitions.
+
+Two new `sim_cluster_index_ddl.rs` scenarios (`_over_seeds` at 5 seeds
+each): `UpdateTable` adding a GSI to a populated table returns it
+`CREATING`/`Backfilling: true`, rejects a `Query` against it while
+backfilling, and converges to `ACTIVE` (via `drive_backfill_seed` +
+`drain_gsi`, polled through further `DescribeTable` calls — never a
+single call assumed to finish) with the expected rows queryable; deleting
+that GSI leaves it absent from `DescribeTable` and rejects a `Query`
+against the now-gone name. **No `update_table`/`run_operation`/
+`execute_routed` change** — `git diff` on `dynamo.rs` shows only
+signatures, `tokio::time` → `ctx.env` conversions, and the new sub-arm;
+the untrimmed real-socket suites (`update_table_create_index.rs`/
+`update_table_drop_index.rs`/`dynamo_gsi_drain.rs`/`backfill_seeder.rs`/
+`stream_backfill_seed_filter.rs`/`console_table_config.rs`, 20 tests) stay
+byte-for-byte identical before and after.
+
+`cargo test -p animusd --lib sim_cluster -- --test-threads=2`: 428 → 432
+passed (+4, 0 regressions), peak RSS ~958 MB (`/usr/bin/time -v`).
