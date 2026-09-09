@@ -1127,8 +1127,9 @@ the still-true paragraph after the table.
 - **Size:** S, 4 PRs.
 - **Depends:** C-10 (closed) — the next unowned residual group per C-08's,
   C-09's, and C-10's own close-outs.
-- **Status (2026-09-09):** open — PR 1 (this docs opener) landed; PRs 2-4
-  planned.
+- **Status (2026-09-09):** open — PR 1 (docs opener) and PR 2
+  (`sim_cluster_dynamo_throttle.rs`, four wire-shape tests converted,
+  `tests/dynamo_throttling.rs` stays untrimmed) landed; PRs 3-4 planned.
 
 ---
 
@@ -1211,7 +1212,7 @@ wave are independent and can run in parallel.
 | 9 | C-08 (closed 2026-09-08 — all eight PRs landed: #764, #765, #766, #767, #773, #776, #777, PR 8) | Gated on C-04 (closed), C-06 (closed), and C-07 (closed) — the same generic dispatch cores, plus rung C5's own widening of `ClientCtx`'s field types |
 | 10 | C-09 (closed 2026-09-09 — all six PRs landed: #780, #782, #785, #786, #787, plus PR 6) | Gated on C-08 (closed) — C-08's own close-out recommendation, stacked directly on it |
 | 11 | C-10 (closed 2026-09-09 — all seven PRs landed: #789, #790, #791, #792, #793, #794, plus PR 7) | Gated on C-09 (closed) — the next unowned residual group per C-08's and C-09's own close-outs |
-| 12 | C-11 (open 2026-09-09 — PR 1, this docs opener, landed; PRs 2-4 planned) | Gated on C-10 (closed) — the next unowned residual group per C-08's, C-09's, and C-10's own close-outs; not yet explicitly sequenced by the maintainer (see the C-11 entry's own note) |
+| 12 | C-11 (open 2026-09-09 — PR 1 docs opener and PR 2 (`sim_cluster_dynamo_throttle.rs`) landed; PRs 3-4 planned) | Gated on C-10 (closed) — the next unowned residual group per C-08's, C-09's, and C-10's own close-outs; not yet explicitly sequenced by the maintainer (see the C-11 entry's own note) |
 
 Open issues mapped: none left (#375 closed by W-01, #319 by W-05). Filed
 from wave 2's own findings: #590 (the operator still emits the deleted
