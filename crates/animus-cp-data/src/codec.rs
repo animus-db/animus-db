@@ -214,7 +214,19 @@ const MAGIC: u8 = 0xCB;
 /// reserved `heartbeat_batch::HEARTBEAT_BATCH_STREAM` (see that module's
 /// doc). Same house convention: a clean bump, no cross-version
 /// compatibility required.
-const VERSION: u8 = 28;
+/// `29` (issue #804, ADR 0018 §2 amendment): the snapshot image gained a
+/// leading `max_ts: Option<HlcTimestamp>` header field (`put_opt_ts`,
+/// before the entry count) — the sender's own apply-task `max_applied_ts`
+/// at image-build time. Closes the InstallSnapshot half of the witnessing
+/// gap: a committed entry whose apply wrote no row (a failed `Cas`, an
+/// aborted txn, ...) carries a `ts` that never advances
+/// `StorageEngine::latest_version()`, so a receiver that installs an image
+/// covering such an entry — and never applies it individually — used to
+/// never witness it. See `lib.rs`'s `engine_image`/`install_engine_image`
+/// doc and the Key invariants "Witnessing" bullet in this crate's
+/// `CLAUDE.md` for the full account. Same house convention: a clean bump,
+/// no cross-version compatibility required.
+const VERSION: u8 = 29;
 
 /// A decode failure: a description of what was malformed, surfaced loudly by
 /// the caller (logged + dropped; never silently misread).
@@ -1223,10 +1235,16 @@ pub(crate) fn decode_wire(bytes: &[u8]) -> Result<KvWire, DecodeError> {
 
 /// Encode the engine snapshot image (`(key, value-or-tombstone, version)`
 /// entries) shipped in `InstallSnapshot` chunks.
-pub(crate) fn encode_image(entries: &[ImageEntry]) -> Vec<u8> {
+///
+/// `max_ts` (version `29`, issue #804) is the sender's own apply-task
+/// `max_applied_ts` at image-build time — an upper bound on every `ts` any
+/// entry folded into this tablet has ever committed, whether or not that
+/// entry's apply wrote a row. See `lib.rs`'s `engine_image` doc.
+pub(crate) fn encode_image(entries: &[ImageEntry], max_ts: Option<HlcTimestamp>) -> Vec<u8> {
     let mut out = Vec::new();
     put_u8(&mut out, MAGIC);
     put_u8(&mut out, VERSION);
+    put_opt_ts(&mut out, &max_ts);
     out.extend_from_slice(&(entries.len() as u32).to_be_bytes());
     for (kind, key, value, version) in entries {
         put_u8(&mut out, *kind);
@@ -1239,7 +1257,11 @@ pub(crate) fn encode_image(entries: &[ImageEntry]) -> Vec<u8> {
 
 /// Decode an engine snapshot image. Loud on any malformation (a partial
 /// transfer never reaches this — chunks are reassembled to `total` first).
-pub(crate) fn decode_image(bytes: &[u8]) -> Result<Vec<ImageEntry>, DecodeError> {
+/// Returns the sender's `max_ts` header (see [`encode_image`]) alongside the
+/// row entries.
+pub(crate) fn decode_image(
+    bytes: &[u8],
+) -> Result<(Option<HlcTimestamp>, Vec<ImageEntry>), DecodeError> {
     let mut c = Cursor::new(bytes);
     let magic = c.u8()?;
     if magic != MAGIC {
@@ -1249,6 +1271,7 @@ pub(crate) fn decode_image(bytes: &[u8]) -> Result<Vec<ImageEntry>, DecodeError>
     if version != VERSION {
         return Err(format!("unsupported codec version {version}"));
     }
+    let max_ts = read_opt_ts(&mut c)?;
     let n = c.u32()?;
     // Capped pre-allocation against an untrusted wire count — see
     // `read_kind_writes`'s comment for why.
@@ -1257,7 +1280,7 @@ pub(crate) fn decode_image(bytes: &[u8]) -> Result<Vec<ImageEntry>, DecodeError>
         entries.push((c.u8()?, c.bytes()?, c.opt_bytes()?, c.u64()?));
     }
     c.finish()?;
-    Ok(entries)
+    Ok((max_ts, entries))
 }
 
 #[cfg(test)]
@@ -1695,8 +1718,25 @@ mod tests {
             (crate::KIND_CHANGE, b"a".to_vec(), Some(vec![8]), 5),
             (crate::KIND_FOOTPRINT, Vec::new(), Some(Vec::new()), 0),
         ];
-        let bytes = encode_image(&entries);
-        assert_eq!(decode_image(&bytes).expect("decodes"), entries);
+        let bytes = encode_image(&entries, None);
+        assert_eq!(decode_image(&bytes).expect("decodes"), (None, entries));
+    }
+
+    /// Issue #804: the `max_ts` header round-trips distinctly from `None`,
+    /// proving the field is actually threaded through the wire bytes rather
+    /// than defaulted.
+    #[test]
+    fn image_max_ts_header_round_trips() {
+        let entries: Vec<ImageEntry> = vec![(crate::KIND_BASE, b"a".to_vec(), Some(vec![1]), 3)];
+        let max_ts = HlcTimestamp {
+            wall_ms: 4300,
+            logical: 99,
+        };
+        let bytes = encode_image(&entries, Some(max_ts));
+        assert_eq!(
+            decode_image(&bytes).expect("decodes"),
+            (Some(max_ts), entries)
+        );
     }
 
     #[test]
