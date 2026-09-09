@@ -7974,3 +7974,62 @@ maintainer's own next step, not yet recorded here.
 
 See `crates/animusd/CLAUDE.md`'s matching appendix and `docs/roadmap.md`'s
 C-10 entry for the full record.
+
+## 2026-09-09 amendment — Rung J, PR 4 landed (the backfill seeder)
+
+Converted 4 of the 5 scenarios in `tests/backfill_seeder.rs` (ADR 0045 §2)
+into a new `crates/animusd/src/sim_cluster_backfill_seeder.rs`, driven
+entirely through PR 2's own primitives (`SimCluster::drive_backfill_seed`/
+`drain_gsi`, the always-on `index_backfill::index_backfill_loop`) — no
+`dynamo.rs`/`index_drain.rs`/`sim_cluster.rs` change, pure test authorship.
+`backfill_seeder_materializes_every_pre_existing_row_then_flips_active`,
+`live_writes_during_backfill_converge_to_the_correct_final_gsi` (issued
+sequenced, not raced — see below), `two_indexes_creating_simultaneously_
+converge_independently`, and `a_crash_and_restart_mid_backfill_still_
+converges` (a `SimCluster::crash`/`restart` of the tablet's own leader
+mid-sweep, 300 rows > `BACKFILL_SEED_BATCH` so one seed round provably
+cannot finish, resuming from the durable `KIND_CURSOR` row committed
+before the crash) each gained an `_over_seeds`-paired sibling (5 seeds).
+
+**`split_during_backfill_converges_with_correct_final_gsi` exercised the
+opener's own explicit license (this amendment's plan already named it,
+above) and stayed on `ProdEnv`, unmodified, alone in the trimmed
+`tests/backfill_seeder.rs`.** `SimCluster` spawns no `index_drain::
+change_consumer_loop` at all, so proving this scenario would mean
+hand-interleaving three separately-timed on-demand primitives
+(`drive_backfill_seed`/`drain_gsi`/`drive_inplace_split_cutover`) every
+round with no way, in the session that wrote this PR, to verify offline
+that the always-on completion aggregator can't race the cutover propose
+to `Active` (the aggregator watches "every tablet *currently* in the
+table's live map has reported," which is satisfied by the still-un-cut-
+over parent alone, independent of whether cutover has actually committed)
+or that the post-cutover Fork-A per-child resweep converges within any
+round budget that was never run.
+
+**A stated deviation**: the converted `live_writes_...` scenario's five
+race writes are issued *sequenced*, immediately after the index commits
+`Creating` and before any `drive_backfill_seed` round runs at all, rather
+than raced via a second concurrent task — this fixture drives everything
+from one thread with no automatic background sweep to race against. What
+it proves is the property the original test's own doc names as load-
+bearing (the final materialized GSI matches the final base-table state
+regardless of write/seed interleaving), not the literal concurrency.
+
+**Originally written with no `cargo` access** (the authoring session's own
+worktree was isolated from a build environment) — every API called was
+confirmed by reading its current signature/doc in the tree rather than by
+compiling. **A subsequent real gate run found and fixed one genuine
+fixture gap**: `SimCluster::restart` respawned every other always-on
+background loop (`heartbeat_loop`/`backup_janitor_loop`/
+`segment_janitor_loop`/`ttl_reaper_loop`/`auto_split_loop` when opted in)
+but not `index_backfill::index_backfill_loop`, spawned unconditionally by
+`SimCluster::new` since PR 2 — fixed by adding the identical respawn,
+mirroring the `ttl_reaper_loop` respawn immediately above it. All 8 tests
+in this module passed on the first full run after that fix
+(`cargo test -p animusd --lib sim_cluster_backfill_seeder`); the trimmed
+`tests/backfill_seeder.rs` residual test passed unchanged; the whole
+`sim_cluster` tier passed 458/458 (2 ignored). `cargo fmt --all --check`
+and `cargo clippy -p animusd --all-targets --all-features -- -D warnings`
+both clean. See `crates/animusd/CLAUDE.md`'s matching C-10 PR 4 appendix,
+`docs/engineering-lessons.md`'s matching entry (updated in place, not
+duplicated), and `docs/roadmap.md`'s C-10 entry for the full account.

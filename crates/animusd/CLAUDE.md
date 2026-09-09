@@ -9483,3 +9483,84 @@ the list of anything left uncertain).
 
 See ADR 0061's "Rung J, PR 3 landed" amendment and `docs/roadmap.md`'s
 C-10 entry for the full record.
+
+## Appendix — the backfill seeder under `SimCluster` (ADR 0061 rung J, C-10 PR 4, 2026-09-09)
+
+Converts 4 of the 5 scenarios in `tests/backfill_seeder.rs` (ADR 0045 §2 —
+the secondary-index **backfill seeder**) into a new `crates/animusd/src/
+sim_cluster_backfill_seeder.rs`, driven entirely through PR 2's own
+primitives (`SimCluster::drive_backfill_seed`/`drain_gsi`, the always-on
+`index_backfill::index_backfill_loop` completion aggregator) — no
+`dynamo.rs`/`index_drain.rs`/`sim_cluster.rs` change was needed or made;
+this PR is pure test authorship, mirroring D3 PR 3b's/rung G PR 4's own
+"no dispatch change needed" precedent.
+
+**Mapping** (see the new module's own doc for the full per-scenario
+account): `backfill_seeder_materializes_every_pre_existing_row_then_
+flips_active`, `live_writes_during_backfill_converge_to_the_correct_
+final_gsi` (sequenced, not raced — see below), `two_indexes_creating_
+simultaneously_converge_independently`, and `a_crash_and_restart_mid_
+backfill_still_converges` (a `SimCluster::crash`/`restart` of the
+tablet's own leader mid-sweep — 300 rows, exceeding the production
+`BACKFILL_SEED_BATCH` of 256, so one seed round provably cannot finish;
+resumes from the durable `KIND_CURSOR` row, committed via the tablet's
+own Raft group before the crash and unaffected by it) each gained a
+deterministic, `_over_seeds`-paired (5 seeds) sibling.
+
+**`split_during_backfill_converges_with_correct_final_gsi` is the ADR
+0061 rung J opener's own explicitly-licensed fallback case and stays on
+`ProdEnv`, unmodified, alone in the trimmed `tests/backfill_seeder.rs`** —
+`SimCluster` spawns no `index_drain::change_consumer_loop` at all, so
+proving it would mean hand-interleaving three separately-timed on-demand
+primitives (`drive_backfill_seed`/`drain_gsi`/`drive_inplace_split_
+cutover`) every round with no way, in this session, to verify offline
+that the always-on completion aggregator can't race the cutover propose,
+or that the post-cutover Fork-A per-child resweep (ADR 0045 §5 — "no
+split-lineage cursor inheritance") converges within a round budget that
+was never actually run.
+
+**A real deviation from the original scenario, stated plainly**: the
+converted `live_writes_...` scenario issues its five-new/one-moved/
+one-deleted race writes *sequenced* — immediately after the index
+commits `Creating` and before any `drive_backfill_seed` round has run at
+all — rather than raced via a second concurrent task the way the real
+`tokio::spawn` writer does, since this fixture drives everything from one
+thread with no automatic background sweep to race against. What it
+proves is the property the original test's own doc names as the actual
+load-bearing claim ("the final materialized GSI matches the final
+base-table state regardless of how the sweep and these writes actually
+interleaved," ADR 0045 §2), not the literal concurrency.
+
+**This PR was originally written with no `cargo` access** (a
+worktree-isolation constraint of the session that authored it) — every API
+this module calls (`SimCluster::propose_meta`/`drive_backfill_seed`/
+`drain_gsi`/`scan`/`dynamo`/`metadata`/`crash`/`restart`/`node_count`/
+`leader_index_of`, `animus_control::{IndexDef, IndexKind, IndexProjection,
+IndexStatus, MetaCommand, ProposeResult}`, `animus_dynamo::wire::
+{BATCH_WRITE_MAX_ITEMS, decode_stored_item}`) was confirmed by reading its
+current signature and doc comment directly in the tree, matching
+`sim_cluster_index_ddl.rs`'s (PR 2) own established call shapes wherever a
+precedent already existed. **A real gate run in the main tree found one
+genuine fixture gap, not a bug in this module's own scenarios**:
+`SimCluster::restart` respawned `heartbeat_loop`/`backup_janitor_loop`/
+`segment_janitor_loop`/`ttl_reaper_loop`/(conditionally) `auto_split_loop`
+— every perpetual background task `Simulator::stop` drops for the
+restarted node — but not `index_backfill::index_backfill_loop` (spawned by
+`SimCluster::new` since PR 2). Fixed by mirroring the `ttl_reaper_loop`
+respawn immediately above it in `SimCluster::restart` — a plain,
+pattern-matching addition, no new mechanism (see `docs/
+engineering-lessons.md`'s matching entry, updated in place rather than
+duplicated). All 8 tests in this module (4 scenarios × pinned-seed +
+`_over_seeds`) passed on the first full run after that fix, including
+`a_crash_and_restart_mid_backfill_still_converges`(`_over_seeds`), which
+exercises the fixed respawn path directly. The trimmed `tests/
+backfill_seeder.rs` (the one residual `split_during_backfill_converges_
+with_correct_final_gsi` test) passed unchanged. The whole `sim_cluster`
+tier (`cargo test -p animusd --lib sim_cluster -- --test-threads=2`)
+passed 458/458 (2 ignored, 0 failed), including `sim_cluster_index_ddl`
+and `sim_cluster_dynamo_update_table_index` (C-10 PR 2/PR 3's own tests),
+confirming the `restart` change didn't disturb anything upstream. `cargo
+fmt --all --check` and `cargo clippy -p animusd --all-targets
+--all-features -- -D warnings` are both clean.
+
+See `docs/roadmap.md`'s C-10 entry for the residual-inventory update.

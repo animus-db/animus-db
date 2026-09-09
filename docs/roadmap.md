@@ -1045,17 +1045,23 @@ the still-true paragraph after the table.
   always-on `SimCluster` `index_backfill_loop` spawn, and
   `drive_backfill_seed`); PR 3
   `sim_cluster_dynamo_update_table_index.rs` (9 tests, 3 files deleted);
-  PR 4 `sim_cluster_backfill_seeder.rs` (5 tests, split-during-backfill
-  licensed to stay `ProdEnv` if it doesn't converge cleanly); PR 5
+  PR 4 `sim_cluster_backfill_seeder.rs` (4 of 5 scenarios converted, 8
+  tests with their `_over_seeds` siblings; `split_during_backfill_
+  converges_with_correct_final_gsi` licensed to stay `ProdEnv` and did —
+  `SimCluster` has no per-tick driver loop to hand-interleave three
+  primitives against with no way, offline, to verify convergence); PR 5
   `sim_cluster_stream_backfill_seed_filter.rs` (2 tests); PR 6 console
   residue into `sim_cluster_console_table_config.rs` (3 tests,
   `console_table_config.rs` trimmed to its 1 out-of-scope PITR test); PR
   7 docs close-out.
 - **Depends:** C-09 (closed) — the next unowned residual group per C-08's
   and C-09's own close-outs, sequenced by the maintainer 2026-09-08.
-- **Status (2026-09-09):** open — PRs 1-3 landed (docs opener; groundwork;
+- **Status (2026-09-09):** open — PRs 1-4 landed (docs opener; groundwork;
   `sim_cluster_dynamo_update_table_index.rs`, 9 tests, 3 files deleted
-  whole). PRs 4-7 planned, not yet started.
+  whole; `sim_cluster_backfill_seeder.rs`, 4 of `tests/backfill_seeder.rs`'s
+  5 scenarios converted, `split_during_backfill_converges_with_correct_
+  final_gsi` kept `ProdEnv` per its own license, `restart` now respawns
+  `index_backfill::index_backfill_loop`). PRs 5-7 planned, not yet started.
 
 ---
 
@@ -1137,7 +1143,7 @@ wave are independent and can run in parallel.
 | 8 | C-07 (closed 2026-09-08 — all six PRs landed: #758, #759, #760, #761, #762, plus PR 6) | Gated on C-04 (closed) and C-06 (closed) — the same generic dispatch cores, plus C-06's own Transact widening |
 | 9 | C-08 (closed 2026-09-08 — all eight PRs landed: #764, #765, #766, #767, #773, #776, #777, PR 8) | Gated on C-04 (closed), C-06 (closed), and C-07 (closed) — the same generic dispatch cores, plus rung C5's own widening of `ClientCtx`'s field types |
 | 10 | C-09 (closed 2026-09-09 — all six PRs landed: #780, #782, #785, #786, #787, plus PR 6) | Gated on C-08 (closed) — C-08's own close-out recommendation, stacked directly on it |
-| 11 | C-10 (open, PRs 1-3 landed 2026-09-09 — docs opener; groundwork generalizing `UpdateTable`'s GSI add/drop sub-arm under `SimCluster`; `sim_cluster_dynamo_update_table_index.rs` converting `update_table_create_index.rs`/`update_table_drop_index.rs`/`dynamo_gsi_drain.rs` (9 tests), all three deleted whole: index DDL beyond plain `CreateTable`, sequenced after C-09 by the maintainer 2026-09-08) | Gated on C-09 (closed) — the next unowned residual group per C-08's and C-09's own close-outs |
+| 11 | C-10 (open, PRs 1-4 landed 2026-09-09 — docs opener; groundwork generalizing `UpdateTable`'s GSI add/drop sub-arm under `SimCluster`; `sim_cluster_dynamo_update_table_index.rs` converting `update_table_create_index.rs`/`update_table_drop_index.rs`/`dynamo_gsi_drain.rs` (9 tests), all three deleted whole; `sim_cluster_backfill_seeder.rs`, 4 of `tests/backfill_seeder.rs`'s 5 scenarios converted, `split_during_backfill_converges_with_correct_final_gsi` kept `ProdEnv` per its own license: index DDL beyond plain `CreateTable`, sequenced after C-09 by the maintainer 2026-09-08) | Gated on C-09 (closed) — the next unowned residual group per C-08's and C-09's own close-outs |
 
 Open issues mapped: none left (#375 closed by W-01, #319 by W-05). Filed
 from wave 2's own findings: #590 (the operator still emits the deleted

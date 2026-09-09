@@ -3394,6 +3394,19 @@ impl SimCluster {
             SIM_TTL_SWEEP_INTERVAL,
         ));
 
+        // ADR 0061 rung J (C-10 PR 4): `Simulator::stop` above also dropped
+        // this node's own `index_backfill_loop` task — respawn it
+        // unconditionally, exactly like `new` spawns it (see that
+        // constructor's own ADR 0061 rung J / C-10 PR 2 comment above) and
+        // mirroring the backup/segment/TTL janitors' own respawns
+        // immediately above. Without this a node's own index-backfill
+        // completion aggregator never runs again after a restart, so a
+        // `Creating` GSI whose backfill happens to finish only after this
+        // node has restarted would never observe the completion this loop
+        // is the one thing that flips it to `Active`.
+        let index_backfill_env = ctx.env.clone();
+        index_backfill_env.spawn_task(index_backfill::index_backfill_loop(ctx.clone()));
+
         let ctx_for_server = ctx.clone();
         fresh_relay.serve(move |req| {
             let ctx = ctx_for_server.clone();

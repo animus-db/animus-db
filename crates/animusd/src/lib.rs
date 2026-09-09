@@ -19070,6 +19070,17 @@ mod sim_cluster_index_ddl;
 #[cfg(test)]
 mod sim_cluster_dynamo_update_table_index;
 
+/// ADR 0061 rung J (C-10 PR 4): the secondary-index backfill seeder (ADR
+/// 0045 §2) end to end under `SimCluster` — 4 of the 5 scenarios in
+/// `tests/backfill_seeder.rs` converted (materialize-then-flip-Active, live
+/// writes racing the sweep, two independently-converging indexes, and a
+/// crash/restart resuming from the persisted backfill cursor); the fifth
+/// (split during backfill) stays on `ProdEnv` — see this module's own doc
+/// for exactly why. Five `_over_seeds`-paired scenarios — see
+/// `crates/animusd/CLAUDE.md`'s matching C-10 entry.
+#[cfg(test)]
+mod sim_cluster_backfill_seeder;
+
 /// Regression for the issue #298 residual confirmed live under the
 /// un-pinned `SplitMode::InPlace` proof soak (ADR 0018's matching amendment,
 /// `docs/engineering-lessons.md`'s matching entry): a stage blocked by
