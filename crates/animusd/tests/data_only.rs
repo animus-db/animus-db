@@ -2,37 +2,29 @@
 //! 0035 PR4): no local control `RaftCore` at all, reaching a
 //! separately-deployed control plane exclusively over the network.
 //!
-//! Covers, over real TCP/time (so every wait is a bounded poll, never a
-//! fixed sleep):
-//! - a genuine split cluster (3 control-only + 2 data-only nodes, no
-//!   combined-mode node anywhere) converges: data nodes self-register via
-//!   the relayed `admin_add_member`, get promoted `Active` by the unmodified
-//!   ADR 0012 heartbeat/failure-detector chain, a table provisions onto
-//!   them, and `Put`/`Get` work through a data node — including a read
-//!   served by a *different* data node than the one written through — and,
-//!   through a single **fixed control-only** node's client port (a
-//!   control-only node hosts zero local CP replicas of anything, so this
-//!   exercises `resolve_cp_route`'s no-local-replica forward branch plus the
-//!   hinted-retry forwarder that resolves it deterministically — see that
-//!   assertion's own doc), also against the genuinely-`Remote` data fleet;
-//! - schema DDL issued against a data node relays to the control leader and
-//!   commits, visible from every node (`metadata_fresh` soundness: the data
-//!   node's own commit-wait poll must observe its just-proposed command,
-//!   never a stale mirror);
-//! - one control node down (of 3): a data node's mirror/leader-hint sync
-//!   loop falls over to a remaining seed and traffic continues;
-//! - a data-node restart: it rejoins, re-hosts its tablets via the
-//!   tablet-host reconciler, and serves a pre-restart write again (a
-//!   converged-or-timeout poll, no leadership gate — a data-only node is
-//!   never a "leader" at all).
+//! **Trimmed (ADR 0061 rung L, C-12 PR 4a).** Of this file's original five
+//! tests, four converted whole to `SimCluster`
+//! (`sim_cluster_control_data_split.rs`'s own classification table has the
+//! per-test mapping): `schema_ddl_via_a_data_node_relays_and_commits`,
+//! `data_node_falls_over_to_a_remaining_control_seed`, `data_node_restart_
+//! rejoins_and_serves_reads_again`, and `data_node_observes_live_control_
+//! voters_after_a_fresh_fetch` are all fully converted. Kept here whole:
+//! `split_cluster_serves_reads_and_writes_across_data_nodes` — its own
+//! real-socket residual is the `/admin/storage/control` and `/admin/
+//! system-table` availability contract (`ctx.control_storage`, always
+//! `None` under `SimCluster` regardless of role — a fixture-wide capability
+//! gap unrelated to this rung), asserted here on BOTH sides of a genuine
+//! split deployment (present on every control node, absent on every data
+//! node) — the cross-data-node routing and fixed-control-node forwarding
+//! it also covers are otherwise fully reproduced by `sim_cluster_control_
+//! data_split.rs`'s `mixed_cluster_put_via_control_node_forwards_to_data_
+//! node`/`split_cluster_serves_reads_and_writes_across_data_nodes` sim
+//! siblings. See that module's own doc for the full classification.
 
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use animusd::{
-    ClientRequest, ClientResponse, ColumnType, MetaCommand, Node, StorageBackend, TableSchema,
-    read_frame,
-};
+use animusd::{ClientRequest, ClientResponse, read_frame};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
@@ -295,290 +287,4 @@ async fn split_cluster_serves_reads_and_writes_across_data_nodes() {
     })
     .await
     .expect("split_cluster_serves_reads_and_writes_across_data_nodes timed out");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn schema_ddl_via_a_data_node_relays_and_commits() {
-    timeout(Duration::from_secs(150), async {
-        let dir = support::panic_safe_tempdir();
-        let (control_nodes, data_nodes, _config) = bring_up_split(3, 2, dir.path()).await;
-        await_leader(&control_nodes).await;
-
-        // A data-only node can never satisfy `propose_schema`'s local-leader
-        // branch (it holds no control Raft role at all) — this proves the
-        // relay path (`leader_addr_hint`-then-broadcast, ADR 0035 §1) reaches
-        // the real control leader from a node with zero control-plane state
-        // of its own at process start.
-        let create = MetaCommand::CreateTableSchema {
-            table: "data_ddl_t".into(),
-            schema: TableSchema::simple("id", ColumnType::String),
-        };
-        // 60s, not 20: a fresh data-only node starts with no leader hint, so
-        // each attempt can fall all the way to broadcast and legitimately
-        // stall up to the full CLIENT_TIMEOUT (10s) relay-hop worst case on a
-        // starved 2-vCPU runner — a 20s budget is barely 2x one such attempt.
-        // Same runner-aware treatment as split_cluster.rs's split-completion
-        // budgets and backfill_seeder.rs's CONVERGE_BUDGET.
-        timeout(Duration::from_secs(60), async {
-            loop {
-                let _ = call(
-                    // ADR 0047: `ProposeSchema` is intra-only.
-                    data_nodes[0].intra_addr(),
-                    ClientRequest::ProposeSchema(create.clone()),
-                )
-                .await;
-                if control_nodes
-                    .iter()
-                    .all(|n| n.metadata().has_table_schema("data_ddl_t"))
-                {
-                    return;
-                }
-                sleep(Duration::from_millis(100)).await;
-            }
-        })
-        .await
-        .expect("data-node-issued schema did not relay + commit in 60s");
-
-        // Every data node's own mirror converges to the same schema too
-        // (`ControlHandle::Remote::metadata_cached()`), not just the control
-        // deployment's own replicas.
-        timeout(Duration::from_secs(20), async {
-            loop {
-                let (status, cfg) = admin_get(data_nodes[1].admin_addr(), "/admin/status").await;
-                assert_eq!(status, 200);
-                if cfg["schemas"]["tables"]
-                    .as_object()
-                    .is_some_and(|t| t.contains_key("data_ddl_t"))
-                {
-                    return;
-                }
-                sleep(Duration::from_millis(100)).await;
-            }
-        })
-        .await
-        .expect("the other data node's mirror never observed the schema in 20s");
-
-        for n in control_nodes.iter().chain(data_nodes.iter()) {
-            n.shutdown_graceful().await;
-        }
-    })
-    .await
-    .expect("schema_ddl_via_a_data_node_relays_and_commits timed out");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn data_node_falls_over_to_a_remaining_control_seed() {
-    timeout(Duration::from_secs(90), async {
-        let dir = support::panic_safe_tempdir();
-        let (mut control_nodes, data_nodes, _config) = bring_up_split(3, 2, dir.path()).await;
-        await_leader(&control_nodes).await;
-
-        let data_raftkv_ids: Vec<animus_env::NodeId> =
-            (3..5).map(animusd::config::node_id).collect();
-        await_data_nodes_active(&control_nodes, &data_raftkv_ids).await;
-
-        // Stop a control node that is NOT the current leader (stopping the
-        // leader would just force a re-election among the remaining two,
-        // which is a different, already-covered scenario) — the data
-        // nodes' `remote_metadata_sync_loop`/`RemoteControlClient` must fall
-        // over to a remaining seed rather than getting stuck retrying a dead
-        // one forever.
-        let leader = control_nodes
-            .iter()
-            .position(Node::is_control_leader)
-            .unwrap();
-        let victim = (0..control_nodes.len()).find(|&i| i != leader).unwrap();
-        let stopped = control_nodes.remove(victim);
-        stopped.shutdown_graceful().await;
-
-        // Traffic through a data node must keep working: a *new* write,
-        // issued only after the control node is down, still has to reach
-        // the (still up) leader through the mirror's seed-scan fallback.
-        timeout(Duration::from_secs(20), async {
-            loop {
-                let put = call(
-                    data_nodes[0].client_addr(),
-                    ClientRequest::Put {
-                        key: b"post-failure-key".to_vec(),
-                        value: b"post-failure-val".to_vec(),
-                        table: "split_t2".to_string(),
-                    },
-                )
-                .await;
-                if matches!(put, ClientResponse::PutOk) {
-                    return;
-                }
-                sleep(Duration::from_millis(100)).await;
-            }
-        })
-        .await
-        .expect("put via a data node did not succeed after a control node went down (20s)");
-
-        let get = call(
-            data_nodes[1].client_addr(),
-            ClientRequest::Get {
-                key: b"post-failure-key".to_vec(),
-                table: "split_t2".to_string(),
-                stale: false,
-            },
-        )
-        .await;
-        assert_eq!(
-            get,
-            ClientResponse::Value(Some(b"post-failure-val".to_vec()))
-        );
-
-        for n in control_nodes.iter().chain(data_nodes.iter()) {
-            n.shutdown_graceful().await;
-        }
-    })
-    .await
-    .expect("data_node_falls_over_to_a_remaining_control_seed timed out");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn data_node_restart_rejoins_and_serves_reads_again() {
-    timeout(Duration::from_secs(90), async {
-        let dir = support::panic_safe_tempdir();
-        let (control_nodes, mut data_nodes, config) = bring_up_split(3, 2, dir.path()).await;
-        await_leader(&control_nodes).await;
-
-        let data_raftkv_ids: Vec<animus_env::NodeId> =
-            (3..5).map(animusd::config::node_id).collect();
-        await_data_nodes_active(&control_nodes, &data_raftkv_ids).await;
-
-        timeout(Duration::from_secs(20), async {
-            loop {
-                let put = call(
-                    data_nodes[0].client_addr(),
-                    ClientRequest::Put {
-                        key: b"restart-key".to_vec(),
-                        value: b"restart-val".to_vec(),
-                        table: "split_t3".to_string(),
-                    },
-                )
-                .await;
-                if matches!(put, ClientResponse::PutOk) {
-                    return;
-                }
-                sleep(Duration::from_millis(100)).await;
-            }
-        })
-        .await
-        .expect("initial put did not succeed in 20s");
-
-        // Restart data node 0 on the same addresses + data dir. A clean
-        // teardown frees its ports (`shutdown_graceful`); rebind on the same
-        // config/dir is `run_node_data` again — the standing "restart-one-
-        // node" lesson applies (no leadership gate: a data-only node is
-        // never a leader of anything; poll for catch-up instead).
-        let stopped = data_nodes.remove(0);
-        stopped.shutdown_graceful().await;
-        let restarted = timeout(Duration::from_secs(10), async {
-            loop {
-                match animusd::run_node_data(
-                    &config,
-                    3,
-                    dir.path().join("a0-d3"),
-                    StorageBackend::Memory,
-                )
-                .await
-                {
-                    Ok(n) => return n,
-                    Err(_) => sleep(Duration::from_millis(100)).await,
-                }
-            }
-        })
-        .await
-        .expect("data node did not rebind on restart in 10s");
-
-        // Poll for the restarted node to re-host the tablet and serve the
-        // pre-restart write again — the reconciler re-discovers what to
-        // host from the (mirrored) replicated `Metadata`, not local state
-        // (a data-only node keeps nothing across a restart except the
-        // shared engine's own durable data, which `--ephemeral` here does
-        // NOT persist — so this specifically proves catch-up via the OTHER
-        // still-hosting replica's data reaching this node through Raft
-        // replication onto a freshly re-formed group member, not merely a
-        // local reopen).
-        timeout(Duration::from_secs(20), async {
-            loop {
-                let get = call(
-                    restarted.client_addr(),
-                    ClientRequest::Get {
-                        key: b"restart-key".to_vec(),
-                        table: "split_t3".to_string(),
-                        stale: false,
-                    },
-                )
-                .await;
-                if get == ClientResponse::Value(Some(b"restart-val".to_vec())) {
-                    return;
-                }
-                sleep(Duration::from_millis(100)).await;
-            }
-        })
-        .await
-        .expect("restarted data node never caught up + served the pre-restart write (20s)");
-
-        restarted.shutdown_graceful().await;
-        for n in control_nodes.iter().chain(data_nodes.iter()) {
-            n.shutdown_graceful().await;
-        }
-    })
-    .await
-    .expect("data_node_restart_rejoins_and_serves_reads_again timed out");
-}
-
-/// ADR 0037 PR2: a data-only node (`ControlHandle::Remote`, no local
-/// `RaftCore` at all) must be able to learn the control plane's *live*
-/// voter set — not just the address-book bookkeeping in `Metadata.
-/// node_addrs` — purely from the same `Status`/`WatchMetadata` round trip
-/// `metadata_fresh`/the mirror sync loop already make. Before this PR,
-/// `ControlHandle::Remote::config()` always answered an unconditional empty
-/// set; this proves the wired-through value actually lands, and lands the
-/// *real* 3-member control group, not a placeholder.
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn data_node_observes_live_control_voters_after_a_fresh_fetch() {
-    timeout(Duration::from_secs(90), async {
-        let dir = support::panic_safe_tempdir();
-        let (control_nodes, data_nodes, _config) = bring_up_split(3, 2, dir.path()).await;
-        await_leader(&control_nodes).await;
-
-        let expected: std::collections::BTreeSet<animus_env::NodeId> =
-            (0..3).map(animusd::config::node_id).collect();
-
-        // Converged-or-timeout poll (never a fixed sleep): the data node's
-        // own `remote_metadata_sync_loop` only refreshes its
-        // `RemoteControlClient` on its own schedule, so query it with a
-        // plain `Status` request (server-side, this hits the SAME
-        // `ctx.control.config()` call the sync loop's `observe` feeds) and
-        // retry until it has synced at least once.
-        for data_node in &data_nodes {
-            timeout(Duration::from_secs(20), async {
-                loop {
-                    if let ClientResponse::Status { control_voters, .. } =
-                        call(data_node.client_addr(), ClientRequest::Status).await
-                        && control_voters == expected
-                    {
-                        return;
-                    }
-                    sleep(Duration::from_millis(100)).await;
-                }
-            })
-            .await
-            .unwrap_or_else(|_| {
-                panic!(
-                    "data node {} never observed the live control-voter set in 20s",
-                    data_node.client_addr()
-                )
-            });
-        }
-
-        for n in control_nodes.iter().chain(data_nodes.iter()) {
-            n.shutdown_graceful().await;
-        }
-    })
-    .await
-    .expect("data_node_observes_live_control_voters_after_a_fresh_fetch timed out");
 }
