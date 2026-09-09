@@ -1,8 +1,14 @@
-//! End-to-end tests for DynamoDB-style TTL (ADR 0051) over the real
-//! DynamoDB JSON/HTTP wire, for the three scenarios of the original 9-test
+//! End-to-end test for DynamoDB-style TTL (ADR 0051) over the real
+//! DynamoDB JSON/HTTP wire, for the one scenario of the original 9-test
 //! suite that `crates/animusd/src/sim_cluster_ttl.rs` (ADR 0061 rung I,
-//! C-09 PR 3) could not convert. The other 6 converted cleanly — see
+//! C-09 PR 3/PR 5) cannot convert. The other 8 converted cleanly — see
 //! `sim_cluster_ttl.rs`'s own module doc for the full mapping.
+//!
+//! `update_time_to_live_enable_and_disable_round_trip` and
+//! `disable_with_a_mismatched_attribute_name_is_rejected` — the two
+//! scenarios PR 3 had to revert here because `DescribeTimeToLive` had no
+//! `dynamo::dispatch_item_op` arm — moved to `sim_cluster_ttl.rs` as
+//! scenarios (c)/(d) once C-09 PR 5 added that arm.
 //!
 //! **Why `expired_item_is_still_readable_immediately` stays here.**
 //! `SimCluster::dynamo`/`put`/etc. (and every other wire-shaped op call)
@@ -21,18 +27,6 @@
 //! there is no "drive zero sweeps between these two wire calls" primitive to
 //! hold it back the way this test's own real interval (production-scale, on
 //! the order of a minute) does below.
-//!
-//! **Why `update_time_to_live_enable_and_disable_round_trip` and
-//! `disable_with_a_mismatched_attribute_name_is_rejected` stay here.** Both
-//! depend on `DescribeTimeToLive`, which has no arm in
-//! `dynamo::dispatch_item_op` — the generic (`SimEnv`-capable) dispatch path
-//! `SimClusterHandle::dynamo` calls through — unlike `UpdateTimeToLive`,
-//! which was widened onto that path in ADR 0061 rung H (C-08 PR 2). Closing
-//! this needs a `crates/animusd/src/dynamo.rs` change (widening
-//! `describe_time_to_live` to `<E: Env, R: RelayClient>` and adding an
-//! `Operation::DescribeTimeToLive` arm to `dispatch_item_op`, mirroring
-//! `UpdateTimeToLive`'s own precedent exactly) — a real, narrow gap for a
-//! future PR, not a scenario-design or reaper defect.
 //!
 //! The `UpdateTimeToLive` follower-relay regression (`is_relayable_command`
 //! must allow `MetaCommand::SetTableTtl`) lives in
@@ -83,10 +77,6 @@ async fn dynamo(addr: SocketAddr, target: &str, body: &str) -> (u16, String) {
         .and_then(|code| code.parse().ok())
         .expect("status line");
     (status, payload.to_string())
-}
-
-fn json(body: &str) -> serde_json::Value {
-    serde_json::from_str(body).unwrap_or_else(|e| panic!("invalid JSON ({e}): {body}"))
 }
 
 /// The current wall-clock epoch second — real `SystemTime`, since this is a
@@ -164,97 +154,6 @@ async fn await_node_bootstrap(node: &animusd::Node) {
     })
     .await
     .expect("node did not bootstrap within 20s");
-}
-
-/// `UpdateTimeToLive` enable → `DescribeTimeToLive` reports `ENABLED` plus
-/// the attribute name; disable → `DISABLED` with **no** `AttributeName`
-/// (ADR 0051 §2, matching AWS's own omission rule).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn update_time_to_live_enable_and_disable_round_trip() {
-    let dir = support::panic_safe_tempdir();
-    let (node, config) =
-        support::start_single_node(&dir.path().join("n"), StorageBackend::default()).await;
-    await_node_bootstrap(&node).await;
-    let addr = config.nodes[0].dynamo;
-    create_table(addr, "t").await;
-
-    enable_ttl(addr, "t", "expiresAt").await;
-    let (status, body) = dynamo(
-        addr,
-        "DynamoDB_20120810.DescribeTimeToLive",
-        r#"{"TableName":"t"}"#,
-    )
-    .await;
-    assert_eq!(status, 200, "{body}");
-    let desc = json(&body);
-    assert_eq!(desc["TimeToLiveDescription"]["TimeToLiveStatus"], "ENABLED");
-    assert_eq!(desc["TimeToLiveDescription"]["AttributeName"], "expiresAt");
-
-    let (status, body) = dynamo(
-        addr,
-        "DynamoDB_20120810.UpdateTimeToLive",
-        r#"{"TableName":"t","TimeToLiveSpecification":{"Enabled":false,"AttributeName":"expiresAt"}}"#,
-    )
-    .await;
-    assert_eq!(status, 200, "UpdateTimeToLive(disable) failed: {body}");
-
-    let (status, body) = dynamo(
-        addr,
-        "DynamoDB_20120810.DescribeTimeToLive",
-        r#"{"TableName":"t"}"#,
-    )
-    .await;
-    assert_eq!(status, 200, "{body}");
-    let desc = json(&body);
-    assert_eq!(
-        desc["TimeToLiveDescription"]["TimeToLiveStatus"],
-        "DISABLED"
-    );
-    assert!(
-        desc["TimeToLiveDescription"].get("AttributeName").is_none(),
-        "a disabled table must omit `AttributeName` entirely: {body}"
-    );
-
-    node.shutdown_graceful().await;
-}
-
-/// Disabling with an `AttributeName` that doesn't match the currently
-/// enabled one is rejected client-side (ADR 0051's `UpdateTimeToLive`
-/// contract) — never silently accepted or silently disabling the wrong
-/// attribute.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn disable_with_a_mismatched_attribute_name_is_rejected() {
-    let dir = support::panic_safe_tempdir();
-    let (node, config) =
-        support::start_single_node(&dir.path().join("n"), StorageBackend::default()).await;
-    await_node_bootstrap(&node).await;
-    let addr = config.nodes[0].dynamo;
-    create_table(addr, "t").await;
-    enable_ttl(addr, "t", "expiresAt").await;
-
-    let (status, body) = dynamo(
-        addr,
-        "DynamoDB_20120810.UpdateTimeToLive",
-        r#"{"TableName":"t","TimeToLiveSpecification":{"Enabled":false,"AttributeName":"wrongAttr"}}"#,
-    )
-    .await;
-    assert_eq!(status, 400, "{body}");
-
-    // TTL is still enabled under the original attribute — the rejected
-    // call must not have taken effect.
-    let (status, body) = dynamo(
-        addr,
-        "DynamoDB_20120810.DescribeTimeToLive",
-        r#"{"TableName":"t"}"#,
-    )
-    .await;
-    assert_eq!(status, 200, "{body}");
-    assert_eq!(
-        json(&body)["TimeToLiveDescription"]["TimeToLiveStatus"],
-        "ENABLED"
-    );
-
-    node.shutdown_graceful().await;
 }
 
 /// ADR 0051 §3: an expired item is **AWS-faithfully visible** immediately

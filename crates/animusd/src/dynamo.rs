@@ -1660,6 +1660,11 @@ async fn dispatch_item_op<E: Env, R: RelayClient>(
             attribute_name,
             enabled,
         } => update_time_to_live(ctx, &table, &attribute_name, enabled).await,
+        // ADR 0061 rung I (C-09 PR 5): `describe_time_to_live` is a pure
+        // catalog read (like `describe_table`), so this arm needs no
+        // `.await` — it takes the same `meta` this function already holds,
+        // mirroring how `UpdateTimeToLive` just above reuses `ctx`.
+        Operation::DescribeTimeToLive { table } => describe_time_to_live(ctx, meta, &table),
         Operation::CreateBackup { table, backup_name } => {
             create_backup(ctx, &table, &backup_name).await
         }
@@ -2008,9 +2013,19 @@ async fn update_time_to_live<E: Env, R: RelayClient>(
 /// mirroring [`describe_table`]'s shape exactly. `ctx` is unused (every
 /// input comes from `meta`) but kept for signature symmetry with the other
 /// operation handlers.
+///
+/// Widened to `<E: Env, R: RelayClient>` (ADR 0061 rung I, C-09 PR 5) so
+/// [`dispatch_item_op`] can reach it from inside `SimCluster` — a pure
+/// signature change, `update_time_to_live`'s own C-08 PR 2 precedent
+/// exactly (it already took an unused `_ctx: &ClientCtx`, so there was no
+/// `tokio::time`/`ProdEnv`-only body to convert). `run_operation`'s own
+/// `DescribeTimeToLive` arm keeps calling this exact function, monomorphized
+/// at `E = ProdEnv, R = AnimusdRelayClient` from `ClientCtx`'s own
+/// definition-site default with no call-site change — production behavior
+/// is unchanged.
 #[allow(clippy::unnecessary_wraps)] // matches every other operation handler's `Result` shape
-fn describe_time_to_live(
-    _ctx: &ClientCtx,
+fn describe_time_to_live<E: Env, R: RelayClient>(
+    _ctx: &ClientCtx<E, R>,
     meta: &Metadata,
     table: &str,
 ) -> Result<String, WireError> {

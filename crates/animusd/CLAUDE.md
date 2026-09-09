@@ -9251,8 +9251,8 @@ original-test mapping (name kept identical except where noted):
 
 | Original `dynamo_ttl.rs` test | `sim_cluster_ttl.rs` scenario | Mechanism |
 |---|---|---|
-| `update_time_to_live_enable_and_disable_round_trip` | **kept in `tests/dynamo_ttl.rs`** | see below |
-| `disable_with_a_mismatched_attribute_name_is_rejected` | **kept in `tests/dynamo_ttl.rs`** | see below |
+| `update_time_to_live_enable_and_disable_round_trip` | **kept in `tests/dynamo_ttl.rs`, then moved to `sim_cluster_ttl.rs` as (c) by PR 5** — see below and the PR 5 appendix | see below |
+| `disable_with_a_mismatched_attribute_name_is_rejected` | **kept in `tests/dynamo_ttl.rs`, then moved to `sim_cluster_ttl.rs` as (d) by PR 5** — see below and the PR 5 appendix | see below |
 | `expired_item_is_still_readable_immediately` | **kept in `tests/dynamo_ttl.rs`** | see below |
 | `expired_item_is_eventually_reaped` | (a) `expired_item_is_reaped_by_the_always_on_loop` (PR 2, unchanged name) | always-on loop, converged-or-timeout poll |
 | `future_ttl_item_is_never_deleted` | (e) same name (new — distinct from PR 2's (b) `future_expiry_survives_a_manual_sweep`, which drives one sweep manually instead of riding out the always-on loop) | always-on loop, `run_for` |
@@ -9418,3 +9418,72 @@ trajectory). `Cargo.lock` untouched by this PR.
 
 See ADR 0061's "Rung I, PR 4" amendment and `docs/roadmap.md`'s C-09 entry
 for the full record.
+
+## Appendix — `dynamo::dispatch_item_op` gains a `DescribeTimeToLive` arm (ADR 0061 rung I, C-09 PR 5, 2026-09-08)
+
+Closes the exact gap PR 3's own appendix above named: `dynamo::
+dispatch_item_op` had an arm for `UpdateTimeToLive` (since ADR 0061 rung
+H, C-08 PR 2) but none for `DescribeTimeToLive`, so every
+`DescribeTimeToLive` call issued under `SimCluster` answered `500`
+regardless of the request's own validity.
+
+**`dynamo.rs`**: `describe_time_to_live` widened from a bare concrete
+`ClientCtx` alias to `<E: Env, R: RelayClient>(_ctx: &ClientCtx<E, R>,
+meta: &Metadata, table: &str)` — a pure signature change, `update_time_
+to_live`'s own C-08 PR 2 precedent exactly (it already took an unused
+`_ctx: &ClientCtx`, and this handler isn't even `async`, so there was no
+`tokio::time` body to convert at all). `dispatch_item_op` gained one new
+arm, immediately after `UpdateTimeToLive`'s own:
+
+```rust
+Operation::DescribeTimeToLive { table } => describe_time_to_live(ctx, meta, &table),
+```
+
+`run_operation`'s own `DescribeTimeToLive` arm is untouched — it keeps
+calling this exact function, monomorphized at `E = ProdEnv, R =
+AnimusdRelayClient` from `ClientCtx`'s own definition-site default, with
+zero call-site changes, so production behavior is byte-identical (the D2
+PR 1 lesson, `docs/engineering-lessons.md`, applied once more: a
+narrowed generic dispatcher gains a sibling arm, production dispatch
+stays untouched).
+
+**`sim_cluster_ttl.rs`**: restores PR 3's own reverted first draft of
+scenarios (c) `update_time_to_live_enable_and_disable_round_trip` and (d)
+`disable_with_a_mismatched_attribute_name_is_rejected` (pinned seeds
+`0xC091_0003`/`0xC091_0004`, `_over_seeds` bases `0xC091_3000`/
+`0xC091_4000` — the range PR 3 had already reserved for these two before
+reverting them), plus the `describe_ttl_via_wire` helper
+(`(u16, serde_json::Value)`, mirroring `describe_stream_via_wire`'s own
+shape) both scenarios need. The module doc's "Three residuals" section
+becomes "One residual" — only `expired_item_is_still_readable_immediately`
+remains, for the `OP_BUDGET`-granularity reason that section already gave
+and this PR does nothing to change.
+
+**`tests/dynamo_ttl.rs`**: trimmed from 3 tests to 1 —
+`expired_item_is_still_readable_immediately`, its own support helpers
+(`dynamo`, `now_secs`, `create_table`, `enable_ttl`, `put_item`,
+`get_item`/`item_present`, `await_node_bootstrap`), and nothing else. The
+`json` helper, used only by the two removed tests, is deleted with them.
+The module doc is rewritten to name the one remaining residual and point
+at `sim_cluster_ttl.rs`'s new (c)/(d) for where the other two moved.
+
+**Gates**: this PR's own agent worked under a hard constraint against
+invoking `cargo` at all — every call shape here was copied from a sibling
+arm/helper already in the tree (`update_time_to_live`'s own widening,
+`describe_stream_via_wire`'s own return shape) and cross-checked by
+reading each function's full definition rather than by compiling, per
+this task's own instructions. Gated separately, in the maintainer's own
+session, on the pushed branch — rebased onto PR 4's own tip rather than
+PR 3's, so the baseline this PR's own new tests add to is PR 4's 424, not
+PR 3's 420. Expected shape, unchanged from every prior rung's own
+template: `cargo test -p animusd --test dynamo_ttl` (1 passed, down from
+3); `cargo test -p animusd --lib sim_cluster_ttl -- --test-threads=2` (18
+passed, up from 14 — PR 3's own baseline for this file, untouched by PR
+4); `cargo test -p animusd --lib sim_cluster -- --test-threads=2` (428
+passed, 0 failed, 2 ignored expected — PR 4's own 424 plus this PR's 4
+new `#[test]` functions); `cargo fmt --all --check` and `cargo clippy -p
+animusd --all-targets --all-features -- -D warnings` clean. `Cargo.lock`
+unchanged.
+
+See ADR 0061's "Rung I, PR 5" amendment and `docs/roadmap.md`'s C-09
+entry for the full record.

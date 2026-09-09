@@ -56,7 +56,21 @@
 //! around). Replays (repo convention): `ANIMUS_SEED=<seed> cargo test -p
 //! animusd --lib <scenario name>`.
 //!
-//! ## PR 3 (this addition): the remainder of `tests/dynamo_ttl.rs`
+//! ## PR 3: the remainder of `tests/dynamo_ttl.rs` (scenarios (e)-(i))
+//!
+//! ## PR 5 (this addition): `DescribeTimeToLive` scenarios (c)/(d)
+//!
+//! `dynamo::dispatch_item_op` gained a `DescribeTimeToLive` arm (ADR 0061
+//! rung I, C-09 PR 5 — see `dynamo.rs::describe_time_to_live`'s own doc),
+//! closing the gap PR 3 hit and had to revert these two scenarios over.
+//!
+//! (c) [`run_update_time_to_live_enable_and_disable_round_trip`] — pure DDL:
+//!     `UpdateTimeToLive` enable/disable round-tripped through
+//!     `DescribeTimeToLive` (ADR 0051 §2's `AttributeName`-omitted-when-
+//!     disabled rule). No wall clock, no reaper.
+//! (d) [`run_disable_with_a_mismatched_attribute_name_is_rejected`] — pure
+//!     DDL: disabling with the wrong `AttributeName` is refused client-side
+//!     and leaves the catalog untouched.
 //!
 //! (e) [`run_future_ttl_item_is_never_deleted`] — a future-expiry item rides
 //!     out several always-on-loop sweep cycles (`SimCluster::run_for`, no
@@ -82,8 +96,9 @@
 //!     ordinary client `DeleteItem` carries none (ADR 0051 §7), reusing C-07
 //!     PR 3's `GetShardIterator`/`GetRecords` wire shapes.
 //!
-//! **Three residuals, kept in `tests/dynamo_ttl.rs` with their own reason
-//! comments rather than converted**:
+//! **One residual, kept in `tests/dynamo_ttl.rs` with its own reason comment
+//! rather than converted** (PR 3's own two `DescribeTimeToLive`-blocked
+//! residuals, scenarios (c) and (d) above, are closed by this PR):
 //!
 //! - `expired_item_is_still_readable_immediately`. Every
 //!   `SimCluster::dynamo`/`put`/etc. call unconditionally advances the
@@ -101,17 +116,6 @@
 //!   two wire calls" primitive to hold the reaper back the way the real
 //!   `ProdEnv` test does by using the *slow* production interval. This is a
 //!   real property of the fixture, not this scenario's design.
-//! - `update_time_to_live_enable_and_disable_round_trip` and
-//!   `disable_with_a_mismatched_attribute_name_is_rejected` (the original
-//!   suite's own (c) and (d)). Both depend on `DescribeTimeToLive`, which
-//!   has no arm in `dynamo::dispatch_item_op` — the generic
-//!   (`SimEnv`-capable) dispatch path `SimClusterHandle::dynamo` calls
-//!   through — unlike `UpdateTimeToLive`, which was widened onto that path
-//!   in ADR 0061 rung H (C-08 PR 2). Adding the missing arm is a
-//!   `crates/animusd/src/dynamo.rs` change, outside this task's edit scope
-//!   (only this file and `tests/dynamo_ttl.rs` are touched here) — a real,
-//!   narrow, separate gap for a future PR to close, not a scenario-design
-//!   or reaper defect.
 
 use std::time::Duration;
 
@@ -301,6 +305,24 @@ fn update_ttl_via_wire(
     cluster.dynamo(node, "DynamoDB_20120810.UpdateTimeToLive", body.as_bytes())
 }
 
+/// `DescribeTimeToLive`, issued from `node` — added alongside
+/// `dynamo::dispatch_item_op`'s new `DescribeTimeToLive` arm (ADR 0061 rung
+/// I, C-09 PR 5); mirrors [`describe_stream_via_wire`]'s own
+/// `(u16, serde_json::Value)` shape.
+fn describe_ttl_via_wire(
+    cluster: &mut SimCluster,
+    node: u64,
+    table: &str,
+) -> (u16, serde_json::Value) {
+    let body = format!(r#"{{"TableName":"{table}"}}"#);
+    let (status, resp) = cluster.dynamo(
+        node,
+        "DynamoDB_20120810.DescribeTimeToLive",
+        body.as_bytes(),
+    );
+    (status, json(&resp))
+}
+
 fn update_item_via_wire(cluster: &mut SimCluster, node: u64, body: &str) -> (u16, String) {
     cluster.dynamo(node, "DynamoDB_20120810.UpdateItem", body.as_bytes())
 }
@@ -364,6 +386,138 @@ fn get_records_via_wire(
     let records = v["Records"].as_array().cloned().unwrap_or_default();
     let next = v["NextShardIterator"].as_str().map(str::to_owned);
     (records, next)
+}
+
+// ---------------------------------------------------------------------------
+// (c) UpdateTimeToLive enable/disable round trip (pure DDL, no wall clock)
+// ---------------------------------------------------------------------------
+
+/// `UpdateTimeToLive` enable -> `DescribeTimeToLive` reports `ENABLED` plus
+/// the attribute name; disable -> `DISABLED` with **no** `AttributeName`
+/// (ADR 0051 §2, matching AWS's own omission rule). Pure DDL over the
+/// replicated schema catalog — no wall clock, no reaper involved at all.
+#[test]
+fn update_time_to_live_enable_and_disable_round_trip() {
+    run_update_time_to_live_enable_and_disable_round_trip(env_seed(0xC091_0003));
+}
+
+#[test]
+fn update_time_to_live_enable_and_disable_round_trip_over_seeds() {
+    for i in 0..5 {
+        run_update_time_to_live_enable_and_disable_round_trip(0xC091_3000 + i);
+    }
+}
+
+fn run_update_time_to_live_enable_and_disable_round_trip(seed: u64) {
+    let mut cluster = SimCluster::new(seed, 3, 3);
+    let table = "ttl_ddl";
+
+    let (status, body) = create_table_via_wire(
+        &mut cluster,
+        0,
+        &format!(
+            r#"{{"TableName":"{table}",
+                "AttributeDefinitions":[{{"AttributeName":"id","AttributeType":"S"}}],
+                "KeySchema":[{{"AttributeName":"id","KeyType":"HASH"}}]}}"#
+        ),
+    );
+    assert_eq!(status, 200, "seed={seed}: CreateTable failed: {body}");
+
+    let (status, body) = update_ttl_via_wire(&mut cluster, 0, table, true, "expiresAt");
+    assert_eq!(
+        status, 200,
+        "seed={seed}: UpdateTimeToLive(enable) failed: {body}"
+    );
+
+    let (status, desc) = describe_ttl_via_wire(&mut cluster, 0, table);
+    assert_eq!(
+        status, 200,
+        "seed={seed}: DescribeTimeToLive failed: {desc}"
+    );
+    assert_eq!(
+        desc["TimeToLiveDescription"]["TimeToLiveStatus"], "ENABLED",
+        "seed={seed}: {desc}"
+    );
+    assert_eq!(
+        desc["TimeToLiveDescription"]["AttributeName"], "expiresAt",
+        "seed={seed}: {desc}"
+    );
+
+    let (status, body) = update_ttl_via_wire(&mut cluster, 0, table, false, "expiresAt");
+    assert_eq!(
+        status, 200,
+        "seed={seed}: UpdateTimeToLive(disable) failed: {body}"
+    );
+
+    let (status, desc) = describe_ttl_via_wire(&mut cluster, 0, table);
+    assert_eq!(
+        status, 200,
+        "seed={seed}: DescribeTimeToLive failed: {desc}"
+    );
+    assert_eq!(
+        desc["TimeToLiveDescription"]["TimeToLiveStatus"], "DISABLED",
+        "seed={seed}: {desc}"
+    );
+    assert!(
+        desc["TimeToLiveDescription"].get("AttributeName").is_none(),
+        "seed={seed}: a disabled table must omit `AttributeName` entirely: {desc}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// (d) a mismatched disable AttributeName is rejected (pure DDL)
+// ---------------------------------------------------------------------------
+
+/// Disabling with an `AttributeName` that doesn't match the currently
+/// enabled one is rejected client-side (ADR 0051's `UpdateTimeToLive`
+/// contract) — never silently accepted or silently disabling the wrong
+/// attribute; the catalog must stay `ENABLED` under the original attribute.
+#[test]
+fn disable_with_a_mismatched_attribute_name_is_rejected() {
+    run_disable_with_a_mismatched_attribute_name_is_rejected(env_seed(0xC091_0004));
+}
+
+#[test]
+fn disable_with_a_mismatched_attribute_name_is_rejected_over_seeds() {
+    for i in 0..5 {
+        run_disable_with_a_mismatched_attribute_name_is_rejected(0xC091_4000 + i);
+    }
+}
+
+fn run_disable_with_a_mismatched_attribute_name_is_rejected(seed: u64) {
+    let mut cluster = SimCluster::new(seed, 3, 3);
+    let table = "ttl_mismatch";
+
+    let (status, body) = create_table_via_wire(
+        &mut cluster,
+        0,
+        &format!(
+            r#"{{"TableName":"{table}",
+                "AttributeDefinitions":[{{"AttributeName":"id","AttributeType":"S"}}],
+                "KeySchema":[{{"AttributeName":"id","KeyType":"HASH"}}]}}"#
+        ),
+    );
+    assert_eq!(status, 200, "seed={seed}: CreateTable failed: {body}");
+    let (status, body) = update_ttl_via_wire(&mut cluster, 0, table, true, "expiresAt");
+    assert_eq!(
+        status, 200,
+        "seed={seed}: UpdateTimeToLive(enable) failed: {body}"
+    );
+
+    let (status, body) = update_ttl_via_wire(&mut cluster, 0, table, false, "wrongAttr");
+    assert_eq!(status, 400, "seed={seed}: {body}");
+
+    // TTL is still enabled under the original attribute — the rejected call
+    // must not have taken effect.
+    let (status, desc) = describe_ttl_via_wire(&mut cluster, 0, table);
+    assert_eq!(
+        status, 200,
+        "seed={seed}: DescribeTimeToLive failed: {desc}"
+    );
+    assert_eq!(
+        desc["TimeToLiveDescription"]["TimeToLiveStatus"], "ENABLED",
+        "seed={seed}: {desc}"
+    );
 }
 
 // ---------------------------------------------------------------------------

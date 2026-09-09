@@ -103,7 +103,38 @@ debugging anything that feels like it might have happened before.
   paper over it by asserting a different status code or skipping the
   assertion — it is to leave the original real-socket test in place with a
   one-line reason naming the missing dispatch arm, exactly as if the
-  fixture itself couldn't express the scenario at all.
+  fixture itself couldn't express the scenario at all. **Closed 2026-09-08
+  (C-09 PR 5)**: the fix was exactly as narrow as predicted —
+  `describe_time_to_live` widened to `<E: Env, R: RelayClient>` (a pure
+  signature change; it already took an unused `_ctx: &ClientCtx` and isn't
+  even `async`, so there was no `tokio::time` body to convert at all) plus
+  one new `Operation::DescribeTimeToLive` arm on `dispatch_item_op`,
+  mirroring `UpdateTimeToLive`'s own arm immediately above it. The two
+  reverted scenarios moved back into `sim_cluster_ttl.rs` unchanged from
+  this PR's own reverted draft, `tests/dynamo_ttl.rs` dropped to its one
+  true residual. The generalizable lesson stands regardless: a narrowed
+  generic dispatcher can be missing just the read-side or write-side half
+  of an otherwise-symmetric operation pair, worth checking for
+  specifically — not just "is the operation covered at all" — before
+  either reverting a scenario or writing a wider fix than the gap needs.
+- **A doc appendix/amendment written and gated against one commit, then
+  rebased onto a sibling PR that landed in between, carries stale
+  "expected N passed" baselines that a clean rebase won't catch
+  (2026-09-09, ADR 0061 rung I C-09 PR 5).** PR 5 was authored and its own
+  gate numbers predicted on top of PR 3's tip (420 `sim_cluster` tests),
+  under a hard no-`cargo` constraint; PR 4 (admin/console residue) landed
+  in the meantime and moved the real baseline to 424. Rebasing PR 5 onto
+  PR 4's tip only conflicts where both PRs' prose literally collides
+  (here: three doc files' appended sections) — it does **not** flag that
+  PR 5's own "424 total = PR 3's 420 + my 4" arithmetic, quoted in prose
+  untouched by the conflict, now needs to read "428 = PR 4's 424 + my 4".
+  A merge that keeps both sides' text in order is necessary but not
+  sufficient: after resolving structural conflicts, grep the merged
+  doc(s) for every predicted/expected count that names a baseline
+  ("PR 3's own N", "up from N", "N passed") and recompute it against the
+  new base before trusting the doc — then confirm by actually running the
+  gate, which is what caught this one (428 passed, matching the corrected
+  prediction, not the stale 424 the unedited prose would have kept).
 - **A `dynamo_retry`+`CreateTable` fixture helper must tolerate
   `ResourceInUseException` on the retry, not just retry 500s (2026-08-31,
   issue #461).** `create_table` (`crates/animusd/src/schema.rs`) calls the

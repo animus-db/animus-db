@@ -847,7 +847,7 @@ supply one, and isn't trying to.
 | F | Post-C-04: Transact/PartiQL `SimCluster` dispatch (C-06) — the two named D2 residuals (Transact, PartiQL), never claimed by any D3/D4 rung. **Closed 2026-09-08 (PRs #728, #729, #732, #748, #750, #756, plus PR 7)** — both residuals now reachable through `dispatch_item_op`, the real-socket `dynamo_partiql.rs`/`dynamo_execute_transaction.rs` kept in full as the `ProdEnv` equivalence proof, `cargo test -p animusd --lib` 353 → 438 passed across PRs 3-6. See the 2026-09-07 "Rung F" amendment and the "Rung F closed" amendment below, and `docs/roadmap.md`'s C-06 entry |
 | G | Post-C-06: Streams `SimCluster` dispatch (C-07) — the largest remaining unowned residual group named by Rung F's own close-out (`dynamo_streams.rs`/`stream_janitor.rs`/`stream_backfill_seed_filter.rs`, 3 files/28 tests, plus `console_stream.rs`'s own 4 tests filed under the console/dashboard group). **Closed 2026-09-08 (PRs #758, #759, #760, #761, #762, plus PR 6)** — `dynamo_streams.rs` (15 tests: 12 converted, 3 kept `ProdEnv`) and `stream_janitor.rs` (11 tests: 9 converted, 2 kept `ProdEnv`) both closed; the read API, stream enable/disable, on-demand sealing, and the segment janitor's two-phase retention sweep are all `SimCluster`-reachable. `stream_backfill_seed_filter.rs` (2 tests) stays `ProdEnv`, filed under the separate "index DDL beyond plain `CreateTable`" residual, per the rung's own plan. `console_stream.rs` (4 tests) stays filed under admin/console/dashboard HTTP. `tests/streams_e2e.rs` stayed out of scope throughout, frozen behind #298/#745. `cargo test -p animusd --lib` 315 passed / 2 ignored at the sim tier after PR 5, no leak trajectory. See the 2026-09-08 "Rung G" amendments below (including the "Rung G closed" amendment) and `docs/roadmap.md`'s C-07 entry |
 | H | Post-C-07: admin/console/dashboard HTTP `SimCluster` dispatch (C-08) — the group Rung G's own close-out named as what remains unowned, 10 files/67 tests (`admin_endpoint.rs` 23, `dashboard_endpoint.rs` 16, `console_endpoint.rs` 3, `console_create_table.rs` 4, `console_items.rs` 4, `console_stream.rs` 4, `console_table_config.rs` 9, `console_tables.rs` 1, `metrics_endpoint.rs` 1, `system_table.rs` 2). **Closed 2026-09-08 (PRs #764, #765, #766, #767, #773, #776, #777, plus this PR 8)** — 42 of the 67 tests now have a deterministic `SimCluster` sibling across six new modules (`sim_cluster_console.rs`, `sim_cluster_console_stream.rs`, `sim_cluster_console_table_config.rs`, `sim_cluster_admin.rs`, `sim_cluster_admin_actions.rs`, `sim_cluster_dashboard.rs`; 89 tests with `_over_seeds`), `console_tables.rs`/`console_create_table.rs`/`console_items.rs` deleted whole; 25 tests stay `ProdEnv` with a documented reason each (`admin_endpoint.rs` 10, `dashboard_endpoint.rs` 4, `console_endpoint.rs` 3, `console_stream.rs` 1, `console_table_config.rs` 4, `metrics_endpoint.rs` 1, `system_table.rs` 2). Two real, previously-latent seam bugs found and fixed (a shared `MetricsHandle::noop()` corrupting `/admin/metrics`'s `is_leader` gauge cluster-wide, PR 5; `ClientCtx::admin_transfer_control_leadership`'s commit-wait loop still reading the real clock despite an already-generic signature, PR 6, the third recorded recurrence of that lesson), plus one same-day-corrected design mistake (PR 2's blanket `impl Trait for ClientCtx` narrowing production, fixed with the `GenericAdminHost`/`GenericConsoleBackend` newtype pair). `cargo test -p animusd --lib sim_cluster` ran 317 → 337 → 353 → 367 → 383 → **406 passed, 0 failed, 2 ignored** (#777's own real gate run, 752.46s, anchored-sampler RSS first ~99 MB / peak ~816 MB / last ~133 MB). See the 2026-09-08 "Rung H" amendments below (including "Rung H, PR 2 landed" through "Rung H, PR 7 landed", and "Rung H closed") and `docs/roadmap.md`'s C-08 entry |
-| I | **Open**, opened 2026-09-08. Post-C-07: TTL reaper `SimCluster` dispatch (C-09) — the `TTL (1/9)` residual Rung H's own close-out named and recommended first, of the six groups left unowned after C-08. `animus_node::ttl_reaper::{ttl_reaper_loop, ttl_sweep_one_tablet}` is already `<E: Env, H: TtlScanHost + TtlReaperProgressHost>`-generic (rung C2); the one remaining concrete surface is `crates/animusd/src/ttl_reaper.rs`'s thin wrapper plus `impl TtlReaperProgressHost for ClientCtx` (bare defaults) in `client_ctx_host.rs:98` — `TtlScanHost` is already `<E, R>`-generic there (D4 PR5). No primitive drives the loop under `SimEnv` today (`SimCluster::new`/`restart` never spawn it), so `tests/dynamo_ttl.rs`'s 9 tests plus one residue test apiece in `admin_endpoint.rs` and `console_stream.rs` all stay `ProdEnv`. **PR 1, this docs-only opener, landed** — see the 2026-09-08 "Rung I" amendment below and `docs/roadmap.md`'s C-09 entry. PRs 2-5 (groundwork, `sim_cluster_ttl.rs`, admin/console residue, close-out) are queued to follow |
+| I | **Open**, opened 2026-09-08. Post-C-07: TTL reaper `SimCluster` dispatch (C-09) — the `TTL (1/9)` residual Rung H's own close-out named and recommended first, of the six groups left unowned after C-08. `animus_node::ttl_reaper::{ttl_reaper_loop, ttl_sweep_one_tablet}` is already `<E: Env, H: TtlScanHost + TtlReaperProgressHost>`-generic (rung C2); the one remaining concrete surface is `crates/animusd/src/ttl_reaper.rs`'s thin wrapper plus `impl TtlReaperProgressHost for ClientCtx` (bare defaults) in `client_ctx_host.rs:98` — `TtlScanHost` is already `<E, R>`-generic there (D4 PR5). No primitive drives the loop under `SimEnv` today (`SimCluster::new`/`restart` never spawn it), so `tests/dynamo_ttl.rs`'s 9 tests plus one residue test apiece in `admin_endpoint.rs` and `console_stream.rs` all stay `ProdEnv`. **PR 1 (docs-only opener), PR 2 (groundwork), PR 3 (`sim_cluster_ttl.rs` extended, 3 tests kept real-socket), and PR 5 (this PR — the `DescribeTimeToLive` dispatch gap PR 3 named, closed; `dynamo_ttl.rs` down to its one true residual) landed** — see the matching 2026-09-08 "Rung I" amendments below and `docs/roadmap.md`'s C-09 entry. Admin/console residue and a close-out amendment are still queued |
 
 Note that the copy-based split driver (ADR 0050) is deliberately **not** on
 this list: ADR 0058 rung 4's remaining layer deletes it. Writing a corpus
@@ -7242,3 +7242,73 @@ that already needs to touch that file) should fix it in passing.
 
 See `crates/animusd/CLAUDE.md`'s matching "C-09 PR 4" appendix and
 `docs/roadmap.md`'s C-09 entry for the crate-level pointer and status.
+
+## 2026-09-08 amendment — Rung I, PR 5 (`DescribeTimeToLive` dispatch gap closed)
+
+Closes the narrow `dynamo.rs` gap PR 3 named and reverted two scenarios
+over: `dynamo::dispatch_item_op` had an arm for `UpdateTimeToLive` (since
+ADR 0061 rung H, C-08 PR 2) but none for `DescribeTimeToLive`, so every
+`DescribeTimeToLive` call issued under `SimCluster` answered `500`
+(`unsupported_by_generic_dispatch`) regardless of how well-formed the
+request was.
+
+**The fix, exactly the shape PR 3's own doc already named**:
+`describe_time_to_live` — a pure catalog read, `_ctx: &ClientCtx` already
+unused before this change — widened from the bare concrete alias to
+`<E: Env, R: RelayClient>(_ctx: &ClientCtx<E, R>, meta: &Metadata, table:
+&str)`, mirroring `update_time_to_live`'s own C-08 PR 2 precedent (no
+`tokio::time`/`ProdEnv`-only body to convert, unlike a widened async
+handler — this one isn't even `async`). `dispatch_item_op` gained one new
+arm, immediately after `UpdateTimeToLive`'s own:
+
+```rust
+Operation::DescribeTimeToLive { table } => describe_time_to_live(ctx, meta, &table),
+```
+
+`run_operation`'s own `DescribeTimeToLive` arm (`describe_time_to_live(ctx,
+meta, &table)`, unchanged in shape) keeps calling this exact function,
+monomorphized at `E = ProdEnv, R = AnimusdRelayClient` from `ClientCtx`'s
+own definition-site default with **zero call-site changes** — the D2 PR 1
+lesson (`docs/engineering-lessons.md`) applied once more: a narrowed
+generic dispatcher gains a sibling arm, production dispatch is untouched.
+
+**`sim_cluster_ttl.rs`**: scenarios (c) `update_time_to_live_enable_and_
+disable_round_trip` and (d) `disable_with_a_mismatched_attribute_name_is_
+rejected`, plus their `_over_seeds` siblings and the `describe_ttl_via_wire`
+helper, restored from PR 3's own reverted first draft (seeds `0xC091_0003`/
+`0xC091_0004` pinned, `0xC091_3000`/`0xC091_4000` bases for the `_over_
+seeds` loops — PR 3 had already reserved this seed range for (c)/(d) before
+reverting them, so no renumbering was needed). `tests/dynamo_ttl.rs` drops
+to its one true residual, `expired_item_is_still_readable_immediately` —
+the `OP_BUDGET`-granularity gap PR 3's own amendment above already
+established has no fix available in this fixture at all, unlike the
+`DescribeTimeToLive` gap this PR closes. The `json` helper in
+`dynamo_ttl.rs`, used only by the two removed tests, is deleted with them.
+
+**Scope note — this diverges from PR 1's own originally-planned PR
+breakdown** (this amendment's "The PR series" list above named PR 4 as
+admin/console residue and PR 5 as a docs-only close-out with no code).
+This PR is a code change instead, sequenced ahead of that plan because
+closing the `DescribeTimeToLive` gap is a smaller, more clearly-scoped
+follow-up to PR 3's own named finding than either of those two — the
+close-out amendment, once written, should renumber or fold in whichever
+of the original PR 4/PR 5 scope still remains open at that time rather
+than assume this PR satisfies it.
+
+**Gates**: not run by this PR's own agent, which worked under a
+hard constraint against invoking `cargo` at all (worktree
+`/home/user/wt-ttl5`, compiled and gated separately by the maintainer,
+who also rebased this PR onto PR 4's own landed tip rather than PR 3's —
+so the baseline this PR's own new tests add to is PR 4's 424, not PR 3's
+420). The expected shape, unchanged from every prior rung's own template:
+`cargo test -p animusd --test dynamo_ttl` (1 passed, down from 3); `cargo
+test -p animusd --lib sim_cluster_ttl -- --test-threads=2` (18 passed, up
+from 14 — PR 3's 14 plus this PR's 4 new `#[test]` functions: scenarios
+(c)/(d) pinned + `_over_seeds` each, untouched by PR 4); `cargo test -p
+animusd --lib sim_cluster -- --test-threads=2` (428 passed, 0 failed, 2
+ignored expected — PR 4's 424 plus these same 4); `cargo fmt --all
+--check` and `cargo clippy -p animusd --all-targets --all-features -- -D
+warnings` clean. `Cargo.lock` unchanged (no dependency touched). See
+`crates/animusd/CLAUDE.md`'s matching "C-09 PR 5" appendix for the
+crate-level pointer, and this PR's own commit for the actual gate
+transcript the maintainer's session records.
