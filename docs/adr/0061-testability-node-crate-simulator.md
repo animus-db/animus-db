@@ -849,7 +849,7 @@ supply one, and isn't trying to.
 | H | Post-C-07: admin/console/dashboard HTTP `SimCluster` dispatch (C-08) — the group Rung G's own close-out named as what remains unowned, 10 files/67 tests (`admin_endpoint.rs` 23, `dashboard_endpoint.rs` 16, `console_endpoint.rs` 3, `console_create_table.rs` 4, `console_items.rs` 4, `console_stream.rs` 4, `console_table_config.rs` 9, `console_tables.rs` 1, `metrics_endpoint.rs` 1, `system_table.rs` 2). **Closed 2026-09-08 (PRs #764, #765, #766, #767, #773, #776, #777, plus this PR 8)** — 42 of the 67 tests now have a deterministic `SimCluster` sibling across six new modules (`sim_cluster_console.rs`, `sim_cluster_console_stream.rs`, `sim_cluster_console_table_config.rs`, `sim_cluster_admin.rs`, `sim_cluster_admin_actions.rs`, `sim_cluster_dashboard.rs`; 89 tests with `_over_seeds`), `console_tables.rs`/`console_create_table.rs`/`console_items.rs` deleted whole; 25 tests stay `ProdEnv` with a documented reason each (`admin_endpoint.rs` 10, `dashboard_endpoint.rs` 4, `console_endpoint.rs` 3, `console_stream.rs` 1, `console_table_config.rs` 4, `metrics_endpoint.rs` 1, `system_table.rs` 2). Two real, previously-latent seam bugs found and fixed (a shared `MetricsHandle::noop()` corrupting `/admin/metrics`'s `is_leader` gauge cluster-wide, PR 5; `ClientCtx::admin_transfer_control_leadership`'s commit-wait loop still reading the real clock despite an already-generic signature, PR 6, the third recorded recurrence of that lesson), plus one same-day-corrected design mistake (PR 2's blanket `impl Trait for ClientCtx` narrowing production, fixed with the `GenericAdminHost`/`GenericConsoleBackend` newtype pair). `cargo test -p animusd --lib sim_cluster` ran 317 → 337 → 353 → 367 → 383 → **406 passed, 0 failed, 2 ignored** (#777's own real gate run, 752.46s, anchored-sampler RSS first ~99 MB / peak ~816 MB / last ~133 MB). See the 2026-09-08 "Rung H" amendments below (including "Rung H, PR 2 landed" through "Rung H, PR 7 landed", and "Rung H closed") and `docs/roadmap.md`'s C-08 entry |
 | I | Post-C-07: TTL reaper `SimCluster` dispatch (C-09) — the `TTL (1/9)` residual Rung H's own close-out named and recommended first, of the six groups left unowned after C-08. `animus_node::ttl_reaper::{ttl_reaper_loop, ttl_sweep_one_tablet}` was already `<E: Env, H: TtlScanHost + TtlReaperProgressHost>`-generic (rung C2); the one remaining concrete surface was `crates/animusd/src/ttl_reaper.rs`'s thin wrapper plus `impl TtlReaperProgressHost for ClientCtx` (bare defaults) in `client_ctx_host.rs:98` — `TtlScanHost` was already `<E, R>`-generic there (D4 PR5). No primitive drove the loop under `SimEnv` before this rung (`SimCluster::new`/`restart` never spawned it), so `tests/dynamo_ttl.rs`'s 9 tests plus one residue test apiece in `admin_endpoint.rs` and `console_stream.rs` all stayed `ProdEnv`. **Closed 2026-09-09 (PRs #780, #782, #785, #786, #787, plus this PR 6)** — PR 2 (groundwork: `TtlReaperProgressHost`/the `ttl_reaper.rs` wrapper widened, `SimCluster`'s always-on per-node reaper spawn at a 200ms sim interval, `drive_ttl_sweep`), PR 3 (`sim_cluster_ttl.rs` extended with 5 more scenarios, 5/8 of the remaining tests converted), PR 4 (admin/console residue: `sim_cluster_admin.rs`'s reaper-progress scenario, `sim_cluster_console_stream.rs`'s TTL-identity scenario replacing `console_stream.rs`, which is deleted whole), and PR 5 (the `DescribeTimeToLive` dispatch gap PR 3 found, closed, restoring its own two reverted scenarios) all landed. `cargo test -p animusd --lib sim_cluster` ran 406 → 408 → 420 → 424 → **428 passed, 0 failed, 2 ignored**. Final residue: exactly one test, `tests/dynamo_ttl.rs::expired_item_is_still_readable_immediately` (every `SimCluster` wire call drains the fixed 12s `OP_BUDGET` while the always-on 200ms reaper ticks, so an already-expired item can never be observed pre-reap through this fixture) — `admin_endpoint.rs` keeps 9 tests, `console_stream.rs` is gone. See the matching 2026-09-08/09 "Rung I" amendments below (including "Rung I closed") and `docs/roadmap.md`'s C-09 entry |
 | J | Post-C-09: index DDL beyond plain `CreateTable` `SimCluster` dispatch (C-10) — blocker (d) named by both Rung H's and Rung I's own close-outs, the largest remaining `SimCluster`-dispatch group (9 files/30 tests in the D3-closing class-D breakdown). `dynamo.rs:1725-1774`'s `dispatch_table_op`'s `UpdateTable` arm rejects any call with `index_update.is_some()` via `unsupported_by_generic_dispatch`; `create_index`/`drop_index`/`set_index_status`/`drop_table_index` (`dynamo.rs:4509/4627/4680/4716`) are concrete (`&ClientCtx`, `tokio::time::Instant::now()`/`sleep`) even though every `ClientCtx` method they call (`propose_schema`/`drop_table_tablets`/`clear_backfill_cursor_for_table`, `schema.rs`'s own `impl<E: Env, R: RelayClient> ClientCtx<E, R>` block) is already generic — pure signature/clock-call widening, no new capability. `index_drain::drain_tablet`/`reconcile_partition`/`gsi_caught_up` are already `<E, R>`/`<E, R>`/`<E>`-generic (D3 PR 3b); `animus_node::index_backfill::index_backfill_loop<E, H: ControlLeaderHost<E>>` is already fully generic and `ControlLeaderHost` is already implemented generically for `ClientCtx<E, R>` (`client_ctx_host.rs:47`) — only `crates/animusd/src/index_backfill.rs`'s 18-line wrapper is concrete. `index_drain::backfill_seed_tick`/`advance_backfill_cursor`/`seed_change_log_record` (`index_drain.rs:1412/1539/1651`) stay concrete (`&ClientCtx`/`&CpGroup`, one `tokio::time::Instant`), called only from `change_consumer_loop`, which `SimCluster` never spawns (`sim_cluster.rs:2987`'s own doc). `SimCluster::drain_gsi` (`sim_cluster.rs:2802`) already exists and hand-drives `drain_tablet` directly; no primitive drives `backfill_seed_tick`. `GenericConsoleBackend::add_gsi`/`drop_gsi` (`lib.rs:4107/4123`) already route through `execute_routed_as_generic` — zero console/`lib.rs` change needed once the dispatch sub-arm exists. `CreateTableIndex`/`DropTableIndex`/`SetIndexStatus`/`MarkIndexBackfilled` are already on `is_relayable_command`'s allowlist (`wire.rs:764-781`). **Closed 2026-09-09 (PRs #789, #790, #791, #792, #793, #794, plus this PR 7)** — PR 2 (groundwork: the four `dynamo.rs` functions plus the `index_drain` seeder trio widened, the `UpdateTable` index sub-arm, the always-on `index_backfill_loop` spawn, `drive_backfill_seed`), PR 3 (`sim_cluster_dynamo_update_table_index.rs`, 9 tests from `update_table_create_index.rs`/`update_table_drop_index.rs`/`dynamo_gsi_drain.rs`, all three deleted whole), PR 4 (`sim_cluster_backfill_seeder.rs`, 4 of `backfill_seeder.rs`'s 5 scenarios, `split_during_backfill_converges_with_correct_final_gsi` kept `ProdEnv` per its own license, `SimCluster::restart` now respawns `index_backfill_loop`), PR 5 (`sim_cluster_stream_backfill_seed_filter.rs`, 2 tests, file deleted whole), and PR 6 (3 GSI-DDL `console_table_config.rs` scenarios into `sim_cluster_console_table_config.rs`, file trimmed to its 1 out-of-scope PITR test) all landed. `cargo test -p animusd --lib sim_cluster` ran 428 → 432 → 458 → 462 → **468 passed, 0 failed, 2 ignored**. Final residue: the three frozen files (`dynamo_index_scan.rs` #418, `index_backfill.rs` #592, `dynamo_index_writes.rs` #610, 14 tests, untouched throughout), `backfill_seeder.rs`'s one licensed `ProdEnv` residual, and `console_table_config.rs`'s one PITR residual — 16 tests total, `schema_ddl_relay.rs`'s 7 tests untouched by design. See the 2026-09-09 "Rung J (post-C-09)" through "Rung J, PR 6 landed" amendments below (including "Rung J closed") and `docs/roadmap.md`'s C-10 entry |
-| K | Post-C-10: throttle-metric counters `SimCluster` dispatch (C-11, open) — the smallest of the four groups Rung J's own close-out left unowned (`ThrottledWrites`/`ThrottledReads`, 1 file/6 tests in the D3-closing class-D breakdown, unchanged since). `tests/dynamo_throttling.rs` still holds all 6: `batch_write_item_sheds_throttled_rows_into_unprocessed_items` (:445), `batch_get_item_sheds_throttled_keys_into_unprocessed_keys` (:492), `transact_write_items_cancels_with_throttling_error` (:538), `a_forwarded_write_is_throttled_on_the_leader` (:605), `admin_metrics_reports_nonzero_throttled_counters` (:652), and `cluster_wide_throttle_default_is_overridden_by_a_tables_own_throughput` (:740, a `run_node_with_cluster_settings`-only config-parse test expected to stay a permanent residual). `dynamo::kind_write_item_at_leader<E: Env, R: RelayClient>` and `dynamo::run_transact<E, R>` are already generic and already increment `Metric::ThrottledWrites` via `ctx.data().raftkv_metrics.incr(..)` (`dynamo.rs:9069`, `write_path.rs:327`, `txn_coordinator.rs:134`); the read-path `ThrottledReads` site (`read_path.rs:99`) is generic too. `dispatch_item_op` already routes `BatchGetItem`/`BatchWriteItem`/`TransactWriteItems`. **The rung's own distinguishing finding, corrected from two stale module docs**: `SimCluster::new`/`::restart` build every node with a real `DataRole` (`data: Some(DataRole { raftkv_metrics: node_metrics[i].clone(), .. })`, `sim_cluster.rs:1460`, since rung D2 PR 1) and a `ThrottleTracker` (`:1504`) — `ThrottledWrites`/`ThrottledReads` **do** increment under `SimCluster` today, contradicting `sim_cluster_throttle.rs`'s and `sim_cluster_dynamo_update_table.rs`'s own module docs, both of which said the counters never increment here; this PR corrects both. `SimCluster::set_throttle_defaults`/`::set_throttle_defaults_all` (`sim_cluster.rs:2121`/`:2134`) and `SimCluster::admin` (`:933`) already exist and already drive `GET /admin/metrics` in `sim_cluster_admin.rs`; `metrics_view<E, R>` (`admin.rs:1982`) is generic, dispatched from `animus-node/src/admin.rs:52`. Wire-level sim siblings already exist for the same operation family (`sim_cluster_dynamo_batch_get.rs`, `sim_cluster_kind_batch_outcome.rs`, `sim_cluster_dynamo_transact.rs`). **Not yet sequenced by the maintainer** — this opener proceeds on C-10's own close-out recommendation as a stated assumption (see that amendment below). **Size S.** See the 2026-09-09 "Rung K (post-C-10)" opener amendment below and `docs/roadmap.md`'s C-11 entry |
+| K | Post-C-10: throttle-metric counters `SimCluster` dispatch (C-11, closed) — the smallest of the four groups Rung J's own close-out left unowned (`ThrottledWrites`/`ThrottledReads`, 1 file/6 tests in the D3-closing class-D breakdown, unchanged since). `tests/dynamo_throttling.rs` held all 6: `batch_write_item_sheds_throttled_rows_into_unprocessed_items` (:445), `batch_get_item_sheds_throttled_keys_into_unprocessed_keys` (:492), `transact_write_items_cancels_with_throttling_error` (:538), `a_forwarded_write_is_throttled_on_the_leader` (:605), `admin_metrics_reports_nonzero_throttled_counters` (:652), and `cluster_wide_throttle_default_is_overridden_by_a_tables_own_throughput` (:740, a `run_node_with_cluster_settings`-only config-parse test expected to stay a permanent residual — and the one that did). `dynamo::kind_write_item_at_leader<E: Env, R: RelayClient>` and `dynamo::run_transact<E, R>` are already generic and already increment `Metric::ThrottledWrites` via `ctx.data().raftkv_metrics.incr(..)` (`dynamo.rs:9069`, `write_path.rs:327`, `txn_coordinator.rs:134`); the read-path `ThrottledReads` site (`read_path.rs:99`) is generic too. `dispatch_item_op` already routes `BatchGetItem`/`BatchWriteItem`/`TransactWriteItems`. **The rung's own distinguishing finding, corrected from two stale module docs, plus a third copy found the same day**: `SimCluster::new`/`::restart` build every node with a real `DataRole` (`data: Some(DataRole { raftkv_metrics: node_metrics[i].clone(), .. })`, `sim_cluster.rs:1460`, since rung D2 PR 1) and a `ThrottleTracker` (`:1504`) — `ThrottledWrites`/`ThrottledReads` **do** increment under `SimCluster` today, contradicting `sim_cluster_throttle.rs`'s and `sim_cluster_dynamo_update_table.rs`'s own module docs (both corrected by PR 1) and a third copy of the identical claim in `sim_cluster.rs:1427`'s own `AdminInfo` comment (corrected by this rung's own PR 4, since `sim_cluster.rs` was off this rung's earlier PRs' allowed-edits list). `SimCluster::set_throttle_defaults`/`::set_throttle_defaults_all` (`sim_cluster.rs:2121`/`:2134`) and `SimCluster::admin` (`:933`) already exist and already drive `GET /admin/metrics` in `sim_cluster_admin.rs`; `metrics_view<E, R>` (`admin.rs:1982`) is generic, dispatched from `animus-node/src/admin.rs:52`. Wire-level sim siblings already exist for the same operation family (`sim_cluster_dynamo_batch_get.rs`, `sim_cluster_kind_batch_outcome.rs`, `sim_cluster_dynamo_transact.rs`). **Closed 2026-09-09 (PRs #796, #797, #799, plus this PR 4)**: PR 2 converted the four wire-shape scenarios into `sim_cluster_dynamo_throttle.rs`; PR 3 converted `admin_metrics_reports_nonzero_throttled_counters` into `sim_cluster_admin.rs` and trimmed `dynamo_throttling.rs` to its one residual; PR 4 (this PR) is the docs close-out — no source, test, or `Cargo` change. `cargo test -p animusd --lib sim_cluster` ran 468 → 476 → **478 passed, 0 failed, 2 ignored**. Final residue: one test (`cluster_wide_throttle_default_is_overridden_by_a_tables_own_throughput`), a config-parse/process-boundary test with no `SimCluster` analog. **Zero production signature changes across the whole rung — its own distinguishing property.** The opener's own "not yet sequenced by the maintainer" question is answered only by this rung having proceeded on Rung J's own recommendation as a stated assumption, never an explicit instruction — restated, not resolved, by this close-out. **Size S.** See the 2026-09-09 "Rung K (post-C-10)" opener amendment through "Rung K closed" below and `docs/roadmap.md`'s C-11 entry |
 
 Note that the copy-based split driver (ADR 0050) is deliberately **not** on
 this list: ADR 0058 rung 4's remaining layer deletes it. Writing a corpus
@@ -8715,3 +8715,165 @@ residual) was 1 passed. The whole `cargo test -p animusd --lib
 sim_cluster -- --test-threads=2` tier passed 478/478 (2 ignored, 0
 failed — the expected 476 + 2), peak RSS ~950 MB (`/usr/bin/time -v`,
 `Maximum resident set size` 972060 KB). `Cargo.lock` unchanged.
+
+## 2026-09-09 amendment — Rung K closed (C-11 complete)
+
+PR 4 is what its own row above and the PR-series amendment promised: no
+source, test, or `Cargo` change — this ADR's own K-row and this amendment,
+`docs/roadmap.md`'s C-11 entry, and `crates/animusd/CLAUDE.md`'s
+consolidated throttle-metric-counters section are the entire PR, plus one
+comment-only correction in `sim_cluster.rs` (below). Rung K (C-11) is now
+**closed**: every scenario the rung set out to convert has a `SimCluster`
+sibling, and the throttle-metric counters are no longer on the post-C-10
+unowned-residual list.
+
+**What the rung set out to do.** `ThrottledWrites`/`ThrottledReads` — ADR
+0065's own throttling mechanism's observability surface — were provable
+only over `ProdEnv`'s real wire: one file, six tests, the smallest of the
+four groups Rung J's own close-out left unowned. The opener's own grep
+found the group's documented blocker stale: every prior mention (Rung J's
+close-out, two module docs) claimed `SimCluster`'s nodes carry no metrics
+sink, but they have carried a real `DataRole`/`MetricsHandle` since rung D2
+PR 1 — the counters simply had no fixture scenario that ever issued a real
+refusal against them.
+
+**PR-by-PR, what landed.** PR 1 (docs-only opener, #796): the plan, the
+grep-verified ground truth (three line-number corrections against the plan
+draft), the six-test disposition table, and the first two of the stale
+doc's three copies corrected (`sim_cluster_throttle.rs`,
+`sim_cluster_dynamo_update_table.rs`). PR 2 (#797):
+`sim_cluster_dynamo_throttle.rs` converting the four wire-shape scenarios
+(`BatchWriteItem`/`BatchGetItem` shedding, `TransactWriteItems`
+cancellation, a forwarded-write throttle check) — 8 new `#[test]` fns (4
+scenarios × pinned-seed + `_over_seeds`), zero production code change,
+`tests/dynamo_throttling.rs` stayed untrimmed. `cargo test -p animusd
+--lib sim_cluster` 468 → 476. PR 3 (#799): `sim_cluster_admin.rs` scenario
+(9), `admin_metrics_reports_nonzero_throttled_counters` — 2 tests, zero
+production code change — trimming `dynamo_throttling.rs` to its one
+residual and rewriting its module doc; 476 → 478. PR 4 (this PR): the
+close-out, plus the third stale-doc copy this opener flagged but could not
+fix (`sim_cluster.rs` was outside PRs 1-3's own allowed-edits list) —
+`sim_cluster.rs:1427`'s `AdminInfo` comment, corrected in this PR alone as
+a comment-only change (see "The third stale-doc copy" below).
+
+**Test-count trajectory** (`cargo test -p animusd --lib sim_cluster --
+--test-threads=2`, whole tier): 468 (C-10 baseline) → 476 (PR 2, +8) →
+**478 passed, 0 failed, 2 ignored** (PR 3, +2) — 10 tests added across the
+rung, every PR's own gate run reporting green with no regressions and a
+consistent no-leak RSS trajectory (~983 MB → ~950 MB peak, the two PRs
+with a recorded `/usr/bin/time -v` figure).
+
+**The final `ProdEnv` residue, in full:**
+
+| File | Kept tests | Reason |
+|---|---|---|
+| `dynamo_throttling.rs` | `cluster_wide_throttle_default_is_overridden_by_a_tables_own_throughput` | Targets `run_node_with_cluster_settings`'s config-parse path (a node-bring-up/process-boundary shape) — `SimCluster::new` builds every node in-process from its own fixed constructor, never from a `ClusterConfig` a real `animusd` binary would parse, so there is no `SimCluster` analog |
+
+One test — a permanent residual, not a gap, matching the opener's own
+Test inventory table exactly (PR 1's "Stays `ProdEnv`" disposition for
+this test) with no deviation.
+
+**Mechanism lessons.**
+
+1. **A "never happens under this fixture" doc claim must be re-verified
+   against the fixture's own constructor before it is used to justify
+   keeping a test on real sockets.** Three independent copies of the same
+   stale claim — "`SimCluster`'s nodes carry no metrics sink, so
+   `ThrottledWrites`/`ThrottledReads` never increment here" — existed in
+   this tree at once (`sim_cluster_throttle.rs`, `sim_cluster_dynamo_
+   update_table.rs`, and `sim_cluster.rs:1427`'s own `AdminInfo` comment),
+   all traceable to the same pre-D2-PR-1 fact having gone stale in place
+   rather than being re-checked when the constructor changed. Two were
+   fixed at the opener once a fixture scenario proved the claim false; the
+   third survived two more PRs simply because it sat in a file outside
+   this rung's own allowed-edits list until PR 4. The general form: a
+   negative claim about what a fixture can or cannot exercise is only ever
+   as fresh as the last time someone grepped the constructor it depends
+   on — this rung's own opener named the same drift for the first two
+   copies, and it recurred once more in a third file this close-out was
+   the first PR free to touch.
+2. **Zero production signature changes is itself a distinguishing finding,
+   not just an outcome.** Every rung since D3 has needed at least one
+   `<E: Env>`/`<E: Env, R: RelayClient>` widening somewhere in production
+   code to unlock its own group; this rung needed none — every call site
+   `ThrottledWrites`/`ThrottledReads` pass through
+   (`kind_write_item_at_leader`, `run_transact`, `dispatch_item_op`, the
+   read-path precharge site, `metrics_view`) was already generic, so the
+   entire rung was pure test-fixture authorship. Worth naming explicitly
+   because it means the group's difficulty was locating and trusting the
+   existing generic path, not building one — the opposite failure mode
+   from every prior rung, and worth watching for in whichever group opens
+   next.
+
+**What remains unowned after C-11**, updating the C-10-closing residual
+inventory now that the throttle-metric counters are no longer on it: the
+control/data role split, `--config` bring-up, and node assembly/raw
+`ClientRequest` — three groups, none with a rung against it today. These
+are **recommendations for the maintainer to sequence, not decisions this
+close-out makes**:
+
+- **The control/data role split** is the only one of the three with an
+  actual `SimCluster` capability gap behind it — this fixture has no
+  per-node role concept (every node is built identically, both control and
+  data), and `SimCluster::grow("data")` already carries a data-only-node
+  primitive with its own sim metadata-mirror loop, suggesting the
+  machinery to add a role split is closer than a from-scratch build. A
+  plan for this group has been drafted (informally, in this rung's own
+  scoping work) but not yet reviewed or sequenced; it is the natural
+  candidate for the next rung (tentatively "rung L" / C-12) once the
+  maintainer sequences it — see `docs/roadmap.md`'s new C-12 entry for the
+  plan summary.
+- **Once the control/data role split lands**, the seed-join-dependent
+  tests (a subset of the "join/growth/decommission" class-D group,
+  9 files/34 tests in the D3-closing breakdown, not otherwise touched by
+  this rung) become a plausible follow-on rung — they need the same
+  data-only-node fixture shape the role split would supply, so sequencing
+  them before it exists would mean duplicating that groundwork. Not
+  scoped in any detail yet; named here only as the next name on the list
+  after C-12, for the maintainer's own future sequencing.
+- **`--config` bring-up, node assembly/raw `ClientRequest`, and a small
+  fixed set of real-disk restart tests** (`control_mirror_restart.rs`,
+  `control_metadata_restart.rs`) plus `seed_join_hostname.rs` are, on the
+  evidence accumulated across every rung since D3, likely **permanent**
+  process-boundary residue in the same family as this crate's real-thread-
+  liveness/real-disk/real-crypto classes (A/B/C) rather than a
+  `SimCluster`-dispatch gap that a rung could close — `--config` parses a
+  real `ClusterConfig`/CLI surface no in-process fixture constructor can
+  stand in for, node assembly and a raw `ClientRequest` sit below the
+  `SimCluster` abstraction rather than inside a gap in it, and the named
+  restart tests exercise real fsync/crash recovery the same way this
+  crate's class-B residue already does. Rung J's own close-out already
+  flagged the first two as "a call for the maintainer to assess and close
+  ... rather than a decided outcome"; this close-out extends the same
+  recommendation to the restart tests and `seed_join_hostname.rs`, still
+  as a recommendation, not a decision — an assess-and-close pass (marking
+  them a permanent, named residual class rather than leaving them as an
+  open rung candidate) is the suggested next step, whenever the maintainer
+  chooses to take it up, in preference to opening a rung against any of
+  them.
+
+**Website: no change needed, verified again at this close.** A targeted
+grep of `website/*.html` for "throttl"/"provisioned throughput"/
+`ProvisionedThroughputExceeded` found only claims already true of
+production behavior — per-table provisioned throughput, a burst refused
+with `ProvisionedThroughputExceededException` — matching ADR 0065's own
+semantics; none names `SimCluster`/`/admin/metrics` testing specifically,
+and this rung changed no production dispatch path or wire-observable
+behavior (see the rung-table row's own "zero production signature
+changes" finding above). No stale claim found.
+
+**Gates**: none — documentation only, no `cargo` command run, `git diff
+--stat` shows only the docs files this PR touches plus the one
+comment-only change in `sim_cluster.rs`.
+
+**Docs**: this amendment (closing Rung K); `docs/roadmap.md`'s C-11 entry
+closed, its wave-12 sequencing row marked closed, a new C-12 entry added as
+"candidate, plan drafted, awaiting the maintainer's sequencing";
+`crates/animusd/CLAUDE.md`'s PR 2/PR 3 appendices folded into one
+consolidated "throttle-metric counters under SimCluster" section with the
+residual inventory corrected and "pending"/"in progress" wording removed;
+`sim_cluster.rs:1427`'s stale `AdminInfo` comment corrected (comment-only,
+no code change); `docs/engineering-lessons.md` already carries this rung's
+own generalizable finding (the "re-verify a never-happens claim against the
+constructor" lesson, PR 1/PR 2's own doc corrections) — no new entry
+needed at this close.
