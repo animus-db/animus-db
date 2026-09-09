@@ -8098,3 +8098,73 @@ alongside this PR's own untrimmed-baseline-first discipline
 module green after, then the whole `sim_cluster` tier, fmt, clippy).
 
 See `docs/roadmap.md`'s C-10 entry for the running per-PR record.
+## 2026-09-09 amendment — Rung J, PR 6 landed (console GSI-DDL residue)
+
+Brief as-built note, per the opener's own PR 6 plan above.
+
+Converted the 3 GSI-related `console_table_config.rs` scenarios into
+`sim_cluster_console_table_config.rs`'s (6)/(7)/(8), same names:
+`add_gsi_rejects_an_unknown_attribute_type`, `add_gsi_records_a_declared_
+attribute_type`, `add_and_drop_gsi_round_trip`, each with a pinned-seed
+test plus its `_over_seeds` sibling (6 new `#[test]` fns). All three
+reach `GenericConsoleBackend::add_gsi`/`drop_gsi` — already generic since
+C-08 PR 2, previously dead-ending in `unsupported_by_generic_dispatch` —
+which now falls through to PR 2's own index-change sub-arm and the real
+`create_index`/`drop_index`. **No `lib.rs`/`console.rs`/`dynamo.rs`/
+`sim_cluster.rs` change was needed at all**: `console_add_gsi_payload`'s
+client-side type validation, `console_add_gsi_result`'s catalog re-read,
+and `dispatch_table_op`'s sub-arm were all already in place from C-08 PR 2
+and this rung's own PR 2 — this PR is pure test authorship on the
+`sim_cluster_console_table_config.rs`/`console_table_config.rs` pair.
+
+The first scenario (`add_gsi_rejects_an_unknown_attribute_type`) is pure
+client-side validation — `console_add_gsi_payload`'s own attribute-type
+check fails and returns before an `UpdateTable` is ever built, so it never
+reaches `dispatch_table_op` and needs no backfill machinery. The second
+(`add_gsi_records_a_declared_attribute_type`) adds a GSI to an *empty*
+table and never asserts a `status`/`Backfilling` field, so it also needs
+no convergence loop. Only the third (`add_and_drop_gsi_round_trip`)
+populates the table first (so the added GSI genuinely starts `CREATING`)
+and round-trips it to `ACTIVE` before dropping it — gained its own small
+`converge_gsi_active_via_console` helper, `sim_cluster_index_ddl.rs::
+converge_gsi_active`'s exact shape (drive `SimCluster::drive_backfill_
+seed`/`drain_gsi` on the table's tablet leader, `sim_cluster_console.rs::
+leader_of_table`, in a bounded loop of further calls) duplicated rather
+than shared per this crate's per-file-fixture convention, but polling the
+console's own `GET /console/api/tables/{name}` rather than `DescribeTable`
+since the console surface is what this module tests.
+
+`tests/console_table_config.rs` trimmed from 4 tests to the 1 the opener's
+Ground-truth section always expected to stay: `table_detail_shows_pitr_
+status_and_backups` (`UpdateContinuousBackups` has no generic-dispatch arm
+in either `dispatch_item_op` or `dispatch_table_op`, and the test also
+depends on the real `pitr_snapshot_loop`'s wall-clock-timed capture driver
+— issue #593's own race, which the retained test guards against with its
+own poll). No helper function was removable: `dynamo`/`console`/`json`/
+`assert_no_cluster_shape` are all still used by the retained test.
+
+**No product bug found.** Every response shape this PR's assertions rely
+on (`{"gsi": ...}`/`{"ok": true}` wrapping, `GsiDetail`'s bare `name`/
+`hash_attribute`/`sort_attribute`/`status`/`projection` fields, the
+`gsis`/`ttl`/`stream` bare-array/bare-object shape on `TableDetail`) was
+cross-checked against `animus-node/src/console.rs`'s `table_api_response`/
+`wrap_json`/`ok_json`/`GsiDetail` before being written into the new
+scenarios, since this PR (per its own worktree constraints) could not run
+`cargo` itself — see `docs/engineering-lessons.md`'s matching entry on
+verifying `SimCluster` fixture code this way when a session cannot
+compile.
+
+**Gates, run in the main tree after rebase onto PR 5's landed 576d99ee**:
+`cargo build -p animusd --tests`, `cargo fmt --all --check`, and `cargo
+clippy -p animusd --all-targets --all-features -- -D warnings` all clean
+with no fixes needed; `cargo test -p animusd --lib
+sim_cluster_console_table_config -- --test-threads=2` (16 tests: the 10
+pre-existing plus these 6 new) and `cargo test -p animusd --test
+console_table_config` (the trimmed 1-test residual) both green; the whole
+`cargo test -p animusd --lib sim_cluster -- --test-threads=2` tier passed
+468/468 (2 ignored, 0 failed — the expected 462 + 6), peak RSS ~970 MB
+(`/usr/bin/time -v`, `Maximum resident set size` 992764 KB), consistent
+with every prior rung's own no-leak trajectory. See `docs/roadmap.md`'s
+C-10 entry and `crates/animusd/CLAUDE.md`'s own "index DDL beyond plain
+`CreateTable`" appendix for the mapping table and residual-inventory
+update.

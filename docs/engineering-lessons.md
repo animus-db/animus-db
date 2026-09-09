@@ -4418,6 +4418,44 @@ debugging anything that feels like it might have happened before.
   converges` (a real single-node crash/restart test) — the fix was simply
   running the equivalent `SimCluster` scenario at `(seed, 3, 3)` instead of
   `(seed, 1, 1)`, not a fixture change.
+- **A "blocker (d)" residual can close itself the moment the product PR that
+  fixes it lands — don't assume the residual needs its own product change
+  too** (2026-09-09, ADR 0061 rung J, C-10 PR 6). C-08 PR 2 left `console_
+  table_config.rs`'s three GSI-DDL tests `ProdEnv` because `GenericConsole
+  Backend::add_gsi`/`drop_gsi` (already generic) fell through `dispatch_
+  table_op`'s `UpdateTable` arm into `unsupported_by_generic_dispatch` —
+  the console methods themselves were never the blocker, the dispatch gap
+  they routed through was. C-10 PR 2, two rungs later and written for an
+  unrelated set of `tests/update_table_*.rs`/`dynamo_gsi_drain.rs` files,
+  closed that exact dispatch gap as groundwork. By the time PR 6 picked up
+  the `console_table_config.rs` residual, converting it needed **zero**
+  `lib.rs`/`console.rs`/`dynamo.rs` change — pure test authorship reusing a
+  product fix two PRs old. The general lesson: when a kept-`ProdEnv` test's
+  own doc comment names a specific blocker ("blocker (d)", "no dispatch
+  arm for X", "falls to `unsupported_by_generic_dispatch`"), re-check
+  whether a *later, unrelated-looking* PR already closed that exact named
+  blocker before assuming the residual still needs product work — grep the
+  blocker's own symptom (the dispatch function's `match` arms, the error
+  string) rather than trusting the kept test's own stale-by-now framing of
+  "this needs X built first."
+- **Verifying a new `SimCluster` fixture scenario without a compiler**: when
+  a task's own worktree constraints forbid running `cargo` (concurrent
+  writers gating elsewhere), the substitute for "compile it and see" is
+  reading the exact production functions the fixture calls end to end —
+  every dispatch method's real signature, the wire/JSON shape it returns
+  (response wrapper keys, field names, status codes), and any helper's
+  actual `pub(crate)` visibility and parameter order — rather than
+  reasoning from a sibling scenario's shape alone (2026-09-09, ADR 0061
+  rung J, C-10 PR 6). Concretely: `console_add_gsi_payload`'s validation-
+  before-dispatch order (confirms a malformed attribute type never reaches
+  `dispatch_table_op` at all), `GsiDetail`'s plain (non-renamed) field
+  names, and `table_api_response`'s `wrap_json("gsi", ...)`/`ok_json()`
+  response shapes were all read directly from `animus-node/src/console.rs`
+  and `animusd/src/lib.rs` before being asserted against in the new tests,
+  rather than assumed from the sibling module's own already-converted
+  scenarios. List every such API read as "uncertain, verify on the next
+  compile" in the handoff report so the compiling session checks them
+  first if anything fails.
 
 ### Code patterns
 - **A new confirm loop copied from a sibling's shape but the wrong sibling's
