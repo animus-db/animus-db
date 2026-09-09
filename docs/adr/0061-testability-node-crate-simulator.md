@@ -8653,3 +8653,65 @@ whole `cargo test -p animusd --lib sim_cluster -- --test-threads=2` tier
 passed 476/476 (2 ignored, 0 failed — the expected 468 + 8), peak RSS
 ~983 MB (`/usr/bin/time -v`, `Maximum resident set size` 982728 KB).
 `Cargo.lock` unchanged.
+
+## 2026-09-09 amendment — Rung K, PR 3 landed (throttle-metric counters under `SimCluster`, C-11, rung closed)
+
+**What landed**: `crates/animusd/src/sim_cluster_admin.rs` gains scenario
+(9), `admin_metrics_reports_nonzero_throttled_counters` (a pinned-seed
+test plus its `_over_seeds` sibling) — the conversion of `crates/animusd/
+tests/dynamo_throttling.rs`'s test of the same name, the one of its six
+remaining sim-reachable scenarios PR 2 deliberately left unconverted. A
+single-node `SimCluster` (mirroring the real-socket original's own
+`bring_up(1, ..)`): seed a `PutItem`, `SimCluster::
+set_throttle_defaults_all(Some(1), Some(1))`, a bounded `PutItem` loop
+draining the write bucket and a bounded `GetItem` loop draining the read
+bucket (the original's own 20/40 iteration caps, unchanged), then `GET
+/admin/metrics` on the table's own tablet leader (`leader_of_table`,
+already imported by this module for scenario (8)) — asserting `counters.
+throttled_writes > 0`, `counters.throttled_reads > 0`, and a nonempty
+per-tablet `throttle` array, verbatim the original's own three
+assertions. **No product code change** — `GET /admin/metrics` was already
+reachable through the generic `AdminHost` dispatch this module's own
+scenario (7) proved out in rung H; this PR is pure test authorship, same
+as every other scenario in this rung.
+
+**`crates/animusd/tests/dynamo_throttling.rs` is trimmed in this same
+PR** to its one remaining residual, `cluster_wide_throttle_default_is_
+overridden_by_a_tables_own_throughput` — removing the five now-converted
+tests (PR 2's four plus this PR's own) and the helpers only they used
+(the plain single-node `bring_up`, the raw HTTP/1.0 `admin` client,
+`set_throttle_defaults_everywhere`, `create_streamed_table`, and
+`error_type`), and rewriting the module doc to point at both destination
+modules and explain why the one residual stays `ProdEnv` permanently: its
+own subject is `run_node_with_cluster_settings`'s **config-parse** path (a
+node-bring-up/process-boundary shape), not a throttle-bucket check the
+generic dispatch core reaches — `SimCluster::new` builds every node
+in-process from its own fixed constructor, never from a `ClusterConfig` a
+real `animusd` binary would parse, so there is no `SimCluster` analog.
+
+**Rung K is closed as of this PR**: every `dynamo_throttling.rs` scenario
+the rung set out to convert now has a `SimCluster` sibling
+(`sim_cluster_dynamo_throttle.rs` for four, `sim_cluster_admin.rs`'s
+scenario (9) for the fifth), and the file's one remaining line is a
+deliberate, permanent `ProdEnv` residual rather than a gap. See
+`crates/animusd/CLAUDE.md`'s matching "Rung K, PR 3" appendix for the full
+account, including the specific helpers removed and why the single-node
+(not three-node) cluster shape was kept.
+
+**Gates**: not run by this PR's own agent, identically to PR 2 — its
+worktree constraints forbid `cargo` entirely (verified instead by reading
+the production dispatch path this scenario drives and cross-checking
+every call signature — `SimCluster::set_throttle_defaults_all`/`admin`/
+`dynamo`, `leader_of_table`/`create_table_via_wire`/`json`/`env_seed` from
+`sim_cluster_console.rs` — against their declared signatures directly).
+**Run in the main tree after rebase onto the landed bb801bd4 (Rung K PR
+2)**: `cargo build -p animusd --tests`, `cargo fmt --all` (no diff), and
+`cargo clippy -p animusd --all-targets --all-features -- -D warnings` all
+clean, no fixes needed against this module as authored. `cargo test -p
+animusd --lib sim_cluster_admin -- --test-threads=2` passed 34/34
+(including both new tests, pinned seed and `_over_seeds`) on the first
+run. `cargo test -p animusd --test dynamo_throttling` (the trimmed
+residual) was 1 passed. The whole `cargo test -p animusd --lib
+sim_cluster -- --test-threads=2` tier passed 478/478 (2 ignored, 0
+failed — the expected 476 + 2), peak RSS ~950 MB (`/usr/bin/time -v`,
+`Maximum resident set size` 972060 KB). `Cargo.lock` unchanged.
