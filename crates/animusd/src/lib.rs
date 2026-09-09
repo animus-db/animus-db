@@ -125,8 +125,8 @@ use animus_control::{PlacementPolicy, ProposeResult, RaftNode, SharedWal};
 use animus_cp_data::hlc::HlcTimestamp;
 use animus_cp_data::host::{MemoryTabletEngines, MetadataView, Reconciler, check_wal_layout};
 use animus_cp_data::{
-    FastRead, KindBatchOutcome, KvCommand, KvState, RaftKvNode, ResolveOutcome, SHARED_WAL,
-    StageOutcome, TxnDecisionStatus, TxnId, TxnOutcome, TxnRecordView,
+    AppliedWatch, FastRead, KindBatchOutcome, KvCommand, KvState, RaftKvNode, ResolveOutcome,
+    SHARED_WAL, StageOutcome, TxnDecisionStatus, TxnId, TxnOutcome, TxnRecordView,
 };
 use animus_env::{
     Clock, Disk, Env, FsSegmentStore, MaybeTlsStream, Metric, MetricsHandle, Nanos, NodeId,
@@ -989,6 +989,17 @@ impl<E: Env> CpGroup<E> {
         match self {
             CpGroup::Lsm(n) => n.engine_applied_index(),
             CpGroup::Mem(n) => n.engine_applied_index(),
+        }
+    }
+
+    /// The wake-on-apply companion to [`engine_applied_index`](Self::
+    /// engine_applied_index) — see [`AppliedWatch`]'s doc. `write_path`'s
+    /// confirm loops park on this instead of polling on a fixed/backed-off
+    /// timer to notice their own accepted entry has applied.
+    pub(crate) fn applied_watch(&self) -> AppliedWatch {
+        match self {
+            CpGroup::Lsm(n) => n.applied_watch(),
+            CpGroup::Mem(n) => n.applied_watch(),
         }
     }
 
@@ -13299,16 +13310,25 @@ const SCHEMA_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// every tick regardless, since that costs nothing.
 const SCHEMA_PROPOSE_PATIENCE: Duration = Duration::from_secs(1);
 
-/// Initial poll granularity while a CP **write/delete** waits for its value to
-/// become locally durable+applied on the leader (the durable-before-ack confirm in
-/// [`ClientCtx::cp_put_local`]/[`cp_delete_local`](ClientCtx::cp_delete_local)).
-/// Far finer than [`SCHEMA_POLL_INTERVAL`]: paired with the cp-data
-/// wake-on-propose, a write that commits+applies in a few ms now returns in ~1ms
-/// instead of eating a fixed 50ms poll floor.
-const CP_CONFIRM_POLL_INIT: Duration = Duration::from_micros(200);
-/// Cap for the CP-confirm poll's exponential back-off: a fast write returns after a
-/// sub-ms poll, but a slow/contended write backs off to this ceiling rather than
-/// busy-spinning the CPU while it waits.
+/// Every CP **write/delete/kind-write/kind-eval** confirm loop
+/// (`write_path::wait_applied_past`, shared by `cp_put_local`/
+/// `cp_delete_local`/`cp_kind_raw_local`/`cp_kind_eval_local`/`poll_probe`)
+/// waits for its own accepted entry to become locally durable+applied on the
+/// leader by parking on the tablet group's `AppliedWatch` — woken the
+/// instant the apply task advances past the entry's index, not by polling on
+/// a timer. This constant is no longer a poll granularity: it only bounds
+/// how long that park can go without a **forced** re-check, so a caller's
+/// own `confirm_wait_is_futile`/deadline logic still fires on schedule even
+/// when the watched index never applies at all (the group loses its leader,
+/// a quorum is lost, the entry gets superseded) — `AppliedWatch::bump` never
+/// wakes for that outcome, since nothing ever advances. A write that
+/// genuinely commits+applies returns as soon as the wake arrives, typically
+/// well under a millisecond, regardless of this value; this ceiling was
+/// itself the exponential back-off's cap before `wait_applied_past` replaced
+/// the whole doubling schedule (`CP_CONFIRM_POLL_INIT` doubling to this) —
+/// each step of that schedule rounded every write up to its own next
+/// checkpoint (an average half-a-step overshoot on top of real apply
+/// latency), which waking on the actual apply event removes entirely.
 const CP_CONFIRM_POLL_MAX: Duration = Duration::from_millis(5);
 
 /// Bind an `n`-node cluster on `ip` with ephemeral ports and the conventional
@@ -18171,10 +18191,11 @@ mod simenv_client_ctx_tests {
         // `ClientRequest::Put` arm drives (via `dynamo::
         // marker_batch_write_raw`, which this call inlines minus the
         // change-log marker — nothing here asserts on Streams). Not a
-        // reimplementation: this exercises the real exponential
-        // confirm-poll backoff (`CP_CONFIRM_POLL_INIT`/`_MAX`) under a
-        // virtual clock, spawned so the sim's own executor can actually
-        // drive any `env.sleep()` inside it forward.
+        // reimplementation: this exercises the real wake-on-apply confirm
+        // wait (`write_path::wait_applied_past`, `CP_CONFIRM_POLL_MAX`'s
+        // forced-recheck cap) under a virtual clock, spawned so the sim's
+        // own executor can actually drive any `env.sleep()` inside it
+        // forward.
         let write_result = spawn_and_capture(&mut sim, &ctx.env, {
             let ctx = ctx.clone();
             let table = table.to_owned();
