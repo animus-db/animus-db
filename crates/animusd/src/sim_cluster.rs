@@ -161,6 +161,10 @@ use animus_node::control_handle::RemoteControlClient as GenericRemoteControlClie
 use animus_sim::{NetConfig, SimEnv, SimSegmentStore, Simulator};
 
 use super::*;
+// ADR 0061 rung L, C-12 PR 2: per-node roles under `SimCluster`. Already
+// production-shipped (`crates/animusd/CLAUDE.md`'s own "control/data role
+// split" entry) — this fixture only consumes it, no widening needed.
+use crate::config::NodeRole;
 
 /// How long a single client op ([`SimCluster::put`]/`get`/`delete`/`scan`)
 /// is driven before it's recorded as timed out. Generous: `CLIENT_TIMEOUT`
@@ -577,19 +581,26 @@ impl SimClusterHandle {
     }
 
     /// ADR 0061 rung D3 PR 2a: every node's own view of `Metadata::members`
-    /// shows every node id (`0..node_count`, derived from `ctxs.len()`
-    /// rather than taking a parameter — this handle already knows the
-    /// cluster's whole node set) `Active` — the convergence check
+    /// shows every id in `expected` `Active` — the convergence check
     /// [`SimCluster::seed_members`] polls on, mirroring
     /// [`all_have_table_tablet`]'s own shape.
-    fn all_members_active(&self) -> bool {
+    ///
+    /// **ADR 0061 rung L, C-12 PR 2**: takes `expected` explicitly rather
+    /// than deriving `0..node_count` itself — a `NodeRole::Control` node's
+    /// id is deliberately never claimed into `members` at all (mirroring
+    /// production: `RegisterNode`'s own `claims_membership` gate never
+    /// inserts for a `role: "control"` registration, `animus-control/src/
+    /// meta.rs`), so requiring every node id, control-only ones included,
+    /// would never converge. For an all-combined cluster `expected` is
+    /// every node id, the identical set this method's own pre-PR-2 `0..
+    /// count` derived — no behavior change there.
+    fn all_members_active(&self, expected: &BTreeSet<NodeId>) -> bool {
         let ctxs = self.ctxs.lock().expect("ctxs poisoned");
-        let count = ctxs.len() as u64;
         ctxs.iter().all(|ctx| {
             let meta = ctx.effective_metadata();
-            (0..count).all(|n| {
+            expected.iter().all(|id| {
                 meta.members
-                    .get(&nid(n))
+                    .get(id)
                     .is_some_and(|m| m.status == NodeStatus::Active)
             })
         })
@@ -1196,6 +1207,15 @@ pub(crate) struct SimCluster {
     /// it already respawns `heartbeat_loop`/the reconciler/the backup
     /// janitor.
     segment_janitor_retention: Duration,
+    /// ADR 0061 rung L, C-12 PR 2: this node's own [`NodeRole`], index ==
+    /// node id — every node built by [`SimCluster::new`]/[`SimCluster::
+    /// new_with_roles`] gets an entry here (`new`'s own all-`Both` shape is
+    /// just `new_with_roles`'s default), and [`SimCluster::grow`] pushes one
+    /// too (always `NodeRole::Data`, its own only supported shape today).
+    /// [`SimCluster::restart`] consults this to rebuild a node in its own
+    /// original shape rather than unconditionally forcing a combined one —
+    /// see that method's own doc.
+    roles: Vec<NodeRole>,
 }
 
 /// Breaks the `Simulator`/`SimEnv` reference cycle (`animus_sim::Simulator::
@@ -1285,16 +1305,73 @@ impl SimCluster {
     /// sibling with one extra parameter" shape. See
     /// [`DEFAULT_SIM_SEGMENT_JANITOR_RETENTION`]'s own doc for why this is
     /// a constructor knob rather than a live setter.
+    ///
+    /// **ADR 0061 rung L, C-12 PR 2**: a thin, behavior-preserving wrapper
+    /// over [`SimCluster::new_with_roles_and_segment_janitor_retention`] —
+    /// every node built `NodeRole::Both`, byte-identical to this method's
+    /// own pre-PR-2 body (which built every node combined unconditionally).
     pub(crate) fn new_with_segment_janitor_retention(
         seed: u64,
         nodes: usize,
         replication: usize,
         segment_janitor_retention: Duration,
     ) -> Self {
+        Self::new_with_roles_and_segment_janitor_retention(
+            seed,
+            &vec![NodeRole::Both; nodes],
+            replication,
+            segment_janitor_retention,
+        )
+    }
+
+    /// **ADR 0061 rung L, C-12 PR 2**: [`SimCluster::new`]'s role-aware
+    /// sibling — `roles[i]` is node `i`'s own [`NodeRole`], so a caller can
+    /// build a mix of control-only (`NodeRole::Control`) and combined
+    /// (`NodeRole::Both`) nodes from construction, rather than only ever
+    /// getting an all-`Both` cluster the way [`SimCluster::new`] does. Every
+    /// node in `roles` must run the control plane today
+    /// (`NodeRole::Control`/`NodeRole::Both`) — a `NodeRole::Data` node
+    /// present from construction is C-12 PR 3's own scope (ADR 0061 rung L),
+    /// not yet implemented here; [`SimCluster::grow`]`("data")` remains the
+    /// only way to add a data-only node to this fixture. Uses
+    /// [`DEFAULT_SIM_SEGMENT_JANITOR_RETENTION`], mirroring [`SimCluster::
+    /// new`]'s own default.
+    pub(crate) fn new_with_roles(seed: u64, roles: &[NodeRole], replication: usize) -> Self {
+        Self::new_with_roles_and_segment_janitor_retention(
+            seed,
+            roles,
+            replication,
+            DEFAULT_SIM_SEGMENT_JANITOR_RETENTION,
+        )
+    }
+
+    /// [`SimCluster::new_with_roles`]'s own sibling exposing the segment-
+    /// janitor retention knob — the actual constructor every other `new*`
+    /// method above delegates to. See each field/role-conditional's own
+    /// comment below for what a [`NodeRole::Control`] node does and does not
+    /// get, mirroring `BoundControlNode::start_control_with`'s production
+    /// shape (`crates/animusd/src/lib.rs`) as closely as this fixture's
+    /// existing per-node loop set allows — see `crates/animusd/CLAUDE.md`'s
+    /// own SimCluster roles entry for the full account of which loops a
+    /// control-only node here does and does not run, and why.
+    pub(crate) fn new_with_roles_and_segment_janitor_retention(
+        seed: u64,
+        roles: &[NodeRole],
+        replication: usize,
+        segment_janitor_retention: Duration,
+    ) -> Self {
+        let nodes = roles.len();
         assert!(nodes >= 1, "a cluster needs at least one node");
         assert!(
             (1..=nodes).contains(&replication),
             "replication must be between 1 and the node count"
+        );
+        assert!(
+            roles.iter().all(|r| r.has_control()),
+            "SimCluster::new_with_roles: every node must run the control plane today \
+             (NodeRole::Control or NodeRole::Both) — a NodeRole::Data node present from \
+             construction is C-12 PR 3's own scope (ADR 0061 rung L), not yet implemented; \
+             SimCluster::grow(\"data\") remains the only way to add a data-only node"
         );
         let sim = Simulator::new(seed);
         let ids: Vec<NodeId> = (0..nodes as u64).map(nid).collect();
@@ -1374,7 +1451,21 @@ impl SimCluster {
         // burns `OP_BUDGET` = 12s) found every member `Down` and could never
         // pick a non-empty replica set, hanging until its own commit-wait
         // deadline. See `docs/engineering-lessons.md`'s matching entry.
-        for id in &ids {
+        //
+        // ADR 0061 rung L, C-12 PR 2: skipped for a `NodeRole::Control`
+        // node — mirroring `BoundControlNode::start_control_with`'s own
+        // doc verbatim ("Deliberately spawns none of: ... `heartbeat_loop`
+        // (raftkv-env-specific — this node has no raftkv env to sync or
+        // heartbeat from)", `crates/animusd/src/lib.rs`). This loop exists
+        // to keep THIS node's own `Metadata::members` row `Active`
+        // (`seed_members`'s own doc, below); a control-only node is never
+        // registered into `members` at all (`seed_members` only proposes
+        // `UpsertMember` for a `has_data()` node), so it has nothing here
+        // to heartbeat about.
+        for (i, id) in ids.iter().enumerate() {
+            if !roles[i].has_data() {
+                continue;
+            }
             let env = sim.env(id.clone());
             let control_ids = ids.clone();
             env.spawn_task(animus_control::node::heartbeat_loop(
@@ -1410,6 +1501,18 @@ impl SimCluster {
 
         let mut ctxs: Vec<SimNodeCtx> = Vec::with_capacity(nodes);
         for (i, id) in ids.iter().enumerate() {
+            // ADR 0061 rung L, C-12 PR 2: `AdminInfo::role` mirrors
+            // production's own per-shape string (`BoundNode::start_with`'s
+            // `"combined"`, `BoundControlNode::start_control_with`'s
+            // `"control"`) — a `NodeRole::Data` node from construction is
+            // out of this rung's own scope (the assert above already
+            // rejects it), so the only two shapes reachable here are
+            // `Both`/`Control`.
+            let role_str = match roles[i] {
+                NodeRole::Both => "combined",
+                NodeRole::Control => "control",
+                NodeRole::Data => "data",
+            };
             let admin = Arc::new(AdminInfo {
                 auto_split_ops_rate_threshold: None,
                 throttle_read_units: None,
@@ -1419,7 +1522,7 @@ impl SimCluster {
                 client_addr: placeholder_addr(),
                 dynamo_addr: None,
                 admin_addr: placeholder_addr(),
-                role: "combined",
+                role: role_str,
                 control_ids: ids.clone(),
                 peers: BTreeMap::new(),
                 admin_addrs: vec![placeholder_addr()],
@@ -1461,13 +1564,26 @@ impl SimCluster {
                 // (`ClientCtx::metrics_json`'s own doc, and `node_metrics`'s
                 // own doc above for the real bug this whole node-local
                 // sink discipline fixes).
-                data: Some(DataRole {
-                    raftkv_metrics: node_metrics[i].clone(),
-                    base_id: id.clone(),
-                    stream_seal_knobs: StreamSealKnobs::default(),
-                    change_rates: ChangeRateTracker::default(),
-                    request_rates: RequestRateTracker::default(),
-                }),
+                //
+                // ADR 0061 rung L, C-12 PR 2: `None` for a `NodeRole::
+                // Control` node — mirroring `BoundControlNode::
+                // start_control_with`'s own `data: None` exactly
+                // (`crates/animusd/src/lib.rs`). Every dispatch path this
+                // fixture drives already tolerates `None` correctly
+                // (`ClientCtx::resolve_cp_route`'s own "a control-only node
+                // is just the limit case of hosts nothing" degrade,
+                // `forwarding.rs`) — no new rejection code needed here.
+                data: if roles[i].has_data() {
+                    Some(DataRole {
+                        raftkv_metrics: node_metrics[i].clone(),
+                        base_id: id.clone(),
+                        stream_seal_knobs: StreamSealKnobs::default(),
+                        change_rates: ChangeRateTracker::default(),
+                        request_rates: RequestRateTracker::default(),
+                    })
+                } else {
+                    None
+                },
                 // ADR 0061 rung G (C-07 PR 2): every node's own handle
                 // wraps the SAME shared `segment_store` built above — the
                 // identical D4 PR 5 trick `backup_store` immediately below
@@ -1555,7 +1671,19 @@ impl SimCluster {
         // the SAME reconciler loop.
         let engines: Vec<MemoryTabletEngines> =
             (0..nodes).map(|_| MemoryTabletEngines::new()).collect();
+        // ADR 0061 rung L, C-12 PR 2: skipped for a `NodeRole::Control`
+        // node — mirroring `BoundControlNode::start_control_with`'s own doc
+        // verbatim ("Deliberately spawns none of: ... the tablet-host
+        // reconciler / `auto_split_loop` (nothing to host, no engine to
+        // sample)", `crates/animusd/src/lib.rs`). `engines[i]` is still
+        // built above for every node uniformly (cheap, `MemoryTabletEngines
+        // ::new()` — keeps every node index-aligned across
+        // `engines`/`ctxs`/`roles` for `SimCluster::restart`), just never
+        // opened by a `Reconciler` on a control-only node.
         for (i, id) in ids.iter().enumerate() {
+            if !roles[i].has_data() {
+                continue;
+            }
             let reconciler = build_reconciler(
                 ctxs[i].env.clone(),
                 engines[i].clone(),
@@ -1593,13 +1721,21 @@ impl SimCluster {
         }
 
         // ADR 0061 rung I (C-09 PR 2): one `ttl_reaper::ttl_reaper_loop` per
-        // node, unconditionally — mirrors the backup/segment janitors' own
-        // always-on spawns immediately above exactly: this loop's own
-        // leader gate (`TtlScanHost::led_tablets`, per-tablet not
-        // per-node) already makes a node leading nothing this tick a cheap
-        // idle scan-nothing sleep, so there is no reason to gate spawning
-        // it behind an opt-in the way `auto_split_loop` is.
-        for ctx in &ctxs {
+        // **data-capable** node — mirrors the backup/segment janitors' own
+        // always-on spawns immediately above, except gated on `has_data()`
+        // (ADR 0061 rung L, C-12 PR 2): `BoundControlNode::
+        // start_control_with` never spawns this loop either (it scans
+        // `TtlScanHost::led_tablets`, which a control-only node can never
+        // have any of — no engine, no hosted tablet). This loop's own
+        // leader gate (per-tablet, not per-node) already makes a
+        // data-capable node leading nothing this tick a cheap idle
+        // scan-nothing sleep, so there is no reason to gate ITS spawn
+        // behind an opt-in the way `auto_split_loop` is — only the
+        // control-only exclusion is new here.
+        for (i, ctx) in ctxs.iter().enumerate() {
+            if !roles[i].has_data() {
+                continue;
+            }
             let env = ctx.env.clone();
             env.spawn_task(ttl_reaper::ttl_reaper_loop(
                 ctx.clone(),
@@ -1636,6 +1772,7 @@ impl SimCluster {
             backup_store,
             segment_store,
             segment_janitor_retention,
+            roles: roles.to_vec(),
         };
         // Let the control group elect before any caller touches it —
         // generous for up to a handful of voters under `SimEnv`'s
@@ -1657,14 +1794,26 @@ impl SimCluster {
     /// empty, so a wire `CreateTable` issued against this fixture could
     /// never actually provision a tablet.
     ///
-    /// For every node: `RegisterNode` with `role: "combined"` — **not**
-    /// `"control"`, since `RegisterNode`'s own `claims_membership` gate
-    /// (`animus_control::meta`) never inserts into `members` at all for a
-    /// control-only registration (a control-only node can never host a
+    /// For every node: `RegisterNode` with a role string matching its own
+    /// [`NodeRole`] (`"combined"` for `Both`, `"control"` for `Control` —
+    /// **ADR 0061 rung L, C-12 PR 2**: previously hardcoded `"combined"`
+    /// for every node, since this method predates per-node roles). A
+    /// `"control"` registration is deliberate: `RegisterNode`'s own
+    /// `claims_membership` gate (`animus_control::meta`) never inserts into
+    /// `members` at all for it (a control-only node can never host a
     /// tablet, so appearing in `members` would make it a placement
     /// candidate and silently corrupt placement the moment it's picked) —
-    /// then `UpsertMember { status: Active }`. `RegisterNode` alone inserts
-    /// the member `Down`; this fixture runs no heartbeat loop
+    /// then `UpsertMember { status: Active }`, but **only for a
+    /// `has_data()` node**: `UpsertMember` unconditionally inserts/updates
+    /// a member row with no `role`-awareness of its own (unlike
+    /// `RegisterNode`), so proposing it for a control-only node would
+    /// silently reintroduce exactly the placement-candidate hazard the
+    /// `"control"` `RegisterNode` role was chosen to avoid — mirroring
+    /// production exactly: `BoundControlNode::start_control_with` never
+    /// spawns `bootstrap` (the loop that would ever call `UpsertMember` for
+    /// this node), so a real control-only node's own id never appears in
+    /// `Metadata::members` either. `RegisterNode` alone inserts the member
+    /// `Down`; this fixture runs no heartbeat loop
     /// (`heartbeat_loop_live`/the control leader's `detect_loop`) to ever
     /// promote it the way a real cluster's failure detector would, so a
     /// direct `UpsertMember{Active}` is the only way this fixture's members
@@ -1688,15 +1837,17 @@ impl SimCluster {
     /// landed).
     fn seed_members(&mut self) {
         let leader = self.control_leader_index();
+        let mut expected_active = BTreeSet::new();
         for n in 0..self.nodes as u64 {
             let id = nid(n);
             let addr = id.to_string();
+            let has_data = self.roles[n as usize].has_data();
             let addrs = NodeAddrs {
                 internal: addr.clone(),
                 client: addr.clone(),
                 intra: addr.clone(),
                 admin: addr,
-                role: "combined".to_owned(),
+                role: if has_data { "combined" } else { "control" }.to_owned(),
             };
             assert!(
                 matches!(
@@ -1709,6 +1860,9 @@ impl SimCluster {
                 ),
                 "RegisterNode must be accepted by the current control leader (node={id})"
             );
+            if !has_data {
+                continue;
+            }
             assert!(
                 matches!(
                     self.controls[leader].propose(MetaCommand::UpsertMember {
@@ -1720,13 +1874,24 @@ impl SimCluster {
                 ),
                 "UpsertMember must be accepted by the current control leader (node={id})"
             );
+            expected_active.insert(id);
         }
-        self.poll_until(Duration::from_secs(5), |c| c.shared.all_members_active());
+        self.poll_until(Duration::from_secs(5), move |c| {
+            c.shared.all_members_active(&expected_active)
+        });
     }
 
     /// The number of nodes this cluster was built with.
     pub(crate) fn node_count(&self) -> usize {
         self.nodes
+    }
+
+    /// ADR 0061 rung L, C-12 PR 2: `node`'s own [`NodeRole`], as recorded at
+    /// construction ([`SimCluster::new`]/[`SimCluster::new_with_roles`]) or
+    /// growth ([`SimCluster::grow`]) — the test-reachable observable behind
+    /// "this node runs no data plane at all."
+    pub(crate) fn role_of(&self, node: u64) -> NodeRole {
+        self.roles[node as usize]
     }
 
     /// A cheap `Clone` of this cluster's [`SimClusterHandle`] — the one
@@ -3243,16 +3408,30 @@ impl SimCluster {
     /// SAME `MemoryTabletEngines` handle this node was built with**
     /// (`self.engines[node]`) — see the module doc's own restart bullet
     /// for why this node's tablet data is no longer wiped by a restart.
+    /// **ADR 0061 rung L, C-12 PR 2**: this node's own [`NodeRole`]
+    /// (`self.roles[node]`) is consulted throughout, so a `NodeRole::
+    /// Control` node comes back control-only (no reconciler, no
+    /// `ttl_reaper_loop`, no self-heartbeat — mirroring [`SimCluster::
+    /// new_with_roles`]'s own construction exactly) rather than
+    /// unconditionally forcing every restarted node combined.
     ///
     /// **`node` must be one of the original `0..nodes` control-voter ids
     /// this cluster was constructed with (ADR 0061 rung D4 PR 4)** — this
     /// method indexes `self.controls[node]`, a control-voter-only `Vec`
     /// that a [`SimCluster::grow`]n data-only node was never pushed onto
     /// (it has no local control `RaftNode` at all — see that method's own
-    /// doc). Restarting a grown node is out of this rung's scope (no
-    /// scenario needs it); calling this with a grown node's index panics on
-    /// the `Vec` index, not gracefully.
+    /// doc). **Restarting a grown node remains out of scope in this rung
+    /// too (C-12 PR 3, ADR 0061 rung L)** — the guard below now panics with
+    /// an explicit message naming that, rather than relying on an
+    /// out-of-bounds `Vec` index to fail for the right reason by accident.
     pub(crate) fn restart(&mut self, node: u64) {
+        assert!(
+            (node as usize) < self.controls.len(),
+            "SimCluster::restart(node={node}): restarting a grown (data-only) node is \
+             deferred to C-12 PR 3 (ADR 0061 rung L) — only original 0..nodes control-voter \
+             ids can be restarted today"
+        );
+        let role = self.roles[node as usize];
         let id = nid(node);
         if self.crashed.remove(&node) {
             self.sim.restart(id.clone());
@@ -3270,12 +3449,16 @@ impl SimCluster {
         // A restarted node's own `Simulator::stop` dropped its previous
         // `heartbeat_loop` task along with everything else it owned — see
         // `SimCluster::new`'s own comment on why this is load-bearing, not
-        // optional.
-        let heartbeat_env = self.sim.env(id.clone());
-        heartbeat_env.spawn_task(animus_control::node::heartbeat_loop(
-            heartbeat_env.clone(),
-            all_ids,
-        ));
+        // optional. ADR 0061 rung L, C-12 PR 2: skipped for a `NodeRole::
+        // Control` node, mirroring `new_with_roles`'s own construction (see
+        // that method's identical gate for why).
+        if role.has_data() {
+            let heartbeat_env = self.sim.env(id.clone());
+            heartbeat_env.spawn_task(animus_control::node::heartbeat_loop(
+                heartbeat_env.clone(),
+                all_ids,
+            ));
+        }
 
         let mut ctx = self.shared.ctx(node);
         // Break the OLD relay's own installed-handler self-cycle (see
@@ -3355,13 +3538,18 @@ impl SimCluster {
             ctx.edge.unregister_raftkv(tablet, id.clone());
         }
 
-        let reconciler = build_reconciler(
-            ctx.env.clone(),
-            self.engines[node as usize].clone(),
-            id.clone(),
-            ctx.edge.clone(),
-        );
-        spawn_reconciler_loop(ctx.clone(), reconciler);
+        // ADR 0061 rung L, C-12 PR 2: skipped for a `NodeRole::Control`
+        // node — mirroring `new_with_roles`'s own construction-time gate
+        // (see that method's identical comment for why).
+        if role.has_data() {
+            let reconciler = build_reconciler(
+                ctx.env.clone(),
+                self.engines[node as usize].clone(),
+                id.clone(),
+                ctx.edge.clone(),
+            );
+            spawn_reconciler_loop(ctx.clone(), reconciler);
+        }
 
         // ADR 0061 rung D4 PR 5: `Simulator::stop` above dropped this
         // node's own `backup_janitor_loop` task along with everything else
@@ -3389,14 +3577,18 @@ impl SimCluster {
         ));
 
         // ADR 0061 rung I (C-09 PR 2): `Simulator::stop` above also dropped
-        // this node's own `ttl_reaper_loop` task — respawn it
-        // unconditionally at the same [`SIM_TTL_SWEEP_INTERVAL`], mirroring
-        // the backup/segment janitors' own respawns immediately above.
-        let ttl_reaper_env = ctx.env.clone();
-        ttl_reaper_env.spawn_task(ttl_reaper::ttl_reaper_loop(
-            ctx.clone(),
-            SIM_TTL_SWEEP_INTERVAL,
-        ));
+        // this node's own `ttl_reaper_loop` task — respawn it at the same
+        // [`SIM_TTL_SWEEP_INTERVAL`], mirroring the backup/segment
+        // janitors' own respawns immediately above, except gated on
+        // `has_data()` (ADR 0061 rung L, C-12 PR 2) — the identical
+        // `new_with_roles`-time gate, see that method's own comment.
+        if role.has_data() {
+            let ttl_reaper_env = ctx.env.clone();
+            ttl_reaper_env.spawn_task(ttl_reaper::ttl_reaper_loop(
+                ctx.clone(),
+                SIM_TTL_SWEEP_INTERVAL,
+            ));
+        }
 
         // ADR 0061 rung J (C-10 PR 4): `Simulator::stop` above also dropped
         // this node's own `index_backfill_loop` task — respawn it
@@ -3659,6 +3851,11 @@ impl SimCluster {
 
         self.shared.push_ctx(ctx.clone());
         self.engines.push(MemoryTabletEngines::new());
+        // ADR 0061 rung L, C-12 PR 2: keeps `self.roles` index-aligned with
+        // `self.engines`/`self.shared`'s own ctxs — `grow` supports
+        // `role == "data"` only (the assert above), so this is always
+        // `NodeRole::Data`.
+        self.roles.push(NodeRole::Data);
         self.nodes += 1;
 
         // Self-registration: `RegisterNode` + `UpsertMember{Active}`,

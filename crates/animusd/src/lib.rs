@@ -19099,6 +19099,16 @@ mod sim_cluster_backfill_seeder;
 #[cfg(test)]
 mod sim_cluster_stream_backfill_seed_filter;
 
+/// ADR 0061 rung L (C-12 PR 2): control-only nodes under `SimCluster` — the
+/// mechanism PR (per-node roles, role-aware `restart`) plus five
+/// seed-parameterized scenarios proving a mixed control-only/combined
+/// cluster boots, elects, restarts, and crash-recovers correctly, and that
+/// a control-only node runs no data-plane loop at all. See `sim_cluster_
+/// control_only.rs`'s own module doc for the full account and
+/// `crates/animusd/CLAUDE.md`'s matching SimCluster-roles entry.
+#[cfg(test)]
+mod sim_cluster_control_only;
+
 /// Regression for the issue #298 residual confirmed live under the
 /// un-pinned `SplitMode::InPlace` proof soak (ADR 0018's matching amendment,
 /// `docs/engineering-lessons.md`'s matching entry): a stage blocked by
