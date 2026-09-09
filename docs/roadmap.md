@@ -1189,14 +1189,23 @@ the still-true paragraph after the table.
   `sim_cluster_control_data_split.rs` (`control_only.rs`/`data_only.rs`/
   `cluster_split.rs`/`control_membership_admin.rs`'s 11 convertible
   tests, 22 tests, three files deleted whole); PR 4b `split_cluster.rs`
-  (8 tests, deleted whole); PR 4c the four role-named console/dashboard
+  (6 of 8 tests converted — 2 real class-B residuals kept, file trimmed
+  not deleted, per this plan's own original "8, deleted whole" estimate
+  corrected against the actual D3 classification); PR 4c the four
+  role-named console/dashboard
   tests (`console_endpoint.rs`/`dashboard_endpoint.rs`, 2 each); PR 4d
   the stream-janitor role test (`stream_janitor.rs`, 1 test); PR 5 docs
   close-out.
 - **Depends:** C-11 (closed) — the next unowned residual group per C-08's,
   C-09's, C-10's, and C-11's own close-outs.
-- **Status (2026-09-09):** open — PR 1 (this docs opener) landed. PRs 2-5
-  not yet started.
+- **Status (2026-09-09):** open — PR 1 (docs opener), PR 2 (control-only
+  nodes + role-aware `restart`/`crash`), PR 3 (data-only nodes
+  first-class), PR 4a (`sim_cluster_control_data_split.rs`), and PR 4b
+  (`sim_cluster_split_cluster.rs` — 6 of `split_cluster.rs`'s 8 tests
+  converted, 2 kept `ProdEnv`; see ADR 0061's matching PR 4b amendment and
+  `crates/animusd/CLAUDE.md`'s own PR 4b appendix) have landed. PR 4c
+  (four role-named console/dashboard tests), PR 4d (the stream-janitor
+  role test), and PR 5 (docs close-out) not yet started.
 
 ## 4. Operator surfaces: admin API, dashboard, console, CLI
 

@@ -9011,7 +9011,7 @@ estimate carried over from an earlier draft):
 | `control_only.rs` | 3 | Converts (PR 4a) — bare control-only cluster election/status/quiescence, control-node DDL relay, mixed control+combined routing |
 | `data_only.rs` | 5 | Converts (PR 4a) — `ControlHandle::Remote`, no local `RaftCore` |
 | `cluster_split.rs` | 3 | Converts (PR 4a) — in-process `--cluster-control N --cluster-data M` |
-| `split_cluster.rs` | 8 | Converts (PR 4b) — failover, split, replica repair, decommission, full-cluster restart, simultaneous control+data failure, decommission-vs-split race, quiesce-after-to-admin-config |
+| `split_cluster.rs` | 8 (6 convert, 2 stay) | **PR 4b landed 2026-09-09**: 6 convert — failover, split, replica repair, decommission, simultaneous control+data failure, decommission-vs-split race; `full_split_cluster_restart_recovers_metadata_and_data` (real on-disk `StorageBackend::Lsm` full-outage restart) and `cluster_control_data_threads_quiesce_after_to_admin_config` (the real `start_split_cluster_with_growth` config-parse/process-boundary path) both stay — the plan row above's "8, file deleted whole" was a pre-grep estimate, corrected here per this crate's own "PR 1's own grep made against its plan draft" precedent (rung K) |
 | `control_membership_admin.rs` | 12 (11 convert, 1 stays) | 11 convert (PR 4a/4b, membership growth/removal/collision scenarios over a split deployment); `admin_config_reports_the_internal_addr_the_cli_resolves_control_add_through` stays — `--config` bring-up, a real process-boundary surface, permanent |
 | `stream_janitor.rs` | 2 (1 relevant) | `segment_janitor_reclaims_objects_from_a_genuinely_control_only_leader` converts (PR 4d); `repair_re_replicates_to_a_fresh_target_after_a_replica_node_dies` is an unrelated C-07-assessed permanent residual (shared S3 store has no per-node replica concept), not this rung's to touch |
 | `console_endpoint.rs` | 3 (2 relevant) | `console_serves_shell_on_data_only_node`/`console_addr_panics_on_control_only_node` convert (PR 4c); `console_serves_shell_assets_and_deep_links_on_combined_node` already has a `sim_cluster_console.rs` sibling from C-08 and stays as the equivalence-regression original, untouched |
@@ -9096,7 +9096,23 @@ to match (see "Docs" below).
   clippy — the same sequencing every prior rung's own gate list used.
 - **PR 4b — `split_cluster.rs`.** Its own sibling module (or folded into
   4a's, sized at implementation time), 8 tests, file deleted whole.
-  **Gate:** identical shape to PR 4a's.
+  **Gate:** identical shape to PR 4a's. **Landed 2026-09-09** as its own
+  sibling module, `sim_cluster_split_cluster.rs` (a first attempt folding
+  it into `sim_cluster_control_data_split.rs` grew that file to 1881
+  lines, over this rung's own ~1800-line guidance, and was reverted) — 6
+  of the 8 converted (12 tests: 6 scenarios × pinned-seed + `_over_seeds`),
+  not all 8 as this plan bullet originally estimated: `full_split_cluster_
+  restart_recovers_metadata_and_data` (real on-disk WAL crash recovery)
+  and `cluster_control_data_threads_quiesce_after_to_admin_config` (the
+  real config-parse/process-boundary path) are genuine class-B residuals,
+  kept whole — `tests/split_cluster.rs` trimmed to those two, not deleted.
+  Three of the six converted scenarios needed a retry helper apiece
+  (`create_table_after_recovery`/`put_retry`/`put_raw_retry`) for a
+  post-fault race each first draft's own single-shot call missed — see
+  `crates/animusd/CLAUDE.md`'s own PR 4b appendix for the full account.
+  Full gate green: `sim_cluster`-filtered tier 534 passed/0 failed/2
+  ignored (1324.88s, 522 baseline + 12); full unfiltered `--lib` 712
+  passed/0 failed/3 ignored (750.52s, 700 baseline + 12).
 - **PR 4c — the four role-named console/dashboard tests.** `sim_cluster_
   console.rs` gains `console_serves_shell_on_data_only_node`/
   `console_addr_panics_on_control_only_node` (`console_endpoint.rs`

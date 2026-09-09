@@ -2089,6 +2089,37 @@ impl SimCluster {
         panic!("control group never elected a leader");
     }
 
+    /// [`SimCluster::control_leader_index`]'s own sibling for a scenario
+    /// that has just [`SimCluster::crash`]ed the CURRENT leader and needs
+    /// to observe the survivors' real re-election — ADR 0061 rung L, C-12
+    /// PR 4b. A crashed control node is muted, not stopped
+    /// ([`SimCluster::crash`]'s own doc): nothing ever delivers it a
+    /// higher-term vote telling it to step down from a term it already
+    /// won, so its own `RaftCore::is_leader()` keeps answering `true`
+    /// forever — a plain, unfiltered [`SimCluster::control_leader_index`]
+    /// call right after crashing the leader can therefore keep returning
+    /// that same crashed node's own index, never noticing the survivors'
+    /// real election. `exclude` (the crashed former leader's own index) is
+    /// skipped on every poll iteration. Mirrors the identical stale-
+    /// self-belief gotcha `sim_cluster_auto_split.rs`'s own module doc
+    /// already documents for a CP-data tablet leader's
+    /// [`SimCluster::leader_index_of`], generalized here to the control
+    /// plane.
+    pub(crate) fn control_leader_index_excluding(&mut self, exclude: u64) -> usize {
+        for _ in 0..40 {
+            if let Some(i) = self
+                .controls
+                .iter()
+                .enumerate()
+                .position(|(i, n)| i as u64 != exclude && n.is_leader())
+            {
+                return i;
+            }
+            self.sim.run_for(Duration::from_millis(50));
+        }
+        panic!("control group never elected a new leader excluding node {exclude}");
+    }
+
     /// Drive the simulator forward in `step`-sized increments, calling
     /// `done(self)` after each, until it returns `true` or `budget` is
     /// exhausted — the converged-or-timeout idiom root `CLAUDE.md`'s

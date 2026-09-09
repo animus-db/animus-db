@@ -19134,6 +19134,23 @@ mod sim_cluster_data_only;
 #[cfg(test)]
 mod sim_cluster_control_data_split;
 
+/// ADR 0061 rung L (C-12 PR 4b): converts `tests/split_cluster.rs`'s own 8
+/// real-socket tests (control-leader failover under live data traffic, a
+/// split over a split deployment, failure-driven replica repair onto a
+/// spare, decommission via the control leader, a full-cluster stop/
+/// restart, a simultaneous control-leader + data-node failure, a
+/// decommission racing a split crossover, and the `--cluster-control`/
+/// `--cluster-data` `--quiesce-after` CLI-wiring proof) — a **separate**
+/// module from `sim_cluster_control_data_split.rs` (PR 4a) purely to stay
+/// under this rung's own ~1800-line-per-module guidance; builds on that
+/// module's own PR 2/3 mechanism, no `dynamo.rs`/`lib.rs` production
+/// change beyond one small `sim_cluster.rs` accessor
+/// (`SimCluster::control_leader_index_excluding`). See `sim_cluster_
+/// split_cluster.rs`'s own module doc for the full classification table
+/// and `crates/animusd/CLAUDE.md`'s matching residual-inventory entry.
+#[cfg(test)]
+mod sim_cluster_split_cluster;
+
 /// Regression for the issue #298 residual confirmed live under the
 /// un-pinned `SplitMode::InPlace` proof soak (ADR 0018's matching amendment,
 /// `docs/engineering-lessons.md`'s matching entry): a stage blocked by

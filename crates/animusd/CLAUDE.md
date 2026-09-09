@@ -9907,3 +9907,121 @@ gate). `Cargo.lock` unchanged.
 See `docs/adr/0061-testability-node-crate-simulator.md`'s rung L PR 4a
 amendment and `docs/roadmap.md`'s C-12 entry for the closing record; this
 appendix is the crate-local pointer.
+
+## Appendix — split_cluster.rs converted to SimCluster (ADR 0061 rung L, C-12 PR 4b, 2026-09-09)
+
+Closes the second conversion PR of C-12 (rung L), converting the
+`--cluster-control N --cluster-data M` split-deployment suite
+`tests/split_cluster.rs` — built on PR 4a's own `NodeRole`-aware
+`SimCluster::new_with_roles`/role-aware `restart`/`crash` mechanism, with
+no further `sim_cluster.rs` production-shaped change beyond one small new
+accessor. Converts 6 of `tests/split_cluster.rs`'s 8 real-socket tests into
+a new `crates/animusd/src/sim_cluster_split_cluster.rs` (6 scenarios ×
+pinned-seed + 5-seed `_over_seeds` = 12 tests), kept as a **separate**
+module from PR 4a's `sim_cluster_control_data_split.rs` (combining them
+would have pushed that file past this rung's own ~1800-line-per-module
+guidance — confirmed empirically: a first attempt that appended PR 4b's
+own doc + scenarios directly into that file grew it to 1881 lines, reverted
+in favor of this new module), then trims `tests/split_cluster.rs` to its
+two genuine real-socket residuals.
+
+**Classification (D3 discipline)**:
+
+| Original test | A/B | Disposition |
+|---|---|---|
+| `control_leader_failover_under_live_data_traffic` | A | Converted → [`run_control_leader_failover_under_live_data_traffic`] — writes issued both before AND after a real [`SimCluster::crash`] of the control LEADER specifically (the harder failover case), a new leader found via the new [`SimCluster::control_leader_index_excluding`], every tracked write still readable, and a post-kill DDL issued from a DATA node relaying to whichever control node now leads |
+| `split_over_a_split_deployment` | A | Converted → [`run_split_over_a_split_deployment`] — an admin-triggered in-place split against a DATA-only node's admin port, driven to full two-`Active`-children convergence via [`SimCluster::drive_inplace_split_cutover`] (this fixture never spawns `index_drain::change_consumer_loop` as a background loop), both halves independently writable/servable afterward, every pre-split key surviving the crossover. Uses `SimCluster::put_raw`/`raw_get` (literal byte keys, not `item_key`'s hashed composite encoding) so a literal split key compares against stored bytes directly |
+| `data_node_failure_is_detected_and_repaired_onto_a_spare` | A | Converted → [`run_data_node_failure_is_detected_and_repaired_onto_a_spare`] — a real [`SimCluster::crash`] of a live replica, the control leader's own failure detector marking it `Down`, and real placement `reconcile_loop`/`rebalance_step` repairing the tablet onto the spare |
+| `decommission_a_data_node_over_split_deployment_via_the_control_leader` | A | Converted → [`run_decommission_a_data_node_over_split_deployment_via_the_control_leader`] — the refusal/success pairing (`/admin/drain`+`/admin/member/remove` refused with a `409`+leader-hint via the DATA node's own admin port, succeeding via the control LEADER's), `/admin/member/drain-status` read cross-node-type, membership/address-book pruning — all via raw [`SimCluster::admin`] calls (not the leader-targeting `drain`/`remove` convenience wrappers, which can't reproduce the refusal half) |
+| `full_split_cluster_restart_recovers_metadata_and_data` | B | **KEPT** whole — a genuine on-disk `StorageBackend::Lsm` full-outage restart (every control AND data process stopped, rebound on the same dir/addresses): real fsync/on-disk WAL crash recovery `SimCluster` cannot stand in for (its own `restart` reuses the same in-memory `MemoryEngine` handle rather than replaying a WAL, ADR 0061 rung D4 PR 1) |
+| `control_leader_and_data_node_failure_simultaneously_still_converges` | A | Converted → [`run_control_leader_and_data_node_failure_simultaneously_still_converges`] — both faults land at the same discrete-event instant (two [`SimCluster::crash`] calls back to back, no intervening `run_for` — `SimCluster` is single-threaded/event-driven, so this genuinely is the same-instant shape), the surviving control pair electing a new leader while placement independently repairs the dead data replica onto the spare, no tracked write lost, a post-dual-failure DDL and a fresh write both recovering |
+| `decommission_racing_a_tablet_split_converges_with_no_data_loss` | A (weakened) | Converted → [`run_decommission_racing_a_tablet_split_converges_with_no_data_loss`] — converts the *shape* (a split kickoff and a drain kickoff fired back to back against the SAME tablet, neither call waiting for the other's own convergence before the second fires) but not `tokio::join!`'s literal single-instant simultaneity of two real HTTP round trips; the reconciler still evacuates the draining node off BOTH the narrowed parent and the freshly-forked child, driven via the same manual-cutover idiom. Every pre-split key plus both crossover-window writes survive |
+| `cluster_control_data_threads_quiesce_after_to_admin_config` | B | **KEPT** whole — the real `animusd::start_split_cluster_with_growth` process assembly (`--cluster-control`/`--cluster-data`'s own CLI-equivalent config wiring), proving `--quiesce-after`/`--heartbeat-batch`/`--shared-wal` reach every data-role node that way too: `SimCluster` never goes through that config-parse/process-boundary path at all |
+
+Real-socket counts before/after PR 4b: 8 → 2 (both kept whole for the
+reasons above — `tests/split_cluster.rs` stays, trimmed, never deleted).
+
+**`SimCluster` gained one new accessor**, alongside this module:
+`SimCluster::control_leader_index_excluding(exclude: u64) -> u64` — a
+`control_leader_index` sibling that skips a crashed former leader's own
+node index while polling for the new leader. A crashed control node is
+**muted, not stopped** (`SimCluster::crash`'s own doc): nothing ever
+delivers it a higher-term vote telling it to step down from a term it
+already won, so its own `RaftCore::is_leader()` keeps answering `true`
+forever — a plain, unfiltered `control_leader_index()` call right after
+crashing the leader can therefore keep returning that same crashed node's
+own index, never noticing the survivors' real election. Mirrors the
+identical stale-self-belief gotcha `sim_cluster_auto_split.rs`'s own
+module doc already documents for a CP-data tablet leader's
+`leader_index_of`, generalized here to the control plane.
+
+**Three post-fault races found and fixed while writing the sim
+scenarios, none a product bug — the mechanism each scenario exercises is
+correct; what needed fixing was giving each scenario the same retry
+discipline the equivalent real-socket client (or a production caller)
+already has**:
+
+- **DDL issued immediately after a control-plane recovery can lose the
+  race against `await_table_serveable`'s own bounded serving-wait**, even
+  though the schema and tablet DO commit — the just-recovered control
+  plane/reconciler settling has no guaranteed head start over the very
+  next DDL a test fires with zero settle buffer. `create_table_after_
+  recovery` tolerates exactly this one failure shape (a `500` naming "did
+  not become serveable", or an outright `ResourceInUseException` if a
+  retry raced an earlier attempt's own already-committed schema) and
+  retries once — used by scenarios (1) and (6)'s own post-recovery DDL
+  calls.
+- **A write issued immediately after a simultaneous control+data fault
+  can need more than one relay attempt to route around the dual
+  disruption** — a stale forward hint chasing the just-crashed node, or a
+  control group briefly leaderless, both resolve given a little more
+  virtual time. `put_retry` retries [`SimCluster::put`] on any error,
+  bounded, advancing virtual time between attempts — used by scenario
+  (6)'s own post-dual-failure write loop.
+- **A write issued into a tablet's own crossover window can hit the
+  ADR 0050 split-cutover-freeze transient** (`"; retry"`-suffixed) the
+  instant the fork happens, and this fixture never runs the periodic
+  cutover driver as a background loop to clear it on its own. `put_raw_
+  retry` retries [`SimCluster::put_raw`] while asserting the transient's
+  own `"; retry"` substring and driving [`SimCluster::drive_inplace_
+  split_cutover`] on every relevant node id on each attempt — mirroring
+  `sim_cluster_auto_split.rs`'s own `put_item_retry` idiom exactly. Used
+  by scenario (7)'s own two crossover-window writes.
+
+**Real-socket counts before/after this PR**: 8 → 2 (both kept whole for
+the reasons in the classification table above). **Baseline vs. new sim
+counts**: baseline `cargo test -p animusd --lib -- sim_cluster` was 522
+passed / 2 ignored before this PR (PR 4a's own closing figure); this PR's
+own new module adds 12 tests (6 scenarios × {pinned seed, `_over_seeds`}),
+all passing, zero regressions — confirmed both via the `sim_cluster`-
+filtered tier (534 passed, 0 failed, 2 ignored, 1324.88s) and a full,
+unfiltered `cargo test -p animusd --lib` run (712 passed, 0 failed, 3
+ignored, 750.52s — 700 PR 4a baseline + this PR's 12 new tests, a superset
+proof covering every in-crate `#[cfg(test)] mod`, not just the
+`sim_cluster` substring).
+
+**No production code changed apart from the one `lib.rs` mod-declaration
+line** (`#[cfg(test)] mod sim_cluster_split_cluster;`, with its own doc
+comment) and the one new `pub(crate) fn control_leader_index_excluding`
+accessor on `SimCluster` — both pure test-fixture surface, no behavior
+change to any production dispatch path.
+
+**Gates, in the required order, all foreground**: `cargo test -p animusd
+--lib -- sim_cluster_split_cluster --test-threads=2` (12 passed, 0 failed,
+274.31s — after the three retry-helper fixes above; the initial cut, before
+those fixes, had 5 of 12 failing); `cargo fmt --all --check` (clean);
+`cargo clippy -p animusd --all-targets --all-features -- -D warnings`
+(one fix needed — `put_retry`'s own 8-argument signature needed
+`#[allow(clippy::too_many_arguments)]`, mirroring `put_raw_retry`'s
+existing one; clean after); `cargo test -p animusd --lib -- sim_cluster
+--test-threads=2` (534 passed, 0 failed, 2 ignored, 1324.88s — 522 baseline
++ this PR's 12 new tests); `cargo build -p animusd --all-targets` (clean);
+`cargo test -p animusd --test split_cluster` on the trimmed file (2
+passed); `cargo test -p animusd --test control_only --test data_only` (the
+PR 4a residual suites, unaffected — 1 + 1 passed); a full, unfiltered
+`cargo test -p animusd --lib` (712 passed, 0 failed, 3 ignored, 750.52s).
+`Cargo.lock` unchanged.
+
+See `docs/adr/0061-testability-node-crate-simulator.md`'s rung L PR 4b
+amendment and `docs/roadmap.md`'s C-12 entry for the closing record; this
+appendix is the crate-local pointer.
