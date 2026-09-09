@@ -19016,6 +19016,22 @@ mod sim_cluster_admin_actions;
 #[cfg(test)]
 mod sim_cluster_dashboard;
 
+/// Deterministic, seed-reproducible regression for the admin seeder's
+/// images-arm pipelining (`admin::action_data_seed`, `SEED_IMAGES_
+/// CONCURRENCY`): seeds a Stream-enabled table through `POST
+/// /admin/data/seed` (reachable via `SimCluster::admin_timed`, the same
+/// `GenericAdminHost` seam `sim_cluster_admin_actions.rs`'s own
+/// `seed_writes_synthetic_keys` already proves reaches this route) and
+/// asserts the virtual elapsed time for a 96-row seed is well under a
+/// quarter of 96x an 8-row seed's own per-row virtual cost — a bound the
+/// bounded-concurrency fix clears with wide margin and the old strictly-
+/// sequential loop fails deterministically (confirmed red on the
+/// pre-fix code, restored — see this module's own doc for the exact
+/// numbers). All in virtual `SimEnv` time, so the assertion cannot flake
+/// under real-thread contention.
+#[cfg(test)]
+mod sim_cluster_seed_latency;
+
 /// Regression for the issue #298 residual confirmed live under the
 /// un-pinned `SplitMode::InPlace` proof soak (ADR 0018's matching amendment,
 /// `docs/engineering-lessons.md`'s matching entry): a stage blocked by

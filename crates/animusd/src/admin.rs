@@ -79,6 +79,7 @@ use animus_node::host::RelayClient;
 use animus_storage::{StorageError, WalRecordView};
 use animus_tablet::{TOKEN_BYTES, TabletId};
 use async_trait::async_trait;
+use futures::TryStreamExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -2747,7 +2748,10 @@ const SEED_MAX_VALUE_BYTES: usize = 1 << 20;
 /// this many keys is proposed as a single consensus round per tablet instead
 /// of one round per key, the bulk-seed throughput win. (An images-carrying
 /// table's seed instead routes per item through the evaluate-at-leader
-/// funnel — correctness over throughput for that rare seed target.)
+/// funnel, pipelined up to [`SEED_IMAGES_CONCURRENCY`] rows in flight at
+/// once — see that constant's own doc for why this is still correctness
+/// over the marker arm's per-tablet-entry throughput, not a second version
+/// of it.)
 const SEED_BATCH_SIZE: u64 = 500;
 /// Cap on a seed batch's **raw entry bytes** (keys + values). `SEED_BATCH_SIZE`
 /// alone lets a large-`value_bytes` seed build a 500 × 1 MiB batch, whose
@@ -2766,6 +2770,21 @@ const SEED_WRITE_ATTEMPTS: usize = 4;
 /// Backoff between seed write attempts — long enough for a freshly-split child
 /// group to elect a leader / the tablet map to settle.
 const SEED_RETRY_BACKOFF: Duration = Duration::from_millis(150);
+/// Bound on in-flight `cp_kind_write_item` calls for an images-carrying
+/// table's seed chunk (the per-item evaluate-at-leader arm below). Each such
+/// write is dominated by *waiting*, not CPU — the confirm-poll round-up
+/// (`write_path::cp_kind_eval_local`'s exponential back-off), the forward hop
+/// to the tablet leader when the seeder isn't running on it, and one fsync —
+/// measured at ~5-7ms/row on a healthy local cluster, so a strictly
+/// sequential loop caps throughput at roughly `1000 / 7 ≈ 140` keys/s
+/// regardless of how fast the leader's own Raft group can actually commit.
+/// 32 is enough concurrency to overlap that per-row wait many times over
+/// (a fully-utilized leader should be issuing/confirming dozens of writes
+/// within one row's own round-trip latency) while keeping the leader's
+/// in-flight write set small relative to `SEED_BATCH_SIZE` — comfortably
+/// below the kind of fan-out that would itself start queueing at the
+/// leader's own apply task or its network stack.
+const SEED_IMAGES_CONCURRENCY: usize = 32;
 
 #[derive(Deserialize)]
 struct SeedReq {
@@ -2948,10 +2967,43 @@ async fn action_data_seed<E: Env, R: RelayClient>(
             // 0049 §1's "every mutation leaves a record" invariant that ADR
             // 0050's split-build tail will depend on. Marker tables commit
             // per-tablet single-entry batches via the one shared
-            // `dynamo::marker_batch_write`; an images table (streamed/GSI'd —
-            // rare for a seed target, correctness over throughput) routes
-            // each item through the same evaluate-at-leader funnel
+            // `dynamo::marker_batch_write`; an images table (streamed/GSI'd)
+            // routes each item through the same evaluate-at-leader funnel
             // `BatchWriteItem` uses.
+            //
+            // **The images arm is pipelined, up to `SEED_IMAGES_CONCURRENCY`
+            // rows in flight at once (issue: a Stream-enabled seed target
+            // measured ~140 keys/s strictly sequential, vs. >10,000 keys/s
+            // for the marker arm — almost entirely waiting, not CPU).**
+            // Concurrency is sound here for reasons specific to this write
+            // shape, not a general license to fan out any write loop:
+            // - Every row in a seed chunk has a **distinct** key (`seed_row`
+            //   derives it from a unique index), so no two concurrent calls
+            //   ever contend on the same item.
+            // - Per-item evaluation happens **at the tablet leader, at apply
+            //   time** (ADR 0054) — each `KvCommand::KindEval` reads its own
+            //   key's current value and evaluates independently of every
+            //   other key's entry, the same "per-item evaluation is
+            //   independent per key" property `BatchWriteItem`'s own images
+            //   arm already relies on for *its* per-item loop (that arm
+            //   stays sequential today — the seeder's own throughput
+            //   pressure never applied to a single `BatchWriteItem` call's
+            //   ≤25-item cap — but nothing about the primitive requires
+            //   sequencing, only that arm's own scope never needed to relax
+            //   it).
+            // - A `Put` is value-idempotent on retry (per-key LWW, same
+            //   bytes) — this chunk's own whole-chunk retry loop below
+            //   already depends on that; concurrency changes nothing about
+            //   which rows might get retried, only how many are in flight
+            //   at once.
+            // - Each row's own stream/GSI/change-log record is per-item —
+            //   nothing here claims cross-row atomicity (the funnel never
+            //   did, sequential or not): nothing downstream observes or
+            //   depends on the commit order of two different keys' entries.
+            // The first error stops issuing new rows and surfaces as the
+            // chunk's error exactly as before (`try_for_each_concurrent`
+            // returns on the first `Err`, dropping any still-in-flight
+            // futures) — the outer whole-chunk retry loop is unchanged.
             //
             // Retries are a bounded whole-chunk loop now (`cp_batch_write_
             // patient`'s poll-not-repropose nuance does not transfer to the
@@ -2968,24 +3020,24 @@ async fn action_data_seed<E: Env, R: RelayClient>(
                     }
                     let meta = ctx.effective_metadata();
                     last = if crate::dynamo::table_change_records_carry_images(&meta, &table) {
-                        let mut r = Ok(());
-                        for (pk, sk, item) in &rows {
-                            if let Err(e) = ctx
-                                .cp_kind_write_item(
-                                    &meta,
-                                    &table,
-                                    pk,
-                                    sk.as_ref(),
-                                    crate::KindWriteOp::Put(item.clone()),
-                                    None,
-                                )
-                                .await
-                            {
-                                r = Err(format!("{e:?}"));
-                                break;
-                            }
-                        }
-                        r
+                        futures::stream::iter(rows.iter().map(Ok::<_, String>))
+                            .try_for_each_concurrent(
+                                SEED_IMAGES_CONCURRENCY,
+                                |(pk, sk, item)| async {
+                                    ctx.cp_kind_write_item(
+                                        &meta,
+                                        &table,
+                                        pk,
+                                        sk.as_ref(),
+                                        crate::KindWriteOp::Put(item.clone()),
+                                        None,
+                                    )
+                                    .await
+                                    .map(|_outcome| ())
+                                    .map_err(|e| format!("{e:?}"))
+                                },
+                            )
+                            .await
                     } else {
                         let batch_rows = rows
                             .iter()

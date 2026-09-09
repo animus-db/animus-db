@@ -2497,6 +2497,62 @@ impl SimCluster {
         })
     }
 
+    /// [`SimCluster::admin`]'s timing-instrumented sibling: instead of
+    /// blindly running the simulator forward by the fixed [`OP_BUDGET`]
+    /// jump (which tells a caller only whether the request resolved, never
+    /// *when*), this steps the simulator forward in `step`-sized
+    /// increments — up to `max_steps` of them — and returns the virtual
+    /// [`Duration`] elapsed at the moment the request's own future actually
+    /// resolved, alongside its `(status, body)`. Used by seed-latency
+    /// assertions (`sim_cluster_seed_latency.rs`) that need a real
+    /// measurement of virtual elapsed time, not just success/failure —
+    /// [`SimCluster::admin`]'s own `spawn_and_capture` deliberately hides
+    /// that by construction (its own doc). Never panics on exhaustion
+    /// (mirrors every other `SimCluster` driver method): returns
+    /// `max_steps * step` and a synthetic `504` body when the request never
+    /// resolves in that window.
+    #[allow(clippy::too_many_arguments)] // a plain (node, method, path, query, body, step, max_steps) parameter list — mirrors `admin`'s own five plus the two timing knobs `admin` doesn't need; a struct would just move the same seven pieces of information one level of indirection away
+    pub(crate) fn admin_timed(
+        &mut self,
+        node: u64,
+        method: &str,
+        path: &str,
+        query: &str,
+        body: &[u8],
+        step: Duration,
+        max_steps: usize,
+    ) -> (Duration, u16, String) {
+        let handle = self.shared.clone();
+        let (method, path, query, body) = (
+            method.to_owned(),
+            path.to_owned(),
+            query.to_owned(),
+            body.to_vec(),
+        );
+        let env = self.shared.env(node);
+        let slot: Arc<Mutex<Option<(u16, String)>>> = Arc::new(Mutex::new(None));
+        let out = slot.clone();
+        let start = self.sim.now();
+        env.spawn_task(async move {
+            let result = handle.admin(node, &method, &path, &query, &body).await;
+            *out.lock().expect("result slot poisoned") = Some(result);
+        });
+        for _ in 0..max_steps {
+            self.sim.run_for(step);
+            if let Some((status, resp)) = slot.lock().expect("result slot poisoned").take() {
+                return (self.sim.now().duration_since(start), status, resp);
+            }
+        }
+        (
+            self.sim.now().duration_since(start),
+            504,
+            format!(
+                "admin request on node {node} did not resolve within {max_steps} x {step:?} \
+                 of virtual time"
+            ),
+        )
+    }
+
     /// Run a console HTTP request against `node`'s own `ClientCtx` (ADR
     /// 0061 rung H, C-08 PR 2) — [`SimClusterHandle::console`]'s
     /// synchronous sibling, driven from a test's own `&mut self` call
