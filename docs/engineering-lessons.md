@@ -24319,3 +24319,99 @@ still describes what the test's own current body actually does and needs
 consecutive one where skipping them would have closed with a materially
 wrong record: one entire file silently mis-declared "converted," and one
 of its own tests mis-declared "permanent" for the wrong reason.
+
+## A dev tool nested in the server's own use-case layer duplicates the wire's byte shapes and grows its own performance bugs — put load generation on the client and let it ride the real path (ADR 0021 amendment, 2026-09-09)
+
+`POST /admin/data/seed` started as a small convenience (ADR 0021: bulk-write
+synthetic rows to drive sharding tests) and grew, over several PRs, into a
+second implementation of `PutItem`: it had to re-derive the exact key/value
+byte shapes a real client's write would produce (`seed_key_attr`,
+`animus_dynamo::wire::encode_stored_item`'s envelope) to stay readable
+through the real DynamoDB edge, and once that duplication existed it also
+had to reinvent, and separately tune, its own performance characteristics
+— a marker-batch fast arm sized around `SEED_BATCH_SIZE`/
+`SEED_BATCH_MAX_BYTES`, and a **second**, unrelated concurrency knob
+(`SEED_IMAGES_CONCURRENCY`) for the per-item images-table arm — neither of
+which had anything to do with the real `BatchWriteItem` operation's own
+25-item cap or its own throttling contract. The images arm's own
+concurrency bug (PR #783) and the marker arm's own entry-granularity bug
+(one-entry-per-item vs. one-per-tablet, this same log's own earlier
+"same-predicate" entries) were each real, each shipped, and each needed
+for exactly the reason a second implementation of a write path always
+needs its own bug-fixing: it is not the same code as the one path a real
+client exercises, so nothing that hardens the real path automatically
+hardens it.
+
+It also had a fidelity gap structurally impossible to close without
+becoming a third thing: a throttled row (ADR 0065) had no `UnprocessedItems`
+to be echoed through, since the internal primitives it called had no such
+wire-level contract at all — so a throttled seed silently under-wrote, with
+`written` reporting a number the caller had no way to tell was short of
+what the real op's own semantics would have reported.
+
+**The fix wasn't a bug fix — it was removing the second implementation.**
+`animus-cli seed` now generates the identical item shape client-side and
+writes it through the real `BatchWriteItem` wire operation; `/admin/data/
+seed` is now a thin proxy over the same operation, through the same
+generic dispatcher `/admin/data/dynamo` already used
+(`execute_routed_as_generic`). Every one of the bugs above stopped being
+possible **by construction**, not by being fixed: there is no byte shape
+left to duplicate (the wire decoder is the one and only encoder/decoder),
+no second concurrency model to separately tune (chunking + `buffer_
+unordered` is the same idiom a real bulk-loading client would use), and no
+missing wire contract to work around (`UnprocessedItems` already exists,
+because the real operation already has one).
+
+**The general lesson**: when a server gains an admin/debug/test-support
+route whose job is "do roughly what a client operation does, but from
+inside the node, for convenience or speed" — a bulk loader, a synthetic
+data generator, a fixture seeder — resist implementing it against the same
+internal primitives the real operation is built from. Implement it as a
+client of the real operation instead (even a very short/proxied hop, as
+`/admin/data/seed` still is). The second implementation looks cheaper up
+front, but it inherits none of the real path's own hardening, duplicates
+work that will drift the moment either side changes, and accumulates its
+own bug class that has nothing to do with the feature it exists to test.
+
+## A `Scan` (or any read) issued from a node that does not lead the tablet, right after a write, needs `ConsistentRead: true` — even in a from-scratch deterministic `SimEnv` test, and even when the pattern was copied from an existing test that had the identical gap (ADR 0021 amendment, `sim_cluster_seed_latency.rs`, 2026-09-09)
+
+Rewriting `sim_cluster_seed_latency.rs` for the new client-side-shaped
+seeder kept its pre-existing verification shape verbatim: seed N rows from
+a node that does not lead the table's tablet (`non_leader_of_table`), then
+`Scan` the same node with `{"Select":"COUNT"}` and assert the count equals
+N. 1 of 5 `_over_seeds` seeds failed this assertion deterministically (199
+of 200 rows), even though the seed call's own `written` field correctly
+reported 200 and every one of its writes had already durably committed
+before the call returned.
+
+**Root cause: the `Scan` carried no `ConsistentRead`, so it defaulted to
+`false`** — ADR 0055's eventually-consistent read path, served from
+whichever replica answers, with no read barrier against the leader's own
+latest commit. `non_leader_of_table`'s whole point is to prove the seed's
+own forwarding path works, which means the node serving the verification
+`Scan` is, by construction, not the node that just committed every write —
+so the `Scan`'s own local replica state can legitimately lag the write
+it's trying to observe. This is precisely the gotcha `animusd/CLAUDE.md`'s
+ADR 0055 section already names in so many words ("a read that verifies a
+write must ask for `ConsistentRead: true`... the failure is a race, so one
+green run of a binary proves nothing") — but it was missed on first read
+because the **pre-existing, pre-rewrite version of this exact test had the
+identical gap** (its own `Scan` call also omitted `ConsistentRead`, also
+against a non-leader node) and had apparently never been observed to fail
+across its prior lifetime. Copying a working-looking pattern from an
+existing test file is not the same as that pattern being correct — a
+latent race can sit unfired for a long time and then fire on the very next
+seed a rewrite happens to add coverage at.
+
+**Fixed** by adding `"ConsistentRead":true` to the verification `Scan` —
+reproduced first with `ANIMUS_SEED=<seed>` against the single-seed test
+(this crate's own standard replay convention) to confirm the exact failure
+deterministically, then confirmed fixed the same way before re-running the
+full `_over_seeds` sweep (three clean repeats). **The generalizable rule,
+restated once more because this is not the first time it's been the actual
+cause of a `SimCluster` test finding a "bug" that was really a missing
+`ConsistentRead`**: whenever a test verifies a write by reading it back,
+check whether the read is `ConsistentRead: true` and whether the node
+serving it is the tablet's own leader — if either is no, the read can race
+replication, and it will eventually be caught, not prevented, by "it
+always passed before."
