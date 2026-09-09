@@ -24113,3 +24113,101 @@ needs its own scripted reproduction (`hlc_differential_skew.rs`) as the
 permanent regression for that exact gap. Neither renders the other
 redundant; don't expect a broadened knob alone to subsume a targeted
 regression it structurally cannot reach.
+
+## Follow-up: disabling the PRIMARY #804 fix (not just the same-day-correction hunks) still didn't fire the raftkv corpus, and the reason generalizes past this one bug (2026-09-09)
+
+A maintainer follow-up asked for a stronger teeth-proof than the entry
+above: disable the *primary* fix (`engine_image` emits `None` for the
+header unconditionally, matching pre-#804 `main` exactly — the receiver
+witnesses only `storage.latest_version()`) rather than only the two
+same-day-correction hunks, and iterate on the corpus until it fires within
+50 seeds. `cargo test -p animus-cp-data --test hlc_differential_skew` went
+red in that state as expected, including the *original* reproduction
+(`lagging_replica_mints_below_a_committed_non_row_writing_entry`) hitting
+`assert_ts_monotonic` directly — confirming the disable was the real
+thing. `ANIMUS_RAFTKV_SEEDS=50 cargo test -p animus-test --test
+raftkv_linearizable` (run twice, cleanly, 249s and 272s) stayed green both
+times.
+
+**Three organic ingredients were added and instrumented, one at a time,
+each confirmed working on its own terms, and the corpus still never
+fired:**
+
+1. A `poison_cas` burst fired immediately before `StopRestart`, on the
+   about-to-be-stopped leader. **Diagnosed as structurally unable to
+   matter**: those entries land in the victim's own durable WAL before it
+   stops, and `RaftCore::recovered`'s WAL replay on restart is a
+   log-*scanning* witness (one of the two "strong" ones) — it witnesses
+   them correctly regardless of anything else. Moving the burst to fire
+   *after* the restart, once the survivors elect a fresh leader (confirmed
+   via `engine_latest_version()` instrumentation and a fine-grained
+   5ms-step poll to land the burst before the victim's own snapshot round
+   trip could complete), fixed that specific gap — verified the victim
+   never received these specific entries via WAL replay.
+2. An explicit, seeded `transfer_leadership` onto the restart victim,
+   retried until `RaftCore::transfer_leadership`'s own gate
+   (`peer_match(target) >= commit_index`) opened. **Confirmed working by
+   instrumentation on every attempt**: `now_leader == victim` every single
+   time, well within budget — Raft election dynamics alone (the two live
+   survivors campaign immediately; the just-restarted node is still busy
+   recovering) never once let the victim win on its own, exactly as
+   predicted, and this ingredient reliably corrected for it.
+3. A genuinely fresh write ("poke") proposed on the new leader after the
+   transfer, since `compaction_crossing_*`'s own fault fires only once the
+   workload has *already fully drained* (confirmed directly:
+   `ok_ops=90/90` in the recorder at the moment the fault fires) — so
+   without a deliberate new write, no replica ever mints anything after
+   the restart for `assert_ts_monotonic` to have a chance to run against.
+
+**Why it still didn't fire, run to ground with `engine_latest_version()`
+instrumentation and an A/B (burst present vs. `ANIMUS_SKIP_BURST=1`)
+comparison**: the burst itself is a guaranteed CAS miss and provably never
+writes a row (verified: with the burst skipped, `engine_latest_version()`
+stays flat and identical across all three replicas straight through the
+transfer) — but issuing it is exactly what triggers `mint_pushed`'s own
+per-term write-conflict machinery on the *first* propose in the new
+leader's term, and this raises `engine_latest_version()` on the survivors
+by several real seconds' worth of wall_ms (confirmed: skipping the burst
+also removes this jump). The victim, once its own `InstallSnapshot` for
+the pre-burst state lands, is back to **ordinarily following** — so it
+witnesses the burst's own entries (and this fold-in write) via
+`witness_append_entries`, a strong, log-scanning witness, the instant they
+replicate, `engine_latest_version()`'s own catch-up lag notwithstanding
+(that accessor reads *rows*, not the in-memory `Hlc`/`max_applied_ts` the
+witnessing chain actually maintains — a real trap in this specific
+diagnostic, worth naming on its own: `engine_latest_version()` is the
+wrong probe for "has this replica witnessed X," since it can legitimately
+lag behind correct witnessing that already happened via log receipt,
+pre-apply). For the fix's absence to matter at all, an entry must be
+compacted away *before* the receiving replica's own `InstallSnapshot` is
+built — which means, for a burst fired **after** a restart to ever be
+invisible to the victim, the sender must **compact again**, a second time,
+crossing `COMPACT_THRESHOLD` (or forcing an on-demand image early) between
+the burst and whatever moment the victim's own snapshot request is
+served — the exact two-compaction choreography (real writes hidden by the
+*first* compaction, before the restart; the failed-CAS burst hidden by a
+*second* one, after it) `hlc_differential_skew.rs`'s own hand-scripted
+scenario builds deliberately, and that a `StopRestart`-shaped corpus cell
+with only ONE scheduled fault has no way to reach without adding a second,
+explicit forced-compaction step of its own — at which point the "organic"
+corpus cell is, structurally, the scripted regression with extra
+indirection, not a broader net cast over more of the state space.
+
+**General lesson, worth the session it cost**: when a witnessing/ordering
+bug's fix works by comparing "what got compacted/discarded" against "what
+a specific replica has independently confirmed," the reachability
+condition is almost always a race between two *independent* trigger
+events (here: the sender's own second compaction, and the receiver's own
+snapshot request) that a single scheduled fault cannot pin relative to
+each other — proving this rigorously (not just suspecting it) took
+building the ingredient, confirming each piece works via targeted
+instrumentation and A/B toggles, and then tracing the SPECIFIC accessor
+(`engine_latest_version()`) being used to judge "did it work" back to
+which witness point it actually reads. All three organic ingredients
+above were removed from the shipped corpus rather than landed half-working
+— per this repo's own convention, unproven complexity that doesn't
+demonstrably do its job doesn't ship; the differential-skew mechanism and
+the per-write `poison_cas` ingredient from the entry above remain, since
+those are independently useful (broad coverage; the necessary-but-not-
+sufficient log ingredient) even though neither alone reproduces this
+specific narrow gap.
