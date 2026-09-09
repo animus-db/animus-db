@@ -89,13 +89,39 @@ async fn scans_survive_concurrent_compaction() {
     let (env, _bound) = ProdEnv::bind(nid(0), addr, &dir)
         .await
         .expect("bind ProdEnv");
-    // Tiny thresholds: flush almost every few writes, compact every 2 L0 tables —
-    // so flushes + compactions (which remove old files) run continuously under the
-    // scanners.
+    // Small thresholds: flush every few writes, compact every 2 L0 tables — so
+    // flushes + compactions (which remove old files) run continuously under the
+    // scanners. Not tinier than this: at `flush_threshold_bytes: 256` (the
+    // original value here) this workload's 3000 30-byte merges produced 333
+    // real flushes + 205 real compactions — ~538 real SSTable-file
+    // create+fsync+rename sequences serialized on the writer's own task
+    // (`background_maintenance` is off by default, so flush/compact run
+    // inline on `merge`'s own await), measured with `LsmEngine::flush_count`/
+    // `compaction_count` on a fixed writer-only rerun of this exact opts+N.
+    // Each of those ~538 syncs is a real, host-latency-bound disk op with no
+    // engine-side bound on how long it can take, so the wall-clock cost of
+    // this test scaled with real disk fsync latency rather than with
+    // anything the engine or the test controls — on a shared/throttled CI
+    // runner that is enough real syncs to occasionally blow the 60s budget
+    // (issue: CI run 34315785737, `scans_survive_concurrent_compaction`
+    // timed out at the 60s bound with 4/5 sibling tests in the same binary
+    // passing, one other test compressed into the low tens of seconds).
+    // That failure's "background task failed" panic was confirmed to be
+    // teardown aftermath, not an earlier real error: it's `tokio::fs`'s own
+    // `asyncify` JoinError text, surfaced only because the timeout fired
+    // first and the `#[tokio::test]` runtime's drop then tore down a
+    // scanner's in-flight blocking-pool read — not evidence of an engine
+    // liveness bug. These thresholds are ~8x/~4x this file's original tiny
+    // ones — the same magnitude the sibling flush/compaction races below use
+    // (`flush_threshold_bytes: 1024`/`2048`) — which cuts the same
+    // measurement to 43 flushes + 29 compactions (~72 syncs, ~7.5x fewer)
+    // while still keeping flush/compaction "continuous" under 3 concurrently
+    // tight-looping scanners: the race this test exists to prove needs many
+    // compactions racing scans, not several hundred.
     let opts = LsmOptions {
-        flush_threshold_bytes: 256,
+        flush_threshold_bytes: 2048,
         compaction_trigger: 2,
-        target_table_bytes: 1024,
+        target_table_bytes: 4096,
         ..LsmOptions::default()
     };
     let lsm = LsmEngine::open_with(env, "db-", opts)
