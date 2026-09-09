@@ -6768,13 +6768,19 @@ layer above `dispatch_item_op` and could never reach it otherwise) plus
 `SimCluster::drive_stream_seal`/an unconditional per-node janitor spawn
 (C-07 PRs 2/3/5 — `sim_cluster_dynamo_streams.rs`,
 `sim_cluster_stream_janitor.rs`). `crates/animusd/tests/dynamo_
-streams.rs` (2 of 15 tests) and `tests/stream_janitor.rs` (2 of 11 tests)
-stay in the `tests/*.rs` tree **deliberately, trimmed rather than
-deleted whole** — each remaining test needs a genuine `ProdEnv` property
-(real-WAL restart durability, the real periodic seal timer's own race,
-the production port guard, a real control-only/data-only role split) —
-per the same "keep the real-socket residual, don't force-convert or
-delete it" call this file's Transact/PartiQL paragraph above already
+streams.rs` (2 of 15 tests) and `tests/stream_janitor.rs` (**1** of 11
+tests — the second of the file's original two kept tests, needing a
+genuine control-only/data-only process split, converted by ADR 0061 rung
+L, C-12 PR 4d once `SimCluster` gained per-node `NodeRole` — see this
+file's own C-12 PR 4d appendix) stay in the `tests/*.rs` tree
+**deliberately, trimmed rather than deleted whole** — each remaining
+test needs a genuine `ProdEnv` property (real-WAL restart durability, the
+real periodic seal timer's own race, the production port guard, or — for
+`stream_janitor.rs`'s own sole remaining test — a genuinely dead replica
+node, a fault no `SimCluster` fixture can express since its shared
+segment store has no per-node replica concept at all) — per the same
+"keep the real-socket residual, don't force-convert or delete it" call
+this file's Transact/PartiQL paragraph above already
 made. `stream_backfill_seed_filter.rs` (2 tests) and `console_stream.rs`
 (4 tests) were never this rung's to claim and are unaffected, filed under
 "index DDL beyond plain `CreateTable`" and admin/console/dashboard HTTP
@@ -10135,3 +10141,113 @@ appendix is the crate-local pointer. **No ADR/roadmap edits were made by
 this PR** — both files' rung-L disposition tables still name the stale
 "no node-role concept" reason for these four tests; a future doc-only PR
 should reconcile them with this appendix.
+
+## Appendix — stream_janitor.rs's role-named test converted to SimCluster (ADR 0061 rung L, C-12 PR 4d, 2026-09-09)
+
+Closes the fourth conversion PR of C-12 (rung L): `tests/stream_
+janitor.rs`'s last remaining role-named test,
+`segment_janitor_reclaims_objects_from_a_genuinely_control_only_leader`
+(kept `ProdEnv` by C-07 PR 5, back when `SimCluster` had no per-node role
+concept at all — see that section's own "Stays `ProdEnv`" entry above),
+now converts too, once PR 2/3 of this rung gave `SimCluster` per-node
+`NodeRole` (`new_with_roles`/`new_with_roles_and_segment_janitor_
+retention`, control-prefixed roles, role-aware `restart`/`crash`,
+`role_of`). The file's OTHER kept test,
+`repair_re_replicates_to_a_fresh_target_after_a_replica_node_dies`,
+is **not** role-relevant — it needs a genuinely dead replica NODE (a
+fault this fixture's own shared `SimSegmentStore`, wrapped in
+`SegmentStoreHandle::S3`, cannot model at all, since that store has no
+per-node replica concept whatsoever — the identical gap a combined-node
+`SimCluster` already has) — so it stays `ProdEnv`, unaffected by this
+rung's own role work.
+
+**Classification (D3 discipline)**:
+
+| Original test | A/B | Disposition |
+|---|---|---|
+| `segment_janitor_reclaims_objects_from_a_genuinely_control_only_leader` | A | Converted → `crates/animusd/src/sim_cluster_stream_janitor.rs::segment_janitor_reclaims_objects_from_a_genuinely_control_only_leader` (a genuine pure control-only/data-only split — `[Control, Control, Control, Data, Data]` via `SimCluster::new_with_roles_and_segment_janitor_retention`, no combined-mode node anywhere) |
+| `repair_re_replicates_to_a_fresh_target_after_a_replica_node_dies` | B | **KEPT** whole — needs a genuinely dead replica node; this fixture's shared `S3`-backed segment store has no per-node replica concept at all (`row.replicas` is always empty), independent of role support |
+
+**No fixture or production bug found.** Unlike `sim_cluster_control_
+only.rs`'s own mixed-cluster scenarios — which need `ensure_control_only_
+leads`'s bounded crash/heal loop to *force* a control-only node into the
+control-leader seat, since a mixed cluster also has combined-node
+candidates — this scenario's own cluster has **no** combined node at all
+(`[Control, Control, Control, Data, Data]`, mirroring the real test's own
+"3 control-only + 2 data-only, no combined-mode node anywhere" topology
+verbatim), so whichever node the control group happens to elect already
+proves the property under test with no forcing machinery needed. The new
+scenario passed at its pinned seed and every `_over_seeds` seed on the
+very first run — `segment_janitor_loop` was already spawned
+unconditionally on every control-bearing node by C-12 PR 2/3's own
+`has_control()` gate (`sim_cluster.rs`), so nothing about the janitor's
+own reclaim logic needed touching; this PR is pure test-fixture authorship
+on an already-correct production path.
+
+**One deliberate translation, not a gap**: the real test's own `row.
+replicas`/`data_ids` assertions (the stream-shard catalog row's own
+per-node replica list, confirmed to name only data-only nodes) have no
+sim analog — this fixture's shared `S3` store carries no per-node replica
+list on that row at all (the identical fact `two_phase_expiry_removes_
+the_row_and_every_replicas_object`'s own doc already establishes). The
+sim-observable substitute is the TABLET's own placement replicas
+(`Metadata::tablets[tablet].replicas`), asserted `len() == 2` and every
+one a `NodeRole::Data` node via `role_of` — proving the identical
+underlying fact (only data-only nodes are ever placement candidates,
+since a control-only node never claims `Metadata::members`) through a
+different, but equally real, replicated-state field. The real test's own
+per-data-node on-disk existence checks (`segment_path(node_dir, ..)`)
+have the same "sim-observable equivalent" substitute every other
+scenario in this module already uses: `SimCluster::segment_store().
+stored_ids()` against the shared store, both before expiry (object
+present) and after reclaim (object gone).
+
+**Real-socket counts before/after this PR**: `stream_janitor.rs`: 2 → 1
+(the file's other test, `repair_re_replicates_to_a_fresh_target_after_a_
+replica_node_dies`, stays whole, unrelated to role support).
+
+**Baseline vs. new sim counts**: `cargo test -p animusd --lib sim_
+cluster_stream_janitor -- --test-threads=2` was 18 passed / 0 failed
+before this PR (C-07 PR 5's own closing figure); this PR adds 2 tests
+(the pinned-seed scenario + its `_over_seeds` sibling), both passing —
+20 passed / 0 failed after. The whole `sim_cluster` tier, split into four
+module-filter-grouped `cargo test -p animusd --lib -- --test-threads=2
+<filters..>` runs (the identical discipline PR 4c's own appendix
+established) to stay under the 10-minute-per-call budget: 216
+passed/1 ignored/438.40s; 45 passed/1 ignored/94.70s; 175 passed/0
+ignored/262.46s; 107 passed/0 ignored/368.18s — **543 passed, 0 failed,
+2 ignored total** (541 PR 4c baseline + this PR's 2 new tests, matching
+exactly), ~1163s test-time summed across the four calls.
+
+**No production code changed apart from the one crate-doc update in this
+file** (the `stream_janitor.rs`/C-07 entry's residual-count line, updated
+from "2 of 11" to "1 of 11") — no `lib.rs` mod-declaration line was
+needed (the new scenario extends the already-declared `sim_cluster_
+stream_janitor` module directly, per this PR's own instruction to prefer
+that over a new module), and no new `SimCluster` accessor was added;
+every primitive this scenario uses (`new_with_roles_and_segment_janitor_
+retention`, `role_of`, `control_voters`, `drive_stream_seal`,
+`segment_store`, plus the module's own pre-existing `create_streamed_
+table`/`put_item`/`first_sealed`/`leader_of_table`/`poll_run_for`
+helpers) already existed from earlier C-07/C-12 PRs.
+
+**Gates, in the required order, all foreground**: `cargo test -p animusd
+--test stream_janitor` on the untrimmed file (2 passed, 3.30s, baseline);
+`cargo check -p animusd --all-targets` (clean — checkpoint commit/push
+before the gates below); `cargo test -p animusd --lib sim_cluster_
+stream_janitor -- --test-threads=2` (20 passed, 0 failed, 24.27s — the 18
+baseline plus this PR's 2 new tests, both passing on the very first run);
+`cargo test -p animusd --test stream_janitor` on the trimmed file (1
+passed, 1.98s); `cargo fmt --all --check` (one pass needed — a stray
+trailing blank line the trim left in `tests/stream_janitor.rs`, applied
+via `cargo fmt --all`, then clean); `cargo clippy -p animusd --all-targets
+--all-features -- -D warnings` (clean, no fix needed); `cargo build -p
+animusd --all-targets` (clean); the full `sim_cluster` tier, split into
+four filter-grouped calls as described above (543 passed, 0 failed, 2
+ignored total). `Cargo.lock` unchanged (confirmed via `git diff` — no
+dependency touched).
+
+See `docs/adr/0061-testability-node-crate-simulator.md`'s rung L
+amendment and `docs/roadmap.md`'s C-12 entry for the closing record; this
+appendix is the crate-local pointer. No ADR/roadmap edits were made by
+this PR, per its own scope.

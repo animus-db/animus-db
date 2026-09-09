@@ -155,25 +155,58 @@
 //!   setup relies on a periodic seal loop this fixture doesn't run at
 //!   all — see [`grow_and_await_cutover`]'s own doc).
 //!
-//! **Stays `ProdEnv`, per this rung's own scope** (see `tests/stream_
-//! janitor.rs`'s own trimmed doc for the authoritative list/reasons):
-//! [`repair_re_replicates_to_a_fresh_target_after_a_replica_node_dies`]
-//! (the shared `SimSegmentStore` this fixture wraps in `SegmentStoreHandle::
+//! # PR 4d: role split (ADR 0061 rung L, C-12 PR 4d)
+//!
+//! `SimCluster` gained per-node [`NodeRole`] in C-12 PR 2/3 (`new_with_
+//! roles`/`new_with_roles_and_segment_janitor_retention`, control-prefixed
+//! roles, role-aware `restart`/`crash`, [`SimCluster::role_of`]) — this
+//! closes the one remaining C-07 PR 5 residual that was blocked purely on
+//! role support, not on anything genuinely `ProdEnv`-only:
+//!
+//! - [`segment_janitor_reclaims_objects_from_a_genuinely_control_only_
+//!   leader`] — a real **pure split** deployment (3 control-only + 2
+//!   data-only nodes, no combined-mode node anywhere — the exact shape the
+//!   real-socket file's own doc called "the whole point of W-10"), built
+//!   directly via [`SimCluster::new_with_roles_and_segment_janitor_
+//!   retention`]. Since every control voter in a topology like this is
+//!   unconditionally control-only by construction, this needs none of
+//!   `sim_cluster_control_only.rs`'s own bounded crash/heal machinery
+//!   (`ensure_control_only_leads`) to *force* a control-only node into the
+//!   leader seat — whichever node currently leads the control group here
+//!   already proves the property under test. Mirrors the real test's own
+//!   operation sequence (create a streamed table from a data-only node,
+//!   two writes each sealed before the next) and invariants (the tablet's
+//!   own placement replicas confirmed data-only-only — the sim-observable
+//!   form of the real test's own `row.replicas` assertion, which the
+//!   segment-shard row itself can't carry here, see below — and the
+//!   two-phase retention reclaim converging on every node's own catalog
+//!   and the shared store alike). Uses [`segment_janitor.rs`]'s existing
+//!   `create_streamed_table`/`put_item`/`first_sealed`/`leader_of_table`/
+//!   `poll_run_for` helpers unchanged, per this crate's own "small
+//!   fixtures duplicated per test module" convention turned inside out —
+//!   these already lived in this very module, so the new scenario just
+//!   reuses them directly rather than duplicating anything.
+//!
+//! **Still stays `ProdEnv`** (see `tests/stream_janitor.rs`'s own trimmed
+//! doc for the authoritative reason):
+//! [`repair_re_replicates_to_a_fresh_target_after_a_replica_node_dies`] —
+//! the shared `SimSegmentStore` this fixture wraps in `SegmentStoreHandle::
 //! S3` has no per-node replica concept at all — `row.replicas` is always
 //! empty, so phase 2's replica-repair loop, which explicitly `continue`s
 //! on an empty `replicas` list, never even runs; there is no honest way to
 //! model "one specific replica lost its copy" over a store every node
-//! already reads the identical bucket through) and `segment_janitor_
-//! reclaims_objects_from_a_genuinely_control_only_leader` (needs a genuine
-//! control-only/data-only role split — `BoundControlNode`/`BoundDataNode`
-//! — which `SimCluster` has no analogue of at all).
+//! already reads the identical bucket through. This is unrelated to role
+//! support — a combined-node `SimCluster` has the identical gap, so C-12
+//! PR 4d's own role work does not change this test's disposition at all.
 
 use std::time::Duration;
 
 use animus_control::Metadata;
+use animus_env::nid;
 use animus_tablet::TabletId;
 
 use super::sim_cluster::SimCluster;
+use crate::config::NodeRole;
 
 fn env_seed(default: u64) -> u64 {
     std::env::var("ANIMUS_SEED")
@@ -1126,5 +1159,196 @@ fn retired_parents_final_shard_expires_by_retention() {
 fn retired_parents_final_shard_expires_by_retention_over_seeds() {
     for i in 0..5 {
         run_retired_parents_final_shard_expires_by_retention(0x5E64_9100 + i);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PR 4d: role split (ADR 0061 rung L, C-12 PR 4d) — a genuinely control-only
+// leader over a real pure control-only/data-only split deployment
+// ---------------------------------------------------------------------------
+
+/// The real-socket file's own last remaining role-named scenario,
+/// `segment_janitor_reclaims_objects_from_a_genuinely_control_only_leader`
+/// — now sim-drivable since `SimCluster` gained per-node [`NodeRole`] (ADR
+/// 0061 rung L, C-12 PR 2/3). A genuine **pure split** deployment (3
+/// control-only + 2 data-only nodes, no combined-mode node anywhere — the
+/// real test's own "whole point of W-10"): every control voter here is
+/// unconditionally control-only by construction, so — unlike
+/// `sim_cluster_control_only.rs`'s own mixed-cluster scenarios, which need
+/// a bounded crash/heal loop to *force* a control-only node into the
+/// leader seat — whichever node currently leads the control group in THIS
+/// topology already proves the property under test with no extra
+/// machinery.
+///
+/// Mirrors the real test's own operation sequence and invariants:
+/// `CreateTable` issued from a data-only node (mirroring the real test's
+/// own `data_nodes[0].dynamo_addr()` — a control-only node never binds a
+/// dynamo listener in production, though `dispatch_table_op` itself never
+/// touches `ctx.data()` either way, so this is about fidelity, not a
+/// structural requirement here), two writes each sealed before the next
+/// (the janitor's own "never remove a tablet's own current max epoch"
+/// guard), the tablet's own placement replicas confirmed data-only-only
+/// (control-only nodes never claim `Metadata::members`, so they can never
+/// be a placement candidate — the sim-observable form of the real test's
+/// own `row.replicas`/`data_ids` assertions, which the STREAM SHARD row
+/// itself can't carry here since this fixture's shared `S3` store has no
+/// per-node replica concept at all, unlike the real test's own per-node
+/// `Cluster` store — see this module's own doc's "Still stays `ProdEnv`"
+/// section), the segment object confirmed present on the shared store
+/// before expiry (the sim-observable form of the real test's own
+/// per-data-node on-disk existence check), then past retention: the row
+/// gone from every node's own catalog and the object gone from the shared
+/// store — driven entirely by whichever control-only node currently
+/// leads.
+///
+/// `retention` (20s) mirrors [`run_two_phase_expiry_removes_the_row_and_
+/// every_replicas_object`]'s own choice and for the identical reason
+/// (this module's own "timing gotcha": comfortably clearing [`OP_BUDGET`]
+/// so the janitor's 200ms tick cannot mark-and-delete the just-sealed
+/// object during a call's own leftover budget before this function reads
+/// it back).
+fn run_segment_janitor_reclaims_objects_from_a_genuinely_control_only_leader(seed: u64) {
+    let retention = Duration::from_secs(20);
+    let roles = [
+        NodeRole::Control,
+        NodeRole::Control,
+        NodeRole::Control,
+        NodeRole::Data,
+        NodeRole::Data,
+    ];
+    let mut cluster =
+        SimCluster::new_with_roles_and_segment_janitor_retention(seed, &roles, 2, retention);
+    let table = "t";
+
+    // Every control voter really is control-only, and every other node is
+    // data-only — the structural precondition this scenario's own title
+    // depends on, checked directly rather than merely assumed from the
+    // `roles` array above.
+    let control_voters = cluster
+        .control_voters(0)
+        .unwrap_or_else(|| panic!("seed={seed}: node 0 has no local control voter view"));
+    for n in 0..3u64 {
+        assert_eq!(
+            cluster.role_of(n),
+            NodeRole::Control,
+            "seed={seed}: node {n} must be control-only"
+        );
+        assert!(
+            control_voters.contains(&nid(n)),
+            "seed={seed}: node {n} must be a control voter: {control_voters:?}"
+        );
+    }
+    for n in 3..5u64 {
+        assert_eq!(
+            cluster.role_of(n),
+            NodeRole::Data,
+            "seed={seed}: node {n} must be data-only"
+        );
+    }
+
+    // CreateTable issued from a data-only node.
+    let (status, body) = create_streamed_table(&mut cluster, 3, table);
+    assert_eq!(status, 200, "seed={seed}: CreateTable failed: {body}");
+    let leader = leader_of_table(&cluster, table);
+    assert!(
+        (3..5).contains(&leader),
+        "seed={seed}: the tablet's own data-plane leader must be a data-only node: {leader}"
+    );
+
+    // Two writes, each sealed before the next — see the identical
+    // happy-path scenario's own doc for why: the janitor's "never remove a
+    // tablet's own current max epoch" guard means epoch 0 only becomes
+    // reclaimable once a LATER epoch exists.
+    let (status, body) = put_item(&mut cluster, 3, table, "p1");
+    assert_eq!(status, 200, "seed={seed}: PutItem(p1) failed: {body}");
+    cluster.drive_stream_seal(leader);
+
+    let meta = cluster.metadata(0);
+    let (tablet, epoch) = first_sealed(&meta, table);
+    assert_eq!(
+        epoch, 0,
+        "seed={seed}: the first-sealed shard must be epoch 0"
+    );
+
+    // The tablet's own placement replicas — sim-observable stand-in for the
+    // real test's own `row.replicas`/`data_ids` assertions (this fixture's
+    // shared `S3` segment-shard store carries no per-node replica list at
+    // all, so that specific field can't be checked here — see this
+    // module's own doc).
+    let replicas = meta
+        .tablets
+        .get(&tablet)
+        .unwrap_or_else(|| panic!("seed={seed}: tablet {} missing from Metadata", tablet.0))
+        .replicas
+        .clone();
+    assert_eq!(
+        replicas.len(),
+        2,
+        "seed={seed}: K = min(replication, data-only candidates) — only the 2 data-only \
+         nodes are placement candidates (a control-only node never claims `Metadata::\
+         members`, so it's never chosen as a replica target itself): {replicas:?}"
+    );
+    for id in &replicas {
+        let idx = (0..cluster.node_count() as u64)
+            .find(|&n| &nid(n) == id)
+            .unwrap_or_else(|| panic!("seed={seed}: replica {id} is not a known node id"));
+        assert_eq!(
+            cluster.role_of(idx),
+            NodeRole::Data,
+            "seed={seed}: every recorded replica must be a data-only node, never a \
+             control-only one: {replicas:?}"
+        );
+    }
+
+    // Confirm the object genuinely landed on the shared store before
+    // asserting it's later gone — the sim-observable form of the real
+    // test's own per-data-node on-disk existence check.
+    let row = meta.stream_shards[&(tablet, epoch)].clone();
+    let stored = cluster.segment_store().stored_ids();
+    assert!(
+        stored.contains(&row.object_id),
+        "seed={seed}: the segment object must exist before expiry: {stored:?}"
+    );
+
+    let (status, body) = put_item(&mut cluster, 3, table, "p2");
+    assert_eq!(status, 200, "seed={seed}: PutItem(p2) failed: {body}");
+    cluster.drive_stream_seal(leader);
+
+    // Past retention: the row is removed from every node's own catalog —
+    // control AND data alike — driven entirely by whichever control-only
+    // node currently leads.
+    let nodes: Vec<u64> = (0..cluster.node_count() as u64).collect();
+    poll_run_for(
+        &mut cluster,
+        Duration::from_secs(60),
+        "row was never removed from every node's catalog",
+        |c| {
+            nodes
+                .iter()
+                .all(|&n| !c.metadata(n).stream_shards.contains_key(&(tablet, epoch)))
+        },
+    );
+
+    // ...and its object is genuinely gone from the shared store — the
+    // physical reclaim step (phase 1b) that a control-only leader used to
+    // skip entirely, before W-10.
+    let stored = cluster.segment_store().stored_ids();
+    assert!(
+        !stored.contains(&row.object_id),
+        "seed={seed}: the segment object must be reclaimed: {stored:?}"
+    );
+}
+
+#[test]
+fn segment_janitor_reclaims_objects_from_a_genuinely_control_only_leader() {
+    run_segment_janitor_reclaims_objects_from_a_genuinely_control_only_leader(env_seed(
+        0x5E64_A001,
+    ));
+}
+
+#[test]
+fn segment_janitor_reclaims_objects_from_a_genuinely_control_only_leader_over_seeds() {
+    for i in 0..5 {
+        run_segment_janitor_reclaims_objects_from_a_genuinely_control_only_leader(0x5E64_A100 + i);
     }
 }
