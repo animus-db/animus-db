@@ -448,20 +448,54 @@ async fn ephemeral_identity_restart_gets_a_new_id_old_left_down_and_prunable() {
     // 4. The old id's member entry lingers — the unmodified ADR 0012
     // heartbeat/failure-detector chain marks it `Down` once its heartbeats
     // stop (no new mechanism needed for this).
+    //
+    // Poll and act through the SAME node (whichever currently leads the
+    // control group) — never an arbitrary one (issue #819). `Metadata` is
+    // `DRIVER_APPLIED` (ADR 0038, `RaftNode::metadata`'s own doc,
+    // `crates/animus-control/src/node.rs`): each node's own async apply
+    // task publishes its cache independently, with no guarantee every
+    // node — the current leader included — catches up to a given
+    // committed transition at the same wall-clock moment. `member_status`
+    // resolves to whichever core node is first in `core_nodes` that has an
+    // entry for `old_id` (in practice `core_nodes[0]`, since every core
+    // node registers one early on), which is not necessarily the leader
+    // `admin_remove_member` (`crates/animusd/src/lib.rs`) will actually
+    // gate its "not drained" check against — that call reads
+    // `self.control.metadata_cached()` on whichever node *receives* the
+    // request, i.e. its own, possibly-lagging, apply-task cache. Polling
+    // an unrelated node for `Down` and then issuing the removal against
+    // "whichever node believes itself leader right now" races that
+    // per-node apply skew: `core_nodes[0]` can observe `Down` first while
+    // the actual leader's own applied cache is still one commit behind,
+    // still reporting `Active` — the flaky `409 "is not drained: status is
+    // Active"`. Fixed by polling the leader's own view before ever calling
+    // into it, per the standing "poll the node you're about to act
+    // through, not the node that made the earlier state change" rule
+    // (root `CLAUDE.md`'s engineering-lessons log).
+    let leader_idx = leader_index(&core_nodes);
+    let leader_admin = core_admin[leader_idx];
     timeout(Duration::from_secs(20), async {
         loop {
-            if member_status(&core_nodes, &old_id) == Some(NodeStatus::Down) {
+            if core_nodes[leader_idx]
+                .metadata()
+                .members
+                .get(&old_id)
+                .map(|m| m.status)
+                == Some(NodeStatus::Down)
+            {
                 return;
             }
             sleep(Duration::from_millis(100)).await;
         }
     })
     .await
-    .unwrap_or_else(|_| panic!("old allocated id {old_id} never settled to Down"));
+    .unwrap_or_else(|_| {
+        panic!("old allocated id {old_id} never settled to Down on the leader ({leader_idx}) it will be removed through")
+    });
 
     // 5. Prunable via the existing decommission primitive — no new cleanup
-    // mechanism was added for this ADR.
-    let leader_admin = core_admin[leader_index(&core_nodes)];
+    // mechanism was added for this ADR. Removed through the SAME leader
+    // node the poll above just confirmed `Down` on.
     let body = serde_json::json!({"node": old_id.to_string()}).to_string();
     let (status, resp) = admin(leader_admin, "POST", "/admin/member/remove", Some(&body)).await;
     assert_eq!(status, 200, "member/remove failed: {resp}");

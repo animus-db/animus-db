@@ -2222,24 +2222,53 @@ regardless of whose entry occupies the index). See
 `animus-cp-data/tests/kind_batch_outcome_identity.rs` for the seed-
 reproducible truncation regression that proves it end to end.
 
-**`cp_kind_eval_local`'s own confirm loop polls with the same exponential
-back-off (`CP_CONFIRM_POLL_INIT`/`CP_CONFIRM_POLL_MAX`) `cp_batch_local`/
-`cp_put_local`/`cp_delete_local` use, not the flat `SCHEMA_POLL_INTERVAL`
-(50ms) it regressed to with ADR 0054 step 3 (2026-09-05, fixed 2026-09-08).** This is
-THE confirm loop for every single-item write since ADR 0054 step 3
-(`PutItem`/`UpdateItem`/`DeleteItem`, the TTL reaper, the admin seeder's
-per-item images arm) — a flat 50ms poll floor there caps sequential
-single-item write throughput at ~20 ops/s regardless of how fast the
-underlying Raft group actually commits, since the first poll right after
-`propose_kind_eval` is almost always `Inconclusive`. Regression test:
-`write_path::kind_eval_confirm_backoff_tests`, a virtual-time `SimEnv`
-bound (never wall-clock, so the assertion can't flake) proving 20
-sequential writes finish in well under the old flat-floor total. See
-`docs/engineering-lessons.md`'s matching 2026-09-08 entry for the
-copy-the-wrong-sibling root cause, and its very next entry for a *second*,
-latent bug this same fix exposed (a fixture's `quiesce_after` shorter than
-`auto_split_loop`'s own sweep period) — a caution for anyone else speeding
-up a write-confirm path here.
+**Every confirm loop in `write_path.rs` — `cp_kind_eval_local`,
+`cp_kind_raw_local`, `cp_put_local`/`cp_delete_local`, and `poll_probe`'s
+own `Inconclusive` tail — shares one wake-on-apply wait,
+`write_path::wait_applied_past`.** It parks on the hosting tablet group's
+`AppliedWatch` (`animus-cp-data`, a multi-waiter watch mirroring
+`animus-control`'s `MetadataWatch`, ADR 0031, bumped at every site the
+apply task's own `engine_applied` watermark advances) instead of sleeping
+on any fixed interval, so a write whose entry commits+applies in a few ms
+returns as soon as that happens rather than rounding up to a poll
+checkpoint. **This replaced two earlier fixed-interval schemes in
+sequence**: a flat `SCHEMA_POLL_INTERVAL` (50ms) — `cp_kind_eval_local`
+regressed onto it with ADR 0054 step 3 (2026-09-05, fixed 2026-09-08) —
+and, before that fix's own successor, an exponential back-off
+(`CP_CONFIRM_POLL_INIT` 200µs doubling to `CP_CONFIRM_POLL_MAX` 5ms) every
+loop here shared; that scheme was correct but still rounded every write up
+to its own next doubling checkpoint (0.2/0.6/1.4/3.0/6.2ms), an average
+half-a-step overshoot on top of real apply latency — wake-on-apply removes
+the rounding entirely. `wait_applied_past` itself is bounded only by a
+forced `CP_CONFIRM_POLL_MAX`-interval re-check, so a caller's own
+`confirm_wait_is_futile`/deadline logic — which the helper never evaluates
+itself — keeps firing on schedule even when the awaited index never
+applies at all (a lost leadership). This is THE confirm loop for every
+single-item write since ADR 0054 step 3 (`PutItem`/`UpdateItem`/
+`DeleteItem`, the TTL reaper, `BatchWriteItem`'s own per-item images arm
+— which the admin seeder rides unchanged since ADR 0021's 2026-09-09
+amendment, no longer having a per-item arm of its own) — a fixed poll
+floor of any size caps sequential single-item write throughput
+at however many of it fit in a second, regardless of how fast the
+underlying Raft group actually commits, since the first check right after
+`propose_kind_eval` is almost always `Inconclusive`. Regression tests:
+`write_path::kind_eval_confirm_wake_tests` (a virtual-time `SimEnv` bound,
+never wall-clock, proving 20 sequential writes finish with **0ns** of
+measured virtual time — see the module's own doc for the by-hand
+before/after measurement) and `write_path::
+wait_applied_past_futility_tests` (a three-voter `SimEnv` cluster proving
+the forced re-check actually fires: an entry accepted-then-superseded by a
+genuine leadership change, engineered with `Simulator::partition`/`heal`
+rather than `transfer_leadership` — an armed transfer only freezes new
+proposes, it does not stop an already-accepted entry from committing on a
+healthy zero-latency link, so it never reproduced the never-applies
+scenario this test needs). See `docs/engineering-lessons.md`'s matching
+2026-09-08 entry for the copy-the-wrong-sibling root cause behind the
+flat-poll regression, its very next entry for a *second*, latent bug that
+same fix exposed (a fixture's `quiesce_after` shorter than
+`auto_split_loop`'s own sweep period), and the later entry on the
+exponential-poll-to-wake-on-apply follow-up itself — a caution for anyone
+else speeding up a write-confirm path here.
 
 **`poll_probe`'s value-equality fallback is idempotency-gated (issue #469).**
 When `classify_kind_batch_outcome` is `Inconclusive` (not yet applied, aged
@@ -5618,8 +5647,9 @@ AnimusdRelayClient>` and so cannot be called with a `SimEnv` context at all
 — they simply never needed a second type parameter before this rung, and
 genericizing them is not needed to prove this rung's claim (see "Not yet
 generic" below). Driving `cp_kind_write_raw` exercises the real
-route → propose → confirm loop, including the exponential confirm-poll
-backoff (`CP_CONFIRM_POLL_INIT`/`_MAX`); `cp_get` exercises the real
+route → propose → confirm loop, including the wake-on-apply confirm wait
+(`write_path::wait_applied_past`, `CP_CONFIRM_POLL_MAX`'s forced-recheck
+cap — see the confirm-loop entry above); `cp_get` exercises the real
 route → local-resolve loop. Both are spawned onto `ctx.env` and driven with
 `Simulator::run_for` (never `block_on` — see the gotcha below), following
 the corpus's converged-or-timeout idiom rather than a fixed-deadline assert.

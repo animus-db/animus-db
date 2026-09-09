@@ -34,6 +34,7 @@ use std::time::Duration;
 
 use animus_env::MaybeTlsStream;
 use animusd::{ClientRequest, ClientResponse, read_frame, write_frame};
+use futures::StreamExt;
 use rustls_pki_types::pem::PemObject;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -62,7 +63,7 @@ async fn main() -> ExitCode {
         Err(msg) => {
             eprintln!("animus: {msg}");
             eprintln!(
-                "\nusage:\n  animus [--tls-ca PATH] status <node-addr>\n  animus [--tls-ca PATH] put <node-addr> <table> <key> <value>\n  animus [--tls-ca PATH] get <node-addr> <table> <key>\n  animus [--tls-ca PATH] get-eventual <node-addr> <table> <key>\n{ADMIN_USAGE}"
+                "\nusage:\n  animus [--tls-ca PATH] status <node-addr>\n  animus [--tls-ca PATH] put <node-addr> <table> <key> <value>\n  animus [--tls-ca PATH] get <node-addr> <table> <key>\n  animus [--tls-ca PATH] get-eventual <node-addr> <table> <key>\n{SEED_USAGE}\n{ADMIN_USAGE}"
             );
             ExitCode::FAILURE
         }
@@ -147,6 +148,9 @@ async fn maybe_tls_connect(
     }
 }
 
+const SEED_USAGE: &str = "  seed <admin-addr> <table> <count> [--start N] [--key-prefix P] \
+    [--value-bytes B] [--concurrency C] [--batch N]";
+
 const ADMIN_USAGE: &str = "  admin <subcommand> <admin-addr> [args]:\n    \
     config|status|raft|raftkv|metrics|health <admin-addr>\n    \
     peers|txns|backups|restores|backup-store|ttl-reaper|gc|segment-store|control-members|storage-control <admin-addr>\n    \
@@ -191,6 +195,18 @@ async fn run(args: &[String], tls: Option<&tokio_rustls::TlsConnector>) -> Resul
     let cmd = args.first().map(String::as_str).ok_or("missing command")?;
     if cmd == "admin" {
         return run_admin(&args[1..], tls).await;
+    }
+    // `seed` is client-side bulk loading over the real `BatchWriteItem` wire
+    // operation (ADR 0021 amendment: seeding is a client concern, not a
+    // server use case) — multi-step orchestration (chunking, bounded
+    // concurrency, `UnprocessedItems` retry), so it's dispatched here
+    // alongside `decommission`/`control-add` rather than through the
+    // generic one-shot admin dispatch below. It talks the admin HTTP proxy
+    // (`POST /admin/data/dynamo`, ADR 0021), not the plain client protocol,
+    // so its first positional argument is an **admin** address like every
+    // `admin` subcommand, not a client address like `put`/`get`.
+    if cmd == "seed" {
+        return run_seed(&args[1..], tls).await;
     }
     let addr = args.get(1).ok_or("missing <node-addr>")?;
 
@@ -237,6 +253,442 @@ async fn run(args: &[String], tls: Option<&tokio_rustls::TlsConnector>) -> Resul
         return Err("operation failed".into());
     }
     Ok(())
+}
+
+// ---- seed: client-side bulk loading (ADR 0021 amendment) -----------------
+//
+// Seeding synthetic rows used to be a server-side admin action
+// (`POST /admin/data/seed`), generating items inside the node and writing
+// them through internal primitives that had to re-derive `PutItem`'s exact
+// key/value byte shapes (a drift hazard) and had no `UnprocessedItems` to
+// echo a throttled row through. The maintainer decided seeding is a client
+// concern: this command generates the same item shape client-side and
+// writes it through the real `BatchWriteItem` wire operation — proxied
+// through `POST /admin/data/dynamo` (ADR 0021), since this CLI has no SigV4
+// client and never dials the DynamoDB port directly (see this crate's own
+// `CLAUDE.md`) — so it rides the one real write path, honours per-table
+// throttling (ADR 0065) via `UnprocessedItems` instead of silently dropping
+// rows, and can never drift from what a real client's `PutItem` would
+// store. `/admin/data/seed` itself becomes a thin server-side proxy over
+// the identical operation (see `animusd::admin::action_data_seed`).
+
+/// DynamoDB's own per-call cap on a `BatchWriteItem` request's items.
+const SEED_BATCH_WRITE_CAP: u64 = 25;
+/// Bounded whole-chunk retry attempts for a chunk's own `UnprocessedItems`
+/// (ADR 0065 throttling, or a transient tablet-split refusal) before giving
+/// up and reporting the remainder unwritten.
+const SEED_MAX_RETRY_ATTEMPTS: usize = 6;
+/// Backoff before a chunk's first retry; doubled (capped) each further
+/// attempt.
+const SEED_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(200);
+/// Ceiling on the doubling backoff between retry attempts.
+const SEED_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(5);
+
+/// A key attribute's DynamoDB scalar type, as declared in the table's
+/// `AttributeDefinitions` — mirrors `animusd::admin`'s own (now-deleted)
+/// `ColumnType` handling for a seeded key, but resolved from the wire
+/// `DescribeTable` response rather than the replicated catalog directly,
+/// since this CLI has no catalog access of its own.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SeedAttrType {
+    S,
+    N,
+    B,
+}
+
+impl SeedAttrType {
+    fn from_wire(s: &str) -> Self {
+        match s {
+            "N" => Self::N,
+            "B" => Self::B,
+            _ => Self::S,
+        }
+    }
+}
+
+/// The wire `AttributeValue` for a seeded key column, typed per the table's
+/// own declared `AttributeType` — mirrors `animusd::admin::seed_key_attr`'s
+/// (now-deleted) convention exactly, so a row seeded by this command reads
+/// back identically to one the old server-side seeder produced: `N` gets the
+/// bare zero-padded index text (a `key_prefix` would not be numeric), `B`
+/// gets the prefixed text's raw bytes (base64-encoded for the wire), and
+/// everything else (including `S`) gets the prefixed text.
+fn seed_attr_value(ty: SeedAttrType, prefix: &str, index_text: &str) -> serde_json::Value {
+    match ty {
+        SeedAttrType::N => serde_json::json!({"N": index_text}),
+        SeedAttrType::B => {
+            serde_json::json!({"B": base64_encode_standard(format!("{prefix}{index_text}").as_bytes())})
+        }
+        SeedAttrType::S => serde_json::json!({"S": format!("{prefix}{index_text}")}),
+    }
+}
+
+/// Build one seeded item's DynamoDB JSON (`{"attr": {"S": ..}, ..}`):
+/// partition key `key_prefix + zero-padded 12-digit index` (typed per
+/// `pk_ty`), the same index (no prefix) as the sort key when the table is
+/// composite, and a filler `payload` string attribute padded to `fill`
+/// bytes — the client-side twin of the deleted `admin.rs::action_data_seed`
+/// row shape.
+fn seed_item(
+    pk_name: &str,
+    pk_ty: SeedAttrType,
+    prefix: &str,
+    sort: Option<&(String, SeedAttrType)>,
+    index: u64,
+    fill: usize,
+) -> serde_json::Value {
+    let index_text = format!("{index:012}");
+    let mut item = serde_json::Map::new();
+    item.insert(
+        pk_name.to_string(),
+        seed_attr_value(pk_ty, prefix, &index_text),
+    );
+    if let Some((sk_name, sk_ty)) = sort {
+        item.insert(sk_name.clone(), seed_attr_value(*sk_ty, "", &index_text));
+    }
+    item.insert(
+        "payload".to_string(),
+        serde_json::json!({"S": "x".repeat(fill)}),
+    );
+    serde_json::Value::Object(item)
+}
+
+/// Parse `DescribeTable`'s response `Table` object into `(partition key
+/// name, type, optional (sort key name, type))`. A missing
+/// `AttributeDefinitions` entry for a key attribute (never happens for a
+/// real `DescribeTable` response, but tolerated defensively) defaults to
+/// `S`, matching `animus_dynamo::schema::column_type_for`'s own permissive
+/// default.
+/// `(partition key name, type, optional (sort key name, type))`.
+type SeedKeySchema = (String, SeedAttrType, Option<(String, SeedAttrType)>);
+
+fn parse_key_schema(table: &serde_json::Value) -> Result<SeedKeySchema, String> {
+    let key_schema = table
+        .get("KeySchema")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("DescribeTable response missing `KeySchema`")?;
+    let attr_defs = table
+        .get("AttributeDefinitions")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let type_of = |name: &str| -> SeedAttrType {
+        attr_defs
+            .iter()
+            .find(|d| d.get("AttributeName").and_then(serde_json::Value::as_str) == Some(name))
+            .and_then(|d| d.get("AttributeType"))
+            .and_then(serde_json::Value::as_str)
+            .map(SeedAttrType::from_wire)
+            .unwrap_or(SeedAttrType::S)
+    };
+    let mut pk: Option<String> = None;
+    let mut sk: Option<String> = None;
+    for entry in key_schema {
+        let name = entry
+            .get("AttributeName")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("KeySchema entry missing `AttributeName`")?
+            .to_string();
+        match entry.get("KeyType").and_then(serde_json::Value::as_str) {
+            Some("HASH") => pk = Some(name),
+            Some("RANGE") => sk = Some(name),
+            other => return Err(format!("KeySchema entry has unexpected KeyType {other:?}")),
+        }
+    }
+    let pk = pk.ok_or("KeySchema has no HASH (partition) key")?;
+    let pk_ty = type_of(&pk);
+    let sort = sk.map(|name| {
+        let ty = type_of(&name);
+        (name, ty)
+    });
+    Ok((pk, pk_ty, sort))
+}
+
+/// Split `count` rows starting at `start` into `(chunk_start, chunk_len)`
+/// pairs of at most `batch` rows each — pure so the boundary math (last
+/// chunk shorter, zero chunks for `count == 0`) is unit-testable without a
+/// socket.
+fn seed_chunk_bounds(start: u64, count: u64, batch: u64) -> Vec<(u64, u64)> {
+    let mut chunks = Vec::new();
+    let mut i = 0u64;
+    while i < count {
+        let len = batch.min(count - i);
+        chunks.push((start + i, len));
+        i += len;
+    }
+    chunks
+}
+
+/// The `POST /admin/data/dynamo` body for a `DescribeTable` call.
+fn describe_table_request_body(table: &str) -> String {
+    serde_json::json!({
+        "op": "DescribeTable",
+        "payload": {"TableName": table},
+    })
+    .to_string()
+}
+
+/// The `POST /admin/data/dynamo` body for a `BatchWriteItem` call writing
+/// `items` (each a full DynamoDB item) as `PutRequest`s against `table`.
+fn batch_write_request_body(table: &str, items: &[serde_json::Value]) -> String {
+    let requests: Vec<serde_json::Value> = items
+        .iter()
+        .map(|item| serde_json::json!({"PutRequest": {"Item": item}}))
+        .collect();
+    serde_json::json!({
+        "op": "BatchWriteItem",
+        "payload": {"RequestItems": {table: requests}},
+    })
+    .to_string()
+}
+
+/// Extract the `PutRequest.Item` values `BatchWriteItem`'s own
+/// `UnprocessedItems.<table>` array names for `table` — the rows a chunk
+/// needs to retry (ADR 0065 §6: a throttled or transiently-refused row is
+/// echoed here, never silently dropped).
+fn unprocessed_items(response: &serde_json::Value, table: &str) -> Vec<serde_json::Value> {
+    response
+        .get("UnprocessedItems")
+        .and_then(|v| v.get(table))
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|req| req.get("PutRequest")?.get("Item").cloned())
+        .collect()
+}
+
+/// Submit one `BatchWriteItem` chunk through the admin proxy, retrying its
+/// own `UnprocessedItems` with a bounded exponential backoff. Returns
+/// `(written, unprocessed, first_error)` — `unprocessed` is nonzero only
+/// once every retry attempt is exhausted.
+async fn submit_seed_chunk(
+    addr: &str,
+    table: &str,
+    mut items: Vec<serde_json::Value>,
+    tls: Option<&tokio_rustls::TlsConnector>,
+) -> (u64, u64, Option<String>) {
+    let total = items.len() as u64;
+    let mut backoff = SEED_RETRY_INITIAL_BACKOFF;
+    let mut last_error = None;
+    for attempt in 0..SEED_MAX_RETRY_ATTEMPTS {
+        if items.is_empty() {
+            return (total, 0, None);
+        }
+        if attempt > 0 {
+            sleep(backoff).await;
+            backoff = (backoff * 2).min(SEED_RETRY_MAX_BACKOFF);
+        }
+        let body = batch_write_request_body(table, &items);
+        match http_call(addr, "POST", "/admin/data/dynamo", Some(body), tls).await {
+            Ok((status, resp)) if (200..300).contains(&status) => {
+                let resp_json: serde_json::Value =
+                    serde_json::from_str(&resp).unwrap_or(serde_json::Value::Null);
+                let remaining = unprocessed_items(&resp_json, table);
+                if remaining.is_empty() {
+                    return (total, 0, None);
+                }
+                items = remaining;
+            }
+            Ok((status, resp)) => {
+                last_error = Some(format!("BatchWriteItem failed (HTTP {status}): {resp}"));
+            }
+            Err(e) => last_error = Some(e),
+        }
+    }
+    let remaining = items.len() as u64;
+    (total - remaining, remaining, last_error)
+}
+
+/// `seed <admin-addr> <table> <count> [--start N] [--key-prefix P]
+/// [--value-bytes B] [--concurrency C] [--batch N]` — bulk-write synthetic
+/// DynamoDB items into an **existing** table via real `BatchWriteItem`
+/// calls proxied through `POST /admin/data/dynamo` (ADR 0021 amendment).
+/// `DescribeTable` first learns the key schema; up to `concurrency`
+/// `<= SEED_BATCH_WRITE_CAP`-sized batches are then issued concurrently,
+/// each retrying its own `UnprocessedItems` with a bounded backoff.
+async fn run_seed(args: &[String], tls: Option<&tokio_rustls::TlsConnector>) -> Result<(), String> {
+    let addr = args.first().ok_or("seed needs <admin-addr>")?.clone();
+    let table = args.get(1).ok_or("seed needs <table>")?.clone();
+    let count: u64 = args
+        .get(2)
+        .ok_or("seed needs <count>")?
+        .parse()
+        .map_err(|_| "seed <count> must be a non-negative integer".to_string())?;
+    let start: u64 = flag_value(args, "--start")
+        .map(|s| {
+            s.parse::<u64>()
+                .map_err(|_| "seed --start must be a non-negative integer".to_string())
+        })
+        .transpose()?
+        .unwrap_or(0);
+    let key_prefix = flag_value(args, "--key-prefix")
+        .unwrap_or("seed:")
+        .to_string();
+    let value_bytes: usize = flag_value(args, "--value-bytes")
+        .map(|s| {
+            s.parse::<usize>()
+                .map_err(|_| "seed --value-bytes must be a non-negative integer".to_string())
+        })
+        .transpose()?
+        .unwrap_or(64);
+    let concurrency: usize = flag_value(args, "--concurrency")
+        .map(|s| {
+            s.parse::<usize>()
+                .map_err(|_| "seed --concurrency must be a positive integer".to_string())
+        })
+        .transpose()?
+        .unwrap_or(8)
+        .max(1);
+    let batch: u64 = flag_value(args, "--batch")
+        .map(|s| {
+            s.parse::<u64>()
+                .map_err(|_| "seed --batch must be a positive integer".to_string())
+        })
+        .transpose()?
+        .unwrap_or(SEED_BATCH_WRITE_CAP)
+        .clamp(1, SEED_BATCH_WRITE_CAP);
+
+    let describe_body = describe_table_request_body(&table);
+    let (status, resp) = http_call(
+        &addr,
+        "POST",
+        "/admin/data/dynamo",
+        Some(describe_body),
+        tls,
+    )
+    .await?;
+    if !(200..300).contains(&status) {
+        return Err(format!(
+            "DescribeTable for `{table}` failed (HTTP {status}): {resp}"
+        ));
+    }
+    let resp_json: serde_json::Value = serde_json::from_str(&resp)
+        .map_err(|e| format!("malformed DescribeTable response: {e}"))?;
+    let table_desc = resp_json
+        .get("Table")
+        .ok_or("DescribeTable response missing `Table`")?;
+    let (pk_name, pk_ty, sort) = parse_key_schema(table_desc)?;
+
+    // Every seeded row's fixed-width index makes one probe (fill = 0) enough
+    // to measure the unpadded envelope; `fill` derives the padding that
+    // lands the item at ~`value_bytes` (floored at the unpadded item).
+    let probe = seed_item(&pk_name, pk_ty, &key_prefix, sort.as_ref(), start, 0);
+    let envelope = serde_json::to_string(&probe).unwrap_or_default().len();
+    let fill = value_bytes.saturating_sub(envelope);
+
+    let started = std::time::Instant::now();
+    let written = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let unprocessed_total = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let first_error: std::sync::Arc<std::sync::Mutex<Option<String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+
+    let chunks = seed_chunk_bounds(start, count, batch);
+    let total_chunks = chunks.len();
+    futures::stream::iter(chunks.into_iter().enumerate().map(
+        |(chunk_index, (chunk_start, chunk_len))| {
+            let addr = &addr;
+            let table = &table;
+            let pk_name = &pk_name;
+            let key_prefix = &key_prefix;
+            let sort = &sort;
+            let written = written.clone();
+            let unprocessed_total = unprocessed_total.clone();
+            let first_error = first_error.clone();
+            async move {
+                let items: Vec<serde_json::Value> = (0..chunk_len)
+                    .map(|j| {
+                        seed_item(
+                            pk_name,
+                            pk_ty,
+                            key_prefix,
+                            sort.as_ref(),
+                            chunk_start + j,
+                            fill,
+                        )
+                    })
+                    .collect();
+                let (chunk_written, chunk_unprocessed, err) =
+                    submit_seed_chunk(addr, table, items, tls).await;
+                written.fetch_add(chunk_written, std::sync::atomic::Ordering::Relaxed);
+                unprocessed_total
+                    .fetch_add(chunk_unprocessed, std::sync::atomic::Ordering::Relaxed);
+                if let Some(e) = err {
+                    let mut fe = first_error.lock().unwrap();
+                    if fe.is_none() {
+                        *fe = Some(e);
+                    }
+                }
+                println!(
+                    "seed: chunk {}/{total_chunks} [{chunk_start}, {}) written={chunk_written} \
+                     unprocessed={chunk_unprocessed} (running written={} unprocessed={})",
+                    chunk_index + 1,
+                    chunk_start + chunk_len,
+                    written.load(std::sync::atomic::Ordering::Relaxed),
+                    unprocessed_total.load(std::sync::atomic::Ordering::Relaxed),
+                );
+            }
+        },
+    ))
+    .buffer_unordered(concurrency)
+    .for_each(|()| async {})
+    .await;
+
+    let elapsed = started.elapsed();
+    let written = written.load(std::sync::atomic::Ordering::Relaxed);
+    let unprocessed = unprocessed_total.load(std::sync::atomic::Ordering::Relaxed);
+    let rate = if elapsed.as_secs_f64() > 0.0 {
+        written as f64 / elapsed.as_secs_f64()
+    } else {
+        0.0
+    };
+    println!(
+        "seed: table={table} written={written} unprocessed={unprocessed} elapsed={elapsed:.2?} \
+         keys/s={rate:.1}"
+    );
+    if count > 0 && written == 0 {
+        let msg = first_error
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| "every row was left unprocessed".to_string());
+        return Err(format!("seed wrote nothing: {msg}"));
+    }
+    Ok(())
+}
+
+const B64_STANDARD_ALPHABET: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Standard (`=`-padded) base64 encode, this crate's own small copy of
+/// `animus_dynamo::wire::base64_encode`'s algorithm — `animus-cli` has no
+/// dependency on `animus-dynamo` (it never speaks the DynamoDB wire
+/// directly, only proxies through the admin HTTP interface), and pulling in
+/// a whole extra crate for one helper isn't worth it just for `seed`'s
+/// `B`-typed key support.
+fn base64_encode_standard(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied();
+        let b2 = chunk.get(2).copied();
+        out.push(B64_STANDARD_ALPHABET[(b0 >> 2) as usize] as char);
+        out.push(
+            B64_STANDARD_ALPHABET[(((b0 & 0x03) << 4) | (b1.unwrap_or(0) >> 4)) as usize] as char,
+        );
+        match b1 {
+            Some(b1) => out.push(
+                B64_STANDARD_ALPHABET[(((b1 & 0x0f) << 2) | (b2.unwrap_or(0) >> 6)) as usize]
+                    as char,
+            ),
+            None => out.push('='),
+        }
+        match b2 {
+            Some(b2) => out.push(B64_STANDARD_ALPHABET[(b2 & 0x3f) as usize] as char),
+            None => out.push('='),
+        }
+    }
+    out
 }
 
 /// The `admin` subcommand group: speak the HTTP/JSON admin interface (ADR 0020)
@@ -2244,5 +2696,192 @@ mod tests {
             .expect("a file with no certificates must be rejected");
         assert!(err.contains("no certificates"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- seed ---------------------------------------------------------
+
+    #[test]
+    fn base64_encode_standard_matches_known_vectors() {
+        // RFC 4648 §10 test vectors — the standard (padded) alphabet, not
+        // the unpadded base64url one `animus_env`/`animus_dynamo` use
+        // elsewhere in this workspace for other purposes.
+        assert_eq!(base64_encode_standard(b""), "");
+        assert_eq!(base64_encode_standard(b"f"), "Zg==");
+        assert_eq!(base64_encode_standard(b"fo"), "Zm8=");
+        assert_eq!(base64_encode_standard(b"foo"), "Zm9v");
+        assert_eq!(base64_encode_standard(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode_standard(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode_standard(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn seed_item_types_a_string_hash_only_key() {
+        let item = seed_item("pk", SeedAttrType::S, "seed:", None, 42, 0);
+        assert_eq!(item["pk"], serde_json::json!({"S": "seed:000000000042"}));
+        assert!(item.get("sk").is_none());
+        assert_eq!(item["payload"], serde_json::json!({"S": ""}));
+    }
+
+    #[test]
+    fn seed_item_types_a_number_key() {
+        let item = seed_item("pk", SeedAttrType::N, "seed:", None, 7, 0);
+        // A key_prefix is ignored for a Number-typed key — the value must
+        // stay a valid `N` (mirrors the deleted `admin.rs::seed_key_attr`).
+        assert_eq!(item["pk"], serde_json::json!({"N": "000000000007"}));
+    }
+
+    #[test]
+    fn seed_item_types_a_binary_key() {
+        let item = seed_item("pk", SeedAttrType::B, "seed:", None, 1, 0);
+        let expected = base64_encode_standard(b"seed:000000000001");
+        assert_eq!(item["pk"], serde_json::json!({"B": expected}));
+    }
+
+    #[test]
+    fn seed_item_composite_key_shares_the_same_index_with_no_prefix_on_the_sort_key() {
+        let sort = Some(("sk".to_string(), SeedAttrType::N));
+        let item = seed_item("pk", SeedAttrType::S, "seed:", sort.as_ref(), 5, 0);
+        assert_eq!(item["pk"], serde_json::json!({"S": "seed:000000000005"}));
+        // The sort key gets the bare index — no `key_prefix` — since it
+        // isn't the partition key seeding is spreading across the ring.
+        assert_eq!(item["sk"], serde_json::json!({"N": "000000000005"}));
+    }
+
+    #[test]
+    fn seed_item_pads_the_payload_attribute_to_the_requested_fill() {
+        let item = seed_item("pk", SeedAttrType::S, "seed:", None, 0, 10);
+        assert_eq!(item["payload"]["S"].as_str().unwrap().len(), 10);
+    }
+
+    #[test]
+    fn parse_key_schema_reads_a_simple_hash_only_table() {
+        let table = serde_json::json!({
+            "KeySchema": [{"AttributeName": "id", "KeyType": "HASH"}],
+            "AttributeDefinitions": [{"AttributeName": "id", "AttributeType": "S"}],
+        });
+        let (pk, pk_ty, sort) = parse_key_schema(&table).unwrap();
+        assert_eq!(pk, "id");
+        assert_eq!(pk_ty, SeedAttrType::S);
+        assert!(sort.is_none());
+    }
+
+    #[test]
+    fn parse_key_schema_reads_a_composite_typed_table() {
+        let table = serde_json::json!({
+            "KeySchema": [
+                {"AttributeName": "pk", "KeyType": "HASH"},
+                {"AttributeName": "sk", "KeyType": "RANGE"},
+            ],
+            "AttributeDefinitions": [
+                {"AttributeName": "pk", "AttributeType": "N"},
+                {"AttributeName": "sk", "AttributeType": "B"},
+            ],
+        });
+        let (pk, pk_ty, sort) = parse_key_schema(&table).unwrap();
+        assert_eq!(pk, "pk");
+        assert_eq!(pk_ty, SeedAttrType::N);
+        let (sk_name, sk_ty) = sort.expect("composite table must report a sort key");
+        assert_eq!(sk_name, "sk");
+        assert_eq!(sk_ty, SeedAttrType::B);
+    }
+
+    #[test]
+    fn parse_key_schema_rejects_a_missing_key_schema() {
+        let err = parse_key_schema(&serde_json::json!({})).unwrap_err();
+        assert!(err.contains("KeySchema"), "{err}");
+    }
+
+    #[test]
+    fn parse_key_schema_defaults_an_undeclared_attribute_type_to_string() {
+        // No `AttributeDefinitions` entry at all — tolerated, defaults `S`.
+        let table = serde_json::json!({
+            "KeySchema": [{"AttributeName": "id", "KeyType": "HASH"}],
+        });
+        let (_, pk_ty, _) = parse_key_schema(&table).unwrap();
+        assert_eq!(pk_ty, SeedAttrType::S);
+    }
+
+    #[test]
+    fn seed_chunk_bounds_splits_at_the_batch_cap() {
+        // 60 rows at a 25-row batch: 25 + 25 + 10, matching DynamoDB's own
+        // per-call `BatchWriteItem` cap (`SEED_BATCH_WRITE_CAP`).
+        assert_eq!(
+            seed_chunk_bounds(0, 60, 25),
+            vec![(0, 25), (25, 25), (50, 10)]
+        );
+    }
+
+    #[test]
+    fn seed_chunk_bounds_honors_a_nonzero_start() {
+        assert_eq!(seed_chunk_bounds(1000, 30, 25), vec![(1000, 25), (1025, 5)]);
+    }
+
+    #[test]
+    fn seed_chunk_bounds_is_empty_for_zero_rows() {
+        assert_eq!(seed_chunk_bounds(0, 0, 25), Vec::<(u64, u64)>::new());
+    }
+
+    #[test]
+    fn seed_chunk_bounds_one_chunk_when_count_is_at_or_under_the_batch_size() {
+        assert_eq!(seed_chunk_bounds(0, 25, 25), vec![(0, 25)]);
+        assert_eq!(seed_chunk_bounds(0, 3, 25), vec![(0, 3)]);
+    }
+
+    #[test]
+    fn describe_table_request_body_shape() {
+        let body = describe_table_request_body("orders");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["op"], "DescribeTable");
+        assert_eq!(v["payload"]["TableName"], "orders");
+    }
+
+    #[test]
+    fn batch_write_request_body_shape() {
+        let items = vec![
+            serde_json::json!({"pk": {"S": "seed:000000000000"}}),
+            serde_json::json!({"pk": {"S": "seed:000000000001"}}),
+        ];
+        let body = batch_write_request_body("orders", &items);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["op"], "BatchWriteItem");
+        let reqs = v["payload"]["RequestItems"]["orders"].as_array().unwrap();
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(
+            reqs[0]["PutRequest"]["Item"],
+            serde_json::json!({"pk": {"S": "seed:000000000000"}})
+        );
+        assert_eq!(
+            reqs[1]["PutRequest"]["Item"]["pk"],
+            serde_json::json!({"S": "seed:000000000001"})
+        );
+    }
+
+    #[test]
+    fn unprocessed_items_recovers_the_bare_item_from_a_put_request() {
+        let response = serde_json::json!({
+            "UnprocessedItems": {
+                "orders": [
+                    {"PutRequest": {"Item": {"pk": {"S": "a"}}}},
+                    {"PutRequest": {"Item": {"pk": {"S": "b"}}}},
+                ],
+                "other_table": [{"PutRequest": {"Item": {"pk": {"S": "z"}}}}],
+            }
+        });
+        let items = unprocessed_items(&response, "orders");
+        assert_eq!(
+            items,
+            vec![
+                serde_json::json!({"pk": {"S": "a"}}),
+                serde_json::json!({"pk": {"S": "b"}}),
+            ]
+        );
+    }
+
+    #[test]
+    fn unprocessed_items_is_empty_when_the_response_has_none() {
+        let response = serde_json::json!({});
+        assert!(unprocessed_items(&response, "orders").is_empty());
+        let response = serde_json::json!({"UnprocessedItems": {}});
+        assert!(unprocessed_items(&response, "orders").is_empty());
     }
 }

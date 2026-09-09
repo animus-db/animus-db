@@ -3868,3 +3868,105 @@ from the surrounding code's own shape. See the matching ADR 0061 amendment
 and `docs/engineering-lessons.md`'s entry for the fuller incident account
 and the general lesson (a mechanical `Instant::now().elapsed()` → `Env`
 conversion must preserve WHAT is measured, not just the API).
+
+## Amendment (2026-09-09, issue #804: the `InstallSnapshot`/group-start witness gap)
+
+§2's witnessing chain lists four fold-in points (WAL recovery, every
+received `AppendEntries`, snapshot install, group start). A real
+multi-node `ProdEnv` cluster hard-panicked `assert_ts_monotonic` under
+ordinary load, no fault injection involved, and the root cause is that
+two of those four points are not actually equivalent to the other two.
+
+**WAL recovery replay and `witness_append_entries` both scan committed
+*log* entries** (`command_ts`, which returns `Some` for every mutating
+variant unconditionally) — so they witness a `ts` regardless of whether
+that entry's own apply wrote anything. **Snapshot install and group start
+instead read back `StorageEngine::latest_version()`** — the engine's own
+highest *written* MVCC version. Those two are equivalent only under an
+assumption §2 never stated because it happened to hold at the time: that
+every committed, applied entry writes a row at its own `ts`. CAS and
+condition semantics deliberately violate it — a `Cas` whose `expected`
+never matches, a condition-failed `KindBatch`/`KindEval`, an aborted
+transaction, `ReadCeiling`/`Freeze`/`SplitTablet`'s bare-`ts`-no-keys
+shape absent their own durable marker — all carry a real `ts`
+(`assert_ts_monotonic` runs on it, `command_ts` returns it) but never
+advance `latest_version()`. Once compaction truncates such an entry out
+of the WAL, WAL-recovery replay can no longer see it either, so a replica
+that only ever catches up via `InstallSnapshot` — or restarts after its
+own local compaction ran — never witnesses it. That replica's `Hlc` floor
+then sits below what every other replica already committed; if its own
+clock also happens to read low relative to the group (production
+start-up skew between independent `ProdEnv` `Instant::now()` bases, sub-
+2s on the reporting cluster — not an unrealistic wall-clock skew, just a
+*differential* one relative to what the group has actually committed),
+its next mint as leader lands below the group's already-applied max, and
+every replica that actually saw the missed entry hard-panics
+`assert_ts_monotonic` on that entry's own apply.
+
+**Fixed, one mechanism per read site** (`crates/animus-cp-data`):
+
+- **`InstallSnapshot` install**: the image (`codec::encode_image`/
+  `decode_image`, version `29`) now carries the sender's own running
+  `max_applied_ts` — the same high-water mark `assert_ts_monotonic`
+  maintains — in a header field, not as a row (the image's per-kind scan
+  deliberately excludes every `RESERVED_NAMESPACE` marker, including
+  `seal.rs`'s/`ceiling.rs`'s own, so a marker row could never have crossed
+  this way regardless). `install_engine_image`'s caller folds it into
+  `hlc` alongside the pre-existing `latest_version()` witness.
+- **Group start (the local-restart case)**: `apply_and_compact`'s
+  compaction path now durably `merge`s a dedicated per-tablet marker
+  (`hwm.rs`) at `hlc::pack(max_applied_ts)` whenever it truncates the WAL
+  — mirroring `ceiling.rs`'s own marker (§2/PR2b above) but generalized to
+  every ts-bearing entry rather than only `ReadCeiling`. Since `merge`
+  unconditionally raises the engine's *global* MVCC high-water mark the
+  instant this key's own version increases, the pre-existing group-start
+  witness (`hlc.witness(hlc::unpack(storage.latest_version()), ..)`)
+  needs no change at all — it simply stops undercounting once the marker
+  is in place.
+
+Neither fix changes what §2's witnessing chain is *for*, and
+`assert_ts_monotonic` itself is unchanged and un-weakened — this closes a
+gap in what fed two of its four inputs, not the check.
+
+**Correction, same day (post-review): the first pass of the `InstallSnapshot`
+fix above closed only the *sending* side's coverage and only the *live-
+process* witness on the *receiving* side, leaving two narrower gaps.** (1)
+`install_engine_image`'s receiver-side fold was `hlc.witness`-only, into the
+receiving replica's in-memory `Hlc` — never durable. A receiver that itself
+restarts before its own next compaction had nothing to re-derive the mark
+from (its own WAL never had the sender's no-row-writing entries to replay —
+it caught up via a snapshot, not by applying them itself). Fixed: `install_
+engine_image` now ALSO durably `merge`s the RECEIVER's own `hwm.rs` marker,
+in the same `merge_batch` as the installed rows and the pre-existing
+applied-watermark marker (identical crash-atomicity argument). (2) The
+image-building call only ever passed the sending apply task's raw `max_
+applied_ts` — which resets to `None` on every restart of that task, "until
+the first qualifying entry it processes this lifetime" (`apply_and_compact`'s
+own doc) — as the header. A sender that restarted since its own last
+compaction, and is asked for a snapshot before applying anything new,
+shipped `None` even though its own durable `hwm.rs` marker (written at that
+earlier compaction) had already raised `storage.latest_version()` to the
+true mark. Fixed: the header now folds `hlc::unpack(storage.latest_version())`
+in alongside the running `max_applied_ts` (`max` of the two) at image-build
+time. See `docs/engineering-lessons.md`'s matching correction for the
+general lesson (a value sourced from a per-task counter documented to reset
+on restart can never be trusted alone — it must be maxed against the same
+task's own durable engine read) and `hlc_differential_skew.rs`'s
+`receiver_installs_the_durable_high_water_mark_not_just_the_rows`/`sender_
+restart_with_nothing_applied_since_still_ships_the_true_high_water_mark`
+for the regressions, each confirmed red with its own fix hunk reverted.
+
+**Why the bug survived this crate's own fault-injection corpora**: this
+crate's clock-skew fault knob (`Simulator::set_clock_skew_for`, used by
+e.g. `animus-test`'s `txn_serializable.rs`) had always been applied
+*uniformly* to every replica of a group — which can only ever test a
+group's clock reading unrealistically vs. a wall clock, never one
+replica's clock reading low **relative to what the group has actually
+committed**, which is what this bug needs. The regression
+(`crates/animus-cp-data/tests/hlc_differential_skew.rs`) gives each
+replica of a 3-node group its own, distinct, fixed skew, assigned only
+after the initial leader election (skew is a pure read-side offset with
+no bearing on who wins that race). See `docs/engineering-lessons.md`'s
+matching entry for the general lesson on both fronts, and this crate's
+own `CLAUDE.md` ("Witnessing" bullet, Key invariants section) for the
+as-built pointer.

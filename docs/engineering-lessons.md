@@ -23992,6 +23992,376 @@ multi-thread runtime test can be completely wrong when the true bottleneck
 is disk fsync latency instead, and tuning the wrong knob (thread counts,
 sleeps, timeout) would have left the flake exactly as likely to recur.
 (`crates/animus-storage/tests/lsm_concurrent.rs`.)
+
+## A witness point that reads back engine state is structurally weaker than one that scans committed log entries, and a uniform clock-skew knob can never expose a differential-skew bug (2026-09-09, issue #804)
+
+A real multi-node `ProdEnv` cluster hard-panicked `assert_ts_monotonic`
+("did not strictly exceed the last applied ... the witnessing chain is
+broken") under ordinary client load — no fault injection, no crash, no
+corruption. ADR 0018 §2's witnessing chain lists four fold-in points, and
+they look equivalent on a skim: WAL recovery, every received
+`AppendEntries`, snapshot install, group start. They are not. The first
+two (`witness_append_entries`, WAL replay) scan committed **log entries**
+directly, via `command_ts`, which returns a command's `ts` unconditionally
+— whether or not that entry's own apply wrote anything. The other two
+instead read back `StorageEngine::latest_version()` — the engine's own
+highest **written** MVCC version. Those two views coincide only under an
+assumption nobody had stated because it happened to hold for a long time:
+that every committed, applied entry writes a row at its own `ts`. CAS and
+condition semantics deliberately violate it by design — a `Cas` whose
+`expected` never matches, a condition-failed `KindBatch`/`KindEval`, an
+aborted transaction all commit a real, monotonicity-checked `ts` that
+`latest_version()` never moves for. Once compaction truncates such an
+entry out of the WAL, the log-scanning witnesses can no longer see it
+either, and the two engine-reading witnesses — snapshot install and group
+start — silently undercount from then on.
+
+**Lesson (a), the general one**: when auditing every entry point of a
+monotonicity/ordering invariant, the entry points are not automatically
+equivalent just because they are "witnessing the same thing" in prose.
+Ask, for each one, "does this read back what was *decided*, or what was
+*written*?" — a CAS/condition/OCC mechanism that can decide "no-op" is
+exactly the kind of thing that makes those two diverge. A marker/watermark
+mechanism that itself lives on the "written" side (`ceiling.rs`'s durable
+`ReadCeiling` marker, the model this fix generalized into `hwm.rs`) is a
+cheap, proven way to pull a "written" read back into agreement with the
+"decided" one, in place of auditing (and maintaining, forever) a "does
+every apply arm remember to bump the version" invariant by hand.
+
+**Lesson (b)**: this crate's clock-skew fault injection
+(`Simulator::set_clock_skew_for`, exercised by e.g.
+`animus-test/tests/txn_serializable.rs`) had always applied the **same**
+skew to every replica of a group. That knob's existence gave false
+confidence that clock-skew-adjacent bugs were covered — but a uniform
+skew can only ever test a group's clock reading unrealistically fast/slow
+relative to a *wall* clock, never one replica's clock reading low
+**relative to what the group has actually committed**, which is exactly
+what this bug needed to reproduce (each `ProdEnv` node samples its own
+independent `Instant::now()` base at bind, so real clusters see
+sub-2-second *differential* skew between nodes routinely). The regression
+(`crates/animus-cp-data/tests/hlc_differential_skew.rs`) assigns each
+replica of a 3-node group its own, distinct, fixed skew — deliberately
+*after* the initial leader election, since skew is a pure read-side
+offset with no bearing on that race, so assigning it up front would need
+to guess the eventual winner instead of reading it off after the fact.
+**A fault-injection knob's own coverage is bounded by how it is invoked,
+not by its mere existence** — before trusting "we have a clock-skew
+corpus" as evidence a clock-skew class of bug is covered, check whether
+every call site drives the *shape* of skew (uniform vs. differential,
+here) the specific bug needs, not just skew of some kind.
+
+Fixed two ways, one per weak witness site (`crates/animus-cp-data/src/
+lib.rs`, `hwm.rs`, `codec.rs`): the `InstallSnapshot` image now carries
+the sender's own running high-water mark in a header field (codec version
+`29`), since the image's per-kind row scan deliberately excludes every
+engine-global marker and so could never have carried it as a row; the
+local-restart path gets a durable per-tablet marker (`hwm.rs`,
+`ceiling.rs`'s own mechanism generalized to every ts-bearing entry) written
+at compaction time, which durably raises the engine's global high-water
+mark by the same `merge`-into-`manifest.max_version` path any real row
+write already uses — so the pre-existing group-start witness needed no
+code change at all. See ADR 0018's 2026-09-09 amendment and this crate's
+own `CLAUDE.md` (Key invariants, "Witnessing" bullet) for the full
+account.
+
+**Correction, same day (post-review): the first pass of both fixes above
+closed the log-order-witnessing half but left two narrower gaps a review
+caught before merge — both now closed, and both are the same lesson
+twice.** (1) The `InstallSnapshot` install side only ever `hlc.witness`ed
+the header value into the receiving replica's **in-memory** `Hlc` — never
+durably. That is fine for the live process, but a receiver that itself
+restarts before its own next compaction has nothing to re-derive the mark
+from: `install_engine_image` now ALSO `merge`s the receiver's own
+`hwm.rs` marker, in the identical `merge_batch` as the installed rows
+(same crash-atomicity argument issue #554 already established for the
+applied-watermark marker riding alongside). (2) The image-building
+`engine_image` call only ever passed the apply task's raw, in-memory
+`max_applied_ts` as the header — which resets to `None` on every restart
+of THIS task, "including after a restart" (`apply_and_compact`'s own
+doc), until the first qualifying entry it processes *this lifetime*.
+A sender that restarted since its own last compaction, then is
+immediately asked for a snapshot before applying anything new, shipped
+`None` even though its own durable `hwm.rs` marker (written at that
+earlier compaction) had already raised `storage.latest_version()` to the
+true mark — the fix folds `hlc::unpack(storage.latest_version())` into
+the header alongside the running `max_applied_ts`, `max`-ing the two.
+**The general lesson**: witnessing something in memory and writing it
+durably to the specific replica that will need to re-derive it later are
+two different claims, and a value sourced from a per-task counter that is
+documented to reset to `None` on every restart can never be trusted alone
+as "the truth" — it must always be maxed against whatever the same
+task's own durable engine state already proves, exactly the same
+"resettable counter vs. durable engine read" shape lesson (a) above
+already names, just one level deeper (a sender's OWN header-building
+step, not only the two original witness points). Regression:
+`crates/animus-cp-data/tests/hlc_differential_skew.rs`'s
+`receiver_installs_the_durable_high_water_mark_not_just_the_rows` and
+`sender_restart_with_nothing_applied_since_still_ships_the_true_high_
+water_mark`, both confirmed red with their own fix hunk reverted and
+green with it restored.
+
+## A genuine process restart of a live, fully-caught-up voter inside an otherwise-active 3-node group pegs one CPU core indefinitely — found while building issue #804's fix, NOT caused by it, and not fixed here (2026-09-09)
+
+While writing a regression for issue #804 fix (1) — proving the receiver's
+own durable `hwm.rs` marker survives a restart of the receiver itself, not
+just an in-memory `hlc.witness` — the literal scenario described (`sim.stop`
++ a fresh `RaftKvNode::start` of the just-caught-up-via-`InstallSnapshot`
+replica, immediately, while the OTHER two replicas of its 3-node group stay
+fully live) hung every time: one CPU core pinned at ~99%, no panic, no
+progress `run_for` would ever return from even for a 50ms window. Two `gdb`
+backtraces taken several seconds apart, on the single OS thread `SimEnv`'s
+cooperative executor runs on, showed the SAME task (the restarted replica's
+own apply task) at two DIFFERENT points inside `apply_and_compact`'s commit-
+effects loop — genuinely making forward progress, not stuck at one
+instruction — yet still running after 6+ minutes of wall time for what
+should be, at most, a few hundred committed entries. **Confirmed independent
+of today's fix**: reverting `lib.rs`/`codec.rs` to this branch's own base
+commit (before either fix (1) or (2) existed) and re-running the identical
+test scenario reproduces the exact same hang, at the exact same call site
+(`apply_and_compact`'s first `core.lock()`, per `gdb`). Neither silencing
+the other two replicas first (`sim.crash` before the restarted one's own
+`sim.stop`, isolating it completely) nor zeroing its clock skew changed
+anything — ruling out both "contention with live peers" and "the
+differential-skew mechanism this file's own scenarios need" as causes.
+
+**Not root-caused, and deliberately not fixed here** — per this repo's own
+convention (`CLAUDE.md`'s Conventions section: "An incidental pre-existing
+bug discovered during a task gets its own separate PR, never a drive-by
+fix folded into an unrelated diff"), and because a genuine fix requires
+first finding what unboundedly keeps `apply_and_compact` reporting
+`did_work = true` forever on a restart shaped exactly this way — worth its
+own investigation (a filed issue, `gdb`-attached to a fresh repro, is the
+fastest next step: attach with `gdb -p <pid> -batch -ex "thread apply all
+bt"`, `pgrep -f target/debug/deps/<test-binary>` finds the pid; the hang
+shows up within the first `run_for(50ms)` tick after the restart, so a
+short, cheap repro is all a follow-up session needs).
+
+**The general lesson**: when a new SCENARIO SHAPE (not a new assertion, not
+a new fixture helper — a genuinely new sequence of `sim.crash`/`sim.stop`/
+`RaftKvNode::start` calls) hangs, don't assume it must be your own change
+that caused it just because you're mid-way through writing that change —
+check the hang against the base commit BEFORE spending more time reading
+the code you just wrote. A `git stash` of only the `src/` files (keeping the
+test file's own new mechanics) is a five-minute check that turns "is my fix
+broken" into "is this test *shape* broken," which are very different next
+steps: the former means fix the code; the latter means redesign the test
+(here: prove the same fact one layer down — `RaftKvNode::
+engine_latest_version()` reads `storage.latest_version()` directly, the
+exact same read a future restart's group-start witness would use, with no
+restart needed to observe it — rather than block on root-causing an
+unrelated, pre-existing hang to land the regression this session actually
+owed).
+
+## Broadening a fault-injection corpus's clock-skew coverage from uniform to per-replica differential is necessary but not sufficient — the workload's own command vocabulary gates which witnessing-gap bugs are even reachable (2026-09-09, issue #804 follow-up)
+
+Extending `raftkv_linearizable.rs` (the leaderful-plane Elle corpus) with
+per-replica differential clock skew — every replica of every scenario's
+group now draws its own seed-derived skew, mirroring
+`hlc_differential_skew.rs`'s regression rather than
+`txn_serializable.rs`'s pre-existing *uniform* skew — surfaced two things
+worth recording beyond issue #804's own two entries above.
+
+**(1) A workload of always-succeeding commands cannot expose a
+"committed-but-wrote-no-row" witnessing gap, no matter how the clocks are
+skewed.** This corpus's client workload only ever calls `put`/
+`linearizable_get` — both always succeed, so for every entry the
+log-scanning witness (which sees every commit) and the engine-reading
+witness (which sees only rows actually written) agree by construction,
+fix present or not. Issue #804's whole bug class needs a command that
+*commits a real, monotonicity-checked `ts` while writing no row* (a failed
+`Cas`, a condition-failed batch, an aborted transaction) — differential
+skew is necessary to trigger the observable symptom (a new leader minting
+below the committed max) but the corpus's command vocabulary gates whether
+the *precondition* for that symptom (an invisible high-ts entry) can even
+exist in the log at all. Closed cheaply: `poison_cas` fires a
+guaranteed-miss CAS (a 1-byte `expected` that can never equal any real
+encoded value) ahead of every real write, entirely outside the Elle model
+(no `Recorder` call — a guaranteed no-op reads and writes nothing the
+list-append history could observe). **General lesson**: before trusting
+that a broadened fault-injection knob (here, differential skew) gives a
+corpus teeth against a specific bug class, check whether the corpus's own
+*command* vocabulary can even produce the state that bug class needs —
+a knob on the fault-injection side cannot compensate for a workload that
+structurally never visits the precondition.
+
+**(2) Even with both fixed, the corpus's organic (single/compound-fault,
+one scenario per named cell) schedule did not reproduce issue #804's own
+narrower same-day-correction gap (the sender-restart-with-nothing-applied-
+since / receiver-restart-before-its-next-compaction edge) at
+`ANIMUS_RAFTKV_SEEDS=50`, confirmed by reverting exactly those two fix
+hunks (the `engine_mark` max-fold in `engine_image`'s on-demand-image
+branch, and the receiver's own durable `hwm.rs` marker write in
+`install_engine_image`) and re-running — genuinely still green, not merely
+unverified.** That narrower gap needs the *same* node that just restarted
+to *also* be the one asked to build or receive a snapshot before it
+applies anything else — a compound precondition organic single-fault
+injection essentially never lines up by chance, partly because Raft's own
+election dynamics mean the just-restarted node is rarely who wins the very
+next election either (the two live survivors can campaign immediately; the
+restarted node must first recover and then still win a vote). **General
+lesson**: a broadened organic fault-injection corpus and a hand-
+choreographed, deterministic regression are not substitutes for each
+other — the corpus's job is breadth (every existing leader-change/restart/
+snapshot-catch-up cell now also runs under asymmetric clocks, for whatever
+*is* reachable that way), while a narrow, multi-step-precondition bug still
+needs its own scripted reproduction (`hlc_differential_skew.rs`) as the
+permanent regression for that exact gap. Neither renders the other
+redundant; don't expect a broadened knob alone to subsume a targeted
+regression it structurally cannot reach.
+
+## Follow-up: disabling the PRIMARY #804 fix (not just the same-day-correction hunks) still didn't fire the raftkv corpus, and the reason generalizes past this one bug (2026-09-09)
+
+A maintainer follow-up asked for a stronger teeth-proof than the entry
+above: disable the *primary* fix (`engine_image` emits `None` for the
+header unconditionally, matching pre-#804 `main` exactly — the receiver
+witnesses only `storage.latest_version()`) rather than only the two
+same-day-correction hunks, and iterate on the corpus until it fires within
+50 seeds. `cargo test -p animus-cp-data --test hlc_differential_skew` went
+red in that state as expected, including the *original* reproduction
+(`lagging_replica_mints_below_a_committed_non_row_writing_entry`) hitting
+`assert_ts_monotonic` directly — confirming the disable was the real
+thing. `ANIMUS_RAFTKV_SEEDS=50 cargo test -p animus-test --test
+raftkv_linearizable` (run twice, cleanly, 249s and 272s) stayed green both
+times.
+
+**Three organic ingredients were added and instrumented, one at a time,
+each confirmed working on its own terms, and the corpus still never
+fired:**
+
+1. A `poison_cas` burst fired immediately before `StopRestart`, on the
+   about-to-be-stopped leader. **Diagnosed as structurally unable to
+   matter**: those entries land in the victim's own durable WAL before it
+   stops, and `RaftCore::recovered`'s WAL replay on restart is a
+   log-*scanning* witness (one of the two "strong" ones) — it witnesses
+   them correctly regardless of anything else. Moving the burst to fire
+   *after* the restart, once the survivors elect a fresh leader (confirmed
+   via `engine_latest_version()` instrumentation and a fine-grained
+   5ms-step poll to land the burst before the victim's own snapshot round
+   trip could complete), fixed that specific gap — verified the victim
+   never received these specific entries via WAL replay.
+2. An explicit, seeded `transfer_leadership` onto the restart victim,
+   retried until `RaftCore::transfer_leadership`'s own gate
+   (`peer_match(target) >= commit_index`) opened. **Confirmed working by
+   instrumentation on every attempt**: `now_leader == victim` every single
+   time, well within budget — Raft election dynamics alone (the two live
+   survivors campaign immediately; the just-restarted node is still busy
+   recovering) never once let the victim win on its own, exactly as
+   predicted, and this ingredient reliably corrected for it.
+3. A genuinely fresh write ("poke") proposed on the new leader after the
+   transfer, since `compaction_crossing_*`'s own fault fires only once the
+   workload has *already fully drained* (confirmed directly:
+   `ok_ops=90/90` in the recorder at the moment the fault fires) — so
+   without a deliberate new write, no replica ever mints anything after
+   the restart for `assert_ts_monotonic` to have a chance to run against.
+
+**Why it still didn't fire, run to ground with `engine_latest_version()`
+instrumentation and an A/B (burst present vs. `ANIMUS_SKIP_BURST=1`)
+comparison**: the burst itself is a guaranteed CAS miss and provably never
+writes a row (verified: with the burst skipped, `engine_latest_version()`
+stays flat and identical across all three replicas straight through the
+transfer) — but issuing it is exactly what triggers `mint_pushed`'s own
+per-term write-conflict machinery on the *first* propose in the new
+leader's term, and this raises `engine_latest_version()` on the survivors
+by several real seconds' worth of wall_ms (confirmed: skipping the burst
+also removes this jump). The victim, once its own `InstallSnapshot` for
+the pre-burst state lands, is back to **ordinarily following** — so it
+witnesses the burst's own entries (and this fold-in write) via
+`witness_append_entries`, a strong, log-scanning witness, the instant they
+replicate, `engine_latest_version()`'s own catch-up lag notwithstanding
+(that accessor reads *rows*, not the in-memory `Hlc`/`max_applied_ts` the
+witnessing chain actually maintains — a real trap in this specific
+diagnostic, worth naming on its own: `engine_latest_version()` is the
+wrong probe for "has this replica witnessed X," since it can legitimately
+lag behind correct witnessing that already happened via log receipt,
+pre-apply). For the fix's absence to matter at all, an entry must be
+compacted away *before* the receiving replica's own `InstallSnapshot` is
+built — which means, for a burst fired **after** a restart to ever be
+invisible to the victim, the sender must **compact again**, a second time,
+crossing `COMPACT_THRESHOLD` (or forcing an on-demand image early) between
+the burst and whatever moment the victim's own snapshot request is
+served — the exact two-compaction choreography (real writes hidden by the
+*first* compaction, before the restart; the failed-CAS burst hidden by a
+*second* one, after it) `hlc_differential_skew.rs`'s own hand-scripted
+scenario builds deliberately, and that a `StopRestart`-shaped corpus cell
+with only ONE scheduled fault has no way to reach without adding a second,
+explicit forced-compaction step of its own — at which point the "organic"
+corpus cell is, structurally, the scripted regression with extra
+indirection, not a broader net cast over more of the state space.
+
+**General lesson, worth the session it cost**: when a witnessing/ordering
+bug's fix works by comparing "what got compacted/discarded" against "what
+a specific replica has independently confirmed," the reachability
+condition is almost always a race between two *independent* trigger
+events (here: the sender's own second compaction, and the receiver's own
+snapshot request) that a single scheduled fault cannot pin relative to
+each other — proving this rigorously (not just suspecting it) took
+building the ingredient, confirming each piece works via targeted
+instrumentation and A/B toggles, and then tracing the SPECIFIC accessor
+(`engine_latest_version()`) being used to judge "did it work" back to
+which witness point it actually reads. All three organic ingredients
+above were removed from the shipped corpus rather than landed half-working
+— per this repo's own convention, unproven complexity that doesn't
+demonstrably do its job doesn't ship; the differential-skew mechanism and
+the per-write `poison_cas` ingredient from the entry above remain, since
+those are independently useful (broad coverage; the necessary-but-not-
+sufficient log ingredient) even though neither alone reproduces this
+specific narrow gap.
+- **A poll with exponential back-off has an average overshoot of half a
+  step — when the producer already has a natural wake point, a
+  multi-waiter watch removes that overshoot for free, and reaching for a
+  single-`AtomicWaker` shortcut to build it is the wrong call the moment a
+  second waiter can exist** (cluster-performance follow-up to ADR 0049 §5
+  and issue #276). Every CP write confirm loop in `animusd::write_path`
+  (`cp_put_local`/`cp_delete_local`/`cp_kind_raw_local`/
+  `cp_kind_eval_local`/`poll_probe`) waited for its own accepted Raft entry
+  to apply via `sleep(poll); poll = (poll * 2).min(CP_CONFIRM_POLL_MAX)`,
+  `CP_CONFIRM_POLL_INIT` 200µs doubling to a 5ms cap. Real apply latency is
+  a few ms, so the doubling schedule's own checkpoints (0.2/0.6/1.4/3.0/
+  6.2ms) rounded every write up to whichever one came next — an average
+  half-a-step overshoot on top of the real latency, the generic cost of
+  *any* poll-based wait regardless of how well-tuned its interval is.
+  The fix is not a shorter initial interval or a gentler back-off curve —
+  both are still guessing at a cadence — but recognizing that the apply
+  task **already knows the instant it makes progress** (it is the thing
+  advancing `engine_applied`), so the wait belongs on a wake, not a timer.
+  `animus-cp-data` grew `AppliedWatch`, a multi-waiter watch bumped at
+  every site `engine_applied` advances, and every confirm loop's poll tail
+  became one shared `wait_applied_past` helper parked on it — a single
+  seed-driven measurement (`write_path::kind_eval_confirm_wake_tests`)
+  showed 20 sequential single-item writes drop from 4ms of virtual time
+  (the old scheme's `WRITE_COUNT * CP_CONFIRM_POLL_INIT` floor) to
+  **0ns**, because under `SimEnv`'s zero-latency network the apply task
+  simply gets its turn before the confirm task is polled again — no timer
+  needed at all. **The single-`AtomicWaker` shortcut (issue #276) was
+  wrong here for the identical reason it was wrong for `MetadataWatch`**:
+  a single-tablet leader routinely has many concurrent single-item writes
+  each confirming a distinct index at once, so `AppliedWatch` was built
+  multi-waiter (a `Mutex<BTreeMap<slot, Waker>>` registry, register-
+  before-check, `bump` drains and wakes every registered slot) from the
+  very first line, rather than starting single-waiter "because today there
+  is only one caller" and waiting for a second consumer to silently break
+  it the way `MetadataWatch` did. The one thing a pure wake-on-progress
+  wait cannot provide on its own is a **forced re-check**: if the awaited
+  index never applies at all (a lost leadership before commit), nothing
+  ever bumps the watch, so a bare `watch.changed(seen).await` with no
+  timeout would hang forever even though the surrounding loop's own
+  `confirm_wait_is_futile`/deadline logic is sitting right there ready to
+  catch it — the wait just never returns control to let it run. Proven
+  directly (`write_path::wait_applied_past_futility_tests`): a genuine
+  three-voter leadership change, engineered with `Simulator::partition`/
+  `heal` rather than `RaftKvNode::transfer_leadership` — an armed transfer
+  only freezes *new* proposes, it does not stop an already-accepted entry
+  from replicating and committing on a healthy zero-latency `SimEnv` link,
+  so a first draft using it always observed `Confirmed`, never the
+  `Superseded` the test needs; only fully isolating the leader before it
+  ever proposes guarantees the entry can never commit at all. So
+  `wait_applied_past` races its watch against a plain bounded sleep
+  (reusing the old scheme's own cap, `CP_CONFIRM_POLL_MAX`, repurposed
+  from an interval into a forced-recheck ceiling) — a wake-on-progress
+  primitive that removes a *poll's* timer still needs its own timeout the
+  moment "progress never happens" is a real, reachable state, not merely
+  "progress happens late." (`crates/animus-cp-data/src/lib.rs`,
+  `crates/animusd/src/write_path.rs`, `crates/animusd/src/lib.rs`.)
 ## A real-thread convergence poll pinned to a captured leader index is unsound the moment the mechanism it drives can legitimately re-elect (issue #781)
 
 `crates/animusd/tests/cp_reconfigure.rs::cp_group_follows_tablet_replica_set`
@@ -24151,6 +24521,63 @@ simulation harness** — it is almost always possible for cursor/bookkeeping
 logic specifically (as opposed to genuine multi-process timing), and it
 turns a probabilistic real-thread reproduction into a deterministic one
 that runs in milliseconds.
+## A converged-or-timeout poll of "any node" before acting through "whichever node leads now" races `Metadata`'s own per-node apply lag, even with no fault injected (2026-09-09, issue #819)
+
+`crates/animusd/tests/seed_join_allocated.rs::
+ephemeral_identity_restart_gets_a_new_id_old_left_down_and_prunable` polled
+`member_status(&core_nodes, &old_id)` — `nodes.iter().find_map(..)`, which
+resolves to whichever core node is *first* in the slice with an entry for
+`old_id` (in practice always `core_nodes[0]`, since every core node
+registers one early in the test) — until it read back `NodeStatus::Down`,
+then immediately POSTed `/admin/member/remove` to `core_admin[leader_index(
+&core_nodes)]`: whichever node's own `RaftNode::is_leader()` currently
+answers `true`, not necessarily `core_nodes[0]`. CI (job 34349214827)
+failed with `left == right` on `status == 409` (`"node ... is not drained:
+status is Active; drain it first"`) even though the immediately preceding
+poll had already observed `Down`.
+
+Root cause: `Metadata` is `StateMachine::DRIVER_APPLIED` (ADR 0038) — each
+node's own async apply task publishes its cache independently
+(`RaftNode::metadata`, `crates/animus-control/src/node.rs:682`, whose own
+doc states this outright: "may briefly read a fresher node's `Metadata::
+default()` before the apply task's first rebuild completes; a caller that
+needs read-your-writes should confirm via `metadata_watch()`... instead of
+assuming this call alone is synchronized with a just-issued `propose`").
+`admin_remove_member` (`crates/animusd/src/lib.rs:10448`) reads `self.
+control.metadata_cached()` on whichever node *receives* the HTTP request —
+its own, possibly-lagging, apply-task cache — not a cluster-wide or
+leader-synchronized view. So `core_nodes[0]` can apply the committed
+`UpsertMember{Down}` transition before the node that happens to be control
+leader at POST time has applied the very same commit — a genuine, everyday
+skew this design accepts by construction (the async apply task is
+deliberately decoupled from the sync Raft core so the driver never blocks
+on apply), not a Down→Active flip from a stale heartbeat. (`Node::
+shutdown()`'s abrupt task-abort — `ProdEnv::send_stream` spawns each send
+onto its own task, `crates/animus-env/src/prod.rs:608`, so `abort()` can in
+principle race an already-launched heartbeat write — was investigated and
+ruled out for *this* failure: several seconds of real time (a second
+node's whole join + its own `await_active` poll) elapse between `first.
+shutdown()` and the `Down` poll, far past `send_stream`'s own 2s
+`SEND_TIMEOUT` and `DETECT_TIMEOUT`'s 500ms, so no in-flight send from the
+killed process could plausibly still be arriving at that point.)
+
+This is the standing "poll the node you're about to act through, not the
+node that made the earlier state change" rule (this file's own
+`S-03 PR 2`/`RestoreTableFromBackup` entry, and the root `CLAUDE.md`'s
+matching note) in a shape that needs **no fault injection and no leader
+change** to trigger — ordinary per-node `DRIVER_APPLIED` apply-task timing
+skew, amplified by a slow/contended CI runner, is enough on its own.
+**Fixed in the test**: compute `leader_index` once, then poll *that same
+node's* own `metadata()` for `Down` before ever POSTing to it — never an
+arbitrary node's view followed by an action against a different one.
+Reproduction: 85 real-thread runs on a 4-vCPU sandbox (30 unloaded, 25
+under 6-way CPU pressure via `taskset -c 0,1`, 30 more as two concurrent
+copies under the same pressure) never reproduced the original failure —
+this sandbox's apply task evidently never lags enough, and the fixture's
+`bring_up` reliably elects `core_nodes[0]`, which is exactly the node
+`member_status` already reads, masking the bug locally; the mechanism was
+confirmed by direct code inspection (the two divergent read sites named
+above) rather than by a local repro. 40/40 runs green after the fix.
 ## A fixture whose node ids used to ALL share one role has implicit "every id is a control voter" assumptions baked into loop targets and membership lists — heterogeneous roles surface every one (ADR 0061 rung L, C-12 PR 3)
 
 `SimCluster::restart`'s control-bearing branch rebuilt a restarted node's
@@ -24383,3 +24810,99 @@ still describes what the test's own current body actually does and needs
 consecutive one where skipping them would have closed with a materially
 wrong record: one entire file silently mis-declared "converted," and one
 of its own tests mis-declared "permanent" for the wrong reason.
+
+## A dev tool nested in the server's own use-case layer duplicates the wire's byte shapes and grows its own performance bugs — put load generation on the client and let it ride the real path (ADR 0021 amendment, 2026-09-09)
+
+`POST /admin/data/seed` started as a small convenience (ADR 0021: bulk-write
+synthetic rows to drive sharding tests) and grew, over several PRs, into a
+second implementation of `PutItem`: it had to re-derive the exact key/value
+byte shapes a real client's write would produce (`seed_key_attr`,
+`animus_dynamo::wire::encode_stored_item`'s envelope) to stay readable
+through the real DynamoDB edge, and once that duplication existed it also
+had to reinvent, and separately tune, its own performance characteristics
+— a marker-batch fast arm sized around `SEED_BATCH_SIZE`/
+`SEED_BATCH_MAX_BYTES`, and a **second**, unrelated concurrency knob
+(`SEED_IMAGES_CONCURRENCY`) for the per-item images-table arm — neither of
+which had anything to do with the real `BatchWriteItem` operation's own
+25-item cap or its own throttling contract. The images arm's own
+concurrency bug (PR #783) and the marker arm's own entry-granularity bug
+(one-entry-per-item vs. one-per-tablet, this same log's own earlier
+"same-predicate" entries) were each real, each shipped, and each needed
+for exactly the reason a second implementation of a write path always
+needs its own bug-fixing: it is not the same code as the one path a real
+client exercises, so nothing that hardens the real path automatically
+hardens it.
+
+It also had a fidelity gap structurally impossible to close without
+becoming a third thing: a throttled row (ADR 0065) had no `UnprocessedItems`
+to be echoed through, since the internal primitives it called had no such
+wire-level contract at all — so a throttled seed silently under-wrote, with
+`written` reporting a number the caller had no way to tell was short of
+what the real op's own semantics would have reported.
+
+**The fix wasn't a bug fix — it was removing the second implementation.**
+`animus-cli seed` now generates the identical item shape client-side and
+writes it through the real `BatchWriteItem` wire operation; `/admin/data/
+seed` is now a thin proxy over the same operation, through the same
+generic dispatcher `/admin/data/dynamo` already used
+(`execute_routed_as_generic`). Every one of the bugs above stopped being
+possible **by construction**, not by being fixed: there is no byte shape
+left to duplicate (the wire decoder is the one and only encoder/decoder),
+no second concurrency model to separately tune (chunking + `buffer_
+unordered` is the same idiom a real bulk-loading client would use), and no
+missing wire contract to work around (`UnprocessedItems` already exists,
+because the real operation already has one).
+
+**The general lesson**: when a server gains an admin/debug/test-support
+route whose job is "do roughly what a client operation does, but from
+inside the node, for convenience or speed" — a bulk loader, a synthetic
+data generator, a fixture seeder — resist implementing it against the same
+internal primitives the real operation is built from. Implement it as a
+client of the real operation instead (even a very short/proxied hop, as
+`/admin/data/seed` still is). The second implementation looks cheaper up
+front, but it inherits none of the real path's own hardening, duplicates
+work that will drift the moment either side changes, and accumulates its
+own bug class that has nothing to do with the feature it exists to test.
+
+## A `Scan` (or any read) issued from a node that does not lead the tablet, right after a write, needs `ConsistentRead: true` — even in a from-scratch deterministic `SimEnv` test, and even when the pattern was copied from an existing test that had the identical gap (ADR 0021 amendment, `sim_cluster_seed_latency.rs`, 2026-09-09)
+
+Rewriting `sim_cluster_seed_latency.rs` for the new client-side-shaped
+seeder kept its pre-existing verification shape verbatim: seed N rows from
+a node that does not lead the table's tablet (`non_leader_of_table`), then
+`Scan` the same node with `{"Select":"COUNT"}` and assert the count equals
+N. 1 of 5 `_over_seeds` seeds failed this assertion deterministically (199
+of 200 rows), even though the seed call's own `written` field correctly
+reported 200 and every one of its writes had already durably committed
+before the call returned.
+
+**Root cause: the `Scan` carried no `ConsistentRead`, so it defaulted to
+`false`** — ADR 0055's eventually-consistent read path, served from
+whichever replica answers, with no read barrier against the leader's own
+latest commit. `non_leader_of_table`'s whole point is to prove the seed's
+own forwarding path works, which means the node serving the verification
+`Scan` is, by construction, not the node that just committed every write —
+so the `Scan`'s own local replica state can legitimately lag the write
+it's trying to observe. This is precisely the gotcha `animusd/CLAUDE.md`'s
+ADR 0055 section already names in so many words ("a read that verifies a
+write must ask for `ConsistentRead: true`... the failure is a race, so one
+green run of a binary proves nothing") — but it was missed on first read
+because the **pre-existing, pre-rewrite version of this exact test had the
+identical gap** (its own `Scan` call also omitted `ConsistentRead`, also
+against a non-leader node) and had apparently never been observed to fail
+across its prior lifetime. Copying a working-looking pattern from an
+existing test file is not the same as that pattern being correct — a
+latent race can sit unfired for a long time and then fire on the very next
+seed a rewrite happens to add coverage at.
+
+**Fixed** by adding `"ConsistentRead":true` to the verification `Scan` —
+reproduced first with `ANIMUS_SEED=<seed>` against the single-seed test
+(this crate's own standard replay convention) to confirm the exact failure
+deterministically, then confirmed fixed the same way before re-running the
+full `_over_seeds` sweep (three clean repeats). **The generalizable rule,
+restated once more because this is not the first time it's been the actual
+cause of a `SimCluster` test finding a "bug" that was really a missing
+`ConsistentRead`**: whenever a test verifies a write by reading it back,
+check whether the read is `ConsistentRead: true` and whether the node
+serving it is the tablet's own leader — if either is no, the read can race
+replication, and it will eventually be caught, not prevented, by "it
+always passed before."
