@@ -19208,6 +19208,30 @@ mod sim_cluster_split_cluster;
 #[cfg(test)]
 mod sim_cluster_control_membership_admin;
 
+/// C-13 / ADR 0061 rung M PR 2 — the real seed/join discovery+claim dial,
+/// self-minted identity, combined mode only (the smallest end-to-end
+/// slice): `SimCluster::join_via_seed` drives the REAL `ClientRequest::
+/// JoinInfo` discovery round trip, a relayed `MetaCommand::RegisterNode`
+/// claim (exercising `is_relayable_command`'s allowlist from a
+/// follower-connected seed, not just the leader), and lets the REAL
+/// control leader's own `detect_loop`/`liveness_transitions`
+/// (`animus-control`) promote the joiner to `Active` on its own first
+/// observed heartbeat — never a bypass `UpsertMember` propose, unlike
+/// `SimCluster::grow`/`seed_members`. New production surface: `forwarding
+/// ::handle_relayed_request` gains a `ClientRequest::JoinInfo` arm (purely
+/// additive — production's own `handle_request` never delegates `JoinInfo`
+/// there, so this is reachable only from a `SimRelayClient` inbound
+/// dispatch); the `_via_relay` siblings of `lib.rs`'s pre-bind join
+/// functions live in `sim_cluster.rs` itself, `#[cfg(test)]`-only, never
+/// touching the byte-identical production functions they mirror. See
+/// `sim_cluster.rs`'s own doc on `SimCluster::join_via_seed` for the two
+/// documented forks this PR resolves (route tables, and why `ctx.control`
+/// stays `Remote` rather than production's real isolated-`Local`-raft-
+/// plus-mirror shape) and `crates/animusd/CLAUDE.md`'s matching appendix
+/// for the full account.
+#[cfg(test)]
+mod sim_cluster_seed_join;
+
 /// Regression for the issue #298 residual confirmed live under the
 /// un-pinned `SplitMode::InPlace` proof soak (ADR 0018's matching amendment,
 /// `docs/engineering-lessons.md`'s matching entry): a stage blocked by

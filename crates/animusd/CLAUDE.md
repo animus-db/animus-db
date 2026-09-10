@@ -6119,6 +6119,65 @@ never a bypass propose. A newly-found, small additive production gap:
 opener amendment for the full grep-verified ground truth, the per-test
 verdict table, and the 7-PR ladder.
 
+**C-13 PR 2 (the dial groundwork) landed.** `forwarding::
+handle_relayed_request` gained the `JoinInfo` arm above (`git diff`
+against `forwarding.rs` is additions/doc updates only — no existing
+line's own behavior changed; `lib.rs`'s own diff is a single new
+`#[cfg(test)] mod sim_cluster_seed_join;` declaration, absent from any
+non-test build. This arm is reachable only from a `SimRelayClient`
+inbound dispatch, never real `AnimusdRelayClient` traffic, since
+production's own `handle_request` keeps its own separate `JoinInfo` arm
+and never delegates it here). Five new `#[cfg(test)]`
+free functions in `sim_cluster.rs` — `join_request_via_relay`/`poll_
+seeds_for_via_relay`/`discover_join_info_via_relay`/`register_node_
+over_wire_via_relay`/`claim_join_identity_via_relay` — mirror `lib.rs`'s
+five pre-bind join functions structurally (same request/response shapes,
+`relay.relay(..)`/`env.now()`/`env.sleep()` instead of `TcpStream`/
+`tokio::time`) but are standalone, never called by and never calling
+into any production function — the opener's "shared generic core" option
+was deliberately not taken, since `lib.rs`'s own pre-bind functions have
+no `Env`/`RelayClient` parameter today and widening them just so a
+sim-only caller could reuse them would touch code with no other reason
+to change. `SimCluster::join_via_seed(&mut self, seed_node: usize) ->
+u64` (self-minted identity, combined mode only) mirrors `grow`'s own
+construction tail, replacing the self-registration bypass with a real
+pre-bind discovery+claim phase (over a throwaway bootstrap identity/env/
+relay, `nid(self.nodes)`, never registered as a real node) followed by
+the real per-node assembly with **no `UpsertMember` propose at all** —
+promotion is left to the real control leader's own `detect_loop`,
+converged-or-timeout polled. Two documented forks, both resolved (see
+`join_via_seed`'s own doc for the full reasoning): route tables keep
+`grow`'s own "patch every existing node directly" shape for pre-existing
+nodes, but the NEW node's own tables are derived from the `JoinInfo`
+discovery reply — more faithful than `grow`, the one place this method
+improves on its template; and `ctx.control` stays `GenericControlHandle::
+Remote` (matching `grow`'s own shape) rather than production's real
+combined-mode isolated-`Local`-raft-plus-`RemoteControlClient::with_
+mirror` shape, a deliberate simplification since every assertion this
+rung's own tests make behaves identically either way, with only
+`AdminInfo.role`/`NodeAddrs.role` saying `"combined"` to match the real
+wire-visible contract — the fixture-internal `self.roles` bookkeeping
+tags the joiner `NodeRole::Data` regardless (its true fixture capability,
+keeping `restart`'s own positional control-bearing-prefix invariant
+intact). A third finding: `RemoteControlClient::with_mirror` (production's
+own growth-node mirror primitive) is already `<R: RelayClient>`-generic,
+reachable with `SimRelayClient` with zero widening — not needed by this
+PR's `Remote` choice, but available for a future rung building the
+literal `Local`-plus-mirror shape. New test module: `sim_cluster_seed_
+join.rs` — `joiner_discovers_claims_and_is_promoted_by_the_real_detector`
+(self-minted id, joined via a control FOLLOWER via the new `SimCluster::
+control_follower_index`, asserting a genuine — not instantaneous —
+promotion latency as the observable proxy for "the real detector
+decided it, not a bypass propose," plus a forwarded put/get through the
+joined node's own discovery-derived route tables) and `rejoin_same_
+identity_is_a_noop` (the ADR 0032 same-identity CAS, proven directly
+against the new relay-based `register_node_over_wire_via_relay` via a new
+`SimCluster::rejoin_same_identity` helper, including the genuine-
+collision negative case) — 4 tests total (pinned seed + 5-seed
+`_over_seeds` sibling each), green and deterministic. See ADR 0061's
+matching "PR 2 landed" amendment for the full account and exact gate
+figures.
+
 ### `sim_cluster_corpus`: the SimCluster cycles/durability corpus (ADR 0061 rung D1 step 3)
 
 `crates/animusd/src/sim_cluster_corpus.rs` (`#[cfg(test)] mod
