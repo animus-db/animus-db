@@ -24152,6 +24152,101 @@ restart needed to observe it — rather than block on root-causing an
 unrelated, pre-existing hang to land the regression this session actually
 owed).
 
+**Resolution (2026-09-10, issue #811).** Root-caused and fixed. The hang is
+specific to a replica that caught up ENTIRELY via `InstallSnapshot` (never
+logged a single `AppendEntries` entry of its own before the restart) —
+confirmed by a repro that also tried a plain restart of an ordinarily-
+replicated follower (never hangs, with or without the fix) and confirmed
+independent of the storage engine (`MemoryEngine` and `LsmEngine<SimEnv>`
+both hang identically pre-fix). `RaftCore::handle_install_snapshot`'s
+successful-install path (`animus-control::raft`) durably fixes up the
+CORE's in-memory `snapshot_index`/log/`snapshot_dirty` synchronously, on
+the consensus loop, the instant the last chunk lands — but nothing ever
+flushes that to the WAL FILE at that point: `RaftCore::has_unflushed_wal`
+(the consensus loop's own ordinary per-message persist gate) checks only
+the pending log-append queue and the current term/vote, never
+`snapshot_dirty`; and `apply_and_compact`'s own compaction pass — the
+*other* WAL writer, on the apply task, `crates/animus-cp-data/src/
+lib.rs`'s `apply_and_compact` — only actually rewrites the WAL when
+`behind >= COMPACT_THRESHOLD` or a peer is waiting on a fresh image
+(`image_needed`), and immediately after an install `behind` (`engine_
+applied - snapshot_index`) is `0`, since both are set to the identical
+`last_index` in the same step. So the just-installed snapshot state sits
+correct in memory but never reaches disk, and a replica caught up this way
+can sit fully caught-up indefinitely with a WAL file that still reads back
+empty. A LATER genuine process restart (`sim.stop` + a fresh `RaftKvNode::
+start` on the same engine) then recovers from that empty WAL: `drive`'s
+`fresh_group` check is true, `RaftCore::recovered` is skipped entirely, and
+the fresh core keeps `snapshot_index == last_applied == 0` — while `engine_
+applied` is correctly reseeded from the ENGINE's own durable watermark
+(already caught up). `behind` is then PERMANENTLY `engine_applied` itself:
+`RaftCore::snapshot_upto(ea)` clamps to `ea.min(last_applied)`, and `last_
+applied` is ALSO stuck at `0` on this fresh, never-recovered core, so it
+can never advance `snapshot_index` past `0` — the compaction threshold is
+crossed on every single pass forever, and the apply task spins `did_work =
+true` with no forward progress: `apply_loop` never reaches its idle
+`select(ApplyPending, sleep(..))`, so `SimEnv`'s executor never advances
+virtual time and `run_for`/`run_until` never return (a `poll_task` call
+that itself never returns control to the executor — see the next
+paragraph for why that specific shape defeated every step-bounded guard
+tried first). **Fixed** in `apply_and_compact`: processing a `drain_
+pending_install` now sets a `just_installed_snapshot` flag that
+unconditionally forces the compaction section's WAL-rewrite branch in the
+SAME pass, regardless of `behind`/`image_needed` — durably recording the
+just-installed `snapshot_index` (and the, here, empty log) before any
+later restart can ever race it. Regression: `crates/animus-cp-data/tests/
+restart_after_install_snapshot.rs` (both a `MemoryEngine` and an
+`LsmEngine<SimEnv>` scenario; both confirmed red with the fix hunk
+reverted, green with it restored).
+
+**Why neither `run_until_quiescent`'s step cap nor any virtual-time
+deadline could have bounded this, and the general lesson**: every guard
+`SimEnv` offers (`run_for`'s deadline, `run_until_quiescent`'s `max_steps`)
+bounds progress through the timeline (`fire_event` calls) or, for the
+step cap, is checked only between drains of the ready queue — neither
+helps when the busy task's own `Future::poll` call itself never returns
+control to the executor at all. `apply_loop`'s `loop { let did_work =
+apply_and_compact(..).await; if !did_work { select(..).await } }` has NO
+`.await` point between iterations when `did_work` stays `true` — and
+under `SimEnv`, an in-memory (or, per the `LsmEngine` variant, a "resolves
+without truly suspending") engine op never returns `Poll::Pending`, so the
+ENTIRE loop — potentially forever — runs inside one single `poll_task`
+call, which is exactly what `gdb`'s two backtraces (taken minutes apart,
+at two different lines of the SAME function) were showing. **The only
+primitive that can catch this class of hang in a test is a real OS-thread
+wall-clock watchdog** (`std::thread::spawn` + `mpsc::Receiver::
+recv_timeout`, driving `sim.run_for` on the spawned thread) — never a
+`SimEnv`-internal bound, however small. See `restart_after_install_
+snapshot.rs`'s own `drive_bounded` helper. General lesson for this crate:
+whenever a state-machine field exists purely to tell "the driver" to
+persist something (`snapshot_dirty`, here), grep EVERY site that could be
+mistaken for "the" driver-side consumer of it — a second, independent WAL
+writer (the compaction pass) existing alongside the "obvious" one (the
+consensus loop's ordinary per-message persist gate) is exactly the kind of
+split this repo's own driver/apply-task architecture (ADR 0017) produces
+by design, and a signal that only one of the two paths is wired to look at
+silently strands the other's obligation.
+
+**Why the existing raftkv corpus never caught this.** `crates/animus-test/
+tests/raftkv_linearizable.rs`'s `Nemesis::StopRestart` — the one cell that
+does exercise a genuine `sim.stop` + reconstruct restart — always targets
+the CURRENT LEADER (or the first live replica if none leads), never a
+partitioned/lagging follower specifically caught up via `InstallSnapshot`.
+A leader is structurally never in the "caught up purely via a snapshot,
+never logged an entry of its own" state its own log IS the replication
+source every follower catches up from. Widening `StopRestart`'s victim
+selection to sometimes target a snapshot-caught-up follower instead would
+need either a new `Nemesis` variant or new state tracking "which live
+replica's own log has never grown," at real risk to the corpus's existing
+seed-pinned coverage guarantees (`raftkv_corpus_covers_the_fault_matrix`) —
+judged not cheap enough to fold in here; the dedicated regression above is
+this fix's own proof instead. Mirrors the exact shape of the (2), 2026-09-09
+issue #804-follow-up entry below: a compound precondition ("this exact
+replica caught up ONLY via snapshot" AND "then gets genuinely restarted
+before anything else touches its WAL") essentially never lines up by
+chance under organic single-fault injection whose victim selection wasn't
+designed with this precondition in mind.
+
 ## Broadening a fault-injection corpus's clock-skew coverage from uniform to per-replica differential is necessary but not sufficient — the workload's own command vocabulary gates which witnessing-gap bugs are even reachable (2026-09-09, issue #804 follow-up)
 
 Extending `raftkv_linearizable.rs` (the leaderful-plane Elle corpus) with
