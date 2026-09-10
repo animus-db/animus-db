@@ -6097,6 +6097,28 @@ record, and ADR 0061's "Rung L closed" amendment for the full per-PR
 account, the mechanism summary, and the assess-and-close verdicts on the
 permanent residuals.
 
+**C-13 (rung M, opened 2026-09-10).** The next residual group, deferred by
+C-12's own close-out: the real ADR 0030/0032 seed/join discovery dance
+`SimCluster::grow`/`seed_members` both bypass with a direct two-propose
+self-registration on the control leader's own in-process handle (skipping
+the pre-bind wire discovery/claim round trip AND the real `detect_loop`-
+driven `Active` promotion). Five files/13 tests (corrected from the
+roadmap's earlier 4/9 — `join_data_seed_settings_reach.rs` was omitted):
+`data_join.rs` (1), `seed_join.rs` (1), `seed_join_allocated.rs` (5, 4
+convertible/1 permanent), `control_membership_split.rs` (2, open
+question), `join_data_seed_settings_reach.rs` (4, 1 convertible/3
+permanent). The dial primitive PR 2 builds: `RelayClient`-generic
+`discover_join_info_via_relay`/`claim_join_identity_via_relay` siblings
+(same request/response shapes as production, over `SimRelayClient`
+instead of a raw `TcpStream`) plus a new `SimCluster::join_via_seed`
+driver that discovers/claims for real, then lets the real `detect_loop`
+promote the member to `Active` on its own first observed heartbeat —
+never a bypass propose. A newly-found, small additive production gap:
+`handle_relayed_request`'s allowlist (`forwarding.rs`) has no
+`ClientRequest::JoinInfo` arm yet. See ADR 0061's "Rung M (post-C-12)"
+opener amendment for the full grep-verified ground truth, the per-test
+verdict table, and the 7-PR ladder.
+
 ### `sim_cluster_corpus`: the SimCluster cycles/durability corpus (ADR 0061 rung D1 step 3)
 
 `crates/animusd/src/sim_cluster_corpus.rs` (`#[cfg(test)] mod
@@ -6755,7 +6777,11 @@ outcome: 22 scenarios/43 tests converted across 7 real-socket files by
 PRs 4a-4d (`cluster_split.rs` deleted whole), plus 11 scenarios/22 tests
 converted from `control_membership_admin.rs` by PR 4e (65 tests total
 across 8 files), 9 tests across 4 files deferred to the seed-join
-candidate (C-13, not yet opened), and 7 tests across 4 files genuinely
+candidate — **opened** 2026-09-10 as C-13/ADR 0061 rung M (PR 1 landed),
+which corrected that figure to 5 files/13 tests (`join_data_seed_
+settings_reach.rs`'s 4 were missing from it; see `docs/roadmap.md`'s C-13
+entry and this file's own "C-13 (rung M, opened 2026-09-10)" pointer
+above) — and 7 tests across 4 files genuinely
 permanent (the prior 6 across 3 files, plus `control_membership_
 admin.rs`'s own permanent `ProdEnv::merge_peer` residual, `runtime_
 added_voter_survives_leadership_change_to_a_different_original_voter`);
