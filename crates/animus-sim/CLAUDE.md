@@ -44,7 +44,20 @@ function of one seed. This is the substrate every distributed test runs on.
   exposed to a following `crash` exactly like any other un-synced tail)),
   and `corrupt_durable(node, file, offset)` (flip one durable byte —
   at-rest corruption of synced data, e.g. to hit an SSTable's per-block CRC).
-- Observability: `trace()` / `trace_lines()`, `now()`, `seed()`.
+- Observability: `trace()` / `trace_lines()`, `now()`, `seed()`, `stats()`
+  (`SimStats { task_polls, timer_fires }`, ADR 0061 rung I C-09 PR 3's
+  follow-on — the corpus-deep `dynamo_wire` timeout fix, 2026-09-09): a
+  pure, additive, seed-reproducible measure of executor work done so far —
+  `task_polls` counts every `poll_task` call the drain loop makes,
+  `timer_fires` every `(time, seq)` timeline entry `fire_event` pops
+  (timers and message deliveries both). Never read by anything inside this
+  crate; purely an observability hook for a caller (e.g. `animusd`'s
+  `sim_cluster_dynamo_corpus.rs::run_scenario`) that wants to bound a
+  scenario's own executor cost deterministically rather than against real
+  wall-clock time, which a shared CI runner's noise floor makes unreliable.
+  Read it once before a scenario and once after, then subtract, to get a
+  per-scenario delta — the counters themselves are monotonic for the
+  lifetime of one `Simulator` (shared across every `Clone`, never reset).
 - Teardown: `shutdown()` — drains still-pending tasks, breaking the
   `Simulator`/`SimEnv` reference cycle a perpetual task's own captured
   handle forms with the simulator's own shared state (see "What's

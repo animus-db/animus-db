@@ -421,6 +421,42 @@ async fn stream_tablet_ids(addr: SocketAddr, stream_arn: &str) -> BTreeSet<u64> 
     ids
 }
 
+/// Prints a failure diagnostic distinguishing "same shard+HLC re-read
+/// twice" (a harness double-poll — duplicate `eventID`s) from "two
+/// different shards produced a record for the same item" (a genuine
+/// cross-tablet production duplication — duplicate item ids under
+/// *distinct* `eventID`s, same trailing packed-HLC digits but a different
+/// `shardId-<tablet>-<epoch>` prefix — see `docs/engineering-lessons.md`)
+/// whenever `delivered.len() != expected`, printed *before* the caller's own
+/// `assert_eq!` so both land together in the test's output (issue #755:
+/// hoisted out of `auto_split_mid_stream_with_live_consumer_across_every_
+/// node`'s own inline copy so every `drain_all_tablets_lineage` caller's
+/// exactly-once assertion gets the same postmortem for free, instead of the
+/// bare count the original report of #755 had nothing more to go on than).
+/// A no-op when the count already matches.
+fn diagnose_exactly_once_mismatch(delivered: &[Value], expected: usize) {
+    if delivered.len() == expected {
+        return;
+    }
+    let mut by_event_id: BTreeMap<String, usize> = BTreeMap::new();
+    let mut by_item_id: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for r in delivered {
+        let event_id = r["eventID"].as_str().unwrap_or("?").to_owned();
+        *by_event_id.entry(event_id.clone()).or_insert(0) += 1;
+        let item_id = r["dynamodb"]["Keys"]["id"]["S"]
+            .as_str()
+            .unwrap_or("?")
+            .to_owned();
+        by_item_id.entry(item_id).or_default().push(event_id);
+    }
+    let dup_events: Vec<_> = by_event_id.iter().filter(|&(_, &c)| c > 1).collect();
+    let dup_items: Vec<_> = by_item_id.iter().filter(|(_, v)| v.len() > 1).collect();
+    eprintln!(
+        "DIAGNOSTIC delivered={} expected={expected} dup_event_ids={dup_events:?} dup_item_ids={dup_items:?}",
+        delivered.len(),
+    );
+}
+
 /// Drains `tablet`'s **whole** lineage of `TABLE`'s stream (every already
 /// closed epoch, `TRIM_HORIZON` to null, in ascending order, then the open
 /// tail polled until `want` records total have been collected) — the
@@ -550,6 +586,153 @@ async fn drain_tablet_lineage(
     }
 }
 
+/// Decision returned by [`LineageCursors::epoch_iterator_decision`]: resume
+/// an in-flight open-tail iterator, or mint a fresh `TRIM_HORIZON` one.
+#[derive(Debug, PartialEq, Eq)]
+enum EpochIteratorDecision {
+    Resume(String),
+    Mint,
+}
+
+/// Pure, synchronous per-tablet cursor bookkeeping for
+/// [`drain_all_tablets_lineage`], extracted (issue #755) so its handoff
+/// rules can be proven with a deterministic table-driven unit test instead
+/// of only ever being exercised by a real-thread, real-cluster timing race.
+/// Holds exactly the state the async drain loop used to keep in four raw
+/// maps: which tablets are tracked, each one's next-epoch-to-drain cursor,
+/// and which tablet (if any) currently has an outstanding open-tail
+/// iterator pinned to which epoch.
+#[derive(Default, Debug, Clone)]
+struct LineageCursors {
+    tracked: BTreeSet<TabletId>,
+    next_epoch: BTreeMap<TabletId, u64>,
+    open_epoch: BTreeMap<TabletId, u64>,
+    open_iterator: BTreeMap<TabletId, String>,
+}
+
+impl LineageCursors {
+    /// Folds newly-discovered tablet ids (from a fresh `DescribeStream`
+    /// call) into the tracked set, seeding a fresh `next_epoch = 0` cursor
+    /// for each one genuinely new. **A tablet already tracked — including
+    /// one this walk has stopped polling because its lineage is fully
+    /// drained and retired — must never be re-seeded**: `DescribeStream`
+    /// lists every shard a tablet ever had, retired or not, forever, so
+    /// anything that forgets a tablet's tracking entirely makes it look
+    /// brand new the very next pass and walks its whole already-delivered
+    /// lineage again from epoch 0 — the same "epoch resumed after being
+    /// observed closed" hazard this walker exists to avoid, just operating
+    /// on an entire tablet instead of one epoch (see [`Self::epoch_trimmed`]
+    /// for the transition that used to cause exactly this). Returns the ids
+    /// that were genuinely new, for tests/diagnostics.
+    fn fold_in_discovered(
+        &mut self,
+        discovered: impl IntoIterator<Item = TabletId>,
+    ) -> BTreeSet<TabletId> {
+        let mut added = BTreeSet::new();
+        for tablet in discovered {
+            if self.tracked.insert(tablet) {
+                self.next_epoch.insert(tablet, 0);
+                added.insert(tablet);
+            }
+        }
+        added
+    }
+
+    fn tracked_ids(&self) -> Vec<TabletId> {
+        self.tracked.iter().copied().collect()
+    }
+
+    fn next_epoch_of(&self, tablet: TabletId) -> u64 {
+        self.next_epoch.get(&tablet).copied().unwrap_or(0)
+    }
+
+    /// The closed-epoch loop's own iterator choice for `tablet`'s current
+    /// cursor epoch: resume the exact outstanding open-tail iterator if one
+    /// is pinned to this same epoch (this epoch was still the open tail as
+    /// of a previous pass and has since sealed — resuming preserves
+    /// whatever position that poll already reached, never re-reading it
+    /// from `TRIM_HORIZON`), otherwise mint fresh.
+    fn epoch_iterator_decision(&mut self, tablet: TabletId, epoch: u64) -> EpochIteratorDecision {
+        if self.open_epoch.get(&tablet) == Some(&epoch) {
+            EpochIteratorDecision::Resume(
+                self.open_iterator
+                    .remove(&tablet)
+                    .expect("open_epoch implies an iterator"),
+            )
+        } else {
+            EpochIteratorDecision::Mint
+        }
+    }
+
+    /// `tablet`'s cursor epoch has now been fully drained (its iterator ran
+    /// to a null `NextShardIterator`) — advance past it and drop any stale
+    /// open-tail pin on it.
+    fn epoch_closed(&mut self, tablet: TabletId) {
+        *self.next_epoch.get_mut(&tablet).expect("tracked tablet") += 1;
+        self.open_epoch.remove(&tablet);
+    }
+
+    /// Is there already a live open-tail iterator pinned to `tablet` at
+    /// exactly `epoch`? If not, the caller must mint one and record it via
+    /// [`Self::set_open_iterator`] before polling.
+    fn is_open_iterator_current(&self, tablet: TabletId, epoch: u64) -> bool {
+        self.open_epoch.get(&tablet) == Some(&epoch)
+    }
+
+    fn set_open_iterator(&mut self, tablet: TabletId, epoch: u64, iterator: String) {
+        self.open_epoch.insert(tablet, epoch);
+        self.open_iterator.insert(tablet, iterator);
+    }
+
+    fn open_iterator_of(&self, tablet: TabletId) -> Option<&str> {
+        self.open_iterator.get(&tablet).map(String::as_str)
+    }
+
+    /// Records one open-tail `GetRecords` poll's outcome for `tablet` at
+    /// `epoch`. A `Some` `next_iterator` means the shard is still open —
+    /// pin the continuation. A `None` means this call's *own* response
+    /// already carries the epoch's final records (the fresh open-vs-sealed
+    /// check inside that one call flipped mid-call, ADR 0042 §2) — the
+    /// cursor must advance immediately and the pin must be dropped, or a
+    /// later pass's closed-epoch loop would "resume" this now-exhausted
+    /// iterator and re-deliver what it already gave up.
+    fn open_tail_polled(&mut self, tablet: TabletId, epoch: u64, next_iterator: Option<String>) {
+        debug_assert_eq!(self.open_epoch.get(&tablet), Some(&epoch));
+        match next_iterator {
+            Some(next) => {
+                self.open_iterator.insert(tablet, next);
+            }
+            None => {
+                self.next_epoch.insert(tablet, epoch + 1);
+                self.open_epoch.remove(&tablet);
+                self.open_iterator.remove(&tablet);
+            }
+        }
+    }
+
+    /// A speculative open-tail poll guessed an epoch that turned out never
+    /// to have existed (`TrimmedDataAccessException`): the tablet retired
+    /// one epoch earlier than the stale `Metadata` read this walk used to
+    /// decide "this looks open" believed. Every epoch that DID exist was
+    /// already fully drained by the closed-epoch loop before this cursor
+    /// ever reached the nonexistent one, so nothing is missing — only the
+    /// speculative pin itself is stale. **This must drop only the open-tail
+    /// pin, never the tablet's own tracking/cursor** (the bug fixed for
+    /// issue #755: the original handler called the equivalent of
+    /// `tracked.remove`/`next_epoch.remove` here, on the theory that a
+    /// retired tablet's children already cover it — true for the *data*,
+    /// but it made the tablet vanish from `tracked`, and
+    /// [`Self::fold_in_discovered`]'s very next call re-discovers the same
+    /// tablet via `DescribeStream` (which lists retired shards forever) and
+    /// re-seeds it at `next_epoch = 0`, silently re-walking and
+    /// re-delivering its entire already-collected lineage — a real,
+    /// reproduced duplicate, not merely a theoretical one).
+    fn epoch_trimmed(&mut self, tablet: TabletId) {
+        self.open_epoch.remove(&tablet);
+        self.open_iterator.remove(&tablet);
+    }
+}
+
 /// [`drain_tablet_lineage`]'s multi-tablet sibling: drains every closed
 /// epoch of every currently-known tablet, then polls every known tablet's
 /// open tail once per pass, summing across all of them, until `want_total`
@@ -577,6 +760,12 @@ async fn drain_tablet_lineage(
 /// pressure (`auto_split_mid_stream_with_live_consumer_across_every_node`,
 /// D8, ~1/20 iterations before this fix), now closed structurally rather
 /// than adjudicated as a known harness limitation.
+///
+/// The cursor bookkeeping itself lives in [`LineageCursors`], extracted so
+/// its handoff rules (in particular [`LineageCursors::epoch_trimmed`]'s
+/// issue #755 fix — a `TrimmedDataAccessException` on the open tail must
+/// never forget the tablet's own tracking, only its stale open-tail pin)
+/// carry a deterministic unit test alongside this real-cluster one.
 async fn drain_all_tablets_lineage(
     dynamo_addr: SocketAddr,
     stream_arn: &str,
@@ -586,14 +775,8 @@ async fn drain_all_tablets_lineage(
     deadline: tokio::time::Instant,
 ) -> Vec<Value> {
     let mut collected = Vec::new();
-    let mut tracked: BTreeSet<TabletId> = tablets.iter().copied().collect();
-    let mut next_epoch: std::collections::BTreeMap<TabletId, u64> =
-        tracked.iter().map(|&t| (t, 0u64)).collect();
-    // Per-tablet open-tail state, resumed from its own last position — see
-    // `drain_tablet_lineage`'s identical doc for why re-minting
-    // `TRIM_HORIZON` every pass would double-count an open shard's records.
-    let mut open_epoch: BTreeMap<TabletId, u64> = BTreeMap::new();
-    let mut open_iterator: BTreeMap<TabletId, String> = BTreeMap::new();
+    let mut cursors = LineageCursors::default();
+    cursors.fold_in_discovered(tablets.iter().copied());
     loop {
         // Re-resolve the shard chain before touching any tablet's records
         // this pass — see this function's own doc for why a static snapshot
@@ -601,32 +784,31 @@ async fn drain_all_tablets_lineage(
         // freshly discovered tablet starts at epoch 0 and has no open-tail
         // state yet, so it falls straight into the ordinary per-tablet loops
         // below exactly like one of the originally-seeded tablets would.
-        for tablet_id in stream_tablet_ids(dynamo_addr, stream_arn).await {
-            let tablet = TabletId(tablet_id);
-            if tracked.insert(tablet) {
-                next_epoch.insert(tablet, 0);
-            }
-        }
-        let current_tablets: Vec<TabletId> = tracked.iter().copied().collect();
+        cursors.fold_in_discovered(
+            stream_tablet_ids(dynamo_addr, stream_arn)
+                .await
+                .into_iter()
+                .map(TabletId),
+        );
+        let current_tablets = cursors.tracked_ids();
         for &tablet in &current_tablets {
             let chain_len = node
                 .metadata()
                 .stream_shards
                 .range((tablet, 0)..=(tablet, u64::MAX))
                 .count() as u64;
-            let cursor = next_epoch.get_mut(&tablet).expect("tracked tablet");
-            while *cursor < chain_len {
+            while cursors.next_epoch_of(tablet) < chain_len {
+                let epoch = cursors.next_epoch_of(tablet);
                 // See `drain_tablet_lineage`'s identical fix: resume from
                 // the open-tail iterator if this epoch was already being
                 // polled as open, rather than re-minting `TRIM_HORIZON`
                 // and re-delivering what that poll already collected.
-                let mut iterator = if open_epoch.get(&tablet) == Some(&*cursor) {
-                    open_iterator
-                        .remove(&tablet)
-                        .expect("open_epoch implies an iterator")
-                } else {
-                    let shard_id = segment::shard_id(tablet.0, *cursor);
-                    get_shard_iterator(dynamo_addr, stream_arn, &shard_id, "TRIM_HORIZON").await
+                let mut iterator = match cursors.epoch_iterator_decision(tablet, epoch) {
+                    EpochIteratorDecision::Resume(iterator) => iterator,
+                    EpochIteratorDecision::Mint => {
+                        let shard_id = segment::shard_id(tablet.0, epoch);
+                        get_shard_iterator(dynamo_addr, stream_arn, &shard_id, "TRIM_HORIZON").await
+                    }
                 };
                 loop {
                     let (records, next) = get_records(dynamo_addr, &iterator).await;
@@ -636,8 +818,7 @@ async fn drain_all_tablets_lineage(
                         None => break,
                     }
                 }
-                *cursor += 1;
-                open_epoch.remove(&tablet); // a fresh epoch just closed
+                cursors.epoch_closed(tablet); // a fresh epoch just closed
             }
         }
         for &tablet in &current_tablets {
@@ -649,42 +830,29 @@ async fn drain_all_tablets_lineage(
             if !node.metadata().tablets.contains_key(&tablet) {
                 continue;
             }
-            let epoch = next_epoch[&tablet];
-            if open_epoch.get(&tablet) != Some(&epoch) {
+            let epoch = cursors.next_epoch_of(tablet);
+            if !cursors.is_open_iterator_current(tablet, epoch) {
                 let shard_id = segment::shard_id(tablet.0, epoch);
                 let iterator =
                     get_shard_iterator(dynamo_addr, stream_arn, &shard_id, "TRIM_HORIZON").await;
-                open_iterator.insert(tablet, iterator);
-                open_epoch.insert(tablet, epoch);
+                cursors.set_open_iterator(tablet, epoch, iterator);
             }
-            let iterator = open_iterator.get(&tablet).expect("just ensured").clone();
+            let iterator = cursors
+                .open_iterator_of(tablet)
+                .expect("just ensured")
+                .to_owned();
             match get_records_allow_trim(dynamo_addr, &iterator).await {
                 RecordsPoll::Delivered(records, next) => {
                     collected.extend(records);
-                    match next {
-                        Some(next) => {
-                            open_iterator.insert(tablet, next);
-                        }
-                        None => {
-                            // Identical race to `drain_tablet_lineage`'s fix
-                            // above: this tablet's epoch sealed between
-                            // mint/last-poll and this call, so this response
-                            // is that epoch's final, fully-exhausted read,
-                            // already folded into `records`. Advance this
-                            // tablet's own cursor past it now and drop the
-                            // now-spent iterator, rather than leaving
-                            // `open_epoch`/`open_iterator` pointed at it —
-                            // the next pass's closed-epoch loop would
-                            // otherwise "resume" an iterator with nothing
-                            // left to give and re-deliver exactly what was
-                            // just collected. Each tablet's own cascade of
-                            // splits/seals hits this independently, so this
-                            // must self-correct per tablet, not just once.
-                            *next_epoch.get_mut(&tablet).expect("tracked tablet") += 1;
-                            open_epoch.remove(&tablet);
-                            open_iterator.remove(&tablet);
-                        }
-                    }
+                    // A `None` here means this call's own response already
+                    // carries the epoch's final records (the fresh
+                    // open-vs-sealed check flipped mid-call, ADR 0042 §2) —
+                    // `open_tail_polled` advances the cursor and drops the
+                    // now-spent pin immediately, exactly like
+                    // `drain_tablet_lineage`'s identical fix, so a later
+                    // pass's closed-epoch loop never "resumes" an iterator
+                    // with nothing left to give.
+                    cursors.open_tail_polled(tablet, epoch, next);
                 }
                 RecordsPoll::Trimmed => {
                     // The `tablets.contains_key` check above is a stale
@@ -694,17 +862,15 @@ async fn drain_all_tablets_lineage(
                     // reaching the server (`get_shard_iterator` then this
                     // `GetRecords`). The speculatively-guessed epoch then
                     // never existed and never will — TrimmedDataAccess is
-                    // the CORRECT answer, not a bug. Every closed epoch this
-                    // tablet ever had was already drained by the
-                    // closed-epoch loop above (a retired parent's chain
-                    // ends at its final sealed epoch), and its children were
-                    // already folded into `tracked` via `stream_tablet_ids`
-                    // at the top of this pass — so dropping this tablet's
-                    // own bookkeeping here loses nothing.
-                    tracked.remove(&tablet);
-                    next_epoch.remove(&tablet);
-                    open_epoch.remove(&tablet);
-                    open_iterator.remove(&tablet);
+                    // the CORRECT answer, not a bug. `epoch_trimmed` drops
+                    // only the stale open-tail pin, never this tablet's own
+                    // tracking — see its own doc for why forgetting the
+                    // tablet here (the pre-#755 behavior) is itself a
+                    // duplicate-delivery bug: `stream_tablet_ids` lists
+                    // every shard a tablet ever had forever, so a forgotten
+                    // tablet gets rediscovered and fully re-walked from
+                    // epoch 0 on the very next pass.
+                    cursors.epoch_trimmed(tablet);
                 }
             }
         }
@@ -1297,38 +1463,7 @@ async fn auto_split_mid_stream_with_live_consumer_across_every_node() {
         deadline,
     )
     .await;
-    if delivered.len() != expected {
-        // Self-adjudicating failure diagnostic: distinguish "same shard+HLC
-        // re-read twice" (a harness double-poll — duplicate `eventID`s)
-        // from "two different shards produced a record for the same item"
-        // (a genuine cross-tablet production duplication — duplicate item
-        // ids under *distinct* `eventID`s, same trailing packed-HLC digits
-        // but a different `shardId-<tablet>-<epoch>` prefix). A run against
-        // `c37995d` found the latter: the *same* write shows up sealed into
-        // both the parent tablet's own epoch and the freshly-split child's
-        // epoch 0 — an open production bug in the split-time change-log
-        // drain (not this file's own iterator bookkeeping), tracked
-        // separately (see this function's own doc comment and
-        // `docs/engineering-lessons.md`) rather than re-investigated here
-        // every time this test goes red.
-        let mut by_event_id: BTreeMap<String, usize> = BTreeMap::new();
-        let mut by_item_id: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for r in &delivered {
-            let event_id = r["eventID"].as_str().unwrap_or("?").to_owned();
-            *by_event_id.entry(event_id.clone()).or_insert(0) += 1;
-            let item_id = r["dynamodb"]["Keys"]["id"]["S"]
-                .as_str()
-                .unwrap_or("?")
-                .to_owned();
-            by_item_id.entry(item_id).or_default().push(event_id);
-        }
-        let dup_events: Vec<_> = by_event_id.iter().filter(|&(_, &c)| c > 1).collect();
-        let dup_items: Vec<_> = by_item_id.iter().filter(|(_, v)| v.len() > 1).collect();
-        eprintln!(
-            "DIAGNOSTIC delivered={} expected={expected} dup_event_ids={dup_events:?} dup_item_ids={dup_items:?}",
-            delivered.len(),
-        );
-    }
+    diagnose_exactly_once_mismatch(&delivered, expected);
     assert_eq!(
         delivered.len(),
         expected,
@@ -2398,6 +2533,7 @@ async fn cascade_split_walks_the_grandparent_chain_with_closed_shard_shape() {
         deadline,
     )
     .await;
+    diagnose_exactly_once_mismatch(&delivered, expected);
     assert_eq!(
         delivered.len(),
         expected,
@@ -2438,4 +2574,136 @@ async fn cascade_split_walks_the_grandparent_chain_with_closed_shard_shape() {
         Some(0),
         "a mid-split tablet must classify as a skip, never an error: {body}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// `LineageCursors` unit tests (issue #755): the cursor bookkeeping proven
+// deterministically, without a real cluster's own non-deterministic timing
+// race. `cascade_split_walks_the_grandparent_chain_with_closed_shard_shape`
+// above is the real-thread `ProdEnv` e2e counterpart that only exercises
+// this race probabilistically; these tests exercise the exact state
+// transition every time, on every run.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod lineage_cursor_tests {
+    use super::{EpochIteratorDecision, LineageCursors};
+    use animus_tablet::TabletId;
+
+    /// The bug this issue is about, reproduced at the level of pure cursor
+    /// state: a tablet whose speculative open-tail poll turns out to have
+    /// guessed a nonexistent epoch (`TrimmedDataAccessException` — the
+    /// tablet retired one epoch earlier than the stale `Metadata` read this
+    /// walk used to decide "this looks open" believed) must stay tracked
+    /// with its cursor exactly where it was, not vanish and get rediscovered
+    /// from scratch. Before the #755 fix, `epoch_trimmed` dropped the
+    /// tablet's tracking entirely (mirroring the original inline
+    /// `tracked.remove`/`next_epoch.remove`), and the very next
+    /// `fold_in_discovered` call — standing in for `stream_tablet_ids`,
+    /// which lists a tablet's shards forever, retired or not — would treat
+    /// it as brand new and reset its cursor to 0, so the record(s) at
+    /// epochs 0..4 would be walked and delivered a second time.
+    #[test]
+    fn a_trimmed_tablet_is_never_rediscovered_as_new() {
+        let mut cursors = LineageCursors::default();
+        let tablet = TabletId(42);
+
+        // Pass 1: this tablet is seeded up front.
+        let added = cursors.fold_in_discovered([tablet]);
+        assert_eq!(added.into_iter().collect::<Vec<_>>(), vec![tablet]);
+        assert_eq!(cursors.next_epoch_of(tablet), 0);
+
+        // The closed-epoch loop drains 4 already-sealed epochs (0..4).
+        for _ in 0..4 {
+            cursors.epoch_closed(tablet);
+        }
+        assert_eq!(cursors.next_epoch_of(tablet), 4);
+
+        // The open-tail loop speculatively guesses epoch 4 is the live
+        // tail (a stale `Metadata` read said so), mints an iterator for it,
+        // and the server answers `TrimmedDataAccessException`: the tablet
+        // actually retired at epoch 3, one epoch earlier than believed.
+        cursors.set_open_iterator(tablet, 4, "spent-guess".to_owned());
+        cursors.epoch_trimmed(tablet);
+
+        // Pass 2: a fresh `DescribeStream`-equivalent re-lists this same
+        // tablet's (now-historical) shards, exactly as the real
+        // `stream_tablet_ids` does for a retired tablet forever.
+        let added_again = cursors.fold_in_discovered([tablet]);
+        assert!(
+            added_again.is_empty(),
+            "a tablet already tracked — even one whose open tail just \
+             turned out to be trimmed — must never be reported as newly \
+             discovered: got {added_again:?}"
+        );
+        assert_eq!(
+            cursors.next_epoch_of(tablet),
+            4,
+            "the cursor must stay exactly where the closed-epoch loop left \
+             it, never reset to 0 — a reset silently re-walks and \
+             re-delivers every one of this tablet's 4 already-collected \
+             epochs"
+        );
+        // And no stale open-tail pin survives the trim.
+        assert_eq!(
+            cursors.epoch_iterator_decision(tablet, 4),
+            EpochIteratorDecision::Mint,
+            "no iterator should be resumable for the epoch that just \
+             trimmed"
+        );
+    }
+
+    /// The already-fixed sibling race (kept as a regression, not newly
+    /// introduced by this change): an open-tail poll whose own response
+    /// witnesses the seal (`next_iterator: None` on a `Delivered`, not a
+    /// `Trimmed`) must advance the cursor immediately, or a later pass's
+    /// closed-epoch loop would resume the now-exhausted iterator and
+    /// re-deliver what it already gave up.
+    #[test]
+    fn a_seal_witnessed_by_the_open_tail_poll_advances_immediately() {
+        let mut cursors = LineageCursors::default();
+        let tablet = TabletId(7);
+        cursors.fold_in_discovered([tablet]);
+
+        cursors.set_open_iterator(tablet, 0, "iter-0-a".to_owned());
+        // Still open: a continuation, not a seal.
+        cursors.open_tail_polled(tablet, 0, Some("iter-0-b".to_owned()));
+        assert_eq!(cursors.next_epoch_of(tablet), 0);
+        assert_eq!(
+            cursors.epoch_iterator_decision(tablet, 0),
+            EpochIteratorDecision::Resume("iter-0-b".to_owned()),
+            "the closed-epoch loop must resume the exact continuation, not \
+             re-mint TRIM_HORIZON"
+        );
+
+        // Re-arm the pin (the decision above consumed it) and this time the
+        // poll's own response witnesses the seal.
+        cursors.set_open_iterator(tablet, 0, "iter-0-c".to_owned());
+        cursors.open_tail_polled(tablet, 0, None);
+        assert_eq!(
+            cursors.next_epoch_of(tablet),
+            1,
+            "a null NextShardIterator on the open-tail poll itself must \
+             advance the cursor immediately"
+        );
+        assert_eq!(
+            cursors.epoch_iterator_decision(tablet, 0),
+            EpochIteratorDecision::Mint,
+            "epoch 0's iterator is spent — nothing must resume it"
+        );
+    }
+
+    /// `fold_in_discovered` seeds a genuinely new tablet at epoch 0 exactly
+    /// once, and stays a no-op for it on every subsequent call.
+    #[test]
+    fn fold_in_discovered_seeds_once_and_is_idempotent() {
+        let mut cursors = LineageCursors::default();
+        let tablet = TabletId(1);
+        assert_eq!(
+            cursors.fold_in_discovered([tablet]),
+            [tablet].into_iter().collect()
+        );
+        assert_eq!(cursors.next_epoch_of(tablet), 0);
+        assert!(cursors.fold_in_discovered([tablet]).is_empty());
+    }
 }

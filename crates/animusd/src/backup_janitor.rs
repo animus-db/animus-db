@@ -14,11 +14,26 @@
 //! (`spawn_common_tail`) still infers `E = ProdEnv, R = AnimusdRelayClient`
 //! from the concrete `ClientCtx` it passes in, so this is a pure signature
 //! widening with no behavior change there.
+//!
+//! **Threads an explicit `interval` (ADR 0061 rung I C-09 PR 3's follow-on,
+//! 2026-09-09)** — `animus_node::backup_janitor::backup_janitor_loop` no
+//! longer hardcodes its own tick cadence internally; both real production
+//! spawn sites (`lib.rs`) pass [`BACKUP_JANITOR_INTERVAL`] explicitly (a
+//! re-export, byte-identical to the constant this loop used to hardcode),
+//! so production behavior is unchanged. `SimCluster` passes its own shared
+//! fallback-tick constant instead — see that fixture's own doc for why.
+
+use std::time::Duration;
 
 use animus_env::Env;
 use animus_node::host::RelayClient;
 
-pub(crate) async fn backup_janitor_loop<E: Env, R: RelayClient>(ctx: crate::ClientCtx<E, R>) {
+pub(crate) use animus_node::backup_janitor::BACKUP_JANITOR_INTERVAL;
+
+pub(crate) async fn backup_janitor_loop<E: Env, R: RelayClient>(
+    ctx: crate::ClientCtx<E, R>,
+    interval: Duration,
+) {
     let env = ctx.env.clone();
-    animus_node::backup_janitor::backup_janitor_loop(env, ctx).await;
+    animus_node::backup_janitor::backup_janitor_loop(env, ctx, interval).await;
 }

@@ -14,16 +14,36 @@
 //! type arguments, so those calls keep inferring the same defaults and stay
 //! byte-identical — the same pure signature-widening shape `ttl_reaper.rs`
 //! already used (C-09 PR 2).
+//!
+//! **Threads an explicit `interval` (ADR 0061 rung I C-09 PR 3's follow-on,
+//! 2026-09-09)** — this wrapper no longer hardcodes
+//! `animus_node::index_backfill::INDEX_BACKFILL_LOOP_INTERVAL_MS`
+//! internally; both real production spawn sites (`lib.rs`) pass
+//! [`INDEX_BACKFILL_LOOP_INTERVAL`] explicitly (a `Duration` view of the
+//! same millisecond constant this wrapper used to hardcode, so production
+//! behavior is unchanged). `SimCluster` passes its own shared fallback-tick
+//! constant instead — see that fixture's own doc for why.
+
+use std::time::Duration;
 
 use animus_env::Env;
 use animus_node::host::RelayClient;
 
-pub(crate) async fn index_backfill_loop<E: Env, R: RelayClient>(ctx: crate::ClientCtx<E, R>) {
+/// [`INDEX_BACKFILL_LOOP_INTERVAL_MS`](animus_node::index_backfill::INDEX_BACKFILL_LOOP_INTERVAL_MS)
+/// as a `Duration` — this wrapper's own production-default `interval`
+/// argument. The underlying `animus_node::index_backfill::
+/// index_backfill_loop` still takes a plain `interval_ms: u64` (unchanged),
+/// so this crate's own `Duration`-typed call sites (mirroring every other
+/// widened loop's own `interval: Duration` parameter) convert once here
+/// rather than at each of the two `lib.rs` spawn sites.
+pub(crate) const INDEX_BACKFILL_LOOP_INTERVAL: Duration =
+    Duration::from_millis(animus_node::index_backfill::INDEX_BACKFILL_LOOP_INTERVAL_MS);
+
+pub(crate) async fn index_backfill_loop<E: Env, R: RelayClient>(
+    ctx: crate::ClientCtx<E, R>,
+    interval: Duration,
+) {
     let env = ctx.env.clone();
-    animus_node::index_backfill::index_backfill_loop(
-        env,
-        ctx,
-        animus_node::index_backfill::INDEX_BACKFILL_LOOP_INTERVAL_MS,
-    )
-    .await;
+    let interval_ms = u64::try_from(interval.as_millis()).unwrap_or(u64::MAX);
+    animus_node::index_backfill::index_backfill_loop(env, ctx, interval_ms).await;
 }
