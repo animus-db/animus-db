@@ -5313,10 +5313,26 @@ ADR itself for the full design/rationale.
   absent — safe only from paths that structurally can't run on a control-only node
   (the dynamo edge, `auto_split_loop`). `resolve_cp_route` must never panic — it
   matches `self.data.as_ref()` directly (control-only node ⇒ zero local replicas).
-- **`--cluster N` without `--dir` reuses ONE fixed path** (`$TMPDIR/animusd`), and
-  `--ephemeral` does NOT make the control/raftkv WALs ephemeral (it only selects
-  the CP-data `StorageBackend`). Two concurrent `--cluster N` runs contend on the
-  same on-disk WALs — always pass a fresh explicit `--dir` for a throwaway run.
+- **`--cluster N`/`--cluster-control N --cluster-data M` without `--dir` now
+  default to a fresh, unique-per-process path** (`main.rs::
+  resolve_cluster_data_dir`, `$TMPDIR/animusd-cluster-<pid>` or
+  `animusd-ephemeral-<pid>` under `--ephemeral`), printed at startup
+  (`animusd: data dir …`). Before this, both commands defaulted `--dir` to
+  ONE fixed path (`$TMPDIR/animusd`) regardless of `--ephemeral` — and
+  `--ephemeral` never made the control/raftkv WALs ephemeral in the first
+  place (it only selects the CP-data `StorageBackend`; `Node::bind` always
+  writes the control-plane `ProdEnv` under `dir.join("internal")` on real
+  disk). Two back-to-back `--cluster N` runs with no `--dir` therefore
+  rehydrated the first run's control-plane WAL — stale membership/term
+  state for a different node set (and different OS-assigned ports, since
+  every node binds `ip:0`) — and could come up stuck/never-electing; this
+  bit two separate investigations before the default was fixed. The fixed
+  default was never a legitimate "resume this cluster" feature (unlike
+  `--config FILE --node I`'s per-index default, which *is* one) precisely
+  because these two commands re-mint every address on every invocation, so
+  there is no stable prior state to legitimately resume. `--dir` still lets
+  you opt into a fixed, reusable location on purpose; a genuinely
+  throwaway run needs nothing extra now.
 - **The cluster's members are node ids** (ADR 0040 unified the control and
   raftkv id spaces into one) — `bootstrap` (leader-only, idempotent)
   registers each data-role node's own id as `Active`. Failure detection
