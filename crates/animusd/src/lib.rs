@@ -5621,6 +5621,7 @@ impl BoundNode {
         tasks.push(tokio::spawn(segment_janitor::segment_janitor_loop(
             ctx.clone(),
             stream_retention,
+            segment_janitor::SEGMENT_JANITOR_INTERVAL,
         )));
 
         // The secondary-index backfill-completion aggregator (ADR 0045 §4):
@@ -5631,6 +5632,7 @@ impl BoundNode {
         // exactly like the segment janitor just above.
         tasks.push(tokio::spawn(index_backfill::index_backfill_loop(
             ctx.clone(),
+            index_backfill::INDEX_BACKFILL_LOOP_INTERVAL,
         )));
 
         // The on-demand backup completion aggregator (ADR 0059 §3/§4, Train
@@ -5651,6 +5653,7 @@ impl BoundNode {
         // backup-completion aggregators above.
         tasks.push(tokio::spawn(backup_janitor::backup_janitor_loop(
             ctx.clone(),
+            backup_janitor::BACKUP_JANITOR_INTERVAL,
         )));
 
         // PITR periodic base snapshots + retention (ADR 0059 §9, Train 3):
@@ -6643,6 +6646,7 @@ impl BoundControlNode {
         tasks.push(tokio::spawn(segment_janitor::segment_janitor_loop(
             ctx.clone(),
             stream_retention,
+            segment_janitor::SEGMENT_JANITOR_INTERVAL,
         )));
 
         // The secondary-index backfill-completion aggregator (ADR 0045 §4):
@@ -6652,6 +6656,7 @@ impl BoundControlNode {
         // documented scope gap here.
         tasks.push(tokio::spawn(index_backfill::index_backfill_loop(
             ctx.clone(),
+            index_backfill::INDEX_BACKFILL_LOOP_INTERVAL,
         )));
 
         // The on-demand backup completion aggregator (ADR 0059 §3/§4, Train
@@ -6673,6 +6678,7 @@ impl BoundControlNode {
         // `backup_janitor.rs`'s own doc for the full design.
         tasks.push(tokio::spawn(backup_janitor::backup_janitor_loop(
             ctx.clone(),
+            backup_janitor::BACKUP_JANITOR_INTERVAL,
         )));
 
         // PITR periodic base snapshots + retention (ADR 0059 §9, Train 3): a

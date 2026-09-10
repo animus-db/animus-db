@@ -24914,3 +24914,219 @@ check whether the read is `ConsistentRead: true` and whether the node
 serving it is the tablet's own leader — if either is no, the read can race
 replication, and it will eventually be caught, not prevented, by "it
 always passed before."
+## A background loop's own "cheap when idle" self-assessment is per-loop, not per-fixture — and a plausible root-cause story still needs a direct measurement before the fix is trusted (2026-09-09, ADR 0061 rung I C-09 PR 3's follow-on, #772)
+
+Five separate rungs (D4 PR 1's real `Reconciler` cutover + `heartbeat_
+loop`, D4 PR 5's backup janitor, C-07 PR 5's segment janitor, C-09's TTL
+reaper, C-10's index backfill), each landing weeks apart, each added one
+more always-on per-node background loop to `SimCluster::new`/`restart` —
+and each one's own PR reasonably concluded its own 200ms tick was cheap,
+because it was validated against this crate's own depth-1 `sim_cluster`
+lib tier (a handful of short scenarios) and looked negligible there. None
+of them was ever run against `ANIMUS_DYNAMO_WIRE_SEEDS=25` — the nightly
+`corpus-deep` tier, 200 scenarios, 30-minute CI budget — because nothing
+about any one PR's own scope pointed at that tier as the place its cost
+would compound. It took a sixth rung's own always-on loop (the TTL
+reaper, then a seventh, index backfill) before the accumulated tick
+overhead crossed the 30-minute wall and the nightly finally went red, at
+scenario 181/200. **The general lesson: a background loop's own
+"cheap-when-idle" self-assessment is scoped to the tier it was measured
+against, never to every tier that will ever spawn it** — the tier to
+measure a NEW always-on `SimCluster` loop's added cost against is
+whichever tier multiplies node-count times op-count the hardest
+(`ANIMUS_DYNAMO_WIRE_SEEDS=25` for this fixture specifically, not the
+depth-1 default), and a fix belongs in a single shared, auditable
+constant (`SIM_FALLBACK_TICK`, `sim_cluster.rs`) rather than five
+independently-tuned 200ms ones that each looked reasonable in isolation.
+
+**A second, sharper lesson from the same investigation: the plausible
+root-cause story the first pass wrote down was only partly right, and a
+direct A/B measurement caught the gap before the fix shipped on faith
+alone.** The framing going in — "200ms times up to 7 nodes times ~12s
+virtual per op is a ~3.3x compounded overhead" — was arithmetically
+clean and matched the timeline (the regression from a documented
+~601s/200-scenario baseline to a 30-minute timeout correlated with
+exactly these five rungs' own landing dates). It was still not the
+dominant cause: a direct `animus_sim::Simulator::stats()` measurement (a
+new, purely additive `task_polls`/`timer_fires` counter, built for
+exactly this) on the corpus's cheapest cell showed the five loops' own
+tick rate moved total executor cost only ~5.6% across a 300x range of
+tick coarseness (200ms to 1s to 60s). The real dominant cost was
+something the fix's own scope never touched: real per-tablet/
+control-plane Raft consensus traffic (heartbeats, `AppendEntries`,
+confirm-poll retries) accumulating across the large cumulative virtual
+time `SimCluster`'s own `spawn_and_capture` design burns — every
+synchronous op call drives a full, unconditional `Simulator::
+run_for(OP_BUDGET)` (12s) regardless of how quickly it resolves, and the
+corpus's own probe calls (`run_transact_probe` especially, added by a
+later, unrelated rung) issue many such calls per scenario. The fix still
+shipped — it closes the acute symptom (the corpus now completes at
+`ANIMUS_DYNAMO_WIRE_SEEDS=25` instead of timing out) and is a real,
+worthwhile simplification (one auditable constant instead of five) — but
+it does **not** restore the corpus to anywhere near its stale ~601s
+baseline, and the honest report says so rather than declaring victory
+against the softer, unverified target. **The rule this leaves behind**:
+when a plausible, timeline-correlated root-cause story is handed to you
+as already-established, measure it directly before trusting it to size
+the fix — correlation in time between "these rungs landed" and "the tier
+went red" does not by itself prove causal magnitude, only that a
+defensible fix in the region has to exist; a cheap, purely additive
+counter (here, two `Relaxed` atomics on the simulator's own drain loop)
+is usually enough to tell the difference between "the whole story" and
+"the timeline-plausible half of it," and is worth building even when the
+task brief already names a fix to implement.
+
+## The dominant cost the entry above left unfixed: an unquiesced CP-data Raft group and a fixed-budget probe helper, both closed without touching production code or dropping coverage (2026-09-09, follow-up to #772, PR 2/2)
+
+The entry above correctly named the real cost driver but explicitly left it
+unfixed: "real per-tablet/control-plane Raft consensus traffic... every
+synchronous op call drives a full, unconditional `Simulator::
+run_for(OP_BUDGET)` (12s) regardless of how quickly the call itself
+resolves... a fuller fix... would need to address the corpus's own
+`OP_BUDGET`-per-call probe design... out of this fix's scope." A follow-up
+bisect (`ANIMUS_DYNAMO_WIRE_SEEDS=25` depth-1 wall time at each first-parent
+merge commit between the stale `12e46df5` baseline and the red-nightly tip)
+localized the ~4.6x per-scenario regression to one commit, `eef8a102` (C-06
+PR 4, "Transact ops in the corpus"): 22.77s → 71.52s at depth-1 (8
+scenarios), a jump bigger than every other candidate's own contribution
+combined (D4 PR 1's real-`Reconciler` hosting cutover, `5d80de25`, moved
+depth-1 wall time by under 4% on its own — ruled out by direct
+measurement, not by reasoning). The mechanism: `run_transact_probe`
+(`sim_cluster_dynamo_corpus.rs`) issues ~11 sequential `SimCluster::dynamo`
+calls per node, and a tokened `TransactWriteItems` among them
+auto-provisions the internal `__animus_txn_idempotency` table — a brand
+new, permanently-unquiesced CP-data tablet group that then keeps ticking
+its own Raft heartbeat/election-timeout machinery for the rest of the
+scenario's virtual-time span, on top of every *existing* group doing the
+same for the full 12s of every one of the corpus's own probe calls, whether
+or not that call ever touches it.
+
+**Two independent, additive root-cause fixes, both entirely inside the
+`#[cfg(test)]` `SimCluster` fixture — zero production code touched:**
+
+1. **CP-data quiescence (ADR 0048), never previously wired into
+   `SimCluster` at all.** `SimCluster::new_with_cp_quiescence` (a new
+   constructor sibling of `new`/`new_with_segment_janitor_retention`,
+   `sim_cluster.rs`) opts every node's `Reconciler` into
+   `enable_quiescence(after)` right after construction, before any tablet
+   is ever hosted — the one place this fixture can call it at all, since by
+   the time `SimCluster::new` returns, every reconciler has already been
+   moved into its own driving task. `sim_cluster_dynamo_corpus.rs::
+   run_scenario` opts in at production's own default threshold
+   (`DEFAULT_QUIESCE_AFTER_SECS` = 5s). Measured contribution in isolation:
+   ~24% of this corpus's own executor cost (`Simulator::stats()`,
+   `dynamowire_baseline`) — real, but a minority of the total; narrowing
+   `quiesce_after` toward the 200ms floor barely moved it further (~5%
+   more), which was itself informative: it proved the *quiesce-after
+   window* was never the dominant lever, ruling out a hypothesis before it
+   could be mistaken for the fix.
+2. **`spawn_and_capture_fast`, a second synchronous-op driver that returns
+   the instant its future resolves instead of always burning the full
+   `OP_BUDGET` (12s) window — used ONLY by this corpus's own probe/
+   verification helpers** (`run_delete_probe`/`run_batch_write_probe`/
+   `run_transact_probe`/`force_resolve_all_keys`), never by the shared
+   `SimCluster::dynamo`/`put`/`get`/`scan` every other `sim_cluster_*`
+   module calls. This is the dominant lever: combined with quiescence,
+   `dynamowire_baseline`'s own executor cost fell from ~786K task_polls
+   (pre-fix) to ~35K (post-fix) — a ~22x reduction — because the SAME
+   control-plane `RaftCore` heartbeat traffic (`heartbeat_interval` = 50ms,
+   never quiesced by design, ADR 0044 phase-1 fork G) that quiescence
+   cannot touch was previously being paid in full for the ~11+ virtual
+   seconds after a probe op had *already resolved*, on every single one of
+   the corpus's dozens of probe calls per scenario.
+
+**Why this couldn't be a change to `spawn_and_capture` itself.** The
+shared method's "always burn the full budget" behavior is load-bearing
+elsewhere in the SAME test tier: `sim_cluster_dynamo_update_table.rs`'s
+`update_table_raising_units_admits_more` relies on every `SimCluster::
+dynamo` call unconditionally advancing virtual time by `OP_BUDGET` so a
+`ThrottleBucket` has genuinely refilled by the next retry, with no explicit
+sleep between attempts. Changing the shared method would have silently
+broken that (and possibly other, unaudited) reliance across the ~30 sibling
+`sim_cluster_*` modules built on it — exactly the failure mode this task's
+own hard rule against widening a fix "to make a change compile" exists to
+prevent. The fix is additive instead: a new method, opt-in per call site,
+touching only the four functions that actually have no dependency on the
+full-budget virtual-time advance.
+
+**Result**: `SCENARIO_TIMER_FIRES_BUDGET` tightened from 3,300,000 to
+110,000 (~2.1x the new measured `two_tables` maximum, 52,273 timer
+fires/scenario — mirroring the original constant's own sizing discipline);
+`ANIMUS_DYNAMO_WIRE_SEEDS=25` wall time fell from 26:56 (post-#772-PR-1,
+still over 4x the stale ~601s baseline the entry above declined to chase)
+to 77.6s — well under that stale baseline, not just under the CI timeout.
+A second, independent measurement race this fix's own gate run surfaced
+(a corpus non-vacuity check racing an in-flight tablet-replica migration,
+not a system defect) is recorded in its own separate entry below. See
+`docs/adr/0061-testability-node-crate-simulator.md`'s matching amendment
+for the exact before/after table. The general lesson, on top of the one
+above: **a documented "out of scope, would need touching a shared
+mechanism" gap is sometimes closeable by adding a second, narrower
+mechanism instead of widening the shared one** — the width of the fix
+should match the width of the actual dependency (four call sites had no
+dependency on the shared method's own timing contract; ~26 others did),
+not the width of the file the slow code happens to live in.
+
+## A speed-up can shrink the "free" virtual time an unrelated check used to accidentally rely on — a corpus non-vacuity check that raced an in-flight replica migration (2026-09-09, #772 PR 2/2)
+
+Fixing the executor-cost regression above (`dynamo_fast`, quiescence) made
+`sim_cluster_dynamo_corpus.rs`'s `dynamowire_forward_heavy` cell fail its
+own `non_hosting_ok_writes > 0` assertion — deterministically, at a fixed
+seed, on both a `--test-threads=1` re-run and with quiescence toggled
+fully off, ruling out cross-test-thread interference and quiescence's own
+timing as the cause before looking anywhere else. Direct instrumentation
+(printing `final_replicas`/`ok_writes_by_node` at the point of the check)
+found the real mechanism: this cell's own randomized workload can draw a
+tokened `TransactWriteItems`, which auto-provisions the internal
+`__animus_txn_idempotency` table and, via ADR 0029's own add-then-remove
+migration sequence, can leave the corpus's modeled tablet's `live_
+replicas()` snapshot showing one MORE member than its configured
+replication factor for as long as that migration is still converging — an
+old replica not yet released alongside the new one already added. Reading
+`live_replicas()` while that transient window is still open narrows the
+"non-hosting" node set from 2-of-4 down to 1-of-4, and for one specific
+seed's own random draw sequence, the SOLE remaining non-hosting node had
+already recorded a successful write that this narrowed, mid-migration
+snapshot then silently excluded — a measurement race in the CORPUS'S OWN
+checking methodology, not a forwarding defect in the system under test.
+
+**Why the speed-up exposed a pre-existing race rather than one it
+introduced.** The old, slow `SimCluster::dynamo` unconditionally burned a
+full `OP_BUDGET` (12s) of virtual time on every call regardless of how
+quickly the op itself resolved — including the several `TransactGetItems`
+calls `force_resolve_all_keys` makes between the workload finishing and
+this check running. That incidental, unplanned "grace period" (tens of
+seconds of virtual time nobody asked for) happened to be enough for the
+migration to settle before the ORIGINAL 25 seeds' own checks ever ran, so
+the race was always there but never observed. `dynamo_fast` removed that
+grace period as a side effect of removing the waste it existed to fix —
+the check's own dependency on "enough incidental time elapses before I'm
+read" had been invisible until the thing supplying that time for free was
+fixed.
+
+**First attempt — moving the same live snapshot to run BEFORE
+`force_resolve_all_keys`/the probes instead of after — did not fix it.**
+The migration was already complete (or already past the vulnerable window,
+just at a different point) by the end of the workload's own `DRAIN`
+period in some runs and still transiently over-counted in others,
+depending on the seed; moving the read earlier only moved which seed hit
+it, the same symptom the initial quiescence/`dynamo_fast` toggle
+experiments already demonstrated (turning one knob shifts which of 200
+seeds gets unlucky, never proves the knob is the cause or the cure on its
+own). The general form: when a flaky-seeming assertion's true dependency
+is "some background process must have settled by the time I'm read," a
+one-shot read at any FIXED point in the timeline is still one-shot —
+fixed correctly by turning it into the SAME converged-or-timeout poll this
+file's own durability/convergence checks already use a few lines below,
+waiting for the replica count to genuinely return to the tablet's own
+configured value before trusting the snapshot.
+
+**The general lesson**: a performance fix that makes something finish
+faster can retroactively remove slack an entirely unrelated correctness
+check was implicitly, invisibly leaning on — "isolate the two toggles and
+re-test with each held at its old value" (quiescence off, `--test-
+threads=1`) is what proved this wasn't the fix's own new bug before
+chasing the real mechanism down; and a live snapshot of any state that can
+be mid-transition needs the SAME converged-or-timeout discipline this
+crate already applies to every other eventual property, not just the ones
+that already had it.

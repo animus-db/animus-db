@@ -33,6 +33,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
@@ -611,6 +612,17 @@ impl SimState {
 struct Shared {
     state: Mutex<SimState>,
     ready: Mutex<VecDeque<TaskId>>,
+    // Pure additive executor-cost counters (`Simulator::stats`) — never read
+    // by any decision this crate makes, only by a caller that wants a
+    // deterministic, seed-reproducible measure of how much executor work one
+    // run did. `Relaxed`: both counters are monotonically incremented from
+    // the single thread that ever drives `run_for`/`run_until`/
+    // `run_until_quiescent` (the same thread `poll_task`/`fire_event` run
+    // on), so there is no cross-thread ordering to establish — a plain
+    // `AtomicU64` is used only so `Simulator::stats(&self)` can read it
+    // through a shared reference with no separate lock.
+    task_polls: AtomicU64,
+    timer_fires: AtomicU64,
 }
 
 impl Shared {
@@ -639,6 +651,43 @@ impl ArcWake for TaskWaker {
             shared.push_ready(arc_self.task);
         }
     }
+}
+
+/// A pure, additive snapshot of how much executor work a [`Simulator`] run
+/// has done, as of the moment [`Simulator::stats`] was called — a
+/// deterministic, seed-reproducible proxy for wall-clock executor cost, for
+/// a caller that wants to bound a scenario's own cost without measuring
+/// real time (which a shared CI runner's own noise floor makes an
+/// unreliable gate — see the root `CLAUDE.md`'s "a flaky test is a real
+/// bug" rule). Never read by anything inside this crate's own decisions —
+/// purely additive, so reading it changes nothing about a run's own
+/// determinism or its RNG/trace stream.
+///
+/// - `task_polls`: how many times [`Simulator::run_for`]/`run_until`/
+///   `run_until_quiescent`'s own drain loop polled some spawned task's
+///   future (`Poll::Ready` and `Poll::Pending` both count — a task that
+///   resolves immediately still counts once).
+/// - `timer_fires`: how many entries on the shared `(time, seq)` timeline
+///   (ADR 0003's own single unified queue for timers *and* message
+///   deliveries) this run has popped and fired — so a fast, cheap-looking
+///   background loop's own `env.sleep(..)` tick is exactly as visible here
+///   as a slow message delivery would be.
+///
+/// Both counters are monotonically non-decreasing for the lifetime of one
+/// `Simulator` (never reset, and every [`Simulator::clone`] shares the same
+/// underlying counters — cloning hands out another handle onto the SAME
+/// simulated world, per that method's own doc, not a fork with its own
+/// zeroed counters). A caller that wants a **per-scenario** cost should
+/// read `stats()` once before a scenario starts and once after, then
+/// subtract — see `crates/animusd/src/sim_cluster_dynamo_corpus.rs`'s
+/// `run_scenario` for the pattern this was built for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SimStats {
+    /// Total spawned-task poll calls this run has made so far.
+    pub task_polls: u64,
+    /// Total timeline entries (timers + message deliveries) this run has
+    /// fired so far.
+    pub timer_fires: u64,
 }
 
 /// The deterministic simulator. Construct with a seed, register nodes via
@@ -713,6 +762,8 @@ impl Simulator {
             shared: Arc::new(Shared {
                 state: Mutex::new(state),
                 ready: Mutex::new(VecDeque::new()),
+                task_polls: AtomicU64::new(0),
+                timer_fires: AtomicU64::new(0),
             }),
             seed,
         }
@@ -1212,6 +1263,20 @@ impl Simulator {
         Nanos(self.shared.lock().clock)
     }
 
+    /// A pure, additive, seed-reproducible measure of how much executor
+    /// work this run has done so far — see [`SimStats`]'s own doc. Cheap
+    /// (two `Relaxed` atomic loads, no lock); safe to call at any point,
+    /// including mid-scenario from a driver task holding its own
+    /// [`Simulator`] handle (the same "any handle, any time" contract
+    /// [`Simulator::now`] already has).
+    #[must_use]
+    pub fn stats(&self) -> SimStats {
+        SimStats {
+            task_polls: self.shared.task_polls.load(Ordering::Relaxed),
+            timer_fires: self.shared.timer_fires.load(Ordering::Relaxed),
+        }
+    }
+
     /// Run until quiescence: no ready tasks and no scheduled events remain.
     ///
     /// Do not use this for protocols with perpetual timers (e.g. Raft
@@ -1287,6 +1352,7 @@ impl Simulator {
     }
 
     fn poll_task(&self, task: TaskId) {
+        self.shared.task_polls.fetch_add(1, Ordering::Relaxed);
         // Check the future out of the map so the poll can re-enter the state
         // lock (e.g. via `env.send`) without deadlocking.
         let fut = {
@@ -1313,6 +1379,7 @@ impl Simulator {
     }
 
     fn fire_event(&self, key: (u64, Seq)) {
+        self.shared.timer_fires.fetch_add(1, Ordering::Relaxed);
         let waker = {
             let mut st = self.shared.lock();
             let event = st.timeline.remove(&key).expect("event present");
