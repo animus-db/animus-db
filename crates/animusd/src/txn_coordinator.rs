@@ -100,6 +100,18 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         if !pending_kind_writes.is_empty() {
             let meta = self.effective_metadata();
             let schema = dynamo::write_schema_for(&meta, table);
+            // Both halves of the throttle pre-charge below are loop-invariant:
+            // they depend only on `meta` (just snapshotted) and `table` (fixed
+            // for this call), never on the per-item key. Hoisted so a 100-action
+            // transaction resolves the limit and counts the table's tablets
+            // once, not once per action — `tablets_for_table` is an O(tablets
+            // in the whole cluster) filter scan, not an indexed per-table
+            // lookup. Paired in one `Option` so the count is not paid at all
+            // when no write limit applies, which is what the per-item form did.
+            let write_throttle = self
+                .throttle_limits_for(&meta, table)
+                .write_units
+                .map(|limit| (limit, meta.tablets_for_table(table).count().max(1) as f64));
             for p in pending_kind_writes {
                 let key = dynamo::item_key(&p.pk, p.sk.as_ref());
                 // ADR 0065 §2/§3/§6: check each participant write BEFORE
@@ -110,15 +122,15 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 // which `run_transact`'s own cancellation-reason mapping
                 // (site 3, `dynamo.rs`) turns into a `ThrottlingError`
                 // `CancellationReasons` entry at this action's own index.
-                // Step 4: `throttle_limits_for` resolves `table`'s own
-                // per-table override (if any) before falling back to the
-                // cluster default — `meta` is already in hand above.
-                if let Some(write_limit) = self.throttle_limits_for(&meta, table).write_units
+                // Step 4: the limit itself comes from `throttle_limits_for`,
+                // which resolves `table`'s own per-table override (if any)
+                // before falling back to the cluster default — resolved once
+                // into `write_throttle` above, with `meta` already in hand.
+                if let Some((write_limit, table_tablet_count)) = write_throttle
                     && let Some(tablet) =
                         crate::topology::tablet_for_key(meta.tablets_for_table(table), &key)
                 {
-                    let share =
-                        write_limit as f64 / meta.tablets_for_table(table).count().max(1) as f64;
+                    let share = write_limit as f64 / table_tablet_count;
                     let cost = 2.0
                         * match &p.op {
                             crate::KindWriteOp::Put(item) => {
