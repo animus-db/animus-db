@@ -4855,7 +4855,19 @@ impl SimCluster {
         new_n
     }
 
-    /// **C-13 / ADR 0061 rung M PR 2: the real seed/join dial** — unlike
+    /// **C-13 / ADR 0061 rung M PR 2: the real seed/join dial.** Combined-
+    /// mode-only entry point, kept unchanged for every existing caller —
+    /// delegates to [`join_via_seed_with_role`](Self::join_via_seed_with_role)
+    /// with `role = NodeRole::Both`. See that method's own doc for the full
+    /// mechanism (this PR's own scope was combined mode only; C-13 PR 3
+    /// added the `role` parameter and the data-only arm without changing
+    /// this wrapper's behavior one bit).
+    pub(crate) fn join_via_seed(&mut self, seed_node: usize) -> u64 {
+        self.join_via_seed_with_role(seed_node, NodeRole::Both)
+    }
+
+    /// **C-13 / ADR 0061 rung M PR 2 (combined-only) + PR 3 (this `role`
+    /// parameter, data-only arm): the real seed/join dial** — unlike
     /// [`grow`](Self::grow), which bypasses discovery/claim entirely
     /// (proposing `RegisterNode`+`UpsertMember{Active}` directly on the
     /// current control leader's own in-process handle), this method drives
@@ -4868,14 +4880,44 @@ impl SimCluster {
     /// (`animus-control`) promote the joiner to `Active` on its own first
     /// observed heartbeat — **no `UpsertMember` propose of any kind here**.
     ///
-    /// **Smallest end-to-end slice (this PR's own scope, not a permanent
-    /// limit)**: self-minted identity only (no explicit-`--id` claim path —
-    /// see [`claim_join_identity_via_relay`]'s own doc), combined
-    /// (`"combined"`) mode only (no `role = "data"` arm yet — that's C-13 PR
-    /// 3, mirroring [`grow`](Self::grow)'s own `role` parameter once built).
+    /// `role` selects the joiner's own wire-visible role — `NodeRole::Both`
+    /// (`"combined"`, [`join_via_seed`](Self::join_via_seed)'s own only
+    /// shape) or `NodeRole::Data` (`"data"`, this PR's new arm, mirroring
+    /// [`grow`](Self::grow)`("data")`'s own data-only `ClientCtx` tail: a
+    /// `ControlHandle::Remote`, a reconciler, `heartbeat_loop`, a TTL
+    /// reaper, and `spawn_remote_mirror_sync_loop`, no control `RaftNode`,
+    /// no control-plane-leader-only janitors — but through the same real
+    /// discover → self-mint → relay-claim dial phase as the combined arm,
+    /// over the SAME `SimRelayClient`/`ClientRequest::JoinInfo` transport,
+    /// and **no `UpsertMember` propose of any kind either** — promotion is
+    /// left entirely to the real control leader's own `detect_loop`, exactly
+    /// like the combined arm). `NodeRole::Control` panics — this fixture's
+    /// control-only nodes are only ever built at construction time via
+    /// [`SimCluster::new_with_roles`]; a control-only join primitive is
+    /// `control_membership_split.rs`'s own open C-13 question, deliberately
+    /// not resolved by this method.
     ///
-    /// # Two documented forks this PR resolves (see the ADR's own amendment
-    /// for the full account)
+    /// **Why the data-only arm needed no fork in the assembly itself, only
+    /// the wire-visible role string**: the combined arm below already builds
+    /// a `ControlHandle::Remote`-controlled node with a reconciler,
+    /// `heartbeat_loop`, TTL reaper, and `spawn_remote_mirror_sync_loop` — no
+    /// control-plane-leader-only `backup_janitor_loop`/`segment_janitor_
+    /// loop`/`index_backfill_loop` spawn at all (a `Remote`-controlled node
+    /// can structurally never become control-plane leader, per this
+    /// method's own "`ctx.control` is `Remote`" note below) — the IDENTICAL
+    /// shape `grow`'s own data-only branch builds. Under this fixture's own
+    /// `Remote`-everywhere simplification (see that note), a real combined
+    /// join and a real data-only join diverge in exactly one place: the
+    /// wire-visible role string (`claim_join_identity_via_relay`'s `role`
+    /// argument, `AdminInfo.role`/`NodeAddrs.role`) — so `role` threads
+    /// through those two call sites only, nothing else.
+    ///
+    /// **Smallest end-to-end slice (PR 2's own scope, not a permanent
+    /// limit)**: self-minted identity only (no explicit-`--id` claim path —
+    /// see [`claim_join_identity_via_relay`]'s own doc).
+    ///
+    /// # Two documented forks PR 2 resolved (see the ADR's own amendment
+    /// for the full account) — both apply identically to the data-only arm
     ///
     /// **Route tables**: kept as [`grow`](Self::grow)'s own "patch every
     /// EXISTING node's `client_route`/`intra_route` directly" shape for
@@ -4915,17 +4957,19 @@ impl SimCluster {
     /// method.
     ///
     /// **This method's own fixture-internal bookkeeping** (`self.roles`)
-    /// tags the joiner [`NodeRole::Data`], even though its wire-visible
-    /// `"combined"` role string says otherwise: `self.roles` gates
-    /// `restart`/`role_of`'s own positional "control-bearing nodes occupy
-    /// `0..self.controls.len()`" invariant, which this method does not
-    /// extend (see the `ctx.control` note above — no `self.controls`
-    /// growth happens here), so tagging it `NodeRole::Both` would silently
-    /// violate that invariant for no real fidelity benefit (nothing about
+    /// tags the joiner [`NodeRole::Data`] **regardless of `role`** — even a
+    /// combined (`NodeRole::Both`) joiner's own wire-visible `"combined"`
+    /// role string says otherwise: `self.roles` gates `restart`/`role_of`'s
+    /// own positional "control-bearing nodes occupy `0..self.controls.len()`"
+    /// invariant, which this method does not extend for either arm (see the
+    /// `ctx.control` note above — no `self.controls` growth happens here),
+    /// so tagging a combined joiner `NodeRole::Both` would silently violate
+    /// that invariant for no real fidelity benefit (nothing about
     /// `NodeRole::Both`'s own `has_control()` gate would be true for this
-    /// node's actual `Remote` shape anyway). `NodeRole::Data` is this
-    /// node's true SimCluster-fixture capability — restart/crash on THIS
-    /// specific node are out of scope regardless (see below).
+    /// node's actual `Remote` shape anyway). `NodeRole::Data` is every
+    /// joiner's true SimCluster-fixture capability regardless of its
+    /// wire-visible role — restart/crash on THIS specific node are out of
+    /// scope regardless (see below).
     ///
     /// # What this does NOT prove (permanent gaps, unrelated to this rung)
     /// `Node::bind`/`ProdEnv` listener binds (never reachable here, like
@@ -4946,7 +4990,19 @@ impl SimCluster {
     /// `Metadata::members` showing the new node `Active` — through the
     /// REAL detector, never a bypass. Returns the new node's own `u64`
     /// index.
-    pub(crate) fn join_via_seed(&mut self, seed_node: usize) -> u64 {
+    pub(crate) fn join_via_seed_with_role(&mut self, seed_node: usize, role: NodeRole) -> u64 {
+        let wire_role = match role {
+            NodeRole::Both => "combined",
+            NodeRole::Data => "data",
+            NodeRole::Control => panic!(
+                "join_via_seed_with_role(seed_node={seed_node}): NodeRole::Control is not \
+                 supported — this fixture's control-only nodes are only ever built at \
+                 construction time via SimCluster::new_with_roles; a control-only join \
+                 primitive is control_membership_split.rs's own open C-13 question, \
+                 deliberately not resolved by this method (seed={})",
+                self.sim.seed()
+            ),
+        };
         let new_n = self.nodes as u64;
 
         // A throwaway identity/env/relay, never registered as this
@@ -4977,7 +5033,7 @@ impl SimCluster {
                 let (control_ids, _peers, client_route, intra_route, _admin_addrs) =
                     discover_join_info_via_relay(&dial_env, &dial_relay, &dial_seeds).await?;
                 let (id, addrs) =
-                    claim_join_identity_via_relay(&dial_env, &dial_relay, &dial_seeds, "combined")
+                    claim_join_identity_via_relay(&dial_env, &dial_relay, &dial_seeds, wire_role)
                         .await?;
                 Ok((
                     id,
@@ -5061,7 +5117,7 @@ impl SimCluster {
             client_addr: placeholder_addr(),
             dynamo_addr: None,
             admin_addr: placeholder_addr(),
-            role: "combined",
+            role: wire_role,
             control_ids: control_ids.clone(),
             peers: BTreeMap::new(),
             admin_addrs: vec![placeholder_addr()],

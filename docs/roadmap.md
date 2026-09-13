@@ -1263,8 +1263,9 @@ the still-true paragraph after the table.
 - **The ladder (7 PRs)**: PR 1 (S, this opener, landed) → PR 2 (M, the
   dial groundwork — the `JoinInfo` relay arm, `RelayClient`-generic
   discovery/claim siblings, `SimCluster::join_via_seed` self-minted/
-  combined-only, its own sim smoke) → PR 3 (M, `data_join.rs` conversion,
-  a data-role arm on the dial) → PR 4 (M, `seed_join.rs` +
+  combined-only, its own sim smoke, **landed**) → PR 3 (M, `data_join.rs`
+  conversion, `join_via_seed_with_role`'s new data-role arm, **landed** —
+  `tests/data_join.rs` deleted whole) → PR 4 (M, `seed_join.rs` +
   `seed_join_allocated.rs` tests 1/3/5) → PR 5 (S, the concurrent-mint
   scenario) → PR 6 (M or assess-and-close, `control_membership_split.rs`'s
   open question) → PR 7 (S, close-out).
@@ -1275,12 +1276,19 @@ the still-true paragraph after the table.
 - **Size:** M to L (S for PR 1/5/7, M for PR 2/3/4/6, no PR sized XL).
 - **Depends:** C-12 (closed) — the next unowned residual group per C-08's
   through C-12's own close-outs.
-- **Status (2026-09-10):** opened — PR 1 (this opener) landed. Inventory
-  corrected to 5 files/13 tests; the two facts the plan left unresolved
-  (`NodeId::mint`'s `Rng` bound, the `JoinInfo` serve arm's field
-  reachability) both resolved in PR 1's favor (no widening needed for
-  either); `control_membership_split.rs`'s own conversion approach left
-  as an open question for the PR that attempts it.
+- **Status (2026-09-13):** opened — PR 1 (opener), PR 2 (the dial
+  groundwork — `SimCluster::join_via_seed`, self-minted/combined-only),
+  and PR 3 (`data_join.rs` conversion — `join_via_seed_with_role`'s new
+  data-role arm, `tests/data_join.rs` deleted whole, its sim sibling in
+  `sim_cluster_seed_join.rs`) all landed. Inventory corrected to 5
+  files/13 tests; the two facts the plan left unresolved (`NodeId::mint`'s
+  `Rng` bound, the `JoinInfo` serve arm's field reachability) both
+  resolved in PR 1's favor (no widening needed for either);
+  `control_membership_split.rs`'s own conversion approach left as an open
+  question for the PR that attempts it. Remaining: PR 4 (`seed_join.rs` +
+  `seed_join_allocated.rs` tests 1/3/5), PR 5 (the concurrent-mint
+  scenario), PR 6 (`control_membership_split.rs`'s open question), PR 7
+  (close-out).
 
 ## 4. Operator surfaces: admin API, dashboard, console, CLI
 
@@ -1363,7 +1371,7 @@ wave are independent and can run in parallel.
 | 11 | C-10 (closed 2026-09-09 — all seven PRs landed: #789, #790, #791, #792, #793, #794, plus PR 7) | Gated on C-09 (closed) — the next unowned residual group per C-08's and C-09's own close-outs |
 | 12 | C-11 (closed 2026-09-09 — all four PRs landed: #796, #797, #799, plus PR 4) | Gated on C-10 (closed) — the next unowned residual group per C-08's, C-09's, and C-10's own close-outs; proceeded without an explicit maintainer sequencing instruction, per Rung J's own close-out recommendation (see the C-11 entry's own note) |
 | 13 | C-12 (closed 2026-09-09 — all nine PRs landed: #806, #808, #822, #823, #824, #825, #826, #827, plus PR 5) | Gated on C-11 (closed) — the next unowned residual group per C-08's, C-09's, C-10's, and C-11's own close-outs; taken up per Rung K's own close-out recommendation |
-| 14 | C-13 (opened 2026-09-10, PR 1 landed — seed/join discovery under `SimCluster`, ADR 0061 rung M) | Gated on C-12 (closed) — the next unowned residual group per C-08's through C-12's own close-outs |
+| 14 | C-13 (opened 2026-09-10, PRs 1-3 landed — seed/join discovery under `SimCluster`, ADR 0061 rung M) | Gated on C-12 (closed) — the next unowned residual group per C-08's through C-12's own close-outs |
 
 Open issues mapped: none left (#375 closed by W-01, #319 by W-05). Filed
 from wave 2's own findings: #590 (the operator still emits the deleted

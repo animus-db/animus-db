@@ -6224,6 +6224,60 @@ collision negative case) — 4 tests total (pinned seed + 5-seed
 matching "PR 2 landed" amendment for the full account and exact gate
 figures.
 
+**C-13 PR 3 (`data_join.rs` conversion) landed.** `SimCluster::join_via_
+seed` was split into a thin wrapper delegating to a new `SimCluster::
+join_via_seed_with_role(&mut self, seed_node: usize, role: NodeRole) ->
+u64` — `join_via_seed(seed_node)` is now `join_via_seed_with_role(seed_node,
+NodeRole::Both)`, byte-identical behavior for every existing combined-mode
+caller. `role` picks the joiner's wire-visible role string (`"combined"`/
+`"data"`, threaded through `claim_join_identity_via_relay`'s own `role`
+argument and `AdminInfo.role`) at exactly two call sites — nothing else in
+the assembly forks, because the combined arm already built a `Control
+Handle::Remote`-controlled node with a reconciler/`heartbeat_loop`/TTL
+reaper/`spawn_remote_mirror_sync_loop` and no control-plane-leader-only
+janitors (a `Remote`-controlled node can never become control-plane
+leader) — the identical shape `grow`'s own data-only branch builds.
+`NodeRole::Control` panics (unsupported — `control_membership_split.rs`'s
+own open question, deliberately left for a later PR). `self.roles.push
+(NodeRole::Data)` stays unconditional for *either* wire role (unchanged
+from PR 2 — see `join_via_seed_with_role`'s own doc on why: `self.roles`
+gates the `restart`/`role_of` control-prefix invariant, which neither arm
+extends).
+
+Sim sibling: `sim_cluster_seed_join.rs` gained scenario (c),
+`data_only_joiner_over_a_split_deployment_gets_a_rebalanced_replica` (2
+tests, pinned seed + 5-seed `_over_seeds`) — a 3-control+2-data split
+deployment (`SimCluster::new_with_roles`, mirroring `support::bring_up_
+split(3, 2, ..)`), three wire-created tables (`create_table_via_wire` —
+**never** `SimCluster::create_table`'s hand-hosted shortcut, which picks
+replicas `0..replication` and would land them on the CONTROL-only nodes in
+a mixed cluster) written through a pre-existing data node, then a THIRD
+data-only node joined via `join_via_seed_with_role(seed, NodeRole::Data)`
+against a control-only FOLLOWER seed. Asserts the identical six-step shape
+`tests/data_join.rs` did: self-minted id, real-detector-driven `Active`
+promotion (the same non-instantaneous timing proxy as scenario (a)), a
+real placement-reconciler-landed tablet replica, and a bidirectional put/
+get round trip through the joined node's own `ClientCtx` for whichever
+table it actually ended up hosting. **A real finding, not assumed**: with
+only 2 data nodes `Active` at `CreateTable` time and a target RF of
+`MAX_REPLICATION_FACTOR` (3) always recorded regardless (`ClientCtx::
+provision_tablet`'s own doc, `schema.rs`), every one of the three tables
+is already under-replicated from creation — so the third replica lands via
+`reconcile_placement`'s violation-repair path the instant the joiner is
+`Active`, a stronger and more deterministic guarantee than `data_join.rs`'s
+own "several tables, in case only balance moves something" caveat; the
+sim sibling keeps three tables anyway, to mirror the original one for one
+rather than exploit the stronger guarantee to simplify.
+
+**File disposition**: `tests/data_join.rs` (1 test) is **deleted whole**
+(precedent: `cluster_split.rs`, C-12) — every one of its assertions has a
+sim sibling above; the one thing it alone ever exercised (`Node::
+bind_data`'s literal real listener bind) is already covered permanently
+elsewhere (`config_node_identity.rs`, per ADR 0061's own "Rung L closed"
+table). No `Cargo.toml`/CI workflow named it explicitly, so nothing else
+needed updating. See ADR 0061's matching "PR 3 landed" amendment for gate
+figures.
+
 ### `sim_cluster_corpus`: the SimCluster cycles/durability corpus (ADR 0061 rung D1 step 3)
 
 `crates/animusd/src/sim_cluster_corpus.rs` (`#[cfg(test)] mod

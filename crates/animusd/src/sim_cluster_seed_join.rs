@@ -1,15 +1,16 @@
 //! `SimCluster`-driven deterministic coverage for the real seed/join dial
-//! (ADR 0061 rung M, C-13 PR 2) — `SimCluster::join_via_seed`, its
-//! `_via_relay` siblings, and `forwarding::handle_relayed_request`'s new
-//! `ClientRequest::JoinInfo` arm. See `sim_cluster.rs`'s own doc on
-//! `SimCluster::join_via_seed` for the full mechanism (what it drives for
-//! real, the two documented forks it resolves, what it deliberately does
-//! not prove) and `crates/animusd/CLAUDE.md`'s matching appendix for the
-//! cross-cutting account. This module is the smallest end-to-end slice
-//! only — self-minted identity, combined mode, a single joiner — proving
-//! the dial primitive itself; converting the real `data_join.rs`/
-//! `seed_join.rs`/`seed_join_allocated.rs` scenarios onto it is later PRs'
-//! own scope (C-13 PR 3+).
+//! (ADR 0061 rung M, C-13 PR 2/3) — `SimCluster::join_via_seed`/
+//! `join_via_seed_with_role`, their `_via_relay` siblings, and
+//! `forwarding::handle_relayed_request`'s `ClientRequest::JoinInfo` arm.
+//! See `sim_cluster.rs`'s own doc on `SimCluster::join_via_seed_with_role`
+//! for the full mechanism (what it drives for real, the two documented
+//! forks it resolves, what it deliberately does not prove) and
+//! `crates/animusd/CLAUDE.md`'s matching appendix for the cross-cutting
+//! account. PR 2's own scope was the smallest end-to-end slice — self-
+//! minted identity, combined mode, a single joiner — proving the dial
+//! primitive itself; PR 3 adds the data-only role arm and the first real
+//! conversion, `tests/data_join.rs`'s own scenario (see (c) below).
+//! `seed_join.rs`/`seed_join_allocated.rs` stay later PRs' own scope.
 //!
 //! **What each scenario proves, and how**:
 //!
@@ -47,6 +48,41 @@
 //!     conversion). A second call with the SAME id but DIFFERENT `addrs`
 //!     is asserted to be a genuine collision, proving the CAS actually
 //!     discriminates rather than always answering "registered."
+//! (c) `data_only_joiner_over_a_split_deployment_gets_a_rebalanced_replica`
+//!     (C-13 PR 3) — the data-only dual of (a), and the sim sibling for the
+//!     real `tests/data_join.rs`'s own scenario: a **split** deployment (3
+//!     control-only + 2 data-only, `SimCluster::new_with_roles`, mirroring
+//!     `support::bring_up_split(3, 2, ..)`), three independently-provisioned
+//!     tables (wire-created, `create_table_via_wire` — never `SimCluster::
+//!     create_table`'s own hand-hosted shortcut, which picks replicas
+//!     `0..replication` and would put them on the CONTROL-only nodes in a
+//!     mixed cluster) written through the two pre-existing data nodes, then
+//!     a THIRD data-only node joined via [`SimCluster::join_via_seed_with_
+//!     role`]`(seed, NodeRole::Data)` against a control-only seed (again
+//!     deliberately a FOLLOWER, not the leader — see (a)'s own reasoning).
+//!     Asserts, in order, mirroring `data_join.rs`'s own six numbered steps
+//!     one for one: the joiner's id is self-minted (same shape checks as
+//!     (a)); every node's view reaches `Active` **through the real
+//!     detector** (the same non-instantaneous timing proxy as (a) — `join_
+//!     via_seed_with_role`'s data arm proposes no `UpsertMember` either, by
+//!     construction); the real placement reconciler — not a fixture stand-
+//!     in — eventually lands a real tablet replica on it (`MAX_REPLICATION_
+//!     FACTOR` is always the *recorded target* regardless of how many
+//!     candidates were `Active` at `CreateTable` time, per `ClientCtx::
+//!     provision_tablet`'s own doc in `schema.rs` — with only 2 data nodes
+//!     initially and a target of 3, every one of the three tables is
+//!     already under-replicated from creation, so `reconcile_placement`'s
+//!     violation-repair path, not merely balance, is what lands the third
+//!     replica the moment the joiner is `Active` — a stronger, more
+//!     deterministic guarantee than (a)'s own doc for `data_join.rs`'s own
+//!     "several tables" caveat, kept anyway to mirror the original one for
+//!     one); and reads/writes round-trip **both directions** through the
+//!     joined node's own `ClientCtx` for whichever table it actually ended
+//!     up hosting (never an arbitrary one — the rebalancer only ever moves
+//!     while it improves the *global* picture, `data_join.rs`'s own `table_
+//!     with_replica` doc, restated here) against the pre-existing data
+//!     nodes, proving it a genuine CP-data participant, not just a
+//!     registered-but-inert member.
 //!
 //! **Why the timing proxy, specifically.** There is no "did this code path
 //! call `propose` for `UpsertMember`" instrumentation hook anywhere in this
@@ -79,8 +115,11 @@ use std::time::Duration;
 
 use animus_control::{NodeAddrs, NodeStatus};
 use animus_env::{NodeId, nid};
+use animus_tablet::TabletId;
 
 use super::sim_cluster::SimCluster;
+use super::sim_cluster_console::{create_table_via_wire, tablet_of_table};
+use crate::config::NodeRole;
 
 fn env_seed(default: u64) -> u64 {
     std::env::var("ANIMUS_SEED")
@@ -135,6 +174,20 @@ fn only_new_member(before: &BTreeSet<NodeId>, after: &BTreeSet<NodeId>) -> NodeI
 fn join_and_get_id(cluster: &mut SimCluster, seed_node: usize) -> (u64, NodeId) {
     let before = member_ids(cluster);
     let idx = cluster.join_via_seed(seed_node);
+    let after = member_ids(cluster);
+    (idx, only_new_member(&before, &after))
+}
+
+/// [`join_and_get_id`]'s role-parameterized sibling (C-13 PR 3) —
+/// [`SimCluster::join_via_seed_with_role`] plus the identical before/after
+/// `Metadata::members` diff.
+fn join_and_get_id_with_role(
+    cluster: &mut SimCluster,
+    seed_node: usize,
+    role: NodeRole,
+) -> (u64, NodeId) {
+    let before = member_ids(cluster);
+    let idx = cluster.join_via_seed_with_role(seed_node, role);
     let after = member_ids(cluster);
     (idx, only_new_member(&before, &after))
 }
@@ -287,5 +340,240 @@ fn rejoin_same_identity_is_a_noop() {
 fn rejoin_same_identity_is_a_noop_over_seeds() {
     for &seed in &OVER_SEEDS_B {
         run_rejoin_same_identity_is_a_noop(seed);
+    }
+}
+
+const PRIMARY_SEED_C: u64 = 0xC13E_0003;
+const OVER_SEEDS_C: [u64; 5] = [
+    0xC13E_3001,
+    0xC13E_3002,
+    0xC13E_3003,
+    0xC13E_3004,
+    0xC13E_3005,
+];
+
+/// The three independent tables [`run_data_only_joiner_over_a_split_
+/// deployment_gets_a_rebalanced_replica`] seeds — mirrors `tests/
+/// data_join.rs`'s own fixed `TABLES` constant (three, not one — kept to
+/// mirror the original one for one even though this module's own doc notes
+/// a single table already suffices here, since `MAX_REPLICATION_FACTOR` is
+/// always the recorded *target*, not a point-in-time observation).
+const DATA_JOIN_TABLES: [&str; 3] = ["datajoin0", "datajoin1", "datajoin2"];
+
+/// One hash-key (`pk`, string) `CreateTable`, issued from `node` — mirrors
+/// every other `sim_cluster_*` module's identically-named helper (this
+/// crate's own "small fixtures duplicated per test module" convention;
+/// `sim_cluster_control_data_split.rs`/`sim_cluster_split_cluster.rs` carry
+/// the identical copy).
+fn create_table(cluster: &mut SimCluster, node: u64, table: &str) -> (u16, String) {
+    let body = format!(
+        r#"{{"TableName":"{table}",
+            "KeySchema":[{{"AttributeName":"pk","KeyType":"HASH"}}],
+            "AttributeDefinitions":[{{"AttributeName":"pk","AttributeType":"S"}}]}}"#
+    );
+    create_table_via_wire(cluster, node, &body)
+}
+
+/// Converged-or-timeout poll on `cond(cluster)` — the shared shape every
+/// `sim_cluster_*` module's own scenario-local convergence check uses
+/// (duplicated, not reached into, per this crate's own convention —
+/// `sim_cluster_control_data_split.rs`/`sim_cluster_split_cluster.rs` carry
+/// the identical copy).
+fn poll_until(
+    cluster: &mut SimCluster,
+    budget: Duration,
+    seed: u64,
+    what: &str,
+    mut cond: impl FnMut(&mut SimCluster) -> bool,
+) {
+    const STEP: Duration = Duration::from_millis(100);
+    let mut elapsed = Duration::ZERO;
+    loop {
+        if cond(cluster) {
+            return;
+        }
+        assert!(
+            elapsed < budget,
+            "seed={seed}: {what} never converged within {budget:?}"
+        );
+        cluster.run_for(STEP);
+        elapsed += STEP;
+    }
+}
+
+/// (c) `data_only_joiner_over_a_split_deployment_gets_a_rebalanced_replica`
+/// — see this module's own doc for the full six-step mapping onto `tests/
+/// data_join.rs`'s own real-socket scenario.
+fn run_data_only_joiner_over_a_split_deployment_gets_a_rebalanced_replica(seed: u64) {
+    // 1. A split deployment: 3 control-only + 2 data-only, mirroring
+    // `support::bring_up_split(3, 2, ..)`.
+    let roles = [
+        NodeRole::Control,
+        NodeRole::Control,
+        NodeRole::Control,
+        NodeRole::Data,
+        NodeRole::Data,
+    ];
+    let mut cluster = SimCluster::new_with_roles(seed, &roles, 2);
+    let leader = cluster.control_leader_index() as u64;
+
+    // 2. Three independent tables, wire-created (never `SimCluster::
+    // create_table`'s own hand-hosted shortcut, which would pick replicas
+    // `0..replication` — the CONTROL-only nodes in this mixed cluster —
+    // see this module's own doc), written through a pre-existing data node
+    // (3) so the pre-join cluster genuinely holds data before the join.
+    for table in DATA_JOIN_TABLES {
+        let (status, body) = create_table(&mut cluster, leader, table);
+        assert_eq!(
+            status, 200,
+            "seed={seed}: CreateTable({table}) failed: {body}"
+        );
+        poll_until(
+            &mut cluster,
+            Duration::from_secs(10),
+            seed,
+            &format!("a pre-existing data node hosting {table}"),
+            |c| {
+                let tablet = tablet_of_table(c, table);
+                (3..5u64).any(|n| c.hosted_tablets(n).contains(&tablet))
+            },
+        );
+        cluster
+            .put(3, table, "k0", "sk", b"v0")
+            .unwrap_or_else(|e| panic!("seed={seed}: seed put into {table} failed: {e}"));
+    }
+
+    // 3. Join a THIRD data-only node, via a control-only seed that is
+    // deliberately a FOLLOWER, not the leader (scenario (a)'s own
+    // reasoning) — no expanded config, no operator admin call, exactly the
+    // real ADR 0030/0032 discovery+claim dial `data_join.rs` proves.
+    let seed_node = cluster.control_follower_index();
+    let before_time = cluster.sim_now();
+    let (joined, joined_id) =
+        join_and_get_id_with_role(&mut cluster, seed_node as usize, NodeRole::Data);
+    let after_time = cluster.sim_now();
+
+    assert_eq!(
+        joined, 5,
+        "seed={seed}: the joiner should get the next sequential index"
+    );
+
+    // 4. Self-minted, not pre-chosen — identical shape checks to (a).
+    assert_ne!(
+        joined_id,
+        nid(joined),
+        "seed={seed}: joined id must be self-minted, not `nid({joined})` \
+         (joined_id={joined_id})"
+    );
+    assert_eq!(
+        joined_id.as_str().len(),
+        22,
+        "seed={seed}: a minted NodeId is a 22-char base64url string \
+         (joined_id={joined_id})"
+    );
+
+    // Promoted through the REAL control-leader detector — `join_via_seed_
+    // with_role`'s data arm proposes no `UpsertMember` at all either (the
+    // same observable-consequence proxy as scenario (a); see this module's
+    // own doc on why the timing proxy is sound).
+    let elapsed = after_time.duration_since(before_time);
+    assert!(
+        elapsed >= Duration::from_millis(80),
+        "seed={seed}: promotion resolved in {elapsed:?} of virtual time — \
+         too fast to be genuine heartbeat/detect_loop-driven promotion \
+         (looks like a bypass propose)"
+    );
+
+    for n in 0..cluster.node_count() as u64 {
+        let status = cluster
+            .metadata(n)
+            .members
+            .get(&joined_id)
+            .map(|m| m.status);
+        assert_eq!(
+            status,
+            Some(NodeStatus::Active),
+            "seed={seed}: node {n}'s own view of the joiner must show Active"
+        );
+    }
+
+    // 5. The real placement reconciler eventually lands a real tablet
+    // replica on the joiner — see this module's own doc for why every one
+    // of the three tables is already under-replicated relative to its
+    // recorded target the moment this node joins, not merely a balance
+    // move.
+    poll_until(
+        &mut cluster,
+        Duration::from_secs(20),
+        seed,
+        "joined data node gaining a tablet replica",
+        |c| !c.hosted_tablets(joined).is_empty(),
+    );
+    let hosted_replica: BTreeSet<TabletId> = cluster.hosted_tablets(joined);
+    let hosted_table: &str = DATA_JOIN_TABLES
+        .iter()
+        .copied()
+        .find(|&table| hosted_replica.contains(&tablet_of_table(&cluster, table)))
+        .unwrap_or_else(|| {
+            panic!(
+                "seed={seed}: joined node hosts {hosted_replica:?}, none of which is one of \
+                 this scenario's own tables ({DATA_JOIN_TABLES:?})"
+            )
+        });
+
+    // 6. Reads and writes round-trip BOTH directions through the joined
+    // node's own `ClientCtx` for `hosted_table` — the one it's confirmed to
+    // actually replicate — against a pre-existing data node, proving it a
+    // genuine CP-data participant, not just a registered-but-inert member.
+    cluster
+        .put(
+            joined,
+            hosted_table,
+            "pk-from-joiner",
+            "sk",
+            b"hello-from-joiner",
+        )
+        .unwrap_or_else(|e| panic!("seed={seed}: put from the joined node ({joined}) failed: {e}"));
+    let got = cluster
+        .get(3, hosted_table, "pk-from-joiner", "sk", true)
+        .unwrap_or_else(|e| panic!("seed={seed}: get from the pre-existing data node failed: {e}"));
+    assert_eq!(
+        got.as_deref(),
+        Some(b"hello-from-joiner".as_slice()),
+        "seed={seed}: a put issued from the joined node must be visible from a \
+         pre-existing data node"
+    );
+
+    cluster
+        .put(
+            3,
+            hosted_table,
+            "pk-from-existing",
+            "sk",
+            b"hello-from-existing",
+        )
+        .unwrap_or_else(|e| panic!("seed={seed}: put from the pre-existing data node failed: {e}"));
+    let got2 = cluster
+        .get(joined, hosted_table, "pk-from-existing", "sk", true)
+        .unwrap_or_else(|e| panic!("seed={seed}: get from the joined node ({joined}) failed: {e}"));
+    assert_eq!(
+        got2.as_deref(),
+        Some(b"hello-from-existing".as_slice()),
+        "seed={seed}: a put issued from a pre-existing data node must be visible from the \
+         joined node's own ClientCtx"
+    );
+}
+
+#[test]
+fn data_only_joiner_over_a_split_deployment_gets_a_rebalanced_replica() {
+    run_data_only_joiner_over_a_split_deployment_gets_a_rebalanced_replica(env_seed(
+        PRIMARY_SEED_C,
+    ));
+}
+
+#[test]
+fn data_only_joiner_over_a_split_deployment_gets_a_rebalanced_replica_over_seeds() {
+    for &seed in &OVER_SEEDS_C {
+        run_data_only_joiner_over_a_split_deployment_gets_a_rebalanced_replica(seed);
     }
 }

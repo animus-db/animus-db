@@ -10413,3 +10413,122 @@ to anything this PR added; most likely the opener's own "565" figure was
 already slightly stale relative to `main` by the time this PR's session
 ran. Left as an open, explicitly-flagged discrepancy rather than
 reconciled by assumption.
+
+## 2026-09-13 amendment — Rung M (post-C-12): seed/join discovery `SimCluster` dispatch (C-13), PR 3 (`data_join.rs` conversion) landed
+
+**Mechanism, as built.** One production-adjacent, behavior-preserving
+signature widening, plus one new sim scenario:
+
+1. **`SimCluster::join_via_seed` became a thin wrapper.** The method's own
+   body (PR 2's construction) moved, verbatim, into a new `SimCluster::
+   join_via_seed_with_role(&mut self, seed_node: usize, role: NodeRole) ->
+   u64`; `join_via_seed(seed_node)` is now exactly `join_via_seed_with_
+   role(seed_node, NodeRole::Both)` — every existing combined-mode caller
+   (PR 2's own `sim_cluster_seed_join.rs` scenarios) keeps calling
+   `join_via_seed` unchanged, and its behavior is byte-identical (confirmed
+   by running PR 2's own two scenarios — `joiner_discovers_claims_and_is_
+   promoted_by_the_real_detector`/`rejoin_same_identity_is_a_noop`, both
+   with their `_over_seeds` siblings — unmodified against the new code;
+   all four still pass).
+2. **`role: NodeRole` selects the joiner's wire-visible role at exactly two
+   call sites**, both inside `join_via_seed_with_role`'s own body: the
+   `role` argument `claim_join_identity_via_relay` receives (so a data-role
+   join is claimed with `NodeAddrs.role == "data"`, not `"combined"`), and
+   `AdminInfo.role` on the freshly built `ClientCtx`. `NodeRole::Control`
+   panics immediately, naming `control_membership_split.rs`'s own open
+   question as the reason it stays unsupported.
+3. **No other fork was needed.** Re-reading the method's own PR 2 body
+   confirmed what its doc already argued: the combined arm already builds
+   a `ControlHandle::Remote`-controlled node with a reconciler,
+   `heartbeat_loop`, TTL reaper, and `spawn_remote_mirror_sync_loop`, and
+   spawns none of the control-plane-leader-only `backup_janitor_loop`/
+   `segment_janitor_loop`/`index_backfill_loop` trio (a `Remote`-controlled
+   node can never become control-plane leader) — the identical shape
+   `SimCluster::grow`'s own data-only branch already builds. Under this
+   fixture's `Remote`-everywhere simplification (PR 2's own documented
+   fork), a real combined join and a real data-only join therefore diverge
+   in exactly one place: the wire-visible role string. `self.roles.push
+   (NodeRole::Data)` stays unconditional for either wire role, unchanged
+   from PR 2 (see the method's own doc: `self.roles` gates the `restart`/
+   `role_of` control-prefix invariant, which neither arm extends).
+
+**A real, load-bearing finding from building the sim sibling, not assumed
+up front**: seeding a table before the join needed the WIRE path
+(`create_table_via_wire`), never `SimCluster::create_table`'s hand-hosted
+shortcut — that shortcut picks replicas `0..replication`, which in a mixed
+3-control+2-data cluster are the CONTROL-only node indices, unable to host
+a CP-data group at all. A second fact, found while reading `ClientCtx::
+provision_tablet`'s own doc (`schema.rs`) to confirm the scenario's own
+timing budget: a wire-created table's recorded placement policy is always
+`PlacementPolicy::simple("cp-rf", MAX_REPLICATION_FACTOR)` (3) — the
+*target*, never a snapshot of how many candidates were `Active` at
+creation time. With only 2 data nodes `Active` when the sim sibling's own
+three tables are created, every one of them is under-replicated relative
+to its own recorded policy from the moment it exists — so the joiner's
+third replica lands via `reconcile_placement`'s ordinary violation-repair
+path (the same one that replaces a killed replica) the instant it reaches
+`Active`, a deterministic policy-satisfaction repair, not a load-balance
+heuristic. This is a *stronger* guarantee than `tests/data_join.rs`'s own
+doc comment implies (framed as "seed enough tables that the rebalancer is
+guaranteed to move something," a balance concern) — the sim sibling keeps
+three tables anyway, mirroring the original one for one rather than
+exploiting the stronger guarantee to simplify. Both facts are recorded in
+`docs/engineering-lessons.md`'s matching new entry.
+
+**Testing**: `sim_cluster_seed_join.rs` gained scenario (c),
+`data_only_joiner_over_a_split_deployment_gets_a_rebalanced_replica` (2
+tests: pinned seed + a fixed 5-seed `_over_seeds` sibling) — a
+3-control+2-data split deployment (`SimCluster::new_with_roles`,
+mirroring `support::bring_up_split(3, 2, ..)`), three wire-created tables
+written through a pre-existing data node, then a third data-only node
+joined via `join_via_seed_with_role(seed, NodeRole::Data)` against a
+control-only FOLLOWER seed (never the leader — mirroring scenario (a)'s
+own reasoning for exercising `is_relayable_command`'s relay-to-leader
+path). Assertions mirror `tests/data_join.rs`'s own six numbered steps one
+for one: self-minted id (same shape checks as scenario (a) — never
+`nid()`, 22-char base64url); every node's view reaching `Active` through
+the real detector, with the same non-instantaneous-elapsed-virtual-time
+proxy scenario (a) established (`join_via_seed_with_role`'s data arm
+proposes no `UpsertMember` either, by construction — read directly, not
+assumed); the real placement reconciler landing a tablet replica on the
+joiner (`hosted_tablets`, converged-or-timeout polled, never a fixed
+sleep); and a bidirectional put/get round trip through the joined node's
+own `ClientCtx` for whichever of the three tables it actually ended up
+hosting, against a pre-existing data node. Helper `join_and_get_id`
+stayed unchanged (still calls `cluster.join_via_seed` directly, so the
+combined-mode entry point keeps a live, exercised caller and does not
+trip `dead_code` under `-D warnings`); a new `join_and_get_id_with_role`
+sibling backs scenario (c).
+
+**File disposition**: `tests/data_join.rs` (1 test,
+`data_node_joins_a_split_cluster_via_seed_and_gets_a_rebalanced_replica`)
+is **deleted whole** — precedent: `cluster_split.rs`, C-12. Proven green
+first, per the D3 conversion discipline (`cargo test -p animusd --test
+data_join`: 1 passed, 0 failed, 2.59s test time / ~41s wall including a
+cold `-p animusd` test-target rebuild), then confirmed to have no
+Cargo.toml/CI-workflow reference to update (`grep` for `data_join` against
+`crates/animusd/Cargo.toml` and `.github/workflows/*.yml`: no hits) before
+deletion. Every one of its own assertions has a sim sibling above; the one
+thing it alone ever exercised — the literal `Node::bind_data` real
+listener bind — is already covered permanently elsewhere
+(`config_node_identity.rs`, per this rung's own opener and ADR 0061's
+"Rung L closed" table).
+
+**Gates, all green, run in the order below**: `cargo build -p animusd
+--lib --tests` clean, zero warnings; `cargo fmt --all --check` clean
+(one lazy-continuation `clippy::doc_lazy_continuation` finding along the
+way — a doc paragraph's line happened to start with `+ `, which rustdoc
+parses as an unindented markdown list continuation; fixed by rewording,
+no behavior change); `cargo clippy --workspace --all-targets
+--all-features -- -D warnings` clean; `cargo test -p animusd --lib
+sim_cluster_seed_join` — **6 passed, 0 failed** (PR 2's own 4 plus this
+PR's new 2), run twice, identical both times (12.33s, 12.37s wall
+including test-binary rebuild the first time); `cargo test -p animusd
+--lib sim_cluster -- --test-threads=2` — the full deterministic tier,
+**573 passed, 0 failed, 2 ignored, 182 filtered out, finished in
+1328.41s** (22m8.6s wall) — exactly PR 2's own recorded baseline of 571
+plus this PR's own 2 new tests, no unreconciled discrepancy this time;
+`cargo test -p animusd --test seed_join --test seed_join_allocated` — the
+untouched real-socket production join suites, **6 passed, 0 failed** (1
+in `seed_join.rs`, 5 in `seed_join_allocated.rs`, 10.4s wall), proving
+production stayed byte-identical. `Cargo.lock` unchanged throughout.
