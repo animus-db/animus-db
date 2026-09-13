@@ -1274,8 +1274,14 @@ the still-true paragraph after the table.
   collision`, `seed_join_allocated.rs`'s test 2 deleted, two new sim
   scenarios (one a strictly stronger deterministic collision proof test 2
   itself never attempted), trimming that file to its one permanent
-  residual) → PR 6 (M or assess-and-close, `control_membership_split.rs`'s
-  open question) → PR 7 (S, close-out).
+  residual) → PR 6 (M/assess-and-close mix, `control_membership_split.rs`'s
+  open question, **landed** — one of its two tests converts cleanly
+  (a pure admin-vs-apply-task timing race, already fully generic, one new
+  `SimCluster::control_raft_indices` accessor); the other stays real-socket,
+  its own real subject needing a "combined control-plane-voter growth"
+  primitive that both `SimCluster::grow`'s own doc and C-12 PR 4e's own
+  module doc independently name as deferred, separately-budgeted
+  machinery, not a small additive extension) → PR 7 (S, close-out).
 - **ADR:** [0061](adr/0061-testability-node-crate-simulator.md), rung M
   (opened) — see its "Rung M (post-C-12)" opener amendment,
   [0030](adr/0030-online-cluster-growth.md)/[0032](adr/0032-decommission-and-join.md)
@@ -1301,11 +1307,20 @@ the still-true paragraph after the table.
   Inventory corrected to 5 files/13 tests; the two facts the plan left
   unresolved (`NodeId::mint`'s `Rng` bound, the `JoinInfo` serve arm's
   field reachability) both resolved in PR 1's favor (no widening needed
-  for either); `control_membership_split.rs`'s own conversion approach
-  left as an open question for the PR that attempts it. `seed_join_
-  allocated.rs` is now trimmed to its one permanent residual (test 4).
-  Remaining: PR 6 (`control_membership_split.rs`'s open question), PR 7
-  (close-out).
+  for either). `seed_join_allocated.rs` is now trimmed to its one
+  permanent residual (test 4). PR 6 resolved `control_membership_split.
+  rs`'s open question as a mixed disposition rather than an all-or-
+  nothing one: `admin_add_control_member_races_a_control_only_self_
+  registration_and_still_converges` converts (new `sim_cluster_control_
+  membership_split.rs`, one new `SimCluster::control_raft_indices`
+  accessor, no other production change); `grow_then_replace_a_voter_
+  over_a_split_deployment_with_live_data_traffic` is assessed and stays
+  real-socket — its own real subject needs a genuinely new `RaftNode<
+  SimEnv>` joining the LIVE control quorum, a primitive both `SimCluster::
+  grow`'s own doc and C-12 PR 4e's own module doc independently name as
+  deferred, separately-budgeted machinery. Remaining: PR 7 (close-out —
+  `join_data_seed_settings_reach.rs`'s disposition recording, the final
+  "Rung M closed" amendment).
 
 ## 4. Operator surfaces: admin API, dashboard, console, CLI
 
@@ -1388,7 +1403,7 @@ wave are independent and can run in parallel.
 | 11 | C-10 (closed 2026-09-09 — all seven PRs landed: #789, #790, #791, #792, #793, #794, plus PR 7) | Gated on C-09 (closed) — the next unowned residual group per C-08's and C-09's own close-outs |
 | 12 | C-11 (closed 2026-09-09 — all four PRs landed: #796, #797, #799, plus PR 4) | Gated on C-10 (closed) — the next unowned residual group per C-08's, C-09's, and C-10's own close-outs; proceeded without an explicit maintainer sequencing instruction, per Rung J's own close-out recommendation (see the C-11 entry's own note) |
 | 13 | C-12 (closed 2026-09-09 — all nine PRs landed: #806, #808, #822, #823, #824, #825, #826, #827, plus PR 5) | Gated on C-11 (closed) — the next unowned residual group per C-08's, C-09's, C-10's, and C-11's own close-outs; taken up per Rung K's own close-out recommendation |
-| 14 | C-13 (opened 2026-09-10, PRs 1-5 landed — seed/join discovery under `SimCluster`, ADR 0061 rung M) | Gated on C-12 (closed) — the next unowned residual group per C-08's through C-12's own close-outs |
+| 14 | C-13 (opened 2026-09-10, PRs 1-6 landed — seed/join discovery under `SimCluster`, ADR 0061 rung M) | Gated on C-12 (closed) — the next unowned residual group per C-08's through C-12's own close-outs |
 
 Open issues mapped: none left (#375 closed by W-01, #319 by W-05). Filed
 from wave 2's own findings: #590 (the operator still emits the deleted

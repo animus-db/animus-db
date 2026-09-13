@@ -2840,6 +2840,28 @@ impl SimCluster {
         self.shared.ctx(node).control.config()
     }
 
+    /// **C-13 / ADR 0061 rung M PR 6**: `(commit_index, engine_applied_index)`
+    /// read directly off `node`'s own local control `RaftNode<SimEnv>` —
+    /// bypasses the `/admin/raft` HTTP-JSON round trip entirely (unlike
+    /// [`SimCluster::admin`], which always burns a full `OP_BUDGET` virtual-
+    /// time jump internally — [`SimCluster::spawn_and_capture`]'s own doc —
+    /// making it useless for observing a narrow, `Duration`-scale timing
+    /// window). This is what lets a scenario reproduce the real `tests/
+    /// control_membership_admin_races_a_control_only_self_registration_and_
+    /// still_converges`-style "committed but not yet locally applied on
+    /// this leader specifically" window (ADR 0038's async apply task lagging
+    /// a leader's own just-committed entry) deterministically, by stepping
+    /// [`SimCluster::run_for`] in small increments between reads instead of
+    /// polling a real `/admin/raft` at real-clock cadence the way the
+    /// real-socket test does. `node` must be control-bearing (a
+    /// `NodeRole::Data` node has no local `RaftNode` at all — this indexes
+    /// `self.controls` directly, unlike `control_voters`'s `ClientCtx`-level
+    /// `None`-for-`Remote` fallback).
+    pub(crate) fn control_raft_indices(&self, node: u64) -> (u64, u64) {
+        let raft = &self.controls[node as usize];
+        (raft.commit_index(), raft.engine_applied_index())
+    }
+
     /// **C-13 / ADR 0061 rung M PR 4**: `node`'s own current `client_route`
     /// map's key set — the sim-native equivalent of a real node's own
     /// `GET /admin/peers` response (this fixture never binds an admin HTTP

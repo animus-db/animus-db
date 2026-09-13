@@ -19307,6 +19307,25 @@ mod sim_cluster_control_membership_admin;
 #[cfg(test)]
 mod sim_cluster_seed_join;
 
+/// C-13 / ADR 0061 rung M PR 6 — `tests/control_membership_split.rs`'s own
+/// two real-socket tests, a mixed disposition: (1)
+/// `admin_add_control_member_races_a_control_only_self_registration_and_
+/// still_converges` converts cleanly (pure control-plane admin-vs-apply-task
+/// timing, already fully `<E, R>`-generic — one small `SimCluster::
+/// control_raft_indices` accessor added, no production behavior change);
+/// (2) `grow_then_replace_a_voter_over_a_split_deployment_with_live_data_
+/// traffic` stays real-socket — its own real subject needs a genuinely new
+/// `RaftNode<SimEnv>` joining the LIVE control quorum
+/// (`self.controls` growing, not just `self.nodes`), which
+/// `SimCluster::grow`'s own doc AND `sim_cluster_control_membership_admin.
+/// rs`'s own module doc (C-12 PR 4e) both independently flag as deferred,
+/// separately-budgeted machinery, not a small additive extension. See `sim_
+/// cluster_control_membership_split.rs`'s own module doc for the full
+/// assertion-by-assertion account and `crates/animusd/CLAUDE.md`'s matching
+/// appendix entry.
+#[cfg(test)]
+mod sim_cluster_control_membership_split;
+
 /// Regression for the issue #298 residual confirmed live under the
 /// un-pinned `SplitMode::InPlace` proof soak (ADR 0018's matching amendment,
 /// `docs/engineering-lessons.md`'s matching entry): a stage blocked by
