@@ -15,6 +15,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use animus_control::Metadata;
@@ -2173,24 +2175,60 @@ async fn admin_stream_grow_doubles_a_multi_tablet_table_with_exactly_once_delive
 
 /// Growth PR3 Fork F (ADR 0042 §14): the opt-in `--auto-split-change-rate`
 /// trigger. Aggressive knobs (a low `RATE`, no other threshold configured)
-/// so a short, sizable write burst against a **streamed** table's single
-/// tablet drives its own smoothed change-append rate well above `RATE`
-/// within a couple of `INDEX_DRAIN_INTERVAL` ticks — proving a high-churn
-/// streamed table splits on rate alone. The SAME burst against a **plain,
-/// unstreamed** table must never split at all: no byte/key threshold is
-/// configured, and the change-rate tracker is never even populated for an
-/// unstreamed tablet (`index_drain::seal_tick`'s `stream_enabled` gate),
-/// so `--auto-split-change-rate` must have zero effect on it regardless of
+/// so a **sustained** high-churn write load against a **streamed** table's
+/// single tablet drives its own smoothed change-append rate well above
+/// `RATE` — proving a high-churn streamed table splits on rate alone. The
+/// SAME load against a **plain, unstreamed** table must never split at
+/// all: no byte/key threshold is configured, and the change-rate tracker
+/// is never even populated for an unstreamed tablet
+/// (`index_drain::seal_tick`'s `stream_enabled` gate), so
+/// `--auto-split-change-rate` must have zero effect on it regardless of
 /// write volume — the "opt-in, streamed tables only, no surprise splits on
 /// an existing plain table" guarantee.
+///
+/// **Issue #867 fix**: this used to write a fixed one-shot burst of 60
+/// items THEN poll for the split — which asserts a property the tracker
+/// never promised. `ChangeRateTracker`'s smoothed rate is an EWMA that
+/// decays by a fixed `1.0 - RATE_EWMA_ALPHA` factor on every
+/// `INDEX_DRAIN_INTERVAL` (200ms) **observation**, regardless of how long
+/// that observation's own gap was (`RateSample::advance`) — and
+/// `auto_split_loop`'s own sweep runs on an *independent* `AUTO_SPLIT_
+/// INTERVAL` (2s) clock. A burst that finishes well inside one
+/// `AUTO_SPLIT_INTERVAL` window (which a fast burst against a single-node,
+/// in-process cluster routinely does) keeps decaying, unobserved, until
+/// whichever sweep tick happens to come next — and ~10 zero-growth ticks
+/// (one `AUTO_SPLIT_INTERVAL`'s worth) is enough to erase even a
+/// two-orders-of-magnitude peak back under this test's 10,000 B/s
+/// threshold (pinned deterministically in `rate_tracker_tests::
+/// change_rate_tracker_a_completed_burst_can_decay_below_threshold_
+/// before_the_next_auto_split_sweep`, `lib.rs`). Once the burst had
+/// already fully completed before this test's own `await_true` poll even
+/// started, there was no way left for the signal to ever come back — it
+/// can only decay further from there, so a sweep landing on unlucky phase
+/// timed the whole test out. This is not a bug in the tracker or the
+/// sweep: "the change-append rate is currently high" legitimately stops
+/// being true once the writes that made it high have stopped. The fix
+/// (mirroring the #580 pattern of targeting the property the mechanism
+/// actually guarantees, `docs/engineering-lessons.md`) is to keep the
+/// write load **running for as long as either poll below is open**, so
+/// every sweep tick — whenever its phase happens to land — observes a
+/// genuinely still-ongoing high rate, never a stale, already-decaying one.
+/// Because that writer now runs straight through the in-place fork it
+/// itself triggers, its own PutItems can land inside the ADR 0050 F8
+/// freeze→cutover window — issue #277's shape — so it uses
+/// [`dynamo_retrying`], not a bare [`dynamo`] + `assert_eq!(200)`, and its
+/// `JoinHandle` is polled for an early exit on every tick of both loops
+/// below so a real write failure (past `dynamo_retrying`'s own documented
+/// retry ceiling) fails loudly and immediately rather than reading as a
+/// plain 20s timeout.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn auto_split_change_rate_splits_a_high_churn_streamed_table_never_a_plain_one() {
     let dir = support::panic_safe_tempdir();
-    // Large seal knobs: the burst below must accumulate in `KIND_CHANGE`
-    // rather than sealing (and hence trimming) mid-burst, so the tracker
+    // Large seal knobs: the load below must accumulate in `KIND_CHANGE`
+    // rather than sealing (and hence trimming) mid-load, so the tracker
     // sees a clean, strongly-rising byte level rather than seal-driven
-    // sawtooth noise. An aggressive 10 KB/sec threshold — the burst below
-    // produces roughly two orders of magnitude more than that.
+    // sawtooth noise. An aggressive 10 KB/sec threshold — the load below
+    // produces roughly two orders of magnitude more than that per item.
     let nodes = start_streamed_cluster_with_change_rate(
         1,
         dir.path(),
@@ -2225,40 +2263,77 @@ async fn auto_split_change_rate_splits_a_high_churn_streamed_table_never_a_plain
     .await;
     assert_eq!(status, 200, "CreateTable(plain_table) failed: {body}");
 
-    // The SAME sizable burst against both tables — 60 items of ~2 KB each
-    // (~120 KB total), written as fast as the test can issue them (well
-    // under the `INDEX_DRAIN_INTERVAL` scale this needs to look "bursty"
-    // against).
-    let filler = "x".repeat(2_000);
-    for i in 0..60u32 {
-        for table in ["hot_stream", "plain_table"] {
-            let (status, body) = dynamo(
-                nodes[0].dynamo_addr(),
-                "DynamoDB_20120810.PutItem",
-                &format!(
-                    r#"{{"TableName":"{table}","Item":{{"id":{{"S":"i{i:04}"}},"body":{{"S":"{filler}"}}}}}}"#
-                ),
-            )
-            .await;
-            assert_eq!(status, 200, "PutItem({table}, i{i}) failed: {body}");
-        }
-    }
+    // A CONTINUOUS round-robin writer against both tables — ~2 KB items,
+    // as fast as it can issue them — kept running by a `stop` flag rather
+    // than a fixed count, so it stays alive for the full span of both
+    // polls below. Overwriting the same small key set is fine: every
+    // write to a streamed table appends a fresh `KIND_CHANGE` record
+    // regardless of whether the key already existed.
+    //
+    // Uses [`dynamo_retrying`], not the bare [`dynamo`] + `assert_eq!(200)`
+    // pair the rest of this test uses for one-shot calls: running straight
+    // through an in-place fork's own freeze→cutover window (this table
+    // splits *because* this writer is driving it) means some PutItem here
+    // will land inside the documented ADR 0050 F8 blip and come back a 500
+    // ("tablet frozen for split cutover ... retry") — issue #277's shape.
+    // `dynamo_retrying` already exists for exactly this transient; a bare
+    // assert on every write would reintroduce that flake the moment the
+    // writer's own traffic starts overlapping a real split.
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let stop = Arc::clone(&stop);
+        let addr = nodes[0].dynamo_addr();
+        let filler = "x".repeat(2_000);
+        tokio::spawn(async move {
+            let mut i: u32 = 0;
+            while !stop.load(Ordering::Relaxed) {
+                for table in ["hot_stream", "plain_table"] {
+                    dynamo_retrying(
+                        addr,
+                        "DynamoDB_20120810.PutItem",
+                        &format!(
+                            r#"{{"TableName":"{table}","Item":{{"id":{{"S":"i{k:04}"}},"body":{{"S":"{filler}"}}}}}}"#,
+                            k = i % 60,
+                        ),
+                        &format!("PutItem({table}, i{i})"),
+                    )
+                    .await;
+                }
+                i = i.wrapping_add(1);
+            }
+        })
+    };
 
     // The streamed table's own tablet count must reach 2 — the change-rate
-    // trigger fired.
+    // trigger fired — with the writer above keeping the tracked rate
+    // genuinely live for every sweep this poll spans. `writer.is_finished()`
+    // is checked on every poll tick (a plain sync read, no `.await` needed)
+    // so a genuine writer panic — `dynamo_retrying` exhausting its own
+    // retry ceiling on a real error — surfaces here immediately, rather
+    // than masquerading as this poll's own 20s "never auto-split" timeout;
+    // the actual panic message already reached stderr via the runtime's
+    // own panic hook the moment the task panicked, independent of when
+    // anything `.await`s the handle.
     await_true(
         20,
         "hot_stream never auto-split on its own change-append rate",
-        || tablets_for(&nodes[0].metadata(), "hot_stream").len() >= 2,
+        || {
+            assert!(
+                !writer.is_finished(),
+                "continuous writer task exited early — see its own panic above"
+            );
+            tablets_for(&nodes[0].metadata(), "hot_stream").len() >= 2
+        },
     )
     .await;
 
-    // Meanwhile — over a comparable window — the plain table must NEVER
-    // gain a second tablet: no byte/key threshold is configured, and the
-    // change-rate tracker was never populated for an unstreamed tablet in
-    // the first place. A converged-or-timeout window that fails the
-    // instant a split is observed (never a fixed sleep followed by one
-    // assertion), matching this crate's own negative-property discipline.
+    // Meanwhile — over a comparable window, writer still running — the
+    // plain table must NEVER gain a second tablet: no byte/key threshold
+    // is configured, and the change-rate tracker was never populated for
+    // an unstreamed tablet in the first place. A converged-or-timeout
+    // window that fails the instant a split is observed (never a fixed
+    // sleep followed by one assertion), matching this crate's own
+    // negative-property discipline. Same early-panic guard as above.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         let plain_tablets = tablets_for(&nodes[0].metadata(), "plain_table").len();
@@ -2266,11 +2341,18 @@ async fn auto_split_change_rate_splits_a_high_churn_streamed_table_never_a_plain
             plain_tablets, 1,
             "an unstreamed table must never be split by --auto-split-change-rate"
         );
+        assert!(
+            !writer.is_finished(),
+            "continuous writer task exited early — see its own panic above"
+        );
         if tokio::time::Instant::now() >= deadline {
             break;
         }
         sleep(Duration::from_millis(100)).await;
     }
+
+    stop.store(true, Ordering::Relaxed);
+    writer.await.expect("continuous writer task panicked");
 }
 
 /// Every shard object `DescribeStream` currently lists for `stream_arn`,

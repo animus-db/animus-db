@@ -9100,6 +9100,81 @@ mod rate_tracker_tests {
         );
     }
 
+    /// Pins the exact mechanism behind issue #867's flake in
+    /// `streams_e2e.rs::auto_split_change_rate_splits_a_high_churn_
+    /// streamed_table_never_a_plain_one`: `auto_split_loop`'s own
+    /// `AUTO_SPLIT_INTERVAL` sweep and `change_consumer_loop`'s
+    /// `INDEX_DRAIN_INTERVAL` tracker tick run on two independent clocks,
+    /// and this tracker decays by a fixed `1.0 - RATE_EWMA_ALPHA` factor on
+    /// every **observation** regardless of how long that observation's own
+    /// gap was (`RateSample::advance`'s `elapsed` only scales the
+    /// instantaneous half of the blend, not the decay factor on the
+    /// previous rate). A burst that completes well inside one
+    /// `AUTO_SPLIT_INTERVAL` window — which a fast burst against a
+    /// single-node, in-process cluster routinely does — keeps decaying,
+    /// unobserved, for as many `INDEX_DRAIN_INTERVAL` ticks as elapse
+    /// before the next sweep happens to run. This test shows that gap is
+    /// large enough, on the e2e test's own numbers, to erase a peak two
+    /// orders of magnitude over threshold: not a bug in the tracker or the
+    /// sweep (a change-append rate legitimately stops being "high" once
+    /// the writes that made it high have stopped), but proof that a
+    /// one-shot, already-finished burst is not a property this trigger
+    /// promises to remember — the reason the e2e test now keeps its write
+    /// load running for the whole time either of its polls is open,
+    /// instead of writing a fixed burst and then only checking afterward.
+    #[test]
+    fn change_rate_tracker_a_completed_burst_can_decay_below_threshold_before_the_next_auto_split_sweep()
+     {
+        // The e2e fixture's own threshold (`--auto-split-change-rate
+        // 10_000` in `streams_e2e.rs`).
+        const CHANGE_RATE_THRESHOLD: f64 = 10_000.0;
+
+        let mut sim = Simulator::new(0x8670_0001);
+        let env = sim.env(nid(0));
+        let tracker = ChangeRateTracker::default();
+
+        // Seed a baseline: a real tablet is already observed at 0 bytes on
+        // every idle `INDEX_DRAIN_INTERVAL` tick before any burst starts.
+        sim.run_for(crate::index_drain::INDEX_DRAIN_INTERVAL);
+        tracker.observe(TABLET, 0, env.now());
+
+        // The e2e fixture's own burst — 60 items of ~2KB each, ~130_000
+        // bytes total — landing inside a single `INDEX_DRAIN_INTERVAL`
+        // tick, mirroring a burst that completes faster than the tracker
+        // samples it (the common case for 60 sequential in-process RPCs).
+        sim.run_for(crate::index_drain::INDEX_DRAIN_INTERVAL);
+        let peak = tracker.observe(TABLET, 130_000, env.now());
+        assert!(
+            peak > CHANGE_RATE_THRESHOLD * 10.0,
+            "expected the burst's own peak reading to clear the threshold by an order \
+             of magnitude (matching the e2e fixture's own comment), got {peak}"
+        );
+
+        // Nothing further is ever written (the burst is over) — but
+        // `change_consumer_loop` keeps ticking every `INDEX_DRAIN_INTERVAL`
+        // regardless, each one a zero-growth observation. Advance exactly
+        // one `AUTO_SPLIT_INTERVAL`'s worth of those ticks: the longest an
+        // `auto_split_loop` sweep can plausibly go without ever having
+        // looked, if its own periodic tick had just fired right as the
+        // burst began.
+        let ticks = (super::AUTO_SPLIT_INTERVAL.as_secs_f64()
+            / crate::index_drain::INDEX_DRAIN_INTERVAL.as_secs_f64())
+        .round() as u32;
+        let mut decayed = peak;
+        for _ in 0..ticks {
+            sim.run_for(crate::index_drain::INDEX_DRAIN_INTERVAL);
+            decayed = tracker.observe(TABLET, 130_000, env.now());
+        }
+        assert!(
+            decayed < CHANGE_RATE_THRESHOLD,
+            "expected one AUTO_SPLIT_INTERVAL's worth of zero-growth ticks to decay a \
+             completed burst back under the sweep's own threshold (peak={peak}, \
+             decayed={decayed}, ticks={ticks}) — if this fails, the decay dynamics have \
+             changed and issue #867's race may have narrowed or closed; re-examine \
+             whether streams_e2e.rs's continuous-writer fix is still needed"
+        );
+    }
+
     #[test]
     fn request_rate_tracker_converges_toward_a_sustained_write_rate() {
         let mut sim = Simulator::new(0x5241_5447);
