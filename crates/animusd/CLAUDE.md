@@ -3035,6 +3035,21 @@ the identical `byte_weighted_median`/`trigger_split` path every other
 trigger uses, so F11/Fork E apply automatically. No production-tuned
 default exists — omitting the flag is a true no-op.
 
+**Testing this trigger**: `ChangeRateTracker`'s EWMA decays by a fixed
+factor on every `INDEX_DRAIN_INTERVAL` observation, not per unit wall
+time, and `auto_split_loop`'s own `AUTO_SPLIT_INTERVAL` sweep runs on an
+independent clock — so a real-thread test that writes a fixed one-shot
+burst and only starts polling once the burst is already over can flake:
+the signal only ever decays from there, and whether some earlier sweep
+tick's phase happened to land while it was still hot is pure luck. Drive
+the write load as a continuous task that keeps running for the whole span
+of the test's own poll instead (`streams_e2e.rs`'s `auto_split_change_
+rate_splits_a_high_churn_streamed_table_never_a_plain_one`, fixed this
+way for issue #867 — see `docs/engineering-lessons.md`'s Testing section
+for the full decay-math writeup and the deterministic
+`rate_tracker_tests::change_rate_tracker_a_completed_burst_can_decay_
+below_threshold_before_the_next_auto_split_sweep` pin).
+
 **Request-rate trigger (opt-in, W-09, ADR 0034's own deferred bullet,
 closed)**: `--auto-split-ops-rate RATE` joins the same any-fires gate
 above, applicable to **any** table — unlike change-rate, this one needs no
