@@ -50,6 +50,7 @@ use tokio::net::TcpStream;
 const STARTUP_DEADLINE: Duration = Duration::from_secs(30);
 const HEALTH_DEADLINE: Duration = Duration::from_secs(30);
 const TEST_DEADLINE: Duration = Duration::from_secs(120);
+const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(30);
 
 struct Run {
     child: Child,
@@ -238,6 +239,23 @@ async fn wait_for_all_healthy(addrs: &[SocketAddr]) -> Result<(), String> {
     }
 }
 
+/// Sends SIGTERM to `pid` via the external `kill` binary (there is no
+/// `libc`/`nix` dev-dependency in this crate to reach for instead — see the
+/// task's own note on this). `main.rs`'s `wait_for_ctrl_c` listens for
+/// SIGTERM on unix, so this is the signal that actually drives a clean
+/// `shutdown_graceful()` — not the plain kill this file's own `Run::drop`
+/// uses for teardown after a test has already made its assertions.
+fn send_sigterm(pid: u32) {
+    let status = Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()
+        .unwrap_or_else(|e| panic!("failed to run `kill -TERM {pid}`: {e}"));
+    assert!(
+        status.success(),
+        "`kill -TERM {pid}` itself failed: {status}"
+    );
+}
+
 /// Names of the entries directly under `std::env::temp_dir()` whose name
 /// starts with `animusd` — this crate's own data-dir naming, pre- and
 /// post-fix alike (`animusd`, `animusd-cluster-<pid>`,
@@ -323,6 +341,153 @@ async fn back_to_back_ephemeral_cluster_runs_get_distinct_default_dirs() {
             "two back-to-back `--cluster N --ephemeral` runs with no `--dir` \
              must not default to the same data directory"
         );
+    })
+    .await
+    .expect("test exceeded its overall deadline");
+}
+
+/// This crate's own follow-up (see `crates/animusd/CLAUDE.md`'s "Ephemeral
+/// runs now leave `animusd-ephemeral-<pid>` directories behind" note on
+/// PR #817): an `--ephemeral` in-process cluster with no `--dir` must remove
+/// its own auto-generated data directory on clean shutdown.
+///
+/// Sends the child SIGTERM (the signal `wait_for_ctrl_c` actually listens
+/// for on unix, alongside Ctrl-C) rather than killing it, so
+/// `shutdown_graceful()` runs and the removal happens on the path this test
+/// exists to prove — a hard kill would prove nothing here.
+#[tokio::test(flavor = "multi_thread")]
+async fn ephemeral_cluster_removes_its_default_dir_on_clean_shutdown() {
+    tokio::time::timeout(TEST_DEADLINE, async {
+        let mut run = spawn_and_capture_banner(&["--cluster", "1", "--ephemeral"], 1);
+        wait_for_all_healthy(&run.admin_addrs)
+            .await
+            .expect("must become healthy before shutting down");
+        let data_dir = run
+            .data_dir
+            .clone()
+            .expect("this binary must print `animusd: data dir …` at startup");
+        assert!(
+            std::path::Path::new(&data_dir).exists(),
+            "the ephemeral data dir {data_dir} must exist while the cluster is running"
+        );
+
+        let pid = run.child.id();
+        send_sigterm(pid);
+
+        // Poll `try_wait` to a bounded deadline — never a fixed sleep. Once
+        // this observes an exit status, `std::process::Child` caches it
+        // internally, so `Run`'s own `Drop` (which also calls `kill`+`wait`
+        // for teardown after every other test in this file) becomes a
+        // guaranteed no-op rather than a double-kill of a possibly-reused
+        // pid.
+        let exit_deadline = tokio::time::Instant::now() + SHUTDOWN_DEADLINE;
+        let status = loop {
+            if let Ok(Some(status)) = run.child.try_wait() {
+                break status;
+            }
+            if tokio::time::Instant::now() >= exit_deadline {
+                panic!(
+                    "`animusd --cluster 1 --ephemeral` did not exit within \
+                     {SHUTDOWN_DEADLINE:?} of SIGTERM"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert!(
+            status.success(),
+            "a clean SIGTERM shutdown must exit successfully, got {status}"
+        );
+
+        // Drain whatever stdout the child produced before it closed the
+        // pipe on exit, looking for the removal line this fix adds.
+        let mut saw_removed_line = false;
+        while let Ok(line) = run._stdout_rx.recv_timeout(Duration::from_millis(500)) {
+            if line.contains("animusd: removed ephemeral data dir") {
+                saw_removed_line = true;
+            }
+        }
+        assert!(
+            saw_removed_line,
+            "expected an `animusd: removed ephemeral data dir …` line on \
+             clean shutdown of an `--ephemeral` cluster"
+        );
+
+        assert!(
+            !std::path::Path::new(&data_dir).exists(),
+            "the ephemeral data dir {data_dir} must be gone after clean shutdown"
+        );
+
+        // Exercise `Run::drop` on an already-exited, already-`try_wait`ed
+        // child directly — it must neither panic nor try to signal a
+        // possibly-reused pid.
+        drop(run);
+    })
+    .await
+    .expect("test exceeded its overall deadline");
+}
+
+/// The mirror-image guard: a durable (non-`--ephemeral`) in-process cluster's
+/// default data directory is real on-disk state, never removed on shutdown —
+/// clean or otherwise.
+#[tokio::test(flavor = "multi_thread")]
+async fn durable_cluster_keeps_its_default_dir_on_clean_shutdown() {
+    tokio::time::timeout(TEST_DEADLINE, async {
+        let mut run = spawn_and_capture_banner(&["--cluster", "1"], 1);
+        wait_for_all_healthy(&run.admin_addrs)
+            .await
+            .expect("must become healthy before shutting down");
+        let data_dir = run
+            .data_dir
+            .clone()
+            .expect("this binary must print `animusd: data dir …` at startup");
+        assert!(
+            std::path::Path::new(&data_dir).exists(),
+            "the durable data dir {data_dir} must exist while the cluster is running"
+        );
+
+        let pid = run.child.id();
+        send_sigterm(pid);
+
+        let exit_deadline = tokio::time::Instant::now() + SHUTDOWN_DEADLINE;
+        let status = loop {
+            if let Ok(Some(status)) = run.child.try_wait() {
+                break status;
+            }
+            if tokio::time::Instant::now() >= exit_deadline {
+                panic!(
+                    "`animusd --cluster 1` did not exit within {SHUTDOWN_DEADLINE:?} \
+                     of SIGTERM"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert!(
+            status.success(),
+            "a clean SIGTERM shutdown must exit successfully, got {status}"
+        );
+
+        let mut saw_removed_line = false;
+        while let Ok(line) = run._stdout_rx.recv_timeout(Duration::from_millis(500)) {
+            if line.contains("animusd: removed ephemeral data dir") {
+                saw_removed_line = true;
+            }
+        }
+        assert!(
+            !saw_removed_line,
+            "a non-`--ephemeral` cluster must never print a `removed ephemeral \
+             data dir` line"
+        );
+
+        assert!(
+            std::path::Path::new(&data_dir).exists(),
+            "the durable data dir {data_dir} must still exist after clean shutdown \
+             — only `--ephemeral` runs remove their default dir"
+        );
+
+        drop(run);
+        // This test's own cleanup — nothing under production code removes a
+        // durable default dir, by design, so this test must.
+        let _ = std::fs::remove_dir_all(&data_dir);
     })
     .await
     .expect("test exceeded its overall deadline");

@@ -5333,6 +5333,37 @@ ADR itself for the full design/rationale.
   there is no stable prior state to legitimately resume. `--dir` still lets
   you opt into a fixed, reusable location on purpose; a genuinely
   throwaway run needs nothing extra now.
+  **Follow-up (closed): an `--ephemeral` run's own auto-generated
+  `animusd-ephemeral-<pid>` directory is removed on clean shutdown**
+  (`main.rs::ephemeral_dir_to_remove`/`remove_ephemeral_dir_on_clean_
+  shutdown`, called from both `run_in_process_cluster`/
+  `run_in_process_split_cluster` right after every node's own
+  `shutdown_graceful().await` has returned — so every file is closed before
+  the `remove_dir_all` runs) — `--dir`'s stated "no directories left behind
+  instead of reusing one" gap above is closed for the `--ephemeral` case;
+  a durable (non-`--ephemeral`) default directory is still never removed
+  (it holds real, restart-resumable on-disk state), and an explicit
+  `--dir` is never removed either way (the caller's own chosen location).
+  `ephemeral_dir_to_remove` is a small, pure, unit-tested predicate
+  (belt-and-braces: it refuses to name anything whose parent isn't
+  `std::env::temp_dir()` or whose final component isn't exactly
+  `animusd-ephemeral-{this process's own pid}`) so the actual `remove_
+  dir_all` call site can never be handed an unexpected path; a removal
+  failure is logged (`eprintln!`/`tracing::warn!`) and never turns a clean
+  shutdown into a non-zero exit. Deliberately an explicit call at the end
+  of each of the two `run_in_process_*` functions, not a `Drop` guard — a
+  `Drop` would also fire on a panic-unwind path, and "clean shutdown only"
+  is the intended contract (a crashed/panicked process's own directory is
+  left in place for a post-mortem, exactly like a durable run's always is).
+  Regression: `tests/cluster_ephemeral_default_dir.rs`'s
+  `ephemeral_cluster_removes_its_default_dir_on_clean_shutdown` (SIGTERM,
+  the signal `wait_for_ctrl_c` actually listens for — poll `try_wait` to a
+  bounded deadline, then assert the directory is gone and the banner
+  printed `animusd: removed ephemeral data dir …`) and its mirror,
+  `durable_cluster_keeps_its_default_dir_on_clean_shutdown` (no
+  `--ephemeral`: the directory survives an identical clean SIGTERM
+  shutdown, and the test cleans it up itself since nothing in production
+  does).
 - **The cluster's members are node ids** (ADR 0040 unified the control and
   raftkv id spaces into one) — `bootstrap` (leader-only, idempotent)
   registers each data-role node's own id as `Active`. Failure detection
