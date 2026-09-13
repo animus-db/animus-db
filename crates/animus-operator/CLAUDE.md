@@ -596,9 +596,9 @@ above.
 
 **`scripts/e2e-kind.sh`'s `E2E_S3=1` leg is UNVERIFIED in this sandbox**
 — same `CAP_SYS_RESOURCE` reason `E2E_TLS`'s own leg is (see the e2e
-section below): it deploys a single-pod MinIO + Service, creates the
-bucket via a throwaway `minio/mc` pod and the credentials `Secret`,
-applies `spec.s3.backupStore` pointing at `http://minio.<ns>.svc:9000`
+section below): it deploys a single-pod RustFS + Service, creates the
+bucket via a throwaway `amazon/aws-cli` pod and the credentials `Secret`,
+applies `spec.s3.backupStore` pointing at `http://rustfs.<ns>.svc:9000`
 with `allowInsecureHttp: true`, then exercises `CreateBackup`/
 `DescribeBackup` over the DynamoDB wire and checks `GET
 /admin/backup-store` reports `"kind":"s3"`. Written carefully and
@@ -1274,11 +1274,13 @@ end anywhere; the first real `e2e-kind-tls` CI run is this path's first
 real test.
 
 **`E2E_S3=1` (S-04 PR 3, CI's own `e2e-kind-s3` job) runs the same smoke
-plus a `spec.s3.backupStore` leg**: deploys a single-pod MinIO + Service
-into the kind cluster (the well-known `minio/minio` image), creates its
-bucket via a throwaway `minio/mc` pod, creates the `access_key_id`/
+plus a `spec.s3.backupStore` leg**: deploys a single-pod RustFS + Service
+into the kind cluster (`rustfs/rustfs`, an Apache-2.0 S3-compatible store
+— it replaced MinIO in #863, after `minio/minio` and `minio/mc` both
+stopped resolving on Docker Hub), creates its bucket via a throwaway
+`amazon/aws-cli` pod, creates the `access_key_id`/
 `secret_access_key` credentials `Secret`, applies the `AnimusCluster` with
-`spec.s3.backupStore` pointing at `http://minio.<ns>.svc:9000`
+`spec.s3.backupStore` pointing at `http://rustfs.<ns>.svc:9000`
 (`allowInsecureHttp: true` — a loopback-to-the-cluster dev target, never a
 real deployment shape), then exercises `CreateBackup`/`DescribeBackup`
 over the DynamoDB wire and checks `GET /admin/backup-store` reports
@@ -1291,7 +1293,7 @@ unchanged. Independent of `E2E_TLS` — either, both, or neither may be set.
 
 **`E2E_ENCRYPTION=1` (ADR 0069 S-03 PR 3, CI's own `e2e-kind-encryption`
 job) runs the same smoke plus a `spec.encryptionKeySecretName` leg**: no
-extra in-cluster dependency (unlike MinIO for `E2E_S3`) — creates the
+extra in-cluster dependency (unlike RustFS for `E2E_S3`) — creates the
 `Secret` (a freshly generated 64-hex-character key via `openssl rand
 -hex 32`, never logged anywhere in the script), sets `spec.
 encryptionKeySecretName` on the manifest, then — right after the ordinary

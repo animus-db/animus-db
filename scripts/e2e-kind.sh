@@ -95,16 +95,16 @@
 #                       comment lying.
 #   E2E_S3           - "1" adds an S-04 PR 3 leg on top of the plain-TCP
 #                       path (mutually independent of E2E_TLS — either, both,
-#                       or neither may be set): deploys a single-pod MinIO
-#                       (the well-known `minio/minio` image) + Service into
-#                       the kind cluster, creates its bucket via a throwaway
-#                       `minio/mc` pod, creates the `access_key_id`/
-#                       `secret_access_key` credentials Secret
+#                       or neither may be set): deploys a single-pod RustFS
+#                       (`rustfs/rustfs`, an Apache-2.0 S3-compatible store)
+#                       + Service into the kind cluster, creates its bucket
+#                       via a throwaway `amazon/aws-cli` pod, creates the
+#                       `access_key_id`/`secret_access_key` credentials Secret
 #                       `spec.s3.credentialsSecretName` names, applies the
 #                       AnimusCluster with `spec.s3.backupStore` pointing at
-#                       `http://minio.<ns>.svc:9000` (`allowInsecureHttp:
-#                       true` — a loopback-to-the-cluster MinIO dev target,
-#                       never a real deployment shape), then exercises
+#                       `http://rustfs.<ns>.svc:9000` (`allowInsecureHttp:
+#                       true` — a loopback-to-the-cluster dev target, never
+#                       a real deployment shape), then exercises
 #                       `CreateBackup`/`DescribeBackup` over the DynamoDB
 #                       wire and checks `GET /admin/backup-store` reports
 #                       `"kind":"s3"`. Default "0" (unset) leaves the smoke
@@ -200,12 +200,19 @@ E2E_TLS="${E2E_TLS:-0}"
 CERT_MANAGER_VERSION="v1.16.2"
 CLUSTER_ISSUER_NAME="e2e-selfsigned"
 E2E_S3="${E2E_S3:-0}"
-MINIO_IMAGE="${MINIO_IMAGE:-minio/minio:latest}"
-MINIO_MC_IMAGE="${MINIO_MC_IMAGE:-minio/mc:latest}"
+# Pinned on purpose: an unpinned `:latest` on a third-party registry is a
+# dependency on someone else's publishing decisions, and #863 is what that
+# costs — `minio/minio` and `minio/mc` both stopped resolving on Docker Hub
+# and took this leg red on every branch at once. Bump these deliberately.
+RUSTFS_IMAGE="${RUSTFS_IMAGE:-rustfs/rustfs:1.0.0-rc.6}"
+AWSCLI_IMAGE="${AWSCLI_IMAGE:-amazon/aws-cli:2.36.44}"
+# The UID/GID the rustfs container runs as; its data directory has to be
+# writable by that user or startup fails with permission denied.
+RUSTFS_UID="10001"
 # Throwaway kind-cluster-local credentials — never anything real, and never
 # reused outside this one ephemeral cluster's lifetime.
-MINIO_ACCESS_KEY="e2eaccesskey"
-MINIO_SECRET_KEY="e2esecretkey123"
+S3_ACCESS_KEY="e2eaccesskey"
+S3_SECRET_KEY="e2esecretkey123"
 S3_BUCKET="e2e-backups"
 S3_CREDS_SECRET_NAME="e2e-s3-creds"
 E2E_ENCRYPTION="${E2E_ENCRYPTION:-0}"
@@ -715,58 +722,82 @@ fi
 
 S3_SPEC_YAML=""
 if [ "$E2E_S3" = "1" ]; then
-    phase "deploy MinIO (S-04 PR 3)"
+    phase "deploy RustFS (S-04 PR 3)"
+    # `fsGroup` is load-bearing, not boilerplate: the image runs as non-root
+    # UID/GID ${RUSTFS_UID}, and an emptyDir is created root-owned, so without it
+    # rustfs cannot write its data directory and the pod never goes ready.
     kubectl apply -f - <<EOF
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: minio
+  name: rustfs
   namespace: ${NAMESPACE}
 spec:
   replicas: 1
   selector:
-    matchLabels: {app: minio}
+    matchLabels: {app: rustfs}
   template:
     metadata:
-      labels: {app: minio}
+      labels: {app: rustfs}
     spec:
+      securityContext:
+        fsGroup: ${RUSTFS_UID}
       containers:
-        - name: minio
-          image: ${MINIO_IMAGE}
-          args: ["server", "/data"]
+        - name: rustfs
+          image: ${RUSTFS_IMAGE}
           env:
-            - name: MINIO_ROOT_USER
-              value: "${MINIO_ACCESS_KEY}"
-            - name: MINIO_ROOT_PASSWORD
-              value: "${MINIO_SECRET_KEY}"
+            - name: RUSTFS_VOLUMES
+              value: "/data"
+            - name: RUSTFS_ADDRESS
+              value: "0.0.0.0:9000"
+            - name: RUSTFS_ACCESS_KEY
+              value: "${S3_ACCESS_KEY}"
+            - name: RUSTFS_SECRET_KEY
+              value: "${S3_SECRET_KEY}"
           ports:
             - containerPort: 9000
+          volumeMounts:
+            - {name: data, mountPath: /data}
           readinessProbe:
-            httpGet: {path: /minio/health/ready, port: 9000}
+            httpGet: {path: /health, port: 9000}
             periodSeconds: 2
             failureThreshold: 30
+      volumes:
+        - name: data
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: minio
+  name: rustfs
   namespace: ${NAMESPACE}
 spec:
-  selector: {app: minio}
+  selector: {app: rustfs}
   ports:
     - port: 9000
       targetPort: 9000
 EOF
-    kubectl -n "$NAMESPACE" rollout status deployment/minio --timeout=120s
+    kubectl -n "$NAMESPACE" rollout status deployment/rustfs --timeout=120s
 
-    phase "create the MinIO bucket"
-    # A throwaway in-cluster `minio/mc` pod is the simplest way to reach the
-    # ClusterIP Service without a port-forward of its own — real S3/MinIO
-    # never auto-creates a bucket on first PUT, so this has to happen before
-    # any backup capture can succeed.
-    kubectl run mc-mb --rm -i --restart=Never -n "$NAMESPACE" \
-        --image="$MINIO_MC_IMAGE" --command -- \
-        sh -c "mc alias set local http://minio.${NAMESPACE}.svc:9000 ${MINIO_ACCESS_KEY} ${MINIO_SECRET_KEY} && mc mb local/${S3_BUCKET}"
+    phase "create the bucket"
+    # A throwaway in-cluster pod is the simplest way to reach the ClusterIP
+    # Service without a port-forward of its own — no S3 implementation
+    # auto-creates a bucket on first PUT, so this has to happen before any
+    # backup capture can succeed.
+    #
+    # `addressing_style = path` is required, not cosmetic: the CLI defaults to
+    # virtual-host addressing, which would resolve the bucket as a hostname
+    # (`${S3_BUCKET}.rustfs.${NAMESPACE}.svc`) and fail DNS. A region must be
+    # set for `mb` to sign at all, and is otherwise meaningless here.
+    kubectl run s3-mb --rm -i --restart=Never -n "$NAMESPACE" \
+        --image="$AWSCLI_IMAGE" \
+        --env="AWS_ACCESS_KEY_ID=${S3_ACCESS_KEY}" \
+        --env="AWS_SECRET_ACCESS_KEY=${S3_SECRET_KEY}" \
+        --env="AWS_DEFAULT_REGION=us-east-1" \
+        --command -- \
+        sh -ec "aws configure set default.s3.addressing_style path && \
+                aws --endpoint-url http://rustfs.${NAMESPACE}.svc:9000 \
+                    s3 mb s3://${S3_BUCKET}"
 
     phase "create the S3 credentials Secret"
     # access_key_id/secret_access_key are the two keys crate::desired::
@@ -774,12 +805,12 @@ EOF
     # container-start time (crate::desired::cluster_config::
     # entrypoint_script) — never written into the ConfigMap/cluster.json.
     kubectl create secret generic "$S3_CREDS_SECRET_NAME" -n "$NAMESPACE" \
-        --from-literal=access_key_id="$MINIO_ACCESS_KEY" \
-        --from-literal=secret_access_key="$MINIO_SECRET_KEY" \
+        --from-literal=access_key_id="$S3_ACCESS_KEY" \
+        --from-literal=secret_access_key="$S3_SECRET_KEY" \
         --dry-run=client -o yaml | kubectl apply -f -
 
     S3_SPEC_YAML="  s3:
-    backupStore: \"s3://${S3_BUCKET}?endpoint=http://minio.${NAMESPACE}.svc:9000&insecure_http=true\"
+    backupStore: \"s3://${S3_BUCKET}?endpoint=http://rustfs.${NAMESPACE}.svc:9000&insecure_http=true\"
     credentialsSecretName: ${S3_CREDS_SECRET_NAME}
     allowInsecureHttp: true"
 fi
