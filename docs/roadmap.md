@@ -1269,9 +1269,13 @@ the still-true paragraph after the table.
   `seed_join_allocated.rs` tests 1/3/5, **landed** — the explicit-`--id`
   claim branch (`SimCluster::join_via_seed_with_explicit_id`), `tests/
   seed_join.rs` deleted whole, `seed_join_allocated.rs` trimmed to its two
-  residuals) → PR 5 (S, the concurrent-mint scenario) → PR 6 (M or
-  assess-and-close, `control_membership_split.rs`'s open question) → PR 7
-  (S, close-out).
+  residuals) → PR 5 (S, the concurrent-mint scenario, **landed** —
+  `SimCluster::join_via_seed_concurrently`/`join_via_seed_forcing_mint_
+  collision`, `seed_join_allocated.rs`'s test 2 deleted, two new sim
+  scenarios (one a strictly stronger deterministic collision proof test 2
+  itself never attempted), trimming that file to its one permanent
+  residual) → PR 6 (M or assess-and-close, `control_membership_split.rs`'s
+  open question) → PR 7 (S, close-out).
 - **ADR:** [0061](adr/0061-testability-node-crate-simulator.md), rung M
   (opened) — see its "Rung M (post-C-12)" opener amendment,
   [0030](adr/0030-online-cluster-growth.md)/[0032](adr/0032-decommission-and-join.md)
@@ -1287,14 +1291,21 @@ the still-true paragraph after the table.
   `seed_join_allocated.rs` tests 1/3/5 removed — the new explicit-`--id`
   claim branch, `SimCluster::join_via_seed_with_explicit_id`, plus two new
   sim scenarios/extensions covering all eight of `seed_join.rs`'s own
-  steps and the balance-driven-replica assertion tests 1/3/5 needed) all
-  landed. Inventory corrected to 5 files/13 tests; the two facts the plan
-  left unresolved (`NodeId::mint`'s `Rng` bound, the `JoinInfo` serve
-  arm's field reachability) both resolved in PR 1's favor (no widening
-  needed for either); `control_membership_split.rs`'s own conversion
-  approach left as an open question for the PR that attempts it.
-  Remaining: PR 5 (the concurrent-mint scenario), PR 6 (`control_
-  membership_split.rs`'s open question), PR 7 (close-out).
+  steps and the balance-driven-replica assertion tests 1/3/5 needed), and
+  PR 5 (`seed_join_allocated.rs`'s test 2 deleted — the concurrent-mint
+  dial, `SimCluster::join_via_seed_concurrently`, is a refactor of PR 2's
+  own single-dial groundwork: spawn every dial first, THEN one shared
+  drive, THEN the shared `finish_join` tail per claim in spawn order;
+  `join_via_seed_forcing_mint_collision` adds a deterministic proof of the
+  retry-on-collision loop test 2 could only ever hit by luck) all landed.
+  Inventory corrected to 5 files/13 tests; the two facts the plan left
+  unresolved (`NodeId::mint`'s `Rng` bound, the `JoinInfo` serve arm's
+  field reachability) both resolved in PR 1's favor (no widening needed
+  for either); `control_membership_split.rs`'s own conversion approach
+  left as an open question for the PR that attempts it. `seed_join_
+  allocated.rs` is now trimmed to its one permanent residual (test 4).
+  Remaining: PR 6 (`control_membership_split.rs`'s open question), PR 7
+  (close-out).
 
 ## 4. Operator surfaces: admin API, dashboard, console, CLI
 
@@ -1377,7 +1388,7 @@ wave are independent and can run in parallel.
 | 11 | C-10 (closed 2026-09-09 — all seven PRs landed: #789, #790, #791, #792, #793, #794, plus PR 7) | Gated on C-09 (closed) — the next unowned residual group per C-08's and C-09's own close-outs |
 | 12 | C-11 (closed 2026-09-09 — all four PRs landed: #796, #797, #799, plus PR 4) | Gated on C-10 (closed) — the next unowned residual group per C-08's, C-09's, and C-10's own close-outs; proceeded without an explicit maintainer sequencing instruction, per Rung J's own close-out recommendation (see the C-11 entry's own note) |
 | 13 | C-12 (closed 2026-09-09 — all nine PRs landed: #806, #808, #822, #823, #824, #825, #826, #827, plus PR 5) | Gated on C-11 (closed) — the next unowned residual group per C-08's, C-09's, C-10's, and C-11's own close-outs; taken up per Rung K's own close-out recommendation |
-| 14 | C-13 (opened 2026-09-10, PRs 1-4 landed — seed/join discovery under `SimCluster`, ADR 0061 rung M) | Gated on C-12 (closed) — the next unowned residual group per C-08's through C-12's own close-outs |
+| 14 | C-13 (opened 2026-09-10, PRs 1-5 landed — seed/join discovery under `SimCluster`, ADR 0061 rung M) | Gated on C-12 (closed) — the next unowned residual group per C-08's through C-12's own close-outs |
 
 Open issues mapped: none left (#375 closed by W-01, #319 by W-05). Filed
 from wave 2's own findings: #590 (the operator still emits the deleted

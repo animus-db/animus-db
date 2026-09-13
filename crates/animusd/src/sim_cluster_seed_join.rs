@@ -1,25 +1,27 @@
 //! `SimCluster`-driven deterministic coverage for the real seed/join dial
-//! (ADR 0061 rung M, C-13 PR 2/3/4) — `SimCluster::join_via_seed`/
-//! `join_via_seed_with_role`/`join_via_seed_with_explicit_id`, their
+//! (ADR 0061 rung M, C-13 PR 2/3/4/5) — `SimCluster::join_via_seed`/
+//! `join_via_seed_with_role`/`join_via_seed_concurrently`/`join_via_seed_
+//! forcing_mint_collision`/`join_via_seed_with_explicit_id`, their
 //! `_via_relay` siblings, and `forwarding::handle_relayed_request`'s
 //! `ClientRequest::JoinInfo` arm. See `sim_cluster.rs`'s own doc on
-//! `SimCluster::join_via_seed_with_role`/`join_via_seed_with_explicit_id`
+//! `SimCluster::join_via_seed_concurrently`/`join_via_seed_with_explicit_id`
 //! for the full mechanism (what each drives for real, the documented forks
 //! it resolves, what it deliberately does not prove) and `crates/animusd/
 //! CLAUDE.md`'s matching appendix for the cross-cutting account. PR 2's own
 //! scope was the smallest end-to-end slice — self-minted identity, combined
 //! mode, a single joiner — proving the dial primitive itself; PR 3 added
 //! the data-only role arm and the first real conversion, `tests/
-//! data_join.rs`'s own scenario (see (c) below); **PR 4 converts `tests/
+//! data_join.rs`'s own scenario (see (c) below); PR 4 converted `tests/
 //! seed_join.rs` (see (d) below) and `tests/seed_join_allocated.rs`'s own
-//! tests 1/3/5** (see this module's own doc note after (d) for the exact
+//! tests 1/3/5 (see this module's own doc note after (d) for the exact
 //! mapping — tests 3/5 turn out to already be a strict subset of (c)/(a)
-//! respectively, so PR 4 adds no new scenario for either; test 1 is what
-//! (a)'s own extension below (the trailing balance-driven-replica/peers
-//! assertions) exists to cover). `seed_join_allocated.rs` test 2
-//! (concurrent minting) and test 4 (ephemeral-identity restart) stay a
-//! later PR's / permanently out of scope respectively — see that file's
-//! own updated doc.
+//! respectively, so PR 4 added no new scenario for either; test 1 is what
+//! (a)'s own extension below, the trailing balance-driven-replica/peers
+//! assertions, covers); **PR 5 converts `seed_join_allocated.rs`'s own test
+//! 2 (concurrent minting, see (e) below) and adds a deterministic mint-
+//! collision proof (f) the real-socket test could only ever hit by luck**.
+//! Test 4 (ephemeral-identity restart) stays permanently out of scope — see
+//! that file's own updated doc.
 //!
 //! **What each scenario proves, and how**:
 //!
@@ -123,6 +125,46 @@
 //!     stay durable across it) is followed by re-registering the identical
 //!     `(id, addrs)` once more, asserting the ADR 0032 rejoin CAS still
 //!     accepts it as a no-op even post-restart.
+//! (e) `two_concurrent_self_minted_joiners_get_distinct_ids_and_both_go_
+//!     active` (C-13 PR 5) — the sim sibling for `tests/seed_join_
+//!     allocated.rs`'s own `two_concurrent_allocated_joins_get_distinct_
+//!     ids`: [`SimCluster::join_via_seed_concurrently`] with `count = 2`
+//!     against the SAME seed, in ONE shared drive (see that method's own
+//!     doc for why splitting spawn from drive is what makes this a genuine
+//!     race, not two sequential dials). Asserts: exactly two new member
+//!     ids appear (the before/after `Metadata::members` diff), both
+//!     self-minted (22-char base64url, neither index-derived) and mutually
+//!     DISTINCT — the direct proof `register_node_over_wire_via_relay`'s
+//!     CAS discriminates two concurrent claims against the same control
+//!     leader, closing the identical residual race ADR 0032 documents for
+//!     the real allocated-join path; and both promoted to `Active` on
+//!     every node's own view through the REAL detector (the same non-
+//!     instantaneous timing proxy as (a)/(c)/(d) — `join_via_seed_
+//!     concurrently` proposes no `UpsertMember` for either joiner).
+//!     **Deliberately no tables and no forwarding proof** — matching the
+//!     real-socket test's own scope exactly (it asserts only distinct/
+//!     minted ids and promotion too); creating balance pressure here the
+//!     way (a)'s own extension does for a SINGLE joiner would let the
+//!     reconciler start moving tablets across BOTH new nodes' own
+//!     promotion windows (a real, if incidental, discovery of this rung —
+//!     see `docs/engineering-lessons.md`), racing a mechanism this
+//!     scenario's own real subject has nothing to do with.
+//! (f) `forced_mint_collision_retries_and_the_colliding_member_is_untouched`
+//!     (C-13 PR 5) — a proof the real-socket test could only ever hit by
+//!     astronomically unlucky chance: [`SimCluster::join_via_seed_forcing_
+//!     mint_collision`] deliberately forces attempt 0 of the self-mint
+//!     retry loop to collide with an EXISTING member's own id (`nid(0)`,
+//!     joined under a DIFFERENT wire role so the forced candidate's addrs
+//!     genuinely differ — see that method's own doc on why role must
+//!     differ for this to be a real collision, not an idempotent no-op).
+//!     Asserts: the join still succeeds (the loop actually retries into a
+//!     real mint on attempt 1 and claims that instead); the node the join
+//!     lands on carries a DIFFERENT id than `colliding_with` (never the
+//!     forced, rejected candidate); the colliding member's own row
+//!     (`Metadata::members[nid(0)]`) is completely untouched — same status,
+//!     same addrs, as before the collision attempt; and the joiner is
+//!     promoted to `Active` through the real detector like every other
+//!     scenario here.
 //!
 //! **What (d) does NOT need to build, and why**: `tests/seed_join_
 //! allocated.rs`'s own test 5 (`follower_connected_seed_completes_the_
@@ -909,5 +951,241 @@ fn explicit_id_joiner_gets_a_balanced_replica_and_survives_a_restart_rejoin() {
 fn explicit_id_joiner_gets_a_balanced_replica_and_survives_a_restart_rejoin_over_seeds() {
     for &seed in &OVER_SEEDS_D {
         run_explicit_id_joiner_gets_a_balanced_replica_and_survives_a_restart_rejoin(seed);
+    }
+}
+
+const PRIMARY_SEED_E: u64 = 0xC13E_0005;
+const OVER_SEEDS_E: [u64; 5] = [
+    0xC13E_5001,
+    0xC13E_5002,
+    0xC13E_5003,
+    0xC13E_5004,
+    0xC13E_5005,
+];
+
+/// (e) `two_concurrent_self_minted_joiners_get_distinct_ids_and_both_go_
+/// active` — see this module's own doc for the full mapping onto `tests/
+/// seed_join_allocated.rs`'s own `two_concurrent_allocated_joins_get_
+/// distinct_ids`.
+fn run_two_concurrent_self_minted_joiners_get_distinct_ids_and_both_go_active(seed: u64) {
+    // Deliberately no tables at all — mirroring `tests/seed_join_
+    // allocated.rs`'s own `two_concurrent_allocated_joins_get_distinct_
+    // ids`, which asserts only distinct/minted ids and real-detector
+    // promotion, never a forwarding round trip (unlike scenarios (a)/(c)/
+    // (d) above). This is deliberate, not an omission: creating balance
+    // pressure here (as (a)'s own extension does for a SINGLE joiner)
+    // would let the placement reconciler start moving tablets across BOTH
+    // new nodes' own promotion windows (strictly more elapsed virtual time
+    // than any single-joiner scenario gives it), and a subsequent
+    // forwarding proof would then be racing an active reconfigure this
+    // scenario's own real subject (the concurrent-mint race) has nothing
+    // to do with — see `docs/engineering-lessons.md`'s matching entry.
+    let mut cluster = SimCluster::new(seed, 3, 3);
+
+    let seed_node = cluster.control_follower_index();
+    let before = member_ids(&cluster);
+    let before_time = cluster.sim_now();
+    // The genuine race: both dials are spawned before either resolves, then
+    // driven by ONE shared `run_for` — see `join_via_seed_concurrently`'s
+    // own doc for why this is what makes them actually race through
+    // `register_node_over_wire_via_relay`'s CAS against the same leader,
+    // never two sequential single-dial calls in a row.
+    let joined = cluster.join_via_seed_concurrently(seed_node as usize, NodeRole::Both, 2);
+    let after_time = cluster.sim_now();
+    let after = member_ids(&cluster);
+
+    assert_eq!(
+        joined.len(),
+        2,
+        "seed={seed}: join_via_seed_concurrently(count=2) must return exactly two indices"
+    );
+    assert_eq!(
+        joined,
+        vec![3, 4],
+        "seed={seed}: the two concurrent joiners should get the next two sequential indices, \
+         in spawn order (joined={joined:?})"
+    );
+
+    // Exactly two new member ids, both self-minted (never index-derived)
+    // and mutually DISTINCT — the direct proof the registration CAS
+    // discriminates two concurrent claims against the same control leader,
+    // closing the identical residual race ADR 0032 documents for the real
+    // allocated-join path (this scenario's own real-socket counterpart,
+    // `two_concurrent_allocated_joins_get_distinct_ids`, could only ever
+    // prove this by running the race for real — this proves it
+    // deterministically, from a pinned seed).
+    let new_ids: Vec<NodeId> = after.difference(&before).cloned().collect();
+    assert_eq!(
+        new_ids.len(),
+        2,
+        "seed={seed}: expected exactly two new member ids (before={before:?}, after={after:?})"
+    );
+    assert_ne!(
+        new_ids[0], new_ids[1],
+        "seed={seed}: two concurrent join attempts must never be allocated the same id \
+         (new_ids={new_ids:?})"
+    );
+    for id in &new_ids {
+        assert_eq!(
+            id.as_str().len(),
+            22,
+            "seed={seed}: a minted NodeId is a 22-char base64url string (id={id})"
+        );
+        assert!(
+            joined.iter().all(|&idx| *id != nid(idx)),
+            "seed={seed}: joined id must be self-minted, not index-derived (id={id}, \
+             joined={joined:?})"
+        );
+    }
+
+    // Promoted through the REAL control-leader detector for BOTH joiners —
+    // the identical non-instantaneous timing proxy as every other scenario
+    // in this module (`join_via_seed_concurrently` proposes no
+    // `UpsertMember` for either one).
+    let elapsed = after_time.duration_since(before_time);
+    assert!(
+        elapsed >= Duration::from_millis(80),
+        "seed={seed}: promotion resolved in {elapsed:?} of virtual time — too fast to be \
+         genuine heartbeat/detect_loop-driven promotion (looks like a bypass propose)"
+    );
+    for id in &new_ids {
+        for n in 0..cluster.node_count() as u64 {
+            let status = cluster.metadata(n).members.get(id).map(|m| m.status);
+            assert_eq!(
+                status,
+                Some(NodeStatus::Active),
+                "seed={seed}: node {n}'s own view of joiner {id} must show Active"
+            );
+        }
+    }
+}
+
+#[test]
+fn two_concurrent_self_minted_joiners_get_distinct_ids_and_both_go_active() {
+    run_two_concurrent_self_minted_joiners_get_distinct_ids_and_both_go_active(env_seed(
+        PRIMARY_SEED_E,
+    ));
+}
+
+#[test]
+fn two_concurrent_self_minted_joiners_get_distinct_ids_and_both_go_active_over_seeds() {
+    for &seed in &OVER_SEEDS_E {
+        run_two_concurrent_self_minted_joiners_get_distinct_ids_and_both_go_active(seed);
+    }
+}
+
+const PRIMARY_SEED_F: u64 = 0xC13E_0006;
+const OVER_SEEDS_F: [u64; 5] = [
+    0xC13E_6001,
+    0xC13E_6002,
+    0xC13E_6003,
+    0xC13E_6004,
+    0xC13E_6005,
+];
+
+/// (f) `forced_mint_collision_retries_and_the_colliding_member_is_
+/// untouched` — a deterministic proof of the self-mint retry-on-collision
+/// loop the real-socket `two_concurrent_allocated_joins_get_distinct_ids`
+/// could only ever exercise by astronomically unlucky chance. See this
+/// module's own doc for the full account and
+/// `SimCluster::join_via_seed_forcing_mint_collision`'s own doc for why the
+/// joiner uses [`NodeRole::Data`] specifically (a different wire role than
+/// the colliding node's own `"combined"` registration, so the forced
+/// candidate's addrs genuinely differ — a same-role forced candidate would
+/// build byte-identical addrs, which the CAS accepts as an idempotent
+/// no-op re-registration rather than a genuine collision).
+fn run_forced_mint_collision_retries_and_the_colliding_member_is_untouched(seed: u64) {
+    let mut cluster = SimCluster::new(seed, 3, 3);
+    let colliding_with = nid(0);
+    let before = member_ids(&cluster);
+    let before_addrs = cluster
+        .metadata(0)
+        .node_addrs
+        .get(&colliding_with)
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!("seed={seed}: node 0 ({colliding_with}) must already be registered")
+        });
+    let before_status = cluster
+        .metadata(0)
+        .members
+        .get(&colliding_with)
+        .map(|m| m.status);
+
+    let seed_node = cluster.control_follower_index();
+    let joined = cluster.join_via_seed_forcing_mint_collision(
+        seed_node as usize,
+        NodeRole::Data,
+        colliding_with.clone(),
+    );
+    let after = member_ids(&cluster);
+
+    assert_eq!(
+        joined, 3,
+        "seed={seed}: the joiner should still get the next sequential index despite the \
+         forced collision on attempt 0"
+    );
+
+    let joined_id = only_new_member(&before, &after);
+    assert_ne!(
+        joined_id, colliding_with,
+        "seed={seed}: the joiner must land on a DIFFERENT id than the forced, rejected \
+         candidate — the retry loop must have minted a fresh one on a later attempt \
+         (joined_id={joined_id})"
+    );
+    assert_eq!(
+        joined_id.as_str().len(),
+        22,
+        "seed={seed}: the retried mint is still a real 22-char base64url self-mint \
+         (joined_id={joined_id})"
+    );
+
+    // The colliding member's own row is completely untouched by the
+    // rejected attempt — same addrs, same status as before.
+    let after_addrs = cluster.metadata(0).node_addrs.get(&colliding_with).cloned();
+    assert_eq!(
+        after_addrs,
+        Some(before_addrs),
+        "seed={seed}: the colliding member's own NodeAddrs must be untouched by a rejected \
+         collision attempt"
+    );
+    let after_status = cluster
+        .metadata(0)
+        .members
+        .get(&colliding_with)
+        .map(|m| m.status);
+    assert_eq!(
+        after_status, before_status,
+        "seed={seed}: the colliding member's own status must be untouched by a rejected \
+         collision attempt"
+    );
+
+    // The joiner itself is promoted through the real detector, like every
+    // other scenario in this module.
+    for n in 0..cluster.node_count() as u64 {
+        let status = cluster
+            .metadata(n)
+            .members
+            .get(&joined_id)
+            .map(|m| m.status);
+        assert_eq!(
+            status,
+            Some(NodeStatus::Active),
+            "seed={seed}: node {n}'s own view of the joiner must show Active"
+        );
+    }
+}
+
+#[test]
+fn forced_mint_collision_retries_and_the_colliding_member_is_untouched() {
+    run_forced_mint_collision_retries_and_the_colliding_member_is_untouched(env_seed(
+        PRIMARY_SEED_F,
+    ));
+}
+
+#[test]
+fn forced_mint_collision_retries_and_the_colliding_member_is_untouched_over_seeds() {
+    for &seed in &OVER_SEEDS_F {
+        run_forced_mint_collision_retries_and_the_colliding_member_is_untouched(seed);
     }
 }

@@ -6388,6 +6388,99 @@ tier), and `cargo test -p animusd --test seed_join_allocated` (the
 trimmed file, tests 2/4) all green — see ADR 0061's matching "PR 4
 landed" amendment for exact figures.
 
+**C-13 PR 5 (`seed_join_allocated.rs` test 2) landed.** The groundwork:
+`join_via_seed_with_role`'s own single-dial Phase 1 (spawn one discover+
+claim task, then `run_for`) was split into a reusable free function,
+**`spawn_self_mint_dial`** — spawns exactly ONE self-mint discover+claim
+task onto its own throwaway mint env, writing its resolved
+`JoinDialOutcome` into a caller-supplied slot, and (this is the whole
+point) never drives the simulator itself. A new method,
+**`SimCluster::join_via_seed_concurrently(seed_node, role, count)`**, calls
+`spawn_self_mint_dial` once per dial (each at a DISTINCT throwaway mint
+node id, `base_n + i`, so each draws from a genuinely independent `SimEnv`
+`Rng` stream — the sim-native analogue of `count` real join processes each
+drawing from their own independent entropy source), THEN runs ONE shared
+`Simulator::run_for` for every spawned dial, THEN feeds each resolved claim
+through the shared `finish_join` tail **sequentially, in spawn order**
+(safe: `finish_join` only ever appends to `self.shared`/`self.engines`/
+`self.roles` and patches route tables, so a later call's own patch
+correctly reaches every earlier call's own new node too).
+`join_via_seed_with_role(seed_node, role)` is now exactly
+`join_via_seed_concurrently(seed_node, role, 1)` — a pure "split spawn from
+drive" refactor, byte-identical behavior for every PR 2/3/4 caller
+(re-verified: PR 2/3/4's own scenarios in `sim_cluster_seed_join.rs` pass
+unmodified). A second new method, **`SimCluster::join_via_seed_forcing_
+mint_collision(seed_node, role, colliding_with)`**, reuses the identical
+`spawn_self_mint_dial` primitive but with its own `forced_first_candidate`
+parameter set — see below.
+
+**The deterministic collision proof (the task's own item 3(ii)) turned out
+to have a clean seam, no production code touched.** `claim_join_identity_
+via_relay` (already `#[cfg(test)]`-only sim code, never production) gained
+one new parameter, `forced_first_candidate: Option<NodeId>`: when `Some`,
+attempt 0 of the retry loop uses the CALLER-SUPPLIED candidate instead of a
+fresh `NodeId::mint` draw, forcing a genuine, reproducible collision;
+`None` (every PR 2/3/4 caller, via `spawn_self_mint_dial`) is byte-
+identical to before this parameter existed. `join_via_seed_forcing_mint_
+collision` uses `Some(colliding_with)` for a single dial, proving the
+`MAX_JOIN_MINT_ATTEMPTS` retry-on-collision loop actually retries and
+succeeds, and that the colliding member's own row is left untouched.
+**One real gotcha found while wiring this**: the forced candidate's own
+built `NodeAddrs` must genuinely DIFFER from the colliding node's already-
+registered ones, or the CAS accepts it as an idempotent no-op re-
+registration (ADR 0032) rather than a genuine collision — since every
+self-mint claim's addrs are always `{internal,client,intra,admin} =
+candidate.to_string()`, `role = wire_role`, forcing a candidate that
+matches an EXISTING `"combined"` registration under `NodeRole::Both` too
+would build byte-identical addrs. Every collision scenario therefore picks
+a colliding member registered under a DIFFERENT wire role than the forcing
+join uses (an existing `"combined"` member, joined via `NodeRole::Data`).
+
+**Two new `sim_cluster_seed_join.rs` scenarios, both pinned-seed + 5-seed
+`_over_seeds`**: (e) `two_concurrent_self_minted_joiners_get_distinct_ids_
+and_both_go_active` — `join_via_seed_concurrently(seed, NodeRole::Both, 2)`
+in ONE shared drive, asserting exactly two new, self-minted, mutually
+distinct member ids and real-detector promotion for both — the direct
+sim sibling of `seed_join_allocated.rs`'s own test 2, matching its scope
+EXACTLY (no tables, no forwarding proof — see the finding below for why);
+(f) `forced_mint_collision_retries_and_the_colliding_member_is_untouched`
+— a NEW proof test 2 itself never attempted, deterministically forcing the
+retry-on-collision branch test 2 could only ever hit by astronomical luck.
+
+**A real finding, not assumed**: an early version of scenario (e) created
+three tables (mirroring scenario (a)'s own balance-pressure convention)
+and closed with a put/get forwarding proof through each joined node. It
+flaked at one of the five `_over_seeds` values with `"no CP group leader
+reachable"` — root-caused (never widened a budget or added `#[ignore]`)
+to a genuine, reproducible mechanism: with TWO joiners promoted back to
+back rather than one, the placement reconciler has strictly more elapsed
+virtual time (two sequential `finish_join` promotion-waits, not one)
+before the forwarding proof even runs, and — confirmed by direct
+instrumentation, reverted afterward — the reconciler used that window to
+move MULTIPLE tablets' replicas across BOTH new nodes at once, so the
+specific tablet a joiner's put/get targeted was sometimes still
+mid-reconfigure (a real, if transient, "no CP group leader reachable"
+window — confirmed self-resolving given enough additional virtual time).
+The fix was **not** a retry wrapper bolted onto the test — re-reading
+`tests/seed_join_allocated.rs`'s own test 2 showed it asserts NO forwarding
+proof at all, only distinct/minted ids and promotion; scenario (e) had
+added that proof by habit, copying scenario (a)'s own convention rather
+than matching test 2's actual scope. Dropping the tables (and the
+forwarding proof) from scenario (e) entirely — matching the real test's
+own scope exactly — removed the race at its root; scenarios (a)/(c)/(d)
+already cover the forwarding proof for a single joiner, where the window
+is too short for the reconciler to get there first (each states this
+explicitly in its own doc). See `docs/engineering-lessons.md`'s matching
+entry for the generalizable lesson.
+
+Gates: `cargo fmt --all --check`; `cargo clippy --workspace --all-targets
+--all-features -- -D warnings`; `cargo test -p animusd --lib
+sim_cluster_seed_join` (twice, identical, 12/12 passed each run — up from
+8/8, the two new scenarios' four tests); `cargo test -p animusd --lib
+sim_cluster -- --test-threads=2` (full tier, green); `cargo test -p
+animusd --test seed_join_allocated` (trimmed to test 4 alone, 1/1 passed)
+— see ADR 0061's matching "PR 5 landed" amendment for exact figures.
+
 ### `sim_cluster_corpus`: the SimCluster cycles/durability corpus (ADR 0061 rung D1 step 3)
 
 `crates/animusd/src/sim_cluster_corpus.rs` (`#[cfg(test)] mod

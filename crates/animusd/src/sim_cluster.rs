@@ -722,14 +722,36 @@ async fn register_node_over_wire_via_relay<E: Env, R: RelayClient>(
 /// pre-bind entropy source with no `SimEnv` analogue), retrying up to
 /// `MAX_JOIN_MINT_ATTEMPTS` times on a mint collision, exactly like
 /// `claim_join_identity`'s own self-mint branch.
+///
+/// **C-13 / ADR 0061 rung M PR 5's own `forced_first_candidate` knob** —
+/// used ONLY by this rung's own deterministic mint-collision proof
+/// ([`SimCluster::join_via_seed_forcing_mint_collision`], see that method's
+/// own doc). When `Some`, attempt 0 of the retry loop uses the
+/// CALLER-SUPPLIED candidate instead of a fresh `NodeId::mint` draw —
+/// forcing a genuine, reproducible collision against an id the caller
+/// already knows is claimed by a DIFFERENT registration — while every
+/// subsequent attempt (`1..MAX_JOIN_MINT_ATTEMPTS`) mints for real,
+/// identically to the plain self-mint loop. Every OTHER caller passes
+/// `None` (a real mint on every attempt, exactly as before this knob
+/// existed — [`spawn_self_mint_dial`]'s own `forced_first_candidate: None`
+/// call for [`SimCluster::join_via_seed_concurrently`]'s ordinary joiners),
+/// so a real-socket join can only ever hit this loop's retry branch by
+/// astronomically unlikely luck
+/// (`two_concurrent_allocated_joins_get_distinct_ids`'s own real-socket
+/// counterpart proves the loop exists but never controls whether it is
+/// actually exercised) — exactly the gap this knob closes deterministically.
 async fn claim_join_identity_via_relay<E: Env, R: RelayClient>(
     env: &E,
     relay: &R,
     seeds: &[String],
     role: &str,
+    forced_first_candidate: Option<NodeId>,
 ) -> Result<(NodeId, NodeAddrs), String> {
-    for _ in 0..MAX_JOIN_MINT_ATTEMPTS {
-        let candidate = NodeId::mint(env);
+    for attempt in 0..MAX_JOIN_MINT_ATTEMPTS {
+        let candidate = match (attempt, &forced_first_candidate) {
+            (0, Some(forced)) => forced.clone(),
+            _ => NodeId::mint(env),
+        };
         let addr = candidate.to_string();
         let addrs = NodeAddrs {
             internal: addr.clone(),
@@ -756,6 +778,58 @@ async fn claim_join_identity_via_relay<E: Env, R: RelayClient>(
         "exhausted {MAX_JOIN_MINT_ATTEMPTS} self-minted id collisions in a row \
          (practically impossible) — this points at a real bug, not bad luck"
     ))
+}
+
+/// **C-13 / ADR 0061 rung M PR 5**: spawns exactly ONE self-mint discover+
+/// claim dial task onto `mint_env`'s own executor, writing its resolved
+/// [`JoinDialOutcome`] into `outcome` once the task completes — the common
+/// Phase 1 body [`SimCluster::join_via_seed_concurrently`] spawns once per
+/// concurrent dial (`forced_first_candidate: None` every time) and
+/// [`SimCluster::join_via_seed_forcing_mint_collision`] spawns once with
+/// `Some` (forcing attempt 0's collision). **Never drives the simulator
+/// itself** — every caller spawns every dial it needs FIRST, then runs ONE
+/// shared [`Simulator::run_for`] afterward; this is the entire point of
+/// factoring the spawn out of the single-dial method that used to inline it
+/// (PR 2/3/4's own `join_via_seed_with_role`): N dials racing through
+/// discovery+claim before a single shared drive, instead of N sequential
+/// single-dial drives, is what makes them genuinely concurrent rather than
+/// merely N calls in a row.
+fn spawn_self_mint_dial(
+    seeds: &[String],
+    wire_role: &'static str,
+    mint_env: SimEnv,
+    mint_relay: SimRelayClient<SimEnv>,
+    forced_first_candidate: Option<NodeId>,
+    outcome: Arc<Mutex<Option<JoinDialOutcome>>>,
+) {
+    let dial_env = mint_env.clone();
+    let dial_relay = mint_relay.clone();
+    let dial_seeds = seeds.to_vec();
+    mint_env.spawn_task(async move {
+        let result = async {
+            let (control_ids, _peers, client_route, intra_route, _admin_addrs) =
+                discover_join_info_via_relay(&dial_env, &dial_relay, &dial_seeds).await?;
+            let (id, addrs) = claim_join_identity_via_relay(
+                &dial_env,
+                &dial_relay,
+                &dial_seeds,
+                wire_role,
+                forced_first_candidate,
+            )
+            .await?;
+            Ok((
+                id,
+                addrs,
+                DiscoveredJoinInfo {
+                    control_ids,
+                    client_route,
+                    intra_route,
+                },
+            ))
+        }
+        .await;
+        *outcome.lock().expect("join dial result slot poisoned") = Some(result);
+    });
 }
 
 /// This fixture's fixed key encoding: every table's items are addressed by
@@ -4896,203 +4970,272 @@ impl SimCluster {
         self.join_via_seed_with_role(seed_node, NodeRole::Both)
     }
 
-    /// **C-13 / ADR 0061 rung M PR 2 (combined-only) + PR 3 (this `role`
-    /// parameter, data-only arm): the real seed/join dial** — unlike
-    /// [`grow`](Self::grow), which bypasses discovery/claim entirely
-    /// (proposing `RegisterNode`+`UpsertMember{Active}` directly on the
-    /// current control leader's own in-process handle), this method drives
-    /// the REAL `ClientRequest::JoinInfo` discovery → self-mint → relayed
-    /// `RegisterNode` claim round trip against `seed_node` (any existing
-    /// node's own `u64` index — leader or follower, both work, since a
-    /// follower relays the claim through `ClientCtx::propose_schema`'s own
-    /// relay-to-leader fallback exactly like production), then lets the
-    /// REAL control leader's own `detect_loop`/`liveness_transitions`
-    /// (`animus-control`) promote the joiner to `Active` on its own first
-    /// observed heartbeat — **no `UpsertMember` propose of any kind here**.
-    ///
-    /// `role` selects the joiner's own wire-visible role — `NodeRole::Both`
-    /// (`"combined"`, [`join_via_seed`](Self::join_via_seed)'s own only
-    /// shape) or `NodeRole::Data` (`"data"`, this PR's new arm, mirroring
-    /// [`grow`](Self::grow)`("data")`'s own data-only `ClientCtx` tail: a
-    /// `ControlHandle::Remote`, a reconciler, `heartbeat_loop`, a TTL
-    /// reaper, and `spawn_remote_mirror_sync_loop`, no control `RaftNode`,
-    /// no control-plane-leader-only janitors — but through the same real
-    /// discover → self-mint → relay-claim dial phase as the combined arm,
-    /// over the SAME `SimRelayClient`/`ClientRequest::JoinInfo` transport,
-    /// and **no `UpsertMember` propose of any kind either** — promotion is
-    /// left entirely to the real control leader's own `detect_loop`, exactly
-    /// like the combined arm). `NodeRole::Control` panics — this fixture's
-    /// control-only nodes are only ever built at construction time via
-    /// [`SimCluster::new_with_roles`]; a control-only join primitive is
-    /// `control_membership_split.rs`'s own open C-13 question, deliberately
-    /// not resolved by this method.
-    ///
-    /// **Why the data-only arm needed no fork in the assembly itself, only
-    /// the wire-visible role string**: the combined arm below already builds
-    /// a `ControlHandle::Remote`-controlled node with a reconciler,
-    /// `heartbeat_loop`, TTL reaper, and `spawn_remote_mirror_sync_loop` — no
-    /// control-plane-leader-only `backup_janitor_loop`/`segment_janitor_
-    /// loop`/`index_backfill_loop` spawn at all (a `Remote`-controlled node
-    /// can structurally never become control-plane leader, per this
-    /// method's own "`ctx.control` is `Remote`" note below) — the IDENTICAL
-    /// shape `grow`'s own data-only branch builds. Under this fixture's own
-    /// `Remote`-everywhere simplification (see that note), a real combined
-    /// join and a real data-only join diverge in exactly one place: the
-    /// wire-visible role string (`claim_join_identity_via_relay`'s `role`
-    /// argument, `AdminInfo.role`/`NodeAddrs.role`) — so `role` threads
-    /// through those two call sites only, nothing else.
-    ///
-    /// **Smallest end-to-end slice (PR 2's own scope, not a permanent
-    /// limit)**: self-minted identity only (no explicit-`--id` claim path —
-    /// see [`claim_join_identity_via_relay`]'s own doc).
-    ///
-    /// # Two documented forks PR 2 resolved (see the ADR's own amendment
-    /// for the full account) — both apply identically to the data-only arm
-    ///
-    /// **Route tables**: kept as [`grow`](Self::grow)'s own "patch every
-    /// EXISTING node's `client_route`/`intra_route` directly" shape for
-    /// every node already in this cluster (unchanged from `grow` — this
-    /// fixture already holds every `ClientCtx` in one process, so a
-    /// one-shot patch is simpler and sufficient). The NEW node's OWN route
-    /// tables, however, are the one place this method is MORE faithful
-    /// than `grow`: they come straight from the `JoinInfo` reply's
-    /// `client_route`/`intra_route` (merged with this node's own entry),
-    /// the real ADR 0032 discovery contract — not read back from an
-    /// already-patched existing node's map. A fully-faithful shape (where
-    /// EXISTING nodes also learn the joiner only via a `finish_combined_
-    /// join`-style merge, never a direct patch) is flagged as future work,
-    /// not built here.
-    ///
-    /// **`ctx.control` is `Remote`, not production's real combined-mode
-    /// `Local`-plus-mirror shape**: a genuine `finish_combined_join`
-    /// builds an isolated, permanently non-participating local `RaftNode`
-    /// (membership = the pre-growth voters, the joiner itself deliberately
-    /// excluded — see `ClientCtx::effective_metadata`'s own "growth-node
-    /// mirror" doc in `lib.rs`) plus a `RemoteControlClient::with_mirror`
-    /// sharing `ctx.remote_metadata`. That shape is real, but orthogonal to
-    /// this rung's own goal (discovery/claim/registration/detector-driven
-    /// promotion) — a plain `ControlHandle::Remote` (`grow`'s own
-    /// construction, reused verbatim here) behaves identically for every
-    /// assertion this rung's own tests make (`effective_metadata()`'s
-    /// freshness contract, `Metadata::members` convergence, a put/get round
-    /// trip through the joined node's own `ClientCtx`), so this method
-    /// reuses it rather than building the isolated-local-raft-plus-mirror
-    /// machinery a literal port would need — only `AdminInfo.role`/
-    /// `NodeAddrs.role` say `"combined"` (the real wire-visible contract a
-    /// converted `seed_join.rs` would assert against), matching what a real
-    /// `animusd join` combined joiner reports. A future rung needing the
-    /// literal `Local` shape (e.g. `control_membership_split.rs`'s own open
-    /// question, or a test proving `RemoteControlClient::with_mirror`'s
-    /// wiring itself) should build it fresh rather than retrofitting this
-    /// method.
-    ///
-    /// **This method's own fixture-internal bookkeeping** (`self.roles`)
-    /// tags the joiner [`NodeRole::Data`] **regardless of `role`** — even a
-    /// combined (`NodeRole::Both`) joiner's own wire-visible `"combined"`
-    /// role string says otherwise: `self.roles` gates `restart`/`role_of`'s
-    /// own positional "control-bearing nodes occupy `0..self.controls.len()`"
-    /// invariant, which this method does not extend for either arm (see the
-    /// `ctx.control` note above — no `self.controls` growth happens here),
-    /// so tagging a combined joiner `NodeRole::Both` would silently violate
-    /// that invariant for no real fidelity benefit (nothing about
-    /// `NodeRole::Both`'s own `has_control()` gate would be true for this
-    /// node's actual `Remote` shape anyway). `NodeRole::Data` is every
-    /// joiner's true SimCluster-fixture capability regardless of its
-    /// wire-visible role — restart/crash on THIS specific node are out of
-    /// scope regardless (see below).
-    ///
-    /// # What this does NOT prove (permanent gaps, unrelated to this rung)
-    /// `Node::bind`/`ProdEnv` listener binds (never reachable here, like
-    /// every other `SimCluster` method); `heartbeat_loop_live` (this
-    /// fixture uses the plain `animus_control::node::heartbeat_loop`
-    /// everywhere, per `grow`'s own note); a fresh-process/fresh-directory
-    /// restart minting a genuinely new identity in place of a vanished one
-    /// (`SimCluster::restart` derives `id = nid(node)` from the node's own
-    /// INDEX — a real structural mismatch for a self-minted node's own
-    /// identity, so `restart`/`crash` on the node THIS method returns are
-    /// out of scope; every OTHER existing node's `restart`/`crash`/
-    /// `role_of` stay completely unaffected, since this method only ever
-    /// appends one aligned entry to each of `self.shared`/`self.engines`/
-    /// `self.roles`, mirroring `grow`'s own append-only discipline).
-    ///
-    /// Converged-or-timeout polled (virtual time, seed-named panic, the
-    /// fixture's own standing idiom) on every node's own view of
-    /// `Metadata::members` showing the new node `Active` — through the
-    /// REAL detector, never a bypass. Returns the new node's own `u64`
-    /// index.
+    /// **C-13 / ADR 0061 rung M PR 2 (combined-only) + PR 3 (`role`,
+    /// data-only arm) + PR 5 (now a thin `count = 1` wrapper): the real
+    /// seed/join dial, single caller.** Delegates to
+    /// [`join_via_seed_concurrently`](Self::join_via_seed_concurrently)`(seed_node,
+    /// role, 1)`, taking its `[0]` — a pure "split phase 1 into spawn-then-
+    /// drive" refactor, byte-identical behavior for every caller that
+    /// predates PR 5 (verified: this method's own single-dial shape and its
+    /// panic/timeout wording are the only visible difference, and no
+    /// scenario asserts on panic text). See that method's own doc for the
+    /// full mechanism this single-caller shape shares — what `role` selects,
+    /// the two documented forks PR 2 resolved, `ctx.control`'s `Remote`
+    /// choice, the fixture-internal `self.roles` tagging, and what this
+    /// never proves.
     pub(crate) fn join_via_seed_with_role(&mut self, seed_node: usize, role: NodeRole) -> u64 {
+        self.join_via_seed_concurrently(seed_node, role, 1)
+            .into_iter()
+            .next()
+            .expect("join_via_seed_concurrently(count=1) always returns exactly one index")
+    }
+
+    /// **C-13 / ADR 0061 rung M PR 5**: [`join_via_seed_with_role`]'s own
+    /// concurrent generalization — `count` independent joiners dial the
+    /// SAME `seed_node` at once, racing through discovery+self-mint+claim
+    /// before this method drives the simulator, rather than one dial fully
+    /// resolving before the next one is even spawned. `join_via_seed_with_
+    /// role(seed_node, role)` is now exactly `join_via_seed_concurrently
+    /// (seed_node, role, 1)` — see that method's own doc for everything this
+    /// one inherits unchanged: what `role` selects (`NodeRole::Both`/`Data`,
+    /// `NodeRole::Control` unsupported), the discovery→self-mint→relayed-
+    /// `RegisterNode`-claim dial itself (unlike [`grow`](Self::grow), which
+    /// bypasses discovery/claim and proposes `RegisterNode`+`UpsertMember{
+    /// Active}` directly on the leader's own in-process handle), the two
+    /// documented route-table/`ctx.control` forks PR 2 resolved, the
+    /// fixture-internal `self.roles` tagging, and the permanent gaps
+    /// (`Node::bind`, `heartbeat_loop_live`, a fresh-identity restart).
+    ///
+    /// **Why splitting Phase 1 (spawn) from Phase 2 (drive) is what makes
+    /// concurrency possible at all**: the single-dial method this replaces
+    /// used to spawn ONE dial task, then immediately `run_for` — so a
+    /// second caller's dial could only ever start after the first had
+    /// already resolved (or timed out), never racing it. This method
+    /// spawns every one of `count` dials FIRST (via [`spawn_self_mint_
+    /// dial`], the shared body factored out of that single-dial method),
+    /// THEN runs ONE shared [`Simulator::run_for`] — so all `count` retry
+    /// loops actually interleave inside the SAME virtual-time window,
+    /// genuinely racing through `register_node_over_wire_via_relay`'s CAS
+    /// against the SAME control leader, exactly like `count` real,
+    /// independent `animusd join` processes dialing the same seed at once.
+    /// `JOIN_DIAL_DRIVE_BUDGET` is unchanged — sized for one dial's own
+    /// worst case, and virtual time costs nothing extra to size generously,
+    /// so `count` dials racing inside it needs no larger budget.
+    ///
+    /// **Each dial's own throwaway pre-bind identity is at a DISTINCT mint
+    /// node id** (`base_n + i` for the `i`-th spawned dial, `base_n =
+    /// self.nodes` at call time — never a shared one): this is what gives
+    /// each dial a genuinely independent `SimEnv` `Rng` stream to mint from
+    /// (`NodeId::mint`'s own seeded draw, per [`claim_join_identity_via_
+    /// relay`]'s doc) — the sim-native analogue of `count` real join
+    /// processes each drawing from their own independent `PreBindRng`/OS
+    /// entropy, never two processes somehow sharing one entropy source. A
+    /// `Vec` indexed by spawn order (never a `BTreeMap`/`HashMap` keyed by
+    /// dial index) is deliberate: order is the only thing that matters here
+    /// (which throwaway mint id belongs to which outcome slot), and a `Vec`
+    /// makes that correspondence positional and unambiguous rather than a
+    /// lookup.
+    ///
+    /// **Phase 2 (`finish_join`) still runs strictly SEQUENTIALLY, in the
+    /// SAME order the dials were spawned** — once every dial has resolved,
+    /// each claimed `(id, DiscoveredJoinInfo)` is fed through the shared
+    /// [`finish_join`](Self::finish_join) tail one at a time. This is safe
+    /// (never a source of cross-call interference) because `finish_join`
+    /// only ever APPENDS to `self.shared`/`self.engines`/`self.roles` and
+    /// PATCHES existing nodes' route tables — a later call in the same
+    /// batch iterates `0..self.nodes` at ITS OWN call time (already
+    /// incremented by every earlier call in this batch), so the second
+    /// joiner's route-table patch correctly reaches the first joiner too,
+    /// and each joiner's own real-detector-promotion poll
+    /// (`finish_join`'s own tail) runs to convergence before the next
+    /// joiner's `finish_join` call even starts — there is no reason this
+    /// needs to be concurrent too: the RACE this method exists to prove is
+    /// the discovery+self-mint+claim dial (`register_node_over_wire_via_
+    /// relay`'s CAS actually discriminating under real contention), not the
+    /// bookkeeping assembly that follows it.
+    ///
+    /// Panics (seed-named) if any dial fails or does not resolve within
+    /// [`JOIN_DIAL_DRIVE_BUDGET`], or if `count == 0`. Returns each joiner's
+    /// own new `u64` index, in the SAME order the dials were spawned (which
+    /// is also ascending index order, `base_n..base_n + count`) — never the
+    /// claimed `NodeId` itself (recover that, if needed, from the
+    /// before/after `Metadata::members` diff, the same `only_new_member`-
+    /// shaped idiom every existing `sim_cluster_seed_join.rs` scenario
+    /// already uses for the single-dial case).
+    pub(crate) fn join_via_seed_concurrently(
+        &mut self,
+        seed_node: usize,
+        role: NodeRole,
+        count: usize,
+    ) -> Vec<u64> {
         let wire_role = match role {
             NodeRole::Both => "combined",
             NodeRole::Data => "data",
             NodeRole::Control => panic!(
-                "join_via_seed_with_role(seed_node={seed_node}): NodeRole::Control is not \
-                 supported — this fixture's control-only nodes are only ever built at \
-                 construction time via SimCluster::new_with_roles; a control-only join \
+                "join_via_seed_concurrently(seed_node={seed_node}, count={count}): NodeRole::\
+                 Control is not supported — this fixture's control-only nodes are only ever \
+                 built at construction time via SimCluster::new_with_roles; a control-only join \
                  primitive is control_membership_split.rs's own open C-13 question, \
                  deliberately not resolved by this method (seed={})",
                 self.sim.seed()
             ),
         };
-        let new_n = self.nodes as u64;
+        assert!(
+            count >= 1,
+            "join_via_seed_concurrently(seed_node={seed_node}): count must be at least 1 \
+             (seed={})",
+            self.sim.seed()
+        );
 
-        // A throwaway identity/env/relay, never registered as this
-        // cluster's real node and never served on — purely this call's own
-        // pre-claim entropy source (`NodeId::mint`'s seeded `Rng` draw) and
-        // outbound relay origin, mirroring production's own pre-bind state
-        // (no `ClientCtx`/bound listener exists yet either). Its own
-        // `serve_loop` (spawned unconditionally by `SimRelayClient::new`)
-        // sits harmlessly idle for the rest of the run — nothing ever
-        // addresses `nid(new_n)` again, real or minted.
+        let base_n = self.nodes as u64;
+        let discovery_seeds: Vec<String> = vec![nid(seed_node as u64).to_string()];
+
+        // Phase 1: spawn every dial FIRST — each its own throwaway pre-bind
+        // identity/env/relay at a DISTINCT mint node id (see this method's
+        // own doc on why `base_n + i`, never a shared one). NONE of these
+        // are ever registered as a real node — mirrors the single-dial
+        // method's own "never addressed again" note.
+        let outcomes: Vec<Arc<Mutex<Option<JoinDialOutcome>>>> =
+            (0..count).map(|_| Arc::new(Mutex::new(None))).collect();
+        for (i, outcome) in outcomes.iter().enumerate() {
+            let mint_id = nid(base_n + i as u64);
+            let mint_env = self.sim.env(mint_id);
+            let mint_relay: SimRelayClient<SimEnv> = SimRelayClient::new(mint_env.clone());
+            spawn_self_mint_dial(
+                &discovery_seeds,
+                wire_role,
+                mint_env,
+                mint_relay,
+                None,
+                outcome.clone(),
+            );
+        }
+
+        // ONE shared drive for every spawned dial — see this method's own
+        // doc on why this is what makes the dials genuinely race rather
+        // than run one after another.
+        self.sim.run_for(JOIN_DIAL_DRIVE_BUDGET);
+
+        let claims: Vec<(NodeId, DiscoveredJoinInfo)> = outcomes
+            .into_iter()
+            .enumerate()
+            .map(|(i, outcome)| {
+                outcome
+                    .lock()
+                    .expect("join dial result slot poisoned")
+                    .take()
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "join_via_seed_concurrently(seed_node={seed_node}, count={count}): \
+                             dial {i} did not complete within {JOIN_DIAL_DRIVE_BUDGET:?} \
+                             (seed={})",
+                            self.sim.seed()
+                        )
+                    })
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "join_via_seed_concurrently(seed_node={seed_node}, count={count}): \
+                             dial {i} failed: {e} (seed={})",
+                            self.sim.seed()
+                        )
+                    })
+            })
+            .map(|(id, _addrs, discovered)| (id, discovered))
+            .collect();
+
+        // Phase 2, strictly sequential, in spawn order — see this method's
+        // own doc on why that is safe and sufficient.
+        claims
+            .into_iter()
+            .map(|(id, discovered)| {
+                self.finish_join(
+                    id,
+                    wire_role,
+                    discovered.control_ids,
+                    discovered.client_route,
+                    discovered.intra_route,
+                )
+            })
+            .collect()
+    }
+
+    /// **C-13 / ADR 0061 rung M PR 5**: the deterministic mint-collision
+    /// proof — identical to [`join_via_seed_with_role`] (one dial, `count =
+    /// 1`) except this dial's own claim phase FORCES attempt 0 of the
+    /// self-mint retry loop to collide with `colliding_with`, an id the
+    /// caller already knows is claimed by a DIFFERENT registration.
+    /// Reaches [`claim_join_identity_via_relay`]'s own `forced_first_
+    /// candidate` knob with `Some(colliding_with)` (via [`spawn_self_mint_
+    /// dial`]'s own parameter of the same name) instead of the plain `None`
+    /// every other join method passes — proving `MAX_JOIN_MINT_ATTEMPTS`'
+    /// retry-on-collision loop actually retries and succeeds, on a genuine
+    /// collision this rung can name in advance rather than hoping a real
+    /// mint draw happens to land on one (astronomically unlikely, per
+    /// `claim_join_identity_via_relay`'s own doc) — the gap the real-socket
+    /// `two_concurrent_allocated_joins_get_distinct_ids` could only ever
+    /// close by luck, never by construction.
+    ///
+    /// **Choose `role` so the forced candidate's addrs genuinely DIFFER
+    /// from `colliding_with`'s own already-registered addrs** — every
+    /// self-mint claim's `NodeAddrs` is `{internal, client, intra, admin} =
+    /// candidate.to_string()`, `role = wire_role`, so forcing the candidate
+    /// to equal an id already registered under the SAME wire role would
+    /// build byte-identical addrs, which `register_node_over_wire_via_
+    /// relay`'s CAS accepts as an idempotent no-op re-registration
+    /// (`RegisterOutcome::Registered`, ADR 0032) — not the genuine
+    /// collision this method exists to force. Every scenario calling this
+    /// picks `colliding_with` and `role` to differ in wire-visible role
+    /// (e.g. an existing `"combined"` member, joined with `NodeRole::Data`)
+    /// specifically to guarantee a real `RegisterOutcome::Collision` on
+    /// attempt 0.
+    pub(crate) fn join_via_seed_forcing_mint_collision(
+        &mut self,
+        seed_node: usize,
+        role: NodeRole,
+        colliding_with: NodeId,
+    ) -> u64 {
+        let wire_role = match role {
+            NodeRole::Both => "combined",
+            NodeRole::Data => "data",
+            NodeRole::Control => panic!(
+                "join_via_seed_forcing_mint_collision(seed_node={seed_node}): NodeRole::Control \
+                 is not supported — see join_via_seed_concurrently's own identical panic message \
+                 (seed={})",
+                self.sim.seed()
+            ),
+        };
+        let new_n = self.nodes as u64;
         let mint_id = nid(new_n);
         let mint_env = self.sim.env(mint_id);
         let mint_relay: SimRelayClient<SimEnv> = SimRelayClient::new(mint_env.clone());
-
         let discovery_seeds: Vec<String> = vec![nid(seed_node as u64).to_string()];
 
-        // Phase 1 (async, bridged into this sync method the same
-        // `spawn_and_capture`-style way every other async op on this
-        // fixture is): discover, then self-mint + claim — the real wire
-        // round trips, never a bypass.
         let outcome: Arc<Mutex<Option<JoinDialOutcome>>> = Arc::new(Mutex::new(None));
-        let out = outcome.clone();
-        let dial_env = mint_env.clone();
-        let dial_relay = mint_relay.clone();
-        let dial_seeds = discovery_seeds.clone();
-        mint_env.spawn_task(async move {
-            let result = async {
-                let (control_ids, _peers, client_route, intra_route, _admin_addrs) =
-                    discover_join_info_via_relay(&dial_env, &dial_relay, &dial_seeds).await?;
-                let (id, addrs) =
-                    claim_join_identity_via_relay(&dial_env, &dial_relay, &dial_seeds, wire_role)
-                        .await?;
-                Ok((
-                    id,
-                    addrs,
-                    DiscoveredJoinInfo {
-                        control_ids,
-                        client_route,
-                        intra_route,
-                    },
-                ))
-            }
-            .await;
-            *out.lock().expect("join dial result slot poisoned") = Some(result);
-        });
+        spawn_self_mint_dial(
+            &discovery_seeds,
+            wire_role,
+            mint_env,
+            mint_relay,
+            Some(colliding_with.clone()),
+            outcome.clone(),
+        );
         self.sim.run_for(JOIN_DIAL_DRIVE_BUDGET);
-        let (id, _my_addrs, discovered) = outcome
+        let (id, _addrs, discovered) = outcome
             .lock()
             .expect("join dial result slot poisoned")
             .take()
             .unwrap_or_else(|| {
                 panic!(
-                    "join_via_seed(seed_node={seed_node}): dial task did not complete within \
+                    "join_via_seed_forcing_mint_collision(seed_node={seed_node}, \
+                     colliding_with={colliding_with}): dial task did not complete within \
                      {JOIN_DIAL_DRIVE_BUDGET:?} (seed={})",
                     self.sim.seed()
                 )
             })
             .unwrap_or_else(|e| {
                 panic!(
-                    "join_via_seed(seed_node={seed_node}): dial failed: {e} (seed={})",
+                    "join_via_seed_forcing_mint_collision(seed_node={seed_node}, \
+                     colliding_with={colliding_with}): dial failed: {e} (seed={})",
                     self.sim.seed()
                 )
             });
@@ -5131,8 +5274,8 @@ impl SimCluster {
     /// (i.e. the caller passes `animus_env::nid(self.node_count() as u64)`
     /// as `id`, the same index the join is about to occupy) — `restart`'s
     /// own `id = nid(node)` derivation
-    /// ([`join_via_seed_with_role`](Self::join_via_seed_with_role)'s own
-    /// doc, "What this does NOT prove") only matches reality when `id`
+    /// ([`join_via_seed_concurrently`](Self::join_via_seed_concurrently)'s
+    /// own doc) only matches reality when `id`
     /// itself is index-derived; any OTHER explicit `id` (a real operator
     /// picking their own free-form string) hits the identical structural
     /// mismatch the self-mint arm already documents. This mirrors

@@ -5,11 +5,12 @@
 //! registration CAS instead of an operator picking a small index or proposing
 //! an explicit `--id`.
 //!
-//! **C-13 / ADR 0061 rung M PR 4 trimmed this file from five tests to two.**
-//! Tests 1/3/5 (`no_node_join_becomes_active_and_gets_a_replica`,
+//! **C-13 / ADR 0061 rung M PR 4 trimmed this file from five tests to two;
+//! PR 5 trims it further, to one.** Tests 1/3/5
+//! (`no_node_join_becomes_active_and_gets_a_replica`,
 //! `data_only_allocated_join_becomes_active_and_gets_a_replica`,
-//! `follower_connected_seed_completes_the_allocate_node_id_round_trip`) are
-//! **deleted** — every assertion each one made now has a `SimCluster`
+//! `follower_connected_seed_completes_the_allocate_node_id_round_trip`) were
+//! **deleted by PR 4** — every assertion each one made had a `SimCluster`
 //! sibling in `crates/animusd/src/sim_cluster_seed_join.rs`:
 //! - Test 5 (a self-minted combined join via a deliberately follower-only
 //!   seed, asserting only the minted-id shape and real-detector promotion)
@@ -29,23 +30,35 @@
 //!   plus a trailing balance-driven-replica-and-peer-book poll) now proves
 //!   for the self-minted combined-join case specifically.
 //!
-//! Tests 2 (`two_concurrent_allocated_joins_get_distinct_ids`) and 4
+//! **Test 2 (`two_concurrent_allocated_joins_get_distinct_ids`) is deleted
+//! by PR 5** — its own real subject (two joiners self-minting CONCURRENTLY
+//! against the same seed, proving the mint-retry-on-collision loop and that
+//! both end up `Active` with distinct ids) now has TWO `SimCluster` siblings
+//! in `sim_cluster_seed_join.rs`: scenario (e),
+//! `two_concurrent_self_minted_joiners_get_distinct_ids_and_both_go_active`
+//! (the direct conversion — `SimCluster::join_via_seed_concurrently` with
+//! `count = 2`, proving exactly what test 2 proved: distinct/minted ids and
+//! real-detector promotion for both, from a pinned seed plus a fixed 5-seed
+//! `_over_seeds` sibling — deterministic where test 2 could only ever hit
+//! the retry-on-collision branch by astronomically unlikely luck), and
+//! scenario (f), `forced_mint_collision_retries_and_the_colliding_member_
+//! is_untouched` (a NEW, stronger proof test 2 itself never attempted: a
+//! DETERMINISTIC forced collision on a self-mint's first attempt, asserting
+//! the retry loop actually retries into a fresh mint and that the colliding
+//! member's own row is left completely untouched by the rejected attempt —
+//! see that scenario's own doc for the exact mechanism).
+//!
+//! **Test 4
 //! (`ephemeral_identity_restart_gets_a_new_id_old_left_down_and_prunable`)
-//! stay, **unmodified**, real TCP/time:
-//! - Test 2 needs the dial to run from two concurrent callers racing
-//!   through the SAME mint-retry-on-collision loop — C-13 PR 5's own scope
-//!   (`SimCluster::join_via_seed*` today drives exactly one dial at a time
-//!   per call; a concurrent-dial variant is a real, if small, addition this
-//!   PR does not build).
-//! - Test 4 is **permanent**: a fresh process on a fresh directory minting a
-//!   genuinely NEW identity in place of one that silently vanished has no
-//!   `SimCluster` analogue — `SimCluster::restart` always resumes the SAME
-//!   node index/id with its retained engine (mirroring a real process
-//!   restarting on the SAME directory), which is structurally the opposite
-//!   of what this test needs to prove. See `docs/adr/0061-testability-node-
-//!   crate-simulator.md`'s "Rung M (post-C-12)" opener amendment, §3, for
-//!   the full reasoning (the same class of permanent gap
-//!   `config_node_identity.rs` already carries).
+//! is permanent** — untouched by PR 5, and stays real TCP/time: a fresh
+//! process on a fresh directory minting a genuinely NEW identity in place of
+//! one that silently vanished has no `SimCluster` analogue —
+//! `SimCluster::restart` always resumes the SAME node index/id with its
+//! retained engine (mirroring a real process restarting on the SAME
+//! directory), which is structurally the opposite of what this test needs
+//! to prove. See `docs/adr/0061-testability-node-crate-simulator.md`'s
+//! "Rung M (post-C-12)" opener amendment, §3, for the full reasoning (the
+//! same class of permanent gap `config_node_identity.rs` already carries).
 //!
 //! Real TCP/time — polls with generous timeouts, not deterministic
 //! assertions (a flaky `ProdEnv` test is a real bug, per the root
@@ -162,17 +175,6 @@ fn member_status(nodes: &[Node], id: &animus_env::NodeId) -> Option<NodeStatus> 
         .find_map(|n| n.metadata().members.get(id).map(|m| m.status))
 }
 
-/// Whether `id` looks like a [`NodeId::mint`](animus_env::NodeId::mint)
-/// output — exactly 22 chars (128 bits of base64url, unpadded). There is no
-/// reserved prefix to check anymore (ADR 0040 retired the ADR 0036
-/// allocator's `"alloc-"` convention along with the allocator itself):
-/// uniqueness is now enforced structurally by the registration CAS, not by a
-/// namespace convention, so this is a sanity check on shape, not a
-/// disjointness proof.
-fn looks_minted(id: &animus_env::NodeId) -> bool {
-    id.as_str().chars().count() == 22
-}
-
 async fn await_active(nodes: &[Node], id: &animus_env::NodeId, secs: u64) {
     timeout(Duration::from_secs(secs), async {
         loop {
@@ -184,61 +186,6 @@ async fn await_active(nodes: &[Node], id: &animus_env::NodeId, secs: u64) {
     })
     .await
     .unwrap_or_else(|_| panic!("node {id} never promoted to Active"));
-}
-
-/// Two nodes joining **concurrently** with no `--node` (ADR 0036) both
-/// succeed with **distinct** allocated ids — no `AlreadyExists` anywhere,
-/// unlike the `--node`-indexed path's best-effort collision guard. This is
-/// the direct proof that ADR 0032's own documented residual race is closed
-/// by construction for the allocated path.
-///
-/// **C-13 PR 4**: kept real-socket — needs `SimCluster`'s own dial to run
-/// concurrently from two callers, C-13 PR 5's own scope (see this file's
-/// own doc).
-#[tokio::test(flavor = "multi_thread", worker_threads = 10)]
-async fn two_concurrent_allocated_joins_get_distinct_ids() {
-    let dir = support::panic_safe_tempdir();
-
-    let (core_nodes, core_config) = bring_up(3, dir.path()).await;
-    await_bootstrap(&core_nodes).await;
-    // ADR 0047: `--seed` now names the seed's intra address.
-    let core_clients: Vec<SocketAddr> = core_config.nodes.iter().map(|a| a.intra).collect();
-
-    // Both joins race through `join_allocated_fresh`'s port-TOCTOU retry loop
-    // concurrently — a genuine race, not a sequential simulation of one.
-    let (a, b) = tokio::join!(
-        join_allocated_fresh(
-            &core_clients,
-            dir.path(),
-            "racer-a",
-            StorageBackend::default()
-        ),
-        join_allocated_fresh(
-            &core_clients,
-            dir.path(),
-            "racer-b",
-            StorageBackend::default()
-        ),
-    );
-    let (node_a, _addrs_a, _dir_a) = a;
-    let (node_b, _addrs_b, _dir_b) = b;
-
-    let id_a = own_raftkv_id(node_a.admin_addr()).await;
-    let id_b = own_raftkv_id(node_b.admin_addr()).await;
-    assert_ne!(
-        id_a, id_b,
-        "two concurrent join attempts must never be allocated the same id"
-    );
-    assert!(looks_minted(&id_a) && looks_minted(&id_b));
-
-    await_active(&core_nodes, &id_a, 20).await;
-    await_active(&core_nodes, &id_b, 20).await;
-
-    node_a.shutdown_graceful().await;
-    node_b.shutdown_graceful().await;
-    for node in core_nodes {
-        node.shutdown_graceful().await;
-    }
 }
 
 /// **Ephemeral-identity regression** (ADR 0036): a no-`--node` joined node
