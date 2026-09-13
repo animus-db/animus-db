@@ -30,6 +30,19 @@
 //! existing per-index/per-id default, which *is* meant to persist across a
 //! restart of that same logical node.
 //!
+//! **An `--ephemeral` run of either of those two commands also removes its
+//! own auto-generated `animusd-ephemeral-<pid>` directory on clean
+//! shutdown** (Ctrl-C/SIGINT or SIGTERM, printing `animusd: removed
+//! ephemeral data dir …`) — there is nothing durable left in it once the
+//! process exits (the volatile in-memory CP-data engine holds no rows to
+//! keep, and the small control-plane WAL/system-keyspace files it also
+//! wrote are equally disposable), so leaving it behind in `$TMPDIR` forever
+//! is pure litter. An explicit `--dir` is never removed, ephemeral or not —
+//! that is the caller's own chosen location. A non-`--ephemeral` (durable)
+//! default directory is never removed either, since it holds a real,
+//! restart-resumable on-disk dataset by construction; only `--dir`
+//! opts a durable run into deliberate reuse, same as before.
+//!
 //! Per-process deployment: generate a config once, copy it to each host, and run
 //! `animusd --config cluster.json --node I` with a distinct `I` per process. A
 //! node that has no expanded config at all — just the **intra-cluster**
@@ -2422,6 +2435,73 @@ fn resolve_cluster_data_dir(
     })
 }
 
+/// Whether an in-process dev cluster's data directory is this process's own
+/// auto-generated *ephemeral* one — and therefore safe to remove on clean
+/// shutdown — and if so, the exact path to remove.
+///
+/// Returns `Some(dir)` only when every one of the following holds, i.e. only
+/// for the exact shape [`resolve_cluster_data_dir`] produces in its
+/// `--ephemeral`-and-no-`--dir` branch:
+/// - `cli_dir` is `None` — an explicit `--dir` is the caller's own choice of
+///   location, ephemeral backend or not, and is never removed;
+/// - `ephemeral` is `true` — a durable (`LsmEngine`-backed) default dir is
+///   real on-disk state by definition, never removed;
+/// - `dir`'s parent is exactly [`std::env::temp_dir()`] — belt-and-braces:
+///   refuses to `rm -rf` anything outside the one location this function
+///   ever mints a default under, however `dir` got here;
+/// - `dir`'s final path component is exactly `animusd-ephemeral-{pid}` —
+///   this process's own pid specifically, not merely a plausible-looking
+///   sibling directory.
+///
+/// Deliberately takes the resolved `dir` as a parameter rather than
+/// recomputing it — the intended call shape is
+/// `resolve_cluster_data_dir(..)` once, followed by this function once,
+/// right after, on the exact same inputs.
+fn ephemeral_dir_to_remove(
+    cli_dir: Option<&std::path::Path>,
+    ephemeral: bool,
+    dir: &std::path::Path,
+    pid: u32,
+) -> Option<std::path::PathBuf> {
+    if cli_dir.is_some() || !ephemeral {
+        return None;
+    }
+    if dir.parent()? != std::env::temp_dir() {
+        return None;
+    }
+    let expected_name = format!("animusd-ephemeral-{pid}");
+    if dir.file_name()?.to_str()? != expected_name {
+        return None;
+    }
+    Some(dir.to_path_buf())
+}
+
+/// Removes an in-process dev cluster's data directory on clean shutdown, but
+/// only when [`ephemeral_dir_to_remove`] says it is safe to — an explicit
+/// `--dir` and a durable (non-`--ephemeral`) default dir are both left
+/// untouched. Never turns a clean shutdown into a non-zero exit: a removal
+/// failure is logged and swallowed, not propagated.
+fn remove_ephemeral_dir_on_clean_shutdown(
+    cli_dir: Option<&std::path::Path>,
+    ephemeral: bool,
+    dir: &std::path::Path,
+    pid: u32,
+) {
+    let Some(target) = ephemeral_dir_to_remove(cli_dir, ephemeral, dir, pid) else {
+        return;
+    };
+    match std::fs::remove_dir_all(&target) {
+        Ok(()) => println!("animusd: removed ephemeral data dir {}", target.display()),
+        Err(e) => {
+            tracing::warn!(?e, dir = %target.display(), "failed to remove ephemeral data dir");
+            eprintln!(
+                "animusd: failed to remove ephemeral data dir {}: {e}",
+                target.display()
+            );
+        }
+    }
+}
+
 /// In-process: run an `n`-node cluster (dev convenience).
 #[allow(clippy::too_many_arguments)]
 async fn run_in_process_cluster(
@@ -2451,11 +2531,10 @@ async fn run_in_process_cluster(
     if n == 0 {
         return Err("--cluster must be at least 1".into());
     }
-    let dir = resolve_cluster_data_dir(
-        dir,
-        backend == animusd::StorageBackend::Memory,
-        std::process::id(),
-    );
+    let ephemeral = backend == animusd::StorageBackend::Memory;
+    let pid = std::process::id();
+    let cli_dir = dir.clone();
+    let dir = resolve_cluster_data_dir(dir, ephemeral, pid);
     println!("animusd: data dir {}", dir.display());
     let bound = animusd::bind_cluster_with_advertise_host_and_key(
         n,
@@ -2526,6 +2605,7 @@ async fn run_in_process_cluster(
     for node in &nodes {
         node.shutdown_graceful().await;
     }
+    remove_ephemeral_dir_on_clean_shutdown(cli_dir.as_deref(), ephemeral, &dir, pid);
     Ok(())
 }
 
@@ -2553,11 +2633,10 @@ async fn run_in_process_split_cluster(
     if control_n == 0 || data_n == 0 {
         return Err("--cluster-control and --cluster-data must each be at least 1".into());
     }
-    let dir = resolve_cluster_data_dir(
-        dir,
-        backend == animusd::StorageBackend::Memory,
-        std::process::id(),
-    );
+    let ephemeral = backend == animusd::StorageBackend::Memory;
+    let pid = std::process::id();
+    let cli_dir = dir.clone();
+    let dir = resolve_cluster_data_dir(dir, ephemeral, pid);
     println!("animusd: data dir {}", dir.display());
     let nodes = animusd::start_split_cluster_with_growth(
         control_n,
@@ -2617,6 +2696,7 @@ async fn run_in_process_split_cluster(
     for node in &nodes {
         node.shutdown_graceful().await;
     }
+    remove_ephemeral_dir_on_clean_shutdown(cli_dir.as_deref(), ephemeral, &dir, pid);
     Ok(())
 }
 
@@ -2745,6 +2825,52 @@ mod tests {
         let ephemeral = resolve_cluster_data_dir(None, true, 42);
         let durable = resolve_cluster_data_dir(None, false, 42);
         assert_ne!(ephemeral, durable);
+    }
+
+    // --- `ephemeral_dir_to_remove` (this fix) ---------------------------
+
+    #[test]
+    fn ephemeral_dir_to_remove_explicit_dir_is_never_removed_even_when_ephemeral() {
+        let explicit = std::path::PathBuf::from("/tmp/whatever-the-caller-chose");
+        let dir = resolve_cluster_data_dir(Some(explicit.clone()), true, 123);
+        assert_eq!(dir, explicit);
+        assert_eq!(
+            ephemeral_dir_to_remove(Some(explicit.as_path()), true, &dir, 123),
+            None
+        );
+    }
+
+    #[test]
+    fn ephemeral_dir_to_remove_non_ephemeral_default_is_never_removed() {
+        let dir = resolve_cluster_data_dir(None, false, 456);
+        assert_eq!(ephemeral_dir_to_remove(None, false, &dir, 456), None);
+    }
+
+    #[test]
+    fn ephemeral_dir_to_remove_ephemeral_default_is_removed() {
+        let dir = resolve_cluster_data_dir(None, true, 789);
+        assert_eq!(ephemeral_dir_to_remove(None, true, &dir, 789), Some(dir));
+    }
+
+    #[test]
+    fn ephemeral_dir_to_remove_refuses_a_path_with_the_wrong_final_component() {
+        // Same parent (`temp_dir()`) as a genuine ephemeral default, but a
+        // different final component — must never be treated as ours to
+        // delete, however it got constructed.
+        let lookalike = std::env::temp_dir().join("animusd-ephemeral-999-but-not-quite");
+        assert_eq!(ephemeral_dir_to_remove(None, true, &lookalike, 999), None);
+        // A path for a *different* pid than the one asked about is the same
+        // hazard in a more realistic disguise.
+        let other_pid = std::env::temp_dir().join("animusd-ephemeral-111");
+        assert_eq!(ephemeral_dir_to_remove(None, true, &other_pid, 222), None);
+    }
+
+    #[test]
+    fn ephemeral_dir_to_remove_refuses_a_path_outside_temp_dir() {
+        // Right final component, wrong parent — belt-and-braces should
+        // still refuse.
+        let outside = std::path::PathBuf::from("/var/lib/animus").join("animusd-ephemeral-333");
+        assert_eq!(ephemeral_dir_to_remove(None, true, &outside, 333), None);
     }
 
     // --- `--backup-store` (ADR 0059 §1) ---------------------------------
