@@ -10226,3 +10226,190 @@ own subject; no edit needed.
 entry (flipped from "candidate, not opened" to "opened," PR 1 landed);
 `crates/animusd/CLAUDE.md`'s residual-inventory pointer, annotated
 **opened** by C-13/rung M, pointing here.
+
+## 2026-09-10 amendment — Rung M (post-C-12): seed/join discovery `SimCluster` dispatch (C-13), PR 2 (the dial groundwork) landed
+
+**Mechanism, as built.** Three additive pieces, none touching a
+production dispatch path's own behavior:
+
+1. **`forwarding::handle_relayed_request` gains a `ClientRequest::
+   JoinInfo` arm** — inserted before the existing catch-all, mirroring
+   `lib.rs`'s real serve arm field for field (`ctx.admin.control_ids`/
+   `peers`/`admin_addrs`, `ctx.route_snapshot()`, `ctx.intra_route_
+   snapshot()`, every one already `<E, R>`-generic-reachable there, per
+   the opener's own fact (2)). `git diff origin/…-130 -- crates/animusd/
+   src/forwarding.rs` shows only additions/doc updates — no existing
+   line's own behavior changed; `lib.rs`'s own diff is a single new
+   `#[cfg(test)] mod sim_cluster_seed_join;` declaration (the test module
+   below), which does not exist in a non-test build at all. Every real
+   production caller of `handle_relayed_request` (`handle_request`'s own
+   `Status`/`Forwarded`/`ProposeSchema` delegation) is untouched;
+   production's `handle_request` never delegates `JoinInfo` to
+   `handle_relayed_request` (it keeps its own, separate arm), so this new
+   arm compiles into every build but is reachable only from a
+   `SimRelayClient` inbound dispatch, exactly as the opener predicted.
+2. **The `_via_relay` siblings live entirely inside `sim_cluster.rs`,
+   `#[cfg(test)]`-only — no shared generic core extraction was
+   attempted.** `join_request_via_relay`/`poll_seeds_for_via_relay`/
+   `discover_join_info_via_relay`/`register_node_over_wire_via_relay`/
+   `claim_join_identity_via_relay` are five new, standalone free
+   functions, each a direct structural mirror of its `lib.rs` production
+   counterpart (same request/response shapes, `relay.relay(..)` instead
+   of `TcpStream`, `env.now()`/`env.sleep()`/`Nanos::saturating_add`
+   throughout — no `tokio::time`, no `HashMap`, no raw `tokio::spawn`)
+   but never called by, and never calling into, any production function.
+   **Chosen over the "shared generic core the production functions could
+   call but don't have to" option the opener left open**: `lib.rs`'s five
+   pre-bind functions have no `Env`/`RelayClient` parameter of any kind
+   today (free functions called before any `ClientCtx` exists), so
+   widening their own signatures purely to let a sim-only caller reuse
+   them would touch code with zero other motivation to change, for a
+   marginal de-duplication benefit this rung's own budget didn't need —
+   the same "a narrowed/widened generic core must earn its own reason to
+   change a byte-identical-for-production function" discipline this
+   crate's history states repeatedly. The one place a genuine,
+   behavior-preserving reuse *was* free — item 1 above — took it.
+3. **`SimCluster::join_via_seed(&mut self, seed_node: usize) -> u64`**
+   (self-minted identity, combined mode only, per the opener's own
+   "smallest end-to-end slice" scope) mirrors `grow`'s own construction
+   tail (env/relay/`ClientCtx`/reconciler/heartbeat-loop/TTL-reaper
+   assembly), with the self-registration bypass replaced by: (a) a
+   throwaway bootstrap identity/env/relay (`nid(self.nodes)`, never
+   registered as a real node — pre-bind entropy source, mirroring
+   production's own disconnected-from-the-bound-identity pre-bind state)
+   driving `discover_join_info_via_relay` against `seed_node`'s own
+   address; (b) `claim_join_identity_via_relay`'s self-mint-and-claim
+   loop over the SAME bootstrap identity, relaying `MetaCommand::
+   RegisterNode` (exercising `is_relayable_command`'s allowlist end to
+   end, including from a follower-connected seed); (c) once claimed, a
+   REAL per-node env/relay/`ClientCtx` built under the minted identity,
+   with `heartbeat_loop` spawned exactly like `grow`'s own and **no
+   `UpsertMember` propose of any kind** — promotion is left entirely to
+   the real control leader's own `detect_loop`/`liveness_transitions`,
+   converged-or-timeout polled at the end (20s virtual budget). Bridged
+   into this sync method the same `spawn_and_capture`-style way every
+   other async op on this fixture is, but hand-rolled rather than reusing
+   `spawn_and_capture` itself (that helper resolves a *node index* to an
+   env via `self.shared.env(node)`, which needs an already-existing
+   `ClientCtx` — the bootstrap phase has none yet, by construction).
+
+**Two documented forks the opener flagged, both resolved by this PR (see
+`SimCluster::join_via_seed`'s own doc, `sim_cluster.rs`, for the
+complete reasoning — summarized here):**
+
+- **Route tables**: `grow`'s own "patch every EXISTING node's
+  `client_route`/`intra_route` directly" shape is kept, unchanged, for
+  every node already in the cluster. The NEW node's own route tables,
+  however, are derived from the `JoinInfo` discovery reply (merged with
+  its own self-entry) — the real ADR 0032 discovery contract, and the
+  one place this method is *more* faithful than `grow`. A fully-faithful
+  shape (existing nodes also learning the joiner only via a
+  `finish_combined_join`-style merge, never a direct patch) is left as
+  explicit future work, not built here — this PR picked the smaller,
+  additive half of the fork rather than the larger, `grow`-touching one.
+- **`ctx.control` stays `GenericControlHandle::Remote`, not production's
+  real combined-mode `Local`-isolated-raft-plus-`RemoteControlClient::
+  with_mirror` shape.** Traced by reading `finish_combined_join`/
+  `start_with_growth` directly (not assumed): a real combined join's own
+  local `RaftNode` is constructed with membership = the *pre-growth*
+  voter set, deliberately excluding the joiner itself — a permanently
+  non-participating replica whose only role is satisfying `ControlHandle`'s
+  type — while `effective_metadata()`'s real freshness comes from a
+  *separate* `RemoteControlClient::with_mirror` sharing `ctx.remote_
+  metadata` directly (`lib.rs`'s `remote_metadata_sync_loop`'s own
+  growth-node branch, confirmed by reading it). That shape is real, but
+  orthogonal to this rung's own goal (discovery/claim/registration/
+  detector-driven promotion) — every assertion PR 2's own tests make
+  (`effective_metadata()`'s contract, `Metadata::members` convergence, a
+  put/get round trip) behaves identically under `Remote`, which `grow`
+  already builds and this method reuses verbatim, with only `AdminInfo.
+  role`/`NodeAddrs.role` saying `"combined"` (the real wire-visible
+  contract) to distinguish it from a data-only grow. The fixture-internal
+  `self.roles` bookkeeping tags the joiner `NodeRole::Data` regardless —
+  its true SimCluster-fixture capability (no `self.controls` growth, so
+  `restart`'s own positional "control-bearing nodes occupy `0..self.
+  controls.len()`" invariant stays intact) — deliberately decoupled from
+  the wire-visible `"combined"` role string, both explained in the
+  method's own doc. A future rung needing the literal `Local`-plus-mirror
+  shape (e.g. `control_membership_split.rs`'s own open question) should
+  build it fresh.
+
+**A third design point the opener didn't anticipate, resolved by
+reading the code rather than by design**: `RemoteControlClient<R>::
+with_mirror` (the primitive production's own growth-node mirror branch
+uses) turned out to already be `<R: RelayClient>`-generic, reachable
+with `SimRelayClient<SimEnv>` with zero widening — confirmed by reading
+`animus_node::control_handle::RemoteControlClient`, not assumed from the
+production-only name. This PR did not end up needing it (the `Remote`
+choice above sidesteps it entirely), but a future rung building the
+literal `Local`-plus-mirror shape can reuse it directly rather than
+building a second sim-only mirror mechanism.
+
+**Testing**: `crates/animusd/src/sim_cluster_seed_join.rs` (new,
+registered next to the other `sim_cluster_*` modules) — two scenarios,
+each with a pinned seed plus a fixed-5-seed `_over_seeds` sibling (4
+tests total): (a) `joiner_discovers_claims_and_is_promoted_by_the_real_
+detector` — a 3-node combined cluster, joined via a control FOLLOWER
+(`SimCluster::control_follower_index`, new — a thin `control_leader_
+index`-plus-filter helper), asserting the id was self-minted (never the
+index-derived `nid()`, and shaped like a real 22-char base64url mint),
+every node's view reaches `Active`, promotion took genuine (non-
+instantaneous) virtual time — the observable proxy for "the real
+detector decided it, not a bypass propose," since `join_via_seed` itself
+provably never proposes `UpsertMember` (confirmed by reading its body,
+stated in its own doc) and there is no test-only instrumentation hook to
+assert that directly without adding fixture-only capability with no
+production analogue — and a put/get issued through the JOINED node's own
+`ClientCtx` (hosting no replica of the table at all) round-trips,
+proving its discovery-derived route tables actually work; (b) `rejoin_
+same_identity_is_a_noop` — re-runs `register_node_over_wire_via_relay`'s
+own CAS for the identical `(id, addrs)` via a new `SimCluster::rejoin_
+same_identity` helper and asserts it is accepted as an idempotent
+no-op, then asserts the SAME id with DIFFERENT `addrs` is a genuine
+collision — the ADR 0032 same-identity-rejoin contract, proven directly
+against the new relay-based CAS rather than a second full `join_via_
+seed` call (this PR's dial only ever self-mints; a literal "same process
+rejoins with an explicit `--id`" scenario needs the explicit-id claim
+branch `claim_join_identity_via_relay` deliberately does not build in
+this smallest slice — left for C-13 PR 4's own conversion of `seed_
+join.rs`'s `rejoin_same` scenario). Both scenarios run twice for
+determinism with identical results.
+
+**One clippy fix needed along the way**: the `outcome` slot inside
+`join_via_seed`'s Phase 1 bridging code (`Arc<Mutex<Option<Result<
+(NodeId, NodeAddrs, DiscoveredJoinInfo), String>>>>`) tripped
+`clippy::type_complexity` under `-D warnings`. Fixed with a named type
+alias, `JoinDialOutcome = Result<(NodeId, NodeAddrs,
+DiscoveredJoinInfo), String>`, right beside `DiscoveredJoinInfo` itself
+— mirroring this file's own `ScanRows`/`SimNodeCtx` precedent for the
+identical lint — with the `outcome` declaration narrowed to
+`Arc<Mutex<Option<JoinDialOutcome>>>`. No behavior change.
+
+**Gates, all green, run in the order below**: `cargo build -p animusd
+--lib --tests` clean, zero warnings (12.98s incremental); `cargo fmt
+--all --check` clean; `cargo clippy --workspace --all-targets
+--all-features -- -D warnings` clean (1m17s incremental, every crate in
+the workspace); `cargo test -p animusd --lib sim_cluster --
+--test-threads=2` — the full deterministic tier, **571 passed, 0
+failed, 2 ignored, finished in 1804.15s** (byte-identical pass count to
+this PR's own earlier mid-session run, confirming determinism across
+the clippy fix — see the unreconciled-baseline note below); `cargo test
+-p animusd --lib sim_cluster_seed_join` — **4 passed, 0 failed**, run
+twice, identical both times (4.57s, 4.48s); `cargo test -p animusd
+--test seed_join_allocated --test seed_join` — the untouched real-socket
+production join suites, **6 passed, 0 failed** (1 in `seed_join.rs`, 5
+in `seed_join_allocated.rs`), proving the production join path stayed
+byte-identical. `Cargo.lock` unchanged throughout.
+
+**Unreconciled, flagged rather than silently absorbed**: this rung's
+own opener predicted "565 passed / 2 ignored before your additions,"
+implying 569 after this PR's own 4 new tests; the actual observed count
+both before and after this PR's own clippy fix is **571 passed**. This
+PR's diff touches only `forwarding.rs` (additive), `lib.rs` (one new
+`#[cfg(test)] mod` line), `sim_cluster.rs`, and `sim_cluster_seed_
+join.rs` (new, 4 tests) — no other file in the `sim_cluster_*` tier was
+edited — so the +2 beyond the predicted +4-over-565 is not attributable
+to anything this PR added; most likely the opener's own "565" figure was
+already slightly stale relative to `main` by the time this PR's session
+ran. Left as an open, explicitly-flagged discrepancy rather than
+reconciled by assumption.
