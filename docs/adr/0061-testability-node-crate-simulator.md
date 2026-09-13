@@ -851,7 +851,7 @@ supply one, and isn't trying to.
 | J | Post-C-09: index DDL beyond plain `CreateTable` `SimCluster` dispatch (C-10) — blocker (d) named by both Rung H's and Rung I's own close-outs, the largest remaining `SimCluster`-dispatch group (9 files/30 tests in the D3-closing class-D breakdown). `dynamo.rs:1725-1774`'s `dispatch_table_op`'s `UpdateTable` arm rejects any call with `index_update.is_some()` via `unsupported_by_generic_dispatch`; `create_index`/`drop_index`/`set_index_status`/`drop_table_index` (`dynamo.rs:4509/4627/4680/4716`) are concrete (`&ClientCtx`, `tokio::time::Instant::now()`/`sleep`) even though every `ClientCtx` method they call (`propose_schema`/`drop_table_tablets`/`clear_backfill_cursor_for_table`, `schema.rs`'s own `impl<E: Env, R: RelayClient> ClientCtx<E, R>` block) is already generic — pure signature/clock-call widening, no new capability. `index_drain::drain_tablet`/`reconcile_partition`/`gsi_caught_up` are already `<E, R>`/`<E, R>`/`<E>`-generic (D3 PR 3b); `animus_node::index_backfill::index_backfill_loop<E, H: ControlLeaderHost<E>>` is already fully generic and `ControlLeaderHost` is already implemented generically for `ClientCtx<E, R>` (`client_ctx_host.rs:47`) — only `crates/animusd/src/index_backfill.rs`'s 18-line wrapper is concrete. `index_drain::backfill_seed_tick`/`advance_backfill_cursor`/`seed_change_log_record` (`index_drain.rs:1412/1539/1651`) stay concrete (`&ClientCtx`/`&CpGroup`, one `tokio::time::Instant`), called only from `change_consumer_loop`, which `SimCluster` never spawns (`sim_cluster.rs:2987`'s own doc). `SimCluster::drain_gsi` (`sim_cluster.rs:2802`) already exists and hand-drives `drain_tablet` directly; no primitive drives `backfill_seed_tick`. `GenericConsoleBackend::add_gsi`/`drop_gsi` (`lib.rs:4107/4123`) already route through `execute_routed_as_generic` — zero console/`lib.rs` change needed once the dispatch sub-arm exists. `CreateTableIndex`/`DropTableIndex`/`SetIndexStatus`/`MarkIndexBackfilled` are already on `is_relayable_command`'s allowlist (`wire.rs:764-781`). **Closed 2026-09-09 (PRs #789, #790, #791, #792, #793, #794, plus this PR 7)** — PR 2 (groundwork: the four `dynamo.rs` functions plus the `index_drain` seeder trio widened, the `UpdateTable` index sub-arm, the always-on `index_backfill_loop` spawn, `drive_backfill_seed`), PR 3 (`sim_cluster_dynamo_update_table_index.rs`, 9 tests from `update_table_create_index.rs`/`update_table_drop_index.rs`/`dynamo_gsi_drain.rs`, all three deleted whole), PR 4 (`sim_cluster_backfill_seeder.rs`, 4 of `backfill_seeder.rs`'s 5 scenarios, `split_during_backfill_converges_with_correct_final_gsi` kept `ProdEnv` per its own license, `SimCluster::restart` now respawns `index_backfill_loop`), PR 5 (`sim_cluster_stream_backfill_seed_filter.rs`, 2 tests, file deleted whole), and PR 6 (3 GSI-DDL `console_table_config.rs` scenarios into `sim_cluster_console_table_config.rs`, file trimmed to its 1 out-of-scope PITR test) all landed. `cargo test -p animusd --lib sim_cluster` ran 428 → 432 → 458 → 462 → **468 passed, 0 failed, 2 ignored**. Final residue: the three frozen files (`dynamo_index_scan.rs` #418, `index_backfill.rs` #592, `dynamo_index_writes.rs` #610, 14 tests, untouched throughout), `backfill_seeder.rs`'s one licensed `ProdEnv` residual, and `console_table_config.rs`'s one PITR residual — 16 tests total, `schema_ddl_relay.rs`'s 7 tests untouched by design. See the 2026-09-09 "Rung J (post-C-09)" through "Rung J, PR 6 landed" amendments below (including "Rung J closed") and `docs/roadmap.md`'s C-10 entry |
 | K | Post-C-10: throttle-metric counters `SimCluster` dispatch (C-11, closed) — the smallest of the four groups Rung J's own close-out left unowned (`ThrottledWrites`/`ThrottledReads`, 1 file/6 tests in the D3-closing class-D breakdown, unchanged since). `tests/dynamo_throttling.rs` held all 6: `batch_write_item_sheds_throttled_rows_into_unprocessed_items` (:445), `batch_get_item_sheds_throttled_keys_into_unprocessed_keys` (:492), `transact_write_items_cancels_with_throttling_error` (:538), `a_forwarded_write_is_throttled_on_the_leader` (:605), `admin_metrics_reports_nonzero_throttled_counters` (:652), and `cluster_wide_throttle_default_is_overridden_by_a_tables_own_throughput` (:740, a `run_node_with_cluster_settings`-only config-parse test expected to stay a permanent residual — and the one that did). `dynamo::kind_write_item_at_leader<E: Env, R: RelayClient>` and `dynamo::run_transact<E, R>` are already generic and already increment `Metric::ThrottledWrites` via `ctx.data().raftkv_metrics.incr(..)` (`dynamo.rs:9069`, `write_path.rs:327`, `txn_coordinator.rs:134`); the read-path `ThrottledReads` site (`read_path.rs:99`) is generic too. `dispatch_item_op` already routes `BatchGetItem`/`BatchWriteItem`/`TransactWriteItems`. **The rung's own distinguishing finding, corrected from two stale module docs, plus a third copy found the same day**: `SimCluster::new`/`::restart` build every node with a real `DataRole` (`data: Some(DataRole { raftkv_metrics: node_metrics[i].clone(), .. })`, `sim_cluster.rs:1460`, since rung D2 PR 1) and a `ThrottleTracker` (`:1504`) — `ThrottledWrites`/`ThrottledReads` **do** increment under `SimCluster` today, contradicting `sim_cluster_throttle.rs`'s and `sim_cluster_dynamo_update_table.rs`'s own module docs (both corrected by PR 1) and a third copy of the identical claim in `sim_cluster.rs:1427`'s own `AdminInfo` comment (corrected by this rung's own PR 4, since `sim_cluster.rs` was off this rung's earlier PRs' allowed-edits list). `SimCluster::set_throttle_defaults`/`::set_throttle_defaults_all` (`sim_cluster.rs:2121`/`:2134`) and `SimCluster::admin` (`:933`) already exist and already drive `GET /admin/metrics` in `sim_cluster_admin.rs`; `metrics_view<E, R>` (`admin.rs:1982`) is generic, dispatched from `animus-node/src/admin.rs:52`. Wire-level sim siblings already exist for the same operation family (`sim_cluster_dynamo_batch_get.rs`, `sim_cluster_kind_batch_outcome.rs`, `sim_cluster_dynamo_transact.rs`). **Closed 2026-09-09 (PRs #796, #797, #799, plus this PR 4)**: PR 2 converted the four wire-shape scenarios into `sim_cluster_dynamo_throttle.rs`; PR 3 converted `admin_metrics_reports_nonzero_throttled_counters` into `sim_cluster_admin.rs` and trimmed `dynamo_throttling.rs` to its one residual; PR 4 (this PR) is the docs close-out — no source, test, or `Cargo` change. `cargo test -p animusd --lib sim_cluster` ran 468 → 476 → **478 passed, 0 failed, 2 ignored**. Final residue: one test (`cluster_wide_throttle_default_is_overridden_by_a_tables_own_throughput`), a config-parse/process-boundary test with no `SimCluster` analog. **Zero production signature changes across the whole rung — its own distinguishing property.** The opener's own "not yet sequenced by the maintainer" question is answered only by this rung having proceeded on Rung J's own recommendation as a stated assumption, never an explicit instruction — restated, not resolved, by this close-out. **Size S.** See the 2026-09-09 "Rung K (post-C-10)" opener amendment through "Rung K closed" below and `docs/roadmap.md`'s C-11 entry |
 | L | Post-C-11: control/data role split under `SimCluster` (C-12, closed) — the one residual group named but never claimed since Rung H's own close-out (Rung H/I/J's own "what remains unowned" lists each repeat it, `crates/animusd/CLAUDE.md`'s residual inventory's "control/data role split (5/21)" entry); Rung K's own close-out, having landed and closed C-11, names it again, explicitly, as the one remaining group needing a genuinely new `SimCluster` deployment-shape fixture. Every animusd role assembly already exists in **production**: `NodeRole::{Control,Data,Both}` (`config.rs:74`), the three real assemblies — combined `Node::start_with` (`lib.rs:4886`), control-only `BoundControlNode::start_control_with` (`lib.rs:6421`, `data: None`), data-only `BoundDataNode::start_data_with` (`lib.rs:6814`, `control: ControlHandle::Remote(RemoteControlClient::new(..))` at `lib.rs:6977`) — and `ControlHandle<E, R>::{Local, Remote}` plus `RemoteControlClient<R>` (`animus-node/src/control_handle.rs:92/146`) are already `<E, R>`/`<R>`-generic, needing zero production widening. `SimCluster` already has a **data-only** growth primitive in miniature — `SimCluster::grow("data")` (`sim_cluster.rs:3530`): a real `GenericControlHandle::Remote`, a real reconciler, and a `SimEnv`-native `spawn_remote_mirror_sync_loop` (`sim_cluster.rs:349`) driving `ControlHandle::Remote`'s real observe/leader-hint logic — though it self-registers directly on the control leader rather than exercising the ADR 0030/0032 join dance. What's actually missing: a **control-only** node variant in `SimCluster` (no `DataRole`, no reconciler/janitors/mirror loop) and per-node role-tracking through `SimCluster::new`/`restart`/`crash` — `restart` (`sim_cluster.rs:3251`) unconditionally rebuilds a fresh `Local` `RaftNode` (`:3295`) for every node and, by its own doc comment, is already documented as out of scope for a grown node (`self.controls[node as usize]` at `:3416` indexes a `Vec` a grown node was never pushed onto — "calling this with a grown node's index panics on the `Vec` index, not gracefully," a pre-existing, self-documented D4 PR 4 limitation this rung lifts, not a newly discovered bug). **Closed 2026-09-09 (PRs #806, #808, #822, #823, #824, #825, #826, #827, plus this PR 5)**: PR 2 gave `SimCluster` a control-only node variant and role-aware `restart`/`crash`; PR 3 made `NodeRole::Data` first-class at construction and fixed two real, previously-latent gaps in `SimCluster::grow`; PR 4a converted `control_only.rs`/`data_only.rs`/`cluster_split.rs` (11 → 2 real-socket, `cluster_split.rs` deleted whole); PR 4b converted 6 of `split_cluster.rs`'s 8 tests (2 genuine class-B residuals kept, file trimmed not deleted — the opener's own "8, deleted whole" estimate was corrected here); PR 4c converted the four role-named `console_endpoint.rs`/`dashboard_endpoint.rs` tests (one converted whole, three stay mixed); PR 4d converted `stream_janitor.rs`'s control-only-leader scenario (2 → 1 real-socket); PR 4e (#827) converted 11 of `control_membership_admin.rs`'s 12 tests (2 → 1 real-socket — `runtime_added_voter_survives_leadership_change_to_a_different_original_voter` kept permanently, pinning `ProdEnv::merge_peer`'s scope-limit behaviour, structurally invisible under `SimEnv`), and found and fixed one real production bug along the way (`ClientCtx::admin_remove_control_member`'s leader-self-removal transfer-wait loop read `tokio::time::Instant::now()`/`tokio::time::sleep` directly despite an already-generic `<E, R>` signature — this crate's fifth recorded recurrence of the "generic signature ≠ seam-clean body" lesson — converted to `self.env.now()`/`self.env.sleep`). **This close-out's own per-file re-verification, in its first draft before PR 4e existed, found the opener's real-socket inventory below was wrong in two respects**: (1) `control_membership_admin.rs` — named above as "11 of 12 convert" and counted into the opener's own "35 tests across 8 files" total — had not been touched by any of PRs 2 through 4d; it remained at all 12 tests, entirely `ProdEnv`. This was a genuine shortfall against the plan, not a permanent residual — the mechanism it needed (`new_with_roles`, control-prefixed roles) already existed — and PR 4e closed it as the rung's own final conversion PR rather than being left as a follow-up. (2) Of its 12 tests, the one the opener called permanent `--config`-bring-up residue — `admin_config_reports_the_internal_addr_the_cli_resolves_control_add_through` — reading it showed it builds its `ClusterConfig` in-process via `bring_up_combined` (`animusd::run_node`, no `--config FILE` parse anywhere) and asserts only a `GET /admin/config` JSON-shape fact (`addrs.internal` present, the legacy `control` key gone) that `SimCluster::admin`'s existing generic dispatch already reaches for a sibling assertion (`sim_cluster_admin.rs::admin_config_reports_auth_state_and_never_serves_the_secret`) — also convertible, not permanent, and PR 4e converted it too. The actual converted total is **22 scenarios / 43 new sim tests across 7 real-socket files by PRs 4a-4d** (one, `cluster_split.rs`, deleted whole), plus **11 scenarios / 22 new sim tests from `control_membership_admin.rs` by PR 4e** — 65 tests total across 8 files, not the opener's estimated 35/8. Deferred to a follow-on rung (needs the real ADR 0030/0032 seed/join dance, not just a role split): `data_join.rs` (1), `seed_join.rs` (1), `seed_join_allocated.rs` (5), `control_membership_split.rs` (2) — 9 tests across 4 files, confirmed unchanged. **Genuinely permanent**, assessed and closed by this PR (read against the actual test body, not the inherited label — see the amendment below): `control_mirror_restart.rs`/`control_metadata_restart.rs` (2 + 2, a real second `LsmEngine` handle opened against real on-disk bytes after process shutdown), `seed_join_hostname.rs` (1, real `TcpStream::connect`/`ToSocketAddrs` DNS resolution), `config_node_identity.rs` (1, the real `Node::bind`/`bind_control`/`bind_data` identity-derivation path — `SimCluster` never calls `Node::bind` at all), `control_membership_admin.rs` (1, `ProdEnv::merge_peer`'s scope-limit behaviour, kept by PR 4e) — 5 files/7 tests. See the 2026-09-09 "Rung L (post-C-11)" opener amendment through "Rung L closed" below for the full grep-verified ground truth, file/line anchors, the PR-by-PR test disposition, and the closing assess-and-close record. **Size L.** |
-| M | Post-C-12: seed/join discovery `SimCluster` dispatch (C-13, opened) — the group Rung L's own close-out deferred by name (`data_join.rs`/`seed_join.rs`/`seed_join_allocated.rs`/`control_membership_split.rs`), named again as "the next candidate" by that close-out's own "What was deferred" section. This opener's own re-derivation from source (not from the deferring pointer's headline sentence alone — see the Lessons entry this PR adds) found the real ADR 0030/0032 joiner sequence — `discover_join_info` → `claim_join_identity`/`register_node_over_wire` → `Node::bind*` → `finish_combined_join`/`finish_data_join` → `start_with_growth`'s post-bind `admin_add_member` + `heartbeat_loop_live` spawn → the control leader's own real `detect_loop`/`liveness_transitions` promoting the member to `Active` on its own first observed heartbeat, never proposed by the joiner itself (`crates/animusd/src/lib.rs:15192-15813`, `crates/animus-control/src/node.rs:1753-1861`) — is almost entirely `Env`/`RelayClient`-generic ALREADY (`ClientCtx::register_node`/`admin_add_member`, `animus_control::node::heartbeat_loop`/`detect_loop`/`liveness_transitions`, `ClientCtx::propose_schema`'s relay fallback); the actual, narrow gap is two pre-bind raw-`TcpStream` wire calls with no `Env` seam at all (`join_request`/`poll_seeds_for`/`discover_join_info`/`claim_join_identity`/`register_node_over_wire`, `lib.rs:15192-15602`) plus one missing `ClientRequest::JoinInfo` arm on `handle_relayed_request`'s allowlist (`crates/animusd/src/forwarding.rs:1391-1414`, three arms — `Status`/`Forwarded`/`ProposeSchema` — with `_ => Error("not relayable under sim")` as the catch-all), a small additive two-line production fix with no existing production behavior to narrow. `SimCluster::grow`/`seed_members` (`sim_cluster.rs`) already prove the POST-claim mechanism correctly (`detect_loop`, `liveness_transitions`, `heartbeat_loop`, `RegisterNode`'s CAS apply arm) by bypassing straight to two in-process leader-handle proposes (`RegisterNode` + an immediate, unconditional `UpsertMember{Active}` — never observed via a real heartbeat) — what they skip is exactly the pre-bind discovery/claim half and the real detector-driven promotion decision. **Corrected inventory (this opener's own grep, folding in a file the roadmap's C-13 entry had omitted)**: 5 files/13 tests, not the roadmap's 4/9 — `join_data_seed_settings_reach.rs` (4 tests) genuinely calls the real join entry points too, its own assertions targeting per-node knob threading (shared-WAL layout, `quiesce_after`, encryption-key-at-rest) through the join path rather than discovery/claim itself. Per-test disposition: **convertible with a new `SimCluster`-native seed/join dial** once built — `data_join.rs` (1), `seed_join.rs` (1, plus its own `rejoin_same` CAS-`NoOp` regression), `seed_join_allocated.rs` tests 1/3/5 (self-minted join, its data-only dual, and the follower-connected-seed relay regression exercising the newly-widened `JoinInfo` arm together with the pre-existing `is_relayable_command` allowlist) — 6 tests solidly convertible, plus `seed_join_allocated.rs` test 2 (two concurrent self-minting joiners) convertible but needing the dial to be genuinely concurrent-caller-safe (a `SimRelayClient`-based design gets this for free); **open question, not resolved by this opener** — `control_membership_split.rs` (2 tests) never calls the discovery/claim path at all (it grows a control-only node via `Node::bind_control` + a hand-assembled `ClusterConfig`, then drives the real, already-generic ADR 0037 admin-HTTP membership-change surface), so building the dial does not by itself unblock it; two candidate resolutions are flagged for the PR that attempts conversion to pick between (extend `SimCluster` with a non-voting control-bearing node primitive, or route it through the dial as a `role: "control"` registration that never claims `members` and needs its own, narrower completion signal, since `detect_loop`'s `Active`-promotion path is structurally inapplicable to a control-only node); **genuinely permanent** — `seed_join_allocated.rs` test 4 (a fresh-process/fresh-directory restart minting a genuinely NEW identity, structurally mismatched with `SimCluster::restart`'s own "same node, same retained engine" contract) and 3 of `join_data_seed_settings_reach.rs`'s 4 tests (real-disk WAL-layout-on-disk and plaintext-absence proofs, the same class as `control_mirror_restart.rs`/`control_metadata_restart.rs`'s own permanent residuals); its 4th (`quiesce_after`) is not permanent on its own knob-threading merits but has no independent reason to be built ahead of the other three files' conversions. **Two facts this opener resolved that the deferring pointer left open**: (1) `NodeId::mint<R: Rng + ?Sized>(rng: &R) -> NodeId` (`crates/animus-env/src/lib.rs:200`) is **already generic** over `animus_env`'s own seam `Rng` trait, not hardcoded to `animus_env::prod::PreBindRng` — its own doc comment already names `SimEnv` as a sanctioned caller ("Sim callers pass a `SimEnv` handle... production join paths mint at the CLI boundary via `prod::PreBindRng`"); PR 2 needs **zero** widening here, only a call site passing a `SimEnv`/its `Rng` impl instead of `PreBindRng`. (2) The real `ClientRequest::JoinInfo` serve arm (`lib.rs:13181-13187`) reads `ctx.admin.control_ids`/`ctx.admin.peers`/`ctx.admin.admin_addrs` (a private, non-generic `Arc<AdminInfo>` field already reachable from `forwarding.rs` as a descendant module, the same way `handle_relayed_request`'s existing `Status` arm already reads `ctx.control`/`ctx.route_snapshot()`) plus `ctx.route_snapshot()`/`ctx.intra_route_snapshot()` (`forwarding.rs:40/77`, both already defined inside the `impl<E: Env, R: RelayClient> ClientCtx<E, R>` block) — every field is already `<E, R>`-generic-reachable at that exact call site, so PR 2's new `handle_relayed_request` `JoinInfo` arm can be written purely with existing accessors, no new plumbing. **The fixture primitive PR 2 builds**: new `RelayClient`-generic `discover_join_info_via_relay`/`claim_join_identity_via_relay` siblings (same request/response shapes as production, `relay.relay(..)` instead of `TcpStream`, `env.sleep()`/`env.now()` throughout, no `HashMap`/`tokio::time`/raw `tokio::spawn`) plus a new `SimCluster::join_via_seed` driver mirroring `grow`'s own construction tail but replacing its self-registration bypass with discover → claim → spawn `heartbeat_loop` → poll for the REAL `detect_loop` to observe the heartbeat and commit `UpsertMember{Active}` on its own, never a bypass propose. **Production code paths stay byte-identical** — every new function is an additive sibling, per this crate's own "narrowed generic core never becomes the production dispatcher's only path" lesson repeated at least a dozen times across this crate's own history. **PR ladder (7 PRs)**: PR 1 (S, this opener, docs only) → PR 2 (M, the dial groundwork: the `JoinInfo` relay arm, the two `_via_relay` siblings, `SimCluster::join_via_seed` self-minted/combined-only, its own sim smoke, the `NodeId::mint` call-site confirmation) → PR 3 (M, `data_join.rs` conversion, `join_via_seed` gains a data role arm) → PR 4 (M, `seed_join.rs` + `seed_join_allocated.rs` tests 1/3/5) → PR 5 (S, `seed_join_allocated.rs` test 2's concurrent-mint scenario) → PR 6 (M or deferred, `control_membership_split.rs`'s open-question resolution attempt, or an honest "assessed, not converted" close if neither candidate resolution proves tractable) → PR 7 (S, close-out: both permanent groups recorded, `docs/roadmap.md`/`crates/animusd/CLAUDE.md` updated, a "Rung M closed" amendment). **Risks**: `control_membership_split.rs`'s own resolution is the largest unknown, deliberately left open rather than forced; the route-table handling choice (patch directly, `grow`'s own shortcut, vs. derive purely from the discovery reply) is a real, unresolved design fork PR 2 must pick; no place in this design closes `seed_join_allocated.rs` test 4's fresh-identity-on-restart property, a structural `SimCluster::restart` mismatch, not a design gap. **Size M to L** (S for PR 1/5/7, M for PR 2/3/4/6, no PR sized XL). See the 2026-09-10 "Rung M opened" amendment below, `docs/roadmap.md`'s C-13 entry, and `crates/animusd/CLAUDE.md`'s residual-inventory pointer for the full grep-verified ground truth, file/line anchors, and the PR ladder. |
+| M | Post-C-12: seed/join discovery `SimCluster` dispatch (C-13, closed) — the group Rung L's own close-out deferred by name (`data_join.rs`/`seed_join.rs`/`seed_join_allocated.rs`/`control_membership_split.rs`), named again as "the next candidate" by that close-out's own "What was deferred" section. This opener's own re-derivation from source (not from the deferring pointer's headline sentence alone — see the Lessons entry this PR adds) found the real ADR 0030/0032 joiner sequence — `discover_join_info` → `claim_join_identity`/`register_node_over_wire` → `Node::bind*` → `finish_combined_join`/`finish_data_join` → `start_with_growth`'s post-bind `admin_add_member` + `heartbeat_loop_live` spawn → the control leader's own real `detect_loop`/`liveness_transitions` promoting the member to `Active` on its own first observed heartbeat, never proposed by the joiner itself (`crates/animusd/src/lib.rs:15192-15813`, `crates/animus-control/src/node.rs:1753-1861`) — is almost entirely `Env`/`RelayClient`-generic ALREADY (`ClientCtx::register_node`/`admin_add_member`, `animus_control::node::heartbeat_loop`/`detect_loop`/`liveness_transitions`, `ClientCtx::propose_schema`'s relay fallback); the actual, narrow gap is two pre-bind raw-`TcpStream` wire calls with no `Env` seam at all (`join_request`/`poll_seeds_for`/`discover_join_info`/`claim_join_identity`/`register_node_over_wire`, `lib.rs:15192-15602`) plus one missing `ClientRequest::JoinInfo` arm on `handle_relayed_request`'s allowlist (`crates/animusd/src/forwarding.rs:1391-1414`, three arms — `Status`/`Forwarded`/`ProposeSchema` — with `_ => Error("not relayable under sim")` as the catch-all), a small additive two-line production fix with no existing production behavior to narrow. `SimCluster::grow`/`seed_members` (`sim_cluster.rs`) already prove the POST-claim mechanism correctly (`detect_loop`, `liveness_transitions`, `heartbeat_loop`, `RegisterNode`'s CAS apply arm) by bypassing straight to two in-process leader-handle proposes (`RegisterNode` + an immediate, unconditional `UpsertMember{Active}` — never observed via a real heartbeat) — what they skip is exactly the pre-bind discovery/claim half and the real detector-driven promotion decision. **Corrected inventory (this opener's own grep, folding in a file the roadmap's C-13 entry had omitted)**: 5 files/13 tests, not the roadmap's 4/9 — `join_data_seed_settings_reach.rs` (4 tests) genuinely calls the real join entry points too, its own assertions targeting per-node knob threading (shared-WAL layout, `quiesce_after`, encryption-key-at-rest) through the join path rather than discovery/claim itself. Per-test disposition: **convertible with a new `SimCluster`-native seed/join dial** once built — `data_join.rs` (1), `seed_join.rs` (1, plus its own `rejoin_same` CAS-`NoOp` regression), `seed_join_allocated.rs` tests 1/3/5 (self-minted join, its data-only dual, and the follower-connected-seed relay regression exercising the newly-widened `JoinInfo` arm together with the pre-existing `is_relayable_command` allowlist) — 6 tests solidly convertible, plus `seed_join_allocated.rs` test 2 (two concurrent self-minting joiners) convertible but needing the dial to be genuinely concurrent-caller-safe (a `SimRelayClient`-based design gets this for free); **open question, not resolved by this opener** — `control_membership_split.rs` (2 tests) never calls the discovery/claim path at all (it grows a control-only node via `Node::bind_control` + a hand-assembled `ClusterConfig`, then drives the real, already-generic ADR 0037 admin-HTTP membership-change surface), so building the dial does not by itself unblock it; two candidate resolutions are flagged for the PR that attempts conversion to pick between (extend `SimCluster` with a non-voting control-bearing node primitive, or route it through the dial as a `role: "control"` registration that never claims `members` and needs its own, narrower completion signal, since `detect_loop`'s `Active`-promotion path is structurally inapplicable to a control-only node); **genuinely permanent** — `seed_join_allocated.rs` test 4 (a fresh-process/fresh-directory restart minting a genuinely NEW identity, structurally mismatched with `SimCluster::restart`'s own "same node, same retained engine" contract) and 3 of `join_data_seed_settings_reach.rs`'s 4 tests (real-disk WAL-layout-on-disk and plaintext-absence proofs, the same class as `control_mirror_restart.rs`/`control_metadata_restart.rs`'s own permanent residuals); its 4th (`quiesce_after`) is not permanent on its own knob-threading merits but has no independent reason to be built ahead of the other three files' conversions. **Two facts this opener resolved that the deferring pointer left open**: (1) `NodeId::mint<R: Rng + ?Sized>(rng: &R) -> NodeId` (`crates/animus-env/src/lib.rs:200`) is **already generic** over `animus_env`'s own seam `Rng` trait, not hardcoded to `animus_env::prod::PreBindRng` — its own doc comment already names `SimEnv` as a sanctioned caller ("Sim callers pass a `SimEnv` handle... production join paths mint at the CLI boundary via `prod::PreBindRng`"); PR 2 needs **zero** widening here, only a call site passing a `SimEnv`/its `Rng` impl instead of `PreBindRng`. (2) The real `ClientRequest::JoinInfo` serve arm (`lib.rs:13181-13187`) reads `ctx.admin.control_ids`/`ctx.admin.peers`/`ctx.admin.admin_addrs` (a private, non-generic `Arc<AdminInfo>` field already reachable from `forwarding.rs` as a descendant module, the same way `handle_relayed_request`'s existing `Status` arm already reads `ctx.control`/`ctx.route_snapshot()`) plus `ctx.route_snapshot()`/`ctx.intra_route_snapshot()` (`forwarding.rs:40/77`, both already defined inside the `impl<E: Env, R: RelayClient> ClientCtx<E, R>` block) — every field is already `<E, R>`-generic-reachable at that exact call site, so PR 2's new `handle_relayed_request` `JoinInfo` arm can be written purely with existing accessors, no new plumbing. **The fixture primitive PR 2 builds**: new `RelayClient`-generic `discover_join_info_via_relay`/`claim_join_identity_via_relay` siblings (same request/response shapes as production, `relay.relay(..)` instead of `TcpStream`, `env.sleep()`/`env.now()` throughout, no `HashMap`/`tokio::time`/raw `tokio::spawn`) plus a new `SimCluster::join_via_seed` driver mirroring `grow`'s own construction tail but replacing its self-registration bypass with discover → claim → spawn `heartbeat_loop` → poll for the REAL `detect_loop` to observe the heartbeat and commit `UpsertMember{Active}` on its own, never a bypass propose. **Production code paths stay byte-identical** — every new function is an additive sibling, per this crate's own "narrowed generic core never becomes the production dispatcher's only path" lesson repeated at least a dozen times across this crate's own history. **PR ladder (7 PRs)**: PR 1 (S, this opener, docs only) → PR 2 (M, the dial groundwork: the `JoinInfo` relay arm, the two `_via_relay` siblings, `SimCluster::join_via_seed` self-minted/combined-only, its own sim smoke, the `NodeId::mint` call-site confirmation) → PR 3 (M, `data_join.rs` conversion, `join_via_seed` gains a data role arm) → PR 4 (M, `seed_join.rs` + `seed_join_allocated.rs` tests 1/3/5) → PR 5 (S, `seed_join_allocated.rs` test 2's concurrent-mint scenario) → PR 6 (M or deferred, `control_membership_split.rs`'s open-question resolution attempt, or an honest "assessed, not converted" close if neither candidate resolution proves tractable) → PR 7 (S, close-out: both permanent groups recorded, `docs/roadmap.md`/`crates/animusd/CLAUDE.md` updated, a "Rung M closed" amendment). **Risks**: `control_membership_split.rs`'s own resolution is the largest unknown, deliberately left open rather than forced; the route-table handling choice (patch directly, `grow`'s own shortcut, vs. derive purely from the discovery reply) is a real, unresolved design fork PR 2 must pick; no place in this design closes `seed_join_allocated.rs` test 4's fresh-identity-on-restart property, a structural `SimCluster::restart` mismatch, not a design gap. **Size M to L** (S for PR 1/5/7, M for PR 2/3/4/6, no PR sized XL). **Closed 2026-09-13 (PRs 1-7, this being PR 7's own close-out)**: PR 2 built the dial (`join_via_seed`, the `_via_relay` siblings, the `JoinInfo` relay arm); PR 3 converted `data_join.rs` (data-only role arm); PR 4 converted `seed_join.rs` (explicit-id arm) and trimmed `seed_join_allocated.rs` to tests 2+4; PR 5 converted `seed_join_allocated.rs` test 2 (concurrent dials) and added a deterministic forced-mint-collision proof, trimming that file to test 4 alone; PR 6 resolved `control_membership_split.rs`'s open question with a mixed disposition — one conversion (full fidelity), one honest assess-and-close (the "combined growth" primitive named as the residual, not attempted under budget pressure); PR 7 (this PR) hardened the three single-joiner forwarding proofs (scenarios (a)/(c)/(d)) against the reconfigure-window race PR 5's own investigation flagged, wrapping each in the fixture's converged-or-timeout retry idiom, and recorded the final assess-and-close verdicts. Sim tier: 565 → 581 tests over PRs 2-6 (+0 from PR 7, hardening only). Final residue: `seed_join_allocated.rs` test 4 (permanent, fresh-process/fresh-identity has no `SimCluster::restart` analogue), `join_data_seed_settings_reach.rs` (4 tests: 3 permanent real-disk/process-boundary, 1 not-permanent-but-not-worth-a-primitive), `control_membership_split.rs`'s one remaining test (deferred pending the combined-voter-growth primitive), `seed_join_hostname.rs` (1, real DNS, already permanent before this rung) — 4 files/7 tests total, none silently dropped. See the 2026-09-10 "Rung M opened" amendment through the "Rung M closed" amendment below, `docs/roadmap.md`'s C-13 entry, and `crates/animusd/CLAUDE.md`'s residual-inventory pointer for the full grep-verified ground truth, file/line anchors, and the PR ladder. |
 
 Note that the copy-based split driver (ADR 0050) is deliberately **not** on
 this list: ADR 0058 rung 4's remaining layer deletes it. Writing a corpus
@@ -11104,3 +11104,303 @@ independently-scoped conversions rather than a single all-or-nothing
 verdict, and on two independently-landed doc comments corroborating the
 same "deferred, separately-budgeted primitive" finding being read as
 confirmation rather than re-litigated from scratch.
+
+## 2026-09-13 amendment — Rung M closed (C-13 complete)
+
+PR 7 is documentation plus one small, deliberately-scoped hardening
+change: the three single-joiner forwarding proofs in `sim_cluster_seed_
+join.rs` (scenarios (a)/(c)/(d)) are wrapped in the fixture's own
+converged-or-timeout retry idiom, against the reconfigure-window race PR
+5's own investigation flagged for the two-joiner case. No new test was
+added by this PR — the sim tier's test count is unchanged from PR 6's own
+581. Rung M (C-13) is now **closed**: all seven PRs of the opener's own
+ladder have landed, every file in the corrected 5-file/13-test inventory
+has a final, grep-verified disposition, and the one genuinely open
+question the opener left (`control_membership_split.rs`) was resolved as
+an honest mixed verdict by PR 6, not forced into either extreme.
+
+### Per-PR record
+
+- **PR 1 (opener, docs only).** The rung-table row M, the "Rung M
+  (post-C-12)" amendment, `docs/roadmap.md`'s C-13 entry, and `crates/
+  animusd/CLAUDE.md`'s residual-inventory pointer. Grep-verified ground
+  truth against the then-current tree: the real ADR 0030/0032 joiner
+  sequence, the split between what's already `<E, R>`-generic and what's
+  raw-socket-only, the missing `ClientRequest::JoinInfo` arm on `handle_
+  relayed_request`'s allowlist, and two resolved open questions
+  (`NodeId::mint`'s `Rng` bound already generic; the real `JoinInfo`
+  serve arm's fields already reachable through existing generic
+  accessors). Corrected the roadmap's own inventory from 4 files/9 tests
+  to 5 files/13 tests, folding in `join_data_seed_settings_reach.rs`
+  (omitted from the original inventory despite genuinely calling the
+  real join entry points).
+- **PR 2 (the dial groundwork).** `handle_relayed_request` gained a
+  `ClientRequest::JoinInfo` arm (`forwarding.rs`) — the rung's one
+  production-adjacent change, purely additive (this arm has no
+  production equivalent to narrow: real joiners dial a seed's listener
+  directly, never through the `Forwarded`/relay envelope). Five new
+  `#[cfg(test)]` free functions in `sim_cluster.rs` —
+  `join_request_via_relay`/`poll_seeds_for_via_relay`/`discover_join_
+  info_via_relay`/`register_node_over_wire_via_relay`/`claim_join_
+  identity_via_relay` — mirror `lib.rs`'s five pre-bind join functions
+  structurally (same request/response shapes, `relay.relay(..)`/`env.
+  now()`/`env.sleep()` instead of `TcpStream`/`tokio::time`) but are
+  standalone, never called by and never calling into any production
+  function. `SimCluster::join_via_seed` (self-minted identity, combined
+  mode only): a real pre-bind discovery+claim phase over a throwaway
+  bootstrap identity/env/relay, followed by the real per-node assembly
+  with **no `UpsertMember` propose at all** — promotion left to the real
+  control leader's own `detect_loop`, converged-or-timeout polled. New
+  module `sim_cluster_seed_join.rs`: `joiner_discovers_claims_and_is_
+  promoted_by_the_real_detector`/`rejoin_same_identity_is_a_noop`, each
+  with a pinned seed plus a 5-seed `_over_seeds` sibling (4 tests).
+- **PR 3 (`data_join.rs` conversion).** `SimCluster::join_via_seed_with_
+  role(seed_node, role)` — `join_via_seed` becomes a thin wrapper calling
+  it with `role = NodeRole::Both`. Shared phase-2 assembly stayed inside
+  `join_via_seed` itself at this point (extracted to `finish_join` in PR
+  4). New scenario (c), `data_only_joiner_over_a_split_deployment_gets_a_
+  rebalanced_replica` (2 tests) — a 3-control+2-data split deployment,
+  three wire-created tables, a third data-only node joined via a
+  control-only FOLLOWER seed; asserts self-minted id, real-detector
+  promotion, a real placement-reconciler-landed replica (violation-
+  repair, not merely balance — every table is already under-replicated
+  the moment the joiner is `Active`), and bidirectional put/get.
+  `tests/data_join.rs` (1 test) **deleted whole** — every assertion has a
+  sim sibling; the one thing it alone exercised (`Node::bind_data`'s
+  literal listener bind) is already covered permanently elsewhere
+  (`config_node_identity.rs`).
+- **PR 4 (`seed_join.rs` + `seed_join_allocated.rs` tests 1/3/5).**
+  `SimCluster::join_via_seed_with_explicit_id(seed_node, role, id) ->
+  Result<u64, String>` — the counterpart of production's explicit-`--id`
+  claim branch: a single `register_node_over_wire_via_relay` call for
+  the caller-supplied id, no retry-on-collision loop, an `Err` (not a
+  panic) on a genuine collision with the cluster left untouched. The
+  shared phase-2 assembly extracted into a new private `finish_join`
+  method, shared by both the self-mint and explicit-id arms. New
+  accessor `SimCluster::client_route_ids(node)` (the sim-native `GET
+  /admin/peers` equivalent). Scenario (a) extended with two more tables
+  (balance pressure) plus a trailing balance-driven-replica/peer-book
+  poll; new scenario (d), `explicit_id_joiner_gets_a_balanced_replica_
+  and_survives_a_restart_rejoin` — the sim sibling for `seed_join.rs`'s
+  own eight-step scenario end to end, including a genuine collision
+  (same id, different addrs, rejected) and a `crash`+`restart` rejoin
+  proof. `tests/seed_join.rs` (1 test) **deleted whole**. `tests/seed_
+  join_allocated.rs` trimmed from 5 tests to 2 (tests 1/3/5 removed as
+  strict subsets of scenarios (a)'s extension/(c)/(a) respectively).
+- **PR 5 (`seed_join_allocated.rs` test 2).** `spawn_self_mint_dial`
+  (new free function) factors PR 2's single-dial Phase 1 out of `join_
+  via_seed_with_role`; `SimCluster::join_via_seed_concurrently(seed_node,
+  role, count)` spawns `count` independent dials (each at a distinct
+  throwaway mint node id, drawing from an independent `SimEnv` `Rng`
+  stream) before ONE shared `Simulator::run_for`, then feeds each
+  resolved claim through `finish_join` sequentially in spawn order.
+  `SimCluster::join_via_seed_forcing_mint_collision` reuses the same
+  primitive with a new `forced_first_candidate` parameter on `claim_
+  join_identity_via_relay`, deterministically forcing attempt 0 of the
+  self-mint retry loop to collide with an existing member. New
+  scenarios (e)/(f): `two_concurrent_self_minted_joiners_get_distinct_
+  ids_and_both_go_active` (2 tests, matching test 2's own scope
+  EXACTLY — no tables, no forwarding proof, after a real finding that
+  adding either raced the placement reconciler against two joiners'
+  own promotion windows at once) and `forced_mint_collision_retries_
+  and_the_colliding_member_is_untouched` (2 tests, a deterministic proof
+  test 2 could only ever hit by astronomical luck). `tests/seed_join_
+  allocated.rs` trimmed to its one permanent residual (test 4).
+- **PR 6 (`control_membership_split.rs`'s open question).** A mixed
+  disposition, not a forced all-or-nothing conversion — see the
+  2026-09-13 "PR 6 ... resolved" amendment above for the full account.
+  `admin_add_control_member_races_a_control_only_self_registration_and_
+  still_converges` converts with full fidelity (new `sim_cluster_
+  control_membership_split.rs`, one new `SimCluster::control_raft_
+  indices` accessor, zero other production change) — its own real
+  subject never touches `Node::bind_control`/discovery/claim at all, a
+  pure control-plane admin-vs-apply-task timing race, every piece of
+  which was already generic and reachable. `grow_then_replace_a_voter_
+  over_a_split_deployment_with_live_data_traffic` is assessed and stays
+  real-socket — its own real subject needs a genuinely new `RaftNode<
+  SimEnv>` joining the LIVE control quorum, a primitive both `SimCluster
+  ::grow`'s own doc and C-12 PR 4e's own module doc independently name
+  as deferred, separately-budgeted machinery, corroborated a third time
+  by this PR rather than attempted under budget pressure (the C-08 PR 2
+  near-miss this crate's own history warns against). `tests/control_
+  membership_split.rs` trimmed to its one remaining test.
+- **PR 7 (this PR, close-out).** Hardens the three single-joiner
+  forwarding proofs (scenarios (a)/(c)/(d)) against the reconfigure-
+  window race — see "Findings" below for why this matters even though
+  every scenario's own doc states the window is "ordinarily too short to
+  observe" for a single joiner. This amendment, `docs/roadmap.md`'s C-13
+  close plus a new C-14 candidate entry, and `crates/animusd/CLAUDE.md`'s
+  consolidated seed/join appendix. No new test; production code
+  untouched (the one `#[cfg(test)]`-only file this PR edits is `sim_
+  cluster_seed_join.rs`).
+
+### File inventory, before/after test counts, and disposition
+
+| File | Before | After | Disposition |
+|---|---|---|---|
+| `data_join.rs` | 1 | 0 | Deleted whole (PR 3) — every assertion has a sim sibling in scenario (c) |
+| `seed_join.rs` | 1 | 0 | Deleted whole (PR 4) — every assertion has a sim sibling in scenario (d) |
+| `seed_join_allocated.rs` | 5 | 1 | Tests 1/3/5 removed as strict subsets (PR 4); test 2 removed, converted (PR 5); test 4 kept, **permanent** |
+| `control_membership_split.rs` | 2 | 1 | One test converted (PR 6); one kept, **deferred** pending the combined-voter-growth primitive |
+| `join_data_seed_settings_reach.rs` | 4 | 4 | Assessed by this PR (unchanged) — 3 **permanent** (real-disk), 1 not-permanent-on-its-own-merits-but-not-worth-a-primitive |
+
+Sim-tier growth over the rung: 565 (C-12 close) → 581 (PR 6, the rung's
+last test-adding PR) — PR 7 adds 0 new tests, hardening only.
+
+### The fixture surface built (PR 2-6)
+
+`SimCluster::{join_via_seed, join_via_seed_with_role, join_via_seed_with_
+explicit_id, join_via_seed_concurrently, join_via_seed_forcing_mint_
+collision}`, the shared `finish_join` tail, `spawn_self_mint_dial`; the
+five `_via_relay` siblings (`join_request_via_relay`/`poll_seeds_for_via_
+relay`/`discover_join_info_via_relay`/`register_node_over_wire_via_
+relay`/`claim_join_identity_via_relay`); the `ClientRequest::JoinInfo` arm
+on `handle_relayed_request`'s allowlist; `SimCluster::{control_raft_
+indices, client_route_ids, control_follower_index, rejoin_same_identity}`.
+Every `join_via_seed*` entry point proposes no `UpsertMember` at all —
+promotion is always left to the real control leader's own `detect_loop`,
+observed only through its timing consequence (a non-trivial virtual-time
+gap between the dial resolving and every node's view reaching `Active`).
+
+### Assess-and-close verdicts (re-derived against each test's own current body)
+
+- **`tests/join_data_seed_settings_reach.rs` (4 tests, confirmed by
+  grep — `join_defaults_to_shared_wal_matching_a_bare_config_node`,
+  `join_no_shared_wal_writes_the_per_group_layout`, `data_seed_join_
+  threads_quiesce_after_to_admin_config`, `join_threads_encryption_
+  key`)**:
+  - `join_defaults_to_shared_wal_matching_a_bare_config_node` — **permanent**.
+    Restarts the joined node's own directory through the real `run_node_
+    with_cluster_settings`/`--config`/`--node` startup surface with a
+    flipped `shared_wal` flag and asserts the loud `check_wal_layout`
+    mismatch error against real on-disk WAL bytes — the identical class
+    of real-disk-layout proof `shared_wal_e2e.rs` already establishes as
+    permanent.
+  - `join_no_shared_wal_writes_the_per_group_layout` — **permanent**, the
+    converse direction of the same real-disk proof.
+  - `data_seed_join_threads_quiesce_after_to_admin_config` — **not
+    permanent on its own knob-threading merits, but not worth a
+    dedicated primitive**, stated honestly rather than inherited: its
+    own assertion (`GET /admin/config`'s `quiesce_after_ms` reflects
+    `--quiesce-after 7` threaded through `data --seed`) is a plain
+    JSON-shape fact `SimCluster::admin`'s existing generic dispatch could
+    answer in principle. What makes it not worth converting is that it
+    still needs the real `run_node_data_join_with_settings`/`Node::
+    bind_data` entry point either way (that IS the mechanism under
+    test — whether the knob survives that specific real-process
+    assembly path), so a `SimCluster` sibling would either skip the
+    thing being tested (config threading through the real join entry
+    point) or need to reconstruct it — no cheaper than leaving this one
+    test real-socket. Every other config-knob-threading property this
+    knob has is already proven elsewhere (`sim_cluster`'s own quiescence
+    coverage) without the join path specifically.
+  - `join_threads_encryption_key` — **permanent**. Writes a real key file
+    to disk and asserts the absence of a plaintext needle in the joined
+    node's own on-disk directory, read back through a genuinely separate
+    process/engine-open — the same real-disk-bytes proof `encryption_at_
+    rest_e2e.rs` already establishes as permanent.
+- **`tests/seed_join_allocated.rs` test 4
+  (`ephemeral_identity_restart_gets_a_new_id_old_left_down_and_prunable`)
+  — permanent.** A fresh process on a fresh directory minting a
+  genuinely NEW identity in place of one that silently vanished has no
+  `SimCluster` analogue: `SimCluster::restart` always resumes the SAME
+  node index/id with its retained `MemoryTabletEngines` handle
+  (mirroring a real process restarting on the SAME directory) — the
+  structural opposite of what this test needs to prove. Confirmed
+  unchanged by re-reading the test body directly (not inherited from PR
+  4/5's own labels, though those labels turn out correct).
+- **`tests/control_membership_split.rs`'s remaining test
+  (`grow_then_replace_a_voter_over_a_split_deployment_with_live_data_
+  traffic`) — deferred, pending the combined-voter-growth primitive.**
+  See PR 6's own amendment and `docs/roadmap.md`'s new C-14 entry. Not a
+  permanent gap in the ADR-0037 sense (its own mechanism has substantial
+  `SimCluster` coverage elsewhere) — narrowly, this one test's own
+  fixture choice (a genuinely fresh `RaftNode<SimEnv>` joining the LIVE
+  control quorum) needs a primitive this rung did not build.
+- **`tests/seed_join_hostname.rs` (1 test,
+  `node_joins_via_a_hostname_seed`) — already-permanent, for
+  completeness of the seed/join family.** Real `TcpStream::connect`/
+  `ToSocketAddrs` DNS resolution against a real `localhost:<port>` seed —
+  confirmed unchanged; not touched by this rung, named here so the
+  family's full residue is in one place.
+
+### Findings
+
+- **The reconfigure-window race, and how it was scoped (PR 7).** PR 5's
+  own investigation found that once a node is promoted `Active`, the
+  placement reconciler can still be mid-reconfigure on the very tablet a
+  forwarding proof targets — a real, transient `"no CP group leader
+  reachable"`-shaped failure, not a fixture bug. That investigation only
+  needed to DROP the forwarding proof for its own two-joiner scenario
+  (the window there was wide enough to matter on a real seed); the
+  three single-joiner scenarios ((a)/(c)/(d)) each state, in their own
+  doc, that a single joiner's window is "ordinarily too short to
+  observe" — true on every seed tried, but a margin, not a guarantee.
+  PR 7 hardens all three without changing what they assert: a new
+  `retry_forwarding_proof` helper (mirroring the fixture's existing
+  `poll_until` converged-or-timeout idiom, just over a fallible op
+  rather than a boolean condition) retries a transiently-failing
+  put/get, driving a 200ms step of virtual time forward between
+  attempts, up to 20 attempts, panicking (naming the seed and the
+  exhausted step count) only if the op never succeeds at all. Every
+  wrapped call is idempotent (a `Put`/`Get` retried with the same key/
+  value), so retrying on a transient failure never changes what a
+  successful attempt would have observed.
+- **The forced-candidate-must-differ-in-addrs CAS fact (PR 5).**
+  `claim_join_identity_via_relay`'s forced-collision test must pick a
+  colliding member registered under a DIFFERENT wire role than the
+  forcing join uses — every self-mint claim's addrs are deterministically
+  derived from the candidate id (`{internal,client,intra,admin} =
+  candidate.to_string()`), so forcing a candidate matching an EXISTING
+  same-role registration would build byte-identical addrs and the CAS
+  would accept it as an idempotent re-registration (ADR 0032) rather than
+  a genuine collision.
+- **The fixed-target-RF self-heal (PR 3).** `MAX_REPLICATION_FACTOR` is
+  always the *recorded target* regardless of how many candidates were
+  `Active` at `CreateTable` time (`ClientCtx::provision_tablet`'s own
+  doc) — with only 2 data nodes initially and a target of 3, every table
+  in scenario (c) is already under-replicated from creation, so `reconcile
+  _placement`'s violation-repair path (not merely balance) is what lands
+  the third replica the moment the joiner is `Active`, a stronger and
+  more deterministic guarantee than balance alone would give.
+- **The hand-hosted-table trap (PR 3).** `SimCluster::create_table`'s own
+  hand-hosted shortcut picks replicas `0..replication`, which would land
+  every replica on the CONTROL-only nodes of a mixed cluster — every
+  scenario over a split deployment uses `create_table_via_wire` instead.
+
+### What was deferred
+
+The combined control-plane voter growth primitive (a fresh `RaftNode<
+SimEnv>` joining the LIVE control quorum after construction) — named
+independently by `SimCluster::grow`'s own doc, `sim_cluster_control_
+membership_admin.rs`'s own module doc (C-12 PR 4e), and this rung's own
+PR 6 amendment. It would unblock `control_membership_split.rs`'s one
+remaining test, `SimCluster::grow`'s own deferred `"combined"` role arm,
+and the seed/join dial's own unimplemented `NodeRole::Control` option
+(`join_via_seed_with_role`/`join_via_seed_with_explicit_id`/`join_via_
+seed_concurrently`/`join_via_seed_forcing_mint_collision` all `panic!`
+on it today). See `docs/roadmap.md`'s new C-14 entry for the full scope.
+
+### Next unowned residual group
+
+`docs/roadmap.md` names C-14 (the combined control-plane voter growth
+primitive above) as a **candidate, not opened** — the one item this
+rung's own PR 6 named precisely enough to scope, unlike the broader
+"node assembly/raw `ClientRequest`" group (2 files/8 tests) that has
+remained unowned by any planned rung since C-08's own close-out with no
+rung claiming it. No other unowned residual group is named by the
+roadmap as ready to open.
+
+### Docs
+
+This amendment; `docs/roadmap.md`'s C-13 entry flipped to closed (status
+line, table row) plus the new C-14 candidate entry (table row); `crates/
+animusd/CLAUDE.md`'s consolidated seed/join appendix (the fixture
+surface, the residual inventory with permanent/deferred reasons, the
+forwarding-proof hardening). `docs/engineering-lessons.md`'s seven
+existing C-13 entries (opener, PR 2-6) were re-read for this close-out and
+found to be independently-scoped, each citing a distinct incident — no
+duplicates to prune; no new rung-level lesson was added, since the one
+candidate (proactively hardening a passing scenario against a
+known-but-not-yet-observed race class) would restate PR 5's own
+reconfigure-window entry rather than add a genuinely new fact.

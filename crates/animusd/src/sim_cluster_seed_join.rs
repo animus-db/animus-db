@@ -387,12 +387,12 @@ fn run_joiner_discovers_claims_and_is_promoted_by_the_real_detector(seed: u64) {
     // behaviorally: a put/get issued from the JOINER's own `ClientCtx`
     // (it hosts no replica of `t1` at all) must forward correctly to the
     // real tablet leader.
-    cluster
-        .put(joined, "t1", "pk-from-joiner", "sk", b"hello-from-joiner")
-        .unwrap_or_else(|e| panic!("seed={seed}: put from the joined node ({joined}) failed: {e}"));
-    let got = cluster
-        .get(joined, "t1", "pk-from-joiner", "sk", true)
-        .unwrap_or_else(|e| panic!("seed={seed}: get from the joined node ({joined}) failed: {e}"));
+    retry_forwarding_proof(&mut cluster, seed, "put from the joined node", |c| {
+        c.put(joined, "t1", "pk-from-joiner", "sk", b"hello-from-joiner")
+    });
+    let got = retry_forwarding_proof(&mut cluster, seed, "get from the joined node", |c| {
+        c.get(joined, "t1", "pk-from-joiner", "sk", true)
+    });
     assert_eq!(
         got.as_deref(),
         Some(b"hello-from-joiner".as_slice()),
@@ -552,6 +552,57 @@ fn poll_until(
     }
 }
 
+/// Retry a single-joiner forwarding proof (a `put`/`get` issued through the
+/// joined node, or against a pre-existing node reading back what the
+/// joiner just wrote) while it transiently fails, driving a small step of
+/// virtual time forward between attempts — the fixture's own bounded-retry
+/// idiom, mirroring [`poll_until`] above (a converged-or-timeout poll, just
+/// over a fallible op rather than a boolean condition) and
+/// `sim_cluster_auto_split.rs`'s own `put_item_retry`.
+///
+/// **Why this exists at all**: C-13 PR 5's own investigation (see this
+/// module's own doc on scenario (e), and `crates/animusd/CLAUDE.md`'s
+/// matching appendix's "A real finding, not assumed" paragraph) found that
+/// once a node is promoted `Active`, the placement reconciler can still be
+/// mid-reconfigure on the very tablet a forwarding proof targets — a real,
+/// transient `"no CP group leader reachable"`-shaped failure, not a
+/// fixture bug. That investigation only needed to DROP the forwarding
+/// proof for its own TWO-joiner scenario (the window there was wide enough
+/// to matter); scenarios (a)/(c)/(d) below each state, in their own doc,
+/// that a SINGLE joiner's window is "ordinarily too short to observe" —
+/// true on every seed tried so far, but a margin, not a guarantee. This
+/// helper hardens those three scenarios' own forwarding proofs against
+/// that same window without changing what they assert, so a future seed
+/// or a slower host that widens the window by chance does not turn a
+/// real, transient mid-reconfigure moment into a flaky failure.
+///
+/// Panics, naming the seed and the exhausted attempt count, if `op` never
+/// succeeds — the same "state precisely on exhaustion" discipline
+/// `poll_until` already follows.
+fn retry_forwarding_proof<T>(
+    cluster: &mut SimCluster,
+    seed: u64,
+    what: &str,
+    mut op: impl FnMut(&mut SimCluster) -> Result<T, String>,
+) -> T {
+    const MAX_ATTEMPTS: u32 = 20;
+    const STEP: Duration = Duration::from_millis(200);
+    for attempt in 0..MAX_ATTEMPTS {
+        let last_err = match op(cluster) {
+            Ok(v) => return v,
+            Err(e) => e,
+        };
+        assert!(
+            attempt + 1 < MAX_ATTEMPTS,
+            "seed={seed}: {what} kept hitting a transient failure after {MAX_ATTEMPTS} \
+             attempts (each spaced {STEP:?} of virtual time apart, step={attempt}) — \
+             last error: {last_err}"
+        );
+        cluster.run_for(STEP);
+    }
+    unreachable!("loop above always returns or panics before exhausting MAX_ATTEMPTS")
+}
+
 /// (c) `data_only_joiner_over_a_split_deployment_gets_a_rebalanced_replica`
 /// — see this module's own doc for the full six-step mapping onto `tests/
 /// data_join.rs`'s own real-socket scenario.
@@ -676,18 +727,21 @@ fn run_data_only_joiner_over_a_split_deployment_gets_a_rebalanced_replica(seed: 
     // node's own `ClientCtx` for `hosted_table` — the one it's confirmed to
     // actually replicate — against a pre-existing data node, proving it a
     // genuine CP-data participant, not just a registered-but-inert member.
-    cluster
-        .put(
+    retry_forwarding_proof(&mut cluster, seed, "put from the joined node", |c| {
+        c.put(
             joined,
             hosted_table,
             "pk-from-joiner",
             "sk",
             b"hello-from-joiner",
         )
-        .unwrap_or_else(|e| panic!("seed={seed}: put from the joined node ({joined}) failed: {e}"));
-    let got = cluster
-        .get(3, hosted_table, "pk-from-joiner", "sk", true)
-        .unwrap_or_else(|e| panic!("seed={seed}: get from the pre-existing data node failed: {e}"));
+    });
+    let got = retry_forwarding_proof(
+        &mut cluster,
+        seed,
+        "get from the pre-existing data node",
+        |c| c.get(3, hosted_table, "pk-from-joiner", "sk", true),
+    );
     assert_eq!(
         got.as_deref(),
         Some(b"hello-from-joiner".as_slice()),
@@ -695,18 +749,23 @@ fn run_data_only_joiner_over_a_split_deployment_gets_a_rebalanced_replica(seed: 
          pre-existing data node"
     );
 
-    cluster
-        .put(
-            3,
-            hosted_table,
-            "pk-from-existing",
-            "sk",
-            b"hello-from-existing",
-        )
-        .unwrap_or_else(|e| panic!("seed={seed}: put from the pre-existing data node failed: {e}"));
-    let got2 = cluster
-        .get(joined, hosted_table, "pk-from-existing", "sk", true)
-        .unwrap_or_else(|e| panic!("seed={seed}: get from the joined node ({joined}) failed: {e}"));
+    retry_forwarding_proof(
+        &mut cluster,
+        seed,
+        "put from the pre-existing data node",
+        |c| {
+            c.put(
+                3,
+                hosted_table,
+                "pk-from-existing",
+                "sk",
+                b"hello-from-existing",
+            )
+        },
+    );
+    let got2 = retry_forwarding_proof(&mut cluster, seed, "get from the joined node", |c| {
+        c.get(joined, hosted_table, "pk-from-existing", "sk", true)
+    });
     assert_eq!(
         got2.as_deref(),
         Some(b"hello-from-existing".as_slice()),
@@ -827,36 +886,36 @@ fn run_explicit_id_joiner_gets_a_balanced_replica_and_survives_a_restart_rejoin(
 
     // 5. Reads and writes round-trip both directions through the joined
     // node's own `ClientCtx` and a pre-existing node.
-    cluster
-        .put(
+    retry_forwarding_proof(&mut cluster, seed, "put from the joined node", |c| {
+        c.put(
             joined,
             hosted_table,
             "pk-from-joiner",
             "sk",
             b"hello-from-joiner",
         )
-        .unwrap_or_else(|e| panic!("seed={seed}: put from the joined node ({joined}) failed: {e}"));
-    let got = cluster
-        .get(0, hosted_table, "pk-from-joiner", "sk", true)
-        .unwrap_or_else(|e| panic!("seed={seed}: get from node 0 failed: {e}"));
+    });
+    let got = retry_forwarding_proof(&mut cluster, seed, "get from node 0", |c| {
+        c.get(0, hosted_table, "pk-from-joiner", "sk", true)
+    });
     assert_eq!(
         got.as_deref(),
         Some(b"hello-from-joiner".as_slice()),
         "seed={seed}: a put issued from the joined node must be visible from a pre-existing node"
     );
 
-    cluster
-        .put(
+    retry_forwarding_proof(&mut cluster, seed, "put from node 0", |c| {
+        c.put(
             0,
             hosted_table,
             "pk-from-existing",
             "sk",
             b"hello-from-existing",
         )
-        .unwrap_or_else(|e| panic!("seed={seed}: put from node 0 failed: {e}"));
-    let got2 = cluster
-        .get(joined, hosted_table, "pk-from-existing", "sk", true)
-        .unwrap_or_else(|e| panic!("seed={seed}: get from the joined node ({joined}) failed: {e}"));
+    });
+    let got2 = retry_forwarding_proof(&mut cluster, seed, "get from the joined node", |c| {
+        c.get(joined, hosted_table, "pk-from-existing", "sk", true)
+    });
     assert_eq!(
         got2.as_deref(),
         Some(b"hello-from-existing".as_slice()),
