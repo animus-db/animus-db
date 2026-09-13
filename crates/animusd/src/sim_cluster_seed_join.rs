@@ -1,16 +1,25 @@
 //! `SimCluster`-driven deterministic coverage for the real seed/join dial
-//! (ADR 0061 rung M, C-13 PR 2/3) — `SimCluster::join_via_seed`/
-//! `join_via_seed_with_role`, their `_via_relay` siblings, and
-//! `forwarding::handle_relayed_request`'s `ClientRequest::JoinInfo` arm.
-//! See `sim_cluster.rs`'s own doc on `SimCluster::join_via_seed_with_role`
-//! for the full mechanism (what it drives for real, the two documented
-//! forks it resolves, what it deliberately does not prove) and
-//! `crates/animusd/CLAUDE.md`'s matching appendix for the cross-cutting
-//! account. PR 2's own scope was the smallest end-to-end slice — self-
-//! minted identity, combined mode, a single joiner — proving the dial
-//! primitive itself; PR 3 adds the data-only role arm and the first real
-//! conversion, `tests/data_join.rs`'s own scenario (see (c) below).
-//! `seed_join.rs`/`seed_join_allocated.rs` stay later PRs' own scope.
+//! (ADR 0061 rung M, C-13 PR 2/3/4) — `SimCluster::join_via_seed`/
+//! `join_via_seed_with_role`/`join_via_seed_with_explicit_id`, their
+//! `_via_relay` siblings, and `forwarding::handle_relayed_request`'s
+//! `ClientRequest::JoinInfo` arm. See `sim_cluster.rs`'s own doc on
+//! `SimCluster::join_via_seed_with_role`/`join_via_seed_with_explicit_id`
+//! for the full mechanism (what each drives for real, the documented forks
+//! it resolves, what it deliberately does not prove) and `crates/animusd/
+//! CLAUDE.md`'s matching appendix for the cross-cutting account. PR 2's own
+//! scope was the smallest end-to-end slice — self-minted identity, combined
+//! mode, a single joiner — proving the dial primitive itself; PR 3 added
+//! the data-only role arm and the first real conversion, `tests/
+//! data_join.rs`'s own scenario (see (c) below); **PR 4 converts `tests/
+//! seed_join.rs` (see (d) below) and `tests/seed_join_allocated.rs`'s own
+//! tests 1/3/5** (see this module's own doc note after (d) for the exact
+//! mapping — tests 3/5 turn out to already be a strict subset of (c)/(a)
+//! respectively, so PR 4 adds no new scenario for either; test 1 is what
+//! (a)'s own extension below (the trailing balance-driven-replica/peers
+//! assertions) exists to cover). `seed_join_allocated.rs` test 2
+//! (concurrent minting) and test 4 (ephemeral-identity restart) stay a
+//! later PR's / permanently out of scope respectively — see that file's
+//! own updated doc.
 //!
 //! **What each scenario proves, and how**:
 //!
@@ -40,14 +49,17 @@
 //!     idempotent no-op (never a collision) — the ADR 0032 same-identity-
 //!     rejoin contract, proven directly against the new relay-based
 //!     `register_node_over_wire_via_relay` sibling rather than a second
-//!     full `join_via_seed` call (this rung's own combined-mode dial only
-//!     ever self-mints, so a literal "the SAME process rejoins" scenario
-//!     needs the explicit-`--id` claim branch `claim_join_identity_via_
-//!     relay` does not build yet — see that function's own doc; C-13 PR 4
-//!     is where `seed_join.rs`'s own `rejoin_same` scenario gets a full
-//!     conversion). A second call with the SAME id but DIFFERENT `addrs`
-//!     is asserted to be a genuine collision, proving the CAS actually
-//!     discriminates rather than always answering "registered."
+//!     full `join_via_seed` call (this rung's own combined-mode self-mint
+//!     dial has no "the SAME process rejoins" shape of its own to call
+//!     twice). A second call with the SAME id but DIFFERENT `addrs` is
+//!     asserted to be a genuine collision, proving the CAS actually
+//!     discriminates rather than always answering "registered." **C-13
+//!     PR 4** builds the explicit-`--id` claim branch this scenario's own
+//!     doc used to flag as missing (`SimCluster::
+//!     join_via_seed_with_explicit_id`) and reuses it, plus a genuine
+//!     `crash`+`restart` (this fixture's own closest analogue to "the
+//!     process goes away and comes back on the same dir"), for a fuller
+//!     rejoin proof against an ACTUAL explicit id — see (d) below.
 //! (c) `data_only_joiner_over_a_split_deployment_gets_a_rebalanced_replica`
 //!     (C-13 PR 3) — the data-only dual of (a), and the sim sibling for the
 //!     real `tests/data_join.rs`'s own scenario: a **split** deployment (3
@@ -83,6 +95,48 @@
 //!     with_replica` doc, restated here) against the pre-existing data
 //!     nodes, proving it a genuine CP-data participant, not just a
 //!     registered-but-inert member.
+//! (d) `explicit_id_joiner_gets_a_balanced_replica_and_survives_a_restart_
+//!     rejoin` (C-13 PR 4) — the sim sibling for the real `tests/
+//!     seed_join.rs`'s own single, eight-step scenario:
+//!     [`SimCluster::join_via_seed_with_explicit_id`] (built this PR), fed
+//!     `id = nid(cluster.node_count())` deliberately — an index-derived id,
+//!     mirroring `seed_join.rs`'s own `animusd::config::node_id(join_
+//!     index)` exactly (never a self-mint), and the ONE choice that keeps
+//!     [`SimCluster::restart`]/[`crash`](SimCluster::crash) usable on the
+//!     joined node afterward (see that method's own doc for why). Asserts,
+//!     mapping onto `seed_join.rs`'s own eight numbered steps: the joiner
+//!     lands at the id it was explicitly given (never minted); promoted
+//!     through the real detector (the same timing proxy as (a)/(c)); a
+//!     real, BALANCE-driven tablet replica (three tables, the identical
+//!     reasoning as (a)'s own extension above) lands on it; bidirectional
+//!     put/get through the joined node's own `ClientCtx` and a pre-existing
+//!     node; every pre-existing node's own peer/route book names the
+//!     joiner and vice versa (`SimCluster::client_route_ids`, the sim-
+//!     native equivalent of `seed_join.rs`'s own `GET /admin/peers` check);
+//!     a genuine collision (the SAME explicit id, DIFFERENT addrs, via
+//!     [`SimCluster::rejoin_same_identity`]) is rejected and leaves the
+//!     cluster's already-written data untouched; and a `crash`+`restart`
+//!     of the joined node (this fixture's own closest analogue to
+//!     `seed_join.rs`'s own literal "shut the process down, start a fresh
+//!     one on the same dir/addrs" — see `SimCluster::restart`'s own doc:
+//!     it reuses the SAME `MemoryTabletEngines` handle, so prior writes
+//!     stay durable across it) is followed by re-registering the identical
+//!     `(id, addrs)` once more, asserting the ADR 0032 rejoin CAS still
+//!     accepts it as a no-op even post-restart.
+//!
+//! **What (d) does NOT need to build, and why**: `tests/seed_join_
+//! allocated.rs`'s own test 5 (`follower_connected_seed_completes_the_
+//! allocate_node_id_round_trip`) turns out to be a strict SUBSET of (a)
+//! — a self-minted combined join via a deliberately follower-only seed,
+//! asserting only the minted-id shape and real-detector promotion, both
+//! already asserted by (a) (which additionally proves the forwarding/
+//! balance/peers properties test 5 never checks) — so PR 4 adds no new
+//! scenario for it. Test 3 (`data_only_allocated_join_becomes_active_
+//! and_gets_a_replica`) is likewise a strict subset of (c) — an identical
+//! 3-control/2-data split deployment, self-minted data-only join, real
+//! replica landing, bidirectional put/get — so PR 4 adds none for it
+//! either. See `tests/seed_join_allocated.rs`'s own updated file doc for
+//! the final per-test disposition table.
 //!
 //! **Why the timing proxy, specifically.** There is no "did this code path
 //! call `propose` for `UpsertMember`" instrumentation hook anywhere in this
@@ -213,8 +267,27 @@ fn run_joiner_discovers_claims_and_is_promoted_by_the_real_detector(seed: u64) {
     let mut cluster = SimCluster::new(seed, 3, 3);
     // Hosted by the pre-existing three nodes only (replication == node
     // count at construction) — the joiner's very own put/get below must
-    // genuinely forward, never resolve locally.
+    // genuinely forward, never resolve locally. Two MORE tables are added
+    // below (`t2`/`t3`, C-13 PR 4) purely so a later step can prove a
+    // BALANCE-driven replica placement too (`tests/seed_join_allocated.rs`'s
+    // own `no_node_join_becomes_active_and_gets_a_replica` shape, three
+    // tables at RF 3 across exactly 3 pre-existing nodes) — a mechanism
+    // distinct from scenario (c)'s own VIOLATION-driven placement (its
+    // under-replicated-from-creation split deployment): with only `t1` at
+    // RF 3 across 3 nodes, one tablet over 4 nodes already sits at
+    // `max - min == 1`, `rebalance_step`'s own convergence threshold
+    // (`crates/animus-placement/CLAUDE.md`), so nothing would ever move —
+    // three tablets over 4 nodes (9 replica-slots, ideal ~2.25/node) is
+    // what actually creates room for a move. `t1` stays the ONE table this
+    // function's own forwarding proof below targets — checked immediately
+    // after promotion, before the later balance-driven poll runs enough
+    // additional virtual time for `t1`'s own tablet to possibly (though
+    // not necessarily) end up moved too; that later movement, if any,
+    // does not retroactively invalidate the point-in-time fact already
+    // asserted below.
     cluster.create_table("t1");
+    cluster.create_table("t2");
+    cluster.create_table("t3");
 
     let follower = cluster.control_follower_index();
     let before_time = cluster.sim_now();
@@ -284,6 +357,42 @@ fn run_joiner_discovers_claims_and_is_promoted_by_the_real_detector(seed: u64) {
         "seed={seed}: put/get through the joined node's own ClientCtx must \
          round-trip (its route tables came straight from JoinInfo discovery)"
     );
+
+    // C-13 PR 4: the two assertions `tests/seed_join_allocated.rs`'s own
+    // `no_node_join_becomes_active_and_gets_a_replica` makes that this
+    // scenario (pre-PR-4) did not — a real, BALANCE-driven tablet replica
+    // eventually lands on the joiner (see this function's own doc on why
+    // three tables, not one, are needed for that to happen at all), and
+    // every pre-existing node's own peer/route book — the sim-native
+    // equivalent of that real test's `GET /admin/peers` check (see
+    // `SimCluster::client_route_ids`'s own doc for why route tables are the
+    // right sim-native substitute) — now names the joiner, in BOTH
+    // directions (the joiner's own table came from discovery, the
+    // pre-existing nodes' via `join_via_seed`'s direct-patch shape).
+    poll_until(
+        &mut cluster,
+        Duration::from_secs(20),
+        seed,
+        "joined combined node gaining a real (balance-driven) tablet replica",
+        |c| !c.hosted_tablets(joined).is_empty(),
+    );
+    for n in 0..cluster.node_count() as u64 {
+        assert!(
+            cluster.client_route_ids(n).contains(&joined_id),
+            "seed={seed}: node {n}'s own client_route must name the joiner \
+             ({joined_id}) — the sim-native equivalent of a real node's own \
+             GET /admin/peers listing it"
+        );
+    }
+    let joiner_routes = cluster.client_route_ids(joined);
+    for n in 0..3u64 {
+        assert!(
+            joiner_routes.contains(&nid(n)),
+            "seed={seed}: the joiner's own client_route (derived straight from its \
+             JoinInfo discovery reply) must name every pre-existing node — missing \
+             node {n} (joiner routes={joiner_routes:?})"
+        );
+    }
 }
 
 #[test]
@@ -575,5 +684,230 @@ fn data_only_joiner_over_a_split_deployment_gets_a_rebalanced_replica() {
 fn data_only_joiner_over_a_split_deployment_gets_a_rebalanced_replica_over_seeds() {
     for &seed in &OVER_SEEDS_C {
         run_data_only_joiner_over_a_split_deployment_gets_a_rebalanced_replica(seed);
+    }
+}
+
+const PRIMARY_SEED_D: u64 = 0xC13E_0004;
+const OVER_SEEDS_D: [u64; 5] = [
+    0xC13E_4001,
+    0xC13E_4002,
+    0xC13E_4003,
+    0xC13E_4004,
+    0xC13E_4005,
+];
+
+/// The three independent tables (d) seeds — mirrors `tests/seed_join.rs`'s
+/// own fixed `TABLES` constant (three, kept for the identical balance-
+/// driven-move reason this module's own doc on scenario (a)'s extension
+/// spells out).
+const SEED_JOIN_TABLES: [&str; 3] = ["seedjoin0", "seedjoin1", "seedjoin2"];
+
+/// (d) `explicit_id_joiner_gets_a_balanced_replica_and_survives_a_restart_
+/// rejoin` — see this module's own doc for the full eight-step mapping onto
+/// `tests/seed_join.rs`'s own real-socket scenario.
+fn run_explicit_id_joiner_gets_a_balanced_replica_and_survives_a_restart_rejoin(seed: u64) {
+    // 1. A plain 3-node combined cluster; three independent tables (hand-
+    // hosted — this cluster is uniformly combined, so `create_table`'s own
+    // `0..replication` shortcut lands every replica on a real node, unlike
+    // (c)'s own mixed-role cluster), each seeded with one write.
+    let mut cluster = SimCluster::new(seed, 3, 3);
+    for table in SEED_JOIN_TABLES {
+        cluster.create_table(table);
+        cluster
+            .put(0, table, "k0", "sk", b"v0")
+            .unwrap_or_else(|e| panic!("seed={seed}: seed put into {table} failed: {e}"));
+    }
+
+    // 2. Join a 4th node via a control FOLLOWER seed (scenario (a)'s own
+    // reasoning), with an EXPLICIT, index-derived id — `nid(3)`, mirroring
+    // `seed_join.rs`'s own `animusd::config::node_id(join_index)` — never a
+    // self-mint (see `join_via_seed_with_explicit_id`'s own doc on why this
+    // specific choice is what keeps `restart`/`crash` usable on this node
+    // later in this same scenario).
+    let seed_node = cluster.control_follower_index();
+    let explicit_id = nid(cluster.node_count() as u64);
+    let before_time = cluster.sim_now();
+    let joined = cluster
+        .join_via_seed_with_explicit_id(seed_node as usize, NodeRole::Both, explicit_id.clone())
+        .unwrap_or_else(|e| panic!("seed={seed}: explicit-id join failed: {e}"));
+    let after_time = cluster.sim_now();
+
+    assert_eq!(
+        joined, 3,
+        "seed={seed}: the joiner should get the next sequential index"
+    );
+
+    // 3. Promoted through the REAL control-leader detector — the identical
+    // timing proxy as (a)/(c) (`join_via_seed_with_explicit_id` proposes no
+    // `UpsertMember` either, by construction — it shares (a)'s own
+    // `finish_join` tail verbatim).
+    let elapsed = after_time.duration_since(before_time);
+    assert!(
+        elapsed >= Duration::from_millis(80),
+        "seed={seed}: promotion resolved in {elapsed:?} of virtual time — \
+         too fast to be genuine heartbeat/detect_loop-driven promotion \
+         (looks like a bypass propose)"
+    );
+    for n in 0..cluster.node_count() as u64 {
+        let status = cluster
+            .metadata(n)
+            .members
+            .get(&explicit_id)
+            .map(|m| m.status);
+        assert_eq!(
+            status,
+            Some(NodeStatus::Active),
+            "seed={seed}: node {n}'s own view of the joiner must show Active"
+        );
+    }
+
+    // 4. A real, BALANCE-driven tablet replica lands on the joiner — the
+    // identical reasoning as scenario (a)'s own extension above (three
+    // tables at RF 3 across exactly 3 pre-existing nodes).
+    poll_until(
+        &mut cluster,
+        Duration::from_secs(20),
+        seed,
+        "explicit-id joiner gaining a balance-driven tablet replica",
+        |c| !c.hosted_tablets(joined).is_empty(),
+    );
+    let hosted_replica: BTreeSet<TabletId> = cluster.hosted_tablets(joined);
+    let hosted_table: &str = SEED_JOIN_TABLES
+        .iter()
+        .copied()
+        .find(|&table| hosted_replica.contains(&tablet_of_table(&cluster, table)))
+        .unwrap_or_else(|| {
+            panic!(
+                "seed={seed}: joined node hosts {hosted_replica:?}, none of which is one of \
+                 this scenario's own tables ({SEED_JOIN_TABLES:?})"
+            )
+        });
+
+    // 5. Reads and writes round-trip both directions through the joined
+    // node's own `ClientCtx` and a pre-existing node.
+    cluster
+        .put(
+            joined,
+            hosted_table,
+            "pk-from-joiner",
+            "sk",
+            b"hello-from-joiner",
+        )
+        .unwrap_or_else(|e| panic!("seed={seed}: put from the joined node ({joined}) failed: {e}"));
+    let got = cluster
+        .get(0, hosted_table, "pk-from-joiner", "sk", true)
+        .unwrap_or_else(|e| panic!("seed={seed}: get from node 0 failed: {e}"));
+    assert_eq!(
+        got.as_deref(),
+        Some(b"hello-from-joiner".as_slice()),
+        "seed={seed}: a put issued from the joined node must be visible from a pre-existing node"
+    );
+
+    cluster
+        .put(
+            0,
+            hosted_table,
+            "pk-from-existing",
+            "sk",
+            b"hello-from-existing",
+        )
+        .unwrap_or_else(|e| panic!("seed={seed}: put from node 0 failed: {e}"));
+    let got2 = cluster
+        .get(joined, hosted_table, "pk-from-existing", "sk", true)
+        .unwrap_or_else(|e| panic!("seed={seed}: get from the joined node ({joined}) failed: {e}"));
+    assert_eq!(
+        got2.as_deref(),
+        Some(b"hello-from-existing".as_slice()),
+        "seed={seed}: a put issued from a pre-existing node must be visible from the joined \
+         node's own ClientCtx"
+    );
+
+    // 6. Every pre-existing node's own peer/route book names the joiner,
+    // and vice versa — the sim-native equivalent of `seed_join.rs`'s own
+    // `GET /admin/peers` check (see `SimCluster::client_route_ids`'s own
+    // doc for why route tables are the right sim-native substitute).
+    for n in 0..3u64 {
+        assert!(
+            cluster.client_route_ids(n).contains(&explicit_id),
+            "seed={seed}: node {n}'s own client_route must name the joiner ({explicit_id})"
+        );
+    }
+    let joiner_routes = cluster.client_route_ids(joined);
+    for n in 0..3u64 {
+        assert!(
+            joiner_routes.contains(&nid(n)),
+            "seed={seed}: the joiner's own client_route must name every pre-existing node — \
+             missing node {n} (joiner routes={joiner_routes:?})"
+        );
+    }
+
+    // 7. Collision: the SAME explicit id with DIFFERENT addrs is rejected
+    // (never silently accepted), and the cluster's already-written data
+    // stays untouched.
+    let mut different_addrs = joined_addrs(&explicit_id);
+    different_addrs.client = format!("{}-different", different_addrs.client);
+    let collision_seed_node = cluster.control_follower_index();
+    let collided = cluster.rejoin_same_identity(
+        collision_seed_node as usize,
+        explicit_id.clone(),
+        different_addrs,
+    );
+    assert!(
+        !collided,
+        "seed={seed}: re-registering the SAME explicit id with DIFFERENT addrs must be a \
+         genuine collision, never accepted"
+    );
+    let still_there = cluster
+        .get(0, hosted_table, "pk-from-joiner", "sk", true)
+        .unwrap_or_else(|e| panic!("seed={seed}: get after the rejected collision failed: {e}"));
+    assert_eq!(
+        still_there.as_deref(),
+        Some(b"hello-from-joiner".as_slice()),
+        "seed={seed}: a rejected collision attempt must leave the cluster's own \
+         already-written data untouched"
+    );
+
+    // 8. Rejoin: `crash`+`restart` the joined node — this fixture's own
+    // closest analogue to `seed_join.rs`'s own literal "shut the process
+    // down, start a fresh one on the same dir/addrs" (`SimCluster::
+    // restart`'s own doc: it reuses the SAME `MemoryTabletEngines` handle,
+    // so prior writes stay durable across it — never wiped the way a naive
+    // rebuild might). Prior data survives, and re-registering the identical
+    // `(id, addrs)` once more is still accepted as a CAS no-op, never a
+    // collision, even post-restart.
+    cluster.crash(joined);
+    cluster.restart(joined);
+    let after_restart = cluster
+        .get(0, hosted_table, "pk-from-joiner", "sk", true)
+        .unwrap_or_else(|e| panic!("seed={seed}: get after crash+restart failed: {e}"));
+    assert_eq!(
+        after_restart.as_deref(),
+        Some(b"hello-from-joiner".as_slice()),
+        "seed={seed}: data written through the joined node must be durable across its own \
+         crash+restart"
+    );
+
+    let rejoin_seed_node = cluster.control_follower_index();
+    let rejoin_addrs = joined_addrs(&explicit_id);
+    let rejoined =
+        cluster.rejoin_same_identity(rejoin_seed_node as usize, explicit_id, rejoin_addrs);
+    assert!(
+        rejoined,
+        "seed={seed}: re-registering the SAME (id, addrs) after a crash+restart must still be \
+         accepted as an idempotent CAS no-op, not a collision"
+    );
+}
+
+#[test]
+fn explicit_id_joiner_gets_a_balanced_replica_and_survives_a_restart_rejoin() {
+    run_explicit_id_joiner_gets_a_balanced_replica_and_survives_a_restart_rejoin(env_seed(
+        PRIMARY_SEED_D,
+    ));
+}
+
+#[test]
+fn explicit_id_joiner_gets_a_balanced_replica_and_survives_a_restart_rejoin_over_seeds() {
+    for &seed in &OVER_SEEDS_D {
+        run_explicit_id_joiner_gets_a_balanced_replica_and_survives_a_restart_rejoin(seed);
     }
 }

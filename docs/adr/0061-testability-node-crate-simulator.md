@@ -10532,3 +10532,183 @@ plus this PR's own 2 new tests, no unreconciled discrepancy this time;
 untouched real-socket production join suites, **6 passed, 0 failed** (1
 in `seed_join.rs`, 5 in `seed_join_allocated.rs`, 10.4s wall), proving
 production stayed byte-identical. `Cargo.lock` unchanged throughout.
+
+## 2026-09-13 amendment — Rung M (post-C-12): seed/join discovery `SimCluster` dispatch (C-13), PR 4 (`seed_join.rs` + `seed_join_allocated.rs` tests 1/3/5) landed
+
+**Mechanism, as built.** One new production-adjacent fixture primitive (the
+explicit-`--id` claim branch PR 2's own doc flagged as unbuilt), one pure
+extraction, one small accessor:
+
+1. **`SimCluster::join_via_seed_with_explicit_id(&mut self, seed_node: usize,
+   role: NodeRole, id: NodeId) -> Result<u64, String>`** — production's OTHER
+   `claim_join_identity` branch (PR 2 built only the self-mint half). Runs
+   the identical discovery phase as `join_via_seed_with_role`, then claims
+   via a SINGLE `register_node_over_wire_via_relay` call for the
+   caller-supplied `id` — no retry-on-collision loop, mirroring
+   `claim_join_identity`'s own explicit branch exactly (ground-truth §1a
+   step 2: "An explicit `--id` calls `register_node_over_wire` once and
+   fails loudly... on a genuine collision"). A genuine collision returns
+   `Err` immediately, before any ctx is pushed or any background loop is
+   spawned — the cluster is left completely unharmed, exactly like a real
+   rejected `run_node_join` call, never a partial/rolled-back state.
+2. **`finish_join`, a new private method, is the shared phase-2 assembly
+   tail** both `join_via_seed_with_role` (self-mint) and
+   `join_via_seed_with_explicit_id` (this PR) now call — a pure move of
+   `join_via_seed_with_role`'s own existing body (route-table patch,
+   `ClientCtx`/background-loop assembly, real-detector-promotion poll) out
+   into its own function, taking `(id, wire_role, control_ids, client_route,
+   intra_route)` as parameters instead of reading them off a closure-local
+   `discovered`. No existing caller's behavior changed by this extraction —
+   confirmed by re-running PR 2/3's own four scenarios (`joiner_discovers_
+   claims_and_is_promoted_by_the_real_detector`/`rejoin_same_identity_is_a_
+   noop`/`data_only_joiner_over_a_split_deployment_gets_a_rebalanced_
+   replica`, each with its `_over_seeds` sibling) unmodified against the
+   refactored code — all still pass.
+3. **`SimCluster::client_route_ids(&self, node: u64) -> BTreeSet<NodeId>`** —
+   a node's own current `client_route` map's key set, the sim-native
+   equivalent of a real node's own `GET /admin/peers` response (this
+   fixture never binds an admin HTTP listener at all, so there is no
+   literal endpoint a converted test could poll against; `client_route`'s
+   own key set IS the underlying data a real `/admin/peers` response is
+   derived from).
+
+**Why `id` must be chosen deliberately — a real, load-bearing finding, not
+assumed up front**: `SimCluster::restart`/`crash` derive `id = nid(node)`
+from the node's own INDEX (unchanged since before this rung). A self-minted
+id already has this structural mismatch, documented as permanently out of
+scope by PR 2's own doc. An explicit id inherits the SAME mismatch UNLESS
+the caller deliberately passes `id = nid(new node's own index)` — i.e. an
+index-derived id, exactly what a real `animusd join --id` operator would
+almost never do by hand, but what `seed_join.rs`'s own real-socket scenario
+does every time (`animusd::config::node_id(join_index)`, the production
+analogue of `nid(index)`) specifically because a same-directory rejoin after
+a restart needs the identical id every time. This PR's own new sim scenario
+(below) exploits exactly this: feeding `nid(cluster.node_count())` as the
+explicit id is what makes `restart`/`crash` on the joined node usable later
+in the SAME scenario, closing the loop `seed_join.rs`'s own "shut down,
+start a fresh process on the same dir/addrs" step needs.
+
+**Two sim additions in `sim_cluster_seed_join.rs`**, both pinned-seed + a
+fixed 5-seed `_over_seeds` sibling:
+
+- **Scenario (a)'s own extension** (`joiner_discovers_claims_and_is_
+  promoted_by_the_real_detector`, PR 2's own combined-mode self-mint
+  scenario): two more tables (three total, matching `seed_join_allocated.
+  rs` test 1's own `TABLES` constant) plus a trailing converged-or-timeout
+  poll for a real BALANCE-driven replica landing on the joiner, and a
+  bidirectional `client_route_ids` check. **Why three tables, not one**: a
+  single table at RF 3 across exactly 3 pre-existing nodes is already at
+  `rebalance_step`'s own `max - min <= 1` convergence threshold the instant
+  a 4th node joins (3 nodes at 1 replica each, 1 node at 0 — diff already
+  1) — nothing would ever move. Three tables (9 replica-slots over 4 nodes,
+  ideal ~2.25/node) creates real imbalance the rebalancer must act on. The
+  scenario's own pre-existing forwarding proof (the joiner has NO local
+  replica of `t1` immediately after promotion) is checked at the SAME point
+  in virtual time as before this PR — unaffected by whatever the LATER
+  balance-driven poll does, since a point-in-time fact does not retroactively
+  become false. This extension is what makes (a) a superset of
+  `seed_join_allocated.rs` test 1 (self-minted combined join, becomes
+  Active, gets a real replica via rebalancing) and, independently, of test 5
+  (an identical self-minted combined join via a deliberately
+  follower-connected seed, asserting strictly less than (a) already does) —
+  both test 1 and test 5 are removed with no new scenario built for either.
+- **A new scenario (d), `explicit_id_joiner_gets_a_balanced_replica_and_
+  survives_a_restart_rejoin`** — the sim sibling for `tests/seed_join.rs`'s
+  own single, eight-step real-socket scenario, mapped one for one: (1) a
+  plain 3-node combined cluster, three tables seeded through a pre-existing
+  node; (2) `join_via_seed_with_explicit_id` via a control-FOLLOWER seed
+  (scenario (a)'s own reasoning for exercising the relay-to-leader path),
+  fed `id = nid(cluster.node_count())`; (3) promoted through the real
+  detector (the same non-instantaneous-elapsed-virtual-time timing proxy as
+  (a)/(c)); (4) a real, balance-driven replica (the identical three-table
+  reasoning as (a)'s own extension); (5) bidirectional put/get through the
+  joined node's own `ClientCtx` and a pre-existing node; (6) the
+  bidirectional `client_route_ids` peer-book check (the sim-native
+  `GET /admin/peers` equivalent, both directions — every pre-existing
+  node's own book names the joiner, and the joiner's own book, derived
+  straight from its `JoinInfo` discovery reply, names every pre-existing
+  node); (7) a genuine collision (the SAME explicit id, DIFFERENT addrs, via
+  the pre-existing `SimCluster::rejoin_same_identity`) rejected, with the
+  cluster's own already-written data left untouched; (8) a `crash`+`restart`
+  of the joined node — this fixture's own closest analogue to `seed_join.
+  rs`'s own literal "shut the process down, start a fresh one on the same
+  dir/addrs" (`restart` reuses the SAME `MemoryTabletEngines` handle, so
+  prior writes stay durable across it, never wiped) — followed by
+  re-registering the identical `(id, addrs)` once more, proving the ADR 0032
+  rejoin CAS still accepts it as a no-op even post-restart.
+
+**What this PR did NOT need to build, and why**: `seed_join_allocated.rs`'s
+own test 5 (`follower_connected_seed_completes_the_allocate_node_id_round_
+trip`) turned out to be a strict SUBSET of (a) once read directly — a
+self-minted combined join via a follower-only seed, asserting only the
+minted-id shape and real-detector promotion, both already asserted by (a),
+which additionally proves the forwarding/balance/peer-book properties test 5
+never checked at all. Test 3 (`data_only_allocated_join_becomes_active_and_
+gets_a_replica`) is likewise a strict subset of PR 3's own scenario (c) — an
+identical 3-control/2-data split deployment, self-minted data-only join,
+real replica landing, bidirectional put/get, all already proven there one PR
+earlier. Neither needed a new scenario.
+
+**File disposition.** `tests/seed_join.rs` (1 test,
+`node_joins_via_seed_with_no_expanded_config`) is **deleted whole** —
+precedent: `data_join.rs` (PR 3), `cluster_split.rs` (C-12). Proven green
+first, per the D3 conversion discipline (`cargo test -p animusd --test
+seed_join --test seed_join_allocated`: 6 passed, 0 failed, 10.4s wall,
+already-built binaries — the identical baseline PR 3's own amendment
+recorded, confirming nothing regressed between PR 3 and PR 4). Every one of
+its eight steps now has a sim sibling in scenario (d) above; `support::
+join_fresh_deadline`/`restart_same_addrs` (shared `tests/support/mod.rs`
+helpers) are still used by several other real-socket files (`drop_table_
+gc.rs`, `control_mirror_restart.rs`, `batch_write.rs`, `advertise_host.rs`,
+`watch_metadata.rs`, `seed_join_hostname.rs`, `control_metadata_restart.rs`,
+`join_data_seed_settings_reach.rs`, `cp_rebalance_gc.rs`, `decommission.rs`,
+`dynamo_schema.rs`, `durable_restart.rs`, `dynamo_streams.rs`, `control_
+membership_split.rs`, `split_cluster.rs` — grep-confirmed), so nothing there
+needed removing.
+
+`tests/seed_join_allocated.rs` is **trimmed from five tests to two** — tests
+1, 3, and 5 removed, along with the helpers only they used
+(`join_data_allocated_fresh`, `call`/`put`/`await_value`/`table_with_
+replica`/`await_replica`, the `TABLES` const, and the `ClientRequest`/
+`ClientResponse`/`read_frame` imports they alone needed — each confirmed
+dead by a full-file grep before removal, not assumed). Tests 2
+(`two_concurrent_allocated_joins_get_distinct_ids`) and 4 (`ephemeral_
+identity_restart_gets_a_new_id_old_left_down_and_prunable`) stay untouched:
+2 needs the dial to run from two concurrent callers racing through the SAME
+mint-retry-on-collision loop — `join_via_seed*` today drives exactly one
+dial per call, so this is genuinely C-13 PR 5's own scope, not something
+this PR's own explicit-id work happens to unblock; 4 is **permanent** — a
+fresh process on a fresh directory minting a genuinely NEW identity in
+place of one that silently vanished has no `SimCluster` analogue
+(`SimCluster::restart` always resumes the SAME node index/id with its
+retained engine, mirroring a real process restarting on the SAME directory
+— structurally the opposite of what test 4 needs to prove). The file's own
+doc comment now states this disposition table directly, so a future reader
+does not have to re-derive it. No `Cargo.toml`/CI-workflow reference to
+either file (`grep` for `seed_join` against `crates/animusd/Cargo.toml` and
+`.github/workflows/*.yml`: no hits).
+
+**Gates, all green, run in the order below**: `cargo build -p animusd --lib
+--tests` clean, zero warnings; `cargo fmt --all --check` clean (one
+rustfmt reflow on this PR's own new code, applied and re-verified clean);
+`cargo clippy --workspace --all-targets --all-features -- -D warnings`
+clean (one `clippy::type_complexity` finding on the explicit-id dial's own
+result-slot type, fixed by naming it `ExplicitJoinDialOutcome` — the same
+"name it, don't nest it inline" idiom `JoinDialOutcome`/`ScanRows`/
+`SimNodeCtx` already established in this file); `cargo test -p animusd
+--lib sim_cluster_seed_join` — **8 passed, 0 failed** (PR 2's 4 plus PR 3's
+2 plus this PR's new 2), run twice, identical both times (17.8s, 17.7s
+wall); `cargo test -p animusd --lib sim_cluster -- --test-threads=2` — the
+full deterministic tier, **575 passed, 0 failed, 2 ignored, 182 filtered
+out, finished in 1348.39s** (22m28.6s wall) — exactly PR 3's own recorded
+baseline of 573 plus this PR's own 2 new tests (the (a) extension added no
+new test *functions*, only more assertions inside the existing two), no
+unreconciled discrepancy; `cargo test -p animusd --test seed_join_
+allocated` (the trimmed file, tests 2/4 only) — **2 passed, 0 failed,
+1.41s**, both pre-existing tests unaffected by the trim. `Cargo.lock`
+unchanged throughout.
+
+**Docs:** this amendment; `docs/roadmap.md`'s C-13 ladder/status lines
+(PR 4 flipped to landed); `crates/animusd/CLAUDE.md`'s consolidated
+appendix, a new "C-13 PR 4" entry with the mechanism, the file dispositions,
+and the two-scenario mapping table.

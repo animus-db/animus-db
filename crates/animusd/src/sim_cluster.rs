@@ -562,6 +562,14 @@ struct DiscoveredJoinInfo {
 /// own precedent elsewhere in this file for the identical reason.
 type JoinDialOutcome = Result<(NodeId, NodeAddrs, DiscoveredJoinInfo), String>;
 
+/// **C-13 / ADR 0061 rung M PR 4**: [`SimCluster::join_via_seed_with_
+/// explicit_id`]'s own Phase 1 dial result — the explicit-id claim's
+/// [`RegisterOutcome`] (`Registered`/`Collision`) instead of a claimed
+/// `(NodeId, NodeAddrs)` pair (already known to the caller, never chosen by
+/// the dial itself), otherwise the identical shape as [`JoinDialOutcome`]
+/// for the identical clippy `type_complexity` reason.
+type ExplicitJoinDialOutcome = Result<(RegisterOutcome, DiscoveredJoinInfo), String>;
+
 /// Virtual-time budget [`SimCluster::join_via_seed`] drives the simulator
 /// forward while its own discovery+claim dial task runs — generous enough
 /// to comfortably clear two back-to-back [`JOIN_DISCOVERY_BUDGET`] windows
@@ -2756,6 +2764,28 @@ impl SimCluster {
     /// name means by "a fresh fetch."
     pub(crate) fn control_voters(&self, node: u64) -> Option<BTreeSet<NodeId>> {
         self.shared.ctx(node).control.config()
+    }
+
+    /// **C-13 / ADR 0061 rung M PR 4**: `node`'s own current `client_route`
+    /// map's key set — the sim-native equivalent of a real node's own
+    /// `GET /admin/peers` response (this fixture never binds an admin HTTP
+    /// listener at all, so there is no literal endpoint a converted test
+    /// could poll; `client_route`'s own key set IS the underlying data that
+    /// response is derived from on a real node — every node this one
+    /// currently knows how to route a client request to). See
+    /// [`join_via_seed_with_role`](Self::join_via_seed_with_role)'s own doc
+    /// on the route-table fork for how a joiner's entry lands here (a
+    /// direct patch on every pre-existing node) and how the joiner's own
+    /// map is populated (derived from its `JoinInfo` discovery reply).
+    pub(crate) fn client_route_ids(&self, node: u64) -> BTreeSet<NodeId> {
+        self.shared
+            .ctx(node)
+            .client_route
+            .lock()
+            .expect("client route poisoned")
+            .keys()
+            .cloned()
+            .collect()
     }
 
     /// `node`'s own view of the replicated control-plane `Metadata` —
@@ -5066,13 +5096,187 @@ impl SimCluster {
                     self.sim.seed()
                 )
             });
+        self.finish_join(
+            id,
+            wire_role,
+            discovered.control_ids,
+            discovered.client_route,
+            discovered.intra_route,
+        )
+    }
+
+    /// **C-13 / ADR 0061 rung M PR 4: the explicit-`--id` claim branch** —
+    /// production's OTHER `claim_join_identity` branch
+    /// ([`join_via_seed_with_role`](Self::join_via_seed_with_role) above
+    /// builds only the self-mint half, PR 2's own documented scope). Runs
+    /// the identical discovery phase, then claims via a SINGLE
+    /// [`register_node_over_wire_via_relay`] call for the CALLER-SUPPLIED
+    /// `id` (addresses always `id.to_string()`, the same fixed convention
+    /// [`claim_join_identity_via_relay`] uses) — no retry-on-collision loop,
+    /// mirroring `claim_join_identity`'s own explicit branch exactly
+    /// (ground-truth §1a step 2: "An explicit `--id` calls
+    /// `register_node_over_wire` once and fails loudly (`AlreadyExists`) on
+    /// a genuine collision"). A genuine collision returns `Err` immediately
+    /// — no ctx pushed, no background loop spawned, `self.nodes` unchanged,
+    /// the cluster left completely unharmed, exactly like a real rejected
+    /// `run_node_join` call. On success, finishes identically to
+    /// [`join_via_seed_with_role`](Self::join_via_seed_with_role)'s own
+    /// phase 2 via the shared [`finish_join`](Self::finish_join) tail (real
+    /// detector-driven promotion, discovery-derived route tables for the
+    /// new node, `grow`'s own direct-patch shape for every existing node).
+    ///
+    /// **Choose `id` deliberately** — unlike a self-minted id,
+    /// [`SimCluster::restart`]/[`crash`](Self::crash) remain usable on the
+    /// returned node's index ONLY if `id == nid(seed_node_returned_index)`
+    /// (i.e. the caller passes `animus_env::nid(self.node_count() as u64)`
+    /// as `id`, the same index the join is about to occupy) — `restart`'s
+    /// own `id = nid(node)` derivation
+    /// ([`join_via_seed_with_role`](Self::join_via_seed_with_role)'s own
+    /// doc, "What this does NOT prove") only matches reality when `id`
+    /// itself is index-derived; any OTHER explicit `id` (a real operator
+    /// picking their own free-form string) hits the identical structural
+    /// mismatch the self-mint arm already documents. This mirrors
+    /// `tests/seed_join.rs`'s own real-socket scenario, whose explicit
+    /// `--id` is always `animusd::config::node_id(join_index)` — the
+    /// production analogue of `nid(index)` — for exactly this reason: a
+    /// same-directory rejoin after a restart needs the SAME id every time,
+    /// which an index-derived scheme gives for free.
+    pub(crate) fn join_via_seed_with_explicit_id(
+        &mut self,
+        seed_node: usize,
+        role: NodeRole,
+        id: NodeId,
+    ) -> Result<u64, String> {
+        let wire_role = match role {
+            NodeRole::Both => "combined",
+            NodeRole::Data => "data",
+            NodeRole::Control => panic!(
+                "join_via_seed_with_explicit_id(seed_node={seed_node}, id={id}): NodeRole::\
+                 Control is not supported — see join_via_seed_with_role's own identical \
+                 panic message (seed={})",
+                self.sim.seed()
+            ),
+        };
         let addr = id.to_string();
-        let control_ids = discovered.control_ids;
+        let claim_addrs = NodeAddrs {
+            internal: addr.clone(),
+            client: addr.clone(),
+            intra: addr.clone(),
+            admin: addr,
+            role: wire_role.to_owned(),
+        };
+
+        // A throwaway pre-bind identity/env/relay, exactly like
+        // `join_via_seed_with_role`'s own Phase 1 — see that method's own
+        // doc for why this is never registered as a real node.
+        let mint_id = nid(self.nodes as u64);
+        let mint_env = self.sim.env(mint_id);
+        let mint_relay: SimRelayClient<SimEnv> = SimRelayClient::new(mint_env.clone());
+        let discovery_seeds: Vec<String> = vec![nid(seed_node as u64).to_string()];
+
+        let outcome: Arc<Mutex<Option<ExplicitJoinDialOutcome>>> = Arc::new(Mutex::new(None));
+        let out = outcome.clone();
+        let dial_env = mint_env.clone();
+        let dial_relay = mint_relay.clone();
+        let dial_seeds = discovery_seeds.clone();
+        let claim_id = id.clone();
+        mint_env.spawn_task(async move {
+            let result = async {
+                let (control_ids, _peers, client_route, intra_route, _admin_addrs) =
+                    discover_join_info_via_relay(&dial_env, &dial_relay, &dial_seeds).await?;
+                let register_outcome = register_node_over_wire_via_relay(
+                    &dial_env,
+                    &dial_relay,
+                    &dial_seeds,
+                    &claim_id,
+                    &claim_addrs,
+                    &BTreeMap::new(),
+                )
+                .await?;
+                Ok((
+                    register_outcome,
+                    DiscoveredJoinInfo {
+                        control_ids,
+                        client_route,
+                        intra_route,
+                    },
+                ))
+            }
+            .await;
+            *out.lock()
+                .expect("explicit-id join dial result slot poisoned") = Some(result);
+        });
+        self.sim.run_for(JOIN_DIAL_DRIVE_BUDGET);
+        let (register_outcome, discovered) = outcome
+            .lock()
+            .expect("explicit-id join dial result slot poisoned")
+            .take()
+            .unwrap_or_else(|| {
+                panic!(
+                    "join_via_seed_with_explicit_id(seed_node={seed_node}, id={id}): dial task \
+                     did not complete within {JOIN_DIAL_DRIVE_BUDGET:?} (seed={})",
+                    self.sim.seed()
+                )
+            })
+            .unwrap_or_else(|e| {
+                panic!(
+                    "join_via_seed_with_explicit_id(seed_node={seed_node}, id={id}): dial \
+                     failed: {e} (seed={})",
+                    self.sim.seed()
+                )
+            });
+        match register_outcome {
+            RegisterOutcome::Collision => {
+                return Err(format!(
+                    "join_via_seed_with_explicit_id(seed_node={seed_node}, id={id}): explicit \
+                     id already claimed by a different registration — a genuine collision, \
+                     mirroring claim_join_identity's own loud AlreadyExists failure (no retry, \
+                     seed={})",
+                    self.sim.seed()
+                ));
+            }
+            RegisterOutcome::Registered => {}
+        }
+
+        Ok(self.finish_join(
+            id,
+            wire_role,
+            discovered.control_ids,
+            discovered.client_route,
+            discovered.intra_route,
+        ))
+    }
+
+    /// **C-13 / ADR 0061 rung M PR 4**: the shared phase-2 assembly tail
+    /// both [`join_via_seed_with_role`](Self::join_via_seed_with_role) (the
+    /// self-mint arm) and
+    /// [`join_via_seed_with_explicit_id`](Self::join_via_seed_with_explicit_id)
+    /// (the explicit-`--id` arm) call once their own claim phase has
+    /// resolved an already-registered `(id, control_ids, client_route,
+    /// intra_route)` — extracted verbatim from PR 2/3's own single-arm
+    /// method (a pure move, no behavior change for any existing caller):
+    /// patches every EXISTING node's route tables directly (`grow`'s own
+    /// shortcut), builds the new node's OWN route tables from the discovery
+    /// reply, assembles its real `ClientCtx`/background loops (`Remote`
+    /// control handle, reconciler, heartbeat, TTL reaper, mirror-sync —
+    /// see `join_via_seed_with_role`'s own doc for the full "why `Remote`,
+    /// not `Local`" reasoning), and converges on the REAL detector's own
+    /// promotion — never a bypass propose of any kind.
+    fn finish_join(
+        &mut self,
+        id: NodeId,
+        wire_role: &'static str,
+        control_ids: Vec<NodeId>,
+        discovered_client_route: BTreeMap<NodeId, String>,
+        discovered_intra_route: BTreeMap<NodeId, String>,
+    ) -> u64 {
+        let new_n = self.nodes as u64;
+        let addr = id.to_string();
         let control_seed_addrs: Vec<String> = control_ids.iter().map(NodeId::to_string).collect();
 
         // Patch every EXISTING node's own route tables with the new node's
-        // entry — `grow`'s own shortcut, unchanged (see this method's own
-        // doc on the route-table fork).
+        // entry — `grow`'s own shortcut, unchanged (see
+        // `join_via_seed_with_role`'s own doc on the route-table fork).
         for n in 0..self.nodes as u64 {
             let existing = self.shared.ctx(n);
             existing
@@ -5088,16 +5292,18 @@ impl SimCluster {
         }
         // The NEW node's own route tables: derived from the discovery
         // reply, merged with its own entry — the real ADR 0032 discovery
-        // contract (see this method's own doc on the route-table fork).
-        let mut client_route = discovered.client_route;
-        let mut intra_route = discovered.intra_route;
+        // contract (see `join_via_seed_with_role`'s own doc on the
+        // route-table fork).
+        let mut client_route = discovered_client_route;
+        let mut intra_route = discovered_intra_route;
         client_route.insert(id.clone(), addr.clone());
         intra_route.insert(id.clone(), addr.clone());
 
         // Phase 2 (sync): build this node's real env/relay/ClientCtx under
         // its own claimed identity and wire up the same background loops
-        // `grow` already builds for a `Remote`-controlled node — see this
-        // method's own doc for why `Remote`, not production's `Local`.
+        // `grow` already builds for a `Remote`-controlled node — see
+        // `join_via_seed_with_role`'s own doc for why `Remote`, not
+        // production's `Local`.
         let env = self.sim.env(id.clone());
         let relay: SimRelayClient<SimEnv> = SimRelayClient::new(env.clone());
         let remote = GenericRemoteControlClient::new(
