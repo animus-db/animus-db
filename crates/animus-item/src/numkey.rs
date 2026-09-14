@@ -227,6 +227,32 @@ pub fn encode(n: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// DynamoDB's documented maximum number of significant digits for an `N`
+/// value (`docs/adr/0063-*.md`'s Context). **[`encode`] itself does not
+/// enforce this** — its own domain is deliberately wider than AWS's actual
+/// `N` contract, so the differential-test generators below can push a
+/// digit run past 38 without tripping this codec's own ordering/round-trip
+/// properties (those hold for *any* representable digit run, not just
+/// AWS-legal ones). A caller that must reject text AWS itself would reject
+/// (the wire decode boundary, `animus-dynamo::wire`'s `"N"` arm) needs
+/// [`encode_checked`], not `encode` alone.
+pub const MAX_SIGNIFICANT_DIGITS: usize = 38;
+
+/// Validate `n` as a well-formed DynamoDB `N` value end-to-end — both this
+/// codec's own grammar (whatever [`encode`] can represent) and DynamoDB's
+/// own documented [`MAX_SIGNIFICANT_DIGITS`] cap, which `encode` alone does
+/// not check (see that constant's doc). `None` for anything either check
+/// would reject; `Some` carries the same bytes [`encode`] would have
+/// produced, so a caller can use this as its sole validate-and-encode step.
+#[must_use]
+pub fn encode_checked(n: &str) -> Option<Vec<u8>> {
+    let (_, _, digits) = canonicalize(n)?;
+    if digits.len() > MAX_SIGNIFICANT_DIGITS {
+        return None;
+    }
+    encode(n)
+}
+
 /// Render a canonical `(negative, exp, digits)` triple back to decimal text
 /// that [`super::condition`]'s `decimal_parts`/`compare_numeric` (and
 /// `bigdecimal::BigDecimal::from_str`) both accept: plain fixed-point text,
@@ -437,6 +463,46 @@ mod tests {
             None,
             "missing terminator"
         );
+    }
+
+    #[test]
+    fn encode_checked_rejects_malformed_text_encode_alone_would_also_reject() {
+        for bad in ["12a", "", "-", ".", "1.2.3", "1e", "abc"] {
+            assert_eq!(encode(bad), None, "encode({bad:?}) should already reject");
+            assert_eq!(
+                encode_checked(bad),
+                None,
+                "encode_checked({bad:?}) should reject"
+            );
+        }
+    }
+
+    #[test]
+    fn encode_checked_enforces_the_38_significant_digit_cap_encode_alone_does_not() {
+        let at_cap = "9".repeat(MAX_SIGNIFICANT_DIGITS);
+        assert!(
+            encode(&at_cap).is_some(),
+            "encode should succeed at exactly the cap"
+        );
+        assert!(
+            encode_checked(&at_cap).is_some(),
+            "encode_checked should succeed at exactly the cap"
+        );
+
+        let over_cap = "9".repeat(MAX_SIGNIFICANT_DIGITS + 1);
+        assert!(
+            encode(&over_cap).is_some(),
+            "encode alone has no digit-count cap of its own"
+        );
+        assert_eq!(
+            encode_checked(&over_cap),
+            None,
+            "encode_checked must reject more than {MAX_SIGNIFICANT_DIGITS} significant digits"
+        );
+
+        // Leading zeros don't count toward the significant-digit total.
+        let padded = format!("{}{}", "0".repeat(10), at_cap);
+        assert!(encode_checked(&padded).is_some());
     }
 
     #[test]
