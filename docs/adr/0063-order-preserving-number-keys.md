@@ -322,3 +322,38 @@ sequence across pages still would not be a global numeric order, since the
 the only fix that makes the on-disk order and the numeric order the same
 thing, which is what makes windowed pagination correct by construction
 rather than by a per-call patch.
+
+## Amendment: the wire layer never actually validated `N` before storing it (issue #846, fixed)
+
+This ADR's `key_bytes`/`numkey::encode` design assumed a well-formed `N`
+always reaches the encoder — `numkey::encode` returning `None` was
+documented as describing input that "no valid DynamoDB `N` ever has," and
+`AttributeValue::key_bytes`'s raw-ASCII fallback for that case was commented
+as unreachable from wire input. That premise was never actually enforced:
+`animus_dynamo::wire::decode_attribute_value`'s `"N"` arm accepted *any*
+JSON string with no format check at all, so a malformed value (`{"N":
+"12a"}`) reached `key_bytes` directly from an ordinary `PutItem`/
+`UpdateItem`/`BatchWriteItem`/`TransactWriteItems` call, fell into the
+raw-ASCII fallback, and corrupted the stored key order for every
+well-formed numeric neighbour in the same partition/index — exactly the
+scan-order guarantee this ADR exists to provide.
+
+Fixed by validating at the one place `N` text enters the system: the
+`"N"` decode arm now calls a new `numkey::encode_checked`, which layers
+DynamoDB's own 38-significant-digit cap (`numkey::MAX_SIGNIFICANT_DIGITS`)
+on top of `encode`'s own grammar check — `encode` alone never enforced
+that cap, since its own domain is deliberately wider than AWS's `N`
+contract (see the module's own updated doc). A malformed or over-long `N`
+is now rejected with a decode-time `ValidationException`, matching real
+DynamoDB's `SerializationException` posture for this input class close
+enough that no wire-reachable value can ever again reach `key_bytes`'s
+fallback. `key_bytes`'s own comment was corrected to state the true
+invariant (wire-validated input is the *intended* path, not a guarantee
+the type system enforces — the fallback is now stated as defensive against
+a future non-wire caller, not as literally unreachable) rather than
+re-asserting the premise this issue found false. See
+`crates/animus-item/src/numkey.rs` and `crates/animus-dynamo/src/wire.rs`'s
+`"N"` decode arm for the implementation, and `docs/engineering-lessons.md`
+for the general lesson (a "should never happen because an earlier layer
+validates it" comment is a claim, not a guarantee — verify the earlier
+layer actually does before trusting it as a safety net).
