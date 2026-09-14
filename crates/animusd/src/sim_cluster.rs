@@ -4772,14 +4772,16 @@ impl SimCluster {
     /// **ADR 0061 rung D4 PR 4: add a node after construction** — the one
     /// piece of ADR 0030/0032 growth/decommission machinery [`SimCluster::
     /// new`] structurally cannot exercise (the module doc's own "the whole
-    /// node set is known at construction" note). `role` must be `"data"`
-    /// today — a `"combined"` growth node (a new control-plane voter, via
-    /// `change_membership`/`admin_add_control_member`) was scoped for this
-    /// rung and deferred: it needs a genuinely new `RaftNode<SimEnv>` joining
-    /// the **live** control quorum (`self.controls` growing, not just
-    /// `self.nodes`), which is a materially different — and separately
-    /// budgeted — piece of machinery than a data-only node's `ControlHandle::
-    /// Remote` mirror. Returns the new node's own `u64` index (always
+    /// node set is known at construction" note). `role` is `"data"`
+    /// (data-only growth, this method's own original scope) or `"combined"`
+    /// (ADR 0061 rung N, C-14 PR 4 — a new control-plane voter, via
+    /// `change_membership`/`admin_add_control_member`, that ALSO carries a
+    /// full data role; dispatches straight to [`SimCluster::grow_combined`],
+    /// see that method's own doc for the mechanism — it needed no new
+    /// design, only composing [`SimCluster::grow_control`]'s own real
+    /// control-voter admission with this method's own data-role assembly
+    /// below, since the two are structurally independent axes). Returns the
+    /// new node's own `u64` index (always
     /// `self.node_count()` as observed just before this call — indices are
     /// **never reused**, even across a later [`SimCluster::remove`] of a
     /// different node, since this fixture only ever appends).
@@ -4821,11 +4823,14 @@ impl SimCluster {
     /// very next op issued from the new node, or targeting it, can rely on
     /// that being true.
     pub(crate) fn grow(&mut self, role: &str) -> u64 {
+        if role == "combined" {
+            return self.grow_combined();
+        }
         assert_eq!(
             role, "data",
-            "SimCluster::grow supports role=\"data\" (data-only growth) \
-             only today — a \"combined\" (new control-plane voter) growth \
-             node is deferred, see this method's own doc"
+            "SimCluster::grow supports role=\"data\" (data-only growth) and \
+             role=\"combined\" (dispatches to SimCluster::grow_combined) only — \
+             see this method's own doc"
         );
         let new_n = self.nodes as u64;
         let id = nid(new_n);
@@ -5421,6 +5426,356 @@ impl SimCluster {
         new_n
     }
 
+    /// **ADR 0061 rung N, C-14 PR 4: combined (`NodeRole::Both`) control-
+    /// plane voter growth** — a straightforward composition of
+    /// [`SimCluster::grow`]'s own data-role assembly (full `ClientCtx`/
+    /// `DataRole`/reconciler/heartbeat/TTL-reaper/auto-split, the fixture's
+    /// own `RegisterNode`+`UpsertMember{Active}` control-plane-bypass
+    /// self-registration) with [`SimCluster::grow_control`]'s own real
+    /// control-voter admission (a fresh, lone standalone `RaftNode<SimEnv>`,
+    /// the real `POST /admin/control/member/add` route, converged-or-
+    /// timeout on `control_voters`). **This needed no new design** — the
+    /// two are structurally INDEPENDENT axes in this fixture exactly as they
+    /// are in production (ADR 0061's "Rung N (post-C-13)" PR 1 opener §1:
+    /// `Metadata::members`/`node_addrs` registration and a node's own local
+    /// `RaftCore` becoming a live control-plane VOTER are two unrelated
+    /// mechanisms — a data-only node is a registered, `Active` member that
+    /// is NEVER a control voter; `grow_control`'s own control-only node is
+    /// a real voter that NEVER claims a `members` row), so composing them
+    /// is exactly this method's own body, nothing more.
+    ///
+    /// **Registration reuses [`SimCluster::grow`]'s own bypass verbatim**
+    /// (propose `RegisterNode{role: "combined"}` + `UpsertMember{Active}`
+    /// directly on the current control leader's own in-process handle)
+    /// rather than [`SimCluster::grow_control`]'s real relayed dial — a
+    /// combined node needs a `members` row (unlike a control-only one,
+    /// which deliberately never claims one), and the fixture already has a
+    /// working, tested mechanism for exactly that registration shape.
+    /// **Admission reuses `grow_control`'s real admin path verbatim** — a
+    /// fresh `RaftNode<SimEnv>` (this node's own live control core,
+    /// `ControlHandle::Local`, its own `self.controls`/`control_index`/
+    /// `control_node_ids` bookkeeping and its own three control-plane-
+    /// leader-gated janitors), then `POST /admin/control/member/add` and a
+    /// poll on `control_voters`.
+    ///
+    /// **Ordering mirrors production's own real sequence** (ADR 0061's PR 1
+    /// opener §1: a combined node self-registers at boot; an operator's own
+    /// `control-add` admits it as a voter, strictly later, as a separate
+    /// action) — registration (and the data-role/reconciler/heartbeat/
+    /// TTL-reaper/auto-split assembly that goes with it) happens first,
+    /// admission second. Neither ordering choice was actually load-bearing
+    /// (the two axes never interact — admission does not require the node
+    /// to already host anything, and hosting does not require the node to
+    /// already be a voter, since `ControlHandle::Local` on a non-voter core
+    /// still answers reads correctly via `effective_metadata()`), but this
+    /// order is the one a real deployment would follow.
+    ///
+    /// `self.roles.push(NodeRole::Both)` — [`SimCluster::restart`] already
+    /// handles a control-bearing `NodeRole::Both` node correctly (its
+    /// `role.has_data()`/`role.has_control()` gates, unchanged by this PR)
+    /// since ADR 0061 rung L, C-12 PR 2/3 built that dispatch generically,
+    /// never assuming every control-bearing node is control-only — this
+    /// method is the first caller to actually exercise the `Both` half of
+    /// that pre-existing support, and it needed no `restart`/`crash` change
+    /// at all. Returns the new node's own `u64` index.
+    pub(crate) fn grow_combined(&mut self) -> u64 {
+        let new_n = self.nodes as u64;
+        let id = nid(new_n);
+        let addr = id.to_string();
+
+        // The CURRENT live control-bearing voter set — `self` is NOT in it
+        // yet. Both the fresh `RaftNode`'s own starting membership (a lone
+        // non-voter, mirroring `grow_control`) and the heartbeat loop's own
+        // target list (mirroring `grow`'s "heartbeat the pre-growth voter
+        // set" reasoning below).
+        let control_ids: Vec<NodeId> = self.control_node_ids.iter().copied().map(nid).collect();
+
+        // Patch every EXISTING node's own route tables with the new node's
+        // entry — `grow`/`grow_control`'s own shared one-shot patch (see
+        // either method's own doc for why this suffices here).
+        for n in 0..self.nodes as u64 {
+            let existing = self.shared.ctx(n);
+            existing
+                .client_route
+                .lock()
+                .expect("client route poisoned")
+                .insert(id.clone(), addr.clone());
+            existing
+                .intra_route
+                .lock()
+                .expect("intra route poisoned")
+                .insert(id.clone(), addr.clone());
+        }
+        let route: BTreeMap<NodeId, String> = self
+            .shared
+            .ctx(0)
+            .client_route
+            .lock()
+            .expect("client route poisoned")
+            .clone();
+
+        let env = self.sim.env(id.clone());
+        let relay: SimRelayClient<SimEnv> = SimRelayClient::new(env.clone());
+
+        // The fresh, lone standalone control-plane core — identical
+        // construction to `grow_control`'s own.
+        let fresh_control: RaftNode<SimEnv> = RaftNode::start_with_metrics(
+            env.clone(),
+            control_ids.clone(),
+            MetricsHandle::recording(),
+            MemoryEngine::new(),
+        );
+        let control = GenericControlHandle::Local(fresh_control.clone());
+        let edge = ClusterEdgeState::<SimEnv>::new();
+        // `grow_control`'s own convention — every control-bearing node
+        // registers its OWN control handle onto its OWN edge, so
+        // `ClientCtx::propose_schema`'s local fast path works.
+        edge.register_control(fresh_control.clone());
+
+        let admin = Arc::new(AdminInfo {
+            auto_split_ops_rate_threshold: None,
+            throttle_read_units: None,
+            throttle_write_units: None,
+            node_id: Some(id.clone()),
+            internal_addr: Some(placeholder_addr()),
+            client_addr: placeholder_addr(),
+            dynamo_addr: None,
+            admin_addr: placeholder_addr(),
+            role: "combined",
+            control_ids: control_ids.clone(),
+            peers: BTreeMap::new(),
+            admin_addrs: vec![placeholder_addr()],
+            auto_split_bytes_threshold: None,
+            backup_store: None,
+            segment_store: None,
+            quiesce_after_ms: None,
+            auth_enabled: None,
+            auth_access_key_ids: None,
+            otlp_endpoint: None,
+        });
+
+        let ctx: SimNodeCtx = ClientCtx {
+            control,
+            edge: edge.clone(),
+            env: env.clone(),
+            // `NodeRole::Both` — the full data role `grow`'s own assembly
+            // builds, unlike `grow_control`'s deliberate `data: None`.
+            data: Some(DataRole {
+                raftkv_metrics: MetricsHandle::recording(),
+                base_id: id.clone(),
+                stream_seal_knobs: StreamSealKnobs::default(),
+                change_rates: ChangeRateTracker::default(),
+                request_rates: RequestRateTracker::default(),
+            }),
+            segment_store: SegmentStoreHandle::S3(Arc::new(self.segment_store.clone())),
+            backup_store: BackupStoreHandle::S3(Arc::new(self.backup_store.clone())),
+            export_store_factory: Arc::new(Mutex::new(default_export_store_factory(None))),
+            backup_janitor_progress: Arc::new(Mutex::new(
+                animus_node::backup_janitor::JanitorProgress::default(),
+            )),
+            ttl_reaper_progress: Arc::new(Mutex::new(
+                animus_node::ttl_reaper::TtlReaperProgress::default(),
+            )),
+            segment_janitor_progress: Arc::new(Mutex::new(
+                segment_janitor::SegmentJanitorProgress::default(),
+            )),
+            client_route: Arc::new(Mutex::new(route.clone())),
+            intra_route: Arc::new(Mutex::new(route)),
+            admin,
+            metrics_history: Arc::new(Mutex::new(VecDeque::new())),
+            remote_metadata: Arc::new(Mutex::new(None)),
+            control_storage: None,
+            dynamo_auth: None,
+            tls: None,
+            relay: relay.clone(),
+            throttle: ThrottleTracker::new(),
+            throttle_defaults: Arc::new(ThrottleDefaults::default()),
+            any_table_throughput: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+
+        let ctx_for_server = ctx.clone();
+        relay.serve(move |req| {
+            let ctx = ctx_for_server.clone();
+            async move { forwarding::handle_relayed_request(&ctx, req).await }
+        });
+
+        self.shared.push_ctx(ctx.clone());
+        self.engines.push(MemoryTabletEngines::new());
+        self.roles.push(NodeRole::Both);
+        self.nodes += 1;
+
+        // Register the fresh core into this fixture's own id/index map and
+        // `self.controls` vec — `grow_control`'s own step 2, unchanged.
+        let new_index = self.controls.len();
+        self.control_index.insert(new_n, new_index);
+        self.control_node_ids.push(new_n);
+        self.controls.push(fresh_control);
+
+        // Self-registration: the SAME control-plane bypass `SimCluster::
+        // grow`/`seed_members` use — `RegisterNode{role: "combined"}` +
+        // `UpsertMember{Active}`, proposed directly on the CURRENT control
+        // leader (a vec index; the fresh core pushed above cannot possibly
+        // be leader yet — it isn't even a voter — so this scan is safe
+        // regardless of push order).
+        let leader = self.control_leader_index();
+        let addrs = NodeAddrs {
+            internal: addr.clone(),
+            client: addr.clone(),
+            intra: addr.clone(),
+            admin: addr,
+            role: "combined".to_owned(),
+        };
+        assert!(
+            matches!(
+                self.controls[leader].propose(MetaCommand::RegisterNode {
+                    node: id.clone(),
+                    addrs,
+                    labels: BTreeMap::new(),
+                }),
+                ProposeResult::Accepted { .. }
+            ),
+            "RegisterNode must be accepted by the current control leader (grow_combined node={new_n})"
+        );
+        assert!(
+            matches!(
+                self.controls[leader].propose(MetaCommand::UpsertMember {
+                    node: id.clone(),
+                    labels: BTreeMap::new(),
+                    status: NodeStatus::Active,
+                }),
+                ProposeResult::Accepted { .. }
+            ),
+            "UpsertMember must be accepted by the current control leader (grow_combined node={new_n})"
+        );
+
+        // Advance virtual time before the admission call below reads back
+        // `Metadata` (the propose-then-observe lesson, `docs/engineering-
+        // lessons.md` — mirrors `sim_cluster_backup_janitor.rs`'s own
+        // propose-then-crash finding and `sim_cluster_growth.rs`'s own
+        // scenario (d)): `propose()` above only appends to the leader's own
+        // local LOG — it commits (majority replication) and applies (ADR
+        // 0038's async apply task) only once the Raft driver actually runs,
+        // which needs real virtual time to happen. `admin_add_control_
+        // member`'s own read-your-writes barrier bound-waits on `engine_
+        // applied_index() >= commit_index()` captured at ITS OWN call
+        // start — with zero time advanced between the proposes above and
+        // that call, `commit_index()` can be read before these two entries
+        // have even committed, so the barrier catches up to a commit index
+        // that doesn't yet include them, the node reads as "genuinely
+        // unclaimed," and the admission call's own retry-on-collision loop
+        // (`MAX_CLAIM_REFRESH_ATTEMPTS`) races this registration to a
+        // permanent, wrong "already claimed by a different registration"
+        // refusal (found live authoring this method's own test, not by
+        // inspection). A short, generous margin — comfortably past one
+        // heartbeat/commit round trip — gives both proposes a real chance
+        // to reach the surviving majority and apply before anything reads
+        // `Metadata` again.
+        self.sim.run_for(Duration::from_millis(300));
+
+        // Heartbeat the pre-growth control voter set — load-bearing, the
+        // identical `grow`/`grow_control` reasoning: a member with no
+        // heartbeat loop running flips back to `Down` within
+        // `DETECT_TIMEOUT` of the control group's own failure detector.
+        let hb_env = env.clone();
+        hb_env.spawn_task(animus_control::node::heartbeat_loop(
+            hb_env.clone(),
+            control_ids,
+        ));
+
+        // The real per-node tablet-host reconciler — `grow`'s own data-role
+        // assembly, unchanged.
+        let mut reconciler = build_reconciler(
+            env.clone(),
+            self.engines[new_n as usize].clone(),
+            id.clone(),
+            edge,
+        );
+        if let Some(after) = self.cp_quiesce_after {
+            reconciler.enable_quiescence(after);
+        }
+        spawn_reconciler_loop(ctx.clone(), reconciler);
+
+        // Control-plane-leader-only janitors — `grow_control`'s own gate:
+        // this node genuinely can become control-plane leader the moment
+        // it's a real voter.
+        let janitor_env = env.clone();
+        janitor_env.spawn_task(backup_janitor::backup_janitor_loop(
+            ctx.clone(),
+            SIM_FALLBACK_TICK,
+        ));
+        let segment_janitor_env = env.clone();
+        segment_janitor_env.spawn_task(segment_janitor::segment_janitor_loop(
+            ctx.clone(),
+            self.segment_janitor_retention,
+            SIM_FALLBACK_TICK,
+        ));
+        let index_backfill_env = env.clone();
+        index_backfill_env.spawn_task(index_backfill::index_backfill_loop(
+            ctx.clone(),
+            SIM_FALLBACK_TICK,
+        ));
+
+        // The TTL reaper — `grow`'s own data-role assembly, unchanged.
+        let ttl_reaper_env = env.clone();
+        ttl_reaper_env.spawn_task(ttl_reaper::ttl_reaper_loop(
+            ctx.clone(),
+            SIM_TTL_SWEEP_INTERVAL,
+        ));
+
+        // Auto-split, if this cluster opted in — identical to `grow`'s own
+        // respawn.
+        if let Some(thresholds) = self.auto_split {
+            self.spawn_auto_split(new_n, thresholds);
+        }
+
+        // Admission: the REAL admin path — `grow_control`'s own steps 4-5,
+        // unchanged. `leader` is translated to a real node id (never the
+        // bare vec index `SimCluster::admin` cannot use directly) since a
+        // control-bearing node's id no longer necessarily equals its
+        // `self.controls`-vec index the instant a voter has been grown.
+        let leader_idx = self.control_leader_index();
+        let leader = self.control_node_id(leader_idx);
+        let body =
+            serde_json::json!({"node": id.to_string(), "addr": placeholder_addr().to_string()})
+                .to_string();
+        let (status, resp) = self.admin(
+            leader,
+            "POST",
+            "/admin/control/member/add",
+            "",
+            body.as_bytes(),
+        );
+        assert_eq!(
+            status,
+            200,
+            "grow_combined(id={id}): control/member/add failed: {resp} (seed={})",
+            self.sim.seed()
+        );
+
+        // Converge on BOTH axes: every node's own view of `Metadata::
+        // members` shows the new node `Active` (`grow`'s own convergence
+        // check) AND every control-bearing node's own live voter belief —
+        // this node's own included — actually includes it (`grow_control`'s
+        // own convergence check).
+        let target = id;
+        let total = self.nodes as u64;
+        self.poll_until(Duration::from_secs(20), move |c| {
+            let members_active = (0..total).all(|n| {
+                c.metadata(n)
+                    .members
+                    .get(&target)
+                    .is_some_and(|m| m.status == NodeStatus::Active)
+            });
+            let voters_converged = c
+                .control_node_ids
+                .iter()
+                .all(|&n| c.control_voters(n).is_some_and(|v| v.contains(&target)));
+            members_active && voters_converged
+        });
+
+        new_n
+    }
+
     /// **C-13 / ADR 0061 rung M PR 2: the real seed/join dial.** Combined-
     /// mode-only entry point, kept unchanged for every existing caller —
     /// delegates to [`join_via_seed_with_role`](Self::join_via_seed_with_role)
@@ -5535,10 +5890,18 @@ impl SimCluster {
             NodeRole::Data => "data",
             NodeRole::Control => panic!(
                 "join_via_seed_concurrently(seed_node={seed_node}, count={count}): NodeRole::\
-                 Control is not supported — this fixture's control-only nodes are only ever \
-                 built at construction time via SimCluster::new_with_roles; a control-only join \
-                 primitive is control_membership_split.rs's own open C-13 question, \
-                 deliberately not resolved by this method (seed={})",
+                 Control is not supported — deliberately, not merely deferred (ADR 0061 rung N, \
+                 C-14 PR 4): production's own seed/join dial (animusd join --seed, \
+                 run_node_join_with_settings) hardcodes role=Both/\"combined\" and has no \
+                 --role flag at all — a control-only node is only ever built from a STATIC \
+                 config file (animusd control --config FILE --node I, Node::bind_control), never \
+                 discovered via --seed, and is admitted as a live voter by a wholly separate, \
+                 later operator action (admin control-add/control-grow, ClientCtx::\
+                 admin_add_control_member) that this fixture's own SimCluster::grow_control \
+                 already covers directly. Implementing this arm would test a path that does not \
+                 exist in production; a control-only node here is built at construction time via \
+                 SimCluster::new_with_roles, or grown as a live voter via SimCluster::\
+                 grow_control (seed={})",
                 self.sim.seed()
             ),
         };
@@ -5661,8 +6024,10 @@ impl SimCluster {
             NodeRole::Data => "data",
             NodeRole::Control => panic!(
                 "join_via_seed_forcing_mint_collision(seed_node={seed_node}): NodeRole::Control \
-                 is not supported — see join_via_seed_concurrently's own identical panic message \
-                 (seed={})",
+                 is not supported — deliberately, not merely deferred (ADR 0061 rung N, C-14 \
+                 PR 4) — see join_via_seed_concurrently's own identical panic message for the \
+                 full reasoning: production's own seed/join dial never produces a control voter \
+                 at all (seed={})",
                 self.sim.seed()
             ),
         };
@@ -5757,8 +6122,10 @@ impl SimCluster {
             NodeRole::Data => "data",
             NodeRole::Control => panic!(
                 "join_via_seed_with_explicit_id(seed_node={seed_node}, id={id}): NodeRole::\
-                 Control is not supported — see join_via_seed_with_role's own identical \
-                 panic message (seed={})",
+                 Control is not supported — deliberately, not merely deferred (ADR 0061 rung N, \
+                 C-14 PR 4) — see join_via_seed_concurrently's own identical panic message for \
+                 the full reasoning: production's own seed/join dial never produces a control \
+                 voter at all (seed={})",
                 self.sim.seed()
             ),
         };

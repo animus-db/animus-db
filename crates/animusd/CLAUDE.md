@@ -6184,7 +6184,11 @@ the other two files but **permanently real-socket**, same reason as
 invisible under `SimEnv`). See ADR 0061's "Rung N (post-C-13)" opener
 amendment for the full grep-verified ground truth, the primitive sketch,
 determinism constraints, and the 5-PR ladder, and `docs/roadmap.md`'s
-C-14 entry.
+C-14 entry. **Both of PR 4's halves landed** (see this file's own "C-14
+PR 4 landed" entry below, after PR 3's) — `SimCluster::grow`'s combined
+arm is implemented (`SimCluster::grow_combined`); the seed/join dial's
+`NodeRole::Control` arm is DEFERRED with a written verdict (production's
+own `--seed`/`join` dial never produces a control voter at all).
 
 **C-14 PR 2 landed** — `SimCluster::grow_control() -> u64` (`sim_cluster.
 rs`), the primitive PR 1's opener scoped: a genuinely fresh `RaftNode
@@ -6357,6 +6361,144 @@ proving the deletion compiles); `cargo test -p animusd --lib sim_
 cluster -- --test-threads=2` (**587 passed** — 585 baseline + this
 PR's 2 new tests — 0 failed, 2 ignored, 1831.18s). `Cargo.lock`
 unchanged.
+
+**C-14 PR 4 landed — both halves implemented, straightforward reuse of
+PR 2's own `grow_control` primitive, no honest-defer needed for
+either.**
+
+**(a) `SimCluster::grow`'s combined arm — implemented as `SimCluster::
+grow_combined()`** (`grow("combined")` dispatches to it; `grow("data")`
+is byte-identical to before). Composes `grow_control`'s real
+control-voter admission (a fresh, lone standalone `RaftNode<SimEnv>`,
+`self.controls`/`control_index`/`control_node_ids` bookkeeping, the
+three control-plane-leader-gated janitors, the real `POST /admin/
+control/member/add` route, converged-or-timeout on `control_voters`)
+with `grow`'s own existing data-role assembly (full `ClientCtx`/
+`DataRole`/reconciler/heartbeat/TTL-reaper/auto-split, the fixture's
+own `RegisterNode{role:"combined"}`+`UpsertMember{Active}`
+control-plane-bypass self-registration) — the two are structurally
+independent axes (`Metadata::members`/`node_addrs` registration vs. a
+node's own local `RaftCore` becoming a live voter), exactly as ADR
+0061's PR 1 opener §1 established for production, so composing them
+needed no new design once traced: registration (and the data-role
+assembly that goes with it) happens first, admission second, mirroring
+a real deployment's own order. `self.roles.push(NodeRole::Both)` —
+`SimCluster::restart` already dispatches on `control_index_of` and
+gates each background loop on `role.has_data()`/`role.has_control()`
+(ADR 0061 rung L, C-12 PR 2/3), so it handles a control-bearing `Both`
+node correctly with **zero** `restart`/`crash` changes — this PR is
+simply the first caller to exercise that pre-existing support's `Both`
+half.
+
+**One real bug found by this PR's own test authorship, not by
+inspection — the propose-then-observe race, a fourth instance of a
+lesson this crate keeps re-finding in a new shape.** The first draft
+called the admission route (`POST /admin/control/member/add`)
+immediately after the two bypass proposes, with zero virtual time
+advanced in between — `propose()` only appends to the leader's own
+local Raft log, and `admin_add_control_member`'s own read-your-writes
+barrier bound-waits on `engine_applied_index() >= commit_index()`
+**captured at the barrier's own call start**; with nothing advancing
+the simulator between the proposes and the admin call, that captured
+commit index can be read before the two entries have even committed,
+so the barrier catches up to a commit index that doesn't include them,
+`Metadata::node_addrs` reads as not-yet-containing the node, and the
+admission call's own bounded retry-on-collision loop
+(`MAX_CLAIM_REFRESH_ATTEMPTS`) races the real registration to a
+permanent `409` — "node n3 is already claimed by a different
+registration (data-plane, control-core, or another admin action)."
+Reproduced deterministically at every seed tried. Fixed with a single
+`self.sim.run_for(Duration::from_millis(300))` between the two
+proposes and the admission call — the identical "advance virtual time
+before the next thing reads back what was just proposed" idiom
+`sim_cluster_growth.rs`'s own scenario (d) and `sim_cluster_backup_
+janitor.rs`'s own propose-then-crash finding already established, now
+confirmed a third time for a propose-then-*admit* shape specifically.
+No production code changed — `admin_add_control_member`'s own barrier
+behaved exactly as designed; the bug was the caller's own missing
+virtual-time margin. See `docs/engineering-lessons.md`'s matching
+entry for the general form.
+
+**(b) The seed/join dial's `NodeRole::Control` arm — DEFERRED, a
+written verdict, not implemented.** Production's own seed/join dial
+(`animusd join --seed ADDR`, `run_join`/`run_node_join_with_settings`
+in `main.rs`) hardcodes `role: animusd::config::NodeRole::Both` and has
+**no `--role` flag at all** — confirmed by direct reading of `run_
+join`'s argument parser, not inferred. A control-only node is only
+ever built from a **static config file** (`animusd control --config
+FILE --node I`, `Node::bind_control`) — a wholly different entry point
+with no `--seed`/discovery dial of its own — and is admitted as a live
+voter by a **separate, later, operator-driven action**
+(`admin control-add`/`control-grow`, `ClientCtx::
+admin_add_control_member`) that never runs as part of joining at all.
+There is therefore no production behavior for this fixture's dial to
+model: implementing the arm would build a fixture-only path (self-mint
++ discover + claim, then somehow become a control voter) that has no
+real counterpart to be faithful to, and the "own completion signal"
+question PR 1's opener flagged (`control_voters` convergence instead
+of `detect_loop`/`members` promotion) would be answered by invented
+rather than observed production behavior. The mechanism this arm would
+need (a fresh `RaftNode<SimEnv>` admitted as a live voter) is already
+fully covered, faithfully, by `SimCluster::grow_control()` (PR 2) and
+`SimCluster::grow_combined()` (this PR, part a) — a control-only node
+in this fixture is built at construction time
+(`SimCluster::new_with_roles`) or grown as a live voter
+(`grow_control`), never joined via the seed dial, matching production
+exactly. The three `NodeRole::Control => panic!(..)` arms stay
+panics — their messages were rewritten to cite this finding directly
+(quoting the `run_join` trace) rather than the prior "deferred, C-13's
+open question" wording, so a future reader hits the reasoning, not a
+stale pointer.
+
+**Test module**: `crates/animusd/src/sim_cluster_growth.rs` gained
+scenario (f), `f_grow_combined_hosts_replicas_and_can_lead` (pinned
+seed `0x6706_0006` + a fixed 5-seed `_over_seeds` sibling,
+`0x6706_6000..`): `SimCluster::new(seed, 3, 3)` (3 combined voters),
+`grow("combined")`, asserts `role_of(grown) == NodeRole::Both` and
+every control-bearing node's own live voter belief shows exactly 4
+voters (the control-plane half); provisions three soak tables and
+polls for a rebalance-placed replica landing on the grown node, then
+`assert_no_zombie_groups` (the data-plane half, reusing scenario (b)'s
+own `provision_soak_tables_and_wait_for_replica` helper verbatim); then
+the shared crash/transfer/serve/restart proof
+(`assert_grown_voter_crash_transfer_serve_and_restart`,
+`sim_cluster_control_growth.rs`'s own PR 2 shape, duplicated here per
+this crate's per-file-fixture-helper convention rather than reached
+into) proving the grown node genuinely SERVES as a control leader: the
+pre-growth leader is crashed, a survivor (or `grown` itself) wins the
+new election, leadership is transferred to `grown` over the real `POST
+/admin/control/transfer` route if it didn't already land there, `grown`
+commits a real `POST /admin/control/member/remove` for the crashed
+voter, every survivor converges on the resulting 3-voter set, and the
+crashed node is restarted and rejoins with that converged config. The
+module's own header doc and `grow`'s own doc comment in `sim_cluster.rs`
+were both updated to state "combined" is no longer deferred.
+
+**Gates, all green, in the required order:**
+- `cargo build -p animusd --lib --tests` — clean (first pass compiled
+  with no errors).
+- `cargo test -p animusd --lib sim_cluster_growth -- --test-threads=2`
+  — 12 passed (10 baseline scenarios a-e + this PR's 2 new f tests), 0
+  failed, run twice, byte-identical both times (before the fmt pass
+  found one reformat needed in the new code, and again after).
+- `cargo fmt --all --check` — one reformat needed (a long `.all(..)`
+  chain in `every_control_node_sees_voter`), applied via `cargo fmt
+  --all`, clean after.
+- `cargo clippy --workspace --all-targets --all-features -- -D
+  warnings` — clean.
+- `cargo test -p animusd --lib sim_cluster_control -- --test-threads=2`
+  (the substring reaching `sim_cluster_control_data_split`/`_growth`/
+  `_membership_admin`/`_membership_split`/`_only`, PR 2/PR 3's own
+  consumers of the primitives this PR builds on) — 62 passed, 0 failed,
+  207.77s, proving no regression in the sibling modules `grow_control`
+  itself is exercised through.
+- `cargo test -p animusd --lib sim_cluster -- --test-threads=2` — the
+  full required tier: **589 passed** (587 baseline + this PR's 2 new
+  tests), 0 failed, 2 ignored, 1848.09s (~30.8 minutes) — matches the
+  task's own "587 + your new tests, 2 ignored, ~31 min" expectation
+  exactly.
+- `Cargo.lock` unchanged throughout (confirmed via `git diff --stat --
+  Cargo.lock`, empty).
 
 
 ### `sim_cluster_corpus`: the SimCluster cycles/durability corpus (ADR 0061 rung D1 step 3)
