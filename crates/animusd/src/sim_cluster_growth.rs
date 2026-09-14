@@ -17,12 +17,18 @@
 //! `SimCluster::grow`/`drain`/`remove`/`spawn_remote_mirror_sync_loop` for
 //! the full per-method design (this file intentionally doesn't restate it).
 //!
-//! **`grow` supports `role = "data"` only** — a `"combined"` growth node (a
-//! new control-plane voter, joining the *live* Raft quorum via
-//! `change_membership`) was scoped for this rung and deferred: it needs
-//! `self.controls` itself to grow, a materially different and separately
-//! budgeted mechanism from a data-only node's `ControlHandle::Remote`
-//! mirror. Every scenario below is therefore a data-only growth/removal.
+//! **`grow` supported `role = "data"` only when this rung landed** — a
+//! `"combined"` growth node (a new control-plane voter, joining the *live*
+//! Raft quorum via `change_membership`) needed `self.controls` itself to
+//! grow, a materially different mechanism from a data-only node's
+//! `ControlHandle::Remote` mirror, and was deferred here. **It is no longer
+//! deferred**: ADR 0061 rung N, C-14 PR 2 built the `self.controls`-growth
+//! primitive (`SimCluster::grow_control`, control-only) and PR 4 composed it
+//! with this method's own data-role assembly into `SimCluster::
+//! grow_combined` (`grow("combined")`) — see scenario (f), below, and
+//! `grow_combined`'s own doc in `sim_cluster.rs` for the mechanism. Every
+//! scenario (a)-(e) below predates that and is still data-only growth/
+//! removal, unaffected by it.
 //!
 //! **The one genuinely new mechanism**: `ControlHandle::Remote`'s real
 //! mirror-sync logic (`RemoteControlClient::observe`/`observe_delta`, the
@@ -99,7 +105,7 @@
 //! and any admin-HTTP-surface assertion — none of those are reachable from
 //! a `SimCluster`-based fixture at all, growth or not.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use animus_control::{MetaCommand, NodeAddrs, NodeStatus, ProposeResult};
@@ -107,6 +113,7 @@ use animus_env::{NodeId, nid};
 
 use super::sim_cluster::SimCluster;
 use super::sim_cluster_dynamo_table_ops::assert_no_zombie_groups;
+use crate::config::NodeRole;
 
 fn env_seed(default: u64) -> u64 {
     std::env::var("ANIMUS_SEED")
@@ -506,5 +513,224 @@ fn e_mirror_sync_recovers_from_partition() {
 fn e_mirror_sync_recovers_from_partition_over_seeds() {
     for i in 0..5 {
         run_e_mirror_sync_recovers_from_partition(0x6706_5000 + i);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scenario (f): grow_combined — hosts tablet replicas AND leads the control
+// plane (ADR 0061 rung N, C-14 PR 4).
+// ---------------------------------------------------------------------------
+
+/// The current control-bearing node id set, as real node ids — mirrors
+/// `sim_cluster_control_growth.rs`'s own identically-named helper
+/// (duplicated, not reached into — this crate's own per-file-fixture
+/// convention, stated in this module's own header comment).
+fn control_node_ids_snapshot(cluster: &SimCluster) -> Vec<u64> {
+    (0..cluster.control_count())
+        .map(|i| cluster.control_node_id(i))
+        .collect()
+}
+
+/// Every control-bearing node's own live voter belief includes `target`.
+fn every_control_node_sees_voter(cluster: &SimCluster, target: u64) -> bool {
+    let target_id = nid(target);
+    control_node_ids_snapshot(cluster).iter().all(|&n| {
+        cluster
+            .control_voters(n)
+            .is_some_and(|v: BTreeSet<NodeId>| v.contains(&target_id))
+    })
+}
+
+/// The shared "REAL catch-up proof" `sim_cluster_control_growth.rs`'s own
+/// `grow_control` scenarios use — duplicated here (this crate's own
+/// per-file-fixture convention, stated in this module's own header comment)
+/// rather than reached into: crash the pre-growth leader, observe a
+/// survivor win a new election, transfer leadership to `grown` over the
+/// real `POST /admin/control/transfer` route if it didn't already land
+/// there, then prove `grown` genuinely SERVES as leader by committing a
+/// real admin mutation (removing the crashed node from the control voter
+/// set) and waiting for every survivor to converge — finally restarting the
+/// crashed node and proving it rejoins with that converged config. See
+/// `sim_cluster_control_growth.rs`'s own identically-shaped function for
+/// the fuller per-step commentary, including the `control_leader_index_
+/// excluding`-vs-`control_leader_index` stale-frozen-belief gotcha every
+/// post-crash leader lookup here must use.
+fn assert_grown_voter_crash_transfer_serve_and_restart(
+    cluster: &mut SimCluster,
+    grown: u64,
+    seed: u64,
+) {
+    let pre_crash_leader_idx = cluster.control_leader_index();
+    let pre_crash_leader_id = cluster.control_node_id(pre_crash_leader_idx);
+    assert_ne!(
+        pre_crash_leader_id, grown,
+        "seed={seed}: the freshly grown voter {grown} must not already be the control leader \
+         at this point — grow_combined's own convergence wait never elects, so this would \
+         indicate a real timing change worth understanding before this scenario's own \
+         crash/transfer logic can be trusted"
+    );
+
+    cluster.crash(pre_crash_leader_id);
+
+    let new_leader_idx = cluster.control_leader_index_excluding(pre_crash_leader_idx as u64);
+    let new_leader_id = cluster.control_node_id(new_leader_idx);
+
+    if new_leader_id != grown {
+        let body = format!(r#"{{"to":"{}"}}"#, nid(grown));
+        let mut accepted_resp = None;
+        for _ in 0..40 {
+            let idx = cluster.control_leader_index_excluding(pre_crash_leader_idx as u64);
+            let leader = cluster.control_node_id(idx);
+            let (status, resp) = cluster.admin(
+                leader,
+                "POST",
+                "/admin/control/transfer",
+                "",
+                body.as_bytes(),
+            );
+            match status {
+                200 => {
+                    accepted_resp = Some(resp);
+                    break;
+                }
+                409 => cluster.run_for(Duration::from_millis(100)),
+                other => panic!(
+                    "seed={seed}: transfer to grown node {grown} should be accepted or \
+                     retryable: {other} {resp}"
+                ),
+            }
+        }
+        accepted_resp.unwrap_or_else(|| {
+            panic!("seed={seed}: transfer to grown node {grown} was never accepted within budget")
+        });
+
+        let leader_after_transfer_idx =
+            cluster.control_leader_index_excluding(pre_crash_leader_idx as u64);
+        let leader_after_transfer = cluster.control_node_id(leader_after_transfer_idx);
+        assert_eq!(
+            leader_after_transfer, grown,
+            "seed={seed}: control leadership never moved to the grown node {grown} (now \
+             {leader_after_transfer})"
+        );
+    }
+
+    // `grown` now genuinely leads — prove it SERVES by committing a real
+    // admin mutation through it: remove the crashed node from the control
+    // voter set. `force: true` sidesteps the failure detector's own
+    // liveness-timeout window (this scenario's own subject is "the grown
+    // node serves as a real leader," not liveness-detection timing).
+    let remove_body = format!(r#"{{"node":"{}","force":true}}"#, nid(pre_crash_leader_id));
+    let (status, resp) = cluster.admin(
+        grown,
+        "POST",
+        "/admin/control/member/remove",
+        "",
+        remove_body.as_bytes(),
+    );
+    assert_eq!(
+        status, 200,
+        "seed={seed}: the grown node {grown} (now leader) should be able to remove the crashed \
+         voter {pre_crash_leader_id}: {resp}"
+    );
+
+    // Converge: every SURVIVING node's own live voter belief excludes the
+    // crashed node — never a fixed-deadline one-shot assert.
+    let crashed_id = nid(pre_crash_leader_id);
+    const BUDGET: Duration = Duration::from_secs(20);
+    const STEP: Duration = Duration::from_millis(100);
+    let mut elapsed = Duration::ZERO;
+    loop {
+        if control_node_ids_snapshot(cluster).iter().all(|&n| {
+            n == pre_crash_leader_id
+                || cluster
+                    .control_voters(n)
+                    .is_some_and(|v: BTreeSet<NodeId>| !v.contains(&crashed_id))
+        }) {
+            break;
+        }
+        assert!(
+            elapsed < BUDGET,
+            "seed={seed}: survivors never converged on the post-removal voter set within \
+             {BUDGET:?}"
+        );
+        cluster.run_for(STEP);
+        elapsed += STEP;
+    }
+
+    // Finally: restart the crashed node and assert it rejoins with the same
+    // converged (post-removal) voter set.
+    cluster.restart(pre_crash_leader_id);
+    let mut elapsed = Duration::ZERO;
+    loop {
+        if cluster
+            .control_voters(pre_crash_leader_id)
+            .is_some_and(|v: BTreeSet<NodeId>| !v.contains(&crashed_id))
+        {
+            return;
+        }
+        assert!(
+            elapsed < BUDGET,
+            "seed={seed}: restarted node {pre_crash_leader_id} never rejoined with the \
+             converged post-removal voter set within {BUDGET:?}"
+        );
+        cluster.run_for(STEP);
+        elapsed += STEP;
+    }
+}
+
+fn run_f_grow_combined_hosts_replicas_and_can_lead(seed: u64) {
+    let mut cluster = SimCluster::new(seed, 3, 3);
+    let grown = cluster.grow("combined");
+    assert_eq!(
+        grown, 3,
+        "seed={seed}: grow_combined's first call must mint node 3"
+    );
+    assert_eq!(cluster.node_count(), 4, "seed={seed}");
+    assert_eq!(
+        cluster.role_of(grown),
+        NodeRole::Both,
+        "seed={seed}: a grow(\"combined\") node must be tagged NodeRole::Both"
+    );
+
+    // Control-plane half: a genuine live voter, converged before
+    // `grow_combined` even returned — re-checked here as the scenario's
+    // own explicit assertion.
+    assert!(
+        every_control_node_sees_voter(&cluster, grown),
+        "seed={seed}: not every control-bearing node sees the grown combined voter {grown} in \
+         its own live config"
+    );
+    for &n in &control_node_ids_snapshot(&cluster) {
+        let voters = cluster
+            .control_voters(n)
+            .unwrap_or_else(|| panic!("seed={seed}: node {n} has no live voter belief at all"));
+        assert_eq!(
+            voters.len(),
+            4,
+            "seed={seed}: node {n}'s own live voter belief should have exactly 4 members, got \
+             {voters:?}"
+        );
+    }
+
+    // Data-plane half: hosts a tablet replica after rebalancing — the
+    // identical proof scenario (b) uses for `grow("data")`.
+    provision_soak_tables_and_wait_for_replica(&mut cluster, grown, seed);
+    assert_no_zombie_groups(&mut cluster, seed);
+
+    // Control-plane half, continued: the grown node genuinely SERVES as a
+    // control leader — the same crash/transfer/serve/restart proof
+    // `sim_cluster_control_growth.rs`'s own `grow_control` scenarios use.
+    assert_grown_voter_crash_transfer_serve_and_restart(&mut cluster, grown, seed);
+}
+
+#[test]
+fn f_grow_combined_hosts_replicas_and_can_lead() {
+    run_f_grow_combined_hosts_replicas_and_can_lead(env_seed(0x6706_0006));
+}
+
+#[test]
+fn f_grow_combined_hosts_replicas_and_can_lead_over_seeds() {
+    for i in 0..5 {
+        run_f_grow_combined_hosts_replicas_and_can_lead(0x6706_6000 + i);
     }
 }
