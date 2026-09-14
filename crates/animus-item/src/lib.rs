@@ -130,13 +130,25 @@ impl AttributeValue {
         match self {
             AttributeValue::S(s) => s.clone().into_bytes(),
             AttributeValue::N(n) => numkey::encode(n).unwrap_or_else(|| {
-                // A key attribute reaching this point has already been
-                // validated as a well-formed DynamoDB `N` by the wire layer
-                // (`numkey::encode` only returns `None` for malformed text or
-                // an exponent outside DynamoDB's own documented range, which
-                // a well-formed `N` never has) — this fallback exists so a
-                // read path never panics on data that somehow got here
-                // anyway, not because it is expected to be hit.
+                // A key attribute reaching this point is *supposed* to have
+                // already been validated as a well-formed DynamoDB `N` by
+                // the wire layer (`animus_dynamo::wire`'s `"N"` decode arm
+                // calls `numkey::encode_checked`, which is strictly stricter
+                // than plain `encode` — see that function's doc — so
+                // nothing wire-decoded should ever reach `encode` failure
+                // here). Issue #846 found that premise had no enforcement
+                // behind it at all until that wire-layer fix landed; this
+                // fallback stays defensive rather than becoming a hard
+                // panic (`unreachable!`) because a read path over
+                // already-stored data must not crash on a row written
+                // before validation existed, or by any future caller that
+                // constructs an `AttributeValue::N` directly rather than
+                // through the wire decoder (this crate has no wire
+                // dependency of its own to enforce the invariant at
+                // construction time). It intentionally does **not**
+                // preserve numeric ordering against well-formed neighbours
+                // — there is no order-preserving encoding for text that
+                // isn't a valid number in the first place.
                 n.clone().into_bytes()
             }),
             AttributeValue::B(b) => b.clone(),
@@ -208,4 +220,28 @@ pub fn storage_key(pk: &AttributeValue, sk: Option<&AttributeValue>) -> Vec<u8> 
         key.extend_from_slice(&sk.key_bytes());
     }
     key
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression for issue #846: valid `N` sort-key neighbours order by
+    /// *value*, not lexicographic text — `"9" < "15"` numerically, the
+    /// opposite of their raw-text byte order (ADR 0063). A malformed `N`
+    /// sharing the same partition used to be able to corrupt this via
+    /// `key_bytes`'s raw-ASCII fallback (reachable from ordinary wire input
+    /// before `animus_dynamo::wire`'s `"N"` arm validated); with that arm
+    /// now rejecting malformed text before it ever reaches `key_bytes`,
+    /// well-formed neighbours keep ordering correctly regardless.
+    #[test]
+    fn n_sort_key_neighbours_order_numerically_via_storage_key() {
+        let pk = AttributeValue::S("p".to_string());
+        let low = storage_key(&pk, Some(&AttributeValue::N("9".to_string())));
+        let high = storage_key(&pk, Some(&AttributeValue::N("15".to_string())));
+        assert!(
+            low < high,
+            "N sort key \"9\" should order before \"15\" (numeric, not lexicographic)"
+        );
+    }
 }

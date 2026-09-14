@@ -339,12 +339,41 @@ fn resolve_key<E: Env, R: RelayClient>(
 ) -> Result<(AttributeValue, Option<AttributeValue>), WireError> {
     mirror_catalog_schema(ctx, meta, table);
     legacy_register(ctx, meta, table);
-    let reg = ctx
-        .edge
-        .dynamo_registry()
-        .lock()
-        .expect("registry poisoned");
-    reg.extract_key(table, item).map_err(registry_error)
+    let (pk, sk) = {
+        let reg = ctx
+            .edge
+            .dynamo_registry()
+            .lock()
+            .expect("registry poisoned");
+        reg.extract_key(table, item).map_err(registry_error)?
+    };
+    reject_empty_key_value(&pk)?;
+    if let Some(sk) = &sk {
+        reject_empty_key_value(sk)?;
+    }
+    Ok((pk, sk))
+}
+
+/// Issue #848: AWS's 2020 empty-value change allows an empty `S`/`B` for a
+/// **non-key** attribute, but a partition/sort key value must stay
+/// non-empty — `escape`/`key_bytes` (`animus-item`) would happily encode an
+/// empty key injectively, so nothing downstream catches this on its own.
+/// This is the single choke point every write/point-read path resolves a
+/// table's key through ([`resolve_key`]), so checked once here covers all
+/// of them.
+fn reject_empty_key_value(v: &AttributeValue) -> Result<(), WireError> {
+    let empty = match v {
+        AttributeValue::S(s) => s.is_empty(),
+        AttributeValue::B(b) => b.is_empty(),
+        _ => false,
+    };
+    if empty {
+        return Err(WireError::validation(
+            "One or more parameter values are not valid. The AttributeValue \
+             for a key attribute cannot contain an empty string value.",
+        ));
+    }
+    Ok(())
 }
 
 /// Accept loop for the DynamoDB HTTP endpoint. Each connection is handled on its
