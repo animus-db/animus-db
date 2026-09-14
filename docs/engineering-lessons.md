@@ -24904,6 +24904,21 @@ leader-index accessor, for the control plane, a CP-data tablet, or any
 future leader-shaped state this fixture grows. Check for this the moment
 a scenario's own shape is "crash the leader, then ask who leads."
 
+**Confirmed a third time anyway (ADR 0061 rung N, C-14 PR 2)** —
+`sim_cluster_control_growth.rs`'s own crash/transfer/serve helper hit the
+identical mistake despite this entry already predicting it: a plain
+`control_leader_index()` call issued right after `cluster.crash(leader)`
+kept returning the crashed node's own frozen `is_leader()==true` belief
+(its vec index sorted before the real new leader's), silently misrouting
+both a `/admin/control/transfer` retry loop (timing out against a dead
+node) and a post-transfer "did it land?" check (reporting the crashed
+node's stale belief instead of the grown node's real, live leadership).
+Fixed the same way — route every post-crash lookup through
+`control_leader_index_excluding`. No new mechanism was added; this is
+recorded here only as confirmation that "check for this the moment a
+scenario crashes a leader" is worth restating to whoever writes the next
+one, not as a new lesson.
+
 ## A scenario converted from a real-socket test needs its own retry discipline for a race the original's real network timing happened to paper over (ADR 0061 rung L, C-12 PR 4b)
 
 Three of `sim_cluster_split_cluster.rs`'s six converted scenarios passed

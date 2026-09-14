@@ -6186,6 +6186,83 @@ amendment for the full grep-verified ground truth, the primitive sketch,
 determinism constraints, and the 5-PR ladder, and `docs/roadmap.md`'s
 C-14 entry.
 
+**C-14 PR 2 landed** — `SimCluster::grow_control() -> u64` (`sim_cluster.
+rs`), the primitive PR 1's opener scoped: a genuinely fresh `RaftNode
+<SimEnv>` joins the LIVE control-plane voter quorum after construction,
+never a bypass propose. **Contract**: mints the next free node id
+(`self.nodes`, never reused); builds it a lone standalone core via
+`RaftNode::start_with_metrics` whose own starting membership is `self.
+control_node_ids`' CURRENT value with `self` NOT included — mirroring
+`tests/control_membership_admin.rs::join_control_nonvoter`'s real
+`bind_control`/`start_control_with` shape as closely as this fixture's
+in-process construction allows; self-registers over the relayed
+`ProposeSchema`/`RegisterNode` path (`register_node_over_wire_via_relay`,
+the identical primitive `SimCluster::join_via_seed_concurrently`'s own
+dial uses) BEFORE ever trying to admit it; admits via the REAL `POST
+/admin/control/member/add` route (`ClientCtx::admin_add_control_member`,
+`SimCluster::admin`) — never a control-plane bypass, unlike `SimCluster::
+grow`'s own data-only self-registration; converges on every control-
+bearing node's own live voter belief (the new node's own included)
+actually including the new id before returning. `NodeRole::Control`
+only (no `DataRole`, no reconciler, no data-plane loop, no self-
+heartbeat — mirrors `new_with_roles`'s own identical skip) but DOES get
+the three control-plane-leader-gated janitors (`backup_janitor_loop`/
+`segment_janitor_loop`/`index_backfill_loop`), since this node can
+genuinely become control-plane leader the moment it's a real voter.
+`SimCluster::restart`/`crash` are usable on the grown node's id
+immediately — `restart` already dispatches on `control_index_of` (PR 1)
+and rebuilds a restarted control-bearing node's own membership from the
+then-current `control_node_ids`, which by construction already includes
+every node `grow_control` has ever grown.
+
+**A real caller-side gotcha this PR's own test authorship found and
+fixed, not a `grow_control` defect**: a crashed control node is muted,
+not stopped (`SimCluster::crash`'s own doc) — its own `is_leader()`
+belief stays frozen at whatever it was the instant it crashed. A plain
+`control_leader_index()` scan after crashing a former leader can
+therefore keep returning that same crashed node's own `self.controls`-
+vec index forever (it comes first in iteration order and never steps
+down locally), silently misrouting every subsequent admin call to a
+dead node — the identical stale-self-belief gotcha `sim_cluster_auto_
+split.rs`'s own module doc already documents for a CP-data tablet leader
+and ADR 0061 rung L, C-12 PR 4b already found for the control plane
+itself (the exact reason `control_leader_index_excluding` exists at
+all) — confirmed here for a third time, exactly as that entry's own
+"stated once so it doesn't need re-discovering a third time" wording
+anticipated. Every leader lookup made after a crash must use
+`control_leader_index_excluding`, never the plain `control_leader_index`.
+
+**Test module**: `crates/animusd/src/sim_cluster_control_growth.rs`
+(`#[cfg(test)] mod sim_cluster_control_growth;`, the sole `lib.rs`
+addition this PR made) — two scenarios, each a pinned-seed test plus a
+fixed 5-seed `_over_seeds` sibling: `grown_control_voter_joins_the_live_
+quorum_and_can_lead` (a 3-node combined cluster, a table with writes,
+`grow_control()`, every node's own live voter belief shows exactly 4
+voters, then the REAL catch-up proof below) and `grow_control_after_
+metadata_has_grown` (8 tables created BEFORE `grow_control()`, so the
+fresh voter must genuinely catch up on real committed log/snapshot
+content rather than an empty log, then the identical proof). The shared
+"REAL catch-up proof" (`assert_grown_voter_crash_transfer_serve_and_
+restart`): crash the pre-growth leader, observe a survivor win a new
+election, transfer leadership to the grown node over the real `POST
+/admin/control/transfer` route if it didn't already land there (the
+same bounded-retry discipline `sim_cluster_admin_actions.rs`'s own
+`run_control_transfer_moves_leadership_to_the_named_node` uses), then
+prove the grown node genuinely SERVES as leader by committing a real
+`POST /admin/control/member/remove` for the crashed voter and
+converging every survivor on the resulting 3-voter config, and finally
+restarting the crashed node and proving it rejoins with that same
+converged config. Gates (all green): `cargo build -p animusd --lib
+--tests`; `cargo fmt --all --check`; `cargo clippy --workspace
+--all-targets --all-features -- -D warnings`; `cargo test -p animusd
+--lib sim_cluster_control_growth` (4 passed, run four times total across
+a pre-fmt and post-fmt pair, byte-identical each time, ~32s per run);
+`cargo test -p animusd --lib sim_cluster -- --test-threads=2` (585
+passed — 581 baseline + this PR's 4 new tests — 0 failed, 2 ignored,
+1865.26s); `cargo test -p animusd --test control_membership_admin --test
+control_membership_split` (2 passed, proving the two remaining
+real-socket files untouched). `Cargo.lock` unchanged.
+
 
 ### `sim_cluster_corpus`: the SimCluster cycles/durability corpus (ADR 0061 rung D1 step 3)
 
