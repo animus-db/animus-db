@@ -18486,6 +18486,122 @@ mod simenv_client_ctx_tests {
             "seed={seed}: the message must not depend on whether the table exists (issue #842)"
         );
     }
+
+    /// ADR 0066 §5 / issue #842 (the sixth site): `execute_one_batch_statement_as`
+    /// — reached through [`crate::dynamo::run_batch_execute_statement_as`], the
+    /// `BatchExecuteStatement` sibling of `execute_statement_as`/
+    /// `execute_transaction_as` above (see `dynamo.rs`'s own "SimEnv-capable
+    /// PartiQL siblings" section) — used to check `table_known` before
+    /// `authz::authorize` for its `SELECT` arm, the identical five-site defect
+    /// this issue names, just uncounted. A denied `SELECT` batch statement must
+    /// report a byte-identical `Error.Code`/`Error.Message` whether the named
+    /// table exists or not — never a distinguishable `ResourceNotFound` that
+    /// would let a table-scoped credential enumerate the cluster's tables via
+    /// the batch API.
+    #[test]
+    fn execute_one_batch_statement_as_authorizes_before_table_known() {
+        use crate::authz::Principal;
+        use crate::dynamo::run_batch_execute_statement_as;
+        use animus_control::{OpClass, Policy, TableMatch};
+        use animus_dynamo::wire::BatchStatementRequest;
+        use std::collections::BTreeSet;
+
+        fn batch_error(raw: &str) -> (String, String) {
+            let parsed: serde_json::Value =
+                serde_json::from_str(raw).expect("valid BatchExecuteStatement response JSON");
+            let entry = &parsed["Responses"][0];
+            let error = &entry["Error"];
+            (
+                error["Code"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("missing Error.Code in {raw}"))
+                    .to_string(),
+                error["Message"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("missing Error.Message in {raw}"))
+                    .to_string(),
+            )
+        }
+
+        let seed = 0x514E_0009;
+        let (mut sim, ctx, control, _kv) = single_node_ctx(seed);
+        sim.run_for(Duration::from_millis(200));
+
+        // Same `DataRole` fix as the test above — `authz::record_denied`
+        // calls `ClientCtx::data()`, which panics on `single_node_ctx`'s
+        // own default control-only shape.
+        let ctx = SimClientCtx {
+            data: Some(DataRole {
+                raftkv_metrics: animus_env::MetricsHandle::recording(),
+                base_id: nid(1),
+                stream_seal_knobs: StreamSealKnobs::default(),
+                change_rates: ChangeRateTracker::default(),
+                request_rates: RequestRateTracker::default(),
+            }),
+            ..ctx
+        };
+
+        // Scoped to some other table entirely — denied for anything this
+        // test names.
+        let denied = Principal::Scoped {
+            access_key_id: "AKIDDENIED842C".to_string(),
+            region: "us-east-1".to_string(),
+            policy: Policy {
+                tables: TableMatch::Names(BTreeSet::from(["unrelated_table".to_string()])),
+                ops: BTreeSet::from([OpClass::Read, OpClass::Write]),
+            },
+        };
+
+        let statements = vec![BatchStatementRequest {
+            statement: "SELECT * FROM issue_842_denied_batch WHERE pk = ?".to_string(),
+            parameters: vec![animus_dynamo::AttributeValue::S("x".to_string())],
+            consistent_read: false,
+        }];
+
+        // (1) The table does not exist yet.
+        let meta_absent = control.metadata();
+        let raw_absent = spawn_and_capture(&mut sim, &ctx.env, {
+            let ctx = ctx.clone();
+            let denied = denied.clone();
+            let meta = meta_absent.clone();
+            let statements = statements.clone();
+            async move { run_batch_execute_statement_as(&ctx, &meta, &denied, &statements).await }
+        })
+        .expect("future completed")
+        .expect("run_batch_execute_statement_as never returns Err — every failure is a per-statement entry");
+
+        // (2) Now the table genuinely exists.
+        seed_schema(&control, "issue_842_denied_batch", TabletId(4));
+        sim.run_for(Duration::from_millis(200));
+        let meta_present = control.metadata();
+        let raw_present = spawn_and_capture(&mut sim, &ctx.env, {
+            let ctx = ctx.clone();
+            let denied = denied.clone();
+            let meta = meta_present.clone();
+            let statements = statements.clone();
+            async move { run_batch_execute_statement_as(&ctx, &meta, &denied, &statements).await }
+        })
+        .expect("future completed")
+        .expect("run_batch_execute_statement_as never returns Err — every failure is a per-statement entry");
+
+        let (code_absent, message_absent) = batch_error(&raw_absent);
+        let (code_present, message_present) = batch_error(&raw_present);
+
+        assert_eq!(
+            code_absent, "AccessDenied",
+            "seed={seed}, absent-table response: {raw_absent}"
+        );
+        assert_eq!(
+            code_absent, code_present,
+            "seed={seed}: the batch Error.Code must not depend on whether the table exists"
+        );
+        assert_eq!(
+            message_absent, message_present,
+            "seed={seed}: the batch Error.Message must not depend on whether the table exists \
+             — a table-scoped principal must not be able to enumerate table existence via this \
+             difference (issue #842)"
+        );
+    }
 }
 
 /// Two-node `ClientCtx<SimEnv, SimRelayClient<SimEnv>>` smoke (ADR 0061

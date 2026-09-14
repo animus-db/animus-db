@@ -8133,10 +8133,6 @@ async fn execute_one_batch_statement_as<E: Env, R: RelayClient>(
     if let Err(e) = reject_internal_table(&table, false) {
         return wire::BatchStatementResult::error(Some(table), &e);
     }
-    if !table_known(ctx, meta, &table) {
-        let e = registry_error(animus_dynamo::RegistryError::NoSuchTable(table.clone()));
-        return wire::BatchStatementResult::error(Some(table), &e);
-    }
 
     match stmt {
         partiql::Statement::Select(sel) => {
@@ -8147,6 +8143,10 @@ async fn execute_one_batch_statement_as<E: Env, R: RelayClient>(
                 animus_control::OpClass::Read,
                 Some(table.as_str()),
             ) {
+                return wire::BatchStatementResult::error(Some(table), &e);
+            }
+            if !table_known(ctx, meta, &table) {
+                let e = registry_error(animus_dynamo::RegistryError::NoSuchTable(table.clone()));
                 return wire::BatchStatementResult::error(Some(table), &e);
             }
 

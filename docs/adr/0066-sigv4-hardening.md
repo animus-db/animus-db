@@ -534,14 +534,17 @@ landed with a few concretizations this ADR left to the implementation:
   request never touches `Policy::allows` at dispatch (structurally
   unrestricted, not merely configured to allow everything).
 
-## Fixed (2026-09-14, issue #842): the five PartiQL entry points authorized after `table_known`, not before
+## Fixed (2026-09-14, issue #842): the six PartiQL entry points authorized after `table_known`, not before
 
 Decision 5's "mirrors the base item API's own authorize-before-dispatch
 order exactly" (stated above for Streams) did not in fact hold for
-`animusd::dynamo`'s five PartiQL entry points — `execute_statement`,
-`execute_transaction`, `execute_one_batch_statement`, and their two
-`<E, R>`-generic siblings (`execute_statement_as`/`execute_transaction_as`,
-ADR 0061 rung F). Each ran its own `table_known` existence check *before*
+`animusd::dynamo`'s six PartiQL entry points — `execute_statement`,
+`execute_transaction`, `execute_one_batch_statement`, and their three
+`<E, R>`-generic siblings (`execute_statement_as`/`execute_transaction_as`/
+`execute_one_batch_statement_as`, ADR 0061 rung F — the issue's own count
+of five had simply missed the third generic sibling, folded into this same
+fix rather than filed separately, since it is the identical defect, not an
+incidental one). Each ran its own `table_known` existence check *before*
 calling `authz::authorize`/`authorize_op`/`authorize_each_table` — the
 opposite of `run_operation`'s own prelude (`authorize_op` always runs
 before dispatch, never after) and of `run_transact`/`run_transact_get`'s
@@ -552,22 +555,26 @@ therefore got a *different* error for a table that exists
 (`ResourceNotFoundException`/a per-statement `ResourceNotFound` entry) — a
 table-enumeration oracle no native single-op path has, latent until a
 credential catalog with a table-scoped `Policy` is actually configured.
-Fixed by reordering all five sites to parse → resolve the table name(s) →
+Fixed by reordering all six sites to parse → resolve the table name(s) →
 authorize (`OpClass::Read`/`Write`, resolved from the statement's own kind
 — `Policy::allows` only ever consults `OpClass`/table, never the operation
 name, so this needs no lowered `Operation` at all) → `table_known`;
-`execute_one_batch_statement`'s per-statement `INSERT`/`UPDATE`/`DELETE`
-arm delegates to the now-fixed `execute_statement` rather than repeating
-the check itself. Regression:
+`execute_one_batch_statement`/`execute_one_batch_statement_as`'s
+per-statement `INSERT`/`UPDATE`/`DELETE` arm delegates to the now-fixed
+`execute_statement`/`execute_statement_as` rather than repeating the check
+itself. Regression:
 `crates/animusd/tests/dynamo_auth_policy.rs`'s three new
 `*_gives_identical_error_whether_or_not_it_exists` tests (one each for
 `ExecuteStatement`, `ExecuteTransaction`, `BatchExecuteStatement`) and
 `crates/animusd/src/lib.rs`'s
 `execute_statement_as_and_execute_transaction_as_authorize_before_table_known`
-(the two `<E, R>`-generic siblings, unreachable from the real wire — see
-`docs/engineering-lessons.md`'s matching entry for the general "a shared
-prelude's *order*, not just its presence, needs auditing at every entry
-point" lesson).
+(`execute_statement_as`/`execute_transaction_as`) and
+`execute_one_batch_statement_as_authorizes_before_table_known`
+(`execute_one_batch_statement_as`, reached through
+`run_batch_execute_statement_as`) — all three `<E, R>`-generic siblings are
+unreachable from the real wire; see `docs/engineering-lessons.md`'s
+matching entry for the general "a shared prelude's *order*, not just its
+presence, needs auditing at every entry point" lesson.
 
 ## Alternatives rejected
 
