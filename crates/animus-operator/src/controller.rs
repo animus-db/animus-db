@@ -1077,7 +1077,25 @@ async fn reconcile<C: ClusterApi, A: AdminOps>(
                     // StatefulSet down past a pod that never finished
                     // draining, and don't attempt a lower ordinal either
                     // (they must go highest-first).
-                    return finish_reconcile(&cluster, &ctx, &ns, status, pdb_control_nodes).await;
+                    //
+                    // `finish_reconcile` applies a StatefulSet built from
+                    // its `cluster` argument's own `spec.nodes` — passing
+                    // the caller's already-lowered `cluster` unpinned here
+                    // (issue #853) would apply the *target* replica count
+                    // regardless of how far the drain got, deleting ordinal
+                    // `ordinal` (and everything above it, if a higher one
+                    // was somehow still present) before it ever finished
+                    // draining. Every ordinal strictly above the one that
+                    // just failed (`ordinal + 1 ..= current_replicas - 1`)
+                    // *did* finish draining and being removed — the loop
+                    // runs highest-first and only reaches `ordinal` after
+                    // each of those succeeded — so the safe replica count
+                    // to apply is `ordinal + 1`: keep ordinals `0..=ordinal`,
+                    // matching the `tls`/`s3`/`backup_store` failure
+                    // branches' own `pinned` pattern above.
+                    let mut pinned = (*cluster).clone();
+                    pinned.spec.nodes = ordinal + 1;
+                    return finish_reconcile(&pinned, &ctx, &ns, status, pdb_control_nodes).await;
                 }
             }
             status
@@ -1664,6 +1682,79 @@ mod tests {
             vec![&admin_url("demo", "ns1", 4, 14003, "/admin/drain")]
         );
         assert!(!calls.iter().any(|(_, u)| u.contains("/member/remove")));
+
+        // Issue #853: ordinal 4 never finished draining, so the applied
+        // StatefulSet's replica count must stay clamped at 5 (ordinals
+        // 0..=4) — never the caller's already-lowered `spec.nodes: 3`,
+        // which would delete the undrained ordinal-4 pod (and ordinal 3,
+        // never even attempted) right out from under it.
+        let applied = ctx
+            .cluster_api
+            .get_statefulset("ns1", "demo")
+            .await
+            .unwrap()
+            .expect("StatefulSet was applied");
+        assert_eq!(
+            applied.spec.and_then(|s| s.replicas),
+            Some(5),
+            "a failed drain of ordinal 4 must clamp the applied replica \
+             count to 5 (ordinal 4 kept), not fall through to the \
+             unclamped target of 3"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_scale_down_drain_failure_clamps_to_last_successful_ordinal() {
+        // Same scale-down (5 -> 3) as the test above, but the drain
+        // sequence gets partway through before failing: ordinal 4 drains
+        // and is removed successfully, then ordinal 3's drain fails. The
+        // clamp must reflect that partial progress — replicas 4 (ordinals
+        // 0..=3 kept), not the pre-drain 5 the "fails immediately" test
+        // above pins, and not the unclamped target of 3.
+        let fake_cluster = FakeClusterApi::new();
+        fake_cluster.seed_statefulset("demo", 5, 5);
+        let fake_admin = FakeAdminClient::new();
+        fake_admin.fail_drain_for_ordinal(3);
+        let ctx = make_ctx(fake_cluster, fake_admin);
+
+        let cluster = Arc::new(test_cluster("demo", "ns1", 3, None));
+        let result = reconcile(Arc::clone(&cluster), Arc::clone(&ctx)).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+
+        let status = ctx.cluster_api.last_status().unwrap();
+        assert!(
+            status
+                .conditions
+                .iter()
+                .any(|c| c.type_ == CONDITION_DRAIN_FAILED)
+        );
+
+        let calls = ctx.admin.calls();
+        let drain_posts: Vec<&String> = calls
+            .iter()
+            .filter(|(m, u)| m == "POST" && u.ends_with("/admin/drain"))
+            .map(|(_, u)| u)
+            .collect();
+        assert_eq!(
+            drain_posts,
+            vec![
+                &admin_url("demo", "ns1", 4, 14003, "/admin/drain"),
+                &admin_url("demo", "ns1", 3, 14003, "/admin/drain"),
+            ]
+        );
+
+        let applied = ctx
+            .cluster_api
+            .get_statefulset("ns1", "demo")
+            .await
+            .unwrap()
+            .expect("StatefulSet was applied");
+        assert_eq!(
+            applied.spec.and_then(|s| s.replicas),
+            Some(4),
+            "ordinal 4 finished draining before ordinal 3 failed, so the \
+             clamp must keep ordinals 0..=3 (replicas: 4)"
+        );
     }
 
     // --- controlNodes decrease is still refused (S-07d renamed this from
