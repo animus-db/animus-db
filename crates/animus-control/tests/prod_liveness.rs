@@ -94,16 +94,42 @@ async fn large_metadata_catch_up_stays_live() {
     // Outer budget: the (now progress-gated, not deadline-gated — see the
     // compaction poll below) fat-member phase can legitimately take up to
     // `COMPACT_OVERALL_BACKSTOP` under contention, plus room for leader
-    // election (bounded at 10s by `leader_of`'s own 200×50ms poll) and node
+    // election (bounded at 20s by `leader_of`'s own 400×50ms poll, issue
+    // #667's boot-time cluster-check round trip included) and node
     // 2's own tight 12s catch-up budget (a deliberate timing guard on a
     // different property — see that phase's own comment — left unchanged).
     timeout(Duration::from_secs(210), async {
+        // Issue #667 (P0 Raft safety): a node whose persisted state replays
+        // empty (`PersistedState::is_empty()`) never grants a vote or
+        // campaigns until it has confirmed, by probing every configured
+        // peer (`RaftCore::begin_cluster_check`), whether this is a genuine
+        // first-ever bootstrap or a wiped voter restarting into an
+        // already-progressed cluster — see this crate's `CLAUDE.md`
+        // ("Cluster-check and genesis-vs-restart") and ADR 0009's matching
+        // amendment. A **static 3-voter genesis config whose 3rd member's
+        // driver never starts** can therefore never resolve for nodes 0/1
+        // either (an unreachable configured peer is never assumed fresh) —
+        // so all three drivers start together here, briefly, purely to let
+        // that mutual genesis handshake resolve; node 2's env is then torn
+        // down (`shutdown_and_wait`) and later re-bound on a fresh port for
+        // the actual "catches a large compacted snapshot up" phase this
+        // test exists to prove, so it still falls behind the fat-member
+        // growth below exactly as before. (An initial *2*-voter group for
+        // 0/1 alone was tried instead of this and rejected: a 2-of-2 group
+        // has zero fault tolerance — unlike this test's original 2-of-3 —
+        // and stalled indefinitely under this same real-thread proposal
+        // burst even on unfixed `main`, confirmed by reproducing the same
+        // stall with issue #667's fix absent entirely; that fragility is
+        // real but pre-existing and orthogonal to this change.) Node 2's
+        // own *second* boot-time cluster-check (once re-bound) will resolve
+        // to a permanent refusal (0/1 by then show real term/commit), which
+        // is harmless here: nothing below requires node 2 to ever vote,
+        // only to replicate and apply.
         let group: Vec<NodeId> = vec![nid(0), nid(1), nid(2)];
         let dirs: Vec<_> = (0..3).map(|_| unique_tmp_dir()).collect();
         let loop0 = || "127.0.0.1:0".parse::<SocketAddr>().unwrap();
 
-        // Bind all three envs up front (so every address is known), but only *start*
-        // the Raft driver on nodes 0 and 1 — node 2 stays dark so it falls behind.
+        // Bind all three envs up front (so every address is known).
         let mut envs = Vec::new();
         for (i, dir) in dirs.iter().enumerate() {
             let (env, _addr) = ProdEnv::bind(nid(i as u64), loop0(), dir)
@@ -111,7 +137,7 @@ async fn large_metadata_catch_up_stays_live() {
                 .expect("bind");
             envs.push(env);
         }
-        let book: BTreeMap<NodeId, String> = envs
+        let mut book: BTreeMap<NodeId, String> = envs
             .iter()
             .map(|e| (e.node_id(), e.local_addr().to_string()))
             .collect();
@@ -119,12 +145,22 @@ async fn large_metadata_catch_up_stays_live() {
             e.set_peers(book.clone());
         }
 
-        // Start the two-node majority (2/3 of the 3-voter group commits without 2).
+        // Start all three drivers together — see the issue #667 comment
+        // above: this is the brief mutual genesis handshake every
+        // configured voter's own cluster-check needs.
         let node0 = RaftNode::start(envs[0].clone(), group.clone(), MemoryEngine::new());
         let node1 = RaftNode::start(envs[1].clone(), group.clone(), MemoryEngine::new());
+        let node2_genesis = RaftNode::start(envs[2].clone(), group.clone(), MemoryEngine::new());
 
+        // Issue #667: 400×50ms (20s), not the pre-fix 200×50ms (10s) — every
+        // configured voter's own boot-time cluster-check (a real round trip
+        // to every OTHER configured voter before the first real pre-vote
+        // can even start, see the comment above) now sits in front of the
+        // first real election, and under this box's own contention that
+        // extra round trip has been observed to occasionally miss a 10s
+        // budget outright even though the cluster is perfectly healthy.
         async fn leader_of<'a>(nodes: &'a [&'a RaftNode<ProdEnv>]) -> Option<usize> {
-            for _ in 0..200 {
+            for _ in 0..400 {
                 for (i, n) in nodes.iter().enumerate() {
                     if n.is_leader() {
                         return Some(i);
@@ -134,8 +170,31 @@ async fn large_metadata_catch_up_stays_live() {
             }
             None
         }
+        // All three are equal, symmetric genesis participants (unlike the
+        // pre-#667 shape, where 0/1 started well before node 2 gave them an
+        // inherent head start), so ANY of the three — node 2 included — may
+        // legitimately win this first election. Confirm the 3-way genesis
+        // handshake produced a leader at all, over all three, before ever
+        // narrowing to "a leader among 0/1 specifically".
+        let genesis_trio = [&node0, &node1, &node2_genesis];
+        leader_of(&genesis_trio)
+            .await
+            .expect("no leader elected among the 3-way genesis trio");
+
+        // Node 2 has served its one purpose (answering 0/1's genesis
+        // cluster-check, and possibly leading briefly itself); take it
+        // fully down now, before any fat-member growth, so it falls behind
+        // exactly like the original "dark until now" design. If node 2 was
+        // the elected leader, this forces a fresh election among 0/1 alone
+        // — still safe (their own majority-of-2 needs nothing from node 2)
+        // — which the second `leader_of` poll below waits out.
+        drop(node2_genesis);
+        envs[2].shutdown_and_wait().await;
+
         let running = [&node0, &node1];
-        let leader_idx = leader_of(&running).await.expect("no leader elected");
+        let leader_idx = leader_of(&running)
+            .await
+            .expect("no leader among 0/1 after node 2 went dark");
         let leader = running[leader_idx];
 
         // Grow the replicated Metadata to ~1.1MB (130 members * 500 label entries).
@@ -218,6 +277,19 @@ async fn large_metadata_catch_up_stays_live() {
         let leader = running[leader_idx];
         let target = leader.snapshot_index();
         let term_before = leader.term();
+
+        // Re-bind node 2 on a fresh port (its earlier env was fully torn
+        // down above) and refresh every peer's book with its new address —
+        // its on-disk state is still genuinely empty (it never voted or
+        // logged anything in its brief genesis appearance), so this is a
+        // faithful re-creation of "the dark node's process finally starts",
+        // not a different scenario.
+        let (env2, _addr2) = ProdEnv::bind(nid(2), loop0(), &dirs[2]).await.expect("bind");
+        book.insert(nid(2), env2.local_addr().to_string());
+        envs[2] = env2;
+        for e in &envs {
+            e.set_peers(book.clone());
+        }
 
         // Start node 2 (dark until now): it must catch up to the large, compacted
         // state. Primary signal: it does so promptly (12s budget; the fix serves the

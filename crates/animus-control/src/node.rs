@@ -671,6 +671,27 @@ impl<E: Env> RaftNode<E> {
         self.lock().election_timeout()
     }
 
+    /// Issue #667: whether this node is still resolving the boot-time
+    /// "genesis bootstrap or wiped-voter restart?" check — `true` means it
+    /// currently grants no votes and starts no elections. See
+    /// `RaftCore::begin_cluster_check`'s own doc.
+    #[must_use]
+    pub fn cluster_check_pending(&self) -> bool {
+        self.lock().cluster_check_pending()
+    }
+
+    /// Issue #667: whether this node has permanently refused to act as a
+    /// voter — its persisted state was empty at startup and a peer proved
+    /// the cluster it is configured into already exists. A health/admin
+    /// surface should treat this exactly like a down/unhealthy replica: it
+    /// requires operator action (remove + re-add via the learner/rejoin
+    /// path, ADR 0032/0058), never a bare process restart. See
+    /// `RaftCore::refused_as_voter`'s own doc.
+    #[must_use]
+    pub fn refused_as_voter(&self) -> bool {
+        self.lock().refused_as_voter()
+    }
+
     /// A clone of the apply task's published `Metadata` cache (ADR 0038 PR3)
     /// — gated on [`engine_applied_index`](Self::engine_applied_index), never
     /// the core's own (unused) in-memory state. May briefly read a fresher
@@ -921,6 +942,36 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
         let recovered =
             RaftCore::recovered(env.node_id(), &all_nodes, state, env.now(), env.next_u64());
         *core.lock().expect("raft core poisoned") = recovered;
+    } else {
+        // Issue #667 (P0 Raft safety): an empty WAL is ambiguous — it reads
+        // identically for "this is a genuine first-ever bootstrap" and "this
+        // voter's disk was wiped (ephemeral storage) and it is restarting
+        // into an already-established cluster". Never assume the former:
+        // the freshly-built `RaftCore` this node started with (`core`,
+        // above) already never votes/campaigns until
+        // `begin_cluster_check`'s probe round resolves one way or the
+        // other — see that method's own doc for the full mechanism and
+        // `docs/adr/0009-*.md`'s matching amendment for the design record.
+        //
+        // Deliberately discard the initial `ClusterProbe` broadcast
+        // `begin_cluster_check` returns here rather than sending it
+        // synchronously before this function's first `env.recv()`: this
+        // task is every OTHER node's own sole message consumer too, and a
+        // pre-loop that blocks on `env.send` to every peer before ever
+        // reading its own inbox risks exactly the mutual stall a real
+        // multi-node genesis (all peers doing the same thing at once) can
+        // hit under real scheduling — confirmed by a real-thread `ProdEnv`
+        // repro (`tests/prod_liveness.rs`'s `large_metadata_catch_up_stays_
+        // live`, which intermittently hung outright with an eager send
+        // here). `begin_cluster_check` already re-arms `election_deadline`,
+        // so the main loop below sends the real first probe round itself,
+        // from inside its normal `select` — sends and receives properly
+        // interleaved, never one blocking the other — the moment that timer
+        // fires (`start_pre_vote`'s own early-return arm resends the probe
+        // for as long as `cluster_check_pending` stays `Some`).
+        core.lock()
+            .expect("raft core poisoned")
+            .begin_cluster_check(env.now(), env.next_u64());
     }
     // Spawn the apply task now — after recovery has installed the recovered
     // core, so its first `drain_apply` sees the real post-recovery frontier,

@@ -333,6 +333,21 @@ pub enum RaftMsg<C = MetaCommand> {
     /// answering or ignoring it never depends on the sender's believed term,
     /// only on whether `self` is currently a `Leader`.
     WakeRequest { term: u64 },
+    /// Issue #667 (P0 Raft safety): sent by a node whose persisted state
+    /// replayed empty (`PersistedState::is_empty()`) to every configured
+    /// peer, asking "have you (or has anyone you know of) ever recorded
+    /// real state?" — the active half of the boot-time genesis-vs-wiped-
+    /// restart check (see [`RaftCore::begin_cluster_check`]). Carries no
+    /// payload: the honest answer is purely local to the responder.
+    ClusterProbe,
+    /// Response to [`RaftMsg::ClusterProbe`]: the responder's own current
+    /// term and commit index, reported honestly regardless of whether the
+    /// responder is itself still mid-check. `term > 0 || committed_index >
+    /// 0` is conclusive proof this responder (and thus the cluster it
+    /// belongs to) has real history — the asker was never told to assume
+    /// otherwise on a `0`/`0` reply from any *one* peer, only once every
+    /// configured peer has answered `0`/`0` (see `begin_cluster_check`).
+    ClusterProbeResp { term: u64, committed_index: u64 },
 }
 
 impl<C> RaftMsg<C> {
@@ -354,6 +369,13 @@ impl<C> RaftMsg<C> {
             | RaftMsg::TimeoutNow { term }
             | RaftMsg::Quiesce { term, .. } => *term,
             RaftMsg::Heartbeat { .. } | RaftMsg::WakeRequest { .. } => 0,
+            // Issue #667: a cluster-check probe carries no term *authority*
+            // either — its whole point is to be answerable (and answered
+            // honestly) independent of the responder's own term-stepdown
+            // state, exactly like `Heartbeat`/`WakeRequest` above. Its real
+            // payload (the responder's term/commit) is read explicitly by
+            // `handle_cluster_probe_resp`, never via this generic extractor.
+            RaftMsg::ClusterProbe | RaftMsg::ClusterProbeResp { .. } => 0,
         }
     }
 }
@@ -803,6 +825,27 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     // sweeper's own cadence is no slower than `quiesce_after` (see
     // `animusd`'s `--quiesce-after` validation).
     quiesce_veto_fresh_through: u64,
+
+    // Issue #667 (P0 Raft safety): boot-time "am I a wiped voter restarting
+    // into an already-established cluster, or is this a genuine fresh
+    // bootstrap?" check. `None` (every existing construction path — `new`
+    // and `recovered` both set this `None`) means "not applicable": this
+    // core's own persisted state was non-empty at recovery (so its own
+    // term/`voted_for` are trustworthy), or the caller never opted into the
+    // check at all (most unit/test construction). Only the driver's own
+    // `begin_cluster_check` (called exactly when a node's WAL replayed to
+    // `PersistedState::is_empty()`, `node.rs`'s `drive`) ever populates
+    // this. See `begin_cluster_check`'s own doc for the full mechanism.
+    cluster_check_pending: Option<BTreeSet<NodeId>>,
+    // Sticky: a peer's `ClusterProbeResp` proved real state exists elsewhere
+    // (`term > 0` or `committed_index > 0`) while `cluster_check_pending`
+    // was `Some`. Sticks for this `RaftCore`'s whole lifetime — there is no
+    // path that clears it, by design (ADR 0009's amendment): an
+    // already-established voter identity whose disk was wiped never
+    // becomes safe to vote/campaign as again just by waiting or catching
+    // up on replication; it must be re-admitted through the learner/
+    // rejoin path (ADR 0032/0058) as a genuinely new membership event.
+    cluster_check_refused: bool,
 }
 
 impl<C, S> RaftCore<C, S>
@@ -870,6 +913,8 @@ where
             quiesce_engine_caught_up: true,
             quiesce_veto: false,
             quiesce_veto_fresh_through: u64::MAX,
+            cluster_check_pending: None,
+            cluster_check_refused: false,
         };
         core.reset_election_timer(now, entropy);
         core
@@ -2052,6 +2097,11 @@ where
             // ignores any that reach it.
             RaftMsg::Heartbeat { .. } => Vec::new(),
             RaftMsg::TimeoutNow { term } => self.handle_timeout_now(term, now, entropy),
+            RaftMsg::ClusterProbe => self.handle_cluster_probe(from),
+            RaftMsg::ClusterProbeResp {
+                term,
+                committed_index,
+            } => self.handle_cluster_probe_resp(from, term, committed_index),
             RaftMsg::Quiesce { term, commit_index } => {
                 self.handle_quiesce(from, term, commit_index);
                 Vec::new()
@@ -2073,6 +2123,141 @@ where
             return Vec::new();
         }
         self.start_election(now, entropy)
+    }
+
+    /// Issue #667 (P0 Raft safety). Called by the driver exactly once, right
+    /// after it builds a fresh `RaftCore` for a node whose WAL replayed to
+    /// `PersistedState::is_empty()` — i.e. `current_term == 0`, `voted_for ==
+    /// None`, an empty log, no snapshot. That local emptiness is ambiguous:
+    /// it is indistinguishable from a genuine first-ever bootstrap of a
+    /// brand new cluster. Voting or campaigning before resolving the
+    /// ambiguity is unsafe — an already-established voter identity whose
+    /// disk was wiped (ephemeral storage) could grant a *second*, distinct
+    /// vote in a term it durably voted in before the wipe, since the vote it
+    /// already cast is exactly what got lost. See `start_pre_vote`/
+    /// `start_election`'s own guards and `handle_request_vote`'s grant
+    /// condition, all of which check `cluster_check_pending`/
+    /// `cluster_check_refused` below.
+    ///
+    /// Broadcasts [`RaftMsg::ClusterProbe`] to every configured peer and
+    /// parks in `cluster_check_pending` until every one of them has
+    /// answered `0`/`0` (see `handle_cluster_probe_resp`) — a single-node
+    /// group (`self.peers` empty) has nothing to wait for and resolves
+    /// immediately. A never-answering peer is never assumed fresh: the
+    /// election-timeout tick keeps resending probes (`start_pre_vote`'s own
+    /// early-return arm) for as long as `cluster_check_pending` stays
+    /// `Some` — "peers unreachable" means keep probing, never vote.
+    pub fn begin_cluster_check(&mut self, now: Nanos, entropy: u64) -> Vec<Out<C>> {
+        if self.peers.is_empty() {
+            // Nothing to confirm with — a lone voter (or a peerless test
+            // core) cannot possibly race anyone else for its own vote.
+            self.cluster_check_pending = None;
+            return Vec::new();
+        }
+        self.cluster_check_pending = Some(self.peers.iter().cloned().collect());
+        self.reset_election_timer(now, entropy);
+        self.broadcast_cluster_probe()
+    }
+
+    fn broadcast_cluster_probe(&self) -> Vec<Out<C>> {
+        self.peers
+            .iter()
+            .map(|p| (p.clone(), RaftMsg::ClusterProbe))
+            .collect()
+    }
+
+    /// Answer a peer's [`RaftMsg::ClusterProbe`] honestly with our own
+    /// current term/commit index — including while our *own*
+    /// `cluster_check_pending` is still unresolved: a still-checking node's
+    /// honest `0`/`0` is exactly the evidence a fellow genesis participant
+    /// needs, and once this node itself resolves (either way) its own
+    /// term/commit reflect that truthfully from then on.
+    fn handle_cluster_probe(&mut self, from: NodeId) -> Vec<Out<C>> {
+        vec![(
+            from,
+            RaftMsg::ClusterProbeResp {
+                term: self.current_term,
+                committed_index: self.commit_index,
+            },
+        )]
+    }
+
+    /// Tally a [`RaftMsg::ClusterProbeResp`]. A no-op unless our own
+    /// `cluster_check_pending` is still `Some` (already resolved, or never
+    /// applicable — a stale/duplicate reply). `term > 0 || committed_index >
+    /// 0` is conclusive: `from` (and thus the cluster) has real history, so
+    /// this node's own identity is an already-established voter whose disk
+    /// was wiped — refuse permanently (`cluster_check_refused`, never
+    /// cleared). Otherwise `from` is confirmed empty too; once *every*
+    /// configured peer has confirmed empty, resolve to a genuine fresh
+    /// bootstrap and kick off the real election machinery immediately
+    /// (rather than waiting for the next election-timeout tick).
+    fn handle_cluster_probe_resp(
+        &mut self,
+        from: NodeId,
+        term: u64,
+        committed_index: u64,
+    ) -> Vec<Out<C>> {
+        let Some(pending) = self.cluster_check_pending.as_mut() else {
+            return Vec::new();
+        };
+        if term > 0 || committed_index > 0 {
+            self.cluster_check_pending = None;
+            self.cluster_check_refused = true;
+            tracing::error!(
+                node = %self.id,
+                peer = %from,
+                peer_term = term,
+                peer_committed_index = committed_index,
+                "refusing to start as a voter: this node's persisted Raft state is empty \
+                 (ephemeral storage wiped?) but peer {from} shows an already-established \
+                 cluster (term or committed index > 0). Re-add this node id through the \
+                 rejoin path instead of restarting it as a static voter: remove it from the \
+                 voter set, add it back as a learner (`animusd join` / admin add-learner, \
+                 ADR 0032/0058), and let it be promoted back to voter once caught up.",
+            );
+            return Vec::new();
+        }
+        pending.remove(&from);
+        if pending.is_empty() {
+            self.cluster_check_pending = None;
+            // Deliberately do NOT jump straight into `start_pre_vote` here.
+            // `begin_cluster_check` already (re)armed `election_deadline`
+            // when the probe round started, so the ordinary tick fires this
+            // node's first real pre-vote at the same moment it always would
+            // have — and waiting for it, rather than racing ahead the
+            // instant *this* node's own round resolves, is what keeps a
+            // genuine multi-node genesis bootstrap safe: every founding
+            // peer's probe round is symmetric and starts at the same time,
+            // so (network latency << election_base) every one of them
+            // resolves before any of them could legitimately start a real
+            // election. Resolving early and campaigning immediately would
+            // let a fast pair elect a leader while a merely-slower third
+            // peer's own round is still in flight — indistinguishable, from
+            // that peer's own evidence, from a real wiped-voter restart, so
+            // it would be wrongly and permanently refused for no better
+            // reason than an ordinary bootstrap timing race.
+        }
+        Vec::new()
+    }
+
+    /// Whether this node is still resolving the issue #667 boot-time check —
+    /// while `true` it never grants a real vote and never campaigns (see
+    /// `begin_cluster_check`'s doc).
+    #[must_use]
+    pub fn cluster_check_pending(&self) -> bool {
+        self.cluster_check_pending.is_some()
+    }
+
+    /// Whether this node has permanently refused to act as a voter (issue
+    /// #667): its persisted state replayed empty, and a peer's
+    /// `ClusterProbeResp` proved the cluster it is configured into already
+    /// exists. Sticky for this `RaftCore`'s lifetime — see
+    /// `cluster_check_refused`'s own field doc for why there is no path
+    /// back from this short of a restart through the learner/rejoin path.
+    #[must_use]
+    pub fn refused_as_voter(&self) -> bool {
+        self.cluster_check_refused
     }
 
     /// Propose a command. If leader, append it (replicated on the next
@@ -2221,9 +2406,16 @@ where
                 || (last_log_term == self.last_log_term()
                     && last_log_index >= self.last_log_index());
             let can_vote = self.voted_for.is_none() || self.voted_for == Some(candidate.clone());
+            // Issue #667: an empty-store node still resolving (or refused
+            // on) the genesis-vs-wiped-restart check must never grant a
+            // real vote — `voted_for.is_none()` above is exactly the
+            // locally-unreliable signal a wiped voter's own forgotten vote
+            // would otherwise defeat. See `begin_cluster_check`'s doc.
+            let cluster_checked =
+                !self.cluster_check_refused && self.cluster_check_pending.is_none();
             // ADR 0058 Train 1: a learner never grants a real vote either
             // (mirrors `handle_pre_vote`'s identical gate/rationale).
-            if self.is_voter() && can_vote && log_ok {
+            if self.is_voter() && can_vote && log_ok && cluster_checked {
                 self.voted_for = Some(candidate.clone());
                 self.reset_election_timer(now, entropy);
                 true
@@ -2807,6 +2999,19 @@ where
     /// partitioned/stalled node thus loops through harmless pre-vote rounds instead
     /// of ratcheting the cluster's term.
     fn start_pre_vote(&mut self, now: Nanos, entropy: u64) -> Vec<Out<C>> {
+        // Issue #667: an empty-store node still resolving (or having
+        // resolved unfavorably) the genesis-vs-wiped-restart check must
+        // never campaign — see `begin_cluster_check`'s doc. While pending,
+        // resend the probe instead of giving up on the round entirely, so a
+        // transiently-unreachable peer's eventual reply still unblocks us.
+        if self.cluster_check_refused {
+            self.reset_election_timer(now, entropy);
+            return Vec::new();
+        }
+        if self.cluster_check_pending.is_some() {
+            self.reset_election_timer(now, entropy);
+            return self.broadcast_cluster_probe();
+        }
         // A node removed from the configuration must not campaign (mirrors
         // `start_election`): it can't win and would only disrupt the survivors.
         // Issue #554: a node whose own state machine is behind its own log's
@@ -2860,6 +3065,13 @@ where
         // independent entry point (`handle_pre_vote_resp`'s own majority
         // check can reach here without going back through `start_pre_vote`),
         // so both need the check, not just one.
+        if self.cluster_check_refused || self.cluster_check_pending.is_some() {
+            // Defense in depth (mirrors `start_pre_vote`'s own primary
+            // guard): `handle_pre_vote_resp`/`handle_timeout_now` can reach
+            // this function directly, bypassing `start_pre_vote`.
+            self.reset_election_timer(now, entropy);
+            return Vec::new();
+        }
         if !self.is_voter() || self.state_machine_behind {
             self.reset_election_timer(now, entropy);
             return Vec::new();
