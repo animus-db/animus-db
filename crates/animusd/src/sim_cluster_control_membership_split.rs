@@ -1,15 +1,114 @@
 //! `SimCluster`-driven conversion of `tests/control_membership_split.rs` —
-//! ADR 0061 rung M (C-13) PR 6.
+//! ADR 0061 rung M (C-13) PR 6, extended by ADR 0061 rung N (C-14) PR 3.
 //!
-//! This file's own 2 real-socket tests are NOT structurally equivalent: one
+//! **C-13 PR 6 converted this file's first test and assessed-and-closed the
+//! second one** (see the original account below, kept verbatim for the
+//! history — the primitive it names as missing, `SimCluster::grow_control`,
+//! did not exist yet). **C-14 PR 3 converts that second test too**, now that
+//! `SimCluster::grow_control` (C-14 PR 2) supplies the exact "combined"
+//! (control-plane-voter) growth primitive both dispositions below named as
+//! deferred — the real `tests/control_membership_split.rs` is now converted
+//! whole and deleted (both of its tests have a deterministic sibling here),
+//! per this crate's own "a file left with zero tests is deleted" discipline
+//! (precedent: `data_join.rs`/`seed_join.rs`, ADR 0061 rung M).
+//!
+//! ## (3) `grow_then_replace_a_voter_over_a_split_deployment_with_live_data_
+//! traffic` — **converted (C-14 PR 3)**
+//!
+//! The real test's own subject — a genuine split deployment (3 control-only
+//! + 2 data-only nodes) growing its control quorum by one real, previously
+//! non-existent voter at runtime, then replacing a founding voter (transfer
+//! leadership away if it's currently leading, crash it for good, remove it
+//! via the real admin route), all while continuous data-plane traffic keeps
+//! flowing — is now fully reachable: [`SimCluster::new_with_roles`] builds
+//! the mixed control/data-only fixture (unchanged since C-12), the wire
+//! `CreateTable`/[`SimCluster::put`]/[`SimCluster::get`] triple already
+//! proves data-plane traffic through a split deployment (`sim_cluster_
+//! control_data_split.rs`'s own precedent), and [`SimCluster::grow_control`]
+//! (C-14 PR 2) is exactly the primitive this file's own C-13 PR 6 doc and
+//! `sim_cluster_control_membership_admin.rs`'s own module doc (C-12 PR 4e)
+//! both independently flagged as the missing piece — a genuinely fresh
+//! `RaftNode<SimEnv>` self-registered over the real relayed discovery path
+//! and admitted as a live voter through the real `POST /admin/control/
+//! member/add` route, never a bypass propose.
+//!
+//! **Traffic idiom, and why it differs from the real test's own background
+//! `tokio::spawn`ed writer**: `SimCluster` is driven `&mut self`, so a
+//! genuinely concurrent background task racing the foreground admin/put/get
+//! calls this scenario also issues is not the natural shape here (unlike
+//! `sim_cluster_corpus.rs`'s own `SimClusterHandle`-based client tasks,
+//! built for a materially different purpose — a randomized fault corpus,
+//! not a fixed membership-change script). Instead, [`write_and_verify_
+//! traffic_key`] issues a checkpoint write-then-read-back at each phase
+//! boundary (before the grow, immediately after it, immediately after the
+//! replace), each hardened with the identical bounded-retry converged-poll
+//! idiom `sim_cluster_seed_join.rs`'s own private `retry_forwarding_proof`
+//! describes (never a fixed-deadline one-shot assert) — and every key
+//! written across the whole scenario is read back once more at the very
+//! end, mirroring the real test's own final per-acked-key `await_value`
+//! loop. Where the real test tolerates `>= 35/40` acked writes (a genuine
+//! real-clock allowance for its own background task's pacing), this
+//! scenario's bounded-retry writes are each REQUIRED to land — a strictly
+//! stronger bar, not a weaker one, since nothing here is racing a real
+//! clock.
+//!
+//! **Voter selection, and the `POST /admin/control/transfer` branch**: the
+//! victim is a FIXED original voter id (`0`) — distinct from `grown` on
+//! every seed, since `grown` is always `>= 5` (the post-construction node
+//! count) — rather than the real test's own dynamic "whichever original
+//! isn't currently leading" pick. This is deliberate, not a shortcut: a
+//! fixed victim means whether it happens to be the CURRENT control leader
+//! at replace time is genuinely seed-dependent (leader election in `SimEnv`
+//! is itself seeded), so across the pinned seed and the five `_over_seeds`
+//! seeds this scenario exercises BOTH branches for real — the transfer-away
+//! path (bounded retry on `409`, mirroring `sim_cluster_control_growth.rs`'s
+//! own `assert_grown_voter_crash_transfer_serve_and_restart` idiom exactly)
+//! on whichever seeds land the leader on node `0`, and the no-transfer-
+//! needed path on every other seed — rather than a selection that
+//! deterministically avoids the leader and leaves the transfer branch
+//! permanently untested. `victim` is always crashed only AFTER it is
+//! confirmed non-leading (either by construction, or by the transfer having
+//! just moved leadership away from it), so the removal's own leader lookup
+//! never needs `control_leader_index_excluding`'s own stale-frozen-belief
+//! guard (`sim_cluster_control_growth.rs`'s own gotcha) — the crashed node
+//! here was never leader at the instant it crashed, unlike that module's
+//! own scenario, which deliberately crashes the CURRENT leader.
+//! `member/remove` is called with `force: true` unconditionally (not
+//! conditionally, unlike the real test, which never needs it): the removing
+//! node can be `grown` itself, freshly promoted by the just-armed transfer,
+//! which — mirroring `sim_cluster_control_growth.rs`'s own documented
+//! reasoning for the identical call — may not yet have exchanged enough
+//! heartbeats with every OTHER survivor to satisfy the liveness-aware
+//! quorum-loss guard without it; using `force` unconditionally avoids a
+//! seed-dependent flake in exactly the cases the transfer branch above is
+//! designed to exercise.
+//!
+//! No new production code was needed — every primitive this scenario
+//! reaches (`SimCluster::new_with_roles`, wire `CreateTable`,
+//! [`SimCluster::put`]/[`SimCluster::get`], [`SimCluster::grow_control`],
+//! [`SimCluster::admin`] for `/admin/control/transfer` and `/admin/control/
+//! member/remove`, [`SimCluster::control_voters`]) already existed before
+//! this PR. **No product bug found** — every scenario passed at its pinned
+//! seed and every `_over_seeds` seed on the first clean run once the wire/
+//! traffic fixture shapes matched.
+//!
+//! Replays (repo convention): `ANIMUS_SEED=<seed> cargo test -p animusd
+//! --lib <scenario name>`.
+//!
+//! ---
+//!
+//! ## C-13 PR 6's own original account (kept for the history)
+//!
+//! This file's own 2 real-socket tests were NOT structurally equivalent: one
 //! converts cleanly with no new production code; the other's own real
-//! subject needs a "combined" (control-plane-voter) growth primitive that
+//! subject needed a "combined" (control-plane-voter) growth primitive that
 //! `SimCluster::grow`'s own doc, and `sim_cluster_control_membership_admin.
-//! rs`'s own module doc (ADR 0061 rung L, C-12 PR 4e), BOTH already flag as
-//! **deferred and separately budgeted** — not the kind of "small additive
-//! `#[cfg(test)]` extension" a single PR should build under time pressure.
-//! See each disposition below for the precise reasoning; this is the
-//! assess-and-close half of this PR, alongside the one real conversion.
+//! rs`'s own module doc (ADR 0061 rung L, C-12 PR 4e), BOTH already flagged
+//! as **deferred and separately budgeted** — not the kind of "small
+//! additive `#[cfg(test)]` extension" a single PR should build under time
+//! pressure. See each disposition below for the precise reasoning; this was
+//! the assess-and-close half of that PR, alongside the one real conversion
+//! — since superseded by (3) above, now that C-14 PR 2 supplied the primitive.
 //!
 //! ## (1) `admin_add_control_member_races_a_control_only_self_registration_
 //! and_still_converges` — **converted**
@@ -54,7 +153,9 @@
 //! seed-reproducible, unlike the real test's own real-clock race.
 //!
 //! ## (2) `grow_then_replace_a_voter_over_a_split_deployment_with_live_data_
-//! traffic` — **assessed, not converted (stays real-socket)**
+//! traffic` — **assessed, not converted (stays real-socket), AT THE TIME**
+//! **(superseded by (3) above — C-14 PR 3 converts it once `grow_control`
+//! exists)**
 //!
 //! This test's own real subject is a genuine control-plane VOTER growth
 //! node: a freshly bound `Node::bind_control` process whose own local
@@ -121,9 +222,11 @@
 //! (needed independently by `SimCluster::grow`'s "data" role's own sibling,
 //! and by `data_join.rs`'s already-converted dial for the "control" role
 //! per C-13's own opener plan §3/§4a option (a)) would make this test's
-//! conversion the natural next PR on top of it — this module's own doc is
-//! the pointer for that future work, not a permanent "never convert"
-//! verdict.
+//! conversion the natural next PR on top of it — this module's own doc was
+//! the pointer for that future work at the time. **That rung landed as
+//! ADR 0061 rung N (C-14): `SimCluster::grow_control` (PR 2) is the
+//! "combined growth" primitive named above, and (3) at the top of this
+//! doc is that natural next PR (C-14 PR 3).**
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -132,7 +235,7 @@ use animus_control::{MetaCommand, NodeAddrs, ProposeResult};
 use animus_env::{NodeId, nid};
 
 use super::sim_cluster::SimCluster;
-use super::sim_cluster_console::{env_seed, json};
+use super::sim_cluster_console::{create_table_via_wire, env_seed, json};
 use crate::config::NodeRole;
 
 /// Converged-or-timeout poll on `cond(cluster)` — the shared shape every
@@ -331,6 +434,326 @@ fn admin_add_control_member_races_a_control_only_self_registration_and_still_con
     for i in 0..5 {
         run_admin_add_control_member_races_a_control_only_self_registration_and_still_converges(
             0xC13F_1000 + i,
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// (3) grow_then_replace_a_voter_over_a_split_deployment_with_live_data_
+//     traffic — ADR 0061 rung N, C-14 PR 3
+// ---------------------------------------------------------------------------
+
+/// The table this scenario's own traffic writes/reads.
+const REPLACE_TRAFFIC_TABLE: &str = "membership_t";
+/// The two data-only nodes (ids 3, 4 — `NodeRole::Control` occupies 0, 1, 2)
+/// this scenario's own traffic round-robins across, mirroring the real
+/// test's own `data_clients` list.
+const REPLACE_DATA_NODES: [u64; 2] = [3, 4];
+
+/// One hash-key (`pk`, string) `CreateTable`, issued from `node` — mirrors
+/// `sim_cluster_seed_join.rs`'s identically-shaped `create_table` helper
+/// (this crate's own "small fixtures duplicated per test module"
+/// convention).
+fn create_membership_table(cluster: &mut SimCluster, node: u64) -> (u16, String) {
+    let body = format!(
+        r#"{{"TableName":"{REPLACE_TRAFFIC_TABLE}",
+            "KeySchema":[{{"AttributeName":"pk","KeyType":"HASH"}}],
+            "AttributeDefinitions":[{{"AttributeName":"pk","AttributeType":"S"}}]}}"#
+    );
+    create_table_via_wire(cluster, node, &body)
+}
+
+/// Retry a fallible `SimCluster` op (a `put`/`get`) while it transiently
+/// fails, driving a small step of virtual time forward between attempts —
+/// the module's own converged-poll idiom (never a fixed-deadline one-shot
+/// assert), duplicated from `sim_cluster_seed_join.rs`'s own private
+/// `retry_forwarding_proof` per this crate's "small fixtures duplicated per
+/// test module" convention (that function is private to its own module).
+/// Panics, naming the seed and the exhausted attempt count, if `op` never
+/// succeeds.
+fn retry_op<T>(
+    cluster: &mut SimCluster,
+    seed: u64,
+    what: &str,
+    mut op: impl FnMut(&mut SimCluster) -> Result<T, String>,
+) -> T {
+    const MAX_ATTEMPTS: u32 = 20;
+    const STEP: Duration = Duration::from_millis(200);
+    for attempt in 0..MAX_ATTEMPTS {
+        let last_err = match op(cluster) {
+            Ok(v) => return v,
+            Err(e) => e,
+        };
+        assert!(
+            attempt + 1 < MAX_ATTEMPTS,
+            "seed={seed}: {what} kept hitting a transient failure after {MAX_ATTEMPTS} \
+             attempts (each spaced {STEP:?} of virtual time apart, step={attempt}) — \
+             last error: {last_err}"
+        );
+        cluster.run_for(STEP);
+    }
+    unreachable!("loop above always returns or panics before exhausting MAX_ATTEMPTS")
+}
+
+/// Write `pk = value` (retried, never a fixed-deadline one-shot attempt),
+/// then read it back (also retried) and assert the value round-tripped —
+/// this scenario's own "data traffic still flows" checkpoint, issued
+/// against whichever of [`REPLACE_DATA_NODES`] accepts the write/answers
+/// the read first.
+fn write_and_verify_traffic_key(cluster: &mut SimCluster, seed: u64, pk: &str, value: &[u8]) {
+    retry_op(cluster, seed, &format!("writing traffic key {pk}"), |c| {
+        let mut last = Err("neither data node accepted the write".to_string());
+        for &node in &REPLACE_DATA_NODES {
+            match c.put(node, REPLACE_TRAFFIC_TABLE, pk, "sk", value) {
+                Ok(()) => return Ok(()),
+                Err(e) => last = Err(e),
+            }
+        }
+        last
+    });
+    let got = retry_op(
+        cluster,
+        seed,
+        &format!("reading back traffic key {pk}"),
+        |c| {
+            for &node in &REPLACE_DATA_NODES {
+                if let Ok(Some(v)) = c.get(node, REPLACE_TRAFFIC_TABLE, pk, "sk", true) {
+                    return Ok(v);
+                }
+            }
+            Err("neither data node returned the value yet".to_string())
+        },
+    );
+    assert_eq!(
+        got, value,
+        "seed={seed}: traffic key {pk} read back the wrong value"
+    );
+}
+
+/// Arm a leadership transfer to `target` and retry on the retryable `409`
+/// this route can answer — mirrors `sim_cluster_control_growth.rs`'s own
+/// `assert_grown_voter_crash_transfer_serve_and_restart` transfer-retry
+/// block exactly (duplicated, not reached into, per this crate's own
+/// convention). Unlike that module's own call, `target` here is never the
+/// node whose stale post-crash belief needs `control_leader_index_
+/// excluding` — this scenario only ever transfers leadership away from a
+/// node BEFORE crashing it (see the caller's own comment), so a plain
+/// [`SimCluster::control_leader_index`] is sound throughout.
+fn transfer_leadership_with_retry(cluster: &mut SimCluster, target: u64, seed: u64) {
+    let body = format!(r#"{{"to":"{}"}}"#, nid(target));
+    let mut accepted = false;
+    for _ in 0..40 {
+        let leader_idx = cluster.control_leader_index();
+        let leader = cluster.control_node_id(leader_idx);
+        if leader == target {
+            accepted = true;
+            break;
+        }
+        let (status, resp) = cluster.admin(
+            leader,
+            "POST",
+            "/admin/control/transfer",
+            "",
+            body.as_bytes(),
+        );
+        match status {
+            200 => {
+                accepted = true;
+                break;
+            }
+            409 => cluster.run_for(Duration::from_millis(100)),
+            other => panic!(
+                "seed={seed}: transfer to {target} should be accepted or retryable: {other} {resp}"
+            ),
+        }
+    }
+    assert!(
+        accepted,
+        "seed={seed}: transfer to {target} was never accepted within budget"
+    );
+    let leader_after_idx = cluster.control_leader_index();
+    let leader_after = cluster.control_node_id(leader_after_idx);
+    assert_eq!(
+        leader_after, target,
+        "seed={seed}: control leadership never moved to {target} (now {leader_after})"
+    );
+}
+
+fn run_grow_then_replace_a_voter_over_a_split_deployment_with_live_data_traffic(seed: u64) {
+    // 3 control-only (ids 0,1,2) + 2 data-only (ids 3,4) — mirrors the real
+    // test's own `support::bring_up_split(3, 2, ..)`.
+    let roles = [
+        NodeRole::Control,
+        NodeRole::Control,
+        NodeRole::Control,
+        NodeRole::Data,
+        NodeRole::Data,
+    ];
+    let mut cluster = SimCluster::new_with_roles(seed, &roles, 2);
+
+    // Wire-created (never `SimCluster::create_table`'s own hand-hosted
+    // shortcut, which would pick replicas `0..replication` — the
+    // CONTROL-only nodes in this mixed cluster, `sim_cluster_seed_join.rs`'s
+    // own documented reason).
+    let create_leader = cluster.control_leader_index() as u64;
+    let (status, body) = create_membership_table(&mut cluster, create_leader);
+    assert_eq!(
+        status, 200,
+        "seed={seed}: CreateTable({REPLACE_TRAFFIC_TABLE}) failed: {body}"
+    );
+
+    // Continuous write traffic spanning the whole grow + replace flow —
+    // every key attempted here is retried (never a fixed-deadline one-shot
+    // assert) and accumulated so the final loop below can re-verify every
+    // one, mirroring the real test's own "a few writes land" gate plus its
+    // final per-acked-key readback loop.
+    let mut written: Vec<(String, Vec<u8>)> = Vec::new();
+    for i in 0..3 {
+        let pk = format!("membership-{i}");
+        let value = format!("v{i}").into_bytes();
+        write_and_verify_traffic_key(&mut cluster, seed, &pk, &value);
+        written.push((pk, value));
+    }
+
+    // ---- Phase 1: grow the control quorum 3 -> 4 --------------------------
+    let grown = cluster.grow_control();
+
+    // Every control-bearing node's own live voter belief includes the new
+    // id — 4 voters total (`grow_control`'s own step 5 already converged
+    // this before returning; re-checking here is this scenario's own
+    // explicit assertion).
+    let control_ids: Vec<u64> = (0..cluster.control_count())
+        .map(|i| cluster.control_node_id(i))
+        .collect();
+    for &n in &control_ids {
+        let voters = cluster
+            .control_voters(n)
+            .unwrap_or_else(|| panic!("seed={seed}: node {n} has no live voter belief at all"));
+        assert!(
+            voters.contains(&nid(grown)),
+            "seed={seed}: node {n}'s own live voter belief must include the grown voter \
+             {grown}: {voters:?}"
+        );
+        assert_eq!(
+            voters.len(),
+            4,
+            "seed={seed}: node {n}'s own live voter belief should have exactly 4 members, \
+             got {voters:?}"
+        );
+    }
+
+    // Data traffic still flows after the grow.
+    write_and_verify_traffic_key(&mut cluster, seed, "post-grow", b"ok");
+    written.push(("post-grow".to_string(), b"ok".to_vec()));
+
+    // ---- Phase 2: replace an ORIGINAL voter --------------------------------
+    // A FIXED original voter id, distinct from `grown` on every seed (see
+    // this module's own doc, above, for why a fixed rather than
+    // leader-avoiding pick is deliberate: it exercises the transfer-away
+    // branch below on whichever seeds happen to land the leader on it,
+    // rather than never at all).
+    let victim: u64 = 0;
+    let leader_before_replace_idx = cluster.control_leader_index();
+    let leader_before_replace = cluster.control_node_id(leader_before_replace_idx);
+    if leader_before_replace == victim {
+        transfer_leadership_with_retry(&mut cluster, grown, seed);
+    }
+
+    // Crash it for good — mirrors the real test's own `shutdown_graceful`
+    // of a voter it never intends to bring back. `victim` is confirmed
+    // non-leading at this point either way (by construction, or by the
+    // transfer just above), so the removal's own leader lookup below needs
+    // no `control_leader_index_excluding` guard.
+    cluster.crash(victim);
+
+    let remover_idx = cluster.control_leader_index();
+    let remover = cluster.control_node_id(remover_idx);
+    // `force: true` unconditionally — see this module's own doc for why:
+    // the remover can be the freshly-promoted `grown` node, which may not
+    // yet have exchanged enough heartbeats with every other survivor to
+    // satisfy the liveness-aware quorum-loss guard without it.
+    let remove_body = format!(r#"{{"node":"{}","force":true}}"#, nid(victim));
+    let (status, resp) = cluster.admin(
+        remover,
+        "POST",
+        "/admin/control/member/remove",
+        "",
+        remove_body.as_bytes(),
+    );
+    assert_eq!(
+        status, 200,
+        "seed={seed}: control/member/remove for victim {victim} failed: {resp}"
+    );
+
+    // Every SURVIVOR (the two remaining originals + grown) converges on the
+    // resulting 3-voter set — never a fixed-deadline one-shot assert.
+    let expected_after_remove: std::collections::BTreeSet<NodeId> = [0u64, 1, 2, grown]
+        .into_iter()
+        .filter(|&n| n != victim)
+        .map(nid)
+        .collect();
+    poll_until(
+        &mut cluster,
+        Duration::from_secs(20),
+        seed,
+        "every survivor converging on the post-remove 3-voter set",
+        |c| {
+            [0u64, 1, 2, grown]
+                .into_iter()
+                .filter(|&n| n != victim)
+                .all(|n| {
+                    c.control_voters(n)
+                        .is_some_and(|v: std::collections::BTreeSet<NodeId>| {
+                            v == expected_after_remove
+                        })
+                })
+        },
+    );
+
+    // Data traffic still flows after the full replace cycle.
+    write_and_verify_traffic_key(&mut cluster, seed, "post-replace", b"ok");
+    written.push(("post-replace".to_string(), b"ok".to_vec()));
+
+    // Every key written across the WHOLE scenario still reads back
+    // correctly — mirrors the real test's own final per-acked-key
+    // `await_value` loop. Where the real test tolerates `>= 35/40` acked
+    // writes (a real-clock allowance for its own background task's
+    // pacing), every attempted write here was already required to land
+    // (each `write_and_verify_traffic_key` call above panics on its own
+    // exhaustion), so this final pass is a re-verification, not a filter.
+    for (pk, value) in &written {
+        let got = retry_op(
+            &mut cluster,
+            seed,
+            &format!("final readback of {pk}"),
+            |c| {
+                for &node in &REPLACE_DATA_NODES {
+                    if let Ok(Some(v)) = c.get(node, REPLACE_TRAFFIC_TABLE, pk, "sk", true) {
+                        return Ok(v);
+                    }
+                }
+                Err("neither data node returned the value yet".to_string())
+            },
+        );
+        assert_eq!(
+            &got, value,
+            "seed={seed}: final readback of {pk} mismatched"
+        );
+    }
+}
+
+#[test]
+fn grow_then_replace_a_voter_over_a_split_deployment_with_live_data_traffic() {
+    run_grow_then_replace_a_voter_over_a_split_deployment_with_live_data_traffic(env_seed(
+        0xC14F_0001,
+    ));
+}
+
+#[test]
+fn grow_then_replace_a_voter_over_a_split_deployment_with_live_data_traffic_over_seeds() {
+    for i in 0..5 {
+        run_grow_then_replace_a_voter_over_a_split_deployment_with_live_data_traffic(
+            0xC14F_1000 + i,
         );
     }
 }

@@ -365,6 +365,42 @@ binary for a build-time-only JSON shape. **Keeping that mirror in sync with
   see that file if `cargo deny check` ever flags it again after a `kube`
   version bump changes its dependency shape.
 
+## NetworkPolicy admin-port ingress needs a namespaceSelector (issue #857, 2026-09-14)
+
+`desired::networkpolicy::build`'s admin-port ingress rule used to admit the
+operator via a bare `podSelector` (`pod_selector(operator_labels)`) — which
+a `NetworkPolicyPeer` scopes to the `NetworkPolicy` object's **own**
+namespace, i.e. the `AnimusCluster`'s namespace, never the operator's. The
+operator runs in its own dedicated namespace
+(`deploy/operator/deployment.yaml`'s `Namespace` object, `animus-operator`),
+distinct from every `AnimusCluster`'s own namespace
+(`deploy/operator/example.yaml`'s `default`), so the rule was a silent
+no-op in the documented deployment topology: nothing in the `AnimusCluster`'s
+own namespace carries the operator's pod labels. Masked under the default
+`--admin-access proxy` (admin calls go through the API server's pod-proxy
+subresource, not sourced from an operator pod at all), but a hard block
+under the supported `--admin-access direct` mode, which dials pods
+directly from the operator's own pod — every scale-down admin call
+(`/admin/drain`, `/admin/member/drain-status`, `/admin/member/remove`)
+would fail, feeding directly into #853's drain-failure path.
+
+Fixed by `operator_peer`, mirroring `dns_peer`'s own precedent exactly: AND
+a `namespaceSelector` (on the namespace's well-known name label,
+`kubernetes.io/metadata.name`) with the existing `podSelector`. The
+operator's namespace is **not** derivable from the `AnimusCluster` object
+or threaded through `build()` as a parameter — it is a fixed constant,
+`OPERATOR_NAMESPACE = "animus-operator"`, matching
+`deploy/operator/deployment.yaml`'s shipped `Namespace` name (which happens
+to equal `OPERATOR_APP_NAME`'s own string value, a coincidence of the
+manifest, not a derivation — kept as its own named constant rather than
+reusing `OPERATOR_APP_NAME` so the two concepts, "the operator's app-name
+label value" and "the operator's namespace name," don't get silently
+conflated if either one changes independently later). **A deployment that
+renames the operator's own namespace away from `animus-operator` must
+update `desired::networkpolicy::OPERATOR_NAMESPACE` to match** — the exact
+same manual-sync posture `KUBE_SYSTEM_NAMESPACE` already has for a
+non-default `kube-dns` namespace.
+
 ## Probes: readiness vs. liveness (issue #710, 2026-09-07)
 
 `desired::statefulset::admin_probe` builds both probes off one shared
