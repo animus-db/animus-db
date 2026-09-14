@@ -25716,3 +25716,78 @@ for a different case (a rung's inherited "why it stays `ProdEnv`" label
 turning out to be stale once actually re-read) — the fix generalizes: two
 independent citations agreeing is good evidence, never a substitute for
 checking the mechanism yourself.
+
+## A "narrowed generic split" bug can hide behind a shared prelude too, not just a shared dispatcher (issue #842)
+
+The five PartiQL entry points in `animusd::dynamo` (`execute_statement`,
+`execute_transaction`, `execute_one_batch_statement`, and their two
+`<E, R>`-generic siblings) each ran `table_known` (existence) *before*
+`authz::authorize`/`authorize_op`/`authorize_each_table` (authorization) —
+the exact reverse of `run_operation`'s own prelude order (`authorize_op`
+always runs before dispatch) and of `run_transact`/`run_transact_get`'s own
+authz-before-`resolve_key` order. A `Principal::Scoped` (ADR 0066)
+principal denied access to a table therefore got a *different* error for a
+table that exists (`AccessDeniedException`, once the real handler's own
+authz check ran) than for one that never existed (`ResourceNotFoundException`,
+from the pre-authz existence short-circuit) — a table-enumeration oracle
+none of the native single-op paths have, since those always authorize
+first. The fix is a small, mechanical reorder at all five sites: parse →
+resolve the table name(s) → authorize (using `OpClass::Read`/`Write`
+resolved from the statement's own kind, needing no lowered `Operation` at
+all — `Policy::allows` only ever consults `OpClass`/table, never the
+operation's own name) → `table_known`. **The general form**: a
+"do X once, up front, before dispatching to per-kind handlers" prelude
+(existence checks, internal-table rejection, authorization) must be
+audited for *order* whenever a new prelude step is added, not just for
+presence — the existing root `CLAUDE.md` lesson about a missed relay
+allowlist entry is one instance of "a new variant needs the same gate every
+sibling variant has"; this is the same category one level up: a new
+top-level entry point (PartiQL) reimplementing a shared prelude by hand,
+inline, rather than delegating to the one place that already gets the
+order right, is exactly how the two preludes drift out of sync with each
+other. Grep every site that computes `table_known`/an existence check
+ahead of an `authz::`/`Policy::allows` call whenever adding a new
+authenticated entry point, and compare its order against `run_operation`'s
+own canonical prelude, not just against its nearest sibling (which can
+carry the identical bug).
+
+## A shared `CARGO_TARGET_DIR` across concurrent git worktrees can silently link the wrong crate content — verify with `-v`/fingerprint logs, don't assume "Fresh" is honest
+
+While gating this same PR, `cargo test -p animusd --lib`/`--test` began
+failing with `error[E0063]: missing field `chunk_count`` against
+`MetaCommand::RecordBackupTabletComplete` — a field that does not exist
+anywhere in this worktree's checked-out `animus-control` source (confirmed
+by `grep`, and by `git status`/`git fetch origin main` showing zero drift).
+Cargo's own trace (`cargo test ... -v`, and `CARGO_LOG=cargo::core::
+compiler::fingerprint=trace`) showed `Fresh animus-control v0.0.0 (.../this
+worktree/crates/animus-control)` — cargo believed a *cached* `.rlib` for
+this worktree's own `animus-control` was up to date, while that cached
+artifact was actually compiled from a **different worktree's** in-progress,
+uncommitted edit to the same crate (name+version), sharing the same
+`CARGO_TARGET_DIR` across sibling agent sessions. Cargo's fingerprint hash
+for a path-dependency's output filename does not appear to depend on the
+dependency's absolute filesystem path, only on package name/version/
+profile/enabled-features/toolchain — so two worktrees' checkouts of the
+identical crate name+version can collide on the identical output filename,
+and whichever worktree's build last "won" the freshness race is what
+every other worktree's dependents silently link against, even though the
+source on disk in *this* worktree says otherwise. Neither `touch`ing the
+suspect source files to the current wall-clock time, nor a plain re-run,
+fixed it (the dep-info freshness check's own recorded timestamp gets
+bumped forward by every "Fresh, nothing to do" cargo invocation too — a
+race that never resolves by retrying alone once a sibling session is also
+iterating on the same crate). The fix: identify the exact stale fingerprint
+hash from the `-v`/trace output (`Fresh <crate> ... is
+".../libfoo-<hash>.rlib"`) and remove only that hash's fingerprint
+directory + `.rlib`/`.rmeta`/`.d` files (`rm -rf .fingerprint/<crate>-
+<hash>`, `rm -f deps/*-<hash>.*`) — never a workspace-wide `cargo clean`,
+which this repo's own instructions forbid and which would also discard
+every *other* worktree's legitimately-cached, unrelated work — then
+rebuild immediately. **The general lesson**: when a compile error names a
+field/variant/type that a direct `grep` of the current checkout proves
+does not exist, suspect cross-worktree `CARGO_TARGET_DIR` contamination
+before suspecting your own edit or a real upstream drift — verify against
+`git status`/`git fetch` first, then `cargo -v`'s own `Fresh <crate> (...)`
+line names the exact worktree path and rlib hash cargo actually trusted, which is
+the fastest way to confirm (or rule out) this class of bug in a shared
+build-directory environment.
