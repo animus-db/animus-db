@@ -101,7 +101,20 @@ comment for its full type/method inventory.
   quantum, RFC 4648 §4) instead of silently treating it as a zero sextet —
   it used to decode `"A=AA"` to `[0x00, 0x00]` rather than reject it, so
   every `B`/`BS` value on the wire could be silently corrupted by malformed
-  input rather than rejected.
+  input rather than rejected. `decode_string_set`/the inline `"BS"` arm
+  (issue #848) reject an empty `SS`/`NS`/`BS` array (AWS: "An `<kind>` set
+  may not be empty" — the double space in that phrase is AWS's own wording,
+  not a typo) — DynamoDB never stores an empty set, the same invariant
+  `animus_item::update::UpdateAction::Delete`'s apply arm already enforced
+  on its own output side; `UpdateAction::Add`'s absent-seed arm gained the
+  identical guard for a caller that constructs an `UpdateAction` directly
+  rather than through this decoder. An empty `S`/`B` for a declared
+  partition/sort key attribute specifically (legal for a non-key attribute
+  since DynamoDB's 2020 empty-value change) is rejected at the `animusd`
+  edge instead (`dynamo::resolve_key`/`reject_empty_key_value`), since only
+  that edge, with the table's resolved key schema in hand, knows which
+  attribute *is* the key — this crate's own decoder has no schema access to
+  make that call itself.
   `ExecuteStatement` (ADR 0071, W-07) is decoded here (`Statement`/
   `Parameters`/`ConsistentRead`/`NextToken`/`Limit`/
   `ReturnConsumedCapacity`) but its `statement` text is opaque at this

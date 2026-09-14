@@ -5362,6 +5362,10 @@ fn decode_attribute_value(name: &str, value: &Value) -> Result<AttributeValue, W
             let arr = inner.as_array().ok_or_else(|| {
                 WireError::validation(format!("`{name}`.BS must be an array of base64 strings"))
             })?;
+            if arr.is_empty() {
+                // Issue #848: DynamoDB does not store empty sets.
+                return Err(WireError::validation(empty_set_message("binary")));
+            }
             let mut out = Vec::with_capacity(arr.len());
             for v in arr {
                 let s = v.as_str().ok_or_else(|| {
@@ -5381,11 +5385,26 @@ fn decode_attribute_value(name: &str, value: &Value) -> Result<AttributeValue, W
     }
 }
 
+/// AWS's own `ValidationException` wording for an empty `SS`/`NS`/`BS` set
+/// value (issue #848) — DynamoDB does not store empty sets; emptying one via
+/// `DELETE` removes the attribute instead (`animus_item::update`'s
+/// `set_is_empty` guard on that path already enforces the same invariant on
+/// the way out, this is its wire-decode-time mirror on the way in).
+/// `kind` is `"string"`/`"number"`/`"binary"`. The double space before
+/// "may" is not a typo here — it matches AWS's actual message text.
+fn empty_set_message(kind: &str) -> String {
+    format!("One or more parameter values were invalid: An {kind} set  may not be empty")
+}
+
 /// Decode an `SS`/`NS` array of strings into a sorted, deduplicated set.
 fn decode_string_set(name: &str, ty: &str, inner: &Value) -> Result<Vec<String>, WireError> {
     let arr = inner.as_array().ok_or_else(|| {
         WireError::validation(format!("`{name}`.{ty} must be an array of strings"))
     })?;
+    if arr.is_empty() {
+        let kind = if ty == "NS" { "number" } else { "string" };
+        return Err(WireError::validation(empty_set_message(kind)));
+    }
     let mut out = Vec::with_capacity(arr.len());
     for v in arr {
         let s = v.as_str().ok_or_else(|| {
@@ -7566,6 +7585,40 @@ mod tests {
         );
         decode_request("DynamoDB_20120810.PutItem", body.as_bytes())
             .expect("well-formed N (including nested) should decode");
+    }
+
+    /// Issue #848: DynamoDB does not store empty sets — `SS`/`NS`/`BS` must
+    /// be rejected at decode time when empty, for a plain `Item` attribute
+    /// and for an `ADD` operand alike.
+    #[test]
+    fn put_item_rejects_empty_sets() {
+        for (ty, val) in [("SS", "[]"), ("NS", "[]"), ("BS", "[]")] {
+            let body =
+                format!(r#"{{"TableName":"t","Item":{{"pk":{{"S":"p"}},"t":{{"{ty}":{val}}}}}}}"#);
+            let err = decode_request("DynamoDB_20120810.PutItem", body.as_bytes()).unwrap_err();
+            assert_eq!(err.code, "ValidationException", "for {ty}");
+            assert!(
+                err.message.contains("may not be empty"),
+                "message should name the empty-set rule for {ty}: {}",
+                err.message
+            );
+        }
+    }
+
+    #[test]
+    fn update_item_add_rejects_an_empty_set_operand() {
+        let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+            "UpdateExpression":"ADD tags :empty",
+            "ExpressionAttributeValues":{":empty":{"SS":[]}}}"#;
+        let err = decode_request("DynamoDB_20120810.UpdateItem", body).unwrap_err();
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    /// A non-empty set is unaffected.
+    #[test]
+    fn put_item_accepts_a_non_empty_set() {
+        let body = br#"{"TableName":"t","Item":{"pk":{"S":"p"},"t":{"SS":["a"]}}}"#;
+        decode_request("DynamoDB_20120810.PutItem", body).expect("non-empty SS should decode");
     }
 
     #[test]
