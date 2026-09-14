@@ -18380,6 +18380,28 @@ types `rustls`/`tokio-rustls` themselves consume) — the fix can be a pure
 subtraction (delete the flagged dependency, add no new one) rather than a
 net-new dependency trading one advisory for a different future one.
 
+## `cargo deny check` is the one gate whose verdict can change with no commit at all: a stack green at PR time can land red on `main` (RUSTSEC-2026-0285, 2026-09-14)
+
+The C-14 stack (#876-#888) was green on every PR head, merged as one
+stack at 16:24 UTC, and `main`'s own CI on the merge commit came back
+red — on `cargo-deny check` alone, every other job (fmt, clippy, build,
+the whole sim tier, the four `prod-liveness` shards) green. `Cargo.lock`
+had not changed once during the rung. What changed was the world:
+RUSTSEC-2026-0285 (`rustls` 0.23.43, TLS 1.3 handshake messages accepted
+across an encryption-level boundary, fixed in 0.23.45) was published
+between the last PR-head CI run and the merge. The fix was the advisory's
+own remedy, `cargo update -p rustls`, as its own flat PR (a one-line
+`Cargo.lock` bump is a single reviewable step, so no stack). **General
+form**: advisories are a function of wall-clock time, not of the diff, so
+(1) a red `cargo-deny` job on `main` after a merge is not evidence the
+merged change was wrong — read the advisory ID before assuming so, and
+(2) it is still a red `main`, so it is still fixed now, in the same
+session, per Session operating mode item 4 — never left for the nightly,
+and never silenced with an `ignore` entry when a patch release exists.
+Every other open PR based on the same `main` inherits the same red
+`cargo-deny` job until it rebases onto the fix; that is expected, not a
+second bug.
+
 ## Turning TLS on for a probed port changes the prober's contract too, and no sandbox without a real cluster can see that (ADR 0064's first real `e2e-kind-tls` CI run)
 
 ADR 0064 commit 3 made `animus-operator`'s `StatefulSet` mount TLS material
@@ -25765,6 +25787,71 @@ ahead of an `authz::`/`Policy::allows` call whenever adding a new
 authenticated entry point, and compare its order against `run_operation`'s
 own canonical prelude, not just against its nearest sibling (which can
 carry the identical bug).
+## A `NetworkPolicyPeer` with no `namespaceSelector` is scoped to the policy's own namespace, never the peer pod's real one (issue #857)
+
+`animus-operator`'s admin-ingress `NetworkPolicy` rule used a bare
+`podSelector` to admit the operator's own pods to a cluster's admin port.
+Kubernetes `NetworkPolicy` semantics make that scoping implicit and easy to
+miss: a `NetworkPolicyPeer` with only a `podSelector` set matches pods *in
+the `NetworkPolicy` object's own namespace* — here, the `AnimusCluster`'s
+namespace — never wherever the labeled pod actually lives. The operator
+runs in its own dedicated namespace, distinct from every `AnimusCluster`'s
+namespace in the documented deployment topology, so the rule was a silent
+no-op: it compiled, applied cleanly, and passed its own test (which only
+ever asserted the `podSelector`'s `matchLabels`, never checking for a
+`namespaceSelector` at all) while admitting nothing in a real cluster.
+Masked entirely under the default `--admin-access proxy` mode (admin calls
+go through the API server's own pod-proxy subresource, never sourced from
+an operator pod), and would only have surfaced as a real outage under the
+also-supported `--admin-access direct` mode — exactly the kind of gap that
+survives review and every existing test because the two things needed to
+notice it (a specific deployment topology, a specific config flag) rarely
+line up in the same test run. **The general rule**: any peer you build for
+a `NetworkPolicy`/`NetworkPolicyPeer` that names a pod living in a
+*different* namespace from the policy's own subject needs an explicit
+`namespaceSelector` ANDed with the `podSelector` — never assume workload
+identity to be enough. When one rule in a builder module already gets this
+right (`dns_peer`'s `kube-system` scoping did, here), that itself is a
+signal to check every *other* peer in the same file for the same
+requirement, not just to write the new one correctly — see
+`crates/animus-operator/CLAUDE.md`'s own "NetworkPolicy admin-port ingress
+needs a namespaceSelector" section for the fix and how the operator's
+namespace is identified.
+
+## A conditional `finish_reconcile`/apply-with-a-lowered-spec branch needs the SAME clamp-before-apply guard every sibling failure branch already has — check by pattern, not by branch (issue #853)
+
+`animus-operator`'s scale-down drain-failure branch called
+`finish_reconcile(&cluster, ...)` with the caller's own, already-lowered
+`cluster.spec.nodes` — even though three sibling failure branches in the
+*same function* (`spec.tls`/`spec.s3`/`spec.backup_store` each rejected as
+invalid) already established the correct pattern: clone `cluster` into a
+`pinned` copy with the unsafe field reset to a safe value, and finish the
+reconcile with `&pinned`, never the raw input. The drain-failure branch's
+own comment even said the right thing ("don't scale the StatefulSet down
+past a pod that never finished draining") while the code one line later
+did exactly that, because nothing clamped `spec.nodes` before it reached
+`apply_children` → `desired::statefulset::build`, which applies
+`spec.nodes` verbatim as `StatefulSet.spec.replicas` with no awareness of
+how much of a multi-step operation (here: a highest-ordinal-first drain
+sequence) actually completed. The fix is the identical `pinned` idiom,
+just computed from the drain loop's own state (the last ordinal that
+failed to drain, `+1`, since every ordinal above it already finished)
+instead of a constant reset value. **The general rule**: when a function
+has several failure branches that all end by finishing/applying a
+reconcile early, and *some* of them already pin/clamp the state they pass
+down, a newly added or overlooked branch that skips that step is not an
+independent bug to reason about from scratch — it is a **pattern
+violation** discoverable by literally diffing the branch against its
+siblings in the same function. Grepping a function for its own established
+idiom (here: `let mut pinned = (*cluster).clone();`) before trusting that
+"this branch already does the safe thing" is a cheap, mechanical check
+that would have caught this without needing to trace the whole
+apply-side of the pipeline. Also: a **partial-progress test case** (some
+ordinals drain successfully, a later one fails) is worth adding alongside
+the immediate-failure one — a test that only ever fails on the very first
+step of a multi-step sequence can't tell "clamp to the pre-operation
+count" apart from "clamp to how far we actually got," and only one of
+those is the right fix once real partial progress is possible.
 ## A closing rung's own "What was deferred" pointer, however precise, is still worth re-deriving from source before scoping the follow-on — the required grep for a new rung is not redundant with a predecessor's (ADR 0061 rung N, C-14 PR 1)
 
 Rung M's own "Rung M closed" amendment named the combined-voter-growth
