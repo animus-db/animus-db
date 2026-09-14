@@ -1243,19 +1243,105 @@ per-tablet CP data plane (`animus-cp-data`).
   `snapshot_blob` by reference — it does NOT re-serialize per chunk**; a
   naive per-chunk serialize on a multi-MB metadata pins the loop past the
   election timeout (a self-sustaining election storm, invisible to
-  `SimEnv`'s virtual clock). Blob management differs by state-machine kind:
-  - **In-core (`Metadata`):** the blob is kept **eagerly**, so the
-    invariant `snapshot_index > 0 ⟹ blob.is_some()` holds and a chunk is
-    never a 0-byte ship (regression:
-    `install_snapshot.rs::caught_up_control_node_reships_non_empty`).
-  - **`DRIVER_APPLIED` (data-plane KV):** the image is the *engine* bytes,
-    built **lazily on demand** and dropped whenever it would go stale/idle,
-    so no whole-tablet image is retained at rest (regression:
+  `SimEnv`'s virtual clock). Blob management is keyed on
+  `S::DRIVER_APPLIED`, **not** "in-core vs. data-plane" — since ADR 0038
+  PR3's cutover, `Metadata::DRIVER_APPLIED = true` too (see `meta.rs`), so
+  this plane's own blob is built **lazily on demand**, the identical shape
+  to the data plane's:
+  - **A non-`DRIVER_APPLIED` toy state machine** (`generic_state_machine.rs`
+    only — nothing real in this workspace uses `DRIVER_APPLIED = false`
+    anymore) keeps the blob **eagerly**, so the invariant `snapshot_index >
+    0 ⟹ blob.is_some()` holds and a chunk is never a 0-byte ship
+    (regression:
+    `install_snapshot.rs::caught_up_control_node_reships_non_empty` proves
+    this for `Metadata` specifically by hand-driving the eager-image
+    contract as a stand-in for the real apply task — see that test file's
+    own module doc for why: it decouples the chunk-mechanics tests from a
+    real `StorageEngine`/`syskv_image` scan entirely).
+  - **`DRIVER_APPLIED` (both planes — the data-plane KV and, since ADR 0038
+    PR3, `Metadata`):** the image is the *engine* bytes (`syskv_image`/
+    `install_syskv_image` here), built **lazily on demand** by the apply
+    task (`meta_apply_and_compact`'s `image_needed`/`set_snapshot_blob`
+    handling) only once a replication attempt actually raises
+    `take_snapshot_needed`, and dropped whenever it would go stale/idle, so
+    no whole-tablet/whole-metadata image is retained at rest (regression:
     `driver_applied_sm.rs::caught_up_node_reships_non_empty_snapshot`).
 
   Liveness teeth:
   `install_snapshot.rs::large_snapshot_ships_in_o_chunk_time_not_o_state` +
   `tests/prod_liveness.rs`.
+
+  **A threshold-triggered compaction must defer while a peer's chunked
+  transfer is genuinely in flight (issue #898, the control-plane instance of
+  issues #532/#537's `animus-cp-data::COMPACT_DEFER_CEILING` finding).**
+  `snapshot_upto` unconditionally invalidates every peer's in-flight
+  transfer the moment the base moves again (required for correctness for a
+  lazily-built `DRIVER_APPLIED` blob — see that method's own doc). Without a
+  defer, ordinary sustained metadata churn — not even perpetual load, a
+  handful of trailing commits landing while a fresh follower's very first
+  transfer is still on the wire is enough — can re-cross
+  `SNAPSHOT_THRESHOLD` before the transfer lands, restarting it from chunk 0
+  forever. `meta_apply_and_compact`'s own doc claimed to mirror
+  `animus-cp-data::apply_and_compact`'s shape/ordering "precisely," but
+  never actually adopted this gate until issue #898 — confirmed live as the
+  root cause of `prod_liveness.rs`'s intermittent CI stall (issue #898,
+  recurrence of #741's shape one layer deeper: a follower stalling
+  permanently mid-catch-up with `control term Δ0`, not the compaction-
+  convergence poll #741 itself fixed). `node.rs`'s
+  `SNAPSHOT_COMPACT_DEFER_CEILING` (`SNAPSHOT_THRESHOLD * 8`, mirroring
+  `COMPACT_DEFER_CEILING`'s own derivation exactly) is the fix — a
+  THRESHOLD-triggered (never `image_needed`-triggered — a peer is actively
+  waiting on that exact image) compaction defers while
+  `RaftCore::snapshot_transfer_in_flight()` is true, up to that ceiling,
+  which still bounds the WAL even if a peer's transfer never completes.
+  **`snapshot_transfer_in_flight()` itself had a second, compounding gap**:
+  defined purely off `snapshot_offset` (populated only once a peer's FIRST
+  ack is *processed*), it reported `false` for the whole round trip from
+  "leader ships chunk 0" to "leader processes the first ack" — a window a
+  slow/contended peer or link (`ProdEnv`'s real shape) can stretch
+  arbitrarily far — so the defer never engaged during exactly the window it
+  mattered most. Fixed by widening the accessor to also check
+  `snapshot_chunk_sent` (set at SEND time, not ack time) — both maps are
+  already cleared together at every existing invalidation/completion point,
+  so this benefits `animus-cp-data` for free (same shared `RaftCore`).
+  Regression: `tests/snapshot_compaction_race.rs` (a `SimEnv` test with an
+  artificially slow leader<->follower link, since `SimEnv`'s own near-zero
+  default latency lets a small synthetic transfer outrun even a bursty
+  churn schedule and never exposes the race).
+
+  **Fixing that defer unmasked a THIRD, previously-latent bug** — read this
+  if you ever touch `handle_install_snapshot_resp`'s mid-transfer branch or
+  the defer gate above again: a leader's per-peer `snapshot_offset`/
+  `snapshot_chunk_sent` bookkeeping is never reset when that peer's
+  *process* restarts (same `NodeId`, a brand-new empty `RaftCore`), and a
+  restarted follower reporting `next_offset == 0` forever can never be
+  reconciled against a leader that keeps resending from its own stale,
+  now-unreachable non-zero offset (`handle_install_snapshot`'s `fresh &&
+  offset == 0` reassembly gate can't bootstrap from a non-zero offset onto
+  an empty buffer). This was **masked** before the defer fix: ordinary
+  threshold-triggered recompaction fired often enough, independent of any
+  peer's own transfer state, to incidentally wipe this stale bookkeeping
+  clean before a restarted peer's next request ever hit it — making
+  compaction fire less often removed that accidental safety net.
+  `tests/control_corpus.rs`'s pre-existing
+  `chunked_snapshot_receiver_stop_restart_3` caught this immediately (a
+  real `StopRestart` of the receiver mid-transfer) once the defer fix
+  landed. Fixed by `snapshot_offset_regressions: BTreeMap<NodeId, u32>` +
+  `SNAPSHOT_OFFSET_REGRESSION_REBASE`: a peer's mid-transfer ack reporting
+  an offset below the currently tracked one increments a per-peer counter
+  instead of being silently absorbed by the existing monotonic `max` guard;
+  once that counter crosses the (small, bounded) threshold with no
+  intervening forward progress, the leader REBASES down to the peer's own
+  reported truth rather than trusting its own stale record — distinguishing
+  "a stale, reordered ack for the ongoing transfer" (self-heals within a
+  round trip, seen once or twice — tolerate it) from "the peer's buffer
+  genuinely reset" (persists indefinitely — must be honored) by consecutive
+  count, not a one-shot check. See `docs/lessons/testing/
+  2026-09-14-control-snapshot-catch-up-stall.md` for the full incident and
+  the generalizable lesson (a fix that makes a background process fire
+  *less* often can remove an accidental cleanup side effect a different
+  code path was quietly relying on — re-run the FULL existing suite, not
+  just the new regression, before calling a fix done).
 
   **`state_machine_behind` + `AppendEntriesResp::needs_snapshot` (issue
   #554, ADR 0009's 2026-09-02 addendum): a follower-to-leader "I need a

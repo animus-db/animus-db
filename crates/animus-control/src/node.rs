@@ -38,6 +38,38 @@ const WAL: &str = "raft.wal";
 /// see [`meta_apply_and_compact`]'s doc).
 const SNAPSHOT_THRESHOLD: u64 = 64;
 
+/// Issue #898 (the control-plane instance of issues #532/#537's second
+/// finding, `animus-cp-data`'s own `COMPACT_DEFER_CEILING`):
+/// `RaftCore::snapshot_upto` unconditionally invalidates every peer's
+/// in-flight chunked `InstallSnapshot` transfer the moment the snapshot base
+/// moves again (required for correctness — a `DRIVER_APPLIED` blob is built
+/// lazily from the engine, so a moved base makes any previously materialized
+/// image stale; see that method's own doc). Under sustained metadata churn,
+/// ordinary `SNAPSHOT_THRESHOLD` pressure can re-cross before a lagging
+/// peer's own transfer (network round trips, `SNAPSHOT_CHUNK_BYTES`-sized
+/// chunks) finishes, restarting it from chunk 0 against a newer, larger
+/// image — every time, forever, if churn keeps winning the race
+/// (`crates/animus-control/tests/snapshot_compaction_race.rs` reproduces
+/// this deterministically under `SimEnv`: a freshly-joined node pinned at
+/// `snapshot_index() == 0` for the whole run while the leader's own log kept
+/// compacting further, the exact shape issue #741/#898's `prod_liveness.rs`
+/// caught intermittently under real `ProdEnv` contention). This is the
+/// ceiling on how far a THRESHOLD-triggered (never an `image_needed`-
+/// triggered — a peer is actively waiting on that image, so it must always
+/// proceed) compaction may be DEFERRED (below, gated on
+/// `RaftCore::snapshot_transfer_in_flight()`) to give an in-flight transfer a
+/// real chance to land before the next threshold crossing yanks it away
+/// again — a multiple of `SNAPSHOT_THRESHOLD`, not a replacement for it, so
+/// the WAL still bounds even if a peer's transfer never completes (dead,
+/// partitioned, or hopelessly outpaced): compaction always proceeds once
+/// `behind` reaches this, transfer or not. Mirrors `animus-cp-data::
+/// COMPACT_DEFER_CEILING` exactly (same derivation, same multiplier) — see
+/// that constant's own doc for the data-plane incident that motivated it,
+/// which this crate's own `meta_apply_and_compact` never adopted despite its
+/// doc's claim to mirror `animus-cp-data::apply_and_compact`'s shape/
+/// ordering precisely.
+const SNAPSHOT_COMPACT_DEFER_CEILING: u64 = SNAPSHOT_THRESHOLD * 8;
+
 /// Idle back-off for the apply task ([`meta_apply_loop`]): when there is
 /// nothing committed-and-durable to apply it sleeps this long before
 /// re-checking. Under load [`meta_apply_and_compact`] keeps returning `true`,
@@ -1321,14 +1353,24 @@ async fn meta_apply_and_compact<E: Env, S: StorageEngine>(
     // *before* `set_snapshot_blob`, so base and image agree), and installs
     // it.
     let ea = engine_applied.load(Ordering::SeqCst);
-    let (behind, image_needed) = {
+    let (behind, image_needed, transfer_in_flight) = {
         let mut c = core.lock().expect("raft core poisoned");
         (
             ea.saturating_sub(c.snapshot_index()),
             c.take_snapshot_needed(),
+            c.snapshot_transfer_in_flight(),
         )
     };
-    if behind >= SNAPSHOT_THRESHOLD || image_needed {
+    // Issue #898 (mirrors `animus-cp-data::apply_and_compact`'s identical
+    // gate for issues #532/#537): a THRESHOLD-triggered base advance is
+    // deferred while some peer's chunked transfer is genuinely in flight,
+    // unless `behind` has grown enough that the WAL itself needs bounding
+    // regardless (`SNAPSHOT_COMPACT_DEFER_CEILING`, that constant's own doc
+    // has the full reasoning). An `image_needed` compaction always proceeds
+    // — a peer is actively waiting on that exact image.
+    let threshold_hit = behind >= SNAPSHOT_THRESHOLD
+        && (!transfer_in_flight || behind >= SNAPSHOT_COMPACT_DEFER_CEILING);
+    if threshold_hit || image_needed {
         let image = if image_needed {
             Some(syskv_image(engine).await)
         } else {
