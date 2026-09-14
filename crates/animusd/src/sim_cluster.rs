@@ -1616,6 +1616,32 @@ pub(crate) struct SimCluster {
     /// `new_with_cp_quiescence`) means every CP-data group in this cluster
     /// stays permanently unquiesced — today's behavior, unchanged.
     cp_quiesce_after: Option<Duration>,
+    /// Node id -> index into `self.controls` (ADR 0061 rung N, C-14 PR 2)
+    /// — decouples "which node id is a control voter" from "position in
+    /// the `self.controls` vec", so a control voter minted AFTER
+    /// construction ([`SimCluster::grow_control`]) can take any unused
+    /// node id while `self.controls` itself only ever grows by pushing at
+    /// the end (no existing entry's own index ever shifts). At
+    /// construction this is exactly `{0: 0, 1: 1, ..., control_count - 1:
+    /// control_count - 1}` — every control-bearing node's own id already
+    /// IS its `self.controls` index, matching `new_with_roles`'s own
+    /// control-prefix invariant for the nodes present at construction
+    /// time (see that method's own doc: the invariant is scoped to
+    /// construction, not the cluster's whole lifetime — growth may append
+    /// a control voter whose id is not contiguous with this prefix, e.g.
+    /// past an existing `NodeRole::Data` node's own id). `BTreeMap`, never
+    /// `HashMap` (ADR 0003's determinism seam). See [`SimCluster::
+    /// control_index_of`]/[`SimCluster::control_node_id`] for the two
+    /// accessors every call site that used to assume `node_id ==
+    /// self.controls`-index now goes through.
+    control_index: BTreeMap<u64, usize>,
+    /// The inverse of `control_index` — `self.controls`-vec index -> node
+    /// id. At construction, `control_node_ids[i] == i as u64` for every
+    /// `i < control_count`. Kept as a plain `Vec`, not re-derived from
+    /// `control_index` on every read, since every growth site already
+    /// knows its own index (the position it's about to push to) and can
+    /// push here in the same breath.
+    control_node_ids: Vec<u64>,
 }
 
 /// Breaks the `Simulator`/`SimEnv` reference cycle (`animus_sim::Simulator::
@@ -1851,11 +1877,19 @@ impl SimCluster {
         // control-bearing (`Control`/`Both`) entry before every `NodeRole::Data`
         // one — so that `self.controls` (built below, one `RaftNode<SimEnv>` per
         // control-bearing node) stays index-aligned with node ids `0..
-        // control_count` for the whole lifetime of this cluster, the same
-        // invariant `SimCluster::grow` already relies on (a grown data-only
-        // node is always appended past every existing id, never spliced in).
-        // `SimCluster::restart` depends on this too — it dispatches purely on
-        // `node < self.controls.len()`.
+        // control_count` AT CONSTRUCTION (the same invariant `SimCluster::grow`
+        // already relies on for its own data-only node — always appended past
+        // every existing id, never spliced in). ADR 0061 rung N, C-14 PR 2: this
+        // is a construction-time-only invariant, not a whole-lifetime one — a
+        // control voter minted after construction (`SimCluster::grow_control`)
+        // is admitted at the next free node id (which may sit past an existing
+        // `NodeRole::Data` node's own id) while its own `self.controls`-vec
+        // index is simply the next position pushed; `self.control_index`/
+        // `self.control_node_ids` (below) are what let node id and
+        // controls-vec index diverge safely from that point on.
+        // `SimCluster::restart` no longer dispatches on `node <
+        // self.controls.len()` for this reason — it uses `self.
+        // control_index_of(node)` instead, see that method's own doc.
         assert!(
             {
                 let mut seen_data = false;
@@ -2370,6 +2404,17 @@ impl SimCluster {
             spawn_remote_mirror_sync_loop(ctxs[i].clone(), remote, control_seeds.clone());
         }
 
+        // ADR 0061 rung N, C-14 PR 2: at construction every control-bearing
+        // node's own id already IS its `controls`-vec index (the
+        // control-prefix assert above) — `control_index`/`control_node_ids`
+        // just make that mapping explicit and queryable, so growth can
+        // diverge from it later without any existing site needing to
+        // change. `BTreeMap`, never `HashMap` (ADR 0003).
+        let control_index: BTreeMap<u64, usize> = (0..control_count as u64)
+            .map(|id| (id, id as usize))
+            .collect();
+        let control_node_ids: Vec<u64> = (0..control_count as u64).collect();
+
         let mut cluster = SimCluster {
             sim,
             nodes,
@@ -2384,6 +2429,8 @@ impl SimCluster {
             segment_janitor_retention,
             roles: roles.to_vec(),
             cp_quiesce_after,
+            control_index,
+            control_node_ids,
         };
         // Let the control group elect before any caller touches it —
         // generous for up to a handful of voters under `SimEnv`'s
@@ -2602,14 +2649,46 @@ impl SimCluster {
         panic!("control group never elected a new leader excluding node {exclude}");
     }
 
-    /// The number of control-bearing nodes (`self.controls.len()`) — the
-    /// live control-plane voter count `new_with_roles`'s own control-
-    /// prefix invariant guarantees is exactly the ids `0..this value`. A
+    /// The number of control-bearing nodes (`self.controls.len()`) — at
+    /// CONSTRUCTION, `new_with_roles`'s own control-prefix invariant
+    /// guarantees this is exactly the ids `0..this value`; after a
+    /// [`SimCluster::grow_control`] call (ADR 0061 rung N, C-14 PR 2) this
+    /// is still the live control-plane voter COUNT, but the voter ids
+    /// themselves may no longer be a contiguous `0..this value` prefix —
+    /// use [`SimCluster::control_index_of`]/[`SimCluster::control_node_id`]
+    /// to translate between a node id and its `self.controls`-vec index. A
     /// thin, `&self`-only accessor for a sibling `#[cfg(test)] mod` that
     /// needs to enumerate the control-bearing prefix without reaching the
     /// private `controls` field directly (ADR 0061 rung M, C-13 PR 2).
     pub(crate) fn control_count(&self) -> usize {
         self.controls.len()
+    }
+
+    /// The `self.controls`-vec index for `node`, or `None` if `node` is
+    /// not (or is no longer) a control-bearing voter this fixture tracks
+    /// locally — ADR 0061 rung N, C-14 PR 2. At construction this is
+    /// simply `(node < control_count).then_some(node as usize)`; after a
+    /// [`SimCluster::grow_control`] call it is a real `BTreeMap` lookup,
+    /// since a grown voter's own node id need not equal its position in
+    /// `self.controls`. This is the one primitive every site that used to
+    /// assume `node_id == self.controls`-index (`SimCluster::restart`'s
+    /// own dispatch, most notably) now goes through instead.
+    pub(crate) fn control_index_of(&self, node: u64) -> Option<usize> {
+        self.control_index.get(&node).copied()
+    }
+
+    /// The node id `self.controls[index]` belongs to — the inverse of
+    /// [`SimCluster::control_index_of`] (ADR 0061 rung N, C-14 PR 2).
+    /// Panics if `index` is out of range, mirroring a plain `Vec` index
+    /// panic (the same discipline every other `self.controls[i]` site in
+    /// this file already has). Needed wherever a caller has a
+    /// `self.controls`-vec index (e.g. from [`SimCluster::
+    /// control_leader_index`], which — unchanged by this rung — still
+    /// returns an index, not a node id) and needs the real node id to pass
+    /// to another `SimCluster` method (`admin`/`crash`/`restart`/…, all of
+    /// which take a plain `u64` node id).
+    pub(crate) fn control_node_id(&self, index: usize) -> u64 {
+        self.control_node_ids[index]
     }
 
     /// Any control-bearing node index that is NOT the current control-
@@ -2854,11 +2933,19 @@ impl SimCluster {
     /// [`SimCluster::run_for`] in small increments between reads instead of
     /// polling a real `/admin/raft` at real-clock cadence the way the
     /// real-socket test does. `node` must be control-bearing (a
-    /// `NodeRole::Data` node has no local `RaftNode` at all — this indexes
-    /// `self.controls` directly, unlike `control_voters`'s `ClientCtx`-level
-    /// `None`-for-`Remote` fallback).
+    /// `NodeRole::Data` node has no local `RaftNode` at all). **ADR 0061
+    /// rung N, C-14 PR 2**: `node` is a node id, resolved to its
+    /// `self.controls`-vec index via [`SimCluster::control_index_of`]
+    /// rather than used as the index directly — byte-identical behavior
+    /// for a construction-time node (where the two coincide), correct for
+    /// a voter minted past construction via [`SimCluster::grow_control`]
+    /// too. Panics with the same message either way if `node` isn't
+    /// control-bearing.
     pub(crate) fn control_raft_indices(&self, node: u64) -> (u64, u64) {
-        let raft = &self.controls[node as usize];
+        let idx = self
+            .control_index_of(node)
+            .unwrap_or_else(|| panic!("control_raft_indices: node {node} is not control-bearing"));
+        let raft = &self.controls[idx];
         (raft.commit_index(), raft.engine_applied_index())
     }
 
@@ -3208,19 +3295,30 @@ impl SimCluster {
         })
     }
 
-    /// Move control-plane leadership to `target` (ADR 0061 rung D4 PR 5) —
-    /// `RaftCore::transfer_leadership`'s own real handoff (ADR 0029/0037),
-    /// not a `crash`/`restart`-driven forced re-election: the current
-    /// leader freezes new proposes and hands off cleanly once `target`'s
-    /// own log has caught up. A no-op if `target` already leads. Retries
-    /// the arm attempt (bounded) since a single attempt only succeeds if
-    /// `target`'s replicated log has caught up to the leader's current
-    /// commit index at that precise instant — the identical one-shot-arm
-    /// caveat `animusd::CLAUDE.md`'s own issue #405 entry documents for
-    /// `admin_remove_control_member`'s self-removal transfer.
+    /// Move control-plane leadership to `target` (a node id, ADR 0061 rung
+    /// D4 PR 5) — `RaftCore::transfer_leadership`'s own real handoff (ADR
+    /// 0029/0037), not a `crash`/`restart`-driven forced re-election: the
+    /// current leader freezes new proposes and hands off cleanly once
+    /// `target`'s own log has caught up. A no-op if `target` already
+    /// leads. Retries the arm attempt (bounded) since a single attempt
+    /// only succeeds if `target`'s replicated log has caught up to the
+    /// leader's current commit index at that precise instant — the
+    /// identical one-shot-arm caveat `animusd::CLAUDE.md`'s own issue #405
+    /// entry documents for `admin_remove_control_member`'s self-removal
+    /// transfer.
+    ///
+    /// **ADR 0061 rung N, C-14 PR 2**: `leader`/`new_leader` (from
+    /// [`SimCluster::control_leader_index`]) are `self.controls`-vec
+    /// indices, never node ids — comparing either directly against
+    /// `target` (a node id) conflates the two, silently correct only for a
+    /// construction-time node (where they coincide) and silently wrong the
+    /// moment `target` is a voter minted past construction via
+    /// [`SimCluster::grow_control`] (whose own node id need not equal its
+    /// `self.controls`-vec index). Every comparison below goes through
+    /// [`SimCluster::control_node_id`] instead.
     pub(crate) fn transfer_control_leadership_to(&mut self, target: u64) {
         let mut leader = self.control_leader_index();
-        if leader == target as usize {
+        if self.control_node_id(leader) == target {
             return;
         }
         for _ in 0..20 {
@@ -3229,15 +3327,17 @@ impl SimCluster {
             }
             self.sim.run_for(Duration::from_millis(200));
             leader = self.control_leader_index();
-            if leader == target as usize {
+            if self.control_node_id(leader) == target {
                 return;
             }
         }
         self.sim.run_for(Duration::from_secs(2));
         let new_leader = self.control_leader_index();
+        let new_leader_id = self.control_node_id(new_leader);
         assert_eq!(
-            new_leader, target as usize,
-            "control leadership must move to node {target} within budget (still on {new_leader})"
+            new_leader_id, target,
+            "control leadership must move to node {target} within budget (still on \
+             {new_leader_id})"
         );
     }
 
@@ -4273,16 +4373,17 @@ impl SimCluster {
     /// control-plane-leader-only janitor), rather than unconditionally
     /// forcing every restarted node combined.
     ///
-    /// **Dispatches purely on `node < self.controls.len()`**: `self.controls`
-    /// is exactly the control-bearing prefix ([`SimCluster::new_with_roles`]'s
-    /// own control-prefix invariant — a `NodeRole::Data` node id is always
-    /// `self.controls.len()..self.nodes`, whether minted directly at
-    /// construction or appended later via [`SimCluster::grow`]). A node
-    /// below that boundary is restarted control-bearing (`Local` handle,
-    /// indexing `self.controls[node]`); a node at or above it is restarted
-    /// data-only (`Remote` handle, dialing `self.controls`'s own ids as its
-    /// `WatchMetadata` seeds — the identical shape [`SimCluster::grow`]
-    /// already establishes for a post-construction data-only node).
+    /// **Dispatches on [`SimCluster::control_index_of`], not `node <
+    /// self.controls.len()` (ADR 0061 rung N, C-14 PR 2 — see that
+    /// method's own doc for why the raw comparison stopped being sound the
+    /// instant a control voter can be minted after construction, at any
+    /// unused node id)**: `Some(idx)` means `node` is a control-bearing
+    /// voter this fixture tracks locally, restarted `Local` (`RaftNode`
+    /// handle) and indexed back into `self.controls[idx]`, never
+    /// `self.controls[node]`; `None` means `node` is a `NodeRole::Data`
+    /// node (constructed or grown, [`SimCluster::grow`]), restarted
+    /// `Remote` (`ControlHandle::Remote`, dialing `self.control_node_ids`
+    /// — the real control-bearing prefix — as its `WatchMetadata` seeds).
     ///
     /// **A real, latent bug this rung found and fixed**: a restarted
     /// control-bearing node's fresh `RaftNode` now takes `control_ids`
@@ -4303,14 +4404,16 @@ impl SimCluster {
         }
         self.sim.stop(id.clone());
 
-        // ADR 0061 rung L, C-12 PR 3: the real control-bearing voter set —
-        // always `0..self.controls.len()` (`SimCluster::new_with_roles`'s
-        // own control-prefix invariant) — never `0..self.nodes`, which the
-        // instant this cluster carries any `NodeRole::Data` node no longer
-        // names only real control voters (see this method's own doc).
-        let control_ids: Vec<NodeId> = (0..self.controls.len() as u64).map(nid).collect();
+        // ADR 0061 rung N, C-14 PR 2: the real, CURRENT control-bearing
+        // voter set — `self.control_node_ids` (index -> node id), never
+        // `0..self.controls.len()` (which assumed node id == index, false
+        // the instant a control voter is minted past construction) and
+        // never `0..self.nodes` (which the instant this cluster carries
+        // any `NodeRole::Data` node no longer names only real control
+        // voters — see this method's own doc).
+        let control_ids: Vec<NodeId> = self.control_node_ids.iter().copied().map(nid).collect();
 
-        if (node as usize) < self.controls.len() {
+        if let Some(idx) = self.control_index_of(node) {
             // ---- control-bearing node (NodeRole::Both / NodeRole::Control) ----
             let fresh_control: RaftNode<SimEnv> = RaftNode::start(
                 self.sim.env(id.clone()),
@@ -4493,19 +4596,19 @@ impl SimCluster {
                 async move { forwarding::handle_relayed_request(&ctx, req).await }
             });
 
-            self.controls[node as usize] = fresh_control;
+            self.controls[idx] = fresh_control;
             self.shared.set_ctx(node, ctx);
         } else {
             // ---- data-only node (NodeRole::Data), constructed or grown (ADR 0061 rung L, C-12 PR 3) ----
             assert_eq!(
                 role,
                 NodeRole::Data,
-                "SimCluster::restart(node={node}): a node index at or beyond the \
-                 control-voter prefix (self.controls.len()={}) must be NodeRole::Data — got \
-                 {role:?}; this invariant is established by SimCluster::new_with_roles's own \
-                 control-prefix requirement and SimCluster::grow's own append-only \
-                 NodeRole::Data shape",
-                self.controls.len()
+                "SimCluster::restart(node={node}): a node id with no SimCluster::\
+                 control_index_of entry must be NodeRole::Data — got {role:?}; this \
+                 invariant is established by SimCluster::new_with_roles's own control-prefix \
+                 requirement (at construction) and SimCluster::grow's own append-only \
+                 NodeRole::Data shape (a NodeRole::Data node is never registered into \
+                 self.control_index)"
             );
 
             let seeds: Vec<String> = control_ids.iter().map(NodeId::to_string).collect();
@@ -4728,12 +4831,18 @@ impl SimCluster {
         let id = nid(new_n);
         let addr = id.to_string();
 
-        // The pre-growth control quorum's own addresses — this fixture's
+        // The CURRENT control quorum's own addresses — this fixture's
         // `SimRelayClient` addressing convention (`NodeId::to_string()`) is
         // identical to `client_route`/`intra_route`'s own entries built in
-        // `SimCluster::new`. Fixed for the life of this rung (no `"combined"`
-        // growth yet, so `self.controls` never grows).
-        let control_ids: Vec<NodeId> = (0..self.controls.len() as u64).map(nid).collect();
+        // `SimCluster::new`. ADR 0061 rung N, C-14 PR 2: derived from
+        // `self.control_node_ids` (index -> node id), never `0..self.
+        // controls.len()` (which assumed node id == index — no longer
+        // true once `SimCluster::grow_control` can mint a control voter
+        // past construction) — this `grow` method itself still only ever
+        // supports `role == "data"`, so `self.controls` never grows via
+        // this call, but the control quorum it dials may already have
+        // grown via a prior `grow_control` call.
+        let control_ids: Vec<NodeId> = self.control_node_ids.iter().copied().map(nid).collect();
         let seeds: Vec<String> = control_ids.iter().map(NodeId::to_string).collect();
 
         // Patch every EXISTING node's own route tables with the new node's
