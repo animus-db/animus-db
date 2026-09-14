@@ -25473,3 +25473,246 @@ specifically "only after everything shut down without incident" (here:
 removing an `--ephemeral` cluster's own auto-generated data directory only
 on a clean `Ctrl-C`/SIGTERM shutdown, leaving it in place for a post-mortem
 on anything else, exactly like a durable run's directory always is).
+## A `SimCluster` pre-bind dial needs a THROWAWAY bootstrap identity, distinct from the real minted one — the relay's own outbound origin is what the control leader's detector attributes a heartbeat to (ADR 0061 rung M, C-13 PR 2)
+
+Building `SimCluster::join_via_seed`'s own discovery+claim phase, the
+natural-looking shortcut is one `SimEnv`/`SimRelayClient` pair, built up
+front and keyed by the joiner's own eventual node index, used for both
+sourcing `NodeId::mint`'s seeded `Rng` draw AND sending the discovery/
+claim relay calls — then reused for the real per-node assembly
+(`heartbeat_loop`, `ClientCtx`, the reconciler) once the claim resolves.
+This is unsound: the minted `NodeId` isn't known until AFTER the mint
+resolves, so whatever env sourced that draw is necessarily keyed to a
+DIFFERENT id than the one `MetaCommand::RegisterNode` ends up claiming. If
+that same (wrongly-keyed) env is then reused to spawn `heartbeat_loop`,
+every heartbeat it sends carries `env.node_id()` as its own origin — never
+the id that was actually registered — so the control leader's own failure
+detector tracks liveness for an id nobody registered, while the genuinely
+registered id never receives a single real heartbeat and is never
+promoted, forever (the "declared-but-never-booted" case `animus_control::
+node::detect_loop`'s own doc already names, reached here by a fixture bug
+rather than a real deployment one).
+
+Fixed by using a THROWAWAY bootstrap identity purely as the pre-bind
+entropy source and outbound relay origin (`nid(self.nodes)` — always one
+index past the last real node at the moment it's drawn, so it can never
+collide with a past or future real node id in this fixture), discarding
+it once mint-and-claim resolves, and building a genuinely fresh env/relay
+under the CLAIMED identity for everything downstream. This mirrors, one
+level down in a simulator, the exact shape production's own `animus_env::
+prod::PreBindRng` already has at the real CLI boundary: pre-bind entropy
+is deliberately disconnected from the eventual bound identity, precisely
+so a mint failure or retry never contaminates what gets bound. The general
+form: whenever a fixture (or production code) needs to draw randomness or
+originate network traffic *before* the identity that randomness will help
+select is known, the env/transport doing the drawing/originating must be
+provably discardable — reusing it "since it's already there" silently
+ties a later mechanism's own identity attribution to the wrong source.
+
+## `SimCluster::create_table`'s hand-hosted replica set is positional (`0..replication`) — wrong for a mixed control+data cluster; a wire-created table's recorded RF is a fixed *target*, not a snapshot (ADR 0061 rung M, C-13 PR 3)
+
+Building the data-only sibling of `join_via_seed`'s own combined-mode sim
+test, the obvious-looking shortcut for seeding a table before the join was
+`SimCluster::create_table`/`create_table_with_replication` — every other
+scenario in `sim_cluster_seed_join.rs` already uses it. That shortcut
+hand-hosts the tablet on node indices `0..replication`, unconditionally —
+correct for an all-`NodeRole::Both` cluster (`SimCluster::new`'s own
+default), but silently wrong for a mixed control+data cluster
+(`SimCluster::new_with_roles`), where indices `0..control_count` are
+CONTROL-ONLY nodes that can never host a CP-data group at all. Every
+`sim_cluster_*` module that already mixes roles (`sim_cluster_control_
+data_split.rs`, `sim_cluster_split_cluster.rs`) avoids this by always
+provisioning through the real wire (`create_table_via_wire`, a `CreateTable`
+dispatched through `ClientCtx::provision_tablet`), which picks its initial
+replica set from `Metadata::members` — a set that, thanks to `RegisterNode`'s
+`claims_membership` gate, never contains a control-only node in the first
+place. **The general rule this generalizes to**: in any `SimCluster`
+scenario built with `new_with_roles`, reach for the wire path first: the
+hand-hosted shortcut's `0..replication` convention is only ever safe when
+every node in that range is data-capable, which a mixed-role cluster does
+not guarantee just because the caller picked a small `replication` number.
+
+A second, non-obvious fact fell out of reading `ClientCtx::
+provision_tablet`'s own doc while diagnosing this: the policy a wire
+`CreateTable` records is always `PlacementPolicy::simple("cp-rf",
+MAX_REPLICATION_FACTOR)` — the *target*, never however many candidates
+happened to be `Active` at creation time. A table created against a
+cluster with fewer `Active` data-capable members than `MAX_REPLICATION_
+FACTOR` (3) is silently under-replicated relative to its own recorded
+policy from the moment it's created — which means a data-only node that
+joins later and reaches `Active` doesn't need a load-balance heuristic to
+gain a replica of every pre-existing table; `reconcile_placement`'s
+ordinary violation-repair path (the same one that replaces a killed
+replica) does it as a plain policy-satisfaction repair, deterministically,
+the instant capacity exists. This is a *stronger* guarantee than `tests/
+data_join.rs`'s own doc comment implies ("seed enough tables that the
+rebalancer is guaranteed to move something," framed as a balance
+concern) — worth knowing before reflexively seeding several tables out of
+caution: one table already suffices whenever the pre-join replica count is
+below `MAX_REPLICATION_FACTOR`, though mirroring the original test's own
+table count one-for-one is still the right choice when the point is a
+faithful conversion, not a minimal reproduction.
+
+## An explicit-id join primitive's own `id` choice determines whether `restart`/`crash` stay usable on it afterward (ADR 0061 rung M, C-13 PR 4)
+
+Building the explicit-`--id` claim branch (`SimCluster::join_via_seed_with_
+explicit_id`, the counterpart of `join_via_seed_with_role`'s self-mint arm)
+looked at first like a pure superset of the self-mint path — the caller
+supplies `id` instead of drawing one from `NodeId::mint`, everything else
+(discovery, the single claim-or-collide call, the shared `finish_join`
+assembly tail) is identical. It very nearly is, with one load-bearing
+exception: `SimCluster::restart`/`crash` both derive `id = nid(node)` from
+the node's own INDEX, unconditionally, unrelated to whatever identity that
+node actually claimed at join time. A self-minted joiner already violates
+this (documented as permanently out of scope by the self-mint arm's own
+doc) — its real id is a 22-char base64url string, never `nid(index)`. An
+explicit-id joiner is NOT automatically exempt from the same mismatch: an
+explicit id is only safe to `restart`/`crash` afterward if the CALLER
+happened to choose `id == nid(that node's own about-to-be-assigned index)`
+— i.e. an index-derived id, not an arbitrary operator-chosen string. This
+is easy to get right by accident (this rung's own new sim scenario always
+passes `nid(cluster.node_count())`) and easy to get wrong silently if a
+future caller ever passes a free-form explicit id and then tries to
+`restart` the result — `restart`'s own `assert_eq!(role, NodeRole::Data,
+...)` guard would still pass (role-based, unrelated to id shape), but the
+rebuilt node would come up under the WRONG id (`nid(node)`, not whatever
+was actually claimed), silently diverging from the real `Metadata` row —
+a bug that manifests as a mysteriously "un-promotable" node, not a panic
+naming the real cause. **The general rule**: any fixture method that lets
+a caller supply an identity FOR a resource whose OTHER methods derive that
+same identity a different way (here: from the resource's own positional
+index) needs its own doc calling out the exact condition under which the
+two derivations agree — "it happens to work" is not the same as "it is
+safe to rely on," and the fix is a documented precondition, not a runtime
+assertion that would fire too late to explain itself. Confirmed the fix is
+adequate here specifically because this rung's own new scenario is the
+ONLY caller of the new method that also calls `restart`/`crash` afterward
+— a documented precondition, not an enforced one, is only acceptable when
+every actual caller at the time of writing already satisfies it and the
+doc makes the condition impossible to miss for the next one.
+
+## Extending an existing scenario's own workload can add a later assertion without invalidating an earlier point-in-time one (ADR 0061 rung M, C-13 PR 4)
+
+Two of `tests/seed_join_allocated.rs`'s five real-socket tests
+(`no_node_join_becomes_active_and_gets_a_replica`, `follower_connected_
+seed_completes_the_allocate_node_id_round_trip`) turned out, once read
+directly rather than assumed from the file's shared module doc, to need
+either MORE of an already-existing sim scenario's own workload or nothing
+new at all — not a fresh scenario apiece. The one genuinely new piece
+needed was proving a BALANCE-driven (not violation-driven) replica
+placement for a self-minted COMBINED joiner, which the existing scenario's
+own single-table setup structurally could not exercise (one tablet at RF 3
+across exactly 3 pre-existing nodes is already at `rebalance_step`'s own
+`max - min <= 1` convergence threshold the moment a 4th node joins — no
+move is ever triggered). The fix was not a new scenario; it was adding two
+more tables to the EXISTING scenario's setup (creating real balance
+pressure) and a TRAILING poll-based assertion after its own pre-existing,
+point-in-time forwarding proof ("the joiner hosts no replica of `t1`
+immediately after promotion"). The two assertions do not conflict even
+though the later poll can eventually move `t1`'s own tablet onto the
+joiner too: the earlier assertion is checked, and is true, at an earlier
+moment in virtual time, and nothing about a LATER fact being different
+un-asserts an EARLIER one that already ran. **The general rule**: before
+reaching for a new scenario to prove one more property of an existing
+mechanism, check whether the existing scenario's own workload merely
+needs to be widened (more tables, more nodes, more writes) — and check
+that any new assertion is either checked at a moment that cannot yet
+have been disturbed by the widened workload, or is itself a converged-
+or-timeout poll for a LATER fact, never a re-assertion of an EARLIER
+point-in-time fact that a wider workload might have since moved past.
+This is materially cheaper to build, review, and maintain than a second
+near-duplicate scenario, and it is what let two of five real-socket tests
+in this file collapse into zero new sim scenarios rather than two.
+
+## A sibling scenario's own convention is not automatically this scenario's own scope — check the conversion target directly before copying it (ADR 0061 rung M, C-13 PR 5)
+
+Converting `tests/seed_join_allocated.rs`'s `two_concurrent_allocated_
+joins_get_distinct_ids` into a `SimCluster` sibling, an early draft created
+three tables and closed with a put/get forwarding proof through each
+joined node — mirroring scenario (a)'s own established convention in the
+same module (a single joiner gets that exact treatment, and it works
+reliably there). It flaked at one of five pinned `_over_seeds` values with
+a genuine, reproducible `"no CP group leader reachable"` — root-caused
+(never widened a budget, never `#[ignore]`d) by direct, temporary
+instrumentation to: with TWO joiners promoted back to back rather than
+one, the placement reconciler has strictly more elapsed virtual time
+before the forwarding proof runs, and it used that window to move MULTIPLE
+tablets' replicas across both new nodes at once — a real, if transient,
+mid-reconfigure window the single-joiner scenarios never hit because their
+own promotion-to-proof window is too short for the reconciler to get there
+first (each already states this reasoning in its own doc). The fix was not
+a retry wrapper around the flaky assertion — re-reading the REAL test's
+own body directly (not the module's accumulated habit of extending each
+new scenario the same way the last one was extended) showed it never made
+a forwarding proof at all: only distinct/minted ids and real-detector
+promotion. Dropping the tables and the forwarding proof from the new
+scenario entirely — matching the conversion target's own actual scope,
+not a sibling scenario's convention — removed the race at its root with no
+loss of coverage (the forwarding proof already exists elsewhere, for the
+case where it's actually safe to make it as a point-in-time assertion).
+**The general rule**: when building the Nth scenario in a module that
+already has an established per-scenario shape, matching that shape by
+habit is not the same as matching what THIS scenario's own conversion
+target actually asserts — re-derive the new scenario's scope from the real
+test/mechanism being converted, the same "re-grep, don't propagate an
+inherited label" discipline this log already records for roadmap
+inventories and closing-rung pointers, and apply it to a sibling
+scenario's own convention too. A flake that only appears at higher
+concurrency (here: two joiners instead of one) is often a sign that an
+assertion copied from a lower-concurrency sibling has quietly picked up an
+implicit precondition (a short promotion-to-proof window) that no longer
+holds — the fix is to check whether the assertion was ever actually
+required, not to make it more patient.
+
+## Two tests in one file can need two different verdicts — don't let a file-level open question force an all-or-nothing answer (ADR 0061 rung M, C-13 PR 6)
+
+`control_membership_split.rs`'s own conversion was left as one open
+question by the opener plan: build a new "introduce a control-bearing
+non-voter node" primitive (option a), or route it through the seed/join
+dial (option b), or — if neither proves tractable — assess-and-close the
+whole file. All three framings implicitly treated the file's two tests as
+one decision. Reading each test's own body directly, independently, before
+picking a framing showed they are not the same kind of test at all: one
+(`admin_add_control_member_races_a_control_only_self_registration_and_
+still_converges`) never touches `Node::bind_control`/discovery/claim at
+all — its own real subject is a pure control-plane admin-vs-apply-task
+timing race, provable with a fabricated `NodeAddrs` and a direct leader
+propose, both mechanisms already fully generic and already reachable; the
+other (`grow_then_replace_a_voter_over_a_split_deployment_with_live_data_
+traffic`) really does need the deferred "combined growth" primitive. Once
+read separately, there was no single verdict to force — one converts
+cleanly with a one-line accessor addition, the other stays real-socket,
+precisely and narrowly named. **The general rule**: an open question
+scoped at the file level by a prior investigation is a starting point for
+where to look, not a commitment to answer at that granularity — re-derive
+the unit of decision (per assertion, per test, or per file) from what the
+tests actually do, the same "don't propagate an inherited label" discipline
+this log already records for single tests and roadmap inventories, applied
+here one level up to a *grouping* decision instead of a single test's own
+label.
+
+**A second, related finding from the same PR: two independent production
+doc comments naming the identical gap is corroborating evidence worth
+citing verbatim, not a reason to skip verifying it yourself.**
+`SimCluster::grow`'s own doc (this rung's own PR 2's template method) and
+`sim_cluster_control_membership_admin.rs`'s own module doc (a separately
+landed prior rung, C-12 PR 4e) both independently state that a genuinely
+new control-plane-voter growth node is deferred, materially-different,
+separately-budgeted machinery — arrived at from two different angles (one
+building the seed/join dial, one converting the closest sibling
+real-socket file) rather than one comment copying the other. That
+independent convergence is strong evidence the gap is real and not an
+artifact of either PR's own local framing — but the conversion still
+should not stop at citing both quotes; this PR re-derived the SAME
+conclusion from the actual mechanism (`self.controls: Vec<RaftNode<
+SimEnv>>` never growing post-construction, `RaftCore`'s own learner
+machinery not being what the real test's `join_control_nonvoter` shape
+needs since that helper's own node starts genuinely OUTSIDE the group's
+config, not as a tracked learner inside it) before treating the two prior
+doc comments as confirmation rather than as the whole argument. Citing a
+predecessor's conclusion without re-deriving it independently is exactly
+the failure mode ADR 0061's own "Rung L closed" amendment already named
+for a different case (a rung's inherited "why it stays `ProdEnv`" label
+turning out to be stale once actually re-read) — the fix generalizes: two
+independent citations agreeing is good evidence, never a substitute for
+checking the mechanism yourself.

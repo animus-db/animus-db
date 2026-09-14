@@ -1369,6 +1369,15 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
 ///   RemoteControlClient::metadata_fresh` sends through this same `R`.
 ///   Answers with the identical `ClientResponse::Status` shape production's
 ///   own `handle_request` builds.
+/// - [`ClientRequest::JoinInfo`] (added C-13/ADR 0061 rung M PR 2) — what a
+///   `SimCluster`-native seed/join dial sends over a
+///   [`SimRelayClient`](animus_node::SimRelayClient) before it has any
+///   `ClientCtx` of its own. **Not** part of the three arms production's
+///   own `handle_request` delegates here (see the next paragraph) — added
+///   purely for `SimRelayClient`'s own inbound dispatch, which (unlike
+///   production's `handle_request`) has no separate `JoinInfo` arm of its
+///   own to fall through to. Answers with the identical
+///   `ClientResponse::JoinInfo` shape `lib.rs`'s real serve arm builds.
 ///
 /// Every other variant returns a plain [`ClientResponse::Error`] — this is
 /// deliberately **not** an attempt to cover `ClientRequest`'s whole surface
@@ -1384,10 +1393,15 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
 /// — a pure refactor (byte-identical behavior, since those three arms'
 /// bodies are copied here verbatim) that leaves exactly one dispatch table
 /// for the relayed set instead of two independently-maintained copies.
-/// Every other `handle_request` arm (the plain client-facing ops, `SplitTablet`,
-/// `JoinInfo`, `WatchMetadata`, `Txn`, and the internal-only tablet-addressed
-/// RPCs) stays exactly where it was — none of those are part of the relayed
-/// set this rung threads through `R`.
+/// Every other `handle_request` arm (the plain client-facing ops,
+/// `SplitTablet`, `WatchMetadata`, `Txn`, and the internal-only
+/// tablet-addressed RPCs) stays exactly where it was — none of those are
+/// part of the relayed set this rung threads through `R`. **`JoinInfo` is
+/// the one exception**: production's own `handle_request` keeps its own,
+/// separate `JoinInfo` arm (never delegating here — it is not one of the
+/// three named above), so this function's own `JoinInfo` arm (added by
+/// C-13 PR 2) is reachable ONLY through a `SimRelayClient` inbound
+/// dispatch, never through production's real client/intra listener.
 pub(crate) async fn handle_relayed_request<E: Env, R: RelayClient>(
     ctx: &ClientCtx<E, R>,
     req: ClientRequest,
@@ -1409,6 +1423,28 @@ pub(crate) async fn handle_relayed_request<E: Env, R: RelayClient>(
                 ClientResponse::PutOk
             }
         }
+        // Join discovery (ADR 0032 PR2, C-13/ADR 0061 rung M PR 2): widens
+        // this dispatcher's own three-arm allowlist by one — purely
+        // additive, no existing arm above touched. Production's real
+        // `handle_request` never reaches this arm for `JoinInfo` (it has
+        // its own, separate arm serving the identical shape directly,
+        // `lib.rs`'s top-level match — only `Status`/`Forwarded`/
+        // `ProposeSchema` delegate here, see this function's own doc), so
+        // this is reachable ONLY from a `SimRelayClient` inbound dispatch —
+        // a genuine `AnimusdRelayClient`-served production node never sends
+        // a bare `JoinInfo` through the relay envelope at all (a real
+        // joiner dials a seed's listener directly). Mirrors `lib.rs`'s own
+        // `JoinInfo` serve arm exactly, field for field — every one of
+        // these accessors is already `<E, R>`-generic-reachable here, the
+        // same way the neighboring `Status` arm above already reads
+        // `ctx.control`/`ctx.route_snapshot()`.
+        ClientRequest::JoinInfo => ClientResponse::JoinInfo {
+            control_ids: ctx.admin.control_ids.clone(),
+            peers: ctx.admin.peers.clone(),
+            client_route: ctx.route_snapshot(),
+            intra_route: ctx.intra_route_snapshot(),
+            admin_addrs: ctx.admin.admin_addrs.clone(),
+        },
         _ => ClientResponse::Error("not relayable under sim".into()),
     }
 }
