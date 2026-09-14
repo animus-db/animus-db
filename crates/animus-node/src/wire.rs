@@ -1377,6 +1377,7 @@ mod tests {
                 tablet: TabletId(1),
                 cut_version: 0,
                 bytes: 0,
+                chunk_count: 1,
             },
             MetaCommand::MarkBackupDeleted {
                 backup_id: "b1".to_string(),

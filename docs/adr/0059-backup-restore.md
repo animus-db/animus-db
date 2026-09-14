@@ -840,16 +840,41 @@ left for a reader to discover by diffing prose against code.
   status field" discipline the codebase already applies to a GSI's own
   `IndexStatus` and to `BackupStatus`'s relationship to capture progress.
 - **A restore does not pin/lock its source backup against a concurrent
-  `DeleteBackup`** — a narrow, accepted residual, not a defended property.
-  If a backup is marked deleted (and, rarer still, actually reclaimed by
-  the janitor) while a restore reading from it is still in flight, the
-  restore driver's own defensive check (re-reading the backup's live
-  status each tick) fails the restore outright (`FailRestore`) rather than
-  serving a half-seeded table — never a correctness violation, but a
-  liveness one an operator could hit by deleting a backup at an unlucky
-  moment mid-restore. Closing it (a reference count, or refusing
-  `DeleteBackup` while any `Seeding` restore names the backup) is a named
-  follow-up, not implemented in this train.
+  `DeleteBackup` — corrected 2026-09-14 (issue #856): this WAS a genuine
+  correctness violation, not merely a liveness one, until the fix below
+  landed.** The per-tick defensive check this paragraph originally
+  described (re-reading the backup's live status once, before each
+  `restore_tick` call) only ever caught a deletion observed **between**
+  ticks — it has no way to notice a deletion that lands **during** the
+  sweep a tick is already running, and `restore_tick`'s own chunk loop
+  used "no object at this index" as its sole end-of-sequence signal, with
+  no recorded expected chunk count to tell a genuine hole apart from
+  ordinary exhaustion. A `DeleteBackup` racing an in-flight restore, with
+  the janitor then reclaiming chunks **out of chunk order** (a real
+  backup store's `list` is unsorted and chunk ids aren't zero-padded, so
+  nothing stops chunk 7 being deleted before chunk 3), could — and, before
+  the fix, reliably did — make the sweep read a still-present later chunk
+  first, hit the hole where an earlier chunk used to be, and misread that
+  hole as "this tablet's chunks are exhausted": the restore completed
+  successfully with every row from the deleted chunk onward silently
+  missing. **Fixed** by recording each tablet's own expected chunk count
+  at capture time (`BackupTabletProgress::chunk_count`, `animus-control`)
+  and bounding `restore_tick`'s sweep to it: a missing chunk strictly
+  before that recorded bound is now a hard `FailRestore`, never a silent
+  "done." See `crates/animus-control/src/meta.rs`'s
+  `BackupTabletProgress::chunk_count`/`MetaCommand::
+  RecordBackupTabletComplete` doc and `crates/animusd/src/
+  backup_restore.rs`'s `restore_tick` for the mechanism, and
+  `crates/animus-test/tests/backup_fault_corpus.rs`'s
+  `delete_backup_mid_restore_fails_restore` cell for the regression
+  (proven red on the pre-fix "`Ok(None)` is the sole end-of-sequence
+  signal" algorithm, green with the recorded-bound fix). **`DeleteBackup`
+  itself still does not refuse while a restore is in flight** — that half
+  (a reference count, or refusing `DeleteBackup`/`MarkBackupDeleted` while
+  any `Seeding` restore names the backup) is issue #856's own second half,
+  landing in a follow-up PR stacked on this one; until it lands, a
+  `DeleteBackup` racing a restore is still possible, it just now fails the
+  restore loudly instead of truncating it silently.
 
 **Corpus** (`crates/animus-test/tests/backup_fault_corpus.rs`,
 `ANIMUS_BACKUP_SEEDS`): five restore cells, the identical self-contained-
@@ -863,7 +888,13 @@ the destination leader mid-seed), `restore_leader_kill_mid_seed_converges`
 later — `SegmentFaultConfig`'s own ack-lost thresholds are `put`/`delete`-
 only, checked directly against `animus-sim`'s source, so a read fault for
 restore's `get`-only workload is `SimSegmentStore::set_unavailable_until`,
-not `SegmentFaultConfig`), and `restore_after_source_drop`. GSI-rebuild
+not `SegmentFaultConfig`), and `restore_after_source_drop`. A sixth cell,
+`delete_backup_mid_restore_fails_restore` (issue #856, added 2026-09-14),
+deletes a middle chunk of a multi-chunk backup directly from the store
+(standing in for `DeleteBackup` + an out-of-chunk-order janitor reclaim)
+and asserts the restore hard-fails (`RestoreStatus::Failed`) rather than
+completing with the deleted chunk's rows silently missing — see this
+ADR's own 2026-09-14 amendment above for the mechanism. GSI-rebuild
 convergence is deliberately not reimplemented a third time in this corpus —
 it is the exact `index_backfill.rs`/`index_drain.rs` machinery
 `backfill_fault_corpus.rs` already proves at depth, applied to an ordinary

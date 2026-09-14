@@ -608,6 +608,11 @@ mod backup_progress_codec {
         tablet: TabletId,
         cut_version: u64,
         bytes: u64,
+        /// `#[serde(default)]` mirrors [`BackupTabletProgress::chunk_count`]'s
+        /// own pre-existing-snapshot convenience (root `CLAUDE.md`: no real
+        /// migration guarantee implied).
+        #[serde(default)]
+        chunk_count: u64,
     }
 
     pub fn serialize<S: Serializer>(
@@ -621,6 +626,7 @@ mod backup_progress_codec {
                 tablet: *tablet,
                 cut_version: progress.cut_version,
                 bytes: progress.bytes,
+                chunk_count: progress.chunk_count,
             })
             .collect();
         entries.serialize(serializer)
@@ -638,6 +644,7 @@ mod backup_progress_codec {
                     BackupTabletProgress {
                         cut_version: entry.cut_version,
                         bytes: entry.bytes,
+                        chunk_count: entry.chunk_count,
                     },
                 )
             })
@@ -947,6 +954,24 @@ pub struct BackupTabletProgress {
     /// The total bytes this tablet's own data objects occupy in the backup
     /// store.
     pub bytes: u64,
+    /// The number of data-chunk objects this tablet's own capture wrote —
+    /// equivalently, the tablet's `CaptureCursor::next_chunk` at the moment
+    /// capture completed, so valid chunk indices are exactly `0..chunk_count`
+    /// (issue #856, closing the gap ADR 0059's "never a correctness
+    /// violation" wording used to overstate). Restore's own chunk sweep
+    /// (`animusd::backup_restore::restore_tick`) reads this as the
+    /// **expected** end of sequence, so a chunk deleted out from under an
+    /// in-flight restore (a `DeleteBackup` racing it, then the janitor
+    /// reclaiming out of chunk order) reads as a genuine hole — a hard
+    /// `FailRestore` — rather than being misread as ordinary end-of-sequence
+    /// and silently completing with missing rows. `#[serde(default)]` is a
+    /// root-`CLAUDE.md` implementation convenience for a pre-existing
+    /// snapshot/fixture that predates this field (no real migration
+    /// guarantee implied) — a `0` default means "no chunks expected," which
+    /// is conservative (an old row with real chunks would then fail the
+    /// restore outright rather than silently truncate it).
+    #[serde(default)]
+    pub chunk_count: u64,
 }
 
 /// A backup catalog row's lifecycle status (ADR 0059 §3/§4). Modeled with
@@ -1512,8 +1537,10 @@ pub enum RestoreStatus {
     Done,
     /// Terminal failure — a stuck-`Seeding` timeout, or a source backup that
     /// became unreadable mid-restore (e.g. deleted and reclaimed by the
-    /// backup janitor while restore was still reading it, ADR 0059's Train 2
-    /// as-built note on this narrow, accepted race). `reason` is diagnostic
+    /// backup janitor while restore was still reading it — the short-read
+    /// guard [`BackupTabletProgress::chunk_count`]'s own doc describes,
+    /// closing issue #856: this is a hard failure, never a silently
+    /// truncated `Available` table). `reason` is diagnostic
     /// only, never interpreted. The target table's schema and its
     /// permanently-`Building` (never-served) tablet are left in place —
     /// `DropTableTablets`/the reconciler's ordinary `Reclaim` action already
@@ -2363,6 +2390,11 @@ pub enum MetaCommand {
         cut_version: u64,
         /// The total bytes this tablet's own data objects occupy.
         bytes: u64,
+        /// The number of data-chunk objects this tablet's own capture
+        /// wrote (issue #856) — see [`BackupTabletProgress::chunk_count`]'s
+        /// own doc for why restore's own chunk sweep needs this recorded
+        /// rather than inferring "end of sequence" from a missing object.
+        chunk_count: u64,
     },
     /// Complete a backup (ADR 0059 §3/§4) once every pinned tablet has
     /// reported — proposed by the control-plane-leader aggregator (a later
@@ -3751,6 +3783,7 @@ impl Metadata {
                 tablet,
                 cut_version,
                 bytes,
+                chunk_count,
             } => {
                 let Some(row) = self.backups.get(backup_id) else {
                     return ApplyOutcome::Rejected("no such backup");
@@ -3766,7 +3799,10 @@ impl Metadata {
                 }
                 let key = (backup_id.clone(), *tablet);
                 if let Some(existing) = self.backup_tablet_progress.get(&key) {
-                    if existing.cut_version == *cut_version && existing.bytes == *bytes {
+                    if existing.cut_version == *cut_version
+                        && existing.bytes == *bytes
+                        && existing.chunk_count == *chunk_count
+                    {
                         return ApplyOutcome::NoOp;
                     }
                     return ApplyOutcome::Rejected(
@@ -3778,6 +3814,7 @@ impl Metadata {
                     BackupTabletProgress {
                         cut_version: *cut_version,
                         bytes: *bytes,
+                        chunk_count: *chunk_count,
                     },
                 );
                 ApplyOutcome::Applied
@@ -6341,6 +6378,7 @@ mod tests {
                 tablet: TabletId(1),
                 cut_version: 10,
                 bytes: 100,
+                chunk_count: 1,
             }),
             ApplyOutcome::Rejected("no such backup")
         );
@@ -6352,6 +6390,7 @@ mod tests {
                 tablet: TabletId(2),
                 cut_version: 10,
                 bytes: 100,
+                chunk_count: 1,
             }),
             ApplyOutcome::Rejected("tablet is not pinned in this backup")
         );
@@ -6362,6 +6401,7 @@ mod tests {
                 tablet: TabletId(1),
                 cut_version: 10,
                 bytes: 100,
+                chunk_count: 1,
             }),
             ApplyOutcome::Applied
         );
@@ -6371,6 +6411,7 @@ mod tests {
             Some(&BackupTabletProgress {
                 cut_version: 10,
                 bytes: 100,
+                chunk_count: 1,
             })
         );
 
@@ -6381,6 +6422,7 @@ mod tests {
                 tablet: TabletId(1),
                 cut_version: 10,
                 bytes: 100,
+                chunk_count: 1,
             }),
             ApplyOutcome::NoOp
         );
@@ -6392,6 +6434,7 @@ mod tests {
                 tablet: TabletId(1),
                 cut_version: 11,
                 bytes: 100,
+                chunk_count: 1,
             }),
             ApplyOutcome::Rejected("tablet already reported a different completion")
         );
@@ -6410,6 +6453,7 @@ mod tests {
                 tablet: TabletId(1),
                 cut_version: 10,
                 bytes: 100,
+                chunk_count: 1,
             }),
             ApplyOutcome::Rejected("backup is not Creating")
         );
@@ -6455,6 +6499,7 @@ mod tests {
                 tablet: TabletId(1),
                 cut_version: 10,
                 bytes: 100,
+                chunk_count: 1,
             }),
             ApplyOutcome::Applied
         );
@@ -6533,6 +6578,7 @@ mod tests {
                 tablet: TabletId(2),
                 cut_version: 10,
                 bytes: 100,
+                chunk_count: 1,
             }),
             ApplyOutcome::Applied
         );
@@ -6549,6 +6595,7 @@ mod tests {
                 tablet: TabletId(3),
                 cut_version: 20,
                 bytes: 200,
+                chunk_count: 1,
             }),
             ApplyOutcome::Applied
         );
@@ -6647,6 +6694,7 @@ mod tests {
                 tablet: TabletId(1),
                 cut_version: 10,
                 bytes: 100,
+                chunk_count: 1,
             }),
             ApplyOutcome::Applied
         );
@@ -6687,6 +6735,7 @@ mod tests {
                 tablet: TabletId(1),
                 cut_version: 10,
                 bytes: 100,
+                chunk_count: 1,
             }),
             ApplyOutcome::Applied
         );
@@ -6760,6 +6809,7 @@ mod tests {
                 tablet: TabletId(1),
                 cut_version: 10,
                 bytes: 100,
+                chunk_count: 1,
             }),
             ApplyOutcome::Applied
         );
@@ -7338,6 +7388,7 @@ mod tests {
                 tablet: TabletId(1),
                 cut_version: 10,
                 bytes: 100,
+                chunk_count: 1,
             }),
             ApplyOutcome::Applied
         );
@@ -7376,6 +7427,7 @@ mod tests {
             Some(&BackupTabletProgress {
                 cut_version: 10,
                 bytes: 100,
+                chunk_count: 1,
             })
         );
         // `total_bytes` was frozen at `CompleteBackup` time and survives the
@@ -7464,6 +7516,7 @@ mod tests {
                 tablet: TabletId(1),
                 cut_version: 1,
                 bytes: 1,
+                chunk_count: 1,
             }),
             ApplyOutcome::Applied
         );
@@ -7484,6 +7537,7 @@ mod tests {
                 tablet: TabletId(2),
                 cut_version: 10,
                 bytes: 111,
+                chunk_count: 1,
             }),
             ApplyOutcome::Applied
         );
@@ -7505,6 +7559,7 @@ mod tests {
                 tablet: TabletId(3),
                 cut_version: 12,
                 bytes: 222,
+                chunk_count: 1,
             }),
             ApplyOutcome::Applied
         );
@@ -7575,6 +7630,7 @@ mod tests {
                     tablet: t,
                     cut_version: 1,
                     bytes: 10,
+                    chunk_count: 1,
                 }),
                 ApplyOutcome::Applied
             );
@@ -7619,6 +7675,7 @@ mod tests {
                 tablet: TabletId(11),
                 cut_version: 1,
                 bytes: 1,
+                chunk_count: 1,
             }),
             ApplyOutcome::Rejected("tablet is not pinned in this backup")
         );
@@ -7648,6 +7705,7 @@ mod tests {
                 tablet: TabletId(1),
                 cut_version: 10,
                 bytes: 100,
+                chunk_count: 1,
             }),
             ApplyOutcome::Applied
         );
@@ -11485,6 +11543,7 @@ mod tests {
             tablet: TabletId(1),
             cut_version: 1,
             bytes: 0,
+            chunk_count: 1,
         });
         assert_eq!(
             m.apply(&MetaCommand::CompleteBackup {

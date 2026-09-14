@@ -138,10 +138,13 @@ pub(crate) async fn backup_restore_loop(ctx: ClientCtx) {
                 continue;
             }
             // The source backup must still be readable. `Expired`/`Failed`
-            // mid-restore (a `DeleteBackup` racing an in-flight restore, ADR
-            // 0059's Train 2 as-built note on this narrow, accepted race) is
+            // mid-restore (a `DeleteBackup` racing an in-flight restore) is
             // fatal — never half-serve a target table seeded from a source
-            // that has vanished out from under it.
+            // that has vanished out from under it. This is a per-tick,
+            // before-the-sweep check only — it cannot by itself catch a
+            // deletion that lands *during* the sweep below (issue #856); the
+            // chunk sweep's own `chunk_count`-bounded short-read check is
+            // what closes that window (see its own comment).
             match meta.backup(&row.backup_id).map(|b| &b.status) {
                 Some(BackupStatus::Available) => {}
                 Some(BackupStatus::Creating) => continue, // shouldn't happen; retry
@@ -170,6 +173,14 @@ pub(crate) async fn backup_restore_loop(ctx: ClientCtx) {
                         .await
                         .insert(restore_id.clone(), RestoreProgress { last_progress: now });
                 }
+                RestoreTickOutcome::Failed => {
+                    // `restore_tick` already proposed `FailRestore` itself
+                    // (issue #856 — a short chunk read, never a silently
+                    // truncated `Available` table) — nothing further to
+                    // observe for this restore; drop its liveness tracking
+                    // the same way the stuck-timeout branch above does.
+                    tracking.lock().await.remove(&restore_id);
+                }
                 RestoreTickOutcome::NoProgress => {}
             }
         }
@@ -186,6 +197,14 @@ enum RestoreTickOutcome {
     Completed,
     /// Nothing happened (a store-read fault, a rejected/timed-out propose).
     NoProgress,
+    /// A reporting tablet's own chunk sequence came up short of its
+    /// recorded [`BackupTabletProgress::chunk_count`] (issue #856) — the
+    /// backup's source data went missing mid-restore, most likely a
+    /// `DeleteBackup` racing this very restore with the janitor reclaiming
+    /// chunks out of order. `restore_tick` has already proposed
+    /// `FailRestore` itself before returning this — never silently
+    /// completing with missing rows.
+    Failed,
 }
 
 /// One restore step for `(restore_id, backup_id)`, seeding **this node's own
@@ -237,12 +256,46 @@ async fn restore_tick(
     // routing (see the module doc's own layout-decision section for why).
     let mut progressed = false;
     for entry in &manifest.tablet_progress {
-        let mut chunk = 0u64;
-        loop {
+        // The recorded end of this tablet's own chunk sequence (issue
+        // #856) — every valid chunk index is `0..expected_chunks`, minted
+        // by the capture driver as `CaptureCursor::next_chunk` at the
+        // moment its own capture completed (`BackupTabletProgress::
+        // chunk_count`'s own doc). Sweeping to this recorded bound, rather
+        // than treating "no object" as the sole end-of-sequence signal,
+        // is what lets a hole distinguish itself from ordinary
+        // exhaustion: a backup deleted out from under an in-flight
+        // restore (`DeleteBackup` racing it, the janitor reclaiming
+        // chunks — possibly out of chunk order) now reads as a genuine
+        // short read, not a silently early "done".
+        let expected_chunks = entry.progress.chunk_count;
+        for chunk in 0..expected_chunks {
             let object_id = backup_codec::backup_data_object_id(backup_id, entry.tablet.0, chunk);
             let bytes = match ctx.backup_store.get_any(&object_id).await {
                 Ok(Some(bytes)) => bytes,
-                Ok(None) => break, // this reporting tablet's own chunks are exhausted
+                Ok(None) => {
+                    // A hole strictly before the recorded end of sequence
+                    // — never ordinary exhaustion (that would be chunk ==
+                    // expected_chunks, outside this loop's own range).
+                    // Never serve a target table silently missing rows:
+                    // fail the restore outright rather than complete it.
+                    tracing::warn!(
+                        backup_id,
+                        tablet = entry.tablet.0,
+                        chunk,
+                        expected_chunks,
+                        "restore: backup data chunk is missing before the recorded end of \
+                         sequence — the source backup was very likely deleted mid-restore; \
+                         failing the restore rather than serving a silently truncated table"
+                    );
+                    fail_restore(
+                        ctx,
+                        restore_id,
+                        "source backup data went missing mid-restore (a chunk short of its \
+                         recorded count) — refusing to activate a silently truncated table",
+                    )
+                    .await;
+                    return RestoreTickOutcome::Failed;
+                }
                 Err(err) => {
                     tracing::debug!(
                         backup_id,
@@ -286,7 +339,6 @@ async fn restore_tick(
                 return progress_outcome(progressed);
             }
             progressed = true;
-            chunk += 1;
         }
     }
 

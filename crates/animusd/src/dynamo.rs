@@ -11118,6 +11118,7 @@ mod list_backups_tests {
                 tablet,
                 cut_version: 1,
                 bytes: 10,
+                chunk_count: 1,
             }),
             ApplyOutcome::Applied
         );

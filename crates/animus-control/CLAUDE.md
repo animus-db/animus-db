@@ -580,6 +580,21 @@ per-tablet CP data plane (`animus-cp-data`).
   progress row; `RecordBackupTabletComplete` is idempotent on an identical
   repeat but rejects a genuinely differing one outright (no repair-update
   path yet, unlike `SealStreamShard`'s replicas-only allowance).
+  **`BackupTabletProgress`/`RecordBackupTabletComplete` also carry
+  `chunk_count: u64` (issue #856, 2026-09-14)** — the capture driver's own
+  `CaptureCursor::next_chunk` at the moment its capture completed, so a
+  reporting tablet's valid chunk-object indices are exactly
+  `0..chunk_count`. This is restore's own recorded end-of-sequence bound
+  (`animusd::backup_restore::restore_tick`, threaded through the manifest
+  object via `BackupManifestTabletEntry::progress`): before this field
+  existed, restore's chunk sweep used "no object at this index" as its
+  sole end-of-sequence signal, which a `DeleteBackup` racing an in-flight
+  restore (with the janitor reclaiming chunks out of order) could turn
+  into a silently truncated table — see `docs/engineering-lessons.md`'s
+  matching entry and `docs/adr/0059-backup-restore.md`'s 2026-09-14
+  amendment for the full account. `#[serde(default)]` on both the field
+  and its `backup_progress_codec::Entry` wire counterpart, per this repo's
+  no-migration convention.
   `BackupStatus` already carries an `Expired` variant for the (not yet
   built) two-phase retention janitor's mark phase, so that later PR doesn't
   reshape the enum. **`DropTableSchema`/`DropTableTablets` deliberately

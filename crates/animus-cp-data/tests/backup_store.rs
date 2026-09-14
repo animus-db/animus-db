@@ -49,6 +49,7 @@ fn sample_manifest_object(created_wall_ms: u64) -> BackupManifestObject {
                 progress: BackupTabletProgress {
                     cut_version: 10,
                     bytes: 100,
+                    chunk_count: 1,
                 },
             },
             BackupManifestTabletEntry {
@@ -56,6 +57,7 @@ fn sample_manifest_object(created_wall_ms: u64) -> BackupManifestObject {
                 progress: BackupTabletProgress {
                     cut_version: 11,
                     bytes: 200,
+                    chunk_count: 1,
                 },
             },
         ],
