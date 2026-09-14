@@ -909,13 +909,26 @@ left for a reader to discover by diffing prose against code.
   eventually proposes `FailRestore` — a slow, honest failure, never a
   silent truncation. See `crates/animus-control/src/meta.rs`'s
   `mark_backup_deleted_refuses_while_a_restore_is_seeding` and
-  `begin_restore_rejects_an_expired_or_failed_backup` unit tests for both
-  halves, and `crates/animusd/tests/dynamo_restore.rs`'s
-  `delete_backup_refuses_while_a_restore_is_in_progress_then_succeeds`
-  for the wire-level integration proof (necessarily opportunistic about
-  catching the in-flight window — see that test's own doc comment — since
-  `RestoreTableFromBackup` returns asynchronously; the apply-time
-  rejection itself is what the unit test proves deterministically).
+  `begin_restore_rejects_an_expired_or_failed_backup` unit tests for the
+  apply-time seatbelt itself. The refusal-while-`Seeding` behavior is
+  proven end to end **deterministically**, not opportunistically, in
+  `crates/animusd/src/sim_cluster_delete_backup_restore.rs`'s own
+  `delete_backup_refuses_while_a_restore_is_seeding_then_succeeds_once_
+  failed` — a `SimCluster`-driven test that mints a `Seeding` restore
+  directly via `propose_meta(MetaCommand::BeginRestore)` and asserts
+  `BackupInUseException` unconditionally: `SimCluster` never spawns
+  `backup_restore::backup_restore_loop`, so that restore stays `Seeding`
+  forever until the test itself moves it to a terminal state — no timing
+  window, no flake. (An earlier version of this account instead cited a
+  wire-level `ProdEnv` test, `delete_backup_refuses_while_a_restore_is_in_
+  progress_then_succeeds`, as "necessarily opportunistic" proof of this
+  same behavior — that test raced the real restore driver's own tick and
+  could pass vacuously on a fast run, exactly the flake-by-construction
+  shape this repo's own conventions forbid. It was trimmed to
+  `delete_backup_succeeds_after_restore_completes`, keeping only its
+  genuinely deterministic half — a real, wire-driven restore run to
+  completion, then `DeleteBackup` succeeds — with the refusal-while-
+  `Seeding` proof moved to the `SimCluster` test above.)
 
 **Corpus** (`crates/animus-test/tests/backup_fault_corpus.rs`,
 `ANIMUS_BACKUP_SEEDS`): five restore cells, the identical self-contained-

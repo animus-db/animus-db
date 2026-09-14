@@ -530,27 +530,46 @@ async fn restore_works_after_the_source_table_is_dropped() {
     node.shutdown_graceful().await;
 }
 
-/// Issue #856 (second half): `DeleteBackup` refuses a backup that is the
-/// source of a restore still in progress (`BackupInUseException`), and the
-/// identical delete succeeds once that restore reaches a terminal state.
+/// Issue #856 (second half): `DeleteBackup` succeeds once a restore that
+/// was reading from it has reached a terminal state.
 ///
-/// The "still in progress" observation is opportunistic, by construction —
-/// `RestoreTableFromBackup` returns asynchronously, before the restore
-/// driver's very own next tick (`animusd::backup_restore`, `RESTORE_TICK_
-/// INTERVAL` = 200ms) — the same class of timing window
-/// `restore_rejects_a_bad_backup_or_an_existing_target`'s own comment
-/// documents for the analogous still-`CREATING`-backup case: a call issued
-/// immediately after the restore kicks off overwhelmingly lands while it is
-/// still `Seeding`, but is not guaranteed to on every run. The apply-time
-/// rejection itself (`MetaCommand::MarkBackupDeleted`'s own seatbelt,
-/// `Metadata::backup_referenced_by_a_live_restore`) is proven
-/// deterministically at the unit level in `animus-control`'s own
-/// `meta::tests::mark_backup_deleted_refuses_while_a_restore_is_seeding` —
-/// this test is the wire-level integration proof that the check is wired
-/// into the real `DeleteBackup` HTTP path, not the load-bearing regression
-/// for the mechanism itself.
+/// **This test deliberately no longer attempts to catch the restore still
+/// `Seeding`** — an earlier version of this test issued `DeleteBackup`
+/// once, immediately after `RestoreTableFromBackup` returned, and branched
+/// on whether the restore happened to still be in flight (`if status ==
+/// 400 { assert BackupInUseException }`, with the `BackupInUseException`
+/// assertion never actually reached on a fast run, where the restore
+/// driver's own next tick — `animusd::backup_restore`, `RESTORE_TICK_
+/// INTERVAL` = 200ms — could already have finished seeding this small
+/// table). That made the test pass vacuously on a fast runner and only
+/// possibly fail on a slow one: a flake by construction, the exact class
+/// CLAUDE.md forbids (a test that depends on winning a race).
+///
+/// The refusal-while-`Seeding` half is now proven **deterministically**
+/// instead, in `crates/animusd/src/sim_cluster_delete_backup_restore.rs`'s
+/// own `delete_backup_refuses_while_a_restore_is_seeding_then_succeeds_
+/// once_failed` — a `SimCluster`-driven test that mints a `Seeding`
+/// restore directly via `propose_meta(MetaCommand::BeginRestore)`. Since
+/// `SimCluster` never spawns `backup_restore::backup_restore_loop` as a
+/// background task at all, that restore stays `Seeding` **forever**, with
+/// zero race, until the test itself moves it to a terminal state — so the
+/// `BackupInUseException` assertion runs unconditionally, every time. See
+/// that module's own doc for the full design.
+///
+/// This test keeps only the genuinely deterministic half: a real, wire-
+/// driven `RestoreTableFromBackup` run all the way to completion (a real
+/// `Seeding` window exists here too, but nothing in this test ever samples
+/// it), then `DeleteBackup` on the now-`Done` restore's own source backup
+/// succeeds. The apply-time rejection itself (`MetaCommand::
+/// MarkBackupDeleted`'s own seatbelt, `Metadata::
+/// backup_referenced_by_a_live_restore`) is proven deterministically at the
+/// unit level in `animus-control`'s own `meta::tests::
+/// mark_backup_deleted_refuses_while_a_restore_is_seeding` — this test is
+/// the wire-level integration proof that a `DeleteBackup` call reaches a
+/// real, completed restore's own backup correctly, not the load-bearing
+/// regression for either the refusal or the seatbelt mechanism.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn delete_backup_refuses_while_a_restore_is_in_progress_then_succeeds() {
+async fn delete_backup_succeeds_after_restore_completes() {
     let dir = support::panic_safe_tempdir();
     let (node, config) = support::start_single_node(dir.path(), StorageBackend::default()).await;
     let addr = config.nodes[0].dynamo;
@@ -584,27 +603,17 @@ async fn delete_backup_refuses_while_a_restore_is_in_progress_then_succeeds() {
         "restore must not activate synchronously: {body}"
     );
 
-    // Opportunistic (see the doc comment above): almost always still
-    // `Seeding` at this instant.
-    let (status, body) = delete_backup(addr, &backup_arn).await;
-    let deleted_while_in_progress = status == 200;
-    if status == 400 {
-        assert_eq!(error_code(&body), "BackupInUseException", "body: {body}");
-    }
-
     await_table_active(addr, "inflight_restored").await;
 
-    if !deleted_while_in_progress {
-        // The restore is now terminal (`Done`) — the identical delete must
-        // now succeed, proving the block was lifted rather than sticky.
-        let (status, body) = delete_backup(addr, &backup_arn).await;
-        assert_eq!(status, 200, "DeleteBackup after restore completion: {body}");
-        assert_eq!(
-            json(&body)["BackupDescription"]["BackupDetails"]["BackupStatus"],
-            "DELETED",
-            "body: {body}"
-        );
-    }
+    // The restore is now terminal (`Done`) — `DeleteBackup` on its source
+    // backup must succeed.
+    let (status, body) = delete_backup(addr, &backup_arn).await;
+    assert_eq!(status, 200, "DeleteBackup after restore completion: {body}");
+    assert_eq!(
+        json(&body)["BackupDescription"]["BackupDetails"]["BackupStatus"],
+        "DELETED",
+        "body: {body}"
+    );
 
     node.shutdown_graceful().await;
 }

@@ -18938,6 +18938,21 @@ mod sim_cluster_auto_split;
 #[cfg(test)]
 mod sim_cluster_backup_janitor;
 
+/// Issue #856 review follow-up (not a numbered ADR 0061 rung): deterministic
+/// `SimCluster` coverage for `DeleteBackup` refusing a backup with a
+/// `Seeding` restore against it (`BackupInUseException`), and the identical
+/// delete succeeding once that restore reaches a terminal state — replacing
+/// the wire-level `dynamo_restore.rs::
+/// delete_backup_refuses_while_a_restore_is_in_progress_then_succeeds`
+/// test's own race-dependent `if status == 400` branch with an
+/// unconditional assertion. `SimCluster` never spawns `backup_restore::
+/// backup_restore_loop`, so a restore minted directly via `propose_meta`
+/// stays `Seeding` forever until explicitly failed/completed — no polling,
+/// no timing window, no flake. See this module's own doc for the two
+/// scenarios and `crates/animusd/CLAUDE.md`'s matching entry.
+#[cfg(test)]
+mod sim_cluster_delete_backup_restore;
+
 /// ADR 0061 rung D4 PR 4 (C-04 D4, closing the D4 roadmap item): deterministic
 /// `SimCluster` coverage for ADR 0030 online growth and ADR 0032 seed-join
 /// decommission — `sim_cluster.rs`'s own new `SimCluster::grow`/`drain`/
