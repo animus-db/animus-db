@@ -25716,3 +25716,42 @@ for a different case (a rung's inherited "why it stays `ProdEnv`" label
 turning out to be stale once actually re-read) — the fix generalizes: two
 independent citations agreeing is good evidence, never a substitute for
 checking the mechanism yourself.
+
+## A closing rung's own "What was deferred" pointer, however precise, is still worth re-deriving from source before scoping the follow-on — the required grep for a new rung is not redundant with a predecessor's (ADR 0061 rung N, C-14 PR 1)
+
+Rung M's own "Rung M closed" amendment named the combined-voter-growth
+primitive precisely — the exact mechanism, the exact three consumers it
+would unblock, citing two independently-landed module docs as prior
+corroboration. Every point it made checked out. But this rung's own
+required full-tree grep for "any real-socket test whose subject is a fresh
+control voter joining" (not merely re-reading the pointer's own consumer
+list) found a FOURTH file, `heartbeat_live_destinations.rs`, that no prior
+C-13/C-14 scoping document had named at all — not because anyone missed it
+carelessly, but because it was never in C-13's own scope to grep for (that
+rung's own grep was scoped to seed/join files, not every control-growth-
+adjacent file in the whole `tests/` tree). The general form: a prior rung's
+own "here's everything relevant" list is scoped to THAT rung's own
+investigation boundary, not to the union of every future rung's own
+boundary — each new rung's own required grep step is not redundant with a
+predecessor's, even when the predecessor was unusually thorough and every
+one of its individual claims turns out correct.
+
+## A test using the same bring-up helper as a known-in-scope test is not the same claim as the test exercising the same mechanism — trace what the test actually asserts, not what it sets up to reach the assertion (ADR 0061 rung N, C-14 PR 1)
+
+`heartbeat_live_destinations.rs::heartbeat_reaches_a_runtime_added_voter_
+after_it_becomes_leader` uses `join_control_nonvoter`, the identical helper
+`control_membership_split.rs` uses — an obvious first guess that it would
+convert the moment the combined-voter-growth primitive lands. It would not:
+its own real subject is `heartbeat_loop_live` itself, a `ProdEnv`-hardcoded
+background loop `SimCluster` has never used (it deliberately spawns the
+plain, generic `heartbeat_loop` everywhere instead), plus `ProdEnv::merge_
+peer`'s own per-env peer-book scope limit — both orthogonal to whether a
+fresh voter can be grown under `SimEnv` at all. The general form: "calls the
+same bring-up helper as a known-in-scope test" answers a different question
+than "tests the same mechanism as a known-in-scope test" — the identical
+distinction this crate's own C-13 template already recorded for
+`join_data_seed_settings_reach.rs` ("does this file call the mechanism
+under investigation" vs. "is the mechanism under investigation what this
+file's assertions are actually about"), now confirmed a second time on an
+unrelated file family. Always trace the test's own asserted property before
+counting it as either in-scope or unblockable by a candidate primitive.

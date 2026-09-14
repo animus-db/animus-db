@@ -6158,6 +6158,34 @@ residual inventory (permanent/deferred reasons), and ADR 0061's "Rung M
 (post-C-12)" opener amendment through "Rung M closed" for the full
 per-PR account, the mechanism summary, and the assess-and-close verdicts.
 
+**C-14 (rung N, opened 2026-09-14, PR 1 landed)** — the one residual C-13
+PR 6 named precisely: `SimCluster` has no way to add a genuinely new
+`RaftNode<SimEnv>` to the LIVE control-plane voter quorum after
+construction (`self.controls` only ever grows at `new_with_roles`
+construction time). PR 1's own opener took two decisions: (1) **id/index
+mapping** — a `BTreeMap<u64, usize>` (node id → `self.controls`-vec
+index) decouples a grown voter's id from its vec position, so `self.
+controls` only ever grows by pushing at the end and no existing data
+node's id shifts (audit: 16 `self.controls[..]` sites, 11 `self.controls.
+len()` sites in `sim_cluster.rs`); (2) **PR 2's own scope is `NodeRole::
+Control` growth only** (`grow_control() -> u64`) — combined-role
+(`NodeRole::Both`) growth is PR 4's scope or an honest defer. **Four
+consumers, not three** — PR 1's own grep found a fourth file no prior
+scoping document had named: `control_membership_split.rs`'s remaining
+test (convertible), `SimCluster::grow`'s deferred `"combined"` arm
+(convertible, a fixture consumer), the seed/join dial's `NodeRole::
+Control` panic (convertible, needs its own `control_voters`-convergence
+completion signal, no `detect_loop` promotion applies), and `heartbeat_
+live_destinations.rs::heartbeat_reaches_a_runtime_added_voter_after_it_
+becomes_leader` — uses the identical `join_control_nonvoter` helper as
+the other two files but **permanently real-socket**, same reason as
+`control_membership_admin.rs`'s own kept test (`heartbeat_loop_live` is
+`ProdEnv`-hardcoded; `ProdEnv::merge_peer`'s peer-book scope limit is
+invisible under `SimEnv`). See ADR 0061's "Rung N (post-C-13)" opener
+amendment for the full grep-verified ground truth, the primitive sketch,
+determinism constraints, and the 5-PR ladder, and `docs/roadmap.md`'s
+C-14 entry.
+
 
 ### `sim_cluster_corpus`: the SimCluster cycles/durability corpus (ADR 0061 rung D1 step 3)
 
