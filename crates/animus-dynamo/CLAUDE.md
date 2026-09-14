@@ -89,6 +89,14 @@ comment for its full type/method inventory.
   TagResource/UntagResource/ListTagsOfResource/DescribeLimits/
   DescribeEndpoints/ExecuteStatement/BatchExecuteStatement, plus the
   response encoders).
+  **Decode-time `N` validation (issue #846)**: the `"N"` arm rejects
+  anything `numkey::encode_checked` can't represent (malformed decimal/
+  exponent text, or more than `numkey::MAX_SIGNIFICANT_DIGITS` significant
+  digits — a cap `numkey::encode` alone does not enforce) as a
+  `ValidationException`, closing the gap where a malformed `N` used to
+  reach `AttributeValue::key_bytes`'s raw-ASCII fallback and corrupt stored
+  key order for its well-formed numeric neighbours (ADR 0063's amendment
+  has the full incident).
   `ExecuteStatement` (ADR 0071, W-07) is decoded here (`Statement`/
   `Parameters`/`ConsistentRead`/`NextToken`/`Limit`/
   `ReturnConsumedCapacity`) but its `statement` text is opaque at this

@@ -5302,8 +5302,24 @@ fn decode_attribute_value(name: &str, value: &Value) -> Result<AttributeValue, W
             .ok_or_else(|| WireError::validation(format!("`{name}`.S must be a string"))),
         "N" => inner
             .as_str()
-            .map(|s| AttributeValue::N(s.to_owned()))
-            .ok_or_else(|| WireError::validation(format!("`{name}`.N must be a string"))),
+            .ok_or_else(|| WireError::validation(format!("`{name}`.N must be a string")))
+            .and_then(|s| {
+                // ADR 0063 / issue #846: `N` text must be a well-formed
+                // DynamoDB number — the same grammar `numkey::encode_checked`
+                // (`AttributeValue::key_bytes`'s own encoder, plus DynamoDB's
+                // 38-significant-digit cap `encode` alone does not enforce)
+                // accepts. Rejecting anything else here is what keeps
+                // `key_bytes`'s raw-ASCII fallback truly unreachable from
+                // wire input, so a malformed `N` never corrupts stored key
+                // order for its well-formed neighbours.
+                if crate::numkey::encode_checked(s).is_some() {
+                    Ok(AttributeValue::N(s.to_owned()))
+                } else {
+                    Err(WireError::validation(format!(
+                        "`{name}`.N is not a valid DynamoDB number"
+                    )))
+                }
+            }),
         "B" => inner
             .as_str()
             .ok_or_else(|| WireError::validation(format!("`{name}`.B must be a base64 string")))
@@ -7476,6 +7492,67 @@ mod tests {
         let body = br#"{"TableName":"t","Item":{"id":{"XX":""}}}"#;
         let err = decode_request("DynamoDB_20120810.PutItem", body).unwrap_err();
         assert_eq!(err.code, "ValidationException");
+    }
+
+    /// Issue #846: malformed `N` text must be rejected at decode time for
+    /// every path that builds an `Item` from wire JSON, not silently
+    /// accepted and later mis-keyed (`AttributeValue::key_bytes`'s
+    /// raw-ASCII fallback, `animus-item`'s `numkey` module).
+    #[test]
+    fn put_item_rejects_malformed_n() {
+        let body = br#"{"TableName":"t","Item":{"pk":{"S":"p"},"sk":{"N":"12a"}}}"#;
+        let err = decode_request("DynamoDB_20120810.PutItem", body).unwrap_err();
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    #[test]
+    fn update_item_value_rejects_malformed_n() {
+        let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+            "UpdateExpression":"SET v = :v",
+            "ExpressionAttributeValues":{":v":{"N":"12a"}}}"#;
+        let err = decode_request("DynamoDB_20120810.UpdateItem", body).unwrap_err();
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    #[test]
+    fn batch_write_item_rejects_malformed_n() {
+        let body = br#"{"RequestItems":{
+            "t":[{"PutRequest":{"Item":{"pk":{"S":"a"},"sk":{"N":"12a"}}}}]}}"#;
+        let err = decode_request("DynamoDB_20120810.BatchWriteItem", body).unwrap_err();
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    #[test]
+    fn transact_write_items_rejects_malformed_n() {
+        let body = br#"{"TransactItems":[
+            {"Put":{"TableName":"t","Item":{"pk":{"S":"a"},"sk":{"N":"12a"}}}}]}"#;
+        let err = decode_request("DynamoDB_20120810.TransactWriteItems", body).unwrap_err();
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    /// Also rejected: too many significant digits (DynamoDB's documented
+    /// 38-digit cap, which `numkey::encode` alone does not enforce — see
+    /// `numkey::encode_checked`'s doc).
+    #[test]
+    fn put_item_rejects_n_over_the_significant_digit_cap() {
+        let over_cap = "9".repeat(animus_item::numkey::MAX_SIGNIFICANT_DIGITS + 1);
+        let body =
+            format!(r#"{{"TableName":"t","Item":{{"pk":{{"S":"p"}},"n":{{"N":"{over_cap}"}}}}}}"#);
+        let err = decode_request("DynamoDB_20120810.PutItem", body.as_bytes()).unwrap_err();
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    /// A well-formed `N` at exactly the 38-digit cap is still accepted, and
+    /// nested `N`s (inside `M`/`L`) go through the same validated arm.
+    #[test]
+    fn put_item_accepts_well_formed_n_including_nested() {
+        let at_cap = "9".repeat(animus_item::numkey::MAX_SIGNIFICANT_DIGITS);
+        let body = format!(
+            r#"{{"TableName":"t","Item":{{"pk":{{"S":"p"}},"n":{{"N":"{at_cap}"}},
+            "nested":{{"M":{{"inner":{{"N":"3.14"}}}}}}}}}}"#
+        );
+        decode_request("DynamoDB_20120810.PutItem", body.as_bytes())
+            .expect("well-formed N (including nested) should decode");
     }
 
     #[test]
