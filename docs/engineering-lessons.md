@@ -24904,6 +24904,21 @@ leader-index accessor, for the control plane, a CP-data tablet, or any
 future leader-shaped state this fixture grows. Check for this the moment
 a scenario's own shape is "crash the leader, then ask who leads."
 
+**Confirmed a third time anyway (ADR 0061 rung N, C-14 PR 2)** —
+`sim_cluster_control_growth.rs`'s own crash/transfer/serve helper hit the
+identical mistake despite this entry already predicting it: a plain
+`control_leader_index()` call issued right after `cluster.crash(leader)`
+kept returning the crashed node's own frozen `is_leader()==true` belief
+(its vec index sorted before the real new leader's), silently misrouting
+both a `/admin/control/transfer` retry loop (timing out against a dead
+node) and a post-transfer "did it land?" check (reporting the crashed
+node's stale belief instead of the grown node's real, live leadership).
+Fixed the same way — route every post-crash lookup through
+`control_leader_index_excluding`. No new mechanism was added; this is
+recorded here only as confirmation that "check for this the moment a
+scenario crashes a leader" is worth restating to whoever writes the next
+one, not as a new lesson.
+
 ## A scenario converted from a real-socket test needs its own retry discipline for a race the original's real network timing happened to paper over (ADR 0061 rung L, C-12 PR 4b)
 
 Three of `sim_cluster_split_cluster.rs`'s six converted scenarios passed
@@ -25786,3 +25801,73 @@ mechanism, the regression cell that would prove it, and why #838's own
 fix and its own regression both deliberately don't cover it — named here,
 not fixed, for whoever next touches `SharedWal`'s or `persist_wal`'s
 failure handling.
+## A closing rung's own "What was deferred" pointer, however precise, is still worth re-deriving from source before scoping the follow-on — the required grep for a new rung is not redundant with a predecessor's (ADR 0061 rung N, C-14 PR 1)
+
+Rung M's own "Rung M closed" amendment named the combined-voter-growth
+primitive precisely — the exact mechanism, the exact three consumers it
+would unblock, citing two independently-landed module docs as prior
+corroboration. Every point it made checked out. But this rung's own
+required full-tree grep for "any real-socket test whose subject is a fresh
+control voter joining" (not merely re-reading the pointer's own consumer
+list) found a FOURTH file, `heartbeat_live_destinations.rs`, that no prior
+C-13/C-14 scoping document had named at all — not because anyone missed it
+carelessly, but because it was never in C-13's own scope to grep for (that
+rung's own grep was scoped to seed/join files, not every control-growth-
+adjacent file in the whole `tests/` tree). The general form: a prior rung's
+own "here's everything relevant" list is scoped to THAT rung's own
+investigation boundary, not to the union of every future rung's own
+boundary — each new rung's own required grep step is not redundant with a
+predecessor's, even when the predecessor was unusually thorough and every
+one of its individual claims turns out correct.
+
+## A test using the same bring-up helper as a known-in-scope test is not the same claim as the test exercising the same mechanism — trace what the test actually asserts, not what it sets up to reach the assertion (ADR 0061 rung N, C-14 PR 1)
+
+`heartbeat_live_destinations.rs::heartbeat_reaches_a_runtime_added_voter_
+after_it_becomes_leader` uses `join_control_nonvoter`, the identical helper
+`control_membership_split.rs` uses — an obvious first guess that it would
+convert the moment the combined-voter-growth primitive lands. It would not:
+its own real subject is `heartbeat_loop_live` itself, a `ProdEnv`-hardcoded
+background loop `SimCluster` has never used (it deliberately spawns the
+plain, generic `heartbeat_loop` everywhere instead), plus `ProdEnv::merge_
+peer`'s own per-env peer-book scope limit — both orthogonal to whether a
+fresh voter can be grown under `SimEnv` at all. The general form: "calls the
+same bring-up helper as a known-in-scope test" answers a different question
+than "tests the same mechanism as a known-in-scope test" — the identical
+distinction this crate's own C-13 template already recorded for
+`join_data_seed_settings_reach.rs` ("does this file call the mechanism
+under investigation" vs. "is the mechanism under investigation what this
+file's assertions are actually about"), now confirmed a second time on an
+unrelated file family. Always trace the test's own asserted property before
+counting it as either in-scope or unblockable by a candidate primitive.
+
+## A `propose()` right before a call that reads `Metadata` back needs virtual time in between, not just between a propose and a crash (ADR 0061 rung N, C-14 PR 4)
+
+Every prior instance of this lesson in this crate was framed around a
+propose racing a *crash* (`sim_cluster_growth.rs`'s own scenario (d),
+`sim_cluster_backup_janitor.rs`'s own finding): `propose()` only appends to
+the leader's own local Raft log, so crashing immediately afterward can lose
+an entry that never left the leader — fixed by advancing virtual time
+before the crash. `SimCluster::grow_combined()`'s own first draft hit the
+identical root cause in a shape with no crash anywhere in it: it proposed
+`RegisterNode`+`UpsertMember{Active}` directly on the current control
+leader (the fixture's own control-plane bypass), then immediately called
+the real `POST /admin/control/member/add` admin route with zero virtual
+time advanced in between. `admin_add_control_member`'s own read-your-writes
+barrier (the issue #406/#450 fix) bound-waits on `engine_applied_index() >=
+commit_index()`, where `commit_index()` is captured **at the barrier's own
+call start** — with nothing advancing the simulator between the proposes
+and the admin call, that captured commit index can itself be read before
+the two just-proposed entries have committed, so the barrier catches up to
+a stale commit index, `Metadata::node_addrs` reads as not-yet-containing
+the node, and the admission call's own bounded retry-on-collision loop
+races the real (eventually-committing) registration to a permanent `409`:
+"node n3 is already claimed by a different registration." The general
+form: the lesson is not "advance time before a crash" specifically — it is
+"a `propose()` commits and applies only once the Raft driver actually
+runs, so ANY subsequent call in the same scenario that reads `Metadata`
+back (a crash, an admin action, a wire read, an admission route with its
+own read-your-writes barrier) needs real virtual time between the propose
+and that read," and the fix is the same `self.sim.run_for(..)` margin
+either way. No production code was at fault — `admin_add_control_member`'s
+barrier behaved exactly as designed against a caller that gave it no time
+to observe anything.
