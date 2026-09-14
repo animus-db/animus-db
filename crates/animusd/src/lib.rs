@@ -18743,6 +18743,8 @@ mod sim_cluster_dynamo_extended;
 #[cfg(test)]
 mod sim_cluster_dynamo_item_size_cap;
 #[cfg(test)]
+mod sim_cluster_dynamo_key_validation;
+#[cfg(test)]
 mod sim_cluster_dynamo_parallel_scan;
 #[cfg(test)]
 mod sim_cluster_dynamo_predicate_bugs;

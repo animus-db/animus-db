@@ -221,7 +221,18 @@ pub fn apply_update(mut item: Item, actions: &[UpdateAction]) -> Result<Item> {
                 let updated = match (get_document_path(&item, path), operand) {
                     // Absent: seed with the operand. This is what makes
                     // `ADD #c :one` the idiomatic counter increment on a row
-                    // that does not exist yet.
+                    // that does not exist yet. Issue #848: an empty
+                    // SS/NS/BS operand must not seed an empty set —
+                    // DynamoDB does not store one (the same invariant the
+                    // `Delete` arm below already enforces on its own,
+                    // resulting-set side; the wire decoder rejects an empty
+                    // set operand before it ever reaches here too, but a
+                    // caller that builds an `UpdateAction` directly, not
+                    // through the wire decoder, must not be able to bypass
+                    // it).
+                    (None, v) if set_is_empty(v) => {
+                        return Err(UpdateError::validation(empty_set_message(v)));
+                    }
                     (None, v) => v.clone(),
                     (Some(AttributeValue::N(cur)), AttributeValue::N(delta)) => {
                         AttributeValue::N(add_numeric(cur, delta).ok_or_else(|| {
@@ -534,6 +545,24 @@ fn set_is_empty(v: &AttributeValue) -> bool {
         AttributeValue::BS(s) => s.is_empty(),
         _ => false,
     }
+}
+
+/// AWS's own `ValidationException` wording for an empty `SS`/`NS`/`BS` set
+/// value (issue #848) — DynamoDB does not store empty sets. `v` must be one
+/// of the three set variants (callers only reach this after [`set_is_empty`]
+/// confirms it). Duplicated from `animus_dynamo::wire`'s identical helper
+/// rather than shared: this crate has no dependency on that wire crate (by
+/// design, see the crate doc), and the message text is small enough that
+/// the duplication costs less than inverting the dependency would. The
+/// double space before "may" is not a typo — it matches AWS's actual
+/// message text.
+fn empty_set_message(v: &AttributeValue) -> String {
+    let kind = match v {
+        AttributeValue::NS(_) => "number",
+        AttributeValue::BS(_) => "binary",
+        _ => "string",
+    };
+    format!("One or more parameter values were invalid: An {kind} set  may not be empty")
 }
 
 /// A human-readable type name for an error message.
@@ -990,6 +1019,39 @@ mod tests {
             Some(&ss(&["a", "b", "c"])),
             "union, deduplicated"
         );
+    }
+
+    /// Issue #848: `ADD`'s absent-seed arm must not seed an empty set —
+    /// DynamoDB does not store one, the same invariant `DELETE`'s own
+    /// `set_is_empty` guard already enforces on its result. This exercises
+    /// `apply_update` directly (an `UpdateAction` built without going
+    /// through `animus_dynamo::wire`'s decoder, which independently rejects
+    /// an empty `SS`/`NS`/`BS` at decode time).
+    #[test]
+    fn add_rejects_seeding_an_empty_set() {
+        let empty_ss = AttributeValue::SS(Vec::new());
+        let err = apply_update(Item::new(), &[UpdateAction::Add(field("t"), empty_ss)])
+            .expect_err("seeding an empty SS must be rejected");
+        assert_eq!(err.code, "ValidationException");
+        assert!(
+            err.message.contains("may not be empty"),
+            "message should name the empty-set rule: {}",
+            err.message
+        );
+
+        let empty_ns = AttributeValue::NS(Vec::new());
+        apply_update(Item::new(), &[UpdateAction::Add(field("t"), empty_ns)])
+            .expect_err("seeding an empty NS must be rejected");
+
+        let empty_bs = AttributeValue::BS(Vec::new());
+        apply_update(Item::new(), &[UpdateAction::Add(field("t"), empty_bs)])
+            .expect_err("seeding an empty BS must be rejected");
+
+        // A non-empty seed is unaffected.
+        let ss = AttributeValue::SS(vec!["a".to_string()]);
+        let out = apply_update(Item::new(), &[UpdateAction::Add(field("t"), ss.clone())])
+            .expect("non-empty seed still applies");
+        assert_eq!(out.get("t"), Some(&ss));
     }
 
     /// `DELETE` subtracts set members, and emptying a set removes the

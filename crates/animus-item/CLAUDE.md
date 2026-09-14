@@ -43,6 +43,15 @@ spawn a task" — that would reopen exactly the hole ADR 0054 exists to close.
 - `numkey` — the order-preserving byte encoding for DynamoDB `N` values (ADR
   0063), used by `AttributeValue::key_bytes` and `condition::matches_raw`.
   Fully self-contained (no `crate::` dependencies of its own).
+  **`encode` alone does not enforce DynamoDB's 38-significant-digit cap**
+  (`MAX_SIGNIFICANT_DIGITS`) — its own domain is deliberately wider, so the
+  module's differential-test generators can push a digit run past 38
+  without tripping `encode`/`decode`'s own ordering/round-trip properties.
+  `encode_checked` layers that cap on top of `encode`'s grammar check and is
+  what `animus_dynamo::wire`'s `"N"` decode arm calls (issue #846) — don't
+  reach for bare `encode` at a wire/decode boundary that must reject
+  DynamoDB-invalid `N` text; it only rejects malformed *decimal* text, not
+  an over-long one.
 - `condition` — `SortKeyCondition`/`ConditionExpression`/`Comparator`, the
   decimal bignum helpers (`add_numeric`/`negate_numeric`/`compare_numeric`),
   and `ConditionError`. Unchanged from `animus-dynamo::condition`. A second

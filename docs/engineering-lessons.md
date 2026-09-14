@@ -25803,6 +25803,95 @@ multi-chunk backup directly from the store (standing in for the
 hard-fails; proven red against the old "`Ok(None)` is the sole
 end-of-sequence signal" algorithm (the restore silently completed missing
 every row from the deleted chunk onward) before the fix, green after.
+## A "should never happen, an earlier layer validates it" comment is a claim, not a guarantee (issue #846)
+
+`AttributeValue::key_bytes`'s `N` arm had a fallback (raw-ASCII bytes) for
+when `numkey::encode` fails, commented as existing "so a read path never
+panics on data that somehow got here anyway, not because it is expected to
+be hit" — i.e. the comment asserted the wire layer already validated `N`
+text before it could ever reach this point. Nothing enforced that: the
+`"N"` decode arm in `animus_dynamo::wire::decode_attribute_value` accepted
+any JSON string with no format check, so `{"N":"12a"}` reached the
+fallback from an ordinary `PutItem` and silently sorted a stored key by
+raw text instead of by the order-preserving `numkey` encoding — corrupting
+scan order not just for the bad row but for every well-formed numeric
+neighbour sharing its partition, since `ScanIndexForward`'s whole guarantee
+(ADR 0063) rests on every stored key using the same encoding.
+
+**The general form**: a defensive fallback justified by "the real input
+can't reach here, an earlier layer already checked" is only as sound as
+that earlier layer's actual code, not its comment. Grep the layer the
+comment names for the actual check before trusting a fallback's own
+"unreachable in practice" framing — especially for a fallback that
+silently produces a *different, wrong* result rather than erroring loudly,
+since a silent wrong-but-plausible answer (mis-ordered keys here, not a
+panic or an obvious error) is far more likely to go unnoticed in review
+and in production than a crash would be. The fix closed the gap at the
+actual validation boundary (a new `numkey::encode_checked`, layering
+DynamoDB's 38-significant-digit cap that `encode` alone doesn't enforce on
+top of `encode`'s own grammar check, called from the wire `"N"` arm) and
+corrected the downstream comment to state the invariant as intended-but-
+not-guaranteed, rather than as an established fact the type system
+enforces.
+
+## A length-prefixed-chunk decoder validating "padding count" without validating "padding position" accepts corrupted input as valid (issue #849)
+
+`base64_decode`'s padding check counted `=` characters per 4-byte chunk
+(`chunk.iter().filter(|&&c| c == b'=').count()`) and rejected only `pad >
+2` — it never checked *where* those `=` characters sat within the chunk,
+so `"A=AA"` (`=` in the second position, not the tail) computed `pad = 1`,
+treated the `=` as a zero sextet exactly like a real trailing pad, and
+returned `Some(vec![0, 0])` instead of `None`. Every `B`/`BS` value on the
+DynamoDB wire routed through this decoder, so a client's malformed base64
+was silently replaced by unrelated bytes rather than rejected — the worst
+class of decode bug, since it corrupts data instead of erroring.
+
+**The general form**: a decoder for any length-prefixed or fixed-width
+chunk format (base64, an escape scheme, a framed record) that checks *how
+many* of a sentinel byte/marker appear in a chunk, without also checking
+*where* they appear, is unsound the instant the format's grammar says the
+marker is only legal in a specific position (RFC 4648 base64: `=` legal
+only as a *trailing run* of the *final* quantum). Count-only validation
+degenerates to "any subset of positions holding this marker is fine,"
+which is a strictly looser grammar than the format defines — the sibling
+codec in the same file (`base64url_decode`) already had this exact
+strictness (canonical-only, no non-canonical trailing bits) as a named
+design goal with its own regression test; the asymmetry between two
+codecs in one module, one deliberately strict and one silently lenient
+with no test ever probing the lenient one's edge cases, was itself a
+signal worth noticing before assuming the leniency was intentional.
+
+
+## An emptiness/non-emptiness invariant enforced on one side of a value's lifecycle (write) must be enforced on every side it can enter from, not assumed inherited (issue #848)
+
+`UpdateAction::Delete`'s apply arm already enforced "DynamoDB does not
+store empty sets" on its own *output* (`set_is_empty(&remaining)` removes
+the attribute rather than writing back `SS([])`) — proving the invariant
+was known and deliberately maintained on that one path. Two other
+entry points for the identical value shape had no such guard at all:
+`decode_string_set`/the inline `"BS"` arm (`animus_dynamo::wire`) accepted
+an empty `SS`/`NS`/`BS` array straight from wire JSON with no check, and
+`UpdateAction::Add`'s absent-seed arm (`(None, v) => v.clone()`) would
+happily seed an attribute with whatever operand it was given, empty set
+included — neither path shares any code with `Delete`'s own guard, so
+`Delete` enforcing the rule proved nothing about whether `Add`/`PutItem`
+did.
+
+**The general form**: when a codebase enforces an invariant on a value at
+one point in its lifecycle (here: never *store* this shape), grep every
+other point that value can be *written* from — a decode boundary, a
+sibling `UpdateAction` variant, a direct-construction call site bypassing
+the decoder entirely — before assuming the invariant holds everywhere. A
+guard that exists because a comment says "DynamoDB does not store X" is a
+statement about the desired end state, not a proof that every path
+reaching that end state has been checked; the fix here needed three
+independent guards (the wire decoder's own `SS`/`NS`/`BS` arms, `Add`'s
+absent-seed arm for a caller that builds an `UpdateAction` directly rather
+than through the decoder, and a matching key-attribute empty-string/binary
+check at the `animusd` edge, since key-attribute validity depends on the
+resolved table schema the wire/decode layer never sees) — a single shared
+`empty_set_message`/`reject_empty_key_value` helper reused by all three,
+not one check assumed to cover the others.
 ## A `NetworkPolicyPeer` with no `namespaceSelector` is scoped to the policy's own namespace, never the peer pod's real one (issue #857)
 
 `animus-operator`'s admin-ingress `NetworkPolicy` rule used a bare
