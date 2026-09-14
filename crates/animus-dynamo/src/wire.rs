@@ -7247,7 +7247,10 @@ pub fn base64_encode(bytes: &[u8]) -> String {
 }
 
 /// Decode standard `=`-padded base64: `None` on a length not a multiple of 4,
-/// a character outside the alphabet, or over-padding.
+/// a character outside the alphabet, over-padding, or a misplaced `=` (RFC
+/// 4648 §4: padding may appear only in the trailing positions of the final
+/// quantum — `"A=AA"`/`"AA=A"` are rejected, not silently decoded as if the
+/// `=` were a zero sextet, issue #849).
 #[must_use]
 pub fn base64_decode(s: &str) -> Option<Vec<u8>> {
     fn val(c: u8) -> Option<u8> {
@@ -7264,11 +7267,21 @@ pub fn base64_decode(s: &str) -> Option<Vec<u8>> {
     if !bytes.len().is_multiple_of(4) {
         return None;
     }
-    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
-    for chunk in bytes.chunks(4) {
+    let num_chunks = bytes.len() / 4;
+    let mut out = Vec::with_capacity(num_chunks * 3);
+    for (i, chunk) in bytes.chunks(4).enumerate() {
         let pad = chunk.iter().filter(|&&c| c == b'=').count();
         if pad > 2 {
             return None;
+        }
+        if pad > 0 {
+            let is_last_chunk = i + 1 == num_chunks;
+            // Padding is only legal in the trailing `pad` positions of the
+            // very last quantum — anywhere else (a non-final chunk, or the
+            // leading `4 - pad` positions of the final one) is malformed.
+            if !is_last_chunk || chunk[..4 - pad].contains(&b'=') {
+                return None;
+            }
         }
         let q: Vec<u8> = chunk
             .iter()
@@ -7899,6 +7912,27 @@ mod tests {
             let encoded = base64_encode(&bytes);
             assert_eq!(base64_decode(&encoded), Some(bytes), "len {len}");
         }
+    }
+
+    #[test]
+    fn base64_decode_is_strict_about_padding_position() {
+        // Padding in the middle of the (only) chunk, at the wrong offset:
+        // decodes character-by-character as if `=` were a zero sextet
+        // without this fix, silently producing `[0x00, 0x00]` instead of
+        // being rejected (issue #849).
+        assert_eq!(base64_decode("A=AA"), None, "padding before the tail");
+        assert_eq!(base64_decode("A=A="), None, "two misplaced/misordered pads");
+        assert_eq!(base64_decode("AA=A"), None, "padding, then a real char");
+        // Padding in a non-final chunk of a multi-chunk input.
+        assert_eq!(
+            base64_decode("QQ==QQAA"),
+            None,
+            "padding in a non-final chunk"
+        );
+        // Valid trailing padding, one and two `=`, is unaffected.
+        assert_eq!(base64_decode("QQ=="), Some(vec![0x41]));
+        assert_eq!(base64_decode("QUI="), Some(vec![0x41, 0x42]));
+        assert_eq!(base64_decode("QUJD"), Some(vec![0x41, 0x42, 0x43]));
     }
 
     #[test]

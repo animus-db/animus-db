@@ -96,7 +96,12 @@ comment for its full type/method inventory.
   `ValidationException`, closing the gap where a malformed `N` used to
   reach `AttributeValue::key_bytes`'s raw-ASCII fallback and corrupt stored
   key order for its well-formed numeric neighbours (ADR 0063's amendment
-  has the full incident).
+  has the full incident). `base64_decode` (issue #849) rejects misplaced
+  `=` padding (legal only in the trailing positions of the *final* 4-byte
+  quantum, RFC 4648 §4) instead of silently treating it as a zero sextet —
+  it used to decode `"A=AA"` to `[0x00, 0x00]` rather than reject it, so
+  every `B`/`BS` value on the wire could be silently corrupted by malformed
+  input rather than rejected.
   `ExecuteStatement` (ADR 0071, W-07) is decoded here (`Statement`/
   `Parameters`/`ConsistentRead`/`NextToken`/`Limit`/
   `ReturnConsumedCapacity`) but its `statement` text is opaque at this
