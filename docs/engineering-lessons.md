@@ -25766,3 +25766,96 @@ multi-chunk backup directly from the store (standing in for the
 hard-fails; proven red against the old "`Ok(None)` is the sole
 end-of-sequence signal" algorithm (the restore silently completed missing
 every row from the deleted chunk onward) before the fix, green after.
+
+## A shared `CARGO_TARGET_DIR` across many concurrent agent sessions can serve a stale, pre-edit `.rlib`/`.rmeta` as "fresh" — delete that one fingerprint entry, don't `cargo clean`
+
+Working in a worktree against a `CARGO_TARGET_DIR` shared with several
+other concurrent sessions (this repo's own standing setup for parallel
+agent work), a `cargo build`/`cargo test` invocation twice reported success
+("Compiling", then "Finished") while linking a downstream crate against an
+`.rlib` that provably predated a source edit several build cycles earlier
+(confirmed directly: `strings` on the `.rmeta` was missing a field name
+just added to the struct it described, even though the source file on disk
+and `git diff` both showed the edit present and unambiguous). This
+reproduced identically across a `cargo build -p <consumer>` **and** a
+`cargo test -p <owner>` invocation for the crate that was actually edited
+— i.e. it wasn't limited to one dependency edge, and re-running the exact
+same command sometimes "fixed" itself and sometimes didn't, consistent
+with a fingerprint race under heavy concurrent target-dir traffic from
+sibling sessions rather than a deterministic Cargo bug in this one
+session's own inputs.
+
+**Fix, in order of preference**: (1) just re-run the command — this
+resolved it about half the time, cheap enough to always try first; (2) if
+it doesn't clear, find the exact stale artifact
+(`cargo build -p <crate> -v 2>&1 | grep -- '--extern <crate>='` on the
+*failing* consumer to get the exact `.rlib`/`.rmeta` path and hash suffix,
+then `strings <path> | grep <the-new-symbol>` to confirm it's really
+missing) and delete only that one hash's fingerprint entry + artifacts
+(`rm -rf target/debug/.fingerprint/<crate>-<hash>`, plus the matching
+`target/debug/deps/lib<crate>-<hash>.{rlib,rmeta,d}`), then rebuild. This
+is targeted and safe to do on a shared target dir — the hash is a function
+of this session's own absolute source paths and profile, so it cannot
+collide with a different worktree's own build of the same crate name.
+**Never run a bare `cargo clean` or delete a whole crate's `.fingerprint`
+namespace** on a target dir other sessions are actively using — that
+discards their in-progress build state too, not just the one stale entry
+causing your own failure.
+
+**Never treat a green build/test run as proof the *specific* content you
+just wrote is what actually got linked**, on a heavily shared target dir —
+if a result looks implausible (a field you just added still reported
+"missing," a fix that should have changed behavior appears to have no
+effect), verify the actual linked artifact directly (`--extern`'s resolved
+path via `-v`, then inspect it) before concluding the source change itself
+is wrong.
+
+## A real-thread `ProdEnv` test that fails only inside a very long, heavily concurrent `cargo test` run — and passes 20/20 in isolation — is sandbox contention, not a logic bug (but verify, don't assume)
+
+Building the issue #856 second-half fix (`DeleteBackup` refusing while a
+restore is in flight), a brand-new real-socket wire test
+(`dynamo_restore::delete_backup_refuses_while_a_restore_is_in_progress_
+then_succeeds`) failed 3/3 when run as part of a ~35-minute
+`cargo test -p animusd --tests` invocation immediately following an even
+longer (~32 min) `--lib` run on the same shared, 4-vCPU sandbox — always
+at the same assertion, `table did not converge to ACTIVE in 20s`. Rerun
+in isolation immediately afterward, the identical test (and the identical
+compiled `.rlib` — content-checked directly, not assumed, per the entry
+above) passed 20/20 across single-test and whole-file reruns. A completely
+fresh, back-to-back full-suite run once the sandbox's load average had
+dropped (checked with `uptime` before starting) came back **1132 passed,
+0 failed, 5 ignored** — clean, including this exact test. A second,
+unrelated pre-existing real-thread test in the same failing run
+(`client_cancellation_tests::abandoning_a_connection_cancels_its_stuck_
+write_and_counts_it`, a 40s wall-clock budget, touching nothing this
+change modified) failed the same run with the same "did not complete in
+time" shape and also passed instantly in isolation — a second, independent
+data point for the same conclusion rather than a coincidence to explain
+away separately.
+
+**The distinguishing move, not just "rerun and hope"**: before trusting
+"passes in isolation, therefore it was contention," rule out the *other*
+explanation a green isolated rerun can paper over — a stale/mismatched
+build artifact (the entry above) or the fix genuinely not being applied.
+Here that meant grep-confirming the new rejection string was present in
+the currently-linked `.rlib` (not just the source file) during the
+investigation, and bisecting by temporarily disabling the new logic
+(`if false { ... }` in place of the real condition) to confirm the test
+still failed identically without it before concluding the mechanism itself
+was sound — only then treating the repeated clean reruns as sufficient
+proof. Skipping that check and just declaring "sandbox noise" on the first
+plausible-sounding excuse is exactly the "not my bug" shortcut the root
+`CLAUDE.md`'s green-is-an-invariant rule forbids; the check is what turns
+a plausible excuse into an actual diagnosis.
+
+**Practical rule**: a real-thread (`ProdEnv`) test with a wall-clock budget
+that fails only deep inside an extremely long, back-to-back concurrent
+test run on a shared sandbox — and passes reliably and repeatedly in
+isolation once verified against the actual linked artifact — is
+environmental, not a defect in the change under test, and should be
+reported as such (with the isolation evidence) rather than chased further
+inside the same overloaded run. Do not paper over it with a longer
+timeout or a retry loop in the test itself; the fix is to not run
+back-to-back multi-tens-of-minutes full-suite invocations back-to-back
+without letting the sandbox's own load settle, and to trust a clean,
+freshly-run full suite over a contended one when the two disagree.

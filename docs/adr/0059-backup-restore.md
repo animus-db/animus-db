@@ -868,13 +868,54 @@ left for a reader to discover by diffing prose against code.
   `crates/animus-test/tests/backup_fault_corpus.rs`'s
   `delete_backup_mid_restore_fails_restore` cell for the regression
   (proven red on the pre-fix "`Ok(None)` is the sole end-of-sequence
-  signal" algorithm, green with the recorded-bound fix). **`DeleteBackup`
-  itself still does not refuse while a restore is in flight** — that half
-  (a reference count, or refusing `DeleteBackup`/`MarkBackupDeleted` while
-  any `Seeding` restore names the backup) is issue #856's own second half,
-  landing in a follow-up PR stacked on this one; until it lands, a
-  `DeleteBackup` racing a restore is still possible, it just now fails the
-  restore loudly instead of truncating it silently.
+  signal" algorithm, green with the recorded-bound fix).
+
+  **Issue #856's second half, closed the same day (stacked follow-up PR)**:
+  `DeleteBackup` (via its own two-phase-janitor **mark** step,
+  `MetaCommand::MarkBackupDeleted`) now refuses outright — client-side
+  (`animusd::dynamo::delete_backup`, a new `BackupInUseException` check,
+  the same wire-error shape the still-`Creating` case already used) and,
+  as the authoritative seatbelt, at apply time
+  (`MetaCommand::MarkBackupDeleted`'s own apply arm,
+  `Metadata::backup_referenced_by_a_live_restore` — any restore still
+  `Seeding` from that backup) — while a restore sourced from it is still
+  in progress. `Done`/`Failed` restores never block a delete; the block
+  clears the instant a restore reaches either terminal state. The
+  short-read guard above is unchanged and stays load-bearing as the
+  fallback for whatever residual race remains (below) — this closure
+  narrows the window to essentially nothing, it does not replace that
+  guard.
+
+  **The mirror race — a restore kicked off against a backup already
+  marked for deletion — is also closed, mostly.** `RestoreTableFromBackup`/
+  `RestoreTableToPointInTime`'s own `visible_backup` freshness read already
+  treats `Expired`/`Failed` as `BackupNotFoundException` before ever
+  proposing `BeginRestore`, so the common case (the mark has already
+  committed by the time a restore is requested) was never reachable to
+  begin with. The genuine race — a `MarkBackupDeleted` that commits
+  strictly *after* that freshness read but *before* `BeginRestore`'s own
+  propose lands — is closed structurally at `BeginRestore`'s own apply arm:
+  it rejects when `backup_id` names a row that is present but
+  `Expired`/`Failed`. **One narrow residual is deliberately left open,
+  not silently missed**: a `backup_id` naming *no* row at all (the backup
+  has already been fully reclaimed — its row physically removed by the
+  janitor's own `DeleteBackup` finalize step, not merely marked) is not
+  rejected here, since a nonexistent row is indistinguishable at this
+  layer from a test fixture's placeholder id and from the ordinary
+  "unrelated command, no such backup" case every other `MetaCommand`
+  already tolerates. This residual is self-healing regardless: the
+  resulting restore's own driver can never find the manifest object
+  (also reclaimed), so it makes no progress and `RESTORE_STUCK_TIMEOUT`
+  eventually proposes `FailRestore` — a slow, honest failure, never a
+  silent truncation. See `crates/animus-control/src/meta.rs`'s
+  `mark_backup_deleted_refuses_while_a_restore_is_seeding` and
+  `begin_restore_rejects_an_expired_or_failed_backup` unit tests for both
+  halves, and `crates/animusd/tests/dynamo_restore.rs`'s
+  `delete_backup_refuses_while_a_restore_is_in_progress_then_succeeds`
+  for the wire-level integration proof (necessarily opportunistic about
+  catching the in-flight window — see that test's own doc comment — since
+  `RestoreTableFromBackup` returns asynchronously; the apply-time
+  rejection itself is what the unit test proves deterministically).
 
 **Corpus** (`crates/animus-test/tests/backup_fault_corpus.rs`,
 `ANIMUS_BACKUP_SEEDS`): five restore cells, the identical self-contained-

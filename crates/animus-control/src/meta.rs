@@ -3895,9 +3895,27 @@ impl Metadata {
                 ApplyOutcome::Applied
             }
             MetaCommand::MarkBackupDeleted { backup_id } => {
-                let Some(row) = self.backups.get_mut(backup_id) else {
+                if !self.backups.contains_key(backup_id) {
                     return ApplyOutcome::Rejected("no such backup");
-                };
+                }
+                // Issue #856 (second half): reject the mark-for-delete step
+                // itself while a restore is still actively reading this
+                // backup's own data objects, rather than letting it race the
+                // janitor's reclaim and rely solely on the restore side's
+                // chunk-count short-read guard to fail loudly. This is the
+                // structural half of the fix; `animusd::dynamo::delete_backup`
+                // carries the matching client-facing `BackupInUseException`
+                // check so a caller sees a clear error instead of a generic
+                // apply rejection.
+                if self.backup_referenced_by_a_live_restore(backup_id) {
+                    return ApplyOutcome::Rejected(
+                        "backup is referenced by a restore still in progress",
+                    );
+                }
+                let row = self
+                    .backups
+                    .get_mut(backup_id)
+                    .expect("presence just checked above");
                 match &row.status {
                     BackupStatus::Expired => ApplyOutcome::NoOp,
                     BackupStatus::Creating => {
@@ -4007,6 +4025,28 @@ impl Metadata {
                 }
                 if self.tablets.contains_key(tablet) {
                     return ApplyOutcome::Rejected("tablet already exists");
+                }
+                // Issue #856's own mirror race: the wire edge's own
+                // `visible_backup`/`BackupInUseException` freshness check
+                // happens strictly before this propose, so a genuine race
+                // is a `MarkBackupDeleted` that commits *after* that read
+                // but *before* this `BeginRestore` does. A backup that has
+                // already been fully reclaimed (its row physically removed
+                // by `DeleteBackup`) reads as `None` here and is
+                // deliberately NOT rejected — the same narrow residual
+                // this command's own callers already accept when the
+                // caller-supplied `backup_id` is a placeholder in tests —
+                // but a still-present, freshly `Expired`/`Failed` row is
+                // caught, closing the far more likely half of the race
+                // (mark-then-restore) structurally rather than leaving it
+                // to `RESTORE_STUCK_TIMEOUT`'s own eventual `FailRestore`.
+                if let Some(backup) = self.backups.get(backup_id)
+                    && matches!(
+                        backup.status,
+                        BackupStatus::Expired | BackupStatus::Failed { .. }
+                    )
+                {
+                    return ApplyOutcome::Rejected("backup is no longer available to restore from");
                 }
                 // Same monotonic-allocator floor as `CreateTablet`/
                 // `BeginSplitInPlace` (and for the same dropped-data-
@@ -5599,6 +5639,27 @@ impl Metadata {
         self.backups.get(backup_id)
     }
 
+    /// Whether any restore still names `backup_id` as its source and has
+    /// not yet reached a terminal state (issue #856, second half): a
+    /// `Seeding` restore is still actively reading the backup's own data
+    /// objects, so deleting it out from under that restore is exactly the
+    /// race the chunk-count short-read guard
+    /// ([`BackupTabletProgress::chunk_count`]'s own doc) was made to
+    /// survive, but survival there means the restore hard-fails, not that
+    /// it should have been allowed to race at all. `Done`/`Failed`
+    /// restores never block a delete — they no longer touch the backup's
+    /// own objects. Shared by [`MetaCommand::MarkBackupDeleted`]'s own
+    /// apply-time seatbelt and the wire edge's client-side
+    /// `BackupInUseException` check (`animusd::dynamo::delete_backup`),
+    /// the same two-layer discipline `is_reserved_name`/F11 token
+    /// alignment already use elsewhere in this crate.
+    #[must_use]
+    pub fn backup_referenced_by_a_live_restore(&self, backup_id: &str) -> bool {
+        self.restores
+            .values()
+            .any(|r| r.backup_id == backup_id && matches!(r.status, RestoreStatus::Seeding))
+    }
+
     /// The export catalog row for `export_id`, if any (ADR 0068 §3). A read
     /// accessor for the wire edge (`DescribeExport`/`ListExports`).
     #[must_use]
@@ -6873,6 +6934,165 @@ mod tests {
         );
     }
 
+    /// Issue #856 (second half): `MarkBackupDeleted` refuses while a
+    /// restore still names the backup as its source and hasn't reached a
+    /// terminal state — closing the race the chunk-count short-read guard
+    /// (`BackupTabletProgress::chunk_count`) was built to survive, rather
+    /// than letting it start at all. The refusal clears the instant the
+    /// restore reaches `Done` or `Failed`.
+    #[test]
+    fn mark_backup_deleted_refuses_while_a_restore_is_seeding() {
+        let mut m = Metadata::default();
+        table_with_one_tablet(&mut m, "users", TabletId(1));
+        assert_eq!(
+            m.apply(&MetaCommand::BeginBackup {
+                backup_id: "backup-1".to_owned(),
+                table: "users".to_owned(),
+                created_wall_ms: 1000,
+                backup_name: "backup".to_string(),
+                pitr_base: false,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::RecordBackupTabletComplete {
+                backup_id: "backup-1".to_owned(),
+                tablet: TabletId(1),
+                cut_version: 10,
+                bytes: 100,
+                chunk_count: 1,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::CompleteBackup {
+                backup_id: "backup-1".to_owned(),
+            }),
+            ApplyOutcome::Applied
+        );
+
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTableSchema {
+                table: "restored".to_owned(),
+                schema: TableSchema::simple("id", ColumnType::String),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::BeginRestore {
+                restore_id: "restore-1".to_owned(),
+                backup_id: "backup-1".to_owned(),
+                source_table: "users".to_owned(),
+                target_table: "restored".to_owned(),
+                tablet: TabletId(5),
+                replicas: vec![nid(1)],
+                gsi_defs: Vec::new(),
+                pitr: None,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert!(m.backup_referenced_by_a_live_restore("backup-1"));
+
+        // Refused while the restore is still `Seeding` — the backup row
+        // itself is untouched (still `Available`).
+        assert_eq!(
+            m.apply(&MetaCommand::MarkBackupDeleted {
+                backup_id: "backup-1".to_owned(),
+            }),
+            ApplyOutcome::Rejected("backup is referenced by a restore still in progress")
+        );
+        assert_eq!(
+            m.backup("backup-1").unwrap().status,
+            BackupStatus::Available
+        );
+
+        // Once the restore completes, the delete succeeds.
+        assert_eq!(
+            m.apply(&MetaCommand::CompleteRestore {
+                restore_id: "restore-1".to_owned(),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert!(!m.backup_referenced_by_a_live_restore("backup-1"));
+        assert_eq!(
+            m.apply(&MetaCommand::MarkBackupDeleted {
+                backup_id: "backup-1".to_owned(),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(m.backup("backup-1").unwrap().status, BackupStatus::Expired);
+
+        // A second backup, restored-then-failed: the delete also succeeds
+        // once the restore reaches `Failed`, not only `Done`.
+        let mut n = Metadata::default();
+        table_with_one_tablet(&mut n, "users", TabletId(1));
+        assert_eq!(
+            n.apply(&MetaCommand::BeginBackup {
+                backup_id: "backup-2".to_owned(),
+                table: "users".to_owned(),
+                created_wall_ms: 1000,
+                backup_name: "backup".to_string(),
+                pitr_base: false,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            n.apply(&MetaCommand::RecordBackupTabletComplete {
+                backup_id: "backup-2".to_owned(),
+                tablet: TabletId(1),
+                cut_version: 10,
+                bytes: 100,
+                chunk_count: 1,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            n.apply(&MetaCommand::CompleteBackup {
+                backup_id: "backup-2".to_owned(),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            n.apply(&MetaCommand::CreateTableSchema {
+                table: "restored2".to_owned(),
+                schema: TableSchema::simple("id", ColumnType::String),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            n.apply(&MetaCommand::BeginRestore {
+                restore_id: "restore-2".to_owned(),
+                backup_id: "backup-2".to_owned(),
+                source_table: "users".to_owned(),
+                target_table: "restored2".to_owned(),
+                tablet: TabletId(5),
+                replicas: vec![nid(1)],
+                gsi_defs: Vec::new(),
+                pitr: None,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            n.apply(&MetaCommand::MarkBackupDeleted {
+                backup_id: "backup-2".to_owned(),
+            }),
+            ApplyOutcome::Rejected("backup is referenced by a restore still in progress")
+        );
+        assert_eq!(
+            n.apply(&MetaCommand::FailRestore {
+                restore_id: "restore-2".to_owned(),
+                reason: "stuck".to_owned(),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            n.apply(&MetaCommand::MarkBackupDeleted {
+                backup_id: "backup-2".to_owned(),
+            }),
+            ApplyOutcome::Applied
+        );
+    }
+
     // --- ADR 0059 §7, Train 2: the restore catalog -----------------------
 
     /// `BeginRestore` (ADR 0059 §7): mints exactly one fresh `Building`
@@ -6963,6 +7183,80 @@ mod tests {
             }),
             ApplyOutcome::Rejected("tablet id below the monotonic allocator")
         );
+    }
+
+    /// Issue #856's own mirror race, closed structurally: `BeginRestore`
+    /// rejects when its own `backup_id` names a row that is present but
+    /// `Expired`/`Failed` — the shape a `MarkBackupDeleted` committing
+    /// between the wire edge's own freshness read and this propose would
+    /// produce. A `backup_id` naming no row at all (either never created,
+    /// or already fully reclaimed) is deliberately left unrejected here —
+    /// the far narrower residual this command's own apply arm doc names,
+    /// self-healing via `RESTORE_STUCK_TIMEOUT`'s eventual `FailRestore`.
+    #[test]
+    fn begin_restore_rejects_an_expired_or_failed_backup() {
+        let mut m = Metadata::default();
+        table_with_one_tablet(&mut m, "users", TabletId(1));
+        assert_eq!(
+            m.apply(&MetaCommand::BeginBackup {
+                backup_id: "backup-1".to_owned(),
+                table: "users".to_owned(),
+                created_wall_ms: 1000,
+                backup_name: "backup".to_string(),
+                pitr_base: false,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::RecordBackupTabletComplete {
+                backup_id: "backup-1".to_owned(),
+                tablet: TabletId(1),
+                cut_version: 10,
+                bytes: 100,
+                chunk_count: 1,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::CompleteBackup {
+                backup_id: "backup-1".to_owned(),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::MarkBackupDeleted {
+                backup_id: "backup-1".to_owned(),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(m.backup("backup-1").unwrap().status, BackupStatus::Expired);
+
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTableSchema {
+                table: "restored".to_owned(),
+                schema: TableSchema::simple("id", ColumnType::String),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::BeginRestore {
+                restore_id: "restore-1".to_owned(),
+                backup_id: "backup-1".to_owned(),
+                source_table: "users".to_owned(),
+                target_table: "restored".to_owned(),
+                tablet: TabletId(5),
+                replicas: vec![nid(1)],
+                gsi_defs: Vec::new(),
+                pitr: None,
+            }),
+            ApplyOutcome::Rejected("backup is no longer available to restore from")
+        );
+        assert!(m.restore("restore-1").is_none());
+        assert!(!m.tablets.contains_key(&TabletId(5)));
+
+        // A `backup_id` naming no row at all is unaffected by this check —
+        // the pre-existing `begin_restore_apply_arm` test above already
+        // covers this shape (`"backup-1"`/`"backup-2"` never created there).
     }
 
     /// `CompleteRestore`/`FailRestore` (ADR 0059 §7): completion activates

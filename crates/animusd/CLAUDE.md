@@ -4820,9 +4820,14 @@ ADR itself for the full design/rationale.
   never inferred from absence, whenever the sequence's own items can be
   deleted out of band" lesson, and the ADR's own 2026-09-14 amendment
   (correcting its prior "never a correctness violation" wording) for the
-  full account. `DeleteBackup` itself still doesn't refuse while a restore
-  is in flight — that's issue #856's own second half, a stacked follow-up
-  PR, not this fix.
+  full account. **`DeleteBackup` itself now refuses while a restore is in
+  flight, closing issue #856's own second half in a stacked follow-up
+  PR** — see `dynamo.rs`'s own `delete_backup` entry below for the
+  client-side `BackupInUseException` check and
+  `animus-control/CLAUDE.md`'s restore-catalog entry for the apply-time
+  seatbelt (`Metadata::backup_referenced_by_a_live_restore`) this short-
+  read guard now works alongside, rather than as the sole line of
+  defense.
 
   **PITR replay (Train 3 PR②) is one more phase of this same
   `restore_tick`, not a parallel driver** — a `Seeding` restore whose

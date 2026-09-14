@@ -643,7 +643,24 @@ per-tablet CP data plane (`animus-cp-data`).
   `Expired`, rejects `Creating` as an apply-time seatbelt behind the wire
   edge's own `BackupInUseException` check), proposed by the `DeleteBackup`
   wire operation (`animusd::dynamo::delete_backup`) — never by the janitor
-  itself. The pre-existing `MetaCommand::DeleteBackup` (PR①'s own row-plus-
+  itself. **Issue #856's second half (2026-09-14)**: the apply arm also
+  rejects while `Metadata::backup_referenced_by_a_live_restore(backup_id)`
+  answers true — any restore still `Seeding` from this backup — the
+  authoritative seatbelt behind `delete_backup`'s own client-side
+  `BackupInUseException` check (a `metadata_fresh` read, so it can race a
+  restore that starts seeding in the narrow window between that read and
+  this propose; this apply-time check is what actually closes it). A
+  `Done`/`Failed` restore never blocks a delete. `MetaCommand::BeginRestore`
+  gained the mirror-direction seatbelt in the same change: it rejects when
+  its own `backup_id` names a row that is present but already
+  `Expired`/`Failed` (the shape a `MarkBackupDeleted` that commits between
+  the wire edge's own freshness read and this propose would produce) — a
+  `backup_id` naming no row at all (already fully reclaimed) is
+  deliberately left unrejected, the far narrower residual `RESTORE_STUCK_
+  TIMEOUT`'s own eventual `FailRestore` self-heals. See `docs/adr/0059-
+  backup-restore.md`'s 2026-09-14 amendment for the full account and both
+  halves' own unit tests (`mark_backup_deleted_refuses_while_a_restore_is_
+  seeding`/`begin_restore_rejects_an_expired_or_failed_backup`, `meta.rs`). The pre-existing `MetaCommand::DeleteBackup` (PR①'s own row-plus-
   progress removal) is unchanged and becomes the janitor's own
   **finalizing** command instead, proposed only once every one of a marked
   backup's objects has been reclaimed (`animusd::backup_janitor`); no new

@@ -2622,6 +2622,25 @@ async fn delete_backup<E: Env, R: RelayClient>(
             reasons: None,
         });
     }
+    // Issue #856 (second half): a restore that is actively reading this
+    // backup's own data objects (`RestoreStatus::Seeding`) must block a
+    // delete outright, not merely rely on the short-read guard
+    // (`BackupTabletProgress::chunk_count`) to fail the restore loudly if
+    // it loses the race — refusing here means the race never starts. This
+    // is a client-side, best-effort check against a `metadata_fresh` read
+    // (real read-your-writes freshness, not the staleness-tolerant
+    // cached/effective read); the authoritative seatbelt is
+    // `MetaCommand::MarkBackupDeleted`'s own apply-time rejection
+    // (`Metadata::backup_referenced_by_a_live_restore`, `animus-control`),
+    // which closes the residual window between this check and the
+    // propose below (a restore that starts seeding in that exact window).
+    if meta.backup_referenced_by_a_live_restore(backup_arn) {
+        return Err(WireError {
+            code: "BackupInUseException",
+            message: format!("backup `{backup_arn}` is the source of a restore still in progress"),
+            reasons: None,
+        });
+    }
     let deadline = ctx.env.now().saturating_add(SCHEMA_COMMIT_TIMEOUT);
     loop {
         ctx.propose_schema(&MetaCommand::MarkBackupDeleted {
