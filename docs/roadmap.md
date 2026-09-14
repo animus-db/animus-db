@@ -1355,7 +1355,7 @@ the still-true paragraph after the table.
 
 ---
 
-### C-14 combined control-plane voter growth under SimCluster (opened 2026-09-14, PR 2 landed — ADR 0061 rung N)
+### C-14 combined control-plane voter growth under SimCluster (opened 2026-09-14, PR 3 landed — ADR 0061 rung N)
 
 - **Problem:** `SimCluster` has no way to add a genuinely new, previously
   non-existent `RaftNode<SimEnv>` to the LIVE control-plane voter quorum
@@ -1372,7 +1372,8 @@ the still-true paragraph after the table.
   1's own grep found a fourth file no prior scoping document had named)**:
   `control_membership_split.rs`'s one remaining real-socket test
   (`grow_then_replace_a_voter_over_a_split_deployment_with_live_data_
-  traffic`) — convertible; `SimCluster::grow`'s own deferred `"combined"`
+  traffic`) — **converted by PR 3, the real file deleted whole**;
+  `SimCluster::grow`'s own deferred `"combined"`
   role arm — convertible, a fixture consumer not a test; C-13's own
   seed/join dial's unimplemented `NodeRole::Control` option
   (`join_via_seed_with_role`/`join_via_seed_with_explicit_id`/`join_via_
@@ -1420,15 +1421,20 @@ the still-true paragraph after the table.
   (id/index refactor)/2b (the growth primitive) if the refactor alone
   proves wider than PR 1's own audit suggests.
 - **Depends:** C-13 (closed).
-- **Status:** opened 2026-09-14 — PR 1 (docs opener) and PR 2 (the
+- **Status:** opened 2026-09-14 — PR 1 (docs opener), PR 2 (the
   `grow_control` primitive + `sim_cluster_control_growth.rs`'s own two
-  scenarios) landed. See ADR 0061's "Rung N (post-C-13)" amendment for
-  the full grep-verified ground truth, the corrected four-consumer
-  inventory, and the primitive sketch, and this ADR's own "PR 2 landed"
-  amendment for the as-built mechanism, the crashed-leader stale-
-  `is_leader()`-belief gotcha PR 2's own test authorship found, and real
-  gate figures. PRs 3-5 (the three convertible consumers named above)
-  remain open.
+  scenarios), and PR 3 (`control_membership_split.rs`'s own remaining
+  test converted to a `grow_control()`-driven sim sibling, the real file
+  deleted whole) landed. See ADR 0061's "Rung N (post-C-13)" amendment
+  for the full grep-verified ground truth, the corrected four-consumer
+  inventory, and the primitive sketch; this ADR's own "PR 2 landed"
+  amendment for the `grow_control` mechanism, the crashed-leader stale-
+  `is_leader()`-belief gotcha, and real gate figures; and this ADR's own
+  "PR 3 landed" amendment for the conversion mechanism (the fixed-victim
+  id strengthening that exercises the transfer-away branch on some seeds
+  and not others), the trim/delete decision, and real gate figures. PRs
+  4-5 (`SimCluster::grow`'s deferred `"combined"` arm plus the seed/join
+  dial's `NodeRole::Control` option, and the close-out) remain open.
 
 ## 4. Operator surfaces: admin API, dashboard, console, CLI
 
@@ -1512,7 +1518,7 @@ wave are independent and can run in parallel.
 | 12 | C-11 (closed 2026-09-09 — all four PRs landed: #796, #797, #799, plus PR 4) | Gated on C-10 (closed) — the next unowned residual group per C-08's, C-09's, and C-10's own close-outs; proceeded without an explicit maintainer sequencing instruction, per Rung J's own close-out recommendation (see the C-11 entry's own note) |
 | 13 | C-12 (closed 2026-09-09 — all nine PRs landed: #806, #808, #822, #823, #824, #825, #826, #827, plus PR 5) | Gated on C-11 (closed) — the next unowned residual group per C-08's, C-09's, C-10's, and C-11's own close-outs; taken up per Rung K's own close-out recommendation |
 | 14 | C-13 (closed 2026-09-13 — all seven PRs landed — seed/join discovery under `SimCluster`, ADR 0061 rung M) | Gated on C-12 (closed) — the next unowned residual group per C-08's through C-12's own close-outs |
-| 15 | C-14 (opened 2026-09-14 — PR 1 and PR 2 landed — combined control-plane voter growth under `SimCluster`, ADR 0061 rung N) | Gated on C-13 (closed) — the one residual C-13 PR 6 named precisely: a fresh `RaftNode<SimEnv>` joining the live control quorum after construction |
+| 15 | C-14 (opened 2026-09-14 — PRs 1-3 landed — combined control-plane voter growth under `SimCluster`, ADR 0061 rung N) | Gated on C-13 (closed) — the one residual C-13 PR 6 named precisely: a fresh `RaftNode<SimEnv>` joining the live control quorum after construction |
 
 Open issues mapped: none left (#375 closed by W-01, #319 by W-05). Filed
 from wave 2's own findings: #590 (the operator still emits the deleted

@@ -6263,6 +6263,101 @@ passed — 581 baseline + this PR's 4 new tests — 0 failed, 2 ignored,
 control_membership_split` (2 passed, proving the two remaining
 real-socket files untouched). `Cargo.lock` unchanged.
 
+**C-14 PR 3 landed** — the one C-13-opener-plan residual PR 1's own
+grep found a *fourth* consumer for (the other three: `control_
+membership_split.rs`'s own remaining test, `SimCluster::grow`'s
+deferred `"combined"` arm, the seed/join dial's `NodeRole::Control`
+panic) is now closed too: `grow_then_replace_a_voter_over_a_split_
+deployment_with_live_data_traffic` — the real test `sim_cluster_
+control_membership_split.rs`'s own C-13 PR 6 doc named as needing
+exactly the "combined growth" primitive PR 2 built — now has a
+deterministic `SimCluster` sibling in that same module, and the real
+file (down to that one test since C-13 PR 6) is deleted whole.
+
+**Mechanism**: `SimCluster::new_with_roles(seed, [Control, Control,
+Control, Data, Data], 2)` builds the identical 3-control-only +
+2-data-only split deployment the real test's own `support::
+bring_up_split(3, 2, ..)` does; a table is created over the real wire
+(`create_table_via_wire`, never `SimCluster::create_table`'s own
+hand-hosted shortcut, which would pick replicas `0..replication` — the
+CONTROL-only nodes in this mixed cluster, `sim_cluster_seed_join.rs`'s
+own documented reason); `SimCluster::grow_control()` grows the control
+quorum 3 → 4 exactly as `sim_cluster_control_growth.rs`'s own two
+scenarios already prove, with every control-bearing node's own live
+voter belief re-checked here too (4 voters, including the grown id).
+Phase 2 ("replace") picks a FIXED original voter id (`0`, always
+distinct from `grown`, which is always `>= 5`) rather than the real
+test's own dynamic "whichever original isn't currently leading" pick
+— a deliberate strengthening, not a shortcut: since which node leads
+after the grow is itself seed-dependent, a fixed victim means the
+pinned seed and the five `_over_seeds` seeds together exercise BOTH
+the transfer-away branch (`POST /admin/control/transfer`, bounded
+retry on `409`, mirroring `sim_cluster_control_growth.rs`'s own
+`assert_grown_voter_crash_transfer_serve_and_restart` idiom exactly,
+on whichever seeds land the leader on node `0`) and the no-transfer-
+needed branch (every other seed) for real, rather than a selection
+that deterministically avoids the leader and leaves the transfer
+branch permanently dead. The victim is only ever crashed once
+confirmed non-leading (by construction, or by the transfer having
+just moved leadership away), so the removal's own leader lookup never
+needs `control_leader_index_excluding`'s stale-frozen-belief guard —
+unlike `sim_cluster_control_growth.rs`'s own scenario, which
+deliberately crashes the CURRENT leader. `POST /admin/control/member/
+remove` is called with `force: true` unconditionally (the real test
+never needs it): the remover can be the freshly-promoted `grown` node,
+which may not yet have exchanged enough heartbeats with every other
+survivor to satisfy the liveness-aware quorum-loss guard without it —
+the identical reasoning `sim_cluster_control_growth.rs`'s own removal
+call already documents for the identical shape.
+
+**Traffic idiom**: `SimCluster` is driven `&mut self`, so a genuinely
+concurrent background writer (the real test's own `tokio::spawn`ed 40-
+key loop) is not the natural shape here — `write_and_verify_traffic_
+key` instead issues a checkpoint write-then-read-back at each phase
+boundary (before the grow, immediately after it, immediately after the
+replace), each hardened with the identical bounded-retry converged-poll
+idiom `sim_cluster_seed_join.rs`'s own private `retry_forwarding_proof`
+uses (never a fixed-deadline one-shot assert), and every key written
+across the whole scenario is read back once more at the very end,
+mirroring the real test's own final per-acked-key `await_value` loop.
+Where the real test tolerates `>= 35/40` acked writes (a real-clock
+allowance for its own background task's pacing), every attempted write
+here is required to land — a strictly stronger bar, since nothing here
+races a real clock. No new production code was needed.
+
+**Trim/delete decision**: every assertion the real test made — the
+grow to 4 voters, data traffic surviving the grow, the transfer-then-
+remove replace down to 3 voters, data traffic surviving the whole
+scenario, and every acked write's own exact value — now has a
+deterministic counterpart in the sibling above. No `[[test]]` entry
+named the file in `Cargo.toml` and no workflow referenced it by name,
+so `crates/animusd/tests/control_membership_split.rs` is deleted
+whole (precedent: `data_join.rs`/`seed_join.rs`, ADR 0061 rung M) —
+the module's own doc in `sim_cluster_control_membership_split.rs` is
+now the sole surviving record of the real test's original shape.
+
+**No product bug found** — the scenario passed at its pinned seed and
+every `_over_seeds` seed on the first clean run once the borrow-
+ordering fix below was applied (a two-step `let idx = ...; let id =
+control_node_id(idx);` split, since `cluster.control_node_id(cluster.
+control_leader_index())` is an `E0502` borrow conflict — `&mut self`
+and `&self` evaluated in the same call — not a logic bug).
+
+**Gates (all green)**: `cargo test -p animusd --test control_
+membership_split` on the untrimmed file (1 passed, 4.44s — proving the
+real test itself was still green before conversion); `cargo build -p
+animusd --lib --tests` (clean); `cargo test -p animusd --lib sim_
+cluster_control_membership_split -- --test-threads=2` (4 passed — 2
+existing + 2 new — run three times total, before and after `cargo fmt
+--all`, byte-identical each time, ~22s/run); `cargo fmt --all --check`
+(clean after one `cargo fmt --all` pass); `cargo clippy --workspace
+--all-targets --all-features -- -D warnings` (clean); trim (delete the
+real-socket file), then `cargo build -p animusd --all-targets` (clean,
+proving the deletion compiles); `cargo test -p animusd --lib sim_
+cluster -- --test-threads=2` (**587 passed** — 585 baseline + this
+PR's 2 new tests — 0 failed, 2 ignored, 1831.18s). `Cargo.lock`
+unchanged.
+
 
 ### `sim_cluster_corpus`: the SimCluster cycles/durability corpus (ADR 0061 rung D1 step 3)
 
