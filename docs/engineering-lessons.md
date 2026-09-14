@@ -25781,47 +25781,8 @@ failing can accidentally exercise a second, unrelated (and possibly
 unfixed) hazard, muddying whether a red-then-green result is actually
 proof of the fix under test.** The buffered-bytes hazard this surfaced is
 real but out of this PR's scope (per this repo's own "an incidental bug
-gets its own PR" convention) — named here, not fixed, for whoever next
-touches `SharedWal`'s or `persist_wal`'s failure handling.
-
-## A shared `CARGO_TARGET_DIR` across concurrently-running agent sessions can serve a build artifact that satisfies cargo's own staleness check yet was compiled from different source than what's on disk right now
-
-Multiple agent sessions in this repo's workflow build against one shared
-`CARGO_TARGET_DIR` (a disk-usage accommodation, not an isolation
-guarantee). While validating this same `SharedWal` fix, `cargo test`
-against a freshly-edited test file intermittently reported a compile
-error naming a struct field (`chunk_count` on `BackupTabletProgress`) that
-does not exist anywhere in this worktree's checked-out source at any
-commit reachable from its history — and, once past that, a test that had
-just been fixed (rollback restoring `group_tails` correctly) went back to
-failing as though the fix were absent, with no source change in between
-two consecutive `cargo test` invocations. Both symptoms had the same root
-cause: cargo's own mtime-based fingerprint check considered a **stale**
-cached `.rlib`/`.rmeta` for a lower-level crate (`animus-control`) "fresh"
-relative to this worktree's own source files, and linked against it
-instead of rebuilding — most likely a leftover artifact from a prior
-occupant of this same worktree directory (worktree directories are reused
-across sessions/tasks) whose recorded fingerprint mtime happened to be
-newer than this checkout's own file mtimes. Confirmed by inspecting
-`$CARGO_TARGET_DIR/debug/.fingerprint/animus-control-*/lib-animus_control.json`
-directly: several coexisting hash variants shared the identical `"path"`
-component (proving they all trace to this same worktree's absolute path,
-ruling out cross-worktree hash collision) but differed in their
-dependency-hash entries, meaning cargo was silently choosing between
-multiple stale/fresh snapshots of the SAME logical build depending on
-which invocation's own dependency resolution happened to match one.
-**Fix/workaround: `find crates -name '*.rs' -exec touch {} +` (bump every
-source file's mtime to "now") before trusting a suspicious compile error
-or an unexpected test regression when working in a shared/reused target
-directory** — this forces cargo to recompute freshness for everything
-rather than trusting a fingerprint that might predate the current
-checkout. **The general rule: in a build environment where the target
-directory can outlive or be shared across the exact checkout that
-populated it, an inexplicable compile error naming code that provably
-isn't in the source, or a passing-then-failing flip with no source change
-in between, is a build-cache staleness symptom before it is anything
-else** — verify by forcing a fully fresh rebuild (touch every source file,
-or a narrower rebuild of just the implicated crate) before spending
-further effort debugging the "error" as if it were real, and never trust
-a single green/red result from such an environment as conclusive without
-at least one clean rebuild confirming it.
+gets its own PR" convention) — filed as issue #883, with the exact
+mechanism, the regression cell that would prove it, and why #838's own
+fix and its own regression both deliberately don't cover it — named here,
+not fixed, for whoever next touches `SharedWal`'s or `persist_wal`'s
+failure handling.
