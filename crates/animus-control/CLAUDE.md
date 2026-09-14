@@ -251,7 +251,24 @@ per-tablet CP data plane (`animus-cp-data`).
   S>>>` cache mutated in the same critical section as each op's own queue
   enqueue (the property the round/ack and GC arguments both rest on — see
   the type's own module doc for the full "Two APIs"/"Recovery / GC
-  contract" account). `physical_write_count()` is a plain running counter
+  contract" account). **A tolerated (halted-gated) failure now rolls that
+  mutation back rather than leaving it permanent (issue #838, fixed
+  2026-09-14)**: the eager-at-enqueue mutation is correct and load-bearing
+  for the FIFO ordering argument, but it is not itself a durability claim
+  — `submit_with_mutation` also snapshots the mutated tablet's own
+  `group_tails` entry from immediately before `mutate` runs
+  (`GroupTailsUndo{tablet, previous}`, carried on the queued `Pending`),
+  and `drive()`'s failure branch applies every batch member's own undo, in
+  **reverse** enqueue order (the LIFO unwind a batch coalescing several
+  `append_tagged` calls for the SAME tablet needs to land back on the
+  pre-batch state). Before this fix, a tolerated failure's phantom
+  mutation survived to be durably written out by a completely different,
+  healthy tablet's own next `compact_group`/`forget` whole-file rewrite —
+  see ADR 0028's matching 2026-09-14 amendment and `docs/engineering-
+  lessons.md`'s entry for the full incident and the general "eager for
+  ordering is not the same claim as final" lesson. Regression:
+  `crates/animus-cp-data/tests/sharedwal_fault_corpus.rs`'s cell (e).
+  `physical_write_count()` is a plain running counter
   of completed physical writes (append-batches and rewrites alike) —
   the coalescing-observability primitive a caller (or a test) reads
   before/after a burst to measure the win directly, without needing a
