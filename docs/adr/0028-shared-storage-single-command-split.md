@@ -675,3 +675,70 @@ that ADR's own 2026-09-07 amendment.
 
 See `crates/animusd/CLAUDE.md`'s "Shared WAL" section for the current,
 complete per-entry-point enumeration this amendment updates.
+
+## Amendment (2026-09-14, issue #838 — a tolerated failure's `group_tails` mutation is now rolled back)
+
+**Bug**: `SharedWal::submit_with_mutation` (`animus-control::shared_wal`)
+applied a caller's `group_tails` mutation synchronously at ENQUEUE time —
+correct and load-bearing for the FIFO ordering argument the "Two APIs"
+section above states (a later op's own `compact_group`/`forget` rewrite
+must see every earlier-enqueued op's mutation already folded in, whether
+or not that earlier op has physically landed yet) — but `drive()`'s
+failure branch only ever delivered the physical error to waiters; it never
+undid the mutation. Since a failed `append_tagged`/`compact_group` is
+*tolerated* rather than fatal exactly when the calling `RaftKvNode`'s
+`halted` flag is already set (an ordinary graceful teardown race, not a
+crash — `crates/animus-cp-data/src/lib.rs`'s `persist_wal`/
+`apply_and_compact`), a tolerated failure left a phantom entry in
+`group_tails` permanently. Because `compact_group`/`forget`'s own physical
+rewrite serializes `group_tails` **whole** — every co-hosted tablet's own
+tail, verbatim — a completely different, healthy tablet's own next
+ordinary compaction durably wrote that phantom entry to disk as a side
+effect of its own successful operation: on a later node restart,
+`SharedWal::open` replays those never-fsynced, never-acked bytes as
+durable, silently diverging that tablet's recovered state from its own
+pre-teardown state and from its peers' beliefs about what it had acked.
+The existing corpus (cells a-d) never exercised this because none of them
+combine a tolerated, non-crashing failure with a sibling's subsequent
+successful rewrite — cell (b)'s crash-based fault is a different shape
+entirely, already fully handled by the per-record CRC32 + torn-tail
+tolerance (issue #495) at the file-decode layer, which has nothing to say
+about a live process baking bad bytes into the file via someone else's
+successful I/O.
+
+**Fix**: `submit_with_mutation` now also snapshots the mutated tablet's
+own `group_tails` entry from immediately *before* `mutate` runs, carried
+on the queued `Pending` as a `GroupTailsUndo` (`{tablet, previous}` — the
+`mutate` closure itself, and the FIFO-ordering argument it rests on, are
+byte-for-byte unchanged). `drive()`'s failure branch now applies every
+batch member's own undo, in **reverse** enqueue order — the LIFO order a
+batch coalescing several `append_tagged` calls for the SAME tablet (queued
+before any of them physically lands) needs to unwind correctly back to
+the pre-batch state. `group_tails` is otherwise unchanged: every reader
+(`recovered_state`, `compact_group`/`forget`'s own image-building reads)
+sees the ordinary, mutated-at-enqueue-time cache exactly as before; only a
+tolerated failure's own mutation is now reverted rather than left
+permanent. See `docs/engineering-lessons.md`'s matching entry for the
+general "eager-for-ordering is not the same claim as final" lesson this
+generalizes, and its own second entry for a fault-injection-technique
+pitfall found building this fix's regression (a `sync`-only failure can
+leave real, unrelated buffered bytes for a later caller's own successful
+sync to durably launder — a distinct, out-of-scope hazard the regression
+below deliberately avoids exercising).
+
+**Regression**: `crates/animus-cp-data/tests/sharedwal_fault_corpus.rs`'s
+new cell (e) — a deliberately different fault shape from cells (a)-(d)'s
+crash-based ones: a live, non-crashing tolerated failure. A tablet is
+halted (`RaftKvNode::shutdown()`), then its own doomed round is submitted
+directly against `SharedWal` with `DiskConfig::set_error_prob(1.0)` armed
+(failing `env.append` instantly, before it ever buffers a byte — see the
+engineering-lessons entry above for why this specific fault point, and not
+a `sync`-only failure, is what isolates this defect cleanly); a healthy
+sibling tablet then churns past `COMPACT_THRESHOLD` to force a real
+`compact_group` whole-file rewrite; the shared file is then reopened from
+scratch (a graceful restart, not a crash) and the recovered state for both
+tablets is checked: the halted tablet's log must contain only its own
+confirmed history, never the phantom write, and the sibling's own
+unrelated tail must reopen byte-for-byte identical to its pre-restart
+state. Verified red on the pre-fix code (the phantom write's `Put`
+command present in the recovered log) and green with the fix.
