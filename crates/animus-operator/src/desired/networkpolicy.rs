@@ -57,6 +57,21 @@ const DNS_POD_LABEL_VALUE: &str = "kube-dns";
 const NAMESPACE_NAME_LABEL_KEY: &str = "kubernetes.io/metadata.name";
 const KUBE_SYSTEM_NAMESPACE: &str = "kube-system";
 const DNS_PORT: i32 = 53;
+/// The operator's own namespace, as shipped
+/// (`deploy/operator/deployment.yaml`'s `Namespace` object is named
+/// `animus-operator` — the same literal as [`OPERATOR_APP_NAME`], but that's
+/// a coincidence of the shipped manifest, not a derivation, so this gets its
+/// own named constant rather than silently reusing `OPERATOR_APP_NAME`).
+/// Matched the same way [`dns_peer`] matches `kube-system`: a
+/// `namespaceSelector` on the namespace's own well-known name label, since a
+/// `NetworkPolicyPeer` can only select a namespace by label, never by name
+/// directly, and this crate has no other way to learn the operator's actual
+/// namespace (the `AnimusCluster` object carries no such field — see issue
+/// #857). **A deployment that renames the operator's namespace away from
+/// `animus-operator` must update this constant to match**, exactly as a
+/// deployment with a non-default `kube-dns` namespace would need to update
+/// `KUBE_SYSTEM_NAMESPACE` above.
+const OPERATOR_NAMESPACE: &str = "animus-operator";
 
 fn tcp_port(p: i32) -> NetworkPolicyPort {
     NetworkPolicyPort {
@@ -122,6 +137,33 @@ fn dns_peer() -> NetworkPolicyPeer {
     }
 }
 
+/// The peer matching the operator's own pods, in the operator's own
+/// namespace — `namespaceSelector` + `podSelector` together, mirroring
+/// [`dns_peer`] exactly (see [`OPERATOR_NAMESPACE`]'s own doc for why a
+/// bare `podSelector` alone, this rule's pre-#857 shape, never matched
+/// anything in the documented deployment topology: a `NetworkPolicyPeer`
+/// with no `namespaceSelector` is scoped to the `NetworkPolicy` object's
+/// own namespace, i.e. the `AnimusCluster`'s namespace, never the
+/// operator's).
+fn operator_peer(operator_labels: BTreeMap<String, String>) -> NetworkPolicyPeer {
+    let mut ns_labels = BTreeMap::new();
+    ns_labels.insert(
+        NAMESPACE_NAME_LABEL_KEY.to_string(),
+        OPERATOR_NAMESPACE.to_string(),
+    );
+    NetworkPolicyPeer {
+        namespace_selector: Some(LabelSelector {
+            match_labels: Some(ns_labels),
+            ..Default::default()
+        }),
+        pod_selector: Some(LabelSelector {
+            match_labels: Some(operator_labels),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
 /// The distinct port(s) `spec.s3`'s configured store URIs' `endpoint=`
 /// values resolve to — deduplicated (`backupStore`/`segmentStore`
 /// typically share one endpoint, but need not). A URI that somehow fails
@@ -173,11 +215,14 @@ pub fn build(cluster: &AnimusCluster, spec: &AnimusClusterSpec) -> NetworkPolicy
             from: Some(vec![pod_selector(own_pods.clone())]),
             ports: None,
         },
-        // The admin port, from the operator's own pods (health/status
-        // polling and the scale-down drain sequence — see
-        // `crate::controller`).
+        // The admin port, from the operator's own pods, in the operator's
+        // own namespace (health/status polling and the scale-down drain
+        // sequence — see `crate::controller`). Needs a `namespaceSelector`
+        // alongside the `podSelector` (see `operator_peer`'s own doc) since
+        // the operator runs in its own dedicated namespace, distinct from
+        // every `AnimusCluster`'s own namespace (issue #857).
         NetworkPolicyIngressRule {
-            from: Some(vec![pod_selector(operator_labels)]),
+            from: Some(vec![operator_peer(operator_labels)]),
             ports: Some(vec![tcp_port(admin_port)]),
         },
         // The dynamo (client-facing DynamoDB wire) port, open to any
@@ -279,7 +324,11 @@ mod tests {
             Some(selector_labels("c"))
         );
 
-        // Rule 2: from the operator, admin port only.
+        // Rule 2: from the operator, admin port only — both a podSelector
+        // (the operator's own pods) AND a namespaceSelector (the operator's
+        // own namespace), since a bare podSelector alone only ever matches
+        // pods in the `NetworkPolicy`'s own namespace, never the operator's
+        // dedicated one (issue #857).
         let from1 = rules[1].from.as_ref().unwrap();
         let operator_sel = from1[0]
             .pod_selector
@@ -293,6 +342,21 @@ mod tests {
                 .get("app.kubernetes.io/name")
                 .map(String::as_str),
             Some("animus-operator")
+        );
+        let operator_ns_sel = from1[0]
+            .namespace_selector
+            .as_ref()
+            .unwrap()
+            .match_labels
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            operator_ns_sel
+                .get("kubernetes.io/metadata.name")
+                .map(String::as_str),
+            Some("animus-operator"),
+            "the admin-ingress peer must scope to the operator's own \
+             namespace, mirroring dns_peer's kube-system scoping"
         );
         assert_eq!(
             rules[1].ports.as_ref().unwrap()[0].port,
