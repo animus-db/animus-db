@@ -171,7 +171,10 @@ fn begin_a_seeding_restore(
     );
     cluster.run_for(std::time::Duration::from_millis(200));
     assert_eq!(
-        cluster.metadata(0).restore(restore_id).map(|r| r.status.clone()),
+        cluster
+            .metadata(0)
+            .restore(restore_id)
+            .map(|r| r.status.clone()),
         Some(animus_control::RestoreStatus::Seeding),
         "restore must be Seeding immediately after BeginRestore commits — \
          SimCluster never spawns backup_restore_loop, so this state never \
@@ -234,7 +237,10 @@ fn run_delete_backup_refuses_while_seeding_then_succeeds_once_failed(seed: u64) 
     cluster.run_for(std::time::Duration::from_millis(200));
     assert!(
         matches!(
-            cluster.metadata(0).restore("restore-inflight").map(|r| &r.status),
+            cluster
+                .metadata(0)
+                .restore("restore-inflight")
+                .map(|r| &r.status),
             Some(animus_control::RestoreStatus::Failed { .. })
         ),
         "seed={seed}: restore must be Failed"
