@@ -19614,6 +19614,18 @@ mod sim_cluster_seed_join;
 #[cfg(test)]
 mod sim_cluster_control_membership_split;
 
+/// ADR 0061 rung N, C-14 PR 2: `SimCluster::grow_control`'s own test
+/// module — the primitive `sim_cluster_control_membership_split.rs`'s own
+/// doc (and `sim_cluster_control_membership_admin.rs`'s before it) named
+/// as deferred, separately-budgeted machinery: a genuinely new
+/// `RaftNode<SimEnv>` joining the LIVE control-plane voter quorum after
+/// construction, self-registered over the real relayed discovery path and
+/// admitted through the real `POST /admin/control/member/add` route. See
+/// `sim_cluster_control_growth.rs`'s own module doc for the two scenarios
+/// and `crates/animusd/CLAUDE.md`'s matching C-14 appendix.
+#[cfg(test)]
+mod sim_cluster_control_growth;
+
 /// Regression for the issue #298 residual confirmed live under the
 /// un-pinned `SplitMode::InPlace` proof soak (ADR 0018's matching amendment,
 /// `docs/engineering-lessons.md`'s matching entry): a stage blocked by
