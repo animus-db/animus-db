@@ -300,6 +300,11 @@ pub struct FakeAdminClient {
     drain_status_responses: Mutex<VecDeque<Value>>,
     fail_drain: Mutex<bool>,
     fail_remove: Mutex<bool>,
+    /// Issue #853: which ordinals' `POST .../admin/drain` calls fail —
+    /// `fail_drain`'s per-ordinal equivalent, letting a test express
+    /// "ordinals above N drain fine, N itself never finishes" so the
+    /// scale-down clamp's partial-progress case can be exercised.
+    fail_drain_ordinals: Mutex<BTreeSet<i32>>,
     /// S-07d: the control group's own live voter-id set — `GET
     /// /admin/control/members` always answers straight from this (never
     /// queued/consumed, unlike `drain_status_responses` above, since a test
@@ -352,6 +357,16 @@ impl FakeAdminClient {
     /// Make every future `POST .../admin/drain` call fail.
     pub fn fail_drain(&self) {
         *self.fail_drain.lock().unwrap() = true;
+    }
+
+    /// Make `POST .../admin/drain` fail specifically when dialed against
+    /// ordinal `ordinal`'s own admin port (issue #853) — the scale-down
+    /// drain sequence's own per-ordinal equivalent of
+    /// `fail_add_control_member_for_ordinal`, so a test can exercise a
+    /// drain sequence that makes partial progress (higher ordinals
+    /// succeed) before failing on this one.
+    pub fn fail_drain_for_ordinal(&self, ordinal: i32) {
+        self.fail_drain_ordinals.lock().unwrap().insert(ordinal);
     }
 
     /// Make every future `POST .../admin/member/remove` call fail.
@@ -453,7 +468,10 @@ impl AdminOps for FakeAdminClient {
             if *self.fail_remove.lock().unwrap() {
                 return Err("remove failed (fake)".to_string());
             }
-        } else if *self.fail_drain.lock().unwrap() {
+        } else if *self.fail_drain.lock().unwrap()
+            || ordinal_from_url(url)
+                .is_some_and(|o| self.fail_drain_ordinals.lock().unwrap().contains(&o))
+        {
             return Err("drain failed (fake)".to_string());
         }
         Ok(serde_json::json!({}))
