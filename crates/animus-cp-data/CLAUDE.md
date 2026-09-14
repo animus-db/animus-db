@@ -1858,8 +1858,13 @@ demand the identical action, so no disambiguation is needed.
     `crates/animus-cp-data/tests/sharedwal_fault_corpus.rs`
     (`ANIMUS_SHAREDWAL_SEEDS`, default 1) — cross-tablet coalescing, a
     crash mid-round with no cross-tablet contamination, `forget`-driven
-    GC, and a quiet tablet surviving a noisy sibling's real compaction.
-    Real-`ProdEnv`/real-disk proof: `crates/animusd/tests/
+    GC, a quiet tablet surviving a noisy sibling's real compaction, and
+    (cell (e), issue #838) a tolerated (halted-gated) LIVE, non-crashing
+    failure never leaving a phantom `group_tails` entry for a healthy
+    sibling's own next compaction to durably write out — see ADR 0028's
+    2026-09-14 amendment and `animus-control/CLAUDE.md`'s `shared_wal.rs`
+    entry for the mechanism and fix. Real-`ProdEnv`/real-disk proof:
+    `crates/animusd/tests/
     shared_wal_e2e.rs` (two tables sharing one node's `SharedWal` over a
     genuine process restart).
 - **Quiescence (ADR 0044 phase 1 / ADR 0048), data-plane groups only.** An
