@@ -1236,7 +1236,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     pub(crate) async fn read_stream_hot_records(
         &self,
         tablet: TabletId,
-        from_position: u64,
+        from_position: (u64, u32),
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
         let deadline = self.env.now().saturating_add(SCHEMA_COMMIT_TIMEOUT);
@@ -1249,13 +1249,14 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     return Ok(index_drain::hot_read(&leader, from_position, limit)
                         .await
                         .into_iter()
-                        .map(|(key, _, value)| (key, value))
+                        .map(|(key, _, _, value)| (key, value))
                         .collect());
                 }
                 Some(CpRoute::Forward(addr, hinted)) => {
                     let request = ClientRequest::StreamHotRead {
                         tablet: tablet.0,
-                        from_position,
+                        from_position_hlc: from_position.0,
+                        from_position_ordinal: from_position.1,
                         limit,
                     };
                     match self

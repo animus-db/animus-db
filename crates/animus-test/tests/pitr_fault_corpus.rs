@@ -150,9 +150,14 @@ fn key(i: usize) -> Vec<u8> {
     format!("k{i:04}").into_bytes()
 }
 
-fn record_hlc_suffix(key: &[u8]) -> Option<u64> {
-    let n = key.len().checked_sub(8)?;
-    Some(u64::from_be_bytes(key[n..].try_into().ok()?))
+/// Recovers the trailing `(packed_hlc, ordinal)` pair a change-log key's
+/// suffix carries (issue #852) — the PITR twin of
+/// `stream_lineage_corpus.rs::record_seqno_suffix`.
+fn record_seqno_suffix(key: &[u8]) -> Option<(u64, u32)> {
+    let n = key.len().checked_sub(12)?;
+    let hlc = u64::from_be_bytes(key[n..n + 8].try_into().ok()?);
+    let ordinal = u32::from_be_bytes(key[n + 8..].try_into().ok()?);
+    Some((hlc, ordinal))
 }
 
 /// `orders` with a schema and PITR enabled at generation 1 — `base_meta`'s
@@ -206,27 +211,28 @@ fn pitr_seal_now(
 ) -> Option<u64> {
     let generation = meta.table_pitr(TABLE)?.generation;
     let watermark = meta.pitr_segment_watermark(group.id).unwrap_or(0);
-    let mut filtered: Vec<(Vec<u8>, u64, Vec<u8>)> =
+    let mut filtered: Vec<(Vec<u8>, u64, u32, Vec<u8>)> =
         block_on(group.nodes[leader].pending_changes())
             .into_iter()
             .filter_map(|(k, v)| {
-                let hlc = record_hlc_suffix(&k)?;
-                (hlc > watermark).then_some((k, hlc, v))
+                let (hlc, ordinal) = record_seqno_suffix(&k)?;
+                (hlc > watermark).then_some((k, hlc, ordinal, v))
             })
             .collect();
     if filtered.is_empty() {
         return None;
     }
-    filtered.sort_by_key(|(_, hlc, _)| *hlc);
+    filtered.sort_by_key(|(_, hlc, ordinal, _)| (*hlc, *ordinal));
 
     let epoch = current_open_pitr_epoch(meta, group.id);
     let hlc_range = (watermark, filtered.last().expect("non-empty").1);
     let count = filtered.len() as u64;
     let records: Vec<segment::SegmentRecord> = filtered
         .iter()
-        .map(|(k, hlc, v)| segment::SegmentRecord {
+        .map(|(k, hlc, ordinal, v)| segment::SegmentRecord {
             source_key: k.clone(),
             packed_hlc: *hlc,
+            ordinal: *ordinal,
             change_record: v.clone(),
         })
         .collect();
@@ -280,7 +286,7 @@ fn collect_pitr_records(
     group: &Group,
     leader: usize,
     generation: u64,
-) -> Vec<(Vec<u8>, u64, Vec<u8>)> {
+) -> Vec<(Vec<u8>, u64, u32, Vec<u8>)> {
     let mut all = Vec::new();
     for ((_, _epoch), row) in meta
         .pitr_segments
@@ -295,18 +301,19 @@ fn collect_pitr_records(
         let (_, records) = segment::decode_and_slice(&bytes, row.hlc_range)
             .unwrap_or_else(|e| panic!("corrupt PITR segment {seg_id}: {e}"));
         for r in records {
-            all.push((r.source_key, r.packed_hlc, r.change_record));
+            all.push((r.source_key, r.packed_hlc, r.ordinal, r.change_record));
         }
     }
     let watermark = meta.pitr_segment_watermark(group.id).unwrap_or(0);
-    let mut hot: Vec<(Vec<u8>, u64, Vec<u8>)> = block_on(group.nodes[leader].pending_changes())
-        .into_iter()
-        .filter_map(|(k, v)| {
-            let hlc = record_hlc_suffix(&k)?;
-            (hlc > watermark).then_some((k, hlc, v))
-        })
-        .collect();
-    hot.sort_by_key(|(_, hlc, _)| *hlc);
+    let mut hot: Vec<(Vec<u8>, u64, u32, Vec<u8>)> =
+        block_on(group.nodes[leader].pending_changes())
+            .into_iter()
+            .filter_map(|(k, v)| {
+                let (hlc, ordinal) = record_seqno_suffix(&k)?;
+                (hlc > watermark).then_some((k, hlc, ordinal, v))
+            })
+            .collect();
+    hot.sort_by_key(|(_, hlc, ordinal, _)| (*hlc, *ordinal));
     all.extend(hot);
     all
 }
@@ -333,17 +340,17 @@ fn verify_pitr_lineage(
         // which this corpus doesn't model (see the split scenario's own
         // doc) — so this check is scoped per-group, not globally across
         // `lineage`.
-        let mut seen_hlcs_this_group: BTreeSet<u64> = BTreeSet::new();
-        for (source_key, hlc, record) in
+        let mut seen_seqnos_this_group: BTreeSet<(u64, u32)> = BTreeSet::new();
+        for (source_key, hlc, ordinal, record) in
             collect_pitr_records(meta, store, group, *leader, *generation)
         {
             assert!(
-                seen_hlcs_this_group.insert(hlc),
-                "[seed={seed}] tablet {:?}: hlc {hlc} delivered more than once within its own \
-                 chain — violates exactly-once",
+                seen_seqnos_this_group.insert((hlc, ordinal)),
+                "[seed={seed}] tablet {:?}: (hlc {hlc}, ordinal {ordinal}) delivered more than \
+                 once within its own chain — violates exactly-once",
                 group.id
             );
-            let item_key = source_key[..source_key.len() - 8].to_vec();
+            let item_key = source_key[..source_key.len() - 12].to_vec();
             delivered_by_key.entry(item_key).or_default().push(record);
             total += 1;
         }
@@ -763,7 +770,7 @@ fn assert_replay_matches_model(
     seed: u64,
 ) {
     let plan = meta.pitr_replay_segments(base_tablet_progress, target_wall_ms);
-    let mut actual: BTreeMap<Vec<u8>, (u64, Vec<u8>)> = BTreeMap::new();
+    let mut actual: BTreeMap<Vec<u8>, (u64, u32, Vec<u8>)> = BTreeMap::new();
     for seg in &plan {
         let bytes = block_on(store.get(&seg.object_id))
             .unwrap_or_else(|e| panic!("[seed={seed}] segment store get {}: {e}", seg.object_id))
@@ -771,18 +778,18 @@ fn assert_replay_matches_model(
         let (_, records) = segment::decode_and_slice(&bytes, seg.replay_range)
             .unwrap_or_else(|e| panic!("[seed={seed}] corrupt segment {}: {e}", seg.object_id));
         for r in records {
-            let Some(n) = r.source_key.len().checked_sub(8) else {
+            let Some(n) = r.source_key.len().checked_sub(12) else {
                 continue;
             };
             let item_key = r.source_key[..n].to_vec();
-            let slot = actual.entry(item_key).or_insert((0, Vec::new()));
-            if r.packed_hlc >= slot.0 {
-                *slot = (r.packed_hlc, r.change_record);
+            let slot = actual.entry(item_key).or_insert((0u64, 0u32, Vec::new()));
+            if (r.packed_hlc, r.ordinal) >= (slot.0, slot.1) {
+                *slot = (r.packed_hlc, r.ordinal, r.change_record);
             }
         }
     }
     let actual_values: BTreeMap<Vec<u8>, Vec<u8>> =
-        actual.into_iter().map(|(k, (_, v))| (k, v)).collect();
+        actual.into_iter().map(|(k, (_, _, v))| (k, v)).collect();
     assert_eq!(
         &actual_values, expected,
         "[seed={seed}] replay to wall_ms={target_wall_ms} did not match the model"

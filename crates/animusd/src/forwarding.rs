@@ -1072,7 +1072,8 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             // that knows how to filter/sort/limit the tablet's own hot tail.
             ClientRequest::StreamHotRead {
                 tablet,
-                from_position,
+                from_position_hlc,
+                from_position_ordinal,
                 limit,
             } => {
                 let tablet = TabletId(tablet);
@@ -1083,11 +1084,15 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 // scope (ADR 0050 rung 7): ranges are immutable and a split
                 // retires the parent whole, so there is no transition window
                 // left to latch.
-                let pairs = index_drain::hot_read(&leader, from_position, limit)
-                    .await
-                    .into_iter()
-                    .map(|(key, _, value)| (key, value))
-                    .collect();
+                let pairs = index_drain::hot_read(
+                    &leader,
+                    (from_position_hlc, from_position_ordinal),
+                    limit,
+                )
+                .await
+                .into_iter()
+                .map(|(key, _, _, value)| (key, value))
+                .collect();
                 ClientResponse::Pairs(pairs)
             }
             // ADR 0045 §5 step 3: the backfill-cursor-cleanup RPC —
