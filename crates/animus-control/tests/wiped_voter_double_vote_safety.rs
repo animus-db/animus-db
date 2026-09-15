@@ -130,12 +130,17 @@ fn wiped_voter_never_grants_a_second_contradicting_vote_in_the_same_term() {
     );
 
     // BOTH of B's peers (A and C) answer B's probe honestly: real history
-    // (this cluster already has a committed leader in `term`), AND their
-    // own committed config already names B as a voter -- exactly the
+    // (this cluster already has a committed leader in `term`), their own
+    // committed config already names B as a voter -- exactly the
     // "already-established voter, disk wiped" signal (as opposed to an ADR
-    // 0060 growth join, which their config would NOT yet contain). Per the
-    // 2026-09-15 amendment (a real bootstrap-race regression this exact
-    // mechanism was found to cause under real `ProdEnv` threading), a
+    // 0060 growth join, which their config would NOT yet contain) -- AND
+    // (2026-09-15, second amendment) `ever_heard_from_prober: true`: both
+    // peers genuinely exchanged real votes/appends with this identity
+    // before the wipe (A received B's real vote grant via `elect()` above),
+    // so neither can honestly report "never heard from you," the signal
+    // that would otherwise let a genesis-race founder resolve safely. Per
+    // the first 2026-09-15 amendment (a real bootstrap-race regression this
+    // exact mechanism was found to cause under real `ProdEnv` threading), a
     // refusal verdict requires evidence from EVERY configured peer, never
     // just the first one to reply -- so both must answer before
     // `refused_as_voter()` can become true.
@@ -147,6 +152,7 @@ fn wiped_voter_never_grants_a_second_contradicting_vote_in_the_same_term() {
                 term,
                 committed_index: 1,
                 config: all_voters.clone(),
+                ever_heard_from_prober: true,
             },
             now,
             7,
@@ -207,6 +213,7 @@ fn a_double_grant_would_elect_two_leaders_in_the_same_term() {
                 term,
                 committed_index: 1,
                 config: all_voters.clone(),
+                ever_heard_from_prober: true,
             },
             now,
             7,

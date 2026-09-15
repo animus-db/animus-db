@@ -304,6 +304,7 @@ fn next_deadline_wakes_for_a_cluster_check_resend_even_after_election_deadline_i
             term: 0,
             committed_index: 0,
             config: set(&group()),
+            ever_heard_from_prober: false,
         },
         deadline_after,
         7,

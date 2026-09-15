@@ -1096,11 +1096,13 @@ fn put_raft(out: &mut Vec<u8>, m: &RaftMsg<KvCommand>) {
             term,
             committed_index,
             config,
+            ever_heard_from_prober,
         } => {
             put_u8(out, 13);
             put_u64(out, *term);
             put_u64(out, *committed_index);
             put_node_set(out, config);
+            put_bool(out, *ever_heard_from_prober);
         }
     }
 }
@@ -1186,6 +1188,7 @@ fn read_raft(c: &mut Cursor<'_>) -> Result<RaftMsg<KvCommand>, DecodeError> {
             term: c.u64()?,
             committed_index: c.u64()?,
             config: c.node_set()?,
+            ever_heard_from_prober: c.bool()?,
         },
         other => return Err(format!("unknown RaftMsg tag {other}")),
     })

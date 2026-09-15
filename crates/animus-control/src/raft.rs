@@ -341,32 +341,65 @@ pub enum RaftMsg<C = MetaCommand> {
     /// payload: the honest answer is purely local to the responder.
     ClusterProbe,
     /// Response to [`RaftMsg::ClusterProbe`]: the responder's own current
-    /// term, commit index, and **committed voter config**, reported
-    /// honestly regardless of whether the responder is itself still
-    /// mid-check. `term > 0 || committed_index > 0` is conclusive proof this
-    /// responder (and thus the cluster it belongs to) has real history — the
-    /// asker was never told to assume otherwise on a `0`/`0` reply from any
-    /// *one* peer, only once every configured peer has answered `0`/`0`
-    /// (see `begin_cluster_check`).
+    /// term, commit index, **committed voter config**, and whether the
+    /// responder has **ever itself received a real protocol message from
+    /// the asker** (`ever_heard_from_prober`), reported honestly regardless
+    /// of whether the responder is itself still mid-check. `term > 0 ||
+    /// committed_index > 0` is conclusive proof this responder (and thus the
+    /// cluster it belongs to) has real history — the asker was never told
+    /// to assume otherwise on a `0`/`0` reply from any *one* peer, only once
+    /// every configured peer has answered `0`/`0` (see
+    /// `begin_cluster_check`).
     ///
-    /// **`config` is what disambiguates a wiped-voter restart from an
-    /// ordinary ADR 0060 growth join** — both look identical from the
-    /// asker's own empty local state, but a responder's *committed* config
-    /// answers "do you already recognize the asker as one of your
-    /// voters?": if not, the asker cannot possibly have cast a now-forgotten
-    /// real vote under this identity in this cluster (it never had voting
-    /// rights before this exact moment), so it is safe to proceed as an
-    /// ordinary fresh voter exactly as it does today without this whole
-    /// mechanism — pre-vote's own log check is what keeps THAT case safe
-    /// (ADR 0060), unchanged. Only `config.contains(asker)` is the
-    /// wiped-voter-restart signal this whole mechanism exists to catch. See
-    /// `RaftCore::handle_cluster_probe_resp`'s doc for the full decision
-    /// table and `docs/adr/0009-*.md`'s matching amendment for why this
-    /// needed the config field rather than term/commit alone.
+    /// **Two independent signals disambiguate a wiped-voter restart from an
+    /// identity that has simply never voted before** — both an ordinary ADR
+    /// 0060 growth join AND a genesis founder still mid its own boot-time
+    /// check look identical to the asker's own empty local state, but
+    /// neither could possibly have cast a now-forgotten real vote under this
+    /// identity, so proceeding as an ordinary fresh voter is safe for both:
+    ///
+    /// - `!config.contains(asker)` — the responder's *committed* config
+    ///   doesn't (yet) recognize the asker as one of its voters at all. The
+    ///   original signal (ADR 0060): pre-vote's own log check is what keeps
+    ///   this case safe, unchanged.
+    /// - `!ever_heard_from_prober` — the responder has *itself* never
+    ///   received any real consensus-protocol message (a vote request/
+    ///   response, an append, a snapshot chunk — anything but this very
+    ///   probe/response pair) from the asker, ever, since this responder's
+    ///   own process started. **Added 2026-09-15** to close a real gap the
+    ///   `config.contains` signal alone cannot: in a genuine N-node genesis
+    ///   (every founder listed in `config` from birth, by construction), a
+    ///   still-checking founder's config membership is unconditionally
+    ///   `true` from the very first committed entry onward, so a majority
+    ///   that elects among itself before a slower founder's own check
+    ///   resolves looks — by `config.contains` alone — indistinguishable
+    ///   from a genuinely established, long-running voter whose disk was
+    ///   wiped. A founder that has never campaigned or voted (gated on
+    ///   `!cluster_check_pending`, see `start_pre_vote`/`start_election`)
+    ///   has sent no peer any real protocol message yet, so
+    ///   `ever_heard_from_prober` is unconditionally `false` for it on
+    ///   every peer — resolving the genesis race immediately, on the first
+    ///   reply, with no need to wait out the full peer set. This is a pure
+    ///   *addition*: it never makes an established-restart refusal less
+    ///   likely (a genuinely wiped voter's peers HAVE received real
+    ///   messages from it pre-wipe and keep answering `true` for as long as
+    ///   they keep running), only faster/safer for an identity that has
+    ///   never had a real vote to forget. See `RaftCore::
+    ///   handle_cluster_probe_resp`'s doc for the full decision table and
+    ///   `docs/adr/0009-*.md`'s matching amendment for the design record.
+    ///   **Known residual**: this signal is per-process, in-memory, not
+    ///   WAL-durable — a responder that itself restarts (recovered, not
+    ///   wiped) forgets it until the prober sends it another real message,
+    ///   so a coordinated whole-cluster restart racing a single voter's
+    ///   disk wipe is not fully covered by this signal alone (unchanged
+    ///   from before this amendment — no prior mechanism covered it
+    ///   either). The common case this feature targets — one voter's disk
+    ///   wiped while its peers keep running — is fully covered.
     ClusterProbeResp {
         term: u64,
         committed_index: u64,
         config: BTreeSet<NodeId>,
+        ever_heard_from_prober: bool,
     },
 }
 
@@ -629,6 +662,44 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     // liveness judgment of its peers depend on stale, potentially very old
     // wall-clock reads survived across a restart, which is actively wrong.
     last_contact: BTreeMap<NodeId, Nanos>,
+    // Issue #667 (2026-09-15 amendment): every peer id this node has ever
+    // witnessed casting a GENUINE, durably-forgettable vote — i.e. a
+    // `voted_for` write this identity's own disk could later lose. Marked
+    // ONLY at the three sites that represent exactly that: this peer
+    // requesting a vote as a candidate (`handle_request_vote`, a self-vote
+    // regardless of whether we grant it), this peer granting us a REAL vote
+    // (`handle_vote_resp`, `granted: true` only — a rejection sets no
+    // `voted_for` and proves nothing forgettable), and this peer appearing
+    // as `leader` in `AppendEntries`/`InstallSnapshot` (proof it previously
+    // won a real election, which required it to self-vote to become a
+    // candidate in the first place). Deliberately NOT marked on
+    // `PreVote`/`PreVoteResp` (a pre-vote round never touches `voted_for`/
+    // `current_term` by design — nothing forgettable happens), nor on
+    // `AppendEntriesResp`/`InstallSnapshotResp` (a plain follower accepting
+    // a leader's log has never itself cast a vote, so it poses no
+    // double-vote risk even after a wipe), nor — critically — on a
+    // REJECTED `RequestVoteResp`/being the target of someone's `RequestVote`
+    // (a candidate that never wins doesn't durably record anyone's grant).
+    // **A real bug this precision fixed**: an earlier, broader version of
+    // this field marked ANY non-probe message, including a REJECTION this
+    // node itself sends back to a peer's `RequestVote` WHILE still
+    // `cluster_check_pending` (a still-checking node still honestly answers
+    // vote requests, just always rejecting) — that rejection is real wire
+    // traffic but represents no forgettable state on the SENDER's part, and
+    // marking it reproduced the exact genesis-race false refusal this
+    // amendment exists to fix (a 2-node genesis: n1 resolves first, starts
+    // campaigning, n0 rejects n1's `RequestVote` since it's still checking,
+    // n1's own `heard_from` then wrongly contains n0). Purely additive to
+    // `last_contact` (leader-only, narrower — only `AppendEntriesResp` —
+    // and keyed to liveness, not vote history) — this exists solely to
+    // answer a peer's `ClusterProbe` honestly (`handle_cluster_probe`'s
+    // `ever_heard_from_prober`). See `RaftMsg::ClusterProbeResp`'s own doc
+    // for why this closes the genesis-race gap `config.contains` alone
+    // cannot, and its "Known residual" note for why this is deliberately
+    // in-memory, not WAL-persisted. Never pruned (a control/data-plane
+    // group's peer set is small and bounded by its own configured
+    // membership).
+    heard_from: BTreeSet<NodeId>,
     // Set by `transfer_leadership`: a caught-up voter this leader is handing off
     // to. Re-sent as a `TimeoutNow` on every heartbeat (`broadcast_append`) until
     // this node steps down (the transfer succeeded) — so a single dropped message
@@ -951,6 +1022,7 @@ where
             match_index: BTreeMap::new(),
             snapshot_served_through: BTreeMap::new(),
             last_contact: BTreeMap::new(),
+            heard_from: BTreeSet::new(),
             departing: BTreeMap::new(),
             transfer_target: None,
             transfer_deadline: Nanos(0),
@@ -1442,11 +1514,11 @@ where
             // was correct in isolation, but `tick()` was never being called
             // at the right time to run it.
             match self.cluster_check_pending {
-                Some(_) => Some(Nanos(
-                    self.election_deadline
-                        .0
-                        .min(self.cluster_check_resend_deadline.map_or(u64::MAX, |d| d.0)),
-                )),
+                Some(_) => {
+                    Some(Nanos(self.election_deadline.0.min(
+                        self.cluster_check_resend_deadline.map_or(u64::MAX, |d| d.0),
+                    )))
+                }
                 None => Some(self.election_deadline),
             }
         }
@@ -2218,7 +2290,14 @@ where
                 term,
                 committed_index,
                 config,
-            } => self.handle_cluster_probe_resp(from, term, committed_index, config),
+                ever_heard_from_prober,
+            } => self.handle_cluster_probe_resp(
+                from,
+                term,
+                committed_index,
+                config,
+                ever_heard_from_prober,
+            ),
             RaftMsg::Quiesce { term, commit_index } => {
                 self.handle_quiesce(from, term, commit_index);
                 Vec::new()
@@ -2307,19 +2386,24 @@ where
     }
 
     /// Answer a peer's [`RaftMsg::ClusterProbe`] honestly with our own
-    /// current term/commit index/committed config — including while our
-    /// *own* `cluster_check_pending` is still unresolved: a still-checking
-    /// node's honest `0`/`0`/(whatever config it started with) is exactly
-    /// the evidence a fellow genesis participant needs, and once this node
-    /// itself resolves (either way) its own term/commit reflect that
-    /// truthfully from then on.
+    /// current term/commit index/committed config, plus whether we
+    /// ourselves have ever received a real protocol message from `from`
+    /// (`ever_heard_from_prober` — see `RaftMsg::ClusterProbeResp`'s own doc
+    /// for why this closes the genesis-race gap `config` alone cannot) —
+    /// including while our *own* `cluster_check_pending` is still
+    /// unresolved: a still-checking node's honest `0`/`0`/(whatever config
+    /// it started with) is exactly the evidence a fellow genesis
+    /// participant needs, and once this node itself resolves (either way)
+    /// its own term/commit reflect that truthfully from then on.
     fn handle_cluster_probe(&mut self, from: NodeId) -> Vec<Out<C>> {
+        let ever_heard_from_prober = self.heard_from.contains(&from);
         vec![(
             from,
             RaftMsg::ClusterProbeResp {
                 term: self.current_term,
                 committed_index: self.commit_index,
                 config: self.config.clone(),
+                ever_heard_from_prober,
             },
         )]
     }
@@ -2396,18 +2480,38 @@ where
     ///   `cluster_check_resend_deadline`'s own doc for the companion fix
     ///   this required).
     ///
-    /// Only once every peer has answered with NEITHER of the two
-    /// unambiguous signals above (every peer already has real history,
-    /// and none of them is fresh) does seeing at least one peer name this
-    /// node as an already-established voter refuse permanently — that
-    /// combination is only possible for a genuinely wiped, previously-
-    /// established voter.
+    /// Only once every peer has answered with NEITHER of the unambiguous
+    /// signals below (every peer already has real history, none of them is
+    /// fresh, and every one of them HAS heard from this identity before)
+    /// does seeing at least one peer name this node as an already-
+    /// established voter refuse permanently — that combination is only
+    /// possible for a genuinely wiped, previously-established voter.
+    ///
+    /// **Issue #667 amendment (2026-09-15, second): `ever_heard_from_prober
+    /// == false` is a THIRD unambiguous, immediately-decisive signal**,
+    /// closing a real gap the two signals above cannot: in a genuine
+    /// N-node genesis, EVERY founder's `config` contains every OTHER
+    /// founder from the very first committed entry onward (that's what a
+    /// genesis config *is*), so `config.contains(&self.id)` is
+    /// unconditionally `true` for a genesis founder the instant any
+    /// majority elects — the exact same signal a truly established,
+    /// long-running cluster's wiped voter produces. The two are otherwise
+    /// observationally identical from `from`'s own term/commit/config
+    /// alone. `ever_heard_from_prober` breaks the tie: a founder still
+    /// resolving its OWN cluster check has not campaigned or voted yet
+    /// (gated on `!cluster_check_pending`), so it has sent no peer any real
+    /// protocol message — every peer's honest answer is `false` — while a
+    /// genuinely established voter's peers, having exchanged real votes/
+    /// appends with it before the wipe, keep answering `true` for as long
+    /// as they keep running. See `RaftMsg::ClusterProbeResp`'s own doc for
+    /// the full reasoning and its documented residual.
     fn handle_cluster_probe_resp(
         &mut self,
         from: NodeId,
         term: u64,
         committed_index: u64,
         config: BTreeSet<NodeId>,
+        ever_heard_from_prober: bool,
     ) -> Vec<Out<C>> {
         let Some(pending) = self.cluster_check_pending.as_mut() else {
             return Vec::new();
@@ -2447,7 +2551,33 @@ where
             );
             return Vec::new();
         }
-        // Real history AND names this node — record as evidence only; do
+        if !ever_heard_from_prober {
+            // Unambiguous on its own, regardless of any other peer's
+            // answer or of `config` (this method's own doc, "second
+            // amendment"): `from` has real history and already names this
+            // node, but has itself never received any real protocol
+            // message from this identity — so this identity has never cast
+            // a real vote `from` could be relying on the memory of. Closes
+            // the genesis-race gap `config.contains` alone cannot: every
+            // founder's config trivially contains every other founder from
+            // birth, so that signal alone can never distinguish "we just
+            // elected among ourselves moments ago, as part of the SAME
+            // bootstrap you're also part of" from "you were an established
+            // voter for a long time before your disk was wiped."
+            self.cluster_check_pending = None;
+            tracing::debug!(
+                node = %self.id,
+                peer = %from,
+                "boot-time cluster check resolved: peer {from} has real history and \
+                 already names this node, but has never itself received a real protocol \
+                 message from this identity — a same-bootstrap genesis race (or an \
+                 ordinary rejoin), not a wiped-voter restart. Proceeding as an \
+                 unestablished fresh voter.",
+            );
+            return Vec::new();
+        }
+        // Real history, names this node, AND has genuinely heard from this
+        // identity before — record as evidence only; do
         // NOT decide yet (see this method's own doc for why a single such
         // reply is not, by itself, trustworthy).
         self.cluster_check_saw_established_with_me = true;
@@ -2630,6 +2760,13 @@ where
         now: Nanos,
         entropy: u64,
     ) -> Vec<Out<C>> {
+        // Issue #667 (2026-09-15 amendment): a real candidacy always
+        // self-votes durably (`voted_for = self`) the moment it's issued,
+        // whether or not WE grant it — record it unconditionally, before
+        // the grant decision, so `heard_from`'s own doc's "never marked on
+        // a rejection this node SENDS" rule stays about the RESPONDER's own
+        // outbound rejection, not the incoming candidate's real self-vote.
+        self.heard_from.insert(candidate.clone());
         let granted = if term < self.current_term {
             false
         } else {
@@ -2670,6 +2807,15 @@ where
         granted: bool,
         now: Nanos,
     ) -> Vec<Out<C>> {
+        // Issue #667 (2026-09-15 amendment): a granted real vote durably
+        // sets `from`'s own `voted_for` — exactly the forgettable state
+        // `heard_from` exists to record. Marked before the stale-response
+        // early-return below (`from`'s own vote was cast regardless of
+        // whether it's still useful to *this* candidacy by the time it
+        // arrives), never on `granted == false` (a rejection sets nothing).
+        if granted {
+            self.heard_from.insert(from.clone());
+        }
         if self.role != Role::Candidate || term != self.current_term {
             return Vec::new();
         }
@@ -2696,6 +2842,12 @@ where
         now: Nanos,
         entropy: u64,
     ) -> Vec<Out<C>> {
+        // Issue #667 (2026-09-15 amendment): `leader` sending `AppendEntries`
+        // at all is proof it previously won a real election — which
+        // required it to self-vote (durable, forgettable state) to become a
+        // candidate in the first place — regardless of whether this
+        // particular message is stale by the time it arrives.
+        self.heard_from.insert(leader.clone());
         if term < self.current_term {
             return vec![(
                 leader,
@@ -2902,6 +3054,10 @@ where
         now: Nanos,
         entropy: u64,
     ) -> Vec<Out<C>> {
+        // Issue #667 (2026-09-15 amendment): same reasoning as
+        // `handle_append_entries` — `leader` sending a snapshot at all
+        // proves it previously won a real election.
+        self.heard_from.insert(leader.clone());
         if term < self.current_term {
             return vec![(
                 leader,
