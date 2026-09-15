@@ -341,13 +341,33 @@ pub enum RaftMsg<C = MetaCommand> {
     /// payload: the honest answer is purely local to the responder.
     ClusterProbe,
     /// Response to [`RaftMsg::ClusterProbe`]: the responder's own current
-    /// term and commit index, reported honestly regardless of whether the
-    /// responder is itself still mid-check. `term > 0 || committed_index >
-    /// 0` is conclusive proof this responder (and thus the cluster it
-    /// belongs to) has real history — the asker was never told to assume
-    /// otherwise on a `0`/`0` reply from any *one* peer, only once every
-    /// configured peer has answered `0`/`0` (see `begin_cluster_check`).
-    ClusterProbeResp { term: u64, committed_index: u64 },
+    /// term, commit index, and **committed voter config**, reported
+    /// honestly regardless of whether the responder is itself still
+    /// mid-check. `term > 0 || committed_index > 0` is conclusive proof this
+    /// responder (and thus the cluster it belongs to) has real history — the
+    /// asker was never told to assume otherwise on a `0`/`0` reply from any
+    /// *one* peer, only once every configured peer has answered `0`/`0`
+    /// (see `begin_cluster_check`).
+    ///
+    /// **`config` is what disambiguates a wiped-voter restart from an
+    /// ordinary ADR 0060 growth join** — both look identical from the
+    /// asker's own empty local state, but a responder's *committed* config
+    /// answers "do you already recognize the asker as one of your
+    /// voters?": if not, the asker cannot possibly have cast a now-forgotten
+    /// real vote under this identity in this cluster (it never had voting
+    /// rights before this exact moment), so it is safe to proceed as an
+    /// ordinary fresh voter exactly as it does today without this whole
+    /// mechanism — pre-vote's own log check is what keeps THAT case safe
+    /// (ADR 0060), unchanged. Only `config.contains(asker)` is the
+    /// wiped-voter-restart signal this whole mechanism exists to catch. See
+    /// `RaftCore::handle_cluster_probe_resp`'s doc for the full decision
+    /// table and `docs/adr/0009-*.md`'s matching amendment for why this
+    /// needed the config field rather than term/commit alone.
+    ClusterProbeResp {
+        term: u64,
+        committed_index: u64,
+        config: BTreeSet<NodeId>,
+    },
 }
 
 impl<C> RaftMsg<C> {
@@ -2101,7 +2121,8 @@ where
             RaftMsg::ClusterProbeResp {
                 term,
                 committed_index,
-            } => self.handle_cluster_probe_resp(from, term, committed_index),
+                config,
+            } => self.handle_cluster_probe_resp(from, term, committed_index, config),
             RaftMsg::Quiesce { term, commit_index } => {
                 self.handle_quiesce(from, term, commit_index);
                 Vec::new()
@@ -2140,13 +2161,18 @@ where
     /// `cluster_check_refused` below.
     ///
     /// Broadcasts [`RaftMsg::ClusterProbe`] to every configured peer and
-    /// parks in `cluster_check_pending` until every one of them has
-    /// answered `0`/`0` (see `handle_cluster_probe_resp`) — a single-node
-    /// group (`self.peers` empty) has nothing to wait for and resolves
-    /// immediately. A never-answering peer is never assumed fresh: the
-    /// election-timeout tick keeps resending probes (`start_pre_vote`'s own
-    /// early-return arm) for as long as `cluster_check_pending` stays
-    /// `Some` — "peers unreachable" means keep probing, never vote.
+    /// parks in `cluster_check_pending` until either (a) any one peer
+    /// answers with real history, resolving immediately one of two ways
+    /// depending on whether that peer's own committed config already names
+    /// this node id (see `handle_cluster_probe_resp`'s own doc for the full
+    /// decision table — this is what tells a genuine ADR 0060 growth join
+    /// apart from an actual wiped-voter restart), or (b) every one of them
+    /// has answered `0`/`0` — a single-node group (`self.peers` empty) has
+    /// nothing to wait for and resolves immediately. A never-answering peer
+    /// is never assumed fresh: the election-timeout tick keeps resending
+    /// probes (`start_pre_vote`'s own early-return arm) for as long as
+    /// `cluster_check_pending` stays `Some` — "peers unreachable" means
+    /// keep probing, never vote.
     pub fn begin_cluster_check(&mut self, now: Nanos, entropy: u64) -> Vec<Out<C>> {
         if self.peers.is_empty() {
             // Nothing to confirm with — a lone voter (or a peerless test
@@ -2167,55 +2193,85 @@ where
     }
 
     /// Answer a peer's [`RaftMsg::ClusterProbe`] honestly with our own
-    /// current term/commit index — including while our *own*
-    /// `cluster_check_pending` is still unresolved: a still-checking node's
-    /// honest `0`/`0` is exactly the evidence a fellow genesis participant
-    /// needs, and once this node itself resolves (either way) its own
-    /// term/commit reflect that truthfully from then on.
+    /// current term/commit index/committed config — including while our
+    /// *own* `cluster_check_pending` is still unresolved: a still-checking
+    /// node's honest `0`/`0`/(whatever config it started with) is exactly
+    /// the evidence a fellow genesis participant needs, and once this node
+    /// itself resolves (either way) its own term/commit reflect that
+    /// truthfully from then on.
     fn handle_cluster_probe(&mut self, from: NodeId) -> Vec<Out<C>> {
         vec![(
             from,
             RaftMsg::ClusterProbeResp {
                 term: self.current_term,
                 committed_index: self.commit_index,
+                config: self.config.clone(),
             },
         )]
     }
 
     /// Tally a [`RaftMsg::ClusterProbeResp`]. A no-op unless our own
     /// `cluster_check_pending` is still `Some` (already resolved, or never
-    /// applicable — a stale/duplicate reply). `term > 0 || committed_index >
-    /// 0` is conclusive: `from` (and thus the cluster) has real history, so
-    /// this node's own identity is an already-established voter whose disk
-    /// was wiped — refuse permanently (`cluster_check_refused`, never
-    /// cleared). Otherwise `from` is confirmed empty too; once *every*
-    /// configured peer has confirmed empty, resolve to a genuine fresh
-    /// bootstrap and kick off the real election machinery immediately
-    /// (rather than waiting for the next election-timeout tick).
+    /// applicable — a stale/duplicate reply).
+    ///
+    /// `term > 0 || committed_index > 0` proves `from` (and thus the
+    /// cluster) has real history — but that alone does NOT mean this node
+    /// itself is unsafe to proceed as a voter: an ordinary ADR 0060 growth
+    /// join (a genuinely brand-new node id, never before a voter anywhere,
+    /// added to an established cluster via `change_membership`) hits this
+    /// exact branch too, since it also starts with an empty local WAL. The
+    /// disambiguator is `from`'s own **committed config**:
+    /// - `config.contains(&self.id)` — `from` already recognizes this node
+    ///   id as one of its own voters, yet this node's own disk is empty.
+    ///   That combination is only possible if this identity was already an
+    ///   established voter and its disk was wiped — refuse permanently
+    ///   (`cluster_check_refused`, never cleared; see that field's own doc).
+    /// - otherwise — `from` has real history but does not (yet) recognize
+    ///   this node id as a voter at all, so this identity could never have
+    ///   cast a real vote here to forget in the first place. Resolve
+    ///   immediately as an ordinary fresh voter: `start_pre_vote`'s own
+    ///   log-check (ADR 0060) is what already keeps this case safe, and
+    ///   always has, with no dependency on this whole mechanism.
+    ///
+    /// Only once *every* configured peer has confirmed genuinely empty
+    /// (`0`/`0`) does this resolve to "genuine fresh multi-node bootstrap".
     fn handle_cluster_probe_resp(
         &mut self,
         from: NodeId,
         term: u64,
         committed_index: u64,
+        config: BTreeSet<NodeId>,
     ) -> Vec<Out<C>> {
         let Some(pending) = self.cluster_check_pending.as_mut() else {
             return Vec::new();
         };
         if term > 0 || committed_index > 0 {
             self.cluster_check_pending = None;
-            self.cluster_check_refused = true;
-            tracing::error!(
-                node = %self.id,
-                peer = %from,
-                peer_term = term,
-                peer_committed_index = committed_index,
-                "refusing to start as a voter: this node's persisted Raft state is empty \
-                 (ephemeral storage wiped?) but peer {from} shows an already-established \
-                 cluster (term or committed index > 0). Re-add this node id through the \
-                 rejoin path instead of restarting it as a static voter: remove it from the \
-                 voter set, add it back as a learner (`animusd join` / admin add-learner, \
-                 ADR 0032/0058), and let it be promoted back to voter once caught up.",
-            );
+            if config.contains(&self.id) {
+                self.cluster_check_refused = true;
+                tracing::error!(
+                    node = %self.id,
+                    peer = %from,
+                    peer_term = term,
+                    peer_committed_index = committed_index,
+                    "refusing to start as a voter: this node's persisted Raft state is empty \
+                     (ephemeral storage wiped?) but peer {from} already recognizes this node id \
+                     as an established voter (term or committed index > 0, and its committed \
+                     config already contains this id). Re-add this node id through the rejoin \
+                     path instead of restarting it as a static voter: remove it from the voter \
+                     set, add it back as a learner (`animusd join` / admin add-learner, ADR \
+                     0032/0058), and let it be promoted back to voter once caught up.",
+                );
+            } else {
+                tracing::debug!(
+                    node = %self.id,
+                    peer = %from,
+                    "boot-time cluster check resolved: peer {from} has real history but does \
+                     not yet recognize this node id as one of its voters — an ordinary new \
+                     voter joining an established cluster (ADR 0060), not a wiped-voter \
+                     restart. Proceeding as an unestablished fresh voter.",
+                );
+            }
             return Vec::new();
         }
         pending.remove(&from);

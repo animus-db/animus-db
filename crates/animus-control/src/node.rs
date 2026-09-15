@@ -462,11 +462,20 @@ impl<E: Env> RaftNode<E> {
         delta_ring: DeltaRing,
         orphan_sweep_after: Duration,
     ) -> Self {
+        // Issue #667: drawn once and threaded through to `drive` below
+        // (`boot_entropy`) rather than each drawing its own — see that
+        // parameter's own doc for why: an extra `env.next_u64()` call in
+        // this always-runs boot path would reshuffle every subsequent draw
+        // for the rest of the run, silently desyncing any fixed-seed test
+        // whose own timing assumptions were tuned against the old sequence
+        // (found via `chunked_snapshot_receiver_stop_restart_3`'s own
+        // seed — see `docs/lessons/` for the general lesson).
+        let boot_entropy = env.next_u64();
         let core = Arc::new(Mutex::new(RaftCore::new(
             env.node_id(),
             &all_nodes,
             env.now(),
-            env.next_u64(),
+            boot_entropy,
         )));
         let detector = Arc::new(Mutex::new(FailureDetector::new(DETECT_TIMEOUT)));
         let watch = MetadataWatch::default();
@@ -500,6 +509,7 @@ impl<E: Env> RaftNode<E> {
             delta_ring,
             wal_lock,
             persist,
+            boot_entropy,
         ));
         // The placement reconciler runs alongside the driver; it only ever
         // *proposes* on the core (no I/O of its own), and proposals are honored
@@ -934,6 +944,15 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
     delta_ring: Arc<Mutex<DeltaRing>>,
     wal_lock: Arc<AsyncMutex<()>>,
     persist: Arc<PersistProgress>,
+    // Issue #667: the SAME entropy value `start_with_orphan_sweep_after`
+    // already drew for this `RaftCore`'s own construction (never a fresh
+    // `env.next_u64()` here) — see that call site's own doc for why reusing
+    // it, rather than drawing again, matters: this function's empty-state
+    // branch below is the boot path EVERY genesis node takes, so an extra
+    // draw there reshuffles every later random draw for the rest of the
+    // run, which desynced a fixed-seed corpus test's own tuned timing with
+    // no logic bug anywhere (`chunked_snapshot_receiver_stop_restart_3`).
+    boot_entropy: u64,
 ) {
     // Recover from the WAL before serving anything.
     let bytes = env.read(WAL).await.unwrap_or_default();
@@ -953,25 +972,45 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
         // other — see that method's own doc for the full mechanism and
         // `docs/adr/0009-*.md`'s matching amendment for the design record.
         //
-        // Deliberately discard the initial `ClusterProbe` broadcast
-        // `begin_cluster_check` returns here rather than sending it
-        // synchronously before this function's first `env.recv()`: this
-        // task is every OTHER node's own sole message consumer too, and a
-        // pre-loop that blocks on `env.send` to every peer before ever
-        // reading its own inbox risks exactly the mutual stall a real
-        // multi-node genesis (all peers doing the same thing at once) can
-        // hit under real scheduling — confirmed by a real-thread `ProdEnv`
-        // repro (`tests/prod_liveness.rs`'s `large_metadata_catch_up_stays_
-        // live`, which intermittently hung outright with an eager send
-        // here). `begin_cluster_check` already re-arms `election_deadline`,
-        // so the main loop below sends the real first probe round itself,
-        // from inside its normal `select` — sends and receives properly
-        // interleaved, never one blocking the other — the moment that timer
-        // fires (`start_pre_vote`'s own early-return arm resends the probe
-        // for as long as `cluster_check_pending` stays `Some`).
-        core.lock()
+        // Send the initial `ClusterProbe` broadcast `begin_cluster_check`
+        // returns from a **separate spawned task**, never inline in this
+        // function before its first `env.recv()`: this task is every OTHER
+        // node's own sole message consumer too, and a pre-loop that blocks
+        // on `env.send` to every peer before ever reading its own inbox
+        // risks a mutual stall a real multi-node genesis (all peers doing
+        // the same thing at once) can hit under real scheduling. Spawning a
+        // sibling task for the send sidesteps that categorically — this
+        // task reaches its own `recv()` immediately regardless of how long
+        // the sends take — while still getting the probe out at boot
+        // instead of waiting a full election timeout for `start_pre_vote`'s
+        // own resend arm to fire it (issue #667 rung 2: that extra
+        // election-timeout delay is what let an ADR 0060 growth join's own
+        // `change_membership` — proposed by a *different* node, often
+        // materially faster than one election timeout under `SimEnv`'s
+        // near-zero latency — commit and have this node's id already
+        // appear in a peer's committed config *before* this node's own
+        // first probe ever reached it, which `handle_cluster_probe_resp`'s
+        // config-membership check then misread as "already an established
+        // voter" and refused permanently; sending immediately at boot,
+        // rather than after a full election timeout, closes that window
+        // for any real deployment, where dialing a growth-joiner's
+        // `change_membership` is always issued well after its own process
+        // is already up. `begin_cluster_check` already re-arms
+        // `election_deadline`, so `start_pre_vote`'s own resend arm still
+        // covers a first probe round lost to a transient send failure).
+        let initial_probe = core
+            .lock()
             .expect("raft core poisoned")
-            .begin_cluster_check(env.now(), env.next_u64());
+            .begin_cluster_check(env.now(), boot_entropy);
+        if !initial_probe.is_empty() {
+            let probe_env = env.clone();
+            env.spawn_task(async move {
+                for (to, msg) in initial_probe {
+                    let bytes = serde_json::to_vec(&msg).expect("raft message serializes");
+                    probe_env.send(to, bytes).await;
+                }
+            });
+        }
     }
     // Spawn the apply task now — after recovery has installed the recovered
     // core, so its first `drain_apply` sees the real post-recovery frontier,
