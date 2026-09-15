@@ -880,3 +880,283 @@ async fn unknown_and_revoked_keys_produce_the_identical_error_body() {
     .await
     .expect("test timed out");
 }
+
+/// (h) issue #842: `ExecuteStatement` must authorize before revealing
+/// whether the named table exists — a table-scoped, denied caller gets the
+/// byte-identical `AccessDeniedException` (`__type` and message) whether
+/// the table has never been created or genuinely exists, never a
+/// distinguishable `ResourceNotFoundException` a caller could use to
+/// enumerate the cluster's tables beyond its own policy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn execute_statement_denied_table_gives_identical_error_whether_or_not_it_exists() {
+    timeout(Duration::from_secs(30), async {
+        let dir = support::panic_safe_tempdir();
+        let (node, _config) = bring_up(dir.path()).await;
+        let dynamo_addr = node.dynamo_addr();
+        let admin_addr = node.admin_addr();
+
+        // Scoped to some other table entirely — denied for the table this
+        // test names either way.
+        let put_body = serde_json::json!({
+            "id": "AKID842STMT",
+            "secret": "s0",
+            "policy": {
+                "tables": {"kind": "names", "names": ["unrelated_842"]},
+                "ops": ["read", "write"],
+            },
+            "enabled": true,
+        })
+        .to_string();
+        let (status, resp) = admin(admin_addr, "POST", "/admin/credentials", Some(&put_body)).await;
+        assert_eq!(status, 200, "PutCredential: {resp}");
+
+        let statement_body =
+            serde_json::json!({"Statement": "SELECT * FROM issue_842_stmt"}).to_string();
+
+        // (1) The table does not exist yet.
+        let (status_absent, body_absent) = call(
+            dynamo_addr,
+            "DynamoDB_20120810.ExecuteStatement",
+            &statement_body,
+            "AKID842STMT",
+            "s0",
+        )
+        .await;
+        assert_eq!(
+            status_absent, 400,
+            "denied against an unknown table: {body_absent}"
+        );
+        let denied_absent = json(&body_absent);
+        assert_eq!(
+            denied_absent["__type"], "com.amazonaws.dynamodb.v20120810#AccessDeniedException",
+            "body: {body_absent}"
+        );
+
+        // (2) Now the table genuinely exists.
+        let (status, body) = call(
+            dynamo_addr,
+            "DynamoDB_20120810.CreateTable",
+            &create_table_body("issue_842_stmt"),
+            BOOT_ACCESS_KEY,
+            BOOT_SECRET,
+        )
+        .await;
+        assert_eq!(status, 200, "seed CreateTable issue_842_stmt: {body}");
+
+        let (status_present, body_present) = call(
+            dynamo_addr,
+            "DynamoDB_20120810.ExecuteStatement",
+            &statement_body,
+            "AKID842STMT",
+            "s0",
+        )
+        .await;
+        assert_eq!(
+            status_present, 400,
+            "denied even once the table exists: {body_present}"
+        );
+        let denied_present = json(&body_present);
+
+        assert_eq!(
+            denied_absent["__type"], denied_present["__type"],
+            "the __type must not depend on whether the table exists"
+        );
+        assert_eq!(
+            denied_absent["message"], denied_present["message"],
+            "the message must not depend on whether the table exists — a table-scoped \
+             credential must not be able to enumerate table existence via this difference \
+             (issue #842)"
+        );
+
+        node.shutdown_graceful().await;
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// (i) issue #842: `ExecuteTransaction` must authorize before revealing
+/// whether any of its statements' tables exist — the identical
+/// existing-vs-nonexistent-table proof as (h), one write statement.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn execute_transaction_denied_table_gives_identical_error_whether_or_not_it_exists() {
+    timeout(Duration::from_secs(30), async {
+        let dir = support::panic_safe_tempdir();
+        let (node, _config) = bring_up(dir.path()).await;
+        let dynamo_addr = node.dynamo_addr();
+        let admin_addr = node.admin_addr();
+
+        let put_body = serde_json::json!({
+            "id": "AKID842XACT",
+            "secret": "s0",
+            "policy": {
+                "tables": {"kind": "names", "names": ["unrelated_842_xact"]},
+                "ops": ["read", "write"],
+            },
+            "enabled": true,
+        })
+        .to_string();
+        let (status, resp) = admin(admin_addr, "POST", "/admin/credentials", Some(&put_body)).await;
+        assert_eq!(status, 200, "PutCredential: {resp}");
+
+        let txn_body = serde_json::json!({
+            "TransactStatements": [
+                {"Statement": "INSERT INTO issue_842_xact VALUE {'id': ?}",
+                 "Parameters": [{"S": "x"}]},
+            ]
+        })
+        .to_string();
+
+        // (1) The table does not exist yet.
+        let (status_absent, body_absent) = call(
+            dynamo_addr,
+            "DynamoDB_20120810.ExecuteTransaction",
+            &txn_body,
+            "AKID842XACT",
+            "s0",
+        )
+        .await;
+        assert_eq!(
+            status_absent, 400,
+            "denied against an unknown table: {body_absent}"
+        );
+        let denied_absent = json(&body_absent);
+        assert_eq!(
+            denied_absent["__type"], "com.amazonaws.dynamodb.v20120810#AccessDeniedException",
+            "body: {body_absent}"
+        );
+
+        // (2) Now the table genuinely exists.
+        let (status, body) = call(
+            dynamo_addr,
+            "DynamoDB_20120810.CreateTable",
+            &create_table_body("issue_842_xact"),
+            BOOT_ACCESS_KEY,
+            BOOT_SECRET,
+        )
+        .await;
+        assert_eq!(status, 200, "seed CreateTable issue_842_xact: {body}");
+
+        let (status_present, body_present) = call(
+            dynamo_addr,
+            "DynamoDB_20120810.ExecuteTransaction",
+            &txn_body,
+            "AKID842XACT",
+            "s0",
+        )
+        .await;
+        assert_eq!(
+            status_present, 400,
+            "denied even once the table exists: {body_present}"
+        );
+        let denied_present = json(&body_present);
+
+        assert_eq!(
+            denied_absent["__type"], denied_present["__type"],
+            "the __type must not depend on whether the table exists"
+        );
+        assert_eq!(
+            denied_absent["message"], denied_present["message"],
+            "the message must not depend on whether the table exists (issue #842)"
+        );
+
+        node.shutdown_graceful().await;
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// (j) issue #842: `BatchExecuteStatement` must authorize each statement
+/// before revealing whether its own table exists — per-statement, mirroring
+/// (h)/(i) but checked against the statement's own `Error` entry rather
+/// than a top-level error (ADR 0071's own "no cross-statement atomicity"
+/// contract extends to authorization: a denial never fails the whole
+/// batch).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn batch_execute_statement_denied_table_gives_identical_error_whether_or_not_it_exists() {
+    timeout(Duration::from_secs(30), async {
+        let dir = support::panic_safe_tempdir();
+        let (node, _config) = bring_up(dir.path()).await;
+        let dynamo_addr = node.dynamo_addr();
+        let admin_addr = node.admin_addr();
+
+        let put_body = serde_json::json!({
+            "id": "AKID842BATCH",
+            "secret": "s0",
+            "policy": {
+                "tables": {"kind": "names", "names": ["unrelated_842_batch"]},
+                "ops": ["read", "write"],
+            },
+            "enabled": true,
+        })
+        .to_string();
+        let (status, resp) = admin(admin_addr, "POST", "/admin/credentials", Some(&put_body)).await;
+        assert_eq!(status, 200, "PutCredential: {resp}");
+
+        let batch_body = serde_json::json!({
+            "Statements": [
+                {"Statement": "SELECT * FROM issue_842_batch"},
+            ]
+        })
+        .to_string();
+
+        // (1) The table does not exist yet.
+        let (status, body_absent) = call(
+            dynamo_addr,
+            "DynamoDB_20120810.BatchExecuteStatement",
+            &batch_body,
+            "AKID842BATCH",
+            "s0",
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "a per-statement AccessDenied must not fail the whole call: {body_absent}"
+        );
+        let v_absent = json(&body_absent);
+        let entry_absent = &v_absent["Responses"].as_array().expect("Responses array")[0];
+        assert_eq!(
+            entry_absent["Error"]["Code"], "AccessDenied",
+            "{entry_absent:?}"
+        );
+
+        // (2) Now the table genuinely exists.
+        let (status, body) = call(
+            dynamo_addr,
+            "DynamoDB_20120810.CreateTable",
+            &create_table_body("issue_842_batch"),
+            BOOT_ACCESS_KEY,
+            BOOT_SECRET,
+        )
+        .await;
+        assert_eq!(status, 200, "seed CreateTable issue_842_batch: {body}");
+
+        let (status, body_present) = call(
+            dynamo_addr,
+            "DynamoDB_20120810.BatchExecuteStatement",
+            &batch_body,
+            "AKID842BATCH",
+            "s0",
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "a per-statement AccessDenied must not fail the whole call: {body_present}"
+        );
+        let v_present = json(&body_present);
+        let entry_present = &v_present["Responses"].as_array().expect("Responses array")[0];
+        assert_eq!(
+            entry_present["Error"]["Code"], "AccessDenied",
+            "{entry_present:?}"
+        );
+
+        assert_eq!(
+            entry_absent["Error"]["Message"], entry_present["Error"]["Message"],
+            "the per-statement error message must not depend on whether the table exists \
+             (issue #842)"
+        );
+
+        node.shutdown_graceful().await;
+    })
+    .await
+    .expect("test timed out");
+}

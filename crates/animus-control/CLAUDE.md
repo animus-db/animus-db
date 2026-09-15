@@ -339,6 +339,70 @@ per-tablet CP data plane (`animus-cp-data`).
 
 ## Key invariants
 
+- **Boot-time genesis-vs-wiped-restart check (ADR 0009's 2026-09-15
+  amendment, issue #667 — P0 Raft safety).** A `RaftCore` whose persisted
+  state replays empty (`node.rs`'s `drive`, the branch that keeps the
+  fresh `RaftCore::new` rather than calling `RaftCore::recovered`) never
+  grants a real vote or campaigns (`RaftCore::cluster_check_pending`/
+  `refused_as_voter`) until `begin_cluster_check`'s peer probe round
+  (`RaftMsg::ClusterProbe`/`ClusterProbeResp`) resolves whether this is a
+  genuine first-ever bootstrap/ADR 0060 growth join (safe — the config a
+  responding peer already has committed does not yet name this node id as
+  a voter) or an already-established voter's disk wiped clean (unsafe —
+  the peer's config already does; refuse permanently, re-admit only
+  through the learner/rejoin path, ADR 0032/0058). Gates only the real
+  vote grant in `handle_request_vote`, deliberately not `handle_pre_vote`
+  (touches no persisted state, so it's never part of the hazard — see the
+  ADR amendment for why gating it too was tried and reverted). The
+  initial probe is sent from a separate spawned task at boot (never
+  inline before the first `env.recv()`, which risks a multi-node-genesis
+  mutual stall) and reuses the SAME entropy `RaftCore::new`'s own
+  construction already drew, never a fresh draw — seemingly-unrelated
+  fixed-seed corpus cells can desync from either an extra draw or the
+  extra task/wire-traffic alone; see `docs/lessons/testing/2026-09-15-
+  boot-path-entropy-desyncs-fixed-seeds.md`. **CP data plane
+  (`animus-cp-data`) has the identical hazard, unfixed** — tracked as
+  issue #900, since a tablet's peer set is dynamic and reconstituted
+  constantly (unlike the control plane's one-time genesis config), a
+  materially different liveness tradeoff needing its own design decision.
+  **Two further real regressions in this same mechanism, found and fixed
+  the same day (ADR 0009's second 2026-09-15 amendment)**: (1)
+  `RaftCore::next_deadline()` didn't account for the cluster-check's own
+  independent resend deadline, so `node.rs`'s driver could oversleep past
+  a due resend for as long as `election_deadline` kept getting reset by
+  ordinary heartbeat traffic — fixed by including
+  `cluster_check_resend_deadline` in `next_deadline()`'s own `min(..)`.
+  (2) `config.contains(&self.id)` alone can never distinguish an ordinary
+  genesis race (every founder's config trivially contains every other
+  founder from birth) from a genuinely established restart — fixed by a
+  new `RaftMsg::ClusterProbeResp` field, `ever_heard_from_prober`, backed
+  by a per-core `heard_from: BTreeSet<NodeId>` marked ONLY at the three
+  sites representing a genuinely durable, forgettable vote (a candidate's
+  own self-vote, a vote WE granted it, or proof it won a real election) —
+  see `RaftMsg::ClusterProbeResp`'s and `RaftCore::
+  handle_cluster_probe_resp`'s own doc comments for the full decision
+  table, and the two matching `docs/lessons/code-patterns/2026-09-15-*`
+  entries for the incidents (including a real bug in the fix's own first
+  draft: a rejected vote is not participation, and counting it
+  reintroduced the exact false refusal the fix exists to prevent).
+  **Third amendment, same day**: `ever_heard_from_prober` was originally
+  wired as decisive on the FIRST peer to answer `false`, on the (false)
+  assumption that an established voter's peers all keep answering `true`
+  forever. `heard_from` is only marked at message sites that route through
+  a candidate/leader, so two ordinary followers that never themselves
+  campaign never learn of each other — any 3-voter cluster with one stable
+  leader is guaranteed to have a follower-follower pair that legitimately,
+  permanently answers `false` for each other. A real, deterministically
+  reproducing (not intermittent) `ProdEnv` failure in `prod_liveness.rs`'s
+  `wiped_voter_refuses_and_the_rest_of_the_cluster_keeps_serving` caught
+  this. Fixed by folding the signal into the SAME wait-for-every-peer
+  aggregation the established verdict already uses (decide only once
+  every peer has answered, refuse if *any* showed `true`, resolve fresh
+  only if *none* did) instead of letting a single `false` short-circuit
+  the wait — see `docs/lessons/testing/2026-09-15-a-per-peer-any-false-
+  signal-is-not-safe-when-the.md` and the new
+  `tests/wiped_voter_follower_peer_evidence.rs`.
+
 - **Config-in-log + current-term-commit gate (ADR 0017 C).** `LogEntry` may
   carry a `config: Option<voters>`; `RaftCore` keeps `peers`/`cluster_size` in
   sync with the latest log config (config rides snapshots + `InstallSnapshot`).
@@ -597,6 +661,21 @@ per-tablet CP data plane (`animus-cp-data`).
   progress row; `RecordBackupTabletComplete` is idempotent on an identical
   repeat but rejects a genuinely differing one outright (no repair-update
   path yet, unlike `SealStreamShard`'s replicas-only allowance).
+  **`BackupTabletProgress`/`RecordBackupTabletComplete` also carry
+  `chunk_count: u64` (issue #856, 2026-09-14)** — the capture driver's own
+  `CaptureCursor::next_chunk` at the moment its capture completed, so a
+  reporting tablet's valid chunk-object indices are exactly
+  `0..chunk_count`. This is restore's own recorded end-of-sequence bound
+  (`animusd::backup_restore::restore_tick`, threaded through the manifest
+  object via `BackupManifestTabletEntry::progress`): before this field
+  existed, restore's chunk sweep used "no object at this index" as its
+  sole end-of-sequence signal, which a `DeleteBackup` racing an in-flight
+  restore (with the janitor reclaiming chunks out of order) could turn
+  into a silently truncated table — see `docs/engineering-lessons.md`'s
+  matching entry and `docs/adr/0059-backup-restore.md`'s 2026-09-14
+  amendment for the full account. `#[serde(default)]` on both the field
+  and its `backup_progress_codec::Entry` wire counterpart, per this repo's
+  no-migration convention.
   `BackupStatus` already carries an `Expired` variant for the (not yet
   built) two-phase retention janitor's mark phase, so that later PR doesn't
   reshape the enum. **`DropTableSchema`/`DropTableTablets` deliberately
@@ -645,7 +724,24 @@ per-tablet CP data plane (`animus-cp-data`).
   `Expired`, rejects `Creating` as an apply-time seatbelt behind the wire
   edge's own `BackupInUseException` check), proposed by the `DeleteBackup`
   wire operation (`animusd::dynamo::delete_backup`) — never by the janitor
-  itself. The pre-existing `MetaCommand::DeleteBackup` (PR①'s own row-plus-
+  itself. **Issue #856's second half (2026-09-14)**: the apply arm also
+  rejects while `Metadata::backup_referenced_by_a_live_restore(backup_id)`
+  answers true — any restore still `Seeding` from this backup — the
+  authoritative seatbelt behind `delete_backup`'s own client-side
+  `BackupInUseException` check (a `metadata_fresh` read, so it can race a
+  restore that starts seeding in the narrow window between that read and
+  this propose; this apply-time check is what actually closes it). A
+  `Done`/`Failed` restore never blocks a delete. `MetaCommand::BeginRestore`
+  gained the mirror-direction seatbelt in the same change: it rejects when
+  its own `backup_id` names a row that is present but already
+  `Expired`/`Failed` (the shape a `MarkBackupDeleted` that commits between
+  the wire edge's own freshness read and this propose would produce) — a
+  `backup_id` naming no row at all (already fully reclaimed) is
+  deliberately left unrejected, the far narrower residual `RESTORE_STUCK_
+  TIMEOUT`'s own eventual `FailRestore` self-heals. See `docs/adr/0059-
+  backup-restore.md`'s 2026-09-14 amendment for the full account and both
+  halves' own unit tests (`mark_backup_deleted_refuses_while_a_restore_is_
+  seeding`/`begin_restore_rejects_an_expired_or_failed_backup`, `meta.rs`). The pre-existing `MetaCommand::DeleteBackup` (PR①'s own row-plus-
   progress removal) is unchanged and becomes the janitor's own
   **finalizing** command instead, proposed only once every one of a marked
   backup's objects has been reclaimed (`animusd::backup_janitor`); no new
@@ -1669,7 +1765,14 @@ must also gate on `cargo test -p animus-cp-data` run in FULL — never
 state machine, and `--lib` only runs `lib.rs`'s own in-crate `#[cfg(test)]`
 module, silently skipping every one of that crate's `tests/*.rs` integration
 binaries (`hlc_differential_skew.rs` among them — the one that caught this
-gap after `--lib` alone reported green). One binary per behavior; the file names describe them
+gap after `--lib` alone reported green). **A `RaftCore`/boot-path change also
+gates on `cargo test -p animus-control --features prod-heavy` too**: this
+crate's `prod_liveness.rs` and `control_membership_prod.rs` are `[[test]]`
+targets with `required-features = ["prod-heavy"]`, so a plain `cargo test -p
+animus-control` silently skips both real-thread `ProdEnv` liveness binaries
+(issue #667's third amendment found this the hard way — a full plain run
+reported green while CI's `--all-features` run caught a real, deterministic
+failure the skipped binary alone exercised). One binary per behavior; the file names describe them
 (`ls crates/animus-control/tests/`) — covering Raft core mechanics
 (election/replication/leader-kill, the DRIVER_APPLIED apply gate, pre-vote,
 leadership transfer, snapshot/InstallSnapshot), the ADR 0038 mirror/delta

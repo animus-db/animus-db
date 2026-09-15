@@ -1,0 +1,3 @@
+# Metadata-level dedup of a proposal only picks one *winner* — it does not stop other legitimate callers from invoking a side-effecting state-machine command, which must therefore be idempotent at APPLY time, not just deduped at the propose layer.
+
+**Metadata-level dedup of a proposal only picks one *winner* — it does not stop other legitimate callers from invoking a side-effecting state-machine command, which must therefore be idempotent at APPLY time, not just deduped at the propose layer.** (Found in the pre-ADR-0028 two-phase split; superseded by ADR 0028's single-command split. Archived in `docs/engineering-lessons-archive.md`.)
