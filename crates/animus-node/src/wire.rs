@@ -288,11 +288,19 @@ pub enum ClientRequest {
     /// the `Forwarded` arm. Answered with `ClientResponse::Pairs` (the
     /// filtered/sorted/limited `(source_key, change_record bytes)` list —
     /// the same shape `Scan`/`KindScan` already use for a raw key/value
-    /// list; the packed HLC each key's own trailing 8 bytes encode is
-    /// recovered by the caller, not carried out-of-band).
+    /// list; the `(packed_hlc, ordinal)` pair each key's own trailing 12
+    /// bytes encode is recovered by the caller, not carried out-of-band).
+    ///
+    /// `from_position_hlc`/`from_position_ordinal` (issue #852) are this
+    /// cursor's own `(packed_hlc, ordinal)` pair, compared as one unit
+    /// (`ordinal` only breaks a tie on an identical `from_position_hlc`) —
+    /// a bare HLC used to let a page boundary land inside a tied group (a
+    /// multi-key `TransactWriteItems` commit) and silently, permanently
+    /// drop the rest of it.
     StreamHotRead {
         tablet: u64,
-        from_position: u64,
+        from_position_hlc: u64,
+        from_position_ordinal: u32,
         limit: usize,
     },
     /// **Internal backfill-cursor-cleanup RPC — never sent bare, only

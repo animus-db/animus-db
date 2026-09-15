@@ -263,15 +263,38 @@ fn current_open_epoch(meta: &Metadata, tablet: TabletId) -> u64 {
         .map_or(0, |((_, e), _)| e + 1)
 }
 
-/// Recover a change-log record's own packed HLC from its key's trailing 8
-/// bytes (`token || escape(pk) || hlc::pack(ts)`, ADR 0041 §4/ADR 0042 §5 —
-/// `animus-dynamo`'s `index::change_record_key`) — the same suffix
+/// Recover a change-log record's own `(packed_hlc, ordinal)` pair (issue
+/// #852) from its key's trailing 12 bytes (`token || escape(pk) ||
+/// hlc::pack(ts) || ordinal`, ADR 0041 §4/ADR 0042 §5 —
+/// `materialize_derived` in `animus-cp-data::lib`) — the same suffix
 /// `ClientResponse::Pairs` (the `StreamHotRead` reply shape) carries, since
 /// that response is deliberately the plain `(key, value)` list every other
-/// kind-scan reply already is, with no separate out-of-band HLC field.
-fn record_hlc_suffix(key: &[u8]) -> Option<u64> {
-    let n = key.len().checked_sub(8)?;
-    Some(u64::from_be_bytes(key[n..].try_into().ok()?))
+/// kind-scan reply already is, with no separate out-of-band field.
+fn record_seqno_suffix(key: &[u8]) -> Option<(u64, u32)> {
+    let n = key.len().checked_sub(12)?;
+    let hlc = u64::from_be_bytes(key[n..n + 8].try_into().ok()?);
+    let ordinal = u32::from_be_bytes(key[n + 8..].try_into().ok()?);
+    Some((hlc, ordinal))
+}
+
+/// The `SeqNo` predecessor: the greatest `(hlc, ordinal)` pair strictly less
+/// than `pos` — turns an inclusive "AT" position into this crate's own
+/// exclusive-lower-bound cursor convention (`seqno > position`). Decrements
+/// `ordinal` within the same `hlc` where possible (the general, correct
+/// case: `AT` on the Nth record of a tie must exclude exactly the first N-1
+/// tied records, never the whole tie — see `animus_cp_data::segment`'s own
+/// module doc); only steps back a whole `hlc` (at `ordinal = u32::MAX`, a
+/// value no real record ever carries) when `ordinal` is already `0` —
+/// which is exactly what makes `AT` on the FIRST record of a tie return
+/// the whole tie (issue #852's third requirement): its own predecessor's
+/// `hlc` no longer matches any record still in this tie, so the `hlc`
+/// field alone already decides every comparison against it.
+fn predecessor((hlc, ordinal): (u64, u32)) -> (u64, u32) {
+    if ordinal > 0 {
+        (hlc, ordinal - 1)
+    } else {
+        (hlc.saturating_sub(1), u32::MAX)
+    }
 }
 
 // --- ListStreams -------------------------------------------------------
@@ -462,12 +485,15 @@ async fn get_shard_iterator<E: Env, R: RelayClient>(
     let meta = ctx.effective_metadata();
     let enabled = resolve_label(&meta, &table, &label)?;
 
-    let position = if let Some(row) = meta.stream_shards.get(&(tablet, epoch)) {
+    let position: (u64, u32) = if let Some(row) = meta.stream_shards.get(&(tablet, epoch)) {
         // SEALED shard: any node answers, purely from the catalog row.
         match iterator_type {
-            ShardIteratorType::TrimHorizon => row.hlc_range.0,
-            ShardIteratorType::Latest => row.hlc_range.1, // the immediate-null path
-            ShardIteratorType::AtSequenceNumber => parse_seq(sequence_number)?.saturating_sub(1),
+            ShardIteratorType::TrimHorizon => (row.hlc_range.0, 0),
+            // The immediate-null path: `u32::MAX` guarantees this exceeds
+            // every real record's own ordinal, even one tied on
+            // `row.hlc_range.1` itself (the shard's own inclusive end).
+            ShardIteratorType::Latest => (row.hlc_range.1, u32::MAX),
+            ShardIteratorType::AtSequenceNumber => predecessor(parse_seq(sequence_number)?),
             ShardIteratorType::AfterSequenceNumber => parse_seq(sequence_number)?,
         }
     } else {
@@ -479,22 +505,25 @@ async fn get_shard_iterator<E: Env, R: RelayClient>(
             return Err(trimmed_data_access(&format!("shard `{shard_id}`")));
         }
         match iterator_type {
-            ShardIteratorType::TrimHorizon => meta.stream_shard_watermark(tablet).unwrap_or(0),
-            ShardIteratorType::AtSequenceNumber => parse_seq(sequence_number)?.saturating_sub(1),
+            ShardIteratorType::TrimHorizon => {
+                (meta.stream_shard_watermark(tablet).unwrap_or(0), 0)
+            }
+            ShardIteratorType::AtSequenceNumber => predecessor(parse_seq(sequence_number)?),
             ShardIteratorType::AfterSequenceNumber => parse_seq(sequence_number)?,
             ShardIteratorType::Latest => {
                 // The tablet's own leader: one hot read from the effective
-                // watermark, taking the max HLC actually present — "current
-                // max + a not-yet-existent tick" per ADR 0042 §5, expressed
-                // via this crate's exclusive-lower-bound convention as
-                // "position = current max" (nothing new yet is > that).
-                let watermark = meta.stream_shard_watermark(tablet).unwrap_or(0);
+                // watermark, taking the max `(hlc, ordinal)` pair actually
+                // present — "current max + a not-yet-existent tick" per ADR
+                // 0042 §5, expressed via this crate's exclusive-lower-bound
+                // convention as "position = current max" (nothing new yet
+                // is > that).
+                let watermark = (meta.stream_shard_watermark(tablet).unwrap_or(0), 0);
                 let hot = ctx
                     .read_stream_hot_records(tablet, watermark, usize::MAX)
                     .await
                     .map_err(|e| internal(&e))?;
                 hot.last()
-                    .and_then(|(key, _)| record_hlc_suffix(key))
+                    .and_then(|(key, _)| record_seqno_suffix(key))
                     .unwrap_or(watermark)
             }
         }
@@ -503,7 +532,7 @@ async fn get_shard_iterator<E: Env, R: RelayClient>(
     Ok(streams_wire::get_shard_iterator_response(&token))
 }
 
-fn parse_seq(sequence_number: Option<&str>) -> Result<u64, WireError> {
+fn parse_seq(sequence_number: Option<&str>) -> Result<(u64, u32), WireError> {
     let s = sequence_number.ok_or_else(|| WireError::validation("missing `SequenceNumber`"))?;
     streams_wire::parse_sequence_number(s)
 }
@@ -574,7 +603,7 @@ async fn get_records_sealed<E: Env, R: RelayClient>(
     meta: &Metadata,
     shard_id: &str,
     row: &StreamShardRow,
-    position: u64,
+    position: (u64, u32),
     limit: usize,
 ) -> Result<String, WireError> {
     // Ledger-named-object amendment (ADR 0042 §10/ADR 0043 §A3): resolve
@@ -592,18 +621,24 @@ async fn get_records_sealed<E: Env, R: RelayClient>(
     };
     let (_, records) = segment::decode_and_slice(&bytes, row.hlc_range)
         .map_err(|e| internal(&format!("corrupt segment {seg_id:?}: {e}")))?;
-    let page: Vec<_> = records
+    // Issue #852: filter/order by the full `(packed_hlc, ordinal)` pair, not
+    // `packed_hlc` alone — several records here can be tied on the identical
+    // HLC (a multi-key `TransactWriteItems` commit), and comparing `>
+    // position` on the pair is what keeps a `Limit` boundary landing inside
+    // that tie from silently dropping the rest of it.
+    let filtered: Vec<_> = records
         .into_iter()
-        .filter(|r| r.packed_hlc > position)
-        .take(limit)
+        .filter(|r| (r.packed_hlc, r.ordinal) > position)
         .collect();
+    let page: Vec<_> = filtered.iter().take(limit).cloned().collect();
 
-    let exhausted = match page.last() {
-        Some(last) => last.packed_hlc >= row.hlc_range.1,
-        None => position >= row.hlc_range.1,
-    };
+    // Exhausted iff this call's own filtered set fit entirely in one page —
+    // never a comparison against `row.hlc_range.1` alone, which cannot tell
+    // "delivered every tied record at this HLC" from "delivered only some
+    // of them" (issue #852's exact bug).
+    let exhausted = filtered.len() <= limit;
     let next_iterator = (!exhausted).then(|| {
-        let next_position = page.last().map_or(position, |r| r.packed_hlc);
+        let next_position = page.last().map_or(position, |r| (r.packed_hlc, r.ordinal));
         streams_wire::encode_iterator(&row.label, shard_id, next_position)
     });
 
@@ -618,6 +653,7 @@ async fn get_records_sealed<E: Env, R: RelayClient>(
             Some(streams_wire::stream_record_json(
                 shard_id,
                 r.packed_hlc,
+                r.ordinal,
                 &record,
                 row.view_type,
                 &dyn_schema.partition_key,
@@ -644,7 +680,7 @@ async fn get_records_open<E: Env, R: RelayClient>(
     label: &str,
     tablet: TabletId,
     shard_id: &str,
-    position: u64,
+    position: (u64, u32),
     limit: usize,
 ) -> Result<String, WireError> {
     let pairs = ctx
@@ -653,7 +689,7 @@ async fn get_records_open<E: Env, R: RelayClient>(
         .map_err(|e| internal(&e))?;
     let next_position = pairs
         .last()
-        .and_then(|(key, _)| record_hlc_suffix(key))
+        .and_then(|(key, _)| record_seqno_suffix(key))
         .unwrap_or(position);
     let next_iterator = streams_wire::encode_iterator(label, shard_id, next_position);
 
@@ -664,7 +700,7 @@ async fn get_records_open<E: Env, R: RelayClient>(
     let json_records: Vec<_> = pairs
         .iter()
         .filter_map(|(key, value)| {
-            let packed = record_hlc_suffix(key)?;
+            let (packed, ordinal) = record_seqno_suffix(key)?;
             let record = ChangeRecord::decode(value)?;
             if consumer_hidden(&record) {
                 return None;
@@ -672,6 +708,7 @@ async fn get_records_open<E: Env, R: RelayClient>(
             Some(streams_wire::stream_record_json(
                 shard_id,
                 packed,
+                ordinal,
                 &record,
                 view_type,
                 &dyn_schema.partition_key,
@@ -808,14 +845,26 @@ mod tests {
     }
 
     #[test]
-    fn record_hlc_suffix_recovers_the_trailing_big_endian_hlc() {
+    fn record_seqno_suffix_recovers_the_trailing_hlc_and_ordinal() {
         let mut key = vec![1, 2, 3];
         key.extend_from_slice(&42u64.to_be_bytes());
-        assert_eq!(record_hlc_suffix(&key), Some(42));
+        key.extend_from_slice(&7u32.to_be_bytes());
+        assert_eq!(record_seqno_suffix(&key), Some((42, 7)));
         assert_eq!(
-            record_hlc_suffix(&[1, 2, 3]),
+            record_seqno_suffix(&[1, 2, 3]),
             None,
-            "too short to hold an HLC suffix"
+            "too short to hold a (hlc, ordinal) suffix"
         );
+    }
+
+    #[test]
+    fn predecessor_decrements_ordinal_within_the_same_hlc() {
+        assert_eq!(predecessor((100, 3)), (100, 2));
+        // ordinal 0: steps back a whole hlc, at ordinal u32::MAX — this is
+        // what makes `AT` on the FIRST record of a tie return the whole
+        // tie (issue #852's third requirement): the predecessor's `hlc` no
+        // longer matches any record still in the tie.
+        assert_eq!(predecessor((100, 0)), (99, u32::MAX));
+        assert_eq!(predecessor((0, 0)), (0, u32::MAX));
     }
 }
