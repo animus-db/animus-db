@@ -33,10 +33,10 @@ use crate::cluster_api::{ClusterApi, RealClusterApi};
 use crate::crd::{
     AnimusCluster, AnimusClusterStatus, CONDITION_CONTROL_NODES_GROWING,
     CONDITION_CONTROL_NODES_SHRINK_REJECTED, CONDITION_DRAIN_FAILED,
-    CONDITION_ENCRYPTION_KEY_SECRET_INVALID, CONDITION_NODES_SPEC_INVALID,
-    CONDITION_S3_SPEC_INVALID, CONDITION_SCALE_BELOW_CONTROL_NODES_REFUSED,
-    CONDITION_STORE_SPEC_INVALID, CONDITION_TLS_SPEC_INVALID, ClusterCondition, ClusterPhase,
-    ConditionStatus,
+    CONDITION_ENCRYPTION_KEY_SECRET_INVALID, CONDITION_EPHEMERAL_VOTER_STORAGE_HAZARD,
+    CONDITION_NODES_SPEC_INVALID, CONDITION_S3_SPEC_INVALID,
+    CONDITION_SCALE_BELOW_CONTROL_NODES_REFUSED, CONDITION_STORE_SPEC_INVALID,
+    CONDITION_TLS_SPEC_INVALID, ClusterCondition, ClusterPhase, ConditionStatus,
 };
 use crate::desired;
 use crate::validate;
@@ -930,6 +930,35 @@ async fn reconcile<C: ClusterApi, A: AdminOps>(
         None => status
             .conditions
             .retain(|c| c.type_ != CONDITION_NODES_SPEC_INVALID),
+    }
+
+    // Issue #864: surface, every reconcile, that `storage.ephemeral: true`
+    // is a standing Raft safety hazard for this cluster's control voters —
+    // see `CONDITION_EPHEMERAL_VOTER_STORAGE_HAZARD`'s own doc for the full
+    // mechanism. Purely informational (never blocks/strips anything,
+    // unlike the validation checks below) — an operator running a genuinely
+    // throwaway ephemeral cluster that never touches `spec.controlNodes`/
+    // `spec.tls`/`spec.s3`/etc. again may accept the risk deliberately;
+    // this makes that risk visible in `kubectl get animuscluster -o yaml`
+    // instead of only in an ADR nobody reads before hitting it.
+    if cluster.spec.storage.is_ephemeral() {
+        set_condition(
+            &mut status,
+            CONDITION_EPHEMERAL_VOTER_STORAGE_HAZARD,
+            "storage.ephemeral: true wipes a control voter's own Raft WAL on every pod \
+             restart (a StatefulSet rolling update deletes and recreates the Pod, which \
+             discards an emptyDir); a config-affecting spec change (spec.controlNodes, \
+             spec.tls, spec.s3, spec.encryptionKeySecretName, ...) rolls every pod's own \
+             container, and issue #667's boot-time check then permanently refuses each \
+             wiped EXISTING voter as unsafe to re-admit — refuse enough of them and the \
+             control group loses quorum for good. Use durable (PersistentVolumeClaim) \
+             storage for any cluster whose controlNodes may ever change."
+                .to_string(),
+        );
+    } else {
+        status
+            .conditions
+            .retain(|c| c.type_ != CONDITION_EPHEMERAL_VOTER_STORAGE_HAZARD);
     }
 
     // Validate `spec.tls` (ADR 0064 commit 3). **The validating webhook
@@ -2574,6 +2603,92 @@ mod tests {
                 .applies()
                 .iter()
                 .any(|(k, _)| *k == AppliedKind::Certificate)
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_warns_when_storage_is_ephemeral() {
+        // Issue #864: `storage.ephemeral: true` is a standing Raft safety
+        // hazard for control voters (ADR 0060's storage section) — the
+        // reconciler must surface it every time, not only on a spec edit.
+        let mut cluster = test_cluster("demo", "ns1", 3, None);
+        cluster.spec.storage.ephemeral = Some(true);
+        let ctx = make_ctx(FakeClusterApi::new(), FakeAdminClient::new());
+
+        let result = reconcile(Arc::new(cluster), Arc::clone(&ctx)).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+
+        let status = ctx.cluster_api.last_status().unwrap();
+        let hazard = status
+            .conditions
+            .iter()
+            .find(|c| c.type_ == CONDITION_EPHEMERAL_VOTER_STORAGE_HAZARD)
+            .expect("EphemeralVoterStorageHazard condition present");
+        let msg = hazard.message.as_deref().unwrap_or_default();
+        assert!(msg.contains("Raft WAL"), "{msg}");
+        assert!(msg.contains("#667"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn reconcile_never_warns_when_storage_is_durable() {
+        // The default (no `storage.ephemeral` set at all, matching
+        // `test_cluster`'s own default) must never carry the hazard
+        // condition — this is the supported, safe shape.
+        let cluster = test_cluster("demo", "ns1", 3, None);
+        let ctx = make_ctx(FakeClusterApi::new(), FakeAdminClient::new());
+
+        let result = reconcile(Arc::new(cluster), Arc::clone(&ctx)).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+
+        let status = ctx.cluster_api.last_status().unwrap();
+        assert!(
+            !status
+                .conditions
+                .iter()
+                .any(|c| c.type_ == CONDITION_EPHEMERAL_VOTER_STORAGE_HAZARD),
+            "{:?}",
+            status.conditions
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_clears_the_ephemeral_hazard_once_storage_becomes_durable() {
+        // The condition must be reactive to a later spec edit, not sticky
+        // once set — mirrors every other `*_INVALID`/hazard condition's own
+        // "retain unless still true" shape.
+        let fake_cluster = FakeClusterApi::new();
+        let ctx = make_ctx(fake_cluster, FakeAdminClient::new());
+        let mut cluster = test_cluster("demo", "ns1", 3, None);
+        cluster.spec.storage.ephemeral = Some(true);
+        reconcile(Arc::new(cluster), Arc::clone(&ctx))
+            .await
+            .unwrap();
+        let status = ctx.cluster_api.last_status().unwrap();
+        assert!(
+            status
+                .conditions
+                .iter()
+                .any(|c| c.type_ == CONDITION_EPHEMERAL_VOTER_STORAGE_HAZARD)
+        );
+
+        // A fresh `AnimusCluster` carrying the *previous* reconcile's own
+        // status (a real watch would deliver exactly this — see the
+        // sibling `ControlNodesGrowing` test's own doc on why `cluster`
+        // can't just be reused verbatim) plus the spec edit that turns
+        // ephemeral storage off.
+        let mut durable_cluster = test_cluster("demo", "ns1", 3, None);
+        durable_cluster.status = Some(status.clone());
+        reconcile(Arc::new(durable_cluster), Arc::clone(&ctx))
+            .await
+            .unwrap();
+        assert!(
+            !ctx.cluster_api
+                .last_status()
+                .unwrap()
+                .conditions
+                .iter()
+                .any(|c| c.type_ == CONDITION_EPHEMERAL_VOTER_STORAGE_HAZARD),
+            "the hazard condition must clear once storage.ephemeral is unset"
         );
     }
 

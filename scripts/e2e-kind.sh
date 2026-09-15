@@ -901,8 +901,29 @@ spec:
   image: ${ANIMUSD_IMAGE}
   nodes: 3
   controlNodes: 3
-  storage:
-    ephemeral: true
+  # Durable (PersistentVolumeClaim-backed) storage, deliberately NOT
+  # `storage: {ephemeral: true}` (issue #864): every control voter's own
+  # Raft WAL lives under this volume, and `spec.controlNodes` growth
+  # (S-07d) unconditionally rolls EVERY pod's own container, not just the
+  # newly promoted ordinal — `restart_relevant_projection`'s config-hash
+  # bakes in the raw `controlNodes` threshold itself, so an already-correct
+  # ordinal (unaffected by the role-split boundary moving) is rolled too;
+  # see `crates/animus-operator/CLAUDE.md`'s own S-07d section. A
+  # StatefulSet's rolling update deletes and recreates each Pod object
+  # (never just restarts a container in place), which wipes an `emptyDir`
+  # along with it. ADR 0060 already documents `ephemeral: true` as "a real
+  # Raft safety hazard for any voter pod, not just a durability
+  # trade-off" — issue #667's boot-time check (ADR 0009's 2026-09-15
+  # amendment) then does exactly what it is designed to do with a wiped
+  # EXISTING voter whose peers still name it in their own committed
+  # config with real history: it refuses that identity PERMANENTLY, on
+  # purpose, to avoid an unsafe double vote. Refuse enough of the
+  # pre-growth voters this way (the growth phase's own roll can reach all
+  # of them) and the group loses quorum for good — not a stall, a
+  # deadlock indistinguishable from one until `/admin/raft` is inspected.
+  # `kind` ships a default `standard` StorageClass (`rancher.io/
+  # local-path`), so omitting `storage` entirely (the CRD's own `false`
+  # default, a 10Gi PVC per pod) needs no further configuration here.
   # S-07b: the non-S3 store CRD surface, exercised unconditionally (not
   # gated on E2E_S3) — segmentStore rather than backupStore specifically so
   # this composes with the E2E_S3=1 leg below, which already sets
@@ -1097,8 +1118,8 @@ log "GetItem ok — item round-tripped"
 
 if [ "$E2E_ENCRYPTION" = "1" ]; then
     phase "check the item's plaintext value is absent from the pod's own data directory"
-    # `grep -r` over the pod's own data volume (`spec.storage.ephemeral: true`
-    # here, but the same on-disk shape as a real PersistentVolumeClaim) — a
+    # `grep -r` over the pod's own data volume (a real PersistentVolumeClaim
+    # since issue #864 — see the manifest's own storage comment above) — a
     # plaintext write would land the note's exact bytes in an SSTable/WAL
     # file somewhere under here (`animus-storage`'s `LsmEngine` applies no
     # block compression), so finding it would mean the encryption wiring did
