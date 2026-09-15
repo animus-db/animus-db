@@ -1501,6 +1501,24 @@ async fn meta_apply_and_compact<E: Env, S: StorageEngine>(
         } else {
             None
         };
+        // Issue #811 (animus-cp-data's sibling bug, same shape here):
+        // `did_work` must mean "state provably changed," never "this
+        // attempt was merely eligible." `snapshot_upto` below is bounded by
+        // `core.last_applied()`, which a restart can leave stuck below `ea`
+        // (an `InstallSnapshot` install advances `RaftCore::snapshot_index`/
+        // `last_applied` in memory and durably raises the engine's own
+        // watermark in the same pass, but the WAL rewrite that would make
+        // the core's own advance durable only happens here, gated on
+        // `behind`/`image_needed` — which is false right after an install,
+        // so a restart before this gate next fires recovers a stale,
+        // pre-install WAL) — in which case `snapshot_upto` legitimately
+        // no-ops every call and `take_snapshot_dirty()` stays `false`
+        // forever, with `behind` never shrinking on its own. Judge the
+        // outcome by what actually happened instead: a freshly-built
+        // on-demand image was installed (`image_needed` is a take-once
+        // flag, so this alone can't spin) and/or a real WAL-rewriting
+        // compaction completed (`bytes.is_some()`, checked below).
+        let image_installed = image.is_some();
         // Serialize the WAL rewrite against the consensus loop's appends —
         // both tasks write the same file.
         let _wal = wal_lock.lock().await;
@@ -1534,6 +1552,7 @@ async fn meta_apply_and_compact<E: Env, S: StorageEngine>(
                 (Some((buf, round)), lli)
             }
         };
+        let bytes_produced = bytes.is_some();
         if let Some((bytes, round)) = bytes {
             env.replace(WAL, &bytes).await.expect("wal compaction");
             let mut c = core.lock().expect("raft core poisoned");
@@ -1542,7 +1561,8 @@ async fn meta_apply_and_compact<E: Env, S: StorageEngine>(
                 persist.complete_drain(round);
             }
         }
-        did_work = true;
+        // Issue #811: NOT unconditional — see `image_installed`'s doc above.
+        did_work |= image_installed || bytes_produced;
     }
 
     did_work
@@ -2573,6 +2593,85 @@ mod tests {
             ring.writes_since(0, last_applied),
             None,
             "a caller stuck before the ring's own window falls back to a full fetch"
+        );
+    }
+
+    /// Regression for issue #811's sibling hazard in this plane's own
+    /// compaction attempt. A genuine restart can seed `engine_applied` (from
+    /// the engine's own durable watermark key) far ahead of the freshly
+    /// WAL-recovered core's `last_applied`/`snapshot_index` — the same
+    /// disagreement `animus-cp-data::apply_and_compact` hit, here modeled
+    /// directly rather than via a timing race: a brand-new, never-advanced
+    /// `RaftCore` (`last_applied() == snapshot_index() == 0`) stands in for
+    /// "WAL recovery only got back to the last compacted base," while
+    /// `engine_applied`/`watermark` are set to a value well past
+    /// `SNAPSHOT_THRESHOLD` — "the engine already durably reflects far more
+    /// than that." `snapshot_upto(ea)` then clamps to `last_applied` (0),
+    /// no-ops every call, and `take_snapshot_dirty()` never returns `true` —
+    /// so a pass here must report `did_work = false`, never the old
+    /// unconditional `true` a merely-*eligible* (`behind >=
+    /// SNAPSHOT_THRESHOLD`) attempt used to report regardless of outcome.
+    #[tokio::test]
+    async fn apply_and_compact_does_not_spuriously_report_work_when_stuck_below_the_engine_watermark()
+     {
+        let sim = animus_sim::Simulator::new(0x811);
+        let env = sim.env(nid(0));
+
+        // Never proposed/advanced at all: `last_applied() == snapshot_index()
+        // == 0`, standing in for a restart's freshly-recovered core whose WAL
+        // only ever reflects the last compacted base.
+        let core = RaftCore::new(nid(0), &[nid(0)], Nanos(0), 7);
+        assert_eq!(core.last_applied(), 0);
+        assert_eq!(core.snapshot_index(), 0);
+
+        let core = Arc::new(Mutex::new(core));
+        let engine = animus_storage::MemoryEngine::new();
+        let cache = Arc::new(Mutex::new(Metadata::default()));
+        // Well past `SNAPSHOT_THRESHOLD` (64) — "the engine's own durable
+        // watermark, re-seeded at this task's own startup, is far ahead of
+        // what this recovered core's own WAL shows."
+        let engine_applied = Arc::new(AtomicU64::new(200));
+        let delta_ring = Arc::new(Mutex::new(DeltaRing::default()));
+        let watch = MetadataWatch::default();
+        let wal_lock = Arc::new(AsyncMutex::new(()));
+        let mut shadow = Metadata::default();
+        let mut watermark = 200;
+        let mut compact_defer_since: Option<Nanos> = None;
+        let mut compact_defer_progress: Option<u64> = None;
+
+        for attempt in 0..3 {
+            let did_work = meta_apply_and_compact(
+                &env,
+                &core,
+                &engine,
+                &cache,
+                &engine_applied,
+                &delta_ring,
+                &watch,
+                &wal_lock,
+                &PersistProgress::default(),
+                &mut shadow,
+                &mut watermark,
+                &mut compact_defer_since,
+                &mut compact_defer_progress,
+            )
+            .await;
+
+            assert!(
+                !did_work,
+                "attempt {attempt}: eligible-but-no-op must report no work \
+                 (issue #811 regression) — stuck at engine_applied=200, \
+                 snapshot_index={}",
+                core.lock().expect("core poisoned").snapshot_index()
+            );
+        }
+        // Genuinely nothing moved across any of the repeated attempts above —
+        // the whole point being tested.
+        assert_eq!(core.lock().expect("core poisoned").snapshot_index(), 0);
+        assert_eq!(watermark, 200, "watermark must not have advanced");
+        assert!(
+            engine.entries().await.expect("engine scan").is_empty(),
+            "nothing should have been written to the engine"
         );
     }
 
