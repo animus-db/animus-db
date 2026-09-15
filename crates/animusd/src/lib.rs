@@ -18314,6 +18314,294 @@ mod simenv_client_ctx_tests {
             "the read must observe the write through the production read path (seed={seed})"
         );
     }
+
+    /// ADR 0066 §5 / issue #842: `execute_statement_as`/`execute_transaction_as`
+    /// — the `<E, R>`-generic PartiQL siblings `dynamo::dispatch_item_op`
+    /// calls (never reached by the real DynamoDB wire, which always calls
+    /// the concrete `execute_statement`/`execute_transaction` directly; see
+    /// `dynamo.rs`'s own "SimEnv-capable PartiQL siblings" section) — must
+    /// authorize a `Principal::Scoped` caller **before** the target table's
+    /// existence is revealed by `table_known`, exactly like their concrete
+    /// counterparts (proven end-to-end over the real wire by
+    /// `crates/animusd/tests/dynamo_auth_policy.rs`'s own scoped-policy
+    /// tests). A denied caller must get the byte-identical
+    /// `AccessDeniedException` (`__type` and message) whether the named
+    /// table exists or not — never a distinguishable
+    /// `ResourceNotFoundException` that would let a table-scoped credential
+    /// enumerate the cluster's tables. `SimCluster` itself never resolves a
+    /// `Principal::Scoped` (its own dynamo dispatch always uses
+    /// `Principal::unrestricted()`), so this harness constructs both
+    /// functions' inputs directly rather than through any wire path.
+    #[test]
+    fn execute_statement_as_and_execute_transaction_as_authorize_before_table_known() {
+        use crate::authz::Principal;
+        use crate::dynamo::{execute_statement_as, execute_transaction_as};
+        use animus_control::{OpClass, Policy, TableMatch};
+        use animus_dynamo::AttributeValue;
+        use animus_dynamo::wire::TransactStatementRequest;
+        use std::collections::BTreeSet;
+
+        let seed = 0x514E_0008;
+        let (mut sim, ctx, control, _kv) = single_node_ctx(seed);
+        sim.run_for(Duration::from_millis(200));
+
+        // `authz::record_denied` (bumping `Metric::AuthDenied` on every
+        // refusal this test expects) calls `ClientCtx::data()`, which
+        // panics on `single_node_ctx`'s own default control-only shape
+        // (`data: None` — deliberate there, since neither `cp_kind_write_raw`
+        // nor `cp_get` ever reads it, per that function's own doc). This
+        // test's whole point is provoking that refusal, so it needs a real
+        // `DataRole` — every field is a plain, `Env`-free, `Default`-able
+        // handle (mirrors `SimCluster::new`'s own per-node construction).
+        let ctx = SimClientCtx {
+            data: Some(DataRole {
+                raftkv_metrics: animus_env::MetricsHandle::recording(),
+                base_id: nid(1),
+                stream_seal_knobs: StreamSealKnobs::default(),
+                change_rates: ChangeRateTracker::default(),
+                request_rates: RequestRateTracker::default(),
+            }),
+            ..ctx
+        };
+
+        // Scoped to some other table entirely — denied for anything this
+        // test names.
+        let denied = Principal::Scoped {
+            access_key_id: "AKIDDENIED842".to_string(),
+            region: "us-east-1".to_string(),
+            policy: Policy {
+                tables: TableMatch::Names(BTreeSet::from(["unrelated_table".to_string()])),
+                ops: BTreeSet::from([OpClass::Read, OpClass::Write]),
+            },
+        };
+
+        let select_statement = "SELECT * FROM issue_842_denied_select";
+
+        // (1) The table does not exist yet.
+        let meta_absent = control.metadata();
+        let select_err_absent = spawn_and_capture(&mut sim, &ctx.env, {
+            let ctx = ctx.clone();
+            let denied = denied.clone();
+            let meta = meta_absent.clone();
+            async move {
+                execute_statement_as(
+                    &ctx,
+                    &meta,
+                    &denied,
+                    select_statement,
+                    &[],
+                    false,
+                    None,
+                    None,
+                )
+                .await
+            }
+        })
+        .expect("future completed")
+        .expect_err("a denied SELECT must be refused even against an unknown table");
+
+        // (2) Now the table genuinely exists.
+        seed_schema(&control, "issue_842_denied_select", TabletId(2));
+        sim.run_for(Duration::from_millis(200));
+        let meta_present = control.metadata();
+        let select_err_present = spawn_and_capture(&mut sim, &ctx.env, {
+            let ctx = ctx.clone();
+            let denied = denied.clone();
+            let meta = meta_present.clone();
+            async move {
+                execute_statement_as(
+                    &ctx,
+                    &meta,
+                    &denied,
+                    select_statement,
+                    &[],
+                    false,
+                    None,
+                    None,
+                )
+                .await
+            }
+        })
+        .expect("future completed")
+        .expect_err("a denied SELECT must be refused even once the table exists");
+
+        assert_eq!(
+            select_err_absent.code, "AccessDeniedException",
+            "seed={seed}, absent-table error: {select_err_absent:?}"
+        );
+        assert_eq!(
+            select_err_absent.code, select_err_present.code,
+            "seed={seed}: the __type must not depend on whether the table exists"
+        );
+        assert_eq!(
+            select_err_absent.message, select_err_present.message,
+            "seed={seed}: the message must not depend on whether the table exists — a \
+             table-scoped principal must not be able to enumerate table existence via this \
+             difference (issue #842)"
+        );
+
+        // The identical proof for `execute_transaction_as`, one write
+        // statement.
+        let txn_statement = "INSERT INTO issue_842_denied_txn VALUE {'pk': ?}";
+        let statements = vec![TransactStatementRequest {
+            statement: txn_statement.to_string(),
+            parameters: vec![AttributeValue::S("x".to_string())],
+            rvocf: Default::default(),
+        }];
+
+        let meta_absent = control.metadata();
+        let txn_err_absent = spawn_and_capture(&mut sim, &ctx.env, {
+            let ctx = ctx.clone();
+            let denied = denied.clone();
+            let meta = meta_absent.clone();
+            let statements = statements.clone();
+            async move { execute_transaction_as(&ctx, &denied, &meta, &statements, None).await }
+        })
+        .expect("future completed")
+        .expect_err("a denied ExecuteTransaction must be refused even against an unknown table");
+
+        seed_schema(&control, "issue_842_denied_txn", TabletId(3));
+        sim.run_for(Duration::from_millis(200));
+        let meta_present = control.metadata();
+        let txn_err_present = spawn_and_capture(&mut sim, &ctx.env, {
+            let ctx = ctx.clone();
+            let denied = denied.clone();
+            let meta = meta_present.clone();
+            let statements = statements.clone();
+            async move { execute_transaction_as(&ctx, &denied, &meta, &statements, None).await }
+        })
+        .expect("future completed")
+        .expect_err("a denied ExecuteTransaction must be refused even once the table exists");
+
+        assert_eq!(
+            txn_err_absent.code, "AccessDeniedException",
+            "seed={seed}, absent-table error: {txn_err_absent:?}"
+        );
+        assert_eq!(
+            txn_err_absent.code, txn_err_present.code,
+            "seed={seed}: the __type must not depend on whether the table exists"
+        );
+        assert_eq!(
+            txn_err_absent.message, txn_err_present.message,
+            "seed={seed}: the message must not depend on whether the table exists (issue #842)"
+        );
+    }
+
+    /// ADR 0066 §5 / issue #842 (the sixth site): `execute_one_batch_statement_as`
+    /// — reached through [`crate::dynamo::run_batch_execute_statement_as`], the
+    /// `BatchExecuteStatement` sibling of `execute_statement_as`/
+    /// `execute_transaction_as` above (see `dynamo.rs`'s own "SimEnv-capable
+    /// PartiQL siblings" section) — used to check `table_known` before
+    /// `authz::authorize` for its `SELECT` arm, the identical five-site defect
+    /// this issue names, just uncounted. A denied `SELECT` batch statement must
+    /// report a byte-identical `Error.Code`/`Error.Message` whether the named
+    /// table exists or not — never a distinguishable `ResourceNotFound` that
+    /// would let a table-scoped credential enumerate the cluster's tables via
+    /// the batch API.
+    #[test]
+    fn execute_one_batch_statement_as_authorizes_before_table_known() {
+        use crate::authz::Principal;
+        use crate::dynamo::run_batch_execute_statement_as;
+        use animus_control::{OpClass, Policy, TableMatch};
+        use animus_dynamo::wire::BatchStatementRequest;
+        use std::collections::BTreeSet;
+
+        fn batch_error(raw: &str) -> (String, String) {
+            let parsed: serde_json::Value =
+                serde_json::from_str(raw).expect("valid BatchExecuteStatement response JSON");
+            let entry = &parsed["Responses"][0];
+            let error = &entry["Error"];
+            (
+                error["Code"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("missing Error.Code in {raw}"))
+                    .to_string(),
+                error["Message"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("missing Error.Message in {raw}"))
+                    .to_string(),
+            )
+        }
+
+        let seed = 0x514E_0009;
+        let (mut sim, ctx, control, _kv) = single_node_ctx(seed);
+        sim.run_for(Duration::from_millis(200));
+
+        // Same `DataRole` fix as the test above — `authz::record_denied`
+        // calls `ClientCtx::data()`, which panics on `single_node_ctx`'s
+        // own default control-only shape.
+        let ctx = SimClientCtx {
+            data: Some(DataRole {
+                raftkv_metrics: animus_env::MetricsHandle::recording(),
+                base_id: nid(1),
+                stream_seal_knobs: StreamSealKnobs::default(),
+                change_rates: ChangeRateTracker::default(),
+                request_rates: RequestRateTracker::default(),
+            }),
+            ..ctx
+        };
+
+        // Scoped to some other table entirely — denied for anything this
+        // test names.
+        let denied = Principal::Scoped {
+            access_key_id: "AKIDDENIED842C".to_string(),
+            region: "us-east-1".to_string(),
+            policy: Policy {
+                tables: TableMatch::Names(BTreeSet::from(["unrelated_table".to_string()])),
+                ops: BTreeSet::from([OpClass::Read, OpClass::Write]),
+            },
+        };
+
+        let statements = vec![BatchStatementRequest {
+            statement: "SELECT * FROM issue_842_denied_batch WHERE pk = ?".to_string(),
+            parameters: vec![animus_dynamo::AttributeValue::S("x".to_string())],
+            consistent_read: false,
+        }];
+
+        // (1) The table does not exist yet.
+        let meta_absent = control.metadata();
+        let raw_absent = spawn_and_capture(&mut sim, &ctx.env, {
+            let ctx = ctx.clone();
+            let denied = denied.clone();
+            let meta = meta_absent.clone();
+            let statements = statements.clone();
+            async move { run_batch_execute_statement_as(&ctx, &meta, &denied, &statements).await }
+        })
+        .expect("future completed")
+        .expect("run_batch_execute_statement_as never returns Err — every failure is a per-statement entry");
+
+        // (2) Now the table genuinely exists.
+        seed_schema(&control, "issue_842_denied_batch", TabletId(4));
+        sim.run_for(Duration::from_millis(200));
+        let meta_present = control.metadata();
+        let raw_present = spawn_and_capture(&mut sim, &ctx.env, {
+            let ctx = ctx.clone();
+            let denied = denied.clone();
+            let meta = meta_present.clone();
+            let statements = statements.clone();
+            async move { run_batch_execute_statement_as(&ctx, &meta, &denied, &statements).await }
+        })
+        .expect("future completed")
+        .expect("run_batch_execute_statement_as never returns Err — every failure is a per-statement entry");
+
+        let (code_absent, message_absent) = batch_error(&raw_absent);
+        let (code_present, message_present) = batch_error(&raw_present);
+
+        assert_eq!(
+            code_absent, "AccessDenied",
+            "seed={seed}, absent-table response: {raw_absent}"
+        );
+        assert_eq!(
+            code_absent, code_present,
+            "seed={seed}: the batch Error.Code must not depend on whether the table exists"
+        );
+        assert_eq!(
+            message_absent, message_present,
+            "seed={seed}: the batch Error.Message must not depend on whether the table exists \
+             — a table-scoped principal must not be able to enumerate table existence via this \
+             difference (issue #842)"
+        );
+    }
 }
 
 /// Two-node `ClientCtx<SimEnv, SimRelayClient<SimEnv>>` smoke (ADR 0061
