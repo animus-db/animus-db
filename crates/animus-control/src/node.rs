@@ -2636,6 +2636,8 @@ mod tests {
         let wal_lock = Arc::new(AsyncMutex::new(()));
         let mut shadow = Metadata::default();
         let mut watermark = 200;
+        let mut compact_defer_since: Option<Nanos> = None;
+        let mut compact_defer_progress: Option<u64> = None;
 
         for attempt in 0..3 {
             let did_work = meta_apply_and_compact(
@@ -2650,6 +2652,8 @@ mod tests {
                 &PersistProgress::default(),
                 &mut shadow,
                 &mut watermark,
+                &mut compact_defer_since,
+                &mut compact_defer_progress,
             )
             .await;
 
