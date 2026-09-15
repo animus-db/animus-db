@@ -554,6 +554,7 @@ fn run_backups_view_reflects_the_catalog(seed: u64) {
             tablet: TabletId(*tablet),
             cut_version: 42,
             bytes: 4_096,
+            chunk_count: 1,
         };
         assert!(
             accepted(cluster.propose_meta(record)),
@@ -672,6 +673,7 @@ fn run_backup_store_reports_reclaim_progress_and_leader_state(seed: u64) {
                 tablet,
                 cut_version: 10,
                 bytes: 4_096,
+                chunk_count: 1,
             })
         ),
         "seed={seed}: RecordBackupTabletComplete rejected"
