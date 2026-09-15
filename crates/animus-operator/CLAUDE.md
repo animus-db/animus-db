@@ -605,6 +605,30 @@ store in both `spec.s3` and the matching top-level field is rejected as a
 conflict naming both — a `StoreSpecInvalid` status condition either way,
 `backupStore`/`segmentStore` stripped for the rest of that reconcile.
 
+**`spec.storage.ephemeral` (an `emptyDir` data volume) is a real Raft
+safety hazard for a voter, control-plane or data-plane, not just a
+durability trade-off (issue #667, ADR 0009's matching 2026-09-15
+amendment).** A control voter whose `emptyDir` is wiped by an ordinary
+pod recreation (a node deletion, a config-hash roll, `S-07d`'s own growth
+flow) restarts with an empty WAL — indistinguishable, locally, from a
+genuine first-ever bootstrap. The control plane refuses to act as a voter
+in that case until a boot-time peer probe resolves the ambiguity (see the
+ADR amendment for the full mechanism); the CP data plane has the
+identical hazard for a hosted tablet's own voter and does **not** yet have
+this protection (issue #900 — a materially harder problem there, since a
+tablet's peer set is dynamic and reconstituted constantly, unlike the
+control plane's one-time genesis config). **Operational guidance until
+issue #900 closes: `storage.ephemeral: true` should be treated as
+unsupported for any pod that ever acts as a CP-data voter** — which today
+means every combined-mode and data-only pod, `spec.storage.ephemeral`'s
+safety story only really holds for a genuinely stateless, disposable
+deployment. This operator does not currently validate or warn against
+that combination; a future rung could reject `spec.storage.ephemeral:
+true` outright, or restrict it to control-only pods (which now have the
+issue #667 protection), pending a decision on whether that restriction
+belongs here or is better left to the ADR's own operational-mitigation
+note.
+
 **Every `fs:`/`dir:` path must live strictly under
 `desired::cluster_config::DATA_DIR`** (`/var/lib/animus`) — the one
 directory every pod already has mounted (a `PersistentVolumeClaim`, or an

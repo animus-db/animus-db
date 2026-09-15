@@ -339,6 +339,33 @@ per-tablet CP data plane (`animus-cp-data`).
 
 ## Key invariants
 
+- **Boot-time genesis-vs-wiped-restart check (ADR 0009's 2026-09-15
+  amendment, issue #667 — P0 Raft safety).** A `RaftCore` whose persisted
+  state replays empty (`node.rs`'s `drive`, the branch that keeps the
+  fresh `RaftCore::new` rather than calling `RaftCore::recovered`) never
+  grants a real vote or campaigns (`RaftCore::cluster_check_pending`/
+  `refused_as_voter`) until `begin_cluster_check`'s peer probe round
+  (`RaftMsg::ClusterProbe`/`ClusterProbeResp`) resolves whether this is a
+  genuine first-ever bootstrap/ADR 0060 growth join (safe — the config a
+  responding peer already has committed does not yet name this node id as
+  a voter) or an already-established voter's disk wiped clean (unsafe —
+  the peer's config already does; refuse permanently, re-admit only
+  through the learner/rejoin path, ADR 0032/0058). Gates only the real
+  vote grant in `handle_request_vote`, deliberately not `handle_pre_vote`
+  (touches no persisted state, so it's never part of the hazard — see the
+  ADR amendment for why gating it too was tried and reverted). The
+  initial probe is sent from a separate spawned task at boot (never
+  inline before the first `env.recv()`, which risks a multi-node-genesis
+  mutual stall) and reuses the SAME entropy `RaftCore::new`'s own
+  construction already drew, never a fresh draw — seemingly-unrelated
+  fixed-seed corpus cells can desync from either an extra draw or the
+  extra task/wire-traffic alone; see `docs/lessons/testing/2026-09-15-
+  boot-path-entropy-desyncs-fixed-seeds.md`. **CP data plane
+  (`animus-cp-data`) has the identical hazard, unfixed** — tracked as
+  issue #900, since a tablet's peer set is dynamic and reconstituted
+  constantly (unlike the control plane's one-time genesis config), a
+  materially different liveness tradeoff needing its own design decision.
+
 - **Config-in-log + current-term-commit gate (ADR 0017 C).** `LogEntry` may
   carry a `config: Option<voters>`; `RaftCore` keeps `peers`/`cluster_size` in
   sync with the latest log config (config rides snapshots + `InstallSnapshot`).
