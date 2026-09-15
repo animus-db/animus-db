@@ -301,12 +301,22 @@ fn current_open_epoch(meta: &Metadata, tablet: TabletId) -> u64 {
         .map_or(0, |((_, e), _)| e + 1)
 }
 
-/// Recovers a change record's packed HLC from its key's trailing 8 bytes —
-/// the same suffix `animusd::dynamo_streams::record_hlc_suffix` recovers from
-/// the real `StreamHotRead`/segment-record shape.
+/// Recovers a change record's own `(packed_hlc, ordinal)` pair (issue #852)
+/// from its key's trailing 12 bytes — the same suffix
+/// `animusd::dynamo_streams::record_seqno_suffix` recovers from the real
+/// `StreamHotRead`/segment-record shape.
+fn record_seqno_suffix(key: &[u8]) -> Option<(u64, u32)> {
+    let n = key.len().checked_sub(12)?;
+    let hlc = u64::from_be_bytes(key[n..n + 8].try_into().ok()?);
+    let ordinal = u32::from_be_bytes(key[n + 8..].try_into().ok()?);
+    Some((hlc, ordinal))
+}
+
+/// [`record_seqno_suffix`]'s HLC-only view, for the (many) call sites here
+/// that only need a bound on which committing entry produced a record,
+/// never which specific tied record within one.
 fn record_hlc_suffix(key: &[u8]) -> Option<u64> {
-    let n = key.len().checked_sub(8)?;
-    Some(u64::from_be_bytes(key[n..].try_into().ok()?))
+    record_seqno_suffix(key).map(|(hlc, _)| hlc)
 }
 
 /// One seal attempt of `group`'s currently-open epoch (ADR 0043 §A3's
@@ -334,33 +344,36 @@ fn seal_now(
     // while after a split. A record outside that declared range already
     // belongs to a sibling tablet and must be left for its own seal.
     let declared_range = meta.tablets.get(&group.id).map(|t| t.range.clone());
-    let mut filtered: Vec<(Vec<u8>, u64, Vec<u8>)> =
+    let mut filtered: Vec<(Vec<u8>, u64, u32, Vec<u8>)> =
         block_on(group.nodes[leader].pending_changes())
             .into_iter()
             .filter_map(|(k, v)| {
-                let hlc = record_hlc_suffix(&k)?;
+                let (hlc, ordinal) = record_seqno_suffix(&k)?;
                 if hlc <= watermark {
                     return None;
                 }
                 if declared_range.as_ref().is_some_and(|r| !r.contains(&k)) {
                     return None;
                 }
-                Some((k, hlc, v))
+                Some((k, hlc, ordinal, v))
             })
             .collect();
     if filtered.is_empty() {
         return None;
     }
-    filtered.sort_by_key(|(_, hlc, _)| *hlc);
+    // Issue #852: sort by `(hlc, ordinal)`, not `hlc` alone — several
+    // records here can share the identical HLC (a multi-key batch commit).
+    filtered.sort_by_key(|(_, hlc, ordinal, _)| (*hlc, *ordinal));
 
     let epoch = current_open_epoch(meta, group.id);
     let hlc_range = (watermark, filtered.last().expect("non-empty").1);
     let count = filtered.len() as u64;
     let records: Vec<segment::SegmentRecord> = filtered
         .iter()
-        .map(|(k, hlc, v)| segment::SegmentRecord {
+        .map(|(k, hlc, ordinal, v)| segment::SegmentRecord {
             source_key: k.clone(),
             packed_hlc: *hlc,
+            ordinal: *ordinal,
             change_record: v.clone(),
         })
         .collect();
@@ -425,7 +438,7 @@ fn collect_tablet_records(
     store: &SimSegmentStore,
     group: &Group,
     leader: usize,
-) -> Vec<(Vec<u8>, u64, Vec<u8>)> {
+) -> Vec<(Vec<u8>, u64, u32, Vec<u8>)> {
     let mut all = Vec::new();
     for (_epoch, row) in meta.stream_shard_chain(TABLE, LABEL, group.id) {
         // Ledger-named-object amendment: resolve from the row, never
@@ -442,26 +455,30 @@ fn collect_tablet_records(
         let (_, records) = segment::decode_and_slice(&bytes, row.hlc_range)
             .unwrap_or_else(|e| panic!("corrupt segment {seg_id}: {e}"));
         for r in records {
-            all.push((r.source_key, r.packed_hlc, r.change_record));
+            all.push((r.source_key, r.packed_hlc, r.ordinal, r.change_record));
         }
     }
     let watermark = meta.stream_shard_watermark(group.id).unwrap_or(0);
-    let mut hot: Vec<(Vec<u8>, u64, Vec<u8>)> = block_on(group.nodes[leader].pending_changes())
-        .into_iter()
-        .filter_map(|(k, v)| {
-            let hlc = record_hlc_suffix(&k)?;
-            (hlc > watermark).then_some((k, hlc, v))
-        })
-        .collect();
-    hot.sort_by_key(|(_, hlc, _)| *hlc);
+    let mut hot: Vec<(Vec<u8>, u64, u32, Vec<u8>)> =
+        block_on(group.nodes[leader].pending_changes())
+            .into_iter()
+            .filter_map(|(k, v)| {
+                let (hlc, ordinal) = record_seqno_suffix(&k)?;
+                (hlc > watermark).then_some((k, hlc, ordinal, v))
+            })
+            .collect();
+    // Issue #852: order by `(hlc, ordinal)`, not `hlc` alone.
+    hot.sort_by_key(|(_, hlc, ordinal, _)| (*hlc, *ordinal));
     all.extend(hot);
     all
 }
 
 /// Walks `lineage` (caller-supplied **parent-before-child** order — the
 /// lineage discipline itself, ADR 0042 §2/ADR 0043 §A4) and asserts:
-/// exactly-once (every packed HLC delivered by exactly one shard, globally),
-/// per-item order (each key's delivered payload sequence matches its
+/// exactly-once (every `(packed_hlc, ordinal)` pair delivered by exactly one
+/// shard, globally — issue #852 widened this from `packed_hlc` alone, since
+/// a multi-key batch commit can legitimately tie several records on one
+/// HLC), per-item order (each key's delivered payload sequence matches its
 /// journal's write order, byte for byte), and total-count agreement (no
 /// record vanished or was invented).
 fn verify_lineage(
@@ -472,15 +489,17 @@ fn verify_lineage(
     seed: u64,
 ) {
     let mut delivered_by_key: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
-    let mut seen_hlcs: BTreeSet<u64> = BTreeSet::new();
+    let mut seen_seqnos: BTreeSet<(u64, u32)> = BTreeSet::new();
     let mut total = 0usize;
     for (group, leader) in lineage {
-        for (source_key, hlc, record) in collect_tablet_records(meta, store, group, *leader) {
+        for (source_key, hlc, ordinal, record) in collect_tablet_records(meta, store, group, *leader)
+        {
             assert!(
-                seen_hlcs.insert(hlc),
-                "[seed={seed}] hlc {hlc} delivered more than once — violates exactly-once"
+                seen_seqnos.insert((hlc, ordinal)),
+                "[seed={seed}] (hlc={hlc}, ordinal={ordinal}) delivered more than once — \
+                 violates exactly-once"
             );
-            let item_key = source_key[..source_key.len() - 8].to_vec();
+            let item_key = source_key[..source_key.len() - 12].to_vec();
             delivered_by_key.entry(item_key).or_default().push(record);
             total += 1;
         }
@@ -879,8 +898,8 @@ fn assert_every_write_recoverable(
 ) {
     let delivered = collect_tablet_records(meta, store, group, leader);
     let mut by_key: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
-    for (source_key, _, record) in delivered {
-        let item_key = source_key[..source_key.len() - 8].to_vec();
+    for (source_key, _, _, record) in delivered {
+        let item_key = source_key[..source_key.len() - 12].to_vec();
         by_key.entry(item_key).or_default().push(record);
     }
     for (key, expected) in journal {
@@ -1081,15 +1100,15 @@ fn scenario_dueling_seals_orphan_hot_range(seed: u64) {
     // changes()` read (`animusd/src/index_drain.rs:944-960`), before its
     // (real, K-way replicated, hence slow) `put_sealed` call.
     let watermark_slow = meta.stream_shard_watermark(group.id).unwrap_or(0);
-    let mut slow_records: Vec<(Vec<u8>, u64, Vec<u8>)> =
+    let mut slow_records: Vec<(Vec<u8>, u64, u32, Vec<u8>)> =
         block_on(group.nodes[slow_leader].pending_changes())
             .into_iter()
             .filter_map(|(k, v)| {
-                let hlc = record_hlc_suffix(&k)?;
-                (hlc > watermark_slow).then_some((k, hlc, v))
+                let (hlc, ordinal) = record_seqno_suffix(&k)?;
+                (hlc > watermark_slow).then_some((k, hlc, ordinal, v))
             })
             .collect();
-    slow_records.sort_by_key(|(_, hlc, _)| *hlc);
+    slow_records.sort_by_key(|(_, hlc, ordinal, _)| (*hlc, *ordinal));
     assert_eq!(
         slow_records.len(),
         5,
@@ -1153,9 +1172,10 @@ fn scenario_dueling_seals_orphan_hot_range(seed: u64) {
     let count = slow_records.len() as u64;
     let seg_records: Vec<segment::SegmentRecord> = slow_records
         .iter()
-        .map(|(k, hlc, v)| segment::SegmentRecord {
+        .map(|(k, hlc, ordinal, v)| segment::SegmentRecord {
             source_key: k.clone(),
             packed_hlc: *hlc,
+            ordinal: *ordinal,
             change_record: v.clone(),
         })
         .collect();
@@ -2264,5 +2284,350 @@ fn inplace_split_races_an_open_seal() {
     for_each_seed(
         "inplace_split_races_an_open_seal",
         scenario_inplace_split_races_an_open_seal,
+    );
+}
+
+// --- cell 17: tied_multi_key_commit_paginates_without_loss (issue #852) ---
+//
+// The regression this issue exists to close: `materialize_derived` stamps
+// every change record one committing entry produces with that entry's own
+// single `ts` — so a multi-key `TransactWriteItems` commit (modeled here,
+// at this crate's own layer, as one `put_kind_batch` call carrying several
+// `change_log` entries at once, exactly the shape `KvCommand::KindBatch`'s
+// apply arm and `KvCommand::TxnResolve`'s commit branch both funnel through
+// `materialize_derived`) mints several change records tied on the identical
+// packed HLC. A `GetRecords`-style page boundary landing inside that tie
+// used to be indistinguishable from "already delivered," permanently
+// dropping every record on the far side of it (the cursor's own `>
+// position` filter, keyed on HLC alone, silently absorbed the rest of the
+// tie forever). The fix widens the cursor to the `(packed_hlc, ordinal)`
+// pair `materialize_derived` now stamps into the completed key.
+//
+// `get_records_page` below is a faithful, from-scratch mirror of the fixed
+// `animusd::dynamo_streams::get_records_sealed`/`get_records_open` (this
+// crate cannot depend on `animusd` — see the module doc's "What this
+// proves" section): same `(packed_hlc, ordinal)` filter/order, same
+// sealed-shard exhaustion rule (the filtered count vs. `limit`, never the
+// last delivered record's HLC vs. the shard's own end — the exact
+// distinction this issue's bug turned on).
+//
+// Exercised under real fault injection (`NetConfig::set_duplicate_prob` +
+// a mid-stream leader kill, mirroring `duplicate_delivery_under_leader_
+// kill`'s own nemesis) so the tie survives more than just the quiet case.
+
+/// Proposes `items` (each `(item_key, payload)`) as ONE `KindBatch` entry —
+/// N base writes plus N change-log records, all sharing the SAME commit
+/// `ts` (issue #852's exact trigger). Mirrors [`propose_write`] otherwise
+/// (one call, then the caller confirms/journals).
+fn propose_multi_write(group: &Group, leader: usize, items: &[(Vec<u8>, Vec<u8>)]) -> u64 {
+    let writes = items
+        .iter()
+        .map(|(k, v)| (KIND_BASE, k.clone(), Some(v.clone())))
+        .collect();
+    let change_log = items.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    match group.nodes[leader].put_kind_batch(writes, change_log) {
+        animus_control::ProposeResult::Accepted { index, .. } => index,
+        other => panic!("leader rejected a multi write: {other:?}"),
+    }
+}
+
+/// One `GetRecords` call against `group`'s own shard `epoch`, mirroring the
+/// FIXED `animusd::dynamo_streams::get_records_sealed`/`get_records_open`
+/// exactly (issue #852) — see this cell's own doc for why this can't just
+/// call the real function.
+///
+/// Returns `(page, next_position)` — `next_position: None` only for a
+/// SEALED shard whose filtered content fit entirely in this one page (the
+/// real "null iterator" exhaustion signal); an OPEN shard always returns
+/// `Some`, matching the real API's "not there yet, poll again" contract.
+fn get_records_page(
+    meta: &Metadata,
+    store: &SimSegmentStore,
+    group: &Group,
+    leader: usize,
+    epoch: u64,
+    position: (u64, u32),
+    limit: usize,
+) -> (Vec<(Vec<u8>, u64, u32, Vec<u8>)>, Option<(u64, u32)>) {
+    if let Some(row) = meta.stream_shards.get(&(group.id, epoch)).cloned() {
+        let seg_id = row.object_id.as_str();
+        let bytes = block_on(store.get(seg_id))
+            .unwrap_or_else(|e| panic!("segment store get of {seg_id}: {e}"))
+            .unwrap_or_else(|| panic!("sealed shard {seg_id} missing from the store"));
+        let (_, records) = segment::decode_and_slice(&bytes, row.hlc_range)
+            .unwrap_or_else(|e| panic!("corrupt segment {seg_id}: {e}"));
+        let filtered: Vec<_> = records
+            .into_iter()
+            .filter(|r| (r.packed_hlc, r.ordinal) > position)
+            .collect();
+        let page: Vec<(Vec<u8>, u64, u32, Vec<u8>)> = filtered
+            .iter()
+            .take(limit)
+            .map(|r| {
+                (
+                    r.source_key.clone(),
+                    r.packed_hlc,
+                    r.ordinal,
+                    r.change_record.clone(),
+                )
+            })
+            .collect();
+        // The exact fix: exhaustion is "did the filtered set fit in one
+        // page," never "did the last delivered record's HLC reach the
+        // shard's own end" — the latter cannot tell a fully-delivered tie
+        // from a partially-delivered one.
+        let exhausted = filtered.len() <= limit;
+        let next = if exhausted {
+            None
+        } else {
+            Some(page.last().map_or(position, |(_, h, o, _)| (*h, *o)))
+        };
+        (page, next)
+    } else {
+        // OPEN shard: mirrors `index_drain::hot_read` exactly.
+        let mut records: Vec<(Vec<u8>, u64, u32, Vec<u8>)> =
+            block_on(group.nodes[leader].pending_changes())
+                .into_iter()
+                .filter_map(|(k, v)| {
+                    let (hlc, ordinal) = record_seqno_suffix(&k)?;
+                    ((hlc, ordinal) > position).then_some((k, hlc, ordinal, v))
+                })
+                .collect();
+        records.sort_by_key(|(_, hlc, ordinal, _)| (*hlc, *ordinal));
+        records.truncate(limit);
+        let next = Some(records.last().map_or(position, |(_, h, o, _)| (*h, *o)));
+        (records, next)
+    }
+}
+
+/// Drains `epoch` via [`get_records_page`] at `limit` per call, starting
+/// from the caller-supplied `position` (pass `(0, 0)` for a fresh
+/// `TRIM_HORIZON` read; a resumed client cursor otherwise), until the
+/// sealed exhaustion signal fires — panics naming `seed` if it never does
+/// within a generous bound (a real bug: a live iterator that never nulls
+/// on a sealed shard). Only meaningful against a SEALED shard; the open
+/// path never exhausts on its own (see [`get_records_page`]'s own doc), so
+/// no scenario below calls this against an open epoch.
+fn drain_sealed_epoch(
+    meta: &Metadata,
+    store: &SimSegmentStore,
+    group: &Group,
+    leader: usize,
+    epoch: u64,
+    mut position: (u64, u32),
+    limit: usize,
+    seed: u64,
+) -> Vec<(Vec<u8>, u64, u32, Vec<u8>)> {
+    let mut delivered = Vec::new();
+    for _ in 0..1000 {
+        let (page, next) = get_records_page(meta, store, group, leader, epoch, position, limit);
+        delivered.extend(page);
+        match next {
+            Some(p) => position = p,
+            None => return delivered,
+        }
+    }
+    panic!("[seed={seed}] sealed epoch {epoch} never exhausted its own iterator");
+}
+
+fn scenario_tied_multi_key_commit_paginates_without_loss(seed: u64) {
+    let mut sim = Simulator::new(seed);
+    let engines = engines();
+    let mut meta = base_meta();
+    let group = start_group(&sim, &engines, TabletId(60), KeyRange::whole());
+    let mut live = vec![0, 1, 2];
+    sim.run_for(Duration::from_secs(2));
+
+    // Fault injection (ADR 0061 Decision 3): duplicated network traffic —
+    // this corpus's own direct probe of "exactly-once," see
+    // `duplicate_delivery_under_leader_kill`'s doc — mixed with a mid-
+    // stream leader kill, so the tie survives more than just the quiet
+    // case.
+    let mut net_cfg = NetConfig::default();
+    net_cfg.set_duplicate_prob(0.3);
+    sim.set_net_config(net_cfg);
+
+    let store = SimSegmentStore::new(sim.env(nid(NODES[0])));
+
+    // --- Part A: the OPEN-tail path, paginated with Limit < N -----------
+    //
+    // Three items, ONE commit: exactly issue #852's trigger. Every one of
+    // them lands at the identical packed HLC.
+    let items_a: Vec<(Vec<u8>, Vec<u8>)> = (0..3)
+        .map(|i| (key(i), format!("a{i}").into_bytes()))
+        .collect();
+    let leader = elect(&mut sim, &group, &live, seed);
+    let index = propose_multi_write(&group, leader, &items_a);
+    confirm(&mut sim, &group, leader, index, seed);
+
+    // Kill the writer's own leader right after the tied commit lands —
+    // proves the tie's ordinals survive a leadership change, not just a
+    // quiet single-leader run.
+    sim.crash(nid(NODES[leader]));
+    live.retain(|&i| i != leader);
+    let leader = elect(&mut sim, &group, &live, seed);
+    // Leadership and apply-catchup are not the same event (see this
+    // corpus's own `pitr_fault_corpus.rs`-style harness lesson): the
+    // freshly-elected leader must have actually replayed the tied entry
+    // before its own `pending_changes()` reflects it.
+    confirm(&mut sim, &group, leader, index, seed);
+
+    // Paginate the OPEN tail with `Limit=1` — a page boundary lands inside
+    // the tie on every single call. Bounded loop: the open path never
+    // exhausts on its own (see `get_records_page`'s doc), so this stops
+    // once it has seen every item the journal expects, not on a `None`.
+    let mut position = (0u64, 0u32);
+    let mut delivered_a: Vec<(Vec<u8>, u64, u32, Vec<u8>)> = Vec::new();
+    for _ in 0..items_a.len() {
+        let (page, next) = get_records_page(&meta, &store, &group, leader, 0, position, 1);
+        assert_eq!(
+            page.len(),
+            1,
+            "[seed={seed}] open-tail Limit=1 must deliver exactly one record per call \
+             once any are pending: {page:?}"
+        );
+        delivered_a.extend(page);
+        position = next.expect("the open path always returns a fresh position");
+    }
+    assert_eq!(
+        delivered_a.len(),
+        items_a.len(),
+        "[seed={seed}] every tied record must be delivered exactly once across the open-tail \
+         pagination: {delivered_a:?}"
+    );
+    assert_tied_delivery_is_sound(&items_a, &delivered_a, seed, "open-tail");
+
+    // --- Part B: the SAME tie, re-read from the SEALED path --------------
+    //
+    // Seal epoch 0 (now covering exactly `items_a`'s tie) and re-drain it
+    // from `TRIM_HORIZON`, again with `Limit=1` — proves the sealed-segment
+    // path independently survives the identical tie.
+    let sealed = seal_now(&mut meta, &store, &group, leader, 1_000, false);
+    assert_eq!(sealed, Some(0), "[seed={seed}] expected epoch 0 to seal");
+    let delivered_a_sealed =
+        drain_sealed_epoch(&meta, &store, &group, leader, 0, (0, 0), 1, seed);
+    assert_eq!(
+        delivered_a_sealed.len(),
+        items_a.len(),
+        "[seed={seed}] every tied record must be delivered exactly once from the sealed \
+         path too: {delivered_a_sealed:?}"
+    );
+    assert_tied_delivery_is_sound(&items_a, &delivered_a_sealed, seed, "sealed");
+
+    // --- Part C: a SECOND tie, split across a seal boundary mid-drain ----
+    //
+    // Deliver ONE record of a fresh tied commit from the OPEN path, THEN
+    // seal (moving the remaining tied records from the hot tail into the
+    // just-sealed segment), then resume pagination from the SAME cursor —
+    // now resolving into the sealed path — and confirm nothing is lost or
+    // duplicated across that transition.
+    let items_c: Vec<(Vec<u8>, Vec<u8>)> = (3..7)
+        .map(|i| (key(i), format!("c{i}").into_bytes()))
+        .collect();
+    let index = propose_multi_write(&group, leader, &items_c);
+    confirm(&mut sim, &group, leader, index, seed);
+
+    // `TRIM_HORIZON` on an OPEN shard starts from the tablet's own current
+    // watermark (`GetShardIterator`'s real rule), never a bare `(0, 0)` —
+    // `pending_changes()` still physically holds `items_a`'s own
+    // already-sealed rows (trimming them is the janitor's separate,
+    // unrelated job). And the floor's own ordinal must be `u32::MAX`, not
+    // `0` — a second issue #852 finding this very cell surfaced: if the
+    // watermark HLC was itself a tie, its tail members (ordinal > 0) are
+    // still physically present and would otherwise be wrongly re-admitted
+    // as "new" (fixed in production at `dynamo_streams::get_shard_
+    // iterator`'s OPEN-shard `TrimHorizon`/`Latest` arms).
+    let watermark = meta.stream_shard_watermark(group.id).unwrap_or(0);
+    let (first_page, next) =
+        get_records_page(&meta, &store, &group, leader, 1, (watermark, u32::MAX), 1);
+    assert_eq!(
+        first_page.len(),
+        1,
+        "[seed={seed}] the first Limit=1 call on the fresh tie must deliver one record: \
+         {first_page:?}"
+    );
+    let mid_tie_position = next.expect("the open path always returns a position");
+
+    // Seal WHILE the boundary above sits mid-tie — the exact race issue
+    // #852 describes: a client holding `mid_tie_position` polls again only
+    // after the tie it was mid-delivery through has already sealed.
+    let sealed = seal_now(&mut meta, &store, &group, leader, 2_000, false);
+    assert_eq!(sealed, Some(1), "[seed={seed}] expected epoch 1 to seal");
+
+    // Resume from the exact position the open-path call handed back — it
+    // now resolves against the SEALED shard (epoch 1 has a catalog row).
+    // Resume from `mid_tie_position`, NOT a fresh `TRIM_HORIZON` — the
+    // whole point of this part is proving a client-held mid-tie cursor
+    // survives the transition into the sealed path with no loss AND no
+    // duplication.
+    let rest = drain_sealed_epoch(&meta, &store, &group, leader, 1, mid_tie_position, 1, seed);
+    let mut delivered_c = first_page;
+    delivered_c.extend(rest);
+    assert_eq!(
+        delivered_c.len(),
+        items_c.len(),
+        "[seed={seed}] resuming across a seal boundary mid-tie must deliver every remaining \
+         record exactly once, none dropped: {delivered_c:?}"
+    );
+    assert_tied_delivery_is_sound(&items_c, &delivered_c, seed, "seal-boundary resume");
+    // The handed-back cursor itself must have been a genuine mid-tie
+    // position (this scenario is vacuous otherwise): same HLC as the first
+    // record's own, ordinal advanced by exactly one.
+    assert_eq!(
+        mid_tie_position.0, delivered_c[0].1,
+        "[seed={seed}] the resumed cursor's own HLC must match the tie it was still inside"
+    );
+}
+
+/// Shared assertions for one tied-commit page's worth of delivered records
+/// (issue #852): every item delivered exactly once, and every
+/// `SequenceNumber` — modeled here directly as the `(packed_hlc, ordinal)`
+/// pair every real reader now compares — is **distinct** and **strictly
+/// increasing** in delivery order (the property a real `SequenceNumber`
+/// string, built the identical fixed-width way, inherits automatically).
+fn assert_tied_delivery_is_sound(
+    written: &[(Vec<u8>, Vec<u8>)],
+    delivered: &[(Vec<u8>, u64, u32, Vec<u8>)],
+    seed: u64,
+    what: &str,
+) {
+    let mut seqnos: Vec<(u64, u32)> = Vec::new();
+    let mut got_by_key: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+    for (source_key, hlc, ordinal, record) in delivered {
+        seqnos.push((*hlc, *ordinal));
+        let item_key = source_key[..source_key.len() - 12].to_vec();
+        assert!(
+            got_by_key.insert(item_key.clone(), record.clone()).is_none(),
+            "[seed={seed}, {what}] item {item_key:?} delivered more than once"
+        );
+    }
+    for (key, payload) in written {
+        assert_eq!(
+            got_by_key.get(key),
+            Some(payload),
+            "[seed={seed}, {what}] item {key:?} missing or wrong payload — a tied record was \
+             silently dropped (issue #852)"
+        );
+    }
+    let mut sorted = seqnos.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(
+        sorted.len(),
+        seqnos.len(),
+        "[seed={seed}, {what}] every delivered SequenceNumber pair must be distinct: {seqnos:?}"
+    );
+    assert!(
+        seqnos.windows(2).all(|w| w[0] < w[1]),
+        "[seed={seed}, {what}] SequenceNumbers must be strictly increasing in delivery order: \
+         {seqnos:?}"
+    );
+}
+
+#[test]
+fn tied_multi_key_commit_paginates_without_loss() {
+    for_each_seed(
+        "tied_multi_key_commit_paginates_without_loss",
+        scenario_tied_multi_key_commit_paginates_without_loss,
     );
 }

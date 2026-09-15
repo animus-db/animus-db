@@ -505,8 +505,21 @@ async fn get_shard_iterator<E: Env, R: RelayClient>(
             return Err(trimmed_data_access(&format!("shard `{shard_id}`")));
         }
         match iterator_type {
+            // Issue #852 (found writing this fix's own regression corpus):
+            // `stream_shard_watermark` is a bare HLC — the immediately
+            // preceding sealed shard's own inclusive end — and sealing
+            // never deletes the physical `KIND_CHANGE` rows it consumed
+            // (trimming is the separate, asynchronous janitor's job). If
+            // that watermark HLC was itself a tie (a multi-key commit),
+            // the tie's own tail members (ordinal > 0) can still be
+            // physically present in `pending_changes()` when this shard's
+            // TRIM_HORIZON is requested — a bare `(watermark, 0)` floor
+            // would wrongly let them back in as "new," re-delivering
+            // content the sealed predecessor shard already served in
+            // full. `u32::MAX` excludes the whole tie at that HLC, exactly
+            // like the sealed-shard `Latest` arm just above.
             ShardIteratorType::TrimHorizon => {
-                (meta.stream_shard_watermark(tablet).unwrap_or(0), 0)
+                (meta.stream_shard_watermark(tablet).unwrap_or(0), u32::MAX)
             }
             ShardIteratorType::AtSequenceNumber => predecessor(parse_seq(sequence_number)?),
             ShardIteratorType::AfterSequenceNumber => parse_seq(sequence_number)?,
@@ -516,8 +529,10 @@ async fn get_shard_iterator<E: Env, R: RelayClient>(
                 // present — "current max + a not-yet-existent tick" per ADR
                 // 0042 §5, expressed via this crate's exclusive-lower-bound
                 // convention as "position = current max" (nothing new yet
-                // is > that).
-                let watermark = (meta.stream_shard_watermark(tablet).unwrap_or(0), 0);
+                // is > that). Same `u32::MAX` floor as `TrimHorizon` above,
+                // for the identical reason — the scan must not treat a
+                // leftover, already-sealed tie's tail as "current."
+                let watermark = (meta.stream_shard_watermark(tablet).unwrap_or(0), u32::MAX);
                 let hot = ctx
                     .read_stream_hot_records(tablet, watermark, usize::MAX)
                     .await
