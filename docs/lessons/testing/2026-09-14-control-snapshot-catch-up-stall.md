@@ -189,6 +189,6 @@ seeing it many times in a row with zero intervening forward progress is.
   real-thread-contention/real-leadership-churn shapes — see `prod_liveness.
   rs`'s own module doc for why this class of property needs a real-thread
   integration guard rather than a virtual-clock one): validated by 20x
-  stress reps of `prod_liveness.rs::large_metadata_catch_up_stays_live`
-  against an md5-verified-unchanged binary (0 failures after fixes 4+5,
-  versus a 20-40% failure rate with fix 1-3 alone).
+  stress reps of `prod_liveness.rs::large_metadata_catch_up_stays_live` (0
+  failures after fixes 4+5, versus a 20-40% failure rate with fixes 1-3
+  alone).

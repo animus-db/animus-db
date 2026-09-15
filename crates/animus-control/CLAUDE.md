@@ -1384,8 +1384,8 @@ per-tablet CP data plane (`animus-cp-data`).
     `env.now()`. Neither fourth nor fifth has a dedicated `SimEnv`
     regression (both are real-thread-contention/real-leadership-churn
     shapes); validated instead by 20x stress reps of `prod_liveness.rs`
-    against an md5-verified-unchanged test binary (0/20 failures with all
-    five fixes, versus 20-40% with only the first three). See the lessons
+    (0/20 failures with all five fixes, versus 20-40% with only the first
+    three). See the lessons
     doc above for the fuller account and the generalized lesson: any new
     bookkeeping feeding a defer/backoff gate needs an explicit answer to
     "what retires this, on *every* path that can make it stale, not just
