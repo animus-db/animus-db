@@ -9019,6 +9019,19 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
         } else {
             None
         };
+        // Issue #811: `did_work` must mean "state provably changed," never
+        // "a branch that usually changes state was entered." Being
+        // ELIGIBLE to attempt compaction (`threshold_hit`/`image_needed`)
+        // is not itself progress — `snapshot_upto` below can legitimately
+        // no-op (bounded by `last_applied`, which a restart can leave
+        // stuck below `ea` — see this function's own restart-disagreement
+        // note a few lines down), so the outcome is judged by what
+        // actually happened: a freshly-built on-demand image was installed
+        // (`image_needed` was true — a peer is genuinely waiting on it,
+        // and `image_needed` is a take-once flag so this can't itself
+        // spin), and/or a real WAL-rewriting compaction completed
+        // (`bytes.is_some()`, checked below).
+        let image_installed = image.is_some();
         // Serialize the WAL rewrite against the consensus loop's appends.
         let _wal = wal_lock.lock().await;
         let (bytes, lli) = {
@@ -9027,6 +9040,25 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
             // any stale image + in-flight transfer offsets), THEN install the
             // fresh image built from that same state — order matters, or the
             // base-move would drop the image we just built.
+            //
+            // Issue #811: `snapshot_upto` clamps its target to `c.last_applied()`
+            // (its own doc), which a restart can leave BELOW `ea` for a while.
+            // `engine_applied` is seeded at driver startup from the engine's own
+            // durable applied-watermark marker (written eagerly by
+            // `install_engine_image` in the SAME `merge_batch` as an installed
+            // snapshot's rows), but a completed `InstallSnapshot`'s matching
+            // `RaftCore::snapshot_index`/`last_applied` advance is only ever
+            // WAL-rewritten by a LATER pass of this same compaction block — one
+            // this exact restart-then-isolated scenario can never reach before
+            // the process stops, since `behind == 0` right after the install
+            // suppresses `threshold_hit` at the time. A restart recovering from
+            // that still-stale WAL comes back with `last_applied` pinned at the
+            // OLD, pre-install value until a leader re-drives commit past it, so
+            // `snapshot_upto(ea)` legitimately no-ops here (`new_index <=
+            // snapshot_index`) call after call — `behind` alone
+            // (`ea.saturating_sub(c.snapshot_index())`) can never shrink on its
+            // own without that Raft-level trigger, which `did_work`'s own
+            // truthfulness (not any change here) is what stops from spinning.
             c.snapshot_upto(ea);
             if let Some(image) = image {
                 c.set_snapshot_blob(image);
@@ -9071,6 +9103,10 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 (Some((records, round, c.snapshot_index())), lli)
             }
         };
+        // Captured before `bytes` is moved into the `if let` below — the
+        // other half of this attempt's own "did anything provably happen"
+        // verdict (see `image_installed`'s doc above).
+        let bytes_produced = bytes.is_some();
         if let Some((records, round, new_snapshot_index)) = bytes {
             // Issue #554: the durable applied-watermark marker is written
             // ONLY here (compaction/on-demand-image time), never on every
@@ -9184,7 +9220,12 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 }
             }
         }
-        did_work = true;
+        // Issue #811: NOT unconditional. Merely being eligible to attempt
+        // compaction (`threshold_hit`/`image_needed`, the outer `if` this
+        // whole block is gated on) is not itself progress — see
+        // `image_installed`'s doc above for the exact restart shape that
+        // used to make this spin forever with no eligibility ever expiring.
+        did_work |= image_installed || bytes_produced;
     }
 
     did_work
