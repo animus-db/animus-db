@@ -3317,21 +3317,45 @@ impl SimCluster {
     /// `self.controls`-vec index). Every comparison below goes through
     /// [`SimCluster::control_node_id`] instead.
     pub(crate) fn transfer_control_leadership_to(&mut self, target: u64) {
-        let mut leader = self.control_leader_index();
-        if self.control_node_id(leader) == target {
-            return;
-        }
-        for _ in 0..20 {
-            if self.controls[leader].transfer_leadership(nid(target)) {
-                break;
-            }
-            self.sim.run_for(Duration::from_millis(200));
-            leader = self.control_leader_index();
+        // Issue #900 follow-up: re-issue the arm against whoever is
+        // CURRENTLY leading, every iteration, rather than arming once
+        // against the leader observed at entry and then passively waiting
+        // out a fixed window. The original one-shot-arm-then-wait shape
+        // assumed the leader `transfer_leadership` was armed on stays
+        // leader until the handoff completes — true the overwhelming
+        // majority of the time, but not guaranteed: an ordinary,
+        // Raft-legal split-vote/re-election sequence (any randomized
+        // election timeout can put two candidates within one round-trip of
+        // each other) can depose the armed leader in favor of a THIRD node
+        // that never received the arm at all, at which point the original
+        // one-shot design stranded the transfer forever — the new leader
+        // has no memory of any pending transfer and simply keeps leading,
+        // and nothing ever re-arms it. Found live: seed `0xBAC7_4002`
+        // (`sim_cluster_backup_janitor::c2_leadership_transfer_yields_
+        // one_clean_reclaim`) reproducibly drives exactly this churn
+        // (`term` 1 -> 2 -> 3 -> 4 across all three voters within ~300ms,
+        // settling on a stable leader that was never the transfer's own
+        // target) once issue #900's own boot-path entropy shift (this
+        // crate's tablet groups now draw extra entropy at fresh-group
+        // formation, reshuffling every later random draw in the same run —
+        // ADR 0009/0017's own "boot-path entropy desync" collateral)
+        // landed this specific seed's election timeouts close enough
+        // together to trigger it — never observed against any of this
+        // fixture's five original seeds before. This is a genuine, if
+        // narrow, pre-existing gap in this test helper (not in
+        // `RaftCore::transfer_leadership` itself, which behaves exactly to
+        // its own documented contract throughout), fixed here rather than
+        // avoided by picking a seed that doesn't trigger it, since a
+        // different unlucky seed could hit the identical shape again at
+        // any time this fixture's own entropy footprint next shifts.
+        for _ in 0..40 {
+            let leader = self.control_leader_index();
             if self.control_node_id(leader) == target {
                 return;
             }
+            self.controls[leader].transfer_leadership(nid(target));
+            self.sim.run_for(Duration::from_millis(200));
         }
-        self.sim.run_for(Duration::from_secs(2));
         let new_leader = self.control_leader_index();
         let new_leader_id = self.control_node_id(new_leader);
         assert_eq!(

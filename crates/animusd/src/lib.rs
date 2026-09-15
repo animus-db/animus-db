@@ -2058,6 +2058,51 @@ const FORWARD_ELECTION_BACKOFF: Duration = Duration::from_millis(100);
 /// ([`MAX_REPLICATION_FACTOR`]) will ever actually present.
 const FORWARD_HOP_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// **Issue #900 follow-up.** The cap on a *hinted* forward hop's own
+/// timeout — unlike [`FORWARD_HOP_TIMEOUT`] (which only ever bounds a
+/// *guessed*, unvouched candidate), a hinted candidate used to get the
+/// **entire** remaining [`CLIENT_TIMEOUT`] budget with no cap at all
+/// (issue #585: "a hinted candidate gets the full `remaining` budget
+/// instead," `forward_to_tablet_leader`'s own doc) — sound reasoning
+/// under `ProdEnv`, where a hinted node that has actually crashed since
+/// the hint was formed fails **fast** (`relay_request_with_timeout`'s own
+/// `TcpStream::connect` either refuses or fails at the OS/network layer
+/// well under a second, surfacing as [`RELAY_TRANSPORT_FAILURE`] long
+/// before any timeout), so an uncapped hinted hop only ever actually
+/// *waits* the full budget for a genuinely live-but-slow leader (the
+/// membership-storm scenario issue #585 exists to accommodate).
+///
+/// **That reasoning does not hold under `SimEnv`.** `SimRelayClient::relay`
+/// (`animus_node::sim_relay`) has no equivalent fast-refusal signal at
+/// all — a crashed/partitioned peer and a merely slow one are perfectly
+/// indistinguishable (nothing arrives from either, ever, until the caller's
+/// own `timeout` elapses) — so a hinted hop to a peer that crashed the
+/// instant before the hint was read consumes the **entire** remaining
+/// budget waiting for a reply that will never come, leaving zero time for
+/// the hinted-retry chase (issue #316/#585) to ever try another replica —
+/// silently defeating that whole mechanism for exactly the case it exists
+/// to handle. Found live: `sim_cluster_data_only.rs`'s
+/// `c_crash_of_a_data_only_replica_holder_the_rest_keep_serving_then_it_
+/// catches_up`, seed `3665440779` — a survivor's own write picked up a
+/// hint still naming the data-only replica that had crashed moments
+/// earlier, and the whole `put` failed outright on that one hop, having
+/// never gotten a chance to try either of the two other, genuinely live
+/// replicas (one of which had already won the tablet's own re-election
+/// within ~300ms).
+///
+/// **Sized deliberately, generous enough to preserve issue #585's own
+/// scenario**: three times [`FORWARD_HOP_TIMEOUT`] (6s of the 10s
+/// [`CLIENT_TIMEOUT`] budget) comfortably covers that issue's own
+/// "several seconds, well past `FORWARD_HOP_TIMEOUT`" characterization of
+/// a real membership-change storm's commit latency, while still leaving
+/// [`CLIENT_TIMEOUT`] minus this — 4s — for the chase to fall back to
+/// another known replica if the hinted one really was dead. Applies
+/// identically under `ProdEnv` (where it is essentially never the
+/// binding constraint — a dead hinted peer already fails within this
+/// window via `RELAY_TRANSPORT_FAILURE`) and `SimEnv` (where it is the
+/// only thing that ever bounds a dead hinted peer's own hop at all).
+const HINTED_FORWARD_HOP_TIMEOUT: Duration = Duration::from_secs(6);
+
 /// Bounded attempts [`ClientCtx::txn_prepare_pushing`] gives a stage blocked
 /// by another transaction's unresolved intent (ADR 0018 §2/PR6, task #16)
 /// before giving up and reporting a client-facing conflict error.

@@ -671,3 +671,113 @@ caught up, closing the "wiped node is the leader" design fork explicitly
 rather than leaving it implicit. See `crates/animus-test/tests/
 raftkv_linearizable.rs`'s LSM-tier compaction-crossing cells for the same
 property proven over the nightly corpus.
+
+## Amendment (2026-09-15, issue #900) — the same wiped-voter double-vote hazard issue #667 closed for the control plane, closed here too
+
+Issue #667 (see ADR 0009's own 2026-09-15 amendments) fixed a P0 Raft
+safety hazard in `animus-control::node::drive`'s boot path: a voter whose
+persisted store replays empty is ambiguous between "genuine first
+bootstrap/growth-join" and "an already-established voter whose disk was
+wiped (ephemeral storage) and is restarting" — and granting a real vote
+in the latter case, forgetting a vote already cast under the same
+identity before the wipe, can elect two leaders in the same term. Issue
+#900 found the identical shape in this ADR's own driver:
+`animus-cp-data`'s tablet-group boot code had the exact same "recover if
+non-empty, else keep the fresh core built at construction, unconditionally"
+branch, with no cluster check at all in the empty-state case — a
+data-plane voter's disk wipe was exactly as unsafe as the control plane's
+was pre-#667.
+
+**What was already safe by construction, and why**: `RaftKvNode`
+instantiates `animus-control`'s own generic, sync `RaftCore<C, S>`
+unchanged (this ADR's own Decision, "reuses the control plane's sync
+`RaftCore`"), with `C = KvCommand`. Issue #667's entire disambiguation
+mechanism — `RaftCore::begin_cluster_check`/`handle_cluster_probe`/
+`handle_cluster_probe_resp`, the `cluster_check_pending`/
+`cluster_check_refused`/`heard_from` state, and the vote/campaign gating
+in `start_pre_vote`/`start_election`/`handle_request_vote` — lives on
+that generic core, not on `MetaCommand` specifically, so it already
+applied to a tablet group's own `RaftCore<KvCommand, KvState>` the moment
+issue #667 landed. `animus-cp-data::codec`'s hand-rolled binary `RaftMsg`
+framing already had working `ClusterProbe`/`ClusterProbeResp` encode/
+decode arms too, forced into existence by `RaftMsg`'s exhaustive match
+(its own comment said as much: "this crate's `RaftKvNode` never calls
+`RaftCore::begin_cluster_check`… but `RaftMsg<KvCommand>` is the same
+generic type either way, and this match must stay exhaustive"). And the
+per-node consensus loop already dispatches every inbound `RaftMsg`
+generically through `RaftCore::handle`, so a `ClusterProbe`/
+`ClusterProbeResp` that did arrive would already have been routed
+correctly. **The only missing piece was the driver-level boot wiring
+itself**: nothing in `animus-cp-data`'s own `drive` function ever called
+`begin_cluster_check`, so the inherited mechanism never engaged for a
+tablet group no matter what a wiped voter's peers would have honestly
+answered.
+
+**The fix**: `drive`'s WAL-recovery branch now mirrors
+`animus-control::node::drive`'s own shape exactly — the non-empty branch
+recovers as before; the new empty-state branch calls
+`begin_cluster_check` and spawns the initial probe broadcast, the
+identical fire-and-forget pattern (never awaited inline, so one
+replica's own first `recv` is never blocked behind every peer's send
+completing under real multi-replica bring-up). `RaftKvNode` gained
+`cluster_check_pending()`/`refused_as_voter()` accessors mirroring the
+control plane's own admin-diagnostic pair
+(`GenericControlHandle::cluster_check_pending`/`refused_as_voter`, added
+for issue #864).
+
+**One tablet-specific carve-out, not present in the control plane**: the
+check is skipped when the caller's own `campaign_immediately` flag is set
+— the ADR 0058 Train 2 rung 4 mechanism that lets the parent's own leader
+at an in-place split fork campaign synchronously, before this loop ever
+selects on a timer, to win the race against the child group's own cold
+randomized election timeout. That flag is set, by construction, only for
+a replica the caller has already proven is a genuine fresh formation
+(never a wiped restart — only `materialize_split_child` sets it, exactly
+once, at the fork itself), so skipping the check there is sound; running
+it anyway would gate `campaign_now` on `cluster_check_pending` and
+silently degrade the deterministic-first-leader optimization to an
+ordinary cold-timeout election on every single split, a real regression
+this fix must not cause. Every other fresh-group replica — an ordinary
+`CreateTablet`, a split child that is *not* the immediate-campaign
+leader, a reconciler-hosted new replica added at runtime, and a
+genuinely wiped voter restarting into an already-established group —
+goes through the same check the control plane's own genesis founders and
+growth joins do, and resolves the same way: a genuinely fresh replica's
+peers answer `!config.contains(asker)` or a genuinely fresh `0`/`0` state
+(both decisive on a single reply, matching the ADR 0060 growth-join
+case), while a genuinely wiped, previously-established voter's peers
+answer with real history that both names it and has itself heard from it
+before, once every peer has answered (the same wait-for-every-peer
+aggregation, unchanged) — never a false refusal for a legitimate new
+participant.
+
+**Collateral, expected**: wiring this in draws extra entropy
+(`env.next_u64()`) at every fresh-group boot that isn't the
+`campaign_immediately` fast path, reshuffling later random draws for the
+rest of that run — the identical "boot-path entropy desync" collateral
+issue #667's own fix produced for the control plane (this ADR's sibling,
+ADR 0009's 2026-09-15 amendments). One pre-existing fixed-seed test,
+`crates/animus-cp-data/tests/read_index.rs::
+linearizable_read_succeeds_after_a_full_membership_rotation`, needed its
+seed re-pinned for exactly this reason (see that test's own updated
+comment); no other fixed-seed test in this crate's suite was affected.
+
+**Regression**: `crates/animus-cp-data/tests/
+wiped_tablet_voter_boot_check.rs` — a `SimEnv`/`RaftKvNode`-driven, plain
+3-replica tablet group (no growth or split involved) with one voter's
+disk *and* engine wiped and restarted fresh into the already-established
+group, confirmed red (via the gate disabled in place, since the fix's own
+new accessor methods have no pre-fix API to compile a literal old-vs-new
+diff against — the same methodology `animus-control`'s own
+`wiped_voter_double_vote_safety.rs` documents) and green after. Confirmed
+unaffected: the full `cargo test -p animus-cp-data` suite (every existing
+corpus and unit test, 63 test binaries), `ANIMUS_RAFTKV_SEEDS=10`,
+`ANIMUS_RECONFIGURE_DROP_SEEDS=10`, and `ANIMUS_INPLACE_SPLIT_SEEDS=10`
+all stay green — a genuinely fresh replica (a new tablet, a split child,
+a reconciler-hosted runtime addition) keeps forming and campaigning
+exactly as before.
+
+See `docs/lessons/code-patterns/2026-09-15-a-generic-core-level-fix-does-
+not-wire-itself-into-every-driver.md` for the generalizable lesson, and
+`crates/animus-cp-data/CLAUDE.md`'s own note in "Entry points" for the
+crate-local detail.

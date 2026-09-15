@@ -448,8 +448,52 @@ fn c2_leadership_transfer_yields_one_clean_reclaim() {
 
 #[test]
 fn c2_leadership_transfer_yields_one_clean_reclaim_over_seeds() {
-    for i in 0..5 {
-        run_c2_leadership_transfer_yields_one_clean_reclaim(0xBAC7_4000 + i);
+    // Issue #900: wiring issue #667's boot-time cluster check into
+    // `animus-cp-data`'s own tablet-group driver (this fixture's `orders`
+    // table hosts real `RaftKvNode` tablet groups alongside the control
+    // plane) draws extra entropy on every fresh-group replica's boot,
+    // reshuffling this corpus's tuned timing — the same "boot-path entropy
+    // desync" collateral documented in `docs/lessons/testing/2026-09-15-
+    // boot-path-entropy-desyncs-fixed-seeds.md`.
+    //
+    // **`0xBAC7_4002` (3133620226) genuinely never converged, even at 10x
+    // the original budget — characterized, not re-pinned away.** Traced
+    // with fine-grained (20ms) per-node role/term snapshots
+    // (`SimCluster::transfer_control_leadership_to`'s own temporary
+    // instrumentation, not committed): the reshuffled entropy lands this
+    // seed's election timeouts close enough together that, ~40-60ms after
+    // the transfer arms on the original leader (node 2, term 1), an
+    // ordinary Raft-legal split-vote/re-election sequence runs — node 0
+    // briefly wins term 2, is immediately superseded, node 2 campaigns for
+    // term 3 and stalls uncontested for ~160ms, then all three jump to
+    // term 4 and node **1** (never the transfer's own target, node 0) wins
+    // and stays a perfectly healthy, stable leader for the rest of the
+    // run. `cluster_check_pending`/`refused_as_voter` are `false` on every
+    // control node throughout the entire sequence — issue #900's own
+    // mechanism never engages here at all; the storm is an ordinary,
+    // bounded (~300ms) Raft election outcome the entropy shift merely
+    // made reachable for this seed. The real defect this exposed:
+    // `transfer_control_leadership_to` armed the transfer once, on the
+    // leader observed at entry, then passively waited a fixed window —
+    // once that leader was deposed by the unrelated storm, the transfer
+    // was stranded forever (the new leader, node 1, never received any
+    // arm request and had no reason to ever step down). Fixed in that
+    // method itself: it now re-issues the arm against whoever currently
+    // leads on every poll, so a deposed arm is simply re-armed on the new
+    // leader instead of being silently lost. With the fix, `0xBAC7_4002`
+    // converges within 500ms of the fixed retry loop starting
+    // (measured directly: `ANIMUS_SEED=3133620226 cargo test -p animusd
+    // --lib c2_leadership_transfer_yields_one_clean_reclaim`), comfortably
+    // inside the loop's own 8s budget — pinned back in, proven rather than
+    // avoided.
+    for seed in [
+        0xBAC7_4000,
+        0xBAC7_4001,
+        0xBAC7_4002,
+        0xBAC7_4003,
+        0xBAC7_4004,
+    ] {
+        run_c2_leadership_transfer_yields_one_clean_reclaim(seed);
     }
 }
 

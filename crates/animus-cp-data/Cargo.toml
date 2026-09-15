@@ -98,3 +98,12 @@ required-features = ["prod-heavy"]
 name = "prod_compaction_persist_round"
 path = "tests/prod_compaction_persist_round.rs"
 required-features = ["prod-heavy"]
+
+# Real-thread `ProdEnv` liveness test (issue #900), mirroring
+# `animus-control`'s own `tests/prod_liveness.rs::wiped_voter_refuses_and_
+# the_rest_of_the_cluster_keeps_serving`. Same `required-features` gating
+# as above.
+[[test]]
+name = "prod_wiped_voter_liveness"
+path = "tests/prod_wiped_voter_liveness.rs"
+required-features = ["prod-heavy"]
