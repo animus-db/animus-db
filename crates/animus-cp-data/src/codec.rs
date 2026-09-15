@@ -226,7 +226,17 @@ const MAGIC: u8 = 0xCB;
 /// doc and the Key invariants "Witnessing" bullet in this crate's
 /// `CLAUDE.md` for the full account. Same house convention: a clean bump,
 /// no cross-version compatibility required.
-const VERSION: u8 = 29;
+/// `30` (issue #667, P0 Raft safety): `RaftMsg` (shared with
+/// `animus-control`) gained `ClusterProbe` (tag `12`) and
+/// `ClusterProbeResp { term, committed_index, config }` (tag `13`) — the
+/// boot-time genesis-vs-wiped-voter-restart check's own wire messages (see
+/// `animus-control::raft`'s doc). This crate's own `RaftKvNode` never
+/// calls `RaftCore::begin_cluster_check` (only `animus-control`'s driver
+/// does), so neither variant is ever actually produced here in production
+/// — but `RaftMsg<KvCommand>` is the same generic type this crate's own
+/// hand-rolled codec must stay exhaustive over regardless. Same house
+/// convention: a clean bump, no cross-version compatibility required.
+const VERSION: u8 = 30;
 
 /// A decode failure: a description of what was malformed, surfaced loudly by
 /// the caller (logged + dropped; never silently misread).
@@ -1072,6 +1082,26 @@ fn put_raft(out: &mut Vec<u8>, m: &RaftMsg<KvCommand>) {
             put_u8(out, 11);
             put_u64(out, *term);
         }
+        // Issue #667 (P0 Raft safety): this crate's `RaftKvNode` never calls
+        // `RaftCore::begin_cluster_check` (only `animus-control`'s own
+        // `node.rs` driver does), so these two variants never actually ride
+        // this wire in production — but `RaftMsg<KvCommand>` is the same
+        // generic type either way, and this match must stay exhaustive.
+        // Encoded for completeness/forward-compat rather than `unreachable!`,
+        // on the same footing as every other variant here.
+        RaftMsg::ClusterProbe => {
+            put_u8(out, 12);
+        }
+        RaftMsg::ClusterProbeResp {
+            term,
+            committed_index,
+            config,
+        } => {
+            put_u8(out, 13);
+            put_u64(out, *term);
+            put_u64(out, *committed_index);
+            put_node_set(out, config);
+        }
     }
 }
 
@@ -1151,6 +1181,12 @@ fn read_raft(c: &mut Cursor<'_>) -> Result<RaftMsg<KvCommand>, DecodeError> {
             commit_index: c.u64()?,
         },
         11 => RaftMsg::WakeRequest { term: c.u64()? },
+        12 => RaftMsg::ClusterProbe,
+        13 => RaftMsg::ClusterProbeResp {
+            term: c.u64()?,
+            committed_index: c.u64()?,
+            config: c.node_set()?,
+        },
         other => return Err(format!("unknown RaftMsg tag {other}")),
     })
 }

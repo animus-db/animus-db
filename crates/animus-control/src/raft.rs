@@ -2984,8 +2984,34 @@ where
         // more round trips to recover from. `max` makes the tracked offset
         // monotonic regardless of ack arrival order — independent of, and
         // additive with, the resend cap below.
+        //
+        // Issue #899 amendment: `next_offset == 0` is a genuine reset, not
+        // a reorder to guard against. `handle_install_snapshot`'s own
+        // "still in progress" branch can only ever report exactly `0` when
+        // `self.incoming_snapshot` is `None` -- which, for an ack reaching
+        // this far (`last_index == 0`, so no completed transfer either),
+        // means the follower has FORGOTTEN whatever it was assembling (a
+        // real restart discarding the volatile in-flight buffer, per
+        // `handle_install_snapshot`'s own doc -- never a reordered ack for
+        // an ongoing transfer, since that always reports a nonzero
+        // `inc.buf.len()`). Applying the monotonic `max` here left a
+        // restarted follower and its leader permanently deadlocked: the
+        // leader kept re-sending chunks at its own stale (pre-restart, high)
+        // tracked offset, which the follower's `fresh && offset == 0` guard
+        // (`handle_install_snapshot`) can never treat as the start of a
+        // fresh transfer, so `incoming_snapshot` never re-initializes and
+        // the transfer never resumes. Confirmed via
+        // `chunked_snapshot_receiver_stop_restart_3`'s fixed corpus seed
+        // (also reachable with zero unrelated code changes at all, by
+        // perturbing any other seed into this same narrow window -- the bug
+        // is pre-existing, not specific to how the seed is reached). See
+        // `docs/lessons/` for the incident writeup.
         let entry = self.snapshot_offset.entry(from.clone()).or_insert(0);
-        *entry = (*entry).max(next_offset);
+        if next_offset == 0 {
+            *entry = 0;
+        } else {
+            *entry = (*entry).max(next_offset);
+        }
         // `SnapshotResend::Capped(SNAPSHOT_ACK_RESEND_CAP)`, not `Always` and
         // not `Capped(0)` — see `snapshot_chunk_for`'s own doc for why this
         // one call site needs a genuine, nonzero-but-bounded cap rather than
