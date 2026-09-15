@@ -804,7 +804,10 @@ mod tests {
         assert_eq!(v["eventVersion"], "1.1");
         assert_eq!(v["eventSource"], "aws:dynamodb");
         assert_eq!(v["awsRegion"], "animus");
-        assert_eq!(v["dynamodb"]["SequenceNumber"], format_sequence_number(42, 0));
+        assert_eq!(
+            v["dynamodb"]["SequenceNumber"],
+            format_sequence_number(42, 0)
+        );
         assert_eq!(v["dynamodb"]["StreamViewType"], "NEW_AND_OLD_IMAGES");
         assert!(v["dynamodb"]["NewImage"].is_object());
         assert!(v["dynamodb"]["OldImage"].is_null());

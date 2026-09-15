@@ -492,7 +492,8 @@ fn verify_lineage(
     let mut seen_seqnos: BTreeSet<(u64, u32)> = BTreeSet::new();
     let mut total = 0usize;
     for (group, leader) in lineage {
-        for (source_key, hlc, ordinal, record) in collect_tablet_records(meta, store, group, *leader)
+        for (source_key, hlc, ordinal, record) in
+            collect_tablet_records(meta, store, group, *leader)
         {
             assert!(
                 seen_seqnos.insert((hlc, ordinal)),
@@ -2504,8 +2505,7 @@ fn scenario_tied_multi_key_commit_paginates_without_loss(seed: u64) {
     // path independently survives the identical tie.
     let sealed = seal_now(&mut meta, &store, &group, leader, 1_000, false);
     assert_eq!(sealed, Some(0), "[seed={seed}] expected epoch 0 to seal");
-    let delivered_a_sealed =
-        drain_sealed_epoch(&meta, &store, &group, leader, 0, (0, 0), 1, seed);
+    let delivered_a_sealed = drain_sealed_epoch(&meta, &store, &group, leader, 0, (0, 0), 1, seed);
     assert_eq!(
         delivered_a_sealed.len(),
         items_a.len(),
@@ -2597,7 +2597,9 @@ fn assert_tied_delivery_is_sound(
         seqnos.push((*hlc, *ordinal));
         let item_key = source_key[..source_key.len() - 12].to_vec();
         assert!(
-            got_by_key.insert(item_key.clone(), record.clone()).is_none(),
+            got_by_key
+                .insert(item_key.clone(), record.clone())
+                .is_none(),
             "[seed={seed}, {what}] item {item_key:?} delivered more than once"
         );
     }

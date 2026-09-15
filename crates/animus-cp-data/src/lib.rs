@@ -7463,7 +7463,8 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     // Single call, whole `change_log` at once — always
                     // starts at ordinal 0; nothing else materializes at
                     // this same `ts` in this entry.
-                    let _ = materialize_derived(kind_scopes, &writes, &change_log, ts, &mut pending, 0);
+                    let _ =
+                        materialize_derived(kind_scopes, &writes, &change_log, ts, &mut pending, 0);
                 }
             }
             KvCommand::KindEval {
@@ -8186,7 +8187,14 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                         // Single call, the WHOLE stage-marker list at once
                         // (built above from every write in this stage) —
                         // always starts at ordinal 0.
-                        let _ = materialize_derived(kind_scopes, &[], &stage_markers, ts, &mut pending, 0);
+                        let _ = materialize_derived(
+                            kind_scopes,
+                            &[],
+                            &stage_markers,
+                            ts,
+                            &mut pending,
+                            0,
+                        );
                     }
                     if is_anchor {
                         let record = txn::TxnRecord {

@@ -10554,7 +10554,9 @@ mod stream_write_path_tests {
         // 12 bytes total (issue #852) — the HLC lives at [len-12, len-4).
         let distinct_hlcs: std::collections::BTreeSet<u64> = records
             .iter()
-            .map(|(key, _)| u64::from_be_bytes(key[key.len() - 12..key.len() - 4].try_into().unwrap()))
+            .map(|(key, _)| {
+                u64::from_be_bytes(key[key.len() - 12..key.len() - 4].try_into().unwrap())
+            })
             .collect();
         assert!(
             distinct_hlcs.len() <= 1,

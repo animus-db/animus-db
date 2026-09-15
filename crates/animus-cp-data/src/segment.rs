@@ -756,7 +756,11 @@ mod tests {
         let decoded = decode(&bytes).expect("decodes");
         assert_eq!(decoded.records, records);
         assert_eq!(
-            decoded.records.iter().map(|r| r.ordinal).collect::<Vec<_>>(),
+            decoded
+                .records
+                .iter()
+                .map(|r| r.ordinal)
+                .collect::<Vec<_>>(),
             vec![0, 1, 2]
         );
     }

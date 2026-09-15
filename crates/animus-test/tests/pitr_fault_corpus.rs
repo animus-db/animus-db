@@ -160,7 +160,6 @@ fn record_seqno_suffix(key: &[u8]) -> Option<(u64, u32)> {
     Some((hlc, ordinal))
 }
 
-
 /// `orders` with a schema and PITR enabled at generation 1 — `base_meta`'s
 /// PITR twin, mirroring `stream_lineage_corpus.rs::base_meta`'s exact
 /// two-step shape (schema, then the feature toggle).
@@ -306,13 +305,14 @@ fn collect_pitr_records(
         }
     }
     let watermark = meta.pitr_segment_watermark(group.id).unwrap_or(0);
-    let mut hot: Vec<(Vec<u8>, u64, u32, Vec<u8>)> = block_on(group.nodes[leader].pending_changes())
-        .into_iter()
-        .filter_map(|(k, v)| {
-            let (hlc, ordinal) = record_seqno_suffix(&k)?;
-            (hlc > watermark).then_some((k, hlc, ordinal, v))
-        })
-        .collect();
+    let mut hot: Vec<(Vec<u8>, u64, u32, Vec<u8>)> =
+        block_on(group.nodes[leader].pending_changes())
+            .into_iter()
+            .filter_map(|(k, v)| {
+                let (hlc, ordinal) = record_seqno_suffix(&k)?;
+                (hlc > watermark).then_some((k, hlc, ordinal, v))
+            })
+            .collect();
     hot.sort_by_key(|(_, hlc, ordinal, _)| (*hlc, *ordinal));
     all.extend(hot);
     all
