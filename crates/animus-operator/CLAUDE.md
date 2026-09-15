@@ -503,6 +503,31 @@ yaml` rather than only in an ADR. **Whether this should instead be a hard
 validating-webhook rejection is left open as a maintainer decision** — see
 ADR 0060's amendment.
 
+**The real, third bug (found after the ephemeral-storage fix landed):
+`advance_control_growth` must never be gated on the `ControlNodesGrowing`
+status condition surviving across reconciles.** The call site in
+`reconcile` used to be `if target_control_nodes > prior || already_growing
+{ ... }`, where `prior` (`previous_applied_control_nodes`, the
+ConfigMap's own applied value) reaches `target` on the very first
+reconcile after a `controlNodes` edit (`reconcile_grows_regenerates_the_
+configmap_role_split_immediately`'s own pinned behavior) — so from the
+second reconcile onward, only `already_growing` (read off `cluster.
+status`, delivered by `kube-runtime`'s watch-fed reflector, never a live
+`GET`) could still trigger the check at all. A real occurrence (issue
+#864) showed exactly this: the growth-step log line present on the
+reconcile right after the patch, and never again once the promoted
+ordinal went `NotReady` — `advance_control_growth` simply stopped being
+called, permanently, with `prior` never dropping back down to retrigger
+it. **Fixed by calling `advance_control_growth` unconditionally** once
+`prior` is known and the edit isn't a rejected shrink — its own first
+step (`discover_control_voters`) is already a cheap live check that
+decides whether there's anything to do, exactly matching this module's
+own "live-truth-driven, not a stored plan" design intent; the status
+condition is a resume-optimization / progress message only, never a gate
+on whether to check again. See ADR 0060's amendment (Part C) for the full
+account and `reconcile_still_attempts_growth_when_the_growing_condition_
+did_not_survive`'s own regression test.
+
 ## TLS (ADR 0064 commit 3)
 
 `AnimusClusterSpec.tls: Option<TlsSpec>` (`crd.rs`), two mutually exclusive

@@ -1103,31 +1103,59 @@ async fn reconcile<C: ClusterApi, A: AdminOps>(
             status
                 .conditions
                 .retain(|c| c.type_ != CONDITION_CONTROL_NODES_SHRINK_REJECTED);
-            let already_growing = status
-                .conditions
-                .iter()
-                .any(|c| c.type_ == CONDITION_CONTROL_NODES_GROWING);
-            if target_control_nodes > prior || already_growing {
-                let admin_port =
-                    cluster.spec.base_port_or_default() + desired::cluster_config::PORT_ADMIN;
-                let internal_port =
-                    cluster.spec.base_port_or_default() + desired::cluster_config::PORT_INTERNAL;
-                let tls_ca = resolve_tls_ca(&ctx.cluster_api, &cluster, &ns, &name).await?;
-                advance_control_growth(
-                    &ctx,
-                    &name,
-                    &ns,
-                    target_control_nodes,
-                    prior,
-                    admin_port,
-                    internal_port,
-                    tls_ca.as_deref(),
-                    &mut status,
-                )
-                .await
-            } else {
-                target_control_nodes
-            }
+            // Issue #864 (second recurrence, after the ephemeral-storage
+            // fix): this used to call `advance_control_growth` only when
+            // `target_control_nodes > prior || already_growing` — gating
+            // the live check itself on the very status condition
+            // `advance_control_growth`'s own doc says should be "a resume
+            // *optimization* ... never the source of truth". That inverted
+            // the intended design into a real bug: `prior` (read back from
+            // the *ConfigMap*, which `reconcile_grows_regenerates_the_
+            // configmap_role_split_immediately` proves jumps to the full
+            // `target` on the very FIRST reconcile after a `controlNodes`
+            // edit lands, long before any voter is actually added) reaches
+            // `target` after that one reconcile, so from the SECOND
+            // reconcile onward the only thing that could still trigger
+            // `advance_control_growth` was `already_growing` — read from
+            // *this reconcile's own* `cluster.status`, which `kube-runtime`
+            // delivers from its watch-fed reflector `Store`, not a live
+            // GET. A confirmed real-cluster recurrence (issue #864,
+            // `e2e-kind-webhook` run 35034285159 job 104599679844) showed
+            // exactly this: the growth-step log line present on the very
+            // first post-patch reconcile (while the promoted ordinal was
+            // still the old, Ready pod) and never again on any of the four
+            // 30s-spaced reconciles that followed (once that ordinal went
+            // `NotReady`, restarted by the very same config-hash rollout
+            // this growth step exists to drive) — a stalled growth that a
+            // reflector catching up late (exactly the busier-than-usual
+            // window a `StatefulSet` rollout creates) can never self-heal,
+            // since `prior` never drops back below `target` to retrigger
+            // it another way. The fix: always call `advance_control_growth`
+            // once `prior` is known and this isn't a rejected shrink —
+            // its own first, cheap step (`discover_control_voters`, one
+            // fast `GET` in the already-converged steady state, since it
+            // returns on the first ordinal that answers) is what actually
+            // decides whether there is anything to do, exactly as the
+            // "live-truth-driven, not a stored plan" design already
+            // intends; the status condition remains a user-visible
+            // progress message, never a gate on whether to check again.
+            let admin_port =
+                cluster.spec.base_port_or_default() + desired::cluster_config::PORT_ADMIN;
+            let internal_port =
+                cluster.spec.base_port_or_default() + desired::cluster_config::PORT_INTERNAL;
+            let tls_ca = resolve_tls_ca(&ctx.cluster_api, &cluster, &ns, &name).await?;
+            advance_control_growth(
+                &ctx,
+                &name,
+                &ns,
+                target_control_nodes,
+                prior,
+                admin_port,
+                internal_port,
+                tls_ca.as_deref(),
+                &mut status,
+            )
+            .await
         }
         None => {
             status
@@ -2488,6 +2516,65 @@ mod tests {
             ctx.admin.control_voters().contains("demo-3"),
             "growth must resume from the surviving status condition, not stall forever \
              just because the ConfigMap already matches the target"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_still_attempts_growth_when_the_growing_condition_did_not_survive() {
+        // Issue #864 (second recurrence): a real cluster showed the growth
+        // step's own log line present on the reconcile right after
+        // `spec.controlNodes` was patched (while the promoted ordinal was
+        // still the old, Ready pod) and never again afterward, once that
+        // ordinal went NotReady — recreated by the very same config-hash
+        // rollout this growth step exists to drive. The prior code only
+        // ever called `advance_control_growth` when `target_control_nodes
+        // > prior || already_growing` — and since the ConfigMap's own
+        // `prior` value reaches `target` on that very first reconcile
+        // (`reconcile_grows_regenerates_the_configmap_role_split_
+        // immediately`), every reconcile after that depended entirely on
+        // `already_growing`, read from *this reconcile's own* `cluster.
+        // status` — which a real `kube-runtime` Controller delivers from
+        // its watch-fed reflector `Store`, not a live GET, and which can
+        // legitimately lag exactly during the busier-than-usual window a
+        // `StatefulSet` rollout creates. This test is the sibling of
+        // `reconcile_resumes_growth_from_live_truth_after_a_simulated_
+        // restart` with the ONE thing that test relies on removed: no
+        // `ControlNodesGrowing` condition survives on `cluster.status` at
+        // all (`Default::default()`, exactly what a stale reflector read —
+        // or a controller that never even got to write it yet — would
+        // hand back) — growth must still be attempted and land, because
+        // the live check must never depend on that condition to run at
+        // all, only to report progress once it does.
+        let fake_cluster = FakeClusterApi::new();
+        let prior_spec = AnimusClusterSpec {
+            nodes: 5,
+            control_nodes: Some(5),
+            ..Default::default()
+        };
+        fake_cluster.seed_configmap(
+            &desired::config_map_name("demo"),
+            prior_cluster_configmap("demo", "ns1", &prior_spec),
+        );
+        let fake_admin = FakeAdminClient::new();
+        fake_admin.seed_control_voters(["demo-0", "demo-1", "demo-2"].map(String::from));
+        fake_admin.mark_ordinal_ready_both(3);
+        fake_cluster.seed_pod_ip("demo-3", "10.0.0.4");
+        let ctx = make_ctx(fake_cluster, fake_admin);
+
+        // No status at all — no surviving `ControlNodesGrowing` condition,
+        // and `cluster.spec.controlNodes` (5) already equals the
+        // ConfigMap's own `prior` (5): this is exactly the shape the old
+        // `target_control_nodes > prior || already_growing` gate would
+        // have skipped entirely.
+        let cluster = test_cluster("demo", "ns1", 5, Some(5));
+        assert!(cluster.status.is_none());
+
+        let result = reconcile(Arc::new(cluster), Arc::clone(&ctx)).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+        assert!(
+            ctx.admin.control_voters().contains("demo-3"),
+            "growth must still be attempted from live truth even with no surviving status \
+             condition and prior == target — the live check, not the condition, must gate this"
         );
     }
 

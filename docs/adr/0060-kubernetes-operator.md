@@ -1455,3 +1455,90 @@ validating-webhook rejection.
 See issue #864 for the full investigation, `crates/animus-operator/
 CLAUDE.md`'s own S-07d section for the config-hash detail, and ADR 0009's
 2026-09-15 amendment for the boot-time check this hazard interacts with.
+
+### Part C (same day, continued) — the real circular dependency: the growth check's own gate, not readiness
+
+The durable-storage fix (Part B) closed one recurrence, but a follow-up
+real occurrence (`e2e-kind-webhook`, run 35034285159, job 104599679844)
+reproduced the *original* signature — the promoted ordinal stuck as
+`PreCandidate` (a fresh, self-inclusive genesis core forever pre-voting,
+correctly rejected by peers that already have a leader), voters stuck at
+`prior`, for the full 120s guard — with PVC storage in place, ruling out
+Part B's own mechanism.
+
+**What the operator's own log showed, with this ADR's own new logging in
+place**: the growth-step's "pod ordinal 3 has not yet restarted into role
+`combined`" line appeared exactly once, on the very first reconcile after
+the `controlNodes` patch — while the promoted ordinal was still the
+**old, Ready, data-role pod**. Every reconcile after that (once the
+config-hash rollout recreated that ordinal and it went `NotReady`) logged
+only the bare "reconciling AnimusCluster" line — `advance_control_growth`
+was never entered again at all.
+
+**Root cause, found by inspection, `controller.rs`'s `reconcile`**: the
+call to `advance_control_growth` was gated on `target_control_nodes >
+prior || already_growing`, where `prior` comes from
+`previous_applied_control_nodes` (the *ConfigMap's* own applied
+`controlNodes` value) and `already_growing` from a
+`CONDITION_CONTROL_NODES_GROWING` status condition read off *this
+reconcile's own* `cluster.status` argument. `reconcile_grows_
+regenerates_the_configmap_role_split_immediately`'s own pinned behavior
+means `prior` reaches `target` on that very first post-patch reconcile
+(the ConfigMap/StatefulSet must show the full target immediately so the
+promoted ordinal can restart into the right role at all) — so from the
+second reconcile onward, `already_growing` was the *only* thing that
+could still trigger the check. That condition is delivered to `reconcile`
+via `kube-runtime`'s watch-fed reflector `Store`, never a live `GET` — a
+real round trip through the API server whose latency is not bounded, and
+which this ADR's own S-07d design doc already says should never be load-
+bearing this way: `advance_control_growth`'s own doc calls the condition
+"a resume *optimization* ... never the source of truth," but the gate
+above made it exactly that once `prior` caught up. Whatever the precise
+timing (busier-than-usual API server traffic during the very rollout this
+mechanism exists to drive is one plausible contributor, though not
+confirmed), the design was fragile by construction: a single missed or
+delayed status round trip, at any point during an active growth, stops
+growth forever, since `prior` never drops back down to make `target >
+prior` true again.
+
+**Fix**: `advance_control_growth` is now called unconditionally whenever
+`prior` is known and the edit is not a rejected shrink — dropping the
+`already_growing` gate entirely. This is not a new cost in the way it
+might look: `advance_control_growth`'s own first step
+(`discover_control_voters`) is a single fast `GET` in the already-
+converged steady state (it returns on the first ordinal that answers),
+and it is what *already* decides whether there is anything to do — the
+condition remains exactly what the design intended it to be, a
+resume-optimization / user-visible progress message, never a gate on
+whether to check again. Regression:
+`reconcile_still_attempts_growth_when_the_growing_condition_did_not_
+survive` (`controller.rs`) — the sibling of the pre-existing `reconcile_
+resumes_growth_from_live_truth_after_a_simulated_restart` with the one
+thing that test relies on removed (no surviving status condition at all);
+confirmed to fail against the pre-fix gate and pass against the fix.
+
+**Also confirmed, not needing the same guard**: a plain `spec.nodes`
+scale-up (no `controlNodes` change) never touches the shared config-hash
+annotation at all — `config_hash_is_unchanged_by_a_nodes_only_scale_up`
+(`desired/statefulset.rs`) is the existing, still-green proof — so it
+never triggers a whole-`StatefulSet` roll and needs no equivalent fix.
+
+### Part D (same day) — a shell comment inside an unquoted heredoc is not a YAML comment
+
+Part B's own explanatory comment, written directly inside `scripts/
+e2e-kind.sh`'s unquoted manifest heredoc, carried backticks — which bash
+executes as command substitution inside an unquoted heredoc regardless of
+a leading `#` (`bash -n` cannot see this). Every e2e variant on that
+commit failed at "apply AnimusCluster" with a YAML parse error and a
+trail of "command not found" lines. Fixed by moving the explanation above
+the heredoc as an ordinary shell comment (always safe — a genuine `#`
+line is never re-interpreted there) and leaving a single, backtick-free
+line inside the heredoc itself. See `docs/lessons/testing/2026-09-15-a-
+comment-inside-an-unquoted-heredoc-is-shell-not-yaml.md` for the general
+lesson. The same commit also added a wait for the whole `StatefulSet`
+rollout (`kubectl rollout status statefulset/${AC_NAME}`) to finish
+before the e2e re-resolves the serving pod after growth converges — the
+config-hash rollout does not stop at the newly-promoted ordinal, it
+proceeds through every pre-existing voter's pod too (Part B's own
+mechanism), and the e2e's own "re-resolve and re-forward" phase was
+racing that continuation.

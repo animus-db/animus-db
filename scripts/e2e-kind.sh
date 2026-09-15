@@ -1242,7 +1242,32 @@ wait_for_progress "control group reports 4 voters" 600 120 5 \
     -- control_growth_progress_signal "$GROWTH_TARGET_ORDINAL"
 log "control group now reports 4 voters"
 
+# Issue #864 (follow-up): "4 voters" only means the newly-promoted ordinal
+# (3) has landed — the SAME config-hash pod-template annotation that
+# triggered its own restart is shared by the whole StatefulSet, so the
+# rolling restart above does not stop there. It proceeds, highest-ordinal-
+# first, through ordinals 2, 1, 0 as well (each an already-correct-role,
+# already-a-voter pod being recycled purely because the shared hash
+# changed — see ADR 0060's 2026-09-15 amendment and `crates/animus-
+# operator/CLAUDE.md`'s own S-07d section). Confirmed live (run
+# 35034285159, job 104599679557, on the durable-storage fix): growth
+# converged in 15s, then the very next phase's freshly-resolved serving
+# pod (e2e-1) was itself deleted/recreated moments later by this same
+# still-in-flight rollout, and its admin port-forward never became ready.
+# Waiting for the WHOLE rollout to finish here — before resolving (or
+# re-resolving) any specific pod as "the" serving pod — is the fix: any
+# earlier resolve is racing a StatefulSet controller that has not
+# finished touching every ordinal yet.
+phase "wait for the controlNodes config-hash rollout to fully finish (issue #864)"
+kubectl rollout status "statefulset/${AC_NAME}" -n "$NAMESPACE" --timeout=300s
+
 phase "check the PodDisruptionBudget after controlNodes growth (S-07d)"
+# Safe to check even mid-rollout, and certainly safe now that the rollout
+# above has finished: `maxUnavailable` is computed by the operator's own
+# reconcile straight from spec.nodes/spec.controlNodes (`desired::
+# poddisruptionbudget`), applied server-side to the PodDisruptionBudget
+# object itself — it does not read any pod's own runtime/readiness state,
+# so it is unaffected by whether the StatefulSet's rollout is in flight.
 # nodes=4/controlNodes=4 now: the control-plane term is floor((4-1)/2)=1,
 # still capped at the same value by the RF-plateaued data-plane term
 # (floor((min(4,3)-1)/2)=1) — the point of this check is that the operator
@@ -1254,18 +1279,18 @@ PDB_MAX_UNAVAIL="$(kubectl get pdb "${AC_NAME}-pdb" -n "$NAMESPACE" \
 after growing controlNodes to 4, got ${PDB_MAX_UNAVAIL:-<empty>}"
 log "PodDisruptionBudget ${AC_NAME}-pdb reports maxUnavailable=1 after growth"
 
-# The rolling restart above may well have recycled the exact pod this
-# script's port-forward targets (a `kubectl port-forward pod/...` dies the
-# moment that specific pod is deleted/recreated) — re-resolve and
-# re-forward the same way the original "resolve which pod .../wait for
-# readiness" phase did, rather than trusting the pre-growth forward is
-# still alive. `control_voters_reading`'s own self-heal (issue #703) may
-# already have done this once during the wait above, but this phase's own
-# forward could just as easily have died again since — a fresh,
-# unconditional re-forward here (fatal=1: by this point growth already
-# converged, so a failure here is a real problem, not a transient miss) is
-# simpler than trying to reason about whether the self-heal's own forward
-# is still current.
+# The rolling restart has now fully finished (the `rollout status` wait
+# above), including — likely — the exact pod this script's port-forward
+# targets (a `kubectl port-forward pod/...` dies the moment that specific
+# pod is deleted/recreated) — re-resolve and re-forward the same way the
+# original "resolve which pod .../wait for readiness" phase did, rather
+# than trusting the pre-growth forward is still alive. `control_voters_
+# reading`'s own self-heal (issue #703) may already have done this once
+# during the wait above, but this phase's own forward could just as
+# easily have died again since — a fresh, unconditional re-forward here
+# (fatal=1: by this point growth already converged, so a failure here is
+# a real problem, not a transient miss) is simpler than trying to reason
+# about whether the self-heal's own forward is still current.
 phase "re-resolve and re-forward the serving pod after controlNodes growth"
 resolve_and_forward_dynamo_pod 1
 wait_for "pod ${DYNAMO_POD}'s /admin/health is 200" 60 2 -- admin_health_ready
