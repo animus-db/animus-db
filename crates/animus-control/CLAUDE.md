@@ -1765,7 +1765,14 @@ must also gate on `cargo test -p animus-cp-data` run in FULL — never
 state machine, and `--lib` only runs `lib.rs`'s own in-crate `#[cfg(test)]`
 module, silently skipping every one of that crate's `tests/*.rs` integration
 binaries (`hlc_differential_skew.rs` among them — the one that caught this
-gap after `--lib` alone reported green). One binary per behavior; the file names describe them
+gap after `--lib` alone reported green). **A `RaftCore`/boot-path change also
+gates on `cargo test -p animus-control --features prod-heavy` too**: this
+crate's `prod_liveness.rs` and `control_membership_prod.rs` are `[[test]]`
+targets with `required-features = ["prod-heavy"]`, so a plain `cargo test -p
+animus-control` silently skips both real-thread `ProdEnv` liveness binaries
+(issue #667's third amendment found this the hard way — a full plain run
+reported green while CI's `--all-features` run caught a real, deterministic
+failure the skipped binary alone exercised). One binary per behavior; the file names describe them
 (`ls crates/animus-control/tests/`) — covering Raft core mechanics
 (election/replication/leader-kill, the DRIVER_APPLIED apply gate, pre-vote,
 leadership transfer, snapshot/InstallSnapshot), the ADR 0038 mirror/delta
