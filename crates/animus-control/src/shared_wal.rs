@@ -449,7 +449,9 @@ impl<C: Clone, S: Clone> SharedWal<C, S> {
                         merged.extend_from_slice(bytes);
                     }
                 }
-                env.append(file, &merged).await.map_err(SharedWalError::from)?;
+                env.append(file, &merged)
+                    .await
+                    .map_err(SharedWalError::from)?;
                 if let Err(e) = env.sync(file).await {
                     // Issue #883: `env.append` above already landed `merged`
                     // in the file's un-synced buffered region before this
@@ -482,12 +484,11 @@ impl<C: Clone, S: Clone> SharedWal<C, S> {
                     // there is nothing further this coordinator can do — the
                     // caller below still sees this round's own `sync` error,
                     // exactly as before this fix.
-                    if let Ok(current) = env.read(file).await {
-                        if let Some(restored_len) = current.len().checked_sub(merged.len()) {
-                            if current[restored_len..] == merged[..] {
-                                let _ = env.replace(file, &current[..restored_len]).await;
-                            }
-                        }
+                    if let Ok(current) = env.read(file).await
+                        && let Some(restored_len) = current.len().checked_sub(merged.len())
+                        && current[restored_len..] == merged[..]
+                    {
+                        let _ = env.replace(file, &current[..restored_len]).await;
                     }
                     return Err(SharedWalError::from(e));
                 }
