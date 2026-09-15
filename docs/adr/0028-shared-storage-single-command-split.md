@@ -742,3 +742,103 @@ confirmed history, never the phantom write, and the sibling's own
 unrelated tail must reopen byte-for-byte identical to its pre-restart
 state. Verified red on the pre-fix code (the phantom write's `Put`
 command present in the recovered log) and green with the fix.
+
+## Amendment (2026-09-15, issue #883 — a tolerated sync-only failure's buffered bytes are now repaired before the next round)
+
+**Bug**: issue #838's own fix (above) closes the `group_tails`
+(in-memory-bookkeeping) side of "a tolerated failure must never become
+durable via a sibling's later success," but named a second, distinct hazard
+at the physical-buffer layer that it deliberately did not cover:
+`SharedWal::flush`'s `Append` branch called `env.append` then `env.sync`
+sequentially. `Disk::append`/`Disk::sync` are two independently-observable
+physical steps — a real `write()` places bytes in the OS page cache before
+any `fsync()`, and a FAILED `fsync()` does not retroactively un-write them;
+`animus-sim`'s own `Disk` model deliberately mirrors this (a failed `sync`
+leaves `buffered` bytes in place rather than discarding them, so a
+following `Simulator::crash` still sees them as an un-synced tail). So when
+a round's own `env.append` succeeded (genuinely buffering real bytes) and
+its own `env.sync` then failed — tolerated exactly when the caller's
+`halted` flag is already set (`persist_wal`/`apply_and_compact`, same
+gate as #838) — those bytes stayed sitting in the shared file's buffered
+region, unrolled-back. Because `Disk::append`'s `buffered.
+extend_from_slice` simply extends whatever is already buffered, a
+completely different, healthy tablet's own next **ordinary** (non-
+compacting) `append_tagged` round would extend the SAME buffered region,
+and that tablet's own successful `sync` would then durably commit the
+whole buffered tail — the doomed round's never-acked bytes included — as
+a side effect of its own perfectly ordinary success. Unlike #838's
+mechanism (which needed a sibling's `compact_group`/`forget` whole-file
+rewrite to leak), this one only needs a sibling's plain `append_tagged`,
+and the existing corpus (including #838's own new cell (e)) never
+exercised it because cell (e) deliberately fails `env.append` itself
+(before a single byte is ever buffered) to isolate the `group_tails`
+mechanism cleanly — see this ADR's issue #838 amendment above and its
+matching `docs/lessons/general/2026-09-14-an-eagerly-applied-mutation-
+made-for-ordering-reasons-still.md` entry, whose closing section names
+this exact gap and files it as issue #883 rather than reproducing it in
+that regression.
+
+**Fix chosen (smallest change that restores the invariant)**: on a
+tolerated `Append`-batch `sync` failure, `flush` now repairs the file
+before returning to `drive()` — which itself never advances to the next
+queued op before `flush` returns — by reading the file back, verifying
+its tail is exactly the `merged` bytes this round itself just appended
+(it always is: every `flush` call only ever returns having fully synced,
+moving its own bytes out of `buffered`, or having already failed and been
+repaired by this same code, so the buffered region is always empty
+entering any round's own `append`), and atomically replacing the file
+with everything before that tail (`Disk::replace`, the same atomic
+temp-file-plus-rename primitive `compact_group`/`forget` already use).
+This is caller-agnostic — it needs no `Serialize`/`DeserializeOwned`
+bounds and lives in the same `impl<C: Clone, S: Clone>` block as the
+raw/untyped `append`/`compact` API, so it protects that path too, not
+just the tagged one `persist_wal` uses — and adds no I/O on the happy
+path, only on the already-rare tolerated-failure path. It is
+best-effort: if the read-back or the replace itself also fails (the disk
+is genuinely gone, not just this one `sync` call), there is nothing
+further the coordinator can do, and the caller still sees the original
+`sync` error exactly as before this fix — no worse than the status quo.
+
+**Alternatives rejected** (from the issue's own "possible fix directions"):
+- Making a failed `sync` discard (rather than retain) the bytes it was
+  asked to sync, when the failure is going to be tolerated, was rejected
+  as conflating two different concerns: `Disk::sync`'s buffered-bytes
+  retention is a deliberate, documented modeling choice needed elsewhere
+  for realistic crash-recovery testing (a following `Simulator::crash`
+  must still see those bytes as an un-synced, possibly-torn tail); making
+  it context-dependent on "will this failure later be tolerated" would
+  need the `Disk` seam to know about a caller-level policy it has no
+  business knowing.
+- Dropping the tolerated-failure path entirely (treating every
+  `append_tagged`/`compact_group` failure as a hard panic, `halted` or
+  not) was rejected because the tolerance is deliberate: an ordinary,
+  non-crashing `shutdown()` racing an in-flight round (or a test's
+  `TempDir` deleting the WAL file out from under a still-running loop) is
+  exactly the scenario `persist_wal`'s own doc names, and turning it into
+  a panic would make routine graceful teardown newly fatal.
+
+**Regression**: `crates/animus-cp-data/tests/sharedwal_fault_corpus.rs`
+gains cell (f) — the complementary shape to cell (e)'s: `env.append`
+genuinely succeeds and buffers real bytes, and only the FOLLOWING
+`env.sync` fails, through real `RaftKvNode` groups sharing one
+`SharedWal`, with a healthy sibling's own subsequent ordinary (not
+compacting) round checked to still land cleanly and byte-identically
+after a full restart. Isolating this fault shape deterministically needed
+a new, narrowly-scoped `DiskConfig::set_sync_error_prob` knob in
+`animus-sim` (`crates/animus-sim/src/lib.rs`): every existing fault knob
+(`set_error_prob`/`set_enospc_prob`) fires uniformly across every disk op
+by deliberate design (documented as "one shared roll" in `DiskConfig`'s
+own doc), so none of them can express "`sync` fails but a `read`/
+`replace` issued moments later, with no scheduling boundary in between
+(the repair runs synchronously inside the same task, before the round's
+caller ever regains control), still succeeds against the same otherwise-
+healthy disk" — exactly the shape needed to prove the repair itself,
+rather than merely the failure, works. The new knob draws no RNG and
+changes no behavior at its default (0), so it perturbs neither the RNG
+stream nor the trace for any existing `DiskConfig`-driven test or
+corpus. Verified red on the pre-fix `shared_wal.rs` (the phantom
+`a-phantom-sync` `Put` present in tablet A's recovered log after
+tablet B's own unrelated, healthy round) and green with the fix; also
+verified red with the fix removed and the pre-existing (non-sync-scoped)
+`set_error_prob(1.0)` technique instead — confirming the new knob, not
+merely a different assertion, is what isolates this hazard.

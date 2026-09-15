@@ -1890,9 +1890,14 @@ demand the identical action, so no disambiguation is needed.
     GC, a quiet tablet surviving a noisy sibling's real compaction, and
     (cell (e), issue #838) a tolerated (halted-gated) LIVE, non-crashing
     failure never leaving a phantom `group_tails` entry for a healthy
-    sibling's own next compaction to durably write out — see ADR 0028's
-    2026-09-14 amendment and `animus-control/CLAUDE.md`'s `shared_wal.rs`
-    entry for the mechanism and fix. Real-`ProdEnv`/real-disk proof:
+    sibling's own next compaction to durably write out, and (cell (f),
+    issue #883) the complementary physical-buffer-layer shape — a
+    tolerated failure whose own `env.append` already buffered real bytes
+    before its own `env.sync` fails never leaving those bytes for a
+    healthy sibling's own next ORDINARY (non-compacting) round to durably
+    launder via its own successful `sync` — see ADR 0028's 2026-09-14 and
+    2026-09-15 amendments and `animus-control/CLAUDE.md`'s `shared_wal.rs`
+    entry for both mechanisms and fixes. Real-`ProdEnv`/real-disk proof:
     `crates/animusd/tests/
     shared_wal_e2e.rs` (two tables sharing one node's `SharedWal` over a
     genuine process restart).

@@ -42,7 +42,15 @@ function of one seed. This is the substrate every distributed test runs on.
   and `DiskConfig::set_fsync_lie_prob` (fsync-acked-but-lost: `sync` returns
   `Ok` but silently skips the buffered→durable move, so the bytes stay
   exposed to a following `crash` exactly like any other un-synced tail)),
-  and `corrupt_durable(node, file, offset)` (flip one durable byte —
+  and `DiskConfig::set_sync_error_prob` (issue #883: an independent
+  per-`sync`-op-ONLY error probability — unlike `set_error_prob`, which
+  fires uniformly on every op by deliberate "one shared roll" design, this
+  affects `sync` alone, leaving a following `append`/`read`/`replace`
+  free to succeed even while it's armed; exists because proving a
+  coordinator's own repair of a tolerated sync-only failure needs a fault
+  shape none of the uniform knobs above can express — see
+  `animus-control::shared_wal`'s `flush` and its `sharedwal_fault_corpus`
+  cell (f)), and `corrupt_durable(node, file, offset)` (flip one durable byte —
   at-rest corruption of synced data, e.g. to hit an SSTable's per-block CRC).
 - Observability: `trace()` / `trace_lines()`, `now()`, `seed()`, `stats()`
   (`SimStats { task_polls, timer_fires }`, ADR 0061 rung I C-09 PR 3's
@@ -316,16 +324,23 @@ function of one seed. This is the substrate every distributed test runs on.
   `NetConfig::set_duplicate_prob`'s doc): it models a real duplicated packet
   taking its own path through the network, and it means a duplicate can
   arrive *before* the original.
-- **`DiskConfig::enospc_threshold` and `error_threshold` share one roll**,
-  not two independent ones (`inject_disk_fault`): `roll < enospc_threshold`
-  fires ENOSPC, else `roll < enospc_threshold + error_threshold` fires
-  generic, else no fault. This is what keeps a pre-existing `error_prob`-only
-  config's draw *and* comparison byte-identical (`enospc_threshold` defaults
-  to 0, so the combined check degenerates to exactly the old single
-  comparison) rather than merely drawing the same number of values — two
+- **`DiskConfig::enospc_threshold`, `error_threshold`, and (for the `sync`
+  op only) `sync_only_error_threshold` share one roll**, not independent
+  ones (`inject_disk_fault`): `roll < enospc_threshold` fires ENOSPC, else
+  `roll < enospc_threshold + error_threshold` fires generic, else (only
+  when `op == "sync"`) `roll < enospc_threshold + error_threshold +
+  sync_only_error_threshold` fires a sync-only generic fault, else no
+  fault. This is what keeps a pre-existing `error_prob`-only config's draw
+  *and* comparison byte-identical (both newer thresholds default to 0, so
+  the combined check degenerates to exactly the original single
+  comparison) rather than merely drawing the same number of values —
   independent rolls would have needed to fire in a fixed order too, but
-  would have drawn an *extra* value even for an enospc-only config, which
-  one-roll-two-buckets avoids.
+  would have drawn an *extra* value even for a config that only sets one
+  of the three, which one-roll-N-buckets avoids. `sync_only_error_
+  threshold` additionally forces its own local value to 0 for every
+  non-`"sync"` op before even reaching this check, so it perturbs neither
+  the draw nor the trace for `append`/`read`/`read_at`/`replace` — see
+  issue #883's `set_sync_error_prob` above.
 
 - **Failure minimization (ADR 0061 rung B4) lives in `animus-test`, not
   here, and deliberately minimizes *scenario parameters*, not the fault
