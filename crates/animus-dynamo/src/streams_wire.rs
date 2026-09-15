@@ -491,6 +491,10 @@ pub fn keys_from_images(
 /// `DeleteItem`. Absent entirely for every other record (an ordinary client
 /// write has no `userIdentity` in real DynamoDB either).
 #[must_use]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "issue #852 added ordinal; every parameter is load-bearing for the AWS record shape"
+)]
 pub fn stream_record_json(
     shard_id: &str,
     packed_hlc: u64,
