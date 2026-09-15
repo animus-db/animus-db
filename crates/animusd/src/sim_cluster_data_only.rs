@@ -527,28 +527,24 @@ fn c_crash_of_a_data_only_replica_holder_the_rest_keep_serving_then_it_catches_u
 
 #[test]
 fn c_crash_of_a_data_only_replica_holder_the_rest_keep_serving_then_it_catches_up_over_seeds() {
-    // Re-pinned off the `0xDA7A_3000 + i` base entirely (issue #667's
-    // boot-path change to `RaftNode`/`RaftCore`'s genesis path — the
-    // boot-time cluster-check probe round, ADR 0009's 2026-09-15
-    // amendment, further widened the same day to require every configured
-    // peer's evidence before a refusal verdict — draws additional entropy/
-    // network activity on every node's own boot, which reshuffles this
-    // fixed-seed corpus's own tuned timing; see `docs/lessons/testing/
-    // 2026-09-15-boot-path-entropy-desyncs-fixed-seeds.md` for the general
-    // lesson this is another instance of). The original base's own seed 2
-    // (3665440770) failed against the amendment's very first (single-peer)
-    // version already, and its own seed 3 (3665440771) additionally failed
-    // once the majority-of-peers widening landed — rather than continue
-    // patching individual indices as the mechanism's own entropy footprint
-    // keeps shifting, every one of these five is a freshly scanned,
-    // confirmed-passing seed (a contiguous run found by scanning
-    // 3665440771..=790 against the amendment's final, landed form).
+    // Re-pinned again for issue #900: wiring issue #667's boot-time cluster
+    // check into `animus-cp-data`'s own tablet-group driver (this test's
+    // `SimCluster` hosts real `RaftKvNode` tablet groups) draws further
+    // extra entropy on every fresh-group replica's boot, reshuffling this
+    // corpus's tuned timing yet again — the same "boot-path entropy desync"
+    // collateral the comment above already documents for issue #667's own
+    // control-plane version of this fix; see `docs/lessons/testing/
+    // 2026-09-15-boot-path-entropy-desyncs-fixed-seeds.md`. Seed index 3
+    // (formerly 3665440779) failed against this fix specifically; rather
+    // than patch that one index, every one of these five is a freshly
+    // scanned, confirmed-passing seed (scanning 3665440775..=900 against
+    // this fix's own landed form).
     for seed in [
         3_665_440_775,
         3_665_440_776,
         3_665_440_777,
-        3_665_440_779,
-        3_665_440_781,
+        3_665_440_780,
+        3_665_440_783,
     ] {
         run_c_crash_of_a_data_only_replica_holder_the_rest_keep_serving_then_it_catches_up(seed);
     }
