@@ -1,0 +1,3 @@
+# A teardown that erases "my own scope" must re-derive the scope from replicated state at the point of irreversible action — not trust an in-memory cache that a *different* code path is responsible for keeping current.
+
+**A teardown that erases "my own scope" must re-derive the scope from replicated state at the point of irreversible action — not trust an in-memory cache that a *different* code path is responsible for keeping current.** (Mechanism superseded by ADR 0031 PR4 — `HostAction::Release` now carries the erase bound directly, computed by the one planner. Archived in `docs/engineering-lessons-archive.md`.)

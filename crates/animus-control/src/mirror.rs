@@ -2039,6 +2039,7 @@ mod tests {
             tablet: TabletId(1),
             cut_version: 10,
             bytes: 100,
+            chunk_count: 1,
         };
         let (outcome, writes) = apply_and_derive_mirror(&mut meta, &command);
         assert_eq!(outcome, ApplyOutcome::Applied);
@@ -2093,6 +2094,7 @@ mod tests {
                 tablet: TabletId(1),
                 cut_version: 10,
                 bytes: 100,
+                chunk_count: 1,
             },
         );
 
@@ -2193,6 +2195,7 @@ mod tests {
                 tablet: TabletId(1),
                 cut_version: 10,
                 bytes: 100,
+                chunk_count: 1,
             },
         );
 
@@ -2261,6 +2264,7 @@ mod tests {
                 tablet: TabletId(1),
                 cut_version: 10,
                 bytes: 100,
+                chunk_count: 1,
             },
         );
         let _ = apply_and_derive_mirror(
@@ -2487,6 +2491,7 @@ mod tests {
             tablet: TabletId(1),
             cut_version: 10,
             bytes: 100,
+            chunk_count: 1,
         });
 
         let command = MetaCommand::DeleteBackup {
@@ -2564,6 +2569,7 @@ mod tests {
                 tablet: TabletId(1),
                 cut_version: 10,
                 bytes: 100,
+                chunk_count: 1,
             },
             MetaCommand::RegisterNode {
                 node: nid(2),

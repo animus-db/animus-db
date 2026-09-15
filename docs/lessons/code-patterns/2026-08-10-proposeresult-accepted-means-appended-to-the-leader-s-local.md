@@ -1,0 +1,3 @@
+# `ProposeResult::Accepted` means "appended to the leader's local log," never "committed" — every proposer must confirm, and a bare boolean flag isn't always enough to confirm the caller's *specific* request.
+
+**`ProposeResult::Accepted` means "appended to the leader's local log," never "committed" — every proposer must confirm, and a bare boolean flag isn't always enough to confirm the caller's *specific* request.** (Found in the pre-ADR-0028 `propose_split_data`/`applied_split_key`, since removed; `cp_put_local`'s confirm-by-index is the still-live instance of this lesson. Archived in `docs/engineering-lessons-archive.md`.)

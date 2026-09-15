@@ -678,6 +678,7 @@ mod tests {
                     progress: BackupTabletProgress {
                         cut_version: 42,
                         bytes: 1_000,
+                        chunk_count: 1,
                     },
                 },
                 BackupManifestTabletEntry {
@@ -685,6 +686,7 @@ mod tests {
                     progress: BackupTabletProgress {
                         cut_version: 43,
                         bytes: 2_000,
+                        chunk_count: 1,
                     },
                 },
             ],

@@ -438,6 +438,11 @@ async fn report_capture_complete(
             tablet,
             cut_version: cur.cut_version,
             bytes: cur.bytes_so_far,
+            // Valid chunk indices for this tablet are exactly `0..next_chunk`
+            // (issue #856) — this is the expected end-of-sequence restore's
+            // own chunk sweep checks against, closing the "a deleted chunk
+            // reads as end-of-sequence" hole.
+            chunk_count: cur.next_chunk,
         })
         .await;
 }

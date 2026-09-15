@@ -1719,6 +1719,35 @@ demand the identical action, so no disambiguation is needed.
     amendment): 3 of 3 with all three fixes in place. See that amendment
     for the full account and `animus-control/CLAUDE.md`'s matching entry
     for the mechanism itself.
+  - **`COMPACT_DEFER_IDLE_CEILING` (issue #898 follow-up, 2026-09-15): a
+    never-acking peer (down, partitioned, or crashed) can hold
+    `snapshot_transfer_in_flight()` true forever, wedging the defer above
+    indefinitely once write volume stops growing `behind` past
+    `COMPACT_DEFER_CEILING`.** Found regression-testing `animus-control`'s
+    own issue #898 fix, which widened the shared `RaftCore::
+    snapshot_transfer_in_flight()` to also count a chunk that has been SENT
+    but not yet acked — correct for that plane's own gap, but it also made
+    THIS plane's identical defer above hold forever for a chunk sent to a
+    peer that will never ack at all, regressing the pre-existing
+    `tests/hlc_differential_skew.rs::receiver_installs_the_durable_high_
+    water_mark_not_just_the_rows`. Fixed by an **idle-progress-gated**
+    companion ceiling, mirroring `animus-control`'s own
+    `SNAPSHOT_COMPACT_DEFER_IDLE_CEILING` exactly: `apply_and_compact`
+    sums `RaftCore::snapshot_chunk_advances` (a genuine forward-progress
+    counter, the same one `snapshot_resend_bound.rs` uses) across every
+    peer `RaftCore::snapshot_transfer_peers` names, and resets a
+    `compact_defer_since: Option<Nanos>` local (owned by `apply_loop`) to
+    `now` every time that sum changes — so the ceiling (2s) bounds idle
+    time since the last genuine advance, never total transfer duration
+    (a flat "time since streak started" ceiling was tried first and
+    rejected for exactly this reason: generous enough for a real slow
+    transfer's total duration is far too generous a wait for one already
+    proven dead). `RaftCore::snapshot_transfer_in_flight()` itself needed
+    no further change. See `animus-control/CLAUDE.md`'s matching "Fifth"/
+    "Sixth" entries and `docs/lessons/testing/
+    2026-09-14-control-snapshot-catch-up-stall.md` for the full incident
+    — including the standing lesson that any change to shared `RaftCore`
+    gates on `cargo test -p animus-cp-data` run in FULL, never `--lib`.
   - This is also where `engine_applied` vs `last_applied` (Key invariants)
     comes from.
 - **Wake-on-propose cuts single-write latency.** `put`/`delete`/`cas`/
