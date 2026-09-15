@@ -1344,3 +1344,114 @@ Regression: `crates/animusd/tests/admin_endpoint.rs`'s
 `admin_live_is_200_while_a_genuinely_leaderless_admin_health_is_503` and
 `crates/animus-operator/src/desired/statefulset.rs`'s
 `probes_target_admin_health_and_admin_live_on_admin_port`.
+
+## Amendment (2026-09-15, issue #864) — `spec.controlNodes` growth's own retry/logging contract, and the ephemeral-storage quorum-loss hazard it surfaced
+
+`e2e-kind-s3`/`e2e-kind-tls`/`e2e-kind-webhook`/`e2e-kind-encryption`
+recurred a flake at the S-07d growth phase: the promoted ordinal's own
+`GET /admin/health` never returned `200`, the control group's voter count
+never reached the target within `scripts/e2e-kind.sh`'s 120s stall guard,
+and the operator's own log showed nothing but its periodic reconcile
+cadence — no error, no reason. Two separate things needed fixing.
+
+### Part A — the growth step's own retry/logging contract
+
+`add_control_voter` (`controller.rs`) tried every already-confirmed
+control-voter ordinal exactly **once** per reconcile before giving up for
+the next ~30s reconcile, and logged nothing beyond a single aggregate
+`warn!` on total failure. `RaftCore::change_membership`'s own
+**erratum guard** (Raft §4/Ongaro — rejects a config change until a
+freshly-elected leader has committed a no-op in its own current term) is a
+genuine, expected, one-round-trip-after-election transient that two other
+call sites in this codebase (`animusd::sim_cluster_growth`/
+`sim_cluster_control_growth`, closing issues #667/#900) already needed a
+bounded in-place retry for — a single-shot attempt turns this transient
+into a 30-second-per-attempt stall.
+
+**Fix**: `add_control_voter` now retries its whole "ask every
+already-confirmed voter" round up to `ADD_VOTER_ROUNDS` (5) times with a
+short (500ms) backoff between rounds, entirely inside one reconcile call,
+before giving up. Every attempt — success or failure, and every
+"no progress this reconcile" branch of `advance_control_growth`
+(discovery unreachable, promoted pod not yet role `"combined"`) — is now
+logged at `INFO` with the target url, round, and outcome, closing the
+diagnosability gap directly (this is the contract: **a stalled growth
+reconcile must always be explainable from the operator's own log, never
+only from its absence**). This is real, useful hardening on its own merit,
+but investigation (Part B) found it unlikely to be what these three
+specific runs hit — the mechanism below better fits the observed timing.
+
+### Part B — the real mechanism: ephemeral storage cannot survive the growth roll
+
+Fresh evidence, captured with this same amendment's own diagnostics
+(`/admin/raft`'s `cluster_check_pending`/`refused_as_voter`, added
+alongside issue #667's boot-time check, and `scripts/e2e-kind.sh`'s
+matching failure-path dump), settled the mechanism on a later
+`e2e-kind-encryption` recurrence: growth *converged* (4 voters, 35s), and
+then the **whole control group went leaderless**, term inflating into the
+hundreds within about two minutes. The lone non-refused voter (the newly
+promoted ordinal, caught up, `refused_as_voter: false`) could never win an
+election alone — a majority of 4 needs 3.
+
+The chain, verified against the code:
+
+1. `scripts/e2e-kind.sh`'s single shared `AnimusCluster` manifest (every
+   e2e leg) sets `storage.ephemeral: true` for every pod, including
+   control voters. This ADR's own `StorageSpec::ephemeral` doc already
+   states this is "a real Raft safety hazard for any voter pod, not just
+   a durability trade-off" (`emptyDir` instead of a `PersistentVolumeClaim`,
+   and `animusd` runs with `--ephemeral`/`StorageBackend::Memory`).
+2. `desired::statefulset::restart_relevant_projection` bakes the raw
+   `controlNodes` threshold into the **one shared** pod-template
+   config-hash annotation — the whole `StatefulSet` has a single pod
+   template, so a `spec.controlNodes` edit rolls **every** pod, not just
+   the newly-promoted ordinal, even though an already-`"both"` ordinal's
+   own effective role never changes. Already documented, and
+   underestimated, in `crates/animus-operator/CLAUDE.md`'s own S-07d
+   section.
+3. A `StatefulSet`'s default `RollingUpdate` deletes and **recreates**
+   each Pod object, highest-ordinal-first, waiting for readiness at each
+   step — which discards an `emptyDir` along with the deleted Pod (a
+   container restart in place would not; a Pod delete+recreate always
+   does).
+4. Once the newly-promoted ordinal becomes `Ready` and growth completes,
+   the *same* rollout proceeds to the pre-existing voters. Each one,
+   wiped, restarts with an **empty Raft WAL** while its own peers'
+   committed config still names it with real history — exactly the
+   "wiped voter of an established cluster" case issue #667's boot-time
+   check (`RaftCore::begin_cluster_check`/`handle_cluster_probe_resp`) is
+   designed to refuse **permanently**, on purpose, to prevent an unsafe
+   double vote. Refuse enough of the pre-growth voters this way and the
+   group loses quorum for good.
+
+This is not a bug in the growth mechanism, the boot-time check, or the
+diagnostics — every piece behaved exactly as designed. It is the e2e
+smoke's own configuration exercising a combination this ADR already
+flagged as unsafe, for the first time, once S-07d's growth started
+routinely restarting every control voter's pod.
+
+**Fix**: `scripts/e2e-kind.sh`'s manifest now uses durable
+(`PersistentVolumeClaim`-backed) storage — the supported shape for any
+cluster whose `controlNodes` may change — instead of `ephemeral: true`.
+`kind` ships a default `StorageClass`, so this needs no further
+configuration. This could not be validated against a real `kind` cluster
+in the environment this fix was written in; the reasoning above is
+verified against the code at every step, and the change itself is a
+narrow, low-risk drop-in (the mounted data path is identical either way).
+
+**Additional safety net**: a new `EphemeralVoterStorageHazard` status
+condition (`crd.rs`) is now set, unconditionally, whenever
+`spec.storage.ephemeral` is `true` — regardless of `controlNodes`, since
+*any* config-affecting spec change (`spec.tls`, `spec.s3`,
+`spec.encryptionKeySecretName`, `spec.controlNodes`, ...) rolls every pod
+the same way. This is purely informational — a genuinely throwaway
+ephemeral cluster that never touches those fields again may still accept
+the risk deliberately — but it makes the hazard visible in `kubectl get
+animuscluster -o yaml` rather than only in this paragraph. **Left open as
+a maintainer decision**: whether a cluster with `controlNodes > 1` (or
+any voter at all) and `storage.ephemeral: true` should instead be a hard
+validating-webhook rejection.
+
+See issue #864 for the full investigation, `crates/animus-operator/
+CLAUDE.md`'s own S-07d section for the config-hash detail, and ADR 0009's
+2026-09-15 amendment for the boot-time check this hazard interacts with.

@@ -451,6 +451,58 @@ exists to catch a genuinely wedged process; the kubelet's only response to
 a liveness failure is a hard restart, which cannot fix "no quorum yet" and
 actively makes it worse.
 
+## `spec.controlNodes` growth's retry/logging contract, and `storage.ephemeral`'s quorum-loss hazard (issue #864, 2026-09-15)
+
+Two related fixes, both from root-causing the recurring S-07d e2e stall
+(`e2e-kind-s3`/`-tls`/`-webhook`/`-encryption`) — see ADR 0060's matching
+2026-09-15 amendment for the full investigation.
+
+**The growth step's own retry contract**: `add_control_voter`
+(`controller.rs`) must never treat a single 409/timeout from one
+already-confirmed voter ordinal as reason to wait for the next ~30s
+reconcile — `RaftCore::change_membership`'s own erratum guard (Raft
+§4/Ongaro) is a genuine one-round-trip-after-election transient, and two
+other call sites in this codebase already needed the identical bounded
+retry (issues #667/#900). `ADD_VOTER_ROUNDS` (5, 500ms backoff) retries
+the whole "ask every already-confirmed voter" round inside one reconcile
+before giving up. **Every attempt and every "no progress this reconcile"
+branch of `advance_control_growth` now logs at `INFO`** (target url,
+round, outcome) — before this fix, a stalled growth reconcile left the
+operator log showing nothing but the `kube-runtime` framework's own
+periodic reconcile-span tag, with no way to tell which of several
+possible causes was actually in play. Any future change to this call
+site must preserve that invariant: **a stalled reconcile must always be
+explainable from the log alone.**
+
+**`storage.ephemeral: true` cannot survive a `controlNodes` growth (or any
+other config-affecting spec change)** — this is the actual mechanism the
+three recorded e2e occurrences hit, not the erratum guard above (verified
+against a later `e2e-kind-encryption` occurrence captured with `/admin/
+raft`'s `cluster_check_pending`/`refused_as_voter` diagnostics: growth
+*converged*, then the whole group went leaderless, term inflating into
+the hundreds, because the newly-promoted voter was the *only* one left
+un-refused). The chain: `restart_relevant_projection`'s config-hash
+annotation is **one shared value for the whole `StatefulSet`**, so any
+edit that changes it (not just `controlNodes` — `spec.tls`/`spec.s3`/
+`spec.encryptionKeySecretName` too) rolls **every** pod, including
+already-correct ordinals whose own role never changes; a `StatefulSet`'s
+default `RollingUpdate` deletes and recreates each Pod (discarding an
+`emptyDir` along with it, unlike an in-place container restart); a
+recreated EXISTING voter therefore comes back with an empty Raft WAL
+while its own peers' committed config still names it with real history —
+exactly the case issue #667's boot-time check refuses **permanently**, on
+purpose, to prevent an unsafe double vote. Refuse enough pre-growth
+voters this way and the group loses quorum for good. This crate cannot
+fix this by itself — `scripts/e2e-kind.sh` now uses durable
+(`PersistentVolumeClaim`) storage instead, the supported shape per this
+struct's own doc comment (`crd::StorageSpec::ephemeral`) — but it does
+surface it: `CONDITION_EPHEMERAL_VOTER_STORAGE_HAZARD` is set,
+unconditionally, whenever `spec.storage.ephemeral` is `true`, so a future
+ephemeral cluster's operator sees this in `kubectl get animuscluster -o
+yaml` rather than only in an ADR. **Whether this should instead be a hard
+validating-webhook rejection is left open as a maintainer decision** — see
+ADR 0060's amendment.
+
 ## TLS (ADR 0064 commit 3)
 
 `AnimusClusterSpec.tls: Option<TlsSpec>` (`crd.rs`), two mutually exclusive
