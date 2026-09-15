@@ -284,7 +284,9 @@ async fn large_metadata_catch_up_stays_live() {
         // logged anything in its brief genesis appearance), so this is a
         // faithful re-creation of "the dark node's process finally starts",
         // not a different scenario.
-        let (env2, _addr2) = ProdEnv::bind(nid(2), loop0(), &dirs[2]).await.expect("bind");
+        let (env2, _addr2) = ProdEnv::bind(nid(2), loop0(), &dirs[2])
+            .await
+            .expect("bind");
         book.insert(nid(2), env2.local_addr().to_string());
         envs[2] = env2;
         for e in &envs {
@@ -622,7 +624,9 @@ async fn wiped_voter_refuses_and_the_rest_of_the_cluster_keeps_serving() {
             None
         }
 
-        let leader_idx = leader_of(&nodes).await.expect("no leader elected at genesis");
+        let leader_idx = leader_of(&nodes)
+            .await
+            .expect("no leader elected at genesis");
         assert!(
             matches!(
                 nodes[leader_idx].propose(MetaCommand::UpsertMember {
@@ -640,7 +644,9 @@ async fn wiped_voter_refuses_and_the_rest_of_the_cluster_keeps_serving() {
         // else in it) and restart it fresh on the same id/config — exactly
         // `storage.ephemeral: true`'s real `EmptyDir` pod-recreate shape,
         // the root cause this issue closes.
-        let victim = (0..3).find(|&i| i != leader_idx).expect("a non-leader exists");
+        let victim = (0..3)
+            .find(|&i| i != leader_idx)
+            .expect("a non-leader exists");
         envs[victim].shutdown_and_wait().await;
         std::fs::remove_dir_all(&dirs[victim]).expect("wipe victim data dir");
         dirs[victim] = unique_tmp_dir();

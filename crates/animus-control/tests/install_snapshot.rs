@@ -650,7 +650,13 @@ fn leader_resumes_from_offset_zero_after_a_restarted_follower_resets() {
     // End to end: a genuinely fresh follower core (standing in for the real
     // restarted process) can now complete the transfer from scratch.
     let mut fresh_follower: RaftCore = RaftCore::new(follower_id.clone(), &pair, Nanos(0), 7);
-    let totals = pump_snapshot(&mut leader, &mut fresh_follower, nid(0), follower_id, resend);
+    let totals = pump_snapshot(
+        &mut leader,
+        &mut fresh_follower,
+        nid(0),
+        follower_id,
+        resend,
+    );
     assert!(
         totals.iter().any(|&t| t > 0),
         "expected a real (non-empty) snapshot transfer to complete after the reset"
