@@ -25790,6 +25790,88 @@ next flake report will look identical to the one just fixed. Measure the
 new poll's own budget against a real run of the environment it will
 actually execute in (a loaded sandbox, a shared CI runner), not against
 whatever number happens to be typed a few lines up.
+## "No object at the next index" is never a safe end-of-sequence signal for a deletable, externally-reclaimed object sequence (issue #856)
+
+`animusd::backup_restore::restore_tick`'s chunk sweep (and its
+self-contained mirror in `crates/animus-test/tests/backup_fault_corpus.rs`)
+used `Ok(None)` from a chunked object store read as its *sole* signal that
+a reporting tablet's own chunk sequence was exhausted — the same "keep
+reading until the store says no" idiom several other per-tablet sweeps in
+this codebase use safely, because in those cases nothing else in the
+system ever deletes an object out from under an in-progress reader. Backup
+chunks are different: `DeleteBackup` can mark a backup `Expired` while a
+restore is still reading it, and the two-phase janitor then reclaims its
+objects on its own schedule, in **whatever order its own unsorted `list`
+happens to return them** (`FsSegmentStore::list` is a plain recursive
+directory walk; chunk ids aren't zero-padded, so even a sorted listing
+isn't numeric order). A reader using "no object" as "done" cannot tell a
+genuine end from a hole punched by an out-of-order reclaim partway
+through — and reading a hole *before* the real end is strictly worse than
+reading one *at* the end, because the reader has no way to know it wasn't
+supposed to stop there: it silently returns everything read so far as a
+complete, correct result.
+
+**The fix is a positive, recorded terminal signal, not a smarter absence
+check.** `BackupTabletProgress` gained a `chunk_count: u64` field — the
+capture driver's own `CaptureCursor::next_chunk` at the moment its capture
+completed, i.e. "valid chunk indices are exactly `0..chunk_count`" — and
+`restore_tick`'s sweep bounds itself to that recorded count instead of
+looping until `Ok(None)`. A miss *inside* the recorded range is now
+unambiguously a hole (hard `FailRestore`); a store answering `None` past
+the range never happens, because the sweep never asks past it. This
+generalizes past backups: **any per-item sweep over a sequence whose
+individual items can be deleted by a party other than the sweeper needs an
+expected-count (or explicit terminal marker) recorded by the producer at
+write time, checked by the consumer, rather than inferring completion from
+the consumer's own read failing to find the next item.** "The store said
+no" answers "does this specific id exist," never "have I read
+everything I was supposed to" — those are different questions, and only
+the second is what "done" is supposed to mean. Before shipping a new
+sweep-to-exhaustion loop over externally-mutable objects, ask explicitly
+whether anything else in the system can delete one of those objects
+out of band, and if so, give the sweep something better than absence to
+stop on.
+
+Regression: `crates/animus-test/tests/backup_fault_corpus.rs::
+delete_backup_mid_restore_fails_restore` — deletes a middle chunk of a
+multi-chunk backup directly from the store (standing in for the
+`DeleteBackup`+janitor-out-of-order-reclaim race) and asserts the restore
+hard-fails; proven red against the old "`Ok(None)` is the sole
+end-of-sequence signal" algorithm (the restore silently completed missing
+every row from the deleted chunk onward) before the fix, green after.
+## A "narrowed generic split" bug can hide behind a shared prelude too, not just a shared dispatcher (issue #842)
+
+The five PartiQL entry points in `animusd::dynamo` (`execute_statement`,
+`execute_transaction`, `execute_one_batch_statement`, and their two
+`<E, R>`-generic siblings) each ran `table_known` (existence) *before*
+`authz::authorize`/`authorize_op`/`authorize_each_table` (authorization) —
+the exact reverse of `run_operation`'s own prelude order (`authorize_op`
+always runs before dispatch) and of `run_transact`/`run_transact_get`'s own
+authz-before-`resolve_key` order. A `Principal::Scoped` (ADR 0066)
+principal denied access to a table therefore got a *different* error for a
+table that exists (`AccessDeniedException`, once the real handler's own
+authz check ran) than for one that never existed (`ResourceNotFoundException`,
+from the pre-authz existence short-circuit) — a table-enumeration oracle
+none of the native single-op paths have, since those always authorize
+first. The fix is a small, mechanical reorder at all five sites: parse →
+resolve the table name(s) → authorize (using `OpClass::Read`/`Write`
+resolved from the statement's own kind, needing no lowered `Operation` at
+all — `Policy::allows` only ever consults `OpClass`/table, never the
+operation's own name) → `table_known`. **The general form**: a
+"do X once, up front, before dispatching to per-kind handlers" prelude
+(existence checks, internal-table rejection, authorization) must be
+audited for *order* whenever a new prelude step is added, not just for
+presence — the existing root `CLAUDE.md` lesson about a missed relay
+allowlist entry is one instance of "a new variant needs the same gate every
+sibling variant has"; this is the same category one level up: a new
+top-level entry point (PartiQL) reimplementing a shared prelude by hand,
+inline, rather than delegating to the one place that already gets the
+order right, is exactly how the two preludes drift out of sync with each
+other. Grep every site that computes `table_known`/an existence check
+ahead of an `authz::`/`Policy::allows` call whenever adding a new
+authenticated entry point, and compare its order against `run_operation`'s
+own canonical prelude, not just against its nearest sibling (which can
+carry the identical bug).
 ## An eagerly-applied mutation made for ordering reasons still needs a symmetric rollback on the failure path (issue #838, `SharedWal::group_tails`)
 
 `SharedWal::submit_with_mutation` (`animus-control::shared_wal`) applies a

@@ -132,6 +132,7 @@ fn run(seed: u64) {
             tablet: TabletId(1),
             cut_version: 42,
             bytes: 4_096,
+            chunk_count: 1,
         },
         "RecordBackupTabletComplete",
         seed,
@@ -215,6 +216,7 @@ fn run(seed: u64) {
             Some(&animus_control::BackupTabletProgress {
                 cut_version: 42,
                 bytes: 4_096,
+                chunk_count: 1,
             }),
             "node {i}: progress record was removed by the table drop (seed={seed})"
         );
@@ -350,6 +352,7 @@ fn backup_catalog_survives_node_restart() {
             tablet: TabletId(1),
             cut_version: 42,
             bytes: 4_096,
+            chunk_count: 1,
         },
         "RecordBackupTabletComplete",
         seed,

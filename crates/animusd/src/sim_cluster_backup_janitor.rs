@@ -130,6 +130,7 @@ fn complete_a_backup(cluster: &mut SimCluster, table: &str, backup_id: &str) {
                 tablet,
                 cut_version: 10,
                 bytes: 100,
+                chunk_count: 1,
             })
         ),
         "RecordBackupTabletComplete rejected"

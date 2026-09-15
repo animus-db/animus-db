@@ -4797,6 +4797,38 @@ ADR itself for the full design/rationale.
   only (mirrors `backup_capture.rs`'s own scope — a control-only node hosts
   no CP-data tablet).
 
+  **The chunk sweep is bounded by a recorded expected count, not "no
+  object" (issue #856, fixed 2026-09-14)** — `restore_tick`'s per-tablet
+  loop used to treat `Ok(None)` from the backup store as the *sole*
+  end-of-sequence signal, which is genuinely ambiguous the moment anything
+  else can delete a chunk out from under an in-flight restore:
+  `DeleteBackup` racing this driver, with the two-phase janitor then
+  reclaiming objects in whatever order its own unsorted `list` returns
+  them (chunk ids aren't zero-padded, so even a sorted listing isn't
+  numeric order), could delete an early chunk while later ones stayed
+  physically present — the old sweep read the still-there later chunks
+  first, hit the hole, and silently treated it as "done," completing the
+  restore with every row from the deleted chunk onward missing. Fixed by
+  bounding each tablet's own sweep to `entry.progress.chunk_count`
+  (`animus_control::BackupTabletProgress`, ADR 0059 §2 — the capture
+  driver's own `CaptureCursor::next_chunk` at completion, so valid chunk
+  indices are exactly `0..chunk_count`): a miss strictly before that
+  recorded bound is now an unambiguous hole, proposing `MetaCommand::
+  FailRestore` (`RestoreTickOutcome::Failed`, a new variant) rather than
+  ever returning `Completed`. See `docs/engineering-lessons.md`'s matching
+  entry for the general "end-of-sequence needs a positive recorded signal,
+  never inferred from absence, whenever the sequence's own items can be
+  deleted out of band" lesson, and the ADR's own 2026-09-14 amendment
+  (correcting its prior "never a correctness violation" wording) for the
+  full account. **`DeleteBackup` itself now refuses while a restore is in
+  flight, closing issue #856's own second half in a stacked follow-up
+  PR** — see `dynamo.rs`'s own `delete_backup` entry below for the
+  client-side `BackupInUseException` check and
+  `animus-control/CLAUDE.md`'s restore-catalog entry for the apply-time
+  seatbelt (`Metadata::backup_referenced_by_a_live_restore`) this short-
+  read guard now works alongside, rather than as the sole line of
+  defense.
+
   **PITR replay (Train 3 PR②) is one more phase of this same
   `restore_tick`, not a parallel driver** — a `Seeding` restore whose
   `RestoreRow.pitr` carries a `PitrRestorePlan` runs `replay_pitr_segments`
