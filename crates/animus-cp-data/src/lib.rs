@@ -6752,29 +6752,46 @@ fn assert_ts_monotonic(max_applied_ts: &mut Option<HlcTimestamp>, ts: HlcTimesta
 /// `KindBatch`'s own arm already had before this extraction.
 ///
 /// **`ordinal` (issue #852 fix).** `ts` alone is not a unique key for a
-/// change-log record: every record this one call completes shares the
-/// identical `ts` (a multi-key `TransactWriteItems` commit resolves several
-/// keys in one `TxnResolve` entry, one change record each; a marker-table
-/// `KindBatch` can likewise carry several). A `GetRecords`/`GetShardIterator`
-/// page boundary landing inside that tie used to be indistinguishable from
+/// change-log record: every record sharing one commit shares the identical
+/// `ts` — either because ONE call's own `change_log` slice carries several
+/// (a marker-table `KindBatch`), or because `KvCommand::TxnResolve`'s
+/// commit branch calls this function ONCE PER RESOLVED KEY in a loop, all
+/// at the SAME resolve entry's `ts` (a multi-key `TransactWriteItems`
+/// commit — this is issue #852's actual concrete trigger, and the reason
+/// `starting_ordinal`/the return value exist at all: a single call's own
+/// internal `change_log.iter().enumerate()` alone cannot see across
+/// separate calls in that loop). A `GetRecords`/`GetShardIterator` page
+/// boundary landing inside such a tie used to be indistinguishable from
 /// "already delivered," permanently dropping every record still on the far
-/// side of it. The fix widens the record's own key/cursor to `(packed_hlc,
-/// ordinal)`: `ordinal` is `change_log`'s own zero-based index in this call
-/// — deterministic and coordination-free, since every replica applies the
-/// identical `change_log` list in the identical order for the identical
-/// entry. It is appended to the completed key immediately after the packed
-/// HLC (`prefix || hlc::pack(ts) || ordinal`, big-endian, 4 bytes) — the
-/// physical key stays the one true source of a record's own position, so a
-/// sealed-segment read and a hot-tail scan agree by construction. See
-/// `animus_cp_data::segment`'s own module doc for the full design and
-/// `animusd::index_drain`/`animusd::dynamo_streams` for the reader side.
+/// side of it.
+///
+/// The fix widens the record's own key/cursor to `(packed_hlc, ordinal)`:
+/// `ordinal` starts at the caller-supplied `starting_ordinal` and increments
+/// once per record actually completed by `change_log` — deterministic and
+/// coordination-free, since every replica applies the identical writes in
+/// the identical order for the identical entry. It is appended to the
+/// completed key immediately after the packed HLC (`prefix || hlc::pack(ts)
+/// || ordinal`, big-endian, 4 bytes) — the physical key stays the one true
+/// source of a record's own position, so a sealed-segment read and a
+/// hot-tail scan agree by construction. Returns the ordinal the NEXT call
+/// in the same logical entry should start from (`starting_ordinal +
+/// change_log.len()`) — every caller that materializes more than one
+/// record for the SAME `ts` across more than one call (`TxnResolve`'s own
+/// loop) must thread this return value back in as the next call's
+/// `starting_ordinal`; a caller that materializes its whole `change_log` in
+/// one call (`KindBatch`'s own arm, the stage-marker batch) always passes
+/// `0` and may discard the return value. See `animus_cp_data::segment`'s
+/// own module doc for the full design and `animusd::index_drain`/
+/// `animusd::dynamo_streams` for the reader side.
+#[must_use]
 fn materialize_derived(
     kind_scopes: &[StorageScope; ALL_KINDS.len()],
     writes: &[KindWrite],
     change_log: &[(Vec<u8>, Vec<u8>)],
     ts: HlcTimestamp,
     pending: &mut Vec<MergeOp>,
-) {
+    starting_ordinal: u32,
+) -> u32 {
     for (kind, key, value) in writes {
         let Some(kscope) = kind_scopes.get(*kind as usize) else {
             tracing::warn!(
@@ -6796,17 +6813,20 @@ fn materialize_derived(
     // Each change-log record's key is completed here, with THIS caller's
     // commit timestamp — the only one that agrees with this entry's
     // position in the log (ADR 0041 §4a / ADR 0046 principle 1) — plus this
-    // record's own zero-based `ordinal` within `change_log` (issue #852):
-    // several records in one entry (a multi-key `TransactWriteItems`
-    // resolve, or a marker-table batch) share the ts, and their per-item
-    // prefixes are NOT guaranteed distinct either (two items sharing a
-    // partition key differ only by sort key, which the change-log prefix
-    // does not carry) — `ordinal` is what keeps every completed key unique
-    // regardless, closing that collision too.
-    for (ordinal, (prefix, record)) in change_log.iter().enumerate() {
-        let ordinal = u32::try_from(ordinal).expect(
-            "materialize_derived: a single entry's change_log carries far fewer than 2^32 records",
-        );
+    // record's own `ordinal`, counting up from `starting_ordinal` (issue
+    // #852): several records sharing this `ts` (a multi-key
+    // `TransactWriteItems` resolve, spread across several calls to this
+    // function, or a marker-table batch's own single call) also have
+    // per-item prefixes that are NOT guaranteed distinct — two items
+    // sharing a partition key differ only by sort key, which the
+    // change-log prefix does not carry — so `ordinal` is what keeps every
+    // completed key unique regardless, closing that collision too.
+    for (i, (prefix, record)) in change_log.iter().enumerate() {
+        let ordinal = starting_ordinal
+            .checked_add(u32::try_from(i).expect(
+                "materialize_derived: a single call's change_log carries far fewer than 2^32 records",
+            ))
+            .expect("materialize_derived: ordinal overflow — an entry minted far more than 2^32 change records");
         let mut key = prefix.clone();
         key.extend_from_slice(&hlc::pack(ts).to_be_bytes());
         key.extend_from_slice(&ordinal.to_be_bytes());
@@ -6816,6 +6836,11 @@ fn materialize_derived(
             hlc::pack(ts),
         ));
     }
+    starting_ordinal
+        .checked_add(u32::try_from(change_log.len()).expect(
+            "materialize_derived: a single call's change_log carries far fewer than 2^32 records",
+        ))
+        .expect("materialize_derived: ordinal overflow — an entry minted far more than 2^32 change records")
 }
 
 /// The logical `KIND_BASE` key of one item, given its identity alone —
@@ -7435,7 +7460,10 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     // materialization helper, also used by `TxnResolve`'s
                     // commit branch below — never a second copy of this
                     // loop.
-                    materialize_derived(kind_scopes, &writes, &change_log, ts, &mut pending);
+                    // Single call, whole `change_log` at once — always
+                    // starts at ordinal 0; nothing else materializes at
+                    // this same `ts` in this entry.
+                    let _ = materialize_derived(kind_scopes, &writes, &change_log, ts, &mut pending, 0);
                 }
             }
             KvCommand::KindEval {
@@ -7522,13 +7550,16 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                                     // verbatim: the ONE shared
                                     // materialization helper `KindBatch`'s
                                     // own arm above and `TxnResolve`'s
-                                    // commit branch below also call.
-                                    materialize_derived(
+                                    // commit branch below also call. Single
+                                    // call, one key evaluated here — always
+                                    // starts at ordinal 0.
+                                    let _ = materialize_derived(
                                         kind_scopes,
                                         &writes,
                                         std::slice::from_ref(&change_log),
                                         ts,
                                         &mut pending,
+                                        0,
                                     );
                                     // Leader-local result payload (ADR 0054
                                     // mechanism 3) — a no-op unless this
@@ -8152,7 +8183,10 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                         .filter_map(|w| w.stage_marker.clone())
                         .collect();
                     if !stage_markers.is_empty() {
-                        materialize_derived(kind_scopes, &[], &stage_markers, ts, &mut pending);
+                        // Single call, the WHOLE stage-marker list at once
+                        // (built above from every write in this stage) —
+                        // always starts at ordinal 0.
+                        let _ = materialize_derived(kind_scopes, &[], &stage_markers, ts, &mut pending, 0);
                     }
                     if is_anchor {
                         let record = txn::TxnRecord {
@@ -8656,6 +8690,19 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                         txn::ResolveOutcome::Resolved
                     };
                     let version = hlc::pack(ts);
+                    // Issue #852: this loop calls `materialize_derived`
+                    // ONCE PER RESOLVED KEY, all at the identical `ts` — a
+                    // multi-key `TransactWriteItems` commit's actual
+                    // concrete trigger. `materialize_derived`'s own
+                    // internal enumeration only sees ONE call's own
+                    // `change_log` slice (0 or 1 elements here — `TxnWrite`
+                    // carries at most its own record), so it cannot by
+                    // itself disambiguate across separate calls; this
+                    // counter threads the running ordinal across the whole
+                    // loop instead, so keys resolved 2nd/3rd/... in one
+                    // entry get distinct ordinals rather than every call
+                    // independently starting over at 0.
+                    let mut next_ordinal: u32 = 0;
                     for (key, resolved_intent) in keys.iter().zip(resolved) {
                         if outcome_mismatch || !all_in_fence {
                             continue; // whole-or-nothing: skip every key, not just this one
@@ -8740,8 +8787,14 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                                 // tablet's own log, which only the entry
                                 // that actually fixes commit order can
                                 // provide). Discarded entirely on abort —
-                                // see the `None` arm below.
-                                materialize_derived(
+                                // see the `None` arm below. `next_ordinal`
+                                // (issue #852) threads the running ordinal
+                                // across every key this loop resolves, so a
+                                // multi-key commit's records land at
+                                // distinct `(ts, ordinal)` pairs rather than
+                                // every one colliding on ordinal 0 — see
+                                // this loop's own doc, above.
+                                next_ordinal = materialize_derived(
                                     kind_scopes,
                                     &kind_writes,
                                     // A `TxnWrite` carries at most one record
@@ -8750,6 +8803,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                                     change_log.as_slice(),
                                     ts,
                                     &mut pending,
+                                    next_ordinal,
                                 );
                             }
                             None => {

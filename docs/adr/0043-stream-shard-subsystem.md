@@ -303,7 +303,12 @@ parent shard id, hlc_range, count, seal wall-ms}` — followed by a body of
 length-prefixed `{source_key, packed hlc, change_record bytes}` triples in
 HLC order. `change_record` stays opaque to `animus-cp-data` (the same
 `ChangeRecord` type `animus-dynamo`/`animusd` already own); this crate only
-ever moves its bytes.
+ever moves its bytes. **Version bumped to `2` (issue #852, 2026-09-15):**
+each body entry gained a fourth field, a trailing 4-byte `ordinal`, so the
+body is now `{source_key, packed_hlc, ordinal, change_record bytes}`
+quadruples in `(packed_hlc, ordinal)` order — see this ADR's own 2026-09-15
+amendment (below) and ADR 0042's matching amendment for the full account of
+why `packed_hlc` alone was never a unique key.
 
 ### A4. Split lineage — records never move
 
@@ -449,8 +454,9 @@ there — a live consumer polling a tablet's open tail during the exact
 cache-staleness sub-window can still observe a record that, per `Metadata`,
 already belongs to a split-off sibling, and later observe the identical
 underlying write again once the sibling correctly seals it — under a
-**different** `eventID` (`{shard_id}-{packed_hlc}`, stamped from whichever
-shard the polling consumer's own iterator names), so this is a genuine
+**different** `eventID` (`{shard_id}-{packed_hlc}-{ordinal}` since the
+2026-09-15 amendment below, stamped from whichever shard the polling
+consumer's own iterator names), so this is a genuine
 fabrication, not the AWS-contract-compatible at-least-once redelivery a
 shared `eventID` would be. Accepted as a known, narrower residual (bounded
 to a live consumer actively polling during the specific race window, never
@@ -1050,3 +1056,40 @@ PER-NODE `loadAll()` fan-out, like `/admin/ttl`, since this route's own
 See ADR 0020's own matching 2026-09-06 as-built note for the full route
 design (the exact JSON shape, the placement/local-scan reasoning, and the
 dashboard card) and the test references.
+
+## As-built amendment (2026-09-15, issue #852 — segment format widened to carry `ordinal`)
+
+`packed_hlc` alone was never a unique per-record key: `KvCommand::
+TxnResolve`'s commit branch (a multi-key `TransactWriteItems` commit's own
+apply path) materializes several change records at the identical resolve
+entry's `ts`. §"Segment format" above's original `{source_key, packed_hlc,
+change_record}` triple could not represent this — encoding two tied
+records left their own `packed_hlc` field identical with no way for a
+reader to tell them apart or resume a page boundary landing between them.
+See ADR 0042's matching 2026-09-15 amendment for the full incident and the
+apply-side fix (`materialize_derived`'s new `starting_ordinal` parameter
+and return value, `TxnResolve`'s own per-key loop threading a running
+counter across its calls).
+
+**This crate's own contribution**: `SegmentRecord` gained an `ordinal: u32`
+field, `encode`/`decode` gained a matching 4-byte body field (codec
+`VERSION` bumped `1` → `2` — an unrecognized version stays a loud, named
+decode error, never a silent misinterpretation, this codec's pre-existing
+stance), and the body's declared order is now `(packed_hlc, ordinal)`
+rather than `packed_hlc` alone — `slice_to_hlc_range`/`decode_and_slice`
+needed no change at all (the superset-slice rule still filters purely on
+`packed_hlc`, which is sound: a seal always consumes an entry's WHOLE tie
+in one segment, so a tie is never split across the `hlc_range` boundary
+between two shards — only *within* one shard's own content did a reader
+ever need finer-than-HLC resolution). No migration: a `1`-tagged object on
+disk is simply rejected, per this repo's standing no-back-compat policy —
+every existing segment is expected to be resealed from scratch.
+
+The reader-side fixes (`dynamo_streams.rs`'s `GetShardIterator`/
+`GetRecords`, `index_drain.rs`'s `hot_read`/`seal_now`/`pitr_seal_now`,
+`ClientRequest::StreamHotRead`) all live in `animusd`/`animus-node`, per
+this ADR's own layering rule (§ "change_record stays opaque," this
+document, and ADR 0042 §3's read-path ownership) — see ADR 0042's amendment
+for their own account, including the second, related bug
+(`TRIM_HORIZON`/`LATEST` on an OPEN shard flooring at a bare `ordinal = 0`)
+this same fix's regression testing found and closed alongside the main one.

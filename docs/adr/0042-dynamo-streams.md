@@ -213,28 +213,46 @@ during the grace window (§9). `ResourceNotFoundException` fires only once a
 label has **zero** catalog rows left — the ordinary retention sweep having
 reaped every one.
 
-### 5. Sequence numbers: the packed HLC, unchanged across sealing (F4)
+### 5. Sequence numbers: the packed HLC + intra-entry ordinal (F4)
 
-**`SequenceNumber` is the decimal string of the record's own packed HLC**
+**Superseded in place, 2026-09-15 (issue #852) — see the closing amendment
+below for the full incident.** `SequenceNumber` is **no longer** a bare
+decimal packed HLC: it is the fixed-width, 30-ASCII-digit decimal string
+`format!("{packed_hlc:020}{ordinal:010}")` — the record's own packed HLC
 (`hlc::pack`, the same `u64 = (wall_ms << 20) | logical` this codebase
 already uses as the MVCC version and a cursor watermark — see
-`animus-cp-data`'s `hlc` module). This is a deliberate, documented deviation
-from real DynamoDB's own opaque sequence-number format, and it is **stable
-across sealing by construction**: a record's HLC never changes when its
-shard closes, so an iterator token minted against an open shard remains
-meaningful, unmodified, once that shard is sealed — no translation layer,
-no round-2-style shard-local counter that would need reassigning at a
-lineage event.
+`animus-cp-data`'s `hlc` module) zero-padded to 20 digits, immediately
+followed by a 4-byte `ordinal` zero-padded to 10 digits. `ordinal`
+disambiguates the several change records one committing entry can mint at
+the identical HLC (a multi-key `TransactWriteItems` commit resolving
+several keys on one tablet in one entry; a marker-table batch) — see
+`animus-cp-data::segment`'s own module doc for the full design. Fixed-width
+digit groups keep the concatenation both lexicographically and numerically
+monotonic, so it still satisfies DynamoDB's own "numeric string" contract.
+It is still **stable across sealing by construction**: a record's `(hlc,
+ordinal)` pair never changes when its shard closes, so an iterator token
+minted against an open shard remains meaningful, unmodified, once that
+shard is sealed — no translation layer, no round-2-style shard-local
+counter that would need reassigning at a lineage event.
 
-- `AT_SEQUENCE_NUMBER(n)` / `AFTER_SEQUENCE_NUMBER(n)` seek to (or just past)
-  HLC `n` — a binary search within a fetched, hlc-range-sliced segment for a
-  closed shard, or a bounded `hlc > n` scan of the tablet's own log for an
-  open one.
-- `TRIM_HORIZON` → the shard's own start (its parent's sealed end-HLC, or
-  `0` for a tablet's epoch-0 shard).
-- `LATEST` → the open shard's current max HLC + a not-yet-existent tick
-  ("nothing yet, wait for new records"); on an already-sealed shard this
-  collapses to its end — the immediate-null iterator path.
+- `AT_SEQUENCE_NUMBER(n)` / `AFTER_SEQUENCE_NUMBER(n)` seek to (or just
+  past) the pair `n` decodes to — a scan within a fetched, hlc-range-sliced
+  segment for a closed shard (filtered/ordered by the pair, not the HLC
+  alone), or a bounded `(hlc, ordinal) > n` scan of the tablet's own log for
+  an open one. `AT` on the FIRST record of a tied group returns the whole
+  group (the predecessor of ordinal `0` steps back a whole HLC, at which
+  point no record in the tie shares it — see `dynamo_streams::predecessor`'s
+  own doc).
+- `TRIM_HORIZON` → the shard's own start (its parent's sealed end-HLC paired
+  with `ordinal = u32::MAX` on an OPEN shard specifically — see the closing
+  amendment for why a bare `ordinal = 0` floor is wrong there — or `(0, 0)`
+  for a tablet's epoch-0 shard).
+- `LATEST` → the open shard's current max `(hlc, ordinal)` pair + a
+  not-yet-existent tick ("nothing yet, wait for new records"); on an
+  already-sealed shard this collapses to its end, paired with `ordinal =
+  u32::MAX` (the immediate-null iterator path, guaranteed to exceed every
+  real record's own ordinal even one tied on the shard's own inclusive
+  end).
 
 Round 2's whole rejected-alternative argument here (an apply-assigned
 monotonic position vs. a source-HLC-keyed one, chosen because a *copier*
@@ -647,3 +665,73 @@ against a value a concurrent write on a different node has already
 superseded. No change to this ADR's record format, per-partition HLC
 ordering, or shard-sealing/retention machinery; only *where* the image that
 feeds a record is read.
+
+## Amendment (2026-09-15, issue #852 — `SequenceNumber` was not unique per record)
+
+**The bug.** `KvCommand::TxnResolve`'s commit branch — the apply arm behind
+every multi-key `TransactWriteItems` commit — calls `materialize_derived`
+(`animus-cp-data::lib`) once per resolved key, all at the identical
+resolve-entry `ts`. Every one of §5's `SequenceNumber`s minted from that
+entry was therefore the SAME decimal string. A `GetRecords` page (`Limit` <
+the item count) landing inside that tie could not tell "already delivered"
+from "still pending" using the old `packed_hlc > position` exclusive-lower-
+bound filter alone — the remaining tied records were silently and
+permanently dropped, never delivered by that iterator or any later one. A
+second, narrower instance of the same root cause (§5's original text
+claiming per-item change-log prefixes stay distinct) also let two items
+sharing a partition key (differing only by sort key) collide on the exact
+same physical `KIND_CHANGE` key within one entry, one silently overwriting
+the other.
+
+**The fix — widen the cursor and the key to `(packed_hlc, ordinal)`.**
+`materialize_derived` now assigns each record it completes a deterministic,
+coordination-free `ordinal` and appends it to the completed key (`prefix ||
+hlc::pack(ts) || ordinal`, big-endian `u32`) — see that function's own doc
+in `animus-cp-data::lib` for the full mechanism, including why a single
+call's own internal enumeration is not enough on its own: `TxnResolve`'s
+per-key loop threads a running `next_ordinal` counter across its own
+separate calls, so keys resolved 2nd/3rd/... in one entry get distinct
+ordinals rather than each call restarting at `0`. `animus_cp_data::segment`
+gained a matching `ordinal: u32` field on `SegmentRecord` (codec version
+bumped to `2`, a pure additive change under this repo's no-back-compat
+policy — an old-version segment is rejected outright, never migrated).
+Every reader that used to compare or resume on `packed_hlc` alone now
+compares/resumes on the pair: `index_drain::hot_read` and the `seal_now`/
+`pitr_seal_now` sealers (`animusd`), the internal `ClientRequest::
+StreamHotRead` wire RPC (`animus-node`), and `dynamo_streams.rs`'s
+`GetShardIterator`/`GetRecords` (both the sealed and open-tail serve
+paths — see §5's updated text above for `TRIM_HORIZON`/`LATEST`/`AT`/
+`AFTER`'s own per-pair semantics). The sealed-shard `GetRecords` exhaustion
+check changed shape too: it now compares the filtered record count against
+`Limit`, never the last-delivered record's own HLC against the shard's
+`EndingSequenceNumber` — the latter genuinely cannot distinguish "delivered
+every tied record at this HLC" from "delivered only some of them," which is
+the exact bug.
+
+**A second, related bug this same fix's own regression testing found**
+(fixed in the same change, `dynamo_streams::get_shard_iterator`): sealing a
+shard never deletes the physical `KIND_CHANGE` rows it consumed — that is
+the separate, asynchronous trim janitor's job (§8/§9) — so if the shard's
+own watermark HLC was itself a tie, the tie's tail members (`ordinal > 0`)
+could still be physically present when a client asked the OPEN successor
+shard for `TRIM_HORIZON`/`LATEST`. Flooring the resume position at
+`(watermark, ordinal = 0)` let those already-delivered records back in as
+"new." Fixed by flooring at `(watermark, ordinal = u32::MAX)` instead —
+`u32::MAX` exceeds any real record's own ordinal, mirroring the
+sealed-shard `Latest` arm's pre-existing convention at its own inclusive
+end.
+
+**No change to this ADR's shard model, seal-epoch boundaries, or
+retention/trim machinery** — a seal still consumes an entry's WHOLE tie in
+one segment (never split mid-tie), so shard boundaries (`hlc_range`, a pure
+HLC pair) needed no widening; only the cursor/`SequenceNumber` GRANULARITY
+inside a shard's own content changed. Regression coverage: `animus-cp-data`
+(`segment.rs`'s own ordinal round-trip and tie-preservation unit tests,
+`materialize_derived`'s widened doc), `animus-test::stream_lineage_corpus`
+(`tied_multi_key_commit_paginates_without_loss`, a hand-scripted multi-key
+`KindBatch` tie paginated with `Limit=1` across the open-tail path, the
+sealed path, and a seal boundary landing mid-tie, under duplicate-network +
+leader-kill fault injection — `ANIMUS_STREAM_SEEDS`), and `animusd`'s
+`sim_cluster_dynamo_streams` (`transact_write_items_tied_records_paginate_
+without_loss`, the real DynamoDB wire regression over a genuine
+`TransactWriteItems` commit).
