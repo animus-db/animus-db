@@ -48,20 +48,30 @@
 //! window enough for a small, bounded churn burst to land inside it), and
 //! passes with both fixes in place.
 //!
-//! **This same seed later caught a rejected fix to a THIRD, separate gap**
-//! (issue #898 follow-up, `node.rs`'s `SNAPSHOT_COMPACT_DEFER_TIME_CEILING`):
-//! an early attempt gated `snapshot_transfer_in_flight` on a per-peer
-//! heartbeat-resend COUNT (give up deferring for a peer once its un-acked
-//! resend count crossed a threshold), meant to stop a never-acking peer from
-//! wedging compaction forever. This test's own deliberately-slow link needed
-//! ~40 heartbeat-driven resends before its peer's first-EVER ack — a real,
-//! healthy, merely-slow transfer — landing right at the chosen threshold and
-//! reopening the exact stall fixes 1+2 above close. The shipped fix instead
-//! bounds elapsed **time** (`env.now()`, tracked by the apply-loop driver,
-//! not `RaftCore` itself), leaving `snapshot_transfer_in_flight` unchanged;
-//! see `SNAPSHOT_COMPACT_DEFER_TIME_CEILING`'s own doc and `docs/lessons/
+//! **This same seed later caught the first of TWO rejected fixes to a
+//! THIRD, separate gap** (issue #898 follow-up, `node.rs`'s
+//! `SNAPSHOT_COMPACT_DEFER_IDLE_CEILING`): a never-acking peer (down,
+//! partitioned, or never started) can hold a transfer "in flight" forever,
+//! wedging compaction indefinitely once write volume stops growing. The
+//! first attempt gated `snapshot_transfer_in_flight` on a per-peer
+//! heartbeat-resend COUNT — this test's own deliberately-slow link needed
+//! ~40 heartbeat-driven resends before its peer's first-EVER ack, a real,
+//! healthy, merely-slow transfer, landing right at the chosen threshold and
+//! reopening the exact stall fixes 1+2 above close. The second attempt
+//! bounded elapsed time since the defer streak STARTED (not idle time) —
+//! this test's own seed didn't catch that one being wrong (its own transfer
+//! completes comfortably inside a flat ceiling generous enough for
+//! `ProdEnv`), but `animus-cp-data/tests/hlc_differential_skew.rs` did,
+//! since a flat streak-start ceiling generous enough for a real slow
+//! transfer is far too generous a wait for a transfer already proven dead
+//! within that OTHER test's own tight time budget — see that file's own
+//! module doc. The shipped fix instead bounds **idle** time since the last
+//! observed forward progress (`RaftCore::snapshot_chunk_advances`, summed
+//! across `RaftCore::snapshot_transfer_peers`), tracked by the apply-loop
+//! driver, leaving `snapshot_transfer_in_flight` unchanged throughout; see
+//! `SNAPSHOT_COMPACT_DEFER_IDLE_CEILING`'s own doc and `docs/lessons/
 //! testing/2026-09-14-control-snapshot-catch-up-stall.md` for the full
-//! account of why a resend count is the wrong proxy for elapsed time.
+//! account of both rejected designs.
 
 use std::collections::BTreeMap;
 use std::time::Duration;

@@ -1153,22 +1153,47 @@ where
     ///
     /// **Deliberately blind to *how long* a peer has gone un-acked (issue
     /// #898 follow-up)** — that is a `Nanos`/`env.now()` question this pure,
-    /// `now`-unaware core cannot answer, and answering it here (e.g. a
-    /// resend-count proxy for elapsed time) was tried and rejected: it
+    /// `now`-unaware core cannot answer. Two answers were tried at THIS
+    /// accessor and rejected: a resend-count proxy for elapsed time
     /// conflated "peer is dead" with "peer's first round trip is merely
-    /// slow" (a real, correct case — `snapshot_compaction_race.rs`'s own
-    /// deliberately slow link needed ~40 heartbeat-driven resends before its
-    /// peer's first-ever ack, coincidentally right at a plausible
-    /// count-based threshold). A caller that needs to give up on a
-    /// peer that is down, partitioned, or — the scenario that motivated
-    /// this note — configured as a cluster member but never actually
-    /// started at all, has `now` and belongs at the driver layer: see
-    /// `node.rs`'s `SNAPSHOT_COMPACT_DEFER_TIME_CEILING`, a time-based
-    /// backstop layered entirely on top of this accessor's own
-    /// `behind`-sized `SNAPSHOT_COMPACT_DEFER_CEILING` escape hatch, with no
-    /// change needed here.
+    /// slow" (`snapshot_compaction_race.rs`'s own deliberately slow link
+    /// needed ~40 heartbeat-driven resends before its peer's first-ever
+    /// ack); a `peer_last_contact`-based "has this peer gone quiet"
+    /// check was ALSO rejected — `become_leader` optimistically seeds
+    /// every peer's `last_contact` to the moment leadership begins (so a
+    /// merely-slow-to-start peer and a peer that never starts at all are
+    /// indistinguishable by that field alone; see `become_leader`'s own
+    /// doc). A caller that needs to give up on a peer that is down,
+    /// partitioned, or configured as a cluster member but never actually
+    /// started at all has `now` and belongs at the driver layer: see
+    /// `node.rs`'s `SNAPSHOT_COMPACT_DEFER_IDLE_CEILING`, an
+    /// idle-progress-gated backstop (using
+    /// [`snapshot_chunk_advances`](Self::snapshot_chunk_advances) as the
+    /// progress signal, not wall-clock alone) layered entirely on top of
+    /// this accessor's own `behind`-sized `SNAPSHOT_COMPACT_DEFER_CEILING`
+    /// escape hatch, with no change needed here.
     pub fn snapshot_transfer_in_flight(&self) -> bool {
         !self.snapshot_offset.is_empty() || !self.snapshot_chunk_sent.is_empty()
+    }
+
+    /// The set of peers [`snapshot_transfer_in_flight`](Self::
+    /// snapshot_transfer_in_flight) currently considers in flight (the
+    /// union of `snapshot_offset`'s and `snapshot_chunk_sent`'s keys) — a
+    /// pure, `now`-unaware structural fact, same as that accessor itself.
+    /// Exists so a driver that DOES have `now` (issue #898 follow-up) can
+    /// sum [`snapshot_chunk_advances`](Self::snapshot_chunk_advances) across
+    /// every currently-outstanding peer as a genuine forward-progress
+    /// signal, distinguishing "still shipping new chunks, however slowly"
+    /// from "stuck at the same offset forever" — see `node.rs`'s
+    /// `SNAPSHOT_COMPACT_DEFER_IDLE_CEILING` for the full mechanism this
+    /// feeds.
+    #[must_use]
+    pub fn snapshot_transfer_peers(&self) -> BTreeSet<NodeId> {
+        self.snapshot_offset
+            .keys()
+            .chain(self.snapshot_chunk_sent.keys())
+            .cloned()
+            .collect()
     }
 
     /// The byte offset `peer` has acked so far in an in-flight chunked

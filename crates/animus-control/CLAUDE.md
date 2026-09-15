@@ -1364,33 +1364,86 @@ per-tablet CP data plane (`animus-cp-data`).
     `large_metadata_catch_up_stays_live`'s dark node 2 is) can still wedge
     compaction forever**, since `SNAPSHOT_COMPACT_DEFER_CEILING`'s escape
     hatch is sized in `behind` and simply never grows once a burst of
-    writes stops. A resend-COUNT proxy for elapsed time was tried and
-    **rejected** — it scales with `heartbeat_interval`, not with how slow a
-    genuinely live peer might legitimately be, and `snapshot_compaction_
-    race.rs`'s own slow-link test needed ~40 un-acked heartbeat resends
-    before a real peer's first-ever ack, landing right at a plausible
-    count threshold and reopening the original race for a transfer that was
-    actually fine. Fixed with a **time-based** companion instead —
-    `SNAPSHOT_COMPACT_DEFER_TIME_CEILING` (10s) — tracked as a plain
-    `Option<Nanos>` owned by `meta_apply_loop` itself (stamped with
-    `env.now()` when a genuine defer streak starts, cleared the instant
-    compaction proceeds or there is nothing left to defer), matching this
-    codebase's own convention for every other staleness window
-    (`DETECT_TIMEOUT`, `CONTROL_PEER_LIVENESS_TIMEOUT`, `COMPACT_IDLE_
-    STALL`) instead of a retry count standing in for one.
-    `RaftCore::snapshot_transfer_in_flight()` needed no change for this —
-    it stays the pure, `now`-unaware fact its own doc says it should be;
-    the time-awareness belongs at the driver layer that already has
-    `env.now()`. Neither fourth nor fifth has a dedicated `SimEnv`
-    regression (both are real-thread-contention/real-leadership-churn
-    shapes); validated instead by 20x stress reps of `prod_liveness.rs`
-    (0/20 failures with all five fixes, versus 20-40% with only the first
-    three). See the lessons
-    doc above for the fuller account and the generalized lesson: any new
-    bookkeeping feeding a defer/backoff gate needs an explicit answer to
-    "what retires this, on *every* path that can make it stale, not just
-    the happy one" — and "how long is too long" is a `env.now()` question
-    that belongs in the driver, never encoded as a message/retry count.
+    writes stops. **Three designs were tried at this one gap; the first
+    two were built, validated against `prod_liveness.rs`, and only later
+    found wrong against a DIFFERENT test in the plane that shares this
+    same `RaftCore`** — see the lessons doc for the full chronology:
+    1. A resend-COUNT proxy for elapsed time — **rejected**: it scales
+       with `heartbeat_interval`, not with how slow a genuinely live peer
+       might legitimately be, and `snapshot_compaction_race.rs`'s own
+       slow-link test needed ~40 un-acked heartbeat resends before a real
+       peer's first-ever ack, landing right at a plausible count
+       threshold and reopening the original race for a transfer that was
+       actually fine.
+    2. A flat "time since the defer streak started" ceiling, gated on
+       `RaftCore::peer_last_contact` going stale as a faster secondary
+       escape — **rejected**: `become_leader` optimistically seeds EVERY
+       peer's `last_contact` to the moment leadership begins (see that
+       method's own doc), so a peer that never started at all and a peer
+       that stopped responding mid-transfer are both "stale relative to
+       leadership start" by that field alone — indistinguishable. Worse,
+       a flat "time since streak started" (rather than "idle") ceiling
+       conflates "this transfer has run a while" (fine — a large
+       multi-chunk snapshot legitimately takes many round trips) with
+       "this transfer has made no progress in a while" (the actual
+       question); `animus-cp-data/tests/hlc_differential_skew.rs`'s own
+       crashed-peer scenario needed the answer within a few virtual
+       seconds, far tighter than any margin safe for a large real
+       transfer's TOTAL duration — a single constant cannot honestly
+       answer both.
+    3. **Shipped**: an **idle-progress-gated** ceiling —
+       `SNAPSHOT_COMPACT_DEFER_IDLE_CEILING` (2s) — that bounds idle time
+       since the LAST observed forward progress, never total transfer
+       duration. `RaftCore::snapshot_transfer_peers()` (the set of peers
+       with an outstanding transfer — reinstated after the rejected
+       peer-recency design above, repurposed) plus the pre-existing
+       `RaftCore::snapshot_chunk_advances(peer)` (a genuine
+       forward-progress counter — already the exact metric
+       `snapshot_resend_bound.rs` uses for the identical reason) give the
+       driver a real progress signal: `meta_apply_and_compact` sums
+       `snapshot_chunk_advances` across every outstanding peer each pass
+       and resets its own `compact_defer_since: Option<Nanos>` to `now`
+       every time that sum changes, so the idle clock only ever measures
+       time since the last genuine advance. `RaftCore::
+       snapshot_transfer_in_flight()` needed no change for any of the
+       three designs — it stays the pure, `now`-unaware fact its own doc
+       says it should be; the time-awareness belongs entirely at the
+       driver layer that already has `env.now()`.
+  - **Sixth, found only by running `cargo test -p animus-cp-data` in
+    full (not `--lib`, which skips every `tests/*.rs` integration
+    binary) — the shared `RaftCore` widening from the SECOND fix above
+    (issue #898's own `snapshot_transfer_in_flight` gap-closer) regressed
+    `animus-cp-data`'s own, PRE-EXISTING `hlc_differential_skew.rs`.**
+    A crashed, partitioned replica's phantom, never-to-be-acked
+    `InstallSnapshot` chunk held `snapshot_transfer_in_flight()` true on
+    the SENDER indefinitely, wedging that replica's own compaction of an
+    unrelated failed-CAS burst — the exact non-row-writing-entry
+    durable-watermark advance that test exists to prove (ADR 0018 §2's
+    issue #804 amendment). Fixed by mirroring the SAME idle-progress-gated
+    ceiling (design 3 above) into `animus-cp-data`'s own
+    `apply_and_compact`/`apply_loop` — see that crate's own
+    `COMPACT_DEFER_IDLE_CEILING` and its `CLAUDE.md`'s matching entry.
+    **The standing lesson this cost a full validation cycle to learn**:
+    any change to `animus-control`'s `RaftCore` needs `cargo test -p
+    animus-cp-data` run in FULL (integration tests included), never just
+    `--lib` — the two planes share this exact state machine, and `--lib`
+    only runs `lib.rs`'s own in-crate `#[cfg(test)]` module, silently
+    skipping every one of that crate's ~55 `tests/*.rs` binaries. Added to
+    this crate's own Tests section above — see it for the exact command.
+  - None of the fourth/fifth/sixth gaps has a dedicated `SimEnv`
+    regression (all are real-thread-contention/real-leadership-churn/
+    cross-plane shapes); validated instead by 10-20x stress reps of
+    `prod_liveness.rs` per round (0 failures with the shipped design,
+    versus 20-40% with only the first three fixes) plus the full
+    `animus-cp-data`/`animus-control` suites for the sixth. See the
+    lessons doc above for the fuller account and the generalized lesson:
+    any new bookkeeping feeding a defer/backoff gate needs an explicit
+    answer to "what retires this, on *every* path that can make it stale,
+    not just the happy one" — "how long is too long" is an `env.now()`
+    question that belongs in the driver, never a retry count or a
+    same-leadership-stint contact timestamp standing in for one — and it
+    must measure idle time since the last real progress, never total
+    elapsed time, or it can't tell "large and slow" from "stuck" either.
 
   **`state_machine_behind` + `AppendEntriesResp::needs_snapshot` (issue
   #554, ADR 0009's 2026-09-02 addendum): a follower-to-leader "I need a
@@ -1610,7 +1663,13 @@ per-tablet CP data plane (`animus-cp-data`).
 ## Tests
 
 `cargo test -p animus-control` (use `run_for`, never `run()` — perpetual
-heartbeats). One binary per behavior; the file names describe them
+heartbeats). **Any change to `RaftCore` (`raft.rs`) or its driver (`node.rs`)
+must also gate on `cargo test -p animus-cp-data` run in FULL — never
+`--lib`** (issue #898's sixth gap, above): the two planes share this exact
+state machine, and `--lib` only runs `lib.rs`'s own in-crate `#[cfg(test)]`
+module, silently skipping every one of that crate's `tests/*.rs` integration
+binaries (`hlc_differential_skew.rs` among them — the one that caught this
+gap after `--lib` alone reported green). One binary per behavior; the file names describe them
 (`ls crates/animus-control/tests/`) — covering Raft core mechanics
 (election/replication/leader-kill, the DRIVER_APPLIED apply gate, pre-vote,
 leadership transfer, snapshot/InstallSnapshot), the ADR 0038 mirror/delta
