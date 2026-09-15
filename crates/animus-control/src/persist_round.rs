@@ -422,6 +422,11 @@ pub fn ships_before_durable<C>(msg: &RaftMsg<C>) -> bool {
             | RaftMsg::Quiesce { .. }
             | RaftMsg::WakeRequest { .. }
             | RaftMsg::Heartbeat { .. }
+            // Issue #667: carries no vote/term authority (see
+            // `RaftMsg::term`'s own doc) and touches no durable state, so it
+            // ships immediately regardless of any unrelated persist round.
+            | RaftMsg::ClusterProbe
+            | RaftMsg::ClusterProbeResp { .. }
     )
 }
 

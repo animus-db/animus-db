@@ -201,14 +201,45 @@ fn assert_grown_voter_crash_transfer_serve_and_restart(
     // is "the grown node serves as a real leader," not the liveness-
     // detection timing `sim_cluster_control_membership_admin.rs`'s own
     // dead-voter scenarios already cover).
+    //
+    // Retried on 409, exactly like the transfer poll above: a leader that
+    // JUST won an election (via transfer or a real re-election after the
+    // crash) may not yet have committed its own current-term no-op —
+    // `RaftCore::change_membership`'s own erratum guard (Raft §4/Ongaro)
+    // rejects a config change until it has, self-hinting via
+    // `ProposeResult::NotLeader` (see that method's own doc). This is a
+    // genuine, expected one-round-trip-after-election transient, not a
+    // bug — `admin_remove_control_member`'s own doc says exactly this
+    // ("a caller ... simply retries after the no-op commits") — so the
+    // assert belongs after a bounded retry, never on the very next tick.
     let remove_body = format!(r#"{{"node":"{}","force":true}}"#, nid(pre_crash_leader_id));
-    let (status, resp) = cluster.admin(
-        grown,
-        "POST",
-        "/admin/control/member/remove",
-        "",
-        remove_body.as_bytes(),
-    );
+    let mut remove_result = None;
+    for _ in 0..40 {
+        let (status, resp) = cluster.admin(
+            grown,
+            "POST",
+            "/admin/control/member/remove",
+            "",
+            remove_body.as_bytes(),
+        );
+        match status {
+            200 => {
+                remove_result = Some((status, resp));
+                break;
+            }
+            409 => cluster.run_for(Duration::from_millis(100)),
+            other => panic!(
+                "seed={seed}: removing crashed voter {pre_crash_leader_id} through the grown \
+                 node {grown} should be accepted or retryable: {other} {resp}"
+            ),
+        }
+    }
+    let (status, resp) = remove_result.unwrap_or_else(|| {
+        panic!(
+            "seed={seed}: removing crashed voter {pre_crash_leader_id} through the grown node \
+             {grown} was never accepted within budget"
+        )
+    });
     assert_eq!(
         status, 200,
         "seed={seed}: the grown node {grown} (now leader) should be able to remove the \

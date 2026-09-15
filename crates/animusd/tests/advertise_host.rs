@@ -11,7 +11,7 @@
 //! assertions (this crate has no `SimEnv`, see the crate's own `CLAUDE.md`).
 
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use animusd::config::NodeRole;
@@ -53,17 +53,22 @@ async fn bring_up_with_config(
     n: usize,
     dir: &Path,
     deadline: Duration,
-) -> (Vec<Node>, ClusterConfig) {
+) -> (Vec<Node>, ClusterConfig, Vec<PathBuf>) {
     let hard_deadline = tokio::time::Instant::now() + deadline;
     let mut attempt: u64 = 0;
     loop {
         let addrs = support::free_addrs(n * 6);
         let config = build_config(&addrs);
         let mut nodes = Vec::new();
+        let mut node_dirs = Vec::new();
         let mut failed = false;
         for i in 0..n {
-            match animusd::run_node(&config, i, dir.join(format!("core-{attempt}-{i}"))).await {
-                Ok(node) => nodes.push(node),
+            let node_dir = dir.join(format!("core-{attempt}-{i}"));
+            match animusd::run_node(&config, i, node_dir.clone()).await {
+                Ok(node) => {
+                    nodes.push(node);
+                    node_dirs.push(node_dir);
+                }
                 Err(_) => {
                     failed = true;
                     break;
@@ -71,7 +76,7 @@ async fn bring_up_with_config(
             }
         }
         if !failed {
-            return (nodes, config);
+            return (nodes, config, node_dirs);
         }
         for node in &nodes {
             node.shutdown_graceful().await;
@@ -175,7 +180,7 @@ fn role_addrs_at(id: usize, addrs: &[SocketAddr], advertise_host: Option<&str>) 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_second_node_reaches_an_advertised_node_purely_by_its_advertised_name() {
     let dir = support::panic_safe_tempdir();
-    let (nodes, config) = bring_up_with_config(
+    let (nodes, config, _node_dirs) = bring_up_with_config(
         |addrs| ClusterConfig {
             nodes: vec![
                 role_addrs_at(0, addrs, Some("localhost")),
@@ -265,7 +270,7 @@ async fn same_identity_restart_on_a_different_bind_ip_keeps_the_same_advertised_
     };
 
     let dir = support::panic_safe_tempdir();
-    let (mut nodes, mut config) = bring_up_with_config(
+    let (mut nodes, mut config, node_dirs) = bring_up_with_config(
         |addrs| ClusterConfig {
             nodes: vec![
                 role_addrs_at(0, addrs, None),
@@ -297,14 +302,20 @@ async fn same_identity_restart_on_a_different_bind_ip_keeps_the_same_advertised_
 
     // Shut node 1 down, freeing its ports, then rebind the identical port
     // numbers on 127.0.0.2 instead of 127.0.0.1 — same id, same
-    // `advertise_host`, same ports, different bind IP. Mirrors
-    // `support::restart_same_addrs`'s bounded-retry shape (a just-freed port
-    // can be stolen momentarily by another test binary's own probe).
-    // Re-pointing the hosts entry now, before the rebind, mirrors a real
-    // DNS update landing slightly ahead of (or concurrent with) the pod
-    // actually moving — `node0`'s already-cached `intra_route` entry for
-    // node 1 is unaffected either way (it's the same string), so this is
-    // never a race against `node0`'s own routing state.
+    // `advertise_host`, same ports, different bind IP, and (issue #667)
+    // the SAME data directory (`node_dirs[1]`, not a fresh one): a real
+    // rescheduled pod keeps its persistent volume across an IP change —
+    // only the pod's own IP moves, never its disk — so this is the
+    // faithful production shape (a preserved-disk restart, the ordinary
+    // recovery path) rather than the wiped-store restart the boot-time
+    // cluster check exists to refuse. Mirrors `support::
+    // restart_same_addrs`'s bounded-retry shape (a just-freed port can be
+    // stolen momentarily by another test binary's own probe). Re-pointing
+    // the hosts entry now, before the rebind, mirrors a real DNS update
+    // landing slightly ahead of (or concurrent with) the pod actually
+    // moving — `node0`'s already-cached `intra_route` entry for node 1 is
+    // unaffected either way (it's the same string), so this is never a
+    // race against `node0`'s own routing state.
     hosts_entry.repoint("127.0.0.2");
     nodes[1].shutdown_graceful().await;
     let moved_addrs = RoleAddrs {
@@ -329,13 +340,8 @@ async fn same_identity_restart_on_a_different_bind_ip_keeps_the_same_advertised_
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let restarted = loop {
-        match animusd::run_node_with(
-            &config,
-            1,
-            dir.path().join("moved"),
-            StorageBackend::default(),
-        )
-        .await
+        match animusd::run_node_with(&config, 1, node_dirs[1].clone(), StorageBackend::default())
+            .await
         {
             Ok(node) => break node,
             Err(e) => {
@@ -406,7 +412,7 @@ async fn same_identity_restart_on_a_different_bind_ip_keeps_the_same_advertised_
 async fn the_static_config_derived_peer_book_dials_every_advertised_name() {
     let dir = support::panic_safe_tempdir();
     let n = 3;
-    let (nodes, _config) = bring_up_with_config(
+    let (nodes, _config, _node_dirs) = bring_up_with_config(
         |addrs| ClusterConfig {
             nodes: (0..n)
                 .map(|i| role_addrs_at(i, addrs, Some("localhost")))

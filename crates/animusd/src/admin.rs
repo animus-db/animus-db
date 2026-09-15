@@ -926,6 +926,19 @@ fn raft_view<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>) -> Value {
         // `Metric::ControlTransferAborted`-metered at the moment it clears,
         // not retained here once it's gone.
         "transfer_target": r.transfer_target(),
+        // Issue #864 diagnostic: a node stuck at `/admin/health` 503 with
+        // `control_leader_known: false` and `is_leader: false` above is
+        // ambiguous from the outside between "genuinely no leader yet" (an
+        // ordinary election in progress, a real outage) and "this
+        // replica's own boot-time issue #667 cluster check is still
+        // pending or was refused, so it will never vote or campaign on its
+        // own" — these two fields resolve that ambiguity directly instead
+        // of leaving an operator to guess from a silent gap. Both are
+        // always `false` for a `Remote` (data-only) handle, which never
+        // holds a local `RaftCore` — see `ControlHandle::
+        // cluster_check_pending`/`refused_as_voter`'s own doc.
+        "cluster_check_pending": r.cluster_check_pending(),
+        "refused_as_voter": r.refused_as_voter(),
         "members": members,
         // ADR 0035 PR7: this handle's control-plane mirror status — the one
         // thing a genuine control-group voter (`ControlHandle::Local`) can't
