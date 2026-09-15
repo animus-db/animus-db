@@ -6539,6 +6539,29 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         self.lock().term()
     }
 
+    /// Whether this replica is still resolving the issue #900/#667
+    /// boot-time cluster check — while `true` it never grants a real vote
+    /// and never campaigns (mirrors `animus_control::node::
+    /// GenericControlHandle::cluster_check_pending`, added for the
+    /// control-plane's own issue #864 diagnostic; see `RaftCore::
+    /// begin_cluster_check`'s doc for the full mechanism, inherited
+    /// unchanged by this crate's `KvCore`).
+    #[must_use]
+    pub fn cluster_check_pending(&self) -> bool {
+        self.lock().cluster_check_pending()
+    }
+
+    /// Whether this replica's boot-time cluster check resolved that it is a
+    /// genuinely wiped, previously-established voter of this tablet's Raft
+    /// group — permanently refused as a voter (never votes/campaigns again)
+    /// until re-admitted through the learner/rejoin path (ADR 0032/0058).
+    /// See `RaftCore::handle_cluster_probe_resp`'s doc for the full
+    /// decision table.
+    #[must_use]
+    pub fn refused_as_voter(&self) -> bool {
+        self.lock().refused_as_voter()
+    }
+
     /// Highest committed log index.
     pub fn commit_index(&self) -> u64 {
         self.lock().commit_index()
@@ -9778,6 +9801,68 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         let recovered =
             RaftCore::recovered(env.node_id(), &all_nodes, state, env.now(), env.next_u64());
         *core.lock().expect("raftkv core poisoned") = recovered;
+    } else if !campaign_immediately {
+        // Issue #900 (P0 Raft safety, mirrors issue #667's control-plane
+        // fix — `animus-control::node::drive`'s own identical branch, ADR
+        // 0009's 2026-09-15 amendment): an empty per-tablet WAL is exactly
+        // as ambiguous as the control plane's own empty WAL — it reads
+        // identically for "this tablet group is a genuine first formation"
+        // (`CreateTablet`, an in-place split child, a reconciler-hosted new
+        // replica) and "this voter was already an established member of
+        // this tablet's Raft group and its disk was wiped (ephemeral
+        // storage)". `RaftKvNode` reuses `animus-control`'s generic, sync
+        // `RaftCore<C, S>` unchanged (ADR 0016/0017), so the disambiguation
+        // mechanism itself — `begin_cluster_check`/`handle_cluster_probe`/
+        // `handle_cluster_probe_resp`, the `ClusterProbe`/`ClusterProbeResp`
+        // wire messages, and the vote/campaign gating — is inherited for
+        // free (it lives on the generic core, not on `MetaCommand`
+        // specifically, and this crate's own `codec.rs` already encodes/
+        // decodes both variants — see that module's own issue #667 comment).
+        // The ONLY thing missing was this driver ever calling
+        // `begin_cluster_check` in the first place; every other node in
+        // this crate's own `drive` loop already dispatches every inbound
+        // `RaftMsg` (including these two) generically through
+        // `RaftCore::handle`.
+        //
+        // Deliberately gated on `!campaign_immediately`: that flag (ADR
+        // 0058 Train 2 rung 4) is set ONLY for the one replica the caller
+        // has already proven, by construction, to be the parent's own
+        // leader at an in-place split fork — never a wiped voter (a
+        // restart can't set this flag; only `materialize_split_child`
+        // does, exactly once, at the fork itself) — and its whole point is
+        // to win the race against this group's own cold randomized
+        // election timeout by campaigning synchronously before this loop
+        // ever starts. Running the cluster check for that one replica too
+        // would gate `campaign_now` (below) on `cluster_check_pending`,
+        // silently degrading the deterministic-first-leader optimization
+        // to an ordinary cold timeout on every single split — a real,
+        // ADR-documented behavior this fix must not weaken. Every other
+        // fresh-group replica (every split child that is NOT the
+        // immediate-campaign leader, an ordinary `CreateTablet`, and a
+        // genuinely wiped voter restarting into an established group)
+        // still goes through the check.
+        let initial_probe = {
+            let mut c = core.lock().expect("raftkv core poisoned");
+            c.begin_cluster_check(env.now(), env.next_u64())
+        };
+        if !initial_probe.is_empty() {
+            // Spawned, never awaited inline, for the identical reason
+            // `animus-control::node::drive`'s own initial probe send is
+            // spawned rather than run before this task's first `recv`:
+            // every peer in a genuine multi-replica fresh formation is
+            // doing the same thing at once, and blocking this task's own
+            // first read of its inbox behind every peer's `env.send`
+            // completing risks a mutual stall under real scheduling.
+            let probe_env = env.clone();
+            let probe_stream = stream;
+            env.spawn_task(async move {
+                for (to, msg) in initial_probe {
+                    probe_env
+                        .send_stream(to, probe_stream, codec::encode_wire(&KvWire::Raft(msg)))
+                        .await;
+                }
+            });
+        }
     }
     // Issue #554: seed `engine_applied` from the ENGINE'S OWN durable applied
     // watermark (`applied.rs`), never from `core.last_applied()`. Right after
