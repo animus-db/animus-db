@@ -2341,6 +2341,10 @@ fn propose_multi_write(group: &Group, leader: usize, items: &[(Vec<u8>, Vec<u8>)
 /// SEALED shard whose filtered content fit entirely in this one page (the
 /// real "null iterator" exhaustion signal); an OPEN shard always returns
 /// `Some`, matching the real API's "not there yet, poll again" contract.
+#[allow(
+    clippy::type_complexity,
+    reason = "a (source_key, packed_hlc, ordinal, change_record) tuple mirrors the real SegmentRecord shape; a named type would just relocate this same tuple"
+)]
 fn get_records_page(
     meta: &Metadata,
     store: &SimSegmentStore,
@@ -2409,6 +2413,10 @@ fn get_records_page(
 /// on a sealed shard). Only meaningful against a SEALED shard; the open
 /// path never exhausts on its own (see [`get_records_page`]'s own doc), so
 /// no scenario below calls this against an open epoch.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "issue #852's ordinal widened `position` from a bare u64 to a pair, and this is a self-contained test-harness function mirroring the real sealer/reader's own parameters"
+)]
 fn drain_sealed_epoch(
     meta: &Metadata,
     store: &SimSegmentStore,
