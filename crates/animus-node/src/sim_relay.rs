@@ -139,6 +139,25 @@ use crate::wire::{ClientRequest, ClientResponse};
 /// this particular value was picked.
 pub const RELAY_STREAM: u64 = u64::MAX - 2;
 
+/// The stable prefix of the plain-text error [`SimRelayClient::relay`]
+/// returns when its own `timeout` elapses with no reply — issue #900's own
+/// follow-up: `animusd::forwarding::ClientCtx::forward_to_tablet_leader`'s
+/// hinted-retry chase (issue #316/#585) classifies a hop's failure by
+/// matching its production-only sibling `relay_request_with_timeout`'s two
+/// sentinel strings (`RELAY_TRANSPORT_FAILURE`/`RELAY_HOP_TIMEOUT`) —
+/// neither of which this method ever produces, since under `SimEnv` there
+/// is no separate "connection refused outright" signal to distinguish from
+/// "no reply arrived in time" (a crashed/partitioned peer and a merely slow
+/// one look identical: nothing arrives). Exported so that classification
+/// can also recognize this shape and retry a genuinely dead first guess —
+/// see that method's own doc for the concrete regression this closes
+/// (`sim_cluster_data_only.rs`'s own seed `3665440779`: a write's first
+/// hint pointed at a data-only replica crashed moments earlier, and with no
+/// matching sentinel the whole hinted-retry chase never engaged at all,
+/// stranding the write for the rest of its budget). Matched by prefix, not
+/// equality, since the full string embeds a per-request `req_id`.
+pub const SIM_RELAY_TIMEOUT_PREFIX: &str = "sim relay: timed out waiting for a reply";
+
 /// How often [`SimRelayClient::relay`]'s wait loop polls its own
 /// [`Pending`] slot for an arrived reply. Small relative to any realistic
 /// `timeout` (`CLIENT_TIMEOUT`-scale, seconds under `SimEnv`'s virtual
@@ -505,7 +524,7 @@ impl<E: Env> RelayClient for SimRelayClient<E> {
             if remaining.is_zero() {
                 drop_pending(&self.pending, req_id);
                 return ClientResponse::Error(format!(
-                    "sim relay: timed out waiting for a reply to req_id={req_id}"
+                    "{SIM_RELAY_TIMEOUT_PREFIX} to req_id={req_id}"
                 ));
             }
             self.env.sleep(RELAY_POLL.min(remaining)).await;

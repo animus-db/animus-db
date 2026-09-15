@@ -15,9 +15,9 @@ use animus_tablet::{KeyRange, TabletId};
 
 use crate::{
     CLIENT_TIMEOUT, ClientCtx, ClientRequest, ClientResponse, CpRoute, FORWARD_ELECTION_BACKOFF,
-    FORWARD_HOP_TIMEOUT, RELAY_HOP_TIMEOUT, RELAY_TRANSPORT_FAILURE, SCHEMA_POLL_INTERVAL,
-    STALE_READ_REFUSAL, STREAM_GROW_NO_SPLIT_POINT, SnapshotRead, TxnAbortReason, decide, dynamo,
-    index_drain, median_split_key, topology,
+    FORWARD_HOP_TIMEOUT, HINTED_FORWARD_HOP_TIMEOUT, RELAY_HOP_TIMEOUT, RELAY_TRANSPORT_FAILURE,
+    SCHEMA_POLL_INTERVAL, STALE_READ_REFUSAL, STREAM_GROW_NO_SPLIT_POINT, SnapshotRead,
+    TxnAbortReason, decide, dynamo, index_drain, median_split_key, topology,
 };
 
 impl<E: Env, R: RelayClient> ClientCtx<E, R> {
@@ -543,16 +543,18 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         loop {
             tried.insert(next.clone());
             let remaining = deadline.duration_since(self.env.now());
-            // Issue #585 / #585 third continuation: cap this hop's own
-            // transport timeout to `FORWARD_HOP_TIMEOUT` ONLY when nothing
-            // vouches for `next` (`!next_hinted`) — see `FORWARD_HOP_TIMEOUT`'s
-            // own doc and this method's doc above. A hinted candidate gets
-            // the full `remaining` budget instead. Either way the final hop
-            // before `deadline` still gets whatever (smaller) time is
-            // actually left, so the overall `CLIENT_TIMEOUT` ceiling is
-            // unchanged.
+            // Issue #585 / #585 third continuation: cap a GUESSED hop to
+            // `FORWARD_HOP_TIMEOUT`; issue #900 follow-up: cap a HINTED hop
+            // to the more generous `HINTED_FORWARD_HOP_TIMEOUT` instead of
+            // the old uncapped `remaining` — see that constant's own doc
+            // for why an uncapped hinted hop, safe under `ProdEnv` (a dead
+            // hinted peer fails fast there), let a `SimEnv` crash strand
+            // the whole chase on one hop with zero budget left to try
+            // another candidate. Either way the final hop before `deadline`
+            // still gets whatever (smaller) time is actually left, so the
+            // overall `CLIENT_TIMEOUT` ceiling is unchanged.
             let hop_timeout = if next_hinted {
-                remaining
+                remaining.min(HINTED_FORWARD_HOP_TIMEOUT)
             } else {
                 remaining.min(FORWARD_HOP_TIMEOUT)
             };
@@ -586,7 +588,31 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             // replica's own hint names it back. Any OTHER error is a
             // genuine application-level failure from a live, leading peer
             // (e.g. a rejected propose) and stays terminal, unchanged.
-            let hint = if e.as_str() == RELAY_HOP_TIMEOUT {
+            //
+            // Issue #900 follow-up: `SimRelayClient::relay` (the whole
+            // `RelayClient` implementation `SimEnv` uses) has no equivalent
+            // to `relay_request_with_timeout`'s outright-connection-refused
+            // signal — under `SimEnv` a crashed/partitioned peer and a
+            // merely slow one are indistinguishable (nothing arrives
+            // either way), so it only ever produces one shape,
+            // `SIM_RELAY_TIMEOUT_PREFIX`, regardless of which is true.
+            // Classifying it as `RELAY_HOP_TIMEOUT` (never `RELAY_
+            // TRANSPORT_FAILURE`) is the conservative, always-correct
+            // choice: a `SimEnv` test's confirmed-dead first guess (issue
+            // #316's own scenario, `sim_cluster_data_only.rs`'s seed
+            // `3665440779`) needs exactly this "try another known replica"
+            // treatment, and staying in `timed_out` (rather than being
+            // permanently excluded) costs nothing extra when the peer
+            // really is dead — no later hint can ever re-vouch for an
+            // identity that never answers again. Before this, `SimEnv`'s
+            // own relay timeout matched neither sentinel and fell through
+            // to the terminal "genuine application failure" arm below,
+            // silently defeating this whole chase under every `SimCluster`
+            // fixture — production's issue #316/#585 mechanism was real
+            // and tested, but only ever exercised over `ProdEnv`.
+            let hint = if e.as_str() == RELAY_HOP_TIMEOUT
+                || e.starts_with(animus_node::sim_relay::SIM_RELAY_TIMEOUT_PREFIX)
+            {
                 timed_out.insert(next.clone());
                 None
             } else if e.as_str() == RELAY_TRANSPORT_FAILURE {

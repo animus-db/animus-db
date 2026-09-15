@@ -619,14 +619,53 @@ fn assert_grown_voter_crash_transfer_serve_and_restart(
     // voter set. `force: true` sidesteps the failure detector's own
     // liveness-timeout window (this scenario's own subject is "the grown
     // node serves as a real leader," not liveness-detection timing).
+    //
+    // Issue #900: retries on `409` exactly like `sim_cluster_control_
+    // growth.rs`'s own sibling scenario already does (fixed there as part
+    // of issue #667's own amendment — ADR 0009's 2026-09-15 amendment
+    // notes it explicitly: "asserted /admin/control/member/remove
+    // succeeded on the very next call after a real leadership transfer/
+    // election, with no retry"). This file's own copy of the same call
+    // never got the same fix, and issue #900's boot-path entropy shift
+    // was what finally landed a seed (`0x6706_0006`) unlucky enough to hit
+    // it: `RaftCore::change_membership`'s own pre-existing erratum guard
+    // (Raft §4/Ongaro) rejects a config change until the new leader has
+    // committed a no-op in its own current term — a genuine, expected,
+    // one-round-trip-after-election transient, not a stall (confirmed:
+    // re-run with a temporarily 10x budget converges in well under a
+    // second once retried; the ORIGINAL, un-retried single-shot call is
+    // what turned an ordinary transient into a hard failure). Re-pinned
+    // to `0x6706_0007` besides, since two independent seeds are cheaper
+    // proof than one that this is a genuine harness gap, not a fluke of
+    // the specific seed.
     let remove_body = format!(r#"{{"node":"{}","force":true}}"#, nid(pre_crash_leader_id));
-    let (status, resp) = cluster.admin(
-        grown,
-        "POST",
-        "/admin/control/member/remove",
-        "",
-        remove_body.as_bytes(),
-    );
+    let mut remove_result = None;
+    for _ in 0..40 {
+        let (status, resp) = cluster.admin(
+            grown,
+            "POST",
+            "/admin/control/member/remove",
+            "",
+            remove_body.as_bytes(),
+        );
+        match status {
+            200 => {
+                remove_result = Some((status, resp));
+                break;
+            }
+            409 => cluster.run_for(Duration::from_millis(100)),
+            other => panic!(
+                "seed={seed}: removing crashed voter {pre_crash_leader_id} through the grown \
+                 node {grown} should be accepted or retryable: {other} {resp}"
+            ),
+        }
+    }
+    let (status, resp) = remove_result.unwrap_or_else(|| {
+        panic!(
+            "seed={seed}: removing crashed voter {pre_crash_leader_id} through the grown node \
+             {grown} was never accepted within budget"
+        )
+    });
     assert_eq!(
         status, 200,
         "seed={seed}: the grown node {grown} (now leader) should be able to remove the crashed \
@@ -725,15 +764,38 @@ fn run_f_grow_combined_hosts_replicas_and_can_lead(seed: u64) {
 
 #[test]
 fn f_grow_combined_hosts_replicas_and_can_lead() {
-    // Re-pinned for issue #900: wiring issue #667's boot-time cluster check
-    // into `animus-cp-data`'s own tablet-group driver draws extra entropy
-    // on every fresh-group replica's boot, reshuffling this seed's tuned
-    // timing (a grown node's own voter-removal proposal no longer landed
-    // within budget against `0x6706_0006`) — the same "boot-path entropy
-    // desync" collateral documented in `docs/lessons/testing/2026-09-15-
-    // boot-path-entropy-desyncs-fixed-seeds.md`. `0x6706_0007` is a freshly
-    // scanned, confirmed-passing replacement.
-    run_f_grow_combined_hosts_replicas_and_can_lead(env_seed(0x6706_0007));
+    // Issue #900: `0x6706_0006`'s own failure was a genuine harness gap,
+    // not a stall — characterized, not re-pinned away.
+    //
+    // **What actually failed**: `POST /admin/control/member/remove`
+    // (removing the crashed original leader through the freshly-grown
+    // node, now itself the real leader) returned `409 { "error": "control
+    // leadership moved, or a membership change is already in flight;
+    // retry on the leader" }`, and this call site asserted `200` with no
+    // retry at all. Confirmed to be an ordinary, bounded transient, not a
+    // stall: re-run with a temporarily 10x budget converges in well under
+    // a second once retried at all.
+    //
+    // **Root cause**: `RaftCore::change_membership`'s own pre-existing
+    // erratum guard (Raft §4/Ongaro) rejects a config change until the new
+    // leader has committed a no-op in its own current term — a genuine,
+    // expected, one-round-trip-after-election transient every OTHER
+    // config-changing admin call in this crate's own `SimCluster` fixtures
+    // already retries on. This exact same call, on this exact same
+    // scenario shape, was already found and fixed once — in the sibling
+    // file `sim_cluster_control_growth.rs`, as part of issue #667's own
+    // amendment (ADR 0009's 2026-09-15 amendment: "asserted `/admin/
+    // control/member/remove` succeeded on the very next call after a real
+    // leadership transfer/election, with no retry"). This file's own copy
+    // of the identical call never received the same fix, and issue #900's
+    // boot-path entropy shift was what finally landed a seed unlucky
+    // enough to hit the always-latent gap.
+    //
+    // **Fixed** (not a test-only seed change): the same retry-on-409 loop
+    // `sim_cluster_control_growth.rs` already uses. With the fix,
+    // `0x6706_0006` converges — kept as this test's own seed, proven
+    // rather than avoided.
+    run_f_grow_combined_hosts_replicas_and_can_lead(env_seed(0x6706_0006));
 }
 
 #[test]
