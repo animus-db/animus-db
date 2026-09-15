@@ -164,7 +164,7 @@ fn restarting_a_live_caught_up_voter_does_not_pin_a_core() {
     let seed = std::env::var("ANIMUS_SEED")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(811_2026_09_15u64);
+        .unwrap_or(81120260915u64); // issue 811, fixed 2026-09-15
 
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
