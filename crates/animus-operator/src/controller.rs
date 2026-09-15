@@ -417,10 +417,38 @@ async fn resolve_control_dial_addr<C: ClusterApi>(
         .map_err(|e| format!("pod {pod}'s podIP {ip:?} did not parse as an address: {e}"))
 }
 
+/// Bound on how many times [`add_control_voter`] retries its whole
+/// "ask every already-confirmed voter" round within **one** reconcile
+/// call, before giving up and letting the next ~30s reconcile try again.
+/// Exists specifically for `RaftCore::change_membership`'s own
+/// **erratum guard** (Raft §4/Ongaro): a freshly-elected leader rejects a
+/// config change until it has committed a no-op in its own current term —
+/// a genuine, expected, one-round-trip-after-election transient, not a
+/// real failure (see `RaftCore::change_membership`'s own doc, and
+/// `animusd::sim_cluster_growth`/`sim_cluster_control_growth`'s identical
+/// "retry on 409, converges in well under a second" fix for the same
+/// guard on a different call site). Before this retry existed, this exact
+/// transient turned into a **30-second-per-attempt** stall: `add_control_
+/// voter` tried every voter ordinal exactly once, and a leader that
+/// rejects the *first* attempt for this reason keeps rejecting every
+/// *subsequent* single-shot attempt too if the same freshly-elected leader
+/// answers again 30s later and some other transient (a slow follower, a
+/// racing config change) keeps its own erratum window open — see issue
+/// #864 for the investigation this closes the diagnosability/latency gap
+/// for. 5 rounds x 500ms is comfortably inside one real election timeout
+/// (the guard clears after the leader's very next successful heartbeat
+/// round, typically tens of milliseconds on a real LAN) while adding at
+/// most ~2s to a reconcile that would otherwise wait 30s for the next one.
+const ADD_VOTER_ROUNDS: u32 = 5;
+const ADD_VOTER_ROUND_BACKOFF: Duration = Duration::from_millis(500);
+
 /// Add ordinal `ordinal` (already known to be missing from the live voter
 /// set) as a control voter: resolves its dial address, then tries
 /// `POST /admin/control/member/add` against each already-confirmed voter
-/// ordinal `0..ordinal` in turn until one accepts. `POST /admin/control/
+/// ordinal `0..ordinal` in turn until one accepts, repeating the whole
+/// round up to [`ADD_VOTER_ROUNDS`] times with a short backoff
+/// ([`ADD_VOTER_ROUND_BACKOFF`]) — see that constant's own doc for why a
+/// single round isn't enough. `POST /admin/control/
 /// member/add` is **local-control-leader-only, not relayed**
 /// (`admin::action_add_control_member`'s own doc) — and a `Local` control
 /// handle's own `leader_addr_hint` is always `None` (unlike a `Remote`
@@ -430,16 +458,23 @@ async fn resolve_control_dial_addr<C: ClusterApi>(
 /// achieves the same "retry on the leader" outcome without needing one:
 /// at most one of them can accept (the real leader), and `admin_add_control_
 /// member`'s own doc states a retry of the whole call is always
-/// safe/idempotent, so trying the others first costs nothing but a
-/// harmless 409.
+/// safe/idempotent, so trying the others first (or a second round) costs
+/// nothing but a harmless 409.
+///
+/// **Every attempt — success or failure — is logged at INFO** with the
+/// target url, the outcome (response body on success, error/status on
+/// failure), and, on failure, whether another attempt will follow: this
+/// closes issue #864's diagnosability gap, where a stalled growth left the
+/// operator log showing nothing but the framework's own periodic
+/// "reconciler requested retry" reconcile-span tag and no reason at all.
 ///
 /// Returns `Ok(true)` once the group's own `GET /admin/control/members`
 /// confirms `ordinal` as a voter (bounded poll), `Ok(false)` if the add
 /// itself succeeded but confirmation didn't land within that bound (not a
 /// failure — the next reconcile re-checks live truth and either finds it
 /// already there or, since the add is idempotent, retries harmlessly), and
-/// `Err` only when no already-confirmed voter accepted the add at all (or
-/// the dial address couldn't be resolved).
+/// `Err` only when no already-confirmed voter accepted the add in any
+/// round (or the dial address couldn't be resolved).
 async fn add_control_voter<C: ClusterApi, A: AdminOps>(
     ctx: &Context<C, A>,
     name: &str,
@@ -455,25 +490,66 @@ async fn add_control_voter<C: ClusterApi, A: AdminOps>(
 
     let mut last_err = "no already-confirmed control voter ordinal to ask".to_string();
     let mut added = false;
-    for voter_ordinal in 0..ordinal {
-        let base = admin_base_url(name, ns, voter_ordinal, admin_port, tls_ca.is_some());
-        match ctx
-            .admin
-            .post_json(
-                &format!("{base}/admin/control/member/add"),
-                &json!({"node": node_id, "addr": addr.to_string()}),
-                tls_ca,
-            )
-            .await
-        {
-            Ok(_) => {
-                added = true;
-                break;
+    'rounds: for round in 0..ADD_VOTER_ROUNDS {
+        for voter_ordinal in 0..ordinal {
+            let base = admin_base_url(name, ns, voter_ordinal, admin_port, tls_ca.is_some());
+            let url = format!("{base}/admin/control/member/add");
+            match ctx
+                .admin
+                .post_json(
+                    &url,
+                    &json!({"node": node_id, "addr": addr.to_string()}),
+                    tls_ca,
+                )
+                .await
+            {
+                Ok(resp) => {
+                    info!(
+                        cluster = %name,
+                        node = %node_id,
+                        %url,
+                        round,
+                        response = %resp,
+                        "control voter add accepted"
+                    );
+                    added = true;
+                    break 'rounds;
+                }
+                Err(e) => {
+                    info!(
+                        cluster = %name,
+                        node = %node_id,
+                        %url,
+                        round,
+                        error = %e,
+                        "control voter add attempt refused or unreachable; trying next \
+                         already-confirmed voter ordinal (or the next round) before giving up"
+                    );
+                    last_err = format!("ordinal {voter_ordinal}: {e}");
+                }
             }
-            Err(e) => last_err = format!("ordinal {voter_ordinal}: {e}"),
+        }
+        if round + 1 < ADD_VOTER_ROUNDS {
+            // ADR 0003 / ADR 0061 Decision 4 (rung B5): same real-wall-clock
+            // allowance `drain_and_remove_node`'s own poll loop already
+            // carries — this reconcile loop polls a real pod's admin port
+            // over a real network, outside the Env seam.
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "animus-operator polls a real pod's admin port outside the Env seam, not system logic (ADR 0003); see ADR 0061 Decision 4"
+            )]
+            tokio::time::sleep(ADD_VOTER_ROUND_BACKOFF).await;
         }
     }
     if !added {
+        warn!(
+            cluster = %name,
+            node = %node_id,
+            rounds = ADD_VOTER_ROUNDS,
+            error = %last_err,
+            "control voter add exhausted every already-confirmed voter ordinal across every \
+             retry round this reconcile; will retry on the next reconcile"
+        );
         return Err(format!("adding {node_id} as a control voter: {last_err}"));
     }
 
@@ -484,9 +560,22 @@ async fn add_control_voter<C: ClusterApi, A: AdminOps>(
             fetch_control_members(&ctx.admin, name, ns, 0, admin_port, tls_ca).await
             && voters.contains(&node_id)
         {
+            info!(
+                cluster = %name,
+                node = %node_id,
+                attempt,
+                "control voter add confirmed in the group's own live voter set"
+            );
             return Ok(true);
         }
         if attempt + 1 == CONFIRM_POLLS {
+            info!(
+                cluster = %name,
+                node = %node_id,
+                polls = CONFIRM_POLLS,
+                "control voter add accepted but not yet confirmed in the live voter set \
+                 within this reconcile's poll budget; the next reconcile re-checks live truth"
+            );
             return Ok(false);
         }
         // ADR 0003 / ADR 0061 Decision 4 (rung B5): same real-wall-clock
@@ -546,6 +635,13 @@ async fn advance_control_growth<C: ClusterApi, A: AdminOps>(
         // surface that a discovery attempt was made and failed, rather than
         // leaving only the generic "discovering" message above, and fall
         // back to the last confirmed-safe count for the PDB.
+        info!(
+            cluster = %name,
+            desired_target = target,
+            previously_applied,
+            "control voter growth: could not reach any control ordinal in 0..{target} to \
+             discover live voter truth this reconcile; will retry next reconcile"
+        );
         set_condition(
             status,
             CONDITION_CONTROL_NODES_GROWING,
@@ -565,6 +661,13 @@ async fn advance_control_growth<C: ClusterApi, A: AdminOps>(
         return target;
     }
     if !ordinal_reports_role_both(&ctx.admin, name, ns, achieved, admin_port, tls_ca).await {
+        info!(
+            cluster = %name,
+            ordinal = achieved,
+            desired_target = target,
+            "control voter growth: pod ordinal {achieved} has not yet restarted into role \
+             \"combined\" (GET /admin/config); no member/add attempted this reconcile"
+        );
         set_condition(
             status,
             CONDITION_CONTROL_NODES_GROWING,
@@ -2027,6 +2130,126 @@ mod tests {
             ],
             "ordinal 0 refused, so ordinal 1 must have been tried next"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconcile_growth_retries_a_transient_409_within_one_reconcile() {
+        // Issue #864: `RaftCore::change_membership`'s own erratum guard
+        // (Raft §4/Ongaro) rejects a config change with a `409` until a
+        // freshly-elected leader has committed a no-op in its own current
+        // term — a one-round-trip-after-election transient, not a real
+        // refusal. Before the `ADD_VOTER_ROUNDS` retry, `add_control_voter`
+        // tried each already-confirmed voter ordinal exactly once and gave
+        // up for the whole 30s reconcile interval; this asserts the retry
+        // recovers *within the same reconcile call* instead.
+        // A single pre-existing control voter (ordinal 0) growing to two —
+        // so the "already-confirmed voter ordinal" set to try is just [0],
+        // and a retry necessarily means retrying that *same* ordinal, not
+        // falling through to a different one (the scenario `reconcile_
+        // growth_retries_a_different_voter_ordinal_when_the_first_refuses`
+        // above already covers).
+        let fake_cluster = FakeClusterApi::new();
+        let fake_admin = FakeAdminClient::new();
+        let prior_spec = AnimusClusterSpec {
+            nodes: 2,
+            control_nodes: Some(1),
+            ..Default::default()
+        };
+        fake_cluster.seed_configmap(
+            &desired::config_map_name("demo"),
+            prior_cluster_configmap("demo", "ns1", &prior_spec),
+        );
+        fake_admin.seed_control_voters(["demo-0"].map(String::from));
+        fake_admin.mark_ordinal_ready_both(1);
+        fake_cluster.seed_pod_ip("demo-1", "10.0.0.4");
+        // Ordinal 0 (the only already-confirmed voter) refuses with a
+        // transient 409 twice, then accepts on its third attempt — well
+        // inside `ADD_VOTER_ROUNDS`.
+        fake_admin.fail_add_control_member_for_ordinal_transiently(0, 2);
+        let ctx = make_ctx(fake_cluster, fake_admin);
+
+        let cluster = Arc::new(test_cluster("demo", "ns1", 2, Some(2)));
+        let result = reconcile(Arc::clone(&cluster), Arc::clone(&ctx)).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+
+        assert!(
+            ctx.admin.control_voters().contains("demo-1"),
+            "the transient refusals must not have stopped growth from landing this reconcile"
+        );
+        let add_calls: Vec<String> = ctx
+            .admin
+            .calls()
+            .into_iter()
+            .filter(|(m, u)| m == "POST" && u.contains("/admin/control/member/add"))
+            .map(|(_, u)| u)
+            .collect();
+        assert_eq!(
+            add_calls,
+            vec![
+                admin_url("demo", "ns1", 0, 14003, "/admin/control/member/add"),
+                admin_url("demo", "ns1", 0, 14003, "/admin/control/member/add"),
+                admin_url("demo", "ns1", 0, 14003, "/admin/control/member/add"),
+            ],
+            "must retry the same ordinal across rounds within this one reconcile, not give up \
+             after the first refusal"
+        );
+
+        // Growth completed in this same reconcile (5 was the target).
+        assert!(
+            !ctx.cluster_api
+                .last_status()
+                .unwrap()
+                .conditions
+                .iter()
+                .any(|c| c.type_ == CONDITION_CONTROL_NODES_GROWING),
+            "growth must be complete, not left pending, once the transient refusals clear"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconcile_growth_gives_up_after_every_retry_round_and_will_retry_next_reconcile() {
+        // The mirror case: a refusal that never clears within this
+        // reconcile's own retry budget must still fail cleanly (not hang,
+        // not panic) and leave the `ControlNodesGrowing` condition naming
+        // the failure, so the *next* reconcile — not this one spinning
+        // forever — is what eventually recovers.
+        let fake_cluster = FakeClusterApi::new();
+        let fake_admin = FakeAdminClient::new();
+        seed_pre_growth_state(&fake_cluster, &fake_admin);
+        fake_admin.mark_ordinal_ready_both(3);
+        fake_cluster.seed_pod_ip("demo-3", "10.0.0.4");
+        // Every already-confirmed voter ordinal refuses outright — no
+        // number of rounds recovers this one.
+        fake_admin.fail_add_control_member_for_ordinal(0);
+        fake_admin.fail_add_control_member_for_ordinal(1);
+        fake_admin.fail_add_control_member_for_ordinal(2);
+        let ctx = make_ctx(fake_cluster, fake_admin);
+
+        let cluster = Arc::new(test_cluster("demo", "ns1", 5, Some(5)));
+        let result = reconcile(Arc::clone(&cluster), Arc::clone(&ctx)).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+
+        assert!(!ctx.admin.control_voters().contains("demo-3"));
+        let add_calls = ctx
+            .admin
+            .calls()
+            .into_iter()
+            .filter(|(m, u)| m == "POST" && u.contains("/admin/control/member/add"))
+            .count();
+        assert_eq!(
+            add_calls,
+            (ADD_VOTER_ROUNDS as usize) * 3,
+            "must try every already-confirmed voter ordinal on every retry round before giving up"
+        );
+
+        let status = ctx.cluster_api.last_status().unwrap();
+        let growing = status
+            .conditions
+            .iter()
+            .find(|c| c.type_ == CONDITION_CONTROL_NODES_GROWING)
+            .expect("ControlNodesGrowing condition present, naming the failure");
+        let msg = growing.message.as_deref().unwrap_or_default();
+        assert!(msg.contains("failed"), "{msg}");
     }
 
     #[tokio::test]
