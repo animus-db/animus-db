@@ -852,6 +852,9 @@ fn kind_bearing_participant_materializes_its_lsi_row_and_change_record_at_resolv
     );
     let mut change_key = kb_change_prefix.clone();
     change_key.extend_from_slice(&animus_cp_data::hlc::pack(resolve_ts).to_be_bytes());
+    // Issue #852: the completed key gained a trailing 4-byte ordinal
+    // (`0` here — this resolve materializes a single record).
+    change_key.extend_from_slice(&0u32.to_be_bytes());
     assert_eq!(
         block_on(nodes_b[lb].local_get_kind(animus_cp_data::KIND_CHANGE, &change_key)),
         Some(b"account-change".to_vec()),

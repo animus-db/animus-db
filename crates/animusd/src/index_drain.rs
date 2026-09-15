@@ -268,10 +268,26 @@ const GSI_TAG: &str = "gsi";
 /// content-aware confirm predicate that generic helper doesn't express.
 const SEAL_COMMIT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The packed HLC suffix every change-record key ends with (see
-/// `KvCommand::KindBatch`'s `change_log`) — the same 8-byte encoding a cursor
-/// row's own value uses ([`cursor::encode_watermark`]/`decode_watermark`).
+/// The packed-HLC half of every change-record key's trailing suffix (see
+/// `materialize_derived`'s doc in `animus-cp-data::lib`) — the same 8-byte
+/// encoding a cursor row's own value uses ([`cursor::encode_watermark`]/
+/// `decode_watermark`).
 const HLC_BYTES: usize = 8;
+
+/// The ordinal half of a change-record key's trailing suffix (issue #852) —
+/// a 4-byte big-endian `u32`, `materialize_derived`'s own zero-based index
+/// of this record within its committing entry's `change_log` list.
+/// Disambiguates several records a single entry can mint at the identical
+/// `packed_hlc` (a multi-key `TransactWriteItems` resolve, or a
+/// marker-table batch) — see `animus_cp_data::segment`'s own module doc for
+/// the full design.
+const ORDINAL_BYTES: usize = 4;
+
+/// The full trailing suffix width a completed change-record key carries:
+/// `packed_hlc || ordinal`. Every place that used to strip a bare
+/// [`HLC_BYTES`] to recover an item's own key prefix must strip this
+/// instead (issue #852 widened the suffix).
+const CHANGE_KEY_SUFFIX_BYTES: usize = HLC_BYTES + ORDINAL_BYTES;
 
 /// How many change records one trim `KindBatch` entry deletes at most —
 /// bounds a large backlog's catch-up to several ticks instead of one
@@ -1092,7 +1108,11 @@ pub(crate) async fn drain_tablet<E: Env, R: RelayClient>(
     let mut by_partition: BTreeSet<Vec<u8>> = BTreeSet::new();
     let mut max_hlc: Option<HlcTimestamp> = None;
     for (key, value) in &records {
-        let Some(fp_key) = key.len().checked_sub(HLC_BYTES).map(|n| key[..n].to_vec()) else {
+        let Some(fp_key) = key
+            .len()
+            .checked_sub(CHANGE_KEY_SUFFIX_BYTES)
+            .map(|n| key[..n].to_vec())
+        else {
             continue; // malformed; leave it rather than mis-attribute it
         };
         let Some(ts) = record_hlc(key) else {
@@ -1232,14 +1252,30 @@ pub(crate) fn is_retryable_elsewhere(e: &str) -> bool {
     e.ends_with("; retry")
 }
 
-/// The HLC a change-record's key suffix encodes — the identical 8-byte
+/// The HLC half of a change-record's key suffix — the identical 8-byte
 /// big-endian packing [`cursor::encode_watermark`] uses for a watermark value
-/// (see `KvCommand::KindBatch`'s `change_log` doc: the key is completed at
-/// apply as `prefix || hlc::pack(ts)`). `None` on a malformed suffix, a
-/// defensive read mirroring the `fp_key` split's own.
+/// (see `materialize_derived`'s doc: the key is completed at apply as
+/// `prefix || hlc::pack(ts) || ordinal`, issue #852). `None` on a malformed
+/// suffix, a defensive read mirroring the `fp_key` split's own. Ignores the
+/// trailing ordinal — every caller of this function only needs a bound on
+/// which whole ENTRY produced a record (GSI dirty-partition detection, the
+/// hot-trim watermark), never which specific tied record within one, both
+/// of which stay correct at HLC granularity alone (see the trim janitor's
+/// own doc for why a tie is harmless there).
 fn record_hlc(key: &[u8]) -> Option<HlcTimestamp> {
-    let suffix = key.len().checked_sub(HLC_BYTES).map(|n| &key[n..])?;
-    cursor::decode_watermark(suffix)
+    record_hlc_ordinal(key).map(|(ts, _)| ts)
+}
+
+/// The full `(HLC, ordinal)` pair a change-record's key suffix encodes
+/// (issue #852) — the pagination-granularity read every `GetRecords`/
+/// `GetShardIterator` cursor path needs, unlike [`record_hlc`]'s
+/// HLC-only view. `None` on a malformed/too-short suffix.
+fn record_hlc_ordinal(key: &[u8]) -> Option<(HlcTimestamp, u32)> {
+    let suffix_start = key.len().checked_sub(CHANGE_KEY_SUFFIX_BYTES)?;
+    let ts = cursor::decode_watermark(&key[suffix_start..suffix_start + HLC_BYTES])?;
+    let ordinal_start = suffix_start + HLC_BYTES;
+    let ordinal = u32::from_be_bytes(key[ordinal_start..].try_into().ok()?);
+    Some((ts, ordinal))
 }
 
 /// Bring one partition's GSI rows in line with its base rows' *current*
@@ -1982,7 +2018,7 @@ pub(crate) async fn pitr_seal_now<E: Env, R: RelayClient>(
         .await
         .into_iter()
         .filter_map(|(key, value)| {
-            let ts = record_hlc(&key)?;
+            let (ts, ordinal) = record_hlc_ordinal(&key)?;
             let packed = hlc::pack(ts);
             if watermark.is_some_and(|w| packed <= w) {
                 return None;
@@ -1990,6 +2026,7 @@ pub(crate) async fn pitr_seal_now<E: Env, R: RelayClient>(
             Some(segment::SegmentRecord {
                 source_key: key,
                 packed_hlc: packed,
+                ordinal,
                 change_record: value,
             })
         })
@@ -1997,7 +2034,11 @@ pub(crate) async fn pitr_seal_now<E: Env, R: RelayClient>(
     if records.is_empty() {
         return Ok(None);
     }
-    records.sort_by_key(|r| r.packed_hlc);
+    // Issue #852: sort by the full `(packed_hlc, ordinal)` pair, not
+    // `packed_hlc` alone — several records here can share the identical
+    // HLC (a multi-key `TransactWriteItems` resolve), and `ordinal` is
+    // their only stable tiebreak.
+    records.sort_by_key(|r| (r.packed_hlc, r.ordinal));
 
     let start_exclusive = watermark.unwrap_or(0);
     let end_inclusive = records.last().expect("just checked non-empty").packed_hlc;
@@ -2206,7 +2247,7 @@ pub(crate) async fn seal_now<E: Env, R: RelayClient>(
         .await
         .into_iter()
         .filter_map(|(key, value)| {
-            let ts = record_hlc(&key)?;
+            let (ts, ordinal) = record_hlc_ordinal(&key)?;
             let packed = hlc::pack(ts);
             if watermark.is_some_and(|w| packed <= w) {
                 return None; // already covered by an earlier seal
@@ -2214,6 +2255,7 @@ pub(crate) async fn seal_now<E: Env, R: RelayClient>(
             Some(segment::SegmentRecord {
                 source_key: key,
                 packed_hlc: packed,
+                ordinal,
                 change_record: value,
             })
         })
@@ -2222,9 +2264,11 @@ pub(crate) async fn seal_now<E: Env, R: RelayClient>(
         return Ok(None); // ADR 0043 §A3: never seal an empty segment
     }
     // `pending_changes`' own key order is token-then-pk-then-HLC, NOT commit
-    // order (see its doc) — this sort by the packed-HLC suffix is load-
-    // bearing, not a formality (ADR 0043 §A3 step 1).
-    records.sort_by_key(|r| r.packed_hlc);
+    // order (see its doc) — this sort by `(packed_hlc, ordinal)` is load-
+    // bearing, not a formality (ADR 0043 §A3 step 1): several records here
+    // can share the identical `packed_hlc` (issue #852), and `ordinal` is
+    // their only stable tiebreak.
+    records.sort_by_key(|r| (r.packed_hlc, r.ordinal));
 
     let start_exclusive = watermark.unwrap_or(0);
     let end_inclusive = records.last().expect("just checked non-empty").packed_hlc;
@@ -2394,10 +2438,11 @@ pub(crate) async fn seal_now<E: Env, R: RelayClient>(
 
 /// The open-shard hot-read path (ADR 0042 §7/§8, PR6's `GetRecords` read
 /// API): a leader-local, non-linearizable scan of `group`'s own
-/// `KIND_CHANGE` hot tail for records with packed HLC strictly greater than
-/// `from_position`, sorted by that HLC — load-bearing, exactly like
-/// [`seal_now`]'s identical sort, since `pending_changes`' own key order is
-/// token-then-pk-then-HLC, not commit order — then truncated to `limit`.
+/// `KIND_CHANGE` hot tail for records whose `(packed_hlc, ordinal)` pair
+/// (issue #852) sorts strictly greater than `from_position`, sorted by that
+/// pair — load-bearing, exactly like [`seal_now`]'s identical sort, since
+/// `pending_changes`' own key order is token-then-pk-then-HLC, not commit
+/// order — then truncated to `limit`.
 ///
 /// **Deliberately no `ReadIndex` barrier** — this is
 /// `ClientRequest::StreamHotRead`'s whole reason to exist (F8, ADR 0042
@@ -2409,28 +2454,28 @@ pub(crate) async fn seal_now<E: Env, R: RelayClient>(
 /// consistent contract. Never "upgrade" this to a `linearizable_scan_kind`
 /// call.
 ///
-/// Returns `(source_key, packed_hlc, change_record bytes)` triples in
-/// ascending HLC order — the caller (`ClientCtx::read_stream_hot_records`,
-/// then the DynamoDB Streams wire edge) builds a `GetRecords` response from
-/// these identically to how it builds one from a sealed segment's own
-/// `SegmentRecord`s.
+/// Returns `(source_key, packed_hlc, ordinal, change_record bytes)`
+/// quadruples in ascending `(packed_hlc, ordinal)` order — the caller
+/// (`ClientCtx::read_stream_hot_records`, then the DynamoDB Streams wire
+/// edge) builds a `GetRecords` response from these identically to how it
+/// builds one from a sealed segment's own `SegmentRecord`s.
 ///
 pub(crate) async fn hot_read<E: Env>(
     group: &CpGroup<E>,
-    from_position: u64,
+    from_position: (u64, u32),
     limit: usize,
-) -> Vec<(Vec<u8>, u64, Vec<u8>)> {
-    let mut records: Vec<(Vec<u8>, u64, Vec<u8>)> = group
+) -> Vec<(Vec<u8>, u64, u32, Vec<u8>)> {
+    let mut records: Vec<(Vec<u8>, u64, u32, Vec<u8>)> = group
         .pending_changes()
         .await
         .into_iter()
         .filter_map(|(key, value)| {
-            let ts = record_hlc(&key)?;
+            let (ts, ordinal) = record_hlc_ordinal(&key)?;
             let packed = hlc::pack(ts);
-            (packed > from_position).then_some((key, packed, value))
+            ((packed, ordinal) > from_position).then_some((key, packed, ordinal, value))
         })
         .collect();
-    records.sort_by_key(|(_, packed, _)| *packed);
+    records.sort_by_key(|(_, packed, ordinal, _)| (*packed, *ordinal));
     records.truncate(limit);
     records
 }

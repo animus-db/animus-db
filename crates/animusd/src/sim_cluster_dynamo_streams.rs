@@ -1681,6 +1681,242 @@ fn transact_write_items_on_a_streamed_table_delivers_correct_events_over_seeds()
 }
 
 // ---------------------------------------------------------------------------
+// New: transact_write_items_tied_records_paginate_without_loss (issue #852)
+// ---------------------------------------------------------------------------
+
+/// Every `record["dynamodb"]["Keys"]["pk"]["S"]` in `delivered`, in delivery
+/// order — the identity half of [`assert_tied_records_are_sound`]'s check.
+fn pk_ids(delivered: &[serde_json::Value]) -> Vec<String> {
+    delivered
+        .iter()
+        .map(|r| {
+            r["dynamodb"]["Keys"]["pk"]["S"]
+                .as_str()
+                .unwrap_or_else(|| panic!("no pk in {r:?}"))
+                .to_owned()
+        })
+        .collect()
+}
+
+/// The real-wire regression assertions for issue #852: every `expected_pk`
+/// delivered exactly once (order-independent — a tie's own relative
+/// ordinal order is an implementation choice, not a contract), and every
+/// `SequenceNumber` distinct and strictly increasing in delivery order —
+/// the property that would have caught the original bug (a dropped tied
+/// record shows up here as a missing pk; a bare-HLC cursor's own
+/// duplicate/collision shows up as a non-increasing or repeated
+/// `SequenceNumber`).
+fn assert_tied_records_are_sound(
+    delivered: &[serde_json::Value],
+    expected_pk: &[&str],
+    seed: u64,
+    what: &str,
+) {
+    let mut ids = pk_ids(delivered);
+    ids.sort();
+    let mut expected: Vec<String> = expected_pk.iter().map(|s| s.to_string()).collect();
+    expected.sort();
+    assert_eq!(
+        ids, expected,
+        "seed={seed}, {what}: every tied item must be delivered exactly once: {delivered:?}"
+    );
+    let seqs: Vec<String> = delivered
+        .iter()
+        .map(|r| {
+            r["dynamodb"]["SequenceNumber"]
+                .as_str()
+                .unwrap_or_else(|| panic!("no SequenceNumber in {r:?}"))
+                .to_owned()
+        })
+        .collect();
+    let mut sorted = seqs.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(
+        sorted.len(),
+        seqs.len(),
+        "seed={seed}, {what}: every SequenceNumber must be distinct: {seqs:?}"
+    );
+    assert!(
+        seqs.windows(2).all(|w| w[0] < w[1]),
+        "seed={seed}, {what}: SequenceNumbers must be strictly increasing in delivery order: \
+         {seqs:?}"
+    );
+}
+
+/// The real DynamoDB Streams wire regression for issue #852: a single
+/// `TransactWriteItems` commit of several items on one tablet ties every
+/// one of its change records on the identical HLC — `SequenceNumber`
+/// wasn't unique per record, so a `GetRecords` page boundary (`Limit` <
+/// the item count) landing inside that tie silently and permanently
+/// dropped every record on the far side of it. Proves, over the real wire
+/// API (not the lower-layer mirror `stream_lineage_corpus.rs`'s own
+/// `tied_multi_key_commit_paginates_without_loss` uses): every record
+/// delivered exactly once with strictly increasing, DISTINCT
+/// `SequenceNumber`s, across the open-tail path AND the sealed path, and
+/// `GetShardIterator`'s `AT_SEQUENCE_NUMBER` on the FIRST tied record
+/// returning the whole tie (the issue's third requirement).
+fn run_transact_write_items_tied_records_paginate_without_loss(seed: u64) {
+    let mut cluster = SimCluster::new(seed, 3, 3);
+    let table = "tied";
+    let (status, body) = create_table_with_stream(&mut cluster, 0, table, "NEW_AND_OLD_IMAGES");
+    assert_eq!(status, 200, "seed={seed}: CreateTable failed: {body}");
+    let label = stream_label(&cluster, 0, table);
+    let stream_arn = format!("arn:aws:dynamodb:animus:0:table/{table}/stream/{label}");
+
+    // One TransactWriteItems, three Puts on the same table/tablet — three
+    // change records, all tied on the identical commit HLC.
+    let writer = non_leader_of_table(&cluster, table);
+    let txn_body = format!(
+        r#"{{"TransactItems":[
+            {{"Put":{{"TableName":"{table}","Item":{{"pk":{{"S":"y1"}}}}}}}},
+            {{"Put":{{"TableName":"{table}","Item":{{"pk":{{"S":"y2"}}}}}}}},
+            {{"Put":{{"TableName":"{table}","Item":{{"pk":{{"S":"y3"}}}}}}}}]}}"#
+    );
+    let (status, body) = transact_write_items(&mut cluster, writer, &txn_body);
+    assert_eq!(status, 200, "seed={seed}: transaction failed: {body}");
+
+    let reader = non_leader_of_table(&cluster, table);
+    let (status, v) = describe_stream_via_wire(&mut cluster, reader, &stream_arn);
+    assert_eq!(status, 200, "seed={seed}: {v}");
+    let shard_id = v["StreamDescription"]["Shards"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap_or_else(|| panic!("seed={seed}: at least one shard: {v}"))["ShardId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // --- The OPEN-tail path, paginated with Limit=1: a page boundary
+    // lands inside the tie on every single call.
+    //
+    // Converged-or-timeout, not a rigid one-record-per-call assertion
+    // (house testing discipline, root `CLAUDE.md`): `hot_read`'s own doc
+    // documents that it deliberately carries no `ReadIndex` barrier, so an
+    // empty page immediately after a commit — the resolve entry is
+    // Raft-committed but not yet locally applied/materialized by this
+    // node's own async apply task — is an accepted, real staleness this
+    // read path's contract allows, not a bug; a real consumer's own
+    // response to an empty page is simply "poll again with the same/next
+    // token," which this loop mirrors.
+    let mut token = get_shard_iterator_via_wire(
+        &mut cluster,
+        reader,
+        &stream_arn,
+        &shard_id,
+        "TRIM_HORIZON",
+        None,
+    );
+    let mut delivered: Vec<serde_json::Value> = Vec::new();
+    for _ in 0..200 {
+        if delivered.len() >= 3 {
+            break;
+        }
+        let (records, next) = get_records_via_wire(&mut cluster, reader, &token, Some(1));
+        assert!(
+            records.len() <= 1,
+            "seed={seed}: open-tail Limit=1 must never deliver more than one record: {records:?}"
+        );
+        delivered.extend(records);
+        token = next.unwrap_or_else(|| panic!("seed={seed}: open shard, must not null"));
+    }
+    assert_eq!(
+        delivered.len(),
+        3,
+        "seed={seed}: every tied record must eventually be delivered across the open-tail \
+         pagination: {delivered:?}"
+    );
+    assert_tied_records_are_sound(&delivered, &["y1", "y2", "y3"], seed, "open-tail");
+
+    // --- Seal, then re-drain the SAME tie from the SEALED path ----------
+    let leader = leader_of_table(&cluster, table);
+    cluster.drive_stream_seal(leader);
+    let (status, v) = describe_stream_via_wire(&mut cluster, reader, &stream_arn);
+    assert_eq!(status, 200, "seed={seed}: {v}");
+    let shards = v["StreamDescription"]["Shards"].as_array().unwrap();
+    assert!(
+        shards[0]["SequenceNumberRange"]["EndingSequenceNumber"].is_string(),
+        "seed={seed}: expected the sealed shard covering the tie: {v}"
+    );
+    let sealed_shard = shards[0]["ShardId"].as_str().unwrap().to_owned();
+
+    let mut token = get_shard_iterator_via_wire(
+        &mut cluster,
+        reader,
+        &stream_arn,
+        &sealed_shard,
+        "TRIM_HORIZON",
+        None,
+    );
+    let mut delivered_sealed: Vec<serde_json::Value> = Vec::new();
+    for _ in 0..10 {
+        let (records, next) = get_records_via_wire(&mut cluster, reader, &token, Some(1));
+        delivered_sealed.extend(records);
+        match next {
+            Some(t) => token = t,
+            None => break,
+        }
+    }
+    assert_tied_records_are_sound(&delivered_sealed, &["y1", "y2", "y3"], seed, "sealed");
+
+    // --- `AT_SEQUENCE_NUMBER` on the FIRST tied record returns the WHOLE
+    // tie (issue #852's third requirement) ------------------------------
+    let seq0 = delivered_sealed[0]["dynamodb"]["SequenceNumber"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let at0 = get_shard_iterator_via_wire(
+        &mut cluster,
+        reader,
+        &stream_arn,
+        &sealed_shard,
+        "AT_SEQUENCE_NUMBER",
+        Some(&seq0),
+    );
+    let (records, next) = get_records_via_wire(&mut cluster, reader, &at0, None);
+    assert_eq!(
+        records.len(),
+        3,
+        "seed={seed}: AT_SEQUENCE_NUMBER on the first tied record must return the whole tie: \
+         {records:?}"
+    );
+    assert!(next.is_none(), "seed={seed}: fully drained: {records:?}");
+    assert_tied_records_are_sound(&records, &["y1", "y2", "y3"], seed, "AT first-of-tie");
+
+    // And `AFTER_SEQUENCE_NUMBER` on the first tied record must exclude
+    // exactly that one record, delivering the remaining two.
+    let after0 = get_shard_iterator_via_wire(
+        &mut cluster,
+        reader,
+        &stream_arn,
+        &sealed_shard,
+        "AFTER_SEQUENCE_NUMBER",
+        Some(&seq0),
+    );
+    let (records, next) = get_records_via_wire(&mut cluster, reader, &after0, None);
+    assert_eq!(
+        records.len(),
+        2,
+        "seed={seed}: AFTER_SEQUENCE_NUMBER on the first tied record must exclude only that \
+         one: {records:?}"
+    );
+    assert!(next.is_none(), "seed={seed}: fully drained: {records:?}");
+}
+
+#[test]
+fn transact_write_items_tied_records_paginate_without_loss() {
+    run_transact_write_items_tied_records_paginate_without_loss(env_seed(0xC07E_7052));
+}
+
+#[test]
+fn transact_write_items_tied_records_paginate_without_loss_over_seeds() {
+    for i in 0..10 {
+        run_transact_write_items_tied_records_paginate_without_loss(0xC07E_7150 + i);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Converted: transact_write_items_abort_leaves_no_stream_event
 // ---------------------------------------------------------------------------
 

@@ -4,13 +4,33 @@
 //!
 //! A segment is a self-describing header (which shard it is, its lineage, its
 //! committed HLC range and record count) followed by a body of
-//! length-prefixed `(source_key, packed_hlc, change_record)` triples, in
-//! ascending `packed_hlc` order (ADR 0043 §A3 step 1: `pending_changes`' own
-//! key order is token-then-pk-then-HLC, not commit order, so the seal step
-//! re-sorts by the HLC suffix before encoding — this module trusts that
-//! order rather than re-deriving it, since re-sorting on every decode would
-//! be wasted work for a reader that already trusts a sealed object's own
-//! construction).
+//! length-prefixed `(source_key, packed_hlc, ordinal, change_record)`
+//! quadruples, in ascending `(packed_hlc, ordinal)` order (ADR 0043 §A3 step
+//! 1: `pending_changes`' own key order is token-then-pk-then-HLC, not commit
+//! order, so the seal step re-sorts by the `(packed_hlc, ordinal)` pair
+//! before encoding — this module trusts that order rather than re-deriving
+//! it, since re-sorting on every decode would be wasted work for a reader
+//! that already trusts a sealed object's own construction).
+//!
+//! ## `ordinal`: disambiguating a tied `packed_hlc` (issue #852)
+//!
+//! `packed_hlc` alone is **not** a unique key: `KvCommand::TxnResolve`'s
+//! commit branch can materialize several change records — one per resolved
+//! key — from a single multi-key `TransactWriteItems` commit, and every one
+//! of them carries that one resolve entry's own `ts` (`assert_ts_monotonic`
+//! only guarantees strict ordering *between* entries, never *within* one).
+//! `ordinal` is the deterministic tiebreak: `materialize_derived`
+//! (`animus-cp-data::lib`) assigns it once, at apply time, as the record's
+//! own index within that entry's `change_log` list — every replica derives
+//! the identical value with no coordination, and it rides in the physical
+//! `KIND_CHANGE` key itself (`prefix || packed_hlc || ordinal`), not just
+//! this segment format, so a sealed shard's on-disk order and a hot-tail
+//! scan's own key order agree by construction. `(packed_hlc, ordinal)`,
+//! compared as a pair (`packed_hlc` first), is this codebase's
+//! `SequenceNumber` (ADR 0042 §5's 2026-09-15 amendment) and the one cursor
+//! granularity every pagination path in this crate and `animusd` uses —
+//! before this fix, a `GetRecords` page boundary landing inside a tied group
+//! silently and permanently dropped the rest of it (issue #852).
 //!
 //! `change_record` is **opaque to this crate** (ADR 0043's own layering
 //! rule): it is `animus-dynamo`/`animusd`'s `ChangeRecord`, already encoded
@@ -93,7 +113,14 @@
 const MAGIC: [u8; 4] = *b"SEGF";
 
 /// Codec version, bumped on any incompatible layout change.
-pub const VERSION: u8 = 1;
+///
+/// `2` (issue #852, 2026-09-15): each body record gained a trailing 4-byte
+/// `ordinal` field (see the module doc's "ordinal" section) — a pure
+/// additive layout change with no migration (this repo's standing
+/// no-back-compat policy, see the root `CLAUDE.md`): a `1`-tagged object is
+/// simply rejected as an unknown version rather than upgraded in place, and
+/// every existing segment is expected to be resealed from scratch.
+pub const VERSION: u8 = 2;
 
 /// Decode/encode failures are plain descriptive strings, mirroring
 /// `codec.rs`'s own `DecodeError` shape — this module has no error-recovery
@@ -149,9 +176,14 @@ pub struct SegmentRecord {
     /// scope (token-leading, HLC-suffixed — see `RaftKvNode::pending_changes`'
     /// own doc in `lib.rs`).
     pub source_key: Vec<u8>,
-    /// This record's own packed HLC (`hlc::pack`) — the DynamoDB Streams
-    /// `SequenceNumber` (ADR 0042 §5).
+    /// This record's own packed HLC (`hlc::pack`).
     pub packed_hlc: u64,
+    /// This record's own intra-entry ordinal (issue #852; see the module
+    /// doc's "ordinal" section) — `0` for the common case (one record per
+    /// committing entry), and the record's own index within a multi-record
+    /// entry's `change_log` list otherwise. `(packed_hlc, ordinal)` together
+    /// are the DynamoDB Streams `SequenceNumber` (ADR 0042 §5).
+    pub ordinal: u32,
     /// The opaque, already-encoded change record (`animus-dynamo`/
     /// `animusd`'s `ChangeRecord` bytes). Never interpreted by this crate.
     pub change_record: Vec<u8>,
@@ -275,6 +307,7 @@ pub fn encode(header: &SegmentHeader, records: &[SegmentRecord]) -> Vec<u8> {
     for r in records {
         put_bytes(&mut out, &r.source_key);
         out.extend_from_slice(&r.packed_hlc.to_be_bytes());
+        out.extend_from_slice(&r.ordinal.to_be_bytes());
         put_bytes(&mut out, &r.change_record);
     }
     out
@@ -386,10 +419,12 @@ pub fn decode(bytes: &[u8]) -> Result<Segment, SegmentError> {
     for i in 0..declared_count {
         let source_key = c.bytes().map_err(|e| format!("record {i}: {e}"))?;
         let packed_hlc = c.u64().map_err(|e| format!("record {i}: {e}"))?;
+        let ordinal = c.u32().map_err(|e| format!("record {i}: {e}"))?;
         let change_record = c.bytes().map_err(|e| format!("record {i}: {e}"))?;
         records.push(SegmentRecord {
             source_key,
             packed_hlc,
+            ordinal,
             change_record,
         });
     }
@@ -509,9 +544,16 @@ mod tests {
     use crate::hlc::HlcTimestamp;
 
     fn rec(key: &[u8], hlc: u64, payload: &[u8]) -> SegmentRecord {
+        rec_ord(key, hlc, 0, payload)
+    }
+
+    /// [`rec`]'s ordinal-carrying sibling, for the tied-`packed_hlc` tests
+    /// (issue #852).
+    fn rec_ord(key: &[u8], hlc: u64, ordinal: u32, payload: &[u8]) -> SegmentRecord {
         SegmentRecord {
             source_key: key.to_vec(),
             packed_hlc: hlc,
+            ordinal,
             change_record: payload.to_vec(),
         }
     }
@@ -697,6 +739,46 @@ mod tests {
     fn ending_sequence_number_is_the_hlc_range_upper_bound() {
         let h = header(1, 0, (10, 999));
         assert_eq!(ending_sequence_number(&h), 999);
+    }
+
+    #[test]
+    fn ordinal_round_trips_through_encode_decode() {
+        // Three records tied on the same `packed_hlc` (a multi-key
+        // `TransactWriteItems` commit, issue #852) must keep their own
+        // distinct ordinals through a round trip.
+        let records = vec![
+            rec_ord(b"k1", 100, 0, b"c1"),
+            rec_ord(b"k1", 100, 1, b"c2"),
+            rec_ord(b"k1", 100, 2, b"c3"),
+        ];
+        let h = header(1, 0, (0, 100));
+        let bytes = encode(&h, &records);
+        let decoded = decode(&bytes).expect("decodes");
+        assert_eq!(decoded.records, records);
+        assert_eq!(
+            decoded
+                .records
+                .iter()
+                .map(|r| r.ordinal)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+    }
+
+    #[test]
+    fn slice_to_hlc_range_keeps_every_record_of_a_tied_group() {
+        // A superset-slice check with a real tie: every record sharing
+        // `packed_hlc == 100` must survive the `<= end_inclusive` filter
+        // together — `packed_hlc` alone decides the bound, `ordinal` never
+        // narrows it (issue #852: the bound is per-entry, not per-record).
+        let records = vec![
+            rec_ord(b"k1", 100, 0, b"c1"),
+            rec_ord(b"k1", 100, 1, b"c2"),
+            rec_ord(b"k1", 100, 2, b"c3"),
+            rec_ord(b"k2", 200, 0, b"c4-should-be-dropped"),
+        ];
+        let sliced = slice_to_hlc_range(&records, (0, 100));
+        assert_eq!(sliced, records[..3]);
     }
 
     #[test]

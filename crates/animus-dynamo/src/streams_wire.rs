@@ -15,14 +15,30 @@
 //! `ShardId` is `animus_cp_data::segment::shard_id`'s own
 //! `shardId-<tablet>-<epoch>` string — [`parse_shard_id`] is its inverse.
 //! A shard iterator is a **stateless, non-expiring** opaque token
-//! (`base64url({label, shard_id, position})`, ADR 0042 §6's documented
-//! deviation from real DynamoDB's 15-minute-expiring ones) —
-//! [`encode_iterator`]/[`decode_iterator`]. `position` is always the
-//! **exclusive** lower bound of the next read (`packed_hlc > position`),
-//! the same convention `animus_cp_data::segment::slice_to_hlc_range`'s
+//! (`base64url({label, shard_id, position_hlc, position_ordinal})`, ADR
+//! 0042 §6's documented deviation from real DynamoDB's 15-minute-expiring
+//! ones) — [`encode_iterator`]/[`decode_iterator`]. `position` is always
+//! the **exclusive** lower bound of the next read, compared as the pair
+//! `(position_hlc, position_ordinal)` (issue #852's 2026-09-15 amendment —
+//! `packed_hlc` alone is not unique per record, since one committing entry
+//! can mint several change records at the identical HLC; `ordinal` is the
+//! deterministic tiebreak, see `animus_cp_data::segment`'s own module
+//! doc), the same convention `animus_cp_data::segment::slice_to_hlc_range`'s
 //! `start_exclusive` and `index_drain::hot_read`'s `from_position` already
 //! use — so a token minted against either tier composes with the other's
 //! filter with no translation step.
+//!
+//! ## `SequenceNumber` (ADR 0042 §5's 2026-09-15 amendment)
+//!
+//! `SequenceNumber` is a fixed-width, 30-ASCII-digit decimal string:
+//! `packed_hlc` zero-padded to 20 digits, immediately followed by `ordinal`
+//! zero-padded to 10 digits ([`format_sequence_number`]/
+//! [`parse_sequence_number`]). Fixed-width digit groups make the
+//! concatenation both lexicographically AND numerically monotonic in
+//! `(packed_hlc, ordinal)` order, satisfying DynamoDB's "numeric string"
+//! contract while staying a total order over every record this adapter
+//! could ever emit — the previous, bare-`packed_hlc` format could collide
+//! across several records sharing one committing entry (issue #852).
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -191,19 +207,22 @@ pub fn parse_stream_arn(arn: &str) -> Option<(String, String)> {
 struct IteratorToken {
     label: String,
     shard_id: String,
-    position: u64,
+    position_hlc: u64,
+    position_ordinal: u32,
 }
 
 /// Mint a stateless, non-expiring shard iterator token (ADR 0042 §6):
-/// `base64url({label, shard_id, position})`. `position` is the **exclusive**
-/// lower bound the next `GetRecords` call filters on (`packed_hlc >
-/// position`) — see the module doc.
+/// `base64url({label, shard_id, position_hlc, position_ordinal})`.
+/// `(position_hlc, position_ordinal)` is the **exclusive** lower bound the
+/// next `GetRecords` call filters on, compared as a pair (issue #852) — see
+/// the module doc.
 #[must_use]
-pub fn encode_iterator(label: &str, shard_id: &str, position: u64) -> String {
+pub fn encode_iterator(label: &str, shard_id: &str, position: (u64, u32)) -> String {
     let token = IteratorToken {
         label: label.to_owned(),
         shard_id: shard_id.to_owned(),
-        position,
+        position_hlc: position.0,
+        position_ordinal: position.1,
     };
     let bytes = serde_json::to_vec(&token).expect("iterator token serializes");
     base64url_encode(&bytes)
@@ -214,24 +233,50 @@ pub fn encode_iterator(label: &str, shard_id: &str, position: u64) -> String {
 /// # Errors
 /// A [`WireError::validation`] for anything that fails to decode — a
 /// tampered, truncated, or foreign token.
-pub fn decode_iterator(token: &str) -> Result<(String, String, u64), WireError> {
+pub fn decode_iterator(token: &str) -> Result<(String, String, (u64, u32)), WireError> {
     let bytes =
         base64url_decode(token).ok_or_else(|| WireError::validation("malformed shard iterator"))?;
     let parsed: IteratorToken = serde_json::from_slice(&bytes)
         .map_err(|_| WireError::validation("malformed shard iterator"))?;
-    Ok((parsed.label, parsed.shard_id, parsed.position))
+    Ok((
+        parsed.label,
+        parsed.shard_id,
+        (parsed.position_hlc, parsed.position_ordinal),
+    ))
 }
 
 // --- sequence numbers ------------------------------------------------------
 
-/// Parse a `SequenceNumber` string (a decimal packed HLC, ADR 0042 §5) into
-/// its `u64`.
+/// The number of decimal digits [`format_sequence_number`] zero-pads
+/// `packed_hlc` to — wide enough for any `u64` (max value has 20 digits).
+const SEQ_HLC_DIGITS: usize = 20;
+/// The number of decimal digits [`format_sequence_number`] zero-pads
+/// `ordinal` to — wide enough for any `u32` (max value has 10 digits).
+const SEQ_ORDINAL_DIGITS: usize = 10;
+
+/// Format `(packed_hlc, ordinal)` as the wire `SequenceNumber` (ADR 0042 §5's
+/// 2026-09-15 amendment) — see the module doc for why the fixed-width
+/// zero-padded concatenation is both lexicographically and numerically
+/// monotonic.
+#[must_use]
+pub fn format_sequence_number(packed_hlc: u64, ordinal: u32) -> String {
+    format!("{packed_hlc:0SEQ_HLC_DIGITS$}{ordinal:0SEQ_ORDINAL_DIGITS$}")
+}
+
+/// Parse a `SequenceNumber` string minted by [`format_sequence_number`] back
+/// into its `(packed_hlc, ordinal)` pair.
 ///
 /// # Errors
-/// A [`WireError::validation`] if it is not a valid decimal `u64`.
-pub fn parse_sequence_number(s: &str) -> Result<u64, WireError> {
-    s.parse()
-        .map_err(|_| WireError::validation(format!("malformed SequenceNumber `{s}`")))
+/// A [`WireError::validation`] if it is not exactly `SEQ_HLC_DIGITS +
+/// SEQ_ORDINAL_DIGITS` ASCII decimal digits.
+pub fn parse_sequence_number(s: &str) -> Result<(u64, u32), WireError> {
+    let err = || WireError::validation(format!("malformed SequenceNumber `{s}`"));
+    if s.len() != SEQ_HLC_DIGITS + SEQ_ORDINAL_DIGITS || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(err());
+    }
+    let packed_hlc: u64 = s[..SEQ_HLC_DIGITS].parse().map_err(|_| err())?;
+    let ordinal: u32 = s[SEQ_HLC_DIGITS..].parse().map_err(|_| err())?;
+    Ok((packed_hlc, ordinal))
 }
 
 // --- response encoding -----------------------------------------------------
@@ -436,7 +481,7 @@ pub fn keys_from_images(
 
 /// Build one `Records[]` entry (ADR 0042 §3, the AWS `Record` shape) from a
 /// decoded [`ChangeRecord`] at shard `shard_id`/sequence number
-/// `packed_hlc`, projected per `view_type`.
+/// `(packed_hlc, ordinal)`, projected per `view_type`.
 ///
 /// **`userIdentity` (ADR 0051 §7)**: present, at the record's own top level
 /// (alongside `dynamodb`, not inside it — AWS's real shape), only when
@@ -446,9 +491,14 @@ pub fn keys_from_images(
 /// `DeleteItem`. Absent entirely for every other record (an ordinary client
 /// write has no `userIdentity` in real DynamoDB either).
 #[must_use]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "issue #852 added ordinal; every parameter is load-bearing for the AWS record shape"
+)]
 pub fn stream_record_json(
     shard_id: &str,
     packed_hlc: u64,
+    ordinal: u32,
     record: &ChangeRecord,
     view_type: StreamViewType,
     partition_key: &str,
@@ -456,7 +506,7 @@ pub fn stream_record_json(
     approx_creation_wall_ms: u64,
 ) -> Value {
     let event_name = record.event_name();
-    let seq = packed_hlc.to_string();
+    let seq = format_sequence_number(packed_hlc, ordinal);
     let keys = keys_from_images(
         partition_key,
         sort_key,
@@ -495,9 +545,14 @@ pub fn stream_record_json(
     );
 
     let mut r = Map::new();
+    // Issue #852: `ordinal` joins `packed_hlc` here too — two records tied
+    // on the identical `packed_hlc` (a multi-key `TransactWriteItems`
+    // commit) used to render the identical `eventID`, which a consumer
+    // library doing idempotent-delivery bookkeeping keyed on `eventID`
+    // would have silently coalesced.
     r.insert(
         "eventID".into(),
-        Value::String(format!("{shard_id}-{packed_hlc}")),
+        Value::String(format!("{shard_id}-{packed_hlc}-{ordinal}")),
     );
     r.insert("eventName".into(), Value::String(event_name.into()));
     r.insert("eventVersion".into(), Value::String("1.1".into()));
@@ -632,16 +687,16 @@ mod tests {
 
     #[test]
     fn iterator_token_round_trips() {
-        let tok = encode_iterator("L1", "shardId-1-0", 42);
+        let tok = encode_iterator("L1", "shardId-1-0", (42, 3));
         let (label, shard_id, position) = decode_iterator(&tok).unwrap();
         assert_eq!(label, "L1");
         assert_eq!(shard_id, "shardId-1-0");
-        assert_eq!(position, 42);
+        assert_eq!(position, (42, 3));
     }
 
     #[test]
     fn tampered_iterator_token_is_rejected() {
-        let mut tok = encode_iterator("L1", "shardId-1-0", 42);
+        let mut tok = encode_iterator("L1", "shardId-1-0", (42, 0));
         tok.push('!'); // corrupt the base64url
         let err = decode_iterator(&tok).unwrap_err();
         assert_eq!(err.code, "ValidationException");
@@ -655,8 +710,30 @@ mod tests {
 
     #[test]
     fn sequence_number_round_trips() {
-        assert_eq!(parse_sequence_number("12345").unwrap(), 12345);
+        assert_eq!(
+            parse_sequence_number(&format_sequence_number(12345, 7)).unwrap(),
+            (12345, 7)
+        );
         assert!(parse_sequence_number("not-a-number").is_err());
+        assert!(
+            parse_sequence_number("12345").is_err(),
+            "must reject anything short of the full fixed 30-digit width"
+        );
+    }
+
+    #[test]
+    fn format_sequence_number_is_fixed_width_and_monotonic() {
+        // Issue #852: a tied `packed_hlc` with distinct ordinals must
+        // compare correctly both lexicographically AND numerically.
+        let a = format_sequence_number(100, 0);
+        let b = format_sequence_number(100, 1);
+        let c = format_sequence_number(101, 0);
+        assert_eq!(a.len(), 30);
+        assert!(a < b, "same hlc, ordinal must break the tie: {a} vs {b}");
+        assert!(b < c, "a higher hlc must always sort after: {b} vs {c}");
+        assert_eq!(parse_sequence_number(&a).unwrap(), (100, 0));
+        assert_eq!(parse_sequence_number(&b).unwrap(), (100, 1));
+        assert_eq!(parse_sequence_number(&c).unwrap(), (101, 0));
     }
 
     #[test]
@@ -719,18 +796,22 @@ mod tests {
         let v = stream_record_json(
             "shardId-1-0",
             42,
+            0,
             &record,
             StreamViewType::NewAndOldImages,
             "pk",
             None,
             1_700_000_000_000,
         );
-        assert_eq!(v["eventID"], "shardId-1-0-42");
+        assert_eq!(v["eventID"], "shardId-1-0-42-0");
         assert_eq!(v["eventName"], "INSERT");
         assert_eq!(v["eventVersion"], "1.1");
         assert_eq!(v["eventSource"], "aws:dynamodb");
         assert_eq!(v["awsRegion"], "animus");
-        assert_eq!(v["dynamodb"]["SequenceNumber"], "42");
+        assert_eq!(
+            v["dynamodb"]["SequenceNumber"],
+            format_sequence_number(42, 0)
+        );
         assert_eq!(v["dynamodb"]["StreamViewType"], "NEW_AND_OLD_IMAGES");
         assert!(v["dynamodb"]["NewImage"].is_object());
         assert!(v["dynamodb"]["OldImage"].is_null());
@@ -757,6 +838,7 @@ mod tests {
         let v = stream_record_json(
             "shardId-1-0",
             99,
+            0,
             &record,
             StreamViewType::NewAndOldImages,
             "pk",
@@ -782,6 +864,7 @@ mod tests {
         let v = stream_record_json(
             "shardId-1-0",
             7,
+            0,
             &record,
             StreamViewType::KeysOnly,
             "pk",

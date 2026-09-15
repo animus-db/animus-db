@@ -206,7 +206,8 @@ async fn bare_stream_hot_read_is_refused() {
         .expect("connect to client port");
     let request = animusd::ClientRequest::StreamHotRead {
         tablet: 1,
-        from_position: 0,
+        from_position_hlc: 0,
+        from_position_ordinal: 0,
         limit: 10,
     };
     animusd::write_frame(&mut stream, &request)
