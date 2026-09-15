@@ -278,6 +278,61 @@ phase() {
     log "=== phase: $1 ==="
 }
 
+# Issue #864: whenever the S-07d control-voter-growth wait is (or was) in
+# flight, `GROWTH_TARGET_ORDINAL` names the pod ordinal being promoted —
+# curl that ONE pod's own `/admin/health` and `/admin/raft` directly (a
+# fresh, throwaway port-forward straight to it, never the pinned
+# `$DYNAMO_POD`/`$PORT_FORWARD_PID` pair the rest of this script uses, so
+# this never disturbs an in-flight wait or another phase's own connection)
+# and print the status code + full body of each. Before this, a stalled
+# growth left this script's diagnostics with nothing more specific than
+# "readinessProbe: false" (`kubectl describe pods`) and a stdout log
+# showing only "ready" — no visibility into WHY: whether the control plane
+# genuinely has no leader yet, or whether this replica's own issue #667
+# boot-time cluster check is still pending or was refused (both now
+# reported by `/admin/raft`'s `cluster_check_pending`/`refused_as_voter`
+# fields, see `crates/animusd/src/admin.rs::raft_view`). The runtime image
+# has no `curl` (`Dockerfile`'s `runtime` stage installs only
+# `ca-certificates`), so this dials from the script's own host over a
+# dedicated port-forward rather than `kubectl exec`ing a curl inside the
+# pod. Best-effort throughout (`|| true` on every step) — a diagnostics
+# dump must never itself fail the run or mask the original failure.
+dump_growth_target_admin_state() {
+    if [ -z "${GROWTH_TARGET_ORDINAL:-}" ]; then
+        return 0
+    fi
+    local pod="${AC_NAME}-${GROWTH_TARGET_ORDINAL}"
+    if ! kubectl get "pod/${pod}" -n "$NAMESPACE" >/dev/null 2>&1; then
+        log "issue #864 admin-state dump: pod/${pod} does not exist, skipping"
+        return 0
+    fi
+    log "issue #864 admin-state dump: pod ${pod}'s own /admin/health + /admin/raft"
+    local local_port=18102
+    local fwd_log="${WORKDIR}/growth-target-port-forward.log"
+    local fwd_pid=""
+    kubectl port-forward "pod/${pod}" -n "$NAMESPACE" \
+        "${local_port}:${ADMIN_REMOTE_PORT}" >"$fwd_log" 2>&1 &
+    fwd_pid=$!
+    # A plain fixed sleep, not `wait_for` — this is a best-effort diagnostic
+    # dump running from inside a failure handler (possibly `on_err`'s trap),
+    # not a correctness-gating wait, so it must never itself risk `fail`
+    # recursing or a `wait_for` timeout eating into the trap's own budget.
+    sleep 2
+    local code body
+    for path in health raft; do
+        body="$(curl -sS -m 3 "${CURL_TLS_ARGS[@]}" \
+            "${ADMIN_SCHEME}://${ADMIN_HOST}:${local_port}/admin/${path}" 2>/dev/null)" || body=""
+        code="$(curl -sS -o /dev/null -m 3 -w '%{http_code}' "${CURL_TLS_ARGS[@]}" \
+            "${ADMIN_SCHEME}://${ADMIN_HOST}:${local_port}/admin/${path}" 2>/dev/null)" || code="<unreachable>"
+        log "  GET /admin/${path} -> ${code}"
+        log "  body: ${body:-<empty>}"
+    done
+    if [ -n "$fwd_pid" ]; then
+        kill "$fwd_pid" >/dev/null 2>&1 || true
+        wait "$fwd_pid" 2>/dev/null || true
+    fi
+}
+
 dump_diagnostics() {
     log "--- diagnostics (phase: ${PHASE}) ---"
     if [ "$KIND_CLUSTER_UP" = "true" ]; then
@@ -332,6 +387,9 @@ dump_diagnostics() {
     if [ -f "$PORT_FORWARD_LOG" ]; then
         log "port-forward log: ${PORT_FORWARD_LOG}"
         cat "$PORT_FORWARD_LOG" 2>&1 | sed 's/^/  /' || true
+    fi
+    if [ "$KIND_CLUSTER_UP" = "true" ]; then
+        dump_growth_target_admin_state
     fi
     log "--- end diagnostics ---"
 }
