@@ -1971,6 +1971,32 @@ demand the identical action, so no disambiguation is needed.
   (`start_election` gates on `is_voter`). A `start` whose `all_nodes` excludes
   its own id is a quiet non-voter until the leader adds it. (Caught by the
   `reconfigure_trigger` seed sweep — a single seed hid it.)
+- **Wiped-voter boot-time safety (issue #900, ADR 0017's matching amendment):
+  `drive`'s WAL-recovery branch calls `RaftCore::begin_cluster_check`
+  whenever `state.is_empty()`, except when the caller's own
+  `campaign_immediately` flag is set** (ADR 0058 Train 2 rung 4's
+  deterministic split-child first-leader optimization — that flag proves,
+  by construction, a genuine fresh formation, so skipping the check there
+  costs zero safety and avoids gating the synchronous `campaign_now` call
+  on `cluster_check_pending`, which would silently degrade "wins the race
+  against the cold election timeout" to "waits out the cold election
+  timeout anyway" on every split). Everything else about the mechanism —
+  the `ClusterProbe`/`ClusterProbeResp` wire messages, the vote/campaign
+  gating, the wait-for-every-peer aggregation — lives on the shared,
+  generic `RaftCore<C, S>` (`animus-control::raft`), so it needed **no**
+  cp-data-specific reimplementation, only this one driver call plus
+  `RaftKvNode::cluster_check_pending()`/`refused_as_voter()` accessors.
+  **Gotcha for any future boot-path change here**: wiring this in draws
+  extra entropy (`env.next_u64()`) at every non-`campaign_immediately`
+  fresh-group boot, reshuffling later random draws for the rest of that
+  `SimEnv` run — re-verify every fixed-seed test that starts a fresh
+  replica (a new tablet, a growth join, a test harness's own second/third
+  node) after touching this branch, not just the tests that exercise it
+  directly; `tests/read_index.rs`'s own
+  `linearizable_read_succeeds_after_a_full_membership_rotation` needed a
+  seed re-pin for exactly this reason. See
+  `docs/lessons/code-patterns/2026-09-15-a-generic-core-level-fix-does-
+  not-wire-itself-into-every-driver.md` for the general lesson.
 - The ADR 0029 reconfigure/leadership-transfer follow-up fix (the two-layer
   transfer-gate threshold mismatch, the proposal-freeze while a transfer is
   armed, and the down-extra search fix) is a cross-cutting lesson — see the
