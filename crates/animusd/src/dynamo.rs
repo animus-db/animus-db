@@ -10550,9 +10550,11 @@ mod stream_write_path_tests {
             "exactly one marker per batched item (live {} + trimmed {trimmed})",
             records.len()
         );
+        // The change-log key suffix is now (packed_hlc: u64, ordinal: u32),
+        // 12 bytes total (issue #852) — the HLC lives at [len-12, len-4).
         let distinct_hlcs: std::collections::BTreeSet<u64> = records
             .iter()
-            .map(|(key, _)| u64::from_be_bytes(key[key.len() - 8..].try_into().unwrap()))
+            .map(|(key, _)| u64::from_be_bytes(key[key.len() - 12..key.len() - 4].try_into().unwrap()))
             .collect();
         assert!(
             distinct_hlcs.len() <= 1,
@@ -10760,9 +10762,9 @@ mod stream_write_path_tests {
             let record = ChangeRecord::decode(value).expect("marker decodes");
             assert!(record.marker && record.consumer_hidden());
             assert!(record.old_image.is_none() && record.new_image.is_none());
-            // Full-raw-key-as-prefix: change key = the raw key + the 8-byte
-            // apply-completed HLC suffix.
-            let prefix = &key[..key.len() - 8];
+            // Full-raw-key-as-prefix: change key = the raw key + the
+            // 12-byte (packed_hlc, ordinal) suffix (issue #852).
+            let prefix = &key[..key.len() - 12];
             assert!(
                 [b"k1".as_slice(), b"k2".as_slice(), b"k3".as_slice()].contains(&prefix),
                 "marker prefix must be the raw key itself: {prefix:?}"
@@ -10833,7 +10835,10 @@ mod stream_write_path_tests {
             assert!(!record.seeded, "a live write is never a seed");
             assert!(record.old_image.is_none(), "a marker carries no images");
             assert!(record.new_image.is_none(), "a marker carries no images");
-            let hlc_suffix = u64::from_be_bytes(key[key.len() - 8..].try_into().unwrap());
+            // The change-log key suffix is (packed_hlc: u64, ordinal: u32),
+            // 12 bytes total (issue #852) — the HLC lives at [len-12, len-4).
+            let hlc_suffix =
+                u64::from_be_bytes(key[key.len() - 12..key.len() - 4].try_into().unwrap());
             assert!(
                 hlc_suffix > last_hlc,
                 "marker HLCs are apply-time-completed and strictly increasing \
