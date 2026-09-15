@@ -2868,7 +2868,38 @@ where
         // monotonic regardless of ack arrival order — independent of, and
         // additive with, the resend cap below.
         let tracked = self.snapshot_offset.entry(from.clone()).or_insert(0);
-        if next_offset < *tracked {
+        if next_offset == 0 && *tracked > 0 {
+            // Issue #899 amendment (folded into #898's own regression-
+            // counting rebase below, not a bypass of it): `next_offset == 0`
+            // is a genuine, AUTHORITATIVE reset, never a reorder to guard
+            // against, so it must not wait out `SNAPSHOT_OFFSET_REGRESSION_
+            // REBASE` retries the way an ordinary partial regression does.
+            // `handle_install_snapshot`'s own "still in progress" branch can
+            // only ever report exactly `0` when `self.incoming_snapshot` is
+            // `None` — which, for an ack reaching this far (`last_index ==
+            // 0`, so no completed transfer either), means the follower has
+            // FORGOTTEN whatever it was assembling (a real restart
+            // discarding the volatile in-flight buffer, per
+            // `handle_install_snapshot`'s own doc — never a reordered ack
+            // for an ongoing transfer, since that always reports a nonzero
+            // `inc.buf.len()`). Waiting for #898's own regression counter
+            // here left a restarted follower and its leader deadlocked for
+            // several extra round trips (and, before #898 existed at all,
+            // permanently): the leader kept re-sending chunks at its own
+            // stale (pre-restart, high) tracked offset, which the
+            // follower's `fresh && offset == 0` guard
+            // (`handle_install_snapshot`) can never treat as the start of a
+            // fresh transfer, so `incoming_snapshot` never re-initializes
+            // and the transfer never resumes. Confirmed via
+            // `chunked_snapshot_receiver_stop_restart_3`'s fixed corpus seed
+            // (also reachable with zero unrelated code changes at all, by
+            // perturbing any other seed into this same narrow window — the
+            // bug is pre-existing, not specific to how the seed is
+            // reached). See `docs/lessons/` for the incident writeup.
+            *tracked = 0;
+            self.snapshot_chunk_sent.remove(&from);
+            self.snapshot_offset_regressions.insert(from.clone(), 0);
+        } else if next_offset < *tracked {
             // Issue #898: a regression below the tracked offset — either a
             // stale, reordered ack for THIS transfer (the common case the
             // monotonic guard below protects against) or a peer whose buffer
@@ -2878,6 +2909,10 @@ where
             // seeing it for the first (few) time(s) is exactly what an
             // ordinary reordered ack looks like too, so rebasing on the
             // first sighting would defeat the monotonic guard's own purpose.
+            // (A regression all the way to exactly `0` is handled above,
+            // immediately, instead — see that branch's own doc for why zero
+            // specifically is never ambiguous the way any other partial
+            // regression is.)
             let regressions = self
                 .snapshot_offset_regressions
                 .entry(from.clone())
