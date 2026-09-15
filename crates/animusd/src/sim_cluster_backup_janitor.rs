@@ -639,3 +639,74 @@ fn e_an_available_backup_is_never_touched_over_seeds() {
         run_e_an_available_backup_is_never_touched(0xBAC7_6000 + i);
     }
 }
+
+/// Regression for the `SimCluster::transfer_control_leadership_to` fix
+/// (issue #900 follow-up, PR #907, `ba883bb5`): an armed leadership
+/// transfer must survive its own leader being deposed (by an unrelated
+/// event) before the handoff lands, not just a leader that stays put the
+/// whole time.
+///
+/// **Found live** (not invented for this test): wiring issue #667's
+/// boot-time cluster check into `animus-cp-data`'s own tablet-group
+/// driver (issue #900) draws extra entropy at every fresh tablet group's
+/// boot, reshuffling later random draws for the rest of a `SimEnv` run —
+/// for one specific seed (`0xBAC7_4002`,
+/// `c2_leadership_transfer_yields_one_clean_reclaim_over_seeds` above),
+/// this landed the control group's own election timeouts close enough
+/// together that an ordinary, Raft-legal split-vote/re-election sequence
+/// deposed the armed leader in favor of a THIRD node that never received
+/// any transfer request, stranding the transfer forever (`term` 1 -> 2 ->
+/// 3 -> 4 across all three voters within ~300ms, settling on a stable
+/// leader that was never the transfer's own target). PR #907 fixed
+/// `transfer_control_leadership_to` itself (re-issue the arm against
+/// whoever currently leads, every poll) but landed without a regression
+/// that reproduces the race deterministically from `main`'s own state —
+/// this test is that regression.
+///
+/// **Reproduces the identical shape without depending on any entropy
+/// shift**: [`SimCluster::schedule_crash_after`] deterministically
+/// crashes the (about to be) armed leader 50ms into
+/// `transfer_control_leadership_to`'s own execution — landing *during*
+/// its internal `run_for` calls, not merely between two top-level test
+/// steps — so the natural re-election that follows is the thing that
+/// deposes the armed leader, exactly as the live incident did, just
+/// triggered on a fixed schedule instead of a lucky/unlucky timing
+/// coincidence.
+///
+/// `SEED = 11` was found by a direct scan of seeds `0..20_000` run
+/// against a **local, temporary revert** of `transfer_control_
+/// leadership_to` back to the pre-#907 arm-once-then-passive-wait shape
+/// (never committed — this test targets the fixed code that is actually
+/// on `main`). That scan found 5 failing seeds before it was capped:
+/// `[11, 24, 32, 44, 53]`. For seed 11 specifically: leader = 2,
+/// target = 0, and the surviving pair `{0, 1}` settles on 1 (the decoy)
+/// once 2 crashes — under the old code this produced exactly
+/// `control leadership must move to node 0 within budget (still on 1)`.
+/// Confirmed **red** against that reverted old code and **green** against
+/// the fix that is on `main` today — this is not a seed picked for "it
+/// happens to fail", it is the shape the fix exists to handle.
+#[test]
+fn transfer_survives_the_armed_leader_being_deposed_before_handoff_completes() {
+    const SEED: u64 = 11;
+    let mut cluster = SimCluster::new(SEED, 3, 3);
+    let leader_idx = cluster.control_leader_index();
+    let leader = cluster.control_node_id(leader_idx);
+    // Confirmed via direct scan for this seed: leader == 2, target == 0,
+    // and the surviving pair {0, 1} settles on 1 (the decoy) first once 2
+    // crashes under the old, arm-once-then-wait implementation.
+    let target = (0..3u64)
+        .find(|&n| n != leader)
+        .expect("a non-leader exists");
+
+    cluster.schedule_crash_after(leader, Duration::from_millis(50));
+    cluster.transfer_control_leadership_to(target);
+
+    let final_leader_idx = cluster.control_leader_index();
+    let final_leader = cluster.control_node_id(final_leader_idx);
+    assert_eq!(
+        final_leader, target,
+        "seed={SEED}: control leadership must converge to the transfer's own target ({target}) \
+         even though its originally-armed leader ({leader}) was deposed by an unrelated crash \
+         before the handoff completed — found leader {final_leader} instead"
+    );
+}
