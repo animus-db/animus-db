@@ -231,6 +231,22 @@ pub struct DiskConfig {
     /// `read`/`read_at`, exactly like any other un-synced tail); only a
     /// following crash reveals the lie.
     fsync_lie_threshold: u64,
+    /// Like [`error_threshold`](Self::error_threshold), but applies ONLY to
+    /// the `sync` op — every other op (`append`/`read`/`read_at`/`replace`)
+    /// is completely unaffected, unlike `error_threshold`'s deliberately
+    /// uniform "one shared roll for every op" shape. Exists for issue #883's
+    /// regression (a tolerated failure whose own `env.append` already
+    /// buffered real bytes before its own `env.sync` fails): proving a
+    /// coordinator's own best-effort repair of that hazard (an immediate
+    /// `read`+`replace` run with no scheduling boundary before it, so a
+    /// test can't "heal" the disk in between) requires a fault shape where
+    /// `sync` fails but a `read`/`replace` issued a moment later, on the
+    /// same still-otherwise-healthy disk, succeeds — a shape
+    /// `error_prob`/`enospc_prob` cannot express on their own. Draws its own
+    /// independent RNG roll, but **only when configured non-zero AND the op
+    /// is `"sync"`** — an unconfigured (default) value perturbs neither the
+    /// RNG stream nor the trace for any existing config, on any op.
+    sync_only_error_threshold: u64,
 }
 
 impl DiskConfig {
@@ -259,6 +275,14 @@ impl DiskConfig {
     /// `[0.0, 1.0]` — see [`fsync_lie_threshold`](Self::fsync_lie_threshold).
     pub fn set_fsync_lie_prob(&mut self, p: f64) {
         self.fsync_lie_threshold = (p.clamp(0.0, 1.0) * (u64::MAX as f64)) as u64;
+    }
+
+    /// Set the independent `sync`-op-only error probability in `[0.0, 1.0]`
+    /// — see [`sync_only_error_threshold`](Self::sync_only_error_threshold)
+    /// for how this differs from [`set_error_prob`](Self::set_error_prob)
+    /// (which fires uniformly across every disk op).
+    pub fn set_sync_error_prob(&mut self, p: f64) {
+        self.sync_only_error_threshold = (p.clamp(0.0, 1.0) * (u64::MAX as f64)) as u64;
     }
 }
 
@@ -574,7 +598,16 @@ impl SimState {
     ) -> Option<std::io::Error> {
         let cfg = self.disk_cfg_for(&node);
         let (error_threshold, enospc_threshold) = (cfg.error_threshold, cfg.enospc_threshold);
-        if error_threshold == 0 && enospc_threshold == 0 {
+        // `sync_only_error_threshold` only ever applies to the `sync` op —
+        // every other op sees it as 0, so this whole function is byte-
+        // identical to before this field existed whenever it's unconfigured
+        // or the op isn't `sync`.
+        let sync_only_error_threshold = if op == "sync" {
+            cfg.sync_only_error_threshold
+        } else {
+            0
+        };
+        if error_threshold == 0 && enospc_threshold == 0 && sync_only_error_threshold == 0 {
             return None;
         }
         let roll = self.rng.next_u64();
@@ -602,6 +635,22 @@ impl SimState {
             });
             return Some(std::io::Error::other(format!(
                 "sim injected disk fault: {op} {file} (node {node})"
+            )));
+        }
+        if roll
+            < enospc_threshold
+                .saturating_add(error_threshold)
+                .saturating_add(sync_only_error_threshold)
+        {
+            self.trace.push(TraceEvent::DiskFault {
+                t,
+                node: node.clone(),
+                op,
+                file: file.to_owned(),
+                kind: "error",
+            });
+            return Some(std::io::Error::other(format!(
+                "sim injected sync-only disk fault: {op} {file} (node {node})"
             )));
         }
         None

@@ -51,6 +51,14 @@
 //! - A round's ack fires only after the physical `append`/`sync` (or,
 //!   for a rewrite, `replace`) actually lands — identical durability
 //!   semantics to the per-group file this replaces.
+//! - **A failed `sync` never leaves this round's own un-synced bytes for a
+//!   later, unrelated caller's own successful `sync` to durably launder**
+//!   (issue #883): [`flush`](SharedWal::flush)'s `Append` branch repairs a
+//!   sync failure by stripping exactly this round's own just-appended bytes
+//!   back off the file's tail (`Disk::replace`, atomic) before `drive()`
+//!   hands the file to the next queued op — see that method's own doc for
+//!   the full mechanism and why it is safe unconditionally, independent of
+//!   `group_tails`/the tagged API.
 //! - **GC policy**: there is no independent segment file to reclaim — the
 //!   coordinator holds one physical file, atomically rewritten. A tablet's
 //!   own bytes are reclaimed the moment THAT tablet itself calls
@@ -441,12 +449,49 @@ impl<C: Clone, S: Clone> SharedWal<C, S> {
                         merged.extend_from_slice(bytes);
                     }
                 }
-                async {
-                    env.append(file, &merged).await?;
-                    env.sync(file).await
+                env.append(file, &merged).await.map_err(SharedWalError::from)?;
+                if let Err(e) = env.sync(file).await {
+                    // Issue #883: `env.append` above already landed `merged`
+                    // in the file's un-synced buffered region before this
+                    // round's own `sync` failed — `Disk::append`/`Disk::sync`
+                    // are two independently-observable physical steps (a real
+                    // `write()` places bytes in the OS page cache before any
+                    // `fsync()`; a FAILED `fsync()` does not retroactively
+                    // un-write them, and `animus-sim`'s own `Disk` model
+                    // deliberately mirrors that). Left in place, those bytes
+                    // are not just this round's own problem: `Disk::append`'s
+                    // `buffered.extend_from_slice` means the NEXT caller's
+                    // own ordinary append physically extends the SAME
+                    // unsynced region, and that caller's own successful
+                    // `sync` then durably commits the whole buffered tail —
+                    // this round's un-acked bytes included — reporting a
+                    // totally unrelated, healthy caller's operation as a
+                    // clean success while silently laundering a write that
+                    // was never acked. Repair it here, before `drive()` can
+                    // hand the file to any other queued op: strip exactly
+                    // the `merged.len()` bytes this round itself just
+                    // appended back off the file's tail via one atomic
+                    // `Disk::replace`. This never touches anything durable
+                    // before it — every prior `flush` call only ever returns
+                    // having fully synced (moving its own bytes out of
+                    // `buffered`) or having already failed and been repaired
+                    // by this same call, so entering ANY round's own
+                    // `append` the file's buffered region is always already
+                    // empty. Best-effort: if the read-back or the replace
+                    // itself also fails (the disk is failing outright),
+                    // there is nothing further this coordinator can do — the
+                    // caller below still sees this round's own `sync` error,
+                    // exactly as before this fix.
+                    if let Ok(current) = env.read(file).await {
+                        if let Some(restored_len) = current.len().checked_sub(merged.len()) {
+                            if current[restored_len..] == merged[..] {
+                                let _ = env.replace(file, &current[..restored_len]).await;
+                            }
+                        }
+                    }
+                    return Err(SharedWalError::from(e));
                 }
-                .await
-                .map_err(SharedWalError::from)
+                Ok(())
             }
         }
     }
