@@ -1423,7 +1423,32 @@ where
                 None => Some(self.heartbeat_deadline),
             }
         } else {
-            Some(self.election_deadline)
+            // Issue #667 amendment: while the boot-time cluster check is still
+            // pending, this node ALSO needs to wake in time to resend its probe
+            // (`cluster_check_resend_deadline`, `tick()`'s own independent
+            // resend check) — never only at `election_deadline`. The driver
+            // loop (`node.rs`) sleeps exactly until whatever this function
+            // returns and calls `tick()` only then; `election_deadline` is
+            // legitimately reset far into the future by `handle_append_entries`
+            // on every valid leader contact (a still-pending founder can start
+            // receiving ordinary heartbeats from an already-elected sibling the
+            // moment any majority forms), and `cluster_check_resend_deadline`
+            // is deliberately never touched by that reset (see its own doc) —
+            // so without this `min`, a real `ProdEnv` founder under real
+            // staggered bring-up can oversleep past its own resend deadline
+            // for as long as `election_deadline` keeps getting pushed out,
+            // reproducing exactly the "cluster did not bootstrap" CI
+            // regression this amendment fixes: the resend logic in `tick()`
+            // was correct in isolation, but `tick()` was never being called
+            // at the right time to run it.
+            match self.cluster_check_pending {
+                Some(_) => Some(Nanos(
+                    self.election_deadline
+                        .0
+                        .min(self.cluster_check_resend_deadline.map_or(u64::MAX, |d| d.0)),
+                )),
+                None => Some(self.election_deadline),
+            }
         }
     }
 
