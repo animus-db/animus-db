@@ -385,6 +385,23 @@ per-tablet CP data plane (`animus-cp-data`).
   entries for the incidents (including a real bug in the fix's own first
   draft: a rejected vote is not participation, and counting it
   reintroduced the exact false refusal the fix exists to prevent).
+  **Third amendment, same day**: `ever_heard_from_prober` was originally
+  wired as decisive on the FIRST peer to answer `false`, on the (false)
+  assumption that an established voter's peers all keep answering `true`
+  forever. `heard_from` is only marked at message sites that route through
+  a candidate/leader, so two ordinary followers that never themselves
+  campaign never learn of each other — any 3-voter cluster with one stable
+  leader is guaranteed to have a follower-follower pair that legitimately,
+  permanently answers `false` for each other. A real, deterministically
+  reproducing (not intermittent) `ProdEnv` failure in `prod_liveness.rs`'s
+  `wiped_voter_refuses_and_the_rest_of_the_cluster_keeps_serving` caught
+  this. Fixed by folding the signal into the SAME wait-for-every-peer
+  aggregation the established verdict already uses (decide only once
+  every peer has answered, refuse if *any* showed `true`, resolve fresh
+  only if *none* did) instead of letting a single `false` short-circuit
+  the wait — see `docs/lessons/testing/2026-09-15-a-per-peer-any-false-
+  signal-is-not-safe-when-the.md` and the new
+  `tests/wiped_voter_follower_peer_evidence.rs`.
 
 - **Config-in-log + current-term-commit gate (ADR 0017 C).** `LogEntry` may
   carry a `config: Option<voters>`; `RaftCore` keeps `peers`/`cluster_size` in

@@ -374,7 +374,7 @@ pub enum RaftMsg<C = MetaCommand> {
     ///   doesn't (yet) recognize the asker as one of its voters at all. The
     ///   original signal (ADR 0060): pre-vote's own log check is what keeps
     ///   this case safe, unchanged.
-    /// - `!ever_heard_from_prober` — the responder has *itself* never
+    /// - `ever_heard_from_prober` — whether the responder has *itself* ever
     ///   received any real consensus-protocol message (a vote request/
     ///   response, an append, a snapshot chunk — anything but this very
     ///   probe/response pair) from the asker, ever, since this responder's
@@ -386,19 +386,26 @@ pub enum RaftMsg<C = MetaCommand> {
     ///   that elects among itself before a slower founder's own check
     ///   resolves looks — by `config.contains` alone — indistinguishable
     ///   from a genuinely established, long-running voter whose disk was
-    ///   wiped. A founder that has never campaigned or voted (gated on
-    ///   `!cluster_check_pending`, see `start_pre_vote`/`start_election`)
-    ///   has sent no peer any real protocol message yet, so
-    ///   `ever_heard_from_prober` is unconditionally `false` for it on
-    ///   every peer — resolving the genesis race immediately, on the first
-    ///   reply, with no need to wait out the full peer set. This is a pure
-    ///   *addition*: it never makes an established-restart refusal less
-    ///   likely (a genuinely wiped voter's peers HAVE received real
-    ///   messages from it pre-wipe and keep answering `true` for as long as
-    ///   they keep running), only faster/safer for an identity that has
-    ///   never had a real vote to forget. See `RaftCore::
-    ///   handle_cluster_probe_resp`'s doc for the full decision table and
-    ///   `docs/adr/0009-*.md`'s matching amendment for the design record.
+    ///   wiped. **Third amendment, same day**: this signal is folded into
+    ///   the SAME wait-for-every-peer aggregation `config.contains`'s
+    ///   established verdict already uses, rather than being decisive on a
+    ///   single `false` reply — a still-checking founder has sent no peer
+    ///   any real protocol message yet, so it is guaranteed `false` from
+    ///   EVERY peer, but the converse is not true: a perfectly ordinary
+    ///   established follower that has never itself been a candidate or
+    ///   leader only ever exchanges real protocol messages with whichever
+    ///   peer *is* the candidate/leader, never with a fellow follower (and
+    ///   the leader does not mark this on receiving a plain
+    ///   `AppendEntriesResp` either), so two long-established, healthy
+    ///   follower peers can go their entire lives never marking each other
+    ///   — a genuinely wiped voter's fellow follower will honestly answer
+    ///   `false` even though the cluster is real, reproducibly (not
+    ///   intermittently) defeating the refusal if treated as decisive on
+    ///   its own (found via a real, deterministic `ProdEnv` failure in
+    ///   `wiped_voter_refuses_and_the_rest_of_the_cluster_keeps_serving`).
+    ///   See `RaftCore::handle_cluster_probe_resp`'s doc for the full
+    ///   decision table and `docs/adr/0009-*.md`'s matching amendment for
+    ///   the design record.
     ///   **Known residual**: this signal is per-process, in-memory, not
     ///   WAL-durable — a responder that itself restarts (recovered, not
     ///   wiped) forgets it until the prober sends it another real message,
@@ -997,7 +1004,14 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     // flaky failure under real `ProdEnv` threading): whether ANY peer has
     // so far answered this boot's cluster check with real history
     // (`term > 0 || committed_index > 0`) that also names this node in its
-    // own committed config. Recorded, never acted on immediately — see
+    // own committed config **and** itself genuinely heard from this
+    // identity before (`ever_heard_from_prober`, added by the second
+    // amendment, folded into this same aggregated flag by the third —
+    // see `handle_cluster_probe_resp`'s doc for why a peer lacking that
+    // last part is not decisive either way on its own, and why requiring
+    // it from ANY one peer rather than ALL of them is what makes this
+    // sound for an ordinary follower-follower pair that never directly
+    // exchanged a message). Recorded, never acted on immediately — see
     // `handle_cluster_probe_resp`'s own doc for why a SINGLE such answer is
     // not, by itself, trustworthy evidence of a genuine wiped-voter restart
     // (a real N-node genesis bootstrap can have a majority-of-peers elect a
@@ -2610,31 +2624,56 @@ where
     ///   `cluster_check_resend_deadline`'s own doc for the companion fix
     ///   this required).
     ///
-    /// Only once every peer has answered with NEITHER of the unambiguous
-    /// signals below (every peer already has real history, none of them is
-    /// fresh, and every one of them HAS heard from this identity before)
-    /// does seeing at least one peer name this node as an already-
-    /// established voter refuse permanently — that combination is only
-    /// possible for a genuinely wiped, previously-established voter.
+    /// Only once every peer has answered with NEITHER of the two
+    /// unambiguous signals above (every peer already has real history and
+    /// none of them is fresh) does the verdict depend on aggregated
+    /// evidence: refuse permanently if *at least one* of those peers both
+    /// names this node as an established voter AND has itself genuinely
+    /// heard from this identity before (`ever_heard_from_prober`) —
+    /// that combination is only possible for a genuinely wiped,
+    /// previously-established voter — otherwise resolve fresh.
     ///
-    /// **Issue #667 amendment (2026-09-15, second): `ever_heard_from_prober
-    /// == false` is a THIRD unambiguous, immediately-decisive signal**,
-    /// closing a real gap the two signals above cannot: in a genuine
-    /// N-node genesis, EVERY founder's `config` contains every OTHER
-    /// founder from the very first committed entry onward (that's what a
-    /// genesis config *is*), so `config.contains(&self.id)` is
-    /// unconditionally `true` for a genesis founder the instant any
-    /// majority elects — the exact same signal a truly established,
-    /// long-running cluster's wiped voter produces. The two are otherwise
-    /// observationally identical from `from`'s own term/commit/config
-    /// alone. `ever_heard_from_prober` breaks the tie: a founder still
-    /// resolving its OWN cluster check has not campaigned or voted yet
+    /// **Issue #667 amendment (2026-09-15, second): added
+    /// `ever_heard_from_prober`** to close a real gap the two signals
+    /// above cannot: in a genuine N-node genesis, EVERY founder's `config`
+    /// contains every OTHER founder from the very first committed entry
+    /// onward (that's what a genesis config *is*), so
+    /// `config.contains(&self.id)` is unconditionally `true` for a genesis
+    /// founder the instant any majority elects — the exact same signal a
+    /// truly established, long-running cluster's wiped voter produces. The
+    /// two are otherwise observationally identical from `from`'s own
+    /// term/commit/config alone. `ever_heard_from_prober` breaks the tie: a
+    /// founder still resolving its OWN cluster check has not campaigned or
+    /// voted yet
     /// (gated on `!cluster_check_pending`), so it has sent no peer any real
-    /// protocol message — every peer's honest answer is `false` — while a
-    /// genuinely established voter's peers, having exchanged real votes/
-    /// appends with it before the wipe, keep answering `true` for as long
-    /// as they keep running. See `RaftMsg::ClusterProbeResp`'s own doc for
-    /// the full reasoning and its documented residual.
+    /// protocol message — every peer's honest answer is `false`.
+    ///
+    /// **Third amendment, same day**: the second amendment originally made
+    /// a single `ever_heard_from_prober == false` reply immediately
+    /// decisive for "fresh", on the claim that a genuinely established
+    /// voter's peers "keep answering `true` for as long as they keep
+    /// running." That claim is false for an ordinary follower-follower
+    /// pair: a plain follower that has never itself been a candidate or
+    /// leader only ever exchanges real protocol messages with whichever
+    /// peer *is* the candidate/leader (a fellow follower never sends it a
+    /// `RequestVote`/`AppendEntries`, and the leader does not mark
+    /// `heard_from` on receiving a plain `AppendEntriesResp` either), so
+    /// two long-established, healthy followers can go their whole lives
+    /// never marking each other in `heard_from` — a genuinely wiped
+    /// voter's fellow-follower peer honestly answers `false` even though
+    /// the cluster is real, which reproducibly (not intermittently)
+    /// defeated the refusal (found via a real, deterministic `ProdEnv`
+    /// failure in
+    /// `wiped_voter_refuses_and_the_rest_of_the_cluster_keeps_serving`).
+    /// The fix folds this signal into the SAME wait-for-every-peer
+    /// aggregation the established verdict already uses — decisive only
+    /// once every peer has answered, and only via "at least one true"
+    /// (mirroring "at least one established-and-naming-me", not "all of
+    /// them") — so a true genesis race (uniformly `false` from every peer)
+    /// still resolves fresh, but a real refusal no longer depends on every
+    /// individual peer having directly talked to the wiped identity. See
+    /// `RaftMsg::ClusterProbeResp`'s own doc for the full reasoning and its
+    /// documented residual.
     fn handle_cluster_probe_resp(
         &mut self,
         from: NodeId,
@@ -2681,53 +2720,93 @@ where
             );
             return Vec::new();
         }
-        if !ever_heard_from_prober {
-            // Unambiguous on its own, regardless of any other peer's
-            // answer or of `config` (this method's own doc, "second
-            // amendment"): `from` has real history and already names this
-            // node, but has itself never received any real protocol
-            // message from this identity — so this identity has never cast
-            // a real vote `from` could be relying on the memory of. Closes
-            // the genesis-race gap `config.contains` alone cannot: every
-            // founder's config trivially contains every other founder from
-            // birth, so that signal alone can never distinguish "we just
-            // elected among ourselves moments ago, as part of the SAME
-            // bootstrap you're also part of" from "you were an established
-            // voter for a long time before your disk was wiped."
-            self.cluster_check_pending = None;
-            tracing::debug!(
-                node = %self.id,
-                peer = %from,
-                "boot-time cluster check resolved: peer {from} has real history and \
-                 already names this node, but has never itself received a real protocol \
-                 message from this identity — a same-bootstrap genesis race (or an \
-                 ordinary rejoin), not a wiped-voter restart. Proceeding as an \
-                 unestablished fresh voter.",
-            );
-            return Vec::new();
+        // Real history, and names this node as an established voter — but
+        // `ever_heard_from_prober` is deliberately NOT treated as decisive
+        // on its own here, in either direction (2026-09-15, third
+        // amendment — a real `ProdEnv` regression,
+        // `wiped_voter_refuses_and_the_rest_of_the_cluster_keeps_serving`,
+        // reproduced this deterministically, not as a flake). The second
+        // amendment's own doc claimed this signal is "a pure addition:
+        // it never makes an established-restart refusal less likely...
+        // a genuinely wiped voter's peers HAVE received real messages from
+        // it pre-wipe and keep answering `true`" — but that assumption is
+        // false for a perfectly ordinary established topology: a plain
+        // FOLLOWER that has never itself been a candidate or leader only
+        // ever receives direct protocol messages (`RequestVote`,
+        // `AppendEntries`) from whichever peer *is* the candidate/leader —
+        // never from a fellow follower. `handle_append_resp` (the leader's
+        // own receipt of a follower's `AppendEntriesResp`) does not mark
+        // `heard_from` either. So two long-established, perfectly healthy
+        // follower peers can go their entire lives never marking
+        // `heard_from` for each other, and a genuinely wiped voter's
+        // fellow-follower will honestly answer `ever_heard_from_prober:
+        // false` even though the cluster is real and long-running —
+        // deciding "fresh" on that single reply (the previous code) is
+        // exactly backward and defeats the refusal this whole mechanism
+        // exists to enforce, reproducibly (not intermittently) whenever
+        // the wiped voter's peer set contains a fellow follower it never
+        // directly talked to.
+        //
+        // The fix: fold `ever_heard_from_prober` into the SAME
+        // wait-for-every-peer aggregation the "established" verdict below
+        // already uses, instead of letting it short-circuit early. A
+        // single peer's `false` no longer resolves anything by itself;
+        // only after every configured peer has answered (with neither of
+        // the two genuinely unambiguous signals above) does the verdict
+        // depend on whether *any* peer ever showed real participation
+        // evidence — mirroring how "established" already only requires
+        // ONE such peer, not all of them (a genuinely established cluster
+        // is not guaranteed to have every peer show `true`, only at least
+        // one that actually interacted with this identity before the
+        // wipe). This restores the "pure addition, never weakens a real
+        // refusal" property the second amendment intended but did not
+        // achieve, while still closing the genesis-race gap the second
+        // amendment targeted: in a true same-bootstrap race, NO peer has
+        // ever received a real message from a still-checking founder
+        // (nothing has been sent yet), so every reply shows `false` and
+        // the aggregate below still resolves fresh.
+        if ever_heard_from_prober {
+            self.cluster_check_saw_established_with_me = true;
         }
-        // Real history, names this node, AND has genuinely heard from this
-        // identity before — record as evidence only; do
-        // NOT decide yet (see this method's own doc for why a single such
-        // reply is not, by itself, trustworthy).
-        self.cluster_check_saw_established_with_me = true;
         pending.remove(&from);
         if pending.is_empty() {
-            // Every peer answered, none was fresh (that branch always
-            // resolves and returns above), and at least one named this
-            // node as established — the only remaining possibility.
             self.cluster_check_pending = None;
-            self.cluster_check_refused = true;
-            tracing::error!(
-                node = %self.id,
-                "refusing to start as a voter: this node's persisted Raft state is empty \
-                 (ephemeral storage wiped?), every configured peer already has real \
-                 history, and at least one already recognizes this node id as an \
-                 established voter. Re-add this node id through the rejoin path instead of \
-                 restarting it as a static voter: remove it from the voter set, add it back \
-                 as a learner (`animusd join` / admin add-learner, ADR 0032/0058), and let \
-                 it be promoted back to voter once caught up.",
-            );
+            if self.cluster_check_saw_established_with_me {
+                // Every peer answered, none was fresh and none denied
+                // recognizing this node (either branch always resolves
+                // and returns above), and at least one of them both named
+                // this node as an established voter AND has itself
+                // genuinely received a real protocol message from this
+                // identity before — only possible for a genuinely
+                // established, previously-active voter whose disk was
+                // wiped.
+                self.cluster_check_refused = true;
+                tracing::error!(
+                    node = %self.id,
+                    "refusing to start as a voter: this node's persisted Raft state is empty \
+                     (ephemeral storage wiped?), every configured peer already has real \
+                     history, and at least one both recognizes this node id as an established \
+                     voter and has itself genuinely heard from this identity before. Re-add \
+                     this node id through the rejoin path instead of restarting it as a static \
+                     voter: remove it from the voter set, add it back as a learner \
+                     (`animusd join` / admin add-learner, ADR 0032/0058), and let it be \
+                     promoted back to voter once caught up.",
+                );
+            } else {
+                // Every peer has real history and names this node, but NOT
+                // ONE of them has ever genuinely heard from this identity —
+                // a same-bootstrap genesis race (or an ordinary rejoin),
+                // never a wiped-voter restart (see this method's own doc,
+                // third amendment).
+                tracing::debug!(
+                    node = %self.id,
+                    "boot-time cluster check resolved: every configured peer has real \
+                     history and names this node, but none of them has ever itself received \
+                     a real protocol message from this identity — a same-bootstrap genesis \
+                     race (or an ordinary rejoin), not a wiped-voter restart. Proceeding as \
+                     an unestablished fresh voter.",
+                );
+            }
         }
         Vec::new()
     }
