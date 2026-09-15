@@ -268,6 +268,32 @@ per-tablet CP data plane (`animus-cp-data`).
   lessons.md`'s entry for the full incident and the general "eager for
   ordering is not the same claim as final" lesson. Regression:
   `crates/animus-cp-data/tests/sharedwal_fault_corpus.rs`'s cell (e).
+  **A tolerated `sync`-only failure's own buffered bytes are now repaired
+  before `drive()` can hand the file to the next queued op (issue #883,
+  fixed 2026-09-15)**: `#838`'s undo above is a `group_tails` (in-memory
+  bookkeeping) fix and has nothing to say about `flush`'s own `Append`
+  branch, where `env.append` succeeding before the round's own `env.sync`
+  fails leaves those bytes genuinely sitting in the file's un-synced
+  buffered region — `Disk::append`/`Disk::sync` are two independently
+  observable physical steps, and a failed `sync` does not retroactively
+  un-write bytes an earlier `append` already buffered. Left in place, a
+  completely different, healthy tablet's own next **ordinary** (not even
+  compacting) `append_tagged` round would extend the SAME buffered
+  region, and that tablet's own successful `sync` would durably commit
+  the whole thing, doomed bytes included. `flush` now repairs this
+  itself on a tolerated `Append`-batch `sync` failure: read the file
+  back, confirm its tail is exactly the bytes this round itself just
+  appended, and atomically `Disk::replace` the file with everything
+  before that tail — caller-agnostic (no `Serialize` bound needed, so it
+  covers the raw/untyped API too), no I/O added on the happy path,
+  best-effort (a repair failure leaves the caller with the same original
+  `sync` error as before this fix). See ADR 0028's matching 2026-09-15
+  amendment for the alternatives rejected. Regression:
+  `crates/animus-cp-data/tests/sharedwal_fault_corpus.rs`'s cell (f),
+  which needed a new `DiskConfig::set_sync_error_prob` knob in
+  `animus-sim` (every existing knob fires uniformly across every disk
+  op, so none could fail only a `sync` while leaving the repair's own
+  immediate `read`/`replace` free to succeed).
   `physical_write_count()` is a plain running counter
   of completed physical writes (append-batches and rewrites alike) —
   the coalescing-observability primitive a caller (or a test) reads
