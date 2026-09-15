@@ -703,3 +703,81 @@ scenarios (liveness after a legitimate rejoin, unaffected); a real
 `ProdEnv` 3-node scenario in `tests/prod_liveness.rs` wiping a voter's data
 directory and confirming both the refusal and that the other two nodes
 keep serving.
+
+### Follow-up amendment (2026-09-15, same day): single-peer evidence is not quorum evidence — a real bootstrap-race regression, found and fixed
+
+The version above decided a refusal verdict the instant **any one**
+configured peer answered `handle_cluster_probe` with real history that
+named this node as an established voter. This is unsound for an ordinary
+multi-node genesis bootstrap under real `ProdEnv` threading, not just an
+adversarial edge case — found via `crates/animusd`'s own real-socket
+`forward_to_tablet_leader_survives_a_dead_first_guess` flaking (~1/3 of
+runs) after this fix landed, reproduced deterministically with a temporary
+`tracing` subscriber capturing the actual decision. The captured trace
+showed three of a genuine 4-node genesis founding committee **cascading**
+into a permanent, wrong refusal: a real bring-up starts nodes
+sequentially, and even a simultaneous start races real OS thread
+scheduling, so a majority of founders can complete a real election among
+themselves (term > 0, committed_index advancing) before every founding
+peer's own probe round has finished exchanging with all three of its
+peers. The slower founder's own honest evidence — a peer answering with
+real history whose committed config names it — is then indistinguishable
+from a genuine wiped-voter restart, since every genesis founder's config
+contains every other founder from construction, whether or not it has
+ever voted. The original design's own justification ("network latency <<
+election_base, so every founding peer's probe round resolves before any
+of them could legitimately start a real election") holds under `SimEnv`
+(every node's clock starts at the same virtual instant) but not under
+real threading, where founders do not start their own election clocks in
+lockstep.
+
+**Fixed** by requiring evidence from **every** configured peer (not the
+first respondent) before ever committing to a refusal verdict, and adding
+a structural veto: if any peer answers genuinely empty
+(`term == 0 && committed_index == 0`), that peer has itself never
+participated in anything, which disproves "this is a genuinely established
+cluster" regardless of what any other peer reported (a truly established
+cluster's surviving voters — the audience a wiped voter's vote would
+actually contradict — would all already show real history). Only once
+every peer has answered, none showed fresh state, and at least one named
+this node as an already-established voter does the mechanism refuse
+(`RaftCore::handle_cluster_probe_resp`'s own doc has the full decision
+table; `cluster_check_saw_established_with_me`/`cluster_check_saw_fresh_
+peer` are the two new tracked signals). The peer-not-recognizing-this-node
+resolution (the ADR 0060 growth case) is unchanged — it was, and remains,
+unambiguous on a single reply and does not need to wait for the rest of
+the peer set.
+
+**Residual, stated plainly**: this does not close every conceivable
+timing — a scenario where two or more voters of the same cluster are
+simultaneously wiped, one of them racing a still-genuinely-fresh peer,
+could still resolve the wiped voter(s) as safe-fresh rather than refused.
+This is a materially narrower and less likely scenario than "an ordinary
+multi-node cluster occasionally bootstraps for the first time under real
+scheduling," which the original design broke outright; a fully airtight
+answer would need a durable, cross-node "has this exact identity ever
+actually participated" record (e.g. in the replicated control-plane
+`Metadata` itself, surviving the wiped node's own local disk loss) —
+out of scope for this fix, and a candidate follow-up if the residual is
+ever judged worth closing.
+
+Also fixed in the same pass: `crates/animusd/src/sim_cluster_control_
+growth.rs`'s two scenarios asserted `/admin/control/member/remove`
+succeeded on the very next call after a real leadership transfer/election,
+with no retry — `RaftCore::change_membership`'s own pre-existing erratum
+guard (Raft §4/Ongaro, unrelated to this amendment) rejects a config
+change until the new leader has committed a no-op in its own current
+term, a genuine one-round-trip-after-election transient the transfer poll
+immediately above it already retried on but the remove call did not; both
+scenarios now retry on `409` exactly like the transfer poll does. A
+`SimCluster`-driven fixed-seed test
+(`sim_cluster_data_only.rs::c_crash_of_a_data_only_replica_holder_the_
+rest_keep_serving_then_it_catches_up_over_seeds`) also needed its whole
+seed list re-pinned — this amendment's own added network activity on the
+genesis boot path reshuffles `SimEnv`'s entropy stream for every later
+draw in the same run, the same collateral class documented in
+`docs/lessons/testing/2026-09-15-boot-path-entropy-desyncs-fixed-seeds.
+md`.
+
+See `docs/lessons/code-patterns/2026-09-15-single-peer-evidence-is-not-
+quorum-evidence.md` for the full incident and the generalizable lesson.

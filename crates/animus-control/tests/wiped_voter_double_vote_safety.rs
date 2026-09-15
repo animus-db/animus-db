@@ -129,22 +129,29 @@ fn wiped_voter_never_grants_a_second_contradicting_vote_in_the_same_term() {
         "a freshly-wiped voter must not vote until the boot-time check resolves"
     );
 
-    // C answers B's probe honestly: real history (this cluster already has
-    // a committed leader in `term`), AND its own committed config already
-    // names B as a voter -- exactly the "already-established voter, disk
-    // wiped" signal (as opposed to an ADR 0060 growth join, which C's
-    // config would NOT yet contain).
+    // BOTH of B's peers (A and C) answer B's probe honestly: real history
+    // (this cluster already has a committed leader in `term`), AND their
+    // own committed config already names B as a voter -- exactly the
+    // "already-established voter, disk wiped" signal (as opposed to an ADR
+    // 0060 growth join, which their config would NOT yet contain). Per the
+    // 2026-09-15 amendment (a real bootstrap-race regression this exact
+    // mechanism was found to cause under real `ProdEnv` threading), a
+    // refusal verdict requires evidence from EVERY configured peer, never
+    // just the first one to reply -- so both must answer before
+    // `refused_as_voter()` can become true.
     let all_voters: BTreeSet<NodeId> = ids.iter().cloned().collect();
-    let _ = b_wiped.handle(
-        ids[2].clone(),
-        RaftMsg::ClusterProbeResp {
-            term,
-            committed_index: 1,
-            config: all_voters,
-        },
-        now,
-        7,
-    );
+    for peer in [ids[0].clone(), ids[2].clone()] {
+        let _ = b_wiped.handle(
+            peer,
+            RaftMsg::ClusterProbeResp {
+                term,
+                committed_index: 1,
+                config: all_voters.clone(),
+            },
+            now,
+            7,
+        );
+    }
     assert!(
         b_wiped.refused_as_voter(),
         "B must recognize itself as a wiped, already-established voter and refuse"
@@ -191,16 +198,20 @@ fn a_double_grant_would_elect_two_leaders_in_the_same_term() {
     let mut b_wiped: RaftCore = RaftCore::new(ids[1].clone(), &ids, construct_now, 7);
     let _ = b_wiped.begin_cluster_check(now, 7);
     let all_voters: BTreeSet<NodeId> = ids.iter().cloned().collect();
-    let _ = b_wiped.handle(
-        ids[2].clone(),
-        RaftMsg::ClusterProbeResp {
-            term,
-            committed_index: 1,
-            config: all_voters,
-        },
-        now,
-        7,
-    );
+    // Both of B's peers must answer before a refusal verdict is reached
+    // (2026-09-15 amendment) -- see the sibling test's own updated comment.
+    for peer in [ids[0].clone(), ids[2].clone()] {
+        let _ = b_wiped.handle(
+            peer,
+            RaftMsg::ClusterProbeResp {
+                term,
+                committed_index: 1,
+                config: all_voters.clone(),
+            },
+            now,
+            7,
+        );
+    }
     assert!(b_wiped.refused_as_voter());
 
     // Drive C's own candidacy for real (pre-vote is ungated even for a
