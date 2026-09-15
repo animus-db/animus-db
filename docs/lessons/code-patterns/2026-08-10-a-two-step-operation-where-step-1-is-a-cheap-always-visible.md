@@ -1,0 +1,3 @@
+# A two-step operation where step 1 is a cheap, always-visible write and step 2 is the expensive, failure-prone "make it real" step must never let a background loop discard a step-2 failure — that silently strands step 1's effect forever.
+
+**A two-step operation where step 1 is a cheap, always-visible write and step 2 is the expensive, failure-prone "make it real" step must never let a background loop discard a step-2 failure — that silently strands step 1's effect forever.** (Found in the pre-ADR-0028 two-phase `auto_split_loop`; superseded by ADR 0028 — split has no step 2 anymore. Archived in `docs/engineering-lessons-archive.md`.)
