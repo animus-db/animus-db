@@ -781,3 +781,93 @@ md`.
 
 See `docs/lessons/code-patterns/2026-09-15-single-peer-evidence-is-not-
 quorum-evidence.md` for the full incident and the generalizable lesson.
+
+### Second follow-up amendment (2026-09-15, same day): the wait-for-every-peer fix above was still not enough — two further, real regressions found and fixed
+
+PR #902 (carrying the amendment above) still failed the exact same shape
+of CI check under real staggered bring-up
+(`dynamo_txn_idempotency::same_token_same_fingerprint_retry_after_commit_
+is_cached` and `dynamo_execute_transaction::
+execute_transaction_over_a_follower_connected_node`, both "cluster did not
+bootstrap in 20s"). Two independent, compounding bugs, found by tracing
+the actual driver wake path and by a direct, cargo-bypassing repro loop
+(the shared build tree's own concurrent-session contamination — see
+`docs/lessons/testing/2026-09-15-shared-cargo-target-dir-phantom-method-
+not-found.md` — was masking the real signal until isolated):
+
+1. **`RaftCore::next_deadline()` never accounted for the cluster-check
+   resend deadline at all.** The wait-for-every-peer fix above added a
+   resend mechanism inside `tick()`, correctly decoupled from
+   `election_deadline`'s own legitimate resets (`handle_append_entries`
+   pushes it out on every valid leader contact) — but `node.rs`'s driver
+   loop computes how long to sleep from `next_deadline()` alone, and that
+   function returned only `election_deadline` for a non-leader. A still-
+   checking founder that starts receiving ordinary heartbeats from an
+   already-elected sibling could have its own driver oversleep past its
+   own resend deadline for as long as `election_deadline` kept getting
+   reset — the resend logic was correct, but `tick()` was never invoked
+   at the right time to run it. **Fixed**: `next_deadline()` now returns
+   `min(election_deadline, cluster_check_resend_deadline)` whenever a
+   cluster check is pending. See `docs/lessons/code-patterns/2026-09-15-a-
+   timer-driven-loop-must-wake-for-every-deadline-it-owns.md`.
+
+2. **`config.contains(&self.id)` cannot distinguish a genesis race from a
+   genuinely established restart, even with the wait-for-every-peer fix in
+   place — this was the actual, dominant root cause.** A genesis config
+   lists every founder from the very first committed entry onward, so
+   `config.contains` is unconditionally `true` for every founder the
+   instant ANY majority elects, regardless of whether that founder has
+   ever voted. Waiting for every peer to answer (amendment above) only
+   delays the identical wrong conclusion until every peer has
+   independently raced ahead — which a real, CPU-starved, staggered
+   bring-up does routinely, not rarely. **Fixed** by adding a genuinely
+   new signal, `ever_heard_from_prober`, to `RaftMsg::ClusterProbeResp`: a
+   peer now also reports whether it has ever itself received real,
+   durably-forgettable-vote evidence from the asker — a self-vote
+   (`handle_request_vote`), a vote we GRANTED it (`handle_vote_resp`,
+   `granted: true` only, never a rejection), or proof it won a real
+   election (`AppendEntries`/`InstallSnapshot` as leader) — tracked in a
+   new per-core `heard_from: BTreeSet<NodeId>`. `handle_cluster_probe_resp`
+   now resolves immediately, safely, the instant any single peer answers
+   `ever_heard_from_prober: false`, alongside the pre-existing fresh-peer
+   and config-membership decisive signals. A genuinely established voter's
+   surviving peers keep answering `true` for as long as they keep
+   running (they really did exchange real votes/appends with it before
+   the wipe), so this never weakens the original safety property — it
+   only adds a THIRD way to resolve "safe" faster and more precisely,
+   closing exactly the gap the first amendment's own "Residual, stated
+   plainly" paragraph anticipated (a durable, or in this case in-process,
+   "has this identity ever actually participated" signal). See
+   `docs/lessons/code-patterns/2026-09-15-config-membership-cannot-
+   disambiguate-a-genesis-race-from-an-established-restart.md` for the
+   full incident, including a real bug found and fixed in the fix itself
+   (an earlier, broader version of `heard_from` wrongly counted this
+   node's own outbound vote REJECTIONS as evidence of the rejected
+   candidate's participation, reproducing the exact false refusal this
+   amendment exists to close).
+
+**New coverage**: `animus-control/tests/next_deadline.rs::
+next_deadline_wakes_for_a_cluster_check_resend_even_after_election_
+deadline_is_pushed_out` (fix 1, confirmed red-before-green) and a new
+file, `animus-control/tests/staggered_genesis_boot.rs` — a deterministic,
+hand-driven 3-node genesis bootstrap with staggered starts and lost/
+delayed cluster-check probes, asserting convergence to a single leader
+with no false refusal within a bounded step budget (fix 2, confirmed
+red-before-green against `ever_heard_from_prober` specifically). Both
+fixes were additionally verified directly against the two real,
+previously-flaking `ProdEnv` binaries named above, run standalone outside
+`cargo test` to avoid the shared-target-dir contamination that was
+masking the signal: 30/30 and 40/40 clean runs respectively.
+
+**Residual, updated**: the two-or-more-simultaneous-wipes edge case named
+in the first amendment's own residual paragraph is narrowed further by
+this fix (a wipe racing a still-genuinely-fresh peer now also needs the
+surviving peers to have never witnessed the wiped identity vote, which is
+a strictly rarer combination than before) but not eliminated — the
+`ever_heard_from_prober` signal is deliberately in-memory, not
+WAL-persisted (a responder that itself restarts, recovered rather than
+wiped, forgets it until the asker sends another real message), so a
+coordinated whole-cluster restart racing a single voter's disk wipe is
+still not fully covered. This is unchanged from before either fix in this
+amendment — no prior mechanism covered it either — and remains a
+candidate follow-up, not a regression introduced here.

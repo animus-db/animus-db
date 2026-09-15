@@ -365,6 +365,26 @@ per-tablet CP data plane (`animus-cp-data`).
   issue #900, since a tablet's peer set is dynamic and reconstituted
   constantly (unlike the control plane's one-time genesis config), a
   materially different liveness tradeoff needing its own design decision.
+  **Two further real regressions in this same mechanism, found and fixed
+  the same day (ADR 0009's second 2026-09-15 amendment)**: (1)
+  `RaftCore::next_deadline()` didn't account for the cluster-check's own
+  independent resend deadline, so `node.rs`'s driver could oversleep past
+  a due resend for as long as `election_deadline` kept getting reset by
+  ordinary heartbeat traffic — fixed by including
+  `cluster_check_resend_deadline` in `next_deadline()`'s own `min(..)`.
+  (2) `config.contains(&self.id)` alone can never distinguish an ordinary
+  genesis race (every founder's config trivially contains every other
+  founder from birth) from a genuinely established restart — fixed by a
+  new `RaftMsg::ClusterProbeResp` field, `ever_heard_from_prober`, backed
+  by a per-core `heard_from: BTreeSet<NodeId>` marked ONLY at the three
+  sites representing a genuinely durable, forgettable vote (a candidate's
+  own self-vote, a vote WE granted it, or proof it won a real election) —
+  see `RaftMsg::ClusterProbeResp`'s and `RaftCore::
+  handle_cluster_probe_resp`'s own doc comments for the full decision
+  table, and the two matching `docs/lessons/code-patterns/2026-09-15-*`
+  entries for the incidents (including a real bug in the fix's own first
+  draft: a rejected vote is not participation, and counting it
+  reintroduced the exact false refusal the fix exists to prevent).
 
 - **Config-in-log + current-term-commit gate (ADR 0017 C).** `LogEntry` may
   carry a `config: Option<voters>`; `RaftCore` keeps `peers`/`cluster_size` in
