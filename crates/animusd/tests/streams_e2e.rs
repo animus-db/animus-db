@@ -362,12 +362,7 @@ async fn get_shard_iterator_allow_trim(
     );
     let deadline = tokio::time::Instant::now() + RETRYABLE_BLIP_DEADLINE;
     loop {
-        let (status, resp) = dynamo(
-            addr,
-            "DynamoDBStreams_20120810.GetShardIterator",
-            &body,
-        )
-        .await;
+        let (status, resp) = dynamo(addr, "DynamoDBStreams_20120810.GetShardIterator", &body).await;
         if status == 200 {
             return Some(
                 json(&resp)["ShardIterator"]
@@ -903,8 +898,13 @@ async fn drain_all_tablets_lineage(
                 // `RecordsPoll::Trimmed` takes below, dropping only the
                 // stale open-tail pin and skipping this tablet for the rest
                 // of this pass (nothing to poll — the mint itself failed).
-                match get_shard_iterator_allow_trim(dynamo_addr, stream_arn, &shard_id, "TRIM_HORIZON")
-                    .await
+                match get_shard_iterator_allow_trim(
+                    dynamo_addr,
+                    stream_arn,
+                    &shard_id,
+                    "TRIM_HORIZON",
+                )
+                .await
                 {
                     Some(iterator) => cursors.set_open_iterator(tablet, epoch, iterator),
                     None => {
