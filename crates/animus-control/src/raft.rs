@@ -857,6 +857,32 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     // `PersistedState::is_empty()`, `node.rs`'s `drive`) ever populates
     // this. See `begin_cluster_check`'s own doc for the full mechanism.
     cluster_check_pending: Option<BTreeSet<NodeId>>,
+    // Issue #667 amendment (a second, real-`ProdEnv` regression, found via
+    // `dynamo_txn_idempotency.rs::same_token_same_fingerprint_retry_after_
+    // commit_is_cached` timing out under real CI load): the ORIGINAL
+    // design resent a still-pending probe round only from `start_pre_vote`'s
+    // own early-return arm, itself gated on `now >= election_deadline` —
+    // sharing `election_deadline` with the ordinary election timer. That
+    // sharing is unsound: `handle_append_entries` legitimately RESETS
+    // `election_deadline` on every valid leader contact (the standard Raft
+    // "don't campaign against a live leader" behavior), and a still-pending
+    // founder DOES receive ordinary `AppendEntries`/heartbeat traffic from
+    // an already-elected SIBLING founder (a real leader broadcasts to every
+    // configured peer, voter or not, resolved or not) the moment a majority
+    // of founders elect one among themselves. Once that starts, the pending
+    // founder's own `election_deadline` never again reaches its resend
+    // check — it is perpetually pushed back by legitimate heartbeats — so
+    // its own probe (lost, or answered by a peer that hadn't yet replied)
+    // is never retried, and the founder can wait past any real test/
+    // deployment timeout with no forward progress at all. This field is a
+    // SEPARATE deadline, armed by `begin_cluster_check` and advanced only
+    // by the dedicated resend check at the top of `tick()` — untouched by
+    // `handle_append_entries` or any other ordinary message handler, so it
+    // keeps firing on schedule regardless of how much legitimate leader
+    // traffic this node receives while still pending. `None` whenever
+    // `cluster_check_pending` is `None` (not applicable, or already
+    // resolved).
+    cluster_check_resend_deadline: Option<Nanos>,
     // Issue #667 amendment (real-cluster bootstrap-race regression, found
     // via `forward_to_tablet_leader_survives_a_dead_first_guess`'s own
     // flaky failure under real `ProdEnv` threading): whether ANY peer has
@@ -873,17 +899,6 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     // `RaftCore` lifetime today, but resetting is cheap and correct
     // regardless).
     cluster_check_saw_established_with_me: bool,
-    // The companion signal: whether ANY peer has so far answered with
-    // genuinely empty state (`term == 0 && committed_index == 0`) — i.e.
-    // that peer, too, has not yet participated in anything. Seeing even one
-    // such answer, ONCE EVERY peer has finally answered, is what
-    // disambiguates "peers who happen to have already elected a leader
-    // among themselves are a genesis bootstrap I'm merely slow to join" (at
-    // least one peer is provably still fresh too) from "every one of my
-    // peers is already an established, running voter" (the genuine
-    // wiped-voter-restart shape this whole mechanism exists to catch) — see
-    // `handle_cluster_probe_resp`'s own doc for the full decision table.
-    cluster_check_saw_fresh_peer: bool,
     // Sticky: `cluster_check_pending` resolved with every configured peer
     // accounted for, at least one showing real history that named this
     // node as an established voter, and **none** showing genuinely fresh
@@ -965,8 +980,8 @@ where
             quiesce_veto: false,
             quiesce_veto_fresh_through: u64::MAX,
             cluster_check_pending: None,
+            cluster_check_resend_deadline: None,
             cluster_check_saw_established_with_me: false,
-            cluster_check_saw_fresh_peer: false,
             cluster_check_refused: false,
         };
         core.reset_election_timer(now, entropy);
@@ -1939,7 +1954,29 @@ where
 
     /// Handle a timer tick at `now`. May start an election or send heartbeats.
     pub fn tick(&mut self, now: Nanos, entropy: u64) -> Vec<Out<C>> {
-        match self.role {
+        // Issue #667 amendment: the boot-time cluster-check resend, on its
+        // OWN deadline (`cluster_check_resend_deadline`'s own doc explains
+        // why this must never share `election_deadline`) — checked
+        // unconditionally, every tick, regardless of role or of whatever
+        // the match below does this same call. In practice this only ever
+        // fires for a `Follower` still resolving `begin_cluster_check` (a
+        // `Leader`/other role can't have `cluster_check_pending` still
+        // `Some` — becoming either requires it already resolved), but
+        // checking it here rather than inside the `Follower` arm means a
+        // future role-handling refactor can't silently reintroduce the
+        // original election-timer coupling this exists to avoid.
+        let mut out = Vec::new();
+        if self.cluster_check_pending.is_some() {
+            let due = self
+                .cluster_check_resend_deadline
+                .is_none_or(|deadline| now.0 >= deadline.0);
+            if due {
+                out.extend(self.broadcast_cluster_probe());
+                self.cluster_check_resend_deadline =
+                    Some(self.next_cluster_check_resend(now, entropy));
+            }
+        }
+        out.extend(match self.role {
             Role::Leader => {
                 // Abort a leadership transfer whose target has not stepped down
                 // by the deadline (Raft §3.10) — e.g. it crashed after arming, or
@@ -1997,7 +2034,8 @@ where
                 }
                 Vec::new()
             }
-        }
+        });
+        out
     }
 
     /// Immediately (re)replicate to all peers if leader — the **wake-on-propose**
@@ -2195,17 +2233,20 @@ where
     ///
     /// Broadcasts [`RaftMsg::ClusterProbe`] to every configured peer and
     /// parks in `cluster_check_pending` until either (a) any one peer
-    /// answers with real history, resolving immediately one of two ways
-    /// depending on whether that peer's own committed config already names
-    /// this node id (see `handle_cluster_probe_resp`'s own doc for the full
-    /// decision table — this is what tells a genuine ADR 0060 growth join
-    /// apart from an actual wiped-voter restart), or (b) every one of them
-    /// has answered `0`/`0` — a single-node group (`self.peers` empty) has
-    /// nothing to wait for and resolves immediately. A never-answering peer
-    /// is never assumed fresh: the election-timeout tick keeps resending
-    /// probes (`start_pre_vote`'s own early-return arm) for as long as
-    /// `cluster_check_pending` stays `Some` — "peers unreachable" means
-    /// keep probing, never vote.
+    /// answers unambiguously (real history naming a DIFFERENT node id than
+    /// this one, or genuinely empty `0`/`0` state — either resolves this
+    /// node's own check immediately, with no need to wait for the rest of
+    /// the peer set; see `handle_cluster_probe_resp`'s own doc for the full
+    /// decision table, including why a peer naming THIS node id as an
+    /// established voter is deliberately NOT unambiguous on its own), or
+    /// (b) every peer has answered and none of them was unambiguously
+    /// fresh — a single-node group (`self.peers` empty) has nothing to
+    /// wait for and resolves immediately. A never-answering peer is never
+    /// assumed fresh: `tick()`'s own independent resend check
+    /// (`cluster_check_resend_deadline`, deliberately NOT tied to the
+    /// ordinary election timer — see that field's own doc for why) keeps
+    /// resending probes for as long as `cluster_check_pending` stays
+    /// `Some` — "peers unreachable" means keep probing, never vote.
     pub fn begin_cluster_check(&mut self, now: Nanos, entropy: u64) -> Vec<Out<C>> {
         if self.peers.is_empty() {
             // Nothing to confirm with — a lone voter (or a peerless test
@@ -2215,9 +2256,22 @@ where
         }
         self.cluster_check_pending = Some(self.peers.iter().cloned().collect());
         self.cluster_check_saw_established_with_me = false;
-        self.cluster_check_saw_fresh_peer = false;
         self.reset_election_timer(now, entropy);
+        self.cluster_check_resend_deadline = Some(self.next_cluster_check_resend(now, entropy));
         self.broadcast_cluster_probe()
+    }
+
+    /// The next deadline for `tick()`'s own independent cluster-check
+    /// resend check (`cluster_check_resend_deadline`'s own doc has the full
+    /// reasoning for why this must never share `election_deadline`). Same
+    /// randomized `[election_base, 2*election_base)` shape
+    /// `reset_election_timer` uses — there is no reason for this cadence to
+    /// differ, and reusing the shape (not the same call, since that would
+    /// touch `election_deadline` too) keeps the resend rate familiar.
+    fn next_cluster_check_resend(&self, now: Nanos, entropy: u64) -> Nanos {
+        let base = self.election_base.as_nanos() as u64;
+        let extra = if base == 0 { 0 } else { entropy % base };
+        Nanos(now.0.saturating_add(base + extra))
     }
 
     fn broadcast_cluster_probe(&self) -> Vec<Out<C>> {
@@ -2290,26 +2344,39 @@ where
     /// The fix: never decide refusal on a single reply. Evidence is
     /// gathered from EVERY configured peer (`cluster_check_pending`'s
     /// existing wait-for-all discipline, unchanged) before a refusal
-    /// verdict is ever reached — except the ONE case that was always
-    /// unambiguous on its own (a peer with real history that does NOT yet
-    /// recognize this node as a voter — see the `else` arm below, still a
-    /// same-reply resolution). Once every peer has answered:
-    /// - if ANY peer answered genuinely empty (`term == 0 && committed_index
-    ///   == 0`) — i.e. that peer, too, has never participated in anything —
+    /// verdict is ever reached — except the two cases that are already
+    /// unambiguous on a single reply, each resolving immediately without
+    /// waiting for the rest of the peer set:
+    /// - a peer with real history that does NOT yet recognize this node as
+    ///   a voter (the `!config.contains` arm below) — safe regardless of
+    ///   what any other peer says.
+    /// - **any** peer answering genuinely empty (`term == 0 &&
+    ///   committed_index == 0`) — i.e. that peer has itself never
+    ///   participated in anything, which is unconditionally decisive:
     ///   this cannot be a cluster this identity was already an established
     ///   voter of and then lost its own record of, because a *genuinely*
     ///   established cluster's surviving voters (the ones this node would
-    ///   need to convince otherwise) would ALL already show real history;
-    ///   a still-fresh peer proves the "established" answer from some OTHER
-    ///   peer is itself a same-bootstrap timing artifact. Resolve safe (a
-    ///   genuine growth/genesis participant), never refuse.
-    /// - otherwise, if at least one peer showed real history that named
-    ///   this node as a voter (and, by the branch above, NONE showed
-    ///   genuinely fresh state) — every peer already has real history, and
-    ///   at least one already recognizes this exact identity as an
-    ///   established voter with an empty local disk. That combination is
-    ///   only possible for a genuinely wiped, previously-established voter
-    ///   — refuse permanently.
+    ///   need to convince otherwise) would ALL already show real history.
+    ///   No later reply from any other peer, established-and-naming-me or
+    ///   otherwise, can ever change this verdict — the veto is decisive
+    ///   the instant it's seen, not merely "sticky until decision time" —
+    ///   so resolving immediately here, rather than waiting for every
+    ///   other configured peer to also answer, is both sound and
+    ///   materially faster to converge under real, adversarial scheduling
+    ///   (found live: a still-pending founder's own resend can be
+    ///   suppressed for a long time once it starts receiving ordinary
+    ///   `AppendEntries`/heartbeat traffic from an already-elected sibling,
+    ///   since `handle_append_entries` legitimately resets
+    ///   `election_deadline` on every such contact — see
+    ///   `cluster_check_resend_deadline`'s own doc for the companion fix
+    ///   this required).
+    ///
+    /// Only once every peer has answered with NEITHER of the two
+    /// unambiguous signals above (every peer already has real history,
+    /// and none of them is fresh) does seeing at least one peer name this
+    /// node as an already-established voter refuse permanently — that
+    /// combination is only possible for a genuinely wiped, previously-
+    /// established voter.
     fn handle_cluster_probe_resp(
         &mut self,
         from: NodeId,
@@ -2320,61 +2387,62 @@ where
         let Some(pending) = self.cluster_check_pending.as_mut() else {
             return Vec::new();
         };
-        if term > 0 || committed_index > 0 {
-            if !config.contains(&self.id) {
-                // Unambiguous on its own, regardless of any other peer's
-                // answer: `from` has real history but has never recognized
-                // this node id as a voter at all, so this identity could
-                // never have cast a real vote here to forget in the first
-                // place — an ordinary new voter joining an established
-                // cluster (ADR 0060). `start_pre_vote`'s own log-check is
-                // what already keeps this case safe, with no dependency on
-                // this whole mechanism.
-                self.cluster_check_pending = None;
-                tracing::debug!(
-                    node = %self.id,
-                    peer = %from,
-                    "boot-time cluster check resolved: peer {from} has real history but does \
-                     not yet recognize this node id as one of its voters — an ordinary new \
-                     voter joining an established cluster (ADR 0060), not a wiped-voter \
-                     restart. Proceeding as an unestablished fresh voter.",
-                );
-                return Vec::new();
-            }
-            // Real history AND names this node — record as evidence only;
-            // do NOT decide yet (see this method's own doc for why a
-            // single such reply is not, by itself, trustworthy).
-            self.cluster_check_saw_established_with_me = true;
-        } else {
-            self.cluster_check_saw_fresh_peer = true;
+        if term == 0 && committed_index == 0 {
+            // Unconditionally decisive the instant it's seen — see this
+            // method's own doc for why waiting for the rest of the peer
+            // set would only add latency, never change the outcome.
+            self.cluster_check_pending = None;
+            tracing::debug!(
+                node = %self.id,
+                peer = %from,
+                "boot-time cluster check resolved: peer {from} is itself genuinely fresh, so \
+                 any other peer's own \"established, and names me\" answer is a same-bootstrap \
+                 timing artifact, not evidence of a genuine wiped-voter restart. Proceeding as \
+                 an unestablished fresh voter.",
+            );
+            return Vec::new();
         }
+        if !config.contains(&self.id) {
+            // Unambiguous on its own, regardless of any other peer's
+            // answer: `from` has real history but has never recognized
+            // this node id as a voter at all, so this identity could
+            // never have cast a real vote here to forget in the first
+            // place — an ordinary new voter joining an established
+            // cluster (ADR 0060). `start_pre_vote`'s own log-check is
+            // what already keeps this case safe, with no dependency on
+            // this whole mechanism.
+            self.cluster_check_pending = None;
+            tracing::debug!(
+                node = %self.id,
+                peer = %from,
+                "boot-time cluster check resolved: peer {from} has real history but does \
+                 not yet recognize this node id as one of its voters — an ordinary new \
+                 voter joining an established cluster (ADR 0060), not a wiped-voter \
+                 restart. Proceeding as an unestablished fresh voter.",
+            );
+            return Vec::new();
+        }
+        // Real history AND names this node — record as evidence only; do
+        // NOT decide yet (see this method's own doc for why a single such
+        // reply is not, by itself, trustworthy).
+        self.cluster_check_saw_established_with_me = true;
         pending.remove(&from);
         if pending.is_empty() {
+            // Every peer answered, none was fresh (that branch always
+            // resolves and returns above), and at least one named this
+            // node as established — the only remaining possibility.
             self.cluster_check_pending = None;
-            if self.cluster_check_saw_fresh_peer {
-                tracing::debug!(
-                    node = %self.id,
-                    "boot-time cluster check resolved: at least one configured peer is itself \
-                     genuinely fresh, so a peer's own \"established, and names me\" answer is a \
-                     same-bootstrap timing artifact, not evidence of a genuine wiped-voter \
-                     restart. Proceeding as an unestablished fresh voter.",
-                );
-            } else if self.cluster_check_saw_established_with_me {
-                self.cluster_check_refused = true;
-                tracing::error!(
-                    node = %self.id,
-                    "refusing to start as a voter: this node's persisted Raft state is empty \
-                     (ephemeral storage wiped?), every configured peer already has real \
-                     history, and at least one already recognizes this node id as an \
-                     established voter. Re-add this node id through the rejoin path instead of \
-                     restarting it as a static voter: remove it from the voter set, add it back \
-                     as a learner (`animusd join` / admin add-learner, ADR 0032/0058), and let \
-                     it be promoted back to voter once caught up.",
-                );
-            }
-            // (Neither flag set is unreachable: every peer answering
-            // resolves via one of the two branches above, or the immediate
-            // early-return for "established, doesn't name me".)
+            self.cluster_check_refused = true;
+            tracing::error!(
+                node = %self.id,
+                "refusing to start as a voter: this node's persisted Raft state is empty \
+                 (ephemeral storage wiped?), every configured peer already has real \
+                 history, and at least one already recognizes this node id as an \
+                 established voter. Re-add this node id through the rejoin path instead of \
+                 restarting it as a static voter: remove it from the voter set, add it back \
+                 as a learner (`animusd join` / admin add-learner, ADR 0032/0058), and let \
+                 it be promoted back to voter once caught up.",
+            );
         }
         Vec::new()
     }
