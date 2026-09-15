@@ -156,6 +156,18 @@ enum SnapshotResend {
 /// produces before either real progress or the next heartbeat arrives.
 const SNAPSHOT_ACK_RESEND_CAP: u32 = 8;
 
+/// Issue #898: how many CONSECUTIVE mid-transfer acks reporting an offset
+/// below the currently tracked `snapshot_offset` this leader tolerates as
+/// "probably a stale, reordered ack" before concluding the peer's own buffer
+/// genuinely reset and rebasing down to match it — see
+/// `snapshot_offset_regressions`'s own doc for the full mechanism and
+/// incident. Small, matching `SNAPSHOT_ACK_RESEND_CAP`'s own order of
+/// magnitude: large enough that an ordinary handful of reordered acks (the
+/// scenario the monotonic guard exists for) never falsely triggers a rebase,
+/// small enough that a genuinely reset peer recovers within a few heartbeat
+/// intervals rather than staying deadlocked for the rest of the run.
+const SNAPSHOT_OFFSET_REGRESSION_REBASE: u32 = 4;
+
 /// A replicated log entry, generic over the command type `C` (defaults to the
 /// control plane's [`MetaCommand`]).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -739,6 +751,32 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     // leader resumes shipping the next chunk on each heartbeat / ack. Cleared for
     // a peer once it has fully installed the snapshot.
     snapshot_offset: BTreeMap<NodeId, u64>,
+    // Issue #898: per-peer count of CONSECUTIVE mid-transfer acks reporting an
+    // offset strictly below the currently tracked `snapshot_offset` — the
+    // monotonic guard's own "is this a stale, reordered ack or a peer whose
+    // buffer genuinely reset" ambiguity (see `handle_install_snapshot_resp`'s
+    // doc). A transient reordering self-heals within a round trip or two (the
+    // peer's very next ack, for whatever legitimately arrives next, reports a
+    // LARGER offset than any stale one, so this resets to 0 the moment real
+    // forward progress is seen); a peer that genuinely lost its buffer (a
+    // real process restart mid-transfer, same `NodeId`, `snapshot_offset`
+    // never told about it) reports the SAME regressed value — 0, from a
+    // fresh `RaftCore` — forever, since it can never accept a chunk at a
+    // nonzero offset with an empty buffer (`handle_install_snapshot`'s
+    // `fresh && offset == 0` reassembly gate). Left unaddressed, the leader
+    // keeps resending from its own stale, now-unreachable offset
+    // indefinitely — confirmed live building this fix:
+    // `chunked_snapshot_receiver_stop_restart_3` deadlocked exactly this way
+    // once `meta_apply_and_compact`'s new compaction-defer gate (also this
+    // issue) stopped the ordinary threshold-triggered recompaction that used
+    // to incidentally wipe this bookkeeping clean before the peer's next
+    // request. Once this counter crosses `SNAPSHOT_OFFSET_REGRESSION_REBASE`,
+    // `handle_install_snapshot_resp` REBASES `snapshot_offset`/
+    // `snapshot_chunk_sent` down to the peer's own reported (lower) truth
+    // instead of taking `max`, which lets a fresh chunk-0 ship land on a
+    // fresh, empty buffer correctly. Cleared at the identical points
+    // `snapshot_offset` itself is.
+    snapshot_offset_regressions: BTreeMap<NodeId, u32>,
     // Per-peer `(offset, resends)` of the last `InstallSnapshot` chunk
     // actually SENT (issues #532/#537): `offset` is the byte offset last
     // transmitted; `resends` counts how many times THAT SAME offset has
@@ -1028,6 +1066,7 @@ where
             transfer_deadline: Nanos(0),
             first_term_index: 0,
             snapshot_offset: BTreeMap::new(),
+            snapshot_offset_regressions: BTreeMap::new(),
             snapshot_chunk_sent: BTreeMap::new(),
             snapshot_chunk_advances: BTreeMap::new(),
             incoming_snapshot: None,
@@ -1239,6 +1278,7 @@ where
             // pass, so a deliberately fresh image is never dropped.
             self.snapshot_blob = None;
             self.snapshot_offset.clear();
+            self.snapshot_offset_regressions.clear();
             self.snapshot_chunk_sent.clear();
         }
     }
@@ -1254,27 +1294,91 @@ where
         self.snapshot_index
     }
 
-    /// Whether a chunked `InstallSnapshot` transfer is currently in flight
-    /// to at least one peer (a non-empty `snapshot_offset` — see that
-    /// field's own doc). `snapshot_upto` unconditionally invalidates every
+    /// Whether a chunked `InstallSnapshot` transfer is currently in flight to
+    /// at least one peer. `snapshot_upto` unconditionally invalidates every
     /// in-flight transfer's own progress the moment the base moves again
-    /// (dropping the blob and clearing every peer's offset — required for
-    /// correctness, since the in-flight bytes were captured at the OLD
-    /// base and shipping them under a new `snapshot_index` would corrupt
-    /// the receiver). Under a sustained write stream that keeps
-    /// re-crossing a `DRIVER_APPLIED` driver's compaction threshold faster
-    /// than a lagging peer's own chunked transfer can complete, that
-    /// invalidation can repeat forever, so the peer's catch-up never
-    /// finishes (issues #532/#537's own residual finding beyond the
-    /// `MAX_APPEND_ENTRIES_BATCH` cap — see that constant's doc). This
-    /// accessor is the fact a `DRIVER_APPLIED` driver's own
+    /// (dropping the blob and clearing every peer's offset/sent-chunk
+    /// bookkeeping — required for correctness, since the in-flight bytes
+    /// were captured at the OLD base and shipping them under a new
+    /// `snapshot_index` would corrupt the receiver). Under a sustained write
+    /// stream that keeps re-crossing a `DRIVER_APPLIED` driver's compaction
+    /// threshold faster than a lagging peer's own chunked transfer can
+    /// complete, that invalidation can repeat forever, so the peer's
+    /// catch-up never finishes (issues #532/#537's own residual finding
+    /// beyond the `MAX_APPEND_ENTRIES_BATCH` cap — see that constant's doc).
+    /// This accessor is the fact a `DRIVER_APPLIED` driver's own
     /// threshold-triggered compaction check needs to defer advancing the
-    /// base while an in-flight transfer still has a chance to land —
-    /// policy lives entirely in the driver (`animus-cp-data`'s
-    /// `apply_and_compact`), never here; this core stays a pure fact,
-    /// same as `snapshot_index` itself.
+    /// base while an in-flight transfer still has a chance to land — policy
+    /// lives entirely in the driver (`animus-cp-data`'s `apply_and_compact`,
+    /// `animus-control`'s `meta_apply_and_compact`), never here; this core
+    /// stays a pure fact, same as `snapshot_index` itself.
+    ///
+    /// **True the moment a chunk has been SENT to some peer, not only once
+    /// it has been ACKED (issue #898)**: checks `snapshot_chunk_sent` (set
+    /// by [`snapshot_chunk_for`](Self::snapshot_chunk_for) at send time, for
+    /// the very first chunk included) in addition to `snapshot_offset` (set
+    /// only once a peer's first ack is processed — see that field's own
+    /// doc). A definition keyed on `snapshot_offset` ALONE leaves a real gap
+    /// from "leader ships chunk 0" to "leader processes that peer's first
+    /// ack": for that whole round trip (which a slow/contended peer or link
+    /// can stretch arbitrarily far), this accessor would report `false` even
+    /// though bytes are genuinely on the wire, so a threshold-triggered
+    /// compaction landing inside that window invalidates a transfer this
+    /// accessor was supposed to protect — the driver-side defer this exists
+    /// for never engages during exactly the window it matters most.
+    /// Confirmed live: `crates/animus-control/tests/
+    /// snapshot_compaction_race.rs` reproduces a freshly-joined follower
+    /// pinned at `snapshot_index() == 0` forever under sustained churn with
+    /// only the offset-based definition, deterministically under `SimEnv`.
+    /// Both maps are cleared together at every existing invalidation/
+    /// completion point (`snapshot_upto`'s base move,
+    /// `handle_install_snapshot_resp`'s completion branch), so checking
+    /// either is equally safe to rely on once populated; checking both
+    /// closes the send-to-first-ack gap the offset map alone cannot see.
+    ///
+    /// **Deliberately blind to *how long* a peer has gone un-acked (issue
+    /// #898 follow-up)** — that is a `Nanos`/`env.now()` question this pure,
+    /// `now`-unaware core cannot answer. Two answers were tried at THIS
+    /// accessor and rejected: a resend-count proxy for elapsed time
+    /// conflated "peer is dead" with "peer's first round trip is merely
+    /// slow" (`snapshot_compaction_race.rs`'s own deliberately slow link
+    /// needed ~40 heartbeat-driven resends before its peer's first-ever
+    /// ack); a `peer_last_contact`-based "has this peer gone quiet"
+    /// check was ALSO rejected — `become_leader` optimistically seeds
+    /// every peer's `last_contact` to the moment leadership begins (so a
+    /// merely-slow-to-start peer and a peer that never starts at all are
+    /// indistinguishable by that field alone; see `become_leader`'s own
+    /// doc). A caller that needs to give up on a peer that is down,
+    /// partitioned, or configured as a cluster member but never actually
+    /// started at all has `now` and belongs at the driver layer: see
+    /// `node.rs`'s `SNAPSHOT_COMPACT_DEFER_IDLE_CEILING`, an
+    /// idle-progress-gated backstop (using
+    /// [`snapshot_chunk_advances`](Self::snapshot_chunk_advances) as the
+    /// progress signal, not wall-clock alone) layered entirely on top of
+    /// this accessor's own `behind`-sized `SNAPSHOT_COMPACT_DEFER_CEILING`
+    /// escape hatch, with no change needed here.
     pub fn snapshot_transfer_in_flight(&self) -> bool {
-        !self.snapshot_offset.is_empty()
+        !self.snapshot_offset.is_empty() || !self.snapshot_chunk_sent.is_empty()
+    }
+
+    /// The set of peers [`snapshot_transfer_in_flight`](Self::
+    /// snapshot_transfer_in_flight) currently considers in flight (the
+    /// union of `snapshot_offset`'s and `snapshot_chunk_sent`'s keys) — a
+    /// pure, `now`-unaware structural fact, same as that accessor itself.
+    /// Exists so a driver that DOES have `now` (issue #898 follow-up) can
+    /// sum [`snapshot_chunk_advances`](Self::snapshot_chunk_advances) across
+    /// every currently-outstanding peer as a genuine forward-progress
+    /// signal, distinguishing "still shipping new chunks, however slowly"
+    /// from "stuck at the same offset forever" — see `node.rs`'s
+    /// `SNAPSHOT_COMPACT_DEFER_IDLE_CEILING` for the full mechanism this
+    /// feeds.
+    #[must_use]
+    pub fn snapshot_transfer_peers(&self) -> BTreeSet<NodeId> {
+        self.snapshot_offset
+            .keys()
+            .chain(self.snapshot_chunk_sent.keys())
+            .cloned()
+            .collect()
     }
 
     /// The byte offset `peer` has acked so far in an in-flight chunked
@@ -2190,6 +2294,32 @@ where
             // `is_leader`-independent inspection (e.g. tests, admin views) never
             // reports a "transfer in flight" for a node that isn't leading.
             self.transfer_target = None;
+            // Issue #898 follow-up: unlike `transfer_target` above,
+            // `snapshot_offset`/`snapshot_chunk_sent` are NOT merely inert
+            // once this node stops being leader — `snapshot_transfer_in_
+            // flight()` (read by every replica's OWN `meta_apply_and_compact`
+            // defer gate, node.rs) has no `role == Leader` guard of its own,
+            // so a sender-side entry left over from a leadership stint that
+            // ended before that specific peer's transfer ever reached
+            // `handle_install_snapshot_resp`'s completion branch (the ONLY
+            // other place these maps are cleared, short of `become_leader`
+            // and `snapshot_upto`'s base move) survives indefinitely as a
+            // FALSE "transfer in flight" — deferring this node's own local
+            // compaction forever once `behind` stops growing (no further
+            // writes), since it never reaches `SNAPSHOT_COMPACT_DEFER_
+            // CEILING` either. Confirmed live: `prod_liveness.rs`'s
+            // `large_metadata_catch_up_stays_live` deadlocking one of its two
+            // 2-node-majority replicas at a small `snapshot_index` (a first,
+            // real compaction) while `engine_applied_index` reached the full
+            // target — the classic signature of a stuck defer, not a slow
+            // apply task — on real `ProdEnv` thread contention triggering an
+            // otherwise-harmless mid-transfer leadership churn between the
+            // two. Clearing here, at the one place a `RaftCore` genuinely
+            // steps down from believing it might be leading, closes it same
+            // as `transfer_target`.
+            self.snapshot_offset.clear();
+            self.snapshot_offset_regressions.clear();
+            self.snapshot_chunk_sent.clear();
         }
         // ADR 0044 phase-1 PR3, un-quiesce trigger (a): **any** inbound Raft
         // message un-quiesces, run before dispatch so every specific handler
@@ -3260,6 +3390,7 @@ where
         if last_index > 0 {
             // Transfer complete: the follower installed the snapshot.
             self.snapshot_offset.remove(&from);
+            self.snapshot_offset_regressions.remove(&from);
             self.snapshot_chunk_sent.remove(&from);
             // Lazy-image discipline (`DRIVER_APPLIED`): once no transfer is in
             // flight, drop the materialized image instead of retaining a
@@ -3315,33 +3446,71 @@ where
         // more round trips to recover from. `max` makes the tracked offset
         // monotonic regardless of ack arrival order — independent of, and
         // additive with, the resend cap below.
-        //
-        // Issue #899 amendment: `next_offset == 0` is a genuine reset, not
-        // a reorder to guard against. `handle_install_snapshot`'s own
-        // "still in progress" branch can only ever report exactly `0` when
-        // `self.incoming_snapshot` is `None` -- which, for an ack reaching
-        // this far (`last_index == 0`, so no completed transfer either),
-        // means the follower has FORGOTTEN whatever it was assembling (a
-        // real restart discarding the volatile in-flight buffer, per
-        // `handle_install_snapshot`'s own doc -- never a reordered ack for
-        // an ongoing transfer, since that always reports a nonzero
-        // `inc.buf.len()`). Applying the monotonic `max` here left a
-        // restarted follower and its leader permanently deadlocked: the
-        // leader kept re-sending chunks at its own stale (pre-restart, high)
-        // tracked offset, which the follower's `fresh && offset == 0` guard
-        // (`handle_install_snapshot`) can never treat as the start of a
-        // fresh transfer, so `incoming_snapshot` never re-initializes and
-        // the transfer never resumes. Confirmed via
-        // `chunked_snapshot_receiver_stop_restart_3`'s fixed corpus seed
-        // (also reachable with zero unrelated code changes at all, by
-        // perturbing any other seed into this same narrow window -- the bug
-        // is pre-existing, not specific to how the seed is reached). See
-        // `docs/lessons/` for the incident writeup.
-        let entry = self.snapshot_offset.entry(from.clone()).or_insert(0);
-        if next_offset == 0 {
-            *entry = 0;
+        let tracked = self.snapshot_offset.entry(from.clone()).or_insert(0);
+        if next_offset == 0 && *tracked > 0 {
+            // Issue #899 amendment (folded into #898's own regression-
+            // counting rebase below, not a bypass of it): `next_offset == 0`
+            // is a genuine, AUTHORITATIVE reset, never a reorder to guard
+            // against, so it must not wait out `SNAPSHOT_OFFSET_REGRESSION_
+            // REBASE` retries the way an ordinary partial regression does.
+            // `handle_install_snapshot`'s own "still in progress" branch can
+            // only ever report exactly `0` when `self.incoming_snapshot` is
+            // `None` — which, for an ack reaching this far (`last_index ==
+            // 0`, so no completed transfer either), means the follower has
+            // FORGOTTEN whatever it was assembling (a real restart
+            // discarding the volatile in-flight buffer, per
+            // `handle_install_snapshot`'s own doc — never a reordered ack
+            // for an ongoing transfer, since that always reports a nonzero
+            // `inc.buf.len()`). Waiting for #898's own regression counter
+            // here left a restarted follower and its leader deadlocked for
+            // several extra round trips (and, before #898 existed at all,
+            // permanently): the leader kept re-sending chunks at its own
+            // stale (pre-restart, high) tracked offset, which the
+            // follower's `fresh && offset == 0` guard
+            // (`handle_install_snapshot`) can never treat as the start of a
+            // fresh transfer, so `incoming_snapshot` never re-initializes
+            // and the transfer never resumes. Confirmed via
+            // `chunked_snapshot_receiver_stop_restart_3`'s fixed corpus seed
+            // (also reachable with zero unrelated code changes at all, by
+            // perturbing any other seed into this same narrow window — the
+            // bug is pre-existing, not specific to how the seed is
+            // reached). See `docs/lessons/` for the incident writeup.
+            *tracked = 0;
+            self.snapshot_chunk_sent.remove(&from);
+            self.snapshot_offset_regressions.insert(from.clone(), 0);
+        } else if next_offset < *tracked {
+            // Issue #898: a regression below the tracked offset — either a
+            // stale, reordered ack for THIS transfer (the common case the
+            // monotonic guard below protects against) or a peer whose buffer
+            // genuinely reset (a real restart, same `NodeId`). Only rebase
+            // once the SAME peer has regressed `SNAPSHOT_OFFSET_REGRESSION_
+            // REBASE` times in a row with no intervening forward progress —
+            // seeing it for the first (few) time(s) is exactly what an
+            // ordinary reordered ack looks like too, so rebasing on the
+            // first sighting would defeat the monotonic guard's own purpose.
+            // (A regression all the way to exactly `0` is handled above,
+            // immediately, instead — see that branch's own doc for why zero
+            // specifically is never ambiguous the way any other partial
+            // regression is.)
+            let regressions = self
+                .snapshot_offset_regressions
+                .entry(from.clone())
+                .or_insert(0);
+            *regressions += 1;
+            if *regressions > SNAPSHOT_OFFSET_REGRESSION_REBASE {
+                *tracked = next_offset;
+                self.snapshot_chunk_sent.remove(&from);
+                *self
+                    .snapshot_offset_regressions
+                    .entry(from.clone())
+                    .or_insert(0) = 0;
+            }
         } else {
-            *entry = (*entry).max(next_offset);
+            // Real forward progress (or an exact repeat) — the monotonic
+            // guard's own case, and proof this peer's transfer is healthy:
+            // clear any accumulated regression count.
+            *tracked = next_offset;
+            self.snapshot_offset_regressions.insert(from.clone(), 0);
         }
         // `SnapshotResend::Capped(SNAPSHOT_ACK_RESEND_CAP)`, not `Always` and
         // not `Capped(0)` — see `snapshot_chunk_for`'s own doc for why this
@@ -3550,8 +3719,17 @@ where
         // doc); it is not reconstructed from a previous leader's in-flight state.
         self.departing.clear();
         self.transfer_target = None;
-        // A fresh term restarts any snapshot transfer from offset 0.
+        // A fresh term restarts any snapshot transfer from offset 0. Clear
+        // `snapshot_chunk_sent` alongside `snapshot_offset` (issue #898's
+        // `snapshot_transfer_in_flight` fix reads both) — a stale sent-chunk
+        // record from a PRIOR stint as leader on this same node would
+        // otherwise make this accessor report an in-flight transfer that no
+        // longer exists, needlessly deferring compaction until the
+        // `SNAPSHOT_COMPACT_DEFER_CEILING`/`COMPACT_DEFER_CEILING` backstop
+        // eventually overrides it (harmless, but not the intent).
         self.snapshot_offset.clear();
+        self.snapshot_offset_regressions.clear();
+        self.snapshot_chunk_sent.clear();
         // No-op entry so prior-term entries can be committed under our term.
         // Record its index: it is this leader's first current-term entry, the
         // watermark ReadIndex barriers and membership changes gate on

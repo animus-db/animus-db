@@ -1403,6 +1403,53 @@ const COMPACT_THRESHOLD: u64 = 64;
 /// always proceeds once `behind` reaches this, transfer or not.
 const COMPACT_DEFER_CEILING: u64 = COMPACT_THRESHOLD * 8;
 
+/// Issue #898 follow-up (`animus-control`'s own `SNAPSHOT_COMPACT_DEFER_
+/// IDLE_CEILING` — see that constant's own doc for the full incident,
+/// rationale, and the two rejected earlier designs, mirrored here exactly):
+/// an **idle-progress-gated** companion to [`COMPACT_DEFER_CEILING`]'s
+/// `behind`-sized one, tracked entirely in this driver loop
+/// (`apply_and_compact`'s own `compact_defer_since`/`compact_defer_progress`
+/// locals, owned by `apply_loop` across iterations) rather than in
+/// `RaftCore` — a pure, `now`-unaware core cannot itself distinguish "a
+/// peer's transfer is genuinely progressing, just slowly" from "this peer
+/// will never ack again."
+///
+/// **Found regression-testing issue #898's own `animus-control` fix**: that
+/// fix widened the shared `RaftCore::snapshot_transfer_in_flight()` (issue
+/// #898, "true the moment a chunk has been SENT, not only once it has been
+/// ACKED") to close a real gap for a slow-but-live peer — but the identical
+/// accessor is read by *this* plane's own gate too, and a chunk SENT to a
+/// peer that is down, partitioned, or crashed (never acking, ever) now holds
+/// this accessor `true` forever, wedging this replica's own local compaction
+/// indefinitely once `behind` stops growing — exactly `COMPACT_DEFER_
+/// CEILING`'s own escape hatch requires *more writes* to ever cross, and a
+/// crashed peer's phantom in-flight chunk never lets that happen on its own.
+/// `crates/animus-cp-data/tests/hlc_differential_skew.rs::receiver_installs_
+/// the_durable_high_water_mark_not_just_the_rows` caught this: a crashed,
+/// partitioned replica's own never-to-be-acked `InstallSnapshot` chunk
+/// (queued the moment the leader's first compaction made it eligible) froze
+/// the leader's OWN subsequent compaction of a failed-CAS burst — the exact
+/// non-row-writing-entry watermark advance that test exists to prove.
+///
+/// **Bounds idle time since the LAST observed forward progress, not total
+/// elapsed time since the defer streak began** — a flat "time since streak
+/// start" ceiling (the first shape tried here) conflates "has this transfer
+/// been running a while" (irrelevant; a large multi-chunk snapshot
+/// legitimately takes many round trips) with "has it made ANY progress
+/// recently" (the actual question), and this same test's own crashed-peer
+/// scenario needs an answer within a few virtual seconds — far tighter than
+/// any margin safe for a genuinely slow-but-live transfer's TOTAL duration.
+/// `compact_defer_progress` tracks the sum of `RaftCore::
+/// snapshot_chunk_advances` (a genuine forward-progress counter — the exact
+/// metric `snapshot_resend_bound.rs` already uses for the identical reason)
+/// across every peer `RaftCore::snapshot_transfer_peers` names;
+/// `compact_defer_since` resets to `now` every time that sum changes.
+/// `2s`, matching `animus-control`'s own value exactly — comfortably above
+/// any single real chunk round trip either crate's own tests or `ProdEnv`
+/// contention have exhibited, comfortably below this test's own
+/// few-virtual-second budget.
+const COMPACT_DEFER_IDLE_CEILING: Duration = Duration::from_secs(2);
+
 /// [`RaftKvNode::reconfigure_step`]'s promotion-readiness threshold (ADR 0058
 /// Train 1's reconciler adoption): a learner within this many log entries of
 /// the leader's own `last_log_index()` (see
@@ -7118,6 +7165,16 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     // group's private file. See `persist_wal`'s doc for the sibling append
     // half.
     shared: Option<&SharedWal<KvCommand, KvState>>,
+    // Issue #898 follow-up: owned by `apply_loop` across iterations — see
+    // `COMPACT_DEFER_IDLE_CEILING`'s own doc for why this lives at the
+    // driver layer rather than in `RaftCore` (a `now`-unaware pure core
+    // cannot track elapsed time itself). `compact_defer_since` resets to
+    // `now` every time `compact_defer_progress` (the last-observed sum of
+    // `RaftCore::snapshot_chunk_advances` across every outstanding peer)
+    // changes, so together they measure idle time since the last genuine
+    // forward progress, never total transfer duration.
+    compact_defer_since: &mut Option<Nanos>,
+    compact_defer_progress: &mut Option<u64>,
 ) -> bool {
     let mut did_work = false;
 
@@ -8866,12 +8923,19 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     // transfer is in flight. A `KvState` WAL snapshot record carries only the unit
     // placeholder, so the threshold rewrite never needed the image bytes.
     let ea = engine_applied.load(Ordering::SeqCst);
-    let (behind, image_needed, transfer_in_flight) = {
+    let now = env.now();
+    let (behind, image_needed, transfer_in_flight, transfer_progress) = {
         let mut c = core.lock().expect("raftkv core poisoned");
+        let transfer_progress: u64 = c
+            .snapshot_transfer_peers()
+            .iter()
+            .map(|p| c.snapshot_chunk_advances(p))
+            .sum();
         (
             ea.saturating_sub(c.snapshot_index()),
             c.take_snapshot_needed(),
             c.snapshot_transfer_in_flight(),
+            transfer_progress,
         )
     };
     // Issues #532/#537: a THRESHOLD-triggered base advance (never an
@@ -8879,11 +8943,44 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     // must always proceed) is deferred while some peer's chunked transfer is
     // genuinely in flight, unless `behind` has grown enough that the WAL
     // itself needs bounding regardless (`COMPACT_DEFER_CEILING`, that
-    // constant's own doc has the full reasoning). Below the ceiling this
+    // constant's own doc has the full reasoning), OR the defer has now sat
+    // IDLE (no forward progress at all) for `COMPACT_DEFER_IDLE_CEILING`
+    // (issue #898 follow-up — see that constant's own doc: a peer that
+    // never acks at all — down, partitioned, or crashed — never grows
+    // `behind` past its own ceiling once writes stop, so this replica's own
+    // compaction would otherwise wedge forever). Below both ceilings this
     // gives a real in-flight transfer a window to land before the next
     // threshold crossing would otherwise yank it back to chunk 0 forever.
-    let threshold_hit =
-        behind >= COMPACT_THRESHOLD && (!transfer_in_flight || behind >= COMPACT_DEFER_CEILING);
+    let would_defer = behind >= COMPACT_THRESHOLD && transfer_in_flight;
+    // Real forward progress (the tracked sum changed since the last pass)
+    // restarts the idle clock — this bounds idle time since the LAST
+    // advance, never total transfer duration. `None` (first observation of
+    // this streak) also counts as "just restarted."
+    let progressed = compact_defer_progress.is_some_and(|prev| prev != transfer_progress);
+    let idle_since = if progressed {
+        None
+    } else {
+        *compact_defer_since
+    };
+    let idle_ceiling_hit = would_defer
+        && idle_since.is_some_and(|since| {
+            now.0.saturating_sub(since.0) >= COMPACT_DEFER_IDLE_CEILING.as_nanos() as u64
+        });
+    let threshold_hit = behind >= COMPACT_THRESHOLD
+        && (!transfer_in_flight || behind >= COMPACT_DEFER_CEILING || idle_ceiling_hit);
+    // Bookkeeping for the NEXT pass: still genuinely deferring (would defer,
+    // and didn't just get overridden by either ceiling) keeps the idle
+    // clock running (restarting it on real progress); anything else —
+    // compaction proceeded, or there is nothing to defer at all — clears
+    // both, so a fresh defer streak always starts its own clock rather than
+    // inheriting a stale one from an unrelated, long-since-resolved episode.
+    if would_defer && !threshold_hit {
+        *compact_defer_since = Some(idle_since.unwrap_or(now));
+        *compact_defer_progress = Some(transfer_progress);
+    } else {
+        *compact_defer_since = None;
+        *compact_defer_progress = None;
+    }
     // Skip compaction once a shutdown is requested: it is only a WAL-bounding
     // optimization (the engine + un-truncated WAL stay consistent without it), and
     // starting a full WAL rewrite while the env is being torn down races the task
@@ -10285,6 +10382,16 @@ async fn apply_loop<E: Env, S: StorageEngine>(
     // snapshot.
     let recovered_baseline_version = storage.latest_version();
     let mut suspicious_noop_log_budget = SUSPICIOUS_MERGE_NOOP_LOG_CAP;
+    // Issue #898 follow-up: owned by this loop, across iterations — see
+    // `COMPACT_DEFER_IDLE_CEILING`'s own doc for why this lives here rather
+    // than in `RaftCore` (a `now`-unaware pure core cannot track elapsed
+    // time itself). `compact_defer_since` is reset to `now` every time
+    // `compact_defer_progress` (the last-observed sum of `RaftCore::
+    // snapshot_chunk_advances` across every outstanding peer, not
+    // wall-clock alone) changes, so it always measures idle time since the
+    // last genuine forward progress, never total transfer duration.
+    let mut compact_defer_since: Option<Nanos> = None;
+    let mut compact_defer_progress: Option<u64> = None;
     loop {
         if halted.load(Ordering::SeqCst) {
             apply_stopped.store(true, Ordering::SeqCst);
@@ -10319,6 +10426,8 @@ async fn apply_loop<E: Env, S: StorageEngine>(
             &fork_signal,
             &persist,
             shared_wal.as_deref(),
+            &mut compact_defer_since,
+            &mut compact_defer_progress,
         )
         .await;
         if !did_work {

@@ -38,6 +38,108 @@ const WAL: &str = "raft.wal";
 /// see [`meta_apply_and_compact`]'s doc).
 const SNAPSHOT_THRESHOLD: u64 = 64;
 
+/// Issue #898 (the control-plane instance of issues #532/#537's second
+/// finding, `animus-cp-data`'s own `COMPACT_DEFER_CEILING`):
+/// `RaftCore::snapshot_upto` unconditionally invalidates every peer's
+/// in-flight chunked `InstallSnapshot` transfer the moment the snapshot base
+/// moves again (required for correctness — a `DRIVER_APPLIED` blob is built
+/// lazily from the engine, so a moved base makes any previously materialized
+/// image stale; see that method's own doc). Under sustained metadata churn,
+/// ordinary `SNAPSHOT_THRESHOLD` pressure can re-cross before a lagging
+/// peer's own transfer (network round trips, `SNAPSHOT_CHUNK_BYTES`-sized
+/// chunks) finishes, restarting it from chunk 0 against a newer, larger
+/// image — every time, forever, if churn keeps winning the race
+/// (`crates/animus-control/tests/snapshot_compaction_race.rs` reproduces
+/// this deterministically under `SimEnv`: a freshly-joined node pinned at
+/// `snapshot_index() == 0` for the whole run while the leader's own log kept
+/// compacting further, the exact shape issue #741/#898's `prod_liveness.rs`
+/// caught intermittently under real `ProdEnv` contention). This is the
+/// ceiling on how far a THRESHOLD-triggered (never an `image_needed`-
+/// triggered — a peer is actively waiting on that image, so it must always
+/// proceed) compaction may be DEFERRED (below, gated on
+/// `RaftCore::snapshot_transfer_in_flight()`) to give an in-flight transfer a
+/// real chance to land before the next threshold crossing yanks it away
+/// again — a multiple of `SNAPSHOT_THRESHOLD`, not a replacement for it, so
+/// the WAL still bounds even if a peer's transfer never completes (dead,
+/// partitioned, or hopelessly outpaced): compaction always proceeds once
+/// `behind` reaches this, transfer or not. Mirrors `animus-cp-data::
+/// COMPACT_DEFER_CEILING` exactly (same derivation, same multiplier) — see
+/// that constant's own doc for the data-plane incident that motivated it,
+/// which this crate's own `meta_apply_and_compact` never adopted despite its
+/// doc's claim to mirror `animus-cp-data::apply_and_compact`'s shape/
+/// ordering precisely.
+const SNAPSHOT_COMPACT_DEFER_CEILING: u64 = SNAPSHOT_THRESHOLD * 8;
+
+/// Issue #898 follow-up: an **idle-progress-gated** companion backstop to
+/// [`SNAPSHOT_COMPACT_DEFER_CEILING`]'s `behind`-sized one, tracked entirely
+/// in this driver loop (`meta_apply_and_compact`'s own `compact_defer_since`/
+/// `compact_defer_progress` locals) rather than in `RaftCore` —
+/// `RaftCore::snapshot_transfer_in_flight` is a pure, `now`-unaware fact,
+/// deliberately (see that accessor's own doc), so it cannot itself
+/// distinguish "a peer's transfer is genuinely progressing, just slowly"
+/// from "this peer will never ack again." The `behind`-sized ceiling alone
+/// requires *more writes* to ever cross, and simply never grows once a
+/// burst of writes stops: a peer that is down, partitioned, or — the
+/// scenario that surfaced this — configured as a cluster member but never
+/// actually started at all (`prod_liveness.rs::large_metadata_catch_up_
+/// stays_live` deliberately keeps node 2 dark through its whole fat-member
+/// phase, ~10-40% of real-thread `ProdEnv` runs observed stalling on this
+/// before this mechanism existed) can hold `snapshot_transfer_in_flight()`
+/// true forever during any quiet period, wedging this node's own local
+/// compaction indefinitely for no benefit — there is no genuinely
+/// in-progress transfer left to protect once a peer has been unresponsive
+/// this long.
+///
+/// **This bounds idle time since the LAST observed forward progress, not
+/// total elapsed time since the defer streak began** — a real design
+/// correction found by a second failing test one layer over
+/// (`animus-cp-data`'s `hlc_differential_skew.rs`, whose own crashed-peer
+/// scenario needs this to fire within a few virtual seconds, far tighter
+/// than this constant's own safe margin for a genuinely slow-but-live
+/// transfer's TOTAL duration). A flat "time since streak start" ceiling
+/// conflates two different questions — "has this transfer been running a
+/// while" (irrelevant; a large multi-chunk snapshot legitimately takes many
+/// round trips) and "has this transfer made ANY progress recently"
+/// (the actual question) — and picking one constant that answers both
+/// honestly is impossible: generous enough for a large real transfer's
+/// total duration is far too generous a wait for a transfer already proven
+/// dead. `compact_defer_progress` tracks the sum of
+/// `RaftCore::snapshot_chunk_advances` (a genuine forward-progress counter,
+/// already the exact metric `snapshot_resend_bound.rs` uses for the
+/// identical reason — see `animus-control/CLAUDE.md`'s entry on why it,
+/// not `snapshot_offset`, is the right denominator) across every peer
+/// `RaftCore::snapshot_transfer_peers` names; `compact_defer_since` resets
+/// to `now` every time that sum changes, so it always measures "how long
+/// since the last real chunk actually shipped a NEW offset," never how
+/// long the transfer has run overall. Once idle this long, compaction
+/// proceeds regardless of `behind`, same as crossing
+/// `SNAPSHOT_COMPACT_DEFER_CEILING`.
+///
+/// **Two earlier designs were tried at this same problem and rejected**:
+/// (1) a per-peer heartbeat-resend-COUNT proxy for elapsed time, which
+/// conflates "peer is dead" with "peer's first round trip is merely slow"
+/// (the resend rate is a function of `heartbeat_interval`, not of
+/// wall/virtual time) — `snapshot_compaction_race.rs`'s own deliberately
+/// slow link needed ~40 heartbeat-driven resends before its peer's
+/// first-EVER ack, landing right at a plausible-looking count threshold
+/// and reopening the original invalidation race for a perfectly healthy,
+/// merely-slow transfer; (2) gating on `RaftCore::peer_last_contact`
+/// going stale, rejected because `become_leader` optimistically seeds
+/// EVERY peer's `last_contact` to the moment leadership begins — a
+/// never-yet-started peer and a peer that stopped responding are both
+/// "stale relative to leadership start" by that field alone, so it cannot
+/// tell them apart either (see `become_leader`'s own doc). This idle
+/// design instead reads `env.now()` directly against a genuine
+/// forward-progress signal (matching this codebase's own convention for
+/// every other liveness/staleness window — `DETECT_TIMEOUT`,
+/// `CONTROL_PEER_LIVENESS_TIMEOUT`, `COMPACT_IDLE_STALL` — never a retry
+/// count or a same-leadership-stint contact timestamp standing in for
+/// one). `2s` is comfortably above any single real chunk round trip this
+/// codebase's own tests or `ProdEnv` contention have exhibited, and
+/// comfortably below `hlc_differential_skew.rs`'s own few-virtual-second
+/// budget for its crashed-peer scenario to resolve.
+const SNAPSHOT_COMPACT_DEFER_IDLE_CEILING: Duration = Duration::from_secs(2);
+
 /// Idle back-off for the apply task ([`meta_apply_loop`]): when there is
 /// nothing committed-and-durable to apply it sleeps this long before
 /// re-checking. Under load [`meta_apply_and_compact`] keeps returning `true`,
@@ -1269,6 +1371,17 @@ async fn meta_apply_loop<E: Env, S: StorageEngine>(
     // this task's first loop iteration should see it too.
     watch.bump(watermark);
 
+    // Issue #898 follow-up: owned by this loop, across iterations — see
+    // `SNAPSHOT_COMPACT_DEFER_IDLE_CEILING`'s own doc for why this lives
+    // here rather than in `RaftCore` (a `now`-unaware pure core cannot track
+    // elapsed time itself). `compact_defer_since` is reset to `now` every
+    // time `compact_defer_progress` (the last-observed sum of
+    // `RaftCore::snapshot_chunk_advances` across every outstanding peer, not
+    // wall-clock alone) changes, so it always measures idle time since the
+    // last genuine forward progress, never total transfer duration.
+    let mut compact_defer_since: Option<Nanos> = None;
+    let mut compact_defer_progress: Option<u64> = None;
+
     loop {
         let did_work = meta_apply_and_compact(
             &env,
@@ -1282,6 +1395,8 @@ async fn meta_apply_loop<E: Env, S: StorageEngine>(
             &persist,
             &mut shadow,
             &mut watermark,
+            &mut compact_defer_since,
+            &mut compact_defer_progress,
         )
         .await;
         if !did_work {
@@ -1308,6 +1423,8 @@ async fn meta_apply_and_compact<E: Env, S: StorageEngine>(
     persist: &PersistProgress,
     shadow: &mut Metadata,
     watermark: &mut u64,
+    compact_defer_since: &mut Option<Nanos>,
+    compact_defer_progress: &mut Option<u64>,
 ) -> bool {
     let mut did_work = false;
 
@@ -1411,14 +1528,64 @@ async fn meta_apply_and_compact<E: Env, S: StorageEngine>(
     // *before* `set_snapshot_blob`, so base and image agree), and installs
     // it.
     let ea = engine_applied.load(Ordering::SeqCst);
-    let (behind, image_needed) = {
+    let now = env.now();
+    let (behind, image_needed, transfer_in_flight, transfer_progress) = {
         let mut c = core.lock().expect("raft core poisoned");
+        let transfer_progress: u64 = c
+            .snapshot_transfer_peers()
+            .iter()
+            .map(|p| c.snapshot_chunk_advances(p))
+            .sum();
         (
             ea.saturating_sub(c.snapshot_index()),
             c.take_snapshot_needed(),
+            c.snapshot_transfer_in_flight(),
+            transfer_progress,
         )
     };
-    if behind >= SNAPSHOT_THRESHOLD || image_needed {
+    // Issue #898 (mirrors `animus-cp-data::apply_and_compact`'s identical
+    // gate for issues #532/#537): a THRESHOLD-triggered base advance is
+    // deferred while some peer's chunked transfer is genuinely in flight,
+    // unless `behind` has grown enough that the WAL itself needs bounding
+    // regardless (`SNAPSHOT_COMPACT_DEFER_CEILING`, that constant's own doc
+    // has the full reasoning), OR the defer has now sat IDLE (no forward
+    // progress at all) for `SNAPSHOT_COMPACT_DEFER_IDLE_CEILING` (issue
+    // #898 follow-up — see that constant's own doc: a peer that never acks
+    // at all never grows `behind` past its own ceiling once churn stops, so
+    // this node's local compaction would otherwise wedge forever). An
+    // `image_needed` compaction always proceeds — a peer is actively
+    // waiting on that exact image.
+    let would_defer = behind >= SNAPSHOT_THRESHOLD && transfer_in_flight;
+    // Real forward progress (the tracked sum changed since the last pass)
+    // restarts the idle clock — this bounds idle time since the LAST
+    // advance, never total transfer duration. `None` (first observation of
+    // this streak) also counts as "just restarted."
+    let progressed = compact_defer_progress.is_some_and(|prev| prev != transfer_progress);
+    let idle_since = if progressed {
+        None
+    } else {
+        *compact_defer_since
+    };
+    let idle_ceiling_hit = would_defer
+        && idle_since.is_some_and(|since| {
+            now.0.saturating_sub(since.0) >= SNAPSHOT_COMPACT_DEFER_IDLE_CEILING.as_nanos() as u64
+        });
+    let threshold_hit = behind >= SNAPSHOT_THRESHOLD
+        && (!transfer_in_flight || behind >= SNAPSHOT_COMPACT_DEFER_CEILING || idle_ceiling_hit);
+    // Bookkeeping for the NEXT pass: still genuinely deferring (would defer,
+    // and didn't just get overridden by either ceiling) keeps the idle
+    // clock running (restarting it on real progress); anything else —
+    // compaction proceeded, or there is nothing to defer at all — clears
+    // both, so a fresh defer streak always starts its own clock rather than
+    // inheriting a stale one from an unrelated, long-since-resolved episode.
+    if would_defer && !threshold_hit {
+        *compact_defer_since = Some(idle_since.unwrap_or(now));
+        *compact_defer_progress = Some(transfer_progress);
+    } else {
+        *compact_defer_since = None;
+        *compact_defer_progress = None;
+    }
+    if threshold_hit || image_needed {
         let image = if image_needed {
             Some(syskv_image(engine).await)
         } else {
@@ -2342,6 +2509,8 @@ mod tests {
             &PersistProgress::default(),
             &mut shadow,
             &mut watermark,
+            &mut None,
+            &mut None,
         )
         .await;
 
@@ -2422,6 +2591,8 @@ mod tests {
             &PersistProgress::default(),
             &mut shadow,
             &mut watermark,
+            &mut None,
+            &mut None,
         )
         .await;
 
