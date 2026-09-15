@@ -1,0 +1,3 @@
+# A "only the owning node acts" gate near a shared registry must check whether the registry actually distinguishes callers by node — or it silently answers "does anyone in the cluster satisfy this," not "do I."
+
+**A "only the owning node acts" gate near a shared registry must check whether the registry actually distinguishes callers by node — or it silently answers "does anyone in the cluster satisfy this," not "do I."** (The sibling cross-node-contention bug referenced above: `auto_split_loop`'s `ctx.edge.cp_leader(tablet)` gate, scoped to the shared `--cluster N` registry rather than per-node. Superseded by ADR 0028, which removed the two-phase split contention this guarded; archived in `docs/engineering-lessons-archive.md`.)

@@ -385,6 +385,7 @@ fn drive_tablet_capture_to_reported(
                 tablet: group.id,
                 cut_version: cur.cut_version,
                 bytes: cur.bytes_so_far,
+                chunk_count: cur.next_chunk,
             });
             assert!(
                 matches!(outcome, ApplyOutcome::Applied | ApplyOutcome::NoOp),
@@ -641,30 +642,50 @@ fn assert_backup_matches_model(
 // merging — the identical fix the production driver needed (see that
 // function's own doc for the corrupt-engine-value hazard this closes).
 
-/// One restore step against `dest` for `backup_id` — `false` on any store
-/// read fault or a not-yet-`Available` manifest (retry next tick, mirroring
-/// production exactly); `true` once every reporting tablet's every chunk
-/// has been proposed to `dest` and confirmed applied.
+/// One [`restore_tick`] call's outcome — mirrors `animusd::backup_restore::
+/// RestoreTickOutcome` (issue #856): `NotDone` retries next tick exactly
+/// like the old bare-`bool` shape did; `Done` means every reporting
+/// tablet's every recorded chunk was proposed and confirmed; `Failed` means
+/// a reporting tablet's own chunk sequence came up short of its recorded
+/// [`animus_control::BackupTabletProgress::chunk_count`] — a hole struck
+/// before the recorded end, never ordinary exhaustion — so the restore must
+/// never be allowed to complete with silently missing rows.
+#[derive(Debug, PartialEq, Eq)]
+enum RestoreStepOutcome {
+    NotDone,
+    Done,
+    Failed,
+}
+
+/// One restore step against `dest` for `backup_id` — mirrors `animusd::
+/// backup_restore::restore_tick`'s exact algorithm (issue #856's fix):
+/// every reporting tablet's chunk sweep is bounded by its own recorded
+/// `chunk_count`, not "keep reading until the store answers `None`" — a
+/// chunk missing strictly before that recorded bound is a genuine short
+/// read (the source backup was deleted mid-restore, most likely a
+/// `DeleteBackup` racing this very restore with the janitor reclaiming
+/// chunks out of order) and returns [`RestoreStepOutcome::Failed`] rather
+/// than silently treating the hole as end-of-sequence.
 fn restore_tick(
     sim: &mut Simulator,
     dest: &KvNode,
     store: &SimSegmentStore,
     backup_id: &str,
-) -> bool {
+) -> RestoreStepOutcome {
     let Ok(Some(manifest_bytes)) =
         block_on(store.get(&backup_codec::backup_manifest_object_id(backup_id)))
     else {
-        return false;
+        return RestoreStepOutcome::NotDone;
     };
     let manifest = backup_codec::decode_manifest_object(&manifest_bytes).expect("manifest decodes");
     for entry in &manifest.tablet_progress {
-        let mut chunk = 0u64;
-        loop {
+        let expected_chunks = entry.progress.chunk_count;
+        for chunk in 0..expected_chunks {
             let object_id = backup_codec::backup_data_object_id(backup_id, entry.tablet.0, chunk);
             let bytes = match block_on(store.get(&object_id)) {
                 Ok(Some(bytes)) => bytes,
-                Ok(None) => break, // this reporting tablet's own chunks are exhausted
-                Err(_) => return false,
+                Ok(None) => return RestoreStepOutcome::Failed,
+                Err(_) => return RestoreStepOutcome::NotDone,
             };
             let rows: Vec<SeedRow> = backup_codec::decode_data_chunk(&bytes)
                 .expect("chunk decodes")
@@ -685,15 +706,18 @@ fn restore_tick(
                     other => panic!("restore seed batch not accepted: {other:?}"),
                 }
             }
-            chunk += 1;
         }
     }
-    true
+    RestoreStepOutcome::Done
 }
 
 /// Drives `dest`'s own restore to completion (re-electing a leader every
 /// tick, tolerating a leadership change mid-sweep) and proposes
-/// `CompleteRestore` against `meta` once done.
+/// `CompleteRestore` against `meta` once done. Panics if the restore is
+/// ever observed [`RestoreStepOutcome::Failed`] — every existing caller
+/// expects a clean, uninterrupted source, so a failure here is itself the
+/// regression; [`drive_restore_expecting_failure`] is the dedicated sibling
+/// for a scenario that deliberately corrupts the source mid-restore.
 #[allow(clippy::too_many_arguments)] // mirrors `drive_tablet_capture_to_reported`'s own shape, one arg wider (restore_id + backup_id both needed, capture only needs one id)
 fn drive_restore_to_done(
     sim: &mut Simulator,
@@ -707,20 +731,90 @@ fn drive_restore_to_done(
 ) {
     for _ in 0..10_000 {
         let leader = elect(sim, dest, live, seed);
-        if restore_tick(sim, &dest.nodes[leader], store, backup_id) {
-            let outcome = meta.apply(&MetaCommand::CompleteRestore {
-                restore_id: restore_id.to_owned(),
-            });
-            assert_eq!(
-                outcome,
-                ApplyOutcome::Applied,
-                "[seed={seed}] CompleteRestore rejected: {outcome:?}"
-            );
-            return;
+        match restore_tick(sim, &dest.nodes[leader], store, backup_id) {
+            RestoreStepOutcome::Done => {
+                let outcome = meta.apply(&MetaCommand::CompleteRestore {
+                    restore_id: restore_id.to_owned(),
+                });
+                assert_eq!(
+                    outcome,
+                    ApplyOutcome::Applied,
+                    "[seed={seed}] CompleteRestore rejected: {outcome:?}"
+                );
+                return;
+            }
+            RestoreStepOutcome::Failed => panic!(
+                "[seed={seed}] restore {restore_id} unexpectedly failed a chunk sweep — \
+                 this driver's caller expected a clean source"
+            ),
+            RestoreStepOutcome::NotDone => {}
         }
         sim.run_for(Duration::from_millis(10));
     }
     panic!("[seed={seed}] restore {restore_id} never reached Done");
+}
+
+/// The dedicated sibling of [`drive_restore_to_done`] for a scenario that
+/// deliberately corrupts the source backup mid-restore (issue #856):
+/// drives ticks until [`RestoreStepOutcome::Failed`] is observed, then
+/// proposes `FailRestore` against `meta` (mirroring `animusd::
+/// backup_restore::fail_restore`'s own call, made from inside `restore_tick`
+/// in production — this mirror keeps that one call at the driver level
+/// purely so the corpus's own call sites read the same "drive to an
+/// expected terminal state" shape `drive_restore_to_done`/`drive_
+/// completion_to_available` already use) and asserts the row lands
+/// `Failed`, never `Done`. Panics if the sweep instead completes cleanly —
+/// that would mean the short-read guard never fired, i.e. the exact defect
+/// issue #856 describes: a chunk hole silently misread as end-of-sequence.
+#[allow(clippy::too_many_arguments)] // mirrors `drive_restore_to_done`'s own shape
+fn drive_restore_expecting_failure(
+    sim: &mut Simulator,
+    meta: &mut Metadata,
+    dest: &Group,
+    live: &[usize],
+    store: &SimSegmentStore,
+    restore_id: &str,
+    backup_id: &str,
+    seed: u64,
+) {
+    for _ in 0..10_000 {
+        let leader = elect(sim, dest, live, seed);
+        match restore_tick(sim, &dest.nodes[leader], store, backup_id) {
+            RestoreStepOutcome::Failed => {
+                let outcome = meta.apply(&MetaCommand::FailRestore {
+                    restore_id: restore_id.to_owned(),
+                    reason: "backup data went missing mid-restore (corpus fault injection, \
+                              issue #856)"
+                        .to_owned(),
+                });
+                assert!(
+                    matches!(outcome, ApplyOutcome::Applied | ApplyOutcome::NoOp),
+                    "[seed={seed}] FailRestore rejected: {outcome:?}"
+                );
+                assert_eq!(
+                    meta.restores.get(restore_id).map(|r| &r.status),
+                    Some(&animus_control::RestoreStatus::Failed {
+                        reason: "backup data went missing mid-restore (corpus fault injection, \
+                                  issue #856)"
+                            .to_owned()
+                    }),
+                    "[seed={seed}] restore {restore_id} did not land Failed"
+                );
+                return;
+            }
+            RestoreStepOutcome::Done => panic!(
+                "[seed={seed}] restore {restore_id} completed despite a deleted chunk — \
+                 issue #856: a chunk hole was silently misread as end-of-sequence instead \
+                 of failing the restore"
+            ),
+            RestoreStepOutcome::NotDone => {}
+        }
+        sim.run_for(Duration::from_millis(10));
+    }
+    panic!(
+        "[seed={seed}] restore {restore_id} never reached a terminal (Failed) state — \
+         expected the short-read guard to fire"
+    );
 }
 
 /// Seed only the manifest's FIRST reporting tablet's chunk `0` directly onto
@@ -1571,8 +1665,9 @@ fn scenario_restore_store_faults_still_converge(seed: u64) {
     store.set_unavailable_until(deadline);
     for _ in 0..5 {
         let dest_leader = elect(&mut sim, &dest, &live, seed);
-        assert!(
-            !restore_tick(&mut sim, &dest.nodes[dest_leader], &store, "backup-1"),
+        assert_eq!(
+            restore_tick(&mut sim, &dest.nodes[dest_leader], &store, "backup-1"),
+            RestoreStepOutcome::NotDone,
             "[seed={seed}] a restore tick must not report done while the store is \
              unavailable"
         );
@@ -1695,6 +1790,120 @@ fn restore_after_source_drop() {
     for_each_seed(
         "restore_after_source_drop",
         scenario_restore_after_source_drop,
+    );
+}
+
+// --- cell: delete_backup_mid_restore_fails_restore (issue #856) ------------
+
+/// Issue #856: `DeleteBackup` racing an in-flight restore, with the janitor
+/// reclaiming chunks **out of chunk order**, must FAIL the restore — never
+/// silently complete it with missing rows. Enough rows are written that the
+/// backup's own base-kind sweep needs several chunks (`CHUNK_ROWS == 3`,
+/// 10 rows ⇒ chunks `0..4`); a MIDDLE chunk (index 1) is then deleted
+/// directly from the store — standing in for the janitor's own two-phase
+/// reclaim landing on an out-of-order object while chunks 2 and 3 are still
+/// physically present, exactly the "chunk 7 deleted before chunk 3" shape
+/// the issue describes. Before the fix, `restore_tick`'s old "`Ok(None)` is
+/// the sole end-of-sequence signal" loop reads chunk 0, then misreads the
+/// hole at chunk 1 as "this tablet's chunks are exhausted" and returns
+/// `Done` having silently dropped chunks 1-3's rows — this cell's own
+/// `drive_restore_expecting_failure` panics loudly if that ever happens
+/// again (`RestoreStepOutcome::Done` there is a **hard failure** of the
+/// cell, not a legitimate outcome). After the fix, the recorded
+/// `chunk_count == 4` bounds the sweep, so the hole at chunk 1 (strictly
+/// before that bound) is a genuine short read: the restore proposes
+/// `FailRestore` and lands `RestoreStatus::Failed`, never `Done`.
+fn scenario_delete_backup_mid_restore_fails_restore(seed: u64) {
+    let mut sim = Simulator::new(seed);
+    let source_engines = engines();
+    let mut meta = base_meta();
+    create_tablet(&mut meta, TabletId(1), KeyRange::whole());
+    let group = start_group(&sim, &source_engines, TabletId(1), KeyRange::whole());
+    let live = [0, 1, 2];
+    sim.run_for(Duration::from_secs(2));
+    let store = SimSegmentStore::new(sim.env(nid(NODES[0])));
+
+    // 10 rows over `CHUNK_ROWS == 3` needs 4 chunks (3, 3, 3, 1) for the
+    // `KIND_BASE` sweep — enough that a hole strictly before the real end
+    // has real, un-swept content on the far side of it to lose.
+    let mut model = BTreeMap::new();
+    let leader = elect(&mut sim, &group, &live, seed);
+    for i in 0..10 {
+        let pk = format!("m{i:03}");
+        let value = format!("v{i}").into_bytes();
+        write_base_row(&mut sim, &group.nodes[leader], pk.as_bytes(), &value);
+        model.insert(logical(pk.as_bytes()), value);
+    }
+    begin_backup(&mut meta, "backup-1", 1_000);
+    drive_tablet_capture_to_reported(&mut sim, &mut meta, &group, &live, &store, "backup-1", seed);
+    let env0 = sim.env(nid(NODES[0]));
+    drive_completion_to_available(&mut sim, &env0, &mut meta, &store, "backup-1", seed);
+    assert_backup_matches_model(&store, "backup-1", &model, &[], seed);
+
+    let progress = meta
+        .backup_tablet_progress
+        .get(&("backup-1".to_owned(), TabletId(1)))
+        .expect("tablet 1 reported completion");
+    assert_eq!(
+        progress.chunk_count, 4,
+        "[seed={seed}] test premise: 10 rows / CHUNK_ROWS==3 should need exactly 4 chunks"
+    );
+
+    begin_restore(
+        &mut meta,
+        "restore-1",
+        "backup-1",
+        "widgets_restored",
+        TabletId(2),
+    );
+    let dest_engines = engines();
+    let dest = start_group(&sim, &dest_engines, TabletId(2), KeyRange::whole());
+    sim.run_for(Duration::from_secs(2));
+
+    // `DeleteBackup` racing this restore, then the janitor reclaiming
+    // objects out of chunk order (ADR 0059's own §3 janitor doc: `SimSeg
+    // mentStore::list`/a real `FsSegmentStore` scan is unsorted, and chunk
+    // ids are not zero-padded, so a real janitor sweep is under no
+    // obligation to delete chunk 0 before chunk 1) — deleting the MIDDLE
+    // chunk (1 of 0..4) while chunks 2 and 3 stay physically present is
+    // exactly this: a hole with real, still-there content on its far side.
+    let hole_object_id = backup_codec::backup_data_object_id("backup-1", TabletId(1).0, 1);
+    block_on(store.delete(&hole_object_id)).expect("delete ok");
+    assert!(
+        block_on(store.get(&hole_object_id))
+            .expect("get ok")
+            .is_none(),
+        "[seed={seed}] test premise: chunk 1 must actually be gone"
+    );
+
+    drive_restore_expecting_failure(
+        &mut sim,
+        &mut meta,
+        &dest,
+        &live,
+        &store,
+        "restore-1",
+        "backup-1",
+        seed,
+    );
+
+    // The target table's own tablet is left `Building` forever (never
+    // served) — an ordinary `DeleteTable` cleans it up, exactly like any
+    // other failed restore; assert here only that nothing masquerades as a
+    // successful restore.
+    assert_ne!(
+        meta.restores.get("restore-1").map(|r| &r.status),
+        Some(&animus_control::RestoreStatus::Done),
+        "[seed={seed}] restore-1 must never land Done — its source had a chunk short of \
+         its recorded count"
+    );
+}
+
+#[test]
+fn delete_backup_mid_restore_fails_restore() {
+    for_each_seed(
+        "delete_backup_mid_restore_fails_restore",
+        scenario_delete_backup_mid_restore_fails_restore,
     );
 }
 

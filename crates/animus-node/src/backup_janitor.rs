@@ -375,6 +375,7 @@ mod tests {
                 tablet: TabletId(1),
                 cut_version: 10,
                 bytes: 100,
+                chunk_count: 1,
             }
         )));
         assert!(accepted(node.propose(MetaCommand::CompleteBackup {
