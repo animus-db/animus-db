@@ -574,3 +574,146 @@ async fn sustained_metadata_churn_over_a_real_engine_stays_live() {
     .await
     .expect("sustained real-engine metadata churn liveness test timed out");
 }
+
+/// Issue #667 (P0 Raft safety), real-thread `ProdEnv` proof: a 3-voter
+/// control cluster on real sockets/threads/disk, one voter's data
+/// directory wiped clean and the process restarted fresh on the exact same
+/// node id and config (precisely `storage.ephemeral: true`'s `EmptyDir`
+/// pod-recreate shape) — the wiped voter must refuse to act as a voter
+/// (`refused_as_voter()`), and the other two must keep serving throughout
+/// (a leader stays elected, a new write still commits) without ever
+/// waiting on the wiped node.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn wiped_voter_refuses_and_the_rest_of_the_cluster_keeps_serving() {
+    timeout(Duration::from_secs(60), async {
+        let group: Vec<NodeId> = (0..3).map(nid).collect();
+        let mut dirs: Vec<_> = (0..3).map(|_| unique_tmp_dir()).collect();
+        let loop0 = || "127.0.0.1:0".parse::<SocketAddr>().unwrap();
+
+        let mut envs = Vec::new();
+        for (i, dir) in dirs.iter().enumerate() {
+            let (env, _addr) = ProdEnv::bind(nid(i as u64), loop0(), dir)
+                .await
+                .expect("bind");
+            envs.push(env);
+        }
+        let mut book: BTreeMap<NodeId, String> = envs
+            .iter()
+            .map(|e| (e.node_id(), e.local_addr().to_string()))
+            .collect();
+        for e in &envs {
+            e.set_peers(book.clone());
+        }
+
+        let mut nodes: Vec<RaftNode<ProdEnv>> = envs
+            .iter()
+            .map(|e| RaftNode::start(e.clone(), group.clone(), MemoryEngine::new()))
+            .collect();
+
+        async fn leader_of(nodes: &[RaftNode<ProdEnv>]) -> Option<usize> {
+            for _ in 0..200 {
+                for (i, n) in nodes.iter().enumerate() {
+                    if n.is_leader() {
+                        return Some(i);
+                    }
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+            None
+        }
+
+        let leader_idx = leader_of(&nodes).await.expect("no leader elected at genesis");
+        assert!(
+            matches!(
+                nodes[leader_idx].propose(MetaCommand::UpsertMember {
+                    node: nid(100),
+                    labels: BTreeMap::new(),
+                    status: NodeStatus::Active,
+                }),
+                ProposeResult::Accepted { .. }
+            ),
+            "pre-wipe write should commit"
+        );
+        sleep(Duration::from_millis(500)).await;
+
+        // Wipe a NON-leader voter's whole data directory (WAL and anything
+        // else in it) and restart it fresh on the same id/config — exactly
+        // `storage.ephemeral: true`'s real `EmptyDir` pod-recreate shape,
+        // the root cause this issue closes.
+        let victim = (0..3).find(|&i| i != leader_idx).expect("a non-leader exists");
+        envs[victim].shutdown_and_wait().await;
+        std::fs::remove_dir_all(&dirs[victim]).expect("wipe victim data dir");
+        dirs[victim] = unique_tmp_dir();
+        let (victim_env, _addr) = ProdEnv::bind(nid(victim as u64), loop0(), &dirs[victim])
+            .await
+            .expect("rebind victim on a fresh port");
+        book.insert(victim_env.node_id(), victim_env.local_addr().to_string());
+        envs[victim] = victim_env.clone();
+        for e in &envs {
+            e.set_peers(book.clone());
+        }
+        nodes[victim] = RaftNode::start(victim_env, group.clone(), MemoryEngine::new());
+
+        // The wiped voter must resolve to a permanent refusal — it already
+        // was an established voter (the leader's own committed config names
+        // it), and at least one other voter is reachable and has real
+        // history to prove it.
+        let mut refused = false;
+        for _ in 0..400 {
+            if nodes[victim].refused_as_voter() {
+                refused = true;
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            refused,
+            "the wiped voter never resolved to a permanent refusal within budget"
+        );
+        assert!(
+            !nodes[victim].is_leader(),
+            "a refused voter must never become leader"
+        );
+
+        // The rest of the cluster must keep serving throughout and after —
+        // never waiting on the wiped node.
+        let live: Vec<usize> = (0..3).filter(|&i| i != victim).collect();
+        let still_leading = leader_of(&[nodes[live[0]].clone(), nodes[live[1]].clone()])
+            .await
+            .is_some();
+        assert!(
+            still_leading,
+            "the other two voters must still elect/keep a leader while the wiped voter is refused"
+        );
+        let cur_leader = if nodes[live[0]].is_leader() {
+            live[0]
+        } else {
+            live[1]
+        };
+        assert!(
+            matches!(
+                nodes[cur_leader].propose(MetaCommand::UpsertMember {
+                    node: nid(200),
+                    labels: BTreeMap::new(),
+                    status: NodeStatus::Active,
+                }),
+                ProposeResult::Accepted { .. }
+            ),
+            "a write must still commit through the surviving majority after the wipe"
+        );
+        sleep(Duration::from_millis(500)).await;
+        assert!(
+            nodes[cur_leader].metadata().members.contains_key(&nid(200)),
+            "the post-wipe write must actually commit"
+        );
+
+        for e in &envs {
+            e.shutdown_and_wait().await;
+        }
+        for dir in &dirs {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    })
+    .await
+    .expect("wiped-voter refusal liveness test timed out");
+}

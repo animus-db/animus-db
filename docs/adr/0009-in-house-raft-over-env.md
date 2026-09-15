@@ -546,3 +546,160 @@ every dependent behavior above is inert when `state_machine_behind` is
 never set, which no control-plane call site does);
 `animus-cp-data/tests/engine_wipe_needs_snapshot.rs` is the live proof
 over the `DRIVER_APPLIED` plane that actually exercises this.
+
+## Amendment (2026-09-15): boot-time genesis-vs-wiped-restart check (issue #667, P0 Raft safety)
+
+**The hazard.** Every existing recovery path (`node.rs`'s `drive`: `if
+!state.is_empty() { RaftCore::recovered(..) } else { /* keep the fresh
+RaftCore::new built at start time */ }`) treated a control-plane voter's
+persisted WAL replaying to `PersistedState::is_empty()` as an unqualified
+genesis bootstrap — safe for a voter's very first-ever run, but identical,
+byte for byte, to a control voter's disk being wiped (ephemeral storage,
+`storage.ephemeral: true`, a real Kubernetes `EmptyDir`) and restarting
+*into an already-established cluster*. `current_term`/`voted_for` are
+exactly what a real vote grant needs to remember to avoid granting a
+second, contradicting vote in a term it already voted in — and both are
+gone. A wiped voter that restarts, is asked to vote for a different
+candidate than the one it already (durably, before the wipe) voted for in
+the same term, and grants it, can elect two leaders in one term — a direct
+violation of Election Safety. Liveness of the *rejoin* was never the
+problem (pre-vote's log check already stops a fresh node's empty log from
+winning a real election against an established group); this is purely a
+safety hole. Root-caused via the S-07d growth roll incident and
+`crates/animus-control/tests/wiped_voter_rejoin.rs`'s own repro (see issue
+#667).
+
+**The decision.** A node whose persisted Raft state is empty must refuse
+to act as a **voter** — grant no real vote, start no campaign — until it
+has resolved, via peers reachable through the `Env` seam, whether this is
+a genuine first-ever bootstrap or an already-established voter's disk
+wiped clean. A refused node must be re-admitted through the existing
+**learner/rejoin path** (ADR 0032/0058: removed from the voter set, added
+back as a non-voting learner, promoted once caught up) as a deliberate new
+membership event — never simply restarted as a static voter again. This
+was considered against two alternatives named in the issue and rejected:
+treating `storage.ephemeral: true` as unsupported/invalid for control
+voters (pushes the whole problem to the operator with no in-process
+safety net at all — a config mistake still silently double-votes) and
+doing nothing beyond documentation (leaves a real, demonstrated P0 hazard
+live). The mechanism:
+
+- `RaftCore` gains `cluster_check_pending: Option<BTreeSet<NodeId>>`
+  (`Some(peers still owed an answer)` while resolving, `None` once
+  resolved either way or never applicable — every pre-existing
+  construction path, `new` and `recovered`, leaves it `None`) and a sticky
+  `cluster_check_refused: bool` with no path back to `false` short of a
+  fresh `RaftCore` from a real restart through the rejoin path.
+- `node.rs`'s `drive`, in the branch where `state.is_empty()` (the ONLY
+  place this whole mechanism is entered — never for a `recovered` core,
+  whose term/`voted_for` are already trustworthy), calls
+  `RaftCore::begin_cluster_check` instead of doing nothing. That method
+  broadcasts a new, term-and-vote-inert message pair,
+  `RaftMsg::ClusterProbe`/`ClusterProbeResp { term, committed_index,
+  config }`, to every configured peer, and parks until either (a) any one
+  peer answers with real history (`term > 0 || committed_index > 0`), or
+  (b) every configured peer has answered genuinely empty. A never-
+  answering peer is never assumed fresh — the election-timeout tick keeps
+  resending the probe for as long as resolution is pending, so "peers
+  unreachable" means keep probing, never vote, indefinitely.
+- **`handle_request_vote`'s real grant condition** gains `&&
+  cluster_checked` (`!cluster_check_refused && cluster_check_pending.is_none()`)
+  alongside its pre-existing `is_voter() && can_vote && log_ok` — this is
+  the one and only place a real, persisted vote is ever granted, so it is
+  the one and only gate this fix needs on the safety side.
+  **`handle_pre_vote` is deliberately NOT gated** the same way: granting a
+  pre-vote touches no persisted state and cannot itself cause a double
+  vote, and gating it too would (as built and reverted during this fix —
+  see below) needlessly slow down every legitimate case pre-vote already
+  makes safe. `start_pre_vote`/`start_election` both also refuse to
+  *campaign* while pending or refused, mirroring the existing
+  `state_machine_behind`/learner campaign gates above.
+
+**The hard part: telling a wiped restart apart from an ADR 0060 growth
+join, without requiring every configured peer to be simultaneously
+online for anything but genuine multi-node genesis.** Both a wiped,
+already-established voter and a brand-new voter joining an established
+cluster via `change_membership` (ADR 0037/0060 — an everyday, frequent
+operation, not a rare disaster-recovery event) present the **identical**
+local symptom: empty persisted state. An early build of this fix treated
+*any* peer showing real history as proof of a wiped restart and refused
+unconditionally — verified, via
+`wiped_voter_rejoin.rs`'s own `growth_then_wiped_leader_rejoin_reestablishes_leader`,
+to livelock an entire 4-voter group: the newly-grown 4th voter refused
+itself the instant its own `change_membership` commit landed on its
+peers, permanently dropping the live quorum below majority. **The fix:
+`ClusterProbeResp` additionally carries the responder's own current
+*committed voter config*.** A responder showing real history is a
+wiped-voter-restart signal only when its own config already names the
+asker as a voter — proof this exact identity was already an established
+voter somewhere. If the asker is not (yet) in that config, it has never
+had voting rights under this identity before and cannot possibly have a
+forgotten prior vote to double — safe to proceed immediately as an
+ordinary fresh voter, exactly as it always could (pre-vote's log check,
+ADR 0060's own existing safety argument, unchanged). This resolves in a
+single round trip to any one reachable peer with real history, regardless
+of how many other peers are up — growth is not slowed by this mechanism
+at all in the common case. Only a genuine **multi-node genesis** (nobody
+has any history yet) still needs every configured peer to confirm empty,
+which is inherent: nobody can yet authoritatively answer "is the asker
+already one of my voters" before the cluster's very first commit exists.
+
+**Boot-path entropy/scheduling sensitivity (a real, generalizable
+lesson).** The initial `ClusterProbe` round is sent from a **separate
+spawned task** at boot, not inline before `drive`'s first `env.recv()`
+(risks a mutual multi-node-genesis stall) and not deferred to the first
+election-timeout tick either (the deferred version is what let the ADR
+0060 growth race above happen at all under `SimEnv`'s near-zero latency).
+`begin_cluster_check`'s own entropy draw is **reused from the same value
+`RaftCore::new`'s own construction already drew**, never a fresh
+`env.next_u64()` call, specifically because this branch runs on every
+genesis node's boot and an extra draw there reshuffles the entropy
+sequence for the rest of a `SimEnv` run — confirmed to desync two
+unrelated fixed-seed corpus cells
+(`chunked_snapshot_receiver_stop_restart_3`,
+`transfer_third_voter_wins_the_election_a_transfer_armed_a_different_target_for`)
+even though total draw counts ended up unchanged for the resolved-quickly
+case (the extra spawned task and wire traffic alone can still perturb
+`SimEnv`'s own deterministic tie-breaking between ready tasks). Both were
+root-caused as pre-existing/orthogonal (one a genuine latent bug in
+`InstallSnapshot` resume — fixed alongside, see below — the other a
+seed re-pin, no bug) rather than papered over; see `docs/lessons/` for
+the general "any boot-path behavior change can desync a hand-tuned fixed
+seed even with zero logic bugs" lesson.
+
+**An unrelated, pre-existing bug found and fixed in the same change**
+(issue #899, discovered by the corpus desync above):
+`handle_install_snapshot_resp`'s monotonic `max` guard on `snapshot_offset`
+(added earlier to stop out-of-order acks regressing an in-flight
+transfer) also swallowed a genuinely restarted follower's own honest
+`next_offset: 0` reset, permanently deadlocking that follower's catch-up
+— the leader kept re-sending chunks at its own stale, pre-restart offset
+forever. Fixed by treating `next_offset == 0` as an authoritative reset
+rather than folding it into the max. See `crates/animus-control/tests/
+install_snapshot.rs`'s `leader_resumes_from_offset_zero_after_a_restarted_
+follower_resets` for the regression.
+
+**Scope: control plane only.** The CP data plane (`animus-cp-data`) reuses
+this same `RaftCore`, and its own per-tablet driver has the identical
+`state.is_empty()`-branches-on-recovery shape (`lib.rs`'s `fresh_group`) —
+the same hazard exists there for a wiped data-plane voter. Not fixed in
+this change: a tablet's peer set is dynamic and reconstituted constantly
+(every `CreateTablet`, every split minting two fresh children, every
+`reconfigure_step` replica move) in a way the control plane's
+one-time-genesis config is not, so the same "wait for peers" mechanism
+would add real per-tablet-genesis latency cluster-wide rather than a
+one-time cluster-genesis cost — a materially different liveness tradeoff
+needing its own design decision. Tracked as issue #900. **Operational
+mitigation in the meantime, for both planes**: a data-directory volume
+backing any control OR data-plane voter must be **persistent**, never
+`storage.ephemeral: true`/an `EmptyDir` — see `crates/animus-operator/
+CLAUDE.md`'s matching note.
+
+Regression: `crates/animus-control/tests/wiped_voter_double_vote_safety.rs`
+(the safety cell — hand-driven, seed-free, proves the double-grant is
+refused and, in a chained scenario, that it would otherwise elect a second
+leader in the same term); the three existing `wiped_voter_rejoin.rs`
+scenarios (liveness after a legitimate rejoin, unaffected); a real
+`ProdEnv` 3-node scenario in `tests/prod_liveness.rs` wiping a voter's data
+directory and confirming both the refusal and that the other two nodes
+keep serving.
