@@ -70,6 +70,46 @@ const SNAPSHOT_THRESHOLD: u64 = 64;
 /// ordering precisely.
 const SNAPSHOT_COMPACT_DEFER_CEILING: u64 = SNAPSHOT_THRESHOLD * 8;
 
+/// Issue #898 follow-up: a **time-based** companion backstop to
+/// [`SNAPSHOT_COMPACT_DEFER_CEILING`]'s `behind`-sized one, tracked entirely
+/// in this driver loop (`meta_apply_and_compact`'s own `compact_defer_since`
+/// local) rather than in `RaftCore` — `RaftCore::snapshot_transfer_in_flight`
+/// is a pure, `now`-unaware fact, deliberately (see that accessor's own
+/// doc), so it cannot itself distinguish "a peer's transfer is genuinely
+/// progressing, just slowly" from "this peer will never ack again." The
+/// `behind`-sized ceiling alone requires *more writes* to ever cross, and
+/// simply never grows once a burst of writes stops: a peer that is down,
+/// partitioned, or — the scenario that surfaced this — configured as a
+/// cluster member but never actually started at all
+/// (`prod_liveness.rs::large_metadata_catch_up_stays_live` deliberately
+/// keeps node 2 dark through its whole fat-member phase, ~10-40% of
+/// real-thread `ProdEnv` runs observed stalling on this before this
+/// constant existed) can hold `snapshot_transfer_in_flight()` true forever
+/// during any quiet period, wedging this node's own local compaction
+/// indefinitely for no benefit — there is no genuinely in-progress transfer
+/// left to protect once a peer has been unresponsive this long. This
+/// ceiling instead bounds *how long a continuous defer streak may run*
+/// regardless of `behind`: once `compact_defer_since` has stood for this
+/// long with the peer still not budging, compaction proceeds anyway, same
+/// as crossing `SNAPSHOT_COMPACT_DEFER_CEILING`.
+///
+/// **A message-COUNT proxy for elapsed time was tried first and rejected**:
+/// gating `snapshot_transfer_in_flight` on a per-peer heartbeat-resend
+/// counter conflated "peer is dead" with "peer's first round trip is merely
+/// slow," since the resend rate is a function of `heartbeat_interval`, not
+/// of wall/virtual time directly — confirmed live, `snapshot_compaction_
+/// race.rs`'s own deliberately slow link needed ~40 heartbeat-driven
+/// resends before its peer's first-EVER ack, landing right at a
+/// plausible-looking count threshold and reopening the original
+/// invalidation race for a perfectly healthy, merely-slow transfer. `10s`
+/// here instead reads `env.now()` directly (matching this codebase's own
+/// convention for every other liveness/staleness window — `DETECT_TIMEOUT`,
+/// `CONTROL_PEER_LIVENESS_TIMEOUT`, `COMPACT_IDLE_STALL` — never a retry
+/// count standing in for one): comfortably above the ~2s that same slow-link
+/// test's genuinely-progressing transfer needs for its slowest round trip,
+/// comfortably below `prod_liveness.rs`'s own 60s idle-stall patience.
+const SNAPSHOT_COMPACT_DEFER_TIME_CEILING: Duration = Duration::from_secs(10);
+
 /// Idle back-off for the apply task ([`meta_apply_loop`]): when there is
 /// nothing committed-and-durable to apply it sleeps this long before
 /// re-checking. Under load [`meta_apply_and_compact`] keeps returning `true`,
@@ -1211,6 +1251,12 @@ async fn meta_apply_loop<E: Env, S: StorageEngine>(
     // this task's first loop iteration should see it too.
     watch.bump(watermark);
 
+    // Issue #898 follow-up: owned by this loop, across iterations — see
+    // `SNAPSHOT_COMPACT_DEFER_TIME_CEILING`'s own doc for why this lives
+    // here rather than in `RaftCore` (a `now`-unaware pure core cannot track
+    // elapsed time itself).
+    let mut compact_defer_since: Option<Nanos> = None;
+
     loop {
         let did_work = meta_apply_and_compact(
             &env,
@@ -1224,6 +1270,7 @@ async fn meta_apply_loop<E: Env, S: StorageEngine>(
             &persist,
             &mut shadow,
             &mut watermark,
+            &mut compact_defer_since,
         )
         .await;
         if !did_work {
@@ -1250,6 +1297,7 @@ async fn meta_apply_and_compact<E: Env, S: StorageEngine>(
     persist: &PersistProgress,
     shadow: &mut Metadata,
     watermark: &mut u64,
+    compact_defer_since: &mut Option<Nanos>,
 ) -> bool {
     let mut did_work = false;
 
@@ -1366,10 +1414,32 @@ async fn meta_apply_and_compact<E: Env, S: StorageEngine>(
     // deferred while some peer's chunked transfer is genuinely in flight,
     // unless `behind` has grown enough that the WAL itself needs bounding
     // regardless (`SNAPSHOT_COMPACT_DEFER_CEILING`, that constant's own doc
-    // has the full reasoning). An `image_needed` compaction always proceeds
-    // — a peer is actively waiting on that exact image.
+    // has the full reasoning), OR the defer has now run continuously for
+    // `SNAPSHOT_COMPACT_DEFER_TIME_CEILING` (issue #898 follow-up — see that
+    // constant's own doc: a peer that never acks at all never grows
+    // `behind` past its own ceiling once churn stops, so this node's local
+    // compaction would otherwise wedge forever). An `image_needed`
+    // compaction always proceeds — a peer is actively waiting on that exact
+    // image.
+    let would_defer = behind >= SNAPSHOT_THRESHOLD && transfer_in_flight;
+    let now = env.now();
+    let time_ceiling_hit = would_defer
+        && compact_defer_since.is_some_and(|since| {
+            now.0.saturating_sub(since.0) >= SNAPSHOT_COMPACT_DEFER_TIME_CEILING.as_nanos() as u64
+        });
     let threshold_hit = behind >= SNAPSHOT_THRESHOLD
-        && (!transfer_in_flight || behind >= SNAPSHOT_COMPACT_DEFER_CEILING);
+        && (!transfer_in_flight || behind >= SNAPSHOT_COMPACT_DEFER_CEILING || time_ceiling_hit);
+    // Bookkeeping for the NEXT pass: still genuinely deferring (would defer,
+    // and didn't just get overridden by either ceiling) keeps/starts the
+    // streak; anything else — compaction proceeded, or there is nothing to
+    // defer at all — clears it, so a fresh defer streak always starts its
+    // own clock rather than inheriting a stale one from an unrelated,
+    // long-since-resolved episode.
+    if would_defer && !threshold_hit {
+        compact_defer_since.get_or_insert(now);
+    } else {
+        *compact_defer_since = None;
+    }
     if threshold_hit || image_needed {
         let image = if image_needed {
             Some(syskv_image(engine).await)
@@ -2294,6 +2364,7 @@ mod tests {
             &PersistProgress::default(),
             &mut shadow,
             &mut watermark,
+            &mut None,
         )
         .await;
 
@@ -2374,6 +2445,7 @@ mod tests {
             &PersistProgress::default(),
             &mut shadow,
             &mut watermark,
+            &mut None,
         )
         .await;
 

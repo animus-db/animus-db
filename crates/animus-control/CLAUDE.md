@@ -1343,6 +1343,55 @@ per-tablet CP data plane (`animus-cp-data`).
   code path was quietly relying on — re-run the FULL existing suite, not
   just the new regression, before calling a fix done).
 
+  **Two more gaps in the same mechanism, found stress-running
+  `prod_liveness.rs` under real `ProdEnv` contention (not caught by any
+  `SimEnv` test)**:
+
+  - **Fourth: the leader-only `snapshot_offset`/`snapshot_offset_
+    regressions`/`snapshot_chunk_sent` bookkeeping outlived losing
+    leadership.** `RaftCore::handle`'s generic higher-term step-down already
+    clears a stale `transfer_target` on the exact same reasoning ("a future
+    `is_leader`-independent inspection must never report a transfer in
+    flight for a node that isn't leading") but never extended that to these
+    three maps. Since `snapshot_transfer_in_flight()` has no `role ==
+    Leader` guard of its own, a sender-side entry surviving an ordinary
+    leadership handoff under real contention (not a bug by itself) made
+    this node's *own* local compaction defer forever afterward, on behalf
+    of a transfer with no sender left. Fixed by clearing all three at that
+    step-down site too.
+  - **Fifth: even with the fourth fix, a peer that never acks at all
+    (down, partitioned, or configured but never started — exactly what
+    `large_metadata_catch_up_stays_live`'s dark node 2 is) can still wedge
+    compaction forever**, since `SNAPSHOT_COMPACT_DEFER_CEILING`'s escape
+    hatch is sized in `behind` and simply never grows once a burst of
+    writes stops. A resend-COUNT proxy for elapsed time was tried and
+    **rejected** — it scales with `heartbeat_interval`, not with how slow a
+    genuinely live peer might legitimately be, and `snapshot_compaction_
+    race.rs`'s own slow-link test needed ~40 un-acked heartbeat resends
+    before a real peer's first-ever ack, landing right at a plausible
+    count threshold and reopening the original race for a transfer that was
+    actually fine. Fixed with a **time-based** companion instead —
+    `SNAPSHOT_COMPACT_DEFER_TIME_CEILING` (10s) — tracked as a plain
+    `Option<Nanos>` owned by `meta_apply_loop` itself (stamped with
+    `env.now()` when a genuine defer streak starts, cleared the instant
+    compaction proceeds or there is nothing left to defer), matching this
+    codebase's own convention for every other staleness window
+    (`DETECT_TIMEOUT`, `CONTROL_PEER_LIVENESS_TIMEOUT`, `COMPACT_IDLE_
+    STALL`) instead of a retry count standing in for one.
+    `RaftCore::snapshot_transfer_in_flight()` needed no change for this —
+    it stays the pure, `now`-unaware fact its own doc says it should be;
+    the time-awareness belongs at the driver layer that already has
+    `env.now()`. Neither fourth nor fifth has a dedicated `SimEnv`
+    regression (both are real-thread-contention/real-leadership-churn
+    shapes); validated instead by 20x stress reps of `prod_liveness.rs`
+    against an md5-verified-unchanged test binary (0/20 failures with all
+    five fixes, versus 20-40% with only the first three). See the lessons
+    doc above for the fuller account and the generalized lesson: any new
+    bookkeeping feeding a defer/backoff gate needs an explicit answer to
+    "what retires this, on *every* path that can make it stale, not just
+    the happy one" — and "how long is too long" is a `env.now()` question
+    that belongs in the driver, never encoded as a message/retry count.
+
   **`state_machine_behind` + `AppendEntriesResp::needs_snapshot` (issue
   #554, ADR 0009's 2026-09-02 addendum): a follower-to-leader "I need a
   fresh `InstallSnapshot` regardless of `next_index`" signal, for a replica

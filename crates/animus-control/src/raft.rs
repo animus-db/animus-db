@@ -1150,6 +1150,23 @@ where
     /// `handle_install_snapshot_resp`'s completion branch), so checking
     /// either is equally safe to rely on once populated; checking both
     /// closes the send-to-first-ack gap the offset map alone cannot see.
+    ///
+    /// **Deliberately blind to *how long* a peer has gone un-acked (issue
+    /// #898 follow-up)** — that is a `Nanos`/`env.now()` question this pure,
+    /// `now`-unaware core cannot answer, and answering it here (e.g. a
+    /// resend-count proxy for elapsed time) was tried and rejected: it
+    /// conflated "peer is dead" with "peer's first round trip is merely
+    /// slow" (a real, correct case — `snapshot_compaction_race.rs`'s own
+    /// deliberately slow link needed ~40 heartbeat-driven resends before its
+    /// peer's first-ever ack, coincidentally right at a plausible
+    /// count-based threshold). A caller that needs to give up on a
+    /// peer that is down, partitioned, or — the scenario that motivated
+    /// this note — configured as a cluster member but never actually
+    /// started at all, has `now` and belongs at the driver layer: see
+    /// `node.rs`'s `SNAPSHOT_COMPACT_DEFER_TIME_CEILING`, a time-based
+    /// backstop layered entirely on top of this accessor's own
+    /// `behind`-sized `SNAPSHOT_COMPACT_DEFER_CEILING` escape hatch, with no
+    /// change needed here.
     pub fn snapshot_transfer_in_flight(&self) -> bool {
         !self.snapshot_offset.is_empty() || !self.snapshot_chunk_sent.is_empty()
     }
@@ -2019,6 +2036,32 @@ where
             // `is_leader`-independent inspection (e.g. tests, admin views) never
             // reports a "transfer in flight" for a node that isn't leading.
             self.transfer_target = None;
+            // Issue #898 follow-up: unlike `transfer_target` above,
+            // `snapshot_offset`/`snapshot_chunk_sent` are NOT merely inert
+            // once this node stops being leader — `snapshot_transfer_in_
+            // flight()` (read by every replica's OWN `meta_apply_and_compact`
+            // defer gate, node.rs) has no `role == Leader` guard of its own,
+            // so a sender-side entry left over from a leadership stint that
+            // ended before that specific peer's transfer ever reached
+            // `handle_install_snapshot_resp`'s completion branch (the ONLY
+            // other place these maps are cleared, short of `become_leader`
+            // and `snapshot_upto`'s base move) survives indefinitely as a
+            // FALSE "transfer in flight" — deferring this node's own local
+            // compaction forever once `behind` stops growing (no further
+            // writes), since it never reaches `SNAPSHOT_COMPACT_DEFER_
+            // CEILING` either. Confirmed live: `prod_liveness.rs`'s
+            // `large_metadata_catch_up_stays_live` deadlocking one of its two
+            // 2-node-majority replicas at a small `snapshot_index` (a first,
+            // real compaction) while `engine_applied_index` reached the full
+            // target — the classic signature of a stuck defer, not a slow
+            // apply task — on real `ProdEnv` thread contention triggering an
+            // otherwise-harmless mid-transfer leadership churn between the
+            // two. Clearing here, at the one place a `RaftCore` genuinely
+            // steps down from believing it might be leading, closes it same
+            // as `transfer_target`.
+            self.snapshot_offset.clear();
+            self.snapshot_offset_regressions.clear();
+            self.snapshot_chunk_sent.clear();
         }
         // ADR 0044 phase-1 PR3, un-quiesce trigger (a): **any** inbound Raft
         // message un-quiesces, run before dispatch so every specific handler

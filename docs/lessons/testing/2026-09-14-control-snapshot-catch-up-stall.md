@@ -49,6 +49,78 @@ own `snapshot_index()` had already moved far past it.
    accurate reading of the same underlying fact, and it benefits
    `animus-cp-data` for free since both planes share the same `RaftCore`.
 
+## Two more, found validating this fix under real `ProdEnv` contention (not covered by fixes 1-3 above)
+
+Fixes 1-3 were written and never gate-validated before landing — resuming
+this work from that checkpoint, running the full crate suite plus 20x
+`prod_liveness.rs` stress reps (per CLAUDE.md's flaky-test rule) surfaced two
+further, independent gaps in the SAME mechanism:
+
+4. **A leader's own sender-side snapshot bookkeeping (`snapshot_offset`/
+   `snapshot_chunk_sent`) survived losing leadership.** `RaftCore`'s generic
+   higher-term step-down (`handle`, the one place that already cleared a
+   stale `transfer_target` "so a future `is_leader`-independent inspection
+   never reports a transfer in flight for a node that isn't leading") never
+   cleared these two maps the identical way. Unlike `transfer_target`,
+   `snapshot_transfer_in_flight()` (what the fix-1 defer gate reads) has no
+   `role == Leader` guard of its own — so a sender-side entry left over from
+   a brief, real leadership stint (ordinary `ProdEnv` election churn under
+   contention, not a bug in itself) persisted into this node's NEXT life as
+   a follower and made its own local compaction defer forever on behalf of a
+   transfer that no longer has a sender. Confirmed live: `large_metadata_
+   catch_up_stays_live` failing ~20-40% of stress runs with one 2-node
+   majority replica pinned at a small `snapshot_index` while its
+   `engine_applied_index` had fully caught up — the classic "stuck defer"
+   signature, not a slow apply task. Fixed by clearing all three snapshot
+   maps at that same step-down site, mirroring `transfer_target`'s own
+   precedent exactly.
+
+5. **Even with fix 4, a peer that never acks at all can still wedge
+   compaction forever** — the scenario that matters in production, not just
+   this test: a down/partitioned replica, or (what this test deliberately
+   does) a configured cluster member that simply hasn't started yet.
+   `SNAPSHOT_COMPACT_DEFER_CEILING`'s escape hatch is sized in `behind`
+   (bytes/commands applied past the snapshot base), which requires **more
+   writes** to ever cross — once a burst of writes stops, `behind` stops
+   growing, and a peer that will never ack holds the defer open
+   indefinitely for a transfer that no longer has anyone to protect. A
+   resend-COUNT-based attempt at a fix (treat `SNAPSHOT_TRANSFER_STALE_
+   RESENDS` consecutive un-acked heartbeat resends to one peer as "give up
+   deferring for it") was tried and **rejected**: `snapshot_compaction_
+   race.rs`'s own deliberately-slow link needed ~40 heartbeat-driven resends
+   before its peer's first-EVER ack — a real, correct, merely-slow
+   transfer — landing right at a plausible-looking count threshold and
+   reopening the original invalidation race for a transfer that was actually
+   fine. The count is a proxy for elapsed time, and it's a bad one: it scales
+   with `heartbeat_interval`, not with anything about how slow a genuinely
+   live peer might legitimately be. Fixed instead with a **time-based**
+   companion ceiling — `SNAPSHOT_COMPACT_DEFER_TIME_CEILING` (10s), tracked
+   as a plain `Option<Nanos>` owned by the apply-loop driver itself (`env.
+   now()`-stamped when a genuine defer streak starts, cleared the moment
+   compaction proceeds or nothing needs deferring) — matching this
+   codebase's own established idiom for every other liveness/staleness
+   window (`DETECT_TIMEOUT`, `CONTROL_PEER_LIVENESS_TIMEOUT`,
+   `COMPACT_IDLE_STALL`: all `Duration`s read against `env.now()`, never a
+   retry count standing in for one) instead of inventing a new one.
+   `RaftCore::snapshot_transfer_in_flight()` itself needed **no change** for
+   this fix — it stays a pure, `now`-unaware fact exactly as its own doc
+   already argued it should, and the time-awareness lives entirely in the
+   driver that already has `env.now()` in hand.
+
+**The generalizable lesson underneath both**: this whole class of bug
+(fixes 1, 4, 5 alike) is the same shape wearing different clothes — some
+piece of leader-only bookkeeping outlives the condition that justified
+creating it (an active send, an active leadership stint, an active peer),
+and nothing yet reads *how long* it's been stale before treating it as
+still meaningful. Any time new bookkeeping is added to feed a defer/backoff
+gate, ask explicitly: what retires this entry, and is retirement
+guaranteed to happen on every path that could make it meaningless (not just
+the "happy path" completion)? A pure, `now`-unaware core is the right
+place for the *fact* (is a chunk outstanding); it is the *wrong* place to
+decide how long is too long — that answer needs `env.now()`, which only the
+driver layer has, and belongs there even when it takes an extra parameter
+threaded through a driver-owned loop to get it there.
+
 ## The lesson that generalizes: fixing a race can unmask a second, previously-masked one
 
 Landing fixes 1+2 above made a **pre-existing, previously-green** fixed-seed
@@ -89,19 +161,34 @@ seeing it many times in a row with zero intervening forward progress is.
 ## Where the mechanism lives
 
 - `crates/animus-control/src/node.rs`: `SNAPSHOT_COMPACT_DEFER_CEILING` +
-  the defer gate in `meta_apply_and_compact` (fix 1).
+  the defer gate in `meta_apply_and_compact` (fix 1);
+  `SNAPSHOT_COMPACT_DEFER_TIME_CEILING` + the `compact_defer_since:
+  Option<Nanos>` local (owned by `meta_apply_loop`, threaded through
+  `meta_apply_and_compact`'s own signature) that tracks how long a defer
+  streak has run (fix 5).
 - `crates/animus-control/src/raft.rs`: `RaftCore::snapshot_transfer_in_flight`
   widened to check `snapshot_chunk_sent` too (fix 2); `become_leader` now
   clears `snapshot_chunk_sent` alongside `snapshot_offset` for the same
   reason it always cleared the latter; `snapshot_offset_regressions` +
   `SNAPSHOT_OFFSET_REGRESSION_REBASE` in `handle_install_snapshot_resp` (fix
-  3, the unmasked-bug fix).
+  3, the unmasked-bug fix); the generic higher-term step-down in `handle`
+  now clears `snapshot_offset`/`snapshot_offset_regressions`/
+  `snapshot_chunk_sent` alongside `transfer_target` (fix 4).
 - `crates/animus-control/tests/snapshot_compaction_race.rs`: the new
   deterministic `SimEnv` regression for fixes 1+2 (an artificially slow
   leader<->follower link stands in for `ProdEnv`'s real contention, since
   `SimEnv`'s own near-zero default latency lets a small synthetic transfer
-  outrun even a bursty churn schedule and never exposes the race).
+  outrun even a bursty churn schedule and never exposes the race). This same
+  test is also what caught fix 5's own first (rejected) resend-count attempt
+  reopening the original race — see its own module doc.
 - `crates/animus-control/tests/control_corpus.rs`'s pre-existing
   `chunked_snapshot_receiver_stop_restart_3` is what caught fix 3's own
   necessity — no new test was needed for it beyond making that one pass
   again.
+- Fixes 4 and 5 have no dedicated `SimEnv` regression (both are `ProdEnv`
+  real-thread-contention/real-leadership-churn shapes — see `prod_liveness.
+  rs`'s own module doc for why this class of property needs a real-thread
+  integration guard rather than a virtual-clock one): validated by 20x
+  stress reps of `prod_liveness.rs::large_metadata_catch_up_stays_live`
+  against an md5-verified-unchanged binary (0 failures after fixes 4+5,
+  versus a 20-40% failure rate with fix 1-3 alone).

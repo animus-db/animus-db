@@ -47,6 +47,21 @@
 //! link stands in for `ProdEnv`'s real contention, widening the send-to-ack
 //! window enough for a small, bounded churn burst to land inside it), and
 //! passes with both fixes in place.
+//!
+//! **This same seed later caught a rejected fix to a THIRD, separate gap**
+//! (issue #898 follow-up, `node.rs`'s `SNAPSHOT_COMPACT_DEFER_TIME_CEILING`):
+//! an early attempt gated `snapshot_transfer_in_flight` on a per-peer
+//! heartbeat-resend COUNT (give up deferring for a peer once its un-acked
+//! resend count crossed a threshold), meant to stop a never-acking peer from
+//! wedging compaction forever. This test's own deliberately-slow link needed
+//! ~40 heartbeat-driven resends before its peer's first-EVER ack — a real,
+//! healthy, merely-slow transfer — landing right at the chosen threshold and
+//! reopening the exact stall fixes 1+2 above close. The shipped fix instead
+//! bounds elapsed **time** (`env.now()`, tracked by the apply-loop driver,
+//! not `RaftCore` itself), leaving `snapshot_transfer_in_flight` unchanged;
+//! see `SNAPSHOT_COMPACT_DEFER_TIME_CEILING`'s own doc and `docs/lessons/
+//! testing/2026-09-14-control-snapshot-catch-up-stall.md` for the full
+//! account of why a resend count is the wrong proxy for elapsed time.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
