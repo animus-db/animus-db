@@ -1440,22 +1440,45 @@ fn export_with_bucket_faults_converges_or_fails_cleanly() {
 // write is not. See ADR 0068's as-built amendment and
 // `docs/engineering-lessons.md`'s matching entry. --------------------------
 
-/// Pins the exact seed the nightly corpus (`ANIMUS_EXPORT_IMPORT_SEEDS=40`)
-/// caught in issue #707: `export_with_bucket_faults_converges_or_fails_
-/// cleanly`'s own variant 25 (`corpus::odd_name_seed(
-/// "export_with_bucket_faults_converges_or_fails_cleanly_s25")` ==
-/// `12_365_148_609_929_809_193`). At this seed every interior fault draw
-/// misses, but the fault fires on the terminal `manifest-summary.json`
-/// put: the object lands in the store and `put` still returns the injected
-/// ack-lost error. Before the fix this propagated straight to
-/// `FailExport` — a `Failed` row with the marker physically present, a
-/// torn `COMPLETED` ADR 0068 says never happens — because the generic
-/// `export_with_bucket_faults_converges_or_fails_cleanly` cell above
-/// accepts either outcome as valid at every seed and so cannot catch a
-/// wrong outcome at one specific seed on its own. This test pins the one
-/// known-bad seed and demands the only outcome the fix allows: `Completed`,
-/// with the marker actually present and byte-identical to what the job
-/// wrote.
+/// Originally pinned the exact seed the nightly corpus
+/// (`ANIMUS_EXPORT_IMPORT_SEEDS=40`) caught in issue #707:
+/// `export_with_bucket_faults_converges_or_fails_cleanly`'s own variant 25
+/// (`corpus::odd_name_seed("export_with_bucket_faults_converges_or_fails_
+/// cleanly_s25")` == `12_365_148_609_929_809_193`), relying on the seed's
+/// own probabilistic `SegmentFaultConfig::set_put_ack_lost_prob` draws to
+/// happen to land the fault specifically on the terminal
+/// `manifest-summary.json` put (every interior fault draw missing, the
+/// terminal one hitting) — the object lands in the store and `put` still
+/// returns the injected ack-lost error. Before the original fix this
+/// propagated straight to `FailExport` — a `Failed` row with the marker
+/// physically present, a torn `COMPLETED` ADR 0068 says never happens —
+/// because the generic `export_with_bucket_faults_converges_or_fails_
+/// cleanly` cell above accepts either outcome as valid at every seed and so
+/// cannot catch a wrong outcome at one specific seed on its own.
+///
+/// **Issue #900 follow-up: the probabilistic pin rotted silently.** Wiring
+/// issue #667's boot-time cluster check into `animus-cp-data`'s own
+/// tablet-group driver (`start_group` above mints a fresh one) draws extra
+/// entropy at boot, reshuffling this seed's later draws — at the same
+/// `SEED`, the ack-lost fault now lands on the *interior* `manifest-
+/// files.json` put instead (`Err("writing manifest-files.json: ...")`,
+/// confirmed by direct reproduction), which the pipeline correctly treats
+/// as a genuine failure (ADR 0068 §9 residual #3: no special-cased
+/// readback recovery before the terminal write) — this test's own
+/// assertion then failed on a scenario it was never meant to exercise, not
+/// on a real regression in the terminal-write recovery mechanism the test
+/// exists to pin.
+///
+/// **Fixed by pinning the fault to the object, not to a seed's own
+/// probabilistic draw at all**: [`SimSegmentStore::force_next_put_ack_lost_
+/// for`] deterministically (no RNG draw) forces the ack-lost fault onto the
+/// next `put` whose id ends with `"manifest-summary.json"` — the terminal
+/// write, by name, every run, regardless of how any other entropy in the
+/// scenario shifts in the future. This is what "assert the shape it pins"
+/// means here: the fault's *target* is now asserted by construction (it
+/// can only ever land on the terminal object), not merely hoped for via a
+/// seed's own probability roll — this pin cannot rot silently again the
+/// way the probabilistic one just did.
 #[test]
 fn export_bucket_fault_on_terminal_write_resolves_to_completed_pinned_seed() {
     const SEED: u64 = 12_365_148_609_929_809_193;
@@ -1474,9 +1497,11 @@ fn export_bucket_fault_on_terminal_write_resolves_to_completed_pinned_seed() {
     }
 
     let store = SimSegmentStore::new(sim.env(nid(NODES[0])));
-    let mut fault = SegmentFaultConfig::default();
-    fault.set_put_ack_lost_prob(0.35);
-    store.set_fault_config(fault);
+    // Deterministic, by-name fault targeting (issue #900 follow-up, see
+    // this test's own doc above) — no probabilistic `SegmentFaultConfig`
+    // needed at all: the terminal write is the ONLY write this run can
+    // ever fault.
+    store.force_next_put_ack_lost_for("manifest-summary.json");
 
     let mut meta = base_meta();
     let export_id = dynamo_wire::export_arn(SRC_TABLE, "e0000000000003");
