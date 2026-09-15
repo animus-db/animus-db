@@ -278,8 +278,8 @@ fn the_change_log_key_is_the_entrys_own_commit_timestamp() {
         "commit timestamps must increase (seed={seed})"
     );
     assert!(
-        suffixes.iter().all(|s| s.len() == 8),
-        "each suffix is a packed 8-byte HLC (seed={seed})"
+        suffixes.iter().all(|s| s.len() == 12),
+        "each suffix is a packed 8-byte HLC + a 4-byte ordinal (issue #852, seed={seed})"
     );
 }
 

@@ -817,25 +817,31 @@ pub enum KvCommand {
         /// **Change-log records** to append in the same entry, each a
         /// `(key prefix, encoded record)` pair (empty = none).
         ///
-        /// Each key is completed at **apply** as `prefix || hlc::pack(ts)`, using
-        /// this entry's own commit timestamp, and it lands in the
-        /// [`KIND_CHANGE`] scope. The proposer deliberately cannot supply that
-        /// suffix: `ts` is minted inside `propose_ordered` and is the only
-        /// timestamp that agrees with the entry's commit order, so letting an
-        /// edge guess it would silently break the ordering the log exists to
-        /// provide (ADR 0041 §4a — DynamoDB Streams reads these in commit
-        /// order). Making it structural also means the record can never be
-        /// keyed inconsistently across replicas. **A `Vec`, not an `Option`,
-        /// since ADR 0049's Train A rung-1 fixup**: a marker-table
+        /// Each key is completed at **apply** as `prefix || hlc::pack(ts) ||
+        /// ordinal` (issue #852), using this entry's own commit timestamp,
+        /// and it lands in the [`KIND_CHANGE`] scope. The proposer
+        /// deliberately cannot supply the `ts` half of that suffix: `ts` is
+        /// minted inside `propose_ordered` and is the only timestamp that
+        /// agrees with the entry's commit order, so letting an edge guess it
+        /// would silently break the ordering the log exists to provide (ADR
+        /// 0041 §4a — DynamoDB Streams reads these in commit order). Making
+        /// it structural also means the record can never be keyed
+        /// inconsistently across replicas. **A `Vec`, not an `Option`, since
+        /// ADR 0049's Train A rung-1 fixup**: a marker-table
         /// `BatchWriteItem` commits one entry per tablet carrying every
         /// item's base row *and* every item's marker record — the
         /// entry-granularity throughput contract the plain `Batch` path had
         /// (one entry per tablet, one WAL record, one apply), which per-item
         /// `KindBatch` proposals were measured to break (the
         /// `backfill_seeder` populate-then-backfill regression). Records in
-        /// one entry share the entry's `ts`; their prefixes differ per item
-        /// (`token || escape(pk)`), so the completed keys stay distinct for
-        /// distinct items.
+        /// one entry share the entry's `ts`, and their per-item prefixes
+        /// (`token || escape(pk)`) are **not** guaranteed distinct either —
+        /// two items sharing a partition key (differing only by sort key)
+        /// share the identical prefix too, a collision issue #852 also
+        /// found and fixed by the same mechanism: `ordinal`
+        /// (`materialize_derived`'s own zero-based index into this list) is
+        /// what keeps every completed key unique, regardless of whether the
+        /// tie is only in `ts` or in the whole prefix as well.
         change_log: Vec<(Vec<u8>, Vec<u8>)>,
         ts: HlcTimestamp,
     },
@@ -6733,8 +6739,9 @@ fn assert_ts_monotonic(max_applied_ts: &mut Option<HlcTimestamp>, ts: HlcTimesta
 /// `KvCommand::TxnResolve`'s commit branch both call this and only this,
 /// so their output is byte-identical for identical payloads. Queues every
 /// `(kind, key, value)` write (`None` = tombstone) into `pending` at
-/// `hlc::pack(ts)`, then — if `change_log` is present — completes its key as
-/// `prefix || hlc::pack(ts)` and queues it too, in [`KIND_CHANGE`]'s scope.
+/// `hlc::pack(ts)`, then — if `change_log` is present — completes each
+/// record's key as `prefix || hlc::pack(ts) || ordinal` (issue #852) and
+/// queues it too, in [`KIND_CHANGE`]'s scope.
 /// `ts` is always the caller's OWN entry's commit timestamp: `KindBatch`
 /// passes its own entry's `ts`; `TxnResolve` passes the *resolve* entry's
 /// `ts` (never the transaction's `commit_ts`, and never the stage's `ts` —
@@ -6743,6 +6750,24 @@ fn assert_ts_monotonic(max_applied_ts: &mut Option<HlcTimestamp>, ts: HlcTimesta
 /// position in this tablet's own commit order). An unknown row kind is
 /// skipped with a warning, never guessed at — the same discipline
 /// `KindBatch`'s own arm already had before this extraction.
+///
+/// **`ordinal` (issue #852 fix).** `ts` alone is not a unique key for a
+/// change-log record: every record this one call completes shares the
+/// identical `ts` (a multi-key `TransactWriteItems` commit resolves several
+/// keys in one `TxnResolve` entry, one change record each; a marker-table
+/// `KindBatch` can likewise carry several). A `GetRecords`/`GetShardIterator`
+/// page boundary landing inside that tie used to be indistinguishable from
+/// "already delivered," permanently dropping every record still on the far
+/// side of it. The fix widens the record's own key/cursor to `(packed_hlc,
+/// ordinal)`: `ordinal` is `change_log`'s own zero-based index in this call
+/// — deterministic and coordination-free, since every replica applies the
+/// identical `change_log` list in the identical order for the identical
+/// entry. It is appended to the completed key immediately after the packed
+/// HLC (`prefix || hlc::pack(ts) || ordinal`, big-endian, 4 bytes) — the
+/// physical key stays the one true source of a record's own position, so a
+/// sealed-segment read and a hot-tail scan agree by construction. See
+/// `animus_cp_data::segment`'s own module doc for the full design and
+/// `animusd::index_drain`/`animusd::dynamo_streams` for the reader side.
 fn materialize_derived(
     kind_scopes: &[StorageScope; ALL_KINDS.len()],
     writes: &[KindWrite],
@@ -6770,12 +6795,21 @@ fn materialize_derived(
     }
     // Each change-log record's key is completed here, with THIS caller's
     // commit timestamp — the only one that agrees with this entry's
-    // position in the log (ADR 0041 §4a / ADR 0046 principle 1). Several
-    // records in one entry (a marker-table batch) share the ts; their
-    // per-item prefixes keep the completed keys distinct.
-    for (prefix, record) in change_log {
+    // position in the log (ADR 0041 §4a / ADR 0046 principle 1) — plus this
+    // record's own zero-based `ordinal` within `change_log` (issue #852):
+    // several records in one entry (a multi-key `TransactWriteItems`
+    // resolve, or a marker-table batch) share the ts, and their per-item
+    // prefixes are NOT guaranteed distinct either (two items sharing a
+    // partition key differ only by sort key, which the change-log prefix
+    // does not carry) — `ordinal` is what keeps every completed key unique
+    // regardless, closing that collision too.
+    for (ordinal, (prefix, record)) in change_log.iter().enumerate() {
+        let ordinal = u32::try_from(ordinal).expect(
+            "materialize_derived: a single entry's change_log carries far fewer than 2^32 records",
+        );
         let mut key = prefix.clone();
         key.extend_from_slice(&hlc::pack(ts).to_be_bytes());
+        key.extend_from_slice(&ordinal.to_be_bytes());
         pending.push(MergeOp::put(
             kind_scopes[KIND_CHANGE as usize].physical(&key),
             txn::encode_committed(record),
