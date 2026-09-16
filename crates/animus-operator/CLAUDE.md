@@ -472,7 +472,27 @@ Either shape resolves to the same `Secret` name
 
 - `desired::certificate::build` creates a `Certificate` (a sixth
   `apply_children` child, applied only for the `certManager` shape) whose
-  SAN list (`dns_names`) covers every pod's own FQDN plus both Services.
+  SAN list (`dns_names`) covers the headless internal `Service`'s own name
+  plus both Services. **Since issue #913, `dns_names` takes no node count
+  at all** — it used to enumerate one FQDN per pod ordinal
+  (`(0..spec.nodes).map(pod_fqdn)`), which meant every `spec.nodes`
+  scale-up changed the `Certificate.spec` and triggered cert-manager to
+  reissue the one leaf every pod mounts identically (below); a pod
+  recreated mid-reissue (a `spec.controlNodes` growth's own config-hash
+  roll, which restarts every pod, not just the newly-promoted ordinal) got
+  the *other* side of that reissue than its still-running peers, and
+  `animusd` never reloads TLS material after boot (ADR 0064 Decision 6),
+  so they never agreed on a trust anchor again —
+  `AlertReceived(BadCertificate)`, permanently. Now `dns_names` returns two
+  **wildcard** SANs (`*.<internal-svc>.<ns>.svc` and the `.cluster.local`
+  form) instead of the per-ordinal list: a headless `Service`'s pod DNS
+  name is always exactly one label before the service name, so a
+  single-label wildcard covers every ordinal a cluster will ever have,
+  and a scale-up never touches the `Certificate` again. See ADR 0064's
+  issue #913 amendment for the full mechanism and the matching
+  `scripts/e2e-kind.sh` CA-hierarchy fix (a bare `selfSigned`
+  `ClusterIssuer` must never be the direct `issuerRef` for a multi-pod
+  mTLS deployment — see this file's e2e section below).
 - `desired::statefulset::build` mounts the resolved `Secret` read-only at
   `/etc/animus/tls` on every pod — identical mount for either shape.
 - **2026-09-05**: `desired::statefulset::build` also switches the
@@ -509,12 +529,28 @@ Either shape resolves to the same `Secret` name
 **`scripts/e2e-kind.sh --tls` path (`E2E_TLS=1`) is UNVERIFIED in this
 sandbox** — `kind` cannot come up here at all (see the e2e section's own
 `CAP_SYS_RESOURCE` note), so the TLS-specific script additions (cert-manager
-install, a self-signed `ClusterIssuer`, `spec.tls.certManager` on the
+install, a self-signed CA hierarchy, `spec.tls.certManager` on the
 manifest, waiting on the `Certificate`'s own `Ready` condition, and
 `curl --cacert --resolve` against the dynamo Service's own SAN) have been
-written carefully and `bash -n`-checked, but never run end to end. Treat a
-first real CI failure on the `e2e-kind-tls` job as this path finding its
-first real bug, not as this note being wrong.
+written carefully and `bash -n`-checked (plus, for every heredoc touched,
+rendered with its variables set and parsed as YAML — a comment with a
+backtick inside an unquoted heredoc executes as shell, not YAML), but
+never run end to end. Treat a first real CI failure on the `e2e-kind-tls`
+job as this path finding its first real bug, not as this note being wrong.
+
+**Since issue #913, the e2e's own `ClusterIssuer` is a two-step CA
+hierarchy, not a bare `selfSigned` one.** A bootstrap `selfSigned: {}`
+`ClusterIssuer` mints exactly one CA `Certificate` (`isCA: true`), once; a
+second `ClusterIssuer` (`spec.ca.secretName`) signs the cluster's actual
+leaf off that CA's key, and only *that* issuer is ever named in the
+`AnimusCluster`'s own `spec.tls.certManager.issuerRef`. This is not
+e2e-specific advice: handing a bare `selfSigned` issuer directly to a
+multi-pod mTLS `issuerRef` means every reissuance is a brand-new,
+mutually-untrusted root (cert-manager's self-signed output Secret sets
+`ca.crt` equal to the leaf itself), whereas a `ca`-backed issuer's output
+Secret sets `ca.crt` to the stable signing CA's own certificate —
+unaffected by a leaf renewal. `deploy/operator/README.md`'s TLS section
+carries the same guidance for real deployments.
 
 ## S3 (S-04 PR 3, closes `docs/roadmap.md`'s S-04)
 
@@ -1318,20 +1354,24 @@ run immediately, on the first attempt, unchanged. See the script's own
 header comment for the two failing run links and the full reasoning.
 
 **`E2E_TLS=1` (ADR 0064 commit 3, CI's own `e2e-kind-tls` job) runs the same
-smoke over TLS**: installs cert-manager (pinned version), creates a
-self-signed `ClusterIssuer`, sets `spec.tls.certManager` on the
-`AnimusCluster` manifest, waits for the resulting `Certificate`'s own
-`Ready` condition, then drives the DynamoDB wire with `curl --cacert
---resolve` (the dynamo Service's cluster-DNS name — one of the
-`Certificate`'s own SANs, `desired::certificate::dns_names` — resolved to
-the port-forward's `127.0.0.1`, so hostname verification passes against the
-issued cert) instead of plain HTTP; the plain-TCP path (`E2E_TLS` unset) is
-byte-for-byte unchanged. **UNVERIFIED in this repository's sandboxed dev
-environment** — this environment cannot bring up `kind` at all (see this
-section's own `CAP_SYS_RESOURCE` note below), so the TLS additions have
-been written carefully and `bash -n`-checked but have not been run end to
-end anywhere; the first real `e2e-kind-tls` CI run is this path's first
-real test.
+smoke over TLS**: installs cert-manager (pinned version), then (since issue
+#913) a bootstrap self-signed `ClusterIssuer` that mints one CA
+`Certificate`, followed by a second, `ca`-backed `ClusterIssuer` signing
+off that CA — never a bare `selfSigned` issuer named directly in
+`spec.tls.certManager.issuerRef` (see the TLS section above for why). Sets
+`spec.tls.certManager` on the `AnimusCluster` manifest, waits for the
+resulting `Certificate`'s own `Ready` condition, then drives the DynamoDB
+wire with `curl --cacert --resolve` (the dynamo Service's cluster-DNS name
+— one of the `Certificate`'s own SANs, `desired::certificate::dns_names` —
+resolved to the port-forward's `127.0.0.1`, so hostname verification passes
+against the issued cert) instead of plain HTTP; the plain-TCP path
+(`E2E_TLS` unset) is byte-for-byte unchanged. **UNVERIFIED in this
+repository's sandboxed dev environment** — this environment cannot bring up
+`kind` at all (see this section's own `CAP_SYS_RESOURCE` note below), so
+the TLS additions have been written carefully, `bash -n`-checked, and (for
+the heredocs) rendered-and-YAML-parsed, but have not been run end to end
+anywhere; the first real `e2e-kind-tls` CI run is this path's first real
+test.
 
 **`E2E_S3=1` (S-04 PR 3, CI's own `e2e-kind-s3` job) runs the same smoke
 plus a `spec.s3.backupStore` leg**: deploys a single-pod RustFS + Service
