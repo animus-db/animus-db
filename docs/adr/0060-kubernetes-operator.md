@@ -1629,3 +1629,59 @@ self-signed-CA-then-CA-issuer hierarchy for `scripts/e2e-kind.sh`'s own
 per this file's standing convention (`spec.tls`'s design lives in ADR
 0064; this ADR only cross-references it). `crates/animus-operator/
 CLAUDE.md` carries the crate-local detail.
+
+### Part F (2026-09-16, continued) — a plain, non-TLS `e2e-kind` run: growth worked, the rollout-completion wait still timed out on a *different* recreated voter never becoming Ready
+
+A further real run (plain `e2e-kind`, run 35040977782, job 104620543550,
+on the #913 fix's own head) hit the same `kubectl rollout status`
+timeout — no `BadCertificate` anywhere (this leg carries no TLS at all),
+and the operator's own log this time showed growth working exactly as
+intended: "pod ordinal 3 has not yet restarted into role combined" at
+`:19`, then at `:29` a refused-or-unreachable add attempt against
+`e2e-0` and `e2e-1` followed by "control voter add accepted" via `e2e-2`
+— the exact "try every already-confirmed voter" retry Part A hardened —
+converging in 10s. The growth target (pod 3) ended the run at `/admin/health`
+`200`, `role: Leader`, `term: 3`, `commit_index: 41`, every voter
+present. **The stuck pod was a *different*, pre-existing, already-durable
+voter** (`e2e-1` in this run) — recreated by the same config-hash roll
+(highest-ordinal-first, one at a time: 3, then 2, then 1 — `kubectl
+describe pods` showed each one's own `Start Time` in that exact order)
+and never becoming Kubernetes-Ready, which is why the rollout-status
+wait (blocking on ordinal 1's readiness before the controller will even
+touch ordinal 0) never completed.
+
+**Hypothesis checked: the "durable" PVC mount isn't actually where
+`animusd` reads/writes**, so a recreated voter boots against empty
+storage exactly like the ephemeral case Part B fixed, despite durable
+storage being configured. **Refuted by direct code inspection**: the
+"data" `VolumeMount`'s own `mount_path` (`desired::statefulset::build`)
+and the `--dir` flag `entrypoint_script` execs `animusd` with
+(`desired::cluster_config`) are both generated from the exact same
+`cluster_config::DATA_DIR` constant (`"/var/lib/animus"`, matching the
+e2e's own `DATA_MOUNT_DIR`) — never two independently-hardcoded strings
+that could drift apart. `kubectl describe pods` for the stuck pod in
+this run's own diagnostics confirms the PVC (`data-e2e-1`) is mounted at
+that exact path, and the `PersistentVolumeClaimRetentionPolicy` (`When
+Deleted: Retain, WhenScaled: Retain`) means the same PVC — not a fresh
+one — reattaches across the pod's own delete/recreate. Pinned with a new
+test, `data_volume_mount_path_matches_the_animusd_dir_flag`
+(`desired/statefulset.rs`), so this specific hypothesis can't silently
+regress even though it wasn't the cause here.
+
+**What actually happened to the stuck voter is not yet known** — this
+run's diagnostics only dumped the growth *target*'s own `/admin/health`/
+`/admin/raft` (`dump_growth_target_admin_state`, now renamed and widened
+to `dump_every_pod_admin_state`, looping over every ordinal
+`0..replicas-1`), so there is no `/admin/raft` view of the actually-stuck
+pod (its role, term, `commit_index`, `cluster_check_pending`,
+`refused_as_voter`) to read. `RaftNode::drive`'s own boot path
+(`node.rs`) only ever calls `RaftCore::begin_cluster_check` when its WAL
+replay finds genuinely **empty** state (`state.is_empty()`) — a
+pre-existing voter with an intact, durable WAL should recover normally
+through `RaftCore::recovered` and skip the cluster-check branch
+entirely, so the "self-inclusive genesis-style config with non-empty
+state" framing this investigation started from does not, on its own,
+match what the code does on that boundary. This needs the next
+recurrence's own per-pod `/admin/raft` dump (now captured) before
+proposing a fix in `animus-control`/`animusd` — no change was made to
+either in this round.

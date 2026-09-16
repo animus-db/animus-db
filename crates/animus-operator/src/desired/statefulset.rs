@@ -723,6 +723,40 @@ mod tests {
         assert_eq!(mount.read_only, Some(true));
     }
 
+    /// Issue #864 (a real, PVC-backed voter recreated by the S-07d growth
+    /// roll never became Ready — one hypothesis checked was that the data
+    /// directory `animusd` actually reads/writes isn't the same path this
+    /// builder mounts the PVC at, so a recreated pod would silently boot
+    /// against empty storage despite durable storage being configured).
+    /// **Refuted, and pinned here so it stays refuted**: the "data"
+    /// `VolumeMount`'s own `mount_path` (this builder) and the `--dir` flag
+    /// `entrypoint_script` execs `animusd` with (`cluster_config.rs`) are
+    /// both generated from the exact same `cluster_config::DATA_DIR`
+    /// constant — never two independently-hardcoded strings that could
+    /// drift — so a real mount/dir mismatch would have to come from an
+    /// explicit future edit to one side only, not a silent regression in
+    /// either builder alone. See ADR 0060's matching 2026-09-16 amendment.
+    #[test]
+    fn data_volume_mount_path_matches_the_animusd_dir_flag() {
+        let cluster = test_cluster("c", "ns", 3, None);
+        let sts = build(&cluster, &cluster.spec);
+        let c = container(&sts);
+        let mount = c
+            .volume_mounts
+            .unwrap()
+            .into_iter()
+            .find(|m| m.name == "data")
+            .expect("a \"data\" VolumeMount is always present");
+        assert_eq!(mount.mount_path, DATA_DIR);
+
+        let script = cluster_config::entrypoint_script(&cluster.spec);
+        assert!(
+            script.contains(&format!("--dir {DATA_DIR}")),
+            "entrypoint_script must exec animusd with the identical --dir the \"data\" \
+             VolumeMount is mounted at: {script}"
+        );
+    }
+
     #[test]
     fn dynamo_auth_secret_mounted_when_named() {
         let mut cluster = test_cluster("c", "ns", 3, None);

@@ -547,6 +547,22 @@ not a missing- or lost-log bug. `scripts/e2e-kind.sh`'s diagnostics now
 print the log's own line count and the operator process's own liveness
 before a much wider `tail`, so this doesn't need re-deriving next time.
 
+**A plain (non-TLS) `e2e-kind` run hit the identical `rollout status`
+timeout with growth working perfectly (ADR 0060's Part F)** — the stuck
+pod was a *different*, already-durable, pre-existing voter recreated by
+the same config-hash roll, never becoming Ready. Checked and refuted:
+the "durable" PVC mount not actually being where `animusd` reads/writes
+— the "data" `VolumeMount`'s `mount_path` and the `--dir` flag
+`entrypoint_script` execs `animusd` with are both generated from the
+same `cluster_config::DATA_DIR` constant, pinned by
+`data_volume_mount_path_matches_the_animusd_dir_flag`
+(`desired/statefulset.rs`). What's still open: *why* that recreated
+voter never became Ready is unknown — the e2e's own diagnostics used to
+dump only the growth target's own `/admin/raft`, never the pod that was
+actually stuck; `dump_growth_target_admin_state` is now
+`dump_every_pod_admin_state`, looping over every ordinal
+`0..replicas-1`, so the next recurrence's own diagnostics will show it.
+
 ## TLS (ADR 0064 commit 3)
 
 `AnimusClusterSpec.tls: Option<TlsSpec>` (`crd.rs`), two mutually exclusive
