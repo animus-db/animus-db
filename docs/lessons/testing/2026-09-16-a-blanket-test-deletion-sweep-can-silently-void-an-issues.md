@@ -9,8 +9,8 @@ copy-based split workflow "cannot ship until #298 is either fixed or this
 soak's own budget is deliberately re-tuned." That bar was never met: the
 last recorded attempt (ADR 0018's 2026-08-29 amendment) explicitly says "no
 fresh 30-run un-pinned soak was run this round... only that soak can move
-the pin." The maintainer nonetheless accepted proceeding with the deletion
-as a "G5 gate pass" (ADR 0058, 2026-09-01), whose Layer A was "delete every
+the pin." The deletion nonetheless shipped as a G5 gate pass (ADR 0058's
+2026-09-01 note), and its Layer A was "delete every
 copy-split-pinned test" — and the soak, being pinned to `Copy`, was swept
 away by that blanket deletion along with it. The result: by the time this
 issue was picked up again, the one test that could prove or disprove its
