@@ -14,7 +14,10 @@
   allocator this ADR's "Coordination with ADR 0036" section wired into; and
   the `believes_alive` raftkv/control id-space mismatch this ADR's own
   quorum-guard work had to route around (below, "Non-goals") is now
-  structurally resolved — see the amendment section below.
+  structurally resolved — see the amendment section below. **Amended
+  2026-09-16 (issue #923):** the quorum guard's own liveness signal had a
+  post-election gap (a fresh leader's seeded-but-never-acked peer aged into
+  a false "dead" verdict too quickly) — see "Amended 2026-09-16" below.
 - **Date:** 2026-08-10
 
 ## Context
@@ -271,6 +274,58 @@ places:
   reachability) than id-space unification alone would, so ADR 0040 doesn't
   make it redundant, only makes the *bridging problem* it was partly built
   to route around disappear.
+
+## Amended 2026-09-16 (issue #923)
+
+The hardening trio's PR 2 quorum guard (above, "Update: implemented by the
+ADR 0037 hardening trio's PR 2") had its own post-election gap, closed here.
+`RaftCore::peer_last_contact` is stamped genuinely from `AppendEntriesResp`
+traffic, but `become_leader` also **seeds** every peer's entry to the instant
+this leadership stint begins — a courtesy timestamp, not a genuine ack,
+there only so a peer that stays silent the entire stint can't hide behind
+the "never contacted yet" grace forever. That seed ages out after the same
+steady-state `CONTROL_PEER_LIVENESS_TIMEOUT` (500ms) a genuine ack would, with
+no wider allowance for "this leader only just took over." CI caught the
+consequence: right after a leadership transfer, `admin_remove_control_
+member`'s guard occasionally refused a removal, naming two perfectly alive
+original voters "apparently dead" — a fresh leader's first real heartbeat
+round can legitimately take longer than 500ms under the load a leadership
+change itself creates (election processing, everyone's own scheduler
+contention), and the guard had no way to tell that apart from genuine
+silence.
+
+Fixed with a second, wider, dedicated grace — `RaftCore::leader_since`
+(the `now` this leadership stint began, gated on `role == Leader` so a
+stepped-down node reads `None` with no explicit clearing needed) and
+`CONTROL_LEADER_TAKEOVER_GRACE` (`animus-control::node`, 2s — several
+multiples of `CONTROL_PEER_LIVENESS_TIMEOUT`, deliberately not equal to it,
+since an equal value is exactly what `become_leader`'s existing seed
+already provides and would not have caught this failure). `control_peer_
+believed_alive` now treats a `last_contact` that is stale by the ordinary
+timeout as still alive as long as this leadership stint itself is younger
+than the takeover grace — a genuine ack still clears a peer's own
+staleness immediately, so this extra allowance only ever matters for a
+peer this stint has heard nothing real from yet, and a voter that stays
+silent for the whole wider window is still judged dead exactly as before
+(the guard's "actual purpose" — refusing a removal that would drop quorum
+when voters are genuinely dead — is unchanged; `cluster_with_one_dead_
+follower`'s own fixture in `sim_cluster_control_membership_admin.rs` now
+settles past the takeover grace before crashing anyone precisely so it
+keeps testing that, decoupled from this new post-election allowance).
+Mirrors ADR 0012's own `LEADER_GRACE` for the **raftkv**-id `FailureDetector`
+— see that ADR's matching 2026-09-16 amendment for why the two grace
+windows are separate constants rather than one shared value, despite
+solving the identical shape of problem for the two different id-space
+liveness signals this plane runs side by side.
+
+Regression coverage: `animus-control/tests/control_membership.rs::
+control_peer_believed_alive_survives_a_leadership_transfer_with_slow_but_
+alive_peers` pins the mechanism directly at the `RaftNode` level (a real
+transfer, two peers with a genuinely degraded — never dropped — link to
+the new leader); `animusd/src/sim_cluster_control_membership_admin.rs::
+remove_right_after_leadership_transfer_is_not_refused_for_merely_slow_
+peers[_over_seeds]` pins it through the actual admin path
+(`admin_remove_control_member`) end to end.
 
 ## Non-goals
 
