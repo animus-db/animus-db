@@ -50,7 +50,6 @@ pub struct FakeClusterApi {
     secrets: Mutex<BTreeMap<String, Secret>>,
     networkpolicies: Mutex<BTreeMap<String, NetworkPolicy>>,
     poddisruptionbudgets: Mutex<BTreeMap<String, PodDisruptionBudget>>,
-    pod_ips: Mutex<BTreeMap<String, String>>,
 }
 
 impl FakeClusterApi {
@@ -141,16 +140,6 @@ impl FakeClusterApi {
     #[must_use]
     pub fn poddisruptionbudget(&self, name: &str) -> Option<PodDisruptionBudget> {
         self.poddisruptionbudgets.lock().unwrap().get(name).cloned()
-    }
-
-    /// Seed a pod's `status.podIP` (S-07d) — used to drive the control-voter
-    /// growth step's dial-address resolution (`crate::controller::
-    /// resolve_control_dial_addr`).
-    pub fn seed_pod_ip(&self, pod_name: &str, ip: &str) {
-        self.pod_ips
-            .lock()
-            .unwrap()
-            .insert(pod_name.to_string(), ip.to_string());
     }
 }
 
@@ -275,14 +264,6 @@ impl ClusterApi for FakeClusterApi {
     async fn get_secret(&self, _ns: &str, name: &str) -> Result<Option<Secret>, ReconcileError> {
         Ok(self.secrets.lock().unwrap().get(name).cloned())
     }
-
-    async fn get_pod_ip(
-        &self,
-        _ns: &str,
-        pod_name: &str,
-    ) -> Result<Option<String>, ReconcileError> {
-        Ok(self.pod_ips.lock().unwrap().get(pod_name).cloned())
-    }
 }
 
 /// An in-memory [`AdminOps`]: records every call (method + url, in call
@@ -334,6 +315,12 @@ pub struct FakeAdminClient {
     /// this reconcile" diagnosability path (every ordinal 0..target
     /// unreachable) without needing a real network partition.
     fail_control_members: Mutex<bool>,
+    /// Issue #913: every `POST .../admin/control/member/add` request body's
+    /// own `addr` field, in call order — lets a test assert on exactly what
+    /// dial address this crate sent (the promoted ordinal's stable pod FQDN,
+    /// never a live `status.podIP`) without needing a real `AddControlMemberReq`
+    /// deserialization round trip.
+    member_add_addrs: Mutex<Vec<String>>,
 }
 
 impl FakeAdminClient {
@@ -421,6 +408,13 @@ impl FakeAdminClient {
     pub fn fail_control_members(&self) {
         *self.fail_control_members.lock().unwrap() = true;
     }
+
+    /// Every `POST .../admin/control/member/add` request body's own `addr`
+    /// field seen so far, in call order (issue #913).
+    #[must_use]
+    pub fn member_add_addrs(&self) -> Vec<String> {
+        self.member_add_addrs.lock().unwrap().clone()
+    }
 }
 
 /// Pulls `{ordinal}` out of a `{name}-{ordinal}.{name}-internal....` admin
@@ -461,6 +455,9 @@ impl AdminOps for FakeAdminClient {
                 .as_str()
                 .ok_or("fake control/member/add: request body has no `node`")?
                 .to_string();
+            if let Some(addr) = body["addr"].as_str() {
+                self.member_add_addrs.lock().unwrap().push(addr.to_string());
+            }
             self.control_voters.lock().unwrap().insert(node.clone());
             return Ok(serde_json::json!({"ok": true, "node": node}));
         }
