@@ -2754,18 +2754,25 @@ impl<E: Env> Snapshot for LsmSnapshot<E> {
         self.version
     }
 
-    async fn get(&self, key: &[u8]) -> Option<VersionedValue> {
-        self.engine.read_at(key, self.version).await.ok().flatten()
+    async fn get(&self, key: &[u8]) -> Result<Option<VersionedValue>> {
+        // Propagate a genuine backing-store failure (corrupt block, injected
+        // disk error, exhausted compaction-race retry) instead of folding it
+        // into `Ok(None)` — see issue #845 and the crate doc's MVCC section.
+        self.engine.read_at(key, self.version).await
     }
 
-    async fn scan(&self, start: &[u8], end: &[u8]) -> Vec<(Key, VersionedValue)> {
+    async fn scan(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Key, VersionedValue)>> {
         if start > end {
-            return Vec::new();
+            // Matches `StorageEngine::scan`'s own contract. This guard is
+            // load-bearing, not just a fast path: `self.engine.scan_at(..)`
+            // below resolves to the private *inherent* `scan_at` (inherent
+            // methods shadow the trait method of the same name), which skips
+            // the trait-level `scan`/`scan_at`'s own `start > end` check and
+            // builds a `BTreeMap::range` directly — an inverted range there
+            // panics rather than erroring.
+            return Err(StorageError::InvalidRange);
         }
-        self.engine
-            .scan_at(start, end, self.version)
-            .await
-            .unwrap_or_default()
+        self.engine.scan_at(start, end, self.version).await
     }
 }
 

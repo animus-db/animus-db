@@ -103,7 +103,7 @@ proptest! {
         // The snapshot still reflects exactly the reference (pre-snapshot) state.
         for (k, v) in &reference {
             prop_assert_eq!(
-                block_on(snap.get(k)).map(|vv| vv.value),
+                block_on(snap.get(k)).unwrap().map(|vv| vv.value),
                 Some(v.clone()),
                 "snapshot read changed after later writes"
             );
@@ -111,7 +111,11 @@ proptest! {
         // Keys that only exist post-snapshot are invisible to the snapshot.
         for k in &touched_keys {
             if !reference.contains_key(k) {
-                prop_assert_eq!(block_on(snap.get(k)), None, "snapshot saw a post-snapshot key");
+                prop_assert_eq!(
+                    block_on(snap.get(k)).unwrap(),
+                    None,
+                    "snapshot saw a post-snapshot key"
+                );
             }
         }
     }

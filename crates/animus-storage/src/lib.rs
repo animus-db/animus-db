@@ -18,7 +18,11 @@
 //! or no such entry exists). Writers assign versions and **must do so
 //! monotonically**; the distributed layer supplies commit timestamps that
 //! satisfy this. Given monotonic versions, a [`Snapshot`] taken at version `v`
-//! is isolated from all later writes.
+//! is isolated from all later writes. [`Snapshot::get`]/[`Snapshot::scan`]
+//! are fallible for the same reason [`StorageEngine::get`]/[`StorageEngine::
+//! scan`] are: a backing-store read can genuinely fail (e.g. on
+//! [`LsmEngine`]), and folding that into "key absent" / "range empty" would
+//! be a silent wrong answer, not a graceful one.
 
 mod lsm;
 mod memory;
@@ -388,8 +392,20 @@ pub trait Snapshot: Send + Sync {
     fn version(&self) -> Version;
 
     /// Read the value at `key` as of the snapshot version.
-    async fn get(&self, key: &[u8]) -> Option<VersionedValue>;
+    ///
+    /// Returns `Err` on a genuine backing-store failure (a corrupt-block CRC
+    /// mismatch, a `ProdEnv` disk I/O error, or a compaction-race retry
+    /// budget exhausted on [`LsmSnapshot`]) rather than folding it into
+    /// `Ok(None)` — an absent key and a failed read must stay
+    /// distinguishable, per this crate's loud-failure convention.
+    /// [`MemorySnapshot`]'s reads are infallible in memory, so it always
+    /// returns `Ok`.
+    async fn get(&self, key: &[u8]) -> Result<Option<VersionedValue>>;
 
     /// Scan keys in `[start, end)` as of the snapshot version, ordered by key.
-    async fn scan(&self, start: &[u8], end: &[u8]) -> Vec<(Key, VersionedValue)>;
+    ///
+    /// Returns `Err` on a genuine backing-store failure, or on `start > end`
+    /// (matching [`StorageEngine::scan`]) — never folds either into an empty
+    /// range. See [`get`](Self::get) for the same contract on a point read.
+    async fn scan(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Key, VersionedValue)>>;
 }
