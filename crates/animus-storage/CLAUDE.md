@@ -193,6 +193,34 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   brief lock first — then takes the lock again only to mutate in-memory state.
   This keeps futures `Send` and ordering deterministic (ADR 0003). Block bytes
   are read from disk outside any lock.
+- **`Inner::readers` is `Arc<Vec<SsTableReader>>`, not a bare `Vec`** (issue
+  #844): an individual `SsTableReader` clone is cheap (Arc-backed metadata +
+  block index), but the three read paths that snapshot the whole table set
+  under the lock — `latest_version_of`/`read_at`/`merged_at` (plus the
+  `#[doc(hidden)]` test introspection `test_disk_versions_of`) — used to
+  `.clone()` the *containing* `Vec` on every single get/scan: an O(N) heap
+  allocation plus N atomic refcount bumps, done while holding `Inner`'s mutex
+  against every other reader and writer. Wrapping the Vec in an `Arc` turns
+  every one of those snapshots into a single O(1) `Arc::clone`, with no
+  change to the read paths' own logic (`Arc<Vec<T>>` derefs to `&[T]`, so
+  `.iter()`/`.iter().rev()` are unchanged; only a bare `for x in &readers`
+  needs `for x in readers.iter()` instead, since `&Arc<Vec<T>>` isn't
+  directly `IntoIterator`). The two mutation sites — `flush` (push one new
+  L0 reader) and `run_compaction` (rebuild the whole vector to match the
+  post-compaction manifest) — build a fresh `Vec` and swap in a new `Arc`
+  (`inner.readers = Arc::new(new_readers)`) rather than mutating the old one
+  in place, which is what keeps a snapshot an in-flight read already took
+  observing exactly the reader set (and length/order) it captured, unaffected
+  by a later flush/compaction — the same "read a stable point-in-time view,
+  then retry via `raced_compaction` only on an actual compaction-generation
+  bump" contract as before, just without paying for a fresh `Vec` on every
+  read that *doesn't* race one. The parallel-to-`manifest.tables`,
+  oldest-first ordering that every read path's reverse scan relies on is
+  unchanged — both mutation sites still produce that same ordering, just via
+  a new `Vec` instead of an in-place edit. Regression:
+  `lsm::readers_arc_tests` (in `lsm.rs`) — `Arc::ptr_eq` before/after a flush
+  and a compaction, asserting a pre-mutation snapshot's own `Vec` (length and
+  contents) is untouched by a later swap.
 - **Flushes and compactions (maintenance) are mutually exclusive** via a
   hand-rolled async `MaintenanceLock` (`lsm.rs`) whose guard *is* held across the
   whole operation's awaits (it's a waker-based async mutex, not a `std` guard, so
