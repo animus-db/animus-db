@@ -10,17 +10,23 @@
 //! its intents are ordinary in-scope logical keys (unlike the engine-global
 //! seal/ceiling markers), they ship through `engine_image` exactly like any
 //! other data — no special-casing needed, and this test is the proof.
+//!
+//! `snapshot_catchup_reseeds_hot_change_max` (issue #859 follow-up) extends
+//! this again to `RaftKvNode::hot_change_max`: unlike a fresh
+//! `start_inner` boot, an `InstallSnapshot` replaces an ALREADY-RUNNING
+//! replica's engine content wholesale, so this cache needs its own
+//! re-seed at that same point — this test is the proof that it gets one.
 
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use animus_control::ProposeResult;
-use animus_cp_data::RaftKvNode;
+use animus_cp_data::{KIND_BASE, RaftKvNode, StorageScope, hlc};
 use animus_env::{EnvExt, nid};
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::{MemoryEngine, StorageEngine};
-use animus_tablet::{escape, partition_token};
+use animus_tablet::{KeyRange, escape, partition_token};
 use futures::executor::block_on;
 
 const NODES: [u64; 3] = [0, 1, 2];
@@ -224,4 +230,152 @@ fn snapshot_catchup_carries_txn_records_and_intents() {
              including the snapshot-caught-up follower (seed={seed})"
         );
     }
+}
+
+/// A real ADR 0022-shaped logical key: `partition_token(pk) || escape(pk) ||
+/// rk` (mirrors `tests/kind_batch.rs`'s identical helper).
+fn logical(pk: &[u8], rk: &[u8]) -> Vec<u8> {
+    let mut out = partition_token(pk).to_vec();
+    out.extend_from_slice(&escape(pk));
+    out.extend_from_slice(rk);
+    out
+}
+
+/// Like [`group`], but scoped to a real `KeyRange` rather than
+/// `StorageScope::whole()`. `pending_changes`/`hot_change_max`'s own boot
+/// scan reads as empty for `StorageScope::whole()` ("only
+/// `StorageScope::whole()`; no real tablet" — that method's own doc), so a
+/// test that needs genuine `KIND_CHANGE` records must use this instead,
+/// mirroring `tests/kind_batch.rs`'s own `group`.
+fn group_scoped(seed: u64) -> (Simulator, Vec<KvNode>) {
+    let sim = Simulator::new(seed);
+    let nodes = NODES
+        .iter()
+        .map(|&id| {
+            RaftKvNode::start_scoped(
+                sim.env(nid(id)),
+                NODES.iter().copied().map(nid).collect(),
+                MemoryEngine::new(),
+                StorageScope::new(KeyRange::whole()),
+            )
+        })
+        .collect();
+    (sim, nodes)
+}
+
+/// Drive `sim` in small ticks, repeatedly (re-)arming a transfer to `target`
+/// on whoever currently leads, until `target` itself reports leadership or
+/// the budget runs out — mirrors `tests/hlc_differential_skew.rs`'s
+/// identical `force_leadership` helper (a single `transfer_leadership` call
+/// only *arms* the handoff; it still needs ticks of virtual time for
+/// `TimeoutNow` to actually land).
+fn force_leadership(sim: &mut Simulator, nodes: &[KvNode], target: usize, seed: u64) {
+    for _ in 0..200 {
+        if nodes[target].is_leader() {
+            return;
+        }
+        let ls: Vec<usize> = (0..nodes.len()).filter(|&i| nodes[i].is_leader()).collect();
+        if ls.len() == 1 && ls[0] != target {
+            nodes[ls[0]].transfer_leadership(nid(target as u64));
+        }
+        sim.run_for(Duration::from_millis(50));
+    }
+    panic!("could not force leadership onto node {target} (seed={seed})");
+}
+
+/// The `(HlcTimestamp, ordinal)` a `KIND_CHANGE` record's own logical key
+/// suffix encodes (`prefix || hlc::pack(ts) || ordinal`,
+/// `materialize_derived`'s doc, issue #852) — the identical decode
+/// `animus-cp-data`'s own `decode_change_suffix`/`animusd::index_drain::
+/// record_hlc_ordinal` perform, reproduced here by hand (rather than
+/// exported) so this test's own ground truth is independent of
+/// `hot_change_max`'s own machinery, not just a re-invocation of it.
+fn decode_change_suffix(key: &[u8]) -> Option<(hlc::HlcTimestamp, u32)> {
+    let n = key.len().checked_sub(12)?;
+    let ts = hlc::unpack(u64::from_be_bytes(key[n..n + 8].try_into().ok()?));
+    let ordinal = u32::from_be_bytes(key[n + 8..].try_into().ok()?);
+    Some((ts, ordinal))
+}
+
+/// Issue #859 follow-up: `hot_change_max` must be re-seeded when
+/// `InstallSnapshot` replaces an already-running replica's engine content
+/// wholesale, not just at a fresh `start_inner` boot — otherwise a replica
+/// that caught up this way keeps a cache reflecting only what IT locally
+/// materialized before falling behind (too low), and if it later becomes
+/// this group's leader, `GetShardIterator{LATEST}` would return a too-low
+/// position and re-deliver records that already existed.
+///
+/// Writes real `KIND_CHANGE` records on the leader, past the compaction
+/// threshold so the lagging follower must catch up via a genuine
+/// engine-image install (not a log replay), then confirms the caught-up
+/// follower's own `hot_change_max()` matches the leader's own true
+/// maximum (found by directly decoding `pending_changes()`, independent of
+/// `hot_change_max` itself — the ground truth). Then forces leadership
+/// onto that follower and re-confirms: the shape that actually matters for
+/// `GetShardIterator{LATEST}`, since only a group's LEADER ever serves it.
+#[test]
+fn snapshot_catchup_reseeds_hot_change_max() {
+    let seed = 0x8590;
+    let (mut sim, nodes) = group_scoped(seed);
+    sim.run_for(Duration::from_secs(2)); // elect
+    let l = leader(&nodes, &[0, 1, 2], seed);
+    let lagging = (0..3).find(|&i| i != l).expect("a follower exists");
+
+    sim.crash(nid(lagging as u64));
+
+    // Past the compaction threshold (64), so the leader snapshots +
+    // truncates the log prefix the crashed follower would have needed —
+    // same shape as `lagging_follower_catches_up_via_snapshot`.
+    const N: u64 = 150;
+    for i in 0..N {
+        let base = logical(format!("k{i:03}").as_bytes(), b"");
+        match nodes[l].put_kind_batch(
+            vec![(KIND_BASE, base.clone(), Some(format!("v{i}").into_bytes()))],
+            vec![(base, format!("rec{i}").into_bytes())],
+        ) {
+            ProposeResult::Accepted { .. } => {}
+            other => panic!("leader rejected kind batch {i}: {other:?} (seed={seed})"),
+        }
+        sim.run_for(Duration::from_millis(20));
+    }
+    sim.run_for(Duration::from_secs(3)); // replicate + apply + compact on {l, third}
+
+    // Ground truth, taken from the leader BEFORE the follower's restart —
+    // every one of `N` writes minted exactly one change record, so this is
+    // never empty.
+    let expected_max = block_on(nodes[l].pending_changes())
+        .iter()
+        .filter_map(|(k, _)| decode_change_suffix(k))
+        .max()
+        .unwrap_or_else(|| panic!("leader has no KIND_CHANGE records (seed={seed})"));
+    assert_eq!(
+        block_on(nodes[l].hot_change_max()),
+        Some(expected_max),
+        "leader's own hot_change_max must already match the ground truth (seed={seed})"
+    );
+
+    // Restart the lagging follower — its log is far behind the leader's
+    // compacted base, so the leader must catch it up with an
+    // InstallSnapshot (engine image), then replay the post-snapshot log
+    // tail on top.
+    sim.restart(nid(lagging as u64));
+    sim.run_for(Duration::from_secs(6));
+
+    assert_eq!(
+        block_on(nodes[lagging].hot_change_max()),
+        Some(expected_max),
+        "follower {lagging}'s hot_change_max must be re-seeded by the InstallSnapshot, \
+         not left at whatever it locally materialized before falling behind (seed={seed})"
+    );
+
+    // The shape that actually matters: only a LEADER's own cache is ever
+    // read by `GetShardIterator{LATEST}`.
+    force_leadership(&mut sim, &nodes, lagging, seed);
+    assert_eq!(
+        block_on(nodes[lagging].hot_change_max()),
+        Some(expected_max),
+        "the now-leading, snapshot-caught-up follower {lagging} must still report the \
+         true max, not a too-low value that would re-deliver already-existing records \
+         through GetShardIterator{{LATEST}} (seed={seed})"
+    );
 }

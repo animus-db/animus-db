@@ -1161,3 +1161,49 @@ that only ever wanted the maximum, never a page of records. See
 `docs/streams-notes.md` for the reader-side pointer, and
 `RaftKvNode::hot_change_max`'s own doc (`animus-cp-data/src/lib.rs`) for
 the field-level account.
+
+**Follow-up fix, same day: the `InstallSnapshot` re-seed gap.** The
+above covered a fresh `start_inner` boot (a restarted or newly-hosted
+replica) but missed the OTHER path that replaces a group's engine content
+wholesale: `apply_and_compact`'s `InstallSnapshot` branch, which runs on
+an **already-running** replica (a lagging follower catching up while its
+own apply task keeps executing) and therefore never goes through
+`start_inner`'s own seed at all. `engine_image` walks every `ALL_KINDS`
+scope, `KIND_CHANGE` included, so an install genuinely can carry change
+records this replica never locally materialized — left unfixed, such a
+replica would keep `hot_change_max` at whatever (possibly lower, possibly
+`None`) value it had before falling behind, and if it later became this
+group's leader, `GetShardIterator{LATEST}` would return a too-low
+position and re-deliver records that already existed before the iterator
+was minted — the exact bug this whole primitive exists to avoid.
+
+Fixed by re-seeding `hot_change_max` at that same install point, right
+beside the existing `txn_tracker` rebuild (`apply_and_compact`'s doc there
+explains why a snapshot install needs an identical re-derivation for that
+field, for the identical "skips individual log entries" reason): a fresh
+`scan_hot_change_max` over the now-installed engine, `max()`-folded into
+the cache via the existing `note_hot_change_write` helper (never an
+unconditional overwrite, though the install's own value can only ever be
+`>=` whatever this replica already knew). Checked every other path that
+replaces engine content wholesale and found none else needed the fix:
+`KvCommand::SeedBatch` (the restore driver's row-merge command) never
+carries a `KIND_CHANGE` row — backup capture's own `CAPTURE_KINDS` is
+`[KIND_BASE, KIND_LSI, KIND_FOOTPRINT]` only, and `backup_restore.rs`'s
+own doc is explicit that a restored table's change log starts fresh; an
+in-place split's child groups and a wiped-then-rehosted tablet are each a
+**brand-new** `RaftKvNode` (a fresh `start_inner`/`drive` call), so they
+already get the ordinary boot-time seed like any other fresh group.
+
+Regression: `crates/animus-cp-data/tests/snapshot_catchup.rs`'s
+`snapshot_catchup_reseeds_hot_change_max` — writes real `KIND_CHANGE`
+records past the compaction threshold, restarts a crashed follower so it
+must catch up via a genuine `InstallSnapshot` (not a log replay), confirms
+its `hot_change_max()` matches the leader's own true maximum (an
+independent ground truth: a direct decode of `pending_changes()`, not a
+re-invocation of `hot_change_max`'s own machinery), then forces leadership
+onto that follower and re-confirms — the shape that actually matters,
+since only a group's LEADER ever serves `GetShardIterator{LATEST}`.
+Verified this test genuinely catches the gap: temporarily reverting the
+re-seed reproduces the exact failure (`hot_change_max()` returns `None`
+where the true max was `Some(..)`), and restoring it turns the test green
+again.

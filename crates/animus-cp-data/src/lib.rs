@@ -2267,6 +2267,24 @@ pub struct RaftKvNode<E: Env, S: StorageEngine> {
     /// `None` means "no `KIND_CHANGE` record has ever been observed for
     /// this tablet" — the caller's own fallback (the stream's sealed
     /// watermark) mirrors `hot_read`'s own `unwrap_or` exactly.
+    ///
+    /// **Every path that replaces this group's engine content wholesale
+    /// must re-seed this field, not just `start_inner`'s fresh boot.**
+    /// `InstallSnapshot` is the one that does, on an ALREADY-RUNNING
+    /// replica: `apply_and_compact`'s install branch re-seeds it with a
+    /// fresh `scan_hot_change_max`, `max()`-folded via
+    /// `note_hot_change_write` (the identical re-seed `txn_tracker` gets
+    /// right beside it, and for the same reason — see that call site's own
+    /// doc). Checked and found **not** a gap: `KvCommand::SeedBatch` (the
+    /// restore driver's row-merge command) never carries a `KIND_CHANGE`
+    /// row — backup capture's own `CAPTURE_KINDS` is `[KIND_BASE, KIND_LSI,
+    /// KIND_FOOTPRINT]` only, and `backup_restore.rs`'s own doc is explicit
+    /// that "`KIND_CHANGE` is deliberately never reproduced" (a restored
+    /// table's change log starts fresh); an in-place split's child groups
+    /// and a wiped-then-rehosted tablet are both a **brand-new**
+    /// `RaftKvNode` (a fresh `start_inner`/`drive` call), so they get this
+    /// field's normal boot-time seed like any other fresh group — there is
+    /// no already-running node whose cache needs folding in.
     hot_change_max: Arc<Mutex<Option<(HlcTimestamp, u32)>>>,
 }
 
@@ -7467,6 +7485,26 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
         // lifecycle, precisely reproducing this gap.
         *txn_tracker.lock().expect("txn tracker poisoned") =
             rebuild_txn_tracker(storage, scope).await;
+        // Issue #859 follow-up: `hot_change_max` needs the identical
+        // re-seed `txn_tracker` just got, for the identical reason — an
+        // `InstallSnapshot` replaces this ALREADY-RUNNING replica's whole
+        // engine (`engine_image` walks every `ALL_KINDS` scope, `KIND_CHANGE`
+        // included), but unlike a fresh `start_inner` boot this apply task
+        // keeps running with whatever it had cached before the install, and
+        // nothing else in this branch touches the cache. Left unfixed, a
+        // replica that caught up via `InstallSnapshot` would keep a cache
+        // reflecting only what IT locally materialized before falling
+        // behind — too low — and if it later became this group's leader,
+        // `GetShardIterator{LATEST}` would return a too-low position,
+        // re-delivering records that already existed before the iterator
+        // was minted (breaking the `LATEST` contract this whole cache
+        // exists to serve correctly). `note_hot_change_write`'s own `max()`
+        // fold-in (not an unconditional overwrite) keeps this correct even
+        // in the (never-expected) case this replica's own cache already
+        // led the sender's.
+        if let Some((ts, ordinal)) = scan_hot_change_max(storage, kind_scopes).await {
+            note_hot_change_write(hot_change_max, ts, ordinal);
+        }
         did_work = true;
     }
 
