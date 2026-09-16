@@ -46,8 +46,8 @@
 //! measured max without weakening the actual claim (batched proposals stay
 //! roughly `BATCH_WRITE_MAX_ITEMS`x fewer than per-key, not "close to
 //! per-key"). This is pre-existing `cp_kind_raw_local` behavior, not
-//! something this change introduces or fixes — see this repo's issue
-//! tracker for the follow-up filed on it.
+//! something this change introduces or fixes — see issue #911 for the
+//! follow-up filed on it.
 
 use std::net::SocketAddr;
 use std::time::Duration;
