@@ -54,8 +54,11 @@ recorded behind a cheap-to-clone `MetricsHandle`. Recording never touches the
 wall clock, does no I/O, and uses no `HashMap` — so a simulation run stays a pure
 function of its seed.
 
-Today the **control-plane Raft driver** is instrumented. The exported counters
-(all `control_`-prefixed) are:
+Both the **control-plane Raft driver** and the **CP data plane** (each
+tablet's own Raft group, `animus-cp-data`) are instrumented and recording
+today.
+
+The control-plane counters (all `control_`-prefixed):
 
 | Metric | Meaning |
 |--------|---------|
@@ -67,6 +70,29 @@ Today the **control-plane Raft driver** is instrumented. The exported counters
 | `control_failure_detector_down` | the failure detector drove a member `Active`→`Down` (ADR 0012) |
 | `control_failure_detector_up` | the failure detector drove a member `Down`→`Active` |
 | `control_is_leader` | gauge: 1 if this node currently believes it is leader, else 0 |
+
+The data-plane counters (all `cp_`-prefixed, declared in
+`crates/animus-env/src/metrics.rs` and incremented across
+`animus-cp-data`/`animusd` at the sites that know the real outcome — never
+on every attempt or every driver-loop tick), grouped by area:
+
+| Metric | Meaning |
+|--------|---------|
+| `cp_proposals_accepted` / `cp_proposals_rejected_not_leader` | a client propose was accepted by this group's leader / rejected because this node isn't leader |
+| `cp_commits` | log entries newly committed, summed by how far the commit index moved |
+| `cp_applies` | committed commands actually drained and applied to the engine |
+| `cp_apply_batch_runs` / `cp_apply_batch_size_sum` | one flushed batch of accumulated effects (one WAL fsync) / effects included in it, summed |
+| `cp_read_barriers_served` / `cp_read_barriers_timed_out` | a ReadIndex barrier (linearizable read) confirmed leadership and was served / didn't confirm before its deadline |
+| `cp_eventual_reads_local` / `cp_eventual_reads_forwarded` / `cp_eventual_reads_fell_back` | an eventually-consistent read (ADR 0055, `ConsistentRead: false`) was served from this replica / forwarded one hop / fell back to the linearizable path |
+| `cp_snapshot_triggers` / `cp_snapshot_image_builds` / `cp_snapshot_ships` / `cp_snapshot_installs` | compaction advanced the snapshot base / an image was actually built / an `InstallSnapshot` chunk was sent / a peer finished installing one |
+| `cp_reconfigure_accepted` / `cp_reconfigure_rejected` | a per-tablet single-server `change_membership` step was accepted / rejected |
+| `cp_txn_recovered_committed` / `cp_txn_recovered_aborted` / `cp_txn_resolver_runs` | in-doubt-transaction recovery (ADR 0018 §2) drove a stale record to `Committed` / `Aborted` / one resolver-loop tick ran |
+
+This is the commonly-watched subset, not the full `Metric` enum — the CP data
+plane also records snapshot-engine-rebuild, quiescence, uncertainty-restart,
+SharedWal, and heartbeat-batching counters among others. `/admin/metrics`
+(below) is the authoritative list of what's currently recording on a live
+node.
 
 A `ProdEnv` owns a real recording sink and renders a point-in-time text export:
 
@@ -103,11 +129,24 @@ coord), read at request time so it reflects live activity. A node runs three
 internal `ProdEnv` roles on distinct ids, each recording into its own sink:
 `RaftNode::start` records into the control env's sink, the data replica and the
 coordinator into theirs. The handler sums the three snapshots counter-by-counter
-(and takes the max of the leadership gauge, which only the control plane sets), so
-both control- and data-plane counters surface from one endpoint. Today only the
-control-plane counters move; data-plane counters surface automatically once
-recorded, with no endpoint change. The export is timeless `name value` text; a
-Prometheus scrape adds its own timestamp.
+(and takes the max of the leadership gauge, which only the control plane sets),
+so both control- and data-plane counters surface from one endpoint. Both move
+today: the control-plane counters as soon as the control Raft group is active,
+the `cp_*` data-plane counters as soon as a tablet group does any work. The
+export is timeless `name value` text; a Prometheus scrape adds its own
+timestamp.
+
+The **admin port** (`RoleAddrs.admin`, isolated from the client/dynamo port)
+also serves the same counters as JSON, alongside per-tablet stream-change-rate
+and request-rate gauges:
+
+```sh
+curl -s <admin addr>/admin/metrics
+```
+
+See `crates/animusd/src/admin.rs`'s module doc comment for the full
+`/admin/*` route list, and `crates/animus-env/src/metrics.rs`'s `Metric` enum
+for every counter's own doc comment.
 
 ## Replaying a failed simulation
 
