@@ -596,12 +596,14 @@ impl<E: Env> CpGroup<E> {
         }
     }
 
-    /// Every pending change-log record this tablet holds, in commit order
-    /// (ADR 0041 §4). See [`RaftKvNode::pending_changes`].
-    pub(crate) async fn pending_changes(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
+    /// Every pending change-log record this tablet holds, in **physical key
+    /// order** (token-then-pk-then-HLC), NOT commit order. See
+    /// [`RaftKvNode::pending_changes_key_order`]'s own doc for the full account and
+    /// ADR 0043 §A3.
+    pub(crate) async fn pending_changes_key_order(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
         match self {
-            CpGroup::Lsm(n) => n.pending_changes().await,
-            CpGroup::Mem(n) => n.pending_changes().await,
+            CpGroup::Lsm(n) => n.pending_changes_key_order().await,
+            CpGroup::Mem(n) => n.pending_changes_key_order().await,
         }
     }
 
@@ -1257,6 +1259,16 @@ impl<E: Env> CpGroup<E> {
                         .into_iter()
                         .map(|(_, voters)| voters.into_iter().map(|id| id.to_string()).collect())
                         .collect(),
+                    membership_history: self
+                        .membership_history()
+                        .into_iter()
+                        .map(|(voters, learners)| {
+                            (
+                                voters.into_iter().map(|id| id.to_string()).collect(),
+                                learners.into_iter().map(|id| id.to_string()).collect(),
+                            )
+                        })
+                        .collect(),
                 }
             };
         }
@@ -1641,6 +1653,21 @@ impl<E: Env> CpGroup<E> {
         match self {
             CpGroup::Lsm(n) => n.voter_history(),
             CpGroup::Mem(n) => n.voter_history(),
+        }
+    }
+
+    /// Every distinct **(voters, learners)** pair this replica has adopted,
+    /// in adoption order (issue #944) — a pure diagnostic, never a wake.
+    /// See [`RaftKvNode::membership_history`]'s doc for why this exists:
+    /// `/admin/raftkv`'s own `membership_history` field (below) is what
+    /// lets a test — or an operator — prove a member passed through ADR
+    /// 0058 Train 1's learner phase before it was ever a voter without
+    /// racing an external poll against how fast the reconciler happens to
+    /// promote it.
+    fn membership_history(&self) -> Vec<(BTreeSet<NodeId>, BTreeSet<NodeId>)> {
+        match self {
+            CpGroup::Lsm(n) => n.membership_history(),
+            CpGroup::Mem(n) => n.membership_history(),
         }
     }
 }

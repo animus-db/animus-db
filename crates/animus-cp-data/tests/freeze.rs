@@ -202,7 +202,7 @@ fn consumer_bookkeeping_still_applies_on_a_frozen_group() {
         Some(b"wm".to_vec()),
         "a frozen group must accept consumer-bookkeeping writes (seed={seed})"
     );
-    let changes = block_on(nodes[l].pending_changes());
+    let changes = block_on(nodes[l].pending_changes_key_order());
     assert_eq!(
         changes.len(),
         1,

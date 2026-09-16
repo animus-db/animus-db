@@ -6,7 +6,7 @@
 //! committed HLC range and record count) followed by a body of
 //! length-prefixed `(source_key, packed_hlc, ordinal, change_record)`
 //! quadruples, in ascending `(packed_hlc, ordinal)` order (ADR 0043 §A3 step
-//! 1: `pending_changes`' own key order is token-then-pk-then-HLC, not commit
+//! 1: `pending_changes_key_order`' own key order is token-then-pk-then-HLC, not commit
 //! order, so the seal step re-sorts by the `(packed_hlc, ordinal)` pair
 //! before encoding — this module trusts that order rather than re-deriving
 //! it, since re-sorting on every decode would be wasted work for a reader
@@ -173,7 +173,7 @@ pub struct SegmentHeader {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SegmentRecord {
     /// The record's own logical key in the source tablet's `KIND_CHANGE`
-    /// scope (token-leading, HLC-suffixed — see `RaftKvNode::pending_changes`'
+    /// scope (token-leading, HLC-suffixed — see `RaftKvNode::pending_changes_key_order`'
     /// own doc in `lib.rs`).
     pub source_key: Vec<u8>,
     /// This record's own packed HLC (`hlc::pack`).

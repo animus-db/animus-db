@@ -2246,16 +2246,12 @@ pub struct RaftKvNode<E: Env, S: StorageEngine> {
     voter_history: Arc<Mutex<VoterHistory>>,
 }
 
-/// A bounded, in-process ring of every distinct Raft voter configuration a
-/// [`RaftKvNode`] has adopted, in adoption order (issue #596). Exists
-/// because a transient intermediate configuration's own DURATION is an
-/// implementation timing artifact, never a property this crate promises —
-/// `reconfigure_step`'s learner-phased sequencing (this file's own doc,
-/// "reconfigure_step's learner-phased replica-move sequencing") only
-/// guarantees an over-replicated intermediate is logically *reached*
-/// between an add and the matching remove, not how long it survives before
-/// the next reconciler tick removes it. An external poller sampling the
-/// live voter set on a fixed interval can race that window shut — see
+/// A bounded, in-process ring of every distinct value of `T` a
+/// [`RaftKvNode`] has observed for some per-tick recomputed fact, in
+/// observation order. Exists because a transient intermediate's own
+/// DURATION is an implementation timing artifact, never a property this
+/// crate promises — an external poller sampling the live voter set on a
+/// fixed interval can race that window shut — see
 /// `crates/animusd/tests/split_placing_two_replica_diff_e2e.rs` and
 /// `docs/engineering-lessons.md`'s matching entry for the incident this
 /// closes. Recording the sequence here, inside the same consensus-loop
@@ -2263,6 +2259,25 @@ pub struct RaftKvNode<E: Env, S: StorageEngine> {
 /// tick" fact (`state_machine_behind`, the quiesce veto), makes the
 /// intermediate provable from a durable-for-this-uptime record instead of
 /// from how fast an external caller happens to poll.
+///
+/// **This same once-per-tick sampling cadence is not fine-grained enough
+/// for the LEARNER set** (issue #944): unlike a voter-set change (which
+/// only ever changes via network-replicated log entries, so this
+/// consensus-loop's own per-message processing bounds how much can happen
+/// between two samples), a leader's own `add_learner`/`promote_learner`
+/// calls (`RaftKvNode::reconfigure_step`) mutate the shared `RaftCore`
+/// SYNCHRONOUSLY, from whichever task calls them (the host reconciler's own
+/// tick, not this drive loop) — and a follower's own per-entry `log_append`
+/// can likewise apply several batched config-changing entries before this
+/// loop ever gets scheduled to sample in between. Sampling from here can
+/// therefore coalesce the whole add-then-promote sequence into one record,
+/// silently skipping the transient learner state entirely — see
+/// `crates/animusd/tests/learner_reconfigure.rs`'s
+/// `spare_replacement_passes_through_an_observable_learner_state_and_keeps_serving`
+/// for the flake this caused. The learner/voter JOINT history that closes
+/// it (`RaftCore::config_history`, recorded synchronously at the one real
+/// mutation site, `apply_config`, in `animus-control`) therefore lives
+/// **inside the core**, not here — see that method's own doc.
 ///
 /// Deliberately **not** rebuilt at group start/recovery — unlike
 /// `sealed`/`committed_ceiling`/`txn_tracker`, "what voter sets has this
@@ -2790,7 +2805,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// optional annotation.** It must be [`engine_applied_index`](Self::
     /// engine_applied_index) read by the caller **before** whatever
     /// observation decided `held` (e.g. before scanning
-    /// [`pending_changes`](Self::pending_changes)) — never after, and never
+    /// [`pending_changes_key_order`](Self::pending_changes_key_order)) — never after, and never
     /// the result of the scan itself. Reading it first gives a valid
     /// *lower* bound: a concurrent apply between the read and the scan can
     /// only make the true state fresher than what's recorded, never make a
@@ -4330,6 +4345,27 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             .snapshot()
     }
 
+    /// Every distinct **(voters, learners)** pair this group has adopted
+    /// since it started (or last recovered), in adoption order — issue
+    /// #944. Unlike [`voter_history`](Self::voter_history) and
+    /// [`learners`](Self::learners) read independently, this pairs each
+    /// recorded voter set with the learner set it changed alongside, so a
+    /// caller can tell whether a member was ever a voter without having
+    /// first appeared as a learner in an earlier entry — the ADR 0058
+    /// Train 1 add-learner-then-promote ordering. A thin passthrough to
+    /// [`RaftCore::config_history`] (`animus-control`), recorded
+    /// synchronously at the one real mutation site rather than sampled
+    /// once per consensus-loop tick like `voter_history` above — see that
+    /// method's own doc for why the learner set specifically needs the
+    /// finer-grained mechanism, and
+    /// `crates/animusd/tests/learner_reconfigure.rs` for the flake this
+    /// closes. A pure accessor — reading it never blocks, proposes, or
+    /// wakes a quiesced group, mirroring [`voter_history`](Self::
+    /// voter_history)'s own contract.
+    pub fn membership_history(&self) -> Vec<(BTreeSet<NodeId>, BTreeSet<NodeId>)> {
+        self.lock().config_history()
+    }
+
     /// The byte offset `peer` has acked so far in an in-flight chunked
     /// `InstallSnapshot` transfer this node is leading — see
     /// [`RaftCore::snapshot_chunk_progress`].
@@ -5283,7 +5319,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                 // tablet's kind scope, which always has a non-`0xFF`-ending
                 // prefix (the scope selector byte itself) and so always
                 // yields a finite `physical_bounds` upper bound. Mirrors
-                // `pending_changes`'s identical fallback.
+                // `pending_changes_key_order`'s identical fallback.
                 None => Vec::new(),
             },
         };
@@ -5588,8 +5624,8 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         Some(rows)
     }
 
-    /// Every pending change-log record this tablet holds, in **commit order**
-    /// (ADR 0041 §4): `(record key, encoded record)`.
+    /// Every pending change-log record this tablet holds, in **physical key
+    /// order** — `(record key, encoded record)`.
     ///
     /// A whole-`KIND_CHANGE`-scope sweep, bounded by this tablet's own scope
     /// (`physical_bounds`, never `entries()` — a node's tablets share one
@@ -5600,11 +5636,20 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// general API bounded stops an accidental full-tablet read being a typo
     /// away.
     ///
-    /// Key order is commit order because a record's key ends in its own commit
-    /// HLC (see [`KvCommand::KindBatch`]'s `change_log`), so a drain processing
-    /// these front-to-back sees each key's mutations in the order they
-    /// committed.
-    pub async fn pending_changes(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
+    /// **This is NOT commit order.** A record's physical key is `token ||
+    /// escape(pk) || packed_hlc || ordinal` (see [`KvCommand::KindBatch`]'s
+    /// `change_log`, and `materialize_derived`'s own doc for the trailing
+    /// `hlc`/`ordinal` pair) — the token leads, so this scan is grouped by
+    /// partition first and by commit HLC only within one partition. Across
+    /// partitions the order is whatever the hash ring put them in, not commit
+    /// order (ADR 0043 §A3 step 1 says this explicitly: "key order is
+    /// token-then-pk-then-HLC, not global commit order"). A caller that needs
+    /// HLC/commit order — a seal, a hot read, anything feeding a
+    /// `GetRecords`-shaped consumer — must sort explicitly by the trailing
+    /// `(packed_hlc, ordinal)` pair, exactly as `seal_now`/`hot_read`
+    /// (`animusd::index_drain`) already do; don't rely on this method's own
+    /// return order for that.
+    pub async fn pending_changes_key_order(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
         let scope = &self.kind_scopes[KIND_CHANGE as usize];
         let (start, end) = scope.physical_bounds();
         let Some(end) = end else {
