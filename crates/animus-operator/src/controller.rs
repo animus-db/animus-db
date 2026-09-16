@@ -228,15 +228,14 @@ async fn previous_applied_control_nodes<C: ClusterApi>(
 //     own doc for the pinned regression this once lacked), the promoted pod
 //     hasn't restarted yet (the config-hash annotation drives that, see
 //     `desired::statefulset`) — wait.
-//  4. Otherwise, resolve that ordinal's live `status.podIP` (via the
-//     Kubernetes API, not DNS — see `resolve_control_dial_addr`'s own doc
-//     for why, including the pre-existing `animusd` admin-API gap this
-//     works around) and `POST /admin/control/member/add` against each
-//     already-confirmed voter ordinal in turn until one accepts (mirroring
-//     "retry on the leader" — see `add_control_voter`'s own doc for why
-//     this, not a parsed error-message address hint, is how that's done
-//     here), then poll `GET /admin/control/members` (bounded) until the new
-//     ordinal shows up before this reconcile returns.
+//  4. Otherwise, build that ordinal's own stable pod DNS name as its dial
+//     address (`control_dial_addr`, issue #662 — a pure function, no
+//     Kubernetes API call) and `POST /admin/control/member/add` against
+//     each already-confirmed voter ordinal in turn until one accepts
+//     (mirroring "retry on the leader" — see `add_control_voter`'s own doc
+//     for why this, not a parsed error-message address hint, is how that's
+//     done here), then poll `GET /admin/control/members` (bounded) until
+//     the new ordinal shows up before this reconcile returns.
 //
 // `advance_control_growth` also returns the control-voter count
 // `apply_children`'s `PodDisruptionBudget` step should use this reconcile
@@ -372,49 +371,23 @@ async fn ordinal_reports_role_both<A: AdminOps>(
     }
 }
 
-/// Resolve ordinal `ordinal`'s **current** internal-Raft dial address to a
-/// literal `SocketAddr`, for `POST /admin/control/member/add`'s `addr`
-/// field.
+/// Ordinal `ordinal`'s internal-Raft dial address, for `POST
+/// /admin/control/member/add`'s `addr` field: the pod's own stable DNS name
+/// (`desired::pod_fqdn`), the same address `RoleAddrs::advertise_host`
+/// already advertises for it, at the internal-Raft port.
 ///
-/// **Works around a real, pre-existing `animusd` admin-API gap**: that
-/// field is typed `std::net::SocketAddr` server-side
-/// (`admin::AddControlMemberReq`), which can only ever deserialize a
-/// literal IP:port — never a DNS name. Every other address surface this
-/// operator or `animusd` itself uses for a Kubernetes pod
-/// (`RoleAddrs::advertise_host`, `ClientResponse::JoinInfo`, the peer book
-/// `ProdEnv::merge_peer`/`ProdEnv::set_peers` populate) is deliberately
-/// string/hostname-typed for exactly the reason a pod's IP is not stable
-/// across a restart while its per-ordinal DNS name is. This reads the
-/// pod's *current* `status.podIP` via the Kubernetes API (never a DNS
-/// lookup — more immediately authoritative, and, unlike a raw
-/// `tokio::net::lookup_host` call, goes through the already-testable
-/// `ClusterApi` seam) purely as a one-time bootstrap value for the
-/// leader's very first dial: the promoted node's own startup self-
-/// registration (`spawn_common_tail`'s `register_node_addrs`,
-/// unconditional on every combined-mode boot, per `animusd::lib`'s own
-/// doc) republishes its real, DNS-name-based `advertised_addr` into the
-/// replicated `Metadata.node_addrs` moments later, which every node's own
-/// `peer_sync_loop` then adopts — so a resolved-IP staleness window here
-/// is self-healing within moments of this call, not a permanent address
-/// pin. See `crates/animus-operator/CLAUDE.md`'s S-07d section for the
-/// full account and the animusd-side fix this should eventually get
-/// (accepting a `String` addr the way `ProdEnv::merge_peer` already does).
-async fn resolve_control_dial_addr<C: ClusterApi>(
-    cluster_api: &C,
-    name: &str,
-    ns: &str,
-    ordinal: i32,
-    internal_port: i32,
-) -> Result<std::net::SocketAddr, String> {
-    let pod = desired::pod_name(name, ordinal);
-    let ip = cluster_api
-        .get_pod_ip(ns, &pod)
-        .await
-        .map_err(|e| format!("reading pod {pod}'s IP: {e}"))?
-        .ok_or_else(|| format!("pod {pod} has no status.podIP yet"))?;
-    format!("{ip}:{internal_port}")
-        .parse()
-        .map_err(|e| format!("pod {pod}'s podIP {ip:?} did not parse as an address: {e}"))
+/// **Issue #662 closed the `animusd`-side gap this used to work around**:
+/// `admin::AddControlMemberReq.addr` is `String`-typed now, resolved lazily
+/// at dial time (`TcpStream::connect`'s own `ToSocketAddrs` impl for `&str`)
+/// the same way every other address surface here already works — so this is
+/// a pure, no-I/O function, not a Kubernetes API call. It used to read the
+/// pod's live `status.podIP` (`ClusterApi::get_pod_ip`, now removed) as a
+/// one-time bootstrap value specifically because `addr` could only ever
+/// deserialize a literal IP:port; see `crates/animus-operator/CLAUDE.md`'s
+/// S-07d section and `docs/adr/0060-kubernetes-operator.md`'s 2026-09-16
+/// amendment for the full before/after account.
+fn control_dial_addr(name: &str, ns: &str, ordinal: i32, internal_port: i32) -> String {
+    format!("{}:{internal_port}", desired::pod_fqdn(name, ns, ordinal))
 }
 
 /// Add ordinal `ordinal` (already known to be missing from the live voter
@@ -438,8 +411,7 @@ async fn resolve_control_dial_addr<C: ClusterApi>(
 /// itself succeeded but confirmation didn't land within that bound (not a
 /// failure — the next reconcile re-checks live truth and either finds it
 /// already there or, since the add is idempotent, retries harmlessly), and
-/// `Err` only when no already-confirmed voter accepted the add at all (or
-/// the dial address couldn't be resolved).
+/// `Err` only when no already-confirmed voter accepted the add at all.
 async fn add_control_voter<C: ClusterApi, A: AdminOps>(
     ctx: &Context<C, A>,
     name: &str,
@@ -450,8 +422,7 @@ async fn add_control_voter<C: ClusterApi, A: AdminOps>(
     tls_ca: Option<&[u8]>,
 ) -> Result<bool, String> {
     let node_id = desired::cluster_config::node_id(name, ordinal);
-    let addr =
-        resolve_control_dial_addr(&ctx.cluster_api, name, ns, ordinal, internal_port).await?;
+    let addr = control_dial_addr(name, ns, ordinal, internal_port);
 
     let mut last_err = "no already-confirmed control voter ordinal to ask".to_string();
     let mut added = false;
@@ -461,7 +432,7 @@ async fn add_control_voter<C: ClusterApi, A: AdminOps>(
             .admin
             .post_json(
                 &format!("{base}/admin/control/member/add"),
-                &json!({"node": node_id, "addr": addr.to_string()}),
+                &json!({"node": node_id, "addr": addr}),
                 tls_ca,
             )
             .await
@@ -1389,6 +1360,18 @@ mod tests {
 
     // --- S-07d: the pure growth-decision functions -------------------------
 
+    /// Issue #662: the control-voter dial address `member/add` gets is the
+    /// promoted ordinal's own stable pod DNS name (`desired::pod_fqdn`), the
+    /// same address `RoleAddrs::advertise_host` already carries for it — no
+    /// `status.podIP` lookup, no `ClusterApi` call at all.
+    #[test]
+    fn control_dial_addr_uses_the_pods_stable_dns_name() {
+        assert_eq!(
+            control_dial_addr("demo", "ns1", 3, 14001),
+            "demo-3.demo-internal.ns1.svc.cluster.local:14001"
+        );
+    }
+
     #[test]
     fn next_growth_ordinal_finds_the_first_missing_voter() {
         let voters: std::collections::BTreeSet<String> =
@@ -1935,7 +1918,6 @@ mod tests {
         let fake_admin = FakeAdminClient::new();
         seed_pre_growth_state(&fake_cluster, &fake_admin);
         fake_admin.mark_ordinal_ready_both(3);
-        fake_cluster.seed_pod_ip("demo-3", "10.0.0.4");
         let ctx = make_ctx(fake_cluster, fake_admin);
 
         let cluster = Arc::new(test_cluster("demo", "ns1", 5, Some(5)));
@@ -2003,7 +1985,6 @@ mod tests {
         );
         fake_admin.seed_control_voters(["demo-0", "demo-1", "demo-2"].map(String::from));
         fake_admin.mark_ordinal_ready_both(3);
-        fake_cluster.seed_pod_ip("demo-3", "10.0.0.4");
         let ctx = make_ctx(fake_cluster, fake_admin);
         ctx.admin.fail_add_control_member_for_ordinal(0);
 
@@ -2163,7 +2144,6 @@ mod tests {
         // its own `GET /admin/config` now reports the real `animusd`
         // literal.
         ctx.admin.mark_ordinal_ready_both(3);
-        ctx.cluster_api.seed_pod_ip("e2e-3", "10.0.0.4");
 
         // Second reconcile: a real watch would deliver the object with the
         // status the first reconcile's own `patch_cluster_status` just
@@ -2215,7 +2195,6 @@ mod tests {
         let fake_admin = FakeAdminClient::new();
         fake_admin.seed_control_voters(["demo-0", "demo-1", "demo-2"].map(String::from));
         fake_admin.mark_ordinal_ready_both(3);
-        fake_cluster.seed_pod_ip("demo-3", "10.0.0.4");
         let ctx = make_ctx(fake_cluster, fake_admin);
 
         let mut cluster = test_cluster("demo", "ns1", 5, Some(5));

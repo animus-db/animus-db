@@ -341,9 +341,10 @@ the reconciler too (a status condition, `ControlNodesShrinkRejected`, is
 set) — since control voters can only be removed one at a time through
 their own careful quorum-loss checks (ADR 0037 §2), never inferred from a
 bare spec edit. See ADR 0060's own "Control-voter growth (S-07d,
-2026-09-06)" section for the full design (the live-truth-driven sequence,
-why role-promotion needs a restart, the `SocketAddr` gap this works
-around, and how a controller restart resumes).
+2026-09-06)" section and its 2026-09-16 amendment for the full design (the
+live-truth-driven sequence, why role-promotion needs a restart, and how a
+controller restart resumes) — the promoted ordinal's dial address is just
+its own stable pod DNS name; no Kubernetes pod-IP lookup is involved.
 
 **Growing `controlNodes` restarts every pod, not just the promoted
 one.** Regenerating the config that drives the role split requires a

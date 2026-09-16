@@ -50,7 +50,6 @@ pub struct FakeClusterApi {
     secrets: Mutex<BTreeMap<String, Secret>>,
     networkpolicies: Mutex<BTreeMap<String, NetworkPolicy>>,
     poddisruptionbudgets: Mutex<BTreeMap<String, PodDisruptionBudget>>,
-    pod_ips: Mutex<BTreeMap<String, String>>,
 }
 
 impl FakeClusterApi {
@@ -141,16 +140,6 @@ impl FakeClusterApi {
     #[must_use]
     pub fn poddisruptionbudget(&self, name: &str) -> Option<PodDisruptionBudget> {
         self.poddisruptionbudgets.lock().unwrap().get(name).cloned()
-    }
-
-    /// Seed a pod's `status.podIP` (S-07d) — used to drive the control-voter
-    /// growth step's dial-address resolution (`crate::controller::
-    /// resolve_control_dial_addr`).
-    pub fn seed_pod_ip(&self, pod_name: &str, ip: &str) {
-        self.pod_ips
-            .lock()
-            .unwrap()
-            .insert(pod_name.to_string(), ip.to_string());
     }
 }
 
@@ -274,14 +263,6 @@ impl ClusterApi for FakeClusterApi {
 
     async fn get_secret(&self, _ns: &str, name: &str) -> Result<Option<Secret>, ReconcileError> {
         Ok(self.secrets.lock().unwrap().get(name).cloned())
-    }
-
-    async fn get_pod_ip(
-        &self,
-        _ns: &str,
-        pod_name: &str,
-    ) -> Result<Option<String>, ReconcileError> {
-        Ok(self.pod_ips.lock().unwrap().get(pod_name).cloned())
     }
 }
 
