@@ -183,6 +183,32 @@ const REBALANCE_EVERY_N_TICKS: u64 = 8;
 /// retarget itself sound regardless of how this is tuned.
 pub const SPLIT_PLACING_RETARGET_DWELL: Duration = Duration::from_millis(5_000);
 
+/// The same dwell, but for a target that has ALREADY been achieved —
+/// `Tablet::replicas` already equals the stored `SplitPlacing::target`
+/// (issue #670/#921 fix). Once metadata has fully committed to a directed-
+/// Placing decision, reconsidering it is strictly more disruptive than
+/// reconsidering one still mid-convergence: `replan`'s only remaining
+/// eligible candidates for a split child are typically its own pre-split
+/// siblings, so a retarget here can converge the tablet right back toward
+/// the set the split was moving it away from — reproduced directly, twice,
+/// over real `ProdEnv` clusters under nothing more than this sandbox's own
+/// ordinary background load (no synthetic contention beyond the two
+/// concurrent processes `crates/animusd/tests/
+/// split_placing_two_replica_diff_e2e.rs` itself runs): `n0`'s own
+/// `voter_history` reaching the correct 3-member target and then, seconds
+/// later, changing AGAIN to a different 4-then-3-member set. A genuinely
+/// (not falsely) dead member here still self-heals — it just does so more
+/// slowly, at [`SPLIT_PLACING_RETARGET_DWELL`]'s own 6x multiple, which
+/// `docs/engineering-lessons.md`'s issue #670/#921 entry measures as
+/// comfortably past what this repo's own two-concurrent-heavy-process
+/// contention methodology can sustain, while [`SPLIT_PLACING_RETARGET_
+/// DWELL`] itself demonstrably is not. This is a deliberate asymmetry, not
+/// an oversight: ADR 0062 §2's own stated design goal is "the target is
+/// never recomputed while it is healthy, which is what makes it stable" —
+/// this constant extends that same stability guarantee to the point AFTER
+/// the target has already been fully realized, where it matters most.
+pub const SPLIT_PLACING_RETARGET_DWELL_ACHIEVED: Duration = Duration::from_millis(30_000);
+
 /// How often a member emits a liveness heartbeat to the control group
 /// (ADR 0012). On the order of the Raft heartbeat interval, and short relative to
 /// [`DETECT_TIMEOUT`] so a live member is comfortably seen within the window.
@@ -1937,6 +1963,12 @@ async fn reconcile_loop<E: Env>(env: E, core: Arc<Mutex<RaftCore>>, cache: Arc<M
 /// least [`SPLIT_PLACING_RETARGET_DWELL`] — i.e. tablets `split_placing_
 /// reconcile` may recompute a fresh target for this tick.
 ///
+/// **Issue #670/#921 fix**: a tablet whose `Tablet::replicas` already equals
+/// the stored `target` uses [`SPLIT_PLACING_RETARGET_DWELL_ACHIEVED`]
+/// instead of the base dwell — see that constant's own doc for why an
+/// already-achieved target is held to a stricter (longer) bar before being
+/// reconsidered than one still mid-convergence.
+///
 /// `retarget_since` is mutated in place: a member observed `Active` this
 /// tick has its tracked timer removed (a "continuously down" clock must
 /// restart from zero the next time it goes down, not resume a stale one —
@@ -1961,6 +1993,10 @@ fn retarget_ready_this_tick<E: Env>(
         let Some(target) = &entry.target else {
             continue; // nothing stored yet for this entry — no dwell to track
         };
+        let dwell = match view.tablets.get(&tablet) {
+            Some(t) if t.replicas == *target => SPLIT_PLACING_RETARGET_DWELL_ACHIEVED,
+            _ => SPLIT_PLACING_RETARGET_DWELL,
+        };
         for member in target {
             let is_active = view
                 .members
@@ -1973,7 +2009,7 @@ fn retarget_ready_this_tick<E: Env>(
             let since = *retarget_since
                 .entry((tablet, member.clone()))
                 .or_insert(now);
-            if now.duration_since(since) >= SPLIT_PLACING_RETARGET_DWELL {
+            if now.duration_since(since) >= dwell {
                 ready.insert(tablet);
             }
         }

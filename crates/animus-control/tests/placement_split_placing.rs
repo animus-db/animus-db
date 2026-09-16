@@ -907,3 +907,106 @@ fn split_placing_phase_flapping_under_the_dwell_does_not_retarget() {
         );
     }
 }
+
+/// **Test 10** (issue #670/#921 fix): unlike test 8 above, where a target
+/// member going `Down` PAST the dwell (before the fix, [`SPLIT_PLACING_
+/// RETARGET_DWELL`]; after it, [`SPLIT_PLACING_RETARGET_DWELL_ACHIEVED`],
+/// since the target here is already achieved) correctly retargets away from
+/// a genuinely dead member — this test proves the ACHIEVED dwell is
+/// genuinely longer: run the identical fault (a target member down for
+/// good) for exactly the SAME window test 8 uses to observe its retarget
+/// (`SPLIT_PLACING_RETARGET_DWELL` plus slack), and assert NOTHING has
+/// retargeted yet — the achieved target is held to the stricter bar. This
+/// is the mechanism reproduced directly, twice, in `crates/animusd/tests/
+/// split_placing_two_replica_diff_e2e.rs` under nothing more than this
+/// repo's own ordinary CI/sandbox contention: a target member's liveness
+/// flap, arriving strictly AFTER the tablet had already converged to the
+/// directed-Placing target, retargeted the tablet away from an
+/// already-realized placement decision.
+#[test]
+fn split_placing_phase_holds_an_already_achieved_target_past_the_base_dwell() {
+    use animus_control::node::{
+        SPLIT_PLACING_RETARGET_DWELL, SPLIT_PLACING_RETARGET_DWELL_ACHIEVED,
+    };
+    assert!(
+        SPLIT_PLACING_RETARGET_DWELL_ACHIEVED > SPLIT_PLACING_RETARGET_DWELL,
+        "the achieved dwell must be strictly longer than the base one for this test to mean \
+         anything"
+    );
+
+    let seed = 0x5717_000au64;
+    let (mut sim, nodes) = cluster(seed);
+    sim.run_for(Duration::from_secs(2));
+    let leader = leader_among(&nodes, &[0, 1, 2]);
+
+    for id in [10, 11, 12, 13, 14] {
+        register(&sim, &nodes[leader], id);
+    }
+    sim.run_for(Duration::from_secs(1));
+
+    // Identical fixture to test 8: RF3 over 5 candidates prefers [n10, n11,
+    // n12], differing from the parent's own fork-inherited replicas.
+    split_fixture(&mut sim, &nodes, leader, &[12, 13, 14]);
+
+    let target = vec![nid(10), nid(11), nid(12)];
+    assert!(
+        wait_converged(
+            &mut sim,
+            &nodes,
+            leader,
+            &[TabletId(2), TabletId(3)],
+            &target
+        ),
+        "initial convergence to the stored target never happened (seed={seed})"
+    );
+
+    // Only NOW, once the target is already fully achieved, does n10 (a
+    // member of it) go down for good — the identical fault, at the
+    // identical point in the sequence, that test 8 applies BEFORE
+    // convergence.
+    sim.crash(nid(10));
+    assert!(matches!(
+        nodes[leader].propose(MetaCommand::UpsertMember {
+            node: nid(10),
+            labels: BTreeMap::new(),
+            status: NodeStatus::Down,
+        }),
+        ProposeResult::Accepted { .. }
+    ));
+
+    // Run for exactly the window that is enough to retarget an UN-achieved
+    // target (test 8's own `SPLIT_PLACING_RETARGET_DWELL` plus slack) —
+    // comfortably short of `SPLIT_PLACING_RETARGET_DWELL_ACHIEVED`. Nothing
+    // must have moved: the stored target and the tablet's own replicas both
+    // stay exactly on the already-achieved value.
+    sim.run_for(SPLIT_PLACING_RETARGET_DWELL + Duration::from_secs(3));
+    for child in [TabletId(2), TabletId(3)] {
+        let meta = nodes[leader].metadata();
+        assert_eq!(
+            meta.split_placing[&child].target,
+            Some(target.clone()),
+            "child {child:?}: an already-achieved target must not retarget within the base \
+             dwell window (seed={seed})"
+        );
+        assert_eq!(
+            meta.tablets[&child].replicas, target,
+            "child {child:?}: replicas must stay on the already-achieved target within the base \
+             dwell window (seed={seed})"
+        );
+    }
+
+    // Past the LONGER achieved dwell, the genuinely (permanently) dead
+    // member is still eventually replaced — the achieved dwell delays
+    // repair, it does not disable it.
+    let fresh_target = vec![nid(11), nid(12), nid(13)];
+    assert!(
+        wait_converged(
+            &mut sim,
+            &nodes,
+            leader,
+            &[TabletId(2), TabletId(3)],
+            &fresh_target
+        ),
+        "never retargeted/converged past the achieved dwell (seed={seed})"
+    );
+}
