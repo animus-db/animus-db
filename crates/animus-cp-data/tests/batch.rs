@@ -183,6 +183,53 @@ fn batch_reapplies_idempotently_on_restart() {
     assert_all_present(&nodes, &[0, 1, 2], &puts, seed);
 }
 
+/// Issue #834 / ADR 0050 rung 5: `KvCommand::Batch`'s own seal gate is
+/// whole-or-nothing, exactly like `Put`/`Cas`/`KindBatch` — a batch proposed
+/// after the range froze must apply as a deterministic no-op on every
+/// replica, not land any of its keys. Not covered by `tests/freeze.rs`'s own
+/// "every later-ordered mutation" sweep (plain put, kind batch, CAS, seed
+/// batch, txn stage — no `Batch`), and issue #834 changed exactly this
+/// arm's write path (from a direct per-key `storage.merge` to the shared
+/// `pending`/`flush_pending` run every other gated arm already uses), so
+/// this closes that gap directly.
+#[test]
+fn batch_rejected_wholesale_by_a_frozen_range() {
+    let seed = 0xBA7C_F235;
+    let (mut sim, nodes) = group(seed);
+    sim.run_for(Duration::from_secs(2));
+    let l = leader(&nodes, &[0, 1, 2], seed);
+
+    match nodes[l].propose_freeze() {
+        ProposeResult::Accepted { .. } => {}
+        other => panic!("freeze not accepted: {other:?} (seed={seed})"),
+    }
+    sim.run_for(Duration::from_secs(2));
+    for (i, n) in nodes.iter().enumerate() {
+        assert!(
+            n.is_frozen(),
+            "replica {i} did not latch frozen after the Freeze applied (seed={seed})"
+        );
+    }
+
+    let puts = batch(10);
+    match nodes[l].put_batch(puts.clone()) {
+        ProposeResult::Accepted { .. } => {}
+        other => panic!("post-freeze batch not appended: {other:?} (seed={seed})"),
+    }
+    sim.run_for(Duration::from_secs(2));
+
+    for (i, n) in nodes.iter().enumerate() {
+        for (k, _) in &puts {
+            assert_eq!(
+                block_on(n.local_get(k)),
+                None,
+                "node {i}: a batch proposed after the freeze must not land any key, \
+                 not even partially (seed={seed})"
+            );
+        }
+    }
+}
+
 #[test]
 fn run_is_deterministic_from_seed() {
     let observe = |seed: u64| {

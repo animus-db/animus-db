@@ -243,8 +243,8 @@ reusing the captured config is the point of the test.
 - **`topology`/`decide` moved to `animus-node`** (ADR 0061 rung C1) — pure,
   side-effect-free routing decisions (`decide_cp_route`, `tablet_for_key`,
   `format_not_leader_refusal`/`parse_not_leader_refusal`) and decision
-  predicates (`frozen_refusal`, `confirm_wait_is_futile`,
-  `read_should_retry`, `align_split_key`, `byte_weighted_median`,
+  predicates (`frozen_refusal`, `read_should_retry`, `align_split_key`,
+  `byte_weighted_median`,
   `other_tablet_replica_addr`/`decide_forward_retry`), respectively — moved
   verbatim into the `E: Env`-generic `animus-node` crate, visibility widened
   `pub(crate)` → `pub` since a crate boundary now sits where an in-crate
@@ -253,19 +253,22 @@ reusing the captured config is the point of the test.
   `topology::decide_cp_route`/`decide::frozen_refusal` call site kept
   compiling unchanged. `decide`'s predicates (originally lifted out of
   `impl ClientCtx` by ADR 0061 Phase A rung A6) take primitive facts
-  (`is_frozen: bool`, `engine_applied_index: u64`, `is_leader: bool`)
-  rather than `&CpGroup` — the caller in `lib.rs` still reads those fields
-  off the real `ProdEnv`-backed handle immediately before calling in, since
-  `CpGroup` can't be constructed without bring-up. `confirm_futility_tests`
+  (`is_frozen: bool`) rather than `&CpGroup` — the caller in `lib.rs` still
+  reads those fields off the real `ProdEnv`-backed handle immediately
+  before calling in, since `CpGroup` can't be constructed without bring-up.
+  **`decide::confirm_wait_is_futile` (moved here alongside the rest) was
+  deleted by issue #971** — its `!is_leader()` clause was unsafe for every
+  one of its callers (issues #911, #967, #971); the leadership-independent
+  replacement, `kind_batch_confirm_superseded`, stayed in `animusd::lib`
+  rather than moving to `animus-node`, since every one of its own callers
+  is itself `animusd`-local. `confirm_futility_tests`
   (in-crate here, real-socket, `#[tokio::test(flavor = "multi_thread")]`)
-  deliberately stays in `lib.rs` rather than moving alongside
-  `confirm_wait_is_futile`: it proves the wired end-to-end fast-fail
-  behavior through a real `CpGroup` propose/apply/poll round trip with
-  timing assertions, not the predicate in isolation — moving it would have
-  broken `animus-node`'s "no bring-up" invariant for no benefit, since
-  `decide::confirm_wait_is_futile` already has its own direct truth-table
-  unit tests there. See `animus-node/CLAUDE.md` for the full module docs,
-  now maintained there instead of here.
+  proves the wired end-to-end fast-fail behavior through a real `CpGroup`
+  propose/apply/poll round trip with timing assertions, not a predicate in
+  isolation — `kind_batch_confirm_superseded`'s own direct truth-table
+  unit tests (`kind_batch_confirm_superseded_tests`, `animusd::lib`) cover
+  the predicate itself. See `animus-node/CLAUDE.md` for the full module
+  docs, now maintained there instead of here.
 - **`ClientRequest`/`ClientResponse`/`Surface`/`surface_of`/
   `is_relayable_command`, plus the plain-data types they embed
   (`KindWriteOp`/`PendingKindWrite`/`TxnTableWrite`/`TxnPrecondition`/
@@ -644,8 +647,10 @@ reusing the captured config is the point of the test.
 - **`dynamo_streams.rs`** (ADR 0042 §3/§5/§6/§7/§9/§10/§11) — the
   DynamoDB Streams read API: `ListStreams`/`DescribeStream`/
   `GetShardIterator`/`GetRecords`. Full design (label resolution, the
-  sealed-vs-open serve split, `StreamHotRead`) is in
-  `docs/streams-notes.md` — this entry is just the module pointer.
+  sealed-vs-open serve split, `StreamHotRead`, and — since issue #859 —
+  `StreamHotChangeMax`, `GetShardIterator{LATEST}`'s own O(1) primitive
+  over `RaftKvNode::hot_change_max` rather than a full hot-tail scan) is
+  in `docs/streams-notes.md` — this entry is just the module pointer.
 - **`pitr_janitor.rs`'s two loop bodies moved to `animus_node::
   pitr_janitor`** (ADR 0061 rung C2) — this module is now a thin wrapper
   for both `pitr_snapshot_loop` and `pitr_janitor_loop`, same shape as
@@ -878,7 +883,25 @@ reusing the captured config is the point of the test.
   for the authoritative design. **The hot-trim arm's merge-residue
   cursor-row cleanup was removed** (tablets are split-only, ADR 0044) —
   `trim_janitor` only ever touches
-  `KIND_CHANGE` rows now, never `KIND_CURSOR`. **`clear_backfill_cursor`**
+  `KIND_CHANGE` rows now, never `KIND_CURSOR`. **`trim_janitor`'s own
+  `KindBatch` deletes share `Metric::CpProposalsAccepted` with every real
+  client write on the same group (issue #974)** — it runs unconditionally
+  on every led tablet each `INDEX_DRAIN_INTERVAL` tick, even for a plain
+  table with no GSI/stream/PITR consumer (a marker record is never itself
+  consumer-visible, so it is always immediately safe to delete), and its
+  `cp_kind_write_raw` call goes through the exact same
+  `RaftKvNode::put_kind_batch`/`record_propose` choke point a client's own
+  `KindBatch` write does — nothing below that point can tell the two apart.
+  `trim_janitor` now also increments `Metric::CpHousekeepingProposalsAccepted`
+  at its own call site (the one place that knows a given accepted propose is
+  housekeeping, not a reaction to a client request), so a caller that needs
+  "proposals a client write actually caused" over some window can subtract
+  that counter's own delta from `CpProposalsAccepted`'s. See
+  `tests/batch_write.rs`'s module doc for the investigation (a same-tick
+  trim landing inside a metrics-scraping test's own before/after window,
+  not a duplicate propose from any confirm-loop retry) and `crates/
+  animus-env/src/metrics.rs`'s `CpHousekeepingProposalsAccepted` doc.
+  **`clear_backfill_cursor`**
   (ADR 0045 §5 step 3) is a fifth, on-demand (not per-tick) function in this
   module: an idempotent tombstone of one index's own backfill cursor row on
   one tablet, reached via the internal-only `ClientRequest::
@@ -1529,6 +1552,31 @@ reusing the captured config is the point of the test.
   legacy shape, plus a real-cluster regression pinning the wire shape
   (`tests/control_membership_admin.rs::
   admin_config_reports_the_internal_addr_the_cli_resolves_control_add_through`).
+  **`addr` is a `String`, not a `std::net::SocketAddr` — fixed 2026-09-16,
+  issue #913 (the same underlying gap issue #662 also reported)**:
+  `AddControlMemberReq.addr` used to be `SocketAddr`-typed, so it could
+  only ever deserialize a literal `ip:port`, never a DNS hostname — the
+  one address surface in this admin API that hadn't caught up to the
+  string/hostname-typed convention every other Kubernetes-facing address
+  already uses (`RoleAddrs::advertise_host`, `--seed`, the `ProdEnv::
+  merge_peer` peer book, `NodeAddrs.internal` itself). Fixed by widening
+  the field to `String` — never a real DNS resolution step in
+  `action_add_control_member` itself, since that handler runs generic
+  over `E: Env` and real I/O may only ever happen behind the `Env` seam
+  (ADR 0003); resolution stays exactly where it already lived for every
+  other such string, lazily at dial time via `TcpStream::connect`'s own
+  `ToSocketAddrs` impl for `&str`. `animus admin control-add` needed no
+  change at all — both its forms already built the request body from a
+  plain `&str`/`String`, never parsed it as a `SocketAddr` (see
+  `crates/animus-cli/CLAUDE.md`). This also let `animus-operator` drop its
+  `ClusterApi::get_pod_ip` detour (ADR 0060's "The `SocketAddr` gap,
+  closed" amendment) and hand the promoted pod's own stable DNS name
+  straight to `member/add`, same as every other address it advertises.
+  **Issue #662's own addition on top**: widening `addr` to a bare `String`
+  also removed the free shape-checking `SocketAddr::deserialize` used to
+  give for free, so the handler now runs a cheap `host:port` shape guard
+  of its own (`looks_like_host_port`, a plain `400` for a garbled `addr`,
+  never a `500`/panic).
   This dashboard control still sidesteps the whole problem rather than
   reproducing the CLI's own resolution step: it asks the
   operator for the new voter's internal address directly (two inputs, node
@@ -2334,6 +2382,59 @@ accept and confirm, reproducing the identical false-negative class
 deterministically) and `cp_kind_raw_local_genuine_loss_tests` (proves the
 fast-fail path for an actually-truncated entry is unchanged).
 
+**`cp_kind_eval_local` carried the identical `!is_leader()` hazard,
+unfixed, until issue #967.** Unlike `cp_kind_raw_local`, it already used
+`classify_kind_batch_outcome` as its *primary* confirm channel (it has no
+value-equality fallback at all — apply computes the written bytes itself),
+but its `Inconclusive` fallthrough still called `decide::
+confirm_wait_is_futile` verbatim before falling back to one more identity
+check and giving up — so the same term-bump false negative reached the ADR
+0054 single-item `PutItem`/`UpdateItem`/`DeleteItem` path too (caught by
+`batch_write.rs::batched_write_beats_per_key`'s exact per-key propose-count
+assertion under CI load: 200 `PutItem`s accepted 201 proposals). Fixed
+identically, and the shared leadership-independent check between the two
+loops is now one function, `kind_batch_confirm_superseded`
+(`crates/animusd/src/lib.rs`, directly unit-tested in
+`kind_batch_confirm_superseded_tests`) — both `cp_kind_raw_local` and
+`cp_kind_eval_local` call it instead of re-deriving the check inline, so a
+future third caller cannot reintroduce this by hand-rolling it again.
+Regression: `write_path.rs`'s `cp_kind_eval_local_genuine_loss_tests`
+(mirrors `cp_kind_raw_local_genuine_loss_tests` — proves the fast-fail path
+for a genuinely truncated entry is unchanged for this loop too). The
+literal term-bump-without-loss window (this node's `is_leader()` flipping
+false while its own accepted entry is still genuinely pending) was, as for
+issue #911, not itself reliably reproducible in `SimEnv` — see
+`docs/lessons/code-patterns/2026-09-16-is-leader-false-is-not-proof-a-write-is-lost.md`
+for why the direct unit tests of the extracted decision function, plus the
+fast-fail regression above, are this fix's actual test evidence rather than
+a live-race reproduction.
+
+**`poll_probe` (the shared primitive behind `cp_batch_local`, the raw
+`PutBatch` client-protocol write) and `cp_put_local`/`cp_delete_local`
+(the raw `Put`/`Delete` client-protocol writes) carried the same
+`!is_leader()` hazard, unfixed, until issue #971.** All three predate
+`cp_kind_raw_local`/`cp_kind_eval_local`'s own fixes and share this file's
+oldest confirm-loop shape: a value-equality primary channel (`local_get`/
+`local_get_kind`), falling through to `decide::confirm_wait_is_futile`
+verbatim once inconclusive. Fixed the same way: all three now call
+`kind_batch_confirm_superseded` instead, keeping their own value-equality
+fallback (and, for `poll_probe`, its `ProbeIdentity` idempotency gate)
+exactly as before — only the futility signal changed, not the confirm
+channel or the probe-vs-apply re-check around it (still needed here,
+unlike `cp_kind_eval_local`: a value probe can race its own write becoming
+visible during its own `.await`, which `kind_batch_confirm_superseded`'s
+synchronous local reads cannot by themselves disambiguate from a genuine
+supersession). `decide::confirm_wait_is_futile` had no remaining caller
+once these three were fixed and was deleted, along with its unit tests
+(`crates/animus-node/src/decide.rs`). Regression:
+`write_path.rs`'s `cp_batch_local_genuine_loss_tests` (mirrors
+`cp_kind_eval_local_genuine_loss_tests` for `cp_batch_local`/`poll_probe`
+— proves the fast-fail path for a genuinely truncated entry is unchanged);
+`cp_put_local`/`cp_delete_local` share the identical `kind_batch_
+confirm_superseded` call and are covered by that function's own direct
+unit tests plus `poll_probe_identity_tests`' existing live coverage of the
+same confirm-loop shape.
+
 **`cp_scan_kind` (ADR 0041)** is `cp_scan`'s single-tablet, kind-scoped
 sibling — the LSI `Query` read primitive: unlike `cp_scan`'s per-table
 fan-out, `start`/`end` must resolve to the *same* tablet (an LSI query is
@@ -2423,6 +2524,37 @@ local replica gives a hint + a `client_route` exists; otherwise **waits** for th
 local group to elect (never forwards to a non-leader, including itself, during
 election). **One-hop invariant**: the receiver (`cp_serve_forwarded`) never
 re-forwards.
+
+**Cross-replica leader-hint fan-out on a stale local view (issue #950,
+fixed).** The "waits for the local group to elect" branch above used to be
+**unconditional and purely local**: if this node hosts a replica of the
+tablet but that replica's own `leader()` hint is unknown, `cp_route`
+polled only its own local state every `SCHEMA_POLL_INTERVAL` for up to
+the full `CLIENT_TIMEOUT`, even when every OTHER replica of the tablet
+had known a stable leader the entire time — indistinguishable, from
+purely local evidence, from a genuine election in progress, but in
+practice usually this one node's own heartbeat/apply processing lagging
+its peers under load (a continuously-known, stable leader confirmed by
+an independent `/admin/raftkv` poll over the same window the routed
+write stalled). Fixed: past `CP_ROUTE_LOCAL_SUB_BUDGET` (750ms,
+comfortably above the CP-data plane's own election-timeout range), `cp_route`
+asks every other known replica **concurrently** what THEIR own local
+replica believes (`ClientRequest::CpLeaderHintProbe`, always wrapped in
+`Forwarded`, answered by any replica — leader or follower — straight
+from `cp_leader_hint`, no leader requirement, no propose/wake/block); the
+first usable answer becomes a real **hinted** forward
+(`CpRoute::Forward(addr, true)`), handing off to the already-hardened
+`forward_to_tablet_leader` chase below. Retries every
+`CP_ROUTE_FANOUT_RETRY_INTERVAL` (500ms) if a round finds nothing, still
+bounded by the overall `CLIENT_TIMEOUT`. Concurrent, not serial — there
+is no vouching signal to prefer one candidate replica over another here,
+so racing them costs nothing over trying them one at a time (see
+`docs/lessons/code-patterns/2026-09-15-a-per-hop-timeout-cap-does-not-
+bound-a-serial-fallbacks-total-cost.md`). `Metric::
+CpRouteFanoutRecoveredLeader`/`CpRouteFanoutExhausted` plus a
+`tracing::warn!` at recovery make this class of staleness observable.
+Regression: `sim_cluster_cp_route_fanout.rs`. See ADR 0017's matching
+2026-09-16 amendment for the full account.
 
 **Hinted-retry forwarding** (`ClientCtx::forward_to_tablet_leader`, the single
 choke point for every forward — `cp_forward` is its (table, key)-resolving
@@ -3746,6 +3878,30 @@ sweeper-skip regression
 (`write_after_leader_kill_of_a_quiesced_group_converges`) — the one
 property `SimEnv` structurally cannot prove.
 
+**Issue #920 (2026-09-16) — a rolling restart of every replica, quiescence
+investigated and ruled out.** `src/sim_cluster_quiesced_rolling_restart.rs`
+has two `SimCluster` scenarios: `quiesced_group_survives_rolling_restart_
+every_order` proves the plain mechanism this section documents already
+self-heals a clean rolling restart of a quiesced 3-replica group (crash +
+restart every replica, every order, durable per-tablet engine reused) —
+passes unmodified, converging in well under a second, since a restarted
+replica's `leader_id` resets to `None` (volatile) and its own ordinary
+election timeout campaigns unaided; quiescence's own wake machinery (fork
+B/H) was never the blocker. `quiesced_group_survives_rolling_restart_
+racing_failure_driven_repair_every_order` is the actual regression: it
+reproduces the production incident by racing the SAME rolling restart
+against the control plane's OWN failure-driven placement repair (ADR
+0012's `DETECT_TIMEOUT`, 500ms, trips on an ordinary pod recreation just
+as readily as a real failure) — fails deterministically on unmodified
+`main` (every order), fixed by reordering `animus-cp-data::RaftKvNode::
+reconfigure_step`'s down-voter-removal step to run after, not before, the
+add-a-replacement-first learner-phase steps (see that crate's `CLAUDE.md`
+and ADR 0048's 2026-09-16 amendment for the full mechanism). Both use the
+same `ANIMUS_QUIESCE_SEEDS` depth knob `animus-cp-data/tests/
+quiescence.rs` already defines — a new cell of that corpus, hosted here
+because it needs this crate's own `ClientCtx`/forwarding machinery, not a
+reason for a new `ANIMUS_*_SEEDS` variable.
+
 ## Heartbeat batching (ADR 0044 phase 2 — C-02 PR 2 shipped it off by
 default; PR 3, the cutover, flips the default ON — C-02 is now complete)
 
@@ -4568,6 +4724,29 @@ ADR itself for the full design/rationale.
 
 ## Gotchas
 
+- **Every listener accept loop must survive a single transient `accept()`
+  error (issue #592, fixed 2026-09-16)** — `serve_requests` (`lib.rs`, the
+  client/intra ports), `dynamo::serve`, `admin::serve`, and
+  `console::serve` each used to `return` on any `Err` from
+  `listener.accept()`, permanently killing that listener (closing the
+  port) on the very first transient `EMFILE`/`ECONNABORTED`/similar —
+  despite each one's own doc comment claiming to mirror
+  `animus_env::prod::spawn_accept`'s established "log + back off + keep
+  accepting" contract, which none of the four actually implemented for a
+  listener-level `accept()` error (only for a per-connection TLS-handshake
+  failure). This is what produced `index_backfill.rs`'s own
+  `connect: Connection refused` panic against an address that had bound
+  and served correctly moments earlier — a split's burst of new per-tablet
+  engines/Raft groups is exactly the kind of transient fd pressure that
+  can tip one `accept()` into a momentary error. All four loops now retry
+  with `ACCEPT_ERROR_BACKOFF` instead of returning. See
+  `docs/lessons/general/2026-09-16-an-accept-loop-must-outlive-a-single-
+  transient-accept-error.md` for the full investigation (including why the
+  CI log showed no diagnostic trace — this crate's test binaries install
+  no `tracing_subscriber`, so the very `"accept failed"` warning that would
+  have named the cause is unconditionally silent there). When adding a
+  fifth listener to this crate, copy the retry shape, not the pre-fix
+  `return`.
 - **The DynamoDB Streams segment store + sealer knobs are wired via the
   `_with_orphan_sweep_after`-style layered-wrapper convention** (ADR
   0042/0043): `main.rs`'s `--stream-seal-bytes B`/
@@ -5597,7 +5776,18 @@ ADR itself for the full design/rationale.
   `control-remove` as part of decommission," never "skip its safety
   checks"). See ADR 0037 (and ADR 0040's amendment on it) for the full
   design, and `docs/engineering-lessons.md` for the id-space-mismatch and
-  self-registration/admin-action-clobber war stories. **`admin_add_control_
+  self-registration/admin-action-clobber war stories. **This guard's own
+  post-election gap (issue #923, ADR 0037's 2026-09-16 amendment)**: right
+  after a leadership transfer, the guard could refuse a removal that names
+  a perfectly alive original voter "apparently dead," because `become_
+  leader`'s per-peer `last_contact` seed (a courtesy timestamp, not a
+  genuine ack) aged out after the same steady-state `CONTROL_PEER_
+  LIVENESS_TIMEOUT` a real ack would, and a fresh leader's first real
+  heartbeat round can legitimately take longer than that under the load a
+  leadership change itself creates. Fixed in `animus-control` (`RaftCore::
+  leader_since` + `CONTROL_LEADER_TAKEOVER_GRACE`, node.rs) — nothing in
+  this crate's own guard code changed, only the liveness signal it reads.
+  **`admin_add_control_
   member`'s "already registered?" gate must check `Metadata::node_addrs`,
   never `members` alone, and must bound-wait for this leader's own
   `engine_applied_index() >= commit_index()` before reading either
@@ -9960,7 +10150,7 @@ not through the DynamoDB wire):
 
 | File | Kept tests | Reason |
 |---|---|---|
-| `dynamo_index_scan.rs` | 5 (all) | Frozen behind open flake issue #418, untouched throughout |
+| `dynamo_index_scan.rs` | 5 (all) | Frozen behind open flake issue #418, untouched throughout (#418 closed 2026-09-16: its mechanism was already fixed under #559, `await_gsi_scan_everywhere`) |
 | `index_backfill.rs` | 3 (all) | Frozen behind open flake issue #592, untouched throughout |
 | `dynamo_index_writes.rs` | 6 (all) | Frozen behind open flake issue #610, untouched throughout |
 | `backfill_seeder.rs` | `split_during_backfill_converges_with_correct_final_gsi` | `SimCluster` spawns no `index_drain::change_consumer_loop`; proving it needs hand-interleaving three separately-timed on-demand primitives with no offline way to verify the aggregator can't race the cutover or that the post-cutover resweep converges — explicitly licensed by the rung's own opener |

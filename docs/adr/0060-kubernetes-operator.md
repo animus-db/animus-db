@@ -999,11 +999,12 @@ most one step:
    hasn't restarted into combined mode yet — wait (a `ControlNodesGrowing`
    status condition records the achieved/target counts and which ordinal is
    pending).
-4. Otherwise, resolve that ordinal's live `status.podIP` (via the
-   Kubernetes API — see "The `SocketAddr` gap" below for why not DNS) and
-   `POST /admin/control/member/add` against each already-confirmed voter
-   ordinal in turn until one accepts, then poll `GET /admin/control/
-   members` (bounded, ~15 × 2s) until the new ordinal shows up before this
+4. Otherwise, `POST /admin/control/member/add` (addressed by the
+   promoted ordinal's own stable `desired::pod_fqdn(name, ns, ordinal)`
+   hostname — see "The `SocketAddr` gap, closed" below; no Kubernetes API
+   lookup needed any more) against each already-confirmed voter ordinal
+   in turn until one accepts, then poll `GET /admin/control/members`
+   (bounded, ~15 × 2s) until the new ordinal shows up before this
    reconcile returns.
 
 This mirrors `drain_and_remove_node`'s own bounded-polling style (the same
@@ -1057,35 +1058,37 @@ restarting mid-growth, or the growth step itself failing and retrying, is
 exactly as safe as retrying `member/add` always is (see `admin_add_
 control_member`'s own doc: idempotent, safe to retry the whole call).
 
-### The `SocketAddr` gap (a real, pre-existing `animusd` limitation)
+### The `SocketAddr` gap, closed (issue #913)
 
-`POST /admin/control/member/add`'s `addr` field is typed
+`POST /admin/control/member/add`'s `addr` field used to be typed
 `std::net::SocketAddr` server-side (`admin::AddControlMemberReq`), which
-can only ever deserialize a literal IP:port — **never a DNS name**. Every
+could only ever deserialize a literal IP:port — never a DNS name. Every
 other address surface this operator or `animusd` itself uses for a
 Kubernetes pod (`RoleAddrs::advertise_host`, `ClientResponse::JoinInfo`,
 the peer book `ProdEnv::merge_peer`/`set_peers` populate) is deliberately
 string/hostname-typed for exactly the reason a pod's IP is not stable
-across a restart while its per-ordinal DNS name is. This is a genuine
-pre-existing gap in the admin API (built for the bare-metal CLI's
-numeric-IP world, ADR 0037), not introduced by this amendment, and not
-fixed by it either — fixing `AddControlMemberReq.addr` to accept a
-`String` the way `ProdEnv::merge_peer` already does is a named follow-up
-for `animusd`, out of this crate's own scope (this crate does not depend
-on `animusd` — see its own `CLAUDE.md`).
-
-The operator works around it by reading the promoted ordinal's **current**
-`status.podIP` via the Kubernetes API (`ClusterApi::get_pod_ip`) — not a
-DNS lookup, which would bypass the already-testable `ClusterApi` seam and
-add a real-network dependency no fake could stand in for — purely as a
-one-time bootstrap value for the leader's very first dial. The promoted
-node's own startup self-registration (`spawn_common_tail`'s
-`register_node_addrs`, unconditional on every combined-mode boot)
-republishes its real, DNS-name-based `advertised_addr` into the replicated
-`Metadata.node_addrs` moments later, which every node's own
-`peer_sync_loop` then adopts — so the resolved-IP staleness window this
-introduces is self-healing within moments of the call, not a permanent
-address pin surviving a future pod restart.
+across a restart while its per-ordinal DNS name is. This was flagged here
+as a genuine pre-existing gap (built for the bare-metal CLI's numeric-IP
+world, ADR 0037) that this crate worked around rather than fixed — and the
+workaround turned out to be load-bearing in a way this amendment did not
+anticipate: **under mutual TLS with DNS-only certificate SANs (ADR 0064),
+dialing the resolved IP fails the handshake outright**
+(`ServerName::IpAddress` against a certificate carrying no IP SAN), and
+the promoted node's own startup self-registration that was supposed to
+"self-heal" the pinned IP into its real hostname within moments (below)
+itself needs a working dial *to* that same node to land — so under TLS
+the failure never actually self-heals; it is permanent for that pod's
+whole lifetime. Root-caused and fixed by issue #913: `AddControlMemberReq.
+addr` is now a plain `String`
+(`docs/adr/0037-control-plane-membership-change.md`'s issue #913
+amendment), so this operator no longer resolves anything at all —
+`add_control_voter` addresses the promoted ordinal by its stable
+`desired::pod_fqdn(name, ns, ordinal)` hostname directly, the same string
+every other address surface here already uses. `ClusterApi::get_pod_ip`
+(and the `resolve_control_dial_addr`/`FakeClusterApi::seed_pod_ip`/
+`desired::pod_name` machinery that existed solely to serve it) is
+**deleted**, not kept as a fallback — there is no longer anything for it
+to work around.
 
 ### "Retry on the leader" without a leader address hint
 
@@ -1208,7 +1211,11 @@ exercised through `FakeAdminClient`/`FakeClusterApi`), `previous_applied_
 control_nodes` (renamed from `control_nodes_changed`, now unconditional),
 `ClusterApi::get_pod_ip` (+ `RealClusterApi`/`FakeClusterApi`
 implementors — `deploy/operator/rbac.yaml`'s pre-existing `pods: get/list/
-watch` grant already covers this, its first real consumer),
+watch` grant already covers this, its first real consumer) —
+**`resolve_control_dial_addr`/`ClusterApi::get_pod_ip` were later deleted
+outright by issue #913** (see this ADR's own "The `SocketAddr` gap,
+closed" section above); this list is an as-built record of what this PR
+shipped, not the current shape,
 `crd::CONDITION_CONTROL_NODES_SHRINK_REJECTED` (renamed)/
 `CONDITION_CONTROL_NODES_GROWING` (new), controller-level tests covering
 the shrink-still-rejected path, immediate config regeneration, waiting for
@@ -1344,3 +1351,394 @@ Regression: `crates/animusd/tests/admin_endpoint.rs`'s
 `admin_live_is_200_while_a_genuinely_leaderless_admin_health_is_503` and
 `crates/animus-operator/src/desired/statefulset.rs`'s
 `probes_target_admin_health_and_admin_live_on_admin_port`.
+
+## Amendment (2026-09-16, issue #662): `member/add`'s `addr` also gets a shape guard
+
+"The `SocketAddr` gap, closed (issue #913)" section above already covers
+widening `admin::AddControlMemberReq.addr` to `String` and dropping
+`animus-operator`'s `ClusterApi::get_pod_ip`/`resolve_control_dial_addr`
+workaround in favor of `desired::pod_fqdn` directly — issue #913 and issue
+#662 were two reports of the same underlying gap, and #913's fix landed
+first. The one thing #913's fix left unguarded: widening `addr` to a bare
+`String` also removed the free shape-checking `SocketAddr::deserialize`
+used to give for free, so `action_add_control_member` now runs a cheap
+`host:port` shape check of its own (`looks_like_host_port`, mirroring
+`main.rs::parse_seed_arg`'s identical guard) and returns a clean `400` for
+a garbled `addr` instead of accepting anything or failing later as an
+opaque dial error. See `crates/animusd/CLAUDE.md`'s matching note.
+
+## Amendment (2026-09-15, issue #864) — `spec.controlNodes` growth's own retry/logging contract, and the ephemeral-storage quorum-loss hazard it surfaced
+
+`e2e-kind-s3`/`e2e-kind-tls`/`e2e-kind-webhook`/`e2e-kind-encryption`
+recurred a flake at the S-07d growth phase: the promoted ordinal's own
+`GET /admin/health` never returned `200`, the control group's voter count
+never reached the target within `scripts/e2e-kind.sh`'s 120s stall guard,
+and the operator's own log showed nothing but its periodic reconcile
+cadence — no error, no reason. Two separate things needed fixing.
+
+### Part A — the growth step's own retry/logging contract
+
+`add_control_voter` (`controller.rs`) tried every already-confirmed
+control-voter ordinal exactly **once** per reconcile before giving up for
+the next ~30s reconcile, and logged nothing beyond a single aggregate
+`warn!` on total failure. `RaftCore::change_membership`'s own
+**erratum guard** (Raft §4/Ongaro — rejects a config change until a
+freshly-elected leader has committed a no-op in its own current term) is a
+genuine, expected, one-round-trip-after-election transient that two other
+call sites in this codebase (`animusd::sim_cluster_growth`/
+`sim_cluster_control_growth`, closing issues #667/#900) already needed a
+bounded in-place retry for — a single-shot attempt turns this transient
+into a 30-second-per-attempt stall.
+
+**Fix**: `add_control_voter` now retries its whole "ask every
+already-confirmed voter" round up to `ADD_VOTER_ROUNDS` (5) times with a
+short (500ms) backoff between rounds, entirely inside one reconcile call,
+before giving up. Every attempt — success or failure, and every
+"no progress this reconcile" branch of `advance_control_growth`
+(discovery unreachable, promoted pod not yet role `"combined"`) — is now
+logged at `INFO` with the target url, round, and outcome, closing the
+diagnosability gap directly (this is the contract: **a stalled growth
+reconcile must always be explainable from the operator's own log, never
+only from its absence**). This is real, useful hardening on its own merit,
+but investigation (Part B) found it unlikely to be what these three
+specific runs hit — the mechanism below better fits the observed timing.
+
+### Part B — the real mechanism: ephemeral storage cannot survive the growth roll
+
+Fresh evidence, captured with this same amendment's own diagnostics
+(`/admin/raft`'s `cluster_check_pending`/`refused_as_voter`, added
+alongside issue #667's boot-time check, and `scripts/e2e-kind.sh`'s
+matching failure-path dump), settled the mechanism on a later
+`e2e-kind-encryption` recurrence: growth *converged* (4 voters, 35s), and
+then the **whole control group went leaderless**, term inflating into the
+hundreds within about two minutes. The lone non-refused voter (the newly
+promoted ordinal, caught up, `refused_as_voter: false`) could never win an
+election alone — a majority of 4 needs 3.
+
+The chain, verified against the code:
+
+1. `scripts/e2e-kind.sh`'s single shared `AnimusCluster` manifest (every
+   e2e leg) sets `storage.ephemeral: true` for every pod, including
+   control voters. This ADR's own `StorageSpec::ephemeral` doc already
+   states this is "a real Raft safety hazard for any voter pod, not just
+   a durability trade-off" (`emptyDir` instead of a `PersistentVolumeClaim`,
+   and `animusd` runs with `--ephemeral`/`StorageBackend::Memory`).
+2. `desired::statefulset::restart_relevant_projection` bakes the raw
+   `controlNodes` threshold into the **one shared** pod-template
+   config-hash annotation — the whole `StatefulSet` has a single pod
+   template, so a `spec.controlNodes` edit rolls **every** pod, not just
+   the newly-promoted ordinal, even though an already-`"both"` ordinal's
+   own effective role never changes. Already documented, and
+   underestimated, in `crates/animus-operator/CLAUDE.md`'s own S-07d
+   section.
+3. A `StatefulSet`'s default `RollingUpdate` deletes and **recreates**
+   each Pod object, highest-ordinal-first, waiting for readiness at each
+   step — which discards an `emptyDir` along with the deleted Pod (a
+   container restart in place would not; a Pod delete+recreate always
+   does).
+4. Once the newly-promoted ordinal becomes `Ready` and growth completes,
+   the *same* rollout proceeds to the pre-existing voters. Each one,
+   wiped, restarts with an **empty Raft WAL** while its own peers'
+   committed config still names it with real history — exactly the
+   "wiped voter of an established cluster" case issue #667's boot-time
+   check (`RaftCore::begin_cluster_check`/`handle_cluster_probe_resp`) is
+   designed to refuse **permanently**, on purpose, to prevent an unsafe
+   double vote. Refuse enough of the pre-growth voters this way and the
+   group loses quorum for good.
+
+This is not a bug in the growth mechanism, the boot-time check, or the
+diagnostics — every piece behaved exactly as designed. It is the e2e
+smoke's own configuration exercising a combination this ADR already
+flagged as unsafe, for the first time, once S-07d's growth started
+routinely restarting every control voter's pod.
+
+**Fix**: `scripts/e2e-kind.sh`'s manifest now uses durable
+(`PersistentVolumeClaim`-backed) storage — the supported shape for any
+cluster whose `controlNodes` may change — instead of `ephemeral: true`.
+`kind` ships a default `StorageClass`, so this needs no further
+configuration. This could not be validated against a real `kind` cluster
+in the environment this fix was written in; the reasoning above is
+verified against the code at every step, and the change itself is a
+narrow, low-risk drop-in (the mounted data path is identical either way).
+
+**Additional safety net**: a new `EphemeralVoterStorageHazard` status
+condition (`crd.rs`) is now set, unconditionally, whenever
+`spec.storage.ephemeral` is `true` — regardless of `controlNodes`, since
+*any* config-affecting spec change (`spec.tls`, `spec.s3`,
+`spec.encryptionKeySecretName`, `spec.controlNodes`, ...) rolls every pod
+the same way. This is purely informational — a genuinely throwaway
+ephemeral cluster that never touches those fields again may still accept
+the risk deliberately — but it makes the hazard visible in `kubectl get
+animuscluster -o yaml` rather than only in this paragraph. **Left open as
+a maintainer decision**: whether a cluster with `controlNodes > 1` (or
+any voter at all) and `storage.ephemeral: true` should instead be a hard
+validating-webhook rejection.
+
+See issue #864 for the full investigation, `crates/animus-operator/
+CLAUDE.md`'s own S-07d section for the config-hash detail, and ADR 0009's
+2026-09-15 amendment for the boot-time check this hazard interacts with.
+
+### Part C (same day, continued) — the real circular dependency: the growth check's own gate, not readiness
+
+The durable-storage fix (Part B) closed one recurrence, but a follow-up
+real occurrence (`e2e-kind-webhook`, run 35034285159, job 104599679844)
+reproduced the *original* signature — the promoted ordinal stuck as
+`PreCandidate` (a fresh, self-inclusive genesis core forever pre-voting,
+correctly rejected by peers that already have a leader), voters stuck at
+`prior`, for the full 120s guard — with PVC storage in place, ruling out
+Part B's own mechanism.
+
+**What the operator's own log showed, with this ADR's own new logging in
+place**: the growth-step's "pod ordinal 3 has not yet restarted into role
+`combined`" line appeared exactly once, on the very first reconcile after
+the `controlNodes` patch — while the promoted ordinal was still the
+**old, Ready, data-role pod**. Every reconcile after that (once the
+config-hash rollout recreated that ordinal and it went `NotReady`) logged
+only the bare "reconciling AnimusCluster" line — `advance_control_growth`
+was never entered again at all.
+
+**Root cause, found by inspection, `controller.rs`'s `reconcile`**: the
+call to `advance_control_growth` was gated on `target_control_nodes >
+prior || already_growing`, where `prior` comes from
+`previous_applied_control_nodes` (the *ConfigMap's* own applied
+`controlNodes` value) and `already_growing` from a
+`CONDITION_CONTROL_NODES_GROWING` status condition read off *this
+reconcile's own* `cluster.status` argument. `reconcile_grows_
+regenerates_the_configmap_role_split_immediately`'s own pinned behavior
+means `prior` reaches `target` on that very first post-patch reconcile
+(the ConfigMap/StatefulSet must show the full target immediately so the
+promoted ordinal can restart into the right role at all) — so from the
+second reconcile onward, `already_growing` was the *only* thing that
+could still trigger the check. That condition is delivered to `reconcile`
+via `kube-runtime`'s watch-fed reflector `Store`, never a live `GET` — a
+real round trip through the API server whose latency is not bounded, and
+which this ADR's own S-07d design doc already says should never be load-
+bearing this way: `advance_control_growth`'s own doc calls the condition
+"a resume *optimization* ... never the source of truth," but the gate
+above made it exactly that once `prior` caught up. Whatever the precise
+timing (busier-than-usual API server traffic during the very rollout this
+mechanism exists to drive is one plausible contributor, though not
+confirmed), the design was fragile by construction: a single missed or
+delayed status round trip, at any point during an active growth, stops
+growth forever, since `prior` never drops back down to make `target >
+prior` true again.
+
+**Fix**: `advance_control_growth` is now called unconditionally whenever
+`prior` is known and the edit is not a rejected shrink — dropping the
+`already_growing` gate entirely. This is not a new cost in the way it
+might look: `advance_control_growth`'s own first step
+(`discover_control_voters`) is a single fast `GET` in the already-
+converged steady state (it returns on the first ordinal that answers),
+and it is what *already* decides whether there is anything to do — the
+condition remains exactly what the design intended it to be, a
+resume-optimization / user-visible progress message, never a gate on
+whether to check again. Regression:
+`reconcile_still_attempts_growth_when_the_growing_condition_did_not_
+survive` (`controller.rs`) — the sibling of the pre-existing `reconcile_
+resumes_growth_from_live_truth_after_a_simulated_restart` with the one
+thing that test relies on removed (no surviving status condition at all);
+confirmed to fail against the pre-fix gate and pass against the fix.
+
+**Also confirmed, not needing the same guard**: a plain `spec.nodes`
+scale-up (no `controlNodes` change) never touches the shared config-hash
+annotation at all — `config_hash_is_unchanged_by_a_nodes_only_scale_up`
+(`desired/statefulset.rs`) is the existing, still-green proof — so it
+never triggers a whole-`StatefulSet` roll and needs no equivalent fix.
+
+### Part D (same day) — a shell comment inside an unquoted heredoc is not a YAML comment
+
+Part B's own explanatory comment, written directly inside `scripts/
+e2e-kind.sh`'s unquoted manifest heredoc, carried backticks — which bash
+executes as command substitution inside an unquoted heredoc regardless of
+a leading `#` (`bash -n` cannot see this). Every e2e variant on that
+commit failed at "apply AnimusCluster" with a YAML parse error and a
+trail of "command not found" lines. Fixed by moving the explanation above
+the heredoc as an ordinary shell comment (always safe — a genuine `#`
+line is never re-interpreted there) and leaving a single, backtick-free
+line inside the heredoc itself. See `docs/lessons/testing/2026-09-15-a-
+comment-inside-an-unquoted-heredoc-is-shell-not-yaml.md` for the general
+lesson. The same commit also added a wait for the whole `StatefulSet`
+rollout (`kubectl rollout status statefulset/${AC_NAME}`) to finish
+before the e2e re-resolves the serving pod after growth converges — the
+config-hash rollout does not stop at the newly-promoted ordinal, it
+proceeds through every pre-existing voter's pod too (Part B's own
+mechanism), and the e2e's own "re-resolve and re-forward" phase was
+racing that continuation.
+
+### Part E (2026-09-16) — the new rollout-completion wait itself timed out on `e2e-kind-tls`; two hypotheses checked, one ruled out, one real bug found, one genuinely new bug filed separately
+
+A further real run (`e2e-kind-tls`, run 35036379078, job 104606305854, on
+the Part C/D head) hit `kubectl rollout status statefulset/${AC_NAME}
+--timeout=300s` (Part D) timing out, after growth itself had already
+converged (voters=4, measured live via `/admin/control/members`). Two
+things needed settling before trusting any of this ADR's own analysis
+further.
+
+**Hypothesis: a second, growth-triggered config-hash roll cascades
+through ordinals 2, 1, 0.** Checked directly against `kubectl describe
+statefulset`'s own `Events`: ordinals 0, 1, 2 show exactly one
+`SuccessfulCreate` each, at the StatefulSet's original creation, and
+**no** `SuccessfulDelete`/`SuccessfulCreate` pair at any point after —
+only ordinal 3 was ever recreated (once at the `spec.nodes` scale-up,
+once more for its `controlNodes`-triggered role flip, the expected
+single roll). **Ruled out**: there was no second cascade in this run.
+
+**Hypothesis: the operator log capture is unreliable (a buffered
+writer, or the operator process itself restarting), which is why earlier
+analysis of a stalled run saw only a handful of log lines.** Checked
+directly: `crates/animus-operator/src/main.rs` calls plain
+`tracing_subscriber::fmt::init()` — the default, synchronous writer over
+`std::io::stdout`'s own `LineWriter`, which flushes on every newline
+regardless of whether the destination is a terminal or (as here) a
+redirected file; this crate never configures `tracing-appender`'s
+non-blocking writer, so there is no buffering layer to lose lines.
+`scripts/e2e-kind.sh` execs `animus-operator run` exactly once, redirects
+its output to `$OPERATOR_LOG` with a single `>` at launch, and never
+re-launches or truncates it mid-run (the only other reference to the
+binary is the cleanup trap's `kill`/`pkill`). **Ruled out** as the cause
+of missing detail: the log is complete as written. What *was* true: this
+operator's `owns()` watches on five child kinds mean `apply_children`'s
+per-reconcile re-apply can itself trigger a burst of "related object
+updated" reconciles (confirmed in this same run's log: six reconcile
+events within under 200ms during the growth window) — over a multi-
+minute stall, this accumulates far past a `tail -n 200` cap, silently
+discarding exactly the reconciles that matter. **Fixed**: the
+diagnostics dump now prints the log's own total line count (`wc -l`) and
+whether the operator process is still alive (`kill -0 "$OPERATOR_PID"`)
+before dumping a much wider `tail -n 1000`, so the *next* recurrence can
+tell "log complete, just cropped too tight" apart from "process gone" or
+"lines genuinely lost" without re-deriving this investigation.
+
+**What actually stalled the rollout in this run**: `kubectl describe
+pods` for `e2e-3` showed `Restart Count: 0`, continuously `Running`
+since its own single post-growth restart, but `Ready: False` for the
+whole five-minute window. Its own log tail was filled with intra-cluster
+mTLS handshake failures against its peers (`e2e-0`/`e2e-1`/`e2e-2`'s own
+pod IPs): `TLS handshake failed ... error: AlertReceived(BadCertificate)`.
+A pod that cannot sustain Raft traffic with its peers never gets recent
+leader contact, `/admin/health` never returns `200`, Kubernetes readiness
+never succeeds, and the StatefulSet's own rolling-update logic — which
+always waits for a recreated pod's own readiness before touching the
+next lower ordinal, independent of `podManagementPolicy` — never
+proceeds past ordinal 3 at all. This is a **real, separate, TLS-specific
+bug** (a working hypothesis: `spec.tls`'s certificate is reissued from
+the *live* `spec.nodes` on every reconcile, `desired::certificate::build`
+— a scale-up can race a freshly-created pod's own boot against
+cert-manager's reissuance, and since TLS material is read once at
+startup and never hot-reloaded, a pod that boots on one side of a
+reissuance can end up permanently unable to validate peers that booted
+(and will never restart) on the other side) — filed as its own issue
+(**#913**) rather than folded into this one: it is orthogonal to every
+fix in Parts A-D, only plain and non-TLS legs (`e2e-kind`, `e2e-kind-
+s3`, `e2e-kind-encryption`) are unaffected, and confirming/fixing it
+needs its own read of how this cluster's mTLS trust material is actually
+wired, which Parts A-D's own growth-mechanism fixes do not touch.
+
+## Amendment (2026-09-16, issue #913) — cross-reference only
+
+Found investigating issue #864's own `e2e-kind-tls` leg: a `spec.nodes`
+scale-up recomputed `desired::certificate::build`'s Certificate SAN list
+from the live node count, so cert-manager reissued the one leaf cert every
+pod mounts identically (this ADR's TLS milestone, ADR 0064) on every
+scale-up — and with the e2e's bare self-signed `ClusterIssuer`, each
+reissuance was a brand-new, mutually-untrusted trust anchor, since
+`animusd` never reloads TLS material after startup (ADR 0064 Decision 6).
+Pods that booted on either side of a reissue rejected each other's
+handshake (`AlertReceived(BadCertificate)`) permanently. Full mechanism
+and fix — a node-count-invariant wildcard SAN set, and a two-step
+self-signed-CA-then-CA-issuer hierarchy for `scripts/e2e-kind.sh`'s own
+`E2E_TLS=1` leg — are written up in ADR 0064's own issue #913 amendment,
+per this file's standing convention (`spec.tls`'s design lives in ADR
+0064; this ADR only cross-references it). `crates/animus-operator/
+CLAUDE.md` carries the crate-local detail.
+
+### Part F (2026-09-16, continued) — a plain, non-TLS `e2e-kind` run: growth worked, the rollout-completion wait still timed out on a *different* recreated voter never becoming Ready
+
+A further real run (plain `e2e-kind`, run 35040977782, job 104620543550,
+on the #913 fix's own head) hit the same `kubectl rollout status`
+timeout — no `BadCertificate` anywhere (this leg carries no TLS at all),
+and the operator's own log this time showed growth working exactly as
+intended: "pod ordinal 3 has not yet restarted into role combined" at
+`:19`, then at `:29` a refused-or-unreachable add attempt against
+`e2e-0` and `e2e-1` followed by "control voter add accepted" via `e2e-2`
+— the exact "try every already-confirmed voter" retry Part A hardened —
+converging in 10s. The growth target (pod 3) ended the run at `/admin/health`
+`200`, `role: Leader`, `term: 3`, `commit_index: 41`, every voter
+present. **The stuck pod was a *different*, pre-existing, already-durable
+voter** (`e2e-1` in this run) — recreated by the same config-hash roll
+(highest-ordinal-first, one at a time: 3, then 2, then 1 — `kubectl
+describe pods` showed each one's own `Start Time` in that exact order)
+and never becoming Kubernetes-Ready, which is why the rollout-status
+wait (blocking on ordinal 1's readiness before the controller will even
+touch ordinal 0) never completed.
+
+**Hypothesis checked: the "durable" PVC mount isn't actually where
+`animusd` reads/writes**, so a recreated voter boots against empty
+storage exactly like the ephemeral case Part B fixed, despite durable
+storage being configured. **Refuted by direct code inspection**: the
+"data" `VolumeMount`'s own `mount_path` (`desired::statefulset::build`)
+and the `--dir` flag `entrypoint_script` execs `animusd` with
+(`desired::cluster_config`) are both generated from the exact same
+`cluster_config::DATA_DIR` constant (`"/var/lib/animus"`, matching the
+e2e's own `DATA_MOUNT_DIR`) — never two independently-hardcoded strings
+that could drift apart. `kubectl describe pods` for the stuck pod in
+this run's own diagnostics confirms the PVC (`data-e2e-1`) is mounted at
+that exact path, and the `PersistentVolumeClaimRetentionPolicy` (`When
+Deleted: Retain, WhenScaled: Retain`) means the same PVC — not a fresh
+one — reattaches across the pod's own delete/recreate. Pinned with a new
+test, `data_volume_mount_path_matches_the_animusd_dir_flag`
+(`desired/statefulset.rs`), so this specific hypothesis can't silently
+regress even though it wasn't the cause here.
+
+**What actually happened to the stuck voter is not yet known** — this
+run's diagnostics only dumped the growth *target*'s own `/admin/health`/
+`/admin/raft` (`dump_growth_target_admin_state`, now renamed and widened
+to `dump_every_pod_admin_state`, looping over every ordinal
+`0..replicas-1`), so there is no `/admin/raft` view of the actually-stuck
+pod (its role, term, `commit_index`, `cluster_check_pending`,
+`refused_as_voter`) to read. `RaftNode::drive`'s own boot path
+(`node.rs`) only ever calls `RaftCore::begin_cluster_check` when its WAL
+replay finds genuinely **empty** state (`state.is_empty()`) — a
+pre-existing voter with an intact, durable WAL should recover normally
+through `RaftCore::recovered` and skip the cluster-check branch
+entirely, so the "self-inclusive genesis-style config with non-empty
+state" framing this investigation started from does not, on its own,
+match what the code does on that boundary. This needs the next
+recurrence's own per-pod `/admin/raft` dump (now captured) before
+proposing a fix in `animus-control`/`animusd` — no change was made to
+either in this round.
+
+## Amendment (2026-09-16, issue #924) — half-open pooled connection to a recreated pod
+
+The S-07d config-hash rolling restart (this ADR's own amendment above)
+recreates pods on durable PVCs, each getting a **new IP** under its old
+stable DNS name. PR #909's `e2e-kind-webhook` run (35053634723, job
+104659100545) caught the recreated ordinal-1 stuck `PreCandidate` for
+minutes after it came back: every other voter's `/admin/raft` still
+believed it alive (its own outbound pre-vote requests were arriving
+fine), but it had received **zero** `AppendEntries` since restart — the
+leader's pooled connection to its *old* address was silently half-open,
+its writes each "succeeding" into the local kernel send buffer with
+nothing ever reaching the recreated pod, so `animus-env`'s reconnect-once
+path (issue #661) never triggered: no write ever *failed*, it just never
+arrived. Corroborated independently on PR #918's `e2e-kind-s3` leg (head
+4b0a84ea): after the same rolling recreation, exactly one voter
+(`e2e-1`) marked the recreated `e2e-2` `believes_alive: false` while
+every other node (including `e2e-2` itself) reported it alive — the
+per-connection timing dependence the mechanism predicts (whether that
+one node's old connection to `e2e-2` happened to get a FIN/RST during
+teardown), with `e2e-2`'s own tablet group correspondingly stuck at
+`commit_index: 0` with no leader.
+
+**Fix** (`animus-env`, ADR 0003's ProdEnv notes carry the full mechanism
+and platform account): every pooled outbound and accepted socket now
+carries TCP keepalive plus, on Linux, `TCP_USER_TIMEOUT`, bounding a
+silently-vanished peer's detection to **5 seconds** — comfortably below
+this operator's own rollout wait budgets (`scripts/e2e-kind.sh`'s
+`wait_for_progress` for the S-07d leg: a 120s stall window, 600s hard
+cap; this amendment's own original 300s `kubectl rollout status`
+timeout, superseded by `wait_for_progress` per the 2026-09-07/issue #705
+amendment above, was already far above this bound too). No change to
+`scripts/e2e-kind.sh` itself was needed or made — the existing wait
+already had ample room for a 5-second detection, and the bug was that
+detection could take 13–15 **minutes**, not that the wait was too short.

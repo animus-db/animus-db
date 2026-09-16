@@ -216,15 +216,15 @@
         </tbody>
       </table>
     </div>
-    <p class="body-text" style="margin-top:14px">Generate a starting config with <code>animusd gen-config --nodes 3 --host 10.0.0.1</code>. Add a node later with <code>animusd join --seed 10.0.0.1:7105</code> — a new node needs exactly one thing, the intra-cluster address of any node that is already running.</p>
+    <p class="body-text" style="margin-top:14px">Generate a starting config with <code>animusd gen-config --nodes 3 --host 10.0.0.1</code>. Add a node later with <code>animusd join --seed 10.0.0.1:7104</code> — a new node needs exactly one thing, the intra-cluster address of any node that is already running.</p>
   </div>
 </section>
 
 <section id="ports">
   <div class="wrap">
     <span class="kicker">Ports</span>
-    <h2>Seven consecutive ports per node.</h2>
-    <p class="body-text">A node claims seven ports from its base port, 7100 by default. Two nodes on one host need different bases.</p>
+    <h2>Six consecutive ports per node.</h2>
+    <p class="body-text">A node claims six ports from its base port, 7100 by default. Two nodes on one host need different bases.</p>
     <div class="table-scroll">
       <table>
         <thead><tr><th>Offset</th><th>Default</th><th>Purpose</th><th>Exposure</th></tr></thead>
@@ -232,10 +232,9 @@
           <tr><td>+0</td><td>7100</td><td>Internal — Raft traffic</td><td>Cluster network only</td></tr>
           <tr><td>+1</td><td>7101</td><td>Client protocol</td><td>Application network</td></tr>
           <tr><td>+2</td><td>7102</td><td>DynamoDB HTTP endpoint — and <code>GET /metrics</code></td><td>Application network</td></tr>
-          <tr><td>+3</td><td>7103</td><td>Reserved</td><td>—</td></tr>
-          <tr><td>+4</td><td>7104</td><td>Admin API and dashboard</td><td>Operator network only</td></tr>
-          <tr><td>+5</td><td>7105</td><td>Intra-cluster communication — the address a joining node needs</td><td>Cluster network only</td></tr>
-          <tr><td>+6</td><td>7106</td><td>Data console</td><td>Operator network only</td></tr>
+          <tr><td>+3</td><td>7103</td><td>Admin API and dashboard</td><td>Operator network only</td></tr>
+          <tr><td>+4</td><td>7104</td><td>Intra-cluster communication — the address a joining node needs</td><td>Cluster network only</td></tr>
+          <tr><td>+5</td><td>7105</td><td>Data console</td><td>Operator network only</td></tr>
         </tbody>
       </table>
     </div>

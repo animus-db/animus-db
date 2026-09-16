@@ -303,6 +303,22 @@ pub enum ClientRequest {
         from_position_ordinal: u32,
         limit: usize,
     },
+    /// **Internal open-shard max-position RPC (issue #859) — never sent
+    /// bare, only wrapped in [`Forwarded`](Self::Forwarded)**, mirroring
+    /// [`StreamHotRead`](Self::StreamHotRead) exactly (same addressing, same
+    /// bare-refusal reason: an arbitrary caller must not read a tablet's own
+    /// change-log state, even indirectly, bypassing the DynamoDB Streams
+    /// surface). `GetShardIterator{LATEST}`'s own primitive
+    /// (`dynamo_streams.rs`): the `(packed_hlc, ordinal)` of `tablet`'s own
+    /// highest-materialized `KIND_CHANGE` record, an `Arc<Mutex<_>>` read on
+    /// the leader (`RaftKvNode::hot_change_max`) rather than the full
+    /// decode-sort-truncate `StreamHotRead`/`hot_read` pay. Answered with
+    /// `ClientResponse::Pairs`, reusing `StreamHotRead`'s own response shape
+    /// (a zero- or one-element list; a present element's key carries the
+    /// same trailing `(packed_hlc, ordinal)` suffix `record_seqno_suffix`
+    /// already decodes, value ignored) rather than adding a new
+    /// `ClientResponse` variant for one optional pair.
+    StreamHotChangeMax { tablet: u64 },
     /// **Internal backfill-cursor-cleanup RPC — never sent bare, only
     /// wrapped in [`Forwarded`](Self::Forwarded)** (ADR 0045 §5 step 3):
     /// delete `tablet`'s own backfill cursor row for `index` (`KIND_CURSOR`,
@@ -360,6 +376,42 @@ pub enum ClientRequest {
         #[serde(default)]
         condition: Option<animus_dynamo::ConditionExpression>,
     },
+    /// **Internal cross-replica leader-hint probe — never sent bare, only
+    /// wrapped in [`Forwarded`](Self::Forwarded)** (issue #950). "Who does
+    /// your own local replica of `tablet` currently believe leads it?" —
+    /// answered by **any** replica, leader or follower, straight from its
+    /// own [`RaftKvNode::leader()`] hint, with no leader requirement of its
+    /// own and no propose/wake/block, mirroring a "not the leader here"
+    /// refusal's embedded hint exactly (same source, same
+    /// `ClientCtx::cp_leader_hint`, animusd) but without needing to attempt
+    /// (and fail) the real op first.
+    ///
+    /// The one production caller is `ClientCtx::cp_route`'s cross-replica
+    /// fan-out: when this node hosts a local replica of a tablet but that
+    /// replica's own leader hint has stayed unknown past a short local
+    /// sub-budget, `cp_route` used to keep polling **only its own** local
+    /// state for the rest of `CLIENT_TIMEOUT` — correct while the group is
+    /// genuinely still electing, but indistinguishable, from purely local
+    /// silence, from this one node's own heartbeat/apply processing simply
+    /// lagging behind every other replica's under load (the root cause of
+    /// issue #950's "no CP group leader reachable" stalls despite a
+    /// continuously known, stable leader elsewhere in the group). This probe
+    /// lets it ask the tablet's other known replicas directly instead of
+    /// waiting out the full budget on its own possibly-stale view.
+    ///
+    /// Addressed by `tablet` directly, mirroring [`ForceSeal`](Self::ForceSeal)
+    /// (there is no client key to derive it from — the caller already
+    /// resolved `tablet` before it ever needed a hint). Bare delivery is
+    /// refused for the same reason every other tablet-addressed internal RPC
+    /// is (an arbitrary caller has no business learning a tablet's own
+    /// leader belief outside the routing mechanism that needs it). Not a
+    /// `MetaCommand`, so `is_relayable_command` does not apply; real
+    /// handling lives in `cp_serve_forwarded`'s match, reached only through
+    /// the `Forwarded` arm. Answered with
+    /// [`CpLeaderHint`](ClientResponse::CpLeaderHint).
+    ///
+    /// [`RaftKvNode::leader()`]: animus_cp_data::RaftKvNode::leader
+    CpLeaderHintProbe { tablet: u64 },
     /// Read the latest value at `key` of `table` (linearizable CP ReadIndex on the
     /// group leader). `table` is **required** (ADR 0023).
     Get {
@@ -690,8 +742,10 @@ pub fn surface_of(request: &ClientRequest) -> Surface {
         | ClientRequest::ForcePitrSeal { .. }
         | ClientRequest::TriggerAutoSplit { .. }
         | ClientRequest::StreamHotRead { .. }
+        | ClientRequest::StreamHotChangeMax { .. }
         | ClientRequest::ClearBackfillCursor { .. }
         | ClientRequest::KindWriteItem { .. }
+        | ClientRequest::CpLeaderHintProbe { .. }
         | ClientRequest::TxnPrepare { .. }
         | ClientRequest::TxnDecide { .. }
         | ClientRequest::TxnResolve { .. }
@@ -1096,6 +1150,13 @@ pub enum ClientResponse {
     /// ordinary transient routing/leadership failure still comes back as
     /// `Error` and is retried exactly like any other CP op.
     Unresolved,
+    /// Reply to [`CpLeaderHintProbe`](ClientRequest::CpLeaderHintProbe): the
+    /// answering replica's own current leader belief for the probed tablet
+    /// — `(id, intra address)` — or `None` if it has no hint right now
+    /// (mid-election, or this replica itself is not yet hosted). Never an
+    /// [`Error`](Self::Error): any replica, leader or follower, answers this
+    /// unconditionally.
+    CpLeaderHint { hint: Option<(NodeId, String)> },
     /// A range scan's live `(key, value)` pairs in key order (reply to
     /// [`Scan`](ClientRequest::Scan)).
     Pairs(Vec<(Vec<u8>, Vec<u8>)>),

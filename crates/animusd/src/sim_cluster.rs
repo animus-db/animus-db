@@ -861,10 +861,42 @@ fn placeholder_addr() -> SocketAddr {
 /// alias's own doc states).
 type ScanRows = Vec<(Vec<u8>, Vec<u8>)>;
 
+/// [`SimCluster::get`]/[`SimCluster::get_timed`]'s own result shape, named
+/// for the same clippy `type_complexity` reason as [`ScanRows`].
+type GetResult = Result<Option<Vec<u8>>, String>;
+
 /// One node's `ClientCtx` handle, named for the same clippy `type_complexity`
 /// reason as [`ScanRows`] — [`SimClusterHandle`]'s own `ctxs` field is a
 /// `Vec` of these behind an `Arc<Mutex<..>>`.
 type SimNodeCtx = ClientCtx<SimEnv, SimRelayClient<SimEnv>>;
+
+/// An `E`-free, plain-data projection of [`CpRoute`] — issue #950's own
+/// [`SimClusterHandle::cp_route`]/[`SimCluster::cp_route_timed`] use this
+/// instead of `CpRoute<SimEnv>` directly, since the real type's `Local`
+/// variant carries a whole [`CpGroup`] handle that has no business crossing
+/// the `spawn_and_capture`-style result-slot boundary [`SimCluster::
+/// cp_route_timed`] drives this through — a test only ever needs to know
+/// WHICH kind of route resolved, not the live handle itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CpRouteOutcome {
+    /// This node hosts the current leader.
+    Local,
+    /// Forward to this address; `bool` is whether it was vouched for by a
+    /// live replica (`CpRoute::Forward`'s own second field, unchanged).
+    Forward(String, bool),
+    /// No leader reachable within the caller's own budget.
+    None,
+}
+
+impl From<CpRoute<SimEnv>> for CpRouteOutcome {
+    fn from(route: CpRoute<SimEnv>) -> Self {
+        match route {
+            CpRoute::Local(_) => CpRouteOutcome::Local,
+            CpRoute::Forward(addr, hinted) => CpRouteOutcome::Forward(addr, hinted),
+            CpRoute::None => CpRouteOutcome::None,
+        }
+    }
+}
 
 /// What this fixture knows about one tablet it has provisioned: its table
 /// name (diagnostics only), and the node ids named as its INITIAL replica
@@ -1129,6 +1161,17 @@ impl SimClusterHandle {
             .into_iter()
             .map(|(tablet, _group)| tablet)
             .collect()
+    }
+
+    /// Resolve a CP route for `(table, key)` from `node`'s own `ClientCtx`
+    /// (`ClientCtx::cp_route`) directly — issue #950's regression drives
+    /// this instead of a full [`put`](Self::put) so it can measure the
+    /// routing DECISION alone (whether it stayed stuck on a stale local
+    /// view or recovered via the cross-replica fan-out), independent of
+    /// whether a subsequent forward hop can physically complete under
+    /// whatever fault the scenario also has in place.
+    pub(crate) async fn cp_route(&self, node: u64, table: &str, key: &[u8]) -> CpRouteOutcome {
+        self.ctx(node).cp_route(table, key).await.into()
     }
 
     /// Write `value` at `(pk, sk)` in `table`, issued from `node`'s own
@@ -2694,6 +2737,40 @@ impl SimCluster {
         self.control_index.get(&node).copied()
     }
 
+    /// Whether `node`'s own `RaftNode<SimEnv>` currently believes ITSELF the
+    /// control-plane leader — a plain, single read of `RaftNode::is_leader`
+    /// with **no hidden retry**, unlike [`SimCluster::control_leader_index`]
+    /// (which silently `run_for`s up to 2s of virtual time if no leader is
+    /// found on its first check). A scenario pinning a narrow post-election
+    /// timing window (issue #923) needs to poll leadership in small,
+    /// explicit steps of its own choosing without a helper's own retry loop
+    /// invisibly consuming part of that window out from under it.
+    pub(crate) fn is_control_leader(&self, node: u64) -> bool {
+        self.control_index_of(node)
+            .is_some_and(|idx| self.controls[idx].is_leader())
+    }
+
+    /// Arm a control-plane leadership transfer directly on `from`'s own
+    /// `RaftNode<SimEnv>` (`RaftNode::transfer_leadership`) — bypassing the
+    /// `POST /admin/control/transfer` HTTP-JSON route entirely, unlike every
+    /// other mutating call this fixture drives through [`SimCluster::admin`].
+    /// Exists for a scenario that needs the transfer armed without
+    /// `SimCluster::admin`'s own `spawn_and_capture` unconditionally burning
+    /// a full `OP_BUDGET` (12s) of virtual time regardless of how fast the
+    /// request actually resolves (its own doc's "load-bearing for other
+    /// consumers" tradeoff) — a scenario pinning a race in a narrow post-
+    /// election window (issue #923) needs virtual time to advance by
+    /// EXACTLY what the caller asks for, nothing implicit on top. Returns
+    /// whether the transfer was armed (mirrors `RaftNode::
+    /// transfer_leadership`'s own bool), never blocks/polls for completion —
+    /// the caller drives that itself via `run_for`/`control_leader_index`.
+    pub(crate) fn transfer_leadership(&mut self, from: u64, to: u64) -> bool {
+        let idx = self
+            .control_index_of(from)
+            .unwrap_or_else(|| panic!("node {from} is not a control-bearing voter"));
+        self.controls[idx].transfer_leadership(nid(to))
+    }
+
     /// The node id `self.controls[index]` belongs to — the inverse of
     /// [`SimCluster::control_index_of`] (ADR 0061 rung N, C-14 PR 2).
     /// Panics if `index` is out of range, mirroring a plain `Vec` index
@@ -3622,6 +3699,53 @@ impl SimCluster {
         })
     }
 
+    /// [`SimCluster::get`]'s timing-instrumented sibling — [`SimCluster::
+    /// admin_timed`]'s identical shape (step the simulator forward in
+    /// `step`-sized increments, up to `max_steps`, and report the virtual
+    /// [`Duration`] elapsed when the read's own future actually resolves)
+    /// applied to a CP read instead of an admin call. Used by issue #920's
+    /// quiesced-group rolling-restart regression to measure how long a
+    /// `ConsistentRead: true` read takes to succeed once every replica of
+    /// a quiesced group has been crashed and restarted, rather than only
+    /// whether it eventually does. Never panics on exhaustion: returns
+    /// `max_steps * step` and a synthetic timeout `Err` when the read
+    /// never resolves in that window.
+    #[allow(clippy::too_many_arguments)] // a plain (node, table, pk, sk, consistent, step, max_steps) parameter list — mirrors `admin_timed`'s own five plus the two timing knobs
+    pub(crate) fn get_timed(
+        &mut self,
+        node: u64,
+        table: &str,
+        pk: &str,
+        sk: &str,
+        consistent: bool,
+        step: Duration,
+        max_steps: usize,
+    ) -> (Duration, GetResult) {
+        let handle = self.shared.clone();
+        let (table, pk, sk) = (table.to_owned(), pk.to_owned(), sk.to_owned());
+        let env = self.shared.env(node);
+        let slot: Arc<Mutex<Option<GetResult>>> = Arc::new(Mutex::new(None));
+        let out = slot.clone();
+        let start = self.sim.now();
+        env.spawn_task(async move {
+            let result = handle.get(node, &table, &pk, &sk, consistent).await;
+            *out.lock().expect("result slot poisoned") = Some(result);
+        });
+        for _ in 0..max_steps {
+            self.sim.run_for(step);
+            if let Some(result) = slot.lock().expect("result slot poisoned").take() {
+                return (self.sim.now().duration_since(start), result);
+            }
+        }
+        (
+            self.sim.now().duration_since(start),
+            Err(format!(
+                "get on node {node} did not resolve within {max_steps} x {step:?} of virtual \
+                 time"
+            )),
+        )
+    }
+
     /// Whole-table scan, issued from `node`'s own `ClientCtx` — the cheap
     /// extra read shape beyond point `get`, at the same `consistent`
     /// granularity as [`SimCluster::get`].
@@ -3812,6 +3936,43 @@ impl SimCluster {
                  of virtual time"
             ),
         )
+    }
+
+    /// [`SimCluster::admin_timed`]'s sibling for [`SimClusterHandle::
+    /// cp_route`] — issue #950's own regression harness: measures how long
+    /// `ClientCtx::cp_route` takes to resolve (or exhaust `max_steps *
+    /// step` of virtual time without resolving), alongside the resolved
+    /// [`CpRouteOutcome`], rather than a full [`SimCluster::put`]'s
+    /// route-then-forward-then-confirm sequence — see [`SimClusterHandle::
+    /// cp_route`]'s own doc for why the routing decision alone is what this
+    /// mechanism's regression needs to isolate. Never panics on exhaustion:
+    /// returns `CpRouteOutcome::None` and the full elapsed budget, mirroring
+    /// [`admin_timed`](Self::admin_timed)'s own convention.
+    pub(crate) fn cp_route_timed(
+        &mut self,
+        node: u64,
+        table: &str,
+        key: &[u8],
+        step: Duration,
+        max_steps: usize,
+    ) -> (Duration, CpRouteOutcome) {
+        let handle = self.shared.clone();
+        let (table, key) = (table.to_owned(), key.to_vec());
+        let env = self.shared.env(node);
+        let slot: Arc<Mutex<Option<CpRouteOutcome>>> = Arc::new(Mutex::new(None));
+        let out = slot.clone();
+        let start = self.sim.now();
+        env.spawn_task(async move {
+            let result = handle.cp_route(node, &table, &key).await;
+            *out.lock().expect("result slot poisoned") = Some(result);
+        });
+        for _ in 0..max_steps {
+            self.sim.run_for(step);
+            if let Some(outcome) = slot.lock().expect("result slot poisoned").take() {
+                return (self.sim.now().duration_since(start), outcome);
+            }
+        }
+        (self.sim.now().duration_since(start), CpRouteOutcome::None)
     }
 
     /// Run a console HTTP request against `node`'s own `ClientCtx` (ADR
@@ -4816,6 +4977,17 @@ impl SimCluster {
     /// Symmetrically partition `a` and `b` (`Simulator::partition_pair`).
     pub(crate) fn partition(&mut self, a: u64, b: u64) {
         self.sim.partition_pair(nid(a), nid(b));
+    }
+
+    /// Directed per-link network-fault override (`Simulator::
+    /// set_link_net_config`) — unlike [`SimCluster::partition`], this models
+    /// a genuinely alive but SLOW peer (e.g. a large `base_delay`/
+    /// `max_jitter`, no drop) rather than an unreachable one: `from` stays
+    /// fully up, it just takes longer than usual for a message it sends
+    /// `to` to arrive. [`SimCluster::heal_all`] resets every link back to
+    /// `NetConfig::default()`, this override included.
+    pub(crate) fn set_link_net_config(&mut self, from: u64, to: u64, cfg: NetConfig) {
+        self.sim.set_link_net_config(nid(from), nid(to), cfg);
     }
 
     /// Heal every partition this fixture has created and `Simulator::

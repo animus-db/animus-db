@@ -132,8 +132,8 @@ pub async fn verify_or_init_segment_store_marker<S: SegmentStore + ?Sized, R: Rn
             }
         }
         (None, Some(k)) => {
-            let others = store.list("").await?;
-            if others.is_empty() {
+            let empty = store.is_empty("").await?;
+            if empty {
                 let marker = seal_whole(k, rng, SEGMENT_STORE_MARKER_PLAINTEXT);
                 store.put(SEGMENT_STORE_MARKER_ID, &marker).await
             } else {
@@ -259,5 +259,25 @@ impl<S: SegmentStore, R: Rng> SegmentStore for EncryptedSegmentStore<S, R> {
         let mut names = self.shared.inner.list(prefix).await?;
         names.retain(|n| n != SEGMENT_STORE_MARKER_ID);
         Ok(names)
+    }
+
+    /// Forwards to the inner store's own (possibly cheap, e.g. `S3SegmentStore`'s
+    /// single-page) probe — but this wrapper's own `list` above excludes
+    /// [`SEGMENT_STORE_MARKER_ID`], so `is_empty` must agree: an inner
+    /// store holding *only* the marker object must still read empty here,
+    /// exactly like `list(prefix).is_empty()` would. The inner probe alone
+    /// answers "genuinely empty" for free (the common case this wrapper is
+    /// opened against, and the one issue #861 cared about); only when the
+    /// inner store reports *something* present do we fall back to a real,
+    /// marker-filtered listing to tell "just the marker" apart from "real
+    /// objects exist" — a case this wrapper's own construction path
+    /// ([`EncryptedSegmentStore::open`]) never actually reaches, since it
+    /// runs [`verify_or_init_segment_store_marker`] on the **unwrapped**
+    /// inner store before this wrapper exists at all.
+    async fn is_empty(&self, prefix: &str) -> io::Result<bool> {
+        if self.shared.inner.is_empty(prefix).await? {
+            return Ok(true);
+        }
+        Ok(self.list(prefix).await?.is_empty())
     }
 }

@@ -416,6 +416,110 @@ fn leader_failover_mid_countdown_still_converges() {
     );
 }
 
+/// **Issue #951's exact contract**: a join whose `RegisterNode` commits and
+/// is observably durable, but whose *process* is then abandoned before it
+/// ever heartbeats (a real operator's join timing out locally, crashing
+/// before its data dir initializes, or — as `join_extra` in
+/// `split_placing_two_replica_diff_e2e.rs` demonstrated under contention — a
+/// test harness that tears down a partially-joined node and retries with a
+/// **fixed id but fresh addresses**), correctly stays `Rejected` for as long
+/// as the stale claim is un-reclaimed — this is [`MetaCommand::RegisterNode`]
+/// working exactly as ADR 0040 Decision C designed it: a live node must
+/// never be silently superseded by an impostor sharing its id, so the CAS
+/// cannot tell "abandoned" from "still starting up" on its own. The
+/// **intended** recovery is reclaiming the specific stale claim — either the
+/// orphan sweep once its grace period elapses (`crash_mid_join_orphan_swept_
+/// after_ttl`, above) or, for a caller that cannot wait out that grace period
+/// (60s of retry budget against a 600s production default, exactly
+/// `join_extra`'s shape), a direct, targeted [`MetaCommand::RemoveMember`]
+/// for that one id — never an automatic same-id supersession. Once reclaimed
+/// either way, the same id can be re-registered with new addresses, same as
+/// any other unclaimed id. This is a **test-harness gap, not a product
+/// gap**: `RegisterNode`'s CAS and `RemoveMember`'s guard already give a
+/// retry loop everything it needs to recover a fixed id it knows is its own
+/// — `join_extra` just never calls it.
+#[test]
+fn same_id_retry_with_fresh_addrs_is_rejected_until_the_stale_claim_is_reclaimed() {
+    let seed = 0x5EED_0009;
+    let (mut sim, nodes) = cluster(seed, SWEEP_AFTER);
+    sim.run_for(Duration::from_secs(2));
+    let leader = unique_leader(&nodes, seed);
+
+    let id = nid(909);
+    // Attempt 1: registers cleanly, then the process is abandoned before it
+    // ever heartbeats (mirrors `join_extra`'s first, failed `run_node_join`
+    // whose `RegisterNode` reached the control plane before local setup
+    // failed).
+    assert!(matches!(
+        nodes[leader].propose(register(id.clone(), "combined", 9)),
+        ProposeResult::Accepted { .. }
+    ));
+    sim.run_for(Duration::from_secs(1));
+    let claimed = addrs("combined", 9);
+    for node in &nodes {
+        let m = node.metadata();
+        assert_eq!(m.node_addrs.get(&id), Some(&claimed), "seed={seed}");
+        assert_eq!(m.members[&id].status, NodeStatus::Down, "seed={seed}");
+        assert!(!m.members[&id].has_activated, "seed={seed}");
+    }
+
+    // Attempt 2: `join_extra`-shaped retry — same id, a fresh address book
+    // (`free_addrs` picked new ports). Today's (correct, by-design)
+    // behaviour: rejected, and the stale claim from attempt 1 is untouched.
+    assert!(matches!(
+        nodes[leader].propose(register(id.clone(), "combined", 19)),
+        ProposeResult::Accepted { .. }
+    ));
+    sim.run_for(Duration::from_secs(1));
+    for (i, node) in nodes.iter().enumerate() {
+        let m = node.metadata();
+        assert_eq!(
+            m.node_addrs.get(&id),
+            Some(&claimed),
+            "node {i}: attempt 2 must not overwrite attempt 1's stale claim (seed={seed})"
+        );
+    }
+
+    // The recovery a `join_extra`-shaped retry loop should perform itself,
+    // instead of waiting out the (10x longer, in production) orphan-sweep
+    // grace period: reclaim the specific stale claim directly, since the
+    // retry loop already knows — it minted it — that `id` is its own and
+    // that attempt 1's node never came up.
+    assert!(matches!(
+        nodes[leader].propose(MetaCommand::RemoveMember { node: id.clone() }),
+        ProposeResult::Accepted { .. }
+    ));
+    sim.run_for(Duration::from_secs(1));
+    for (i, node) in nodes.iter().enumerate() {
+        let m = node.metadata();
+        assert!(
+            !m.node_addrs.contains_key(&id) && !m.members.contains_key(&id),
+            "node {i}: targeted reclaim of the stale claim failed (seed={seed})"
+        );
+    }
+
+    // Attempt 3: the same id, with attempt 2's fresh addresses, now succeeds
+    // — proving the reclaim path (whichever of the two triggers it) is all a
+    // fixed-id retry loop needs; no product-level id-supersession is
+    // required or, per the ADR 0040 Decision C safety argument, desired.
+    let retried = addrs("combined", 19);
+    assert!(matches!(
+        nodes[leader].propose(register(id.clone(), "combined", 19)),
+        ProposeResult::Accepted { .. }
+    ));
+    sim.run_for(Duration::from_secs(1));
+    for (i, node) in nodes.iter().enumerate() {
+        let m = node.metadata();
+        assert_eq!(
+            m.node_addrs.get(&id),
+            Some(&retried),
+            "node {i}: same id must be freely re-claimable once reclaimed (seed={seed})"
+        );
+        assert_eq!(m.members[&id].status, NodeStatus::Down, "seed={seed}");
+        assert!(!m.members[&id].has_activated, "seed={seed}");
+    }
+}
+
 /// `orphan_sweep_after == Duration::ZERO` disables the sweep outright: an
 /// otherwise-eligible orphan is kept indefinitely (no loop is even spawned).
 #[test]

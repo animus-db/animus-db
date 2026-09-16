@@ -205,9 +205,9 @@
 <section class="alt" id="running">
   <div class="wrap">
     <span class="kicker">Operating</span>
-    <h2>One binary, four shapes, seven ports.</h2>
+    <h2>One binary, four shapes, six ports.</h2>
     <p class="body-text">Every node is the same <code>animusd</code> binary; what differs is which planes it hosts, and that is a line in a config file. Run <strong>combined</strong> nodes by default, split into <strong>control-only</strong> and <strong>data-only</strong> as a cluster grows, or start an entire cluster in a <strong>single process</strong> for development. A config can mix shapes, so a cluster migrates between them incrementally rather than being rebuilt.</p>
-    <p class="body-text">A node claims seven consecutive ports from its base, 7100 by default: Raft traffic, the client protocol, the DynamoDB HTTP endpoint (which also serves <code>GET /metrics</code>), the admin API and dashboard, intra-cluster communication and a data console.</p>
+    <p class="body-text">A node claims six consecutive ports from its base, 7100 by default: Raft traffic, the client protocol, the DynamoDB HTTP endpoint (which also serves <code>GET /metrics</code>), the admin API and dashboard, intra-cluster communication and a data console.</p>
     <div class="cardgrid c2" style="margin-top:16px;max-width:860px">
       <div class="lcard"><h3>Day two, available</h3><ul>
         <li>Growing: a joining node needs the intra-cluster address of any running node</li>
@@ -254,7 +254,7 @@
     <h2>Four reference pages sit under this one.</h2>
     <p class="body-text">Each section above stops at the point where detail starts being useful only to someone who has decided to look. That detail is here.</p>
     <div class="cardgrid c4" style="margin-top:16px">
-      <div class="lcard"><span class="tag">Reference</span><h3><a href="architecture.html">Architecture</a></h3><p>The two planes and why the split matters, tablets and placement, the consistency model, four deployment shapes with their commands, the seven ports, determinism internals, day-two operations, and the known limits in one list.</p></div>
+      <div class="lcard"><span class="tag">Reference</span><h3><a href="architecture.html">Architecture</a></h3><p>The two planes and why the split matters, tablets and placement, the consistency model, four deployment shapes with their commands, the six ports, determinism internals, day-two operations, and the known limits in one list.</p></div>
       <div class="lcard"><span class="tag">Reference</span><h3><a href="compatibility.html">Compatibility</a></h3><p>Every DynamoDB operation with its status and per-operation notes, the data model, and the four differences that will actually show up in your code rather than in a table.</p></div>
       <div class="lcard"><span class="tag">Reference</span><h3><a href="performance.html">Performance</a></h3><p>The cost model operation by operation, what scales with the cluster and what doesn't, six questions worth more than someone else's benchmark, and the methodology we're committing to before we have results.</p></div>
       <div class="lcard"><span class="tag">Reference</span><h3><a href="licence.html">Licensing</a></h3><p>AGPL-3.0 scenario by scenario, the section 13 question your counsel will ask, why this licence and not a permissive one, and exactly where a commercial licence stands today.</p></div>

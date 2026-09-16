@@ -857,7 +857,7 @@ async fn admin_raftkv_default_does_not_materialize_the_dataset() {
         // writes leaves an ADR 0049 change-log marker record with no
         // stream/GSI/PITR to consume it, so this table's tablet takes the
         // loop's mandatory idle fast path: as long as `KIND_CHANGE` bytes
-        // remain, each tick does a real `pending_changes` scan (real
+        // remain, each tick does a real `pending_changes_key_order` scan (real
         // SSTable block reads once flushed) and trims a `TRIM_BATCH`-sized
         // slice, in batches, until the backlog is fully drained — only then
         // does the fast path's `bytes == 0` branch stop scanning for good.

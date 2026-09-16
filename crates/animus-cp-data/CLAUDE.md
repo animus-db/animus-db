@@ -387,21 +387,37 @@ straight into the voter set. `reconfigure_step` sequences an add as
 remove-the-old-replica**, still exactly **one single-server step per call**
 (ADR 0031 discipline unchanged — no new `HostAction`, `host::plan` is
 untouched; only what `reconfigure_step` proposes on a given call changed).
-Full priority order, most urgent first: (1) remove a `Down` extra **voter**
-(unchanged, failure repair); (2) drop a current **learner** no longer in
-`desired` — regardless of its liveness or catch-up progress, since it is
-stale by construction the moment placement retargets away from it (the
-fix for "a learner mid-catch-up that dies or is decommissioned must not
-wedge every later step" — the reconciler's job is only to not block on a
-target nobody wants any more; *re*-targeting `desired` is placement's job,
-untouched); (3) promote a learner that is both still desired and caught up
-(finish an in-flight move before starting a new one); (4) add a `desired`
-member missing from both `config` and `learners`, as a **learner**, never
-straight to voter; (5)/(6) — once every `desired` member is already a
-voter — the pre-Train-1 remove-healthy-extra/leader-self-removal-via-
-transfer steps, unchanged. A remove-only delta and a brand-new group's
-initial bootstrap (`host::plan_join_host`) are both untouched — this only
-changes the sequencing of an *add*. **Gotcha this shipped with**: the early
+Full priority order, most urgent first: (1) drop a current **learner** no
+longer in `desired` — regardless of its liveness or catch-up progress,
+since it is stale by construction the moment placement retargets away
+from it (the fix for "a learner mid-catch-up that dies or is
+decommissioned must not wedge every later step" — the reconciler's job is
+only to not block on a target nobody wants any more; *re*-targeting
+`desired` is placement's job, untouched); (2) promote a learner that is
+both still desired and caught up (finish an in-flight move before
+starting a new one); (3) add a `desired` member missing from both
+`config` and `learners`, as a **learner**, never straight to voter; (4)
+remove a `Down` extra **voter** (failure repair) — **since issue #920's
+fix (2026-09-16), ordered AFTER steps 1–3, not before**: removing a down
+voter fires immediately only once no `desired` member is still missing or
+mid-catch-up as a learner, i.e. only once any replacement is already
+safely a voter. Before the fix, this fired *first*, ahead of adding the
+replacement — sound only if "marked `Down`" means "permanently gone," but
+ADR 0012's failure detector (`DETECT_TIMEOUT`, 500ms) trips just as
+readily on a transient absence (a pod recreation with durable storage,
+issue #920's own production shape) as on a real failure, and removing the
+old voter early shrinks the live quorum requirement for the whole
+in-flight window with no way back if a *second* voter is then also lost
+mid-rolling-restart — see `reconfigure_step`'s own doc for the full
+before/after account and ADR 0048's 2026-09-16 amendment for the incident;
+(5)/(6) — once every `desired` member is already a voter — the pre-Train-1
+remove-healthy-extra/leader-self-removal-via-transfer steps, unchanged. A
+remove-only delta (no missing/mid-catch-up member) still removes a down
+extra on the very first tick that reaches step 4, exactly as before the
+reordering — steps 1–3 are no-ops when nothing is stale/promotable/missing,
+so the fix costs nothing in that case. A brand-new group's initial
+bootstrap (`host::plan_join_host`) is untouched — this only changes the
+sequencing of an *add-with-a-down-extra-to-remove*. **Gotcha this shipped with**: the early
 "already converged" return must check `current == desired &&
 learners.is_empty()`, not `current == desired` alone — a stray learner at
 that point is stale by construction (see step 2), and an early return
@@ -461,6 +477,33 @@ in both the initial and the desired set); `admin::CpRaftView`'s
 `voter_history` field (`animusd`) surfaces it read-only on `/admin/raftkv`,
 mirroring `learners`' own "purely observational" contract above — reading it
 never blocks, proposes, or wakes a quiesced group.
+
+**`RaftKvNode::membership_history()` (issue #944)** is the LEARNER-set
+sibling of `voter_history()` above, but recorded in a different place for a
+reason worth being explicit about: `voter_history`'s once-per-consensus-
+loop-iteration sampling cadence is fine-grained enough for a voter-set
+change (which only ever advances via this group's own network-replicated
+log, so this loop's own per-message processing bounds how much can happen
+between two samples) but is **not** fine-grained enough for the learner
+set, because `reconfigure_step`'s add-learner-then-promote pair is proposed
+by the host reconciler's own task, synchronously mutating the shared
+`RaftCore` from OUTSIDE this drive loop entirely — and a follower's own
+`log_append` can likewise adopt several batched config-changing entries
+before this loop next gets scheduled to sample. Sampling from `drive()` can
+therefore coalesce the whole add-then-promote sequence into one record,
+silently skipping the transient learner state — `crates/animusd/tests/
+learner_reconfigure.rs`'s `spare_replacement_passes_through_an_observable_
+learner_state_and_keeps_serving` used to prove the learner phase occurred
+by polling `/admin/raftkv` externally every 100ms, which this exact
+coalescing can race shut just like the `voter_history` incident above (same
+class, `docs/engineering-lessons.md`'s matching entry). The fix records the
+joint `(voters, learners)` pair **inside `RaftCore::apply_config`** itself
+(`animus-control`, `config_history`, capacity 64) — the one call every real
+transition funnels through regardless of which task or how much batching
+triggered it — rather than sampling it from any layer above. `RaftKvNode::
+membership_history()` is a thin passthrough to `RaftCore::config_history()`;
+`admin::CpRaftView`'s `membership_history` field surfaces it the same way
+`voter_history` does.
 **Eventually-consistent reads (ADR 0055)** are the second read path this
 crate serves, and the one whose budget is easiest to destroy by accident:
 `stale_read_ready()` (the gate), `stale_get_served()` (outer `None` =
@@ -745,6 +788,47 @@ State once here; cross-referenced from the sections below.
   and never the stage's own ts — ADR 0018 §2 B1). Regression:
   `tests/txn_kind_writes.rs::kind_batch_and_txn_resolve_materialize_byte_
   identical_rows_for_identical_payloads`.
+- **`KvCommand::Batch` and `TxnResolve`'s commit/abort-restore writes are
+  coalesced-fsync too (issue #834)** — they now push onto the same
+  loop-local `pending: Vec<MergeOp>` `flush_pending` already drains for
+  `Put`/`Delete`/`SeedBatch`/`KindBatch`/`materialize_derived`, instead of
+  calling `storage.merge`/`merge_tombstone` directly once per key. Closes
+  two defects together: N un-amortized `fsync`s per `Batch`/`TxnResolve`
+  entry on a durable engine collapse to one (`flush_pending`'s single
+  `merge_batch` call — see `animus-storage/CLAUDE.md`'s ~9.7x batch-vs-
+  per-key figure; invisible under `SimEnv`/`MemoryEngine`, where `fsync` is
+  free), and both arms inherit `flush_pending`'s halted-gated error
+  tolerance for free (they used to hard-panic via a bare `.expect(..)`
+  even during a graceful shutdown racing an in-flight write — see the
+  "Apply task" bullet above). `TxnResolve`'s commit/abort-restore writes
+  used to check the direct `merge`/`merge_tombstone`'s returned
+  `took_effect` against `surface_suspicious_merge_noop`'s soft seatbelt;
+  that diagnostic is dropped on this now-batched path (it never covered
+  `Batch` either) — see ADR 0018's 2026-09-16 amendment for why that's
+  safe (a documented metric+log-only diagnostic with no correctness role;
+  the real safety net, `TxnResolve`'s own per-entry `fence`, is untouched).
+  **The one thing this conversion required elsewhere**: `KvCommand::
+  TxnStage`'s own `already_decided`/`blocked_by` reads now need a leading
+  `flush_pending` call too (mirroring `Cas`/`KindEval`'s own — see their
+  doc above) — before this fix, `TxnResolve`'s commit write was direct and
+  immediate, so a same-pass `TxnStage` reading `storage.get` right after it
+  always saw the just-landed `Committed` envelope; deferred through
+  `pending`, it could see the stale, still-`Intent` state instead and
+  spuriously treat it as a foreign-transaction block. Caught by
+  `animus-test`'s `txn_serializable.rs` corpus (`ANIMUS_TXN_SEEDS=5`,
+  `participant_leader_kill_early`) as a genuine cross-replica divergence,
+  not a flake — see ADR 0018's amendment for the full trace and
+  `docs/lessons/code-patterns/` for the generalized rule (every
+  `storage.get`/`get_at`/`scan` inside the effects loop needs a preceding
+  `flush_pending` if what it reads could be produced by a `pending`-queued
+  write earlier in the same pass). Tests: `tests/batch.rs::
+  batch_rejected_wholesale_by_a_frozen_range` (the sealed-key branch, not
+  previously covered by `tests/freeze.rs`'s own sweep), `tests/
+  txn_single.rs::commit_with_a_mixed_put_and_a_staged_delete_lands_both_
+  from_one_resolve_entry`, and `tests/batch_txn_resolve_apply_fault.rs`
+  (halted-gate regression via a fault-injecting `StorageEngine` test
+  double, and an `LsmEngine`-backed `Disk::sync`-counting fsync-count
+  proof — both `MemoryEngine`/`SimEnv` alone can't observe).
 - **`KvCommand::KindEval` — the self-contained evaluated write (ADR 0054
   step 2), unwired.** This crate now depends on `animus-item` (`WriteSchema`/
   `derive_kind_writes`/`AttributeValue`/`Item`/`ConditionExpression`/
@@ -1018,6 +1102,45 @@ State once here; cross-referenced from the sections below.
   in `animus-test/tests/raftkv_linearizable.rs`. See `docs/engineering-
   lessons.md`'s Code-patterns entry: *a state machine's applied watermark
   must be the state machine's own, never the log's.*
+
+  **Issue #811 (2026-09-10): a successfully-installed snapshot's `RaftCore`
+  state must be forced into the SAME pass's WAL rewrite, not left for
+  `behind`/`image_needed` to trigger later.** `RaftCore::
+  handle_install_snapshot`'s successful-install path fixes up `snapshot_
+  index`/the log/`snapshot_dirty` synchronously (consensus loop) the
+  instant the last chunk lands, but nothing durably persists that: `has_
+  unflushed_wal` checks only the pending log-append queue and the current
+  term/vote (never `snapshot_dirty`), and `apply_and_compact`'s compaction
+  branch only rewrites the WAL when `behind >= COMPACT_THRESHOLD` or a peer
+  needs a fresh image — both false immediately after an install, since
+  `engine_applied` and `snapshot_index` are set to the identical value in
+  the same step. A replica that caught up ENTIRELY via `InstallSnapshot`
+  (no log entry of its own ever logged) can therefore sit fully caught-up
+  with a WAL file that still reads back empty — and a LATER genuine process
+  restart (`sim.stop` + fresh `RaftKvNode::start`, never `sim.crash`/`sim.
+  restart`) recovers from that empty WAL as a `fresh_group`, skipping
+  `RaftCore::recovered` and leaving `snapshot_index == last_applied == 0`
+  while `engine_applied` is correctly reseeded from the engine's own
+  watermark — a permanent, non-convergent `behind` gap (`snapshot_upto`
+  clamps to `min(engine_applied, last_applied)`, and `last_applied` is
+  ALSO stuck at `0` on the fresh core) that pegs the apply task at `did_
+  work = true` forever, spinning one CPU core with `run_for`/`run_until`
+  never returning. **Fixed**: `apply_and_compact` now forces the
+  compaction section's WAL-rewrite branch whenever this pass processed a
+  `drain_pending_install`, regardless of `behind`/`image_needed`.
+  Regression: `tests/restart_after_install_snapshot.rs` (`MemoryEngine` and
+  `LsmEngine<SimEnv>`, both red-before/green-after). **Test-authoring
+  gotcha this bug's own repro needed**: neither `run_for`'s virtual-time
+  deadline nor `run_until_quiescent`'s step cap can bound this hang shape —
+  the busy task's own `Future::poll` call never returns control to the
+  executor at all (no `.await` point is reached between loop iterations
+  once `did_work` stays `true`), so nothing short of a real OS-thread
+  wall-clock watchdog (`std::thread::spawn` + `mpsc::Receiver::
+  recv_timeout` around `sim.run_for`) can catch it in a test — see
+  `docs/engineering-lessons.md`'s matching issue #811 entry for the full
+  account, including why `crates/animus-test/tests/raftkv_linearizable.rs`'s
+  own `Nemesis::StopRestart` (which always targets the current leader,
+  never a snapshot-caught-up follower) structurally cannot reproduce this.
 - **Durable-before-visible** (ADR 0009): effects are only drained for fsynced
   entries, and the engine write follows the WAL `fsync`.
 - **Write-conflict push + the logged read ceiling — the serializability half
@@ -1655,17 +1778,26 @@ demand the identical action, so no disambiguation is needed.
     mid-pass is the same class of teardown-artifact error as `persist_wal`'s
     — tolerated iff `halted`, a hard panic otherwise (a live apply failure can
     silently leave the engine short a committed write, so this stays loud).
-    No dedicated regression: unlike `persist_wal`'s pending-write queue (a
-    bare synchronous `core` write bypassing the driver loop's own check
-    entirely, so a `put`-then-`shutdown()` beat reaches it deterministically),
-    `apply_and_compact`'s work source (`drain_apply`) only becomes non-empty
-    through the *apply task's own prior progress*, and its effects loop —
-    once entered, after that same iteration's own `halted` check already
-    passed — runs uninterrupted to completion under `SimEnv` (disk ops
-    resolve without yielding), so there is no reachable window for an
-    external test driver to inject `halted` between the check and this
-    call the way `persist_wal`'s regression does. Covered structurally by
-    the identical, already-proven idiom instead. When idle it races a new
+    Genuinely racing this from outside — a real `shutdown()` call
+    interleaving mid-pass under `SimEnv` — has no reachable window: unlike
+    `persist_wal`'s pending-write queue (a bare synchronous `core` write
+    bypassing the driver loop's own check entirely, so a
+    `put`-then-`shutdown()` beat reaches it deterministically),
+    `apply_and_compact`'s work source (`drain_apply`) only becomes
+    non-empty through the *apply task's own prior progress*, and its
+    effects loop — once entered, after that same iteration's own `halted`
+    check already passed — runs uninterrupted to completion under `SimEnv`
+    (disk ops resolve without yielding), so there is no reachable window
+    for an external test driver to inject `halted` between the check and
+    this call the way `persist_wal`'s own regression does. **A dedicated
+    regression exists anyway** (issue #834,
+    `tests/batch_txn_resolve_apply_fault.rs`): rather than racing a real
+    concurrent `shutdown()`, a `FaultyEngine` test double's own
+    `merge_batch` override calls `shutdown()` itself, in-line, immediately
+    before returning the injected `Err` — the deterministic stand-in for
+    "halted is already true by the time `flush_pending`'s error path
+    observes it," proving the tolerance without needing the unreachable
+    real race. When idle it races a new
     `ApplySignal` (ADR 0044 phase-1 PR1, same shape as `ProposeSignal` below)
     against a long `APPLY_SAFETY_POLL` (250ms) rather than spinning on the old
     unconditional 5ms `APPLY_IDLE_POLL` — the consensus loop raises it at
@@ -1979,20 +2111,17 @@ demand the identical action, so no disambiguation is needed.
 - **Wiped-voter boot-time safety (issue #900, ADR 0017's matching amendment):
   `drive`'s WAL-recovery branch calls `RaftCore::begin_cluster_check`
   whenever `state.is_empty()`, except when the caller's own
-  `campaign_immediately` flag is set** (ADR 0058 Train 2 rung 4's
-  deterministic split-child first-leader optimization — that flag proves,
-  by construction, a genuine fresh formation, so skipping the check there
-  costs zero safety and avoids gating the synchronous `campaign_now` call
-  on `cluster_check_pending`, which would silently degrade "wins the race
-  against the cold election timeout" to "waits out the cold election
-  timeout anyway" on every split). Everything else about the mechanism —
-  the `ClusterProbe`/`ClusterProbeResp` wire messages, the vote/campaign
-  gating, the wait-for-every-peer aggregation — lives on the shared,
-  generic `RaftCore<C, S>` (`animus-control::raft`), so it needed **no**
-  cp-data-specific reimplementation, only this one driver call plus
+  `skip_cluster_check` flag is set** (issue #945: this used to be gated on
+  `campaign_immediately` directly, which only exempted the ONE replica per
+  split child that campaigns — see below for why that was a real
+  regression, not just a naming choice). Everything else about the
+  mechanism — the `ClusterProbe`/`ClusterProbeResp` wire messages, the
+  vote/campaign gating, the wait-for-every-peer aggregation — lives on the
+  shared, generic `RaftCore<C, S>` (`animus-control::raft`), so it needed
+  **no** cp-data-specific reimplementation, only this one driver call plus
   `RaftKvNode::cluster_check_pending()`/`refused_as_voter()` accessors.
   **Gotcha for any future boot-path change here**: wiring this in draws
-  extra entropy (`env.next_u64()`) at every non-`campaign_immediately`
+  extra entropy (`env.next_u64()`) at every non-`skip_cluster_check`
   fresh-group boot, reshuffling later random draws for the rest of that
   `SimEnv` run — re-verify every fixed-seed test that starts a fresh
   replica (a new tablet, a growth join, a test harness's own second/third
@@ -2002,6 +2131,36 @@ demand the identical action, so no disambiguation is needed.
   seed re-pin for exactly this reason. See
   `docs/lessons/code-patterns/2026-09-15-a-generic-core-level-fix-does-
   not-wire-itself-into-every-driver.md` for the general lesson.
+- **Issue #945 (the corpus-deep regression this shipped as): `campaign_immediately`
+  and `skip_cluster_check` are two different flags, not one.** The
+  original issue #900 fix gated the cluster-check skip on
+  `campaign_immediately` alone, reasoning (correctly) that the ONE replica
+  which campaigns is safe to exempt. It missed that a real
+  `materialize_split_child` fork hosts SEVERAL replicas of the same child
+  at once (only one of which campaigns) — and `handle_request_vote`
+  refuses a REAL vote while `cluster_check_pending` (see that function's
+  own comment), so every OTHER replica of that same, equally-fresh-by-
+  construction child still blocked the campaigner's own vote behind a full
+  `ClusterProbe`/`ClusterProbeResp` round trip, silently degrading ADR
+  0058 Train 2 rung 4's documented "no added latency" guarantee on every
+  single split — caught by the nightly deep corpus (`inplace_split_
+  reconciler_corpus`, `heartbeat_batch_corpus`; `ANIMUS_INPLACE_SPLIT_SEEDS`/
+  `ANIMUS_HEARTBEAT_SEEDS=40`), not the per-push tier (depth 1), because
+  the regression only bites on the *unlucky* simulated link-latency draws
+  a handful of the 40 seeds happen to hit. Fixed by splitting the flag:
+  `start_inner` now takes `skip_cluster_check` independently of
+  `campaign_immediately`, and `materialize_split_child`'s non-campaigning
+  branch calls the new `RaftKvNode::start_hosted_split_follower_with_
+  batcher[_and_shared_wal]` constructor (skip=true, campaign=false)
+  instead of the ordinary `start_hosted_with_batcher[_and_shared_wal]`
+  those functions' own ordinary (non-split) callers keep using unchanged.
+  **The general rule this generalizes to**: when a safety check is
+  ambiguous only because a caller *hasn't yet proven itself* fresh by
+  construction, and one specific caller flag proves exactly that — audit
+  every OTHER party to the SAME operation that shares the caller's own
+  "proven fresh" premise, not just the one with a convenient existing
+  flag. A single-node exemption on a multi-node operation is usually
+  incomplete.
 - The ADR 0029 reconfigure/leadership-transfer follow-up fix (the two-layer
   transfer-gate threshold mismatch, the proposal-freeze while a transfer is
   armed, and the down-extra search fix) is a cross-cutting lesson — see the

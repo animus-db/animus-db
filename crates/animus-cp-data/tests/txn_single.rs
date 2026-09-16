@@ -245,6 +245,57 @@ fn committed_delete_intent_produces_a_real_tombstone() {
     }
 }
 
+/// Issue #834: `TxnResolve`'s commit branch now queues its per-key writes
+/// onto the shared `pending` run (the same one `flush_pending` coalesces
+/// into a single `merge_batch` `fsync`) instead of calling `storage.merge`/
+/// `merge_tombstone` directly, one call per key. A single resolve entry
+/// mixing a put and a staged delete is the shape that would have caught an
+/// off-by-one in that conversion (e.g. the tombstone branch losing its
+/// queued op, or the two writes landing out of order) that a single-key
+/// test can't.
+#[test]
+fn commit_with_a_mixed_put_and_a_staged_delete_lands_both_from_one_resolve_entry() {
+    let seed = 0x834_0006;
+    let (mut sim, nodes) = group(seed);
+    sim.run_for(ELECT);
+    let l = leader(&nodes, &[0, 1, 2], seed);
+
+    let put_key = key(b"acct-6a", b"balance");
+    let del_key = key(b"acct-6b", b"balance");
+    assert!(matches!(
+        nodes[l].put(del_key.clone(), b"old".to_vec()),
+        ProposeResult::Accepted { .. }
+    ));
+    sim.run_for(SETTLE);
+
+    let commit_ts = txn_write(
+        &mut sim,
+        &nodes[l],
+        vec![
+            (put_key.clone(), Some(b"new".to_vec())),
+            (del_key.clone(), None),
+        ],
+        SETTLE,
+    )
+    .unwrap_or_else(|| panic!("mixed put+delete txn_write did not complete (seed={seed})"));
+    let _ = commit_ts;
+
+    sim.run_for(SETTLE);
+    for (i, n) in nodes.iter().enumerate() {
+        assert_eq!(
+            block_on(n.local_get(&put_key)),
+            Some(b"new".to_vec()),
+            "node {i}: the put half of the mixed resolve must land (seed={seed})"
+        );
+        assert_eq!(
+            block_on(n.local_get(&del_key)),
+            None,
+            "node {i}: the staged-delete half of the mixed resolve must land as a real \
+             tombstone (seed={seed})"
+        );
+    }
+}
+
 #[test]
 fn a_pending_read_blocks_then_serves_once_committed() {
     let seed = 0xB10_0004;

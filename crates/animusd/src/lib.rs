@@ -596,12 +596,23 @@ impl<E: Env> CpGroup<E> {
         }
     }
 
-    /// Every pending change-log record this tablet holds, in commit order
-    /// (ADR 0041 §4). See [`RaftKvNode::pending_changes`].
-    pub(crate) async fn pending_changes(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
+    /// Every pending change-log record this tablet holds, in **physical key
+    /// order** (token-then-pk-then-HLC), NOT commit order. See
+    /// [`RaftKvNode::pending_changes_key_order`]'s own doc for the full account and
+    /// ADR 0043 §A3.
+    pub(crate) async fn pending_changes_key_order(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
         match self {
-            CpGroup::Lsm(n) => n.pending_changes().await,
-            CpGroup::Mem(n) => n.pending_changes().await,
+            CpGroup::Lsm(n) => n.pending_changes_key_order().await,
+            CpGroup::Mem(n) => n.pending_changes_key_order().await,
+        }
+    }
+
+    /// This tablet's own highest-materialized `KIND_CHANGE` `(ts, ordinal)`
+    /// (issue #859). See [`RaftKvNode::hot_change_max`].
+    pub(crate) async fn hot_change_max(&self) -> Option<(animus_cp_data::hlc::HlcTimestamp, u32)> {
+        match self {
+            CpGroup::Lsm(n) => n.hot_change_max().await,
+            CpGroup::Mem(n) => n.hot_change_max().await,
         }
     }
 
@@ -1257,6 +1268,16 @@ impl<E: Env> CpGroup<E> {
                         .into_iter()
                         .map(|(_, voters)| voters.into_iter().map(|id| id.to_string()).collect())
                         .collect(),
+                    membership_history: self
+                        .membership_history()
+                        .into_iter()
+                        .map(|(voters, learners)| {
+                            (
+                                voters.into_iter().map(|id| id.to_string()).collect(),
+                                learners.into_iter().map(|id| id.to_string()).collect(),
+                            )
+                        })
+                        .collect(),
                 }
             };
         }
@@ -1643,6 +1664,21 @@ impl<E: Env> CpGroup<E> {
             CpGroup::Mem(n) => n.voter_history(),
         }
     }
+
+    /// Every distinct **(voters, learners)** pair this replica has adopted,
+    /// in adoption order (issue #944) — a pure diagnostic, never a wake.
+    /// See [`RaftKvNode::membership_history`]'s doc for why this exists:
+    /// `/admin/raftkv`'s own `membership_history` field (below) is what
+    /// lets a test — or an operator — prove a member passed through ADR
+    /// 0058 Train 1's learner phase before it was ever a voter without
+    /// racing an external poll against how fast the reconciler happens to
+    /// promote it.
+    fn membership_history(&self) -> Vec<(BTreeSet<NodeId>, BTreeSet<NodeId>)> {
+        match self {
+            CpGroup::Lsm(n) => n.membership_history(),
+            CpGroup::Mem(n) => n.membership_history(),
+        }
+    }
 }
 
 /// How a CP op originating on this node reaches the group leader
@@ -1713,7 +1749,7 @@ impl ReadConsistency {
 
 /// How a [`ClientCtx::poll_probe`] confirm wait ended: the probed effect
 /// appeared (`Confirmed`), the wait became provably futile before the
-/// deadline (`Superseded` — see [`decide::confirm_wait_is_futile`]), or
+/// deadline (`Superseded` — see [`kind_batch_confirm_superseded`]), or
 /// the deadline elapsed with the accepted entry still plausibly in flight
 /// (`TimedOut`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1815,6 +1851,129 @@ fn classify_kind_batch_outcome(
             | KindBatchOutcome::Rejected { .. },
         )) => KindBatchSignal::NoOp,
         _ => KindBatchSignal::Inconclusive,
+    }
+}
+
+/// The leadership-independent half of a CP write confirm loop's superseded
+/// decision (issues #911, #967, #971) — shared by `write_path.rs`'s
+/// `cp_kind_raw_local`, `cp_kind_eval_local`, `poll_probe` (the shared
+/// primitive behind `cp_batch_local`) and `cp_put_local`/`cp_delete_local`,
+/// every confirm loop in the file. All five used to give up on
+/// `decide::confirm_wait_is_futile` (deleted — this function replaced its
+/// only remaining callers). That predicate's own `!is_leader()` clause was
+/// not proof of loss for any of them — a term bump from a missed heartbeat
+/// deadline under real
+/// contention flips `is_leader()` false well before anyone can tell whether
+/// an already-accepted entry will still commit, and `kind_batch_outcome`/
+/// `engine_applied_index` are plain local reads needing no leadership at
+/// all — so `is_leader()` is deliberately not a parameter here. Only two
+/// proofs are leadership-independent: `engine_applied_index` has passed
+/// `accepted_index` with no matching outcome (whatever occupied that slot
+/// no-opped or belongs to a different entry entirely), or the outcome
+/// recorded at `accepted_index` carries a *different* term (Raft's
+/// log-matching property means a different term there can only mean a
+/// different, reoccupying entry — see `ProposeResult::Accepted`'s doc).
+/// "Nothing has decided this index yet" (`outcome` is `None` and
+/// `engine_applied_index` has not passed `accepted_index`) returns `false`
+/// regardless of `is_leader()` — the caller keeps waiting, bounded by its
+/// own `CLIENT_TIMEOUT` deadline.
+fn kind_batch_confirm_superseded(
+    engine_applied_index: u64,
+    accepted_index: u64,
+    accepted_term: u64,
+    outcome: &Option<(u64, KindBatchOutcome)>,
+) -> bool {
+    engine_applied_index >= accepted_index
+        || outcome
+            .as_ref()
+            .is_some_and(|(term, _)| *term != accepted_term)
+}
+
+#[cfg(test)]
+mod kind_batch_confirm_superseded_tests {
+    use super::{KindBatchOutcome, kind_batch_confirm_superseded};
+
+    const ACCEPTED_INDEX: u64 = 10;
+    const ACCEPTED_TERM: u64 = 7;
+
+    /// The case issues #911/#967 exist for: nothing has decided this index
+    /// yet (no recorded outcome, applied index still behind) — must keep
+    /// waiting no matter what `is_leader()` would have said, since that
+    /// signal is not even a parameter here any more.
+    #[test]
+    fn nothing_decided_yet_is_never_superseded() {
+        assert!(!kind_batch_confirm_superseded(
+            ACCEPTED_INDEX - 1,
+            ACCEPTED_INDEX,
+            ACCEPTED_TERM,
+            &None,
+        ));
+    }
+
+    /// Effects merged exactly at our own index with our own term recorded:
+    /// this is the `Confirm` shape — `classify_kind_batch_outcome` catches
+    /// it first in every real caller (both `cp_kind_raw_local` and
+    /// `cp_kind_eval_local` only ever call this function *after* that check
+    /// already returned `Inconclusive`/`NoOp` this same iteration), so this
+    /// function has no need to special-case it and correctly does not: it
+    /// reports `true` here too (`engine_applied_index >= accepted_index`
+    /// alone is sufficient by design, mirroring `cp_kind_raw_local`'s own
+    /// pre-extraction shape) — this test pins that contract explicitly so
+    /// a future caller of this function in isolation cannot mistake it for
+    /// a full confirm/superseded decision on its own.
+    #[test]
+    fn effects_merged_at_our_own_index_is_reported_true_by_this_check_alone() {
+        assert!(kind_batch_confirm_superseded(
+            ACCEPTED_INDEX,
+            ACCEPTED_INDEX,
+            ACCEPTED_TERM,
+            &Some((ACCEPTED_TERM, KindBatchOutcome::Applied)),
+        ));
+    }
+
+    /// Effects merged past our index with nothing recorded there for us —
+    /// whatever occupied that slot no-opped or belongs to a different,
+    /// already-applied-and-gone entry. Leadership-independent proof.
+    #[test]
+    fn effects_past_our_index_with_no_outcome_is_superseded() {
+        assert!(kind_batch_confirm_superseded(
+            ACCEPTED_INDEX,
+            ACCEPTED_INDEX,
+            ACCEPTED_TERM,
+            &None,
+        ));
+    }
+
+    /// A different term recorded at our own index: Raft's log-matching
+    /// property means a different, reoccupying entry landed there, ours
+    /// having been truncated — superseded regardless of whether effects
+    /// are readable yet.
+    #[test]
+    fn a_different_term_at_our_index_is_superseded() {
+        assert!(kind_batch_confirm_superseded(
+            ACCEPTED_INDEX - 1,
+            ACCEPTED_INDEX,
+            ACCEPTED_TERM,
+            &Some((ACCEPTED_TERM + 1, KindBatchOutcome::Applied)),
+        ));
+    }
+
+    /// The false-negative issue #911/#967 fixed, pinned directly: a real
+    /// term bump makes `is_leader()` read false while this index is still
+    /// entirely undecided — this function has no `is_leader` parameter to
+    /// even consult, so it cannot regress back into treating that alone as
+    /// proof of loss.
+    #[test]
+    fn is_leader_is_not_a_parameter_and_cannot_cause_a_false_supersede() {
+        // Same inputs as `nothing_decided_yet_is_never_superseded`, standing
+        // in for "this node just lost leadership" — no `bool` for it exists
+        // to pass here at all, which is the fix.
+        assert!(!kind_batch_confirm_superseded(
+            ACCEPTED_INDEX - 1,
+            ACCEPTED_INDEX,
+            ACCEPTED_TERM,
+            &None,
+        ));
     }
 }
 
@@ -1986,6 +2145,36 @@ pub(crate) enum SnapshotRead {
 /// a leader is reachable; the cap only bounds the wait when the group is forming.
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long every one of this crate's own listener accept loops
+/// (`serve_requests`, `dynamo::serve`, `admin::serve`, `console::serve`)
+/// backs off after a failed `accept()` before retrying — issue #592.
+///
+/// **A failed `accept()` must never stop an accept loop.**
+/// `TcpListener::accept`'s error cases (`EMFILE`/`ENFILE` when the process
+/// or system is at its file-descriptor limit, `ECONNABORTED`/`ECONNRESET`
+/// from a peer that disconnected mid-handshake, and similar per-connection
+/// conditions) are ordinarily transient — the classic accept-loop hazard,
+/// well documented for `accept(2)`-style servers, is treating any of them
+/// as fatal and returning, which silently and permanently deafens this
+/// listener to every future connection despite the process staying alive
+/// and otherwise healthy. `animus_env::prod::spawn_accept` already
+/// documents fixing exactly this shape for the internal Raft wire (a
+/// transient `EMFILE` during a bootstrap connect storm killed that
+/// listener's accept loop, stranding the node); the four listeners in this
+/// crate each carried a `return` on any `accept()` error instead, despite
+/// each one's own doc comment claiming to "keep serving," and this is the
+/// most likely account of issue #592's own `index_backfill.rs` panic: a
+/// split's own burst of new per-tablet engines/Raft groups is exactly the
+/// kind of transient fd pressure that can turn one `accept()` on the intra
+/// listener into a permanently dead port for the rest of that test's later
+/// calls, with no bind-side race or scheduling delay required at all. See
+/// `docs/lessons/general/2026-09-16-an-accept-loop-must-outlive-a-single-
+/// transient-accept-error.md`. Matches `spawn_accept`'s own
+/// `ACCEPT_ERROR_BACKOFF` value — short, so a genuinely transient blip
+/// resumes accepting within a fraction of an election timeout rather than
+/// lingering backed off while a caller times out reaching this node.
+pub(crate) const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(10);
+
 /// ADR 0055: the refusal a node returns for a **forwarded** eventual read it
 /// cannot serve — it holds no serveable replica of the tablet, or the one it
 /// holds does not cover the requested range.
@@ -2102,6 +2291,55 @@ const FORWARD_HOP_TIMEOUT: Duration = Duration::from_secs(2);
 /// window via `RELAY_TRANSPORT_FAILURE`) and `SimEnv` (where it is the
 /// only thing that ever bounds a dead hinted peer's own hop at all).
 const HINTED_FORWARD_HOP_TIMEOUT: Duration = Duration::from_secs(6);
+
+/// **Issue #950.** How long [`ClientCtx::cp_route`] trusts its OWN, purely
+/// local view before asking the tablet's other known replicas for their own
+/// leader belief. `cp_route`'s "this node hosts a replica but its own
+/// leader hint is unknown" branch (`topology::decide_cp_route`'s
+/// `RouteDecision::Wait`) is deliberately conservative — the only real
+/// "route" might be this very node, mid-election — but before this fix that
+/// caution was unconditional: `cp_route` polled only `self.edge.cp_leader`/
+/// this node's own `RaftKvNode::leader()` every [`SCHEMA_POLL_INTERVAL`] for
+/// up to the full [`CLIENT_TIMEOUT`], with no fallback, even when every
+/// OTHER replica of the group had known a stable leader the entire time
+/// (the exact evidence in issue #950: a continuously known leader per an
+/// independent `/admin/raftkv` poll, while a routed write still burned the
+/// whole 10s and reported "no CP group leader reachable"). A node's own
+/// local Raft replica can lag the rest of its group under severe scheduling
+/// pressure (bulk request handling starving its own heartbeat/apply
+/// processing) without the group itself ever losing its leader — that
+/// staleness is indistinguishable, from purely local state, from a genuine
+/// election in progress.
+///
+/// **Sized deliberately**: comfortably above the CP-data plane's own
+/// randomized election-timeout range (`[150ms, 300ms)`, `animus-control`'s
+/// `election_base`) so a real, brief election is never mistaken for
+/// staleness — several such windows fit inside this budget — while still
+/// leaving most of [`CLIENT_TIMEOUT`] for the cross-replica fan-out this
+/// triggers and whatever forwarding follows it.
+const CP_ROUTE_LOCAL_SUB_BUDGET: Duration = Duration::from_millis(750);
+
+/// **Issue #950.** How often [`ClientCtx::cp_route`] re-tries its
+/// cross-replica leader-hint fan-out (see [`CP_ROUTE_LOCAL_SUB_BUDGET`])
+/// once a first attempt has come back with nothing — a real election in
+/// progress needs more than one round; a fixed cadence bounds how much of
+/// the remaining [`CLIENT_TIMEOUT`] budget each additional round can cost,
+/// mirroring [`FORWARD_ELECTION_BACKOFF`]'s identical role in the
+/// forward-hop chase.
+const CP_ROUTE_FANOUT_RETRY_INTERVAL: Duration = Duration::from_millis(500);
+
+/// **Issue #950.** The per-replica transport timeout for
+/// [`ClientCtx::cp_route`]'s cross-replica leader-hint fan-out — every known
+/// replica is probed **concurrently** (not serially, unlike the forward-hop
+/// chase's own candidate walk: there is no vouching signal to prefer one
+/// probed replica over another, so racing them costs nothing extra — see
+/// `docs/lessons/code-patterns/2026-09-15-a-per-hop-timeout-cap-does-not-
+/// bound-a-serial-fallbacks-total-cost.md`), so this bounds the WHOLE
+/// fan-out round, not one candidate's share of it. Short: the probe is a
+/// single cheap local read on the answering side
+/// (`RaftKvNode::leader()`, no propose/wake/block), so even a busy peer
+/// should answer well inside this.
+const CP_ROUTE_FANOUT_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Bounded attempts [`ClientCtx::txn_prepare_pushing`] gives a stage blocked
 /// by another transaction's unresolved intent (ADR 0018 §2/PR6, task #16)
@@ -10231,10 +10469,6 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     // eventual-read-specific failure a client can ever observe, only an
     // eventual read that quietly cost what a strong one costs.
 
-    // The futility predicate this used to hold (`confirm_wait_is_futile`)
-    // moved to [`decide::confirm_wait_is_futile`] (ADR 0061 A6) — see that
-    // function's own doc for the full two-signal rationale (issue #268).
-
     // ---- multi-participant transactions (ADR 0018 §2/PR4) --------------------
 
     // ---- in-doubt transaction recovery (ADR 0018 §2/PR5) ------------------
@@ -10671,7 +10905,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     pub(crate) async fn admin_add_control_member(
         &self,
         node: Option<NodeId>,
-        addr: SocketAddr,
+        addr: String,
         labels: BTreeMap<String, String>,
     ) -> Result<NodeId, String> {
         let Some(leader) = self.edge.leader_handle() else {
@@ -10695,12 +10929,12 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             // env — every other control-role node's `peer_sync_loop` only
             // ever learns an updated address from `Metadata.node_addrs`,
             // never from this call's local `merge_peer` side effect.
-            leader.env().merge_peer(node.clone(), addr.to_string());
+            leader.env().merge_peer(node.clone(), addr.clone());
             let meta = self.control.metadata_cached();
             if let Some(mut addrs) = meta.node_addrs.get(&node).cloned()
-                && addrs.internal != addr.to_string()
+                && addrs.internal != addr
             {
-                addrs.internal = addr.to_string();
+                addrs.internal = addr.clone();
                 let _ = leader.propose(MetaCommand::RegisterNodeAddrs {
                     node: node.clone(),
                     addrs,
@@ -10777,8 +11011,8 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 intra: String::new(),
                 role: "control".to_string(),
             });
-            if addrs.internal != addr.to_string() {
-                addrs.internal = addr.to_string();
+            if addrs.internal != addr {
+                addrs.internal = addr.clone();
                 if let ProposeResult::NotLeader { .. } =
                     leader.propose(MetaCommand::RegisterNodeAddrs {
                         node: node.clone(),
@@ -10857,7 +11091,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                         intra: String::new(),
                         role: "control".to_string(),
                     });
-                addrs.internal = addr.to_string();
+                addrs.internal = addr.clone();
                 match self
                     .register_node(node.clone(), addrs, labels.clone())
                     .await
@@ -10881,7 +11115,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 }
             }
         }
-        leader.env().merge_peer(node.clone(), addr.to_string());
+        leader.env().merge_peer(node.clone(), addr.clone());
         let mut voters = current;
         voters.insert(node.clone());
         match leader.change_membership(voters) {
@@ -12950,8 +13184,11 @@ async fn median_split_key<E: Env>(group: &CpGroup<E>) -> Option<Vec<u8>> {
 /// call sites for why). `None` (TLS unconfigured, the default) is plain
 /// TCP, byte-for-byte unchanged. A failed handshake is logged at `warn`
 /// with the peer's address and the connection dropped — the loop keeps
-/// serving every other connection, mirroring `animus_env::prod::
-/// spawn_accept`'s own contract.
+/// serving every other connection. **A failed `accept()` itself also never
+/// stops this loop** (issue #592, [`ACCEPT_ERROR_BACKOFF`]'s own doc) — it
+/// now genuinely mirrors `animus_env::prod::spawn_accept`'s contract,
+/// which this doc comment used to claim without the code actually doing
+/// it.
 async fn serve_requests(
     listener_socket: TcpListener,
     ctx: ClientCtx,
@@ -12984,8 +13221,8 @@ async fn serve_requests(
                 });
             }
             Err(err) => {
-                tracing::warn!(?err, "accept failed");
-                return;
+                tracing::warn!(?err, "accept failed (retrying)");
+                tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
             }
         }
     }
@@ -13145,11 +13382,13 @@ fn request_kind(request: &ClientRequest) -> &'static str {
         ClientRequest::PutBatch { .. } => "put_batch",
         ClientRequest::KindWrite { .. } => "kind_write",
         ClientRequest::KindWriteItem { .. } => "kind_write_item",
+        ClientRequest::CpLeaderHintProbe { .. } => "cp_leader_hint_probe",
         ClientRequest::KindScan { .. } => "kind_scan",
         ClientRequest::ForceSeal { .. } => "force_seal",
         ClientRequest::ForcePitrSeal { .. } => "force_pitr_seal",
         ClientRequest::TriggerAutoSplit { .. } => "trigger_auto_split",
         ClientRequest::StreamHotRead { .. } => "stream_hot_read",
+        ClientRequest::StreamHotChangeMax { .. } => "stream_hot_change_max",
         ClientRequest::ClearBackfillCursor { .. } => "clear_backfill_cursor",
         ClientRequest::Get { .. } => "get",
         ClientRequest::GetSnapshot { .. } => "get_snapshot",
@@ -13361,6 +13600,17 @@ async fn handle_request(
              in `Forwarded`"
                 .into(),
         ),
+        // Issue #950: the cross-replica leader-hint probe, refused bare for
+        // the identical reason every other tablet-addressed internal RPC is
+        // — see `ClientRequest::CpLeaderHintProbe`'s doc. Real handling
+        // lives in `cp_serve_forwarded`'s match, reached only through
+        // `Forwarded`; not a `MetaCommand`, so `is_relayable_command` does
+        // not apply.
+        ClientRequest::CpLeaderHintProbe { .. } => ClientResponse::Error(
+            "this request is an internal leader-hint probe RPC and must be sent wrapped in \
+             `Forwarded`"
+                .into(),
+        ),
         // ADR 0041 §5: the LSI `Query` read primitive, the read-side dual of
         // `KindWrite` just above and refused for the identical reason — a
         // bare caller could otherwise read a table's LSI/change-log/
@@ -13401,6 +13651,11 @@ async fn handle_request(
         ClientRequest::StreamHotRead { .. } => ClientResponse::Error(
             "this request is an internal open-shard hot-read RPC and must be sent wrapped in \
              `Forwarded`"
+                .into(),
+        ),
+        ClientRequest::StreamHotChangeMax { .. } => ClientResponse::Error(
+            "this request is an internal open-shard max-position RPC and must be sent wrapped \
+             in `Forwarded`"
                 .into(),
         ),
         ClientRequest::ClearBackfillCursor { .. } => ClientResponse::Error(
@@ -13478,7 +13733,7 @@ const BROADCAST_EXHAUSTED_BACKOFF: Duration = Duration::from_millis(250);
 /// instant the apply task advances past the entry's index, not by polling on
 /// a timer. This constant is no longer a poll granularity: it only bounds
 /// how long that park can go without a **forced** re-check, so a caller's
-/// own `confirm_wait_is_futile`/deadline logic still fires on schedule even
+/// own `kind_batch_confirm_superseded`/deadline logic still fires on schedule even
 /// when the watched index never applies at all (the group loses its leader,
 /// a quorum is lost, the entry gets superseded) — `AppliedWatch::bump` never
 /// wakes for that outcome, since nothing ever advances. A write that
@@ -16180,16 +16435,18 @@ pub async fn read_frame<T: DeserializeOwned, S: AsyncRead + Unpin>(
 // alongside the function itself (ADR 0061 A6, formerly `auto_split_median_tests`
 // here).
 
-/// Regression tests for the end-to-end fast-fail behavior
-/// [`decide::confirm_wait_is_futile`] enables (issue #268) — in-crate
+/// Regression tests for the end-to-end fast-fail behavior a confirm loop's
+/// own futility check ([`kind_batch_confirm_superseded`], formerly
+/// `decide::confirm_wait_is_futile`) enables (issue #268) — in-crate
 /// because they need a private [`CpGroup`] handle and the `pub(crate)`
 /// [`ClientCtx::cp_kind_local`], which no external `tests/` file can reach
 /// (the same reason `gsi_drain_cursor_tests` lives inside `index_drain.rs`).
 /// Run via `cargo test -p animusd --lib`.
 ///
 /// **Deliberately not moved into `decide`'s own test module (ADR 0061 A6):**
-/// unlike `decide::confirm_wait_is_futile`'s own direct unit tests (a plain
-/// truth table over the predicate's three primitive inputs), these prove
+/// unlike `kind_batch_confirm_superseded`'s own direct unit tests
+/// (`kind_batch_confirm_superseded_tests`, a plain truth table over the
+/// predicate's inputs), these prove
 /// the *wired* behavior — a real `CpGroup` propose/apply/poll round trip
 /// through `cp_kind_local`, with real timing assertions — which needs a
 /// live single-node cluster regardless of how pure the underlying predicate
@@ -17594,9 +17851,41 @@ mod client_cancellation_tests {
         // unilaterally step down just because it cannot reach followers
         // (nothing left alive can out-campaign it), so it keeps believing
         // it leads for the rest of this test.
+        // **Uses `shutdown_and_wait`, not bare `shutdown` (issue #638).**
+        // `Node::shutdown()` is documented fire-and-forget: `task.abort()`
+        // only *requests* cancellation, and under CI's real 2-vCPU runners
+        // (`.github/workflows/ci.yml`'s `prod-liveness-animusd` comment) that
+        // can lag well behind this call returning. Confirmed directly here
+        // (a temporary diagnostic probe, not part of this fix): a "killed"
+        // follower's own client listener was still accepting fresh
+        // connections up to ~0.5ms after `shutdown()` returned in several
+        // local runs even on an idle 4-core sandbox -- meaning its Raft
+        // driver task was *also* still alive and able to ACK a fresh
+        // AppendEntries in that window. If this test's own "stranding" write
+        // below reaches a not-yet-dead follower during that window, it can
+        // legitimately reach 2-of-3 quorum and complete normally instead of
+        // getting stuck -- silently defeating the whole scenario this test
+        // exists to exercise, with no server-side bug at all: the write
+        // finishes, the response is written back (successfully, since the
+        // client hasn't closed its socket yet), `handle_connection` loops to
+        // read the *next* frame, observes the later `shutdown()`+`drop` as a
+        // plain between-requests EOF (never counted as an abandoned
+        // in-flight request), and `client_requests_abandoned` never moves --
+        // exactly CI's own observed symptom (a `9.87s` total run: bring-up
+        // plus a normal-speed write, then the unconditional 5s wait for a
+        // metric that was never going to fire, then the timeout `Elapsed`
+        // panic at this test's `.expect(...)` for that wait). A slower/more
+        // contended host only widens this window, which is consistent with
+        // this reproducing in CI's real 2-vCPU shards and not this sandbox's
+        // fast path, yet still measurably observable here too.
+        // `shutdown_and_wait` closes the race: it awaits every aborted
+        // task's teardown (including each follower's own internal `ProdEnv`,
+        // covering its Raft driver and every connection it owns) before
+        // returning, so by the time this loop finishes every non-leader
+        // replica is genuinely, verifiably gone -- not just requested to be.
         for (i, node) in nodes.iter().enumerate() {
             if i != leader_idx {
-                node.shutdown();
+                node.shutdown_and_wait().await;
             }
         }
 
@@ -19038,6 +19327,11 @@ mod sim_cluster;
 /// private fields stay reachable with no further visibility widened.
 #[cfg(test)]
 mod sim_cluster_corpus;
+/// Issue #950: `ClientCtx::cp_route`'s cross-replica leader-hint fan-out —
+/// a sibling of `sim_cluster_data_only` for the identical reason (needs
+/// `SimCluster`'s own `pub(crate)` surface, no further visibility widened).
+#[cfg(test)]
+mod sim_cluster_cp_route_fanout;
 /// ADR 0061 rung K (C-11) PR 2: the `BatchWriteItem`/`BatchGetItem`/
 /// `TransactWriteItems`/forwarded-write conversion of `tests/dynamo_
 /// throttling.rs`'s four sim-reachable throttle scenarios — a sibling of
@@ -19283,6 +19577,15 @@ mod sim_cluster_schema_broadcast;
 /// investigation found and reports (not fixed here, out of scope).
 #[cfg(test)]
 mod sim_cluster_dynamo_drop_table;
+
+/// Issue #920: a `ConsistentRead: true` read routed through a node hosting
+/// no replica must not hang for tens of seconds after every replica of an
+/// idle (quiesced, ADR 0048) tablet group is crashed and restarted in
+/// turn with durable storage. See this module's own doc for the full
+/// scenario and why it lives here (needs `ClientCtx`/forwarding, not just
+/// `RaftKvNode`) rather than in `animus-cp-data`'s own quiescence corpus.
+#[cfg(test)]
+mod sim_cluster_quiesced_rolling_restart;
 
 /// ADR 0061 rung D4 PR 2 (C-04 D4): deterministic `SimCluster` coverage for
 /// the auto-split BYTE trigger (ADR 0034) — `auto_split_loop` (`lib.rs`)

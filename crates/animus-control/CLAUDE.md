@@ -121,6 +121,26 @@ per-tablet CP data plane (`animus-cp-data`).
   `match_index` — it's a volatile per-peer liveness timestamp, not
   replicated state.
 
+  **A second gotcha (issue #923): `become_leader` seeds every peer's
+  `peer_last_contact` to the instant a leadership stint begins — a
+  courtesy timestamp, not a genuine ack, there only so a peer that stays
+  silent the whole stint can't hide behind the "never contacted yet" grace
+  forever.** That seed ages out after the same `CONTROL_PEER_LIVENESS_
+  TIMEOUT` a real ack would, with no wider allowance for "this leader only
+  just took over" — a fresh leader's first real heartbeat round can
+  legitimately take longer than that steady-state timeout under the load a
+  leadership change itself creates. `control_peer_believed_alive` covers
+  this with a **second**, wider, separately-named grace —
+  `RaftCore::leader_since` (gated on `role == Leader`, so a stepped-down
+  node reads `None` with no explicit clearing needed) +
+  `CONTROL_LEADER_TAKEOVER_GRACE` — deliberately not a reuse of
+  `CONTROL_PEER_LIVENESS_TIMEOUT` itself, since an equal-sized second grace
+  would be a no-op (`become_leader`'s own seed already provides exactly
+  that much). See ADR 0037's 2026-09-16 amendment and ADR 0012's matching
+  one (the identical shape of fix for the **raftkv**-id `FailureDetector`'s
+  own `LEADER_GRACE`, a structurally separate mechanism/id-space that
+  needed the same kind of post-election patience).
+
   **`Metadata` is `DRIVER_APPLIED` (ADR 0038): the driver is split into a
   consensus loop (`drive`, no engine I/O — services heartbeats regardless
   of engine speed) and an async apply task (`meta_apply_loop`/
@@ -660,6 +680,51 @@ per-tablet CP data plane (`animus-cp-data`).
   tests/reconfigure_multi_replica_diff.rs`, `docs/engineering-lessons.md`,
   and ADR 0062's #513 amendment. Directed Placing relocates a child
   regardless of how many replicas its fresh target differs by.
+
+  **Issues #670/#921/#928 (2026-09-16, two-layer fix): an achieved
+  directed-Placing target could be discarded by a failure-detector false
+  positive, both before AND after `done`.** `retarget_ready_this_tick`'s
+  dwell above (`SPLIT_PLACING_RETARGET_DWELL`, 5s) applied identically
+  whether a tablet's stored target was still converging or already
+  achieved (`t.replicas == target`) — but discarding an ALREADY-achieved
+  target via a fresh `replan` is strictly more disruptive (a split child's
+  only other eligible candidates are typically its own pre-split
+  siblings, so this can converge the tablet right back toward the set the
+  split was moving it away from) than discarding one still mid-move.
+  Fixed with a separate, longer dwell,
+  `node::SPLIT_PLACING_RETARGET_DWELL_ACHIEVED` (30s), used once
+  `t.replicas == target`. **This alone only protects the narrow window
+  before `done` fires** (`animusd`'s own settle window,
+  `SPLIT_PLACING_DONE_SETTLE`, is 1.5s) — the instant `done` is set, the
+  tablet falls under *ordinary* `reconcile_placement`/`rebalance_placement`,
+  which had no dwell at all against the identical false positive. Closed
+  by `node::recently_done_this_tick` (the same driver-local,
+  `env.now()`-keyed pattern as `retarget_ready_this_tick`, tracking the
+  FIRST tick each tablet's `split_placing` entry was observed `done`) and
+  a new `recently_done: &BTreeSet<TabletId>` parameter on
+  `Metadata::reconcile`/`rebalance` (and their `PlacementView` mirrors) —
+  a tablet named in it is excluded from repair/rebalance for the same
+  `SPLIT_PLACING_RETARGET_DWELL_ACHIEVED` window, counted from when `done`
+  was first observed rather than from when the target was achieved (one
+  continuous protection window in spirit, two mechanisms in practice
+  because `reconcile_placement`/`rebalance_placement` have no
+  `split_placing`-specific timing state of their own before this fix). An
+  empty `recently_done` (every pure/unit-test caller) reproduces the
+  pre-fix behavior exactly — this is **not** a fix to issue #928's fully
+  general form (an ordinary tablet with no `split_placing` history still
+  has no repair dwell at all against a false positive); only the
+  directed-Placing-specific instance this crate can still name a tablet
+  set for. Tests: `meta::tests::
+  reconcile_does_not_repair_away_an_achieved_recently_done_target` (pure,
+  proves the bug existed with an empty `recently_done` and closes with a
+  populated one), `tests/placement_split_placing.rs`'s test 10
+  (`split_placing_phase_holds_an_already_achieved_target_past_the_base_dwell`,
+  the pre-`done` half) and test 11
+  (`ordinary_reconcile_holds_a_recently_done_target_past_the_grace_window`,
+  the post-`done` half, driven through the real `reconcile_loop`/`SimEnv`).
+  See ADR 0062's 2026-09-16 amendment and `docs/lessons/testing/
+  2026-09-16-a-directed-placement-decision-can-be-undone-by-a-transient-
+  failure-detector-false-positive.md`.
 
 - **The backup catalog (ADR 0059 §3, Train 1 PR ①): `BeginBackup`/
   `RecordBackupTabletComplete`/`CompleteBackup`/`FailBackup`/`DeleteBackup`.**
@@ -1279,6 +1344,29 @@ per-tablet CP data plane (`animus-cp-data`).
   concern, not a safety one) and any policy for *when* to call
   `promote_learner` (the host reconciler's replica-move sequencing).
 
+  **`RaftCore::config_history()` (issue #944)**: a small bounded ring
+  (`config_history`, capacity 64, oldest dropped, never rebuilt at
+  recovery) of every distinct `(config, learners)` pair this core has
+  adopted, appended **synchronously inside `apply_config`** — the one call
+  every real transition funnels through, whether it's a leader's own
+  `add_learner`/`promote_learner`/`change_membership` call (mutating this
+  core directly, from whatever task calls it — for `animus-cp-data` that's
+  the host reconciler's own tick, not the consensus/drive loop) or a
+  follower's own per-entry `log_append` while draining a batched
+  `AppendEntries`. This is deliberately **not** the same mechanism as
+  `animus-cp-data`'s `VoterHistory` (issue #596), which samples
+  `config()`/`learners()` from OUTSIDE, once per consensus-loop iteration —
+  fine-grained enough for a voter-set change (bounded by this core's own
+  per-message processing) but NOT for the learner set specifically, since a
+  caller invoking two membership-changing methods back-to-back (or a
+  follower draining several batched entries) can mutate this core more than
+  once before an external sampler next gets scheduled, silently coalescing
+  the transient learner phase away — see `crates/animus-cp-data/CLAUDE.md`'s
+  matching entry and `crates/animusd/tests/learner_reconfigure.rs` for the
+  flake this closed. Recording at the mutation site itself cannot miss it,
+  regardless of which task or how much batching triggered it. A pure
+  accessor — `config_history()` never blocks or mutates anything.
+
 - **Leadership transfer (`RaftCore::transfer_leadership`, ADR 0029).**
   Originally a per-tablet CP-data primitive living here because the sync
   core is shared, described in an earlier revision of this note as
@@ -1673,8 +1761,14 @@ per-tablet CP data plane (`animus-cp-data`).
 
 - **Automatic placement + rebalancing (ADR 0005, 0029).** Policies are
   replicated (`SetTabletPolicy` → `policies`). The decision is the pure
-  `Metadata::reconcile` (repair: `animus_placement::replan` over `Active`
-  members, emits a `CasTabletReplicas` only for policy-violating tablets) and its
+  `Metadata::reconcile` (repair: `animus_placement::replan_repair` over
+  `Active` members, emits a `CasTabletReplicas` only for policy-violating
+  tablets — **issue #957**: `replan_repair`, not plain `replan`, so a
+  policy RF the current candidate pool can't fully satisfy still gets
+  grown as far as it genuinely can be, e.g. RF 3 on a 2-node cluster still
+  repairs a 1-replica tablet up to 2, rather than refusing to propose
+  anything until a 3rd candidate ever appears — see `animus-placement/
+  CLAUDE.md`'s entry for the growth-only/never-shrinks contract) and its
   balance-driven complement `Metadata::rebalance` (`rebalance_step` picks a
   single balance-improving healthy-replica move, wrapped as a `CasTabletReplicas`
   at the current epoch — reusing the command, so no relay-allowlist change). The

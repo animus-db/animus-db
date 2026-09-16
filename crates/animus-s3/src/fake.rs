@@ -77,9 +77,22 @@ impl FakeS3 {
     fn handle(&self, req: HttpRequest) -> HttpResponse {
         let (raw_path_wire, raw_query_wire) = split_uri(&req.uri);
         let path = sigv4::percent_decode(raw_path_wire);
-        let query = sigv4::percent_decode(raw_query_wire);
+        // Recover raw pairs by splitting the still-**encoded** wire query
+        // first, then decoding each side — never the other order. Decoding
+        // the whole query string up front and then splitting the result on
+        // `&` (an earlier version of this function did exactly that) is the
+        // identical bug issue #855 fixed on the signing side: a value
+        // containing its own literal `&` (e.g. a `prefix` derived from a
+        // customer `S3KeyPrefix`) would already have been un-escaped back
+        // to `&` by then, making it indistinguishable from a real pair
+        // separator. See `sigv4::parse_wire_query_pairs`'s own doc.
+        let query_pairs = sigv4::parse_wire_query_pairs(raw_query_wire);
+        let query_pair_refs: Vec<(&str, &str)> = query_pairs
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
 
-        if let Err(resp) = self.verify(&req, &path, &query) {
+        if let Err(resp) = self.verify(&req, &path, &query_pair_refs) {
             return resp;
         }
 
@@ -92,17 +105,17 @@ impl FakeS3 {
             return error_response(404, "NoSuchBucket", "The specified bucket does not exist");
         }
 
-        let is_list = query.split('&').any(|pair| pair == "list-type=2");
+        let is_list = query_pairs
+            .iter()
+            .any(|(k, v)| k == "list-type" && v == "2");
         if is_list {
             let mut prefix = String::new();
             let mut continuation: Option<String> = None;
-            for pair in query.split('&') {
-                if let Some((k, v)) = pair.split_once('=') {
-                    match k {
-                        "prefix" => prefix = v.to_string(),
-                        "continuation-token" => continuation = Some(v.to_string()),
-                        _ => {}
-                    }
+            for (k, v) in &query_pairs {
+                match k.as_str() {
+                    "prefix" => prefix = v.clone(),
+                    "continuation-token" => continuation = Some(v.clone()),
+                    _ => {}
                 }
             }
             return self.handle_list(&prefix, continuation.as_deref());
@@ -126,7 +139,12 @@ impl FakeS3 {
 
     /// Structural + cryptographic verification of `req`, returning the
     /// error response to send back the moment anything fails.
-    fn verify(&self, req: &HttpRequest, path: &str, query: &str) -> Result<(), HttpResponse> {
+    fn verify(
+        &self,
+        req: &HttpRequest,
+        path: &str,
+        query_pairs: &[(&str, &str)],
+    ) -> Result<(), HttpResponse> {
         let auth_header = req.headers.get("authorization").ok_or_else(|| {
             error_response(
                 400,
@@ -170,7 +188,7 @@ impl FakeS3 {
             &secret,
             req.method,
             path,
-            query,
+            query_pairs,
             &req.headers,
             &claimed_hash,
         );

@@ -37,3 +37,13 @@ its doc comment — a `SocketAddr` (or any other strictly-typed, IP-only
 field) is a signal the API was designed for a deployment shape where a
 literal IP is stable, which a Kubernetes pod's is not. Grep for the type,
 don't infer it from the wire.
+
+**Archived 2026-09-16 — the specific mechanism this entry describes is
+gone**: issue #662 widened `AddControlMemberReq.addr` to `String` (a cheap
+`host:port` shape check at the handler, resolution left exactly where it
+already lived for every other such address — lazily, at dial time), and
+`animus-operator`'s `resolve_control_dial_addr`/`ClusterApi::get_pod_ip`
+workaround was removed in favor of handing `member/add` the promoted pod's
+own stable DNS name directly, same as every other address surface. The
+**general form** above still applies — kept for exactly that, moved here
+because its own concrete example no longer exists in the code.

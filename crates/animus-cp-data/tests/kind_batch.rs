@@ -360,3 +360,87 @@ fn kind_scoped_reads_see_their_own_scope_and_no_other() {
     ));
     assert_eq!(limited, vec![(row_a.clone(), b"ra".to_vec())]);
 }
+
+/// Issue #858: `pending_changes_key_order`'s return order is **physical key
+/// order** — token-then-pk-then-HLC (ADR 0043 §A3 step 1) — never global
+/// commit order. Two partitions whose tokens sort the opposite way from
+/// their commit HLCs pin the distinction: write the higher-token partition
+/// FIRST (so it has the lower/earlier HLC) and the lower-token partition
+/// SECOND (the higher/later HLC), then confirm the scan returns the
+/// lower-token — later-committed — record first, and that sorting explicitly
+/// by the trailing `(packed_hlc, ordinal)` suffix recovers true commit order.
+#[test]
+fn pending_changes_key_order_is_token_order_not_commit_order() {
+    let seed = 0x0041_0006;
+    let (mut sim, nodes) = group(seed);
+    sim.run_for(Duration::from_secs(2));
+    let l = leader(&nodes, seed);
+
+    // Never hardcode which literal has the smaller token — murmur3 doesn't
+    // sort lexically with the input. Compute both and swap if needed.
+    let (mut pk_lo, mut pk_hi): (&[u8], &[u8]) = (b"partition-a", b"partition-b");
+    if partition_token(pk_lo) > partition_token(pk_hi) {
+        std::mem::swap(&mut pk_lo, &mut pk_hi);
+    }
+    assert!(
+        partition_token(pk_lo) < partition_token(pk_hi),
+        "need two distinct tokens for this test to mean anything (seed={seed})"
+    );
+
+    let prefix_lo = logical(pk_lo, b"");
+    let prefix_hi = logical(pk_hi, b"");
+
+    // Commit order: pk_hi FIRST (the earlier, lower HLC), pk_lo SECOND (the
+    // later, higher HLC) — two separate entries, sequential commits.
+    assert!(
+        matches!(
+            nodes[l].put_kind_batch(Vec::new(), vec![(prefix_hi.clone(), b"rec-hi".to_vec())]),
+            ProposeResult::Accepted { .. }
+        ),
+        "pk_hi's change record rejected (seed={seed})"
+    );
+    sim.run_for(Duration::from_secs(1));
+    assert!(
+        matches!(
+            nodes[l].put_kind_batch(Vec::new(), vec![(prefix_lo.clone(), b"rec-lo".to_vec())]),
+            ProposeResult::Accepted { .. }
+        ),
+        "pk_lo's change record rejected (seed={seed})"
+    );
+    sim.run_for(Duration::from_secs(1));
+
+    let records = block_on(nodes[l].pending_changes_key_order());
+    assert_eq!(records.len(), 2, "seed={seed}: {records:?}");
+
+    // Physical key order groups by token: pk_lo's record (lower token, the
+    // LATER commit) sorts first; pk_hi's (higher token, the EARLIER commit)
+    // sorts second — the opposite of commit order.
+    assert!(
+        records[0].0.starts_with(&prefix_lo),
+        "expected pk_lo's record (later commit, lower token) first in key order \
+         (seed={seed}): {records:?}"
+    );
+    assert!(
+        records[1].0.starts_with(&prefix_hi),
+        "expected pk_hi's record (earlier commit, higher token) second in key order \
+         (seed={seed}): {records:?}"
+    );
+
+    // Sorting explicitly by the trailing 12-byte `(packed_hlc, ordinal)`
+    // suffix (issue #852) — exactly what `seal_now`/`hot_read`
+    // (`animusd::index_drain`) do before treating this as a log — recovers
+    // true commit order: pk_hi (committed first) before pk_lo (committed
+    // second).
+    let mut by_hlc = records.clone();
+    by_hlc.sort_by_key(|(k, _)| k[k.len() - 12..].to_vec());
+    assert!(
+        by_hlc[0].0.starts_with(&prefix_hi),
+        "sorted by packed HLC, pk_hi (committed first) must come first \
+         (seed={seed}): {by_hlc:?}"
+    );
+    assert!(
+        by_hlc[1].0.starts_with(&prefix_lo),
+        "sorted by packed HLC, pk_lo (committed second) must come second \
+         (seed={seed}): {by_hlc:?}"
+    );
+}
