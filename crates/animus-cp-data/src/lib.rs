@@ -4450,11 +4450,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// priority order applies unchanged, straight on the voter set.
     ///
     /// Priority order, most urgent first:
-    /// 1. **Remove an extra `Down` voter** (never self) — restores quorum margin
-    ///    immediately; this is failure repair, and the removed node isn't going
-    ///    to ack anything anyway, so there is nothing to wait for. Never touches
-    ///    a learner — a down voter is the only thing this urgent.
-    /// 2. **Drop a learner no longer wanted.** `desired` can change out from
+    /// 1. **Drop a learner no longer wanted.** `desired` can change out from
     ///    under a learner still mid-catch-up (its node crashed or was
     ///    decommissioned, or a rebalance simply picked someone else) — any
     ///    current learner absent from `desired` is stale by construction (a
@@ -4463,25 +4459,58 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     ///    mean every remaining learner is stale) and is removed directly,
     ///    regardless of its liveness or catch-up progress. Without this, a
     ///    replaced learner would wedge every later step forever.
-    /// 3. **Promote a learner that is both still desired and caught up** —
+    /// 2. **Promote a learner that is both still desired and caught up** —
     ///    advances an in-flight move before starting a new one.
-    /// 4. **Add a `desired` member that is neither a voter nor a learner, as a
+    /// 3. **Add a `desired` member that is neither a voter nor a learner, as a
     ///    LEARNER** — never straight to voter. The old voter quorum keeps its
     ///    pre-move margin (and majority size) untouched while the newcomer
     ///    catches up via ordinary log replication/`InstallSnapshot`, instead of
     ///    briefly counting an uncaught-up node toward quorum.
     ///
-    ///    While any `desired` member is still a learner mid-catch-up (steps 2/3
-    ///    didn't apply this tick), no later step fires — in particular a
-    ///    healthy extra voter (step 5) is never removed while a replacement is
-    ///    still proving it can keep up.
+    ///    While any `desired` member is still a learner mid-catch-up (steps
+    ///    1/2 didn't apply this tick), no later step fires — in particular
+    ///    **neither** an extra `Down` voter (step 4) **nor** a healthy extra
+    ///    (step 5) is removed while a replacement is still proving it can
+    ///    keep up.
+    /// 4. **Remove an extra `Down` voter** (never self) — but, since issue
+    ///    #920's fix, only once every `desired` member is already a voter
+    ///    (steps 1–3 above have had their turn, so no replacement is still
+    ///    mid-catch-up as a learner). **Before this fix, a down extra was
+    ///    removed immediately, ahead of steps 1–3** — "restores quorum
+    ///    margin immediately, and the removed node isn't going to ack
+    ///    anything anyway, so there is nothing to wait for." That reasoning
+    ///    holds for a *permanently* dead voter, but a `Down` mark is a
+    ///    500ms-liveness-timeout inference (ADR 0012's `DETECT_TIMEOUT`),
+    ///    not a proof of permanent loss — a routine pod recreation trips it
+    ///    just as readily as a real failure. Removing the old voter before
+    ///    its replacement is safely a voter shrinks the live quorum
+    ///    requirement for the whole in-flight window (e.g. 3 voters → 2,
+    ///    instead of 3 → 4 → 3 via the learner phase); if the rolling
+    ///    operation causing the `Down` mark then goes on to touch a
+    ///    *second* voter (an ordinary next step of the very same rolling
+    ///    restart), the group can permanently lose majority with no
+    ///    recovery path, since the evicted voter's own tablet-host
+    ///    reconciler has already released it and Metadata no longer names
+    ///    it a replica (issue #920's reproduction — see
+    ///    `animusd::sim_cluster_quiesced_rolling_restart`'s ignored
+    ///    investigation probe and ADR 0048's as-built amendment). Ordering
+    ///    the down-extra removal after the add-a-replacement-first
+    ///    discipline steps 1–3 already use closes this: the group never
+    ///    dips below its pre-move voter count when a replacement is
+    ///    already in flight, exactly the ADD-before-REMOVE safety margin
+    ///    the learner phase was built to give every other reconfigure path.
+    ///    A down extra with **no** replacement pending (`desired` simply
+    ///    excludes it, e.g. a policy-driven RF reduction) still gets
+    ///    removed the moment this step is reached — steps 1–3 are no-ops
+    ///    when nothing is missing/mid-catch-up, so this fires the same
+    ///    tick exactly as before.
     /// 5. **Remove an extra *healthy* voter** (never self) — but only once every
     ///    member of `desired` has caught up to this leader's `commit_index`.
     ///    Skipping this gate would let a healthy move (e.g. a rebalance) drop
     ///    quorum to a still-catching-up newcomer, an availability regression
     ///    relative to just leaving the extra replica in place a little longer.
     ///    By the time this step can fire, every `desired` member is already a
-    ///    voter (steps 2–4 handle the learner phase first), so this is exactly
+    ///    voter (steps 1–3 handle the learner phase first), so this is exactly
     ///    the pre-Train-1 step 3, unchanged.
     /// 6. **The only remaining delta is removing the leader's own replica** —
     ///    `change_membership` always rejects that, so instead transfer
@@ -4507,11 +4536,13 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         }
         let me = self.env.node_id();
         // Any extra (non-self) voter, regardless of liveness — used by step 5
-        // (a *healthy* extra). Step 1 below searches independently for a *down*
-        // extra: `extra().filter(down.contains)` would only ever look at the
+        // (a *healthy* extra) and step 4 (a *down* extra, issue #920's fix:
+        // no longer checked first — see that step's own doc above for why).
+        // `extra().filter(down.contains)` would only ever look at the
         // lowest-id extra (bug fixed under ADR 0029's follow-up — see the root
         // CLAUDE.md engineering-practices entry), silently skipping a Down extra
-        // that happens to sort after a healthy one.
+        // that happens to sort after a healthy one, so `down_extra` below still
+        // searches independently.
         let extra = || current.difference(desired).find(|&n| n != &me).cloned();
         let down_extra = || {
             current
@@ -4520,13 +4551,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                 .cloned()
         };
 
-        if let Some(target) = down_extra() {
-            let mut c = current.clone();
-            c.remove(&target);
-            return self.propose_config(c);
-        }
-
-        // Step 2: drop a stale learner (ADR 0058 Train 1's stuck-learner
+        // Step 1: drop a stale learner (ADR 0058 Train 1's stuck-learner
         // cleanup — see the doc above).
         if let Some(stale) = current_learners.iter().find(|n| !desired.contains(*n)) {
             if !matches!(
@@ -4541,7 +4566,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             return None;
         }
 
-        // Step 3: promote a learner that is both still desired and caught up.
+        // Step 2: promote a learner that is both still desired and caught up.
         if let Some(id) = current_learners.iter().find(|n| {
             desired.contains(*n)
                 && self.learner_caught_up(n, RECONFIGURE_LEARNER_CATCH_UP_THRESHOLD)
@@ -4555,14 +4580,15 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         }
 
         // A `desired` member is still mid-catch-up as a learner: nothing else
-        // to do this tick — in particular, never fall through to step 5 and
-        // remove a healthy extra voter while a replacement hasn't yet proven
-        // it can keep up (the whole point of the learner phase).
+        // to do this tick — in particular, never fall through to step 4/5 and
+        // remove a down or healthy extra voter while a replacement hasn't yet
+        // proven it can keep up (the whole point of the learner phase, and,
+        // since issue #920's fix, of the down-extra step too).
         if desired.iter().any(|n| current_learners.contains(n)) {
             return None;
         }
 
-        // Step 4: a `desired` member genuinely missing from both the voter set
+        // Step 3: a `desired` member genuinely missing from both the voter set
         // and the learner set — add it as a LEARNER, never straight to voter.
         if let Some(missing) = desired
             .iter()
@@ -4580,8 +4606,23 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             return None;
         }
 
-        // From here on every `desired` member is already a voter — the
-        // remaining deltas are exactly the pre-Train-1 steps 3/4.
+        // From here on every `desired` member is already a voter (no earlier
+        // step found a stale/mid-catch-up/missing learner) — safe ground for
+        // step 4: remove an extra `Down` voter (issue #920's fix reordered
+        // this after, not before, steps 1–3 — see this method's own doc for
+        // the full reasoning). A down extra with no replacement pending
+        // reaches this exact tick with nothing having fired above, so it is
+        // removed immediately, matching the pre-fix behavior for that case;
+        // a down extra WITH a replacement in flight only reaches here once
+        // that replacement is already promoted, never before.
+        if let Some(target) = down_extra() {
+            let mut c = current.clone();
+            c.remove(&target);
+            return self.propose_config(c);
+        }
+
+        // Step 5: remove an extra *healthy* voter, once every `desired`
+        // member has caught up — the pre-Train-1 step 3/4, unchanged.
         if let Some(healthy_extra) = extra() {
             let commit = self.commit_index();
             let caught_up = desired

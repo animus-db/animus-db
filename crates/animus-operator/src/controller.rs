@@ -33,10 +33,10 @@ use crate::cluster_api::{ClusterApi, RealClusterApi};
 use crate::crd::{
     AnimusCluster, AnimusClusterStatus, CONDITION_CONTROL_NODES_GROWING,
     CONDITION_CONTROL_NODES_SHRINK_REJECTED, CONDITION_DRAIN_FAILED,
-    CONDITION_ENCRYPTION_KEY_SECRET_INVALID, CONDITION_NODES_SPEC_INVALID,
-    CONDITION_S3_SPEC_INVALID, CONDITION_SCALE_BELOW_CONTROL_NODES_REFUSED,
-    CONDITION_STORE_SPEC_INVALID, CONDITION_TLS_SPEC_INVALID, ClusterCondition, ClusterPhase,
-    ConditionStatus,
+    CONDITION_ENCRYPTION_KEY_SECRET_INVALID, CONDITION_EPHEMERAL_VOTER_STORAGE_HAZARD,
+    CONDITION_NODES_SPEC_INVALID, CONDITION_S3_SPEC_INVALID,
+    CONDITION_SCALE_BELOW_CONTROL_NODES_REFUSED, CONDITION_STORE_SPEC_INVALID,
+    CONDITION_TLS_SPEC_INVALID, ClusterCondition, ClusterPhase, ConditionStatus,
 };
 use crate::desired;
 use crate::validate;
@@ -228,10 +228,9 @@ async fn previous_applied_control_nodes<C: ClusterApi>(
 //     own doc for the pinned regression this once lacked), the promoted pod
 //     hasn't restarted yet (the config-hash annotation drives that, see
 //     `desired::statefulset`) — wait.
-//  4. Otherwise, resolve that ordinal's live `status.podIP` (via the
-//     Kubernetes API, not DNS — see `resolve_control_dial_addr`'s own doc
-//     for why, including the pre-existing `animusd` admin-API gap this
-//     works around) and `POST /admin/control/member/add` against each
+//  4. Otherwise, `POST /admin/control/member/add` — addressed by that
+//     ordinal's own stable `desired::pod_fqdn` hostname (issue #913; no
+//     Kubernetes API lookup needed any more) — against each
 //     already-confirmed voter ordinal in turn until one accepts (mirroring
 //     "retry on the leader" — see `add_control_voter`'s own doc for why
 //     this, not a parsed error-message address hint, is how that's done
@@ -372,55 +371,41 @@ async fn ordinal_reports_role_both<A: AdminOps>(
     }
 }
 
-/// Resolve ordinal `ordinal`'s **current** internal-Raft dial address to a
-/// literal `SocketAddr`, for `POST /admin/control/member/add`'s `addr`
-/// field.
-///
-/// **Works around a real, pre-existing `animusd` admin-API gap**: that
-/// field is typed `std::net::SocketAddr` server-side
-/// (`admin::AddControlMemberReq`), which can only ever deserialize a
-/// literal IP:port — never a DNS name. Every other address surface this
-/// operator or `animusd` itself uses for a Kubernetes pod
-/// (`RoleAddrs::advertise_host`, `ClientResponse::JoinInfo`, the peer book
-/// `ProdEnv::merge_peer`/`ProdEnv::set_peers` populate) is deliberately
-/// string/hostname-typed for exactly the reason a pod's IP is not stable
-/// across a restart while its per-ordinal DNS name is. This reads the
-/// pod's *current* `status.podIP` via the Kubernetes API (never a DNS
-/// lookup — more immediately authoritative, and, unlike a raw
-/// `tokio::net::lookup_host` call, goes through the already-testable
-/// `ClusterApi` seam) purely as a one-time bootstrap value for the
-/// leader's very first dial: the promoted node's own startup self-
-/// registration (`spawn_common_tail`'s `register_node_addrs`,
-/// unconditional on every combined-mode boot, per `animusd::lib`'s own
-/// doc) republishes its real, DNS-name-based `advertised_addr` into the
-/// replicated `Metadata.node_addrs` moments later, which every node's own
-/// `peer_sync_loop` then adopts — so a resolved-IP staleness window here
-/// is self-healing within moments of this call, not a permanent address
-/// pin. See `crates/animus-operator/CLAUDE.md`'s S-07d section for the
-/// full account and the animusd-side fix this should eventually get
-/// (accepting a `String` addr the way `ProdEnv::merge_peer` already does).
-async fn resolve_control_dial_addr<C: ClusterApi>(
-    cluster_api: &C,
-    name: &str,
-    ns: &str,
-    ordinal: i32,
-    internal_port: i32,
-) -> Result<std::net::SocketAddr, String> {
-    let pod = desired::pod_name(name, ordinal);
-    let ip = cluster_api
-        .get_pod_ip(ns, &pod)
-        .await
-        .map_err(|e| format!("reading pod {pod}'s IP: {e}"))?
-        .ok_or_else(|| format!("pod {pod} has no status.podIP yet"))?;
-    format!("{ip}:{internal_port}")
-        .parse()
-        .map_err(|e| format!("pod {pod}'s podIP {ip:?} did not parse as an address: {e}"))
-}
+/// Bound on how many times [`add_control_voter`] retries its whole
+/// "ask every already-confirmed voter" round within **one** reconcile
+/// call, before giving up and letting the next ~30s reconcile try again.
+/// Exists specifically for `RaftCore::change_membership`'s own
+/// **erratum guard** (Raft §4/Ongaro): a freshly-elected leader rejects a
+/// config change until it has committed a no-op in its own current term —
+/// a genuine, expected, one-round-trip-after-election transient, not a
+/// real failure (see `RaftCore::change_membership`'s own doc, and
+/// `animusd::sim_cluster_growth`/`sim_cluster_control_growth`'s identical
+/// "retry on 409, converges in well under a second" fix for the same
+/// guard on a different call site). Before this retry existed, this exact
+/// transient turned into a **30-second-per-attempt** stall: `add_control_
+/// voter` tried every voter ordinal exactly once, and a leader that
+/// rejects the *first* attempt for this reason keeps rejecting every
+/// *subsequent* single-shot attempt too if the same freshly-elected leader
+/// answers again 30s later and some other transient (a slow follower, a
+/// racing config change) keeps its own erratum window open — see issue
+/// #864 for the investigation this closes the diagnosability/latency gap
+/// for. 5 rounds x 500ms is comfortably inside one real election timeout
+/// (the guard clears after the leader's very next successful heartbeat
+/// round, typically tens of milliseconds on a real LAN) while adding at
+/// most ~2s to a reconcile that would otherwise wait 30s for the next one.
+const ADD_VOTER_ROUNDS: u32 = 5;
+const ADD_VOTER_ROUND_BACKOFF: Duration = Duration::from_millis(500);
 
 /// Add ordinal `ordinal` (already known to be missing from the live voter
-/// set) as a control voter: resolves its dial address, then tries
+/// set) as a control voter: addresses it by its own stable
+/// `desired::pod_fqdn` hostname (issue #913 — no live lookup needed, so
+/// this step cannot itself fail; see that call site's own comment for why
+/// this replaced an earlier `status.podIP` lookup), then tries
 /// `POST /admin/control/member/add` against each already-confirmed voter
-/// ordinal `0..ordinal` in turn until one accepts. `POST /admin/control/
+/// ordinal `0..ordinal` in turn until one accepts, repeating the whole
+/// round up to [`ADD_VOTER_ROUNDS`] times with a short backoff
+/// ([`ADD_VOTER_ROUND_BACKOFF`]) — see that constant's own doc for why a
+/// single round isn't enough. `POST /admin/control/
 /// member/add` is **local-control-leader-only, not relayed**
 /// (`admin::action_add_control_member`'s own doc) — and a `Local` control
 /// handle's own `leader_addr_hint` is always `None` (unlike a `Remote`
@@ -430,16 +415,23 @@ async fn resolve_control_dial_addr<C: ClusterApi>(
 /// achieves the same "retry on the leader" outcome without needing one:
 /// at most one of them can accept (the real leader), and `admin_add_control_
 /// member`'s own doc states a retry of the whole call is always
-/// safe/idempotent, so trying the others first costs nothing but a
-/// harmless 409.
+/// safe/idempotent, so trying the others first (or a second round) costs
+/// nothing but a harmless 409.
+///
+/// **Every attempt — success or failure — is logged at INFO** with the
+/// target url, the outcome (response body on success, error/status on
+/// failure), and, on failure, whether another attempt will follow: this
+/// closes issue #864's diagnosability gap, where a stalled growth left the
+/// operator log showing nothing but the framework's own periodic
+/// "reconciler requested retry" reconcile-span tag and no reason at all.
 ///
 /// Returns `Ok(true)` once the group's own `GET /admin/control/members`
 /// confirms `ordinal` as a voter (bounded poll), `Ok(false)` if the add
 /// itself succeeded but confirmation didn't land within that bound (not a
 /// failure — the next reconcile re-checks live truth and either finds it
 /// already there or, since the add is idempotent, retries harmlessly), and
-/// `Err` only when no already-confirmed voter accepted the add at all (or
-/// the dial address couldn't be resolved).
+/// `Err` only when no already-confirmed voter accepted the add in any
+/// round.
 async fn add_control_voter<C: ClusterApi, A: AdminOps>(
     ctx: &Context<C, A>,
     name: &str,
@@ -450,30 +442,82 @@ async fn add_control_voter<C: ClusterApi, A: AdminOps>(
     tls_ca: Option<&[u8]>,
 ) -> Result<bool, String> {
     let node_id = desired::cluster_config::node_id(name, ordinal);
-    let addr =
-        resolve_control_dial_addr(&ctx.cluster_api, name, ns, ordinal, internal_port).await?;
+    // Issue #913: the promoted ordinal's own stable per-pod DNS name — the
+    // same string `RoleAddrs::advertise_host`/`desired::pod_fqdn` already
+    // gives every other address surface this operator or `animusd` uses
+    // for a Kubernetes pod — never its live `status.podIP`. `animusd`'s
+    // own `AddControlMemberReq.addr` field used to be typed `SocketAddr`,
+    // which could only ever deserialize a numeric address, forcing this
+    // call to resolve and pin the pod's current IP instead
+    // (`resolve_control_dial_addr`, now deleted); under mutual TLS with
+    // DNS-only certificate SANs that pinned IP fails every handshake
+    // permanently (`ServerName::IpAddress` against a cert with no IP SAN)
+    // — see `docs/adr/0037-control-plane-membership-change.md`'s issue
+    // #913 amendment.
+    let addr = format!("{}:{internal_port}", desired::pod_fqdn(name, ns, ordinal));
 
     let mut last_err = "no already-confirmed control voter ordinal to ask".to_string();
     let mut added = false;
-    for voter_ordinal in 0..ordinal {
-        let base = admin_base_url(name, ns, voter_ordinal, admin_port, tls_ca.is_some());
-        match ctx
-            .admin
-            .post_json(
-                &format!("{base}/admin/control/member/add"),
-                &json!({"node": node_id, "addr": addr.to_string()}),
-                tls_ca,
-            )
-            .await
-        {
-            Ok(_) => {
-                added = true;
-                break;
+    'rounds: for round in 0..ADD_VOTER_ROUNDS {
+        for voter_ordinal in 0..ordinal {
+            let base = admin_base_url(name, ns, voter_ordinal, admin_port, tls_ca.is_some());
+            let url = format!("{base}/admin/control/member/add");
+            match ctx
+                .admin
+                .post_json(
+                    &url,
+                    &json!({"node": node_id, "addr": addr.to_string()}),
+                    tls_ca,
+                )
+                .await
+            {
+                Ok(resp) => {
+                    info!(
+                        cluster = %name,
+                        node = %node_id,
+                        %url,
+                        round,
+                        response = %resp,
+                        "control voter add accepted"
+                    );
+                    added = true;
+                    break 'rounds;
+                }
+                Err(e) => {
+                    info!(
+                        cluster = %name,
+                        node = %node_id,
+                        %url,
+                        round,
+                        error = %e,
+                        "control voter add attempt refused or unreachable; trying next \
+                         already-confirmed voter ordinal (or the next round) before giving up"
+                    );
+                    last_err = format!("ordinal {voter_ordinal}: {e}");
+                }
             }
-            Err(e) => last_err = format!("ordinal {voter_ordinal}: {e}"),
+        }
+        if round + 1 < ADD_VOTER_ROUNDS {
+            // ADR 0003 / ADR 0061 Decision 4 (rung B5): same real-wall-clock
+            // allowance `drain_and_remove_node`'s own poll loop already
+            // carries — this reconcile loop polls a real pod's admin port
+            // over a real network, outside the Env seam.
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "animus-operator polls a real pod's admin port outside the Env seam, not system logic (ADR 0003); see ADR 0061 Decision 4"
+            )]
+            tokio::time::sleep(ADD_VOTER_ROUND_BACKOFF).await;
         }
     }
     if !added {
+        warn!(
+            cluster = %name,
+            node = %node_id,
+            rounds = ADD_VOTER_ROUNDS,
+            error = %last_err,
+            "control voter add exhausted every already-confirmed voter ordinal across every \
+             retry round this reconcile; will retry on the next reconcile"
+        );
         return Err(format!("adding {node_id} as a control voter: {last_err}"));
     }
 
@@ -484,9 +528,22 @@ async fn add_control_voter<C: ClusterApi, A: AdminOps>(
             fetch_control_members(&ctx.admin, name, ns, 0, admin_port, tls_ca).await
             && voters.contains(&node_id)
         {
+            info!(
+                cluster = %name,
+                node = %node_id,
+                attempt,
+                "control voter add confirmed in the group's own live voter set"
+            );
             return Ok(true);
         }
         if attempt + 1 == CONFIRM_POLLS {
+            info!(
+                cluster = %name,
+                node = %node_id,
+                polls = CONFIRM_POLLS,
+                "control voter add accepted but not yet confirmed in the live voter set \
+                 within this reconcile's poll budget; the next reconcile re-checks live truth"
+            );
             return Ok(false);
         }
         // ADR 0003 / ADR 0061 Decision 4 (rung B5): same real-wall-clock
@@ -546,6 +603,13 @@ async fn advance_control_growth<C: ClusterApi, A: AdminOps>(
         // surface that a discovery attempt was made and failed, rather than
         // leaving only the generic "discovering" message above, and fall
         // back to the last confirmed-safe count for the PDB.
+        info!(
+            cluster = %name,
+            desired_target = target,
+            previously_applied,
+            "control voter growth: could not reach any control ordinal in 0..{target} to \
+             discover live voter truth this reconcile; will retry next reconcile"
+        );
         set_condition(
             status,
             CONDITION_CONTROL_NODES_GROWING,
@@ -565,6 +629,13 @@ async fn advance_control_growth<C: ClusterApi, A: AdminOps>(
         return target;
     }
     if !ordinal_reports_role_both(&ctx.admin, name, ns, achieved, admin_port, tls_ca).await {
+        info!(
+            cluster = %name,
+            ordinal = achieved,
+            desired_target = target,
+            "control voter growth: pod ordinal {achieved} has not yet restarted into role \
+             \"combined\" (GET /admin/config); no member/add attempted this reconcile"
+        );
         set_condition(
             status,
             CONDITION_CONTROL_NODES_GROWING,
@@ -829,6 +900,35 @@ async fn reconcile<C: ClusterApi, A: AdminOps>(
             .retain(|c| c.type_ != CONDITION_NODES_SPEC_INVALID),
     }
 
+    // Issue #864: surface, every reconcile, that `storage.ephemeral: true`
+    // is a standing Raft safety hazard for this cluster's control voters —
+    // see `CONDITION_EPHEMERAL_VOTER_STORAGE_HAZARD`'s own doc for the full
+    // mechanism. Purely informational (never blocks/strips anything,
+    // unlike the validation checks below) — an operator running a genuinely
+    // throwaway ephemeral cluster that never touches `spec.controlNodes`/
+    // `spec.tls`/`spec.s3`/etc. again may accept the risk deliberately;
+    // this makes that risk visible in `kubectl get animuscluster -o yaml`
+    // instead of only in an ADR nobody reads before hitting it.
+    if cluster.spec.storage.is_ephemeral() {
+        set_condition(
+            &mut status,
+            CONDITION_EPHEMERAL_VOTER_STORAGE_HAZARD,
+            "storage.ephemeral: true wipes a control voter's own Raft WAL on every pod \
+             restart (a StatefulSet rolling update deletes and recreates the Pod, which \
+             discards an emptyDir); a config-affecting spec change (spec.controlNodes, \
+             spec.tls, spec.s3, spec.encryptionKeySecretName, ...) rolls every pod's own \
+             container, and issue #667's boot-time check then permanently refuses each \
+             wiped EXISTING voter as unsafe to re-admit — refuse enough of them and the \
+             control group loses quorum for good. Use durable (PersistentVolumeClaim) \
+             storage for any cluster whose controlNodes may ever change."
+                .to_string(),
+        );
+    } else {
+        status
+            .conditions
+            .retain(|c| c.type_ != CONDITION_EPHEMERAL_VOTER_STORAGE_HAZARD);
+    }
+
     // Validate `spec.tls` (ADR 0064 commit 3). **The validating webhook
     // (`crate::webhook`, S-07e/ADR 0070) rejects this at write time when
     // installed** — the same `TlsSpec::validate` call, reached via
@@ -971,31 +1071,59 @@ async fn reconcile<C: ClusterApi, A: AdminOps>(
             status
                 .conditions
                 .retain(|c| c.type_ != CONDITION_CONTROL_NODES_SHRINK_REJECTED);
-            let already_growing = status
-                .conditions
-                .iter()
-                .any(|c| c.type_ == CONDITION_CONTROL_NODES_GROWING);
-            if target_control_nodes > prior || already_growing {
-                let admin_port =
-                    cluster.spec.base_port_or_default() + desired::cluster_config::PORT_ADMIN;
-                let internal_port =
-                    cluster.spec.base_port_or_default() + desired::cluster_config::PORT_INTERNAL;
-                let tls_ca = resolve_tls_ca(&ctx.cluster_api, &cluster, &ns, &name).await?;
-                advance_control_growth(
-                    &ctx,
-                    &name,
-                    &ns,
-                    target_control_nodes,
-                    prior,
-                    admin_port,
-                    internal_port,
-                    tls_ca.as_deref(),
-                    &mut status,
-                )
-                .await
-            } else {
-                target_control_nodes
-            }
+            // Issue #864 (second recurrence, after the ephemeral-storage
+            // fix): this used to call `advance_control_growth` only when
+            // `target_control_nodes > prior || already_growing` — gating
+            // the live check itself on the very status condition
+            // `advance_control_growth`'s own doc says should be "a resume
+            // *optimization* ... never the source of truth". That inverted
+            // the intended design into a real bug: `prior` (read back from
+            // the *ConfigMap*, which `reconcile_grows_regenerates_the_
+            // configmap_role_split_immediately` proves jumps to the full
+            // `target` on the very FIRST reconcile after a `controlNodes`
+            // edit lands, long before any voter is actually added) reaches
+            // `target` after that one reconcile, so from the SECOND
+            // reconcile onward the only thing that could still trigger
+            // `advance_control_growth` was `already_growing` — read from
+            // *this reconcile's own* `cluster.status`, which `kube-runtime`
+            // delivers from its watch-fed reflector `Store`, not a live
+            // GET. A confirmed real-cluster recurrence (issue #864,
+            // `e2e-kind-webhook` run 35034285159 job 104599679844) showed
+            // exactly this: the growth-step log line present on the very
+            // first post-patch reconcile (while the promoted ordinal was
+            // still the old, Ready pod) and never again on any of the four
+            // 30s-spaced reconciles that followed (once that ordinal went
+            // `NotReady`, restarted by the very same config-hash rollout
+            // this growth step exists to drive) — a stalled growth that a
+            // reflector catching up late (exactly the busier-than-usual
+            // window a `StatefulSet` rollout creates) can never self-heal,
+            // since `prior` never drops back below `target` to retrigger
+            // it another way. The fix: always call `advance_control_growth`
+            // once `prior` is known and this isn't a rejected shrink —
+            // its own first, cheap step (`discover_control_voters`, one
+            // fast `GET` in the already-converged steady state, since it
+            // returns on the first ordinal that answers) is what actually
+            // decides whether there is anything to do, exactly as the
+            // "live-truth-driven, not a stored plan" design already
+            // intends; the status condition remains a user-visible
+            // progress message, never a gate on whether to check again.
+            let admin_port =
+                cluster.spec.base_port_or_default() + desired::cluster_config::PORT_ADMIN;
+            let internal_port =
+                cluster.spec.base_port_or_default() + desired::cluster_config::PORT_INTERNAL;
+            let tls_ca = resolve_tls_ca(&ctx.cluster_api, &cluster, &ns, &name).await?;
+            advance_control_growth(
+                &ctx,
+                &name,
+                &ns,
+                target_control_nodes,
+                prior,
+                admin_port,
+                internal_port,
+                tls_ca.as_deref(),
+                &mut status,
+            )
+            .await
         }
         None => {
             status
@@ -1935,7 +2063,6 @@ mod tests {
         let fake_admin = FakeAdminClient::new();
         seed_pre_growth_state(&fake_cluster, &fake_admin);
         fake_admin.mark_ordinal_ready_both(3);
-        fake_cluster.seed_pod_ip("demo-3", "10.0.0.4");
         let ctx = make_ctx(fake_cluster, fake_admin);
 
         let cluster = Arc::new(test_cluster("demo", "ns1", 5, Some(5)));
@@ -1963,6 +2090,24 @@ mod tests {
                 "/admin/control/member/add"
             )],
             "must try the first already-confirmed voter ordinal first"
+        );
+
+        // Issue #913: the promoted ordinal's own stable per-pod DNS name —
+        // never a `status.podIP` (`FakeClusterApi::seed_pod_ip`/`get_pod_ip`
+        // and the IP-resolution step they fed, `resolve_control_dial_addr`,
+        // are gone). A hostname here is what lets a peer's TLS handshake
+        // validate against a certificate whose SAN list only ever covers
+        // DNS names, never IP addresses.
+        let member_add_addrs = ctx.admin.member_add_addrs();
+        assert_eq!(member_add_addrs.len(), 1);
+        assert_eq!(
+            member_add_addrs[0],
+            format!(
+                "{}:{}",
+                desired::pod_fqdn("demo", "ns1", 3),
+                cluster.spec.base_port_or_default() + desired::cluster_config::PORT_INTERNAL
+            ),
+            "the member/add body's addr must be the pod's own stable FQDN, never an IP"
         );
 
         let status = ctx.cluster_api.last_status().unwrap();
@@ -2003,7 +2148,6 @@ mod tests {
         );
         fake_admin.seed_control_voters(["demo-0", "demo-1", "demo-2"].map(String::from));
         fake_admin.mark_ordinal_ready_both(3);
-        fake_cluster.seed_pod_ip("demo-3", "10.0.0.4");
         let ctx = make_ctx(fake_cluster, fake_admin);
         ctx.admin.fail_add_control_member_for_ordinal(0);
 
@@ -2027,6 +2171,124 @@ mod tests {
             ],
             "ordinal 0 refused, so ordinal 1 must have been tried next"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconcile_growth_retries_a_transient_409_within_one_reconcile() {
+        // Issue #864: `RaftCore::change_membership`'s own erratum guard
+        // (Raft §4/Ongaro) rejects a config change with a `409` until a
+        // freshly-elected leader has committed a no-op in its own current
+        // term — a one-round-trip-after-election transient, not a real
+        // refusal. Before the `ADD_VOTER_ROUNDS` retry, `add_control_voter`
+        // tried each already-confirmed voter ordinal exactly once and gave
+        // up for the whole 30s reconcile interval; this asserts the retry
+        // recovers *within the same reconcile call* instead.
+        // A single pre-existing control voter (ordinal 0) growing to two —
+        // so the "already-confirmed voter ordinal" set to try is just [0],
+        // and a retry necessarily means retrying that *same* ordinal, not
+        // falling through to a different one (the scenario `reconcile_
+        // growth_retries_a_different_voter_ordinal_when_the_first_refuses`
+        // above already covers).
+        let fake_cluster = FakeClusterApi::new();
+        let fake_admin = FakeAdminClient::new();
+        let prior_spec = AnimusClusterSpec {
+            nodes: 2,
+            control_nodes: Some(1),
+            ..Default::default()
+        };
+        fake_cluster.seed_configmap(
+            &desired::config_map_name("demo"),
+            prior_cluster_configmap("demo", "ns1", &prior_spec),
+        );
+        fake_admin.seed_control_voters(["demo-0"].map(String::from));
+        fake_admin.mark_ordinal_ready_both(1);
+        // Ordinal 0 (the only already-confirmed voter) refuses with a
+        // transient 409 twice, then accepts on its third attempt — well
+        // inside `ADD_VOTER_ROUNDS`.
+        fake_admin.fail_add_control_member_for_ordinal_transiently(0, 2);
+        let ctx = make_ctx(fake_cluster, fake_admin);
+
+        let cluster = Arc::new(test_cluster("demo", "ns1", 2, Some(2)));
+        let result = reconcile(Arc::clone(&cluster), Arc::clone(&ctx)).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+
+        assert!(
+            ctx.admin.control_voters().contains("demo-1"),
+            "the transient refusals must not have stopped growth from landing this reconcile"
+        );
+        let add_calls: Vec<String> = ctx
+            .admin
+            .calls()
+            .into_iter()
+            .filter(|(m, u)| m == "POST" && u.contains("/admin/control/member/add"))
+            .map(|(_, u)| u)
+            .collect();
+        assert_eq!(
+            add_calls,
+            vec![
+                admin_url("demo", "ns1", 0, 14003, "/admin/control/member/add"),
+                admin_url("demo", "ns1", 0, 14003, "/admin/control/member/add"),
+                admin_url("demo", "ns1", 0, 14003, "/admin/control/member/add"),
+            ],
+            "must retry the same ordinal across rounds within this one reconcile, not give up \
+             after the first refusal"
+        );
+
+        // Growth completed in this same reconcile (5 was the target).
+        assert!(
+            !ctx.cluster_api
+                .last_status()
+                .unwrap()
+                .conditions
+                .iter()
+                .any(|c| c.type_ == CONDITION_CONTROL_NODES_GROWING),
+            "growth must be complete, not left pending, once the transient refusals clear"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconcile_growth_gives_up_after_every_retry_round_and_will_retry_next_reconcile() {
+        // The mirror case: a refusal that never clears within this
+        // reconcile's own retry budget must still fail cleanly (not hang,
+        // not panic) and leave the `ControlNodesGrowing` condition naming
+        // the failure, so the *next* reconcile — not this one spinning
+        // forever — is what eventually recovers.
+        let fake_cluster = FakeClusterApi::new();
+        let fake_admin = FakeAdminClient::new();
+        seed_pre_growth_state(&fake_cluster, &fake_admin);
+        fake_admin.mark_ordinal_ready_both(3);
+        // Every already-confirmed voter ordinal refuses outright — no
+        // number of rounds recovers this one.
+        fake_admin.fail_add_control_member_for_ordinal(0);
+        fake_admin.fail_add_control_member_for_ordinal(1);
+        fake_admin.fail_add_control_member_for_ordinal(2);
+        let ctx = make_ctx(fake_cluster, fake_admin);
+
+        let cluster = Arc::new(test_cluster("demo", "ns1", 5, Some(5)));
+        let result = reconcile(Arc::clone(&cluster), Arc::clone(&ctx)).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+
+        assert!(!ctx.admin.control_voters().contains("demo-3"));
+        let add_calls = ctx
+            .admin
+            .calls()
+            .into_iter()
+            .filter(|(m, u)| m == "POST" && u.contains("/admin/control/member/add"))
+            .count();
+        assert_eq!(
+            add_calls,
+            (ADD_VOTER_ROUNDS as usize) * 3,
+            "must try every already-confirmed voter ordinal on every retry round before giving up"
+        );
+
+        let status = ctx.cluster_api.last_status().unwrap();
+        let growing = status
+            .conditions
+            .iter()
+            .find(|c| c.type_ == CONDITION_CONTROL_NODES_GROWING)
+            .expect("ControlNodesGrowing condition present, naming the failure");
+        let msg = growing.message.as_deref().unwrap_or_default();
+        assert!(msg.contains("failed"), "{msg}");
     }
 
     #[tokio::test]
@@ -2163,7 +2425,6 @@ mod tests {
         // its own `GET /admin/config` now reports the real `animusd`
         // literal.
         ctx.admin.mark_ordinal_ready_both(3);
-        ctx.cluster_api.seed_pod_ip("e2e-3", "10.0.0.4");
 
         // Second reconcile: a real watch would deliver the object with the
         // status the first reconcile's own `patch_cluster_status` just
@@ -2215,7 +2476,6 @@ mod tests {
         let fake_admin = FakeAdminClient::new();
         fake_admin.seed_control_voters(["demo-0", "demo-1", "demo-2"].map(String::from));
         fake_admin.mark_ordinal_ready_both(3);
-        fake_cluster.seed_pod_ip("demo-3", "10.0.0.4");
         let ctx = make_ctx(fake_cluster, fake_admin);
 
         let mut cluster = test_cluster("demo", "ns1", 5, Some(5));
@@ -2236,6 +2496,64 @@ mod tests {
             ctx.admin.control_voters().contains("demo-3"),
             "growth must resume from the surviving status condition, not stall forever \
              just because the ConfigMap already matches the target"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_still_attempts_growth_when_the_growing_condition_did_not_survive() {
+        // Issue #864 (second recurrence): a real cluster showed the growth
+        // step's own log line present on the reconcile right after
+        // `spec.controlNodes` was patched (while the promoted ordinal was
+        // still the old, Ready pod) and never again afterward, once that
+        // ordinal went NotReady — recreated by the very same config-hash
+        // rollout this growth step exists to drive. The prior code only
+        // ever called `advance_control_growth` when `target_control_nodes
+        // > prior || already_growing` — and since the ConfigMap's own
+        // `prior` value reaches `target` on that very first reconcile
+        // (`reconcile_grows_regenerates_the_configmap_role_split_
+        // immediately`), every reconcile after that depended entirely on
+        // `already_growing`, read from *this reconcile's own* `cluster.
+        // status` — which a real `kube-runtime` Controller delivers from
+        // its watch-fed reflector `Store`, not a live GET, and which can
+        // legitimately lag exactly during the busier-than-usual window a
+        // `StatefulSet` rollout creates. This test is the sibling of
+        // `reconcile_resumes_growth_from_live_truth_after_a_simulated_
+        // restart` with the ONE thing that test relies on removed: no
+        // `ControlNodesGrowing` condition survives on `cluster.status` at
+        // all (`Default::default()`, exactly what a stale reflector read —
+        // or a controller that never even got to write it yet — would
+        // hand back) — growth must still be attempted and land, because
+        // the live check must never depend on that condition to run at
+        // all, only to report progress once it does.
+        let fake_cluster = FakeClusterApi::new();
+        let prior_spec = AnimusClusterSpec {
+            nodes: 5,
+            control_nodes: Some(5),
+            ..Default::default()
+        };
+        fake_cluster.seed_configmap(
+            &desired::config_map_name("demo"),
+            prior_cluster_configmap("demo", "ns1", &prior_spec),
+        );
+        let fake_admin = FakeAdminClient::new();
+        fake_admin.seed_control_voters(["demo-0", "demo-1", "demo-2"].map(String::from));
+        fake_admin.mark_ordinal_ready_both(3);
+        let ctx = make_ctx(fake_cluster, fake_admin);
+
+        // No status at all — no surviving `ControlNodesGrowing` condition,
+        // and `cluster.spec.controlNodes` (5) already equals the
+        // ConfigMap's own `prior` (5): this is exactly the shape the old
+        // `target_control_nodes > prior || already_growing` gate would
+        // have skipped entirely.
+        let cluster = test_cluster("demo", "ns1", 5, Some(5));
+        assert!(cluster.status.is_none());
+
+        let result = reconcile(Arc::new(cluster), Arc::clone(&ctx)).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+        assert!(
+            ctx.admin.control_voters().contains("demo-3"),
+            "growth must still be attempted from live truth even with no surviving status \
+             condition and prior == target — the live check, not the condition, must gate this"
         );
     }
 
@@ -2351,6 +2669,92 @@ mod tests {
                 .applies()
                 .iter()
                 .any(|(k, _)| *k == AppliedKind::Certificate)
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_warns_when_storage_is_ephemeral() {
+        // Issue #864: `storage.ephemeral: true` is a standing Raft safety
+        // hazard for control voters (ADR 0060's storage section) — the
+        // reconciler must surface it every time, not only on a spec edit.
+        let mut cluster = test_cluster("demo", "ns1", 3, None);
+        cluster.spec.storage.ephemeral = Some(true);
+        let ctx = make_ctx(FakeClusterApi::new(), FakeAdminClient::new());
+
+        let result = reconcile(Arc::new(cluster), Arc::clone(&ctx)).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+
+        let status = ctx.cluster_api.last_status().unwrap();
+        let hazard = status
+            .conditions
+            .iter()
+            .find(|c| c.type_ == CONDITION_EPHEMERAL_VOTER_STORAGE_HAZARD)
+            .expect("EphemeralVoterStorageHazard condition present");
+        let msg = hazard.message.as_deref().unwrap_or_default();
+        assert!(msg.contains("Raft WAL"), "{msg}");
+        assert!(msg.contains("#667"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn reconcile_never_warns_when_storage_is_durable() {
+        // The default (no `storage.ephemeral` set at all, matching
+        // `test_cluster`'s own default) must never carry the hazard
+        // condition — this is the supported, safe shape.
+        let cluster = test_cluster("demo", "ns1", 3, None);
+        let ctx = make_ctx(FakeClusterApi::new(), FakeAdminClient::new());
+
+        let result = reconcile(Arc::new(cluster), Arc::clone(&ctx)).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+
+        let status = ctx.cluster_api.last_status().unwrap();
+        assert!(
+            !status
+                .conditions
+                .iter()
+                .any(|c| c.type_ == CONDITION_EPHEMERAL_VOTER_STORAGE_HAZARD),
+            "{:?}",
+            status.conditions
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_clears_the_ephemeral_hazard_once_storage_becomes_durable() {
+        // The condition must be reactive to a later spec edit, not sticky
+        // once set — mirrors every other `*_INVALID`/hazard condition's own
+        // "retain unless still true" shape.
+        let fake_cluster = FakeClusterApi::new();
+        let ctx = make_ctx(fake_cluster, FakeAdminClient::new());
+        let mut cluster = test_cluster("demo", "ns1", 3, None);
+        cluster.spec.storage.ephemeral = Some(true);
+        reconcile(Arc::new(cluster), Arc::clone(&ctx))
+            .await
+            .unwrap();
+        let status = ctx.cluster_api.last_status().unwrap();
+        assert!(
+            status
+                .conditions
+                .iter()
+                .any(|c| c.type_ == CONDITION_EPHEMERAL_VOTER_STORAGE_HAZARD)
+        );
+
+        // A fresh `AnimusCluster` carrying the *previous* reconcile's own
+        // status (a real watch would deliver exactly this — see the
+        // sibling `ControlNodesGrowing` test's own doc on why `cluster`
+        // can't just be reused verbatim) plus the spec edit that turns
+        // ephemeral storage off.
+        let mut durable_cluster = test_cluster("demo", "ns1", 3, None);
+        durable_cluster.status = Some(status.clone());
+        reconcile(Arc::new(durable_cluster), Arc::clone(&ctx))
+            .await
+            .unwrap();
+        assert!(
+            !ctx.cluster_api
+                .last_status()
+                .unwrap()
+                .conditions
+                .iter()
+                .any(|c| c.type_ == CONDITION_EPHEMERAL_VOTER_STORAGE_HAZARD),
+            "the hazard condition must clear once storage.ephemeral is unset"
         );
     }
 

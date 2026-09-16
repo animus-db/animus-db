@@ -29,6 +29,7 @@ prod = [
     "dep:tokio-rustls",
     "dep:rustls-pki-types",
     "dep:animus-s3",
+    "dep:socket2",
 ]
 
 [dependencies]
@@ -56,6 +57,10 @@ tracing = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
 tokio-rustls = { workspace = true, optional = true }
 rustls-pki-types = { workspace = true, optional = true }
+# TCP keepalive + `TCP_USER_TIMEOUT` on every pooled outbound and accepted
+# socket (issue #924) — `SockRef` reaches through the live `tokio::net::
+# TcpStream` to set socket options tokio itself doesn't expose a setter for.
+socket2 = { workspace = true, optional = true }
 # `s3_store.rs`'s `S3SegmentStore<T>` (S-04 PR 2, ADR 0059 amendment): wraps
 # `animus_s3::client::S3Client<T>` behind the `SegmentStore` trait. Only
 # `animus_s3::client`'s `Transport`-generic pieces are needed here — no
