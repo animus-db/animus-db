@@ -1101,6 +1101,21 @@ impl<E: Env> LsmEngine<E> {
             let mut merged: BTreeMap<Key, (Version, Option<Value>)> = BTreeMap::new();
             let mut read_err = None;
             for reader in &readers {
+                // Skip a table whose own `[min_key, max_key]` can't overlap
+                // `[start, end)` at all — the same cheap in-memory gate every
+                // other multi-table path here already applies (`may_contain_
+                // observed` for point reads, `ranges_overlap` for compaction,
+                // `sstable_overlaps` for `approx_bytes_in_range`). Without it,
+                // `SsTableReader::scan_at` starts from `block_for_key(start)`,
+                // which for a table sorting entirely below `start` resolves to
+                // the table's *last* block — fetched, decompressed, and then
+                // filtered out record by record (issue #835). This is a pure
+                // key-range gate, independent of `version`: a table that
+                // overlaps by key but whose versions are all above `version`
+                // is still visited, exactly as before.
+                if !sstable_overlaps(reader.meta(), start, end) {
+                    continue;
+                }
                 match reader.scan_at(&self.env, start, end, version).await {
                     Ok(rows) => {
                         for (k, v, slot) in rows {

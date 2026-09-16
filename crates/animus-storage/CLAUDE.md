@@ -168,6 +168,25 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   double-hashing bit vector, deterministic, no external dep). A legacy table from
   a pre-Bloom manifest (`has_bloom == false`) is range-gated only, so an upgrade
   stays correct. Built over the table's distinct keys on flush/compaction.
+- **`merged_at` (the shared backend for `scan`/`scan_at`/`entries`/
+  `entries_at`/`entries_with_tombstones`/`scan_with_tombstones`) applies the
+  same range gate as every other multi-table path — `sstable_overlaps` — before
+  calling into a reader's `scan_at` at all** (issue #835). Without it, every
+  reader was visited unconditionally: `SsTableReader::scan_at` starts from
+  `block_for_key(start)`, which for a table sorting entirely *below* `start`
+  resolves to that table's *last* block (every block satisfies `first_key <=
+  start`), so the whole engine paid one wasted block fetch + CRC + LZ4
+  decompress per below-range table, scaling with table count rather than
+  query selectivity — the common case under ADR 0050's packed-kind keyspace
+  (a kind-scoped scan skips nothing among tables holding a lower-sorting
+  kind). The gate is a pure key-range test, independent of `version`: a table
+  that overlaps by key but whose versions are all above the query's `version`
+  is still visited, unchanged. The memtable side of `merged_at` needed no
+  equivalent change — it was already range-scoped via `BTreeMap::range`.
+  Regression: `tests/lsm_scan_range_gate.rs` (correctness across table
+  layouts + `MemoryEngine`; a deterministic zero-block-reads assertion via
+  the existing `LsmEngine::block_read_count()` introspection, no new metric
+  needed).
 - **The `std::sync::Mutex` guard is never held across an `.await`** in
   `LsmEngine`: every op does its disk I/O (await) lock-free — snapshotting the
   cheap `SsTableReader` clones (metadata + block index, no block bytes) under a
