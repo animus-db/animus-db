@@ -8,6 +8,29 @@
   gives a node exactly one id, so this detector's keys and the control
   plane's voter ids are now **the same space**, structurally — no bridging
   needed, nothing else about the detector's design changes.
+  **Amended again 2026-09-16 (issue #923):** this ADR's own `LEADER_GRACE`
+  only ever covered the **raftkv**-id `FailureDetector` this document
+  describes. `RaftCore::peer_last_contact`/`RaftNode::control_
+  peer_believed_alive` — ADR 0037 hardening PR2's separate, **control**-id-native
+  liveness signal the quorum-loss guard reads — turned out to need the
+  identical class of post-election grace, but had none: `become_leader`
+  seeds a fresh peer's `last_contact` to the instant it takes over (so an
+  unresponsive peer still ages out, rather than keeping the "never
+  contacted yet" grace forever), but that seed ages out after the same
+  steady-state `CONTROL_PEER_LIVENESS_TIMEOUT` a genuine ack would — no
+  wider allowance for "I only just became leader." A fresh leader's first
+  real heartbeat round can legitimately take longer than that steady-state
+  timeout under the load a leadership change itself creates (election
+  processing, everyone's own scheduler contention), so the guard could
+  misjudge a perfectly alive voter as dead moments after a transfer. Fixed
+  the same way this ADR's own `LEADER_GRACE` fixed the raftkv-id case, but
+  as its own, wider, separately-named constant
+  (`CONTROL_LEADER_TAKEOVER_GRACE`, `animus-control::node`) rather than
+  reusing `LEADER_GRACE`'s value: unlike the raftkv detector (which starts
+  fully cold, so any positive value works), the control-id path already
+  gets `CONTROL_PEER_LIVENESS_TIMEOUT` of grace for free from `become_
+  leader`'s own seed, so an equal-sized second grace would be a no-op. See
+  ADR 0037's own amendment note for the mechanism.
 - **Date:** 2026-08-01
 
 ## Context

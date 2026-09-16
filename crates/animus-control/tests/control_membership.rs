@@ -23,10 +23,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
-use animus_control::node::CONTROL_PEER_LIVENESS_TIMEOUT;
+use animus_control::node::{CONTROL_LEADER_TAKEOVER_GRACE, CONTROL_PEER_LIVENESS_TIMEOUT};
 use animus_control::{MetaCommand, NodeStatus, ProposeResult, RaftNode};
 use animus_env::{NodeId, nid};
-use animus_sim::{SimEnv, Simulator};
+use animus_sim::{NetConfig, SimEnv, Simulator};
 use animus_storage::MemoryEngine;
 
 /// Bring up a control group over node ids `ids` (each its own `RaftCore`,
@@ -752,5 +752,78 @@ fn last_contact_ages_out_a_partitioned_peer_but_not_a_healthy_one() {
         nodes[l].control_peer_believed_alive(nid(partitioned as u64)),
         "seed={seed}: a healed peer should be believed alive again once it \
          resumes acking"
+    );
+}
+
+/// Issue #923's own low-level pin, at the `RaftNode` level directly (no
+/// admin/HTTP layer): right after a REAL leadership transfer, a peer that
+/// is alive but merely slow to ack (well past [`CONTROL_PEER_LIVENESS_
+/// TIMEOUT`], comfortably inside [`CONTROL_LEADER_TAKEOVER_GRACE`]) must
+/// still read as believed-alive from the new leader's own
+/// `control_peer_believed_alive` — never the false "dead" verdict
+/// `admin_remove_control_member`'s quorum guard hit in CI (the flake this
+/// issue is about). Two of the four remaining voters are kept genuinely
+/// slow (their link to/from the transfer target degraded, never dropped —
+/// alive, just answering far slower than the ordinary timeout) while a
+/// third stays fast, so the transfer's own election never needs a vote
+/// from either slow voter — isolating this fix from the unrelated,
+/// already-tolerant-of-slow-voters election path.
+#[test]
+fn control_peer_believed_alive_survives_a_leadership_transfer_with_slow_but_alive_peers() {
+    let seed = 0x0000_C923_0001u64;
+    let ids = [0u64, 1, 2, 3, 4];
+    let (mut sim, nodes) = cluster(seed, &ids);
+    sim.run_for(Duration::from_secs(2));
+    let old_leader = unique_leader(&nodes, &[0, 1, 2, 3, 4], seed);
+    let mut others: Vec<usize> = (0..5).filter(|&i| i != old_leader).collect();
+    let new_leader = others.remove(0);
+    let fast_voter = others.remove(0);
+    let slow_voters = others; // exactly 2 left
+
+    let mut degraded = NetConfig::default();
+    degraded.base_delay = Duration::from_secs(10);
+    degraded.max_jitter = Duration::ZERO;
+    for &slow in &slow_voters {
+        sim.set_link_net_config(nid(slow as u64), nid(new_leader as u64), degraded.clone());
+        sim.set_link_net_config(nid(new_leader as u64), nid(slow as u64), degraded.clone());
+    }
+
+    assert!(
+        nodes[old_leader].transfer_leadership(nid(new_leader as u64)),
+        "seed={seed}: could not arm the transfer from {old_leader} to {new_leader}"
+    );
+    let mut elapsed = Duration::ZERO;
+    loop {
+        if nodes[new_leader].is_leader() {
+            break;
+        }
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "seed={seed}: transfer to {new_leader} never landed within 5s"
+        );
+        sim.run_for(Duration::from_millis(20));
+        elapsed += Duration::from_millis(20);
+    }
+
+    // Past the ordinary per-peer timeout, still comfortably inside the
+    // takeover grace — the exact window issue #923's real failure landed in.
+    let wait = CONTROL_PEER_LIVENESS_TIMEOUT + Duration::from_millis(200);
+    assert!(
+        wait < CONTROL_LEADER_TAKEOVER_GRACE,
+        "test assumption: the wait below must stay inside the takeover grace"
+    );
+    sim.run_for(wait);
+
+    for &slow in &slow_voters {
+        assert!(
+            nodes[new_leader].control_peer_believed_alive(nid(slow as u64)),
+            "seed={seed}: slow-but-alive voter {slow} must still be believed alive by the new \
+             leader {new_leader}, {wait:?} after the transfer — it has not answered yet only \
+             because it only just inherited this leader, not because it is dead"
+        );
+    }
+    assert!(
+        nodes[new_leader].control_peer_believed_alive(nid(fast_voter as u64)),
+        "seed={seed}: a promptly-acking voter should obviously be believed alive"
     );
 }
