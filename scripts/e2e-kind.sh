@@ -293,59 +293,76 @@ phase() {
     log "=== phase: $1 ==="
 }
 
-# Issue #864: whenever the S-07d control-voter-growth wait is (or was) in
-# flight, `GROWTH_TARGET_ORDINAL` names the pod ordinal being promoted —
-# curl that ONE pod's own `/admin/health` and `/admin/raft` directly (a
-# fresh, throwaway port-forward straight to it, never the pinned
-# `$DYNAMO_POD`/`$PORT_FORWARD_PID` pair the rest of this script uses, so
-# this never disturbs an in-flight wait or another phase's own connection)
-# and print the status code + full body of each. Before this, a stalled
-# growth left this script's diagnostics with nothing more specific than
-# "readinessProbe: false" (`kubectl describe pods`) and a stdout log
-# showing only "ready" — no visibility into WHY: whether the control plane
-# genuinely has no leader yet, or whether this replica's own issue #667
-# boot-time cluster check is still pending or was refused (both now
-# reported by `/admin/raft`'s `cluster_check_pending`/`refused_as_voter`
-# fields, see `crates/animusd/src/admin.rs::raft_view`). The runtime image
-# has no `curl` (`Dockerfile`'s `runtime` stage installs only
-# `ca-certificates`), so this dials from the script's own host over a
-# dedicated port-forward rather than `kubectl exec`ing a curl inside the
-# pod. Best-effort throughout (`|| true` on every step) — a diagnostics
-# dump must never itself fail the run or mask the original failure.
-dump_growth_target_admin_state() {
-    if [ -z "${GROWTH_TARGET_ORDINAL:-}" ]; then
+# Issue #864: dump every pod ordinal's own `/admin/health` and
+# `/admin/raft` (a fresh, throwaway port-forward straight to each, never
+# the pinned `$DYNAMO_POD`/`$PORT_FORWARD_PID` pair the rest of this
+# script uses, so this never disturbs an in-flight wait or another
+# phase's own connection) and print the status code + full body of each.
+# Before this, a stalled growth left this script's diagnostics with
+# nothing more specific than "readinessProbe: false" (`kubectl describe
+# pods`) and a stdout log showing only "ready" — no visibility into WHY:
+# whether the control plane genuinely has no leader yet, whether this
+# replica's own issue #667 boot-time cluster check is still pending or
+# was refused (both reported by `/admin/raft`'s `cluster_check_pending`/
+# `refused_as_voter` fields, see `crates/animusd/src/admin.rs::
+# raft_view`), or — the shape a later recurrence actually showed
+# (`kubectl rollout status` stuck on a pre-existing, PVC-backed voter
+# that was recreated and never became Ready, not the pod S-07d was
+# actively growing) — some OTHER pod entirely stuck in a state this
+# script had no visibility into because it only ever dumped the growth
+# target's own ordinal. Looping over every ordinal `0..replicas-1`
+# (reading the StatefulSet's own live `spec.replicas`, so this dumps the
+# right count whether called before or after a scale-up) makes the next
+# recurrence decisive regardless of which pod is actually stuck. The
+# runtime image has no `curl` (`Dockerfile`'s `runtime` stage installs
+# only `ca-certificates`), so this dials from the script's own host over
+# a dedicated port-forward rather than `kubectl exec`ing a curl inside
+# the pod — one ordinal at a time (never concurrent forwards, to keep
+# this simple and avoid port collisions), each on the same local port,
+# fully torn down before the next. Best-effort throughout (`|| true` on
+# every step) — a diagnostics dump must never itself fail the run or
+# mask the original failure.
+dump_every_pod_admin_state() {
+    local replicas
+    replicas="$(kubectl get statefulset "$AC_NAME" -n "$NAMESPACE" \
+        -o jsonpath='{.spec.replicas}' 2>/dev/null || true)"
+    if [ -z "$replicas" ]; then
+        log "issue #864 admin-state dump: could not read statefulset/${AC_NAME}'s own replicas, skipping"
         return 0
     fi
-    local pod="${AC_NAME}-${GROWTH_TARGET_ORDINAL}"
-    if ! kubectl get "pod/${pod}" -n "$NAMESPACE" >/dev/null 2>&1; then
-        log "issue #864 admin-state dump: pod/${pod} does not exist, skipping"
-        return 0
-    fi
-    log "issue #864 admin-state dump: pod ${pod}'s own /admin/health + /admin/raft"
     local local_port=18102
     local fwd_log="${WORKDIR}/growth-target-port-forward.log"
-    local fwd_pid=""
-    kubectl port-forward "pod/${pod}" -n "$NAMESPACE" \
-        "${local_port}:${ADMIN_REMOTE_PORT}" >"$fwd_log" 2>&1 &
-    fwd_pid=$!
-    # A plain fixed sleep, not `wait_for` — this is a best-effort diagnostic
-    # dump running from inside a failure handler (possibly `on_err`'s trap),
-    # not a correctness-gating wait, so it must never itself risk `fail`
-    # recursing or a `wait_for` timeout eating into the trap's own budget.
-    sleep 2
-    local code body
-    for path in health raft; do
-        body="$(curl -sS -m 3 "${CURL_TLS_ARGS[@]}" \
-            "${ADMIN_SCHEME}://${ADMIN_HOST}:${local_port}/admin/${path}" 2>/dev/null)" || body=""
-        code="$(curl -sS -o /dev/null -m 3 -w '%{http_code}' "${CURL_TLS_ARGS[@]}" \
-            "${ADMIN_SCHEME}://${ADMIN_HOST}:${local_port}/admin/${path}" 2>/dev/null)" || code="<unreachable>"
-        log "  GET /admin/${path} -> ${code}"
-        log "  body: ${body:-<empty>}"
+    local ord pod fwd_pid code body
+    for ((ord = 0; ord < replicas; ord++)); do
+        pod="${AC_NAME}-${ord}"
+        if ! kubectl get "pod/${pod}" -n "$NAMESPACE" >/dev/null 2>&1; then
+            log "issue #864 admin-state dump: pod/${pod} does not exist, skipping"
+            continue
+        fi
+        log "issue #864 admin-state dump: pod ${pod}'s own /admin/health + /admin/raft"
+        fwd_pid=""
+        kubectl port-forward "pod/${pod}" -n "$NAMESPACE" \
+            "${local_port}:${ADMIN_REMOTE_PORT}" >"$fwd_log" 2>&1 &
+        fwd_pid=$!
+        # A plain fixed sleep, not `wait_for` — this is a best-effort
+        # diagnostic dump running from inside a failure handler (possibly
+        # `on_err`'s trap), not a correctness-gating wait, so it must
+        # never itself risk `fail` recursing or a `wait_for` timeout
+        # eating into the trap's own budget.
+        sleep 2
+        for path in health raft; do
+            body="$(curl -sS -m 3 "${CURL_TLS_ARGS[@]}" \
+                "${ADMIN_SCHEME}://${ADMIN_HOST}:${local_port}/admin/${path}" 2>/dev/null)" || body=""
+            code="$(curl -sS -o /dev/null -m 3 -w '%{http_code}' "${CURL_TLS_ARGS[@]}" \
+                "${ADMIN_SCHEME}://${ADMIN_HOST}:${local_port}/admin/${path}" 2>/dev/null)" || code="<unreachable>"
+            log "  GET /admin/${path} -> ${code}"
+            log "  body: ${body:-<empty>}"
+        done
+        if [ -n "$fwd_pid" ]; then
+            kill "$fwd_pid" >/dev/null 2>&1 || true
+            wait "$fwd_pid" 2>/dev/null || true
+        fi
     done
-    if [ -n "$fwd_pid" ]; then
-        kill "$fwd_pid" >/dev/null 2>&1 || true
-        wait "$fwd_pid" 2>/dev/null || true
-    fi
 }
 
 dump_diagnostics() {
@@ -396,15 +413,38 @@ dump_diagnostics() {
         done
     fi
     if [ -f "$OPERATOR_LOG" ]; then
-        log "operator log (tail 200): ${OPERATOR_LOG}"
-        tail -n 200 "$OPERATOR_LOG" 2>&1 | sed 's/^/  /' || true
+        # Issue #864 (third recurrence): a `tail -n 200` cap here silently
+        # discarded the exact reconcile(s) that mattered on at least one
+        # real occurrence — this operator's own `owns()` watches on five
+        # child kinds mean `apply_children`'s per-reconcile re-apply can
+        # itself trigger a burst of "related object updated" reconciles,
+        # and a multi-minute stall accumulates far more than 200 lines
+        # long before the interesting part of the timeline. `wc -l` and an
+        # explicit liveness check make the *next* recurrence's diagnostics
+        # answer, rather than raise, "is this log actually complete, and
+        # is the process that wrote it still alive?" — ruled out here as
+        # an operator-process restart (a single `exec` at launch, no
+        # re-exec/truncation anywhere else in this script) or a buffered
+        # writer (`tracing_subscriber::fmt::init()` uses the plain,
+        # synchronous, line-flushing `Stdout` writer, never `tracing-
+        # appender`'s non-blocking one) — but both are cheap enough to
+        # keep confirming on every run rather than trusting that finding
+        # to still hold after a future change to either.
+        log "operator log: ${OPERATOR_LOG} ($(wc -l <"$OPERATOR_LOG") lines total)"
+        if [ -n "$OPERATOR_PID" ] && kill -0 "$OPERATOR_PID" 2>/dev/null; then
+            log "operator process (PID ${OPERATOR_PID}) is still alive"
+        else
+            log "operator process (PID ${OPERATOR_PID:-<unknown>}) is NOT running"
+        fi
+        log "operator log (tail 1000): ${OPERATOR_LOG}"
+        tail -n 1000 "$OPERATOR_LOG" 2>&1 | sed 's/^/  /' || true
     fi
     if [ -f "$PORT_FORWARD_LOG" ]; then
         log "port-forward log: ${PORT_FORWARD_LOG}"
         cat "$PORT_FORWARD_LOG" 2>&1 | sed 's/^/  /' || true
     fi
     if [ "$KIND_CLUSTER_UP" = "true" ]; then
-        dump_growth_target_admin_state
+        dump_every_pod_admin_state
     fi
     log "--- end diagnostics ---"
 }
@@ -942,6 +982,35 @@ if [ "$E2E_ENCRYPTION" = "1" ]; then
     ENCRYPTION_SPEC_YAML="  encryptionKeySecretName: ${ENCRYPTION_KEY_SECRET_NAME}"
 fi
 
+# Issue #864: the manifest below deliberately omits `storage:` (the CRD's own
+# default is a durable PersistentVolumeClaim per pod), never
+# `storage: {ephemeral: true}`. This explanation lives OUTSIDE the heredoc on
+# purpose: the heredoc is unquoted (it expands ${AC_NAME} and friends), so a
+# backtick or $(...) inside it is executed by the shell and corrupts the
+# generated YAML, and `bash -n` cannot catch that.
+# Durable (PersistentVolumeClaim-backed) storage, deliberately NOT
+# `storage: {ephemeral: true}` (issue #864): every control voter's own
+# Raft WAL lives under this volume, and `spec.controlNodes` growth
+# (S-07d) unconditionally rolls EVERY pod's own container, not just the
+# newly promoted ordinal — `restart_relevant_projection`'s config-hash
+# bakes in the raw `controlNodes` threshold itself, so an already-correct
+# ordinal (unaffected by the role-split boundary moving) is rolled too;
+# see `crates/animus-operator/CLAUDE.md`'s own S-07d section. A
+# StatefulSet's rolling update deletes and recreates each Pod object
+# (never just restarts a container in place), which wipes an `emptyDir`
+# along with it. ADR 0060 already documents `ephemeral: true` as "a real
+# Raft safety hazard for any voter pod, not just a durability
+# trade-off" — issue #667's boot-time check (ADR 0009's 2026-09-15
+# amendment) then does exactly what it is designed to do with a wiped
+# EXISTING voter whose peers still name it in their own committed
+# config with real history: it refuses that identity PERMANENTLY, on
+# purpose, to avoid an unsafe double vote. Refuse enough of the
+# pre-growth voters this way (the growth phase's own roll can reach all
+# of them) and the group loses quorum for good — not a stall, a
+# deadlock indistinguishable from one until `/admin/raft` is inspected.
+# `kind` ships a default `standard` StorageClass (`rancher.io/
+# local-path`), so omitting `storage` entirely (the CRD's own `false`
+# default, a 10Gi PVC per pod) needs no further configuration here.
 phase "apply AnimusCluster"
 cat >"$MANIFEST_FILE" <<EOF
 apiVersion: animusdb.io/v1alpha1
@@ -953,8 +1022,8 @@ spec:
   image: ${ANIMUSD_IMAGE}
   nodes: 3
   controlNodes: 3
-  storage:
-    ephemeral: true
+  # Storage deliberately omitted: durable PVC per pod (CRD default), never
+  # ephemeral; see the comment above this heredoc (issue #864).
   # S-07b: the non-S3 store CRD surface, exercised unconditionally (not
   # gated on E2E_S3) — segmentStore rather than backupStore specifically so
   # this composes with the E2E_S3=1 leg below, which already sets
@@ -1149,8 +1218,8 @@ log "GetItem ok — item round-tripped"
 
 if [ "$E2E_ENCRYPTION" = "1" ]; then
     phase "check the item's plaintext value is absent from the pod's own data directory"
-    # `grep -r` over the pod's own data volume (`spec.storage.ephemeral: true`
-    # here, but the same on-disk shape as a real PersistentVolumeClaim) — a
+    # `grep -r` over the pod's own data volume (a real PersistentVolumeClaim
+    # since issue #864 — see the manifest's own storage comment above) — a
     # plaintext write would land the note's exact bytes in an SSTable/WAL
     # file somewhere under here (`animus-storage`'s `LsmEngine` applies no
     # block compression), so finding it would mean the encryption wiring did
@@ -1265,7 +1334,32 @@ wait_for_progress "control group reports 4 voters" 600 120 5 \
     -- control_growth_progress_signal "$GROWTH_TARGET_ORDINAL"
 log "control group now reports 4 voters"
 
+# Issue #864 (follow-up): "4 voters" only means the newly-promoted ordinal
+# (3) has landed — the SAME config-hash pod-template annotation that
+# triggered its own restart is shared by the whole StatefulSet, so the
+# rolling restart above does not stop there. It proceeds, highest-ordinal-
+# first, through ordinals 2, 1, 0 as well (each an already-correct-role,
+# already-a-voter pod being recycled purely because the shared hash
+# changed — see ADR 0060's 2026-09-15 amendment and `crates/animus-
+# operator/CLAUDE.md`'s own S-07d section). Confirmed live (run
+# 35034285159, job 104599679557, on the durable-storage fix): growth
+# converged in 15s, then the very next phase's freshly-resolved serving
+# pod (e2e-1) was itself deleted/recreated moments later by this same
+# still-in-flight rollout, and its admin port-forward never became ready.
+# Waiting for the WHOLE rollout to finish here — before resolving (or
+# re-resolving) any specific pod as "the" serving pod — is the fix: any
+# earlier resolve is racing a StatefulSet controller that has not
+# finished touching every ordinal yet.
+phase "wait for the controlNodes config-hash rollout to fully finish (issue #864)"
+kubectl rollout status "statefulset/${AC_NAME}" -n "$NAMESPACE" --timeout=300s
+
 phase "check the PodDisruptionBudget after controlNodes growth (S-07d)"
+# Safe to check even mid-rollout, and certainly safe now that the rollout
+# above has finished: `maxUnavailable` is computed by the operator's own
+# reconcile straight from spec.nodes/spec.controlNodes (`desired::
+# poddisruptionbudget`), applied server-side to the PodDisruptionBudget
+# object itself — it does not read any pod's own runtime/readiness state,
+# so it is unaffected by whether the StatefulSet's rollout is in flight.
 # nodes=4/controlNodes=4 now: the control-plane term is floor((4-1)/2)=1,
 # still capped at the same value by the RF-plateaued data-plane term
 # (floor((min(4,3)-1)/2)=1) — the point of this check is that the operator
@@ -1277,18 +1371,18 @@ PDB_MAX_UNAVAIL="$(kubectl get pdb "${AC_NAME}-pdb" -n "$NAMESPACE" \
 after growing controlNodes to 4, got ${PDB_MAX_UNAVAIL:-<empty>}"
 log "PodDisruptionBudget ${AC_NAME}-pdb reports maxUnavailable=1 after growth"
 
-# The rolling restart above may well have recycled the exact pod this
-# script's port-forward targets (a `kubectl port-forward pod/...` dies the
-# moment that specific pod is deleted/recreated) — re-resolve and
-# re-forward the same way the original "resolve which pod .../wait for
-# readiness" phase did, rather than trusting the pre-growth forward is
-# still alive. `control_voters_reading`'s own self-heal (issue #703) may
-# already have done this once during the wait above, but this phase's own
-# forward could just as easily have died again since — a fresh,
-# unconditional re-forward here (fatal=1: by this point growth already
-# converged, so a failure here is a real problem, not a transient miss) is
-# simpler than trying to reason about whether the self-heal's own forward
-# is still current.
+# The rolling restart has now fully finished (the `rollout status` wait
+# above), including — likely — the exact pod this script's port-forward
+# targets (a `kubectl port-forward pod/...` dies the moment that specific
+# pod is deleted/recreated) — re-resolve and re-forward the same way the
+# original "resolve which pod .../wait for readiness" phase did, rather
+# than trusting the pre-growth forward is still alive. `control_voters_
+# reading`'s own self-heal (issue #703) may already have done this once
+# during the wait above, but this phase's own forward could just as
+# easily have died again since — a fresh, unconditional re-forward here
+# (fatal=1: by this point growth already converged, so a failure here is
+# a real problem, not a transient miss) is simpler than trying to reason
+# about whether the self-heal's own forward is still current.
 phase "re-resolve and re-forward the serving pod after controlNodes growth"
 resolve_and_forward_dynamo_pod 1
 wait_for "pod ${DYNAMO_POD}'s /admin/health is 200" 60 2 -- admin_health_ready

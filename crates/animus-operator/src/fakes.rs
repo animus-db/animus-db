@@ -334,6 +334,16 @@ pub struct FakeAdminClient {
     /// this reconcile" diagnosability path (every ordinal 0..target
     /// unreachable) without needing a real network partition.
     fail_control_members: Mutex<bool>,
+    /// Issue #864: how many more times ordinal `k`'s own
+    /// `POST .../admin/control/member/add` should return a transient `409`
+    /// (mirroring `RaftCore::change_membership`'s own erratum-guard
+    /// rejection right after an election) before it starts succeeding —
+    /// decremented on every matching call, so a test can express "this
+    /// exact ordinal refuses N times then accepts" without conflating it
+    /// with `fail_control_member_add_ordinals`'s "refuses forever" shape
+    /// (which a real leader that has cleared its erratum window never
+    /// does).
+    transient_fail_control_member_add_ordinals: Mutex<BTreeMap<i32, u32>>,
 }
 
 impl FakeAdminClient {
@@ -421,6 +431,19 @@ impl FakeAdminClient {
     pub fn fail_control_members(&self) {
         *self.fail_control_members.lock().unwrap() = true;
     }
+
+    /// Make voter ordinal `ordinal`'s own `POST .../admin/control/
+    /// member/add` return a transient `409` exactly `times` more times,
+    /// then succeed from then on (issue #864) — mirrors a freshly-elected
+    /// leader's own `RaftCore::change_membership` erratum-guard rejection
+    /// clearing after its own next successful heartbeat round, unlike
+    /// [`Self::fail_add_control_member_for_ordinal`]'s permanent refusal.
+    pub fn fail_add_control_member_for_ordinal_transiently(&self, ordinal: i32, times: u32) {
+        self.transient_fail_control_member_add_ordinals
+            .lock()
+            .unwrap()
+            .insert(ordinal, times);
+    }
 }
 
 /// Pulls `{ordinal}` out of a `{name}-{ordinal}.{name}-internal....` admin
@@ -456,6 +479,22 @@ impl AdminOps for FakeAdminClient {
                     .contains(&o)
             }) {
                 return Err("control/member/add failed (fake)".to_string());
+            }
+            if let Some(o) = target_ordinal {
+                let mut transient = self
+                    .transient_fail_control_member_add_ordinals
+                    .lock()
+                    .unwrap();
+                if let Some(remaining) = transient.get_mut(&o)
+                    && *remaining > 0
+                {
+                    *remaining -= 1;
+                    return Err(
+                        "admin endpoint returned status 409: control leadership moved, or a \
+                         membership change is already in flight (fake, transient)"
+                            .to_string(),
+                    );
+                }
             }
             let node = body["node"]
                 .as_str()
