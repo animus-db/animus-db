@@ -2283,6 +2283,55 @@ const FORWARD_HOP_TIMEOUT: Duration = Duration::from_secs(2);
 /// only thing that ever bounds a dead hinted peer's own hop at all).
 const HINTED_FORWARD_HOP_TIMEOUT: Duration = Duration::from_secs(6);
 
+/// **Issue #950.** How long [`ClientCtx::cp_route`] trusts its OWN, purely
+/// local view before asking the tablet's other known replicas for their own
+/// leader belief. `cp_route`'s "this node hosts a replica but its own
+/// leader hint is unknown" branch (`topology::decide_cp_route`'s
+/// `RouteDecision::Wait`) is deliberately conservative — the only real
+/// "route" might be this very node, mid-election — but before this fix that
+/// caution was unconditional: `cp_route` polled only `self.edge.cp_leader`/
+/// this node's own `RaftKvNode::leader()` every [`SCHEMA_POLL_INTERVAL`] for
+/// up to the full [`CLIENT_TIMEOUT`], with no fallback, even when every
+/// OTHER replica of the group had known a stable leader the entire time
+/// (the exact evidence in issue #950: a continuously known leader per an
+/// independent `/admin/raftkv` poll, while a routed write still burned the
+/// whole 10s and reported "no CP group leader reachable"). A node's own
+/// local Raft replica can lag the rest of its group under severe scheduling
+/// pressure (bulk request handling starving its own heartbeat/apply
+/// processing) without the group itself ever losing its leader — that
+/// staleness is indistinguishable, from purely local state, from a genuine
+/// election in progress.
+///
+/// **Sized deliberately**: comfortably above the CP-data plane's own
+/// randomized election-timeout range (`[150ms, 300ms)`, `animus-control`'s
+/// `election_base`) so a real, brief election is never mistaken for
+/// staleness — several such windows fit inside this budget — while still
+/// leaving most of [`CLIENT_TIMEOUT`] for the cross-replica fan-out this
+/// triggers and whatever forwarding follows it.
+const CP_ROUTE_LOCAL_SUB_BUDGET: Duration = Duration::from_millis(750);
+
+/// **Issue #950.** How often [`ClientCtx::cp_route`] re-tries its
+/// cross-replica leader-hint fan-out (see [`CP_ROUTE_LOCAL_SUB_BUDGET`])
+/// once a first attempt has come back with nothing — a real election in
+/// progress needs more than one round; a fixed cadence bounds how much of
+/// the remaining [`CLIENT_TIMEOUT`] budget each additional round can cost,
+/// mirroring [`FORWARD_ELECTION_BACKOFF`]'s identical role in the
+/// forward-hop chase.
+const CP_ROUTE_FANOUT_RETRY_INTERVAL: Duration = Duration::from_millis(500);
+
+/// **Issue #950.** The per-replica transport timeout for
+/// [`ClientCtx::cp_route`]'s cross-replica leader-hint fan-out — every known
+/// replica is probed **concurrently** (not serially, unlike the forward-hop
+/// chase's own candidate walk: there is no vouching signal to prefer one
+/// probed replica over another, so racing them costs nothing extra — see
+/// `docs/lessons/code-patterns/2026-09-15-a-per-hop-timeout-cap-does-not-
+/// bound-a-serial-fallbacks-total-cost.md`), so this bounds the WHOLE
+/// fan-out round, not one candidate's share of it. Short: the probe is a
+/// single cheap local read on the answering side
+/// (`RaftKvNode::leader()`, no propose/wake/block), so even a busy peer
+/// should answer well inside this.
+const CP_ROUTE_FANOUT_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+
 /// Bounded attempts [`ClientCtx::txn_prepare_pushing`] gives a stage blocked
 /// by another transaction's unresolved intent (ADR 0018 §2/PR6, task #16)
 /// before giving up and reporting a client-facing conflict error.
@@ -13324,6 +13373,7 @@ fn request_kind(request: &ClientRequest) -> &'static str {
         ClientRequest::PutBatch { .. } => "put_batch",
         ClientRequest::KindWrite { .. } => "kind_write",
         ClientRequest::KindWriteItem { .. } => "kind_write_item",
+        ClientRequest::CpLeaderHintProbe { .. } => "cp_leader_hint_probe",
         ClientRequest::KindScan { .. } => "kind_scan",
         ClientRequest::ForceSeal { .. } => "force_seal",
         ClientRequest::ForcePitrSeal { .. } => "force_pitr_seal",
@@ -13538,6 +13588,17 @@ async fn handle_request(
         ClientRequest::KindWriteItem { .. } => ClientResponse::Error(
             "this request is an internal evaluate-at-leader write RPC and must be sent wrapped \
              in `Forwarded`"
+                .into(),
+        ),
+        // Issue #950: the cross-replica leader-hint probe, refused bare for
+        // the identical reason every other tablet-addressed internal RPC is
+        // — see `ClientRequest::CpLeaderHintProbe`'s doc. Real handling
+        // lives in `cp_serve_forwarded`'s match, reached only through
+        // `Forwarded`; not a `MetaCommand`, so `is_relayable_command` does
+        // not apply.
+        ClientRequest::CpLeaderHintProbe { .. } => ClientResponse::Error(
+            "this request is an internal leader-hint probe RPC and must be sent wrapped in \
+             `Forwarded`"
                 .into(),
         ),
         // ADR 0041 §5: the LSI `Query` read primitive, the read-side dual of
@@ -19251,6 +19312,11 @@ mod sim_cluster;
 /// private fields stay reachable with no further visibility widened.
 #[cfg(test)]
 mod sim_cluster_corpus;
+/// Issue #950: `ClientCtx::cp_route`'s cross-replica leader-hint fan-out —
+/// a sibling of `sim_cluster_data_only` for the identical reason (needs
+/// `SimCluster`'s own `pub(crate)` surface, no further visibility widened).
+#[cfg(test)]
+mod sim_cluster_cp_route_fanout;
 /// ADR 0061 rung K (C-11) PR 2: the `BatchWriteItem`/`BatchGetItem`/
 /// `TransactWriteItems`/forwarded-write conversion of `tests/dynamo_
 /// throttling.rs`'s four sim-reachable throttle scenarios — a sibling of

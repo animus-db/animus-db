@@ -739,6 +739,32 @@ pub enum Metric {
     /// co-hosted tablet's own cached tail too.
     CpSharedWalGcRewrites,
 
+    // --- `cp_route` cross-replica leader-hint fan-out (issue #950) ---
+    // Appended after the shared-WAL GC variant above; every earlier
+    // variant's slot and the text-export order stay stable. Recorded by
+    // `animusd::forwarding::ClientCtx::cp_route` — see that method's own
+    // doc for the mechanism this observes: a client-facing node whose own
+    // local replica of a tablet has gone quiet (no leader hint, even
+    // though it hosts a replica) used to poll only its own stale local
+    // state for the whole `CLIENT_TIMEOUT`; it now asks the tablet's other
+    // known replicas for their own leader belief once a short local
+    // sub-budget elapses.
+    /// A `cp_route` call's own local view stayed stale (this node hosts a
+    /// replica but had no leader hint) past its local sub-budget, and a
+    /// concurrent fan-out to the tablet's other known replicas found one
+    /// that did know the leader — the exact case this node's own local
+    /// wait would otherwise have burned the rest of `CLIENT_TIMEOUT` on.
+    /// A sustained nonzero rate means this node's own heartbeat/leader-hint
+    /// processing is routinely lagging its peers', worth investigating even
+    /// though each individual case self-heals via the fan-out.
+    CpRouteFanoutRecoveredLeader,
+    /// A `cp_route` call gave up (returned no route at all) after its own
+    /// cross-replica fan-out ran at least once and still found no replica
+    /// with a usable leader hint — the fan-out was tried and came back
+    /// empty, not skipped. Distinct from the ordinary "genuinely no leader
+    /// anywhere yet" case only in that this confirms more than one node's
+    /// own view was checked, not just this one's.
+    CpRouteFanoutExhausted,
     // --- Housekeeping-vs-client propose attribution (issue #974) ---
     // Appended after the shared-WAL variant above; every earlier variant's
     // slot and the text-export order stay stable, so the snapshot remains
@@ -769,7 +795,7 @@ pub enum Metric {
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 94] = [
+    pub const ALL: [Metric; 96] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -863,6 +889,8 @@ impl Metric {
         Metric::CpHeartbeatDemuxDropped,
         Metric::CpSharedWalSyncs,
         Metric::CpSharedWalGcRewrites,
+        Metric::CpRouteFanoutRecoveredLeader,
+        Metric::CpRouteFanoutExhausted,
         Metric::CpHousekeepingProposalsAccepted,
     ];
 
@@ -964,6 +992,8 @@ impl Metric {
             Metric::CpHeartbeatDemuxDropped => "cp_heartbeat_demux_dropped",
             Metric::CpSharedWalSyncs => "cp_shared_wal_syncs",
             Metric::CpSharedWalGcRewrites => "cp_shared_wal_gc_rewrites",
+            Metric::CpRouteFanoutRecoveredLeader => "cp_route_fanout_recovered_leader",
+            Metric::CpRouteFanoutExhausted => "cp_route_fanout_exhausted",
             Metric::CpHousekeepingProposalsAccepted => "cp_housekeeping_proposals_accepted",
         }
     }

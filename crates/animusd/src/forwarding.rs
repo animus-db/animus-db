@@ -9,15 +9,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use animus_cp_data::{TxnDecisionStatus, TxnOutcome};
-use animus_env::{Env, NodeId};
+use animus_env::{Env, Metric, NodeId};
 use animus_node::host::RelayClient;
 use animus_tablet::{KeyRange, TabletId};
 
 use crate::{
-    CLIENT_TIMEOUT, ClientCtx, ClientRequest, ClientResponse, CpRoute, FORWARD_ELECTION_BACKOFF,
-    FORWARD_HOP_TIMEOUT, HINTED_FORWARD_HOP_TIMEOUT, RELAY_HOP_TIMEOUT, RELAY_TRANSPORT_FAILURE,
-    SCHEMA_POLL_INTERVAL, STALE_READ_REFUSAL, STREAM_GROW_NO_SPLIT_POINT, SnapshotRead,
-    TxnAbortReason, decide, dynamo, index_drain, median_split_key, topology,
+    CLIENT_TIMEOUT, CP_ROUTE_FANOUT_PROBE_TIMEOUT, CP_ROUTE_FANOUT_RETRY_INTERVAL,
+    CP_ROUTE_LOCAL_SUB_BUDGET, ClientCtx, ClientRequest, ClientResponse, CpRoute,
+    FORWARD_ELECTION_BACKOFF, FORWARD_HOP_TIMEOUT, HINTED_FORWARD_HOP_TIMEOUT, RELAY_HOP_TIMEOUT,
+    RELAY_TRANSPORT_FAILURE, SCHEMA_POLL_INTERVAL, STALE_READ_REFUSAL, STREAM_GROW_NO_SPLIT_POINT,
+    SnapshotRead, TxnAbortReason, decide, dynamo, index_drain, median_split_key, topology,
 };
 
 impl<E: Env, R: RelayClient> ClientCtx<E, R> {
@@ -136,18 +137,152 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     ///   so forward to any known route (the receiver serves iff it is the leader,
     ///   else the client retries with fresh routing);
     /// - the tablet itself is not in the map yet (bootstrap) → **wait** for it.
+    ///
+    /// **Cross-replica fan-out on a stale local view (issue #950).** The
+    /// "this node hosts a replica but its own leader hint is unknown" case
+    /// above (`topology::decide_cp_route`'s `RouteDecision::Wait`) used to
+    /// mean this whole method polled **only** this node's own local state —
+    /// `self.edge.cp_leader`/a local replica's own `leader()` hint — every
+    /// [`SCHEMA_POLL_INTERVAL`] for up to the full deadline, with no
+    /// fallback, even when the tablet's OTHER known replicas had all known a
+    /// stable leader the entire time. That reasoning ("the only real route
+    /// might be this very node, mid-election") is sound for a genuinely
+    /// short election, but a node's own Raft replica can also simply lag
+    /// its group under severe scheduling pressure (bulk client-request
+    /// handling starving this node's own heartbeat/apply processing) — a
+    /// state indistinguishable from a real election using only local
+    /// evidence. Issue #950's own reproduction showed exactly this: an
+    /// independent `/admin/raftkv` poll of the SAME group saw a
+    /// continuously known, stable leader the whole time, while a routed
+    /// write on this node burned the entire `CLIENT_TIMEOUT` reporting "no
+    /// CP group leader reachable."
+    ///
+    /// Once this node's own local view has stayed unresolved past
+    /// [`CP_ROUTE_LOCAL_SUB_BUDGET`] — comfortably above the CP-data plane's
+    /// own election-timeout range, so a real election is never mistaken for
+    /// staleness — this method asks every OTHER known replica of the tablet,
+    /// **concurrently** (there is no vouching signal to prefer one probed
+    /// replica over another, so racing them costs nothing extra over trying
+    /// them one at a time — see `docs/lessons/code-patterns/2026-09-15-a-
+    /// per-hop-timeout-cap-does-not-bound-a-serial-fallbacks-total-cost.md`),
+    /// what THEIR own local replica believes
+    /// ([`ClientRequest::CpLeaderHintProbe`]) instead of continuing to poll
+    /// only its own. The first usable answer resolves this call to a real,
+    /// **hinted** forward (`CpRoute::Forward(addr, true)` — vouched for by a
+    /// live replica, exactly [`resolve_cp_route`](Self::resolve_cp_route)'s
+    /// own `Hinted` classification), handing off to the already-hardened
+    /// [`forward_to_tablet_leader`](Self::forward_to_tablet_leader) chase for
+    /// the rest. A fan-out round that finds nothing retries every
+    /// [`CP_ROUTE_FANOUT_RETRY_INTERVAL`] (a real election needs more than
+    /// one round) — this call still never exceeds the overall
+    /// `CLIENT_TIMEOUT` deadline.
     pub(crate) async fn cp_route(&self, table: &str, key: &[u8]) -> CpRoute<E> {
         let deadline = self.env.now().saturating_add(CLIENT_TIMEOUT);
+        let mut next_fanout_at = self.env.now().saturating_add(CP_ROUTE_LOCAL_SUB_BUDGET);
+        let mut fanned_out = false;
         loop {
-            if let Some(tablet) = self.tablet_for(table, key)
+            let tablet = self.tablet_for(table, key);
+            if let Some(tablet) = tablet
                 && let Some(route) = self.resolve_cp_route(tablet)
             {
                 return route;
             }
+            if let Some(tablet) = tablet
+                && self.env.now() >= next_fanout_at
+            {
+                fanned_out = true;
+                if let Some((_, addr)) = self.probe_replica_leader_hints(tablet).await {
+                    if let Some(data) = self.data.as_ref() {
+                        data.raftkv_metrics
+                            .incr(Metric::CpRouteFanoutRecoveredLeader);
+                    }
+                    tracing::warn!(
+                        tablet = tablet.0,
+                        %addr,
+                        "cp_route: local view stale past sub-budget, recovered leader via \
+                         cross-replica fan-out"
+                    );
+                    return CpRoute::Forward(addr, true);
+                }
+                next_fanout_at = self
+                    .env
+                    .now()
+                    .saturating_add(CP_ROUTE_FANOUT_RETRY_INTERVAL);
+            }
             if self.env.now() >= deadline {
+                if fanned_out {
+                    if let Some(data) = self.data.as_ref() {
+                        data.raftkv_metrics.incr(Metric::CpRouteFanoutExhausted);
+                    }
+                    tracing::warn!(
+                        table,
+                        "cp_route: gave up after CLIENT_TIMEOUT; cross-replica fan-out also \
+                         found no leader"
+                    );
+                }
                 return CpRoute::None;
             }
             self.env.sleep(SCHEMA_POLL_INTERVAL).await;
+        }
+    }
+
+    /// Ask every other known replica of `tablet` (per replicated
+    /// `Metadata`, excluding this node) what THEIR own local replica
+    /// currently believes the leader is — concurrently, each capped at
+    /// [`CP_ROUTE_FANOUT_PROBE_TIMEOUT`] — and return the first usable
+    /// answer. `None` if the tablet has no other known replica address, or
+    /// none of them currently know a leader either (a genuine
+    /// group-wide-unknown-leader window, e.g. a real election). See
+    /// [`cp_route`](Self::cp_route)'s own doc for why this exists and when
+    /// it's called (issue #950).
+    async fn probe_replica_leader_hints(&self, tablet: TabletId) -> Option<(NodeId, String)> {
+        let meta = self.effective_metadata();
+        let replicas = meta.tablets.get(&tablet)?.replicas.clone();
+        let route = self.intra_route_snapshot();
+        let self_id = self.data.as_ref().map(|d| d.base_id.clone());
+        let targets: Vec<String> = replicas
+            .into_iter()
+            .filter(|id| Some(id) != self_id.as_ref())
+            .filter_map(|id| route.get(&id).cloned())
+            .collect();
+        if targets.is_empty() {
+            return None;
+        }
+        let probes = targets
+            .into_iter()
+            .map(|addr| self.probe_one_leader_hint(tablet, addr));
+        futures::future::join_all(probes)
+            .await
+            .into_iter()
+            .flatten()
+            .next()
+    }
+
+    /// One [`ClientRequest::CpLeaderHintProbe`] round trip to `addr` (always
+    /// wrapped in [`Forwarded`](ClientRequest::Forwarded), like every other
+    /// tablet-addressed internal RPC) — `None` on any transport failure,
+    /// timeout, or a replica that itself has no hint right now. Never
+    /// retried on its own; [`probe_replica_leader_hints`](Self::probe_replica_leader_hints)
+    /// races one of these per candidate replica.
+    async fn probe_one_leader_hint(
+        &self,
+        tablet: TabletId,
+        addr: String,
+    ) -> Option<(NodeId, String)> {
+        let resp = self
+            .relay
+            .relay(
+                addr,
+                &ClientRequest::Forwarded {
+                    request: Box::new(ClientRequest::CpLeaderHintProbe { tablet: tablet.0 }),
+                    traceparent: crate::otel::current_traceparent(),
+                },
+                CP_ROUTE_FANOUT_PROBE_TIMEOUT,
+            )
+            .await;
+        match resp {
+            ClientResponse::CpLeaderHint { hint } => hint,
+            _ => None,
         }
     }
 
@@ -1134,6 +1269,20 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     Err(e) => ClientResponse::Error(e),
                 }
             }
+            // Issue #950: the cross-replica leader-hint probe — answered by
+            // ANY replica of `tablet`, leader or follower, straight from its
+            // own local `cp_leader_hint`. Deliberately no leader requirement
+            // (unlike every other arm here): the whole point is to learn
+            // what this node's own local replica believes even when it
+            // isn't the leader, so `cp_route`'s fan-out (`ClientCtx::
+            // probe_replica_leader_hints`) can find a leader another
+            // replica already knows about while THIS node's own view is
+            // stale. Never a refusal — no hint is a legitimate answer
+            // (`None`, e.g. this replica is itself mid-election), not an
+            // error.
+            ClientRequest::CpLeaderHintProbe { tablet } => ClientResponse::CpLeaderHint {
+                hint: self.cp_leader_hint(TabletId(tablet)),
+            },
             // ADR 0018 §2/PR4: the four internal 2PC coordinator RPCs.
             // Routed by the first write key (`TxnPrepare`) or one of `keys`
             // (`TxnResolve`) — **never** `record_key` for a non-anchor
