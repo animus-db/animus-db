@@ -126,6 +126,22 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   WAL pattern), and `sst-NNNNNN` (immutable, sorted, **per-block CRC32** via `crc32fast`, with
   an in-file block index + footer, plus a per-table **Bloom filter** in the
   manifest; point reads fetch one block with `read_at`, never the whole file).
+  The **block index region** itself is a third **compact hand-rolled binary
+  codec** (issue #839, `encode_block_index`/`decode_block_index` in
+  `lsm/sstable.rs`) — `SSIX` magic + version, `u32` count (capped
+  `.min(1 << 20)` like the manifest/WAL decoders), little-endian
+  length-prefixed `first_key` + fixed 8-byte `offset`/`len` per entry, and a
+  trailing CRC32 over the whole region (unlike the manifest, which relies on
+  its own atomic swap and carries no CRC — the index region lives inside an
+  otherwise block-checksummed SSTable file, so it gets one too); replaced a
+  `serde_json` encoding of `Vec<BlockIndex>` that rendered every `first_key`
+  as a decimal-number JSON array, the same 3-6x inflation the WAL and
+  manifest codecs were hand-rolled to avoid, paid on every flush/compaction
+  output and read back on every table open (`LsmEngine::open_with_metrics`
+  opens every manifest-listed table up front, so it lands on recovery time
+  too). A truncated region, an over-cap count, a key length past the region,
+  or a bad checksum all decode to `StorageError::Backend` — the same error
+  class the manifest/WAL decoders use — never a panic.
   Each data block is **LZ4-compressed** (`lz4_flex`, pure-Rust/MIT, safe-only
   build) when that is smaller, else stored verbatim — framed `tag(u8) || payload
   || crc`, the CRC covering `tag || payload`. Records inside a block use
@@ -256,9 +272,10 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   *second* recovery would then lose it (regression:
   `lsm_disk_faults.rs::acked_writes_after_torn_tail_recovery_survive_second_restart`).
   Corruption regression: `lsm_disk_faults.rs::corrupted_durable_wal_record_surfaces_loudly`.
-- **Every length-prefixed element count this codec (and the manifest codec
-  right below it) reads off disk pre-sizes its `Vec` with a capped
-  requested capacity (`.min(1 << 20)`), never the raw untrusted count.**
+- **Every length-prefixed element count this codec (the manifest codec right
+  below it, and the SSTable block-index codec in `lsm/sstable.rs`) reads off
+  disk pre-sizes its `Vec` with a capped requested capacity (`.min(1 << 20)`),
+  never the raw untrusted count.**
   Bounds-checking each individual read is not the same guarantee as
   allocation safety: `Vec::with_capacity(n)` fed directly from a corrupted
   count can demand a many-GB allocation before a single element is
@@ -267,10 +284,13 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   own reads happen only after a passing CRC-32 (`try_parse_wal_frame`),
   which makes an undetected corrupted count astronomically unlikely from
   ordinary bit rot but not impossible in principle (CRC-32 isn't
-  adversary-resistant), so it's capped as defense in depth; the
-  **manifest** decoder has no CRC at all, so a corrupted on-disk manifest
-  byte was a real instance of the same abort, not merely theoretical. See
-  `docs/engineering-lessons.md`'s "untrusted length-prefix pre-sizing a
+  adversary-resistant), so it's capped as defense in depth; likewise the
+  block-index codec's own count is covered by its trailing CRC32
+  (`decode_block_index` checks the checksum before trusting the count at
+  all). The **manifest** decoder has no CRC at all, so a corrupted on-disk
+  manifest byte was a real instance of the same abort, not merely
+  theoretical. See `docs/engineering-lessons.md`'s "untrusted length-prefix
+  pre-sizing a
   `Vec`" entry (found and fixed first in `animus-cp-data::codec`) for the
   full account.
 - **A `snapshot()`'s pinned version must floor compaction's tombstone-GC
