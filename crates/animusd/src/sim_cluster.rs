@@ -861,6 +861,10 @@ fn placeholder_addr() -> SocketAddr {
 /// alias's own doc states).
 type ScanRows = Vec<(Vec<u8>, Vec<u8>)>;
 
+/// [`SimCluster::get`]/[`SimCluster::get_timed`]'s own result shape, named
+/// for the same clippy `type_complexity` reason as [`ScanRows`].
+type GetResult = Result<Option<Vec<u8>>, String>;
+
 /// One node's `ClientCtx` handle, named for the same clippy `type_complexity`
 /// reason as [`ScanRows`] — [`SimClusterHandle`]'s own `ctxs` field is a
 /// `Vec` of these behind an `Arc<Mutex<..>>`.
@@ -3606,6 +3610,53 @@ impl SimCluster {
                 "get on node {node} did not complete within {OP_BUDGET:?}"
             ))
         })
+    }
+
+    /// [`SimCluster::get`]'s timing-instrumented sibling — [`SimCluster::
+    /// admin_timed`]'s identical shape (step the simulator forward in
+    /// `step`-sized increments, up to `max_steps`, and report the virtual
+    /// [`Duration`] elapsed when the read's own future actually resolves)
+    /// applied to a CP read instead of an admin call. Used by issue #920's
+    /// quiesced-group rolling-restart regression to measure how long a
+    /// `ConsistentRead: true` read takes to succeed once every replica of
+    /// a quiesced group has been crashed and restarted, rather than only
+    /// whether it eventually does. Never panics on exhaustion: returns
+    /// `max_steps * step` and a synthetic timeout `Err` when the read
+    /// never resolves in that window.
+    #[allow(clippy::too_many_arguments)] // a plain (node, table, pk, sk, consistent, step, max_steps) parameter list — mirrors `admin_timed`'s own five plus the two timing knobs
+    pub(crate) fn get_timed(
+        &mut self,
+        node: u64,
+        table: &str,
+        pk: &str,
+        sk: &str,
+        consistent: bool,
+        step: Duration,
+        max_steps: usize,
+    ) -> (Duration, GetResult) {
+        let handle = self.shared.clone();
+        let (table, pk, sk) = (table.to_owned(), pk.to_owned(), sk.to_owned());
+        let env = self.shared.env(node);
+        let slot: Arc<Mutex<Option<GetResult>>> = Arc::new(Mutex::new(None));
+        let out = slot.clone();
+        let start = self.sim.now();
+        env.spawn_task(async move {
+            let result = handle.get(node, &table, &pk, &sk, consistent).await;
+            *out.lock().expect("result slot poisoned") = Some(result);
+        });
+        for _ in 0..max_steps {
+            self.sim.run_for(step);
+            if let Some(result) = slot.lock().expect("result slot poisoned").take() {
+                return (self.sim.now().duration_since(start), result);
+            }
+        }
+        (
+            self.sim.now().duration_since(start),
+            Err(format!(
+                "get on node {node} did not resolve within {max_steps} x {step:?} of virtual \
+                 time"
+            )),
+        )
     }
 
     /// Whole-table scan, issued from `node`'s own `ClientCtx` — the cheap
