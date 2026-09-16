@@ -876,3 +876,41 @@ mechanism and `docs/lessons/` for the general lessons this amendment both
 applies and, where the fix stopped short of a broader rewrite (the
 forward-hop chase's own per-hop timeout shape is unchanged), deliberately
 did not re-litigate.
+## Amendment (2026-09-16, issue #945) — the `campaign_immediately` carve-out above was incomplete: it only exempted one replica of a multi-replica split, not all of them
+
+The "One tablet-specific carve-out" paragraph above claimed skipping the
+cluster check for the `campaign_immediately` replica was sufficient to
+preserve "no added latency" for a split. That was wrong: a real
+`materialize_split_child` fork hosts **several** replicas of the same
+child at once (`bootstrap_voters`, typically 2-3), and only ONE of them
+ever sets `campaign_immediately`. `handle_request_vote` refuses a real
+vote while `cluster_check_pending` is `Some` (`animus-control::raft`, see
+that function's own comment) — so every OTHER replica of that same,
+equally-fresh-by-construction child still ran the check, and its own
+vote grant to the campaigning sibling stayed blocked behind a
+`ClusterProbe`/`ClusterProbeResp` round trip. The "wins the race against
+the cold election timeout with no added latency" guarantee this ADR (and
+ADR 0058 Train 2 rung 4) documents was silently degraded to "wins the
+race, but only after one probe round trip" on **every** split — a real
+regression, not a test artifact. It was invisible at the `ANIMUS_
+INPLACE_SPLIT_SEEDS=10`/`ANIMUS_HEARTBEAT_SEEDS` depth this ADR's own
+"Regression" paragraph confirmed green at: whether the added round trip
+matters depends on the simulated link-latency draw for a given seed, and
+depth 10 didn't happen to hit an unlucky one. The nightly deep corpus
+(`ANIMUS_INPLACE_SPLIT_SEEDS=40`/`ANIMUS_HEARTBEAT_SEEDS=40`) did.
+
+**The fix**: the driver-level skip is no longer keyed off
+`campaign_immediately` directly. `RaftKvNode::start_inner` (and
+`DriveState`) now carry a separate `skip_cluster_check` flag;
+`materialize_split_child`'s non-campaigning branch passes `true` for it
+via a new `RaftKvNode::start_hosted_split_follower_with_batcher[
+_and_shared_wal]` constructor, alongside the campaigning replica's
+existing `start_hosted_campaigning_with_batcher[_and_shared_wal]` (which
+now sets both flags). Every ordinary fresh-hosting caller (`CreateTablet`,
+an ADR 0060 growth join, a reconciler-adopted replica of an
+already-established tablet) is unaffected — `skip_cluster_check` stays
+`false` there, exactly as `campaign_immediately` always was. See
+`crates/animus-cp-data/CLAUDE.md`'s issue #945 note for the crate-local
+detail and the generalized rule ("audit every party to the same
+operation that shares a caller's own 'proven fresh' premise, not just the
+one with a convenient existing flag").

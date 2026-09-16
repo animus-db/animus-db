@@ -310,6 +310,7 @@ fn snapshot_scan_is_isolated() {
         let snap_keys: Vec<_> = snap
             .scan(b"", b"z")
             .await
+            .unwrap()
             .into_iter()
             .map(|(k, _)| k)
             .collect();

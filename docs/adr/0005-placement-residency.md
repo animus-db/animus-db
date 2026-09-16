@@ -129,3 +129,55 @@ driven by the same `reconcile_loop` on a slower cadence whenever repair has
 nothing to do. A cluster-default policy, topology labels in `animusd`'s
 deployment config, and operator-facing policy management (CLI/wire) are still
 future work.
+
+**2026-09-16 amendment (issue #957): repair grows a tablet as far as it
+genuinely can, not only all the way to the full RF.** `Metadata::reconcile`
+called plain `replan` (`animus_placement`) for repair; `replan`'s underlying
+`choose` is all-or-nothing — it refuses outright
+(`PlacementError::InsufficientCandidates`) the instant the eligible
+candidate pool can't reach the policy's full `replication_factor`, even
+when a smaller, strictly-improving move is possible. Since a tablet's
+policy always records the *target* RF rather than the observed candidate
+count at provision time (the design this ADR's own "reconciler now runs in
+the production binary" section already establishes, and
+`crates/animusd/tests/tablet_rf_self_heals.rs`'s own module doc restates),
+an ordinary small cluster — an RF-3 policy with only 2 members ever
+registered, say — could mint a tablet with fewer replicas than even that
+2-node ceiling (a real, structural race: the very first tablet can be
+provisioned before every founding member's own registration has committed
+and applied, `docs/lessons/testing/2026-09-16-a-faster-bootstrap-time-
+schema-proposal-makes-initial-tablet-placement-an-eventual-property.md`)
+and then never self-heal even the achievable 1→2 repair, permanently,
+until a 3rd candidate happened to make the full RF reachable in one step.
+This was found root-causing exactly that flaky test — the boot-time
+"wiped voter" cluster check (issue #667/#900) was the prime suspect but
+was ruled out empirically (`cluster_check_pending`/`refused_as_voter` both
+`false` on every replica throughout several captured stalls, with the
+control plane's own consensus and apply task fully healthy and idle the
+entire time — nothing was stuck at the Raft layer at all). The actual
+defect was purely in the pure placement-policy engine's own contract.
+
+**The fix**: a new, growth-only best-effort sibling,
+`animus_placement::replan_repair`, is what `Metadata::reconcile` now calls
+for repair. It behaves exactly like `replan` except when the eligible pool
+is smaller than the policy's RF but still larger than the tablet's current
+eligible survivors — real progress is possible — in which case it grows to
+every eligible candidate instead of refusing. It is a **strict widening**:
+whenever the full RF *is* satisfiable, or the tablet already holds as many
+replicas as the cluster can currently support (an already-at-capacity set,
+whether or not that satisfies the full policy), `replan_repair` returns
+`replan`'s own plain, unmodified answer — including `Err` — which is what
+keeps a stale, currently-ineligible replica in place rather than dropping
+it the moment there's nothing better to replace it with (the growth-only
+guarantee is deliberately independent of, and does not relax, the
+never-shrink one). `replan` itself, and every one of its other callers
+(the directed-Placing convergence phase, ADR 0062 §2, and fresh-tablet
+placement via `select_replicas`), are unchanged — best-effort repair is
+`Metadata::reconcile`'s own concern, not a change to the crate's general
+contract. See `animus-placement/CLAUDE.md`'s entry for the full function
+doc and `animus-control/tests/placement_auto_reconcile.rs::
+leader_automatically_grows_an_undersized_tablet_when_rf_exceeds_the_
+candidate_pool` for the live, Raft-driven regression (a 2-node cluster,
+RF-3 policy, the leader's own timer-driven `reconcile_loop` — never
+test-driven — growing a 1-replica tablet to 2 and converging idempotently
+until a 3rd candidate reaches the full RF).

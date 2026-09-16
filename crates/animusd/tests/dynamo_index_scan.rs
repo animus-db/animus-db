@@ -113,7 +113,7 @@ async fn await_gsi_scan(addr: SocketAddr, body: &str, accept: impl Fn(&str) -> b
     match timeout(Duration::from_secs(15), converged).await {
         Ok(body) => body,
         Err(_) => panic!(
-            "GSI scan never converged within 15s (last saw: {})",
+            "GSI scan against {addr} never converged within 15s (last saw: {})",
             last.lock().unwrap()
         ),
     }

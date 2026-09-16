@@ -2246,16 +2246,12 @@ pub struct RaftKvNode<E: Env, S: StorageEngine> {
     voter_history: Arc<Mutex<VoterHistory>>,
 }
 
-/// A bounded, in-process ring of every distinct Raft voter configuration a
-/// [`RaftKvNode`] has adopted, in adoption order (issue #596). Exists
-/// because a transient intermediate configuration's own DURATION is an
-/// implementation timing artifact, never a property this crate promises —
-/// `reconfigure_step`'s learner-phased sequencing (this file's own doc,
-/// "reconfigure_step's learner-phased replica-move sequencing") only
-/// guarantees an over-replicated intermediate is logically *reached*
-/// between an add and the matching remove, not how long it survives before
-/// the next reconciler tick removes it. An external poller sampling the
-/// live voter set on a fixed interval can race that window shut — see
+/// A bounded, in-process ring of every distinct value of `T` a
+/// [`RaftKvNode`] has observed for some per-tick recomputed fact, in
+/// observation order. Exists because a transient intermediate's own
+/// DURATION is an implementation timing artifact, never a property this
+/// crate promises — an external poller sampling the live voter set on a
+/// fixed interval can race that window shut — see
 /// `crates/animusd/tests/split_placing_two_replica_diff_e2e.rs` and
 /// `docs/engineering-lessons.md`'s matching entry for the incident this
 /// closes. Recording the sequence here, inside the same consensus-loop
@@ -2263,6 +2259,25 @@ pub struct RaftKvNode<E: Env, S: StorageEngine> {
 /// tick" fact (`state_machine_behind`, the quiesce veto), makes the
 /// intermediate provable from a durable-for-this-uptime record instead of
 /// from how fast an external caller happens to poll.
+///
+/// **This same once-per-tick sampling cadence is not fine-grained enough
+/// for the LEARNER set** (issue #944): unlike a voter-set change (which
+/// only ever changes via network-replicated log entries, so this
+/// consensus-loop's own per-message processing bounds how much can happen
+/// between two samples), a leader's own `add_learner`/`promote_learner`
+/// calls (`RaftKvNode::reconfigure_step`) mutate the shared `RaftCore`
+/// SYNCHRONOUSLY, from whichever task calls them (the host reconciler's own
+/// tick, not this drive loop) — and a follower's own per-entry `log_append`
+/// can likewise apply several batched config-changing entries before this
+/// loop ever gets scheduled to sample in between. Sampling from here can
+/// therefore coalesce the whole add-then-promote sequence into one record,
+/// silently skipping the transient learner state entirely — see
+/// `crates/animusd/tests/learner_reconfigure.rs`'s
+/// `spare_replacement_passes_through_an_observable_learner_state_and_keeps_serving`
+/// for the flake this caused. The learner/voter JOINT history that closes
+/// it (`RaftCore::config_history`, recorded synchronously at the one real
+/// mutation site, `apply_config`, in `animus-control`) therefore lives
+/// **inside the core**, not here — see that method's own doc.
 ///
 /// Deliberately **not** rebuilt at group start/recovery — unlike
 /// `sealed`/`committed_ceiling`/`txn_tracker`, "what voter sets has this
@@ -2323,6 +2338,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             StorageScope::whole(),
             PRIMARY_STREAM,
             false,
+            false,
             None,
             None,
         )
@@ -2341,6 +2357,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             metrics,
             scope,
             PRIMARY_STREAM,
+            false,
             false,
             None,
             None,
@@ -2365,7 +2382,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     ) -> Self {
         let metrics = env.metrics();
         Self::start_inner(
-            env, all_nodes, storage, metrics, scope, stream, false, None, None,
+            env, all_nodes, storage, metrics, scope, stream, false, false, None, None,
         )
     }
 
@@ -2411,7 +2428,63 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     ) -> Self {
         let metrics = env.metrics();
         Self::start_inner(
-            env, all_nodes, storage, metrics, scope, stream, false, batcher, shared_wal,
+            env, all_nodes, storage, metrics, scope, stream, false, false, batcher, shared_wal,
+        )
+    }
+
+    /// Like [`start_hosted_with_batcher_and_shared_wal`]
+    /// (Self::start_hosted_with_batcher_and_shared_wal), but for a replica
+    /// the caller already knows, by construction, is a split child's
+    /// non-campaigning sibling — every replica
+    /// [`host::Reconciler::materialize_split_child`](crate::host) hosts
+    /// OTHER than the one it also passes `campaign: true` for (see
+    /// `start_hosted_campaigning_with_batcher_and_shared_wal`'s doc for
+    /// that one). Skips the issue #900/#667 boot-time cluster check (see
+    /// `DriveState::skip_cluster_check`'s doc for why this is safe here but
+    /// not for [`start_hosted_with_batcher_and_shared_wal`]
+    /// (Self::start_hosted_with_batcher_and_shared_wal)'s own ordinary
+    /// fresh-hosting callers) without campaigning immediately — this
+    /// replica still waits out the group's own randomized election timer
+    /// (or a `RequestVote` from whichever sibling DID campaign), exactly
+    /// like any other follower.
+    pub fn start_hosted_split_follower_with_batcher_and_shared_wal(
+        env: E,
+        all_nodes: Vec<NodeId>,
+        storage: S,
+        scope: StorageScope,
+        stream: u64,
+        batcher: Option<HeartbeatBatcher<E>>,
+        shared_wal: Option<Arc<SharedWal<KvCommand, KvState>>>,
+    ) -> Self {
+        let metrics = env.metrics();
+        Self::start_inner(
+            env, all_nodes, storage, metrics, scope, stream, false, true, batcher, shared_wal,
+        )
+    }
+
+    /// Like [`start_hosted_split_follower_with_batcher_and_shared_wal`]
+    /// (Self::start_hosted_split_follower_with_batcher_and_shared_wal),
+    /// without the `shared_wal` opt-in — mirrors
+    /// [`start_hosted_with_batcher`](Self::start_hosted_with_batcher)'s own
+    /// relationship to
+    /// [`start_hosted_with_batcher_and_shared_wal`](Self::
+    /// start_hosted_with_batcher_and_shared_wal). A sim test that hand-hosts
+    /// a group outside `host::Reconciler` (never going through
+    /// `materialize_split_child` itself) uses this to accurately model a
+    /// split child's non-campaigning replica alongside
+    /// [`start_hosted_campaigning_with_batcher`](Self::
+    /// start_hosted_campaigning_with_batcher)'s own campaigning one — see
+    /// `heartbeat_batch_corpus.rs`'s `hosted_group_fixed_leader`.
+    pub fn start_hosted_split_follower_with_batcher(
+        env: E,
+        all_nodes: Vec<NodeId>,
+        storage: S,
+        scope: StorageScope,
+        stream: u64,
+        batcher: Option<HeartbeatBatcher<E>>,
+    ) -> Self {
+        Self::start_hosted_split_follower_with_batcher_and_shared_wal(
+            env, all_nodes, storage, scope, stream, batcher, None,
         )
     }
 
@@ -2461,7 +2534,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     ) -> Self {
         let metrics = env.metrics();
         Self::start_inner(
-            env, all_nodes, storage, metrics, scope, stream, true, None, None,
+            env, all_nodes, storage, metrics, scope, stream, true, true, None, None,
         )
     }
 
@@ -2503,7 +2576,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     ) -> Self {
         let metrics = env.metrics();
         Self::start_inner(
-            env, all_nodes, storage, metrics, scope, stream, true, batcher, shared_wal,
+            env, all_nodes, storage, metrics, scope, stream, true, true, batcher, shared_wal,
         )
     }
 
@@ -2525,6 +2598,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             StorageScope::whole(),
             PRIMARY_STREAM,
             false,
+            false,
             None,
             None,
         )
@@ -2539,6 +2613,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         scope: StorageScope,
         stream: u64,
         campaign_immediately: bool,
+        skip_cluster_check: bool,
         heartbeat_batcher: Option<HeartbeatBatcher<E>>,
         shared_wal: Option<Arc<SharedWal<KvCommand, KvState>>>,
     ) -> Self {
@@ -2695,6 +2770,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             external_quiesce_veto,
             external_quiesce_veto_fresh_through,
             campaign_immediately,
+            skip_cluster_check,
             voter_history,
             heartbeat_batcher,
             shared_wal,
@@ -2790,7 +2866,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// optional annotation.** It must be [`engine_applied_index`](Self::
     /// engine_applied_index) read by the caller **before** whatever
     /// observation decided `held` (e.g. before scanning
-    /// [`pending_changes`](Self::pending_changes)) — never after, and never
+    /// [`pending_changes_key_order`](Self::pending_changes_key_order)) — never after, and never
     /// the result of the scan itself. Reading it first gives a valid
     /// *lower* bound: a concurrent apply between the read and the scan can
     /// only make the true state fresher than what's recorded, never make a
@@ -4330,6 +4406,27 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             .snapshot()
     }
 
+    /// Every distinct **(voters, learners)** pair this group has adopted
+    /// since it started (or last recovered), in adoption order — issue
+    /// #944. Unlike [`voter_history`](Self::voter_history) and
+    /// [`learners`](Self::learners) read independently, this pairs each
+    /// recorded voter set with the learner set it changed alongside, so a
+    /// caller can tell whether a member was ever a voter without having
+    /// first appeared as a learner in an earlier entry — the ADR 0058
+    /// Train 1 add-learner-then-promote ordering. A thin passthrough to
+    /// [`RaftCore::config_history`] (`animus-control`), recorded
+    /// synchronously at the one real mutation site rather than sampled
+    /// once per consensus-loop tick like `voter_history` above — see that
+    /// method's own doc for why the learner set specifically needs the
+    /// finer-grained mechanism, and
+    /// `crates/animusd/tests/learner_reconfigure.rs` for the flake this
+    /// closes. A pure accessor — reading it never blocks, proposes, or
+    /// wakes a quiesced group, mirroring [`voter_history`](Self::
+    /// voter_history)'s own contract.
+    pub fn membership_history(&self) -> Vec<(BTreeSet<NodeId>, BTreeSet<NodeId>)> {
+        self.lock().config_history()
+    }
+
     /// The byte offset `peer` has acked so far in an in-flight chunked
     /// `InstallSnapshot` transfer this node is leading — see
     /// [`RaftCore::snapshot_chunk_progress`].
@@ -4450,11 +4547,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// priority order applies unchanged, straight on the voter set.
     ///
     /// Priority order, most urgent first:
-    /// 1. **Remove an extra `Down` voter** (never self) — restores quorum margin
-    ///    immediately; this is failure repair, and the removed node isn't going
-    ///    to ack anything anyway, so there is nothing to wait for. Never touches
-    ///    a learner — a down voter is the only thing this urgent.
-    /// 2. **Drop a learner no longer wanted.** `desired` can change out from
+    /// 1. **Drop a learner no longer wanted.** `desired` can change out from
     ///    under a learner still mid-catch-up (its node crashed or was
     ///    decommissioned, or a rebalance simply picked someone else) — any
     ///    current learner absent from `desired` is stale by construction (a
@@ -4463,25 +4556,58 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     ///    mean every remaining learner is stale) and is removed directly,
     ///    regardless of its liveness or catch-up progress. Without this, a
     ///    replaced learner would wedge every later step forever.
-    /// 3. **Promote a learner that is both still desired and caught up** —
+    /// 2. **Promote a learner that is both still desired and caught up** —
     ///    advances an in-flight move before starting a new one.
-    /// 4. **Add a `desired` member that is neither a voter nor a learner, as a
+    /// 3. **Add a `desired` member that is neither a voter nor a learner, as a
     ///    LEARNER** — never straight to voter. The old voter quorum keeps its
     ///    pre-move margin (and majority size) untouched while the newcomer
     ///    catches up via ordinary log replication/`InstallSnapshot`, instead of
     ///    briefly counting an uncaught-up node toward quorum.
     ///
-    ///    While any `desired` member is still a learner mid-catch-up (steps 2/3
-    ///    didn't apply this tick), no later step fires — in particular a
-    ///    healthy extra voter (step 5) is never removed while a replacement is
-    ///    still proving it can keep up.
+    ///    While any `desired` member is still a learner mid-catch-up (steps
+    ///    1/2 didn't apply this tick), no later step fires — in particular
+    ///    **neither** an extra `Down` voter (step 4) **nor** a healthy extra
+    ///    (step 5) is removed while a replacement is still proving it can
+    ///    keep up.
+    /// 4. **Remove an extra `Down` voter** (never self) — but, since issue
+    ///    #920's fix, only once every `desired` member is already a voter
+    ///    (steps 1–3 above have had their turn, so no replacement is still
+    ///    mid-catch-up as a learner). **Before this fix, a down extra was
+    ///    removed immediately, ahead of steps 1–3** — "restores quorum
+    ///    margin immediately, and the removed node isn't going to ack
+    ///    anything anyway, so there is nothing to wait for." That reasoning
+    ///    holds for a *permanently* dead voter, but a `Down` mark is a
+    ///    500ms-liveness-timeout inference (ADR 0012's `DETECT_TIMEOUT`),
+    ///    not a proof of permanent loss — a routine pod recreation trips it
+    ///    just as readily as a real failure. Removing the old voter before
+    ///    its replacement is safely a voter shrinks the live quorum
+    ///    requirement for the whole in-flight window (e.g. 3 voters → 2,
+    ///    instead of 3 → 4 → 3 via the learner phase); if the rolling
+    ///    operation causing the `Down` mark then goes on to touch a
+    ///    *second* voter (an ordinary next step of the very same rolling
+    ///    restart), the group can permanently lose majority with no
+    ///    recovery path, since the evicted voter's own tablet-host
+    ///    reconciler has already released it and Metadata no longer names
+    ///    it a replica (issue #920's reproduction — see
+    ///    `animusd::sim_cluster_quiesced_rolling_restart`'s ignored
+    ///    investigation probe and ADR 0048's as-built amendment). Ordering
+    ///    the down-extra removal after the add-a-replacement-first
+    ///    discipline steps 1–3 already use closes this: the group never
+    ///    dips below its pre-move voter count when a replacement is
+    ///    already in flight, exactly the ADD-before-REMOVE safety margin
+    ///    the learner phase was built to give every other reconfigure path.
+    ///    A down extra with **no** replacement pending (`desired` simply
+    ///    excludes it, e.g. a policy-driven RF reduction) still gets
+    ///    removed the moment this step is reached — steps 1–3 are no-ops
+    ///    when nothing is missing/mid-catch-up, so this fires the same
+    ///    tick exactly as before.
     /// 5. **Remove an extra *healthy* voter** (never self) — but only once every
     ///    member of `desired` has caught up to this leader's `commit_index`.
     ///    Skipping this gate would let a healthy move (e.g. a rebalance) drop
     ///    quorum to a still-catching-up newcomer, an availability regression
     ///    relative to just leaving the extra replica in place a little longer.
     ///    By the time this step can fire, every `desired` member is already a
-    ///    voter (steps 2–4 handle the learner phase first), so this is exactly
+    ///    voter (steps 1–3 handle the learner phase first), so this is exactly
     ///    the pre-Train-1 step 3, unchanged.
     /// 6. **The only remaining delta is removing the leader's own replica** —
     ///    `change_membership` always rejects that, so instead transfer
@@ -4507,11 +4633,13 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         }
         let me = self.env.node_id();
         // Any extra (non-self) voter, regardless of liveness — used by step 5
-        // (a *healthy* extra). Step 1 below searches independently for a *down*
-        // extra: `extra().filter(down.contains)` would only ever look at the
+        // (a *healthy* extra) and step 4 (a *down* extra, issue #920's fix:
+        // no longer checked first — see that step's own doc above for why).
+        // `extra().filter(down.contains)` would only ever look at the
         // lowest-id extra (bug fixed under ADR 0029's follow-up — see the root
         // CLAUDE.md engineering-practices entry), silently skipping a Down extra
-        // that happens to sort after a healthy one.
+        // that happens to sort after a healthy one, so `down_extra` below still
+        // searches independently.
         let extra = || current.difference(desired).find(|&n| n != &me).cloned();
         let down_extra = || {
             current
@@ -4520,13 +4648,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                 .cloned()
         };
 
-        if let Some(target) = down_extra() {
-            let mut c = current.clone();
-            c.remove(&target);
-            return self.propose_config(c);
-        }
-
-        // Step 2: drop a stale learner (ADR 0058 Train 1's stuck-learner
+        // Step 1: drop a stale learner (ADR 0058 Train 1's stuck-learner
         // cleanup — see the doc above).
         if let Some(stale) = current_learners.iter().find(|n| !desired.contains(*n)) {
             if !matches!(
@@ -4541,7 +4663,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             return None;
         }
 
-        // Step 3: promote a learner that is both still desired and caught up.
+        // Step 2: promote a learner that is both still desired and caught up.
         if let Some(id) = current_learners.iter().find(|n| {
             desired.contains(*n)
                 && self.learner_caught_up(n, RECONFIGURE_LEARNER_CATCH_UP_THRESHOLD)
@@ -4555,14 +4677,15 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         }
 
         // A `desired` member is still mid-catch-up as a learner: nothing else
-        // to do this tick — in particular, never fall through to step 5 and
-        // remove a healthy extra voter while a replacement hasn't yet proven
-        // it can keep up (the whole point of the learner phase).
+        // to do this tick — in particular, never fall through to step 4/5 and
+        // remove a down or healthy extra voter while a replacement hasn't yet
+        // proven it can keep up (the whole point of the learner phase, and,
+        // since issue #920's fix, of the down-extra step too).
         if desired.iter().any(|n| current_learners.contains(n)) {
             return None;
         }
 
-        // Step 4: a `desired` member genuinely missing from both the voter set
+        // Step 3: a `desired` member genuinely missing from both the voter set
         // and the learner set — add it as a LEARNER, never straight to voter.
         if let Some(missing) = desired
             .iter()
@@ -4580,8 +4703,23 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             return None;
         }
 
-        // From here on every `desired` member is already a voter — the
-        // remaining deltas are exactly the pre-Train-1 steps 3/4.
+        // From here on every `desired` member is already a voter (no earlier
+        // step found a stale/mid-catch-up/missing learner) — safe ground for
+        // step 4: remove an extra `Down` voter (issue #920's fix reordered
+        // this after, not before, steps 1–3 — see this method's own doc for
+        // the full reasoning). A down extra with no replacement pending
+        // reaches this exact tick with nothing having fired above, so it is
+        // removed immediately, matching the pre-fix behavior for that case;
+        // a down extra WITH a replacement in flight only reaches here once
+        // that replacement is already promoted, never before.
+        if let Some(target) = down_extra() {
+            let mut c = current.clone();
+            c.remove(&target);
+            return self.propose_config(c);
+        }
+
+        // Step 5: remove an extra *healthy* voter, once every `desired`
+        // member has caught up — the pre-Train-1 step 3/4, unchanged.
         if let Some(healthy_extra) = extra() {
             let commit = self.commit_index();
             let caught_up = desired
@@ -5242,7 +5380,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                 // tablet's kind scope, which always has a non-`0xFF`-ending
                 // prefix (the scope selector byte itself) and so always
                 // yields a finite `physical_bounds` upper bound. Mirrors
-                // `pending_changes`'s identical fallback.
+                // `pending_changes_key_order`'s identical fallback.
                 None => Vec::new(),
             },
         };
@@ -5547,8 +5685,8 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         Some(rows)
     }
 
-    /// Every pending change-log record this tablet holds, in **commit order**
-    /// (ADR 0041 §4): `(record key, encoded record)`.
+    /// Every pending change-log record this tablet holds, in **physical key
+    /// order** — `(record key, encoded record)`.
     ///
     /// A whole-`KIND_CHANGE`-scope sweep, bounded by this tablet's own scope
     /// (`physical_bounds`, never `entries()` — a node's tablets share one
@@ -5559,11 +5697,20 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// general API bounded stops an accidental full-tablet read being a typo
     /// away.
     ///
-    /// Key order is commit order because a record's key ends in its own commit
-    /// HLC (see [`KvCommand::KindBatch`]'s `change_log`), so a drain processing
-    /// these front-to-back sees each key's mutations in the order they
-    /// committed.
-    pub async fn pending_changes(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
+    /// **This is NOT commit order.** A record's physical key is `token ||
+    /// escape(pk) || packed_hlc || ordinal` (see [`KvCommand::KindBatch`]'s
+    /// `change_log`, and `materialize_derived`'s own doc for the trailing
+    /// `hlc`/`ordinal` pair) — the token leads, so this scan is grouped by
+    /// partition first and by commit HLC only within one partition. Across
+    /// partitions the order is whatever the hash ring put them in, not commit
+    /// order (ADR 0043 §A3 step 1 says this explicitly: "key order is
+    /// token-then-pk-then-HLC, not global commit order"). A caller that needs
+    /// HLC/commit order — a seal, a hot read, anything feeding a
+    /// `GetRecords`-shaped consumer — must sort explicitly by the trailing
+    /// `(packed_hlc, ordinal)` pair, exactly as `seal_now`/`hot_read`
+    /// (`animusd::index_drain`) already do; don't rely on this method's own
+    /// return order for that.
+    pub async fn pending_changes_key_order(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
         let scope = &self.kind_scopes[KIND_CHANGE as usize];
         let (start, end) = scope.physical_bounds();
         let Some(end) = end else {
@@ -7266,6 +7413,14 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
         .lock()
         .expect("raftkv core poisoned")
         .drain_pending_install();
+    // Issue #811: whether this pass just installed a fully-received
+    // snapshot — see the compaction section below, which this flag forces
+    // into even though `behind` (computed from `engine_applied` vs.
+    // `snapshot_index`) is typically `0` immediately after an install (both
+    // are set to the same `last_index` in the same step: `engine_applied`
+    // here, `snapshot_index` synchronously by `RaftCore::
+    // handle_install_snapshot` on the consensus loop).
+    let just_installed_snapshot = pending_install.is_some();
     if let Some((last_index, bytes)) = pending_install {
         // Issue #554: the durable applied watermark rides in the SAME
         // `merge_batch` as every row this image installs — `install_engine_
@@ -9100,11 +9255,57 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
         *compact_defer_since = None;
         *compact_defer_progress = None;
     }
+    // Issue #811: a just-completed `InstallSnapshot` (`just_installed_
+    // snapshot`, above) must force a WAL rewrite in THIS pass, same as
+    // `threshold_hit`/`image_needed` — never deferred by the in-flight-
+    // transfer check above (that check exists only for a THRESHOLD-driven
+    // base advance; this one is this node's own receive, unrelated to
+    // whatever it might separately be sending elsewhere as a leader).
+    //
+    // Without this, `RaftCore::handle_install_snapshot`'s successful-install
+    // path (`animus-control::raft`) durably fixes up the CORE's in-memory
+    // `snapshot_index`/log/`snapshot_dirty` synchronously on the consensus
+    // loop, but nothing ever flushes that to the WAL FILE: `behind` here is
+    // `engine_applied.saturating_sub(snapshot_index)`, and immediately after
+    // an install both are set to the identical `last_index` in the same
+    // step, so `threshold_hit` is false; `image_needed` is unrelated (it
+    // fires only when a PEER needs a snapshot FROM this node); and
+    // `RaftCore::has_unflushed_wal` — the consensus loop's own ordinary
+    // per-message persist gate — checks only the pending log-append queue
+    // and the current term/vote, never `snapshot_dirty`. A replica that
+    // caught up ENTIRELY via `InstallSnapshot` (no log entry of its own ever
+    // logged) can therefore sit fully caught-up with a WAL file that still
+    // reads back empty. A later genuine process restart (`sim.stop` + a
+    // fresh `RaftKvNode::start` on the same engine — never `sim.crash`/
+    // `sim.restart`, which mute/re-arm the SAME still-live in-memory `Raft
+    // Core` and never touch the WAL at all) then recovers from that empty
+    // WAL: `drive`'s `fresh_group` check is true, so `RaftCore::recovered`
+    // is skipped and the fresh core keeps `snapshot_index == last_applied ==
+    // 0` — while `engine_applied` is correctly reseeded from the ENGINE's
+    // own durable watermark (already caught up, e.g. `201`). `behind` is
+    // then permanently `engine_applied` itself: `snapshot_upto(ea)` clamps
+    // to `ea.min(last_applied)`, and `last_applied` is ALSO stuck at `0` on
+    // this fresh, never-recovered core, so it can never advance
+    // `snapshot_index` past `0` — `behind` never shrinks, `threshold_hit`
+    // (recomputed fresh every pass) is `true` forever, and this whole apply
+    // task spins `did_work = true` on every single pass with no forward
+    // progress: `apply_loop` never reaches its idle
+    // `select(ApplyPending, sleep(APPLY_SAFETY_POLL))`, so `SimEnv`'s
+    // executor never advances virtual time and `run_for`/`run_until` never
+    // return (one CPU core pinned indefinitely — issue #811). Forcing the
+    // WAL rewrite here, in the SAME pass that installs the snapshot,
+    // durably records `snapshot_index`/the (here, empty) log BEFORE any
+    // restart can ever race it, closing the gap at its source rather than
+    // papering over the eventual symptom. Regression:
+    // `tests/restart_after_install_snapshot.rs`.
+    let just_installed_snapshot_needs_wal_rewrite = just_installed_snapshot;
     // Skip compaction once a shutdown is requested: it is only a WAL-bounding
     // optimization (the engine + un-truncated WAL stay consistent without it), and
     // starting a full WAL rewrite while the env is being torn down races the task
     // abort — the `replace` can then fail on a half-gone data dir.
-    if (threshold_hit || image_needed) && !halted.load(Ordering::SeqCst) {
+    if (threshold_hit || image_needed || just_installed_snapshot_needs_wal_rewrite)
+        && !halted.load(Ordering::SeqCst)
+    {
         // The on-demand image: a slow whole-engine scan, done with no locks held,
         // and only when a follower is actually waiting on a snapshot.
         let image = if image_needed {
@@ -9604,6 +9805,24 @@ struct DriveState<E: Env, S: StorageEngine> {
     /// genuine first formation instead of waiting out the randomized
     /// election timeout — see [`RaftKvNode::start_hosted_campaigning`]'s doc.
     campaign_immediately: bool,
+    /// Issue #945: skip the issue #900/#667 boot-time cluster check
+    /// entirely for this fresh group, because the caller already knows —
+    /// by construction, not by convention — that an empty local WAL here
+    /// can never be an established voter's wiped disk. `true` for
+    /// `campaign_immediately` (the one replica proven fresh by being the
+    /// parent's own leader at an in-place split fork) **and** for every
+    /// other replica of that same [`materialize_split_child`](crate::host)
+    /// call (a brand new `TabletId` minted once, at the fork, from the
+    /// parent's own committed entry — there is no prior identity for THIS
+    /// tablet id to have been wiped). `false` for every ordinary fresh
+    /// hosting (`CreateTablet`, an ADR 0060 growth join, a
+    /// reconciler-adopted replica of an already-established tablet) —
+    /// those genuinely are ambiguous with a wiped voter and must still run
+    /// the check. See `start_hosted_split_follower_with_batcher_and_shared_wal`'s
+    /// doc for why this can't just be `campaign_immediately` itself: only
+    /// ONE replica per child ever campaigns, but EVERY replica of that
+    /// child is equally safe to skip the check.
+    skip_cluster_check: bool,
     /// See [`RaftKvNode::voter_history`]'s doc — threaded through so this
     /// loop can record the initial (post-recovery) config and every later
     /// distinct one it adopts.
@@ -9748,6 +9967,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         external_quiesce_veto,
         external_quiesce_veto_fresh_through,
         campaign_immediately,
+        skip_cluster_check,
         voter_history,
         heartbeat_batcher,
         shared_wal,
@@ -9801,7 +10021,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         let recovered =
             RaftCore::recovered(env.node_id(), &all_nodes, state, env.now(), env.next_u64());
         *core.lock().expect("raftkv core poisoned") = recovered;
-    } else if !campaign_immediately {
+    } else if !skip_cluster_check {
         // Issue #900 (P0 Raft safety, mirrors issue #667's control-plane
         // fix — `animus-control::node::drive`'s own identical branch, ADR
         // 0009's 2026-09-15 amendment): an empty per-tablet WAL is exactly
@@ -9824,23 +10044,29 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         // `RaftMsg` (including these two) generically through
         // `RaftCore::handle`.
         //
-        // Deliberately gated on `!campaign_immediately`: that flag (ADR
-        // 0058 Train 2 rung 4) is set ONLY for the one replica the caller
-        // has already proven, by construction, to be the parent's own
-        // leader at an in-place split fork — never a wiped voter (a
-        // restart can't set this flag; only `materialize_split_child`
-        // does, exactly once, at the fork itself) — and its whole point is
-        // to win the race against this group's own cold randomized
-        // election timeout by campaigning synchronously before this loop
-        // ever starts. Running the cluster check for that one replica too
-        // would gate `campaign_now` (below) on `cluster_check_pending`,
-        // silently degrading the deterministic-first-leader optimization
-        // to an ordinary cold timeout on every single split — a real,
-        // ADR-documented behavior this fix must not weaken. Every other
-        // fresh-group replica (every split child that is NOT the
-        // immediate-campaign leader, an ordinary `CreateTablet`, and a
-        // genuinely wiped voter restarting into an established group)
-        // still goes through the check.
+        // Gated on `!skip_cluster_check`, NOT `!campaign_immediately`
+        // (issue #945 fix — see `DriveState::skip_cluster_check`'s own
+        // doc): `campaign_immediately` (ADR 0058 Train 2 rung 4) is set for
+        // exactly ONE replica per split child — the parent's own leader at
+        // the fork — but EVERY replica of that same child is equally
+        // provably fresh by construction (`materialize_split_child` mints
+        // a brand new `TabletId` once, at the fork, from the parent's own
+        // committed entry; there is no prior identity for that tablet id
+        // to have been wiped). The original `!campaign_immediately` gate
+        // only exempted the one campaigning replica, so a real production
+        // split still gated its OTHER replicas' `handle_request_vote` on
+        // their own `cluster_check_pending` — which refuses to grant a
+        // REAL vote while pending (see that function's own comment) — so
+        // the "no added latency" deterministic-first-leader optimization
+        // was silently degraded to "wait one probe round trip" on every
+        // split despite this comment's own prior claim otherwise. Callers
+        // now pass `skip_cluster_check` independently of
+        // `campaign_immediately`, `true` for every replica
+        // `materialize_split_child` hosts (both the campaigning one and
+        // every sibling), `false` for every ordinary fresh hosting
+        // (`CreateTablet`, an ADR 0060 growth join, a reconciler-adopted
+        // replica of an already-established tablet) — those still
+        // genuinely need the check.
         let initial_probe = {
             let mut c = core.lock().expect("raftkv core poisoned");
             c.begin_cluster_check(env.now(), env.next_u64())

@@ -765,12 +765,37 @@ pub enum Metric {
     /// anywhere yet" case only in that this confirms more than one node's
     /// own view was checked, not just this one's.
     CpRouteFanoutExhausted,
+    // --- Housekeeping-vs-client propose attribution (issue #974) ---
+    // Appended after the shared-WAL variant above; every earlier variant's
+    // slot and the text-export order stay stable, so the snapshot remains
+    // byte-reproducible. `CpProposalsAccepted` counts every accepted
+    // propose on a CP-data group regardless of who issued it — a genuine
+    // client write, but also a background node-local loop's own upkeep
+    // write (the ADR 0049 change-log hot-trim janitor's `KindBatch`
+    // tombstone deletes, `animusd::index_drain::trim_janitor` — the only
+    // one of that loop's five per-tablet arms that runs unconditionally,
+    // even on a plain table with no GSI/stream/PITR consumer, since a
+    // marker record is never itself consumer-visible). Both go through the
+    // identical `ClientCtx::cp_kind_write_raw`/`RaftKvNode::put_kind_batch`
+    // path, so nothing below `animus-cp-data`'s propose choke point can
+    // tell them apart — this counter is recorded one layer up, at
+    // `trim_janitor`'s own call site, the one place that already knows a
+    // write is housekeeping rather than a reaction to a client request.
+    /// One `KindBatch` propose `trim_janitor` issued to delete already-
+    /// consumed `KIND_CHANGE` marker/change-log rows was accepted —
+    /// `CpProposalsAccepted`'s own housekeeping share. Subtract this
+    /// counter's delta from `CpProposalsAccepted`'s to recover "proposals a
+    /// client write actually caused" over any window, which is what
+    /// exposed the mechanism (`batch_write.rs::batched_write_beats_per_key`
+    /// occasionally counting a same-tick trim landing inside its own
+    /// measurement window as one of the batch's own proposals).
+    CpHousekeepingProposalsAccepted,
 }
 
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 95] = [
+    pub const ALL: [Metric; 96] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -866,6 +891,7 @@ impl Metric {
         Metric::CpSharedWalGcRewrites,
         Metric::CpRouteFanoutRecoveredLeader,
         Metric::CpRouteFanoutExhausted,
+        Metric::CpHousekeepingProposalsAccepted,
     ];
 
     /// The stable exported name of this metric (snake_case, used as the text
@@ -968,6 +994,7 @@ impl Metric {
             Metric::CpSharedWalGcRewrites => "cp_shared_wal_gc_rewrites",
             Metric::CpRouteFanoutRecoveredLeader => "cp_route_fanout_recovered_leader",
             Metric::CpRouteFanoutExhausted => "cp_route_fanout_exhausted",
+            Metric::CpHousekeepingProposalsAccepted => "cp_housekeeping_proposals_accepted",
         }
     }
 

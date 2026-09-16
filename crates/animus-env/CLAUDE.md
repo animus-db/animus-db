@@ -302,6 +302,51 @@ the production implementation; the deterministic implementation lives in
   error (peer restarted) the stale stream is dropped and the send reconnects
   **once**, then surfaces the error — still fire-and-forget, and the frame in
   flight when a peer dies can be lost (higher layers retry, as before).
+- **Every pooled outbound and accepted socket carries TCP keepalive +
+  `TCP_USER_TIMEOUT` (issue #924)** — the reconnect-once path above only
+  fires on a write **error**, and a peer that vanishes with no FIN/RST at
+  all (a Kubernetes pod recreated at a new IP, its old network namespace
+  torn down before its final FIN got out) never produces one: every write
+  into the half-open connection keeps "succeeding" into this host's own
+  kernel send buffer, so the OS's own TCP retransmission timer — commonly
+  13–15 minutes (`tcp_retries2`) — was the only thing standing between
+  this and detection. `harden_pooled_socket` (`prod.rs`) reaches through
+  `socket2::SockRef` (no ownership transfer — `tokio::net::TcpStream`
+  itself exposes no keepalive/user-timeout setter) to set `TCP_KEEPIDLE`/
+  `TCP_KEEPINTVL`/`TCP_KEEPCNT` on every socket, plus `TCP_USER_TIMEOUT`
+  on Linux/Android/Fuchsia/Cygwin (the only targets `socket2` supports it
+  on) — called from both `connect_nodelay` (dial side) and `spawn_accept`
+  (accept side, before any TLS handshake or frame read), so detection is
+  symmetric regardless of which side of the connection this node was on,
+  and identical whether or not TLS is layered on top (both operate below
+  the TLS record layer). **Detection bound: 5 seconds** on Linux
+  (`POOLED_SOCKET_DEAD_PEER_TIMEOUT`) — see that constant's own doc for
+  the full worked-through mechanism, why keepalive alone (the fallback on
+  platforms without `TCP_USER_TIMEOUT`) cannot distinguish "peer vanished"
+  from "peer's kernel alive but its application never reads" (a live
+  kernel always acks a keepalive probe regardless of application read
+  state), and ADR 0003's ProdEnv notes / ADR 0060's issue #924 amendment
+  for the incident and the rollout-budget cross-check. Best-effort: a
+  platform/sandbox that rejects one of these `setsockopt` calls degrades
+  to "no early detection on this socket" (logged at `warn`) rather than
+  failing the connect/accept — the pre-#924 behavior is a strict subset of
+  every platform's outcome here. Regression:
+  `send_reconnects_after_peer_vanishes_without_fin_or_rst` (`prod::tests`)
+  — see that test's own doc for why an `iptables OUTPUT -d <ip> DROP` rule
+  is the one hermetic, single-host construction that actually reproduces
+  "no ack, ever" (a socket close always sends FIN/RST; an application that
+  merely stops reading is still kernel-acked either way). **A tempting
+  companion fix was tried and reverted**: also dropping the cached
+  connection whenever `SEND_TIMEOUT` merely *elapses* (not just on a
+  genuine write error) sounds like harmless extra robustness, but under
+  sustained host contention it is actively harmful — a `SEND_TIMEOUT`
+  elapsing is routinely just scheduling latency on an otherwise-healthy
+  connection, and discarding it forces the *next* chunk to pay a fresh
+  connect, which can itself exceed `SEND_TIMEOUT` under the same load,
+  repeating forever; this turned `animus-control`'s
+  `large_metadata_catch_up_stays_live` (a ~1100-chunk streaming
+  `InstallSnapshot`) from "slow" into "zero bytes ever delivered" on a
+  loaded box. See `docs/lessons/code-patterns/` for the general form.
 - **`Coresident`/`sibling` (ADR 0017 D) is gone (ADR 0040 PR5)**, superseded
   by multiplexed streams (ADR 0026, below): co-hosting a second protocol
   instance (a tablet's CP Raft group) rides a distinct *stream* on the node's

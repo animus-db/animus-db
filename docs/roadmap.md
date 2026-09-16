@@ -34,13 +34,11 @@ landed 2026-09-06 and its roadmap section is removed the same way).
 ## 0. Corrections: the docs say "missing", the code says "built"
 
 These are not feature gaps. They are prose that lags the code. Most of the
-rows this section used to carry were fixed by the stale-prose sweep; what's
-left is the one row below with nowhere in the docs to point a fix at, plus
-the still-true paragraph after the table.
+rows this section used to carry were fixed by the stale-prose sweep.
 
 | Prose claim | Where | Reality |
 |---|---|---|
-| Read-path counters for ReadIndex vs eventual reads "missing" | (this audit's first pass) | `CpReadBarriersServed/TimedOut`, `CpEventualReads{Local,Forwarded,FellBack}` exist and surface in `/admin/metrics` |
+| Read-path counters for ReadIndex vs eventual reads "missing" | Fixed in [`docs/getting-started.md`](getting-started.md#where-metrics-surface) (issue #851) | `CpReadBarriersServed/TimedOut`, `CpEventualReads{Local,Forwarded,FellBack}` exist and surface in `/admin/metrics` |
 
 ---
 

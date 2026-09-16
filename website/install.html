@@ -303,7 +303,7 @@ table.put_item(Item={<span class="s">"id"</span>: <span class="s">"a-2"</span>, 
 <pre><span class="p">$</span> <span class="k">animusd gen-config --nodes 3 --host 10.0.0.1 &gt; cluster.json</span></pre>
           </div>
           <p>
-            The generated config lists every node's identity and its seven listener addresses.
+            The generated config lists every node's identity and its six listener addresses.
             Edit the hosts so each entry names the right machine, then copy the same file to
             all of them. Ports start at <code>--base-port</code> (7100 by default).
           </p>
@@ -324,10 +324,10 @@ table.put_item(Item={<span class="s">"id"</span>: <span class="s">"a-2"</span>, 
           <h3>Check it came up</h3>
           <div class="code">
             <div class="code-head"><span class="lights"><i></i><i></i><i></i></span><span class="title">verify</span></div>
-<pre><span class="p">$</span> <span class="k">animus admin status 10.0.0.1:7104</span>
-<span class="p">$</span> <span class="k">animus admin health 10.0.0.1:7104</span></pre>
+<pre><span class="p">$</span> <span class="k">animus admin status 10.0.0.1:7103</span>
+<span class="p">$</span> <span class="k">animus admin health 10.0.0.1:7103</span></pre>
           </div>
-          <p>Or open the dashboard at <code>http://10.0.0.1:7104</code>.</p>
+          <p>Or open the dashboard at <code>http://10.0.0.1:7103</code>.</p>
         </li>
       </ol>
     </section>
@@ -341,15 +341,15 @@ table.put_item(Item={<span class="s">"id"</span>: <span class="s">"a-2"</span>, 
       </p>
       <div class="code">
         <div class="code-head"><span class="lights"><i></i><i></i><i></i></span><span class="title">grow</span></div>
-<pre><span class="c"># on the new machine — 7105 is node 0's intra port</span>
-<span class="p">$</span> <span class="k">animusd join --seed 10.0.0.1:7105 --base-port 7100 --dir /var/lib/animusdb</span></pre>
+<pre><span class="c"># on the new machine — 7104 is node 0's intra port</span>
+<span class="p">$</span> <span class="k">animusd join --seed 10.0.0.1:7104 --base-port 7100 --dir /var/lib/animusdb</span></pre>
       </div>
       <p>Removing one is a drain followed by a decommission, so replicas move off before the node goes away:</p>
       <div class="code">
         <div class="code-head"><span class="lights"><i></i><i></i><i></i></span><span class="title">shrink</span></div>
-<pre><span class="p">$</span> <span class="k">animus admin drain 10.0.0.1:7104 n3</span>
-<span class="p">$</span> <span class="k">animus admin drain-status 10.0.0.1:7104 n3</span>
-<span class="p">$</span> <span class="k">animus admin decommission 10.0.0.1:7104 n3</span></pre>
+<pre><span class="p">$</span> <span class="k">animus admin drain 10.0.0.1:7103 n3</span>
+<span class="p">$</span> <span class="k">animus admin drain-status 10.0.0.1:7103 n3</span>
+<span class="p">$</span> <span class="k">animus admin decommission 10.0.0.1:7103 n3</span></pre>
       </div>
     </section>
 
@@ -370,7 +370,7 @@ table.put_item(Item={<span class="s">"id"</span>: <span class="s">"a-2"</span>, 
 <span class="p">$</span> <span class="k">animusd data --config cluster.json --node 3</span>
 
 <span class="c"># or let a data node join by seed instead of by config</span>
-<span class="p">$</span> <span class="k">animusd data --seed 10.0.0.1:7105 --base-port 7200</span></pre>
+<span class="p">$</span> <span class="k">animusd data --seed 10.0.0.1:7104 --base-port 7200</span></pre>
       </div>
       <p>
         To try the shape without eight machines, <code>animusd --cluster-control 3 --cluster-data 5</code>
@@ -381,8 +381,8 @@ table.put_item(Item={<span class="s">"id"</span>: <span class="s">"a-2"</span>, 
     <section id="ports">
       <h2>Ports</h2>
       <p>
-        Each node owns a block of seven consecutive ports, starting at its base port
-        (<code>7100</code> for node 0 in a generated config, then <code>7107</code>, <code>7114</code>, and so on).
+        Each node owns a block of six consecutive ports, starting at its base port
+        (<code>7100</code> for node 0 in a generated config, then <code>7106</code>, <code>7112</code>, and so on).
       </p>
       <div class="table-scroll">
         <table>
@@ -391,17 +391,16 @@ table.put_item(Item={<span class="s">"id"</span>: <span class="s">"a-2"</span>, 
             <tr><td>+0</td><td><code>7100</code></td><td>internal</td><td>Raft traffic between nodes</td><td><span class="pill no">Cluster-internal</span></td></tr>
             <tr><td>+1</td><td><code>7101</code></td><td>client</td><td>The native length-prefixed protocol the <code>animus</code> CLI speaks</td><td><span class="pill part">Trusted</span></td></tr>
             <tr><td>+2</td><td><code>7102</code></td><td>dynamo</td><td>DynamoDB JSON over HTTP, plus <code>GET /metrics</code></td><td><span class="pill part">Trusted</span></td></tr>
-            <tr><td>+3</td><td><code>7103</code></td><td>(reserved)</td><td>Bound for a second wire protocol that these docs don't cover.</td><td><span class="pill no">Cluster-internal</span></td></tr>
-            <tr><td>+4</td><td><code>7104</code></td><td>admin</td><td>Admin JSON API and the operator dashboard</td><td><span class="pill no">Cluster-internal</span></td></tr>
-            <tr><td>+5</td><td><code>7105</code></td><td>intra</td><td>Node-to-node request forwarding and metadata mirroring; the address to <code>--seed</code></td><td><span class="pill no">Cluster-internal</span></td></tr>
-            <tr><td>+6</td><td><code>7106</code></td><td>console</td><td>The data console (not bound on control-only nodes)</td><td><span class="pill no">Cluster-internal</span></td></tr>
+            <tr><td>+3</td><td><code>7103</code></td><td>admin</td><td>Admin JSON API and the operator dashboard</td><td><span class="pill no">Cluster-internal</span></td></tr>
+            <tr><td>+4</td><td><code>7104</code></td><td>intra</td><td>Node-to-node request forwarding and metadata mirroring; the address to <code>--seed</code></td><td><span class="pill no">Cluster-internal</span></td></tr>
+            <tr><td>+5</td><td><code>7105</code></td><td>console</td><td>The data console (not bound on control-only nodes)</td><td><span class="pill no">Cluster-internal</span></td></tr>
           </tbody>
         </table>
       </div>
       <p class="muted" style="margin-top:14px">
         Only the DynamoDB port can verify a caller, and only if you turn on SigV4 — off by
         default. Everywhere else "trusted" means a network you control. Keep the internal,
-        reserved, intra, admin and console ports off any externally reachable address.
+        intra, admin and console ports off any externally reachable address.
       </p>
     </section>
 
@@ -460,7 +459,7 @@ table.put_item(Item={<span class="s">"id"</span>: <span class="s">"a-2"</span>, 
 
       <h3>Address already in use</h3>
       <p>
-        Every node needs its own block of seven ports. In a generated config the blocks are
+        Every node needs its own block of six ports. In a generated config the blocks are
         contiguous, so two nodes on one host must be given different base ports.
       </p>
 

@@ -139,10 +139,24 @@ impl PayloadHash {
 
 /// One HTTP request's SigV4-relevant surface, enough to sign it.
 ///
-/// `query` is the **raw, undecoded** query string with no leading `?`
-/// (empty if none) — mirroring `animus_dynamo::sigv4::SigV4Request::query`'s
-/// exact contract: [`canonical_request`] percent-encodes and sorts it
-/// itself. `headers` carries any *extra* headers the caller wants signed
+/// `query` is the **raw (unescaped) key/value pairs**, in any order — empty
+/// for no query string. **Deliberately typed pairs, not a pre-joined
+/// `"k=v&k=v"` string**: [`canonical_request`]/[`canonical_query_string`]
+/// percent-encode each side and sort the pairs, but if a caller joined the
+/// pairs into a string first (with a literal `&` between them) and handed
+/// *that* over, a value containing its own literal `&` or `=` would be
+/// indistinguishable from a separator — exactly the bug issue #855 found in
+/// `client::S3Client::execute` (an `S3KeyPrefix` containing `&` fabricated
+/// extra query parameters after a join-then-split round trip). Passing raw
+/// pairs instead of a string closes that off by construction: there is no
+/// intermediate joined representation to mis-parse. This diverges from
+/// `animus_dynamo::sigv4::SigV4Request::query`'s string contract
+/// deliberately — that type parses an already-received **wire** query
+/// string (where a literal `&`/`=` inside a value is impossible, since the
+/// sender must have percent-encoded it), a different value domain from this
+/// crate's outbound signing path, which builds a query from raw
+/// (unescaped) values it does not control (see `crate::client`'s module
+/// doc). `headers` carries any *extra* headers the caller wants signed
 /// beyond `host`/`x-amz-date`/`x-amz-content-sha256`, which [`sign_request`]
 /// adds automatically — do not pass those three in here.
 #[derive(Debug, Clone, Copy)]
@@ -154,8 +168,9 @@ pub struct RequestToSign<'a> {
     /// The `Host` header value (and the `ServerName` a TLS transport would
     /// verify against).
     pub host: &'a str,
-    /// The raw query string, no leading `?`.
-    pub query: &'a str,
+    /// The raw (unescaped) query key/value pairs — see this struct's own
+    /// doc for why this is typed pairs, not a joined string.
+    pub query: &'a [(&'a str, &'a str)],
     /// Extra headers to sign, beyond the three [`sign_request`] adds itself.
     pub headers: &'a BTreeMap<String, String>,
     pub payload_sha256_hex: &'a PayloadHash,
@@ -229,17 +244,20 @@ pub fn sign_request(
 /// `payload_hash` (unlike `animus_dynamo::sigv4::canonical_request`, which
 /// always hashes `req.body` itself — this crate's caller may want
 /// `UNSIGNED-PAYLOAD`, so the hash is a parameter here, not derived).
+/// `query_pairs` are raw (unescaped) key/value pairs — see
+/// [`RequestToSign::query`]'s doc for why this takes pairs, not a joined
+/// string.
 #[must_use]
 pub fn canonical_request(
     method: &str,
     uri: &str,
-    query: &str,
+    query_pairs: &[(&str, &str)],
     headers: &BTreeMap<String, String>,
     signed_headers: &[&str],
     payload_hash: &str,
 ) -> String {
     let canon_uri = canonical_uri_s3(uri);
-    let canon_query = canonical_query_string(query);
+    let canon_query = canonical_query_string(query_pairs);
     let mut headers_block = String::new();
     for name in signed_headers {
         let raw = headers.get(*name).map(String::as_str).unwrap_or("");
@@ -358,14 +376,18 @@ pub fn parse_authorization(value: &str) -> Option<ParsedAuthorization> {
 /// `parsed.signed_headers` names (including `x-amz-date`, needed to derive
 /// the string-to-sign's own timestamp line) — a name absent from `headers`
 /// contributes an empty canonical value, exactly like [`canonical_request`]
-/// does for [`sign_request`] itself.
+/// does for [`sign_request`] itself. `query_pairs` are raw (unescaped)
+/// key/value pairs, same contract as [`RequestToSign::query`] — a caller
+/// holding an already-encoded **wire** query string must recover pairs from
+/// it with [`parse_wire_query_pairs`] (split before decoding), never by
+/// decoding the whole string and re-splitting it.
 #[must_use]
 pub fn verify_signature(
     parsed: &ParsedAuthorization,
     secret_access_key: &str,
     method: &str,
     uri: &str,
-    query: &str,
+    query_pairs: &[(&str, &str)],
     headers: &BTreeMap<String, String>,
     payload_hash: &str,
 ) -> bool {
@@ -376,7 +398,7 @@ pub fn verify_signature(
     let creq = canonical_request(
         method,
         uri,
-        query,
+        query_pairs,
         headers,
         &signed_header_refs,
         payload_hash,
@@ -465,29 +487,59 @@ pub(crate) fn canonical_uri_s3(path: &str) -> String {
         .join("/")
 }
 
-/// The SigV4 canonical query string: parses a **raw, undecoded** `&`-joined
-/// `key=value` query string, percent-encodes each side once, and sorts by
-/// the encoded key then the encoded value. Copied from `animus_dynamo::
-/// sigv4::canonical_query_string` (same algorithm, same "raw in, canonical
-/// out" contract) — see this module's own doc for why this crate doesn't
-/// depend on that one instead.
-pub(crate) fn canonical_query_string(query: &str) -> String {
-    if query.is_empty() {
+/// The SigV4 canonical query string: takes **raw (unescaped) key/value
+/// pairs**, percent-encodes each side once, and sorts by the encoded key
+/// then the encoded value (the SigV4 rule for duplicate keys). Unlike
+/// `animus_dynamo::sigv4::canonical_query_string` (which parses an
+/// already-received wire query string by splitting on `&`), this function
+/// takes pairs directly and never splits a joined string at all — see
+/// [`RequestToSign::query`]'s doc for why: this crate's own caller
+/// (`crate::client::S3Client::execute`) builds a query from raw values it
+/// does not control, and a value containing a literal `&` would make a
+/// split-based parse fabricate extra pairs (issue #855).
+pub(crate) fn canonical_query_string(pairs: &[(&str, &str)]) -> String {
+    if pairs.is_empty() {
         return String::new();
     }
-    let mut pairs: Vec<(String, String)> = query
-        .split('&')
-        .map(|part| {
-            let (k, v) = part.split_once('=').unwrap_or((part, ""));
-            (percent_encode(k.as_bytes()), percent_encode(v.as_bytes()))
-        })
+    let mut encoded: Vec<(String, String)> = pairs
+        .iter()
+        .map(|(k, v)| (percent_encode(k.as_bytes()), percent_encode(v.as_bytes())))
         .collect();
-    pairs.sort();
-    pairs
+    encoded.sort();
+    encoded
         .into_iter()
         .map(|(k, v)| format!("{k}={v}"))
         .collect::<Vec<_>>()
         .join("&")
+}
+
+/// Parse an already-canonical (percent-encoded) **wire** query string —
+/// e.g. the part of `HttpRequest::uri` after `?` — into raw `(key, value)`
+/// pairs, the inverse of [`canonical_query_string`]. Used only by
+/// [`crate::fake`], which receives a real wire request and must recover the
+/// raw pairs it was signed from to re-verify the signature.
+///
+/// Splits on the wire-encoded `&`/`=` **before** decoding anything, which
+/// is safe by construction: in a well-formed, already-percent-encoded query
+/// string, a literal `&` or `=` cannot occur inside a key or value (the
+/// sender must have escaped it to `%26`/`%3D`), so every separator this
+/// naive split finds is a real one. Decoding the whole string first and
+/// *then* splitting it — as an earlier draft of `crate::fake` did — would
+/// reintroduce the identical defect issue #855 fixed on the signing side: a
+/// decoded value's own literal `&` becomes indistinguishable from a real
+/// separator.
+#[cfg(any(test, feature = "fake"))]
+pub(crate) fn parse_wire_query_pairs(wire_query: &str) -> Vec<(String, String)> {
+    if wire_query.is_empty() {
+        return Vec::new();
+    }
+    wire_query
+        .split('&')
+        .map(|part| {
+            let (k, v) = part.split_once('=').unwrap_or((part, ""));
+            (percent_decode(k), percent_decode(v))
+        })
+        .collect()
 }
 
 /// Trim leading/trailing whitespace and collapse any run of internal spaces
@@ -667,7 +719,7 @@ mod tests {
             method: "GET",
             uri: "/test.txt",
             host: "examplebucket.s3.amazonaws.com",
-            query: "",
+            query: &[],
             headers: &extra,
             payload_sha256_hex: &payload_hash,
             timestamp: "20130524T000000Z",
@@ -716,7 +768,7 @@ mod tests {
             method: "PUT",
             uri: "/bucket/key",
             host: "s3.amazonaws.com",
-            query: "",
+            query: &[],
             headers: &empty,
             payload_sha256_hex: &PayloadHash::Unsigned,
             timestamp: "20150830T123600Z",
@@ -743,7 +795,7 @@ mod tests {
             method: "PUT",
             uri: "/my-bucket/my/key.txt",
             host: "127.0.0.1:9000",
-            query: "",
+            query: &[],
             headers: &empty,
             payload_sha256_hex: &payload_hash,
             timestamp: "20240101T000000Z",
@@ -805,6 +857,69 @@ mod tests {
         // own *encoding* convention, not a decoding requirement).
         assert_eq!(percent_decode("%2f"), "/");
         assert_eq!(percent_decode("%2F"), "/");
+    }
+
+    // --- issue #855 regression coverage ----------------------------------
+
+    #[test]
+    fn canonical_query_string_encodes_a_value_containing_ampersand_equals_space_and_non_ascii() {
+        // The exact failure mode issue #855 describes: a customer-supplied
+        // `S3KeyPrefix` containing a literal `&` used to be joined into a
+        // raw `"k=v&k=v"` string and then re-split on `&`, truncating the
+        // value at the embedded `&` and fabricating a spurious second pair.
+        // Taking pairs directly (this function's whole point) makes that
+        // representation impossible: there is no joined string to mis-split.
+        let pairs: &[(&str, &str)] = &[("prefix", "teamA&teamB=x c/\u{2603}")];
+        let out = canonical_query_string(pairs);
+        // Exactly one `prefix=...` pair — no fabricated second parameter.
+        assert_eq!(out.matches('&').count(), 0, "no spurious pair in {out:?}");
+        let (k, v) = out.split_once('=').expect("one key=value pair");
+        assert_eq!(k, "prefix");
+        assert_eq!(
+            percent_decode(v),
+            "teamA&teamB=x c/\u{2603}",
+            "decoding the wire value recovers the original raw value"
+        );
+        // `/` is a reserved character in SigV4 query encoding (unlike the
+        // S3 URI-path rule, which preserves it) — must come out as `%2F`.
+        assert!(v.contains("%2F"), "expected %2F in {v:?}");
+        // Space must be `%20`, never `+`.
+        assert!(v.contains("%20"), "expected %20 in {v:?}");
+        assert!(!v.contains('+'), "space must not encode as '+' in {v:?}");
+    }
+
+    #[test]
+    fn canonical_query_string_sorts_duplicate_keys_by_value() {
+        // SigV4: sort by encoded key, then by encoded value for ties.
+        let pairs: &[(&str, &str)] = &[("k", "b"), ("k", "a"), ("k", "c")];
+        assert_eq!(canonical_query_string(pairs), "k=a&k=b&k=c");
+    }
+
+    #[test]
+    fn canonical_query_string_sorts_by_key_first() {
+        let pairs: &[(&str, &str)] = &[("prefix", "x"), ("list-type", "2")];
+        assert_eq!(canonical_query_string(pairs), "list-type=2&prefix=x");
+    }
+
+    #[test]
+    fn canonical_query_string_empty_pairs_is_empty_string() {
+        assert_eq!(canonical_query_string(&[]), "");
+    }
+
+    #[test]
+    fn parse_wire_query_pairs_recovers_pairs_from_an_encoded_ampersand() {
+        // Split-before-decode: the wire string's only real `&` is the
+        // separator this function itself inserted between the two pairs;
+        // the `%26` inside the `prefix` value must not be treated as one.
+        let wire = canonical_query_string(&[("list-type", "2"), ("prefix", "teamA&teamB")]);
+        let pairs = parse_wire_query_pairs(&wire);
+        assert_eq!(
+            pairs,
+            vec![
+                ("list-type".to_string(), "2".to_string()),
+                ("prefix".to_string(), "teamA&teamB".to_string()),
+            ]
+        );
     }
 
     #[test]

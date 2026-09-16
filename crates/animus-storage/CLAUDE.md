@@ -33,6 +33,23 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   `async fn`); `LsmEngine` is the one that actually reaches the disk. Storage-only
   tests with no `Env` drive the futures with `futures::executor::block_on`; code
   already inside a `SimEnv` task just `.await`s.
+- **`Snapshot::get`/`scan` return `Result`, exactly like `StorageEngine::get`/
+  `scan`** (issue #845, 2026-09-16). They used to be infallible by signature
+  (`Option<VersionedValue>`/`Vec<(Key, VersionedValue)>`), so `LsmSnapshot`'s
+  impl had no way to report a genuine `LsmEngine` read failure (a
+  corrupt-block CRC mismatch, a `ProdEnv` disk I/O error, an exhausted
+  `READ_COMPACTION_RETRIES` budget) and instead folded it into `Ok(None)`
+  (`.ok().flatten()`) / an empty vec (`.unwrap_or_default()`) — a
+  backend fault silently indistinguishable from "key absent"/"range empty".
+  `MemorySnapshot`'s reads are genuinely infallible in memory, so its impl is
+  `Ok(..)` everywhere. `LsmSnapshot::scan`'s own `start > end` guard is
+  load-bearing, not just a style choice: `self.engine.scan_at(..)` resolves
+  to the engine's private *inherent* `scan_at` (inherent methods shadow a
+  trait method of the same name), which skips the trait-level `scan`/
+  `scan_at`'s own range check and builds a `BTreeMap::range` directly — an
+  inverted range there panics rather than erroring, so the guard must stay in
+  `LsmSnapshot::scan` itself. Regression: `tests/lsm_disk_faults.rs::
+  snapshot_get_and_scan_surface_corrupted_block_as_err_not_absent`.
 - **Versions are MVCC commit timestamps supplied by the caller and must be
   strictly increasing** (enforced via `StorageError::NonMonotonicVersion`).
   Given that, a `Snapshot` taken at version `v` is isolated from later writes —

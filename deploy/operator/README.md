@@ -69,11 +69,33 @@ The `certManager` shape only *references* an `Issuer`/`ClusterIssuer` — it
 must already exist (cert-manager itself, plus that issuer, are prerequisites
 this operator does not install or create) — and the controller creates a
 `cert-manager.io/v1` `Certificate` (owned by the `AnimusCluster`, named
-`{cluster}-tls`) whose `dnsNames` cover every pod's stable per-ordinal FQDN
-plus both Services (headless internal + client-facing `dynamo`), so the
-cert-manager-issued cert (in `Secret` `{cluster}-tls`) verifies against
-however a peer dials it. The `secretName` shape skips the `Certificate`
+`{cluster}-tls`) whose `dnsNames` cover the headless internal `Service`'s
+own name (short + FQDN) plus two wildcard SANs (`*.<internal-svc>.<ns>.svc`
+and the `.cluster.local` form — a headless `Service`'s pod DNS name is
+always exactly one label before the service name, so this covers every
+ordinal without depending on `spec.nodes`) plus the client-facing `dynamo`
+Service, so the cert-manager-issued cert (in `Secret` `{cluster}-tls`)
+verifies against however a peer dials it — and, since issue #913, the SAN
+list never changes as the cluster scales, so a `spec.nodes` edit never
+triggers a reissuance. The `secretName` shape skips the `Certificate`
 entirely — you own that `Secret`'s lifecycle (issuance and rotation).
+
+**If your `issuerRef` ultimately traces to a self-signed root, put a
+`ca`-type `Issuer`/`ClusterIssuer` between that root and this field —
+never name a bare `selfSigned` issuer here directly.** cert-manager's
+`selfSigned` issuer type makes every `Certificate` it signs its own,
+independent trust anchor (its output `Secret`'s `ca.crt` equals the leaf
+itself); pointing this operator's `issuerRef` straight at one means any
+future reissuance of the cluster's one shared leaf (a `duration`/
+`renewBefore` rollover) mints a brand-new root that pods already running
+with the old leaf will never trust, since `animusd` reads its TLS material
+once at startup and never reloads it (ADR 0064 Decision 6). Mint a CA
+`Certificate` (`isCA: true`) off the `selfSigned` issuer once, back a
+second `ca`-type issuer with that CA's `Secret`, and reference *that*
+issuer here instead — its output `Secret`'s `ca.crt` is the stable CA
+certificate, unaffected by a leaf renewal. `scripts/e2e-kind.sh`'s own
+`E2E_TLS=1` leg does exactly this (see its "create self-signed CA
+hierarchy" phase) and is the reference shape to copy.
 
 Either way the resolved `Secret` (`kubernetes.io/tls` shape:
 `tls.crt`/`tls.key`/`ca.crt`) is mounted read-only at `/etc/animus/tls` on
@@ -342,8 +364,10 @@ set) — since control voters can only be removed one at a time through
 their own careful quorum-loss checks (ADR 0037 §2), never inferred from a
 bare spec edit. See ADR 0060's own "Control-voter growth (S-07d,
 2026-09-06)" section for the full design (the live-truth-driven sequence,
-why role-promotion needs a restart, the `SocketAddr` gap this works
-around, and how a controller restart resumes).
+why role-promotion needs a restart, and how a controller restart resumes)
+and its "The `SocketAddr` gap, closed" amendment (issue #913) for why the
+promoted ordinal is addressed by its own stable per-pod DNS hostname, not
+a resolved pod IP.
 
 **Growing `controlNodes` restarts every pod, not just the promoted
 one.** Regenerating the config that drives the role split requires a
@@ -494,9 +518,12 @@ out-of-cluster `cargo run`.
   matrix entry publishes `ghcr.io/animus-db/animus-operator` on the same
   tag/push rules as `animusd` — `deployment.yaml`'s image reference is real,
   not a placeholder.
-- **`spec.autoSplitBytes` is accepted but not yet wired to a flag** —
-  `animusd`'s `--config FILE --node I`/`animusd data --config FILE --node I`
-  invocations (what every pod in this deployment shape runs) don't accept
-  `--auto-split-bytes` today; only the dev-only `--cluster N` in-process
-  mode does. See `crates/animus-operator/src/desired/cluster_config.rs`'s
-  `entrypoint_script` doc.
+- ~~`spec.autoSplitBytes` is accepted but not yet wired to a flag~~ —
+  closed 2026-09-04 (S-06). It never needed a flag: the operator writes
+  `spec.autoSplitBytes` (and `spec.quiesceAfterSecs`) into the generated
+  `cluster.json`'s own `cluster_settings` section
+  (`cluster_settings.auto_split_bytes`/`.quiesce_after_secs`), which
+  `animusd --config FILE --node I`/`animusd data --config FILE --node I`
+  read on every deployment shape. See
+  `crates/animus-operator/src/desired/cluster_config.rs`'s
+  `ClusterSettings` doc.

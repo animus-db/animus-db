@@ -132,16 +132,15 @@ before signing would silently mis-sign (or worse, mis-address) such a key.
 See `sigv4.rs`'s module doc for the full comparison.
 
 **Encode exactly once, from the same raw input, for each purpose — never
-chain the two.** Both the request path and the query string are threaded
-through this crate as **raw** (unescaped) strings from construction
-(`client::S3Client`'s own methods) all the way to [`sigv4::RequestToSign`];
-the wire URI and the signed canonical form are each derived by calling
-[`sigv4::canonical_uri_s3`]/[`sigv4::canonical_query_string`] **once**,
-independently, on that same raw string — never by re-encoding the other's
-already-encoded output (which would double-percent-encode, e.g. turning a
-key containing a space into `%20` for one purpose and `%2520` for the
-other, breaking the signature). `crate::fake`'s verification path is the
-mirror image: it receives an already-canonical wire URI/query and must
+chain the two.** The request path is threaded through this crate as a
+**raw** (unescaped) string from construction (`client::S3Client`'s own
+methods) all the way to [`sigv4::RequestToSign::uri`]; the wire URI and the
+signed canonical form are each derived by calling [`sigv4::canonical_uri_s3`]
+**once**, independently, on that same raw string — never by re-encoding the
+other's already-encoded output (which would double-percent-encode, e.g.
+turning a key containing a space into `%20` for one purpose and `%2520` for
+the other, breaking the signature). `crate::fake`'s verification path is the
+mirror image: it receives an already-canonical wire URI and must
 [`sigv4::percent_decode`] it back to raw **once** before re-deriving the
 canonical form for comparison — see `client.rs`'s and `fake.rs`'s own doc
 comments at the exact call sites for the worked-through reasoning; this was
@@ -149,6 +148,28 @@ a real bug caught and fixed while building this PR (an earlier draft
 percent-encoded an object key at both `client::S3Client`'s call site *and*
 inside `canonical_uri_s3`, silently breaking any request for a key
 containing a character needing escaping).
+
+**The query string follows the same "encode exactly once" rule, but as
+typed pairs, never a joined string** (fixed by issue #855 — see
+[`sigv4::RequestToSign::query`]'s own doc for the full account). An earlier
+version of this crate joined raw `(key, value)` pairs with `&` into a single
+string, threaded *that* through to `RequestToSign`, and separately
+re-derived the wire query by splitting the same joined string back apart —
+so a value containing its own literal `&` (S3 permits `&` in an object key,
+and ADR 0068's `ImportTable` `S3KeyPrefix` is an unrestricted customer
+string that reaches `list_objects_v2`'s `prefix` this way) was
+indistinguishable from a second key/value pair once joined, silently
+corrupting both the wire request and its own signature identically. Fixed
+by never introducing the joined-string representation at all:
+[`sigv4::canonical_query_string`] takes `&[(&str, &str)]` directly (raw,
+unescaped pairs — percent-encodes and sorts them once, itself), and
+[`sigv4::RequestToSign::query`] is typed pairs for the same reason.
+`crate::fake`'s verification path recovers pairs from a wire query string
+with [`sigv4::parse_wire_query_pairs`], which splits on `&`/`=` **before**
+percent-decoding (safe by construction, since an already-encoded value's own
+`&`/`=` would already read as `%26`/`%3D`) — never by decoding the whole
+string first and then splitting the result, which would reopen the
+identical bug on the verification side.
 
 ## Path-style addressing only (this PR)
 
@@ -173,11 +194,21 @@ S3 for a non-`us-east-1`-created bucket).
   round trips, a 404 on a missing key, a key containing special characters
   (space, `+`, parens — the exact shape that would break under the
   double-percent-encoding bug this PR found and fixed, see "Encode exactly
-  once" below), `list_objects_v2` pagination across more than one page
-  (`FakeS3::with_page_size`), a wrong-secret/unknown-access-key request
-  rejected, and both `tests/sigv4_known_answers.rs`/`tests/
+  once" below), a `list_objects_v2` prefix containing a literal `&` (issue
+  #855 — the query-string analogue of the same double-encoding bug class,
+  see "Encode exactly once" below), `list_objects_v2` pagination across more
+  than one page (`FakeS3::with_page_size`), a wrong-secret/unknown-access-key
+  request rejected, and both `tests/sigv4_known_answers.rs`/`tests/
   sigv4_chain_matches_dynamo.rs` below (dev-dependencies only, no feature
   needed).
+- **`tests/query_encoding.rs`** — issue #855's own end-to-end regression:
+  drives `S3Client::list_objects_v2` over a small recording `Transport`
+  (not `fake::FakeS3`, so the test inspects exactly what `S3Client` built
+  rather than having a second double re-interpret it) and asserts the wire
+  query for a prefix containing `&` is the exact canonical SigV4 encoding,
+  and that the request's own signature verifies against those same raw
+  pairs (and does *not* verify against the truncated prefix a join-then-
+  split bug would have produced).
 - **`tests/sigv4_known_answers.rs`** — AWS's own published SigV4
   test-vector suite (the same `aws-sig-v4-test-suite` `animus-dynamo`
   vendors, transcribed here as literal test cases rather than a second

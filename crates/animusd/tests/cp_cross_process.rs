@@ -33,55 +33,6 @@ async fn call(addr: SocketAddr, req: ClientRequest) -> ClientResponse {
         .expect("a reply")
 }
 
-/// Bring up `n` per-process nodes (each via `run_node`, so each has its own edge
-/// state), wrapped in the documented **port-TOCTOU retry**: `free_addrs` releases
-/// the probed ports before `run_node` rebinds them, so a concurrent test binary can
-/// steal one — re-allocate fresh ports and retry the whole bring-up as a unit.
-async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, animusd::ClusterConfig) {
-    for attempt in 0..16 {
-        let addrs = support::free_addrs(n * 6);
-        let nodes_cfg: Vec<animusd::RoleAddrs> = (0..n)
-            .map(|i| animusd::RoleAddrs {
-                id: animusd::config::node_id(i),
-                role: animusd::config::NodeRole::Both,
-                internal: addrs[6 * i],
-                client: addrs[6 * i + 1],
-                dynamo: addrs[6 * i + 2],
-                admin: addrs[6 * i + 3],
-                intra: addrs[6 * i + 4],
-                console: addrs[6 * i + 5],
-                advertise_host: None,
-                tls: None,
-                encryption_key_path: None,
-            })
-            .collect();
-        let config = animusd::ClusterConfig {
-            nodes: nodes_cfg,
-            dynamo_auth: None,
-            cluster_settings: None,
-        };
-        let mut nodes = Vec::new();
-        let mut failed = false;
-        for i in 0..n {
-            match animusd::run_node(&config, i, dir.join(format!("node-{attempt}-{i}"))).await {
-                Ok(node) => nodes.push(node),
-                Err(_) => {
-                    failed = true;
-                    break;
-                }
-            }
-        }
-        if !failed {
-            return (nodes, config);
-        }
-        for node in &nodes {
-            node.shutdown_graceful().await;
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
-    panic!("could not bring up cluster after retries (ports kept getting stolen)");
-}
-
 async fn await_bootstrap(nodes: &[Node]) {
     timeout(Duration::from_secs(20), async {
         loop {
@@ -115,7 +66,7 @@ async fn cp_op_on_a_non_leader_node_is_forwarded_to_the_leader() {
     let n = 3;
     // One node per process — each gets its own edge state via `run_node`.
     let dir = support::panic_safe_tempdir();
-    let (nodes, config) = bring_up(n, dir.path()).await;
+    let (nodes, config) = support::bring_up_deadline(n, dir.path(), support::JOIN_DEADLINE).await;
     await_bootstrap(&nodes).await;
 
     // Create the table (served by the CP plane unconditionally, ADR 0019) and
@@ -147,6 +98,7 @@ async fn cp_op_on_a_non_leader_node_is_forwarded_to_the_leader() {
     // Write the CP key via node 0. Whether or not node 0 is the CP leader, this
     // must succeed — locally if it leads, else by forwarding. Retry while the CP
     // group elects its own leader.
+    let mut last_err = String::new();
     timeout(Duration::from_secs(25), async {
         loop {
             match call(
@@ -160,13 +112,18 @@ async fn cp_op_on_a_non_leader_node_is_forwarded_to_the_leader() {
             .await
             {
                 ClientResponse::PutOk => return,
-                ClientResponse::Error(_) => sleep(Duration::from_millis(150)).await,
+                ClientResponse::Error(e) => {
+                    last_err = e;
+                    sleep(Duration::from_millis(150)).await;
+                }
                 other => panic!("unexpected CP put response: {other:?}"),
             }
         }
     })
     .await
-    .expect("CP write (possibly forwarded) did not succeed in 25s");
+    .unwrap_or_else(|_| {
+        panic!("CP write (possibly forwarded) did not succeed in 25s; last error: {last_err}")
+    });
 
     // Read it back via *every* node. With one CP leader among three nodes, at least
     // two of these reads land on a non-leader and must be served by forwarding.
@@ -203,7 +160,7 @@ async fn cp_op_on_a_non_leader_node_is_forwarded_to_the_leader() {
 async fn batch_write_on_a_non_leader_node_is_forwarded() {
     let n = 3;
     let dir = support::panic_safe_tempdir();
-    let (nodes, config) = bring_up(n, dir.path()).await;
+    let (nodes, config) = support::bring_up_deadline(n, dir.path(), support::JOIN_DEADLINE).await;
     await_bootstrap(&nodes).await;
     let client = |i: usize| config.nodes[i].client;
 
@@ -218,6 +175,7 @@ async fn batch_write_on_a_non_leader_node_is_forwarded() {
                 )
             })
             .collect();
+        let mut last_err = String::new();
         timeout(Duration::from_secs(25), async {
             loop {
                 match call(
@@ -230,13 +188,18 @@ async fn batch_write_on_a_non_leader_node_is_forwarded() {
                 .await
                 {
                     ClientResponse::PutOk => return,
-                    ClientResponse::Error(_) => sleep(Duration::from_millis(150)).await,
+                    ClientResponse::Error(e) => {
+                        last_err = e;
+                        sleep(Duration::from_millis(150)).await;
+                    }
                     other => panic!("unexpected CP batch response: {other:?}"),
                 }
             }
         })
         .await
-        .unwrap_or_else(|_| panic!("CP batch via node {i} did not succeed in 25s"));
+        .unwrap_or_else(|_| {
+            panic!("CP batch via node {i} did not succeed in 25s; last error: {last_err}")
+        });
     }
 
     // Every key of every batch reads back (via node 0 — forwarded if it's not the
@@ -276,7 +239,7 @@ async fn batch_write_on_a_non_leader_node_is_forwarded() {
 async fn second_table_forwards_across_processes() {
     let n = 3;
     let dir = support::panic_safe_tempdir();
-    let (nodes, config) = bring_up(n, dir.path()).await;
+    let (nodes, config) = support::bring_up_deadline(n, dir.path(), support::JOIN_DEADLINE).await;
     await_bootstrap(&nodes).await;
     let client = |i: usize| config.nodes[i].client;
 
@@ -287,6 +250,7 @@ async fn second_table_forwards_across_processes() {
         ("cp_first", b"a".to_vec(), b"v1".to_vec()),
         ("cp_second", b"b".to_vec(), b"v2".to_vec()),
     ] {
+        let mut last_err = String::new();
         timeout(Duration::from_secs(25), async {
             loop {
                 match call(
@@ -300,13 +264,18 @@ async fn second_table_forwards_across_processes() {
                 .await
                 {
                     ClientResponse::PutOk => return,
-                    ClientResponse::Error(_) => sleep(Duration::from_millis(150)).await,
+                    ClientResponse::Error(e) => {
+                        last_err = e;
+                        sleep(Duration::from_millis(150)).await;
+                    }
                     other => panic!("unexpected CP put response: {other:?}"),
                 }
             }
         })
         .await
-        .unwrap_or_else(|_| panic!("CP write to {table} did not succeed in 25s"));
+        .unwrap_or_else(|_| {
+            panic!("CP write to {table} did not succeed in 25s; last error: {last_err}")
+        });
     }
 
     // Read the second table's key via *every* node: at least two reads land on a
