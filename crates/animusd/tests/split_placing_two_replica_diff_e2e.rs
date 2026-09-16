@@ -554,7 +554,7 @@ async fn two_of_three_replica_diff_placing_target_converges_end_to_end() {
         }
 
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        let _ = writer.await;
+        writer.await.expect("background writer task panicked");
 
         eprintln!("=== left child {left} voter trajectory ===");
         for (t, n, v, l) in &trace_left {

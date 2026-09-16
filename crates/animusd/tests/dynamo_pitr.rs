@@ -424,7 +424,7 @@ async fn disable_survives_concurrent_periodic_seal_on_local_route() {
 
             stop.store(true, Ordering::Relaxed);
             for w in writers {
-                let _ = w.await;
+                w.await.expect("background writer task panicked");
             }
 
             assert_eq!(
