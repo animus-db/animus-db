@@ -117,6 +117,21 @@ fn hosted_group_inner(
                 RaftKvNode::start_hosted_campaigning_with_batcher(
                     env, all_nodes, engine, scope, stream, batcher,
                 )
+            } else if leader_idx.is_some() {
+                // Issue #945: this group is standing in for a real
+                // in-place split child (`hosted_group_fixed_leader`'s own
+                // doc) — its non-leader replicas must be modeled the same
+                // way `materialize_split_child` actually hosts them
+                // (`start_hosted_split_follower_with_batcher`, not the
+                // plain `start_hosted_with_batcher` an ordinary fresh
+                // `CreateTablet` host uses), or the boot-time cluster
+                // check (issue #900/#667) gates their real-vote grant on
+                // its own probe round trip and silently defeats the
+                // "wins leadership almost immediately" fast path this
+                // cell exists to measure.
+                RaftKvNode::start_hosted_split_follower_with_batcher(
+                    env, all_nodes, engine, scope, stream, batcher,
+                )
             } else {
                 RaftKvNode::start_hosted_with_batcher(
                     env, all_nodes, engine, scope, stream, batcher,

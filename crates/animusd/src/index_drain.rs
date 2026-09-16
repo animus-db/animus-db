@@ -2617,6 +2617,14 @@ async fn trim_janitor(
             ctx.data()
                 .raftkv_metrics
                 .incr_by(Metric::ChangeLogTrimmedTotal, n);
+            // Issue #974: this is a `KindBatch` propose that shares
+            // `CpProposalsAccepted` with every real client write on this
+            // group (see that metric's own doc) — recorded separately here,
+            // the one place that knows this particular accepted propose was
+            // housekeeping rather than a client-caused write.
+            ctx.data()
+                .raftkv_metrics
+                .incr(Metric::CpHousekeepingProposalsAccepted);
         }
     }
     if !writes.is_empty() {
@@ -2625,6 +2633,9 @@ async fn trim_janitor(
         ctx.data()
             .raftkv_metrics
             .incr_by(Metric::ChangeLogTrimmedTotal, n);
+        ctx.data()
+            .raftkv_metrics
+            .incr(Metric::CpHousekeepingProposalsAccepted);
     }
     Ok(())
 }

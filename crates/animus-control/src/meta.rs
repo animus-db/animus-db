@@ -13,7 +13,9 @@ use std::fmt;
 use animus_env::NodeId;
 #[cfg(test)]
 use animus_env::nid;
-use animus_placement::{Candidate, PlacementPolicy, rebalance_step, replan, select_replicas};
+use animus_placement::{
+    Candidate, PlacementPolicy, rebalance_step, replan, replan_repair, select_replicas,
+};
 use animus_tablet::{
     Epoch, InPlaceSplitIntent, KeyRange, SplitChild, TOKEN_BYTES, Tablet, TabletId, TabletState,
 };
@@ -2895,10 +2897,17 @@ fn reconcile_placement(
             {
                 return None;
             }
-            let desired = replan(&t.replicas, &candidates, policy).ok()?;
-            // `replan` returns a sorted set; `t.replicas` is normalized
-            // (sorted + deduped) by `Tablet::new` / `CasTabletReplicas`, so a
-            // direct comparison is a faithful "already satisfied" check.
+            // `replan_repair`, not plain `replan` (issue #957): this is the
+            // repair pass, so a policy RF the current candidate pool can't
+            // fully satisfy must still grow the tablet as far as it
+            // genuinely can, rather than refusing to make any progress —
+            // see that function's own doc for the growth-only contract
+            // (it never shrinks an already-at-capacity set).
+            let desired = replan_repair(&t.replicas, &candidates, policy).ok()?;
+            // `replan_repair` returns a sorted set; `t.replicas` is
+            // normalized (sorted + deduped) by `Tablet::new` /
+            // `CasTabletReplicas`, so a direct comparison is a faithful
+            // "already satisfied" check.
             if desired == t.replicas {
                 None
             } else {
@@ -3098,10 +3107,17 @@ impl Metadata {
     /// (and a replay) computes the same proposals. The leader's reconciler
     /// (`node.rs`) calls it on a timer and proposes the result through Raft; a
     /// tablet already satisfying its policy yields nothing, so the loop is
-    /// **idempotent** (no churn at steady state). A tablet whose policy cannot be
-    /// satisfied with the current candidates (e.g. too few eligible nodes) is
-    /// skipped, leaving the existing replicas in place rather than shrinking the
-    /// set. **ADR 0062 §2 (issue #528 fix)**: a tablet carrying an un-`done`
+    /// **idempotent** (no churn at steady state). **A tablet whose policy RF
+    /// exceeds the current candidate pool is still grown as far as it
+    /// genuinely can be (issue #957, `animus_placement::replan_repair`)** —
+    /// e.g. an RF-3 policy on a cluster that currently has only 2 eligible
+    /// members still repairs a 1-replica tablet up to 2, rather than
+    /// refusing to make any progress until a 3rd member ever becomes
+    /// eligible; see `replan_repair`'s own doc for the exact growth-only
+    /// contract (it never shrinks an already-at-capacity set, which is what
+    /// still leaves a tablet's existing replicas in place — stale entries
+    /// included — whenever there is truly nothing better to add).
+    /// **ADR 0062 §2 (issue #528 fix)**: a tablet carrying an un-`done`
     /// [`split_placing`](Self::split_placing) entry is skipped here too — the
     /// dwell-gated directed-Placing phase
     /// ([`split_placing_reconcile`](Self::split_placing_reconcile)) is the
@@ -9708,6 +9724,151 @@ mod tests {
         assert!(
             !m.reconcile(&BTreeSet::new()).is_empty(),
             "a done split_placing entry must no longer exclude the tablet from repair"
+        );
+    }
+
+    /// Issue #957: a tablet under-provisioned below its own policy RF (the
+    /// policy always records the *target* RF, `MAX_REPLICATION_FACTOR` in
+    /// `animusd`, never the observed initial candidate count — see
+    /// `tests/tablet_rf_self_heals.rs`) must still self-heal up to every
+    /// candidate the cluster actually has, not just up to the full RF. Found
+    /// root-causing the flaky
+    /// `tablet_provisioned_undersized_on_a_small_cluster_self_heals_after_
+    /// growth`: a 2-node cluster, RF-3 policy, a tablet minted with only 1
+    /// replica (the initial-placement race
+    /// `docs/lessons/testing/2026-09-16-a-faster-bootstrap-time-schema-
+    /// proposal-makes-initial-tablet-placement-an-eventual-property.md`
+    /// documents) never gained its second replica: `reconcile_placement`
+    /// called plain `replan`, which refuses outright ("not enough eligible
+    /// candidates: need 3, have 2") the instant the full RF can't be met —
+    /// even though genuine, strictly-improving progress (1 -> 2 replicas)
+    /// was possible. The control plane itself was never at fault — no
+    /// stalled apply task, no stuck boot-time cluster check (see the issue
+    /// for the ruled-out candidates) — this repair pass simply proposed
+    /// nothing, ever, until a third node made the full RF reachable in one
+    /// step.
+    #[test]
+    fn reconcile_grows_an_undersized_tablet_toward_rf_even_when_rf_cannot_be_fully_met() {
+        let mut m = Metadata::default();
+        for n in [1u64, 2] {
+            assert_eq!(
+                m.apply(&MetaCommand::UpsertMember {
+                    node: nid(n),
+                    labels: BTreeMap::new(),
+                    status: NodeStatus::Active,
+                }),
+                ApplyOutcome::Applied
+            );
+        }
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTablet {
+                tablet: TabletId(2),
+                table: Some("rf_self_heal".to_owned()),
+                range: KeyRange::whole(),
+                // Only node 1 was `Active` at provision time (the race) —
+                // one replica, on a 2-node cluster.
+                replicas: vec![nid(1)],
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::SetTabletPolicy {
+                tablet: TabletId(2),
+                // The recorded target, MAX_REPLICATION_FACTOR in production
+                // — deliberately more than either currently-Active member
+                // count this test exercises.
+                policy: Some(PlacementPolicy::simple("cp-rf", 3)),
+            }),
+            ApplyOutcome::Applied
+        );
+
+        let proposals = m.reconcile(&BTreeSet::new());
+        assert_eq!(
+            proposals,
+            vec![MetaCommand::CasTabletReplicas {
+                tablet: TabletId(2),
+                expected_epoch: m.tablets[&TabletId(2)].epoch,
+                replicas: vec![nid(1), nid(2)],
+            }],
+            "reconcile must grow the tablet to every Active candidate (2), not refuse \
+             outright because RF 3 can't be fully met"
+        );
+
+        // Applying it converges: a second `reconcile` pass on the 2-node
+        // cluster is now idempotent (no further churn) until a 3rd node
+        // becomes Active — the exact steady state the flaky test's first
+        // `poll_until_or_stalled` call was waiting on.
+        for command in &proposals {
+            assert_eq!(m.apply(command), ApplyOutcome::Applied);
+        }
+        assert_eq!(
+            m.reconcile(&BTreeSet::new()),
+            Vec::new(),
+            "already at the 2-node cluster's own capacity; no further churn until growth"
+        );
+
+        // Growing to a 3rd Active member reaches the full RF in the
+        // ordinary way — the exact shape the flaky test's own second phase
+        // (growth to 3 nodes) already covered and never flaked on.
+        assert_eq!(
+            m.apply(&MetaCommand::UpsertMember {
+                node: nid(3),
+                labels: BTreeMap::new(),
+                status: NodeStatus::Active,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.reconcile(&BTreeSet::new()),
+            vec![MetaCommand::CasTabletReplicas {
+                tablet: TabletId(2),
+                expected_epoch: m.tablets[&TabletId(2)].epoch,
+                replicas: vec![nid(1), nid(2), nid(3)],
+            }]
+        );
+    }
+
+    /// The growth-only guarantee, at the `Metadata::reconcile` level: a
+    /// tablet that already holds as many replicas as the candidate pool can
+    /// support must not be shrunk by repair just because full RF still
+    /// can't be met — a currently-ineligible (e.g. `Down`) replica stays in
+    /// the tablet's row rather than being dropped, unchanged from before
+    /// issue #957's fix.
+    #[test]
+    fn reconcile_does_not_shrink_a_tablet_already_at_the_clusters_capacity() {
+        let mut m = Metadata::default();
+        for n in [1u64, 2] {
+            assert_eq!(
+                m.apply(&MetaCommand::UpsertMember {
+                    node: nid(n),
+                    labels: BTreeMap::new(),
+                    status: NodeStatus::Active,
+                }),
+                ApplyOutcome::Applied
+            );
+        }
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTablet {
+                tablet: TabletId(2),
+                table: Some("rf_self_heal".to_owned()),
+                range: KeyRange::whole(),
+                // Already at every Active candidate; RF 3 still can't be
+                // met with only 2 members ever registered.
+                replicas: vec![nid(1), nid(2)],
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::SetTabletPolicy {
+                tablet: TabletId(2),
+                policy: Some(PlacementPolicy::simple("cp-rf", 3)),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.reconcile(&BTreeSet::new()),
+            Vec::new(),
+            "already at capacity for this 2-node cluster; nothing to repair"
         );
     }
 

@@ -347,8 +347,13 @@ truth; this map is just for navigation.
   group never quiesces), remains leader while quiesced, and admin/
   dashboard reads never wake a group (`quiesced` is a pure diagnostic).
 - **Placement, rebalancing & growth** — `animus-placement` (ADR 0005): pure
-  policy engine (RF + residency labels + failure-domain spread), `replan`
-  (failure repair) + `rebalance_step` (ADR 0029: one balance-driven move per
+  policy engine (RF + residency labels + failure-domain spread), `replan`'s
+  growth-only best-effort sibling `replan_repair` (the control plane's own
+  repair pass, issue #957 — a policy RF the current candidate pool can't
+  fully satisfy still gets grown as far as it genuinely can, e.g. an RF-3
+  policy on a 2-node cluster still repairs a 1-replica tablet up to 2,
+  rather than refusing to make any progress at all; never shrinks an
+  already-at-capacity set) + `rebalance_step` (ADR 0029: one balance-driven move per
   call; converges to max−min ≤ 1 when the policy sets no `SpreadPolicy` — with
   a spread constraint the domain guard can legally block every improving move,
   so only monotonic non-worsening and termination hold, see the property tests
