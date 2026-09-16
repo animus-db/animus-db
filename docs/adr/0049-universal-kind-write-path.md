@@ -414,3 +414,21 @@ this by re-deriving the check by hand. See
 `crates/animusd/src/write_path.rs`'s `cp_kind_eval_local` doc and
 `docs/lessons/code-patterns/2026-09-16-is-leader-false-is-not-proof-a-write-is-lost.md`
 (amended) for the full account.
+
+**Further amendment (2026-09-16, issue #971): `poll_probe` (the shared
+primitive behind `cp_batch_local`, the raw `PutBatch` client-protocol
+write) and `cp_put_local`/`cp_delete_local` (the raw `Put`/`Delete`
+client-protocol writes) carried the same `!is_leader()` hazard, unfixed —
+this file's oldest confirm-loop family, predating both fixes above.** All
+three fall back to `decide::confirm_wait_is_futile` once their own
+value-equality probe (`local_get`/`local_get_kind`) is inconclusive,
+identically to the pre-fix `cp_kind_raw_local`. Fixed the same way: all
+three now call `kind_batch_confirm_superseded` in place of
+`confirm_wait_is_futile`, keeping their own value-equality fallback (and,
+for `poll_probe`, its `ProbeIdentity` idempotency gate) and the
+probe-vs-apply re-check around it exactly as before — only the futility
+signal changed. `decide::confirm_wait_is_futile` had no remaining caller
+once these three were fixed and was deleted, along with its own unit
+tests. See `crates/animusd/src/write_path.rs`'s `poll_probe` doc and
+`docs/lessons/code-patterns/2026-09-16-is-leader-false-is-not-proof-a-write-is-lost.md`
+(amended) for the full account.

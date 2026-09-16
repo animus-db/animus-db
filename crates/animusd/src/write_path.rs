@@ -416,9 +416,9 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// least that often even if nothing ever applies again (the group loses
     /// its leader, a quorum is lost, the entry gets superseded). That forced
     /// re-check is what lets every caller's own
-    /// `confirm_wait_is_futile`/deadline logic — which this helper never
-    /// evaluates itself — keep firing on schedule instead of hanging until a
-    /// wake that may never come.
+    /// [`kind_batch_confirm_superseded`]/deadline logic — which this helper
+    /// never evaluates itself — keep firing on schedule instead of hanging
+    /// until a wake that may never come.
     async fn wait_applied_past(leader: &CpGroup<E>, index: u64) {
         let watch = leader.applied_watch();
         loop {
@@ -460,7 +460,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     ///
     /// **Never trusts `confirm_wait_is_futile`'s `!is_leader()` clause on
     /// its own (issue #911).** This loop used to call
-    /// [`decide::confirm_wait_is_futile`] exactly like every other confirm
+    /// `decide::confirm_wait_is_futile` (since deleted by issue #971) like every other confirm
     /// loop here and, the instant it returned `true`, do one last value
     /// probe and give up. That predicate's own doc is honest about the
     /// hazard it accepts for its OTHER callers: "the accepted entry may yet
@@ -841,8 +841,23 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// Poll `leader`'s local engine for `probe_key` to reflect `probe_val` until
     /// `deadline` — the durable-before-ack confirm wait shared by every CP write
     /// path (mirrors [`cp_put_local`](Self::cp_put_local)). Ends early, with
-    /// [`ProbeWait::Superseded`], once [`decide::confirm_wait_is_futile`]
+    /// [`ProbeWait::Superseded`], once [`kind_batch_confirm_superseded`]
     /// says the accepted entry's effect can no longer appear.
+    ///
+    /// **Never trusts `decide::confirm_wait_is_futile`'s `!is_leader()`
+    /// clause on its own (issue #971 — the same false-negative class issues
+    /// #911/#967 closed for `cp_kind_raw_local`/`cp_kind_eval_local`,
+    /// reached here too since this loop used to call that same predicate).**
+    /// A term bump from a missed heartbeat deadline under real contention
+    /// flips `is_leader()` false the instant this node steps down, well
+    /// before anyone can tell whether the entry it already accepted will
+    /// still commit — [`kind_batch_confirm_superseded`]'s two checks
+    /// (`engine_applied_index` past the accepted index with no matching
+    /// outcome, or a different term recorded at that index) are plain local
+    /// reads needing no leadership at all, so this loop keeps watching its
+    /// own entry resolve even after it stops leading, bounded by the same
+    /// `deadline` as before. See
+    /// `docs/lessons/code-patterns/2026-09-16-is-leader-false-is-not-proof-a-write-is-lost.md`.
     ///
     /// `accepted_term` is the term [`ProposeResult::Accepted`] carried
     /// alongside `accepted_index` — see the identity-check note below.
@@ -940,17 +955,22 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             {
                 return ProbeWait::Confirmed;
             }
-            if decide::confirm_wait_is_futile(
+            // Leadership-independent proof this index resolved against us
+            // (issue #971 — see [`kind_batch_confirm_superseded`]'s own doc
+            // for why `!is_leader()` alone is deliberately NOT consulted
+            // here any more).
+            if kind_batch_confirm_superseded(
                 leader.engine_applied_index(),
-                leader.is_leader(),
                 accepted_index,
+                accepted_term,
+                &leader.kind_batch_outcome(accepted_index),
             ) {
-                // Close the probe-vs-apply race before giving up: re-check the
-                // outcome first, then the value. `confirm_wait_is_futile` can
-                // have returned `true` via its `!is_leader()` clause alone,
-                // with `engine_applied_index()` still behind `accepted_index`
-                // — so `effects_readable` must be recomputed here, not
-                // assumed `true` from the fact that we're in this branch.
+                // Close the probe-vs-apply race before giving up: the value-
+                // equality check above (and the outcome check that feeds
+                // `kind_batch_confirm_superseded`) can race this entry's own
+                // effects actually becoming visible during their own
+                // `.await` above — re-check the outcome first, then the
+                // value, before reporting `Superseded`.
                 if classify_kind_batch_outcome(
                     leader.kind_batch_outcome(accepted_index),
                     accepted_term,
@@ -1036,10 +1056,17 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// reflecting our value means it is durable. A per-write quorum barrier would
     /// not scale under concurrent load. (If we lose leadership before commit, the
     /// entry may be truncated and never appear locally — the confirm loop then
-    /// ends early via [`decide::confirm_wait_is_futile`]
+    /// ends early via [`kind_batch_confirm_superseded`]
     /// with a retryable error rather than polling out the whole
     /// [`CLIENT_TIMEOUT`]: the write did not confirm, and the caller's retry
     /// re-resolves routing.)
+    ///
+    /// **Never trusts `decide::confirm_wait_is_futile`'s `!is_leader()`
+    /// clause on its own (issue #971 — the same false-negative class issues
+    /// #911/#967 closed for `cp_kind_raw_local`/`cp_kind_eval_local`, reached
+    /// here too since this loop used to call that same predicate)** — see
+    /// [`poll_probe`](Self::poll_probe)'s own doc for the full account and
+    /// `docs/lessons/code-patterns/2026-09-16-is-leader-false-is-not-proof-a-write-is-lost.md`.
     ///
     /// **Pre-propose range check (ADR 0028 write fences).** `cp_route` can hand
     /// us a `Local` leader off a stale `Metadata` view during a split's
@@ -1053,7 +1080,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// index applied yet" — a no-op still advances that watermark) it would
     /// **falsely ack** a write that never actually landed anywhere. This confirm
     /// loop polls value equality (success is never keyed on the coarser
-    /// applied-index signal — [`decide::confirm_wait_is_futile`]
+    /// applied-index signal — [`kind_batch_confirm_superseded`]
     /// only ever ends a wait *early with an error*),
     /// which degrades that hazard to "returns a retryable error" rather than a
     /// false ack — but that is a property of *this* poll, not a defense to rely on, so the
@@ -1082,18 +1109,27 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             );
         }
         match leader.put(key.clone(), value.clone()) {
-            ProposeResult::Accepted { index, .. } => {
+            ProposeResult::Accepted { index, term } => {
                 let deadline = leader.env().now().saturating_add(CLIENT_TIMEOUT);
                 loop {
                     if leader.local_get(&key).await.as_deref() == Some(value.as_slice()) {
                         return Ok(());
                     }
-                    if decide::confirm_wait_is_futile(
+                    // Leadership-independent proof this index resolved
+                    // against us (issue #971 — see
+                    // [`poll_probe`](Self::poll_probe)'s own doc for why
+                    // `!is_leader()` alone is deliberately NOT consulted
+                    // here any more).
+                    if kind_batch_confirm_superseded(
                         leader.engine_applied_index(),
-                        leader.is_leader(),
                         index,
+                        term,
+                        &leader.kind_batch_outcome(index),
                     ) {
-                        // Close the probe-vs-apply race before giving up.
+                        // Close the probe-vs-apply race before giving up:
+                        // the value-equality check above can race this
+                        // entry's own effects actually becoming visible
+                        // during its own `.await`.
                         if leader.local_get(&key).await.as_deref() == Some(value.as_slice()) {
                             return Ok(());
                         }
@@ -1134,18 +1170,27 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             );
         }
         match leader.delete(key.clone()) {
-            ProposeResult::Accepted { index, .. } => {
+            ProposeResult::Accepted { index, term } => {
                 let deadline = leader.env().now().saturating_add(CLIENT_TIMEOUT);
                 loop {
                     if leader.local_get(&key).await.is_none() {
                         return Ok(());
                     }
-                    if decide::confirm_wait_is_futile(
+                    // Leadership-independent proof this index resolved
+                    // against us (issue #971 — see
+                    // [`poll_probe`](Self::poll_probe)'s own doc for why
+                    // `!is_leader()` alone is deliberately NOT consulted
+                    // here any more).
+                    if kind_batch_confirm_superseded(
                         leader.engine_applied_index(),
-                        leader.is_leader(),
                         index,
+                        term,
+                        &leader.kind_batch_outcome(index),
                     ) {
-                        // Close the probe-vs-apply race before giving up.
+                        // Close the probe-vs-apply race before giving up:
+                        // the value-equality check above can race this
+                        // entry's own effects actually becoming visible
+                        // during its own `.await`.
                         if leader.local_get(&key).await.is_none() {
                             return Ok(());
                         }
@@ -1616,7 +1661,7 @@ mod kind_eval_confirm_wake_tests {
 /// change before it ever commits — would hang forever: nothing ever bumps
 /// the watermark past that index, so a pure `watch.changed(seen).await`
 /// with no timeout races alongside it would never resolve either. The
-/// surrounding loop's own `decide::confirm_wait_is_futile` check only gets
+/// surrounding loop's own [`kind_batch_confirm_superseded`] check only gets
 /// a chance to re-fire once `wait_applied_past` itself returns, so this
 /// also exercises the real end-to-end property: the confirm resolves
 /// `Superseded`, not a hang and not the full `CLIENT_TIMEOUT` deadline.
@@ -2457,6 +2502,181 @@ mod cp_kind_eval_local_genuine_loss_tests {
         );
         assert_eq!(
             futures::executor::block_on(leader.local_get_kind(KIND_BASE, &base_key)),
+            None,
+            "the superseded entry's write must never have applied under \
+             any term (seed={seed:#x})"
+        );
+    }
+}
+
+/// Companion to `cp_kind_raw_local_genuine_loss_tests`/
+/// `cp_kind_eval_local_genuine_loss_tests`, for the raw `PutBatch`
+/// client-protocol primitive (issue #971): proves `cp_batch_local`'s own
+/// confirm loop — `poll_probe`, rewired off `decide::
+/// confirm_wait_is_futile`'s `!is_leader()` clause onto the
+/// leadership-independent [`kind_batch_confirm_superseded`] check, same as
+/// `cp_kind_raw_local`/`cp_kind_eval_local` — still fails fast on a
+/// **genuinely** superseded entry (a real leadership change that truncates
+/// it, never replicated anywhere else), not a hang to `CLIENT_TIMEOUT` or
+/// worse. Identical scenario/setup to the other two genuine-loss tests
+/// (isolate the eventual leader in both directions *before* it ever
+/// proposes, so the entry can never replicate; the other two elect a new
+/// leader with no matching log entry, which truncates it for good on heal)
+/// but drives the real `ClientCtx::cp_batch_local` end to end — `poll_probe`
+/// is the one shared primitive underneath all of them, but each caller's
+/// own value-equality shape (`local_get` here, a plain `Batch` write,
+/// versus `local_get_kind`/no-value-probe-at-all for the other two) means
+/// this needs its own direct coverage of the same property. `cp_put_local`/
+/// `cp_delete_local` share the identical `kind_batch_confirm_superseded`
+/// call inline (never `poll_probe` itself) and are covered by that
+/// function's own direct unit tests (`kind_batch_confirm_superseded_tests`)
+/// plus `poll_probe_identity_tests`' existing live coverage of the same
+/// confirm-loop shape — a fourth live end-to-end genuine-loss harness for
+/// each would be redundant with this one and the two above, since all five
+/// confirm loops now share the one tested decision function.
+#[cfg(test)]
+mod cp_batch_local_genuine_loss_tests {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use animus_cp_data::RaftKvNode;
+    use animus_env::{EnvExt, nid};
+    use animus_sim::{SimEnv, Simulator};
+    use animus_storage::MemoryEngine;
+
+    use super::*;
+
+    #[derive(Clone, Copy, Debug, Default)]
+    struct NeverRelay;
+
+    #[async_trait::async_trait]
+    impl RelayClient for NeverRelay {
+        async fn relay(
+            &self,
+            addr: String,
+            _request: &ClientRequest,
+            _timeout: Duration,
+        ) -> ClientResponse {
+            ClientResponse::Error(format!(
+                "NeverRelay: this three-node harness never relays (addr={addr})"
+            ))
+        }
+    }
+
+    fn three_voter_cluster(seed: u64) -> (Simulator, Vec<RaftKvNode<SimEnv, MemoryEngine>>) {
+        let sim = Simulator::new(seed);
+        let ids = [nid(0), nid(1), nid(2)];
+        let nodes: Vec<_> = ids
+            .iter()
+            .map(|id| RaftKvNode::start(sim.env(id.clone()), ids.to_vec(), MemoryEngine::new()))
+            .collect();
+        (sim, nodes)
+    }
+
+    fn leader_index(nodes: &[RaftKvNode<SimEnv, MemoryEngine>]) -> Option<usize> {
+        let ls: Vec<usize> = (0..nodes.len()).filter(|&i| nodes[i].is_leader()).collect();
+        if ls.len() == 1 { Some(ls[0]) } else { None }
+    }
+
+    #[test]
+    fn a_genuinely_superseded_raw_batch_write_still_fails_fast_not_a_hang() {
+        run(0x0971_1001);
+    }
+
+    fn run(seed: u64) {
+        let (mut sim, nodes) = three_voter_cluster(seed);
+        sim.run_for(Duration::from_secs(2));
+        let l = leader_index(&nodes).unwrap_or_else(|| {
+            panic!("a three-voter cluster must elect a leader (seed={seed:#x})")
+        });
+        let l_id = nid(l as u64);
+        let followers: Vec<usize> = (0..nodes.len()).filter(|&i| i != l).collect();
+        let follower_ids: Vec<_> = followers.iter().map(|&i| nid(i as u64)).collect();
+        let original_term = nodes[l].term();
+
+        // Isolate the leader in BOTH directions before it ever proposes —
+        // exactly the other two genuine-loss tests' own setup.
+        for f in &follower_ids {
+            sim.partition_pair(l_id.clone(), f.clone());
+        }
+
+        let leader = CpGroup::Mem(nodes[l].clone());
+        let key = b"item".to_vec();
+        let value = b"will-never-land".to_vec();
+        let slot: Arc<Mutex<Option<Result<(), String>>>> = Arc::new(Mutex::new(None));
+        let out = slot.clone();
+        {
+            let leader = leader.clone();
+            let key = key.clone();
+            let value = value.clone();
+            let env = leader.env().clone();
+            env.spawn_task(async move {
+                let r =
+                    ClientCtx::<SimEnv, NeverRelay>::cp_batch_local(&leader, vec![(key, value)])
+                        .await;
+                *out.lock().expect("poisoned") = Some(r);
+            });
+        }
+
+        sim.run_for(Duration::from_millis(50));
+        assert!(
+            slot.lock().expect("poisoned").is_none(),
+            "the confirm must still be waiting here, or this run doesn't \
+             exercise the accepted-but-unapplied window this test exists \
+             to pin (seed={seed:#x})"
+        );
+
+        // The two followers, cut off from the isolated leader, elect a new
+        // one among themselves. Converged-or-timeout.
+        let mut new_leader = None;
+        for _ in 0..40 {
+            sim.run_for(Duration::from_millis(100));
+            new_leader = followers
+                .iter()
+                .copied()
+                .find(|&i| nodes[i].is_leader() && nodes[i].term() > original_term);
+            if new_leader.is_some() {
+                break;
+            }
+        }
+        assert!(
+            new_leader.is_some(),
+            "the two followers never elected a new leader (seed={seed:#x})"
+        );
+
+        // Heal: the old leader learns of the new term and steps down.
+        for f in &follower_ids {
+            sim.heal(l_id.clone(), f.clone());
+        }
+        let mut stepped_down = false;
+        for _ in 0..40 {
+            sim.run_for(Duration::from_millis(100));
+            if !nodes[l].is_leader() {
+                stepped_down = true;
+                break;
+            }
+        }
+        assert!(
+            stepped_down,
+            "the old leader never learned of the new term (seed={seed:#x})"
+        );
+
+        let mut result = None;
+        for _ in 0..100 {
+            sim.run_for(Duration::from_millis(100));
+            result = slot.lock().expect("poisoned").clone();
+            if result.is_some() {
+                break;
+            }
+        }
+        assert!(
+            matches!(&result, Some(Err(e)) if e.ends_with("; retry")),
+            "a genuinely superseded raw batch write must resolve to a \
+             retryable error promptly, not hang to `CLIENT_TIMEOUT` or \
+             worse (seed={seed:#x}): {result:?}"
+        );
+        assert_eq!(
+            futures::executor::block_on(leader.local_get(&key)),
             None,
             "the superseded entry's write must never have applied under \
              any term (seed={seed:#x})"

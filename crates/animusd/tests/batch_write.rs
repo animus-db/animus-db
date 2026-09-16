@@ -32,22 +32,28 @@
 //! not an exact one-propose-per-chunk equality.** Under this repo's own
 //! testing-discipline load (a shared, CPU-contended box), a freshly-hosted
 //! tablet's very first burst of `KindBatch` writes occasionally sees one
-//! extra accepted propose — `cp_kind_raw_local`'s confirm loop
-//! (`write_path.rs`) reads a real, if rare-under-normal-load, self-
-//! heartbeat-miss/re-election artifact (`decide::confirm_wait_is_futile`'s
-//! own doc cites the identical issue #268 lineage: a stalled tick loop under
-//! real contention can legitimately invalidate an already-accepted-but-not-
-//! yet-committed entry, and the caller's retry-on-"; retry" convention then
-//! re-proposes — harmless to apply, real extra WAL/replicate/apply work,
-//! exactly `provision_tablet`'s own documented amplification class). Measured
-//! at most one such extra propose per run across 50 real local runs on this
-//! box (never on the per-key side, whose single-item writes apply too fast
-//! to expose the same window) — `RETRY_MARGIN` gives headroom past that
-//! measured max without weakening the actual claim (batched proposals stay
-//! roughly `BATCH_WRITE_MAX_ITEMS`x fewer than per-key, not "close to
-//! per-key"). This is pre-existing `cp_kind_raw_local` behavior, not
-//! something this change introduces or fixes — see issue #911 for the
-//! follow-up filed on it.
+//! extra accepted propose — harmless to apply, real extra WAL/replicate/
+//! apply work, exactly `provision_tablet`'s own documented amplification
+//! class.
+//!
+//! **This margin's original explanation (issue #911) is stale as of
+//! 2026-09-16 (issue #971).** It used to attribute the extra propose to
+//! `cp_kind_raw_local`'s confirm loop giving up on `decide::
+//! confirm_wait_is_futile`'s `!is_leader()` clause alone. That specific
+//! hazard is fixed for `cp_kind_raw_local` (#911), `cp_kind_eval_local`
+//! (#967), and every remaining confirm loop in `write_path.rs`
+//! (`poll_probe`/`cp_batch_local`, `cp_put_local`, `cp_delete_local`) by
+//! #971, and `decide::confirm_wait_is_futile` itself is deleted — no
+//! confirm loop anywhere in this crate can re-propose an already-accepted
+//! entry on `!is_leader()` alone any more, provably so since the unsafe
+//! predicate no longer exists to be called. **The margin itself could not
+//! be removed, though**: a same-box, unloaded, single run against the
+//! #971 fix still hit exactly one extra accepted propose (9 vs. the
+//! expected 8, `batched_write_beats_per_key`), so whatever is producing it
+//! is not (or not only) the confirm-loop hazard the original explanation
+//! named — an unexplained, pre-existing amplification source, not
+//! something this change introduces. `RETRY_MARGIN` stays until that
+//! source is found and its own issue is filed.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -277,13 +283,14 @@ async fn batched_write_beats_per_key() {
         // BatchWriteItem call — one accepted propose per chunk, not per item.
         let expected_chunks = N.div_ceil(BATCH_WRITE_MAX_ITEMS) as i64;
         // A freshly-hosted tablet's first burst of writes can occasionally see
-        // one extra accepted propose under real contention (a genuine, if rare
-        // in normal operation, self-heartbeat-miss/re-election artifact in
-        // `cp_kind_raw_local`'s confirm loop — see this file's module doc).
-        // This margin absorbs that pre-existing, already-idempotent-in-effect
-        // behavior without weakening the actual claim below (batched stays
-        // roughly `BATCH_WRITE_MAX_ITEMS`x fewer proposals than per-key, never
-        // close to it).
+        // one extra accepted propose under real contention. This margin
+        // absorbs that pre-existing, already-idempotent-in-effect behavior
+        // without weakening the actual claim below (batched stays roughly
+        // `BATCH_WRITE_MAX_ITEMS`x fewer proposals than per-key, never close
+        // to it). Its original explanation (a `cp_kind_raw_local` confirm-loop
+        // `!is_leader()` false negative, issue #911) is stale — that specific
+        // hazard is fixed everywhere in this crate as of issue #971 — but the
+        // margin itself is still needed: see this file's module doc.
         const RETRY_MARGIN: i64 = 3;
         let before_batched = metric_value(&metrics(dynamo_addr).await, PROPOSALS);
         let batched_wall = std::time::Instant::now();

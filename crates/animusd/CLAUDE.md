@@ -243,8 +243,8 @@ reusing the captured config is the point of the test.
 - **`topology`/`decide` moved to `animus-node`** (ADR 0061 rung C1) — pure,
   side-effect-free routing decisions (`decide_cp_route`, `tablet_for_key`,
   `format_not_leader_refusal`/`parse_not_leader_refusal`) and decision
-  predicates (`frozen_refusal`, `confirm_wait_is_futile`,
-  `read_should_retry`, `align_split_key`, `byte_weighted_median`,
+  predicates (`frozen_refusal`, `read_should_retry`, `align_split_key`,
+  `byte_weighted_median`,
   `other_tablet_replica_addr`/`decide_forward_retry`), respectively — moved
   verbatim into the `E: Env`-generic `animus-node` crate, visibility widened
   `pub(crate)` → `pub` since a crate boundary now sits where an in-crate
@@ -253,19 +253,22 @@ reusing the captured config is the point of the test.
   `topology::decide_cp_route`/`decide::frozen_refusal` call site kept
   compiling unchanged. `decide`'s predicates (originally lifted out of
   `impl ClientCtx` by ADR 0061 Phase A rung A6) take primitive facts
-  (`is_frozen: bool`, `engine_applied_index: u64`, `is_leader: bool`)
-  rather than `&CpGroup` — the caller in `lib.rs` still reads those fields
-  off the real `ProdEnv`-backed handle immediately before calling in, since
-  `CpGroup` can't be constructed without bring-up. `confirm_futility_tests`
+  (`is_frozen: bool`) rather than `&CpGroup` — the caller in `lib.rs` still
+  reads those fields off the real `ProdEnv`-backed handle immediately
+  before calling in, since `CpGroup` can't be constructed without bring-up.
+  **`decide::confirm_wait_is_futile` (moved here alongside the rest) was
+  deleted by issue #971** — its `!is_leader()` clause was unsafe for every
+  one of its callers (issues #911, #967, #971); the leadership-independent
+  replacement, `kind_batch_confirm_superseded`, stayed in `animusd::lib`
+  rather than moving to `animus-node`, since every one of its own callers
+  is itself `animusd`-local. `confirm_futility_tests`
   (in-crate here, real-socket, `#[tokio::test(flavor = "multi_thread")]`)
-  deliberately stays in `lib.rs` rather than moving alongside
-  `confirm_wait_is_futile`: it proves the wired end-to-end fast-fail
-  behavior through a real `CpGroup` propose/apply/poll round trip with
-  timing assertions, not the predicate in isolation — moving it would have
-  broken `animus-node`'s "no bring-up" invariant for no benefit, since
-  `decide::confirm_wait_is_futile` already has its own direct truth-table
-  unit tests there. See `animus-node/CLAUDE.md` for the full module docs,
-  now maintained there instead of here.
+  proves the wired end-to-end fast-fail behavior through a real `CpGroup`
+  propose/apply/poll round trip with timing assertions, not a predicate in
+  isolation — `kind_batch_confirm_superseded`'s own direct truth-table
+  unit tests (`kind_batch_confirm_superseded_tests`, `animusd::lib`) cover
+  the predicate itself. See `animus-node/CLAUDE.md` for the full module
+  docs, now maintained there instead of here.
 - **`ClientRequest`/`ClientResponse`/`Surface`/`surface_of`/
   `is_relayable_command`, plus the plain-data types they embed
   (`KindWriteOp`/`PendingKindWrite`/`TxnTableWrite`/`TxnPrecondition`/
@@ -2360,6 +2363,32 @@ issue #911, not itself reliably reproducible in `SimEnv` — see
 for why the direct unit tests of the extracted decision function, plus the
 fast-fail regression above, are this fix's actual test evidence rather than
 a live-race reproduction.
+
+**`poll_probe` (the shared primitive behind `cp_batch_local`, the raw
+`PutBatch` client-protocol write) and `cp_put_local`/`cp_delete_local`
+(the raw `Put`/`Delete` client-protocol writes) carried the same
+`!is_leader()` hazard, unfixed, until issue #971.** All three predate
+`cp_kind_raw_local`/`cp_kind_eval_local`'s own fixes and share this file's
+oldest confirm-loop shape: a value-equality primary channel (`local_get`/
+`local_get_kind`), falling through to `decide::confirm_wait_is_futile`
+verbatim once inconclusive. Fixed the same way: all three now call
+`kind_batch_confirm_superseded` instead, keeping their own value-equality
+fallback (and, for `poll_probe`, its `ProbeIdentity` idempotency gate)
+exactly as before — only the futility signal changed, not the confirm
+channel or the probe-vs-apply re-check around it (still needed here,
+unlike `cp_kind_eval_local`: a value probe can race its own write becoming
+visible during its own `.await`, which `kind_batch_confirm_superseded`'s
+synchronous local reads cannot by themselves disambiguate from a genuine
+supersession). `decide::confirm_wait_is_futile` had no remaining caller
+once these three were fixed and was deleted, along with its unit tests
+(`crates/animus-node/src/decide.rs`). Regression:
+`write_path.rs`'s `cp_batch_local_genuine_loss_tests` (mirrors
+`cp_kind_eval_local_genuine_loss_tests` for `cp_batch_local`/`poll_probe`
+— proves the fast-fail path for a genuinely truncated entry is unchanged);
+`cp_put_local`/`cp_delete_local` share the identical `kind_batch_
+confirm_superseded` call and are covered by that function's own direct
+unit tests plus `poll_probe_identity_tests`' existing live coverage of the
+same confirm-loop shape.
 
 **`cp_scan_kind` (ADR 0041)** is `cp_scan`'s single-tablet, kind-scoped
 sibling — the LSI `Query` read primitive: unlike `cp_scan`'s per-table

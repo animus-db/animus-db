@@ -1713,7 +1713,7 @@ impl ReadConsistency {
 
 /// How a [`ClientCtx::poll_probe`] confirm wait ended: the probed effect
 /// appeared (`Confirmed`), the wait became provably futile before the
-/// deadline (`Superseded` — see [`decide::confirm_wait_is_futile`]), or
+/// deadline (`Superseded` — see [`kind_batch_confirm_superseded`]), or
 /// the deadline elapsed with the accepted entry still plausibly in flight
 /// (`TimedOut`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1818,13 +1818,15 @@ fn classify_kind_batch_outcome(
     }
 }
 
-/// The leadership-independent half of a `KindBatch`/`KindEval` confirm
-/// loop's superseded decision (issues #911, #967) — shared by
-/// `write_path.rs`'s `cp_kind_raw_local` and `cp_kind_eval_local`, the two
-/// confirm loops that gave up on `classify_kind_batch_outcome` returning
-/// `Inconclusive` (issue #911's fix), NOT `decide::confirm_wait_is_futile`.
-/// That predicate's own `!is_leader()` clause is not proof of loss for
-/// either caller — a term bump from a missed heartbeat deadline under real
+/// The leadership-independent half of a CP write confirm loop's superseded
+/// decision (issues #911, #967, #971) — shared by `write_path.rs`'s
+/// `cp_kind_raw_local`, `cp_kind_eval_local`, `poll_probe` (the shared
+/// primitive behind `cp_batch_local`) and `cp_put_local`/`cp_delete_local`,
+/// every confirm loop in the file. All five used to give up on
+/// `decide::confirm_wait_is_futile` (deleted — this function replaced its
+/// only remaining callers). That predicate's own `!is_leader()` clause was
+/// not proof of loss for any of them — a term bump from a missed heartbeat
+/// deadline under real
 /// contention flips `is_leader()` false well before anyone can tell whether
 /// an already-accepted entry will still commit, and `kind_batch_outcome`/
 /// `engine_applied_index` are plain local reads needing no leadership at
@@ -10352,10 +10354,6 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     // eventual-read-specific failure a client can ever observe, only an
     // eventual read that quietly cost what a strong one costs.
 
-    // The futility predicate this used to hold (`confirm_wait_is_futile`)
-    // moved to [`decide::confirm_wait_is_futile`] (ADR 0061 A6) — see that
-    // function's own doc for the full two-signal rationale (issue #268).
-
     // ---- multi-participant transactions (ADR 0018 §2/PR4) --------------------
 
     // ---- in-doubt transaction recovery (ADR 0018 §2/PR5) ------------------
@@ -13599,7 +13597,7 @@ const BROADCAST_EXHAUSTED_BACKOFF: Duration = Duration::from_millis(250);
 /// instant the apply task advances past the entry's index, not by polling on
 /// a timer. This constant is no longer a poll granularity: it only bounds
 /// how long that park can go without a **forced** re-check, so a caller's
-/// own `confirm_wait_is_futile`/deadline logic still fires on schedule even
+/// own `kind_batch_confirm_superseded`/deadline logic still fires on schedule even
 /// when the watched index never applies at all (the group loses its leader,
 /// a quorum is lost, the entry gets superseded) — `AppliedWatch::bump` never
 /// wakes for that outcome, since nothing ever advances. A write that
@@ -16301,16 +16299,18 @@ pub async fn read_frame<T: DeserializeOwned, S: AsyncRead + Unpin>(
 // alongside the function itself (ADR 0061 A6, formerly `auto_split_median_tests`
 // here).
 
-/// Regression tests for the end-to-end fast-fail behavior
-/// [`decide::confirm_wait_is_futile`] enables (issue #268) — in-crate
+/// Regression tests for the end-to-end fast-fail behavior a confirm loop's
+/// own futility check ([`kind_batch_confirm_superseded`], formerly
+/// `decide::confirm_wait_is_futile`) enables (issue #268) — in-crate
 /// because they need a private [`CpGroup`] handle and the `pub(crate)`
 /// [`ClientCtx::cp_kind_local`], which no external `tests/` file can reach
 /// (the same reason `gsi_drain_cursor_tests` lives inside `index_drain.rs`).
 /// Run via `cargo test -p animusd --lib`.
 ///
 /// **Deliberately not moved into `decide`'s own test module (ADR 0061 A6):**
-/// unlike `decide::confirm_wait_is_futile`'s own direct unit tests (a plain
-/// truth table over the predicate's three primitive inputs), these prove
+/// unlike `kind_batch_confirm_superseded`'s own direct unit tests
+/// (`kind_batch_confirm_superseded_tests`, a plain truth table over the
+/// predicate's inputs), these prove
 /// the *wired* behavior — a real `CpGroup` propose/apply/poll round trip
 /// through `cp_kind_local`, with real timing assertions — which needs a
 /// live single-node cluster regardless of how pure the underlying predicate

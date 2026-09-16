@@ -184,3 +184,49 @@ margin-tolerant one.
    intractable across more than one caller, testing the extracted pure
    decision in isolation is the correct fallback, not a weaker substitute
    pursued only for lack of effort.
+
+## Amendment (issue #971): the fix covered every caller; a symptom attributed to it did not go away
+
+`poll_probe` (the primitive behind `cp_batch_local`, the raw `PutBatch`
+client-protocol write) and `cp_put_local`/`cp_delete_local` (the raw
+`Put`/`Delete` client-protocol writes) — this file's oldest confirm-loop
+family, predating both fixes above — carried the identical `!is_leader()`
+hazard, unfixed. Closed the same way: all three now call
+`kind_batch_confirm_superseded` instead of `decide::confirm_wait_is_futile`,
+keeping their own value-equality fallback (and, for `poll_probe`, its
+`ProbeIdentity` idempotency gate) and the probe-vs-apply re-check around it
+exactly as before — these three, unlike `cp_kind_eval_local`, still needed
+that re-check kept: a value probe (`local_get`/`local_get_kind`) can race
+its own write becoming visible during its own `.await`, an ambiguity
+`kind_batch_confirm_superseded`'s synchronous local reads cannot resolve by
+themselves the way `classify_kind_batch_outcome`'s outcome channel can.
+`decide::confirm_wait_is_futile` had no remaining caller once these three
+were fixed and was deleted outright, along with its own unit tests — not
+just "fixed in place" as the two prior callers were, since nothing else in
+the tree could reintroduce a call to it.
+
+**A second, independent lesson, from trying to also tighten
+`batch_write.rs`'s `RETRY_MARGIN`** (a tolerance for "one extra accepted
+Raft propose" on `BatchWriteItem`'s batched phase, whose comment blamed
+this exact `!is_leader()` hazard in `cp_kind_raw_local`'s confirm loop,
+issue #911). With every confirm loop in the crate now provably unable to
+hit that hazard — the predicate that enabled it no longer exists to be
+called — the margin's stated cause was gone, so tightening it to exact
+equality looked justified from the code alone. It was not: a single
+unloaded local run against the fix still produced one extra accepted
+propose (9 vs. the expected 8). The margin's *comment* had one named cause,
+but the *symptom* it covers apparently has at least one other, still
+unidentified, source (plausibly related to `provision_tablet`'s own
+documented amplification class, per the same comment, which is a genuinely
+different mechanism from a confirm-loop false negative). **Fixing the one
+cause a tolerance's comment names does not prove the tolerance itself is
+now unnecessary — the comment is a hypothesis about the symptom's origin,
+not a proof, and a shared symptom can have more than one cause even when
+only one was ever diagnosed.** Verify a tolerance can be removed by
+actually removing it and observing the (previously flaky/marginal) test
+pass repeatedly, never by code-reading the one named cause closed and
+inferring the rest. Here that check failed on the very first run, so the
+margin was restored, the comment corrected to say the named cause is closed
+but the symptom persists for an unexplained reason, and the real source is
+left as an open, separately-fileable question rather than folded into this
+fix.
