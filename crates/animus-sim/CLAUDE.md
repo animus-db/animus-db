@@ -366,15 +366,49 @@ function of one seed. This is the substrate every distributed test runs on.
   regression here looks like).
 - **Multiplexed `(node, stream)` addressing (ADR 0026).** The inbox/waker maps
   are keyed `(NodeId, u64)` instead of `NodeId`, so a node can be addressed on
-  more than one stream; `crash`/`stop` now node-prefix-scan both maps (the same
-  pattern `Disk::list`'s node-prefix scan already used) to clear *every* stream
-  of a crashed/stopped node, not just its primary one. `Simulator::env` still
-  only pre-registers `PRIMARY_STREAM`'s inbox entry — any other stream is
-  created lazily on first send/recv. No new RNG draw or timeline event shape,
-  so the determinism argument (trace = pure function of the seed) is unchanged;
-  `tests/determinism.rs::multiplexed_streams_are_isolated_and_deterministic`
-  proves it directly (two streams to one node don't cross-talk, and the run —
-  trace included — reproduces byte-for-byte from the seed).
+  more than one stream; `crash`/`stop` clear *every* stream of a
+  crashed/stopped node, not just its primary one, by scanning both maps for
+  the target node's own entries (see `node_prefix_keys` below for how, as of
+  issue #841). `Simulator::env` still only pre-registers `PRIMARY_STREAM`'s
+  inbox entry — any other stream is created lazily on first send/recv. No new
+  RNG draw or timeline event shape, so the determinism argument (trace = pure
+  function of the seed) is unchanged; `tests/determinism.rs::
+  multiplexed_streams_are_isolated_and_deterministic` proves it directly (two
+  streams to one node don't cross-talk, and the run — trace included —
+  reproduces byte-for-byte from the seed).
+
+- **`SimState::node_prefix_keys` (issue #841) is the one place the
+  `disks`/`inboxes`/`recv_wakers` node-prefix scans live**, replacing seven
+  call sites (`wipe_disk` ×1, `crash` ×3, `stop` ×3) that used to be a full
+  `.keys().filter(|(n, _)| *n == node)` pass over *every* node's entries —
+  paid repeatedly by every fault-injecting corpus (`crash`/`stop`/`restart`
+  at every `ANIMUS_*_SEEDS` depth) and, under ADR 0050's per-tablet private
+  engine, `disks` in particular can hold a large multi-node, multi-tablet
+  entry count. `disks: BTreeMap<(NodeId, String), _>` and
+  `inboxes`/`recv_wakers: BTreeMap<(NodeId, u64), _>` are both lexicographic
+  on `NodeId` first, so all of one node's entries sit contiguously; the
+  helper is `map.range((node.clone(), K::default())..).take_while(|((n,
+  _), _)| n == node)`, generic over the trailing key type `K: Ord + Clone +
+  Default` — `u64::default() == u64::MIN` and `String::default() == ""` are
+  each type's own `Ord` minimum, so one shape covers both maps with no
+  artificial upper bound needed, mirroring `Disk::list`'s own
+  `(node, String::new())..` + `take_while` prefix scan (below) rather than
+  inventing a second convention. Cost is now O(this node's own entries),
+  not O(every node's). Only `NodeId`'s `Ord` is relied on — nothing here
+  assumes anything about its string form (`NodeId::mint`'s ids don't sort
+  in creation order, so this matters). `task_owner`/`timer_owner` are
+  **not** leading-component maps (`BTreeMap<TaskId/TimerId, NodeId>` — the
+  node is the *value*, not the key prefix) and stay a `.iter().filter()`
+  pass; the `Deliver`-drop scan `stop` added for issue #836 (over
+  `st.timeline`, keyed by `(time, seq)`) isn't one either, for the same
+  reason — neither is in scope for a prefix-range rewrite. Regression:
+  `tests/stop_semantics.rs::other_nodes_are_untouched_by_{crash,stop,
+  wipe_disk}` (a fault op on one node must never read or mutate another
+  node's disk/inbox/task — using `nid(10)` as the fault target since it
+  sorts lexicographically *between* `nid(1)` and `nid(2)`, the boundary
+  case an off-by-one range bound would get wrong) and `src/lib.rs`'s own
+  `#[cfg(test)] mod tests` (`node_prefix_keys_scans_only_the_target_node_
+  {u64,string}_suffixed`, unit-level, since `SimState` is private).
 
 - **`NetConfig`'s new knobs share one fixed draw order per send, all gated on
   their own threshold being non-zero** (ADR 0061 rung B2/B3): drop roll →
@@ -437,7 +471,11 @@ function of one seed. This is the substrate every distributed test runs on.
 process-exit fidelity (issue #836): a message still in flight when its
 target is `stop`ped is discarded, never surfacing in a fresh incarnation's
 inbox after restart, while the discard is a one-time snapshot that doesn't
-mute traffic a fresh incarnation sends/receives afterward. `tests/
+mute traffic a fresh incarnation sends/receives afterward. The same file's
+`other_nodes_are_untouched_by_{crash,stop,wipe_disk}` (issue #841) prove the
+`node_prefix_keys` range-scan rewrite stayed correct, not just cheaper: a
+fault op on one node leaves every other node's disk, inbox, and running
+task exactly as it was. `tests/
 sleep_drop.rs` proves a `Sleep` dropped before its deadline leaves no
 phantom timer on the timeline (issue #837) and that `stop`/`shutdown`
 dropping a task parked mid-`sleep` doesn't deadlock (see "What's

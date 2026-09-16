@@ -4,11 +4,17 @@
 //! before `stop` but not yet delivered must never land in a later
 //! incarnation's inbox on restart. See `crates/animus-sim/CLAUDE.md`'s
 //! `stop` section for the full contract this proves.
+//!
+//! Also covers issue #841: `crash`/`stop`/`wipe_disk` node-prefix-range
+//! (not full-)scan `disks`/`inboxes`/`recv_wakers` for the target node —
+//! the `other_nodes_are_untouched_by` tests below prove that rewrite didn't
+//! just get cheaper, it stayed correct: a fault op on one node must never
+//! read or mutate another node's disk, inbox, or running task.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use animus_env::{EnvExt, Network, nid};
+use animus_env::{Disk, EnvExt, Network, NodeId, nid};
 use animus_sim::{NetConfig, Simulator};
 
 /// A message sent before `stop` — still in flight on the timeline — must
@@ -157,4 +163,170 @@ fn seed_from_env(default: u64) -> u64 {
         Ok(s) => s.parse().unwrap_or(default),
         Err(_) => default,
     }
+}
+
+// --- Issue #841: a fault op on one node must not touch another node's
+// disk, inbox, or task ownership. `nid(10)` == "n10" is always the fault
+// target below: lexicographically it sorts *between* `nid(1)` == "n1" and
+// `nid(2)` == "n2" (NodeId's own Ord), which is exactly the boundary a
+// naive off-by-one range bound would get wrong. `nid(1)`/`nid(2)` are the
+// bystanders each test asserts stayed untouched.
+
+const FILE: &str = "wal";
+
+/// Write durable bytes to `node`'s `FILE`, driving the write to completion.
+fn write_disk(sim: &mut Simulator, node: NodeId, bytes: &'static [u8]) {
+    let env = sim.env(node);
+    env.clone().spawn_task(async move {
+        env.append(FILE, bytes).await.unwrap();
+        env.sync(FILE).await.unwrap();
+    });
+    assert!(sim.run_until_quiescent(10_000), "disk write should settle");
+}
+
+/// Read `node`'s `FILE` back, driving the read to completion.
+fn read_disk(sim: &mut Simulator, node: NodeId) -> Vec<u8> {
+    let out = Arc::new(Mutex::new(Vec::new()));
+    let env = sim.env(node);
+    let o = Arc::clone(&out);
+    env.clone().spawn_task(async move {
+        *o.lock().unwrap() = env.read(FILE).await.unwrap();
+    });
+    assert!(sim.run_until_quiescent(10_000), "disk read should settle");
+    out.lock().unwrap().clone()
+}
+
+/// Spawn a perpetual echo loop on `node`: every message it receives is sent
+/// straight back to whoever sent it. Used to prove `node`'s task (and its
+/// `recv` registration) is still alive and polled after a fault op on some
+/// *other* node.
+fn spawn_echo(sim: &Simulator, node: NodeId) {
+    let env = sim.env(node);
+    env.clone().spawn_task(async move {
+        loop {
+            let msg = env.recv().await;
+            env.send(msg.from, msg.payload).await;
+        }
+    });
+}
+
+/// Probe `target`'s echo loop from `prober` with a one-byte round trip and
+/// assert the exact byte comes back.
+fn assert_echo_round_trips(sim: &mut Simulator, prober: NodeId, target: NodeId, tag: u8) {
+    let seen = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let env = sim.env(prober);
+    let out = Arc::clone(&seen);
+    env.clone().spawn_task(async move {
+        env.send(target, vec![tag]).await;
+        let reply = env.recv().await;
+        out.lock().unwrap().push(reply.payload[0]);
+    });
+    assert!(
+        sim.run_until_quiescent(10_000),
+        "echo round trip (tag={tag}) should settle"
+    );
+    assert_eq!(
+        &*seen.lock().unwrap(),
+        &[tag],
+        "target's echo task must still be alive and responsive (tag={tag})"
+    );
+}
+
+/// Shared scaffold for the three `other_nodes_are_untouched_by_*` tests
+/// below: set up bystanders `nid(1)`/`nid(2)` (durable disk content, a live
+/// echo task on `nid(1)`, one message pre-queued — unconsumed — in
+/// `nid(2)`'s inbox) and matching durable disk content on the fault target
+/// `nid(10)`, run `fault` on `nid(10)`, then assert every bystander's disk,
+/// inbox and task are exactly as they were.
+fn assert_fault_op_leaves_other_nodes_untouched(seed: u64, fault: impl FnOnce(&mut Simulator)) {
+    let mut sim = Simulator::new(seed);
+    let a = nid(1); // bystander: has a live task through the fault
+    let b = nid(10); // fault target: sorts between `a` and `c`
+    let c = nid(2); // bystander: has an unconsumed pre-queued inbox message
+    let prober = nid(99);
+
+    write_disk(&mut sim, a.clone(), b"node-a-durable-bytes");
+    write_disk(&mut sim, b.clone(), b"node-b-durable-bytes");
+    write_disk(&mut sim, c.clone(), b"node-c-durable-bytes");
+
+    spawn_echo(&sim, a.clone());
+    assert_echo_round_trips(&mut sim, prober.clone(), a.clone(), 1);
+
+    // Queue one message in `c`'s inbox with no task consuming it yet, so it
+    // sits in `st.inboxes`/is the only entry for `c` while the fault op on
+    // `b` range-scans past it.
+    {
+        let env = sim.env(prober.clone());
+        let target = c.clone();
+        env.clone().spawn_task(async move {
+            env.send(target, vec![0xC1]).await;
+        });
+        assert!(
+            sim.run_until_quiescent(10_000),
+            "pre-queued send to c should settle"
+        );
+    }
+
+    fault(&mut sim);
+
+    // `a`'s disk, still exactly what was written.
+    assert_eq!(
+        read_disk(&mut sim, a.clone()),
+        b"node-a-durable-bytes",
+        "bystander a's disk must be untouched by a fault op on b (seed={seed})"
+    );
+    // `c`'s disk, still exactly what was written.
+    assert_eq!(
+        read_disk(&mut sim, c.clone()),
+        b"node-c-durable-bytes",
+        "bystander c's disk must be untouched by a fault op on b (seed={seed})"
+    );
+
+    // `a`'s task (and task_owner/recv_wakers entries) is still alive.
+    assert_echo_round_trips(&mut sim, prober.clone(), a.clone(), 2);
+
+    // `c`'s pre-queued inbox message survived exactly, in order: spawn its
+    // echo loop only now and check the very first thing it gets back is
+    // the byte queued *before* the fault op on b.
+    spawn_echo(&sim, c.clone());
+    let first = Arc::new(Mutex::new(Vec::<u8>::new()));
+    {
+        let env = sim.env(prober.clone());
+        let out = Arc::clone(&first);
+        env.clone().spawn_task(async move {
+            let reply = env.recv().await;
+            out.lock().unwrap().push(reply.payload[0]);
+        });
+        assert!(
+            sim.run_until_quiescent(10_000),
+            "c's pre-queued message should echo back (seed={seed})"
+        );
+    }
+    assert_eq!(
+        &*first.lock().unwrap(),
+        &[0xC1],
+        "c's inbox entry queued before the fault on b must survive it \
+         unchanged (seed={seed})"
+    );
+
+    // And a fresh round trip to `c` still works too.
+    assert_echo_round_trips(&mut sim, prober, c, 3);
+}
+
+#[test]
+fn other_nodes_are_untouched_by_crash() {
+    let seed = seed_from_env(0x5701_0841);
+    assert_fault_op_leaves_other_nodes_untouched(seed, |sim| sim.crash(nid(10)));
+}
+
+#[test]
+fn other_nodes_are_untouched_by_stop() {
+    let seed = seed_from_env(0x5701_0842);
+    assert_fault_op_leaves_other_nodes_untouched(seed, |sim| sim.stop(nid(10)));
+}
+
+#[test]
+fn other_nodes_are_untouched_by_wipe_disk() {
+    let seed = seed_from_env(0x5701_0843);
+    assert_fault_op_leaves_other_nodes_untouched(seed, |sim| sim.wipe_disk(nid(10)));
 }

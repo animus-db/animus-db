@@ -580,6 +580,29 @@ impl SimState {
         self.node_disk_cfg.get(node).unwrap_or(&self.disk_cfg)
     }
 
+    /// Collect the keys of `map` whose leading component equals `node`, in
+    /// key order, via a `BTreeMap::range` prefix scan — O(this node's own
+    /// entries) rather than a full O(every node's) scan (issue #841).
+    /// Mirrors `Disk::list`'s existing `(node, String::new())..` +
+    /// `take_while` shape (below) generalized over the trailing key
+    /// component: `u64` for `inboxes`/`recv_wakers`, `String` for `disks`.
+    /// `K::default()` is the lower bound — `u64::default() == u64::MIN` and
+    /// `String::default() == ""` are already each type's own `Ord` minimum,
+    /// so no artificial maximum is needed and no per-type helper either.
+    /// `NodeId`'s `Ord` is the only ordering this relies on; nothing here
+    /// assumes anything about its string form. Returns owned keys (not a
+    /// borrowing iterator) because every call site uses them to drive a
+    /// second pass that mutates the same map.
+    fn node_prefix_keys<K, V>(map: &BTreeMap<(NodeId, K), V>, node: &NodeId) -> Vec<(NodeId, K)>
+    where
+        K: Ord + Clone + Default,
+    {
+        map.range((node.clone(), K::default())..)
+            .take_while(|((n, _), _)| n == node)
+            .map(|(k, _)| k.clone())
+            .collect()
+    }
+
     /// The effective network fault/delay model for a message from `from` to
     /// `to`. Resolution order, **most specific wins**: a link override for
     /// the exact directed `(from, to)` pair
@@ -996,12 +1019,7 @@ impl Simulator {
         let mut guard = self.shared.lock();
         let st = &mut *guard;
         let t = st.clock;
-        let keys: Vec<_> = st
-            .disks
-            .keys()
-            .filter(|(n, _)| *n == node)
-            .cloned()
-            .collect();
+        let keys = SimState::node_prefix_keys(&st.disks, &node);
         for k in keys {
             if let Some(f) = st.disks.get_mut(&k) {
                 f.durable.clear();
@@ -1050,23 +1068,13 @@ impl Simulator {
         st.crashed.insert(node.clone());
         // Clear every stream's inbox for this node (ADR 0026): a crashed node's
         // whole inbox is volatile, not just its primary stream's.
-        let inbox_keys: Vec<_> = st
-            .inboxes
-            .keys()
-            .filter(|(n, _)| *n == node)
-            .cloned()
-            .collect();
+        let inbox_keys = SimState::node_prefix_keys(&st.inboxes, &node);
         for k in inbox_keys {
             if let Some(inbox) = st.inboxes.get_mut(&k) {
                 inbox.clear();
             }
         }
-        let waker_keys: Vec<_> = st
-            .recv_wakers
-            .keys()
-            .filter(|(n, _)| *n == node)
-            .cloned()
-            .collect();
+        let waker_keys = SimState::node_prefix_keys(&st.recv_wakers, &node);
         for k in waker_keys {
             st.recv_wakers.remove(&k);
         }
@@ -1074,12 +1082,7 @@ impl Simulator {
             let cfg = st.disk_cfg_for(&node);
             (cfg.torn_tail_on_crash, cfg.corrupt_on_crash)
         };
-        let keys: Vec<_> = st
-            .disks
-            .keys()
-            .filter(|(n, _)| *n == node)
-            .cloned()
-            .collect();
+        let keys = SimState::node_prefix_keys(&st.disks, &node);
         let t = st.clock;
         for k in keys {
             let Some(f) = st.disks.get_mut(&k) else {
@@ -1195,32 +1198,17 @@ impl Simulator {
         }
         // Volatile state dies with the process; durable disk is kept.
         // Clear every stream's inbox for this node (ADR 0026), mirroring `crash`.
-        let inbox_keys: Vec<_> = st
-            .inboxes
-            .keys()
-            .filter(|(n, _)| *n == node)
-            .cloned()
-            .collect();
+        let inbox_keys = SimState::node_prefix_keys(&st.inboxes, &node);
         for k in inbox_keys {
             if let Some(inbox) = st.inboxes.get_mut(&k) {
                 inbox.clear();
             }
         }
-        let waker_keys: Vec<_> = st
-            .recv_wakers
-            .keys()
-            .filter(|(n, _)| *n == node)
-            .cloned()
-            .collect();
+        let waker_keys = SimState::node_prefix_keys(&st.recv_wakers, &node);
         for k in waker_keys {
             st.recv_wakers.remove(&k);
         }
-        let keys: Vec<_> = st
-            .disks
-            .keys()
-            .filter(|(n, _)| *n == node)
-            .cloned()
-            .collect();
+        let keys = SimState::node_prefix_keys(&st.disks, &node);
         for k in keys {
             if let Some(f) = st.disks.get_mut(&k) {
                 f.buffered.clear();
@@ -2186,4 +2174,96 @@ fn gen_below(rng: &mut ChaCha8Rng, n: u64) -> u64 {
         }
     }
     (m >> 64) as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use animus_env::nid;
+
+    use super::SimState;
+
+    /// `node_prefix_keys` over a `u64`-suffixed map (the `inboxes`/
+    /// `recv_wakers` shape) yields exactly the target node's own keys, in
+    /// key order, and nothing for a node with no entries at all — including
+    /// a node whose `NodeId` sorts **between** two others under `NodeId`'s
+    /// own `Ord` (issue #841). `nid` formats as `"n{n}"`, so `nid(10)` ==
+    /// `"n10"` sorts lexicographically between `nid(1)` == `"n1"` and
+    /// `nid(2)` == `"n2"` — a real case this crate's own `NodeId::mint`-free
+    /// test ids hit "for free", not a contrived one.
+    #[test]
+    fn node_prefix_keys_scans_only_the_target_node_u64_suffixed() {
+        let mut map: BTreeMap<(animus_env::NodeId, u64), &'static str> = BTreeMap::new();
+        for (n, streams) in [
+            (nid(1), [0u64, 5, 9].as_slice()),
+            (nid(10), [1, 2].as_slice()),
+            (nid(2), [0, 100].as_slice()),
+        ] {
+            for &s in streams {
+                map.insert((n.clone(), s), "v");
+            }
+        }
+
+        let got: Vec<u64> = SimState::node_prefix_keys(&map, &nid(10))
+            .into_iter()
+            .map(|(_, s)| s)
+            .collect();
+        assert_eq!(
+            got,
+            vec![1, 2],
+            "expected exactly nid(10)'s own entries in key order"
+        );
+
+        let got1: Vec<u64> = SimState::node_prefix_keys(&map, &nid(1))
+            .into_iter()
+            .map(|(_, s)| s)
+            .collect();
+        assert_eq!(got1, vec![0, 5, 9]);
+
+        let got2: Vec<u64> = SimState::node_prefix_keys(&map, &nid(2))
+            .into_iter()
+            .map(|(_, s)| s)
+            .collect();
+        assert_eq!(got2, vec![0, 100]);
+
+        assert!(
+            SimState::node_prefix_keys(&map, &nid(99)).is_empty(),
+            "an absent node must yield no keys at all"
+        );
+    }
+
+    /// The `String`-suffixed shape (`disks`), same node arrangement,
+    /// including several files per node and an absent node.
+    #[test]
+    fn node_prefix_keys_scans_only_the_target_node_string_suffixed() {
+        let mut map: BTreeMap<(animus_env::NodeId, String), &'static str> = BTreeMap::new();
+        for (n, files) in [
+            (nid(1), ["wal", "manifest"].as_slice()),
+            (nid(10), ["wal"].as_slice()),
+            (nid(2), ["wal", "0.sst", "1.sst"].as_slice()),
+        ] {
+            for &f in files {
+                map.insert((n.clone(), f.to_owned()), "v");
+            }
+        }
+
+        let got: Vec<String> = SimState::node_prefix_keys(&map, &nid(10))
+            .into_iter()
+            .map(|(_, f)| f)
+            .collect();
+        assert_eq!(got, vec!["wal".to_owned()]);
+
+        let got2: Vec<String> = SimState::node_prefix_keys(&map, &nid(2))
+            .into_iter()
+            .map(|(_, f)| f)
+            .collect();
+        assert_eq!(
+            got2,
+            vec!["0.sst".to_owned(), "1.sst".to_owned(), "wal".to_owned()],
+            "keys come back in lexicographic order, not insertion order"
+        );
+
+        assert!(SimState::node_prefix_keys(&map, &nid(99)).is_empty());
+    }
 }
