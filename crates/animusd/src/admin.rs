@@ -2193,18 +2193,33 @@ struct AddMemberReq {
 /// `ClientCtx::admin_add_control_member`'s doc); omitted (`null` or absent,
 /// `#[serde(default)]`), the control plane self-mints one (`NodeId::mint`)
 /// instead. `addr` is that node's internal control-Raft listen address, not
-/// its admin/client address — a `host:port` **string**, not a
-/// `std::net::SocketAddr` (issue #662): a literal `ip:port` still works, but
-/// so does a hostname (a Kubernetes pod's stable DNS name), matching every
-/// other address surface (`RoleAddrs::advertise_host`, `ClientResponse::
-/// JoinInfo`, the `ProdEnv::merge_peer` peer book) — `Metadata`'s own
-/// `NodeAddrs.internal` is `String`-typed too, so this was never anything
-/// but an over-restrictive deserialize target; resolution, same as every one
-/// of those other surfaces, happens lazily at dial time
-/// (`TcpStream::connect`'s own `ToSocketAddrs` impl for `&str`), never here.
-/// `labels` seed the minted member's topology labels (ignored for an
-/// operator-supplied `node` that's already a member — see the doc above),
-/// the same shape `AddMemberReq`'s does.
+/// its admin/client address. `labels` seed the minted member's topology
+/// labels (ignored for an operator-supplied `node` that's already a member —
+/// see the doc above), the same shape `AddMemberReq`'s does.
+///
+/// **`addr` is a plain wire-format string, not `SocketAddr` (issue #913)**:
+/// a numeric `ip:port` or a DNS hostname:port, uninterpreted here — exactly
+/// the shape `ProdEnv::merge_peer`/`NodeAddrs`'s own address fields already
+/// use, and every other Kubernetes-pod-facing address surface in this
+/// codebase (`RoleAddrs::advertise_host`, `ClientResponse::JoinInfo`) picked
+/// for the identical reason: a pod's IP is not stable across a restart while
+/// its per-ordinal DNS name is. Before this fix, `SocketAddr`'s own `FromStr`
+/// could only ever parse a numeric address, forcing every caller (the
+/// Kubernetes operator's own growth step included) to resolve and pin a
+/// pod's *current* IP rather than pass its stable hostname — under mutual
+/// TLS with DNS-only certificate SANs, dialing that pinned IP fails the
+/// handshake outright (`ServerName::IpAddress` against a cert with no IP
+/// SAN), permanently, since the very re-registration that would otherwise
+/// replace the IP with the real hostname itself needs a working dial to the
+/// newly-promoted node to land. See `docs/adr/0037-control-plane-membership-change.md`'s
+/// issue #913 amendment and `crates/animus-operator/CLAUDE.md`'s S-07d
+/// section for the full account.
+///
+/// Since widening `addr` to `String` also removed the free shape-checking
+/// `SocketAddr::deserialize` used to give for free, the handler now runs a
+/// cheap `host:port` shape guard of its own (issue #662,
+/// [`looks_like_host_port`]) and returns a clean `400` for a garbled `addr`
+/// instead of accepting anything or failing later as an opaque dial error.
 #[derive(Deserialize)]
 struct AddControlMemberReq {
     #[serde(default)]
@@ -3709,33 +3724,40 @@ mod tests {
         );
     }
 
-    /// Issue #662: `AddControlMemberReq.addr` deserializes a literal
-    /// `ip:port` string, the shape every existing caller already sends.
+    /// Issue #913: `AddControlMemberReq.addr` is a plain wire-format string,
+    /// not `SocketAddr` — before this fix, `SocketAddr`'s own `FromStr`
+    /// rejected any non-numeric address, forcing every caller (the
+    /// Kubernetes operator's own growth step included) to resolve a pod's
+    /// *current* IP rather than pass its stable per-ordinal DNS name. A DNS
+    /// hostname:port must deserialize cleanly now, byte-for-byte, exactly
+    /// as a numeric address always did.
     #[test]
-    fn add_control_member_req_deserializes_a_literal_ip_port_addr() {
+    fn add_control_member_req_accepts_a_dns_hostname_addr() {
+        let hostname = "e2e-3.e2e-internal.animus-e2e.svc.cluster.local:14000";
+        let body = serde_json::json!({"node": "e2e-3", "addr": hostname, "labels": {}}).to_string();
         let req: AddControlMemberReq =
-            serde_json::from_str(r#"{"node":"n1","addr":"127.0.0.1:9001"}"#).unwrap();
-        assert_eq!(req.node.as_ref().map(NodeId::as_str), Some("n1"));
-        assert_eq!(req.addr, "127.0.0.1:9001");
+            serde_json::from_str(&body).expect("a DNS hostname:port addr must deserialize");
+        assert_eq!(req.addr, hostname);
+        assert_eq!(req.node.as_ref().map(NodeId::as_str), Some("e2e-3"));
     }
 
-    /// Issue #662, the actual bug: a DNS name (a Kubernetes pod's stable
-    /// hostname) must deserialize too — it never could while `addr` was
-    /// `std::net::SocketAddr`-typed, since that type's `Deserialize` impl
-    /// only ever accepts a literal address.
+    /// The pre-existing numeric shape must keep working unchanged — this
+    /// fix widens the accepted shape, it does not narrow or reinterpret the
+    /// one every existing caller (the CLI's own `run_control_add*`, every
+    /// `SimCluster` test) already sends.
     #[test]
-    fn add_control_member_req_deserializes_a_hostname_addr() {
+    fn add_control_member_req_still_accepts_a_numeric_socket_addr() {
+        let body = serde_json::json!({"addr": "127.0.0.1:14000"}).to_string();
         let req: AddControlMemberReq =
-            serde_json::from_str(r#"{"addr":"pod-1.animus-internal.ns.svc.cluster.local:9001"}"#)
-                .unwrap();
-        assert_eq!(req.node, None, "omitted `node` self-mints, per ADR 0037");
-        assert_eq!(req.addr, "pod-1.animus-internal.ns.svc.cluster.local:9001");
+            serde_json::from_str(&body).expect("a numeric ip:port addr must still deserialize");
+        assert_eq!(req.addr, "127.0.0.1:14000");
+        assert_eq!(req.node, None);
     }
 
-    /// [`looks_like_host_port`] is the handler's only shape guard now that
+    /// [`looks_like_host_port`] is the handler's own shape guard now that
     /// `addr` is a bare `String` — every JSON string value deserializes, so
     /// this is what actually rejects a garbled `addr` with a `400` instead
-    /// of silently accepting it.
+    /// of silently accepting it (issue #662).
     #[test]
     fn looks_like_host_port_accepts_literal_and_hostname_forms() {
         assert!(looks_like_host_port("127.0.0.1:9001"));

@@ -58,6 +58,23 @@ hook re-injects a summary at boot; treat a violation like a failed gate.
    or the maintainer has overridden the objection explicitly and
    deliberately, in so many words. A silent bypass is a gate violation.
 
+5. **Independent work runs in a separate session, one session per
+   workstream.** A session is one container: one 4-core CPU budget and one
+   `CARGO_TARGET_DIR`, and more than two concurrent test gates on it produce
+   spurious `ProdEnv` timeouts that read like real failures (and a stale
+   binary served from the shared target dir can even run another worktree's
+   test). So a session keeps only work that is *entangled* — a stacked
+   series and the defects that gate it — and runs at most two heavy agents
+   at a time. Anything independent (the next unrelated issues on a backlog,
+   or a pre-existing defect discovered mid-task that does not gate the
+   current PR) is launched in a **new session in the same environment**
+   (`create_session`), briefed with its scope, an explicit do-not-touch list
+   of what the parent owns, the mechanics that session needs (PR creation,
+   gates, worktrees, commit trailers with its own session URL), and the
+   instruction to report to the maintainer in its own chat. The parent
+   session never launches backlog work after the split, and the split is a
+   normal step, not an exception to announce.
+
 
 
 AnimusDB is a masterless, linearly-scalable NoSQL database in Rust. **For v1

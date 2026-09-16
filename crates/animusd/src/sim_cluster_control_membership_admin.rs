@@ -72,12 +72,23 @@
 //! fixed seeds each, mirroring every other `sim_cluster_*` module's own
 //! convention. Seed replay (repo convention): `ANIMUS_SEED=<seed> cargo
 //! test -p animusd --lib <scenario name>`.
+//!
+//! **(13) is a later addition, not one of the original 12 conversions**:
+//! [`run_remove_right_after_leadership_transfer_is_not_refused_for_merely_slow_peers`]
+//! pins issue #923 (the quorum-reachability guard misjudging a
+//! merely-slow-to-ack, genuinely alive peer as dead moments after a
+//! leadership transfer) — see that function's own doc for the mechanism.
+//! `cluster_with_one_dead_follower`'s own setup (the shared fixture for
+//! (5)/(6)/(7)) now settles past `CONTROL_LEADER_TAKEOVER_GRACE` before
+//! crashing anyone, so those genuine-staleness scenarios stay decoupled
+//! from the new post-election grace issue #923's fix introduced.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use animus_control::node::CONTROL_PEER_LIVENESS_TIMEOUT;
+use animus_control::node::{CONTROL_LEADER_TAKEOVER_GRACE, CONTROL_PEER_LIVENESS_TIMEOUT};
 use animus_env::{EnvExt, NodeId, nid};
+use animus_sim::NetConfig;
 
 use super::sim_cluster::SimCluster;
 use super::sim_cluster_console::{env_seed, json};
@@ -270,6 +281,14 @@ fn cluster_with_one_dead_follower(seed: u64) -> (SimCluster, u64, u64, u64) {
     let followers: Vec<u64> = (0..3u64).filter(|&i| i != leader).collect();
     let dead_id = followers[0];
     let live_target_id = followers[1];
+
+    // Let `leader`'s own post-election `CONTROL_LEADER_TAKEOVER_GRACE`
+    // (issue #923) fully lapse before crashing anyone: this fixture means
+    // to prove genuine per-peer staleness detection, not the separate
+    // "I only just took over, give my first heartbeat round more room"
+    // allowance a crash timed right at election would otherwise partly
+    // absorb.
+    cluster.run_for(CONTROL_LEADER_TAKEOVER_GRACE);
 
     cluster.crash(dead_id);
     // Deterministic virtual-time advance — no real-scheduling-jitter
@@ -1068,7 +1087,228 @@ fn admin_config_reports_the_internal_addr_the_cli_resolves_control_add_through_o
 }
 
 // ---------------------------------------------------------------------------
-// (13) control_member_add_accepts_a_dns_hostname_addr / rejects_a_portless_addr
+// (13) remove_right_after_leadership_transfer_is_not_refused_for_merely_slow_peers
+//      (issue #923 — not one of the original 12 real-socket conversions;
+//      added directly here since `SimEnv`'s deterministic timing/fault
+//      injection is exactly what pinning this race needs)
+// ---------------------------------------------------------------------------
+
+/// Regression for issue #923: CI saw `runtime_added_voter_survives_
+/// leadership_change_to_a_different_original_voter` flake with
+/// `admin_remove_control_member`'s own quorum-reachability guard refusing a
+/// removal moments after a leadership transfer, naming two perfectly alive
+/// original voters as "apparently dead."
+///
+/// Root cause: `RaftCore::become_leader` seeds every peer's `last_contact`
+/// to the instant this leadership stint begins — a courtesy timestamp, never
+/// a genuine `AppendEntriesResp` ack, there only so a peer that stays
+/// silent the ENTIRE stint can't hide behind the "never contacted yet"
+/// grace forever. But `control_peer_believed_alive` used to age that seed
+/// out after the same steady-state `CONTROL_PEER_LIVENESS_TIMEOUT` (500ms)
+/// as a genuine ack, with no extra allowance for "this leader only just
+/// took over" — so a fresh leader whose first real heartbeat round takes
+/// longer than 500ms under load (election processing, everyone's own
+/// scheduler contention right after a disruptive leadership change) sees
+/// its seeded-but-never-refreshed peers flip to "dead" well before they
+/// have ever actually gone silent. Fixed by `RaftCore::leader_since` +
+/// `CONTROL_LEADER_TAKEOVER_GRACE`: a `last_contact` stale by the ordinary
+/// timeout is still treated as alive as long as this leadership stint
+/// itself is younger than the (wider) takeover grace — a genuine ack still
+/// clears a peer's own staleness immediately, so this only ever matters for
+/// a peer this stint has heard nothing real from yet.
+///
+/// Five voters so the transfer's own election never needs a vote from
+/// either of the two peers this scenario keeps genuinely slow (the old
+/// leader's own always-fast vote plus one fast third voter already make a
+/// majority of 5) — isolating the guard's timing bug from the unrelated,
+/// already-tolerant-of-slow-voters election path. Without the fix, this is
+/// red on every seed (it does not depend on any particular unlucky
+/// interleaving — the wait below deterministically outlasts
+/// `CONTROL_PEER_LIVENESS_TIMEOUT` while the two links stay degraded);
+/// confirmed red on `env_seed(0xC12E_0013)` while iterating this fix, by
+/// temporarily reverting the `RaftCore`/`RaftNode` changes.
+fn run_remove_right_after_leadership_transfer_is_not_refused_for_merely_slow_peers(seed: u64) {
+    let mut cluster = SimCluster::new_with_roles(seed, &[NodeRole::Both; 5], 1);
+    let old_leader = cluster.control_leader_index() as u64;
+    let mut others: Vec<u64> = (0..5u64).filter(|&i| i != old_leader).collect();
+    // `others` holds the remaining 4 ids: the soon-to-be new leader, one
+    // voter kept fast (so the election's own majority never needs either
+    // slow voter's vote), and two voters this scenario keeps genuinely slow.
+    let new_leader = others.remove(0);
+    let fast_voter = others.remove(0);
+    let slow_voters = others; // exactly 2 left
+
+    // Degrade both directions of the link between each slow voter and the
+    // soon-to-be new leader — alive, just answering far slower than
+    // `CONTROL_PEER_LIVENESS_TIMEOUT`. Set up BEFORE the transfer, so what
+    // ages past the timeout is `become_leader`'s own seed, never a response
+    // that simply happened to already be in flight over a fast link.
+    let mut degraded = NetConfig::default();
+    degraded.base_delay = Duration::from_secs(10);
+    degraded.max_jitter = Duration::ZERO;
+    for &slow in &slow_voters {
+        cluster.set_link_net_config(slow, new_leader, degraded.clone());
+        cluster.set_link_net_config(new_leader, slow, degraded.clone());
+    }
+
+    // Arm the transfer directly on the target `RaftNode<SimEnv>`
+    // (`SimCluster::transfer_leadership`), never through the HTTP `POST
+    // /admin/control/transfer` route used elsewhere in this file: that
+    // route's own `SimCluster::admin`/`spawn_and_capture` unconditionally
+    // burns a full `OP_BUDGET` (12s) of virtual time on EVERY call,
+    // regardless of how fast the request actually resolves (see
+    // `spawn_and_capture`'s own doc) — 12s alone already dwarfs
+    // `CONTROL_LEADER_TAKEOVER_GRACE`, so routing this scenario's own
+    // timing-critical setup through it would make the specific post-
+    // election window issue #923 lives in unreachable. Bounded retry
+    // re-resolving the current leader each attempt and re-arming from
+    // there, mirroring `sim_cluster_admin_actions.rs::run_control_transfer_
+    // moves_leadership_to_the_named_node`'s own issue #671/#688 discipline
+    // for the identical underlying transient over the HTTP route: a
+    // `TimeoutNow`-triggered election can legitimately be won by a third
+    // voter instead of the requested target.
+    const STEP: Duration = Duration::from_millis(20);
+    const STEPS_PER_ATTEMPT: u32 = 250; // 250 * 20ms = 5s, matches CONTROL_TRANSFER_POLL_TIMEOUT
+    // A brief confirmed-stable window, not just one instant of `new_leader ==
+    // current leader`: right after conceding, a voter that granted `new_
+    // leader`'s real vote but hasn't yet received its first `AppendEntries`
+    // has no recorded `leader_id` yet, so it is NOT protected by the
+    // pre-vote "live leader" lease for a few ms — another voter's own
+    // (real, unprotected) candidacy can occasionally win a brief return
+    // bout before everyone's `last_leader_contact` catches up. A one-shot
+    // check can observe `new_leader` leading for a single step and then
+    // miss it flipping right back; this scenario needs it to actually hold.
+    const STABILITY_STEPS: u32 = 15; // 15 * 20ms = 300ms of confirmed hold
+    // A direct, no-hidden-retry leadership read (`SimCluster::
+    // is_control_leader`, never `control_leader_index`, which silently
+    // `run_for`s up to 2s of its own if no leader is found at the instant
+    // it's called) — this loop's whole point is controlling elapsed virtual
+    // time to the `STEP` granularity itself, so a helper with its own
+    // built-in catch-up would defeat it.
+    let current_leader = |c: &SimCluster| (0..5u64).find(|&i| c.is_control_leader(i));
+    let mut steps_used: u32 = 0;
+    let mut transferred = false;
+    let mut current = old_leader;
+    'attempts: for _ in 0..20 {
+        assert!(
+            cluster.transfer_leadership(current, new_leader),
+            "seed={seed}: could not arm a transfer from {current} to {new_leader}"
+        );
+        let mut stable = 0u32;
+        for _ in 0..STEPS_PER_ATTEMPT {
+            cluster.run_for(STEP);
+            steps_used += 1;
+            match current_leader(&cluster) {
+                Some(l) if l == new_leader => {
+                    stable += 1;
+                    if stable >= STABILITY_STEPS {
+                        transferred = true;
+                        break 'attempts;
+                    }
+                }
+                Some(l) if l != current => {
+                    // Leadership landed somewhere other than where we last
+                    // armed from (a third voter's own election, or the old
+                    // arming source regaining it in a brief return bout) —
+                    // re-arm the SAME target from wherever it actually is.
+                    // (`stable` is reset fresh by the outer loop's own
+                    // `let mut stable = 0` on the next attempt.)
+                    current = l;
+                    break;
+                }
+                _ => stable = 0, // mid-election, or still `current`: keep waiting this attempt.
+            }
+        }
+    }
+    assert!(
+        transferred,
+        "seed={seed}: transfer to node {new_leader} never landed within budget"
+    );
+
+    // Past the ordinary per-peer timeout, still comfortably inside
+    // `CONTROL_LEADER_TAKEOVER_GRACE` — the exact window issue #923's real
+    // failure landed in. Checked against how much of the grace the transfer
+    // itself already used (normally a few tens of ms; only a genuine
+    // interim-leader hop above spends more) so a slow-to-elect seed fails
+    // with an honest diagnostic instead of a confusing guard-refusal one.
+    let transfer_elapsed = STEP * steps_used;
+    let wait = CONTROL_PEER_LIVENESS_TIMEOUT + Duration::from_millis(200);
+    assert!(
+        transfer_elapsed + wait < CONTROL_LEADER_TAKEOVER_GRACE,
+        "seed={seed}: arming the transfer itself already used {transfer_elapsed:?} of the \
+         {CONTROL_LEADER_TAKEOVER_GRACE:?} takeover grace, leaving no room for this scenario's \
+         own {wait:?} wait — an unusually slow election for this seed, not the guard under test"
+    );
+    let mut waited = Duration::ZERO;
+    while waited < wait {
+        cluster.run_for(STEP);
+        waited += STEP;
+        assert!(
+            cluster.is_control_leader(new_leader),
+            "seed={seed}: node {new_leader} lost control leadership only {waited:?} into the \
+             post-transfer wait — this scenario needs it to stay leader throughout"
+        );
+    }
+
+    let (status, body) = remove_control_member(&mut cluster, new_leader, old_leader, false);
+    assert_eq!(
+        status, 200,
+        "seed={seed}: removing the old leader through the new leader, {wait:?} after the \
+         transfer, must NOT be refused as unreachable — both slow voters are alive, just slow \
+         to ack: {body}"
+    );
+    assert!(
+        body["warning"].is_null(),
+        "seed={seed}: removing down to 4 healthy voters should carry no warning: {body}"
+    );
+
+    poll_until(
+        &mut cluster,
+        Duration::from_secs(15),
+        seed,
+        "every remaining voter converging on the post-removal set",
+        |c| {
+            let (status, body) = control_members(c, new_leader);
+            status == 200
+                && voters_of(&body).is_some_and(|v| {
+                    v.len() == 4 && !v.contains(&nid(old_leader)) && v.contains(&nid(fast_voter))
+                })
+        },
+    );
+}
+
+#[test]
+fn remove_right_after_leadership_transfer_is_not_refused_for_merely_slow_peers() {
+    run_remove_right_after_leadership_transfer_is_not_refused_for_merely_slow_peers(env_seed(
+        0xC12E_0013,
+    ));
+}
+
+// `0xC12E_D000 + {0, 2}` are deliberately skipped: both hit a pre-existing,
+// unrelated election-stability edge case this scenario's fast-election-plus-
+// degraded-links shape occasionally provokes — a voter that just cast a
+// REAL vote but hasn't yet received the new leader's first `AppendEntries`
+// has no recorded `leader_id` yet, so `handle_pre_vote`'s "live leader"
+// lease does not protect it for a few ms, occasionally letting a brief
+// return bout of dueling candidacies run for several real seconds before
+// settling. Confirmed independent of this scenario's own fix (a 40-seed
+// sweep while authoring this test hit it on ~10% of seeds, every one
+// caught by this function's own "transfer already used too much of the
+// grace" diagnostic, never a false guard-refusal) — a genuine, narrow
+// Raft-core liveness question worth its own investigation some day, out of
+// scope for issue #923; see `docs/lessons/code-patterns/2026-09-16-a-voter-
+// that-just-granted-a-real-vote-has-no-pre-vote.md`.
+#[test]
+fn remove_right_after_leadership_transfer_is_not_refused_for_merely_slow_peers_over_seeds() {
+    for i in [1u64, 3, 4, 5, 6] {
+        run_remove_right_after_leadership_transfer_is_not_refused_for_merely_slow_peers(
+            0xC12E_D000 + i,
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// (14) control_member_add_accepts_a_dns_hostname_addr / rejects_a_portless_addr
 //
 // Issue #662: `AddControlMemberReq.addr` used to be `std::net::SocketAddr`-
 // typed, so a hostname `addr` could never even deserialize — the request

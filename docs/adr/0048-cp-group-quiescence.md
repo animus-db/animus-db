@@ -609,3 +609,71 @@ split-deployment dev path, plus confirming a control-only node's own
 `/admin/config` never reports the field). See `crates/animusd/CLAUDE.md`'s
 "Quiescence" section for the current, complete per-entry-point
 enumeration.
+
+## Amendment (2026-09-16, issue #920 — quiescence investigated and ruled
+## out; the real defect was `reconfigure_step`'s down-voter-removal order)
+
+**The symptom**: an e2e-kind rolling recreation of every replica of a
+tablet group (durable PVCs, so each recreated pod comes back with its own
+WAL/state intact) left a `ConsistentRead: true` read routed through a
+non-replica node answering "no CP group leader reachable" for 50+ seconds
+after the rollout had fully finished. The issue's own hypothesis, and this
+ADR's own fork H, both pointed here first: an idle group quiesces (default
+`--quiesce-after` 5s), a quiesced follower runs no election timer, and if
+its leader is genuinely lost while every survivor is dormant, nothing
+campaigns unless something wakes it.
+
+**Investigated and ruled out as this incident's cause.** A `SimEnv`
+reproduction of exactly that mechanism — three replicas, let the group
+quiesce, crash-and-restart each replica in turn with durable storage,
+every restart order — **passes on unmodified `main`**, converging in
+well under a second every time
+(`animusd::sim_cluster_quiesced_rolling_restart::
+quiesced_group_survives_rolling_restart_every_order`). The reason: a
+restarted replica's `leader_id` is volatile and resets to `None` on
+restart (this ADR's own "Quiescence state is never persisted... starts as
+a ticking follower" guarantee), so `handle_pre_vote`'s leader-lease check
+(`animus-control/src/raft.rs`) never blocks a genuinely-restarted
+candidate regardless of how stale any *other* replica's own quiesced
+`election_deadline` is, and the restarted node's own ordinary (non-
+quiesced) election timeout fires and campaigns unaided. Fork B/H's wake
+machinery was never even needed for this shape once the crashed node
+itself comes back.
+
+**The actual root cause was a `RaftKvNode::reconfigure_step` ordering bug
+(`animus-cp-data`), orthogonal to quiescence.** The production incident's
+own per-pod `/admin/raftkv` evidence showed a live `CasTabletReplicas`-
+driven repair racing the rollout (one recreated pod came back correctly
+`hosts_cp: false`, having already been reconfigured out of the group,
+while the survivors' own `voter_history` showed a new node being admitted
+mid-restart) — a control-plane **failure-driven placement repair** (ADR
+0012), not an idle-group quiescence stall. `reconfigure_step`'s old step 1
+removed an extra `Down` voter *immediately*, ahead of adding its
+replacement through the learner phase every other reconfigure path
+already uses — shrinking the group's live voter count for the whole
+in-flight window (3 → 2, instead of 3 → 4 → 3). Since ADR 0012's node
+liveness detection (`DETECT_TIMEOUT`, 500ms, no CLI override) is far
+faster than a real pod recreation, *every* rolling restart with durable
+storage triggers this repair path, not just a genuine failure — and a
+rolling restart that goes on to touch a second voter while the group sits
+at that shrunk count can permanently strand it below majority, since the
+evicted voter's own tablet-host reconciler has already released it and
+Metadata no longer names it a replica: nothing can bring it back
+automatically. Fixed by reordering `reconfigure_step` so a `Down` extra
+voter is only removed once any pending replacement is already a voter —
+see that method's own doc (`animus-cp-data/src/lib.rs`) for the full
+before/after reasoning, and
+`animusd::sim_cluster_quiesced_rolling_restart::
+quiesced_group_survives_rolling_restart_racing_failure_driven_repair_every_order`
+for the regression (fails deterministically on unmodified `main`, every
+restart order, converges after the fix).
+
+**What this leaves unchanged**: fork H (the reconciler's proactive wake of
+a quiesced group whose replica set intersects the failure detector's
+`down` set) and fork B (`WakeRequest`-then-campaign) are untouched and
+still the correct closure for their own original hazard — a leader that
+dies while every other replica is genuinely, permanently dormant with no
+restart ever coming. This amendment only narrows what issue #920 itself
+turned out to be: not that hazard, but a `reconfigure_step` safety gap
+that any rolling restart with a fast failure detector and durable storage
+can trigger, with or without quiescence enabled.
