@@ -1344,3 +1344,40 @@ Regression: `crates/animusd/tests/admin_endpoint.rs`'s
 `admin_live_is_200_while_a_genuinely_leaderless_admin_health_is_503` and
 `crates/animus-operator/src/desired/statefulset.rs`'s
 `probes_target_admin_health_and_admin_live_on_admin_port`.
+
+## Amendment (2026-09-16, issue #662): the `SocketAddr` gap is closed
+
+The S-07d amendment's own "The `SocketAddr` gap" subsection above named a
+real, pre-existing `animusd` limitation as a deliberately out-of-scope
+follow-up: `POST /admin/control/member/add`'s `addr` field was typed
+`std::net::SocketAddr` server-side, so it could only ever deserialize a
+literal `ip:port`, never a DNS name — the one address surface in that
+admin API that hadn't caught up to the string/hostname-typed convention
+every other Kubernetes-facing address already used. That follow-up has
+now landed: `admin::AddControlMemberReq.addr` is `String`-typed, guarded
+by a cheap `host:port` shape check at the handler (a `400` for a garbled
+`addr`, never a `500`/panic) rather than any real DNS resolution there —
+resolution stays exactly where it already lived for every other such
+address, lazily at dial time via `TcpStream::connect`'s own
+`ToSocketAddrs` impl for `&str`, never inside the `E: Env`-generic admin
+handler itself (ADR 0003).
+
+`animus-operator`'s `resolve_control_dial_addr`/`ClusterApi::get_pod_ip`
+workaround (S-07d amendment above) is removed as a result:
+`add_control_voter` now hands `member/add` the promoted ordinal's own
+stable pod DNS name (`desired::pod_fqdn`) directly, the same address
+`RoleAddrs::advertise_host` already advertises for it, rather than reading
+its live `status.podIP` through the Kubernetes API as a one-time
+bootstrap value. This also drops `ClusterApi::get_pod_ip` (+ its
+`RealClusterApi`/`FakeClusterApi` implementations and `FakeClusterApi::
+seed_pod_ip`) entirely — nothing else in this crate used it — though the
+`pods: get/list/watch` RBAC grant `deploy/operator/rbac.yaml` already
+carried stays (still legitimately pre-provisioned for future pod-status
+reads, per that grant's own original doc comment).
+
+See `crates/animusd/CLAUDE.md`'s matching 2026-09-16 note and
+`crates/animus-operator/CLAUDE.md`'s S-07d section for the full account,
+and `docs/lessons/archive/2026-09-06-a-strictly-typed-admin-api-address-
+field-socketaddr.md` for the now-archived lesson this closes (its general
+form — check an address field's actual server-side type before automating
+against it — still generalizes).

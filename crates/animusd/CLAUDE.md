@@ -1529,6 +1529,27 @@ reusing the captured config is the point of the test.
   legacy shape, plus a real-cluster regression pinning the wire shape
   (`tests/control_membership_admin.rs::
   admin_config_reports_the_internal_addr_the_cli_resolves_control_add_through`).
+  **`addr` is a `String`, not a `std::net::SocketAddr` — fixed 2026-09-16,
+  issue #662**: `AddControlMemberReq.addr` used to be `SocketAddr`-typed,
+  so it could only ever deserialize a literal `ip:port`, never a DNS
+  hostname — the one address surface in this admin API that hadn't caught
+  up to the string/hostname-typed convention every other Kubernetes-facing
+  address already uses (`RoleAddrs::advertise_host`, `--seed`, the
+  `ProdEnv::merge_peer` peer book, `NodeAddrs.internal` itself). Fixed by
+  widening the field to `String` and adding a cheap `host:port` shape
+  guard at the handler (`looks_like_host_port`, a plain `400` for a
+  garbled `addr`, never a `500`/panic) — never a real DNS resolution step
+  in `action_add_control_member` itself, since that handler runs generic
+  over `E: Env` and real I/O may only ever happen behind the `Env` seam
+  (ADR 0003); resolution stays exactly where it already lived for every
+  other such string, lazily at dial time via `TcpStream::connect`'s own
+  `ToSocketAddrs` impl for `&str`. `animus admin control-add` needed no
+  change at all — both its forms already built the request body from a
+  plain `&str`/`String`, never parsed it as a `SocketAddr` (see
+  `crates/animus-cli/CLAUDE.md`). This also let `animus-operator` drop its
+  `ClusterApi::get_pod_ip` detour (ADR 0060's "The `SocketAddr` gap"
+  amendment) and hand the promoted pod's own stable DNS name straight to
+  `member/add`, same as every other address it advertises.
   This dashboard control still sidesteps the whole problem rather than
   reproducing the CLI's own resolution step: it asks the
   operator for the new voter's internal address directly (two inputs, node

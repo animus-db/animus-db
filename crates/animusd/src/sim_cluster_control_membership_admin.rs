@@ -1066,3 +1066,80 @@ fn admin_config_reports_the_internal_addr_the_cli_resolves_control_add_through_o
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// (13) control_member_add_accepts_a_dns_hostname_addr / rejects_a_portless_addr
+//
+// Issue #662: `AddControlMemberReq.addr` used to be `std::net::SocketAddr`-
+// typed, so a hostname `addr` could never even deserialize — the request
+// body itself would fail `parse_body` with a 400 `"invalid JSON body"`
+// before reaching any admin logic. Not a converted real-suite test (there
+// is no original counterpart) — new coverage for the fix itself, added
+// here rather than in `tests/control_membership_admin.rs` because the JSON
+// wire shape is exactly what `SimCluster::admin` already reaches; the
+// *real DNS resolution* end of the fix (a hostname actually dialing) is
+// necessarily `SimEnv`-unreachable for the same `Env::merge_peer` no-op
+// reason (4) is — see `tests/control_membership_admin.rs::
+// control_member_add_accepts_a_hostname_dial_address` for that half.
+// ---------------------------------------------------------------------------
+
+fn run_control_member_add_accepts_a_dns_hostname_addr(seed: u64) {
+    let mut cluster = SimCluster::new_with_roles(seed, &[NodeRole::Both; 3], 1);
+    let leader = cluster.control_leader_index() as u64;
+
+    let (status, body) = add_control_member(
+        &mut cluster,
+        leader,
+        1,
+        "pod-1.animus-internal.ns.svc.cluster.local:9001",
+    );
+    assert_eq!(
+        status, 200,
+        "seed={seed}: a hostname addr must deserialize and be accepted: {body}"
+    );
+}
+
+#[test]
+fn control_member_add_accepts_a_dns_hostname_addr() {
+    run_control_member_add_accepts_a_dns_hostname_addr(env_seed(0xC12E_0013));
+}
+
+#[test]
+fn control_member_add_accepts_a_dns_hostname_addr_over_seeds() {
+    for i in 0..5 {
+        run_control_member_add_accepts_a_dns_hostname_addr(0xC12E_D000 + i);
+    }
+}
+
+fn run_control_member_add_rejects_a_portless_addr(seed: u64) {
+    let mut cluster = SimCluster::new_with_roles(seed, &[NodeRole::Both; 3], 1);
+    let leader = cluster.control_leader_index() as u64;
+
+    // No `:port` at all — `addr` is a bare `String` now, so this deserializes
+    // fine; `looks_like_host_port`'s shape guard is what must catch it,
+    // never a panic or a 500.
+    let (status, body) = add_control_member(&mut cluster, leader, 1, "not-a-host-port");
+    assert_eq!(
+        status, 400,
+        "seed={seed}: a portless addr should be a clean 400: {body}"
+    );
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("host:port"),
+        "seed={seed}: error should name the expected shape: {body}"
+    );
+}
+
+#[test]
+fn control_member_add_rejects_a_portless_addr() {
+    run_control_member_add_rejects_a_portless_addr(env_seed(0xC12E_0014));
+}
+
+#[test]
+fn control_member_add_rejects_a_portless_addr_over_seeds() {
+    for i in 0..5 {
+        run_control_member_add_rejects_a_portless_addr(0xC12E_E000 + i);
+    }
+}

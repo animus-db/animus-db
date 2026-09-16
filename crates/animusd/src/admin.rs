@@ -2193,16 +2193,39 @@ struct AddMemberReq {
 /// `ClientCtx::admin_add_control_member`'s doc); omitted (`null` or absent,
 /// `#[serde(default)]`), the control plane self-mints one (`NodeId::mint`)
 /// instead. `addr` is that node's internal control-Raft listen address, not
-/// its admin/client address. `labels` seed the minted member's topology
-/// labels (ignored for an operator-supplied `node` that's already a member —
-/// see the doc above), the same shape `AddMemberReq`'s does.
+/// its admin/client address — a `host:port` **string**, not a
+/// `std::net::SocketAddr` (issue #662): a literal `ip:port` still works, but
+/// so does a hostname (a Kubernetes pod's stable DNS name), matching every
+/// other address surface (`RoleAddrs::advertise_host`, `ClientResponse::
+/// JoinInfo`, the `ProdEnv::merge_peer` peer book) — `Metadata`'s own
+/// `NodeAddrs.internal` is `String`-typed too, so this was never anything
+/// but an over-restrictive deserialize target; resolution, same as every one
+/// of those other surfaces, happens lazily at dial time
+/// (`TcpStream::connect`'s own `ToSocketAddrs` impl for `&str`), never here.
+/// `labels` seed the minted member's topology labels (ignored for an
+/// operator-supplied `node` that's already a member — see the doc above),
+/// the same shape `AddMemberReq`'s does.
 #[derive(Deserialize)]
 struct AddControlMemberReq {
     #[serde(default)]
     node: Option<NodeId>,
-    addr: std::net::SocketAddr,
+    addr: String,
     #[serde(default)]
     labels: BTreeMap<String, String>,
+}
+
+/// Cheap shape check for [`AddControlMemberReq::addr`] (and every other
+/// `host:port` string this admin surface accepts): require a `:port` suffix,
+/// the same minimal guard `main.rs::parse_seed_arg`/`animus_node::topology::
+/// parse_not_leader_refusal` already use for the identical `host:port`
+/// shape elsewhere in this codebase. This is deliberately **not** a real DNS
+/// resolution — this handler runs generic over `E: Env` (a `SimEnv` test
+/// drives it directly), and real I/O may only ever happen behind the `Env`
+/// seam (ADR 0003); an unresolvable-but-shape-valid hostname is instead
+/// caught later, as an ordinary dial failure, the same way a bad `--seed`
+/// entry is.
+fn looks_like_host_port(addr: &str) -> bool {
+    addr.contains(':')
 }
 
 /// `POST /admin/control/member/remove` request body (ADR 0037 PR3): `node` is
@@ -2538,8 +2561,11 @@ fn control_members_view<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>) -> Value 
 /// [`crate::ClientCtx::admin_add_control_member`]'s doc for the full
 /// rationale, the collision/idempotence rules, and the allocator-minted path.
 /// `addr` is the new voter's **internal control-Raft** listen address
-/// (distinct from its admin/client/raftkv ports) — `animus admin control-add`
-/// resolves it from the new node's own `/admin/config` before calling this.
+/// (distinct from its admin/client/raftkv ports), a `host:port` string that
+/// may be a literal address or a hostname (issue #662, see
+/// [`AddControlMemberReq`]'s own doc) — `animus admin control-add` resolves
+/// it from the new node's own `/admin/config` before calling this. Returns
+/// `400` for a malformed `addr` ([`looks_like_host_port`]), never `500`.
 /// The response's `"node"` is the **effective** id either way: echoed back
 /// when operator-supplied, or the freshly-minted one when `node` was omitted
 /// — the caller (the CLI, an operator) needs this to know what id the new
@@ -2552,6 +2578,16 @@ async fn action_add_control_member<E: Env, R: RelayClient>(
         Ok(r) => r,
         Err(e) => return e,
     };
+    if !looks_like_host_port(&req.addr) {
+        return (
+            400,
+            json!({"error": format!(
+                "invalid `addr` {:?}: expected a `host:port` string (a literal address or a \
+                 resolvable hostname)",
+                req.addr
+            )}),
+        );
+    }
     match ctx
         .admin_add_control_member(req.node, req.addr, req.labels)
         .await
@@ -3671,6 +3707,49 @@ mod tests {
             parse_key_display("seed-0000042:x"),
             b"seed-0000042:x".to_vec()
         );
+    }
+
+    /// Issue #662: `AddControlMemberReq.addr` deserializes a literal
+    /// `ip:port` string, the shape every existing caller already sends.
+    #[test]
+    fn add_control_member_req_deserializes_a_literal_ip_port_addr() {
+        let req: AddControlMemberReq =
+            serde_json::from_str(r#"{"node":"n1","addr":"127.0.0.1:9001"}"#).unwrap();
+        assert_eq!(req.node.as_ref().map(NodeId::as_str), Some("n1"));
+        assert_eq!(req.addr, "127.0.0.1:9001");
+    }
+
+    /// Issue #662, the actual bug: a DNS name (a Kubernetes pod's stable
+    /// hostname) must deserialize too — it never could while `addr` was
+    /// `std::net::SocketAddr`-typed, since that type's `Deserialize` impl
+    /// only ever accepts a literal address.
+    #[test]
+    fn add_control_member_req_deserializes_a_hostname_addr() {
+        let req: AddControlMemberReq =
+            serde_json::from_str(r#"{"addr":"pod-1.animus-internal.ns.svc.cluster.local:9001"}"#)
+                .unwrap();
+        assert_eq!(req.node, None, "omitted `node` self-mints, per ADR 0037");
+        assert_eq!(req.addr, "pod-1.animus-internal.ns.svc.cluster.local:9001");
+    }
+
+    /// [`looks_like_host_port`] is the handler's only shape guard now that
+    /// `addr` is a bare `String` — every JSON string value deserializes, so
+    /// this is what actually rejects a garbled `addr` with a `400` instead
+    /// of silently accepting it.
+    #[test]
+    fn looks_like_host_port_accepts_literal_and_hostname_forms() {
+        assert!(looks_like_host_port("127.0.0.1:9001"));
+        assert!(looks_like_host_port("localhost:9001"));
+        assert!(looks_like_host_port(
+            "pod-1.animus-internal.ns.svc.cluster.local:9001"
+        ));
+    }
+
+    #[test]
+    fn looks_like_host_port_rejects_a_portless_addr() {
+        assert!(!looks_like_host_port("127.0.0.1"));
+        assert!(!looks_like_host_port("localhost"));
+        assert!(!looks_like_host_port(""));
     }
 }
 
