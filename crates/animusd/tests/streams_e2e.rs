@@ -332,6 +332,59 @@ async fn get_records_allow_trim(addr: SocketAddr, iterator: &str) -> RecordsPoll
     }
 }
 
+/// As [`get_shard_iterator`], but surfaces a terminal `TrimmedDataAccess-
+/// Exception` (400) to the caller as `None` instead of panicking on it.
+/// Used ONLY by `drain_all_tablets_lineage`'s speculative open-tail MINT
+/// (issue #745 — the residual half of #299/#755 the `GetRecords` sibling,
+/// [`get_records_allow_trim`], didn't cover): that mint computes the epoch
+/// to guess from a locally-cached `Metadata` snapshot, guarded by an
+/// `if !tablets.contains_key(&tablet)` check one line above the call, but a
+/// real split cutover can retire the tablet in the gap between that check
+/// and this `GetShardIterator` reaching the server — one async round trip
+/// *earlier* than the `GetRecords` race #755 already handles. The
+/// speculatively-guessed epoch then never existed, and the server's 400 is
+/// the CORRECT answer (`dynamo_streams::get_shard_iterator`'s own
+/// `!meta.tablets.contains_key(&tablet)` guard, the exact same check,
+/// re-evaluated fresh at serve time), not a bug — so this helper, like
+/// [`get_records_allow_trim`], is deliberately NOT folded into
+/// `dynamo_retrying`'s general allowlist: that wrapper is shared with the
+/// closed-epoch mint (whose epochs were already observed to exist in a
+/// prior `stream_shards` read, so a 400 there still means a real bug) and
+/// the transactional-write path.
+async fn get_shard_iterator_allow_trim(
+    addr: SocketAddr,
+    stream_arn: &str,
+    shard_id: &str,
+    iterator_type: &str,
+) -> Option<String> {
+    let body = format!(
+        r#"{{"StreamArn":"{stream_arn}","ShardId":"{shard_id}","ShardIteratorType":"{iterator_type}"}}"#
+    );
+    let deadline = tokio::time::Instant::now() + RETRYABLE_BLIP_DEADLINE;
+    loop {
+        let (status, resp) = dynamo(addr, "DynamoDBStreams_20120810.GetShardIterator", &body).await;
+        if status == 200 {
+            return Some(
+                json(&resp)["ShardIterator"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("no ShardIterator in: {resp}"))
+                    .to_owned(),
+            );
+        }
+        if status == 400 && resp.contains("TrimmedDataAccessException") {
+            return None;
+        }
+        if status == 500 && tokio::time::Instant::now() < deadline {
+            sleep(Duration::from_millis(150)).await;
+            continue;
+        }
+        panic!(
+            "GetShardIterator failed (status {status}) after retrying for \
+             {RETRYABLE_BLIP_DEADLINE:?} with the condition never clearing: {resp}"
+        );
+    }
+}
+
 async fn describe_stream(addr: SocketAddr, stream_arn: &str) -> String {
     let (status, resp) = dynamo(
         addr,
@@ -835,9 +888,30 @@ async fn drain_all_tablets_lineage(
             let epoch = cursors.next_epoch_of(tablet);
             if !cursors.is_open_iterator_current(tablet, epoch) {
                 let shard_id = segment::shard_id(tablet.0, epoch);
-                let iterator =
-                    get_shard_iterator(dynamo_addr, stream_arn, &shard_id, "TRIM_HORIZON").await;
-                cursors.set_open_iterator(tablet, epoch, iterator);
+                // #745: the SAME stale-`Metadata` race #755 already handles
+                // one round trip later on `GetRecords` can land HERE
+                // instead — a split cutover retiring `tablet` between the
+                // `tablets.contains_key` check above and this mint reaching
+                // the server. `get_shard_iterator_allow_trim` surfaces that
+                // terminal 400 as `None` rather than panicking through
+                // `dynamo_retrying`; take the identical "chain done" arm
+                // `RecordsPoll::Trimmed` takes below, dropping only the
+                // stale open-tail pin and skipping this tablet for the rest
+                // of this pass (nothing to poll — the mint itself failed).
+                match get_shard_iterator_allow_trim(
+                    dynamo_addr,
+                    stream_arn,
+                    &shard_id,
+                    "TRIM_HORIZON",
+                )
+                .await
+                {
+                    Some(iterator) => cursors.set_open_iterator(tablet, epoch, iterator),
+                    None => {
+                        cursors.epoch_trimmed(tablet);
+                        continue;
+                    }
+                }
             }
             let iterator = cursors
                 .open_iterator_of(tablet)
