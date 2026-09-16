@@ -74,12 +74,15 @@ makes the constraint **compiler-enforced**:
   `ClientCtx::resolve_cp_route`, which gathers the (real, `ProdEnv`-backed)
   inputs and executes the decision.
 - **`decide`** — the pure predicates ADR 0061 rung A6 lifted out of
-  `animusd`'s `impl ClientCtx`: `frozen_refusal`, `confirm_wait_is_futile`,
-  `read_should_retry`, `ok_or_err`, `align_split_key`,
+  `animusd`'s `impl ClientCtx`: `frozen_refusal`, `read_should_retry`,
+  `ok_or_err`, `align_split_key`,
   `byte_weighted_median`, `other_tablet_replica_addr`/
   `decide_forward_retry`/`ForwardRetryStep`. Every function takes plain
   values (no `&self`, no `&CpGroup`, no `ProdEnv`) and returns a plain
-  value.
+  value. (`confirm_wait_is_futile` lived here too until issue #971 removed
+  it — its `!is_leader()` clause was unsafe for every one of its callers;
+  `animusd::kind_batch_confirm_superseded` is the leadership-independent
+  replacement every CP write confirm loop now shares.)
 
 `animusd::lib` re-exports everything in this crate's public surface at its
 own crate root (`pub use animus_node::{ClientRequest, ClientResponse, ...,
