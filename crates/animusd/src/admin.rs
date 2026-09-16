@@ -2210,11 +2210,29 @@ struct AddMemberReq {
 /// its admin/client address. `labels` seed the minted member's topology
 /// labels (ignored for an operator-supplied `node` that's already a member —
 /// see the doc above), the same shape `AddMemberReq`'s does.
+///
+/// **`addr` is a plain wire-format string, not `SocketAddr` (issue #913)**:
+/// a numeric `ip:port` or a DNS hostname:port, uninterpreted here — exactly
+/// the shape `ProdEnv::merge_peer`/`NodeAddrs`'s own address fields already
+/// use, and every other Kubernetes-pod-facing address surface in this
+/// codebase (`RoleAddrs::advertise_host`, `ClientResponse::JoinInfo`) picked
+/// for the identical reason: a pod's IP is not stable across a restart while
+/// its per-ordinal DNS name is. Before this fix, `SocketAddr`'s own `FromStr`
+/// could only ever parse a numeric address, forcing every caller (the
+/// Kubernetes operator's own growth step included) to resolve and pin a
+/// pod's *current* IP rather than pass its stable hostname — under mutual
+/// TLS with DNS-only certificate SANs, dialing that pinned IP fails the
+/// handshake outright (`ServerName::IpAddress` against a cert with no IP
+/// SAN), permanently, since the very re-registration that would otherwise
+/// replace the IP with the real hostname itself needs a working dial to the
+/// newly-promoted node to land. See `docs/adr/0037-control-plane-membership-change.md`'s
+/// issue #913 amendment and `crates/animus-operator/CLAUDE.md`'s S-07d
+/// section for the full account.
 #[derive(Deserialize)]
 struct AddControlMemberReq {
     #[serde(default)]
     node: Option<NodeId>,
-    addr: std::net::SocketAddr,
+    addr: String,
     #[serde(default)]
     labels: BTreeMap<String, String>,
 }
@@ -3685,6 +3703,36 @@ mod tests {
             parse_key_display("seed-0000042:x"),
             b"seed-0000042:x".to_vec()
         );
+    }
+
+    /// Issue #913: `AddControlMemberReq.addr` is a plain wire-format string,
+    /// not `SocketAddr` — before this fix, `SocketAddr`'s own `FromStr`
+    /// rejected any non-numeric address, forcing every caller (the
+    /// Kubernetes operator's own growth step included) to resolve a pod's
+    /// *current* IP rather than pass its stable per-ordinal DNS name. A DNS
+    /// hostname:port must deserialize cleanly now, byte-for-byte, exactly
+    /// as a numeric address always did.
+    #[test]
+    fn add_control_member_req_accepts_a_dns_hostname_addr() {
+        let hostname = "e2e-3.e2e-internal.animus-e2e.svc.cluster.local:14000";
+        let body = serde_json::json!({"node": "e2e-3", "addr": hostname, "labels": {}}).to_string();
+        let req: AddControlMemberReq =
+            serde_json::from_str(&body).expect("a DNS hostname:port addr must deserialize");
+        assert_eq!(req.addr, hostname);
+        assert_eq!(req.node.as_ref().map(NodeId::as_str), Some("e2e-3"));
+    }
+
+    /// The pre-existing numeric shape must keep working unchanged — this
+    /// fix widens the accepted shape, it does not narrow or reinterpret the
+    /// one every existing caller (the CLI's own `run_control_add*`, every
+    /// `SimCluster` test) already sends.
+    #[test]
+    fn add_control_member_req_still_accepts_a_numeric_socket_addr() {
+        let body = serde_json::json!({"addr": "127.0.0.1:14000"}).to_string();
+        let req: AddControlMemberReq =
+            serde_json::from_str(&body).expect("a numeric ip:port addr must still deserialize");
+        assert_eq!(req.addr, "127.0.0.1:14000");
+        assert_eq!(req.node, None);
     }
 }
 

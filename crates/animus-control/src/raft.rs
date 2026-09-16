@@ -703,6 +703,24 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     // liveness judgment of its peers depend on stale, potentially very old
     // wall-clock reads survived across a restart, which is actively wrong.
     last_contact: BTreeMap<NodeId, Nanos>,
+    // The `now` at which THIS leadership stint began (issue #923): set once in
+    // `become_leader`, read back only through [`leader_since`](Self::
+    // leader_since), which additionally gates on `role == Leader` so a
+    // stepped-down node reads `None` with no explicit clearing needed
+    // elsewhere — mirrors `next_index`/`match_index`/`last_contact`'s own
+    // "meaningless once not leader, naturally overwritten on the next
+    // `become_leader`" volatility; never persisted or snapshotted. Exists so
+    // `RaftNode::control_peer_believed_alive` can tell "this leader has never
+    // heard a GENUINE ack from this peer because it only just took over"
+    // apart from "this leader has been up for a while and this peer has gone
+    // properly silent" — `last_contact`'s own per-peer seed in `become_leader`
+    // makes both cases look byte-identical (a stamp at `now`, aging out after
+    // the same `CONTROL_PEER_LIVENESS_TIMEOUT`), which is exactly the
+    // false-dead race issue #923 hit: a fresh leader's first real heartbeat
+    // round can legitimately take longer than that steady-state per-peer
+    // timeout under load (post-election processing, everyone's own scheduler
+    // contention right after a disruptive leadership change).
+    leader_since: Option<Nanos>,
     // Issue #667 (2026-09-15 amendment): every peer id this node has ever
     // witnessed casting a GENUINE, durably-forgettable vote — i.e. a
     // `voted_for` write this identity's own disk could later lose. Marked
@@ -1097,6 +1115,7 @@ where
             match_index: BTreeMap::new(),
             snapshot_served_through: BTreeMap::new(),
             last_contact: BTreeMap::new(),
+            leader_since: None,
             heard_from: BTreeSet::new(),
             departing: BTreeMap::new(),
             transfer_target: None,
@@ -2057,6 +2076,22 @@ where
     #[must_use]
     pub fn peer_last_contact(&self, node: NodeId) -> Option<Nanos> {
         self.last_contact.get(&node).copied()
+    }
+
+    /// The `now` at which THIS leadership stint began (issue #923), or `None`
+    /// on every non-leader — gated on `role == Leader` rather than a separate
+    /// clear-on-step-down write, so a stepped-down node reads `None`
+    /// immediately with no extra bookkeeping (see the `leader_since` field
+    /// doc). Another raw fact with no policy baked in: `RaftNode::
+    /// control_peer_believed_alive` is the one place that turns "how long
+    /// have I held the gavel this stint" into a grace period.
+    #[must_use]
+    pub fn leader_since(&self) -> Option<Nanos> {
+        if self.role == Role::Leader {
+            self.leader_since
+        } else {
+            None
+        }
     }
 
     /// The voter this leader is currently handing leadership off to, if a
@@ -3811,6 +3846,9 @@ where
     fn become_leader(&mut self, now: Nanos) -> Vec<Out<C>> {
         self.role = Role::Leader;
         self.leader_id = Some(self.id.clone());
+        // Issue #923: mark when THIS stint began, before any per-peer
+        // `last_contact` seeding below — `leader_since`'s own field doc.
+        self.leader_since = Some(now);
         // Issue #595: this node itself just won an election — record itself
         // as the genuine contact (see `last_leader_contact`'s own doc).
         self.last_leader_contact = Some((self.id.clone(), now));
