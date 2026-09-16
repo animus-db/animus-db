@@ -1035,7 +1035,7 @@ admin path (`animus admin control-add`) a human operator used to run by
 hand. See ADR 0060's own "Control-voter growth (S-07d, 2026-09-06)"
 amendment for the full design write-up (the live-truth-driven sequence,
 why role-promotion needs a restart, why growth doesn't reopen genesis's
-own "sequential join" rejection, the `SocketAddr` gap and its workaround,
+own "sequential join" rejection, the (now-closed) `SocketAddr` gap,
 "retry on the leader" without a leader address hint, the PDB interaction,
 and how a controller restart resumes) — this section is the crate-local
 pointer + the gotchas worth knowing before touching this code.
@@ -1046,11 +1046,14 @@ voters)`/`achieved_control_nodes(cluster_name, target, voters)` in
 fully unit-tested — turning the control group's own live voter-id set
 (`GET /admin/control/members`'s `"voters"` field, parsed by
 `parse_voters`) into "which ordinal is missing next" / "how many are
-already confirmed". Everything async around them
-(`fetch_control_members`/`discover_control_voters`/
-`ordinal_reports_role_both`/`add_control_voter`/`advance_control_growth`)
-is a thin orchestration layer exercised through `FakeAdminClient`/
-`FakeClusterApi` — see Tests below.
+already confirmed". `control_dial_addr(name, ns, ordinal, internal_port)`
+(issue #913, replacing the former `resolve_control_dial_addr`) is pure
+too now — it just formats the ordinal's own stable pod DNS name
+(`desired::pod_fqdn`) at the internal-Raft port, no Kubernetes API call.
+Everything async around these (`fetch_control_members`/
+`discover_control_voters`/`ordinal_reports_role_both`/`add_control_voter`/
+`advance_control_growth`) is a thin orchestration layer exercised through
+`FakeAdminClient` — see Tests below.
 
 **Config-hash restart annotation, a separate, independently-reviewable
 groundwork step (its own first commit)**: `desired::statefulset::
@@ -1071,8 +1074,9 @@ behind `controlNodes` specifically — there was no clean way to restart
 across every ordinal), so this is the simplest correct mechanism, not a
 narrowly-scoped one.
 
-**(2026-09-16, issue #913) `add_control_voter` dials the promoted
-ordinal's own stable `desired::pod_fqdn(name, ns, ordinal)` hostname —
+**(2026-09-16, issue #913, the same gap issue #662 independently
+reported) `add_control_voter` dials the promoted ordinal's own stable
+`desired::pod_fqdn(name, ns, ordinal)` hostname (`control_dial_addr`) —
 never a live `status.podIP`.** `ClusterApi::get_pod_ip` (and the
 `resolve_control_dial_addr`/`FakeClusterApi::seed_pod_ip`/`desired::
 pod_name` machinery that existed solely to serve it) is **deleted**, not
@@ -1090,7 +1094,12 @@ own field is now a plain `String` (`docs/adr/
 0037-control-plane-membership-change.md`'s issue #913 amendment), so
 this crate no longer needs to resolve anything at all — `add_control_
 voter` just formats the same hostname:port string every other
-Kubernetes-pod address surface in this codebase already uses.
+Kubernetes-pod address surface in this codebase already uses. The `pods:
+get/list/watch` RBAC grant `deploy/operator/rbac.yaml` carries stays
+regardless (still legitimately pre-provisioned for "the controller reads
+pod status/conditions" in general — nothing in this crate exercises it
+right now). See ADR 0060's own "The `SocketAddr` gap, closed" section for
+the full before/after account.
 
 **`FakeAdminClient` (S-07d additions, `fakes.rs`)**: `seed_control_voters`/
 `control_voters()` back `GET /admin/control/members` with a plain

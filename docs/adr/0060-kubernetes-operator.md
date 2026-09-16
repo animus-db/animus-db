@@ -1352,6 +1352,21 @@ Regression: `crates/animusd/tests/admin_endpoint.rs`'s
 `crates/animus-operator/src/desired/statefulset.rs`'s
 `probes_target_admin_health_and_admin_live_on_admin_port`.
 
+## Amendment (2026-09-16, issue #662): `member/add`'s `addr` also gets a shape guard
+
+"The `SocketAddr` gap, closed (issue #913)" section above already covers
+widening `admin::AddControlMemberReq.addr` to `String` and dropping
+`animus-operator`'s `ClusterApi::get_pod_ip`/`resolve_control_dial_addr`
+workaround in favor of `desired::pod_fqdn` directly — issue #913 and issue
+#662 were two reports of the same underlying gap, and #913's fix landed
+first. The one thing #913's fix left unguarded: widening `addr` to a bare
+`String` also removed the free shape-checking `SocketAddr::deserialize`
+used to give for free, so `action_add_control_member` now runs a cheap
+`host:port` shape check of its own (`looks_like_host_port`, mirroring
+`main.rs::parse_seed_arg`'s identical guard) and returns a clean `400` for
+a garbled `addr` instead of accepting anything or failing later as an
+opaque dial error. See `crates/animusd/CLAUDE.md`'s matching note.
+
 ## Amendment (2026-09-15, issue #864) — `spec.controlNodes` growth's own retry/logging contract, and the ephemeral-storage quorum-loss hazard it surfaced
 
 `e2e-kind-s3`/`e2e-kind-tls`/`e2e-kind-webhook`/`e2e-kind-encryption`

@@ -2231,6 +2231,12 @@ struct AddMemberReq {
 /// newly-promoted node to land. See `docs/adr/0037-control-plane-membership-change.md`'s
 /// issue #913 amendment and `crates/animus-operator/CLAUDE.md`'s S-07d
 /// section for the full account.
+///
+/// Since widening `addr` to `String` also removed the free shape-checking
+/// `SocketAddr::deserialize` used to give for free, the handler now runs a
+/// cheap `host:port` shape guard of its own (issue #662,
+/// [`looks_like_host_port`]) and returns a clean `400` for a garbled `addr`
+/// instead of accepting anything or failing later as an opaque dial error.
 #[derive(Deserialize)]
 struct AddControlMemberReq {
     #[serde(default)]
@@ -2238,6 +2244,20 @@ struct AddControlMemberReq {
     addr: String,
     #[serde(default)]
     labels: BTreeMap<String, String>,
+}
+
+/// Cheap shape check for [`AddControlMemberReq::addr`] (and every other
+/// `host:port` string this admin surface accepts): require a `:port` suffix,
+/// the same minimal guard `main.rs::parse_seed_arg`/`animus_node::topology::
+/// parse_not_leader_refusal` already use for the identical `host:port`
+/// shape elsewhere in this codebase. This is deliberately **not** a real DNS
+/// resolution — this handler runs generic over `E: Env` (a `SimEnv` test
+/// drives it directly), and real I/O may only ever happen behind the `Env`
+/// seam (ADR 0003); an unresolvable-but-shape-valid hostname is instead
+/// caught later, as an ordinary dial failure, the same way a bad `--seed`
+/// entry is.
+fn looks_like_host_port(addr: &str) -> bool {
+    addr.contains(':')
 }
 
 /// `POST /admin/control/member/remove` request body (ADR 0037 PR3): `node` is
@@ -2573,8 +2593,11 @@ fn control_members_view<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>) -> Value 
 /// [`crate::ClientCtx::admin_add_control_member`]'s doc for the full
 /// rationale, the collision/idempotence rules, and the allocator-minted path.
 /// `addr` is the new voter's **internal control-Raft** listen address
-/// (distinct from its admin/client/raftkv ports) — `animus admin control-add`
-/// resolves it from the new node's own `/admin/config` before calling this.
+/// (distinct from its admin/client/raftkv ports), a `host:port` string that
+/// may be a literal address or a hostname (issue #662, see
+/// [`AddControlMemberReq`]'s own doc) — `animus admin control-add` resolves
+/// it from the new node's own `/admin/config` before calling this. Returns
+/// `400` for a malformed `addr` ([`looks_like_host_port`]), never `500`.
 /// The response's `"node"` is the **effective** id either way: echoed back
 /// when operator-supplied, or the freshly-minted one when `node` was omitted
 /// — the caller (the CLI, an operator) needs this to know what id the new
@@ -2587,6 +2610,16 @@ async fn action_add_control_member<E: Env, R: RelayClient>(
         Ok(r) => r,
         Err(e) => return e,
     };
+    if !looks_like_host_port(&req.addr) {
+        return (
+            400,
+            json!({"error": format!(
+                "invalid `addr` {:?}: expected a `host:port` string (a literal address or a \
+                 resolvable hostname)",
+                req.addr
+            )}),
+        );
+    }
     match ctx
         .admin_add_control_member(req.node, req.addr, req.labels)
         .await
@@ -3736,6 +3769,26 @@ mod tests {
             serde_json::from_str(&body).expect("a numeric ip:port addr must still deserialize");
         assert_eq!(req.addr, "127.0.0.1:14000");
         assert_eq!(req.node, None);
+    }
+
+    /// [`looks_like_host_port`] is the handler's own shape guard now that
+    /// `addr` is a bare `String` — every JSON string value deserializes, so
+    /// this is what actually rejects a garbled `addr` with a `400` instead
+    /// of silently accepting it (issue #662).
+    #[test]
+    fn looks_like_host_port_accepts_literal_and_hostname_forms() {
+        assert!(looks_like_host_port("127.0.0.1:9001"));
+        assert!(looks_like_host_port("localhost:9001"));
+        assert!(looks_like_host_port(
+            "pod-1.animus-internal.ns.svc.cluster.local:9001"
+        ));
+    }
+
+    #[test]
+    fn looks_like_host_port_rejects_a_portless_addr() {
+        assert!(!looks_like_host_port("127.0.0.1"));
+        assert!(!looks_like_host_port("localhost"));
+        assert!(!looks_like_host_port(""));
     }
 }
 
