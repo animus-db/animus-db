@@ -3699,10 +3699,9 @@ impl SimCluster {
     /// fixture's own scenarios never rely on telling the two apart.
     pub(crate) fn propose_schema_fast(&mut self, node: u64, command: MetaCommand) -> bool {
         let handle = self.shared.clone();
-        self.spawn_and_capture_fast(
-            node,
-            async move { handle.propose_schema_direct(node, command).await },
-        )
+        self.spawn_and_capture_fast(node, async move {
+            handle.propose_schema_direct(node, command).await
+        })
         .unwrap_or(false)
     }
 

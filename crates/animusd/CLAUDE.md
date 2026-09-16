@@ -2479,7 +2479,44 @@ per-candidate-gets-the-whole-timeout shape also existed in
 `ClientCtx::propose_schema`'s own broadcast-to-every-known-address chase**
 (the ADR 0030 growth-node fallback, `schema.rs`) — fixed the same way,
 calling `relay_request_with_timeout` directly with `FORWARD_HOP_TIMEOUT`
-instead of `self.relay`'s flat `CLIENT_TIMEOUT`. `remote_metadata_watch_
+instead of `self.relay`'s flat `CLIENT_TIMEOUT`.
+
+**Capping each hop was not enough on its own (issue #610, fixed): a
+*serial* loop over the cap can still cost `(N-1) * FORWARD_HOP_TIMEOUT`
+for one call, and this chase's own callers have far less headroom than
+`forward_to_tablet_leader`'s `CLIENT_TIMEOUT` (10s) gives that one.**
+`dynamo.rs`'s `CreateTable` gives its whole propose-then-commit-wait loop
+only `SCHEMA_COMMIT_TIMEOUT` (5s) — so on a mere 3-node cluster, two
+capped hops (4s) already leave almost no room for the commit-wait that
+has to follow, and the shortfall gets worse with every additional voter.
+This is exactly the "first `CreateTable` after bootstrap" shape:
+`await_bootstrap` (every `ProdEnv` cluster fixture's own barrier) only
+guarantees *some* node is control leader and every node has non-empty
+membership, never that the node a client happens to reach already knows
+*who* leads — so a first `CreateTable` landing on a node whose own raw
+`leader()` is transiently `None` (issue #595's `start_pre_vote`-clears-
+`leader_id` mechanism, unrelated to a real partition) pays this
+broadcast's full serialized worst case, worse under exactly the runner
+load that makes each capped hop run closer to its cap instead of failing
+fast. Fixed by racing every candidate **concurrently** instead of one at a
+time (`futures::future::select_all` in a loop, retrying the survivors on
+each failure until one succeeds or all are exhausted) — this chase's own
+candidates carry no vouching signal over one another (unlike
+`forward_to_tablet_leader`'s `Hinted`/`Guessed` split, since nothing here
+has ever named a leader), so there is no preferred order worth trying
+serially. `select_all` rather than a plain `join_all`: it must resolve as
+soon as *any* candidate answers, not block on a dead one's own
+`FORWARD_HOP_TIMEOUT` after a live one already replied. Bounds one call to
+`FORWARD_HOP_TIMEOUT` regardless of cluster size. Regression:
+`sim_cluster_schema_broadcast.rs`'s `propose_schema_from_a_leaderless_
+follower_does_not_wait_out_an_unreachable_broadcast_candidate` — a
+follower partitioned from the (pinned) leader past one election window
+(`leader_within_hysteresis.rs`'s own repro shape for issue #595), whose
+ascending-node-id candidate order always tries the unreachable leader
+before the reachable witness; confirmed to take 2.1s pre-fix (one wasted
+`FORWARD_HOP_TIMEOUT`) and under 1s post-fix on the same seed.
+
+`remote_metadata_watch_
 loop`'s long-poll (`WATCH_METADATA_CLIENT_TIMEOUT`, deliberately *longer*
 than `CLIENT_TIMEOUT` since it must outlive the serving node's own
 `WATCH_METADATA_SERVER_TIMEOUT` park) is the one call site that

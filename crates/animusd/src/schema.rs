@@ -232,24 +232,25 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             // spelled.
             .filter_map(|(id, addr)| (Some(&id) != self.admin.node_id.as_ref()).then_some(addr))
             .collect();
-        let mut attempts: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = ClientResponse> + Send + '_>>> =
-            candidates
-                .into_iter()
-                .map(|addr| {
-                    let fut: std::pin::Pin<
-                        Box<dyn std::future::Future<Output = ClientResponse> + Send + '_>,
-                    > = Box::pin(async move {
-                        self.relay
-                            .relay(
-                                addr,
-                                &ClientRequest::ProposeSchema(command.clone()),
-                                FORWARD_HOP_TIMEOUT,
-                            )
-                            .await
-                    });
-                    fut
-                })
-                .collect();
+        let mut attempts: Vec<
+            std::pin::Pin<Box<dyn std::future::Future<Output = ClientResponse> + Send + '_>>,
+        > = candidates
+            .into_iter()
+            .map(|addr| {
+                let fut: std::pin::Pin<
+                    Box<dyn std::future::Future<Output = ClientResponse> + Send + '_>,
+                > = Box::pin(async move {
+                    self.relay
+                        .relay(
+                            addr,
+                            &ClientRequest::ProposeSchema(command.clone()),
+                            FORWARD_HOP_TIMEOUT,
+                        )
+                        .await
+                });
+                fut
+            })
+            .collect();
         while !attempts.is_empty() {
             let (resp, _idx, remaining) = futures::future::select_all(attempts).await;
             if !matches!(resp, ClientResponse::Error(_)) {
