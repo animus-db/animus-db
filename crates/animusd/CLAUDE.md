@@ -881,7 +881,25 @@ reusing the captured config is the point of the test.
   for the authoritative design. **The hot-trim arm's merge-residue
   cursor-row cleanup was removed** (tablets are split-only, ADR 0044) —
   `trim_janitor` only ever touches
-  `KIND_CHANGE` rows now, never `KIND_CURSOR`. **`clear_backfill_cursor`**
+  `KIND_CHANGE` rows now, never `KIND_CURSOR`. **`trim_janitor`'s own
+  `KindBatch` deletes share `Metric::CpProposalsAccepted` with every real
+  client write on the same group (issue #974)** — it runs unconditionally
+  on every led tablet each `INDEX_DRAIN_INTERVAL` tick, even for a plain
+  table with no GSI/stream/PITR consumer (a marker record is never itself
+  consumer-visible, so it is always immediately safe to delete), and its
+  `cp_kind_write_raw` call goes through the exact same
+  `RaftKvNode::put_kind_batch`/`record_propose` choke point a client's own
+  `KindBatch` write does — nothing below that point can tell the two apart.
+  `trim_janitor` now also increments `Metric::CpHousekeepingProposalsAccepted`
+  at its own call site (the one place that knows a given accepted propose is
+  housekeeping, not a reaction to a client request), so a caller that needs
+  "proposals a client write actually caused" over some window can subtract
+  that counter's own delta from `CpProposalsAccepted`'s. See
+  `tests/batch_write.rs`'s module doc for the investigation (a same-tick
+  trim landing inside a metrics-scraping test's own before/after window,
+  not a duplicate propose from any confirm-loop retry) and `crates/
+  animus-env/src/metrics.rs`'s `CpHousekeepingProposalsAccepted` doc.
+  **`clear_backfill_cursor`**
   (ADR 0045 §5 step 3) is a fifth, on-demand (not per-tick) function in this
   module: an idempotent tombstone of one index's own backfill cursor row on
   one tablet, reached via the internal-only `ClientRequest::
