@@ -1986,6 +1986,36 @@ pub(crate) enum SnapshotRead {
 /// a leader is reachable; the cap only bounds the wait when the group is forming.
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long every one of this crate's own listener accept loops
+/// (`serve_requests`, `dynamo::serve`, `admin::serve`, `console::serve`)
+/// backs off after a failed `accept()` before retrying — issue #592.
+///
+/// **A failed `accept()` must never stop an accept loop.**
+/// `TcpListener::accept`'s error cases (`EMFILE`/`ENFILE` when the process
+/// or system is at its file-descriptor limit, `ECONNABORTED`/`ECONNRESET`
+/// from a peer that disconnected mid-handshake, and similar per-connection
+/// conditions) are ordinarily transient — the classic accept-loop hazard,
+/// well documented for `accept(2)`-style servers, is treating any of them
+/// as fatal and returning, which silently and permanently deafens this
+/// listener to every future connection despite the process staying alive
+/// and otherwise healthy. `animus_env::prod::spawn_accept` already
+/// documents fixing exactly this shape for the internal Raft wire (a
+/// transient `EMFILE` during a bootstrap connect storm killed that
+/// listener's accept loop, stranding the node); the four listeners in this
+/// crate each carried a `return` on any `accept()` error instead, despite
+/// each one's own doc comment claiming to "keep serving," and this is the
+/// most likely account of issue #592's own `index_backfill.rs` panic: a
+/// split's own burst of new per-tablet engines/Raft groups is exactly the
+/// kind of transient fd pressure that can turn one `accept()` on the intra
+/// listener into a permanently dead port for the rest of that test's later
+/// calls, with no bind-side race or scheduling delay required at all. See
+/// `docs/lessons/general/2026-09-16-an-accept-loop-must-outlive-a-single-
+/// transient-accept-error.md`. Matches `spawn_accept`'s own
+/// `ACCEPT_ERROR_BACKOFF` value — short, so a genuinely transient blip
+/// resumes accepting within a fraction of an election timeout rather than
+/// lingering backed off while a caller times out reaching this node.
+pub(crate) const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(10);
+
 /// ADR 0055: the refusal a node returns for a **forwarded** eventual read it
 /// cannot serve — it holds no serveable replica of the tablet, or the one it
 /// holds does not cover the requested range.
@@ -12950,8 +12980,11 @@ async fn median_split_key<E: Env>(group: &CpGroup<E>) -> Option<Vec<u8>> {
 /// call sites for why). `None` (TLS unconfigured, the default) is plain
 /// TCP, byte-for-byte unchanged. A failed handshake is logged at `warn`
 /// with the peer's address and the connection dropped — the loop keeps
-/// serving every other connection, mirroring `animus_env::prod::
-/// spawn_accept`'s own contract.
+/// serving every other connection. **A failed `accept()` itself also never
+/// stops this loop** (issue #592, [`ACCEPT_ERROR_BACKOFF`]'s own doc) — it
+/// now genuinely mirrors `animus_env::prod::spawn_accept`'s contract,
+/// which this doc comment used to claim without the code actually doing
+/// it.
 async fn serve_requests(
     listener_socket: TcpListener,
     ctx: ClientCtx,
@@ -12984,8 +13017,8 @@ async fn serve_requests(
                 });
             }
             Err(err) => {
-                tracing::warn!(?err, "accept failed");
-                return;
+                tracing::warn!(?err, "accept failed (retrying)");
+                tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
             }
         }
     }
