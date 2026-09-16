@@ -2244,6 +2244,30 @@ pub struct RaftKvNode<E: Env, S: StorageEngine> {
     /// adoption order (issue #596) — see [`VoterHistory`]'s doc for why this
     /// exists and [`voter_history`](Self::voter_history) for the read side.
     voter_history: Arc<Mutex<VoterHistory>>,
+    /// The `(commit ts, ordinal)` of the **most recently materialized**
+    /// `KIND_CHANGE` record this group has applied (issue #859) — an
+    /// incrementally-maintained cache of the same maximum a full
+    /// decode-and-sort of [`pending_changes`](Self::pending_changes) would
+    /// find, kept cheap to read on every `GetShardIterator{LATEST}` call
+    /// instead of re-scanning the whole hot tail for it.
+    ///
+    /// **Why this is always the true max, not just the latest write's own
+    /// value**: every applied entry's `ts` is strictly greater than every
+    /// `ts` applied before it ([`assert_ts_monotonic`]), and within one
+    /// entry `ordinal` only ever increases (`materialize_derived`'s own
+    /// doc) — so the sequence of `(ts, ordinal)` pairs this field is ever
+    /// set to is itself non-decreasing. Updated in-memory, synchronously,
+    /// at every one of `apply_and_compact`'s `materialize_derived` call
+    /// sites whose `change_log` was non-empty — never written durably (no
+    /// new marker key, unlike `ceiling.rs`/`hwm.rs`'s precedent): a restart
+    /// re-seeds it from one bounded engine scan at group start
+    /// (`start_inner`'s caller, `drive`), the same one-time cost `sealed`/
+    /// `committed_ceiling`/`txn_tracker` already pay there, so every
+    /// `GetShardIterator{LATEST}` call while the process is up stays O(1).
+    /// `None` means "no `KIND_CHANGE` record has ever been observed for
+    /// this tablet" — the caller's own fallback (the stream's sealed
+    /// watermark) mirrors `hot_read`'s own `unwrap_or` exactly.
+    hot_change_max: Arc<Mutex<Option<(HlcTimestamp, u32)>>>,
 }
 
 /// A bounded, in-process ring of every distinct Raft voter configuration a
@@ -2624,6 +2648,11 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         // restart's history never starts from a config this node never
         // actually held.
         let voter_history = Arc::new(Mutex::new(VoterHistory::default()));
+        // Issue #859: rebuilt asynchronously inside `drive` from one bounded
+        // engine scan (needs `.await`), exactly like `txn_tracker` just
+        // above — starts empty and is populated before the apply task's
+        // first pass.
+        let hot_change_max = Arc::new(Mutex::new(None));
         let node = Self {
             env: env.clone(),
             core: Arc::clone(&core),
@@ -2658,6 +2687,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             external_quiesce_veto: Arc::clone(&external_quiesce_veto),
             external_quiesce_veto_fresh_through: Arc::clone(&external_quiesce_veto_fresh_through),
             voter_history: Arc::clone(&voter_history),
+            hot_change_max: Arc::clone(&hot_change_max),
         };
         // The consensus loop recovers from the WAL, then spawns the apply task
         // (so the apply task sees the recovered core + the correct
@@ -2698,6 +2728,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             voter_history,
             heartbeat_batcher,
             shared_wal,
+            hot_change_max,
         }));
         node
     }
@@ -5585,6 +5616,18 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             .collect()
     }
 
+    /// The `(commit ts, ordinal)` of this group's own highest-committed
+    /// `KIND_CHANGE` record (issue #859) — the cheap, O(1) replacement for
+    /// decoding-and-sorting the whole [`pending_changes`](Self::pending_changes)
+    /// tail just to find its own maximum. See
+    /// [`hot_change_max`](Self::hot_change_max)'s field doc for why this is
+    /// always exactly the value a full scan-and-sort would find, and never
+    /// stale while this process is up. `None` means this tablet has never
+    /// materialized a single `KIND_CHANGE` record.
+    pub async fn hot_change_max(&self) -> Option<(HlcTimestamp, u32)> {
+        *self.hot_change_max.lock().expect("hot change max poisoned")
+    }
+
     /// The split-build driver's raw row read (ADR 0050 Train B rung 4): every
     /// row of one kind scope — **tombstones and MVCC versions retained, value
     /// bytes verbatim** (envelope tag included, so a staged intent ships as
@@ -6804,6 +6847,62 @@ fn assert_ts_monotonic(max_applied_ts: &mut Option<HlcTimestamp>, ts: HlcTimesta
     *max_applied_ts = Some(ts);
 }
 
+/// The exact dual of [`materialize_derived`]'s own key completion (`prefix
+/// || hlc::pack(ts) || ordinal`, issue #852): recovers a `KIND_CHANGE`
+/// record's own `(ts, ordinal)` from its **logical** key (post-
+/// [`StorageScope::strip_in_range`]). `None` on a malformed/too-short
+/// suffix — an engine-internal key this crate itself wrote should never be
+/// malformed, mirroring `seal.rs`/`ceiling.rs`'s "defensive read" doctrine.
+/// A small in-crate duplicate of `animusd::index_drain::record_hlc_ordinal`
+/// (that crate decodes the identical suffix from the *physical* key
+/// `hot_read` reads back over the wire) — kept local rather than shared
+/// since [`scan_hot_change_max`]'s boot-time seed (issue #859) is this
+/// crate's only consumer, and the encoding itself already has exactly one
+/// source of truth: `materialize_derived`'s own key-building code.
+fn decode_change_suffix(key: &[u8]) -> Option<(HlcTimestamp, u32)> {
+    const ORDINAL_BYTES: usize = 4;
+    const HLC_BYTES: usize = 8;
+    let suffix_start = key.len().checked_sub(HLC_BYTES + ORDINAL_BYTES)?;
+    let ts = cursor::decode_watermark(&key[suffix_start..suffix_start + HLC_BYTES])?;
+    let ordinal = u32::from_be_bytes(key[suffix_start + HLC_BYTES..].try_into().ok()?);
+    Some((ts, ordinal))
+}
+
+/// [`RaftKvNode::hot_change_max`]'s boot-time seed (issue #859): one bounded
+/// scan of `KIND_CHANGE`'s own scope, decoding every record's key suffix to
+/// find the `(ts, ordinal)` of the highest one — the identical maximum
+/// `animusd::index_drain::hot_read`'s own decode-sort-truncate would find,
+/// computed once here (via a plain `max()` fold, no allocation/sort) so
+/// every `GetShardIterator{LATEST}` call afterward is an `Arc<Mutex<_>>`
+/// read instead. Paid exactly once per group start, alongside `sealed`/
+/// `committed_ceiling`/`txn_tracker`'s own rebuild-at-start scans (`drive`'s
+/// doc). `None` for a tablet that has never materialized a change record —
+/// including a fresh `StorageScope::whole()` group, which
+/// [`pending_changes`](RaftKvNode::pending_changes)'s identical `end`-less
+/// guard also treats as empty.
+async fn scan_hot_change_max<S: StorageEngine>(
+    storage: &S,
+    kind_scopes: &[StorageScope; ALL_KINDS.len()],
+) -> Option<(HlcTimestamp, u32)> {
+    let scope = &kind_scopes[KIND_CHANGE as usize];
+    let (start, end) = scope.physical_bounds();
+    let end = end?;
+    storage
+        .scan(&start, &end)
+        .await
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|(k, vv)| {
+            let logical = scope.strip_in_range(&k)?;
+            match txn::decode_envelope(&vv.value) {
+                txn::Envelope::Committed(_) => decode_change_suffix(logical),
+                txn::Envelope::Intent { .. } => None,
+            }
+        })
+        .max()
+}
+
 /// **The one shared "materialize derived writes at this ts" helper (ADR
 /// 0046 binding decision)** — `KvCommand::KindBatch`'s apply arm and
 /// `KvCommand::TxnResolve`'s commit branch both call this and only this,
@@ -6911,6 +7010,29 @@ fn materialize_derived(
             "materialize_derived: a single call's change_log carries far fewer than 2^32 records",
         ))
         .expect("materialize_derived: ordinal overflow — an entry minted far more than 2^32 change records")
+}
+
+/// Folds one just-materialized change-log write into [`RaftKvNode::
+/// hot_change_max`]'s shared cache (issue #859) — called at every
+/// `materialize_derived` call site whose `change_log` was non-empty, with
+/// that entry's own `ts` and the highest ordinal it just wrote
+/// (`next_ordinal - 1`, `materialize_derived`'s own return value minus
+/// one). Takes the `max()` against whatever is already cached rather than
+/// unconditionally overwriting: `ts` only increases monotonically *across*
+/// applied entries (`assert_ts_monotonic`), but `TxnResolve`'s own commit
+/// loop can call `materialize_derived` more than once for the SAME entry's
+/// `ts`, each with a growing `ordinal` (`materialize_derived`'s own doc) —
+/// tuple `Ord` compares `ts` first, so `max()` is correct regardless of
+/// call order and never needs a caller to know whether it holds an entry's
+/// LAST call.
+fn note_hot_change_write(
+    hot_change_max: &Arc<Mutex<Option<(HlcTimestamp, u32)>>>,
+    ts: HlcTimestamp,
+    max_ordinal: u32,
+) {
+    let mut guard = hot_change_max.lock().expect("hot change max poisoned");
+    let candidate = (ts, max_ordinal);
+    *guard = Some(guard.map_or(candidate, |existing| existing.max(candidate)));
 }
 
 /// The logical `KIND_BASE` key of one item, given its identity alone —
@@ -7257,6 +7379,12 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     // forward progress, never total transfer duration.
     compact_defer_since: &mut Option<Nanos>,
     compact_defer_progress: &mut Option<u64>,
+    // Issue #859: the shared, incrementally-maintained cache
+    // `GetShardIterator{LATEST}` reads instead of a full `hot_read` scan —
+    // see `RaftKvNode::hot_change_max`'s doc. Updated in-memory at every
+    // `materialize_derived` call site below whose `change_log` was
+    // non-empty (`note_hot_change_write`); never written durably.
+    hot_change_max: &Arc<Mutex<Option<(HlcTimestamp, u32)>>>,
 ) -> bool {
     let mut did_work = false;
 
@@ -7543,8 +7671,11 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     // Single call, whole `change_log` at once — always
                     // starts at ordinal 0; nothing else materializes at
                     // this same `ts` in this entry.
-                    let _ =
+                    let next_ordinal =
                         materialize_derived(kind_scopes, &writes, &change_log, ts, &mut pending, 0);
+                    if !change_log.is_empty() {
+                        note_hot_change_write(hot_change_max, ts, next_ordinal - 1);
+                    }
                 }
             }
             KvCommand::KindEval {
@@ -7634,7 +7765,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                                     // commit branch below also call. Single
                                     // call, one key evaluated here — always
                                     // starts at ordinal 0.
-                                    let _ = materialize_derived(
+                                    let next_ordinal = materialize_derived(
                                         kind_scopes,
                                         &writes,
                                         std::slice::from_ref(&change_log),
@@ -7642,6 +7773,11 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                                         &mut pending,
                                         0,
                                     );
+                                    // `std::slice::from_ref` above always
+                                    // hands `materialize_derived` exactly
+                                    // one record, so `change_log` here is
+                                    // never empty — unconditional update.
+                                    note_hot_change_write(hot_change_max, ts, next_ordinal - 1);
                                     // Leader-local result payload (ADR 0054
                                     // mechanism 3) — a no-op unless this
                                     // node itself registered interest in
@@ -8267,7 +8403,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                         // Single call, the WHOLE stage-marker list at once
                         // (built above from every write in this stage) —
                         // always starts at ordinal 0.
-                        let _ = materialize_derived(
+                        let next_ordinal = materialize_derived(
                             kind_scopes,
                             &[],
                             &stage_markers,
@@ -8275,6 +8411,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                             &mut pending,
                             0,
                         );
+                        note_hot_change_write(hot_change_max, ts, next_ordinal - 1);
                     }
                     if is_anchor {
                         let record = txn::TxnRecord {
@@ -8882,6 +9019,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                                 // distinct `(ts, ordinal)` pairs rather than
                                 // every one colliding on ordinal 0 — see
                                 // this loop's own doc, above.
+                                let starting_ordinal = next_ordinal;
                                 next_ordinal = materialize_derived(
                                     kind_scopes,
                                     &kind_writes,
@@ -8893,6 +9031,13 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                                     &mut pending,
                                     next_ordinal,
                                 );
+                                // Issue #859: only when THIS call actually
+                                // materialized a record (`next_ordinal`
+                                // advanced) — `change_log` can be empty for
+                                // a resolved key with no record of its own.
+                                if next_ordinal > starting_ordinal {
+                                    note_hot_change_write(hot_change_max, ts, next_ordinal - 1);
+                                }
                             }
                             None => {
                                 // Aborted: restore whatever this key held
@@ -9619,6 +9764,10 @@ struct DriveState<E: Env, S: StorageEngine> {
     /// `wal_file(stream)`. `None` (every pre-C-05-PR-2 constructor) is
     /// byte-for-byte today's per-group-file behavior.
     shared_wal: Option<Arc<SharedWal<KvCommand, KvState>>>,
+    /// See [`RaftKvNode::hot_change_max`]'s doc — threaded through so
+    /// `drive` can seed it from one bounded boot scan and the apply task
+    /// can keep it current as new `KIND_CHANGE` records materialize.
+    hot_change_max: Arc<Mutex<Option<(HlcTimestamp, u32)>>>,
 }
 
 /// One split-build seed row (ADR 0050 Train B rung 4): `(kind index into
@@ -9751,6 +9900,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         voter_history,
         heartbeat_batcher,
         shared_wal,
+        hot_change_max,
     } = st;
 
     // ADR 0044 phase 2 (C-02 PR 2): register this group's own stream with
@@ -9969,9 +10119,16 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
     // accepted cost this crate already pays for `has_data`/`engine_image`.
     let rebuilt_tracker = rebuild_txn_tracker(&storage, &scope).await;
     *txn_tracker.lock().expect("txn tracker poisoned") = rebuilt_tracker;
+    // Issue #859: seed `hot_change_max` from one bounded scan of this
+    // tablet's own `KIND_CHANGE` scope — the same "engine scan paid once at
+    // group start" cost `sealed`/`committed_ceiling`/`txn_tracker` already
+    // pay just above, so every `GetShardIterator{LATEST}` call afterward
+    // reads the cache instead of re-deriving this maximum.
+    *hot_change_max.lock().expect("hot change max poisoned") =
+        scan_hot_change_max(&storage, &kind_scopes).await;
     // Spawn the apply task now — after recovery seeded the core + `engine_applied`
-    // + `sealed` + `committed_ceiling` + `txn_tracker`, so it never merges
-    // against pre-recovery state.
+    // + `sealed` + `committed_ceiling` + `txn_tracker` + `hot_change_max`, so it
+    // never merges against pre-recovery state.
     env.spawn_task(apply_loop(
         env.clone(),
         wal.clone(),
@@ -10000,6 +10157,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         Arc::clone(&fork_signal),
         Arc::clone(&persist),
         shared_wal.clone(),
+        Arc::clone(&hot_change_max),
     ));
 
     // Issue #279: the loop's own in-flight persist round, and the outbound
@@ -10585,6 +10743,10 @@ async fn apply_loop<E: Env, S: StorageEngine>(
     fork_signal: Arc<ForkSignal>,
     persist: Arc<PersistProgress>,
     shared_wal: Option<Arc<SharedWal<KvCommand, KvState>>>,
+    // Issue #859: seeded by `drive`'s own boot scan before this task
+    // spawns, then kept current in-memory as this task materializes new
+    // `KIND_CHANGE` records — see `RaftKvNode::hot_change_max`'s doc.
+    hot_change_max: Arc<Mutex<Option<(HlcTimestamp, u32)>>>,
 ) {
     // This apply task's own sequential, single-writer bookkeeping (see
     // `apply_and_compact`'s doc): `sealed` is seeded from the engine-durable
@@ -10650,6 +10812,7 @@ async fn apply_loop<E: Env, S: StorageEngine>(
             shared_wal.as_deref(),
             &mut compact_defer_since,
             &mut compact_defer_progress,
+            &hot_change_max,
         )
         .await;
         if !did_work {

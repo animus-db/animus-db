@@ -303,6 +303,22 @@ pub enum ClientRequest {
         from_position_ordinal: u32,
         limit: usize,
     },
+    /// **Internal open-shard max-position RPC (issue #859) — never sent
+    /// bare, only wrapped in [`Forwarded`](Self::Forwarded)**, mirroring
+    /// [`StreamHotRead`](Self::StreamHotRead) exactly (same addressing, same
+    /// bare-refusal reason: an arbitrary caller must not read a tablet's own
+    /// change-log state, even indirectly, bypassing the DynamoDB Streams
+    /// surface). `GetShardIterator{LATEST}`'s own primitive
+    /// (`dynamo_streams.rs`): the `(packed_hlc, ordinal)` of `tablet`'s own
+    /// highest-materialized `KIND_CHANGE` record, an `Arc<Mutex<_>>` read on
+    /// the leader (`RaftKvNode::hot_change_max`) rather than the full
+    /// decode-sort-truncate `StreamHotRead`/`hot_read` pay. Answered with
+    /// `ClientResponse::Pairs`, reusing `StreamHotRead`'s own response shape
+    /// (a zero- or one-element list; a present element's key carries the
+    /// same trailing `(packed_hlc, ordinal)` suffix `record_seqno_suffix`
+    /// already decodes, value ignored) rather than adding a new
+    /// `ClientResponse` variant for one optional pair.
+    StreamHotChangeMax { tablet: u64 },
     /// **Internal backfill-cursor-cleanup RPC — never sent bare, only
     /// wrapped in [`Forwarded`](Self::Forwarded)** (ADR 0045 §5 step 3):
     /// delete `tablet`'s own backfill cursor row for `index` (`KIND_CURSOR`,
@@ -690,6 +706,7 @@ pub fn surface_of(request: &ClientRequest) -> Surface {
         | ClientRequest::ForcePitrSeal { .. }
         | ClientRequest::TriggerAutoSplit { .. }
         | ClientRequest::StreamHotRead { .. }
+        | ClientRequest::StreamHotChangeMax { .. }
         | ClientRequest::ClearBackfillCursor { .. }
         | ClientRequest::KindWriteItem { .. }
         | ClientRequest::TxnPrepare { .. }

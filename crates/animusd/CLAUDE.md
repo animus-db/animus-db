@@ -644,8 +644,10 @@ reusing the captured config is the point of the test.
 - **`dynamo_streams.rs`** (ADR 0042 §3/§5/§6/§7/§9/§10/§11) — the
   DynamoDB Streams read API: `ListStreams`/`DescribeStream`/
   `GetShardIterator`/`GetRecords`. Full design (label resolution, the
-  sealed-vs-open serve split, `StreamHotRead`) is in
-  `docs/streams-notes.md` — this entry is just the module pointer.
+  sealed-vs-open serve split, `StreamHotRead`, and — since issue #859 —
+  `StreamHotChangeMax`, `GetShardIterator{LATEST}`'s own O(1) primitive
+  over `RaftKvNode::hot_change_max` rather than a full hot-tail scan) is
+  in `docs/streams-notes.md` — this entry is just the module pointer.
 - **`pitr_janitor.rs`'s two loop bodies moved to `animus_node::
   pitr_janitor`** (ADR 0061 rung C2) — this module is now a thin wrapper
   for both `pitr_snapshot_loop` and `pitr_janitor_loop`, same shape as

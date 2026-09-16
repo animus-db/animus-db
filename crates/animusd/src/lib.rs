@@ -605,6 +605,15 @@ impl<E: Env> CpGroup<E> {
         }
     }
 
+    /// This tablet's own highest-materialized `KIND_CHANGE` `(ts, ordinal)`
+    /// (issue #859). See [`RaftKvNode::hot_change_max`].
+    pub(crate) async fn hot_change_max(&self) -> Option<(animus_cp_data::hlc::HlcTimestamp, u32)> {
+        match self {
+            CpGroup::Lsm(n) => n.hot_change_max().await,
+            CpGroup::Mem(n) => n.hot_change_max().await,
+        }
+    }
+
     /// This group's current Raft term — one axis of the ledger-named-object
     /// amendment's per-attempt segment id (ADR 0042 §10/ADR 0043 §A3,
     /// `index_drain::seal_now`): a node that crashes and later resumes
@@ -13150,6 +13159,7 @@ fn request_kind(request: &ClientRequest) -> &'static str {
         ClientRequest::ForcePitrSeal { .. } => "force_pitr_seal",
         ClientRequest::TriggerAutoSplit { .. } => "trigger_auto_split",
         ClientRequest::StreamHotRead { .. } => "stream_hot_read",
+        ClientRequest::StreamHotChangeMax { .. } => "stream_hot_change_max",
         ClientRequest::ClearBackfillCursor { .. } => "clear_backfill_cursor",
         ClientRequest::Get { .. } => "get",
         ClientRequest::GetSnapshot { .. } => "get_snapshot",
@@ -13401,6 +13411,11 @@ async fn handle_request(
         ClientRequest::StreamHotRead { .. } => ClientResponse::Error(
             "this request is an internal open-shard hot-read RPC and must be sent wrapped in \
              `Forwarded`"
+                .into(),
+        ),
+        ClientRequest::StreamHotChangeMax { .. } => ClientResponse::Error(
+            "this request is an internal open-shard max-position RPC and must be sent wrapped \
+             in `Forwarded`"
                 .into(),
         ),
         ClientRequest::ClearBackfillCursor { .. } => ClientResponse::Error(
