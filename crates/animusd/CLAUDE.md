@@ -9960,7 +9960,7 @@ not through the DynamoDB wire):
 
 | File | Kept tests | Reason |
 |---|---|---|
-| `dynamo_index_scan.rs` | 5 (all) | Frozen behind open flake issue #418, untouched throughout |
+| `dynamo_index_scan.rs` | 5 (all) | Frozen behind open flake issue #418, untouched throughout (#418 closed 2026-09-16: its mechanism was already fixed under #559, `await_gsi_scan_everywhere`) |
 | `index_backfill.rs` | 3 (all) | Frozen behind open flake issue #592, untouched throughout |
 | `dynamo_index_writes.rs` | 6 (all) | Frozen behind open flake issue #610, untouched throughout |
 | `backfill_seeder.rs` | `split_during_backfill_converges_with_correct_final_gsi` | `SimCluster` spawns no `index_drain::change_consumer_loop`; proving it needs hand-interleaving three separately-timed on-demand primitives with no offline way to verify the aggregator can't race the cutover or that the post-cutover resweep converges — explicitly licensed by the rung's own opener |
