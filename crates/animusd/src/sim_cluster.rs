@@ -4374,6 +4374,29 @@ impl SimCluster {
         self.crashed.insert(node);
     }
 
+    /// Test-only: crash `node` `delay` of virtual time from now, via a
+    /// spawned task rather than a synchronous call — so the crash can land
+    /// **while** a caller's own long-running, multi-`run_for` driver method
+    /// (e.g. [`SimCluster::transfer_control_leadership_to`]) is still
+    /// executing, not merely between two of the caller's own top-level
+    /// calls. `Simulator::run_for` drains every scheduled task across the
+    /// whole simulator, not just ones the immediate caller spawned, so a
+    /// crash scheduled here before such a call fires at the right moment
+    /// inside it. Used by
+    /// `sim_cluster_backup_janitor::transfer_survives_the_armed_leader_being_deposed_before_handoff_completes`
+    /// to reproduce, deterministically, the exact shape of race that a
+    /// naturally-occurring election storm produced live for issue #900:
+    /// an armed leadership transfer's own leader is deposed by an
+    /// unrelated event before the handoff lands.
+    pub(crate) fn schedule_crash_after(&mut self, node: u64, delay: Duration) {
+        let sim = self.sim.clone();
+        let env = self.shared.env(node);
+        env.clone().spawn_task(async move {
+            env.sleep(delay).await;
+            sim.crash(nid(node));
+        });
+    }
+
     /// A true process restart of `node`: every task it owns is dropped
     /// (`Simulator::stop` — its control `RaftNode` driver (a control-bearing
     /// node) or its `ControlHandle::Remote` mirror-sync loop (a `NodeRole::
