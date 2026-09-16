@@ -196,7 +196,7 @@ fn held_snapshot_survives_compaction_gc() {
             "seed={seed}: snapshot pinned before the delete"
         );
         assert_eq!(
-            snap.get(b"victim").await.map(|v| v.value),
+            snap.get(b"victim").await.unwrap().map(|v| v.value),
             Some(b"hello".to_vec()),
             "seed={seed}: snapshot must see the pre-delete value"
         );
@@ -219,7 +219,7 @@ fn held_snapshot_survives_compaction_gc() {
         // While the snapshot is alive, it must still see the pre-delete value —
         // GC must not have reclaimed version 1 out from under it.
         assert_eq!(
-            snap.get(b"victim").await.map(|v| v.value),
+            snap.get(b"victim").await.unwrap().map(|v| v.value),
             Some(b"hello".to_vec()),
             "seed={seed}: held snapshot's data was reclaimed by GC"
         );

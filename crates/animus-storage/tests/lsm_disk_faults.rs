@@ -50,7 +50,7 @@
 
 use animus_env::{Disk, nid};
 use animus_sim::{DiskConfig, SimEnv, Simulator};
-use animus_storage::{LsmEngine, LsmOptions, StorageEngine};
+use animus_storage::{LsmEngine, LsmOptions, Snapshot, StorageEngine};
 use animus_test::corpus::{self, SeedVariant};
 use futures::executor::block_on;
 use std::collections::BTreeSet;
@@ -335,6 +335,91 @@ fn scenario_corrupted_sstable_block_read_is_a_clean_error(seed: u64) {
             .get(key(0).as_bytes())
             .await
             .expect_err("seed={seed}: a corrupted block must fail the read, not return data");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("crc") || msg.contains("corrupt") || msg.contains("decompress"),
+            "seed={seed}: expected a checksum/corruption error, got: {msg}"
+        );
+    });
+}
+
+/// REGRESSION for issue #845: `LsmSnapshot::get`/`scan` used to fold a real
+/// backing-store failure into "not found" / "empty"
+/// (`self.engine.read_at(..).ok().flatten()` /
+/// `self.engine.scan_at(..).unwrap_or_default()`), because `Snapshot::get`/
+/// `scan` were infallible by signature. A corrupt-block CRC mismatch reached
+/// through a snapshot was therefore indistinguishable from a genuinely
+/// absent key or an empty range. Mirrors
+/// [`scenario_corrupted_sstable_block_read_is_a_clean_error`]'s corruption
+/// setup, but reads through `LsmEngine::snapshot()` — proving `Err`
+/// propagates through the `Snapshot` trait, not just the engine's own
+/// `get`/`scan`. Also pins the companion positive case: a **healthy**
+/// snapshot still returns `Ok(Some(..))`/`Ok(vec)`, not an accidental `Err`.
+#[test]
+fn snapshot_get_and_scan_surface_corrupted_block_as_err_not_absent() {
+    let seed = corpus::name_seed("snapshot_get_and_scan_surface_corrupted_block_as_err_not_absent");
+    let sim = Simulator::new(seed);
+    let e = open(&sim, wal_only_opts());
+    block_on(async {
+        for i in 0..30u64 {
+            e.put(key(i).as_bytes(), value(i).as_bytes(), i + 1)
+                .await
+                .unwrap();
+        }
+        // One explicit flush: everything moves to a single SSTable and the
+        // memtable is cleared, so subsequent point reads must hit disk.
+        e.flush_now().await.unwrap();
+        assert_eq!(e.sstable_count(), 1, "seed={seed}: expected one SSTable");
+    });
+    assert_eq!(
+        e.memtable_len(),
+        0,
+        "seed={seed}: memtable must be empty so the read goes to the SSTable"
+    );
+
+    // Pin a snapshot now, over the healthy engine.
+    let snap = e.snapshot();
+
+    // Healthy baseline: a snapshot's get/scan still succeed normally.
+    block_on(async {
+        assert_eq!(
+            snap.get(key(0).as_bytes()).await.unwrap().unwrap().value,
+            value(0).as_bytes(),
+            "seed={seed}: a healthy snapshot get must return Ok(Some(..))"
+        );
+        let rows = snap.scan(b"k000", b"k999").await.unwrap_or_else(|e| {
+            panic!("seed={seed}: healthy snapshot scan must return Ok(..): {e}")
+        });
+        assert!(
+            !rows.is_empty(),
+            "seed={seed}: a healthy snapshot scan must return Ok(non-empty)"
+        );
+    });
+
+    // Corrupt the sole SSTable's first data block (same technique as
+    // `scenario_corrupted_sstable_block_read_is_a_clean_error`).
+    let views = e.sstable_views();
+    let sst_file = format!("{PREFIX}sst-{:06}", views[0].seq);
+    assert!(
+        sim.corrupt_durable(nid(0), &sst_file, 1),
+        "seed={seed}: corruption must land"
+    );
+
+    block_on(async {
+        let err = snap.get(key(0).as_bytes()).await.expect_err(&format!(
+            "seed={seed}: a corrupted block read through a snapshot must \
+             fail loudly (Err), not silently return Ok(None) — issue #845"
+        ));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("crc") || msg.contains("corrupt") || msg.contains("decompress"),
+            "seed={seed}: expected a checksum/corruption error, got: {msg}"
+        );
+
+        let err = snap.scan(b"k000", b"k999").await.expect_err(&format!(
+            "seed={seed}: a corrupted block read through a snapshot scan must \
+             fail loudly (Err), not silently return Ok(empty) — issue #845"
+        ));
         let msg = err.to_string();
         assert!(
             msg.contains("crc") || msg.contains("corrupt") || msg.contains("decompress"),
