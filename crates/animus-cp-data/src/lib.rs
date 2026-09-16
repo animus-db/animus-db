@@ -5547,8 +5547,8 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         Some(rows)
     }
 
-    /// Every pending change-log record this tablet holds, in **commit order**
-    /// (ADR 0041 §4): `(record key, encoded record)`.
+    /// Every pending change-log record this tablet holds, in **physical key
+    /// order** — `(record key, encoded record)`.
     ///
     /// A whole-`KIND_CHANGE`-scope sweep, bounded by this tablet's own scope
     /// (`physical_bounds`, never `entries()` — a node's tablets share one
@@ -5559,10 +5559,19 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// general API bounded stops an accidental full-tablet read being a typo
     /// away.
     ///
-    /// Key order is commit order because a record's key ends in its own commit
-    /// HLC (see [`KvCommand::KindBatch`]'s `change_log`), so a drain processing
-    /// these front-to-back sees each key's mutations in the order they
-    /// committed.
+    /// **This is NOT commit order.** A record's physical key is `token ||
+    /// escape(pk) || packed_hlc || ordinal` (see [`KvCommand::KindBatch`]'s
+    /// `change_log`, and `materialize_derived`'s own doc for the trailing
+    /// `hlc`/`ordinal` pair) — the token leads, so this scan is grouped by
+    /// partition first and by commit HLC only within one partition. Across
+    /// partitions the order is whatever the hash ring put them in, not commit
+    /// order (ADR 0043 §A3 step 1 says this explicitly: "key order is
+    /// token-then-pk-then-HLC, not global commit order"). A caller that needs
+    /// HLC/commit order — a seal, a hot read, anything feeding a
+    /// `GetRecords`-shaped consumer — must sort explicitly by the trailing
+    /// `(packed_hlc, ordinal)` pair, exactly as `seal_now`/`hot_read`
+    /// (`animusd::index_drain`) already do; don't rely on this method's own
+    /// return order for that.
     pub async fn pending_changes(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
         let scope = &self.kind_scopes[KIND_CHANGE as usize];
         let (start, end) = scope.physical_bounds();
