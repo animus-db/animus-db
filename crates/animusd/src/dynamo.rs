@@ -384,7 +384,9 @@ fn reject_empty_key_value(v: &AttributeValue) -> Result<(), WireError> {
 /// caller-identity story; TLS here is confidentiality + server
 /// authenticity only). `None` (the default) is plain TCP, byte-for-byte
 /// unchanged. A failed handshake is logged at `warn` with the peer's
-/// address and the connection dropped; the loop keeps serving.
+/// address and the connection dropped; the loop keeps serving. **A failed
+/// `accept()` itself also never stops this loop** (issue #592,
+/// `crate::ACCEPT_ERROR_BACKOFF`'s own doc).
 pub(crate) async fn serve(
     listener: TcpListener,
     ctx: ClientCtx,
@@ -416,8 +418,8 @@ pub(crate) async fn serve(
                 });
             }
             Err(err) => {
-                tracing::warn!(?err, "dynamo accept failed");
-                return;
+                tracing::warn!(?err, "dynamo accept failed (retrying)");
+                tokio::time::sleep(crate::ACCEPT_ERROR_BACKOFF).await;
             }
         }
     }

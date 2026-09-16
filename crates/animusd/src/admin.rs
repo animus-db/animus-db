@@ -231,8 +231,11 @@ pub(crate) struct CpTxnView {
 /// `None` (the default) is plain TCP, byte-for-byte unchanged. A failed
 /// handshake (a plain-TCP dial into a TLS listener, or any other TLS
 /// error) is logged at `warn` with the peer's address and the connection
-/// dropped; the loop keeps serving every other connection, mirroring
-/// `animus_env::prod::spawn_accept`'s own contract.
+/// dropped; the loop keeps serving every other connection. **A failed
+/// `accept()` itself also never stops this loop** (issue #592,
+/// `crate::ACCEPT_ERROR_BACKOFF`'s own doc) — it now genuinely mirrors
+/// `animus_env::prod::spawn_accept`'s contract, which this doc comment
+/// used to claim without the code actually doing it.
 pub(crate) async fn serve(
     listener: TcpListener,
     ctx: ClientCtx,
@@ -264,8 +267,8 @@ pub(crate) async fn serve(
                 });
             }
             Err(err) => {
-                tracing::warn!(?err, "admin accept failed");
-                return;
+                tracing::warn!(?err, "admin accept failed (retrying)");
+                tokio::time::sleep(crate::ACCEPT_ERROR_BACKOFF).await;
             }
         }
     }

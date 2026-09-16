@@ -4568,6 +4568,29 @@ ADR itself for the full design/rationale.
 
 ## Gotchas
 
+- **Every listener accept loop must survive a single transient `accept()`
+  error (issue #592, fixed 2026-09-16)** — `serve_requests` (`lib.rs`, the
+  client/intra ports), `dynamo::serve`, `admin::serve`, and
+  `console::serve` each used to `return` on any `Err` from
+  `listener.accept()`, permanently killing that listener (closing the
+  port) on the very first transient `EMFILE`/`ECONNABORTED`/similar —
+  despite each one's own doc comment claiming to mirror
+  `animus_env::prod::spawn_accept`'s established "log + back off + keep
+  accepting" contract, which none of the four actually implemented for a
+  listener-level `accept()` error (only for a per-connection TLS-handshake
+  failure). This is what produced `index_backfill.rs`'s own
+  `connect: Connection refused` panic against an address that had bound
+  and served correctly moments earlier — a split's burst of new per-tablet
+  engines/Raft groups is exactly the kind of transient fd pressure that
+  can tip one `accept()` into a momentary error. All four loops now retry
+  with `ACCEPT_ERROR_BACKOFF` instead of returning. See
+  `docs/lessons/general/2026-09-16-an-accept-loop-must-outlive-a-single-
+  transient-accept-error.md` for the full investigation (including why the
+  CI log showed no diagnostic trace — this crate's test binaries install
+  no `tracing_subscriber`, so the very `"accept failed"` warning that would
+  have named the cause is unconditionally silent there). When adding a
+  fifth listener to this crate, copy the retry shape, not the pre-fix
+  `return`.
 - **The DynamoDB Streams segment store + sealer knobs are wired via the
   `_with_orphan_sweep_after`-style layered-wrapper convention** (ADR
   0042/0043): `main.rs`'s `--stream-seal-bytes B`/
