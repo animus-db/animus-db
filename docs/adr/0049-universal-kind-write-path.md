@@ -384,3 +384,33 @@ original code could. See `crates/animusd/src/write_path.rs`'s
 `cp_kind_raw_local` doc for the full mechanism and
 `docs/lessons/code-patterns/2026-09-16-is-leader-false-is-not-proof-a-write-is-lost.md`
 for the generalizable lesson.
+
+**Further amendment (2026-09-16, issue #967): `cp_kind_eval_local`'s own
+confirm loop — the ADR 0054 single-item `PutItem`/`UpdateItem`/`DeleteItem`
+path — carried the identical `!is_leader()` hazard the #911 fix above
+closed for `cp_kind_raw_local`, unfixed.** Found by CI running
+`batch_write.rs::batched_write_beats_per_key` under load: 200 serial
+per-key `PutItem`s accepted 201 proposals — a violation of that test's exact
+`== N` assertion (deliberately left exact, per #911's own note that the
+per-key side had never shown an extra propose in 6000+ sampled writes).
+Unlike `cp_kind_raw_local`, `cp_kind_eval_local` already used
+`classify_kind_batch_outcome`'s (index, term) identity channel as its
+*primary* confirm signal (never a value-equality probe — apply computes the
+written bytes itself, so there is nothing to compare against) — but its
+`Inconclusive` fallthrough still called `decide::confirm_wait_is_futile`
+verbatim, the same `!is_leader()`-consulting predicate, before falling back
+to one more identity re-check and then giving up. A term bump from a missed
+heartbeat deadline flips `is_leader()` false before this node — now a plain
+follower — can tell whether its own already-accepted entry will still
+commit; `kind_batch_outcome`/`engine_applied_index` need no leadership at
+all, so nothing justified ending the wait there. Fixed identically:
+`cp_kind_eval_local`'s confirm loop now asks only the two
+leadership-independent questions (effects merged past the accepted index
+with no matching outcome, or a different term recorded at that index) — the
+common logic between the two confirm loops is now one shared, directly
+unit-tested helper, `kind_batch_confirm_superseded`
+(`crates/animusd/src/lib.rs`), so a future third caller cannot reintroduce
+this by re-deriving the check by hand. See
+`crates/animusd/src/write_path.rs`'s `cp_kind_eval_local` doc and
+`docs/lessons/code-patterns/2026-09-16-is-leader-false-is-not-proof-a-write-is-lost.md`
+(amended) for the full account.

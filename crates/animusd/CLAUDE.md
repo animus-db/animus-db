@@ -2334,6 +2334,33 @@ accept and confirm, reproducing the identical false-negative class
 deterministically) and `cp_kind_raw_local_genuine_loss_tests` (proves the
 fast-fail path for an actually-truncated entry is unchanged).
 
+**`cp_kind_eval_local` carried the identical `!is_leader()` hazard,
+unfixed, until issue #967.** Unlike `cp_kind_raw_local`, it already used
+`classify_kind_batch_outcome` as its *primary* confirm channel (it has no
+value-equality fallback at all — apply computes the written bytes itself),
+but its `Inconclusive` fallthrough still called `decide::
+confirm_wait_is_futile` verbatim before falling back to one more identity
+check and giving up — so the same term-bump false negative reached the ADR
+0054 single-item `PutItem`/`UpdateItem`/`DeleteItem` path too (caught by
+`batch_write.rs::batched_write_beats_per_key`'s exact per-key propose-count
+assertion under CI load: 200 `PutItem`s accepted 201 proposals). Fixed
+identically, and the shared leadership-independent check between the two
+loops is now one function, `kind_batch_confirm_superseded`
+(`crates/animusd/src/lib.rs`, directly unit-tested in
+`kind_batch_confirm_superseded_tests`) — both `cp_kind_raw_local` and
+`cp_kind_eval_local` call it instead of re-deriving the check inline, so a
+future third caller cannot reintroduce this by hand-rolling it again.
+Regression: `write_path.rs`'s `cp_kind_eval_local_genuine_loss_tests`
+(mirrors `cp_kind_raw_local_genuine_loss_tests` — proves the fast-fail path
+for a genuinely truncated entry is unchanged for this loop too). The
+literal term-bump-without-loss window (this node's `is_leader()` flipping
+false while its own accepted entry is still genuinely pending) was, as for
+issue #911, not itself reliably reproducible in `SimEnv` — see
+`docs/lessons/code-patterns/2026-09-16-is-leader-false-is-not-proof-a-write-is-lost.md`
+for why the direct unit tests of the extracted decision function, plus the
+fast-fail regression above, are this fix's actual test evidence rather than
+a live-race reproduction.
+
 **`cp_scan_kind` (ADR 0041)** is `cp_scan`'s single-tablet, kind-scoped
 sibling — the LSI `Query` read primitive: unlike `cp_scan`'s per-table
 fan-out, `start`/`end` must resolve to the *same* tablet (an LSI query is
