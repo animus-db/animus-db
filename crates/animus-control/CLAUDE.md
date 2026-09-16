@@ -1673,8 +1673,14 @@ per-tablet CP data plane (`animus-cp-data`).
 
 - **Automatic placement + rebalancing (ADR 0005, 0029).** Policies are
   replicated (`SetTabletPolicy` → `policies`). The decision is the pure
-  `Metadata::reconcile` (repair: `animus_placement::replan` over `Active`
-  members, emits a `CasTabletReplicas` only for policy-violating tablets) and its
+  `Metadata::reconcile` (repair: `animus_placement::replan_repair` over
+  `Active` members, emits a `CasTabletReplicas` only for policy-violating
+  tablets — **issue #957**: `replan_repair`, not plain `replan`, so a
+  policy RF the current candidate pool can't fully satisfy still gets
+  grown as far as it genuinely can be, e.g. RF 3 on a 2-node cluster still
+  repairs a 1-replica tablet up to 2, rather than refusing to propose
+  anything until a 3rd candidate ever appears — see `animus-placement/
+  CLAUDE.md`'s entry for the growth-only/never-shrinks contract) and its
   balance-driven complement `Metadata::rebalance` (`rebalance_step` picks a
   single balance-improving healthy-replica move, wrapped as a `CasTabletReplicas`
   at the current epoch — reusing the command, so no relay-allowlist change). The

@@ -275,3 +275,165 @@ fn reconcile_is_reproducible_from_seed() {
     }
     assert_eq!(trace(0x5EED_A070), trace(0x5EED_A070));
 }
+
+/// Issue #957: a tablet whose policy RF exceeds the number of currently
+/// `Active` candidates must still be grown toward that RF as far as the
+/// cluster genuinely allows — not refused outright the instant the full RF
+/// can't be met. Root-caused chasing the flaky
+/// `tablet_provisioned_undersized_on_a_small_cluster_self_heals_after_
+/// growth` (`crates/animusd/tests/tablet_rf_self_heals.rs`): the boot-time
+/// cluster check (issue #667/#900) was the prime suspect but was ruled out
+/// live (`cluster_check_pending`/`refused_as_voter` both `false` on every
+/// replica throughout a captured stall, control-plane consensus fully
+/// healthy and idle) — the real mechanism was `reconcile_placement` calling
+/// plain `animus_placement::replan`, whose `choose` refuses outright
+/// ("not enough eligible candidates") the instant the full policy RF can't
+/// be met, even when strictly-improving partial progress is possible. Fixed
+/// by `replan_repair` (`animus-placement`).
+///
+/// Uses a 2-node data pool against an RF-3 policy (mirroring
+/// `tablet_rf_self_heals.rs`'s own 2-node-cluster/RF-3-policy shape) so the
+/// leader's real, timer-driven `reconcile_loop` (never test-driven here,
+/// same discipline as `leader_automatically_reconciles_a_dead_replica`)
+/// must commit a `CasTabletReplicas` that grows 1 -> 2 replicas, then
+/// converge idempotently until a 3rd candidate makes the full RF reachable.
+#[test]
+fn leader_automatically_grows_an_undersized_tablet_when_rf_exceeds_the_candidate_pool() {
+    run_undersized(0x0957_0001);
+}
+
+fn run_undersized(seed: u64) {
+    let (mut sim, nodes) = cluster(seed);
+    sim.run_for(Duration::from_secs(2));
+    let leader = leader_among(&nodes, &[0, 1, 2]);
+
+    // Only node 10 registered/Active at first — mirroring the real-world
+    // race `docs/lessons/testing/2026-09-16-a-faster-bootstrap-time-schema-
+    // proposal-makes-initial-tablet-placement-an-eventual-property.md`
+    // documents: a fresh cluster's very first tablet can be minted before
+    // every founding member's own registration has committed and applied.
+    assert!(matches!(
+        nodes[leader].propose(MetaCommand::UpsertMember {
+            node: nid(10),
+            labels: labels("eu", "a"),
+            status: NodeStatus::Active,
+        }),
+        ProposeResult::Accepted { .. }
+    ));
+    sim.run_for(Duration::from_secs(1));
+
+    // RF 3 — deliberately more than either candidate count this scenario
+    // ever exercises before its final phase, mirroring `provision_tablet`'s
+    // own always-record-the-target-RF discipline.
+    let rf3 = PlacementPolicy::simple("cp-rf", 3);
+    assert!(matches!(
+        nodes[leader].propose(MetaCommand::CreateTablet {
+            tablet: TABLET,
+            table: None,
+            range: KeyRange::whole(),
+            replicas: vec![nid(10)],
+        }),
+        ProposeResult::Accepted { .. }
+    ));
+    assert!(matches!(
+        nodes[leader].propose(MetaCommand::SetTabletPolicy {
+            tablet: TABLET,
+            policy: Some(rf3),
+        }),
+        ProposeResult::Accepted { .. }
+    ));
+
+    // The 2nd node joins only now — this is what the leader's own
+    // reconciler must react to, entirely on its own timer.
+    assert!(matches!(
+        nodes[leader].propose(MetaCommand::UpsertMember {
+            node: nid(11),
+            labels: labels("eu", "b"),
+            status: NodeStatus::Active,
+        }),
+        ProposeResult::Accepted { .. }
+    ));
+
+    // No test-driven replan/CAS: let the leader's own reconcile_loop notice
+    // and grow the tablet as far as it genuinely can (2 of the RF-3
+    // target) — this is the exact self-heal the flaky test's own first
+    // `poll_until_or_stalled` call was waiting on, and which the unfixed
+    // code never proposed at all.
+    sim.run_for(Duration::from_secs(3));
+    for (i, node) in nodes.iter().enumerate() {
+        let m = node.metadata();
+        let placed = &m.tablets[&TABLET].replicas;
+        assert_eq!(
+            placed,
+            &vec![nid(10), nid(11)],
+            "node {i}: tablet did not grow to both available candidates (seed={seed})"
+        );
+    }
+
+    // Idempotent: further time produces no more churn on this 2-node pool
+    // — the exact steady state a wider stall-timeout would have papered
+    // over, never the actual fix.
+    let stable = nodes[leader].metadata().tablets[&TABLET].clone();
+    sim.run_for(Duration::from_secs(3));
+    assert_eq!(
+        nodes[leader].metadata().tablets[&TABLET],
+        stable,
+        "reconciler churned a tablet already at this cluster's own capacity (seed={seed})"
+    );
+
+    // A 3rd candidate makes the full RF reachable — the ordinary case,
+    // unaffected by this fix (and the shape `tablet_rf_self_heals.rs`'s own
+    // second phase, growth to 3 nodes, already exercised without flaking),
+    // converges the rest of the way.
+    assert!(matches!(
+        nodes[leader].propose(MetaCommand::UpsertMember {
+            node: nid(12),
+            labels: labels("eu", "c"),
+            status: NodeStatus::Active,
+        }),
+        ProposeResult::Accepted { .. }
+    ));
+    sim.run_for(Duration::from_secs(3));
+    for (i, node) in nodes.iter().enumerate() {
+        let m = node.metadata();
+        let placed = &m.tablets[&TABLET].replicas;
+        assert_eq!(
+            placed,
+            &vec![nid(10), nid(11), nid(12)],
+            "node {i}: tablet did not reach the full RF once 3 candidates existed (seed={seed})"
+        );
+    }
+}
+
+#[test]
+fn undersized_growth_is_reproducible_from_seed() {
+    fn trace(seed: u64) -> Vec<String> {
+        let (mut sim, nodes) = cluster(seed);
+        sim.run_for(Duration::from_secs(2));
+        let leader = leader_among(&nodes, &[0, 1, 2]);
+        nodes[leader].propose(MetaCommand::UpsertMember {
+            node: nid(10),
+            labels: labels("eu", "a"),
+            status: NodeStatus::Active,
+        });
+        sim.run_for(Duration::from_secs(1));
+        nodes[leader].propose(MetaCommand::CreateTablet {
+            tablet: TABLET,
+            table: None,
+            range: KeyRange::whole(),
+            replicas: vec![nid(10)],
+        });
+        nodes[leader].propose(MetaCommand::SetTabletPolicy {
+            tablet: TABLET,
+            policy: Some(PlacementPolicy::simple("cp-rf", 3)),
+        });
+        nodes[leader].propose(MetaCommand::UpsertMember {
+            node: nid(11),
+            labels: labels("eu", "b"),
+            status: NodeStatus::Active,
+        });
+        sim.run_for(Duration::from_secs(3));
+        sim.trace_lines()
+    }
+    assert_eq!(trace(0x5EED_0957), trace(0x5EED_0957));
+}
