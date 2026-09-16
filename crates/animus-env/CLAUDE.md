@@ -443,24 +443,52 @@ the production implementation; the deterministic implementation lives in
   component's choice of store vary independently of its `Env` (a sim test
   pairs a `SimEnv` with `animus-sim`'s fault-injecting `SimSegmentStore`;
   production pairs `ProdEnv` with the cluster-replicated default). The
-  trait is four methods — `put`/`get`/`delete`/`list`, all `io::Result`,
-  `#[async_trait]` like `Disk` — over an opaque string `id` (production ids
-  are `{table}/{label}/{tablet}/{epoch}/{attempt-suffix}`, ADR 0043 §A3's
-  ledger-named-object amendment — a per-*attempt* unique id, not the bare
-  per-*shard* `{table}/{label}/{tablet}/{epoch}` prefix a reader/sweep
-  resolves from the catalog row instead of recomputing). Its **consistency
-  contract** (read-after-put, **write-once** — an identical-content re-put
-  is a safe no-op, a differing-content re-put is a hard `Err` — `get` after
-  `delete` is a defined `None` not an error, `list` is debug/sweep-only and
-  never load-bearing for a read) is spelled out on the trait's own doc.
-  **As-built amendment**: this used to say "idempotent overwrite,
-  last-write-wins," with a documented "superset-slice rule" reader-side
-  exception for a crash-retried `put`'s late arrival — that design let two
-  independently-computed seal attempts for the same shard silently
-  overwrite each other's bytes at the shared deterministic id, a real
-  data-loss bug (see `animus_cp_data::segment`'s own module doc for the
-  incident). Write-once, unique-per-attempt ids close it structurally: two
-  attempts can no longer share a storage key at all.
+  trait is five methods — `put`/`get`/`delete`/`list`/`is_empty`, all
+  `io::Result`, `#[async_trait]` like `Disk` — over an opaque string `id`
+  (production ids are `{table}/{label}/{tablet}/{epoch}/{attempt-suffix}`,
+  ADR 0043 §A3's ledger-named-object amendment — a per-*attempt* unique id,
+  not the bare per-*shard* `{table}/{label}/{tablet}/{epoch}` prefix a
+  reader/sweep resolves from the catalog row instead of recomputing). Its
+  **consistency contract** (read-after-put, **write-once** — an
+  identical-content re-put is a safe no-op, a differing-content re-put is a
+  hard `Err` — `get` after `delete` is a defined `None` not an error,
+  `list` is debug/sweep-only and never load-bearing for a read) is spelled
+  out on the trait's own doc. **As-built amendment**: this used to say
+  "idempotent overwrite, last-write-wins," with a documented
+  "superset-slice rule" reader-side exception for a crash-retried `put`'s
+  late arrival — that design let two independently-computed seal attempts
+  for the same shard silently overwrite each other's bytes at the shared
+  deterministic id, a real data-loss bug (see `animus_cp_data::segment`'s
+  own module doc for the incident). Write-once, unique-per-attempt ids
+  close it structurally: two attempts can no longer share a storage key at
+  all.
+- **`SegmentStore::is_empty(prefix)` (issue #861) is a cheap existence
+  probe, distinct from `list`** — a **default** method (`self.list(prefix)
+  .await?.is_empty()`), so every existing implementor keeps compiling
+  unchanged, the same "additive default" shape `Env::metrics()`/
+  `Env::merge_peer()` already establish. It exists because
+  `verify_or_init_segment_store_marker`'s own "does anything else exist
+  here" check (below) used to answer that yes/no question by calling
+  `list("")` and discarding everything but `.is_empty()` — against
+  `S3SegmentStore`, whose `list` drains every page (up to
+  `LIST_PAGE_CAP`), that meant a full bucket enumeration on every node's
+  startup just to decide whether to refuse. `S3SegmentStore::is_empty`
+  overrides the default with a genuine one-request probe: one
+  `ListObjectsV2` page, answered from whatever that first page contains
+  regardless of `IsTruncated`/a continuation token — never the `list`
+  method's own pagination loop. `EncryptedSegmentStore::is_empty` also
+  overrides: it forwards to the inner store's own `is_empty` first (free
+  when the inner store is genuinely empty, the common case this checks
+  guards), and only falls back to a real, marker-filtered `list` when the
+  inner store reports something present — since this wrapper's own `list`
+  excludes `SEGMENT_STORE_MARKER_ID`, `is_empty` must agree that a store
+  holding only the marker object still reads empty. In practice this
+  fallback is never reached from `verify_or_init_segment_store_marker`
+  itself, which always runs against the **unwrapped** inner store before
+  `EncryptedSegmentStore` exists at all — see that function's own doc.
+  `SimSegmentStore`/`FsSegmentStore` keep the plain default: an in-memory
+  `BTreeMap` scan and a bounded local directory walk are already cheap
+  enough that a second, specialized code path buys nothing.
 - **`FsSegmentStore` (single directory) is `ProdEnv`'s `SegmentStore`
   sibling, opt-in** (`--segment-store=dir:...`, wired by a later PR) for dev
   use or a shared mount, and doubles as the default
@@ -739,7 +767,14 @@ configured_prefix` (`assert_segment_store_contract` against
 `S3SegmentStore<animus_s3::fake::FakeS3>` — no network at all) and
 `list_paginates_across_more_than_one_page` (a `FakeS3::with_page_size(2)`
 five-object list, proving this store's own `list` loop follows
-`next_continuation_token` rather than truncating at the first page).
+`next_continuation_token` rather than truncating at the first page). **Issue
+#861**: `is_empty_probes_one_page_against_a_multi_page_listing`/
+`is_empty_probes_one_page_against_an_empty_store` — a `CountingTransport`
+wrapper (this module's own test-only `Transport` decorator, counting
+`list-type=2` requests) proves `S3SegmentStore::is_empty` issues **exactly
+one** `ListObjectsV2` request and answers correctly, against both a
+multi-page-if-fully-listed bucket and a fresh one — the direct regression
+for the full-listing bug `verify_or_init_segment_store_marker` used to hit.
 `tests/s3_segment_store_minio.rs` is the opt-in real-endpoint counterpart,
 mirroring `animus-s3`'s own `tests/minio_real_endpoint.rs` down to the exact
 `ANIMUS_S3_TEST_ENDPOINT`/`_BUCKET`/`_ACCESS_KEY_ID`/`_SECRET_ACCESS_KEY`
@@ -764,7 +799,18 @@ counterpart — `EncryptedSegmentStore<SimSegmentStore, SimEnv>` — lives in
 `animus-sim/src/segment_store.rs`'s own test module (see that crate's
 `CLAUDE.md`), and the fault-injection corpus lives in `animus-test/tests/
 segment_store_encrypted_fault_corpus.rs` (depth knob
-`ANIMUS_SEGMENT_STORE_ENCRYPTED_SEEDS`).
+`ANIMUS_SEGMENT_STORE_ENCRYPTED_SEEDS`). `test_support::
+assert_segment_store_contract` (run against every implementor above) also
+asserts `is_empty` agrees with `list(prefix).is_empty()` at three points —
+non-empty, a disjoint never-written prefix, and after full cleanup — so
+every implementor's `is_empty` (default or overridden) is pinned by the one
+shared contract, not hand-copied per impl. `animus-sim/src/
+segment_store.rs::tests::
+marker_absent_key_given_branch_unchanged_by_the_is_empty_switch` (issue
+#861) is the dedicated regression for `verify_or_init_segment_store_
+marker`'s own switch to `is_empty`: the marker-absent/key-given branch
+still refuses with the identical text over a populated store and still
+initializes the marker over a fresh one.
 
 **`send_stream` ordering after #666.** Each send is its own bounded task,
 so two back-to-back sends to the same destination may reach the pooled

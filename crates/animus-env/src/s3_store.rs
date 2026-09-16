@@ -339,6 +339,25 @@ impl<T: Transport> crate::SegmentStore for S3SegmentStore<T> {
         }
         Ok(out)
     }
+
+    /// Issue exactly one `ListObjectsV2` request and answer from its first
+    /// page alone — never the `list`'s own full-pagination loop above
+    /// (issue #861: a full drain just to answer a yes/no question is a
+    /// slow, billable enumeration of an entire populated bucket, paid on
+    /// every node's startup by `verify_or_init_segment_store_marker`'s own
+    /// "does anything else exist here" check). Whether that one page is
+    /// truncated is irrelevant — a single returned object already answers
+    /// "not empty," and `IsTruncated: true` with zero objects cannot
+    /// happen (a page only truncates because it *had* something to cut
+    /// off).
+    async fn is_empty(&self, prefix: &str) -> std::io::Result<bool> {
+        let full_prefix = self.object_key(prefix);
+        let page = self
+            .retry_list_page(&full_prefix, None)
+            .await
+            .map_err(map_io_error)?;
+        Ok(page.objects.is_empty())
+    }
 }
 
 #[cfg(test)]
@@ -466,6 +485,101 @@ mod tests {
             .map(|_| ())
             .expect_err("the wrong key must be refused");
         assert!(err.to_string().contains("does not match the key"));
+    }
+
+    /// A [`Transport`] wrapper counting how many `ListObjectsV2` requests
+    /// pass through it — the regression harness for issue #861: proves
+    /// [`S3SegmentStore::is_empty`] answers from exactly one page,
+    /// regardless of how many pages the underlying listing actually has.
+    struct CountingTransport<T> {
+        inner: T,
+        list_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl<T: animus_s3::client::Transport> animus_s3::client::Transport for CountingTransport<T> {
+        async fn send(
+            &self,
+            request: animus_s3::client::HttpRequest,
+        ) -> Result<animus_s3::client::HttpResponse, animus_s3::client::TransportError> {
+            let (_, query) = request.uri.split_once('?').unwrap_or((&request.uri, ""));
+            if query.split('&').any(|pair| pair == "list-type=2") {
+                self.list_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            self.inner.send(request).await
+        }
+    }
+
+    /// [`S3SegmentStore::is_empty`] against a populated, multi-page
+    /// listing must issue exactly **one** `ListObjectsV2` request and
+    /// report non-empty — the direct regression for issue #861, where the
+    /// old `list("").is_empty()` check drained every page first.
+    #[tokio::test]
+    async fn is_empty_probes_one_page_against_a_multi_page_listing() {
+        use crate::SegmentStore as _;
+
+        let fake = FakeS3::new("test-bucket")
+            .with_credential("AKIDTEST", "secret")
+            .with_page_size(2);
+        let config = S3Config {
+            endpoint: "http://fake.example:9000".to_string(),
+            bucket: "test-bucket".to_string(),
+            region: "us-east-1".to_string(),
+            credentials: Credentials::new("AKIDTEST", "secret"),
+        };
+        let list_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counting = CountingTransport {
+            inner: fake,
+            list_calls: list_calls.clone(),
+        };
+        let store = S3SegmentStore::new(counting, config, None);
+        for i in 0..5 {
+            store
+                .put(&format!("page-test/{i}"), format!("v{i}").as_bytes())
+                .await
+                .expect("put");
+        }
+        list_calls.store(0, std::sync::atomic::Ordering::SeqCst);
+
+        let empty = store.is_empty("page-test/").await.expect("is_empty");
+
+        assert!(!empty, "a populated prefix must report non-empty");
+        assert_eq!(
+            list_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "is_empty must issue exactly one ListObjectsV2 request, never paginate"
+        );
+    }
+
+    /// The empty-store counterpart: no objects at all under `prefix`
+    /// still resolves from one request and reports empty.
+    #[tokio::test]
+    async fn is_empty_probes_one_page_against_an_empty_store() {
+        use crate::SegmentStore as _;
+
+        let fake = FakeS3::new("test-bucket").with_credential("AKIDTEST", "secret");
+        let config = S3Config {
+            endpoint: "http://fake.example:9000".to_string(),
+            bucket: "test-bucket".to_string(),
+            region: "us-east-1".to_string(),
+            credentials: Credentials::new("AKIDTEST", "secret"),
+        };
+        let list_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counting = CountingTransport {
+            inner: fake,
+            list_calls: list_calls.clone(),
+        };
+        let store = S3SegmentStore::new(counting, config, None);
+
+        let empty = store.is_empty("").await.expect("is_empty");
+
+        assert!(empty, "a fresh bucket must report empty");
+        assert_eq!(
+            list_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "is_empty must issue exactly one ListObjectsV2 request even against an empty store"
+        );
     }
 
     /// `list` must paginate across more than one page, exactly like
