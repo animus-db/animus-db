@@ -65,10 +65,14 @@ leaderless AP plane, which is deferred and its code deleted.
 | `animus-cp-data` | The CP data plane: a leaderful Raft group per tablet serving linearizable single-tablet reads/writes/scans (ADR 0016/0017) |
 | `animus-tablet` | Tablet model + per-table hash-ring key layout (Murmur3 partitioning, order-preserving key escapes) |
 | `animus-placement` | Topology-aware placement + data residency: replication factor, residency labels, failure-domain spread |
-| `animus-dynamo` | DynamoDB-style item API + DynamoDB JSON wire encoding over the common storage core |
+| `animus-item` | The pure DynamoDB item model — `AttributeValue`/`Item`/`TableSchema`, key encoding, condition/update-expression evaluation, GSI/LSI index derivation — shared below `animus-dynamo` and `animus-cp-data` (ADR 0054) |
+| `animus-dynamo` | The wire adapter over `animus-item`'s data model (ADR 0054): DynamoDB JSON/HTTP encoding |
+| `animus-s3` | An S3 client for AnimusDB's own use: SigV4 request signing + a minimal object API, generic over an explicit transport seam |
 | `animus-test` | Elle-style consistency checker + fault-injecting corpora for the CP data plane (raftkv, cross-tablet txn, streams, backfill) |
+| `animus-node` | The `Env`-generic node core: routing, forwarding, the wire surface, background loops, transaction coordination — carved out of `animusd` so it needs no real clock/socket/`tokio` (ADR 0061) |
 | `animusd` | Node server: assembles the control plane + CP data plane + wire edges (DynamoDB, admin, console) over `ProdEnv` (runnable `--cluster` mode) |
 | `animus-cli` | Operator/client CLI (`status` / `put` / `get`) |
+| `animus-operator` | Kubernetes operator (`kube-rs`) reconciling the `AnimusCluster` custom resource into a running per-process AnimusDB deployment |
 
 ## Running a cluster
 
