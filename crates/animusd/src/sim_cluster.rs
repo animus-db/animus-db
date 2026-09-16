@@ -2677,6 +2677,40 @@ impl SimCluster {
         self.control_index.get(&node).copied()
     }
 
+    /// Whether `node`'s own `RaftNode<SimEnv>` currently believes ITSELF the
+    /// control-plane leader — a plain, single read of `RaftNode::is_leader`
+    /// with **no hidden retry**, unlike [`SimCluster::control_leader_index`]
+    /// (which silently `run_for`s up to 2s of virtual time if no leader is
+    /// found on its first check). A scenario pinning a narrow post-election
+    /// timing window (issue #923) needs to poll leadership in small,
+    /// explicit steps of its own choosing without a helper's own retry loop
+    /// invisibly consuming part of that window out from under it.
+    pub(crate) fn is_control_leader(&self, node: u64) -> bool {
+        self.control_index_of(node)
+            .is_some_and(|idx| self.controls[idx].is_leader())
+    }
+
+    /// Arm a control-plane leadership transfer directly on `from`'s own
+    /// `RaftNode<SimEnv>` (`RaftNode::transfer_leadership`) — bypassing the
+    /// `POST /admin/control/transfer` HTTP-JSON route entirely, unlike every
+    /// other mutating call this fixture drives through [`SimCluster::admin`].
+    /// Exists for a scenario that needs the transfer armed without
+    /// `SimCluster::admin`'s own `spawn_and_capture` unconditionally burning
+    /// a full `OP_BUDGET` (12s) of virtual time regardless of how fast the
+    /// request actually resolves (its own doc's "load-bearing for other
+    /// consumers" tradeoff) — a scenario pinning a race in a narrow post-
+    /// election window (issue #923) needs virtual time to advance by
+    /// EXACTLY what the caller asks for, nothing implicit on top. Returns
+    /// whether the transfer was armed (mirrors `RaftNode::
+    /// transfer_leadership`'s own bool), never blocks/polls for completion —
+    /// the caller drives that itself via `run_for`/`control_leader_index`.
+    pub(crate) fn transfer_leadership(&mut self, from: u64, to: u64) -> bool {
+        let idx = self
+            .control_index_of(from)
+            .unwrap_or_else(|| panic!("node {from} is not a control-bearing voter"));
+        self.controls[idx].transfer_leadership(nid(to))
+    }
+
     /// The node id `self.controls[index]` belongs to — the inverse of
     /// [`SimCluster::control_index_of`] (ADR 0061 rung N, C-14 PR 2).
     /// Panics if `index` is out of range, mirroring a plain `Vec` index
@@ -4729,6 +4763,17 @@ impl SimCluster {
     /// Symmetrically partition `a` and `b` (`Simulator::partition_pair`).
     pub(crate) fn partition(&mut self, a: u64, b: u64) {
         self.sim.partition_pair(nid(a), nid(b));
+    }
+
+    /// Directed per-link network-fault override (`Simulator::
+    /// set_link_net_config`) — unlike [`SimCluster::partition`], this models
+    /// a genuinely alive but SLOW peer (e.g. a large `base_delay`/
+    /// `max_jitter`, no drop) rather than an unreachable one: `from` stays
+    /// fully up, it just takes longer than usual for a message it sends
+    /// `to` to arrive. [`SimCluster::heal_all`] resets every link back to
+    /// `NetConfig::default()`, this override included.
+    pub(crate) fn set_link_net_config(&mut self, from: u64, to: u64, cfg: NetConfig) {
+        self.sim.set_link_net_config(nid(from), nid(to), cfg);
     }
 
     /// Heal every partition this fixture has created and `Simulator::

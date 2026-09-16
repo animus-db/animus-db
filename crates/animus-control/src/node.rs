@@ -241,6 +241,39 @@ const DETECT_INTERVAL: Duration = Duration::from_millis(100);
 /// `AppendEntries` round doesn't flap a healthy voter.
 pub const CONTROL_PEER_LIVENESS_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// [`CONTROL_PEER_LIVENESS_TIMEOUT`]'s own post-takeover counterpart to
+/// [`LEADER_GRACE`] (issue #923). A voter this leader has genuinely never
+/// heard from in a PRIOR stint gets an unbounded "never contacted yet" grace
+/// from [`RaftNode::control_peer_believed_alive`] — but `become_leader` also
+/// seeds every peer's `last_contact` to the instant it takes over, precisely
+/// so a peer that stays silent for the entire stint can't hide behind that
+/// grace forever. That seed is a courtesy timestamp, not a genuine ack, and
+/// it makes "peer hasn't answered yet because I only just became leader"
+/// look byte-identical to "peer has gone properly silent" once
+/// `CONTROL_PEER_LIVENESS_TIMEOUT` has passed either way — which is exactly
+/// what let `admin_remove_control_member`'s quorum guard misjudge a
+/// perfectly alive voter as dead moments after a leadership transfer
+/// (issue #923): a fresh leader's very first heartbeat round has to survive
+/// election processing plus whatever scheduling/network contention a
+/// disruptive leadership change itself stirs up, on top of the ordinary
+/// heartbeat round trip `CONTROL_PEER_LIVENESS_TIMEOUT` alone budgets for.
+/// `control_peer_believed_alive` grants any peer this much time since
+/// [`RaftCore::leader_since`] before treating a `last_contact` that is
+/// stale-by-[`CONTROL_PEER_LIVENESS_TIMEOUT`] as a real death verdict — a
+/// GENUINE ack (`handle_append_resp`) still clears that peer's own
+/// staleness clock immediately, so a peer that answers promptly is never
+/// held to this wider window; only a peer this leader has heard nothing
+/// from ALL stint is. Deliberately several multiples of
+/// `CONTROL_PEER_LIVENESS_TIMEOUT`, not equal to it — a value equal to it
+/// would be a no-op (`become_leader`'s own seed already provides exactly
+/// that much grace) and would not have caught issue #923's own failure,
+/// which needed more than one ordinary timeout's worth of slack. Still
+/// bounded, unlike the never-contacted-in-a-PRIOR-stint case: a voter that
+/// stays silent for this whole window, this soon after a transfer, is
+/// treated as genuinely dead exactly like any other stale peer — this is
+/// extra patience for a fresh leader's first round, not a blanket amnesty.
+pub const CONTROL_LEADER_TAKEOVER_GRACE: Duration = Duration::from_millis(2_000);
+
 /// Grace period after this node first observes itself leader for a term, during
 /// which it will **not** mark any member `Down` (ADR 0012). The
 /// [`FailureDetector`] is per-node volatile state (only the transitions it drives
@@ -993,8 +1026,18 @@ impl<E: Env> RaftNode<E> {
     ///   an election. Deliberately generous, not "unknown" — see the
     ///   `last_contact` field doc in `raft.rs` for why this case is not
     ///   back-filled instead.
-    /// - Otherwise: alive iff the last contact is within
-    ///   [`CONTROL_PEER_LIVENESS_TIMEOUT`] of now.
+    /// - Otherwise: alive if the last contact is within
+    ///   [`CONTROL_PEER_LIVENESS_TIMEOUT`] of now, OR this leadership stint
+    ///   itself began within [`CONTROL_LEADER_TAKEOVER_GRACE`] of now
+    ///   (issue #923) — `last_contact` may hold nothing but `become_leader`'s
+    ///   own courtesy seed, never a genuine ack, and a fresh leader's first
+    ///   real heartbeat round can legitimately outrun the steady-state
+    ///   timeout under the load a leadership change itself creates; see
+    ///   [`CONTROL_LEADER_TAKEOVER_GRACE`]'s own doc for why this is a wider
+    ///   window, not the same one `become_leader`'s seed already provides.
+    ///   A GENUINE ack (`handle_append_resp`) refreshes `last_contact`
+    ///   immediately, so this extra allowance only ever matters for a peer
+    ///   this stint has heard nothing real from yet.
     ///
     /// Meaningful only when this node is (or recently was) the control
     /// leader — a non-leader's `last_contact` map is always empty (nobody
@@ -1005,11 +1048,32 @@ impl<E: Env> RaftNode<E> {
         if node == self.env.node_id() {
             return true;
         }
-        match self.lock().peer_last_contact(node) {
+        let core = self.lock();
+        let last_contact = core.peer_last_contact(node);
+        let leader_since = core.leader_since();
+        drop(core);
+        let now = self.env.now();
+        match last_contact {
             None => true,
             Some(last) => {
-                let now = self.env.now();
-                now.0.saturating_sub(last.0) < CONTROL_PEER_LIVENESS_TIMEOUT.as_nanos() as u64
+                if now.0.saturating_sub(last.0) < CONTROL_PEER_LIVENESS_TIMEOUT.as_nanos() as u64 {
+                    return true;
+                }
+                // Stale by the steady-state timeout — still generous if this
+                // leadership stint itself is young enough that `last` could
+                // be nothing more than `become_leader`'s own seed rather
+                // than a real silence.
+                match leader_since {
+                    Some(since) => {
+                        now.0.saturating_sub(since.0)
+                            < CONTROL_LEADER_TAKEOVER_GRACE.as_nanos() as u64
+                    }
+                    // Not currently leader (or `leader_since` predates this
+                    // accessor's own introduction — never true in practice
+                    // since it's set unconditionally in `become_leader`):
+                    // no extra allowance to give.
+                    None => false,
+                }
             }
         }
     }
