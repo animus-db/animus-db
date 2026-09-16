@@ -28,26 +28,34 @@
 //! phase and asserts the *counts*, not the clock. Timing is kept as an
 //! `eprintln!` diagnostic only.
 //!
-//! **The batched side's own bound carries a small, explained `RETRY_MARGIN`,
-//! not an exact one-propose-per-chunk equality.** Under this repo's own
-//! testing-discipline load (a shared, CPU-contended box), a freshly-hosted
-//! tablet's very first burst of `KindBatch` writes occasionally sees one
-//! extra accepted propose — `cp_kind_raw_local`'s confirm loop
-//! (`write_path.rs`) reads a real, if rare-under-normal-load, self-
-//! heartbeat-miss/re-election artifact (`decide::confirm_wait_is_futile`'s
-//! own doc cites the identical issue #268 lineage: a stalled tick loop under
-//! real contention can legitimately invalidate an already-accepted-but-not-
-//! yet-committed entry, and the caller's retry-on-"; retry" convention then
-//! re-proposes — harmless to apply, real extra WAL/replicate/apply work,
-//! exactly `provision_tablet`'s own documented amplification class). Measured
-//! at most one such extra propose per run across 50 real local runs on this
-//! box (never on the per-key side, whose single-item writes apply too fast
-//! to expose the same window) — `RETRY_MARGIN` gives headroom past that
-//! measured max without weakening the actual claim (batched proposals stay
-//! roughly `BATCH_WRITE_MAX_ITEMS`x fewer than per-key, not "close to
-//! per-key"). This is pre-existing `cp_kind_raw_local` behavior, not
-//! something this change introduces or fixes — see issue #911 for the
-//! follow-up filed on it.
+//! **`cp_proposals_accepted` is not exclusively a client-write counter —
+//! issue #974, closing the investigation issue #911/#967/#971 left open.**
+//! It counts every accepted propose on the group's Raft log, whoever issued
+//! it. On a fully quiescent single-write cluster the only other proposer is
+//! `animusd::index_drain::trim_janitor` (ADR 0049 §1): its hot-trim arm runs
+//! unconditionally on every led tablet each `INDEX_DRAIN_INTERVAL` tick,
+//! even for a plain (no GSI/stream/PITR) table, since a marker record is
+//! never itself consumer-visible and so is always immediately safe to
+//! delete — a fault-free, single-node run of this very test reproduced 9
+//! accepted proposals for 8 `BatchWriteItem` chunks in the FIRST unloaded
+//! run tried, and `eprintln!`-level tracing of every accepted propose (kind,
+//! tablet, index, term, call site) showed the 9th to be exactly one such
+//! trim: a `KindBatch` tombstone-delete of the per-key phase's own 200
+//! now-consumed change-log markers, landing — by ordinary scheduling luck,
+//! not a bug in the write path — inside the batched phase's own before/
+//! after `/metrics` window rather than the per-key phase's. **No confirm
+//! loop re-proposed anything**: the trace carries zero `"; retry"` results
+//! and zero superseded/no-op confirms anywhere in the run. So the #911
+//! hazard closed by #971 really is closed, and the margin this file used to
+//! carry for it was never covering a duplicate client propose — it was
+//! covering an entirely different, legitimate proposer sharing the same
+//! counter. Fixed at the root: `trim_janitor` now also increments
+//! `Metric::CpHousekeepingProposalsAccepted` (see that metric's own doc) at
+//! its one call site, so this test (and anyone else who needs "proposals a
+//! client write actually caused") can subtract that delta from
+//! `cp_proposals_accepted`'s own and assert **exact** equality with no
+//! margin, regardless of which side of the phase boundary a trim tick lands
+//! on.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -253,10 +261,21 @@ async fn batched_write_beats_per_key() {
 
         const N: usize = 200;
         const PROPOSALS: &str = "cp_proposals_accepted";
+        // Issue #974: the trim janitor (`index_drain::trim_janitor`) shares
+        // `cp_proposals_accepted` with every client write on the same
+        // group — see this file's module doc. Subtracting this counter's
+        // own delta recovers "proposals a client write actually caused"
+        // over any window, regardless of which side of a phase boundary a
+        // trim tick's own propose happens to land on.
+        const HOUSEKEEPING: &str = "cp_housekeeping_proposals_accepted";
 
         // Per-key: N individual PutItems, serially (each its own consensus round,
         // so each its own accepted propose).
-        let before_per_key = metric_value(&metrics(dynamo_addr).await, PROPOSALS);
+        let before = metrics(dynamo_addr).await;
+        let (before_per_key, before_per_key_housekeeping) = (
+            metric_value(&before, PROPOSALS),
+            metric_value(&before, HOUSEKEEPING),
+        );
         let per_key_wall = std::time::Instant::now();
         for i in 0..N {
             let (s, b) = dynamo(
@@ -270,22 +289,18 @@ async fn batched_write_beats_per_key() {
             assert_eq!(s, 200, "per-key PutItem k{i}: {b}");
         }
         let per_key_wall = per_key_wall.elapsed();
-        let after_per_key = metric_value(&metrics(dynamo_addr).await, PROPOSALS);
-        let per_key_proposals = after_per_key - before_per_key;
+        let after = metrics(dynamo_addr).await;
+        let per_key_proposals = metric_value(&after, PROPOSALS) - before_per_key;
+        let per_key_housekeeping = metric_value(&after, HOUSEKEEPING) - before_per_key_housekeeping;
 
         // Batched: the same N items, chunked to BATCH_WRITE_MAX_ITEMS per
         // BatchWriteItem call — one accepted propose per chunk, not per item.
         let expected_chunks = N.div_ceil(BATCH_WRITE_MAX_ITEMS) as i64;
-        // A freshly-hosted tablet's first burst of writes can occasionally see
-        // one extra accepted propose under real contention (a genuine, if rare
-        // in normal operation, self-heartbeat-miss/re-election artifact in
-        // `cp_kind_raw_local`'s confirm loop — see this file's module doc).
-        // This margin absorbs that pre-existing, already-idempotent-in-effect
-        // behavior without weakening the actual claim below (batched stays
-        // roughly `BATCH_WRITE_MAX_ITEMS`x fewer proposals than per-key, never
-        // close to it).
-        const RETRY_MARGIN: i64 = 3;
-        let before_batched = metric_value(&metrics(dynamo_addr).await, PROPOSALS);
+        let before = metrics(dynamo_addr).await;
+        let (before_batched, before_batched_housekeeping) = (
+            metric_value(&before, PROPOSALS),
+            metric_value(&before, HOUSEKEEPING),
+        );
         let batched_wall = std::time::Instant::now();
         for chunk_start in (0..N).step_by(BATCH_WRITE_MAX_ITEMS) {
             let chunk_end = (chunk_start + BATCH_WRITE_MAX_ITEMS).min(N);
@@ -301,29 +316,37 @@ async fn batched_write_beats_per_key() {
             );
         }
         let batched_wall = batched_wall.elapsed();
-        let after_batched = metric_value(&metrics(dynamo_addr).await, PROPOSALS);
-        let batched_proposals = after_batched - before_batched;
+        let after = metrics(dynamo_addr).await;
+        let batched_proposals_raw = metric_value(&after, PROPOSALS) - before_batched;
+        let batched_housekeeping = metric_value(&after, HOUSEKEEPING) - before_batched_housekeeping;
+        let batched_proposals = batched_proposals_raw - batched_housekeeping;
 
         // Diagnostic only — real-time noise on a shared runner is expected and
         // is exactly why nothing below asserts on it (issue #601).
         eprintln!(
-            "batched {N} items in {batched_wall:?} ({batched_proposals} proposals) vs \
-             per-key {per_key_wall:?} ({per_key_proposals} proposals)"
+            "batched {N} items in {batched_wall:?} ({batched_proposals_raw} raw / \
+             {batched_housekeeping} housekeeping / {batched_proposals} client proposals) vs \
+             per-key {per_key_wall:?} ({per_key_proposals} proposals, \
+             {per_key_housekeeping} housekeeping)"
         );
 
-        // The mechanism: one propose per key for per-key writes, and at most
-        // one propose per BATCH_WRITE_MAX_ITEMS-sized chunk for the batch (plus
-        // the small, explained retry margin above) — deterministic and
-        // seed-independent, no wall clock involved.
+        // The mechanism: one propose per key for per-key writes, and exactly
+        // one propose per BATCH_WRITE_MAX_ITEMS-sized chunk for the batch,
+        // once the trim janitor's own housekeeping proposals (issue #974) are
+        // subtracted out — deterministic and seed-independent, no wall clock,
+        // and no margin: every accepted propose is now attributed to either a
+        // client write or the janitor, never left unexplained.
         assert_eq!(
-            per_key_proposals, N as i64,
-            "N per-key PutItems should accept exactly N proposals (got {per_key_proposals})"
+            per_key_proposals - per_key_housekeeping,
+            N as i64,
+            "N per-key PutItems should accept exactly N client proposals (got \
+             {per_key_proposals} raw, {per_key_housekeeping} housekeeping)"
         );
-        assert!(
-            batched_proposals <= expected_chunks + RETRY_MARGIN,
+        assert_eq!(
+            batched_proposals, expected_chunks,
             "batched write of {N} items in chunks of {BATCH_WRITE_MAX_ITEMS} should accept \
-             at most {expected_chunks} proposals (+ a {RETRY_MARGIN}-propose retry margin, \
-             got {batched_proposals})"
+             exactly {expected_chunks} client proposals (got {batched_proposals_raw} raw, \
+             {batched_housekeeping} housekeeping)"
         );
         assert!(
             batched_proposals * 4 < per_key_proposals,

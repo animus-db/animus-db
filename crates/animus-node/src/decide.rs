@@ -58,40 +58,6 @@ pub fn frozen_refusal(is_frozen: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// Whether waiting any longer for `accepted_index`'s effect to appear can
-/// still succeed — the confirm-side dual of `RaftKvNode::
-/// wait_stage_outcome`'s own `!is_leader()` bail (ADR 0018 §2). Two futility
-/// signals, either of which ends the wait:
-///
-/// - **the group has applied past the accepted entry's own log index without
-///   the probed effect appearing** (`engine_applied_index >= accepted_index`
-///   — the caller re-probes once after this returns `true`, closing the
-///   probe-vs-apply race): whatever occupied that log position either
-///   no-opped at apply (a freeze/seal miss, a failed `KindBatch` condition)
-///   or is a different entry entirely (the accepted one was truncated by a
-///   leadership change, and the new leader's election no-op has already
-///   applied past it). Either way the effect will never appear from *this*
-///   propose — only a fresh retry can land it;
-/// - **this node no longer leads the group** (`!is_leader`): the accepted
-///   entry may yet commit under the new leader (a retry is then a harmless
-///   idempotent duplicate — per-key LWW converges), or it may have been
-///   truncated — this node cannot tell which within bounded time, and the
-///   caller's retry re-resolves routing to wherever the leader now is.
-///
-/// These confirm loops used to poll out the full `CLIENT_TIMEOUT` in both
-/// states — correct, but a client-visible stall *per attempt* under
-/// leadership churn (issue #268). A futile wait now fails fast with the
-/// house retryable-error shape so the caller's own retry loop makes progress
-/// instead. **Success still requires exact effect equality** — this coarser
-/// signal only ever ends a wait, never acks one.
-pub fn confirm_wait_is_futile(
-    engine_applied_index: u64,
-    is_leader: bool,
-    accepted_index: u64,
-) -> bool {
-    engine_applied_index >= accepted_index || !is_leader
-}
-
 /// Whether a CP read error is a **transient routing/leadership/scope race**
 /// the reader should retry with re-resolved routing (the `"; retry"` shape
 /// every such error in this file carries), as opposed to a genuine failure
@@ -402,31 +368,6 @@ mod tests {
             err.ends_with("; retry"),
             "must carry the house retryable shape so caller loops re-route"
         );
-    }
-
-    // --- confirm_wait_is_futile -----------------------------------------------
-
-    #[test]
-    fn confirm_wait_is_not_futile_while_leading_and_not_yet_applied() {
-        assert!(!confirm_wait_is_futile(9, true, 10));
-    }
-
-    #[test]
-    fn confirm_wait_is_futile_once_applied_past_the_accepted_index() {
-        assert!(confirm_wait_is_futile(10, true, 10));
-        assert!(confirm_wait_is_futile(11, true, 10));
-    }
-
-    #[test]
-    fn confirm_wait_is_futile_once_leadership_is_lost_regardless_of_apply_progress() {
-        // Not yet applied at all, but no longer leader: still futile.
-        assert!(confirm_wait_is_futile(0, false, 10));
-    }
-
-    #[test]
-    fn confirm_wait_is_futile_combines_both_signals_with_or() {
-        // Applied past AND not leading: still futile (not exclusive).
-        assert!(confirm_wait_is_futile(10, false, 10));
     }
 
     // --- read_should_retry -----------------------------------------------------
