@@ -402,6 +402,20 @@ dump_diagnostics() {
             log "kubectl get certificaterequests -n ${NAMESPACE} -o wide"
             kubectl get certificaterequests -n "$NAMESPACE" -o wide 2>&1 | sed 's/^/  /' || true
         fi
+        # Issue #913 round 2: the tail alone cannot show *when* a
+        # BadCertificate storm started relative to the pod's own boot — a
+        # pod recreated by the controlNodes config-hash roll could log a
+        # handful of clean lines before the storm begins (evidence for a
+        # boot-time race, hypothesis (d)) or open with BadCertificate
+        # immediately (evidence the cert it mounted was already wrong at
+        # container start). `--tail=-1` is `kubectl logs`' own documented
+        # spelling for "the whole log," piped through `head` for just the
+        # first lines — cheap for a fresh pod's short log either way.
+        log "pod logs (first 40 lines, per pod)"
+        for pod in $(kubectl get pods -n "$NAMESPACE" -o name 2>/dev/null || true); do
+            log "  logs (head): ${pod}"
+            kubectl logs -n "$NAMESPACE" "$pod" --tail=-1 2>&1 | head -n 40 | sed 's/^/    /' || true
+        done
         log "pod logs (tail 100, per pod)"
         for pod in $(kubectl get pods -n "$NAMESPACE" -o name 2>/dev/null || true); do
             log "  logs: ${pod}"
