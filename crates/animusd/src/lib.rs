@@ -1818,6 +1818,127 @@ fn classify_kind_batch_outcome(
     }
 }
 
+/// The leadership-independent half of a `KindBatch`/`KindEval` confirm
+/// loop's superseded decision (issues #911, #967) — shared by
+/// `write_path.rs`'s `cp_kind_raw_local` and `cp_kind_eval_local`, the two
+/// confirm loops that gave up on `classify_kind_batch_outcome` returning
+/// `Inconclusive` (issue #911's fix), NOT `decide::confirm_wait_is_futile`.
+/// That predicate's own `!is_leader()` clause is not proof of loss for
+/// either caller — a term bump from a missed heartbeat deadline under real
+/// contention flips `is_leader()` false well before anyone can tell whether
+/// an already-accepted entry will still commit, and `kind_batch_outcome`/
+/// `engine_applied_index` are plain local reads needing no leadership at
+/// all — so `is_leader()` is deliberately not a parameter here. Only two
+/// proofs are leadership-independent: `engine_applied_index` has passed
+/// `accepted_index` with no matching outcome (whatever occupied that slot
+/// no-opped or belongs to a different entry entirely), or the outcome
+/// recorded at `accepted_index` carries a *different* term (Raft's
+/// log-matching property means a different term there can only mean a
+/// different, reoccupying entry — see `ProposeResult::Accepted`'s doc).
+/// "Nothing has decided this index yet" (`outcome` is `None` and
+/// `engine_applied_index` has not passed `accepted_index`) returns `false`
+/// regardless of `is_leader()` — the caller keeps waiting, bounded by its
+/// own `CLIENT_TIMEOUT` deadline.
+fn kind_batch_confirm_superseded(
+    engine_applied_index: u64,
+    accepted_index: u64,
+    accepted_term: u64,
+    outcome: &Option<(u64, KindBatchOutcome)>,
+) -> bool {
+    engine_applied_index >= accepted_index
+        || outcome
+            .as_ref()
+            .is_some_and(|(term, _)| *term != accepted_term)
+}
+
+#[cfg(test)]
+mod kind_batch_confirm_superseded_tests {
+    use super::{KindBatchOutcome, kind_batch_confirm_superseded};
+
+    const ACCEPTED_INDEX: u64 = 10;
+    const ACCEPTED_TERM: u64 = 7;
+
+    /// The case issues #911/#967 exist for: nothing has decided this index
+    /// yet (no recorded outcome, applied index still behind) — must keep
+    /// waiting no matter what `is_leader()` would have said, since that
+    /// signal is not even a parameter here any more.
+    #[test]
+    fn nothing_decided_yet_is_never_superseded() {
+        assert!(!kind_batch_confirm_superseded(
+            ACCEPTED_INDEX - 1,
+            ACCEPTED_INDEX,
+            ACCEPTED_TERM,
+            &None,
+        ));
+    }
+
+    /// Effects merged exactly at our own index with our own term recorded:
+    /// this is the `Confirm` shape — `classify_kind_batch_outcome` catches
+    /// it first in every real caller (both `cp_kind_raw_local` and
+    /// `cp_kind_eval_local` only ever call this function *after* that check
+    /// already returned `Inconclusive`/`NoOp` this same iteration), so this
+    /// function has no need to special-case it and correctly does not: it
+    /// reports `true` here too (`engine_applied_index >= accepted_index`
+    /// alone is sufficient by design, mirroring `cp_kind_raw_local`'s own
+    /// pre-extraction shape) — this test pins that contract explicitly so
+    /// a future caller of this function in isolation cannot mistake it for
+    /// a full confirm/superseded decision on its own.
+    #[test]
+    fn effects_merged_at_our_own_index_is_reported_true_by_this_check_alone() {
+        assert!(kind_batch_confirm_superseded(
+            ACCEPTED_INDEX,
+            ACCEPTED_INDEX,
+            ACCEPTED_TERM,
+            &Some((ACCEPTED_TERM, KindBatchOutcome::Applied)),
+        ));
+    }
+
+    /// Effects merged past our index with nothing recorded there for us —
+    /// whatever occupied that slot no-opped or belongs to a different,
+    /// already-applied-and-gone entry. Leadership-independent proof.
+    #[test]
+    fn effects_past_our_index_with_no_outcome_is_superseded() {
+        assert!(kind_batch_confirm_superseded(
+            ACCEPTED_INDEX,
+            ACCEPTED_INDEX,
+            ACCEPTED_TERM,
+            &None,
+        ));
+    }
+
+    /// A different term recorded at our own index: Raft's log-matching
+    /// property means a different, reoccupying entry landed there, ours
+    /// having been truncated — superseded regardless of whether effects
+    /// are readable yet.
+    #[test]
+    fn a_different_term_at_our_index_is_superseded() {
+        assert!(kind_batch_confirm_superseded(
+            ACCEPTED_INDEX - 1,
+            ACCEPTED_INDEX,
+            ACCEPTED_TERM,
+            &Some((ACCEPTED_TERM + 1, KindBatchOutcome::Applied)),
+        ));
+    }
+
+    /// The false-negative issue #911/#967 fixed, pinned directly: a real
+    /// term bump makes `is_leader()` read false while this index is still
+    /// entirely undecided — this function has no `is_leader` parameter to
+    /// even consult, so it cannot regress back into treating that alone as
+    /// proof of loss.
+    #[test]
+    fn is_leader_is_not_a_parameter_and_cannot_cause_a_false_supersede() {
+        // Same inputs as `nothing_decided_yet_is_never_superseded`, standing
+        // in for "this node just lost leadership" — no `bool` for it exists
+        // to pass here at all, which is the fix.
+        assert!(!kind_batch_confirm_superseded(
+            ACCEPTED_INDEX - 1,
+            ACCEPTED_INDEX,
+            ACCEPTED_TERM,
+            &None,
+        ));
+    }
+}
+
 #[cfg(test)]
 mod kind_batch_signal_tests {
     use super::{KindBatchOutcome, KindBatchSignal, classify_kind_batch_outcome};

@@ -123,3 +123,64 @@ check everyone else uses" by rote, but working out which specific ambiguity
 that identity check needs to resolve *for this caller* — index-alone vs.
 (index, term) closes one shape of ambiguity ("whose entry is this"); it
 does not, by itself, close "has anyone decided this index at all yet."
+
+## Amendment (issue #967): the fix above did not cover every caller of the same predicate
+
+`ClientCtx::cp_kind_eval_local` (`crates/animusd/src/write_path.rs`) — the
+ADR 0054 single-item `PutItem`/`UpdateItem`/`DeleteItem` write path, the
+*other* production caller of `decide::confirm_wait_is_futile` in this
+file's confirm-loop family — carried the identical `!is_leader()` hazard
+this file's original entry closed for `cp_kind_raw_local`, and was not
+touched by the #911 fix at all: the issue that found the bug explicitly
+scoped it to `cp_kind_raw_local` ("never on the single-item side, in 6000+
+sampled writes") and filed the per-key side as unaffected. It was not
+unaffected — it was simply unobserved at the sample size available then.
+Issue #967 found it the same way #911 was found: CI running the very same
+`batch_write.rs::batched_write_beats_per_key` test under real load, this
+time tripping the per-key phase's own exact-count assertion (200
+`PutItem`s, 201 accepted proposals) rather than the batched phase's
+margin-tolerant one.
+
+**Two things generalize from this beyond the original lesson above:**
+
+1. **"Never observed in N samples" is evidence of rarity, not evidence of
+   absence** — especially for a race gated on real thread-scheduling
+   contention, which is exactly the class of bug that gets *less* likely to
+   show up the more a box is idle and *more* likely under CI's own shared,
+   loaded runners. A root-cause fix scoped to "the one call site that
+   happened to trip the assertion first" should always prompt a search for
+   *every other caller of the same unsafe predicate* — not just the one the
+   failing test happened to name — before considering the class of bug
+   closed. In this case that search was one `grep -rn
+   confirm_wait_is_futile` away the whole time.
+
+2. **The "different, easier door in" this file's original entry used to
+   pin #911 deterministically does not transfer to every caller of the same
+   predicate.** `cp_kind_raw_local`'s bug was reproducible via an unrelated
+   concurrent overwrite of the same key specifically *because* that loop's
+   confirm probe was value-equality-based — a second write changing the
+   visible bytes is what created the false negative there. `cp_kind_eval_local`
+   has no value-equality fallback at all (apply computes the written bytes
+   itself, so there is nothing external to compare against); its *only*
+   confirm signal was always the `classify_kind_batch_outcome` identity
+   channel, which already correctly distinguishes "my own entry, at my own
+   term" from any unrelated concurrent write — so the overwrite door that
+   worked for the first caller is a no-op for the second one (it never
+   produces a false `Inconclusive` there to begin with). This caller's bug
+   is reachable *only* through the literal `!is_leader()` clause with
+   nothing else yet decided — the exact scenario the original entry above
+   already reported as "empirically very hard to pin in `SimEnv`" for the
+   first caller, and no more tractable here. The regression evidence for
+   this fix is therefore a direct unit test of the extracted, now-shared
+   decision function (`kind_batch_confirm_superseded`,
+   `crates/animusd/src/lib.rs` — pulled out specifically so both callers
+   share one tested implementation instead of two hand-rolled copies that
+   can drift), plus a live `SimEnv` regression
+   (`cp_kind_eval_local_genuine_loss_tests`) proving the fast-fail path for
+   a *genuinely* truncated entry is unchanged — not a live reproduction of
+   the literal false-negative race, which remains real and code-verified
+   (Raft's log-matching property) rather than independently pinned by a
+   timing-dependent test. When a live repro is this consistently
+   intractable across more than one caller, testing the extracted pure
+   decision in isolation is the correct fallback, not a weaker substitute
+   pursued only for lack of effort.
