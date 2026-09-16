@@ -8,6 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use animus_cp_data::hlc;
 use animus_cp_data::{TxnDecisionStatus, TxnOutcome};
 use animus_env::{Env, Metric, NodeId};
 use animus_node::host::RelayClient;
@@ -1254,6 +1255,25 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 .into_iter()
                 .map(|(key, _, _, value)| (key, value))
                 .collect();
+                ClientResponse::Pairs(pairs)
+            }
+            // Issue #859: the open-shard max-position RPC — addressed by
+            // `tablet` directly, mirroring `StreamHotRead` just above (see
+            // this variant's own doc). Leader-local `Arc<Mutex<_>>` read —
+            // no engine scan, unlike `StreamHotRead`.
+            ClientRequest::StreamHotChangeMax { tablet } => {
+                let tablet = TabletId(tablet);
+                let Some(leader) = self.edge.cp_leader(tablet) else {
+                    return self.not_leader_refusal(Some(tablet));
+                };
+                let pairs = match leader.hot_change_max().await {
+                    Some((ts, ordinal)) => {
+                        let mut key = hlc::pack(ts).to_be_bytes().to_vec();
+                        key.extend_from_slice(&ordinal.to_be_bytes());
+                        vec![(key, Vec::new())]
+                    }
+                    None => Vec::new(),
+                };
                 ClientResponse::Pairs(pairs)
             }
             // ADR 0045 §5 step 3: the backfill-cursor-cleanup RPC —

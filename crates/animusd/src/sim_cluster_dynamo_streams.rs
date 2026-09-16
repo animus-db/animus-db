@@ -1125,6 +1125,157 @@ fn iterator_types_latest_at_and_after_sequence_number_over_seeds() {
     }
 }
 
+/// Issue #859 regression: `GetShardIterator{LATEST}` resolves through the
+/// new `RaftKvNode::hot_change_max` O(1) primitive instead of a full
+/// `hot_read` decode-and-sort of the hot tail — this proves the value it
+/// returns is still exactly the one `hot.last()` would have picked.
+///
+/// (a) **Many distinct partition keys.** `KIND_CHANGE` keys are `token(pk)
+///     || escape(pk) || hlc || ordinal` (`materialize_derived`'s doc) — a
+///     tablet's own hash-ring token does NOT sort by commit order across
+///     different partition keys, so a naive "descending scan of the
+///     physical key space, take the first row" primitive would pick the
+///     wrong record here with high probability. Nine keys are written in
+///     sequence; a `LATEST` iterator minted after all of them must not
+///     re-deliver ANY of them, regardless of how their tokens happen to
+///     sort — only a genuinely later write becomes visible through it.
+/// (b) **Empty hot tail.** Once everything written so far is sealed, the
+///     fresh open epoch's own hot tail is empty — `LATEST` there must fall
+///     back to the sealed watermark, exactly like `hot.last().unwrap_or(watermark)`
+///     did, not panic or return a stale/wrong position.
+/// (c) **Records on both sides of the sealed watermark.** Sealing does not
+///     delete the physical `KIND_CHANGE` rows it consumed (the trim
+///     janitor's separate job) — an old, already-sealed record staying
+///     physically present below the watermark must not be picked as
+///     "current" once a genuinely new write lands above it, and an
+///     iterator minted from the empty-hot-tail watermark in (b) must still
+///     correctly see that later write.
+fn run_latest_iterator_max_hlc_matches_true_commit_order(seed: u64) {
+    let mut cluster = SimCluster::new(seed, 3, 3);
+    let table = "t";
+
+    let (status, body) = create_table(&mut cluster, 0, table);
+    assert_eq!(status, 200, "seed={seed}: CreateTable failed: {body}");
+    let (status, body) = enable_stream_via_wire(&mut cluster, 0, table);
+    assert_eq!(status, 200, "seed={seed}: enable failed: {body}");
+    let label = cluster
+        .metadata(0)
+        .table_stream(table)
+        .map(|s| s.label.clone())
+        .unwrap();
+    let stream_arn = format!("arn:aws:dynamodb:animus:0:table/{table}/stream/{label}");
+    let reader = non_leader_of_table(&cluster, table);
+    let writer = non_leader_of_table(&cluster, table);
+
+    // --- (a): nine distinct partition keys; LATEST must not re-deliver any ---
+    for i in 0..9 {
+        let pk = format!("k{i}");
+        let (status, body) = put_item(&mut cluster, writer, table, &pk, "v");
+        assert_eq!(status, 200, "seed={seed}: PutItem({pk}) failed: {body}");
+    }
+
+    let (status, v) = describe_stream_via_wire(&mut cluster, reader, &stream_arn);
+    assert_eq!(status, 200, "seed={seed}: {v}");
+    let shards = v["StreamDescription"]["Shards"].as_array().unwrap();
+    assert_eq!(shards.len(), 1, "seed={seed}: {v}");
+    let shard0 = shards[0]["ShardId"].as_str().unwrap().to_owned();
+
+    let latest =
+        get_shard_iterator_via_wire(&mut cluster, reader, &stream_arn, &shard0, "LATEST", None);
+    let (records, next) = get_records_via_wire(&mut cluster, reader, &latest, None);
+    assert!(
+        records.is_empty(),
+        "seed={seed}: LATEST must not re-deliver any of the 9 prior writes: {records:?}"
+    );
+    let latest = next.unwrap_or_else(|| panic!("seed={seed}: open shard, must not null"));
+
+    let (status, body) = put_item(&mut cluster, writer, table, "k9", "v");
+    assert_eq!(status, 200, "seed={seed}: PutItem(k9) failed: {body}");
+    let (records, _next) = get_records_via_wire(&mut cluster, reader, &latest, None);
+    assert_eq!(
+        records.len(),
+        1,
+        "seed={seed}: LATEST must see exactly the write minted after it: {records:?}"
+    );
+    assert_eq!(
+        records[0]["dynamodb"]["Keys"]["pk"]["S"], "k9",
+        "seed={seed}: {records:?}"
+    );
+
+    // --- (b)/(c): seal everything so far, then exercise the fresh open
+    // epoch's own empty-hot-tail fallback and the sealed/hot boundary.
+    let leader = leader_of_table(&cluster, table);
+    cluster.drive_stream_seal(leader);
+
+    let (status, v) = describe_stream_via_wire(&mut cluster, reader, &stream_arn);
+    assert_eq!(status, 200, "seed={seed}: {v}");
+    let shards = v["StreamDescription"]["Shards"].as_array().unwrap();
+    assert_eq!(shards.len(), 2, "seed={seed}: {v}");
+    assert!(
+        shards[0]["SequenceNumberRange"]["EndingSequenceNumber"].is_string(),
+        "seed={seed}: {v}"
+    );
+    let open_shard = shards[1]["ShardId"].as_str().unwrap().to_owned();
+
+    // (b): nothing written to the new open epoch yet — LATEST must fall
+    // back to the sealed watermark, not panic and not return a stale one.
+    let latest_empty = get_shard_iterator_via_wire(
+        &mut cluster,
+        reader,
+        &stream_arn,
+        &open_shard,
+        "LATEST",
+        None,
+    );
+    let (records, next_empty) = get_records_via_wire(&mut cluster, reader, &latest_empty, None);
+    assert!(
+        records.is_empty(),
+        "seed={seed}: LATEST on a fresh open shard must see nothing yet: {records:?}"
+    );
+
+    // (c): a write lands above the watermark. The old, already-sealed
+    // records (still physically present below the watermark) must not
+    // leak into the new max.
+    let (status, body) = put_item(&mut cluster, writer, table, "p_above", "v");
+    assert_eq!(status, 200, "seed={seed}: PutItem(p_above) failed: {body}");
+    let latest2 = get_shard_iterator_via_wire(
+        &mut cluster,
+        reader,
+        &stream_arn,
+        &open_shard,
+        "LATEST",
+        None,
+    );
+    let (records, _next2) = get_records_via_wire(&mut cluster, reader, &latest2, None);
+    assert!(
+        records.is_empty(),
+        "seed={seed}: LATEST minted after p_above must not re-deliver it: {records:?}"
+    );
+    // An iterator minted BEFORE `p_above` (`next_empty`, from the empty
+    // hot tail in (b)) DOES see it — proving the watermark fallback
+    // returned the correct exclusive-lower-bound position, not an
+    // inflated one that would have skipped this write.
+    let before = next_empty.unwrap_or_else(|| panic!("seed={seed}: open shard, must not null"));
+    let (records, _next3) = get_records_via_wire(&mut cluster, reader, &before, None);
+    assert_eq!(records.len(), 1, "seed={seed}: {records:?}");
+    assert_eq!(
+        records[0]["dynamodb"]["Keys"]["pk"]["S"], "p_above",
+        "seed={seed}: {records:?}"
+    );
+}
+
+#[test]
+fn latest_iterator_max_hlc_matches_true_commit_order() {
+    run_latest_iterator_max_hlc_matches_true_commit_order(env_seed(0xC07E_A001));
+}
+
+#[test]
+fn latest_iterator_max_hlc_matches_true_commit_order_over_seeds() {
+    for i in 0..5 {
+        run_latest_iterator_max_hlc_matches_true_commit_order(0xC07E_A100 + i);
+    }
+}
+
 /// Scenario (g): cross-node reads — every node of the cluster answers the
 /// identical `(records, NextShardIterator)` for the SAME iterator token
 /// (ADR 0043 §A3: a sealed shard is served by any node).

@@ -1093,3 +1093,117 @@ document, and ADR 0042 §3's read-path ownership) — see ADR 0042's amendment
 for their own account, including the second, related bug
 (`TRIM_HORIZON`/`LATEST` on an OPEN shard flooring at a bare `ordinal = 0`)
 this same fix's regression testing found and closed alongside the main one.
+
+## As-built amendment (2026-09-16, issue #859 — `GetShardIterator{LATEST}` no longer full-scans the hot tail)
+
+`GetShardIterator{LATEST}` on a genuinely open shard used to resolve its
+own "current max" position by calling `ClientCtx::read_stream_hot_records`
+(`index_drain::hot_read`) with `limit: usize::MAX` — decoding, collecting
+and sorting **every** pending `KIND_CHANGE` record in the tablet's hot
+tail just to take the last element after the sort. Bounded in practice by
+the sealer's own size/age triggers, but still a full decode-and-sort of
+the whole backlog on every call — a hot path, since a live-tailing
+console or consumer re-acquires a `LATEST` iterator repeatedly.
+
+**The fix adds one new cheap primitive, not a scan variant.** The
+`KIND_CHANGE` key layout is `token(pk) || escape(pk) || packed_hlc ||
+ordinal` (`materialize_derived`, `animus-cp-data`) — physical key order is
+therefore token-then-pk-then-commit-order, **not** commit order across
+different partition keys, so a bounded *descending scan of the physical
+key space* (this issue's own original suggestion) would pick the
+lexicographically-largest key, not the highest-committed record — a
+correctness bug, not a valid shortcut. Instead, `animus-cp-data`'s
+`RaftKvNode` gained an incrementally-maintained cache,
+`hot_change_max: Arc<Mutex<Option<(HlcTimestamp, u32)>>>`: the `(ts,
+ordinal)` of the highest `KIND_CHANGE` record this group has ever
+materialized. It is updated **in-memory, synchronously**, at every
+`materialize_derived` call site whose `change_log` was non-empty (taking
+the `max()` against whatever is already cached, since one Raft entry —
+`TxnResolve`'s own multi-key commit loop — can call it more than once at
+the same `ts` with a growing `ordinal`); seeded **once**, at group start,
+from a single bounded scan of the tablet's own `KIND_CHANGE` scope
+(`scan_hot_change_max`), the identical one-time cost `sealed`/
+`committed_ceiling`/`txn_tracker` already pay there — never written
+durably (no new marker key). `GetShardIterator{LATEST}` reads it via the
+new internal `ClientRequest::StreamHotChangeMax` RPC
+(`ClientCtx::stream_hot_change_max`, mirroring `StreamHotRead`'s own
+local/forward split) — an `Arc<Mutex<_>>` read on the tablet's leader, no
+engine scan at all.
+
+**Why this is provably the same maximum `hot_read`'s own decode-sort-
+truncate would find.** Every applied entry's `ts` is strictly greater than
+every `ts` applied before it (`assert_ts_monotonic`'s own invariant), and
+within one entry `ordinal` only ever increases — so the sequence of `(ts,
+ordinal)` pairs `hot_change_max` is ever set to is itself non-decreasing,
+and its value after any prefix of applied entries equals the true maximum
+over every `KIND_CHANGE` record materialized so far, unfiltered.
+`GetShardIterator{LATEST}` needs that maximum filtered to `>
+(watermark, u32::MAX)` (the existing exclusion of a leftover, already-
+sealed tie's tail — issue #852's own `u32::MAX` floor, unchanged);
+re-applying that identical filter to the cached, unfiltered maximum
+reproduces `hot_read`'s filtered-then-maxed result exactly: whenever the
+old filtered set was non-empty, its own max IS the unfiltered max (nothing
+above the watermark can exceed the true global maximum); whenever it was
+empty, the cached maximum (if any exists at all) is `<= watermark` too, so
+the filter rejects it the same way, falling back to `watermark` — the
+identical `hot.last().unwrap_or(watermark)` the old code fell back to.
+This covers both new regression cases this fix added alongside the
+existing `LATEST`/`AT`/`AFTER_SEQUENCE_NUMBER` corpus: an empty hot tail
+after a seal, and records present on both sides of the sealed watermark
+(the sealed one, still physically present until the trim janitor clears
+it, must never be picked as "current").
+
+Every other caller of `hot_read`/`read_stream_hot_records`
+(`GetRecords`'s open-shard path, `TRIM_HORIZON`/`AT`/
+`AFTER_SEQUENCE_NUMBER`) is untouched — this fix is scoped to the one arm
+that only ever wanted the maximum, never a page of records. See
+`crates/animusd/CLAUDE.md`'s `dynamo_streams.rs` entry and
+`docs/streams-notes.md` for the reader-side pointer, and
+`RaftKvNode::hot_change_max`'s own doc (`animus-cp-data/src/lib.rs`) for
+the field-level account.
+
+**Follow-up fix, same day: the `InstallSnapshot` re-seed gap.** The
+above covered a fresh `start_inner` boot (a restarted or newly-hosted
+replica) but missed the OTHER path that replaces a group's engine content
+wholesale: `apply_and_compact`'s `InstallSnapshot` branch, which runs on
+an **already-running** replica (a lagging follower catching up while its
+own apply task keeps executing) and therefore never goes through
+`start_inner`'s own seed at all. `engine_image` walks every `ALL_KINDS`
+scope, `KIND_CHANGE` included, so an install genuinely can carry change
+records this replica never locally materialized — left unfixed, such a
+replica would keep `hot_change_max` at whatever (possibly lower, possibly
+`None`) value it had before falling behind, and if it later became this
+group's leader, `GetShardIterator{LATEST}` would return a too-low
+position and re-deliver records that already existed before the iterator
+was minted — the exact bug this whole primitive exists to avoid.
+
+Fixed by re-seeding `hot_change_max` at that same install point, right
+beside the existing `txn_tracker` rebuild (`apply_and_compact`'s doc there
+explains why a snapshot install needs an identical re-derivation for that
+field, for the identical "skips individual log entries" reason): a fresh
+`scan_hot_change_max` over the now-installed engine, `max()`-folded into
+the cache via the existing `note_hot_change_write` helper (never an
+unconditional overwrite, though the install's own value can only ever be
+`>=` whatever this replica already knew). Checked every other path that
+replaces engine content wholesale and found none else needed the fix:
+`KvCommand::SeedBatch` (the restore driver's row-merge command) never
+carries a `KIND_CHANGE` row — backup capture's own `CAPTURE_KINDS` is
+`[KIND_BASE, KIND_LSI, KIND_FOOTPRINT]` only, and `backup_restore.rs`'s
+own doc is explicit that a restored table's change log starts fresh; an
+in-place split's child groups and a wiped-then-rehosted tablet are each a
+**brand-new** `RaftKvNode` (a fresh `start_inner`/`drive` call), so they
+already get the ordinary boot-time seed like any other fresh group.
+
+Regression: `crates/animus-cp-data/tests/snapshot_catchup.rs`'s
+`snapshot_catchup_reseeds_hot_change_max` — writes real `KIND_CHANGE`
+records past the compaction threshold, restarts a crashed follower so it
+must catch up via a genuine `InstallSnapshot` (not a log replay), confirms
+its `hot_change_max()` matches the leader's own true maximum (an
+independent ground truth: a direct decode of `pending_changes()`, not a
+re-invocation of `hot_change_max`'s own machinery), then forces leadership
+onto that follower and re-confirms — the shape that actually matters,
+since only a group's LEADER ever serves `GetShardIterator{LATEST}`.
+Verified this test genuinely catches the gap: temporarily reverting the
+re-seed reproduces the exact failure (`hot_change_max()` returns `None`
+where the true max was `Some(..)`), and restoring it turns the test green
+again.

@@ -7,6 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
+use animus_cp_data::hlc;
 use animus_env::{Env, Metric, NodeId};
 use animus_node::control_handle::ControlHandle;
 use animus_node::host::RelayClient;
@@ -1378,6 +1379,63 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             }
             if self.env.now() >= deadline {
                 return Err("stream hot read did not reach a tablet leader in time".into());
+            }
+            self.env.sleep(SCHEMA_POLL_INTERVAL).await;
+        }
+    }
+
+    /// `tablet`'s own `(packed_hlc, ordinal)` maximum over every
+    /// `KIND_CHANGE` record it has ever materialized (issue #859) —
+    /// `GetShardIterator{LATEST}`'s open-shard primitive
+    /// (`dynamo_streams.rs`), replacing what used to be a
+    /// [`read_stream_hot_records`](Self::read_stream_hot_records) call with
+    /// `limit: usize::MAX` just to take the last element. Mirrors that
+    /// method's own local/forward split exactly — a `CpRoute::Local` leader
+    /// answers from its own `RaftKvNode::hot_change_max` cache (an
+    /// `Arc<Mutex<_>>` read, no engine scan); a `CpRoute::Forward` hop
+    /// round-trips the identical `ClientRequest::StreamHotChangeMax` RPC.
+    /// `None` means this tablet has never materialized a change record —
+    /// the caller falls back to the stream's own sealed watermark, exactly
+    /// like `hot_read`'s own `unwrap_or` did.
+    pub(crate) async fn stream_hot_change_max(
+        &self,
+        tablet: TabletId,
+    ) -> Result<Option<(u64, u32)>, String> {
+        let deadline = self.env.now().saturating_add(SCHEMA_COMMIT_TIMEOUT);
+        loop {
+            match self.resolve_cp_route(tablet) {
+                Some(CpRoute::Local(leader)) => {
+                    return Ok(leader
+                        .hot_change_max()
+                        .await
+                        .map(|(ts, ordinal)| (hlc::pack(ts), ordinal)));
+                }
+                Some(CpRoute::Forward(addr, hinted)) => {
+                    let request = ClientRequest::StreamHotChangeMax { tablet: tablet.0 };
+                    match self
+                        .forward_to_tablet_leader(Some(tablet), addr, hinted, request)
+                        .await
+                    {
+                        ClientResponse::Pairs(pairs) => {
+                            return Ok(pairs.first().and_then(|(key, _)| {
+                                crate::dynamo_streams::record_seqno_suffix(key)
+                            }));
+                        }
+                        ClientResponse::Error(e) if self.env.now() >= deadline => {
+                            return Err(e);
+                        }
+                        ClientResponse::Error(_) => {} // retry below
+                        other => {
+                            return Err(format!(
+                                "unexpected reply to forwarded stream hot change max: {other:?}"
+                            ));
+                        }
+                    }
+                }
+                Some(CpRoute::None) | None => {} // not settled yet, retry
+            }
+            if self.env.now() >= deadline {
+                return Err("stream hot change max did not reach a tablet leader in time".into());
             }
             self.env.sleep(SCHEMA_POLL_INTERVAL).await;
         }

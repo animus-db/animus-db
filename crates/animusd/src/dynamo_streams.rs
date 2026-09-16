@@ -31,6 +31,20 @@
 //! (never cached from `GetShardIterator` mint time), which is exactly what
 //! makes an open-shard iterator survive a seal that happens between polls
 //! (ADR 0042 §2's "sealing never invalidates an open-shard iterator").
+//!
+//! ## `GetShardIterator{LATEST}`'s own primitive (issue #859)
+//!
+//! Resolving `LATEST` on a genuinely open shard does **not** go through
+//! `StreamHotRead`/`hot_read` — that path decodes, collects and sorts every
+//! pending record in the hot tail just to take its own last element, an
+//! unbounded cost on a call a live-tailing consumer re-issues often. It
+//! instead uses the internal `ClientRequest::StreamHotChangeMax`
+//! (`ClientCtx::stream_hot_change_max`, `RaftKvNode::hot_change_max`): an
+//! incrementally-maintained, O(1)-to-read `(packed_hlc, ordinal)` cache of
+//! the tablet's own highest-materialized `KIND_CHANGE` record, seeded once
+//! at group start and kept current as the apply task materializes new
+//! records — see that field's own doc for the proof that it always equals
+//! the value a full `hot_read`-style scan-and-sort would find.
 
 use animus_control::{Metadata, StreamShardRow, StreamViewType};
 use animus_cp_data::{hlc, segment};
@@ -270,7 +284,7 @@ fn current_open_epoch(meta: &Metadata, tablet: TabletId) -> u64 {
 /// `ClientResponse::Pairs` (the `StreamHotRead` reply shape) carries, since
 /// that response is deliberately the plain `(key, value)` list every other
 /// kind-scan reply already is, with no separate out-of-band field.
-fn record_seqno_suffix(key: &[u8]) -> Option<(u64, u32)> {
+pub(crate) fn record_seqno_suffix(key: &[u8]) -> Option<(u64, u32)> {
     let n = key.len().checked_sub(12)?;
     let hlc = u64::from_be_bytes(key[n..n + 8].try_into().ok()?);
     let ordinal = u32::from_be_bytes(key[n + 8..].try_into().ok()?);
@@ -524,21 +538,38 @@ async fn get_shard_iterator<E: Env, R: RelayClient>(
             ShardIteratorType::AtSequenceNumber => predecessor(parse_seq(sequence_number)?),
             ShardIteratorType::AfterSequenceNumber => parse_seq(sequence_number)?,
             ShardIteratorType::Latest => {
-                // The tablet's own leader: one hot read from the effective
-                // watermark, taking the max `(hlc, ordinal)` pair actually
-                // present — "current max + a not-yet-existent tick" per ADR
-                // 0042 §5, expressed via this crate's exclusive-lower-bound
+                // Issue #859: the tablet's own leader's `hot_change_max`
+                // cache — the `(hlc, ordinal)` of the highest `KIND_CHANGE`
+                // record it has ever materialized — instead of a full
+                // `read_stream_hot_records(.., usize::MAX)` decode-sort of
+                // the whole hot tail just to take its own last element.
+                // "current max + a not-yet-existent tick" per ADR 0042 §5,
+                // expressed via this crate's exclusive-lower-bound
                 // convention as "position = current max" (nothing new yet
                 // is > that). Same `u32::MAX` floor as `TrimHorizon` above,
-                // for the identical reason — the scan must not treat a
-                // leftover, already-sealed tie's tail as "current."
+                // for the identical reason — a leftover, already-sealed
+                // tie's tail must not read as "current."
+                //
+                // **Equivalence to the old `hot_read`-derived value**: the
+                // old code filtered `pending_changes()` to `(hlc, ordinal)
+                // > watermark`, sorted ascending, and took the last element
+                // (`None` when nothing passed the filter). `hot_change_max`
+                // is that same maximum taken over the UNFILTERED set (see
+                // `RaftKvNode::hot_change_max`'s doc for why it always
+                // equals the true global max), so re-applying the identical
+                // `> watermark` filter here — keep it only if it's actually
+                // above the watermark, otherwise fall back exactly like
+                // `hot.last()`'s own `unwrap_or` did — reproduces the same
+                // value: whenever the old filtered set was non-empty, its
+                // max IS the unfiltered max (nothing above `watermark` can
+                // ever be smaller than the unfiltered maximum); whenever it
+                // was empty, `hot_change_max` (if `Some`) is `<= watermark`
+                // too, so the filter below rejects it the same way.
                 let watermark = (meta.stream_shard_watermark(tablet).unwrap_or(0), u32::MAX);
-                let hot = ctx
-                    .read_stream_hot_records(tablet, watermark, usize::MAX)
+                ctx.stream_hot_change_max(tablet)
                     .await
-                    .map_err(|e| internal(&e))?;
-                hot.last()
-                    .and_then(|(key, _)| record_seqno_suffix(key))
+                    .map_err(|e| internal(&e))?
+                    .filter(|&gm| gm > watermark)
                     .unwrap_or(watermark)
             }
         }
