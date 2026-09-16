@@ -1542,3 +1542,72 @@ config-hash rollout does not stop at the newly-promoted ordinal, it
 proceeds through every pre-existing voter's pod too (Part B's own
 mechanism), and the e2e's own "re-resolve and re-forward" phase was
 racing that continuation.
+
+### Part E (2026-09-16) — the new rollout-completion wait itself timed out on `e2e-kind-tls`; two hypotheses checked, one ruled out, one real bug found, one genuinely new bug filed separately
+
+A further real run (`e2e-kind-tls`, run 35036379078, job 104606305854, on
+the Part C/D head) hit `kubectl rollout status statefulset/${AC_NAME}
+--timeout=300s` (Part D) timing out, after growth itself had already
+converged (voters=4, measured live via `/admin/control/members`). Two
+things needed settling before trusting any of this ADR's own analysis
+further.
+
+**Hypothesis: a second, growth-triggered config-hash roll cascades
+through ordinals 2, 1, 0.** Checked directly against `kubectl describe
+statefulset`'s own `Events`: ordinals 0, 1, 2 show exactly one
+`SuccessfulCreate` each, at the StatefulSet's original creation, and
+**no** `SuccessfulDelete`/`SuccessfulCreate` pair at any point after —
+only ordinal 3 was ever recreated (once at the `spec.nodes` scale-up,
+once more for its `controlNodes`-triggered role flip, the expected
+single roll). **Ruled out**: there was no second cascade in this run.
+
+**Hypothesis: the operator log capture is unreliable (a buffered
+writer, or the operator process itself restarting), which is why earlier
+analysis of a stalled run saw only a handful of log lines.** Checked
+directly: `crates/animus-operator/src/main.rs` calls plain
+`tracing_subscriber::fmt::init()` — the default, synchronous writer over
+`std::io::stdout`'s own `LineWriter`, which flushes on every newline
+regardless of whether the destination is a terminal or (as here) a
+redirected file; this crate never configures `tracing-appender`'s
+non-blocking writer, so there is no buffering layer to lose lines.
+`scripts/e2e-kind.sh` execs `animus-operator run` exactly once, redirects
+its output to `$OPERATOR_LOG` with a single `>` at launch, and never
+re-launches or truncates it mid-run (the only other reference to the
+binary is the cleanup trap's `kill`/`pkill`). **Ruled out** as the cause
+of missing detail: the log is complete as written. What *was* true: this
+operator's `owns()` watches on five child kinds mean `apply_children`'s
+per-reconcile re-apply can itself trigger a burst of "related object
+updated" reconciles (confirmed in this same run's log: six reconcile
+events within under 200ms during the growth window) — over a multi-
+minute stall, this accumulates far past a `tail -n 200` cap, silently
+discarding exactly the reconciles that matter. **Fixed**: the
+diagnostics dump now prints the log's own total line count (`wc -l`) and
+whether the operator process is still alive (`kill -0 "$OPERATOR_PID"`)
+before dumping a much wider `tail -n 1000`, so the *next* recurrence can
+tell "log complete, just cropped too tight" apart from "process gone" or
+"lines genuinely lost" without re-deriving this investigation.
+
+**What actually stalled the rollout in this run**: `kubectl describe
+pods` for `e2e-3` showed `Restart Count: 0`, continuously `Running`
+since its own single post-growth restart, but `Ready: False` for the
+whole five-minute window. Its own log tail was filled with intra-cluster
+mTLS handshake failures against its peers (`e2e-0`/`e2e-1`/`e2e-2`'s own
+pod IPs): `TLS handshake failed ... error: AlertReceived(BadCertificate)`.
+A pod that cannot sustain Raft traffic with its peers never gets recent
+leader contact, `/admin/health` never returns `200`, Kubernetes readiness
+never succeeds, and the StatefulSet's own rolling-update logic — which
+always waits for a recreated pod's own readiness before touching the
+next lower ordinal, independent of `podManagementPolicy` — never
+proceeds past ordinal 3 at all. This is a **real, separate, TLS-specific
+bug** (a working hypothesis: `spec.tls`'s certificate is reissued from
+the *live* `spec.nodes` on every reconcile, `desired::certificate::build`
+— a scale-up can race a freshly-created pod's own boot against
+cert-manager's reissuance, and since TLS material is read once at
+startup and never hot-reloaded, a pod that boots on one side of a
+reissuance can end up permanently unable to validate peers that booted
+(and will never restart) on the other side) — filed as its own issue
+(**#913**) rather than folded into this one: it is orthogonal to every
+fix in Parts A-D, only plain and non-TLS legs (`e2e-kind`, `e2e-kind-
+s3`, `e2e-kind-encryption`) are unaffected, and confirming/fixing it
+needs its own read of how this cluster's mTLS trust material is actually
+wired, which Parts A-D's own growth-mechanism fixes do not touch.

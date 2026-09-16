@@ -528,6 +528,25 @@ on whether to check again. See ADR 0060's amendment (Part C) for the full
 account and `reconcile_still_attempts_growth_when_the_growing_condition_
 did_not_survive`'s own regression test.
 
+**A `kubectl rollout status statefulset/...` wait after growth converges
+(the e2e's own follow-up phase) can time out for a reason unrelated to
+this crate's own reconcile logic**: a real occurrence (ADR 0060's Part E)
+found `e2e-kind-tls`'s promoted ordinal stuck `Ready: False` forever,
+not from a second config-hash roll (checked directly against the
+StatefulSet's own events — there wasn't one) but from persistent
+intra-cluster mTLS `BadCertificate` handshake failures against its
+never-restarted peers, filed separately as issue #913 (a TLS
+certificate-lifecycle question, not a growth-mechanism one). Also from
+that investigation: this crate's own log capture was confirmed reliable
+(`tracing_subscriber::fmt::init()`'s default writer is synchronous and
+line-flushing, never buffered; the e2e execs the operator exactly once
+and never truncates its log) — a stalled run that looks log-sparse is a
+`tail` cap on the diagnostics dump discarding a busy reconcile burst
+(this `owns()`-watches-five-child-kinds crate can genuinely produce one),
+not a missing- or lost-log bug. `scripts/e2e-kind.sh`'s diagnostics now
+print the log's own line count and the operator process's own liveness
+before a much wider `tail`, so this doesn't need re-deriving next time.
+
 ## TLS (ADR 0064 commit 3)
 
 `AnimusClusterSpec.tls: Option<TlsSpec>` (`crd.rs`), two mutually exclusive

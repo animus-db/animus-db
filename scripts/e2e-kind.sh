@@ -381,8 +381,31 @@ dump_diagnostics() {
         done
     fi
     if [ -f "$OPERATOR_LOG" ]; then
-        log "operator log (tail 200): ${OPERATOR_LOG}"
-        tail -n 200 "$OPERATOR_LOG" 2>&1 | sed 's/^/  /' || true
+        # Issue #864 (third recurrence): a `tail -n 200` cap here silently
+        # discarded the exact reconcile(s) that mattered on at least one
+        # real occurrence — this operator's own `owns()` watches on five
+        # child kinds mean `apply_children`'s per-reconcile re-apply can
+        # itself trigger a burst of "related object updated" reconciles,
+        # and a multi-minute stall accumulates far more than 200 lines
+        # long before the interesting part of the timeline. `wc -l` and an
+        # explicit liveness check make the *next* recurrence's diagnostics
+        # answer, rather than raise, "is this log actually complete, and
+        # is the process that wrote it still alive?" — ruled out here as
+        # an operator-process restart (a single `exec` at launch, no
+        # re-exec/truncation anywhere else in this script) or a buffered
+        # writer (`tracing_subscriber::fmt::init()` uses the plain,
+        # synchronous, line-flushing `Stdout` writer, never `tracing-
+        # appender`'s non-blocking one) — but both are cheap enough to
+        # keep confirming on every run rather than trusting that finding
+        # to still hold after a future change to either.
+        log "operator log: ${OPERATOR_LOG} ($(wc -l <"$OPERATOR_LOG") lines total)"
+        if [ -n "$OPERATOR_PID" ] && kill -0 "$OPERATOR_PID" 2>/dev/null; then
+            log "operator process (PID ${OPERATOR_PID}) is still alive"
+        else
+            log "operator process (PID ${OPERATOR_PID:-<unknown>}) is NOT running"
+        fi
+        log "operator log (tail 1000): ${OPERATOR_LOG}"
+        tail -n 1000 "$OPERATOR_LOG" 2>&1 | sed 's/^/  /' || true
     fi
     if [ -f "$PORT_FORWARD_LOG" ]; then
         log "port-forward log: ${PORT_FORWARD_LOG}"
