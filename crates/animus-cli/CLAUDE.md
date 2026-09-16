@@ -20,10 +20,19 @@ The whole crate is one file, `src/main.rs`.
 ## TLS (`--tls-ca PATH`, ADR 0064, S-01 commit 2)
 
 Config-gated, default off — omitted, every dial is plain TCP,
-byte-for-byte unchanged. `--tls-ca PATH` may appear anywhere in the
-argument list (`extract_tls_ca` pulls it out, in place, before any
-subcommand's own positional parsing runs) and applies to **every** dial
-this invocation makes — the client-protocol port (`status`/`put`/`get`)
+byte-for-byte unchanged. `--tls-ca PATH` is a **global flag that must
+precede the subcommand name** (`animus --tls-ca PATH status ...`, matching
+every usage string this CLI prints) — `extract_tls_ca` pulls it out, in
+place, before any subcommand's own positional parsing runs. It is
+deliberately **not** a whole-argv scan (issue #840): only the very first
+token is eligible, so a subcommand's own positional data that happens to
+equal the literal string `"--tls-ca"` (a `<key>`/`<value>` most obviously)
+is never scanned for and can never be silently stripped or shift later
+arguments. A leading `--` closes the global-flag prefix without being
+treated as one itself (the usual end-of-options idiom) and is consumed, so
+`--tls-ca` can still appear as genuine positional data in the very first
+slot when written as `animus -- --tls-ca ...`. `--tls-ca` applies to
+**every** dial this invocation makes — the client-protocol port (`status`/`put`/`get`)
 and every admin-port call (`http_call`, reached by the flat one-shot
 routes and by the `decommission`/`control-add`/`control-remove`/
 `control-grow` orchestration functions, all of which now take an explicit
@@ -393,11 +402,14 @@ exercised by `animusd`'s existing dashboard-action tests
 those ops already have (`dynamo_backup.rs`, `dynamo_restore.rs`,
 `dynamo_pitr_restore.rs`, `dynamo_ttl.rs`, `dynamo_streams.rs`), unrelated
 to this crate. Also
-`extract_tls_ca` (found anywhere in args / absent / trailing with no
-value) and `build_tls_connector` (rejects a missing file and a file with
-no certificates) — pure/local-filesystem-only, no socket, no live TLS
-handshake; `animusd`'s `tests/tls_e2e.rs` is the real end-to-end
-regression net for a genuine `--tls-ca` dial against a live node.
+`extract_tls_ca` (leading flag / absent / leading with no value / a `--`
+separator / a positional equal to `"--tls-ca"` left intact, including the
+exact issue #840 shift scenario — a `<key>` positional literally
+`"--tls-ca"` followed by a `<value>`) and `build_tls_connector` (rejects a
+missing file and a file with no certificates) — pure/local-filesystem-only,
+no socket, no live TLS handshake; `animusd`'s `tests/tls_e2e.rs` is the
+real end-to-end regression net for a genuine `--tls-ca` dial against a
+live node.
 
 **`seed`'s own request-shaping/item-generation logic** (ADR 0021
 amendment) is unit-tested the same pure, socket-free way: `seed_item` for

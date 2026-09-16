@@ -43,10 +43,12 @@ use tokio::time::sleep;
 #[tokio::main]
 async fn main() -> ExitCode {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
-    // `--tls-ca PATH` (ADR 0064, S-01 commit 2) may appear anywhere in the
-    // argument list — extracted up front, before any subcommand's own
-    // positional parsing runs, so it never collides with a subcommand's own
-    // argument shape. Server-only TLS (this CLI never presents a client
+    // `--tls-ca PATH` (ADR 0064, S-01 commit 2) is a *global* flag,
+    // recognized only as a prefix before the subcommand name — never as, or
+    // after, positional data (issue #840: a positional argument that happens
+    // to equal the literal string "--tls-ca" must never be eligible for
+    // extraction, and extracting a real flag must never shift later
+    // positionals). Server-only TLS (this CLI never presents a client
     // certificate): it verifies the node it talks to, on both the
     // client-protocol and admin ports.
     let tls = match extract_tls_ca(&mut args)
@@ -70,22 +72,45 @@ async fn main() -> ExitCode {
     }
 }
 
-/// Pull `--tls-ca PATH` out of `args` (in place), wherever it appears —
-/// returns its value, or `None` if the flag was never given.
+/// Pull a leading `--tls-ca PATH` out of `args` (in place) — returns its
+/// value, or `None` if the flag was not given.
+///
+/// **Only the very first token is eligible** (issue #840): `--tls-ca` is a
+/// global flag that precedes the subcommand name (`animus --tls-ca PATH
+/// status ...`), matching every usage string this CLI prints. It is
+/// deliberately **not** a whole-argv scan — a subcommand's own positional
+/// data (a `<key>`/`<value>` that happens to equal the literal string
+/// `"--tls-ca"`) is never eligible for extraction, so it can never be
+/// silently stripped, and a later positional can never shift as a result.
+/// Nothing in this repo relies on `--tls-ca` appearing after the subcommand
+/// name (grepped for `--tls-ca` across scripts/, deploy/, website/ and the
+/// operator's e2e script), so there is no form that keeps it legal there.
+///
+/// A leading `--` closes the global-flag prefix without itself being
+/// treated as one (the usual end-of-options idiom) — it is consumed here so
+/// the subcommand dispatch never sees it, which lets `--tls-ca` (or
+/// anything else) appear as genuine positional data in the very first slot
+/// without being mistaken for the flag.
 ///
 /// # Errors
-/// A message if `--tls-ca` is given with no following value.
+/// A message if a leading `--tls-ca` is given with no following value.
 fn extract_tls_ca(args: &mut Vec<String>) -> Result<Option<String>, String> {
-    let Some(pos) = args.iter().position(|a| a == "--tls-ca") else {
-        return Ok(None);
-    };
-    let value = args
-        .get(pos + 1)
-        .cloned()
-        .ok_or("--tls-ca requires a PATH argument")?;
-    args.remove(pos + 1);
-    args.remove(pos);
-    Ok(Some(value))
+    match args.first().map(String::as_str) {
+        Some("--") => {
+            args.remove(0);
+            Ok(None)
+        }
+        Some("--tls-ca") => {
+            let value = args
+                .get(1)
+                .cloned()
+                .ok_or("--tls-ca requires a PATH argument")?;
+            args.remove(1);
+            args.remove(0);
+            Ok(Some(value))
+        }
+        _ => Ok(None),
+    }
 }
 
 /// Build a **server-only** TLS client config trusting `ca_path` (ADR 0064,
@@ -2652,11 +2677,11 @@ mod tests {
     }
 
     #[test]
-    fn extract_tls_ca_removes_the_flag_and_its_value_wherever_it_appears() {
+    fn extract_tls_ca_removes_a_leading_flag_and_its_value() {
         let mut a = vec![
-            "status".to_string(),
             "--tls-ca".to_string(),
             "ca.pem".to_string(),
+            "status".to_string(),
             "127.0.0.1:9000".to_string(),
         ];
         assert_eq!(extract_tls_ca(&mut a).unwrap(), Some("ca.pem".to_string()));
@@ -2664,10 +2689,71 @@ mod tests {
     }
 
     #[test]
-    fn extract_tls_ca_at_the_end_with_no_value_is_an_error() {
-        let mut a = vec!["status".to_string(), "--tls-ca".to_string()];
+    fn extract_tls_ca_leading_with_no_value_is_an_error() {
+        let mut a = vec!["--tls-ca".to_string()];
         let err = extract_tls_ca(&mut a).expect_err("no value must be rejected");
         assert!(err.contains("--tls-ca"), "{err}");
+    }
+
+    /// Issue #840: `--tls-ca` used as a subcommand's own positional data
+    /// (e.g. a literal `<key>`/`<value>`) must never be scanned for or
+    /// extracted — it is not a global-flag occurrence just because the
+    /// string matches.
+    #[test]
+    fn extract_tls_ca_as_a_positional_after_the_subcommand_is_left_intact() {
+        let mut a = vec![
+            "put".to_string(),
+            "127.0.0.1:9000".to_string(),
+            "mytable".to_string(),
+            "mykey".to_string(),
+            "--tls-ca".to_string(),
+        ];
+        let before = a.clone();
+        assert_eq!(extract_tls_ca(&mut a).unwrap(), None);
+        assert_eq!(a, before);
+    }
+
+    /// Issue #840's exact shift scenario: a `<key>` positional literally
+    /// equal to `"--tls-ca"`, followed by a `<value>` — neither token may be
+    /// stripped, and no later argument may shift.
+    #[test]
+    fn extract_tls_ca_does_not_shift_a_positional_key_equal_to_the_flag_name() {
+        let mut a = vec![
+            "put".to_string(),
+            "127.0.0.1:9000".to_string(),
+            "mytable".to_string(),
+            "--tls-ca".to_string(),
+            "myvalue".to_string(),
+        ];
+        let before = a.clone();
+        assert_eq!(extract_tls_ca(&mut a).unwrap(), None);
+        assert_eq!(a, before, "positional data must never shift");
+    }
+
+    #[test]
+    fn extract_tls_ca_honors_a_leading_double_dash_separator() {
+        // An explicit `--` closes the global-flag prefix (and is consumed),
+        // so the token right after it — even the literal string
+        // `"--tls-ca"` — is left for the subcommand to parse as its own.
+        let mut a = vec![
+            "--".to_string(),
+            "put".to_string(),
+            "127.0.0.1:9000".to_string(),
+            "mytable".to_string(),
+            "--tls-ca".to_string(),
+            "myvalue".to_string(),
+        ];
+        assert_eq!(extract_tls_ca(&mut a).unwrap(), None);
+        assert_eq!(
+            a,
+            vec![
+                "put".to_string(),
+                "127.0.0.1:9000".to_string(),
+                "mytable".to_string(),
+                "--tls-ca".to_string(),
+                "myvalue".to_string(),
+            ]
+        );
     }
 
     #[test]
