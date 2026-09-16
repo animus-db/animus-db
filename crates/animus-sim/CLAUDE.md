@@ -257,6 +257,30 @@ function of one seed. This is the substrate every distributed test runs on.
   rest of the run — no panic, no error, just a replica that never sends or
   receives again (see `docs/engineering-lessons.md`'s entry on this, found
   writing `animus-cp-data/tests/quiescence.rs`'s fault-primitives cells).
+- **`stop(node)` also discards any `Deliver` already scheduled for `node` on
+  the shared timeline (issue #836)**: a real process exit drops its open TCP
+  connections, so a message sent before the exit but still in flight must
+  never surface later. Before this, `stop` cleaned up the node's tasks/inbox/
+  un-synced-disk but never touched `st.timeline` — a `Deliver` already
+  scheduled for a future `deliver_at` survived, and `fire_event` (finding the
+  target neither `crashed` nor partitioned, since `stop` sets neither) pushed
+  it straight into whichever inbox existed under that node id when the
+  deadline arrived — including a **fresh incarnation's** inbox, since
+  `Simulator::env` only does `.entry(..).or_default()`. This made `stop`
+  strictly more forgiving than a real process boundary, and weakened every
+  test using the `StopRestart` nemesis (`crash`+`stop`+reconstruct, modelling
+  cold WAL recovery) whenever a message happened to be in flight at the stop
+  instant. The fix: `stop` takes a one-time snapshot of the timeline at the
+  moment it's called and removes every `Deliver` addressed to `node`,
+  tracing each as a `TraceEvent::Drop { reason: "stopped", .. }`. This is
+  **not** a standing mute like `crashed` — nothing persists that would need
+  clearing on the next `env(node)`/`restart`, so a message a *fresh*
+  incarnation sends or receives after `stop` (its own later `send_stream`
+  call, inserting a brand-new timeline entry) is entirely unaffected.
+  Regression: `tests/stop_semantics.rs::stop_drops_a_message_already_in_
+  flight_to_it` (and its sibling
+  `stop_does_not_mute_a_fresh_incarnation`, proving the fix doesn't
+  overcorrect into a standing mute).
 - Determinism invariants to preserve when editing: only `BTreeMap`/`BTreeSet`,
   RNG drawn only in deterministic order, no wall clock. Disk ops add no timeline
   events and — under the **default** `DiskConfig` — draw no RNG, so they don't
@@ -364,7 +388,12 @@ function of one seed. This is the substrate every distributed test runs on.
 
 ## Tests
 
-`cargo test -p animus-sim` — `tests/executor_leak.rs` proves the
+`cargo test -p animus-sim` — `tests/stop_semantics.rs` proves `stop`'s
+process-exit fidelity (issue #836): a message still in flight when its
+target is `stop`ped is discarded, never surfacing in a fresh incarnation's
+inbox after restart, while the discard is a one-time snapshot that doesn't
+mute traffic a fresh incarnation sends/receives afterward. `tests/
+executor_leak.rs` proves the
 `Simulator`/`SimEnv` task-queue reference cycle directly (`Simulator::
 downgrade`'s `Weak` still upgrades after every external handle is dropped,
 for a scenario that spawned a perpetual task, and no longer does once

@@ -308,7 +308,9 @@ pub enum TraceEvent {
         stream: u64,
         len: usize,
     },
-    /// A message was dropped (lossy link, partition, or crashed target).
+    /// A message was dropped (lossy link, partition, crashed target, or a
+    /// [`Simulator::stop`]ped target's in-flight delivery discarded at stop
+    /// time — `reason: "stopped"`).
     Drop {
         t: u64,
         from: NodeId,
@@ -1137,6 +1139,18 @@ impl Simulator {
     ///
     /// Unlike [`crash`](Self::crash), this does not mute or set the node
     /// `crashed`; the node simply has no tasks until one is started again.
+    ///
+    /// **Also discards any `Deliver` already scheduled for `node` on the
+    /// timeline** (issue #836): a real process exit drops its open TCP
+    /// connections, so a message still in flight when the process dies must
+    /// never surface later, in a fresh incarnation's inbox, as if the
+    /// connection had survived. This is a one-time snapshot of the timeline
+    /// *at the moment `stop` is called* — each discarded entry is traced as a
+    /// [`TraceEvent::Drop`] with `reason: "stopped"` — not a standing mute
+    /// like `crashed`: nothing is recorded that would need clearing later, so
+    /// a message a *new* incarnation on this same node id sends or receives
+    /// after `stop` (its own fresh `Deliver` timeline entries, inserted by a
+    /// later `send_stream` call) is entirely unaffected.
     pub fn stop(&self, node: NodeId) {
         let mut st = self.shared.lock();
         let task_ids: Vec<TaskId> = st
@@ -1180,6 +1194,33 @@ impl Simulator {
         for k in keys {
             if let Some(f) = st.disks.get_mut(&k) {
                 f.buffered.clear();
+            }
+        }
+        // A process exit drops its open connections: any `Deliver` already
+        // scheduled for `node` on the shared timeline must never land in a
+        // later incarnation's inbox. Unlike `crashed` (a standing set
+        // `fire_event` checks at delivery time), this is a one-time removal
+        // of what's on the timeline *right now* — it cannot affect a `Deliver`
+        // a fresh incarnation sends/receives afterward, since that insert
+        // hasn't happened yet.
+        let stale_deliveries: Vec<(u64, Seq)> = st
+            .timeline
+            .iter()
+            .filter_map(|(key, event)| match event {
+                Event::Deliver { to, .. } if *to == node => Some(*key),
+                _ => None,
+            })
+            .collect();
+        let t = st.clock;
+        for key in stale_deliveries {
+            if let Some(Event::Deliver { to, env }) = st.timeline.remove(&key) {
+                st.trace.push(TraceEvent::Drop {
+                    t,
+                    from: env.from,
+                    to,
+                    stream: env.stream,
+                    reason: "stopped",
+                });
             }
         }
     }
