@@ -1257,6 +1257,16 @@ impl<E: Env> CpGroup<E> {
                         .into_iter()
                         .map(|(_, voters)| voters.into_iter().map(|id| id.to_string()).collect())
                         .collect(),
+                    membership_history: self
+                        .membership_history()
+                        .into_iter()
+                        .map(|(voters, learners)| {
+                            (
+                                voters.into_iter().map(|id| id.to_string()).collect(),
+                                learners.into_iter().map(|id| id.to_string()).collect(),
+                            )
+                        })
+                        .collect(),
                 }
             };
         }
@@ -1641,6 +1651,21 @@ impl<E: Env> CpGroup<E> {
         match self {
             CpGroup::Lsm(n) => n.voter_history(),
             CpGroup::Mem(n) => n.voter_history(),
+        }
+    }
+
+    /// Every distinct **(voters, learners)** pair this replica has adopted,
+    /// in adoption order (issue #944) — a pure diagnostic, never a wake.
+    /// See [`RaftKvNode::membership_history`]'s doc for why this exists:
+    /// `/admin/raftkv`'s own `membership_history` field (below) is what
+    /// lets a test — or an operator — prove a member passed through ADR
+    /// 0058 Train 1's learner phase before it was ever a voter without
+    /// racing an external poll against how fast the reconciler happens to
+    /// promote it.
+    fn membership_history(&self) -> Vec<(BTreeSet<NodeId>, BTreeSet<NodeId>)> {
+        match self {
+            CpGroup::Lsm(n) => n.membership_history(),
+            CpGroup::Mem(n) => n.membership_history(),
         }
     }
 }
