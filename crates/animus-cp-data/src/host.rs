@@ -35,7 +35,7 @@ use std::time::Duration;
 
 #[cfg(test)]
 use animus_env::nid;
-use animus_env::{Env, Metric, NodeId};
+use animus_env::{Env, Metric, Nanos, NodeId};
 use animus_storage::{MemoryEngine, StorageEngine};
 use animus_tablet::{Epoch, KeyRange, SplitChild, Tablet, TabletId};
 
@@ -899,18 +899,36 @@ fn tablets_to_release_set(
 
 // === The execute half (ADR 0031 PR4) ========================================
 
-/// How long [`Reconciler::tick`] waits for a group's driver to actually stop
-/// after a [`HostAction::Release`]/[`HostAction::Reclaim`] calls
-/// [`RaftKvNode::shutdown`], before giving up for this tick — mirrors
-/// `animusd`'s old `CP_GC_STOP_TIMEOUT`. On timeout the handle is
-/// re-registered via `on_host` and the teardown is **not** confirmed: `plan`
-/// simply re-emits the identical action on the next tick (see
-/// [`LocalState::confirm_torn_down`]'s doc), so nothing is ever erased while
-/// the driver might still be writing.
+/// How long a **parked** teardown (see [`Reconciler::stopping`]) may sit
+/// waiting for a group's driver to actually stop before
+/// [`Reconciler::sweep_stopping`] logs the "did not stop in time" warning and
+/// bumps [`Metric::CpReconcilerStopTimeout`] — mirrors `animusd`'s old
+/// `CP_GC_STOP_TIMEOUT`.
+///
+/// **This is no longer how long any single `tick()` call blocks** (that was
+/// the bug: see [`teardown`](Reconciler::teardown)'s doc for the full
+/// before/after). It is now purely an observability threshold — "a teardown
+/// has been parked for longer than this is worth a human noticing" — checked
+/// once per tick against [`StoppingNode::halted_at`], never awaited inline.
 pub const RECLAIM_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How often [`Reconciler::tick`] polls [`RaftKvNode::is_stopped`] while
-/// waiting out [`RECLAIM_STOP_TIMEOUT`].
+/// How long [`Reconciler::teardown`] itself waits **inline**, polling
+/// [`RaftKvNode::is_stopped`], before giving up and parking the tablet in
+/// [`Reconciler::stopping`] instead of continuing to block this `tick()`
+/// call. Deliberately short: the common case — a group with a short apply
+/// backlog and no in-flight snapshot transfer — stops within one persist
+/// round plus one apply pass, both normally sub-millisecond under
+/// `SimEnv` and low-single-digit milliseconds against a real disk, so a few
+/// hundred milliseconds of inline grace absorbs that common case without
+/// making a *rare* slow stop (the case this constant no longer needs to
+/// bound) stall every other tablet this node hosts — see
+/// [`teardown`](Reconciler::teardown)'s own doc for why blocking longer than
+/// this here would reintroduce the exact starvation this fixes.
+pub const RECLAIM_STOP_GRACE: Duration = Duration::from_millis(500);
+
+/// How often [`Reconciler::teardown`] polls [`RaftKvNode::is_stopped`] while
+/// waiting out [`RECLAIM_STOP_GRACE`], and how often
+/// [`Reconciler::sweep_stopping`] re-checks each parked teardown.
 const RECLAIM_STOP_POLL: Duration = Duration::from_millis(50);
 
 /// The execute half of the per-node tablet-host reconciler (ADR 0031 PR4):
@@ -987,6 +1005,43 @@ pub struct Reconciler<E: Env, S: StorageEngine> {
     /// fix from adding a per-tick directory-listing cost to every tick for
     /// the rest of this reconciler's life.
     local_engines_checked: bool,
+    /// Reconciler group-driver-stop-timing fix: a tablet whose teardown
+    /// (`Release`/`Reclaim`) outlasted [`RECLAIM_STOP_GRACE`] — its driver
+    /// is halted but not yet confirmed `is_stopped()`, so it is parked here
+    /// rather than either re-registered as live (it can never serve again)
+    /// or torn down (its engine/WAL files must not be erased while it might
+    /// still be flushing). [`tick`](Self::tick) sweeps this once, at the
+    /// very start, before [`plan`] runs — see [`sweep_stopping`]
+    /// (Self::sweep_stopping)'s own doc. A tablet id in here is, by
+    /// construction, still in [`LocalState::hosted`] (never confirmed torn
+    /// down) and absent from [`hosted`](Self::hosted) (its live handle
+    /// moved here) — [`plan`]'s own claim-gating on `LocalState::hosted`
+    /// keeps it from being re-`Host`ed for exactly this reason (see
+    /// `plan`'s own doc).
+    stopping: BTreeMap<TabletId, StoppingNode<E, S>>,
+}
+
+/// One tablet parked mid-teardown — see [`Reconciler::stopping`]'s doc.
+struct StoppingNode<E: Env, S: StorageEngine> {
+    /// The halted driver handle, kept only so [`Reconciler::sweep_stopping`]
+    /// can poll [`RaftKvNode::is_stopped`] and, once true, finish the
+    /// teardown (erase files, confirm to [`LocalState`]) — never reused for
+    /// routing or actions (`shutdown()`'s own doc: "a halted node must not
+    /// be used again").
+    node: RaftKvNode<E, S>,
+    /// `env.now()` at the moment this tablet was parked (i.e. when
+    /// [`Reconciler::teardown`]'s own inline [`RECLAIM_STOP_GRACE`] wait
+    /// gave up) — what [`Reconciler::sweep_stopping`] compares against
+    /// [`RECLAIM_STOP_TIMEOUT`] to decide whether this has been stopping
+    /// for long enough to warn about.
+    halted_at: Nanos,
+    /// Whether [`Reconciler::sweep_stopping`] has already logged the "did
+    /// not stop in time" warning and bumped [`Metric::
+    /// CpReconcilerStopTimeout`] for this stopping episode — bumped **at
+    /// most once per episode**, not once per tick past the timeout, so the
+    /// metric counts distinct slow-stop episodes rather than growing
+    /// without bound the longer one stays parked.
+    warned: bool,
 }
 
 /// Fresh/re-registered-hosting mirror hook — see [`Reconciler`]'s `on_host`
@@ -1029,6 +1084,7 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
             heartbeat_batcher: None,
             shared_wal: None,
             local_engines_checked: false,
+            stopping: BTreeMap::new(),
         }
     }
 
@@ -1178,6 +1234,18 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
         self.hosted.get(&tablet)
     }
 
+    /// Whether `tablet`'s teardown is currently parked (see
+    /// [`stopping`](Self::stopping)'s own doc) — its driver has been asked
+    /// to shut down and hasn't yet confirmed [`RaftKvNode::is_stopped`], but
+    /// this reconciler is no longer waiting inline on it. Read-only,
+    /// primarily for tests; production code never branches on this (`plan`
+    /// deriving its own gating from `LocalState::hosted` is what actually
+    /// matters for correctness — see that field's doc).
+    #[must_use]
+    pub fn is_stopping(&self, tablet: TabletId) -> bool {
+        self.stopping.contains_key(&tablet)
+    }
+
     /// A future that resolves as soon as ANY currently-hosted tablet's own
     /// apply task observes a local `SplitTablet` fork (ADR 0058 Train 2 rung
     /// 4 layer 1) — the caller's own tick-trigger `select` (`animusd::
@@ -1228,6 +1296,13 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
     /// full mechanism and why exactly one check is enough for this
     /// reconciler's whole lifetime.
     pub async fn tick(&mut self, view: &MetadataView) {
+        // Reconciler group-driver-stop-timing fix: finish any parked
+        // teardown whose driver has since stopped, and surface a
+        // genuinely-stuck one — BEFORE `plan` runs, so a teardown that
+        // completes here is already reflected in `state` this same tick
+        // (see `sweep_stopping`'s own doc).
+        self.sweep_stopping().await;
+
         // ADR 0044 phase-1 PR4, fork H: proactively wake any hosted group
         // whose replica set intersects the failure detector's `down` set —
         // the TiKV-hibernate-regions lesson (a quiesced leader that dies
@@ -1424,6 +1499,29 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
         range: KeyRange,
         initial_formation: bool,
     ) {
+        // Defense in depth (reconciler group-driver-stop-timing fix):
+        // `plan`'s own claim-gating on `LocalState::hosted` already keeps a
+        // parked-teardown tablet id from producing a `Host` action at all
+        // (see `Reconciler::stopping`'s own doc), so this should be
+        // unreachable in practice — but re-hosting a tablet whose old
+        // driver is still winding down would race a live `RaftKvNode`
+        // against `sweep_stopping`'s own eventual file erase for the exact
+        // same tablet id, so this is a hard backstop, not an optimization:
+        // skip and let the next tick retry once the old driver's teardown
+        // has actually finished.
+        if self.stopping.contains_key(&tablet) {
+            tracing::warn!(
+                tablet = tablet.0,
+                "reconciler: refusing to host a tablet whose old driver is still \
+                 stopping — retrying next tick"
+            );
+            // Deliberately leave `state` untouched (unlike the two ordinary
+            // skip paths below): this tablet's claim is still legitimately
+            // "mine, mid-teardown" (see `Reconciler::stopping`'s own doc) —
+            // `release_unconfirmed_host` would wrongly say the opposite,
+            // that this node never hosted it at all.
+            return;
+        }
         let Some(t) = view.tablets.get(&tablet) else {
             self.state.release_unconfirmed_host(tablet);
             return;
@@ -1686,26 +1784,72 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
 
     /// Execute a [`HostAction::Release`]/[`HostAction::Reclaim`]: unregister
     /// from the caller's routing registry first, shut the driver down and
-    /// wait for it to actually stop (never touch data under a live driver),
-    /// then **delete the tablet's own engine files** (ADR 0050 rung 1 — both
-    /// actions reduce to the identical deletion since the engine is private,
-    /// so whole-engine deletion is the erase either way — there is no
-    /// behavioral fork left to take a `kind` parameter for) and its WAL file,
-    /// and only then confirm the teardown to [`LocalState`] and drop the
-    /// local handle. A timeout waiting for the driver to stop re-registers
-    /// the handle (so routing keeps working) and leaves `state`/`hosted`
-    /// untouched — `plan` re-emits the identical action next tick.
+    /// wait **briefly** (at most [`RECLAIM_STOP_GRACE`], the common case —
+    /// see that constant's own doc) for it to actually stop (never touch
+    /// data under a live driver), then **delete the tablet's own engine
+    /// files** (ADR 0050 rung 1 — both actions reduce to the identical
+    /// deletion since the engine is private, so whole-engine deletion is the
+    /// erase either way — there is no behavioral fork left to take a `kind`
+    /// parameter for) and its WAL file, and only then confirm the teardown
+    /// to [`LocalState`] and drop the local handle.
     ///
-    /// `self.hosted.remove(&tablet)` returning `None` means a **zombie
-    /// claim**: [`LocalState::hosted`] (or a caller's stale `plan` input)
-    /// names a tablet with no live handle here, and nothing else ever
-    /// populates `self.hosted` — so there is no driver to shut down and
-    /// nothing to wait on. Best-effort cleanup still runs (a previous
-    /// `host()` attempt may have left partial engine/WAL files on disk before
-    /// failing to establish a handle) and the claim is confirmed torn down
+    /// **The reconciler group-driver-stop-timing fix.** Before this, a
+    /// driver that took longer than `RECLAIM_STOP_TIMEOUT` (10s) to stop
+    /// made THIS method itself block inline for up to that whole 10s —
+    /// **once per `tick()` call**, because on timeout the old code
+    /// re-registered the handle via `on_host` and left `state`/`hosted`
+    /// untouched, so `plan` re-emitted the identical `Reclaim`/`Release`
+    /// action on the very next tick and this method paid the same 10s wait
+    /// all over again. `Reconciler::tick` runs every planned action
+    /// serially in one `.await` chain (ADR 0031's own "the decision is
+    /// pure, the execution is sequential" shape), so one slow-to-stop
+    /// tablet's driver starved every OTHER action that tick — hosting a
+    /// split child, a `Reconfigure`, a `ProposeSplitFork` — and, since the
+    /// next tick just re-planned and re-blocked on the SAME tablet, kept
+    /// starving them indefinitely. See `docs/lessons/code-patterns/` for the
+    /// general lesson this shipped with.
+    ///
+    /// The fix: wait only the short [`RECLAIM_STOP_GRACE`], and if the
+    /// driver still hasn't stopped by then, **park** it in
+    /// [`stopping`](Self::stopping) and return — never re-register it via
+    /// `on_host` (a halted driver can never serve again; the tablet is
+    /// either gone from `Metadata` entirely or this node is no longer a
+    /// replica, so there is nothing to route to it for). `state`/`hosted`
+    /// stay exactly as before (the claim in `LocalState::hosted` is neither
+    /// cleared nor re-confirmed), so `plan` keeps re-emitting the identical
+    /// action every tick — but THIS method now recognizes that and turns
+    /// into a fast no-op for an already-parked tablet (see the early check
+    /// below) instead of re-running the zombie-claim path against a still-
+    /// live (if halted) driver, which would erase its files out from under
+    /// it. [`sweep_stopping`](Self::sweep_stopping), called once at the top
+    /// of every [`tick`](Self::tick) before [`plan`] runs, is what actually
+    /// finishes a parked teardown once its driver's `is_stopped()` goes
+    /// true, and what surfaces a genuinely-stuck one via the
+    /// `RECLAIM_STOP_TIMEOUT` warning/metric.
+    ///
+    /// `self.hosted.remove(&tablet)` returning `None` (and `tablet` not
+    /// already in [`stopping`](Self::stopping)) means a **zombie claim**:
+    /// [`LocalState::hosted`] (or a caller's stale `plan` input) names a
+    /// tablet with no live handle here, and nothing else ever populates
+    /// `self.hosted` — so there is no driver to shut down and nothing to
+    /// wait on. Best-effort cleanup still runs (a previous `host()` attempt
+    /// may have left partial engine/WAL files on disk before failing to
+    /// establish a handle) and the claim is confirmed torn down
     /// immediately, so `plan` stops re-emitting a teardown action that could
     /// otherwise never make progress.
     async fn teardown(&mut self, tablet: TabletId) {
+        // Already parked from an earlier tick's timed-out wait: `plan` will
+        // keep re-emitting the identical `Reclaim`/`Release` for this
+        // tablet every tick until `sweep_stopping` confirms it torn down
+        // (see this method's own doc) — a no-op here, not a re-run of
+        // either path below, is exactly what that re-emission needs. Firing
+        // the zombie-claim path here would erase files out from under a
+        // driver that may still be flushing; firing the normal path would
+        // double-call `on_teardown`/`shutdown` on state already moved into
+        // `self.stopping`.
+        if self.stopping.contains_key(&tablet) {
+            return;
+        }
         let Some(node) = self.hosted.remove(&tablet) else {
             tracing::warn!(
                 tablet = tablet.0,
@@ -1718,15 +1862,23 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
         };
         (self.on_teardown)(tablet);
         node.shutdown();
-        let deadline = self.env.now().saturating_add(RECLAIM_STOP_TIMEOUT);
+        let deadline = self.env.now().saturating_add(RECLAIM_STOP_GRACE);
         while !node.is_stopped() {
             if self.env.now() >= deadline {
-                tracing::warn!(
-                    tablet = tablet.0,
-                    "reconciler: group driver did not stop in time"
+                // Park it — never re-register via `on_host` (see this
+                // method's own doc: a halted driver must never serve
+                // again), and leave `state`/`hosted` untouched so `plan`
+                // keeps re-emitting this same action (which the check at
+                // the top of this method turns into a no-op) until
+                // `sweep_stopping` confirms the teardown complete.
+                self.stopping.insert(
+                    tablet,
+                    StoppingNode {
+                        node,
+                        halted_at: self.env.now(),
+                        warned: false,
+                    },
                 );
-                (self.on_host)(tablet, &node);
-                self.hosted.insert(tablet, node);
                 return;
             }
             self.env.sleep(RECLAIM_STOP_POLL).await;
@@ -1739,6 +1891,54 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
         drop(node);
         self.erase_tablet_files(tablet).await;
         self.state.confirm_torn_down(tablet);
+    }
+
+    /// Sweep [`stopping`](Self::stopping): finish any parked teardown whose
+    /// driver has since actually stopped, and surface (once) any that has
+    /// now sat parked past [`RECLAIM_STOP_TIMEOUT`]. Called once, at the
+    /// very start of every [`tick`](Self::tick), **before** [`plan`] runs —
+    /// so a teardown that finishes here is already reflected in `state`
+    /// (via [`LocalState::confirm_torn_down`]) by the time `plan` reads it
+    /// this same tick, exactly as if it had finished inline the old way.
+    ///
+    /// This is a plain poll, not a wait: each parked tablet is checked once
+    /// and this returns immediately either way — the whole point of parking
+    /// is that nothing here ever blocks `tick()` on a slow driver again.
+    async fn sweep_stopping(&mut self) {
+        let due: Vec<TabletId> = self.stopping.keys().copied().collect();
+        for tablet in due {
+            let stopped = self
+                .stopping
+                .get(&tablet)
+                .is_some_and(|s| s.node.is_stopped());
+            if stopped {
+                let stopping = self
+                    .stopping
+                    .remove(&tablet)
+                    .expect("just observed in the map above");
+                // Mirrors `teardown`'s own stopped-driver tail exactly (ADR
+                // 0050 rung 1: whole-engine deletion).
+                drop(stopping.node);
+                self.erase_tablet_files(tablet).await;
+                self.state.confirm_torn_down(tablet);
+                continue;
+            }
+            let now = self.env.now();
+            let should_warn = self.stopping.get(&tablet).is_some_and(|s| {
+                !s.warned
+                    && now.0.saturating_sub(s.halted_at.0) >= RECLAIM_STOP_TIMEOUT.as_nanos() as u64
+            });
+            if should_warn {
+                tracing::warn!(
+                    tablet = tablet.0,
+                    "reconciler: group driver did not stop in time"
+                );
+                self.env.metrics().incr(Metric::CpReconcilerStopTimeout);
+                if let Some(s) = self.stopping.get_mut(&tablet) {
+                    s.warned = true;
+                }
+            }
+        }
     }
 
     /// Delete `tablet`'s own engine files (ADR 0050 rung 1 — the engine is

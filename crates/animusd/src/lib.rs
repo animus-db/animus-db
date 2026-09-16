@@ -6344,11 +6344,17 @@ async fn wait_all_finished(tasks: &[tokio::task::JoinHandle<()>]) {
 /// How long a graceful process teardown ([`Node::shutdown_graceful`], via
 /// [`ClusterEdgeState::shutdown_all_cp_groups`]) waits for each hosted CP
 /// group's driver to actually stop before giving up and proceeding to the
-/// hard `abort()` anyway (the process is exiting either way). Also the bound
-/// the per-node tablet-host reconciler's own teardown uses for the identical
-/// shutdown-then-wait wait (`animus_cp_data::host::RECLAIM_STOP_TIMEOUT` —
-/// kept as a separate constant here since this one guards an unrelated,
-/// whole-process concern, not a single tablet's release/reclaim).
+/// hard `abort()` anyway (the process is exiting either way) — an unrelated,
+/// whole-process concern from a single tablet's release/reclaim, so it stays
+/// its own constant here rather than reusing anything in `animus_cp_data::
+/// host`. **No longer analogous to that crate's own inline wait** (the
+/// reconciler group-driver-stop-timing fix): `host::Reconciler::teardown`
+/// now blocks inline only for the much shorter `RECLAIM_STOP_GRACE`, parking
+/// a slow-to-stop driver and letting `sweep_stopping` finish it on a later
+/// tick rather than blocking a whole `tick()` call for anywhere near this
+/// constant's own value. This function's own blocking wait remains
+/// deliberate: the *process* is exiting either way, so there is no "later
+/// tick" to defer to and no reconciler-starvation concern to avoid.
 const CP_GC_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A **control-only** node (ADR 0035 PR3) whose listeners are bound but not

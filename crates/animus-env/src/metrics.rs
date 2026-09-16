@@ -738,12 +738,26 @@ pub enum Metric {
     /// tablet's own compaction pays the cost of rewriting every OTHER
     /// co-hosted tablet's own cached tail too.
     CpSharedWalGcRewrites,
+    /// `animus-cp-data`'s per-node tablet-host reconciler (`host::
+    /// Reconciler::teardown`, the reconciler group-driver-stop-timing fix)
+    /// parked a tablet's teardown past its stop-timeout without the
+    /// tablet's own driver actually stopping. Bumped **at most once per
+    /// stopping episode** (when the tick sweep first notices the timeout
+    /// crossed, not once per tick), so this counts distinct slow-stop
+    /// episodes, never a steady per-tick rate. Should stay at (or near)
+    /// zero in steady state; a nonzero rate points at a tablet whose
+    /// apply/consensus loop is taking longer than the timeout to observe
+    /// `halted` (a stuck/very slow engine, or something else blocking that
+    /// loop's own top-of-iteration check) — worth investigating, though the
+    /// reconciler itself keeps making progress on every other tablet
+    /// regardless (that isolation is the fix this metric observes).
+    CpReconcilerStopTimeout,
 }
 
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 93] = [
+    pub const ALL: [Metric; 94] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -837,6 +851,7 @@ impl Metric {
         Metric::CpHeartbeatDemuxDropped,
         Metric::CpSharedWalSyncs,
         Metric::CpSharedWalGcRewrites,
+        Metric::CpReconcilerStopTimeout,
     ];
 
     /// The stable exported name of this metric (snake_case, used as the text
@@ -937,6 +952,7 @@ impl Metric {
             Metric::CpHeartbeatDemuxDropped => "cp_heartbeat_demux_dropped",
             Metric::CpSharedWalSyncs => "cp_shared_wal_syncs",
             Metric::CpSharedWalGcRewrites => "cp_shared_wal_gc_rewrites",
+            Metric::CpReconcilerStopTimeout => "cp_reconciler_stop_timeout",
         }
     }
 
