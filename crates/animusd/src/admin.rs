@@ -160,6 +160,20 @@ pub(crate) struct CpRaftView {
     /// against how fast the reconciler happens to converge past it — see
     /// `RaftKvNode::voter_history`'s doc for the full incident this closes.
     pub(crate) voter_history: Vec<Vec<String>>,
+    /// Every distinct **(voters, learners)** pair this replica has adopted,
+    /// in adoption order (issue #944) — each entry `(voters, learners)`
+    /// (both the sorted `String` node ids), oldest first. Unlike
+    /// `voter_history` above (sampled once per consensus-loop tick, which
+    /// is fine-grained enough for a voter-set change but NOT for a
+    /// learner-set change — see `RaftKvNode::membership_history`'s doc for
+    /// why), this is a thin passthrough to `RaftCore::config_history`,
+    /// recorded synchronously at the one real mutation site
+    /// (`apply_config`), so it lets a caller prove a member passed through
+    /// ADR 0058 Train 1's learner phase before it was ever a voter, durably,
+    /// without racing an external poll against how fast the reconciler
+    /// promotes it — see `crates/animusd/tests/learner_reconfigure.rs` for
+    /// the flake this closes.
+    pub(crate) membership_history: Vec<(Vec<String>, Vec<String>)>,
 }
 
 /// One entry of a group's `pending: BTreeMap<TxnId, (record_key, created_ts)>`
