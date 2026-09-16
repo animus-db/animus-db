@@ -332,20 +332,25 @@ impl Snapshot for MemorySnapshot {
         self.version
     }
 
-    async fn get(&self, key: &[u8]) -> Option<VersionedValue> {
-        self.inner
+    async fn get(&self, key: &[u8]) -> Result<Option<VersionedValue>> {
+        // `MemoryEngine`'s reads are infallible in memory, so this can never
+        // return `Err` — unlike `LsmSnapshot::get`, which propagates a real
+        // backing-store failure.
+        Ok(self
+            .inner
             .lock()
             .expect("storage poisoned")
-            .read_at(key, self.version)
+            .read_at(key, self.version))
     }
 
-    async fn scan(&self, start: &[u8], end: &[u8]) -> Vec<(Key, VersionedValue)> {
+    async fn scan(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Key, VersionedValue)>> {
         if start > end {
-            return Vec::new();
+            return Err(StorageError::InvalidRange);
         }
-        self.inner
+        Ok(self
+            .inner
             .lock()
             .expect("storage poisoned")
-            .scan_at(start, end, self.version)
+            .scan_at(start, end, self.version))
     }
 }

@@ -564,6 +564,28 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     // `snapshot_config`.
     snapshot_learners: Option<BTreeSet<NodeId>>,
 
+    // Every distinct `(config, learners)` pair this core has adopted, in
+    // adoption order (issue #944) — a small bounded ring, appended
+    // synchronously inside `apply_config`, the ONE place a real transition
+    // happens: both a leader's own local `propose`/`add_learner`/
+    // `promote_learner` call (synchronous, on whatever task calls it) and a
+    // follower's own per-entry `log_append` (looping over a batched
+    // `AppendEntries`'s entries) funnel through it. A caller sampling
+    // `config()`/`learners()` from OUTSIDE, on any cadence — even "once per
+    // consensus-loop iteration" — can coalesce two back-to-back transitions
+    // the same scheduling gap applies both of, silently skipping the
+    // intermediate; recording at the mutation site itself cannot. See
+    // `crates/animusd/tests/learner_reconfigure.rs`'s
+    // `spare_replacement_passes_through_an_observable_learner_state_and_keeps_serving`
+    // for the flake this closes, and `config_history`'s own accessor doc
+    // for the read side. Deliberately **not** seeded at fresh construction
+    // (`RaftCore::new` never calls `apply_config`, so a brand-new group's
+    // ring starts empty until its first real change) — a restart's
+    // recovery (`recovered`'s `recompute_config` call) seeds exactly one
+    // entry, the just-recovered state, mirroring `VoterHistory`'s own
+    // "restart starts fresh" discipline in `animus-cp-data`.
+    config_history: std::collections::VecDeque<(BTreeSet<NodeId>, BTreeSet<NodeId>)>,
+
     role: Role,
     current_term: u64,
     voted_for: Option<NodeId>,
@@ -681,6 +703,24 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     // liveness judgment of its peers depend on stale, potentially very old
     // wall-clock reads survived across a restart, which is actively wrong.
     last_contact: BTreeMap<NodeId, Nanos>,
+    // The `now` at which THIS leadership stint began (issue #923): set once in
+    // `become_leader`, read back only through [`leader_since`](Self::
+    // leader_since), which additionally gates on `role == Leader` so a
+    // stepped-down node reads `None` with no explicit clearing needed
+    // elsewhere — mirrors `next_index`/`match_index`/`last_contact`'s own
+    // "meaningless once not leader, naturally overwritten on the next
+    // `become_leader`" volatility; never persisted or snapshotted. Exists so
+    // `RaftNode::control_peer_believed_alive` can tell "this leader has never
+    // heard a GENUINE ack from this peer because it only just took over"
+    // apart from "this leader has been up for a while and this peer has gone
+    // properly silent" — `last_contact`'s own per-peer seed in `become_leader`
+    // makes both cases look byte-identical (a stamp at `now`, aging out after
+    // the same `CONTROL_PEER_LIVENESS_TIMEOUT`), which is exactly the
+    // false-dead race issue #923 hit: a fresh leader's first real heartbeat
+    // round can legitimately take longer than that steady-state per-peer
+    // timeout under load (post-election processing, everyone's own scheduler
+    // contention right after a disruptive leadership change).
+    leader_since: Option<Nanos>,
     // Issue #667 (2026-09-15 amendment): every peer id this node has ever
     // witnessed casting a GENUINE, durably-forgettable vote — i.e. a
     // `voted_for` write this identity's own disk could later lose. Marked
@@ -1057,6 +1097,7 @@ where
             learners: BTreeSet::new(),
             initial_learners: BTreeSet::new(),
             snapshot_learners: None,
+            config_history: std::collections::VecDeque::new(),
             role: Role::Follower,
             current_term: 0,
             voted_for: None,
@@ -1074,6 +1115,7 @@ where
             match_index: BTreeMap::new(),
             snapshot_served_through: BTreeMap::new(),
             last_contact: BTreeMap::new(),
+            leader_since: None,
             heard_from: BTreeSet::new(),
             departing: BTreeMap::new(),
             transfer_target: None,
@@ -1704,6 +1746,15 @@ where
         self.learners.clone()
     }
 
+    /// Every distinct `(config, learners)` pair this core has adopted, in
+    /// adoption order (issue #944) — see [`config_history`](Self)'s own
+    /// field doc for the mechanism and why this exists. A pure accessor,
+    /// reading it never blocks or mutates anything.
+    #[must_use]
+    pub fn config_history(&self) -> Vec<(BTreeSet<NodeId>, BTreeSet<NodeId>)> {
+        self.config_history.iter().cloned().collect()
+    }
+
     /// `id`'s role in the active configuration, or `None` if it is not
     /// currently a member at all (ADR 0058 Train 1).
     #[must_use]
@@ -1747,8 +1798,19 @@ where
     fn apply_config(&mut self, voters: BTreeSet<NodeId>, learners: BTreeSet<NodeId>) {
         self.peers = voters.iter().filter(|n| **n != self.id).cloned().collect();
         self.cluster_size = voters.len();
+        let changed = self.config != voters || self.learners != learners;
         self.config = voters;
         self.learners = learners;
+        if changed {
+            // Issue #944: this IS the one real transition, recorded right
+            // where it happens — see `config_history`'s field doc.
+            const CONFIG_HISTORY_CAPACITY: usize = 64;
+            if self.config_history.len() >= CONFIG_HISTORY_CAPACITY {
+                self.config_history.pop_front();
+            }
+            self.config_history
+                .push_back((self.config.clone(), self.learners.clone()));
+        }
     }
 
     /// The voter config effective at log `index`: the latest config-bearing entry
@@ -2014,6 +2076,22 @@ where
     #[must_use]
     pub fn peer_last_contact(&self, node: NodeId) -> Option<Nanos> {
         self.last_contact.get(&node).copied()
+    }
+
+    /// The `now` at which THIS leadership stint began (issue #923), or `None`
+    /// on every non-leader — gated on `role == Leader` rather than a separate
+    /// clear-on-step-down write, so a stepped-down node reads `None`
+    /// immediately with no extra bookkeeping (see the `leader_since` field
+    /// doc). Another raw fact with no policy baked in: `RaftNode::
+    /// control_peer_believed_alive` is the one place that turns "how long
+    /// have I held the gavel this stint" into a grace period.
+    #[must_use]
+    pub fn leader_since(&self) -> Option<Nanos> {
+        if self.role == Role::Leader {
+            self.leader_since
+        } else {
+            None
+        }
     }
 
     /// The voter this leader is currently handing leadership off to, if a
@@ -3768,6 +3846,9 @@ where
     fn become_leader(&mut self, now: Nanos) -> Vec<Out<C>> {
         self.role = Role::Leader;
         self.leader_id = Some(self.id.clone());
+        // Issue #923: mark when THIS stint began, before any per-peer
+        // `last_contact` seeding below — `leader_since`'s own field doc.
+        self.leader_since = Some(now);
         // Issue #595: this node itself just won an election — record itself
         // as the genuine contact (see `last_leader_contact`'s own doc).
         self.last_leader_contact = Some((self.id.clone(), now));

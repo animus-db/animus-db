@@ -145,9 +145,22 @@ read path's only impure layer).
   `AT`/`AFTER_SEQUENCE_NUMBER` read straight off the catalog row (sealed)
   or `effective_stream_shard_watermark` (open) with no round trip;
   `LATEST` on a sealed shard collapses to `hlc_range.1` (the
-  immediate-null path); `LATEST` on a genuinely open shard needs one
-  hot read (`ClientCtx::read_stream_hot_records(tablet, watermark,
-  usize::MAX)`) to find the current max.
+  immediate-null path); `LATEST` on a genuinely open shard resolves via
+  `ClientCtx::stream_hot_change_max` (issue #859) — an O(1) read of the
+  tablet leader's own `RaftKvNode::hot_change_max` cache, **not** a
+  `read_stream_hot_records(tablet, watermark, usize::MAX)` hot read: that
+  used to decode, collect and sort every pending `KIND_CHANGE` record in
+  the hot tail just to take its own last element, an unbounded cost on a
+  call a live-tailing consumer re-issues often. `hot_change_max` is the
+  `(packed_hlc, ordinal)` of the highest `KIND_CHANGE` record this group
+  has ever materialized, kept current in-memory by the apply task
+  (`materialize_derived`'s callers) and seeded once at group start from a
+  bounded engine scan — see `RaftKvNode::hot_change_max`'s doc
+  (`animus-cp-data/src/lib.rs`) for the proof that it always equals the
+  value a full `hot_read`-style decode-and-sort would find, including the
+  `unwrap_or(watermark)` empty-hot-tail fallback and the sealed-vs-hot
+  boundary (a record below the watermark, still physically present until
+  the trim janitor clears it, must never be picked as "current").
 - **`GetRecords`** resolves the shard id against the catalog **fresh at
   every call** (never cached from mint time) — this is what makes an
   open-shard iterator survive a seal that happens between polls (ADR
@@ -184,6 +197,19 @@ read path's only impure layer).
   `index_drain::hot_read` is `seal_now`'s read-only sibling: an
   identical `pending_changes()` scan/HLC-suffix-sort, filtered by
   `from_position` instead of the watermark, never sealing anything.
+- **`ClientRequest::StreamHotChangeMax { tablet }`** (issue #859, new
+  internal-only RPC, mirroring `StreamHotRead`'s exact shape/gating —
+  same four sites: `surface_of` (`animus-node`'s `wire.rs`), the
+  `request_kind`/bare-refusal arms in `handle_request`, and the real
+  handling arm in `cp_serve_forwarded`) is `GetShardIterator{LATEST}`'s
+  own primitive: `tablet`'s leader answers with its own
+  `RaftKvNode::hot_change_max()` — an `Arc<Mutex<_>>` read, no engine
+  scan — encoded into the existing `ClientResponse::Pairs` shape (a
+  zero- or one-element list, reusing `StreamHotRead`'s own trailing
+  `(packed_hlc, ordinal)` key-suffix convention rather than adding a new
+  response variant for one optional pair). `ClientCtx::
+  stream_hot_change_max` mirrors `read_stream_hot_records`'s own
+  local/forward split exactly.
 - **`SegmentStoreHandle::get_sealed`** (new, alongside the existing
   `put_sealed`) is the sealed-tier read: `ClusterSegmentStore::get_from`
   for the default `Cluster` variant (any recorded replica), or a plain

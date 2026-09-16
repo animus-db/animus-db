@@ -160,6 +160,20 @@ pub(crate) struct CpRaftView {
     /// against how fast the reconciler happens to converge past it — see
     /// `RaftKvNode::voter_history`'s doc for the full incident this closes.
     pub(crate) voter_history: Vec<Vec<String>>,
+    /// Every distinct **(voters, learners)** pair this replica has adopted,
+    /// in adoption order (issue #944) — each entry `(voters, learners)`
+    /// (both the sorted `String` node ids), oldest first. Unlike
+    /// `voter_history` above (sampled once per consensus-loop tick, which
+    /// is fine-grained enough for a voter-set change but NOT for a
+    /// learner-set change — see `RaftKvNode::membership_history`'s doc for
+    /// why), this is a thin passthrough to `RaftCore::config_history`,
+    /// recorded synchronously at the one real mutation site
+    /// (`apply_config`), so it lets a caller prove a member passed through
+    /// ADR 0058 Train 1's learner phase before it was ever a voter, durably,
+    /// without racing an external poll against how fast the reconciler
+    /// promotes it — see `crates/animusd/tests/learner_reconfigure.rs` for
+    /// the flake this closes.
+    pub(crate) membership_history: Vec<(Vec<String>, Vec<String>)>,
 }
 
 /// One entry of a group's `pending: BTreeMap<TxnId, (record_key, created_ts)>`
@@ -231,8 +245,11 @@ pub(crate) struct CpTxnView {
 /// `None` (the default) is plain TCP, byte-for-byte unchanged. A failed
 /// handshake (a plain-TCP dial into a TLS listener, or any other TLS
 /// error) is logged at `warn` with the peer's address and the connection
-/// dropped; the loop keeps serving every other connection, mirroring
-/// `animus_env::prod::spawn_accept`'s own contract.
+/// dropped; the loop keeps serving every other connection. **A failed
+/// `accept()` itself also never stops this loop** (issue #592,
+/// `crate::ACCEPT_ERROR_BACKOFF`'s own doc) — it now genuinely mirrors
+/// `animus_env::prod::spawn_accept`'s contract, which this doc comment
+/// used to claim without the code actually doing it.
 pub(crate) async fn serve(
     listener: TcpListener,
     ctx: ClientCtx,
@@ -264,8 +281,8 @@ pub(crate) async fn serve(
                 });
             }
             Err(err) => {
-                tracing::warn!(?err, "admin accept failed");
-                return;
+                tracing::warn!(?err, "admin accept failed (retrying)");
+                tokio::time::sleep(crate::ACCEPT_ERROR_BACKOFF).await;
             }
         }
     }
@@ -2196,13 +2213,51 @@ struct AddMemberReq {
 /// its admin/client address. `labels` seed the minted member's topology
 /// labels (ignored for an operator-supplied `node` that's already a member —
 /// see the doc above), the same shape `AddMemberReq`'s does.
+///
+/// **`addr` is a plain wire-format string, not `SocketAddr` (issue #913)**:
+/// a numeric `ip:port` or a DNS hostname:port, uninterpreted here — exactly
+/// the shape `ProdEnv::merge_peer`/`NodeAddrs`'s own address fields already
+/// use, and every other Kubernetes-pod-facing address surface in this
+/// codebase (`RoleAddrs::advertise_host`, `ClientResponse::JoinInfo`) picked
+/// for the identical reason: a pod's IP is not stable across a restart while
+/// its per-ordinal DNS name is. Before this fix, `SocketAddr`'s own `FromStr`
+/// could only ever parse a numeric address, forcing every caller (the
+/// Kubernetes operator's own growth step included) to resolve and pin a
+/// pod's *current* IP rather than pass its stable hostname — under mutual
+/// TLS with DNS-only certificate SANs, dialing that pinned IP fails the
+/// handshake outright (`ServerName::IpAddress` against a cert with no IP
+/// SAN), permanently, since the very re-registration that would otherwise
+/// replace the IP with the real hostname itself needs a working dial to the
+/// newly-promoted node to land. See `docs/adr/0037-control-plane-membership-change.md`'s
+/// issue #913 amendment and `crates/animus-operator/CLAUDE.md`'s S-07d
+/// section for the full account.
+///
+/// Since widening `addr` to `String` also removed the free shape-checking
+/// `SocketAddr::deserialize` used to give for free, the handler now runs a
+/// cheap `host:port` shape guard of its own (issue #662,
+/// [`looks_like_host_port`]) and returns a clean `400` for a garbled `addr`
+/// instead of accepting anything or failing later as an opaque dial error.
 #[derive(Deserialize)]
 struct AddControlMemberReq {
     #[serde(default)]
     node: Option<NodeId>,
-    addr: std::net::SocketAddr,
+    addr: String,
     #[serde(default)]
     labels: BTreeMap<String, String>,
+}
+
+/// Cheap shape check for [`AddControlMemberReq::addr`] (and every other
+/// `host:port` string this admin surface accepts): require a `:port` suffix,
+/// the same minimal guard `main.rs::parse_seed_arg`/`animus_node::topology::
+/// parse_not_leader_refusal` already use for the identical `host:port`
+/// shape elsewhere in this codebase. This is deliberately **not** a real DNS
+/// resolution — this handler runs generic over `E: Env` (a `SimEnv` test
+/// drives it directly), and real I/O may only ever happen behind the `Env`
+/// seam (ADR 0003); an unresolvable-but-shape-valid hostname is instead
+/// caught later, as an ordinary dial failure, the same way a bad `--seed`
+/// entry is.
+fn looks_like_host_port(addr: &str) -> bool {
+    addr.contains(':')
 }
 
 /// `POST /admin/control/member/remove` request body (ADR 0037 PR3): `node` is
@@ -2538,8 +2593,11 @@ fn control_members_view<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>) -> Value 
 /// [`crate::ClientCtx::admin_add_control_member`]'s doc for the full
 /// rationale, the collision/idempotence rules, and the allocator-minted path.
 /// `addr` is the new voter's **internal control-Raft** listen address
-/// (distinct from its admin/client/raftkv ports) — `animus admin control-add`
-/// resolves it from the new node's own `/admin/config` before calling this.
+/// (distinct from its admin/client/raftkv ports), a `host:port` string that
+/// may be a literal address or a hostname (issue #662, see
+/// [`AddControlMemberReq`]'s own doc) — `animus admin control-add` resolves
+/// it from the new node's own `/admin/config` before calling this. Returns
+/// `400` for a malformed `addr` ([`looks_like_host_port`]), never `500`.
 /// The response's `"node"` is the **effective** id either way: echoed back
 /// when operator-supplied, or the freshly-minted one when `node` was omitted
 /// — the caller (the CLI, an operator) needs this to know what id the new
@@ -2552,6 +2610,16 @@ async fn action_add_control_member<E: Env, R: RelayClient>(
         Ok(r) => r,
         Err(e) => return e,
     };
+    if !looks_like_host_port(&req.addr) {
+        return (
+            400,
+            json!({"error": format!(
+                "invalid `addr` {:?}: expected a `host:port` string (a literal address or a \
+                 resolvable hostname)",
+                req.addr
+            )}),
+        );
+    }
     match ctx
         .admin_add_control_member(req.node, req.addr, req.labels)
         .await
@@ -3671,6 +3739,56 @@ mod tests {
             parse_key_display("seed-0000042:x"),
             b"seed-0000042:x".to_vec()
         );
+    }
+
+    /// Issue #913: `AddControlMemberReq.addr` is a plain wire-format string,
+    /// not `SocketAddr` — before this fix, `SocketAddr`'s own `FromStr`
+    /// rejected any non-numeric address, forcing every caller (the
+    /// Kubernetes operator's own growth step included) to resolve a pod's
+    /// *current* IP rather than pass its stable per-ordinal DNS name. A DNS
+    /// hostname:port must deserialize cleanly now, byte-for-byte, exactly
+    /// as a numeric address always did.
+    #[test]
+    fn add_control_member_req_accepts_a_dns_hostname_addr() {
+        let hostname = "e2e-3.e2e-internal.animus-e2e.svc.cluster.local:14000";
+        let body = serde_json::json!({"node": "e2e-3", "addr": hostname, "labels": {}}).to_string();
+        let req: AddControlMemberReq =
+            serde_json::from_str(&body).expect("a DNS hostname:port addr must deserialize");
+        assert_eq!(req.addr, hostname);
+        assert_eq!(req.node.as_ref().map(NodeId::as_str), Some("e2e-3"));
+    }
+
+    /// The pre-existing numeric shape must keep working unchanged — this
+    /// fix widens the accepted shape, it does not narrow or reinterpret the
+    /// one every existing caller (the CLI's own `run_control_add*`, every
+    /// `SimCluster` test) already sends.
+    #[test]
+    fn add_control_member_req_still_accepts_a_numeric_socket_addr() {
+        let body = serde_json::json!({"addr": "127.0.0.1:14000"}).to_string();
+        let req: AddControlMemberReq =
+            serde_json::from_str(&body).expect("a numeric ip:port addr must still deserialize");
+        assert_eq!(req.addr, "127.0.0.1:14000");
+        assert_eq!(req.node, None);
+    }
+
+    /// [`looks_like_host_port`] is the handler's own shape guard now that
+    /// `addr` is a bare `String` — every JSON string value deserializes, so
+    /// this is what actually rejects a garbled `addr` with a `400` instead
+    /// of silently accepting it (issue #662).
+    #[test]
+    fn looks_like_host_port_accepts_literal_and_hostname_forms() {
+        assert!(looks_like_host_port("127.0.0.1:9001"));
+        assert!(looks_like_host_port("localhost:9001"));
+        assert!(looks_like_host_port(
+            "pod-1.animus-internal.ns.svc.cluster.local:9001"
+        ));
+    }
+
+    #[test]
+    fn looks_like_host_port_rejects_a_portless_addr() {
+        assert!(!looks_like_host_port("127.0.0.1"));
+        assert!(!looks_like_host_port("localhost"));
+        assert!(!looks_like_host_port(""));
     }
 }
 

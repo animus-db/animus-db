@@ -141,7 +141,7 @@ fn seed_batch_installs_rows_byte_identically_and_emits_no_change_records() {
         "seeded rows must land byte-identically at their carried versions (seed={seed_n})"
     );
     // No change-log emission: history transfer, not new mutation.
-    let changes = block_on(child[l].pending_changes());
+    let changes = block_on(child[l].pending_changes_key_order());
     assert!(
         changes.is_empty(),
         "a seed must emit nothing into the child's change log, got {changes:?}"

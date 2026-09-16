@@ -320,11 +320,19 @@ impl<T: Transport> S3Client<T> {
 
     /// `path` is the RAW (unescaped) request path — see
     /// [`Self::execute_object`]'s doc for why. `query_pairs` are RAW
-    /// key/value pairs too (their values must not themselves contain a
-    /// literal `&`, the one thing raw-string query construction can't
-    /// disambiguate — true of every value this client passes today:
-    /// `list-type`'s literal `"2"`, and S3-generated prefixes/continuation
-    /// tokens, which never contain `&`).
+    /// (unescaped) key/value pairs, handed straight to
+    /// [`canonical_query_string`]/[`RequestToSign::query`] as typed pairs
+    /// rather than joined into a `"k=v&k=v"` string first — a value may
+    /// freely contain its own literal `&`, `=`, space, or any other byte
+    /// (an `S3KeyPrefix` value is customer-controlled and S3 explicitly
+    /// permits `&` in an object key). Joining raw pairs with `&` and later
+    /// re-splitting on it, as an earlier version of this method did, is
+    /// exactly the bug issue #855 fixed: a value containing a literal `&`
+    /// truncated at the first one and fabricated a spurious extra
+    /// parameter, self-consistently signed (both the wire query and the
+    /// canonical form were re-derived from the same corrupted string) so
+    /// nothing detected it — S3 just interpreted the request differently
+    /// than intended.
     async fn execute(
         &self,
         method: &'static str,
@@ -335,16 +343,11 @@ impl<T: Transport> S3Client<T> {
         now_epoch_ms: u64,
     ) -> Result<HttpResponse, S3Error> {
         let host = crate::endpoint_host(&self.config.endpoint);
-        let raw_query = query_pairs
-            .iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect::<Vec<_>>()
-            .join("&");
-        // Both derived from the SAME raw strings, independently, exactly
-        // once each — never chained (never fed each other's output back
-        // in).
+        // Both derived from the SAME raw pairs, independently, exactly once
+        // each — never chained (never fed each other's output back in), and
+        // never routed through an intermediate joined-then-split string.
         let wire_path = canonical_uri_s3(path);
-        let wire_query = canonical_query_string(&raw_query);
+        let wire_query = canonical_query_string(query_pairs);
 
         let payload_hash = PayloadHash::signed(&body);
         let amz_date = format_amz_date((now_epoch_ms / 1000) as i64);
@@ -353,7 +356,7 @@ impl<T: Transport> S3Client<T> {
             method,
             uri: path,
             host: &host,
-            query: &raw_query,
+            query: query_pairs,
             headers: &extra_headers,
             payload_sha256_hex: &payload_hash,
             timestamp: &amz_date,

@@ -58,6 +58,23 @@ hook re-injects a summary at boot; treat a violation like a failed gate.
    or the maintainer has overridden the objection explicitly and
    deliberately, in so many words. A silent bypass is a gate violation.
 
+5. **Independent work runs in a separate session, one session per
+   workstream.** A session is one container: one 4-core CPU budget and one
+   `CARGO_TARGET_DIR`, and more than two concurrent test gates on it produce
+   spurious `ProdEnv` timeouts that read like real failures (and a stale
+   binary served from the shared target dir can even run another worktree's
+   test). So a session keeps only work that is *entangled* — a stacked
+   series and the defects that gate it — and runs at most two heavy agents
+   at a time. Anything independent (the next unrelated issues on a backlog,
+   or a pre-existing defect discovered mid-task that does not gate the
+   current PR) is launched in a **new session in the same environment**
+   (`create_session`), briefed with its scope, an explicit do-not-touch list
+   of what the parent owns, the mechanics that session needs (PR creation,
+   gates, worktrees, commit trailers with its own session URL), and the
+   instruction to report to the maintainer in its own chat. The parent
+   session never launches backlog work after the split, and the split is a
+   normal step, not an exception to announce.
+
 
 
 AnimusDB is a masterless, linearly-scalable NoSQL database in Rust. **For v1
@@ -330,8 +347,13 @@ truth; this map is just for navigation.
   group never quiesces), remains leader while quiesced, and admin/
   dashboard reads never wake a group (`quiesced` is a pure diagnostic).
 - **Placement, rebalancing & growth** — `animus-placement` (ADR 0005): pure
-  policy engine (RF + residency labels + failure-domain spread), `replan`
-  (failure repair) + `rebalance_step` (ADR 0029: one balance-driven move per
+  policy engine (RF + residency labels + failure-domain spread), `replan`'s
+  growth-only best-effort sibling `replan_repair` (the control plane's own
+  repair pass, issue #957 — a policy RF the current candidate pool can't
+  fully satisfy still gets grown as far as it genuinely can, e.g. an RF-3
+  policy on a 2-node cluster still repairs a 1-replica tablet up to 2,
+  rather than refusing to make any progress at all; never shrinks an
+  already-at-capacity set) + `rebalance_step` (ADR 0029: one balance-driven move per
   call; converges to max−min ≤ 1 when the policy sets no `SpreadPolicy` — with
   a spread constraint the domain guard can legally block every improving move,
   so only monotonic non-worsening and termination hold, see the property tests

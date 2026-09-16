@@ -384,7 +384,9 @@ fn reject_empty_key_value(v: &AttributeValue) -> Result<(), WireError> {
 /// caller-identity story; TLS here is confidentiality + server
 /// authenticity only). `None` (the default) is plain TCP, byte-for-byte
 /// unchanged. A failed handshake is logged at `warn` with the peer's
-/// address and the connection dropped; the loop keeps serving.
+/// address and the connection dropped; the loop keeps serving. **A failed
+/// `accept()` itself also never stops this loop** (issue #592,
+/// `crate::ACCEPT_ERROR_BACKOFF`'s own doc).
 pub(crate) async fn serve(
     listener: TcpListener,
     ctx: ClientCtx,
@@ -416,8 +418,8 @@ pub(crate) async fn serve(
                 });
             }
             Err(err) => {
-                tracing::warn!(?err, "dynamo accept failed");
-                return;
+                tracing::warn!(?err, "dynamo accept failed (retrying)");
+                tokio::time::sleep(crate::ACCEPT_ERROR_BACKOFF).await;
             }
         }
     }
@@ -1126,7 +1128,7 @@ async fn dispatch_item_op<E: Env, R: RelayClient>(
                 && !table_change_records_carry_images(meta, &table)
             {
                 let value = wire::encode_stored_item(&item);
-                fast_marker_write(ctx, &table, &pk, sk.as_ref(), value).await?;
+                fast_marker_write(ctx, meta, &table, &pk, sk.as_ref(), value).await?;
                 // No metrics: this arm is reachable only when the table has
                 // no index at all, so it has no LSI, so an item collection is
                 // not a thing this table has.
@@ -1201,7 +1203,7 @@ async fn dispatch_item_op<E: Env, R: RelayClient>(
                 && !table_change_records_carry_images(meta, &table)
             {
                 let value = wire::encode_tombstone();
-                fast_marker_write(ctx, &table, &pk, sk.as_ref(), value).await?;
+                fast_marker_write(ctx, meta, &table, &pk, sk.as_ref(), value).await?;
                 // No metrics, for `PutItem`'s reason above: no index here
                 // means no LSI means no item collection.
                 return Ok(wire::write_response(return_values, None, None, None));
@@ -9583,6 +9585,7 @@ pub(crate) fn projected_item(item: &Item, base: &TableSchema, idx: &IndexDef) ->
 /// funnel.
 async fn fast_marker_write<E: Env, R: RelayClient>(
     ctx: &ClientCtx<E, R>,
+    meta: &Metadata,
     table: &str,
     pk: &AttributeValue,
     sk: Option<&AttributeValue>,
@@ -9591,13 +9594,21 @@ async fn fast_marker_write<E: Env, R: RelayClient>(
     // Auto-provision the table's tablet on first write (ADR 0023), exactly
     // as `cp_kind_write_item`/`cp_batch_write` do — `cp_kind_write_raw`
     // itself never provisions (its other callers only ever write to tablets
-    // that exist).
-    let meta = ctx.effective_metadata();
-    if !meta.has_table_tablet(table) {
+    // that exist). `meta` is the caller's own `run_operation` snapshot
+    // (issue #843) — the common case (tablet already exists) spends no
+    // clone at all here; a fresh `effective_metadata()` clone is paid only
+    // on the rare first-write-on-a-new-table path, exactly once, after
+    // `provision_tablet` actually ran.
+    let refreshed;
+    let meta: &Metadata = if meta.has_table_tablet(table) {
+        meta
+    } else {
         ctx.provision_tablet(table)
             .await
             .map_err(|e| internal(&e))?;
-    }
+        refreshed = ctx.effective_metadata();
+        &refreshed
+    };
     let base_key = item_key(pk, sk);
     ctx.cp_kind_write_raw(
         table,
@@ -9615,11 +9626,14 @@ async fn fast_marker_write<E: Env, R: RelayClient>(
     // deferred and `RequestRateTracker` exists to catch, so it must be
     // observed here too, not only at the evaluated funnel — omitting this
     // arm would leave the signal blind to the single most common write
-    // shape (an ordinary unconditioned item write). `meta` is the
-    // pre-provision snapshot from above; a first write on a brand-new
-    // table's tablet (just provisioned this call) misses this one tick —
-    // harmless, since every following write on the same tablet observes
-    // normally and the EWMA self-heals within a couple of ticks.
+    // shape (an ordinary unconditioned item write). `meta` above is either
+    // the caller's own snapshot (tablet already existed) or the freshly
+    // re-fetched one (tablet just provisioned this call); on the growth-
+    // node mirror overlay (ADR 0030) that re-fetch can itself still lag a
+    // poll interval behind, in which case this lookup finds nothing and the
+    // tick is simply skipped — harmless, since every following write on the
+    // same tablet observes normally and the EWMA self-heals within a
+    // couple of ticks.
     if let Some(tablet) = crate::topology::tablet_for_key(meta.tablets_for_table(table), &base_key)
     {
         ctx.data().request_rates.observe(tablet, ctx.env.now());
@@ -9689,10 +9703,16 @@ pub(crate) async fn marker_batch_write_raw<E: Env, R: RelayClient>(
     rows: Vec<MarkerRow>,
     provision_if_absent: bool,
 ) -> Result<Vec<Vec<u8>>, String> {
-    if provision_if_absent && !ctx.effective_metadata().has_table_tablet(table) {
+    // One clone in the common case (tablet already exists): fetch once and
+    // reuse it for routing below, re-fetching only when `provision_tablet`
+    // actually ran (issue #843) — previously this fetched twice back to
+    // back with nothing observable in between, discarding the first clone
+    // whenever the tablet already existed.
+    let mut route_meta = ctx.effective_metadata();
+    if provision_if_absent && !route_meta.has_table_tablet(table) {
         ctx.provision_tablet(table).await?;
+        route_meta = ctx.effective_metadata();
     }
-    let route_meta = ctx.effective_metadata();
     // One `(kind writes, marker records)` pair per tablet — the per-tablet
     // single-entry batches proposed below.
     type TabletBatch = (Vec<(u8, Vec<u8>, Option<Vec<u8>>)>, Vec<(Vec<u8>, Vec<u8>)>);
@@ -10344,7 +10364,7 @@ mod relayed_error_tests {
 /// path and commits *exactly* base row + change record, never an LSI or
 /// footprint row; and that an unstreamed, unindexed table still takes the
 /// plain fast path (no change log at all). These need `CpGroup`'s private
-/// kind-scan accessors (`pending_changes`/`local_scan_kind_bounded`) an
+/// kind-scan accessors (`pending_changes_key_order`/`local_scan_kind_bounded`) an
 /// external `tests/` crate cannot reach — the same reason
 /// `index_drain::gsi_drain_cursor_tests` lives in-crate.
 #[cfg(test)]
@@ -10514,7 +10534,7 @@ mod stream_write_path_tests {
         let node = single_node(dir.path()).await;
         create_streamed_table(node.dynamo_addr(), "s1").await;
         let group = await_group(&node, "s1").await;
-        assert_eq!(group.pending_changes().await.len(), 0);
+        assert_eq!(group.pending_changes_key_order().await.len(), 0);
 
         let (status, body) = dynamo(
             node.dynamo_addr(),
@@ -10524,7 +10544,7 @@ mod stream_write_path_tests {
         .await;
         assert_eq!(status, 200, "PutItem failed: {body}");
         assert_eq!(
-            group.pending_changes().await.len(),
+            group.pending_changes_key_order().await.len(),
             1,
             "PutItem must leave exactly one change record"
         );
@@ -10560,7 +10580,7 @@ mod stream_write_path_tests {
         )
         .await;
         assert_eq!(status, 200, "UpdateItem failed: {body}");
-        assert_eq!(group.pending_changes().await.len(), 2);
+        assert_eq!(group.pending_changes_key_order().await.len(), 2);
 
         let (status, body) = dynamo(
             node.dynamo_addr(),
@@ -10569,7 +10589,7 @@ mod stream_write_path_tests {
         )
         .await;
         assert_eq!(status, 200, "DeleteItem failed: {body}");
-        assert_eq!(group.pending_changes().await.len(), 3);
+        assert_eq!(group.pending_changes_key_order().await.len(), 3);
         assert!(
             group
                 .local_scan_kind_bounded(KIND_LSI, &[], None)
@@ -10636,7 +10656,7 @@ mod stream_write_path_tests {
         // which under a BATCH_WRITE_MAX_ITEMS-item batch they essentially
         // always do; a fully-trimmed-before-observation batch skips only
         // this half, never the count).
-        let records = group.pending_changes().await;
+        let records = group.pending_changes_key_order().await;
         let trimmed = metrics_value(node.dynamo_addr(), "change_log_trimmed_total").await;
         assert_eq!(
             records.len() as u64 + trimmed,
@@ -10846,7 +10866,7 @@ mod stream_write_path_tests {
         // per mutation — 4 total (put + 2 batched + delete), live or
         // already trimmed.
         let group = await_group(&node, "rawt").await;
-        let records = group.pending_changes().await;
+        let records = group.pending_changes_key_order().await;
         let trimmed = metrics_value(node.dynamo_addr(), "change_log_trimmed_total").await;
         assert_eq!(
             records.len() as u64 + trimmed,
@@ -10916,7 +10936,7 @@ mod stream_write_path_tests {
         // still pending or counted by `change_log_trimmed_total` (the
         // union a trim cannot erase; both zero would mean emission itself
         // regressed).
-        let records = group.pending_changes().await;
+        let records = group.pending_changes_key_order().await;
         let trimmed = metrics_value(node.dynamo_addr(), "change_log_trimmed_total").await;
         assert_eq!(
             records.len() as u64 + trimmed,
@@ -10996,7 +11016,7 @@ mod stream_write_path_tests {
         .await;
         assert_eq!(status, 200, "BatchWriteItem failed: {body}");
 
-        let records = group.pending_changes().await;
+        let records = group.pending_changes_key_order().await;
         assert_eq!(
             records.len(),
             2,
@@ -11040,7 +11060,7 @@ mod stream_write_path_tests {
         .await;
         assert_eq!(status, 200, "second PutItem failed: {body}");
 
-        let records = group.pending_changes().await;
+        let records = group.pending_changes_key_order().await;
         assert_eq!(records.len(), 2, "one record per write");
         let (_, second) = &records[1];
         let record = ChangeRecord::decode(second).expect("change record decodes as Some");
@@ -11081,7 +11101,7 @@ mod stream_write_path_tests {
         // missing "copier" cursor.
         sleep(Duration::from_millis(500)).await;
         assert_eq!(
-            group.pending_changes().await.len(),
+            group.pending_changes_key_order().await.len(),
             5,
             "every change record must survive — the streamed table's \
              expected \"copier\" tag has no cursor row yet"

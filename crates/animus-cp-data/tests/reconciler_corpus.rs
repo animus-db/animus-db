@@ -2355,7 +2355,27 @@ fn scenario_torn_tail_crash_restart_replica_recovers(seed: u64) {
                 "pre-crash data must survive a torn (not merely dropped) WAL tail"
             );
         }
-        let leader = if ha.is_leader() { &ha } else { &hb };
+        // Issue #945: leadership is not necessarily still on `a`/`b` at this
+        // point — the recovered replica (`hc2`) is a fully legitimate voter
+        // once it rejoins (asserted above), so it can win a later election
+        // just like any other replica. The original `if ha.is_leader() {
+        // &ha } else { &hb }` silently assumed otherwise: when neither `a`
+        // nor `b` led, it issued the write to a non-leader (`hb`), which
+        // never got it committed, so `hc2` (which by then WAS leader) never
+        // saw it either — a test-harness bug, not a product one (see
+        // `docs/lessons/testing/2026-09-16-fixed-seed-desync-can-expose-a-
+        // too-narrow-test-assumption.md`).
+        let leader = if ha.is_leader() {
+            &ha
+        } else if hb.is_leader() {
+            &hb
+        } else {
+            assert!(
+                hc2.is_leader(),
+                "exactly one of a/b/the recovered replica must be leader"
+            );
+            &hc2
+        };
         leader.put(b"post_recovery".to_vec(), b"still_replicates".to_vec());
         assert!(
             wait_until(&env, 50, Duration::from_millis(100), || {

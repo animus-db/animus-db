@@ -1302,3 +1302,73 @@ from the pure decision function in isolation.
 See `docs/engineering-lessons.md`'s matching entry for the generalizable
 lesson this incident teaches about auditing a convergence loop's *inputs*,
 not just its own internal logic.
+
+## Amendment (2026-09-16): the retarget dwell above did not protect an already-achieved target — issues #670/#921
+
+The 2026-09-01 amendment's dwell (`SPLIT_PLACING_RETARGET_DWELL`, 5s)
+protects a target **while it is still converging**: a target member
+observed non-`Active` pauses the drive, and only a continuously-non-`Active`
+member past the dwell triggers a fresh `replan`. It applied the identical
+5s window once the target was **already achieved**
+(`Tablet::replicas == target`, still un-`done` — the narrow window before
+`MarkSplitPlacingDone` fires) — a case strictly more disruptive to
+discard than one still mid-convergence, since a split child's only other
+eligible candidates are typically its own pre-split siblings: retargeting
+an achieved target can converge the tablet right back toward the set the
+split was moving it away from. Reproduced directly, more than once, over a
+real multi-node `ProdEnv` cluster with no synthetic fault injection beyond
+ordinary background contention on the host running the test
+(`crates/animusd/tests/split_placing_two_replica_diff_e2e.rs`) — a target
+member's control-plane liveness flipped `Down` for long enough to cross the
+5s dwell despite the
+process never actually dying (a failure-detector false positive), and the
+tablet's `voter_history` showed it reach the correct target and then,
+seconds later, get retargeted away from it — the exact shape issue #921
+captured.
+
+**Fix**: `retarget_ready_this_tick` (`crates/animus-control/src/node.rs`)
+now uses a separate, longer dwell — `SPLIT_PLACING_RETARGET_DWELL_ACHIEVED`
+(30s) — once a tablet's replicas already equal the stored target, extending
+this ADR's own §2 design goal ("the target is never recomputed while it is
+healthy, which is what makes it stable") to the point right after the
+target is realized, where discarding it costs the most. A genuinely (not
+falsely) dead member still self-heals, just more slowly. New regression:
+`split_placing_phase_holds_an_already_achieved_target_past_the_base_dwell`
+(`crates/animus-control/tests/placement_split_placing.rs`).
+
+**This is a partial fix, not a full close of the underlying class of bug**:
+it only protects the window between achieving the target and
+`MarkSplitPlacingDone` firing — `animusd::split_placing_completion`'s own
+settle window (`SPLIT_PLACING_DONE_SETTLE`) is just 1.5s. The instant
+`done` is set, the tablet falls under **ordinary** `Metadata::reconcile()`
+(this ADR's §4's exclusion only covers an un-`done` tablet), which has no
+dwell/hysteresis at all — a false positive there is not protected by
+anything this amendment adds, and reproduces the identical divergence
+shape. This is not split-placing-specific — it is a property of
+`Metadata::reconcile()` itself, affecting any tablet's placement, not only
+a freshly-split one — and is filed separately as issue #928 rather than
+folded into this narrower fix, since hardening ordinary repair is a wider
+availability trade-off (a genuinely dead node's replica would then stay
+unrepaired for the dwell window too, for every tablet in the cluster).
+
+**A related, but distinct, mechanism in the same investigation — issue
+#920/PR #932, `animus-cp-data`, not this crate**: `RaftKvNode::
+reconfigure_step`'s own step ordering (unrelated to `Metadata`/placement,
+this is the per-tablet Raft membership-change sequencing one layer below)
+used to remove a `Down` extra voter **before** adding its replacement,
+which could shrink a group's live quorum requirement mid-swap and, under
+the same failure-detector-false-positive conditions, skip the
+over-replicated intermediate `split_placing_two_replica_diff_e2e.rs`
+otherwise reliably observes. Fixed by reordering that removal to fire only
+once any replacement is already a voter — see `crates/animus-cp-data/
+CLAUDE.md`'s `reconfigure_step` priority-order entry for the full account.
+The two fixes are complementary, not overlapping: this amendment's dwell
+protects the **placement decision** (`Metadata::split_placing`'s stored
+`target`); #920/#932's reorder protects the **Raft membership execution**
+of whatever target placement hands it. 60 real-`ProdEnv` runs under
+deliberate two-`dynamo_txn`-loop CPU contention against both fixes
+combined reproduced neither failure shape.
+
+See `docs/lessons/testing/2026-09-16-a-directed-placement-decision-can-be-
+undone-by-a-transient-failure-detector-false-positive.md` for the full
+writeup.

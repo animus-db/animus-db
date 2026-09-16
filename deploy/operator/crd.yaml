@@ -314,6 +314,19 @@ spec:
                       Have cert-manager issue and renew the cluster's cert via a
                       `Certificate` resource this operator creates and owns (`crate::
                       desired::certificate::build`). Mutually exclusive with `secretName`.
+
+                      **`issuerRef` must never resolve to a bare `selfSigned` issuer
+                      directly** (issue #913): every pod mounts the identical resulting
+                      `Secret` (one shared leaf, not one per pod), and a `selfSigned`
+                      issuer's output `Secret` sets `ca.crt` equal to that same leaf — so
+                      any future reissuance mints a brand-new, mutually-untrusted root
+                      rather than a renewed leaf under a stable CA, and `animusd` never
+                      reloads TLS material after boot to recover from that. Put a
+                      `ca`-typed issuer between a self-signed root and this field instead
+                      (mint one CA `Certificate` off the `selfSigned` issuer, then a
+                      second issuer signing real leaves from that CA's key) — see
+                      `docs/adr/0064-tls-on-every-port.md`'s issue #913 amendment and
+                      `scripts/e2e-kind.sh`'s own TLS setup for the reference shape.
                     nullable: true
                     properties:
                       duration:

@@ -13,7 +13,9 @@ use std::fmt;
 use animus_env::NodeId;
 #[cfg(test)]
 use animus_env::nid;
-use animus_placement::{Candidate, PlacementPolicy, rebalance_step, replan, select_replicas};
+use animus_placement::{
+    Candidate, PlacementPolicy, rebalance_step, replan, replan_repair, select_replicas,
+};
 use animus_tablet::{
     Epoch, InPlaceSplitIntent, KeyRange, SplitChild, TOKEN_BYTES, Tablet, TabletId, TabletState,
 };
@@ -2801,25 +2803,33 @@ pub struct PlacementView {
 impl PlacementView {
     /// The pure placement decision over this view — identical to
     /// [`Metadata::reconcile`] (both delegate to the same body).
+    /// `recently_done` is the driver's own post-`done` grace-window decision
+    /// (`node.rs`'s `recently_done_this_tick`, issue #928/#921 fix) — see
+    /// [`reconcile_placement`]'s own doc for why a freshly-`done`
+    /// directed-Placing child needs the same protection ordinary repair
+    /// already gives an un-`done` one.
     #[must_use]
-    pub fn reconcile(&self) -> Vec<MetaCommand> {
+    pub fn reconcile(&self, recently_done: &BTreeSet<TabletId>) -> Vec<MetaCommand> {
         reconcile_placement(
             &self.members,
             &self.tablets,
             &self.policies,
             &self.split_placing,
+            recently_done,
         )
     }
 
     /// The pure load-rebalancing decision over this view — identical to
-    /// [`Metadata::rebalance`] (both delegate to the same body).
+    /// [`Metadata::rebalance`] (both delegate to the same body). See
+    /// [`reconcile`](Self::reconcile) for `recently_done`.
     #[must_use]
-    pub fn rebalance(&self) -> Option<MetaCommand> {
+    pub fn rebalance(&self, recently_done: &BTreeSet<TabletId>) -> Option<MetaCommand> {
         rebalance_placement(
             &self.members,
             &self.tablets,
             &self.policies,
             &self.split_placing,
+            recently_done,
         )
     }
 
@@ -2860,6 +2870,7 @@ fn reconcile_placement(
     tablets: &BTreeMap<TabletId, Tablet>,
     policies: &BTreeMap<TabletId, PlacementPolicy>,
     split_placing: &BTreeMap<TabletId, SplitPlacing>,
+    recently_done: &BTreeSet<TabletId>,
 ) -> Vec<MetaCommand> {
     let candidates = active_candidates(members);
     policies
@@ -2878,14 +2889,25 @@ fn reconcile_placement(
             // the dwell-gated placing phase is the sole mover until
             // `done`, so repair must not independently retarget it too
             // (the same exclusion `rebalance_placement` already applies,
-            // below).
-            if split_placing.get(tablet).is_some_and(|entry| !entry.done) {
+            // below). Issue #928/#921 fix: `recently_done` extends this
+            // exclusion past `done` itself, for the caller's own grace
+            // window — see [`Metadata::reconcile`]'s own doc for why.
+            if split_placing.get(tablet).is_some_and(|entry| !entry.done)
+                || recently_done.contains(tablet)
+            {
                 return None;
             }
-            let desired = replan(&t.replicas, &candidates, policy).ok()?;
-            // `replan` returns a sorted set; `t.replicas` is normalized
-            // (sorted + deduped) by `Tablet::new` / `CasTabletReplicas`, so a
-            // direct comparison is a faithful "already satisfied" check.
+            // `replan_repair`, not plain `replan` (issue #957): this is the
+            // repair pass, so a policy RF the current candidate pool can't
+            // fully satisfy must still grow the tablet as far as it
+            // genuinely can, rather than refusing to make any progress —
+            // see that function's own doc for the growth-only contract
+            // (it never shrinks an already-at-capacity set).
+            let desired = replan_repair(&t.replicas, &candidates, policy).ok()?;
+            // `replan_repair` returns a sorted set; `t.replicas` is
+            // normalized (sorted + deduped) by `Tablet::new` /
+            // `CasTabletReplicas`, so a direct comparison is a faithful
+            // "already satisfied" check.
             if desired == t.replicas {
                 None
             } else {
@@ -2923,6 +2945,7 @@ fn rebalance_placement(
     tablets: &BTreeMap<TabletId, Tablet>,
     policies: &BTreeMap<TabletId, PlacementPolicy>,
     split_placing: &BTreeMap<TabletId, SplitPlacing>,
+    recently_done: &BTreeSet<TabletId>,
 ) -> Option<MetaCommand> {
     let candidates = active_candidates(members);
     let entries: Vec<(TabletId, &[NodeId], &PlacementPolicy)> = policies
@@ -2934,8 +2957,12 @@ fn rebalance_placement(
                 return None;
             }
             // ADR 0062 §2: an un-done directed-Placing obligation owns this
-            // tablet's convergence exclusively until it finishes.
-            if split_placing.get(tablet).is_some_and(|entry| !entry.done) {
+            // tablet's convergence exclusively until it finishes. Issue
+            // #928/#921 fix: `recently_done` extends this past `done` too —
+            // see `reconcile_placement`'s own doc.
+            if split_placing.get(tablet).is_some_and(|entry| !entry.done)
+                || recently_done.contains(tablet)
+            {
                 return None;
             }
             Some((*tablet, t.replicas.as_slice(), policy))
@@ -3080,23 +3107,51 @@ impl Metadata {
     /// (and a replay) computes the same proposals. The leader's reconciler
     /// (`node.rs`) calls it on a timer and proposes the result through Raft; a
     /// tablet already satisfying its policy yields nothing, so the loop is
-    /// **idempotent** (no churn at steady state). A tablet whose policy cannot be
-    /// satisfied with the current candidates (e.g. too few eligible nodes) is
-    /// skipped, leaving the existing replicas in place rather than shrinking the
-    /// set. **ADR 0062 §2 (issue #528 fix)**: a tablet carrying an un-`done`
+    /// **idempotent** (no churn at steady state). **A tablet whose policy RF
+    /// exceeds the current candidate pool is still grown as far as it
+    /// genuinely can be (issue #957, `animus_placement::replan_repair`)** —
+    /// e.g. an RF-3 policy on a cluster that currently has only 2 eligible
+    /// members still repairs a 1-replica tablet up to 2, rather than
+    /// refusing to make any progress until a 3rd member ever becomes
+    /// eligible; see `replan_repair`'s own doc for the exact growth-only
+    /// contract (it never shrinks an already-at-capacity set, which is what
+    /// still leaves a tablet's existing replicas in place — stale entries
+    /// included — whenever there is truly nothing better to add).
+    /// **ADR 0062 §2 (issue #528 fix)**: a tablet carrying an un-`done`
     /// [`split_placing`](Self::split_placing) entry is skipped here too — the
     /// dwell-gated directed-Placing phase
     /// ([`split_placing_reconcile`](Self::split_placing_reconcile)) is the
     /// sole mover for that tablet until `done`, so this repair pass must not
     /// independently retarget it (the same exclusion
     /// [`rebalance`](Self::rebalance) already applies).
+    ///
+    /// **Issue #928/#921 fix**: `recently_done` names tablets whose
+    /// `split_placing` entry flipped `done` within the caller's own grace
+    /// window (`node.rs`'s `recently_done_this_tick` /
+    /// `SPLIT_PLACING_RETARGET_DWELL_ACHIEVED`) and are skipped here too, for
+    /// the identical reason an un-`done` entry is: `done` firing quickly
+    /// (`SPLIT_PLACING_DONE_SETTLE`, 1.5s) means a freshly-realized
+    /// directed-Placing target falls under this **un-dwelled** repair pass
+    /// almost immediately, so a failure-detector false positive on a target
+    /// member right after `done` reproduces the identical
+    /// achieved-target-discarded regression the pre-`done` dwell
+    /// (`SPLIT_PLACING_RETARGET_DWELL_ACHIEVED`) exists to prevent — the two
+    /// mechanisms are one continuous protection window, not two, from the
+    /// achieved point through the caller's own grace period past `done`. An
+    /// empty `recently_done` (every non-driver caller, all pure/unit tests)
+    /// reproduces this method's pre-fix behavior exactly. This does **not**
+    /// close issue #928's fully general form (ordinary `reconcile()` still
+    /// has no dwell at all for a tablet with no `split_placing` history) —
+    /// only the directed-Placing-specific instance this crate can name a
+    /// tablet set for.
     #[must_use]
-    pub fn reconcile(&self) -> Vec<MetaCommand> {
+    pub fn reconcile(&self, recently_done: &BTreeSet<TabletId>) -> Vec<MetaCommand> {
         reconcile_placement(
             &self.members,
             &self.tablets,
             &self.policies,
             &self.split_placing,
+            recently_done,
         )
     }
 
@@ -3112,14 +3167,18 @@ impl Metadata {
     /// `CasTabletReplicas` per call — a deliberate one-CAS-per-tick churn bound;
     /// the leader's `reconcile_loop` calls it (paced) only once repair had nothing
     /// to do. Safety rests on the epoch-CAS (a stale move is epoch-rejected) and the
-    /// data-plane catch-up gate, not on the cadence.
+    /// data-plane catch-up gate, not on the cadence. See [`reconcile`](Self::reconcile)
+    /// for `recently_done` (issue #928/#921 fix) — extended here identically so a
+    /// freshly-`done` child cannot be nudged by a balance-driven move either
+    /// before it has had a chance to settle.
     #[must_use]
-    pub fn rebalance(&self) -> Option<MetaCommand> {
+    pub fn rebalance(&self, recently_done: &BTreeSet<TabletId>) -> Option<MetaCommand> {
         rebalance_placement(
             &self.members,
             &self.tablets,
             &self.policies,
             &self.split_placing,
+            recently_done,
         )
     }
 
@@ -8483,7 +8542,7 @@ mod tests {
         // several simulated ticks, with no state mutation in between.
         for tick in 0..5 {
             assert_eq!(
-                m.reconcile(),
+                m.reconcile(&BTreeSet::new()),
                 Vec::new(),
                 "tick {tick}: expected zero proposals with only 1 of 3 required \
                  candidates Active — a proposal here would be a storm against a \
@@ -8511,7 +8570,7 @@ mod tests {
             }),
             ApplyOutcome::Applied
         );
-        let proposals = m.reconcile();
+        let proposals = m.reconcile(&BTreeSet::new());
         assert_eq!(
             proposals.len(),
             1,
@@ -9646,20 +9705,271 @@ mod tests {
         let mut without_entry = m.clone();
         without_entry.split_placing.remove(&TabletId(2));
         assert!(
-            !without_entry.reconcile().is_empty(),
+            !without_entry.reconcile(&BTreeSet::new()).is_empty(),
             "expected the sanity baseline to actually repair the violation"
         );
 
         assert!(
-            m.reconcile().is_empty(),
+            m.reconcile(&BTreeSet::new()).is_empty(),
             "repair must not touch a tablet with an un-done split_placing entry"
         );
 
-        // Marking it done reopens the tablet to ordinary repair.
+        // Marking it done reopens the tablet to ordinary repair — UNLESS the
+        // caller's own `recently_done` grace window still names it (issue
+        // #928/#921 fix, proven in its own dedicated test below); an empty
+        // set (no driver-side grace tracking, as every other caller of this
+        // pure function passes) reopens it immediately, exactly as before
+        // that fix.
         m.split_placing.get_mut(&TabletId(2)).unwrap().done = true;
         assert!(
-            !m.reconcile().is_empty(),
+            !m.reconcile(&BTreeSet::new()).is_empty(),
             "a done split_placing entry must no longer exclude the tablet from repair"
+        );
+    }
+
+    /// Issue #957: a tablet under-provisioned below its own policy RF (the
+    /// policy always records the *target* RF, `MAX_REPLICATION_FACTOR` in
+    /// `animusd`, never the observed initial candidate count — see
+    /// `tests/tablet_rf_self_heals.rs`) must still self-heal up to every
+    /// candidate the cluster actually has, not just up to the full RF. Found
+    /// root-causing the flaky
+    /// `tablet_provisioned_undersized_on_a_small_cluster_self_heals_after_
+    /// growth`: a 2-node cluster, RF-3 policy, a tablet minted with only 1
+    /// replica (the initial-placement race
+    /// `docs/lessons/testing/2026-09-16-a-faster-bootstrap-time-schema-
+    /// proposal-makes-initial-tablet-placement-an-eventual-property.md`
+    /// documents) never gained its second replica: `reconcile_placement`
+    /// called plain `replan`, which refuses outright ("not enough eligible
+    /// candidates: need 3, have 2") the instant the full RF can't be met —
+    /// even though genuine, strictly-improving progress (1 -> 2 replicas)
+    /// was possible. The control plane itself was never at fault — no
+    /// stalled apply task, no stuck boot-time cluster check (see the issue
+    /// for the ruled-out candidates) — this repair pass simply proposed
+    /// nothing, ever, until a third node made the full RF reachable in one
+    /// step.
+    #[test]
+    fn reconcile_grows_an_undersized_tablet_toward_rf_even_when_rf_cannot_be_fully_met() {
+        let mut m = Metadata::default();
+        for n in [1u64, 2] {
+            assert_eq!(
+                m.apply(&MetaCommand::UpsertMember {
+                    node: nid(n),
+                    labels: BTreeMap::new(),
+                    status: NodeStatus::Active,
+                }),
+                ApplyOutcome::Applied
+            );
+        }
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTablet {
+                tablet: TabletId(2),
+                table: Some("rf_self_heal".to_owned()),
+                range: KeyRange::whole(),
+                // Only node 1 was `Active` at provision time (the race) —
+                // one replica, on a 2-node cluster.
+                replicas: vec![nid(1)],
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::SetTabletPolicy {
+                tablet: TabletId(2),
+                // The recorded target, MAX_REPLICATION_FACTOR in production
+                // — deliberately more than either currently-Active member
+                // count this test exercises.
+                policy: Some(PlacementPolicy::simple("cp-rf", 3)),
+            }),
+            ApplyOutcome::Applied
+        );
+
+        let proposals = m.reconcile(&BTreeSet::new());
+        assert_eq!(
+            proposals,
+            vec![MetaCommand::CasTabletReplicas {
+                tablet: TabletId(2),
+                expected_epoch: m.tablets[&TabletId(2)].epoch,
+                replicas: vec![nid(1), nid(2)],
+            }],
+            "reconcile must grow the tablet to every Active candidate (2), not refuse \
+             outright because RF 3 can't be fully met"
+        );
+
+        // Applying it converges: a second `reconcile` pass on the 2-node
+        // cluster is now idempotent (no further churn) until a 3rd node
+        // becomes Active — the exact steady state the flaky test's first
+        // `poll_until_or_stalled` call was waiting on.
+        for command in &proposals {
+            assert_eq!(m.apply(command), ApplyOutcome::Applied);
+        }
+        assert_eq!(
+            m.reconcile(&BTreeSet::new()),
+            Vec::new(),
+            "already at the 2-node cluster's own capacity; no further churn until growth"
+        );
+
+        // Growing to a 3rd Active member reaches the full RF in the
+        // ordinary way — the exact shape the flaky test's own second phase
+        // (growth to 3 nodes) already covered and never flaked on.
+        assert_eq!(
+            m.apply(&MetaCommand::UpsertMember {
+                node: nid(3),
+                labels: BTreeMap::new(),
+                status: NodeStatus::Active,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.reconcile(&BTreeSet::new()),
+            vec![MetaCommand::CasTabletReplicas {
+                tablet: TabletId(2),
+                expected_epoch: m.tablets[&TabletId(2)].epoch,
+                replicas: vec![nid(1), nid(2), nid(3)],
+            }]
+        );
+    }
+
+    /// The growth-only guarantee, at the `Metadata::reconcile` level: a
+    /// tablet that already holds as many replicas as the candidate pool can
+    /// support must not be shrunk by repair just because full RF still
+    /// can't be met — a currently-ineligible (e.g. `Down`) replica stays in
+    /// the tablet's row rather than being dropped, unchanged from before
+    /// issue #957's fix.
+    #[test]
+    fn reconcile_does_not_shrink_a_tablet_already_at_the_clusters_capacity() {
+        let mut m = Metadata::default();
+        for n in [1u64, 2] {
+            assert_eq!(
+                m.apply(&MetaCommand::UpsertMember {
+                    node: nid(n),
+                    labels: BTreeMap::new(),
+                    status: NodeStatus::Active,
+                }),
+                ApplyOutcome::Applied
+            );
+        }
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTablet {
+                tablet: TabletId(2),
+                table: Some("rf_self_heal".to_owned()),
+                range: KeyRange::whole(),
+                // Already at every Active candidate; RF 3 still can't be
+                // met with only 2 members ever registered.
+                replicas: vec![nid(1), nid(2)],
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::SetTabletPolicy {
+                tablet: TabletId(2),
+                policy: Some(PlacementPolicy::simple("cp-rf", 3)),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.reconcile(&BTreeSet::new()),
+            Vec::new(),
+            "already at capacity for this 2-node cluster; nothing to repair"
+        );
+    }
+
+    /// **Issue #928/#921 regression**: an ALREADY-ACHIEVED, `done`
+    /// directed-Placing target with a genuinely `Down` TARGET member must
+    /// NOT be repaired away by ordinary `reconcile()` while the tablet is
+    /// still inside the caller's `recently_done` grace window — reproducing,
+    /// at the pure-`Metadata` level, the exact regression
+    /// `split_placing_two_replica_diff_e2e.rs` hit over a real `ProdEnv`
+    /// cluster: `done` fires quickly after a target is achieved
+    /// (`SPLIT_PLACING_DONE_SETTLE`, 1.5s), and a failure-detector false
+    /// positive on a target member right after that used to make
+    /// `reconcile()`'s un-dwelled `replan` discard the achieved placement,
+    /// converging the tablet back toward a DIFFERENT candidate set — the
+    /// identical "achieved target undone by a false positive" shape
+    /// `SPLIT_PLACING_RETARGET_DWELL_ACHIEVED` already fixes for the
+    /// pre-`done` window (that fix alone leaves this post-`done` gap open,
+    /// per that constant's own doc).
+    #[test]
+    fn reconcile_does_not_repair_away_an_achieved_recently_done_target() {
+        let mut m = Metadata::default();
+        for n in [1u64, 2, 3, 4] {
+            assert_eq!(
+                m.apply(&MetaCommand::UpsertMember {
+                    node: nid(n),
+                    labels: BTreeMap::new(),
+                    status: NodeStatus::Active,
+                }),
+                ApplyOutcome::Applied
+            );
+        }
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTablet {
+                tablet: TabletId(2),
+                table: Some("users".to_owned()),
+                range: KeyRange::whole(),
+                // Already ON the target — this child fully converged before
+                // `done` fired, exactly like the real driver's own sequence.
+                replicas: vec![nid(1), nid(2), nid(3)],
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::SetTabletPolicy {
+                tablet: TabletId(2),
+                policy: Some(PlacementPolicy::simple("users", 3)),
+            }),
+            ApplyOutcome::Applied
+        );
+        m.split_placing.insert(
+            TabletId(2),
+            SplitPlacing {
+                target: Some(vec![nid(1), nid(2), nid(3)]),
+                done: true,
+            },
+        );
+
+        // n3, a TARGET member, flips `Down` — a failure-detector false
+        // positive in the real scenario, indistinguishable here from a
+        // genuine failure (that distinction is exactly what the grace
+        // window buys time for).
+        assert_eq!(
+            m.apply(&MetaCommand::UpsertMember {
+                node: nid(3),
+                labels: BTreeMap::new(),
+                status: NodeStatus::Down,
+            }),
+            ApplyOutcome::Applied
+        );
+
+        // Sanity: WITHOUT `recently_done` naming this tablet, `reconcile`
+        // WOULD repair it away from the achieved target (proves this
+        // scenario is a real violation `replan` reacts to, not a vacuous
+        // no-op either way) — this is the exact pre-fix behavior/bug.
+        let violation = m.reconcile(&BTreeSet::new());
+        assert!(
+            !violation.is_empty(),
+            "expected the sanity baseline to actually move the tablet off its \
+             achieved target when n3 is Down and unprotected"
+        );
+        assert!(
+            matches!(&violation[0], MetaCommand::CasTabletReplicas { replicas, .. }
+                if *replicas != vec![nid(1), nid(2), nid(3)]),
+            "expected the unprotected repair to move AWAY from the achieved \
+             target: {violation:?}"
+        );
+
+        // With the tablet named in `recently_done` (as the real driver would
+        // for `SPLIT_PLACING_RETARGET_DWELL_ACHIEVED` after observing
+        // `done`), `reconcile` must propose nothing at all.
+        let mut recently_done = BTreeSet::new();
+        recently_done.insert(TabletId(2));
+        assert_eq!(
+            m.reconcile(&recently_done),
+            Vec::new(),
+            "a recently-done tablet must not be repaired away during its grace window"
+        );
+        assert_eq!(
+            m.tablets[&TabletId(2)].replicas,
+            vec![nid(1), nid(2), nid(3)],
+            "the achieved target itself must be untouched"
         );
     }
 
@@ -9763,7 +10073,7 @@ mod tests {
             ApplyOutcome::Applied
         );
 
-        let proposed = m.reconcile();
+        let proposed = m.reconcile(&BTreeSet::new());
         let targets: Vec<TabletId> = proposed
             .iter()
             .map(|c| match c {
@@ -9780,7 +10090,7 @@ mod tests {
         // The rebalancer proposes nothing for the frozen set either (the
         // Active tablet's set violates policy, so rebalance skips it by its
         // own pre-existing rule; nothing else is eligible at all).
-        assert!(m.rebalance().is_none());
+        assert!(m.rebalance(&BTreeSet::new()).is_none());
     }
 
     /// `DropTableTablets` (ADR 0024): removes every tablet scoped to the table —

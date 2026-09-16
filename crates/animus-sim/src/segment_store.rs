@@ -513,6 +513,75 @@ mod tests {
         assert!(sim.run_until_quiescent(MAX_STEPS), "must settle (4)");
     }
 
+    /// Issue #861 regression: `verify_or_init_segment_store_marker`'s
+    /// marker-absent/key-given branch now answers via
+    /// [`SegmentStore::is_empty`] rather than draining a full
+    /// `list("").is_empty()` — the outcome and refusal text must be
+    /// byte-identical to before on both a populated and a fresh store.
+    #[test]
+    fn marker_absent_key_given_branch_unchanged_by_the_is_empty_switch() {
+        use animus_env::verify_or_init_segment_store_marker;
+
+        let mut sim = Simulator::new(0x861);
+        let env = sim.env(nid(0));
+
+        // A store already holding an ordinary (non-marker) object is
+        // refused, with the exact same message the full-listing check used
+        // to produce.
+        {
+            let store = SimSegmentStore::new(env.clone());
+            let env_for_task = env.clone();
+            env.spawn_task(async move {
+                store.put("some/object", b"plaintext").await.expect("put");
+                let err =
+                    verify_or_init_segment_store_marker(&store, &env_for_task, Some(&test_key(20)))
+                        .await
+                        .expect_err("a key against a populated plaintext store must be refused");
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("already holds unencrypted objects"),
+                    "unexpected message: {msg}"
+                );
+                assert!(
+                    msg.contains(SEGMENT_STORE_MARKER_ID),
+                    "must name the marker id: {msg}"
+                );
+                assert!(
+                    msg.contains("refusing to start"),
+                    "must say why it's refusing: {msg}"
+                );
+                // The refusal must not have written the marker.
+                let listed = store.list("").await.expect("list after refusal");
+                assert!(
+                    !listed.contains(&SEGMENT_STORE_MARKER_ID.to_string()),
+                    "a refused open must not leave a marker behind: {listed:?}"
+                );
+            });
+        }
+        assert!(
+            sim.run_until_quiescent(MAX_STEPS),
+            "must settle (populated)"
+        );
+
+        // A genuinely empty store still initializes the marker and
+        // proceeds.
+        {
+            let store = SimSegmentStore::new(env.clone());
+            let env_for_task = env.clone();
+            env.spawn_task(async move {
+                verify_or_init_segment_store_marker(&store, &env_for_task, Some(&test_key(21)))
+                    .await
+                    .expect("a key against an empty store must initialize the marker");
+                let listed = store.list("").await.expect("raw list");
+                assert!(
+                    listed.contains(&SEGMENT_STORE_MARKER_ID.to_string()),
+                    "the marker must actually be written: {listed:?}"
+                );
+            });
+        }
+        assert!(sim.run_until_quiescent(MAX_STEPS), "must settle (empty)");
+    }
+
     /// The exact ambiguity a seal step must tolerate: a `put` whose caller
     /// sees an error can still have landed the object — a subsequent `get`
     /// (even from a different clone of the same store) sees it.

@@ -617,6 +617,33 @@ impl Network for ProdEnv {
                     tracing::debug!(?err, to = %to, %addr, "send failed (dropped)");
                 }
                 Err(_elapsed) => {
+                    // Deliberately does NOT drop the cached connection here
+                    // (issue #924 investigation): a `SEND_TIMEOUT` elapsing
+                    // means only "this one send didn't finish in 2s" — under
+                    // real host contention (a busy CI box, a CPU-starved
+                    // node) that is routinely just scheduling latency on an
+                    // otherwise perfectly healthy connection, not evidence
+                    // the peer is unreachable. An earlier version of this
+                    // fix cleared the slot unconditionally on timeout too,
+                    // reasoning that a spurious reconnect "only costs one
+                    // extra handshake" — that reasoning was wrong under
+                    // *sustained* contention: discarding a warm connection
+                    // forces the *next* chunk to pay a fresh connect, which
+                    // can itself exceed `SEND_TIMEOUT` under the same load,
+                    // repeating forever and turning transient slowness into
+                    // total, permanent lack of progress (caught by this
+                    // crate's own `large_metadata_catch_up_stays_live`
+                    // sibling in `animus-control`, a ~1100-chunk streaming
+                    // `InstallSnapshot` that went from "slow" to "zero bytes
+                    // ever delivered" under exactly this change on a loaded
+                    // box). The actually-dead-peer case this bound exists
+                    // for is already covered by `POOLED_SOCKET_DEAD_PEER_
+                    // TIMEOUT`'s keepalive/`TCP_USER_TIMEOUT`, which surface
+                    // as a genuine write **error** (the `Ok(Err(err))` arm
+                    // above, which does drop the slot) well within this
+                    // 2s bound in the ordinary case — see that constant's
+                    // own doc. See `docs/lessons/code-patterns/` for the
+                    // general form of this lesson.
                     tracing::debug!(to = %to, %addr, "send timed out (dropped)");
                 }
             }
@@ -696,6 +723,139 @@ const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(10);
 /// entry for the incident this closes.
 const SEND_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Bounds how long a pooled outbound or accepted socket can sit with data
+/// genuinely unacknowledged (or, on platforms without [`TCP_USER_TIMEOUT`]
+/// wired up, how long it can sit fully idle) before the kernel forces it
+/// closed — issue #924.
+///
+/// [`SEND_TIMEOUT`]'s own doc closes the case of a peer that never *answers
+/// the connect itself*. It does not close a distinct, worse case: a pooled
+/// connection that was already established and cached, whose peer then
+/// vanishes with **no FIN/RST at all** — exactly what a Kubernetes pod
+/// recreated at a new IP looks like when its old network namespace's
+/// teardown races (or loses to) the final FIN on the way out. Every write
+/// on that connection still succeeds instantly (the bytes just land in this
+/// host's own kernel send buffer; nothing about `write()` ever notices the
+/// peer is gone), so `send_frame_pooled`'s "reconnect once on a write
+/// error" path (issue #661) never triggers — the OS's own retransmission
+/// timer is the only thing standing between this and detecting the vanish,
+/// and that timer's default budget (`tcp_retries2`, Linux default ~15
+/// exponential-backoff retries, commonly 13–15 **minutes** before the
+/// kernel finally reports the write as failed) is why issue #924's
+/// recreated voter sat `PreCandidate` with no leader contact for minutes: a
+/// heartbeat "sent" every interval, none of them ever actually arriving,
+/// none of them ever failing either.
+///
+/// [`TCP_KEEPALIVE_TIME`]/[`TCP_KEEPALIVE_INTERVAL`]/
+/// [`TCP_KEEPALIVE_RETRIES`] plus, on Linux/Android/Fuchsia/Cygwin (the
+/// only targets `socket2::Socket::set_tcp_user_timeout` supports),
+/// `TCP_USER_TIMEOUT` set to this same bound, are applied to **every**
+/// pooled outbound connection ([`connect_nodelay`]) and every accepted
+/// inbound one ([`spawn_accept`]) — symmetric, and independent of whether
+/// TLS is layered on top (both operate below the TLS record layer, on the
+/// raw `TcpStream`). `TCP_USER_TIMEOUT` is the primary defense: per Linux's
+/// `tcp(7)`, it bounds "the maximum amount of time transmitted data may
+/// remain unacknowledged" *and* — this is the part that matters here —
+/// "when used with the keepalive option, `TCP_USER_TIMEOUT` will override
+/// keepalive to determine when to close the connection due to keepalive
+/// failure," so it also bounds an idle connection's own keepalive-probe
+/// failures, not just outstanding writes. Keepalive is kept alongside it
+/// (not dropped once `TCP_USER_TIMEOUT` is set) for two reasons: it is the
+/// **only** bound available on the handful of platforms without
+/// `TCP_USER_TIMEOUT` (see [`harden_pooled_socket`]'s own doc for exactly
+/// which), and on Linux itself an idle connection with no outstanding
+/// writes needs keepalive's own probes to generate the traffic
+/// `TCP_USER_TIMEOUT` bounds the acknowledgment of in the first place — a
+/// connection that never writes and never probes never triggers either
+/// timer.
+///
+/// **Detection bound**: on Linux, a vanished-with-no-FIN/RST peer surfaces
+/// as a write/keepalive-probe error within this bound (5s) of its last
+/// acknowledged traffic, at which point `send_frame_pooled`'s existing
+/// reconnect-once path (issue #661) re-resolves the peer's address string —
+/// picking up a moved pod's new IP exactly the way a live-but-restarted
+/// peer already does — well within a Raft election timeout. Documented in
+/// ADR 0003's ProdEnv notes and ADR 0060's rollout section (the operator's
+/// own rollout wait budgets, `scripts/e2e-kind.sh`'s `wait_for_progress`
+/// among them, already run to a 600s hard cap / 120s stall window, comfortably
+/// above this). Chosen well under `heartbeat_interval`/`election_base` (so
+/// this never itself looks like an election timeout to a merely-slow-but-
+/// live peer) yet far below the OS's own multi-minute default.
+///
+/// [`TCP_USER_TIMEOUT`]: https://man7.org/linux/man-pages/man7/tcp.7.html
+const POOLED_SOCKET_DEAD_PEER_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long a pooled/accepted connection may sit fully idle before the
+/// first TCP keepalive probe is sent (`TCP_KEEPIDLE` on Linux/most Unix,
+/// `TCP_KEEPALIVE` on macOS/iOS). Combined with
+/// [`TCP_KEEPALIVE_INTERVAL`]/[`TCP_KEEPALIVE_RETRIES`] below, the worst-
+/// case keepalive-only detection time (no `TCP_USER_TIMEOUT` support) is
+/// `TIME + INTERVAL * RETRIES` = 2s + 1s*3 = 5s, matching
+/// [`POOLED_SOCKET_DEAD_PEER_TIMEOUT`] — the two mechanisms are tuned to
+/// the same bound rather than one silently being the stricter one.
+const TCP_KEEPALIVE_TIME: Duration = Duration::from_secs(2);
+
+/// Interval between successive keepalive probes once the idle period above
+/// has elapsed and the first probe goes unanswered (`TCP_KEEPINTVL`).
+const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Number of unanswered keepalive probes before the kernel gives up on the
+/// connection (`TCP_KEEPCNT`).
+const TCP_KEEPALIVE_RETRIES: u32 = 3;
+
+/// Apply [`POOLED_SOCKET_DEAD_PEER_TIMEOUT`]'s keepalive + `TCP_USER_TIMEOUT`
+/// hardening to a just-connected or just-accepted socket (issue #924) —
+/// called from both [`connect_nodelay`] (dial side) and [`spawn_accept`]
+/// (accept side) so a vanished peer is detected symmetrically regardless of
+/// which side of the pooled connection this node was on.
+///
+/// `socket2::SockRef::from(stream)` borrows the live `tokio::net::TcpStream`
+/// by its raw fd — no ownership transfer, no duplication, no interruption
+/// of whatever is already `.await`ing on it — since `tokio::net::TcpStream`
+/// itself exposes no keepalive/user-timeout setters at all.
+///
+/// **Best-effort, never connection-fatal**: a platform or sandbox that
+/// rejects one of these `setsockopt` calls (a restrictive seccomp filter,
+/// an exotic OS) degrades to "no early detection on this one socket" —
+/// logged at `warn` — rather than failing the connect/accept outright. The
+/// pre-#924 behavior (no hardening at all) is a strict subset of every
+/// platform's outcome here, so this can never make a working connection
+/// stop working.
+///
+/// **Platform coverage**: `TcpKeepalive::with_time`/`with_interval` are
+/// supported on every Unix `socket2` targets plus Windows;
+/// `with_retries` and `set_tcp_user_timeout` both additionally need the
+/// `all` Cargo feature (enabled unconditionally on this dependency, see
+/// `Cargo.toml`), and `set_tcp_user_timeout` itself only exists for
+/// Linux/Android/Fuchsia/Cygwin — every other target (macOS/BSD/Windows/
+/// dev sandboxes) falls back to keepalive alone, whose own worst case is
+/// tuned to the identical bound (see [`TCP_KEEPALIVE_TIME`]'s doc) except
+/// that it cannot distinguish "peer vanished" from "peer's kernel alive but
+/// its application never reads" (a live kernel always acks a keepalive
+/// probe, application-read state notwithstanding) — a real but narrower gap
+/// than the one this fixes, tracked rather than closed for those platforms
+/// since v1's actual deployment target (ADR 0060: Kubernetes, Linux nodes)
+/// always has `TCP_USER_TIMEOUT` available.
+fn harden_pooled_socket(stream: &TcpStream, peer_desc: &str) {
+    let sock_ref = socket2::SockRef::from(stream);
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(TCP_KEEPALIVE_TIME)
+        .with_interval(TCP_KEEPALIVE_INTERVAL)
+        .with_retries(TCP_KEEPALIVE_RETRIES);
+    if let Err(err) = sock_ref.set_tcp_keepalive(&keepalive) {
+        tracing::warn!(?err, peer = %peer_desc, "failed to set TCP keepalive (continuing without it)");
+    }
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "fuchsia",
+        target_os = "cygwin"
+    ))]
+    if let Err(err) = sock_ref.set_tcp_user_timeout(Some(POOLED_SOCKET_DEAD_PEER_TIMEOUT)) {
+        tracing::warn!(?err, peer = %peer_desc, "failed to set TCP_USER_TIMEOUT (continuing without it)");
+    }
+}
+
 /// Spawn the accept loop for `listener` — one reader task per inbound connection,
 /// each demuxing length-prefixed frames into a fresh inbox channel. Returns the
 /// inbox receiver and the accept task's abort handle (for `shutdown`).
@@ -729,6 +889,13 @@ const SEND_TIMEOUT: Duration = Duration::from_secs(2);
 /// peer's address and the connection is simply dropped: exactly like a
 /// failed accept, never a panic, and the listener keeps serving every other
 /// (genuine) peer without interruption.
+///
+/// **Keepalive/`TCP_USER_TIMEOUT` (issue #924):** every accepted socket is
+/// hardened via [`harden_pooled_socket`] before any frame is read or (for
+/// TLS) any handshake is attempted — the accept-side twin of what
+/// [`connect_nodelay`] already does on the dial side, so a peer that
+/// silently vanishes is detected the same way regardless of which side of
+/// the connection this node was on.
 fn spawn_accept(
     listener: TcpListener,
     tls: Option<TlsMaterial>,
@@ -738,6 +905,7 @@ fn spawn_accept(
         loop {
             match listener.accept().await {
                 Ok((stream, peer_addr)) => {
+                    harden_pooled_socket(&stream, &peer_addr.to_string());
                     let tx = tx.clone();
                     let tls = tls.clone();
                     tokio::spawn(async move {
@@ -826,6 +994,11 @@ async fn connect_nodelay(addr: &str) -> std::io::Result<TcpStream> {
     // Frames are small (heartbeats, votes) and latency-sensitive; never let
     // Nagle hold one back waiting to coalesce.
     stream.set_nodelay(true)?;
+    // Issue #924: bound how long this pooled connection can survive its
+    // peer vanishing silently (no FIN/RST — a recreated pod's collapsed old
+    // endpoint) before a write/keepalive-probe failure surfaces and lets
+    // `send_frame_pooled`'s reconnect-once path re-resolve `addr` fresh.
+    harden_pooled_socket(&stream, addr);
     Ok(stream)
 }
 
@@ -1871,6 +2044,336 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir_b);
     }
 
+    /// A narrow, `Drop`-cleaned `iptables OUTPUT -d {dest_ip} -j DROP` rule —
+    /// the reproduction's stand-in for "this peer's entire network namespace
+    /// vanished" (ADR 0060 S-07d's real incident).
+    ///
+    /// Three other ways to make a peer unresponsive were considered and
+    /// rejected as unfaithful to what issue #924 actually needs proven
+    /// (**a peer that never acknowledges anything again, with no FIN/RST
+    /// ever sent**), all for the same underlying reason: on a single host/
+    /// kernel, any technique that leaves the peer's own kernel alive still
+    /// gets every send acknowledged (up to buffer capacity) and every
+    /// keepalive probe answered — a live kernel always acks a keepalive
+    /// probe regardless of whether the *application* ever reads, since the
+    /// probe is deliberately crafted within the already-acknowledged
+    /// window. Concretely:
+    /// - Closing the peer's socket (`shutdown`/drop, what
+    ///   `send_reconnects_after_peer_restart` already covers) always emits a
+    ///   FIN or RST — that is the reconnect path the pre-#924 code
+    ///   *already* handles; it does not exercise this bug at all.
+    /// - Accepting a connection and simply never reading it (the socket
+    ///   left open) only ever produces a legitimate flow-control stall
+    ///   (zero window) — TCP still acks every byte it already buffered, and
+    ///   keepalive probes still succeed, so this fix would make no
+    ///   observable difference to that scenario (correctly so: a slow
+    ///   reader is not a dead peer).
+    ///  - Killing the peer's own OS process (even `SIGKILL`) does not avoid
+    ///    a FIN/RST either: the *kernel* — shared with this process on a
+    ///    single-host test — reclaims every fd on process exit and closes
+    ///    the socket as part of that, unconditionally.
+    ///
+    /// An `iptables OUTPUT` `DROP` on the destination IP is the one
+    /// technique that genuinely reproduces "no ack, ever" without any of
+    /// those escape hatches: every packet this host's kernel would send to
+    /// `dest_ip` is discarded before it ever leaves the machine, so nothing
+    /// this sender transmits after the rule is installed is ever
+    /// acknowledged — indistinguishable, from the sender's TCP stack's own
+    /// point of view, from a pod whose entire network namespace (and every
+    /// route to it) was torn down. `try_new` returns `None` (never panics)
+    /// when this sandbox can't support it (no `iptables`, no root/
+    /// `NET_ADMIN`) — see `HostsEntryGuard`'s own doc for why a
+    /// sandbox-dependent real-network test degrades to "skipped" rather
+    /// than failing the suite.
+    struct IptablesDropGuard {
+        dest_ip: String,
+    }
+
+    impl IptablesDropGuard {
+        fn try_new(dest_ip: &str) -> Option<Self> {
+            let status = std::process::Command::new("iptables")
+                .args(["-I", "OUTPUT", "-d", dest_ip, "-j", "DROP"])
+                .status()
+                .ok()?;
+            if status.success() {
+                Some(Self {
+                    dest_ip: dest_ip.to_string(),
+                })
+            } else {
+                None
+            }
+        }
+    }
+
+    impl Drop for IptablesDropGuard {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("iptables")
+                .args(["-D", "OUTPUT", "-d", &self.dest_ip, "-j", "DROP"])
+                .status();
+        }
+    }
+
+    /// A test-only `/etc/hosts` entry, removed by `Drop` even on panic —
+    /// this crate's own copy of `animusd/tests/advertise_host.rs`'s
+    /// `HostsEntryGuard` (per this crate's own doc on the test-PKI helper:
+    /// a small test-only shape like this is duplicated rather than shared
+    /// across a crate boundary). Real DNS (a Kubernetes headless `Service`)
+    /// re-points a stable hostname to wherever its target actually is; a
+    /// sandboxed test has no real DNS server to control, so this is the
+    /// closest honest simulation available, and it exercises exactly the
+    /// production assumption this crate's own `Inner::conns` doc states:
+    /// resolution happens fresh on every dial, never cached, only the
+    /// *connection* is. `try_new` returns `None` (never panics) if
+    /// `/etc/hosts` isn't writable here (a non-root sandbox, a read-only
+    /// mount) — the one test that needs this degrades to "skipped" rather
+    /// than failing the whole suite on an environment it can't assume.
+    struct HostsEntryGuard {
+        hostname: &'static str,
+    }
+
+    impl HostsEntryGuard {
+        fn try_new(hostname: &'static str, ip: &str) -> Option<Self> {
+            let mut contents = std::fs::read_to_string("/etc/hosts").ok()?;
+            if !contents.ends_with('\n') {
+                contents.push('\n');
+            }
+            contents.push_str(&format!("{ip} {hostname}\n"));
+            std::fs::write("/etc/hosts", &contents).ok()?;
+            Some(Self { hostname })
+        }
+
+        /// Re-point this entry to `ip`, simulating a DNS update (a
+        /// recreated pod's stable name now resolving to its new address).
+        fn repoint(&self, ip: &str) {
+            let contents = std::fs::read_to_string("/etc/hosts").expect("read /etc/hosts");
+            let marker = format!(" {}", self.hostname);
+            let mut new_contents: String = contents
+                .lines()
+                .map(|line| {
+                    if line.trim_end().ends_with(&marker) {
+                        format!("{ip} {}", self.hostname)
+                    } else {
+                        line.to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            new_contents.push('\n');
+            std::fs::write("/etc/hosts", new_contents).expect("rewrite /etc/hosts");
+        }
+    }
+
+    impl Drop for HostsEntryGuard {
+        fn drop(&mut self) {
+            if let Ok(contents) = std::fs::read_to_string("/etc/hosts") {
+                let marker = format!(" {}", self.hostname);
+                let mut cleaned: String = contents
+                    .lines()
+                    .filter(|line| !line.trim_end().ends_with(&marker))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !cleaned.is_empty() {
+                    cleaned.push('\n');
+                }
+                let _ = std::fs::write("/etc/hosts", cleaned);
+            }
+        }
+    }
+
+    /// Find a port number free on both `ip_a` and `ip_b` (distinct loopback
+    /// addresses, e.g. `127.0.0.2`/`127.0.0.3`) at the moment of the check —
+    /// bounded, best-effort retries; the tiny remaining TOCTOU window before
+    /// the caller's own real bind is the same "port-TOCTOU lore" every
+    /// rebind-retry loop in this test module already tolerates.
+    fn pick_port_free_on_both(ip_a: &str, ip_b: &str) -> Option<u16> {
+        for _ in 0..50 {
+            let Ok(probe) = std::net::TcpListener::bind((ip_a, 0)) else {
+                continue;
+            };
+            let port = probe.local_addr().expect("local addr").port();
+            drop(probe);
+            if std::net::TcpListener::bind((ip_b, port)).is_ok() {
+                return Some(port);
+            }
+        }
+        None
+    }
+
+    /// Issue #924: a pooled connection whose peer vanishes with **no
+    /// FIN/RST at all** — a Kubernetes pod recreated at a new IP, its old
+    /// network namespace torn down before (or racing) its final FIN — is
+    /// never detected by the pre-#924 code. Every write into it still
+    /// succeeds (the bytes just land in this host's own kernel send
+    /// buffer; nothing about `write()` ever notices the peer is gone), so
+    /// `send_frame_pooled`'s reconnect-once path (issue #661 — already
+    /// proven above, in [`send_reconnects_after_peer_restart`], for a peer
+    /// that *closes*, FIN/RST) never triggers, and the peer's address is
+    /// never re-resolved: exactly "sends that never fail and never reach
+    /// the new endpoint," the evidence this issue was opened with.
+    ///
+    /// **Construction** (see [`IptablesDropGuard`]'s own doc for the
+    /// alternatives this rejects and why): the peer's *registered* address
+    /// is one hostname string (`HOST:PORT`) for the whole test — matching
+    /// production, where the pooled-connection cache is keyed by that
+    /// registered string, not by whatever it resolves to (see `Inner::
+    /// conns`'s own doc), so an address that visibly *changes* in
+    /// `set_peers` would trivially "fix itself" via a plain cache miss and
+    /// prove nothing about this fix. `HOST` resolves first to `peer_a`
+    /// (`127.0.0.2:PORT`, via [`HostsEntryGuard`]); after the connection is
+    /// established and cached, this test installs a narrow `iptables
+    /// OUTPUT -d 127.0.0.2 DROP` ([`IptablesDropGuard`]) — genuinely
+    /// black-holing every packet this sender ever sends there — and
+    /// re-points `HOST` at `peer_b` (`127.0.0.3:PORT`, the *same* port,
+    /// [`pick_port_free_on_both`]), simulating a recreated pod's new IP
+    /// under its old stable DNS name.
+    ///
+    /// Proves both halves: (RED, still true pre-fix) nothing reaches
+    /// `peer_b` within a window well under the fix's own detection bound —
+    /// the stale connection to the now-silent `peer_a` is still what gets
+    /// reused, i.e. no re-dial happened yet; (GREEN, the fix) something
+    /// *does* reach `peer_b` well within a generous recovery budget — the
+    /// vanished-peer detection fired and the reconnect-once path
+    /// re-resolved `HOST` fresh. `peer_b.recv()` succeeding is the "count
+    /// accepts on the new listener" proof this issue asks for: it can only
+    /// happen after a real accept, TCP handshake, and one full frame
+    /// round-trip through this crate's own wire format — strictly stronger
+    /// evidence than a bare accept counter.
+    ///
+    /// Skips (never fails outright) if this sandbox can't support the
+    /// construction: not Linux, `iptables` unusable, `/etc/hosts`
+    /// unwritable, or `127.0.0.2`/`127.0.0.3` unbindable/no mutually-free
+    /// port — see each guard's own doc for why that's the right failure
+    /// mode for a real-network test whose infrastructure this crate cannot
+    /// assume (mirrors `animusd/tests/advertise_host.rs`'s identical
+    /// posture for the same reason).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_reconnects_after_peer_vanishes_without_fin_or_rst() {
+        use crate::Network;
+
+        if !cfg!(target_os = "linux") {
+            eprintln!("skipping: this reproduction needs Linux (iptables + TCP_USER_TIMEOUT)");
+            return;
+        }
+        if std::net::TcpListener::bind("127.0.0.2:0").is_err()
+            || std::net::TcpListener::bind("127.0.0.3:0").is_err()
+        {
+            eprintln!("skipping: 127.0.0.2/127.0.0.3 are not bindable in this sandbox");
+            return;
+        }
+        const HOST: &str = "animus-issue924-vanished-peer.invalid";
+        let Some(hosts_entry) = HostsEntryGuard::try_new(HOST, "127.0.0.2") else {
+            eprintln!("skipping: /etc/hosts is not writable in this sandbox");
+            return;
+        };
+        let Some(port) = pick_port_free_on_both("127.0.0.2", "127.0.0.3") else {
+            eprintln!("skipping: no port free on both 127.0.0.2 and 127.0.0.3");
+            return;
+        };
+
+        let dir_sender = unique_tmp_dir();
+        let dir_peer_a = unique_tmp_dir();
+        let dir_peer_b = unique_tmp_dir();
+
+        let (peer_a, _) = ProdEnv::bind(
+            nid(1),
+            format!("127.0.0.2:{port}").parse().unwrap(),
+            &dir_peer_a,
+        )
+        .await
+        .expect("bind peer_a on 127.0.0.2");
+
+        let loop0 = "127.0.0.1:0".parse::<SocketAddr>().unwrap();
+        let (sender, _) = ProdEnv::bind(nid(0), loop0, &dir_sender)
+            .await
+            .expect("bind sender");
+        sender.set_peers([(nid(1), format!("{HOST}:{port}"))].into_iter().collect());
+
+        // Establish (and cache) the connection with one delivered frame —
+        // proves the peer really was reachable, exactly like the incident's
+        // own "everything was healthy" starting state.
+        sender.send(nid(1), b"before-vanish".to_vec()).await;
+        let env = tokio::time::timeout(Duration::from_secs(10), peer_a.recv())
+            .await
+            .expect("first recv (via peer_a) timed out");
+        assert_eq!(env.payload, b"before-vanish");
+
+        // The peer vanishes: black-holed at the network layer (no socket
+        // anywhere is ever closed) and its stable name re-pointed at the
+        // recreated pod's new address.
+        let Some(_drop_guard) = IptablesDropGuard::try_new("127.0.0.2") else {
+            eprintln!("skipping: iptables is not usable in this sandbox (needs root/NET_ADMIN)");
+            return;
+        };
+        hosts_entry.repoint("127.0.0.3");
+        let (peer_b, _) = ProdEnv::bind(
+            nid(1),
+            format!("127.0.0.3:{port}").parse().unwrap(),
+            &dir_peer_b,
+        )
+        .await
+        .expect("bind peer_b on 127.0.0.3");
+
+        // RED evidence: well under the fix's documented detection bound
+        // (`POOLED_SOCKET_DEAD_PEER_TIMEOUT`), nothing must reach `peer_b`
+        // — the sender is still blindly reusing its cached, now-silently-
+        // dead connection to `peer_a`.
+        let short_deadline = Instant::now() + Duration::from_secs(2);
+        let mut reached_before_bound = false;
+        while Instant::now() < short_deadline {
+            sender.send(nid(1), b"during-vanish".to_vec()).await;
+            if tokio::time::timeout(Duration::from_millis(100), peer_b.recv())
+                .await
+                .is_ok()
+            {
+                reached_before_bound = true;
+                break;
+            }
+        }
+        assert!(
+            !reached_before_bound,
+            "a send reached peer_b before the detection bound elapsed — this \
+             reproduction is not exercising issue #924's silent-vanish path \
+             at all (a real bug here would be a *different*, more suspicious \
+             regression: an immediate, unconditional re-dial on every send)"
+        );
+
+        // GREEN evidence: within a generous recovery budget comfortably
+        // above the documented bound, sends recover and reach `peer_b` —
+        // the vanished-peer detection fired, `send_frame_pooled`'s
+        // reconnect-once path re-resolved `HOST` (now 127.0.0.3), and the
+        // *new* connection is what carries this frame.
+        let recover_deadline = Instant::now() + Duration::from_secs(20);
+        let started = Instant::now();
+        loop {
+            sender.send(nid(1), b"after-vanish".to_vec()).await;
+            match tokio::time::timeout(Duration::from_millis(200), peer_b.recv()).await {
+                Ok(env) => {
+                    assert_eq!(env.from, nid(0));
+                    assert_eq!(env.payload, b"after-vanish");
+                    eprintln!(
+                        "issue #924 repro: recovered {:?} after the silent \
+                         vanish (documented bound: {:?})",
+                        started.elapsed(),
+                        POOLED_SOCKET_DEAD_PEER_TIMEOUT
+                    );
+                    break;
+                }
+                Err(_elapsed) => assert!(
+                    Instant::now() < recover_deadline,
+                    "sends never reached the recreated peer within the \
+                     recovery budget — the silent vanish was never detected"
+                ),
+            }
+        }
+
+        sender.shutdown();
+        peer_a.shutdown();
+        peer_b.shutdown();
+        let _ = std::fs::remove_dir_all(&dir_sender);
+        let _ = std::fs::remove_dir_all(&dir_peer_a);
+        let _ = std::fs::remove_dir_all(&dir_peer_b);
+    }
+
     /// `merge_peer` adds a reachable entry without disturbing any other
     /// existing entry (ADR 0037) — the incremental dual of `set_peers`'s full
     /// replace. Binds three envs: `a` starts with a peer book containing only
@@ -2514,6 +3017,72 @@ mod tests {
         let _ = std::fs::remove_dir_all(&pki_dir);
     }
 
+    /// Issue #913: `POST /admin/control/member/add`'s own dial address is
+    /// now a hostname (`animus-operator`'s `desired::pod_fqdn(name, ns,
+    /// ordinal):internal_port` — the same per-pod stable DNS name every
+    /// other Kubernetes address surface in this codebase already uses),
+    /// never a resolved `status.podIP`. This proves the actual payoff end
+    /// to end: a real loopback TLS handshake dialed by exactly that
+    /// hostname shape succeeds when the peer's certificate SAN covers it —
+    /// through the same `TlsMaterial::acceptor`/`connector` and
+    /// `server_name_for` derivation `spawn_accept`/`connect_maybe_tls` use
+    /// in production, not a unit-level `server_name_for` parse check alone.
+    /// Before this fix, `AddControlMemberReq.addr` being typed `SocketAddr`
+    /// forced the caller to resolve and dial the pod's numeric IP instead,
+    /// which a certificate carrying only DNS SANs (this one included) can
+    /// never satisfy — `ServerName::IpAddress` against a cert with no IP
+    /// SAN fails the handshake outright, exactly the `AlertReceived(
+    /// BadCertificate)` this issue's own investigation traced back to this
+    /// dial address.
+    #[tokio::test]
+    async fn tls_dial_by_member_add_style_pod_hostname_succeeds() {
+        // The exact shape `desired::pod_fqdn` produces for ordinal 3 of a
+        // cluster named "e2e" in namespace "animus-e2e" — literal, not a
+        // wildcard: this PR's own fix is the address becoming a hostname
+        // at all, independent of the separate wildcard-SAN fix that makes
+        // the *certificate* stable across a scale-up.
+        let pod_hostname = "e2e-3.e2e-internal.animus-e2e.svc.cluster.local";
+        let pki_dir = unique_tmp_dir();
+        let (_ca_path, mut configs) = write_test_pki(&pki_dir, &[pod_hostname, "127.0.0.1"]);
+        let cfg_client = configs.pop().expect("client tls config");
+        let cfg_server = configs.remove(0);
+        let server_material = cfg_server.load().expect("load server tls material");
+        let client_material = cfg_client.load().expect("load client tls material");
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+
+        let accept_task = tokio::spawn(async move {
+            let (stream, _peer) = listener.accept().await.expect("accept");
+            server_material
+                .acceptor
+                .accept(stream)
+                .await
+                .expect("server-side handshake must succeed for the pod's own hostname SAN")
+        });
+
+        let stream = TcpStream::connect(addr).await.expect("connect");
+        // `member/add`'s own `addr` field, dialed exactly as `add_control_
+        // voter` constructs it (`{pod_fqdn}:{internal_port}`) and exactly
+        // as `connect_maybe_tls` derives a `ServerName` from any dial
+        // address.
+        let server_name = server_name_for(&format!("{pod_hostname}:14000"))
+            .expect("derive server name from the member-add-style hostname:port");
+        client_material
+            .connector
+            .connect(server_name, stream)
+            .await
+            .expect(
+                "client-side hostname verification must accept the pod's own \
+                 member-add-style hostname",
+            );
+
+        accept_task.await.expect("accept task panicked");
+        let _ = std::fs::remove_dir_all(&pki_dir);
+    }
+
     /// [`TlsMaterial::server_acceptor`] (ADR 0064 commit 2) accepts a TLS
     /// client that presents **no** client certificate at all — unlike
     /// [`TlsMaterial::acceptor`] (mutual, exercised by every test above,
@@ -2584,6 +3153,74 @@ mod tests {
             .await
             .expect("write hello");
         tls_stream.flush().await.expect("flush");
+
+        accept_task.await.expect("accept task panicked");
+        let _ = std::fs::remove_dir_all(&pki_dir);
+    }
+
+    /// A wildcard SAN (`*.<label>.<label>...`, the shape `animus-operator`'s
+    /// `desired::certificate::dns_names` issues since issue #913 to cover
+    /// every pod ordinal of a headless `Service` without depending on node
+    /// count) is honored by this crate's own real handshake path — proven
+    /// against the exact hostname a Kubernetes headless `Service` gives a
+    /// pod (`desired::pod_fqdn`'s own shape: `{cluster}-{ordinal}.
+    /// {internal-svc}.{ns}.svc.cluster.local`), not merely asserted. This is
+    /// deliberately a full loopback handshake through [`TlsMaterial::
+    /// acceptor`]/[`TlsMaterial::connector`] (the identical code
+    /// `spawn_accept`/`connect_maybe_tls` use), with the client's
+    /// `ServerName` derived from [`server_name_for`] exactly the way a real
+    /// peer-book dial derives it — the one detail a unit test against
+    /// `rustls-webpki` directly could get subtly wrong by not exercising
+    /// this crate's own derivation. issue #913's investigation needed this
+    /// pinned decisively rather than assumed from RFC 6125 wildcard rules
+    /// in the abstract.
+    #[tokio::test]
+    async fn tls_wildcard_san_matches_a_per_ordinal_pod_hostname() {
+        // The server's leaf SAN is a single-label wildcard scoped to one
+        // headless Service's own DNS zone — `desired::certificate::
+        // dns_names`'s own shape (`*.<internal-svc>.<ns>.svc.cluster.local`)
+        // — and the client dials a concrete per-ordinal hostname under that
+        // same zone (`desired::pod_fqdn`'s own shape), never the wildcard
+        // pattern itself.
+        let pki_dir = unique_tmp_dir();
+        let (_ca_path, mut configs) = write_test_pki(
+            &pki_dir,
+            &["*.e2e-internal.animus-e2e.svc.cluster.local", "127.0.0.1"],
+        );
+        let cfg_client = configs.pop().expect("client tls config");
+        let cfg_server = configs.remove(0);
+        let server_material = cfg_server.load().expect("load server tls material");
+        let client_material = cfg_client.load().expect("load client tls material");
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+
+        let accept_task = tokio::spawn(async move {
+            let (stream, _peer) = listener.accept().await.expect("accept");
+            server_material
+                .acceptor
+                .accept(stream)
+                .await
+                .expect("server-side handshake must succeed under a matching wildcard SAN")
+        });
+
+        let stream = TcpStream::connect(addr).await.expect("connect");
+        // The exact hostname a peer book entry carries for pod ordinal 3
+        // (`desired::pod_fqdn("e2e", "animus-e2e", 3)`) — one label deeper
+        // than the wildcard's own `*.` position, and never itself in the
+        // certificate's SAN list.
+        let server_name = server_name_for("e2e-3.e2e-internal.animus-e2e.svc.cluster.local:14000")
+            .expect("derive server name from the pod's own hostname");
+        client_material
+            .connector
+            .connect(server_name, stream)
+            .await
+            .expect(
+                "client-side hostname verification must accept the per-ordinal \
+                 hostname against the wildcard SAN",
+            );
 
         accept_task.await.expect("accept task panicked");
         let _ = std::fs::remove_dir_all(&pki_dir);

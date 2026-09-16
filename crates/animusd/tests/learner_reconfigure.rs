@@ -13,6 +13,21 @@
 //! **keeps serving writes** while a newcomer is mid-catch-up as a learner —
 //! the structural property this rung exists for, over real TCP/time rather
 //! than `SimEnv`.
+//!
+//! **Issue #944**: observing the learner phase used to mean polling
+//! `/admin/raftkv` every 100ms and recording whether the spare was ever
+//! sampled in `learners` before `voters`. Add-learner-then-promote has no
+//! minimum dwell between the two steps, so a fast enough pair of
+//! consecutive reconciler ticks can land both inside a single 100ms polling
+//! gap on every replica — the same class of bug as `docs/engineering-
+//! lessons.md`'s `voter_history` incident (issue #596), just for the
+//! learner set instead of the voter count. The fix is the same one that
+//! incident used: `RaftKvNode::membership_history()` (`admin::CpRaftView`'s
+//! `membership_history` field) records the joint `(voters, learners)` pair
+//! once per consensus-loop iteration, durably, for the group's whole
+//! uptime — a poll only ever has to catch the CONVERGED end state (which it
+//! cannot miss), and the transient-phase assertion below reads the durable
+//! history instead of a live sample.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -82,6 +97,38 @@ async fn group_view(admin_addr: SocketAddr) -> Option<(bool, Vec<NodeId>, Vec<No
         .filter_map(|x| x.as_str()?.parse::<NodeId>().ok())
         .collect();
     Some((g["is_leader"].as_bool().unwrap_or(false), voters, learners))
+}
+
+/// This node's own recorded `RaftKvNode::membership_history()` for the
+/// bootstrap tablet, as `(voters, learners)` pairs in adoption order — the
+/// `/admin/raftkv` `membership_history` field (ADR 0058 Train 1's
+/// reconciler adoption, issue #944). Unlike `group_view`'s live sample,
+/// this is a durable record the node has kept for its whole uptime (once
+/// per consensus-loop iteration), so it cannot miss a transient the poll
+/// loop below happens to land between — see this test's own module doc
+/// note on why the old poll-only version of this test was flaky.
+async fn membership_history_of(admin_addr: SocketAddr) -> Option<Vec<(Vec<NodeId>, Vec<NodeId>)>> {
+    let (_s, v) = admin_get(admin_addr, "/admin/raftkv").await;
+    let g = v["groups"].as_array()?.iter().find(|g| g["tablet"] == 1)?;
+    let entries = g["membership_history"].as_array()?;
+    let mut out = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let pair = entry.as_array()?;
+        let voters: Vec<NodeId> = pair
+            .first()?
+            .as_array()?
+            .iter()
+            .filter_map(|x| x.as_str()?.parse::<NodeId>().ok())
+            .collect();
+        let learners: Vec<NodeId> = pair
+            .get(1)?
+            .as_array()?
+            .iter()
+            .filter_map(|x| x.as_str()?.parse::<NodeId>().ok())
+            .collect();
+        out.push((voters, learners));
+    }
+    Some(out)
 }
 
 /// Bring up `n` nodes one-process-per-node, retrying the (alloc fresh ports +
@@ -254,25 +301,17 @@ async fn spare_replacement_passes_through_an_observable_learner_state_and_keeps_
         })
     };
 
-    // Observe the spare pass through a real learner state: it must appear in
-    // SOME survivor's `learners` list before it ever appears in `voters`.
-    let mut saw_spare_as_learner = false;
-    let mut saw_spare_as_voter_before_learner = false;
+    // Converged-or-timeout poll (never itself the proof of the transient
+    // learner phase — see below): wait until the spare is a voter and the
+    // killed replica is gone from SOME survivor's own view.
     let cascade = async {
         loop {
             for &i in &survivors {
-                if let Some((_, voters, learners)) = group_view(config.nodes[i].admin).await {
-                    if learners.contains(&spare) {
-                        saw_spare_as_learner = true;
-                    }
-                    if voters.contains(&spare) && !learners.contains(&spare) {
-                        if !saw_spare_as_learner {
-                            saw_spare_as_voter_before_learner = true;
-                        }
-                        if !voters.contains(&killed_id) {
-                            return;
-                        }
-                    }
+                if let Some((_, voters, _)) = group_view(config.nodes[i].admin).await
+                    && voters.contains(&spare)
+                    && !voters.contains(&killed_id)
+                {
+                    return;
                 }
             }
             sleep(Duration::from_millis(100)).await;
@@ -285,16 +324,41 @@ async fn spare_replacement_passes_through_an_observable_learner_state_and_keeps_
     writer_done.store(true, std::sync::atomic::Ordering::Relaxed);
     writer.await.expect("writer task panicked");
 
+    // Issue #944: the spare must have passed through a real, admin-visible
+    // learner state — a real instance of ADR 0058 Train 1's add-learner
+    // phase, not just the eventual converged state. Proved from each
+    // survivor's own durable `membership_history()` (recorded once per
+    // consensus-loop iteration, so it cannot miss the transient the way an
+    // external poll on a fixed interval can), never from a live sample.
+    let mut saw_spare_as_learner = false;
+    let mut saw_spare_as_voter_before_learner = false;
+    for &i in &survivors {
+        let Some(history) = membership_history_of(config.nodes[i].admin).await else {
+            continue;
+        };
+        let mut saw_learner_on_this_node = false;
+        for (voters, learners) in &history {
+            if learners.contains(&spare) {
+                saw_learner_on_this_node = true;
+                saw_spare_as_learner = true;
+            }
+            if voters.contains(&spare) && !saw_learner_on_this_node {
+                saw_spare_as_voter_before_learner = true;
+            }
+        }
+    }
+
     assert!(
         saw_spare_as_learner,
-        "the spare must have been observed in some replica's `learners` set before joining \
-         `voters` — a real, admin-visible instance of ADR 0058 Train 1's add-learner phase, \
-         not just the eventual converged state"
+        "the spare must have been recorded in some replica's `membership_history` `learners` \
+         set before joining `voters` — a real, admin-visible instance of ADR 0058 Train 1's \
+         add-learner phase, not just the eventual converged state"
     );
     assert!(
         !saw_spare_as_voter_before_learner,
-        "the spare must never be observed as a voter without ALSO having been observed as a \
-         learner first — a direct voter add would defeat the whole point of this rung"
+        "the spare must never be recorded as a voter without ALSO having been recorded as a \
+         learner first, on the SAME replica's own `membership_history` — a direct voter add \
+         would defeat the whole point of this rung"
     );
     assert!(
         writes_committed.load(std::sync::atomic::Ordering::Relaxed) > 0,

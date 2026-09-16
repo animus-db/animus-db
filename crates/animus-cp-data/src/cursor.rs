@@ -18,7 +18,7 @@
 //! "everything at or below this ts is done" is therefore a complete,
 //! unambiguous cursor — there is no reordering within one tablet's own
 //! applied sequence a positional/key cursor would need to account for
-//! (contrast `pending_changes`' own note that change-log **key** order is
+//! (contrast `pending_changes_key_order`' own note that change-log **key** order is
 //! *token-then-pk-then-HLC*, not global commit order, which is exactly what
 //! rules a positional cursor out and a timestamp one in).
 //!

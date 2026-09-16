@@ -39,7 +39,7 @@ fn headers(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
 fn assert_vector(
     method: &str,
     uri: &str,
-    query: &str,
+    query_pairs: &[(&str, &str)],
     header_pairs: &[(&str, &str)],
     signed_headers: &[&str],
     payload_hash: &str,
@@ -48,7 +48,14 @@ fn assert_vector(
     expected_authz: &str,
 ) {
     let hmap = headers(header_pairs);
-    let creq = canonical_request(method, uri, query, &hmap, signed_headers, payload_hash);
+    let creq = canonical_request(
+        method,
+        uri,
+        query_pairs,
+        &hmap,
+        signed_headers,
+        payload_hash,
+    );
     assert_eq!(creq, expected_creq, "canonical request mismatch");
 
     let sts = string_to_sign(AMZ_DATE, CREDENTIAL_SCOPE, &creq);
@@ -71,7 +78,7 @@ fn get_vanilla() {
     assert_vector(
         "GET",
         "/",
-        "",
+        &[],
         &[("host", "example.amazonaws.com"), ("x-amz-date", AMZ_DATE)],
         &["host", "x-amz-date"],
         EMPTY_BODY_SHA256,
@@ -88,11 +95,13 @@ fn get_vanilla() {
 #[test]
 fn get_vanilla_query_order_key_case() {
     // The suite's raw request line carries `Param2=value2&Param1=value1`;
-    // `canonical_request` re-sorts by encoded key internally.
+    // `canonical_request` re-sorts by encoded key internally. Passed here
+    // as pairs directly (never as a joined `"k=v&k=v"` string reparsed by
+    // splitting — see `canonical_query_string`'s own doc, issue #855).
     assert_vector(
         "GET",
         "/",
-        "Param2=value2&Param1=value1",
+        &[("Param2", "value2"), ("Param1", "value1")],
         &[("host", "example.amazonaws.com"), ("x-amz-date", AMZ_DATE)],
         &["host", "x-amz-date"],
         EMPTY_BODY_SHA256,
@@ -116,7 +125,7 @@ fn post_x_www_form_urlencoded() {
     assert_vector(
         "POST",
         "/",
-        "",
+        &[],
         &[
             ("content-type", "application/x-www-form-urlencoded"),
             ("host", "example.amazonaws.com"),
@@ -154,7 +163,7 @@ fn unsigned_payload_case() {
     let creq = canonical_request(
         "PUT",
         "/test.txt",
-        "",
+        &[],
         &hmap,
         &signed_headers,
         "UNSIGNED-PAYLOAD",

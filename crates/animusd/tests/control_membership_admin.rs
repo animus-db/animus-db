@@ -96,7 +96,21 @@ async fn add_control_member_raw(
     node: &str,
     addr: SocketAddr,
 ) -> (u16, serde_json::Value) {
-    let body = serde_json::json!({"node": node, "addr": addr.to_string()}).to_string();
+    add_control_member_addr_str(admin_addr, node, &addr.to_string()).await
+}
+
+/// The raw-string-`addr` form (issue #662): `addr` need not parse as a
+/// literal [`SocketAddr`] at all — a hostname works exactly as well, since
+/// `AddControlMemberReq.addr` is `String`-typed, resolved lazily at dial
+/// time the same way every other `host:port` address surface in this
+/// codebase is (`RoleAddrs::advertise_host`, `--seed`, `ProdEnv::
+/// merge_peer`).
+async fn add_control_member_addr_str(
+    admin_addr: SocketAddr,
+    node: &str,
+    addr: &str,
+) -> (u16, serde_json::Value) {
+    let body = serde_json::json!({"node": node, "addr": addr}).to_string();
     admin(admin_addr, "POST", "/admin/control/member/add", Some(&body)).await
 }
 
@@ -448,6 +462,85 @@ async fn runtime_added_voter_survives_leadership_change_to_a_different_original_
     timeout(Duration::from_secs(15), replicated_to_grown)
         .await
         .expect("the runtime-added voter never saw the new leader's proposal replicate");
+
+    grown.shutdown_graceful().await;
+    for node in nodes {
+        node.shutdown_graceful().await;
+    }
+}
+
+/// **Issue #662 regression, real-socket for the same reason the test above
+/// is**: `POST /admin/control/member/add`'s `addr` used to be typed
+/// `std::net::SocketAddr` server-side, so it could only ever deserialize a
+/// literal `ip:port` — never a DNS name, the address shape every other
+/// Kubernetes-facing surface (`RoleAddrs::advertise_host`, `--seed`,
+/// `ProdEnv::merge_peer`) already accepted. This proves the fix end to end,
+/// not just that the JSON deserializes: `localhost:<port>` — a real hostname
+/// resolving to `127.0.0.1`, never a literal address, mirroring `tests/
+/// seed_join_hostname.rs`'s own approach — is handed to `member/add` as the
+/// new voter's dial address, and the new voter's OWN admin port (reachable
+/// only once the leader has actually dialed it through that hostname and
+/// replicated the membership change) is polled until it reports itself a
+/// voter. `SimEnv` cannot exercise this: `ProdEnv::merge_peer`'s real DNS
+/// resolution (`TcpStream::connect`'s own `ToSocketAddrs` impl for `&str`)
+/// is a no-op on the `Env` trait's default, only ever overridden by
+/// `ProdEnv`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 10)]
+async fn control_member_add_accepts_a_hostname_dial_address() {
+    let dir = support::panic_safe_tempdir();
+    let (nodes, config) = bring_up_combined(3, dir.path()).await;
+    await_bootstrap(&nodes).await;
+    let admin_addrs: Vec<SocketAddr> = config.nodes.iter().map(|n| n.admin).collect();
+    let adder = leader_index(&nodes);
+
+    let new_id = 3u64;
+    let (grown, grown_addrs) = join_control_nonvoter(&config, new_id, dir.path()).await;
+    let hostname_addr = format!("localhost:{}", grown_addrs.internal.port());
+
+    // Wait for `grown`'s own self-registration to land on the real cluster
+    // before adding it — see `runtime_added_voter_survives_leadership_
+    // change_to_a_different_original_voter`'s own doc for why a too-hasty
+    // add can otherwise race a stale retry back over the address this call
+    // is about to write.
+    let self_registered_on_cluster = async {
+        loop {
+            if nodes[adder]
+                .metadata()
+                .node_addrs
+                .contains_key(&nid(new_id))
+            {
+                return;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    };
+    timeout(Duration::from_secs(15), self_registered_on_cluster)
+        .await
+        .expect("grown node's own self-registration never landed on the real cluster");
+    sleep(Duration::from_secs(11)).await;
+
+    let (status, body) =
+        add_control_member_addr_str(admin_addrs[adder], &nid(new_id).to_string(), &hostname_addr)
+            .await;
+    assert_eq!(
+        status, 200,
+        "control/member/add with a hostname addr should succeed: {body}"
+    );
+
+    let grown_admin = grown.admin_addr();
+    let converged = async {
+        loop {
+            let (status, body) = control_members(grown_admin).await;
+            if status == 200 && voters_of(&body) == Some(vec![nid(0), nid(1), nid(2), nid(3)]) {
+                return;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    };
+    timeout(Duration::from_secs(30), converged).await.expect(
+        "the hostname-added voter never converged — the leader never actually dialed \
+         it through the hostname",
+    );
 
     grown.shutdown_graceful().await;
     for node in nodes {

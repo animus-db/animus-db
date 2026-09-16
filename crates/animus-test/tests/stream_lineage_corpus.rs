@@ -11,7 +11,7 @@
 //! lower-layer primitives — see `txn_serializable.rs`'s coordinator for the
 //! precedent). This file follows the identical discipline: it reimplements
 //! the **sealer** (`seal_now`, mirroring `index_drain::seal_now`'s exact
-//! sequence: scan `pending_changes()` past the effective watermark, sort by
+//! sequence: scan `pending_changes_key_order()` past the effective watermark, sort by
 //! the HLC key suffix, encode a segment, `SegmentStore::put`, then propose
 //! `MetaCommand::SealStreamShard`) and a **model consumer**
 //! (`collect_tablet_records`/`verify_lineage`, mirroring
@@ -338,14 +338,14 @@ fn seal_now(
     let watermark = meta.stream_shard_watermark(group.id).unwrap_or(0);
     // Split-seal range-fence amendment (ADR 0043 §A3/§A4/§A6, 2026-08-15):
     // mirrors `index_drain::seal_now`'s own fence exactly, same reason —
-    // `pending_changes()` is bounded only by this group's *physical* scope,
+    // `pending_changes_key_order()` is bounded only by this group's *physical* scope,
     // which a caller (a scripted scenario here; the reconciler in
     // production) can leave wider than `meta`'s own declared range for a
     // while after a split. A record outside that declared range already
     // belongs to a sibling tablet and must be left for its own seal.
     let declared_range = meta.tablets.get(&group.id).map(|t| t.range.clone());
     let mut filtered: Vec<(Vec<u8>, u64, u32, Vec<u8>)> =
-        block_on(group.nodes[leader].pending_changes())
+        block_on(group.nodes[leader].pending_changes_key_order())
             .into_iter()
             .filter_map(|(k, v)| {
                 let (hlc, ordinal) = record_seqno_suffix(&k)?;
@@ -460,7 +460,7 @@ fn collect_tablet_records(
     }
     let watermark = meta.stream_shard_watermark(group.id).unwrap_or(0);
     let mut hot: Vec<(Vec<u8>, u64, u32, Vec<u8>)> =
-        block_on(group.nodes[leader].pending_changes())
+        block_on(group.nodes[leader].pending_changes_key_order())
             .into_iter()
             .filter_map(|(k, v)| {
                 let (hlc, ordinal) = record_seqno_suffix(&k)?;
@@ -743,7 +743,7 @@ fn scenario_store_outage_then_heal(seed: u64) {
         "[seed={seed}] no catalog row may exist while the store never acked a put"
     );
     // Every write is still recoverable straight from the hot log.
-    let hot = block_on(group.nodes[leader].pending_changes());
+    let hot = block_on(group.nodes[leader].pending_changes_key_order());
     assert_eq!(
         hot.len(),
         4,
@@ -795,7 +795,7 @@ fn scenario_disable_grace_drain(seed: u64) {
     let sealed = seal_now(&mut meta, &store, &group, leader, 1_000, false);
     assert_eq!(sealed, Some(0), "[seed={seed}] the final seal must commit");
     assert!(
-        block_on(group.nodes[leader].pending_changes())
+        block_on(group.nodes[leader].pending_changes_key_order())
             .into_iter()
             .filter_map(|(k, _)| record_hlc_suffix(&k))
             .all(|hlc| hlc <= meta.stream_shard_watermark(group.id).unwrap_or(0)),
@@ -1102,7 +1102,7 @@ fn scenario_dueling_seals_orphan_hot_range(seed: u64) {
     // (real, K-way replicated, hence slow) `put_sealed` call.
     let watermark_slow = meta.stream_shard_watermark(group.id).unwrap_or(0);
     let mut slow_records: Vec<(Vec<u8>, u64, u32, Vec<u8>)> =
-        block_on(group.nodes[slow_leader].pending_changes())
+        block_on(group.nodes[slow_leader].pending_changes_key_order())
             .into_iter()
             .filter_map(|(k, v)| {
                 let (hlc, ordinal) = record_seqno_suffix(&k)?;
@@ -2069,11 +2069,11 @@ fn scenario_inplace_split_lineage_frozen_at_fork(seed: u64) {
     let ll = elect(&mut sim, &left, &live, seed);
     let rl = elect(&mut sim, &right, &live, seed);
     assert!(
-        block_on(left.nodes[ll].pending_changes()).is_empty(),
+        block_on(left.nodes[ll].pending_changes_key_order()).is_empty(),
         "[seed={seed}] the LEFT child must be born with an EMPTY change log"
     );
     assert!(
-        block_on(right.nodes[rl].pending_changes()).is_empty(),
+        block_on(right.nodes[rl].pending_changes_key_order()).is_empty(),
         "[seed={seed}] the RIGHT child must be born with an EMPTY change log"
     );
 
@@ -2391,7 +2391,7 @@ fn get_records_page(
     } else {
         // OPEN shard: mirrors `index_drain::hot_read` exactly.
         let mut records: Vec<(Vec<u8>, u64, u32, Vec<u8>)> =
-            block_on(group.nodes[leader].pending_changes())
+            block_on(group.nodes[leader].pending_changes_key_order())
                 .into_iter()
                 .filter_map(|(k, v)| {
                     let (hlc, ordinal) = record_seqno_suffix(&k)?;
@@ -2478,7 +2478,7 @@ fn scenario_tied_multi_key_commit_paginates_without_loss(seed: u64) {
     // Leadership and apply-catchup are not the same event (see this
     // corpus's own `pitr_fault_corpus.rs`-style harness lesson): the
     // freshly-elected leader must have actually replayed the tied entry
-    // before its own `pending_changes()` reflects it.
+    // before its own `pending_changes_key_order()` reflects it.
     confirm(&mut sim, &group, leader, index, seed);
 
     // Paginate the OPEN tail with `Limit=1` — a page boundary lands inside
@@ -2537,7 +2537,7 @@ fn scenario_tied_multi_key_commit_paginates_without_loss(seed: u64) {
 
     // `TRIM_HORIZON` on an OPEN shard starts from the tablet's own current
     // watermark (`GetShardIterator`'s real rule), never a bare `(0, 0)` —
-    // `pending_changes()` still physically holds `items_a`'s own
+    // `pending_changes_key_order()` still physically holds `items_a`'s own
     // already-sealed rows (trimming them is the janitor's separate,
     // unrelated job). And the floor's own ordinal must be `u32::MAX`, not
     // `0` — a second issue #852 finding this very cell surfaced: if the

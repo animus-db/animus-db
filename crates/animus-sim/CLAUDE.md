@@ -257,6 +257,30 @@ function of one seed. This is the substrate every distributed test runs on.
   rest of the run — no panic, no error, just a replica that never sends or
   receives again (see `docs/engineering-lessons.md`'s entry on this, found
   writing `animus-cp-data/tests/quiescence.rs`'s fault-primitives cells).
+- **`stop(node)` also discards any `Deliver` already scheduled for `node` on
+  the shared timeline (issue #836)**: a real process exit drops its open TCP
+  connections, so a message sent before the exit but still in flight must
+  never surface later. Before this, `stop` cleaned up the node's tasks/inbox/
+  un-synced-disk but never touched `st.timeline` — a `Deliver` already
+  scheduled for a future `deliver_at` survived, and `fire_event` (finding the
+  target neither `crashed` nor partitioned, since `stop` sets neither) pushed
+  it straight into whichever inbox existed under that node id when the
+  deadline arrived — including a **fresh incarnation's** inbox, since
+  `Simulator::env` only does `.entry(..).or_default()`. This made `stop`
+  strictly more forgiving than a real process boundary, and weakened every
+  test using the `StopRestart` nemesis (`crash`+`stop`+reconstruct, modelling
+  cold WAL recovery) whenever a message happened to be in flight at the stop
+  instant. The fix: `stop` takes a one-time snapshot of the timeline at the
+  moment it's called and removes every `Deliver` addressed to `node`,
+  tracing each as a `TraceEvent::Drop { reason: "stopped", .. }`. This is
+  **not** a standing mute like `crashed` — nothing persists that would need
+  clearing on the next `env(node)`/`restart`, so a message a *fresh*
+  incarnation sends or receives after `stop` (its own later `send_stream`
+  call, inserting a brand-new timeline entry) is entirely unaffected.
+  Regression: `tests/stop_semantics.rs::stop_drops_a_message_already_in_
+  flight_to_it` (and its sibling
+  `stop_does_not_mute_a_fresh_incarnation`, proving the fix doesn't
+  overcorrect into a standing mute).
 - Determinism invariants to preserve when editing: only `BTreeMap`/`BTreeSet`,
   RNG drawn only in deterministic order, no wall clock. Disk ops add no timeline
   events and — under the **default** `DiskConfig` — draw no RNG, so they don't
@@ -295,17 +319,96 @@ function of one seed. This is the substrate every distributed test runs on.
   run) at the exact moment `pause` was called: the executor still polls it
   synchronously (pause never blocks *execution*, only future timer/delivery
   *events*), but whatever it sends is held back regardless.
+- **`Sleep` has a `Drop` impl (issue #837)**, so a sleep dropped before its
+  deadline — the losing branch of a `select!`, which production code does
+  everywhere (`animusd/src/write_path.rs`, `schema.rs`, `txn_coordinator.rs`,
+  `sim_cluster.rs`, `animus-cp-data/src/host.rs`) — no longer leaves a
+  phantom `Event::Timer` on the timeline (previously: no `Drop` impl at all,
+  so `fire_event` still popped and "fired" it at its stale deadline,
+  burning a step, advancing virtual time, waking a task at the wrong await
+  point, and inflating `SimStats`). Removal is keyed on the `TimerId`, via a
+  new `timer_key: BTreeMap<TimerId, (u64, Seq)>` tracking each still-armed
+  timer's **current** timeline key — not a `(deadline, seq)` pair frozen at
+  schedule time — because `pause`'s defer mechanism (above) can move a
+  timer's live key to a fresh `(until, seq)` one or more times before it
+  fires; `timer_key` is kept in sync at every defer, so `Drop` finds the
+  right entry even then. `fire_event`'s own non-deferred fire path also
+  removes the `timer_key` entry (nothing left to clean up once a timer has
+  genuinely fired). Tests: `tests/sleep_drop.rs::
+  dropped_sleep_leaves_no_phantom_timer_in_the_timeline` races a sleep
+  against an already-ready future and asserts the whole scenario resolves
+  in the initial synchronous drain — `run_until_quiescent(0) == true` and
+  `stats().timer_fires` unchanged — which is unreachable pre-fix.
+  **Load-bearing lock-discipline consequence**: `stop`/`shutdown` remove a
+  node's/every task's futures from `SimState.tasks`, and a task parked on
+  `env.sleep(..)` embeds a live `Sleep` — dropping it now runs `Sleep`'s
+  `Drop`, which re-locks the same state mutex. Both `stop` and `shutdown`
+  used to drop the removed futures **while still holding that lock**
+  (`stop`'s `st.tasks.remove(&task)` inside its function-scoped `let mut st
+  = self.shared.lock();`; `shutdown`'s `st.tasks.clear()`), which is a
+  guaranteed self-deadlock the instant one of them held a live timer —
+  confirmed by temporarily reverting to the naive form and watching the
+  process hang under a `timeout` guard. Both now **defer** the drop: they
+  move the removed futures out (`stop` collects them into a
+  `Vec<BoxFuture>` declared *before* `st` so it drops after, per Rust's
+  reverse-declaration-order rule, reinforced by an explicit `drop(st)`;
+  `shutdown` uses `std::mem::take(&mut st.tasks)` then an explicit
+  `drop(st); drop(removed);`), so the futures — and any `Sleep` inside them
+  — are only actually dropped after the lock is released. `poll_task`
+  itself needed no change: it already checks a task's future *out* of
+  `tasks` before polling (the existing "so the poll can re-enter the state
+  lock... without deadlocking" comment), so by the time its `Poll::Ready`
+  arm calls `tasks.remove(&task)`, that slot already holds `None` — nothing
+  to drop there. Tests: `tests/sleep_drop.rs::
+  stopping_a_node_parked_on_sleep_does_not_deadlock` and `::
+  shutdown_with_a_live_sleep_does_not_deadlock` (proof-by-completion: the
+  test hanging forever, not a normal assertion failure, is what a
+  regression here looks like).
 - **Multiplexed `(node, stream)` addressing (ADR 0026).** The inbox/waker maps
   are keyed `(NodeId, u64)` instead of `NodeId`, so a node can be addressed on
-  more than one stream; `crash`/`stop` now node-prefix-scan both maps (the same
-  pattern `Disk::list`'s node-prefix scan already used) to clear *every* stream
-  of a crashed/stopped node, not just its primary one. `Simulator::env` still
-  only pre-registers `PRIMARY_STREAM`'s inbox entry — any other stream is
-  created lazily on first send/recv. No new RNG draw or timeline event shape,
-  so the determinism argument (trace = pure function of the seed) is unchanged;
-  `tests/determinism.rs::multiplexed_streams_are_isolated_and_deterministic`
-  proves it directly (two streams to one node don't cross-talk, and the run —
-  trace included — reproduces byte-for-byte from the seed).
+  more than one stream; `crash`/`stop` clear *every* stream of a
+  crashed/stopped node, not just its primary one, by scanning both maps for
+  the target node's own entries (see `node_prefix_keys` below for how, as of
+  issue #841). `Simulator::env` still only pre-registers `PRIMARY_STREAM`'s
+  inbox entry — any other stream is created lazily on first send/recv. No new
+  RNG draw or timeline event shape, so the determinism argument (trace = pure
+  function of the seed) is unchanged; `tests/determinism.rs::
+  multiplexed_streams_are_isolated_and_deterministic` proves it directly (two
+  streams to one node don't cross-talk, and the run — trace included —
+  reproduces byte-for-byte from the seed).
+
+- **`SimState::node_prefix_keys` (issue #841) is the one place the
+  `disks`/`inboxes`/`recv_wakers` node-prefix scans live**, replacing seven
+  call sites (`wipe_disk` ×1, `crash` ×3, `stop` ×3) that used to be a full
+  `.keys().filter(|(n, _)| *n == node)` pass over *every* node's entries —
+  paid repeatedly by every fault-injecting corpus (`crash`/`stop`/`restart`
+  at every `ANIMUS_*_SEEDS` depth) and, under ADR 0050's per-tablet private
+  engine, `disks` in particular can hold a large multi-node, multi-tablet
+  entry count. `disks: BTreeMap<(NodeId, String), _>` and
+  `inboxes`/`recv_wakers: BTreeMap<(NodeId, u64), _>` are both lexicographic
+  on `NodeId` first, so all of one node's entries sit contiguously; the
+  helper is `map.range((node.clone(), K::default())..).take_while(|((n,
+  _), _)| n == node)`, generic over the trailing key type `K: Ord + Clone +
+  Default` — `u64::default() == u64::MIN` and `String::default() == ""` are
+  each type's own `Ord` minimum, so one shape covers both maps with no
+  artificial upper bound needed, mirroring `Disk::list`'s own
+  `(node, String::new())..` + `take_while` prefix scan (below) rather than
+  inventing a second convention. Cost is now O(this node's own entries),
+  not O(every node's). Only `NodeId`'s `Ord` is relied on — nothing here
+  assumes anything about its string form (`NodeId::mint`'s ids don't sort
+  in creation order, so this matters). `task_owner`/`timer_owner` are
+  **not** leading-component maps (`BTreeMap<TaskId/TimerId, NodeId>` — the
+  node is the *value*, not the key prefix) and stay a `.iter().filter()`
+  pass; the `Deliver`-drop scan `stop` added for issue #836 (over
+  `st.timeline`, keyed by `(time, seq)`) isn't one either, for the same
+  reason — neither is in scope for a prefix-range rewrite. Regression:
+  `tests/stop_semantics.rs::other_nodes_are_untouched_by_{crash,stop,
+  wipe_disk}` (a fault op on one node must never read or mutate another
+  node's disk/inbox/task — using `nid(10)` as the fault target since it
+  sorts lexicographically *between* `nid(1)` and `nid(2)`, the boundary
+  case an off-by-one range bound would get wrong) and `src/lib.rs`'s own
+  `#[cfg(test)] mod tests` (`node_prefix_keys_scans_only_the_target_node_
+  {u64,string}_suffixed`, unit-level, since `SimState` is private).
 
 - **`NetConfig`'s new knobs share one fixed draw order per send, all gated on
   their own threshold being non-zero** (ADR 0061 rung B2/B3): drop roll →
@@ -364,7 +467,20 @@ function of one seed. This is the substrate every distributed test runs on.
 
 ## Tests
 
-`cargo test -p animus-sim` — `tests/executor_leak.rs` proves the
+`cargo test -p animus-sim` — `tests/stop_semantics.rs` proves `stop`'s
+process-exit fidelity (issue #836): a message still in flight when its
+target is `stop`ped is discarded, never surfacing in a fresh incarnation's
+inbox after restart, while the discard is a one-time snapshot that doesn't
+mute traffic a fresh incarnation sends/receives afterward. The same file's
+`other_nodes_are_untouched_by_{crash,stop,wipe_disk}` (issue #841) prove the
+`node_prefix_keys` range-scan rewrite stayed correct, not just cheaper: a
+fault op on one node leaves every other node's disk, inbox, and running
+task exactly as it was. `tests/
+sleep_drop.rs` proves a `Sleep` dropped before its deadline leaves no
+phantom timer on the timeline (issue #837) and that `stop`/`shutdown`
+dropping a task parked mid-`sleep` doesn't deadlock (see "What's
+non-obvious" above for both). `tests/
+executor_leak.rs` proves the
 `Simulator`/`SimEnv` task-queue reference cycle directly (`Simulator::
 downgrade`'s `Weak` still upgrades after every external handle is dropped,
 for a scenario that spawned a perpetual task, and no longer does once

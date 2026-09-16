@@ -171,3 +171,35 @@ async fn list_objects_v2_only_matches_the_given_prefix() {
     assert_eq!(page.objects[0].key, "a/1");
     assert_eq!(page.next_continuation_token, None);
 }
+
+#[tokio::test]
+async fn list_objects_v2_with_an_ampersand_in_the_prefix_lists_only_that_prefix() {
+    // Regression for issue #855: a customer-supplied `S3KeyPrefix`
+    // containing a literal `&` (S3 explicitly permits `&` in an object
+    // key) used to be joined with `&` into a raw query string and
+    // re-split on `&`, truncating the prefix at the embedded `&` and
+    // fabricating a spurious extra query parameter — so this exact
+    // `list_objects_v2` call would have listed everything under `teamA`
+    // instead of the intended `teamA&teamB/exports`.
+    let c = client(fake_bucket());
+    c.put_object("teamA&teamB/exports/one", b"x".to_vec(), NOW_MS)
+        .await
+        .unwrap();
+    // A key that starts with the truncated prefix `teamA` but is NOT under
+    // the real prefix — must NOT show up in the result.
+    c.put_object("teamA-unrelated/two", b"x".to_vec(), NOW_MS)
+        .await
+        .unwrap();
+
+    let page = c
+        .list_objects_v2("teamA&teamB/exports", None, NOW_MS)
+        .await
+        .expect("list");
+    assert_eq!(
+        page.objects
+            .iter()
+            .map(|o| o.key.as_str())
+            .collect::<Vec<_>>(),
+        vec!["teamA&teamB/exports/one"]
+    );
+}
