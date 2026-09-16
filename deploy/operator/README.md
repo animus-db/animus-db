@@ -69,11 +69,33 @@ The `certManager` shape only *references* an `Issuer`/`ClusterIssuer` — it
 must already exist (cert-manager itself, plus that issuer, are prerequisites
 this operator does not install or create) — and the controller creates a
 `cert-manager.io/v1` `Certificate` (owned by the `AnimusCluster`, named
-`{cluster}-tls`) whose `dnsNames` cover every pod's stable per-ordinal FQDN
-plus both Services (headless internal + client-facing `dynamo`), so the
-cert-manager-issued cert (in `Secret` `{cluster}-tls`) verifies against
-however a peer dials it. The `secretName` shape skips the `Certificate`
+`{cluster}-tls`) whose `dnsNames` cover the headless internal `Service`'s
+own name (short + FQDN) plus two wildcard SANs (`*.<internal-svc>.<ns>.svc`
+and the `.cluster.local` form — a headless `Service`'s pod DNS name is
+always exactly one label before the service name, so this covers every
+ordinal without depending on `spec.nodes`) plus the client-facing `dynamo`
+Service, so the cert-manager-issued cert (in `Secret` `{cluster}-tls`)
+verifies against however a peer dials it — and, since issue #913, the SAN
+list never changes as the cluster scales, so a `spec.nodes` edit never
+triggers a reissuance. The `secretName` shape skips the `Certificate`
 entirely — you own that `Secret`'s lifecycle (issuance and rotation).
+
+**If your `issuerRef` ultimately traces to a self-signed root, put a
+`ca`-type `Issuer`/`ClusterIssuer` between that root and this field —
+never name a bare `selfSigned` issuer here directly.** cert-manager's
+`selfSigned` issuer type makes every `Certificate` it signs its own,
+independent trust anchor (its output `Secret`'s `ca.crt` equals the leaf
+itself); pointing this operator's `issuerRef` straight at one means any
+future reissuance of the cluster's one shared leaf (a `duration`/
+`renewBefore` rollover) mints a brand-new root that pods already running
+with the old leaf will never trust, since `animusd` reads its TLS material
+once at startup and never reloads it (ADR 0064 Decision 6). Mint a CA
+`Certificate` (`isCA: true`) off the `selfSigned` issuer once, back a
+second `ca`-type issuer with that CA's `Secret`, and reference *that*
+issuer here instead — its output `Secret`'s `ca.crt` is the stable CA
+certificate, unaffected by a leaf renewal. `scripts/e2e-kind.sh`'s own
+`E2E_TLS=1` leg does exactly this (see its "create self-signed CA
+hierarchy" phase) and is the reference shape to copy.
 
 Either way the resolved `Secret` (`kubernetes.io/tls` shape:
 `tls.crt`/`tls.key`/`ca.crt`) is mounted read-only at `/etc/animus/tls` on

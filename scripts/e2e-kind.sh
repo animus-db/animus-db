@@ -198,7 +198,22 @@ ANIMUSD_IMAGE="${ANIMUSD_IMAGE:-animusd:e2e}"
 KIND_NODE_IMAGE="${KIND_NODE_IMAGE:-}"
 E2E_TLS="${E2E_TLS:-0}"
 CERT_MANAGER_VERSION="v1.16.2"
-CLUSTER_ISSUER_NAME="e2e-selfsigned"
+# Two-step CA hierarchy (issue #913): a bare `selfSigned: {}` ClusterIssuer
+# mints exactly one CA Certificate, once, at cluster bring-up — it is never
+# referenced by the AnimusCluster's own spec.tls.certManager.issuerRef.
+# That CA's Secret then backs a second ClusterIssuer (`ca: {secretName}`)
+# which is what actually signs the cluster's leaf certificate. Any future
+# reissuance of that leaf (a duration/renewBefore rollover — never a scale
+# event, since the SAN list is now node-count-invariant, see
+# desired::certificate::dns_names) stays under the same CA key, so pods
+# that booted on either side of a reissue still trust each other. See
+# docs/adr/0064-tls-on-every-port.md's issue #913 amendment for why a bare
+# self-signed issuer, used directly as the leaf issuer, is unsafe for any
+# multi-peer mTLS deployment.
+BOOTSTRAP_ISSUER_NAME="e2e-selfsigned-bootstrap"
+CA_CERT_NAME="e2e-ca"
+CA_SECRET_NAME="e2e-ca-secret"
+CLUSTER_ISSUER_NAME="e2e-ca-issuer"
 E2E_S3="${E2E_S3:-0}"
 # Pinned on purpose: an unpinned `:latest` on a third-party registry is a
 # dependency on someone else's publishing decisions, and #863 is what that
@@ -780,17 +795,54 @@ if [ "$E2E_TLS" = "1" ]; then
         kubectl -n cert-manager rollout status "deployment/${deploy}" --timeout=180s
     done
 
-    phase "create self-signed ClusterIssuer"
-    # A self-signed root is the right, and only sane, choice for a
-    # throwaway e2e cluster — no ACME account, no real CA, nothing to wait
-    # on external to this kind cluster.
+    phase "create self-signed CA hierarchy (issue #913)"
+    # Do NOT hand a bare `selfSigned: {}` ClusterIssuer to the cluster's own
+    # spec.tls.certManager.issuerRef: every Certificate that issuer signs is
+    # its own independent root, so any reissuance of the cluster's leaf
+    # (mounted identically on every pod) replaces the trust anchor every pod
+    # validates its peers against, not just the leaf's own SAN list. Pods
+    # that booted on either side of such a reissue then reject each other's
+    # handshake permanently, since animusd reads its TLS material once at
+    # startup and never reloads it. Instead: a bootstrap self-signed issuer
+    # mints one CA certificate, once, and a second ClusterIssuer signs the
+    # cluster's actual leaf off that stable CA key.
+    kubectl apply -f - <<EOF
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: ${BOOTSTRAP_ISSUER_NAME}
+spec:
+  selfSigned: {}
+EOF
+    kubectl wait "clusterissuer/${BOOTSTRAP_ISSUER_NAME}" --for=condition=Ready --timeout=60s
+
+    kubectl apply -f - <<EOF
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: ${CA_CERT_NAME}
+  namespace: cert-manager
+spec:
+  isCA: true
+  commonName: animus-e2e-root-ca
+  secretName: ${CA_SECRET_NAME}
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  issuerRef:
+    name: ${BOOTSTRAP_ISSUER_NAME}
+    kind: ClusterIssuer
+EOF
+    kubectl -n cert-manager wait "certificate/${CA_CERT_NAME}" --for=condition=Ready --timeout=60s
+
     kubectl apply -f - <<EOF
 apiVersion: cert-manager.io/v1
 kind: ClusterIssuer
 metadata:
   name: ${CLUSTER_ISSUER_NAME}
 spec:
-  selfSigned: {}
+  ca:
+    secretName: ${CA_SECRET_NAME}
 EOF
     kubectl wait "clusterissuer/${CLUSTER_ISSUER_NAME}" --for=condition=Ready --timeout=60s
 

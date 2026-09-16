@@ -552,3 +552,178 @@ codebase). Any of these is a new ADR's job, not a reopening of this one.
 unverified in any sandbox that cannot run `kind` at all — its first real
 verification is whenever CI's `e2e-kind-tls` job first runs green (or
 doesn't).
+
+## Amendment (2026-09-16, issue #913) — stable SANs and a CA hierarchy requirement
+
+`e2e-kind-tls`'s first real run to reach a `spec.nodes`/`spec.controlNodes`
+scale-up (found investigating issue #864's own growth stall, and filed
+separately as #913 since the mechanism is TLS-specific) hit a persistent
+mTLS failure: after `spec.nodes` 3→4 and `spec.controlNodes` 3→4, the
+recreated pod `e2e-3` logged, continuously, for the whole ~5-minute window
+before the rollout wait timed out:
+
+```
+WARN animus_env::prod: TLS handshake failed (dropping connection) err=Custom { kind: InvalidData, error: AlertReceived(BadCertificate) } peer_addr=10.244.0.12:44804
+WARN animus_env::prod: TLS handshake failed (dropping connection) err=Custom { kind: InvalidData, error: AlertReceived(BadCertificate) } peer_addr=10.244.0.11:48712
+WARN animus_env::prod: TLS handshake failed (dropping connection) err=Custom { kind: InvalidData, error: AlertReceived(BadCertificate) } peer_addr=10.244.0.13:55980
+```
+
+against the pod IPs of `e2e-0`/`e2e-1`/`e2e-2` — the three pre-existing,
+never-restarted control voters. `e2e-3` never sustained
+`control_leader_recent`, so `/admin/health` never returned 200, so the
+`StatefulSet`'s own `OrderedReady`-equivalent readiness gate on a recreated
+pod never let the rollout proceed. Timing (run 35036379078, job
+104606305854): `spec.nodes` patched at 23:44:17, `spec.nodes` StatefulSet
+converged (4/4 ready — the pre-growth SAN list at that point still covered
+3 pods, but pod 3 hadn't been TLS-recreated by the growth step yet) at
+23:44:22, `spec.controlNodes` patched at 23:44:22, control group converged
+to 4 voters at 23:44:39, and the wait for the `controlNodes` config-hash
+roll to finish timed out at 23:49:39 with `e2e-3` (`Start Time: 23:44:25`,
+`Restart Count: 0`, continuously `Running`, never `Ready`) still failing
+its readiness probe.
+
+### Mechanism
+
+- **Which Secret keys `animusd` reads, and what `ca_path` is** (`crates/
+  animus-operator/src/desired/cluster_config.rs:305,327-333`): every pod
+  mounts one `Secret` at `/etc/animus/tls`, and every node's `cluster.json`
+  points `cert_path`/`key_path`/`ca_path` at `tls.crt`/`tls.key`/`ca.crt`
+  inside it — `ca_path` is **whatever the mounted Secret's `ca.crt` key
+  holds**, not necessarily a distinct root: for a bare `selfSigned`
+  `ClusterIssuer` (what the e2e used), cert-manager's output Secret has
+  `ca.crt` equal to the leaf certificate itself (a self-signed cert is its
+  own issuer), so the "CA" every pod trusts against **is** the one shared
+  leaf this cluster presents (ADR 0064 commit 3's own "one shared cert, not
+  per-pod" design, `deploy/operator/README.md`'s TLS section).
+- **What changes in the Certificate spec on a scale-up, and why that
+  matters**: `desired::certificate::build` (before this fix,
+  `crates/animus-operator/src/desired/certificate.rs:121` as it stood
+  investigating this issue) recomputed `dns_names(name, ns, spec.nodes)` —
+  one per-ordinal FQDN per node — on every reconcile. `spec.controlNodes`
+  changes alone never touched this list (only `spec.nodes` does); this
+  e2e's phase order happens to change both nearly at once, but only the
+  `spec.nodes` edit is what mutates the `Certificate`. cert-manager treats
+  any change to a `Certificate`'s `spec` (its `dnsNames` included) as a
+  reissuance request, updating the same `{cluster}-tls` `Secret` **in
+  place** — `tls.crt`/`tls.key`/`ca.crt` all get overwritten.
+- **`animusd` never hot-reloads TLS material** (ADR 0064 Decision 6,
+  unchanged by this amendment): `animus_env::tls::TlsConfig::load` (
+  `crates/animus-env/src/tls.rs:187`) reads the PEM files once, at listener
+  bind time; there is no file watcher or reload path anywhere in
+  `crates/animusd` or `crates/animus-env`. A pod's in-memory `TlsMaterial`
+  is exactly whatever was on disk the instant it booted, for its entire
+  lifetime.
+- **Net effect, for a bare self-signed `ClusterIssuer` used directly as the
+  leaf issuer**: since `ca.crt` *is* the leaf, a reissuance replaces the
+  trust anchor and the presented identity together, atomically, for every
+  *future* pod — but every already-running pod's in-memory copy of the old
+  leaf-as-CA is untouched. `e2e-0`/`e2e-1`/`e2e-2` booted at 23:44:0x,
+  before the `spec.nodes` 3→4 patch (23:44:17) reached cert-manager and it
+  finished reissuing; they hold the **pre-scale-up** cert/CA. `e2e-3`
+  (`Start Time: 23:44:25`, created by the *separate* `spec.controlNodes`
+  growth step's config-hash roll, not by the `spec.nodes` StatefulSet
+  scale-up itself — S-07d's `restart_relevant_projection` rolls every pod
+  on a `controlNodes` change) mounted the Secret **after** cert-manager
+  reissued it for the wider SAN list, so it holds the **post-scale-up**
+  cert/CA. Two mutually-incompatible root certificates now coexist across
+  the running pods, permanently (nothing ever re-reads the file): `e2e-3`
+  presents a leaf `e2e-0`/`e2e-1`/`e2e-2` cannot validate against their old
+  `ca.crt`, and it cannot validate *their* leaf against its own new
+  `ca.crt` either — `AlertReceived(BadCertificate)` on every handshake
+  attempt, in both directions, exactly as the log shows.
+
+This is not a rotation-policy detail to pin down further: **whether
+cert-manager happens to reuse the private key across that reissuance is
+irrelevant to the fix** — a bare self-signed issuer's output Secret making
+`ca.crt` and `tls.crt` the same value means *any* leaf change is also a
+trust-anchor change, for a deployment that was never supposed to need one
+during ordinary scaling.
+
+### Fix
+
+1. **A SAN set that is stable across `spec.nodes`/`spec.controlNodes`**
+   (`crates/animus-operator/src/desired/certificate.rs`): `dns_names` no
+   longer takes a node count. It now covers the headless internal
+   `Service`'s own name (short + FQDN, unchanged) plus two **wildcard**
+   SANs — `*.<internal-svc>.<ns>.svc` and
+   `*.<internal-svc>.<ns>.svc.cluster.local` — replacing the per-ordinal
+   FQDN list entirely. A Kubernetes headless `Service`'s pod DNS name
+   (`RoleAddrs::advertise_host`, `desired::pod_fqdn`) is always exactly one
+   label before the service name — `{cluster}-{ordinal}.{internal-svc}...`
+   — so a single-label wildcard covers every ordinal a cluster will ever
+   have, present or future, with **no reissue ever triggered by a
+   node-count change again**. The client-facing `dynamo` `Service`'s SANs
+   are unchanged (they never depended on node count to begin with). Both
+   cert-manager's ACME issuers and its `ca`/`selfSigned` issuer types
+   accept wildcard `dnsNames` — no ACME DNS-01 requirement applies to the
+   non-ACME issuer types this operator supports (`Issuer`/`ClusterIssuer`
+   referencing a `ca`- or `selfSigned`-backed signer; this codebase has no
+   ACME support to begin with). A new test
+   (`certificate_spec_is_byte_identical_across_a_nodes_scale_up`) pins the
+   regression directly: the built `Certificate.spec` is byte-identical for
+   a `nodes=3/controlNodes=3` cluster and a `nodes=4/controlNodes=4` one.
+2. **A stable trust anchor for the e2e's own TLS leg**
+   (`scripts/e2e-kind.sh`): the bare `selfSigned: {}` `ClusterIssuer` is no
+   longer handed to the `AnimusCluster`'s own
+   `spec.tls.certManager.issuerRef`. It now mints exactly one CA
+   `Certificate` (`isCA: true`), once, at cluster bring-up; a second
+   `ClusterIssuer` (`spec.ca.secretName`) signs the cluster's actual leaf
+   off that CA's key. This is a structural improvement beyond just
+   surviving *this* issue: for a `ca`-backed (non-self-signed-leaf) issuer,
+   cert-manager's output Secret sets `ca.crt` to the **issuing CA's own
+   certificate**, distinct from `tls.crt`/`tls.key` — so `ca.crt` now stays
+   byte-identical across *any* future leaf reissuance (a
+   `duration`/`renewBefore` rollover, not just a scale event), and mutual
+   TLS peer validation keeps working across such a reissuance even without
+   hot-reloading `tls.crt`/`tls.key` on already-running pods. This is also
+   the shape a real production deployment should use with a self-signed
+   root: `deploy/operator/README.md`'s own TLS section and
+   `crates/animus-operator/CLAUDE.md` now say so explicitly, since a bare
+   `selfSigned` issuer handed directly to a multi-pod mTLS deployment's
+   `issuerRef` was never a safe pattern, only one that happened not to be
+   exercised (`spec.nodes` never changed) until this issue's own scale-up
+   step first ran in CI.
+3. **Hot-reloading TLS material in `animusd` was not needed for this
+   fix** and is not built here: fix 1 removes the only reissue trigger a
+   routine scale-up can hit (a `Certificate.spec` change) and fix 2 makes
+   the one remaining trigger (a time-based renewal) safe without a reload,
+   since the CA half of the trust store — the actual thing mutual TLS
+   validates a peer's leaf against — no longer changes on a leaf renewal.
+   Cert rotation without a process restart remains exactly the Decision-6
+   gap this ADR already named, unchanged; nothing here narrows or widens
+   it.
+
+### Consequences
+
+- A `spec.nodes` scale-up (with TLS on) no longer reissues the cluster's
+  shared leaf certificate at all — the `Certificate` object's `spec` is
+  identical before and after.
+- Any deployment (this e2e included) using a self-signed root for
+  `spec.tls.certManager` must put a `ca`-type `ClusterIssuer` between that
+  root and the `AnimusCluster`'s own `issuerRef` — a bare `selfSigned`
+  issuer used directly is now a documented anti-pattern for this
+  operator's mTLS shape, not a silent trap.
+- Decision 7's SAN requirement ("every string a peer's peer book might
+  dial it by") is now satisfied by a wildcard rather than an enumerated
+  list — still exact-matching every pod's real dial string, just without
+  needing to be regenerated as the cluster grows.
+
+### Tests
+
+`crates/animus-operator/src/desired/certificate.rs`:
+`dns_names_cover_the_internal_service_wildcard_plus_both_services_short_and_fqdn`,
+`dns_names_do_not_depend_on_node_count`,
+`certificate_spec_is_byte_identical_across_a_nodes_scale_up`, and the
+pre-existing `cert_manager_shape_builds_a_certificate_with_the_right_gvk_and_name`/
+`issuer_ref_and_usages_and_is_ca`/`duration_and_renew_before_*`/
+`owner_reference_present` suite, updated where the SAN list itself was
+asserted. `scripts/e2e-kind.sh`'s new/changed heredocs were rendered with
+their variables set and parsed as YAML (not just `bash -n`'d) — a comment
+carrying a backtick inside an unquoted heredoc executes as shell rather
+than staying inert YAML, the same class of bug the concurrent issue #864
+investigation (PR #909) hit and is recording as its own lessons entry; the
+comments this PR adds around the new CA-hierarchy heredocs are placed
+*above* them, never inside. The `E2E_TLS=1` leg's actual scale-up-then-growth sequence remains
+unverified in any sandbox that cannot run `kind` at all (the same
+standing limitation ADR 0064 commit 3 and ADR 0060 already note) — its
+first real verification is the next green `e2e-kind-tls` CI run.

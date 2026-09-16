@@ -1611,3 +1611,21 @@ fix in Parts A-D, only plain and non-TLS legs (`e2e-kind`, `e2e-kind-
 s3`, `e2e-kind-encryption`) are unaffected, and confirming/fixing it
 needs its own read of how this cluster's mTLS trust material is actually
 wired, which Parts A-D's own growth-mechanism fixes do not touch.
+
+## Amendment (2026-09-16, issue #913) — cross-reference only
+
+Found investigating issue #864's own `e2e-kind-tls` leg: a `spec.nodes`
+scale-up recomputed `desired::certificate::build`'s Certificate SAN list
+from the live node count, so cert-manager reissued the one leaf cert every
+pod mounts identically (this ADR's TLS milestone, ADR 0064) on every
+scale-up — and with the e2e's bare self-signed `ClusterIssuer`, each
+reissuance was a brand-new, mutually-untrusted trust anchor, since
+`animusd` never reloads TLS material after startup (ADR 0064 Decision 6).
+Pods that booted on either side of a reissue rejected each other's
+handshake (`AlertReceived(BadCertificate)`) permanently. Full mechanism
+and fix — a node-count-invariant wildcard SAN set, and a two-step
+self-signed-CA-then-CA-issuer hierarchy for `scripts/e2e-kind.sh`'s own
+`E2E_TLS=1` leg — are written up in ADR 0064's own issue #913 amendment,
+per this file's standing convention (`spec.tls`'s design lives in ADR
+0064; this ADR only cross-references it). `crates/animus-operator/
+CLAUDE.md` carries the crate-local detail.
