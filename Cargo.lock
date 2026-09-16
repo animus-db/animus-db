@@ -126,6 +126,7 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "serde",
+ "socket2",
  "thiserror",
  "tokio",
  "tokio-rustls",

@@ -10881,7 +10881,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 }
             }
         }
-        leader.env().merge_peer(node.clone(), addr);
+        leader.env().merge_peer(node.clone(), addr.clone());
         let mut voters = current;
         voters.insert(node.clone());
         match leader.change_membership(voters) {
@@ -19283,6 +19283,15 @@ mod sim_cluster_schema_broadcast;
 /// investigation found and reports (not fixed here, out of scope).
 #[cfg(test)]
 mod sim_cluster_dynamo_drop_table;
+
+/// Issue #920: a `ConsistentRead: true` read routed through a node hosting
+/// no replica must not hang for tens of seconds after every replica of an
+/// idle (quiesced, ADR 0048) tablet group is crashed and restarted in
+/// turn with durable storage. See this module's own doc for the full
+/// scenario and why it lives here (needs `ClientCtx`/forwarding, not just
+/// `RaftKvNode`) rather than in `animus-cp-data`'s own quiescence corpus.
+#[cfg(test)]
+mod sim_cluster_quiesced_rolling_restart;
 
 /// ADR 0061 rung D4 PR 2 (C-04 D4): deterministic `SimCluster` coverage for
 /// the auto-split BYTE trigger (ADR 0034) — `auto_split_loop` (`lib.rs`)

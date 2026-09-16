@@ -43,6 +43,15 @@ full text in CLAUDE.md "Session operating mode"):
    merging. Push back — including on the maintainer — on any "merge it
    anyway / it's just flaky / skip that test"; bypass only on an explicit,
    deliberate override stated in so many words, never silently.
+5. Independent work runs in a SEPARATE SESSION, one session per workstream.
+   A session is one container (one 4-core CPU budget, one CARGO_TARGET_DIR);
+   keep only entangled work here (a stacked series + the defects gating it),
+   at most two heavy agents at a time, and launch anything independent (next
+   unrelated backlog issues, a discovered pre-existing defect that does not
+   gate the current PR) in a new session in this environment with its scope,
+   a do-not-touch list, the mechanics it needs, and reporting to the
+   maintainer in its own chat. Never launch backlog work in the parent after
+   the split.
 EOF
 
 # --- 2. Tooling install (web containers only) -------------------------------

@@ -91,6 +91,34 @@ above reads, and the gaps are exactly where prod-only bugs have already hidden:
   and two sequential appends via separate handles could land **inverted** on
   disk (the long-standing `lsm_concurrent` flake; independently found and
   fixed in PRs #26 and #27).
+- **`ProdEnv` half-open pooled connections — closed, issue #924.** A pooled
+  outbound (or accepted inbound) TCP connection whose peer vanished with
+  **no FIN/RST at all** — a Kubernetes pod recreated at a new IP, its old
+  network namespace torn down before, or racing, its final FIN — was
+  invisible to `send_frame_pooled`'s reconnect-once path (issue #661):
+  every write into it kept succeeding (the bytes just land in this host's
+  own kernel send buffer), so the OS's own TCP retransmission timer
+  (`tcp_retries2`, commonly 13–15 **minutes** on Linux) was the only thing
+  standing between this and detection — the mechanism behind a recreated
+  voter sitting `PreCandidate` with no leader contact for minutes even
+  though every other node believed it alive. **Fixed** by hardening every
+  pooled/accepted socket with TCP keepalive (`TCP_KEEPIDLE`/`TCP_KEEPINTVL`/
+  `TCP_KEEPCNT`, via `socket2::SockRef`, since `tokio::net::TcpStream`
+  exposes no setter) plus, on Linux/Android/Fuchsia/Cygwin,
+  `TCP_USER_TIMEOUT` — symmetric on the dial and accept sides, TLS and
+  plain alike. **Detection bound: 5 seconds** on Linux (the actual v1
+  deployment target, ADR 0060) from a vanished peer's last acknowledged
+  traffic, at which point the existing reconnect-once path re-resolves the
+  peer's address string and reaches a moved pod's new IP under its old
+  stable DNS name — see `crates/animus-env/src/prod.rs`'s
+  `POOLED_SOCKET_DEAD_PEER_TIMEOUT` for the full mechanism and platform-
+  fallback account, and its `send_reconnects_after_peer_vanishes_without_
+  fin_or_rst` test for a hermetic, iptables-black-hole-based reproduction
+  (a socket close always sends FIN/RST, and an application that merely
+  stops reading is still kernel-acked, so neither reproduces this case —
+  see that test's own doc for why an `iptables OUTPUT DROP` is the closest
+  a single-host test can get). This is a `ProdEnv`-only fix behind the
+  `prod` feature; `SimEnv` has no real sockets and is unaffected.
 - **`SimEnv` disk faults — closed, then extended.** The original gap (the sim
   disk never returned an error, never left a *partial* (torn) tail on crash,
   and could not corrupt a byte) was **closed in PR #24**: opt-in, seed-driven

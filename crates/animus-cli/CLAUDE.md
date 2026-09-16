@@ -282,10 +282,11 @@ control-grow <leader-admin-addr> <node-id> <admin-addr> [<node-id> <admin-addr>.
   `<new-node-control-addr>`/the `/admin/config`-derived internal address as
   a `std::net::SocketAddr`, only build a JSON string with it. The one place
   that *did* restrict to a literal `ip:port` was server-side
-  (`animusd::admin::AddControlMemberReq.addr`, fixed by issue #662 —
-  `POST /admin/control/member/add` now accepts a DNS hostname the same way
-  `RoleAddrs::advertise_host`/`--seed`/`ProdEnv::merge_peer` already did),
-  so this CLI needed no change at all to gain hostname support end to end.
+  (`animusd::admin::AddControlMemberReq.addr`, fixed by issue #913 — the
+  same underlying gap issue #662 also reported — `POST /admin/control/
+  member/add` now accepts a DNS hostname the same way `RoleAddrs::
+  advertise_host`/`--seed`/`ProdEnv::merge_peer` already did), so this CLI
+  needed no change at all to gain hostname support end to end.
 - **Dynamo-proxy wrappers** (roadmap U-08(ii)): `backup-create`/
   `backup-delete`/`restore`/`pitr-enable`/`pitr-disable`/`ttl`/`stream` are
   the last flat mutating group — each a thin `POST /admin/data/dynamo
