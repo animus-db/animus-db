@@ -383,3 +383,30 @@ could be — the right direction for this comparison to be wrong in.
   (converged-or-timeout, never a fixed-deadline assert — the eventual-property
   rule), `ConsistentRead: true` is immediately correct on every node including
   the ones that host only followers, and both agree once the cluster is quiet.
+
+## Amendment (2026-09-16, issue #920 — the strong path's own forwarding
+## chase, and the eventual path's quiescence boundary, both confirmed intact)
+
+Issue #920's investigation (a `ConsistentRead: true` read stuck for 50+
+seconds after a rolling restart) turned out to be a `RaftKvNode::
+reconfigure_step` ordering bug (ADR 0048's own 2026-09-16 amendment has
+the full account), not anything on this ADR's own read paths. Recorded
+here because the investigation specifically exercised, and confirmed
+unaffected, the two invariants this ADR is responsible for:
+
+- **The strong (`ConsistentRead: true`) path's own forwarding
+  (`ClientCtx::forward_to_tablet_leader`/`cp_serve_forwarded`,
+  `animusd::forwarding`) never itself calls `wake()` on a receiving node's
+  local replica** — only `resolve_cp_route`'s *local* branch does (ADR
+  0048 PR4). This is correct, not a gap: a quiesced group's own inbound
+  Raft traffic (a peer's `AppendEntries`/`PreVote`/`RequestVote`) already
+  un-quiesces it unconditionally regardless of any client-driven read
+  arriving concurrently, so the read path needs no separate wake — closing
+  this ADR's own "no CP group leader reachable" symptom needed a
+  `reconfigure_step` fix, not a forwarding-path wake call.
+- **The eventual (`ConsistentRead: false`) path's own "never wakes a
+  quiesced group" contract (§2, "Quiescence falls out for free") is
+  untouched by the fix** — `reconfigure_step` and the eventual read's
+  `stale_read_ready()` freshness gate share no code path, and this ADR's
+  own `quiesced_eventual_read.rs` regression (`animus-cp-data/tests/`)
+  still passes unmodified.

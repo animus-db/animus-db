@@ -387,21 +387,37 @@ straight into the voter set. `reconfigure_step` sequences an add as
 remove-the-old-replica**, still exactly **one single-server step per call**
 (ADR 0031 discipline unchanged — no new `HostAction`, `host::plan` is
 untouched; only what `reconfigure_step` proposes on a given call changed).
-Full priority order, most urgent first: (1) remove a `Down` extra **voter**
-(unchanged, failure repair); (2) drop a current **learner** no longer in
-`desired` — regardless of its liveness or catch-up progress, since it is
-stale by construction the moment placement retargets away from it (the
-fix for "a learner mid-catch-up that dies or is decommissioned must not
-wedge every later step" — the reconciler's job is only to not block on a
-target nobody wants any more; *re*-targeting `desired` is placement's job,
-untouched); (3) promote a learner that is both still desired and caught up
-(finish an in-flight move before starting a new one); (4) add a `desired`
-member missing from both `config` and `learners`, as a **learner**, never
-straight to voter; (5)/(6) — once every `desired` member is already a
-voter — the pre-Train-1 remove-healthy-extra/leader-self-removal-via-
-transfer steps, unchanged. A remove-only delta and a brand-new group's
-initial bootstrap (`host::plan_join_host`) are both untouched — this only
-changes the sequencing of an *add*. **Gotcha this shipped with**: the early
+Full priority order, most urgent first: (1) drop a current **learner** no
+longer in `desired` — regardless of its liveness or catch-up progress,
+since it is stale by construction the moment placement retargets away
+from it (the fix for "a learner mid-catch-up that dies or is
+decommissioned must not wedge every later step" — the reconciler's job is
+only to not block on a target nobody wants any more; *re*-targeting
+`desired` is placement's job, untouched); (2) promote a learner that is
+both still desired and caught up (finish an in-flight move before
+starting a new one); (3) add a `desired` member missing from both
+`config` and `learners`, as a **learner**, never straight to voter; (4)
+remove a `Down` extra **voter** (failure repair) — **since issue #920's
+fix (2026-09-16), ordered AFTER steps 1–3, not before**: removing a down
+voter fires immediately only once no `desired` member is still missing or
+mid-catch-up as a learner, i.e. only once any replacement is already
+safely a voter. Before the fix, this fired *first*, ahead of adding the
+replacement — sound only if "marked `Down`" means "permanently gone," but
+ADR 0012's failure detector (`DETECT_TIMEOUT`, 500ms) trips just as
+readily on a transient absence (a pod recreation with durable storage,
+issue #920's own production shape) as on a real failure, and removing the
+old voter early shrinks the live quorum requirement for the whole
+in-flight window with no way back if a *second* voter is then also lost
+mid-rolling-restart — see `reconfigure_step`'s own doc for the full
+before/after account and ADR 0048's 2026-09-16 amendment for the incident;
+(5)/(6) — once every `desired` member is already a voter — the pre-Train-1
+remove-healthy-extra/leader-self-removal-via-transfer steps, unchanged. A
+remove-only delta (no missing/mid-catch-up member) still removes a down
+extra on the very first tick that reaches step 4, exactly as before the
+reordering — steps 1–3 are no-ops when nothing is stale/promotable/missing,
+so the fix costs nothing in that case. A brand-new group's initial
+bootstrap (`host::plan_join_host`) is untouched — this only changes the
+sequencing of an *add-with-a-down-extra-to-remove*. **Gotcha this shipped with**: the early
 "already converged" return must check `current == desired &&
 learners.is_empty()`, not `current == desired` alone — a stray learner at
 that point is stale by construction (see step 2), and an early return
@@ -1018,6 +1034,45 @@ State once here; cross-referenced from the sections below.
   in `animus-test/tests/raftkv_linearizable.rs`. See `docs/engineering-
   lessons.md`'s Code-patterns entry: *a state machine's applied watermark
   must be the state machine's own, never the log's.*
+
+  **Issue #811 (2026-09-10): a successfully-installed snapshot's `RaftCore`
+  state must be forced into the SAME pass's WAL rewrite, not left for
+  `behind`/`image_needed` to trigger later.** `RaftCore::
+  handle_install_snapshot`'s successful-install path fixes up `snapshot_
+  index`/the log/`snapshot_dirty` synchronously (consensus loop) the
+  instant the last chunk lands, but nothing durably persists that: `has_
+  unflushed_wal` checks only the pending log-append queue and the current
+  term/vote (never `snapshot_dirty`), and `apply_and_compact`'s compaction
+  branch only rewrites the WAL when `behind >= COMPACT_THRESHOLD` or a peer
+  needs a fresh image — both false immediately after an install, since
+  `engine_applied` and `snapshot_index` are set to the identical value in
+  the same step. A replica that caught up ENTIRELY via `InstallSnapshot`
+  (no log entry of its own ever logged) can therefore sit fully caught-up
+  with a WAL file that still reads back empty — and a LATER genuine process
+  restart (`sim.stop` + fresh `RaftKvNode::start`, never `sim.crash`/`sim.
+  restart`) recovers from that empty WAL as a `fresh_group`, skipping
+  `RaftCore::recovered` and leaving `snapshot_index == last_applied == 0`
+  while `engine_applied` is correctly reseeded from the engine's own
+  watermark — a permanent, non-convergent `behind` gap (`snapshot_upto`
+  clamps to `min(engine_applied, last_applied)`, and `last_applied` is
+  ALSO stuck at `0` on the fresh core) that pegs the apply task at `did_
+  work = true` forever, spinning one CPU core with `run_for`/`run_until`
+  never returning. **Fixed**: `apply_and_compact` now forces the
+  compaction section's WAL-rewrite branch whenever this pass processed a
+  `drain_pending_install`, regardless of `behind`/`image_needed`.
+  Regression: `tests/restart_after_install_snapshot.rs` (`MemoryEngine` and
+  `LsmEngine<SimEnv>`, both red-before/green-after). **Test-authoring
+  gotcha this bug's own repro needed**: neither `run_for`'s virtual-time
+  deadline nor `run_until_quiescent`'s step cap can bound this hang shape —
+  the busy task's own `Future::poll` call never returns control to the
+  executor at all (no `.await` point is reached between loop iterations
+  once `did_work` stays `true`), so nothing short of a real OS-thread
+  wall-clock watchdog (`std::thread::spawn` + `mpsc::Receiver::
+  recv_timeout` around `sim.run_for`) can catch it in a test — see
+  `docs/engineering-lessons.md`'s matching issue #811 entry for the full
+  account, including why `crates/animus-test/tests/raftkv_linearizable.rs`'s
+  own `Nemesis::StopRestart` (which always targets the current leader,
+  never a snapshot-caught-up follower) structurally cannot reproduce this.
 - **Durable-before-visible** (ADR 0009): effects are only drained for fsynced
   entries, and the engine write follows the WAL `fsync`.
 - **Write-conflict push + the logged read ceiling — the serializability half

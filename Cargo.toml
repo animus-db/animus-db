@@ -108,6 +108,19 @@ tokio-rustls = { version = "0.26", default-features = false, features = [
 ] }
 rustls-pki-types = "1"
 rcgen = "0.13"
+# TCP keepalive + `TCP_USER_TIMEOUT` on every pooled/accepted intra-node
+# socket (issue #924, ADR 0003's ProdEnv notes): `tokio::net::TcpStream`
+# exposes no keepalive/user-timeout setters, so `animus-env::prod` reaches
+# through a `SockRef` (no ownership transfer, no fd duplication) to set
+# them on the live socket. Already in the dependency graph transitively (via
+# `tokio`'s own `net` feature) at this exact version — pinning it directly
+# here is a version-consistency no-op, not a new transitive resolution.
+# `features = ["all"]` is needed for `TcpKeepalive::with_retries` and
+# `Socket::set_tcp_user_timeout`, both gated behind it upstream. MIT OR
+# Apache-2.0, pure Rust FFI wrapper (no unsafe code of *this workspace's*
+# own, per crate — `unsafe_code = "forbid"` is a per-crate lint, not
+# transitive).
+socket2 = { version = "0.6", features = ["all"] }
 # Encryption at rest (ADR 0069): XChaCha20-Poly1305 AEAD for the `Disk`-seam
 # frame wrapper, chosen over AES-GCM specifically for its 24-byte extended
 # nonce (room for a 16-byte per-file random salt plus a 64-bit frame counter
