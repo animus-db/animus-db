@@ -309,7 +309,7 @@ fn decode_change_suffix(key: &[u8]) -> Option<(hlc::HlcTimestamp, u32)> {
 /// threshold so the lagging follower must catch up via a genuine
 /// engine-image install (not a log replay), then confirms the caught-up
 /// follower's own `hot_change_max()` matches the leader's own true
-/// maximum (found by directly decoding `pending_changes()`, independent of
+/// maximum (found by directly decoding `pending_changes_key_order()`, independent of
 /// `hot_change_max` itself — the ground truth). Then forces leadership
 /// onto that follower and re-confirms: the shape that actually matters for
 /// `GetShardIterator{LATEST}`, since only a group's LEADER ever serves it.
@@ -343,7 +343,7 @@ fn snapshot_catchup_reseeds_hot_change_max() {
     // Ground truth, taken from the leader BEFORE the follower's restart —
     // every one of `N` writes minted exactly one change record, so this is
     // never empty.
-    let expected_max = block_on(nodes[l].pending_changes())
+    let expected_max = block_on(nodes[l].pending_changes_key_order())
         .iter()
         .filter_map(|(k, _)| decode_change_suffix(k))
         .max()
