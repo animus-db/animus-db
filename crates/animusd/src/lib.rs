@@ -1713,7 +1713,7 @@ impl ReadConsistency {
 
 /// How a [`ClientCtx::poll_probe`] confirm wait ended: the probed effect
 /// appeared (`Confirmed`), the wait became provably futile before the
-/// deadline (`Superseded` — see [`decide::confirm_wait_is_futile`]), or
+/// deadline (`Superseded` — see [`kind_batch_confirm_superseded`]), or
 /// the deadline elapsed with the accepted entry still plausibly in flight
 /// (`TimedOut`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1815,6 +1815,129 @@ fn classify_kind_batch_outcome(
             | KindBatchOutcome::Rejected { .. },
         )) => KindBatchSignal::NoOp,
         _ => KindBatchSignal::Inconclusive,
+    }
+}
+
+/// The leadership-independent half of a CP write confirm loop's superseded
+/// decision (issues #911, #967, #971) — shared by `write_path.rs`'s
+/// `cp_kind_raw_local`, `cp_kind_eval_local`, `poll_probe` (the shared
+/// primitive behind `cp_batch_local`) and `cp_put_local`/`cp_delete_local`,
+/// every confirm loop in the file. All five used to give up on
+/// `decide::confirm_wait_is_futile` (deleted — this function replaced its
+/// only remaining callers). That predicate's own `!is_leader()` clause was
+/// not proof of loss for any of them — a term bump from a missed heartbeat
+/// deadline under real
+/// contention flips `is_leader()` false well before anyone can tell whether
+/// an already-accepted entry will still commit, and `kind_batch_outcome`/
+/// `engine_applied_index` are plain local reads needing no leadership at
+/// all — so `is_leader()` is deliberately not a parameter here. Only two
+/// proofs are leadership-independent: `engine_applied_index` has passed
+/// `accepted_index` with no matching outcome (whatever occupied that slot
+/// no-opped or belongs to a different entry entirely), or the outcome
+/// recorded at `accepted_index` carries a *different* term (Raft's
+/// log-matching property means a different term there can only mean a
+/// different, reoccupying entry — see `ProposeResult::Accepted`'s doc).
+/// "Nothing has decided this index yet" (`outcome` is `None` and
+/// `engine_applied_index` has not passed `accepted_index`) returns `false`
+/// regardless of `is_leader()` — the caller keeps waiting, bounded by its
+/// own `CLIENT_TIMEOUT` deadline.
+fn kind_batch_confirm_superseded(
+    engine_applied_index: u64,
+    accepted_index: u64,
+    accepted_term: u64,
+    outcome: &Option<(u64, KindBatchOutcome)>,
+) -> bool {
+    engine_applied_index >= accepted_index
+        || outcome
+            .as_ref()
+            .is_some_and(|(term, _)| *term != accepted_term)
+}
+
+#[cfg(test)]
+mod kind_batch_confirm_superseded_tests {
+    use super::{KindBatchOutcome, kind_batch_confirm_superseded};
+
+    const ACCEPTED_INDEX: u64 = 10;
+    const ACCEPTED_TERM: u64 = 7;
+
+    /// The case issues #911/#967 exist for: nothing has decided this index
+    /// yet (no recorded outcome, applied index still behind) — must keep
+    /// waiting no matter what `is_leader()` would have said, since that
+    /// signal is not even a parameter here any more.
+    #[test]
+    fn nothing_decided_yet_is_never_superseded() {
+        assert!(!kind_batch_confirm_superseded(
+            ACCEPTED_INDEX - 1,
+            ACCEPTED_INDEX,
+            ACCEPTED_TERM,
+            &None,
+        ));
+    }
+
+    /// Effects merged exactly at our own index with our own term recorded:
+    /// this is the `Confirm` shape — `classify_kind_batch_outcome` catches
+    /// it first in every real caller (both `cp_kind_raw_local` and
+    /// `cp_kind_eval_local` only ever call this function *after* that check
+    /// already returned `Inconclusive`/`NoOp` this same iteration), so this
+    /// function has no need to special-case it and correctly does not: it
+    /// reports `true` here too (`engine_applied_index >= accepted_index`
+    /// alone is sufficient by design, mirroring `cp_kind_raw_local`'s own
+    /// pre-extraction shape) — this test pins that contract explicitly so
+    /// a future caller of this function in isolation cannot mistake it for
+    /// a full confirm/superseded decision on its own.
+    #[test]
+    fn effects_merged_at_our_own_index_is_reported_true_by_this_check_alone() {
+        assert!(kind_batch_confirm_superseded(
+            ACCEPTED_INDEX,
+            ACCEPTED_INDEX,
+            ACCEPTED_TERM,
+            &Some((ACCEPTED_TERM, KindBatchOutcome::Applied)),
+        ));
+    }
+
+    /// Effects merged past our index with nothing recorded there for us —
+    /// whatever occupied that slot no-opped or belongs to a different,
+    /// already-applied-and-gone entry. Leadership-independent proof.
+    #[test]
+    fn effects_past_our_index_with_no_outcome_is_superseded() {
+        assert!(kind_batch_confirm_superseded(
+            ACCEPTED_INDEX,
+            ACCEPTED_INDEX,
+            ACCEPTED_TERM,
+            &None,
+        ));
+    }
+
+    /// A different term recorded at our own index: Raft's log-matching
+    /// property means a different, reoccupying entry landed there, ours
+    /// having been truncated — superseded regardless of whether effects
+    /// are readable yet.
+    #[test]
+    fn a_different_term_at_our_index_is_superseded() {
+        assert!(kind_batch_confirm_superseded(
+            ACCEPTED_INDEX - 1,
+            ACCEPTED_INDEX,
+            ACCEPTED_TERM,
+            &Some((ACCEPTED_TERM + 1, KindBatchOutcome::Applied)),
+        ));
+    }
+
+    /// The false-negative issue #911/#967 fixed, pinned directly: a real
+    /// term bump makes `is_leader()` read false while this index is still
+    /// entirely undecided — this function has no `is_leader` parameter to
+    /// even consult, so it cannot regress back into treating that alone as
+    /// proof of loss.
+    #[test]
+    fn is_leader_is_not_a_parameter_and_cannot_cause_a_false_supersede() {
+        // Same inputs as `nothing_decided_yet_is_never_superseded`, standing
+        // in for "this node just lost leadership" — no `bool` for it exists
+        // to pass here at all, which is the fix.
+        assert!(!kind_batch_confirm_superseded(
+            ACCEPTED_INDEX - 1,
+            ACCEPTED_INDEX,
+            ACCEPTED_TERM,
+            &None,
+        ));
     }
 }
 
@@ -10231,10 +10354,6 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     // eventual-read-specific failure a client can ever observe, only an
     // eventual read that quietly cost what a strong one costs.
 
-    // The futility predicate this used to hold (`confirm_wait_is_futile`)
-    // moved to [`decide::confirm_wait_is_futile`] (ADR 0061 A6) — see that
-    // function's own doc for the full two-signal rationale (issue #268).
-
     // ---- multi-participant transactions (ADR 0018 §2/PR4) --------------------
 
     // ---- in-doubt transaction recovery (ADR 0018 §2/PR5) ------------------
@@ -13478,7 +13597,7 @@ const BROADCAST_EXHAUSTED_BACKOFF: Duration = Duration::from_millis(250);
 /// instant the apply task advances past the entry's index, not by polling on
 /// a timer. This constant is no longer a poll granularity: it only bounds
 /// how long that park can go without a **forced** re-check, so a caller's
-/// own `confirm_wait_is_futile`/deadline logic still fires on schedule even
+/// own `kind_batch_confirm_superseded`/deadline logic still fires on schedule even
 /// when the watched index never applies at all (the group loses its leader,
 /// a quorum is lost, the entry gets superseded) — `AppliedWatch::bump` never
 /// wakes for that outcome, since nothing ever advances. A write that
@@ -16180,16 +16299,18 @@ pub async fn read_frame<T: DeserializeOwned, S: AsyncRead + Unpin>(
 // alongside the function itself (ADR 0061 A6, formerly `auto_split_median_tests`
 // here).
 
-/// Regression tests for the end-to-end fast-fail behavior
-/// [`decide::confirm_wait_is_futile`] enables (issue #268) — in-crate
+/// Regression tests for the end-to-end fast-fail behavior a confirm loop's
+/// own futility check ([`kind_batch_confirm_superseded`], formerly
+/// `decide::confirm_wait_is_futile`) enables (issue #268) — in-crate
 /// because they need a private [`CpGroup`] handle and the `pub(crate)`
 /// [`ClientCtx::cp_kind_local`], which no external `tests/` file can reach
 /// (the same reason `gsi_drain_cursor_tests` lives inside `index_drain.rs`).
 /// Run via `cargo test -p animusd --lib`.
 ///
 /// **Deliberately not moved into `decide`'s own test module (ADR 0061 A6):**
-/// unlike `decide::confirm_wait_is_futile`'s own direct unit tests (a plain
-/// truth table over the predicate's three primitive inputs), these prove
+/// unlike `kind_batch_confirm_superseded`'s own direct unit tests
+/// (`kind_batch_confirm_superseded_tests`, a plain truth table over the
+/// predicate's inputs), these prove
 /// the *wired* behavior — a real `CpGroup` propose/apply/poll round trip
 /// through `cp_kind_local`, with real timing assertions — which needs a
 /// live single-node cluster regardless of how pure the underlying predicate
