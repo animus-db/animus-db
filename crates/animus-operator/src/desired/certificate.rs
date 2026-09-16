@@ -18,7 +18,7 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::core::{ApiResource, DynamicObject, GroupVersionKind};
 use serde_json::json;
 
-use super::{client_service_name, common_labels, internal_service_name, owner_reference, pod_fqdn};
+use super::{client_service_name, common_labels, internal_service_name, owner_reference};
 use crate::crd::{AnimusCluster, AnimusClusterSpec, IssuerRef};
 
 /// `cert-manager.io/v1` `Certificate`'s [`ApiResource`] — used both to build
@@ -44,20 +44,35 @@ pub fn certificate_name(name: &str) -> String {
 /// Every DNS name a peer might dial a pod of this cluster by, so the
 /// issued certificate's SAN list covers every string `animusd`'s own peer
 /// book / a client could present during a TLS handshake (ADR 0064 Decision
-/// 7): each pod's own stable per-ordinal FQDN (what `RoleAddrs.
-/// advertise_host` carries and the internal wire/intra relays dial), the
-/// headless internal `Service`'s own zone name (short + FQDN — some
-/// in-cluster callers resolve the bare `Service` name), and the
-/// client-facing `dynamo` `Service` name (short + FQDN — what a DynamoDB
-/// client inside the cluster, or a `kubectl port-forward` combined with
-/// `--resolve`, dials).
+/// 7). **Deliberately independent of `spec.nodes`/`spec.controlNodes`**
+/// (issue #913): a per-ordinal SAN list here would change on every
+/// scale-up, and cert-manager treats a changed `Certificate.spec` as a
+/// reissuance request — the leaf this operator mounts identically on every
+/// pod (ADR 0064 commit 3's "one shared cert, not per-pod") would then be
+/// replaced mid-cluster-lifetime, and a scale-triggered `StatefulSet` roll
+/// races that reissuance against pods that already booted with the old
+/// material and never reload it (`animusd` reads its TLS material once at
+/// startup, ADR 0064 Decision 6). Two **wildcard** SANs cover every
+/// ordinal's stable per-pod hostname instead (a Kubernetes headless
+/// `Service`'s pod DNS name is always exactly one label — `{pod}.{svc}...`
+/// — so a single-label wildcard matches any ordinal, present or future,
+/// with no reissue ever needed for a node-count change): the headless
+/// internal `Service`'s own zone name (short + FQDN — some in-cluster
+/// callers resolve the bare `Service` name) plus its wildcard forms, and
+/// the client-facing `dynamo` `Service` name (short + FQDN — what a
+/// DynamoDB client inside the cluster, or a `kubectl port-forward` combined
+/// with `--resolve`, dials). See `docs/adr/0064-tls-on-every-port.md`'s
+/// issue #913 amendment.
 #[must_use]
-pub fn dns_names(name: &str, ns: &str, nodes: i32) -> Vec<String> {
-    let mut names: Vec<String> = (0..nodes).map(|i| pod_fqdn(name, ns, i)).collect();
+pub fn dns_names(name: &str, ns: &str) -> Vec<String> {
     let internal = internal_service_name(name);
-    names.push(internal.clone());
-    names.push(format!("{internal}.{ns}"));
-    names.push(format!("{internal}.{ns}.svc.cluster.local"));
+    let mut names = vec![
+        format!("{internal}.{ns}.svc.cluster.local"),
+        internal.clone(),
+        format!("{internal}.{ns}"),
+        format!("*.{internal}.{ns}.svc"),
+        format!("*.{internal}.{ns}.svc.cluster.local"),
+    ];
     let client = client_service_name(name);
     names.push(client.clone());
     names.push(format!("{client}.{ns}"));
@@ -118,7 +133,7 @@ pub fn build(cluster: &AnimusCluster, spec: &AnimusClusterSpec) -> Option<Dynami
         .as_deref()
         .expect("AnimusCluster read from the API server always has a namespace");
 
-    let names = dns_names(name, ns, spec.nodes);
+    let names = dns_names(name, ns);
     let cert_spec = cert_spec(
         &certificate_name(name),
         &names,
@@ -241,22 +256,47 @@ mod tests {
     }
 
     #[test]
-    fn dns_names_cover_every_pod_plus_both_services_short_and_fqdn() {
-        let names = dns_names("c", "ns", 3);
+    fn dns_names_cover_the_internal_service_wildcard_plus_both_services_short_and_fqdn() {
+        let names = dns_names("c", "ns");
         assert_eq!(
             names,
             vec![
-                "c-0.c-internal.ns.svc.cluster.local",
-                "c-1.c-internal.ns.svc.cluster.local",
-                "c-2.c-internal.ns.svc.cluster.local",
+                "c-internal.ns.svc.cluster.local",
                 "c-internal",
                 "c-internal.ns",
-                "c-internal.ns.svc.cluster.local",
+                "*.c-internal.ns.svc",
+                "*.c-internal.ns.svc.cluster.local",
                 "c-dynamo",
                 "c-dynamo.ns",
                 "c-dynamo.ns.svc.cluster.local",
             ]
         );
+    }
+
+    #[test]
+    fn dns_names_do_not_depend_on_node_count() {
+        // issue #913: the whole point of the wildcard SANs is that no
+        // scale-up (spec.nodes) or control-group growth (spec.controlNodes,
+        // which never fed into dns_names to begin with) ever changes this
+        // list — dns_names doesn't even take a node count any more.
+        assert_eq!(dns_names("c", "ns"), dns_names("c", "ns"));
+    }
+
+    #[test]
+    fn certificate_spec_is_byte_identical_across_a_nodes_scale_up() {
+        // issue #913: a scale-up must never trigger cert-manager to reissue
+        // the cluster's shared leaf certificate. Build the Certificate for
+        // otherwise-identical clusters at nodes=3 and nodes=4 (mirroring the
+        // e2e's own 3->4 scale) and assert the resulting `spec` is
+        // byte-identical — the regression this issue's fix pins directly.
+        let small = cert_manager_cluster("ClusterIssuer", None);
+        let mut large = small.clone();
+        large.spec.nodes = 4;
+        large.spec.control_nodes = Some(4);
+
+        let small_obj = build(&small, &small.spec).unwrap();
+        let large_obj = build(&large, &large.spec).unwrap();
+        assert_eq!(small_obj.data["spec"], large_obj.data["spec"]);
     }
 
     #[test]
@@ -306,12 +346,12 @@ mod tests {
     }
 
     #[test]
-    fn common_name_is_the_first_pod_fqdn() {
+    fn common_name_is_the_internal_service_fqdn() {
         let cluster = cert_manager_cluster("Issuer", None);
         let obj = build(&cluster, &cluster.spec).unwrap();
         assert_eq!(
             obj.data["spec"]["commonName"],
-            "c-0.c-internal.ns.svc.cluster.local"
+            "c-internal.ns.svc.cluster.local"
         );
     }
 

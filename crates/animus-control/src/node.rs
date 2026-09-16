@@ -183,6 +183,32 @@ const REBALANCE_EVERY_N_TICKS: u64 = 8;
 /// retarget itself sound regardless of how this is tuned.
 pub const SPLIT_PLACING_RETARGET_DWELL: Duration = Duration::from_millis(5_000);
 
+/// The same dwell, but for a target that has ALREADY been achieved —
+/// `Tablet::replicas` already equals the stored `SplitPlacing::target`
+/// (issue #670/#921 fix). Once metadata has fully committed to a directed-
+/// Placing decision, reconsidering it is strictly more disruptive than
+/// reconsidering one still mid-convergence: `replan`'s only remaining
+/// eligible candidates for a split child are typically its own pre-split
+/// siblings, so a retarget here can converge the tablet right back toward
+/// the set the split was moving it away from — reproduced directly, twice,
+/// over real `ProdEnv` clusters under nothing more than this sandbox's own
+/// ordinary background load (no synthetic contention beyond the two
+/// concurrent processes `crates/animusd/tests/
+/// split_placing_two_replica_diff_e2e.rs` itself runs): `n0`'s own
+/// `voter_history` reaching the correct 3-member target and then, seconds
+/// later, changing AGAIN to a different 4-then-3-member set. A genuinely
+/// (not falsely) dead member here still self-heals — it just does so more
+/// slowly, at [`SPLIT_PLACING_RETARGET_DWELL`]'s own 6x multiple, which
+/// `docs/engineering-lessons.md`'s issue #670/#921 entry measures as
+/// comfortably past what this repo's own two-concurrent-heavy-process
+/// contention methodology can sustain, while [`SPLIT_PLACING_RETARGET_
+/// DWELL`] itself demonstrably is not. This is a deliberate asymmetry, not
+/// an oversight: ADR 0062 §2's own stated design goal is "the target is
+/// never recomputed while it is healthy, which is what makes it stable" —
+/// this constant extends that same stability guarantee to the point AFTER
+/// the target has already been fully realized, where it matters most.
+pub const SPLIT_PLACING_RETARGET_DWELL_ACHIEVED: Duration = Duration::from_millis(30_000);
+
 /// How often a member emits a liveness heartbeat to the control group
 /// (ADR 0012). On the order of the Raft heartbeat interval, and short relative to
 /// [`DETECT_TIMEOUT`] so a live member is comfortably seen within the window.
@@ -214,6 +240,39 @@ const DETECT_INTERVAL: Duration = Duration::from_millis(100);
 /// `broadcast_append` on every leader tick) so one delayed/dropped
 /// `AppendEntries` round doesn't flap a healthy voter.
 pub const CONTROL_PEER_LIVENESS_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// [`CONTROL_PEER_LIVENESS_TIMEOUT`]'s own post-takeover counterpart to
+/// [`LEADER_GRACE`] (issue #923). A voter this leader has genuinely never
+/// heard from in a PRIOR stint gets an unbounded "never contacted yet" grace
+/// from [`RaftNode::control_peer_believed_alive`] — but `become_leader` also
+/// seeds every peer's `last_contact` to the instant it takes over, precisely
+/// so a peer that stays silent for the entire stint can't hide behind that
+/// grace forever. That seed is a courtesy timestamp, not a genuine ack, and
+/// it makes "peer hasn't answered yet because I only just became leader"
+/// look byte-identical to "peer has gone properly silent" once
+/// `CONTROL_PEER_LIVENESS_TIMEOUT` has passed either way — which is exactly
+/// what let `admin_remove_control_member`'s quorum guard misjudge a
+/// perfectly alive voter as dead moments after a leadership transfer
+/// (issue #923): a fresh leader's very first heartbeat round has to survive
+/// election processing plus whatever scheduling/network contention a
+/// disruptive leadership change itself stirs up, on top of the ordinary
+/// heartbeat round trip `CONTROL_PEER_LIVENESS_TIMEOUT` alone budgets for.
+/// `control_peer_believed_alive` grants any peer this much time since
+/// [`RaftCore::leader_since`] before treating a `last_contact` that is
+/// stale-by-[`CONTROL_PEER_LIVENESS_TIMEOUT`] as a real death verdict — a
+/// GENUINE ack (`handle_append_resp`) still clears that peer's own
+/// staleness clock immediately, so a peer that answers promptly is never
+/// held to this wider window; only a peer this leader has heard nothing
+/// from ALL stint is. Deliberately several multiples of
+/// `CONTROL_PEER_LIVENESS_TIMEOUT`, not equal to it — a value equal to it
+/// would be a no-op (`become_leader`'s own seed already provides exactly
+/// that much grace) and would not have caught issue #923's own failure,
+/// which needed more than one ordinary timeout's worth of slack. Still
+/// bounded, unlike the never-contacted-in-a-PRIOR-stint case: a voter that
+/// stays silent for this whole window, this soon after a transfer, is
+/// treated as genuinely dead exactly like any other stale peer — this is
+/// extra patience for a fresh leader's first round, not a blanket amnesty.
+pub const CONTROL_LEADER_TAKEOVER_GRACE: Duration = Duration::from_millis(2_000);
 
 /// Grace period after this node first observes itself leader for a term, during
 /// which it will **not** mark any member `Down` (ADR 0012). The
@@ -967,8 +1026,18 @@ impl<E: Env> RaftNode<E> {
     ///   an election. Deliberately generous, not "unknown" — see the
     ///   `last_contact` field doc in `raft.rs` for why this case is not
     ///   back-filled instead.
-    /// - Otherwise: alive iff the last contact is within
-    ///   [`CONTROL_PEER_LIVENESS_TIMEOUT`] of now.
+    /// - Otherwise: alive if the last contact is within
+    ///   [`CONTROL_PEER_LIVENESS_TIMEOUT`] of now, OR this leadership stint
+    ///   itself began within [`CONTROL_LEADER_TAKEOVER_GRACE`] of now
+    ///   (issue #923) — `last_contact` may hold nothing but `become_leader`'s
+    ///   own courtesy seed, never a genuine ack, and a fresh leader's first
+    ///   real heartbeat round can legitimately outrun the steady-state
+    ///   timeout under the load a leadership change itself creates; see
+    ///   [`CONTROL_LEADER_TAKEOVER_GRACE`]'s own doc for why this is a wider
+    ///   window, not the same one `become_leader`'s seed already provides.
+    ///   A GENUINE ack (`handle_append_resp`) refreshes `last_contact`
+    ///   immediately, so this extra allowance only ever matters for a peer
+    ///   this stint has heard nothing real from yet.
     ///
     /// Meaningful only when this node is (or recently was) the control
     /// leader — a non-leader's `last_contact` map is always empty (nobody
@@ -979,11 +1048,32 @@ impl<E: Env> RaftNode<E> {
         if node == self.env.node_id() {
             return true;
         }
-        match self.lock().peer_last_contact(node) {
+        let core = self.lock();
+        let last_contact = core.peer_last_contact(node);
+        let leader_since = core.leader_since();
+        drop(core);
+        let now = self.env.now();
+        match last_contact {
             None => true,
             Some(last) => {
-                let now = self.env.now();
-                now.0.saturating_sub(last.0) < CONTROL_PEER_LIVENESS_TIMEOUT.as_nanos() as u64
+                if now.0.saturating_sub(last.0) < CONTROL_PEER_LIVENESS_TIMEOUT.as_nanos() as u64 {
+                    return true;
+                }
+                // Stale by the steady-state timeout — still generous if this
+                // leadership stint itself is young enough that `last` could
+                // be nothing more than `become_leader`'s own seed rather
+                // than a real silence.
+                match leader_since {
+                    Some(since) => {
+                        now.0.saturating_sub(since.0)
+                            < CONTROL_LEADER_TAKEOVER_GRACE.as_nanos() as u64
+                    }
+                    // Not currently leader (or `leader_since` predates this
+                    // accessor's own introduction — never true in practice
+                    // since it's set unconditionally in `become_leader`):
+                    // no extra allowance to give.
+                    None => false,
+                }
             }
         }
     }
@@ -1875,6 +1965,11 @@ async fn reconcile_loop<E: Env>(env: E, core: Arc<Mutex<RaftCore>>, cache: Arc<M
     // retarget, never mis-times one unsoundly (the epoch-CAS on
     // `RetargetSplitPlacing` is what keeps it safe regardless).
     let mut retarget_since: BTreeMap<(TabletId, NodeId), Nanos> = BTreeMap::new();
+    // Driver-local grace tracking for ordinary repair/rebalance's post-`done`
+    // exclusion (issue #928/#921 fix) — see `recently_done_this_tick`'s own
+    // doc. Same volatile, per-node, `env.now()`-keyed, lost-on-leadership-
+    // change shape as `retarget_since` above, for the identical reason.
+    let mut done_since: BTreeMap<TabletId, Nanos> = BTreeMap::new();
     loop {
         env.sleep(RECONCILE_INTERVAL).await;
         tick = tick.wrapping_add(1);
@@ -1894,10 +1989,15 @@ async fn reconcile_loop<E: Env>(env: E, core: Arc<Mutex<RaftCore>>, cache: Arc<M
             // in the past, mirroring the failure detector's own cold-start
             // stance on regaining leadership.
             retarget_since.clear();
+            done_since.clear();
             continue;
         }
         let view = cache.lock().expect("cache poisoned").placement_view();
-        let proposals = view.reconcile();
+        // Issue #928/#921 fix: computed before repair/rebalance so both can
+        // exclude a tablet still inside its post-`done` grace window — see
+        // `recently_done_this_tick`'s own doc.
+        let recently_done = recently_done_this_tick(&env, &view, &mut done_since);
+        let proposals = view.reconcile(&recently_done);
         let repaired = !proposals.is_empty();
         for command in proposals {
             // Off-leader transitions between the check and here are harmless:
@@ -1913,7 +2013,7 @@ async fn reconcile_loop<E: Env>(env: E, core: Arc<Mutex<RaftCore>>, cache: Arc<M
         // safety is the epoch-CAS + data-plane catch-up gate, not this timing.
         if !repaired
             && tick.is_multiple_of(REBALANCE_EVERY_N_TICKS)
-            && let Some(command) = view.rebalance()
+            && let Some(command) = view.rebalance(&recently_done)
         {
             core.lock().expect("raft core poisoned").propose(command);
         }
@@ -1936,6 +2036,12 @@ async fn reconcile_loop<E: Env>(env: E, core: Arc<Mutex<RaftCore>>, cache: Arc<M
 /// set of tablets for which at least one target member has been down for at
 /// least [`SPLIT_PLACING_RETARGET_DWELL`] — i.e. tablets `split_placing_
 /// reconcile` may recompute a fresh target for this tick.
+///
+/// **Issue #670/#921 fix**: a tablet whose `Tablet::replicas` already equals
+/// the stored `target` uses [`SPLIT_PLACING_RETARGET_DWELL_ACHIEVED`]
+/// instead of the base dwell — see that constant's own doc for why an
+/// already-achieved target is held to a stricter (longer) bar before being
+/// reconsidered than one still mid-convergence.
 ///
 /// `retarget_since` is mutated in place: a member observed `Active` this
 /// tick has its tracked timer removed (a "continuously down" clock must
@@ -1961,6 +2067,10 @@ fn retarget_ready_this_tick<E: Env>(
         let Some(target) = &entry.target else {
             continue; // nothing stored yet for this entry — no dwell to track
         };
+        let dwell = match view.tablets.get(&tablet) {
+            Some(t) if t.replicas == *target => SPLIT_PLACING_RETARGET_DWELL_ACHIEVED,
+            _ => SPLIT_PLACING_RETARGET_DWELL,
+        };
         for member in target {
             let is_active = view
                 .members
@@ -1973,13 +2083,64 @@ fn retarget_ready_this_tick<E: Env>(
             let since = *retarget_since
                 .entry((tablet, member.clone()))
                 .or_insert(now);
-            if now.duration_since(since) >= SPLIT_PLACING_RETARGET_DWELL {
+            if now.duration_since(since) >= dwell {
                 ready.insert(tablet);
             }
         }
     }
     retarget_since.retain(|key, _| live.contains(key));
     ready
+}
+
+/// One tick's worth of post-`done` grace-window bookkeeping for
+/// `reconcile_loop`'s ordinary repair/rebalance phases (issue #928/#921
+/// fix): the set of tablets whose `split_placing` entry has been `done` for
+/// less than [`SPLIT_PLACING_RETARGET_DWELL_ACHIEVED`], counted from the
+/// FIRST tick this leader observed `done` for that tablet (`done_since` is
+/// mutated in place to track that first-seen instant, `env.now()`-keyed,
+/// never wall clock, exactly like `retarget_since`).
+///
+/// **Why this exists**: `SPLIT_PLACING_RETARGET_DWELL_ACHIEVED` (the
+/// 2026-09-16 issue #670/#921 fix, see that constant's own doc) protects an
+/// achieved-but-not-yet-`done` directed-Placing target from
+/// `split_placing_reconcile`'s own retarget. It does **not** protect the
+/// tablet the instant `done` fires (`SPLIT_PLACING_DONE_SETTLE`, 1.5s,
+/// fires quickly) and it falls under *ordinary*, un-dwelled
+/// `Metadata::reconcile`/`rebalance` — a failure-detector false positive
+/// there reproduces the identical achieved-target-discarded regression via
+/// a different code path. This closes that gap for exactly the tablets this
+/// crate can still name a `split_placing` history for (**not** issue #928's
+/// fully general form — an ordinary tablet with no split-placing history at
+/// all still has no dwell against a false positive; hardening the failure
+/// detector's own `Down` transition, or giving `reconcile()` a general
+/// per-violation dwell, remain open, cross-cutting follow-ups with their own
+/// availability trade-offs — see that issue).
+///
+/// A tablet's own timer is one-shot from first observation, not reset by
+/// anything (unlike `retarget_since`'s liveness-flap reset) — `done` cannot
+/// un-flip, so there is nothing to restart. Pruned once past the grace
+/// window or once the tablet no longer carries a `done` entry at all, so
+/// this map never grows unbounded across a long-running leader's lifetime.
+fn recently_done_this_tick<E: Env>(
+    env: &E,
+    view: &PlacementView,
+    done_since: &mut BTreeMap<TabletId, Nanos>,
+) -> BTreeSet<TabletId> {
+    let now = env.now();
+    let mut recent = BTreeSet::new();
+    let mut live: BTreeSet<TabletId> = BTreeSet::new();
+    for (&tablet, entry) in &view.split_placing {
+        if !entry.done {
+            continue;
+        }
+        let since = *done_since.entry(tablet).or_insert(now);
+        if now.duration_since(since) < SPLIT_PLACING_RETARGET_DWELL_ACHIEVED {
+            live.insert(tablet);
+            recent.insert(tablet);
+        }
+    }
+    done_since.retain(|tablet, _| live.contains(tablet));
+    recent
 }
 
 /// The leader's failure detector (ADR 0012): on a timer, if this node is leader,

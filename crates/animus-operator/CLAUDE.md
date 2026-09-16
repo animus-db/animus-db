@@ -451,6 +451,118 @@ exists to catch a genuinely wedged process; the kubelet's only response to
 a liveness failure is a hard restart, which cannot fix "no quorum yet" and
 actively makes it worse.
 
+## `spec.controlNodes` growth's retry/logging contract, and `storage.ephemeral`'s quorum-loss hazard (issue #864, 2026-09-15)
+
+Two related fixes, both from root-causing the recurring S-07d e2e stall
+(`e2e-kind-s3`/`-tls`/`-webhook`/`-encryption`) — see ADR 0060's matching
+2026-09-15 amendment for the full investigation.
+
+**The growth step's own retry contract**: `add_control_voter`
+(`controller.rs`) must never treat a single 409/timeout from one
+already-confirmed voter ordinal as reason to wait for the next ~30s
+reconcile — `RaftCore::change_membership`'s own erratum guard (Raft
+§4/Ongaro) is a genuine one-round-trip-after-election transient, and two
+other call sites in this codebase already needed the identical bounded
+retry (issues #667/#900). `ADD_VOTER_ROUNDS` (5, 500ms backoff) retries
+the whole "ask every already-confirmed voter" round inside one reconcile
+before giving up. **Every attempt and every "no progress this reconcile"
+branch of `advance_control_growth` now logs at `INFO`** (target url,
+round, outcome) — before this fix, a stalled growth reconcile left the
+operator log showing nothing but the `kube-runtime` framework's own
+periodic reconcile-span tag, with no way to tell which of several
+possible causes was actually in play. Any future change to this call
+site must preserve that invariant: **a stalled reconcile must always be
+explainable from the log alone.**
+
+**`storage.ephemeral: true` cannot survive a `controlNodes` growth (or any
+other config-affecting spec change)** — this is the actual mechanism the
+three recorded e2e occurrences hit, not the erratum guard above (verified
+against a later `e2e-kind-encryption` occurrence captured with `/admin/
+raft`'s `cluster_check_pending`/`refused_as_voter` diagnostics: growth
+*converged*, then the whole group went leaderless, term inflating into
+the hundreds, because the newly-promoted voter was the *only* one left
+un-refused). The chain: `restart_relevant_projection`'s config-hash
+annotation is **one shared value for the whole `StatefulSet`**, so any
+edit that changes it (not just `controlNodes` — `spec.tls`/`spec.s3`/
+`spec.encryptionKeySecretName` too) rolls **every** pod, including
+already-correct ordinals whose own role never changes; a `StatefulSet`'s
+default `RollingUpdate` deletes and recreates each Pod (discarding an
+`emptyDir` along with it, unlike an in-place container restart); a
+recreated EXISTING voter therefore comes back with an empty Raft WAL
+while its own peers' committed config still names it with real history —
+exactly the case issue #667's boot-time check refuses **permanently**, on
+purpose, to prevent an unsafe double vote. Refuse enough pre-growth
+voters this way and the group loses quorum for good. This crate cannot
+fix this by itself — `scripts/e2e-kind.sh` now uses durable
+(`PersistentVolumeClaim`) storage instead, the supported shape per this
+struct's own doc comment (`crd::StorageSpec::ephemeral`) — but it does
+surface it: `CONDITION_EPHEMERAL_VOTER_STORAGE_HAZARD` is set,
+unconditionally, whenever `spec.storage.ephemeral` is `true`, so a future
+ephemeral cluster's operator sees this in `kubectl get animuscluster -o
+yaml` rather than only in an ADR. **Whether this should instead be a hard
+validating-webhook rejection is left open as a maintainer decision** — see
+ADR 0060's amendment.
+
+**The real, third bug (found after the ephemeral-storage fix landed):
+`advance_control_growth` must never be gated on the `ControlNodesGrowing`
+status condition surviving across reconciles.** The call site in
+`reconcile` used to be `if target_control_nodes > prior || already_growing
+{ ... }`, where `prior` (`previous_applied_control_nodes`, the
+ConfigMap's own applied value) reaches `target` on the very first
+reconcile after a `controlNodes` edit (`reconcile_grows_regenerates_the_
+configmap_role_split_immediately`'s own pinned behavior) — so from the
+second reconcile onward, only `already_growing` (read off `cluster.
+status`, delivered by `kube-runtime`'s watch-fed reflector, never a live
+`GET`) could still trigger the check at all. A real occurrence (issue
+#864) showed exactly this: the growth-step log line present on the
+reconcile right after the patch, and never again once the promoted
+ordinal went `NotReady` — `advance_control_growth` simply stopped being
+called, permanently, with `prior` never dropping back down to retrigger
+it. **Fixed by calling `advance_control_growth` unconditionally** once
+`prior` is known and the edit isn't a rejected shrink — its own first
+step (`discover_control_voters`) is already a cheap live check that
+decides whether there's anything to do, exactly matching this module's
+own "live-truth-driven, not a stored plan" design intent; the status
+condition is a resume-optimization / progress message only, never a gate
+on whether to check again. See ADR 0060's amendment (Part C) for the full
+account and `reconcile_still_attempts_growth_when_the_growing_condition_
+did_not_survive`'s own regression test.
+
+**A `kubectl rollout status statefulset/...` wait after growth converges
+(the e2e's own follow-up phase) can time out for a reason unrelated to
+this crate's own reconcile logic**: a real occurrence (ADR 0060's Part E)
+found `e2e-kind-tls`'s promoted ordinal stuck `Ready: False` forever,
+not from a second config-hash roll (checked directly against the
+StatefulSet's own events — there wasn't one) but from persistent
+intra-cluster mTLS `BadCertificate` handshake failures against its
+never-restarted peers, filed separately as issue #913 (a TLS
+certificate-lifecycle question, not a growth-mechanism one). Also from
+that investigation: this crate's own log capture was confirmed reliable
+(`tracing_subscriber::fmt::init()`'s default writer is synchronous and
+line-flushing, never buffered; the e2e execs the operator exactly once
+and never truncates its log) — a stalled run that looks log-sparse is a
+`tail` cap on the diagnostics dump discarding a busy reconcile burst
+(this `owns()`-watches-five-child-kinds crate can genuinely produce one),
+not a missing- or lost-log bug. `scripts/e2e-kind.sh`'s diagnostics now
+print the log's own line count and the operator process's own liveness
+before a much wider `tail`, so this doesn't need re-deriving next time.
+
+**A plain (non-TLS) `e2e-kind` run hit the identical `rollout status`
+timeout with growth working perfectly (ADR 0060's Part F)** — the stuck
+pod was a *different*, already-durable, pre-existing voter recreated by
+the same config-hash roll, never becoming Ready. Checked and refuted:
+the "durable" PVC mount not actually being where `animusd` reads/writes
+— the "data" `VolumeMount`'s `mount_path` and the `--dir` flag
+`entrypoint_script` execs `animusd` with are both generated from the
+same `cluster_config::DATA_DIR` constant, pinned by
+`data_volume_mount_path_matches_the_animusd_dir_flag`
+(`desired/statefulset.rs`). What's still open: *why* that recreated
+voter never became Ready is unknown — the e2e's own diagnostics used to
+dump only the growth target's own `/admin/raft`, never the pod that was
+actually stuck; `dump_growth_target_admin_state` is now
+`dump_every_pod_admin_state`, looping over every ordinal
+`0..replicas-1`, so the next recurrence's own diagnostics will show it.
+
 ## TLS (ADR 0064 commit 3)
 
 `AnimusClusterSpec.tls: Option<TlsSpec>` (`crd.rs`), two mutually exclusive
@@ -472,7 +584,27 @@ Either shape resolves to the same `Secret` name
 
 - `desired::certificate::build` creates a `Certificate` (a sixth
   `apply_children` child, applied only for the `certManager` shape) whose
-  SAN list (`dns_names`) covers every pod's own FQDN plus both Services.
+  SAN list (`dns_names`) covers the headless internal `Service`'s own name
+  plus both Services. **Since issue #913, `dns_names` takes no node count
+  at all** — it used to enumerate one FQDN per pod ordinal
+  (`(0..spec.nodes).map(pod_fqdn)`), which meant every `spec.nodes`
+  scale-up changed the `Certificate.spec` and triggered cert-manager to
+  reissue the one leaf every pod mounts identically (below); a pod
+  recreated mid-reissue (a `spec.controlNodes` growth's own config-hash
+  roll, which restarts every pod, not just the newly-promoted ordinal) got
+  the *other* side of that reissue than its still-running peers, and
+  `animusd` never reloads TLS material after boot (ADR 0064 Decision 6),
+  so they never agreed on a trust anchor again —
+  `AlertReceived(BadCertificate)`, permanently. Now `dns_names` returns two
+  **wildcard** SANs (`*.<internal-svc>.<ns>.svc` and the `.cluster.local`
+  form) instead of the per-ordinal list: a headless `Service`'s pod DNS
+  name is always exactly one label before the service name, so a
+  single-label wildcard covers every ordinal a cluster will ever have,
+  and a scale-up never touches the `Certificate` again. See ADR 0064's
+  issue #913 amendment for the full mechanism and the matching
+  `scripts/e2e-kind.sh` CA-hierarchy fix (a bare `selfSigned`
+  `ClusterIssuer` must never be the direct `issuerRef` for a multi-pod
+  mTLS deployment — see this file's e2e section below).
 - `desired::statefulset::build` mounts the resolved `Secret` read-only at
   `/etc/animus/tls` on every pod — identical mount for either shape.
 - **2026-09-05**: `desired::statefulset::build` also switches the
@@ -509,12 +641,47 @@ Either shape resolves to the same `Secret` name
 **`scripts/e2e-kind.sh --tls` path (`E2E_TLS=1`) is UNVERIFIED in this
 sandbox** — `kind` cannot come up here at all (see the e2e section's own
 `CAP_SYS_RESOURCE` note), so the TLS-specific script additions (cert-manager
-install, a self-signed `ClusterIssuer`, `spec.tls.certManager` on the
+install, a self-signed CA hierarchy, `spec.tls.certManager` on the
 manifest, waiting on the `Certificate`'s own `Ready` condition, and
 `curl --cacert --resolve` against the dynamo Service's own SAN) have been
-written carefully and `bash -n`-checked, but never run end to end. Treat a
-first real CI failure on the `e2e-kind-tls` job as this path finding its
-first real bug, not as this note being wrong.
+written carefully and `bash -n`-checked (plus, for every heredoc touched,
+rendered with its variables set and parsed as YAML — a comment with a
+backtick inside an unquoted heredoc executes as shell, not YAML), but
+never run end to end. Treat a first real CI failure on the `e2e-kind-tls`
+job as this path finding its first real bug, not as this note being wrong.
+
+**Since issue #913, the e2e's own `ClusterIssuer` is a two-step CA
+hierarchy, not a bare `selfSigned` one.** A bootstrap `selfSigned: {}`
+`ClusterIssuer` mints exactly one CA `Certificate` (`isCA: true`), once; a
+second `ClusterIssuer` (`spec.ca.secretName`) signs the cluster's actual
+leaf off that CA's key, and only *that* issuer is ever named in the
+`AnimusCluster`'s own `spec.tls.certManager.issuerRef`. This is not
+e2e-specific advice: handing a bare `selfSigned` issuer directly to a
+multi-pod mTLS `issuerRef` means every reissuance is a brand-new,
+mutually-untrusted root (cert-manager's self-signed output Secret sets
+`ca.crt` equal to the leaf itself), whereas a `ca`-backed issuer's output
+Secret sets `ca.crt` to the stable signing CA's own certificate —
+unaffected by a leaf renewal. `deploy/operator/README.md`'s TLS section
+carries the same guidance for real deployments.
+
+**Issue #913 round 2 (2026-09-16): this fix is necessary but not yet
+proven sufficient.** A fresh-head `e2e-kind-tls` run of this exact fix
+(stacked under PR #909's `kubectl rollout status` addition, so the run
+could no longer report success before pod 3 was actually `Ready`) still
+hit the identical `BadCertificate` failure. Three of the four standing
+hypotheses are now ruled out with direct evidence — the wildcard SAN
+correctly matches a per-ordinal pod hostname (a new decisive test,
+`crates/animus-env/src/prod.rs`'s
+`tls_wildcard_san_matches_a_per_ordinal_pod_hostname`), client-certificate
+verification does no hostname check, and the operator's own re-apply of
+the `Certificate` is a server-side-apply of byte-identical content that
+gives cert-manager nothing to react to. What remains open is a genuine
+timing/propagation question this crate's own code cannot settle — see
+ADR 0064's issue #913 round-2 amendment for the full account.
+`dump_diagnostics` (`scripts/e2e-kind.sh`) now captures `Certificate`/
+`Secret` resourceVersions, `CertificateRequest` objects/events, and
+`tls.crt`/`ca.crt` fingerprints whenever `E2E_TLS=1`, specifically so the
+next run settles it.
 
 ## S3 (S-04 PR 3, closes `docs/roadmap.md`'s S-04)
 
@@ -881,10 +1048,9 @@ fully unit-tested — turning the control group's own live voter-id set
 `parse_voters`) into "which ordinal is missing next" / "how many are
 already confirmed". Everything async around them
 (`fetch_control_members`/`discover_control_voters`/
-`ordinal_reports_role_both`/`resolve_control_dial_addr`/
-`add_control_voter`/`advance_control_growth`) is a thin orchestration
-layer exercised through `FakeAdminClient`/`FakeClusterApi` — see Tests
-below.
+`ordinal_reports_role_both`/`add_control_voter`/`advance_control_growth`)
+is a thin orchestration layer exercised through `FakeAdminClient`/
+`FakeClusterApi` — see Tests below.
 
 **Config-hash restart annotation, a separate, independently-reviewable
 groundwork step (its own first commit)**: `desired::statefulset::
@@ -905,17 +1071,26 @@ behind `controlNodes` specifically — there was no clean way to restart
 across every ordinal), so this is the simplest correct mechanism, not a
 narrowly-scoped one.
 
-**`ClusterApi::get_pod_ip` is this crate's first real consumer of the
-`pods: get/list/watch` RBAC grant** `deploy/operator/rbac.yaml` already
-carried (pre-provisioned for "the controller reads pod status/conditions"
-in general, never actually exercised before S-07d) — no RBAC change was
-needed. It reads a promoted ordinal's live `status.podIP` via the
-Kubernetes API, **not a DNS lookup** — seeded via `FakeClusterApi::
-seed_pod_ip` in tests, unlike a raw `tokio::net::lookup_host` call, which
-would bypass the seam entirely and make this untestable without a real
-cluster. See ADR 0060's own "The `SocketAddr` gap" subsection for why this
-lookup exists at all (a real, pre-existing `animusd` admin-API limitation
-this crate works around rather than fixes).
+**(2026-09-16, issue #913) `add_control_voter` dials the promoted
+ordinal's own stable `desired::pod_fqdn(name, ns, ordinal)` hostname —
+never a live `status.podIP`.** `ClusterApi::get_pod_ip` (and the
+`resolve_control_dial_addr`/`FakeClusterApi::seed_pod_ip`/`desired::
+pod_name` machinery that existed solely to serve it) is **deleted**, not
+kept as a fallback: it worked around a real `animusd` admin-API
+limitation — `admin::AddControlMemberReq.addr` used to be typed
+`std::net::SocketAddr`, which can only ever deserialize a numeric
+address — by resolving and pinning the pod's *current* IP instead of its
+stable DNS name. That was fine for plaintext dialing, but under mutual
+TLS with DNS-only certificate SANs it fails every handshake permanently:
+`ServerName::IpAddress` against a cert with no IP SAN is rejected
+outright, and the very re-registration that would otherwise "self-heal"
+the pinned IP into the real hostname itself needs a working dial to the
+newly-promoted node to land — so the failure never recovers. `animusd`'s
+own field is now a plain `String` (`docs/adr/
+0037-control-plane-membership-change.md`'s issue #913 amendment), so
+this crate no longer needs to resolve anything at all — `add_control_
+voter` just formats the same hostname:port string every other
+Kubernetes-pod address surface in this codebase already uses.
 
 **`FakeAdminClient` (S-07d additions, `fakes.rs`)**: `seed_control_voters`/
 `control_voters()` back `GET /admin/control/members` with a plain
@@ -1318,20 +1493,24 @@ run immediately, on the first attempt, unchanged. See the script's own
 header comment for the two failing run links and the full reasoning.
 
 **`E2E_TLS=1` (ADR 0064 commit 3, CI's own `e2e-kind-tls` job) runs the same
-smoke over TLS**: installs cert-manager (pinned version), creates a
-self-signed `ClusterIssuer`, sets `spec.tls.certManager` on the
-`AnimusCluster` manifest, waits for the resulting `Certificate`'s own
-`Ready` condition, then drives the DynamoDB wire with `curl --cacert
---resolve` (the dynamo Service's cluster-DNS name — one of the
-`Certificate`'s own SANs, `desired::certificate::dns_names` — resolved to
-the port-forward's `127.0.0.1`, so hostname verification passes against the
-issued cert) instead of plain HTTP; the plain-TCP path (`E2E_TLS` unset) is
-byte-for-byte unchanged. **UNVERIFIED in this repository's sandboxed dev
-environment** — this environment cannot bring up `kind` at all (see this
-section's own `CAP_SYS_RESOURCE` note below), so the TLS additions have
-been written carefully and `bash -n`-checked but have not been run end to
-end anywhere; the first real `e2e-kind-tls` CI run is this path's first
-real test.
+smoke over TLS**: installs cert-manager (pinned version), then (since issue
+#913) a bootstrap self-signed `ClusterIssuer` that mints one CA
+`Certificate`, followed by a second, `ca`-backed `ClusterIssuer` signing
+off that CA — never a bare `selfSigned` issuer named directly in
+`spec.tls.certManager.issuerRef` (see the TLS section above for why). Sets
+`spec.tls.certManager` on the `AnimusCluster` manifest, waits for the
+resulting `Certificate`'s own `Ready` condition, then drives the DynamoDB
+wire with `curl --cacert --resolve` (the dynamo Service's cluster-DNS name
+— one of the `Certificate`'s own SANs, `desired::certificate::dns_names` —
+resolved to the port-forward's `127.0.0.1`, so hostname verification passes
+against the issued cert) instead of plain HTTP; the plain-TCP path
+(`E2E_TLS` unset) is byte-for-byte unchanged. **UNVERIFIED in this
+repository's sandboxed dev environment** — this environment cannot bring up
+`kind` at all (see this section's own `CAP_SYS_RESOURCE` note below), so
+the TLS additions have been written carefully, `bash -n`-checked, and (for
+the heredocs) rendered-and-YAML-parsed, but have not been run end to end
+anywhere; the first real `e2e-kind-tls` CI run is this path's first real
+test.
 
 **`E2E_S3=1` (S-04 PR 3, CI's own `e2e-kind-s3` job) runs the same smoke
 plus a `spec.s3.backupStore` leg**: deploys a single-pod RustFS + Service

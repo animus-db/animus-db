@@ -3746,6 +3746,30 @@ sweeper-skip regression
 (`write_after_leader_kill_of_a_quiesced_group_converges`) — the one
 property `SimEnv` structurally cannot prove.
 
+**Issue #920 (2026-09-16) — a rolling restart of every replica, quiescence
+investigated and ruled out.** `src/sim_cluster_quiesced_rolling_restart.rs`
+has two `SimCluster` scenarios: `quiesced_group_survives_rolling_restart_
+every_order` proves the plain mechanism this section documents already
+self-heals a clean rolling restart of a quiesced 3-replica group (crash +
+restart every replica, every order, durable per-tablet engine reused) —
+passes unmodified, converging in well under a second, since a restarted
+replica's `leader_id` resets to `None` (volatile) and its own ordinary
+election timeout campaigns unaided; quiescence's own wake machinery (fork
+B/H) was never the blocker. `quiesced_group_survives_rolling_restart_
+racing_failure_driven_repair_every_order` is the actual regression: it
+reproduces the production incident by racing the SAME rolling restart
+against the control plane's OWN failure-driven placement repair (ADR
+0012's `DETECT_TIMEOUT`, 500ms, trips on an ordinary pod recreation just
+as readily as a real failure) — fails deterministically on unmodified
+`main` (every order), fixed by reordering `animus-cp-data::RaftKvNode::
+reconfigure_step`'s down-voter-removal step to run after, not before, the
+add-a-replacement-first learner-phase steps (see that crate's `CLAUDE.md`
+and ADR 0048's 2026-09-16 amendment for the full mechanism). Both use the
+same `ANIMUS_QUIESCE_SEEDS` depth knob `animus-cp-data/tests/
+quiescence.rs` already defines — a new cell of that corpus, hosted here
+because it needs this crate's own `ClientCtx`/forwarding machinery, not a
+reason for a new `ANIMUS_*_SEEDS` variable.
+
 ## Heartbeat batching (ADR 0044 phase 2 — C-02 PR 2 shipped it off by
 default; PR 3, the cutover, flips the default ON — C-02 is now complete)
 
@@ -5597,7 +5621,18 @@ ADR itself for the full design/rationale.
   `control-remove` as part of decommission," never "skip its safety
   checks"). See ADR 0037 (and ADR 0040's amendment on it) for the full
   design, and `docs/engineering-lessons.md` for the id-space-mismatch and
-  self-registration/admin-action-clobber war stories. **`admin_add_control_
+  self-registration/admin-action-clobber war stories. **This guard's own
+  post-election gap (issue #923, ADR 0037's 2026-09-16 amendment)**: right
+  after a leadership transfer, the guard could refuse a removal that names
+  a perfectly alive original voter "apparently dead," because `become_
+  leader`'s per-peer `last_contact` seed (a courtesy timestamp, not a
+  genuine ack) aged out after the same steady-state `CONTROL_PEER_
+  LIVENESS_TIMEOUT` a real ack would, and a fresh leader's first real
+  heartbeat round can legitimately take longer than that under the load a
+  leadership change itself creates. Fixed in `animus-control` (`RaftCore::
+  leader_since` + `CONTROL_LEADER_TAKEOVER_GRACE`, node.rs) — nothing in
+  this crate's own guard code changed, only the liveness signal it reads.
+  **`admin_add_control_
   member`'s "already registered?" gate must check `Metadata::node_addrs`,
   never `members` alone, and must bound-wait for this leader's own
   `engine_applied_index() >= commit_index()` before reading either
