@@ -331,6 +331,26 @@ phase() {
 # than `kubectl exec`ing a curl inside the pod. Best-effort throughout
 # (`|| true` on every step) — a diagnostics dump must never itself fail the
 # run or mask the original failure.
+#
+# **Under `E2E_TLS=1`, `$CURL_TLS_ARGS` cannot be reused as-is** (issue
+# #864, commit e8f9145, ported here): its own `--resolve` entries are bound
+# to `$DYNAMO_LOCAL_PORT`/`$ADMIN_LOCAL_PORT` specifically (the *primary*
+# port-forward's fixed local ports), so they never match this function's
+# own `$local_port` (18102) and curl falls through to real DNS resolution
+# of a cluster-internal name from outside the cluster — which fails,
+# indistinguishable from the pod itself being down (a real occurrence: a
+# TLS-leg run reported every pod `<unreachable>` for `/admin/health`,
+# `/admin/raft`, *and* `/admin/raftkv` while every pod was actually
+# healthy, per `kubectl describe pods`). Every pod presents the identical
+# shared leaf certificate (ADR 0064 commit 3), so `$ADMIN_HOST` — already
+# a name that certificate covers (`$DYNAMO_HOST`, an exact SAN entry via
+# `desired::certificate::dns_names`) — just needs a fresh `--resolve`
+# naming *this* function's own local port instead. Also captures curl's
+# own error text (via the "redirect stdout to /dev/null, swap stderr onto
+# the command substitution's stdout" trick) whenever the status-code probe
+# comes back empty, so `<unreachable>` is never bare — it always carries
+# curl's own diagnostic, distinguishing a diagnostics-pipeline failure
+# from a real pod failure without a second, ambiguous pass next time.
 dump_per_pod_admin_state() {
     local pods
     pods="$(kubectl get pods -n "$NAMESPACE" -o name 2>/dev/null || true)"
@@ -338,11 +358,15 @@ dump_per_pod_admin_state() {
         log "per-pod admin-state dump: no pods found, skipping"
         return 0
     fi
+    local local_port=18102
+    local dump_curl_args=()
+    if [ "$E2E_TLS" = "1" ]; then
+        dump_curl_args=(--cacert "$CA_FILE" --resolve "${ADMIN_HOST}:${local_port}:127.0.0.1")
+    fi
     local pod
     for pod_ref in $pods; do
         pod="${pod_ref#pod/}"
         log "per-pod admin-state dump: pod ${pod}'s own /admin/health + /admin/raft + /admin/raftkv"
-        local local_port=18102
         local fwd_log="${WORKDIR}/growth-target-port-forward.log"
         local fwd_pid=""
         kubectl port-forward "pod/${pod}" -n "$NAMESPACE" \
@@ -354,13 +378,17 @@ dump_per_pod_admin_state() {
         # itself risk `fail` recursing or a `wait_for` timeout eating into
         # the trap's own budget.
         sleep 2
-        local code body
+        local code body curl_err url
         for path in health raft raftkv; do
-            body="$(curl -sS -m 3 "${CURL_TLS_ARGS[@]}" \
-                "${ADMIN_SCHEME}://${ADMIN_HOST}:${local_port}/admin/${path}" 2>/dev/null)" || body=""
-            code="$(curl -sS -o /dev/null -m 3 -w '%{http_code}' "${CURL_TLS_ARGS[@]}" \
-                "${ADMIN_SCHEME}://${ADMIN_HOST}:${local_port}/admin/${path}" 2>/dev/null)" || code="<unreachable>"
-            log "  GET /admin/${path} -> ${code}"
+            url="${ADMIN_SCHEME}://${ADMIN_HOST}:${local_port}/admin/${path}"
+            body="$(curl -sS -m 3 "${dump_curl_args[@]}" "$url" 2>/dev/null)" || body=""
+            code="$(curl -sS -o /dev/null -m 3 -w '%{http_code}' "${dump_curl_args[@]}" "$url" 2>/dev/null)" || code=""
+            if [ -z "$code" ]; then
+                curl_err="$(curl -sS -o /dev/null -m 3 -w '%{http_code}' "${dump_curl_args[@]}" "$url" 2>&1 >/dev/null | head -c 300)" || true
+                log "  GET /admin/${path} -> <unreachable> (curl: ${curl_err:-<no error output>})"
+            else
+                log "  GET /admin/${path} -> ${code}"
+            fi
             log "  body: ${body:-<empty>}"
         done
         if [ -n "$fwd_pid" ]; then
