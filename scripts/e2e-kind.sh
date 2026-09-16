@@ -260,6 +260,20 @@ WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/animus-e2e-kind.XXXXXX")"
 KIND_KUBECONFIG="${WORKDIR}/kubeconfig"
 OPERATOR_LOG="${WORKDIR}/operator.log"
 PORT_FORWARD_LOG="${WORKDIR}/port-forward.log"
+# The current port-forward's own PID, on disk rather than only in the
+# `$PORT_FORWARD_PID` shell variable (issue #913, webhook leg): a file
+# survives a subshell boundary a variable assignment does not.
+# `resolve_and_forward_dynamo_pod` is called both directly (a plain
+# top-level statement) and from inside a `$(...)` command substitution
+# (`control_voters_reading`'s own self-heal, itself invoked from a
+# `wait_for_progress` probe) — a `PORT_FORWARD_PID=$!` made *inside* that
+# substitution's subshell vanishes the instant the subshell exits, so the
+# parent shell's own copy of the variable stays stale while the actual
+# `kubectl port-forward` process it just spawned keeps running,
+# untracked, holding the two local ports open forever (an orphan the next
+# `resolve_and_forward_dynamo_pod` call can never kill because it only
+# ever looks at its own now-wrong `$PORT_FORWARD_PID`).
+PORT_FORWARD_PID_FILE="${WORKDIR}/port-forward.pid"
 MANIFEST_FILE="${WORKDIR}/animuscluster.yaml"
 CA_FILE="${WORKDIR}/ca.crt"
 # Every `curl` hitting the dynamo OR the admin port, plain or TLS — kept as
@@ -293,95 +307,83 @@ phase() {
     log "=== phase: $1 ==="
 }
 
-# Issue #864: dump every pod ordinal's own `/admin/health` and
-# `/admin/raft` (a fresh, throwaway port-forward straight to each, never
-# the pinned `$DYNAMO_POD`/`$PORT_FORWARD_PID` pair the rest of this
-# script uses, so this never disturbs an in-flight wait or another
-# phase's own connection) and print the status code + full body of each.
-# Before this, a stalled growth left this script's diagnostics with
-# nothing more specific than "readinessProbe: false" (`kubectl describe
-# pods`) and a stdout log showing only "ready" — no visibility into WHY:
-# whether the control plane genuinely has no leader yet, whether this
-# replica's own issue #667 boot-time cluster check is still pending or
-# was refused (both reported by `/admin/raft`'s `cluster_check_pending`/
-# `refused_as_voter` fields, see `crates/animusd/src/admin.rs::
-# raft_view`), or — the shape a later recurrence actually showed
-# (`kubectl rollout status` stuck on a pre-existing, PVC-backed voter
-# that was recreated and never became Ready, not the pod S-07d was
-# actively growing) — some OTHER pod entirely stuck in a state this
-# script had no visibility into because it only ever dumped the growth
-# target's own ordinal. Looping over every ordinal `0..replicas-1`
-# (reading the StatefulSet's own live `spec.replicas`, so this dumps the
-# right count whether called before or after a scale-up) makes the next
-# recurrence decisive regardless of which pod is actually stuck. The
-# runtime image has no `curl` (`Dockerfile`'s `runtime` stage installs
-# only `ca-certificates`), so this dials from the script's own host over
-# a dedicated port-forward rather than `kubectl exec`ing a curl inside
-# the pod — one ordinal at a time (never concurrent forwards, to keep
-# this simple and avoid port collisions), each on the same local port,
-# fully torn down before the next. Best-effort throughout (`|| true` on
-# every step) — a diagnostics dump must never itself fail the run or
-# mask the original failure.
+# Issue #864/#913: curl one pod's own `/admin/health`, `/admin/raft` (control-
+# plane Raft state), and `/admin/raftkv` (issue #913: per-hosted-tablet CP
+# Raft state — which tablets this pod hosts, whether it leads each, term,
+# voters) directly — a fresh, throwaway port-forward straight to it, never
+# the pinned `$DYNAMO_POD`/`$PORT_FORWARD_PID` pair the rest of this script
+# uses, so this never disturbs an in-flight wait or another phase's own
+# connection — and print the status code + full body of each. Originally
+# just the growth target's own `/admin/health`+`/admin/raft` (issue #864: a
+# stalled growth left this script's diagnostics with nothing more specific
+# than "readinessProbe: false", `kubectl describe pods`, and a stdout log
+# showing only "ready" — no visibility into WHY). Issue #913's own
+# `e2e-kind-webhook` leg needed more: after `spec.controlNodes` growth rolls
+# every pod (S-07d), a post-growth `ConsistentRead: true` GetItem can fail
+# with "no CP group leader reachable" while the *data-plane* tablet group
+# (not the control-plane one `/admin/raft` reports on) is mid-re-election —
+# `/admin/raftkv` is the one place that shows which pod(s) actually host
+# the table's tablet and whether any of them currently leads it, so this
+# now dumps every currently-existing pod, not just the growth target, and
+# `raftkv` alongside `raft`. The runtime image has no `curl`
+# (`Dockerfile`'s `runtime` stage installs only `ca-certificates`), so this
+# dials from the script's own host over a dedicated port-forward rather
+# than `kubectl exec`ing a curl inside the pod. Best-effort throughout
+# (`|| true` on every step) — a diagnostics dump must never itself fail the
+# run or mask the original failure.
 #
-# Under `E2E_TLS=1`, `$CURL_TLS_ARGS` cannot be reused as-is: its own
-# `--resolve` entries are bound to `$DYNAMO_LOCAL_PORT`/`$ADMIN_LOCAL_PORT`
-# specifically (the *primary* port-forward's fixed local ports), so they
-# never match this function's own `$local_port` and curl falls through to
-# real DNS resolution of a cluster-internal name from outside the
-# cluster — which fails, indistinguishable in the old code from the pod
-# itself being down (a real occurrence: every one of e2e-0..3 came back
-# `<unreachable>` on a TLS-leg run where three of the four were actually
-# healthy). Every pod presents the identical shared leaf certificate
-# (ADR 0064 commit 3), so `$ADMIN_HOST` — already a name that certificate
-# covers (`$DYNAMO_HOST`, an exact SAN entry via `desired::certificate::
-# dns_names` — this doesn't need a per-pod wildcard hostname; the primary
-# flow already dials whichever pod its own port-forward lands on through
-# this same fixed name) — just needs a fresh `--resolve` naming *this*
-# function's own local port instead.
-dump_every_pod_admin_state() {
-    local replicas
-    replicas="$(kubectl get statefulset "$AC_NAME" -n "$NAMESPACE" \
-        -o jsonpath='{.spec.replicas}' 2>/dev/null || true)"
-    if [ -z "$replicas" ]; then
-        log "issue #864 admin-state dump: could not read statefulset/${AC_NAME}'s own replicas, skipping"
+# **Under `E2E_TLS=1`, `$CURL_TLS_ARGS` cannot be reused as-is** (issue
+# #864, commit e8f9145, ported here): its own `--resolve` entries are bound
+# to `$DYNAMO_LOCAL_PORT`/`$ADMIN_LOCAL_PORT` specifically (the *primary*
+# port-forward's fixed local ports), so they never match this function's
+# own `$local_port` (18102) and curl falls through to real DNS resolution
+# of a cluster-internal name from outside the cluster — which fails,
+# indistinguishable from the pod itself being down (a real occurrence: a
+# TLS-leg run reported every pod `<unreachable>` for `/admin/health`,
+# `/admin/raft`, *and* `/admin/raftkv` while every pod was actually
+# healthy, per `kubectl describe pods`). Every pod presents the identical
+# shared leaf certificate (ADR 0064 commit 3), so `$ADMIN_HOST` — already
+# a name that certificate covers (`$DYNAMO_HOST`, an exact SAN entry via
+# `desired::certificate::dns_names`) — just needs a fresh `--resolve`
+# naming *this* function's own local port instead. Also captures curl's
+# own error text (via the "redirect stdout to /dev/null, swap stderr onto
+# the command substitution's stdout" trick) whenever the status-code probe
+# comes back empty, so `<unreachable>` is never bare — it always carries
+# curl's own diagnostic, distinguishing a diagnostics-pipeline failure
+# from a real pod failure without a second, ambiguous pass next time.
+dump_per_pod_admin_state() {
+    local pods
+    pods="$(kubectl get pods -n "$NAMESPACE" -o name 2>/dev/null || true)"
+    if [ -z "$pods" ]; then
+        log "per-pod admin-state dump: no pods found, skipping"
         return 0
     fi
     local local_port=18102
-    local fwd_log="${WORKDIR}/growth-target-port-forward.log"
     local dump_curl_args=()
     if [ "$E2E_TLS" = "1" ]; then
         dump_curl_args=(--cacert "$CA_FILE" --resolve "${ADMIN_HOST}:${local_port}:127.0.0.1")
     fi
-    local ord pod fwd_pid code body curl_err url
-    for ((ord = 0; ord < replicas; ord++)); do
-        pod="${AC_NAME}-${ord}"
-        if ! kubectl get "pod/${pod}" -n "$NAMESPACE" >/dev/null 2>&1; then
-            log "issue #864 admin-state dump: pod/${pod} does not exist, skipping"
-            continue
-        fi
-        log "issue #864 admin-state dump: pod ${pod}'s own /admin/health + /admin/raft"
-        fwd_pid=""
+    local pod
+    for pod_ref in $pods; do
+        pod="${pod_ref#pod/}"
+        log "per-pod admin-state dump: pod ${pod}'s own /admin/health + /admin/raft + /admin/raftkv"
+        local fwd_log="${WORKDIR}/growth-target-port-forward.log"
+        local fwd_pid=""
         kubectl port-forward "pod/${pod}" -n "$NAMESPACE" \
             "${local_port}:${ADMIN_REMOTE_PORT}" >"$fwd_log" 2>&1 &
         fwd_pid=$!
         # A plain fixed sleep, not `wait_for` — this is a best-effort
         # diagnostic dump running from inside a failure handler (possibly
-        # `on_err`'s trap), not a correctness-gating wait, so it must
-        # never itself risk `fail` recursing or a `wait_for` timeout
-        # eating into the trap's own budget.
+        # `on_err`'s trap), not a correctness-gating wait, so it must never
+        # itself risk `fail` recursing or a `wait_for` timeout eating into
+        # the trap's own budget.
         sleep 2
-        for path in health raft; do
+        local code body curl_err url
+        for path in health raft raftkv; do
             url="${ADMIN_SCHEME}://${ADMIN_HOST}:${local_port}/admin/${path}"
             body="$(curl -sS -m 3 "${dump_curl_args[@]}" "$url" 2>/dev/null)" || body=""
             code="$(curl -sS -o /dev/null -m 3 -w '%{http_code}' "${dump_curl_args[@]}" "$url" 2>/dev/null)" || code=""
             if [ -z "$code" ]; then
-                # Distinguish "curl itself failed" (TLS/DNS/connection —
-                # a diagnostics-pipeline problem) from a real non-2xx HTTP
-                # response (which `%{http_code}` above would have printed
-                # regardless of exit status) — the swap trick below
-                # captures curl's own stderr, never its stdout, so a
-                # failure here is never confused with the pod's own
-                # response body.
                 curl_err="$(curl -sS -o /dev/null -m 3 -w '%{http_code}' "${dump_curl_args[@]}" "$url" 2>&1 >/dev/null | head -c 300)" || true
                 log "  GET /admin/${path} -> <unreachable> (curl: ${curl_err:-<no error output>})"
             else
@@ -540,7 +542,7 @@ dump_diagnostics() {
         cat "$PORT_FORWARD_LOG" 2>&1 | sed 's/^/  /' || true
     fi
     if [ "$KIND_CLUSTER_UP" = "true" ]; then
-        dump_every_pod_admin_state
+        dump_per_pod_admin_state
     fi
     log "--- end diagnostics ---"
 }
@@ -567,6 +569,22 @@ cleanup() {
         kill "$PORT_FORWARD_PID" >/dev/null 2>&1 || true
         wait "$PORT_FORWARD_PID" 2>/dev/null || true
     fi
+    # Issue #913 (webhook leg): the last-established forward may have been
+    # made from inside a `resolve_and_forward_dynamo_pod` call that itself
+    # ran in a `$(...)` subshell (the growth wait's own self-heal probe),
+    # in which case this top-level `$PORT_FORWARD_PID` was never updated —
+    # the PID file is the one place that call could actually leave a
+    # record. Kill by pattern too, as a last resort: cheap, and correct
+    # even if both the variable and the file are somehow stale.
+    if [ -f "$PORT_FORWARD_PID_FILE" ]; then
+        local file_pid=""
+        file_pid="$(cat "$PORT_FORWARD_PID_FILE" 2>/dev/null || true)"
+        if [ -n "$file_pid" ]; then
+            kill "$file_pid" >/dev/null 2>&1 || true
+            wait "$file_pid" 2>/dev/null || true
+        fi
+    fi
+    pkill -f "port-forward pod/.* ${DYNAMO_LOCAL_PORT}:${DYNAMO_REMOTE_PORT} ${ADMIN_LOCAL_PORT}:${ADMIN_REMOTE_PORT}" >/dev/null 2>&1 || true
     if [ -n "$OPERATOR_PID" ]; then
         kill "$OPERATOR_PID" >/dev/null 2>&1 || true
         wait "$OPERATOR_PID" 2>/dev/null || true
@@ -704,11 +722,32 @@ admin_health_ready() {
 # the whole run, only this one reading.
 resolve_and_forward_dynamo_pod() {
     local fatal="$1"
-    if [ -n "$PORT_FORWARD_PID" ]; then
-        kill "$PORT_FORWARD_PID" >/dev/null 2>&1 || true
-        wait "$PORT_FORWARD_PID" 2>/dev/null || true
-        PORT_FORWARD_PID=""
+    # Kill whatever the PID file says is the current forward — never the
+    # `$PORT_FORWARD_PID` variable alone (see this function's own PID-file
+    # doc above: a self-heal call made from inside a `$(...)` substitution
+    # can only ever update the file, since its own variable assignment
+    # dies with the subshell). `kill` works by PID regardless of which
+    # shell/subshell originally spawned the process; `wait` only works on
+    # the *calling* shell's own direct children, so it's expected to do
+    # nothing (silently) for a PID some other, already-exited subshell
+    # spawned — the `kill` above is what actually matters for freeing the
+    # port.
+    if [ -f "$PORT_FORWARD_PID_FILE" ]; then
+        local old_pid=""
+        old_pid="$(cat "$PORT_FORWARD_PID_FILE" 2>/dev/null || true)"
+        if [ -n "$old_pid" ]; then
+            kill "$old_pid" >/dev/null 2>&1 || true
+            wait "$old_pid" 2>/dev/null || true
+        fi
+        rm -f "$PORT_FORWARD_PID_FILE"
     fi
+    PORT_FORWARD_PID=""
+    # Belt-and-suspenders on top of the PID-file kill above: a leaked
+    # `kubectl port-forward` targeting these exact local ports, from any
+    # source (this function's own historical bug, a prior run's stray
+    # process, anything), must never be left standing in for a genuinely
+    # fresh forward — kill by pattern before ever trying to bind.
+    pkill -f "port-forward pod/.* ${DYNAMO_LOCAL_PORT}:${DYNAMO_REMOTE_PORT} ${ADMIN_LOCAL_PORT}:${ADMIN_REMOTE_PORT}" >/dev/null 2>&1 || true
     if ! wait_for "svc/${AC_NAME}-dynamo has a resolved endpoint" 30 1 -- has_dynamo_endpoint; then
         [ "$fatal" = "1" ] && fail "svc/${AC_NAME}-dynamo never resolved an endpoint"
         return 1
@@ -723,12 +762,29 @@ resolve_and_forward_dynamo_pod() {
         "${DYNAMO_LOCAL_PORT}:${DYNAMO_REMOTE_PORT}" "${ADMIN_LOCAL_PORT}:${ADMIN_REMOTE_PORT}" \
         >"$PORT_FORWARD_LOG" 2>&1 &
     PORT_FORWARD_PID=$!
+    echo "$PORT_FORWARD_PID" >"$PORT_FORWARD_PID_FILE"
     if ! wait_for "dynamo port-forward listening" 30 1 -- port_forward_ready; then
         [ "$fatal" = "1" ] && fail "dynamo port-forward against pod ${DYNAMO_POD} never became ready"
         return 1
     fi
     if ! wait_for "admin port-forward listening" 30 1 -- admin_port_forward_ready; then
         [ "$fatal" = "1" ] && fail "admin port-forward against pod ${DYNAMO_POD} never became ready"
+        return 1
+    fi
+    # The two waits above only prove *some* listener answers on these
+    # ports — exactly the gap that let a leaked, unrelated forward from an
+    # earlier call satisfy both checks while this call's own
+    # `kubectl port-forward` had already failed to bind
+    # ("address already in use") and exited. Confirm the process this
+    # call itself just spawned (`$PORT_FORWARD_PID`, always correct here —
+    # this is the same shell invocation that set it, subshell or not)
+    # is still alive, and that its own log never reported a bind failure.
+    if ! kill -0 "$PORT_FORWARD_PID" 2>/dev/null; then
+        [ "$fatal" = "1" ] && fail "dynamo port-forward against pod ${DYNAMO_POD} exited immediately after appearing ready (pid ${PORT_FORWARD_PID} is gone) — see ${PORT_FORWARD_LOG}"
+        return 1
+    fi
+    if grep -qi "address already in use" "$PORT_FORWARD_LOG" 2>/dev/null; then
+        [ "$fatal" = "1" ] && fail "dynamo port-forward against pod ${DYNAMO_POD} failed to bind (address already in use) — a stale forward was still answering the readiness checks; see ${PORT_FORWARD_LOG}"
         return 1
     fi
     return 0
@@ -1488,13 +1544,49 @@ resolve_and_forward_dynamo_pod 1
 wait_for "pod ${DYNAMO_POD}'s /admin/health is 200" 60 2 -- admin_health_ready
 
 phase "GetItem still returns the item after controlNodes growth"
-RESULT="$(dynamo_call "DynamoDB_20120810.GetItem" \
-    '{"TableName":"E2EItems","Key":{"id":{"S":"widget-1"}},"ConsistentRead":true}')"
-STATUS="$(dynamo_status "$RESULT")"
-BODY="$(dynamo_body "$RESULT")"
-[ "$STATUS" = "200" ] || fail "post-growth GetItem failed: status=${STATUS} body=${BODY}"
-NOTE="$(jq -r '.Item.note.S // empty' <<<"$BODY")"
-[ "$NOTE" = "hello from e2e" ] || fail "post-growth GetItem did not round-trip the item: ${BODY}"
+# Issue #913 (webhook leg, run 35049164392): this was a single-shot
+# `dynamo_call`, no retry — and it can genuinely need one. `controlNodes`
+# growth's own config-hash roll (S-07d) restarts e2e-0/1/2 *sequentially*
+# (a StatefulSet rolling update is always one-at-a-time, descending
+# ordinal, regardless of `podManagementPolicy`), each restart discarding
+# and re-electing that pod's own share of the table's *data-plane* tablet
+# Raft group (a different, unrelated group from the control-plane one
+# `/admin/raft` reports on) if it happened to be hosting/leading it.
+# `ConsistentRead: true` routes through the linearizable ReadIndex path
+# (ADR 0055), which needs a live tablet leader *right now* to answer at
+# all — animusd itself returns `no CP group leader reachable` after
+# waiting ~10s server-side for one to appear (the single observed failure
+# took exactly that long), not a client-side timeout (`dynamo_call` sets
+# none). Three sequential pod restarts in a ~24s window, the last only
+# ~2s old by the time this phase first asks, is a real, expected source of
+# a slow-to-settle election — not a bug in the growth mechanism or in
+# core Raft — so this is now a bounded retry, matching the repo's own
+# `wait_for`/`wait_for_progress` convention elsewhere in this script,
+# rather than a single shot. `wait_for`'s own `timeout_secs` only counts
+# time spent *sleeping between* attempts, never an attempt's own duration
+# — with `20 10` that is 3 real attempts (waited hits 0, then 10, then 20
+# across the two inter-attempt sleeps), each already bounded to ~10s
+# server-side on failure, for a worst case of roughly 3×10s (calls) +
+# 2×10s (sleeps) ≈ 50s real wall time — generous enough to observe
+# recovery from a routine rolling-restart-triggered election without
+# masking a genuine deadlock for minutes. If this budget is ever the
+# thing that actually times out, that is itself the product finding to
+# escalate (a tablet election that does not converge within about a
+# minute after a routine rolling restart), not a bound to keep widening.
+POST_GROWTH_GETITEM_STATUS=""
+POST_GROWTH_GETITEM_BODY=""
+post_growth_getitem_ready() {
+    local result
+    result="$(dynamo_call "DynamoDB_20120810.GetItem" \
+        '{"TableName":"E2EItems","Key":{"id":{"S":"widget-1"}},"ConsistentRead":true}')"
+    POST_GROWTH_GETITEM_STATUS="$(dynamo_status "$result")"
+    POST_GROWTH_GETITEM_BODY="$(dynamo_body "$result")"
+    [ "$POST_GROWTH_GETITEM_STATUS" = "200" ] || return 1
+    [ "$(jq -r '.Item.note.S // empty' <<<"$POST_GROWTH_GETITEM_BODY")" = "hello from e2e" ]
+}
+if ! wait_for "post-growth GetItem returns the item" 20 10 -- post_growth_getitem_ready; then
+    fail "post-growth GetItem never converged: status=${POST_GROWTH_GETITEM_STATUS} body=${POST_GROWTH_GETITEM_BODY}"
+fi
 log "post-growth GetItem ok — controlNodes growth left the DynamoDB wire serving"
 
 if [ "$E2E_S3" = "1" ]; then
