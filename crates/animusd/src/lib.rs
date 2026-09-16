@@ -19225,6 +19225,18 @@ mod sim_cluster_dynamo_documents;
 #[cfg(test)]
 mod sim_cluster_dynamo_schema;
 
+/// Issue #610 regression: `ClientCtx::propose_schema`'s "no locally-known
+/// leader" broadcast fallback (`schema.rs`) races every known intra
+/// candidate concurrently rather than trying them one at a time — a
+/// deterministic pin of "a node that has not yet learned the leader
+/// receives the first `CreateTable`" (the real-world race `await_
+/// bootstrap` under-specifies across every `ProdEnv` cluster fixture) via
+/// the identical partition-past-one-election-window repro shape
+/// `crates/animus-control/tests/leader_within_hysteresis.rs` already
+/// established for issue #595.
+#[cfg(test)]
+mod sim_cluster_schema_broadcast;
+
 /// ADR 0061 rung D4 PR 3 (C-04 D4): deterministic `SimCluster` coverage for
 /// the dropped-table GC reclaim (ADR 0024) — driven through the real
 /// `DeleteTable` wire operation (`dynamo::dispatch_table_op` →

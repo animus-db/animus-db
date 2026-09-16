@@ -174,7 +174,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         // hop to). Broadcast to every other known **intra** address instead:
         // a real control-group member among them resolves the actual leader
         // itself (one more hop — `ProposeSchema`'s handler is a single,
-        // bounded relay, never a chain). Returns true on the first address that
+        // bounded relay, never a chain). Returns true once any address
         // connects, regardless of what its own `propose_schema` achieves
         // (best-effort, same as every other branch here — the caller confirms
         // via replicated `Metadata`, not this return value).
@@ -188,28 +188,74 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         // reachable-but-slow candidate must not be able to consume the whole
         // timeout on one hop and starve every candidate still left in this
         // broadcast.
-        for (id, addr) in self.intra_route_snapshot() {
+        //
+        // **Issue #610: race every candidate CONCURRENTLY, never serially.**
+        // Each hop is capped at `FORWARD_HOP_TIMEOUT`, but a serial loop over
+        // this cluster's other N-1 members can still cost up to
+        // `(N-1) * FORWARD_HOP_TIMEOUT` for a *single* call — `dynamo.rs`'s
+        // `CreateTable` gives this whole function only `SCHEMA_COMMIT_
+        // TIMEOUT` (5s), so on a mere 3-node cluster two capped hops (4s)
+        // already leave next to no headroom for the commit-wait that has to
+        // follow. That is exactly the shape a fresh cluster's first DDL
+        // hits: `await_bootstrap` only guarantees *some* node is control
+        // leader and every node has non-empty membership, not that the node
+        // a client happens to reach already knows *who* — so a first
+        // `CreateTable` landing on a node whose own `leader()` is
+        // transiently `None` (a missed pre-vote window clears it before any
+        // heartbeat restores it, see issue #595) pays this broadcast's full
+        // serialized worst case, worse under exactly the runner load that
+        // makes each capped hop run closer to its cap instead of failing
+        // fast. No candidate here carries a vouching signal over any other
+        // (that is exactly why the hinted branches above didn't apply), so
+        // there is no preferred order worth trying serially.
+        //
+        // `select_all` rather than `join_all`: this must resolve as soon as
+        // ANY candidate answers, not wait for the slowest one to finish too
+        // — a plain `join_all` would still block on a dead/partitioned
+        // candidate's own `FORWARD_HOP_TIMEOUT` even after a live one
+        // already answered, which defeats the point when only one of
+        // several candidates is actually reachable. Losing candidates keep
+        // racing (`remaining`) until one succeeds or all of them have
+        // failed, so the worst case (every candidate dead) stays bounded at
+        // one `FORWARD_HOP_TIMEOUT` regardless of how many candidates exist,
+        // while the common case (some candidate answers quickly) resolves
+        // in whatever that candidate's own round trip actually takes,
+        // rather than the slowest candidate's.
+        let candidates: Vec<String> = self
+            .intra_route_snapshot()
+            .into_iter()
             // Self-skip by id, not by address string: this node's own
             // `intra_route` entry is `advertised_addr(self)`, which a bind
             // address comparison would never match once `advertise_host`
             // (ADR 0060) is set — the id is the one identity that's always
             // comparable regardless of how this node's own address is
             // spelled.
-            if Some(&id) == self.admin.node_id.as_ref() {
-                continue;
-            }
-            if !matches!(
-                self.relay
-                    .relay(
-                        addr,
-                        &ClientRequest::ProposeSchema(command.clone()),
-                        FORWARD_HOP_TIMEOUT,
-                    )
-                    .await,
-                ClientResponse::Error(_)
-            ) {
+            .filter_map(|(id, addr)| (Some(&id) != self.admin.node_id.as_ref()).then_some(addr))
+            .collect();
+        let mut attempts: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = ClientResponse> + Send + '_>>> =
+            candidates
+                .into_iter()
+                .map(|addr| {
+                    let fut: std::pin::Pin<
+                        Box<dyn std::future::Future<Output = ClientResponse> + Send + '_>,
+                    > = Box::pin(async move {
+                        self.relay
+                            .relay(
+                                addr,
+                                &ClientRequest::ProposeSchema(command.clone()),
+                                FORWARD_HOP_TIMEOUT,
+                            )
+                            .await
+                    });
+                    fut
+                })
+                .collect();
+        while !attempts.is_empty() {
+            let (resp, _idx, remaining) = futures::future::select_all(attempts).await;
+            if !matches!(resp, ClientResponse::Error(_)) {
                 return true;
             }
+            attempts = remaining;
         }
         false
     }
