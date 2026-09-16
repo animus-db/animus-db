@@ -428,7 +428,15 @@ struct Inner {
     memtable_bytes: usize,
     /// Open readers for the live SSTables, oldest first (parallel to
     /// `manifest.tables`). Each holds only metadata + the block index in memory.
-    readers: Vec<SsTableReader>,
+    /// Wrapped in an `Arc` so every read-path snapshot (`latest_version_of`/
+    /// `read_at`/`merged_at`) is an O(1) `Arc::clone` under the lock rather than
+    /// an O(N) `Vec` allocation + N atomic refcount bumps on every get/scan; a
+    /// mutation (flush, compaction) builds a fresh `Vec` and swaps in a new
+    /// `Arc` rather than mutating this one in place, so an already-taken
+    /// snapshot keeps observing its own point-in-time reader set unaffected by
+    /// a later swap (see `LsmEngine::open_with_metrics`'s construction and the
+    /// swap sites in `flush`/`run_compaction`).
+    readers: Arc<Vec<SsTableReader>>,
     /// The current durable manifest image.
     manifest: Manifest,
     /// Count of flushes performed (introspection / tests).
@@ -836,7 +844,7 @@ impl<E: Env> LsmEngine<E> {
         let inner = Inner {
             memtable,
             memtable_bytes,
-            readers,
+            readers: Arc::new(readers),
             manifest: Manifest {
                 max_version,
                 ..manifest
@@ -1100,7 +1108,22 @@ impl<E: Env> LsmEngine<E> {
             // Oldest first, so newer overwrites older; the memtable is applied last.
             let mut merged: BTreeMap<Key, (Version, Option<Value>)> = BTreeMap::new();
             let mut read_err = None;
-            for reader in &readers {
+            for reader in readers.iter() {
+                // Skip a table whose own `[min_key, max_key]` can't overlap
+                // `[start, end)` at all — the same cheap in-memory gate every
+                // other multi-table path here already applies (`may_contain_
+                // observed` for point reads, `ranges_overlap` for compaction,
+                // `sstable_overlaps` for `approx_bytes_in_range`). Without it,
+                // `SsTableReader::scan_at` starts from `block_for_key(start)`,
+                // which for a table sorting entirely below `start` resolves to
+                // the table's *last* block — fetched, decompressed, and then
+                // filtered out record by record (issue #835). This is a pure
+                // key-range gate, independent of `version`: a table that
+                // overlaps by key but whose versions are all above `version`
+                // is still visited, exactly as before.
+                if !sstable_overlaps(reader.meta(), start, end) {
+                    continue;
+                }
                 match reader.scan_at(&self.env, start, end, version).await {
                     Ok(rows) => {
                         for (k, v, slot) in rows {
@@ -1366,7 +1389,13 @@ impl<E: Env> LsmEngine<E> {
         {
             let mut inner = self.lock();
             inner.manifest = new_manifest;
-            inner.readers.push(reader);
+            // Rebuild rather than mutate in place: an outstanding read-path
+            // snapshot (an `Arc::clone` of the pre-flush `readers`) must keep
+            // observing exactly the reader set it snapshotted, not gain this
+            // flush's new table underneath it.
+            let mut new_readers = (*inner.readers).clone();
+            new_readers.push(reader);
+            inner.readers = Arc::new(new_readers);
             for rec in &records {
                 let now_empty = match inner.memtable.get_mut(&rec.key) {
                     Some(history) => {
@@ -1585,7 +1614,12 @@ impl<E: Env> LsmEngine<E> {
                         .clone()
                 })
                 .collect();
-            inner.readers = readers;
+            // Fresh Arc, not a mutation of the old one: any snapshot already
+            // taken by a concurrent read keeps its own pre-compaction reader
+            // set (see the `readers` field doc); the read path's own
+            // `raced_compaction` retry is what makes it re-snapshot the new
+            // one afterwards.
+            inner.readers = Arc::new(readers);
             inner.manifest = new_manifest;
             inner.compactions += 1;
         }
@@ -1775,7 +1809,7 @@ impl<E: Env> LsmEngine<E> {
             inner.readers.clone()
         };
         let mut out: BTreeMap<Version, bool> = BTreeMap::new();
-        for reader in &readers {
+        for reader in readers.iter() {
             if !reader.meta().may_contain(key) {
                 continue;
             }
@@ -4218,5 +4252,149 @@ mod compaction_policy_tests {
             };
             prop_assert_eq!(next_compaction_plan(&tables, &o), expected);
         }
+    }
+}
+
+/// Pins issue #844's mechanism: `Inner::readers` is an `Arc<Vec<SsTableReader>>`
+/// swapped for a fresh one by flush/compaction, never mutated in place, so a
+/// snapshot a read path already `Arc::clone`d keeps observing exactly the
+/// reader set it captured even after a later flush/compaction commits. This is
+/// what makes the read-path snapshot (taken under a brief lock, then read
+/// lock-free) safe: it can't be surprised by tables appearing/disappearing
+/// underneath it mid-read.
+#[cfg(test)]
+mod readers_arc_tests {
+    use super::*;
+    use animus_env::nid;
+    use animus_sim::{SimEnv, Simulator};
+    use futures::executor::block_on;
+
+    const PREFIX: &str = "db/";
+
+    fn opts() -> LsmOptions {
+        LsmOptions {
+            flush_threshold_bytes: 64,
+            compaction_trigger: 2,
+            target_table_bytes: 256,
+            level_fanout: 2,
+            wal_segment_bytes: 96,
+            tombstone_grace_versions: 1 << 20,
+            trust_monotonic_versions: false,
+            background_maintenance: false,
+        }
+    }
+
+    fn open(sim: &Simulator) -> LsmEngine<SimEnv> {
+        block_on(LsmEngine::open_with(sim.env(nid(0)), PREFIX, opts())).expect("open")
+    }
+
+    /// A `readers` snapshot taken before a flush is a *different* `Arc` from
+    /// the one installed after: the flush builds a fresh `Vec` (old + the new
+    /// table) and swaps it in, instead of `push`ing onto the vector the
+    /// earlier snapshot's `Arc` still points at. The earlier snapshot's own
+    /// `Vec` (still empty here) must therefore be observably unaffected by
+    /// the flush that ran after it was taken.
+    #[test]
+    fn flush_swaps_the_readers_arc_leaving_a_prior_snapshot_untouched() {
+        let seed = 0x844_u64;
+        let sim = Simulator::new(seed);
+        let e = open(&sim);
+        block_on(async {
+            let before = e.lock().readers.clone();
+            assert_eq!(before.len(), 0, "seed={seed}");
+
+            // Cross the flush threshold so the write path's own
+            // `maybe_flush_and_compact` runs a flush inline.
+            for i in 0u64..10 {
+                let k = format!("k{i:04}");
+                e.put(k.as_bytes(), format!("v{i}").as_bytes(), i + 1)
+                    .await
+                    .unwrap();
+            }
+            assert!(e.flush_count() >= 1, "flush should have run, seed={seed}");
+
+            let after = e.lock().readers.clone();
+            assert!(
+                !Arc::ptr_eq(&before, &after),
+                "flush must install a fresh Arc rather than mutate the \
+                 snapshotted one, seed={seed}"
+            );
+            assert_eq!(
+                before.len(),
+                0,
+                "a snapshot taken before the flush must still see zero \
+                 readers afterwards — mutating in place would leak the new \
+                 table into it, seed={seed}"
+            );
+            assert!(
+                !after.is_empty(),
+                "the fresh snapshot must see the flushed table, seed={seed}"
+            );
+        });
+    }
+
+    /// Same property across compaction: a `readers` snapshot taken before a
+    /// compaction keeps its own (pre-compaction) table count after the
+    /// compaction commits, because `run_compaction` rebuilds the vector and
+    /// swaps in a new `Arc` rather than mutating the snapshotted one.
+    #[test]
+    fn compaction_swaps_the_readers_arc_leaving_a_prior_snapshot_untouched() {
+        let seed = 0x845_u64;
+        let sim = Simulator::new(seed);
+        let e = open(&sim);
+        block_on(async {
+            // Enough writes to cross the flush threshold at least once,
+            // landing L0 table(s) but staying under `compaction_trigger`.
+            for i in 0u64..10 {
+                let k = format!("a{i:04}");
+                e.put(k.as_bytes(), format!("v{i}").as_bytes(), i + 1)
+                    .await
+                    .unwrap();
+            }
+            assert!(e.flush_count() >= 1, "seed={seed}");
+
+            let before = e.lock().readers.clone();
+            let before_len = before.len();
+            assert!(before_len >= 1, "seed={seed}");
+
+            // More writes push the L0 count over `compaction_trigger`,
+            // firing a compaction into L1 inline.
+            for i in 0u64..10 {
+                let k = format!("b{i:04}");
+                e.put(k.as_bytes(), format!("v{i}").as_bytes(), 100 + i)
+                    .await
+                    .unwrap();
+            }
+            assert!(
+                e.compaction_count() >= 1,
+                "compaction should have run, seed={seed}"
+            );
+
+            let after = e.lock().readers.clone();
+            assert!(
+                !Arc::ptr_eq(&before, &after),
+                "compaction must install a fresh Arc rather than mutate the \
+                 snapshotted one, seed={seed}"
+            );
+            assert_eq!(
+                before.len(),
+                before_len,
+                "a snapshot taken before the compaction must still report \
+                 its own pre-compaction reader count afterwards — mutating \
+                 in place would change it out from under a concurrent \
+                 reader, seed={seed}"
+            );
+
+            // The engine itself still answers every key correctly across the
+            // flush + compaction (the swap changes physical layout only).
+            for i in 0u64..10 {
+                let k = format!("a{i:04}");
+                assert_eq!(
+                    e.get(k.as_bytes()).await.unwrap().map(|vv| vv.value),
+                    Some(format!("v{i}").into_bytes()),
+                    "seed={seed}"
+                );
+            }
+        });
     }
 }
