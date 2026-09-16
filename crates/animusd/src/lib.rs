@@ -17654,9 +17654,41 @@ mod client_cancellation_tests {
         // unilaterally step down just because it cannot reach followers
         // (nothing left alive can out-campaign it), so it keeps believing
         // it leads for the rest of this test.
+        // **Uses `shutdown_and_wait`, not bare `shutdown` (issue #638).**
+        // `Node::shutdown()` is documented fire-and-forget: `task.abort()`
+        // only *requests* cancellation, and under CI's real 2-vCPU runners
+        // (`.github/workflows/ci.yml`'s `prod-liveness-animusd` comment) that
+        // can lag well behind this call returning. Confirmed directly here
+        // (a temporary diagnostic probe, not part of this fix): a "killed"
+        // follower's own client listener was still accepting fresh
+        // connections up to ~0.5ms after `shutdown()` returned in several
+        // local runs even on an idle 4-core sandbox -- meaning its Raft
+        // driver task was *also* still alive and able to ACK a fresh
+        // AppendEntries in that window. If this test's own "stranding" write
+        // below reaches a not-yet-dead follower during that window, it can
+        // legitimately reach 2-of-3 quorum and complete normally instead of
+        // getting stuck -- silently defeating the whole scenario this test
+        // exists to exercise, with no server-side bug at all: the write
+        // finishes, the response is written back (successfully, since the
+        // client hasn't closed its socket yet), `handle_connection` loops to
+        // read the *next* frame, observes the later `shutdown()`+`drop` as a
+        // plain between-requests EOF (never counted as an abandoned
+        // in-flight request), and `client_requests_abandoned` never moves --
+        // exactly CI's own observed symptom (a `9.87s` total run: bring-up
+        // plus a normal-speed write, then the unconditional 5s wait for a
+        // metric that was never going to fire, then the timeout `Elapsed`
+        // panic at this test's `.expect(...)` for that wait). A slower/more
+        // contended host only widens this window, which is consistent with
+        // this reproducing in CI's real 2-vCPU shards and not this sandbox's
+        // fast path, yet still measurably observable here too.
+        // `shutdown_and_wait` closes the race: it awaits every aborted
+        // task's teardown (including each follower's own internal `ProdEnv`,
+        // covering its Raft driver and every connection it owns) before
+        // returning, so by the time this loop finishes every non-leader
+        // replica is genuinely, verifiably gone -- not just requested to be.
         for (i, node) in nodes.iter().enumerate() {
             if i != leader_idx {
-                node.shutdown();
+                node.shutdown_and_wait().await;
             }
         }
 
