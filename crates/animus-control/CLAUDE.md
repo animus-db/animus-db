@@ -121,6 +121,26 @@ per-tablet CP data plane (`animus-cp-data`).
   `match_index` — it's a volatile per-peer liveness timestamp, not
   replicated state.
 
+  **A second gotcha (issue #923): `become_leader` seeds every peer's
+  `peer_last_contact` to the instant a leadership stint begins — a
+  courtesy timestamp, not a genuine ack, there only so a peer that stays
+  silent the whole stint can't hide behind the "never contacted yet" grace
+  forever.** That seed ages out after the same `CONTROL_PEER_LIVENESS_
+  TIMEOUT` a real ack would, with no wider allowance for "this leader only
+  just took over" — a fresh leader's first real heartbeat round can
+  legitimately take longer than that steady-state timeout under the load a
+  leadership change itself creates. `control_peer_believed_alive` covers
+  this with a **second**, wider, separately-named grace —
+  `RaftCore::leader_since` (gated on `role == Leader`, so a stepped-down
+  node reads `None` with no explicit clearing needed) +
+  `CONTROL_LEADER_TAKEOVER_GRACE` — deliberately not a reuse of
+  `CONTROL_PEER_LIVENESS_TIMEOUT` itself, since an equal-sized second grace
+  would be a no-op (`become_leader`'s own seed already provides exactly
+  that much). See ADR 0037's 2026-09-16 amendment and ADR 0012's matching
+  one (the identical shape of fix for the **raftkv**-id `FailureDetector`'s
+  own `LEADER_GRACE`, a structurally separate mechanism/id-space that
+  needed the same kind of post-election patience).
+
   **`Metadata` is `DRIVER_APPLIED` (ADR 0038): the driver is split into a
   consensus loop (`drive`, no engine I/O — services heartbeats regardless
   of engine speed) and an async apply task (`meta_apply_loop`/
