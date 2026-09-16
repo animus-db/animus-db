@@ -552,6 +552,25 @@ Secret sets `ca.crt` to the stable signing CA's own certificate —
 unaffected by a leaf renewal. `deploy/operator/README.md`'s TLS section
 carries the same guidance for real deployments.
 
+**Issue #913 round 2 (2026-09-16): this fix is necessary but not yet
+proven sufficient.** A fresh-head `e2e-kind-tls` run of this exact fix
+(stacked under PR #909's `kubectl rollout status` addition, so the run
+could no longer report success before pod 3 was actually `Ready`) still
+hit the identical `BadCertificate` failure. Three of the four standing
+hypotheses are now ruled out with direct evidence — the wildcard SAN
+correctly matches a per-ordinal pod hostname (a new decisive test,
+`crates/animus-env/src/prod.rs`'s
+`tls_wildcard_san_matches_a_per_ordinal_pod_hostname`), client-certificate
+verification does no hostname check, and the operator's own re-apply of
+the `Certificate` is a server-side-apply of byte-identical content that
+gives cert-manager nothing to react to. What remains open is a genuine
+timing/propagation question this crate's own code cannot settle — see
+ADR 0064's issue #913 round-2 amendment for the full account.
+`dump_diagnostics` (`scripts/e2e-kind.sh`) now captures `Certificate`/
+`Secret` resourceVersions, `CertificateRequest` objects/events, and
+`tls.crt`/`ca.crt` fingerprints whenever `E2E_TLS=1`, specifically so the
+next run settles it.
+
 ## S3 (S-04 PR 3, closes `docs/roadmap.md`'s S-04)
 
 `AnimusClusterSpec.s3: Option<S3StoreSpec>` (`crd.rs`) mirrors `TlsSpec`'s

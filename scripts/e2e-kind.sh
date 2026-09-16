@@ -360,6 +360,48 @@ dump_diagnostics() {
         kubectl describe statefulset "$AC_NAME" -n "$NAMESPACE" 2>&1 | sed 's/^/  /' || true
         log "kubectl describe pods -n ${NAMESPACE}"
         kubectl describe pods -n "$NAMESPACE" 2>&1 | sed 's/^/  /' || true
+        if [ "$E2E_TLS" = "1" ]; then
+            # Issue #913 (round 2): a fresh-head run still hit BadCertificate
+            # on the recreated controlNodes-growth pod even with a
+            # node-count-invariant SAN set and a CA-backed issuer, so
+            # whether the leaf's own Secret was reissued mid-run — and
+            # whether the trust anchor (ca.crt) moved with it — needs to be
+            # directly observable, not inferred. Never dumps tls.key or
+            # tls.crt/ca.crt's raw bytes (a throwaway e2e cert, but no
+            # reason to spam CI logs with key material): openssl
+            # fingerprints/serials/validity only, so two runs — or two pods
+            # within one run — are trivially diffable without a decode step.
+            log "kubectl get certificate,secret -n ${NAMESPACE} (issue #913 diagnostics)"
+            kubectl get certificate,secret -n "$NAMESPACE" -o wide 2>&1 | sed 's/^/  /' || true
+            log "certificate.cert-manager.io/${AC_NAME}-tls -o yaml (status + conditions only)"
+            kubectl get "certificate.cert-manager.io/${AC_NAME}-tls" -n "$NAMESPACE" \
+                -o jsonpath='{"resourceVersion="}{.metadata.resourceVersion}{"\ngeneration="}{.metadata.generation}{"\nstatus="}{.status}{"\n"}' \
+                2>&1 | sed 's/^/  /' || true
+            log "secret/${AC_NAME}-tls metadata (resourceVersion/creationTimestamp only, never its data)"
+            kubectl get secret "${AC_NAME}-tls" -n "$NAMESPACE" \
+                -o jsonpath='{"resourceVersion="}{.metadata.resourceVersion}{"\ncreationTimestamp="}{.metadata.creationTimestamp}{"\n"}' \
+                2>&1 | sed 's/^/  /' || true
+            log "secret/${AC_NAME}-tls: tls.crt / ca.crt fingerprints, serials, validity (never the private key)"
+            for key in tls.crt ca.crt; do
+                cert_pem="$(kubectl get secret "${AC_NAME}-tls" -n "$NAMESPACE" \
+                    -o jsonpath="{.data.${key}}" 2>/dev/null | base64 -d 2>/dev/null || true)"
+                if [ -n "$cert_pem" ]; then
+                    log "  ${key}:"
+                    openssl x509 -noout -subject -issuer -serial -fingerprint -sha256 -dates \
+                        <<<"$cert_pem" 2>&1 | sed 's/^/    /' || true
+                else
+                    log "  ${key}: <missing>"
+                fi
+            done
+            log "kubectl get events -n ${NAMESPACE} --field-selector involvedObject.kind=Certificate"
+            kubectl get events -n "$NAMESPACE" --field-selector involvedObject.kind=Certificate \
+                --sort-by=.lastTimestamp 2>&1 | sed 's/^/  /' || true
+            log "kubectl get events -n ${NAMESPACE} --field-selector involvedObject.kind=CertificateRequest"
+            kubectl get events -n "$NAMESPACE" --field-selector involvedObject.kind=CertificateRequest \
+                --sort-by=.lastTimestamp 2>&1 | sed 's/^/  /' || true
+            log "kubectl get certificaterequests -n ${NAMESPACE} -o wide"
+            kubectl get certificaterequests -n "$NAMESPACE" -o wide 2>&1 | sed 's/^/  /' || true
+        fi
         log "pod logs (tail 100, per pod)"
         for pod in $(kubectl get pods -n "$NAMESPACE" -o name 2>/dev/null || true); do
             log "  logs: ${pod}"
@@ -1264,6 +1306,18 @@ wait_for_progress "control group reports 4 voters" 600 120 5 \
     -- control_voters_equals 4 \
     -- control_growth_progress_signal "$GROWTH_TARGET_ORDINAL"
 log "control group now reports 4 voters"
+
+phase "wait for the controlNodes config-hash rollout to fully finish (issue #864)"
+# Growth reporting 4 voters only means the control group *accepted* ordinal
+# 3 as a voter — it says nothing about whether the config-hash-triggered
+# StatefulSet rolling restart (this phase's own comment block above) has
+# actually finished rolling every pod through. Without this wait, the
+# script can declare success while a pod is still `Running` but not yet
+# `Ready` — exactly the shape issue #913 needs this leg to actually
+# exercise (a scale-up immediately followed by a controlNodes growth) for
+# its own TLS regression to be caught at all, instead of silently limping
+# past it the way an earlier run of this script's own TLS leg did.
+kubectl rollout status "statefulset/${AC_NAME}" -n "$NAMESPACE" --timeout=300s
 
 phase "check the PodDisruptionBudget after controlNodes growth (S-07d)"
 # nodes=4/controlNodes=4 now: the control-plane term is floor((4-1)/2)=1,

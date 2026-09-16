@@ -727,3 +727,90 @@ comments this PR adds around the new CA-hierarchy heredocs are placed
 unverified in any sandbox that cannot run `kind` at all (the same
 standing limitation ADR 0064 commit 3 and ADR 0060 already note) — its
 first real verification is the next green `e2e-kind-tls` CI run.
+
+## Amendment (2026-09-16, issue #913 round 2) — the fresh-head e2e run still failed; three hypotheses ruled out, one open
+
+The above fix's first real validation — stacking it under PR #909's own
+`e2e-kind-tls` leg (which adds `kubectl rollout status statefulset/e2e
+--timeout=300s` right after growth converges, so the run can no longer
+declare success before pod 3 is actually `Ready`) and running it on a
+**fresh** cluster (so every pod, including `e2e-0..2`, was created from
+the wildcard-SAN Certificate and the CA-backed issuer from the start, not
+migrated from an earlier state) — still failed the same way (run
+35040977782, job 104620543323): `spec.nodes` 3→4 converged in 10s,
+`spec.controlNodes` 3→4 converged (4 voters) in 10s, then the rollout wait
+timed out after 300s with pod `e2e-3` continuously `Running`/never
+`Ready`, its log full of the identical
+`AlertReceived(BadCertificate)` lines against `e2e-0`/`e2e-1`/`e2e-2`'s
+pod IPs. Confirmed from that run's own diagnostics: `spec.tls.certManager.
+issuerRef.name` is `e2e-ca-issuer` (the CA-backed issuer, not the bootstrap
+`selfSigned` one) — the round-1 fix's own wiring is in place and being
+used.
+
+**Direction of the alert, established from the code, not assumed**:
+`AlertReceived(BadCertificate)` is logged only in `spawn_accept`
+(`crates/animus-env/src/prod.rs:749-753`), the **inbound**-accept path —
+`peer_addr` is `listener.accept()`'s own remote-socket address, so pod 3
+is the **server** here, and the three logged addresses are `e2e-0`/`e2e-1`/
+`e2e-2` **dialing in** to it. `rustls::Error::AlertReceived` means this
+side *received* the alert, i.e. **the peer sent it** — and in a TLS 1.3
+mutual handshake the server sends its own certificate (and requests the
+client's) *before* the client sends its client certificate, so a client
+that rejects the server's presented certificate aborts and sends
+`bad_certificate` back without ever completing its own certificate flight.
+Read together: **`e2e-0`/`e2e-1`/`e2e-2`, dialing pod 3 as TLS clients,
+rejected pod 3's presented server certificate.**
+
+**Three of the four standing hypotheses are now ruled out with direct
+evidence, not just review:**
+
+- **(a) Wildcard-SAN/hostname mismatch — ruled out by a new, decisive
+  test.** `crates/animus-env/src/prod.rs`'s
+  `tls_wildcard_san_matches_a_per_ordinal_pod_hostname` runs a real
+  loopback handshake through the exact same `TlsMaterial::acceptor`/
+  `connector` and `server_name_for` derivation `spawn_accept`/
+  `connect_maybe_tls` use in production, with the server's leaf SAN set to
+  `*.e2e-internal.animus-e2e.svc.cluster.local` (this fix's own shape) and
+  the client dialing `e2e-3.e2e-internal.animus-e2e.svc.cluster.local` (a
+  real per-ordinal pod hostname, `desired::pod_fqdn`'s own shape) — it
+  passes. The wildcard construction is not the bug.
+- **(b) Client-certificate hostname check — ruled out by TLS semantics.**
+  Nothing in `crates/animus-env/src/tls.rs`'s acceptor construction (a
+  standard `rustls` client-cert verifier built from the CA root store)
+  performs any hostname/SAN check against an inbound client certificate —
+  only chain-of-trust validation. There is no mechanism here that could
+  reject a client based on what hostname it dialed by.
+- **(c) The operator's own re-apply reissuing the Certificate — ruled out
+  by code review.** `apply_certificate` (`crates/animus-operator/src/
+  controller.rs:103-105`, `cluster_api.rs`) is a server-side-apply
+  `PatchParams::apply(FIELD_MANAGER).force()`, run unconditionally on
+  every reconcile with **exactly the same** `Certificate.spec` regardless
+  of `spec.nodes`/`spec.controlNodes` (pinned by
+  `certificate_spec_is_byte_identical_across_a_nodes_scale_up`, added in
+  this issue's first fix) — an idempotent re-apply of byte-identical
+  content gives cert-manager nothing to react to. Neither `cert_spec`
+  (this crate) nor the e2e's own CA `Certificate` sets
+  `privateKey.rotationPolicy`, so both default to cert-manager's own
+  `Never` — no forced key rotation on any resync either.
+
+**What remains open**: hypothesis (d), a genuine timing/propagation issue
+around the recreated pod's Secret mount, is neither confirmed nor ruled
+out — the evidence to settle it (the `Certificate`/`Secret`'s own
+`resourceVersion` history, cert-manager's `CertificateRequest` objects and
+events across the whole scale-up-then-growth window) was not captured by
+this run's diagnostics. `dump_diagnostics` (`scripts/e2e-kind.sh`) now
+captures it whenever `E2E_TLS=1`: `kubectl get certificate,secret`,
+per-`Certificate` `resourceVersion`/`generation`/`status`, the `Secret`'s
+own `resourceVersion`/`creationTimestamp`, `openssl x509`-derived
+fingerprint/serial/validity for `tls.crt` and `ca.crt` specifically (never
+the private key or raw cert bytes), and every `Certificate`/
+`CertificateRequest` event plus the `CertificateRequest` objects
+themselves. The next `e2e-kind-tls` run — now also gated by the same
+`kubectl rollout status` wait on this branch, closing the gap that let an
+earlier run of this same fix "pass" without ever waiting for pod 3 to
+become `Ready` — is what actually settles (d): if `e2e-3`'s `tls.crt`/
+`ca.crt` fingerprints differ from `e2e-0`'s, a reissue is confirmed and
+its `CertificateRequest` timeline pinpoints when and why; if they're
+identical, the divergence is somewhere this investigation has not yet
+looked, and the round-1 fix's own architecture (wildcard SAN, CA
+hierarchy) needs to be revisited rather than assumed sufficient.
