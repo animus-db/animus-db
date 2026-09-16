@@ -3970,3 +3970,85 @@ no bearing on who wins that race). See `docs/engineering-lessons.md`'s
 matching entry for the general lesson on both fronts, and this crate's
 own `CLAUDE.md` ("Witnessing" bullet, Key invariants section) for the
 as-built pointer.
+
+**2026-09-16 amendment (issue #834): `TxnResolve`'s commit/abort-restore
+writes are now coalesced-fsync, and the merge-took-no-effect seatbelt is
+deliberately dropped on that path — closing a real regression the fix
+introduced along the way.** `apply_and_compact`'s effects loop already
+coalesced a run of `Put`/`Delete`/`SeedBatch`/`KindBatch`/
+`materialize_derived` writes into one `merge_batch` `fsync` via a
+loop-local `pending: Vec<MergeOp>` (`flush_pending`) — but `KvCommand::
+Batch` and `TxnResolve`'s commit/staged-delete branch instead called
+`storage.merge`/`merge_tombstone` directly, once per key: a 50-key
+`put_batch` committed as one Raft entry paid 50 sequential un-amortized
+`fsync`s at apply time on `LsmEngine`/`ProdEnv` (invisible under `SimEnv`/
+`MemoryEngine`, where `fsync` is free — see `animus-storage/CLAUDE.md`'s
+~9.7x batch-vs-per-key figure), and neither site was `halted`-gated the
+way every other write in the loop is, so a graceful shutdown racing an
+in-flight write hard-panicked instead of exiting cleanly. Both arms now
+push onto the same shared `pending` run instead, closing both defects at
+once (halted-gating comes for free — it lives in `flush_pending`, not in
+each arm).
+
+**The seatbelt this drops.** §3's "kept from the investigation" entry
+above already documents `surface_suspicious_merge_noop`
+(`Metric::CpMergeTookNoEffect`/`CpMergeTookNoEffectUnexplained`) as
+"metric + a capped `tracing::warn!` only, **deliberately not a hard
+assert**" — a soft diagnostic with no correctness role, kept as "a
+permanent, if currently soft, guard against the next bug shaped like it."
+`TxnResolve`'s commit/abort-restore writes used to call this at their two
+direct-`merge`/`merge_tombstone` sites, using the returned `took_effect`
+bool. `StorageEngine::merge_batch` returns `Result<()>`, not a per-op
+effect report, and threading one through would mean either a new trait
+method (`animus-storage`) or an extended `MergeOp` outcome, plus a way to
+correlate a specific queued op back to its own diagnostic call once the
+*shared* `pending` run — which can, by construction, also carry unrelated
+ops from other commands in the same apply pass — is eventually flushed.
+Given the seatbelt's own documented soft/no-correctness-role status, that
+machinery isn't worth it: the diagnostic is dropped on this specific
+batched path (`Batch` never had it either — it always called `.expect(..)`
+directly, discarding `merge`'s bool outright). It stays exactly as before
+on the two sites this change doesn't touch — `Cas`'s swap and `TxnStage`'s
+own intent write — and the real safety net for `TxnResolve` specifically,
+the per-entry `fence` check (§2 above), is untouched by this change
+either way.
+
+**The regression this surfaced, and why it's a docs-worthy lesson, not
+just a bug fix.** Converting `TxnResolve`'s commit write from a direct,
+immediate `storage.merge` to a `pending`-queued, flush-deferred one broke
+an assumption `KvCommand::TxnStage`'s own apply arm depended on but never
+enforced: its `already_decided`/`blocked_by` reads — deciding whether a
+target key already carries a *foreign* unresolved `Intent` — read
+`storage.get` directly, with no preceding `flush_pending`, unlike `Cas`'s
+and `KindEval`'s own arms (which already call `flush_pending` first,
+specifically so their own read observes every earlier write in the same
+apply pass). This was safe only as long as every command capable of
+turning an `Intent` into a `Committed` envelope at a key applied
+*immediately* — true before this change (`TxnResolve`'s own commit was
+the only such transition, and it was a direct merge), false after (its
+write can now sit un-flushed in `pending` while a *later* entry in the
+*same* apply pass — e.g. a new transaction's own `TxnStage` reusing that
+key — reads stale, pre-resolve state). Caught by `animus-test`'s
+`txn_serializable.rs` corpus at `ANIMUS_TXN_SEEDS=5`
+(`participant_leader_kill_early`, seed `2743871795844702347`): two
+replicas of one group permanently diverged on one key's final value
+(`[4, 16]` vs `[4, 16, 20]`) — not a timing flake, since the test's own
+converged-or-timeout poll never closed the gap. Root cause, traced with
+temporary instrumentation: on the diverging replica, the intervening
+`TxnStage` for the *next* transaction targeting that key saw the *prior*
+transaction's still-un-flushed `Intent` (not yet turned into `Committed`
+by the deferred resolve) and spuriously treated it as a foreign-txn block
+(`blocked_by`), so its own intent for the new transaction's candidate
+value was never written — the later `TxnResolve` then correctly found
+"nothing left here to resolve" and no-op'd. Fixed by giving `TxnStage`'s
+arm the identical `flush_pending`-first discipline `Cas`/`KindEval`
+already have. **The general lesson**: converting a direct engine write
+into a `pending`-queued one is not purely a perf/durability-tolerance
+change — it changes *when* the write becomes visible to any other arm's
+own `storage.get`/`get_at` read within the same apply pass, and every
+such read-then-decide arm must itself drain `pending` first, or it can
+observe stale state a direct-write world could never produce. Grep every
+`storage.get`/`get_at`/`scan` call inside `apply_and_compact`'s effects
+loop for a preceding `flush_pending` before converting any further
+direct-write site — see `docs/lessons/code-patterns/` for the recorded
+general form of this check.
