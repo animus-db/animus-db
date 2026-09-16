@@ -308,7 +308,9 @@ pub enum TraceEvent {
         stream: u64,
         len: usize,
     },
-    /// A message was dropped (lossy link, partition, or crashed target).
+    /// A message was dropped (lossy link, partition, crashed target, or a
+    /// [`Simulator::stop`]ped target's in-flight delivery discarded at stop
+    /// time — `reason: "stopped"`).
     Drop {
         t: u64,
         from: NodeId,
@@ -526,6 +528,21 @@ struct SimState {
     // reused, so this is a small unbounded map for the lifetime of a
     // simulation — the same tradeoff `task_owner` already makes).
     timer_owner: BTreeMap<TimerId, NodeId>,
+    // The CURRENT pending `(time, seq)` timeline key for a still-armed timer
+    // id (issue #837) — as opposed to `timer_owner`, which is never removed,
+    // this map holds an entry **only** while the timer genuinely has a live
+    // `Event::Timer(id)` sitting on `timeline`. Populated alongside
+    // `timer_owner` the first time a `Sleep` future actually schedules a
+    // timeline entry; updated (not just read) by `fire_event`'s own
+    // `Simulator::pause` defer path, since a deferred timer's key moves to a
+    // fresh `(until, seq)` — tracking the *id*, not a frozen key, is what
+    // lets `Sleep`'s `Drop` impl below find and remove the right entry even
+    // after it's been deferred one or more times. Removed either when the
+    // timer genuinely fires (`fire_event`'s non-deferred branch) or when the
+    // owning `Sleep` future is dropped before that (`impl Drop for Sleep`) —
+    // so, unlike `timer_owner`, this one stays bounded to the number of
+    // currently-pending timers, not every timer a run has ever scheduled.
+    timer_key: BTreeMap<TimerId, (u64, Seq)>,
 
     next_task_id: TaskId,
     // `None` while a task's future is checked out for polling.
@@ -561,6 +578,29 @@ impl SimState {
     /// The effective disk fault model for `node`: its override, else the global.
     fn disk_cfg_for(&self, node: &NodeId) -> &DiskConfig {
         self.node_disk_cfg.get(node).unwrap_or(&self.disk_cfg)
+    }
+
+    /// Collect the keys of `map` whose leading component equals `node`, in
+    /// key order, via a `BTreeMap::range` prefix scan — O(this node's own
+    /// entries) rather than a full O(every node's) scan (issue #841).
+    /// Mirrors `Disk::list`'s existing `(node, String::new())..` +
+    /// `take_while` shape (below) generalized over the trailing key
+    /// component: `u64` for `inboxes`/`recv_wakers`, `String` for `disks`.
+    /// `K::default()` is the lower bound — `u64::default() == u64::MIN` and
+    /// `String::default() == ""` are already each type's own `Ord` minimum,
+    /// so no artificial maximum is needed and no per-type helper either.
+    /// `NodeId`'s `Ord` is the only ordering this relies on; nothing here
+    /// assumes anything about its string form. Returns owned keys (not a
+    /// borrowing iterator) because every call site uses them to drive a
+    /// second pass that mutates the same map.
+    fn node_prefix_keys<K, V>(map: &BTreeMap<(NodeId, K), V>, node: &NodeId) -> Vec<(NodeId, K)>
+    where
+        K: Ord + Clone + Default,
+    {
+        map.range((node.clone(), K::default())..)
+            .take_while(|((n, _), _)| n == node)
+            .map(|(k, _)| k.clone())
+            .collect()
     }
 
     /// The effective network fault/delay model for a message from `from` to
@@ -792,6 +832,7 @@ impl Simulator {
             clock_drift: BTreeMap::new(),
             paused_until: BTreeMap::new(),
             timer_owner: BTreeMap::new(),
+            timer_key: BTreeMap::new(),
             next_task_id: 0,
             tasks: BTreeMap::new(),
             task_owner: BTreeMap::new(),
@@ -978,12 +1019,7 @@ impl Simulator {
         let mut guard = self.shared.lock();
         let st = &mut *guard;
         let t = st.clock;
-        let keys: Vec<_> = st
-            .disks
-            .keys()
-            .filter(|(n, _)| *n == node)
-            .cloned()
-            .collect();
+        let keys = SimState::node_prefix_keys(&st.disks, &node);
         for k in keys {
             if let Some(f) = st.disks.get_mut(&k) {
                 f.durable.clear();
@@ -1032,23 +1068,13 @@ impl Simulator {
         st.crashed.insert(node.clone());
         // Clear every stream's inbox for this node (ADR 0026): a crashed node's
         // whole inbox is volatile, not just its primary stream's.
-        let inbox_keys: Vec<_> = st
-            .inboxes
-            .keys()
-            .filter(|(n, _)| *n == node)
-            .cloned()
-            .collect();
+        let inbox_keys = SimState::node_prefix_keys(&st.inboxes, &node);
         for k in inbox_keys {
             if let Some(inbox) = st.inboxes.get_mut(&k) {
                 inbox.clear();
             }
         }
-        let waker_keys: Vec<_> = st
-            .recv_wakers
-            .keys()
-            .filter(|(n, _)| *n == node)
-            .cloned()
-            .collect();
+        let waker_keys = SimState::node_prefix_keys(&st.recv_wakers, &node);
         for k in waker_keys {
             st.recv_wakers.remove(&k);
         }
@@ -1056,12 +1082,7 @@ impl Simulator {
             let cfg = st.disk_cfg_for(&node);
             (cfg.torn_tail_on_crash, cfg.corrupt_on_crash)
         };
-        let keys: Vec<_> = st
-            .disks
-            .keys()
-            .filter(|(n, _)| *n == node)
-            .cloned()
-            .collect();
+        let keys = SimState::node_prefix_keys(&st.disks, &node);
         let t = st.clock;
         for k in keys {
             let Some(f) = st.disks.get_mut(&k) else {
@@ -1137,7 +1158,24 @@ impl Simulator {
     ///
     /// Unlike [`crash`](Self::crash), this does not mute or set the node
     /// `crashed`; the node simply has no tasks until one is started again.
+    ///
+    /// **Also discards any `Deliver` already scheduled for `node` on the
+    /// timeline** (issue #836): a real process exit drops its open TCP
+    /// connections, so a message still in flight when the process dies must
+    /// never surface later, in a fresh incarnation's inbox, as if the
+    /// connection had survived. This is a one-time snapshot of the timeline
+    /// *at the moment `stop` is called* — each discarded entry is traced as a
+    /// [`TraceEvent::Drop`] with `reason: "stopped"` — not a standing mute
+    /// like `crashed`: nothing is recorded that would need clearing later, so
+    /// a message a *new* incarnation on this same node id sends or receives
+    /// after `stop` (its own fresh `Deliver` timeline entries, inserted by a
+    /// later `send_stream` call) is entirely unaffected.
     pub fn stop(&self, node: NodeId) {
+        // Declared before `st` so it drops *after* `st` at function end
+        // (locals drop in reverse declaration order) — see the comment
+        // below on why the removed futures themselves must not be dropped
+        // while the lock is still held.
+        let mut removed_futures: Vec<BoxFuture<'static, ()>> = Vec::new();
         let mut st = self.shared.lock();
         let task_ids: Vec<TaskId> = st
             .task_owner
@@ -1146,42 +1184,67 @@ impl Simulator {
             .map(|(&task, _)| task)
             .collect();
         for task in task_ids {
-            st.tasks.remove(&task);
+            // Collect the removed future rather than letting it drop right
+            // here: a task parked on `env.sleep(..)` embeds a live `Sleep`
+            // whose own `Drop` impl (issue #837) re-locks this same state
+            // mutex to clean up its timer — dropping it while `st` (a named
+            // binding held for this whole function) is still locked would
+            // self-deadlock. Stashing it in `removed_futures` (dropped after
+            // `st` releases the lock, below) sidesteps that entirely.
+            if let Some(Some(fut)) = st.tasks.remove(&task) {
+                removed_futures.push(fut);
+            }
             st.task_owner.remove(&task);
         }
         // Volatile state dies with the process; durable disk is kept.
         // Clear every stream's inbox for this node (ADR 0026), mirroring `crash`.
-        let inbox_keys: Vec<_> = st
-            .inboxes
-            .keys()
-            .filter(|(n, _)| *n == node)
-            .cloned()
-            .collect();
+        let inbox_keys = SimState::node_prefix_keys(&st.inboxes, &node);
         for k in inbox_keys {
             if let Some(inbox) = st.inboxes.get_mut(&k) {
                 inbox.clear();
             }
         }
-        let waker_keys: Vec<_> = st
-            .recv_wakers
-            .keys()
-            .filter(|(n, _)| *n == node)
-            .cloned()
-            .collect();
+        let waker_keys = SimState::node_prefix_keys(&st.recv_wakers, &node);
         for k in waker_keys {
             st.recv_wakers.remove(&k);
         }
-        let keys: Vec<_> = st
-            .disks
-            .keys()
-            .filter(|(n, _)| *n == node)
-            .cloned()
-            .collect();
+        let keys = SimState::node_prefix_keys(&st.disks, &node);
         for k in keys {
             if let Some(f) = st.disks.get_mut(&k) {
                 f.buffered.clear();
             }
         }
+        // A process exit drops its open connections: any `Deliver` already
+        // scheduled for `node` on the shared timeline must never land in a
+        // later incarnation's inbox. Unlike `crashed` (a standing set
+        // `fire_event` checks at delivery time), this is a one-time removal
+        // of what's on the timeline *right now* — it cannot affect a `Deliver`
+        // a fresh incarnation sends/receives afterward, since that insert
+        // hasn't happened yet.
+        let stale_deliveries: Vec<(u64, Seq)> = st
+            .timeline
+            .iter()
+            .filter_map(|(key, event)| match event {
+                Event::Deliver { to, .. } if *to == node => Some(*key),
+                _ => None,
+            })
+            .collect();
+        let t = st.clock;
+        for key in stale_deliveries {
+            if let Some(Event::Deliver { to, env }) = st.timeline.remove(&key) {
+                st.trace.push(TraceEvent::Drop {
+                    t,
+                    from: env.from,
+                    to,
+                    stream: env.stream,
+                    reason: "stopped",
+                });
+            }
+        }
+        // Explicit, not relying only on declaration-order drop semantics:
+        // release the lock before `removed_futures` (declared above `st`)
+        // drops the collected futures — see that field's own comment.
+        drop(st);
     }
 
     /// Pause `node`: alive but frozen for `dur` of virtual time from now,
@@ -1274,8 +1337,18 @@ impl Simulator {
     /// a pause.
     pub fn shutdown(&self) {
         let mut st = self.shared.lock();
-        st.tasks.clear();
+        // `std::mem::take` (not `.clear()`) so the removed futures themselves
+        // — some of which may embed a live `Sleep`, whose own `Drop` impl
+        // (issue #837) re-locks this same state mutex — are moved out
+        // intact rather than dropped right here while `st` is still held;
+        // `.clear()` would drop every value in place, which would
+        // self-deadlock the instant one of them tried to re-lock. `removed`
+        // isn't actually dropped until after `st` releases the lock below
+        // (see `stop`'s matching comment for the general pattern).
+        let removed = std::mem::take(&mut st.tasks);
         st.task_owner.clear();
+        drop(st);
+        drop(removed);
     }
 
     /// A weak handle onto this simulation's shared state, for proving (in a
@@ -1451,9 +1524,18 @@ impl Simulator {
                         let seq = st.next_seq;
                         st.next_seq += 1;
                         st.timeline.insert((until, seq), Event::Timer(id));
+                        // The timer's live key moved — keep `timer_key`
+                        // pointed at wherever it actually is, so a `Sleep`
+                        // dropped while deferred still finds (and removes)
+                        // the right timeline entry (issue #837).
+                        st.timer_key.insert(id, (until, seq));
                         None
                     } else {
                         st.trace.push(TraceEvent::Timer { t, id });
+                        // Genuinely fired: nothing left on the timeline for
+                        // this id, so there's nothing left for a later
+                        // `Sleep::drop` to clean up either.
+                        st.timer_key.remove(&id);
                         st.timer_wakers.remove(&id)
                     }
                 }
@@ -1943,11 +2025,42 @@ impl Future for Sleep {
                 st.next_seq += 1;
                 let deadline = self.deadline;
                 st.timeline.insert((deadline, seq), Event::Timer(id));
+                st.timer_key.insert(id, (deadline, seq));
                 drop(st);
                 self.timer = Some(id);
             }
         }
         Poll::Pending
+    }
+}
+
+/// A `Sleep` dropped before its deadline (the losing branch of a `select!`,
+/// which production code does everywhere — see issue #837) must not leave a
+/// phantom timer on the shared timeline: without this, `fire_event` still
+/// pops and "fires" the now-meaningless entry at its stale deadline, burning
+/// a step, advancing virtual time for no reason, and inflating `SimStats`.
+/// Removal is keyed on the timer id via `timer_key`, not a frozen `(time,
+/// seq)` pair captured at schedule time, so this is correct even if the
+/// timer was deferred one or more times by `Simulator::pause` before being
+/// dropped (its live key moves; `timer_key` is kept pointed at wherever it
+/// currently is — see that field's own doc).
+impl Drop for Sleep {
+    fn drop(&mut self) {
+        // A `sleep` that resolved on its first poll (deadline already past)
+        // never scheduled a timer at all — nothing to clean up. Likewise, a
+        // timer that has already genuinely fired was already removed from
+        // both `timeline` and `timer_key` by `fire_event`, so `timer_key`
+        // holds nothing for it and this is a no-op — mirrors `poll`'s own
+        // lock-then-mutate discipline (a plain, single, short-held lock; no
+        // `.await` inside it, so this can never deadlock against
+        // `fire_event`, which also only ever holds this same lock for one
+        // synchronous critical section at a time).
+        let Some(id) = self.timer else { return };
+        let mut st = self.shared.lock();
+        if let Some(key) = st.timer_key.remove(&id) {
+            st.timeline.remove(&key);
+            st.timer_wakers.remove(&id);
+        }
     }
 }
 
@@ -2061,4 +2174,96 @@ fn gen_below(rng: &mut ChaCha8Rng, n: u64) -> u64 {
         }
     }
     (m >> 64) as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use animus_env::nid;
+
+    use super::SimState;
+
+    /// `node_prefix_keys` over a `u64`-suffixed map (the `inboxes`/
+    /// `recv_wakers` shape) yields exactly the target node's own keys, in
+    /// key order, and nothing for a node with no entries at all — including
+    /// a node whose `NodeId` sorts **between** two others under `NodeId`'s
+    /// own `Ord` (issue #841). `nid` formats as `"n{n}"`, so `nid(10)` ==
+    /// `"n10"` sorts lexicographically between `nid(1)` == `"n1"` and
+    /// `nid(2)` == `"n2"` — a real case this crate's own `NodeId::mint`-free
+    /// test ids hit "for free", not a contrived one.
+    #[test]
+    fn node_prefix_keys_scans_only_the_target_node_u64_suffixed() {
+        let mut map: BTreeMap<(animus_env::NodeId, u64), &'static str> = BTreeMap::new();
+        for (n, streams) in [
+            (nid(1), [0u64, 5, 9].as_slice()),
+            (nid(10), [1, 2].as_slice()),
+            (nid(2), [0, 100].as_slice()),
+        ] {
+            for &s in streams {
+                map.insert((n.clone(), s), "v");
+            }
+        }
+
+        let got: Vec<u64> = SimState::node_prefix_keys(&map, &nid(10))
+            .into_iter()
+            .map(|(_, s)| s)
+            .collect();
+        assert_eq!(
+            got,
+            vec![1, 2],
+            "expected exactly nid(10)'s own entries in key order"
+        );
+
+        let got1: Vec<u64> = SimState::node_prefix_keys(&map, &nid(1))
+            .into_iter()
+            .map(|(_, s)| s)
+            .collect();
+        assert_eq!(got1, vec![0, 5, 9]);
+
+        let got2: Vec<u64> = SimState::node_prefix_keys(&map, &nid(2))
+            .into_iter()
+            .map(|(_, s)| s)
+            .collect();
+        assert_eq!(got2, vec![0, 100]);
+
+        assert!(
+            SimState::node_prefix_keys(&map, &nid(99)).is_empty(),
+            "an absent node must yield no keys at all"
+        );
+    }
+
+    /// The `String`-suffixed shape (`disks`), same node arrangement,
+    /// including several files per node and an absent node.
+    #[test]
+    fn node_prefix_keys_scans_only_the_target_node_string_suffixed() {
+        let mut map: BTreeMap<(animus_env::NodeId, String), &'static str> = BTreeMap::new();
+        for (n, files) in [
+            (nid(1), ["wal", "manifest"].as_slice()),
+            (nid(10), ["wal"].as_slice()),
+            (nid(2), ["wal", "0.sst", "1.sst"].as_slice()),
+        ] {
+            for &f in files {
+                map.insert((n.clone(), f.to_owned()), "v");
+            }
+        }
+
+        let got: Vec<String> = SimState::node_prefix_keys(&map, &nid(10))
+            .into_iter()
+            .map(|(_, f)| f)
+            .collect();
+        assert_eq!(got, vec!["wal".to_owned()]);
+
+        let got2: Vec<String> = SimState::node_prefix_keys(&map, &nid(2))
+            .into_iter()
+            .map(|(_, f)| f)
+            .collect();
+        assert_eq!(
+            got2,
+            vec!["0.sst".to_owned(), "1.sst".to_owned(), "wal".to_owned()],
+            "keys come back in lexicographic order, not insertion order"
+        );
+
+        assert!(SimState::node_prefix_keys(&map, &nid(99)).is_empty());
+    }
 }
