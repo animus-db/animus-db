@@ -319,6 +319,51 @@ function of one seed. This is the substrate every distributed test runs on.
   run) at the exact moment `pause` was called: the executor still polls it
   synchronously (pause never blocks *execution*, only future timer/delivery
   *events*), but whatever it sends is held back regardless.
+- **`Sleep` has a `Drop` impl (issue #837)**, so a sleep dropped before its
+  deadline — the losing branch of a `select!`, which production code does
+  everywhere (`animusd/src/write_path.rs`, `schema.rs`, `txn_coordinator.rs`,
+  `sim_cluster.rs`, `animus-cp-data/src/host.rs`) — no longer leaves a
+  phantom `Event::Timer` on the timeline (previously: no `Drop` impl at all,
+  so `fire_event` still popped and "fired" it at its stale deadline,
+  burning a step, advancing virtual time, waking a task at the wrong await
+  point, and inflating `SimStats`). Removal is keyed on the `TimerId`, via a
+  new `timer_key: BTreeMap<TimerId, (u64, Seq)>` tracking each still-armed
+  timer's **current** timeline key — not a `(deadline, seq)` pair frozen at
+  schedule time — because `pause`'s defer mechanism (above) can move a
+  timer's live key to a fresh `(until, seq)` one or more times before it
+  fires; `timer_key` is kept in sync at every defer, so `Drop` finds the
+  right entry even then. `fire_event`'s own non-deferred fire path also
+  removes the `timer_key` entry (nothing left to clean up once a timer has
+  genuinely fired). Tests: `tests/sleep_drop.rs::
+  dropped_sleep_leaves_no_phantom_timer_in_the_timeline` races a sleep
+  against an already-ready future and asserts the whole scenario resolves
+  in the initial synchronous drain — `run_until_quiescent(0) == true` and
+  `stats().timer_fires` unchanged — which is unreachable pre-fix.
+  **Load-bearing lock-discipline consequence**: `stop`/`shutdown` remove a
+  node's/every task's futures from `SimState.tasks`, and a task parked on
+  `env.sleep(..)` embeds a live `Sleep` — dropping it now runs `Sleep`'s
+  `Drop`, which re-locks the same state mutex. Both `stop` and `shutdown`
+  used to drop the removed futures **while still holding that lock**
+  (`stop`'s `st.tasks.remove(&task)` inside its function-scoped `let mut st
+  = self.shared.lock();`; `shutdown`'s `st.tasks.clear()`), which is a
+  guaranteed self-deadlock the instant one of them held a live timer —
+  confirmed by temporarily reverting to the naive form and watching the
+  process hang under a `timeout` guard. Both now **defer** the drop: they
+  move the removed futures out (`stop` collects them into a
+  `Vec<BoxFuture>` declared *before* `st` so it drops after, per Rust's
+  reverse-declaration-order rule, reinforced by an explicit `drop(st)`;
+  `shutdown` uses `std::mem::take(&mut st.tasks)` then an explicit
+  `drop(st); drop(removed);`), so the futures — and any `Sleep` inside them
+  — are only actually dropped after the lock is released. `poll_task`
+  itself needed no change: it already checks a task's future *out* of
+  `tasks` before polling (the existing "so the poll can re-enter the state
+  lock... without deadlocking" comment), so by the time its `Poll::Ready`
+  arm calls `tasks.remove(&task)`, that slot already holds `None` — nothing
+  to drop there. Tests: `tests/sleep_drop.rs::
+  stopping_a_node_parked_on_sleep_does_not_deadlock` and `::
+  shutdown_with_a_live_sleep_does_not_deadlock` (proof-by-completion: the
+  test hanging forever, not a normal assertion failure, is what a
+  regression here looks like).
 - **Multiplexed `(node, stream)` addressing (ADR 0026).** The inbox/waker maps
   are keyed `(NodeId, u64)` instead of `NodeId`, so a node can be addressed on
   more than one stream; `crash`/`stop` now node-prefix-scan both maps (the same
@@ -393,6 +438,10 @@ process-exit fidelity (issue #836): a message still in flight when its
 target is `stop`ped is discarded, never surfacing in a fresh incarnation's
 inbox after restart, while the discard is a one-time snapshot that doesn't
 mute traffic a fresh incarnation sends/receives afterward. `tests/
+sleep_drop.rs` proves a `Sleep` dropped before its deadline leaves no
+phantom timer on the timeline (issue #837) and that `stop`/`shutdown`
+dropping a task parked mid-`sleep` doesn't deadlock (see "What's
+non-obvious" above for both). `tests/
 executor_leak.rs` proves the
 `Simulator`/`SimEnv` task-queue reference cycle directly (`Simulator::
 downgrade`'s `Weak` still upgrades after every external handle is dropped,

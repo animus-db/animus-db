@@ -528,6 +528,21 @@ struct SimState {
     // reused, so this is a small unbounded map for the lifetime of a
     // simulation — the same tradeoff `task_owner` already makes).
     timer_owner: BTreeMap<TimerId, NodeId>,
+    // The CURRENT pending `(time, seq)` timeline key for a still-armed timer
+    // id (issue #837) — as opposed to `timer_owner`, which is never removed,
+    // this map holds an entry **only** while the timer genuinely has a live
+    // `Event::Timer(id)` sitting on `timeline`. Populated alongside
+    // `timer_owner` the first time a `Sleep` future actually schedules a
+    // timeline entry; updated (not just read) by `fire_event`'s own
+    // `Simulator::pause` defer path, since a deferred timer's key moves to a
+    // fresh `(until, seq)` — tracking the *id*, not a frozen key, is what
+    // lets `Sleep`'s `Drop` impl below find and remove the right entry even
+    // after it's been deferred one or more times. Removed either when the
+    // timer genuinely fires (`fire_event`'s non-deferred branch) or when the
+    // owning `Sleep` future is dropped before that (`impl Drop for Sleep`) —
+    // so, unlike `timer_owner`, this one stays bounded to the number of
+    // currently-pending timers, not every timer a run has ever scheduled.
+    timer_key: BTreeMap<TimerId, (u64, Seq)>,
 
     next_task_id: TaskId,
     // `None` while a task's future is checked out for polling.
@@ -794,6 +809,7 @@ impl Simulator {
             clock_drift: BTreeMap::new(),
             paused_until: BTreeMap::new(),
             timer_owner: BTreeMap::new(),
+            timer_key: BTreeMap::new(),
             next_task_id: 0,
             tasks: BTreeMap::new(),
             task_owner: BTreeMap::new(),
@@ -1152,6 +1168,11 @@ impl Simulator {
     /// after `stop` (its own fresh `Deliver` timeline entries, inserted by a
     /// later `send_stream` call) is entirely unaffected.
     pub fn stop(&self, node: NodeId) {
+        // Declared before `st` so it drops *after* `st` at function end
+        // (locals drop in reverse declaration order) — see the comment
+        // below on why the removed futures themselves must not be dropped
+        // while the lock is still held.
+        let mut removed_futures: Vec<BoxFuture<'static, ()>> = Vec::new();
         let mut st = self.shared.lock();
         let task_ids: Vec<TaskId> = st
             .task_owner
@@ -1160,7 +1181,16 @@ impl Simulator {
             .map(|(&task, _)| task)
             .collect();
         for task in task_ids {
-            st.tasks.remove(&task);
+            // Collect the removed future rather than letting it drop right
+            // here: a task parked on `env.sleep(..)` embeds a live `Sleep`
+            // whose own `Drop` impl (issue #837) re-locks this same state
+            // mutex to clean up its timer — dropping it while `st` (a named
+            // binding held for this whole function) is still locked would
+            // self-deadlock. Stashing it in `removed_futures` (dropped after
+            // `st` releases the lock, below) sidesteps that entirely.
+            if let Some(Some(fut)) = st.tasks.remove(&task) {
+                removed_futures.push(fut);
+            }
             st.task_owner.remove(&task);
         }
         // Volatile state dies with the process; durable disk is kept.
@@ -1223,6 +1253,10 @@ impl Simulator {
                 });
             }
         }
+        // Explicit, not relying only on declaration-order drop semantics:
+        // release the lock before `removed_futures` (declared above `st`)
+        // drops the collected futures — see that field's own comment.
+        drop(st);
     }
 
     /// Pause `node`: alive but frozen for `dur` of virtual time from now,
@@ -1315,8 +1349,18 @@ impl Simulator {
     /// a pause.
     pub fn shutdown(&self) {
         let mut st = self.shared.lock();
-        st.tasks.clear();
+        // `std::mem::take` (not `.clear()`) so the removed futures themselves
+        // — some of which may embed a live `Sleep`, whose own `Drop` impl
+        // (issue #837) re-locks this same state mutex — are moved out
+        // intact rather than dropped right here while `st` is still held;
+        // `.clear()` would drop every value in place, which would
+        // self-deadlock the instant one of them tried to re-lock. `removed`
+        // isn't actually dropped until after `st` releases the lock below
+        // (see `stop`'s matching comment for the general pattern).
+        let removed = std::mem::take(&mut st.tasks);
         st.task_owner.clear();
+        drop(st);
+        drop(removed);
     }
 
     /// A weak handle onto this simulation's shared state, for proving (in a
@@ -1492,9 +1536,18 @@ impl Simulator {
                         let seq = st.next_seq;
                         st.next_seq += 1;
                         st.timeline.insert((until, seq), Event::Timer(id));
+                        // The timer's live key moved — keep `timer_key`
+                        // pointed at wherever it actually is, so a `Sleep`
+                        // dropped while deferred still finds (and removes)
+                        // the right timeline entry (issue #837).
+                        st.timer_key.insert(id, (until, seq));
                         None
                     } else {
                         st.trace.push(TraceEvent::Timer { t, id });
+                        // Genuinely fired: nothing left on the timeline for
+                        // this id, so there's nothing left for a later
+                        // `Sleep::drop` to clean up either.
+                        st.timer_key.remove(&id);
                         st.timer_wakers.remove(&id)
                     }
                 }
@@ -1984,11 +2037,42 @@ impl Future for Sleep {
                 st.next_seq += 1;
                 let deadline = self.deadline;
                 st.timeline.insert((deadline, seq), Event::Timer(id));
+                st.timer_key.insert(id, (deadline, seq));
                 drop(st);
                 self.timer = Some(id);
             }
         }
         Poll::Pending
+    }
+}
+
+/// A `Sleep` dropped before its deadline (the losing branch of a `select!`,
+/// which production code does everywhere — see issue #837) must not leave a
+/// phantom timer on the shared timeline: without this, `fire_event` still
+/// pops and "fires" the now-meaningless entry at its stale deadline, burning
+/// a step, advancing virtual time for no reason, and inflating `SimStats`.
+/// Removal is keyed on the timer id via `timer_key`, not a frozen `(time,
+/// seq)` pair captured at schedule time, so this is correct even if the
+/// timer was deferred one or more times by `Simulator::pause` before being
+/// dropped (its live key moves; `timer_key` is kept pointed at wherever it
+/// currently is — see that field's own doc).
+impl Drop for Sleep {
+    fn drop(&mut self) {
+        // A `sleep` that resolved on its first poll (deadline already past)
+        // never scheduled a timer at all — nothing to clean up. Likewise, a
+        // timer that has already genuinely fired was already removed from
+        // both `timeline` and `timer_key` by `fire_event`, so `timer_key`
+        // holds nothing for it and this is a no-op — mirrors `poll`'s own
+        // lock-then-mutate discipline (a plain, single, short-held lock; no
+        // `.await` inside it, so this can never deadlock against
+        // `fire_event`, which also only ever holds this same lock for one
+        // synchronous critical section at a time).
+        let Some(id) = self.timer else { return };
+        let mut st = self.shared.lock();
+        if let Some(key) = st.timer_key.remove(&id) {
+            st.timeline.remove(&key);
+            st.timer_wakers.remove(&id);
+        }
     }
 }
 
