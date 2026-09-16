@@ -378,7 +378,7 @@ fn base_partitions_present(node: &KvNode) -> BTreeSet<Vec<u8>> {
 /// issue #852's ordinal-widened key), so the partition is its key minus the
 /// fixed 12-byte `(hlc, ordinal)` suffix.
 fn partitions_with_change_marker(node: &KvNode) -> BTreeSet<Vec<u8>> {
-    block_on(node.pending_changes())
+    block_on(node.pending_changes_key_order())
         .into_iter()
         .filter_map(|(k, _)| k.len().checked_sub(12).map(|n| k[..n].to_vec()))
         .collect()
@@ -392,7 +392,7 @@ fn partitions_with_change_marker(node: &KvNode) -> BTreeSet<Vec<u8>> {
 /// cell below (ADR 0045 follow-up "E1") needs to classify *every* dirty
 /// marker a partition got, not just whether it got at least one.
 fn decoded_change_records(node: &KvNode) -> Vec<(Vec<u8>, ChangeRecord)> {
-    block_on(node.pending_changes())
+    block_on(node.pending_changes_key_order())
         .into_iter()
         .filter_map(|(k, v)| {
             let prefix_len = k.len().checked_sub(12)?;

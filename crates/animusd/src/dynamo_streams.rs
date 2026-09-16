@@ -512,7 +512,7 @@ async fn get_shard_iterator<E: Env, R: RelayClient>(
             // (trimming is the separate, asynchronous janitor's job). If
             // that watermark HLC was itself a tie (a multi-key commit),
             // the tie's own tail members (ordinal > 0) can still be
-            // physically present in `pending_changes()` when this shard's
+            // physically present in `pending_changes_key_order()` when this shard's
             // TRIM_HORIZON is requested — a bare `(watermark, 0)` floor
             // would wrongly let them back in as "new," re-delivering
             // content the sealed predecessor shard already served in

@@ -598,12 +598,12 @@ impl<E: Env> CpGroup<E> {
 
     /// Every pending change-log record this tablet holds, in **physical key
     /// order** (token-then-pk-then-HLC), NOT commit order. See
-    /// [`RaftKvNode::pending_changes`]'s own doc for the full account and
+    /// [`RaftKvNode::pending_changes_key_order`]'s own doc for the full account and
     /// ADR 0043 §A3.
-    pub(crate) async fn pending_changes(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
+    pub(crate) async fn pending_changes_key_order(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
         match self {
-            CpGroup::Lsm(n) => n.pending_changes().await,
-            CpGroup::Mem(n) => n.pending_changes().await,
+            CpGroup::Lsm(n) => n.pending_changes_key_order().await,
+            CpGroup::Mem(n) => n.pending_changes_key_order().await,
         }
     }
 

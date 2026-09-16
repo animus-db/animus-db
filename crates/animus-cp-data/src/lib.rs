@@ -2790,7 +2790,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// optional annotation.** It must be [`engine_applied_index`](Self::
     /// engine_applied_index) read by the caller **before** whatever
     /// observation decided `held` (e.g. before scanning
-    /// [`pending_changes`](Self::pending_changes)) — never after, and never
+    /// [`pending_changes_key_order`](Self::pending_changes_key_order)) — never after, and never
     /// the result of the scan itself. Reading it first gives a valid
     /// *lower* bound: a concurrent apply between the read and the scan can
     /// only make the true state fresher than what's recorded, never make a
@@ -5242,7 +5242,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                 // tablet's kind scope, which always has a non-`0xFF`-ending
                 // prefix (the scope selector byte itself) and so always
                 // yields a finite `physical_bounds` upper bound. Mirrors
-                // `pending_changes`'s identical fallback.
+                // `pending_changes_key_order`'s identical fallback.
                 None => Vec::new(),
             },
         };
@@ -5572,7 +5572,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// `(packed_hlc, ordinal)` pair, exactly as `seal_now`/`hot_read`
     /// (`animusd::index_drain`) already do; don't rely on this method's own
     /// return order for that.
-    pub async fn pending_changes(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
+    pub async fn pending_changes_key_order(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
         let scope = &self.kind_scopes[KIND_CHANGE as usize];
         let (start, end) = scope.physical_bounds();
         let Some(end) = end else {

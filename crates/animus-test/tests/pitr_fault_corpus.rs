@@ -194,7 +194,7 @@ fn current_open_pitr_epoch(meta: &Metadata, tablet: TabletId) -> u64 {
 
 /// One PITR seal attempt of `group`'s currently-open epoch — mirrors
 /// `animusd::index_drain::pitr_seal_now`'s exact sequence (see that
-/// function's own doc): scan `pending_changes()` past the effective PITR
+/// function's own doc): scan `pending_changes_key_order()` past the effective PITR
 /// watermark, sort by the HLC key suffix, encode a segment, `SegmentStore::
 /// put` under the PITR object namespace, then propose
 /// `MetaCommand::SealPitrSegment`. `None` if there was nothing to seal, or
@@ -212,7 +212,7 @@ fn pitr_seal_now(
     let generation = meta.table_pitr(TABLE)?.generation;
     let watermark = meta.pitr_segment_watermark(group.id).unwrap_or(0);
     let mut filtered: Vec<(Vec<u8>, u64, u32, Vec<u8>)> =
-        block_on(group.nodes[leader].pending_changes())
+        block_on(group.nodes[leader].pending_changes_key_order())
             .into_iter()
             .filter_map(|(k, v)| {
                 let (hlc, ordinal) = record_seqno_suffix(&k)?;
@@ -306,7 +306,7 @@ fn collect_pitr_records(
     }
     let watermark = meta.pitr_segment_watermark(group.id).unwrap_or(0);
     let mut hot: Vec<(Vec<u8>, u64, u32, Vec<u8>)> =
-        block_on(group.nodes[leader].pending_changes())
+        block_on(group.nodes[leader].pending_changes_key_order())
             .into_iter()
             .filter_map(|(k, v)| {
                 let (hlc, ordinal) = record_seqno_suffix(&k)?;
@@ -411,7 +411,7 @@ fn quiet_table_pitr_rollover() {
 /// Structural proof of ADR 0059 §9's quiescence contract's "read locally
 /// without waking" half: with nothing pending, `pitr_seal_now` returns
 /// `None` without ever calling `store.put`/proposing — the identical
-/// early-return `pending_changes().is_empty()`-adjacent shape production's
+/// early-return `pending_changes_key_order().is_empty()`-adjacent shape production's
 /// own `pitr_tick` gates its whole sweep behind (`approx_bytes_kind(KIND_
 /// CHANGE) == 0` in production; here, directly, the filtered-set-empty
 /// check). A seal only ever happens once real writes land.
@@ -880,14 +880,14 @@ fn scenario_restore_to_random_second_matches_the_model_with_a_leader_kill(seed: 
         // node is leader now) is what proves the new leader has actually
         // caught its apply cursor up to the crashed leader's last
         // committed entry before this round's own seal ever reads
-        // `pending_changes()` on it. Killing AFTER the burst (or sealing
+        // `pending_changes_key_order()` on it. Killing AFTER the burst (or sealing
         // right after a bare re-election with no confirmed write of its
         // own in between) is unsound: a freshly elected leader's
         // `is_leader()` flipping true is a LEADERSHIP signal, not an APPLY
         // one — see `docs/engineering-lessons.md` for the general lesson
         // this scenario's own first depth run at seed 8085152262896110479
         // found the hard way (a real corpus-harness gap, not a production
-        // bug: `pitr_seal_now`'s own `pending_changes()` scan is exactly
+        // bug: `pitr_seal_now`'s own `pending_changes_key_order()` scan is exactly
         // as fresh as the node it's read from).
         if round == 3 {
             let old_leader = elect(&mut sim, &group, &live, seed);
@@ -1288,7 +1288,7 @@ fn chaotic_network_pitr_rollover() {
 /// [`scenario_idle_group_never_proposes_a_pitr_seal`] (cell 2), under the
 /// same compound lossy+duplicating network as cell 14 — proving the
 /// "nothing pending ⇒ no store `put`, no propose" contract is a purely
-/// local decision (`pending_changes()` reading empty) that packet loss or
+/// local decision (`pending_changes_key_order()` reading empty) that packet loss or
 /// duplication cannot spuriously trip into a false seal, and that a real
 /// write still gets through and seals despite the same fault.
 fn scenario_chaotic_network_idle_group_never_proposes_a_pitr_seal(seed: u64) {
