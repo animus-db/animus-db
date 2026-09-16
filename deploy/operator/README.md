@@ -494,9 +494,12 @@ out-of-cluster `cargo run`.
   matrix entry publishes `ghcr.io/animus-db/animus-operator` on the same
   tag/push rules as `animusd` — `deployment.yaml`'s image reference is real,
   not a placeholder.
-- **`spec.autoSplitBytes` is accepted but not yet wired to a flag** —
-  `animusd`'s `--config FILE --node I`/`animusd data --config FILE --node I`
-  invocations (what every pod in this deployment shape runs) don't accept
-  `--auto-split-bytes` today; only the dev-only `--cluster N` in-process
-  mode does. See `crates/animus-operator/src/desired/cluster_config.rs`'s
-  `entrypoint_script` doc.
+- ~~`spec.autoSplitBytes` is accepted but not yet wired to a flag~~ —
+  closed 2026-09-04 (S-06). It never needed a flag: the operator writes
+  `spec.autoSplitBytes` (and `spec.quiesceAfterSecs`) into the generated
+  `cluster.json`'s own `cluster_settings` section
+  (`cluster_settings.auto_split_bytes`/`.quiesce_after_secs`), which
+  `animusd --config FILE --node I`/`animusd data --config FILE --node I`
+  read on every deployment shape. See
+  `crates/animus-operator/src/desired/cluster_config.rs`'s
+  `ClusterSettings` doc.
