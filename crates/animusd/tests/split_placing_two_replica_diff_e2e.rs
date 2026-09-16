@@ -425,47 +425,26 @@ async fn two_of_three_replica_diff_placing_target_converges_end_to_end() {
         put(&mut client, vec![b'k', 0], vec![b'v', 0]).await;
         let parent = sole_tablet_of(&nodes[0], "t");
 
-        // The freshly-provisioned first tablet's replica set is only a
-        // best-effort target the instant `provision_tablet` mints it — a
-        // transiently under-sized initial set is a legal, documented
-        // eventual property (see `tests/tablet_rf_self_heals.rs`), not a
-        // one-shot fact to assert on immediately (issue #622/#670 — a
-        // one-shot assert here has hit both under CPU-starvation-simulated
-        // contention and in real, unpressured CI). Poll converged-or-timeout
-        // until the recorded replica set reaches three members, then assert
-        // the final membership — printing the full tablet entry and the
-        // control-plane membership snapshot on timeout so a genuine
-        // three-way divergence (as opposed to a slow climb to three) is
-        // diagnosable from the failure alone. Budget matches this file's
-        // own `join_extra`/`await_cutover_of` convergence-under-load
-        // budgets (60s, both above) rather than `await_bootstrap`'s
-        // narrower 20s cluster-bootstrap bound — a fresh sandbox run
-        // measured this self-heal genuinely taking longer than 20s under
-        // real contention (2 of 10 runs), well before ever approaching
-        // this file's 150s overall test timeout.
-        const INITIAL_PLACEMENT_TIMEOUT: Duration = Duration::from_secs(60);
-        let deadline = tokio::time::Instant::now() + INITIAL_PLACEMENT_TIMEOUT;
-        let mut status0;
-        loop {
-            let (_, status) = admin(nodes[0].admin_addr(), "GET", "/admin/status", None).await;
-            status0 = status;
-            if tablet_replicas(&status0, parent).len() >= 3 || tokio::time::Instant::now() >= deadline
-            {
-                break;
-            }
-            sleep(Duration::from_millis(100)).await;
-        }
-        let mut replicas = tablet_replicas(&status0, parent);
-        replicas.sort();
-        assert_eq!(
-            replicas,
-            vec!["n0", "n1", "n2"],
-            "unexpected initial replica placement (never converged to three members within {:?}): \
-             tablets[{parent}]={}, members={}",
-            INITIAL_PLACEMENT_TIMEOUT,
-            status0["tablets"][parent.to_string()],
-            status0["members"],
-        );
+        // The freshly-provisioned tablet's initial replica set is an
+        // eventual property, not a one-shot fact — see docs/lessons/
+        // testing/2026-09-16-a-faster-bootstrap-time-schema-proposal-
+        // makes-initial-tablet-placement-an-eventual-property.md
+        // (issue #610/#622/#670). This test's own two-replica-move premise
+        // genuinely needs all three original nodes, so poll for the full
+        // set before proceeding.
+        let admin_addr = nodes[0].admin_addr();
+        support::poll_until_or_stalled(
+            admin_addr,
+            "tablet never converged to the 3 founding members",
+            Duration::from_millis(100),
+            || async move {
+                let (_, status) = admin(admin_addr, "GET", "/admin/status", None).await;
+                let mut r = tablet_replicas(&status, parent);
+                r.sort();
+                r == vec!["n0", "n1", "n2"]
+            },
+        )
+        .await;
 
         // Grow by TWO lower-sorting nodes ("m0" < "m1" < "n0") — the exact
         // two-of-three shape issue #513 reports.

@@ -157,20 +157,11 @@ async fn tablet_provisioned_undersized_on_a_small_cluster_self_heals_after_growt
     const TABLE: &str = "rf_self_heal";
     put(&base_clients, TABLE, b"k0", b"v0", 30).await;
 
-    // A transiently under-sized initial replica set is a legal, documented
-    // eventual property (issue #622/#670, `split_placing_two_replica_diff_
-    // e2e.rs`'s own identical precedent) — not a one-shot fact to assert on
-    // immediately right after the first write returns. Issue #610's own
-    // concurrent broadcast fallback made the first `CreateTable`/auto-create
-    // (and therefore `provision_tablet`'s own replica-selection read)
-    // resolve fast enough to make this test's own genuinely-2-node cluster
-    // hit exactly this window: `n1`'s own `RegisterNode` self-registration
-    // can still be in flight when `provision_tablet` reads `meta.members`,
-    // so the tablet is legitimately minted with just `n0` at that instant —
-    // `reconcile_placement`'s own violation-repair (the RF policy always
-    // records the *target* `MAX_REPLICATION_FACTOR`, per this file's own
-    // module doc) then grows it to 2 within one reconcile tick once `n1`
-    // goes `Active`. Poll converged-or-timeout instead of asserting once.
+    // The freshly-provisioned tablet's initial replica set is an eventual
+    // property, not a one-shot fact — see docs/lessons/testing/
+    // 2026-09-16-a-faster-bootstrap-time-schema-proposal-makes-initial-
+    // tablet-placement-an-eventual-property.md (issue #610/#622/#670).
+    // Poll converged-or-timeout instead of asserting once.
     let progress_addr = base_admin[0];
     support::poll_until_or_stalled(
         progress_addr,
