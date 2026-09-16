@@ -7416,19 +7416,23 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 // guarantee. Every key in the batch merges at this one entry's
                 // shared `ts`. The keys are distinct, so per-key LWW is
                 // well-defined; `engine_applied` advances once past the whole batch
-                // at the end of the loop iteration (the batch is one entry). Composes
-                // with a future coalesced-fsync merge_batch (perf/lsm) — this is the
-                // normal per-key `merge` path that batching optimization refines.
+                // at the end of the loop iteration (the batch is one entry).
+                // Issue #834: queued onto the shared `pending` run exactly like
+                // `Put`/`Delete`/`SeedBatch`, instead of a direct per-key
+                // `storage.merge` — a batch entry's own N keys now share the
+                // run's one coalesced `merge_batch` `fsync` (`flush_pending`)
+                // rather than paying one `fsync` per key, and inherit
+                // `flush_pending`'s halted-gated error tolerance for free
+                // (this arm used to hard-panic via `.expect(..)` even during a
+                // graceful shutdown racing an in-flight write).
                 if puts.iter().all(|(key, _)| !is_sealed(sealed, key)) {
+                    let version = hlc::pack(ts);
                     for (key, value) in &puts {
-                        storage
-                            .merge(
-                                &scope.physical(key),
-                                &txn::encode_committed(value),
-                                hlc::pack(ts),
-                            )
-                            .await
-                            .expect("raftkv apply batch put");
+                        pending.push(MergeOp::put(
+                            scope.physical(key),
+                            txn::encode_committed(value),
+                            version,
+                        ));
                     }
                 }
             }
@@ -7886,6 +7890,22 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 ts,
             } => {
                 assert_ts_monotonic(max_applied_ts, ts);
+                // Issue #834: drain the pending run first, mirroring `Cas`'s
+                // identical call above — this arm's own reads below
+                // (`already_decided`, and `blocked_by`'s per-write conflict
+                // check) must observe every earlier committed write in this
+                // apply pass, including a `TxnResolve` commit that finalized
+                // an `Intent` into a `Committed` envelope at one of these
+                // same keys. Before issue #834 routed `TxnResolve`'s commit
+                // writes through the shared `pending` run, this call wasn't
+                // needed here: those writes landed via a direct, immediate
+                // `storage.merge`. Now that they're deferred like every
+                // other write in this loop, a `TxnStage` later in the same
+                // pass without this flush could still see the stale
+                // pre-resolve `Intent` and spuriously treat it as a
+                // foreign-transaction block (`blocked_by`) — see
+                // `docs/lessons/` for the regression this closed.
+                flush_pending(storage, &mut pending, metrics, halted).await;
                 // ADR 0018 §2/PR5 resurrection guard: PR4's prepare phase
                 // is concurrent, so the anchor's own `TxnStage` (this
                 // entry, when `is_anchor`) can arrive **after** a recovery
@@ -8805,62 +8825,54 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                         else {
                             continue; // nothing left here to resolve (idempotent no-op)
                         };
-                        // ADR 0018 §2 write-loss amendment (Part B): every
-                        // branch below already treated this key as resolved
-                        // (it is removed from `TxnTracker`, and the
-                        // coordinator's own client-facing ack was computed
-                        // independently) before this fix started checking
-                        // whether the merge that's supposed to *make* it so
-                        // actually landed — see
-                        // `surface_suspicious_merge_noop`'s doc, and this
-                        // variant's own `fence` (above, in `KvCommand::
-                        // TxnResolve`'s doc) for why a misrouted resolve
-                        // used to leave a foreign tablet's key permanently
-                        // unable to land correctly.
+                        // ADR 0018 §2 write-loss amendment (Part B) /
+                        // issue #834: every branch below already treats this
+                        // key as resolved (it is removed from `TxnTracker`,
+                        // and the coordinator's own client-facing ack was
+                        // computed independently); this variant's own
+                        // `fence` (above, in `KvCommand::TxnResolve`'s doc)
+                        // is the structural backstop against a misrouted
+                        // resolve leaving a foreign tablet's key permanently
+                        // unable to land correctly. The commit/abort-restore
+                        // writes below used to call `storage.merge`/
+                        // `merge_tombstone` directly (one `fsync` per key)
+                        // and check the returned `took_effect` against
+                        // `surface_suspicious_merge_noop`'s soft seatbelt.
+                        // Issue #834 routes them through the shared
+                        // `pending` run instead — one coalesced `fsync` per
+                        // `TxnResolve` entry, however many keys it commits,
+                        // and `flush_pending`'s halted-gated error tolerance
+                        // for free — which means `merge`'s per-op
+                        // `took_effect` is no longer observed here. That
+                        // diagnostic is a deliberately soft, metric+log-only
+                        // seatbelt with no correctness role (see ADR 0018's
+                        // "kept from the investigation" §3, "deliberately
+                        // not a hard assert"); the real safety net is the
+                        // `fence` above, which is untouched by this change.
+                        // See ADR 0018's 2026-09-16 amendment. It stays live
+                        // on `Cas`'s swap and `TxnStage`'s own intent write,
+                        // neither of which this change touches.
                         match outcome_commit_ts {
                             Some(_commit_ts) => {
                                 match staged_value {
                                     // Committed: the staged value becomes the
                                     // committed value.
                                     Some(v) => {
-                                        let took_effect = storage
-                                            .merge(
-                                                &physical_key,
-                                                &txn::encode_committed(&v),
-                                                version,
-                                            )
-                                            .await
-                                            .expect("raftkv apply txn resolve commit");
-                                        if !took_effect {
-                                            surface_suspicious_merge_noop(
-                                                metrics,
-                                                suspicious_noop_log_budget,
-                                                "TxnResolve commit",
-                                                &physical_key,
-                                                version,
-                                                recovered_baseline_version,
-                                            );
-                                        }
+                                        pending.push(MergeOp::put(
+                                            physical_key.clone(),
+                                            txn::encode_committed(&v),
+                                            version,
+                                        ));
                                     }
                                     // A staged delete resolves to an actual
                                     // tombstone — the only place `TxnResolve`
                                     // writes one, since it's finalizing an
                                     // already-decided delete, not guessing.
                                     None => {
-                                        let took_effect = storage
-                                            .merge_tombstone(&physical_key, version)
-                                            .await
-                                            .expect("raftkv apply txn resolve commit delete");
-                                        if !took_effect {
-                                            surface_suspicious_merge_noop(
-                                                metrics,
-                                                suspicious_noop_log_budget,
-                                                "TxnResolve commit delete",
-                                                &physical_key,
-                                                version,
-                                                recovered_baseline_version,
-                                            );
-                                        }
+                                        pending.push(MergeOp::tombstone(
+                                            physical_key.clone(),
+                                            version,
+                                        ));
                                     }
                                 }
                                 // ADR 0046 A1 ("materialize-at-resolve"): on
@@ -8928,33 +8940,25 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                                     .get_at(&physical_key, intent_version.saturating_sub(1))
                                     .await
                                     .expect("raftkv txn resolve prior read");
-                                let (took_effect, site) = match prior {
-                                    Some(pvv) => (
-                                        storage
-                                            .merge(&physical_key, &pvv.value, version)
-                                            .await
-                                            .expect("raftkv apply txn resolve abort restore"),
-                                        "TxnResolve abort restore",
-                                    ),
-                                    None => (
-                                        storage
-                                            .merge_tombstone(&physical_key, version)
-                                            .await
-                                            .expect(
-                                                "raftkv apply txn resolve abort restore tombstone",
-                                            ),
-                                        "TxnResolve abort restore tombstone",
-                                    ),
-                                };
-                                if !took_effect {
-                                    surface_suspicious_merge_noop(
-                                        metrics,
-                                        suspicious_noop_log_budget,
-                                        site,
-                                        &physical_key,
-                                        version,
-                                        recovered_baseline_version,
-                                    );
+                                // Issue #834: queued onto `pending` like the
+                                // commit branch above — see this match's own
+                                // doc for why `took_effect`/
+                                // `surface_suspicious_merge_noop` are no
+                                // longer checked here.
+                                match prior {
+                                    Some(pvv) => {
+                                        pending.push(MergeOp::put(
+                                            physical_key.clone(),
+                                            pvv.value,
+                                            version,
+                                        ));
+                                    }
+                                    None => {
+                                        pending.push(MergeOp::tombstone(
+                                            physical_key.clone(),
+                                            version,
+                                        ));
+                                    }
                                 }
                             }
                         }

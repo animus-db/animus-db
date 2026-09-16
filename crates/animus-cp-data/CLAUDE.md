@@ -745,6 +745,47 @@ State once here; cross-referenced from the sections below.
   and never the stage's own ts — ADR 0018 §2 B1). Regression:
   `tests/txn_kind_writes.rs::kind_batch_and_txn_resolve_materialize_byte_
   identical_rows_for_identical_payloads`.
+- **`KvCommand::Batch` and `TxnResolve`'s commit/abort-restore writes are
+  coalesced-fsync too (issue #834)** — they now push onto the same
+  loop-local `pending: Vec<MergeOp>` `flush_pending` already drains for
+  `Put`/`Delete`/`SeedBatch`/`KindBatch`/`materialize_derived`, instead of
+  calling `storage.merge`/`merge_tombstone` directly once per key. Closes
+  two defects together: N un-amortized `fsync`s per `Batch`/`TxnResolve`
+  entry on a durable engine collapse to one (`flush_pending`'s single
+  `merge_batch` call — see `animus-storage/CLAUDE.md`'s ~9.7x batch-vs-
+  per-key figure; invisible under `SimEnv`/`MemoryEngine`, where `fsync` is
+  free), and both arms inherit `flush_pending`'s halted-gated error
+  tolerance for free (they used to hard-panic via a bare `.expect(..)`
+  even during a graceful shutdown racing an in-flight write — see the
+  "Apply task" bullet above). `TxnResolve`'s commit/abort-restore writes
+  used to check the direct `merge`/`merge_tombstone`'s returned
+  `took_effect` against `surface_suspicious_merge_noop`'s soft seatbelt;
+  that diagnostic is dropped on this now-batched path (it never covered
+  `Batch` either) — see ADR 0018's 2026-09-16 amendment for why that's
+  safe (a documented metric+log-only diagnostic with no correctness role;
+  the real safety net, `TxnResolve`'s own per-entry `fence`, is untouched).
+  **The one thing this conversion required elsewhere**: `KvCommand::
+  TxnStage`'s own `already_decided`/`blocked_by` reads now need a leading
+  `flush_pending` call too (mirroring `Cas`/`KindEval`'s own — see their
+  doc above) — before this fix, `TxnResolve`'s commit write was direct and
+  immediate, so a same-pass `TxnStage` reading `storage.get` right after it
+  always saw the just-landed `Committed` envelope; deferred through
+  `pending`, it could see the stale, still-`Intent` state instead and
+  spuriously treat it as a foreign-transaction block. Caught by
+  `animus-test`'s `txn_serializable.rs` corpus (`ANIMUS_TXN_SEEDS=5`,
+  `participant_leader_kill_early`) as a genuine cross-replica divergence,
+  not a flake — see ADR 0018's amendment for the full trace and
+  `docs/lessons/code-patterns/` for the generalized rule (every
+  `storage.get`/`get_at`/`scan` inside the effects loop needs a preceding
+  `flush_pending` if what it reads could be produced by a `pending`-queued
+  write earlier in the same pass). Tests: `tests/batch.rs::
+  batch_rejected_wholesale_by_a_frozen_range` (the sealed-key branch, not
+  previously covered by `tests/freeze.rs`'s own sweep), `tests/
+  txn_single.rs::commit_with_a_mixed_put_and_a_staged_delete_lands_both_
+  from_one_resolve_entry`, and `tests/batch_txn_resolve_apply_fault.rs`
+  (halted-gate regression via a fault-injecting `StorageEngine` test
+  double, and an `LsmEngine`-backed `Disk::sync`-counting fsync-count
+  proof — both `MemoryEngine`/`SimEnv` alone can't observe).
 - **`KvCommand::KindEval` — the self-contained evaluated write (ADR 0054
   step 2), unwired.** This crate now depends on `animus-item` (`WriteSchema`/
   `derive_kind_writes`/`AttributeValue`/`Item`/`ConditionExpression`/
@@ -1655,17 +1696,26 @@ demand the identical action, so no disambiguation is needed.
     mid-pass is the same class of teardown-artifact error as `persist_wal`'s
     — tolerated iff `halted`, a hard panic otherwise (a live apply failure can
     silently leave the engine short a committed write, so this stays loud).
-    No dedicated regression: unlike `persist_wal`'s pending-write queue (a
-    bare synchronous `core` write bypassing the driver loop's own check
-    entirely, so a `put`-then-`shutdown()` beat reaches it deterministically),
-    `apply_and_compact`'s work source (`drain_apply`) only becomes non-empty
-    through the *apply task's own prior progress*, and its effects loop —
-    once entered, after that same iteration's own `halted` check already
-    passed — runs uninterrupted to completion under `SimEnv` (disk ops
-    resolve without yielding), so there is no reachable window for an
-    external test driver to inject `halted` between the check and this
-    call the way `persist_wal`'s regression does. Covered structurally by
-    the identical, already-proven idiom instead. When idle it races a new
+    Genuinely racing this from outside — a real `shutdown()` call
+    interleaving mid-pass under `SimEnv` — has no reachable window: unlike
+    `persist_wal`'s pending-write queue (a bare synchronous `core` write
+    bypassing the driver loop's own check entirely, so a
+    `put`-then-`shutdown()` beat reaches it deterministically),
+    `apply_and_compact`'s work source (`drain_apply`) only becomes
+    non-empty through the *apply task's own prior progress*, and its
+    effects loop — once entered, after that same iteration's own `halted`
+    check already passed — runs uninterrupted to completion under `SimEnv`
+    (disk ops resolve without yielding), so there is no reachable window
+    for an external test driver to inject `halted` between the check and
+    this call the way `persist_wal`'s own regression does. **A dedicated
+    regression exists anyway** (issue #834,
+    `tests/batch_txn_resolve_apply_fault.rs`): rather than racing a real
+    concurrent `shutdown()`, a `FaultyEngine` test double's own
+    `merge_batch` override calls `shutdown()` itself, in-line, immediately
+    before returning the injected `Err` — the deterministic stand-in for
+    "halted is already true by the time `flush_pending`'s error path
+    observes it," proving the tolerance without needing the unreachable
+    real race. When idle it races a new
     `ApplySignal` (ADR 0044 phase-1 PR1, same shape as `ProposeSignal` below)
     against a long `APPLY_SAFETY_POLL` (250ms) rather than spinning on the old
     unconditional 5ms `APPLY_IDLE_POLL` — the consensus loop raises it at
