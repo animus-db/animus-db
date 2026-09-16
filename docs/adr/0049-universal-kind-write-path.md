@@ -337,3 +337,50 @@ else in the plan above shipped as written, plus regressions this document
 did not anticipate: the torn-pair scoping unit test, the per-tablet
 entry-count guard, the hidden-table marker test, and the raw-protocol
 marker/no-auto-provision test.
+
+**Further amendment (2026-09-16, issue #911): `cp_kind_raw_local`'s confirm
+loop could spuriously re-propose an already-accepted write.** Found
+root-causing issue #601's own flake (`docs/lessons/testing/2026-09-15-...`):
+50 real `ProdEnv` runs of a 200-item batched write occasionally (1/50)
+proposed 9 Raft entries instead of the expected 8. Root cause:
+`cp_kind_raw_local` probed by value equality alone and, on
+`decide::confirm_wait_is_futile` returning `true`, gave up and told the
+caller to retry. `confirm_wait_is_futile`'s own doc is explicit about the
+hazard its `!is_leader()` clause accepts for its *other* callers ("a retry
+is then a harmless idempotent duplicate"), and its
+`engine_applied_index >= accepted_index` clause only proves *something*
+resolved this index, not *what*. Both are genuinely ambiguous about a
+write that actually succeeded (this node's own entry, still readable by
+its outcome even once it stops leading, or simply overwritten a moment
+later by a legitimate concurrent write) — and for a raw kind batch, unlike
+this ADR's other callers, that ambiguity is not academic: a spurious
+second, distinct accepted entry means a second, distinct HLC `ts` (§ above,
+`materialize_derived`), hence a genuinely doubled change-log/marker record
+in `KIND_CHANGE` — a spurious duplicate DynamoDB Streams/backfill-drain
+event for a write the client made exactly once. The base/LSI rows
+themselves stay harmless (last-write-wins on identical bytes), so this was
+never visible as a data-correctness bug, only as an amplification one
+(wasted WAL/replicate/apply work, plus one extra downstream stream event
+per occurrence) — still a real bug, not merely tolerated.
+
+Fixed by giving `cp_kind_raw_local` the same `classify_kind_batch_outcome`
+(index, term) identity channel `poll_probe` already uses for the adjacent
+false-**ack** class this section's own `ProbeIdentity` amendment describes
+(issue #334/#469), but pointed the other direction: instead of trusting
+`!is_leader()`/`engine_applied_index >= accepted_index` alone as proof of
+loss, the loop now asks specifically "did *my own* (index, term) resolve,
+and if so how" before ever giving up, and only fails fast once that channel
+proves someone else's entry — not this one — actually occupies the index.
+"Nothing has decided this index yet" (`kind_batch_outcome` is `None`) no
+longer ends the wait on `!is_leader()` alone; it keeps polling, bounded by
+the same `CLIENT_TIMEOUT` this loop already had (never a wider one — a
+genuinely orphaned entry, decided by no one, still gives up on schedule).
+Rejected alternative: a `SCHEMA_PROPOSE_PATIENCE`-style time-based pacer
+before the outer `cp_kind_write_raw_bounded` retry (the issue's own first
+sketch) — strictly weaker, since it only *delays* the same
+value-equality-only false negative rather than closing it, and it cannot
+distinguish "still pending" from "genuinely gone" any better than the
+original code could. See `crates/animusd/src/write_path.rs`'s
+`cp_kind_raw_local` doc for the full mechanism and
+`docs/lessons/code-patterns/2026-09-16-is-leader-false-is-not-proof-a-write-is-lost.md`
+for the generalizable lesson.

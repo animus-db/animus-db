@@ -457,6 +457,50 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// *required* a `Some`-valued base write), so a raw batch whose base
     /// write is a tombstone erred iff the connected node did not lead the
     /// tablet (leader-placement-bimodal).
+    ///
+    /// **Never trusts `confirm_wait_is_futile`'s `!is_leader()` clause on
+    /// its own (issue #911).** This loop used to call
+    /// [`decide::confirm_wait_is_futile`] exactly like every other confirm
+    /// loop here and, the instant it returned `true`, do one last value
+    /// probe and give up. That predicate's own doc is honest about the
+    /// hazard it accepts for its OTHER callers: "the accepted entry may yet
+    /// commit under the new leader (**a retry is then a harmless idempotent
+    /// duplicate**...)". For a raw kind batch that premise is false — a
+    /// second, distinct accepted entry is a real doubled change-log/marker
+    /// record (ADR 0046 `materialize_derived` keys each record by its own
+    /// entry's own HLC `ts`, freshly minted per propose), a spurious
+    /// duplicate DynamoDB Streams/backfill-drain event for a write the
+    /// client only made once — never mind the wasted WAL/replicate/apply
+    /// work. And `!is_leader()` on its own is simply not proof of loss: a
+    /// term bump from a missed heartbeat deadline under real contention
+    /// (the same lineage as issue #268, which `ClientCtx::provision_tablet`
+    /// already guards against on the schema-proposal path) flips
+    /// `is_leader()` false the instant this node steps down, well before
+    /// anyone — including this node, once it catches back up as a plain
+    /// follower — can tell whether the entry it already accepted will still
+    /// commit. Raft only ever truncates a log tail that *conflicts* with a
+    /// new leader's own log, never one that matches it, so an
+    /// accepted-but-uncommitted entry that already reached a majority goes
+    /// on to commit and apply regardless of who leads afterward — and
+    /// `kind_batch_outcome`/`local_get_kind` are plain **local** reads, needing
+    /// no leadership at all, so this node can keep watching its own entry
+    /// resolve even after it stops leading.
+    ///
+    /// So this loop distinguishes **"nothing has decided this index yet"**
+    /// (`kind_batch_outcome` is `None`) from **"something already has, and
+    /// it isn't us"** (`engine_applied_index` has passed our index with our
+    /// value never appearing, or a *different* term is recorded there) —
+    /// only the second is safe to fail fast on; the first just keeps
+    /// waiting, bounded by the same `CLIENT_TIMEOUT` deadline this loop
+    /// already had (never a wider one: a write that really is orphaned —
+    /// no node anywhere ever decides its index — still gives up on
+    /// schedule). `classify_kind_batch_outcome`'s (index, term) identity
+    /// check (already used by `poll_probe` for the adjacent false-**ack**
+    /// this same channel closes, issue #334) is reused for the "something
+    /// else already happened here" half, since a value match alone cannot
+    /// tell "my entry" from "a different entry that happened to write the
+    /// identical bytes." See
+    /// `docs/lessons/code-patterns/2026-09-16-is-leader-false-is-not-proof-a-write-is-lost.md`.
     pub(crate) async fn cp_kind_raw_local(
         leader: &CpGroup<E>,
         writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
@@ -484,41 +528,38 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         else {
             return Ok(()); // empty batch is a no-op
         };
-        let accepted_index = match leader.put_kind_batch(writes, change_log) {
-            ProposeResult::Accepted { index, .. } => index,
+        const SUPERSEDED: &str = "kind batch superseded before its effect appeared (leadership \
+             churn or an apply-time no-op); retry";
+        let (accepted_index, accepted_term) = match leader.put_kind_batch(writes, change_log) {
+            ProposeResult::Accepted { index, term } => (index, term),
             other => return Err(format!("kind write not accepted: {other:?}")),
         };
         let deadline = leader.env().now().saturating_add(CLIENT_TIMEOUT);
-        // Wake-on-apply confirm wait (`wait_applied_past`) — NOT the drain's
-        // old flat 10ms sleep, nor the exponential poll that replaced it and
-        // this loop shared with `cp_put_local` before it. This is a client
-        // hot path since ADR 0049 routed every plain Dynamo/raw-protocol
-        // write through it, and a flat 10ms floor put one whole tick under
-        // nearly every sequential write (measured on the ADR 0049 §5 bench:
-        // ~13.6 ms/op vs the pre-train ~4.7 — the poll cadence, not the
-        // marker bytes); the exponential poll it was replaced with then
-        // rounded every write up to its own next checkpoint (an average
-        // half-a-step overshoot). Waking exactly when the apply task
-        // advances removes that rounding entirely.
+        // Wake-on-apply confirm wait (`wait_applied_past`) — see this
+        // function's own longer-standing doc note above for why this
+        // replaced the old flat/exponential polls.
         while leader.env().now() < deadline {
+            let effects_readable = leader.engine_applied_index() >= accepted_index;
+            let outcome = leader.kind_batch_outcome(accepted_index);
+            match classify_kind_batch_outcome(outcome.clone(), accepted_term, effects_readable) {
+                KindBatchSignal::Confirm => return Ok(()),
+                KindBatchSignal::NoOp => return Err(SUPERSEDED.into()),
+                KindBatchSignal::Inconclusive => {}
+            }
             if leader.local_get_kind(probe_kind, &probe_key).await == probe_value {
                 return Ok(());
             }
-            if decide::confirm_wait_is_futile(
-                leader.engine_applied_index(),
-                leader.is_leader(),
-                accepted_index,
-            ) {
-                // Close the probe-vs-apply race: the entry may have applied
-                // between the probe above and the futility read.
-                if leader.local_get_kind(probe_kind, &probe_key).await == probe_value {
-                    return Ok(());
-                }
-                return Err(
-                    "kind batch superseded before its effect appeared (leadership churn \
-                     or an apply-time no-op); retry"
-                        .into(),
-                );
+            // Leadership-independent proof this index resolved against us:
+            // effects are merged (someone's entry landed there) but not
+            // ours, or a definitively different term already occupies it.
+            // This is `confirm_wait_is_futile`'s own first clause plus the
+            // identity check that clause's `!is_leader()` half cannot
+            // provide for this caller (see this function's own doc) —
+            // `!is_leader()` alone is deliberately NOT consulted here.
+            if leader.engine_applied_index() >= accepted_index
+                || outcome.is_some_and(|(term, _)| term != accepted_term)
+            {
+                return Err(SUPERSEDED.into());
             }
             Self::wait_applied_past(leader, accepted_index).await;
         }
@@ -1814,6 +1855,420 @@ mod wait_applied_past_futility_tests {
             None,
             "the superseded entry's write must never have applied under \
              any term (seed={seed})"
+        );
+    }
+}
+
+/// Regression for issue #911: `cp_kind_raw_local`'s confirm loop used to
+/// probe by value equality alone, so a write whose OWN entry genuinely
+/// applied — but whose key a later, unrelated write immediately
+/// overwrote — read back the wrong bytes and, once `confirm_wait_is_futile`
+/// noticed `engine_applied_index` had passed its own accepted index with no
+/// matching value, declared the write superseded and told the caller to
+/// retry: a **spurious** re-propose of an already-successful write (a
+/// genuinely new, distinct Raft entry — a real doubled change-log/marker
+/// record for a client that only wrote once, not just wasted work). This is
+/// the identical false-negative class `poll_probe` already closes for
+/// `cp_batch_local`/`cp_kind_eval_local` (issue #334's index+term identity
+/// channel) — `cp_kind_raw_local` was simply never wired to it.
+///
+/// Single-voter group, no leadership change, no network fault at all: entry
+/// A (this test's own write, via the real `cp_kind_raw_local`) is proposed,
+/// then — before its own confirm loop gets a single chance to run past its
+/// first park — entry B (a plain `put_kind_batch`, standing in for a
+/// completely unrelated concurrent writer) overwrites the identical key.
+/// Both apply in order; A's own value is never visible again, but A's own
+/// `KindBatchOutcome` (recorded at A's own accepted term) proves it
+/// genuinely applied. `run_for(Duration::ZERO)` (draining every currently-
+/// ready task to its own first parked `.await` before firing any timed
+/// event) is what lets entry B slot in **between** A's propose and A's
+/// first confirm check — see `poll_probe_identity_tests`'s own doc for why
+/// proposing entry A outside the spawned task instead (an earlier failure
+/// mode of that sibling test) would let the apply loop race ahead and close
+/// this exact window before the task under test ever saw it.
+#[cfg(test)]
+mod cp_kind_raw_local_outcome_confirm_tests {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use animus_cp_data::{KIND_BASE, RaftKvNode};
+    use animus_env::{EnvExt, Metric, MetricsHandle, nid};
+    use animus_sim::{SimEnv, Simulator};
+    use animus_storage::MemoryEngine;
+
+    use super::*;
+
+    #[derive(Clone, Copy, Debug, Default)]
+    struct NeverRelay;
+
+    #[async_trait::async_trait]
+    impl RelayClient for NeverRelay {
+        async fn relay(
+            &self,
+            addr: String,
+            _request: &ClientRequest,
+            _timeout: Duration,
+        ) -> ClientResponse {
+            ClientResponse::Error(format!(
+                "NeverRelay: this harness never relays (addr={addr})"
+            ))
+        }
+    }
+
+    /// A three-voter group, not a single-voter one: a single-node group can
+    /// advance commit + apply **inline** on `propose` (ADR 0044 phase-1
+    /// PR1), so entry A would already be fully applied by the time
+    /// `run_for(Duration::ZERO)` first returns, closing the very
+    /// accepted-but-unapplied window this test needs — commit here instead
+    /// genuinely needs a majority-ack round trip, which cannot complete
+    /// with zero virtual time elapsed.
+    /// `start_with_metrics` with a fresh per-node [`MetricsHandle::
+    /// recording`] — NOT plain `start` — because `SimEnv::metrics()`'s own
+    /// default handle is process-global (additive/no-op under sim per ADR
+    /// 0015, but still one shared counter), so reading it back would pick
+    /// up whatever every OTHER test in this same process/thread has ever
+    /// recorded rather than this test's own two proposes (observed
+    /// directly: a fresh `Simulator` still reported a nonzero starting
+    /// count when tests ran alongside each other).
+    fn three_voter_group(
+        seed: u64,
+    ) -> (
+        Simulator,
+        Vec<RaftKvNode<SimEnv, MemoryEngine>>,
+        Vec<MetricsHandle>,
+    ) {
+        let sim = Simulator::new(seed);
+        let ids = [nid(0), nid(1), nid(2)];
+        let metrics: Vec<MetricsHandle> = ids.iter().map(|_| MetricsHandle::recording()).collect();
+        let nodes: Vec<RaftKvNode<SimEnv, MemoryEngine>> = ids
+            .iter()
+            .zip(metrics.iter())
+            .map(|(id, m)| {
+                RaftKvNode::start_with_metrics(
+                    sim.env(id.clone()),
+                    ids.to_vec(),
+                    MemoryEngine::new(),
+                    m.clone(),
+                )
+            })
+            .collect();
+        (sim, nodes, metrics)
+    }
+
+    /// The current leader among `nodes`, if exactly one reports it — mirrors
+    /// `wait_applied_past_futility_tests::leader_index`.
+    fn leader_index(nodes: &[RaftKvNode<SimEnv, MemoryEngine>]) -> Option<usize> {
+        let ls: Vec<usize> = (0..nodes.len()).filter(|&i| nodes[i].is_leader()).collect();
+        if ls.len() == 1 { Some(ls[0]) } else { None }
+    }
+
+    #[test]
+    fn a_write_overwritten_immediately_after_still_confirms_without_a_spurious_repropose() {
+        run(0x0911_0001);
+    }
+
+    #[test]
+    fn a_write_overwritten_immediately_after_still_confirms_without_a_spurious_repropose_seed2() {
+        run(0x0911_0002);
+    }
+
+    /// Replay proof (repo convention): `ANIMUS_SEED=<seed> cargo test -p
+    /// animusd --lib replays_issue_911_from_an_explicit_env_seed` reruns
+    /// this exact scenario from a printed seed.
+    #[test]
+    fn replays_issue_911_from_an_explicit_env_seed() {
+        let seed = std::env::var("ANIMUS_SEED")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0x0911_0003);
+        run(seed);
+    }
+
+    fn run(seed: u64) {
+        let (mut sim, nodes, metrics) = three_voter_group(seed);
+        sim.run_for(Duration::from_secs(2));
+        let l = leader_index(&nodes)
+            .unwrap_or_else(|| panic!("a three-voter group must elect a leader (seed={seed:#x})"));
+        let leader = CpGroup::Mem(nodes[l].clone());
+        let leader_metrics = metrics[l].clone();
+
+        let key = b"contended-item".to_vec();
+        let value_a = b"from-entry-A".to_vec();
+        let value_b = b"from-entry-B-a-concurrent-overwrite".to_vec();
+
+        let proposals_before = leader_metrics.get(Metric::CpProposalsAccepted);
+
+        // Entry A: the write under test, via the REAL production confirm
+        // loop — spawned so entry B (below) can land in the middle of it.
+        // (There is no separate place to hook a sanity check on A's own
+        // accepted index without duplicating the function; the sanity
+        // assertion below instead confirms the *group's* own proposal
+        // count so far — exactly one, A — which proves this task's poll
+        // got only as far as proposing before yielding.)
+        let a_result: Arc<Mutex<Option<Result<(), String>>>> = Arc::new(Mutex::new(None));
+        {
+            let leader = leader.clone();
+            let key = key.clone();
+            let value_a = value_a.clone();
+            let env = leader.env().clone();
+            let out = a_result.clone();
+            env.spawn_task(async move {
+                let r = ClientCtx::<SimEnv, NeverRelay>::cp_kind_raw_local(
+                    &leader,
+                    vec![(KIND_BASE, key, Some(value_a))],
+                    Vec::new(),
+                )
+                .await;
+                *out.lock().expect("poisoned") = Some(r);
+            });
+        }
+        // Drain every currently-ready task to its own first park, firing no
+        // timed event yet: entry A's task runs up to (and including)
+        // proposing A and parking on its own first `wait_applied_past`
+        // wait, and nothing else has had a turn.
+        sim.run_for(Duration::ZERO);
+        assert_eq!(
+            a_result.lock().expect("poisoned").clone(),
+            None,
+            "entry A's confirm loop must still be waiting at this point, or \
+             this run doesn't exercise the accepted-but-unapplied window \
+             this test exists to pin (seed={seed:#x})"
+        );
+        assert_eq!(
+            leader_metrics.get(Metric::CpProposalsAccepted) - proposals_before,
+            1,
+            "entry A must already be proposed (and only A) before entry B \
+             is proposed below (seed={seed:#x})"
+        );
+
+        // Entry B: an entirely unrelated concurrent write to the SAME key —
+        // proposed directly (standing in for any other client/task), landing
+        // at the very next index. A plain `put_kind_batch` call is
+        // synchronous (no `.await`), so this does not give entry A's own
+        // task, or the apply loop, any further turn before it returns.
+        let (b_index, _b_term) = match leader.put_kind_batch(
+            vec![(KIND_BASE, key.clone(), Some(value_b.clone()))],
+            Vec::new(),
+        ) {
+            ProposeResult::Accepted { index, term } => (index, term),
+            other => panic!("entry B not accepted (seed={seed:#x}): {other:?}"),
+        };
+
+        // Let both entries commit and apply, in order, and drive entry A's
+        // confirm loop to completion.
+        for _ in 0..200 {
+            sim.run_for(Duration::from_millis(10));
+            if leader.engine_applied_index() >= b_index
+                && a_result.lock().expect("poisoned").is_some()
+            {
+                break;
+            }
+        }
+        assert!(
+            leader.engine_applied_index() >= b_index,
+            "entry B must have applied (seed={seed:#x})"
+        );
+        assert_eq!(
+            futures::executor::block_on(leader.local_get_kind(KIND_BASE, &key)),
+            Some(value_b),
+            "entry B's bytes must be the ones actually visible — entry A's \
+             own value must never be readable again (seed={seed:#x})"
+        );
+
+        let result = a_result
+            .lock()
+            .expect("poisoned")
+            .clone()
+            .unwrap_or_else(|| panic!("entry A's confirm loop never finished (seed={seed:#x})"));
+        assert_eq!(
+            result,
+            Ok(()),
+            "entry A genuinely applied (its own `KindBatchOutcome` proves \
+             it, at its own accepted term) and must confirm as such — a \
+             value-equality-only probe reads entry B's overwritten bytes \
+             instead and wrongly declares entry A superseded, telling the \
+             caller to retry (seed={seed:#x}): {result:?}"
+        );
+
+        // The bug's actual cost: a caller that received the OLD code's
+        // spurious `"; retry"` here would re-propose entry A verbatim
+        // (`cp_kind_write_raw_bounded`'s own retry convention) — a THIRD,
+        // wholly redundant accepted proposal for what should have been
+        // exactly two real writes (A, B). Assert that ceiling directly via
+        // the same `cp_proposals_accepted` counter PR #914's own regression
+        // reads (ADR 0015).
+        assert_eq!(
+            leader_metrics.get(Metric::CpProposalsAccepted) - proposals_before,
+            2,
+            "exactly two Raft entries were ever proposed for this test's \
+             two real writes (A, B) — a third would mean entry A's \
+             confirm loop spuriously re-proposed it (seed={seed:#x})"
+        );
+    }
+}
+
+/// Companion to `cp_kind_raw_local_outcome_confirm_tests`: proves issue
+/// #911's fix did NOT weaken the fast-fail side of the same loop — a
+/// genuinely superseded entry (a real leadership change that truncates it,
+/// never replicated anywhere else) must still resolve promptly with the
+/// retryable `Superseded` error, not hang out to `CLIENT_TIMEOUT` or worse.
+/// Mirrors `wait_applied_past_futility_tests`' own scenario (isolate the
+/// leader in both directions *before* it ever proposes, so the entry can
+/// never replicate; the other two elect a new leader with no matching log
+/// entry, which truncates it for good on heal) but drives the real
+/// `ClientCtx::cp_kind_raw_local` end to end instead of the lower-level
+/// `poll_probe` primitive it shares with `cp_batch_local` — `cp_kind_raw_local`
+/// stopped calling `poll_probe` for this class of caller as of the issue
+/// #911 fix, so it needs its own direct coverage of the same property.
+#[cfg(test)]
+mod cp_kind_raw_local_genuine_loss_tests {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use animus_cp_data::{KIND_BASE, RaftKvNode};
+    use animus_env::{EnvExt, nid};
+    use animus_sim::{SimEnv, Simulator};
+    use animus_storage::MemoryEngine;
+
+    use super::*;
+
+    #[derive(Clone, Copy, Debug, Default)]
+    struct NeverRelay;
+
+    #[async_trait::async_trait]
+    impl RelayClient for NeverRelay {
+        async fn relay(
+            &self,
+            addr: String,
+            _request: &ClientRequest,
+            _timeout: Duration,
+        ) -> ClientResponse {
+            ClientResponse::Error(format!(
+                "NeverRelay: this three-node harness never relays (addr={addr})"
+            ))
+        }
+    }
+
+    fn three_voter_cluster(seed: u64) -> (Simulator, Vec<RaftKvNode<SimEnv, MemoryEngine>>) {
+        let sim = Simulator::new(seed);
+        let ids = [nid(0), nid(1), nid(2)];
+        let nodes: Vec<_> = ids
+            .iter()
+            .map(|id| RaftKvNode::start(sim.env(id.clone()), ids.to_vec(), MemoryEngine::new()))
+            .collect();
+        (sim, nodes)
+    }
+
+    fn leader_index(nodes: &[RaftKvNode<SimEnv, MemoryEngine>]) -> Option<usize> {
+        let ls: Vec<usize> = (0..nodes.len()).filter(|&i| nodes[i].is_leader()).collect();
+        if ls.len() == 1 { Some(ls[0]) } else { None }
+    }
+
+    #[test]
+    fn a_genuinely_superseded_write_still_fails_fast_not_a_hang() {
+        run(0x0911_1001);
+    }
+
+    fn run(seed: u64) {
+        let (mut sim, nodes) = three_voter_cluster(seed);
+        sim.run_for(Duration::from_secs(2));
+        let l = leader_index(&nodes).unwrap_or_else(|| {
+            panic!("a three-voter cluster must elect a leader (seed={seed:#x})")
+        });
+        let l_id = nid(l as u64);
+        let followers: Vec<usize> = (0..nodes.len()).filter(|&i| i != l).collect();
+        let follower_ids: Vec<_> = followers.iter().map(|&i| nid(i as u64)).collect();
+        let original_term = nodes[l].term();
+
+        // Isolate the leader in BOTH directions before it ever proposes —
+        // exactly `wait_applied_past_futility_tests`' own setup.
+        for f in &follower_ids {
+            sim.partition_pair(l_id.clone(), f.clone());
+        }
+
+        let leader = CpGroup::Mem(nodes[l].clone());
+        let key = b"item".to_vec();
+        let value = b"will-never-land".to_vec();
+        let slot: Arc<Mutex<Option<Result<(), String>>>> = Arc::new(Mutex::new(None));
+        let out = slot.clone();
+        {
+            let leader = leader.clone();
+            let key = key.clone();
+            let value = value.clone();
+            let env = leader.env().clone();
+            env.spawn_task(async move {
+                let r = ClientCtx::<SimEnv, NeverRelay>::cp_kind_raw_local(
+                    &leader,
+                    vec![(KIND_BASE, key, Some(value))],
+                    Vec::new(),
+                )
+                .await;
+                *out.lock().expect("poisoned") = Some(r);
+            });
+        }
+
+        sim.run_for(Duration::from_millis(50));
+        assert!(
+            slot.lock().expect("poisoned").is_none(),
+            "the confirm must still be waiting here, or this run doesn't \
+             exercise the accepted-but-unapplied window this test exists \
+             to pin (seed={seed:#x})"
+        );
+
+        // The two followers, cut off from the isolated leader, elect a new
+        // one among themselves. Converged-or-timeout.
+        let mut new_leader = None;
+        for _ in 0..40 {
+            sim.run_for(Duration::from_millis(100));
+            new_leader = followers
+                .iter()
+                .copied()
+                .find(|&i| nodes[i].is_leader() && nodes[i].term() > original_term);
+            if new_leader.is_some() {
+                break;
+            }
+        }
+        assert!(
+            new_leader.is_some(),
+            "the two followers never elected a new leader (seed={seed:#x})"
+        );
+
+        // Heal: the old leader learns of the new term and steps down.
+        for f in &follower_ids {
+            sim.heal(l_id.clone(), f.clone());
+        }
+        let mut stepped_down = false;
+        for _ in 0..40 {
+            sim.run_for(Duration::from_millis(100));
+            if !nodes[l].is_leader() {
+                stepped_down = true;
+                break;
+            }
+        }
+        assert!(
+            stepped_down,
+            "the old leader never learned of the new term (seed={seed:#x})"
+        );
+
+        let mut result = None;
+        for _ in 0..100 {
+            sim.run_for(Duration::from_millis(100));
+            result = slot.lock().expect("poisoned").clone();
+            if result.is_some() {
+                break;
+            }
+        }
+        assert!(
+            matches!(&result, Some(Err(e)) if e.ends_with("; retry")),
+            "a genuinely superseded write must resolve to a retryable \
+             error promptly, not hang to `CLIENT_TIMEOUT` or worse \
+             (seed={seed:#x}): {result:?}"
+        );
+        assert_eq!(
+            futures::executor::block_on(leader.local_get_kind(KIND_BASE, &key)),
+            None,
+            "the superseded entry's write must never have applied under \
+             any term (seed={seed:#x})"
         );
     }
 }
