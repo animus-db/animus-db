@@ -2424,6 +2424,37 @@ local group to elect (never forwards to a non-leader, including itself, during
 election). **One-hop invariant**: the receiver (`cp_serve_forwarded`) never
 re-forwards.
 
+**Cross-replica leader-hint fan-out on a stale local view (issue #950,
+fixed).** The "waits for the local group to elect" branch above used to be
+**unconditional and purely local**: if this node hosts a replica of the
+tablet but that replica's own `leader()` hint is unknown, `cp_route`
+polled only its own local state every `SCHEMA_POLL_INTERVAL` for up to
+the full `CLIENT_TIMEOUT`, even when every OTHER replica of the tablet
+had known a stable leader the entire time — indistinguishable, from
+purely local evidence, from a genuine election in progress, but in
+practice usually this one node's own heartbeat/apply processing lagging
+its peers under load (a continuously-known, stable leader confirmed by
+an independent `/admin/raftkv` poll over the same window the routed
+write stalled). Fixed: past `CP_ROUTE_LOCAL_SUB_BUDGET` (750ms,
+comfortably above the CP-data plane's own election-timeout range), `cp_route`
+asks every other known replica **concurrently** what THEIR own local
+replica believes (`ClientRequest::CpLeaderHintProbe`, always wrapped in
+`Forwarded`, answered by any replica — leader or follower — straight
+from `cp_leader_hint`, no leader requirement, no propose/wake/block); the
+first usable answer becomes a real **hinted** forward
+(`CpRoute::Forward(addr, true)`), handing off to the already-hardened
+`forward_to_tablet_leader` chase below. Retries every
+`CP_ROUTE_FANOUT_RETRY_INTERVAL` (500ms) if a round finds nothing, still
+bounded by the overall `CLIENT_TIMEOUT`. Concurrent, not serial — there
+is no vouching signal to prefer one candidate replica over another here,
+so racing them costs nothing over trying them one at a time (see
+`docs/lessons/code-patterns/2026-09-15-a-per-hop-timeout-cap-does-not-
+bound-a-serial-fallbacks-total-cost.md`). `Metric::
+CpRouteFanoutRecoveredLeader`/`CpRouteFanoutExhausted` plus a
+`tracing::warn!` at recovery make this class of staleness observable.
+Regression: `sim_cluster_cp_route_fanout.rs`. See ADR 0017's matching
+2026-09-16 amendment for the full account.
+
 **Hinted-retry forwarding** (`ClientCtx::forward_to_tablet_leader`, the single
 choke point for every forward — `cp_forward` is its (table, key)-resolving
 wrapper, and every **tablet-id-addressed** internal RPC (`ForceSeal`,

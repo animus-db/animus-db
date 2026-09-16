@@ -781,3 +781,98 @@ See `docs/lessons/code-patterns/2026-09-15-a-generic-core-level-fix-does-
 not-wire-itself-into-every-driver.md` for the generalizable lesson, and
 `crates/animus-cp-data/CLAUDE.md`'s own note in "Entry points" for the
 crate-local detail.
+
+## Amendment (2026-09-16, issue #950) — `cp_route`'s cross-replica
+leader-hint fan-out, closing a purely-local-wait stall on a stale replica
+
+**Symptom.** A routed write (`ClientCtx::cp_kind_write_raw` →
+`cp_kind_write_raw_bounded`, `write_path.rs`) could stall 30–100+ seconds
+even though the target tablet group had a **continuously known, stable
+leader** the entire time, confirmed by an independently-polled
+`/admin/raftkv` — never `None` — over the same window. Reproduced under a
+loaded, oversubscribed host (two concurrent integration-test binaries
+sharing two cores with the target test's own 6-worker runtime); every
+failed attempt took almost exactly `CLIENT_TIMEOUT` (10s) or
+`HINTED_FORWARD_HOP_TIMEOUT` (6s, compounding with `cp_route`'s own wait
+when both fired in the same attempt).
+
+**Root cause.** `ClientCtx::cp_route`'s "this node hosts a replica of the
+tablet but its own leader hint is unknown" branch
+(`topology::decide_cp_route`'s `RouteDecision::Wait`) is deliberately
+conservative by design — the only real "route" might be this very node,
+mid-election — but that caution was, before this amendment,
+**unconditional**: `cp_route` polled **only** this node's own local
+`RaftKvNode::leader()` every `SCHEMA_POLL_INTERVAL` for up to the full
+`CLIENT_TIMEOUT`, with no fallback of any kind, even when the tablet's
+OTHER known replicas had all known a stable leader throughout. A node's
+own Raft replica can lag the rest of its group under severe scheduling
+pressure (bulk client-request handling starving its own heartbeat/apply
+processing) without the group itself ever losing its leader — a state
+genuinely indistinguishable, from purely local evidence, from a real
+election in progress. Every one of the three error strings the original
+report captured (`"no CP group leader reachable"`, `"relay to peer node
+failed"`, `"forwarded CP op: not the leader here; leader_hint=none"`)
+traces back to this one mechanism: a client-facing node whose own local
+view had gone stale, either giving up locally (the first) or guessing a
+stale/wrong forward target and chasing it through the full budget (the
+other two).
+
+**Fix.** `cp_route` now bounds how long it trusts its own purely local
+view: past a short sub-budget (`CP_ROUTE_LOCAL_SUB_BUDGET`, 750ms —
+comfortably above the CP-data plane's own randomized election-timeout
+range, `[150ms, 300ms)`), it asks every OTHER known replica of the
+tablet, **concurrently**, what THEIR own local replica believes the
+leader is (`ClientRequest::CpLeaderHintProbe`, always wrapped in
+`Forwarded` like every other tablet-addressed internal RPC — answered by
+**any** replica, leader or follower, straight from `ClientCtx::
+cp_leader_hint`, with no leader requirement of its own and no propose/
+wake/block). The first usable answer resolves the call to a real,
+**hinted** forward (`CpRoute::Forward(addr, true)` — vouched for by a
+live replica, not a blind guess), handing off to the already-hardened
+`forward_to_tablet_leader` chase (issues #316/#585/#900) for the rest. A
+round that finds nothing retries every `CP_ROUTE_FANOUT_RETRY_INTERVAL`
+(500ms) — a real election needs more than one round — still bounded by
+the same overall `CLIENT_TIMEOUT` deadline. The probes race
+**concurrently, not serially**: there is no vouching signal to prefer one
+candidate replica over another here (unlike the forward chase's own
+`Hinted`/`Guessed` distinction), so serializing them would only let the
+per-candidate cap (`CP_ROUTE_FANOUT_PROBE_TIMEOUT`, 500ms) multiply by
+candidate count for no benefit — see `docs/lessons/code-patterns/
+2026-09-15-a-per-hop-timeout-cap-does-not-bound-a-serial-fallbacks-total-
+cost.md`, the general rule this amendment applies. Two new metrics
+(`Metric::CpRouteFanoutRecoveredLeader`/`CpRouteFanoutExhausted`) plus a
+`tracing::warn!` at the moment the fan-out recovers a leader make this
+class of staleness observable in production, per the original issue's own
+proposed remedy, rather than only reachable via ad hoc test
+instrumentation.
+
+**What this does not change.** Linearizable writes still go only to the
+real leader — the fan-out's answer is routing advice only, never trusted
+directly: the actual forward still lands on `cp_serve_forwarded`, which
+still refuses (with its own hint) if the target turns out not to be the
+leader by the time the hop arrives, and the forward-hop chase's own
+hinted-retry machinery is unchanged. The one-hop forwarding invariant
+(A1, above) is untouched.
+
+**Regression**: `crates/animusd/src/sim_cluster_cp_route_fanout.rs`'s
+`victim_recovers_a_route_via_cross_replica_fanout_despite_a_permanently_
+stale_local_view` — a 3-node, RF-3 `SimCluster` with one node partitioned
+from the tablet's leader only (so the leader keeps its majority through
+the untouched third replica and never steps down — the group has a
+continuously known, stable leader throughout, exactly the original
+issue's own reproduction shape); the partitioned node's own `cp_route`
+call is measured directly (`SimCluster::cp_route_timed`) rather than
+routed through a full `put`, since completing the actual write also needs
+the partitioned link itself to heal — a separate, already-correct
+limitation this fix does not (and should not) route around. Confirmed
+red before (elapsed the full measurement budget, resolving to no route at
+all — the pre-fix "no CP group leader reachable" shape) and green after
+(resolves to a hinted forward within roughly one sub-budget plus one
+fan-out round, comfortably under a bound far below `CLIENT_TIMEOUT`) by
+temporarily reverting `cp_route`'s own fan-out branch.
+
+See `crates/animusd/CLAUDE.md`'s forwarding section for the full
+mechanism and `docs/lessons/` for the general lessons this amendment both
+applies and, where the fix stopped short of a broader rewrite (the
+forward-hop chase's own per-hop timeout shape is unchanged), deliberately
+did not re-litigate.

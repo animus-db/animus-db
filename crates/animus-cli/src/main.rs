@@ -1801,6 +1801,13 @@ fn print_response(response: &ClientResponse) {
         ClientResponse::TxnVerifyReply { staged } => {
             println!("txn verify: staged={staged}");
         }
+        // Issue #950: the cross-replica leader-hint probe reply — never
+        // requested by any CLI subcommand of its own (consumed only by
+        // `ClientCtx::cp_route`'s own fan-out); printed raw if one ever
+        // surfaces here, mirroring `JoinInfo`/`MetadataDelta` above.
+        ClientResponse::CpLeaderHint { hint } => {
+            println!("cp leader hint: {hint:?}");
+        }
     }
 }
 

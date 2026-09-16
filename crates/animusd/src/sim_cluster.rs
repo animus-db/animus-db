@@ -866,6 +866,34 @@ type ScanRows = Vec<(Vec<u8>, Vec<u8>)>;
 /// `Vec` of these behind an `Arc<Mutex<..>>`.
 type SimNodeCtx = ClientCtx<SimEnv, SimRelayClient<SimEnv>>;
 
+/// An `E`-free, plain-data projection of [`CpRoute`] — issue #950's own
+/// [`SimClusterHandle::cp_route`]/[`SimCluster::cp_route_timed`] use this
+/// instead of `CpRoute<SimEnv>` directly, since the real type's `Local`
+/// variant carries a whole [`CpGroup`] handle that has no business crossing
+/// the `spawn_and_capture`-style result-slot boundary [`SimCluster::
+/// cp_route_timed`] drives this through — a test only ever needs to know
+/// WHICH kind of route resolved, not the live handle itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CpRouteOutcome {
+    /// This node hosts the current leader.
+    Local,
+    /// Forward to this address; `bool` is whether it was vouched for by a
+    /// live replica (`CpRoute::Forward`'s own second field, unchanged).
+    Forward(String, bool),
+    /// No leader reachable within the caller's own budget.
+    None,
+}
+
+impl From<CpRoute<SimEnv>> for CpRouteOutcome {
+    fn from(route: CpRoute<SimEnv>) -> Self {
+        match route {
+            CpRoute::Local(_) => CpRouteOutcome::Local,
+            CpRoute::Forward(addr, hinted) => CpRouteOutcome::Forward(addr, hinted),
+            CpRoute::None => CpRouteOutcome::None,
+        }
+    }
+}
+
 /// What this fixture knows about one tablet it has provisioned: its table
 /// name (diagnostics only), and the node ids named as its INITIAL replica
 /// set (in the order [`SimCluster::create_table`] chose them —
@@ -1129,6 +1157,17 @@ impl SimClusterHandle {
             .into_iter()
             .map(|(tablet, _group)| tablet)
             .collect()
+    }
+
+    /// Resolve a CP route for `(table, key)` from `node`'s own `ClientCtx`
+    /// (`ClientCtx::cp_route`) directly — issue #950's regression drives
+    /// this instead of a full [`put`](Self::put) so it can measure the
+    /// routing DECISION alone (whether it stayed stuck on a stale local
+    /// view or recovered via the cross-replica fan-out), independent of
+    /// whether a subsequent forward hop can physically complete under
+    /// whatever fault the scenario also has in place.
+    pub(crate) async fn cp_route(&self, node: u64, table: &str, key: &[u8]) -> CpRouteOutcome {
+        self.ctx(node).cp_route(table, key).await.into()
     }
 
     /// Write `value` at `(pk, sk)` in `table`, issued from `node`'s own
@@ -3812,6 +3851,43 @@ impl SimCluster {
                  of virtual time"
             ),
         )
+    }
+
+    /// [`SimCluster::admin_timed`]'s sibling for [`SimClusterHandle::
+    /// cp_route`] — issue #950's own regression harness: measures how long
+    /// `ClientCtx::cp_route` takes to resolve (or exhaust `max_steps *
+    /// step` of virtual time without resolving), alongside the resolved
+    /// [`CpRouteOutcome`], rather than a full [`SimCluster::put`]'s
+    /// route-then-forward-then-confirm sequence — see [`SimClusterHandle::
+    /// cp_route`]'s own doc for why the routing decision alone is what this
+    /// mechanism's regression needs to isolate. Never panics on exhaustion:
+    /// returns `CpRouteOutcome::None` and the full elapsed budget, mirroring
+    /// [`admin_timed`](Self::admin_timed)'s own convention.
+    pub(crate) fn cp_route_timed(
+        &mut self,
+        node: u64,
+        table: &str,
+        key: &[u8],
+        step: Duration,
+        max_steps: usize,
+    ) -> (Duration, CpRouteOutcome) {
+        let handle = self.shared.clone();
+        let (table, key) = (table.to_owned(), key.to_vec());
+        let env = self.shared.env(node);
+        let slot: Arc<Mutex<Option<CpRouteOutcome>>> = Arc::new(Mutex::new(None));
+        let out = slot.clone();
+        let start = self.sim.now();
+        env.spawn_task(async move {
+            let result = handle.cp_route(node, &table, &key).await;
+            *out.lock().expect("result slot poisoned") = Some(result);
+        });
+        for _ in 0..max_steps {
+            self.sim.run_for(step);
+            if let Some(outcome) = slot.lock().expect("result slot poisoned").take() {
+                return (self.sim.now().duration_since(start), outcome);
+            }
+        }
+        (self.sim.now().duration_since(start), CpRouteOutcome::None)
     }
 
     /// Run a console HTTP request against `node`'s own `ClientCtx` (ADR
