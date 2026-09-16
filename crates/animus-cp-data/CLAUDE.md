@@ -1018,6 +1018,45 @@ State once here; cross-referenced from the sections below.
   in `animus-test/tests/raftkv_linearizable.rs`. See `docs/engineering-
   lessons.md`'s Code-patterns entry: *a state machine's applied watermark
   must be the state machine's own, never the log's.*
+
+  **Issue #811 (2026-09-10): a successfully-installed snapshot's `RaftCore`
+  state must be forced into the SAME pass's WAL rewrite, not left for
+  `behind`/`image_needed` to trigger later.** `RaftCore::
+  handle_install_snapshot`'s successful-install path fixes up `snapshot_
+  index`/the log/`snapshot_dirty` synchronously (consensus loop) the
+  instant the last chunk lands, but nothing durably persists that: `has_
+  unflushed_wal` checks only the pending log-append queue and the current
+  term/vote (never `snapshot_dirty`), and `apply_and_compact`'s compaction
+  branch only rewrites the WAL when `behind >= COMPACT_THRESHOLD` or a peer
+  needs a fresh image — both false immediately after an install, since
+  `engine_applied` and `snapshot_index` are set to the identical value in
+  the same step. A replica that caught up ENTIRELY via `InstallSnapshot`
+  (no log entry of its own ever logged) can therefore sit fully caught-up
+  with a WAL file that still reads back empty — and a LATER genuine process
+  restart (`sim.stop` + fresh `RaftKvNode::start`, never `sim.crash`/`sim.
+  restart`) recovers from that empty WAL as a `fresh_group`, skipping
+  `RaftCore::recovered` and leaving `snapshot_index == last_applied == 0`
+  while `engine_applied` is correctly reseeded from the engine's own
+  watermark — a permanent, non-convergent `behind` gap (`snapshot_upto`
+  clamps to `min(engine_applied, last_applied)`, and `last_applied` is
+  ALSO stuck at `0` on the fresh core) that pegs the apply task at `did_
+  work = true` forever, spinning one CPU core with `run_for`/`run_until`
+  never returning. **Fixed**: `apply_and_compact` now forces the
+  compaction section's WAL-rewrite branch whenever this pass processed a
+  `drain_pending_install`, regardless of `behind`/`image_needed`.
+  Regression: `tests/restart_after_install_snapshot.rs` (`MemoryEngine` and
+  `LsmEngine<SimEnv>`, both red-before/green-after). **Test-authoring
+  gotcha this bug's own repro needed**: neither `run_for`'s virtual-time
+  deadline nor `run_until_quiescent`'s step cap can bound this hang shape —
+  the busy task's own `Future::poll` call never returns control to the
+  executor at all (no `.await` point is reached between loop iterations
+  once `did_work` stays `true`), so nothing short of a real OS-thread
+  wall-clock watchdog (`std::thread::spawn` + `mpsc::Receiver::
+  recv_timeout` around `sim.run_for`) can catch it in a test — see
+  `docs/engineering-lessons.md`'s matching issue #811 entry for the full
+  account, including why `crates/animus-test/tests/raftkv_linearizable.rs`'s
+  own `Nemesis::StopRestart` (which always targets the current leader,
+  never a snapshot-caught-up follower) structurally cannot reproduce this.
 - **Durable-before-visible** (ADR 0009): effects are only drained for fsynced
   entries, and the engine write follows the WAL `fsync`.
 - **Write-conflict push + the logged read ceiling — the serializability half

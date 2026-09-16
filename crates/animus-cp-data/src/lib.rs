@@ -7266,6 +7266,14 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
         .lock()
         .expect("raftkv core poisoned")
         .drain_pending_install();
+    // Issue #811: whether this pass just installed a fully-received
+    // snapshot — see the compaction section below, which this flag forces
+    // into even though `behind` (computed from `engine_applied` vs.
+    // `snapshot_index`) is typically `0` immediately after an install (both
+    // are set to the same `last_index` in the same step: `engine_applied`
+    // here, `snapshot_index` synchronously by `RaftCore::
+    // handle_install_snapshot` on the consensus loop).
+    let just_installed_snapshot = pending_install.is_some();
     if let Some((last_index, bytes)) = pending_install {
         // Issue #554: the durable applied watermark rides in the SAME
         // `merge_batch` as every row this image installs — `install_engine_
@@ -9100,11 +9108,57 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
         *compact_defer_since = None;
         *compact_defer_progress = None;
     }
+    // Issue #811: a just-completed `InstallSnapshot` (`just_installed_
+    // snapshot`, above) must force a WAL rewrite in THIS pass, same as
+    // `threshold_hit`/`image_needed` — never deferred by the in-flight-
+    // transfer check above (that check exists only for a THRESHOLD-driven
+    // base advance; this one is this node's own receive, unrelated to
+    // whatever it might separately be sending elsewhere as a leader).
+    //
+    // Without this, `RaftCore::handle_install_snapshot`'s successful-install
+    // path (`animus-control::raft`) durably fixes up the CORE's in-memory
+    // `snapshot_index`/log/`snapshot_dirty` synchronously on the consensus
+    // loop, but nothing ever flushes that to the WAL FILE: `behind` here is
+    // `engine_applied.saturating_sub(snapshot_index)`, and immediately after
+    // an install both are set to the identical `last_index` in the same
+    // step, so `threshold_hit` is false; `image_needed` is unrelated (it
+    // fires only when a PEER needs a snapshot FROM this node); and
+    // `RaftCore::has_unflushed_wal` — the consensus loop's own ordinary
+    // per-message persist gate — checks only the pending log-append queue
+    // and the current term/vote, never `snapshot_dirty`. A replica that
+    // caught up ENTIRELY via `InstallSnapshot` (no log entry of its own ever
+    // logged) can therefore sit fully caught-up with a WAL file that still
+    // reads back empty. A later genuine process restart (`sim.stop` + a
+    // fresh `RaftKvNode::start` on the same engine — never `sim.crash`/
+    // `sim.restart`, which mute/re-arm the SAME still-live in-memory `Raft
+    // Core` and never touch the WAL at all) then recovers from that empty
+    // WAL: `drive`'s `fresh_group` check is true, so `RaftCore::recovered`
+    // is skipped and the fresh core keeps `snapshot_index == last_applied ==
+    // 0` — while `engine_applied` is correctly reseeded from the ENGINE's
+    // own durable watermark (already caught up, e.g. `201`). `behind` is
+    // then permanently `engine_applied` itself: `snapshot_upto(ea)` clamps
+    // to `ea.min(last_applied)`, and `last_applied` is ALSO stuck at `0` on
+    // this fresh, never-recovered core, so it can never advance
+    // `snapshot_index` past `0` — `behind` never shrinks, `threshold_hit`
+    // (recomputed fresh every pass) is `true` forever, and this whole apply
+    // task spins `did_work = true` on every single pass with no forward
+    // progress: `apply_loop` never reaches its idle
+    // `select(ApplyPending, sleep(APPLY_SAFETY_POLL))`, so `SimEnv`'s
+    // executor never advances virtual time and `run_for`/`run_until` never
+    // return (one CPU core pinned indefinitely — issue #811). Forcing the
+    // WAL rewrite here, in the SAME pass that installs the snapshot,
+    // durably records `snapshot_index`/the (here, empty) log BEFORE any
+    // restart can ever race it, closing the gap at its source rather than
+    // papering over the eventual symptom. Regression:
+    // `tests/restart_after_install_snapshot.rs`.
+    let just_installed_snapshot_needs_wal_rewrite = just_installed_snapshot;
     // Skip compaction once a shutdown is requested: it is only a WAL-bounding
     // optimization (the engine + un-truncated WAL stay consistent without it), and
     // starting a full WAL rewrite while the env is being torn down races the task
     // abort — the `replace` can then fail on a half-gone data dir.
-    if (threshold_hit || image_needed) && !halted.load(Ordering::SeqCst) {
+    if (threshold_hit || image_needed || just_installed_snapshot_needs_wal_rewrite)
+        && !halted.load(Ordering::SeqCst)
+    {
         // The on-demand image: a slow whole-engine scan, done with no locks held,
         // and only when a follower is actually waiting on a snapshot.
         let image = if image_needed {
