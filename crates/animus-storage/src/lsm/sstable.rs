@@ -27,9 +27,15 @@
 //!   - Reading is: fetch the block, verify the CRC, read the tag, decompress if
 //!     `LZ4`, then decode the records, reconstructing each full key from the
 //!     previous one.
-//! - The **index region** is `serde_json` of `Vec<BlockIndex>` — one entry per
-//!   block giving its first key + byte offset + byte length. The reader loads it
-//!   once on open and keeps it in memory (it is small: one entry per ~block).
+//! - The **index region** is a compact hand-rolled binary encoding of
+//!   `Vec<BlockIndex>` — one entry per block giving its first key, byte
+//!   offset, and byte length (see [`encode_block_index`]/[`decode_block_index`]
+//!   for the exact layout: it mirrors the WAL record and manifest codecs —
+//!   no field names, length-prefixed keys, fixed-width integers, a trailing
+//!   CRC32 — rather than `serde_json`, which renders a `Vec<u8>` key as a
+//!   decimal-number JSON array 3-6x bigger than the raw bytes, repeated per
+//!   entry with its field names). The reader loads it once on open and
+//!   keeps it in memory (it is small: one entry per ~block).
 //! - The **footer** is a fixed 24 bytes at end of file: `index_offset: u64`,
 //!   `index_len: u64`, `magic: u64` ([`MAGIC`]). The reader reads it with one
 //!   `read_at` at `size - 24`, then reads the index region, then individual blocks
@@ -93,7 +99,11 @@ pub struct Record {
 }
 
 /// One index entry: the first key of a block and where the block lives.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+///
+/// No `serde` derive: the index *region*'s on-disk encoding is the
+/// hand-rolled binary codec below ([`encode_block_index`]/
+/// [`decode_block_index`]), never JSON — see the module doc for why.
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct BlockIndex {
     /// First (smallest `(key, version)`) record's key in this block.
     first_key: Key,
@@ -102,6 +112,128 @@ struct BlockIndex {
     /// Byte length of the on-disk block, including its framing (`tag || payload`)
     /// and the 4-byte trailing CRC.
     len: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Compact binary block-INDEX codec
+// ---------------------------------------------------------------------------
+//
+// Mirrors the manifest codec's style (`lsm.rs`'s `encode_manifest`/
+// `decode_manifest`): a fixed header, length-prefixed byte strings, fixed-width
+// integers, no field names — plus a trailing CRC32 (matching this file's own
+// per-block framing, since unlike the manifest the index region lives inside
+// an otherwise-checksummed SSTable file). All integers little-endian, matching
+// this file's own record/footer encoding (`encode_record`, the footer below) —
+// the sibling `lsm.rs` manifest/WAL codecs are big-endian instead; there is no
+// cross-file convention here, only a per-file one, and this stays consistent
+// with its immediate neighbors.
+//
+//   MAGIC(4 = b"SSIX") | version(u8) | count(u32)
+//   | entry[0] | entry[1] | ... | crc32(u32)
+//
+// One entry:
+//   key_len(u32) | first_key: bytes | offset(u64) | len(u64)
+//
+// The CRC32 covers every byte from MAGIC through the last entry (i.e.
+// everything except itself), so a flipped byte anywhere in the region —
+// including inside `count` or a `key_len` — is caught before any of it is
+// trusted enough to drive an allocation or a bounds check.
+
+/// Binary block-index magic: "SSIX" (SSTable IndeX).
+const INDEX_MAGIC: [u8; 4] = *b"SSIX";
+/// Binary block-index format version.
+const INDEX_VERSION: u8 = 1;
+/// Fixed header length: magic(4) + version(1) + count(4).
+const INDEX_HEADER_LEN: usize = 4 + 1 + 4;
+/// Trailing CRC32 length.
+const INDEX_CRC_LEN: usize = 4;
+/// Sanity cap on the decoded entry count, matching the manifest/WAL decoders'
+/// `.min(1 << 20)` convention (defense in depth against an untrusted on-disk
+/// count driving a huge `Vec::with_capacity` — see the crate guide's
+/// "untrusted length-prefix pre-sizing a `Vec`" entry). The CRC already
+/// covers `count`, so this only matters if the CRC itself was defeated.
+const INDEX_MAX_ENTRIES: usize = 1 << 20;
+
+/// Encode a block index in the compact binary format described above.
+fn encode_block_index(index: &[BlockIndex]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&INDEX_MAGIC);
+    out.push(INDEX_VERSION);
+    out.extend_from_slice(&(index.len() as u32).to_le_bytes());
+    for bi in index {
+        out.extend_from_slice(&(bi.first_key.len() as u32).to_le_bytes());
+        out.extend_from_slice(&bi.first_key);
+        out.extend_from_slice(&bi.offset.to_le_bytes());
+        out.extend_from_slice(&bi.len.to_le_bytes());
+    }
+    let crc = crc32fast::hash(&out);
+    out.extend_from_slice(&crc.to_le_bytes());
+    out
+}
+
+/// Decode a block index encoded by [`encode_block_index`]. Returns
+/// [`StorageError::Backend`] — the same error class the manifest/WAL decoders
+/// use — on a truncated region, an unrecognized magic/version, a bad checksum,
+/// or a length prefix (entry count or key length) that runs past the region;
+/// never panics.
+fn decode_block_index(bytes: &[u8]) -> Result<Vec<BlockIndex>> {
+    if bytes.len() < INDEX_HEADER_LEN + INDEX_CRC_LEN {
+        return Err(StorageError::Backend("truncated sstable index".into()));
+    }
+    // Verify the checksum over the whole region before trusting any of its
+    // fields (magic, version, count, or any entry) — mirrors this file's own
+    // block-read path (`read_block` checks the CRC before touching the tag).
+    let split = bytes.len() - INDEX_CRC_LEN;
+    let (body, crc_bytes) = bytes.split_at(split);
+    let want = u32::from_le_bytes(crc_bytes.try_into().unwrap());
+    if crc32fast::hash(body) != want {
+        return Err(StorageError::Backend("sstable index crc mismatch".into()));
+    }
+    if body[..4] != INDEX_MAGIC {
+        return Err(StorageError::Backend("bad sstable index magic".into()));
+    }
+    let version = body[4];
+    if version == 0 || version > INDEX_VERSION {
+        return Err(StorageError::Backend(format!(
+            "unsupported sstable index version {version}"
+        )));
+    }
+    let count = u32::from_le_bytes(body[5..INDEX_HEADER_LEN].try_into().unwrap()) as usize;
+    let mut out = Vec::with_capacity(count.min(INDEX_MAX_ENTRIES));
+    let mut i = INDEX_HEADER_LEN;
+    let need = |i: usize, n: usize| -> Result<()> {
+        if i + n <= body.len() {
+            Ok(())
+        } else {
+            Err(StorageError::Backend(
+                "truncated sstable index entry".into(),
+            ))
+        }
+    };
+    for _ in 0..count {
+        need(i, 4)?;
+        let key_len = u32::from_le_bytes(body[i..i + 4].try_into().unwrap()) as usize;
+        i += 4;
+        need(i, key_len)?;
+        let first_key = body[i..i + key_len].to_vec();
+        i += key_len;
+        need(i, 16)?;
+        let offset = u64::from_le_bytes(body[i..i + 8].try_into().unwrap());
+        i += 8;
+        let len = u64::from_le_bytes(body[i..i + 8].try_into().unwrap());
+        i += 8;
+        out.push(BlockIndex {
+            first_key,
+            offset,
+            len,
+        });
+    }
+    if i != body.len() {
+        return Err(StorageError::Backend(
+            "trailing garbage in sstable index".into(),
+        ));
+    }
+    Ok(out)
 }
 
 /// Per-table metadata stored in the manifest. Carries no block data, only the
@@ -379,8 +511,7 @@ impl SsTableWriter {
 
         // Write the index region.
         let index_offset = offset;
-        let index_bytes = serde_json::to_vec(&index)
-            .map_err(|e| StorageError::Backend(format!("sstable index encode: {e}")))?;
+        let index_bytes = encode_block_index(&index);
         let index_len = index_bytes.len() as u64;
         env.append(file, &index_bytes).await.map_err(io)?;
 
@@ -442,7 +573,7 @@ impl SsTableReader {
                 .read_at(&file, meta.index_offset, meta.index_len as usize)
                 .await
                 .map_err(io)?;
-            serde_json::from_slice(&bytes)
+            decode_block_index(&bytes)
                 .map_err(|e| StorageError::Backend(format!("corrupt sstable index: {e}")))?
         };
         Ok(Self {
@@ -826,5 +957,301 @@ mod tests {
             full_key_cost
         );
         assert_eq!(decode_block(&pfx).unwrap(), records);
+    }
+
+    // -----------------------------------------------------------------
+    // Block-index codec (issue #839: replaced `serde_json` with a compact
+    // binary encoding mirroring the manifest/WAL codecs' style).
+    // -----------------------------------------------------------------
+
+    fn sample_index(entries: &[(&[u8], u64, u64)]) -> Vec<BlockIndex> {
+        entries
+            .iter()
+            .map(|&(k, offset, len)| BlockIndex {
+                first_key: k.to_vec(),
+                offset,
+                len,
+            })
+            .collect()
+    }
+
+    /// The binary codec round-trips an empty index, a single entry, many
+    /// entries, and keys covering every byte value (including `0x00`/`0xFF`)
+    /// and a zero-length key.
+    #[test]
+    fn index_codec_round_trips_empty_one_many_and_edge_keys() {
+        let empty: Vec<BlockIndex> = Vec::new();
+        assert_eq!(
+            decode_block_index(&encode_block_index(&empty)).unwrap(),
+            empty
+        );
+
+        let one = sample_index(&[(b"only".as_slice(), 0, 100)]);
+        assert_eq!(decode_block_index(&encode_block_index(&one)).unwrap(), one);
+
+        let many: Vec<BlockIndex> = (0..5000u64)
+            .map(|i| BlockIndex {
+                first_key: format!("key-{i:06}").into_bytes(),
+                offset: i * 4096,
+                len: 4096,
+            })
+            .collect();
+        assert_eq!(
+            decode_block_index(&encode_block_index(&many)).unwrap(),
+            many
+        );
+
+        let all_bytes: Vec<u8> = (0u8..=255).collect();
+        let edge = vec![
+            BlockIndex {
+                first_key: Vec::new(),
+                offset: 0,
+                len: 0,
+            },
+            BlockIndex {
+                first_key: vec![0x00],
+                offset: 1,
+                len: 2,
+            },
+            BlockIndex {
+                first_key: vec![0xFF],
+                offset: 3,
+                len: 4,
+            },
+            BlockIndex {
+                first_key: all_bytes,
+                offset: 5,
+                len: 6,
+            },
+        ];
+        assert_eq!(
+            decode_block_index(&encode_block_index(&edge)).unwrap(),
+            edge
+        );
+    }
+
+    /// The encoded index for `N` entries with fixed `K`-byte keys is exactly
+    /// `N*(4+K+16)` bytes plus the codec's fixed 13-byte header+CRC overhead
+    /// (`key_len(4) + key(K) + offset(8) + len(8)` per entry) — no per-entry
+    /// field-name repetition — and is smaller than the same index encoded as
+    /// `serde_json` by at least 2x. The JSON encoding exists only in this test
+    /// as a comparison baseline (a local struct, `derive(Serialize)`'d just for
+    /// this measurement) — never in the product, per the module doc.
+    #[test]
+    fn index_codec_size_is_near_theoretical_and_beats_json_by_2x() {
+        const N: usize = 1000;
+        const K: usize = 24;
+        let index: Vec<BlockIndex> = (0..N as u64)
+            .map(|i| {
+                let mut key = format!("k{i:016}").into_bytes();
+                key.resize(K, b'x');
+                BlockIndex {
+                    first_key: key,
+                    offset: i * 4096,
+                    len: 4096,
+                }
+            })
+            .collect();
+
+        let encoded = encode_block_index(&index);
+        let theoretical = N * (4 + K + 16);
+        let overhead = INDEX_HEADER_LEN + INDEX_CRC_LEN;
+        assert_eq!(
+            encoded.len(),
+            theoretical + overhead,
+            "encoded size should be exactly the theoretical per-entry cost plus \
+             the fixed header+CRC overhead"
+        );
+
+        #[derive(serde::Serialize)]
+        struct JsonBlockIndex {
+            first_key: Vec<u8>,
+            offset: u64,
+            len: u64,
+        }
+        let json_index: Vec<JsonBlockIndex> = index
+            .iter()
+            .map(|bi| JsonBlockIndex {
+                first_key: bi.first_key.clone(),
+                offset: bi.offset,
+                len: bi.len,
+            })
+            .collect();
+        let json_bytes = serde_json::to_vec(&json_index).unwrap();
+        assert!(
+            json_bytes.len() >= encoded.len() * 2,
+            "binary index {} not at least 2x smaller than json index {}",
+            encoded.len(),
+            json_bytes.len()
+        );
+    }
+
+    /// Decoding rejects every truncation point of a realistic multi-entry
+    /// index — the header alone, mid-entry, and right at the trailing CRC —
+    /// with the same error class the manifest/WAL decoders use
+    /// (`StorageError::Backend`), never a panic and never a successful decode
+    /// of a shorter-than-written region.
+    #[test]
+    fn index_codec_rejects_truncated_region() {
+        let index = sample_index(&[(b"a".as_slice(), 0, 10), (b"bb".as_slice(), 10, 20)]);
+        let full = encode_block_index(&index);
+        for cut in 0..full.len() {
+            match decode_block_index(&full[..cut]) {
+                Err(StorageError::Backend(_)) => {}
+                Err(other) => panic!("cut={cut}: wrong error class: {other:?}"),
+                Ok(decoded) => panic!("cut={cut}: truncated bytes decoded as {decoded:?}"),
+            }
+        }
+    }
+
+    /// A declared entry count far past [`INDEX_MAX_ENTRIES`] never drives a
+    /// huge allocation (the pre-sized `Vec::with_capacity` is capped) and
+    /// fails cleanly — here on the first entry it cannot actually read past —
+    /// rather than hanging or aborting the process.
+    #[test]
+    fn index_codec_rejects_count_over_cap() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&INDEX_MAGIC);
+        body.push(INDEX_VERSION);
+        body.extend_from_slice(&((INDEX_MAX_ENTRIES as u32) + 1).to_le_bytes());
+        // One well-formed entry follows so the decoder gets partway through
+        // before running out of bytes for the (nonexistent) second one.
+        body.extend_from_slice(&4u32.to_le_bytes());
+        body.extend_from_slice(b"key1");
+        body.extend_from_slice(&0u64.to_le_bytes());
+        body.extend_from_slice(&10u64.to_le_bytes());
+        let crc = crc32fast::hash(&body);
+        let mut bytes = body;
+        bytes.extend_from_slice(&crc.to_le_bytes());
+
+        match decode_block_index(&bytes) {
+            Err(StorageError::Backend(_)) => {}
+            other => panic!("expected a Backend error for an over-cap count, got {other:?}"),
+        }
+    }
+
+    /// A key-length prefix that claims far more bytes than the region actually
+    /// holds is rejected cleanly, never read out of bounds and never a panic.
+    #[test]
+    fn index_codec_rejects_key_length_past_region() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&INDEX_MAGIC);
+        body.push(INDEX_VERSION);
+        body.extend_from_slice(&1u32.to_le_bytes());
+        body.extend_from_slice(&(1u32 << 30).to_le_bytes()); // absurd key length
+        body.extend_from_slice(b"short"); // nowhere near 2^30 bytes present
+        let crc = crc32fast::hash(&body);
+        let mut bytes = body;
+        bytes.extend_from_slice(&crc.to_le_bytes());
+
+        match decode_block_index(&bytes) {
+            Err(StorageError::Backend(_)) => {}
+            other => panic!("expected a Backend error for an oversized key length, got {other:?}"),
+        }
+    }
+
+    /// A single flipped byte anywhere in an otherwise well-formed region is
+    /// caught by the trailing CRC32 before any field is trusted.
+    #[test]
+    fn index_codec_rejects_bad_checksum() {
+        let index = sample_index(&[(b"a".as_slice(), 0, 10)]);
+        let mut bytes = encode_block_index(&index);
+        let mid = INDEX_HEADER_LEN + 2;
+        bytes[mid] ^= 0xFF;
+        match decode_block_index(&bytes) {
+            Err(StorageError::Backend(msg)) => assert!(msg.contains("crc"), "got: {msg}"),
+            other => panic!("expected a crc-mismatch error, got {other:?}"),
+        }
+    }
+
+    /// At-rest corruption of the on-disk index region surfaces as a clean
+    /// `StorageError` from `SsTableReader::open` — never a panic, never a
+    /// silently wrong block index — using the same `Simulator::corrupt_durable`
+    /// idiom as the crash/disk-fault corpora
+    /// (`lsm_disk_faults.rs::scenario_corrupted_sstable_block_read_is_a_clean_error`
+    /// is the sibling test for a data block).
+    #[test]
+    fn corrupted_index_region_fails_open_cleanly() {
+        let sim = Simulator::new(3);
+        let env = sim.env(nid(0));
+        let meta = block_on(async {
+            let mut records = Vec::new();
+            for i in 0u32..500 {
+                records.push(Record {
+                    key: format!("k{i:05}").into_bytes(),
+                    version: u64::from(i) + 1,
+                    value: Some(vec![b'v'; 32]),
+                });
+            }
+            let meta = SsTableWriter::write(&env, "idx", 1, 0, &records)
+                .await
+                .unwrap();
+            env.sync("idx").await.unwrap();
+            meta
+        });
+        assert!(meta.index_len > 20, "sanity: a nontrivial index region");
+
+        // Sanity: an uncorrupted reopen works.
+        block_on(async {
+            SsTableReader::open(&env, "idx".into(), meta.clone())
+                .await
+                .unwrap();
+        });
+
+        // Flip a byte squarely inside the index region — not a data block,
+        // not the footer.
+        assert!(
+            sim.corrupt_durable(nid(0), "idx", meta.index_offset + 5),
+            "corruption must land"
+        );
+        let err = match block_on(SsTableReader::open(&env, "idx".into(), meta)) {
+            Ok(_) => panic!("a corrupted index region must fail open, not return a wrong index"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, StorageError::Backend(_)),
+            "expected the same error class the manifest/WAL decoders use, got: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("crc") || msg.contains("corrupt") || msg.contains("magic"),
+            "expected a checksum/corruption error, got: {msg}"
+        );
+    }
+
+    /// A truncated index region — modeling a manifest/footer that (through some
+    /// other bug) understates its own length — likewise fails `open` cleanly,
+    /// never a panic, via a meta whose declared `index_len` undersizes the
+    /// actual on-disk region.
+    #[test]
+    fn truncated_index_region_fails_open_cleanly() {
+        let sim = Simulator::new(4);
+        let env = sim.env(nid(0));
+        let meta = block_on(async {
+            let mut records = Vec::new();
+            for i in 0u32..500 {
+                records.push(Record {
+                    key: format!("k{i:05}").into_bytes(),
+                    version: u64::from(i) + 1,
+                    value: Some(vec![b'v'; 32]),
+                });
+            }
+            let meta = SsTableWriter::write(&env, "idx2", 1, 0, &records)
+                .await
+                .unwrap();
+            env.sync("idx2").await.unwrap();
+            meta
+        });
+        assert!(
+            meta.index_len > 20,
+            "sanity: index region big enough to truncate meaningfully"
+        );
+
+        let mut truncated = meta.clone();
+        truncated.index_len = 5; // shorter than even the 13-byte header+CRC
+        match block_on(SsTableReader::open(&env, "idx2".into(), truncated)) {
+            Ok(_) => panic!("a truncated index region must fail open, not panic"),
+            Err(err) => assert!(matches!(err, StorageError::Backend(_))),
+        }
     }
 }
