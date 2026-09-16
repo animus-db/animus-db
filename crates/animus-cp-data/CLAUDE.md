@@ -1979,20 +1979,17 @@ demand the identical action, so no disambiguation is needed.
 - **Wiped-voter boot-time safety (issue #900, ADR 0017's matching amendment):
   `drive`'s WAL-recovery branch calls `RaftCore::begin_cluster_check`
   whenever `state.is_empty()`, except when the caller's own
-  `campaign_immediately` flag is set** (ADR 0058 Train 2 rung 4's
-  deterministic split-child first-leader optimization — that flag proves,
-  by construction, a genuine fresh formation, so skipping the check there
-  costs zero safety and avoids gating the synchronous `campaign_now` call
-  on `cluster_check_pending`, which would silently degrade "wins the race
-  against the cold election timeout" to "waits out the cold election
-  timeout anyway" on every split). Everything else about the mechanism —
-  the `ClusterProbe`/`ClusterProbeResp` wire messages, the vote/campaign
-  gating, the wait-for-every-peer aggregation — lives on the shared,
-  generic `RaftCore<C, S>` (`animus-control::raft`), so it needed **no**
-  cp-data-specific reimplementation, only this one driver call plus
+  `skip_cluster_check` flag is set** (issue #945: this used to be gated on
+  `campaign_immediately` directly, which only exempted the ONE replica per
+  split child that campaigns — see below for why that was a real
+  regression, not just a naming choice). Everything else about the
+  mechanism — the `ClusterProbe`/`ClusterProbeResp` wire messages, the
+  vote/campaign gating, the wait-for-every-peer aggregation — lives on the
+  shared, generic `RaftCore<C, S>` (`animus-control::raft`), so it needed
+  **no** cp-data-specific reimplementation, only this one driver call plus
   `RaftKvNode::cluster_check_pending()`/`refused_as_voter()` accessors.
   **Gotcha for any future boot-path change here**: wiring this in draws
-  extra entropy (`env.next_u64()`) at every non-`campaign_immediately`
+  extra entropy (`env.next_u64()`) at every non-`skip_cluster_check`
   fresh-group boot, reshuffling later random draws for the rest of that
   `SimEnv` run — re-verify every fixed-seed test that starts a fresh
   replica (a new tablet, a growth join, a test harness's own second/third
@@ -2002,6 +1999,36 @@ demand the identical action, so no disambiguation is needed.
   seed re-pin for exactly this reason. See
   `docs/lessons/code-patterns/2026-09-15-a-generic-core-level-fix-does-
   not-wire-itself-into-every-driver.md` for the general lesson.
+- **Issue #945 (the corpus-deep regression this shipped as): `campaign_immediately`
+  and `skip_cluster_check` are two different flags, not one.** The
+  original issue #900 fix gated the cluster-check skip on
+  `campaign_immediately` alone, reasoning (correctly) that the ONE replica
+  which campaigns is safe to exempt. It missed that a real
+  `materialize_split_child` fork hosts SEVERAL replicas of the same child
+  at once (only one of which campaigns) — and `handle_request_vote`
+  refuses a REAL vote while `cluster_check_pending` (see that function's
+  own comment), so every OTHER replica of that same, equally-fresh-by-
+  construction child still blocked the campaigner's own vote behind a full
+  `ClusterProbe`/`ClusterProbeResp` round trip, silently degrading ADR
+  0058 Train 2 rung 4's documented "no added latency" guarantee on every
+  single split — caught by the nightly deep corpus (`inplace_split_
+  reconciler_corpus`, `heartbeat_batch_corpus`; `ANIMUS_INPLACE_SPLIT_SEEDS`/
+  `ANIMUS_HEARTBEAT_SEEDS=40`), not the per-push tier (depth 1), because
+  the regression only bites on the *unlucky* simulated link-latency draws
+  a handful of the 40 seeds happen to hit. Fixed by splitting the flag:
+  `start_inner` now takes `skip_cluster_check` independently of
+  `campaign_immediately`, and `materialize_split_child`'s non-campaigning
+  branch calls the new `RaftKvNode::start_hosted_split_follower_with_
+  batcher[_and_shared_wal]` constructor (skip=true, campaign=false)
+  instead of the ordinary `start_hosted_with_batcher[_and_shared_wal]`
+  those functions' own ordinary (non-split) callers keep using unchanged.
+  **The general rule this generalizes to**: when a safety check is
+  ambiguous only because a caller *hasn't yet proven itself* fresh by
+  construction, and one specific caller flag proves exactly that — audit
+  every OTHER party to the SAME operation that shares the caller's own
+  "proven fresh" premise, not just the one with a convenient existing
+  flag. A single-node exemption on a multi-node operation is usually
+  incomplete.
 - The ADR 0029 reconfigure/leadership-transfer follow-up fix (the two-layer
   transfer-gate threshold mismatch, the proposal-freeze while a transfer is
   armed, and the down-extra search fix) is a cross-cutting lesson — see the

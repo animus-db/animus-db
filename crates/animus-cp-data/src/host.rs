@@ -1667,7 +1667,19 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
                 self.shared_wal.clone(),
             )
         } else {
-            RaftKvNode::start_hosted_with_batcher_and_shared_wal(
+            // Issue #945: this replica doesn't campaign, but it is exactly
+            // as provably fresh-by-construction as the sibling that does —
+            // both come from this same `materialize_split_child` call, a
+            // brand new `TabletId` minted once, at the fork, from the
+            // parent's own committed entry. Skip the issue #900/#667
+            // boot-time cluster check here too (see `DriveState::
+            // skip_cluster_check`'s doc): gating it on `campaign` alone
+            // left every non-campaigning split replica's own
+            // `handle_request_vote` refusing a real vote to the campaigning
+            // sibling until its own cluster check resolved, silently
+            // degrading ADR 0058 Train 2 rung 4's "no added latency"
+            // deterministic-first-leader optimization on every split.
+            RaftKvNode::start_hosted_split_follower_with_batcher_and_shared_wal(
                 self.env.clone(),
                 voters,
                 engine,

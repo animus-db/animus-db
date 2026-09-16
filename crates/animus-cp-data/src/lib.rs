@@ -2323,6 +2323,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             StorageScope::whole(),
             PRIMARY_STREAM,
             false,
+            false,
             None,
             None,
         )
@@ -2341,6 +2342,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             metrics,
             scope,
             PRIMARY_STREAM,
+            false,
             false,
             None,
             None,
@@ -2365,7 +2367,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     ) -> Self {
         let metrics = env.metrics();
         Self::start_inner(
-            env, all_nodes, storage, metrics, scope, stream, false, None, None,
+            env, all_nodes, storage, metrics, scope, stream, false, false, None, None,
         )
     }
 
@@ -2411,7 +2413,63 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     ) -> Self {
         let metrics = env.metrics();
         Self::start_inner(
-            env, all_nodes, storage, metrics, scope, stream, false, batcher, shared_wal,
+            env, all_nodes, storage, metrics, scope, stream, false, false, batcher, shared_wal,
+        )
+    }
+
+    /// Like [`start_hosted_with_batcher_and_shared_wal`]
+    /// (Self::start_hosted_with_batcher_and_shared_wal), but for a replica
+    /// the caller already knows, by construction, is a split child's
+    /// non-campaigning sibling — every replica
+    /// [`host::Reconciler::materialize_split_child`](crate::host) hosts
+    /// OTHER than the one it also passes `campaign: true` for (see
+    /// `start_hosted_campaigning_with_batcher_and_shared_wal`'s doc for
+    /// that one). Skips the issue #900/#667 boot-time cluster check (see
+    /// `DriveState::skip_cluster_check`'s doc for why this is safe here but
+    /// not for [`start_hosted_with_batcher_and_shared_wal`]
+    /// (Self::start_hosted_with_batcher_and_shared_wal)'s own ordinary
+    /// fresh-hosting callers) without campaigning immediately — this
+    /// replica still waits out the group's own randomized election timer
+    /// (or a `RequestVote` from whichever sibling DID campaign), exactly
+    /// like any other follower.
+    pub fn start_hosted_split_follower_with_batcher_and_shared_wal(
+        env: E,
+        all_nodes: Vec<NodeId>,
+        storage: S,
+        scope: StorageScope,
+        stream: u64,
+        batcher: Option<HeartbeatBatcher<E>>,
+        shared_wal: Option<Arc<SharedWal<KvCommand, KvState>>>,
+    ) -> Self {
+        let metrics = env.metrics();
+        Self::start_inner(
+            env, all_nodes, storage, metrics, scope, stream, false, true, batcher, shared_wal,
+        )
+    }
+
+    /// Like [`start_hosted_split_follower_with_batcher_and_shared_wal`]
+    /// (Self::start_hosted_split_follower_with_batcher_and_shared_wal),
+    /// without the `shared_wal` opt-in — mirrors
+    /// [`start_hosted_with_batcher`](Self::start_hosted_with_batcher)'s own
+    /// relationship to
+    /// [`start_hosted_with_batcher_and_shared_wal`](Self::
+    /// start_hosted_with_batcher_and_shared_wal). A sim test that hand-hosts
+    /// a group outside `host::Reconciler` (never going through
+    /// `materialize_split_child` itself) uses this to accurately model a
+    /// split child's non-campaigning replica alongside
+    /// [`start_hosted_campaigning_with_batcher`](Self::
+    /// start_hosted_campaigning_with_batcher)'s own campaigning one — see
+    /// `heartbeat_batch_corpus.rs`'s `hosted_group_fixed_leader`.
+    pub fn start_hosted_split_follower_with_batcher(
+        env: E,
+        all_nodes: Vec<NodeId>,
+        storage: S,
+        scope: StorageScope,
+        stream: u64,
+        batcher: Option<HeartbeatBatcher<E>>,
+    ) -> Self {
+        Self::start_hosted_split_follower_with_batcher_and_shared_wal(
+            env, all_nodes, storage, scope, stream, batcher, None,
         )
     }
 
@@ -2461,7 +2519,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     ) -> Self {
         let metrics = env.metrics();
         Self::start_inner(
-            env, all_nodes, storage, metrics, scope, stream, true, None, None,
+            env, all_nodes, storage, metrics, scope, stream, true, true, None, None,
         )
     }
 
@@ -2503,7 +2561,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     ) -> Self {
         let metrics = env.metrics();
         Self::start_inner(
-            env, all_nodes, storage, metrics, scope, stream, true, batcher, shared_wal,
+            env, all_nodes, storage, metrics, scope, stream, true, true, batcher, shared_wal,
         )
     }
 
@@ -2525,6 +2583,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             StorageScope::whole(),
             PRIMARY_STREAM,
             false,
+            false,
             None,
             None,
         )
@@ -2539,6 +2598,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         scope: StorageScope,
         stream: u64,
         campaign_immediately: bool,
+        skip_cluster_check: bool,
         heartbeat_batcher: Option<HeartbeatBatcher<E>>,
         shared_wal: Option<Arc<SharedWal<KvCommand, KvState>>>,
     ) -> Self {
@@ -2695,6 +2755,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             external_quiesce_veto,
             external_quiesce_veto_fresh_through,
             campaign_immediately,
+            skip_cluster_check,
             voter_history,
             heartbeat_batcher,
             shared_wal,
@@ -9604,6 +9665,24 @@ struct DriveState<E: Env, S: StorageEngine> {
     /// genuine first formation instead of waiting out the randomized
     /// election timeout — see [`RaftKvNode::start_hosted_campaigning`]'s doc.
     campaign_immediately: bool,
+    /// Issue #945: skip the issue #900/#667 boot-time cluster check
+    /// entirely for this fresh group, because the caller already knows —
+    /// by construction, not by convention — that an empty local WAL here
+    /// can never be an established voter's wiped disk. `true` for
+    /// `campaign_immediately` (the one replica proven fresh by being the
+    /// parent's own leader at an in-place split fork) **and** for every
+    /// other replica of that same [`materialize_split_child`](crate::host)
+    /// call (a brand new `TabletId` minted once, at the fork, from the
+    /// parent's own committed entry — there is no prior identity for THIS
+    /// tablet id to have been wiped). `false` for every ordinary fresh
+    /// hosting (`CreateTablet`, an ADR 0060 growth join, a
+    /// reconciler-adopted replica of an already-established tablet) —
+    /// those genuinely are ambiguous with a wiped voter and must still run
+    /// the check. See `start_hosted_split_follower_with_batcher_and_shared_wal`'s
+    /// doc for why this can't just be `campaign_immediately` itself: only
+    /// ONE replica per child ever campaigns, but EVERY replica of that
+    /// child is equally safe to skip the check.
+    skip_cluster_check: bool,
     /// See [`RaftKvNode::voter_history`]'s doc — threaded through so this
     /// loop can record the initial (post-recovery) config and every later
     /// distinct one it adopts.
@@ -9748,6 +9827,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         external_quiesce_veto,
         external_quiesce_veto_fresh_through,
         campaign_immediately,
+        skip_cluster_check,
         voter_history,
         heartbeat_batcher,
         shared_wal,
@@ -9801,7 +9881,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         let recovered =
             RaftCore::recovered(env.node_id(), &all_nodes, state, env.now(), env.next_u64());
         *core.lock().expect("raftkv core poisoned") = recovered;
-    } else if !campaign_immediately {
+    } else if !skip_cluster_check {
         // Issue #900 (P0 Raft safety, mirrors issue #667's control-plane
         // fix — `animus-control::node::drive`'s own identical branch, ADR
         // 0009's 2026-09-15 amendment): an empty per-tablet WAL is exactly
@@ -9824,23 +9904,29 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         // `RaftMsg` (including these two) generically through
         // `RaftCore::handle`.
         //
-        // Deliberately gated on `!campaign_immediately`: that flag (ADR
-        // 0058 Train 2 rung 4) is set ONLY for the one replica the caller
-        // has already proven, by construction, to be the parent's own
-        // leader at an in-place split fork — never a wiped voter (a
-        // restart can't set this flag; only `materialize_split_child`
-        // does, exactly once, at the fork itself) — and its whole point is
-        // to win the race against this group's own cold randomized
-        // election timeout by campaigning synchronously before this loop
-        // ever starts. Running the cluster check for that one replica too
-        // would gate `campaign_now` (below) on `cluster_check_pending`,
-        // silently degrading the deterministic-first-leader optimization
-        // to an ordinary cold timeout on every single split — a real,
-        // ADR-documented behavior this fix must not weaken. Every other
-        // fresh-group replica (every split child that is NOT the
-        // immediate-campaign leader, an ordinary `CreateTablet`, and a
-        // genuinely wiped voter restarting into an established group)
-        // still goes through the check.
+        // Gated on `!skip_cluster_check`, NOT `!campaign_immediately`
+        // (issue #945 fix — see `DriveState::skip_cluster_check`'s own
+        // doc): `campaign_immediately` (ADR 0058 Train 2 rung 4) is set for
+        // exactly ONE replica per split child — the parent's own leader at
+        // the fork — but EVERY replica of that same child is equally
+        // provably fresh by construction (`materialize_split_child` mints
+        // a brand new `TabletId` once, at the fork, from the parent's own
+        // committed entry; there is no prior identity for that tablet id
+        // to have been wiped). The original `!campaign_immediately` gate
+        // only exempted the one campaigning replica, so a real production
+        // split still gated its OTHER replicas' `handle_request_vote` on
+        // their own `cluster_check_pending` — which refuses to grant a
+        // REAL vote while pending (see that function's own comment) — so
+        // the "no added latency" deterministic-first-leader optimization
+        // was silently degraded to "wait one probe round trip" on every
+        // split despite this comment's own prior claim otherwise. Callers
+        // now pass `skip_cluster_check` independently of
+        // `campaign_immediately`, `true` for every replica
+        // `materialize_split_child` hosts (both the campaigning one and
+        // every sibling), `false` for every ordinary fresh hosting
+        // (`CreateTablet`, an ADR 0060 growth join, a reconciler-adopted
+        // replica of an already-established tablet) — those still
+        // genuinely need the check.
         let initial_probe = {
             let mut c = core.lock().expect("raftkv core poisoned");
             c.begin_cluster_check(env.now(), env.next_u64())
