@@ -365,6 +365,42 @@ binary for a build-time-only JSON shape. **Keeping that mirror in sync with
   see that file if `cargo deny check` ever flags it again after a `kube`
   version bump changes its dependency shape.
 
+## NetworkPolicy admin-port ingress needs a namespaceSelector (issue #857, 2026-09-14)
+
+`desired::networkpolicy::build`'s admin-port ingress rule used to admit the
+operator via a bare `podSelector` (`pod_selector(operator_labels)`) — which
+a `NetworkPolicyPeer` scopes to the `NetworkPolicy` object's **own**
+namespace, i.e. the `AnimusCluster`'s namespace, never the operator's. The
+operator runs in its own dedicated namespace
+(`deploy/operator/deployment.yaml`'s `Namespace` object, `animus-operator`),
+distinct from every `AnimusCluster`'s own namespace
+(`deploy/operator/example.yaml`'s `default`), so the rule was a silent
+no-op in the documented deployment topology: nothing in the `AnimusCluster`'s
+own namespace carries the operator's pod labels. Masked under the default
+`--admin-access proxy` (admin calls go through the API server's pod-proxy
+subresource, not sourced from an operator pod at all), but a hard block
+under the supported `--admin-access direct` mode, which dials pods
+directly from the operator's own pod — every scale-down admin call
+(`/admin/drain`, `/admin/member/drain-status`, `/admin/member/remove`)
+would fail, feeding directly into #853's drain-failure path.
+
+Fixed by `operator_peer`, mirroring `dns_peer`'s own precedent exactly: AND
+a `namespaceSelector` (on the namespace's well-known name label,
+`kubernetes.io/metadata.name`) with the existing `podSelector`. The
+operator's namespace is **not** derivable from the `AnimusCluster` object
+or threaded through `build()` as a parameter — it is a fixed constant,
+`OPERATOR_NAMESPACE = "animus-operator"`, matching
+`deploy/operator/deployment.yaml`'s shipped `Namespace` name (which happens
+to equal `OPERATOR_APP_NAME`'s own string value, a coincidence of the
+manifest, not a derivation — kept as its own named constant rather than
+reusing `OPERATOR_APP_NAME` so the two concepts, "the operator's app-name
+label value" and "the operator's namespace name," don't get silently
+conflated if either one changes independently later). **A deployment that
+renames the operator's own namespace away from `animus-operator` must
+update `desired::networkpolicy::OPERATOR_NAMESPACE` to match** — the exact
+same manual-sync posture `KUBE_SYSTEM_NAMESPACE` already has for a
+non-default `kube-dns` namespace.
+
 ## Probes: readiness vs. liveness (issue #710, 2026-09-07)
 
 `desired::statefulset::admin_probe` builds both probes off one shared
@@ -569,6 +605,30 @@ store in both `spec.s3` and the matching top-level field is rejected as a
 conflict naming both — a `StoreSpecInvalid` status condition either way,
 `backupStore`/`segmentStore` stripped for the rest of that reconcile.
 
+**`spec.storage.ephemeral` (an `emptyDir` data volume) is a real Raft
+safety hazard for a voter, control-plane or data-plane, not just a
+durability trade-off (issue #667, ADR 0009's matching 2026-09-15
+amendment).** A control voter whose `emptyDir` is wiped by an ordinary
+pod recreation (a node deletion, a config-hash roll, `S-07d`'s own growth
+flow) restarts with an empty WAL — indistinguishable, locally, from a
+genuine first-ever bootstrap. The control plane refuses to act as a voter
+in that case until a boot-time peer probe resolves the ambiguity (see the
+ADR amendment for the full mechanism); the CP data plane has the
+identical hazard for a hosted tablet's own voter and does **not** yet have
+this protection (issue #900 — a materially harder problem there, since a
+tablet's peer set is dynamic and reconstituted constantly, unlike the
+control plane's one-time genesis config). **Operational guidance until
+issue #900 closes: `storage.ephemeral: true` should be treated as
+unsupported for any pod that ever acts as a CP-data voter** — which today
+means every combined-mode and data-only pod, `spec.storage.ephemeral`'s
+safety story only really holds for a genuinely stateless, disposable
+deployment. This operator does not currently validate or warn against
+that combination; a future rung could reject `spec.storage.ephemeral:
+true` outright, or restrict it to control-only pods (which now have the
+issue #667 protection), pending a decision on whether that restriction
+belongs here or is better left to the ADR's own operational-mitigation
+note.
+
 **Every `fs:`/`dir:` path must live strictly under
 `desired::cluster_config::DATA_DIR`** (`/var/lib/animus`) — the one
 directory every pod already has mounted (a `PersistentVolumeClaim`, or an
@@ -596,9 +656,9 @@ above.
 
 **`scripts/e2e-kind.sh`'s `E2E_S3=1` leg is UNVERIFIED in this sandbox**
 — same `CAP_SYS_RESOURCE` reason `E2E_TLS`'s own leg is (see the e2e
-section below): it deploys a single-pod MinIO + Service, creates the
-bucket via a throwaway `minio/mc` pod and the credentials `Secret`,
-applies `spec.s3.backupStore` pointing at `http://minio.<ns>.svc:9000`
+section below): it deploys a single-pod RustFS + Service, creates the
+bucket via a throwaway `amazon/aws-cli` pod and the credentials `Secret`,
+applies `spec.s3.backupStore` pointing at `http://rustfs.<ns>.svc:9000`
 with `allowInsecureHttp: true`, then exercises `CreateBackup`/
 `DescribeBackup` over the DynamoDB wire and checks `GET
 /admin/backup-store` reports `"kind":"s3"`. Written carefully and
@@ -1274,11 +1334,13 @@ end anywhere; the first real `e2e-kind-tls` CI run is this path's first
 real test.
 
 **`E2E_S3=1` (S-04 PR 3, CI's own `e2e-kind-s3` job) runs the same smoke
-plus a `spec.s3.backupStore` leg**: deploys a single-pod MinIO + Service
-into the kind cluster (the well-known `minio/minio` image), creates its
-bucket via a throwaway `minio/mc` pod, creates the `access_key_id`/
+plus a `spec.s3.backupStore` leg**: deploys a single-pod RustFS + Service
+into the kind cluster (`rustfs/rustfs`, an Apache-2.0 S3-compatible store
+— it replaced MinIO in #863, after `minio/minio` and `minio/mc` both
+stopped resolving on Docker Hub), creates its bucket via a throwaway
+`amazon/aws-cli` pod, creates the `access_key_id`/
 `secret_access_key` credentials `Secret`, applies the `AnimusCluster` with
-`spec.s3.backupStore` pointing at `http://minio.<ns>.svc:9000`
+`spec.s3.backupStore` pointing at `http://rustfs.<ns>.svc:9000`
 (`allowInsecureHttp: true` — a loopback-to-the-cluster dev target, never a
 real deployment shape), then exercises `CreateBackup`/`DescribeBackup`
 over the DynamoDB wire and checks `GET /admin/backup-store` reports
@@ -1291,7 +1353,7 @@ unchanged. Independent of `E2E_TLS` — either, both, or neither may be set.
 
 **`E2E_ENCRYPTION=1` (ADR 0069 S-03 PR 3, CI's own `e2e-kind-encryption`
 job) runs the same smoke plus a `spec.encryptionKeySecretName` leg**: no
-extra in-cluster dependency (unlike MinIO for `E2E_S3`) — creates the
+extra in-cluster dependency (unlike RustFS for `E2E_S3`) — creates the
 `Secret` (a freshly generated 64-hex-character key via `openssl rand
 -hex 32`, never logged anywhere in the script), sets `spec.
 encryptionKeySecretName` on the manifest, then — right after the ordinary

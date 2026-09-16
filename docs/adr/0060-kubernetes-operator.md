@@ -307,7 +307,7 @@ Spec (initial surface):
 | `image` | The `animusd` image to run. |
 | `nodes` | Total pod/replica count. |
 | `controlNodes` | Control-voter count (default `3`); **grow-only since S-07d** (a decrease is rejected; an increase is driven by the controller itself — see this ADR's own "Control-voter growth (S-07d, 2026-09-06)" section below). Pods `0..controlNodes-1` run role `Both` (ADR 0035); the rest run role `Data`. |
-| `storage.size`, `storage.storageClassName?`, `storage.ephemeral?` | Per-pod PVC sizing/class, or an ephemeral (no-PVC) mode for throwaway clusters. |
+| `storage.size`, `storage.storageClassName?`, `storage.ephemeral?` | Per-pod PVC sizing/class, or an ephemeral (no-PVC) mode for throwaway clusters. **`ephemeral: true` is a real Raft safety hazard for any voter pod, not just a durability trade-off** — a control voter's `emptyDir` wipe is exactly the scenario issue #667 (ADR 0009's 2026-09-15 amendment) closes for the control plane; the CP data plane has the identical hazard, unclosed (issue #900). See `crates/animus-operator/CLAUDE.md`'s matching note for the operational guidance until that closes. |
 | `resources?` | Pod resource requests/limits, passed through verbatim. |
 | `basePort` | Port-stride base (default `14000`, matching `animusd`'s own default). |
 | `clientService.type` | `ClusterIP` \| `LoadBalancer` \| `NodePort` — how the DynamoDB-only client Service is exposed. |

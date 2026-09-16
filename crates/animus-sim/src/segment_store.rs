@@ -64,6 +64,12 @@ struct Inner {
     /// [`SimSegmentStore::clear_unavailable`] or once virtual time reaches
     /// the deadline.
     unavailable_until: Option<Nanos>,
+    /// Issue #900 follow-up: a one-shot, deterministic (no RNG draw)
+    /// ack-lost fault pinned to the next `put` whose id ends with this
+    /// suffix — see
+    /// [`SimSegmentStore::force_next_put_ack_lost_for`]'s own doc for why
+    /// this exists alongside the probabilistic `fault` config above.
+    forced_put_ack_lost_suffix: Option<String>,
 }
 
 /// A deterministic, seeded, fault-injectable in-memory [`SegmentStore`]
@@ -91,6 +97,7 @@ impl SimSegmentStore {
                 objects: BTreeMap::new(),
                 fault: SegmentFaultConfig::default(),
                 unavailable_until: None,
+                forced_put_ack_lost_suffix: None,
             })),
         }
     }
@@ -99,6 +106,28 @@ impl SimSegmentStore {
     /// effect immediately for every clone sharing this store's state.
     pub fn set_fault_config(&self, cfg: SegmentFaultConfig) {
         self.lock().fault = cfg;
+    }
+
+    /// **Issue #900 follow-up.** Force the ack-lost fault, deterministically
+    /// (no RNG draw, so it never perturbs the seed's own entropy stream for
+    /// anything else), on the very next `put` whose id ends with `suffix` —
+    /// one-shot, cleared the moment it fires. For a test that needs to pin
+    /// a specific *named* object (e.g. an export job's own terminal
+    /// `manifest-summary.json`) to the ack-lost path regardless of how a
+    /// seed's own probabilistic draws land elsewhere, rather than relying
+    /// on [`SegmentFaultConfig::set_put_ack_lost_prob`]'s blanket
+    /// probability happening to hit the right object at the right moment —
+    /// exactly the assumption issue #900's own boot-path entropy shift
+    /// broke for `export_bucket_fault_on_terminal_write_resolves_to_
+    /// completed_pinned_seed` (the ack-lost fault landed on an interior
+    /// write, `manifest-files.json`, instead of the terminal one the test
+    /// means to pin). Composes with a nonzero `SegmentFaultConfig`
+    /// threshold if both are set — this fires first (deterministically),
+    /// and does not consume an RNG draw the probabilistic path would have,
+    /// so later probabilistic rolls in the same run are unaffected by
+    /// whether this ever matches anything.
+    pub fn force_next_put_ack_lost_for(&self, suffix: impl Into<String>) {
+        self.lock().forced_put_ack_lost_suffix = Some(suffix.into());
     }
 
     /// Make every op error "unavailable" until virtual time reaches
@@ -167,7 +196,22 @@ impl SegmentStore for SimSegmentStore {
             }
             return Ok(()); // identical content: safe no-op, no fault sampling
         }
-        let ack_lost = self.roll(self.lock().fault.put_ack_lost_threshold);
+        // Issue #900 follow-up: a forced, deterministic pin (if one is
+        // armed and matches) takes priority over — and draws no RNG that
+        // would perturb — the probabilistic roll below. One-shot: cleared
+        // the instant it matches, regardless of id, so a later `put` to
+        // the same suffix (a retry) is not forced again.
+        let forced = {
+            let mut guard = self.lock();
+            match &guard.forced_put_ack_lost_suffix {
+                Some(suffix) if id.ends_with(suffix.as_str()) => {
+                    guard.forced_put_ack_lost_suffix = None;
+                    true
+                }
+                _ => false,
+            }
+        };
+        let ack_lost = forced || self.roll(self.lock().fault.put_ack_lost_threshold);
         self.lock().objects.insert(id.to_string(), bytes.to_vec());
         if ack_lost {
             return Err(io::Error::other(

@@ -540,6 +540,41 @@ impl<E: Env, R: RelayClient> ControlHandle<E, R> {
         }
     }
 
+    /// Whether this handle's own `RaftCore` is still resolving the issue
+    /// #667 boot-time genesis-vs-wiped-restart check (`RaftCore::
+    /// begin_cluster_check`'s own doc has the full mechanism) — i.e. it
+    /// booted from an empty persisted store and is still waiting on peer
+    /// `ClusterProbe` evidence before it will vote or campaign. Always
+    /// `false` for `Remote`: a data-only node never holds a local
+    /// `RaftCore` at all, so the check is meaningless for it. Surfaced by
+    /// `/admin/raft` (ADR 0020) as the diagnostic issue #864 asks for — a
+    /// node that prints "ready" but never reports readiness can be told
+    /// apart, from the outside, between "genuinely no leader yet" and
+    /// "still gated on this specific boot-time check" instead of leaving an
+    /// operator to guess from silence.
+    #[must_use]
+    pub fn cluster_check_pending(&self) -> bool {
+        match self {
+            Self::Local(raft) => raft.cluster_check_pending(),
+            Self::Remote(_) => false,
+        }
+    }
+
+    /// Whether this handle's own `RaftCore` has permanently refused to act
+    /// as a voter (issue #667: its persisted state replayed empty and a
+    /// peer's `ClusterProbeResp` proved the cluster it is configured into
+    /// already exists — see `RaftCore::refused_as_voter`'s own doc). Sticky
+    /// for the underlying core's lifetime. Always `false` for `Remote`, the
+    /// identical "no local `RaftCore`" reasoning `cluster_check_pending`
+    /// above documents.
+    #[must_use]
+    pub fn refused_as_voter(&self) -> bool {
+        match self {
+            Self::Local(raft) => raft.refused_as_voter(),
+            Self::Remote(_) => false,
+        }
+    }
+
     /// The current leader's id, if this handle knows one. For `Remote`, the
     /// id half of the [leader hint](RemoteControlClient) — see that type's
     /// doc.

@@ -76,7 +76,26 @@ fn leader_index(nodes: &[RaftNode<SimEnv>]) -> Option<usize> {
 /// that ends up winning the resulting election — the exact race this test
 /// exists to pin. Plenty of seeds in that range reproduce it; this is just
 /// the first one found.
-const SEED: u64 = 0x0B38;
+///
+/// **Re-picked for issue #667 (2026-09-15)**: the original `0x0B38` no
+/// longer reproduces the race this test exists to pin, because issue
+/// #667's boot-time cluster-check gives every genesis `RaftNode` one extra
+/// spawned task and (for the resolving-peers case) a couple of extra wire
+/// messages before its first real election — a purely topological change
+/// with no extra `env.next_u64()` draws, but SimEnv's own deterministic
+/// tie-breaking between ready tasks is itself part of what a seed this
+/// finely tuned pins, so ANY such change can flip which of two equally
+/// legitimate election winners a specific seed lands on. This is not a
+/// regression in the issue #688 mechanism itself (`third_voter_wins_is_
+/// reproducible_from_seed` still holds for whatever seed is pinned here,
+/// and the underlying "read the stepped-down leader's own live belief,
+/// don't trust a bare step-down" contract is unchanged) — re-scanned via
+/// this same exhaustive-seed-search technique against the post-#667
+/// codebase and re-pinned to the first newly-found match. See
+/// `docs/lessons/` for the general "a seed this narrowly tuned is
+/// re-derived, not treated as broken, when unrelated scheduling changes"
+/// lesson.
+const SEED: u64 = 0x16CD;
 
 #[test]
 fn third_voter_wins_the_election_a_transfer_armed_a_different_target_for() {

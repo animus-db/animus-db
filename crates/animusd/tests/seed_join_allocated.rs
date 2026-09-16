@@ -3,13 +3,62 @@
 //! --base-port P`, both with no `--id` — this node self-mints its own id
 //! (`NodeId::mint`) and claims it via `MetaCommand::RegisterNode`'s
 //! registration CAS instead of an operator picking a small index or proposing
-//! an explicit `--id`. The sibling of `tests/seed_join.rs`/`tests/
-//! data_join.rs` (which cover the explicit-`--id` path, left completely
-//! untouched by this change); this file exercises only what's new: no-id
-//! discovery + self-minting, concurrent-registration safety, the data-only
-//! dual, the ephemeral-identity restart semantics, and the
-//! `is_relayable_command` regression for `RegisterNode` through a
-//! follower-connected seed.
+//! an explicit `--id`.
+//!
+//! **C-13 / ADR 0061 rung M PR 4 trimmed this file from five tests to two;
+//! PR 5 trims it further, to one.** Tests 1/3/5
+//! (`no_node_join_becomes_active_and_gets_a_replica`,
+//! `data_only_allocated_join_becomes_active_and_gets_a_replica`,
+//! `follower_connected_seed_completes_the_allocate_node_id_round_trip`) were
+//! **deleted by PR 4** — every assertion each one made had a `SimCluster`
+//! sibling in `crates/animusd/src/sim_cluster_seed_join.rs`:
+//! - Test 5 (a self-minted combined join via a deliberately follower-only
+//!   seed, asserting only the minted-id shape and real-detector promotion)
+//!   is a strict SUBSET of that module's own scenario (a),
+//!   `joiner_discovers_claims_and_is_promoted_by_the_real_detector` — (a)
+//!   already asserts both, plus the forwarding/balance-driven-replica/peer-
+//!   book properties test 5 never checked at all.
+//! - Test 3 (the data-only dual, over a 3-control/2-data split deployment)
+//!   is a strict SUBSET of that module's own scenario (c),
+//!   `data_only_joiner_over_a_split_deployment_gets_a_rebalanced_replica` —
+//!   the identical deployment shape, self-minted data-only join, real
+//!   replica landing, and bidirectional put/get, already covered there
+//!   (built one PR earlier, C-13 PR 3).
+//! - Test 1 (the happy path this file's own doc used to point to for
+//!   "becomes Active and gets a real tablet replica via rebalancing") is
+//!   what scenario (a)'s own PR-4 extension (three tables instead of one,
+//!   plus a trailing balance-driven-replica-and-peer-book poll) now proves
+//!   for the self-minted combined-join case specifically.
+//!
+//! **Test 2 (`two_concurrent_allocated_joins_get_distinct_ids`) is deleted
+//! by PR 5** — its own real subject (two joiners self-minting CONCURRENTLY
+//! against the same seed, proving the mint-retry-on-collision loop and that
+//! both end up `Active` with distinct ids) now has TWO `SimCluster` siblings
+//! in `sim_cluster_seed_join.rs`: scenario (e),
+//! `two_concurrent_self_minted_joiners_get_distinct_ids_and_both_go_active`
+//! (the direct conversion — `SimCluster::join_via_seed_concurrently` with
+//! `count = 2`, proving exactly what test 2 proved: distinct/minted ids and
+//! real-detector promotion for both, from a pinned seed plus a fixed 5-seed
+//! `_over_seeds` sibling — deterministic where test 2 could only ever hit
+//! the retry-on-collision branch by astronomically unlikely luck), and
+//! scenario (f), `forced_mint_collision_retries_and_the_colliding_member_
+//! is_untouched` (a NEW, stronger proof test 2 itself never attempted: a
+//! DETERMINISTIC forced collision on a self-mint's first attempt, asserting
+//! the retry loop actually retries into a fresh mint and that the colliding
+//! member's own row is left completely untouched by the rejected attempt —
+//! see that scenario's own doc for the exact mechanism).
+//!
+//! **Test 4
+//! (`ephemeral_identity_restart_gets_a_new_id_old_left_down_and_prunable`)
+//! is permanent** — untouched by PR 5, and stays real TCP/time: a fresh
+//! process on a fresh directory minting a genuinely NEW identity in place of
+//! one that silently vanished has no `SimCluster` analogue —
+//! `SimCluster::restart` always resumes the SAME node index/id with its
+//! retained engine (mirroring a real process restarting on the SAME
+//! directory), which is structurally the opposite of what this test needs
+//! to prove. See `docs/adr/0061-testability-node-crate-simulator.md`'s
+//! "Rung M (post-C-12)" opener amendment, §3, for the full reasoning (the
+//! same class of permanent gap `config_node_identity.rs` already carries).
 //!
 //! Real TCP/time — polls with generous timeouts, not deterministic
 //! assertions (a flaky `ProdEnv` test is a real bug, per the root
@@ -19,17 +68,12 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use animusd::{
-    ClientRequest, ClientResponse, ClusterConfig, Node, NodeStatus, RoleAddrs, StorageBackend,
-    read_frame,
-};
+use animusd::{ClusterConfig, Node, NodeStatus, RoleAddrs, StorageBackend};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
 mod support;
-
-const TABLES: [&str; 3] = ["allocjoin0", "allocjoin1", "allocjoin2"];
 
 /// Bring up the initial `n`-node combined-mode config core (port-TOCTOU
 /// mitigation) — see `support::bring_up_deadline`.
@@ -61,8 +105,7 @@ fn leader_index(nodes: &[Node]) -> usize {
 }
 
 /// Join a fresh **combined-mode, cluster-allocated-id** node against `seeds`
-/// (ADR 0036) — the allocated-id counterpart of `tests/seed_join.rs::
-/// join_fresh`, see `support::join_allocated_fresh_deadline`.
+/// (ADR 0036), see `support::join_allocated_fresh_deadline`.
 async fn join_allocated_fresh(
     seeds: &[SocketAddr],
     dir: &Path,
@@ -72,21 +115,8 @@ async fn join_allocated_fresh(
     support::join_allocated_fresh_deadline(seeds, dir, label, backend, support::JOIN_DEADLINE).await
 }
 
-/// Join a fresh **data-only, cluster-allocated-id** node against `seeds`
-/// (ADR 0036) — the data-only dual of [`join_allocated_fresh`], see
-/// `support::join_data_allocated_fresh_deadline`.
-async fn join_data_allocated_fresh(
-    seeds: &[SocketAddr],
-    dir: &Path,
-    label: &str,
-    backend: StorageBackend,
-) -> Node {
-    support::join_data_allocated_fresh_deadline(seeds, dir, label, backend, support::JOIN_DEADLINE)
-        .await
-}
-
 /// One HTTP/1.0 request to the admin endpoint; returns `(status, parsed
-/// JSON)` — mirrors `tests/seed_join.rs::admin` verbatim.
+/// JSON)`.
 async fn admin(
     addr: SocketAddr,
     method: &str,
@@ -145,97 +175,6 @@ fn member_status(nodes: &[Node], id: &animus_env::NodeId) -> Option<NodeStatus> 
         .find_map(|n| n.metadata().members.get(id).map(|m| m.status))
 }
 
-/// Whether `id` looks like a [`NodeId::mint`](animus_env::NodeId::mint)
-/// output — exactly 22 chars (128 bits of base64url, unpadded). There is no
-/// reserved prefix to check anymore (ADR 0040 retired the ADR 0036
-/// allocator's `"alloc-"` convention along with the allocator itself):
-/// uniqueness is now enforced structurally by the registration CAS, not by a
-/// namespace convention, so this is a sanity check on shape, not a
-/// disjointness proof.
-fn looks_minted(id: &animus_env::NodeId) -> bool {
-    id.as_str().chars().count() == 22
-}
-
-/// A table whose tablet currently lists `raftkv_id` as a replica, if any —
-/// mirrors `tests/seed_join.rs::table_with_replica`'s doc: rebalancing (ADR
-/// 0029) only ever proposes a move while it improves the *global* imbalance,
-/// so a through-only-the-joined-node check must target a table this actually
-/// returns, not an arbitrary one. Reads straight off `Node::metadata()`
-/// rather than admin JSON (`Metadata.tablets` already carries `table` +
-/// `replicas`).
-fn table_with_replica(nodes: &[Node], raftkv_id: &animus_env::NodeId) -> Option<String> {
-    nodes.iter().find_map(|n| {
-        n.metadata()
-            .tablets
-            .values()
-            .find(|t| t.replicas.contains(raftkv_id))
-            .and_then(|t| t.table.clone())
-    })
-}
-
-async fn call(addr: SocketAddr, req: ClientRequest) -> Option<ClientResponse> {
-    let mut stream = TcpStream::connect(addr).await.ok()?;
-    animusd::write_frame(&mut stream, &req).await.ok()?;
-    read_frame(&mut stream).await.ok()?
-}
-
-/// Try every client address in `clients` (round-robin) until one accepts the
-/// write.
-async fn put(clients: &[SocketAddr], table: &str, key: &[u8], value: &[u8], secs: u64) {
-    let mut last: Option<ClientResponse> = None;
-    let w = async {
-        loop {
-            for &c in clients {
-                let resp = call(
-                    c,
-                    ClientRequest::Put {
-                        key: key.to_vec(),
-                        value: value.to_vec(),
-                        table: table.to_string(),
-                    },
-                )
-                .await;
-                if let Some(ClientResponse::PutOk) = &resp {
-                    return;
-                }
-                last = resp;
-            }
-            sleep(Duration::from_millis(100)).await;
-        }
-    };
-    timeout(Duration::from_secs(secs), w)
-        .await
-        .unwrap_or_else(|_| {
-            panic!("write of {table}/{key:?} never committed; last reply: {last:?}")
-        });
-}
-
-async fn await_value(clients: &[SocketAddr], table: &str, key: &[u8], want: &[u8], secs: u64) {
-    let p = async {
-        loop {
-            for &c in clients {
-                if let Some(ClientResponse::Value(Some(v))) = call(
-                    c,
-                    ClientRequest::Get {
-                        key: key.to_vec(),
-                        table: table.to_string(),
-                        stale: false,
-                    },
-                )
-                .await
-                    && v == want
-                {
-                    return;
-                }
-            }
-            sleep(Duration::from_millis(150)).await;
-        }
-    };
-    timeout(Duration::from_secs(secs), p)
-        .await
-        .unwrap_or_else(|_| panic!("key {table}/{key:?} never read back as {want:?}"));
-}
-
 async fn await_active(nodes: &[Node], id: &animus_env::NodeId, secs: u64) {
     timeout(Duration::from_secs(secs), async {
         loop {
@@ -249,153 +188,6 @@ async fn await_active(nodes: &[Node], id: &animus_env::NodeId, secs: u64) {
     .unwrap_or_else(|_| panic!("node {id} never promoted to Active"));
 }
 
-async fn await_replica(nodes: &[Node], id: &animus_env::NodeId, secs: u64) -> String {
-    timeout(Duration::from_secs(secs), async {
-        loop {
-            if let Some(table) = table_with_replica(nodes, id) {
-                return table;
-            }
-            sleep(Duration::from_millis(300)).await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("node {id} never gained a tablet replica"))
-}
-
-/// Happy path (ADR 0036): `join --seed ... --base-port P` with no `--node`
-/// comes up, becomes `Active`, gets a real tablet replica via rebalancing,
-/// and serves reads/writes both through itself and through the core.
-#[tokio::test(flavor = "multi_thread", worker_threads = 10)]
-async fn no_node_join_becomes_active_and_gets_a_replica() {
-    let dir = support::panic_safe_tempdir();
-
-    let (core_nodes, core_config) = bring_up(3, dir.path()).await;
-    await_bootstrap(&core_nodes).await;
-    let core_clients: Vec<SocketAddr> = core_config.nodes.iter().map(|a| a.client).collect();
-    // ADR 0047: `--seed` now names the seed's intra address.
-    let core_intra: Vec<SocketAddr> = core_config.nodes.iter().map(|a| a.intra).collect();
-    for table in TABLES {
-        put(&core_clients, table, b"k0", b"v0", 30).await;
-    }
-
-    let (joined, _addrs, _node_dir) =
-        join_allocated_fresh(&core_intra, dir.path(), "happy", StorageBackend::default()).await;
-    let joined_id = own_raftkv_id(joined.admin_addr()).await;
-    assert!(
-        looks_minted(&joined_id),
-        "self-minted id {joined_id} must look like a NodeId::mint output, \
-         distinct from any --id-proposed id"
-    );
-
-    await_active(&core_nodes, &joined_id, 20).await;
-    let hosted_table = await_replica(&core_nodes, &joined_id, 90).await;
-
-    put(&[joined.client_addr()], &hosted_table, b"k1", b"v1", 30).await;
-    await_value(&core_clients, &hosted_table, b"k1", b"v1", 30).await;
-    put(&core_clients, &hosted_table, b"k2", b"v2", 30).await;
-    await_value(&[joined.client_addr()], &hosted_table, b"k2", b"v2", 30).await;
-
-    joined.shutdown_graceful().await;
-    for node in core_nodes {
-        node.shutdown_graceful().await;
-    }
-}
-
-/// Two nodes joining **concurrently** with no `--node` (ADR 0036) both
-/// succeed with **distinct** allocated ids — no `AlreadyExists` anywhere,
-/// unlike the `--node`-indexed path's best-effort collision guard. This is
-/// the direct proof that ADR 0032's own documented residual race is closed
-/// by construction for the allocated path.
-#[tokio::test(flavor = "multi_thread", worker_threads = 10)]
-async fn two_concurrent_allocated_joins_get_distinct_ids() {
-    let dir = support::panic_safe_tempdir();
-
-    let (core_nodes, core_config) = bring_up(3, dir.path()).await;
-    await_bootstrap(&core_nodes).await;
-    // ADR 0047: `--seed` now names the seed's intra address.
-    let core_clients: Vec<SocketAddr> = core_config.nodes.iter().map(|a| a.intra).collect();
-
-    // Both joins race through `join_allocated_fresh`'s port-TOCTOU retry loop
-    // concurrently — a genuine race, not a sequential simulation of one.
-    let (a, b) = tokio::join!(
-        join_allocated_fresh(
-            &core_clients,
-            dir.path(),
-            "racer-a",
-            StorageBackend::default()
-        ),
-        join_allocated_fresh(
-            &core_clients,
-            dir.path(),
-            "racer-b",
-            StorageBackend::default()
-        ),
-    );
-    let (node_a, _addrs_a, _dir_a) = a;
-    let (node_b, _addrs_b, _dir_b) = b;
-
-    let id_a = own_raftkv_id(node_a.admin_addr()).await;
-    let id_b = own_raftkv_id(node_b.admin_addr()).await;
-    assert_ne!(
-        id_a, id_b,
-        "two concurrent join attempts must never be allocated the same id"
-    );
-    assert!(looks_minted(&id_a) && looks_minted(&id_b));
-
-    await_active(&core_nodes, &id_a, 20).await;
-    await_active(&core_nodes, &id_b, 20).await;
-
-    node_a.shutdown_graceful().await;
-    node_b.shutdown_graceful().await;
-    for node in core_nodes {
-        node.shutdown_graceful().await;
-    }
-}
-
-/// The data-only dual (ADR 0036): `data --seed ... --base-port P` with no
-/// `--node` against a genuine split deployment — the control plane mints
-/// the raftkv id, this node has no local control role at all, and it still
-/// becomes `Active` and gains a real replica.
-#[tokio::test(flavor = "multi_thread", worker_threads = 10)]
-async fn data_only_allocated_join_becomes_active_and_gets_a_replica() {
-    let dir = support::panic_safe_tempdir();
-
-    let (control_nodes, data_nodes, _config) = support::bring_up_split(3, 2, dir.path()).await;
-    support::await_leader(&control_nodes).await;
-    let existing_data_raftkv_ids: Vec<animus_env::NodeId> =
-        (3..5).map(animusd::config::node_id).collect();
-    support::await_data_nodes_active(&control_nodes, &existing_data_raftkv_ids).await;
-
-    let data_clients: Vec<SocketAddr> = data_nodes.iter().map(Node::client_addr).collect();
-    for table in TABLES {
-        put(&data_clients, table, b"k0", b"v0", 30).await;
-    }
-
-    // ADR 0047: `--seed` now names the seed's intra address.
-    let mut seeds: Vec<SocketAddr> = control_nodes.iter().map(Node::intra_addr).collect();
-    seeds.extend(data_nodes.iter().map(Node::intra_addr));
-    let joined =
-        join_data_allocated_fresh(&seeds, dir.path(), "data", StorageBackend::Memory).await;
-    let joined_id = own_raftkv_id(joined.admin_addr()).await;
-    assert!(looks_minted(&joined_id));
-
-    await_active(&control_nodes, &joined_id, 20).await;
-    let hosted_table = await_replica(&control_nodes, &joined_id, 90).await;
-
-    put(&[joined.client_addr()], &hosted_table, b"k1", b"v1", 30).await;
-    await_value(&data_clients, &hosted_table, b"k1", b"v1", 30).await;
-    put(&data_clients, &hosted_table, b"k2", b"v2", 30).await;
-    await_value(&[joined.client_addr()], &hosted_table, b"k2", b"v2", 30).await;
-
-    for node in control_nodes
-        .iter()
-        .chain(data_nodes.iter())
-        .chain(std::iter::once(&joined))
-    {
-        node.shutdown_graceful().await;
-    }
-}
-
 /// **Ephemeral-identity regression** (ADR 0036): a no-`--node` joined node
 /// that goes away and comes back with a fresh nonce (a fresh process/dir,
 /// modeled here by calling `join_allocated_fresh` again from scratch) gets a
@@ -403,6 +195,8 @@ async fn data_only_allocated_join_becomes_active_and_gets_a_replica() {
 /// address-less, forever, exactly as documented, and is prunable via the
 /// existing `POST /admin/member/remove` like any other drained, unreferenced
 /// member.
+///
+/// **C-13 PR 4**: kept real-socket, permanently — see this file's own doc.
 #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
 async fn ephemeral_identity_restart_gets_a_new_id_old_left_down_and_prunable() {
     let dir = support::panic_safe_tempdir();
@@ -512,44 +306,6 @@ async fn ephemeral_identity_restart_gets_a_new_id_old_left_down_and_prunable() {
     .unwrap_or_else(|_| panic!("old allocated id {old_id} was never pruned after removal"));
 
     second.shutdown_graceful().await;
-    for node in core_nodes {
-        node.shutdown_graceful().await;
-    }
-}
-
-/// **Follower-connected seed** (the `is_relayable_command` regression for
-/// `MetaCommand::RegisterNode`, ADR 0040): a joiner whose *only* seed is a
-/// non-leader control node still completes the whole mint-and-confirm
-/// round trip — proving `RegisterNode` is actually in the relay allowlist
-/// (a missed entry would hang this join until `JOIN_DISCOVERY_BUDGET`
-/// expires, indistinguishable from "no seed answered").
-#[tokio::test(flavor = "multi_thread", worker_threads = 10)]
-async fn follower_connected_seed_completes_the_allocate_node_id_round_trip() {
-    let dir = support::panic_safe_tempdir();
-
-    let (core_nodes, core_config) = bring_up(3, dir.path()).await;
-    await_bootstrap(&core_nodes).await;
-    let follower = (0..core_nodes.len())
-        .find(|&i| i != leader_index(&core_nodes))
-        .expect("a follower exists in a 3-node core");
-    // ADR 0047: `--seed` now names the seed's intra address.
-    let follower_intra = core_config.nodes[follower].intra;
-
-    // Contact ONLY the follower's intra address — no leader address
-    // anywhere in the seed list.
-    let (joined, _addrs, _node_dir) = join_allocated_fresh(
-        &[follower_intra],
-        dir.path(),
-        "follower-seed",
-        StorageBackend::default(),
-    )
-    .await;
-    let joined_id = own_raftkv_id(joined.admin_addr()).await;
-    assert!(looks_minted(&joined_id));
-
-    await_active(&core_nodes, &joined_id, 20).await;
-
-    joined.shutdown_graceful().await;
     for node in core_nodes {
         node.shutdown_graceful().await;
     }

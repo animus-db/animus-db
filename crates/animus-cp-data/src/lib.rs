@@ -817,25 +817,31 @@ pub enum KvCommand {
         /// **Change-log records** to append in the same entry, each a
         /// `(key prefix, encoded record)` pair (empty = none).
         ///
-        /// Each key is completed at **apply** as `prefix || hlc::pack(ts)`, using
-        /// this entry's own commit timestamp, and it lands in the
-        /// [`KIND_CHANGE`] scope. The proposer deliberately cannot supply that
-        /// suffix: `ts` is minted inside `propose_ordered` and is the only
-        /// timestamp that agrees with the entry's commit order, so letting an
-        /// edge guess it would silently break the ordering the log exists to
-        /// provide (ADR 0041 §4a — DynamoDB Streams reads these in commit
-        /// order). Making it structural also means the record can never be
-        /// keyed inconsistently across replicas. **A `Vec`, not an `Option`,
-        /// since ADR 0049's Train A rung-1 fixup**: a marker-table
+        /// Each key is completed at **apply** as `prefix || hlc::pack(ts) ||
+        /// ordinal` (issue #852), using this entry's own commit timestamp,
+        /// and it lands in the [`KIND_CHANGE`] scope. The proposer
+        /// deliberately cannot supply the `ts` half of that suffix: `ts` is
+        /// minted inside `propose_ordered` and is the only timestamp that
+        /// agrees with the entry's commit order, so letting an edge guess it
+        /// would silently break the ordering the log exists to provide (ADR
+        /// 0041 §4a — DynamoDB Streams reads these in commit order). Making
+        /// it structural also means the record can never be keyed
+        /// inconsistently across replicas. **A `Vec`, not an `Option`, since
+        /// ADR 0049's Train A rung-1 fixup**: a marker-table
         /// `BatchWriteItem` commits one entry per tablet carrying every
         /// item's base row *and* every item's marker record — the
         /// entry-granularity throughput contract the plain `Batch` path had
         /// (one entry per tablet, one WAL record, one apply), which per-item
         /// `KindBatch` proposals were measured to break (the
         /// `backfill_seeder` populate-then-backfill regression). Records in
-        /// one entry share the entry's `ts`; their prefixes differ per item
-        /// (`token || escape(pk)`), so the completed keys stay distinct for
-        /// distinct items.
+        /// one entry share the entry's `ts`, and their per-item prefixes
+        /// (`token || escape(pk)`) are **not** guaranteed distinct either —
+        /// two items sharing a partition key (differing only by sort key)
+        /// share the identical prefix too, a collision issue #852 also
+        /// found and fixed by the same mechanism: `ordinal`
+        /// (`materialize_derived`'s own zero-based index into this list) is
+        /// what keeps every completed key unique, regardless of whether the
+        /// tie is only in `ts` or in the whole prefix as well.
         change_log: Vec<(Vec<u8>, Vec<u8>)>,
         ts: HlcTimestamp,
     },
@@ -1402,6 +1408,53 @@ const COMPACT_THRESHOLD: u64 = 64;
 /// never completes (dead, partitioned, or hopelessly outpaced): compaction
 /// always proceeds once `behind` reaches this, transfer or not.
 const COMPACT_DEFER_CEILING: u64 = COMPACT_THRESHOLD * 8;
+
+/// Issue #898 follow-up (`animus-control`'s own `SNAPSHOT_COMPACT_DEFER_
+/// IDLE_CEILING` — see that constant's own doc for the full incident,
+/// rationale, and the two rejected earlier designs, mirrored here exactly):
+/// an **idle-progress-gated** companion to [`COMPACT_DEFER_CEILING`]'s
+/// `behind`-sized one, tracked entirely in this driver loop
+/// (`apply_and_compact`'s own `compact_defer_since`/`compact_defer_progress`
+/// locals, owned by `apply_loop` across iterations) rather than in
+/// `RaftCore` — a pure, `now`-unaware core cannot itself distinguish "a
+/// peer's transfer is genuinely progressing, just slowly" from "this peer
+/// will never ack again."
+///
+/// **Found regression-testing issue #898's own `animus-control` fix**: that
+/// fix widened the shared `RaftCore::snapshot_transfer_in_flight()` (issue
+/// #898, "true the moment a chunk has been SENT, not only once it has been
+/// ACKED") to close a real gap for a slow-but-live peer — but the identical
+/// accessor is read by *this* plane's own gate too, and a chunk SENT to a
+/// peer that is down, partitioned, or crashed (never acking, ever) now holds
+/// this accessor `true` forever, wedging this replica's own local compaction
+/// indefinitely once `behind` stops growing — exactly `COMPACT_DEFER_
+/// CEILING`'s own escape hatch requires *more writes* to ever cross, and a
+/// crashed peer's phantom in-flight chunk never lets that happen on its own.
+/// `crates/animus-cp-data/tests/hlc_differential_skew.rs::receiver_installs_
+/// the_durable_high_water_mark_not_just_the_rows` caught this: a crashed,
+/// partitioned replica's own never-to-be-acked `InstallSnapshot` chunk
+/// (queued the moment the leader's first compaction made it eligible) froze
+/// the leader's OWN subsequent compaction of a failed-CAS burst — the exact
+/// non-row-writing-entry watermark advance that test exists to prove.
+///
+/// **Bounds idle time since the LAST observed forward progress, not total
+/// elapsed time since the defer streak began** — a flat "time since streak
+/// start" ceiling (the first shape tried here) conflates "has this transfer
+/// been running a while" (irrelevant; a large multi-chunk snapshot
+/// legitimately takes many round trips) with "has it made ANY progress
+/// recently" (the actual question), and this same test's own crashed-peer
+/// scenario needs an answer within a few virtual seconds — far tighter than
+/// any margin safe for a genuinely slow-but-live transfer's TOTAL duration.
+/// `compact_defer_progress` tracks the sum of `RaftCore::
+/// snapshot_chunk_advances` (a genuine forward-progress counter — the exact
+/// metric `snapshot_resend_bound.rs` already uses for the identical reason)
+/// across every peer `RaftCore::snapshot_transfer_peers` names;
+/// `compact_defer_since` resets to `now` every time that sum changes.
+/// `2s`, matching `animus-control`'s own value exactly — comfortably above
+/// any single real chunk round trip either crate's own tests or `ProdEnv`
+/// contention have exhibited, comfortably below this test's own
+/// few-virtual-second budget.
+const COMPACT_DEFER_IDLE_CEILING: Duration = Duration::from_secs(2);
 
 /// [`RaftKvNode::reconfigure_step`]'s promotion-readiness threshold (ADR 0058
 /// Train 1's reconciler adoption): a learner within this many log entries of
@@ -6486,6 +6539,29 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         self.lock().term()
     }
 
+    /// Whether this replica is still resolving the issue #900/#667
+    /// boot-time cluster check — while `true` it never grants a real vote
+    /// and never campaigns (mirrors `animus_control::node::
+    /// GenericControlHandle::cluster_check_pending`, added for the
+    /// control-plane's own issue #864 diagnostic; see `RaftCore::
+    /// begin_cluster_check`'s doc for the full mechanism, inherited
+    /// unchanged by this crate's `KvCore`).
+    #[must_use]
+    pub fn cluster_check_pending(&self) -> bool {
+        self.lock().cluster_check_pending()
+    }
+
+    /// Whether this replica's boot-time cluster check resolved that it is a
+    /// genuinely wiped, previously-established voter of this tablet's Raft
+    /// group — permanently refused as a voter (never votes/campaigns again)
+    /// until re-admitted through the learner/rejoin path (ADR 0032/0058).
+    /// See `RaftCore::handle_cluster_probe_resp`'s doc for the full
+    /// decision table.
+    #[must_use]
+    pub fn refused_as_voter(&self) -> bool {
+        self.lock().refused_as_voter()
+    }
+
     /// Highest committed log index.
     pub fn commit_index(&self) -> u64 {
         self.lock().commit_index()
@@ -6733,8 +6809,9 @@ fn assert_ts_monotonic(max_applied_ts: &mut Option<HlcTimestamp>, ts: HlcTimesta
 /// `KvCommand::TxnResolve`'s commit branch both call this and only this,
 /// so their output is byte-identical for identical payloads. Queues every
 /// `(kind, key, value)` write (`None` = tombstone) into `pending` at
-/// `hlc::pack(ts)`, then — if `change_log` is present — completes its key as
-/// `prefix || hlc::pack(ts)` and queues it too, in [`KIND_CHANGE`]'s scope.
+/// `hlc::pack(ts)`, then — if `change_log` is present — completes each
+/// record's key as `prefix || hlc::pack(ts) || ordinal` (issue #852) and
+/// queues it too, in [`KIND_CHANGE`]'s scope.
 /// `ts` is always the caller's OWN entry's commit timestamp: `KindBatch`
 /// passes its own entry's `ts`; `TxnResolve` passes the *resolve* entry's
 /// `ts` (never the transaction's `commit_ts`, and never the stage's `ts` —
@@ -6743,13 +6820,48 @@ fn assert_ts_monotonic(max_applied_ts: &mut Option<HlcTimestamp>, ts: HlcTimesta
 /// position in this tablet's own commit order). An unknown row kind is
 /// skipped with a warning, never guessed at — the same discipline
 /// `KindBatch`'s own arm already had before this extraction.
+///
+/// **`ordinal` (issue #852 fix).** `ts` alone is not a unique key for a
+/// change-log record: every record sharing one commit shares the identical
+/// `ts` — either because ONE call's own `change_log` slice carries several
+/// (a marker-table `KindBatch`), or because `KvCommand::TxnResolve`'s
+/// commit branch calls this function ONCE PER RESOLVED KEY in a loop, all
+/// at the SAME resolve entry's `ts` (a multi-key `TransactWriteItems`
+/// commit — this is issue #852's actual concrete trigger, and the reason
+/// `starting_ordinal`/the return value exist at all: a single call's own
+/// internal `change_log.iter().enumerate()` alone cannot see across
+/// separate calls in that loop). A `GetRecords`/`GetShardIterator` page
+/// boundary landing inside such a tie used to be indistinguishable from
+/// "already delivered," permanently dropping every record still on the far
+/// side of it.
+///
+/// The fix widens the record's own key/cursor to `(packed_hlc, ordinal)`:
+/// `ordinal` starts at the caller-supplied `starting_ordinal` and increments
+/// once per record actually completed by `change_log` — deterministic and
+/// coordination-free, since every replica applies the identical writes in
+/// the identical order for the identical entry. It is appended to the
+/// completed key immediately after the packed HLC (`prefix || hlc::pack(ts)
+/// || ordinal`, big-endian, 4 bytes) — the physical key stays the one true
+/// source of a record's own position, so a sealed-segment read and a
+/// hot-tail scan agree by construction. Returns the ordinal the NEXT call
+/// in the same logical entry should start from (`starting_ordinal +
+/// change_log.len()`) — every caller that materializes more than one
+/// record for the SAME `ts` across more than one call (`TxnResolve`'s own
+/// loop) must thread this return value back in as the next call's
+/// `starting_ordinal`; a caller that materializes its whole `change_log` in
+/// one call (`KindBatch`'s own arm, the stage-marker batch) always passes
+/// `0` and may discard the return value. See `animus_cp_data::segment`'s
+/// own module doc for the full design and `animusd::index_drain`/
+/// `animusd::dynamo_streams` for the reader side.
+#[must_use]
 fn materialize_derived(
     kind_scopes: &[StorageScope; ALL_KINDS.len()],
     writes: &[KindWrite],
     change_log: &[(Vec<u8>, Vec<u8>)],
     ts: HlcTimestamp,
     pending: &mut Vec<MergeOp>,
-) {
+    starting_ordinal: u32,
+) -> u32 {
     for (kind, key, value) in writes {
         let Some(kscope) = kind_scopes.get(*kind as usize) else {
             tracing::warn!(
@@ -6770,18 +6882,35 @@ fn materialize_derived(
     }
     // Each change-log record's key is completed here, with THIS caller's
     // commit timestamp — the only one that agrees with this entry's
-    // position in the log (ADR 0041 §4a / ADR 0046 principle 1). Several
-    // records in one entry (a marker-table batch) share the ts; their
-    // per-item prefixes keep the completed keys distinct.
-    for (prefix, record) in change_log {
+    // position in the log (ADR 0041 §4a / ADR 0046 principle 1) — plus this
+    // record's own `ordinal`, counting up from `starting_ordinal` (issue
+    // #852): several records sharing this `ts` (a multi-key
+    // `TransactWriteItems` resolve, spread across several calls to this
+    // function, or a marker-table batch's own single call) also have
+    // per-item prefixes that are NOT guaranteed distinct — two items
+    // sharing a partition key differ only by sort key, which the
+    // change-log prefix does not carry — so `ordinal` is what keeps every
+    // completed key unique regardless, closing that collision too.
+    for (i, (prefix, record)) in change_log.iter().enumerate() {
+        let ordinal = starting_ordinal
+            .checked_add(u32::try_from(i).expect(
+                "materialize_derived: a single call's change_log carries far fewer than 2^32 records",
+            ))
+            .expect("materialize_derived: ordinal overflow — an entry minted far more than 2^32 change records");
         let mut key = prefix.clone();
         key.extend_from_slice(&hlc::pack(ts).to_be_bytes());
+        key.extend_from_slice(&ordinal.to_be_bytes());
         pending.push(MergeOp::put(
             kind_scopes[KIND_CHANGE as usize].physical(&key),
             txn::encode_committed(record),
             hlc::pack(ts),
         ));
     }
+    starting_ordinal
+        .checked_add(u32::try_from(change_log.len()).expect(
+            "materialize_derived: a single call's change_log carries far fewer than 2^32 records",
+        ))
+        .expect("materialize_derived: ordinal overflow — an entry minted far more than 2^32 change records")
 }
 
 /// The logical `KIND_BASE` key of one item, given its identity alone —
@@ -7118,6 +7247,16 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     // group's private file. See `persist_wal`'s doc for the sibling append
     // half.
     shared: Option<&SharedWal<KvCommand, KvState>>,
+    // Issue #898 follow-up: owned by `apply_loop` across iterations — see
+    // `COMPACT_DEFER_IDLE_CEILING`'s own doc for why this lives at the
+    // driver layer rather than in `RaftCore` (a `now`-unaware pure core
+    // cannot track elapsed time itself). `compact_defer_since` resets to
+    // `now` every time `compact_defer_progress` (the last-observed sum of
+    // `RaftCore::snapshot_chunk_advances` across every outstanding peer)
+    // changes, so together they measure idle time since the last genuine
+    // forward progress, never total transfer duration.
+    compact_defer_since: &mut Option<Nanos>,
+    compact_defer_progress: &mut Option<u64>,
 ) -> bool {
     let mut did_work = false;
 
@@ -7409,7 +7548,11 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     // materialization helper, also used by `TxnResolve`'s
                     // commit branch below — never a second copy of this
                     // loop.
-                    materialize_derived(kind_scopes, &writes, &change_log, ts, &mut pending);
+                    // Single call, whole `change_log` at once — always
+                    // starts at ordinal 0; nothing else materializes at
+                    // this same `ts` in this entry.
+                    let _ =
+                        materialize_derived(kind_scopes, &writes, &change_log, ts, &mut pending, 0);
                 }
             }
             KvCommand::KindEval {
@@ -7496,13 +7639,16 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                                     // verbatim: the ONE shared
                                     // materialization helper `KindBatch`'s
                                     // own arm above and `TxnResolve`'s
-                                    // commit branch below also call.
-                                    materialize_derived(
+                                    // commit branch below also call. Single
+                                    // call, one key evaluated here — always
+                                    // starts at ordinal 0.
+                                    let _ = materialize_derived(
                                         kind_scopes,
                                         &writes,
                                         std::slice::from_ref(&change_log),
                                         ts,
                                         &mut pending,
+                                        0,
                                     );
                                     // Leader-local result payload (ADR 0054
                                     // mechanism 3) — a no-op unless this
@@ -8126,7 +8272,17 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                         .filter_map(|w| w.stage_marker.clone())
                         .collect();
                     if !stage_markers.is_empty() {
-                        materialize_derived(kind_scopes, &[], &stage_markers, ts, &mut pending);
+                        // Single call, the WHOLE stage-marker list at once
+                        // (built above from every write in this stage) —
+                        // always starts at ordinal 0.
+                        let _ = materialize_derived(
+                            kind_scopes,
+                            &[],
+                            &stage_markers,
+                            ts,
+                            &mut pending,
+                            0,
+                        );
                     }
                     if is_anchor {
                         let record = txn::TxnRecord {
@@ -8630,6 +8786,19 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                         txn::ResolveOutcome::Resolved
                     };
                     let version = hlc::pack(ts);
+                    // Issue #852: this loop calls `materialize_derived`
+                    // ONCE PER RESOLVED KEY, all at the identical `ts` — a
+                    // multi-key `TransactWriteItems` commit's actual
+                    // concrete trigger. `materialize_derived`'s own
+                    // internal enumeration only sees ONE call's own
+                    // `change_log` slice (0 or 1 elements here — `TxnWrite`
+                    // carries at most its own record), so it cannot by
+                    // itself disambiguate across separate calls; this
+                    // counter threads the running ordinal across the whole
+                    // loop instead, so keys resolved 2nd/3rd/... in one
+                    // entry get distinct ordinals rather than every call
+                    // independently starting over at 0.
+                    let mut next_ordinal: u32 = 0;
                     for (key, resolved_intent) in keys.iter().zip(resolved) {
                         if outcome_mismatch || !all_in_fence {
                             continue; // whole-or-nothing: skip every key, not just this one
@@ -8714,8 +8883,14 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                                 // tablet's own log, which only the entry
                                 // that actually fixes commit order can
                                 // provide). Discarded entirely on abort —
-                                // see the `None` arm below.
-                                materialize_derived(
+                                // see the `None` arm below. `next_ordinal`
+                                // (issue #852) threads the running ordinal
+                                // across every key this loop resolves, so a
+                                // multi-key commit's records land at
+                                // distinct `(ts, ordinal)` pairs rather than
+                                // every one colliding on ordinal 0 — see
+                                // this loop's own doc, above.
+                                next_ordinal = materialize_derived(
                                     kind_scopes,
                                     &kind_writes,
                                     // A `TxnWrite` carries at most one record
@@ -8724,6 +8899,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                                     change_log.as_slice(),
                                     ts,
                                     &mut pending,
+                                    next_ordinal,
                                 );
                             }
                             None => {
@@ -8874,12 +9050,19 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     // transfer is in flight. A `KvState` WAL snapshot record carries only the unit
     // placeholder, so the threshold rewrite never needed the image bytes.
     let ea = engine_applied.load(Ordering::SeqCst);
-    let (behind, image_needed, transfer_in_flight) = {
+    let now = env.now();
+    let (behind, image_needed, transfer_in_flight, transfer_progress) = {
         let mut c = core.lock().expect("raftkv core poisoned");
+        let transfer_progress: u64 = c
+            .snapshot_transfer_peers()
+            .iter()
+            .map(|p| c.snapshot_chunk_advances(p))
+            .sum();
         (
             ea.saturating_sub(c.snapshot_index()),
             c.take_snapshot_needed(),
             c.snapshot_transfer_in_flight(),
+            transfer_progress,
         )
     };
     // Issues #532/#537: a THRESHOLD-triggered base advance (never an
@@ -8887,11 +9070,44 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     // must always proceed) is deferred while some peer's chunked transfer is
     // genuinely in flight, unless `behind` has grown enough that the WAL
     // itself needs bounding regardless (`COMPACT_DEFER_CEILING`, that
-    // constant's own doc has the full reasoning). Below the ceiling this
+    // constant's own doc has the full reasoning), OR the defer has now sat
+    // IDLE (no forward progress at all) for `COMPACT_DEFER_IDLE_CEILING`
+    // (issue #898 follow-up — see that constant's own doc: a peer that
+    // never acks at all — down, partitioned, or crashed — never grows
+    // `behind` past its own ceiling once writes stop, so this replica's own
+    // compaction would otherwise wedge forever). Below both ceilings this
     // gives a real in-flight transfer a window to land before the next
     // threshold crossing would otherwise yank it back to chunk 0 forever.
-    let threshold_hit =
-        behind >= COMPACT_THRESHOLD && (!transfer_in_flight || behind >= COMPACT_DEFER_CEILING);
+    let would_defer = behind >= COMPACT_THRESHOLD && transfer_in_flight;
+    // Real forward progress (the tracked sum changed since the last pass)
+    // restarts the idle clock — this bounds idle time since the LAST
+    // advance, never total transfer duration. `None` (first observation of
+    // this streak) also counts as "just restarted."
+    let progressed = compact_defer_progress.is_some_and(|prev| prev != transfer_progress);
+    let idle_since = if progressed {
+        None
+    } else {
+        *compact_defer_since
+    };
+    let idle_ceiling_hit = would_defer
+        && idle_since.is_some_and(|since| {
+            now.0.saturating_sub(since.0) >= COMPACT_DEFER_IDLE_CEILING.as_nanos() as u64
+        });
+    let threshold_hit = behind >= COMPACT_THRESHOLD
+        && (!transfer_in_flight || behind >= COMPACT_DEFER_CEILING || idle_ceiling_hit);
+    // Bookkeeping for the NEXT pass: still genuinely deferring (would defer,
+    // and didn't just get overridden by either ceiling) keeps the idle
+    // clock running (restarting it on real progress); anything else —
+    // compaction proceeded, or there is nothing to defer at all — clears
+    // both, so a fresh defer streak always starts its own clock rather than
+    // inheriting a stale one from an unrelated, long-since-resolved episode.
+    if would_defer && !threshold_hit {
+        *compact_defer_since = Some(idle_since.unwrap_or(now));
+        *compact_defer_progress = Some(transfer_progress);
+    } else {
+        *compact_defer_since = None;
+        *compact_defer_progress = None;
+    }
     // Issue #811: a just-completed `InstallSnapshot` (`just_installed_
     // snapshot`, above) must force a WAL rewrite in THIS pass, same as
     // `threshold_hit`/`image_needed` — never deferred by the in-flight-
@@ -8976,6 +9192,19 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
         } else {
             None
         };
+        // Issue #811: `did_work` must mean "state provably changed," never
+        // "a branch that usually changes state was entered." Being
+        // ELIGIBLE to attempt compaction (`threshold_hit`/`image_needed`)
+        // is not itself progress — `snapshot_upto` below can legitimately
+        // no-op (bounded by `last_applied`, which a restart can leave
+        // stuck below `ea` — see this function's own restart-disagreement
+        // note a few lines down), so the outcome is judged by what
+        // actually happened: a freshly-built on-demand image was installed
+        // (`image_needed` was true — a peer is genuinely waiting on it,
+        // and `image_needed` is a take-once flag so this can't itself
+        // spin), and/or a real WAL-rewriting compaction completed
+        // (`bytes.is_some()`, checked below).
+        let image_installed = image.is_some();
         // Serialize the WAL rewrite against the consensus loop's appends.
         let _wal = wal_lock.lock().await;
         let (bytes, lli) = {
@@ -8984,6 +9213,25 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
             // any stale image + in-flight transfer offsets), THEN install the
             // fresh image built from that same state — order matters, or the
             // base-move would drop the image we just built.
+            //
+            // Issue #811: `snapshot_upto` clamps its target to `c.last_applied()`
+            // (its own doc), which a restart can leave BELOW `ea` for a while.
+            // `engine_applied` is seeded at driver startup from the engine's own
+            // durable applied-watermark marker (written eagerly by
+            // `install_engine_image` in the SAME `merge_batch` as an installed
+            // snapshot's rows), but a completed `InstallSnapshot`'s matching
+            // `RaftCore::snapshot_index`/`last_applied` advance is only ever
+            // WAL-rewritten by a LATER pass of this same compaction block — one
+            // this exact restart-then-isolated scenario can never reach before
+            // the process stops, since `behind == 0` right after the install
+            // suppresses `threshold_hit` at the time. A restart recovering from
+            // that still-stale WAL comes back with `last_applied` pinned at the
+            // OLD, pre-install value until a leader re-drives commit past it, so
+            // `snapshot_upto(ea)` legitimately no-ops here (`new_index <=
+            // snapshot_index`) call after call — `behind` alone
+            // (`ea.saturating_sub(c.snapshot_index())`) can never shrink on its
+            // own without that Raft-level trigger, which `did_work`'s own
+            // truthfulness (not any change here) is what stops from spinning.
             c.snapshot_upto(ea);
             if let Some(image) = image {
                 c.set_snapshot_blob(image);
@@ -9028,6 +9276,10 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 (Some((records, round, c.snapshot_index())), lli)
             }
         };
+        // Captured before `bytes` is moved into the `if let` below — the
+        // other half of this attempt's own "did anything provably happen"
+        // verdict (see `image_installed`'s doc above).
+        let bytes_produced = bytes.is_some();
         if let Some((records, round, new_snapshot_index)) = bytes {
             // Issue #554: the durable applied-watermark marker is written
             // ONLY here (compaction/on-demand-image time), never on every
@@ -9141,7 +9393,12 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 }
             }
         }
-        did_work = true;
+        // Issue #811: NOT unconditional. Merely being eligible to attempt
+        // compaction (`threshold_hit`/`image_needed`, the outer `if` this
+        // whole block is gated on) is not itself progress — see
+        // `image_installed`'s doc above for the exact restart shape that
+        // used to make this spin forever with no eligibility ever expiring.
+        did_work |= image_installed || bytes_produced;
     }
 
     did_work
@@ -9598,6 +9855,68 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         let recovered =
             RaftCore::recovered(env.node_id(), &all_nodes, state, env.now(), env.next_u64());
         *core.lock().expect("raftkv core poisoned") = recovered;
+    } else if !campaign_immediately {
+        // Issue #900 (P0 Raft safety, mirrors issue #667's control-plane
+        // fix — `animus-control::node::drive`'s own identical branch, ADR
+        // 0009's 2026-09-15 amendment): an empty per-tablet WAL is exactly
+        // as ambiguous as the control plane's own empty WAL — it reads
+        // identically for "this tablet group is a genuine first formation"
+        // (`CreateTablet`, an in-place split child, a reconciler-hosted new
+        // replica) and "this voter was already an established member of
+        // this tablet's Raft group and its disk was wiped (ephemeral
+        // storage)". `RaftKvNode` reuses `animus-control`'s generic, sync
+        // `RaftCore<C, S>` unchanged (ADR 0016/0017), so the disambiguation
+        // mechanism itself — `begin_cluster_check`/`handle_cluster_probe`/
+        // `handle_cluster_probe_resp`, the `ClusterProbe`/`ClusterProbeResp`
+        // wire messages, and the vote/campaign gating — is inherited for
+        // free (it lives on the generic core, not on `MetaCommand`
+        // specifically, and this crate's own `codec.rs` already encodes/
+        // decodes both variants — see that module's own issue #667 comment).
+        // The ONLY thing missing was this driver ever calling
+        // `begin_cluster_check` in the first place; every other node in
+        // this crate's own `drive` loop already dispatches every inbound
+        // `RaftMsg` (including these two) generically through
+        // `RaftCore::handle`.
+        //
+        // Deliberately gated on `!campaign_immediately`: that flag (ADR
+        // 0058 Train 2 rung 4) is set ONLY for the one replica the caller
+        // has already proven, by construction, to be the parent's own
+        // leader at an in-place split fork — never a wiped voter (a
+        // restart can't set this flag; only `materialize_split_child`
+        // does, exactly once, at the fork itself) — and its whole point is
+        // to win the race against this group's own cold randomized
+        // election timeout by campaigning synchronously before this loop
+        // ever starts. Running the cluster check for that one replica too
+        // would gate `campaign_now` (below) on `cluster_check_pending`,
+        // silently degrading the deterministic-first-leader optimization
+        // to an ordinary cold timeout on every single split — a real,
+        // ADR-documented behavior this fix must not weaken. Every other
+        // fresh-group replica (every split child that is NOT the
+        // immediate-campaign leader, an ordinary `CreateTablet`, and a
+        // genuinely wiped voter restarting into an established group)
+        // still goes through the check.
+        let initial_probe = {
+            let mut c = core.lock().expect("raftkv core poisoned");
+            c.begin_cluster_check(env.now(), env.next_u64())
+        };
+        if !initial_probe.is_empty() {
+            // Spawned, never awaited inline, for the identical reason
+            // `animus-control::node::drive`'s own initial probe send is
+            // spawned rather than run before this task's first `recv`:
+            // every peer in a genuine multi-replica fresh formation is
+            // doing the same thing at once, and blocking this task's own
+            // first read of its inbox behind every peer's `env.send`
+            // completing risks a mutual stall under real scheduling.
+            let probe_env = env.clone();
+            let probe_stream = stream;
+            env.spawn_task(async move {
+                for (to, msg) in initial_probe {
+                    probe_env
+                        .send_stream(to, probe_stream, codec::encode_wire(&KvWire::Raft(msg)))
+                        .await;
+                }
+            });
+        }
     }
     // Issue #554: seed `engine_applied` from the ENGINE'S OWN durable applied
     // watermark (`applied.rs`), never from `core.last_applied()`. Right after
@@ -10339,6 +10658,16 @@ async fn apply_loop<E: Env, S: StorageEngine>(
     // snapshot.
     let recovered_baseline_version = storage.latest_version();
     let mut suspicious_noop_log_budget = SUSPICIOUS_MERGE_NOOP_LOG_CAP;
+    // Issue #898 follow-up: owned by this loop, across iterations — see
+    // `COMPACT_DEFER_IDLE_CEILING`'s own doc for why this lives here rather
+    // than in `RaftCore` (a `now`-unaware pure core cannot track elapsed
+    // time itself). `compact_defer_since` is reset to `now` every time
+    // `compact_defer_progress` (the last-observed sum of `RaftCore::
+    // snapshot_chunk_advances` across every outstanding peer, not
+    // wall-clock alone) changes, so it always measures idle time since the
+    // last genuine forward progress, never total transfer duration.
+    let mut compact_defer_since: Option<Nanos> = None;
+    let mut compact_defer_progress: Option<u64> = None;
     loop {
         if halted.load(Ordering::SeqCst) {
             apply_stopped.store(true, Ordering::SeqCst);
@@ -10373,6 +10702,8 @@ async fn apply_loop<E: Env, S: StorageEngine>(
             &fork_signal,
             &persist,
             shared_wal.as_deref(),
+            &mut compact_defer_since,
+            &mut compact_defer_progress,
         )
         .await;
         if !did_work {

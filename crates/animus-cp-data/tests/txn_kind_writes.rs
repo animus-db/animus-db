@@ -89,12 +89,14 @@ fn drive<T: Send + 'static>(
     slot.lock().unwrap().take()
 }
 
-/// The change-log record's completed key for a resolve landing at `ts` —
-/// `prefix || hlc::pack(ts)`, exactly as `materialize_derived` (and
-/// `KindBatch`'s own arm before it) completes it.
+/// The change-log record's completed key for a resolve landing at `ts`,
+/// ordinal `0` (every call site here stages/resolves a single record) —
+/// `prefix || hlc::pack(ts) || 0u32`, exactly as `materialize_derived`
+/// completes it (issue #852 widened the suffix with the ordinal).
 fn change_key(prefix: &[u8], ts: animus_cp_data::hlc::HlcTimestamp) -> Vec<u8> {
     let mut k = prefix.to_vec();
     k.extend_from_slice(&hlc::pack(ts).to_be_bytes());
+    k.extend_from_slice(&0u32.to_be_bytes());
     k
 }
 
@@ -531,13 +533,17 @@ fn stage_bearing_write(pk: &[u8], base_value: Vec<u8>, lsi_value: Vec<u8>) -> Tx
     w
 }
 
-/// The trailing 8-byte packed-HLC suffix of a completed change-log key.
+/// The packed-HLC half of a completed change-log key's trailing suffix
+/// (issue #852 widened it to `8-byte packed HLC || 4-byte ordinal` — every
+/// call site here materializes exactly one record per entry, so `ordinal`
+/// is always `0` and this helper only ever needs the HLC half).
 fn key_hlc_suffix(prefix: &[u8], key: &[u8]) -> u64 {
     assert!(
-        key.starts_with(prefix) && key.len() == prefix.len() + 8,
-        "change key must be prefix || 8-byte packed HLC: {key:?}"
+        key.starts_with(prefix) && key.len() == prefix.len() + 12,
+        "change key must be prefix || 8-byte packed HLC || 4-byte ordinal: {key:?}"
     );
-    u64::from_be_bytes(key[prefix.len()..].try_into().unwrap())
+    let hlc_start = prefix.len();
+    u64::from_be_bytes(key[hlc_start..hlc_start + 8].try_into().unwrap())
 }
 
 /// ADR 0049 §3: staging an intent leaves exactly one image-less stage

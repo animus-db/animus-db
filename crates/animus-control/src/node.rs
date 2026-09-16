@@ -38,6 +38,108 @@ const WAL: &str = "raft.wal";
 /// see [`meta_apply_and_compact`]'s doc).
 const SNAPSHOT_THRESHOLD: u64 = 64;
 
+/// Issue #898 (the control-plane instance of issues #532/#537's second
+/// finding, `animus-cp-data`'s own `COMPACT_DEFER_CEILING`):
+/// `RaftCore::snapshot_upto` unconditionally invalidates every peer's
+/// in-flight chunked `InstallSnapshot` transfer the moment the snapshot base
+/// moves again (required for correctness — a `DRIVER_APPLIED` blob is built
+/// lazily from the engine, so a moved base makes any previously materialized
+/// image stale; see that method's own doc). Under sustained metadata churn,
+/// ordinary `SNAPSHOT_THRESHOLD` pressure can re-cross before a lagging
+/// peer's own transfer (network round trips, `SNAPSHOT_CHUNK_BYTES`-sized
+/// chunks) finishes, restarting it from chunk 0 against a newer, larger
+/// image — every time, forever, if churn keeps winning the race
+/// (`crates/animus-control/tests/snapshot_compaction_race.rs` reproduces
+/// this deterministically under `SimEnv`: a freshly-joined node pinned at
+/// `snapshot_index() == 0` for the whole run while the leader's own log kept
+/// compacting further, the exact shape issue #741/#898's `prod_liveness.rs`
+/// caught intermittently under real `ProdEnv` contention). This is the
+/// ceiling on how far a THRESHOLD-triggered (never an `image_needed`-
+/// triggered — a peer is actively waiting on that image, so it must always
+/// proceed) compaction may be DEFERRED (below, gated on
+/// `RaftCore::snapshot_transfer_in_flight()`) to give an in-flight transfer a
+/// real chance to land before the next threshold crossing yanks it away
+/// again — a multiple of `SNAPSHOT_THRESHOLD`, not a replacement for it, so
+/// the WAL still bounds even if a peer's transfer never completes (dead,
+/// partitioned, or hopelessly outpaced): compaction always proceeds once
+/// `behind` reaches this, transfer or not. Mirrors `animus-cp-data::
+/// COMPACT_DEFER_CEILING` exactly (same derivation, same multiplier) — see
+/// that constant's own doc for the data-plane incident that motivated it,
+/// which this crate's own `meta_apply_and_compact` never adopted despite its
+/// doc's claim to mirror `animus-cp-data::apply_and_compact`'s shape/
+/// ordering precisely.
+const SNAPSHOT_COMPACT_DEFER_CEILING: u64 = SNAPSHOT_THRESHOLD * 8;
+
+/// Issue #898 follow-up: an **idle-progress-gated** companion backstop to
+/// [`SNAPSHOT_COMPACT_DEFER_CEILING`]'s `behind`-sized one, tracked entirely
+/// in this driver loop (`meta_apply_and_compact`'s own `compact_defer_since`/
+/// `compact_defer_progress` locals) rather than in `RaftCore` —
+/// `RaftCore::snapshot_transfer_in_flight` is a pure, `now`-unaware fact,
+/// deliberately (see that accessor's own doc), so it cannot itself
+/// distinguish "a peer's transfer is genuinely progressing, just slowly"
+/// from "this peer will never ack again." The `behind`-sized ceiling alone
+/// requires *more writes* to ever cross, and simply never grows once a
+/// burst of writes stops: a peer that is down, partitioned, or — the
+/// scenario that surfaced this — configured as a cluster member but never
+/// actually started at all (`prod_liveness.rs::large_metadata_catch_up_
+/// stays_live` deliberately keeps node 2 dark through its whole fat-member
+/// phase, ~10-40% of real-thread `ProdEnv` runs observed stalling on this
+/// before this mechanism existed) can hold `snapshot_transfer_in_flight()`
+/// true forever during any quiet period, wedging this node's own local
+/// compaction indefinitely for no benefit — there is no genuinely
+/// in-progress transfer left to protect once a peer has been unresponsive
+/// this long.
+///
+/// **This bounds idle time since the LAST observed forward progress, not
+/// total elapsed time since the defer streak began** — a real design
+/// correction found by a second failing test one layer over
+/// (`animus-cp-data`'s `hlc_differential_skew.rs`, whose own crashed-peer
+/// scenario needs this to fire within a few virtual seconds, far tighter
+/// than this constant's own safe margin for a genuinely slow-but-live
+/// transfer's TOTAL duration). A flat "time since streak start" ceiling
+/// conflates two different questions — "has this transfer been running a
+/// while" (irrelevant; a large multi-chunk snapshot legitimately takes many
+/// round trips) and "has this transfer made ANY progress recently"
+/// (the actual question) — and picking one constant that answers both
+/// honestly is impossible: generous enough for a large real transfer's
+/// total duration is far too generous a wait for a transfer already proven
+/// dead. `compact_defer_progress` tracks the sum of
+/// `RaftCore::snapshot_chunk_advances` (a genuine forward-progress counter,
+/// already the exact metric `snapshot_resend_bound.rs` uses for the
+/// identical reason — see `animus-control/CLAUDE.md`'s entry on why it,
+/// not `snapshot_offset`, is the right denominator) across every peer
+/// `RaftCore::snapshot_transfer_peers` names; `compact_defer_since` resets
+/// to `now` every time that sum changes, so it always measures "how long
+/// since the last real chunk actually shipped a NEW offset," never how
+/// long the transfer has run overall. Once idle this long, compaction
+/// proceeds regardless of `behind`, same as crossing
+/// `SNAPSHOT_COMPACT_DEFER_CEILING`.
+///
+/// **Two earlier designs were tried at this same problem and rejected**:
+/// (1) a per-peer heartbeat-resend-COUNT proxy for elapsed time, which
+/// conflates "peer is dead" with "peer's first round trip is merely slow"
+/// (the resend rate is a function of `heartbeat_interval`, not of
+/// wall/virtual time) — `snapshot_compaction_race.rs`'s own deliberately
+/// slow link needed ~40 heartbeat-driven resends before its peer's
+/// first-EVER ack, landing right at a plausible-looking count threshold
+/// and reopening the original invalidation race for a perfectly healthy,
+/// merely-slow transfer; (2) gating on `RaftCore::peer_last_contact`
+/// going stale, rejected because `become_leader` optimistically seeds
+/// EVERY peer's `last_contact` to the moment leadership begins — a
+/// never-yet-started peer and a peer that stopped responding are both
+/// "stale relative to leadership start" by that field alone, so it cannot
+/// tell them apart either (see `become_leader`'s own doc). This idle
+/// design instead reads `env.now()` directly against a genuine
+/// forward-progress signal (matching this codebase's own convention for
+/// every other liveness/staleness window — `DETECT_TIMEOUT`,
+/// `CONTROL_PEER_LIVENESS_TIMEOUT`, `COMPACT_IDLE_STALL` — never a retry
+/// count or a same-leadership-stint contact timestamp standing in for
+/// one). `2s` is comfortably above any single real chunk round trip this
+/// codebase's own tests or `ProdEnv` contention have exhibited, and
+/// comfortably below `hlc_differential_skew.rs`'s own few-virtual-second
+/// budget for its crashed-peer scenario to resolve.
+const SNAPSHOT_COMPACT_DEFER_IDLE_CEILING: Duration = Duration::from_secs(2);
+
 /// Idle back-off for the apply task ([`meta_apply_loop`]): when there is
 /// nothing committed-and-durable to apply it sleeps this long before
 /// re-checking. Under load [`meta_apply_and_compact`] keeps returning `true`,
@@ -462,11 +564,20 @@ impl<E: Env> RaftNode<E> {
         delta_ring: DeltaRing,
         orphan_sweep_after: Duration,
     ) -> Self {
+        // Issue #667: drawn once and threaded through to `drive` below
+        // (`boot_entropy`) rather than each drawing its own — see that
+        // parameter's own doc for why: an extra `env.next_u64()` call in
+        // this always-runs boot path would reshuffle every subsequent draw
+        // for the rest of the run, silently desyncing any fixed-seed test
+        // whose own timing assumptions were tuned against the old sequence
+        // (found via `chunked_snapshot_receiver_stop_restart_3`'s own
+        // seed — see `docs/lessons/` for the general lesson).
+        let boot_entropy = env.next_u64();
         let core = Arc::new(Mutex::new(RaftCore::new(
             env.node_id(),
             &all_nodes,
             env.now(),
-            env.next_u64(),
+            boot_entropy,
         )));
         let detector = Arc::new(Mutex::new(FailureDetector::new(DETECT_TIMEOUT)));
         let watch = MetadataWatch::default();
@@ -500,6 +611,7 @@ impl<E: Env> RaftNode<E> {
             delta_ring,
             wal_lock,
             persist,
+            boot_entropy,
         ));
         // The placement reconciler runs alongside the driver; it only ever
         // *proposes* on the core (no I/O of its own), and proposals are honored
@@ -669,6 +781,27 @@ impl<E: Env> RaftNode<E> {
     /// health`'s `HEALTH_LEADER_GRACE`).
     pub fn election_timeout(&self) -> Duration {
         self.lock().election_timeout()
+    }
+
+    /// Issue #667: whether this node is still resolving the boot-time
+    /// "genesis bootstrap or wiped-voter restart?" check — `true` means it
+    /// currently grants no votes and starts no elections. See
+    /// `RaftCore::begin_cluster_check`'s own doc.
+    #[must_use]
+    pub fn cluster_check_pending(&self) -> bool {
+        self.lock().cluster_check_pending()
+    }
+
+    /// Issue #667: whether this node has permanently refused to act as a
+    /// voter — its persisted state was empty at startup and a peer proved
+    /// the cluster it is configured into already exists. A health/admin
+    /// surface should treat this exactly like a down/unhealthy replica: it
+    /// requires operator action (remove + re-add via the learner/rejoin
+    /// path, ADR 0032/0058), never a bare process restart. See
+    /// `RaftCore::refused_as_voter`'s own doc.
+    #[must_use]
+    pub fn refused_as_voter(&self) -> bool {
+        self.lock().refused_as_voter()
     }
 
     /// A clone of the apply task's published `Metadata` cache (ADR 0038 PR3)
@@ -913,6 +1046,15 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
     delta_ring: Arc<Mutex<DeltaRing>>,
     wal_lock: Arc<AsyncMutex<()>>,
     persist: Arc<PersistProgress>,
+    // Issue #667: the SAME entropy value `start_with_orphan_sweep_after`
+    // already drew for this `RaftCore`'s own construction (never a fresh
+    // `env.next_u64()` here) — see that call site's own doc for why reusing
+    // it, rather than drawing again, matters: this function's empty-state
+    // branch below is the boot path EVERY genesis node takes, so an extra
+    // draw there reshuffles every later random draw for the rest of the
+    // run, which desynced a fixed-seed corpus test's own tuned timing with
+    // no logic bug anywhere (`chunked_snapshot_receiver_stop_restart_3`).
+    boot_entropy: u64,
 ) {
     // Recover from the WAL before serving anything.
     let bytes = env.read(WAL).await.unwrap_or_default();
@@ -921,6 +1063,56 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
         let recovered =
             RaftCore::recovered(env.node_id(), &all_nodes, state, env.now(), env.next_u64());
         *core.lock().expect("raft core poisoned") = recovered;
+    } else {
+        // Issue #667 (P0 Raft safety): an empty WAL is ambiguous — it reads
+        // identically for "this is a genuine first-ever bootstrap" and "this
+        // voter's disk was wiped (ephemeral storage) and it is restarting
+        // into an already-established cluster". Never assume the former:
+        // the freshly-built `RaftCore` this node started with (`core`,
+        // above) already never votes/campaigns until
+        // `begin_cluster_check`'s probe round resolves one way or the
+        // other — see that method's own doc for the full mechanism and
+        // `docs/adr/0009-*.md`'s matching amendment for the design record.
+        //
+        // Send the initial `ClusterProbe` broadcast `begin_cluster_check`
+        // returns from a **separate spawned task**, never inline in this
+        // function before its first `env.recv()`: this task is every OTHER
+        // node's own sole message consumer too, and a pre-loop that blocks
+        // on `env.send` to every peer before ever reading its own inbox
+        // risks a mutual stall a real multi-node genesis (all peers doing
+        // the same thing at once) can hit under real scheduling. Spawning a
+        // sibling task for the send sidesteps that categorically — this
+        // task reaches its own `recv()` immediately regardless of how long
+        // the sends take — while still getting the probe out at boot
+        // instead of waiting a full election timeout for `start_pre_vote`'s
+        // own resend arm to fire it (issue #667 rung 2: that extra
+        // election-timeout delay is what let an ADR 0060 growth join's own
+        // `change_membership` — proposed by a *different* node, often
+        // materially faster than one election timeout under `SimEnv`'s
+        // near-zero latency — commit and have this node's id already
+        // appear in a peer's committed config *before* this node's own
+        // first probe ever reached it, which `handle_cluster_probe_resp`'s
+        // config-membership check then misread as "already an established
+        // voter" and refused permanently; sending immediately at boot,
+        // rather than after a full election timeout, closes that window
+        // for any real deployment, where dialing a growth-joiner's
+        // `change_membership` is always issued well after its own process
+        // is already up. `begin_cluster_check` already re-arms
+        // `election_deadline`, so `start_pre_vote`'s own resend arm still
+        // covers a first probe round lost to a transient send failure).
+        let initial_probe = core
+            .lock()
+            .expect("raft core poisoned")
+            .begin_cluster_check(env.now(), boot_entropy);
+        if !initial_probe.is_empty() {
+            let probe_env = env.clone();
+            env.spawn_task(async move {
+                for (to, msg) in initial_probe {
+                    let bytes = serde_json::to_vec(&msg).expect("raft message serializes");
+                    probe_env.send(to, bytes).await;
+                }
+            });
+        }
     }
     // Spawn the apply task now — after recovery has installed the recovered
     // core, so its first `drain_apply` sees the real post-recovery frontier,
@@ -1179,6 +1371,17 @@ async fn meta_apply_loop<E: Env, S: StorageEngine>(
     // this task's first loop iteration should see it too.
     watch.bump(watermark);
 
+    // Issue #898 follow-up: owned by this loop, across iterations — see
+    // `SNAPSHOT_COMPACT_DEFER_IDLE_CEILING`'s own doc for why this lives
+    // here rather than in `RaftCore` (a `now`-unaware pure core cannot track
+    // elapsed time itself). `compact_defer_since` is reset to `now` every
+    // time `compact_defer_progress` (the last-observed sum of
+    // `RaftCore::snapshot_chunk_advances` across every outstanding peer, not
+    // wall-clock alone) changes, so it always measures idle time since the
+    // last genuine forward progress, never total transfer duration.
+    let mut compact_defer_since: Option<Nanos> = None;
+    let mut compact_defer_progress: Option<u64> = None;
+
     loop {
         let did_work = meta_apply_and_compact(
             &env,
@@ -1192,6 +1395,8 @@ async fn meta_apply_loop<E: Env, S: StorageEngine>(
             &persist,
             &mut shadow,
             &mut watermark,
+            &mut compact_defer_since,
+            &mut compact_defer_progress,
         )
         .await;
         if !did_work {
@@ -1218,6 +1423,8 @@ async fn meta_apply_and_compact<E: Env, S: StorageEngine>(
     persist: &PersistProgress,
     shadow: &mut Metadata,
     watermark: &mut u64,
+    compact_defer_since: &mut Option<Nanos>,
+    compact_defer_progress: &mut Option<u64>,
 ) -> bool {
     let mut did_work = false;
 
@@ -1321,19 +1528,87 @@ async fn meta_apply_and_compact<E: Env, S: StorageEngine>(
     // *before* `set_snapshot_blob`, so base and image agree), and installs
     // it.
     let ea = engine_applied.load(Ordering::SeqCst);
-    let (behind, image_needed) = {
+    let now = env.now();
+    let (behind, image_needed, transfer_in_flight, transfer_progress) = {
         let mut c = core.lock().expect("raft core poisoned");
+        let transfer_progress: u64 = c
+            .snapshot_transfer_peers()
+            .iter()
+            .map(|p| c.snapshot_chunk_advances(p))
+            .sum();
         (
             ea.saturating_sub(c.snapshot_index()),
             c.take_snapshot_needed(),
+            c.snapshot_transfer_in_flight(),
+            transfer_progress,
         )
     };
-    if behind >= SNAPSHOT_THRESHOLD || image_needed {
+    // Issue #898 (mirrors `animus-cp-data::apply_and_compact`'s identical
+    // gate for issues #532/#537): a THRESHOLD-triggered base advance is
+    // deferred while some peer's chunked transfer is genuinely in flight,
+    // unless `behind` has grown enough that the WAL itself needs bounding
+    // regardless (`SNAPSHOT_COMPACT_DEFER_CEILING`, that constant's own doc
+    // has the full reasoning), OR the defer has now sat IDLE (no forward
+    // progress at all) for `SNAPSHOT_COMPACT_DEFER_IDLE_CEILING` (issue
+    // #898 follow-up — see that constant's own doc: a peer that never acks
+    // at all never grows `behind` past its own ceiling once churn stops, so
+    // this node's local compaction would otherwise wedge forever). An
+    // `image_needed` compaction always proceeds — a peer is actively
+    // waiting on that exact image.
+    let would_defer = behind >= SNAPSHOT_THRESHOLD && transfer_in_flight;
+    // Real forward progress (the tracked sum changed since the last pass)
+    // restarts the idle clock — this bounds idle time since the LAST
+    // advance, never total transfer duration. `None` (first observation of
+    // this streak) also counts as "just restarted."
+    let progressed = compact_defer_progress.is_some_and(|prev| prev != transfer_progress);
+    let idle_since = if progressed {
+        None
+    } else {
+        *compact_defer_since
+    };
+    let idle_ceiling_hit = would_defer
+        && idle_since.is_some_and(|since| {
+            now.0.saturating_sub(since.0) >= SNAPSHOT_COMPACT_DEFER_IDLE_CEILING.as_nanos() as u64
+        });
+    let threshold_hit = behind >= SNAPSHOT_THRESHOLD
+        && (!transfer_in_flight || behind >= SNAPSHOT_COMPACT_DEFER_CEILING || idle_ceiling_hit);
+    // Bookkeeping for the NEXT pass: still genuinely deferring (would defer,
+    // and didn't just get overridden by either ceiling) keeps the idle
+    // clock running (restarting it on real progress); anything else —
+    // compaction proceeded, or there is nothing to defer at all — clears
+    // both, so a fresh defer streak always starts its own clock rather than
+    // inheriting a stale one from an unrelated, long-since-resolved episode.
+    if would_defer && !threshold_hit {
+        *compact_defer_since = Some(idle_since.unwrap_or(now));
+        *compact_defer_progress = Some(transfer_progress);
+    } else {
+        *compact_defer_since = None;
+        *compact_defer_progress = None;
+    }
+    if threshold_hit || image_needed {
         let image = if image_needed {
             Some(syskv_image(engine).await)
         } else {
             None
         };
+        // Issue #811 (animus-cp-data's sibling bug, same shape here):
+        // `did_work` must mean "state provably changed," never "this
+        // attempt was merely eligible." `snapshot_upto` below is bounded by
+        // `core.last_applied()`, which a restart can leave stuck below `ea`
+        // (an `InstallSnapshot` install advances `RaftCore::snapshot_index`/
+        // `last_applied` in memory and durably raises the engine's own
+        // watermark in the same pass, but the WAL rewrite that would make
+        // the core's own advance durable only happens here, gated on
+        // `behind`/`image_needed` — which is false right after an install,
+        // so a restart before this gate next fires recovers a stale,
+        // pre-install WAL) — in which case `snapshot_upto` legitimately
+        // no-ops every call and `take_snapshot_dirty()` stays `false`
+        // forever, with `behind` never shrinking on its own. Judge the
+        // outcome by what actually happened instead: a freshly-built
+        // on-demand image was installed (`image_needed` is a take-once
+        // flag, so this alone can't spin) and/or a real WAL-rewriting
+        // compaction completed (`bytes.is_some()`, checked below).
+        let image_installed = image.is_some();
         // Serialize the WAL rewrite against the consensus loop's appends —
         // both tasks write the same file.
         let _wal = wal_lock.lock().await;
@@ -1367,6 +1642,7 @@ async fn meta_apply_and_compact<E: Env, S: StorageEngine>(
                 (Some((buf, round)), lli)
             }
         };
+        let bytes_produced = bytes.is_some();
         if let Some((bytes, round)) = bytes {
             env.replace(WAL, &bytes).await.expect("wal compaction");
             let mut c = core.lock().expect("raft core poisoned");
@@ -1375,7 +1651,8 @@ async fn meta_apply_and_compact<E: Env, S: StorageEngine>(
                 persist.complete_drain(round);
             }
         }
-        did_work = true;
+        // Issue #811: NOT unconditional — see `image_installed`'s doc above.
+        did_work |= image_installed || bytes_produced;
     }
 
     did_work
@@ -2252,6 +2529,8 @@ mod tests {
             &PersistProgress::default(),
             &mut shadow,
             &mut watermark,
+            &mut None,
+            &mut None,
         )
         .await;
 
@@ -2332,6 +2611,8 @@ mod tests {
             &PersistProgress::default(),
             &mut shadow,
             &mut watermark,
+            &mut None,
+            &mut None,
         )
         .await;
 
@@ -2402,6 +2683,85 @@ mod tests {
             ring.writes_since(0, last_applied),
             None,
             "a caller stuck before the ring's own window falls back to a full fetch"
+        );
+    }
+
+    /// Regression for issue #811's sibling hazard in this plane's own
+    /// compaction attempt. A genuine restart can seed `engine_applied` (from
+    /// the engine's own durable watermark key) far ahead of the freshly
+    /// WAL-recovered core's `last_applied`/`snapshot_index` — the same
+    /// disagreement `animus-cp-data::apply_and_compact` hit, here modeled
+    /// directly rather than via a timing race: a brand-new, never-advanced
+    /// `RaftCore` (`last_applied() == snapshot_index() == 0`) stands in for
+    /// "WAL recovery only got back to the last compacted base," while
+    /// `engine_applied`/`watermark` are set to a value well past
+    /// `SNAPSHOT_THRESHOLD` — "the engine already durably reflects far more
+    /// than that." `snapshot_upto(ea)` then clamps to `last_applied` (0),
+    /// no-ops every call, and `take_snapshot_dirty()` never returns `true` —
+    /// so a pass here must report `did_work = false`, never the old
+    /// unconditional `true` a merely-*eligible* (`behind >=
+    /// SNAPSHOT_THRESHOLD`) attempt used to report regardless of outcome.
+    #[tokio::test]
+    async fn apply_and_compact_does_not_spuriously_report_work_when_stuck_below_the_engine_watermark()
+     {
+        let sim = animus_sim::Simulator::new(0x811);
+        let env = sim.env(nid(0));
+
+        // Never proposed/advanced at all: `last_applied() == snapshot_index()
+        // == 0`, standing in for a restart's freshly-recovered core whose WAL
+        // only ever reflects the last compacted base.
+        let core = RaftCore::new(nid(0), &[nid(0)], Nanos(0), 7);
+        assert_eq!(core.last_applied(), 0);
+        assert_eq!(core.snapshot_index(), 0);
+
+        let core = Arc::new(Mutex::new(core));
+        let engine = animus_storage::MemoryEngine::new();
+        let cache = Arc::new(Mutex::new(Metadata::default()));
+        // Well past `SNAPSHOT_THRESHOLD` (64) — "the engine's own durable
+        // watermark, re-seeded at this task's own startup, is far ahead of
+        // what this recovered core's own WAL shows."
+        let engine_applied = Arc::new(AtomicU64::new(200));
+        let delta_ring = Arc::new(Mutex::new(DeltaRing::default()));
+        let watch = MetadataWatch::default();
+        let wal_lock = Arc::new(AsyncMutex::new(()));
+        let mut shadow = Metadata::default();
+        let mut watermark = 200;
+        let mut compact_defer_since: Option<Nanos> = None;
+        let mut compact_defer_progress: Option<u64> = None;
+
+        for attempt in 0..3 {
+            let did_work = meta_apply_and_compact(
+                &env,
+                &core,
+                &engine,
+                &cache,
+                &engine_applied,
+                &delta_ring,
+                &watch,
+                &wal_lock,
+                &PersistProgress::default(),
+                &mut shadow,
+                &mut watermark,
+                &mut compact_defer_since,
+                &mut compact_defer_progress,
+            )
+            .await;
+
+            assert!(
+                !did_work,
+                "attempt {attempt}: eligible-but-no-op must report no work \
+                 (issue #811 regression) — stuck at engine_applied=200, \
+                 snapshot_index={}",
+                core.lock().expect("core poisoned").snapshot_index()
+            );
+        }
+        // Genuinely nothing moved across any of the repeated attempts above —
+        // the whole point being tested.
+        assert_eq!(core.lock().expect("core poisoned").snapshot_index(), 0);
+        assert_eq!(watermark, 200, "watermark must not have advanced");
+        assert!(
+            engine.entries().await.expect("engine scan").is_empty(),
+            "nothing should have been written to the engine"
         );
     }
 

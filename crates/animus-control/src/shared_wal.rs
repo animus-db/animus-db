@@ -51,6 +51,14 @@
 //! - A round's ack fires only after the physical `append`/`sync` (or,
 //!   for a rewrite, `replace`) actually lands — identical durability
 //!   semantics to the per-group file this replaces.
+//! - **A failed `sync` never leaves this round's own un-synced bytes for a
+//!   later, unrelated caller's own successful `sync` to durably launder**
+//!   (issue #883): [`flush`](SharedWal::flush)'s `Append` branch repairs a
+//!   sync failure by stripping exactly this round's own just-appended bytes
+//!   back off the file's tail (`Disk::replace`, atomic) before `drive()`
+//!   hands the file to the next queued op — see that method's own doc for
+//!   the full mechanism and why it is safe unconditionally, independent of
+//!   `group_tails`/the tagged API.
 //! - **GC policy**: there is no independent segment file to reclaim — the
 //!   coordinator holds one physical file, atomically rewritten. A tablet's
 //!   own bytes are reclaimed the moment THAT tablet itself calls
@@ -126,16 +134,65 @@ impl From<SharedWalError> for io::Error {
     }
 }
 
-struct Pending {
+struct Pending<C, S> {
     op: WalOp,
     done: oneshot::Sender<Result<(), SharedWalError>>,
+    /// How to undo this op's own `group_tails` mutation if its physical
+    /// write never lands (issue #838) — `None` for the raw/untyped
+    /// `append`/`compact` API, which never touches `group_tails` at all.
+    /// See [`GroupTailsUndo`]'s own doc for why this is a snapshot-and-
+    /// restore rather than a re-derivation.
+    undo: Option<GroupTailsUndo<C, S>>,
+}
+
+/// A failed physical write must leave `group_tails` exactly as it was before
+/// the failed op's own mutation — a snapshot of one tablet's entry taken
+/// **before** [`submit_with_mutation`](SharedWal::submit_with_mutation)'s
+/// `mutate` closure runs, restorable in one call regardless of which of the
+/// three tagged mutations (`append_tagged`'s extend, `compact_group`'s
+/// replace, `forget`'s remove) produced it. `None` means the tablet had no
+/// entry at all before this op — undoing removes it again rather than
+/// restoring an empty `Vec` (which would be a *different*, observable state:
+/// `group_tails.contains_key` would wrongly start returning `true`).
+///
+/// See issue #838: undoing by snapshot-and-restore, rather than re-deriving
+/// "what the tail should be," is what makes a multi-entry batch for the SAME
+/// tablet (several `append_tagged` calls coalesced into one physical
+/// `Append` batch before any of them flushes) unwind correctly — applying
+/// every batch member's own undo in **reverse** enqueue order peels the
+/// mutations off exactly like a stack, landing back on the pre-batch state
+/// regardless of how many of that tablet's own ops were coalesced together.
+struct GroupTailsUndo<C, S> {
+    tablet: TabletId,
+    previous: Option<Vec<WalRecord<C, S>>>,
+}
+
+impl<C: Clone, S: Clone> GroupTailsUndo<C, S> {
+    fn apply(&self, group_tails: &mut BTreeMap<TabletId, Vec<WalRecord<C, S>>>) {
+        match &self.previous {
+            Some(previous) => {
+                group_tails.insert(self.tablet, previous.clone());
+            }
+            None => {
+                group_tails.remove(&self.tablet);
+            }
+        }
+    }
 }
 
 struct SharedWalState<C, S> {
-    queue: VecDeque<Pending>,
+    queue: VecDeque<Pending<C, S>>,
     leader_active: bool,
     /// Every locally-known tablet's own currently-durable-on-this-file
     /// record set (C-05 PR 2) — see the module doc's "Two APIs" section.
+    ///
+    /// **Only ever mutated for an op ALREADY judged safe to include in its
+    /// eventual physical write (issue #838)**: a tolerated (halted-gated)
+    /// live failure now rolls its own mutation back via the queued op's own
+    /// [`GroupTailsUndo`] rather than leaving a phantom entry a sibling
+    /// tablet's later `compact_group`/`forget` rewrite could durably write
+    /// out — see `drive`'s failure branch and this module's own "Recovery /
+    /// GC contract" doc for the full argument.
     group_tails: BTreeMap<TabletId, Vec<WalRecord<C, S>>>,
 }
 
@@ -175,7 +232,13 @@ pub struct SharedWal<C = MetaCommand, S = Metadata> {
     physical_writes: std::sync::atomic::AtomicU64,
 }
 
-impl<C, S> SharedWal<C, S> {
+// `C: Clone, S: Clone` here (not previously required) is issue #838's
+// `GroupTailsUndo` rollback machinery: `drive`'s failure branch restores a
+// tablet's pre-mutation `group_tails` entry by cloning the snapshot
+// `submit_with_mutation` captured, and every real instantiation in this
+// workspace (`MetaCommand`/`Metadata`, `animus-cp-data`'s `KvCommand`/
+// `KvState`) already derives `Clone` — see `GroupTailsUndo`'s own doc.
+impl<C: Clone, S: Clone> SharedWal<C, S> {
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -223,7 +286,11 @@ impl<C, S> SharedWal<C, S> {
         let (tx, rx) = oneshot::channel();
         let become_leader = {
             let mut state = self.inner.lock().await;
-            state.queue.push_back(Pending { op, done: tx });
+            state.queue.push_back(Pending {
+                op,
+                done: tx,
+                undo: None,
+            });
             if state.leader_active {
                 false
             } else {
@@ -251,17 +318,35 @@ impl<C, S> SharedWal<C, S> {
     /// `group_tails` mutation happened first, so by the time a LATER op's
     /// `mutate` builds its own physical image, every op that will land
     /// before it physically has already been folded into `group_tails`.
+    ///
+    /// **Issue #838**: `mutate` still runs eagerly, exactly as before — a
+    /// later op's own `mutate` must still see this one's mutation whether or
+    /// not this one has physically landed yet, which is what the doc
+    /// paragraph above rests on. What's new is that this call also snapshots
+    /// `tablet`'s own `group_tails` entry from **immediately before**
+    /// `mutate` runs, and carries that snapshot on the queued `Pending` as
+    /// its own [`GroupTailsUndo`]. `drive`'s failure branch applies it (only
+    /// on a tolerated, halted-gated failure — a live failure is already a
+    /// hard panic before this ever matters) so a write that never
+    /// physically lands can never leave a phantom entry for a sibling
+    /// tablet's later `compact_group`/`forget` rewrite to durably write out.
     async fn submit_with_mutation<E: Env>(
         &self,
         env: &E,
         file: &str,
+        tablet: TabletId,
         mutate: impl FnOnce(&mut SharedWalState<C, S>) -> WalOp,
     ) -> io::Result<()> {
         let (tx, rx) = oneshot::channel();
         let become_leader = {
             let mut state = self.inner.lock().await;
+            let previous = state.group_tails.get(&tablet).cloned();
             let op = mutate(&mut state);
-            state.queue.push_back(Pending { op, done: tx });
+            state.queue.push_back(Pending {
+                op,
+                done: tx,
+                undo: Some(GroupTailsUndo { tablet, previous }),
+            });
             if state.leader_active {
                 false
             } else {
@@ -320,6 +405,22 @@ impl<C, S> SharedWal<C, S> {
             if result.is_ok() {
                 self.physical_writes
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            } else {
+                // Issue #838: this batch never physically landed — undo
+                // every op's own `group_tails` mutation before any sibling
+                // tablet's later `compact_group`/`forget` rewrite can read
+                // (and durably write out) a phantom entry for content that
+                // was never fsynced. Applied in REVERSE enqueue order: a
+                // batch coalescing several ops for the SAME tablet (e.g.
+                // two `append_tagged` calls queued before either flushed)
+                // must unwind like a stack to land back on the pre-batch
+                // state — see `GroupTailsUndo`'s own doc for why.
+                let mut state = self.inner.lock().await;
+                for pending in batch.iter().rev() {
+                    if let Some(undo) = &pending.undo {
+                        undo.apply(&mut state.group_tails);
+                    }
+                }
             }
             for pending in batch {
                 let _ = pending.done.send(result.clone());
@@ -327,7 +428,11 @@ impl<C, S> SharedWal<C, S> {
         }
     }
 
-    async fn flush<E: Env>(env: &E, file: &str, batch: &[Pending]) -> Result<(), SharedWalError> {
+    async fn flush<E: Env>(
+        env: &E,
+        file: &str,
+        batch: &[Pending<C, S>],
+    ) -> Result<(), SharedWalError> {
         match &batch[0].op {
             WalOp::Compact(image) => {
                 debug_assert_eq!(
@@ -344,12 +449,50 @@ impl<C, S> SharedWal<C, S> {
                         merged.extend_from_slice(bytes);
                     }
                 }
-                async {
-                    env.append(file, &merged).await?;
-                    env.sync(file).await
+                env.append(file, &merged)
+                    .await
+                    .map_err(SharedWalError::from)?;
+                if let Err(e) = env.sync(file).await {
+                    // Issue #883: `env.append` above already landed `merged`
+                    // in the file's un-synced buffered region before this
+                    // round's own `sync` failed — `Disk::append`/`Disk::sync`
+                    // are two independently-observable physical steps (a real
+                    // `write()` places bytes in the OS page cache before any
+                    // `fsync()`; a FAILED `fsync()` does not retroactively
+                    // un-write them, and `animus-sim`'s own `Disk` model
+                    // deliberately mirrors that). Left in place, those bytes
+                    // are not just this round's own problem: `Disk::append`'s
+                    // `buffered.extend_from_slice` means the NEXT caller's
+                    // own ordinary append physically extends the SAME
+                    // unsynced region, and that caller's own successful
+                    // `sync` then durably commits the whole buffered tail —
+                    // this round's un-acked bytes included — reporting a
+                    // totally unrelated, healthy caller's operation as a
+                    // clean success while silently laundering a write that
+                    // was never acked. Repair it here, before `drive()` can
+                    // hand the file to any other queued op: strip exactly
+                    // the `merged.len()` bytes this round itself just
+                    // appended back off the file's tail via one atomic
+                    // `Disk::replace`. This never touches anything durable
+                    // before it — every prior `flush` call only ever returns
+                    // having fully synced (moving its own bytes out of
+                    // `buffered`) or having already failed and been repaired
+                    // by this same call, so entering ANY round's own
+                    // `append` the file's buffered region is always already
+                    // empty. Best-effort: if the read-back or the replace
+                    // itself also fails (the disk is failing outright),
+                    // there is nothing further this coordinator can do — the
+                    // caller below still sees this round's own `sync` error,
+                    // exactly as before this fix.
+                    if let Ok(current) = env.read(file).await
+                        && let Some(restored_len) = current.len().checked_sub(merged.len())
+                        && current[restored_len..] == merged[..]
+                    {
+                        let _ = env.replace(file, &current[..restored_len]).await;
+                    }
+                    return Err(SharedWalError::from(e));
                 }
-                .await
-                .map_err(SharedWalError::from)
+                Ok(())
             }
         }
     }
@@ -420,7 +563,7 @@ where
             return Ok(());
         }
         let records = records.to_vec();
-        self.submit_with_mutation(env, file, move |state| {
+        self.submit_with_mutation(env, file, tablet, move |state| {
             let mut bytes = Vec::new();
             for record in &records {
                 bytes.extend_from_slice(&PersistedState::<C, S>::encode_tagged_record(
@@ -465,7 +608,7 @@ where
         tablet: TabletId,
         image: Vec<WalRecord<C, S>>,
     ) -> io::Result<()> {
-        self.submit_with_mutation(env, file, move |state| {
+        self.submit_with_mutation(env, file, tablet, move |state| {
             state.group_tails.insert(tablet, image);
             let bytes = PersistedState::<C, S>::encode_multiplexed_image(
                 state
@@ -488,7 +631,7 @@ where
     /// conditional skip that would leave callers guessing whether a rewrite
     /// happened.
     pub async fn forget<E: Env>(&self, env: &E, file: &str, tablet: TabletId) -> io::Result<()> {
-        self.submit_with_mutation(env, file, move |state| {
+        self.submit_with_mutation(env, file, tablet, move |state| {
             state.group_tails.remove(&tablet);
             let bytes = PersistedState::<C, S>::encode_multiplexed_image(
                 state
@@ -502,7 +645,7 @@ where
     }
 }
 
-impl<C, S> Default for SharedWal<C, S> {
+impl<C: Clone, S: Clone> Default for SharedWal<C, S> {
     fn default() -> Self {
         Self::new()
     }

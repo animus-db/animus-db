@@ -1,0 +1,3 @@
+# A *per-node* decision must dedup on *per-node* state, never on shared registry state — a registry that doesn't distinguish callers by node silently answers "does anyone in the cluster satisfy this," not "do I."
+
+**A *per-node* decision must dedup on *per-node* state, never on shared registry state — a registry that doesn't distinguish callers by node silently answers "does anyone in the cluster satisfy this," not "do I."** (Found in the pre-ADR-0031 `cp_join_host_loop`/`minted`/shared `ClusterEdgeState`; both halves are superseded by ADR 0031 PR2+PR4. Archived in `docs/engineering-lessons-archive.md`.)

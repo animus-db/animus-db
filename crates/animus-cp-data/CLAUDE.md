@@ -1758,6 +1758,35 @@ demand the identical action, so no disambiguation is needed.
     amendment): 3 of 3 with all three fixes in place. See that amendment
     for the full account and `animus-control/CLAUDE.md`'s matching entry
     for the mechanism itself.
+  - **`COMPACT_DEFER_IDLE_CEILING` (issue #898 follow-up, 2026-09-15): a
+    never-acking peer (down, partitioned, or crashed) can hold
+    `snapshot_transfer_in_flight()` true forever, wedging the defer above
+    indefinitely once write volume stops growing `behind` past
+    `COMPACT_DEFER_CEILING`.** Found regression-testing `animus-control`'s
+    own issue #898 fix, which widened the shared `RaftCore::
+    snapshot_transfer_in_flight()` to also count a chunk that has been SENT
+    but not yet acked — correct for that plane's own gap, but it also made
+    THIS plane's identical defer above hold forever for a chunk sent to a
+    peer that will never ack at all, regressing the pre-existing
+    `tests/hlc_differential_skew.rs::receiver_installs_the_durable_high_
+    water_mark_not_just_the_rows`. Fixed by an **idle-progress-gated**
+    companion ceiling, mirroring `animus-control`'s own
+    `SNAPSHOT_COMPACT_DEFER_IDLE_CEILING` exactly: `apply_and_compact`
+    sums `RaftCore::snapshot_chunk_advances` (a genuine forward-progress
+    counter, the same one `snapshot_resend_bound.rs` uses) across every
+    peer `RaftCore::snapshot_transfer_peers` names, and resets a
+    `compact_defer_since: Option<Nanos>` local (owned by `apply_loop`) to
+    `now` every time that sum changes — so the ceiling (2s) bounds idle
+    time since the last genuine advance, never total transfer duration
+    (a flat "time since streak started" ceiling was tried first and
+    rejected for exactly this reason: generous enough for a real slow
+    transfer's total duration is far too generous a wait for one already
+    proven dead). `RaftCore::snapshot_transfer_in_flight()` itself needed
+    no further change. See `animus-control/CLAUDE.md`'s matching "Fifth"/
+    "Sixth" entries and `docs/lessons/testing/
+    2026-09-14-control-snapshot-catch-up-stall.md` for the full incident
+    — including the standing lesson that any change to shared `RaftCore`
+    gates on `cargo test -p animus-cp-data` run in FULL, never `--lib`.
   - This is also where `engine_applied` vs `last_applied` (Key invariants)
     comes from.
 - **Wake-on-propose cuts single-write latency.** `put`/`delete`/`cas`/
@@ -1897,8 +1926,18 @@ demand the identical action, so no disambiguation is needed.
     `crates/animus-cp-data/tests/sharedwal_fault_corpus.rs`
     (`ANIMUS_SHAREDWAL_SEEDS`, default 1) — cross-tablet coalescing, a
     crash mid-round with no cross-tablet contamination, `forget`-driven
-    GC, and a quiet tablet surviving a noisy sibling's real compaction.
-    Real-`ProdEnv`/real-disk proof: `crates/animusd/tests/
+    GC, a quiet tablet surviving a noisy sibling's real compaction, and
+    (cell (e), issue #838) a tolerated (halted-gated) LIVE, non-crashing
+    failure never leaving a phantom `group_tails` entry for a healthy
+    sibling's own next compaction to durably write out, and (cell (f),
+    issue #883) the complementary physical-buffer-layer shape — a
+    tolerated failure whose own `env.append` already buffered real bytes
+    before its own `env.sync` fails never leaving those bytes for a
+    healthy sibling's own next ORDINARY (non-compacting) round to durably
+    launder via its own successful `sync` — see ADR 0028's 2026-09-14 and
+    2026-09-15 amendments and `animus-control/CLAUDE.md`'s `shared_wal.rs`
+    entry for both mechanisms and fixes. Real-`ProdEnv`/real-disk proof:
+    `crates/animusd/tests/
     shared_wal_e2e.rs` (two tables sharing one node's `SharedWal` over a
     genuine process restart).
 - **Quiescence (ADR 0044 phase 1 / ADR 0048), data-plane groups only.** An
@@ -1976,6 +2015,32 @@ demand the identical action, so no disambiguation is needed.
   (`start_election` gates on `is_voter`). A `start` whose `all_nodes` excludes
   its own id is a quiet non-voter until the leader adds it. (Caught by the
   `reconfigure_trigger` seed sweep — a single seed hid it.)
+- **Wiped-voter boot-time safety (issue #900, ADR 0017's matching amendment):
+  `drive`'s WAL-recovery branch calls `RaftCore::begin_cluster_check`
+  whenever `state.is_empty()`, except when the caller's own
+  `campaign_immediately` flag is set** (ADR 0058 Train 2 rung 4's
+  deterministic split-child first-leader optimization — that flag proves,
+  by construction, a genuine fresh formation, so skipping the check there
+  costs zero safety and avoids gating the synchronous `campaign_now` call
+  on `cluster_check_pending`, which would silently degrade "wins the race
+  against the cold election timeout" to "waits out the cold election
+  timeout anyway" on every split). Everything else about the mechanism —
+  the `ClusterProbe`/`ClusterProbeResp` wire messages, the vote/campaign
+  gating, the wait-for-every-peer aggregation — lives on the shared,
+  generic `RaftCore<C, S>` (`animus-control::raft`), so it needed **no**
+  cp-data-specific reimplementation, only this one driver call plus
+  `RaftKvNode::cluster_check_pending()`/`refused_as_voter()` accessors.
+  **Gotcha for any future boot-path change here**: wiring this in draws
+  extra entropy (`env.next_u64()`) at every non-`campaign_immediately`
+  fresh-group boot, reshuffling later random draws for the rest of that
+  `SimEnv` run — re-verify every fixed-seed test that starts a fresh
+  replica (a new tablet, a growth join, a test harness's own second/third
+  node) after touching this branch, not just the tests that exercise it
+  directly; `tests/read_index.rs`'s own
+  `linearizable_read_succeeds_after_a_full_membership_rotation` needed a
+  seed re-pin for exactly this reason. See
+  `docs/lessons/code-patterns/2026-09-15-a-generic-core-level-fix-does-
+  not-wire-itself-into-every-driver.md` for the general lesson.
 - The ADR 0029 reconfigure/leadership-transfer follow-up fix (the two-layer
   transfer-gate threshold mismatch, the proposal-freeze while a transfer is
   armed, and the down-extra search fix) is a cross-cutting lesson — see the

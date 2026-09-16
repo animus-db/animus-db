@@ -524,3 +524,146 @@ fn caught_up_control_node_reships_non_empty() {
         "node 2 reassembled the full original image via the re-shipped chunks"
     );
 }
+
+/// Regression (issue #899, found validating issue #667): a follower that
+/// restarts mid-chunked-transfer and loses its volatile `incoming_snapshot`
+/// buffer must not permanently deadlock the leader's resend logic.
+/// `handle_install_snapshot_resp`'s monotonic `max` guard on
+/// `snapshot_offset` (added to keep out-of-order acks from regressing an
+/// in-flight transfer) used to also swallow a follower's own honest
+/// post-restart reset: the only way that response's `next_offset` field
+/// can ever legitimately report exactly `0` again mid-transfer is a
+/// follower that has forgotten everything it had reassembled so far — but
+/// `max(stale_high, 0)` left the leader's own tracked offset unchanged, so
+/// it kept re-sending chunks starting at the old high offset, which
+/// `handle_install_snapshot`'s own `fresh && offset == 0` guard can never
+/// treat as the start of a new transfer. The transfer never resumed.
+#[test]
+fn leader_resumes_from_offset_zero_after_a_restarted_follower_resets() {
+    let pair: [NodeId; 2] = [nid(0), nid(1)];
+    let now = Nanos(1_000_000_000);
+    let follower_id = nid(1);
+
+    // A synthetic multi-chunk image, same shape as this file's other
+    // multi-chunk tests.
+    let image = vec![0xCDu8; 5 * SNAPSHOT_CHUNK_BYTES + 99];
+
+    let mut leader: RaftCore = RaftCore::new(nid(0), &pair, Nanos(0), 7);
+    let _ = leader.tick(now, 7);
+    let _ = leader.handle(
+        follower_id.clone(),
+        RaftMsg::PreVoteResp {
+            term: leader.term() + 1,
+            granted: true,
+        },
+        now,
+        7,
+    );
+    let _ = leader.handle(
+        follower_id.clone(),
+        RaftMsg::RequestVoteResp {
+            term: leader.term(),
+            granted: true,
+        },
+        now,
+        7,
+    );
+    assert!(leader.is_leader(), "node 0 should have won the election");
+
+    for i in 0..300u64 {
+        if let animus_control::ProposeResult::Accepted { index, .. } = leader.propose(upsert(i)) {
+            let _ = leader.handle(
+                follower_id.clone(),
+                RaftMsg::AppendEntriesResp {
+                    term: leader.term(),
+                    success: true,
+                    match_index: index,
+                    needs_snapshot: false,
+                },
+                now,
+                7,
+            );
+        }
+    }
+    leader.mark_durable_through(leader.last_log_index());
+    leader.snapshot();
+    assert!(leader.snapshot_index() > 0, "leader should have a snapshot");
+    leader.set_snapshot_blob(image.clone());
+
+    let mut follower: RaftCore = RaftCore::new(follower_id.clone(), &pair, Nanos(0), 7);
+    let hb = Nanos(now.0 + 1_000_000_000);
+    let mut pending: Vec<(NodeId, RaftMsg)> = leader.tick(hb, 7);
+    assert!(!pending.is_empty(), "heartbeat should start the transfer");
+
+    // Pump only a bounded number of rounds — enough to get real, nonzero
+    // progress acked, but stop well before completion.
+    for _ in 0..10 {
+        if pending.is_empty() {
+            break;
+        }
+        let mut next: Vec<(NodeId, RaftMsg)> = Vec::new();
+        for (to, msg) in pending {
+            if to == follower_id {
+                next.extend(follower.handle(nid(0), msg, now, 7));
+            } else {
+                next.extend(leader.handle(follower_id.clone(), msg, now, 7));
+            }
+        }
+        pending = next;
+    }
+    let stale_progress = leader
+        .snapshot_chunk_progress(&follower_id)
+        .expect("a transfer should be in flight with real progress");
+    assert!(
+        stale_progress > 0,
+        "test setup should have made real progress before the simulated restart"
+    );
+
+    // Simulate the follower restarting: its own volatile in-flight buffer is
+    // gone, so a genuinely fresh `RaftCore` (never having received a single
+    // chunk of THIS transfer) is what would actually run — but the crux of
+    // this regression is purely the wire-level effect, so drive it via the
+    // exact message a restarted follower's own `handle_install_snapshot`
+    // would emit next (`next_offset: 0`, since its `incoming_snapshot` is
+    // `None` again) rather than reconstructing the whole recovery path.
+    let reset_ack = RaftMsg::InstallSnapshotResp {
+        term: leader.term(),
+        last_index: 0,
+        next_offset: 0,
+    };
+    let resend = leader.handle(follower_id.clone(), reset_ack, now, 7);
+
+    assert_eq!(
+        leader.snapshot_chunk_progress(&follower_id),
+        Some(0),
+        "the leader's tracked offset for a restarted follower must reset to 0, \
+         not stay pinned at its pre-restart value ({stale_progress}) via the max guard"
+    );
+    assert!(
+        resend
+            .iter()
+            .any(|(_, m)| matches!(m, RaftMsg::InstallSnapshot { offset: 0, .. })),
+        "the leader must resend starting at offset 0 right away, not silently drop \
+         the follower until some later unrelated event: got {resend:?}"
+    );
+
+    // End to end: a genuinely fresh follower core (standing in for the real
+    // restarted process) can now complete the transfer from scratch.
+    let mut fresh_follower: RaftCore = RaftCore::new(follower_id.clone(), &pair, Nanos(0), 7);
+    let totals = pump_snapshot(
+        &mut leader,
+        &mut fresh_follower,
+        nid(0),
+        follower_id,
+        resend,
+    );
+    assert!(
+        totals.iter().any(|&t| t > 0),
+        "expected a real (non-empty) snapshot transfer to complete after the reset"
+    );
+    assert_eq!(
+        fresh_follower.snapshot_index(),
+        leader.snapshot_index(),
+        "the restarted follower must fully catch up after the reset"
+    );
+}

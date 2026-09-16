@@ -552,9 +552,10 @@ pub enum ConditionExpression {
     /// is between two supplied operands, not a domain violation of the
     /// attribute itself).
     BeginsWith(String, AttributeValue),
-    /// `contains(attr, operand)` — substring for `S`, membership for the set
-    /// and list types. An existing attribute of any other type (`N`, `B`,
-    /// `BOOL`, `NULL`, `M`) is a `ValidationException` ([`ConditionError`]),
+    /// `contains(attr, operand)` — substring for `S`, byte subsequence for
+    /// `B`, membership for the set and list types. An existing attribute of
+    /// any other type (`N`, `BOOL`, `NULL`, `M`) is a `ValidationException`
+    /// ([`ConditionError`]),
     /// matching real DynamoDB; a missing attribute is still `false`, and an
     /// operand of the wrong element type against an otherwise-valid
     /// container is still `false` too, the same supplied-operands-mismatch
@@ -653,6 +654,19 @@ impl ConditionExpression {
                         AttributeValue::S(needle) => v.contains(needle.as_str()),
                         _ => false,
                     }),
+                    // Binary is a first-class member of `contains`' domain
+                    // (AWS's own Comparison Operator reference), and the
+                    // match is a byte *subsequence* — not the prefix
+                    // `BeginsWith` looks for. An empty operand is contained
+                    // by definition, and short-circuiting it is load-bearing:
+                    // `slice::windows(0)` panics.
+                    Some(AttributeValue::B(v)) => Ok(match operand {
+                        AttributeValue::B(needle) => {
+                            needle.is_empty()
+                                || v.windows(needle.len()).any(|w| w == needle.as_slice())
+                        }
+                        _ => false,
+                    }),
                     Some(AttributeValue::SS(vs)) => Ok(match operand {
                         AttributeValue::S(needle) => vs.contains(needle),
                         _ => false,
@@ -670,8 +684,8 @@ impl ConditionExpression {
                     Some(AttributeValue::L(items)) => {
                         Ok(items.iter().any(|i| values_equal(i, operand)))
                     }
-                    // `attr` itself (N/B/BOOL/NULL/M) is outside contains's
-                    // string/set/list domain.
+                    // `attr` itself (N/BOOL/NULL/M) is outside contains's
+                    // string/binary/set/list domain.
                     Some(actual) => Err(ConditionError::invalid_operand_type("contains", actual)),
                 }
             }
@@ -1277,6 +1291,46 @@ mod tests {
                 .evaluate(Some(&item))
                 .unwrap(),
             "a missing attribute is still false"
+        );
+    }
+
+    /// `contains()` on a **Binary** attribute is a byte-subsequence match, not
+    /// an error: AWS's Comparison Operator reference puts `B` in `contains`'
+    /// domain alongside `S` and the set/list types. This arm was missing, so
+    /// every Binary attribute raised a `ValidationException` that failed the
+    /// whole `Query`/`Scan` (a 400) rather than matching or filtering that one
+    /// item — while `begins_with`, three arms above it in the same match, had
+    /// handled `B` correctly all along.
+    #[test]
+    fn contains_on_a_binary_attribute_matches_a_byte_subsequence() {
+        let b = |v: &[u8]| AttributeValue::B(v.to_vec());
+        let item = item_of(&[("blob", b(b"hello"))]);
+
+        for needle in [&b"ell"[..], &b"hello"[..], &b"h"[..], &b"o"[..], &b""[..]] {
+            assert!(
+                ConditionExpression::Contains("blob".into(), b(needle))
+                    .evaluate(Some(&item))
+                    .expect("contains on a B attribute is in-domain, never an error"),
+                "{needle:?} is a subsequence of b\"hello\""
+            );
+        }
+
+        for needle in [&b"xyz"[..], &b"hlo"[..], &b"hello!"[..], &b"elo"[..]] {
+            assert!(
+                !ConditionExpression::Contains("blob".into(), b(needle))
+                    .evaluate(Some(&item))
+                    .expect("a non-match is false, not an error"),
+                "{needle:?} is not a subsequence of b\"hello\""
+            );
+        }
+
+        // A mismatched-type literal against an in-domain attribute stays
+        // `false` — the supplied-operands distinction `BeginsWith` draws.
+        assert!(
+            !ConditionExpression::Contains("blob".into(), s("ell"))
+                .evaluate(Some(&item))
+                .unwrap(),
+            "a B attribute against an S literal is a supplied-operands mismatch, still false"
         );
     }
 

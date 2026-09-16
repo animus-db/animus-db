@@ -2058,6 +2058,51 @@ const FORWARD_ELECTION_BACKOFF: Duration = Duration::from_millis(100);
 /// ([`MAX_REPLICATION_FACTOR`]) will ever actually present.
 const FORWARD_HOP_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// **Issue #900 follow-up.** The cap on a *hinted* forward hop's own
+/// timeout — unlike [`FORWARD_HOP_TIMEOUT`] (which only ever bounds a
+/// *guessed*, unvouched candidate), a hinted candidate used to get the
+/// **entire** remaining [`CLIENT_TIMEOUT`] budget with no cap at all
+/// (issue #585: "a hinted candidate gets the full `remaining` budget
+/// instead," `forward_to_tablet_leader`'s own doc) — sound reasoning
+/// under `ProdEnv`, where a hinted node that has actually crashed since
+/// the hint was formed fails **fast** (`relay_request_with_timeout`'s own
+/// `TcpStream::connect` either refuses or fails at the OS/network layer
+/// well under a second, surfacing as [`RELAY_TRANSPORT_FAILURE`] long
+/// before any timeout), so an uncapped hinted hop only ever actually
+/// *waits* the full budget for a genuinely live-but-slow leader (the
+/// membership-storm scenario issue #585 exists to accommodate).
+///
+/// **That reasoning does not hold under `SimEnv`.** `SimRelayClient::relay`
+/// (`animus_node::sim_relay`) has no equivalent fast-refusal signal at
+/// all — a crashed/partitioned peer and a merely slow one are perfectly
+/// indistinguishable (nothing arrives from either, ever, until the caller's
+/// own `timeout` elapses) — so a hinted hop to a peer that crashed the
+/// instant before the hint was read consumes the **entire** remaining
+/// budget waiting for a reply that will never come, leaving zero time for
+/// the hinted-retry chase (issue #316/#585) to ever try another replica —
+/// silently defeating that whole mechanism for exactly the case it exists
+/// to handle. Found live: `sim_cluster_data_only.rs`'s
+/// `c_crash_of_a_data_only_replica_holder_the_rest_keep_serving_then_it_
+/// catches_up`, seed `3665440779` — a survivor's own write picked up a
+/// hint still naming the data-only replica that had crashed moments
+/// earlier, and the whole `put` failed outright on that one hop, having
+/// never gotten a chance to try either of the two other, genuinely live
+/// replicas (one of which had already won the tablet's own re-election
+/// within ~300ms).
+///
+/// **Sized deliberately, generous enough to preserve issue #585's own
+/// scenario**: three times [`FORWARD_HOP_TIMEOUT`] (6s of the 10s
+/// [`CLIENT_TIMEOUT`] budget) comfortably covers that issue's own
+/// "several seconds, well past `FORWARD_HOP_TIMEOUT`" characterization of
+/// a real membership-change storm's commit latency, while still leaving
+/// [`CLIENT_TIMEOUT`] minus this — 4s — for the chase to fall back to
+/// another known replica if the hinted one really was dead. Applies
+/// identically under `ProdEnv` (where it is essentially never the
+/// binding constraint — a dead hinted peer already fails within this
+/// window via `RELAY_TRANSPORT_FAILURE`) and `SimEnv` (where it is the
+/// only thing that ever bounds a dead hinted peer's own hop at all).
+const HINTED_FORWARD_HOP_TIMEOUT: Duration = Duration::from_secs(6);
+
 /// Bounded attempts [`ClientCtx::txn_prepare_pushing`] gives a stage blocked
 /// by another transaction's unresolved intent (ADR 0018 §2/PR6, task #16)
 /// before giving up and reporting a client-facing conflict error.
@@ -9100,6 +9145,81 @@ mod rate_tracker_tests {
         );
     }
 
+    /// Pins the exact mechanism behind issue #867's flake in
+    /// `streams_e2e.rs::auto_split_change_rate_splits_a_high_churn_
+    /// streamed_table_never_a_plain_one`: `auto_split_loop`'s own
+    /// `AUTO_SPLIT_INTERVAL` sweep and `change_consumer_loop`'s
+    /// `INDEX_DRAIN_INTERVAL` tracker tick run on two independent clocks,
+    /// and this tracker decays by a fixed `1.0 - RATE_EWMA_ALPHA` factor on
+    /// every **observation** regardless of how long that observation's own
+    /// gap was (`RateSample::advance`'s `elapsed` only scales the
+    /// instantaneous half of the blend, not the decay factor on the
+    /// previous rate). A burst that completes well inside one
+    /// `AUTO_SPLIT_INTERVAL` window — which a fast burst against a
+    /// single-node, in-process cluster routinely does — keeps decaying,
+    /// unobserved, for as many `INDEX_DRAIN_INTERVAL` ticks as elapse
+    /// before the next sweep happens to run. This test shows that gap is
+    /// large enough, on the e2e test's own numbers, to erase a peak two
+    /// orders of magnitude over threshold: not a bug in the tracker or the
+    /// sweep (a change-append rate legitimately stops being "high" once
+    /// the writes that made it high have stopped), but proof that a
+    /// one-shot, already-finished burst is not a property this trigger
+    /// promises to remember — the reason the e2e test now keeps its write
+    /// load running for the whole time either of its polls is open,
+    /// instead of writing a fixed burst and then only checking afterward.
+    #[test]
+    fn change_rate_tracker_a_completed_burst_can_decay_below_threshold_before_the_next_auto_split_sweep()
+     {
+        // The e2e fixture's own threshold (`--auto-split-change-rate
+        // 10_000` in `streams_e2e.rs`).
+        const CHANGE_RATE_THRESHOLD: f64 = 10_000.0;
+
+        let mut sim = Simulator::new(0x8670_0001);
+        let env = sim.env(nid(0));
+        let tracker = ChangeRateTracker::default();
+
+        // Seed a baseline: a real tablet is already observed at 0 bytes on
+        // every idle `INDEX_DRAIN_INTERVAL` tick before any burst starts.
+        sim.run_for(crate::index_drain::INDEX_DRAIN_INTERVAL);
+        tracker.observe(TABLET, 0, env.now());
+
+        // The e2e fixture's own burst — 60 items of ~2KB each, ~130_000
+        // bytes total — landing inside a single `INDEX_DRAIN_INTERVAL`
+        // tick, mirroring a burst that completes faster than the tracker
+        // samples it (the common case for 60 sequential in-process RPCs).
+        sim.run_for(crate::index_drain::INDEX_DRAIN_INTERVAL);
+        let peak = tracker.observe(TABLET, 130_000, env.now());
+        assert!(
+            peak > CHANGE_RATE_THRESHOLD * 10.0,
+            "expected the burst's own peak reading to clear the threshold by an order \
+             of magnitude (matching the e2e fixture's own comment), got {peak}"
+        );
+
+        // Nothing further is ever written (the burst is over) — but
+        // `change_consumer_loop` keeps ticking every `INDEX_DRAIN_INTERVAL`
+        // regardless, each one a zero-growth observation. Advance exactly
+        // one `AUTO_SPLIT_INTERVAL`'s worth of those ticks: the longest an
+        // `auto_split_loop` sweep can plausibly go without ever having
+        // looked, if its own periodic tick had just fired right as the
+        // burst began.
+        let ticks = (super::AUTO_SPLIT_INTERVAL.as_secs_f64()
+            / crate::index_drain::INDEX_DRAIN_INTERVAL.as_secs_f64())
+        .round() as u32;
+        let mut decayed = peak;
+        for _ in 0..ticks {
+            sim.run_for(crate::index_drain::INDEX_DRAIN_INTERVAL);
+            decayed = tracker.observe(TABLET, 130_000, env.now());
+        }
+        assert!(
+            decayed < CHANGE_RATE_THRESHOLD,
+            "expected one AUTO_SPLIT_INTERVAL's worth of zero-growth ticks to decay a \
+             completed burst back under the sweep's own threshold (peak={peak}, \
+             decayed={decayed}, ticks={ticks}) — if this fails, the decay dynamics have \
+             changed and issue #867's race may have narrowed or closed; re-examine \
+             whether streams_e2e.rs's continuous-writer fix is still needed"
+        );
+    }
+
     #[test]
     fn request_rate_tracker_converges_toward_a_sustained_write_rate() {
         let mut sim = Simulator::new(0x5241_5447);
@@ -13312,9 +13432,43 @@ const SCHEMA_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// believes reached a leader's log, before resubmitting it — see
 /// [`ClientCtx::propose_schema`]'s doc for why blindly resubmitting every
 /// [`SCHEMA_POLL_INTERVAL`] tick is a retry-amplification bug. A proposal
-/// known *not* to have been sent anywhere (no leader reachable) is retried
-/// every tick regardless, since that costs nothing.
+/// known *not* to have been sent anywhere (no leader reachable) used to be
+/// retried every tick regardless, on the theory that costs nothing — true
+/// only while `propose_schema`'s own "no known leader" broadcast fallback
+/// was slow enough on a total failure to throttle the retry rate as a
+/// side effect; see [`BROADCAST_EXHAUSTED_BACKOFF`]'s own doc for why that
+/// stopped being true (issue #610's own fd-exhaustion regression) and
+/// where the correction actually lives.
 const SCHEMA_PROPOSE_PATIENCE: Duration = Duration::from_secs(1);
+/// How long [`ClientCtx::propose_schema`]'s "no locally-known leader"
+/// broadcast fallback sleeps after every one of its candidates has failed,
+/// before returning — found necessary live in CI
+/// (`prod-liveness-hammer-pair`/`prod-liveness-animusd`) after issue
+/// #610's own concurrency fix: racing every candidate at once
+/// (`futures::future::select_all`) fixed that fix's *success* path (a
+/// broadcast that actually reaches a leader now resolves in one hop's
+/// worth of latency, never `(N-1) * FORWARD_HOP_TIMEOUT`), but it also
+/// made a *total* failure resolve almost instantly instead of after
+/// several seconds — and every caller of `propose_schema` re-invokes it on
+/// its very next [`SCHEMA_POLL_INTERVAL`] (50ms) tick with no backoff of
+/// its own on a `false` return (see [`SCHEMA_PROPOSE_PATIENCE`]'s own
+/// now-corrected assumption). During the one window every node in a fresh
+/// cluster genuinely hits this on every tick — before the control group
+/// has elected *any* leader at all, e.g. every node's own concurrent
+/// self-registration — that turned a naturally-throttled ~1-2 broadcasts
+/// per second per node into effectively 20/sec, each opening up to `N-1`
+/// fresh sockets concurrently; under real per-push-CI load (several nodes
+/// bootstrapping at once, competing for the runner's own CPU) the kernel/
+/// runtime reclaims a closed relay socket's fd slower than that pace opens
+/// new ones, and the accumulating in-flight sockets exhaust the process's
+/// whole fd table — surfacing as an unrelated `RaftCore` WAL append
+/// failing with `EMFILE` (any fd-needing call would). Sized well under
+/// [`SCHEMA_POLL_INTERVAL`]'s own caller-visible cadence multiplied out
+/// and tiny next to [`FORWARD_HOP_TIMEOUT`]/[`SCHEMA_COMMIT_TIMEOUT`], so
+/// it restores a sane ceiling on the broadcast retry rate without
+/// reintroducing issue #610's own per-*candidate* multiplicative cost —
+/// this sleep fires once per exhausted *call*, never once per candidate.
+const BROADCAST_EXHAUSTED_BACKOFF: Duration = Duration::from_millis(250);
 
 /// Every CP **write/delete/kind-write/kind-eval** confirm loop
 /// (`write_path::wait_applied_past`, shared by `cp_put_local`/
@@ -18239,6 +18393,294 @@ mod simenv_client_ctx_tests {
             "the read must observe the write through the production read path (seed={seed})"
         );
     }
+
+    /// ADR 0066 §5 / issue #842: `execute_statement_as`/`execute_transaction_as`
+    /// — the `<E, R>`-generic PartiQL siblings `dynamo::dispatch_item_op`
+    /// calls (never reached by the real DynamoDB wire, which always calls
+    /// the concrete `execute_statement`/`execute_transaction` directly; see
+    /// `dynamo.rs`'s own "SimEnv-capable PartiQL siblings" section) — must
+    /// authorize a `Principal::Scoped` caller **before** the target table's
+    /// existence is revealed by `table_known`, exactly like their concrete
+    /// counterparts (proven end-to-end over the real wire by
+    /// `crates/animusd/tests/dynamo_auth_policy.rs`'s own scoped-policy
+    /// tests). A denied caller must get the byte-identical
+    /// `AccessDeniedException` (`__type` and message) whether the named
+    /// table exists or not — never a distinguishable
+    /// `ResourceNotFoundException` that would let a table-scoped credential
+    /// enumerate the cluster's tables. `SimCluster` itself never resolves a
+    /// `Principal::Scoped` (its own dynamo dispatch always uses
+    /// `Principal::unrestricted()`), so this harness constructs both
+    /// functions' inputs directly rather than through any wire path.
+    #[test]
+    fn execute_statement_as_and_execute_transaction_as_authorize_before_table_known() {
+        use crate::authz::Principal;
+        use crate::dynamo::{execute_statement_as, execute_transaction_as};
+        use animus_control::{OpClass, Policy, TableMatch};
+        use animus_dynamo::AttributeValue;
+        use animus_dynamo::wire::TransactStatementRequest;
+        use std::collections::BTreeSet;
+
+        let seed = 0x514E_0008;
+        let (mut sim, ctx, control, _kv) = single_node_ctx(seed);
+        sim.run_for(Duration::from_millis(200));
+
+        // `authz::record_denied` (bumping `Metric::AuthDenied` on every
+        // refusal this test expects) calls `ClientCtx::data()`, which
+        // panics on `single_node_ctx`'s own default control-only shape
+        // (`data: None` — deliberate there, since neither `cp_kind_write_raw`
+        // nor `cp_get` ever reads it, per that function's own doc). This
+        // test's whole point is provoking that refusal, so it needs a real
+        // `DataRole` — every field is a plain, `Env`-free, `Default`-able
+        // handle (mirrors `SimCluster::new`'s own per-node construction).
+        let ctx = SimClientCtx {
+            data: Some(DataRole {
+                raftkv_metrics: animus_env::MetricsHandle::recording(),
+                base_id: nid(1),
+                stream_seal_knobs: StreamSealKnobs::default(),
+                change_rates: ChangeRateTracker::default(),
+                request_rates: RequestRateTracker::default(),
+            }),
+            ..ctx
+        };
+
+        // Scoped to some other table entirely — denied for anything this
+        // test names.
+        let denied = Principal::Scoped {
+            access_key_id: "AKIDDENIED842".to_string(),
+            region: "us-east-1".to_string(),
+            policy: Policy {
+                tables: TableMatch::Names(BTreeSet::from(["unrelated_table".to_string()])),
+                ops: BTreeSet::from([OpClass::Read, OpClass::Write]),
+            },
+        };
+
+        let select_statement = "SELECT * FROM issue_842_denied_select";
+
+        // (1) The table does not exist yet.
+        let meta_absent = control.metadata();
+        let select_err_absent = spawn_and_capture(&mut sim, &ctx.env, {
+            let ctx = ctx.clone();
+            let denied = denied.clone();
+            let meta = meta_absent.clone();
+            async move {
+                execute_statement_as(
+                    &ctx,
+                    &meta,
+                    &denied,
+                    select_statement,
+                    &[],
+                    false,
+                    None,
+                    None,
+                )
+                .await
+            }
+        })
+        .expect("future completed")
+        .expect_err("a denied SELECT must be refused even against an unknown table");
+
+        // (2) Now the table genuinely exists.
+        seed_schema(&control, "issue_842_denied_select", TabletId(2));
+        sim.run_for(Duration::from_millis(200));
+        let meta_present = control.metadata();
+        let select_err_present = spawn_and_capture(&mut sim, &ctx.env, {
+            let ctx = ctx.clone();
+            let denied = denied.clone();
+            let meta = meta_present.clone();
+            async move {
+                execute_statement_as(
+                    &ctx,
+                    &meta,
+                    &denied,
+                    select_statement,
+                    &[],
+                    false,
+                    None,
+                    None,
+                )
+                .await
+            }
+        })
+        .expect("future completed")
+        .expect_err("a denied SELECT must be refused even once the table exists");
+
+        assert_eq!(
+            select_err_absent.code, "AccessDeniedException",
+            "seed={seed}, absent-table error: {select_err_absent:?}"
+        );
+        assert_eq!(
+            select_err_absent.code, select_err_present.code,
+            "seed={seed}: the __type must not depend on whether the table exists"
+        );
+        assert_eq!(
+            select_err_absent.message, select_err_present.message,
+            "seed={seed}: the message must not depend on whether the table exists — a \
+             table-scoped principal must not be able to enumerate table existence via this \
+             difference (issue #842)"
+        );
+
+        // The identical proof for `execute_transaction_as`, one write
+        // statement.
+        let txn_statement = "INSERT INTO issue_842_denied_txn VALUE {'pk': ?}";
+        let statements = vec![TransactStatementRequest {
+            statement: txn_statement.to_string(),
+            parameters: vec![AttributeValue::S("x".to_string())],
+            rvocf: Default::default(),
+        }];
+
+        let meta_absent = control.metadata();
+        let txn_err_absent = spawn_and_capture(&mut sim, &ctx.env, {
+            let ctx = ctx.clone();
+            let denied = denied.clone();
+            let meta = meta_absent.clone();
+            let statements = statements.clone();
+            async move { execute_transaction_as(&ctx, &denied, &meta, &statements, None).await }
+        })
+        .expect("future completed")
+        .expect_err("a denied ExecuteTransaction must be refused even against an unknown table");
+
+        seed_schema(&control, "issue_842_denied_txn", TabletId(3));
+        sim.run_for(Duration::from_millis(200));
+        let meta_present = control.metadata();
+        let txn_err_present = spawn_and_capture(&mut sim, &ctx.env, {
+            let ctx = ctx.clone();
+            let denied = denied.clone();
+            let meta = meta_present.clone();
+            let statements = statements.clone();
+            async move { execute_transaction_as(&ctx, &denied, &meta, &statements, None).await }
+        })
+        .expect("future completed")
+        .expect_err("a denied ExecuteTransaction must be refused even once the table exists");
+
+        assert_eq!(
+            txn_err_absent.code, "AccessDeniedException",
+            "seed={seed}, absent-table error: {txn_err_absent:?}"
+        );
+        assert_eq!(
+            txn_err_absent.code, txn_err_present.code,
+            "seed={seed}: the __type must not depend on whether the table exists"
+        );
+        assert_eq!(
+            txn_err_absent.message, txn_err_present.message,
+            "seed={seed}: the message must not depend on whether the table exists (issue #842)"
+        );
+    }
+
+    /// ADR 0066 §5 / issue #842 (the sixth site): `execute_one_batch_statement_as`
+    /// — reached through [`crate::dynamo::run_batch_execute_statement_as`], the
+    /// `BatchExecuteStatement` sibling of `execute_statement_as`/
+    /// `execute_transaction_as` above (see `dynamo.rs`'s own "SimEnv-capable
+    /// PartiQL siblings" section) — used to check `table_known` before
+    /// `authz::authorize` for its `SELECT` arm, the identical five-site defect
+    /// this issue names, just uncounted. A denied `SELECT` batch statement must
+    /// report a byte-identical `Error.Code`/`Error.Message` whether the named
+    /// table exists or not — never a distinguishable `ResourceNotFound` that
+    /// would let a table-scoped credential enumerate the cluster's tables via
+    /// the batch API.
+    #[test]
+    fn execute_one_batch_statement_as_authorizes_before_table_known() {
+        use crate::authz::Principal;
+        use crate::dynamo::run_batch_execute_statement_as;
+        use animus_control::{OpClass, Policy, TableMatch};
+        use animus_dynamo::wire::BatchStatementRequest;
+        use std::collections::BTreeSet;
+
+        fn batch_error(raw: &str) -> (String, String) {
+            let parsed: serde_json::Value =
+                serde_json::from_str(raw).expect("valid BatchExecuteStatement response JSON");
+            let entry = &parsed["Responses"][0];
+            let error = &entry["Error"];
+            (
+                error["Code"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("missing Error.Code in {raw}"))
+                    .to_string(),
+                error["Message"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("missing Error.Message in {raw}"))
+                    .to_string(),
+            )
+        }
+
+        let seed = 0x514E_0009;
+        let (mut sim, ctx, control, _kv) = single_node_ctx(seed);
+        sim.run_for(Duration::from_millis(200));
+
+        // Same `DataRole` fix as the test above — `authz::record_denied`
+        // calls `ClientCtx::data()`, which panics on `single_node_ctx`'s
+        // own default control-only shape.
+        let ctx = SimClientCtx {
+            data: Some(DataRole {
+                raftkv_metrics: animus_env::MetricsHandle::recording(),
+                base_id: nid(1),
+                stream_seal_knobs: StreamSealKnobs::default(),
+                change_rates: ChangeRateTracker::default(),
+                request_rates: RequestRateTracker::default(),
+            }),
+            ..ctx
+        };
+
+        // Scoped to some other table entirely — denied for anything this
+        // test names.
+        let denied = Principal::Scoped {
+            access_key_id: "AKIDDENIED842C".to_string(),
+            region: "us-east-1".to_string(),
+            policy: Policy {
+                tables: TableMatch::Names(BTreeSet::from(["unrelated_table".to_string()])),
+                ops: BTreeSet::from([OpClass::Read, OpClass::Write]),
+            },
+        };
+
+        let statements = vec![BatchStatementRequest {
+            statement: "SELECT * FROM issue_842_denied_batch WHERE pk = ?".to_string(),
+            parameters: vec![animus_dynamo::AttributeValue::S("x".to_string())],
+            consistent_read: false,
+        }];
+
+        // (1) The table does not exist yet.
+        let meta_absent = control.metadata();
+        let raw_absent = spawn_and_capture(&mut sim, &ctx.env, {
+            let ctx = ctx.clone();
+            let denied = denied.clone();
+            let meta = meta_absent.clone();
+            let statements = statements.clone();
+            async move { run_batch_execute_statement_as(&ctx, &meta, &denied, &statements).await }
+        })
+        .expect("future completed")
+        .expect("run_batch_execute_statement_as never returns Err — every failure is a per-statement entry");
+
+        // (2) Now the table genuinely exists.
+        seed_schema(&control, "issue_842_denied_batch", TabletId(4));
+        sim.run_for(Duration::from_millis(200));
+        let meta_present = control.metadata();
+        let raw_present = spawn_and_capture(&mut sim, &ctx.env, {
+            let ctx = ctx.clone();
+            let denied = denied.clone();
+            let meta = meta_present.clone();
+            let statements = statements.clone();
+            async move { run_batch_execute_statement_as(&ctx, &meta, &denied, &statements).await }
+        })
+        .expect("future completed")
+        .expect("run_batch_execute_statement_as never returns Err — every failure is a per-statement entry");
+
+        let (code_absent, message_absent) = batch_error(&raw_absent);
+        let (code_present, message_present) = batch_error(&raw_present);
+
+        assert_eq!(
+            code_absent, "AccessDenied",
+            "seed={seed}, absent-table response: {raw_absent}"
+        );
+        assert_eq!(
+            code_absent, code_present,
+            "seed={seed}: the batch Error.Code must not depend on whether the table exists"
+        );
+        assert_eq!(
+            message_absent, message_present,
+            "seed={seed}: the batch Error.Message must not depend on whether the table exists \
+             — a table-scoped principal must not be able to enumerate table existence via this \
+             difference (issue #842)"
+        );
+    }
 }
 
 /// Two-node `ClientCtx<SimEnv, SimRelayClient<SimEnv>>` smoke (ADR 0061
@@ -18668,6 +19110,8 @@ mod sim_cluster_dynamo_extended;
 #[cfg(test)]
 mod sim_cluster_dynamo_item_size_cap;
 #[cfg(test)]
+mod sim_cluster_dynamo_key_validation;
+#[cfg(test)]
 mod sim_cluster_dynamo_parallel_scan;
 #[cfg(test)]
 mod sim_cluster_dynamo_predicate_bugs;
@@ -18815,6 +19259,18 @@ mod sim_cluster_dynamo_documents;
 #[cfg(test)]
 mod sim_cluster_dynamo_schema;
 
+/// Issue #610 regression: `ClientCtx::propose_schema`'s "no locally-known
+/// leader" broadcast fallback (`schema.rs`) races every known intra
+/// candidate concurrently rather than trying them one at a time — a
+/// deterministic pin of "a node that has not yet learned the leader
+/// receives the first `CreateTable`" (the real-world race `await_
+/// bootstrap` under-specifies across every `ProdEnv` cluster fixture) via
+/// the identical partition-past-one-election-window repro shape
+/// `crates/animus-control/tests/leader_within_hysteresis.rs` already
+/// established for issue #595.
+#[cfg(test)]
+mod sim_cluster_schema_broadcast;
+
 /// ADR 0061 rung D4 PR 3 (C-04 D4): deterministic `SimCluster` coverage for
 /// the dropped-table GC reclaim (ADR 0024) — driven through the real
 /// `DeleteTable` wire operation (`dynamo::dispatch_table_op` →
@@ -18862,6 +19318,21 @@ mod sim_cluster_auto_split;
 /// entry for the full account.
 #[cfg(test)]
 mod sim_cluster_backup_janitor;
+
+/// Issue #856 review follow-up (not a numbered ADR 0061 rung): deterministic
+/// `SimCluster` coverage for `DeleteBackup` refusing a backup with a
+/// `Seeding` restore against it (`BackupInUseException`), and the identical
+/// delete succeeding once that restore reaches a terminal state — replacing
+/// the wire-level `dynamo_restore.rs::
+/// delete_backup_refuses_while_a_restore_is_in_progress_then_succeeds`
+/// test's own race-dependent `if status == 400` branch with an
+/// unconditional assertion. `SimCluster` never spawns `backup_restore::
+/// backup_restore_loop`, so a restore minted directly via `propose_meta`
+/// stays `Seeding` forever until explicitly failed/completed — no polling,
+/// no timing window, no flake. See this module's own doc for the two
+/// scenarios and `crates/animusd/CLAUDE.md`'s matching entry.
+#[cfg(test)]
+mod sim_cluster_delete_backup_restore;
 
 /// ADR 0061 rung D4 PR 4 (C-04 D4, closing the D4 roadmap item): deterministic
 /// `SimCluster` coverage for ADR 0030 online growth and ADR 0032 seed-join
@@ -19207,6 +19678,61 @@ mod sim_cluster_split_cluster;
 /// `crates/animusd/CLAUDE.md`'s matching residual-inventory entry.
 #[cfg(test)]
 mod sim_cluster_control_membership_admin;
+
+/// C-13 / ADR 0061 rung M PR 2 — the real seed/join discovery+claim dial,
+/// self-minted identity, combined mode only (the smallest end-to-end
+/// slice): `SimCluster::join_via_seed` drives the REAL `ClientRequest::
+/// JoinInfo` discovery round trip, a relayed `MetaCommand::RegisterNode`
+/// claim (exercising `is_relayable_command`'s allowlist from a
+/// follower-connected seed, not just the leader), and lets the REAL
+/// control leader's own `detect_loop`/`liveness_transitions`
+/// (`animus-control`) promote the joiner to `Active` on its own first
+/// observed heartbeat — never a bypass `UpsertMember` propose, unlike
+/// `SimCluster::grow`/`seed_members`. New production surface: `forwarding
+/// ::handle_relayed_request` gains a `ClientRequest::JoinInfo` arm (purely
+/// additive — production's own `handle_request` never delegates `JoinInfo`
+/// there, so this is reachable only from a `SimRelayClient` inbound
+/// dispatch); the `_via_relay` siblings of `lib.rs`'s pre-bind join
+/// functions live in `sim_cluster.rs` itself, `#[cfg(test)]`-only, never
+/// touching the byte-identical production functions they mirror. See
+/// `sim_cluster.rs`'s own doc on `SimCluster::join_via_seed` for the two
+/// documented forks this PR resolves (route tables, and why `ctx.control`
+/// stays `Remote` rather than production's real isolated-`Local`-raft-
+/// plus-mirror shape) and `crates/animusd/CLAUDE.md`'s matching appendix
+/// for the full account.
+#[cfg(test)]
+mod sim_cluster_seed_join;
+
+/// C-13 / ADR 0061 rung M PR 6 — `tests/control_membership_split.rs`'s own
+/// two real-socket tests, a mixed disposition: (1)
+/// `admin_add_control_member_races_a_control_only_self_registration_and_
+/// still_converges` converts cleanly (pure control-plane admin-vs-apply-task
+/// timing, already fully `<E, R>`-generic — one small `SimCluster::
+/// control_raft_indices` accessor added, no production behavior change);
+/// (2) `grow_then_replace_a_voter_over_a_split_deployment_with_live_data_
+/// traffic` stays real-socket — its own real subject needs a genuinely new
+/// `RaftNode<SimEnv>` joining the LIVE control quorum
+/// (`self.controls` growing, not just `self.nodes`), which
+/// `SimCluster::grow`'s own doc AND `sim_cluster_control_membership_admin.
+/// rs`'s own module doc (C-12 PR 4e) both independently flag as deferred,
+/// separately-budgeted machinery, not a small additive extension. See `sim_
+/// cluster_control_membership_split.rs`'s own module doc for the full
+/// assertion-by-assertion account and `crates/animusd/CLAUDE.md`'s matching
+/// appendix entry.
+#[cfg(test)]
+mod sim_cluster_control_membership_split;
+
+/// ADR 0061 rung N, C-14 PR 2: `SimCluster::grow_control`'s own test
+/// module — the primitive `sim_cluster_control_membership_split.rs`'s own
+/// doc (and `sim_cluster_control_membership_admin.rs`'s before it) named
+/// as deferred, separately-budgeted machinery: a genuinely new
+/// `RaftNode<SimEnv>` joining the LIVE control-plane voter quorum after
+/// construction, self-registered over the real relayed discovery path and
+/// admitted through the real `POST /admin/control/member/add` route. See
+/// `sim_cluster_control_growth.rs`'s own module doc for the two scenarios
+/// and `crates/animusd/CLAUDE.md`'s matching C-14 appendix.
+#[cfg(test)]
+mod sim_cluster_control_growth;
 
 /// Regression for the issue #298 residual confirmed live under the
 /// un-pinned `SplitMode::InPlace` proof soak (ADR 0018's matching amendment,

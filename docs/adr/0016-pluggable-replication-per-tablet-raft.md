@@ -8,7 +8,12 @@
   leaderless AP data plane this ADR framed CP as living "alongside" was deferred and
   its crate deleted, so the pluggable-backend *seam* collapsed to a single (CP)
   backend in v1. The decision here stands; both-planes is the long-shot future this
-  seam keeps possible.
+  seam keeps possible. **Note (issue #900, 2026-09-15):** because `RaftCore<C, S>`
+  (follow-up 2) is reused unchanged, `animus-cp-data`'s tablet groups inherit
+  issue #667's control-plane wiped-voter safety mechanism (ADR 0009's own
+  2026-09-15 amendments) for free at the core level; the driver-level wiring
+  that was still missing, and the fix, are written up in ADR 0017's own
+  matching amendment.
 - **Date:** 2026-08-03
 
 ## Context

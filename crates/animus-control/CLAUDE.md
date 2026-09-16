@@ -251,7 +251,50 @@ per-tablet CP data plane (`animus-cp-data`).
   S>>>` cache mutated in the same critical section as each op's own queue
   enqueue (the property the round/ack and GC arguments both rest on — see
   the type's own module doc for the full "Two APIs"/"Recovery / GC
-  contract" account). `physical_write_count()` is a plain running counter
+  contract" account). **A tolerated (halted-gated) failure now rolls that
+  mutation back rather than leaving it permanent (issue #838, fixed
+  2026-09-14)**: the eager-at-enqueue mutation is correct and load-bearing
+  for the FIFO ordering argument, but it is not itself a durability claim
+  — `submit_with_mutation` also snapshots the mutated tablet's own
+  `group_tails` entry from immediately before `mutate` runs
+  (`GroupTailsUndo{tablet, previous}`, carried on the queued `Pending`),
+  and `drive()`'s failure branch applies every batch member's own undo, in
+  **reverse** enqueue order (the LIFO unwind a batch coalescing several
+  `append_tagged` calls for the SAME tablet needs to land back on the
+  pre-batch state). Before this fix, a tolerated failure's phantom
+  mutation survived to be durably written out by a completely different,
+  healthy tablet's own next `compact_group`/`forget` whole-file rewrite —
+  see ADR 0028's matching 2026-09-14 amendment and `docs/engineering-
+  lessons.md`'s entry for the full incident and the general "eager for
+  ordering is not the same claim as final" lesson. Regression:
+  `crates/animus-cp-data/tests/sharedwal_fault_corpus.rs`'s cell (e).
+  **A tolerated `sync`-only failure's own buffered bytes are now repaired
+  before `drive()` can hand the file to the next queued op (issue #883,
+  fixed 2026-09-15)**: `#838`'s undo above is a `group_tails` (in-memory
+  bookkeeping) fix and has nothing to say about `flush`'s own `Append`
+  branch, where `env.append` succeeding before the round's own `env.sync`
+  fails leaves those bytes genuinely sitting in the file's un-synced
+  buffered region — `Disk::append`/`Disk::sync` are two independently
+  observable physical steps, and a failed `sync` does not retroactively
+  un-write bytes an earlier `append` already buffered. Left in place, a
+  completely different, healthy tablet's own next **ordinary** (not even
+  compacting) `append_tagged` round would extend the SAME buffered
+  region, and that tablet's own successful `sync` would durably commit
+  the whole thing, doomed bytes included. `flush` now repairs this
+  itself on a tolerated `Append`-batch `sync` failure: read the file
+  back, confirm its tail is exactly the bytes this round itself just
+  appended, and atomically `Disk::replace` the file with everything
+  before that tail — caller-agnostic (no `Serialize` bound needed, so it
+  covers the raw/untyped API too), no I/O added on the happy path,
+  best-effort (a repair failure leaves the caller with the same original
+  `sync` error as before this fix). See ADR 0028's matching 2026-09-15
+  amendment for the alternatives rejected. Regression:
+  `crates/animus-cp-data/tests/sharedwal_fault_corpus.rs`'s cell (f),
+  which needed a new `DiskConfig::set_sync_error_prob` knob in
+  `animus-sim` (every existing knob fires uniformly across every disk
+  op, so none could fail only a `sync` while leaving the repair's own
+  immediate `read`/`replace` free to succeed).
+  `physical_write_count()` is a plain running counter
   of completed physical writes (append-batches and rewrites alike) —
   the coalescing-observability primitive a caller (or a test) reads
   before/after a burst to measure the win directly, without needing a
@@ -321,6 +364,70 @@ per-tablet CP data plane (`animus-cp-data`).
   (a real `ProdEnv` restart).
 
 ## Key invariants
+
+- **Boot-time genesis-vs-wiped-restart check (ADR 0009's 2026-09-15
+  amendment, issue #667 — P0 Raft safety).** A `RaftCore` whose persisted
+  state replays empty (`node.rs`'s `drive`, the branch that keeps the
+  fresh `RaftCore::new` rather than calling `RaftCore::recovered`) never
+  grants a real vote or campaigns (`RaftCore::cluster_check_pending`/
+  `refused_as_voter`) until `begin_cluster_check`'s peer probe round
+  (`RaftMsg::ClusterProbe`/`ClusterProbeResp`) resolves whether this is a
+  genuine first-ever bootstrap/ADR 0060 growth join (safe — the config a
+  responding peer already has committed does not yet name this node id as
+  a voter) or an already-established voter's disk wiped clean (unsafe —
+  the peer's config already does; refuse permanently, re-admit only
+  through the learner/rejoin path, ADR 0032/0058). Gates only the real
+  vote grant in `handle_request_vote`, deliberately not `handle_pre_vote`
+  (touches no persisted state, so it's never part of the hazard — see the
+  ADR amendment for why gating it too was tried and reverted). The
+  initial probe is sent from a separate spawned task at boot (never
+  inline before the first `env.recv()`, which risks a multi-node-genesis
+  mutual stall) and reuses the SAME entropy `RaftCore::new`'s own
+  construction already drew, never a fresh draw — seemingly-unrelated
+  fixed-seed corpus cells can desync from either an extra draw or the
+  extra task/wire-traffic alone; see `docs/lessons/testing/2026-09-15-
+  boot-path-entropy-desyncs-fixed-seeds.md`. **CP data plane
+  (`animus-cp-data`) has the identical hazard, unfixed** — tracked as
+  issue #900, since a tablet's peer set is dynamic and reconstituted
+  constantly (unlike the control plane's one-time genesis config), a
+  materially different liveness tradeoff needing its own design decision.
+  **Two further real regressions in this same mechanism, found and fixed
+  the same day (ADR 0009's second 2026-09-15 amendment)**: (1)
+  `RaftCore::next_deadline()` didn't account for the cluster-check's own
+  independent resend deadline, so `node.rs`'s driver could oversleep past
+  a due resend for as long as `election_deadline` kept getting reset by
+  ordinary heartbeat traffic — fixed by including
+  `cluster_check_resend_deadline` in `next_deadline()`'s own `min(..)`.
+  (2) `config.contains(&self.id)` alone can never distinguish an ordinary
+  genesis race (every founder's config trivially contains every other
+  founder from birth) from a genuinely established restart — fixed by a
+  new `RaftMsg::ClusterProbeResp` field, `ever_heard_from_prober`, backed
+  by a per-core `heard_from: BTreeSet<NodeId>` marked ONLY at the three
+  sites representing a genuinely durable, forgettable vote (a candidate's
+  own self-vote, a vote WE granted it, or proof it won a real election) —
+  see `RaftMsg::ClusterProbeResp`'s and `RaftCore::
+  handle_cluster_probe_resp`'s own doc comments for the full decision
+  table, and the two matching `docs/lessons/code-patterns/2026-09-15-*`
+  entries for the incidents (including a real bug in the fix's own first
+  draft: a rejected vote is not participation, and counting it
+  reintroduced the exact false refusal the fix exists to prevent).
+  **Third amendment, same day**: `ever_heard_from_prober` was originally
+  wired as decisive on the FIRST peer to answer `false`, on the (false)
+  assumption that an established voter's peers all keep answering `true`
+  forever. `heard_from` is only marked at message sites that route through
+  a candidate/leader, so two ordinary followers that never themselves
+  campaign never learn of each other — any 3-voter cluster with one stable
+  leader is guaranteed to have a follower-follower pair that legitimately,
+  permanently answers `false` for each other. A real, deterministically
+  reproducing (not intermittent) `ProdEnv` failure in `prod_liveness.rs`'s
+  `wiped_voter_refuses_and_the_rest_of_the_cluster_keeps_serving` caught
+  this. Fixed by folding the signal into the SAME wait-for-every-peer
+  aggregation the established verdict already uses (decide only once
+  every peer has answered, refuse if *any* showed `true`, resolve fresh
+  only if *none* did) instead of letting a single `false` short-circuit
+  the wait — see `docs/lessons/testing/2026-09-15-a-per-peer-any-false-
+  signal-is-not-safe-when-the.md` and the new
+  `tests/wiped_voter_follower_peer_evidence.rs`.
 
 - **Config-in-log + current-term-commit gate (ADR 0017 C).** `LogEntry` may
   carry a `config: Option<voters>`; `RaftCore` keeps `peers`/`cluster_size` in
@@ -580,6 +687,21 @@ per-tablet CP data plane (`animus-cp-data`).
   progress row; `RecordBackupTabletComplete` is idempotent on an identical
   repeat but rejects a genuinely differing one outright (no repair-update
   path yet, unlike `SealStreamShard`'s replicas-only allowance).
+  **`BackupTabletProgress`/`RecordBackupTabletComplete` also carry
+  `chunk_count: u64` (issue #856, 2026-09-14)** — the capture driver's own
+  `CaptureCursor::next_chunk` at the moment its capture completed, so a
+  reporting tablet's valid chunk-object indices are exactly
+  `0..chunk_count`. This is restore's own recorded end-of-sequence bound
+  (`animusd::backup_restore::restore_tick`, threaded through the manifest
+  object via `BackupManifestTabletEntry::progress`): before this field
+  existed, restore's chunk sweep used "no object at this index" as its
+  sole end-of-sequence signal, which a `DeleteBackup` racing an in-flight
+  restore (with the janitor reclaiming chunks out of order) could turn
+  into a silently truncated table — see `docs/engineering-lessons.md`'s
+  matching entry and `docs/adr/0059-backup-restore.md`'s 2026-09-14
+  amendment for the full account. `#[serde(default)]` on both the field
+  and its `backup_progress_codec::Entry` wire counterpart, per this repo's
+  no-migration convention.
   `BackupStatus` already carries an `Expired` variant for the (not yet
   built) two-phase retention janitor's mark phase, so that later PR doesn't
   reshape the enum. **`DropTableSchema`/`DropTableTablets` deliberately
@@ -628,7 +750,24 @@ per-tablet CP data plane (`animus-cp-data`).
   `Expired`, rejects `Creating` as an apply-time seatbelt behind the wire
   edge's own `BackupInUseException` check), proposed by the `DeleteBackup`
   wire operation (`animusd::dynamo::delete_backup`) — never by the janitor
-  itself. The pre-existing `MetaCommand::DeleteBackup` (PR①'s own row-plus-
+  itself. **Issue #856's second half (2026-09-14)**: the apply arm also
+  rejects while `Metadata::backup_referenced_by_a_live_restore(backup_id)`
+  answers true — any restore still `Seeding` from this backup — the
+  authoritative seatbelt behind `delete_backup`'s own client-side
+  `BackupInUseException` check (a `metadata_fresh` read, so it can race a
+  restore that starts seeding in the narrow window between that read and
+  this propose; this apply-time check is what actually closes it). A
+  `Done`/`Failed` restore never blocks a delete. `MetaCommand::BeginRestore`
+  gained the mirror-direction seatbelt in the same change: it rejects when
+  its own `backup_id` names a row that is present but already
+  `Expired`/`Failed` (the shape a `MarkBackupDeleted` that commits between
+  the wire edge's own freshness read and this propose would produce) — a
+  `backup_id` naming no row at all (already fully reclaimed) is
+  deliberately left unrejected, the far narrower residual `RESTORE_STUCK_
+  TIMEOUT`'s own eventual `FailRestore` self-heals. See `docs/adr/0059-
+  backup-restore.md`'s 2026-09-14 amendment for the full account and both
+  halves' own unit tests (`mark_backup_deleted_refuses_while_a_restore_is_
+  seeding`/`begin_restore_rejects_an_expired_or_failed_backup`, `meta.rs`). The pre-existing `MetaCommand::DeleteBackup` (PR①'s own row-plus-
   progress removal) is unchanged and becomes the janitor's own
   **finalizing** command instead, proposed only once every one of a marked
   backup's objects has been reclaimed (`animusd::backup_janitor`); no new
@@ -1226,19 +1365,207 @@ per-tablet CP data plane (`animus-cp-data`).
   `snapshot_blob` by reference — it does NOT re-serialize per chunk**; a
   naive per-chunk serialize on a multi-MB metadata pins the loop past the
   election timeout (a self-sustaining election storm, invisible to
-  `SimEnv`'s virtual clock). Blob management differs by state-machine kind:
-  - **In-core (`Metadata`):** the blob is kept **eagerly**, so the
-    invariant `snapshot_index > 0 ⟹ blob.is_some()` holds and a chunk is
-    never a 0-byte ship (regression:
-    `install_snapshot.rs::caught_up_control_node_reships_non_empty`).
-  - **`DRIVER_APPLIED` (data-plane KV):** the image is the *engine* bytes,
-    built **lazily on demand** and dropped whenever it would go stale/idle,
-    so no whole-tablet image is retained at rest (regression:
+  `SimEnv`'s virtual clock). Blob management is keyed on
+  `S::DRIVER_APPLIED`, **not** "in-core vs. data-plane" — since ADR 0038
+  PR3's cutover, `Metadata::DRIVER_APPLIED = true` too (see `meta.rs`), so
+  this plane's own blob is built **lazily on demand**, the identical shape
+  to the data plane's:
+  - **A non-`DRIVER_APPLIED` toy state machine** (`generic_state_machine.rs`
+    only — nothing real in this workspace uses `DRIVER_APPLIED = false`
+    anymore) keeps the blob **eagerly**, so the invariant `snapshot_index >
+    0 ⟹ blob.is_some()` holds and a chunk is never a 0-byte ship
+    (regression:
+    `install_snapshot.rs::caught_up_control_node_reships_non_empty` proves
+    this for `Metadata` specifically by hand-driving the eager-image
+    contract as a stand-in for the real apply task — see that test file's
+    own module doc for why: it decouples the chunk-mechanics tests from a
+    real `StorageEngine`/`syskv_image` scan entirely).
+  - **`DRIVER_APPLIED` (both planes — the data-plane KV and, since ADR 0038
+    PR3, `Metadata`):** the image is the *engine* bytes (`syskv_image`/
+    `install_syskv_image` here), built **lazily on demand** by the apply
+    task (`meta_apply_and_compact`'s `image_needed`/`set_snapshot_blob`
+    handling) only once a replication attempt actually raises
+    `take_snapshot_needed`, and dropped whenever it would go stale/idle, so
+    no whole-tablet/whole-metadata image is retained at rest (regression:
     `driver_applied_sm.rs::caught_up_node_reships_non_empty_snapshot`).
 
   Liveness teeth:
   `install_snapshot.rs::large_snapshot_ships_in_o_chunk_time_not_o_state` +
   `tests/prod_liveness.rs`.
+
+  **A threshold-triggered compaction must defer while a peer's chunked
+  transfer is genuinely in flight (issue #898, the control-plane instance of
+  issues #532/#537's `animus-cp-data::COMPACT_DEFER_CEILING` finding).**
+  `snapshot_upto` unconditionally invalidates every peer's in-flight
+  transfer the moment the base moves again (required for correctness for a
+  lazily-built `DRIVER_APPLIED` blob — see that method's own doc). Without a
+  defer, ordinary sustained metadata churn — not even perpetual load, a
+  handful of trailing commits landing while a fresh follower's very first
+  transfer is still on the wire is enough — can re-cross
+  `SNAPSHOT_THRESHOLD` before the transfer lands, restarting it from chunk 0
+  forever. `meta_apply_and_compact`'s own doc claimed to mirror
+  `animus-cp-data::apply_and_compact`'s shape/ordering "precisely," but
+  never actually adopted this gate until issue #898 — confirmed live as the
+  root cause of `prod_liveness.rs`'s intermittent CI stall (issue #898,
+  recurrence of #741's shape one layer deeper: a follower stalling
+  permanently mid-catch-up with `control term Δ0`, not the compaction-
+  convergence poll #741 itself fixed). `node.rs`'s
+  `SNAPSHOT_COMPACT_DEFER_CEILING` (`SNAPSHOT_THRESHOLD * 8`, mirroring
+  `COMPACT_DEFER_CEILING`'s own derivation exactly) is the fix — a
+  THRESHOLD-triggered (never `image_needed`-triggered — a peer is actively
+  waiting on that exact image) compaction defers while
+  `RaftCore::snapshot_transfer_in_flight()` is true, up to that ceiling,
+  which still bounds the WAL even if a peer's transfer never completes.
+  **`snapshot_transfer_in_flight()` itself had a second, compounding gap**:
+  defined purely off `snapshot_offset` (populated only once a peer's FIRST
+  ack is *processed*), it reported `false` for the whole round trip from
+  "leader ships chunk 0" to "leader processes the first ack" — a window a
+  slow/contended peer or link (`ProdEnv`'s real shape) can stretch
+  arbitrarily far — so the defer never engaged during exactly the window it
+  mattered most. Fixed by widening the accessor to also check
+  `snapshot_chunk_sent` (set at SEND time, not ack time) — both maps are
+  already cleared together at every existing invalidation/completion point,
+  so this benefits `animus-cp-data` for free (same shared `RaftCore`).
+  Regression: `tests/snapshot_compaction_race.rs` (a `SimEnv` test with an
+  artificially slow leader<->follower link, since `SimEnv`'s own near-zero
+  default latency lets a small synthetic transfer outrun even a bursty
+  churn schedule and never exposes the race).
+
+  **Fixing that defer unmasked a THIRD, previously-latent bug** — read this
+  if you ever touch `handle_install_snapshot_resp`'s mid-transfer branch or
+  the defer gate above again: a leader's per-peer `snapshot_offset`/
+  `snapshot_chunk_sent` bookkeeping is never reset when that peer's
+  *process* restarts (same `NodeId`, a brand-new empty `RaftCore`), and a
+  restarted follower reporting `next_offset == 0` forever can never be
+  reconciled against a leader that keeps resending from its own stale,
+  now-unreachable non-zero offset (`handle_install_snapshot`'s `fresh &&
+  offset == 0` reassembly gate can't bootstrap from a non-zero offset onto
+  an empty buffer). This was **masked** before the defer fix: ordinary
+  threshold-triggered recompaction fired often enough, independent of any
+  peer's own transfer state, to incidentally wipe this stale bookkeeping
+  clean before a restarted peer's next request ever hit it — making
+  compaction fire less often removed that accidental safety net.
+  `tests/control_corpus.rs`'s pre-existing
+  `chunked_snapshot_receiver_stop_restart_3` caught this immediately (a
+  real `StopRestart` of the receiver mid-transfer) once the defer fix
+  landed. Fixed by `snapshot_offset_regressions: BTreeMap<NodeId, u32>` +
+  `SNAPSHOT_OFFSET_REGRESSION_REBASE`: a peer's mid-transfer ack reporting
+  an offset below the currently tracked one increments a per-peer counter
+  instead of being silently absorbed by the existing monotonic `max` guard;
+  once that counter crosses the (small, bounded) threshold with no
+  intervening forward progress, the leader REBASES down to the peer's own
+  reported truth rather than trusting its own stale record — distinguishing
+  "a stale, reordered ack for the ongoing transfer" (self-heals within a
+  round trip, seen once or twice — tolerate it) from "the peer's buffer
+  genuinely reset" (persists indefinitely — must be honored) by consecutive
+  count, not a one-shot check. See `docs/lessons/testing/
+  2026-09-14-control-snapshot-catch-up-stall.md` for the full incident and
+  the generalizable lesson (a fix that makes a background process fire
+  *less* often can remove an accidental cleanup side effect a different
+  code path was quietly relying on — re-run the FULL existing suite, not
+  just the new regression, before calling a fix done).
+
+  **Two more gaps in the same mechanism, found stress-running
+  `prod_liveness.rs` under real `ProdEnv` contention (not caught by any
+  `SimEnv` test)**:
+
+  - **Fourth: the leader-only `snapshot_offset`/`snapshot_offset_
+    regressions`/`snapshot_chunk_sent` bookkeeping outlived losing
+    leadership.** `RaftCore::handle`'s generic higher-term step-down already
+    clears a stale `transfer_target` on the exact same reasoning ("a future
+    `is_leader`-independent inspection must never report a transfer in
+    flight for a node that isn't leading") but never extended that to these
+    three maps. Since `snapshot_transfer_in_flight()` has no `role ==
+    Leader` guard of its own, a sender-side entry surviving an ordinary
+    leadership handoff under real contention (not a bug by itself) made
+    this node's *own* local compaction defer forever afterward, on behalf
+    of a transfer with no sender left. Fixed by clearing all three at that
+    step-down site too.
+  - **Fifth: even with the fourth fix, a peer that never acks at all
+    (down, partitioned, or configured but never started — exactly what
+    `large_metadata_catch_up_stays_live`'s dark node 2 is) can still wedge
+    compaction forever**, since `SNAPSHOT_COMPACT_DEFER_CEILING`'s escape
+    hatch is sized in `behind` and simply never grows once a burst of
+    writes stops. **Three designs were tried at this one gap; the first
+    two were built, validated against `prod_liveness.rs`, and only later
+    found wrong against a DIFFERENT test in the plane that shares this
+    same `RaftCore`** — see the lessons doc for the full chronology:
+    1. A resend-COUNT proxy for elapsed time — **rejected**: it scales
+       with `heartbeat_interval`, not with how slow a genuinely live peer
+       might legitimately be, and `snapshot_compaction_race.rs`'s own
+       slow-link test needed ~40 un-acked heartbeat resends before a real
+       peer's first-ever ack, landing right at a plausible count
+       threshold and reopening the original race for a transfer that was
+       actually fine.
+    2. A flat "time since the defer streak started" ceiling, gated on
+       `RaftCore::peer_last_contact` going stale as a faster secondary
+       escape — **rejected**: `become_leader` optimistically seeds EVERY
+       peer's `last_contact` to the moment leadership begins (see that
+       method's own doc), so a peer that never started at all and a peer
+       that stopped responding mid-transfer are both "stale relative to
+       leadership start" by that field alone — indistinguishable. Worse,
+       a flat "time since streak started" (rather than "idle") ceiling
+       conflates "this transfer has run a while" (fine — a large
+       multi-chunk snapshot legitimately takes many round trips) with
+       "this transfer has made no progress in a while" (the actual
+       question); `animus-cp-data/tests/hlc_differential_skew.rs`'s own
+       crashed-peer scenario needed the answer within a few virtual
+       seconds, far tighter than any margin safe for a large real
+       transfer's TOTAL duration — a single constant cannot honestly
+       answer both.
+    3. **Shipped**: an **idle-progress-gated** ceiling —
+       `SNAPSHOT_COMPACT_DEFER_IDLE_CEILING` (2s) — that bounds idle time
+       since the LAST observed forward progress, never total transfer
+       duration. `RaftCore::snapshot_transfer_peers()` (the set of peers
+       with an outstanding transfer — reinstated after the rejected
+       peer-recency design above, repurposed) plus the pre-existing
+       `RaftCore::snapshot_chunk_advances(peer)` (a genuine
+       forward-progress counter — already the exact metric
+       `snapshot_resend_bound.rs` uses for the identical reason) give the
+       driver a real progress signal: `meta_apply_and_compact` sums
+       `snapshot_chunk_advances` across every outstanding peer each pass
+       and resets its own `compact_defer_since: Option<Nanos>` to `now`
+       every time that sum changes, so the idle clock only ever measures
+       time since the last genuine advance. `RaftCore::
+       snapshot_transfer_in_flight()` needed no change for any of the
+       three designs — it stays the pure, `now`-unaware fact its own doc
+       says it should be; the time-awareness belongs entirely at the
+       driver layer that already has `env.now()`.
+  - **Sixth, found only by running `cargo test -p animus-cp-data` in
+    full (not `--lib`, which skips every `tests/*.rs` integration
+    binary) — the shared `RaftCore` widening from the SECOND fix above
+    (issue #898's own `snapshot_transfer_in_flight` gap-closer) regressed
+    `animus-cp-data`'s own, PRE-EXISTING `hlc_differential_skew.rs`.**
+    A crashed, partitioned replica's phantom, never-to-be-acked
+    `InstallSnapshot` chunk held `snapshot_transfer_in_flight()` true on
+    the SENDER indefinitely, wedging that replica's own compaction of an
+    unrelated failed-CAS burst — the exact non-row-writing-entry
+    durable-watermark advance that test exists to prove (ADR 0018 §2's
+    issue #804 amendment). Fixed by mirroring the SAME idle-progress-gated
+    ceiling (design 3 above) into `animus-cp-data`'s own
+    `apply_and_compact`/`apply_loop` — see that crate's own
+    `COMPACT_DEFER_IDLE_CEILING` and its `CLAUDE.md`'s matching entry.
+    **The standing lesson this cost a full validation cycle to learn**:
+    any change to `animus-control`'s `RaftCore` needs `cargo test -p
+    animus-cp-data` run in FULL (integration tests included), never just
+    `--lib` — the two planes share this exact state machine, and `--lib`
+    only runs `lib.rs`'s own in-crate `#[cfg(test)]` module, silently
+    skipping every one of that crate's ~55 `tests/*.rs` binaries. Added to
+    this crate's own Tests section above — see it for the exact command.
+  - None of the fourth/fifth/sixth gaps has a dedicated `SimEnv`
+    regression (all are real-thread-contention/real-leadership-churn/
+    cross-plane shapes); validated instead by 10-20x stress reps of
+    `prod_liveness.rs` per round (0 failures with the shipped design,
+    versus 20-40% with only the first three fixes) plus the full
+    `animus-cp-data`/`animus-control` suites for the sixth. See the
+    lessons doc above for the fuller account and the generalized lesson:
+    any new bookkeeping feeding a defer/backoff gate needs an explicit
+    answer to "what retires this, on *every* path that can make it stale,
+    not just the happy one" — "how long is too long" is an `env.now()`
+    question that belongs in the driver, never a retry count or a
+    same-leadership-stint contact timestamp standing in for one — and it
+    must measure idle time since the last real progress, never total
+    elapsed time, or it can't tell "large and slow" from "stuck" either.
 
   **`state_machine_behind` + `AppendEntriesResp::needs_snapshot` (issue
   #554, ADR 0009's 2026-09-02 addendum): a follower-to-leader "I need a
@@ -1458,7 +1785,20 @@ per-tablet CP data plane (`animus-cp-data`).
 ## Tests
 
 `cargo test -p animus-control` (use `run_for`, never `run()` — perpetual
-heartbeats). One binary per behavior; the file names describe them
+heartbeats). **Any change to `RaftCore` (`raft.rs`) or its driver (`node.rs`)
+must also gate on `cargo test -p animus-cp-data` run in FULL — never
+`--lib`** (issue #898's sixth gap, above): the two planes share this exact
+state machine, and `--lib` only runs `lib.rs`'s own in-crate `#[cfg(test)]`
+module, silently skipping every one of that crate's `tests/*.rs` integration
+binaries (`hlc_differential_skew.rs` among them — the one that caught this
+gap after `--lib` alone reported green). **A `RaftCore`/boot-path change also
+gates on `cargo test -p animus-control --features prod-heavy` too**: this
+crate's `prod_liveness.rs` and `control_membership_prod.rs` are `[[test]]`
+targets with `required-features = ["prod-heavy"]`, so a plain `cargo test -p
+animus-control` silently skips both real-thread `ProdEnv` liveness binaries
+(issue #667's third amendment found this the hard way — a full plain run
+reported green while CI's `--all-features` run caught a real, deterministic
+failure the skipped binary alone exercised). One binary per behavior; the file names describe them
 (`ls crates/animus-control/tests/`) — covering Raft core mechanics
 (election/replication/leader-kill, the DRIVER_APPLIED apply gate, pre-vote,
 leadership transfer, snapshot/InstallSnapshot), the ADR 0038 mirror/delta

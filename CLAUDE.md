@@ -497,26 +497,28 @@ truth; this map is just for navigation.
 
 ## Engineering practices
 
-**Standing instruction (the mechanism): the repo keeps an append-only
-institutional-memory log at
-[`docs/engineering-lessons.md`](docs/engineering-lessons.md).** Whenever you —
-human or agent — discover a non-obvious lesson, gotcha, or better way of
-working *during a task* (a bug whose root cause generalizes; a test that caught
-what the gates didn't; a workflow misstep that cost time), **add an entry
-there, with the *why*, in the same change** — don't wait to be asked. Every
-agent prompt for this repo must include: "if you learn a generalizable lesson,
-record it in `docs/engineering-lessons.md` (and the relevant crate guide)
-before you finish." Codebase-specific gotchas also belong in that crate's
-`CLAUDE.md`; the log holds the cross-cutting ones. Prune/merge entries that
-become obsolete; entries whose specific mechanism was deleted or replaced move
-verbatim to
-[`docs/engineering-lessons-archive.md`](docs/engineering-lessons-archive.md)
-(so the history stays greppable), leaving a one-line pointer when the lesson
-still generalizes.
+**Standing instruction (the mechanism): the repo keeps an institutional-memory
+log, one file per entry, under
+[`docs/lessons/`](docs/lessons/) (see [`docs/engineering-lessons.md`](docs/engineering-lessons.md)
+for the full layout).** Whenever you — human or agent — discover a
+non-obvious lesson, gotcha, or better way of working *during a task* (a bug
+whose root cause generalizes; a test that caught what the gates didn't; a
+workflow misstep that cost time), **record it as a new file under
+`docs/lessons/<section>/`, with the *why*, in the same change** — don't wait
+to be asked, and don't edit any other file to do it (that's the whole point:
+concurrent PRs adding lessons never touch the same line). Every agent prompt
+for this repo must include: "if you learn a generalizable lesson, record it
+as a new file under `docs/lessons/` (and the relevant crate guide) before you
+finish." Codebase-specific gotchas also belong in that crate's `CLAUDE.md`;
+the log holds the cross-cutting ones. Prune/merge entries that become
+obsolete; to archive an entry whose specific mechanism was deleted or
+replaced, `git mv` its file into `docs/lessons/archive/` (so the history
+stays greppable), leaving a one-line pointer when the lesson still
+generalizes.
 
-**Read the log's relevant section (Testing / Code patterns / Parallel-agent
-orchestration) before starting non-trivial work.** The rules you will need
-most often, distilled:
+**Read the relevant directory (`docs/lessons/testing/`,
+`docs/lessons/code-patterns/`, `docs/lessons/orchestration/`) before starting
+non-trivial work.** The rules you will need most often, distilled:
 
 - **A flaky test is a real bug, full stop** — see Session operating mode
   item 4: `main` is green all the time, nothing merges on red, and a

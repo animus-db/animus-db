@@ -437,7 +437,24 @@ async fn disable_survives_concurrent_periodic_seal_on_local_route() {
         // One more clean (non-racing) round proves the fix doesn't
         // silently drop coverage across the stress loop above: every write
         // in this fresh generation is fully accounted for by that
-        // generation's own sealed segments before the final disable.
+        // generation's own sealed segments before the table moves on.
+        //
+        // The coverage check below is driven by the **final disable**, not
+        // by waiting on the ambient periodic sealer (issues #626/#875 fix,
+        // 2026-09-16). `UpdateContinuousBackups(false)` runs
+        // `ClientCtx::force_pitr_seal_tablet` (F12-b) to completion before
+        // it ever returns 200 — the exact same `pitr_seal_now` sequence the
+        // periodic arm uses, but behind its own commit-wait retry loop this
+        // test already trusts unconditionally (see the `assert_eq!` right
+        // below it). Checking coverage against the periodic arm's own
+        // real-time cadence *first*, as this test used to, made the
+        // assertion depend on `change_consumer_loop`'s background tokio
+        // task getting scheduled again within a fixed wall-clock budget —
+        // a real-thread-liveness property `ProdEnv` cannot bound (see
+        // `docs/engineering-lessons.md`'s Testing section) and orthogonal
+        // to what this round exists to prove. Sealing deterministically
+        // first keeps the same "no write is ever silently lost" property
+        // without gambling on periodic-tick scheduling under host load.
         let (status, body) = update_continuous_backups(node.dynamo_addr(), table, true).await;
         assert_eq!(status, 200, "final re-enable failed: {body}");
         let generation = node
@@ -449,6 +466,16 @@ async fn disable_survives_concurrent_periodic_seal_on_local_route() {
         for i in 0..FINAL_WRITES {
             put_item_padded(node.dynamo_addr(), table, &format!("final-{i}"), 40).await;
         }
+
+        let (status, body) = update_continuous_backups(node.dynamo_addr(), table, false).await;
+        assert_eq!(status, 200, "final disable failed: {body}");
+
+        // The disable above already forced every pending record through
+        // `pitr_seal_now` to completion — this is a fast sanity check, not
+        // a real wait; kept as a converged-or-timeout poll (rather than a
+        // one-shot assert) only as defense-in-depth, matching this
+        // codebase's own "eventual properties get a converged-or-timeout
+        // poll" discipline.
         await_true(
             20,
             "this generation's PITR segments cover every final write",
@@ -464,9 +491,6 @@ async fn disable_survives_concurrent_periodic_seal_on_local_route() {
             },
         )
         .await;
-
-        let (status, body) = update_continuous_backups(node.dynamo_addr(), table, false).await;
-        assert_eq!(status, 200, "final disable failed: {body}");
     })
     .await
     .expect("did not converge in time");

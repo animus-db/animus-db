@@ -130,6 +130,7 @@ fn complete_a_backup(cluster: &mut SimCluster, table: &str, backup_id: &str) {
                 tablet,
                 cut_version: 10,
                 bytes: 100,
+                chunk_count: 1,
             })
         ),
         "RecordBackupTabletComplete rejected"
@@ -447,8 +448,52 @@ fn c2_leadership_transfer_yields_one_clean_reclaim() {
 
 #[test]
 fn c2_leadership_transfer_yields_one_clean_reclaim_over_seeds() {
-    for i in 0..5 {
-        run_c2_leadership_transfer_yields_one_clean_reclaim(0xBAC7_4000 + i);
+    // Issue #900: wiring issue #667's boot-time cluster check into
+    // `animus-cp-data`'s own tablet-group driver (this fixture's `orders`
+    // table hosts real `RaftKvNode` tablet groups alongside the control
+    // plane) draws extra entropy on every fresh-group replica's boot,
+    // reshuffling this corpus's tuned timing — the same "boot-path entropy
+    // desync" collateral documented in `docs/lessons/testing/2026-09-15-
+    // boot-path-entropy-desyncs-fixed-seeds.md`.
+    //
+    // **`0xBAC7_4002` (3133620226) genuinely never converged, even at 10x
+    // the original budget — characterized, not re-pinned away.** Traced
+    // with fine-grained (20ms) per-node role/term snapshots
+    // (`SimCluster::transfer_control_leadership_to`'s own temporary
+    // instrumentation, not committed): the reshuffled entropy lands this
+    // seed's election timeouts close enough together that, ~40-60ms after
+    // the transfer arms on the original leader (node 2, term 1), an
+    // ordinary Raft-legal split-vote/re-election sequence runs — node 0
+    // briefly wins term 2, is immediately superseded, node 2 campaigns for
+    // term 3 and stalls uncontested for ~160ms, then all three jump to
+    // term 4 and node **1** (never the transfer's own target, node 0) wins
+    // and stays a perfectly healthy, stable leader for the rest of the
+    // run. `cluster_check_pending`/`refused_as_voter` are `false` on every
+    // control node throughout the entire sequence — issue #900's own
+    // mechanism never engages here at all; the storm is an ordinary,
+    // bounded (~300ms) Raft election outcome the entropy shift merely
+    // made reachable for this seed. The real defect this exposed:
+    // `transfer_control_leadership_to` armed the transfer once, on the
+    // leader observed at entry, then passively waited a fixed window —
+    // once that leader was deposed by the unrelated storm, the transfer
+    // was stranded forever (the new leader, node 1, never received any
+    // arm request and had no reason to ever step down). Fixed in that
+    // method itself: it now re-issues the arm against whoever currently
+    // leads on every poll, so a deposed arm is simply re-armed on the new
+    // leader instead of being silently lost. With the fix, `0xBAC7_4002`
+    // converges within 500ms of the fixed retry loop starting
+    // (measured directly: `ANIMUS_SEED=3133620226 cargo test -p animusd
+    // --lib c2_leadership_transfer_yields_one_clean_reclaim`), comfortably
+    // inside the loop's own 8s budget — pinned back in, proven rather than
+    // avoided.
+    for seed in [
+        0xBAC7_4000,
+        0xBAC7_4001,
+        0xBAC7_4002,
+        0xBAC7_4003,
+        0xBAC7_4004,
+    ] {
+        run_c2_leadership_transfer_yields_one_clean_reclaim(seed);
     }
 }
 
@@ -593,4 +638,75 @@ fn e_an_available_backup_is_never_touched_over_seeds() {
     for i in 0..5 {
         run_e_an_available_backup_is_never_touched(0xBAC7_6000 + i);
     }
+}
+
+/// Regression for the `SimCluster::transfer_control_leadership_to` fix
+/// (issue #900 follow-up, PR #907, `ba883bb5`): an armed leadership
+/// transfer must survive its own leader being deposed (by an unrelated
+/// event) before the handoff lands, not just a leader that stays put the
+/// whole time.
+///
+/// **Found live** (not invented for this test): wiring issue #667's
+/// boot-time cluster check into `animus-cp-data`'s own tablet-group
+/// driver (issue #900) draws extra entropy at every fresh tablet group's
+/// boot, reshuffling later random draws for the rest of a `SimEnv` run —
+/// for one specific seed (`0xBAC7_4002`,
+/// `c2_leadership_transfer_yields_one_clean_reclaim_over_seeds` above),
+/// this landed the control group's own election timeouts close enough
+/// together that an ordinary, Raft-legal split-vote/re-election sequence
+/// deposed the armed leader in favor of a THIRD node that never received
+/// any transfer request, stranding the transfer forever (`term` 1 -> 2 ->
+/// 3 -> 4 across all three voters within ~300ms, settling on a stable
+/// leader that was never the transfer's own target). PR #907 fixed
+/// `transfer_control_leadership_to` itself (re-issue the arm against
+/// whoever currently leads, every poll) but landed without a regression
+/// that reproduces the race deterministically from `main`'s own state —
+/// this test is that regression.
+///
+/// **Reproduces the identical shape without depending on any entropy
+/// shift**: [`SimCluster::schedule_crash_after`] deterministically
+/// crashes the (about to be) armed leader 50ms into
+/// `transfer_control_leadership_to`'s own execution — landing *during*
+/// its internal `run_for` calls, not merely between two top-level test
+/// steps — so the natural re-election that follows is the thing that
+/// deposes the armed leader, exactly as the live incident did, just
+/// triggered on a fixed schedule instead of a lucky/unlucky timing
+/// coincidence.
+///
+/// `SEED = 11` was found by a direct scan of seeds `0..20_000` run
+/// against a **local, temporary revert** of `transfer_control_
+/// leadership_to` back to the pre-#907 arm-once-then-passive-wait shape
+/// (never committed — this test targets the fixed code that is actually
+/// on `main`). That scan found 5 failing seeds before it was capped:
+/// `[11, 24, 32, 44, 53]`. For seed 11 specifically: leader = 2,
+/// target = 0, and the surviving pair `{0, 1}` settles on 1 (the decoy)
+/// once 2 crashes — under the old code this produced exactly
+/// `control leadership must move to node 0 within budget (still on 1)`.
+/// Confirmed **red** against that reverted old code and **green** against
+/// the fix that is on `main` today — this is not a seed picked for "it
+/// happens to fail", it is the shape the fix exists to handle.
+#[test]
+fn transfer_survives_the_armed_leader_being_deposed_before_handoff_completes() {
+    const SEED: u64 = 11;
+    let mut cluster = SimCluster::new(SEED, 3, 3);
+    let leader_idx = cluster.control_leader_index();
+    let leader = cluster.control_node_id(leader_idx);
+    // Confirmed via direct scan for this seed: leader == 2, target == 0,
+    // and the surviving pair {0, 1} settles on 1 (the decoy) first once 2
+    // crashes under the old, arm-once-then-wait implementation.
+    let target = (0..3u64)
+        .find(|&n| n != leader)
+        .expect("a non-leader exists");
+
+    cluster.schedule_crash_after(leader, Duration::from_millis(50));
+    cluster.transfer_control_leadership_to(target);
+
+    let final_leader_idx = cluster.control_leader_index();
+    let final_leader = cluster.control_node_id(final_leader_idx);
+    assert_eq!(
+        final_leader, target,
+        "seed={SEED}: control leadership must converge to the transfer's own target ({target}) \
+         even though its originally-armed leader ({leader}) was deposed by an unrelated crash \
+         before the handoff completed — found leader {final_leader} instead"
+    );
 }

@@ -424,16 +424,27 @@ async fn two_of_three_replica_diff_placing_target_converges_end_to_end() {
             .expect("connect client port");
         put(&mut client, vec![b'k', 0], vec![b'v', 0]).await;
         let parent = sole_tablet_of(&nodes[0], "t");
-        let (_, status0) = admin(nodes[0].admin_addr(), "GET", "/admin/status", None).await;
-        assert_eq!(
-            {
-                let mut r = tablet_replicas(&status0, parent);
+
+        // The freshly-provisioned tablet's initial replica set is an
+        // eventual property, not a one-shot fact — see docs/lessons/
+        // testing/2026-09-16-a-faster-bootstrap-time-schema-proposal-
+        // makes-initial-tablet-placement-an-eventual-property.md
+        // (issue #610/#622/#670). This test's own two-replica-move premise
+        // genuinely needs all three original nodes, so poll for the full
+        // set before proceeding.
+        let admin_addr = nodes[0].admin_addr();
+        support::poll_until_or_stalled(
+            admin_addr,
+            "tablet never converged to the 3 founding members",
+            Duration::from_millis(100),
+            || async move {
+                let (_, status) = admin(admin_addr, "GET", "/admin/status", None).await;
+                let mut r = tablet_replicas(&status, parent);
                 r.sort();
-                r
+                r == vec!["n0", "n1", "n2"]
             },
-            vec!["n0", "n1", "n2"],
-            "unexpected initial replica placement"
-        );
+        )
+        .await;
 
         // Grow by TWO lower-sorting nodes ("m0" < "m1" < "n0") — the exact
         // two-of-three shape issue #513 reports.

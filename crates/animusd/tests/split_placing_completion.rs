@@ -451,17 +451,25 @@ async fn placing_relocates_a_child_off_the_parents_original_nodes_and_the_comple
             .expect("connect client port");
         put(&mut client, vec![b'k', 0], vec![b'v', 0]).await;
         let parent = sole_tablet_of(&nodes[0], "t");
-        let (_, status0) = admin(nodes[0].admin_addr(), "GET", "/admin/status", None).await;
-        assert_eq!(
-            {
-                let mut r = tablet_replicas(&status0, parent);
+        // The freshly-provisioned tablet's initial replica set is an
+        // eventual property, not a one-shot fact — see docs/lessons/
+        // testing/2026-09-16-a-faster-bootstrap-time-schema-proposal-
+        // makes-initial-tablet-placement-an-eventual-property.md. This
+        // test's own growth-forces-a-move premise genuinely needs all
+        // three original nodes, so poll for the full set before proceeding.
+        let admin_addr = nodes[0].admin_addr();
+        support::poll_until_or_stalled(
+            admin_addr,
+            "tablet never converged to the 3 founding members",
+            Duration::from_millis(100),
+            || async move {
+                let (_, status) = admin(admin_addr, "GET", "/admin/status", None).await;
+                let mut r = tablet_replicas(&status, parent);
                 r.sort();
-                r
+                r == vec!["n0", "n1", "n2"]
             },
-            vec!["n0", "n1", "n2"],
-            "unexpected initial replica placement — the growth-forces-a-move \
-             premise of this test depends on it"
-        );
+        )
+        .await;
 
         // Grow the cluster by one node whose id sorts BELOW every existing
         // one ("m" < "n" lexically) — see this file's own module doc for

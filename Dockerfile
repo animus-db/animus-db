@@ -107,10 +107,10 @@ LABEL org.opencontainers.image.source="https://github.com/animus-db/animus-db" \
       org.opencontainers.image.title="animus-operator" \
       org.opencontainers.image.description="AnimusDB Kubernetes operator (AnimusCluster controller)"
 
-# ca-certificates is required here (unlike the animusd runtime stage below):
-# `animus-operator` talks to the Kubernetes API server over TLS via `kube`'s
-# rustls-platform-verifier stack, which needs a real trust store to verify
-# that connection.
+# ca-certificates is required here: `animus-operator` talks to the Kubernetes
+# API server over TLS via `kube`'s rustls-platform-verifier stack, which needs
+# a real trust store to verify that connection. (The animusd runtime stage
+# below needs it too, for its own outbound TLS to an S3 object store.)
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
@@ -132,11 +132,21 @@ LABEL org.opencontainers.image.source="https://github.com/animus-db/animus-db" \
       org.opencontainers.image.title="animusd" \
       org.opencontainers.image.description="AnimusDB node server and operator CLI"
 
-# No extra runtime packages: the binaries are dynamically linked against
-# glibc only, which bookworm-slim already ships. (An outbound-TLS backup
-# target such as an S3 `SegmentStore`, ADR 0059, would need ca-certificates
-# added here — not yet required by anything v1 ships.)
-RUN groupadd --system --gid 1000 animus \
+# ca-certificates is required: an S3 `SegmentStore`/backup store (ADR 0059,
+# ADR 0068 — `--segment-store`/`--backup-store s3://...`, and the operator's
+# own `spec.s3`) dials the endpoint over TLS, and `animus-s3`'s transport
+# builds its root store from the OS's native certificates
+# (`rustls_native_certs::load_native_certs`), which on Debian only the
+# ca-certificates package populates. Without it that store is empty, every
+# peer certificate is untrusted, and every HTTPS object-store operation fails
+# the handshake at runtime with nothing catching it earlier — the cargo gates
+# never build this image, and the S3 e2e leg deliberately uses plaintext
+# `http://` MinIO. Otherwise no extra runtime packages: the binaries are
+# dynamically linked against glibc only, which bookworm-slim already ships.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system --gid 1000 animus \
     && useradd --system --uid 1000 --gid animus --home-dir /var/lib/animus --shell /usr/sbin/nologin animus \
     && mkdir -p /var/lib/animus \
     && chown -R animus:animus /var/lib/animus

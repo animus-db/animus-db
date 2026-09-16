@@ -840,16 +840,95 @@ left for a reader to discover by diffing prose against code.
   status field" discipline the codebase already applies to a GSI's own
   `IndexStatus` and to `BackupStatus`'s relationship to capture progress.
 - **A restore does not pin/lock its source backup against a concurrent
-  `DeleteBackup`** — a narrow, accepted residual, not a defended property.
-  If a backup is marked deleted (and, rarer still, actually reclaimed by
-  the janitor) while a restore reading from it is still in flight, the
-  restore driver's own defensive check (re-reading the backup's live
-  status each tick) fails the restore outright (`FailRestore`) rather than
-  serving a half-seeded table — never a correctness violation, but a
-  liveness one an operator could hit by deleting a backup at an unlucky
-  moment mid-restore. Closing it (a reference count, or refusing
-  `DeleteBackup` while any `Seeding` restore names the backup) is a named
-  follow-up, not implemented in this train.
+  `DeleteBackup` — corrected 2026-09-14 (issue #856): this WAS a genuine
+  correctness violation, not merely a liveness one, until the fix below
+  landed.** The per-tick defensive check this paragraph originally
+  described (re-reading the backup's live status once, before each
+  `restore_tick` call) only ever caught a deletion observed **between**
+  ticks — it has no way to notice a deletion that lands **during** the
+  sweep a tick is already running, and `restore_tick`'s own chunk loop
+  used "no object at this index" as its sole end-of-sequence signal, with
+  no recorded expected chunk count to tell a genuine hole apart from
+  ordinary exhaustion. A `DeleteBackup` racing an in-flight restore, with
+  the janitor then reclaiming chunks **out of chunk order** (a real
+  backup store's `list` is unsorted and chunk ids aren't zero-padded, so
+  nothing stops chunk 7 being deleted before chunk 3), could — and, before
+  the fix, reliably did — make the sweep read a still-present later chunk
+  first, hit the hole where an earlier chunk used to be, and misread that
+  hole as "this tablet's chunks are exhausted": the restore completed
+  successfully with every row from the deleted chunk onward silently
+  missing. **Fixed** by recording each tablet's own expected chunk count
+  at capture time (`BackupTabletProgress::chunk_count`, `animus-control`)
+  and bounding `restore_tick`'s sweep to it: a missing chunk strictly
+  before that recorded bound is now a hard `FailRestore`, never a silent
+  "done." See `crates/animus-control/src/meta.rs`'s
+  `BackupTabletProgress::chunk_count`/`MetaCommand::
+  RecordBackupTabletComplete` doc and `crates/animusd/src/
+  backup_restore.rs`'s `restore_tick` for the mechanism, and
+  `crates/animus-test/tests/backup_fault_corpus.rs`'s
+  `delete_backup_mid_restore_fails_restore` cell for the regression
+  (proven red on the pre-fix "`Ok(None)` is the sole end-of-sequence
+  signal" algorithm, green with the recorded-bound fix).
+
+  **Issue #856's second half, closed the same day (stacked follow-up PR)**:
+  `DeleteBackup` (via its own two-phase-janitor **mark** step,
+  `MetaCommand::MarkBackupDeleted`) now refuses outright — client-side
+  (`animusd::dynamo::delete_backup`, a new `BackupInUseException` check,
+  the same wire-error shape the still-`Creating` case already used) and,
+  as the authoritative seatbelt, at apply time
+  (`MetaCommand::MarkBackupDeleted`'s own apply arm,
+  `Metadata::backup_referenced_by_a_live_restore` — any restore still
+  `Seeding` from that backup) — while a restore sourced from it is still
+  in progress. `Done`/`Failed` restores never block a delete; the block
+  clears the instant a restore reaches either terminal state. The
+  short-read guard above is unchanged and stays load-bearing as the
+  fallback for whatever residual race remains (below) — this closure
+  narrows the window to essentially nothing, it does not replace that
+  guard.
+
+  **The mirror race — a restore kicked off against a backup already
+  marked for deletion — is also closed, mostly.** `RestoreTableFromBackup`/
+  `RestoreTableToPointInTime`'s own `visible_backup` freshness read already
+  treats `Expired`/`Failed` as `BackupNotFoundException` before ever
+  proposing `BeginRestore`, so the common case (the mark has already
+  committed by the time a restore is requested) was never reachable to
+  begin with. The genuine race — a `MarkBackupDeleted` that commits
+  strictly *after* that freshness read but *before* `BeginRestore`'s own
+  propose lands — is closed structurally at `BeginRestore`'s own apply arm:
+  it rejects when `backup_id` names a row that is present but
+  `Expired`/`Failed`. **One narrow residual is deliberately left open,
+  not silently missed**: a `backup_id` naming *no* row at all (the backup
+  has already been fully reclaimed — its row physically removed by the
+  janitor's own `DeleteBackup` finalize step, not merely marked) is not
+  rejected here, since a nonexistent row is indistinguishable at this
+  layer from a test fixture's placeholder id and from the ordinary
+  "unrelated command, no such backup" case every other `MetaCommand`
+  already tolerates. This residual is self-healing regardless: the
+  resulting restore's own driver can never find the manifest object
+  (also reclaimed), so it makes no progress and `RESTORE_STUCK_TIMEOUT`
+  eventually proposes `FailRestore` — a slow, honest failure, never a
+  silent truncation. See `crates/animus-control/src/meta.rs`'s
+  `mark_backup_deleted_refuses_while_a_restore_is_seeding` and
+  `begin_restore_rejects_an_expired_or_failed_backup` unit tests for the
+  apply-time seatbelt itself. The refusal-while-`Seeding` behavior is
+  proven end to end **deterministically**, not opportunistically, in
+  `crates/animusd/src/sim_cluster_delete_backup_restore.rs`'s own
+  `delete_backup_refuses_while_a_restore_is_seeding_then_succeeds_once_
+  failed` — a `SimCluster`-driven test that mints a `Seeding` restore
+  directly via `propose_meta(MetaCommand::BeginRestore)` and asserts
+  `BackupInUseException` unconditionally: `SimCluster` never spawns
+  `backup_restore::backup_restore_loop`, so that restore stays `Seeding`
+  forever until the test itself moves it to a terminal state — no timing
+  window, no flake. (An earlier version of this account instead cited a
+  wire-level `ProdEnv` test, `delete_backup_refuses_while_a_restore_is_in_
+  progress_then_succeeds`, as "necessarily opportunistic" proof of this
+  same behavior — that test raced the real restore driver's own tick and
+  could pass vacuously on a fast run, exactly the flake-by-construction
+  shape this repo's own conventions forbid. It was trimmed to
+  `delete_backup_succeeds_after_restore_completes`, keeping only its
+  genuinely deterministic half — a real, wire-driven restore run to
+  completion, then `DeleteBackup` succeeds — with the refusal-while-
+  `Seeding` proof moved to the `SimCluster` test above.)
 
 **Corpus** (`crates/animus-test/tests/backup_fault_corpus.rs`,
 `ANIMUS_BACKUP_SEEDS`): five restore cells, the identical self-contained-
@@ -863,7 +942,13 @@ the destination leader mid-seed), `restore_leader_kill_mid_seed_converges`
 later — `SegmentFaultConfig`'s own ack-lost thresholds are `put`/`delete`-
 only, checked directly against `animus-sim`'s source, so a read fault for
 restore's `get`-only workload is `SimSegmentStore::set_unavailable_until`,
-not `SegmentFaultConfig`), and `restore_after_source_drop`. GSI-rebuild
+not `SegmentFaultConfig`), and `restore_after_source_drop`. A sixth cell,
+`delete_backup_mid_restore_fails_restore` (issue #856, added 2026-09-14),
+deletes a middle chunk of a multi-chunk backup directly from the store
+(standing in for `DeleteBackup` + an out-of-chunk-order janitor reclaim)
+and asserts the restore hard-fails (`RestoreStatus::Failed`) rather than
+completing with the deleted chunk's rows silently missing — see this
+ADR's own 2026-09-14 amendment above for the mechanism. GSI-rebuild
 convergence is deliberately not reimplemented a third time in this corpus —
 it is the exact `index_backfill.rs`/`index_drain.rs` machinery
 `backfill_fault_corpus.rs` already proves at depth, applied to an ordinary

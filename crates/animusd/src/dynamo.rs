@@ -339,12 +339,41 @@ fn resolve_key<E: Env, R: RelayClient>(
 ) -> Result<(AttributeValue, Option<AttributeValue>), WireError> {
     mirror_catalog_schema(ctx, meta, table);
     legacy_register(ctx, meta, table);
-    let reg = ctx
-        .edge
-        .dynamo_registry()
-        .lock()
-        .expect("registry poisoned");
-    reg.extract_key(table, item).map_err(registry_error)
+    let (pk, sk) = {
+        let reg = ctx
+            .edge
+            .dynamo_registry()
+            .lock()
+            .expect("registry poisoned");
+        reg.extract_key(table, item).map_err(registry_error)?
+    };
+    reject_empty_key_value(&pk)?;
+    if let Some(sk) = &sk {
+        reject_empty_key_value(sk)?;
+    }
+    Ok((pk, sk))
+}
+
+/// Issue #848: AWS's 2020 empty-value change allows an empty `S`/`B` for a
+/// **non-key** attribute, but a partition/sort key value must stay
+/// non-empty — `escape`/`key_bytes` (`animus-item`) would happily encode an
+/// empty key injectively, so nothing downstream catches this on its own.
+/// This is the single choke point every write/point-read path resolves a
+/// table's key through ([`resolve_key`]), so checked once here covers all
+/// of them.
+fn reject_empty_key_value(v: &AttributeValue) -> Result<(), WireError> {
+    let empty = match v {
+        AttributeValue::S(s) => s.is_empty(),
+        AttributeValue::B(b) => b.is_empty(),
+        _ => false,
+    };
+    if empty {
+        return Err(WireError::validation(
+            "One or more parameter values are not valid. The AttributeValue \
+             for a key attribute cannot contain an empty string value.",
+        ));
+    }
+    Ok(())
 }
 
 /// Accept loop for the DynamoDB HTTP endpoint. Each connection is handled on its
@@ -2619,6 +2648,25 @@ async fn delete_backup<E: Env, R: RelayClient>(
         return Err(WireError {
             code: "BackupInUseException",
             message: format!("backup `{backup_arn}` is still being created"),
+            reasons: None,
+        });
+    }
+    // Issue #856 (second half): a restore that is actively reading this
+    // backup's own data objects (`RestoreStatus::Seeding`) must block a
+    // delete outright, not merely rely on the short-read guard
+    // (`BackupTabletProgress::chunk_count`) to fail the restore loudly if
+    // it loses the race — refusing here means the race never starts. This
+    // is a client-side, best-effort check against a `metadata_fresh` read
+    // (real read-your-writes freshness, not the staleness-tolerant
+    // cached/effective read); the authoritative seatbelt is
+    // `MetaCommand::MarkBackupDeleted`'s own apply-time rejection
+    // (`Metadata::backup_referenced_by_a_live_restore`, `animus-control`),
+    // which closes the residual window between this check and the
+    // propose below (a restore that starts seeding in that exact window).
+    if meta.backup_referenced_by_a_live_restore(backup_arn) {
+        return Err(WireError {
+            code: "BackupInUseException",
+            message: format!("backup `{backup_arn}` is the source of a restore still in progress"),
             reasons: None,
         });
     }
@@ -7032,6 +7080,30 @@ async fn execute_statement(
     let stmt = partiql::parse_statement(statement).map_err(WireError::from)?;
     let table = stmt.table().to_string();
     reject_internal_table(&table, false)?;
+
+    // ADR 0066 §5 / issue #842: authorize before `table_known` below reveals
+    // whether the table exists, mirroring `run_operation`'s own authz-then-
+    // dispatch order (and `run_transact`/`run_transact_get`'s authz-before-
+    // `resolve_key`) — a table-scoped principal must get an identical
+    // `AccessDeniedException` for a denied table whether or not it exists,
+    // never a distinguishable `ResourceNotFoundException`. `Policy::allows`
+    // only ever consults `OpClass`/table (never the operation name), so one
+    // `OpClass::Read`/`OpClass::Write` check here — before the statement's
+    // exact write kind is even lowered — makes the identical allow/deny
+    // decision `run_operation`'s own `authorize_op` would make later for
+    // every kind this function can produce.
+    let class = if matches!(stmt, partiql::Statement::Select(_)) {
+        animus_control::OpClass::Read
+    } else {
+        animus_control::OpClass::Write
+    };
+    authz::authorize(
+        ctx,
+        principal,
+        "ExecuteStatement",
+        class,
+        Some(table.as_str()),
+    )?;
     if !table_known(ctx, meta, &table) {
         return Err(registry_error(animus_dynamo::RegistryError::NoSuchTable(
             table.clone(),
@@ -7040,14 +7112,6 @@ async fn execute_statement(
 
     match stmt {
         partiql::Statement::Select(sel) => {
-            authz::authorize(
-                ctx,
-                principal,
-                "ExecuteStatement",
-                animus_control::OpClass::Read,
-                Some(table.as_str()),
-            )?;
-
             mirror_catalog_schema(ctx, meta, &table);
 
             let (partition_key, sort_key): (String, Option<String>) = match &sel.index {
@@ -7293,8 +7357,33 @@ async fn execute_transaction(
     }
 
     for stmt in &parsed {
+        reject_internal_table(stmt.table(), false)?;
+    }
+
+    // ADR 0066 §5 / issue #842: authorize every named table, whole-set,
+    // before the `table_known` loop below reveals which of them exist —
+    // mirroring `run_transact`/`run_transact_get`'s own authz-before-
+    // `resolve_key` ordering, applied one layer up, ahead of this
+    // function's own pre-loop existence short-circuit. `run_transact_get`/
+    // `run_transact` still run their own identical `authorize_each_table`
+    // call once dispatched below (`OpClass::Read`/`Write` respectively) —
+    // this is deliberately redundant, not a replacement, so a caller of
+    // either function directly stays fully protected on its own.
+    let class = if all_select {
+        animus_control::OpClass::Read
+    } else {
+        animus_control::OpClass::Write
+    };
+    authz::authorize_each_table(
+        ctx,
+        principal,
+        "ExecuteTransaction",
+        class,
+        parsed.iter().map(partiql::Statement::table),
+    )?;
+
+    for stmt in &parsed {
         let table = stmt.table();
-        reject_internal_table(table, false)?;
         if !table_known(ctx, meta, table) {
             return Err(registry_error(animus_dynamo::RegistryError::NoSuchTable(
                 table.to_string(),
@@ -7494,13 +7583,16 @@ async fn execute_one_batch_statement(
     if let Err(e) = reject_internal_table(&table, false) {
         return wire::BatchStatementResult::error(Some(table), &e);
     }
-    if !table_known(ctx, meta, &table) {
-        let e = registry_error(animus_dynamo::RegistryError::NoSuchTable(table.clone()));
-        return wire::BatchStatementResult::error(Some(table), &e);
-    }
 
     match stmt {
         partiql::Statement::Select(sel) => {
+            // ADR 0066 §5 / issue #842: authorize before `table_known`
+            // below reveals whether the table exists — see
+            // `execute_statement`'s identical comment for the full
+            // reasoning. The `INSERT`/`UPDATE`/`DELETE` arm below needs no
+            // check of its own here: it delegates wholesale to
+            // `execute_statement`, which authorizes-then-checks
+            // internally.
             if let Err(e) = authz::authorize(
                 ctx,
                 principal,
@@ -7508,6 +7600,10 @@ async fn execute_one_batch_statement(
                 animus_control::OpClass::Read,
                 Some(table.as_str()),
             ) {
+                return wire::BatchStatementResult::error(Some(table), &e);
+            }
+            if !table_known(ctx, meta, &table) {
+                let e = registry_error(animus_dynamo::RegistryError::NoSuchTable(table.clone()));
                 return wire::BatchStatementResult::error(Some(table), &e);
             }
 
@@ -7722,6 +7818,22 @@ pub(crate) async fn execute_statement_as<E: Env, R: RelayClient>(
     let stmt = partiql::parse_statement(statement).map_err(WireError::from)?;
     let table = stmt.table().to_string();
     reject_internal_table(&table, false)?;
+
+    // ADR 0066 §5 / issue #842: authorize before `table_known` below reveals
+    // whether the table exists — see `execute_statement`'s identical comment
+    // for the full reasoning; this is its `<E, R>`-generic sibling.
+    let class = if matches!(stmt, partiql::Statement::Select(_)) {
+        animus_control::OpClass::Read
+    } else {
+        animus_control::OpClass::Write
+    };
+    authz::authorize(
+        ctx,
+        principal,
+        "ExecuteStatement",
+        class,
+        Some(table.as_str()),
+    )?;
     if !table_known(ctx, meta, &table) {
         return Err(registry_error(animus_dynamo::RegistryError::NoSuchTable(
             table.clone(),
@@ -7730,14 +7842,6 @@ pub(crate) async fn execute_statement_as<E: Env, R: RelayClient>(
 
     match stmt {
         partiql::Statement::Select(sel) => {
-            authz::authorize(
-                ctx,
-                principal,
-                "ExecuteStatement",
-                animus_control::OpClass::Read,
-                Some(table.as_str()),
-            )?;
-
             mirror_catalog_schema(ctx, meta, &table);
 
             let (partition_key, sort_key): (String, Option<String>) = match &sel.index {
@@ -7948,8 +8052,27 @@ pub(crate) async fn execute_transaction_as<E: Env, R: RelayClient>(
     }
 
     for stmt in &parsed {
+        reject_internal_table(stmt.table(), false)?;
+    }
+
+    // ADR 0066 §5 / issue #842: authorize before `table_known` below reveals
+    // which named tables exist — see `execute_transaction`'s identical
+    // comment for the full reasoning; this is its `<E, R>`-generic sibling.
+    let class = if all_select {
+        animus_control::OpClass::Read
+    } else {
+        animus_control::OpClass::Write
+    };
+    authz::authorize_each_table(
+        ctx,
+        principal,
+        "ExecuteTransaction",
+        class,
+        parsed.iter().map(partiql::Statement::table),
+    )?;
+
+    for stmt in &parsed {
         let table = stmt.table();
-        reject_internal_table(table, false)?;
         if !table_known(ctx, meta, table) {
             return Err(registry_error(animus_dynamo::RegistryError::NoSuchTable(
                 table.to_string(),
@@ -8058,10 +8181,6 @@ async fn execute_one_batch_statement_as<E: Env, R: RelayClient>(
     if let Err(e) = reject_internal_table(&table, false) {
         return wire::BatchStatementResult::error(Some(table), &e);
     }
-    if !table_known(ctx, meta, &table) {
-        let e = registry_error(animus_dynamo::RegistryError::NoSuchTable(table.clone()));
-        return wire::BatchStatementResult::error(Some(table), &e);
-    }
 
     match stmt {
         partiql::Statement::Select(sel) => {
@@ -8072,6 +8191,10 @@ async fn execute_one_batch_statement_as<E: Env, R: RelayClient>(
                 animus_control::OpClass::Read,
                 Some(table.as_str()),
             ) {
+                return wire::BatchStatementResult::error(Some(table), &e);
+            }
+            if !table_known(ctx, meta, &table) {
+                let e = registry_error(animus_dynamo::RegistryError::NoSuchTable(table.clone()));
                 return wire::BatchStatementResult::error(Some(table), &e);
             }
 
@@ -10521,9 +10644,13 @@ mod stream_write_path_tests {
             "exactly one marker per batched item (live {} + trimmed {trimmed})",
             records.len()
         );
+        // The change-log key suffix is now (packed_hlc: u64, ordinal: u32),
+        // 12 bytes total (issue #852) — the HLC lives at [len-12, len-4).
         let distinct_hlcs: std::collections::BTreeSet<u64> = records
             .iter()
-            .map(|(key, _)| u64::from_be_bytes(key[key.len() - 8..].try_into().unwrap()))
+            .map(|(key, _)| {
+                u64::from_be_bytes(key[key.len() - 12..key.len() - 4].try_into().unwrap())
+            })
             .collect();
         assert!(
             distinct_hlcs.len() <= 1,
@@ -10731,9 +10858,9 @@ mod stream_write_path_tests {
             let record = ChangeRecord::decode(value).expect("marker decodes");
             assert!(record.marker && record.consumer_hidden());
             assert!(record.old_image.is_none() && record.new_image.is_none());
-            // Full-raw-key-as-prefix: change key = the raw key + the 8-byte
-            // apply-completed HLC suffix.
-            let prefix = &key[..key.len() - 8];
+            // Full-raw-key-as-prefix: change key = the raw key + the
+            // 12-byte (packed_hlc, ordinal) suffix (issue #852).
+            let prefix = &key[..key.len() - 12];
             assert!(
                 [b"k1".as_slice(), b"k2".as_slice(), b"k3".as_slice()].contains(&prefix),
                 "marker prefix must be the raw key itself: {prefix:?}"
@@ -10804,7 +10931,10 @@ mod stream_write_path_tests {
             assert!(!record.seeded, "a live write is never a seed");
             assert!(record.old_image.is_none(), "a marker carries no images");
             assert!(record.new_image.is_none(), "a marker carries no images");
-            let hlc_suffix = u64::from_be_bytes(key[key.len() - 8..].try_into().unwrap());
+            // The change-log key suffix is (packed_hlc: u64, ordinal: u32),
+            // 12 bytes total (issue #852) — the HLC lives at [len-12, len-4).
+            let hlc_suffix =
+                u64::from_be_bytes(key[key.len() - 12..key.len() - 4].try_into().unwrap());
             assert!(
                 hlc_suffix > last_hlc,
                 "marker HLCs are apply-time-completed and strictly increasing \
@@ -11118,6 +11248,7 @@ mod list_backups_tests {
                 tablet,
                 cut_version: 1,
                 bytes: 10,
+                chunk_count: 1,
             }),
             ApplyOutcome::Applied
         );

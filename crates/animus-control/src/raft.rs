@@ -156,6 +156,18 @@ enum SnapshotResend {
 /// produces before either real progress or the next heartbeat arrives.
 const SNAPSHOT_ACK_RESEND_CAP: u32 = 8;
 
+/// Issue #898: how many CONSECUTIVE mid-transfer acks reporting an offset
+/// below the currently tracked `snapshot_offset` this leader tolerates as
+/// "probably a stale, reordered ack" before concluding the peer's own buffer
+/// genuinely reset and rebasing down to match it — see
+/// `snapshot_offset_regressions`'s own doc for the full mechanism and
+/// incident. Small, matching `SNAPSHOT_ACK_RESEND_CAP`'s own order of
+/// magnitude: large enough that an ordinary handful of reordered acks (the
+/// scenario the monotonic guard exists for) never falsely triggers a rebase,
+/// small enough that a genuinely reset peer recovers within a few heartbeat
+/// intervals rather than staying deadlocked for the rest of the run.
+const SNAPSHOT_OFFSET_REGRESSION_REBASE: u32 = 4;
+
 /// A replicated log entry, generic over the command type `C` (defaults to the
 /// control plane's [`MetaCommand`]).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -333,6 +345,81 @@ pub enum RaftMsg<C = MetaCommand> {
     /// answering or ignoring it never depends on the sender's believed term,
     /// only on whether `self` is currently a `Leader`.
     WakeRequest { term: u64 },
+    /// Issue #667 (P0 Raft safety): sent by a node whose persisted state
+    /// replayed empty (`PersistedState::is_empty()`) to every configured
+    /// peer, asking "have you (or has anyone you know of) ever recorded
+    /// real state?" — the active half of the boot-time genesis-vs-wiped-
+    /// restart check (see [`RaftCore::begin_cluster_check`]). Carries no
+    /// payload: the honest answer is purely local to the responder.
+    ClusterProbe,
+    /// Response to [`RaftMsg::ClusterProbe`]: the responder's own current
+    /// term, commit index, **committed voter config**, and whether the
+    /// responder has **ever itself received a real protocol message from
+    /// the asker** (`ever_heard_from_prober`), reported honestly regardless
+    /// of whether the responder is itself still mid-check. `term > 0 ||
+    /// committed_index > 0` is conclusive proof this responder (and thus the
+    /// cluster it belongs to) has real history — the asker was never told
+    /// to assume otherwise on a `0`/`0` reply from any *one* peer, only once
+    /// every configured peer has answered `0`/`0` (see
+    /// `begin_cluster_check`).
+    ///
+    /// **Two independent signals disambiguate a wiped-voter restart from an
+    /// identity that has simply never voted before** — both an ordinary ADR
+    /// 0060 growth join AND a genesis founder still mid its own boot-time
+    /// check look identical to the asker's own empty local state, but
+    /// neither could possibly have cast a now-forgotten real vote under this
+    /// identity, so proceeding as an ordinary fresh voter is safe for both:
+    ///
+    /// - `!config.contains(asker)` — the responder's *committed* config
+    ///   doesn't (yet) recognize the asker as one of its voters at all. The
+    ///   original signal (ADR 0060): pre-vote's own log check is what keeps
+    ///   this case safe, unchanged.
+    /// - `ever_heard_from_prober` — whether the responder has *itself* ever
+    ///   received any real consensus-protocol message (a vote request/
+    ///   response, an append, a snapshot chunk — anything but this very
+    ///   probe/response pair) from the asker, ever, since this responder's
+    ///   own process started. **Added 2026-09-15** to close a real gap the
+    ///   `config.contains` signal alone cannot: in a genuine N-node genesis
+    ///   (every founder listed in `config` from birth, by construction), a
+    ///   still-checking founder's config membership is unconditionally
+    ///   `true` from the very first committed entry onward, so a majority
+    ///   that elects among itself before a slower founder's own check
+    ///   resolves looks — by `config.contains` alone — indistinguishable
+    ///   from a genuinely established, long-running voter whose disk was
+    ///   wiped. **Third amendment, same day**: this signal is folded into
+    ///   the SAME wait-for-every-peer aggregation `config.contains`'s
+    ///   established verdict already uses, rather than being decisive on a
+    ///   single `false` reply — a still-checking founder has sent no peer
+    ///   any real protocol message yet, so it is guaranteed `false` from
+    ///   EVERY peer, but the converse is not true: a perfectly ordinary
+    ///   established follower that has never itself been a candidate or
+    ///   leader only ever exchanges real protocol messages with whichever
+    ///   peer *is* the candidate/leader, never with a fellow follower (and
+    ///   the leader does not mark this on receiving a plain
+    ///   `AppendEntriesResp` either), so two long-established, healthy
+    ///   follower peers can go their entire lives never marking each other
+    ///   — a genuinely wiped voter's fellow follower will honestly answer
+    ///   `false` even though the cluster is real, reproducibly (not
+    ///   intermittently) defeating the refusal if treated as decisive on
+    ///   its own (found via a real, deterministic `ProdEnv` failure in
+    ///   `wiped_voter_refuses_and_the_rest_of_the_cluster_keeps_serving`).
+    ///   See `RaftCore::handle_cluster_probe_resp`'s doc for the full
+    ///   decision table and `docs/adr/0009-*.md`'s matching amendment for
+    ///   the design record.
+    ///   **Known residual**: this signal is per-process, in-memory, not
+    ///   WAL-durable — a responder that itself restarts (recovered, not
+    ///   wiped) forgets it until the prober sends it another real message,
+    ///   so a coordinated whole-cluster restart racing a single voter's
+    ///   disk wipe is not fully covered by this signal alone (unchanged
+    ///   from before this amendment — no prior mechanism covered it
+    ///   either). The common case this feature targets — one voter's disk
+    ///   wiped while its peers keep running — is fully covered.
+    ClusterProbeResp {
+        term: u64,
+        committed_index: u64,
+        config: BTreeSet<NodeId>,
+        ever_heard_from_prober: bool,
+    },
 }
 
 impl<C> RaftMsg<C> {
@@ -354,6 +441,13 @@ impl<C> RaftMsg<C> {
             | RaftMsg::TimeoutNow { term }
             | RaftMsg::Quiesce { term, .. } => *term,
             RaftMsg::Heartbeat { .. } | RaftMsg::WakeRequest { .. } => 0,
+            // Issue #667: a cluster-check probe carries no term *authority*
+            // either — its whole point is to be answerable (and answered
+            // honestly) independent of the responder's own term-stepdown
+            // state, exactly like `Heartbeat`/`WakeRequest` above. Its real
+            // payload (the responder's term/commit) is read explicitly by
+            // `handle_cluster_probe_resp`, never via this generic extractor.
+            RaftMsg::ClusterProbe | RaftMsg::ClusterProbeResp { .. } => 0,
         }
     }
 }
@@ -587,6 +681,44 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     // liveness judgment of its peers depend on stale, potentially very old
     // wall-clock reads survived across a restart, which is actively wrong.
     last_contact: BTreeMap<NodeId, Nanos>,
+    // Issue #667 (2026-09-15 amendment): every peer id this node has ever
+    // witnessed casting a GENUINE, durably-forgettable vote — i.e. a
+    // `voted_for` write this identity's own disk could later lose. Marked
+    // ONLY at the three sites that represent exactly that: this peer
+    // requesting a vote as a candidate (`handle_request_vote`, a self-vote
+    // regardless of whether we grant it), this peer granting us a REAL vote
+    // (`handle_vote_resp`, `granted: true` only — a rejection sets no
+    // `voted_for` and proves nothing forgettable), and this peer appearing
+    // as `leader` in `AppendEntries`/`InstallSnapshot` (proof it previously
+    // won a real election, which required it to self-vote to become a
+    // candidate in the first place). Deliberately NOT marked on
+    // `PreVote`/`PreVoteResp` (a pre-vote round never touches `voted_for`/
+    // `current_term` by design — nothing forgettable happens), nor on
+    // `AppendEntriesResp`/`InstallSnapshotResp` (a plain follower accepting
+    // a leader's log has never itself cast a vote, so it poses no
+    // double-vote risk even after a wipe), nor — critically — on a
+    // REJECTED `RequestVoteResp`/being the target of someone's `RequestVote`
+    // (a candidate that never wins doesn't durably record anyone's grant).
+    // **A real bug this precision fixed**: an earlier, broader version of
+    // this field marked ANY non-probe message, including a REJECTION this
+    // node itself sends back to a peer's `RequestVote` WHILE still
+    // `cluster_check_pending` (a still-checking node still honestly answers
+    // vote requests, just always rejecting) — that rejection is real wire
+    // traffic but represents no forgettable state on the SENDER's part, and
+    // marking it reproduced the exact genesis-race false refusal this
+    // amendment exists to fix (a 2-node genesis: n1 resolves first, starts
+    // campaigning, n0 rejects n1's `RequestVote` since it's still checking,
+    // n1's own `heard_from` then wrongly contains n0). Purely additive to
+    // `last_contact` (leader-only, narrower — only `AppendEntriesResp` —
+    // and keyed to liveness, not vote history) — this exists solely to
+    // answer a peer's `ClusterProbe` honestly (`handle_cluster_probe`'s
+    // `ever_heard_from_prober`). See `RaftMsg::ClusterProbeResp`'s own doc
+    // for why this closes the genesis-race gap `config.contains` alone
+    // cannot, and its "Known residual" note for why this is deliberately
+    // in-memory, not WAL-persisted. Never pruned (a control/data-plane
+    // group's peer set is small and bounded by its own configured
+    // membership).
+    heard_from: BTreeSet<NodeId>,
     // Set by `transfer_leadership`: a caught-up voter this leader is handing off
     // to. Re-sent as a `TimeoutNow` on every heartbeat (`broadcast_append`) until
     // this node steps down (the transfer succeeded) — so a single dropped message
@@ -626,6 +758,32 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     // leader resumes shipping the next chunk on each heartbeat / ack. Cleared for
     // a peer once it has fully installed the snapshot.
     snapshot_offset: BTreeMap<NodeId, u64>,
+    // Issue #898: per-peer count of CONSECUTIVE mid-transfer acks reporting an
+    // offset strictly below the currently tracked `snapshot_offset` — the
+    // monotonic guard's own "is this a stale, reordered ack or a peer whose
+    // buffer genuinely reset" ambiguity (see `handle_install_snapshot_resp`'s
+    // doc). A transient reordering self-heals within a round trip or two (the
+    // peer's very next ack, for whatever legitimately arrives next, reports a
+    // LARGER offset than any stale one, so this resets to 0 the moment real
+    // forward progress is seen); a peer that genuinely lost its buffer (a
+    // real process restart mid-transfer, same `NodeId`, `snapshot_offset`
+    // never told about it) reports the SAME regressed value — 0, from a
+    // fresh `RaftCore` — forever, since it can never accept a chunk at a
+    // nonzero offset with an empty buffer (`handle_install_snapshot`'s
+    // `fresh && offset == 0` reassembly gate). Left unaddressed, the leader
+    // keeps resending from its own stale, now-unreachable offset
+    // indefinitely — confirmed live building this fix:
+    // `chunked_snapshot_receiver_stop_restart_3` deadlocked exactly this way
+    // once `meta_apply_and_compact`'s new compaction-defer gate (also this
+    // issue) stopped the ordinary threshold-triggered recompaction that used
+    // to incidentally wipe this bookkeeping clean before the peer's next
+    // request. Once this counter crosses `SNAPSHOT_OFFSET_REGRESSION_REBASE`,
+    // `handle_install_snapshot_resp` REBASES `snapshot_offset`/
+    // `snapshot_chunk_sent` down to the peer's own reported (lower) truth
+    // instead of taking `max`, which lets a fresh chunk-0 ship land on a
+    // fresh, empty buffer correctly. Cleared at the identical points
+    // `snapshot_offset` itself is.
+    snapshot_offset_regressions: BTreeMap<NodeId, u32>,
     // Per-peer `(offset, resends)` of the last `InstallSnapshot` chunk
     // actually SENT (issues #532/#537): `offset` is the byte offset last
     // transmitted; `resends` counts how many times THAT SAME offset has
@@ -803,6 +961,80 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     // sweeper's own cadence is no slower than `quiesce_after` (see
     // `animusd`'s `--quiesce-after` validation).
     quiesce_veto_fresh_through: u64,
+
+    // Issue #667 (P0 Raft safety): boot-time "am I a wiped voter restarting
+    // into an already-established cluster, or is this a genuine fresh
+    // bootstrap?" check. `None` (every existing construction path — `new`
+    // and `recovered` both set this `None`) means "not applicable": this
+    // core's own persisted state was non-empty at recovery (so its own
+    // term/`voted_for` are trustworthy), or the caller never opted into the
+    // check at all (most unit/test construction). Only the driver's own
+    // `begin_cluster_check` (called exactly when a node's WAL replayed to
+    // `PersistedState::is_empty()`, `node.rs`'s `drive`) ever populates
+    // this. See `begin_cluster_check`'s own doc for the full mechanism.
+    cluster_check_pending: Option<BTreeSet<NodeId>>,
+    // Issue #667 amendment (a second, real-`ProdEnv` regression, found via
+    // `dynamo_txn_idempotency.rs::same_token_same_fingerprint_retry_after_
+    // commit_is_cached` timing out under real CI load): the ORIGINAL
+    // design resent a still-pending probe round only from `start_pre_vote`'s
+    // own early-return arm, itself gated on `now >= election_deadline` —
+    // sharing `election_deadline` with the ordinary election timer. That
+    // sharing is unsound: `handle_append_entries` legitimately RESETS
+    // `election_deadline` on every valid leader contact (the standard Raft
+    // "don't campaign against a live leader" behavior), and a still-pending
+    // founder DOES receive ordinary `AppendEntries`/heartbeat traffic from
+    // an already-elected SIBLING founder (a real leader broadcasts to every
+    // configured peer, voter or not, resolved or not) the moment a majority
+    // of founders elect one among themselves. Once that starts, the pending
+    // founder's own `election_deadline` never again reaches its resend
+    // check — it is perpetually pushed back by legitimate heartbeats — so
+    // its own probe (lost, or answered by a peer that hadn't yet replied)
+    // is never retried, and the founder can wait past any real test/
+    // deployment timeout with no forward progress at all. This field is a
+    // SEPARATE deadline, armed by `begin_cluster_check` and advanced only
+    // by the dedicated resend check at the top of `tick()` — untouched by
+    // `handle_append_entries` or any other ordinary message handler, so it
+    // keeps firing on schedule regardless of how much legitimate leader
+    // traffic this node receives while still pending. `None` whenever
+    // `cluster_check_pending` is `None` (not applicable, or already
+    // resolved).
+    cluster_check_resend_deadline: Option<Nanos>,
+    // Issue #667 amendment (real-cluster bootstrap-race regression, found
+    // via `forward_to_tablet_leader_survives_a_dead_first_guess`'s own
+    // flaky failure under real `ProdEnv` threading): whether ANY peer has
+    // so far answered this boot's cluster check with real history
+    // (`term > 0 || committed_index > 0`) that also names this node in its
+    // own committed config **and** itself genuinely heard from this
+    // identity before (`ever_heard_from_prober`, added by the second
+    // amendment, folded into this same aggregated flag by the third —
+    // see `handle_cluster_probe_resp`'s doc for why a peer lacking that
+    // last part is not decisive either way on its own, and why requiring
+    // it from ANY one peer rather than ALL of them is what makes this
+    // sound for an ordinary follower-follower pair that never directly
+    // exchanged a message). Recorded, never acted on immediately — see
+    // `handle_cluster_probe_resp`'s own doc for why a SINGLE such answer is
+    // not, by itself, trustworthy evidence of a genuine wiped-voter restart
+    // (a real N-node genesis bootstrap can have a majority-of-peers elect a
+    // leader before every founding peer's own probe round has completed,
+    // which looks byte-identical to this signal from the still-forming
+    // peer's own point of view). Reset to `false` whenever a fresh
+    // `begin_cluster_check` round starts (there is only ever one per
+    // `RaftCore` lifetime today, but resetting is cheap and correct
+    // regardless).
+    cluster_check_saw_established_with_me: bool,
+    // Sticky: `cluster_check_pending` resolved with every configured peer
+    // accounted for, at least one showing real history that named this
+    // node as an established voter, and **none** showing genuinely fresh
+    // (`0`/`0`) state — the combination `handle_cluster_probe_resp`'s own
+    // doc explains is only possible for a genuinely wiped, previously-
+    // established voter, never an ordinary still-forming genesis bootstrap.
+    // Sticks for this `RaftCore`'s whole lifetime — there is no path that
+    // clears it, by design (ADR 0009's amendment): an already-established
+    // voter identity whose disk was wiped never becomes safe to
+    // vote/campaign as again just by waiting or catching up on
+    // replication; it must be re-admitted through the learner/rejoin path
+    // (ADR 0032/0058) as a genuinely new membership event.
+    cluster_check_refused: bool,
 }
 
 impl<C, S> RaftCore<C, S>
@@ -842,11 +1074,13 @@ where
             match_index: BTreeMap::new(),
             snapshot_served_through: BTreeMap::new(),
             last_contact: BTreeMap::new(),
+            heard_from: BTreeSet::new(),
             departing: BTreeMap::new(),
             transfer_target: None,
             transfer_deadline: Nanos(0),
             first_term_index: 0,
             snapshot_offset: BTreeMap::new(),
+            snapshot_offset_regressions: BTreeMap::new(),
             snapshot_chunk_sent: BTreeMap::new(),
             snapshot_chunk_advances: BTreeMap::new(),
             incoming_snapshot: None,
@@ -870,6 +1104,10 @@ where
             quiesce_engine_caught_up: true,
             quiesce_veto: false,
             quiesce_veto_fresh_through: u64::MAX,
+            cluster_check_pending: None,
+            cluster_check_resend_deadline: None,
+            cluster_check_saw_established_with_me: false,
+            cluster_check_refused: false,
         };
         core.reset_election_timer(now, entropy);
         core
@@ -1054,6 +1292,7 @@ where
             // pass, so a deliberately fresh image is never dropped.
             self.snapshot_blob = None;
             self.snapshot_offset.clear();
+            self.snapshot_offset_regressions.clear();
             self.snapshot_chunk_sent.clear();
         }
     }
@@ -1069,27 +1308,91 @@ where
         self.snapshot_index
     }
 
-    /// Whether a chunked `InstallSnapshot` transfer is currently in flight
-    /// to at least one peer (a non-empty `snapshot_offset` — see that
-    /// field's own doc). `snapshot_upto` unconditionally invalidates every
+    /// Whether a chunked `InstallSnapshot` transfer is currently in flight to
+    /// at least one peer. `snapshot_upto` unconditionally invalidates every
     /// in-flight transfer's own progress the moment the base moves again
-    /// (dropping the blob and clearing every peer's offset — required for
-    /// correctness, since the in-flight bytes were captured at the OLD
-    /// base and shipping them under a new `snapshot_index` would corrupt
-    /// the receiver). Under a sustained write stream that keeps
-    /// re-crossing a `DRIVER_APPLIED` driver's compaction threshold faster
-    /// than a lagging peer's own chunked transfer can complete, that
-    /// invalidation can repeat forever, so the peer's catch-up never
-    /// finishes (issues #532/#537's own residual finding beyond the
-    /// `MAX_APPEND_ENTRIES_BATCH` cap — see that constant's doc). This
-    /// accessor is the fact a `DRIVER_APPLIED` driver's own
+    /// (dropping the blob and clearing every peer's offset/sent-chunk
+    /// bookkeeping — required for correctness, since the in-flight bytes
+    /// were captured at the OLD base and shipping them under a new
+    /// `snapshot_index` would corrupt the receiver). Under a sustained write
+    /// stream that keeps re-crossing a `DRIVER_APPLIED` driver's compaction
+    /// threshold faster than a lagging peer's own chunked transfer can
+    /// complete, that invalidation can repeat forever, so the peer's
+    /// catch-up never finishes (issues #532/#537's own residual finding
+    /// beyond the `MAX_APPEND_ENTRIES_BATCH` cap — see that constant's doc).
+    /// This accessor is the fact a `DRIVER_APPLIED` driver's own
     /// threshold-triggered compaction check needs to defer advancing the
-    /// base while an in-flight transfer still has a chance to land —
-    /// policy lives entirely in the driver (`animus-cp-data`'s
-    /// `apply_and_compact`), never here; this core stays a pure fact,
-    /// same as `snapshot_index` itself.
+    /// base while an in-flight transfer still has a chance to land — policy
+    /// lives entirely in the driver (`animus-cp-data`'s `apply_and_compact`,
+    /// `animus-control`'s `meta_apply_and_compact`), never here; this core
+    /// stays a pure fact, same as `snapshot_index` itself.
+    ///
+    /// **True the moment a chunk has been SENT to some peer, not only once
+    /// it has been ACKED (issue #898)**: checks `snapshot_chunk_sent` (set
+    /// by [`snapshot_chunk_for`](Self::snapshot_chunk_for) at send time, for
+    /// the very first chunk included) in addition to `snapshot_offset` (set
+    /// only once a peer's first ack is processed — see that field's own
+    /// doc). A definition keyed on `snapshot_offset` ALONE leaves a real gap
+    /// from "leader ships chunk 0" to "leader processes that peer's first
+    /// ack": for that whole round trip (which a slow/contended peer or link
+    /// can stretch arbitrarily far), this accessor would report `false` even
+    /// though bytes are genuinely on the wire, so a threshold-triggered
+    /// compaction landing inside that window invalidates a transfer this
+    /// accessor was supposed to protect — the driver-side defer this exists
+    /// for never engages during exactly the window it matters most.
+    /// Confirmed live: `crates/animus-control/tests/
+    /// snapshot_compaction_race.rs` reproduces a freshly-joined follower
+    /// pinned at `snapshot_index() == 0` forever under sustained churn with
+    /// only the offset-based definition, deterministically under `SimEnv`.
+    /// Both maps are cleared together at every existing invalidation/
+    /// completion point (`snapshot_upto`'s base move,
+    /// `handle_install_snapshot_resp`'s completion branch), so checking
+    /// either is equally safe to rely on once populated; checking both
+    /// closes the send-to-first-ack gap the offset map alone cannot see.
+    ///
+    /// **Deliberately blind to *how long* a peer has gone un-acked (issue
+    /// #898 follow-up)** — that is a `Nanos`/`env.now()` question this pure,
+    /// `now`-unaware core cannot answer. Two answers were tried at THIS
+    /// accessor and rejected: a resend-count proxy for elapsed time
+    /// conflated "peer is dead" with "peer's first round trip is merely
+    /// slow" (`snapshot_compaction_race.rs`'s own deliberately slow link
+    /// needed ~40 heartbeat-driven resends before its peer's first-ever
+    /// ack); a `peer_last_contact`-based "has this peer gone quiet"
+    /// check was ALSO rejected — `become_leader` optimistically seeds
+    /// every peer's `last_contact` to the moment leadership begins (so a
+    /// merely-slow-to-start peer and a peer that never starts at all are
+    /// indistinguishable by that field alone; see `become_leader`'s own
+    /// doc). A caller that needs to give up on a peer that is down,
+    /// partitioned, or configured as a cluster member but never actually
+    /// started at all has `now` and belongs at the driver layer: see
+    /// `node.rs`'s `SNAPSHOT_COMPACT_DEFER_IDLE_CEILING`, an
+    /// idle-progress-gated backstop (using
+    /// [`snapshot_chunk_advances`](Self::snapshot_chunk_advances) as the
+    /// progress signal, not wall-clock alone) layered entirely on top of
+    /// this accessor's own `behind`-sized `SNAPSHOT_COMPACT_DEFER_CEILING`
+    /// escape hatch, with no change needed here.
     pub fn snapshot_transfer_in_flight(&self) -> bool {
-        !self.snapshot_offset.is_empty()
+        !self.snapshot_offset.is_empty() || !self.snapshot_chunk_sent.is_empty()
+    }
+
+    /// The set of peers [`snapshot_transfer_in_flight`](Self::
+    /// snapshot_transfer_in_flight) currently considers in flight (the
+    /// union of `snapshot_offset`'s and `snapshot_chunk_sent`'s keys) — a
+    /// pure, `now`-unaware structural fact, same as that accessor itself.
+    /// Exists so a driver that DOES have `now` (issue #898 follow-up) can
+    /// sum [`snapshot_chunk_advances`](Self::snapshot_chunk_advances) across
+    /// every currently-outstanding peer as a genuine forward-progress
+    /// signal, distinguishing "still shipping new chunks, however slowly"
+    /// from "stuck at the same offset forever" — see `node.rs`'s
+    /// `SNAPSHOT_COMPACT_DEFER_IDLE_CEILING` for the full mechanism this
+    /// feeds.
+    #[must_use]
+    pub fn snapshot_transfer_peers(&self) -> BTreeSet<NodeId> {
+        self.snapshot_offset
+            .keys()
+            .chain(self.snapshot_chunk_sent.keys())
+            .cloned()
+            .collect()
     }
 
     /// The byte offset `peer` has acked so far in an in-flight chunked
@@ -1310,7 +1613,32 @@ where
                 None => Some(self.heartbeat_deadline),
             }
         } else {
-            Some(self.election_deadline)
+            // Issue #667 amendment: while the boot-time cluster check is still
+            // pending, this node ALSO needs to wake in time to resend its probe
+            // (`cluster_check_resend_deadline`, `tick()`'s own independent
+            // resend check) — never only at `election_deadline`. The driver
+            // loop (`node.rs`) sleeps exactly until whatever this function
+            // returns and calls `tick()` only then; `election_deadline` is
+            // legitimately reset far into the future by `handle_append_entries`
+            // on every valid leader contact (a still-pending founder can start
+            // receiving ordinary heartbeats from an already-elected sibling the
+            // moment any majority forms), and `cluster_check_resend_deadline`
+            // is deliberately never touched by that reset (see its own doc) —
+            // so without this `min`, a real `ProdEnv` founder under real
+            // staggered bring-up can oversleep past its own resend deadline
+            // for as long as `election_deadline` keeps getting pushed out,
+            // reproducing exactly the "cluster did not bootstrap" CI
+            // regression this amendment fixes: the resend logic in `tick()`
+            // was correct in isolation, but `tick()` was never being called
+            // at the right time to run it.
+            match self.cluster_check_pending {
+                Some(_) => {
+                    Some(Nanos(self.election_deadline.0.min(
+                        self.cluster_check_resend_deadline.map_or(u64::MAX, |d| d.0),
+                    )))
+                }
+                None => Some(self.election_deadline),
+            }
         }
     }
 
@@ -1841,7 +2169,29 @@ where
 
     /// Handle a timer tick at `now`. May start an election or send heartbeats.
     pub fn tick(&mut self, now: Nanos, entropy: u64) -> Vec<Out<C>> {
-        match self.role {
+        // Issue #667 amendment: the boot-time cluster-check resend, on its
+        // OWN deadline (`cluster_check_resend_deadline`'s own doc explains
+        // why this must never share `election_deadline`) — checked
+        // unconditionally, every tick, regardless of role or of whatever
+        // the match below does this same call. In practice this only ever
+        // fires for a `Follower` still resolving `begin_cluster_check` (a
+        // `Leader`/other role can't have `cluster_check_pending` still
+        // `Some` — becoming either requires it already resolved), but
+        // checking it here rather than inside the `Follower` arm means a
+        // future role-handling refactor can't silently reintroduce the
+        // original election-timer coupling this exists to avoid.
+        let mut out = Vec::new();
+        if self.cluster_check_pending.is_some() {
+            let due = self
+                .cluster_check_resend_deadline
+                .is_none_or(|deadline| now.0 >= deadline.0);
+            if due {
+                out.extend(self.broadcast_cluster_probe());
+                self.cluster_check_resend_deadline =
+                    Some(self.next_cluster_check_resend(now, entropy));
+            }
+        }
+        out.extend(match self.role {
             Role::Leader => {
                 // Abort a leadership transfer whose target has not stepped down
                 // by the deadline (Raft §3.10) — e.g. it crashed after arming, or
@@ -1899,7 +2249,8 @@ where
                 }
                 Vec::new()
             }
-        }
+        });
+        out
     }
 
     /// Immediately (re)replicate to all peers if leader — the **wake-on-propose**
@@ -1957,6 +2308,32 @@ where
             // `is_leader`-independent inspection (e.g. tests, admin views) never
             // reports a "transfer in flight" for a node that isn't leading.
             self.transfer_target = None;
+            // Issue #898 follow-up: unlike `transfer_target` above,
+            // `snapshot_offset`/`snapshot_chunk_sent` are NOT merely inert
+            // once this node stops being leader — `snapshot_transfer_in_
+            // flight()` (read by every replica's OWN `meta_apply_and_compact`
+            // defer gate, node.rs) has no `role == Leader` guard of its own,
+            // so a sender-side entry left over from a leadership stint that
+            // ended before that specific peer's transfer ever reached
+            // `handle_install_snapshot_resp`'s completion branch (the ONLY
+            // other place these maps are cleared, short of `become_leader`
+            // and `snapshot_upto`'s base move) survives indefinitely as a
+            // FALSE "transfer in flight" — deferring this node's own local
+            // compaction forever once `behind` stops growing (no further
+            // writes), since it never reaches `SNAPSHOT_COMPACT_DEFER_
+            // CEILING` either. Confirmed live: `prod_liveness.rs`'s
+            // `large_metadata_catch_up_stays_live` deadlocking one of its two
+            // 2-node-majority replicas at a small `snapshot_index` (a first,
+            // real compaction) while `engine_applied_index` reached the full
+            // target — the classic signature of a stuck defer, not a slow
+            // apply task — on real `ProdEnv` thread contention triggering an
+            // otherwise-harmless mid-transfer leadership churn between the
+            // two. Clearing here, at the one place a `RaftCore` genuinely
+            // steps down from believing it might be leading, closes it same
+            // as `transfer_target`.
+            self.snapshot_offset.clear();
+            self.snapshot_offset_regressions.clear();
+            self.snapshot_chunk_sent.clear();
         }
         // ADR 0044 phase-1 PR3, un-quiesce trigger (a): **any** inbound Raft
         // message un-quiesces, run before dispatch so every specific handler
@@ -2052,6 +2429,19 @@ where
             // ignores any that reach it.
             RaftMsg::Heartbeat { .. } => Vec::new(),
             RaftMsg::TimeoutNow { term } => self.handle_timeout_now(term, now, entropy),
+            RaftMsg::ClusterProbe => self.handle_cluster_probe(from),
+            RaftMsg::ClusterProbeResp {
+                term,
+                committed_index,
+                config,
+                ever_heard_from_prober,
+            } => self.handle_cluster_probe_resp(
+                from,
+                term,
+                committed_index,
+                config,
+                ever_heard_from_prober,
+            ),
             RaftMsg::Quiesce { term, commit_index } => {
                 self.handle_quiesce(from, term, commit_index);
                 Vec::new()
@@ -2073,6 +2463,371 @@ where
             return Vec::new();
         }
         self.start_election(now, entropy)
+    }
+
+    /// Issue #667 (P0 Raft safety). Called by the driver exactly once, right
+    /// after it builds a fresh `RaftCore` for a node whose WAL replayed to
+    /// `PersistedState::is_empty()` — i.e. `current_term == 0`, `voted_for ==
+    /// None`, an empty log, no snapshot. That local emptiness is ambiguous:
+    /// it is indistinguishable from a genuine first-ever bootstrap of a
+    /// brand new cluster. Voting or campaigning before resolving the
+    /// ambiguity is unsafe — an already-established voter identity whose
+    /// disk was wiped (ephemeral storage) could grant a *second*, distinct
+    /// vote in a term it durably voted in before the wipe, since the vote it
+    /// already cast is exactly what got lost. See `start_pre_vote`/
+    /// `start_election`'s own guards and `handle_request_vote`'s grant
+    /// condition, all of which check `cluster_check_pending`/
+    /// `cluster_check_refused` below.
+    ///
+    /// Broadcasts [`RaftMsg::ClusterProbe`] to every configured peer and
+    /// parks in `cluster_check_pending` until either (a) any one peer
+    /// answers unambiguously (real history naming a DIFFERENT node id than
+    /// this one, or genuinely empty `0`/`0` state — either resolves this
+    /// node's own check immediately, with no need to wait for the rest of
+    /// the peer set; see `handle_cluster_probe_resp`'s own doc for the full
+    /// decision table, including why a peer naming THIS node id as an
+    /// established voter is deliberately NOT unambiguous on its own), or
+    /// (b) every peer has answered and none of them was unambiguously
+    /// fresh — a single-node group (`self.peers` empty) has nothing to
+    /// wait for and resolves immediately. A never-answering peer is never
+    /// assumed fresh: `tick()`'s own independent resend check
+    /// (`cluster_check_resend_deadline`, deliberately NOT tied to the
+    /// ordinary election timer — see that field's own doc for why) keeps
+    /// resending probes for as long as `cluster_check_pending` stays
+    /// `Some` — "peers unreachable" means keep probing, never vote.
+    pub fn begin_cluster_check(&mut self, now: Nanos, entropy: u64) -> Vec<Out<C>> {
+        if self.peers.is_empty() {
+            // Nothing to confirm with — a lone voter (or a peerless test
+            // core) cannot possibly race anyone else for its own vote.
+            self.cluster_check_pending = None;
+            return Vec::new();
+        }
+        self.cluster_check_pending = Some(self.peers.iter().cloned().collect());
+        self.cluster_check_saw_established_with_me = false;
+        self.reset_election_timer(now, entropy);
+        self.cluster_check_resend_deadline = Some(self.next_cluster_check_resend(now, entropy));
+        self.broadcast_cluster_probe()
+    }
+
+    /// The next deadline for `tick()`'s own independent cluster-check
+    /// resend check (`cluster_check_resend_deadline`'s own doc has the full
+    /// reasoning for why this must never share `election_deadline`). Same
+    /// randomized `[election_base, 2*election_base)` shape
+    /// `reset_election_timer` uses — there is no reason for this cadence to
+    /// differ, and reusing the shape (not the same call, since that would
+    /// touch `election_deadline` too) keeps the resend rate familiar.
+    fn next_cluster_check_resend(&self, now: Nanos, entropy: u64) -> Nanos {
+        let base = self.election_base.as_nanos() as u64;
+        let extra = if base == 0 { 0 } else { entropy % base };
+        Nanos(now.0.saturating_add(base + extra))
+    }
+
+    fn broadcast_cluster_probe(&self) -> Vec<Out<C>> {
+        self.peers
+            .iter()
+            .map(|p| (p.clone(), RaftMsg::ClusterProbe))
+            .collect()
+    }
+
+    /// Answer a peer's [`RaftMsg::ClusterProbe`] honestly with our own
+    /// current term/commit index/committed config, plus whether we
+    /// ourselves have ever received a real protocol message from `from`
+    /// (`ever_heard_from_prober` — see `RaftMsg::ClusterProbeResp`'s own doc
+    /// for why this closes the genesis-race gap `config` alone cannot) —
+    /// including while our *own* `cluster_check_pending` is still
+    /// unresolved: a still-checking node's honest `0`/`0`/(whatever config
+    /// it started with) is exactly the evidence a fellow genesis
+    /// participant needs, and once this node itself resolves (either way)
+    /// its own term/commit reflect that truthfully from then on.
+    fn handle_cluster_probe(&mut self, from: NodeId) -> Vec<Out<C>> {
+        let ever_heard_from_prober = self.heard_from.contains(&from);
+        vec![(
+            from,
+            RaftMsg::ClusterProbeResp {
+                term: self.current_term,
+                committed_index: self.commit_index,
+                config: self.config.clone(),
+                ever_heard_from_prober,
+            },
+        )]
+    }
+
+    /// Tally a [`RaftMsg::ClusterProbeResp`]. A no-op unless our own
+    /// `cluster_check_pending` is still `Some` (already resolved, or never
+    /// applicable — a stale/duplicate reply).
+    ///
+    /// `term > 0 || committed_index > 0` proves `from` (and thus the
+    /// cluster) has real history — but that alone does NOT mean this node
+    /// itself is unsafe to proceed as a voter: an ordinary ADR 0060 growth
+    /// join (a genuinely brand-new node id, never before a voter anywhere,
+    /// added to an established cluster via `change_membership`) hits this
+    /// exact branch too, since it also starts with an empty local WAL. The
+    /// disambiguator is `from`'s own **committed config**:
+    /// - `config.contains(&self.id)` — `from` already recognizes this node
+    ///   id as one of its own voters, yet this node's own disk is empty.
+    ///   That combination is only possible if this identity was already an
+    ///   established voter and its disk was wiped — refuse permanently
+    ///   (`cluster_check_refused`, never cleared; see that field's own doc).
+    /// - otherwise — `from` has real history but does not (yet) recognize
+    ///   this node id as a voter at all, so this identity could never have
+    ///   cast a real vote here to forget in the first place. Resolve
+    ///   immediately as an ordinary fresh voter: `start_pre_vote`'s own
+    ///   log-check (ADR 0060) is what already keeps this case safe, and
+    ///   always has, with no dependency on this whole mechanism.
+    ///
+    /// Only once *every* configured peer has confirmed genuinely empty
+    /// (`0`/`0`) does this resolve to "genuine fresh multi-node bootstrap".
+    /// Issue #667 amendment (2026-09-15): a REAL `ProdEnv` regression —
+    /// `forward_to_tablet_leader_survives_a_dead_first_guess` flaking under
+    /// real threading, root-caused via a reproduced trace log — proved the
+    /// original one-reply-and-decide version of this function unsound for
+    /// ordinary multi-node genesis bootstrap, not just an adversarial edge
+    /// case: in a real (not `SimEnv`-synchronized) N-node genesis, a
+    /// majority of peers can complete a real election among themselves
+    /// before every founding peer's own probe round has finished — which
+    /// looks BYTE-IDENTICAL, from a merely-slower founder's own evidence
+    /// (a peer replying with `term > 0`/`committed_index > 0` whose
+    /// committed config names this node, since a genesis committee always
+    /// contains every founder from construction), to a genuine wiped-voter
+    /// restart. Deciding on the FIRST such reply — as this function
+    /// originally did — reproduces exactly this false permanent refusal,
+    /// observed live cascading across 3 of 4 genesis founders in one
+    /// captured run (see `docs/lessons/` for the reproduction).
+    ///
+    /// The fix: never decide refusal on a single reply. Evidence is
+    /// gathered from EVERY configured peer (`cluster_check_pending`'s
+    /// existing wait-for-all discipline, unchanged) before a refusal
+    /// verdict is ever reached — except the two cases that are already
+    /// unambiguous on a single reply, each resolving immediately without
+    /// waiting for the rest of the peer set:
+    /// - a peer with real history that does NOT yet recognize this node as
+    ///   a voter (the `!config.contains` arm below) — safe regardless of
+    ///   what any other peer says.
+    /// - **any** peer answering genuinely empty (`term == 0 &&
+    ///   committed_index == 0`) — i.e. that peer has itself never
+    ///   participated in anything, which is unconditionally decisive:
+    ///   this cannot be a cluster this identity was already an established
+    ///   voter of and then lost its own record of, because a *genuinely*
+    ///   established cluster's surviving voters (the ones this node would
+    ///   need to convince otherwise) would ALL already show real history.
+    ///   No later reply from any other peer, established-and-naming-me or
+    ///   otherwise, can ever change this verdict — the veto is decisive
+    ///   the instant it's seen, not merely "sticky until decision time" —
+    ///   so resolving immediately here, rather than waiting for every
+    ///   other configured peer to also answer, is both sound and
+    ///   materially faster to converge under real, adversarial scheduling
+    ///   (found live: a still-pending founder's own resend can be
+    ///   suppressed for a long time once it starts receiving ordinary
+    ///   `AppendEntries`/heartbeat traffic from an already-elected sibling,
+    ///   since `handle_append_entries` legitimately resets
+    ///   `election_deadline` on every such contact — see
+    ///   `cluster_check_resend_deadline`'s own doc for the companion fix
+    ///   this required).
+    ///
+    /// Only once every peer has answered with NEITHER of the two
+    /// unambiguous signals above (every peer already has real history and
+    /// none of them is fresh) does the verdict depend on aggregated
+    /// evidence: refuse permanently if *at least one* of those peers both
+    /// names this node as an established voter AND has itself genuinely
+    /// heard from this identity before (`ever_heard_from_prober`) —
+    /// that combination is only possible for a genuinely wiped,
+    /// previously-established voter — otherwise resolve fresh.
+    ///
+    /// **Issue #667 amendment (2026-09-15, second): added
+    /// `ever_heard_from_prober`** to close a real gap the two signals
+    /// above cannot: in a genuine N-node genesis, EVERY founder's `config`
+    /// contains every OTHER founder from the very first committed entry
+    /// onward (that's what a genesis config *is*), so
+    /// `config.contains(&self.id)` is unconditionally `true` for a genesis
+    /// founder the instant any majority elects — the exact same signal a
+    /// truly established, long-running cluster's wiped voter produces. The
+    /// two are otherwise observationally identical from `from`'s own
+    /// term/commit/config alone. `ever_heard_from_prober` breaks the tie: a
+    /// founder still resolving its OWN cluster check has not campaigned or
+    /// voted yet
+    /// (gated on `!cluster_check_pending`), so it has sent no peer any real
+    /// protocol message — every peer's honest answer is `false`.
+    ///
+    /// **Third amendment, same day**: the second amendment originally made
+    /// a single `ever_heard_from_prober == false` reply immediately
+    /// decisive for "fresh", on the claim that a genuinely established
+    /// voter's peers "keep answering `true` for as long as they keep
+    /// running." That claim is false for an ordinary follower-follower
+    /// pair: a plain follower that has never itself been a candidate or
+    /// leader only ever exchanges real protocol messages with whichever
+    /// peer *is* the candidate/leader (a fellow follower never sends it a
+    /// `RequestVote`/`AppendEntries`, and the leader does not mark
+    /// `heard_from` on receiving a plain `AppendEntriesResp` either), so
+    /// two long-established, healthy followers can go their whole lives
+    /// never marking each other in `heard_from` — a genuinely wiped
+    /// voter's fellow-follower peer honestly answers `false` even though
+    /// the cluster is real, which reproducibly (not intermittently)
+    /// defeated the refusal (found via a real, deterministic `ProdEnv`
+    /// failure in
+    /// `wiped_voter_refuses_and_the_rest_of_the_cluster_keeps_serving`).
+    /// The fix folds this signal into the SAME wait-for-every-peer
+    /// aggregation the established verdict already uses — decisive only
+    /// once every peer has answered, and only via "at least one true"
+    /// (mirroring "at least one established-and-naming-me", not "all of
+    /// them") — so a true genesis race (uniformly `false` from every peer)
+    /// still resolves fresh, but a real refusal no longer depends on every
+    /// individual peer having directly talked to the wiped identity. See
+    /// `RaftMsg::ClusterProbeResp`'s own doc for the full reasoning and its
+    /// documented residual.
+    fn handle_cluster_probe_resp(
+        &mut self,
+        from: NodeId,
+        term: u64,
+        committed_index: u64,
+        config: BTreeSet<NodeId>,
+        ever_heard_from_prober: bool,
+    ) -> Vec<Out<C>> {
+        let Some(pending) = self.cluster_check_pending.as_mut() else {
+            return Vec::new();
+        };
+        if term == 0 && committed_index == 0 {
+            // Unconditionally decisive the instant it's seen — see this
+            // method's own doc for why waiting for the rest of the peer
+            // set would only add latency, never change the outcome.
+            self.cluster_check_pending = None;
+            tracing::debug!(
+                node = %self.id,
+                peer = %from,
+                "boot-time cluster check resolved: peer {from} is itself genuinely fresh, so \
+                 any other peer's own \"established, and names me\" answer is a same-bootstrap \
+                 timing artifact, not evidence of a genuine wiped-voter restart. Proceeding as \
+                 an unestablished fresh voter.",
+            );
+            return Vec::new();
+        }
+        if !config.contains(&self.id) {
+            // Unambiguous on its own, regardless of any other peer's
+            // answer: `from` has real history but has never recognized
+            // this node id as a voter at all, so this identity could
+            // never have cast a real vote here to forget in the first
+            // place — an ordinary new voter joining an established
+            // cluster (ADR 0060). `start_pre_vote`'s own log-check is
+            // what already keeps this case safe, with no dependency on
+            // this whole mechanism.
+            self.cluster_check_pending = None;
+            tracing::debug!(
+                node = %self.id,
+                peer = %from,
+                "boot-time cluster check resolved: peer {from} has real history but does \
+                 not yet recognize this node id as one of its voters — an ordinary new \
+                 voter joining an established cluster (ADR 0060), not a wiped-voter \
+                 restart. Proceeding as an unestablished fresh voter.",
+            );
+            return Vec::new();
+        }
+        // Real history, and names this node as an established voter — but
+        // `ever_heard_from_prober` is deliberately NOT treated as decisive
+        // on its own here, in either direction (2026-09-15, third
+        // amendment — a real `ProdEnv` regression,
+        // `wiped_voter_refuses_and_the_rest_of_the_cluster_keeps_serving`,
+        // reproduced this deterministically, not as a flake). The second
+        // amendment's own doc claimed this signal is "a pure addition:
+        // it never makes an established-restart refusal less likely...
+        // a genuinely wiped voter's peers HAVE received real messages from
+        // it pre-wipe and keep answering `true`" — but that assumption is
+        // false for a perfectly ordinary established topology: a plain
+        // FOLLOWER that has never itself been a candidate or leader only
+        // ever receives direct protocol messages (`RequestVote`,
+        // `AppendEntries`) from whichever peer *is* the candidate/leader —
+        // never from a fellow follower. `handle_append_resp` (the leader's
+        // own receipt of a follower's `AppendEntriesResp`) does not mark
+        // `heard_from` either. So two long-established, perfectly healthy
+        // follower peers can go their entire lives never marking
+        // `heard_from` for each other, and a genuinely wiped voter's
+        // fellow-follower will honestly answer `ever_heard_from_prober:
+        // false` even though the cluster is real and long-running —
+        // deciding "fresh" on that single reply (the previous code) is
+        // exactly backward and defeats the refusal this whole mechanism
+        // exists to enforce, reproducibly (not intermittently) whenever
+        // the wiped voter's peer set contains a fellow follower it never
+        // directly talked to.
+        //
+        // The fix: fold `ever_heard_from_prober` into the SAME
+        // wait-for-every-peer aggregation the "established" verdict below
+        // already uses, instead of letting it short-circuit early. A
+        // single peer's `false` no longer resolves anything by itself;
+        // only after every configured peer has answered (with neither of
+        // the two genuinely unambiguous signals above) does the verdict
+        // depend on whether *any* peer ever showed real participation
+        // evidence — mirroring how "established" already only requires
+        // ONE such peer, not all of them (a genuinely established cluster
+        // is not guaranteed to have every peer show `true`, only at least
+        // one that actually interacted with this identity before the
+        // wipe). This restores the "pure addition, never weakens a real
+        // refusal" property the second amendment intended but did not
+        // achieve, while still closing the genesis-race gap the second
+        // amendment targeted: in a true same-bootstrap race, NO peer has
+        // ever received a real message from a still-checking founder
+        // (nothing has been sent yet), so every reply shows `false` and
+        // the aggregate below still resolves fresh.
+        if ever_heard_from_prober {
+            self.cluster_check_saw_established_with_me = true;
+        }
+        pending.remove(&from);
+        if pending.is_empty() {
+            self.cluster_check_pending = None;
+            if self.cluster_check_saw_established_with_me {
+                // Every peer answered, none was fresh and none denied
+                // recognizing this node (either branch always resolves
+                // and returns above), and at least one of them both named
+                // this node as an established voter AND has itself
+                // genuinely received a real protocol message from this
+                // identity before — only possible for a genuinely
+                // established, previously-active voter whose disk was
+                // wiped.
+                self.cluster_check_refused = true;
+                tracing::error!(
+                    node = %self.id,
+                    "refusing to start as a voter: this node's persisted Raft state is empty \
+                     (ephemeral storage wiped?), every configured peer already has real \
+                     history, and at least one both recognizes this node id as an established \
+                     voter and has itself genuinely heard from this identity before. Re-add \
+                     this node id through the rejoin path instead of restarting it as a static \
+                     voter: remove it from the voter set, add it back as a learner \
+                     (`animusd join` / admin add-learner, ADR 0032/0058), and let it be \
+                     promoted back to voter once caught up.",
+                );
+            } else {
+                // Every peer has real history and names this node, but NOT
+                // ONE of them has ever genuinely heard from this identity —
+                // a same-bootstrap genesis race (or an ordinary rejoin),
+                // never a wiped-voter restart (see this method's own doc,
+                // third amendment).
+                tracing::debug!(
+                    node = %self.id,
+                    "boot-time cluster check resolved: every configured peer has real \
+                     history and names this node, but none of them has ever itself received \
+                     a real protocol message from this identity — a same-bootstrap genesis \
+                     race (or an ordinary rejoin), not a wiped-voter restart. Proceeding as \
+                     an unestablished fresh voter.",
+                );
+            }
+        }
+        Vec::new()
+    }
+
+    /// Whether this node is still resolving the issue #667 boot-time check —
+    /// while `true` it never grants a real vote and never campaigns (see
+    /// `begin_cluster_check`'s doc).
+    #[must_use]
+    pub fn cluster_check_pending(&self) -> bool {
+        self.cluster_check_pending.is_some()
+    }
+
+    /// Whether this node has permanently refused to act as a voter (issue
+    /// #667): its persisted state replayed empty, and a peer's
+    /// `ClusterProbeResp` proved the cluster it is configured into already
+    /// exists. Sticky for this `RaftCore`'s lifetime — see
+    /// `cluster_check_refused`'s own field doc for why there is no path
+    /// back from this short of a restart through the learner/rejoin path.
+    #[must_use]
+    pub fn refused_as_voter(&self) -> bool {
+        self.cluster_check_refused
     }
 
     /// Propose a command. If leader, append it (replicated on the next
@@ -2214,6 +2969,13 @@ where
         now: Nanos,
         entropy: u64,
     ) -> Vec<Out<C>> {
+        // Issue #667 (2026-09-15 amendment): a real candidacy always
+        // self-votes durably (`voted_for = self`) the moment it's issued,
+        // whether or not WE grant it — record it unconditionally, before
+        // the grant decision, so `heard_from`'s own doc's "never marked on
+        // a rejection this node SENDS" rule stays about the RESPONDER's own
+        // outbound rejection, not the incoming candidate's real self-vote.
+        self.heard_from.insert(candidate.clone());
         let granted = if term < self.current_term {
             false
         } else {
@@ -2221,9 +2983,16 @@ where
                 || (last_log_term == self.last_log_term()
                     && last_log_index >= self.last_log_index());
             let can_vote = self.voted_for.is_none() || self.voted_for == Some(candidate.clone());
+            // Issue #667: an empty-store node still resolving (or refused
+            // on) the genesis-vs-wiped-restart check must never grant a
+            // real vote — `voted_for.is_none()` above is exactly the
+            // locally-unreliable signal a wiped voter's own forgotten vote
+            // would otherwise defeat. See `begin_cluster_check`'s doc.
+            let cluster_checked =
+                !self.cluster_check_refused && self.cluster_check_pending.is_none();
             // ADR 0058 Train 1: a learner never grants a real vote either
             // (mirrors `handle_pre_vote`'s identical gate/rationale).
-            if self.is_voter() && can_vote && log_ok {
+            if self.is_voter() && can_vote && log_ok && cluster_checked {
                 self.voted_for = Some(candidate.clone());
                 self.reset_election_timer(now, entropy);
                 true
@@ -2247,6 +3016,15 @@ where
         granted: bool,
         now: Nanos,
     ) -> Vec<Out<C>> {
+        // Issue #667 (2026-09-15 amendment): a granted real vote durably
+        // sets `from`'s own `voted_for` — exactly the forgettable state
+        // `heard_from` exists to record. Marked before the stale-response
+        // early-return below (`from`'s own vote was cast regardless of
+        // whether it's still useful to *this* candidacy by the time it
+        // arrives), never on `granted == false` (a rejection sets nothing).
+        if granted {
+            self.heard_from.insert(from.clone());
+        }
         if self.role != Role::Candidate || term != self.current_term {
             return Vec::new();
         }
@@ -2273,6 +3051,12 @@ where
         now: Nanos,
         entropy: u64,
     ) -> Vec<Out<C>> {
+        // Issue #667 (2026-09-15 amendment): `leader` sending `AppendEntries`
+        // at all is proof it previously won a real election — which
+        // required it to self-vote (durable, forgettable state) to become a
+        // candidate in the first place — regardless of whether this
+        // particular message is stale by the time it arrives.
+        self.heard_from.insert(leader.clone());
         if term < self.current_term {
             return vec![(
                 leader,
@@ -2479,6 +3263,10 @@ where
         now: Nanos,
         entropy: u64,
     ) -> Vec<Out<C>> {
+        // Issue #667 (2026-09-15 amendment): same reasoning as
+        // `handle_append_entries` — `leader` sending a snapshot at all
+        // proves it previously won a real election.
+        self.heard_from.insert(leader.clone());
         if term < self.current_term {
             return vec![(
                 leader,
@@ -2681,6 +3469,7 @@ where
         if last_index > 0 {
             // Transfer complete: the follower installed the snapshot.
             self.snapshot_offset.remove(&from);
+            self.snapshot_offset_regressions.remove(&from);
             self.snapshot_chunk_sent.remove(&from);
             // Lazy-image discipline (`DRIVER_APPLIED`): once no transfer is in
             // flight, drop the materialized image instead of retaining a
@@ -2736,8 +3525,72 @@ where
         // more round trips to recover from. `max` makes the tracked offset
         // monotonic regardless of ack arrival order — independent of, and
         // additive with, the resend cap below.
-        let entry = self.snapshot_offset.entry(from.clone()).or_insert(0);
-        *entry = (*entry).max(next_offset);
+        let tracked = self.snapshot_offset.entry(from.clone()).or_insert(0);
+        if next_offset == 0 && *tracked > 0 {
+            // Issue #899 amendment (folded into #898's own regression-
+            // counting rebase below, not a bypass of it): `next_offset == 0`
+            // is a genuine, AUTHORITATIVE reset, never a reorder to guard
+            // against, so it must not wait out `SNAPSHOT_OFFSET_REGRESSION_
+            // REBASE` retries the way an ordinary partial regression does.
+            // `handle_install_snapshot`'s own "still in progress" branch can
+            // only ever report exactly `0` when `self.incoming_snapshot` is
+            // `None` — which, for an ack reaching this far (`last_index ==
+            // 0`, so no completed transfer either), means the follower has
+            // FORGOTTEN whatever it was assembling (a real restart
+            // discarding the volatile in-flight buffer, per
+            // `handle_install_snapshot`'s own doc — never a reordered ack
+            // for an ongoing transfer, since that always reports a nonzero
+            // `inc.buf.len()`). Waiting for #898's own regression counter
+            // here left a restarted follower and its leader deadlocked for
+            // several extra round trips (and, before #898 existed at all,
+            // permanently): the leader kept re-sending chunks at its own
+            // stale (pre-restart, high) tracked offset, which the
+            // follower's `fresh && offset == 0` guard
+            // (`handle_install_snapshot`) can never treat as the start of a
+            // fresh transfer, so `incoming_snapshot` never re-initializes
+            // and the transfer never resumes. Confirmed via
+            // `chunked_snapshot_receiver_stop_restart_3`'s fixed corpus seed
+            // (also reachable with zero unrelated code changes at all, by
+            // perturbing any other seed into this same narrow window — the
+            // bug is pre-existing, not specific to how the seed is
+            // reached). See `docs/lessons/` for the incident writeup.
+            *tracked = 0;
+            self.snapshot_chunk_sent.remove(&from);
+            self.snapshot_offset_regressions.insert(from.clone(), 0);
+        } else if next_offset < *tracked {
+            // Issue #898: a regression below the tracked offset — either a
+            // stale, reordered ack for THIS transfer (the common case the
+            // monotonic guard below protects against) or a peer whose buffer
+            // genuinely reset (a real restart, same `NodeId`). Only rebase
+            // once the SAME peer has regressed `SNAPSHOT_OFFSET_REGRESSION_
+            // REBASE` times in a row with no intervening forward progress —
+            // seeing it for the first (few) time(s) is exactly what an
+            // ordinary reordered ack looks like too, so rebasing on the
+            // first sighting would defeat the monotonic guard's own purpose.
+            // (A regression all the way to exactly `0` is handled above,
+            // immediately, instead — see that branch's own doc for why zero
+            // specifically is never ambiguous the way any other partial
+            // regression is.)
+            let regressions = self
+                .snapshot_offset_regressions
+                .entry(from.clone())
+                .or_insert(0);
+            *regressions += 1;
+            if *regressions > SNAPSHOT_OFFSET_REGRESSION_REBASE {
+                *tracked = next_offset;
+                self.snapshot_chunk_sent.remove(&from);
+                *self
+                    .snapshot_offset_regressions
+                    .entry(from.clone())
+                    .or_insert(0) = 0;
+            }
+        } else {
+            // Real forward progress (or an exact repeat) — the monotonic
+            // guard's own case, and proof this peer's transfer is healthy:
+            // clear any accumulated regression count.
+            *tracked = next_offset;
+            self.snapshot_offset_regressions.insert(from.clone(), 0);
+        }
         // `SnapshotResend::Capped(SNAPSHOT_ACK_RESEND_CAP)`, not `Always` and
         // not `Capped(0)` — see `snapshot_chunk_for`'s own doc for why this
         // one call site needs a genuine, nonzero-but-bounded cap rather than
@@ -2807,6 +3660,19 @@ where
     /// partitioned/stalled node thus loops through harmless pre-vote rounds instead
     /// of ratcheting the cluster's term.
     fn start_pre_vote(&mut self, now: Nanos, entropy: u64) -> Vec<Out<C>> {
+        // Issue #667: an empty-store node still resolving (or having
+        // resolved unfavorably) the genesis-vs-wiped-restart check must
+        // never campaign — see `begin_cluster_check`'s doc. While pending,
+        // resend the probe instead of giving up on the round entirely, so a
+        // transiently-unreachable peer's eventual reply still unblocks us.
+        if self.cluster_check_refused {
+            self.reset_election_timer(now, entropy);
+            return Vec::new();
+        }
+        if self.cluster_check_pending.is_some() {
+            self.reset_election_timer(now, entropy);
+            return self.broadcast_cluster_probe();
+        }
         // A node removed from the configuration must not campaign (mirrors
         // `start_election`): it can't win and would only disrupt the survivors.
         // Issue #554: a node whose own state machine is behind its own log's
@@ -2860,6 +3726,13 @@ where
         // independent entry point (`handle_pre_vote_resp`'s own majority
         // check can reach here without going back through `start_pre_vote`),
         // so both need the check, not just one.
+        if self.cluster_check_refused || self.cluster_check_pending.is_some() {
+            // Defense in depth (mirrors `start_pre_vote`'s own primary
+            // guard): `handle_pre_vote_resp`/`handle_timeout_now` can reach
+            // this function directly, bypassing `start_pre_vote`.
+            self.reset_election_timer(now, entropy);
+            return Vec::new();
+        }
         if !self.is_voter() || self.state_machine_behind {
             self.reset_election_timer(now, entropy);
             return Vec::new();
@@ -2925,8 +3798,17 @@ where
         // doc); it is not reconstructed from a previous leader's in-flight state.
         self.departing.clear();
         self.transfer_target = None;
-        // A fresh term restarts any snapshot transfer from offset 0.
+        // A fresh term restarts any snapshot transfer from offset 0. Clear
+        // `snapshot_chunk_sent` alongside `snapshot_offset` (issue #898's
+        // `snapshot_transfer_in_flight` fix reads both) — a stale sent-chunk
+        // record from a PRIOR stint as leader on this same node would
+        // otherwise make this accessor report an in-flight transfer that no
+        // longer exists, needlessly deferring compaction until the
+        // `SNAPSHOT_COMPACT_DEFER_CEILING`/`COMPACT_DEFER_CEILING` backstop
+        // eventually overrides it (harmless, but not the intent).
         self.snapshot_offset.clear();
+        self.snapshot_offset_regressions.clear();
+        self.snapshot_chunk_sent.clear();
         // No-op entry so prior-term entries can be committed under our term.
         // Record its index: it is this leader's first current-term entry, the
         // watermark ReadIndex barriers and membership changes gate on

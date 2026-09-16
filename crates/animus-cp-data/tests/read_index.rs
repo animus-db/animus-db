@@ -234,7 +234,27 @@ fn set(ids: &[u64]) -> BTreeSet<u64> {
 /// incorrectly reports the key absent forever after such a move.
 #[test]
 fn linearizable_read_succeeds_after_a_full_membership_rotation() {
-    let seed = 0xBEAD;
+    // Re-pinned from 0xBEAD (issue #900): wiring issue #667's boot-time
+    // cluster check into this crate's own tablet-group driver draws extra
+    // entropy (`env.next_u64()`) whenever a fresh-group replica boots
+    // (`node3`/`node4` below, added as quiet non-voters) — the exact
+    // "boot-path entropy desync" collateral the control-plane's own #667 fix
+    // needed several fixed-seed re-pins for (see
+    // `docs/adr/0009-in-house-raft-over-env.md`'s 2026-09-15 amendments and
+    // `docs/lessons/testing/2026-09-15-boot-path-entropy-desyncs-fixed-
+    // seeds.md`). Under 0xBEAD the reshuffled draws elect node **1** instead
+    // of node 2 as the original 3-node group's leader; this test's own
+    // hard-coded removal order (0, then 1) then hits `change_membership`'s
+    // unconditional self-removal guard once the still-leading node 1 is
+    // asked to remove itself in the final `{2,3,4}` step — a correct
+    // rejection, not a bug (`membership.rs`'s own
+    // `rejects_multi_server_and_self_removal` exercises the identical
+    // guard), just incompatible with a hard-coded removal order that never
+    // transfers leadership away from whichever node happens to win the
+    // first election. 0xBF4F elects node 2 (the one node this rotation
+    // never removes) under the fixed entropy stream, restoring the
+    // scenario this test actually means to exercise.
+    let seed = 0xBF4F;
     let (mut sim, nodes) = group(seed);
     sim.run_for(Duration::from_secs(2));
     put(&nodes, &[0, 1, 2], seed, b"k", b"v");
