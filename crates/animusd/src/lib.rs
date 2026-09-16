@@ -10671,7 +10671,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     pub(crate) async fn admin_add_control_member(
         &self,
         node: Option<NodeId>,
-        addr: SocketAddr,
+        addr: String,
         labels: BTreeMap<String, String>,
     ) -> Result<NodeId, String> {
         let Some(leader) = self.edge.leader_handle() else {
@@ -10695,12 +10695,12 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             // env — every other control-role node's `peer_sync_loop` only
             // ever learns an updated address from `Metadata.node_addrs`,
             // never from this call's local `merge_peer` side effect.
-            leader.env().merge_peer(node.clone(), addr.to_string());
+            leader.env().merge_peer(node.clone(), addr.clone());
             let meta = self.control.metadata_cached();
             if let Some(mut addrs) = meta.node_addrs.get(&node).cloned()
-                && addrs.internal != addr.to_string()
+                && addrs.internal != addr
             {
-                addrs.internal = addr.to_string();
+                addrs.internal = addr.clone();
                 let _ = leader.propose(MetaCommand::RegisterNodeAddrs {
                     node: node.clone(),
                     addrs,
@@ -10777,8 +10777,8 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 intra: String::new(),
                 role: "control".to_string(),
             });
-            if addrs.internal != addr.to_string() {
-                addrs.internal = addr.to_string();
+            if addrs.internal != addr {
+                addrs.internal = addr.clone();
                 if let ProposeResult::NotLeader { .. } =
                     leader.propose(MetaCommand::RegisterNodeAddrs {
                         node: node.clone(),
@@ -10857,7 +10857,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                         intra: String::new(),
                         role: "control".to_string(),
                     });
-                addrs.internal = addr.to_string();
+                addrs.internal = addr.clone();
                 match self
                     .register_node(node.clone(), addrs, labels.clone())
                     .await
@@ -10881,7 +10881,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 }
             }
         }
-        leader.env().merge_peer(node.clone(), addr.to_string());
+        leader.env().merge_peer(node.clone(), addr.clone());
         let mut voters = current;
         voters.insert(node.clone());
         match leader.change_membership(voters) {
@@ -19283,6 +19283,15 @@ mod sim_cluster_schema_broadcast;
 /// investigation found and reports (not fixed here, out of scope).
 #[cfg(test)]
 mod sim_cluster_dynamo_drop_table;
+
+/// Issue #920: a `ConsistentRead: true` read routed through a node hosting
+/// no replica must not hang for tens of seconds after every replica of an
+/// idle (quiesced, ADR 0048) tablet group is crashed and restarted in
+/// turn with durable storage. See this module's own doc for the full
+/// scenario and why it lives here (needs `ClientCtx`/forwarding, not just
+/// `RaftKvNode`) rather than in `animus-cp-data`'s own quiescence corpus.
+#[cfg(test)]
+mod sim_cluster_quiesced_rolling_restart;
 
 /// ADR 0061 rung D4 PR 2 (C-04 D4): deterministic `SimCluster` coverage for
 /// the auto-split BYTE trigger (ADR 0034) — `auto_split_loop` (`lib.rs`)

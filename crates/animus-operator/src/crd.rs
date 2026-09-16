@@ -77,6 +77,19 @@ pub struct TlsSpec {
     /// Have cert-manager issue and renew the cluster's cert via a
     /// `Certificate` resource this operator creates and owns (`crate::
     /// desired::certificate::build`). Mutually exclusive with `secretName`.
+    ///
+    /// **`issuerRef` must never resolve to a bare `selfSigned` issuer
+    /// directly** (issue #913): every pod mounts the identical resulting
+    /// `Secret` (one shared leaf, not one per pod), and a `selfSigned`
+    /// issuer's output `Secret` sets `ca.crt` equal to that same leaf — so
+    /// any future reissuance mints a brand-new, mutually-untrusted root
+    /// rather than a renewed leaf under a stable CA, and `animusd` never
+    /// reloads TLS material after boot to recover from that. Put a
+    /// `ca`-typed issuer between a self-signed root and this field instead
+    /// (mint one CA `Certificate` off the `selfSigned` issuer, then a
+    /// second issuer signing real leaves from that CA's key) — see
+    /// `docs/adr/0064-tls-on-every-port.md`'s issue #913 amendment and
+    /// `scripts/e2e-kind.sh`'s own TLS setup for the reference shape.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cert_manager: Option<CertManagerSpec>,
 }
@@ -661,6 +674,21 @@ pub const CONDITION_CONTROL_NODES_SHRINK_REJECTED: &str = "ControlNodesShrinkRej
 /// voter check once nothing is pending), never the source of truth, which
 /// is always the live control group itself.
 pub const CONDITION_CONTROL_NODES_GROWING: &str = "ControlNodesGrowing";
+/// Condition type name warning that `spec.storage.ephemeral: true` is a
+/// standing Raft safety hazard for this cluster's control voters (issue
+/// #864, root-causing the S-07d growth stall): every control voter's own
+/// Raft WAL lives on an `emptyDir`, which a StatefulSet rolling update
+/// (triggered by ANY config-affecting spec change, not just
+/// `spec.controlNodes` growth — the pod-template config-hash annotation
+/// rolls every pod, see `crates/animus-operator/CLAUDE.md`'s S-07d
+/// section) discards along with the deleted-and-recreated Pod. A wiped
+/// EXISTING voter is then permanently refused by issue #667's boot-time
+/// check (ADR 0009's 2026-09-15 amendment) — a correct, deliberate safety
+/// response, but one that can cost the group its quorum for good if
+/// enough voters are wiped this way. Set unconditionally whenever
+/// `storage.ephemeral` is `true` (regardless of `controlNodes`), cleared
+/// otherwise — see ADR 0060's own storage section for the full account.
+pub const CONDITION_EPHEMERAL_VOTER_STORAGE_HAZARD: &str = "EphemeralVoterStorageHazard";
 /// Condition type name used when a scale-down below `controlNodes` is
 /// refused.
 pub const CONDITION_SCALE_BELOW_CONTROL_NODES_REFUSED: &str = "ScaleBelowControlNodesRefused";
