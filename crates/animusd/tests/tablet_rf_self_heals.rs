@@ -157,11 +157,33 @@ async fn tablet_provisioned_undersized_on_a_small_cluster_self_heals_after_growt
     const TABLE: &str = "rf_self_heal";
     put(&base_clients, TABLE, b"k0", b"v0", 30).await;
 
-    let initial = tablet_replicas(base_admin[0]).await;
+    // A transiently under-sized initial replica set is a legal, documented
+    // eventual property (issue #622/#670, `split_placing_two_replica_diff_
+    // e2e.rs`'s own identical precedent) — not a one-shot fact to assert on
+    // immediately right after the first write returns. Issue #610's own
+    // concurrent broadcast fallback made the first `CreateTable`/auto-create
+    // (and therefore `provision_tablet`'s own replica-selection read)
+    // resolve fast enough to make this test's own genuinely-2-node cluster
+    // hit exactly this window: `n1`'s own `RegisterNode` self-registration
+    // can still be in flight when `provision_tablet` reads `meta.members`,
+    // so the tablet is legitimately minted with just `n0` at that instant —
+    // `reconcile_placement`'s own violation-repair (the RF policy always
+    // records the *target* `MAX_REPLICATION_FACTOR`, per this file's own
+    // module doc) then grows it to 2 within one reconcile tick once `n1`
+    // goes `Active`. Poll converged-or-timeout instead of asserting once.
+    let progress_addr = base_admin[0];
+    support::poll_until_or_stalled(
+        progress_addr,
+        "tablet never converged to the 2 available members after the first write",
+        Duration::from_millis(100),
+        || async move { tablet_replicas(progress_addr).await.len() == 2 },
+    )
+    .await;
+    let initial = tablet_replicas(progress_addr).await;
     assert_eq!(
         initial.len(),
         2,
-        "tablet should be provisioned with exactly the 2 available members: {initial:?}"
+        "tablet should have converged to exactly the 2 available members: {initial:?}"
     );
 
     // Grow to 3 — a normal ADR 0030 growth node, exactly like `cluster_growth.rs`.
