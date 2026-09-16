@@ -2312,6 +2312,28 @@ Regression: `write_path.rs`'s in-crate `poll_probe_identity_tests` (a
 to legitimately `ConditionFailed`, and drives `poll_probe` directly for the
 second entry's own accepted-but-unapplied window).
 
+**`cp_kind_raw_local` did NOT go through `poll_probe` — until issue #911.**
+It had its own bespoke confirm loop, value-equality-only, that trusted
+`decide::confirm_wait_is_futile`'s `!is_leader()` clause as proof an
+accepted entry was lost. That clause's own doc is candid that this is only
+safe when "a retry is then a harmless idempotent duplicate" — true for
+every OTHER caller here, false for a raw kind batch: a spurious second
+accepted entry mints its own fresh HLC `ts` (ADR 0049's
+`materialize_derived`), so it is a genuinely **doubled** change-log/marker
+record, not just wasted work — a real duplicate DynamoDB Streams/backfill-
+drain event for a write the client made once. Fixed the same way ADR 0049's
+own 2026-09-16 amendment records: `cp_kind_raw_local` now checks
+`classify_kind_batch_outcome`'s (index, term) identity first, and only
+fails fast once that channel (or `engine_applied_index` passing the
+accepted index) proves something else decided the slot — "nothing decided
+yet" no longer ends the wait on `!is_leader()` alone, bounded by the same
+`CLIENT_TIMEOUT` as before. Regression: `write_path.rs`'s
+`cp_kind_raw_local_outcome_confirm_tests` (a three-voter group, no faults
+at all — an unrelated concurrent write overwrites the probed key between
+accept and confirm, reproducing the identical false-negative class
+deterministically) and `cp_kind_raw_local_genuine_loss_tests` (proves the
+fast-fail path for an actually-truncated entry is unchanged).
+
 **`cp_scan_kind` (ADR 0041)** is `cp_scan`'s single-tablet, kind-scoped
 sibling — the LSI `Query` read primitive: unlike `cp_scan`'s per-table
 fan-out, `start`/`end` must resolve to the *same* tablet (an LSI query is
