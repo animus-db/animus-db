@@ -14,11 +14,12 @@ use animus_tablet::{KeyRange, TabletId, TabletState};
 
 use crate::ReadConsistency;
 use crate::{
-    CLIENT_TIMEOUT, ClientCtx, ClientRequest, ClientResponse, CpRoute, FORWARD_HOP_TIMEOUT,
-    MAX_REPLICATION_FACTOR, MetaCommand, NodeAddrs, NodeStatus, PlacementPolicy, ProposeResult,
-    RegisterOutcome, SCHEMA_COMMIT_TIMEOUT, SCHEMA_POLL_INTERVAL, SCHEMA_PROPOSE_PATIENCE,
-    SPLIT_KEY_NOT_TOKEN_VIABLE, STREAM_GROW_MID_SPLIT, STREAM_GROW_NO_SPLIT_POINT,
-    WATCH_METADATA_SERVER_TIMEOUT, decide, index_drain, median_split_key, topology,
+    BROADCAST_EXHAUSTED_BACKOFF, CLIENT_TIMEOUT, ClientCtx, ClientRequest, ClientResponse, CpRoute,
+    FORWARD_HOP_TIMEOUT, MAX_REPLICATION_FACTOR, MetaCommand, NodeAddrs, NodeStatus,
+    PlacementPolicy, ProposeResult, RegisterOutcome, SCHEMA_COMMIT_TIMEOUT, SCHEMA_POLL_INTERVAL,
+    SCHEMA_PROPOSE_PATIENCE, SPLIT_KEY_NOT_TOKEN_VIABLE, STREAM_GROW_MID_SPLIT,
+    STREAM_GROW_NO_SPLIT_POINT, WATCH_METADATA_SERVER_TIMEOUT, decide, index_drain,
+    median_split_key, topology,
 };
 
 impl<E: Env, R: RelayClient> ClientCtx<E, R> {
@@ -110,6 +111,78 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         }
     }
 
+    /// The three ways `propose_schema` can resolve **without** falling back
+    /// to its own broadcast: this node is itself the leader (propose
+    /// directly), it has an intra-leader-address hint, or its own raw
+    /// `self.control.leader()` names someone to relay one hop to. `None`
+    /// means none of those apply — the caller (`propose_schema`) then owns
+    /// deciding what to do next (its own broadcast fallback).
+    ///
+    /// **Split out for issue #610's own fd-exhaustion regression, fixed by
+    /// issue #610 itself, continued.** [`forwarding::handle_relayed_
+    /// request`](crate::forwarding::handle_relayed_request)'s
+    /// `ProposeSchema` arm calls *this* method, never the full
+    /// `propose_schema`, on the receiving end of a relay — the doc on
+    /// `propose_schema`'s own broadcast fallback below claims the whole
+    /// relay is "a single, bounded hop, never a chain," but before this
+    /// split the receiving node's own `ctx.propose_schema(&command)` call
+    /// was the **entire** function, broadcast fallback included: if the
+    /// receiving node *also* had no locally-known leader (exactly the
+    /// common case during a fresh cluster's pre-election window, when
+    /// every voter is in this state at once), it silently re-broadcast to
+    /// every address **it** knew, each of which could do the same again —
+    /// an unbounded-depth fan-out the "never a chain" doc claimed didn't
+    /// exist. Every control voter already has direct connectivity to every
+    /// other one (this fixture's own `intra_route_snapshot()`), so a
+    /// receiving node's own further broadcast could never reach a
+    /// candidate the *original* caller could not have reached directly
+    /// itself — it was pure duplicated fan-out, not genuinely-needed
+    /// reach. Capping the relay handler to this one non-recursive step
+    /// keeps the ADR 0030 growth-node case fully intact (a growth node's
+    /// own relay still reaches a real control voter, which still tries its
+    /// own local/hinted/stale-leader-guess paths one hop further) while
+    /// making "a single, bounded hop, never a chain" true in fact, not
+    /// just in the comment.
+    pub(crate) async fn propose_schema_local_or_hinted(
+        &self,
+        command: &MetaCommand,
+    ) -> Option<bool> {
+        if let Some(leader) = self.edge.leader_handle() {
+            return Some(matches!(
+                leader.propose(command.clone()),
+                ProposeResult::Accepted { .. }
+            ));
+        }
+        // Prefer the control handle's own **intra** leader-address hint (ADR
+        // 0047; ADR 0035 PR4's original `leader_addr_hint` populated directly
+        // from `Status` replies for a `Remote` data node) over an
+        // `intra_addr` lookup — the hint is strictly fresher for a data-only
+        // node, since it rides the very `Status` reply that filled the
+        // mirror, whereas `intra_addr` needs this leader's address to have
+        // separately synced into the replicated node-address book. This is a
+        // machine-to-machine relay, so it uses the intra hint/route, never
+        // the human-facing `leader_addr_hint`/`route_addr` (see the root
+        // `CLAUDE.md`'s hint-field-conflation lesson). A no-op for `Local`
+        // (always `None`).
+        if let Some(addr) = self.control.intra_leader_addr_hint() {
+            return Some(!matches!(
+                self.relay(addr, ClientRequest::ProposeSchema(command.clone()))
+                    .await,
+                ClientResponse::Error(_)
+            ));
+        }
+        if let Some(leader_id) = self.control.leader()
+            && let Some(addr) = self.intra_addr(leader_id)
+        {
+            return Some(!matches!(
+                self.relay(addr, ClientRequest::ProposeSchema(command.clone()))
+                    .await,
+                ClientResponse::Error(_)
+            ));
+        }
+        None
+    }
+
     /// Propose a **schema-catalog** `command` toward the control-plane leader
     /// (v1 Phase 1 / A2): propose locally if this node is the control leader, else
     /// relay [`ClientRequest::ProposeSchema`] to the leader's node. Best-effort per
@@ -131,38 +204,8 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// `cp_batch_write_patient`/`propose_and_confirm_split` retry-amplification
     /// bugs, applied to the schema-proposal path.
     pub(crate) async fn propose_schema(&self, command: &MetaCommand) -> bool {
-        if let Some(leader) = self.edge.leader_handle() {
-            return matches!(
-                leader.propose(command.clone()),
-                ProposeResult::Accepted { .. }
-            );
-        }
-        // Prefer the control handle's own **intra** leader-address hint (ADR
-        // 0047; ADR 0035 PR4's original `leader_addr_hint` populated directly
-        // from `Status` replies for a `Remote` data node) over an
-        // `intra_addr` lookup — the hint is strictly fresher for a data-only
-        // node, since it rides the very `Status` reply that filled the
-        // mirror, whereas `intra_addr` needs this leader's address to have
-        // separately synced into the replicated node-address book. This is a
-        // machine-to-machine relay, so it uses the intra hint/route, never
-        // the human-facing `leader_addr_hint`/`route_addr` (see the root
-        // `CLAUDE.md`'s hint-field-conflation lesson). A no-op for `Local`
-        // (always `None`).
-        if let Some(addr) = self.control.intra_leader_addr_hint() {
-            return !matches!(
-                self.relay(addr, ClientRequest::ProposeSchema(command.clone()))
-                    .await,
-                ClientResponse::Error(_)
-            );
-        }
-        if let Some(leader_id) = self.control.leader()
-            && let Some(addr) = self.intra_addr(leader_id)
-        {
-            return !matches!(
-                self.relay(addr, ClientRequest::ProposeSchema(command.clone()))
-                    .await,
-                ClientResponse::Error(_)
-            );
+        if let Some(sent) = self.propose_schema_local_or_hinted(command).await {
+            return sent;
         }
         // No locally-known leader. The common cause is a real control-group
         // voter mid-election (rare, brief); the other is a **control-plane-
@@ -258,6 +301,15 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             }
             attempts = remaining;
         }
+        // Every candidate failed. See `BROADCAST_EXHAUSTED_BACKOFF`'s own
+        // doc for why this call backs off before returning — issue #610's
+        // own fd-exhaustion regression, found live in CI
+        // (`prod-liveness-hammer-pair`/`prod-liveness-animusd`): racing
+        // every candidate fixed this function's success-path latency, but
+        // let a *total* failure return so fast that every caller's own
+        // 50ms poll turned into an unthrottled broadcast storm during a
+        // fresh cluster's pre-election window.
+        self.env.sleep(BROADCAST_EXHAUSTED_BACKOFF).await;
         false
     }
 
