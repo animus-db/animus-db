@@ -2516,6 +2516,47 @@ ascending-node-id candidate order always tries the unreachable leader
 before the reachable witness; confirmed to take 2.1s pre-fix (one wasted
 `FORWARD_HOP_TIMEOUT`) and under 1s post-fix on the same seed.
 
+**Racing every candidate concurrently regressed a different resource
+entirely: file descriptors, found live in CI (fixed in the same issue
+#610 series).** Two assumptions this crate's own code carried elsewhere
+were only ever true because the pre-fix serial broadcast was slow: (1)
+`forwarding::handle_relayed_request`'s `ProposeSchema` arm called the
+*full* `propose_schema` on the receiving end of a relay — the doc's own
+"a single, bounded hop, never a chain" claim was false whenever the
+receiving node *also* had no locally-known leader (routine cluster-wide
+during a fresh cluster's pre-election window), since it then launched
+its *own* further broadcast, an unbounded-depth fan-out (every control
+voter already has direct connectivity to every other one, so this
+recursion could never reach a candidate the original caller couldn't
+have reached directly itself — pure duplicated fan-out); (2)
+`propose_and_await`'s doc justified retrying a "not sent anywhere"
+proposal every `SCHEMA_POLL_INTERVAL` (50ms) tick with no backoff as
+"costs nothing" — true only because a total failure used to take
+seconds, throttling the retry rate as a side effect. Once a total
+failure started resolving almost instantly, every node's own
+self-registration (which hits exactly this path pre-election) became an
+unthrottled broadcast storm. Under real per-push CI load (several nodes
+bootstrapping at once), the resulting socket count outpaced the kernel/
+runtime's own fd reclamation and exhausted the process's whole
+descriptor table — surfacing as an unrelated `RaftCore` WAL append
+failing with `EMFILE`, then a bootstrap timeout. **Fixed by**: splitting
+`propose_schema_local_or_hinted` out of `propose_schema` (`schema.rs`) —
+`handle_relayed_request` now calls this non-recursive, single-hop-only
+path, capping the relay to a true single hop; and `BROADCAST_EXHAUSTED_
+BACKOFF` (`lib.rs`, 250ms), a bounded sleep the broadcast fallback takes
+after every candidate has failed, restoring a sane retry-rate ceiling
+without reintroducing the original per-*candidate* multiplicative cost.
+Verified by fd-sampling `dynamo_index_writes` (6 tests, one process —
+the exact CI shape) under a constrained `ulimit -n`: pre-fix, 256 →
+243 peak fds, 5/6 tests failed with `EMFILE`; 1024 → 986 peak, 4/6
+failed; post-fix, 256 → 61 peak, 6/6 passed. Regression:
+`crates/animusd/tests/schema_broadcast_fd_bound.rs` — four 3-node
+clusters bootstrapping concurrently in one process, asserting every
+bootstrap succeeds and the process's own open-fd count returns under a
+generous ceiling afterward; confirmed to fail against the concurrent-
+broadcast-only intermediate state with the identical `"cluster did not
+bootstrap within 20s"` signature CI reported.
+
 `remote_metadata_watch_
 loop`'s long-poll (`WATCH_METADATA_CLIENT_TIMEOUT`, deliberately *longer*
 than `CLIENT_TIMEOUT` since it must outlive the serving node's own
