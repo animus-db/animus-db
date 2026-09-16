@@ -322,6 +322,22 @@ phase() {
 # fully torn down before the next. Best-effort throughout (`|| true` on
 # every step) — a diagnostics dump must never itself fail the run or
 # mask the original failure.
+#
+# Under `E2E_TLS=1`, `$CURL_TLS_ARGS` cannot be reused as-is: its own
+# `--resolve` entries are bound to `$DYNAMO_LOCAL_PORT`/`$ADMIN_LOCAL_PORT`
+# specifically (the *primary* port-forward's fixed local ports), so they
+# never match this function's own `$local_port` and curl falls through to
+# real DNS resolution of a cluster-internal name from outside the
+# cluster — which fails, indistinguishable in the old code from the pod
+# itself being down (a real occurrence: every one of e2e-0..3 came back
+# `<unreachable>` on a TLS-leg run where three of the four were actually
+# healthy). Every pod presents the identical shared leaf certificate
+# (ADR 0064 commit 3), so `$ADMIN_HOST` — already a name that certificate
+# covers (`$DYNAMO_HOST`, an exact SAN entry via `desired::certificate::
+# dns_names` — this doesn't need a per-pod wildcard hostname; the primary
+# flow already dials whichever pod its own port-forward lands on through
+# this same fixed name) — just needs a fresh `--resolve` naming *this*
+# function's own local port instead.
 dump_every_pod_admin_state() {
     local replicas
     replicas="$(kubectl get statefulset "$AC_NAME" -n "$NAMESPACE" \
@@ -332,7 +348,11 @@ dump_every_pod_admin_state() {
     fi
     local local_port=18102
     local fwd_log="${WORKDIR}/growth-target-port-forward.log"
-    local ord pod fwd_pid code body
+    local dump_curl_args=()
+    if [ "$E2E_TLS" = "1" ]; then
+        dump_curl_args=(--cacert "$CA_FILE" --resolve "${ADMIN_HOST}:${local_port}:127.0.0.1")
+    fi
+    local ord pod fwd_pid code body curl_err url
     for ((ord = 0; ord < replicas; ord++)); do
         pod="${AC_NAME}-${ord}"
         if ! kubectl get "pod/${pod}" -n "$NAMESPACE" >/dev/null 2>&1; then
@@ -351,11 +371,22 @@ dump_every_pod_admin_state() {
         # eating into the trap's own budget.
         sleep 2
         for path in health raft; do
-            body="$(curl -sS -m 3 "${CURL_TLS_ARGS[@]}" \
-                "${ADMIN_SCHEME}://${ADMIN_HOST}:${local_port}/admin/${path}" 2>/dev/null)" || body=""
-            code="$(curl -sS -o /dev/null -m 3 -w '%{http_code}' "${CURL_TLS_ARGS[@]}" \
-                "${ADMIN_SCHEME}://${ADMIN_HOST}:${local_port}/admin/${path}" 2>/dev/null)" || code="<unreachable>"
-            log "  GET /admin/${path} -> ${code}"
+            url="${ADMIN_SCHEME}://${ADMIN_HOST}:${local_port}/admin/${path}"
+            body="$(curl -sS -m 3 "${dump_curl_args[@]}" "$url" 2>/dev/null)" || body=""
+            code="$(curl -sS -o /dev/null -m 3 -w '%{http_code}' "${dump_curl_args[@]}" "$url" 2>/dev/null)" || code=""
+            if [ -z "$code" ]; then
+                # Distinguish "curl itself failed" (TLS/DNS/connection —
+                # a diagnostics-pipeline problem) from a real non-2xx HTTP
+                # response (which `%{http_code}` above would have printed
+                # regardless of exit status) — the swap trick below
+                # captures curl's own stderr, never its stdout, so a
+                # failure here is never confused with the pod's own
+                # response body.
+                curl_err="$(curl -sS -o /dev/null -m 3 -w '%{http_code}' "${dump_curl_args[@]}" "$url" 2>&1 >/dev/null | head -c 300)" || true
+                log "  GET /admin/${path} -> <unreachable> (curl: ${curl_err:-<no error output>})"
+            else
+                log "  GET /admin/${path} -> ${code}"
+            fi
             log "  body: ${body:-<empty>}"
         done
         if [ -n "$fwd_pid" ]; then
