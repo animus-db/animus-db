@@ -1450,8 +1450,23 @@ pub(crate) async fn handle_relayed_request<E: Env, R: RelayClient>(
             if !crate::is_relayable_command(&command) {
                 ClientResponse::Error("command not allowed over the relay path".into())
             } else {
-                ctx.propose_schema(&command).await;
-                ClientResponse::PutOk
+                // `propose_schema_local_or_hinted`, never the full
+                // `propose_schema` — issue #610's own fd-exhaustion
+                // regression: this is the RECEIVING end of a relay, and
+                // letting it fall into its own broadcast fallback turned a
+                // documented "single, bounded hop" into an unbounded-depth
+                // fan-out whenever the receiving node also had no
+                // locally-known leader (the common case cluster-wide during
+                // a fresh bootstrap's pre-election window). See that
+                // method's own doc for the full account.
+                match ctx.propose_schema_local_or_hinted(&command).await {
+                    Some(_) => ClientResponse::PutOk,
+                    None => ClientResponse::Error(
+                        "this node has no locally-known control-plane leader either; try \
+                         another known address"
+                            .into(),
+                    ),
+                }
             }
         }
         // Join discovery (ADR 0032 PR2, C-13/ADR 0061 rung M PR 2): widens

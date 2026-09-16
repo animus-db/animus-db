@@ -2479,7 +2479,85 @@ per-candidate-gets-the-whole-timeout shape also existed in
 `ClientCtx::propose_schema`'s own broadcast-to-every-known-address chase**
 (the ADR 0030 growth-node fallback, `schema.rs`) — fixed the same way,
 calling `relay_request_with_timeout` directly with `FORWARD_HOP_TIMEOUT`
-instead of `self.relay`'s flat `CLIENT_TIMEOUT`. `remote_metadata_watch_
+instead of `self.relay`'s flat `CLIENT_TIMEOUT`.
+
+**Capping each hop was not enough on its own (issue #610, fixed): a
+*serial* loop over the cap can still cost `(N-1) * FORWARD_HOP_TIMEOUT`
+for one call, and this chase's own callers have far less headroom than
+`forward_to_tablet_leader`'s `CLIENT_TIMEOUT` (10s) gives that one.**
+`dynamo.rs`'s `CreateTable` gives its whole propose-then-commit-wait loop
+only `SCHEMA_COMMIT_TIMEOUT` (5s) — so on a mere 3-node cluster, two
+capped hops (4s) already leave almost no room for the commit-wait that
+has to follow, and the shortfall gets worse with every additional voter.
+This is exactly the "first `CreateTable` after bootstrap" shape:
+`await_bootstrap` (every `ProdEnv` cluster fixture's own barrier) only
+guarantees *some* node is control leader and every node has non-empty
+membership, never that the node a client happens to reach already knows
+*who* leads — so a first `CreateTable` landing on a node whose own raw
+`leader()` is transiently `None` (issue #595's `start_pre_vote`-clears-
+`leader_id` mechanism, unrelated to a real partition) pays this
+broadcast's full serialized worst case, worse under exactly the runner
+load that makes each capped hop run closer to its cap instead of failing
+fast. Fixed by racing every candidate **concurrently** instead of one at a
+time (`futures::future::select_all` in a loop, retrying the survivors on
+each failure until one succeeds or all are exhausted) — this chase's own
+candidates carry no vouching signal over one another (unlike
+`forward_to_tablet_leader`'s `Hinted`/`Guessed` split, since nothing here
+has ever named a leader), so there is no preferred order worth trying
+serially. `select_all` rather than a plain `join_all`: it must resolve as
+soon as *any* candidate answers, not block on a dead one's own
+`FORWARD_HOP_TIMEOUT` after a live one already replied. Bounds one call to
+`FORWARD_HOP_TIMEOUT` regardless of cluster size. Regression:
+`sim_cluster_schema_broadcast.rs`'s `propose_schema_from_a_leaderless_
+follower_does_not_wait_out_an_unreachable_broadcast_candidate` — a
+follower partitioned from the (pinned) leader past one election window
+(`leader_within_hysteresis.rs`'s own repro shape for issue #595), whose
+ascending-node-id candidate order always tries the unreachable leader
+before the reachable witness; confirmed to take 2.1s pre-fix (one wasted
+`FORWARD_HOP_TIMEOUT`) and under 1s post-fix on the same seed.
+
+**Racing every candidate concurrently regressed a different resource
+entirely: file descriptors, found live in CI (fixed in the same issue
+#610 series).** Two assumptions this crate's own code carried elsewhere
+were only ever true because the pre-fix serial broadcast was slow: (1)
+`forwarding::handle_relayed_request`'s `ProposeSchema` arm called the
+*full* `propose_schema` on the receiving end of a relay — the doc's own
+"a single, bounded hop, never a chain" claim was false whenever the
+receiving node *also* had no locally-known leader (routine cluster-wide
+during a fresh cluster's pre-election window), since it then launched
+its *own* further broadcast, an unbounded-depth fan-out (every control
+voter already has direct connectivity to every other one, so this
+recursion could never reach a candidate the original caller couldn't
+have reached directly itself — pure duplicated fan-out); (2)
+`propose_and_await`'s doc justified retrying a "not sent anywhere"
+proposal every `SCHEMA_POLL_INTERVAL` (50ms) tick with no backoff as
+"costs nothing" — true only because a total failure used to take
+seconds, throttling the retry rate as a side effect. Once a total
+failure started resolving almost instantly, every node's own
+self-registration (which hits exactly this path pre-election) became an
+unthrottled broadcast storm. Under real per-push CI load (several nodes
+bootstrapping at once), the resulting socket count outpaced the kernel/
+runtime's own fd reclamation and exhausted the process's whole
+descriptor table — surfacing as an unrelated `RaftCore` WAL append
+failing with `EMFILE`, then a bootstrap timeout. **Fixed by**: splitting
+`propose_schema_local_or_hinted` out of `propose_schema` (`schema.rs`) —
+`handle_relayed_request` now calls this non-recursive, single-hop-only
+path, capping the relay to a true single hop; and `BROADCAST_EXHAUSTED_
+BACKOFF` (`lib.rs`, 250ms), a bounded sleep the broadcast fallback takes
+after every candidate has failed, restoring a sane retry-rate ceiling
+without reintroducing the original per-*candidate* multiplicative cost.
+Verified by fd-sampling `dynamo_index_writes` (6 tests, one process —
+the exact CI shape) under a constrained `ulimit -n`: pre-fix, 256 →
+243 peak fds, 5/6 tests failed with `EMFILE`; 1024 → 986 peak, 4/6
+failed; post-fix, 256 → 61 peak, 6/6 passed. Regression:
+`crates/animusd/tests/schema_broadcast_fd_bound.rs` — four 3-node
+clusters bootstrapping concurrently in one process, asserting every
+bootstrap succeeds and the process's own open-fd count returns under a
+generous ceiling afterward; confirmed to fail against the concurrent-
+broadcast-only intermediate state with the identical `"cluster did not
+bootstrap within 20s"` signature CI reported.
+
+`remote_metadata_watch_
 loop`'s long-poll (`WATCH_METADATA_CLIENT_TIMEOUT`, deliberately *longer*
 than `CLIENT_TIMEOUT` since it must outlive the serving node's own
 `WATCH_METADATA_SERVER_TIMEOUT` park) is the one call site that

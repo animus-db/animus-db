@@ -13432,9 +13432,43 @@ const SCHEMA_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// believes reached a leader's log, before resubmitting it — see
 /// [`ClientCtx::propose_schema`]'s doc for why blindly resubmitting every
 /// [`SCHEMA_POLL_INTERVAL`] tick is a retry-amplification bug. A proposal
-/// known *not* to have been sent anywhere (no leader reachable) is retried
-/// every tick regardless, since that costs nothing.
+/// known *not* to have been sent anywhere (no leader reachable) used to be
+/// retried every tick regardless, on the theory that costs nothing — true
+/// only while `propose_schema`'s own "no known leader" broadcast fallback
+/// was slow enough on a total failure to throttle the retry rate as a
+/// side effect; see [`BROADCAST_EXHAUSTED_BACKOFF`]'s own doc for why that
+/// stopped being true (issue #610's own fd-exhaustion regression) and
+/// where the correction actually lives.
 const SCHEMA_PROPOSE_PATIENCE: Duration = Duration::from_secs(1);
+/// How long [`ClientCtx::propose_schema`]'s "no locally-known leader"
+/// broadcast fallback sleeps after every one of its candidates has failed,
+/// before returning — found necessary live in CI
+/// (`prod-liveness-hammer-pair`/`prod-liveness-animusd`) after issue
+/// #610's own concurrency fix: racing every candidate at once
+/// (`futures::future::select_all`) fixed that fix's *success* path (a
+/// broadcast that actually reaches a leader now resolves in one hop's
+/// worth of latency, never `(N-1) * FORWARD_HOP_TIMEOUT`), but it also
+/// made a *total* failure resolve almost instantly instead of after
+/// several seconds — and every caller of `propose_schema` re-invokes it on
+/// its very next [`SCHEMA_POLL_INTERVAL`] (50ms) tick with no backoff of
+/// its own on a `false` return (see [`SCHEMA_PROPOSE_PATIENCE`]'s own
+/// now-corrected assumption). During the one window every node in a fresh
+/// cluster genuinely hits this on every tick — before the control group
+/// has elected *any* leader at all, e.g. every node's own concurrent
+/// self-registration — that turned a naturally-throttled ~1-2 broadcasts
+/// per second per node into effectively 20/sec, each opening up to `N-1`
+/// fresh sockets concurrently; under real per-push-CI load (several nodes
+/// bootstrapping at once, competing for the runner's own CPU) the kernel/
+/// runtime reclaims a closed relay socket's fd slower than that pace opens
+/// new ones, and the accumulating in-flight sockets exhaust the process's
+/// whole fd table — surfacing as an unrelated `RaftCore` WAL append
+/// failing with `EMFILE` (any fd-needing call would). Sized well under
+/// [`SCHEMA_POLL_INTERVAL`]'s own caller-visible cadence multiplied out
+/// and tiny next to [`FORWARD_HOP_TIMEOUT`]/[`SCHEMA_COMMIT_TIMEOUT`], so
+/// it restores a sane ceiling on the broadcast retry rate without
+/// reintroducing issue #610's own per-*candidate* multiplicative cost —
+/// this sleep fires once per exhausted *call*, never once per candidate.
+const BROADCAST_EXHAUSTED_BACKOFF: Duration = Duration::from_millis(250);
 
 /// Every CP **write/delete/kind-write/kind-eval** confirm loop
 /// (`write_path::wait_applied_past`, shared by `cp_put_local`/
@@ -19224,6 +19258,18 @@ mod sim_cluster_dynamo_documents;
 /// and `extended_surface` stay on `ProdEnv`.
 #[cfg(test)]
 mod sim_cluster_dynamo_schema;
+
+/// Issue #610 regression: `ClientCtx::propose_schema`'s "no locally-known
+/// leader" broadcast fallback (`schema.rs`) races every known intra
+/// candidate concurrently rather than trying them one at a time — a
+/// deterministic pin of "a node that has not yet learned the leader
+/// receives the first `CreateTable`" (the real-world race `await_
+/// bootstrap` under-specifies across every `ProdEnv` cluster fixture) via
+/// the identical partition-past-one-election-window repro shape
+/// `crates/animus-control/tests/leader_within_hysteresis.rs` already
+/// established for issue #595.
+#[cfg(test)]
+mod sim_cluster_schema_broadcast;
 
 /// ADR 0061 rung D4 PR 3 (C-04 D4): deterministic `SimCluster` coverage for
 /// the dropped-table GC reclaim (ADR 0024) — driven through the real

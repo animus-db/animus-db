@@ -1275,6 +1275,23 @@ impl SimClusterHandle {
         .await
     }
 
+    /// Call `node`'s own `ClientCtx::propose_schema` directly, bypassing a
+    /// full DynamoDB `CreateTable`'s own confirmation-poll loop — issue
+    /// #610's own regression needs to measure `propose_schema`'s latency
+    /// and success in isolation, since that confirmation loop (correctly)
+    /// can never observe a commit from a node PERMANENTLY partitioned from
+    /// the leader, even when `propose_schema` itself reaches the leader
+    /// fine via a relay through a third node: a partitioned node's own
+    /// Raft log can never advance to the committed entry regardless of how
+    /// the proposal got into the leader's log. `propose_schema`'s own
+    /// return value already carries everything this needs — whether the
+    /// command reached *some* leader's log, without the caller polling
+    /// this exact node's own replicated view for it.
+    pub(crate) async fn propose_schema_direct(&self, node: u64, command: MetaCommand) -> bool {
+        let ctx = self.ctx(node);
+        ctx.propose_schema(&command).await
+    }
+
     /// Run a decoded DynamoDB **Streams** wire request
     /// (`DynamoDBStreams_20120810.<Op>` + JSON body) against `node`'s own
     /// `ClientCtx`, through the exact same
@@ -2691,6 +2708,37 @@ impl SimCluster {
         self.control_node_ids[index]
     }
 
+    /// `node`'s own randomized-election-timeout base
+    /// (`RaftNode::election_timeout()`) — every control voter this fixture
+    /// builds shares the identical default, so any voter's own value is
+    /// representative, but reading `node`'s own removes any doubt for a
+    /// caller sizing a `run_for` window relative to a *specific* voter it
+    /// is about to partition. Issue #610's own regression
+    /// (`sim_cluster_schema_broadcast.rs`) uses this to hold a partition
+    /// open just past the window `start_pre_vote` needs to clear that
+    /// voter's own `leader()` belief (issue #595).
+    pub(crate) fn control_election_timeout(&self, node: u64) -> Duration {
+        self.controls[self
+            .control_index_of(node)
+            .expect("node is not a control voter")]
+        .election_timeout()
+    }
+
+    /// Whether `node`'s own control `RaftNode::leader()` currently believes
+    /// a leader exists — the direct analogue of `ClientCtx::propose_schema`'s
+    /// own `self.control.leader()` read on a `Local` control handle.
+    /// `pub(crate)` for issue #610's own regression, which needs to observe
+    /// one specific follower's transient "no known leader" window (cleared
+    /// by `start_pre_vote` on a bare election-timer expiry, issue #595)
+    /// rather than the whole group's [`SimCluster::control_leader_index`].
+    pub(crate) fn control_knows_leader(&self, node: u64) -> bool {
+        self.controls[self
+            .control_index_of(node)
+            .expect("node is not a control voter")]
+        .leader()
+        .is_some()
+    }
+
     /// Any control-bearing node index that is NOT the current control-
     /// plane leader — the "dial a follower, not the leader" seed a real
     /// seed/join joiner's own discovery round trip needs to exercise the
@@ -3639,6 +3687,22 @@ impl SimCluster {
                 format!("dynamo request on node {node} did not complete within {OP_BUDGET:?}"),
             )
         })
+    }
+
+    /// [`SimClusterHandle::propose_schema_direct`]'s own `&mut self` driver
+    /// sibling — same early-returning shape as [`SimCluster::dynamo_fast`]
+    /// (stops the instant the result lands, [`SPAWN_CAPTURE_FAST_STEP`]
+    /// increments), used by issue #610's own regression to measure how
+    /// long a single `propose_schema` call actually takes rather than a
+    /// full `CreateTable`'s own confirmation loop. `false` on a timeout,
+    /// indistinguishable from a genuine "reached no leader" — this
+    /// fixture's own scenarios never rely on telling the two apart.
+    pub(crate) fn propose_schema_fast(&mut self, node: u64, command: MetaCommand) -> bool {
+        let handle = self.shared.clone();
+        self.spawn_and_capture_fast(node, async move {
+            handle.propose_schema_direct(node, command).await
+        })
+        .unwrap_or(false)
     }
 
     /// Run a decoded DynamoDB **Streams** wire request against `node`'s own
