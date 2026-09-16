@@ -1965,6 +1965,11 @@ async fn reconcile_loop<E: Env>(env: E, core: Arc<Mutex<RaftCore>>, cache: Arc<M
     // retarget, never mis-times one unsoundly (the epoch-CAS on
     // `RetargetSplitPlacing` is what keeps it safe regardless).
     let mut retarget_since: BTreeMap<(TabletId, NodeId), Nanos> = BTreeMap::new();
+    // Driver-local grace tracking for ordinary repair/rebalance's post-`done`
+    // exclusion (issue #928/#921 fix) — see `recently_done_this_tick`'s own
+    // doc. Same volatile, per-node, `env.now()`-keyed, lost-on-leadership-
+    // change shape as `retarget_since` above, for the identical reason.
+    let mut done_since: BTreeMap<TabletId, Nanos> = BTreeMap::new();
     loop {
         env.sleep(RECONCILE_INTERVAL).await;
         tick = tick.wrapping_add(1);
@@ -1984,10 +1989,15 @@ async fn reconcile_loop<E: Env>(env: E, core: Arc<Mutex<RaftCore>>, cache: Arc<M
             // in the past, mirroring the failure detector's own cold-start
             // stance on regaining leadership.
             retarget_since.clear();
+            done_since.clear();
             continue;
         }
         let view = cache.lock().expect("cache poisoned").placement_view();
-        let proposals = view.reconcile();
+        // Issue #928/#921 fix: computed before repair/rebalance so both can
+        // exclude a tablet still inside its post-`done` grace window — see
+        // `recently_done_this_tick`'s own doc.
+        let recently_done = recently_done_this_tick(&env, &view, &mut done_since);
+        let proposals = view.reconcile(&recently_done);
         let repaired = !proposals.is_empty();
         for command in proposals {
             // Off-leader transitions between the check and here are harmless:
@@ -2003,7 +2013,7 @@ async fn reconcile_loop<E: Env>(env: E, core: Arc<Mutex<RaftCore>>, cache: Arc<M
         // safety is the epoch-CAS + data-plane catch-up gate, not this timing.
         if !repaired
             && tick.is_multiple_of(REBALANCE_EVERY_N_TICKS)
-            && let Some(command) = view.rebalance()
+            && let Some(command) = view.rebalance(&recently_done)
         {
             core.lock().expect("raft core poisoned").propose(command);
         }
@@ -2080,6 +2090,57 @@ fn retarget_ready_this_tick<E: Env>(
     }
     retarget_since.retain(|key, _| live.contains(key));
     ready
+}
+
+/// One tick's worth of post-`done` grace-window bookkeeping for
+/// `reconcile_loop`'s ordinary repair/rebalance phases (issue #928/#921
+/// fix): the set of tablets whose `split_placing` entry has been `done` for
+/// less than [`SPLIT_PLACING_RETARGET_DWELL_ACHIEVED`], counted from the
+/// FIRST tick this leader observed `done` for that tablet (`done_since` is
+/// mutated in place to track that first-seen instant, `env.now()`-keyed,
+/// never wall clock, exactly like `retarget_since`).
+///
+/// **Why this exists**: `SPLIT_PLACING_RETARGET_DWELL_ACHIEVED` (the
+/// 2026-09-16 issue #670/#921 fix, see that constant's own doc) protects an
+/// achieved-but-not-yet-`done` directed-Placing target from
+/// `split_placing_reconcile`'s own retarget. It does **not** protect the
+/// tablet the instant `done` fires (`SPLIT_PLACING_DONE_SETTLE`, 1.5s,
+/// fires quickly) and it falls under *ordinary*, un-dwelled
+/// `Metadata::reconcile`/`rebalance` — a failure-detector false positive
+/// there reproduces the identical achieved-target-discarded regression via
+/// a different code path. This closes that gap for exactly the tablets this
+/// crate can still name a `split_placing` history for (**not** issue #928's
+/// fully general form — an ordinary tablet with no split-placing history at
+/// all still has no dwell against a false positive; hardening the failure
+/// detector's own `Down` transition, or giving `reconcile()` a general
+/// per-violation dwell, remain open, cross-cutting follow-ups with their own
+/// availability trade-offs — see that issue).
+///
+/// A tablet's own timer is one-shot from first observation, not reset by
+/// anything (unlike `retarget_since`'s liveness-flap reset) — `done` cannot
+/// un-flip, so there is nothing to restart. Pruned once past the grace
+/// window or once the tablet no longer carries a `done` entry at all, so
+/// this map never grows unbounded across a long-running leader's lifetime.
+fn recently_done_this_tick<E: Env>(
+    env: &E,
+    view: &PlacementView,
+    done_since: &mut BTreeMap<TabletId, Nanos>,
+) -> BTreeSet<TabletId> {
+    let now = env.now();
+    let mut recent = BTreeSet::new();
+    let mut live: BTreeSet<TabletId> = BTreeSet::new();
+    for (&tablet, entry) in &view.split_placing {
+        if !entry.done {
+            continue;
+        }
+        let since = *done_since.entry(tablet).or_insert(now);
+        if now.duration_since(since) < SPLIT_PLACING_RETARGET_DWELL_ACHIEVED {
+            live.insert(tablet);
+            recent.insert(tablet);
+        }
+    }
+    done_since.retain(|tablet, _| live.contains(tablet));
+    recent
 }
 
 /// The leader's failure detector (ADR 0012): on a timer, if this node is leader,

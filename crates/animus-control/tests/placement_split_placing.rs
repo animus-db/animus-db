@@ -1010,3 +1010,110 @@ fn split_placing_phase_holds_an_already_achieved_target_past_the_base_dwell() {
         "never retargeted/converged past the achieved dwell (seed={seed})"
     );
 }
+
+/// **Test 11** (issue #928/#921 fix): test 10 above proves the achieved
+/// dwell holds an un-`done` achieved target. This proves the DISTINCT gap
+/// that dwell alone cannot close: the instant `done` fires (which happens
+/// quickly for real — `SPLIT_PLACING_DONE_SETTLE`, 1.5s — long before this
+/// test's own dwell-window fault), the tablet falls under *ordinary*,
+/// un-dwelled `Metadata::reconcile`, which used to react to the identical
+/// fault immediately. Driven through the SAME real `reconcile_loop` this
+/// crate's node.rs runs (not the pure function directly), over the
+/// identical fault/timing shape as test 10, but with `MarkSplitPlacingDone`
+/// proposed right after convergence — reproducing, deterministically and
+/// seed-replayably, the exact regression `split_placing_two_replica_diff_
+/// e2e.rs` hit over a real `ProdEnv` cluster (see that test's own module
+/// doc and this crate's `CLAUDE.md`).
+#[test]
+fn ordinary_reconcile_holds_a_recently_done_target_past_the_grace_window() {
+    use animus_control::node::SPLIT_PLACING_RETARGET_DWELL;
+
+    let seed = 0x5717_000bu64;
+    let (mut sim, nodes) = cluster(seed);
+    sim.run_for(Duration::from_secs(2));
+    let leader = leader_among(&nodes, &[0, 1, 2]);
+
+    for id in [10, 11, 12, 13, 14] {
+        register(&sim, &nodes[leader], id);
+    }
+    sim.run_for(Duration::from_secs(1));
+
+    split_fixture(&mut sim, &nodes, leader, &[12, 13, 14]);
+
+    let target = vec![nid(10), nid(11), nid(12)];
+    assert!(
+        wait_converged(
+            &mut sim,
+            &nodes,
+            leader,
+            &[TabletId(2), TabletId(3)],
+            &target
+        ),
+        "initial convergence to the stored target never happened (seed={seed})"
+    );
+
+    // Mark both children `done` — the real driver's own completion loop
+    // (`animusd::split_placing_completion`) does this within
+    // `SPLIT_PLACING_DONE_SETTLE` (1.5s) of exactly this observation, so
+    // proposing it directly here (this rung's own established idiom — see
+    // `split_placing_phase_never_touches_a_done_entry` above) stands in for
+    // that loop without needing to wire it into this crate's own test
+    // harness.
+    for child in [TabletId(2), TabletId(3)] {
+        let epoch = nodes[leader].metadata().tablets[&child].epoch;
+        assert!(matches!(
+            nodes[leader].propose(MetaCommand::MarkSplitPlacingDone {
+                tablet: child,
+                expected_epoch: epoch,
+            }),
+            ProposeResult::Accepted { .. }
+        ));
+    }
+    sim.run_for(Duration::from_millis(300));
+    for child in [TabletId(2), TabletId(3)] {
+        assert!(nodes[leader].metadata().split_placing[&child].done);
+    }
+
+    // Now a target member goes `Down` for good — a false positive in the
+    // real scenario, indistinguishable here from a genuine failure.
+    sim.crash(nid(10));
+    assert!(matches!(
+        nodes[leader].propose(MetaCommand::UpsertMember {
+            node: nid(10),
+            labels: BTreeMap::new(),
+            status: NodeStatus::Down,
+        }),
+        ProposeResult::Accepted { .. }
+    ));
+
+    // Run for the SAME window test 10 uses to prove the pre-`done` dwell
+    // holds — comfortably past `SPLIT_PLACING_RETARGET_DWELL` (5s), the
+    // window within which the pre-fix ordinary `reconcile()` would already
+    // have proposed a `CasTabletReplicas` away from the achieved target
+    // (repair has no dwell of its own at all — it would have reacted on the
+    // very next tick, not waited even this long). Nothing must have moved.
+    sim.run_for(SPLIT_PLACING_RETARGET_DWELL + Duration::from_secs(3));
+    for child in [TabletId(2), TabletId(3)] {
+        assert_eq!(
+            nodes[leader].metadata().tablets[&child].replicas,
+            target,
+            "child {child:?}: a recently-done target must not be repaired away by ordinary \
+             reconcile within its grace window (seed={seed})"
+        );
+    }
+
+    // Past the grace window, the genuinely (permanently) dead member is
+    // still eventually replaced by ordinary repair — the grace window
+    // delays repair, it does not disable it.
+    let fresh_target = vec![nid(11), nid(12), nid(13)];
+    assert!(
+        wait_converged(
+            &mut sim,
+            &nodes,
+            leader,
+            &[TabletId(2), TabletId(3)],
+            &fresh_target
+        ),
+        "never repaired past the grace window (seed={seed})"
+    );
+}

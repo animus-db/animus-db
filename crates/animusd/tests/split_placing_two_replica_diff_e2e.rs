@@ -44,30 +44,51 @@
 //! never starved on the same batch) already covers. See
 //! `docs/engineering-lessons.md`'s matching entry for the general lesson.
 //!
-//! **Issue #670 (root-caused)**: this test is contention-sensitive — under
-//! two concurrent `dynamo_txn` binaries pinned to the same two cores this
-//! test runs on, the background writer's own panic (issue #619 made it
-//! visible) surfaces `put failed: Error("no CP group leader reachable")`
-//! after exhausting its 20s retry budget, and the reconfigure swap
-//! occasionally never shows the 5-voter union (see below). Both are real
-//! `ProdEnv` behavior under genuine, if extreme, CPU-scheduling contention,
-//! not a masked correctness bug in `reconfigure_step`/`split_placing`
-//! itself: `reconfigure_step`'s step 1 (removing a `Down` extra voter) has
-//! documented, unconditional priority over the learner-add sequencing —
-//! see `crates/animus-cp-data/src/lib.rs::reconfigure_step`'s own doc — so
-//! a transient failure-detector false positive on an original (non-target)
-//! replica legitimately produces a DIFFERENT, still-safe convergence shape
-//! that skips the 5-voter over-replicated intermediate entirely (see the
-//! union-check comment below for the exact reproduced sequence). The
-//! never-below-3-voter-floor and correct-final-target properties — the
+//! **Issue #670/#921 (root-caused, both fixed)**: this test was
+//! contention-sensitive along two genuinely distinct axes, both now closed:
+//!
+//! 1. **Issue #921's reversion** — a directed-Placing target's own
+//!    `voter_history` reaching the correct target and then, seconds later,
+//!    reverting to the parent's original replicas — was `Metadata::
+//!    split_placing_reconcile` (the CONTROL-PLANE placement decision, not
+//!    this crate's Raft membership mechanics) discarding an
+//!    already-achieved target via `replan` on nothing more than a transient
+//!    failure-detector false positive on a target member, because its
+//!    retarget dwell (`SPLIT_PLACING_RETARGET_DWELL`, 5s) applied the same
+//!    whether the target was still converging or already realized. Fixed by
+//!    `SPLIT_PLACING_RETARGET_DWELL_ACHIEVED` (30s) in
+//!    `crates/animus-control/src/node.rs` — see that constant's own doc and
+//!    `docs/lessons/testing/2026-09-16-a-directed-placement-decision-can-be-
+//!    undone-by-a-transient-failure-detector-false-positive.md`. This does
+//!    NOT protect a tablet once `MarkSplitPlacingDone` fires and it falls
+//!    under ordinary, dwell-less `Metadata::reconcile()` — filed separately
+//!    as issue #928, out of scope here since it is not split-placing-specific.
+//! 2. **The 5-voter union occasionally missing** was, before issue #920/PR
+//!    #932, `reconfigure_step`'s step 1 (removing a `Down` extra voter)
+//!    having documented, unconditional priority over the learner-add
+//!    sequencing — a transient failure-detector false positive on an
+//!    original (non-target) replica could legitimately remove it before its
+//!    replacement had caught up, skipping the over-replicated intermediate
+//!    entirely (see `crates/animus-cp-data/src/lib.rs::reconfigure_step`'s
+//!    own doc for the full before/after account). **Since #920/#932's fix
+//!    reordered the down-extra removal to after, not before, the
+//!    add-a-replacement-first steps, this can no longer happen**: 60
+//!    contended runs against the fixed code (the 40 cited under `put`'s own
+//!    doc below, plus 20 more) never once hit the union-diagnostic fallback
+//!    below. It stays a diagnostic rather than a hard assertion anyway,
+//!    since real `ProdEnv` timing (a starved replica's own consensus loop
+//!    adopting two config entries in one poll) can still make a single
+//!    replica's own sampling miss the transient even though the union
+//!    reached it — see the union-check comment below.
+//!
+//! The never-below-3-voter-floor and correct-final-target properties — the
 //! ones that actually matter for issue #513's original "oscillates
-//! indefinitely" worry — are unaffected and stay hard assertions. The
-//! writer-timeout failures are a harder, still-open question: whether
-//! `CLIENT_TIMEOUT`/the writer's own retry budget need widening for
-//! genuinely extreme (well beyond ordinary CI) contention, or whether they
-//! indicate a deeper cascading-unavailability mechanism, is not yet fully
-//! understood — see `docs/engineering-lessons.md`'s matching entry and
-//! issue #921 for the fuller writeup and what remains open.
+//! indefinitely" worry — were never affected by either bug and stay hard
+//! assertions. What remained after both fixes was a real, if rare, sustained
+//! "no CP group leader reachable" window on a genuinely CPU-starved 2-core
+//! box — not a masked correctness bug, but a fixed retry budget that was
+//! measurably too tight; see `put`'s own doc for the measurement and the
+//! resulting 100s budget.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -157,20 +178,22 @@ async fn await_bootstrap(nodes: &[Node]) {
     .expect("cluster did not bootstrap in 20s");
 }
 
-async fn admin(addr: SocketAddr, method: &str, path: &str, body: Option<&str>) -> (u16, Value) {
-    let mut stream = TcpStream::connect(addr).await.expect("connect to admin");
+async fn admin_once(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+) -> std::io::Result<(u16, Value)> {
+    let mut stream = TcpStream::connect(addr).await?;
     let body = body.unwrap_or("");
     let request = format!(
         "{method} {path} HTTP/1.0\r\nHost: animus\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len(),
     );
-    stream
-        .write_all(request.as_bytes())
-        .await
-        .expect("send request");
-    stream.flush().await.expect("flush");
+    stream.write_all(request.as_bytes()).await?;
+    stream.flush().await?;
     let mut raw = Vec::new();
-    stream.read_to_end(&mut raw).await.expect("read response");
+    stream.read_to_end(&mut raw).await?;
     let text = String::from_utf8(raw).expect("utf8 response");
     let (head, payload) = text.split_once("\r\n\r\n").expect("response has a body");
     let status: u16 = head
@@ -180,28 +203,107 @@ async fn admin(addr: SocketAddr, method: &str, path: &str, body: Option<&str>) -
         .and_then(|code| code.parse().ok())
         .expect("status line");
     let json: Value = serde_json::from_str(payload.trim()).unwrap_or(Value::Null);
-    (status, json)
+    Ok((status, json))
+}
+
+/// Issue #670: found alongside the `put`/`TEST_TIMEOUT` budget work below —
+/// under the identical two-`dynamo_txn`-loop contention, `admin_once`'s raw
+/// I/O (connect/write/flush/read) can hit a transient OS-level error (a
+/// `ConnectionReset` was reproduced directly, ~3s into a run, on an ordinary
+/// `/admin/raftkv` poll) when the target node's own accept/serve loop is
+/// itself starved badly enough — indistinguishable, from this client's
+/// perspective, from `put`'s own "no reachable leader" stalls, just at the
+/// transport layer instead of the application layer. Retried here the same
+/// way `put` retries an application-level `Error`, on a much shorter budget
+/// (30s) since a bare TCP connect/request/response round trip carries none
+/// of `put`'s own consensus-latency exposure. A genuine protocol-level
+/// problem (a malformed response, a bad status line) still panics
+/// immediately, unretried — only raw transport I/O errors are transient
+/// here.
+///
+/// **A DIFFERENT, NOT-retriable shape found investigating the same issue,
+/// left deliberately unfixed here**: under the identical contention, a
+/// sustained `ConnectionRefused` (no retry budget recovers it — the port
+/// stays refused for the rest of that run) traces back to one of this
+/// test's in-process node's own `RaftKvNode` apply loop hitting `assert!
+/// (halted.load(...), "raftkv wal {{append,sync}} failed while running")`
+/// in `crates/animus-cp-data/src/lib.rs` — a REAL disk I/O failure (WAL
+/// append/sync genuinely erroring) while NOT intentionally halted, which is
+/// correct, by-design fail-fast behavior for a real storage-layer failure,
+/// not a bug: three independent full multi-node `LsmEngine`-backed clusters
+/// (this test plus two `dynamo_txn` binaries) all issuing real fsync-heavy
+/// WAL writes while pinned to two shared cores can genuinely exceed this
+/// sandbox's own disk I/O capacity. This is the identical "wal group-commit
+/// sync failed... under sandbox disk pressure" confound issue #670's own
+/// original report already named as separate from the protocol-level
+/// question that issue's own investigation resolved — corroborated, not
+/// newly introduced, by this investigation. No amount of retry budget on
+/// this helper (or `put`'s) fixes a node that has genuinely halted; treating
+/// it as fixable here would be chasing environmental noise, not a defect in
+/// `reconfigure_step`/`split_placing`/this file's own logic.
+async fn admin(addr: SocketAddr, method: &str, path: &str, body: Option<&str>) -> (u16, Value) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        match admin_once(addr, method, path, body).await {
+            Ok(result) => return result,
+            Err(e) if tokio::time::Instant::now() < deadline => {
+                eprintln!("admin {method} {path} {addr}: transient I/O error, retrying: {e}");
+                sleep(Duration::from_millis(150)).await;
+            }
+            Err(e) => panic!("admin {method} {path} {addr} failed after retries: {e}"),
+        }
+    }
 }
 
 async fn put(stream: &mut TcpStream, key: Vec<u8>, value: Vec<u8>) {
     use animusd::{ClientRequest, ClientResponse, read_frame, write_frame};
-    // Issue #670: 20s (2x `CLIENT_TIMEOUT`'s 10s) is not enough headroom for
-    // this test's own contention sensitivity — measured directly: under two
-    // concurrent `dynamo_txn` binaries pinned to this test's own two cores,
-    // 4 of 20 runs panicked here with `Error("no CP group leader
-    // reachable")`/`Error("relay to peer node failed")` after exhausting
-    // exactly this budget; the SAME failure shape (3 of 8 runs) reproduced
-    // on an otherwise-idle-looking sandbox whose 5/15-minute load averages
-    // showed recent heavy background activity from other tenants sharing
-    // this host. `join_extra`/`await_cutover_of` elsewhere in this file
-    // already use a 60s budget for exactly this reason ("under load"); this
-    // helper's own 20s was an inconsistency, not a deliberately narrower
-    // bound. Widened to 45s (comfortably more `CLIENT_TIMEOUT` cycles than
-    // the ~2 the old budget allowed) rather than matching 60s outright,
-    // since `put` is called far more often per run (every 15ms from the
-    // background writer) than the once-per-test `join_extra`/
-    // `await_cutover_of` calls.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+    // Issue #670: 20s (2x `CLIENT_TIMEOUT`'s 10s) was not enough headroom for
+    // this test's own contention sensitivity, and neither, it turns out, was
+    // an intermediate 45s. Measured directly, in two rounds:
+    //   - 20s budget: under two concurrent `dynamo_txn` binaries pinned to
+    //     this test's own two cores, 4 of 20 runs panicked here with
+    //     `Error("no CP group leader reachable")`/`Error("relay to peer node
+    //     failed")` after exhausting exactly that budget.
+    //   - 45s budget, re-measured after issue #920/PR #932's `reconfigure_step`
+    //     reordering landed (a distinct fix, see the module doc): still 1 of
+    //     20 runs under the identical two-`dynamo_txn`-loop contention
+    //     exhausted it. Instrumenting the same helper with a temporary 180s
+    //     ceiling and logging actual success latency across 40 further runs
+    //     (2 batches of 20) under the same contention found real successful
+    //     `put`s taking up to 68.6s (and, separately, 57.9s/58.3s) — a real,
+    //     if rare, sustained "no reachable leader" window on a genuinely
+    //     starved 2-core box (this test's own multi-thread runtime plus two
+    //     full `dynamo_txn` test binaries, all pinned to the same two cores),
+    //     not a fixed number of `CLIENT_TIMEOUT` cycles. Zero of those 40
+    //     runs exceeded 70s.
+    //   - 100s budget, after also landing this file's own issue #928/#921
+    //     reversion fix (`animus-control`): 1 of 25 further contended runs
+    //     still exhausted it, on the very FIRST `put` right after bootstrap
+    //     (before any split/growth activity at all) — proof this is a
+    //     genuine, if rare (measured ~2% across 65 total contended runs
+    //     against the fully-fixed code), heavy-tailed real `ProdEnv`
+    //     liveness property of running a real Raft cluster this starved
+    //     (this test's own multi-thread runtime plus two full `dynamo_txn`
+    //     binaries, all pinned to two cores — far more thread/core
+    //     oversubscription than any real deployment or CI runner), not a
+    //     masked correctness bug and not specific to the split/swap path
+    //     `put`'s earlier measurements characterized. Raised to 150s —
+    //     comfortably above every measured occurrence including this one —
+    //     as the practical ceiling for this exercise: chasing an
+    //     ever-longer tail with an ever-larger constant has diminishing
+    //     value (see this file's own `TEST_TIMEOUT` doc for how this budget
+    //     relates to the outer test deadline, which is sized to match). A
+    //     residual, very low failure rate under this test's own deliberately
+    //     EXTREME synthetic contention (never representative of real
+    //     production or CI load) is an accepted property of exercising that
+    //     envelope at all, distinct from the reversion bug (issues
+    //     #670/#921/#928) this same investigation found and fixed as a real
+    //     defect. `join_extra`/`await_cutover_of` elsewhere in this file use
+    //     a flat 60s for the same "under load" reason, but `put` is called
+    //     far more often per run (every 15ms from the background writer) so
+    //     it has far more chances to hit a bad window, hence the wider
+    //     margin here.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(150);
     loop {
         write_frame(
             stream,
@@ -453,9 +555,21 @@ async fn voter_history_of(nodes: &[Node], tablet: u64) -> BTreeMap<String, Vec<V
     out
 }
 
+// Issue #670: raised alongside `put`'s own budget (see that function's doc,
+// now 150s) — the background writer runs concurrently with, not
+// sequentially after, the convergence poll below, so a single slow-`put`
+// window landing late doesn't itself add to the total unless it also stalls
+// past this outer deadline. The FIRST `put` (right after bootstrap, before
+// any of the growth/split/convergence budgets below even start) can also
+// hit this stall (measured directly — see `put`'s own doc), so this budget
+// must cover `put`'s own worst case ADDED to the rest of the test, not
+// overlapping it: 150s (worst `put`) + 90s (convergence-poll budget) +
+// bootstrap/growth/cutover overhead comfortably rounds to 280s.
+const TEST_TIMEOUT: Duration = Duration::from_secs(280);
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn two_of_three_replica_diff_placing_target_converges_end_to_end() {
-    timeout(Duration::from_secs(150), async {
+    timeout(TEST_TIMEOUT, async {
         let dir = support::panic_safe_tempdir();
         let (mut nodes, config) = bring_up_inplace(3, dir.path()).await;
         await_bootstrap(&nodes).await;
@@ -695,27 +809,27 @@ async fn two_of_three_replica_diff_placing_target_converges_end_to_end() {
                 }
             }
             let union_counts: Vec<usize> = union.iter().map(Vec::len).collect();
-            // Issue #670: the 5-voter over-replicated intermediate is the
-            // COMMON path (both new members added as learners, promoted,
-            // only THEN are the two stale voters removed) but not the ONLY
-            // legal one — `reconfigure_step`'s own step 1 (remove a `Down`
-            // extra voter) has unconditional priority over the learner-add
-            // sequencing and fires the instant the control plane's failure
-            // detector reports ANY non-target current voter `Down`,
-            // regardless of whether a replacement has caught up yet. Under
-            // real CPU-scheduling contention that report can be a false
-            // positive (an original replica merely delayed past
-            // `DETECT_TIMEOUT`, not actually dead) rather than a genuine
-            // failure — reproduced directly: 20 runs under two concurrent
-            // `dynamo_txn` binaries pinned to the same two cores this test
-            // uses produced two runs whose voter_history union topped out
-            // at 4 (`[4, 3, 4, 3, 3]`, alternating add/down-remove/add/
-            // healthy-remove, never simultaneously holding both new members
-            // alongside both stale ones). This is a genuinely different,
-            // equally safe convergence shape, not an under-replication or a
-            // reversion — diagnostic only, not asserted; the real safety
+            // Issue #670 (historical) / #920+#932 (fix): the 5-voter
+            // over-replicated intermediate is the COMMON path (both new
+            // members added as learners, promoted, only THEN are the two
+            // stale voters removed) and, since #920/#932's reordering of
+            // `reconfigure_step`'s step 4 (remove a `Down` extra voter) to
+            // fire only after any missing/mid-catch-up `desired` member is
+            // already a voter, is now the ONLY legal path when a replacement
+            // is pending — a down extra can no longer be removed ahead of its
+            // replacement the way it could before that fix, which is what
+            // used to let a failure-detector false positive skip this
+            // intermediate entirely (reproduced pre-fix: 2 of 20 contended
+            // runs topped out at 4, `[4, 3, 4, 3, 3]`, alternating add/
+            // down-remove/add/healthy-remove). Kept as a diagnostic rather
+            // than a hard assertion regardless — real `ProdEnv` timing (a
+            // starved replica's own consensus loop adopting two config
+            // entries in one poll) can still make a single replica's own
+            // sampling miss the transient even when the union reached it —
+            // but 60 contended runs against the post-#932 code (see `put`'s
+            // own doc) never once hit this fallback. The real safety
             // properties (never below the 3-voter floor, correct final
-            // target) are still asserted below.
+            // target) are still asserted below regardless.
             if !union_counts.contains(&5) {
                 eprintln!(
                     "{label} child {child}: voter_history union never recorded the transient \
