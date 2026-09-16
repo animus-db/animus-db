@@ -664,6 +664,25 @@ Secret sets `ca.crt` to the stable signing CA's own certificate —
 unaffected by a leaf renewal. `deploy/operator/README.md`'s TLS section
 carries the same guidance for real deployments.
 
+**Issue #913 round 2 (2026-09-16): this fix is necessary but not yet
+proven sufficient.** A fresh-head `e2e-kind-tls` run of this exact fix
+(stacked under PR #909's `kubectl rollout status` addition, so the run
+could no longer report success before pod 3 was actually `Ready`) still
+hit the identical `BadCertificate` failure. Three of the four standing
+hypotheses are now ruled out with direct evidence — the wildcard SAN
+correctly matches a per-ordinal pod hostname (a new decisive test,
+`crates/animus-env/src/prod.rs`'s
+`tls_wildcard_san_matches_a_per_ordinal_pod_hostname`), client-certificate
+verification does no hostname check, and the operator's own re-apply of
+the `Certificate` is a server-side-apply of byte-identical content that
+gives cert-manager nothing to react to. What remains open is a genuine
+timing/propagation question this crate's own code cannot settle — see
+ADR 0064's issue #913 round-2 amendment for the full account.
+`dump_diagnostics` (`scripts/e2e-kind.sh`) now captures `Certificate`/
+`Secret` resourceVersions, `CertificateRequest` objects/events, and
+`tls.crt`/`ca.crt` fingerprints whenever `E2E_TLS=1`, specifically so the
+next run settles it.
+
 ## S3 (S-04 PR 3, closes `docs/roadmap.md`'s S-04)
 
 `AnimusClusterSpec.s3: Option<S3StoreSpec>` (`crd.rs`) mirrors `TlsSpec`'s
@@ -1029,10 +1048,9 @@ fully unit-tested — turning the control group's own live voter-id set
 `parse_voters`) into "which ordinal is missing next" / "how many are
 already confirmed". Everything async around them
 (`fetch_control_members`/`discover_control_voters`/
-`ordinal_reports_role_both`/`resolve_control_dial_addr`/
-`add_control_voter`/`advance_control_growth`) is a thin orchestration
-layer exercised through `FakeAdminClient`/`FakeClusterApi` — see Tests
-below.
+`ordinal_reports_role_both`/`add_control_voter`/`advance_control_growth`)
+is a thin orchestration layer exercised through `FakeAdminClient`/
+`FakeClusterApi` — see Tests below.
 
 **Config-hash restart annotation, a separate, independently-reviewable
 groundwork step (its own first commit)**: `desired::statefulset::
@@ -1053,17 +1071,26 @@ behind `controlNodes` specifically — there was no clean way to restart
 across every ordinal), so this is the simplest correct mechanism, not a
 narrowly-scoped one.
 
-**`ClusterApi::get_pod_ip` is this crate's first real consumer of the
-`pods: get/list/watch` RBAC grant** `deploy/operator/rbac.yaml` already
-carried (pre-provisioned for "the controller reads pod status/conditions"
-in general, never actually exercised before S-07d) — no RBAC change was
-needed. It reads a promoted ordinal's live `status.podIP` via the
-Kubernetes API, **not a DNS lookup** — seeded via `FakeClusterApi::
-seed_pod_ip` in tests, unlike a raw `tokio::net::lookup_host` call, which
-would bypass the seam entirely and make this untestable without a real
-cluster. See ADR 0060's own "The `SocketAddr` gap" subsection for why this
-lookup exists at all (a real, pre-existing `animusd` admin-API limitation
-this crate works around rather than fixes).
+**(2026-09-16, issue #913) `add_control_voter` dials the promoted
+ordinal's own stable `desired::pod_fqdn(name, ns, ordinal)` hostname —
+never a live `status.podIP`.** `ClusterApi::get_pod_ip` (and the
+`resolve_control_dial_addr`/`FakeClusterApi::seed_pod_ip`/`desired::
+pod_name` machinery that existed solely to serve it) is **deleted**, not
+kept as a fallback: it worked around a real `animusd` admin-API
+limitation — `admin::AddControlMemberReq.addr` used to be typed
+`std::net::SocketAddr`, which can only ever deserialize a numeric
+address — by resolving and pinning the pod's *current* IP instead of its
+stable DNS name. That was fine for plaintext dialing, but under mutual
+TLS with DNS-only certificate SANs it fails every handshake permanently:
+`ServerName::IpAddress` against a cert with no IP SAN is rejected
+outright, and the very re-registration that would otherwise "self-heal"
+the pinned IP into the real hostname itself needs a working dial to the
+newly-promoted node to land — so the failure never recovers. `animusd`'s
+own field is now a plain `String` (`docs/adr/
+0037-control-plane-membership-change.md`'s issue #913 amendment), so
+this crate no longer needs to resolve anything at all — `add_control_
+voter` just formats the same hostname:port string every other
+Kubernetes-pod address surface in this codebase already uses.
 
 **`FakeAdminClient` (S-07d additions, `fakes.rs`)**: `seed_control_voters`/
 `control_voters()` back `GET /admin/control/members` with a plain

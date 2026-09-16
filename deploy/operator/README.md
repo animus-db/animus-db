@@ -364,8 +364,10 @@ set) — since control voters can only be removed one at a time through
 their own careful quorum-loss checks (ADR 0037 §2), never inferred from a
 bare spec edit. See ADR 0060's own "Control-voter growth (S-07d,
 2026-09-06)" section for the full design (the live-truth-driven sequence,
-why role-promotion needs a restart, the `SocketAddr` gap this works
-around, and how a controller restart resumes).
+why role-promotion needs a restart, and how a controller restart resumes)
+and its "The `SocketAddr` gap, closed" amendment (issue #913) for why the
+promoted ordinal is addressed by its own stable per-pod DNS hostname, not
+a resolved pod IP.
 
 **Growing `controlNodes` restarts every pod, not just the promoted
 one.** Regenerating the config that drives the role split requires a

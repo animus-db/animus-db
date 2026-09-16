@@ -464,3 +464,68 @@ transfer_third_voter_wins.rs` is the new deterministic `SimEnv` proof that
 voter win — driven directly against `RaftNode`, with no `animusd` route in
 the loop, confirming the race this fix has to tolerate is a real property
 of the primitive itself, not a testing artifact of the route above it.
+
+## As-built (2026-09-16, issue #913) — `member/add`'s `addr` is a hostname-capable string, not `SocketAddr`
+
+`POST /admin/control/member/add`'s `addr` field (`admin::
+AddControlMemberReq`) was typed `std::net::SocketAddr` from this ADR's own
+PR3 onward, which can only ever deserialize a literal numeric `ip:port` —
+never a DNS name. The Kubernetes operator (`animus-operator`, ADR 0060)
+flagged this explicitly as a real, pre-existing limitation it worked
+around rather than fixed (`crates/animus-operator/CLAUDE.md`'s S-07d
+section, ADR 0060's own "The `SocketAddr` gap" subsection): it resolved
+the newly-promoted ordinal's *current* `status.podIP` via the Kubernetes
+API and dialed that instead of the pod's stable per-ordinal DNS name,
+reasoning that the pod's own startup self-registration would "self-heal"
+the pinned IP into its real hostname moments later via the replicated
+peer book.
+
+That workaround was safe for a plaintext cluster, but issue #913 found it
+is not safe under mutual TLS with DNS-only certificate SANs (ADR 0064):
+dialing the resolved IP means the handshake's `ServerName` is
+`ServerName::IpAddress`, which a certificate carrying only DNS SANs
+rejects outright (`AlertReceived(BadCertificate)`, traced in that issue's
+own investigation to exactly this call site). Worse, the "self-heals in
+moments" reasoning breaks down specifically because it fails: the
+promoted node's own re-registration needs a working dial *to* that same
+node from whichever peer relays it, and every such dial fails the same
+handshake, so the IP pin never gets corrected — a permanent failure, not
+a transient staleness window.
+
+**Fix**: `AddControlMemberReq.addr` (`crates/animusd/src/admin.rs`) is now
+a plain `String` — an uninterpreted wire-format address, `ip:port` or
+`hostname:port`, exactly the shape `ProdEnv::merge_peer`/`NodeAddrs`'s own
+address fields already use and every consumer of this field (`ClientCtx::
+admin_add_control_member`'s `merge_peer`/`NodeAddrs.internal` calls) was
+already string-typed to accept — the `SocketAddr` boundary was purely a
+deserialization-time restriction with no downstream reason to exist.
+`animus-operator`'s `add_control_voter` now addresses the promoted
+ordinal by its stable `desired::pod_fqdn(name, ns, ordinal)` hostname
+directly; `ClusterApi::get_pod_ip` and the `resolve_control_dial_addr`/
+`FakeClusterApi::seed_pod_ip`/`desired::pod_name` machinery that existed
+solely to serve the old IP-resolution workaround are **deleted outright**,
+not kept as a fallback — see ADR 0060's own matching "The `SocketAddr`
+gap, closed" amendment. `animus-cli`'s `control-add` (both its
+operator-supplied-id and self-minted-id arities, `run_control_add`/
+`run_control_add_allocated`) needed no change: it already forwards
+whatever string `internal_addr_from_admin_config` resolves from the
+target node's
+own `/admin/config` (itself that node's real bound address, correctly
+`SocketAddr`-typed there since it is genuinely self-reported bind info,
+not a third party's address guess) — the wire body was always a JSON
+string; only the server's own deserialization type was ever the
+restriction.
+
+**Tests**: `crates/animusd/src/admin.rs`'s
+`add_control_member_req_accepts_a_dns_hostname_addr` (a DNS hostname:port
+deserializes cleanly) and `add_control_member_req_still_accepts_a_numeric_
+socket_addr` (the pre-existing numeric shape is unchanged); `crates/
+animus-operator/src/controller.rs`'s `reconcile_growth_adds_a_voter_once_
+its_pod_reports_role_both` extended to assert the `member/add` request
+body's own `addr` is the promoted ordinal's pod FQDN, never an IP
+(`FakeAdminClient::member_add_addrs`); `crates/animus-env/src/prod.rs`'s
+`tls_dial_by_member_add_style_pod_hostname_succeeds`, a real loopback TLS
+handshake proving a `member/add`-shaped hostname:port dial succeeds
+end to end through the production `TlsMaterial`/`server_name_for` path
+when the peer's certificate SAN covers it — the actual payoff this fix
+exists for, not just a wire-deserialization detail.

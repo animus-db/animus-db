@@ -727,3 +727,214 @@ comments this PR adds around the new CA-hierarchy heredocs are placed
 unverified in any sandbox that cannot run `kind` at all (the same
 standing limitation ADR 0064 commit 3 and ADR 0060 already note) — its
 first real verification is the next green `e2e-kind-tls` CI run.
+
+## Amendment (2026-09-16, issue #913 round 2) — the fresh-head e2e run still failed; three hypotheses ruled out, one open
+
+The above fix's first real validation — stacking it under PR #909's own
+`e2e-kind-tls` leg (which adds `kubectl rollout status statefulset/e2e
+--timeout=300s` right after growth converges, so the run can no longer
+declare success before pod 3 is actually `Ready`) and running it on a
+**fresh** cluster (so every pod, including `e2e-0..2`, was created from
+the wildcard-SAN Certificate and the CA-backed issuer from the start, not
+migrated from an earlier state) — still failed the same way (run
+35040977782, job 104620543323): `spec.nodes` 3→4 converged in 10s,
+`spec.controlNodes` 3→4 converged (4 voters) in 10s, then the rollout wait
+timed out after 300s with pod `e2e-3` continuously `Running`/never
+`Ready`, its log full of the identical
+`AlertReceived(BadCertificate)` lines against `e2e-0`/`e2e-1`/`e2e-2`'s
+pod IPs. Confirmed from that run's own diagnostics: `spec.tls.certManager.
+issuerRef.name` is `e2e-ca-issuer` (the CA-backed issuer, not the bootstrap
+`selfSigned` one) — the round-1 fix's own wiring is in place and being
+used.
+
+**Direction of the alert, established from the code, not assumed**:
+`AlertReceived(BadCertificate)` is logged only in `spawn_accept`
+(`crates/animus-env/src/prod.rs:749-753`), the **inbound**-accept path —
+`peer_addr` is `listener.accept()`'s own remote-socket address, so pod 3
+is the **server** here, and the three logged addresses are `e2e-0`/`e2e-1`/
+`e2e-2` **dialing in** to it. `rustls::Error::AlertReceived` means this
+side *received* the alert, i.e. **the peer sent it** — and in a TLS 1.3
+mutual handshake the server sends its own certificate (and requests the
+client's) *before* the client sends its client certificate, so a client
+that rejects the server's presented certificate aborts and sends
+`bad_certificate` back without ever completing its own certificate flight.
+Read together: **`e2e-0`/`e2e-1`/`e2e-2`, dialing pod 3 as TLS clients,
+rejected pod 3's presented server certificate.**
+
+**Three of the four standing hypotheses are now ruled out with direct
+evidence, not just review:**
+
+- **(a) Wildcard-SAN/hostname mismatch — ruled out by a new, decisive
+  test.** `crates/animus-env/src/prod.rs`'s
+  `tls_wildcard_san_matches_a_per_ordinal_pod_hostname` runs a real
+  loopback handshake through the exact same `TlsMaterial::acceptor`/
+  `connector` and `server_name_for` derivation `spawn_accept`/
+  `connect_maybe_tls` use in production, with the server's leaf SAN set to
+  `*.e2e-internal.animus-e2e.svc.cluster.local` (this fix's own shape) and
+  the client dialing `e2e-3.e2e-internal.animus-e2e.svc.cluster.local` (a
+  real per-ordinal pod hostname, `desired::pod_fqdn`'s own shape) — it
+  passes. The wildcard construction is not the bug.
+- **(b) Client-certificate hostname check — ruled out by TLS semantics.**
+  Nothing in `crates/animus-env/src/tls.rs`'s acceptor construction (a
+  standard `rustls` client-cert verifier built from the CA root store)
+  performs any hostname/SAN check against an inbound client certificate —
+  only chain-of-trust validation. There is no mechanism here that could
+  reject a client based on what hostname it dialed by.
+- **(c) The operator's own re-apply reissuing the Certificate — ruled out
+  by code review.** `apply_certificate` (`crates/animus-operator/src/
+  controller.rs:103-105`, `cluster_api.rs`) is a server-side-apply
+  `PatchParams::apply(FIELD_MANAGER).force()`, run unconditionally on
+  every reconcile with **exactly the same** `Certificate.spec` regardless
+  of `spec.nodes`/`spec.controlNodes` (pinned by
+  `certificate_spec_is_byte_identical_across_a_nodes_scale_up`, added in
+  this issue's first fix) — an idempotent re-apply of byte-identical
+  content gives cert-manager nothing to react to. Neither `cert_spec`
+  (this crate) nor the e2e's own CA `Certificate` sets
+  `privateKey.rotationPolicy`, so both default to cert-manager's own
+  `Never` — no forced key rotation on any resync either.
+
+**What remains open**: hypothesis (d), a genuine timing/propagation issue
+around the recreated pod's Secret mount, is neither confirmed nor ruled
+out — the evidence to settle it (the `Certificate`/`Secret`'s own
+`resourceVersion` history, cert-manager's `CertificateRequest` objects and
+events across the whole scale-up-then-growth window) was not captured by
+this run's diagnostics. `dump_diagnostics` (`scripts/e2e-kind.sh`) now
+captures it whenever `E2E_TLS=1`: `kubectl get certificate,secret`,
+per-`Certificate` `resourceVersion`/`generation`/`status`, the `Secret`'s
+own `resourceVersion`/`creationTimestamp`, `openssl x509`-derived
+fingerprint/serial/validity for `tls.crt` and `ca.crt` specifically (never
+the private key or raw cert bytes), and every `Certificate`/
+`CertificateRequest` event plus the `CertificateRequest` objects
+themselves. The next `e2e-kind-tls` run — now also gated by the same
+`kubectl rollout status` wait on this branch, closing the gap that let an
+earlier run of this same fix "pass" without ever waiting for pod 3 to
+become `Ready` — is what actually settles (d): if `e2e-3`'s `tls.crt`/
+`ca.crt` fingerprints differ from `e2e-0`'s, a reissue is confirmed and
+its `CertificateRequest` timeline pinpoints when and why; if they're
+identical, the divergence is somewhere this investigation has not yet
+looked, and the round-1 fix's own architecture (wildcard SAN, CA
+hierarchy) needs to be revisited rather than assumed sufficient.
+
+## Amendment (2026-09-16, issue #913 round 3) — two more code-level candidates checked and ruled out; no code change
+
+Given (1) `e2e-0`/`e2e-1`/`e2e-2` reject pod 3's *server* certificate (the
+round-2 amendment's own directional finding), (2) the `Certificate` spec
+is provably byte-identical across the scale-up, and (3) `e2e-0`/`e2e-1`/
+`e2e-2` handshake with each other fine, two further code-level candidates
+specific to pod 3's *second incarnation* were checked — both ruled out,
+with no live cluster needed:
+
+**(A) The hostname peers actually dial for node 3, versus the wildcard's
+own shape.** Traced end to end through the real address-construction
+code, not the ADR's own descriptive prose:
+
+- `desired::cluster_config::build_cluster_config`
+  (`crates/animus-operator/src/desired/cluster_config.rs:193-232`) writes,
+  for **every** ordinal (`0..spec.nodes`, role-independent): `internal`/
+  `client`/`intra`/`dynamo`/`admin`/`console` as the identical bind
+  placeholder `0.0.0.0:{port}` (every pod is its own network namespace in
+  Kubernetes, so there is nothing node-specific to put here — see this
+  module's own doc, lines 13-20), and `advertise_host: Some(super::
+  pod_fqdn(name, ns, i))` — the **one and only** per-node differentiator,
+  always the full FQDN form `{name}-{i}.{internal-svc}.{ns}.svc.cluster.
+  local` (`desired::pod_fqdn`, `crates/animus-operator/src/desired/mod.rs:
+  129-134`). No bare `<pod>.<svc>` short form, no IP, is ever written —
+  `pod_fqdn` has exactly one hardcoded shape.
+- On the `animusd` side, every dial address — for both ports this ADR
+  makes mutual TLS (`internal` **and** `intra`) — ultimately traces back
+  to the same helper, `advertised_addr(advertise_host, bind_addr) ->
+  format!("{host}:{}", bind_addr.port())` (`crates/animusd/src/lib.rs:
+  2342-2347`). Two route sources exist and both trace back to it:
+  `ClusterConfig::peer_book` (`internal`, `crates/animusd/src/config.rs:
+  511-521`) and the static `client_route`/`intra_route` builders
+  (`crates/animusd/src/lib.rs:14707,14919,15133,15151,15268,15478,15819`)
+  read every node's `advertise_host` straight out of the shared
+  `cluster.json` directly through `advertised_addr`; `intra_route_
+  sync_loop` (`crates/animusd/src/lib.rs:11400-11404`) instead **layers a
+  live, gossip-replicated `NodeAddrs.intra` value over that static route**
+  for any node that has self-registered — but that live value was itself
+  set via the identical `advertised_addr(self.advertise_host.as_deref(),
+  ...)` call at that node's own registration (e.g. `BoundControlNode`'s
+  own `NodeAddrs` construction, `crates/animusd/src/lib.rs:6644-6647`),
+  so it carries the same hostname either way; the dynamic path changes
+  *when* a route updates (on registration/rejoin), never *what hostname
+  shape* it uses. **Reading every other node's own `advertise_host`
+  directly**, not a separately-discovered address, is what both paths
+  share. Both ports therefore dial the
+  identical hostname `advertised_addr` produces, differing only in port
+  number, which `server_name_for` strips before deriving the `ServerName`
+  (`crates/animus-env/src/tls.rs:329`) — so testing one port's hostname
+  form (as `tls_wildcard_san_matches_a_per_ordinal_pod_hostname` already
+  does) is dispositive for both; there is no second, port-dependent
+  hostname shape to separately test.
+- **Whether the old per-ordinal list could have covered a form the new
+  wildcard misses**: no. The old `dns_names(name, ns, nodes)` enumerated
+  `(0..nodes).map(pod_fqdn)` — literally the same `pod_fqdn` function,
+  same shape, and (this is the point the round-1 fix exists to close)
+  **it would not have listed ordinal 3 at all before the scale-up**
+  (`nodes` was still 3). The wildcard is a strict superset of anything
+  the old per-ordinal list could ever have provided for an FQDN dial —
+  round 1 did not trade a covered form for an uncovered one.
+
+**Conclusion: (A) is ruled out.** Every internal/intra dial for pod 3,
+from any peer, targets exactly the hostname
+`tls_wildcard_san_matches_a_per_ordinal_pod_hostname` already proves the
+wildcard SAN matches.
+
+**(B) Which certificate pod 3 presents on its intra port as a
+combined-role pod versus as the data-only pod it was before growth.**
+Traced through the same config-generation and load path:
+
+- `build_cluster_config` computes `tls: spec.tls.as_ref().map(|_|
+  tls_section())` **once**, outside the per-ordinal `.map(|i| RoleAddrs
+  {...})` closure (`crates/animus-operator/src/desired/cluster_config.rs:
+  203,229`), and assigns the identical cloned value to every node
+  regardless of `role: NodeRole::{Both,Data}` (line 229). `tls_section()`
+  itself (`crates/animus-operator/src/desired/cluster_config.rs:327-333`)
+  returns fixed, mount-path-only fields — `/etc/animus/tls/{tls.crt,tls.
+  key,ca.crt}` — with no role or port parameter at all.
+- On the `animusd` side there is exactly one `TlsConfig`/`TlsMaterial`
+  per node (loaded once at startup, `TlsConfig::load`,
+  `crates/animus-env/src/tls.rs:187`), and `TlsMaterial` carries three
+  pre-built handshake objects derived from that **same** cert/key/ca —
+  `acceptor` (mutual, for `internal`/`intra`), `server_acceptor`
+  (server-only, for `client`/`dynamo`/`admin`/`console`), and `connector`
+  (outbound) — ADR 0064 commit 2's own as-built note above
+  ("`TlsMaterial` grew a second acceptor... built from the same cert/key
+  as `acceptor`"). Nothing in this construction branches on node role at
+  all; a data-only node binds and TLS-wraps its `internal` port
+  identically to a combined node (every role needs the internal env —
+  control Raft, per-tablet Raft, and heartbeats all ride it,
+  `crates/animusd/src/config.rs:502-509`'s own doc).
+- Since ordinal 3's `advertise_host`/`internal`/`intra`/`tls` fields are
+  byte-identical between its `Data`-role generation of `cluster.json` and
+  its `Both`-role regeneration after `controlNodes` growth (only `role`
+  itself, and the `entrypoint.sh` dispatch it drives, differ — the config
+  generator's own `NodeRole` branch, lines 217-221, touches nothing else),
+  there is no per-role cert/key/ca *selection* anywhere for this fix to
+  have broken, and no "dynamo Service's certificate" distinct from the
+  internal wire's own — every port shares the one `Secret`
+  (`deploy/operator/README.md`'s TLS section, "the *same* cert/key on
+  every pod, not a distinct one per ordinal").
+
+**Conclusion: (B) is ruled out.** There is no role- or
+incarnation-dependent certificate selection in this codebase for either
+the config that's generated or the material `animusd` loads from it.
+
+**Diagnostics hardened further, no live cluster needed for this part
+either**: `dump_diagnostics` now also dumps each pod's **first** 40 log
+lines (`kubectl logs --tail=-1 | head -n 40`), alongside the pre-existing
+tail — so the next `e2e-kind-tls` run shows whether the `BadCertificate`
+storm on the recreated pod starts at its very first handshake attempt
+(consistent with a boot-time race, hypothesis (d)) or only after some
+clean activity (which would point somewhere this investigation has not
+yet considered).
+
+**Status**: (A) and (B) — the two candidates specific to pod 3's second
+incarnation that code review alone could settle — are ruled out. (a),
+(b), (c) from round 2 remain ruled out. (d), a live timing/propagation
+question, is the only standing hypothesis, and the next `e2e-kind-tls`
+run (with round 2's certificate/secret/event diagnostics and this round's
+first-lines log capture) is what will settle it. No code change was made
+in this round — round 1's wildcard-SAN and CA-hierarchy fix remains in
+place unmodified, since neither (A) nor (B) found a gap in it.
