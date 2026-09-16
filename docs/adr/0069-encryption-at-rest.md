@@ -349,7 +349,17 @@ No `--encryption-key`/`encryption_key_path` configured anywhere means
 branch per call, no allocation, no extra I/O. `verify_or_init_marker` still
 runs once at bind time even with no key (to catch "directory already
 encrypted, key omitted by mistake") — a single `Disk::list()` call, paid
-once per node startup, never on the read/write hot path.
+once per node startup, never on the read/write hot path. This is the
+`Disk`-seam story only — `verify_or_init_marker`'s `Disk::list()` walks one
+node's own local directory, already bounded. **The `SegmentStore`-seam
+counterpart (PR 2, below) did *not* inherit that same "cheap, once"
+property for free**: `verify_or_init_segment_store_marker`'s own "does
+anything else exist here" check called `SegmentStore::list("")` and threw
+away everything but `.is_empty()` — against `S3SegmentStore`, whose `list`
+pages over the network to completion, that was a full bucket enumeration
+on every node's startup, undetected until issue #861. See the "As-built:
+`SegmentStore::is_empty`" amendment at the end of this ADR for the gap and
+its fix.
 
 ## Wiring into `animusd`
 
@@ -1114,3 +1124,66 @@ test (`crates/animusd/src/main.rs`'s `tests` module,
 recognizes the flag without needing a real bind. See
 `crates/animusd/CLAUDE.md`'s own `--encryption-key` CLI-reference entry
 for the current, complete per-entry-point enumeration.
+
+## As-built: `SegmentStore::is_empty` (2026-09-16, closes issue #861)
+
+`verify_or_init_segment_store_marker`'s marker-absent/key-given branch
+("does anything else exist here?") answered that yes/no question by
+calling `store.list("").await?.is_empty()` — materializing, and then
+discarding, the full matching set just to check it was non-empty. Against
+`SimSegmentStore`/`FsSegmentStore` this is a cheap in-memory scan or a
+bounded local directory walk (unaffected in practice), but against
+`S3SegmentStore` — whose `list` pages `ListObjectsV2` to completion, up to
+`LIST_PAGE_CAP` (10,000 pages) — it meant an operator turning on
+`--encryption-key` for the first time against an already-populated `s3://`
+segment or backup store paid a full, billable enumeration of the entire
+bucket, on every node's startup, purely to produce a refusal message. The
+"Off by default; zero overhead" section above only ever established this
+for the `Disk` seam's own `verify_or_init_marker`; PR 2's own text never
+made (or checked) the equivalent claim for `SegmentStore`.
+
+**Fix: a new trait method, `SegmentStore::is_empty(prefix) -> io::Result
+<bool>`, with a default implementation in terms of `list`** — so every
+existing implementor keeps compiling and behaving identically without
+change, the same additive-default shape `Env::metrics()`/`Env::
+merge_peer()` already use. `S3SegmentStore::is_empty` overrides the
+default with a genuine one-request probe: a single `ListObjectsV2` page
+(no `MaxKeys` parameter was added — `animus_s3::client::S3Client::
+list_objects_v2` doesn't expose one, and widening that crate's own client
+API was judged out of scope for this fix; real S3's default page size,
+1000 keys, already turns a 10,000-page worst case into one request in the
+overwhelming common case), answered from whatever that first page
+contains regardless of `IsTruncated`/a continuation token — never `list`'s
+own pagination loop. `EncryptedSegmentStore::is_empty` also overrides:
+`list` on that wrapper already excludes `SEGMENT_STORE_MARKER_ID`, so
+`is_empty` must agree that a store holding only the marker object still
+reads empty; it forwards to the inner store's own (possibly fast)
+`is_empty` first — free in the common "genuinely empty" case this
+existence check exists for — and falls back to a real, marker-filtered
+`list` only when the inner store reports something present. In practice
+that fallback is never reached from `verify_or_init_segment_store_marker`
+itself, which always runs against the **unwrapped** inner store before
+`EncryptedSegmentStore` exists at all (see that function's own doc);
+it's there for the wrapper's own `SegmentStore` contract to hold
+regardless of caller. `verify_or_init_segment_store_marker` itself changed
+by exactly one line: `store.list("").await?.is_empty()` became `store.
+is_empty("").await?` — no change to its decision table, refusal text, or
+any other branch.
+
+**Tests**: `crates/animus-env/src/s3_store.rs`'s
+`is_empty_probes_one_page_against_a_multi_page_listing`/
+`is_empty_probes_one_page_against_an_empty_store` (a `CountingTransport`
+test decorator proves exactly one `ListObjectsV2` request is issued, in
+both the populated and empty cases); `crates/animus-env/src/
+test_support.rs`'s shared `assert_segment_store_contract` gained three
+`is_empty` assertions (non-empty, a disjoint never-written prefix, empty
+after cleanup), so every implementor already exercised by that contract
+picked up `is_empty` coverage for free; `crates/animus-sim/src/
+segment_store.rs`'s `marker_absent_key_given_branch_unchanged_by_the_
+is_empty_switch` pins the exact refusal text and marker-write outcome
+unchanged, over both a populated and a fresh `SimSegmentStore`. The
+existing `ANIMUS_SEGMENT_STORE_ENCRYPTED_SEEDS` fault corpus (`animus-test/
+tests/segment_store_encrypted_fault_corpus.rs`) stays green unmodified —
+this change alters no fault-injection surface.
+
+No wire, config, or CLI change; no new dependency.

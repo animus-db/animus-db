@@ -644,6 +644,29 @@ pub trait SegmentStore: Send + Sync {
     /// List every id currently starting with `prefix` — for debugging or a
     /// sweep (retention, repair), never load-bearing for serving a read.
     async fn list(&self, prefix: &str) -> io::Result<Vec<String>>;
+
+    /// Whether **any** id currently starts with `prefix` — a cheap
+    /// existence probe, distinct from [`list`](SegmentStore::list): an
+    /// implementor with a paginated backing store should answer as soon as
+    /// it sees one matching object (or one empty page), never materialize
+    /// the whole matching set just to check it's non-empty (issue #861 —
+    /// [`verify_or_init_segment_store_marker`](crate::verify_or_init_segment_store_marker)'s
+    /// own "does anything else exist here" check was doing exactly that
+    /// against `S3SegmentStore::list`, draining every page of an
+    /// already-populated bucket before discarding all but the boolean
+    /// answer).
+    ///
+    /// The **default** forwards to [`list`](SegmentStore::list) — correct
+    /// for any implementor with no cheaper path (an in-memory listing is
+    /// already O(1) to check for emptiness once materialized, e.g.
+    /// `SimSegmentStore`/`FsSegmentStore`'s bounded local directory walk).
+    /// A store whose `list` pages over the network overrides this with a
+    /// genuine one-page probe — see [`crate::S3SegmentStore`]'s own
+    /// `is_empty`: `MaxKeys=1`, returns after the first response with no
+    /// regard for `IsTruncated`/a continuation token.
+    async fn is_empty(&self, prefix: &str) -> io::Result<bool> {
+        Ok(self.list(prefix).await?.is_empty())
+    }
 }
 
 /// Task spawning. Under production this is `tokio::spawn`; under simulation it

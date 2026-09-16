@@ -82,6 +82,25 @@ pub async fn assert_segment_store_contract<S: SegmentStore>(store: &S) {
     // A second id, so `list` has more than one entry to filter over.
     store.put(id_b, b"b-bytes").await.expect("put b");
 
+    // `is_empty` must agree with `list(prefix).is_empty()`: this prefix now
+    // holds three objects, so it must read non-empty.
+    assert!(
+        !store
+            .is_empty("contract-test/")
+            .await
+            .expect("is_empty non-empty prefix"),
+        "is_empty must be false while contract-test/ objects exist"
+    );
+    // A disjoint prefix nothing was ever written under must read empty,
+    // independent of what else the store holds.
+    assert!(
+        store
+            .is_empty("contract-test-disjoint-prefix/")
+            .await
+            .expect("is_empty disjoint prefix"),
+        "is_empty must be true for a prefix with no matching objects"
+    );
+
     let listed = store.list("contract-test/").await.expect("list");
     assert!(
         listed.contains(&id_a.to_string()),
@@ -148,4 +167,13 @@ pub async fn assert_segment_store_contract<S: SegmentStore>(store: &S) {
         .delete(id_nested)
         .await
         .expect("cleanup delete nested");
+
+    // After cleanup, this prefix is empty again.
+    assert!(
+        store
+            .is_empty("contract-test/")
+            .await
+            .expect("is_empty after cleanup"),
+        "is_empty must be true once every contract-test/ object is deleted"
+    );
 }
