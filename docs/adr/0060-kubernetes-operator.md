@@ -999,11 +999,12 @@ most one step:
    hasn't restarted into combined mode yet — wait (a `ControlNodesGrowing`
    status condition records the achieved/target counts and which ordinal is
    pending).
-4. Otherwise, resolve that ordinal's live `status.podIP` (via the
-   Kubernetes API — see "The `SocketAddr` gap" below for why not DNS) and
-   `POST /admin/control/member/add` against each already-confirmed voter
-   ordinal in turn until one accepts, then poll `GET /admin/control/
-   members` (bounded, ~15 × 2s) until the new ordinal shows up before this
+4. Otherwise, `POST /admin/control/member/add` (addressed by the
+   promoted ordinal's own stable `desired::pod_fqdn(name, ns, ordinal)`
+   hostname — see "The `SocketAddr` gap, closed" below; no Kubernetes API
+   lookup needed any more) against each already-confirmed voter ordinal
+   in turn until one accepts, then poll `GET /admin/control/members`
+   (bounded, ~15 × 2s) until the new ordinal shows up before this
    reconcile returns.
 
 This mirrors `drain_and_remove_node`'s own bounded-polling style (the same
@@ -1057,35 +1058,37 @@ restarting mid-growth, or the growth step itself failing and retrying, is
 exactly as safe as retrying `member/add` always is (see `admin_add_
 control_member`'s own doc: idempotent, safe to retry the whole call).
 
-### The `SocketAddr` gap (a real, pre-existing `animusd` limitation)
+### The `SocketAddr` gap, closed (issue #913)
 
-`POST /admin/control/member/add`'s `addr` field is typed
+`POST /admin/control/member/add`'s `addr` field used to be typed
 `std::net::SocketAddr` server-side (`admin::AddControlMemberReq`), which
-can only ever deserialize a literal IP:port — **never a DNS name**. Every
+could only ever deserialize a literal IP:port — never a DNS name. Every
 other address surface this operator or `animusd` itself uses for a
 Kubernetes pod (`RoleAddrs::advertise_host`, `ClientResponse::JoinInfo`,
 the peer book `ProdEnv::merge_peer`/`set_peers` populate) is deliberately
 string/hostname-typed for exactly the reason a pod's IP is not stable
-across a restart while its per-ordinal DNS name is. This is a genuine
-pre-existing gap in the admin API (built for the bare-metal CLI's
-numeric-IP world, ADR 0037), not introduced by this amendment, and not
-fixed by it either — fixing `AddControlMemberReq.addr` to accept a
-`String` the way `ProdEnv::merge_peer` already does is a named follow-up
-for `animusd`, out of this crate's own scope (this crate does not depend
-on `animusd` — see its own `CLAUDE.md`).
-
-The operator works around it by reading the promoted ordinal's **current**
-`status.podIP` via the Kubernetes API (`ClusterApi::get_pod_ip`) — not a
-DNS lookup, which would bypass the already-testable `ClusterApi` seam and
-add a real-network dependency no fake could stand in for — purely as a
-one-time bootstrap value for the leader's very first dial. The promoted
-node's own startup self-registration (`spawn_common_tail`'s
-`register_node_addrs`, unconditional on every combined-mode boot)
-republishes its real, DNS-name-based `advertised_addr` into the replicated
-`Metadata.node_addrs` moments later, which every node's own
-`peer_sync_loop` then adopts — so the resolved-IP staleness window this
-introduces is self-healing within moments of the call, not a permanent
-address pin surviving a future pod restart.
+across a restart while its per-ordinal DNS name is. This was flagged here
+as a genuine pre-existing gap (built for the bare-metal CLI's numeric-IP
+world, ADR 0037) that this crate worked around rather than fixed — and the
+workaround turned out to be load-bearing in a way this amendment did not
+anticipate: **under mutual TLS with DNS-only certificate SANs (ADR 0064),
+dialing the resolved IP fails the handshake outright**
+(`ServerName::IpAddress` against a certificate carrying no IP SAN), and
+the promoted node's own startup self-registration that was supposed to
+"self-heal" the pinned IP into its real hostname within moments (below)
+itself needs a working dial *to* that same node to land — so under TLS
+the failure never actually self-heals; it is permanent for that pod's
+whole lifetime. Root-caused and fixed by issue #913: `AddControlMemberReq.
+addr` is now a plain `String`
+(`docs/adr/0037-control-plane-membership-change.md`'s issue #913
+amendment), so this operator no longer resolves anything at all —
+`add_control_voter` addresses the promoted ordinal by its stable
+`desired::pod_fqdn(name, ns, ordinal)` hostname directly, the same string
+every other address surface here already uses. `ClusterApi::get_pod_ip`
+(and the `resolve_control_dial_addr`/`FakeClusterApi::seed_pod_ip`/
+`desired::pod_name` machinery that existed solely to serve it) is
+**deleted**, not kept as a fallback — there is no longer anything for it
+to work around.
 
 ### "Retry on the leader" without a leader address hint
 
@@ -1208,7 +1211,11 @@ exercised through `FakeAdminClient`/`FakeClusterApi`), `previous_applied_
 control_nodes` (renamed from `control_nodes_changed`, now unconditional),
 `ClusterApi::get_pod_ip` (+ `RealClusterApi`/`FakeClusterApi`
 implementors — `deploy/operator/rbac.yaml`'s pre-existing `pods: get/list/
-watch` grant already covers this, its first real consumer),
+watch` grant already covers this, its first real consumer) —
+**`resolve_control_dial_addr`/`ClusterApi::get_pod_ip` were later deleted
+outright by issue #913** (see this ADR's own "The `SocketAddr` gap,
+closed" section above); this list is an as-built record of what this PR
+shipped, not the current shape,
 `crd::CONDITION_CONTROL_NODES_SHRINK_REJECTED` (renamed)/
 `CONDITION_CONTROL_NODES_GROWING` (new), controller-level tests covering
 the shrink-still-rejected path, immediate config regeneration, waiting for

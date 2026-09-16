@@ -2514,6 +2514,72 @@ mod tests {
         let _ = std::fs::remove_dir_all(&pki_dir);
     }
 
+    /// Issue #913: `POST /admin/control/member/add`'s own dial address is
+    /// now a hostname (`animus-operator`'s `desired::pod_fqdn(name, ns,
+    /// ordinal):internal_port` — the same per-pod stable DNS name every
+    /// other Kubernetes address surface in this codebase already uses),
+    /// never a resolved `status.podIP`. This proves the actual payoff end
+    /// to end: a real loopback TLS handshake dialed by exactly that
+    /// hostname shape succeeds when the peer's certificate SAN covers it —
+    /// through the same `TlsMaterial::acceptor`/`connector` and
+    /// `server_name_for` derivation `spawn_accept`/`connect_maybe_tls` use
+    /// in production, not a unit-level `server_name_for` parse check alone.
+    /// Before this fix, `AddControlMemberReq.addr` being typed `SocketAddr`
+    /// forced the caller to resolve and dial the pod's numeric IP instead,
+    /// which a certificate carrying only DNS SANs (this one included) can
+    /// never satisfy — `ServerName::IpAddress` against a cert with no IP
+    /// SAN fails the handshake outright, exactly the `AlertReceived(
+    /// BadCertificate)` this issue's own investigation traced back to this
+    /// dial address.
+    #[tokio::test]
+    async fn tls_dial_by_member_add_style_pod_hostname_succeeds() {
+        // The exact shape `desired::pod_fqdn` produces for ordinal 3 of a
+        // cluster named "e2e" in namespace "animus-e2e" — literal, not a
+        // wildcard: this PR's own fix is the address becoming a hostname
+        // at all, independent of the separate wildcard-SAN fix that makes
+        // the *certificate* stable across a scale-up.
+        let pod_hostname = "e2e-3.e2e-internal.animus-e2e.svc.cluster.local";
+        let pki_dir = unique_tmp_dir();
+        let (_ca_path, mut configs) = write_test_pki(&pki_dir, &[pod_hostname, "127.0.0.1"]);
+        let cfg_client = configs.pop().expect("client tls config");
+        let cfg_server = configs.remove(0);
+        let server_material = cfg_server.load().expect("load server tls material");
+        let client_material = cfg_client.load().expect("load client tls material");
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+
+        let accept_task = tokio::spawn(async move {
+            let (stream, _peer) = listener.accept().await.expect("accept");
+            server_material
+                .acceptor
+                .accept(stream)
+                .await
+                .expect("server-side handshake must succeed for the pod's own hostname SAN")
+        });
+
+        let stream = TcpStream::connect(addr).await.expect("connect");
+        // `member/add`'s own `addr` field, dialed exactly as `add_control_
+        // voter` constructs it (`{pod_fqdn}:{internal_port}`) and exactly
+        // as `connect_maybe_tls` derives a `ServerName` from any dial
+        // address.
+        let server_name = server_name_for(&format!("{pod_hostname}:14000"))
+            .expect("derive server name from the member-add-style hostname:port");
+        client_material
+            .connector
+            .connect(server_name, stream)
+            .await
+            .expect(
+                "client-side hostname verification must accept the pod's own \
+                 member-add-style hostname",
+            );
+
+        accept_task.await.expect("accept task panicked");
+        let _ = std::fs::remove_dir_all(&pki_dir);
+    }
+
     /// [`TlsMaterial::server_acceptor`] (ADR 0064 commit 2) accepts a TLS
     /// client that presents **no** client certificate at all — unlike
     /// [`TlsMaterial::acceptor`] (mutual, exercised by every test above,
