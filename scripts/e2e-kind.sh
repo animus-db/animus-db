@@ -198,7 +198,22 @@ ANIMUSD_IMAGE="${ANIMUSD_IMAGE:-animusd:e2e}"
 KIND_NODE_IMAGE="${KIND_NODE_IMAGE:-}"
 E2E_TLS="${E2E_TLS:-0}"
 CERT_MANAGER_VERSION="v1.16.2"
-CLUSTER_ISSUER_NAME="e2e-selfsigned"
+# Two-step CA hierarchy (issue #913): a bare `selfSigned: {}` ClusterIssuer
+# mints exactly one CA Certificate, once, at cluster bring-up — it is never
+# referenced by the AnimusCluster's own spec.tls.certManager.issuerRef.
+# That CA's Secret then backs a second ClusterIssuer (`ca: {secretName}`)
+# which is what actually signs the cluster's leaf certificate. Any future
+# reissuance of that leaf (a duration/renewBefore rollover — never a scale
+# event, since the SAN list is now node-count-invariant, see
+# desired::certificate::dns_names) stays under the same CA key, so pods
+# that booted on either side of a reissue still trust each other. See
+# docs/adr/0064-tls-on-every-port.md's issue #913 amendment for why a bare
+# self-signed issuer, used directly as the leaf issuer, is unsafe for any
+# multi-peer mTLS deployment.
+BOOTSTRAP_ISSUER_NAME="e2e-selfsigned-bootstrap"
+CA_CERT_NAME="e2e-ca"
+CA_SECRET_NAME="e2e-ca-secret"
+CLUSTER_ISSUER_NAME="e2e-ca-issuer"
 E2E_S3="${E2E_S3:-0}"
 # Pinned on purpose: an unpinned `:latest` on a third-party registry is a
 # dependency on someone else's publishing decisions, and #863 is what that
@@ -345,6 +360,62 @@ dump_diagnostics() {
         kubectl describe statefulset "$AC_NAME" -n "$NAMESPACE" 2>&1 | sed 's/^/  /' || true
         log "kubectl describe pods -n ${NAMESPACE}"
         kubectl describe pods -n "$NAMESPACE" 2>&1 | sed 's/^/  /' || true
+        if [ "$E2E_TLS" = "1" ]; then
+            # Issue #913 (round 2): a fresh-head run still hit BadCertificate
+            # on the recreated controlNodes-growth pod even with a
+            # node-count-invariant SAN set and a CA-backed issuer, so
+            # whether the leaf's own Secret was reissued mid-run — and
+            # whether the trust anchor (ca.crt) moved with it — needs to be
+            # directly observable, not inferred. Never dumps tls.key or
+            # tls.crt/ca.crt's raw bytes (a throwaway e2e cert, but no
+            # reason to spam CI logs with key material): openssl
+            # fingerprints/serials/validity only, so two runs — or two pods
+            # within one run — are trivially diffable without a decode step.
+            log "kubectl get certificate,secret -n ${NAMESPACE} (issue #913 diagnostics)"
+            kubectl get certificate,secret -n "$NAMESPACE" -o wide 2>&1 | sed 's/^/  /' || true
+            log "certificate.cert-manager.io/${AC_NAME}-tls -o yaml (status + conditions only)"
+            kubectl get "certificate.cert-manager.io/${AC_NAME}-tls" -n "$NAMESPACE" \
+                -o jsonpath='{"resourceVersion="}{.metadata.resourceVersion}{"\ngeneration="}{.metadata.generation}{"\nstatus="}{.status}{"\n"}' \
+                2>&1 | sed 's/^/  /' || true
+            log "secret/${AC_NAME}-tls metadata (resourceVersion/creationTimestamp only, never its data)"
+            kubectl get secret "${AC_NAME}-tls" -n "$NAMESPACE" \
+                -o jsonpath='{"resourceVersion="}{.metadata.resourceVersion}{"\ncreationTimestamp="}{.metadata.creationTimestamp}{"\n"}' \
+                2>&1 | sed 's/^/  /' || true
+            log "secret/${AC_NAME}-tls: tls.crt / ca.crt fingerprints, serials, validity (never the private key)"
+            for key in tls.crt ca.crt; do
+                cert_pem="$(kubectl get secret "${AC_NAME}-tls" -n "$NAMESPACE" \
+                    -o jsonpath="{.data.${key}}" 2>/dev/null | base64 -d 2>/dev/null || true)"
+                if [ -n "$cert_pem" ]; then
+                    log "  ${key}:"
+                    openssl x509 -noout -subject -issuer -serial -fingerprint -sha256 -dates \
+                        <<<"$cert_pem" 2>&1 | sed 's/^/    /' || true
+                else
+                    log "  ${key}: <missing>"
+                fi
+            done
+            log "kubectl get events -n ${NAMESPACE} --field-selector involvedObject.kind=Certificate"
+            kubectl get events -n "$NAMESPACE" --field-selector involvedObject.kind=Certificate \
+                --sort-by=.lastTimestamp 2>&1 | sed 's/^/  /' || true
+            log "kubectl get events -n ${NAMESPACE} --field-selector involvedObject.kind=CertificateRequest"
+            kubectl get events -n "$NAMESPACE" --field-selector involvedObject.kind=CertificateRequest \
+                --sort-by=.lastTimestamp 2>&1 | sed 's/^/  /' || true
+            log "kubectl get certificaterequests -n ${NAMESPACE} -o wide"
+            kubectl get certificaterequests -n "$NAMESPACE" -o wide 2>&1 | sed 's/^/  /' || true
+        fi
+        # Issue #913 round 2: the tail alone cannot show *when* a
+        # BadCertificate storm started relative to the pod's own boot — a
+        # pod recreated by the controlNodes config-hash roll could log a
+        # handful of clean lines before the storm begins (evidence for a
+        # boot-time race, hypothesis (d)) or open with BadCertificate
+        # immediately (evidence the cert it mounted was already wrong at
+        # container start). `--tail=-1` is `kubectl logs`' own documented
+        # spelling for "the whole log," piped through `head` for just the
+        # first lines — cheap for a fresh pod's short log either way.
+        log "pod logs (first 40 lines, per pod)"
+        for pod in $(kubectl get pods -n "$NAMESPACE" -o name 2>/dev/null || true); do
+            log "  logs (head): ${pod}"
+            kubectl logs -n "$NAMESPACE" "$pod" --tail=-1 2>&1 | head -n 40 | sed 's/^/    /' || true
+        done
         log "pod logs (tail 100, per pod)"
         for pod in $(kubectl get pods -n "$NAMESPACE" -o name 2>/dev/null || true); do
             log "  logs: ${pod}"
@@ -757,17 +828,54 @@ if [ "$E2E_TLS" = "1" ]; then
         kubectl -n cert-manager rollout status "deployment/${deploy}" --timeout=180s
     done
 
-    phase "create self-signed ClusterIssuer"
-    # A self-signed root is the right, and only sane, choice for a
-    # throwaway e2e cluster — no ACME account, no real CA, nothing to wait
-    # on external to this kind cluster.
+    phase "create self-signed CA hierarchy (issue #913)"
+    # Do NOT hand a bare `selfSigned: {}` ClusterIssuer to the cluster's own
+    # spec.tls.certManager.issuerRef: every Certificate that issuer signs is
+    # its own independent root, so any reissuance of the cluster's leaf
+    # (mounted identically on every pod) replaces the trust anchor every pod
+    # validates its peers against, not just the leaf's own SAN list. Pods
+    # that booted on either side of such a reissue then reject each other's
+    # handshake permanently, since animusd reads its TLS material once at
+    # startup and never reloads it. Instead: a bootstrap self-signed issuer
+    # mints one CA certificate, once, and a second ClusterIssuer signs the
+    # cluster's actual leaf off that stable CA key.
+    kubectl apply -f - <<EOF
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: ${BOOTSTRAP_ISSUER_NAME}
+spec:
+  selfSigned: {}
+EOF
+    kubectl wait "clusterissuer/${BOOTSTRAP_ISSUER_NAME}" --for=condition=Ready --timeout=60s
+
+    kubectl apply -f - <<EOF
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: ${CA_CERT_NAME}
+  namespace: cert-manager
+spec:
+  isCA: true
+  commonName: animus-e2e-root-ca
+  secretName: ${CA_SECRET_NAME}
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  issuerRef:
+    name: ${BOOTSTRAP_ISSUER_NAME}
+    kind: ClusterIssuer
+EOF
+    kubectl -n cert-manager wait "certificate/${CA_CERT_NAME}" --for=condition=Ready --timeout=60s
+
     kubectl apply -f - <<EOF
 apiVersion: cert-manager.io/v1
 kind: ClusterIssuer
 metadata:
   name: ${CLUSTER_ISSUER_NAME}
 spec:
-  selfSigned: {}
+  ca:
+    secretName: ${CA_SECRET_NAME}
 EOF
     kubectl wait "clusterissuer/${CLUSTER_ISSUER_NAME}" --for=condition=Ready --timeout=60s
 
@@ -1212,6 +1320,18 @@ wait_for_progress "control group reports 4 voters" 600 120 5 \
     -- control_voters_equals 4 \
     -- control_growth_progress_signal "$GROWTH_TARGET_ORDINAL"
 log "control group now reports 4 voters"
+
+phase "wait for the controlNodes config-hash rollout to fully finish (issue #864)"
+# Growth reporting 4 voters only means the control group *accepted* ordinal
+# 3 as a voter — it says nothing about whether the config-hash-triggered
+# StatefulSet rolling restart (this phase's own comment block above) has
+# actually finished rolling every pod through. Without this wait, the
+# script can declare success while a pod is still `Running` but not yet
+# `Ready` — exactly the shape issue #913 needs this leg to actually
+# exercise (a scale-up immediately followed by a controlNodes growth) for
+# its own TLS regression to be caught at all, instead of silently limping
+# past it the way an earlier run of this script's own TLS leg did.
+kubectl rollout status "statefulset/${AC_NAME}" -n "$NAMESPACE" --timeout=300s
 
 phase "check the PodDisruptionBudget after controlNodes growth (S-07d)"
 # nodes=4/controlNodes=4 now: the control-plane term is floor((4-1)/2)=1,
