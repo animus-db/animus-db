@@ -5,7 +5,9 @@
 use std::collections::BTreeMap;
 
 use animus_env::{NodeId, nid};
-use animus_placement::{Candidate, PlacementError, PlacementPolicy, replan, select_replicas};
+use animus_placement::{
+    Candidate, PlacementError, PlacementPolicy, replan, replan_repair, select_replicas,
+};
 
 /// A candidate in `region` / `zone`.
 fn node(id: u64, region: &str, zone: &str) -> Candidate {
@@ -165,6 +167,98 @@ fn replan_is_a_noop_when_the_set_still_satisfies_the_policy() {
     // Nothing changed in the pool ⇒ the same set comes back unchanged.
     let again = replan(&current, &pool, &policy).unwrap();
     assert_eq!(again, current);
+}
+
+/// Issue #957: a tablet's policy RF can legitimately exceed the current
+/// candidate pool (the policy always records the *target* RF, never the
+/// observed candidate count — see `tests/tablet_rf_self_heals.rs`,
+/// `crates/animusd`). `replan_repair` must still grow an under-replicated
+/// tablet up to every candidate that IS available, rather than refusing to
+/// make any progress at all the way plain `replan` does.
+#[test]
+fn replan_repair_grows_to_every_eligible_candidate_when_rf_cannot_be_fully_met() {
+    let pool = vec![node(10, "eu", "a"), node(11, "eu", "b")];
+    let policy = PlacementPolicy::simple("rf3-on-2", 3).require_label("region", "eu");
+    let current = vec![nid(10)];
+
+    // Plain `replan` refuses outright: 2 eligible candidates can never reach
+    // RF 3, so it reports exactly that.
+    assert_eq!(
+        replan(&current, &pool, &policy),
+        Err(PlacementError::InsufficientCandidates {
+            needed: 3,
+            eligible: 2
+        })
+    );
+
+    // `replan_repair` instead grows to both eligible candidates — real
+    // progress (1 -> 2 replicas) even though RF 3 still can't be met.
+    let grown = replan_repair(&current, &pool, &policy).unwrap();
+    assert_eq!(grown, vec![nid(10), nid(11)]);
+}
+
+/// The growth-only guarantee: once a tablet already holds as many replicas
+/// as the candidate pool can support, `replan_repair` must not shrink it —
+/// a stale, currently-ineligible replica stays in place exactly like plain
+/// `replan` leaves it, rather than being dropped the moment there's nothing
+/// better to replace it with.
+#[test]
+fn replan_repair_never_shrinks_an_already_at_capacity_set() {
+    let pool = vec![node(10, "eu", "a"), node(11, "eu", "b")];
+    let policy = PlacementPolicy::simple("rf3-on-2", 3).require_label("region", "eu");
+    // A prior 3-replica placement; node 12 is no longer in the candidate
+    // pool at all (e.g. it went `Down` and was excluded upstream).
+    let current = vec![nid(10), nid(11), nid(12)];
+
+    assert_eq!(
+        replan(&current, &pool, &policy),
+        Err(PlacementError::InsufficientCandidates {
+            needed: 3,
+            eligible: 2
+        }),
+        "sanity: plain replan also can't do better here"
+    );
+    assert_eq!(
+        replan_repair(&current, &pool, &policy),
+        Err(PlacementError::InsufficientCandidates {
+            needed: 3,
+            eligible: 2
+        }),
+        "replan_repair must not drop node 12 just because nothing else is available"
+    );
+}
+
+/// Once the pool genuinely covers the full RF, `replan_repair` behaves
+/// exactly like plain `replan` — the best-effort branch is a strict
+/// widening, never a change to the ordinary, fully-satisfiable case.
+#[test]
+fn replan_repair_matches_replan_when_rf_is_satisfiable() {
+    let pool = eu_pool();
+    let policy = PlacementPolicy::simple("eu", 3)
+        .require_label("region", "eu")
+        .spread_across("zone", true);
+    let current = select_replicas(&pool, &policy).unwrap();
+    assert_eq!(
+        replan_repair(&current, &pool, &policy),
+        replan(&current, &pool, &policy),
+    );
+}
+
+/// A degenerate but real input: zero eligible candidates. `replan_repair`
+/// must not manufacture an empty replica set out of a non-empty current
+/// one — that would durably orphan the tablet's data the instant every
+/// candidate happens to be transiently ineligible.
+#[test]
+fn replan_repair_with_zero_eligible_candidates_does_not_empty_the_set() {
+    let policy = PlacementPolicy::simple("rf3", 3).require_label("region", "eu");
+    let current = vec![nid(10)];
+    assert_eq!(
+        replan_repair(&current, &[], &policy),
+        Err(PlacementError::InsufficientCandidates {
+            needed: 3,
+            eligible: 0
+        })
+    );
 }
 
 /// ADR 0050 fork F5 (`select_replicas_balanced`): fresh placement prefers

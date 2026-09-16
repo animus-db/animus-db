@@ -204,6 +204,79 @@ pub fn replan(
     choose(&eligible, &keep, policy)
 }
 
+/// [`replan`]'s **best-effort** sibling (issue #957): recompute a replica set
+/// after a membership change exactly like `replan`, except when there are
+/// fewer eligible candidates than the policy's `replication_factor` **and**
+/// that pool is still bigger than the tablet's current eligible survivors —
+/// i.e. real, if partial, progress is possible. In that one case this grows
+/// the replica set to `eligible.len()` (every currently-eligible candidate)
+/// instead of refusing outright, so a tablet in a cluster that is
+/// chronically smaller than its own policy's target RF (e.g. RF 3 recorded
+/// against a 2-node cluster — [`PlacementPolicy`] deliberately always
+/// records the *target* RF, never the observed candidate count, so a wider
+/// cluster can later grow the tablet the rest of the way) still gains every
+/// replica it legitimately can, rather than being refused and left exactly
+/// as under-replicated as before, forever, until the cluster happens to
+/// reach the full RF in one step.
+///
+/// **Never used to shrink an already-at-capacity set.** When the eligible
+/// pool is no larger than the current eligible survivors (`eligible.len()
+/// <= keep.len()`) — the tablet already holds as many replicas as the
+/// cluster can currently support, whether or not that satisfies the full
+/// policy — this returns [`replan`]'s own plain, unmodified answer (`Err`
+/// when the survivors alone can't reach `replication_factor`), which is
+/// what preserves a stale, currently-ineligible replica rather than
+/// dropping it the moment there's nothing better available to replace it
+/// with. Growing "as far as possible" and never shrinking below what a
+/// caller already achieved are two independent guarantees; this function
+/// only ever relaxes the *growth* side of [`choose`]'s all-or-nothing rule.
+///
+/// A strict [`SpreadPolicy`] is still enforced against the SAME reduced
+/// target (never the full `replication_factor`) in the best-effort branch —
+/// best-effort growth never trades away a residency/spread guarantee for
+/// the replicas it does place; [`PlacementError::InsufficientDomains`] can
+/// still fire there exactly as it would for an ordinary `replan` call at
+/// that smaller RF.
+///
+/// The control plane's own repair pass (`Metadata::reconcile` /
+/// `PlacementView::reconcile`, `animus-control`) is this function's one
+/// production caller — see that crate's `reconcile_placement` for the
+/// wiring. [`select_replicas`]/[`select_replicas_balanced`] (fresh-tablet
+/// placement) and the directed-Placing convergence phase's own `replan`/
+/// `select_replicas` calls (ADR 0062 §2, ADR/`split_placing_reconcile`) are
+/// deliberately untouched — a fresh mint or a directed-Placing target has
+/// its own established "still write `target: None`/pause and retry" story
+/// for "not enough candidates yet" (fork B), which this function's
+/// broader, unconditional growth would silently change.
+///
+/// # Errors
+/// As [`replan`] — only when even the best-effort target can't be reached
+/// (a strict spread with too few available domains at that reduced target,
+/// or, in the never-shrink branch, whatever `replan` itself would return).
+#[must_use = "the caller must propose the returned replica set for it to take effect"]
+pub fn replan_repair(
+    current: &[NodeId],
+    candidates: &[Candidate],
+    policy: &PlacementPolicy,
+) -> Result<Vec<NodeId>> {
+    let eligible = eligible_domains(candidates, policy);
+    let eligible_ids: BTreeSet<NodeId> = eligible.iter().map(|(n, _)| n.clone()).collect();
+    let keep: BTreeSet<NodeId> = current
+        .iter()
+        .filter(|n| eligible_ids.contains(*n))
+        .cloned()
+        .collect();
+    if eligible.len() > keep.len() && eligible.len() < policy.replication_factor {
+        let capped = PlacementPolicy {
+            replication_factor: eligible.len(),
+            ..policy.clone()
+        };
+        choose(&eligible, &keep, &capped)
+    } else {
+        choose(&eligible, &keep, policy)
+    }
+}
+
 /// One step of **load rebalancing** across the candidate nodes (ADR 0029): move a
 /// single replica of a single tablet from a most-loaded node to a least-loaded
 /// one, iff doing so strictly improves balance and keeps every policy satisfied.
