@@ -84,11 +84,21 @@
 //! The never-below-3-voter-floor and correct-final-target properties — the
 //! ones that actually matter for issue #513's original "oscillates
 //! indefinitely" worry — were never affected by either bug and stay hard
-//! assertions. What remained after both fixes was a real, if rare, sustained
-//! "no CP group leader reachable" window on a genuinely CPU-starved 2-core
-//! box — not a masked correctness bug, but a fixed retry budget that was
-//! measurably too tight; see `put`'s own doc for the measurement and the
-//! resulting 100s budget.
+//! assertions. **What remained after both fixes is a real, still-open
+//! product defect, tracked separately as issue #950**: `cp_route`/the
+//! forward-hop chase (`crates/animusd/src/write_path.rs`,
+//! `crates/animusd/src/forwarding.rs`) can stall a single write for
+//! `CLIENT_TIMEOUT`/`HINTED_FORWARD_HOP_TIMEOUT`-sized increments (10s/6s),
+//! repeatedly, for 30–100+ seconds total, even while the target tablet
+//! group has a continuously known, stable leader the entire time (proven
+//! by lining up `put`'s own per-attempt timing against this file's
+//! independent `/admin/raftkv` leader poll — see `put`'s own doc). This is
+//! **not** the leaderless-election window issue #596 investigated (that
+//! symptom's own root cause is different, and this one's own reproductions
+//! show a stable leader throughout) and **not** a masked correctness bug
+//! in `reconfigure_step`/`split_placing` — it is a real client-routing gap,
+//! with a widened `put` budget (150s) standing in as a measured ceiling
+//! over it until issue #950 has its own fix.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -104,6 +114,15 @@ use tokio::time::{sleep, timeout};
 
 mod support;
 use support::free_addrs;
+
+/// DIAGNOSTIC, kept permanently (issue #670/#950): set to the test's own
+/// start instant so `put`'s per-attempt timing lines share the identical
+/// clock origin as the voter/leader trace below (`t=Xms`), letting a slow
+/// `put` window be lined up directly against whether the target tablet's
+/// own group had a leader at that moment — this is exactly the
+/// cross-reference that isolated issue #950 (a stall with a continuously
+/// known, stable leader the whole time, ruling out leader election).
+static TEST_START: std::sync::OnceLock<tokio::time::Instant> = std::sync::OnceLock::new();
 
 async fn bring_up_inplace(n: usize, dir: &Path) -> (Vec<Node>, ClusterConfig) {
     for attempt in 0..16 {
@@ -232,9 +251,9 @@ async fn admin_once(
 /// correct, by-design fail-fast behavior for a real storage-layer failure,
 /// not a bug: three independent full multi-node `LsmEngine`-backed clusters
 /// (this test plus two `dynamo_txn` binaries) all issuing real fsync-heavy
-/// WAL writes while pinned to two shared cores can genuinely exceed this
-/// sandbox's own disk I/O capacity. This is the identical "wal group-commit
-/// sync failed... under sandbox disk pressure" confound issue #670's own
+/// WAL writes while pinned to two shared cores can genuinely exceed the
+/// host's own disk I/O capacity. This is the identical "wal group-commit
+/// sync failed... under disk pressure" confound issue #670's own
 /// original report already named as separate from the protocol-level
 /// question that issue's own investigation resolved — corroborated, not
 /// newly introduced, by this investigation. No amount of retry budget on
@@ -259,52 +278,69 @@ async fn put(stream: &mut TcpStream, key: Vec<u8>, value: Vec<u8>) {
     use animusd::{ClientRequest, ClientResponse, read_frame, write_frame};
     // Issue #670: 20s (2x `CLIENT_TIMEOUT`'s 10s) was not enough headroom for
     // this test's own contention sensitivity, and neither, it turns out, was
-    // an intermediate 45s. Measured directly, in two rounds:
-    //   - 20s budget: under two concurrent `dynamo_txn` binaries pinned to
-    //     this test's own two cores, 4 of 20 runs panicked here with
-    //     `Error("no CP group leader reachable")`/`Error("relay to peer node
-    //     failed")` after exhausting exactly that budget.
-    //   - 45s budget, re-measured after issue #920/PR #932's `reconfigure_step`
-    //     reordering landed (a distinct fix, see the module doc): still 1 of
-    //     20 runs under the identical two-`dynamo_txn`-loop contention
-    //     exhausted it. Instrumenting the same helper with a temporary 180s
-    //     ceiling and logging actual success latency across 40 further runs
-    //     (2 batches of 20) under the same contention found real successful
-    //     `put`s taking up to 68.6s (and, separately, 57.9s/58.3s) — a real,
-    //     if rare, sustained "no reachable leader" window on a genuinely
-    //     starved 2-core box (this test's own multi-thread runtime plus two
-    //     full `dynamo_txn` test binaries, all pinned to the same two cores),
-    //     not a fixed number of `CLIENT_TIMEOUT` cycles. Zero of those 40
-    //     runs exceeded 70s.
-    //   - 100s budget, after also landing this file's own issue #928/#921
-    //     reversion fix (`animus-control`): 1 of 25 further contended runs
-    //     still exhausted it, on the very FIRST `put` right after bootstrap
-    //     (before any split/growth activity at all) — proof this is a
-    //     genuine, if rare (measured ~2% across 65 total contended runs
-    //     against the fully-fixed code), heavy-tailed real `ProdEnv`
-    //     liveness property of running a real Raft cluster this starved
-    //     (this test's own multi-thread runtime plus two full `dynamo_txn`
-    //     binaries, all pinned to two cores — far more thread/core
-    //     oversubscription than any real deployment or CI runner), not a
-    //     masked correctness bug and not specific to the split/swap path
-    //     `put`'s earlier measurements characterized. Raised to 150s —
-    //     comfortably above every measured occurrence including this one —
-    //     as the practical ceiling for this exercise: chasing an
-    //     ever-longer tail with an ever-larger constant has diminishing
-    //     value (see this file's own `TEST_TIMEOUT` doc for how this budget
-    //     relates to the outer test deadline, which is sized to match). A
-    //     residual, very low failure rate under this test's own deliberately
-    //     EXTREME synthetic contention (never representative of real
-    //     production or CI load) is an accepted property of exercising that
-    //     envelope at all, distinct from the reversion bug (issues
-    //     #670/#921/#928) this same investigation found and fixed as a real
-    //     defect. `join_extra`/`await_cutover_of` elsewhere in this file use
-    //     a flat 60s for the same "under load" reason, but `put` is called
-    //     far more often per run (every 15ms from the background writer) so
-    //     it has far more chances to hit a bad window, hence the wider
-    //     margin here.
+    // 45s or 100s. Widened in stages as each contributor was found and fixed
+    // (20s -> 45s -> 100s -> this 150s), with the tail re-measured after each
+    // fix — see this file's own git history for the full sequence.
+    //
+    // **150s IS NOT A NORMAL BOUND — it is a measured ceiling over a KNOWN,
+    // still-open defect, issue #950.** Per-attempt timing
+    // (`PUTDIAG`, below) lined up against this file's own independent
+    // `/admin/raftkv` leader poll during three reproductions (51.9s, 47.0s,
+    // 102.7s totals) showed every failing attempt taking almost exactly
+    // `CLIENT_TIMEOUT` (10s) or `HINTED_FORWARD_HOP_TIMEOUT` (6s, compounding
+    // with `cp_route`'s own wait when both fire in one attempt) —
+    // `no CP group leader reachable` / `relay to peer node failed` /
+    // `forwarded CP op: not the leader here; leader_hint=none` — stacking
+    // attempt after attempt, WHILE the independent admin poll showed a
+    // continuously known, stable leader (and, in the clearest reproduction,
+    // an already-converged, UNCHANGING voter set — not even mid-swap) for
+    // the entire stalled window. This rules out leader election as the
+    // cause: `cp_route`/the forward-hop chase are failing to resolve or
+    // reach a route to a leader that demonstrably exists and is reachable
+    // from at least one other replica the whole time. See issue #950 for
+    // the full breakdown and proposed fix directions (not attempted here —
+    // it needs its own design/PR); this budget just needs to be comfortably
+    // above the worst measured total (102.7s) until that lands. Reproduced
+    // on a 4-core host with two cores pinned (`taskset -c 0,1`) and two
+    // concurrent `cargo test -p animusd --test dynamo_txn` integration-test
+    // loops contending for those two cores alongside this test's own
+    // 6-worker-thread runtime — deliberately far more thread/core
+    // oversubscription than any real deployment or CI runner, which is why
+    // this defect's *frequency* here (measured up to ~20% of contended runs
+    // hitting a >10s stall in one batch) does not carry over to a
+    // realistically loaded environment, even though the mechanism itself is
+    // real. `join_extra`/`await_cutover_of` elsewhere in this file use a
+    // flat 60s for the same "under load" reason, but `put` is called far
+    // more often per run (every 15ms from the background writer) and, per
+    // issue #950, can now be understood to hit this specific defect rather
+    // than just generic slowness, hence the much wider margin here.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(150);
+    // DIAGNOSTIC, kept permanently (issue #670/#950): per-attempt timing
+    // against `TEST_START`'s shared origin, so a slow key's round-trip
+    // durations can be lined up against the `t=Xms leader=...` trace this
+    // file already prints during the writer's own active window. Each
+    // `write_frame`/`read_frame` round trip is ONE server-side
+    // `cp_kind_write_raw` call (`crates/animusd/src/write_path.rs`), itself
+    // bounded by `CLIENT_TIMEOUT` (10s) and internally dominated by
+    // `cp_route`'s own up-to-`CLIENT_TIMEOUT` wait for a resolvable route —
+    // this print's *count* and *per-attempt duration* were exactly what
+    // isolated issue #950's shape (see `deadline`'s own doc above): a small
+    // number of ~10s/~16s attempts, not many short ones, while an
+    // independently-known leader existed the whole time. Left in place
+    // rather than stripped once the ceiling was set, since any future
+    // recurrence (or a genuine widening of this defect) is immediately
+    // diagnosable from a single run's own output instead of needing this
+    // instrumentation re-added from scratch.
+    let t0 = TEST_START.get().copied();
+    let elapsed_ms = || {
+        t0.map(|t0| tokio::time::Instant::now().duration_since(t0).as_millis())
+            .unwrap_or(0)
+    };
+    let attempt_start = tokio::time::Instant::now();
+    let mut attempt: u32 = 0;
     loop {
+        attempt += 1;
+        let this_attempt_start = tokio::time::Instant::now();
         write_frame(
             stream,
             &ClientRequest::Put {
@@ -316,8 +352,24 @@ async fn put(stream: &mut TcpStream, key: Vec<u8>, value: Vec<u8>) {
         .await
         .expect("send frame");
         match read_frame(stream).await.expect("read").expect("reply") {
-            ClientResponse::PutOk => return,
-            ClientResponse::Error(_) if tokio::time::Instant::now() < deadline => {
+            ClientResponse::PutOk => {
+                let total = attempt_start.elapsed();
+                if total > Duration::from_secs(2) {
+                    eprintln!(
+                        "PUTDIAG t={}ms key={key:?} succeeded after {attempt} attempt(s), \
+                         total {total:?}, last attempt took {:?}",
+                        elapsed_ms(),
+                        this_attempt_start.elapsed(),
+                    );
+                }
+                return;
+            }
+            ClientResponse::Error(e) if tokio::time::Instant::now() < deadline => {
+                eprintln!(
+                    "PUTDIAG t={}ms key={key:?} attempt {attempt} failed after {:?}: {e}",
+                    elapsed_ms(),
+                    this_attempt_start.elapsed(),
+                );
                 sleep(Duration::from_millis(150)).await;
             }
             other => panic!("put failed: {other:?}"),
@@ -569,6 +621,7 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(280);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn two_of_three_replica_diff_placing_target_converges_end_to_end() {
+    let _ = TEST_START.set(tokio::time::Instant::now());
     timeout(TEST_TIMEOUT, async {
         let dir = support::panic_safe_tempdir();
         let (mut nodes, config) = bring_up_inplace(3, dir.path()).await;
@@ -651,7 +704,7 @@ async fn two_of_three_replica_diff_placing_target_converges_end_to_end() {
         let writer_addr = nodes[0].client_addr();
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop2 = std::sync::Arc::clone(&stop);
-        let writer = tokio::spawn(async move {
+        let mut writer = tokio::spawn(async move {
             let mut stream = TcpStream::connect(writer_addr)
                 .await
                 .expect("connect writer client port");
@@ -681,8 +734,11 @@ async fn two_of_three_replica_diff_placing_target_converges_end_to_end() {
         const SETTLE_SAMPLES: usize = 3;
         let mut trace_left: Vec<(u128, usize, Vec<String>, Option<String>)> = Vec::new();
         let mut trace_right: Vec<(u128, usize, Vec<String>, Option<String>)> = Vec::new();
-        let start = tokio::time::Instant::now();
-        let deadline = start + Duration::from_secs(90);
+        // Shares `TEST_START`'s origin (see that static's own doc) so this
+        // trace's `t=Xms` lines can be lined up directly against `put`'s own
+        // diagnostic timing, both printed against the identical clock.
+        let start = *TEST_START.get().expect("set at test entry");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
         let mut converged = false;
         loop {
             let t = tokio::time::Instant::now().duration_since(start).as_millis();
@@ -709,7 +765,32 @@ async fn two_of_three_replica_diff_placing_target_converges_end_to_end() {
         }
 
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        writer.await.expect("background writer task panicked");
+        // DIAGNOSTIC, kept permanently (issue #670/#950): the writer checks
+        // `stop` only between `put()` calls, so a `put()` already in flight
+        // when convergence is detected can keep running for a while past
+        // this point — exactly the window a slow `put` most often falls in,
+        // and one the trace above stops sampling at convergence, so it used
+        // to have NO leader visibility during it (this gap is what let
+        // issue #950's stalls go unexplained for as long as they did). Keep
+        // sampling both children's leader every 200ms, appended to the SAME
+        // trace vectors, until the writer actually finishes.
+        loop {
+            tokio::select! {
+                res = &mut writer => {
+                    res.expect("background writer task panicked");
+                    break;
+                }
+                () = sleep(Duration::from_millis(200)) => {
+                    let t = tokio::time::Instant::now().duration_since(start).as_millis();
+                    if let Some((v, l)) = live_voters_leader(&nodes, left).await {
+                        trace_left.push((t, v.len(), v, l));
+                    }
+                    if let Some((v, l)) = live_voters_leader(&nodes, right).await {
+                        trace_right.push((t, v.len(), v, l));
+                    }
+                }
+            }
+        }
 
         eprintln!("=== left child {left} voter trajectory ===");
         for (t, n, v, l) in &trace_left {

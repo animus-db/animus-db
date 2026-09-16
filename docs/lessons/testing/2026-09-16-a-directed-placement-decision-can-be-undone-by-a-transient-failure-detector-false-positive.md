@@ -15,14 +15,26 @@ the tablet right back toward the set the split was moving it away from.
 
 Reproduced directly, more than once, over a real multi-node `ProdEnv`
 cluster (`crates/animusd/tests/split_placing_two_replica_diff_e2e.rs`) with
-no synthetic fault injection at all — just this repo's own ordinary
-background CPU/disk contention on a shared sandbox (confirmed via `uptime`
-and concurrent `cargo test` processes from other sessions at the time): a
-target member's control-plane liveness status flips `Down` for long enough
-to cross the dwell (a false positive — the process itself never died, its
-heartbeat was merely delayed), and the tablet's `voter_history` shows it
-reach the correct directed-Placing target and then, seconds later, get
-retargeted away from it.
+no synthetic fault injection at all — just ordinary background CPU/disk
+contention on the host running the tests: a target member's control-plane
+liveness status flips `Down` for long enough to cross the dwell (a false
+positive — the process itself never died, its heartbeat was merely
+delayed), and the tablet's `voter_history` shows it reach the correct
+directed-Placing target and then, seconds later, get retargeted away from
+it.
+
+**The reproduction recipe, precisely, for anyone re-running this**: a
+4-core host with two cores pinned (`taskset -c 0,1`) running the target
+test, and two more concurrent `cargo test -p animusd --test dynamo_txn`
+integration-test loops pinned to the SAME two cores as extra contention —
+this test's own 6-worker-thread runtime plus two more full 6-worker-thread
+test binaries all sharing two cores is deliberately far more thread/core
+oversubscription than any real deployment or CI runner would see. `uptime`
+1-minute load averages during these batches ranged from under 1 (early in
+a batch) up to about 5 (once all three processes were fully warmed up and
+contending) on the 4-core host; batches were never run while independent,
+unrelated load was also present, so this range reflects the three
+processes' own contention alone.
 
 **Two layers to the fix — both now implemented (2026-09-16, issue #928's own
 follow-up landed in the same change that closed #921 for good)**:
@@ -105,30 +117,70 @@ this kind of staleness once #932 landed).
 **Also fixed in the same investigation**: `crates/animusd/tests/
 split_placing_two_replica_diff_e2e.rs`'s background writer used
 `let _ = writer.await;`, discarding the writer task's own `JoinError` — see
-issue #619's own lesson entry for the general form of that bug. Its own
-`put` helper's retry budget went through THREE measured revisions as the
-underlying mechanism bugs were fixed and the harness's own true tail
-latency was characterized more precisely each time: 20s → 45s → 150s (see
-that function's own doc comment for the full measurement history) — a
-reminder that a budget widened once with real measurement can still be
-short by a further measured amount once a DIFFERENT confound (here: the
-placement-reversion bug itself contributing to some of the apparent
-timeouts) is fixed and the residual tail can finally be measured cleanly.
-A second, independent test-harness gap found in the same investigation:
-`admin()`'s raw TCP I/O had no retry at all, panicking immediately on a
-transient `ConnectionReset` under the same contention — given the identical
-retry-with-a-measured-budget treatment as `put`. **Not every failure shape
-under this test's own deliberately EXTREME contention is fixable by a
-retry, though**: a SEPARATE, sustained `ConnectionRefused` (no budget
-recovers it) traced back to a genuinely halted node — `RaftKvNode`'s apply
-loop hit its own `assert!(halted, "raftkv wal {append,sync} failed while
-running")` on a REAL WAL fsync failure, i.e. actual sandbox disk I/O
-exhaustion from three full multi-node `LsmEngine`-backed clusters (this
-test plus two `dynamo_txn` contention binaries) all issuing real fsync
-traffic while pinned to two shared cores — the identical "wal group-commit
-sync failed... under sandbox disk pressure" confound issue #670's own
-original report already named as separate from the protocol-level
-question. Corroborated, not newly introduced, by this investigation, and
-correctly NOT treated as something to retry around: a real storage failure
-fail-fasting when not intentionally halted is by-design crash-safety
-behavior (durable-before-visible), not a defect.
+issue #619's own lesson entry for the general form of that bug. A second,
+independent test-harness gap found in the same investigation: `admin()`'s
+raw TCP I/O had no retry at all, panicking immediately on a transient
+`ConnectionReset` under the same contention — given a retry with a measured
+budget (30s), mirroring `put`'s own treatment below.
+
+**A third, DIFFERENT failure shape, correctly left un-retried**: a
+sustained `ConnectionRefused` (no retry budget recovers it) traced back to
+a genuinely halted node — `RaftKvNode`'s apply loop hit its own
+`assert!(halted, "raftkv wal {append,sync} failed while running")` on a
+REAL WAL fsync failure, i.e. actual disk I/O exhaustion on the host from
+three full multi-node `LsmEngine`-backed clusters (this test plus two
+`dynamo_txn` contention binaries) all issuing real fsync traffic while
+pinned to two shared cores — the identical "wal group-commit sync
+failed... under disk pressure" confound issue #670's own original report
+already named as separate from the protocol-level question. Corroborated,
+not newly introduced, by this investigation, and correctly NOT treated as
+something to retry around: a real storage failure fail-fasting when not
+intentionally halted is by-design crash-safety behavior
+(durable-before-visible), not a defect.
+
+**`put`'s own retry budget — a measured ceiling over a KNOWN, still-open
+defect, not harness noise (issue #950)**: the budget went through several
+revisions (20s → 45s → 100s → 150s) as reversion-bug contributions to the
+apparent timeouts were fixed above and the residual tail was re-measured
+each time (see `put`'s own doc comment in the test file for the full
+sequence). The first two rounds' framing — "a heavy-tailed real `ProdEnv`
+liveness property of extreme contention, not a masked correctness bug" —
+was itself incomplete. Instrumenting `put`'s own per-attempt timing against
+a SHARED clock origin with the test's existing `/admin/raftkv` leader poll
+(so a stalled `put`'s exact wall-clock window can be checked against
+whether the target tablet group had a leader at that moment) showed, across
+three reproductions (51.9s, 47.0s, 102.7s totals):
+
+```
+PUTDIAG t=13836ms key=[119,56,48] attempt 1 failed after 10.002857478s: relay to peer node failed
+PUTDIAG t=24028ms key=[119,56,48] attempt 2 failed after 10.04037591s: no CP group leader reachable
+PUTDIAG t=34221ms key=[119,56,48] attempt 3 failed after 10.042607227s: no CP group leader reachable
+PUTDIAG t=44685ms key=[119,56,48] attempt 4 failed after 10.311502806s: relay to peer node failed
+...
+PUTDIAG t=106509ms key=[119,56,48] succeeded after 10 attempt(s), total 102.676585368s
+```
+
+— every failing attempt taking almost exactly `CLIENT_TIMEOUT` (10s) or
+`HINTED_FORWARD_HOP_TIMEOUT` (6s, compounding with `cp_route`'s own wait
+when both fire in one attempt), stacking attempt after attempt — **while
+the independently-polled admin leader trace for the SAME window showed a
+continuously known, stable leader the entire time** (and, in the clearest
+reproduction, an already-converged, UNCHANGING voter set — not even
+mid-reconfigure). This rules out leader election: `cp_route`
+(`crates/animusd/src/forwarding.rs`) and the forward-hop chase
+(`crates/animusd/src/write_path.rs`'s `cp_kind_write_raw_bounded`) are
+failing to resolve or reach a route to a leader that demonstrably exists
+and is reachable from at least one other replica throughout. Filed as its
+own issue, #950, with the full breakdown and proposed fix directions (fan
+out the route/hint lookup across known replicas instead of one sequential
+per-node wait; shorter first-probe timeouts with backoff instead of
+committing a full `CLIENT_TIMEOUT`/`HINTED_FORWARD_HOP_TIMEOUT` per
+attempt; a metric/log line when this stall class occurs in production).
+**The general lesson**: when a client-visible timeout keeps needing to
+widen even after every mechanism bug you can find has been fixed, don't
+stop at "measured, so it's fine" — cross-reference the client's own
+per-attempt timing against an independent, concurrently-collected signal
+(here: an admin poll the test already had, sharing one clock origin) before
+concluding the tail is unexplainable harness noise. It may be a real,
+separately-fileable product gap hiding behind what looks like ordinary
+contention-induced slowness.

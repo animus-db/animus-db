@@ -1317,9 +1317,10 @@ eligible candidates are typically its own pre-split siblings: retargeting
 an achieved target can converge the tablet right back toward the set the
 split was moving it away from. Reproduced directly, more than once, over a
 real multi-node `ProdEnv` cluster with no synthetic fault injection beyond
-ordinary shared-sandbox background contention (`crates/animusd/tests/
-split_placing_two_replica_diff_e2e.rs`) — a target member's control-plane
-liveness flipped `Down` for long enough to cross the 5s dwell despite the
+ordinary background contention on the host running the test
+(`crates/animusd/tests/split_placing_two_replica_diff_e2e.rs`) — a target
+member's control-plane liveness flipped `Down` for long enough to cross the
+5s dwell despite the
 process never actually dying (a failure-detector false positive), and the
 tablet's `voter_history` showed it reach the correct target and then,
 seconds later, get retargeted away from it — the exact shape issue #921
