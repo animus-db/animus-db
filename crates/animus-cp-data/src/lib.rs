@@ -7390,6 +7390,66 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     // not merged yet, letting a read gate open and observe past the engine.
     let mut max_index = 0u64;
     for (index, term, command) in effects {
+        // Stall fix (reconciler group-driver-stop timing): re-check `halted`
+        // at the top of EVERY entry, not only once at the top of
+        // `apply_loop`'s own outer loop. Before this, a backlog of N
+        // committed-not-yet-applied entries at shutdown time had to be
+        // fully applied — real engine I/O per entry, including this loop's
+        // own internal `flush_pending` drains for `Cas`/`Freeze`/
+        // `ReadCeiling`/conditioned-`KindBatch` — before `apply_stopped`
+        // could ever flip, which is exactly what let one slow stop block
+        // `Reconciler::teardown`'s inline wait for the full
+        // `RECLAIM_STOP_TIMEOUT` and starve every other tablet this node
+        // hosts (see `host.rs`'s `RECLAIM_STOP_TIMEOUT`/`teardown` docs).
+        //
+        // Abandoning the rest of this pass here is always safe:
+        // - `RaftKvNode::shutdown`'s own doc: `halted` is one-way — "a
+        //   halted node must not be used again — restarting the tablet
+        //   means a fresh `start`." So this process never applies another
+        //   entry for this tablet again in its own lifetime once this branch
+        //   fires; there is no "resume mid-pass later" case to protect.
+        // - The remaining entries are not lost: they are still durably
+        //   committed in the Raft log (that's what "effects" already means
+        //   here), and a fresh `start` — this process reusing the tablet
+        //   after a `Reconciler::teardown` timeout re-registers it (pre-fix
+        //   behavior), or a brand new process after a real restart —
+        //   rebuilds `RaftCore`'s `pending_apply` from the log/WAL and this
+        //   apply task re-derives and re-drains the identical backlog from
+        //   scratch. Applying is idempotent (per-key LWW at the entry's own
+        //   packed-HLC version), so redoing already-in-flight work here
+        //   costs nothing beyond repeated I/O.
+        // - The durable applied watermark (`applied.rs`'s engine-global
+        //   marker, `applied_marker_key`) is written ONLY at compaction
+        //   (`RaftCore::snapshot_upto`, below) and at `InstallSnapshot`
+        //   receipt (`install_engine_image`) — never on an ordinary pass
+        //   like this one (see `applied.rs`'s own module doc, "deliberately
+        //   coarser than every commit"). So a restart's recovery
+        //   (`drive()` reading that marker back, `engine_applied.store` at
+        //   the bottom of this file's recovery path) always replays the
+        //   WHOLE committed log tail since the last durable marker forward
+        //   — it never trusts how far a since-halted process's in-memory
+        //   `engine_applied` watermark (bumped below, after the trailing
+        //   `flush_pending`) got mid-pass before stopping. Breaking early
+        //   changes nothing about what gets recovered.
+        // - `Reconciler::teardown` only erases this tablet's engine/WAL
+        //   files once `RaftKvNode::is_stopped()` — `stopped &&
+        //   apply_stopped` — is true, i.e. strictly after this loop has
+        //   actually exited (either by draining `effects` or by this
+        //   `break`) and `apply_loop`'s own outer `halted` check has run
+        //   again. So erasure can never race a merge this break just chose
+        //   not to perform.
+        // - Every in-process waiter for one of these skipped entries'
+        //   outcome (`wait_applied`/`wait_stage_outcome`/`cas_result`'s own
+        //   poll loop/the `KindBatchOutcomes`/`KindEvalResults` probes) is
+        //   already a bounded poll against `CAS_TIMEOUT`/`CAS_POLL` that
+        //   also re-checks `is_leader()` every iteration — never an
+        //   unbounded channel wait — so a skipped entry's waiter simply
+        //   times out and the caller retries (indistinguishable from any
+        //   other mid-flight leadership loss/shutdown), rather than hanging
+        //   forever.
+        if halted.load(Ordering::SeqCst) {
+            break;
+        }
         match command {
             KvCommand::Put { key, value, ts } => {
                 assert_ts_monotonic(max_applied_ts, ts);
@@ -9011,7 +9071,16 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
         max_index = index; // ascending; watermark advances after the final flush
     }
     // Apply any trailing Put/Delete run under one final sync. Only now does the
-    // engine reflect every index in this pass.
+    // engine reflect every index in this pass. Runs unconditionally, whether
+    // the loop above drained every effect or broke early on `halted` — the
+    // entries already matched before the break earned real, if buffered,
+    // work (sealed/frozen/txn-tracker bookkeeping, recorded CAS/stage/
+    // kind-batch outcomes), so flushing what's already accumulated in
+    // `pending` makes that work durable instead of silently discarding it;
+    // it costs nothing extra (this call already runs on every pass) and
+    // keeps `max_index`/`engine_applied` an honest reflection of what is
+    // actually merged (see the `halted` check inside the loop above for why
+    // an early break is safe either way).
     flush_pending(storage, &mut pending, metrics, halted).await;
     // Publish the watermark: the engine now holds all effects through `max_index`,
     // so linearizable reads may serve up to it and compaction may snapshot up to it.
@@ -9355,17 +9424,20 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
 ///
 /// **Halted-gated error tolerance** (issue #278 item 1 follow-up, the identical
 /// idiom `persist_wal`/the compaction path above use): `apply_and_compact`'s
-/// top-of-`apply_loop` `halted` check only gates *starting* a pass — the effects
-/// loop that calls this function up to ten times per pass (once per `Cas`/
-/// `Freeze`/`ReadCeiling`/conditioned-`KindBatch` ordering-hygiene drain, plus
-/// the trailing flush) does not re-check `halted` between merges, so a
-/// `shutdown()` racing a still-in-flight `merge_batch` mid-pass can surface the
-/// identical class of teardown-artifact I/O error `persist_wal` tolerates. On
-/// error: tolerated (no `pending` restore — the caller is discarding this pass
-/// on the same halt anyway) iff `halted` is already set; a live group's
-/// identical failure stays a hard panic (durable-before-visible: an apply
-/// failure while running means the engine may now be silently missing a
-/// committed write, so this must never be softened into a swallowed error).
+/// effects loop re-checks `halted` once per entry (the reconciler
+/// group-driver-stop-timing fix — see that loop's own comment), but a single
+/// entry's own apply arm can still call this function more than once before
+/// that next check (up to ten times per pass, once per `Cas`/`Freeze`/
+/// `ReadCeiling`/conditioned-`KindBatch` ordering-hygiene drain, plus the
+/// trailing flush) with no `halted` re-check between those calls, so a
+/// `shutdown()` racing a still-in-flight `merge_batch` mid-entry can surface
+/// the identical class of teardown-artifact I/O error `persist_wal`
+/// tolerates. On error: tolerated (no `pending` restore — the caller is
+/// discarding this pass on the same halt anyway) iff `halted` is already
+/// set; a live group's identical failure stays a hard panic
+/// (durable-before-visible: an apply failure while running means the engine
+/// may now be silently missing a committed write, so this must never be
+/// softened into a swallowed error).
 async fn flush_pending<S: StorageEngine>(
     storage: &S,
     pending: &mut Vec<MergeOp>,
