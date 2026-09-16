@@ -1279,6 +1279,29 @@ per-tablet CP data plane (`animus-cp-data`).
   concern, not a safety one) and any policy for *when* to call
   `promote_learner` (the host reconciler's replica-move sequencing).
 
+  **`RaftCore::config_history()` (issue #944)**: a small bounded ring
+  (`config_history`, capacity 64, oldest dropped, never rebuilt at
+  recovery) of every distinct `(config, learners)` pair this core has
+  adopted, appended **synchronously inside `apply_config`** — the one call
+  every real transition funnels through, whether it's a leader's own
+  `add_learner`/`promote_learner`/`change_membership` call (mutating this
+  core directly, from whatever task calls it — for `animus-cp-data` that's
+  the host reconciler's own tick, not the consensus/drive loop) or a
+  follower's own per-entry `log_append` while draining a batched
+  `AppendEntries`. This is deliberately **not** the same mechanism as
+  `animus-cp-data`'s `VoterHistory` (issue #596), which samples
+  `config()`/`learners()` from OUTSIDE, once per consensus-loop iteration —
+  fine-grained enough for a voter-set change (bounded by this core's own
+  per-message processing) but NOT for the learner set specifically, since a
+  caller invoking two membership-changing methods back-to-back (or a
+  follower draining several batched entries) can mutate this core more than
+  once before an external sampler next gets scheduled, silently coalescing
+  the transient learner phase away — see `crates/animus-cp-data/CLAUDE.md`'s
+  matching entry and `crates/animusd/tests/learner_reconfigure.rs` for the
+  flake this closed. Recording at the mutation site itself cannot miss it,
+  regardless of which task or how much batching triggered it. A pure
+  accessor — `config_history()` never blocks or mutates anything.
+
 - **Leadership transfer (`RaftCore::transfer_leadership`, ADR 0029).**
   Originally a per-tablet CP-data primitive living here because the sync
   core is shared, described in an earlier revision of this note as

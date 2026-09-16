@@ -461,6 +461,33 @@ in both the initial and the desired set); `admin::CpRaftView`'s
 `voter_history` field (`animusd`) surfaces it read-only on `/admin/raftkv`,
 mirroring `learners`' own "purely observational" contract above — reading it
 never blocks, proposes, or wakes a quiesced group.
+
+**`RaftKvNode::membership_history()` (issue #944)** is the LEARNER-set
+sibling of `voter_history()` above, but recorded in a different place for a
+reason worth being explicit about: `voter_history`'s once-per-consensus-
+loop-iteration sampling cadence is fine-grained enough for a voter-set
+change (which only ever advances via this group's own network-replicated
+log, so this loop's own per-message processing bounds how much can happen
+between two samples) but is **not** fine-grained enough for the learner
+set, because `reconfigure_step`'s add-learner-then-promote pair is proposed
+by the host reconciler's own task, synchronously mutating the shared
+`RaftCore` from OUTSIDE this drive loop entirely — and a follower's own
+`log_append` can likewise adopt several batched config-changing entries
+before this loop next gets scheduled to sample. Sampling from `drive()` can
+therefore coalesce the whole add-then-promote sequence into one record,
+silently skipping the transient learner state — `crates/animusd/tests/
+learner_reconfigure.rs`'s `spare_replacement_passes_through_an_observable_
+learner_state_and_keeps_serving` used to prove the learner phase occurred
+by polling `/admin/raftkv` externally every 100ms, which this exact
+coalescing can race shut just like the `voter_history` incident above (same
+class, `docs/engineering-lessons.md`'s matching entry). The fix records the
+joint `(voters, learners)` pair **inside `RaftCore::apply_config`** itself
+(`animus-control`, `config_history`, capacity 64) — the one call every real
+transition funnels through regardless of which task or how much batching
+triggered it — rather than sampling it from any layer above. `RaftKvNode::
+membership_history()` is a thin passthrough to `RaftCore::config_history()`;
+`admin::CpRaftView`'s `membership_history` field surfaces it the same way
+`voter_history` does.
 **Eventually-consistent reads (ADR 0055)** are the second read path this
 crate serves, and the one whose budget is easiest to destroy by accident:
 `stale_read_ready()` (the gate), `stale_get_served()` (outer `None` =

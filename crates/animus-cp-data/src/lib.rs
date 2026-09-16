@@ -2246,16 +2246,12 @@ pub struct RaftKvNode<E: Env, S: StorageEngine> {
     voter_history: Arc<Mutex<VoterHistory>>,
 }
 
-/// A bounded, in-process ring of every distinct Raft voter configuration a
-/// [`RaftKvNode`] has adopted, in adoption order (issue #596). Exists
-/// because a transient intermediate configuration's own DURATION is an
-/// implementation timing artifact, never a property this crate promises —
-/// `reconfigure_step`'s learner-phased sequencing (this file's own doc,
-/// "reconfigure_step's learner-phased replica-move sequencing") only
-/// guarantees an over-replicated intermediate is logically *reached*
-/// between an add and the matching remove, not how long it survives before
-/// the next reconciler tick removes it. An external poller sampling the
-/// live voter set on a fixed interval can race that window shut — see
+/// A bounded, in-process ring of every distinct value of `T` a
+/// [`RaftKvNode`] has observed for some per-tick recomputed fact, in
+/// observation order. Exists because a transient intermediate's own
+/// DURATION is an implementation timing artifact, never a property this
+/// crate promises — an external poller sampling the live voter set on a
+/// fixed interval can race that window shut — see
 /// `crates/animusd/tests/split_placing_two_replica_diff_e2e.rs` and
 /// `docs/engineering-lessons.md`'s matching entry for the incident this
 /// closes. Recording the sequence here, inside the same consensus-loop
@@ -2263,6 +2259,25 @@ pub struct RaftKvNode<E: Env, S: StorageEngine> {
 /// tick" fact (`state_machine_behind`, the quiesce veto), makes the
 /// intermediate provable from a durable-for-this-uptime record instead of
 /// from how fast an external caller happens to poll.
+///
+/// **This same once-per-tick sampling cadence is not fine-grained enough
+/// for the LEARNER set** (issue #944): unlike a voter-set change (which
+/// only ever changes via network-replicated log entries, so this
+/// consensus-loop's own per-message processing bounds how much can happen
+/// between two samples), a leader's own `add_learner`/`promote_learner`
+/// calls (`RaftKvNode::reconfigure_step`) mutate the shared `RaftCore`
+/// SYNCHRONOUSLY, from whichever task calls them (the host reconciler's own
+/// tick, not this drive loop) — and a follower's own per-entry `log_append`
+/// can likewise apply several batched config-changing entries before this
+/// loop ever gets scheduled to sample in between. Sampling from here can
+/// therefore coalesce the whole add-then-promote sequence into one record,
+/// silently skipping the transient learner state entirely — see
+/// `crates/animusd/tests/learner_reconfigure.rs`'s
+/// `spare_replacement_passes_through_an_observable_learner_state_and_keeps_serving`
+/// for the flake this caused. The learner/voter JOINT history that closes
+/// it (`RaftCore::config_history`, recorded synchronously at the one real
+/// mutation site, `apply_config`, in `animus-control`) therefore lives
+/// **inside the core**, not here — see that method's own doc.
 ///
 /// Deliberately **not** rebuilt at group start/recovery — unlike
 /// `sealed`/`committed_ceiling`/`txn_tracker`, "what voter sets has this
@@ -4389,6 +4404,27 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             .lock()
             .expect("voter history poisoned")
             .snapshot()
+    }
+
+    /// Every distinct **(voters, learners)** pair this group has adopted
+    /// since it started (or last recovered), in adoption order — issue
+    /// #944. Unlike [`voter_history`](Self::voter_history) and
+    /// [`learners`](Self::learners) read independently, this pairs each
+    /// recorded voter set with the learner set it changed alongside, so a
+    /// caller can tell whether a member was ever a voter without having
+    /// first appeared as a learner in an earlier entry — the ADR 0058
+    /// Train 1 add-learner-then-promote ordering. A thin passthrough to
+    /// [`RaftCore::config_history`] (`animus-control`), recorded
+    /// synchronously at the one real mutation site rather than sampled
+    /// once per consensus-loop tick like `voter_history` above — see that
+    /// method's own doc for why the learner set specifically needs the
+    /// finer-grained mechanism, and
+    /// `crates/animusd/tests/learner_reconfigure.rs` for the flake this
+    /// closes. A pure accessor — reading it never blocks, proposes, or
+    /// wakes a quiesced group, mirroring [`voter_history`](Self::
+    /// voter_history)'s own contract.
+    pub fn membership_history(&self) -> Vec<(BTreeSet<NodeId>, BTreeSet<NodeId>)> {
+        self.lock().config_history()
     }
 
     /// The byte offset `peer` has acked so far in an in-flight chunked

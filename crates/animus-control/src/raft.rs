@@ -564,6 +564,28 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     // `snapshot_config`.
     snapshot_learners: Option<BTreeSet<NodeId>>,
 
+    // Every distinct `(config, learners)` pair this core has adopted, in
+    // adoption order (issue #944) — a small bounded ring, appended
+    // synchronously inside `apply_config`, the ONE place a real transition
+    // happens: both a leader's own local `propose`/`add_learner`/
+    // `promote_learner` call (synchronous, on whatever task calls it) and a
+    // follower's own per-entry `log_append` (looping over a batched
+    // `AppendEntries`'s entries) funnel through it. A caller sampling
+    // `config()`/`learners()` from OUTSIDE, on any cadence — even "once per
+    // consensus-loop iteration" — can coalesce two back-to-back transitions
+    // the same scheduling gap applies both of, silently skipping the
+    // intermediate; recording at the mutation site itself cannot. See
+    // `crates/animusd/tests/learner_reconfigure.rs`'s
+    // `spare_replacement_passes_through_an_observable_learner_state_and_keeps_serving`
+    // for the flake this closes, and `config_history`'s own accessor doc
+    // for the read side. Deliberately **not** seeded at fresh construction
+    // (`RaftCore::new` never calls `apply_config`, so a brand-new group's
+    // ring starts empty until its first real change) — a restart's
+    // recovery (`recovered`'s `recompute_config` call) seeds exactly one
+    // entry, the just-recovered state, mirroring `VoterHistory`'s own
+    // "restart starts fresh" discipline in `animus-cp-data`.
+    config_history: std::collections::VecDeque<(BTreeSet<NodeId>, BTreeSet<NodeId>)>,
+
     role: Role,
     current_term: u64,
     voted_for: Option<NodeId>,
@@ -1057,6 +1079,7 @@ where
             learners: BTreeSet::new(),
             initial_learners: BTreeSet::new(),
             snapshot_learners: None,
+            config_history: std::collections::VecDeque::new(),
             role: Role::Follower,
             current_term: 0,
             voted_for: None,
@@ -1704,6 +1727,15 @@ where
         self.learners.clone()
     }
 
+    /// Every distinct `(config, learners)` pair this core has adopted, in
+    /// adoption order (issue #944) — see [`config_history`](Self)'s own
+    /// field doc for the mechanism and why this exists. A pure accessor,
+    /// reading it never blocks or mutates anything.
+    #[must_use]
+    pub fn config_history(&self) -> Vec<(BTreeSet<NodeId>, BTreeSet<NodeId>)> {
+        self.config_history.iter().cloned().collect()
+    }
+
     /// `id`'s role in the active configuration, or `None` if it is not
     /// currently a member at all (ADR 0058 Train 1).
     #[must_use]
@@ -1747,8 +1779,19 @@ where
     fn apply_config(&mut self, voters: BTreeSet<NodeId>, learners: BTreeSet<NodeId>) {
         self.peers = voters.iter().filter(|n| **n != self.id).cloned().collect();
         self.cluster_size = voters.len();
+        let changed = self.config != voters || self.learners != learners;
         self.config = voters;
         self.learners = learners;
+        if changed {
+            // Issue #944: this IS the one real transition, recorded right
+            // where it happens — see `config_history`'s field doc.
+            const CONFIG_HISTORY_CAPACITY: usize = 64;
+            if self.config_history.len() >= CONFIG_HISTORY_CAPACITY {
+                self.config_history.pop_front();
+            }
+            self.config_history
+                .push_back((self.config.clone(), self.learners.clone()));
+        }
     }
 
     /// The voter config effective at log `index`: the latest config-bearing entry
