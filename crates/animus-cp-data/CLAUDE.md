@@ -387,21 +387,37 @@ straight into the voter set. `reconfigure_step` sequences an add as
 remove-the-old-replica**, still exactly **one single-server step per call**
 (ADR 0031 discipline unchanged — no new `HostAction`, `host::plan` is
 untouched; only what `reconfigure_step` proposes on a given call changed).
-Full priority order, most urgent first: (1) remove a `Down` extra **voter**
-(unchanged, failure repair); (2) drop a current **learner** no longer in
-`desired` — regardless of its liveness or catch-up progress, since it is
-stale by construction the moment placement retargets away from it (the
-fix for "a learner mid-catch-up that dies or is decommissioned must not
-wedge every later step" — the reconciler's job is only to not block on a
-target nobody wants any more; *re*-targeting `desired` is placement's job,
-untouched); (3) promote a learner that is both still desired and caught up
-(finish an in-flight move before starting a new one); (4) add a `desired`
-member missing from both `config` and `learners`, as a **learner**, never
-straight to voter; (5)/(6) — once every `desired` member is already a
-voter — the pre-Train-1 remove-healthy-extra/leader-self-removal-via-
-transfer steps, unchanged. A remove-only delta and a brand-new group's
-initial bootstrap (`host::plan_join_host`) are both untouched — this only
-changes the sequencing of an *add*. **Gotcha this shipped with**: the early
+Full priority order, most urgent first: (1) drop a current **learner** no
+longer in `desired` — regardless of its liveness or catch-up progress,
+since it is stale by construction the moment placement retargets away
+from it (the fix for "a learner mid-catch-up that dies or is
+decommissioned must not wedge every later step" — the reconciler's job is
+only to not block on a target nobody wants any more; *re*-targeting
+`desired` is placement's job, untouched); (2) promote a learner that is
+both still desired and caught up (finish an in-flight move before
+starting a new one); (3) add a `desired` member missing from both
+`config` and `learners`, as a **learner**, never straight to voter; (4)
+remove a `Down` extra **voter** (failure repair) — **since issue #920's
+fix (2026-09-16), ordered AFTER steps 1–3, not before**: removing a down
+voter fires immediately only once no `desired` member is still missing or
+mid-catch-up as a learner, i.e. only once any replacement is already
+safely a voter. Before the fix, this fired *first*, ahead of adding the
+replacement — sound only if "marked `Down`" means "permanently gone," but
+ADR 0012's failure detector (`DETECT_TIMEOUT`, 500ms) trips just as
+readily on a transient absence (a pod recreation with durable storage,
+issue #920's own production shape) as on a real failure, and removing the
+old voter early shrinks the live quorum requirement for the whole
+in-flight window with no way back if a *second* voter is then also lost
+mid-rolling-restart — see `reconfigure_step`'s own doc for the full
+before/after account and ADR 0048's 2026-09-16 amendment for the incident;
+(5)/(6) — once every `desired` member is already a voter — the pre-Train-1
+remove-healthy-extra/leader-self-removal-via-transfer steps, unchanged. A
+remove-only delta (no missing/mid-catch-up member) still removes a down
+extra on the very first tick that reaches step 4, exactly as before the
+reordering — steps 1–3 are no-ops when nothing is stale/promotable/missing,
+so the fix costs nothing in that case. A brand-new group's initial
+bootstrap (`host::plan_join_host`) is untouched — this only changes the
+sequencing of an *add-with-a-down-extra-to-remove*. **Gotcha this shipped with**: the early
 "already converged" return must check `current == desired &&
 learners.is_empty()`, not `current == desired` alone — a stray learner at
 that point is stale by construction (see step 2), and an early return

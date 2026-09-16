@@ -3646,6 +3646,30 @@ sweeper-skip regression
 (`write_after_leader_kill_of_a_quiesced_group_converges`) — the one
 property `SimEnv` structurally cannot prove.
 
+**Issue #920 (2026-09-16) — a rolling restart of every replica, quiescence
+investigated and ruled out.** `src/sim_cluster_quiesced_rolling_restart.rs`
+has two `SimCluster` scenarios: `quiesced_group_survives_rolling_restart_
+every_order` proves the plain mechanism this section documents already
+self-heals a clean rolling restart of a quiesced 3-replica group (crash +
+restart every replica, every order, durable per-tablet engine reused) —
+passes unmodified, converging in well under a second, since a restarted
+replica's `leader_id` resets to `None` (volatile) and its own ordinary
+election timeout campaigns unaided; quiescence's own wake machinery (fork
+B/H) was never the blocker. `quiesced_group_survives_rolling_restart_
+racing_failure_driven_repair_every_order` is the actual regression: it
+reproduces the production incident by racing the SAME rolling restart
+against the control plane's OWN failure-driven placement repair (ADR
+0012's `DETECT_TIMEOUT`, 500ms, trips on an ordinary pod recreation just
+as readily as a real failure) — fails deterministically on unmodified
+`main` (every order), fixed by reordering `animus-cp-data::RaftKvNode::
+reconfigure_step`'s down-voter-removal step to run after, not before, the
+add-a-replacement-first learner-phase steps (see that crate's `CLAUDE.md`
+and ADR 0048's 2026-09-16 amendment for the full mechanism). Both use the
+same `ANIMUS_QUIESCE_SEEDS` depth knob `animus-cp-data/tests/
+quiescence.rs` already defines — a new cell of that corpus, hosted here
+because it needs this crate's own `ClientCtx`/forwarding machinery, not a
+reason for a new `ANIMUS_*_SEEDS` variable.
+
 ## Heartbeat batching (ADR 0044 phase 2 — C-02 PR 2 shipped it off by
 default; PR 3, the cutover, flips the default ON — C-02 is now complete)
 
