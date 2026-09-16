@@ -17,7 +17,22 @@ membership and a placement policy, decide which nodes replicate a tablet.
   - `select_replicas(candidates, policy)` — fresh placement.
   - `replan(current, candidates, policy)` — recompute after a membership
     change, **keeping eligible survivors** so only failed/ineligible replicas
-    move (minimal data churn).
+    move (minimal data churn). All-or-nothing: `Err(InsufficientCandidates)`
+    the instant the eligible pool can't reach the full `replication_factor`,
+    even when a smaller improving move is possible.
+  - `replan_repair(current, candidates, policy)` — `replan`'s **growth-only
+    best-effort** sibling (issue #957): identical to `replan` except when
+    the eligible pool is smaller than `replication_factor` but still bigger
+    than the tablet's current eligible survivors, in which case it grows to
+    every eligible candidate instead of refusing outright — a policy whose
+    RF the cluster can't yet fully satisfy (e.g. RF 3 on a 2-node cluster)
+    still gets repaired as far as it genuinely can be. Never shrinks an
+    already-at-capacity set (that's still `replan`'s own plain, unmodified
+    answer) — a stale, currently-ineligible replica stays in place rather
+    than being dropped the moment there's nothing better to add it with.
+    This is `Metadata::reconcile`'s (`animus-control`) one production
+    caller; `replan` itself is still what the directed-Placing convergence
+    phase (ADR 0062 §2) and every other caller use unchanged.
   - `rebalance_step(tablets, candidates)` — one **load-rebalancing** move (ADR
     0029): the balance-driven counterpart of `replan`. Where `replan` only moves
     a replica *off* a failed/ineligible node, this moves a *healthy* replica from
@@ -40,8 +55,8 @@ membership and a placement policy, decide which nodes replicate a tablet.
   introduce a clock, RNG, or `HashMap` here.
 - It depends only on `animus-env` (`NodeId`), **not** on `animus-control` — the
   control plane depends on placement (now a *normal* dependency: `Metadata`
-  stores `PlacementPolicy` and `Metadata::reconcile` calls `replan`), so a
-  reverse dep would be a cycle. The control plane builds `Candidate`s from
+  stores `PlacementPolicy` and `Metadata::reconcile` calls `replan_repair`),
+  so a reverse dep would be a cycle. The control plane builds `Candidate`s from
   `Active` `Metadata` members and turns the result into a `CasTabletReplicas`.
   Sim integration tests: `animus-control/tests/placement_reconcile.rs`
   (caller-driven) and `placement_auto_reconcile.rs` (leader-driven, automatic).
@@ -66,7 +81,11 @@ membership and a placement policy, decide which nodes replicate a tablet.
 ## Tests
 
 `cargo test -p animus-placement` — residency, strict/best-effort spread, error
-cases, determinism, churn-minimizing `replan` (`tests/placement.rs`), and the
+cases, determinism, churn-minimizing `replan`, and `replan_repair`'s own
+growth-only-and-never-shrinks contract (issue #957: grows to every eligible
+candidate when RF can't be fully met, never touches an already-at-capacity
+set, matches plain `replan` whenever RF *is* satisfiable, and never empties
+a set when zero candidates are eligible) — `tests/placement.rs` — and the
 `rebalance_step` planner: noop-when-balanced, single most→least move, residency +
 strict/best-effort spread guards, at-most-one-move + repeated-application
 convergence, and input-permutation determinism (`tests/rebalance.rs`). The
