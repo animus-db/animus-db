@@ -1344,3 +1344,39 @@ Regression: `crates/animusd/tests/admin_endpoint.rs`'s
 `admin_live_is_200_while_a_genuinely_leaderless_admin_health_is_503` and
 `crates/animus-operator/src/desired/statefulset.rs`'s
 `probes_target_admin_health_and_admin_live_on_admin_port`.
+
+## Amendment (2026-09-16, issue #924) — half-open pooled connection to a
+recreated pod
+
+The S-07d config-hash rolling restart (this ADR's own amendment above)
+recreates pods on durable PVCs, each getting a **new IP** under its old
+stable DNS name. PR #909's `e2e-kind-webhook` run (35053634723, job
+104659100545) caught the recreated ordinal-1 stuck `PreCandidate` for
+minutes after it came back: every other voter's `/admin/raft` still
+believed it alive (its own outbound pre-vote requests were arriving
+fine), but it had received **zero** `AppendEntries` since restart — the
+leader's pooled connection to its *old* address was silently half-open,
+its writes each "succeeding" into the local kernel send buffer with
+nothing ever reaching the recreated pod, so `animus-env`'s reconnect-once
+path (issue #661) never triggered: no write ever *failed*, it just never
+arrived. Corroborated independently on PR #918's `e2e-kind-s3` leg (head
+4b0a84ea): after the same rolling recreation, exactly one voter
+(`e2e-1`) marked the recreated `e2e-2` `believes_alive: false` while
+every other node (including `e2e-2` itself) reported it alive — the
+per-connection timing dependence the mechanism predicts (whether that
+one node's old connection to `e2e-2` happened to get a FIN/RST during
+teardown), with `e2e-2`'s own tablet group correspondingly stuck at
+`commit_index: 0` with no leader.
+
+**Fix** (`animus-env`, ADR 0003's ProdEnv notes carry the full mechanism
+and platform account): every pooled outbound and accepted socket now
+carries TCP keepalive plus, on Linux, `TCP_USER_TIMEOUT`, bounding a
+silently-vanished peer's detection to **5 seconds** — comfortably below
+this operator's own rollout wait budgets (`scripts/e2e-kind.sh`'s
+`wait_for_progress` for the S-07d leg: a 120s stall window, 600s hard
+cap; this amendment's own original 300s `kubectl rollout status`
+timeout, superseded by `wait_for_progress` per the 2026-09-07/issue #705
+amendment above, was already far above this bound too). No change to
+`scripts/e2e-kind.sh` itself was needed or made — the existing wait
+already had ample room for a 5-second detection, and the bug was that
+detection could take 13–15 **minutes**, not that the wait was too short.
