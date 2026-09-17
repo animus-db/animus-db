@@ -914,6 +914,37 @@ of just waiting out a slow one. Measured on the e2e test's own 3-node
 cluster: the paced writer needed **zero** retries across every observed
 run — the fork/cutover transition was not visible to it at all.
 
+**Amendment (2026-09-17, issue #987 follow-up) — the reconciler itself no
+longer depends on this timing bound for correctness, only for latency.**
+This rung's own fix narrowed the window (fast 50ms polling + a 250ms
+settle delay before `CutoverSplit`) but did not close it: `host::plan`'s
+phase 1.5/`gather_facts` still keyed materialization purely on THIS
+tick's `MetadataView` still showing the parent's `inplace_split` intent —
+so a replica whose reconciler tick simply never lands inside that
+now-shortened window (paused, descheduled, or coalescing several
+metadata-watch wakes into one, per ADR 0003's own event-driven design)
+was handed a view that had already retired the parent and published both
+children as ordinary `Active` entries, and silently hosted them fresh
+through `HostAction::Host` instead of materializing from its own local
+fork — the exact "wrong (non-split) path... permanent, silent data loss"
+this rung's own paragraph above describes, just with the trigger being a
+missed reconciler tick rather than a too-eager `CutoverSplit`. Closed by
+teaching `gather_facts`/`plan` to derive "should this replica materialize
+a child" from `RaftKvNode::pending_split()` — a durable, permanent-once-
+true local fact, checked for every hosted tablet regardless of whether
+the CURRENT view still shows the parent or its intent — rather than from
+having *observed* the transient `Splitting` view (`crates/animus-cp-data/
+src/host.rs`'s phase 0.5, ADR 0058 Train 2 rung 3's original phase 1.5
+split into a materialize half that runs unconditionally and a propose
+half that still needs the intent visible). The `INPLACE_SPLIT_RECONCILE_
+INTERVAL`/`INPLACE_SPLIT_MATERIALIZE_SETTLE_MS` guards above are
+unaffected and still narrow the window in practice (a tighter window is
+still better for the eager-campaign/leader-election latency this ADR's
+own rung 4 cares about) — they are no longer, however, the only thing
+standing between a coalesced wake and silent data loss. See
+`crates/animus-cp-data/CLAUDE.md`'s "In-place split" section and
+`docs/lessons/code-patterns/` for the general lesson this closes.
+
 **Measurement note (2026-08-25) — the rung-8 bench, pointed at Train 2, on
 the same host as the copy-based number it's compared against.** Per this
 ADR's own Testing plan ("the bench that proved [the convergence-predicate

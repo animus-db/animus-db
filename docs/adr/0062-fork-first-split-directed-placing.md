@@ -484,7 +484,7 @@ sees a green "split complete" pill versus an amber "still placing" one.
   parent's range is cut*.
 - **The 50ms-cadence (`INPLACE_SPLIT_RECONCILE_INTERVAL`) and 250ms-settle
   (`INPLACE_SPLIT_MATERIALIZE_SETTLE_MS`) cutover guards** (ADR 0058's own
-  rung-3 as-built fix) are unaffected and remain load-bearing exactly as
+  rung-3 as-built fix) are unaffected and remain in place exactly as
   shipped. That fix closes a **materialize-vs-cutover race**: the
   in-place cutover driver (`inplace_split_driver_tick`) must not propose
   `CutoverSplit` before *every* fork participant's own reconciler has had
@@ -495,7 +495,15 @@ sees a green "split complete" pill versus an amber "still placing" one.
   replica set a child converges *toward*), never anything about *whether*
   or *when* `CutoverSplit` is safe to propose in the first place — the
   materialize-vs-cutover race is entirely a Stage 3/4 property this design
-  inherits unmodified.
+  inherits unmodified. **Amendment (2026-09-17, issue #987 follow-up):**
+  "load-bearing exactly as shipped" no longer describes these two guards
+  correctly — see ADR 0058's own matching amendment. `host::plan`'s
+  materialize decision is no longer gated on the CURRENT view still
+  showing the parent's intent at all (a replica whose tick missed even
+  this narrowed window used to silently take the wrong, non-split `Host`
+  path); these two guards now only narrow the window in practice
+  (latency), not correctness. Nothing about this ADR's own placement
+  reorder changes as a result.
 - **Companion decisions referenced, not decided, here** (separate
   ADR-adjacent follow-up work): a range-aware clone at the SSTable-clone
   step (ADR 0058's own open fork G2 — filtering an `InstallSnapshot`/clone

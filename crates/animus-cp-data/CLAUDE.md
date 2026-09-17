@@ -1427,20 +1427,60 @@ DynamoDB-wire and real-`LsmEngine` regressions this fix also carries.
 
 ### In-place split (ADR 0058 Train 2 rung 3; fork-first per ADR 0062)
 
-`plan`'s phase 1.5, between `Host` and `Reconfigure`: a tablet whose
-`Metadata` row carries `Tablet::inplace_split` (the control plane's
-`MetaCommand::BeginSplitInPlace`) takes this branch INSTEAD of the
-ordinary `Reconfigure` action for as long as the intent exists — the two
-must never both fire for the same tablet in the same tick (an ordinary
-reconfigure would see the fork's own children as a foreign membership
-change and try to interfere). **The Stage 1/2 learner-add-and-wait phase
-(ADR 0058 Train 2) is deleted (ADR 0062 rung 5)** — `HostAction::
-AddSplitLearner`, `INPLACE_SPLIT_LEARNER_CATCH_UP_THRESHOLD`, and the
-`TabletFacts::config`/`learners`/`learners_caught_up` fields that fed it
-are all gone, along with phase 1's "recruited via a child's own replicas"
-host-candidate branch and phase 3's matching release exclusion — both
-provably dead under the ADR 0062 rung 4 invariant (`SplitChild::replicas`
-IS the parent's own replicas at propose time, and a `Splitting` parent's
+**The invariant, since the issue #987 follow-up (2026-09-17): a local fork
+always materializes, independent of whether this tick's view still shows
+the parent.** `TabletFacts::pending_split` is gathered for EVERY hosted
+tablet, every tick, regardless of what `view` says about it
+(`gather_facts` used to gate the `RaftKvNode::pending_split()` call on the
+view still showing an `inplace_split` intent — removed, since
+`pending_split()` is a cheap point read, documented safe to call
+unconditionally, and the old gate was exactly the bug: it made
+`gather_facts` blind to a replica's own already-durable local fork the
+instant this tick's view moved past the transient `Splitting` state). This
+split the old single "phase 1.5" into two:
+
+- **Phase 0.5, BEFORE `Host`**: for every hosted tablet whose own
+  `pending_split` fact is `Some` (a local fork has already applied here,
+  whether or not the CURRENT view still shows the parent or its intent),
+  materialize any child not yet in `next.hosted`. Range/drop-range come
+  from the parent's own still-live `range` when the parent is present in
+  `view.tablets` (the ordinary in-flight-split window), or from each
+  child's own already-published `Active` entry once the parent has been
+  retired by `CutoverSplit` (the two are bit-identical by construction).
+  Running this BEFORE phase 1 is what makes phase 1's own
+  `!next.hosted.contains` gate correctly skip these child ids instead of
+  hosting either one fresh through an ordinary, empty-engine `Host` — the
+  defect this closed: a replica whose reconciler tick never lands inside
+  the sub-second fork→cutover window (ADR 0062 rung 5) used to be handed a
+  view that had already retired the parent and published both children as
+  ordinary `Active` entries, materialize never fired (gated on the
+  since-vanished intent), and phase 1 silently hosted both children with a
+  fresh, empty engine — silent per-replica data divergence, and, if the
+  skipped replica was the parent's own former leader, no replica ever
+  campaigns for either child (`campaign` is only ever set on this path),
+  leaving both stuck "forming" with no leader. See `host::plan`'s own
+  phase 0.5 doc comment for the full incident and the safety argument for
+  why every child `MaterializeSplitChild` can ever name is still provably
+  a member of `known` (the issue #722 `local_tablets` safety net).
+- **Phase 1.5, between `Host` and `Reconfigure`, propose-only now**: a
+  tablet whose `Metadata` row still carries `Tablet::inplace_split` (the
+  control plane's `MetaCommand::BeginSplitInPlace`) and whose own
+  `pending_split` fact is still `None` takes this branch INSTEAD of the
+  ordinary `Reconfigure` action — the two must never both fire for the
+  same tablet in the same tick (an ordinary reconfigure would see the
+  fork's own children as a foreign membership change and try to
+  interfere). Once `pending_split` turns `Some`, phase 0.5 above already
+  owns this tablet's materialization; this loop has nothing left to do
+  for it.
+
+**The Stage 1/2 learner-add-and-wait phase (ADR 0058 Train 2) is deleted
+(ADR 0062 rung 5)** — `HostAction::AddSplitLearner`,
+`INPLACE_SPLIT_LEARNER_CATCH_UP_THRESHOLD`, and the `TabletFacts::config`/
+`learners`/`learners_caught_up` fields that fed it are all gone, along
+with phase 1's "recruited via a child's own replicas" host-candidate
+branch and phase 3's matching release exclusion — both provably dead
+under the ADR 0062 rung 4 invariant (`SplitChild::replicas` IS the
+parent's own replicas at propose time, and a `Splitting` parent's
 `replicas` cannot change for the intent's whole lifetime —
 `reconcile_placement`/`rebalance_placement` both skip non-`Active`
 tablets — so nothing is ever named in a child's `replicas` that isn't
@@ -1697,17 +1737,25 @@ table.
 
 ### HostAction
 
-**Emitted in this fixed order: `Host` → (`ProposeSplitFork`/
-`MaterializeSplitChild`) → `Reconfigure` → `Release`/`Reclaim`.** The
-parenthesized pair (ADR 0058 Train 2 rung 3; `AddSplitLearner` deleted by
-ADR 0062 rung 5) is mutually exclusive with `Reconfigure` per tablet — see
-"In-place split" above. `Release`/`Reclaim` tear down a tablet moved off or
-dropped/retired, respectively. Tablets are split-only (ADR 0044) and
-ranges immutable (ADR 0050): the zero-copy `ProposeSeal`/`NarrowScope`
-actions were deleted in the rung-7 sweep, as merge's `WidenScope`/`Absorb`
-were by ADR 0044 — a hosted-but-now-absent tablet is unconditionally
-`Reclaim`ed; its two causes (dropped table, cutover-retired split parent)
-demand the identical action, so no disambiguation is needed.
+**Emitted in this fixed order: `MaterializeSplitChild` (phase 0.5) →
+`Host` → `ProposeSplitFork` (phase 1.5) → `Reconfigure` →
+`Release`/`Reclaim`.** (Since the issue #987 follow-up, 2026-09-17:
+`MaterializeSplitChild` moved ahead of `Host` — see "In-place split"
+above — so `next.hosted` already claims a locally-forked split's children
+before phase 1's own `Host` gate ever sees them, and so a split's own
+`Reclaim{parent}` — planned in the same tick whenever the parent has
+already left `view.tablets` — always executes AFTER the clone from the
+parent's still-open engine has completed, never before.)
+`ProposeSplitFork`/`MaterializeSplitChild` (ADR 0058 Train 2 rung 3;
+`AddSplitLearner` deleted by ADR 0062 rung 5) are mutually exclusive with
+`Reconfigure` per tablet — see "In-place split" above. `Release`/`Reclaim`
+tear down a tablet moved off or dropped/retired, respectively. Tablets are
+split-only (ADR 0044) and ranges immutable (ADR 0050): the zero-copy
+`ProposeSeal`/`NarrowScope` actions were deleted in the rung-7 sweep, as
+merge's `WidenScope`/`Absorb` were by ADR 0044 — a hosted-but-now-absent
+tablet is unconditionally `Reclaim`ed; its two causes (dropped table,
+cutover-retired split parent) demand the identical action, so no
+disambiguation is needed.
 
 - **`Reconciler` teardown** (`Release`/`Reclaim`) — **the reconciler
   group-driver-stop-timing fix**: unregister from routing *before* touching
