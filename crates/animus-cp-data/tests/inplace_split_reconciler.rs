@@ -1213,6 +1213,321 @@ fn scenario_crash_after_apply_loses_the_eager_wake_but_reconciler_fallback_recov
     });
 }
 
+/// **Regression for the reconciler-group-driver-timing defect (the
+/// "materialize split children from a local fork even after the parent left
+/// the metadata view" fix).** Unlike
+/// [`scenario_crash_between_fork_and_materialization`] (which restarts the
+/// skipped replica and hands it the SAME `Splitting` view all along), this
+/// scenario never gives the skipped replica (p2) the `Splitting` view AT
+/// ALL — its very first tick after the base (pre-split) view is the
+/// POST-CUTOVER one (parent retired, both children published `Active`),
+/// exactly the coalesced-metadata-watch-wake gap the fix closes: a
+/// sub-second fork→cutover window (ADR 0062 rung 5) a replica's own tick
+/// simply never lands inside.
+///
+/// **Pre-fix**: `gather_facts` only ever called `RaftKvNode::pending_split`
+/// when THIS tick's view still showed the parent's `inplace_split` intent,
+/// and `plan`'s old phase 1.5 only ever looked for a fork by iterating
+/// `view.tablets` for an entry carrying that intent — both false once the
+/// view shows the post-cutover shape, so p2 falls straight through to phase
+/// 1's ordinary `HostAction::Host` for both children: a fresh, EMPTY engine
+/// via `EngineFactory::open`, silently diverging from p0/p1 (which
+/// correctly cloned the parent's live engine during the window they DID
+/// observe). Asserted below: this fails pre-fix (p2's LEFT engine is
+/// missing the pre-fork write) and passes post-fix.
+fn scenario_skipped_reconciler_window_materializes_from_local_fork(seed: u64) {
+    run(seed, move |sim| async move {
+        let env = sim.env(driver_id());
+        let mut c = Cluster::new(sim.clone());
+        let (p0, p1, p2) = (n(40), n(41), n(42));
+        let parents = [p0.clone(), p1.clone(), p2.clone()];
+        for id in parents.iter().cloned() {
+            c.add_node(id);
+        }
+        let homes = vec![p0.clone(), p1.clone(), p2.clone()];
+        let base_view = view([parent_tablet(homes.clone(), None)]);
+        assert!(
+            converge(&mut c, &env, &parents, &base_view, |c| leader_of(
+                c, &parents, PARENT
+            )
+            .is_some())
+            .await,
+            "parent never elected (seed={seed})"
+        );
+        // Force leadership onto p0 — p2 (the replica this scenario strands
+        // outside the fork→cutover window) must be a plain follower here;
+        // the leader-skip shape is the sibling scenario below.
+        let mut on_p0 = c
+            .node(p0.clone())
+            .hosted_node(PARENT)
+            .is_some_and(|h| h.is_leader());
+        for _ in 0..150 {
+            if on_p0 {
+                break;
+            }
+            if let Some(leader) = leader_of(&c, &parents, PARENT) {
+                leader.transfer_leadership(p0.clone());
+            }
+            env.sleep(Duration::from_millis(100)).await;
+            on_p0 = c
+                .node(p0.clone())
+                .hosted_node(PARENT)
+                .is_some_and(|h| h.is_leader());
+        }
+        assert!(on_p0, "could not force leadership onto p0 (seed={seed})");
+        {
+            let leader = leader_of(&c, &parents, PARENT).expect("elected above");
+            match leader.put(b"left-key".to_vec(), b"lv".to_vec()) {
+                ProposeResult::Accepted { .. } => {}
+                other => panic!("pre-fork put rejected: {other:?} (seed={seed})"),
+            }
+        }
+        env.sleep(Duration::from_millis(300)).await;
+
+        let pending_view = view([splitting_parent(homes.clone())]);
+        // Drive ONLY p0/p1's reconcilers through the whole Splitting
+        // window — propose, the fork applies everywhere via ordinary Raft
+        // replication (independent of any reconciler tick), both correctly
+        // materialize LEFT/RIGHT from the parent's live engine. p2's
+        // reconciler is NEVER ticked against `pending_view` — that is the
+        // whole point of this scenario.
+        let drivers = [p0.clone(), p1.clone()];
+        assert!(
+            converge(&mut c, &env, &drivers, &pending_view, |c| {
+                drivers.iter().all(|id| {
+                    let hosted = c.hosted_set(id.clone());
+                    hosted.contains(&LEFT) && hosted.contains(&RIGHT)
+                })
+            })
+            .await,
+            "p0/p1 never materialized both children (seed={seed})"
+        );
+        // p2's own Raft group replicates+applies the fork with NO
+        // reconciler involvement at all — poll its raw accessor directly.
+        let mut p2_forked = false;
+        for _ in 0..100 {
+            if c.node(p2.clone())
+                .hosted_node(PARENT)
+                .is_some_and(|h| block_on(h.pending_split()).is_some())
+            {
+                p2_forked = true;
+                break;
+            }
+            env.sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            p2_forked,
+            "p2's own Raft log never replicated the fork (seed={seed})"
+        );
+        assert!(
+            !c.hosted_set(p2.clone()).contains(&LEFT),
+            "test fixture invariant: p2's reconciler must never have ticked past the fork \
+             (seed={seed})"
+        );
+
+        // The control plane cuts over: parent retired, both children
+        // published `Active` at their final (here: still the parent's own
+        // current) replicas. p2's reconciler's FIRST tick since the base
+        // view is THIS view — it never saw `pending_view` at all.
+        let cutover = cutover_view(homes.clone(), homes.clone());
+        let recovered = converge(&mut c, &env, &parents, &cutover, |c| {
+            let hosted = c.hosted_set(p2.clone());
+            hosted.contains(&LEFT) && hosted.contains(&RIGHT)
+        })
+        .await;
+        assert!(
+            recovered,
+            "p2 never hosted both children after being handed the post-cutover view directly \
+             (seed={seed})"
+        );
+
+        // The witness: p2's LEFT engine must hold the pre-fork write,
+        // proving it materialized from the parent's own live engine rather
+        // than hosting a fresh, empty one through ordinary `Host`.
+        let left_engine = c.storage(p2.clone(), LEFT);
+        assert!(
+            left_engine
+                .get(&physical(b"left-key"))
+                .await
+                .unwrap()
+                .is_some(),
+            "p2's LEFT child is missing the pre-fork write — it hosted a fresh, empty engine \
+             through ordinary Host instead of materializing from its own local fork (seed={seed})"
+        );
+    });
+}
+
+/// **Second variant of the same regression — the "stuck forming" shape.**
+/// When the SKIPPED replica is the parent's own Raft LEADER at the fork
+/// (rather than an ordinary follower, as above), the deterministic-
+/// first-leader `campaign` flag (ADR 0058 Train 2 rung 4) is only ever
+/// computed on the materialize path — a replica that instead falls through
+/// to ordinary `Host` never campaigns eagerly for either child, and (this
+/// being the ONLY replica that was ever the parent's leader) neither does
+/// anyone else.
+///
+/// **Empirically confirmed pre-fix outcome (both this scenario's own runs,
+/// see the fix's PR description)**: in THIS harness's fast, fault-free
+/// `SimEnv` timing, both children still elect a leader and serve a read
+/// even pre-fix — ordinary `Host` still bootstraps a fresh, full-voter
+/// config at `Epoch::INITIAL` (`plan_join_host`), so the ordinary
+/// randomized-timeout Raft election path alone is enough to elect *someone*
+/// within this scenario's bounded budget; the eager `campaign` flag only
+/// shaves off that cold-election delay, which the production incident
+/// report's "stuck forming" language describes as it plays out over real
+/// wall-clock time with real network latency and contention from every
+/// other tablet's own election traffic, not as a mathematical permanent
+/// deadlock this synthetic harness can reproduce directly. **What pre-fix
+/// code CANNOT do here, and what this scenario actually regression-tests,
+/// is materialize p2's LEFT child with the correct data** (the identical
+/// data-divergence defect the sibling scenario proves) — asserted below,
+/// red pre-fix / green post-fix, immediately before the election/read
+/// checks. On the fixed code, p2 never lost the parent's own leadership
+/// (nothing here disturbs it), so once its reconciler finally ticks —
+/// against the post-cutover view directly — it materializes both children
+/// with `campaign: true`, and both elect a leader and serve a read within a
+/// bounded sim time, exactly as claimed.
+fn scenario_skipped_leader_window_still_elects_and_serves(seed: u64) {
+    run(seed, move |sim| async move {
+        let env = sim.env(driver_id());
+        let mut c = Cluster::new(sim.clone());
+        let (p0, p1, p2) = (n(50), n(51), n(52));
+        let parents = [p0.clone(), p1.clone(), p2.clone()];
+        for id in parents.iter().cloned() {
+            c.add_node(id);
+        }
+        let homes = vec![p0.clone(), p1.clone(), p2.clone()];
+        let base_view = view([parent_tablet(homes.clone(), None)]);
+        assert!(
+            converge(&mut c, &env, &parents, &base_view, |c| leader_of(
+                c, &parents, PARENT
+            )
+            .is_some())
+            .await,
+            "parent never elected (seed={seed})"
+        );
+        // Force leadership onto p2 this time — it is p2 we strand outside
+        // the fork→cutover window.
+        let mut on_p2 = c
+            .node(p2.clone())
+            .hosted_node(PARENT)
+            .is_some_and(|h| h.is_leader());
+        for _ in 0..150 {
+            if on_p2 {
+                break;
+            }
+            if let Some(leader) = leader_of(&c, &parents, PARENT) {
+                leader.transfer_leadership(p2.clone());
+            }
+            env.sleep(Duration::from_millis(100)).await;
+            on_p2 = c
+                .node(p2.clone())
+                .hosted_node(PARENT)
+                .is_some_and(|h| h.is_leader());
+        }
+        assert!(on_p2, "could not force leadership onto p2 (seed={seed})");
+        {
+            let leader = leader_of(&c, &parents, PARENT).expect("elected above");
+            match leader.put(b"left-key".to_vec(), b"lv".to_vec()) {
+                ProposeResult::Accepted { .. } => {}
+                other => panic!("pre-fork put rejected: {other:?} (seed={seed})"),
+            }
+        }
+        env.sleep(Duration::from_millis(300)).await;
+
+        let pending_view = view([splitting_parent(homes.clone())]);
+        // p2 (the leader) ticks EXACTLY ONCE against `pending_view` — just
+        // enough for phase 1.5 to propose the fork — and is never ticked
+        // again until the post-cutover view, below. p0/p1 tick normally
+        // throughout and materialize both children themselves, each with
+        // `campaign: false` (neither of them was ever the parent's
+        // leader).
+        c.tick(p2.clone(), &pending_view).await;
+        let drivers = [p0.clone(), p1.clone()];
+        assert!(
+            converge(&mut c, &env, &drivers, &pending_view, |c| {
+                drivers.iter().all(|id| {
+                    let hosted = c.hosted_set(id.clone());
+                    hosted.contains(&LEFT) && hosted.contains(&RIGHT)
+                })
+            })
+            .await,
+            "p0/p1 never materialized both children (seed={seed})"
+        );
+        assert!(
+            !c.hosted_set(p2.clone()).contains(&LEFT),
+            "test fixture invariant: p2's reconciler must never tick again before cutover \
+             (seed={seed})"
+        );
+        assert!(
+            c.node(p2.clone())
+                .hosted_node(PARENT)
+                .is_some_and(|h| h.is_leader()),
+            "test fixture invariant: p2 must still lead the (locally still-hosted) parent \
+             (seed={seed})"
+        );
+
+        let cutover = cutover_view(homes.clone(), homes.clone());
+        let recovered = converge(&mut c, &env, &parents, &cutover, |c| {
+            let hosted = c.hosted_set(p2.clone());
+            hosted.contains(&LEFT) && hosted.contains(&RIGHT)
+        })
+        .await;
+        assert!(
+            recovered,
+            "p2 never hosted both children after being handed the post-cutover view directly \
+             (seed={seed})"
+        );
+
+        // The same data-divergence witness as the sibling scenario: p2's
+        // LEFT engine must hold the pre-fork write, proving it
+        // materialized from the parent's own live engine rather than
+        // hosting a fresh, empty one through ordinary `Host` — this is
+        // what actually distinguishes pre-fix from post-fix here (both
+        // happen to still elect a leader in THIS harness's own fast,
+        // fault-free `SimEnv` timing even pre-fix, since ordinary `Host`
+        // still bootstraps a fresh full-voter config at `Epoch::INITIAL` —
+        // the eager `campaign` flag only shaves off the cold-election
+        // delay; the missing data is the load-bearing defect).
+        let left_engine = c.storage(p2.clone(), LEFT);
+        assert!(
+            left_engine
+                .get(&physical(b"left-key"))
+                .await
+                .unwrap()
+                .is_some(),
+            "p2's LEFT child is missing the pre-fork write — it hosted a fresh, empty engine \
+             through ordinary Host instead of materializing from its own local fork (seed={seed})"
+        );
+
+        // Both children must still elect a leader and serve a read within a
+        // bounded sim time — the "stuck forming" symptom this fix closes.
+        for tablet in [LEFT, RIGHT] {
+            let elected = converge(&mut c, &env, &parents, &cutover, |c| {
+                leader_of(c, &parents, tablet).is_some()
+            })
+            .await;
+            assert!(
+                elected,
+                "child {tablet:?} never elected a leader within the bounded budget (seed={seed})"
+            );
+            let leader = leader_of(&c, &parents, tablet).expect("elected above");
+            let mut served = false;
+            for _ in 0..50 {
+                if leader.linearizable_get_served(b"left-key").await.is_some() {
+                    served = true;
+                    break;
+                }
+                env.sleep(Duration::from_millis(50)).await;
+            }
+            assert!(
+                served,
+                "child {tablet:?}'s leader never served a linearizable read (seed={seed})"
+            );
+        }
+    });
+}
+
 // ---------------------------------------------------------------------------
 // The frozen corpus.
 // ---------------------------------------------------------------------------
@@ -1272,6 +1587,14 @@ fn scenario_cells() -> Vec<Scenario> {
         scenario!(
             "crash_after_apply_loses_the_eager_wake_but_reconciler_fallback_recovers",
             scenario_crash_after_apply_loses_the_eager_wake_but_reconciler_fallback_recovers
+        ),
+        scenario!(
+            "skipped_reconciler_window_materializes_from_local_fork",
+            scenario_skipped_reconciler_window_materializes_from_local_fork
+        ),
+        scenario!(
+            "skipped_leader_window_still_elects_and_serves",
+            scenario_skipped_leader_window_still_elects_and_serves
         ),
     ]
 }

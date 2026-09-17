@@ -555,8 +555,22 @@ pub enum HostAction {
     /// own final `replicas` — see `materialize_split_child`'s doc for why
     /// every fork participant hosts both children initially, trimmed to
     /// final placement by the ordinary post-cutover `Reconfigure`).
+    ///
+    /// **Independent of whether this tick's `view` still shows `parent`'s
+    /// `inplace_split` intent, or even `parent` itself (issue #987
+    /// follow-up)** — decided purely from this replica's own durable
+    /// `pending_split()` fact (`plan`'s phase 0.5). The control plane may
+    /// have already retired `parent` and published both children as
+    /// ordinary `Active` entries by the time this fires; a local fork is a
+    /// permanent fact about this replica regardless of what the CURRENT
+    /// view says, and a materialization must never be skipped just because
+    /// this tick's view arrived after cutover instead of during it — see
+    /// `plan`'s phase 0.5 doc for the full incident this closes.
     MaterializeSplitChild {
-        /// The (still-hosted, not-yet-retired) parent tablet.
+        /// The parent tablet — still locally hosted by this replica at the
+        /// moment this action is planned (its own engine is what gets
+        /// cloned), though the control plane's own `view.tablets` may
+        /// already show it retired if this tick landed after cutover.
         parent: TabletId,
         /// The child to materialize.
         child: SplitChild,
@@ -627,19 +641,25 @@ pub enum HostAction {
 /// an engine only ever exists locally for a tablet id this exact node has
 /// itself, at some prior tick, observed as real — [`HostAction::Host`] and
 /// [`HostAction::MaterializeSplitChild`] are the only two actions that ever
-/// create one, and both are emitted only in reaction to observing the
-/// tablet in `view.tablets` (an ordinary entry for `Host`; one of the two
-/// `children` named on its PARENT's own `inplace_split` intent — itself a
-/// `view.tablets` field — for `MaterializeSplitChild`, which is why a
-/// pre-cutover split child, materialized before it has its OWN
-/// `view.tablets` entry, must never be misread as an orphan: `known` below
-/// names it via its parent's intent instead). Tablet ids are never reused
-/// (ADR 0022/0050), so a locally-present id absent from `known` is either a
-/// dropped table's leftover engine (reclaim it) or — structurally
-/// impossible by the argument above — nothing else: it can never be "a
-/// tablet that merely hasn't appeared in `Metadata` yet," since nothing on
-/// this node ever creates an engine before first observing the tablet
-/// itself.
+/// create one. `Host` fires only in reaction to observing the tablet as an
+/// ordinary `view.tablets` entry. `MaterializeSplitChild` fires in reaction
+/// to this replica's OWN durable local fork fact
+/// (`TabletFacts::pending_split`, checked independently of whatever this
+/// tick's `view` says about the parent — see the fix note on `plan`'s own
+/// materialize pass below) — but every child it can ever name is still
+/// provably a member of `known`: either the parent's own `inplace_split`
+/// intent still names it (the pre-cutover window, before the child has any
+/// `view.tablets` entry of its own — `known` chains in a live intent's
+/// `children` for exactly this reason) or the child has ALREADY been
+/// published as its own ordinary `Active` `view.tablets` entry (the
+/// post-cutover window this fix closes — `known`'s plain `view.tablets.
+/// keys()` half already covers it, no separate chaining needed). Tablet ids
+/// are never reused (ADR 0022/0050), so a locally-present id absent from
+/// `known` is either a dropped table's leftover engine (reclaim it) or —
+/// structurally impossible by the argument above — nothing else: it can
+/// never be "a tablet that merely hasn't appeared in `Metadata` yet," since
+/// nothing on this node ever creates an engine before first observing the
+/// tablet itself (directly, or via its parent's own intent).
 #[must_use]
 pub fn plan(
     view: &MetadataView,
@@ -659,9 +679,105 @@ pub fn plan(
     next.split_forming
         .retain(|child| !view.tablets.contains_key(child));
 
+    // --- Phase 0.5: materialize any in-place split child THIS REPLICA has
+    // already forked locally (ADR 0058 Train 2 rung 3, Stage 3; ADR 0062
+    // rung 5) — independent of whether this tick's `view` still shows the
+    // parent's `inplace_split` intent at all, and run BEFORE phase 1.
+    //
+    // **The defect this closes (issue #987 follow-up)**: the fork→cutover
+    // window is sub-second (ADR 0062 rung 5), and the per-node reconciler
+    // coalesces metadata-watch wakes into one tick — a replica whose own
+    // tick doesn't land inside that window can be handed a view that has
+    // ALREADY retired the parent and published both children as ordinary
+    // `Active` entries, having never itself observed the intermediate
+    // `Splitting` view at all. `TabletFacts::pending_split` is this node's
+    // own durable fact (`RaftKvNode::pending_split`, gathered for EVERY
+    // hosted tablet regardless of what `view` shows — see `gather_facts`)
+    // and is exactly as true post-cutover as it was during the split: a
+    // tablet forks at most once, the marker never expires, and it says
+    // nothing about the CURRENT view. Deciding "materialize the two
+    // children" from this fact, not from having *observed* the transient
+    // `Splitting` view, is what makes this phase run unconditionally: if it
+    // ran ONLY when `view` still showed the intent (the pre-fix gate,
+    // mirrored in `gather_facts` too), a replica that skipped the window
+    // would fall straight through to phase 1's ordinary `Host` for both
+    // children — a fresh, EMPTY engine via `EngineFactory::open`, silently
+    // diverging from every replica that materialized correctly, and — since
+    // the deterministic-first-leader `campaign` flag only exists on THIS
+    // path — if the skipped replica was the parent's own leader, no replica
+    // campaigns for either child and both sit leaderless ("stuck forming").
+    //
+    // Runs before phase 1 so `next.hosted`, updated below, is already
+    // current by the time phase 1's own `!next.hosted.contains` gate sees
+    // either child id — phase 1 must never independently host one of these.
+    for (&tablet, fact) in facts {
+        let Some(pending) = fact.pending_split.as_ref().filter(|_| fact.hosted) else {
+            continue;
+        };
+        let [left, right] = &pending.children;
+
+        // Each child's own range, and its sibling's drop range (what a
+        // fresh clone of the parent's full data must drop from this
+        // child's own copy). Two sources, tried in order:
+        // - The parent's own still-live declared range, when the parent is
+        //   still a `view.tablets` entry (the ordinary in-flight-split
+        //   window this used to be the ONLY source for).
+        // - Each child's own already-published `Active` range, once the
+        //   parent has been retired by `CutoverSplit` (the post-cutover
+        //   window this fix adds). The two sources are bit-identical by
+        //   construction — `CutoverSplit` publishes each child's `range` as
+        //   exactly `parent.range.split_at(split_key)` — so whichever is
+        //   available yields the same answer.
+        let ranges = if let Some(parent_t) = view.tablets.get(&tablet) {
+            parent_t.range.split_at(&pending.split_key)
+        } else {
+            match (view.tablets.get(&left.id), view.tablets.get(&right.id)) {
+                (Some(l), Some(r)) => Some((l.range.clone(), r.range.clone())),
+                // Neither the parent nor both children are visible in THIS
+                // tick's view yet — a genuinely stale/lagging metadata pull
+                // on this replica (cutover has committed control-plane-side
+                // but hasn't reached this replica's own view). Nothing to
+                // do this tick; the next tick, once a fresher view names
+                // one side or the other, retries. This is "today's
+                // behaviour" for a parent-absent tick: before this fix,
+                // this phase never ran at all when the parent was absent.
+                _ => None,
+            }
+        };
+        let Some((left_range, right_range)) = ranges else {
+            continue;
+        };
+
+        for (child, range, drop_range) in [
+            (left, left_range.clone(), right_range.clone()),
+            (right, right_range, left_range),
+        ] {
+            if next.hosted.contains(&child.id) {
+                continue;
+            }
+            actions.push(HostAction::MaterializeSplitChild {
+                parent: tablet,
+                child: child.clone(),
+                range,
+                drop_range,
+                bootstrap_voters: pending.bootstrap_voters.clone(),
+                // ADR 0058 Train 2 rung 4: purely local — `fact.is_leader`
+                // is this same tick's already-gathered fact for the
+                // PARENT tablet (`tablet`, not `child.id`), so this is
+                // "was I the parent's leader just now," never a fact
+                // about either child (which doesn't exist yet).
+                campaign: fact.is_leader,
+            });
+            next.hosted.insert(child.id);
+            next.split_forming.insert(child.id);
+        }
+    }
+
     // --- Phase 1: host a newly-placed tablet (a tablet's declared range is
     // immutable, ADR 0050 rung 2 — there is no scope to adjust on an
-    // already-hosted one).
+    // already-hosted one). Phase 0.5 above has already claimed both of any
+    // locally-forked split's children into `next.hosted`, so this loop can
+    // never independently (re)host one of them fresh.
     let mut to_host = Vec::new();
     for (&tablet, t) in &view.tablets {
         if next.hosted.contains(&tablet) {
@@ -681,14 +797,14 @@ pub fn plan(
         next.hosted.insert(tablet);
     }
 
-    // --- Phase 1.5: advance an in-place split intent this node is hosting
-    // the parent of (ADR 0058 Train 2 rung 3, Stage 3/materialization; ADR
-    // 0062 rung 5). A tablet with `inplace_split.is_some()` takes THIS
-    // branch instead of phase 2's ordinary `Reconfigure` for the duration of
-    // the split (the fork itself, plus each participant's own
-    // materialization — both settle within a tick or two, so the exclusion
-    // window is short-lived, not the multi-tick learner-catch-up window this
-    // phase used to gate on).
+    // --- Phase 1.5: propose an in-place split fork for an intent this node
+    // is hosting the parent of but has not yet forked locally (ADR 0058
+    // Train 2 rung 3, Stage 1; ADR 0062 rung 5) — mirroring phase 2's own
+    // `Reconfigure` "planned every tick this node leads the group"
+    // convention. A tablet with `inplace_split.is_some()` takes THIS branch
+    // instead of phase 2's ordinary `Reconfigure` for the duration of the
+    // split. Materializing an ALREADY-forked intent is phase 0.5's job,
+    // above — this loop only ever proposes the fork itself.
     for (&tablet, t) in &view.tablets {
         let Some(intent) = &t.inplace_split else {
             continue;
@@ -696,52 +812,17 @@ pub fn plan(
         let Some(fact) = facts.get(&tablet).filter(|f| f.hosted) else {
             continue;
         };
-        let [left, right] = &intent.children;
-
-        if let Some(pending) = &fact.pending_split {
-            // Stage 3 already forked HERE — materialize any of the two
-            // children not yet hosted on this node. Emitted for BOTH
-            // children on EVERY fork participant (see
-            // `HostAction::MaterializeSplitChild`'s own doc for why —
-            // the post-cutover trim to final placement is what narrows each
-            // child back to its own final placement, not this gate).
-            let Some((left_range, right_range)) = t.range.split_at(&pending.split_key) else {
-                // Structurally unreachable (the control plane validated this
-                // exact split at `BeginSplitInPlace` time) — nothing to do
-                // rather than a panic in a pure planning function.
-                continue;
-            };
-            for (child, range, drop_range) in [
-                (left, left_range.clone(), right_range.clone()),
-                (right, right_range, left_range),
-            ] {
-                if next.hosted.contains(&child.id) {
-                    continue;
-                }
-                actions.push(HostAction::MaterializeSplitChild {
-                    parent: tablet,
-                    child: child.clone(),
-                    range,
-                    drop_range,
-                    bootstrap_voters: pending.bootstrap_voters.clone(),
-                    // ADR 0058 Train 2 rung 4: purely local — `fact.is_leader`
-                    // is this same tick's already-gathered fact for the
-                    // PARENT tablet (`tablet`, not `child.id`), so this is
-                    // "was I the parent's leader just now," never a fact
-                    // about either child (which doesn't exist yet).
-                    campaign: fact.is_leader,
-                });
-                next.hosted.insert(child.id);
-                next.split_forming.insert(child.id);
-            }
+        if fact.pending_split.is_some() {
+            // Already forked here — phase 0.5 already planned (or already
+            // completed) this tablet's materialization. Nothing left for
+            // this loop.
             continue;
         }
 
         // Not forked here yet — propose immediately (ADR 0062 rung 5: no
         // learner-catch-up gate; every replica named in the intent's
         // children already hosts the parent as an ordinary voter, so there
-        // is nothing to recruit or wait on). Leader-only, mirroring phase
-        // 2's own `Reconfigure` convention (a non-leader's
+        // is nothing to recruit or wait on). Leader-only (a non-leader's
         // `propose_split_tablet` call would harmlessly no-op anyway, but
         // emitting only on the leader keeps this phase's actions as
         // churn-free as `Reconfigure`'s).
@@ -1410,19 +1491,26 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
         for (&tablet, node) in &self.hosted {
             let scope_range = node.scope_range();
             let config_excludes_me = !node.config().contains(&self.base_id);
-            // ADR 0062 rung 5: `pending_split()` is only ever consulted for
-            // a tablet the control plane currently shows an in-place split
-            // intent for — gated here so an ordinary tablet's tick pays no
-            // extra engine read.
-            let pending_split = if view
-                .tablets
-                .get(&tablet)
-                .is_some_and(|t| t.inplace_split.is_some())
-            {
-                node.pending_split().await
-            } else {
-                None
-            };
+            // Issue #987 follow-up: consulted for EVERY hosted tablet,
+            // never gated on whether THIS tick's `view` still shows an
+            // `inplace_split` intent. The old gate (only call
+            // `pending_split()` when the view names an in-flight split)
+            // assumed the view and this replica's own local fork state
+            // stay in lockstep — false the instant this replica's
+            // reconciler tick lands outside the sub-second fork→cutover
+            // window (ADR 0062 rung 5) and is handed a view that has
+            // ALREADY retired the parent and published both children as
+            // ordinary `Active` entries: the gate then never asked, so
+            // `plan`'s phase 0.5 never saw this replica's own already-
+            // durable fork and phase 1 hosted both children fresh with an
+            // empty engine instead of materializing them from the parent's
+            // — see `plan`'s own phase 0.5 doc for the full incident.
+            // `pending_split()`'s own doc already states this point read is
+            // "cheap (no scan ...) and safe to call every reconciler tick
+            // on every hosted tablet, forked or not" — this fixes
+            // `gather_facts` to actually match that documented contract
+            // instead of second-guessing it with a view-shaped gate.
+            let pending_split = node.pending_split().await;
             facts.insert(
                 tablet,
                 TabletFacts {
@@ -1680,11 +1768,30 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
             // re-open the same on-disk prefix a second time (see
             // `EngineFactory::clone_engine`'s own doc for why that would be
             // unsafe for `LsmEngine`).
+            // If `parent`'s own engine is already gone by the time this
+            // runs (its `Reclaim` teardown — planned in the SAME `plan`
+            // call, per phase 0.5's own doc — somehow already executed
+            // first, or a genuinely corrupt/unopenable parent engine),
+            // there is nothing left to clone from. `release_unconfirmed_
+            // host`/`split_forming.remove` below undo `plan`'s optimistic
+            // claim (mirroring every other failure branch in this
+            // function), so the NEXT `plan` call sees `child.id` neither in
+            // `next.hosted` nor named by a still-hosted parent's
+            // `pending_split` fact (the parent, if truly torn down, no
+            // longer produces a fact at all) — it therefore falls through
+            // to phase 1's ORDINARY `Host`, which hosts the child fresh
+            // with an empty engine and lets it catch up via `InstallSnapshot`
+            // from a peer that materialized correctly. This is the correct
+            // fallback, not a data-loss path: `Host`'s own `initial_
+            // formation`/needs-snapshot machinery is exactly what recovers
+            // a legitimately-behind replica in every other case. Retrying
+            // the same failing clone forever would be strictly worse.
             let Some(parent_engine) = self.ensure_engine(parent).await else {
                 tracing::warn!(
                     child = child.id.0,
                     parent = parent.0,
-                    "reconciler: parent engine unavailable while materializing a split child"
+                    "reconciler: parent engine unavailable while materializing a split child — \
+                     falling back to an ordinary fresh Host next tick rather than retrying"
                 );
                 self.state.release_unconfirmed_host(child.id);
                 self.state.split_forming.remove(&child.id);
