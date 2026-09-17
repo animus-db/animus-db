@@ -343,7 +343,7 @@ fn snapshot_catchup_reseeds_hot_change_max() {
     // Ground truth, taken from the leader BEFORE the follower's restart —
     // every one of `N` writes minted exactly one change record, so this is
     // never empty.
-    let expected_max = block_on(nodes[l].pending_changes())
+    let expected_max = block_on(nodes[l].pending_changes_key_order())
         .iter()
         .filter_map(|(k, _)| decode_change_suffix(k))
         .max()
