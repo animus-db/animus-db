@@ -1709,16 +1709,37 @@ were by ADR 0044 — a hosted-but-now-absent tablet is unconditionally
 `Reclaim`ed; its two causes (dropped table, cutover-retired split parent)
 demand the identical action, so no disambiguation is needed.
 
-- **`Reconciler` teardown** (`Release`/`Reclaim`): unregister from routing
-  *before* touching the driver, `shutdown()`, poll `is_stopped()` bounded
-  by `RECLAIM_STOP_TIMEOUT` (10s), re-register and leave `LocalState`
-  untouched on timeout (so `plan` re-emits the same action next tick), else
-  delete the tablet's engine files + WAL, and only then
-  `confirm_torn_down`. (Merge's `Absorb` teardown — which
-  skipped the narrow/`erase_scope()` and drained the committed log before
-  halting, since the absorbed data was about to be served elsewhere — was
-  removed along with `TeardownKind::Absorb`; see the Key invariants entry
-  above for what remains of that mechanism's lesson.)
+- **`Reconciler` teardown** (`Release`/`Reclaim`) — **the reconciler
+  group-driver-stop-timing fix**: unregister from routing *before* touching
+  the driver, `shutdown()`, then poll `is_stopped()` bounded by a much
+  shorter `RECLAIM_STOP_GRACE` (~500ms — the common case: one persist round
+  plus one apply pass). If the driver hasn't stopped by then, **park** the
+  halted handle in a new `stopping` side map and return — never
+  re-registered via `on_host` (a halted driver can never serve again) and
+  `LocalState` left untouched, so `plan` keeps re-emitting the identical
+  action every tick, which `teardown` now recognizes as a no-op for an
+  already-parked tablet rather than re-running the zombie-claim path
+  against a live-if-halted driver. `Reconciler::sweep_stopping`, run once
+  at the very start of every `tick()` (before `plan`), finishes a parked
+  teardown once `is_stopped()` actually goes true (delete the tablet's
+  engine files + WAL, then `confirm_torn_down`) and — only once a parked
+  teardown has sat past the full `RECLAIM_STOP_TIMEOUT` (10s, now purely an
+  observability threshold, checked by the sweep rather than awaited inline)
+  — logs the existing "group driver did not stop in time" warning once and
+  bumps `Metric::CpReconcilerStopTimeout`. **Why this had to change**: the
+  old inline wait ran *serially inside `tick()`*, so a genuinely slow
+  driver (a real backlog under the apply task's own per-*pass*, not
+  per-*entry*, `halted` check — since fixed in `apply_and_compact`, see
+  `lib.rs`'s own effects-loop comment) blocked that tick's every OTHER
+  planned action — hosting a split child, a `Reconfigure`, a
+  `ProposeSplitFork` — for up to the full old timeout, repeated every tick
+  since a timed-out teardown was never confirmed. Halting the driver and
+  parking it decouples one slow stop from every other tablet this node
+  hosts. (Merge's `Absorb` teardown — which skipped the narrow/
+  `erase_scope()` and drained the committed log before halting, since the
+  absorbed data was about to be served elsewhere — was removed along with
+  `TeardownKind::Absorb`; see the Key invariants entry above for what
+  remains of that mechanism's lesson.)
 
 ## What's non-obvious
 
