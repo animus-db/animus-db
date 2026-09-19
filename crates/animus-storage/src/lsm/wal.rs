@@ -108,6 +108,15 @@ struct Inner {
     /// Set when a leader's batch `append`/`sync` failed: every writer whose record
     /// was in that lost batch must surface the failure rather than claim durability.
     failed_through: u64,
+    /// The leader's own `flush_batch` error text for the *first* failure
+    /// (`failed_through`'s companion) — kept so every waiter riding that lost
+    /// batch, not only the leader, can see what actually failed on disk instead
+    /// of a generic "sync failed" message. Never overwritten by a later failure:
+    /// the first failure is what every already-parked waiter is surfacing, and a
+    /// second, unrelated failure on a later batch gets its own `failed_through`
+    /// bump but does not need its own text (the generic prefix already names the
+    /// batch as failed; the point of this field is the *first* underlying cause).
+    failed_error: Option<String>,
     /// The segment number currently being appended to.
     active_seg: u64,
     /// Bytes the leader has appended to the active segment so far (drives
@@ -156,6 +165,7 @@ impl GroupCommit {
                 flushing: false,
                 waiters: BTreeMap::new(),
                 failed_through: 0,
+                failed_error: None,
                 active_seg,
                 active_seg_bytes: 0,
                 sealed,
@@ -285,7 +295,16 @@ impl GroupCommit {
             match action {
                 Action::Done => return Ok(()),
                 Action::Failed => {
-                    return Err(StorageError::Backend("wal group-commit sync failed".into()));
+                    let leader_err = {
+                        let inner = self.lock();
+                        inner
+                            .failed_error
+                            .clone()
+                            .unwrap_or_else(|| "unknown error".to_string())
+                    };
+                    return Err(StorageError::Backend(format!(
+                        "wal group-commit sync failed: {leader_err}"
+                    )));
                 }
                 Action::Wait => {
                     DurableUpTo {
@@ -297,6 +316,7 @@ impl GroupCommit {
                 Action::Lead { batch, up_to, seg } => {
                     // Perform the single batched append + sync, lock-free, to the
                     // chosen segment file.
+                    let batch_len = batch.len();
                     let res = self.flush_batch(env, seg, &batch).await;
                     let woken = {
                         let mut inner = self.lock();
@@ -307,8 +327,23 @@ impl GroupCommit {
                             // point is durable, and the claimed records are gone from
                             // `pending`. Mark the whole lost batch failed so every
                             // writer it carried surfaces the error rather than waiting
-                            // forever or falsely claiming durability.
-                            Err(_) => inner.failed_through = inner.failed_through.max(up_to),
+                            // forever or falsely claiming durability. Keep the
+                            // *first* failure's text (see `failed_error`'s own doc) and
+                            // log it once here, at the leader, with the detail a waiter
+                            // has no way to reconstruct on its own.
+                            Err(e) => {
+                                inner.failed_through = inner.failed_through.max(up_to);
+                                if inner.failed_error.is_none() {
+                                    inner.failed_error = Some(e.to_string());
+                                }
+                                tracing::error!(
+                                    segment = seg,
+                                    batch_bytes = batch_len,
+                                    up_to,
+                                    error = %e,
+                                    "wal group-commit sync failed"
+                                );
+                            }
                         }
                         // Wake **all** parked writers, not only the ones this batch
                         // made durable: a writer whose record arrived *after* we
