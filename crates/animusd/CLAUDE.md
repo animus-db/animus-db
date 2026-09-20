@@ -106,7 +106,16 @@ same-address restart (`gsi_drain_cursor_tests::
 crash_mid_reconcile_recovers_without_skipping_or_corrupting_the_gsi`) instead
 retries the rebind itself on a bounded deadline, mirroring
 `tests/support/mod.rs::restart_same_addrs` — it can't reallocate ports since
-reusing the captured config is the point of the test.
+reusing the captured config is the point of the test. **`tests/support/
+mod.rs`'s own fresh-cluster bring-ups no longer do this at all (issue
+#627)** — `bring_up_deadline`/`bring_up_deadline_tls`/`start_single_node`
+bind every node's listeners on `:0` and hold them open before starting
+anything, closing the port-TOCTOU (and a second, partial-start-then-
+teardown hazard) structurally rather than retrying around it; see
+`docs/lessons/testing/2026-09-20-allocate-test-ports-by-binding-and-holding-never-probe-and-release.md`.
+These in-crate `#[cfg(test)] mod`s are unaffected by that fix (they still
+can't reach `tests/support` at all) and still need their own bounded retry
+exactly as before.
 
 ## Module map (`src/`)
 
@@ -7467,8 +7476,17 @@ shrink the periodic base-snapshot cadence from its 6-hour production
 default to a test-sized interval), restart/durability across every
 deployment shape, and the `WatchMetadata`/system-table/OTel/metrics support
 surfaces.
-`support/mod.rs` holds the shared bring-up helpers (port-TOCTOU retries,
-split-cluster bring-up), **and `support::PanicSafeTempDir`/
+`support/mod.rs` holds the shared bring-up helpers — `bring_up_deadline`/
+`bring_up_deadline_tls`/`start_single_node` bind-and-hold every node's
+listeners before starting any of them (issue #627, no port-TOCTOU, no
+retry loop; see this file's own "Every in-crate bring-up retries the
+port-TOCTOU race" entry above and `docs/lessons/testing/2026-09-20-
+allocate-test-ports-by-binding-and-holding-never-probe-and-release.md`),
+while `free_addrs`'s own probe-then-release allocator survives only for
+the callers that need a not-yet-bound address ahead of a **joiner or
+growth** path binding it itself (`grow_deadline`, the four `join_*_
+deadline` helpers, `bring_up_split`) — plus split-cluster bring-up,
+**and `support::PanicSafeTempDir`/
 `support::panic_safe_tempdir()` (issue #511)** — the drop-in replacement
 for `tempfile::tempdir().unwrap()`/`TempDir::new().unwrap()`: it leaks
 its directory (`std::mem::forget`) instead of removing it on a

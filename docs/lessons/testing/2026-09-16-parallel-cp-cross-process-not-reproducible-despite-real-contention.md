@@ -92,3 +92,76 @@ contention was real (here: a sibling test in the same batch failing) before
 concluding the target test is simply exempt — a negative result is only
 solid evidence once you know your induced load could have tripped the bug
 if the reported theory were the right one.
+
+## Outcome (2026-09-20, PR for #627)
+
+This entry's own "cannot be stolen after bring-up" argument is correct as
+far as it goes, but it only reasons about `call()`'s own connect target
+**once `bring_up_deadline` has already returned `Ok`** — it says nothing
+about the **window before that**, inside a single bring-up attempt itself,
+which a follow-up investigation
+(`docs/lessons/testing/2026-09-20-allocate-test-ports-by-binding-and-holding-never-probe-and-release.md`)
+found carries two real, code-confirmed structural hazards that this entry's
+own reasoning never covered:
+
+1. **The `free_addrs` release window itself.** `free_addrs` probed every
+   port via a bind-then-release, so the instant it returned, every one of
+   those ports was free for *any* process to steal — including a sibling
+   test binary's own concurrent `free_addrs` call, or this same fixture's
+   own next retry attempt after a partial failure.
+2. **Partial-start-then-teardown, with fixed node ids and no cluster
+   identity on the wire.** `bring_up_deadline`'s old shape bound and fully
+   *started* one node at a time (`run_node`, not just `Node::bind`) — so if
+   node *k* failed, nodes `0..k-1` were already live processes with running
+   background tasks, torn down only via `shutdown_graceful()` before the
+   whole attempt retried with **freshly reallocated** ports. `shutdown_graceful`
+   aborts tracked tasks, but `serve_requests` spawns one **untracked**,
+   fire-and-forget task per accepted connection (this crate's own
+   `handle_connection` gotcha) — a request already mid-flight on such a
+   task at the instant of teardown keeps running on the same runtime, still
+   holding a live `ClientCtx`/`env` clone, and can still dial out via
+   `self.relay`. Every attempt reuses the same fixed node ids
+   (`"n0"`, `"n1"`, …), and the raw Raft/`ClientRequest` wire carries **no
+   cluster/attempt identity of any kind** — so a survivor from a torn-down
+   attempt that happens to dial a port a *later* attempt or a sibling test
+   has since bound lands on a live peer with no way for either side to
+   detect it came from a different incarnation of the cluster. Issue #627's
+   own symptom (a forwarded write receiving a graceful `ClientResponse::
+   Error` for the whole 25s budget, from a live peer) fits this shape
+   exactly — a live-but-foreign peer answering with a plausible-looking
+   refusal, not a connect failure.
+
+**What the fix guarantees**: `bring_up_deadline`/`bring_up_deadline_tls`/
+`start_single_node` now bind every node's six listeners on `127.0.0.1:0`
+directly via `Node::bind` (OS-assigned at bind time, atomically, never
+released) and hold every one of them open until each node itself starts —
+binding every node of a cluster *before* starting any of them, so a bind
+failure on node *k* leaves **zero** tasks running for **any** node, and no
+later step can ever race a still-open port, because nothing in this path
+ever releases one. There is no retry loop left to reintroduce either
+hazard. See the new lesson file above for the general rule this
+generalizes into, and `crates/animusd/src/lib.rs`'s
+`start_bound_node_with_streams_quiesce_and_ttl_sweep_interval`/
+`run_bound_node` (the new bind/start-split production entry points this
+fixture is built on) for the mechanism.
+
+**Reproduction numbers (2026-09-20, same 4-core sandbox, built test binary
+run directly in default-parallel mode, `timeout 120` per iteration, the
+09-16 contention recipe — `taskset` pinning, two extra looping copies of
+the binary, two `dd oflag=dsync` fsync loops)**:
+
+| Phase | Load | Before fix | After fix |
+|-------|------|-----------:|----------:|
+| A | unloaded, 100 iterations | 0 failures, median 1.34s | 0 failures, median 1.29s |
+| B | 2 cores, 3 concurrent copies + fsync, 150 iterations | 0 failures, median 2.27s | 0 failures, median 2.20s |
+| C | 1 core, 3 concurrent copies + fsync, 100 iterations | 0 failures, median 3.45s | 0 failures, median 3.23s |
+| D | phase-B load, `bring_up_allocation` interleaved 50/50, 100 iterations | — | 0 failures |
+
+So the outer symptom did **not** reproduce before the fix either (350
+iterations, contention measurably real: median wall time rose 2.6x from
+phase A to C), exactly as this entry's own 09-16 attempt found; the
+evidence for the fix is therefore the structural argument above (no
+release window can exist; nothing starts before every bind succeeds) plus
+the traced hazards, not a red-to-green flip. The after-fix run adds the
+new allocator regression test under the same contention (phase D).
+

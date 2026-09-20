@@ -113,14 +113,23 @@ pub fn panic_safe_tempdir() -> PanicSafeTempDir {
 pub const JOIN_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Reserve `count` free loopback ports (bind :0, read addr, release the
-/// listener). This is itself the source of the documented port-TOCTOU: the
-/// port is free the instant this returns, so another test binary's own probe
-/// can steal it before the real bind. Callers that build a **fresh** config
-/// per attempt (e.g. [`start_single_node`], or a per-process cluster
-/// bring-up helper) ride this out by retrying the whole
-/// allocate-fresh-ports-and-start unit; a same-address restart that must
-/// reuse a captured config instead retries the rebind itself (see
-/// [`restart_same_addrs`]).
+/// listener). **This is itself a port-TOCTOU by construction**: the port is
+/// free the instant this returns, so another process/test's own bind can
+/// steal it before the real one happens — see issue #627's own investigation
+/// (`docs/lessons/testing/2026-09-20-allocate-test-ports-by-binding-and-
+/// holding-never-probe-and-release.md`) for the two structural hazards this
+/// created in every bring-up that used to retry around it instead. **Every
+/// fresh-cluster bring-up in this module now avoids this window entirely**
+/// by binding with ephemeral (`:0`) addresses directly via [`Node::bind`] and
+/// holding the resulting listeners open until the node itself starts (see
+/// [`bring_up_deadline`]/[`bring_up_deadline_tls`]/[`start_single_node`]) —
+/// this function survives only for the callers that genuinely need a
+/// not-yet-bound address to hand to a **joiner or growth** path *before* that
+/// path itself binds anything ([`grow_deadline`], [`join_fresh_deadline`],
+/// [`join_data_fresh_deadline`], [`join_allocated_fresh_deadline`],
+/// [`join_data_allocated_fresh_deadline`], [`bring_up_split`]) — those retry
+/// their own bind-and-join step as a unit, the same shape every one of these
+/// bring-up helpers used before this fix.
 pub fn free_addrs(count: usize) -> Vec<SocketAddr> {
     let listeners: Vec<std::net::TcpListener> = (0..count)
         .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
@@ -129,45 +138,73 @@ pub fn free_addrs(count: usize) -> Vec<SocketAddr> {
     // listeners dropped here, freeing the ports for the caller to bind.
 }
 
-/// A single-node config pinned to fresh ephemeral addresses.
-fn single_node_config() -> ClusterConfig {
-    let a = free_addrs(6);
-    ClusterConfig {
-        nodes: vec![RoleAddrs {
-            id: animusd::config::node_id(0),
-            role: animusd::config::NodeRole::Both,
-            internal: a[0],
-            client: a[1],
-            dynamo: a[2],
-            admin: a[3],
-            intra: a[4],
-            console: a[5],
-            advertise_host: None,
-            tls: None,
-            encryption_key_path: None,
-        }],
-        dynamo_auth: None,
-        cluster_settings: None,
+/// `127.0.0.1:0` — an address [`Node::bind`] resolves to a real,
+/// OS-assigned ephemeral port at bind time, atomically, with no separate
+/// probe-then-release step (contrast [`free_addrs`]'s own doc).
+fn ephemeral_loopback() -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], 0))
+}
+
+/// A fresh, unbound [`RoleAddrs`] for [`Node::bind`] — every port
+/// `127.0.0.1:0`, [`NodeRole::Both`], no advertise host/TLS/encryption key.
+/// `id` is [`animusd::config::node_id(index)`].
+fn unbound_role_addrs(index: usize) -> RoleAddrs {
+    RoleAddrs {
+        id: animusd::config::node_id(index),
+        role: NodeRole::Both,
+        internal: ephemeral_loopback(),
+        client: ephemeral_loopback(),
+        dynamo: ephemeral_loopback(),
+        admin: ephemeral_loopback(),
+        intra: ephemeral_loopback(),
+        console: ephemeral_loopback(),
+        advertise_host: None,
+        tls: None,
+        encryption_key_path: None,
     }
 }
 
-/// Start a single-node cluster, retrying bring-up against the port-TOCTOU
-/// race documented on [`free_addrs`] — each attempt allocates a **fresh**
-/// config (new ports), since unlike [`restart_same_addrs`] there is no
-/// existing config this helper is bound to reuse.
-pub async fn start_single_node(dir: &Path, backend: StorageBackend) -> (Node, ClusterConfig) {
-    let mut last_err = None;
-    for attempt in 0..10 {
-        let config = single_node_config();
-        match animusd::run_node_with(&config, 0, dir, backend).await {
-            Ok(node) => return (node, config),
-            Err(e) => {
-                last_err = Some(e);
-                tokio::time::sleep(Duration::from_millis(50 * (attempt + 1))).await;
-            }
-        }
+/// The [`RoleAddrs`] entry a [`ClusterConfig`] should carry for an
+/// already-[`Node::bind`]-bound `node` — its own resolved addresses, its own
+/// id, same role/advertise-host/TLS/encryption-key shape [`unbound_role_addrs`]
+/// gave it (a combined-mode bring-up fixture never sets the last three).
+fn bound_role_addrs(node: &animusd::BoundNode) -> RoleAddrs {
+    RoleAddrs {
+        id: node.id().clone(),
+        role: NodeRole::Both,
+        internal: node.internal_addr(),
+        client: node.client_addr(),
+        dynamo: node.dynamo_addr(),
+        admin: node.admin_addr(),
+        intra: node.intra_addr(),
+        console: node.console_addr(),
+        advertise_host: None,
+        tls: None,
+        encryption_key_path: None,
     }
-    panic!("single node failed to start after 10 attempts: {last_err:?}");
+}
+
+/// Start a single-node cluster. **Bind-and-hold, not probe-and-release**
+/// (issue #627): [`Node::bind`] itself resolves every `127.0.0.1:0` port to
+/// a real, OS-assigned address at bind time and holds every listener open
+/// until the node starts, so there is no window in which another
+/// process/test could steal one — no retry loop is needed or present. A bind
+/// failure here can only be genuine local resource exhaustion (too many open
+/// fds/ports), never a stolen port, so it panics immediately rather than
+/// retrying.
+pub async fn start_single_node(dir: &Path, backend: StorageBackend) -> (Node, ClusterConfig) {
+    let bound = Node::bind(animusd::config::node_id(0), unbound_role_addrs(0), dir)
+        .await
+        .unwrap_or_else(|e| panic!("start_single_node: bind failed: {e}"));
+    let config = ClusterConfig {
+        nodes: vec![bound_role_addrs(&bound)],
+        dynamo_auth: None,
+        cluster_settings: None,
+    };
+    let node = animusd::run_bound_node_with(bound, &config, 0, backend)
+        .await
+        .unwrap_or_else(|e| panic!("start_single_node: start failed: {e}"));
+    (node, config)
 }
 
 /// Restart a node on the **same addresses + data dir** (the durability tests'
@@ -199,67 +236,69 @@ pub async fn restart_same_addrs(
     }
 }
 
-/// Bring up a combined-mode `n`-node core, one process per node, retrying the
-/// (allocate-fresh-ports + start-all) as a unit against a wall-clock
-/// `deadline` rather than a fixed attempt count — same shape as
-/// [`restart_same_addrs`], generalized from a fixed 16-attempt/50ms retry
-/// (duplicated near-verbatim across `decommission.rs`, `seed_join.rs`,
-/// `seed_join_allocated.rs`, and `cluster_growth.rs`) that could exhaust
-/// under `cargo test --workspace`-level port-TOCTOU contention while the
-/// churn was still transient.
+/// Bring up a combined-mode `n`-node core, one process per node — **bind
+/// every node first, then start every node** (issue #627), never
+/// probe-and-release-then-rebind-one-at-a-time: each of `n` nodes is
+/// [`Node::bind`]-bound (holding its six listeners open, OS-assigned ports)
+/// before any of them is started, so a bind failure on node *k* can never
+/// leave nodes `0..k-1` already running with live background tasks that then
+/// need tearing down before a retry — and once every bind succeeds, no later
+/// step can ever race a still-open port a not-yet-started node holds, because
+/// nothing here ever releases one. **There is no retry loop any more**: a
+/// `:0` bind is assigned by the kernel atomically at bind time and held by
+/// this cluster's own nodes until they themselves drop it, so no other
+/// process or test can ever be named as the culprit in this config — the old
+/// partial-start-then-teardown retry (and the survivor-task hazard it
+/// created: an untracked per-connection handler from a torn-down partial
+/// attempt could still dial out to whatever a *later* attempt or a sibling
+/// test had since bound at the very port that attempt's own address named,
+/// under the same reused `"n{i}"` node id and with no cluster identity on
+/// the raw Raft wire to catch it — see `docs/lessons/testing/
+/// 2026-09-20-allocate-test-ports-by-binding-and-holding-never-probe-and-
+/// release.md`) is gone entirely, not merely retried around. `deadline` is
+/// now a pure **liveness bound on bring-up as a whole** (wrapped in
+/// [`tokio::time::timeout`]): a genuinely hung bind or start fails loudly
+/// once `deadline` elapses instead of hanging the test forever — it no
+/// longer has anything to do with port contention. Each bind failure and
+/// each start failure panics immediately, naming the failing node's index
+/// and the underlying error (a bind failure here can only be genuine local
+/// resource exhaustion, never a stolen port). Data dirs are `core-{i}` — no
+/// attempt counter, since there is only ever one attempt.
 pub async fn bring_up_deadline(
     n: usize,
     dir: &Path,
     deadline: Duration,
 ) -> (Vec<Node>, ClusterConfig) {
-    let hard_deadline = tokio::time::Instant::now() + deadline;
-    let mut attempt: u64 = 0;
-    loop {
-        let addrs = free_addrs(n * 6);
-        let nodes_cfg: Vec<RoleAddrs> = (0..n)
-            .map(|i| RoleAddrs {
-                id: animusd::config::node_id(i),
-                role: NodeRole::Both,
-                internal: addrs[6 * i],
-                client: addrs[6 * i + 1],
-                dynamo: addrs[6 * i + 2],
-                admin: addrs[6 * i + 3],
-                intra: addrs[6 * i + 4],
-                console: addrs[6 * i + 5],
-                advertise_host: None,
-                tls: None,
-                encryption_key_path: None,
-            })
-            .collect();
+    timeout(deadline, async move {
+        let mut bounds = Vec::with_capacity(n);
+        for i in 0..n {
+            let bound = Node::bind(
+                animusd::config::node_id(i),
+                unbound_role_addrs(i),
+                dir.join(format!("core-{i}")),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("bring_up_deadline: node {i} failed to bind: {e}"));
+            bounds.push(bound);
+        }
         let config = ClusterConfig {
-            nodes: nodes_cfg,
+            nodes: bounds.iter().map(bound_role_addrs).collect(),
             dynamo_auth: None,
             cluster_settings: None,
         };
-        let mut nodes = Vec::new();
-        let mut failed = false;
-        for i in 0..n {
-            match animusd::run_node(&config, i, dir.join(format!("core-{attempt}-{i}"))).await {
-                Ok(node) => nodes.push(node),
-                Err(_) => {
-                    failed = true;
-                    break;
-                }
-            }
+        let mut nodes = Vec::with_capacity(n);
+        for (i, bound) in bounds.into_iter().enumerate() {
+            let node = animusd::run_bound_node(bound, &config, i)
+                .await
+                .unwrap_or_else(|e| panic!("bring_up_deadline: node {i} failed to start: {e}"));
+            nodes.push(node);
         }
-        if !failed {
-            return (nodes, config);
-        }
-        for node in &nodes {
-            node.shutdown_graceful().await;
-        }
-        assert!(
-            tokio::time::Instant::now() < hard_deadline,
-            "could not bring up the initial {n}-node cluster within {deadline:?}"
-        );
-        sleep(Duration::from_millis(50)).await;
-        attempt += 1;
-    }
+        (nodes, config)
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!("bring_up_deadline: {n}-node cluster did not come up within {deadline:?}")
+    })
 }
 
 // ---- TLS (ADR 0064, S-01 commit 2) ---------------------------------------
@@ -332,61 +371,57 @@ pub fn tls_pki(names: &[&str]) -> (TempDir, Vec<TlsSection>) {
 /// usual `(nodes, config)` — callers must keep it alive for as long as the
 /// returned nodes run (their TLS material was loaded from these files at
 /// bind time, but a restart/rebind against the same config would need them
-/// again).
+/// again). Bind-and-hold, same as [`bring_up_deadline`] — the port itself is
+/// irrelevant to which leaf cert a node presents (every leaf's SAN/CN is
+/// `"127.0.0.1"`, [`tls_pki`]'s own doc), so nothing about TLS material
+/// selection changes with this fix; only the allocation mechanism does.
 pub async fn bring_up_deadline_tls(
     n: usize,
     dir: &Path,
     deadline: Duration,
 ) -> (Vec<Node>, ClusterConfig, TempDir) {
     let (pki_dir, sections) = tls_pki(&vec!["127.0.0.1"; n]);
-    let hard_deadline = tokio::time::Instant::now() + deadline;
-    let mut attempt: u64 = 0;
-    loop {
-        let addrs = free_addrs(n * 6);
-        let nodes_cfg: Vec<RoleAddrs> = (0..n)
-            .map(|i| RoleAddrs {
-                id: animusd::config::node_id(i),
-                role: NodeRole::Both,
-                internal: addrs[6 * i],
-                client: addrs[6 * i + 1],
-                dynamo: addrs[6 * i + 2],
-                admin: addrs[6 * i + 3],
-                intra: addrs[6 * i + 4],
-                console: addrs[6 * i + 5],
-                advertise_host: None,
-                tls: Some(sections[i].clone()),
-                encryption_key_path: None,
-            })
-            .collect();
+    timeout(deadline, async move {
+        let mut bounds = Vec::with_capacity(n);
+        for (i, section) in sections.iter().enumerate() {
+            let addrs = RoleAddrs {
+                tls: Some(section.clone()),
+                ..unbound_role_addrs(i)
+            };
+            let bound = Node::bind(
+                animusd::config::node_id(i),
+                addrs,
+                dir.join(format!("tls-core-{i}")),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("bring_up_deadline_tls: node {i} failed to bind: {e}"));
+            bounds.push(bound);
+        }
         let config = ClusterConfig {
-            nodes: nodes_cfg,
+            nodes: bounds
+                .iter()
+                .enumerate()
+                .map(|(i, b)| RoleAddrs {
+                    tls: Some(sections[i].clone()),
+                    ..bound_role_addrs(b)
+                })
+                .collect(),
             dynamo_auth: None,
             cluster_settings: None,
         };
-        let mut nodes = Vec::new();
-        let mut failed = false;
-        for i in 0..n {
-            match animusd::run_node(&config, i, dir.join(format!("tls-core-{attempt}-{i}"))).await {
-                Ok(node) => nodes.push(node),
-                Err(_) => {
-                    failed = true;
-                    break;
-                }
-            }
+        let mut nodes = Vec::with_capacity(n);
+        for (i, bound) in bounds.into_iter().enumerate() {
+            let node = animusd::run_bound_node(bound, &config, i)
+                .await
+                .unwrap_or_else(|e| panic!("bring_up_deadline_tls: node {i} failed to start: {e}"));
+            nodes.push(node);
         }
-        if !failed {
-            return (nodes, config, pki_dir);
-        }
-        for node in &nodes {
-            node.shutdown_graceful().await;
-        }
-        assert!(
-            tokio::time::Instant::now() < hard_deadline,
-            "could not bring up the initial {n}-node TLS cluster within {deadline:?}"
-        );
-        sleep(Duration::from_millis(50)).await;
-        attempt += 1;
-    }
+        (nodes, config, pki_dir)
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!("bring_up_deadline_tls: {n}-node TLS cluster did not come up within {deadline:?}")
+    })
 }
 
 /// Grow `base` by `extra` control-plane-follower-less nodes (ADR 0030) via
@@ -943,4 +978,61 @@ pub async fn poll_until_or_stalled<C, Fut>(
         }
         sleep(poll_interval).await;
     }
+}
+
+/// One best-effort `GET /admin/status` against `addr`, returning the raw
+/// response body text (or a description of why it failed) — deliberately
+/// raw, not parsed `Value`, since this is diagnostic-only (folded into a
+/// timeout panic message) and a malformed/absent response is itself
+/// diagnostic. Mirrors [`engine_applied_index`]'s own minimal GET-only shape.
+async fn admin_status_get(addr: SocketAddr) -> Result<String, String> {
+    let mut stream = TcpStream::connect(addr)
+        .await
+        .map_err(|e| format!("connect failed: {e}"))?;
+    let request = "GET /admin/status HTTP/1.0\r\nHost: animus\r\nConnection: close\r\n\r\n";
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .map_err(|e| format!("write failed: {e}"))?;
+    stream
+        .flush()
+        .await
+        .map_err(|e| format!("flush failed: {e}"))?;
+    let mut raw = Vec::new();
+    stream
+        .read_to_end(&mut raw)
+        .await
+        .map_err(|e| format!("read failed: {e}"))?;
+    let text = String::from_utf8(raw).map_err(|e| format!("non-utf8 response: {e}"))?;
+    let (_head, payload) = text
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| "response has no body".to_string())?;
+    Ok(payload.to_string())
+}
+
+/// Best-effort, bounded (~2s per node) snapshot of every `config.nodes[i]`'s
+/// own `GET /admin/status` — one line per node naming its index, its admin
+/// address, and either the raw JSON body it answered with or the error that
+/// kept it from answering. Meant to be folded into a timeout panic message
+/// (`cp_cross_process.rs`'s own retry-loop timeouts, issue #627) alongside
+/// the last `ClientResponse::Error` text, so a next occurrence pinpoints
+/// which node actually answered and what its own leader/term/membership
+/// view of the cluster looked like at the moment the write kept failing —
+/// none of the existing `ClientResponse::Error` strings name which node
+/// answered `call()`'s own connect, only what that node's own routing
+/// decision concluded (see the issue's own investigation notes). Never
+/// panics — a wedged/unreachable process is exactly the scenario this
+/// diagnostic exists to describe, not fail on.
+pub async fn cluster_status_snapshot(config: &ClusterConfig) -> String {
+    let mut out = String::new();
+    for (i, node) in config.nodes.iter().enumerate() {
+        let line = match timeout(Duration::from_secs(2), admin_status_get(node.admin)).await {
+            Ok(Ok(body)) => format!("node {i} (admin {}): {body}", node.admin),
+            Ok(Err(e)) => format!("node {i} (admin {}): {e}", node.admin),
+            Err(_) => format!("node {i} (admin {}): timed out after 2s", node.admin),
+        };
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out
 }
