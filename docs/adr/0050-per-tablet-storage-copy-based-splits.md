@@ -232,6 +232,12 @@ which holds the copied intent + record and materializes at its own commit
 position — `materialize-at-resolve` unchanged, no force-aborts ever, and
 cutover latency never depends on a foreign coordinator.
 
+The retryable-error convention this stage's own freeze relies on can
+itself outlast a client's own retry budget (the in-place fork, ADR 0058,
+shares this exact latch) — see that ADR's 2026-09-20 amendment (issue
+#994) for the wire edge's own fix (an exhausted-but-transient refusal now
+reports `503 ServiceUnavailable`, never a terminal `500`).
+
 ### Stage 4 — `CutoverSplit`
 
 A new `MetaCommand::CutoverSplit { parent, expected_epoch }`. Apply,

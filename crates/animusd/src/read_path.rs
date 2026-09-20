@@ -633,6 +633,16 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 return Err(err);
             }
             self.env.sleep(SCHEMA_POLL_INTERVAL).await;
+            // Issue #994: re-check the deadline immediately after the
+            // sleep, before looping back to a fresh attempt. Without this,
+            // the final iteration can start a fresh cp_route/cp_forward
+            // attempt with effectively zero time left, and that attempt's
+            // own generic "budget exhausted" error then overwrites this
+            // iteration's actually-informative one (e.g. a frozen-tablet
+            // refusal) the next time the loop-top check runs.
+            if self.env.now() >= deadline {
+                return Err(err);
+            }
         }
     }
 
@@ -743,6 +753,16 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 return Err(err);
             }
             self.env.sleep(SCHEMA_POLL_INTERVAL).await;
+            // Issue #994: re-check the deadline immediately after the
+            // sleep, before looping back to a fresh attempt. Without this,
+            // the final iteration can start a fresh cp_route/cp_forward
+            // attempt with effectively zero time left, and that attempt's
+            // own generic "budget exhausted" error then overwrites this
+            // iteration's actually-informative one (e.g. a frozen-tablet
+            // refusal) the next time the loop-top check runs.
+            if self.env.now() >= deadline {
+                return Err(err);
+            }
         }
     }
 
@@ -909,6 +929,16 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 return Err(err);
             }
             self.env.sleep(SCHEMA_POLL_INTERVAL).await;
+            // Issue #994: re-check the deadline immediately after the
+            // sleep, before looping back to a fresh attempt. Without this,
+            // the final iteration can start a fresh cp_route/cp_forward
+            // attempt with effectively zero time left, and that attempt's
+            // own generic "budget exhausted" error then overwrites this
+            // iteration's actually-informative one (e.g. a frozen-tablet
+            // refusal) the next time the loop-top check runs.
+            if self.env.now() >= deadline {
+                return Err(err);
+            }
         }
     }
 
@@ -1125,6 +1155,16 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 return Err(err);
             }
             self.env.sleep(SCHEMA_POLL_INTERVAL).await;
+            // Issue #994: re-check the deadline immediately after the
+            // sleep, before looping back to a fresh attempt. Without this,
+            // the final iteration can start a fresh cp_route/cp_forward
+            // attempt with effectively zero time left, and that attempt's
+            // own generic "budget exhausted" error then overwrites this
+            // iteration's actually-informative one (e.g. a frozen-tablet
+            // refusal) the next time the loop-top check runs.
+            if self.env.now() >= deadline {
+                return Err(err);
+            }
         }
     }
 

@@ -3371,6 +3371,65 @@ impl SimCluster {
         self.controls[leader].propose(command)
     }
 
+    /// **Issue #994 regression helper.** Propose the ADR 0050 split-cutover
+    /// freeze (`RaftKvNode::propose_freeze`) directly on `tablet`'s CP-data
+    /// group as hosted on `node`, and drive the simulator until it is
+    /// durably applied (`CpGroup::is_frozen()`) on every replica this
+    /// fixture can see — the fixture's own way of putting a tablet into
+    /// the exact latched state `decide::frozen_refusal`/`RaftKvNode::
+    /// is_frozen` gate on, without waiting out a real in-place split's own
+    /// fork→cutover window (which this fixture never runs as a background
+    /// loop — see `drive_inplace_split_cutover`'s own doc). `node` must
+    /// currently **lead** `tablet` — `propose_freeze` is leader-only, the
+    /// same discipline every other direct-propose helper in this file
+    /// (`propose_meta`, `set_table_throughput`) already assumes for its own
+    /// target.
+    pub(crate) fn freeze_tablet(&mut self, node: u64, tablet: TabletId) {
+        let group = self
+            .shared
+            .ctx(node)
+            .edge
+            .local_cp(tablet)
+            .unwrap_or_else(|| panic!("freeze_tablet: node {node} hosts no replica of {tablet:?}"));
+        assert!(
+            group.is_leader(),
+            "freeze_tablet: node {node} does not lead {tablet:?}"
+        );
+        let outcome = group.propose_freeze();
+        assert!(
+            matches!(outcome, ProposeResult::Accepted { .. }),
+            "propose_freeze must be accepted by the current leader (node={node}, tablet={tablet:?}): {outcome:?}"
+        );
+        self.wait_for_fork_freeze(node, tablet, Duration::from_secs(5));
+    }
+
+    /// Whether `node`'s own replica of `tablet` currently reports frozen
+    /// (`RaftKvNode::is_frozen`, ADR 0050 rung 5) — `false` (never a panic)
+    /// if `node` hosts no replica of `tablet` at all, so a caller can poll
+    /// this across a fork/teardown window with no separate existence check.
+    fn is_tablet_frozen(&self, node: u64, tablet: TabletId) -> bool {
+        self.shared
+            .ctx(node)
+            .edge
+            .local_cp(tablet)
+            .map(|g| g.is_frozen())
+            .unwrap_or(false)
+    }
+
+    /// **Issue #994 regression helper.** Poll until `node`'s own replica of
+    /// `tablet` latches frozen — used to wait out a REAL in-place split's
+    /// own data-plane fork (`KvCommand::SplitTablet`, `animus_cp_data::
+    /// host::Reconciler` adding learners/catching up/forking on its own,
+    /// ADR 0058 rung 3), as opposed to [`freeze_tablet`](Self::
+    /// freeze_tablet)'s own direct injection. **Load-bearing distinction**:
+    /// `Metadata`'s own `Splitting` intent (`POST /admin/tablet/split`'s
+    /// own commit) does NOT mean frozen yet — the parent keeps serving
+    /// fully until the fork itself actually applies, which is what this
+    /// polls for, never a metadata-only proxy.
+    pub(crate) fn wait_for_fork_freeze(&mut self, node: u64, tablet: TabletId, budget: Duration) {
+        self.poll_until(budget, |c| c.is_tablet_frozen(node, tablet));
+    }
+
     /// Stage (prepare) ONE write of a raw plain 2PC transaction against
     /// `table`, issued from `node`'s own coordinator — and, deliberately,
     /// never decides or resolves it (ADR 0061 rung F, C-06 PR 3). This is
