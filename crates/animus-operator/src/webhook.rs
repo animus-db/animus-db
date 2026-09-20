@@ -429,6 +429,68 @@ mod tests {
         assert!(resp.allowed, "{:?}", resp.result);
     }
 
+    fn ephemeral_spec(nodes: i32, control_nodes: Option<i32>) -> AnimusClusterSpec {
+        let mut s = spec(nodes, control_nodes);
+        s.storage.ephemeral = Some(true);
+        s
+    }
+
+    /// Issue #989: a CREATE with `storage.ephemeral: true` and a resolved
+    /// `controlNodes > 1` is denied, naming `spec.storage.ephemeral`.
+    #[test]
+    fn a_create_with_ephemeral_multi_voter_storage_is_denied() {
+        let out = handle_review(review(
+            Operation::Create,
+            Some(cluster(ephemeral_spec(3, None))),
+            None,
+            animuscluster_gvk(),
+        ));
+        let resp = out.response.expect("response set");
+        assert!(!resp.allowed);
+        assert!(
+            resp.result.message.contains("spec.storage.ephemeral"),
+            "{}",
+            resp.result.message
+        );
+    }
+
+    /// Issue #989: an UPDATE flipping an existing multi-voter cluster's
+    /// storage to ephemeral is denied the same way a CREATE is.
+    #[test]
+    fn an_update_flipping_a_multi_voter_cluster_to_ephemeral_is_denied() {
+        let old = cluster(spec(3, Some(3)));
+        let new = cluster(ephemeral_spec(3, Some(3)));
+        let out = handle_review(review(
+            Operation::Update,
+            Some(new),
+            Some(old),
+            animuscluster_gvk(),
+        ));
+        let resp = out.response.expect("response set");
+        assert!(!resp.allowed);
+        assert!(
+            resp.result.message.contains("spec.storage.ephemeral"),
+            "{}",
+            resp.result.message
+        );
+    }
+
+    /// Issue #989: a single-voter cluster (`controlNodes` resolving to 1)
+    /// with `storage.ephemeral: true` has no quorum to lose beyond itself,
+    /// so it stays allowed at admission — only the reconciler's own
+    /// informational hazard condition applies to it.
+    #[test]
+    fn a_single_voter_ephemeral_cluster_is_allowed() {
+        let out = handle_review(review(
+            Operation::Create,
+            Some(cluster(ephemeral_spec(3, Some(1)))),
+            None,
+            animuscluster_gvk(),
+        ));
+        let resp = out.response.expect("response set");
+        assert!(resp.allowed, "{:?}", resp.result);
+    }
+
     #[test]
     fn a_malformed_body_is_denied_not_a_process_error() {
         let out: AdmissionReview<DynamicObject> =

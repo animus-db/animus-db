@@ -307,7 +307,7 @@ Spec (initial surface):
 | `image` | The `animusd` image to run. |
 | `nodes` | Total pod/replica count. |
 | `controlNodes` | Control-voter count (default `3`); **grow-only since S-07d** (a decrease is rejected; an increase is driven by the controller itself — see this ADR's own "Control-voter growth (S-07d, 2026-09-06)" section below). Pods `0..controlNodes-1` run role `Both` (ADR 0035); the rest run role `Data`. |
-| `storage.size`, `storage.storageClassName?`, `storage.ephemeral?` | Per-pod PVC sizing/class, or an ephemeral (no-PVC) mode for throwaway clusters. **`ephemeral: true` is a real Raft safety hazard for any voter pod, not just a durability trade-off** — a control voter's `emptyDir` wipe is exactly the scenario issue #667 (ADR 0009's 2026-09-15 amendment) closes for the control plane; the CP data plane has the identical hazard, unclosed (issue #900). See `crates/animus-operator/CLAUDE.md`'s matching note for the operational guidance until that closes. |
+| `storage.size`, `storage.storageClassName?`, `storage.ephemeral?` | Per-pod PVC sizing/class, or an ephemeral (no-PVC) mode for throwaway clusters. **`ephemeral: true` is a real Raft safety hazard for any voter pod, not just a durability trade-off** — a control voter's `emptyDir` wipe is exactly the scenario issue #667 (ADR 0009's 2026-09-15 amendment) closes for the control plane; the CP data plane has the identical hazard, unclosed (issue #900). **Since issue #989 (2026-09-19 amendment below), `ephemeral: true` together with a resolved `controlNodes > 1` is rejected outright** (admission webhook, or the reconciler's own fallback) — only a single control voter (no quorum to lose beyond itself) may still use it. See `crates/animus-operator/CLAUDE.md`'s matching note for the still-open CP-data-plane operational guidance. |
 | `resources?` | Pod resource requests/limits, passed through verbatim. |
 | `basePort` | Port-stride base (default `14000`, matching `animusd`'s own default). |
 | `clientService.type` | `ClusterIP` \| `LoadBalancer` \| `NodePort` — how the DynamoDB-only client Service is exposed. |
@@ -1470,9 +1470,11 @@ the same way. This is purely informational — a genuinely throwaway
 ephemeral cluster that never touches those fields again may still accept
 the risk deliberately — but it makes the hazard visible in `kubectl get
 animuscluster -o yaml` rather than only in this paragraph. **Left open as
-a maintainer decision**: whether a cluster with `controlNodes > 1` (or
-any voter at all) and `storage.ephemeral: true` should instead be a hard
-validating-webhook rejection.
+a maintainer decision at the time**: whether a cluster with `controlNodes
+> 1` (or any voter at all) and `storage.ephemeral: true` should instead be
+a hard validating-webhook rejection — resolved by the 2026-09-19
+amendment below (issue #989): `controlNodes > 1` is now rejected outright;
+a single voter stays allowed.
 
 See issue #864 for the full investigation, `crates/animus-operator/
 CLAUDE.md`'s own S-07d section for the config-hash detail, and ADR 0009's
@@ -1742,3 +1744,114 @@ amendment above, was already far above this bound too). No change to
 `scripts/e2e-kind.sh` itself was needed or made — the existing wait
 already had ample room for a 5-second detection, and the bug was that
 detection could take 13–15 **minutes**, not that the wait was too short.
+
+## Amendment (2026-09-19, issue #989) — `storage.ephemeral` with more than one control voter is now a hard rejection ("option 2")
+
+The 2026-09-15/issue #864 amendment above surfaced
+`EphemeralVoterStorageHazard` as a purely informational condition and left
+open, as a maintainer decision, whether the dangerous combination should
+instead be a hard validating-webhook rejection. **Decision (maintainer-
+approved, "option 2" from the issue)**: reject, at admission and in the
+reconciler's own fallback, only the combination that actually costs
+quorum — `spec.storage.ephemeral: true` together with a resolved
+`spec.controlNodes > 1` (`AnimusClusterSpec::control_nodes_or_default()`,
+which defaults to `min(3, nodes)` — so `nodes: 3` with `controlNodes`
+omitted and `ephemeral: true` is rejected too; `nodes: 1`, or
+`controlNodes: 1` set explicitly, with `ephemeral: true` remains allowed).
+
+**Why the predicate is exactly "`controlNodes > 1`", not "any voter at
+all"** (the second alternative the "left open" paragraph itself named):
+the mechanism this whole hazard is about — a wiped EXISTING voter of an
+*already-established* group being permanently refused by issue #667's
+boot-time check, costing the group its quorum — requires there to be a
+quorum to lose in the first place. A single voter has none beyond
+itself: `RaftCore::begin_cluster_check`'s own decision procedure (ADR
+0009's 2026-09-15 amendment) waits for **every configured peer** to
+answer before ever refusing a wiped-looking restart, and with
+`controlNodes: 1` there are zero configured peers — that condition is
+vacuously satisfied immediately, so a wiped lone voter is never refused
+at all; it simply restarts as a fresh, empty single-voter bootstrap,
+losing its own data but never its identity or its ability to serve.
+Rejecting that shape too would forbid a real, common use case (a
+disposable single-node dev/CI cluster) for a hazard it cannot actually
+suffer from. It still keeps the informational `EphemeralVoterStorageHazard`
+condition — losing all data on a routine pod restart is still worth
+surfacing, just not worth refusing.
+
+**Mechanism, shared by both enforcement points**
+(`crate::validate::validate_ephemeral_voters`, `crates/animus-operator/
+src/validate.rs`): a pure function over the spec alone, called from
+`validate_spec` (so both the webhook and the reconciler's own fallback
+can never disagree about which specs are valid — the same structural
+guarantee every other rule in `validate_spec` already has, per ADR 0070's
+own Decision 1) and, separately, from `crate::controller::reconcile`
+directly (the reconciler needs the bare `Option<Violation>` before it can
+decide whether to skip every child-resource apply, which `validate_spec`'s
+aggregate `Result<(), Vec<Violation>>` shape doesn't suit as directly).
+
+**The reconciler's own fallback refuses, it does not strip-and-continue**
+— unlike `spec.tls`/`spec.s3`/`spec.backupStore`/`spec.segmentStore`,
+whose own invalid values are pinned to `None` for the rest of that
+reconcile so every other field still converges. Two reasons this field is
+different: (1) `desired::statefulset::build` (`crates/animus-operator/
+src/desired/statefulset.rs`) emits the pod template's data volume as
+either an `emptyDir` (`spec.storage.ephemeral: true`) or a
+`volumeClaimTemplates`-backed `PersistentVolumeClaim` (`false`/unset) —
+which of the two a `StatefulSet` gets is fixed at creation and is an
+**immutable** field on an existing object; stripping `ephemeral` back to
+"as if unset" on an already-ephemeral, already-multi-voter cluster
+couldn't actually converge the running `StatefulSet` to durable storage
+even if the reconciler tried, so continuing to reconcile with the field
+stripped would silently lie about what the cluster actually has. (2) On a
+*fresh* cluster with no `StatefulSet` yet, silently building a durable
+one the manifest never asked for is its own kind of surprise — a visible
+refusal (`CONDITION_EPHEMERAL_VOTER_STORAGE_REJECTED`, `crd.rs`) is
+strictly better than either a wrong storage mode or an outright
+`StatefulSet` immutable-field apply error surfacing as an opaque
+`ReconcileError` instead. So the reconciler's own fallback, on hitting
+this violation, sets the rejected condition (superseding the pre-existing
+informational hazard condition — an operator should see exactly one of
+the two, never both), patches `status`, and returns immediately, **before
+`finish_reconcile`/`apply_children` builds or applies a single child
+resource** — nothing is created on a fresh cluster hitting this
+combination for the first time, and nothing is rolled on an
+already-running one that flips into it.
+
+**A single wiped voter is not permanently refused, verified against the
+#667 boot check's own decision procedure** (checked explicitly, rather
+than assumed, for this amendment): with zero configured peers,
+`begin_cluster_check`'s wait-for-every-configured-peer condition holds
+trivially, so the check resolves immediately and the node proceeds as an
+ordinary fresh voter — it is never placed into the `cluster_check_
+refused: true` sticky state a multi-peer wiped restart can reach. The
+loss for a single voter is exactly "the cluster's own state" (every write
+since its last durable checkpoint), never "quorum" — this amendment
+updated the hazard-condition's own wording (`crate::controller::
+reconcile`, `CONDITION_EPHEMERAL_VOTER_STORAGE_HAZARD`'s doc in `crd.rs`)
+to say so precisely, correcting the original 2026-09-15 amendment's
+message text, which described the hazard in quorum terms unconditionally
+(true for `controlNodes > 1`, misleading for the single-voter shape that
+message used to cover too, before this amendment split the two
+conditions apart).
+
+**Scope note, carried over from `crates/animus-operator/CLAUDE.md`'s own
+issue #900 section**: this predicate covers only the control-plane
+voter-count hazard `controlNodes` describes. The CP data plane has the
+structurally identical hazard for a hosted tablet's own voter (issue
+#900, still open, and materially harder — a tablet's peer set is dynamic
+and reconstituted constantly, unlike the control plane's one-time genesis
+config) on *every* combined-mode or data-only pod, regardless of
+`controlNodes`; nothing here validates against that, since a tablet's
+voters are not a CRD-visible concept this operator's spec can check. The
+operational guidance to avoid `storage.ephemeral: true` on any multi-node
+cluster (not just a multi-*control*-voter one) stands until issue #900
+closes.
+
+Delivered as a single PR: `crate::validate::validate_ephemeral_voters` +
+its `validate_spec` wiring, the new `CONDITION_EPHEMERAL_VOTER_STORAGE_
+REJECTED` condition, the reconciler's own early-return fallback, the
+webhook's shared coverage (via `validate_spec`, no separate webhook-side
+change needed), `deploy/operator/crd.yaml` regenerated from `crd.rs`'s
+updated doc comments, and this amendment. See `crates/animus-operator/
+CLAUDE.md`'s issue #864 section (updated in the same change) for the
+crate-local version of this account.

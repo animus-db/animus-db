@@ -496,12 +496,40 @@ voters this way and the group loses quorum for good. This crate cannot
 fix this by itself — `scripts/e2e-kind.sh` now uses durable
 (`PersistentVolumeClaim`) storage instead, the supported shape per this
 struct's own doc comment (`crd::StorageSpec::ephemeral`) — but it does
-surface it: `CONDITION_EPHEMERAL_VOTER_STORAGE_HAZARD` is set,
-unconditionally, whenever `spec.storage.ephemeral` is `true`, so a future
-ephemeral cluster's operator sees this in `kubectl get animuscluster -o
-yaml` rather than only in an ADR. **Whether this should instead be a hard
-validating-webhook rejection is left open as a maintainer decision** — see
-ADR 0060's amendment.
+surface it: `CONDITION_EPHEMERAL_VOTER_STORAGE_HAZARD` is set whenever
+`spec.storage.ephemeral` is `true` for the shape that stays allowed (a
+resolved `controlNodes <= 1` — see the next paragraph), so a throwaway
+single-voter ephemeral cluster's operator sees this in `kubectl get
+animuscluster -o yaml` rather than only in an ADR.
+
+**Rejected since issue #989 (2026-09-19) when `controlNodes > 1`.** The
+"left open as a maintainer decision" question above was resolved: `spec.
+storage.ephemeral: true` together with a resolved `spec.controlNodes > 1`
+(`AnimusClusterSpec::control_nodes_or_default`) is now refused outright —
+`crate::validate::validate_ephemeral_voters`, enforced both by the
+validating webhook (denied at admission, `CONDITION_EPHEMERAL_VOTER_
+STORAGE_REJECTED`'s doc names the exact predicate) and by `crate::
+controller::reconcile`'s own fallback for a cluster installed without one
+(same condition, set before any child resource is touched — the
+reconcile returns immediately, applying nothing, rather than stripping
+`ephemeral` and reconciling the rest of the spec the way `spec.tls`/
+`spec.s3`/`spec.backupStore` do: `desired::statefulset::build` emits the
+data volume as either an `emptyDir` or a `volumeClaimTemplates`-backed
+PVC depending on this exact field, and a `StatefulSet` treats that shape
+as immutable once the object exists, so there is no safe "as if unset"
+fallback to strip into here — see the condition's own doc for the full
+reasoning). A single voter (`controlNodes: 1`, or `nodes: 1` with
+`controlNodes` omitted) has no quorum to lose beyond itself — a wipe just
+restarts it as a fresh, empty single-voter bootstrap (verified against
+ADR 0009's 2026-09-15 boot-time-check amendment: with zero configured
+peers, `begin_cluster_check`'s "every configured peer answered empty"
+condition is vacuously satisfied, so a wiped lone voter is never
+permanently refused the way a multi-voter cluster's wiped EXISTING voter
+is — it just loses its own data, not its identity) — so that shape stays
+allowed, with only the informational hazard condition above. See ADR
+0060's 2026-09-19 amendment for the full account and
+`crates/animus-operator/src/validate.rs`'s `validate_ephemeral_voters`
+tests for the boundary cases.
 
 **The real, third bug (found after the ephemeral-storage fix landed):
 `advance_control_growth` must never be gated on the `ControlNodesGrowing`
@@ -789,12 +817,25 @@ issue #900 closes: `storage.ephemeral: true` should be treated as
 unsupported for any pod that ever acts as a CP-data voter** — which today
 means every combined-mode and data-only pod, `spec.storage.ephemeral`'s
 safety story only really holds for a genuinely stateless, disposable
-deployment. This operator does not currently validate or warn against
-that combination; a future rung could reject `spec.storage.ephemeral:
-true` outright, or restrict it to control-only pods (which now have the
-issue #667 protection), pending a decision on whether that restriction
-belongs here or is better left to the ADR's own operational-mitigation
-note.
+deployment.
+
+**Rejected since issue #989 (2026-09-19) when `controlNodes` resolves to
+more than 1** — but only for that specific control-plane predicate, not
+the broader CP-data-plane hazard this paragraph is actually about:
+`crate::validate::validate_ephemeral_voters` (enforced by the validating
+webhook at admission, and by the reconciler's own fallback,
+`CONDITION_EPHEMERAL_VOTER_STORAGE_REJECTED`) checks only `spec.
+controlNodes`'s resolved value against `spec.storage.ephemeral`; a
+single-control-voter cluster (`controlNodes: 1`) still passes validation
+even though every one of its combined-mode or data-only pods still hosts
+CP-data tablet voters with the identical issue #900 hazard this paragraph
+describes, unaddressed. This operator has no way to validate *that* one
+purely from the spec (a tablet's voters aren't a CRD-visible concept at
+all), so the operational guidance above still stands for any ephemeral
+cluster with more than a single node, in addition to (not instead of) the
+now-enforced control-voter rule; restricting `storage.ephemeral` to
+control-only pods remains open, pending its own decision, exactly as
+before.
 
 **Every `fs:`/`dir:` path must live strictly under
 `desired::cluster_config::DATA_DIR`** (`/var/lib/animus`) — the one
