@@ -31,6 +31,54 @@
   gets `CONTROL_PEER_LIVENESS_TIMEOUT` of grace for free from `become_
   leader`'s own seed, so an equal-sized second grace would be a no-op. See
   ADR 0037's own amendment note for the mechanism.
+  **2026-09-20 amendment (issue #928): a suspect/dead split for placement
+  repair.** This ADR's `Down` transition — everything above — stays the FAST
+  "suspect" signal for every consumer: the detector's own `DETECT_TIMEOUT`
+  (500ms) is unchanged, and `Down` still commits exactly as described. What
+  changed is what the placement **repair** pass (ADR 0005's
+  `reconcile_placement`) does with it. Before this amendment,
+  `reconcile_placement` fed the fresh `Active`-only membership straight to
+  `replan_repair` on every `RECONCILE_INTERVAL` (500ms) tick — so a member
+  merely marked `Down` by one missed heartbeat round (a GC pause, a
+  scheduler hiccup, a moment of congestion, never an actual crash) had its
+  healthy replica evicted, and a full replica rebuild (engine transfer,
+  `InstallSnapshot`, catch-up) triggered, on the very next tick, for every
+  tablet it hosted. `reconcile_placement` now honours a second, SLOWER gate,
+  `node::REPAIR_DWELL` (5s, tracked per-member in a driver-local,
+  `env.now()`-keyed `BTreeMap` — `node::recently_down_this_tick`, the same
+  shape ADR 0062 §2's `retarget_ready_this_tick`/`recently_done_this_tick`
+  already established for the identical false-positive class in the
+  directed-Placing phase): a member must be observed CONTINUOUSLY `Down` for
+  the whole dwell before repair evicts its replica from a tablet it already
+  hosts. `Down` itself, and every other consumer of it (an admin/dashboard
+  read, a client's routing hints, this ADR's own detector logic), is
+  completely unaffected — only the repair pass's own reaction is delayed.
+  **Why not detector hysteresis** (e.g. widening `DETECT_TIMEOUT` itself, or
+  adding a second detector-level threshold before `Down` even commits)?
+  Because `Down` is a genuinely useful FAST signal for other purposes (a
+  dashboard operator wants to see a flapping node promptly; a future
+  routing-hint consumer might want to avoid a suspect node's read path
+  without waiting 5 full seconds) — narrowing what `Down` means to satisfy
+  repair's own, much more expensive, threshold would blunt it everywhere
+  else. The Cockroach/TiKV-shaped fix keeps the fast/cheap "suspect" signal
+  exactly as fast as it was, and adds the slow/expensive "dead enough to
+  actually spend a replica rebuild on" gate as a second, independent
+  threshold that only the one action expensive enough to need it consults.
+  **Takeover semantics**: `recently_down_this_tick`'s `BTreeMap` is
+  driver-local, volatile state — a leadership change resets it, exactly like
+  `retarget_since`/`done_since` before it, so a dwelling member's protection
+  is only ever EXTENDED by a takeover (the new leader's own first
+  observation restarts the timer), never shortened, mirroring `LEADER_GRACE`
+  itself. **The trade-off**: a genuinely dead member's replicas stay
+  under-replicated for up to one extra `REPAIR_DWELL` per tablet — reduced
+  redundancy, not reduced availability, since reads/writes still route
+  through whichever replicas remain (ADR 0016/0017) — in exchange for a
+  transient flap no longer triggering any replica churn at all. See
+  `node::REPAIR_DWELL`'s own doc for the full trade-off writeup and why 5s
+  (equal to `SPLIT_PLACING_RETARGET_DWELL`, not Cockroach's 5-minute
+  `time_until_store_dead`) was chosen, and `crates/animus-control/CLAUDE.md`'s
+  matching entry and `docs/lessons/code-patterns/` for the general
+  suspect/dead pattern.
 - **Date:** 2026-08-01
 
 ## Context
@@ -137,6 +185,12 @@ ordinary `UpsertMember` log entries committed under the current term.
   function of `Env`-supplied time, so it stays deterministic; the decision helper
   `liveness_transitions` takes an `allow_down` flag and is unit-tested in
   `node.rs`.
+- **Placement repair no longer reacts to `Down` instantly (2026-09-20, issue
+  #928)** — see this ADR's own 2026-09-20 amendment above for the full
+  suspect/dead split (`node::REPAIR_DWELL`). `Down` itself is unchanged;
+  only `reconcile_placement`'s reaction to it is now dwell-gated.
 - **Deferred:** tuning the timeout adaptively (or a full φ-accrual detector) under
   real network jitter; and heartbeating only the leader (vs. all control nodes)
-  once leader discovery is cheap.
+  once leader discovery is cheap. `REPAIR_DWELL` itself is a fixed constant for
+  now — an operator-configurable knob (mirroring `--quiesce-after`) is a natural
+  follow-up.

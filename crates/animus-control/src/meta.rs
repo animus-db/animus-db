@@ -2807,29 +2807,43 @@ impl PlacementView {
     /// (`node.rs`'s `recently_done_this_tick`, issue #928/#921 fix) — see
     /// [`reconcile_placement`]'s own doc for why a freshly-`done`
     /// directed-Placing child needs the same protection ordinary repair
-    /// already gives an un-`done` one.
+    /// already gives an un-`done` one. `recently_down` is the driver's own
+    /// `REPAIR_DWELL` decision (`node.rs`'s `recently_down_this_tick`, issue
+    /// #928's fully general form) — see [`reconcile_placement`]'s own doc for
+    /// how it protects a dwelling member from being evicted by a transient
+    /// failure-detector false positive.
     #[must_use]
-    pub fn reconcile(&self, recently_done: &BTreeSet<TabletId>) -> Vec<MetaCommand> {
+    pub fn reconcile(
+        &self,
+        recently_done: &BTreeSet<TabletId>,
+        recently_down: &BTreeSet<NodeId>,
+    ) -> Vec<MetaCommand> {
         reconcile_placement(
             &self.members,
             &self.tablets,
             &self.policies,
             &self.split_placing,
             recently_done,
+            recently_down,
         )
     }
 
     /// The pure load-rebalancing decision over this view — identical to
     /// [`Metadata::rebalance`] (both delegate to the same body). See
-    /// [`reconcile`](Self::reconcile) for `recently_done`.
+    /// [`reconcile`](Self::reconcile) for `recently_done`/`recently_down`.
     #[must_use]
-    pub fn rebalance(&self, recently_done: &BTreeSet<TabletId>) -> Option<MetaCommand> {
+    pub fn rebalance(
+        &self,
+        recently_done: &BTreeSet<TabletId>,
+        recently_down: &BTreeSet<NodeId>,
+    ) -> Option<MetaCommand> {
         rebalance_placement(
             &self.members,
             &self.tablets,
             &self.policies,
             &self.split_placing,
             recently_done,
+            recently_down,
         )
     }
 
@@ -2865,12 +2879,42 @@ fn active_candidates(members: &BTreeMap<NodeId, Member>) -> Vec<Candidate> {
 /// The shared body of [`Metadata::reconcile`] / [`PlacementView::reconcile`]: a
 /// pure, deterministic function of exactly the placement-relevant maps, so the
 /// caller can evaluate it on a narrow clone off the `RaftCore` lock.
+///
+/// **Issue #928's fully general form.** `recently_down` names every member
+/// the driver's own `node::recently_down_this_tick` has observed
+/// CONTINUOUSLY `Down` for less than `node::REPAIR_DWELL` — see that
+/// constant's own doc for the suspect/dead split this implements. For each
+/// policied tablet, before calling `replan_repair`, the shared
+/// `active_candidates` pool is augmented, PER TABLET, with a fresh
+/// [`Candidate`] for every one of THAT tablet's own current `replicas` named
+/// in `recently_down` (built from the member's own still-current labels, so
+/// residency/spread checks see the same topology they would if the member
+/// were still `Active`) — never added to the shared pool every OTHER
+/// tablet's own `replan_repair` call reads from. This is deliberate and
+/// LOAD-BEARING, not a stylistic choice: `animus_placement::choose` seeds its
+/// `must_keep` set only from nodes that are already present in the
+/// eligible/domain map it's given (see that function's own doc), so a
+/// dwelling member has to be IN the candidate list for `replan_repair`'s own
+/// keep-survivors logic to keep it — a side-channel "protect this id" set
+/// with no matching candidate entry would do nothing at all. Being
+/// per-tablet (gated on "already a replica of THIS tablet") is what keeps a
+/// dwelling member from ever being offered as a FRESH placement destination
+/// for some other tablet it doesn't already replicate — it is protected in
+/// place, never recruited elsewhere. Concretely: RF=3 on `{A,B,C}` with a
+/// spare `D` and `C` dwelling ⟹ the augmented pool is `{A,B,D,C}` ⟹
+/// `replan_repair` keeps `{A,B,C}` (already `RF`, `C` still eligible) ⟹
+/// `desired == t.replicas` ⟹ no `CasTabletReplicas`. RF=3 on `{A,C}` (already
+/// under-replicated) with `C` dwelling and `D` spare ⟹ augmented pool
+/// `{A,D,C}` ⟹ grows to `{A,C,D}` (`C` kept, `D` added) — growth-only repair
+/// (issue #957) still proceeds around a protected member, it just never
+/// evicts it.
 fn reconcile_placement(
     members: &BTreeMap<NodeId, Member>,
     tablets: &BTreeMap<TabletId, Tablet>,
     policies: &BTreeMap<TabletId, PlacementPolicy>,
     split_placing: &BTreeMap<TabletId, SplitPlacing>,
     recently_done: &BTreeSet<TabletId>,
+    recently_down: &BTreeSet<NodeId>,
 ) -> Vec<MetaCommand> {
     let candidates = active_candidates(members);
     policies
@@ -2897,13 +2941,34 @@ fn reconcile_placement(
             {
                 return None;
             }
+            // Issue #928 (fully general form): dwell-protect any of THIS
+            // tablet's own current replicas that are still inside their
+            // `REPAIR_DWELL` window — see this function's own doc above for
+            // why this must be a per-tablet candidate augmentation, not a
+            // side-channel keep set.
+            let dwelling: Vec<Candidate> = t
+                .replicas
+                .iter()
+                .filter(|r| recently_down.contains(r))
+                .filter_map(|r| {
+                    members
+                        .get(r)
+                        .map(|m| Candidate::new(r.clone(), m.labels.clone()))
+                })
+                .collect();
             // `replan_repair`, not plain `replan` (issue #957): this is the
             // repair pass, so a policy RF the current candidate pool can't
             // fully satisfy must still grow the tablet as far as it
             // genuinely can, rather than refusing to make any progress —
             // see that function's own doc for the growth-only contract
             // (it never shrinks an already-at-capacity set).
-            let desired = replan_repair(&t.replicas, &candidates, policy).ok()?;
+            let desired = if dwelling.is_empty() {
+                replan_repair(&t.replicas, &candidates, policy).ok()?
+            } else {
+                let mut augmented = candidates.clone();
+                augmented.extend(dwelling);
+                replan_repair(&t.replicas, &augmented, policy).ok()?
+            };
             // `replan_repair` returns a sorted set; `t.replicas` is
             // normalized (sorted + deduped) by `Tablet::new` /
             // `CasTabletReplicas`, so a direct comparison is a faithful
@@ -2940,12 +3005,26 @@ fn reconcile_placement(
 /// tablet's epoch on the same tick — harmless (the loser's CAS just rejects),
 /// but avoidable churn. Once `done` flips, the tablet rejoins this population
 /// like any other.
+///
+/// **`recently_down` (issue #928's fully general form) is accepted here only
+/// for parameter symmetry with [`reconcile_placement`] — it is UNUSED, and
+/// deliberately so.** `rebalance_step`'s own `eligible` filter already
+/// excludes any tablet whose *current* replica set does not `set_satisfies`
+/// its policy against the (un-augmented) `Active`-only candidate pool — and a
+/// `Down` member is never a candidate, so a tablet still carrying a dwelling
+/// replica already fails that check today, with or without this parameter,
+/// and is skipped entirely (never a rebalance source OR destination) until
+/// repair (`reconcile_placement`, which DOES consult `recently_down`) either
+/// confirms it in place past the dwell or evicts it. So there is nothing for
+/// rebalance's own balance-driven move to protect that it wasn't already
+/// leaving alone.
 fn rebalance_placement(
     members: &BTreeMap<NodeId, Member>,
     tablets: &BTreeMap<TabletId, Tablet>,
     policies: &BTreeMap<TabletId, PlacementPolicy>,
     split_placing: &BTreeMap<TabletId, SplitPlacing>,
     recently_done: &BTreeSet<TabletId>,
+    _recently_down: &BTreeSet<NodeId>,
 ) -> Option<MetaCommand> {
     let candidates = active_candidates(members);
     let entries: Vec<(TabletId, &[NodeId], &PlacementPolicy)> = policies
@@ -3131,27 +3210,47 @@ impl Metadata {
     /// `SPLIT_PLACING_RETARGET_DWELL_ACHIEVED`) and are skipped here too, for
     /// the identical reason an un-`done` entry is: `done` firing quickly
     /// (`SPLIT_PLACING_DONE_SETTLE`, 1.5s) means a freshly-realized
-    /// directed-Placing target falls under this **un-dwelled** repair pass
+    /// directed-Placing target falls under this repair pass
     /// almost immediately, so a failure-detector false positive on a target
-    /// member right after `done` reproduces the identical
+    /// member right after `done` would otherwise reproduce the identical
     /// achieved-target-discarded regression the pre-`done` dwell
     /// (`SPLIT_PLACING_RETARGET_DWELL_ACHIEVED`) exists to prevent — the two
     /// mechanisms are one continuous protection window, not two, from the
     /// achieved point through the caller's own grace period past `done`. An
     /// empty `recently_done` (every non-driver caller, all pure/unit tests)
-    /// reproduces this method's pre-fix behavior exactly. This does **not**
-    /// close issue #928's fully general form (ordinary `reconcile()` still
-    /// has no dwell at all for a tablet with no `split_placing` history) —
-    /// only the directed-Placing-specific instance this crate can name a
-    /// tablet set for.
+    /// reproduces this method's pre-fix behavior exactly.
+    ///
+    /// **Issue #928's fully general form is now closed too, by
+    /// `recently_down`** (2026-09-20): the driver's own `node::
+    /// recently_down_this_tick`/`node::REPAIR_DWELL` decision — every member
+    /// observed CONTINUOUSLY `Down` for less than `REPAIR_DWELL`. This used
+    /// to be the one gap `recently_done` didn't close: an ORDINARY tablet
+    /// with no `split_placing` history at all had no dwell whatsoever
+    /// against a failure-detector false positive — a member marked `Down` by
+    /// a single missed heartbeat round had its healthy replica evicted (and
+    /// a full replica rebuild triggered) on the very next `RECONCILE_
+    /// INTERVAL` tick, for every tablet it replicated. `reconcile_placement`
+    /// now augments its candidate pool, PER TABLET, with any of that
+    /// tablet's own current replicas named in `recently_down` — see that
+    /// function's own doc for the full mechanics (why this must be a
+    /// per-tablet augmentation rather than a side-channel keep set, and why
+    /// a dwelling member is still never offered as a fresh destination for a
+    /// tablet it doesn't already replicate). An empty `recently_down` (every
+    /// non-driver caller, all pure/unit tests) reproduces this method's
+    /// pre-`REPAIR_DWELL` behavior exactly.
     #[must_use]
-    pub fn reconcile(&self, recently_done: &BTreeSet<TabletId>) -> Vec<MetaCommand> {
+    pub fn reconcile(
+        &self,
+        recently_done: &BTreeSet<TabletId>,
+        recently_down: &BTreeSet<NodeId>,
+    ) -> Vec<MetaCommand> {
         reconcile_placement(
             &self.members,
             &self.tablets,
             &self.policies,
             &self.split_placing,
             recently_done,
+            recently_down,
         )
     }
 
@@ -3170,15 +3269,25 @@ impl Metadata {
     /// data-plane catch-up gate, not on the cadence. See [`reconcile`](Self::reconcile)
     /// for `recently_done` (issue #928/#921 fix) — extended here identically so a
     /// freshly-`done` child cannot be nudged by a balance-driven move either
-    /// before it has had a chance to settle.
+    /// before it has had a chance to settle. `recently_down` (issue #928's
+    /// fully general form) is accepted here purely for parameter symmetry
+    /// with [`reconcile`](Self::reconcile) — see `rebalance_placement`'s own
+    /// doc for why it is unused: a dwelling member is never a candidate, so
+    /// `rebalance_step`'s own `set_satisfies` check already excludes any
+    /// tablet still carrying one, with or without this parameter.
     #[must_use]
-    pub fn rebalance(&self, recently_done: &BTreeSet<TabletId>) -> Option<MetaCommand> {
+    pub fn rebalance(
+        &self,
+        recently_done: &BTreeSet<TabletId>,
+        recently_down: &BTreeSet<NodeId>,
+    ) -> Option<MetaCommand> {
         rebalance_placement(
             &self.members,
             &self.tablets,
             &self.policies,
             &self.split_placing,
             recently_done,
+            recently_down,
         )
     }
 
@@ -8542,7 +8651,7 @@ mod tests {
         // several simulated ticks, with no state mutation in between.
         for tick in 0..5 {
             assert_eq!(
-                m.reconcile(&BTreeSet::new()),
+                m.reconcile(&BTreeSet::new(), &BTreeSet::new()),
                 Vec::new(),
                 "tick {tick}: expected zero proposals with only 1 of 3 required \
                  candidates Active — a proposal here would be a storm against a \
@@ -8570,7 +8679,7 @@ mod tests {
             }),
             ApplyOutcome::Applied
         );
-        let proposals = m.reconcile(&BTreeSet::new());
+        let proposals = m.reconcile(&BTreeSet::new(), &BTreeSet::new());
         assert_eq!(
             proposals.len(),
             1,
@@ -9705,12 +9814,14 @@ mod tests {
         let mut without_entry = m.clone();
         without_entry.split_placing.remove(&TabletId(2));
         assert!(
-            !without_entry.reconcile(&BTreeSet::new()).is_empty(),
+            !without_entry
+                .reconcile(&BTreeSet::new(), &BTreeSet::new())
+                .is_empty(),
             "expected the sanity baseline to actually repair the violation"
         );
 
         assert!(
-            m.reconcile(&BTreeSet::new()).is_empty(),
+            m.reconcile(&BTreeSet::new(), &BTreeSet::new()).is_empty(),
             "repair must not touch a tablet with an un-done split_placing entry"
         );
 
@@ -9722,7 +9833,7 @@ mod tests {
         // that fix.
         m.split_placing.get_mut(&TabletId(2)).unwrap().done = true;
         assert!(
-            !m.reconcile(&BTreeSet::new()).is_empty(),
+            !m.reconcile(&BTreeSet::new(), &BTreeSet::new()).is_empty(),
             "a done split_placing entry must no longer exclude the tablet from repair"
         );
     }
@@ -9782,7 +9893,7 @@ mod tests {
             ApplyOutcome::Applied
         );
 
-        let proposals = m.reconcile(&BTreeSet::new());
+        let proposals = m.reconcile(&BTreeSet::new(), &BTreeSet::new());
         assert_eq!(
             proposals,
             vec![MetaCommand::CasTabletReplicas {
@@ -9802,7 +9913,7 @@ mod tests {
             assert_eq!(m.apply(command), ApplyOutcome::Applied);
         }
         assert_eq!(
-            m.reconcile(&BTreeSet::new()),
+            m.reconcile(&BTreeSet::new(), &BTreeSet::new()),
             Vec::new(),
             "already at the 2-node cluster's own capacity; no further churn until growth"
         );
@@ -9819,7 +9930,7 @@ mod tests {
             ApplyOutcome::Applied
         );
         assert_eq!(
-            m.reconcile(&BTreeSet::new()),
+            m.reconcile(&BTreeSet::new(), &BTreeSet::new()),
             vec![MetaCommand::CasTabletReplicas {
                 tablet: TabletId(2),
                 expected_epoch: m.tablets[&TabletId(2)].epoch,
@@ -9866,7 +9977,7 @@ mod tests {
             ApplyOutcome::Applied
         );
         assert_eq!(
-            m.reconcile(&BTreeSet::new()),
+            m.reconcile(&BTreeSet::new(), &BTreeSet::new()),
             Vec::new(),
             "already at capacity for this 2-node cluster; nothing to repair"
         );
@@ -9943,7 +10054,7 @@ mod tests {
         // WOULD repair it away from the achieved target (proves this
         // scenario is a real violation `replan` reacts to, not a vacuous
         // no-op either way) — this is the exact pre-fix behavior/bug.
-        let violation = m.reconcile(&BTreeSet::new());
+        let violation = m.reconcile(&BTreeSet::new(), &BTreeSet::new());
         assert!(
             !violation.is_empty(),
             "expected the sanity baseline to actually move the tablet off its \
@@ -9962,7 +10073,7 @@ mod tests {
         let mut recently_done = BTreeSet::new();
         recently_done.insert(TabletId(2));
         assert_eq!(
-            m.reconcile(&recently_done),
+            m.reconcile(&recently_done, &BTreeSet::new()),
             Vec::new(),
             "a recently-done tablet must not be repaired away during its grace window"
         );
@@ -9970,6 +10081,298 @@ mod tests {
             m.tablets[&TabletId(2)].replicas,
             vec![nid(1), nid(2), nid(3)],
             "the achieved target itself must be untouched"
+        );
+    }
+
+    // --- Issue #928 (fully general form): `REPAIR_DWELL`'s `recently_down` ---
+    //
+    // An ordinary tablet, no `split_placing` history at all — the general
+    // case `recently_done`/`SPLIT_PLACING_RETARGET_DWELL_ACHIEVED` never
+    // covered. Mirrors `reconcile_does_not_repair_away_an_achieved_recently_
+    // done_target`'s own shape: a "sanity" call with an empty `recently_down`
+    // first proves the scenario is a real violation the unfixed code would
+    // act on, then a populated `recently_down` proves the fix.
+
+    /// **(i)**: RF=3 on `{A,B,C}`, a spare `D` `Active`, and `C` named in
+    /// `recently_down` — the exact false-positive shape issue #928 reports
+    /// (a healthy replica evicted the instant its member is merely `Down`).
+    /// Without the fix (`recently_down` empty), `reconcile` proposes a
+    /// `CasTabletReplicas` dropping `C` for `D` — proving the bug. With `C`
+    /// named in `recently_down`, `reconcile` proposes nothing at all: `C` is
+    /// kept in place, exactly as if it were still `Active`.
+    #[test]
+    fn reconcile_keeps_a_recently_down_members_replica_during_the_repair_dwell() {
+        let mut m = Metadata::default();
+        for n in [1u64, 2, 3, 4] {
+            assert_eq!(
+                m.apply(&MetaCommand::UpsertMember {
+                    node: nid(n),
+                    labels: BTreeMap::new(),
+                    status: NodeStatus::Active,
+                }),
+                ApplyOutcome::Applied
+            );
+        }
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTablet {
+                tablet: TabletId(2),
+                table: Some("users".to_owned()),
+                range: KeyRange::whole(),
+                replicas: vec![nid(1), nid(2), nid(3)],
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::SetTabletPolicy {
+                tablet: TabletId(2),
+                policy: Some(PlacementPolicy::simple("users", 3)),
+            }),
+            ApplyOutcome::Applied
+        );
+        // n3 flaps `Down` — a failure-detector false positive in the real
+        // scenario, indistinguishable here from a genuine failure (that
+        // distinction is exactly what the dwell buys time for). n4 is the
+        // spare candidate that makes eviction possible at all.
+        assert_eq!(
+            m.apply(&MetaCommand::UpsertMember {
+                node: nid(3),
+                labels: BTreeMap::new(),
+                status: NodeStatus::Down,
+            }),
+            ApplyOutcome::Applied
+        );
+
+        // Sanity: WITHOUT `recently_down` naming n3, `reconcile` WOULD evict
+        // it for the spare — this is the exact pre-fix bug (issue #928).
+        let violation = m.reconcile(&BTreeSet::new(), &BTreeSet::new());
+        assert!(
+            !violation.is_empty(),
+            "expected the sanity baseline to actually evict the Down replica"
+        );
+        assert!(
+            matches!(&violation[0], MetaCommand::CasTabletReplicas { replicas, .. }
+                if !replicas.contains(&nid(3)) && replicas.contains(&nid(4))),
+            "expected the unprotected repair to evict n3 for the spare n4: {violation:?}"
+        );
+
+        // With n3 named in `recently_down` (as the real driver's
+        // `recently_down_this_tick` would within `REPAIR_DWELL`), `reconcile`
+        // must propose nothing: n3 stays in place.
+        let mut recently_down = BTreeSet::new();
+        recently_down.insert(nid(3));
+        assert_eq!(
+            m.reconcile(&BTreeSet::new(), &recently_down),
+            Vec::new(),
+            "a dwelling member's replica must not be evicted during REPAIR_DWELL"
+        );
+        assert_eq!(
+            m.tablets[&TabletId(2)].replicas,
+            vec![nid(1), nid(2), nid(3)],
+            "the dwelling member's replica must be untouched"
+        );
+    }
+
+    /// **(ii)**: `repair_dwell_still_grows_an_under_replicated_tablet` — the
+    /// dwell protects a replica IN PLACE, it does not disable the
+    /// growth-only repair (issue #957) around it. RF=3 on `{A,C}` (already
+    /// under-replicated) with `C` dwelling and `D` spare: the augmented
+    /// candidate pool is `{A,D,C}`, so `replan_repair` grows to `{A,C,D}` —
+    /// `C` kept (protected), `D` added (ordinary growth).
+    #[test]
+    fn repair_dwell_still_grows_an_under_replicated_tablet() {
+        let mut m = Metadata::default();
+        for n in [1u64, 3, 4] {
+            assert_eq!(
+                m.apply(&MetaCommand::UpsertMember {
+                    node: nid(n),
+                    labels: BTreeMap::new(),
+                    status: NodeStatus::Active,
+                }),
+                ApplyOutcome::Applied
+            );
+        }
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTablet {
+                tablet: TabletId(2),
+                table: Some("users".to_owned()),
+                range: KeyRange::whole(),
+                replicas: vec![nid(1), nid(3)],
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::SetTabletPolicy {
+                tablet: TabletId(2),
+                policy: Some(PlacementPolicy::simple("users", 3)),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::UpsertMember {
+                node: nid(3),
+                labels: BTreeMap::new(),
+                status: NodeStatus::Down,
+            }),
+            ApplyOutcome::Applied
+        );
+
+        let mut recently_down = BTreeSet::new();
+        recently_down.insert(nid(3));
+        let proposals = m.reconcile(&BTreeSet::new(), &recently_down);
+        assert_eq!(proposals.len(), 1, "expected a single growth proposal");
+        assert!(
+            matches!(&proposals[0], MetaCommand::CasTabletReplicas { replicas, .. }
+                if *replicas == vec![nid(1), nid(3), nid(4)]),
+            "expected growth to {{n1,n3,n4}} (n3 kept, n4 added): {proposals:?}"
+        );
+    }
+
+    /// **(iii)**: `a_dwelling_member_is_never_a_fresh_destination` — a
+    /// dwelling member must be protected only where it is ALREADY a
+    /// replica, never recruited as a fresh destination for some OTHER
+    /// under-replicated tablet it doesn't already host. n3 dwells but is not
+    /// a replica of tablet 5 (RF=3 on `{A,B}`, no spare beyond n3 itself):
+    /// with no OTHER eligible candidate, nothing is proposed at all — n3
+    /// must never appear in the result.
+    #[test]
+    fn a_dwelling_member_is_never_a_fresh_destination() {
+        let mut m = Metadata::default();
+        for n in [1u64, 2, 3] {
+            assert_eq!(
+                m.apply(&MetaCommand::UpsertMember {
+                    node: nid(n),
+                    labels: BTreeMap::new(),
+                    status: NodeStatus::Active,
+                }),
+                ApplyOutcome::Applied
+            );
+        }
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTablet {
+                tablet: TabletId(5),
+                table: Some("orders".to_owned()),
+                range: KeyRange::whole(),
+                // n3 is NOT a replica of this tablet.
+                replicas: vec![nid(1), nid(2)],
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::SetTabletPolicy {
+                tablet: TabletId(5),
+                policy: Some(PlacementPolicy::simple("orders", 3)),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::UpsertMember {
+                node: nid(3),
+                labels: BTreeMap::new(),
+                status: NodeStatus::Down,
+            }),
+            ApplyOutcome::Applied
+        );
+
+        let mut recently_down = BTreeSet::new();
+        recently_down.insert(nid(3));
+        // n3 is the only non-replica candidate, and it's Down/dwelling — not
+        // an ordinary `Active` candidate, so it must never be recruited as a
+        // fresh destination for tablet 5, whether or not it's protected in
+        // `recently_down`.
+        assert_eq!(
+            m.reconcile(&BTreeSet::new(), &recently_down),
+            Vec::new(),
+            "a dwelling member must never be offered as a fresh placement destination"
+        );
+
+        // With a genuine spare candidate `D` `Active`, tablet 5 grows onto
+        // it — never onto the dwelling n3.
+        assert_eq!(
+            m.apply(&MetaCommand::UpsertMember {
+                node: nid(4),
+                labels: BTreeMap::new(),
+                status: NodeStatus::Active,
+            }),
+            ApplyOutcome::Applied
+        );
+        let proposals = m.reconcile(&BTreeSet::new(), &recently_down);
+        assert_eq!(proposals.len(), 1);
+        assert!(
+            matches!(&proposals[0], MetaCommand::CasTabletReplicas { replicas, .. }
+                if *replicas == vec![nid(1), nid(2), nid(4)]),
+            "expected growth onto the genuine spare n4, never the dwelling n3: {proposals:?}"
+        );
+    }
+
+    /// **(iv)**: `leaving_members_are_repaired_away_regardless_of_the_dwell`
+    /// — the gate is `Down`-only. `Leaving` (a deliberate ADR 0032
+    /// decommission) must keep being repaired away immediately, never
+    /// protected by the dwell. **`reconcile_placement` itself is a pure
+    /// trust boundary: it protects exactly the ids `recently_down` names,
+    /// with no status re-check of its own** — so the real enforcement that
+    /// `Leaving` never gets that protection lives entirely in the
+    /// PRODUCER, `node::recently_down_this_tick`, which only ever inserts a
+    /// member observed `NodeStatus::Down` (proven directly, over a real
+    /// `SimEnv`, by `node::tests::
+    /// recently_down_this_tick_never_tracks_leaving_or_joining`). This test
+    /// proves the consumer side with the realistic input the real driver
+    /// actually produces — an EMPTY `recently_down` for a `Leaving` member,
+    /// since it was never inserted — and that `reconcile` still evicts it
+    /// immediately, exactly as before this fix.
+    #[test]
+    fn leaving_members_are_repaired_away_regardless_of_the_dwell() {
+        let mut m = Metadata::default();
+        for n in [1u64, 2, 3, 4] {
+            assert_eq!(
+                m.apply(&MetaCommand::UpsertMember {
+                    node: nid(n),
+                    labels: BTreeMap::new(),
+                    status: NodeStatus::Active,
+                }),
+                ApplyOutcome::Applied
+            );
+        }
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTablet {
+                tablet: TabletId(2),
+                table: Some("users".to_owned()),
+                range: KeyRange::whole(),
+                replicas: vec![nid(1), nid(2), nid(3)],
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::SetTabletPolicy {
+                tablet: TabletId(2),
+                policy: Some(PlacementPolicy::simple("users", 3)),
+            }),
+            ApplyOutcome::Applied
+        );
+        // n3 is decommissioning (ADR 0032) — a deliberate departure, not a
+        // liveness false positive.
+        assert_eq!(
+            m.apply(&MetaCommand::UpsertMember {
+                node: nid(3),
+                labels: BTreeMap::new(),
+                status: NodeStatus::Leaving,
+            }),
+            ApplyOutcome::Applied
+        );
+
+        // The realistic input: `recently_down` is empty, since the real
+        // driver's `recently_down_this_tick` never inserts a `Leaving`
+        // member (only `Down` — see that function's own dedicated node.rs
+        // tests). `reconcile` must still evict n3 immediately.
+        let proposals = m.reconcile(&BTreeSet::new(), &BTreeSet::new());
+        assert_eq!(
+            proposals.len(),
+            1,
+            "expected the Leaving replica to be moved off"
+        );
+        assert!(
+            matches!(&proposals[0], MetaCommand::CasTabletReplicas { replicas, .. }
+                if !replicas.contains(&nid(3)) && replicas.contains(&nid(4))),
+            "expected n3 (Leaving) evicted for the spare n4: {proposals:?}"
         );
     }
 
@@ -10073,7 +10476,7 @@ mod tests {
             ApplyOutcome::Applied
         );
 
-        let proposed = m.reconcile(&BTreeSet::new());
+        let proposed = m.reconcile(&BTreeSet::new(), &BTreeSet::new());
         let targets: Vec<TabletId> = proposed
             .iter()
             .map(|c| match c {
@@ -10090,7 +10493,7 @@ mod tests {
         // The rebalancer proposes nothing for the frozen set either (the
         // Active tablet's set violates policy, so rebalance skips it by its
         // own pre-existing rule; nothing else is eligible at all).
-        assert!(m.rebalance(&BTreeSet::new()).is_none());
+        assert!(m.rebalance(&BTreeSet::new(), &BTreeSet::new()).is_none());
     }
 
     /// `DropTableTablets` (ADR 0024): removes every tablet scoped to the table —
