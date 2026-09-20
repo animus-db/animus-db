@@ -7521,6 +7521,39 @@ comment on `PanicSafeTempDir` has the full account. Regression
 (deterministic, no ProdEnv, no timing dependency):
 `tests/panic_safe_teardown.rs`.
 
+**`support::TaskPanicGuard`/`support::watch_task_panics`/`support::
+assert_no_task_panics` (issue #939)** — the teardown check for the *other*
+half of "a background task can die silently mid-test": `ProdEnv::spawn`
+counts a spawned task's panic on the env (`animus-env/CLAUDE.md`'s matching
+entry), and `Node::spawned_task_panics()`/`first_spawned_task_panic()` sum/
+pick across a node's role envs, but neither *fails a test* on its own — a
+test still has to check. `watch_task_panics(&[&node, ...])` returns a
+`TaskPanicGuard` that, on a non-panicking drop, panics loudly if any
+watched node counted one, naming the count and the first message — so the
+issue's Run-6 shape (a leader's apply task panics on a real `wal
+group-commit sync failed`, the replica quietly stops applying, and the
+test's own assertions happen to pass some other way) can never again report
+ok. Non-panicking-only on purpose: a genuine assertion failure already
+unwinding must never also panic in `Drop` (that aborts the process instead
+of reporting either failure cleanly) — same discipline as
+`PanicSafeTempDir`'s own panicking-vs-not branch, just inverted (that type
+acts only *while* panicking; this one only when *not*). `TaskPanicGuard`
+borrows its watched `Node`s (`Vec<&'a Node>`), not clones of their envs, so
+it must be dropped (`drop(guard)`, or let it fall out of an inner scope)
+before a caller that needs to *consume* the node (`support::stop`'s
+`shutdown_graceful().await; drop(node);` shape in `durable_restart.rs`) —
+`TaskPanicGuard::extend`/`::watch` add more nodes to an already-constructed
+guard (e.g. ones added later via `grow_deadline`). Adopted in
+`streams_e2e.rs` (including
+`cascade_split_walks_the_grandparent_chain_with_closed_shard_shape`, the
+test the issue names) and `durable_restart.rs`; **not** retrofitted into
+every `tests/*.rs` file that brings up a `Vec<Node>` — see
+`docs/lessons/testing/`'s matching 2026-09-19 entry for the scope decision
+and why a wider sweep is a separate, mechanical follow-up, not this fix's
+job. Proof, end to end against a real `ProdEnv` node: `tests/
+task_panic_guard.rs` (also covers the guard's own no-op-on-a-clean-node
+path, so this fix provably never changes a passing test's outcome).
+
 ## Benchmark
 
 `benches/cluster_bench.rs` (`cargo bench -p animusd`) is a hand-rolled

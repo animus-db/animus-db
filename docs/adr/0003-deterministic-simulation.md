@@ -119,6 +119,31 @@ above reads, and the gaps are exactly where prod-only bugs have already hidden:
   see that test's own doc for why an `iptables OUTPUT DROP` is the closest
   a single-host test can get). This is a `ProdEnv`-only fix behind the
   `prod` feature; `SimEnv` has no real sockets and is unaffected.
+- **`ProdEnv` spawned-task panics were invisible — closed, issue #939
+  (2026-09-19).** `Spawner::spawn`'s `tokio::spawn` kept only the task's
+  `AbortHandle` (needed for `shutdown`/`shutdown_and_wait`), never a
+  `JoinHandle` — so a panic inside a background driver/apply task (found
+  via a real leader's apply task panicking on a genuine `wal group-commit
+  sync failed` under disk pressure) was printed by the default panic hook
+  and then simply discarded: the task stopped running, silently, and
+  nothing — not the production node, not the test driving it — ever
+  observed it. **Fixed**: `spawn` wraps the future in `futures::
+  FutureExt::catch_unwind`, counts a caught panic (and remembers its first
+  message) on the env *before* `std::panic::resume_unwind`ing it, so
+  `tokio`'s own `JoinError`/panic-hook behavior is unchanged for any real
+  caller — this only adds an observation point. `ProdEnv::
+  spawned_task_panics()`/`first_spawned_task_panic()` expose the count/
+  message; `animusd::Node` sums/picks across its role envs; `animusd`'s
+  `tests/support::TaskPanicGuard` is the test-side teardown check built on
+  it (see `crates/animus-env/CLAUDE.md`'s and `crates/animusd/CLAUDE.md`'s
+  matching entries, and `docs/lessons/testing/`'s 2026-09-19 entry for the
+  two-layer "count at the seam, check at teardown" shape and the rejected
+  process-global-panic-hook alternative). An `abort()`ed (cancelled) task
+  never counts — cancellation drops the future without resuming its poll,
+  so `catch_unwind` never runs for it — which is what keeps every existing
+  simulated-kill-node test unaffected. `SimEnv` has no equivalent gap: its
+  cooperative single-threaded run-queue means a panicking task's poll
+  unwinds directly into the driving test, exactly like any other panic.
 - **`SimEnv` disk faults — closed, then extended.** The original gap (the sim
   disk never returned an error, never left a *partial* (torn) tail on crash,
   and could not corrupt a byte) was **closed in PR #24**: opt-in, seed-driven
