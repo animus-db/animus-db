@@ -5091,6 +5091,15 @@ fn spawn_common_tail(
 }
 
 impl BoundNode {
+    /// This node's own identity, as bound — the same [`NodeId`] [`Node::bind`]
+    /// was given. Lets a caller holding a bag of already-bound nodes (e.g. a
+    /// test fixture binding every node before starting any of them, issue
+    /// #627) recover which node is which without threading a separate index
+    /// alongside each one.
+    pub fn id(&self) -> &NodeId {
+        &self.id
+    }
+
     /// `(id, addr)` — the one entry this node contributes to the cluster peer
     /// book (ADR 0040 PR1: one identity, one internal `ProdEnv`, per node).
     /// `addr` is this node's own advertised `host:port` (ADR 0060) — see
@@ -5100,6 +5109,12 @@ impl BoundNode {
             self.id.clone(),
             advertised_addr(self.advertise_host.as_deref(), self.internal_addr),
         )]
+    }
+
+    /// The address the internal Raft wire (control + every hosted per-tablet
+    /// group, ADR 0026) listens on.
+    pub fn internal_addr(&self) -> SocketAddr {
+        self.internal_addr
     }
 
     /// The address clients connect to.
@@ -5120,6 +5135,13 @@ impl BoundNode {
     /// The address the intra-cluster RPC endpoint listens on (ADR 0047).
     pub fn intra_addr(&self) -> SocketAddr {
         self.intra_addr
+    }
+
+    /// The address animusd console listens on (ADR 0052) — a [`BoundNode`]
+    /// always hosts CP-data tablets (combined mode), so unlike
+    /// [`BoundDataNode::console_addr`] this is never optional.
+    pub fn console_addr(&self) -> SocketAddr {
+        self.console_addr
     }
 
     /// Wire the peer address book into the node's one env and start all
@@ -5689,13 +5711,60 @@ impl BoundNode {
         if !quiesce_after.is_zero() {
             // See `MIN_QUIESCE_AFTER`'s own doc for the full argument. The
             // CLI's own parser is the primary enforcement (a release build
-            // still refuses a misconfigured `--quiesce-after`); this is the
-            // second-layer belt for any other caller reaching this method.
+            // still refuses a misconfigured `--quiesce-after`); these are
+            // the second-layer belt for any other caller reaching this
+            // method. Two asserts, not one, since the two floors this
+            // constant folds together (issue #302, issue #992) have
+            // different applicability:
+            //
+            // - The `INDEX_DRAIN_INTERVAL` floor is UNCONDITIONAL — it's
+            //   the quiescence mechanism's own veto-freshness floor (issue
+            //   #302), which every quiescing group depends on regardless of
+            //   what else is configured. A value below it corrupts that
+            //   argument no matter which triggers this node runs.
+            // - The full `MIN_QUIESCE_AFTER` floor (which also folds in
+            //   `AUTO_SPLIT_INTERVAL`, issue #992) is CONDITIONAL on a
+            //   configured bytes/change-rate/ops-rate auto-split trigger —
+            //   the coupling this floor exists for is specifically between
+            //   quiescence and `auto_split_loop`'s own single `leader.
+            //   is_quiesced() { continue; }` skip, which gates all THREE of
+            //   those trigger arms identically (verified by reading the
+            //   loop, not assumed from the bytes case alone: `ChangeRate
+            //   Tracker`/`RequestRateTracker` both freeze at their last-
+            //   observed value once a tablet goes quiesced — the former via
+            //   `change_consumer_loop`'s own identical sweeper-skip, the
+            //   latter because it is only ever fed by a write, which
+            //   quiescence's own idle-clock precondition already rules out
+            //   — so the "whatever the last pre-quiescence tick already
+            //   checked still holds" argument applies to all three, not
+            //   just bytes). A quiesced group with NONE of the three
+            //   configured is not depended on by that skip at all. Four
+            //   existing fixtures legitimately run quiescence below
+            //   `AUTO_SPLIT_INTERVAL` (`index_drain.rs`'s `stream_sealer_
+            //   tests` at 300ms, `tests/cp_quiescence.rs` at 300ms) with
+            //   none of the three configured — sound, since #992's own
+            //   constraint is a property of that coupling, not of
+            //   quiescence alone.
             debug_assert!(
-                quiesce_after >= MIN_QUIESCE_AFTER,
+                quiesce_after >= index_drain::INDEX_DRAIN_INTERVAL,
                 "quiesce_after ({quiesce_after:?}) must be at least \
-                 MIN_QUIESCE_AFTER ({MIN_QUIESCE_AFTER:?}) or 0 to disable \
-                 quiescence — see that constant's own doc"
+                 INDEX_DRAIN_INTERVAL ({:?}) or 0 to disable quiescence — \
+                 this floor applies unconditionally, see MIN_QUIESCE_AFTER's \
+                 own doc (issue #302)",
+                index_drain::INDEX_DRAIN_INTERVAL
+            );
+            debug_assert!(
+                (auto_split_bytes_threshold.is_none()
+                    && auto_split_change_rate.is_none()
+                    && auto_split_ops_rate.is_none())
+                    || quiesce_after >= MIN_QUIESCE_AFTER,
+                "quiesce_after ({quiesce_after:?}) must be at least \
+                 MIN_QUIESCE_AFTER ({MIN_QUIESCE_AFTER:?}) whenever a bytes, \
+                 change-rate, or ops-rate auto-split threshold is configured \
+                 — auto_split_loop's quiesced-skip gates all three trigger \
+                 arms identically and is only sound if at least one sweep \
+                 observed the tablet awake since its last growth, see \
+                 MIN_QUIESCE_AFTER's own doc (issue #992)"
             );
             reconciler.enable_quiescence(quiesce_after);
         }
@@ -7457,11 +7526,35 @@ impl BoundDataNode {
         // (every pre-S-06 call site) disables it entirely, zero behavior
         // change.
         if !quiesce_after.is_zero() {
+            // Two asserts, not one — identical contract/rationale to
+            // `BoundNode::start_with_growth`'s own gate above: the
+            // `INDEX_DRAIN_INTERVAL` half (issue #302) is unconditional,
+            // the full `MIN_QUIESCE_AFTER` (which also folds in
+            // `AUTO_SPLIT_INTERVAL`, issue #992) is conditional on a
+            // configured bytes/change-rate/ops-rate auto-split trigger —
+            // `auto_split_loop`'s single quiesced-skip gates all three
+            // arms identically. See that call site's own doc for the full
+            // reasoning.
             debug_assert!(
-                quiesce_after >= MIN_QUIESCE_AFTER,
+                quiesce_after >= index_drain::INDEX_DRAIN_INTERVAL,
                 "quiesce_after ({quiesce_after:?}) must be at least \
-                 MIN_QUIESCE_AFTER ({MIN_QUIESCE_AFTER:?}) or 0 to disable \
-                 quiescence — see that constant's own doc"
+                 INDEX_DRAIN_INTERVAL ({:?}) or 0 to disable quiescence — \
+                 this floor applies unconditionally, see MIN_QUIESCE_AFTER's \
+                 own doc (issue #302)",
+                index_drain::INDEX_DRAIN_INTERVAL
+            );
+            debug_assert!(
+                (auto_split_bytes_threshold.is_none()
+                    && auto_split_change_rate.is_none()
+                    && auto_split_ops_rate.is_none())
+                    || quiesce_after >= MIN_QUIESCE_AFTER,
+                "quiesce_after ({quiesce_after:?}) must be at least \
+                 MIN_QUIESCE_AFTER ({MIN_QUIESCE_AFTER:?}) whenever a bytes, \
+                 change-rate, or ops-rate auto-split threshold is configured \
+                 — auto_split_loop's quiesced-skip gates all three trigger \
+                 arms identically and is only sound if at least one sweep \
+                 observed the tablet awake since its last growth, see \
+                 MIN_QUIESCE_AFTER's own doc (issue #992)"
             );
             reconciler.enable_quiescence(quiesce_after);
         }
@@ -8012,23 +8105,69 @@ impl Default for StreamSealKnobs {
 /// testing discipline — see [`StreamSealKnobs::default`]'s own precedent).
 pub const DEFAULT_STREAM_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// **The `--quiesce-after` correctness floor (issue #302 fix).** A nonzero
-/// `quiesce_after` shorter than this can reintroduce the stale-veto race the
-/// fix closes: `RaftCore::quiesce_entry_ok`'s freshness clause only rejects
-/// an observation that's gone stale *since it was made* — it has no teeth
+/// **The `--quiesce-after` correctness floor — now the max of TWO
+/// independent per-loop constraints, not just the original one (issue
+/// #302, then issue #992).**
+///
+/// (a) **Issue #302 — `change_consumer_loop`'s veto-freshness argument.** A
+/// nonzero `quiesce_after` shorter than `index_drain::INDEX_DRAIN_INTERVAL`
+/// can reintroduce the stale-veto race that fix closed:
+/// `RaftCore::quiesce_entry_ok`'s freshness clause only rejects an
+/// observation that's gone stale *since it was made* — it has no teeth
 /// against a tablet `change_consumer_loop` has never observed at all (see
 /// that field's own doc for why the "never engaged" sentinel must impose no
 /// constraint). The remaining soundness argument is structural: the loop's
 /// own period bounds how long a hosted tablet can go unobserved, so as long
 /// as `quiesce_after` gives it at least one full period of headroom before
 /// the group's *own* idle-clock clause could first fire, at least one real
-/// sweep is guaranteed to have landed first. `0` (disabling quiescence
-/// entirely) is exempt — this floor only constrains a genuinely-enabled
-/// value. `main`'s CLI parsing rejects a smaller `--quiesce-after` outright;
-/// `Node::start_with_growth` `debug_assert`s it too, as a second layer for
-/// any caller that reaches `enable_quiescence` without going through the
-/// CLI (a test, or a future embedder).
-pub const MIN_QUIESCE_AFTER: Duration = index_drain::INDEX_DRAIN_INTERVAL;
+/// sweep is guaranteed to have landed first.
+///
+/// (b) **Issue #992 — `auto_split_loop`'s quiesced-skip soundness
+/// argument.** `auto_split_loop` skips a led tablet outright once
+/// `leader.is_quiesced()` is true, trusting that "whatever this tablet's
+/// last pre-quiescence tick already checked still holds" (ADR 0044 phase-1
+/// PR6's own doc). That trust is sound only if the loop got at least ONE
+/// tick while the tablet was genuinely non-quiesced since its last growth —
+/// i.e. only if `quiesce_after` is at least as long as `AUTO_SPLIT_INTERVAL`
+/// (the loop's own sweep period), so a sweep is guaranteed to land before
+/// the tablet can re-quiesce and go unobserved again. A `quiesce_after`
+/// below `AUTO_SPLIT_INTERVAL` (but at or above `INDEX_DRAIN_INTERVAL`, e.g.
+/// the pre-fix floor of 200ms) let a bursty tablet quiesce again before the
+/// next `AUTO_SPLIT_INTERVAL` tick ever observed it awake, silently
+/// skipping a real over-threshold check indefinitely — see the issue #992
+/// amendment to ADR 0048 for the full incident. **The single `is_quiesced()`
+/// skip gates the loop's bytes, change-rate, AND ops-rate trigger arms
+/// identically** (one `continue` ahead of all three checks) — `ChangeRate
+/// Tracker`/`RequestRateTracker` both freeze at their last-observed value
+/// once a tablet goes quiesced exactly like the byte estimate does (the
+/// former via `change_consumer_loop`'s own matching sweeper-skip, the
+/// latter because it is fed only by a write, which quiescence's own
+/// idle-clock precondition already rules out), so this argument — and this
+/// floor — applies whichever of the three triggers is configured, not
+/// bytes alone.
+///
+/// The floor is the **max** of both loops' own periods — general on
+/// purpose: **any future loop that adopts the same "skip a quiesced
+/// tablet outright" optimization must add its own period to this max**,
+/// not merely audit it. `0` (disabling quiescence entirely) is exempt —
+/// this floor only constrains a genuinely-enabled value. `main`'s CLI
+/// parsing rejects a smaller `--quiesce-after` outright; `Node::
+/// start_with_growth`/`Node::start_data_with_growth` each carry a matching
+/// `debug_assert!` too, as a second layer for any caller that reaches
+/// `enable_quiescence` without going through the CLI (a test, or a future
+/// embedder) — see those call sites' own doc for why the auto-split half of
+/// the belt is conditional on a bytes/change-rate/ops-rate trigger actually
+/// being configured, unlike the unconditional `INDEX_DRAIN_INTERVAL` half.
+pub const MIN_QUIESCE_AFTER: Duration =
+    max_duration(index_drain::INDEX_DRAIN_INTERVAL, AUTO_SPLIT_INTERVAL);
+
+/// `Duration::partial_cmp`/`Ord` are not `const fn` (as of this workspace's
+/// MSRV), so [`MIN_QUIESCE_AFTER`] can't be spelled with a plain `.max(..)`
+/// call at the const-eval site — `Duration::as_nanos` IS `const fn`, so
+/// comparing the nanosecond count is the const-evaluable equivalent.
+const fn max_duration(a: Duration, b: Duration) -> Duration {
+    if a.as_nanos() > b.as_nanos() { a } else { b }
+}
 
 /// **Default ON** at 5 seconds when `--quiesce-after` (or
 /// `cluster_settings.quiesce_after_secs`) is omitted (ADR 0044 phase-1 PR7)
@@ -14938,6 +15077,20 @@ pub async fn run_node_with_cluster_settings(
 /// with — see [`run_node_with_cluster_settings`]'s own doc for the identical
 /// "call the innermost layer directly" reasoning.
 ///
+/// This is the **bind half plus the start half** of node bring-up, back to
+/// back — see [`start_bound_node_with_streams_quiesce_and_ttl_sweep_interval`]
+/// for why the two are split into their own function at all (issue #627): a
+/// caller that must bind every node of a cluster before starting any of them
+/// (so a bind failure on node *k* never leaves nodes `0..k-1` already
+/// running, and so no later bind can ever race a still-open `:0`-allocated
+/// port — `Node::bind`'s six `TcpListener::bind` calls hold every socket open
+/// from the instant the OS assigns it) calls [`Node::bind`] and
+/// [`start_bound_node_with_streams_quiesce_and_ttl_sweep_interval`]
+/// separately instead of this function. This function's own observable
+/// behavior is unchanged: same argument values, same order of operations
+/// (bind, then the identical start-half work), byte-identical to before this
+/// split.
+///
 /// # Errors
 /// As [`run_node_with`].
 #[allow(clippy::too_many_arguments)]
@@ -14980,6 +15133,116 @@ pub async fn run_node_with_streams_quiesce_and_ttl_sweep_interval(
     // config, so it never campaigns and the group never elects a leader. See
     // `docs/engineering-lessons.md` for the incident this fixes.
     let bound = Node::bind(addrs.id.clone(), addrs, dir).await?;
+    start_bound_node_with_streams_quiesce_and_ttl_sweep_interval(
+        bound,
+        config,
+        index,
+        backend,
+        orphan_sweep_after,
+        stream_seal_knobs,
+        segment_store_config,
+        stream_retention,
+        quiesce_after,
+        heartbeat_batch,
+        auto_split_bytes,
+        auto_split_change_rate,
+        auto_split_ops_rate,
+        ttl_sweep_interval,
+        backup_store_config,
+        pitr_snapshot_cadence,
+        throttle_read_units,
+        throttle_write_units,
+        tablet_max_read_units,
+        tablet_max_write_units,
+        export_s3,
+        shared_wal,
+    )
+    .await
+}
+
+/// The **start half** of
+/// [`run_node_with_streams_quiesce_and_ttl_sweep_interval`], taking an
+/// already-[`Node::bind`]-bound node instead of binding one itself (issue
+/// #627).
+///
+/// # Why this split exists
+/// [`Node::bind`] does six `TcpListener::bind(..., 0)` calls (ADR 0060: an
+/// ephemeral port, OS-assigned *at bind time* and held open by the returned
+/// [`BoundNode`] until it — or the [`Node`] it becomes — is dropped/shut
+/// down). A caller that binds one node, then fully starts it, then binds the
+/// next (the shape [`run_node_with_streams_quiesce_and_ttl_sweep_interval`]
+/// itself uses, one node at a time) has a structural problem for a
+/// **multi-node** bring-up: if node *k*'s own bind or start fails, every
+/// node `0..k-1` is already a fully running process with live background
+/// tasks (Raft drivers, per-connection request handlers, …) that must then
+/// be torn down before the whole attempt can be retried — and a retry that
+/// reallocates fresh `:0` ports can, in principle, collide with a port one
+/// of those not-yet-torn-down tasks is still mid-flight on. Binding every
+/// node of a cluster FIRST (so a bind failure on any node leaves *zero*
+/// tasks running anywhere) and starting them only once every bind has
+/// succeeded closes that hole entirely — this is exactly what
+/// [`bind_cluster`]/[`start_cluster`] already do for `--cluster N`'s
+/// in-process dev cluster; this function is the equivalent split for a
+/// `--config`-driven, one-process-per-node bring-up (the shape a test
+/// fixture standing up several real `animusd` processes needs — see
+/// `tests/support/mod.rs::bring_up_deadline`). A later caller in this same
+/// spirit (an ADR 0060-shaped Kubernetes operator wanting to hold every pod's
+/// listener open across its own multi-step admission sequence) has the
+/// identical structural need.
+///
+/// # Behavior
+/// Byte-identical to the start-half of
+/// [`run_node_with_streams_quiesce_and_ttl_sweep_interval`] — same argument
+/// values, same order of operations, just with `Node::bind` itself factored
+/// out to the caller. `config`/`index` are still required (not derivable
+/// from `bound` alone): `client_route`/`intra_route`/`config.peer_book()`/
+/// `config.control_ids()`/`config.data_ids()` are all built from the
+/// **whole** `config.nodes` list, and `index` re-selects this node's own
+/// `RoleAddrs` entry the same way the bind half did, in case a knob this
+/// function does not itself take were ever added here later that needs it —
+/// today only `config.nodes[index]` is actually reread (the admin-address
+/// list and the two route maps already iterate every entry).
+///
+/// # Errors
+/// As [`run_node_with`].
+#[allow(clippy::too_many_arguments)]
+pub async fn start_bound_node_with_streams_quiesce_and_ttl_sweep_interval(
+    bound: BoundNode,
+    config: &ClusterConfig,
+    index: usize,
+    backend: StorageBackend,
+    orphan_sweep_after: Duration,
+    stream_seal_knobs: StreamSealKnobs,
+    segment_store_config: SegmentStoreConfig,
+    stream_retention: Duration,
+    quiesce_after: Duration,
+    heartbeat_batch: bool,
+    auto_split_bytes: Option<u64>,
+    auto_split_change_rate: Option<u64>,
+    auto_split_ops_rate: Option<u64>,
+    ttl_sweep_interval: Duration,
+    backup_store_config: BackupStoreConfig,
+    pitr_snapshot_cadence: Duration,
+    throttle_read_units: Option<u64>,
+    throttle_write_units: Option<u64>,
+    tablet_max_read_units: Option<u64>,
+    tablet_max_write_units: Option<u64>,
+    export_s3: Option<ExportS3Config>,
+    shared_wal: bool,
+) -> std::io::Result<Node> {
+    // Re-derived from `config`/`index` rather than threaded from the bind
+    // half's own already-fetched `RoleAddrs` — see this function's own doc.
+    // `config.nodes.get(index)` is not itself needed by anything below (every
+    // per-node value the start half reads comes from `bound` or iterates the
+    // whole `config.nodes` list), but is validated here anyway so an
+    // out-of-range `index` fails the same way it always has, rather than
+    // being silently ignored by a caller that only reaches this function.
+    if config.nodes.get(index).is_none() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "node index out of range",
+        ));
+    }
     // One node per process: a fresh per-process edge-state set (it registers only
     // this node's control handle — cross-process proposal forwarding is future
     // work, ADR 0013).
@@ -15044,6 +15307,64 @@ pub async fn run_node_with_streams_quiesce_and_ttl_sweep_interval(
             shared_wal,
         )
         .await
+}
+
+/// Like [`run_node`], but for an already-[`Node::bind`]-bound node (issue
+/// #627) — see [`start_bound_node_with_streams_quiesce_and_ttl_sweep_interval`]
+/// for why this split exists. Defaults every knob exactly the way
+/// [`run_node`]'s own wrapper chain does: [`DEFAULT_ORPHAN_SWEEP_AFTER`],
+/// default [`StreamSealKnobs`]/[`SegmentStoreConfig`],
+/// [`DEFAULT_STREAM_RETENTION`], quiescence/heartbeat-batching/auto-split/
+/// throttling off, [`ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL`], default
+/// [`BackupStoreConfig`], [`pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE`], no
+/// S3 export, and the per-group WAL layout (`shared_wal: false`).
+///
+/// # Errors
+/// As [`run_node`].
+pub async fn run_bound_node(
+    bound: BoundNode,
+    config: &ClusterConfig,
+    index: usize,
+) -> std::io::Result<Node> {
+    run_bound_node_with(bound, config, index, StorageBackend::default()).await
+}
+
+/// Like [`run_bound_node`], but selects the CP group's storage `backend` —
+/// the bound-node dual of [`run_node_with`].
+///
+/// # Errors
+/// As [`run_node_with`].
+pub async fn run_bound_node_with(
+    bound: BoundNode,
+    config: &ClusterConfig,
+    index: usize,
+    backend: StorageBackend,
+) -> std::io::Result<Node> {
+    start_bound_node_with_streams_quiesce_and_ttl_sweep_interval(
+        bound,
+        config,
+        index,
+        backend,
+        DEFAULT_ORPHAN_SWEEP_AFTER,
+        StreamSealKnobs::default(),
+        SegmentStoreConfig::default(),
+        DEFAULT_STREAM_RETENTION,
+        Duration::ZERO,
+        false,
+        None,
+        None,
+        None,
+        ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
+        BackupStoreConfig::default(),
+        pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
+        None,
+        None,
+        None,
+        None,
+        None,
+        false,
+    )
+    .await
 }
 
 /// Like [`run_node_with`], but with a test-tunable TTL reaper sweep
@@ -20053,6 +20374,22 @@ mod sim_cluster_control_membership_split;
 /// and `crates/animusd/CLAUDE.md`'s matching C-14 appendix.
 #[cfg(test)]
 mod sim_cluster_control_growth;
+
+/// ADR 0061 rung O, issue #997 — closes the "node assembly / raw
+/// `ClientRequest`" real-socket test group C-08's own close-out flagged
+/// for an assess-and-close decision rather than a dedicated rung: two of
+/// `tests/cp_plane.rs`'s five tests convert here
+/// (`cp_member_addresses_register_and_replicate`,
+/// `cp_tablet_splits_and_both_halves_serve`); a third
+/// (`reads_and_writes_route_through_the_raft_group`) is deleted outright
+/// as redundant with `tests/cluster.rs::
+/// cluster_serves_put_get_and_status_over_tcp`; the remaining two
+/// (`single_write_latency_is_low`, `tablet_auto_splits_on_bytes_with_
+/// skewed_value_sizes`) stay `ProdEnv` permanently. See `sim_cluster_
+/// cp_plane.rs`'s own module doc for the full per-test account and
+/// `crates/animusd/CLAUDE.md`'s matching entry.
+#[cfg(test)]
+mod sim_cluster_cp_plane;
 
 /// Regression for the issue #298 residual confirmed live under the
 /// un-pinned `SplitMode::InPlace` proof soak (ADR 0018's matching amendment,

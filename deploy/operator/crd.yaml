@@ -288,6 +288,21 @@ spec:
                       `PersistentVolumeClaim`, and `animusd` is started with `--ephemeral`
                       (the volatile in-memory storage engine) — data does not survive a
                       pod restart. Defaults to `false`.
+
+                      **Rejected together with more than one control voter (issue #989,
+                      ADR 0060's 2026-09-19 amendment)**: `true` here with `spec.
+                      controlNodes` resolving (via [`AnimusClusterSpec::
+                      control_nodes_or_default`]) to more than `1` fails admission
+                      (`crate::validate::validate_ephemeral_voters`, enforced by the
+                      validating webhook when installed, and by `crate::controller::
+                      reconcile`'s own fallback otherwise) — an `emptyDir` wipe on any
+                      config-affecting pod recreation gets a wiped EXISTING voter
+                      permanently refused by issue #667's boot-time check, and enough
+                      refusals cost the control group its quorum for good. A single voter
+                      (`controlNodes: 1`, or `nodes: 1` with `controlNodes` omitted) has no
+                      quorum to lose beyond itself, so that shape stays allowed — see
+                      [`CONDITION_EPHEMERAL_VOTER_STORAGE_HAZARD`]'s own doc for what it
+                      still warns about there.
                     nullable: true
                     type: boolean
                   size:

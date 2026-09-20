@@ -40,6 +40,12 @@
   See `docs/engineering-lessons.md` for the generalized lesson and the
   "Costs and risks" / §trigger sections below, updated in place rather than
   left describing the old, no-longer-true contract.
+- **2026-09-20 note:** this ADR's reconciler only ever reacts to `Metadata`
+  changes as they land (the "event-driven trigger" below) — including a
+  `Down`-driven `CasTabletReplicas` once the control-plane's OWN placement
+  decision (ADR 0005) has already committed one. It makes no claim about how
+  quickly that upstream decision itself reacts to a member going `Down`; see
+  ADR 0012's 2026-09-20 amendment (issue #928) for the dwell now gating it.
 - **Date:** 2026-08-07
 
 ## Context

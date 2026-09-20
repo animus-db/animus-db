@@ -26,6 +26,21 @@ pub struct StorageSpec {
     /// `PersistentVolumeClaim`, and `animusd` is started with `--ephemeral`
     /// (the volatile in-memory storage engine) — data does not survive a
     /// pod restart. Defaults to `false`.
+    ///
+    /// **Rejected together with more than one control voter (issue #989,
+    /// ADR 0060's 2026-09-19 amendment)**: `true` here with `spec.
+    /// controlNodes` resolving (via [`AnimusClusterSpec::
+    /// control_nodes_or_default`]) to more than `1` fails admission
+    /// (`crate::validate::validate_ephemeral_voters`, enforced by the
+    /// validating webhook when installed, and by `crate::controller::
+    /// reconcile`'s own fallback otherwise) — an `emptyDir` wipe on any
+    /// config-affecting pod recreation gets a wiped EXISTING voter
+    /// permanently refused by issue #667's boot-time check, and enough
+    /// refusals cost the control group its quorum for good. A single voter
+    /// (`controlNodes: 1`, or `nodes: 1` with `controlNodes` omitted) has no
+    /// quorum to lose beyond itself, so that shape stays allowed — see
+    /// [`CONDITION_EPHEMERAL_VOTER_STORAGE_HAZARD`]'s own doc for what it
+    /// still warns about there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ephemeral: Option<bool>,
 }
@@ -675,20 +690,46 @@ pub const CONDITION_CONTROL_NODES_SHRINK_REJECTED: &str = "ControlNodesShrinkRej
 /// is always the live control group itself.
 pub const CONDITION_CONTROL_NODES_GROWING: &str = "ControlNodesGrowing";
 /// Condition type name warning that `spec.storage.ephemeral: true` is a
-/// standing Raft safety hazard for this cluster's control voters (issue
-/// #864, root-causing the S-07d growth stall): every control voter's own
-/// Raft WAL lives on an `emptyDir`, which a StatefulSet rolling update
-/// (triggered by ANY config-affecting spec change, not just
-/// `spec.controlNodes` growth — the pod-template config-hash annotation
-/// rolls every pod, see `crates/animus-operator/CLAUDE.md`'s S-07d
-/// section) discards along with the deleted-and-recreated Pod. A wiped
-/// EXISTING voter is then permanently refused by issue #667's boot-time
-/// check (ADR 0009's 2026-09-15 amendment) — a correct, deliberate safety
-/// response, but one that can cost the group its quorum for good if
-/// enough voters are wiped this way. Set unconditionally whenever
-/// `storage.ephemeral` is `true` (regardless of `controlNodes`), cleared
-/// otherwise — see ADR 0060's own storage section for the full account.
+/// standing Raft safety hazard for this cluster's control voter(s) (issue
+/// #864, root-causing the S-07d growth stall): the voter's own Raft WAL
+/// lives on an `emptyDir`, which a StatefulSet rolling update (triggered by
+/// ANY config-affecting spec change, not just `spec.controlNodes` growth —
+/// the pod-template config-hash annotation rolls every pod, see
+/// `crates/animus-operator/CLAUDE.md`'s S-07d section) discards along with
+/// the deleted-and-recreated Pod.
+///
+/// **Since issue #989 (ADR 0060's 2026-09-19 amendment) this condition is
+/// only ever set for the still-*allowed* single-voter shape** (`spec.
+/// controlNodes` resolving to `1`) — a wipe there just restarts the lone
+/// voter as a fresh bootstrap, losing the cluster's own state but not its
+/// quorum, so it stays a warning. `controlNodes > 1` with `storage.
+/// ephemeral: true` is now rejected outright
+/// ([`CONDITION_EPHEMERAL_VOTER_STORAGE_REJECTED`] instead) rather than
+/// merely warned about: a wiped EXISTING voter of a multi-voter group is
+/// permanently refused by issue #667's boot-time check (ADR 0009's
+/// 2026-09-15 amendment), and enough refusals cost the group its quorum for
+/// good. Cleared whenever `storage.ephemeral` is not `true`, or whenever
+/// the rejected combination applies instead (the rejected condition
+/// supersedes this one) — see ADR 0060's own storage section for the full
+/// account.
 pub const CONDITION_EPHEMERAL_VOTER_STORAGE_HAZARD: &str = "EphemeralVoterStorageHazard";
+/// Condition type name used when `spec.storage.ephemeral: true` is paired
+/// with a resolved `spec.controlNodes > 1` (issue #989, ADR 0060's
+/// 2026-09-19 amendment) — `crate::validate::validate_ephemeral_voters`.
+/// Unlike [`CONDITION_EPHEMERAL_VOTER_STORAGE_HAZARD`], this is a hard
+/// refusal, not a warning: the validating webhook (`crate::webhook`, S-07e/
+/// ADR 0070) denies the write outright when installed; `crate::controller::
+/// reconcile`'s own fallback, for a cluster installed without the webhook,
+/// sets this condition, clears the informational hazard condition (this one
+/// supersedes it), and returns without touching any child resource at all
+/// — unlike `TlsSpecInvalid`/`S3SpecInvalid`/`StoreSpecInvalid`, which
+/// strip the bad field and keep reconciling, stripping `ephemeral` here
+/// would either try to flip an existing StatefulSet's data volume between
+/// `emptyDir` and a `volumeClaimTemplates`-backed PVC (immutable on an
+/// existing StatefulSet) or silently build a durable cluster on a fresh one
+/// nobody asked for — a visible refusal is safer than either. Cleared once
+/// the spec no longer matches the rejected combination.
+pub const CONDITION_EPHEMERAL_VOTER_STORAGE_REJECTED: &str = "EphemeralVoterStorageRejected";
 /// Condition type name used when a scale-down below `controlNodes` is
 /// refused.
 pub const CONDITION_SCALE_BELOW_CONTROL_NODES_REFUSED: &str = "ScaleBelowControlNodesRefused";

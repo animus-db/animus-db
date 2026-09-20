@@ -99,7 +99,7 @@ async fn cp_op_on_a_non_leader_node_is_forwarded_to_the_leader() {
     // must succeed — locally if it leads, else by forwarding. Retry while the CP
     // group elects its own leader.
     let mut last_err = String::new();
-    timeout(Duration::from_secs(25), async {
+    let write_result = timeout(Duration::from_secs(25), async {
         loop {
             match call(
                 client(0),
@@ -120,10 +120,15 @@ async fn cp_op_on_a_non_leader_node_is_forwarded_to_the_leader() {
             }
         }
     })
-    .await
-    .unwrap_or_else(|_| {
-        panic!("CP write (possibly forwarded) did not succeed in 25s; last error: {last_err}")
-    });
+    .await;
+    if write_result.is_err() {
+        let snapshot = support::cluster_status_snapshot(&config).await;
+        panic!(
+            "CP write (possibly forwarded) did not succeed in 25s; client addr dialled: \
+             {}; last error: {last_err}\ncluster status:\n{snapshot}",
+            client(0),
+        );
+    }
 
     // Read it back via *every* node. With one CP leader among three nodes, at least
     // two of these reads land on a non-leader and must be served by forwarding.
@@ -176,7 +181,7 @@ async fn batch_write_on_a_non_leader_node_is_forwarded() {
             })
             .collect();
         let mut last_err = String::new();
-        timeout(Duration::from_secs(25), async {
+        let batch_result = timeout(Duration::from_secs(25), async {
             loop {
                 match call(
                     client(i),
@@ -196,10 +201,15 @@ async fn batch_write_on_a_non_leader_node_is_forwarded() {
                 }
             }
         })
-        .await
-        .unwrap_or_else(|_| {
-            panic!("CP batch via node {i} did not succeed in 25s; last error: {last_err}")
-        });
+        .await;
+        if batch_result.is_err() {
+            let snapshot = support::cluster_status_snapshot(&config).await;
+            panic!(
+                "CP batch via node {i} did not succeed in 25s; client addr dialled: {}; \
+                 last error: {last_err}\ncluster status:\n{snapshot}",
+                client(i),
+            );
+        }
     }
 
     // Every key of every batch reads back (via node 0 — forwarded if it's not the
@@ -251,7 +261,7 @@ async fn second_table_forwards_across_processes() {
         ("cp_second", b"b".to_vec(), b"v2".to_vec()),
     ] {
         let mut last_err = String::new();
-        timeout(Duration::from_secs(25), async {
+        let write_result = timeout(Duration::from_secs(25), async {
             loop {
                 match call(
                     client(0),
@@ -272,10 +282,15 @@ async fn second_table_forwards_across_processes() {
                 }
             }
         })
-        .await
-        .unwrap_or_else(|_| {
-            panic!("CP write to {table} did not succeed in 25s; last error: {last_err}")
-        });
+        .await;
+        if write_result.is_err() {
+            let snapshot = support::cluster_status_snapshot(&config).await;
+            panic!(
+                "CP write to {table} did not succeed in 25s; client addr dialled: {}; \
+                 last error: {last_err}\ncluster status:\n{snapshot}",
+                client(0),
+            );
+        }
     }
 
     // Read the second table's key via *every* node: at least two reads land on a

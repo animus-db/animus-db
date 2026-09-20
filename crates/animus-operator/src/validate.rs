@@ -120,6 +120,56 @@ pub fn control_nodes_regression(prior: i32, target: i32) -> Option<Violation> {
     }
 }
 
+/// `spec.storage.ephemeral: true` together with a resolved `spec.
+/// controlNodes` above `1` is rejected outright (issue #989, ADR 0060's
+/// 2026-09-19 amendment to its own
+/// `CONDITION_EPHEMERAL_VOTER_STORAGE_HAZARD` discussion — that condition
+/// documents the still-allowed single-voter shape this function leaves
+/// alone).
+///
+/// The mechanism (also spelled out in `crate::controller`'s matching
+/// reconcile-time fallback and `crates/animus-operator/CLAUDE.md`'s issue
+/// #864 section): an `emptyDir` data volume is wiped by an ordinary pod
+/// recreation, and a `StatefulSet`'s pod-template config-hash annotation is
+/// **one shared value for the whole StatefulSet**
+/// (`desired::statefulset::restart_relevant_projection`), so *any*
+/// config-affecting spec edit — not just `controlNodes` itself —
+/// recreates every pod, including already-correct control voters whose own
+/// role never changes. A recreated EXISTING voter then comes back with an
+/// empty Raft WAL while its peers' committed config still names it with
+/// real history — exactly the case issue #667's boot-time check refuses
+/// **permanently**, on purpose (ADR 0009's 2026-09-15 amendment). Refuse
+/// enough pre-existing voters this way and the control group loses quorum
+/// for good: "one spec edit bricks the cluster."
+///
+/// A single voter (`spec.controlNodes` resolving to `1`) has no quorum to
+/// lose beyond itself — a wipe just restarts it as a fresh single-voter
+/// bootstrap, so a genuinely throwaway ephemeral dev cluster stays usable
+/// and is left alone here (it still gets the informational
+/// `CONDITION_EPHEMERAL_VOTER_STORAGE_HAZARD` condition from the
+/// reconciler, since even a lone voter's *own data* — not quorum — is lost
+/// on every recreation).
+#[must_use]
+pub fn validate_ephemeral_voters(new: &AnimusClusterSpec) -> Option<Violation> {
+    let control_nodes = new.control_nodes_or_default();
+    if new.storage.is_ephemeral() && control_nodes > 1 {
+        Some(Violation {
+            field: "spec.storage.ephemeral",
+            message: format!(
+                "spec.storage.ephemeral: true with spec.controlNodes resolving to \
+                 {control_nodes} (more than one control voter) is rejected: an emptyDir data \
+                 volume is wiped by any pod recreation a config-affecting spec edit triggers \
+                 (a StatefulSet rolling update, not just a controlNodes change), and issue \
+                 #667's boot-time check then permanently refuses each wiped EXISTING voter as \
+                 unsafe to re-admit — enough refusals cost the control group its quorum for \
+                 good. Use durable (PersistentVolumeClaim) storage, or set spec.controlNodes: 1."
+            ),
+        })
+    } else {
+        None
+    }
+}
+
 /// Every CRD-shape rule this crate enforces purely from the spec (and, for
 /// the grow-only rule, the previous spec) — the full rule list, run by both
 /// the reconciler and the webhook:
@@ -131,6 +181,11 @@ pub fn control_nodes_regression(prior: i32, target: i32) -> Option<Violation> {
 ///   resolved value, when `old` is given ([`control_nodes_regression`]) —
 ///   `None` on a CREATE review, or when the reconciler has no previously-
 ///   applied `ConfigMap` yet.
+/// - `spec.storage.ephemeral: true` requires `spec.controlNodes` (resolved)
+///   `<= 1` ([`validate_ephemeral_voters`]) — checked on every CREATE and
+///   UPDATE, so flipping an existing multi-voter cluster to ephemeral, or
+///   growing `controlNodes` past 1 on an already-ephemeral one, is rejected
+///   exactly like starting out that way.
 /// - `spec.tls` sets exactly one of `secretName`/`certManager`
 ///   ([`crate::crd::TlsSpec::validate`]).
 /// - `spec.s3` is internally consistent ([`crate::crd::S3StoreSpec::
@@ -156,6 +211,7 @@ pub fn validate_spec(
             new.control_nodes_or_default(),
         ));
     }
+    violations.extend(validate_ephemeral_voters(new));
 
     if let Some(tls) = &new.tls
         && let Err(e) = tls.validate()
@@ -310,6 +366,131 @@ mod tests {
                 .iter()
                 .any(|v| v.field == "spec.backupStore/spec.segmentStore")
         );
+    }
+
+    fn ephemeral_spec(nodes: i32, control_nodes: Option<i32>) -> AnimusClusterSpec {
+        let mut spec = base_spec(nodes, control_nodes);
+        spec.storage.ephemeral = Some(true);
+        spec
+    }
+
+    #[test]
+    fn ephemeral_with_one_control_node_is_allowed() {
+        let spec = ephemeral_spec(3, Some(1));
+        assert_eq!(validate_spec(None, &spec), Ok(()));
+    }
+
+    #[test]
+    fn ephemeral_with_two_control_nodes_is_a_violation() {
+        let spec = ephemeral_spec(3, Some(2));
+        let violations = validate_spec(None, &spec).unwrap_err();
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.field == "spec.storage.ephemeral")
+        );
+    }
+
+    #[test]
+    fn durable_with_two_control_nodes_is_allowed() {
+        let spec = base_spec(3, Some(2));
+        assert_eq!(validate_spec(None, &spec), Ok(()));
+    }
+
+    #[test]
+    fn durable_with_one_control_node_is_allowed() {
+        let spec = base_spec(3, Some(1));
+        assert_eq!(validate_spec(None, &spec), Ok(()));
+    }
+
+    #[test]
+    fn ephemeral_with_control_nodes_omitted_and_one_node_is_allowed() {
+        // `control_nodes_or_default()` resolves to `min(3, nodes)` — a
+        // single-node cluster with `controlNodes` omitted resolves to 1,
+        // the still-allowed shape.
+        let spec = ephemeral_spec(1, None);
+        assert_eq!(validate_spec(None, &spec), Ok(()));
+    }
+
+    #[test]
+    fn ephemeral_with_control_nodes_omitted_and_two_nodes_is_a_violation() {
+        let spec = ephemeral_spec(2, None);
+        let violations = validate_spec(None, &spec).unwrap_err();
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.field == "spec.storage.ephemeral")
+        );
+    }
+
+    #[test]
+    fn ephemeral_with_control_nodes_omitted_and_three_nodes_is_a_violation() {
+        // `nodes: 3` with `controlNodes` omitted resolves to `min(3, 3) ==
+        // 3` — the default three-voter shape most clusters start from, and
+        // exactly the combination issue #989 exists to catch.
+        let spec = ephemeral_spec(3, None);
+        let violations = validate_spec(None, &spec).unwrap_err();
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.field == "spec.storage.ephemeral")
+        );
+    }
+
+    #[test]
+    fn update_flipping_an_existing_multi_voter_cluster_to_ephemeral_is_rejected() {
+        let old = base_spec(3, Some(3));
+        let new = ephemeral_spec(3, Some(3));
+        let violations = validate_spec(Some(&old), &new).unwrap_err();
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.field == "spec.storage.ephemeral")
+        );
+    }
+
+    #[test]
+    fn update_growing_control_nodes_past_one_on_an_already_ephemeral_cluster_is_rejected() {
+        let old = ephemeral_spec(5, Some(1));
+        let new = ephemeral_spec(5, Some(2));
+        let violations = validate_spec(Some(&old), &new).unwrap_err();
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.field == "spec.storage.ephemeral")
+        );
+    }
+
+    #[test]
+    fn update_keeping_a_single_ephemeral_voter_with_other_edits_is_allowed() {
+        let old = ephemeral_spec(3, Some(1));
+        let mut new = ephemeral_spec(5, Some(1));
+        new.image = Some("ghcr.io/animus-db/animusd:v2".to_string());
+        assert_eq!(validate_spec(Some(&old), &new), Ok(()));
+    }
+
+    #[test]
+    fn ephemeral_violation_collects_alongside_other_violations() {
+        let mut spec = ephemeral_spec(0, Some(2));
+        spec.segment_store = Some("cluster".to_string());
+        let violations = validate_spec(None, &spec).unwrap_err();
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.field == "spec.storage.ephemeral"),
+            "{violations:?}"
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.field == "spec.backupStore/spec.segmentStore"),
+            "{violations:?}"
+        );
+        assert!(
+            violations.iter().any(|v| v.field == "spec.nodes"),
+            "{violations:?}"
+        );
+        assert!(violations.len() >= 3, "{violations:?}");
     }
 
     #[test]

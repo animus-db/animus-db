@@ -1462,7 +1462,62 @@ rows this section used to carry were fixed by the stale-prose sweep.
   subject area are both already recorded permanent; the separately-
   tracked "node assembly/raw `ClientRequest`" group (2 files/8 tests,
   unowned since C-08's own close-out) remains unowned and un-opened,
-  unchanged by this rung.
+  unchanged by this rung (taken up and closed as C-15, 2026-09-20 — see
+  below).
+
+### C-15 node assembly/raw ClientRequest assess-and-close (closed, ADR 0061 rung O)
+
+- **Problem:** the one class-D group C-14's own close-out confirmed was
+  still unowned — `crates/animusd/tests/cp_plane.rs` +
+  `crates/animusd/tests/cluster.rs` — had never been named by file in
+  this roadmap, `crates/animusd/CLAUDE.md`, or ADR 0061; every prior
+  mention carried only a bare count, "2 files / 8 tests," which had
+  itself gone stale the same day it was published (D4 PR 2, 2026-09-07,
+  moved two tests out of `cp_plane.rs` without restating it — the true
+  count by the time this rung assessed it was 2 files/6 tests) and was
+  repeated unread by four later close-outs. This is inventory hygiene,
+  not a coverage gap: no new `SimCluster` capability was needed to
+  resolve it.
+- **Disposition** (verified against the D3 snapshot commit and the
+  current tree): `reads_and_writes_route_through_the_raft_group`
+  **deleted** — strictly subsumed by `cluster.rs::cluster_serves_put_
+  get_and_status_over_tcp`'s stronger cross-node-overwrite/`Status`
+  proof over the identical `bind_cluster`/`start_cluster` entry point;
+  `cp_member_addresses_register_and_replicate` and `cp_tablet_splits_
+  and_both_halves_serve` **converted** to `sim_cluster_cp_plane.rs`
+  (member-address replication via `SimCluster::metadata(node).
+  node_addrs`; manual split via raw-KV `put_raw`/`raw_get` plus the real
+  `POST /admin/tablet/split` dispatch); `single_write_latency_is_low`
+  **permanent** (a real-TCP wall-clock median, class A); `tablet_auto_
+  splits_on_bytes_with_skewed_value_sizes` **permanent (kept) but no
+  longer sim-unreachable** — this rung's bounded spike found the raw-KV
+  path (`put_raw` + `set_auto_split_thresholds`) sidesteps the
+  DynamoDB-wire token-correlation problem D4 PR 2 recorded, so a
+  deterministic sibling now proves the byte-weighted-median balance too
+  (`sim_cluster_cp_plane.rs`, three scenarios/six tests in all; see ADR
+  0061's "Rung O" amendment); `cluster_serves_put_get_
+  and_status_over_tcp` **permanent** (the sole surviving real-socket
+  proof of the `bind_cluster`/`start_cluster` assembly). A second finding
+  along the way: `per_process.rs::per_process_nodes_form_a_cluster_
+  from_shared_config`, never previously named anywhere, is the D3
+  inventory's own unnamed second file of the separate "`--config`
+  bring-up 2/2" class-D line — permanent, same `Node::bind` identity
+  family as `config_node_identity.rs` (re-labeled by C-12/rung L).
+- **ADR:** [0061](adr/0061-testability-node-crate-simulator.md) (rung O's
+  own amendment has the full grep-verified ground truth, the count-drift
+  account, and the per-test disposition table).
+- **Size:** S — an assess-and-close decision over a small, already-
+  identified group, not a new fixture primitive.
+- **Depends:** C-14 (closed) — the close-out that reconfirmed this was
+  the one remaining unowned group.
+- **Status (2026-09-20):** closed. Result: 2 files / 6 tests (the true
+  pre-PR count) → 2 files / 3 permanent real-socket tests, 2 converted,
+  1 deleted; the `--config` bring-up 2/2 line is now fully named and
+  accounted for. Zero production code changed by the docs side of this
+  PR; the sibling code PR carries the conversions. No class-D residual
+  group remains unowned after this rung — see ADR 0061's "Rung O"
+  amendment's own "what remains unowned" accounting and `crates/animusd/
+  CLAUDE.md`'s consolidated closed-C-15 appendix.
 
 ## 4. Operator surfaces: admin API, dashboard, console, CLI
 
@@ -1547,6 +1602,7 @@ wave are independent and can run in parallel.
 | 13 | C-12 (closed 2026-09-09 — all nine PRs landed: #806, #808, #822, #823, #824, #825, #826, #827, plus PR 5) | Gated on C-11 (closed) — the next unowned residual group per C-08's, C-09's, C-10's, and C-11's own close-outs; taken up per Rung K's own close-out recommendation |
 | 14 | C-13 (closed 2026-09-13 — all seven PRs landed — seed/join discovery under `SimCluster`, ADR 0061 rung M) | Gated on C-12 (closed) — the next unowned residual group per C-08's through C-12's own close-outs |
 | 15 | C-14 (closed 2026-09-14 — all five PRs landed: #876, #884, #886, #887, plus PR 5 — combined control-plane voter growth under `SimCluster`, ADR 0061 rung N) | Gated on C-13 (closed) — the one residual C-13 PR 6 named precisely: a fresh `RaftNode<SimEnv>` joining the live control quorum after construction |
+| 16 | C-15 (closed 2026-09-20 — node assembly/raw `ClientRequest` assess-and-close, ADR 0061 rung O, #997) | Gated on C-14 (closed) — the last class-D group C-14's own close-out confirmed still unowned |
 
 Open issues mapped: none left (#375 closed by W-01, #319 by W-05). Filed
 from wave 2's own findings: #590 (the operator still emits the deleted

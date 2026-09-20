@@ -181,3 +181,35 @@ candidate_pool` for the live, Raft-driven regression (a 2-node cluster,
 RF-3 policy, the leader's own timer-driven `reconcile_loop` — never
 test-driven — growing a 1-replica tablet to 2 and converging idempotently
 until a 3rd candidate reaches the full RF).
+
+**2026-09-20 amendment (issue #928): repair's candidate pool is now
+dwell-protected, per tablet, against a failure-detector false positive.**
+`reconcile_placement` used to feed `active_candidates` (built fresh from
+`Active` members every `RECONCILE_INTERVAL` tick) straight to
+`replan_repair` — so a member marked `Down` by a single missed heartbeat
+round (never an actual failure) had its healthy replica evicted, and a full
+replica rebuild triggered, on the very next tick, for every tablet it
+hosted (see ADR 0012's own 2026-09-20 amendment for the failure-detection
+side of this fix). `reconcile_placement` now builds a PER-TABLET augmented
+candidate list before calling `replan_repair`: the shared
+`active_candidates` plus a fresh `Candidate` for each of THAT tablet's own
+current replicas named in the driver's `recently_down`
+(`node::recently_down_this_tick`/`node::REPAIR_DWELL`, the same
+`env.now()`-keyed dwell-tracking shape ADR 0062 §2's directed-Placing phase
+already established for the identical false-positive class). This is
+LOAD-BEARING as a per-tablet candidate augmentation, not a side-channel keep
+set: `animus_placement::choose` seeds `must_keep` only from nodes already
+present in the eligible/domain map it's handed, so a protected member has
+to actually be a candidate for `replan_repair`'s own survivor-keeping logic
+to keep it. Being per-tablet — gated on "already a replica of THIS
+tablet" — is what keeps a dwelling member from ever being recruited as a
+FRESH destination for some OTHER tablet it doesn't already replicate: it is
+protected in place, never offered elsewhere. `rebalance_placement` accepts
+the same `recently_down` parameter for symmetry but doesn't need to act on
+it — `rebalance_step`'s own `set_satisfies` check already excludes any
+tablet whose current set includes a non-candidate (i.e. non-`Active`, which
+a dwelling member still is) replica, so a dwell-protected tablet was already
+untouched by rebalance. See `node::REPAIR_DWELL`'s own doc for the dwell
+value and trade-off, `crates/animus-control/CLAUDE.md`'s matching entry, and
+`docs/lessons/code-patterns/` for the general "protect an existing replica
+without offering it for fresh placement" pattern this established.
