@@ -229,6 +229,17 @@ endpoint's hostname into the right CIDR for you; `egressCidrs` defaults to
 narrowed to your object store's real address range** in any environment
 where that egress must be restricted.
 
+**A private-CA `https://` endpoint needs its CA baked into the `animusd`
+image, not `spec.tls`.** The S3 client trusts only the container image's
+own OS trust store (`ca-certificates`, read via `rustls_native_certs`) —
+`spec.tls`'s CA is a separate trust anchor, feeding rustls's own mTLS
+config for the cluster's own ports, and is never merged into the OS store
+the S3 path reads. Point `endpoint=` at a CA already covered by a public
+root, or build a derived image that adds your CA (`FROM` the base image,
+`USER root`, `COPY` the CA in, `RUN update-ca-certificates`, back to `USER
+animus:animus`) and set that as `spec.image` — `scripts/e2e-kind.sh`'s own
+`E2E_S3_TLS=1` leg does exactly this and is the reference shape to copy.
+
 Invalid specs (neither store set, an empty `credentialsSecretName`, a
 malformed store URI, or `insecure_http=true` without `allowInsecureHttp`)
 are rejected: the controller sets an `S3SpecInvalid` status condition and

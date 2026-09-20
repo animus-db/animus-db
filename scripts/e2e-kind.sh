@@ -114,6 +114,69 @@
 #                       end to end anywhere; treat a first real CI failure
 #                       on the `e2e-kind-s3` job as this leg finding its
 #                       first real bug.
+#   E2E_S3_TLS       - "1" adds an https:// leg on top of E2E_S3 (issue
+#                       #991): implies E2E_S3=1 even if left unset (forced
+#                       inside the script, right after both are read).
+#                       `animus-s3`'s outbound TLS path
+#                       (`prod::build_tls_connector`, root store from
+#                       `rustls_native_certs::load_native_certs`, i.e. only
+#                       the runtime image's own `ca-certificates` package)
+#                       was, before this leg, proven PRESENT (the package
+#                       is installed) but never proven SUFFICIENT (nothing
+#                       drove a real `https://` handshake through it).
+#                       RustFS gets a second, TLS-terminating container in
+#                       front of its own plaintext port (a pinned nginx
+#                       sidecar, NGINX_IMAGE, reverse-proxying 9443 -> local
+#                       9000), fronted by a cert-manager Certificate off the
+#                       same CA hierarchy E2E_TLS installs (that hierarchy
+#                       is shared between the two flags — gated on
+#                       `E2E_TLS=1 || E2E_S3_TLS=1` — even though each flag
+#                       still issues its own leaf certificate), and
+#                       `spec.s3.backupStore` points at `https://rustfs.<ns>
+#                       .svc:9443` with no `insecure_http`/
+#                       `allowInsecureHttp` anywhere. Because the runtime
+#                       image runs as a non-root user (Dockerfile's `USER
+#                       animus:animus`), the trust anchor cannot be added to
+#                       a running pod's OS store the way a root image could
+#                       (`kubectl exec` + `update-ca-certificates` needs
+#                       root, and there is no product hook either —
+#                       `spec.tls`'s CA feeds rustls's own mTLS config
+#                       directly and is never merged into the OS store the
+#                       S3 path reads) — this leg instead builds a DERIVED
+#                       image (`FROM $ANIMUSD_IMAGE`, `USER root`, `COPY`
+#                       the e2e CA in, `RUN update-ca-certificates`, back to
+#                       `USER animus:animus`), `kind load`s it, and points
+#                       the AnimusCluster's own `spec.image` at it instead
+#                       of the untrusted base — which is what makes the
+#                       positive case (every pod goes Ready, and the
+#                       existing CreateBackup/DescribeBackup round trip
+#                       succeeds over TLS) prove sufficiency, not mere
+#                       presence. Before the AnimusCluster is even applied,
+#                       a NEGATIVE check runs a one-off pod on the
+#                       UNTRUSTED base image (`animusd --cluster 1
+#                       --ephemeral --backup-store 's3://...?
+#                       endpoint=https://...'`, credentials via the
+#                       `ANIMUS_S3_ACCESS_KEY_ID`/`ANIMUS_S3_SECRET_
+#                       ACCESS_KEY` env fallback — `animusd` probes an S3
+#                       backup store at startup, so a TLS failure there
+#                       fails the process) and asserts it reaches pod phase
+#                       `Failed` with both `TLS handshake with rustfs.<ns>
+#                       .svc:9443` and `UnknownIssuer` in its logs — proving
+#                       the positive case is not vacuously permissive (a
+#                       wrong cert/sidecar would fail this negative check
+#                       too, differently, which is exactly why it runs
+#                       first). An independent `aws --ca-bundle` TLS
+#                       pre-check from the bucket-creation pod isolates a
+#                       sidecar/cert problem from an animusd trust-store
+#                       problem before either matters. Default "0" (unset)
+#                       leaves the smoke byte-for-byte unchanged; setting
+#                       only E2E_S3_TLS (leaving E2E_S3 unset) still runs
+#                       the whole S3 leg, forced on. UNVERIFIED in this
+#                       sandbox, same `CAP_SYS_RESOURCE` reason every leg
+#                       above is — written carefully and `bash -n`-checked,
+#                       never run end to end anywhere; treat a first real
+#                       CI failure on the `e2e-kind-s3-tls` job as this leg
+#                       finding its first real bug.
 #   E2E_ENCRYPTION   - "1" adds an ADR 0069 S-03 PR 3 leg on top of the
 #                       plain-TCP path (mutually independent of E2E_TLS/
 #                       E2E_S3 — any combination may be set): creates a
@@ -195,6 +258,12 @@
 set -euo pipefail
 
 ANIMUSD_IMAGE="${ANIMUSD_IMAGE:-animusd:e2e}"
+# The image the AnimusCluster manifest actually uses — plain `$ANIMUSD_IMAGE`
+# on every path except E2E_S3_TLS=1, which points this at a derived image
+# (built below) that trusts the e2e CA. Keeping `ANIMUSD_IMAGE` itself
+# unmodified is deliberate: it is also the untrusted base the E2E_S3_TLS
+# negative check runs directly, and reused by E2E_WEBHOOK's own build.
+AC_IMAGE="$ANIMUSD_IMAGE"
 KIND_NODE_IMAGE="${KIND_NODE_IMAGE:-}"
 E2E_TLS="${E2E_TLS:-0}"
 CERT_MANAGER_VERSION="v1.16.2"
@@ -215,12 +284,21 @@ CA_CERT_NAME="e2e-ca"
 CA_SECRET_NAME="e2e-ca-secret"
 CLUSTER_ISSUER_NAME="e2e-ca-issuer"
 E2E_S3="${E2E_S3:-0}"
+# Issue #991: an https:// leg on top of E2E_S3 implies E2E_S3=1 even when
+# the caller left it unset — see this script's own header doc for E2E_S3_TLS.
+E2E_S3_TLS="${E2E_S3_TLS:-0}"
+if [ "$E2E_S3_TLS" = "1" ]; then
+    E2E_S3="1"
+fi
 # Pinned on purpose: an unpinned `:latest` on a third-party registry is a
 # dependency on someone else's publishing decisions, and #863 is what that
 # costs — `minio/minio` and `minio/mc` both stopped resolving on Docker Hub
 # and took this leg red on every branch at once. Bump these deliberately.
 RUSTFS_IMAGE="${RUSTFS_IMAGE:-rustfs/rustfs:1.0.0-rc.6}"
 AWSCLI_IMAGE="${AWSCLI_IMAGE:-amazon/aws-cli:2.36.44}"
+# Same pinning discipline, for E2E_S3_TLS=1's own TLS-terminating sidecar in
+# front of RustFS (issue #991) — verified to exist on Docker Hub.
+NGINX_IMAGE="${NGINX_IMAGE:-nginx:1.28.0-alpine}"
 # The UID/GID the rustfs container runs as; its data directory has to be
 # writable by that user or startup fails with permission denied.
 RUSTFS_UID="10001"
@@ -230,6 +308,13 @@ S3_ACCESS_KEY="e2eaccesskey"
 S3_SECRET_KEY="e2esecretkey123"
 S3_BUCKET="e2e-backups"
 S3_CREDS_SECRET_NAME="e2e-s3-creds"
+# E2E_S3_TLS=1 object names (issue #991) — see the "deploy RustFS" phase and
+# the derived-image/negative-check phases below.
+RUSTFS_CERT_NAME="rustfs-tls"
+RUSTFS_TLS_SECRET_NAME="rustfs-tls"
+RUSTFS_NGINX_CONFIGMAP_NAME="rustfs-nginx-tls-proxy"
+TRUSTED_IMAGE_TAG="animusd-e2e:s3-tls-trusted"
+S3_TLS_NEGATIVE_POD_NAME="s3-tls-untrusted-check"
 E2E_ENCRYPTION="${E2E_ENCRYPTION:-0}"
 ENCRYPTION_KEY_SECRET_NAME="e2e-encryption-key"
 E2E_WEBHOOK="${E2E_WEBHOOK:-0}"
@@ -276,6 +361,13 @@ PORT_FORWARD_LOG="${WORKDIR}/port-forward.log"
 PORT_FORWARD_PID_FILE="${WORKDIR}/port-forward.pid"
 MANIFEST_FILE="${WORKDIR}/animuscluster.yaml"
 CA_FILE="${WORKDIR}/ca.crt"
+# E2E_S3_TLS=1 only (issue #991): the e2e CA's own PEM bytes, extracted
+# directly from cert-manager's `$CA_SECRET_NAME` (not from `$CA_FILE` above,
+# which is only ever populated under E2E_TLS=1 and reads a *different*
+# Secret — the AnimusCluster's own leaf's copy of `ca.crt`). Used to build
+# the derived trusted image and to hand the bucket-creation pod's own TLS
+# pre-check a `--ca-bundle` file.
+E2E_CA_FILE="${WORKDIR}/e2e-rustfs-ca.crt"
 # Every `curl` hitting the dynamo OR the admin port, plain or TLS — kept as
 # arrays so "no extra args" (plain path) and "--cacert ... --resolve ..."
 # (TLS path) compose the same call sites without a second, near-duplicate
@@ -460,6 +552,23 @@ dump_diagnostics() {
                 --sort-by=.lastTimestamp 2>&1 | sed 's/^/  /' || true
             log "kubectl get certificaterequests -n ${NAMESPACE} -o wide"
             kubectl get certificaterequests -n "$NAMESPACE" -o wide 2>&1 | sed 's/^/  /' || true
+        fi
+        if [ "$E2E_S3_TLS" = "1" ]; then
+            # Issue #991: this leg's own three moving parts, dumped
+            # independently of the E2E_TLS block above (a different
+            # Certificate/leaf, and a sidecar container the AnimusCluster's
+            # own pods don't have) — best-effort throughout, same as every
+            # other diagnostics step in this function.
+            log "kubectl get certificate ${RUSTFS_CERT_NAME} -n ${NAMESPACE} -o wide (issue #991)"
+            kubectl get certificate "$RUSTFS_CERT_NAME" -n "$NAMESPACE" -o wide 2>&1 | sed 's/^/  /' || true
+            log "kubectl describe certificate ${RUSTFS_CERT_NAME} -n ${NAMESPACE}"
+            kubectl describe certificate "$RUSTFS_CERT_NAME" -n "$NAMESPACE" 2>&1 | sed 's/^/  /' || true
+            log "kubectl logs deployment/rustfs -c tls-proxy -n ${NAMESPACE} (tail 200)"
+            kubectl logs deployment/rustfs -c tls-proxy -n "$NAMESPACE" --tail=200 2>&1 | sed 's/^/  /' || true
+            if kubectl get pod "$S3_TLS_NEGATIVE_POD_NAME" -n "$NAMESPACE" >/dev/null 2>&1; then
+                log "kubectl logs ${S3_TLS_NEGATIVE_POD_NAME} -n ${NAMESPACE} (negative check, still present)"
+                kubectl logs "$S3_TLS_NEGATIVE_POD_NAME" -n "$NAMESPACE" 2>&1 | sed 's/^/  /' || true
+            fi
         fi
         # Issue #913 round 2: the tail alone cannot show *when* a
         # BadCertificate storm started relative to the pod's own boot — a
@@ -957,7 +1066,7 @@ kubectl apply -f "${REPO_ROOT}/deploy/operator/crd.yaml"
 kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
 
 TLS_SPEC_YAML=""
-if [ "$E2E_TLS" = "1" ]; then
+if [ "$E2E_TLS" = "1" ] || [ "$E2E_S3_TLS" = "1" ]; then
     phase "install cert-manager"
     kubectl apply -f "https://github.com/cert-manager/cert-manager/releases/download/${CERT_MANAGER_VERSION}/cert-manager.yaml"
     for deploy in cert-manager cert-manager-webhook cert-manager-cainjector; do
@@ -1015,19 +1124,154 @@ spec:
 EOF
     kubectl wait "clusterissuer/${CLUSTER_ISSUER_NAME}" --for=condition=Ready --timeout=60s
 
-    TLS_SPEC_YAML="  tls:
+    if [ "$E2E_TLS" = "1" ]; then
+        TLS_SPEC_YAML="  tls:
     certManager:
       issuerRef:
         name: ${CLUSTER_ISSUER_NAME}
         kind: ClusterIssuer"
+    fi
 fi
 
 S3_SPEC_YAML=""
 if [ "$E2E_S3" = "1" ]; then
+    RUSTFS_TLS_PROXY_CONTAINER=""
+    RUSTFS_TLS_PROXY_VOLUMES=""
+    # A Service with more than one port must name EVERY port (a hard
+    # Kubernetes API validation rule) — the plain E2E_S3=1 path's single
+    # port stays unnamed (unchanged), and E2E_S3_TLS=1 replaces the whole
+    # ports list with two named entries, never just appending an extra
+    # named port next to an unnamed one (which the API server would reject).
+    RUSTFS_SERVICE_PORTS="    - port: 9000
+      targetPort: 9000"
+    if [ "$E2E_S3_TLS" = "1" ]; then
+        phase "extract the e2e CA for RustFS trust (issue #991)"
+        # The bootstrap self-signed issuer's own CA Certificate (`isCA:
+        # true`, created in the shared cert-manager block above) writes its
+        # OWN certificate into `tls.crt` of its output Secret — for an
+        # `isCA` leaf off a self-signed issuer, `tls.crt` IS the CA
+        # certificate, not a leaf signed by something else (cert-manager
+        # also mirrors it into `ca.crt` on the same Secret; either key
+        # works here, `tls.crt` is used since it is the one every other
+        # Certificate/Secret pair in this script already reads for its own
+        # leaf). This is deliberately independent of `$CA_FILE` above,
+        # which only exists under E2E_TLS=1 and reads a different Secret
+        # (the AnimusCluster's own leaf's copy of `ca.crt`).
+        kubectl -n cert-manager get secret "$CA_SECRET_NAME" \
+            -o jsonpath='{.data.tls\.crt}' | base64 -d >"$E2E_CA_FILE"
+        [ -s "$E2E_CA_FILE" ] || fail "extracted e2e CA file is empty: ${E2E_CA_FILE}"
+        grep -q "BEGIN CERTIFICATE" "$E2E_CA_FILE" ||
+            fail "extracted e2e CA file does not look like a PEM certificate: ${E2E_CA_FILE}"
+
+        phase "issue the RustFS server certificate (issue #991)"
+        kubectl apply -f - <<EOF
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: ${RUSTFS_CERT_NAME}
+  namespace: ${NAMESPACE}
+spec:
+  secretName: ${RUSTFS_TLS_SECRET_NAME}
+  dnsNames:
+    - rustfs
+    - rustfs.${NAMESPACE}
+    - rustfs.${NAMESPACE}.svc
+    - rustfs.${NAMESPACE}.svc.cluster.local
+  # Explicit, like the operator's own Certificate (crate::desired::
+  # certificate sets "server auth"/"client auth"): cert-manager's default
+  # usages carry no extended-key-usage at all, and the point of this leg is
+  # to leave the trust chain nothing to be lenient about.
+  usages:
+    - server auth
+    - digital signature
+    - key encipherment
+  issuerRef:
+    name: ${CLUSTER_ISSUER_NAME}
+    kind: ClusterIssuer
+EOF
+        kubectl -n "$NAMESPACE" wait "certificate/${RUSTFS_CERT_NAME}" \
+            --for=condition=Ready --timeout=120s
+
+        phase "create the nginx TLS-proxy ConfigMap (issue #991)"
+        # A separate file + `--from-file`, not an inline heredoc: the config
+        # needs a literal `$http_host` (nginx's own variable syntax), which
+        # an unquoted heredoc interpolating ${NAMESPACE} etc. elsewhere in
+        # this script would instead try to expand as a shell variable.
+        # `client_max_body_size 0`/`proxy_request_buffering off`/
+        # `proxy_buffering off` matter for more than large objects: SigV4
+        # signs the exact bytes sent, and buffering/re-chunking here would
+        # risk the signature no longer matching what RustFS receives.
+        # `proxy_pass http://127.0.0.1:9000;` carries NO path component
+        # deliberately — SigV4 also signs the canonical URI and the `host`
+        # header verbatim, so nginx must forward the request URI and Host
+        # unmodified, never rewrite it.
+        RUSTFS_NGINX_CONF_FILE="${WORKDIR}/rustfs-nginx.conf"
+        cat >"$RUSTFS_NGINX_CONF_FILE" <<'NGINXCONF'
+worker_processes 1;
+events {
+    worker_connections 128;
+}
+http {
+    server {
+        listen 9443 ssl;
+        ssl_certificate     /etc/nginx/tls/tls.crt;
+        ssl_certificate_key /etc/nginx/tls/tls.key;
+        client_max_body_size 0;
+        proxy_request_buffering off;
+        proxy_buffering off;
+
+        location / {
+            proxy_http_version 1.1;
+            proxy_set_header Host $http_host;
+            proxy_set_header Connection "";
+            proxy_pass http://127.0.0.1:9000;
+        }
+    }
+}
+NGINXCONF
+        kubectl create configmap "$RUSTFS_NGINX_CONFIGMAP_NAME" -n "$NAMESPACE" \
+            --from-file=nginx.conf="$RUSTFS_NGINX_CONF_FILE" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+        # Composed into the Deployment/Service heredoc below, mirroring how
+        # TLS_SPEC_YAML/S3_SPEC_YAML themselves compose into the
+        # AnimusCluster manifest — an empty string here just leaves a blank
+        # line, which is valid YAML, so the E2E_S3=1-without-TLS path below
+        # is untouched byte-for-byte.
+        RUSTFS_TLS_PROXY_CONTAINER="        - name: tls-proxy
+          image: ${NGINX_IMAGE}
+          ports:
+            - containerPort: 9443
+          volumeMounts:
+            - {name: rustfs-tls, mountPath: /etc/nginx/tls, readOnly: true}
+            - {name: nginx-conf, mountPath: /etc/nginx/nginx.conf, subPath: nginx.conf, readOnly: true}
+          readinessProbe:
+            tcpSocket: {port: 9443}
+            periodSeconds: 2
+            failureThreshold: 30"
+        RUSTFS_TLS_PROXY_VOLUMES="        - name: rustfs-tls
+          secret: {secretName: ${RUSTFS_TLS_SECRET_NAME}}
+        - name: nginx-conf
+          configMap: {name: ${RUSTFS_NGINX_CONFIGMAP_NAME}}"
+        # Replaces (not appends to) the plain path's single unnamed port —
+        # see this block's own comment above on why both must be named once
+        # there is more than one.
+        RUSTFS_SERVICE_PORTS="    - name: http
+      port: 9000
+      targetPort: 9000
+    - name: https
+      port: 9443
+      targetPort: 9443"
+    fi
+
     phase "deploy RustFS (S-04 PR 3)"
     # `fsGroup` is load-bearing, not boilerplate: the image runs as non-root
     # UID/GID ${RUSTFS_UID}, and an emptyDir is created root-owned, so without it
     # rustfs cannot write its data directory and the pod never goes ready.
+    # `rustfs-tls`/`nginx-conf` (E2E_S3_TLS=1 only) mount as world-readable
+    # (Secret/ConfigMap default file mode), so the nginx sidecar — which
+    # runs as its own image default, not this pod-level fsGroup — can read
+    # them regardless.
     kubectl apply -f - <<EOF
 apiVersion: apps/v1
 kind: Deployment
@@ -1064,9 +1308,11 @@ spec:
             httpGet: {path: /health, port: 9000}
             periodSeconds: 2
             failureThreshold: 30
+${RUSTFS_TLS_PROXY_CONTAINER}
       volumes:
         - name: data
           emptyDir: {}
+${RUSTFS_TLS_PROXY_VOLUMES}
 ---
 apiVersion: v1
 kind: Service
@@ -1076,8 +1322,7 @@ metadata:
 spec:
   selector: {app: rustfs}
   ports:
-    - port: 9000
-      targetPort: 9000
+${RUSTFS_SERVICE_PORTS}
 EOF
     kubectl -n "$NAMESPACE" rollout status deployment/rustfs --timeout=120s
 
@@ -1091,15 +1336,36 @@ EOF
     # virtual-host addressing, which would resolve the bucket as a hostname
     # (`${S3_BUCKET}.rustfs.${NAMESPACE}.svc`) and fail DNS. A region must be
     # set for `mb` to sign at all, and is otherwise meaningless here.
-    kubectl run s3-mb --rm -i --restart=Never -n "$NAMESPACE" \
-        --image="$AWSCLI_IMAGE" \
-        --env="AWS_ACCESS_KEY_ID=${S3_ACCESS_KEY}" \
-        --env="AWS_SECRET_ACCESS_KEY=${S3_SECRET_KEY}" \
-        --env="AWS_DEFAULT_REGION=us-east-1" \
-        --command -- \
-        sh -ec "aws configure set default.s3.addressing_style path && \
+    #
+    # Issue #991 (E2E_S3_TLS=1 only): an independent TLS pre-check, in the
+    # SAME pod's own script, right after `mb` succeeds over plain http —
+    # `aws --ca-bundle` against `https://rustfs.${NAMESPACE}.svc:9443`
+    # isolates "the sidecar/cert is wrong" from "animusd's own trust store
+    # is wrong" before either question reaches an actual AnimusCluster pod.
+    # The CA is handed in as a base64 env var (`--env`, a literal string the
+    # Kubernetes API stores verbatim — never shell-interpreted) and decoded
+    # to a file inside the pod, since this image has no way to mount
+    # `$E2E_CA_FILE` from the host.
+    S3_MB_ENV_ARGS=(
+        --env="AWS_ACCESS_KEY_ID=${S3_ACCESS_KEY}"
+        --env="AWS_SECRET_ACCESS_KEY=${S3_SECRET_KEY}"
+        --env="AWS_DEFAULT_REGION=us-east-1"
+    )
+    S3_MB_SCRIPT="aws configure set default.s3.addressing_style path && \
                 aws --endpoint-url http://rustfs.${NAMESPACE}.svc:9000 \
                     s3 mb s3://${S3_BUCKET}"
+    if [ "$E2E_S3_TLS" = "1" ]; then
+        S3_MB_ENV_ARGS+=(--env="E2E_CA_B64=$(base64 -w0 "$E2E_CA_FILE")")
+        S3_MB_SCRIPT="${S3_MB_SCRIPT} && \
+                echo \"\$E2E_CA_B64\" | base64 -d >/tmp/e2e-ca.crt && \
+                aws --endpoint-url https://rustfs.${NAMESPACE}.svc:9443 --ca-bundle /tmp/e2e-ca.crt \
+                    s3 ls s3://${S3_BUCKET}"
+    fi
+    kubectl run s3-mb --rm -i --restart=Never -n "$NAMESPACE" \
+        --image="$AWSCLI_IMAGE" \
+        "${S3_MB_ENV_ARGS[@]}" \
+        --command -- \
+        sh -ec "$S3_MB_SCRIPT"
 
     phase "create the S3 credentials Secret"
     # access_key_id/secret_access_key are the two keys crate::desired::
@@ -1111,10 +1377,93 @@ EOF
         --from-literal=secret_access_key="$S3_SECRET_KEY" \
         --dry-run=client -o yaml | kubectl apply -f -
 
-    S3_SPEC_YAML="  s3:
+    if [ "$E2E_S3_TLS" = "1" ]; then
+        phase "build the trusted animusd image (issue #991)"
+        # A derived image, not `kubectl exec` + `update-ca-certificates`
+        # into a running pod: the runtime image runs as non-root
+        # `USER animus:animus` (Dockerfile), and writing
+        # /etc/ssl/certs needs root. This is also the honest production
+        # shape for a private-CA S3 endpoint — see
+        # crates/animus-operator/CLAUDE.md's own S3 section and
+        # deploy/operator/README.md.
+        TRUSTED_IMAGE_DIR="${WORKDIR}/trusted-image"
+        mkdir -p "$TRUSTED_IMAGE_DIR"
+        cp "$E2E_CA_FILE" "${TRUSTED_IMAGE_DIR}/e2e-ca.crt"
+        cat >"${TRUSTED_IMAGE_DIR}/Dockerfile" <<EOF
+FROM ${ANIMUSD_IMAGE}
+USER root
+COPY e2e-ca.crt /usr/local/share/ca-certificates/animus-e2e-ca.crt
+RUN update-ca-certificates
+USER animus:animus
+EOF
+        docker build -t "$TRUSTED_IMAGE_TAG" "$TRUSTED_IMAGE_DIR"
+        kind load docker-image "$TRUSTED_IMAGE_TAG" --name "$CLUSTER_NAME"
+        AC_IMAGE="$TRUSTED_IMAGE_TAG"
+
+        phase "negative check: untrusted image must fail the handshake (issue #991)"
+        # The whole point of this leg: proving the trust store is what
+        # makes the positive case pass, not merely present. `animusd`
+        # probes its configured S3 backup store at startup
+        # (`build_backup_store` -> `verify_or_init_segment_store_marker`),
+        # so a TLS failure here fails the process before it ever starts
+        # serving — `--restart=Never` means the pod goes `Failed`, not
+        # `CrashLoopBackOff`. Deliberately the UNTRUSTED `$ANIMUSD_IMAGE`,
+        # never the derived `$TRUSTED_IMAGE_TAG` above.
+        kubectl delete pod "$S3_TLS_NEGATIVE_POD_NAME" -n "$NAMESPACE" \
+            --ignore-not-found >/dev/null 2>&1 || true
+        kubectl run "$S3_TLS_NEGATIVE_POD_NAME" --restart=Never -n "$NAMESPACE" \
+            --image="$ANIMUSD_IMAGE" \
+            --env="ANIMUS_S3_ACCESS_KEY_ID=${S3_ACCESS_KEY}" \
+            --env="ANIMUS_S3_SECRET_ACCESS_KEY=${S3_SECRET_KEY}" \
+            -- --cluster 1 --ephemeral \
+            --backup-store "s3://${S3_BUCKET}?endpoint=https://rustfs.${NAMESPACE}.svc:9443"
+
+        s3_tls_negative_pod_failed() {
+            local phase
+            phase="$(kubectl get pod "$S3_TLS_NEGATIVE_POD_NAME" -n "$NAMESPACE" \
+                -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+            [ "$phase" = "Failed" ]
+        }
+        if ! wait_for "pod ${S3_TLS_NEGATIVE_POD_NAME} reaches phase Failed (issue #991)" \
+            120 3 -- s3_tls_negative_pod_failed; then
+            S3_TLS_NEGATIVE_LOGS="$(kubectl logs "$S3_TLS_NEGATIVE_POD_NAME" -n "$NAMESPACE" 2>&1 || true)"
+            kubectl delete pod "$S3_TLS_NEGATIVE_POD_NAME" -n "$NAMESPACE" \
+                --ignore-not-found >/dev/null 2>&1 || true
+            fail "untrusted image's pod ${S3_TLS_NEGATIVE_POD_NAME} never reached phase \
+Failed (this leg's whole point is that it must fail the TLS handshake against the \
+trusted-CA-only RustFS endpoint): ${S3_TLS_NEGATIVE_LOGS:-<no logs>}"
+        fi
+        # Logged unconditionally, not only on failure below — this leg's
+        # first real run is on the PR, so its own evidence belongs in the
+        # log even when every assertion passes.
+        S3_TLS_NEGATIVE_LOGS="$(kubectl logs "$S3_TLS_NEGATIVE_POD_NAME" -n "$NAMESPACE" 2>&1 || true)"
+        log "negative check pod logs (untrusted image, expected to fail the handshake): ${S3_TLS_NEGATIVE_LOGS}"
+        if ! grep -qF "TLS handshake with rustfs.${NAMESPACE}.svc:9443" <<<"$S3_TLS_NEGATIVE_LOGS"; then
+            kubectl delete pod "$S3_TLS_NEGATIVE_POD_NAME" -n "$NAMESPACE" \
+                --ignore-not-found >/dev/null 2>&1 || true
+            fail "negative check pod logs did not mention the expected TLS-handshake \
+target (rustfs.${NAMESPACE}.svc:9443): ${S3_TLS_NEGATIVE_LOGS}"
+        fi
+        if ! grep -qF "UnknownIssuer" <<<"$S3_TLS_NEGATIVE_LOGS"; then
+            kubectl delete pod "$S3_TLS_NEGATIVE_POD_NAME" -n "$NAMESPACE" \
+                --ignore-not-found >/dev/null 2>&1 || true
+            fail "negative check pod logs did not mention UnknownIssuer (the untrusted \
+base image's own OS trust store should reject the e2e CA): ${S3_TLS_NEGATIVE_LOGS}"
+        fi
+        log "negative check ok — the untrusted base image's pod failed the TLS \
+handshake as expected (UnknownIssuer)"
+        kubectl delete pod "$S3_TLS_NEGATIVE_POD_NAME" -n "$NAMESPACE" \
+            --ignore-not-found >/dev/null 2>&1 || true
+
+        S3_SPEC_YAML="  s3:
+    backupStore: \"s3://${S3_BUCKET}?endpoint=https://rustfs.${NAMESPACE}.svc:9443\"
+    credentialsSecretName: ${S3_CREDS_SECRET_NAME}"
+    else
+        S3_SPEC_YAML="  s3:
     backupStore: \"s3://${S3_BUCKET}?endpoint=http://rustfs.${NAMESPACE}.svc:9000&insecure_http=true\"
     credentialsSecretName: ${S3_CREDS_SECRET_NAME}
     allowInsecureHttp: true"
+    fi
 fi
 
 ENCRYPTION_SPEC_YAML=""
@@ -1171,7 +1520,7 @@ metadata:
   name: ${AC_NAME}
   namespace: ${NAMESPACE}
 spec:
-  image: ${ANIMUSD_IMAGE}
+  image: ${AC_IMAGE}
   nodes: 3
   controlNodes: 3
   # Storage deliberately omitted: durable PVC per pod (CRD default), never
@@ -1590,7 +1939,11 @@ fi
 log "post-growth GetItem ok — controlNodes growth left the DynamoDB wire serving"
 
 if [ "$E2E_S3" = "1" ]; then
-    phase "exercise DynamoDB wire: CreateBackup (S-04 PR 3, S3 backup store)"
+    if [ "$E2E_S3_TLS" = "1" ]; then
+        phase "exercise DynamoDB wire: CreateBackup (S-04 PR 3, S3 backup store, over TLS — issue #991)"
+    else
+        phase "exercise DynamoDB wire: CreateBackup (S-04 PR 3, S3 backup store)"
+    fi
     RESULT="$(dynamo_call "DynamoDB_20120810.CreateBackup" \
         '{"TableName":"E2EItems","BackupName":"e2e-s3-backup"}')"
     STATUS="$(dynamo_status "$RESULT")"
@@ -1615,7 +1968,11 @@ if [ "$E2E_S3" = "1" ]; then
         "${ADMIN_SCHEME}://${ADMIN_HOST}:${ADMIN_LOCAL_PORT}/admin/backup-store")"
     KIND="$(jq -r '.store.kind // empty' <<<"$RESULT")"
     [ "$KIND" = "s3" ] || fail "GET /admin/backup-store did not report store.kind \"s3\": ${RESULT}"
-    log "admin/backup-store reports store.kind=s3 (${RESULT})"
+    if [ "$E2E_S3_TLS" = "1" ]; then
+        log "admin/backup-store reports store.kind=s3 over an https:// endpoint (issue #991): ${RESULT}"
+    else
+        log "admin/backup-store reports store.kind=s3 (${RESULT})"
+    fi
 fi
 
 if [ "$E2E_WEBHOOK" = "1" ]; then
