@@ -341,11 +341,14 @@ truth; this map is just for navigation.
   data is reclaimed by a convergent **GC** (ADR 0024). Tablet ids are never
   reused. An idle CP-data group **quiesces** (ADR 0048, phase 1 of ADR
   0044's cheap-groups roadmap): no local activity for `--quiesce-after`
-  (default on, 5s) stops its Raft timers/heartbeats/apply-poll entirely
-  until a write, a peer message, or the reconciler's proactive wake (a
-  replica marked `Down`) touches it again — data-plane only (the control
-  group never quiesces), remains leader while quiesced, and admin/
-  dashboard reads never wake a group (`quiesced` is a pure diagnostic).
+  (default on, 5s; floor 2s, the auto-split sweep period, so a bursty
+  tablet is always observed awake by at least one bytes-split sweep — ADR
+  0048's issue #992 amendment) stops its Raft timers/heartbeats/apply-poll
+  entirely until a write, a peer message, or the reconciler's proactive
+  wake (a replica marked `Down`) touches it again — data-plane only (the
+  control group never quiesces), remains leader while quiesced, and
+  admin/dashboard reads never wake a group (`quiesced` is a pure
+  diagnostic).
 - **Placement, rebalancing & growth** — `animus-placement` (ADR 0005): pure
   policy engine (RF + residency labels + failure-domain spread), `replan`'s
   growth-only best-effort sibling `replan_repair` (the control plane's own

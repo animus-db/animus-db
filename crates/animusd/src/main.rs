@@ -123,10 +123,13 @@
 //! `--node` reads (see that flag's `run_single`/`run_data_config` doc and
 //! `animusd::config::ClusterSettings`'s own doc for the full per-field
 //! applicability breakdown, since a control-only node ignores this field
-//! entirely). **A nonzero value below `animusd::MIN_QUIESCE_AFTER` (200ms,
-//! the change-consumer sweep interval — issue #302 fix) is rejected at
-//! parse time**, since it can reopen the stale-veto quiescence race the fix
-//! closes; see that constant's own doc.
+//! entirely). **A nonzero value below `animusd::MIN_QUIESCE_AFTER` (2s, the
+//! longest sweep period among the loops that skip a quiesced tablet
+//! outright — the change-consumer sweep interval, 200ms, issue #302's own
+//! floor, and `auto_split_loop`'s own sweep interval, 2s, issue #992's
+//! floor) is rejected at parse time**, since it can reopen either loop's
+//! own soundness argument for skipping a quiesced tablet; see that
+//! constant's own doc.
 //!
 //! `--heartbeat-batch`/`--no-heartbeat-batch` (ADR 0044 phase 2 — C-02 PR 2
 //! shipped the mechanism off by default; PR 3, the cutover, flips the
@@ -1579,8 +1582,10 @@ fn resolve_cluster_settings(
 fn validate_quiesce_after(quiesce_after: Duration) -> Result<(), String> {
     if !quiesce_after.is_zero() && quiesce_after < animusd::MIN_QUIESCE_AFTER {
         return Err(format!(
-            "--quiesce-after must be at least {} ms (animusd's change-consumer \
-             sweep interval) or 0 to disable quiescence entirely; got {} ms",
+            "--quiesce-after must be at least {} ms (the longest sweep period \
+             among the loops that skip a quiesced tablet: change-consumer \
+             200ms, auto-split 2s) or 0 to disable quiescence entirely; got \
+             {} ms",
             animusd::MIN_QUIESCE_AFTER.as_millis(),
             quiesce_after.as_millis()
         ));
@@ -3564,6 +3569,38 @@ mod tests {
         let err = reject_data_config_seed_only_flags(false, true, false, false, false, false)
             .expect_err("--quiesce-after alongside --config must be rejected");
         assert!(err.contains("--quiesce-after"), "{err}");
+    }
+
+    /// Issue #992's own floor-raise regression: a `--quiesce-after` of
+    /// exactly 1s used to pass this validator (the pre-fix
+    /// `MIN_QUIESCE_AFTER` was 200ms) even though it sits below
+    /// `AUTO_SPLIT_INTERVAL` (2s) — the value `auto_split_loop`'s own
+    /// quiesced-skip soundness argument depends on. Confirmed red against
+    /// the unmodified predicate before this fix (see this task's own
+    /// commit message / PR description for the red-before evidence); this
+    /// value is now rejected.
+    #[test]
+    fn validate_quiesce_after_rejects_one_second() {
+        let err = validate_quiesce_after(Duration::from_secs(1))
+            .expect_err("1s is below the auto-split-sweep-period floor and must be rejected");
+        assert!(err.contains("--quiesce-after"), "{err}");
+        assert!(
+            err.contains(&animusd::MIN_QUIESCE_AFTER.as_millis().to_string()),
+            "error should name the floor in ms: {err}"
+        );
+    }
+
+    /// The floor itself is always accepted — the boundary case.
+    #[test]
+    fn validate_quiesce_after_accepts_the_floor_exactly() {
+        validate_quiesce_after(animusd::MIN_QUIESCE_AFTER)
+            .expect("the floor value itself must be accepted");
+    }
+
+    /// `0` (disable quiescence entirely) stays exempt from the floor.
+    #[test]
+    fn validate_quiesce_after_accepts_zero() {
+        validate_quiesce_after(Duration::ZERO).expect("0 (disabled) must always be accepted");
     }
 
     #[test]

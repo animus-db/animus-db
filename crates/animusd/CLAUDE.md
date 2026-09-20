@@ -3793,9 +3793,20 @@ crate's `CLAUDE.md`. This crate's own contribution:
   mutually consistent and each is a valid lower bound (issue #302 — see
   `animus-cp-data/CLAUDE.md`'s fork-D bullet for why reading it afterward,
   or stamping wall-clock time instead, would both be unsound). The floor
-  `MIN_QUIESCE_AFTER` (= `INDEX_DRAIN_INTERVAL`) is validated on
-  `--quiesce-after` so a nonzero setting can never sit below the sweep
-  period that feeds the veto.
+  `MIN_QUIESCE_AFTER` — now `max(INDEX_DRAIN_INTERVAL, AUTO_SPLIT_
+  INTERVAL)` = 2s, not just `INDEX_DRAIN_INTERVAL` (issue #992, ADR 0048's
+  2026-09-19 amendment) — is validated on `--quiesce-after` so a nonzero
+  setting can never sit below the sweep period that feeds the veto. The
+  second constraint this floor now also enforces: `auto_split_loop`
+  (below) skips a quiesced tablet outright for its bytes/change-rate/
+  ops-rate triggers, which is only sound if `quiesce_after` is at least
+  `AUTO_SPLIT_INTERVAL` — a shorter value could let a bursty tablet
+  re-quiesce before the one sweep that could have observed a threshold
+  crossing ever ran. The in-process `debug_assert!` belt for this second
+  half is conditional on a bytes/change-rate/ops-rate trigger actually
+  being configured (`BoundNode::start_with_growth`/`start_data_with_
+  growth`'s own doc has the full reasoning); the `INDEX_DRAIN_INTERVAL`
+  half stays unconditional.
 - **Sweeper skip** (the fleet-scale CPU win — PR5's veto alone only stops
   pointless Raft timer/heartbeat/apply-poll activity, not these loops' own
   per-tablet LSM scans): `change_consumer_loop`, `txn_resolver_loop`, and
