@@ -279,31 +279,28 @@
 //! could return the stale one first. `ClusterEdgeState::replace_control`
 //! (clears before pushing) is the real fix — see its own doc in `lib.rs`.
 //!
-//! # A resource-scale finding filed, not fixed: peak memory grows with
-//! `ANIMUS_DYNAMO_WIRE_SEEDS` depth
+//! # A resource-scale finding, since root-caused and fixed (PR #753)
 //!
-//! Measured on this rung's own development sandbox (4 vCPU / 15 GiB RAM,
-//! no swap): `sim_cluster_dynamo_corpus_is_consistent` at the default
-//! depth (8 scenarios) completes in ~114s with modest RSS; at
-//! `ANIMUS_DYNAMO_WIRE_SEEDS=4` (32 scenarios) it completed cleanly in
-//! ~460s; at `=12` (96 scenarios) process RSS was observed climbing
-//! through ~6.3 GiB at the ~10-minute mark and on to a ~13.8 GiB plateau
-//! by ~30-37 minutes, matching (not exceeding) the plateau independently
-//! observed at `=25` (200 scenarios) before the OS OOM-killed that run on
-//! this same sandbox. The plateau, not a strictly-monotonic per-scenario
-//! climb, and its rough independence from total scenario count once
-//! depth is large enough, are both consistent with ordinary glibc
-//! allocator high-water-mark behavior (freed memory not returned to the
-//! OS) rather than a true per-scenario leak — but this was not run to a
-//! confirmed root cause, only measured and reported per this task's own
-//! explicit instruction not to keep investigating it here. Filed as a
-//! resource-scale characteristic of the fixture worth a maintainer look
-//! (e.g. under a memory profiler, or with `MALLOC_ARENA_MAX=1`, which did
-//! not visibly change the trajectory in this sandbox), not a correctness
-//! defect and not fixed in this PR — CI's own already-established green
-//! `=25` figure (`~10m2s wall`, see the D2 PR 2 entry this file's own doc
-//! history references) implies CI's runners simply have materially more
-//! RAM than this 15 GiB sandbox.
+//! When this corpus was first built (rung D2 PR 2, PR #748) its peak
+//! memory was observed growing with `ANIMUS_DYNAMO_WIRE_SEEDS` depth on
+//! a 4 vCPU / 15 GiB sandbox — a ~13.8 GiB plateau at `=12` and at
+//! `=25` (the latter OOM-killed) — and was filed, not fixed, as a
+//! suspected glibc allocator high-water-mark characteristic. That theory
+//! was wrong. PR #753 (2026-09-08) root-caused it as two genuine `Arc`
+//! reference cycles, proved with `Weak`-handle tests rather than RSS
+//! inference: `animus_sim::Simulator`'s own task queue holding a
+//! perpetual background task whose future captured a `SimEnv` back to
+//! the same shared state, and `animus_node::SimRelayClient`'s handler
+//! slot holding a closure whose captured `ClientCtx` held another clone
+//! of the same relay. Neither `SimCluster` a scenario built was ever
+//! freed. `impl Drop for SimCluster` (`sim_cluster.rs`) now breaks both
+//! — every node's relay `shutdown()`, then `Simulator::shutdown()` — so
+//! each scenario's cluster is released at the end of `run_scenario`'s
+//! loop body. Post-fix, the full `--lib` suite peaks near 1 GB where it
+//! used to thrash at 12–14 GB. See ADR 0061's two 2026-09-08 amendments
+//! and `docs/roadmap.md`'s C-06 entry for the measured numbers and the
+//! `Weak`-handle methodology; issue #995, which quoted the pre-#753
+//! version of this section, is closed by this correction.
 //!
 //! # The cells
 //!
