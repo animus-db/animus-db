@@ -134,7 +134,7 @@
 //! bug needs. See `docs/engineering-lessons.md`'s matching entry.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 use animus_control::ProposeResult;
@@ -962,6 +962,18 @@ struct Group<S: StorageEngine + 'static> {
     crashed: BTreeSet<u64>,
     /// How this tier opens / re-opens a node's engine (used by `StopRestart`).
     factory: EngineFactory<S>,
+    /// Each replica's own engine handle, as originally created by `factory`
+    /// at group start — kept alongside (never touched by) `Nemesis::
+    /// StopRestart`'s own existing behavior, which deliberately re-opens a
+    /// FRESH engine via `factory` on every restart (issue #554's own
+    /// established `mem_engine`-tier exercise: an engine wipe on every
+    /// restart, regardless of prior catch-up history). A caller that instead
+    /// wants a restart to model a SURVIVING engine — issue #811's own exact
+    /// shape, where only the WAL/in-memory `RaftCore` are lost, never the
+    /// engine's own durable data — clones the relevant entry here instead of
+    /// calling `factory` again (see [`run_snapshot_caught_up_follower_
+    /// restart_scenario`]).
+    engines: Vec<S>,
 }
 
 impl<S: StorageEngine + 'static> Group<S> {
@@ -984,13 +996,24 @@ impl<S: StorageEngine + 'static> Group<S> {
                 sim.set_clock_drift_for(nid(id), drift);
             }
         }
+        // Built in one pass, in the exact per-id call order (`env` then
+        // `factory`) the pre-existing single-loop version used — never two
+        // separate passes (build every engine, then every node) — so
+        // whatever a tier's own `factory` does internally (e.g.
+        // `lsm_engine`'s own `sim.env`/disk calls) draws from the
+        // simulator in the byte-identical relative order it always has,
+        // and every existing frozen corpus seed's behavior is unchanged.
+        let mut engines: Vec<S> = Vec::with_capacity(ids.len());
         let nodes: Vec<Arc<Node<S>>> = ids
             .iter()
             .map(|&id| {
+                let env = sim.env(nid(id));
+                let engine = factory(&sim, id);
+                engines.push(engine.clone());
                 Arc::new(RaftKvNode::start(
-                    sim.env(nid(id)),
+                    env,
                     ids.clone().into_iter().map(nid).collect(),
-                    factory(&sim, id),
+                    engine,
                 ))
             })
             .collect();
@@ -1005,6 +1028,7 @@ impl<S: StorageEngine + 'static> Group<S> {
             }),
             crashed: BTreeSet::new(),
             factory,
+            engines,
         }
     }
 
@@ -1411,54 +1435,64 @@ fn run_scenario_on<S: StorageEngine + 'static>(
     group.heal_all();
     group.sim.run_for(DRAIN);
 
-    let keys = scenario.keyspace;
+    finalize_scenario_result(&mut group, scenario.seed, scenario.keyspace)
+}
+
+/// The shared tail every scenario runner ends with, once its group has
+/// already been healed and drained: snapshot the recorded history and run
+/// `check_cycles` on it, then a **converged-or-timeout** poll (never a
+/// fixed-deadline one-shot read) for the eventual durability/convergence
+/// properties. Factored out of [`run_scenario_on`] so the dedicated
+/// snapshot-caught-up-follower-restart runner (issue #990,
+/// [`run_snapshot_caught_up_follower_restart_scenario`]) reuses the
+/// identical full-group check rather than a second, independently
+/// maintained copy — this file's own established rule (see e.g.
+/// `animus-cp-data`'s `materialize_derived`) that a fix/check belongs in
+/// exactly one place, never two copies that start identical and diverge the
+/// first time either is touched alone.
+///
+/// Checked against **every** replica, not just indices {0, replicas-1}
+/// (issue #554 finding): `Nemesis::StopRestart`'s victim is "the current
+/// leader, or the first live replica" — an index that moves around with the
+/// leader election outcome, essentially arbitrary per seed/scenario, and for
+/// a >2-replica group can land on neither endpoint. A check that only ever
+/// reads the two fixed endpoints can silently never inspect the one replica
+/// an outage actually hit, so a real durability/convergence violation on
+/// that replica goes undetected. Reading every replica is cheap (`local_get`
+/// is a local read, no network round trip) and makes this a genuine
+/// full-group property instead of a two-corner sample.
+fn finalize_scenario_result<S: StorageEngine + 'static>(
+    group: &mut Group<S>,
+    seed: u64,
+    keys: u64,
+) -> ScenarioResult {
     let history = group.shared.rec.lock().unwrap().history().clone();
     let cycles = check_cycles(&history);
 
-    // Converged-or-timeout poll for the eventual properties: a lagging follower
-    // may still be catching up at the fixed drain, so re-read in bounded
-    // increments and stop early once both hold.
-    //
-    // Checked against **every** replica, not just indices {0, replicas-1}
-    // (issue #554 finding): `Nemesis::StopRestart`'s victim is "the current
-    // leader, or the first live replica" — an index that moves around with
-    // the leader election outcome, essentially arbitrary per seed/scenario,
-    // and for a >2-replica group can land on neither endpoint. A check that
-    // only ever reads the two fixed endpoints can silently never inspect
-    // the one replica an outage actually hit, so a real durability/
-    // convergence violation on that replica goes undetected. Reading every
-    // replica is cheap (`local_get` is a local read, no network round trip)
-    // and makes this a genuine full-group property instead of a two-corner
-    // sample.
     let all_states = |group: &Group<S>| -> Vec<BTreeMap<Key, Vec<u64>>> {
         (0..group.replicas)
             .map(|i| final_state(&group.nodes, i, keys))
             .collect()
     };
-    let mut states = all_states(&group);
-    let mut durability = combine_reports(
-        scenario.seed,
-        states.iter().map(|s| check_durability(&history, s)),
-    );
+    let mut states = all_states(group);
+    let mut durability =
+        combine_reports(seed, states.iter().map(|s| check_durability(&history, s)));
     let mut convergence = combine_reports(
-        scenario.seed,
+        seed,
         states[1..]
             .iter()
-            .map(|s| check_convergence(scenario.seed, &states[0], s)),
+            .map(|s| check_convergence(seed, &states[0], s)),
     );
     let poll_deadline = group.sim.now().0 + CONVERGENCE_BUDGET.as_nanos() as u64;
     while !(convergence.ok && durability.ok) && group.sim.now().0 < poll_deadline {
         group.sim.run_for(CONVERGENCE_POLL_STEP);
-        states = all_states(&group);
-        durability = combine_reports(
-            scenario.seed,
-            states.iter().map(|s| check_durability(&history, s)),
-        );
+        states = all_states(group);
+        durability = combine_reports(seed, states.iter().map(|s| check_durability(&history, s)));
         convergence = combine_reports(
-            scenario.seed,
+            seed,
             states[1..]
                 .iter()
-                .map(|s| check_convergence(scenario.seed, &states[0], s)),
+                .map(|s| check_convergence(seed, &states[0], s)),
         );
     }
 
@@ -1564,6 +1598,322 @@ fn assert_scenario_ok(tier: &str, s: &Scenario, r: &ScenarioResult) {
         "[{tier}] scenario {} did not converge: {:?} (seed={} skew_ns={skew_ns:?})",
         s.name, r.convergence.violations, s.seed
     );
+}
+
+// ---------------------------------------------------------------------------
+// A dedicated cell: a follower whose ENTIRE catch-up was a pure
+// `InstallSnapshot` (issue #990/#811). Not a `Nemesis` variant — see this
+// section's own doc for why the existing `faults: Vec<(Duration, Nemesis)>`
+// schedule/`Group::apply` machinery cannot express it, and why a bespoke
+// runner is used instead of forcing the shape through `run_scenario_on`.
+// ---------------------------------------------------------------------------
+
+/// `Nemesis::StopRestart`'s victim is "the current leader, or the first live
+/// replica" and `Nemesis::FollowerKill`'s is "the first live non-leader" —
+/// neither rule can ever land on a replica whose entire catch-up was a pure
+/// `InstallSnapshot` (no ordinary logged `AppendEntries` tail of its own
+/// ever committed locally), which is exactly issue #811's state: a genuine
+/// process restart (`sim.stop` + a fresh `RaftKvNode::start`) of such a
+/// replica used to livelock the apply task forever (`apply_and_compact`
+/// spinning `did_work = true` with no forward progress — see
+/// `animus-cp-data/tests/restart_after_install_snapshot.rs`'s module doc for
+/// the full mechanism), fixed by PR #937's two-line `apply_and_compact`
+/// change (this crate's own CLAUDE.md documents both). This corpus's own
+/// `stop_restart`/`fsync_lie_stop_restart`/`compaction_crossing_stop_
+/// restart_3` cells all restart a replica that was LIVE (on the `mem_engine`
+/// tier, "live" up to that tier's own always-fresh-engine wrinkle) right up
+/// to the moment of restart — none of them ever isolates a replica for the
+/// workload's whole life first, so none of them can reach the state this
+/// cell exists to test. This is therefore a **dedicated runner**, not an
+/// addition to `Nemesis`/`corpus_cells`/`run_scenario_on`: that machinery
+/// resolves every fault against "the live group at the time it fires"
+/// (`Group::apply`'s own doc), with no way to express "isolate this replica
+/// BEFORE the workload starts, keep it isolated through the whole write
+/// phase, heal it, poll for a specific durable precondition, THEN restart
+/// it" — forcing that shape through the generic schedule would need either
+/// a new `Nemesis` variant with a bespoke multi-step apply arm (breaking the
+/// "one fault, one apply() call" contract every other variant follows) or
+/// smuggling cross-cutting state through `Scenario`'s fields, both worse
+/// than a small, self-contained runner mirroring `run_scenario_on`'s own
+/// shape.
+const SNAPSHOT_CAUGHT_UP_RESTART_NAME: &str = "snapshot_caught_up_follower_stop_restart_3";
+
+/// Real wall-clock budget for the restart + heal/drain/converged-or-timeout
+/// window below — mirrors `restart_after_install_snapshot.rs`'s own
+/// `WATCHDOG_BUDGET`/`drive_bounded` exactly (see that file's module doc for
+/// why only a real OS-thread wall-clock bound catches this hang shape: the
+/// busy apply-task `Future::poll` never returns control to the executor at
+/// all, so neither `run_for`'s virtual-time deadline nor
+/// `run_until_quiescent`'s step cap can bound it). A healthy run finishes in
+/// a small fraction of a second of real wall time; this budget is generous
+/// by orders of magnitude so it never flakes on a loaded CI runner, while
+/// still turning a reintroduced #811 livelock into a loud test failure
+/// instead of a hung `cargo test` process.
+const SNAPSHOT_RESTART_WATCHDOG_BUDGET: Duration = Duration::from_secs(30);
+
+/// Bounded, converged-or-timeout poll for this cell's own precondition
+/// (`snapshot_index() > 0 && log_len() == 0` on the healed-but-not-yet-
+/// restarted `lagging` replica) — never a fixed-deadline one-shot check. A
+/// corpus cell that silently never reaches the state it exists to test is a
+/// bug, not a pass (see `docs/lessons/testing/2026-08-10-a-fault-schedule-
+/// runner-that-heals-immediately-after-the.md` and the root `CLAUDE.md`'s
+/// "Eventual properties get a converged-or-timeout poll" rule) — so a
+/// timeout here is a loud `assert!` failure naming the seed and the last
+/// observed `(snapshot_index, log_len)`, never a silent skip.
+const SNAPSHOT_CATCH_UP_POLL_BUDGET: Duration = Duration::from_secs(30);
+const SNAPSHOT_CATCH_UP_POLL_STEP: Duration = Duration::from_millis(200);
+
+/// Converged-or-timeout budget for this cell's own initial leader election
+/// (see the call site's own doc for why a fixed `SETTLE`-only wait isn't
+/// robust enough across many seed variants).
+const LEADER_SETTLE_BUDGET: Duration = Duration::from_secs(10);
+
+/// Size of the guaranteed-miss CAS burst that forces the leader's own
+/// SECOND compaction crossing before `lagging` is healed (see the call
+/// site's own doc) — comfortably past `animus-cp-data::COMPACT_THRESHOLD`
+/// (64, not exported; mirrors `restart_after_install_snapshot.rs`'s own
+/// `FAILED_CAS: u64 = 100` for the identical reason) so the leader's own
+/// residual log tail is guaranteed to cross the threshold again and get
+/// folded into a fresh compaction pass, regardless of how large that tail
+/// happened to be when the main workload above finished draining.
+const POISON_BURST_LEN: u64 = 100;
+/// Real time to let the poison burst above commit, apply, and compact on
+/// the leader before healing `lagging` — generous relative to `DRAIN`'s own
+/// budget for a much smaller (single-key, uncontended) burst.
+const POISON_BURST_SETTLE: Duration = Duration::from_secs(3);
+
+/// This cell's own workload shape: identical to
+/// [`compaction_crossing_workload`] (issue #554's wide-keyspace, all-write,
+/// 3-client, 30-round shape) — a wide keyspace is load-bearing here for the
+/// identical reason `corpus_cells`' own doc gives for that cell (most
+/// touched keys get exactly one write, so a compacted-and-lost prefix has no
+/// later write in the same key's list to paper over it). `faults` is
+/// deliberately empty: this cell's fault injection is bespoke (see
+/// [`run_snapshot_caught_up_follower_restart_scenario`]), not expressed
+/// through `Scenario::faults`/`Group::apply`.
+fn snapshot_caught_up_restart_scenario(seed: u64) -> Scenario {
+    Scenario {
+        seed,
+        name: SNAPSHOT_CAUGHT_UP_RESTART_NAME.to_string(),
+        ..compaction_crossing_workload(SNAPSHOT_CAUGHT_UP_RESTART_NAME, vec![])
+    }
+}
+
+/// The dedicated runner: isolate one specific follower for the workload's
+/// whole life, drain the workload against the surviving majority (crossing
+/// `COMPACT_THRESHOLD` on the leader, exactly like `compaction_crossing_
+/// workload`'s own cells), heal the isolated replica so it catches up
+/// entirely via a pure `InstallSnapshot`, assert that precondition twice
+/// (once via the converged-or-timeout poll, once immediately before the
+/// restart), then perform the GENUINE process restart issue #811 needs
+/// (`sim.stop` + a fresh `RaftKvNode::start` on the same engine) — with
+/// everything from that restart onward (heal/drain/the converged-or-timeout
+/// durability+convergence poll) run on a dedicated OS thread bounded by
+/// [`SNAPSHOT_RESTART_WATCHDOG_BUDGET`] of real wall time, mirroring
+/// `restart_after_install_snapshot.rs`'s own `drive_bounded` — a
+/// reintroduced #811 livelock pins that thread forever with no timeline
+/// event to bound it, so only a real wall-clock bound turns it into a test
+/// failure instead of a hung process. Generic over the engine tier
+/// (`factory`) so both `mem_engine` and `lsm_engine` can drive it.
+fn run_snapshot_caught_up_follower_restart_scenario<S: StorageEngine + 'static>(
+    scenario: &Scenario,
+    factory: EngineFactory<S>,
+) -> ScenarioResult {
+    assert_eq!(
+        scenario.replicas, 3,
+        "{}: this cell is only meaningful at 3 replicas (seed={})",
+        scenario.name, scenario.seed
+    );
+    let mut group = Group::start(scenario.seed, scenario.replicas, factory);
+    let ids: Vec<u64> = GROUP_IDS[..scenario.replicas].to_vec();
+
+    // Elect a leader among all 3 replicas first, then isolate the victim —
+    // mirrors `restart_after_install_snapshot.rs`'s own `run_scenario`
+    // shape, so the victim is a genuine, deterministically-chosen follower,
+    // never the leader itself. A converged-or-timeout poll, never a
+    // fixed-deadline one-shot check (this repo's own house rule): most
+    // seeds elect within `SETTLE` alone (the same budget every other cell
+    // in this corpus uses), but this cell runs many more seed variants
+    // than a single frozen-seed cell does (`ANIMUS_RAFTKV_SEEDS`), and an
+    // occasional split-vote seed genuinely needs a second election round —
+    // confirmed empirically while building this cell (seed
+    // 18144529451291547079, the `s18` seed variant, needs a second round).
+    group.sim.run_for(SETTLE);
+    let mut l0 = leader_slot(&group.nodes).map(|(i, _)| i);
+    let leader_deadline = group.sim.now().0 + LEADER_SETTLE_BUDGET.as_nanos() as u64;
+    while l0.is_none() && group.sim.now().0 < leader_deadline {
+        group.sim.run_for(SNAPSHOT_CATCH_UP_POLL_STEP);
+        l0 = leader_slot(&group.nodes).map(|(i, _)| i);
+    }
+    let l0 = l0.unwrap_or_else(|| {
+        panic!(
+            "{}: no leader within {LEADER_SETTLE_BUDGET:?} of SETTLE (seed={})",
+            scenario.name, scenario.seed
+        )
+    });
+    // Deterministic victim: the first live non-leader replica — the same
+    // rule `Nemesis::FollowerKill` uses (`Group::apply`'s own arm) — never
+    // the leader, and (structurally, by construction below) never a
+    // replica `Nemesis::StopRestart`'s own "current leader, or first live
+    // replica" rule would ever pick either.
+    let lagging = (0..scenario.replicas)
+        .find(|&i| i != l0)
+        .unwrap_or_else(|| {
+            panic!(
+                "{}: no non-leader replica exists (seed={})",
+                scenario.name, scenario.seed
+            )
+        });
+
+    // Isolate `lagging`'s network for the workload's whole life (`sim.crash`
+    // — never `sim.stop`: its in-memory `RaftCore`/driver must stay alive
+    // and never touch the WAL again until healed, exactly like
+    // `restart_after_install_snapshot.rs`'s own `sim.crash`/`sim.restart`
+    // pair) while the surviving two-of-three majority drains the workload
+    // past `COMPACT_THRESHOLD`.
+    group.sim.crash(nid(ids[lagging]));
+    group.spawn_workload(
+        scenario.clients,
+        scenario.rounds,
+        scenario.keyspace,
+        scenario.read_pct,
+    );
+    group.sim.run_for(COMPACTION_CROSSING_FAULT_AT);
+
+    // A SECOND compaction crossing, on the LEADER, before healing `lagging`
+    // (mirrors `restart_after_install_snapshot.rs`'s own two-wave shape —
+    // `REAL_WRITES` then a `FAILED_CAS` burst — for the identical reason,
+    // confirmed empirically while building this cell: by the time the
+    // workload above has fully drained, the leader's own log always has a
+    // small residual TAIL of entries committed since its own last
+    // threshold crossing (< `COMPACT_THRESHOLD`, by construction — a
+    // compaction only fires again once `behind` crosses the threshold a
+    // SECOND time), and that tail sits there forever once traffic stops.
+    // Healing `lagging` at exactly that point makes it catch up via
+    // InstallSnapshot for the compacted prefix PLUS ordinary log replication
+    // for that small residual tail straight off the leader's own
+    // still-resident log — NOT "entirely via InstallSnapshot," the precise
+    // state this cell exists to reach. A guaranteed-miss CAS burst
+    // (`poison_cas`, already outside the Elle model — see its own doc) large
+    // enough to itself cross `COMPACT_THRESHOLD` again forces the leader to
+    // fold that residual tail into a fresh compaction pass, so its own log
+    // is empty back to its (now-advanced) `snapshot_index` before `lagging`
+    // ever gets a chance to replicate any of it directly.
+    for _ in 0..POISON_BURST_LEN {
+        poison_cas(&group.nodes, 0);
+    }
+    group.sim.run_for(POISON_BURST_SETTLE);
+
+    // Heal `lagging`'s network only — its own in-memory `RaftCore`/driver
+    // never went away, only its inbox/sends were muted.
+    group.sim.restart(nid(ids[lagging]));
+
+    // Converged-or-timeout poll for this cell's own precondition: `lagging`
+    // fully caught up ENTIRELY via a pure `InstallSnapshot` — no ordinary
+    // logged `AppendEntries` tail of its own ever committed locally
+    // (`snapshot_index() > 0`: an install actually happened; `log_len() ==
+    // 0`: nothing beyond it was ever logged here).
+    let read_lagging = |group: &Group<S>| -> (u64, usize) {
+        let node = Arc::clone(&group.nodes.lock().unwrap()[lagging]);
+        (node.snapshot_index(), node.log_len())
+    };
+    let poll_deadline = group.sim.now().0 + SNAPSHOT_CATCH_UP_POLL_BUDGET.as_nanos() as u64;
+    let mut last_seen = read_lagging(&group);
+    while !(last_seen.0 > 0 && last_seen.1 == 0) && group.sim.now().0 < poll_deadline {
+        group.sim.run_for(SNAPSHOT_CATCH_UP_POLL_STEP);
+        last_seen = read_lagging(&group);
+    }
+    assert!(
+        last_seen.0 > 0 && last_seen.1 == 0,
+        "{}: the isolated replica never caught up ENTIRELY via a pure \
+         InstallSnapshot within {SNAPSHOT_CATCH_UP_POLL_BUDGET:?} — this \
+         cell is vacuous without that state (seed={}, observed \
+         (snapshot_index, log_len)={last_seen:?})",
+        scenario.name,
+        scenario.seed
+    );
+
+    // Re-check the precondition IMMEDIATELY before the genuine restart —
+    // the poll above already broke on it, but this is the fact the restart
+    // below is actually relying on, so re-confirm right at the point of use
+    // rather than trusting a value read a poll iteration ago.
+    let precondition = read_lagging(&group);
+    assert!(
+        precondition.0 > 0 && precondition.1 == 0,
+        "{}: precondition no longer holds immediately before the genuine \
+         restart (seed={}, (snapshot_index, log_len)={precondition:?})",
+        scenario.name,
+        scenario.seed
+    );
+    // The GENUINE process restart issue #811 needs: `sim.stop` (tasks +
+    // in-memory `RaftCore` die; durable disk survives) + a fresh
+    // `RaftKvNode::start` on the SAME engine — never `sim.crash`/
+    // `sim.restart`, which mute/re-arm the SAME still-live in-memory core
+    // and never touch the WAL at all.
+    //
+    // **Deliberately `group.engines[lagging].clone()`, never
+    // `factory(&group.sim, ids[lagging])`.** The latter is what `Nemesis::
+    // StopRestart` itself calls (never touched by this cell — see that
+    // arm's own doc) and is exactly right THERE: on the `mem_engine` tier
+    // it deliberately hands back a genuinely fresh, empty engine on every
+    // restart, modeling issue #554's own "the engine itself did not
+    // survive" shape. That is NOT this cell's shape: issue #811 is
+    // specifically about a restart where the ENGINE's own durable data
+    // SURVIVES (only the WAL/in-memory `RaftCore` are lost) — reusing the
+    // ORIGINAL engine handle here is what makes that true on `mem_engine`
+    // too, exactly mirroring `restart_after_install_snapshot.rs`'s own
+    // `engines[lagging].clone()`. (Using `factory` instead was tried while
+    // building this cell and reliably reproduced a DIFFERENT, genuine
+    // defect on unmodified `main` — a follower needing a SECOND full
+    // `InstallSnapshot` catch-up gets permanently stuck once the leader's
+    // own `snapshot_served_through` high-water mark for it already covers
+    // the leader's current `snapshot_index` from the FIRST catch-up, since
+    // nothing advances that index in between — see
+    // `animus-control::raft::handle_append_resp`'s `needs_snapshot` arm.
+    // That finding is out of this cell's scope — issue #990 is about
+    // #811 specifically — and is reported separately rather than folded in
+    // here, per this repo's "an incidental bug gets its own PR" rule.)
+    group.sim.stop(nid(ids[lagging]));
+    let engine = group.engines[lagging].clone();
+    let fresh = Arc::new(RaftKvNode::start(
+        group.sim.env(nid(ids[lagging])),
+        ids.iter().copied().map(nid).collect(),
+        engine,
+    ));
+    group.nodes.lock().unwrap()[lagging] = fresh;
+    // Proposals made to the old node object died with it.
+    group.shared.bump_epoch();
+
+    // Everything from here on is the window a reintroduced #811 livelocks
+    // in: bound it by a real OS-thread wall-clock watchdog, exactly like
+    // `restart_after_install_snapshot.rs`'s own `drive_bounded`. `group` is
+    // moved into the spawned thread wholesale (never cloned/aliased back
+    // onto this thread) — there is no cross-thread aliasing hazard the way
+    // there would be if a live node handle were kept here too, since this
+    // thread retains no reference into the simulated world at all once the
+    // move happens.
+    let seed = scenario.seed;
+    let name = scenario.name.clone();
+    let keys = scenario.keyspace;
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut group = group;
+        group.heal_all();
+        group.sim.run_for(DRAIN);
+        let result = finalize_scenario_result(&mut group, seed, keys);
+        let _ = tx.send(result);
+    });
+    rx.recv_timeout(SNAPSHOT_RESTART_WATCHDOG_BUDGET)
+        .unwrap_or_else(|_| {
+            panic!(
+                "issue #811 reproduced: a genuine restart of an \
+                 InstallSnapshot-caught-up-entirely follower livelocked the \
+                 apply task — the post-restart settle/drain/convergence \
+                 window did not complete within \
+                 {SNAPSHOT_RESTART_WATCHDOG_BUDGET:?} of real wall time \
+                 (scenario={name}, seed={seed})"
+            )
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -1942,6 +2292,71 @@ fn raftkv_run_is_deterministic() {
 }
 
 // ---------------------------------------------------------------------------
+// The dedicated snapshot-caught-up-follower-restart cell (issue #990/#811).
+// Not part of `corpus()`/`corpus_cells()` — see the runner's own doc, above,
+// for why — so it gets its own small test group, mirroring the shape every
+// other standalone test in this file uses (a `run_is_linearizable` proof at
+// depth plus a `run_is_deterministic` regression), rather than folding into
+// `raftkv_corpus_is_linearizable`/`raftkv_corpus_covers_the_fault_matrix`/
+// `raftkv_seed_expansion_is_additive_and_unique`, whose expectations are
+// about `corpus_cells()`'s own frozen set and would otherwise need updating
+// for a cell those tests were never meant to describe.
+// ---------------------------------------------------------------------------
+
+/// Runs at `cargo test -p animus-test --test raftkv_linearizable` with no
+/// env var (so it is automatically part of the nightly deep-corpus tier,
+/// `.github/workflows/corpus-deep.yml`, which runs this whole binary at
+/// `ANIMUS_RAFTKV_SEEDS=40`) and deepens with `ANIMUS_RAFTKV_SEEDS=K` via
+/// the identical `corpus::seed_expand`/`SeedVariant` machinery every other
+/// cell in this file uses — `Scenario::reseeded` (this file's own
+/// `SeedVariant` impl) keeps every field except `name`/`seed`, so each
+/// variant runs the identical isolate/drain/heal/restart shape at its own
+/// seed.
+#[test]
+fn raftkv_snapshot_caught_up_follower_restart_is_linearizable() {
+    let base =
+        snapshot_caught_up_restart_scenario(corpus::name_seed(SNAPSHOT_CAUGHT_UP_RESTART_NAME));
+    let scenarios = corpus::seed_expand(vec![base], seeds_per_cell());
+    let mut total_ok_writes = 0usize;
+    for s in &scenarios {
+        let r = run_scenario_identified(s, || {
+            run_snapshot_caught_up_follower_restart_scenario(s, mem_engine)
+        });
+        assert_scenario_ok("mem", s, &r);
+        total_ok_writes += r.ok_writes;
+    }
+    // Non-vacuity: the cell's own precondition assertions (inside the
+    // runner) already prove the InstallSnapshot-catch-up state was reached
+    // on every variant — this additionally proves the surrounding workload
+    // itself did real, checkable work.
+    assert!(
+        total_ok_writes > scenarios.len(),
+        "cell too vacuous: only {total_ok_writes} acked writes across {} seed variants",
+        scenarios.len()
+    );
+}
+
+/// Pure function of its seed (ADR 0003): the same scenario run twice
+/// produces byte-identical recorded histories, despite the restart/heal
+/// tail running on a spawned OS thread (`run_snapshot_caught_up_follower_
+/// restart_scenario`'s own watchdog) — the simulated world's own logical
+/// clock/RNG/message order is entirely `Simulator`-internal and unaffected
+/// by which OS thread happens to drive it, only bounded in real wall time.
+#[test]
+fn raftkv_snapshot_caught_up_follower_restart_run_is_deterministic() {
+    let scenario =
+        snapshot_caught_up_restart_scenario(corpus::name_seed(SNAPSHOT_CAUGHT_UP_RESTART_NAME));
+    let a = run_snapshot_caught_up_follower_restart_scenario(&scenario, mem_engine);
+    let b = run_snapshot_caught_up_follower_restart_scenario(&scenario, mem_engine);
+    assert_eq!(
+        serde_json::to_string(&a.history).unwrap(),
+        serde_json::to_string(&b.history).unwrap(),
+        "history not reproducible for seed {}",
+        scenario.seed
+    );
+}
+
+// ---------------------------------------------------------------------------
 // The LsmEngine tier: the durable path (real WAL/SSTable recovery through the
 // deterministic disk seam) under faults — what production actually runs on, and
 // what no corpus exercised before.
@@ -2022,6 +2437,43 @@ fn raftkv_lsm_run_is_deterministic() {
         serde_json::to_string(&a.history).unwrap(),
         serde_json::to_string(&b.history).unwrap(),
         "LSM history not reproducible for seed {}",
+        scenario.seed
+    );
+}
+
+/// The snapshot-caught-up-follower-restart cell over `LsmEngine<SimEnv>` —
+/// cheap to add (the runner is already generic over the engine tier via
+/// `factory`), and this is precisely the tier issue #811 itself was found
+/// on (`restart_after_install_snapshot.rs` proves both tiers): unlike
+/// `mem_engine` (which hands back a brand-new `MemoryEngine::new()` on
+/// every call, so its own "restart" always starts from a wiped engine
+/// regardless of this bug), `lsm_engine` re-opens the SAME on-disk prefix —
+/// the tier where the Raft WAL file (`raftkv.wal`, wholly separate from the
+/// `StorageEngine`) genuinely persists across the restart unmodified,
+/// exactly the shape the fix's own "durably record `snapshot_index`/the log
+/// in the SAME pass" reasoning is about. Gated on `ANIMUS_RAFTKV_LSM=1`
+/// like every other full-corpus LSM run in this file, so default-depth CI
+/// is unaffected; a single seed is enough here (this dimension is about the
+/// storage backend, not seed-driven scheduling timing — the mem-tier test
+/// above already covers depth).
+#[test]
+fn raftkv_snapshot_caught_up_follower_restart_is_linearizable_lsm() {
+    if !lsm_full_enabled() {
+        eprintln!(
+            "raftkv_snapshot_caught_up_follower_restart_is_linearizable_lsm: \
+             skipped (set ANIMUS_RAFTKV_LSM=1)"
+        );
+        return;
+    }
+    let scenario =
+        snapshot_caught_up_restart_scenario(corpus::name_seed(SNAPSHOT_CAUGHT_UP_RESTART_NAME));
+    let r = run_scenario_identified(&scenario, || {
+        run_snapshot_caught_up_follower_restart_scenario(&scenario, lsm_engine)
+    });
+    assert_scenario_ok("lsm", &scenario, &r);
+    assert!(
+        r.ok_writes > 0,
+        "LSM tier too vacuous: 0 acked writes (seed={})",
         scenario.seed
     );
 }

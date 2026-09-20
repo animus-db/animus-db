@@ -302,6 +302,83 @@ retrievable from git history.)
   `leader_kill_early_3`'s single fault away and every scalar to its floor,
   and the printed replay handle reproduced identically through
   `raftkv_shrink_replay`.
+- **The dedicated snapshot-caught-up-follower-restart cell (issue #990,
+  `snapshot_caught_up_follower_stop_restart_3`) is deliberately NOT part of
+  `corpus_cells()`.** `Nemesis::StopRestart`'s victim is "the current
+  leader, or the first live replica" and `Nemesis::FollowerKill`'s is "the
+  first live non-leader" — neither rule, nor any composition of the
+  existing fault schedule, can ever land on a replica whose entire catch-up
+  was a pure `InstallSnapshot` (no ordinary logged `AppendEntries` tail of
+  its own ever committed locally), the precise state issue #811 needed (a
+  genuine `sim.stop` + fresh `RaftKvNode::start` of such a replica used to
+  livelock `apply_and_compact` forever — see `animus-cp-data/CLAUDE.md`'s
+  matching entry and `tests/restart_after_install_snapshot.rs`). This cell
+  reaches that state on purpose: isolate one specific non-leader follower
+  (`sim.crash`, never `sim.stop`) for the workload's WHOLE life, drain a
+  `compaction_crossing_workload`-shaped load (issue #554's own wide-
+  keyspace, all-write shape — load-bearing here for the identical reason)
+  against the surviving two-of-three majority, force a SECOND compaction
+  crossing on the leader with a guaranteed-miss CAS burst (mirroring
+  `restart_after_install_snapshot.rs`'s own two-wave `REAL_WRITES`/
+  `FAILED_CAS` shape — needed so the leader's own residual sub-threshold
+  log tail doesn't let the healed follower finish its catch-up via ordinary
+  replication instead of a pure install), heal the follower's network only
+  (`sim.restart`), **poll (converged-or-timeout, never a fixed-deadline
+  check) for `snapshot_index() > 0 && log_len() == 0`** on it, re-assert
+  that precondition immediately before the restart, then perform the
+  GENUINE restart (`sim.stop` + a fresh `RaftKvNode::start` reusing the
+  SAME engine handle — see the next bullet for why that reuse is
+  load-bearing) — with the restart-onward window (heal/drain/the
+  converged-or-timeout durability+convergence poll) run on a dedicated OS
+  thread bounded by a 30s real wall-clock watchdog
+  (`SNAPSHOT_RESTART_WATCHDOG_BUDGET`), mirroring `restart_after_install_
+  snapshot.rs`'s own `drive_bounded` (a reintroduced #811 livelock has no
+  `.await` yield point `SimEnv`'s own step/timeline budget could otherwise
+  bound — only a real OS-thread wall-clock bound catches it). Runs at
+  `cargo test -p animus-test --test raftkv_linearizable` with no env var
+  (`raftkv_snapshot_caught_up_follower_restart_is_linearizable`, so
+  automatically in the nightly `corpus-deep.yml` tier), deepens with
+  `ANIMUS_RAFTKV_SEEDS=K` via the same `corpus::seed_expand`/`SeedVariant`
+  machinery every other cell uses, has its own `_run_is_deterministic`
+  regression, and an `_is_linearizable_lsm` sibling gated on
+  `ANIMUS_RAFTKV_LSM=1` (cheap to add — the runner is already generic over
+  the engine tier). A separate, dedicated runner rather than a new
+  `Nemesis` variant/`corpus_cells()` entry, since `run_scenario_on`'s
+  generic fault-schedule model (resolve each fault against "the live group
+  at the time it fires") has no way to express "isolate this replica BEFORE
+  the workload starts, poll a replica-specific durability predicate mid-run,
+  THEN restart it" — see the runner's own doc in `raftkv_linearizable.rs`
+  for the full account of why forcing this into the existing machinery
+  would be worse than a small, self-contained function.
+- **`Group` gained an `engines: Vec<S>` field (additive; `Group::start`'s
+  own per-id call order — `env` then `factory`, never split into two
+  passes — is unchanged, so no existing frozen seed's behavior moved) so a
+  caller can reuse a replica's ORIGINAL engine handle across a genuine
+  restart, instead of `Nemesis::StopRestart`'s own `factory(&sim, id)` call
+  (a deliberately FRESH engine on the `mem_engine` tier — issue #554's own
+  "the engine did not survive" exercise, unaffected, untouched).** The
+  snapshot-caught-up-follower cell needs the OPPOSITE shape — issue #811 is
+  specifically about a restart where the engine's own durable data
+  SURVIVES — and reusing `factory` there instead (tried while building this
+  cell) reliably reproduced a genuinely different, real defect on
+  unmodified `main`: a follower needing a SECOND full `InstallSnapshot`
+  catch-up can get permanently stuck once the leader's own
+  `snapshot_served_through` high-water mark for it already covers the
+  leader's current `snapshot_index` from the FIRST catch-up (nothing
+  advances that index in between) — see `animus-control::raft::
+  handle_append_resp`'s `needs_snapshot` arm. That finding is reported, not
+  fixed, here (out of issue #990's own scope; this repo's "an incidental
+  bug gets its own PR" rule).
+- **Red-before proving this cell surfaced a second, general finding**:
+  issue #811 has TWO independent fixes in `apply_and_compact` (PR #937,
+  2026-09-10, and PR #905, 2026-09-15 — see `animus-cp-data/CLAUDE.md` and
+  `docs/lessons/testing/2026-09-19-a-red-before-proof-must-check-whether-a-
+  later-independent-fix-already-covers-the-one-being-reverted.md`), landed
+  five days apart and each closing the identical CPU-pinning spin via a
+  different mechanism. Reverting only the first no longer reproduces a
+  failure on current `main` — the second, more general fix already
+  prevents the spin regardless. This cell's own red-before proof reverted
+  both together.
 
 ### Elle-against-cross-tablet-transactions: the multi-tablet corpus (ADR 0018 §4, PR6)
 
