@@ -44,6 +44,13 @@ crc32fast.workspace = true
 # (ADR 0061 rung C0).
 animus-env = { workspace = true, features = ["prod"] }
 animus-sim.workspace = true
+# `tests/halted_gate_apply_and_wal_fault.rs`'s `FaultyEngine` implements
+# `StorageEngine` directly (the identical `animus-cp-data`
+# `tests/batch_txn_resolve_apply_fault.rs` idiom) to inject a deterministic
+# `merge_batch` failure — the trait's own `#[async_trait::async_trait]`
+# attribute macro needs this in scope for a downstream impl, not just the
+# trait's own defining crate.
+async-trait.workspace = true
 # Shared corpus seed-management scaffolding (ADR 0061 rung B1,
 # `animus_test::corpus`). This is a dev-dependency cycle (animus-test's own
 # dev-dependencies include animus-control), which Cargo permits: a dev-dep

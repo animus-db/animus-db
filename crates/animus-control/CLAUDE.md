@@ -1219,22 +1219,45 @@ per-tablet CP data plane (`animus-cp-data`).
   of a wiped-voter rejoin was never the bug: pre-vote's log-up-to-date
   check already makes a fresh, empty-log rejoiner safe).
 
-  **`node.rs`'s `persist_wal` has no halted-gate at all** (unlike
-  `animus-cp-data`'s own `persist_wal`/`flush_pending`, which tolerate a
-  live I/O error only while a group's `halted: AtomicBool` is set — see
-  `docs/engineering-lessons.md`'s "halted-gated durability assert" entry,
-  issues #282/#279): here `env.append(WAL, ..).await.expect("wal append")`
-  and `env.sync(WAL).await.expect("wal sync")` are bare, unconditional
-  `.expect()`s with no tolerated-error path whatsoever, on any node,
-  live or shutting down. **Test-authoring consequence**: never point
-  `DiskConfig::set_enospc_prob`/`set_error_prob` at a live node's disk in
-  this crate's tests (`SimEnv` or otherwise) — an injected disk error on
-  the consensus loop's own WAL append/sync panics the test process itself
-  rather than exercising any application-level fault handling, since there
-  is none to exercise. `DiskConfig::set_fsync_lie_prob` (never errors —
-  `sync` returns `Ok` and silently leaves the bytes buffered) and
+  **`RaftNode<E>` now carries its own `halted: Arc<AtomicBool>`, mirroring
+  `animus-cp-data::RaftKvNode::shutdown`/`is_halted` exactly (ADR 0038's
+  2026-09-19 amendment, issue #939)**: `halt()`/`is_halted()` are the public
+  latch/query pair, and `persist_wal`'s `env.append(WAL, ..)`/`env.sync(WAL)`,
+  `meta_apply_and_compact`'s system-keyspace `merge_batch` write, its
+  `install_syskv_image` `InstallSnapshot` install, and its WAL-compaction
+  `env.replace` are all `if let Err(e) = ... { assert!(halted.load(SeqCst),
+  "... while running: {e}") }` — tolerated only while `halted` is set, in
+  which case the caller returns/skips without advancing anything that call
+  would otherwise have advanced (see each function's own doc for exactly
+  what). A failure while *not* halted stays a hard panic, live or not.
+  **Unlike `RaftKvNode`, this crate's driver tasks (the consensus loop,
+  the apply task) have no exit path of their own gated on `halted`** — it
+  only ever changes what a *subsequent* I/O failure means, never when the
+  loops stop; that is still entirely `task.abort()`'s job.
+  `animusd::Node::shutdown`/`shutdown_and_wait` call a new
+  `Node::halt_local_control()` (a no-op on a data-only node's
+  `ControlHandle::Remote`) right alongside `ClusterEdgeState::
+  halt_hosted_cp_groups`, before their hard `task.abort()`.
+  **Test-authoring consequence, updated**: `DiskConfig::set_enospc_prob`/
+  `set_error_prob` can now be pointed at a live node's disk in this crate's
+  tests **once `halt()` has been called first** — that is the intended new
+  regression-test idiom (`tests/halted_gate_apply_and_wal_fault.rs`); pointed
+  at a node that is *not* halted, the identical fault still panics the test
+  process, exactly as before this fix (this is what the "live" half of that
+  test file's own pairs proves). `DiskConfig::set_fsync_lie_prob` (never
+  errors — `sync` returns `Ok` and silently leaves the bytes buffered) and
   `torn_tail_on_crash`/`corrupt_on_crash` (fire only at `Simulator::crash`,
-  not mid-`.expect()`) remain safe.
+  not mid-`.expect()`/assert) remain safe regardless of `halted`.
+  **Coverage gap, left open**: the WAL-compaction-rewrite and
+  `install_syskv_image` sites are gated identically but have no dedicated
+  regression — triggering either deterministically needs a genuine
+  `SNAPSHOT_THRESHOLD` compaction or a received `InstallSnapshot`, which
+  `tests/halted_gate_apply_and_wal_fault.rs` doesn't attempt to construct.
+  There is also no `Drop for Node` counterpart in `animusd` for the control
+  plane the way issues #282/#279 eventually added for the CP data plane
+  (`docs/engineering-lessons.md`'s matching entry) — a panic that drops a
+  `Node` with no explicit `shutdown()` call still leaves this plane's
+  `halted` unlatched.
 
 - **One apply model, generic across both planes (ADR 0017, cut over to
   `Metadata` by ADR 0038 PR3).** `StateMachine::DRIVER_APPLIED = true` is now

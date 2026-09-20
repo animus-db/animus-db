@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
@@ -604,6 +604,20 @@ pub struct RaftNode<E: Env> {
     /// detector transitions) and keep the leadership gauge current. Cheap to
     /// clone; a clone is moved into each spawned loop.
     metrics: MetricsHandle,
+    /// Set by [`halt`](Self::halt) — mirrors `animus-cp-data::RaftKvNode`'s
+    /// own field of the same name exactly (ADR 0038's 2026-09-19 amendment):
+    /// "this node is being torn down, so a subsequent WAL/engine I/O error is
+    /// a teardown artifact, not a live durability fault." Read by the
+    /// consensus loop's own [`persist_wal`] and the apply task's
+    /// [`meta_apply_and_compact`] to gate their otherwise-unconditional
+    /// `.expect()`s on engine/WAL I/O — see those functions' own docs. Unlike
+    /// `RaftKvNode`, this is a **one-way latch with no accompanying "stop the
+    /// driver loops" signal**: this crate's `drive`/`meta_apply_loop` have no
+    /// shutdown/exit path of their own (the control plane's driver tasks run
+    /// for the life of the process) — `halt()` only ever changes what an I/O
+    /// failure the *rest of teardown* (task abort, env teardown) can still
+    /// cause means, never when the loops themselves stop.
+    halted: Arc<AtomicBool>,
 }
 
 impl<E: Env> RaftNode<E> {
@@ -710,6 +724,7 @@ impl<E: Env> RaftNode<E> {
         let delta_ring = Arc::new(Mutex::new(delta_ring));
         let wal_lock = Arc::new(AsyncMutex::new(()));
         let persist = Arc::new(PersistProgress::default());
+        let halted = Arc::new(AtomicBool::new(false));
         let node = Self {
             env: env.clone(),
             core: Arc::clone(&core),
@@ -721,6 +736,7 @@ impl<E: Env> RaftNode<E> {
             wal_lock: Arc::clone(&wal_lock),
             persist: Arc::clone(&persist),
             metrics: metrics.clone(),
+            halted: Arc::clone(&halted),
         };
         env.spawn_task(drive(
             env.clone(),
@@ -736,6 +752,7 @@ impl<E: Env> RaftNode<E> {
             wal_lock,
             persist,
             boot_entropy,
+            halted,
         ));
         // The placement reconciler runs alongside the driver; it only ever
         // *proposes* on the core (no I/O of its own), and proposals are honored
@@ -770,6 +787,31 @@ impl<E: Env> RaftNode<E> {
             ));
         }
         node
+    }
+
+    /// Latch this node's `halted` flag (ADR 0038's 2026-09-19 amendment,
+    /// mirrors `animus-cp-data::RaftKvNode::shutdown`'s doc exactly): tells
+    /// this node's own [`persist_wal`] (the consensus loop's WAL append/sync)
+    /// and [`meta_apply_and_compact`] (the apply task's system-keyspace
+    /// merge, image install, and WAL-compaction rewrite) that this node is
+    /// being torn down, so any I/O error they hit from here on is a teardown
+    /// artifact — a directory yanked out from under a still-live task, say —
+    /// never a live durability fault. A one-way latch (never cleared);
+    /// idempotent. **Deliberately does not stop the consensus loop or the
+    /// apply task** — this crate's driver tasks have no exit path of their
+    /// own (unlike `RaftKvNode`'s `shutdown`, which also wakes and eventually
+    /// stops its driver): the caller (`animusd::Node::shutdown`/
+    /// `shutdown_and_wait`) is expected to call this immediately before its
+    /// own hard `task.abort()`, exactly like it already does for every
+    /// hosted CP-data group's own `halt`.
+    pub fn halt(&self) {
+        self.halted.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether [`halt`](Self::halt) has been called.
+    #[must_use]
+    pub fn is_halted(&self) -> bool {
+        self.halted.load(Ordering::SeqCst)
     }
 
     /// This node's metrics handle (ADR 0015). A snapshot of it
@@ -852,7 +894,14 @@ impl<E: Env> RaftNode<E> {
     /// *before* it becomes client-visible is the proper fix, tracked as a follow-up
     /// (ADR 0009 — see the root CLAUDE.md engineering-practices note).
     pub async fn flush(&self) -> usize {
-        persist_wal(&self.env, &self.core, &self.wal_lock, &self.persist).await
+        persist_wal(
+            &self.env,
+            &self.core,
+            &self.wal_lock,
+            &self.persist,
+            &self.halted,
+        )
+        .await
     }
 
     /// This node's environment handle.
@@ -1210,6 +1259,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
     // run, which desynced a fixed-seed corpus test's own tuned timing with
     // no logic bug anywhere (`chunked_snapshot_receiver_stop_restart_3`).
     boot_entropy: u64,
+    halted: Arc<AtomicBool>,
 ) {
     // Recover from the WAL before serving anything.
     let bytes = env.read(WAL).await.unwrap_or_default();
@@ -1288,6 +1338,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
         watch,
         Arc::clone(&wal_lock),
         Arc::clone(&persist),
+        Arc::clone(&halted),
     ));
 
     // Issue #279: the loop's own in-flight persist round, and the outbound
@@ -1309,7 +1360,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
             // `persist_wal`'s record count is `flush`'s return value, not this
             // loop's business — drop it so the boxed future matches `PersistFut`.
             persist_fut = Some(Box::pin(async {
-                persist_wal(&env, &core, &wal_lock, &persist).await;
+                persist_wal(&env, &core, &wal_lock, &persist, &halted).await;
             }));
         }
 
@@ -1494,6 +1545,7 @@ async fn meta_apply_loop<E: Env, S: StorageEngine>(
     watch: MetadataWatch,
     wal_lock: Arc<AsyncMutex<()>>,
     persist: Arc<PersistProgress>,
+    halted: Arc<AtomicBool>,
 ) {
     // Rebuild this task's own owned `Metadata` from whatever the engine
     // already durably holds (empty on a fresh engine; a prior run's content
@@ -1548,6 +1600,7 @@ async fn meta_apply_loop<E: Env, S: StorageEngine>(
             &watch,
             &wal_lock,
             &persist,
+            &halted,
             &mut shadow,
             &mut watermark,
             &mut compact_defer_since,
@@ -1565,6 +1618,17 @@ async fn meta_apply_loop<E: Env, S: StorageEngine>(
 /// the engine has merged enough past the snapshot base. Returns whether it
 /// did any work (so the caller backs off only when idle). Mirrors
 /// `animus-cp-data::apply_and_compact`'s shape/ordering precisely.
+///
+/// **Halted-gated error tolerance** (ADR 0038's 2026-09-19 amendment, the
+/// identical idiom `animus-cp-data::flush_pending`/its own compaction path
+/// use — see those functions' own docs and `persist_wal`'s above): every
+/// engine/WAL I/O failure below is tolerated only while `halted` is set, and
+/// a tolerated failure always means "return/skip without advancing
+/// `watermark`/publishing `cache`/bumping `engine_applied`/feeding the delta
+/// ring/bumping `watch`" — nothing durable happened, so nothing gets to look
+/// like it did. A failure while *not* halted stays a hard panic: an apply
+/// failure while running means the engine may now be silently missing a
+/// committed write.
 #[allow(clippy::too_many_arguments)]
 async fn meta_apply_and_compact<E: Env, S: StorageEngine>(
     env: &E,
@@ -1576,6 +1640,7 @@ async fn meta_apply_and_compact<E: Env, S: StorageEngine>(
     watch: &MetadataWatch,
     wal_lock: &AsyncMutex<()>,
     persist: &PersistProgress,
+    halted: &AtomicBool,
     shadow: &mut Metadata,
     watermark: &mut u64,
     compact_defer_since: &mut Option<Nanos>,
@@ -1593,7 +1658,13 @@ async fn meta_apply_and_compact<E: Env, S: StorageEngine>(
         .expect("raft core poisoned")
         .drain_pending_install();
     if let Some((last_index, bytes)) = pending_install {
-        install_syskv_image(engine, &bytes).await;
+        if !install_syskv_image(engine, &bytes, halted).await {
+            // Tolerated only because `halted` is set (this node is tearing
+            // down): the image never durably installed, so nothing below may
+            // advance on its account — return without touching `shadow`/
+            // `cache`/`watermark`/`engine_applied`/the delta ring/`watch`.
+            return did_work;
+        }
         *shadow = mirror::rebuild_metadata_from_engine(engine)
             .await
             .expect("system-keyspace engine scan (post-install rebuild)");
@@ -1648,10 +1719,16 @@ async fn meta_apply_and_compact<E: Env, S: StorageEngine>(
             max_index.to_be_bytes().to_vec(),
             max_index,
         ));
-        engine
-            .merge_batch(ops)
-            .await
-            .expect("system-keyspace apply write");
+        if let Err(e) = engine.merge_batch(ops).await {
+            assert!(
+                halted.load(Ordering::SeqCst),
+                "system-keyspace apply write failed while running: {e}"
+            );
+            // Tolerated only because this node is tearing down: nothing
+            // durable happened, so `watermark`/`cache`/`engine_applied`/the
+            // delta ring/`watch` must not advance on this pass.
+            return did_work;
+        }
         *watermark = max_index;
         *cache.lock().expect("cache poisoned") = shadow.clone();
         engine_applied.fetch_max(max_index, Ordering::SeqCst);
@@ -1799,11 +1876,27 @@ async fn meta_apply_and_compact<E: Env, S: StorageEngine>(
         };
         let bytes_produced = bytes.is_some();
         if let Some((bytes, round)) = bytes {
-            env.replace(WAL, &bytes).await.expect("wal compaction");
-            let mut c = core.lock().expect("raft core poisoned");
-            c.mark_durable_through(lli);
-            if let Some(round) = round {
-                persist.complete_drain(round);
+            // A teardown that lands mid-rewrite (aborting tasks + tearing
+            // down the env) can fail this `replace`; tolerate it only while
+            // halted — the pre-compaction WAL is still intact (this only
+            // ever rewrites it to a smaller equivalent image), so recovery
+            // is unaffected. A failure while *not* halted is a real
+            // durability fault → surface (mirrors `animus-cp-data`'s own
+            // compaction-rewrite handling exactly).
+            match env.replace(WAL, &bytes).await {
+                Ok(()) => {
+                    let mut c = core.lock().expect("raft core poisoned");
+                    c.mark_durable_through(lli);
+                    if let Some(round) = round {
+                        persist.complete_drain(round);
+                    }
+                }
+                Err(e) => {
+                    assert!(
+                        halted.load(Ordering::SeqCst),
+                        "system-keyspace wal compaction failed while running: {e}"
+                    );
+                }
             }
         }
         // Issue #811: NOT unconditional — see `image_installed`'s doc above.
@@ -1837,16 +1930,29 @@ async fn syskv_image<S: StorageEngine>(engine: &S) -> Vec<u8> {
 /// warning and drops the image on an undecodable payload rather than
 /// panicking — mirrors `animus-cp-data::install_engine_image`'s treatment of
 /// a corrupt wire image.
-async fn install_syskv_image<S: StorageEngine>(engine: &S, bytes: &[u8]) {
+///
+/// Returns whether the caller may treat this pass as having installed
+/// something (`true` for both "genuinely installed" and "nothing to
+/// install" — an undecodable or empty image is not a failure). Returns
+/// `false` only for a **tolerated** `merge_batch` failure — `halted` is set,
+/// so the caller must not advance `watermark`/`cache`/`engine_applied`/the
+/// delta ring/`watch` on this pass, since nothing durable happened (mirrors
+/// `persist_wal`'s/`meta_apply_and_compact`'s own halted-gated tolerance —
+/// see their docs). A failure while *not* halted stays a hard panic.
+async fn install_syskv_image<S: StorageEngine>(
+    engine: &S,
+    bytes: &[u8],
+    halted: &AtomicBool,
+) -> bool {
     let entries: Vec<(Vec<u8>, Option<Vec<u8>>, u64)> = match serde_json::from_slice(bytes) {
         Ok(e) => e,
         Err(err) => {
             tracing::warn!(?err, "undecodable system-keyspace snapshot image dropped");
-            return;
+            return true;
         }
     };
     if entries.is_empty() {
-        return;
+        return true;
     }
     let ops = entries
         .into_iter()
@@ -1855,10 +1961,14 @@ async fn install_syskv_image<S: StorageEngine>(engine: &S, bytes: &[u8]) {
             None => MergeOp::tombstone(key, version),
         })
         .collect();
-    engine
-        .merge_batch(ops)
-        .await
-        .expect("system-keyspace image install");
+    if let Err(e) = engine.merge_batch(ops).await {
+        assert!(
+            halted.load(Ordering::SeqCst),
+            "system-keyspace image install failed while running: {e}"
+        );
+        return false;
+    }
+    true
 }
 
 /// Decode an 8-byte big-endian `u64` watermark value (the same encoding
@@ -2620,11 +2730,26 @@ async fn orphan_sweep_loop<E: Env>(
 /// messages/heartbeats within the election timeout. Holds `wal_lock` so this
 /// append cannot interleave with the apply task's compaction rewrite of the
 /// same file.
+///
+/// **Halted-gated error tolerance** (ADR 0038's 2026-09-19 amendment, mirrors
+/// `animus-cp-data::persist_wal`'s identical handling): a teardown that lands
+/// mid-append/sync — aborting tasks and tearing down the env, or a test's
+/// `TempDir` deleting the WAL file out from under a still-running loop — can
+/// surface as an `env.append`/`env.sync` error here. Tolerated **only**
+/// while `halted` is set: this returns early with **no** `mark_durable_through`
+/// (never mark durability that didn't happen) and no `complete_drain` — the
+/// round claimed by `drain_for_round` above is left permanently un-durable,
+/// stranding any `GatedOuts` waiting on it, which is safe here specifically
+/// because a tolerated failure only happens once this node is already being
+/// torn down (nothing left to release those outbound messages *to*). A
+/// failure while *not* halted is a real durability fault on a live leader
+/// (crash-stop-before-ack) and stays exactly as loud as before: a hard panic.
 async fn persist_wal<E: Env>(
     env: &E,
     core: &Arc<Mutex<RaftCore>>,
     wal_lock: &AsyncMutex<()>,
     progress: &PersistProgress,
+    halted: &AtomicBool,
 ) -> usize {
     let _wal = wal_lock.lock().await;
     // Capture the log high-water under the same lock as the drain: after we sync
@@ -2640,11 +2765,24 @@ async fn persist_wal<E: Env>(
         return 0;
     };
     for record in &records {
-        env.append(WAL, &PersistedState::encode_record(record))
+        if let Err(e) = env
+            .append(WAL, &PersistedState::encode_record(record))
             .await
-            .expect("wal append");
+        {
+            assert!(
+                halted.load(Ordering::SeqCst),
+                "wal append failed while running: {e}"
+            );
+            return 0;
+        }
     }
-    env.sync(WAL).await.expect("wal sync");
+    if let Err(e) = env.sync(WAL).await {
+        assert!(
+            halted.load(Ordering::SeqCst),
+            "wal sync failed while running: {e}"
+        );
+        return 0;
+    }
     // The records are now durable: advance both watermarks under one acquisition
     // — the log index (which applies any now-durable committed entries) and the
     // persist round (which releases whatever `drive` buffered against it). Only
@@ -2966,6 +3104,7 @@ mod tests {
             &watch,
             &wal_lock,
             &PersistProgress::default(),
+            &AtomicBool::new(false),
             &mut shadow,
             &mut watermark,
             &mut None,
@@ -3048,6 +3187,7 @@ mod tests {
             &watch,
             &wal_lock,
             &PersistProgress::default(),
+            &AtomicBool::new(false),
             &mut shadow,
             &mut watermark,
             &mut None,
@@ -3179,6 +3319,7 @@ mod tests {
                 &watch,
                 &wal_lock,
                 &PersistProgress::default(),
+                &AtomicBool::new(false),
                 &mut shadow,
                 &mut watermark,
                 &mut compact_defer_since,
