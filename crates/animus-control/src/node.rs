@@ -209,6 +209,71 @@ pub const SPLIT_PLACING_RETARGET_DWELL: Duration = Duration::from_millis(5_000);
 /// the target has already been fully realized, where it matters most.
 pub const SPLIT_PLACING_RETARGET_DWELL_ACHIEVED: Duration = Duration::from_millis(30_000);
 
+/// How long a member must be observed CONTINUOUSLY `Down` — by
+/// `reconcile_loop`'s own per-tick liveness check, never wall clock — before
+/// ordinary placement **repair** ([`Metadata::reconcile`]/
+/// [`PlacementView::reconcile`]) treats it as genuinely gone and evicts it
+/// from any tablet's replica set, rather than keeping it in place (issue
+/// #928's fully general form — see `recently_down_this_tick`'s own doc for
+/// the tracking mechanics and `reconcile_placement`'s (`meta.rs`) for how the
+/// dwell is actually enforced).
+///
+/// **The suspect/dead split (Cockroach/TiKV-shaped).** [`DETECT_TIMEOUT`]
+/// (500ms) stays the FAST "suspect" signal for every other consumer — the
+/// failure detector's own `Down` transition, an admin/dashboard read, a
+/// client's routing hints — none of that changes. This constant is a
+/// SEPARATE, SLOWER "dead enough to actually repair" gate that only the
+/// placement repair pass honours: a member can be `Down` (suspect, fast) for
+/// up to `REPAIR_DWELL` before repair (expensive: a full replica rebuild —
+/// engine transfer, `InstallSnapshot`, catch-up) reacts to it. Before this
+/// gate existed, `reconcile_placement` computed `active_candidates` (only
+/// `Active` members) fresh every `RECONCILE_INTERVAL` (500ms) tick and fed
+/// it straight to `replan_repair` — so a member marked `Down` by a single
+/// missed heartbeat round (a GC pause, a scheduler hiccup, a moment of
+/// congestion — exactly the false-positive class ADR 0062 §2's own
+/// `SPLIT_PLACING_RETARGET_DWELL`/`SPLIT_PLACING_RETARGET_DWELL_ACHIEVED`
+/// already exist to protect the directed-Placing convergence phase from,
+/// see those constants' own docs) had its healthy replica evicted and a full
+/// rebuild triggered on the very next tick, for every tablet it replicated,
+/// even though the node was never actually dead.
+///
+/// **The trade-off, both directions.** A genuinely dead node's replicas stay
+/// unrepaired for up to one extra `REPAIR_DWELL` on every tablet it
+/// hosted — reduced redundancy for that long, not reduced availability
+/// (linearizable single-tablet reads/writes still route to whichever
+/// replicas remain, ADR 0016/0017; only a THIRD failure inside the same
+/// tablet's remaining quorum during this window would matter, and RF is
+/// chosen with exactly that kind of margin in mind). In exchange, a
+/// transient flap no longer churns a healthy replica through a full
+/// rebuild at all — the false-positive-triggered churn this constant
+/// exists to eliminate.
+///
+/// **Why 5s, not Cockroach's `time_until_store_dead` (5 minutes by
+/// default).** This repo's own `ProdEnv` self-heal integration tests
+/// (`crates/animusd/tests/{self_heal,tablet_rf_self_heals,cp_reconfigure}.rs`,
+/// owned outside this change) budget 20-60s of real wall-clock time for
+/// repair to complete after a kill, so the default here has to leave that
+/// budget comfortably intact rather than consume most of it just waiting
+/// out the dwell. Deliberately set EQUAL to
+/// [`SPLIT_PLACING_RETARGET_DWELL`] — this is the same false-positive class
+/// that constant already protects the directed-Placing phase from, just for
+/// ordinary repair instead, so there is no principled reason for the two
+/// numbers to differ (the ACHIEVED variant is longer specifically because
+/// undoing an already-realized decision is more disruptive than deferring
+/// one still converging — see that constant's own doc — a distinction that
+/// doesn't apply here: ordinary repair has no "already realized" phase of
+/// its own, so it needs only the one, base-dwell-equivalent number). A
+/// configurable knob (mirroring `--quiesce-after`/orphan-sweep's own
+/// operator-tunable grace windows) is a natural follow-up, not part of this
+/// fix — this is a fixed constant for now, same as `SPLIT_PLACING_RETARGET_
+/// DWELL` was when it first landed.
+///
+/// This is a pacing/liveness heuristic, not a safety invariant: the
+/// epoch-CAS on `CasTabletReplicas` is what keeps a repair itself sound
+/// regardless of how this is tuned, exactly like `SPLIT_PLACING_RETARGET_
+/// DWELL`'s own equivalent disclaimer.
+pub const REPAIR_DWELL: Duration = Duration::from_secs(5);
+
 /// How often a member emits a liveness heartbeat to the control group
 /// (ADR 0012). On the order of the Raft heartbeat interval, and short relative to
 /// [`DETECT_TIMEOUT`] so a live member is comfortably seen within the window.
@@ -1921,7 +1986,12 @@ fn record_transfer_clear(
 /// The leader's placement reconciler (ADR 0005): on a slow timer, if this node
 /// is leader, recompute the desired replica set for every tablet that has a
 /// policy and propose a `CasTabletReplicas` for any that drifted out of
-/// compliance (e.g. a replica's member went `Down`).
+/// compliance (e.g. a replica's member went `Down`). **Issue #928**: a
+/// `Down` replica is not evicted the instant it's observed — `recently_down_
+/// this_tick`'s [`REPAIR_DWELL`] gate keeps a dwelling member in place for a
+/// tablet it already replicates until the dwell elapses, so a transient
+/// failure-detector false positive doesn't trigger a full replica rebuild;
+/// see that function's own doc and `reconcile_placement`'s (`meta.rs`).
 ///
 /// The decision is the **pure, deterministic** [`Metadata::reconcile`]; this
 /// driver supplies only timing (over the `Env` seam) and the propose. It runs on
@@ -1970,6 +2040,16 @@ async fn reconcile_loop<E: Env>(env: E, core: Arc<Mutex<RaftCore>>, cache: Arc<M
     // doc. Same volatile, per-node, `env.now()`-keyed, lost-on-leadership-
     // change shape as `retarget_since` above, for the identical reason.
     let mut done_since: BTreeMap<TabletId, Nanos> = BTreeMap::new();
+    // Driver-local suspect/dead dwell tracking for ordinary repair's
+    // `REPAIR_DWELL` gate (issue #928's fully general form) — see
+    // `recently_down_this_tick`'s own doc. Same volatile, per-node,
+    // `env.now()`-keyed, lost-on-leadership-change shape as `retarget_since`/
+    // `done_since` above: a takeover only ever EXTENDS a dwelling member's
+    // protection (the new leader's own first observation restarts the
+    // timer), never shortens it — see `recently_down_this_tick`'s doc for
+    // why that's the right call and why a replicated `down_since` was
+    // rejected.
+    let mut down_since: BTreeMap<NodeId, Nanos> = BTreeMap::new();
     loop {
         env.sleep(RECONCILE_INTERVAL).await;
         tick = tick.wrapping_add(1);
@@ -1990,6 +2070,7 @@ async fn reconcile_loop<E: Env>(env: E, core: Arc<Mutex<RaftCore>>, cache: Arc<M
             // stance on regaining leadership.
             retarget_since.clear();
             done_since.clear();
+            down_since.clear();
             continue;
         }
         let view = cache.lock().expect("cache poisoned").placement_view();
@@ -1997,7 +2078,11 @@ async fn reconcile_loop<E: Env>(env: E, core: Arc<Mutex<RaftCore>>, cache: Arc<M
         // exclude a tablet still inside its post-`done` grace window — see
         // `recently_done_this_tick`'s own doc.
         let recently_done = recently_done_this_tick(&env, &view, &mut done_since);
-        let proposals = view.reconcile(&recently_done);
+        // Issue #928 (fully general form): the suspect/dead dwell for
+        // ordinary repair — see `recently_down_this_tick`'s own doc and
+        // `REPAIR_DWELL`'s.
+        let recently_down = recently_down_this_tick(&env, &view, &mut down_since);
+        let proposals = view.reconcile(&recently_done, &recently_down);
         let repaired = !proposals.is_empty();
         for command in proposals {
             // Off-leader transitions between the check and here are harmless:
@@ -2013,7 +2098,7 @@ async fn reconcile_loop<E: Env>(env: E, core: Arc<Mutex<RaftCore>>, cache: Arc<M
         // safety is the epoch-CAS + data-plane catch-up gate, not this timing.
         if !repaired
             && tick.is_multiple_of(REBALANCE_EVERY_N_TICKS)
-            && let Some(command) = view.rebalance(&recently_done)
+            && let Some(command) = view.rebalance(&recently_done, &recently_down)
         {
             core.lock().expect("raft core poisoned").propose(command);
         }
@@ -2140,6 +2225,72 @@ fn recently_done_this_tick<E: Env>(
         }
     }
     done_since.retain(|tablet, _| live.contains(tablet));
+    recent
+}
+
+/// One tick's worth of dwell-gate bookkeeping for `reconcile_loop`'s ordinary
+/// repair phase (issue #928's fully general form; see [`REPAIR_DWELL`]'s own
+/// doc for the suspect/dead split this implements): for every member
+/// currently `NodeStatus::Down` in `view.members`, tracks how long it has
+/// been observed CONTINUOUSLY `Down` (via `env.now()`, never wall clock) in
+/// `down_since`, and returns the set of members that have been `Down` for
+/// LESS than [`REPAIR_DWELL`] — i.e. members `reconcile_placement`/
+/// `rebalance_placement` must still treat as an eligible candidate for any
+/// tablet that ALREADY replicates them (never for a tablet it does not — see
+/// `reconcile_placement`'s own doc for that per-tablet augmentation), rather
+/// than evicting yet.
+///
+/// `down_since` is mutated in place, mirroring `recently_done_this_tick`'s
+/// discipline exactly (see that function's own doc for the general shape):
+/// a member observed `Active`/`Leaving`/`Joining` this tick — or no longer
+/// present in `view.members` at all — has its tracked timer pruned outright,
+/// so a later `Down` for the same node restarts the dwell from zero rather
+/// than resuming a stale clock, and this map never grows unbounded across a
+/// long-running leader's lifetime. Only `Down` is ever inserted: `Leaving` is
+/// a deliberate decommission (ADR 0032) that must keep being repaired away
+/// immediately, and `Joining` is never a replica in the first place, so
+/// neither needs — or gets — any dwell protection.
+///
+/// **Takeover semantics.** This map is driver-local, volatile state, exactly
+/// like `retarget_since`/`done_since` above — a control-plane leader
+/// takeover clears it (see this function's own call site in
+/// [`reconcile_loop`]), so a member already `Down` at the moment of takeover
+/// restarts its dwell from the new leader's very first observation, even if
+/// the PREVIOUS leader had already been tracking it for a while. This only
+/// ever EXTENDS a dwelling member's protection — delaying a genuine repair
+/// by at most one more `REPAIR_DWELL`, mirroring [`LEADER_GRACE`]'s own
+/// post-election patience for the failure detector — never shortens it,
+/// since a member's dwell can never be treated as started earlier than it
+/// actually was observed by whichever leader is currently proposing.
+///
+/// A REPLICATED `down_since` (durable in `Metadata`, immune to a leadership
+/// change) was considered and rejected: `env.now()` under `ProdEnv` is
+/// process-local monotonic time, not comparable across nodes (a value one
+/// leader wrote could be nonsensical read back by a different one, and
+/// `SimEnv`'s own per-node clock-skew tooling exists precisely because
+/// `now()` readings are not assumed portable across nodes elsewhere in this
+/// codebase either); and every `Member`/`UpsertMember` construction site
+/// spans crates this one doesn't own, so widening that type is a much larger
+/// change than this fix warrants for a volatile-state bound this loose.
+fn recently_down_this_tick<E: Env>(
+    env: &E,
+    view: &PlacementView,
+    down_since: &mut BTreeMap<NodeId, Nanos>,
+) -> BTreeSet<NodeId> {
+    let now = env.now();
+    let mut recent = BTreeSet::new();
+    let mut live: BTreeSet<NodeId> = BTreeSet::new();
+    for (node, member) in &view.members {
+        if member.status != NodeStatus::Down {
+            continue;
+        }
+        live.insert(node.clone());
+        let since = *down_since.entry(node.clone()).or_insert(now);
+        if now.duration_since(since) < REPAIR_DWELL {
+            recent.insert(node.clone());
+        }
+    }
+    down_since.retain(|node, _| live.contains(node));
     recent
 }
 
@@ -2629,6 +2780,133 @@ mod tests {
             det.forget(id);
         }
         assert!(!det.tracks(nid(99)));
+    }
+
+    // --- Issue #928: `recently_down_this_tick`'s REPAIR_DWELL bookkeeping ---
+    //
+    // White-box tests of the free function directly, mirroring the shape
+    // `recently_done_this_tick`'s own doc describes: a driver-local,
+    // `env.now()`-keyed `BTreeMap`, exercised over a real `SimEnv` (via
+    // `Simulator::run_for`) so `env.now()` genuinely advances rather than
+    // being hand-constructed.
+
+    fn view_with_members(members: BTreeMap<NodeId, Member>) -> PlacementView {
+        PlacementView {
+            members,
+            tablets: BTreeMap::new(),
+            policies: BTreeMap::new(),
+            split_placing: BTreeMap::new(),
+        }
+    }
+
+    fn member(status: NodeStatus) -> Member {
+        Member {
+            labels: BTreeMap::new(),
+            status,
+            has_activated: true,
+        }
+    }
+
+    #[test]
+    fn recently_down_this_tick_starts_the_timer_on_first_observation() {
+        let sim = animus_sim::Simulator::new(0x928_0001);
+        let env = sim.env(nid(0));
+        let view = view_with_members(BTreeMap::from([(nid(7), member(NodeStatus::Down))]));
+        let mut down_since = BTreeMap::new();
+        let recent = recently_down_this_tick(&env, &view, &mut down_since);
+        assert!(
+            recent.contains(&nid(7)),
+            "a freshly-observed Down member must be recently-down on its own first tick"
+        );
+        assert!(
+            down_since.contains_key(&nid(7)),
+            "the first observation must seed a timer"
+        );
+    }
+
+    #[test]
+    fn recently_down_this_tick_is_still_recent_just_under_the_dwell() {
+        let mut sim = animus_sim::Simulator::new(0x928_0002);
+        let env = sim.env(nid(0));
+        let view = view_with_members(BTreeMap::from([(nid(7), member(NodeStatus::Down))]));
+        let mut down_since = BTreeMap::new();
+        recently_down_this_tick(&env, &view, &mut down_since); // seeds the timer at t=0
+
+        sim.run_for(REPAIR_DWELL - Duration::from_millis(1));
+        let recent = recently_down_this_tick(&env, &view, &mut down_since);
+        assert!(
+            recent.contains(&nid(7)),
+            "1ms under REPAIR_DWELL must still be protected"
+        );
+    }
+
+    #[test]
+    fn recently_down_this_tick_is_not_recent_once_the_dwell_elapses() {
+        let mut sim = animus_sim::Simulator::new(0x928_0003);
+        let env = sim.env(nid(0));
+        let view = view_with_members(BTreeMap::from([(nid(7), member(NodeStatus::Down))]));
+        let mut down_since = BTreeMap::new();
+        recently_down_this_tick(&env, &view, &mut down_since); // seeds the timer at t=0
+
+        sim.run_for(REPAIR_DWELL);
+        let recent = recently_down_this_tick(&env, &view, &mut down_since);
+        assert!(
+            !recent.contains(&nid(7)),
+            "a member Down for exactly REPAIR_DWELL must no longer be protected"
+        );
+    }
+
+    #[test]
+    fn recently_down_this_tick_restarts_the_dwell_after_a_recovery() {
+        let mut sim = animus_sim::Simulator::new(0x928_0004);
+        let env = sim.env(nid(0));
+        let mut down_since = BTreeMap::new();
+
+        // First Down observation seeds a timer at t=0.
+        let down_view = view_with_members(BTreeMap::from([(nid(7), member(NodeStatus::Down))]));
+        recently_down_this_tick(&env, &down_view, &mut down_since);
+
+        // The member is seen Active again well before the dwell elapses —
+        // its tracked timer must be dropped entirely, not merely paused.
+        sim.run_for(Duration::from_millis(500));
+        let active_view = view_with_members(BTreeMap::from([(nid(7), member(NodeStatus::Active))]));
+        let recent = recently_down_this_tick(&env, &active_view, &mut down_since);
+        assert!(recent.is_empty());
+        assert!(
+            !down_since.contains_key(&nid(7)),
+            "an Active observation must prune the tracked timer"
+        );
+
+        // Down again, well past where the ORIGINAL timer would have expired
+        // (500ms + REPAIR_DWELL) — if the dwell had resumed a stale clock
+        // instead of restarting from zero, this would already read as not
+        // recent.
+        sim.run_for(REPAIR_DWELL);
+        let recent = recently_down_this_tick(&env, &down_view, &mut down_since);
+        assert!(
+            recent.contains(&nid(7)),
+            "a fresh Down observation must restart the dwell from zero, not resume a stale clock"
+        );
+    }
+
+    #[test]
+    fn recently_down_this_tick_never_tracks_leaving_or_joining() {
+        let sim = animus_sim::Simulator::new(0x928_0005);
+        let env = sim.env(nid(0));
+        let mut down_since = BTreeMap::new();
+
+        for status in [NodeStatus::Leaving, NodeStatus::Joining] {
+            let view = view_with_members(BTreeMap::from([(nid(7), member(status))]));
+            let recent = recently_down_this_tick(&env, &view, &mut down_since);
+            assert!(
+                recent.is_empty(),
+                "{status:?} must never be treated as recently-down"
+            );
+            assert!(
+                down_since.is_empty(),
+                "{status:?} must never seed a dwell timer"
+            );
+        }
     }
 
     // --- ADR 0038 PR3: the apply task's watermark-gated tail replay ---------

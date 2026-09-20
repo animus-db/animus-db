@@ -24,14 +24,14 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use animus_control::node::heartbeat_loop;
+use animus_control::node::{REPAIR_DWELL, heartbeat_loop};
 use animus_control::raft::ProposeResult;
 use animus_control::{MetaCommand, Metadata, NodeStatus, RaftNode};
 use animus_env::{EnvExt, NodeId, nid};
 use animus_placement::PlacementPolicy;
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::MemoryEngine;
-use animus_tablet::{KeyRange, TabletId};
+use animus_tablet::{KeyRange, Tablet, TabletId};
 
 const CONTROL: [u64; 3] = [0, 1, 2];
 const TABLET: TabletId = TabletId(1);
@@ -176,8 +176,12 @@ fn run(seed: u64) {
     ));
 
     // Again: no test-driven reconcile. Let the leader notice and fix it.
+    // Issue #928: repair now waits out `node::REPAIR_DWELL` (5s) after a
+    // member is first observed `Down` before evicting its replica — see that
+    // constant's own doc — so this budget must clear the dwell plus slack,
+    // not just `RECONCILE_INTERVAL`.
     let epoch_before = nodes[leader].metadata().tablets[&TABLET].epoch;
-    sim.run_for(Duration::from_secs(3));
+    sim.run_for(REPAIR_DWELL + Duration::from_secs(3));
 
     // The reconcile committed on every control node: the dead replica is gone,
     // residency + spread still hold, survivors stayed put, and the replacement
@@ -436,4 +440,198 @@ fn undersized_growth_is_reproducible_from_seed() {
         sim.trace_lines()
     }
     assert_eq!(trace(0x5EED_0957), trace(0x5EED_0957));
+}
+
+fn status_of(meta: &Metadata, node: &NodeId) -> NodeStatus {
+    meta.members[node].status
+}
+
+/// Place a compliant 3-replica tablet exactly like `run`'s own setup, and
+/// return its `Tablet` snapshot — shared scaffolding for the two
+/// `REPAIR_DWELL` tests below so neither repeats `run`'s own fixture
+/// verbatim.
+fn place_compliant_tablet(
+    sim: &mut Simulator,
+    nodes: &[RaftNode<SimEnv>],
+    leader: usize,
+) -> Tablet {
+    for (id, region, zone) in DATA_NODES {
+        assert!(matches!(
+            nodes[leader].propose(MetaCommand::UpsertMember {
+                node: nid(id),
+                labels: labels(region, zone),
+                status: NodeStatus::Active,
+            }),
+            ProposeResult::Accepted { .. }
+        ));
+    }
+    sim.run_for(Duration::from_secs(1));
+    let initial = vec![10, 12, 14];
+    assert!(matches!(
+        nodes[leader].propose(MetaCommand::CreateTablet {
+            tablet: TABLET,
+            table: None,
+            range: KeyRange::whole(),
+            replicas: initial.into_iter().map(nid).collect(),
+        }),
+        ProposeResult::Accepted { .. }
+    ));
+    assert!(matches!(
+        nodes[leader].propose(MetaCommand::SetTabletPolicy {
+            tablet: TABLET,
+            policy: Some(policy()),
+        }),
+        ProposeResult::Accepted { .. }
+    ));
+    sim.run_for(Duration::from_secs(1));
+    nodes[leader].metadata().tablets[&TABLET].clone()
+}
+
+/// **Issue #928 regression, live over a real `reconcile_loop`/`SimEnv`.** A
+/// failure-detector false positive — a member merely paused (a GC pause /
+/// scheduler hiccup / brief congestion), never actually dead — must not
+/// evict its replica or trigger any placement change while it is within
+/// [`REPAIR_DWELL`] of first being observed `Down`.
+///
+/// **Red-before proof (recorded in this fix's commit message)**: with
+/// `node.rs`'s `reconcile_loop` call site temporarily passing
+/// `&BTreeSet::new()` instead of the real `recently_down` (the pre-fix
+/// behavior), this test fails with the tablet's replica set changing (a
+/// `CasTabletReplicas` moving the paused-but-not-dead member off) well
+/// within the dwell window, the very shape this fix closes.
+#[test]
+fn a_detector_false_positive_within_the_repair_dwell_does_not_move_the_replica() {
+    run_false_positive(0x0928_0001);
+}
+
+fn run_false_positive(seed: u64) {
+    let (mut sim, nodes) = cluster(seed);
+    sim.run_for(Duration::from_secs(2));
+    let leader = leader_among(&nodes, &[0, 1, 2]);
+    let before = place_compliant_tablet(&mut sim, &nodes, leader);
+
+    // Fault: the first placed replica's node stops heartbeating for 1.5s — a
+    // GC pause / scheduler hiccup, not a real death. This is comfortably
+    // over `DETECT_TIMEOUT` (500ms, so the detector genuinely marks it
+    // `Down`) and comfortably under `REPAIR_DWELL` (5s).
+    let flapping = before.replicas[0].clone();
+    sim.pause(flapping.clone(), Duration::from_millis(1_500));
+
+    // Poll every `RECONCILE_INTERVAL`-scale tick across the whole window (up
+    // to REPAIR_DWELL + 2s), converged-or-timeout style: confirm the
+    // detector actually observes both transitions (Down, then recovered
+    // Active — proving this is a real, reacted-to liveness event and not a
+    // vacuous no-op either way), while asserting on EVERY tick that the
+    // tablet's replicas and epoch never moved.
+    let mut saw_down = false;
+    let mut saw_recovered = false;
+    let ticks = (REPAIR_DWELL + Duration::from_secs(2)).as_millis() / 100;
+    for _ in 0..ticks {
+        sim.run_for(Duration::from_millis(100));
+        let meta = nodes[leader].metadata();
+        let status = status_of(&meta, &flapping);
+        if status == NodeStatus::Down {
+            saw_down = true;
+        }
+        if saw_down && status == NodeStatus::Active {
+            saw_recovered = true;
+        }
+        assert_eq!(
+            meta.tablets[&TABLET].replicas, before.replicas,
+            "replica set changed during the repair dwell (seed={seed})"
+        );
+        assert_eq!(
+            meta.tablets[&TABLET].epoch, before.epoch,
+            "epoch changed during the repair dwell (seed={seed})"
+        );
+    }
+    assert!(
+        saw_down,
+        "expected the detector to mark the paused node Down at some point (seed={seed})"
+    );
+    assert!(
+        saw_recovered,
+        "expected the paused node to recover to Active once its pause ended (seed={seed})"
+    );
+}
+
+/// **The other half of the same fix**: a member that stays `Down` PAST
+/// `REPAIR_DWELL` — a genuine failure, not a false positive — is still
+/// repaired; the dwell delays repair, it does not disable it.
+#[test]
+fn a_member_down_past_the_repair_dwell_is_repaired() {
+    run_down_past_dwell(0x0928_0002);
+}
+
+fn run_down_past_dwell(seed: u64) {
+    let (mut sim, nodes) = cluster(seed);
+    sim.run_for(Duration::from_secs(2));
+    let leader = leader_among(&nodes, &[0, 1, 2]);
+    let before = place_compliant_tablet(&mut sim, &nodes, leader);
+
+    let dead = before.replicas[0].clone();
+    let dead_zone = zone_of(&nodes[leader].metadata(), &dead);
+    // Stop its heartbeat too — otherwise the (pre-existing, unchanged) `Down`
+    // -> `Active` recovery rule would immediately revert this manual `Down`.
+    sim.crash(dead.clone());
+    assert!(matches!(
+        nodes[leader].propose(MetaCommand::UpsertMember {
+            node: dead.clone(),
+            labels: nodes[leader].metadata().members[&dead].labels.clone(),
+            status: NodeStatus::Down,
+        }),
+        ProposeResult::Accepted { .. }
+    ));
+
+    // Nothing must move for the first REPAIR_DWELL - 1s.
+    sim.run_for(REPAIR_DWELL - Duration::from_secs(1));
+    let meta = nodes[leader].metadata();
+    assert_eq!(
+        meta.tablets[&TABLET].replicas, before.replicas,
+        "seed={seed}: repair reacted before the dwell elapsed"
+    );
+    assert_eq!(
+        meta.tablets[&TABLET].epoch, before.epoch,
+        "seed={seed}: epoch bumped before the dwell elapsed"
+    );
+
+    // Repair lands within REPAIR_DWELL + 3s of the Down instant (1s of that
+    // window is already spent above; poll the rest, converged-or-timeout).
+    let mut done = false;
+    for _ in 0..40 {
+        sim.run_for(Duration::from_millis(100));
+        if !nodes[leader].metadata().tablets[&TABLET]
+            .replicas
+            .contains(&dead)
+        {
+            done = true;
+            break;
+        }
+    }
+    assert!(
+        done,
+        "member Down past REPAIR_DWELL was never repaired (seed={seed})"
+    );
+    let meta = nodes[leader].metadata();
+    assert!(
+        meta.tablets[&TABLET].epoch > before.epoch,
+        "epoch not bumped (seed={seed})"
+    );
+    for kept in before.replicas.iter().filter(|n| **n != dead) {
+        assert!(
+            meta.tablets[&TABLET].replicas.contains(kept),
+            "survivor {kept} needlessly moved (seed={seed})"
+        );
+    }
+    let replacement = meta.tablets[&TABLET]
+        .replicas
+        .iter()
+        .find(|n| !before.replicas.contains(n))
+        .unwrap()
+        .clone();
+    assert_eq!(
+        zone_of(&meta, &replacement),
+        dead_zone,
+        "replacement should reuse the dead zone (seed={seed})"
+    );
 }

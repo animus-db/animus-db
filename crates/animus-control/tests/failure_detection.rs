@@ -19,7 +19,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use animus_control::node::heartbeat_loop;
+use animus_control::node::{REPAIR_DWELL, heartbeat_loop};
 use animus_control::raft::ProposeResult;
 use animus_control::{MetaCommand, Metadata, NodeStatus, RaftNode};
 use animus_env::{EnvExt, NodeId, nid};
@@ -165,8 +165,11 @@ fn run(seed: u64) {
 
     // No manual `Down`, no test-driven reconcile: the leader's detector must
     // notice the silence (> DETECT_TIMEOUT) and commit `Down`, which the
-    // placement reconciler then reacts to.
-    sim.run_for(Duration::from_secs(2));
+    // placement reconciler then reacts to. Issue #928: repair now waits out
+    // `REPAIR_DWELL` (5s) after the member is first observed `Down` before
+    // evicting its replica — see that constant's own doc — so this budget
+    // must clear the dwell plus slack, not just `DETECT_TIMEOUT`.
+    sim.run_for(REPAIR_DWELL + Duration::from_secs(3));
 
     for (i, node) in nodes.iter().enumerate() {
         let m = node.metadata();
