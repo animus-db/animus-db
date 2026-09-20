@@ -5,24 +5,35 @@
 //!
 //! This is the production assembly of the CP plane whose mechanism is sim-proven
 //! in `animus-cp-data` (single-tablet linearizable KV, ReadIndex reads). Here we
-//! drive it over real TCP/time through the same client API the CLI uses:
-//!
-//! 1. bring up a 3-node cluster and bootstrap it;
-//! 2. write a key through one node's client API — the node routes it to the CP
-//!    group leader (in-process: the shared cluster edge state reaches the leader);
-//! 3. read it back through a *different* node — the CP group is the single source
-//!    of truth, so the linearizable read observes the committed write;
-//! 4. an absent key reads as `None` (not a phantom); an untagged key round-trips
-//!    the same way (the optional `table` no longer selects a plane — there is only
-//!    the CP plane).
+//! drive it over real TCP/time through the same client API the CLI uses.
 //!
 //! Real TCP/time, so it polls with generous timeouts rather than asserting
 //! deterministic timing. Cross-process CP routing (forwarding to the leader's
 //! node) is covered by `cp_cross_process.rs`.
+//!
+//! **ADR 0061 rung O, issue #997**: this file used to hold five tests.
+//! `reads_and_writes_route_through_the_raft_group` was deleted outright as
+//! redundant — `tests/cluster.rs::cluster_serves_put_get_and_status_over_tcp`
+//! drives the identical `bind_cluster`/`start_cluster` production entry point
+//! and proves a strictly *stronger* version of the same put/get/absent-key
+//! property (plus a cross-node overwrite proving quorum-derived versioning,
+//! and a `Status`/`control_voters` check neither test here ever had).
+//! `cp_member_addresses_register_and_replicate` and
+//! `cp_tablet_splits_and_both_halves_serve` converted to deterministic
+//! `SimCluster` siblings, `crates/animusd/src/sim_cluster_cp_plane.rs` — see
+//! that module's own doc for the exact per-property mapping.
+//! `tablet_auto_splits_on_bytes_with_skewed_value_sizes` (below) ALSO now has
+//! a deterministic `SimCluster` sibling there (the rung's own bounded spike
+//! succeeded — `SimCluster::put_raw`'s literal keys make the byte-weighted-
+//! median-to-token-range correlation reproducible after all) but **stays
+//! here too, unconverted, permanently** — the sim sibling proves the same
+//! quantitative claim, not the real per-tablet Raft group/real-thread commit
+//! path this test's own `ProdEnv` assembly exercises it through.
+//! `single_write_latency_is_low` (below) remains — a permanent `ProdEnv`
+//! regression, real-thread wall-clock latency `SimEnv` cannot reproduce.
 
 use std::time::Duration;
 
-use animus_env::NodeId;
 use animusd::{
     ClientRequest, ClientResponse, Node, StorageBackend, bind_cluster, read_frame, start_cluster,
     start_cluster_with_auto_split_bytes,
@@ -59,296 +70,6 @@ async fn await_bootstrap(nodes: &[Node]) {
     timeout(Duration::from_secs(20), ready)
         .await
         .expect("cluster did not bootstrap within 20s");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
-async fn reads_and_writes_route_through_the_raft_group() {
-    let dir = support::panic_safe_tempdir();
-    let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
-        .await
-        .unwrap();
-    let nodes = start_cluster(bound).await.unwrap();
-    await_bootstrap(&nodes).await;
-
-    // Write a key through node 0's client API, tagged with a table name. The node
-    // routes it to the CP group leader. Retry until PutOk: the CP group may still
-    // be electing its own leader (independent of the control plane's), so `cp_put`
-    // errors until it settles.
-    let addr0 = nodes[0].client_addr();
-    let put_ok = async {
-        loop {
-            let resp = call(
-                addr0,
-                ClientRequest::Put {
-                    key: b"k".to_vec(),
-                    value: b"cp-value".to_vec(),
-                    table: CP_TABLE.into(),
-                },
-            )
-            .await;
-            match resp {
-                ClientResponse::PutOk => return,
-                ClientResponse::Error(_) => sleep(Duration::from_millis(100)).await,
-                other => panic!("unexpected CP put response: {other:?}"),
-            }
-        }
-    };
-    timeout(Duration::from_secs(20), put_ok)
-        .await
-        .expect("CP write did not succeed within 20s");
-
-    // Read it back through a *different* node's client API: the CP group is the
-    // single source of truth (reached via the shared cluster edge state), so the
-    // linearizable read observes the committed write.
-    let addr2 = nodes[2].client_addr();
-    let got = call(
-        addr2,
-        ClientRequest::Get {
-            key: b"k".to_vec(),
-            table: CP_TABLE.into(),
-            stale: false,
-        },
-    )
-    .await;
-    assert_eq!(
-        got,
-        ClientResponse::Value(Some(b"cp-value".to_vec())),
-        "CP read must observe the committed CP write"
-    );
-
-    // A read of an absent key reads as `None` (not a phantom).
-    let absent = call(
-        addr0,
-        ClientRequest::Get {
-            key: b"absent".to_vec(),
-            table: CP_TABLE.into(),
-            stale: false,
-        },
-    )
-    .await;
-    assert_eq!(absent, ClientResponse::Value(None));
-
-    // An **untagged** key round-trips the same way (there is only the CP plane; the
-    // optional `table` no longer selects a plane). This is `kv`'s own first write
-    // (a distinct table from `CP_TABLE` above), so it retries until `PutOk` for the
-    // same first-provision-race reason the write above did.
-    let untagged_put_ok = async {
-        loop {
-            let resp = call(
-                addr0,
-                ClientRequest::Put {
-                    key: b"u".to_vec(),
-                    value: b"u-value".to_vec(),
-                    table: "kv".to_string(),
-                },
-            )
-            .await;
-            match resp {
-                ClientResponse::PutOk => return,
-                ClientResponse::Error(_) => sleep(Duration::from_millis(100)).await,
-                other => panic!("unexpected untagged put response: {other:?}"),
-            }
-        }
-    };
-    timeout(Duration::from_secs(20), untagged_put_ok)
-        .await
-        .expect("untagged put did not succeed within 20s");
-    let untagged_got = call(
-        addr2,
-        ClientRequest::Get {
-            key: b"u".to_vec(),
-            table: "kv".to_string(),
-            stale: false,
-        },
-    )
-    .await;
-    assert_eq!(
-        untagged_got,
-        ClientResponse::Value(Some(b"u-value".to_vec()))
-    );
-
-    for n in &nodes {
-        n.shutdown_graceful().await;
-    }
-}
-
-/// Phase 2.3a / ADR 0032 PR1 — **CP member address distribution.** Each
-/// CP-group node registers its full address book (`raftkv`/`client`/`admin`) in
-/// the replicated control-plane `Metadata` (`node_addrs` — `RegisterNodeAddrs`
-/// superseded `RegisterCpAddr` for this self-registration; the older command
-/// stays only for WAL back-compat), so a peer-sync loop on every node can reach
-/// a runtime-created group member (a split sibling, a joined node), and any
-/// node can forward/relay to any other. Here we assert the bootstrap members
-/// register and the entries replicate cluster-wide: every node sees a
-/// parseable `raftkv` address for each of the 3 CP group member ids
-/// (node ids `0..3`).
-#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
-async fn cp_member_addresses_register_and_replicate() {
-    let dir = support::panic_safe_tempdir();
-    let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
-        .await
-        .unwrap();
-    let nodes = start_cluster(bound).await.unwrap();
-    await_bootstrap(&nodes).await;
-
-    let want: Vec<NodeId> = (0..3).map(animusd::config::node_id).collect();
-    let replicated = async {
-        loop {
-            // Every node's replicated view has a parseable raftkv address for
-            // all 3 members.
-            let ok = nodes.iter().all(|n| {
-                let m = n.metadata();
-                want.iter().all(|id| {
-                    m.node_addrs
-                        .get(id)
-                        .and_then(|a| a.internal.parse::<std::net::SocketAddr>().ok())
-                        .is_some()
-                })
-            });
-            if ok {
-                return;
-            }
-            sleep(Duration::from_millis(100)).await;
-        }
-    };
-    timeout(Duration::from_secs(20), replicated)
-        .await
-        .expect("CP member addresses did not register + replicate within 20s");
-
-    for n in &nodes {
-        n.shutdown_graceful().await;
-    }
-}
-
-/// **CP tablet split over `ProdEnv`.** A single, atomic control-plane command
-/// (`SplitTablet`) narrows the source tablet's range and mints a new sibling
-/// tablet covering the upper range — both served from the same replicas' one
-/// shared per-node storage engine (ADR 0026/0028), so no data moves. The
-/// per-node join-host loop then forms the new tablet's Raft group on each
-/// replica. Both halves keep serving, and a value written before the split
-/// (into what becomes the upper range) is still there after.
-///
-/// Real TCP/time: bring up a 3-node cluster, write a lower + an upper key, trigger
-/// the split, then poll until the new tablet is in the map and the upper key is
-/// served by the new group (its election takes a moment).
-#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
-async fn cp_tablet_splits_and_both_halves_serve() {
-    let dir = support::panic_safe_tempdir();
-    let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
-        .await
-        .unwrap();
-    let nodes = start_cluster(bound).await.unwrap();
-    await_bootstrap(&nodes).await;
-    let addr0 = nodes[0].client_addr();
-
-    // Helper: a Put that retries until PutOk (CP group may still be electing).
-    async fn put_until_ok(addr: std::net::SocketAddr, key: &[u8], value: &[u8]) {
-        let put = async {
-            loop {
-                match call(
-                    addr,
-                    ClientRequest::Put {
-                        key: key.to_vec(),
-                        value: value.to_vec(),
-                        table: "kv".to_string(),
-                    },
-                )
-                .await
-                {
-                    ClientResponse::PutOk => return,
-                    ClientResponse::Error(_) => sleep(Duration::from_millis(100)).await,
-                    other => panic!("unexpected put response: {other:?}"),
-                }
-            }
-        };
-        timeout(Duration::from_secs(20), put)
-            .await
-            .expect("put did not succeed within 20s");
-    }
-
-    // Write a lower key and an upper key (split point will be "k5").
-    put_until_ok(addr0, b"k1", b"lower").await;
-    put_until_ok(addr0, b"k9", b"upper").await; // rides the handoff to the new group
-
-    // Trigger the split of the bootstrap tablet (id 1) at "k5".
-    let resp = call(
-        addr0,
-        ClientRequest::SplitTablet {
-            tablet: 1,
-            split_key: b"k5".to_vec(),
-        },
-    )
-    .await;
-    assert!(
-        matches!(resp, ClientResponse::PutOk),
-        "split trigger rejected: {resp:?}"
-    );
-
-    // The control plane now has a second tablet (the new upper-range tablet).
-    let split_recorded = async {
-        loop {
-            if nodes.iter().all(|n| n.metadata().tablets.len() == 2) {
-                return;
-            }
-            sleep(Duration::from_millis(100)).await;
-        }
-    };
-    timeout(Duration::from_secs(20), split_recorded)
-        .await
-        .expect("split was not recorded in the tablet map within 20s");
-
-    // The upper key is now served by the NEW group (seeded from the handoff): read
-    // it back via a different node, retrying while the new group elects + its
-    // members' addresses propagate.
-    let read_upper = async {
-        loop {
-            let got = call(
-                nodes[2].client_addr(),
-                ClientRequest::Get {
-                    key: b"k9".to_vec(),
-                    table: "kv".to_string(),
-                    stale: false,
-                },
-            )
-            .await;
-            if got == ClientResponse::Value(Some(b"upper".to_vec())) {
-                return;
-            }
-            sleep(Duration::from_millis(150)).await;
-        }
-    };
-    timeout(Duration::from_secs(30), read_upper)
-        .await
-        .expect("upper key not served by the new tablet's group within 30s");
-
-    // The lower key still round-trips on the original group.
-    let lower = call(
-        addr0,
-        ClientRequest::Get {
-            key: b"k1".to_vec(),
-            table: "kv".to_string(),
-            stale: false,
-        },
-    )
-    .await;
-    assert_eq!(lower, ClientResponse::Value(Some(b"lower".to_vec())));
-
-    // A *new* upper-range write routes to the new group and round-trips.
-    put_until_ok(addr0, b"k7", b"upper2").await;
-    let new_upper = call(
-        nodes[1].client_addr(),
-        ClientRequest::Get {
-            key: b"k7".to_vec(),
-            table: "kv".to_string(),
-            stale: false,
-        },
-    )
-    .await;
-    assert_eq!(new_upper, ClientResponse::Value(Some(b"upper2".to_vec())));
-
-    for n in &nodes {
-        n.shutdown_graceful().await;
-    }
 }
 
 /// **Single-write latency (deferred fix #2).** A lone CP write used to eat two
@@ -462,9 +183,22 @@ async fn single_write_latency_is_low() {
 /// keeps `tablet_auto_splits_on_bytes_with_skewed_value_sizes` just below
 /// — its specific byte-weighted-median quantitative-balance claim (a loose
 /// 15% floor derived from correlating written keys against real token
-/// ranges) isn't reproduced by the new `SimCluster` scenarios, which don't
-/// correlate a DynamoDB item's `pk` to its token range — see
-/// `crates/animusd/CLAUDE.md`'s matching entry.
+/// ranges) wasn't reproduced by that file's own DynamoDB-wire scenarios,
+/// which don't correlate a DynamoDB item's `pk` to its token range.
+///
+/// **ADR 0061 rung O, issue #997 — a bounded spike closed this gap after
+/// all**: `sim_cluster_cp_plane.rs`'s own scenario (3),
+/// `tablet_auto_splits_on_bytes_with_skewed_value_sizes`, reproduces the
+/// identical byte-weighted-median claim deterministically via the
+/// **raw-KV** path (`SimCluster::put_raw`'s literal, un-encoded keys —
+/// this file's own `cp_tablet_splits_and_both_halves_serve` conversion's
+/// own primitive) instead of the DynamoDB-wire path — a literal key can be
+/// correlated against a child tablet's own `KeyRange` directly, no token
+/// hashing in the way. This test stays here anyway, unconverted and
+/// permanent: the sim sibling proves the same quantitative claim, not the
+/// real per-tablet Raft group / real-thread commit path this test's own
+/// `ProdEnv` assembly exercises it through. See `crates/animusd/CLAUDE.md`'s
+/// matching entry.
 ///
 /// ADR 0034 — **byte-based** auto-split trigger with skewed value sizes. A
 /// tablet with only a handful of keys auto-splits purely on the **byte**
