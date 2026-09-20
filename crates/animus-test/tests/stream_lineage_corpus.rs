@@ -60,11 +60,13 @@ use animus_control::{
     ApplyOutcome, ColumnType, MetaCommand, Metadata, StreamSpec, StreamViewType, TableSchema,
 };
 use animus_cp_data::host::{MemoryTabletEngines, MetadataView, Reconciler};
-use animus_cp_data::{KIND_BASE, RaftKvNode, StorageScope, TxnOutcome, TxnWrite, segment};
+use animus_cp_data::{
+    KIND_BASE, KindEvalEntry, KindEvalOp, RaftKvNode, StorageScope, TxnOutcome, TxnWrite, segment,
+};
 use animus_env::{Env, EnvExt, Nanos, NodeId, Rng, SegmentStore, nid};
 use animus_sim::{DiskConfig, NetConfig, SimEnv, SimSegmentStore, Simulator};
 use animus_storage::MemoryEngine;
-use animus_tablet::{KeyRange, TabletId, TabletState};
+use animus_tablet::{KeyRange, TabletId, TabletState, partition_token};
 use animus_test::corpus;
 use futures::executor::block_on;
 use std::sync::{Arc, Mutex};
@@ -2639,5 +2641,167 @@ fn tied_multi_key_commit_paginates_without_loss() {
     for_each_seed(
         "tied_multi_key_commit_paginates_without_loss",
         scenario_tied_multi_key_commit_paginates_without_loss,
+    );
+}
+
+// --- cell 18: kind_eval_batch_delivers_every_item_exactly_once_in_order (issue #996) ---
+//
+// `KvCommand::KindEvalBatch` (ADR 0049's batched-`BatchWriteItem`-images
+// amendment, issue #996 layer 1) is the newer, apply-evaluated sibling of
+// `KvCommand::KindBatch` — cell 17 above proves the `(packed_hlc, ordinal)`
+// exactly-once walk for a tied `KindBatch` entry; this cell proves the
+// IDENTICAL claim for a `KindEvalBatch` entry end to end, including
+// surviving a mid-commit leader kill, since `materialize_derived`'s own
+// ordinal-threading is reused verbatim by both variants' apply arms (see
+// `animus-cp-data/CLAUDE.md`'s Key invariants section).
+
+fn kind_eval_batch_pk(i: usize) -> animus_item::AttributeValue {
+    animus_item::AttributeValue::S(format!("kb-item-{i}"))
+}
+
+fn kind_eval_batch_schema() -> animus_item::WriteSchema {
+    animus_item::WriteSchema {
+        key: animus_item::TableSchema::simple("pk"),
+        lsis: Vec::new(),
+        change_records_carry_images: true,
+    }
+}
+
+/// Proposes one `KindEvalBatch` entry carrying `n` independent `Put`s (one
+/// per key `kind_eval_batch_pk(0..n)`) — the evaluate-at-apply sibling of
+/// [`propose_multi_write`]'s hand-built `KindBatch`. Returns the accepted
+/// index and every item's own pk, in proposal order.
+fn propose_kind_eval_batch_items(
+    group: &Group,
+    leader: usize,
+    n: usize,
+) -> (u64, Vec<animus_item::AttributeValue>) {
+    let schema = kind_eval_batch_schema();
+    let pks: Vec<_> = (0..n).map(kind_eval_batch_pk).collect();
+    let entries: Vec<KindEvalEntry> = pks
+        .iter()
+        .enumerate()
+        .map(|(i, pk)| {
+            let item: animus_item::Item = [
+                ("pk".to_owned(), pk.clone()),
+                (
+                    "v".to_owned(),
+                    animus_item::AttributeValue::N(i.to_string()),
+                ),
+            ]
+            .into_iter()
+            .collect();
+            KindEvalEntry {
+                schema: schema.clone(),
+                pk: pk.clone(),
+                sk: None,
+                op: KindEvalOp::Put(item),
+                condition: None,
+                ttl_expired: false,
+            }
+        })
+        .collect();
+    match group.nodes[leader].propose_kind_eval_batch(entries) {
+        animus_control::ProposeResult::Accepted { index, .. } => (index, pks),
+        other => panic!("leader rejected a KindEvalBatch: {other:?}"),
+    }
+}
+
+fn scenario_kind_eval_batch_delivers_every_item_exactly_once_in_order(seed: u64) {
+    let mut sim = Simulator::new(seed);
+    let engines = engines();
+    let group = start_group(&sim, &engines, TabletId(70), KeyRange::whole());
+    let mut live = vec![0, 1, 2];
+    sim.run_for(Duration::from_secs(2));
+
+    const N: usize = 5;
+    let leader_before = elect(&mut sim, &group, &live, seed);
+    let (index, pks) = propose_kind_eval_batch_items(&group, leader_before, N);
+    // Confirm the entry committed BEFORE killing its own leader — this cell
+    // proves the batch's ordinals survive a leadership change AFTER commit
+    // (mirroring `scenario_tied_multi_key_commit_paginates_without_loss`'s
+    // own kill-right-after-confirm shape), not that it survives an
+    // uncommitted-entry truncation (a different, already-covered claim —
+    // see `animus-cp-data/tests/kind_eval_batch_fault.rs`'s own leader-kill
+    // truncation scenario).
+    confirm(&mut sim, &group, leader_before, index, seed);
+
+    sim.crash(nid(NODES[leader_before]));
+    live.retain(|&i| i != leader_before);
+    let leader = elect(&mut sim, &group, &live, seed);
+    // Leadership and apply-catchup are not the same event — the freshly
+    // elected leader must have actually replayed the entry before its own
+    // state reflects it.
+    confirm(&mut sim, &group, leader, index, seed);
+
+    // Every item's own base row applied on every surviving replica —
+    // converged-or-timeout (never a fixed-deadline one-shot read, per this
+    // crate's own doctrine): `confirm` above only polled the (new) leader's
+    // own applied index, so a surviving NON-leader replica may still be a
+    // few replication rounds behind at this exact instant.
+    for pk in &pks {
+        let mut key = partition_token(&animus_item::storage_key(pk, None)).to_vec();
+        key.extend_from_slice(&animus_item::storage_key(pk, None));
+        for &i in &live {
+            let mut applied = false;
+            for _ in 0..300 {
+                if block_on(group.nodes[i].local_get_kind(KIND_BASE, &key)).is_some() {
+                    applied = true;
+                    break;
+                }
+                sim.run_for(Duration::from_millis(10));
+            }
+            assert!(
+                applied,
+                "[seed={seed}] node {i}: base row for {pk:?} never converged"
+            );
+        }
+    }
+
+    // The `(packed_hlc, ordinal)` exactly-once walk: every one of this
+    // entry's N items materializes exactly one change record, all sharing
+    // this entry's own ts, at distinct ordinals 0..N with no gaps/repeats —
+    // read via `pending_changes_key_order` (the OPEN-tail path, the same
+    // primitive `get_records_page`'s own open-shard arm uses), mirroring
+    // cell 17's own `assert_tied_delivery_is_sound` property but for the
+    // newer, apply-evaluated variant.
+    let records = block_on(group.nodes[leader].pending_changes_key_order());
+    let mut seqnos: Vec<(u64, u32)> = records
+        .iter()
+        .filter_map(|(k, _)| record_seqno_suffix(k))
+        .collect();
+    assert_eq!(
+        seqnos.len(),
+        N,
+        "[seed={seed}] every one of this batch's {N} items must materialize exactly one \
+         change record: {seqnos:?}"
+    );
+    seqnos.sort_unstable();
+    let mut dedup = seqnos.clone();
+    dedup.dedup();
+    assert_eq!(
+        dedup.len(),
+        seqnos.len(),
+        "[seed={seed}] every (packed_hlc, ordinal) pair must be distinct: {seqnos:?}"
+    );
+    let hlc = seqnos[0].0;
+    assert!(
+        seqnos.iter().all(|(h, _)| *h == hlc),
+        "[seed={seed}] every item in one KindEvalBatch entry shares its entry's own ts: \
+         {seqnos:?}"
+    );
+    let ordinals: Vec<u32> = seqnos.iter().map(|(_, o)| o).copied().collect();
+    assert_eq!(
+        ordinals,
+        (0..N as u32).collect::<Vec<_>>(),
+        "[seed={seed}] ordinals must be exactly 0..{N}, no gaps and no repeats: {ordinals:?}"
+    );
+}
+
+#[test]
+fn kind_eval_batch_delivers_every_item_exactly_once_in_order() {
+    for_each_seed(
+        "kind_eval_batch_delivers_every_item_exactly_once_in_order",
+        scenario_kind_eval_batch_delivers_every_item_exactly_once_in_order,
     );
 }

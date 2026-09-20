@@ -432,3 +432,79 @@ once these three were fixed and was deleted, along with its own unit
 tests. See `crates/animusd/src/write_path.rs`'s `poll_probe` doc and
 `docs/lessons/code-patterns/2026-09-16-is-leader-false-is-not-proof-a-write-is-lost.md`
 (amended) for the full account.
+
+**Further amendment (2026-09-20, issue #996 layer 1): a batched sibling of
+the single-item evaluate-at-apply path, `KvCommand::KindEvalBatch`, for a
+`BatchWriteItem` call against an indexed/streamed table's images-carrying
+arm.** `KvCommand::KindEval` (ADR 0054 step 2/3) proved apply-time
+evaluation for one item per Raft entry; a `BatchWriteItem` call currently
+proposes one such entry PER ITEM, which is the identical per-item-entry
+throughput regression §1's own "Entry granularity is a contract" fixup
+found for the marker-table path (the `backfill_seeder` populate-then-
+backfill budget breach) — just not yet closed for the newer evaluate-at-
+apply path. `KindEvalBatch { entries: Vec<KindEvalEntry>, ts }` closes it:
+one Raft entry, one WAL record, one `merge_batch`/fsync, carrying `N`
+independent per-item writes that each still evaluate their own condition
+and operation against the tablet's own current committed state, in commit
+order, exactly like the singular variant — an item's own `ConditionFailed`/
+`Rejected` never aborts its siblings.
+
+**Two outcome grains, mirroring `KindEval`'s own read/write-vs-outcome
+split.** The replicated `KindBatchOutcome` records exactly ONE `Applied`/
+`Sealed{key}` for the WHOLE entry — `classify_kind_batch_outcome`/
+`kind_batch_confirm_superseded` (`animusd`) need nothing more, reused
+verbatim with no changes. The ordered per-item `Applied { old, new } |
+ConditionFailed | Rejected { code, message }` breakdown lives in a new,
+leader-local, never-replicated `KindEvalBatchResults` slot map — the
+identical "a follower never needs this, so don't grow its bounded
+retention map" reasoning `KindEvalResults` already established for the
+singular variant's own `old`/`new` images.
+
+**A whole-entry seal check, not a per-item one.** Every item in one
+`KindEvalBatch` entry shares this tablet's single declared range, so a
+`Freeze` either sealed every item's base key or none of them — there is no
+torn "half-sealed" state to represent, mirroring `KindBatch`'s own
+`carries_user_data`/`sealed_key` scan.
+
+**Same-key duplicates — genuinely new apply logic, and a real storage-layer
+gotcha found writing it.** A plain `BatchWriteItem` call has no
+duplicate-key validation today (confirmed: no such check exists in
+`animus-dynamo`'s `decode_batch_write`, unlike `TransactWriteItems`'s own
+`duplicate_item` check) — before this variant, that "worked" only because
+each item was its own Raft entry at its own, strictly-increasing `ts`, so a
+later duplicate naturally overwrote an earlier one at the storage layer
+with no special-casing. Once every item in a `BatchWriteItem` shares ONE
+entry's ONE `ts`, preserving that same last-write-wins behavior needs two
+distinct fixes, not one:
+1. **The read side**: an in-apply overlay (`BTreeMap<base_key,
+   Option<Item>>`), consulted before `storage.get`, so a later item
+   observes an earlier item's own write within the same entry.
+2. **The write side** — the one the overlay alone does NOT fix, found by
+   this layer's own test (c): `StorageEngine::merge`'s per-key
+   last-writer-wins takes effect only when its version is STRICTLY greater
+   than the key's current latest. Two items writing the SAME physical key
+   at the entry's one shared `ts` therefore carry the IDENTICAL version —
+   the engine silently keeps the FIRST push and drops the second, the
+   *opposite* of last-write-wins, unless the apply arm itself collapses
+   this entry's own accumulated writes to at most one op per physical key
+   (keeping the last) before they are queued for the engine. This is sound
+   specifically because `flush_pending` is called once, up front, before
+   this entry's own loop — `pending` is empty at that point and accumulates
+   only this entry's own writes until the arm's own dedup step, so
+   collapsing it cannot affect any other entry's writes.
+
+See `docs/lessons/code-patterns/2026-09-20-a-batched-entry-sharing-one-ts-can-silently-drop-a-same-key-duplicates-write.md`
+for the generalizable version of finding 2.
+
+**No production caller as of this PR** — `animusd`'s `BatchWriteItem`
+images-carrying arm adopts `KindEvalBatch` in the stacked follow-up (layer
+2), the same "type/apply-arm/codec surface lands ahead of its own cutover"
+staging discipline `KindEval` itself used (ADR 0054 step 2 before step 3).
+Codec: `KvCommand::KindEvalBatch` is tag `17`, version `31`
+(`crates/animus-cp-data/src/codec.rs`). Corpus coverage:
+`crates/animus-cp-data/tests/kind_eval.rs`'s `kind_eval_batch_*` scenarios
+(distinct-key application, per-item independence, the same-key duplicate,
+the frozen-tablet seal, and term identity), a leader-kill/crash-restart
+fault scenario in `crates/animus-cp-data/tests/kind_eval_batch_fault.rs`,
+and a multi-record `(hlc, ordinal)` exactly-once walk cell in
+`crates/animus-test/tests/stream_lineage_corpus.rs`.
