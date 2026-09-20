@@ -40,6 +40,27 @@ plus 7 data-only pods — sets `nodes: 10` and `controlNodes: 3`: ordinals
 `0..3` run combined, `3..10` run data-only (`animusd data`). `controlNodes`
 is **grow-only** since S-07d — see the dedicated section below.
 
+## Ephemeral storage (`storage.ephemeral`, issue #989)
+
+`storage.ephemeral: true` swaps every pod's data volume for an `emptyDir`
+instead of a `PersistentVolumeClaim` — data does not survive a pod
+restart. **Rejected together with more than one control voter** (a
+resolved `controlNodes > 1`, `AnimusClusterSpec::control_nodes_or_default`
+— `nodes: 3` with `controlNodes` omitted resolves to 3 and is rejected
+too): losing a voter's disk on an ordinary pod recreation (any
+config-affecting spec edit rolls every pod, not just a `controlNodes`
+change) gets that EXISTING voter permanently refused by issue #667's
+boot-time check, and enough refusals cost the control group its quorum
+for good. A single voter (`controlNodes: 1`, or `nodes: 1` with
+`controlNodes` omitted) has no quorum to lose beyond itself — a wipe just
+restarts it as a fresh, empty single-voter bootstrap — so that shape
+stays allowed, with only an informational `EphemeralVoterStorageHazard`
+status condition. The rejected combination fails at admission when the
+validating webhook below is installed, or is refused by the reconciler's
+own fallback (`EphemeralVoterStorageRejected` status condition, no child
+resource touched) otherwise. See ADR 0060's 2026-09-19 amendment for the
+full mechanism.
+
 ## TLS (ADR 0064 commit 3)
 
 `spec.tls` turns on TLS across the cluster's own ports (mutual on
