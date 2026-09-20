@@ -790,3 +790,260 @@ fn e_a_crashed_and_restarted_node_converges_over_seeds() {
         run_e_a_crashed_and_restarted_node_converges(0xA5F1_5000 + i);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Scenarios (f)/(g): issue #992 — `MIN_QUIESCE_AFTER` must cover
+// `auto_split_loop`'s own `AUTO_SPLIT_INTERVAL` sweep period, not just
+// `index_drain::INDEX_DRAIN_INTERVAL` (issue #302's own floor). (f) proves
+// the fixed floor (`animusd::MIN_QUIESCE_AFTER`, now the max of both
+// periods) still lets a bursty tablet split; (g) is the negative control
+// pinning WHY the floor exists — the identical burst pattern at a
+// below-`AUTO_SPLIT_INTERVAL` `quiesce_after` (300ms, between the old and
+// new floors) never splits, because the tablet re-quiesces before the one
+// tick that could ever have observed the crossing.
+//
+// Every write here goes through [`SimCluster::dynamo_fast`], not the
+// regular [`put_item`]/[`SimCluster::dynamo`] this module's other
+// scenarios use — an ordinary op call unconditionally burns a full
+// `OP_BUDGET` (12s) of virtual time regardless of how quickly it resolves
+// (`SimCluster::spawn_and_capture`'s own doc), which is far coarser than
+// the few-hundred-millisecond precision this scenario needs relative to
+// `AUTO_SPLIT_INTERVAL` (2s) tick boundaries. `dynamo_fast` instead stops
+// the instant the write resolves (a single [`SimCluster`]-internal 100ms
+// polling step for an ordinary single-item `PutItem` with no fault in the
+// way), which is what makes placing a write within ~150ms of a tick
+// boundary possible at all.
+// ---------------------------------------------------------------------------
+
+const BURST_BYTES_THRESHOLD: u64 = 2_000;
+
+fn burst_thresholds() -> AutoSplitThresholds {
+    AutoSplitThresholds {
+        bytes: Some(BURST_BYTES_THRESHOLD),
+        change_rate: None,
+        ops_rate: None,
+        tablet_capacity_ceilings: Default::default(),
+    }
+}
+
+/// [`put_item`]'s `dynamo_fast`-driven sibling — same request shape, but
+/// resolving in one near-instant polling step instead of always burning
+/// [`SimCluster`]'s `OP_BUDGET`. See this section's own header comment for
+/// why that distinction is load-bearing here.
+fn put_item_fast(cluster: &mut SimCluster, node: u64, table: &str, pk: &str, pad_len: usize) {
+    let pad = "x".repeat(pad_len);
+    let body = format!(
+        r#"{{"TableName":"{table}","Item":{{"pk":{{"S":"{pk}"}},"pad":{{"S":"{pad}"}}}}}}"#
+    );
+    let (status, resp) = cluster.dynamo_fast(node, "DynamoDB_20120810.PutItem", body.as_bytes());
+    assert_eq!(
+        status,
+        200,
+        "seed={}: PutItem({pk}) on node {node} failed: {resp}",
+        cluster.seed()
+    );
+}
+
+/// Whether every replica of `tablet` on `node` reports `quiesced: true` via
+/// `GET /admin/raftkv` — mirrors `sim_cluster_quiesced_rolling_restart.rs`'s
+/// own identically-named helper (duplicated, not shared, per this crate's
+/// own per-file-fixture convention). **Never called near this scenario's
+/// own delicate tick-boundary timing** — `SimCluster::admin` goes through
+/// the ordinary `OP_BUDGET`-costing `spawn_and_capture`, so this is only
+/// used once the burst placement above is already done and only a
+/// long-window, no-longer-timing-sensitive steady state is being checked.
+fn is_quiesced(cluster: &mut SimCluster, node: u64, tablet_id: u64) -> bool {
+    let (status, body) = cluster.admin(node, "GET", "/admin/raftkv", "", &[]);
+    assert_eq!(status, 200, "node {node} /admin/raftkv failed: {body}");
+    let parsed: serde_json::Value = serde_json::from_str(&body)
+        .unwrap_or_else(|e| panic!("bad /admin/raftkv JSON: {e}: {body}"));
+    let groups = parsed["groups"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no groups array in /admin/raftkv: {body}"));
+    let group = groups
+        .iter()
+        .find(|g| g["tablet"].as_u64() == Some(tablet_id))
+        .unwrap_or_else(|| panic!("node {node} does not host tablet {tablet_id}: {body}"));
+    group["quiesced"]
+        .as_bool()
+        .unwrap_or_else(|| panic!("group has no quiesced field: {body}"))
+}
+
+/// Drives the exact bursty pattern issue #992 depends on `--quiesce-after`
+/// clearing `AUTO_SPLIT_INTERVAL` to catch, against `table`'s sole tablet
+/// (already led by `leader`, already below `BURST_BYTES_THRESHOLD`) —
+/// **two** small writes, neither alone crossing the threshold, whose SUM
+/// does; timed so the only `AUTO_SPLIT_INTERVAL` tick that could ever
+/// observe the crossing is the one landing while the tablet may or may not
+/// have already re-quiesced, depending on `quiesce_after`.
+///
+/// Timing, in virtual time measured from `set_auto_split_thresholds`'s own
+/// call (`t0 = 0`; `T` = `AUTO_SPLIT_INTERVAL` = 2s; every `dynamo_fast`
+/// write itself advances virtual time by a fixed, deterministic 100ms —
+/// [`SimCluster::spawn_and_capture_fast`]'s own one-polling-step contract
+/// for an ordinary, fault-free single-item write):
+///
+/// - `t ≈ 0`: burst 1 (`pad_len = 1_000`) — well under
+///   `BURST_BYTES_THRESHOLD` alone. Tick 1 (at `t = T`) sees this — quiesced
+///   or not, it's still under threshold either way, so this tick's own
+///   outcome doesn't matter to the scenario.
+/// - `t ≈ T + 150ms`: burst 2 (`pad_len = 1_200`) — the crossing write.
+///   Still under threshold alone; the running total is what crosses. Placed
+///   *after* tick 1's own check (never seen by it) and comfortably before
+///   tick 2's.
+/// - `t ≈ 2T`: tick 2 fires — the ONE tick that could ever observe the
+///   crossing. The idle gap since burst 2's own propose (`T + 150ms` to
+///   `2T` is `T - 150ms`, strictly less than `T` itself) is what decides
+///   the outcome: a `quiesce_after >= T` tablet has NOT yet re-quiesced
+///   (150ms of margin below its own floor) and this tick performs a real
+///   bytes check, which lands the split; a `quiesce_after` well below `T`
+///   (this module's own negative control uses 300ms — over 1.5s of margin
+///   the other way) has already re-quiesced long before tick 2 ever looks,
+///   which skips it — permanently, since nothing writes again afterward.
+///
+/// Returns with virtual time parked at `2T + 150ms` — past tick 2's own
+/// nominal firing time, with a small settle margin, but still well short of
+/// `AUTO_SPLIT_COOLDOWN` (15s) or any further tick — so the caller's own
+/// assertions see exactly the state tick 2 alone produced.
+fn run_quiesce_floor_burst(cluster: &mut SimCluster, leader: u64, table: &str) {
+    let t = super::AUTO_SPLIT_INTERVAL;
+    let margin = Duration::from_millis(150);
+
+    // t ≈ 0: burst 1, well under threshold on its own. Consumes a fixed
+    // 100ms of virtual time (`dynamo_fast`'s own one-step contract).
+    put_item_fast(cluster, leader, table, "burst0", 1_000);
+
+    // Advance to T + margin, safely past tick 1's own check.
+    cluster.run_for(t + margin - Duration::from_millis(100));
+
+    // t ≈ T + margin: burst 2, the crossing write. Consumes another fixed
+    // 100ms.
+    put_item_fast(cluster, leader, table, "burst1", 1_200);
+
+    // Advance to 2T + margin, safely past tick 2's own check — the one
+    // tick that could ever observe the crossing.
+    cluster.run_for(t - Duration::from_millis(100));
+}
+
+fn run_f_quiesce_floor_still_lets_a_bursty_tablet_split(seed: u64) {
+    let mut cluster =
+        SimCluster::new_with_cp_quiescence(seed, 3, 3, Some(super::MIN_QUIESCE_AFTER));
+    let (status, body) = create_table(&mut cluster, 0, "bursty");
+    assert_eq!(status, 200, "seed={seed}: CreateTable failed: {body}");
+    let parent = tablet_of(&cluster, 0, "bursty");
+    let leader = cluster
+        .leader_index_of(parent)
+        .unwrap_or_else(|| panic!("seed={seed}: {parent:?} has no leader"));
+
+    cluster.set_auto_split_thresholds(burst_thresholds());
+    run_quiesce_floor_burst(&mut cluster, leader, "bursty");
+
+    // Tick 2 (the one tick that could ever have observed the crossing) has
+    // already fired by the time `run_quiesce_floor_burst` returns — at
+    // `quiesce_after == MIN_QUIESCE_AFTER` (>= `AUTO_SPLIT_INTERVAL`), the
+    // tablet was provably still awake for it, so the split has already been
+    // proposed. Converge the rest of the workflow the ordinary way.
+    let nodes: Vec<u64> = (0..cluster.node_count() as u64).collect();
+    poll_split_converged(&mut cluster, "bursty", &nodes, SETTLE_FLOOR);
+
+    let children: Vec<TabletId> = cluster
+        .metadata(0)
+        .tablets_for_table("bursty")
+        .map(|(&id, _)| id)
+        .collect();
+    assert_eq!(
+        children.len(),
+        2,
+        "seed={seed}: expected exactly one fork (two children) from the \
+         bursty crossing, got {children:?}"
+    );
+    assert!(
+        !children.contains(&parent),
+        "seed={seed}: the parent tablet {parent:?} must be retired, not among {children:?}"
+    );
+}
+
+#[test]
+fn f_quiesce_floor_still_lets_a_bursty_tablet_split() {
+    run_f_quiesce_floor_still_lets_a_bursty_tablet_split(env_seed(0xA5F1_0006));
+}
+
+#[test]
+fn f_quiesce_floor_still_lets_a_bursty_tablet_split_over_seeds() {
+    for i in 0..5 {
+        run_f_quiesce_floor_still_lets_a_bursty_tablet_split(0xA5F1_6000 + i);
+    }
+}
+
+/// The negative control: the identical burst pattern, at a `quiesce_after`
+/// BELOW `AUTO_SPLIT_INTERVAL` but above the pre-#992 `INDEX_DRAIN_INTERVAL`
+/// floor (200ms) — exactly the gap issue #992 closed. Pins WHY
+/// `MIN_QUIESCE_AFTER` has to cover `auto_split_loop`'s own sweep period:
+/// with this shorter value the tablet re-quiesces long before the one tick
+/// that could have observed the crossing ever fires, and — since nothing
+/// ever writes to it again — it stays quiesced and unsplit forever.
+fn run_g_a_sub_floor_quiesce_after_hides_the_crossing_forever(seed: u64) {
+    const BELOW_FLOOR_QUIESCE_AFTER: Duration = Duration::from_millis(300);
+
+    let mut cluster =
+        SimCluster::new_with_cp_quiescence(seed, 3, 3, Some(BELOW_FLOOR_QUIESCE_AFTER));
+    let (status, body) = create_table(&mut cluster, 0, "hidden");
+    assert_eq!(status, 200, "seed={seed}: CreateTable failed: {body}");
+    let parent = tablet_of(&cluster, 0, "hidden");
+    let leader = cluster
+        .leader_index_of(parent)
+        .unwrap_or_else(|| panic!("seed={seed}: {parent:?} has no leader"));
+
+    cluster.set_auto_split_thresholds(burst_thresholds());
+    run_quiesce_floor_burst(&mut cluster, leader, "hidden");
+
+    // (i) The tablet is observed quiesced — the crossing tick skipped it
+    // outright rather than genuinely checking and finding it under
+    // threshold. Checked at several points across a long window (each
+    // `is_quiesced` call is `OP_BUDGET`-costing, so this is well past the
+    // scenario's own delicate tick-boundary timing by now).
+    for _ in 0..3 {
+        assert!(
+            is_quiesced(&mut cluster, leader, parent.0),
+            "seed={seed}: the tablet must be observed quiesced — a \
+             quiesce_after below AUTO_SPLIT_INTERVAL must let it re-quiesce \
+             before the crossing tick ever looks"
+        );
+        cluster.run_for(AUTO_SPLIT_COOLDOWN_MARGIN);
+    }
+
+    // (ii) No split ever happens, over a window spanning several
+    // AUTO_SPLIT_COOLDOWNs — the crossing was real (bytes are past
+    // BURST_BYTES_THRESHOLD) but permanently unobserved, since nothing
+    // ever un-quiesces the tablet again.
+    let count = active_tablet_count(&cluster, 0, "hidden");
+    assert_eq!(
+        count, 1,
+        "seed={seed}: a bursty tablet whose crossing tick was skipped for \
+         being quiesced must never split (got {count} Active tablets)"
+    );
+    let meta = cluster.metadata(0);
+    assert!(
+        meta.tablets_for_table("hidden")
+            .all(|(_, t)| t.state == TabletState::Active),
+        "seed={seed}: no tablet should ever have entered Splitting"
+    );
+}
+
+/// Three `is_quiesced` checks spaced this far apart comfortably clear
+/// several `AUTO_SPLIT_COOLDOWN`s (15s) in total, satisfying this
+/// scenario's own "over a long window" requirement without needing a
+/// fourth, separate settle loop.
+const AUTO_SPLIT_COOLDOWN_MARGIN: Duration = Duration::from_secs(20);
+
+#[test]
+fn g_a_sub_floor_quiesce_after_hides_the_crossing_forever() {
+    run_g_a_sub_floor_quiesce_after_hides_the_crossing_forever(env_seed(0xA5F1_0007));
+}
+
+#[test]
+fn g_a_sub_floor_quiesce_after_hides_the_crossing_forever_over_seeds() {
+    for i in 0..5 {
+        run_g_a_sub_floor_quiesce_after_hides_the_crossing_forever(0xA5F1_7000 + i);
+    }
+}

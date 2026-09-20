@@ -380,7 +380,8 @@ this stack. Phase 1 was built to hand it a clean seam:
   own soak testing finds 5s too aggressive, the fix is lowering the
   constant or defaulting to `0` — **never below `animusd::
   MIN_QUIESCE_AFTER` (the `change_consumer_loop` sweep interval, 200ms),
-  which the CLI now rejects outright (2026-08-19 amendment, issue #302)**;
+  which the CLI now rejects outright (2026-08-19 amendment, issue #302)**
+  [superseded 2026-09-19: now 2s, see the issue #992 amendment];
   the mechanism itself is correct at any threshold at or above that floor.
 - Phase 2 (heartbeat amortization, roadmap item 2) remains unscheduled;
   the constraints above are what this phase leaves it to build against.
@@ -516,7 +517,11 @@ victims — now pass stably at the original `quiesce_after` = 300ms test
 knob (1.5× the sweep interval), which is sound rather than merely lucky
 under this fix: `MIN_QUIESCE_AFTER` = 200ms is the floor, so 300ms carries
 real (if modest) headroom, and the invariant no longer depends on timing
-luck to hold.
+luck to hold [superseded 2026-09-19: `MIN_QUIESCE_AFTER` is now 2s, see
+the issue #992 amendment — this specific 300ms test knob stays legal
+under the new floor too, since neither fixture configures a bytes/
+change-rate/ops-rate auto-split trigger, the coupling that amendment's
+own floor is conditional on].
 
 ## Amendment (2026-09-04, S-06): reaches `animusd data --config` too, and
 gains a config-file source
@@ -677,3 +682,134 @@ restart ever coming. This amendment only narrows what issue #920 itself
 turned out to be: not that hazard, but a `reconfigure_step` safety gap
 that any rolling restart with a fast failure detector and durable storage
 can trigger, with or without quiescence enabled.
+
+## Amendment (2026-09-19, issue #992 — the `--quiesce-after` floor now also covers `auto_split_loop`'s sweep period)
+
+### The gap
+
+`MIN_QUIESCE_AFTER` (`animusd`) was sized against exactly one loop's own
+period — `index_drain::INDEX_DRAIN_INTERVAL` (200ms), the floor the
+2026-08-19 amendment above introduced to close issue #302's stale-veto
+race. But a *second*, independently-added loop had, by then, already
+adopted the identical "skip a quiesced tablet outright" optimization this
+ADR's own "Sweeper skip (PR6)" section documents for three loops, not one:
+`auto_split_loop` (`animusd`, ADR 0034) skips a led tablet the instant
+`leader.is_quiesced()` is true, trusting "whatever this tablet's last
+pre-quiescence tick already checked still holds." That trust is sound only
+if the loop got at least ONE tick while the tablet was genuinely
+non-quiesced since its last growth — i.e. only if `quiesce_after` is at
+least as long as `AUTO_SPLIT_INTERVAL` (2s, the loop's own sweep period),
+so a sweep is guaranteed to land before the tablet can re-quiesce and go
+unobserved again. `MIN_QUIESCE_AFTER`'s own floor (200ms) never accounted
+for this second loop's period at all — a `--quiesce-after` of 1 second (a
+value between the two floors) passed validation cleanly, yet sat below
+`AUTO_SPLIT_INTERVAL`.
+
+The 2026-09-08 lesson entry (`docs/lessons/code-patterns/2026-09-08-
+speeding-up-a-confirm-loop-can-expose-a-latent-race-between.md`) had
+already found and characterized the exact mechanism — a bursty tablet
+whose writes land, cross a byte threshold, and finish fast enough that the
+tablet re-quiesces before the next `AUTO_SPLIT_INTERVAL` tick ever
+observes it hot — but fixed only the one test fixture that tripped over
+it (raising its own `quiesce_after` from 300ms to 3s), leaving the
+underlying floor unenforced for every other caller, including the CLI's
+only-configurable value (`--quiesce-after SECS`, whole seconds — the only
+value this gap could ever manifest at in production is exactly `1`).
+
+### The fix
+
+`MIN_QUIESCE_AFTER` is now the **max** of both loops' own periods —
+`max(index_drain::INDEX_DRAIN_INTERVAL, AUTO_SPLIT_INTERVAL)` = 2 seconds
+— computed with a small `const fn` comparing `Duration::as_nanos()` (the
+one `Duration` accessor that is itself `const fn`, since `Duration`'s
+`Ord`/`PartialOrd` impls are not). The name, and every downstream
+consumer (`main::validate_quiesce_after`, the two `debug_assert!`s in
+`animusd::lib`), are unchanged — only the value and its derivation are
+wider. `0` (disabling quiescence entirely) stays exempt, as before.
+
+**The in-process belt is now split into two asserts, not one, because the
+two floors it folds together have different applicability.** The
+`INDEX_DRAIN_INTERVAL` half is unconditional — it is the quiescence
+mechanism's own veto-freshness floor, which every quiescing group depends
+on regardless of what else is configured, so a value below it corrupts
+that argument no matter which auto-split triggers this node runs. The full
+`MIN_QUIESCE_AFTER` (which folds in `AUTO_SPLIT_INTERVAL`) is conditional
+on a bytes, change-rate, or ops-rate auto-split trigger actually being
+configured: `auto_split_loop`'s single `leader.is_quiesced() { continue;
+}` skip gates all three of those trigger arms identically (verified by
+reading the loop, not assumed from the bytes case alone — `ChangeRate
+Tracker`/`RequestRateTracker` both freeze at their last-observed value
+once a tablet goes quiesced, the former via `change_consumer_loop`'s own
+matching sweeper-skip, the latter because it is only ever fed by a write,
+which quiescence's own idle-clock precondition already rules out — so
+"whatever the last pre-quiescence tick already checked still holds"
+applies to all three, not just bytes), while the fourth arm (ADR 0067's
+throughput-derived minimum tablet count) deliberately does *not* skip a
+quiesced candidate at all (see this ADR's own "Sweeper skip" section) and
+so has no coupling to this floor. A quiesced group with none of the three
+opt-in triggers configured is not depended on by that skip at all — four
+existing fixtures (`index_drain.rs`'s `stream_sealer_tests` at 300ms,
+`tests/cp_quiescence.rs` at 300ms) legitimately run quiescence below
+`AUTO_SPLIT_INTERVAL` with no bytes/change-rate/ops-rate trigger
+configured, and stay sound under this fix precisely because issue #992's
+own constraint is a property of that specific coupling, not of quiescence
+in general. The CLI's own floor (`main::validate_quiesce_after`) stays
+unconditional regardless — an operator gets one simple rule, and the CLI
+value is whole seconds, so the only value this closes off is `1`.
+
+**Any future loop that adopts the same "skip a quiesced tablet outright"
+optimization must add its own period to this max, not merely audit
+against it** — `MIN_QUIESCE_AFTER`'s own doc states this directly, so the
+same investigation this issue needed does not have to happen a third time
+by accident.
+
+### Alternative considered and rejected: a per-tablet "grew since last sweep" flag
+
+A per-tablet flag set the instant a group un-quiesces (a write arrives)
+and cleared by `auto_split_loop`'s own sweep once it observes the tablet
+again — `auto_split_loop` would then only apply its quiesced-skip once
+that flag confirms a sweep has genuinely happened since the last growth,
+independent of `quiesce_after`'s own value relative to `AUTO_SPLIT_
+INTERVAL`. This would keep sub-2s quiescence legal even with a bytes/
+change-rate/ops-rate trigger configured. Rejected: it adds mutable
+cross-loop state to the write path (`resolve_cp_route` or wherever
+un-quiescing is observed would need to touch a structure `auto_split_
+loop` also reads) for a configuration with no production need — a
+quiesced group's entire saving is avoided timer/heartbeat/apply-poll
+activity, so re-quiescing within 2 seconds of a burst just thrashes a
+bursty tablet's own wake cost for no benefit; the production default is
+5 seconds (well above this floor already), and the CLI's own unit is
+whole seconds, so the only configuration value this fix actually removes
+from the legal range is `1`. A floor that is trivially easy to state,
+enforce, and reason about beats a second, only-sometimes-needed piece of
+cross-loop bookkeeping for closing off one integer value.
+
+### Regression coverage
+
+`main.rs`'s own `#[cfg(test)] mod tests` gained direct unit coverage of
+`validate_quiesce_after`: `Duration::from_secs(1)` is now rejected
+(previously accepted — the exact gap this issue closes), the floor value
+itself (`MIN_QUIESCE_AFTER`) is accepted, and `Duration::ZERO` stays
+accepted (the disable case, always exempt). `crates/animusd/src/
+sim_cluster_auto_split.rs` gained two deterministic `SimCluster` scenarios
+exercising the mechanism itself, not just the validator: scenario (f)
+(`f_quiesce_floor_still_lets_a_bursty_tablet_split`) drives a bursty
+two-write pattern — sized so neither write alone crosses the configured
+byte threshold, only their sum does, and timed so the only
+`AUTO_SPLIT_INTERVAL` tick that could ever observe the crossing lands
+right at the edge of the tablet's own re-quiescing window — at
+`quiesce_after == animusd::MIN_QUIESCE_AFTER` (using the constant itself,
+so a future regression of the constant's own value is what this test
+would then exercise) and asserts the split still converges; scenario (g)
+(`g_a_sub_floor_quiesce_after_hides_the_crossing_forever`) drives the
+identical burst pattern at `quiesce_after = 300ms` — a value between the
+pre-#992 floor (200ms) and `AUTO_SPLIT_INTERVAL` (2s) — and asserts the
+tablet is observed quiesced at the point the crossing tick would have
+fired and that no split ever happens over a window spanning several
+`AUTO_SPLIT_COOLDOWN`s, since nothing ever writes to the tablet again to
+un-quiesce it. Both scenarios use `SimCluster::dynamo_fast` (not the
+ordinary `SimCluster::dynamo`/`put`, which unconditionally advance virtual
+time by a full `OP_BUDGET` per call) specifically because this scenario's
+own timing precision — placing a write within roughly 150ms of an
+`AUTO_SPLIT_INTERVAL` tick boundary — is far finer than `OP_BUDGET` (12s)
+would ever allow.
