@@ -710,11 +710,20 @@ per-tablet CP data plane (`animus-cp-data`).
   because `reconcile_placement`/`rebalance_placement` have no
   `split_placing`-specific timing state of their own before this fix). An
   empty `recently_done` (every pure/unit-test caller) reproduces the
-  pre-fix behavior exactly — this is **not** a fix to issue #928's fully
-  general form (an ordinary tablet with no `split_placing` history still
-  has no repair dwell at all against a false positive); only the
-  directed-Placing-specific instance this crate can still name a tablet
-  set for. Tests: `meta::tests::
+  pre-fix behavior exactly — at the time this landed, this was **not** yet a
+  fix to issue #928's fully general form (an ordinary tablet with no
+  `split_placing` history had no repair dwell at all against a false
+  positive); only the directed-Placing-specific instance this crate could
+  name a tablet set for. **That general form is now closed too (2026-09-20,
+  same issue #928): `node::REPAIR_DWELL` + `node::recently_down_this_tick`**
+  — a new `recently_down: &BTreeSet<NodeId>` parameter on
+  `reconcile_placement`/`Metadata::reconcile`/`PlacementView::reconcile` (and
+  `rebalance_placement`/`Metadata::rebalance`/`PlacementView::rebalance`, for
+  parameter symmetry — see that entry's own doc for why rebalance needs no
+  actual protection) that dwell-protects ANY tablet's replica, not just a
+  split child's, the identical `env.now()`-keyed pattern one layer up from
+  `split_placing`. See the "Automatic placement + rebalancing" entry below
+  for the full mechanics. Tests: `meta::tests::
   reconcile_does_not_repair_away_an_achieved_recently_done_target` (pure,
   proves the bug existed with an empty `recently_done` and closes with a
   populated one), `tests/placement_split_placing.rs`'s test 10
@@ -1793,6 +1802,31 @@ per-tablet CP data plane (`animus-cp-data`).
   correctness rests on the epoch-CAS and the data-plane catch-up gate. Keep the
   *timing* in the driver and the *decision* pure. A split child inherits the
   source's policy (else it is invisible to both repair and rebalance).
+  **Issue #928 (2026-09-20): repair no longer reacts to a `Down` member
+  instantly.** `reconcile_placement` used to feed `active_candidates`
+  straight to `replan_repair` every tick, so a member merely marked `Down`
+  by one missed heartbeat round (a GC pause, a scheduler hiccup — never an
+  actual failure) had its healthy replica evicted and a full rebuild
+  triggered on the very next tick. `node::REPAIR_DWELL` (5s, tracked
+  per-member by a new driver-local `node::recently_down_this_tick`, the same
+  `env.now()`-keyed shape ADR 0062 §2's `retarget_ready_this_tick`/
+  `recently_done_this_tick` already use for the identical false-positive
+  class) now gates it: `reconcile_placement` augments its candidate pool,
+  PER TABLET, with a fresh `Candidate` for each of that tablet's own current
+  replicas still inside its dwell — LOAD-BEARING as a per-tablet
+  augmentation rather than a side-channel keep set, since `animus_placement::
+  choose` only ever keeps a survivor that is actually a candidate — so a
+  dwelling member is protected in place on the tablet(s) it already
+  replicates but is never offered as a fresh destination for any other. An
+  empty `recently_down` (every non-driver caller) reproduces the pre-fix
+  behavior exactly. `rebalance_placement` takes the same parameter for
+  symmetry but doesn't need it — `rebalance_step`'s own `set_satisfies`
+  check already excludes a tablet with a non-candidate (still-dwelling)
+  replica. This closes issue #928's fully general form (see the ADR 0062 §2
+  entry's own #670/#921/#928 paragraph above, which fixed only the
+  directed-Placing-specific instance) — see ADR 0005's 2026-09-20 amendment,
+  ADR 0012's own 2026-09-20 amendment (the suspect/dead split), and
+  `node::REPAIR_DWELL`'s doc for the dwell value and trade-off.
 
 - **Automatic failure detection (ADR 0012).** Members heartbeat the control
   group (`heartbeat_loop` → `RaftMsg::Heartbeat`, a term-less message the driver
@@ -1808,7 +1842,12 @@ per-tablet CP data plane (`animus-cp-data`).
   live members `Down` before heartbeats repopulate the detector (recoveries are
   never suppressed). These loops are driven in production (`animusd`, proven over
   `ProdEnv`/TCP in `animusd/tests/self_heal.rs`). Detector state is per-node
-  volatile; only transitions are replicated.
+  volatile; only transitions are replicated. **`Down` itself commits exactly
+  as fast as before (issue #928, 2026-09-20)** — only placement *repair*'s
+  reaction to it is now gated by `node::REPAIR_DWELL`, a separate, slower
+  "dead enough to repair" threshold on top of this fast "suspect" signal;
+  see the "Automatic placement + rebalancing" entry above and ADR 0012's own
+  2026-09-20 amendment.
 
 - **Orphan-member auto-reclaim sweep (ADR 0040 PR6), same home and pattern
   as the detector above.** `orphan_sweep_loop` is the leader's own volatile
