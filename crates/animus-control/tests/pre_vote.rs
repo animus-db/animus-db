@@ -148,6 +148,179 @@ fn timeout_makes_pre_candidate_without_bumping_term() {
     }
 }
 
+/// Issue #930: a voter that just granted a REAL vote has, until this fix, had
+/// no live-leader lease of its own — `leader_id` is only ever set by
+/// `handle_append_entries`/`InstallSnapshot`/`become_leader`, never by a
+/// granted `RequestVote` — so it granted any competing pre-vote in the window
+/// before the real winner's first `AppendEntries` arrived. The fix widens the
+/// lease to also cover `voted_for.is_some()` within the same
+/// `election_deadline` the grant itself reset. See `docs/lessons/code-
+/// patterns/2026-09-16-a-voter-that-just-granted-a-real-vote-has-no-pre-vote.md`.
+#[test]
+fn prevote_rejected_after_granting_a_real_vote_until_deadline() {
+    let mut core: RaftCore = RaftCore::new(nid(0), &member_ids(), Nanos(0), 7);
+    assert_eq!(core.term(), 0);
+
+    // Node 1 solicits (and wins) a real vote for term 1 — this both bumps our
+    // term and resets our own election timer.
+    let grant_at = Nanos(1_000_000);
+    let outs = core.handle(
+        nid(1),
+        RaftMsg::RequestVote {
+            term: 1,
+            candidate: nid(1),
+            last_log_index: 0,
+            last_log_term: 0,
+        },
+        grant_at,
+        7,
+    );
+    assert!(
+        matches!(
+            outs.as_slice(),
+            [(to, RaftMsg::RequestVoteResp { term: 1, granted: true })] if *to == nid(1)
+        ),
+        "expected the real vote to be granted: {outs:?}"
+    );
+    assert_eq!(core.term(), 1);
+
+    // Node 2 immediately solicits a competing pre-vote for the next
+    // prospective term, with an up-to-date (empty) log. Before the fix this
+    // was granted, since `leader_id` is still `None` at this point.
+    let outs = core.handle(
+        nid(2),
+        RaftMsg::PreVote {
+            term: 2,
+            candidate: nid(2),
+            last_log_index: 0,
+            last_log_term: 0,
+        },
+        Nanos(grant_at.0 + 1),
+        7,
+    );
+    assert!(
+        matches!(
+            outs.as_slice(),
+            [(to, RaftMsg::PreVoteResp { granted: false, .. })] if *to == nid(2)
+        ),
+        "a voter that just granted a real vote must reject a competing \
+         pre-vote until its election deadline (issue #930): {outs:?}"
+    );
+    // The rejection itself must not have touched our term.
+    assert_eq!(core.term(), 1);
+
+    // Once the granted vote's own election deadline has elapsed, the same
+    // pre-vote is now granted — the lease, not the vote itself, is what
+    // expires.
+    let later = Nanos(grant_at.0 + 400_000_000);
+    let outs = core.handle(
+        nid(2),
+        RaftMsg::PreVote {
+            term: 2,
+            candidate: nid(2),
+            last_log_index: 0,
+            last_log_term: 0,
+        },
+        later,
+        7,
+    );
+    assert!(
+        matches!(
+            outs.as_slice(),
+            [(
+                to,
+                RaftMsg::PreVoteResp {
+                    granted: true,
+                    term: 2
+                }
+            )] if *to == nid(2)
+        ),
+        "the lease on a granted real vote must expire like any other: {outs:?}"
+    );
+}
+
+/// Issue #930, consequence 1: a `Candidate` durably self-votes
+/// (`voted_for = Some(self)`, in `start_election`) the instant it campaigns,
+/// so — now that `handle_pre_vote`'s lease also covers `voted_for` — it
+/// rejects a competing pre-vote for the rest of its own election deadline
+/// instead of granting it (as it did before this fix, since `leader_id` is
+/// `None` for the whole candidacy). This is standard pre-vote behaviour: it
+/// reduces dueling candidacies rather than causing any.
+#[test]
+fn prevote_rejected_by_a_candidate_within_its_own_election_deadline() {
+    let mut core: RaftCore = RaftCore::new(nid(0), &member_ids(), Nanos(0), 7);
+
+    // Time out into a pre-vote round.
+    core.tick(Nanos(1_000_000_000), 7);
+    assert_eq!(core.role(), Role::PreCandidate);
+    let prospective = core.term() + 1;
+
+    // A peer's grant reaches pre-vote majority (self + one of two peers, in a
+    // 3-node cluster): the real, term-incrementing election starts.
+    let elect_at = Nanos(1_000_000_100);
+    core.handle(
+        nid(1),
+        RaftMsg::PreVoteResp {
+            term: prospective,
+            granted: true,
+        },
+        elect_at,
+        7,
+    );
+    assert_eq!(
+        core.role(),
+        Role::Candidate,
+        "expected the pre-vote majority to start a real election"
+    );
+    assert_eq!(core.term(), prospective);
+
+    // A third node's competing pre-vote for a higher prospective term must be
+    // rejected: this candidate's own self-vote is a real, term-scoped vote,
+    // and `start_election` reset its own election deadline when it cast it.
+    let outs = core.handle(
+        nid(2),
+        RaftMsg::PreVote {
+            term: prospective + 1,
+            candidate: nid(2),
+            last_log_index: 0,
+            last_log_term: 0,
+        },
+        Nanos(elect_at.0 + 1),
+        7,
+    );
+    assert!(
+        matches!(
+            outs.as_slice(),
+            [(to, RaftMsg::PreVoteResp { granted: false, .. })] if *to == nid(2)
+        ),
+        "a candidate should reject a competing pre-vote within its own \
+         election deadline: {outs:?}"
+    );
+
+    // Past the candidate's own election deadline, the same pre-vote is
+    // granted — the lease is purely a function of `election_deadline`, same
+    // as any other voter's.
+    let later = Nanos(elect_at.0 + 400_000_000);
+    let outs = core.handle(
+        nid(2),
+        RaftMsg::PreVote {
+            term: prospective + 1,
+            candidate: nid(2),
+            last_log_index: 0,
+            last_log_term: 0,
+        },
+        later,
+        7,
+    );
+    assert!(
+        matches!(
+            outs.as_slice(),
+            [(to, RaftMsg::PreVoteResp { granted: true, term })] if *to == nid(2) && *term == prospective + 1
+        ),
+        "the lease must expire even for a candidate: {outs:?}"
+    );
+}
+
 // ---- end to end under SimEnv ----------------------------------------------
 
 fn cluster(seed: u64) -> (Simulator, Vec<RaftNode<SimEnv>>) {
