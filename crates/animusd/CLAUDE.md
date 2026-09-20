@@ -7190,7 +7190,9 @@ see `docs/roadmap.md`'s C-12 entry), reconciler-driven split/rebalance/GC
 (7/13), TTL
 (1/9, **owned and closed** by C-09/ADR 0061 rung I as of 2026-09-09 — see
 `docs/roadmap.md`'s C-09 entry), node
-assembly/raw `ClientRequest` (2/8), throttle metric counters
+assembly/raw `ClientRequest` (2/8, **owned and closed** by C-15/ADR 0061
+rung O as of 2026-09-20 — see `docs/roadmap.md`'s C-15 entry and this
+file's own consolidated closed-C-15 appendix below), throttle metric counters
 (1/6, **owned and closed** by C-11/ADR 0061 rung K as of 2026-09-09 — one
 file, `tests/dynamo_throttling.rs`, down to its one permanent `ProdEnv`
 residual, `cluster_wide_throttle_default_is_overridden_by_a_tables_own_
@@ -7208,7 +7210,13 @@ on inspection — no `--config` parsing in it either — and was converted
 by PR 4e (`admin_config_reports_the_internal_addr_the_cli_resolves_
 control_add_through` → `run_admin_config_reports_the_internal_addr_the_
 cli_resolves_control_add_through` in `sim_cluster_control_membership_
-admin.rs`) —
+admin.rs`); C-15's own close-out (2026-09-20) found the D3 inventory's
+true, never-named second file of this original `--config` bring-up `2/2`
+line was actually `per_process.rs` (`per_process_nodes_form_a_cluster_
+from_shared_config`, the same `run_node`→`Node::bind` identity family as
+`config_node_identity.rs`, not `control_membership_admin.rs`'s residue,
+which C-12 PR 4e had already converted) — permanent, see the closed-C-15
+appendix below —
 reconciler-driven split/rebalance/GC, auto-split, join/growth, and the
 backup janitor are D4's own scope (D4 PR 1 already supplied the real
 reconciler these need next); Streams, admin/console/dashboard HTTP, TTL,
@@ -7229,11 +7237,11 @@ converted from `console_table_config.rs`, file trimmed to its 1 out-of-scope
 PITR test; docs close-out — see `docs/roadmap.md`'s C-10 entry and this
 file's own "index DDL beyond plain `CreateTable` under SimCluster" appendix
 below for the grep-verified ground truth and the full per-PR record);
-node assembly/raw `ClientRequest` remains unowned by any planned rung,
-flagged for an assess-and-close decision rather than a rung — the same
-disposition C-12's own close-out confirmed still applies to it, having
-found only `config_node_identity.rs` (not this separately-tracked
-2-file/8-test group) actually needed re-labeling; (E) frozen behind an
+node assembly/raw `ClientRequest` is **owned and closed** by C-15/ADR
+0061 rung O as of 2026-09-20 (its true count had drifted to 2 files/6
+tests by the time it was assessed, not the inherited 2/8 — see the
+closed-C-15 appendix below and ADR 0061's "Rung O" amendment for how the
+count drifted); (E) frozen behind an
 open flake
 issue, 7 files/32 tests (#298, #418, #592, #601, #610, #619/#622, #627) —
 out of scope for C-04, tracked by their own issues.
@@ -7827,9 +7835,12 @@ removed (replaced by scenarios (a) and (c) respectively).
 byte-weighted-median quantitative-balance claim (correlating written keys
 against their real post-split token ranges) isn't reproduced by the new
 sim scenarios, which don't correlate a DynamoDB item's `pk` to its hashed
-token range. `cp_tablet_splits_and_both_halves_serve` stays (a different
-subject: the MANUAL raw-`ClientRequest::SplitTablet` path, not the byte
-trigger). `f11_split_alignment.rs` and `inplace_split_e2e.rs`'s Streams
+token range. `cp_tablet_splits_and_both_halves_serve` stays at this PR's
+own close (a different subject: the MANUAL raw-`ClientRequest::
+SplitTablet` path, not the byte trigger) — **later converted by C-15/ADR
+0061 rung O (2026-09-20)** to `sim_cluster_cp_plane.rs::cp_tablet_splits_
+and_both_halves_serve`, see the closed-C-15 appendix below.
+`f11_split_alignment.rs` and `inplace_split_e2e.rs`'s Streams
 test stay (Streams remains documented `ProdEnv`-only for this fixture);
 `inplace_split_e2e.rs`'s paced-continuous-writer test stays (real-thread
 timing + admin HTTP). `auto_split_min_tablets.rs`/`auto_split_ops_rate.rs`
@@ -11120,3 +11131,67 @@ touch it or change its status.
 
 See ADR 0061's "Rung N (post-C-13)" opener amendment through "Rung N
 closed" and `docs/roadmap.md`'s C-14 entry for the full per-PR record.
+
+## Appendix — node assembly/raw `ClientRequest` assess-and-close, C-15 closed (ADR 0061 rung O, 2026-09-20, #997)
+
+Assesses and closes the one class-D group C-14's own close-out confirmed
+was still unowned — `crates/animusd/tests/cp_plane.rs` +
+`crates/animusd/tests/cluster.rs`, never named by file anywhere in this
+guide, `docs/roadmap.md`, or ADR 0061 before this appendix. See ADR
+0061's "Rung O" amendment for the full ground-truth account, including
+how the group's own headline count drifted from "2 files / 8 tests" to
+the true "2 files / 6 tests" the day D4 PR 2 moved two tests out of
+`cp_plane.rs` without restating the count.
+
+**Disposition table:**
+
+| Test | File | Verdict |
+|---|---|---|
+| `reads_and_writes_route_through_the_raft_group` | `cp_plane.rs` | **Deleted** — `cluster.rs::cluster_serves_put_get_and_status_over_tcp` drives the identical `bind_cluster`/`start_cluster` entry point and proves a strictly stronger property set (a cross-node overwrite pinning quorum-derived versioning, plus a `Status`/`control_voters` check); the deleted test's only unique property, a second table-name string, proved nothing independent once ADR 0019's 2026-08-23 amendment deleted the plane `ClientRequest::Put.table` used to select |
+| `cp_member_addresses_register_and_replicate` | `cp_plane.rs` | **Converted** → `sim_cluster_cp_plane.rs::cp_member_addresses_register_and_replicate` (+ `_over_seeds`) — `SimCluster::metadata(node).node_addrs` cross-node presence/identity, not literal `SocketAddr` parseability (no sim equivalent: `seed_members` registers bare `NodeId` strings as routing keys) |
+| `cp_tablet_splits_and_both_halves_serve` | `cp_plane.rs` | **Converted** → `sim_cluster_cp_plane.rs::cp_tablet_splits_and_both_halves_serve` (+ `_over_seeds`) — raw-KV `put_raw`/`raw_get` (literal byte keys, matching `trigger_split`'s own raw-byte `split_key` comparison) plus a manual split through `POST /admin/tablet/split`, the same dispatch `ClientRequest::SplitTablet` itself funnels into |
+| `single_write_latency_is_low` | `cp_plane.rs` | **Permanent, class A** — a wall-clock median over 50 real TCP round trips; `SimCluster`'s single-threaded virtual-time executor has no real scheduling/IO overhead for a sim median to regress against |
+| `tablet_auto_splits_on_bytes_with_skewed_value_sizes` | `cp_plane.rs` | **Permanent (kept)** as the real `auto_split_loop` proof over `ProdEnv`, but no longer sim-*unreachable*: the raw-KV path (`put_raw` + `set_auto_split_thresholds`) sidesteps the DynamoDB-wire token-correlation problem D4 PR 2 recorded, so `sim_cluster_cp_plane.rs::tablet_auto_splits_on_bytes_with_skewed_value_sizes` (+ `_over_seeds`) now proves the byte-weighted-median balance (smaller child ≥15% of the bytes, every key in exactly one routable child) deterministically — see ADR 0061's Rung O amendment |
+| `cluster_serves_put_get_and_status_over_tcp` | `cluster.rs` | **Permanent** — the sole surviving real-socket proof of `bind_cluster`/`start_cluster`/`Node::bind` assembly plus a raw `ClientRequest` frame over TCP |
+| `per_process_nodes_form_a_cluster_from_shared_config` | `per_process.rs` | **Permanent**, and newly named as the D3 inventory's own never-named second file of the separate "`--config` bring-up 2/2" class-D line — same `run_node`→`Node::bind(addrs.id, ..)` identity family `config_node_identity.rs` pins (`lib.rs:14981`); `grep -n 'run_node\|bind_cluster\|Node::bind\|start_cluster' crates/animusd/src/sim_cluster*.rs` returns zero call sites, so `SimCluster` is structurally incapable of reaching either file's own subject |
+
+**`sim_cluster_cp_plane.rs` scenarios**: `cp_member_addresses_register_
+and_replicate`, `cp_tablet_splits_and_both_halves_serve`, and `tablet_
+auto_splits_on_bytes_with_skewed_value_sizes` (each + `_over_seeds` at 5
+seeds) — six tests total, new module, declared
+alongside the other small `sim_cluster_*` modules in `lib.rs`'s `#[cfg(
+test)] mod` block.
+
+**Result**: 2 files / 6 tests (the true pre-PR count, corrected from the
+long-stale "2 files / 8 tests") → 2 files / 3 permanent real-socket
+tests (`cp_plane.rs` down to 2, `cluster.rs` unchanged at 1), 2 converted,
+1 deleted. Group closed — no further conversion candidate remains in it.
+
+**`--config` bring-up, resolved.** With `per_process.rs` named above, the
+D3 inventory's own "`--config` bring-up 2/2" class-D line is now fully
+accounted for: `config_node_identity.rs` (re-labeled by C-12/rung L,
+2026-09-09, into its true `Node::bind`-identity reason) and
+`per_process.rs` (named by this rung) are both permanent, same family,
+neither convertible.
+
+**What remains unowned after C-15**: nothing. Every class-D group named
+by the D3-closing residual inventory is now either owned-and-closed
+(admin/console/dashboard HTTP, PartiQL, Transact, Streams, TTL,
+control/data role split, index DDL beyond plain `CreateTable`, throttle
+metric counters, seed/join discovery, combined control-plane voter
+growth, and — this rung — node assembly/raw `ClientRequest`) or already
+implemented as D4's own scope (reconciler-driven split/rebalance/GC,
+auto-split loops, join/growth/decommission, backup/PITR/export/import —
+D4 PRs 1-5, closed 2026-09-07). No further "next rung" pointer is owed
+by this close-out.
+
+**Zero production change**: this rung's own docs PR touches no Rust
+source; the sibling code PR (`crates/animusd/tests/cp_plane.rs`,
+`crates/animusd/src/sim_cluster_cp_plane.rs`, `crates/animusd/src/
+lib.rs`) carries the conversions themselves, additive only (one new
+`#[cfg(test)] mod sim_cluster_cp_plane;` declaration plus the trimmed
+`cp_plane.rs`) — its own PR has the gate counts.
+
+See ADR 0061's "Rung O (post-C-14)" amendment for the full grep-verified
+ground truth (including the D4-PR-2 count-drift account) and
+`docs/roadmap.md`'s C-15 entry.

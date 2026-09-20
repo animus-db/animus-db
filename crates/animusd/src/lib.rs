@@ -20171,6 +20171,22 @@ mod sim_cluster_control_membership_split;
 #[cfg(test)]
 mod sim_cluster_control_growth;
 
+/// ADR 0061 rung O, issue #997 — closes the "node assembly / raw
+/// `ClientRequest`" real-socket test group C-08's own close-out flagged
+/// for an assess-and-close decision rather than a dedicated rung: two of
+/// `tests/cp_plane.rs`'s five tests convert here
+/// (`cp_member_addresses_register_and_replicate`,
+/// `cp_tablet_splits_and_both_halves_serve`); a third
+/// (`reads_and_writes_route_through_the_raft_group`) is deleted outright
+/// as redundant with `tests/cluster.rs::
+/// cluster_serves_put_get_and_status_over_tcp`; the remaining two
+/// (`single_write_latency_is_low`, `tablet_auto_splits_on_bytes_with_
+/// skewed_value_sizes`) stay `ProdEnv` permanently. See `sim_cluster_
+/// cp_plane.rs`'s own module doc for the full per-test account and
+/// `crates/animusd/CLAUDE.md`'s matching entry.
+#[cfg(test)]
+mod sim_cluster_cp_plane;
+
 /// Regression for the issue #298 residual confirmed live under the
 /// un-pinned `SplitMode::InPlace` proof soak (ADR 0018's matching amendment,
 /// `docs/engineering-lessons.md`'s matching entry): a stage blocked by
