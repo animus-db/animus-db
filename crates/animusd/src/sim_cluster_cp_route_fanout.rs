@@ -103,3 +103,158 @@ fn victim_recovers_a_route_via_cross_replica_fanout_despite_a_permanently_stale_
          under CLIENT_TIMEOUT (10s)"
     );
 }
+
+/// Issue #961 regression: a single logical write/read attempt must be
+/// bounded by `CLIENT_TIMEOUT` end to end, even when `cp_route`'s own
+/// cross-replica fan-out burns most of that budget before the forward chase
+/// that follows it stalls too.
+///
+/// **The scenario, precisely** (see [`SimCluster::deadline_regression_write`]/
+/// [`SimCluster::deadline_regression_read`]'s own doc for the driving
+/// mechanism): `victim` (a non-leader replica) is partitioned from BOTH the
+/// tablet's real leader and the third replica (`informant`) — its own local
+/// leader belief clears (the same 600ms settle this file's sibling test
+/// above uses) and every cross-replica fan-out round finds nothing, since
+/// `informant` is unreachable too. Partway through the call (`HEAL_AT`,
+/// comfortably past several fan-out rounds — most of `CLIENT_TIMEOUT`),
+/// `victim`↔`informant` heals — the NEXT fan-out round succeeds, resolving a
+/// real, live-vouched-for **hinted** forward to the leader's address. But
+/// `victim`↔`leader` is never healed: the forward chase that follows spends
+/// the REST of the call's budget stalled on that one hinted hop, exactly the
+/// "the following hop stalls on a slow-to-answer replica" shape issue #961
+/// names — under `SimEnv` a partitioned peer and a merely slow one are
+/// indistinguishable to the relay layer (`RELAY_HOP_TIMEOUT`'s own doc), so
+/// this is the deterministic stand-in for a genuinely slow (not dead) stub
+/// replica.
+///
+/// **Before the fix**, `cp_route` and `forward_to_tablet_leader` each minted
+/// their own fresh `now + CLIENT_TIMEOUT` — so this one attempt cost roughly
+/// (time for `cp_route` to resolve via the fan-out) **plus** a full second
+/// `CLIENT_TIMEOUT` for the stalled forward chase, on the order of 1.5–2x
+/// the nominal budget. **After the fix**, `cp_route`/`cp_forward`/
+/// `forward_to_tablet_leader` all spend from the ONE deadline the caller
+/// (`cp_kind_write_raw`/`cp_read`) minted once at the top of its own loop,
+/// so the whole attempt is bounded by `CLIENT_TIMEOUT` plus only a small
+/// amount of scheduling slack (this fixture's own `STEP` granularity plus
+/// `SCHEMA_POLL_INTERVAL`) — never a second hop cap's worth, and never a
+/// second full timeout.
+mod deadline_budget_tests {
+    use std::time::Duration;
+
+    use animus_dynamo::AttributeValue;
+
+    use crate::sim_cluster::SimCluster;
+
+    fn env_seed(default: u64) -> u64 {
+        std::env::var("ANIMUS_SEED")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(default)
+    }
+
+    /// Every faked-network parameter shared by both scenarios below —
+    /// pulled up here once so the write/read variants can't drift apart.
+    const HEAL_AT: Duration = Duration::from_secs(5);
+    const STEP: Duration = Duration::from_millis(20);
+    const MAX_TOTAL: Duration = Duration::from_secs(25);
+    /// `CLIENT_TIMEOUT` itself (`crate::CLIENT_TIMEOUT` is private to
+    /// `lib.rs`; this crate's own doc convention states it as 10s in every
+    /// constant's doc comment — restated here as a plain literal so this
+    /// test has no dependency on that visibility).
+    const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
+    /// The bound this test actually asserts: `CLIENT_TIMEOUT` plus a few
+    /// hundred ms of scheduling slack (this fixture's own `STEP`
+    /// granularity, `SCHEMA_POLL_INTERVAL`, and the terminal hop's own
+    /// timeout rounding) — explicitly NOT `CLIENT_TIMEOUT` plus a whole
+    /// extra hop cap, which is the exact bound issue #961 makes unacceptable.
+    const ACCEPTABLE_BOUND: Duration = Duration::from_millis(10_300);
+
+    fn setup(seed: u64) -> (SimCluster, animus_tablet::TabletId, u64, u64, u64) {
+        let mut cluster = SimCluster::new(seed, 3, 3);
+        let tablet = cluster.create_table("t");
+        let leader = cluster.leader_index_of(tablet).unwrap_or_else(|| {
+            panic!("seed={seed}: table `t`'s tablet has no leader after create")
+        });
+        let others: Vec<u64> = (0..3u64).filter(|&n| n != leader).collect();
+        let victim = others[0];
+        let informant = others[1];
+        // Fully isolate `victim` from both other replicas — its own local
+        // view clears, and every fan-out round finds nothing until
+        // `victim`<->`informant` heals partway through the timed call
+        // itself (never `victim`<->`leader`, which stays partitioned for
+        // the whole test — that is the stalled hop the forward chase hits).
+        cluster.partition(victim, leader);
+        cluster.partition(victim, informant);
+        cluster.run_for(Duration::from_millis(600));
+        (cluster, tablet, leader, victim, informant)
+    }
+
+    #[test]
+    fn a_stalled_route_then_a_stalled_hop_still_bounds_a_kind_write_raw_attempt_by_client_timeout()
+    {
+        let seed = env_seed(0x961_0001);
+        let (mut cluster, _tablet, leader, victim, informant) = setup(seed);
+
+        let key = crate::dynamo::item_key(
+            &AttributeValue::S("pk1".into()),
+            Some(&AttributeValue::S("sk1".into())),
+        );
+        let (elapsed, result) = cluster.deadline_regression_write(
+            victim,
+            "t",
+            key,
+            b"v1".to_vec(),
+            (victim, informant),
+            HEAL_AT,
+            STEP,
+            MAX_TOTAL,
+        );
+
+        // The attempt is expected to fail (the leader is never reachable
+        // from `victim` at all) — what this test proves is HOW LONG that
+        // failure is allowed to take, not that it succeeds.
+        assert!(
+            result.is_err(),
+            "seed={seed}: expected the write to fail (leader={leader} stays partitioned from \
+             victim={victim} for the whole test), got {result:?} after {elapsed:?}"
+        );
+        assert!(
+            elapsed <= ACCEPTABLE_BOUND,
+            "seed={seed}: cp_kind_write_raw took {elapsed:?} — expected at most \
+             {ACCEPTABLE_BOUND:?} ({CLIENT_TIMEOUT:?} CLIENT_TIMEOUT plus scheduling slack, \
+             never a second independent timeout on top of it, issue #961)"
+        );
+    }
+
+    #[test]
+    fn a_stalled_route_then_a_stalled_hop_still_bounds_a_cp_read_attempt_by_client_timeout() {
+        let seed = env_seed(0x961_0002);
+        let (mut cluster, _tablet, leader, victim, informant) = setup(seed);
+
+        let key = crate::dynamo::item_key(
+            &AttributeValue::S("pk1".into()),
+            Some(&AttributeValue::S("sk1".into())),
+        );
+        let (elapsed, result) = cluster.deadline_regression_read(
+            victim,
+            "t",
+            key,
+            (victim, informant),
+            HEAL_AT,
+            STEP,
+            MAX_TOTAL,
+        );
+
+        assert!(
+            result.is_err(),
+            "seed={seed}: expected the read to fail (leader={leader} stays partitioned from \
+             victim={victim} for the whole test), got {result:?} after {elapsed:?}"
+        );
+        assert!(
+            elapsed <= ACCEPTABLE_BOUND,
+            "seed={seed}: cp_read took {elapsed:?} — expected at most {ACCEPTABLE_BOUND:?} \
+             ({CLIENT_TIMEOUT:?} CLIENT_TIMEOUT plus scheduling slack, never a second \
+             independent timeout on top of it, issue #961)"
+        );
+    }
+}

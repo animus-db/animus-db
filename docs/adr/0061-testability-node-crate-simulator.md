@@ -12458,6 +12458,40 @@ close-out finding two deferred halves resolved as real/verdict rather
 than forced) would restate PR 4's own finding rather than add a
 genuinely new fact.
 
+## Amendment (2026-09-19, issue #961) — a new `SimCluster` fixture primitive for mid-call network mutation, backing a deadline-threading regression this rung's own `sim_cluster_cp_route_fanout.rs` file now hosts
+
+Issue #961 (fixed in `crates/animusd/src/forwarding.rs` — `cp_route`/
+`cp_forward`/`forward_to_tablet_leader` now share ONE caller-minted
+`deadline: Nanos` instead of each minting its own `CLIENT_TIMEOUT`; the
+full account is in **ADR 0017's own matching 2026-09-19 amendment**,
+since that ADR — not this one — owns the routing/forwarding design this
+fix touches) needed a regression that reproduces BOTH stalls the bug
+composed (a `cp_route` fan-out that burns most of the budget, then a
+resolved forward hint that itself stalls) in one deterministic `SimEnv`
+run. No existing spawn/capture helper in `sim_cluster.rs` interleaves a
+network mutation partway through a single logical call — `SimCluster::
+put`/`get`/`spawn_and_capture` all drive one uninterrupted `OP_BUDGET`
+burst with no interleaving point at all.
+
+**`SimCluster::spawn_stepped_with_heal`** (private) plus its two thin
+callers, `SimCluster::deadline_regression_write`/`deadline_regression_
+read` (both `pub(crate)`), close that gap: spawn a future already bound
+to a node's own env, then step the simulator forward in small increments,
+healing one named link the first time elapsed virtual time crosses a
+caller-given threshold — letting a test hold a fault open for the FIRST
+half of a call and heal it for the second, which every existing `partition
+`/`run_for`-before-the-call idiom in this file cannot express. Building
+block for `sim_cluster_cp_route_fanout.rs`'s new `deadline_budget_tests`
+module (2 tests, sibling to this ADR's own 2026-09-16/issue #950
+regression in the same file) — see `crates/animusd/CLAUDE.md`'s
+forwarding section and ADR 0017's 2026-09-19 amendment for the full
+scenario and the confirmed red-before (~16.3s)/green-after (bounded by
+`CLIENT_TIMEOUT` plus scheduling slack) numbers.
+
+This is additive fixture surface only — no existing `SimCluster`
+consumer's behavior changed, and no other rung's own residual/consumer
+inventory in this file is affected.
+
 ## 2026-09-20 amendment — Rung O (post-C-14): node assembly/raw `ClientRequest` assess-and-close (C-15, closed)
 
 **Why this group, now.** Rung N's own close-out re-derived, rather than

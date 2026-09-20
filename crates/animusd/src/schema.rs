@@ -1023,7 +1023,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 Some(CpRoute::Forward(addr, hinted)) => {
                     let request = ClientRequest::ForceSeal { tablet: tablet.0 };
                     match self
-                        .forward_to_tablet_leader(Some(tablet), addr, hinted, request)
+                        .forward_to_tablet_leader(Some(tablet), addr, hinted, request, deadline)
                         .await
                     {
                         ClientResponse::PutOk => return Ok(()),
@@ -1080,7 +1080,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 Some(CpRoute::Forward(addr, hinted)) => {
                     let request = ClientRequest::ForcePitrSeal { tablet: tablet.0 };
                     match self
-                        .forward_to_tablet_leader(Some(tablet), addr, hinted, request)
+                        .forward_to_tablet_leader(Some(tablet), addr, hinted, request, deadline)
                         .await
                     {
                         ClientResponse::PutOk => return Ok(()),
@@ -1136,7 +1136,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 Some(CpRoute::Forward(addr, hinted)) => {
                     let request = ClientRequest::TriggerAutoSplit { tablet: tablet.0 };
                     match self
-                        .forward_to_tablet_leader(Some(tablet), addr, hinted, request)
+                        .forward_to_tablet_leader(Some(tablet), addr, hinted, request, deadline)
                         .await
                     {
                         ClientResponse::Error(e)
@@ -1260,7 +1260,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                         index: index.to_owned(),
                     };
                     match self
-                        .forward_to_tablet_leader(Some(tablet), addr, hinted, request)
+                        .forward_to_tablet_leader(Some(tablet), addr, hinted, request, deadline)
                         .await
                     {
                         ClientResponse::PutOk => return Ok(()),
@@ -1360,7 +1360,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                         limit,
                     };
                     match self
-                        .forward_to_tablet_leader(Some(tablet), addr, hinted, request)
+                        .forward_to_tablet_leader(Some(tablet), addr, hinted, request, deadline)
                         .await
                     {
                         ClientResponse::Pairs(pairs) => return Ok(pairs),
@@ -1413,7 +1413,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 Some(CpRoute::Forward(addr, hinted)) => {
                     let request = ClientRequest::StreamHotChangeMax { tablet: tablet.0 };
                     match self
-                        .forward_to_tablet_leader(Some(tablet), addr, hinted, request)
+                        .forward_to_tablet_leader(Some(tablet), addr, hinted, request, deadline)
                         .await
                     {
                         ClientResponse::Pairs(pairs) => {

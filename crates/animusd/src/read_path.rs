@@ -597,7 +597,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     ) -> Result<SnapshotRead, String> {
         let deadline = self.env.now().saturating_add(CLIENT_TIMEOUT);
         loop {
-            let err = match self.cp_route(table, &key).await {
+            let err = match self.cp_route(table, &key, deadline).await {
                 CpRoute::Local(leader) => match self.cp_get_local_snapshot(&leader, &key).await {
                     Ok(outcome) => return Ok(outcome),
                     Err(e) => e,
@@ -613,6 +613,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                                 key: key.clone(),
                                 table: table.to_owned(),
                             },
+                            deadline,
                         )
                         .await
                     {
@@ -704,7 +705,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         }
         let deadline = self.env.now().saturating_add(CLIENT_TIMEOUT);
         loop {
-            let err = match self.cp_route(table, &key).await {
+            let err = match self.cp_route(table, &key, deadline).await {
                 CpRoute::Local(leader) => {
                     match self.cp_get_local_resolving(&leader, table, &key).await {
                         Ok(v) => return Ok(v),
@@ -723,6 +724,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                                 table: table.to_owned(),
                                 stale: false,
                             },
+                            deadline,
                         )
                         .await
                     {
@@ -853,7 +855,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         }
         let deadline = self.env.now().saturating_add(CLIENT_TIMEOUT);
         loop {
-            let err = match self.cp_route(table, &start).await {
+            let err = match self.cp_route(table, &start, deadline).await {
                 CpRoute::Local(leader) => {
                     // ADR 0065 §2/§3: one check per tablet actually
                     // visited — this is that tablet's own leader-local
@@ -888,7 +890,10 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                         table: table.to_owned(),
                         stale: false,
                     };
-                    match self.cp_forward(table, &start, addr, hinted, request).await {
+                    match self
+                        .cp_forward(table, &start, addr, hinted, request, deadline)
+                        .await
+                    {
                         ClientResponse::Pairs(p) => return Ok(p),
                         ClientResponse::Error(e) => e,
                         other => {
@@ -1063,7 +1068,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         }
         let deadline = self.env.now().saturating_add(CLIENT_TIMEOUT);
         loop {
-            let err = match self.cp_route(table, &start).await {
+            let err = match self.cp_route(table, &start, deadline).await {
                 CpRoute::Local(leader) => {
                     // ADR 0065 §2/§3 — see `cp_scan_one`'s identical arm.
                     let precharge = match self.tablet_for(table, &start) {
@@ -1101,7 +1106,10 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                         reverse,
                         stale: false,
                     };
-                    match self.cp_forward(table, &start, addr, hinted, request).await {
+                    match self
+                        .cp_forward(table, &start, addr, hinted, request, deadline)
+                        .await
+                    {
                         ClientResponse::Pairs(p) => return Ok(p),
                         ClientResponse::Error(e) => e,
                         other => {

@@ -876,6 +876,94 @@ mechanism and `docs/lessons/` for the general lessons this amendment both
 applies and, where the fix stopped short of a broader rewrite (the
 forward-hop chase's own per-hop timeout shape is unchanged), deliberately
 did not re-litigate.
+
+## Amendment (2026-09-19, issue #961) — `cp_route`/`cp_forward`/`forward_to_tablet_leader` now share ONE caller-minted deadline, closing the doubled-budget compounding the amendment above left standing
+
+**Symptom.** The 2026-09-16 amendment fixed `cp_route`'s own fan-out from
+stalling forever on a stale local view, and handed off to the
+already-hardened `forward_to_tablet_leader` chase "for the rest" — but
+each of the two independently minted its own `now + CLIENT_TIMEOUT` (or,
+for a tablet-id-addressed internal RPC, `now + SCHEMA_COMMIT_TIMEOUT`)
+the instant it was called, with no shared budget between them. A single
+logical attempt — `cp_route` genuinely needing most of its own budget to
+resolve via the fan-out, immediately followed by a `forward_to_tablet_
+leader` chase that also stalls (a resolved, live-vouched-for hint whose
+target then turns out to be slow or unreachable) — could therefore cost
+up to ~2x its nominal timeout before the CALLER's own outer retry loop
+(`cp_kind_write_item`, `cp_read`, `force_seal_tablet`, …) ever got a
+chance to check its own deadline: that outer loop's deadline was set once,
+at its own start, but the two inner calls it made never spent from it.
+
+**Fix.** `cp_route`, `cp_forward`, and `forward_to_tablet_leader`
+(`forwarding.rs`) all now take a `deadline: Nanos` parameter instead of
+each minting `self.env.now().saturating_add(CLIENT_TIMEOUT)` internally.
+Every composing call site already had its own local `deadline` binding
+(the outer loop's own budget) — the fix is purely to pass that existing
+value through instead of letting the callee re-derive a fresh one: `cp_
+read`/`cp_read_snapshot`/`cp_scan_one`/`cp_scan_kind_one` (`read_path.rs`),
+`cp_kind_write_item`/`cp_kind_write_raw_bounded` (`write_path.rs`), the
+six tablet-id-addressed internal RPCs (`force_seal_tablet`/`force_pitr_
+seal_tablet`/`grow_stream_tablet`/`clear_backfill_cursor_tablet`/`read_
+stream_hot_records`/`stream_hot_change_max`, `schema.rs`, all already
+looping against their own `SCHEMA_COMMIT_TIMEOUT`-sized deadline), and
+the six single-shot 2PC coordinator RPCs (`txn_prepare`/`txn_decide_
+anchor`/`txn_resolve_participant`/`txn_status`/`txn_record_view`/`txn_
+verify`, `txn_coordinator.rs`, each minting one `CLIENT_TIMEOUT` deadline
+at the top of the call itself, since none of them loop internally — their
+own bounded-retry wrappers, e.g. `txn_prepare_pushing`, re-invoke the
+single-shot call fresh on each attempt rather than looping inside it).
+The per-hop caps this ADR's own 2026-09-16 amendment and issues #316/#585/
+#900 established (`FORWARD_HOP_TIMEOUT`, `HINTED_FORWARD_HOP_TIMEOUT`,
+`CP_ROUTE_FANOUT_PROBE_TIMEOUT`, `CP_ROUTE_LOCAL_SUB_BUDGET`) are
+completely unchanged — they still bound one sub-step of one phase; a
+hop's actual timeout is still `min(cap, remaining)`, only `remaining` is
+now `deadline - now` against the ONE shared deadline rather than a
+locally re-derived budget. `ClientCtx::relay` (the plain one-shot relay
+wrapper behind schema-DDL relay, unrelated to `cp_route`/`cp_forward`)
+keeps its own flat `CLIENT_TIMEOUT` default, since nothing upstream of it
+threads a shared budget in.
+
+**Regression**: `crates/animusd/src/sim_cluster_cp_route_fanout.rs`'s new
+`deadline_budget_tests` module, beside this ADR's own 2026-09-16
+regression above — a 3-node RF-3 `SimCluster` where the calling node is
+partitioned from BOTH the tablet's leader and the third replica, so `cp_
+route`'s own fan-out finds nothing for several rounds (burning most of
+`CLIENT_TIMEOUT`); the calling node's link to the third replica heals
+partway through (letting the NEXT fan-out round resolve a real, live-
+vouched-for hinted forward to the leader), but its link to the leader
+itself never does — so the forward chase that follows stalls on that one
+resolved-but-unreachable hop for the rest of the attempt (`SimEnv`'s
+`SimRelayClient` cannot distinguish a partitioned peer from a merely slow
+one, making this the deterministic stand-in for a genuinely slow-but-live
+stub replica). Confirmed red before the fix (both a `cp_kind_write_raw`
+and a `cp_read` attempt took ~16.3s — close to the doubled-budget
+prediction) and green after (both attempts complete within `CLIENT_
+TIMEOUT` plus a few hundred ms of scheduling slack, never a second hop
+cap's worth on top). See `crates/animusd/CLAUDE.md`'s forwarding section
+for the full per-function account.
+
+**Follow-up fix, same day: sharing the budget exposed the exhaustion path
+itself.** Now that the chase runs out of its (correctly, tightly) shared
+budget more often, `forward_to_tablet_leader` had to stop returning the
+LAST HOP's raw response on exhaustion — a relay timeout / transport
+failure / not-leader-refusal string carrying no `"; retry"` suffix, which
+`decide::read_should_retry`'s house convention (an error is transient iff
+it ends in `"; retry"`) then classified as terminal, defeating every
+caller's own outer retry loop. Fixed by returning a dedicated
+`FORWARD_BUDGET_EXHAUSTED` message (`forwarding.rs`, via a small pure
+`format_forward_budget_exhausted` helper) whenever the deadline is
+exhausted while still chasing a TRANSIENT condition (a timed-out hop, a
+confirmed-dead transport, or a not-yet-elected leader) — always suffixed
+`"; retry"`, so a caller's loop, and eventually the DynamoDB client, see a
+transient condition, never the last hop's raw transport error. A genuine
+application-level refusal from a live, leading peer is unaffected — still
+returned verbatim, since that is a real answer, not an exhaustion.
+Regression: `sim_cluster_cp_route_fanout.rs::deadline_budget_tests`'
+`a_stalled_route_then_a_stalled_hop_still_bounds_a_kind_write_raw_attempt_
+by_client_timeout`/`..._a_cp_read_attempt_...` — updated to assert the
+bounded elapsed time (their original purpose) rather than the specific
+error shape, since that shape changed with this fix.
+
 ## Amendment (2026-09-16, issue #945) — the `campaign_immediately` carve-out above was incomplete: it only exempted one replica of a multi-replica split, not all of them
 
 The "One tablet-specific carve-out" paragraph above claimed skipping the

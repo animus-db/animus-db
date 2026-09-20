@@ -108,6 +108,13 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// at all any more (ADR 0054 step 4b deleted `rmw_lock` outright), so
     /// retrying here — including the sleep between attempts — was never at
     /// risk of pinning one across the wait.
+    ///
+    /// **Issue #961**: this loop's own `deadline` is now the ONE budget
+    /// [`cp_route`](Self::cp_route)/[`cp_forward`](Self::cp_forward) spend
+    /// from too, passed through explicitly rather than letting either mint
+    /// its own fresh `CLIENT_TIMEOUT` — see `cp_route`'s own doc for why a
+    /// caller-minted, shared deadline matters (a single retry iteration
+    /// used to be able to cost up to ~2x this loop's own nominal budget).
     pub(crate) async fn cp_kind_write_item(
         &self,
         meta: &Metadata,
@@ -134,7 +141,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         let idempotent = dynamo::kind_write_is_idempotent(&op);
         let deadline = self.env.now().saturating_add(CLIENT_TIMEOUT);
         loop {
-            let err = match self.cp_route(table, &base_key).await {
+            let err = match self.cp_route(table, &base_key, deadline).await {
                 CpRoute::Local(leader) => {
                     match dynamo::kind_write_item_at_leader::<E, R>(
                         self,
@@ -166,7 +173,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                         condition: condition.cloned(),
                     };
                     match self
-                        .cp_forward(table, &base_key, addr, hinted, request)
+                        .cp_forward(table, &base_key, addr, hinted, request, deadline)
                         .await
                     {
                         ClientResponse::KindWriteOk {
@@ -366,9 +373,22 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         let Some(first) = writes.first().map(|(_, k, _)| k.clone()) else {
             return Ok(());
         };
-        let deadline = self.env.now().saturating_add(timeout);
+        // Issue #961: `deadline` is the ONE budget `cp_route`/`cp_forward`
+        // spend from for a single attempt — always a full `CLIENT_TIMEOUT`,
+        // regardless of `timeout` (this loop's own, separate "keep retrying
+        // a retryable error" budget, `retry_until` below). The two must NOT
+        // collapse into one value: `cp_kind_write_raw_once`'s `timeout:
+        // Duration::ZERO` means "never retry a failed attempt," never "give
+        // the one necessary attempt zero time to route/forward at all" — an
+        // early draft of this fix conflated the two and broke every ordinary
+        // (non-frozen) GSI-drain write, whose one caller,
+        // `index_drain::reconcile_partition`, uses `_once` unconditionally,
+        // not just from the frozen-endgame acceleration loop its own doc
+        // names. See `docs/lessons/` for the general lesson.
+        let deadline = self.env.now().saturating_add(CLIENT_TIMEOUT);
+        let retry_until = self.env.now().saturating_add(timeout);
         loop {
-            let err = match self.cp_route(table, &first).await {
+            let err = match self.cp_route(table, &first, deadline).await {
                 CpRoute::Local(leader) => {
                     match Self::cp_kind_raw_local(&leader, writes.clone(), change_log.clone()).await
                     {
@@ -383,7 +403,8 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                         change_log: change_log.clone(),
                     };
                     match decide::ok_or_err(
-                        self.cp_forward(table, &first, addr, hinted, request).await,
+                        self.cp_forward(table, &first, addr, hinted, request, deadline)
+                            .await,
                         "forwarded CP kind write",
                     ) {
                         Ok(()) => return Ok(()),
@@ -392,7 +413,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 }
                 CpRoute::None => "no CP group leader reachable".to_string(),
             };
-            if !decide::read_should_retry(&err) || self.env.now() >= deadline {
+            if !decide::read_should_retry(&err) || self.env.now() >= retry_until {
                 return Err(err);
             }
             self.env.sleep(SCHEMA_POLL_INTERVAL).await;
