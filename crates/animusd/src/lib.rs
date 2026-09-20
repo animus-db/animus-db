@@ -50,8 +50,9 @@ pub use animus_control::{
 // `ClientRequest`, `topology::decide_cp_route`, `decide::frozen_refusal`,
 // `use crate::KindWriteOp`, etc.) keep compiling unchanged.
 pub use animus_node::{
-    ClientRequest, ClientResponse, KindWriteOp, PendingKindWrite, Surface, TxnPrecondition,
-    TxnTableWrite, TxnWriteCondition, decide, is_relayable_command, surface_of, topology,
+    ClientRequest, ClientResponse, KindWriteBatchItem, KindWriteItemReply, KindWriteOp,
+    PendingKindWrite, Surface, TxnPrecondition, TxnTableWrite, TxnWriteCondition, decide,
+    is_relayable_command, surface_of, topology,
 };
 // ADR 0061 rung C5 step 3a: `ClientCtx`'s own `control` field needs the
 // *generic* `ControlHandle<E, R>` (not this crate's `E = ProdEnv`/`R =
@@ -1054,6 +1055,35 @@ impl<E: Env> CpGroup<E> {
         match self {
             CpGroup::Lsm(n) => n.take_kind_eval_result(index, term),
             CpGroup::Mem(n) => n.take_kind_eval_result(index, term),
+        }
+    }
+
+    /// Propose a **batch of self-contained evaluated writes** as ONE Raft
+    /// entry (issue #996 layer 2 — the animusd-side sibling of
+    /// [`propose_kind_eval`](Self::propose_kind_eval), beside it for the
+    /// identical reason). See [`RaftKvNode::propose_kind_eval_batch`].
+    pub(crate) fn propose_kind_eval_batch(
+        &self,
+        entries: Vec<animus_cp_data::KindEvalEntry>,
+    ) -> ProposeResult {
+        match self {
+            CpGroup::Lsm(n) => n.propose_kind_eval_batch(entries),
+            CpGroup::Mem(n) => n.propose_kind_eval_batch(entries),
+        }
+    }
+
+    /// Take back the leader-local per-item result payload of a confirmed
+    /// `KindEvalBatch` entry (issue #996 layer 2) — `Some` only on the
+    /// node that proposed it, and only once. See
+    /// [`RaftKvNode::take_kind_eval_batch_result`].
+    pub(crate) fn take_kind_eval_batch_result(
+        &self,
+        index: u64,
+        term: u64,
+    ) -> Option<animus_cp_data::KindEvalBatchResult> {
+        match self {
+            CpGroup::Lsm(n) => n.take_kind_eval_batch_result(index, term),
+            CpGroup::Mem(n) => n.take_kind_eval_batch_result(index, term),
         }
     }
 
@@ -13528,6 +13558,7 @@ fn request_kind(request: &ClientRequest) -> &'static str {
         ClientRequest::PutBatch { .. } => "put_batch",
         ClientRequest::KindWrite { .. } => "kind_write",
         ClientRequest::KindWriteItem { .. } => "kind_write_item",
+        ClientRequest::KindWriteBatch { .. } => "kind_write_batch",
         ClientRequest::CpLeaderHintProbe { .. } => "cp_leader_hint_probe",
         ClientRequest::KindScan { .. } => "kind_scan",
         ClientRequest::ForceSeal { .. } => "force_seal",
@@ -13744,6 +13775,17 @@ async fn handle_request(
         ClientRequest::KindWriteItem { .. } => ClientResponse::Error(
             "this request is an internal evaluate-at-leader write RPC and must be sent wrapped \
              in `Forwarded`"
+                .into(),
+        ),
+        // Issue #996 layer 2: the batched evaluate-at-leader write RPC,
+        // refused bare for the identical reason `KindWriteItem` just above
+        // is — see `ClientRequest::KindWriteBatch`'s own doc. Real handling
+        // lives in `cp_serve_forwarded`'s match, reached only through
+        // `Forwarded`; not a `MetaCommand`, so `is_relayable_command` does
+        // not apply.
+        ClientRequest::KindWriteBatch { .. } => ClientResponse::Error(
+            "this request is an internal evaluate-at-leader batch write RPC and must be sent \
+             wrapped in `Forwarded`"
                 .into(),
         ),
         // Issue #950: the cross-replica leader-hint probe, refused bare for

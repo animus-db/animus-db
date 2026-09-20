@@ -1041,6 +1041,42 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     Err(e) => ClientResponse::Error(dynamo::encode_relayed_error(&e)),
                 }
             }
+            // Issue #996 layer 2: the batched evaluate-at-leader write RPC —
+            // resolve the leader by the FIRST item's own base key (every
+            // item in one `KindWriteBatch` request shares one tablet by
+            // construction — the caller groups by tablet before sending,
+            // mirroring `KindWrite`'s own arm above resolving by
+            // `writes.first()`), then defer to the identical leader-side
+            // batch evaluator `kind_write_batch_at_leader` — the SAME
+            // function `ClientCtx::cp_kind_write_batch`'s own `Local`
+            // branch calls in-process, never a re-implementation (per the
+            // house lesson: a forwarded RPC's serve arm must run the same
+            // confirm discipline as its local counterpart).
+            ClientRequest::KindWriteBatch { table, items } => {
+                let Some(first) = items
+                    .first()
+                    .map(|item| dynamo::item_key(&item.pk, item.sk.as_ref()))
+                else {
+                    return ClientResponse::KindWriteBatchOk {
+                        results: Vec::new(),
+                    };
+                };
+                let tablet = self.tablet_for(&table, &first);
+                let Some(leader) = tablet.and_then(|t| self.edge.cp_leader(t)) else {
+                    return self.not_leader_refusal(tablet);
+                };
+                let meta = self.effective_metadata();
+                let results = dynamo::kind_write_batch_at_leader::<E, R>(
+                    self, &leader, &meta, &table, items, false,
+                )
+                .await;
+                ClientResponse::KindWriteBatchOk {
+                    results: results
+                        .into_iter()
+                        .map(dynamo::kind_write_outcome_to_reply)
+                        .collect(),
+                }
+            }
             // ADR 0055: an eventual read is answered by whichever replica
             // of the tablet this node happens to hold — the forwarder chose
             // this node for hosting one, not for leading it. Serve-or-refuse

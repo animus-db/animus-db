@@ -18,8 +18,9 @@ use animus_node::host::RelayClient;
 
 use crate::{
     CLIENT_TIMEOUT, CP_CONFIRM_POLL_MAX, ClientCtx, ClientRequest, ClientResponse, CpGroup,
-    CpRoute, KindBatchSignal, KindWriteOp, KvPair, ProbeIdentity, ProbeWait, SCHEMA_POLL_INTERVAL,
-    classify_kind_batch_outcome, decide, dynamo, kind_batch_confirm_superseded,
+    CpRoute, KindBatchSignal, KindWriteBatchItem, KindWriteOp, KvPair, ProbeIdentity, ProbeWait,
+    SCHEMA_POLL_INTERVAL, classify_kind_batch_outcome, decide, dynamo,
+    kind_batch_confirm_superseded,
 };
 
 /// The message [`ClientCtx::cp_kind_eval_local`] returns for a confirmed-
@@ -225,6 +226,99 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             if !idempotent || !decide::read_should_retry(&err.message) || self.env.now() >= deadline
             {
                 return Err(err);
+            }
+            self.env.sleep(SCHEMA_POLL_INTERVAL).await;
+        }
+    }
+
+    /// **The batched sibling of [`cp_kind_write_item`](Self::
+    /// cp_kind_write_item)** (issue #996 layer 2, ADR 0049's batched-
+    /// `BatchWriteItem`-images amendment): the top-level retry loop for one
+    /// tablet-group's worth of `BatchWriteItem` requests against an
+    /// indexed/streamed table — auto-provisions the table's tablet
+    /// (mirroring `cp_kind_write_item` exactly, outside the retry loop),
+    /// then loops `cp_route`/`cp_forward` by the GROUP's own first item's
+    /// key: every item in `items` is expected to route to the SAME tablet
+    /// (the caller groups by tablet before calling this — see
+    /// `Operation::BatchWriteItem`'s images-carrying arm, `dynamo.rs`,
+    /// which uses `crate::topology::tablet_for_key` the identical way
+    /// `marker_batch_write_raw` already does for the fast arm).
+    ///
+    /// **Retries the WHOLE group, never a subset** — mirroring
+    /// `KvCommand::KindEvalBatch`'s own doc (`animus-cp-data`): a retry
+    /// re-proposes every item again, since the batch commits as one Raft
+    /// entry with a freshly-minted `ts` each time — there is no
+    /// partial-group propose to retry instead, and the #911/#967 false-
+    /// loss hazard `cp_kind_raw_local`/`cp_kind_eval_local` already close
+    /// applies here unchanged (`cp_kind_eval_batch_local` reuses their
+    /// exact confirm/supersede machinery). Only a retryable, whole-attempt-
+    /// level error triggers a retry (`FROZEN_REFUSAL`'s `"; retry"` suffix,
+    /// or an unreachable/electing leader) — a **per-item** throttle
+    /// refusal never reaches this level at all: `kind_write_batch_at_leader`
+    /// sheds a throttled item into its own `Err` slot without ever failing
+    /// the whole call, so this loop's own retry decision only ever sees a
+    /// group-wide routing/propose failure.
+    pub(crate) async fn cp_kind_write_batch(
+        &self,
+        meta: &Metadata,
+        table: &str,
+        items: Vec<KindWriteBatchItem>,
+    ) -> Vec<Result<dynamo::KindWriteOutcome, animus_dynamo::wire::WireError>> {
+        if items.is_empty() {
+            return Vec::new();
+        }
+        if !self.effective_metadata().has_table_tablet(table)
+            && let Err(e) = self.provision_tablet(table).await
+        {
+            let err = dynamo::internal(&e);
+            return items.iter().map(|_| Err(err.clone())).collect();
+        }
+        let first_key = dynamo::item_key(&items[0].pk, items[0].sk.as_ref());
+        let deadline = self.env.now().saturating_add(CLIENT_TIMEOUT);
+        loop {
+            let err = match self.cp_route(table, &first_key, deadline).await {
+                CpRoute::Local(leader) => {
+                    return dynamo::kind_write_batch_at_leader::<E, R>(
+                        self,
+                        &leader,
+                        meta,
+                        table,
+                        items.clone(),
+                        false,
+                    )
+                    .await;
+                }
+                CpRoute::Forward(addr, hinted) => {
+                    let request = ClientRequest::KindWriteBatch {
+                        table: table.to_owned(),
+                        items: items.clone(),
+                    };
+                    match self
+                        .cp_forward(table, &first_key, addr, hinted, request, deadline)
+                        .await
+                    {
+                        ClientResponse::KindWriteBatchOk { results } => {
+                            return results
+                                .into_iter()
+                                .map(dynamo::kind_write_item_reply_to_outcome)
+                                .collect();
+                        }
+                        // The far side may carry a typed error's own code
+                        // in the string (`dynamo::encode_relayed_error`),
+                        // exactly like `KindWriteItem`'s own singular reply
+                        // does for a whole-attempt-level failure (a per-item
+                        // outcome never reaches this arm at all — those ride
+                        // `KindWriteBatchOk` above).
+                        ClientResponse::Error(e) => dynamo::decode_relayed_error(&e),
+                        other => dynamo::internal(&format!(
+                            "unexpected reply to forwarded kind write batch: {other:?}"
+                        )),
+                    }
+                }
+                CpRoute::None => dynamo::internal("no CP group leader reachable"),
+            };
+            if !decide::read_should_retry(&err.message) || self.env.now() >= deadline {
+                return items.iter().map(|_| Err(err.clone())).collect();
             }
             self.env.sleep(SCHEMA_POLL_INTERVAL).await;
         }
@@ -800,6 +894,193 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             other => unreachable!(
                 "classify_kind_batch_outcome only returns NoOp for ConditionFailed/Sealed/\
                  Rejected, got {other:?}"
+            ),
+        }
+    }
+
+    /// **The batched sibling of [`cp_kind_eval_local`](Self::
+    /// cp_kind_eval_local)** (issue #996 layer 2 — `KvCommand::
+    /// KindEvalBatch`, layer 1): propose a whole tablet-group's worth of
+    /// self-contained evaluated writes as ONE Raft entry and confirm it.
+    /// Mirrors `cp_kind_eval_local` almost verbatim, at the batch grain:
+    /// `entries`/`identities`/`base_keys` are parallel `Vec`s, one triple
+    /// per item, in the SAME order as the caller's own `items` (minus any
+    /// item its own throttle precharge already shed before this function is
+    /// ever called — see `kind_write_batch_at_leader`).
+    ///
+    /// **Reuses `classify_kind_batch_outcome`/`kind_batch_confirm_
+    /// superseded`/`wait_applied_past` verbatim** — those functions only
+    /// ever look at the ENTRY-granularity `KindBatchOutcome`
+    /// (`Applied`/`Sealed`), which `KvCommand::KindEvalBatch`'s own apply
+    /// arm still records exactly once per entry regardless of how many
+    /// items it carries (see that variant's own doc, `animus-cp-data`) —
+    /// so this confirm loop needs zero changes to either shared function,
+    /// and inherits the identical never-trusts-`!is_leader()`-alone
+    /// discipline `cp_kind_eval_local`'s own doc already argues for (issue
+    /// #967 and its `docs/lessons/code-patterns/2026-09-16-is-leader-
+    /// false-is-not-proof-a-write-is-lost.md` writeup).
+    ///
+    /// **`NoOp`'s only reachable shape at this grain is `Sealed`** — unlike
+    /// the singular variant's `kind_eval_noop`, a per-item `ConditionFailed`/
+    /// `Rejected` is folded into the per-item `KindEvalItemResult` inside a
+    /// successfully-`Applied` entry (see `KvCommand::KindEvalBatch`'s own
+    /// doc: "one item's own `ConditionFailed`/`Rejected` never aborts its
+    /// siblings" — the WHOLE entry still applies), so those two variants
+    /// never reach `KindBatchOutcome` at the whole-entry grain the way they
+    /// do for a bare singular `KindEval`.
+    ///
+    /// **Retry semantics (see `KvCommand::KindEvalBatch`'s own doc): a
+    /// superseded/failed confirm means the WHOLE batch is retried by the
+    /// caller** (`ClientCtx::cp_kind_write_batch`) — since a fresh propose
+    /// mints a fresh `ts` (`RaftKvNode::propose_kind_eval_batch`'s own
+    /// `mint_pushed` call), a retried batch is a genuinely new entry, never
+    /// a resumed wait on the old one.
+    #[allow(clippy::too_many_arguments)] // a whole batch's full identity
+    pub(crate) async fn cp_kind_eval_batch_local(
+        leader: &CpGroup<E>,
+        entries: Vec<animus_cp_data::KindEvalEntry>,
+        identities: Vec<ProbeIdentity>,
+        base_keys: Vec<Vec<u8>>,
+    ) -> Result<Vec<KindEvalApplied>, String> {
+        decide::frozen_refusal(leader.is_frozen())?;
+        // Pre-propose range check — the identical routing-bug tripwire
+        // `cp_kind_eval_local`/`cp_batch_local` already carry, checked over
+        // EVERY item's own base key (every item is expected to share this
+        // group's one range, but a stale `cp_route` resolution could in
+        // principle hand this function a key that has since moved — belt-
+        // and-suspenders, never a lock).
+        let fence = leader.scope_range();
+        for base_key in &base_keys {
+            if !fence.contains(base_key) {
+                return Err("kind write outside this group's live range; retry".into());
+            }
+        }
+        let (accepted_index, accepted_term) = match leader.propose_kind_eval_batch(entries) {
+            ProposeResult::Accepted { index, term } => (index, term),
+            other => return Err(format!("kind eval batch not accepted: {other:?}")),
+        };
+        let deadline = leader.env().now().saturating_add(CLIENT_TIMEOUT);
+        const SUPERSEDED: &str = "CP kind write batch superseded before its effect appeared \
+             (leadership churn or an apply-time no-op); retry";
+        // Wake-on-apply confirm wait — see `cp_kind_eval_local`'s own doc
+        // for why this is THE confirm loop shape for every write since ADR
+        // 0054 step 3, unchanged here at the batch grain.
+        while leader.env().now() < deadline {
+            let effects_readable = leader.engine_applied_index() >= accepted_index;
+            let outcome = leader.kind_batch_outcome(accepted_index);
+            match classify_kind_batch_outcome(outcome.clone(), accepted_term, effects_readable) {
+                KindBatchSignal::Confirm => {
+                    return Self::kind_eval_batch_confirmed(
+                        leader,
+                        accepted_index,
+                        accepted_term,
+                        &identities,
+                        &base_keys,
+                    )
+                    .await;
+                }
+                KindBatchSignal::NoOp => return Err(Self::kind_eval_batch_noop(outcome)),
+                KindBatchSignal::Inconclusive => {}
+            }
+            if kind_batch_confirm_superseded(
+                leader.engine_applied_index(),
+                accepted_index,
+                accepted_term,
+                &outcome,
+            ) {
+                return Err(SUPERSEDED.into());
+            }
+            Self::wait_applied_past(leader, accepted_index).await;
+        }
+        Err(KIND_EVAL_CONFIRM_AMBIGUOUS.into())
+    }
+
+    /// [`cp_kind_eval_batch_local`](Self::cp_kind_eval_batch_local)'s
+    /// `Confirm` arm: this proposer's own `(index, term)` entry provably
+    /// applied. Reads back the leader-local per-item payload
+    /// (`RaftKvNode::take_kind_eval_batch_result`, issue #996 layer 1) and
+    /// maps each item, in order, exactly like
+    /// [`kind_eval_confirmed`](Self::kind_eval_confirmed) does for the
+    /// singular variant.
+    ///
+    /// **The lost-payload residual, at the batch grain.** Unlike the
+    /// singular variant (one `old`/`new` slot to lose), a batch's whole
+    /// per-item breakdown lives in ONE leader-local slot — if it aged out
+    /// or was never registered, EVERY item in the entry loses its own
+    /// `old`/`new` at once. This function recovers the identical way
+    /// `kind_eval_confirmed` does, but at the whole-batch grain: if every
+    /// item's own `identity` is `ValueProves` (idempotent), each item's
+    /// `new` is recovered via a best-effort re-read of its own current
+    /// value (`old` stays `None`, the pre-image is genuinely gone); if ANY
+    /// item `RequiresOwnEntry` (a non-idempotent `ADD`), the whole batch
+    /// returns the same ambiguous, non-retried error an ordinary confirm
+    /// timeout does — a per-item split of "some items recoverable, one
+    /// isn't" has no way to ride this function's own `Result<Vec<..>, ..>`
+    /// shape, and guessing a non-idempotent item's own effect from a bare
+    /// re-read is exactly the false-ack `ProbeIdentity::RequiresOwnEntry`
+    /// exists to forbid. This is genuinely new logic — a duplicated,
+    /// batch-shaped sibling of `kind_eval_confirmed`'s own per-item
+    /// mapping, not a shared helper, since folding an all-or-nothing
+    /// recovery rule into `kind_eval_confirmed`'s own single-item shape
+    /// would change that function's behavior for no benefit.
+    async fn kind_eval_batch_confirmed(
+        leader: &CpGroup<E>,
+        index: u64,
+        term: u64,
+        identities: &[ProbeIdentity],
+        base_keys: &[Vec<u8>],
+    ) -> Result<Vec<KindEvalApplied>, String> {
+        match leader.take_kind_eval_batch_result(index, term) {
+            Some(result) => Ok(result
+                .items
+                .into_iter()
+                .map(|item| match item {
+                    animus_cp_data::KindEvalItemResult::Applied { old, new } => {
+                        KindEvalApplied::Ok { old, new }
+                    }
+                    animus_cp_data::KindEvalItemResult::ConditionFailed => {
+                        KindEvalApplied::ConditionFailed
+                    }
+                    animus_cp_data::KindEvalItemResult::Rejected { code, message } => {
+                        KindEvalApplied::Rejected { code, message }
+                    }
+                })
+                .collect()),
+            None if identities
+                .iter()
+                .all(|id| *id == ProbeIdentity::ValueProves) =>
+            {
+                let mut applied = Vec::with_capacity(base_keys.len());
+                for base_key in base_keys {
+                    let new = leader.local_get(base_key).await.and_then(|bytes| {
+                        animus_dynamo::wire::decode_stored_item(&bytes)
+                            .ok()
+                            .flatten()
+                    });
+                    applied.push(KindEvalApplied::Ok { old: None, new });
+                }
+                Ok(applied)
+            }
+            None => Err(KIND_EVAL_CONFIRM_AMBIGUOUS.into()),
+        }
+    }
+
+    /// [`cp_kind_eval_batch_local`](Self::cp_kind_eval_batch_local)'s
+    /// `NoOp` arm: at the `KindEvalBatch` grain, `classify_kind_batch_
+    /// outcome` can only ever return `NoOp` for `Sealed` — see this
+    /// function's own doc for why `ConditionFailed`/`Rejected` never
+    /// appear here.
+    fn kind_eval_batch_noop(outcome: Option<(u64, KindBatchOutcome)>) -> String {
+        match outcome.map(|(_, o)| o) {
+            Some(KindBatchOutcome::Sealed { .. }) => {
+                "CP kind write batch superseded before its effect appeared (tablet frozen for \
+                 split cutover); retry"
+                    .to_string()
+            }
+            other => unreachable!(
+                "classify_kind_batch_outcome only returns NoOp for Sealed at the KindEvalBatch \
+                 grain (ConditionFailed/Rejected are per-item, folded into an Applied entry's \
+                 own KindEvalBatchResult, never the whole-entry KindBatchOutcome), got {other:?}"
             ),
         }
     }

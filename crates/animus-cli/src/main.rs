@@ -1766,6 +1766,17 @@ fn print_response(response: &ClientResponse) {
             }
         }
         ClientResponse::ConditionFailed => println!("condition failed"),
+        // Internal batched evaluate-at-leader write RPC reply (issue #996
+        // layer 2): consumed programmatically by `ClientCtx::
+        // cp_kind_write_batch`'s own caller (`dynamo.rs`'s
+        // `BatchWriteItem` images-carrying arm) — not requested by any CLI
+        // subcommand of its own, mirroring `KindWriteOk` above.
+        ClientResponse::KindWriteBatchOk { results } => {
+            println!("kind write batch ok: {} result(s)", results.len());
+            for (i, result) in results.iter().enumerate() {
+                println!("  [{i}] {result:?}");
+            }
+        }
         // Internal TxnResolve RPC reply (ADR 0018 §3/§6, torn-pair-fix
         // stack PR2): consumed programmatically by `txn_resolve_participant_retrying`,
         // not requested by any CLI subcommand of its own — printed raw if

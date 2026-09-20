@@ -595,6 +595,63 @@ async fn measure_query(addr: SocketAddr, items: u64, ops: u64, deadline: Duratio
     Stats::from_samples(samples, retries)
 }
 
+/// DynamoDB's own per-call `BatchWriteItem` item cap — also the chunk size
+/// issue #996 layer 2's images-carrying `BatchWriteItem` arm groups by
+/// tablet and commits as one `KvCommand::KindEvalBatch` Raft entry (one
+/// entry per tablet per call, not one per item — `dynamo.rs`, `docs/adr/
+/// 0049-universal-kind-write-path.md`'s matching amendment).
+const BATCH_WRITE_CAP: u64 = 25;
+
+/// One `BatchWriteItem` call per op, each a fresh `PutRequest` batch of
+/// `BATCH_WRITE_CAP` new items landing on the bench table's own single
+/// (unsplit) tablet — so this measures the one-`KindEvalBatch`-entry-
+/// per-chunk-per-tablet cost issue #996 layer 2 introduced, not a
+/// per-item sequential cost.
+async fn measure_batch_write(
+    addr: SocketAddr,
+    ops: u64,
+    value_bytes: usize,
+    tag: &str,
+    deadline: Duration,
+) -> Stats {
+    let mut samples = Vec::with_capacity(ops as usize);
+    let mut retries = 0u64;
+    for i in 0..ops {
+        let mut put_requests = Vec::with_capacity(BATCH_WRITE_CAP as usize);
+        for j in 0..BATCH_WRITE_CAP {
+            let pk = format!("batch-{tag}-{i:07}-{j:03}");
+            let value = value_string((i * BATCH_WRITE_CAP + j) ^ 0xbeef_cafe, value_bytes);
+            put_requests.push(serde_json::json!({
+                "PutRequest": {
+                    "Item": {
+                        "pk": {"S": pk},
+                        "sk": {"N": "0"},
+                        "v": {"S": value},
+                    }
+                }
+            }));
+        }
+        let body = serde_json::json!({ "RequestItems": { TABLE: put_requests } }).to_string();
+        let t0 = Instant::now();
+        let (status, resp, attempts) =
+            dynamo_retry(addr, "DynamoDB_20120810.BatchWriteItem", &body, deadline).await;
+        samples.push(t0.elapsed());
+        assert_eq!(status, 200, "BatchWriteItem[{tag}] {i} failed: {resp}");
+        let parsed: Value = serde_json::from_str(&resp).unwrap_or_default();
+        let unprocessed = parsed
+            .get("UnprocessedItems")
+            .and_then(|v| v.as_object())
+            .map(|m| !m.is_empty())
+            .unwrap_or(false);
+        assert!(
+            !unprocessed,
+            "BatchWriteItem[{tag}] {i} left unprocessed items: {resp}"
+        );
+        retries += u64::from(attempts.saturating_sub(1));
+    }
+    Stats::from_samples(samples, retries)
+}
+
 /// A full paged `Scan` (`Limit`/`ExclusiveStartKey`/`LastEvaluatedKey`, the
 /// real DynamoDB pagination contract — see `tests/dynamo_parallel_scan.rs`).
 /// Returns per-page latency stats, the scan's own total wall clock, and the
@@ -822,6 +879,18 @@ async fn main() {
         scan_wall.as_secs_f64()
     );
     classes.push(("Scan (per page)".to_string(), scan_stats));
+
+    // BatchWriteItem: roughly the same total item count as the PutItem
+    // class above, chunked into BATCH_WRITE_CAP-item calls (issue #996
+    // layer 2 — one KindEvalBatch Raft entry per call, not per item).
+    let batch_ops = (cfg.ops / BATCH_WRITE_CAP).max(1);
+    let batch_write_stats =
+        measure_batch_write(addr0, batch_ops, cfg.value_bytes, "bw", HEALTHY_DEADLINE).await;
+    report_row("BatchWriteItem (25 items/call)", &batch_write_stats);
+    classes.push((
+        "BatchWriteItem (25 items/call)".to_string(),
+        batch_write_stats,
+    ));
 
     println!("\nconcurrent PutItem throughput sweep:");
     let mut sweep = Vec::with_capacity(cfg.clients.len());

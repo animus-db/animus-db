@@ -115,6 +115,57 @@ pub struct PendingKindWrite {
     pub condition: Option<animus_dynamo::ConditionExpression>,
 }
 
+/// One item's write request inside a [`ClientRequest::KindWriteBatch`]
+/// entry — the batched sibling of [`ClientRequest::KindWriteItem`]'s own
+/// per-item fields (ADR 0049's batched-`BatchWriteItem`-images amendment,
+/// issue #996 layer 2: `crates/animus-cp-data`'s `KvCommand::
+/// KindEvalBatch`/`KindEvalEntry` is layer 1's cp-data-side primitive this
+/// wire shape ultimately proposes through). Every item in one
+/// `KindWriteBatch` request shares this request's own `table` and is
+/// expected — by construction of the proposer that builds the request,
+/// never validated on this wire type itself — to route to the SAME
+/// tablet, exactly like [`KindWrite`](ClientRequest::KindWrite)'s own
+/// `writes` field.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct KindWriteBatchItem {
+    pub pk: animus_dynamo::AttributeValue,
+    pub sk: Option<animus_dynamo::AttributeValue>,
+    pub op: KindWriteOp,
+    #[serde(default)]
+    pub condition: Option<animus_dynamo::ConditionExpression>,
+}
+
+/// One item's own outcome inside a [`ClientResponse::KindWriteBatchOk`]
+/// reply, in the same order as the request's own `items` (issue #996
+/// layer 2) — the batched sibling of
+/// [`KindWriteOk`](ClientResponse::KindWriteOk)/
+/// [`ConditionFailed`](ClientResponse::ConditionFailed). Unlike
+/// `KindWriteItem`'s singular reply (which smuggles a typed error code
+/// through `ClientResponse::Error` via the `RELAYED_WIRE_ERROR_MARK`
+/// string-marker convention, `animusd::dynamo`), a batch has no single
+/// top-level error channel for that trick to use — each item's own
+/// `Rejected { code, message }` therefore rides explicitly in its own
+/// slot instead.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum KindWriteItemReply {
+    /// This item's write landed. `new: None` for a `Delete` op. See
+    /// [`ClientResponse::KindWriteOk`]'s own doc for `collection_bytes`.
+    Ok {
+        old: Option<animus_dynamo::Item>,
+        new: Option<animus_dynamo::Item>,
+        #[serde(default)]
+        collection_bytes: Option<u64>,
+    },
+    /// This item's own `condition` did not match apply's fresh read — a
+    /// genuine `ConditionalCheckFailedException` for THIS item only; every
+    /// sibling item in the same batch still applies on its own merits.
+    ConditionFailed,
+    /// This item's own `condition`/`op` evaluation returned `Err` — a
+    /// domain violation (e.g. `size()` on the wrong attribute type) or a
+    /// malformed/oversized update, scoped to this one item.
+    Rejected { code: String, message: String },
+}
+
 /// A request from a client to a node (length-prefixed JSON over TCP).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum ClientRequest {
@@ -375,6 +426,35 @@ pub enum ClientRequest {
         op: KindWriteOp,
         #[serde(default)]
         condition: Option<animus_dynamo::ConditionExpression>,
+    },
+    /// **Internal evaluate-at-leader BATCH write RPC — never sent bare,
+    /// only wrapped in [`Forwarded`](Self::Forwarded)** (ADR 0049's
+    /// batched-`BatchWriteItem`-images amendment, issue #996 layer 2): the
+    /// batched sibling of [`KindWriteItem`](Self::KindWriteItem), for a
+    /// `BatchWriteItem` chunk against an indexed/streamed table whose
+    /// requests all resolve to ONE tablet. Closes the same per-item-entry
+    /// throughput gap `KindWriteItem`'s own singular path leaves for a
+    /// batch: proposing one `KvCommand::KindEvalBatch` (`animus-cp-data`)
+    /// entry for the whole group instead of one `KindEval` entry per item.
+    ///
+    /// Every item in `items` is independent — one item's own
+    /// `ConditionFailed`/`Rejected` never aborts its siblings — but the
+    /// whole entry can be refused before ever proposing (a frozen tablet
+    /// mid-split-cutover, `FROZEN_REFUSAL`) or superseded after
+    /// (leadership churn), in which case the WHOLE group is retried
+    /// together by the caller (`ClientCtx::cp_kind_write_batch`,
+    /// `animusd`) — a retry re-proposes every item in `items`, never a
+    /// partial subset, mirroring `cp_kind_write_item`'s own whole-request
+    /// retry shape at the batch grain.
+    ///
+    /// Not a `MetaCommand`, so `is_relayable_command` does not apply —
+    /// this is a data-plane RPC, exactly like `KindWriteItem`/`KindWrite`/
+    /// `KindScan` before it. Real handling lives in `cp_serve_forwarded`'s
+    /// match, reached only through the `Forwarded` arm. Answered with
+    /// [`KindWriteBatchOk`](ClientResponse::KindWriteBatchOk).
+    KindWriteBatch {
+        table: String,
+        items: Vec<KindWriteBatchItem>,
     },
     /// **Internal cross-replica leader-hint probe — never sent bare, only
     /// wrapped in [`Forwarded`](Self::Forwarded)** (issue #950). "Who does
@@ -745,6 +825,7 @@ pub fn surface_of(request: &ClientRequest) -> Surface {
         | ClientRequest::StreamHotChangeMax { .. }
         | ClientRequest::ClearBackfillCursor { .. }
         | ClientRequest::KindWriteItem { .. }
+        | ClientRequest::KindWriteBatch { .. }
         | ClientRequest::CpLeaderHintProbe { .. }
         | ClientRequest::TxnPrepare { .. }
         | ClientRequest::TxnDecide { .. }
@@ -1141,6 +1222,12 @@ pub enum ClientResponse {
     /// `WireError::conditional_check_failed`), not a transient failure to
     /// retry.
     ConditionFailed,
+    /// Reply to [`KindWriteBatch`](ClientRequest::KindWriteBatch): every
+    /// item's own outcome, in the same order as the request's own `items`
+    /// (issue #996 layer 2). See [`KindWriteItemReply`]'s own doc for why
+    /// a per-item `Rejected` rides explicitly here instead of the
+    /// singular reply's `RELAYED_WIRE_ERROR_MARK` string-marker trick.
+    KindWriteBatchOk { results: Vec<KindWriteItemReply> },
     /// Reply to [`GetSnapshot`](ClientRequest::GetSnapshot): the queried
     /// key's covering transaction did not resolve within one single,
     /// point-in-time attempt (ADR 0018 §2, torn-pair-fix stack PR2) — see

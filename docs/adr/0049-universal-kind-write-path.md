@@ -508,3 +508,71 @@ the frozen-tablet seal, and term identity), a leader-kill/crash-restart
 fault scenario in `crates/animus-cp-data/tests/kind_eval_batch_fault.rs`,
 and a multi-record `(hlc, ordinal)` exactly-once walk cell in
 `crates/animus-test/tests/stream_lineage_corpus.rs`.
+
+**Further amendment (2026-09-20, issue #996 layer 2): the stacked
+follow-up lands the `animusd` cutover.** `Operation::BatchWriteItem`'s
+images-carrying arm (`dynamo.rs`) now groups a chunk's requests by tablet
+(`topology::tablet_for_key`, the identical grouping
+`marker_batch_write_raw` already uses for the marker-table fast arm) and
+proposes each tablet's own group as ONE `KvCommand::KindEvalBatch` entry —
+`ClientCtx::cp_kind_write_batch` (`write_path.rs`) resolves/forwards the
+group to the tablet leader, and `dynamo::kind_write_batch_at_leader`
+builds the batch's `Vec<KindEvalEntry>`/`Vec<ProbeIdentity>` and calls the
+new `ClientCtx::cp_kind_eval_batch_local` — the batched sibling of
+`cp_kind_eval_local`, reusing `wait_applied_past`/
+`classify_kind_batch_outcome`/`kind_batch_confirm_superseded` **verbatim**
+(no bespoke `!is_leader()` shortcut was introduced; see
+`crates/animusd/CLAUDE.md`'s confirm-loop entries for why that reuse is
+load-bearing). This replaces the prior per-item loop — one `KvCommand::
+KindEval` Raft entry per item — with one entry per tablet per chunk.
+
+**Per-item throttle admission is preserved despite the batched propose.**
+Before entries are built, each item is pre-charge-checked against its
+tablet's `ThrottleTracker` share (ADR 0065) *in submission order*; a
+refused item is shed straight to its own `KindWriteItemReply::Rejected`
+slot with no propose at all, while every admitted item in the same tablet
+group still lands in one shared `KindEvalBatch` entry. This means a
+partially-throttled chunk against an indexed/streamed table sheds only
+the specific over-budget items (`BatchWriteItem`'s own documented
+per-table-shape throttle-granularity contract, `crates/animusd/CLAUDE.md`)
+— unchanged from the pre-batching per-item-funnel behavior, since
+admission is still decided one item at a time; only the *commit* is now
+batched per tablet.
+
+**Same-key duplicate within one chunk resolves to the last write** — the
+identical last-write-wins semantics layer 1's own same-`ts`-collapse fix
+established at the apply layer; `animusd`'s grouping does not
+deduplicate by key itself; layer 1's apply-arm collapse is what makes a
+duplicate `PutRequest`/`DeleteRequest` pair for the same base key resolve
+correctly regardless of which physical order the chunk's own items were
+submitted in.
+
+**Wire additions are additive, internal-only, one-hop-forwarded**:
+`ClientRequest::KindWriteBatch`/`ClientResponse::KindWriteBatchOk`
+(`animus-node::wire`), classified `Surface::Intra` and refused bare like
+every other internal-only kind-write RPC — handled only inside
+`cp_serve_forwarded`. A batch item's own error surfaces as an explicit
+typed `KindWriteItemReply::Rejected { code, message }` slot rather than
+the singular path's `RELAYED_WIRE_ERROR_MARK` string-marker convention,
+since a multi-item response has no single top-level error channel to
+smuggle a marker through.
+
+**Bench + regression**: `cargo bench -p animusd`'s `cluster_bench` gained
+a `BatchWriteItem (25 items/call)` class, alongside the existing
+`PutItem`/`GetItem`/`Query`/`Scan` classes. `crates/animusd/src/
+sim_cluster_seed_latency.rs`'s own `POST /admin/data/seed` regression
+(a thin `BatchWriteItem` proxy, ADR 0021's 2026-09-09 amendment) is
+rewritten for the new one-entry-per-chunk-per-tablet cost model and its
+bound tightened from `sequential_extrapolation / 4` (25%) to
+`sequential_extrapolation / 20` (5%) — the looser bound could not
+distinguish the batched arm from the old sequential one (both the
+measured ~0.85% batched ratio and the ~8.00% sequential ratio pass a 25%
+bound); the tighter one was confirmed, by temporarily reverting the
+`animusd` arm to the old sequential loop and re-measuring, to separate
+the two mechanisms cleanly (green ≈0.50%-0.85%, red ≈8.00%-8.50%).
+`crates/animusd/tests/kind_write_batch.rs` is the new end-to-end suite:
+a same-tablet multi-item batch costing one proposal and producing N
+stream records in submission order; a cross-tablet chunk where one
+group is refused (throttled) while the other table's group still
+applies; the forwarded path via a non-leader-connected node; and a
+same-key duplicate resolving to the last write via `GetItem`.
