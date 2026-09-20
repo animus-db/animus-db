@@ -54,24 +54,6 @@ fn format_forward_budget_exhausted(last_hop_error: &str) -> String {
     format!("{FORWARD_BUDGET_EXHAUSTED} (last hop: {last_hop_error}); retry")
 }
 
-#[cfg(test)]
-mod forward_budget_exhausted_tests {
-    use super::{FORWARD_BUDGET_EXHAUSTED, format_forward_budget_exhausted};
-
-    /// The one property every caller actually depends on: the house
-    /// `"; retry"` retryability convention must classify this message as
-    /// transient (issue #961) — a caller's own loop, or the DynamoDB wire's
-    /// eventual typed mapping, must see "try again," never a terminal
-    /// error carrying the last hop's raw transport failure.
-    #[test]
-    fn always_ends_in_the_house_retry_suffix() {
-        let msg = format_forward_budget_exhausted("relay hop timed out");
-        assert!(msg.ends_with("; retry"), "{msg}");
-        assert!(msg.contains("relay hop timed out"), "{msg}");
-        assert!(msg.starts_with(FORWARD_BUDGET_EXHAUSTED), "{msg}");
-    }
-}
-
 impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// The client-API address `id` currently routes to, if known (ADR 0032
     /// PR1) — a single lookup into the live [`client_route`](Self::client_route)
@@ -1785,5 +1767,23 @@ pub(crate) async fn handle_relayed_request<E: Env, R: RelayClient>(
             admin_addrs: ctx.admin.admin_addrs.clone(),
         },
         _ => ClientResponse::Error("not relayable under sim".into()),
+    }
+}
+
+#[cfg(test)]
+mod forward_budget_exhausted_tests {
+    use super::{FORWARD_BUDGET_EXHAUSTED, format_forward_budget_exhausted};
+
+    /// The one property every caller actually depends on: the house
+    /// `"; retry"` retryability convention must classify this message as
+    /// transient (issue #961) — a caller's own loop, or the DynamoDB wire's
+    /// eventual typed mapping, must see "try again," never a terminal
+    /// error carrying the last hop's raw transport failure.
+    #[test]
+    fn always_ends_in_the_house_retry_suffix() {
+        let msg = format_forward_budget_exhausted("relay hop timed out");
+        assert!(msg.ends_with("; retry"), "{msg}");
+        assert!(msg.contains("relay hop timed out"), "{msg}");
+        assert!(msg.starts_with(FORWARD_BUDGET_EXHAUSTED), "{msg}");
     }
 }
