@@ -64,9 +64,16 @@ thin delegation — and stays under the package-level allow along with
 `admin`, `backup_capture`, `backup_restore`, `client_ctx_host`, `console`,
 `control_handle`, `dashboard`, `dynamo`, `dynamo_streams`, `http`, and
 `import` (ADR 0068 §6, S-05 PR 2 — a real per-tablet `tokio::time::sleep`
-loop, `backup_restore`'s own twin, not a thin delegation either). Ten
+loop, `backup_restore`'s own twin, not a thin delegation either). Eleven
 modules now carry the narrower `#[deny(...)]`: the original five (`schema`,
-`read_path`, `write_path`, `txn_coordinator`, `forwarding`) plus these five.
+`read_path`, `write_path`, `txn_coordinator`, `forwarding`) plus the five
+leaf background-loop wrappers above, plus `index_drain` (issue #993,
+2026-09-19) — not a rung C2 move (its five drain/seal/backfill arms stay
+genuinely in this crate), but `pitr_seal_now`'s commit-wait loop was the
+last raw `tokio::time` site in the file (its structural twin `seal_now`
+had already been converted by PR #759); once fixed, the whole module had
+zero remaining `Instant::now`/`SystemTime::now`/`tokio::time::*`/
+`tokio::spawn` sites and earned the same enforcement.
 
 **`lib.rs` is ~11,800 lines** (down from ~17,300 before ADR 0061 rung C5
 step 2 split `impl<E: Env> ClientCtx<E>` into `schema.rs`/`read_path.rs`/

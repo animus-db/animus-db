@@ -31,6 +31,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub mod config;
+#[deny(clippy::disallowed_methods)]
 mod index_drain;
 mod min_tablets;
 pub mod otel;
@@ -19703,6 +19704,16 @@ mod sim_cluster_dynamo_partiql;
 /// wired into `ClientCtx::segment_store`).
 #[cfg(test)]
 mod sim_cluster_dynamo_streams;
+
+/// Issue #993: `SimCluster`-driven deterministic coverage for
+/// `index_drain::pitr_seal_now` — the PITR seal arm's structural twin of
+/// `index_drain::seal_now`, whose own `tokio::time` commit-wait loop was
+/// converted to the `Env` seam (mirroring `seal_now`'s own conversion) so
+/// this module could drive it under `SimEnv` for the first time. See this
+/// module's own doc for the scenario and `crates/animusd/CLAUDE.md`'s
+/// matching entry.
+#[cfg(test)]
+mod sim_cluster_dynamo_pitr_seal;
 
 /// ADR 0061 rung G (post-C-06): Streams `SimCluster` dispatch (C-07), PR 5
 /// — deterministic `SimCluster` coverage for the stream segment janitor's

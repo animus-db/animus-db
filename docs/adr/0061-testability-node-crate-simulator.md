@@ -4779,6 +4779,23 @@ identical panic. See `docs/engineering-lessons.md`'s matching entry for
 the general lesson: a function's generic type parameters prove nothing
 about whether its body actually avoids the real clock/timer.
 
+**2026-09-19, issue #993, closed**: the gap this paragraph deferred is
+fixed. `pitr_seal_now`'s commit-wait loop is converted to `ctx.env.now()`/
+`ctx.env.sleep(..)`, the identical conversion `seal_now` got here;
+`index_drain` (the whole module — its five drain/seal/backfill arms, not
+just this one function) now carries `#[deny(clippy::disallowed_methods)]`
+on its `mod` declaration in `lib.rs`, so the compiler owns the invariant
+this paragraph could only flag by hand. `crates/animusd/src/sim_cluster_
+dynamo_pitr_seal.rs` (a new sibling of `sim_cluster_dynamo_streams.rs`) is
+the first `SimCluster`-driven regression for `pitr_seal_now`, using a new
+`SimCluster::enable_pitr`/`drive_pitr_seal` pair mirroring `set_table_
+throughput`/`drive_stream_seal`'s own shapes (PITR's own wire enablement,
+`UpdateContinuousBackups`, still has no generic-dispatch arm — see this
+ADR's own C-08 PR 4/C-10 close-out entries — so this bypasses the wire the
+same way every other sim-native DDL helper in that module already does).
+See `crates/animusd/CLAUDE.md`'s matching entry and `docs/lessons/
+code-patterns/2026-09-19-grep-for-structural-twins-when-fixing-a-seam-hole.md`.
+
 `SimCluster::new` now builds a second shared `SimSegmentStore` (independent
 from the backup store) and wraps every node's `ClientCtx::segment_store`
 in `SegmentStoreHandle::S3` around a clone of it; `SimCluster::restart`

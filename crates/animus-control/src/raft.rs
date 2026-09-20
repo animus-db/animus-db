@@ -2952,12 +2952,75 @@ where
     /// never mutates term/vote/role/timer, so a pre-vote round can never disrupt
     /// this node. Grant only if we would actually vote for the candidate:
     ///
-    /// - we do **not** currently have a live leader (a leader ourselves, or a
-    ///   follower still within its election timeout of the last heartbeat, is
-    ///   protected — this is the leader-lease that stops a partitioned node from
-    ///   winning a pre-vote and forcing an election);
+    /// - we do **not** currently have a live leader (a leader ourselves, a
+    ///   follower still within its election timeout of the last heartbeat, OR a
+    ///   follower/candidate that has cast a REAL vote (for someone else, or for
+    ///   itself) within its election timeout, is protected — this is the
+    ///   leader-lease that stops a partitioned node from winning a pre-vote and
+    ///   forcing an election);
     /// - the candidate's prospective `term` is not behind ours; and
     /// - the candidate's log is at least as up to date as ours.
+    ///
+    /// **Issue #930 (2026-09-19): the lease used to be `leader_id`-only.**
+    /// `leader_id` is set only by `handle_append_entries`/`InstallSnapshot`/
+    /// `become_leader` — never by `handle_request_vote` on a granted real vote.
+    /// So a voter that had just granted a real vote to the term's eventual
+    /// winner had `leader_id == None` (and thus no lease at all) until that
+    /// winner's first `AppendEntries` actually arrived — a real window with no
+    /// pre-vote protection. A granted real vote IS a per-term commitment to
+    /// this term's likely winner (Raft's own vote-splitting safety already
+    /// relies on it), and the grant already reset this node's own election
+    /// timer (`handle_request_vote`), so `voted_for.is_some()` is exactly as
+    /// trustworthy a lease signal as `leader_id.is_some()` — **but only while
+    /// we are still `Follower` or `Candidate`.**
+    ///
+    /// That role restriction is load-bearing, not incidental — an earlier
+    /// draft of this fix used a bare `voted_for.is_some() && now <
+    /// election_deadline` with no role gate at all, and it deadlocked the
+    /// most ordinary recovery case there is: after a leader crashes, every
+    /// surviving follower already has `voted_for = Some(<the dead leader>)`
+    /// for the still-current term (that vote is how the leader got elected),
+    /// and `voted_for` is never cleared by a timeout alone (only a higher
+    /// term clears it — it is a durable per-term commitment, not something a
+    /// mere timeout may retract). Meanwhile `start_pre_vote` — the handler
+    /// for THIS node's own election timeout — resets `election_deadline` on
+    /// every round it starts, forever, as long as no majority is reached.
+    /// With no role gate, that stale, unrelated vote for the now-dead leader
+    /// would combine with that perpetually-refreshed deadline to make this
+    /// node believe it has a live leader for as long as it keeps timing out
+    /// into fresh pre-vote rounds — i.e. forever — so it would reject every
+    /// peer's pre-vote and no survivor could ever assemble a pre-vote
+    /// majority. `RaftCore::tick`'s `Follower | PreCandidate | Candidate` arm
+    /// moves a timed-out `Follower`/`Candidate` to `PreCandidate` in the same
+    /// step that its own `election_deadline` lapses, so gating on role here
+    /// makes the lease expire at exactly that transition — a `PreCandidate`
+    /// gets no protection from a `voted_for` it can no longer vouch for, only
+    /// from `leader_id` (already `None` the moment it starts campaigning
+    /// itself; see `start_pre_vote`'s own comment). A `Candidate`, by
+    /// contrast, sets `voted_for = Some(self)` in the very same call
+    /// (`start_election`) that resets `election_deadline`, so its own lease
+    /// window is never stale — see the consequence below.
+    ///
+    /// One knock-on consequence, not a bug: a `Candidate`'s self-vote
+    /// (`voted_for = Some(self)`, set atomically with a fresh
+    /// `election_deadline` in `start_election`) now protects it too, so it
+    /// rejects a competing pre-vote for the rest of its own election
+    /// deadline instead of granting it (the pre-`#930` behavior, since
+    /// `leader_id` is `None` for the whole candidacy) — standard pre-vote
+    /// behavior, and it reduces dueling candidacies rather than causing any.
+    /// A second, bounded consequence: `voted_for` is persisted and a
+    /// recovered `RaftCore` always starts `Follower` (`recovered`'s own
+    /// doc), so a node that restarts with a vote already recorded for its
+    /// current term refuses pre-votes for one full freshly-randomized
+    /// election-timeout window after restart, even though it has no live
+    /// leader belief of its own yet — a one-time, bounded startup cost, not
+    /// a recurring one (see `RaftCore::new`/`recovered`).
+    ///
+    /// Regression coverage for both the fix and the rejected naive draft:
+    /// `tests/pre_vote.rs`'s `prevote_rejected_after_granting_a_real_vote_
+    /// until_deadline`, `prevote_rejected_by_a_candidate_within_its_own_
+    /// election_deadline`, and the pre-existing `election_still_succeeds_
+    /// when_leader_is_gone` (which the role-less draft above broke).
     fn handle_pre_vote(
         &mut self,
         candidate: NodeId,
@@ -2966,8 +3029,12 @@ where
         last_log_term: u64,
         now: Nanos,
     ) -> Vec<Out<C>> {
+        let voted_lease = matches!(self.role, Role::Follower | Role::Candidate)
+            && self.voted_for.is_some()
+            && now.0 < self.election_deadline.0;
         let has_live_leader = self.role == Role::Leader
-            || (self.leader_id.is_some() && now.0 < self.election_deadline.0);
+            || (self.leader_id.is_some() && now.0 < self.election_deadline.0)
+            || voted_lease;
         let log_ok = last_log_term > self.last_log_term()
             || (last_log_term == self.last_log_term() && last_log_index >= self.last_log_index());
         // ADR 0058 Train 1: a learner never pre-votes — it is never solicited

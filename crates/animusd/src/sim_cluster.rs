@@ -1043,6 +1043,18 @@ impl SimClusterHandle {
             .all(|ctx| ctx.effective_metadata().table_throughput(table) == spec)
     }
 
+    /// Issue #993: every node's own view of `table`'s PITR enablement
+    /// matches `enabled` — the `UpdateContinuousBackups` convergence check
+    /// [`SimCluster::enable_pitr`] polls on, mirroring
+    /// [`all_have_table_throughput`]'s own shape.
+    fn all_have_table_pitr(&self, table: &str, enabled: bool) -> bool {
+        self.ctxs
+            .lock()
+            .expect("ctxs poisoned")
+            .iter()
+            .all(|ctx| ctx.effective_metadata().table_pitr(table).is_some() == enabled)
+    }
+
     /// ADR 0065 §5(b): recompute every node's own `ClientCtx::
     /// any_table_throughput` flag from that node's own just-converged
     /// `effective_metadata()` — this fixture never spawns
@@ -3305,6 +3317,39 @@ impl SimCluster {
         self.shared.recompute_any_table_throughput_all();
     }
 
+    /// Enable point-in-time recovery (PITR, ADR 0059 §9) for `table` —
+    /// `MetaCommand::UpdateContinuousBackups{enabled: true}`, proposed on
+    /// the control group's current leader and converged-or-timeout polled
+    /// across every node, the identical shape
+    /// [`SimCluster::set_table_throughput`]'s own tail uses. Issue #993: a
+    /// sim-native bypass of the wire's own `UpdateContinuousBackups`
+    /// (`dynamo::update_continuous_backups`) — that function is still
+    /// `ProdEnv`-only (no `dispatch_item_op`/`dispatch_table_op` arm exists
+    /// for `Operation::UpdateContinuousBackups` yet, a documented residual
+    /// this crate's own C-08/C-10 close-outs both name), so this proposes
+    /// the same `MetaCommand` directly the identical way
+    /// [`SimCluster::set_table_throughput`]/[`SimCluster::
+    /// create_table_with_replication`] already bypass the wire for their
+    /// own DDL. `wall_ms` is drawn from the leader's own `env.wall_now()`
+    /// (ADR 0051 discipline — `UpdateContinuousBackups`'s own `wall_ms`
+    /// field feeds `PitrSpec::enabled_wall_ms`, never a bare `env.now()`).
+    pub(crate) fn enable_pitr(&mut self, table: &str) {
+        let leader = self.control_leader_index();
+        let wall_ms = self.controls[leader].env().wall_now().0;
+        let outcome = self.controls[leader].propose(MetaCommand::UpdateContinuousBackups {
+            table: table.to_owned(),
+            enabled: true,
+            wall_ms,
+        });
+        assert!(
+            matches!(outcome, ProposeResult::Accepted { .. }),
+            "UpdateContinuousBackups must be accepted by the current control leader (table={table})"
+        );
+        self.poll_until(Duration::from_secs(5), |c| {
+            c.shared.all_have_table_pitr(table, true)
+        });
+    }
+
     /// Propose `command` directly on this cluster's CURRENT control-plane
     /// leader (ADR 0061 rung D4 PR 5) — the same `self.controls[leader]
     /// .propose(..)` bypass every DDL helper above already uses (see the
@@ -4545,6 +4590,52 @@ impl SimCluster {
             Some(Ok(())) => {}
             Some(Err(e)) => panic!("drive_stream_seal(node={node}) failed: {e}"),
             None => panic!("drive_stream_seal(node={node}) did not complete within {OP_BUDGET:?}"),
+        }
+    }
+
+    /// Issue #993: [`SimCluster::drive_stream_seal`]'s PITR twin — drive
+    /// [`index_drain::pitr_seal_now`] to exhaustion for every tablet `node`
+    /// both hosts and currently leads of a table with PITR enabled
+    /// (`meta.table_pitr(table).is_some()`, mirroring `drive_stream_seal`'s
+    /// own `meta.table_stream` gate). Same leader-check/no-quiescence-or-
+    /// split-guard/bounded-dueling-seal-retry/panic-on-genuine-failure
+    /// shape as `drive_stream_seal` — see that method's own doc for the
+    /// full reasoning, which applies identically here (`pitr_seal_now`'s
+    /// own commit-wait loop shares `seal_now`'s exact structure, including
+    /// the same `is_retryable_elsewhere`-classified dueling-seal race).
+    pub(crate) fn drive_pitr_seal(&mut self, node: u64) {
+        let handle = self.shared.clone();
+        let outcome: Option<Result<(), String>> = self.spawn_and_capture(node, async move {
+            let ctx = handle.ctx(node);
+            let meta = ctx.effective_metadata();
+            for (tablet, group) in ctx.edge.hosted_groups() {
+                if !group.is_leader() {
+                    continue;
+                }
+                let Some(table) = meta.tablets.get(&tablet).and_then(|t| t.table.as_deref()) else {
+                    continue;
+                };
+                if meta.table_pitr(table).is_none() {
+                    continue;
+                }
+                let mut retries_left = STREAM_SEAL_RETRIES;
+                loop {
+                    match index_drain::pitr_seal_now(&ctx, table, tablet, &group).await {
+                        Ok(Some(_)) => {}  // sealed a segment; more may remain
+                        Ok(None) => break, // nothing left pending; done
+                        Err(e) if retries_left > 0 && index_drain::is_retryable_elsewhere(&e) => {
+                            retries_left -= 1; // dueling seal; retry
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+            Ok(())
+        });
+        match outcome {
+            Some(Ok(())) => {}
+            Some(Err(e)) => panic!("drive_pitr_seal(node={node}) failed: {e}"),
+            None => panic!("drive_pitr_seal(node={node}) did not complete within {OP_BUDGET:?}"),
         }
     }
 

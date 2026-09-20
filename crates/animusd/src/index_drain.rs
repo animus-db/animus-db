@@ -333,6 +333,10 @@ const BACKFILL_SEED_TIMEOUT: Duration = Duration::from_secs(10);
 /// durable records/catalog state (nothing is trimmed until every expected
 /// term says it's safe to, and a failed seal simply re-evaluates its
 /// triggers next tick).
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a concrete ClientCtx (E = ProdEnv) process-boundary background loop; SimCluster never spawns this loop (it drives its five arms on demand via drain_gsi/drive_stream_seal/drive_backfill_seed/etc. instead), so its own sleep cadence never needs to advance virtual time; issue #993"
+)]
 pub(crate) async fn change_consumer_loop(ctx: ClientCtx) {
     // Driver-local memo of the seal arm's age-trigger basis for a tablet
     // that has never sealed a shard of its own (no catalog row to read a
@@ -2112,8 +2116,22 @@ pub(crate) async fn pitr_seal_now<E: Env, R: RelayClient>(
     };
     // Commit-wait poll, identical shape (and identical dueling-seal
     // reasoning) to `seal_now`'s own.
-    let deadline = tokio::time::Instant::now() + SEAL_COMMIT_TIMEOUT;
-    let mut next_propose_at = tokio::time::Instant::now();
+    //
+    // Issue #993: this loop used to read the wall clock via
+    // `tokio::time::Instant::now()`/`tokio::time::sleep` directly despite
+    // this function's own `<E: Env, R: RelayClient>` signature already being
+    // generic — the same gap ADR 0061 rung G (C-07 PR 2) found and fixed in
+    // `seal_now`'s structural twin, immediately below (see that loop's own
+    // doc for the full account: a generic *signature* doesn't imply a
+    // seam-clean *body*). Under `SimEnv` there is no real Tokio reactor, so
+    // `tokio::time::sleep` panics ("there is no reactor running") the
+    // instant a `SimEnv`-driven caller reaches this loop. Converted to
+    // `ctx.env.now()`/`ctx.env.sleep(..)` per the rung C5 step 3b precedent
+    // (`Nanos` has no `Add<Duration>`, hence `saturating_add`) — behavior
+    // under `ProdEnv` is unchanged, since `ctx.env.now()`/`ctx.env.sleep`
+    // are themselves backed by the real clock/timer there.
+    let deadline = ctx.env.now().saturating_add(SEAL_COMMIT_TIMEOUT);
+    let mut next_propose_at = ctx.env.now();
     loop {
         match ctx
             .metadata_fresh()
@@ -2133,7 +2151,7 @@ pub(crate) async fn pitr_seal_now<E: Env, R: RelayClient>(
             }
             None => {}
         }
-        let now = tokio::time::Instant::now();
+        let now = ctx.env.now();
         if now >= deadline {
             return Err(format!(
                 "SealPitrSegment({}, {next_epoch}) did not commit in time",
@@ -2142,14 +2160,13 @@ pub(crate) async fn pitr_seal_now<E: Env, R: RelayClient>(
         }
         if now >= next_propose_at {
             let sent = ctx.propose_schema(&cmd).await;
-            next_propose_at = now
-                + if sent {
-                    Duration::from_secs(1)
-                } else {
-                    Duration::ZERO
-                };
+            next_propose_at = now.saturating_add(if sent {
+                Duration::from_secs(1)
+            } else {
+                Duration::ZERO
+            });
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        ctx.env.sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -2671,6 +2688,10 @@ fn projected(item: &Item, base: &animus_dynamo::TableSchema, idx: &IndexDef) -> 
 /// crate's own testing discipline; every eventual property is a
 /// converged-or-timeout poll, never a fixed sleep.
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "real-thread ProdEnv integration tests (raw TcpListener bring-up, real elapsed-time commit-wait polling) — the class SimEnv's virtual clock cannot observe; issue #993"
+)]
 mod gsi_drain_cursor_tests {
     use std::net::SocketAddr;
     use std::path::Path;
@@ -3469,6 +3490,10 @@ mod gsi_drain_cursor_tests {
 /// codebase's own testing discipline — never wait out the 4h/4MiB
 /// production defaults).
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "real-thread ProdEnv integration tests (raw TcpListener bring-up, real elapsed-time commit-wait polling) — the class SimEnv's virtual clock cannot observe; issue #993"
+)]
 mod stream_sealer_tests {
     use std::net::SocketAddr;
     use std::path::Path;

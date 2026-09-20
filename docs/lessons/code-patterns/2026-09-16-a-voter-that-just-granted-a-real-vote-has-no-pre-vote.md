@@ -31,3 +31,40 @@ before trusting it landed, and by hand-picking seeds for the small fixed
 narrow Raft-core liveness question, out of scope for the guard-timing issue
 that test exists to pin, and worth its own investigation (and its own test)
 if it ever needs closing.
+
+## Fixed (2026-09-19, issue #930)
+
+`handle_pre_vote`'s lease now also covers a **role-gated** `voted_for.is_some()`
+(`Follower`/`Candidate` only — never `PreCandidate`/`Leader`), since granting a
+real vote already reset `election_deadline` the same way a heartbeat does. See
+`docs/adr/0009-in-house-raft-over-env.md`'s 2026-09-19 amendment for the full
+mechanism, and `animus-control/tests/pre_vote.rs`'s
+`prevote_rejected_after_granting_a_real_vote_until_deadline`/
+`prevote_rejected_by_a_candidate_within_its_own_election_deadline` for the
+regression coverage (both confirmed red before the fix, green after).
+
+**The role gate is the load-bearing part, not a nicety.** A first draft used
+a bare `voted_for.is_some() && now < election_deadline` with no role
+restriction, and it deadlocked the single most common recovery path there
+is: after any leader crash, every surviving follower already has `voted_for
+= Some(<the dead leader>)` for the still-current term, and nothing but a
+higher term ever clears it. Meanwhile `start_pre_vote` — the handler for a
+node's *own* election timeout — keeps refreshing `election_deadline` every
+time it re-arms a fresh pre-vote round, forever, independent of any vote.
+Combine the two and every survivor believes it has a live leader for as
+long as it keeps timing out into new rounds — i.e. permanently — so no
+survivor ever grants another's pre-vote and the cluster can never
+re-elect. This is a general shape worth naming: **a field that is genuinely
+a per-term commitment (must survive across unrelated retries) must not be
+gated by a deadline that some *other*, unrelated retry loop keeps
+refreshing.** The fix is to scope the check to the specific role/transition
+in which that deadline and that commitment were set *together* (here,
+`Follower` granting a vote or `Candidate` self-voting — both pair the write
+to `voted_for` with the same `reset_election_timer` call) rather than
+reusing a shared timer field across unrelated purposes. Caught immediately
+by the pre-existing `election_still_succeeds_when_leader_is_gone` cluster
+test flipping from green to red under the naive draft — a useful reminder
+that a "boring", already-green end-to-end liveness test is exactly what
+catches this class of regression that a brand-new, narrowly-targeted unit
+test cannot (it only exercises the new code path, never the old one this
+kind of fix can quietly break).
