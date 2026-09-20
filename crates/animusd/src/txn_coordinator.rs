@@ -241,7 +241,14 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 "txn prepare: writes must be non-empty".into(),
             ));
         };
-        match self.cp_route(table, &first).await {
+        // Issue #961: a single, caller-minted deadline for this whole
+        // attempt — `cp_route`/`cp_forward` spend from it instead of each
+        // minting their own `CLIENT_TIMEOUT`. This is a single-shot call
+        // (its own bounded-retry wrapper is `txn_prepare_pushing`, which
+        // re-invokes this method fresh on each attempt), so the deadline
+        // is minted once, here, at the top.
+        let deadline = self.env.now().saturating_add(CLIENT_TIMEOUT);
+        match self.cp_route(table, &first, deadline).await {
             CpRoute::Local(leader) => {
                 self.txn_stage_local(
                     &leader,
@@ -263,7 +270,10 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     participant_spans,
                     pending_kind_writes,
                 };
-                match self.cp_forward(table, &first, addr, hinted, request).await {
+                match self
+                    .cp_forward(table, &first, addr, hinted, request, deadline)
+                    .await
+                {
                     ClientResponse::TxnPrepared {
                         txn_id,
                         record_key,
@@ -636,7 +646,11 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         min_commit_ts: HlcTimestamp,
         orphan_created_ts: Option<HlcTimestamp>,
     ) -> Result<TxnOutcome, String> {
-        match self.cp_route(table, &record_key).await {
+        // Issue #961: one caller-minted deadline for this single-shot call
+        // (see `txn_prepare`'s matching comment) — `txn_decide_anchor_
+        // retrying` re-invokes this method fresh each attempt.
+        let deadline = self.env.now().saturating_add(CLIENT_TIMEOUT);
+        match self.cp_route(table, &record_key, deadline).await {
             CpRoute::Local(leader) => {
                 decide::frozen_refusal(leader.is_frozen())?;
                 if let Some(created_ts) = orphan_created_ts {
@@ -678,7 +692,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     orphan_created_ts,
                 };
                 match self
-                    .cp_forward(table, &record_key, addr, hinted, request)
+                    .cp_forward(table, &record_key, addr, hinted, request, deadline)
                     .await
                 {
                     ClientResponse::TxnDecided { outcome } => Ok(outcome),
@@ -791,7 +805,12 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         let Some(first) = keys.first().cloned() else {
             return Ok(ResolveOutcome::Resolved); // nothing to resolve
         };
-        match self.cp_route(table, &first).await {
+        // Issue #961: one caller-minted deadline for this single-shot
+        // attempt (see `txn_prepare`'s matching comment) —
+        // `txn_resolve_participant_retrying` re-invokes this method fresh
+        // each attempt with its own fresh routing.
+        let deadline = self.env.now().saturating_add(CLIENT_TIMEOUT);
+        match self.cp_route(table, &first, deadline).await {
             CpRoute::Local(leader) => {
                 // ADR 0050 rung 5 (fork F7): a resolve landing on a frozen
                 // parent is refused retryably — post-cutover the identical
@@ -811,7 +830,10 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     keys,
                     outcome,
                 };
-                match self.cp_forward(table, &first, addr, hinted, request).await {
+                match self
+                    .cp_forward(table, &first, addr, hinted, request, deadline)
+                    .await
+                {
                     ClientResponse::TxnResolved { outcome } => Ok(outcome),
                     ClientResponse::Error(e) => Err(e),
                     other => Err(format!(
@@ -898,7 +920,9 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         record_table: &str,
         record_key: &[u8],
     ) -> Result<TxnDecisionStatus, String> {
-        match self.cp_route(record_table, record_key).await {
+        // Issue #961: one caller-minted deadline for this single-shot call.
+        let deadline = self.env.now().saturating_add(CLIENT_TIMEOUT);
+        match self.cp_route(record_table, record_key, deadline).await {
             CpRoute::Local(leader) => leader
                 .txn_status_local(record_key)
                 .await
@@ -909,7 +933,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     record_key: record_key.to_vec(),
                 };
                 match self
-                    .cp_forward(record_table, record_key, addr, hinted, request)
+                    .cp_forward(record_table, record_key, addr, hinted, request, deadline)
                     .await
                 {
                     ClientResponse::TxnStatusReply { status } => Ok(status),
@@ -946,7 +970,9 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         record_table: &str,
         record_key: &[u8],
     ) -> Result<Option<animus_cp_data::TxnRecordView>, String> {
-        match self.cp_route(record_table, record_key).await {
+        // Issue #961: one caller-minted deadline for this single-shot call.
+        let deadline = self.env.now().saturating_add(CLIENT_TIMEOUT);
+        match self.cp_route(record_table, record_key, deadline).await {
             CpRoute::Local(leader) => leader
                 .txn_record_view(record_key)
                 .await
@@ -957,7 +983,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     record_key: record_key.to_vec(),
                 };
                 match self
-                    .cp_forward(record_table, record_key, addr, hinted, request)
+                    .cp_forward(record_table, record_key, addr, hinted, request, deadline)
                     .await
                 {
                     ClientResponse::TxnRecordViewReply { view } => Ok(view),
@@ -981,7 +1007,9 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         span: &KeyRange,
         txn_id: &TxnId,
     ) -> Result<bool, String> {
-        match self.cp_route(table, &span.start).await {
+        // Issue #961: one caller-minted deadline for this single-shot call.
+        let deadline = self.env.now().saturating_add(CLIENT_TIMEOUT);
+        match self.cp_route(table, &span.start, deadline).await {
             CpRoute::Local(leader) => leader
                 .txn_verify_staged(span, txn_id)
                 .await
@@ -993,7 +1021,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     txn_id: txn_id.clone(),
                 };
                 match self
-                    .cp_forward(table, &span.start, addr, hinted, request)
+                    .cp_forward(table, &span.start, addr, hinted, request, deadline)
                     .await
                 {
                     ClientResponse::TxnVerifyReply { staged } => Ok(staged),
@@ -1185,7 +1213,16 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 let Some(hint_ts) = intent_ts_hint else {
                     return Ok(TxnDecisionStatus::Pending);
                 };
-                let route = self.cp_route(record_table, record_key).await;
+                // Issue #961: a bare clock-read call, not a forward — mint
+                // its own one-off `CLIENT_TIMEOUT` budget the way every
+                // other single-shot `cp_route` call in this file does.
+                let route = self
+                    .cp_route(
+                        record_table,
+                        record_key,
+                        self.env.now().saturating_add(CLIENT_TIMEOUT),
+                    )
+                    .await;
                 let now_ms = recovery_grace_now_ms(&self.env, &route);
                 if now_ms < hint_ts.wall_ms + animus_cp_data::RECOVERY_GRACE.as_millis() as u64 {
                     return Ok(TxnDecisionStatus::Pending);
@@ -1242,7 +1279,15 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         // always resolves *some* local or forwarded leader for `record_key`
         // itself, so re-route here rather than plumb a fresh `Env` handle
         // through just for a clock read.
-        let route = self.cp_route(record_table, record_key).await;
+        // Issue #961: a bare clock-read call, not a forward — see the
+        // matching comment on this method's other `cp_route` call above.
+        let route = self
+            .cp_route(
+                record_table,
+                record_key,
+                self.env.now().saturating_add(CLIENT_TIMEOUT),
+            )
+            .await;
         let now_ms = recovery_grace_now_ms(&self.env, &route);
         if now_ms < view.created_ts.wall_ms + animus_cp_data::RECOVERY_GRACE.as_millis() as u64 {
             return Ok(TxnDecisionStatus::Pending);

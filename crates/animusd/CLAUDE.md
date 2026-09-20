@@ -2525,6 +2525,69 @@ local group to elect (never forwards to a non-leader, including itself, during
 election). **One-hop invariant**: the receiver (`cp_serve_forwarded`) never
 re-forwards.
 
+**`cp_route`/`cp_forward`/`forward_to_tablet_leader` all take a caller-minted
+`deadline: Nanos`, never mint their own (issue #961, fixed).** Each used to
+independently compute `now + CLIENT_TIMEOUT` (or, for a tablet-id-addressed
+internal RPC, `now + SCHEMA_COMMIT_TIMEOUT`) the instant it was called — so
+one logical attempt (`cp_route` resolving via the cross-replica fan-out,
+immediately followed by `forward_to_tablet_leader` chasing the resolved
+hint) could cost up to ~2x its caller's own nominal budget before that
+caller's own outer retry loop ever got to check its deadline: `cp_route`
+burning most of a 10s `CLIENT_TIMEOUT` on a slow fan-out, then handing off
+to a `forward_to_tablet_leader` that mints a **fresh** 10s budget of its
+own for a hop that then also stalls. Fixed by threading ONE deadline
+through all three: every composing call site (`cp_read`/`cp_read_snapshot`/
+`cp_scan_one`/`cp_scan_kind_one`, `cp_kind_write_item`/
+`cp_kind_write_raw_bounded`, `force_seal_tablet`/`force_pitr_seal_tablet`/
+`grow_stream_tablet`/`clear_backfill_cursor_tablet`/
+`read_stream_hot_records`/`stream_hot_change_max`, and the six
+single-shot 2PC RPCs in `txn_coordinator.rs` — `txn_prepare`/
+`txn_decide_anchor`/`txn_resolve_participant`/`txn_status`/
+`txn_record_view`/`txn_verify`) mints its own deadline exactly once, at
+the top of its own loop (or, for a single-shot call, at the top of the
+call itself), and passes that SAME value into every `cp_route`/
+`cp_forward`/`forward_to_tablet_leader` call it makes. The per-hop caps
+(`FORWARD_HOP_TIMEOUT`, `HINTED_FORWARD_HOP_TIMEOUT`,
+`CP_ROUTE_FANOUT_PROBE_TIMEOUT`, `CP_ROUTE_LOCAL_SUB_BUDGET`) are
+unchanged — they still bound one sub-step within a phase; what changed is
+that a hop's own timeout is now `min(cap, deadline - now)` against the
+ONE shared deadline, not a locally re-derived one. `ClientCtx::relay`
+(the plain one-shot relay wrapper, used by schema-DDL relay) keeps its own
+flat `CLIENT_TIMEOUT` default — it has no shared budget to spend from,
+since nothing upstream of it mints one. Regression:
+`sim_cluster_cp_route_fanout.rs`'s `deadline_budget_tests` module (a
+`cp_route` fan-out that burns most of the budget, followed by a resolved-
+but-unreachable hinted hop — the deterministic `SimEnv` stand-in for a
+genuinely slow-but-live replica, since a partitioned peer and a merely
+slow one are indistinguishable to `SimRelayClient`).
+
+**Sharing one budget means `forward_to_tablet_leader` now exhausts it more
+often — and its exhaustion is reported as retryable, not as the last hop's
+raw error (issue #961, same day).** Before this fix, exhaustion while
+still chasing a TRANSIENT condition (a timed-out hop, a confirmed-dead
+transport, or a not-yet-elected leader) returned that last hop's own raw
+response verbatim — a relay timeout / transport-failure / not-leader-
+refusal string carrying no `"; retry"` suffix, so `decide::
+read_should_retry`'s house convention (transient iff the message ends in
+`"; retry"`) classified it as terminal. Under the old doubled-budget
+behavior this branch was rarely reached in practice; sharing one deadline
+makes it routine, so a caller's own retry loop (`cp_kind_write_raw_
+bounded`, a test's own retry helper, eventually the DynamoDB wire's typed
+error mapping) started seeing a merely-exhausted transient chase as a
+permanent failure. Fixed: `forwarding.rs`'s `FORWARD_BUDGET_EXHAUSTED`
+message (built by the small pure `format_forward_budget_exhausted`
+helper, unit-tested directly) is returned instead, always suffixed
+`"; retry"` and citing the last hop's own failure for diagnosis — a
+caller's loop, and the DynamoDB client, see a transient condition, never
+the last hop's raw transport error. A genuine application-level refusal
+from a live, leading peer is unaffected — that arm still `return`s `resp`
+verbatim, since it is a real answer, not an exhaustion. The top of the hop
+loop also now guards against issuing a hop with zero time left at all,
+returning the same exhaustion shape rather than a zero-timeout relay call.
+See `docs/lessons/code-patterns/2026-09-19-shortening-a-shared-budget-
+exposes-its-exhaustion-path-which-must-still-classify-as-transient.md`
+for the general lesson.
+
 **Cross-replica leader-hint fan-out on a stale local view (issue #950,
 fixed).** The "waits for the local group to elect" branch above used to be
 **unconditional and purely local**: if this node hosts a replica of the

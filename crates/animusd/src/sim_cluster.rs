@@ -1171,7 +1171,12 @@ impl SimClusterHandle {
     /// whether a subsequent forward hop can physically complete under
     /// whatever fault the scenario also has in place.
     pub(crate) async fn cp_route(&self, node: u64, table: &str, key: &[u8]) -> CpRouteOutcome {
-        self.ctx(node).cp_route(table, key).await.into()
+        let ctx = self.ctx(node);
+        // Issue #961: `cp_route` no longer mints its own deadline — mint
+        // the identical `CLIENT_TIMEOUT` budget a production caller would,
+        // here at the one place this harness calls it standalone.
+        let deadline = ctx.env.now().saturating_add(CLIENT_TIMEOUT);
+        ctx.cp_route(table, key, deadline).await.into()
     }
 
     /// Write `value` at `(pk, sk)` in `table`, issued from `node`'s own
@@ -3973,6 +3978,115 @@ impl SimCluster {
             }
         }
         (self.sim.now().duration_since(start), CpRouteOutcome::None)
+    }
+
+    /// **Issue #961 regression driver.** Spawns `fut` (already bound to
+    /// `node`'s own env) and steps the simulator forward in `step`
+    /// increments up to `max_total`, healing `heal_pair` the first time
+    /// elapsed virtual time reaches `heal_at` — the one mid-call network
+    /// mutation no existing spawn/capture helper interleaves (`SimCluster::
+    /// put`/`get`/`spawn_and_capture` each drive one uninterrupted
+    /// `OP_BUDGET` burst with no interleaving point at all). This is what
+    /// lets a single logical attempt reproduce BOTH stalls issue #961 fixed
+    /// — a `cp_route` fan-out that finds nothing for a while, then a
+    /// resolved forward hint that itself stalls — deterministically rather
+    /// than merely plausibly. Never panics on exhaustion: returns
+    /// `max_total` elapsed and a `"did not resolve"` error instead,
+    /// mirroring [`cp_route_timed`](Self::cp_route_timed)'s own convention.
+    fn spawn_stepped_with_heal(
+        &mut self,
+        node: u64,
+        fut: std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>,
+        heal_pair: (u64, u64),
+        heal_at: Duration,
+        step: Duration,
+        max_total: Duration,
+    ) -> (Duration, Result<(), String>) {
+        let env = self.shared.env(node);
+        let slot: Arc<Mutex<Option<Result<(), String>>>> = Arc::new(Mutex::new(None));
+        let out = slot.clone();
+        let start = self.sim.now();
+        env.spawn_task(async move {
+            let result = fut.await;
+            *out.lock().expect("result slot poisoned") = Some(result);
+        });
+        let mut healed = false;
+        loop {
+            let elapsed = self.sim.now().duration_since(start);
+            if elapsed >= max_total {
+                break;
+            }
+            if !healed && elapsed >= heal_at {
+                self.sim.heal(nid(heal_pair.0), nid(heal_pair.1));
+                healed = true;
+            }
+            self.sim.run_for(step);
+            if slot.lock().expect("result slot poisoned").is_some() {
+                break;
+            }
+        }
+        let elapsed = self.sim.now().duration_since(start);
+        let result = slot
+            .lock()
+            .expect("result slot poisoned")
+            .take()
+            .unwrap_or_else(|| Err("op did not resolve within max_total".into()));
+        (elapsed, result)
+    }
+
+    /// **Issue #961 regression**: drive `ClientCtx::cp_kind_write_raw` on
+    /// `node` for one raw base-kind write of `key`/`value`, healing
+    /// `heal_pair` partway through — see
+    /// [`spawn_stepped_with_heal`](Self::spawn_stepped_with_heal)'s own doc
+    /// for the mechanism and why this needs its own stepped driver rather
+    /// than [`SimCluster::put`].
+    #[allow(clippy::too_many_arguments)] // a stepped fault-schedule driver's full shape
+    pub(crate) fn deadline_regression_write(
+        &mut self,
+        node: u64,
+        table: &str,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        heal_pair: (u64, u64),
+        heal_at: Duration,
+        step: Duration,
+        max_total: Duration,
+    ) -> (Duration, Result<(), String>) {
+        let ctx = self.shared.ctx(node);
+        let table = table.to_owned();
+        let fut: std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>> =
+            Box::pin(async move {
+                ctx.cp_kind_write_raw(&table, vec![(KIND_BASE, key, Some(value))], Vec::new())
+                    .await
+            });
+        self.spawn_stepped_with_heal(node, fut, heal_pair, heal_at, step, max_total)
+    }
+
+    /// **Issue #961 regression**: drive `ClientCtx::cp_read` (`Strong`
+    /// consistency — the linearizable, `cp_route`+`cp_forward`-bound path
+    /// this whole fix is about) on `node` for `key`, healing `heal_pair`
+    /// partway through — see [`spawn_stepped_with_heal`](Self::
+    /// spawn_stepped_with_heal)'s own doc for the mechanism.
+    #[allow(clippy::too_many_arguments)] // a stepped fault-schedule driver's full shape
+    pub(crate) fn deadline_regression_read(
+        &mut self,
+        node: u64,
+        table: &str,
+        key: Vec<u8>,
+        heal_pair: (u64, u64),
+        heal_at: Duration,
+        step: Duration,
+        max_total: Duration,
+    ) -> (Duration, Result<(), String>) {
+        let ctx = self.shared.ctx(node);
+        let table = table.to_owned();
+        let fut: std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>> =
+            Box::pin(async move {
+                ctx.cp_read(&table, key, ReadConsistency::Strong)
+                    .await
+                    .map(|_| ())
+            });
+        self.spawn_stepped_with_heal(node, fut, heal_pair, heal_at, step, max_total)
     }
 
     /// Run a console HTTP request against `node`'s own `ClientCtx` (ADR

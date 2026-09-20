@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use animus_cp_data::hlc;
 use animus_cp_data::{TxnDecisionStatus, TxnOutcome};
-use animus_env::{Env, Metric, NodeId};
+use animus_env::{Env, Metric, Nanos, NodeId};
 use animus_node::host::RelayClient;
 use animus_tablet::{KeyRange, TabletId};
 
@@ -21,6 +21,56 @@ use crate::{
     RELAY_TRANSPORT_FAILURE, SCHEMA_POLL_INTERVAL, STALE_READ_REFUSAL, STREAM_GROW_NO_SPLIT_POINT,
     SnapshotRead, TxnAbortReason, decide, dynamo, index_drain, median_split_key, topology,
 };
+
+/// The plain-text prefix on the error [`ClientCtx::forward_to_tablet_leader`]
+/// returns when its own whole-attempt `deadline` is exhausted while still
+/// chasing a **transient** condition (a timed-out hop, a confirmed-dead
+/// transport, or a not-yet-elected leader) — as opposed to a genuine
+/// application-level failure from a live, leading peer, which is returned
+/// verbatim (see that method's own doc).
+///
+/// **Issue #961**: once `cp_route`/`cp_forward`/`forward_to_tablet_leader`
+/// began sharing ONE caller-minted deadline instead of each re-minting its
+/// own, the chase runs out of budget more often than before — and used to
+/// return the LAST HOP's raw response in that case: a relay timeout /
+/// transport failure / not-leader-refusal string with no `"; retry"`
+/// suffix, so `decide::read_should_retry` (the house convention: an error is
+/// transient iff it ends in `"; retry"`) classified it as terminal, and
+/// every caller (`cp_kind_write_raw_bounded`, a test's own retry helper,
+/// eventually the DynamoDB wire's typed error mapping) treated a
+/// merely-exhausted transient chase as a permanent failure. This prefix —
+/// via [`format_forward_budget_exhausted`] — always ends in `"; retry"`, so
+/// the house convention classifies it correctly: the caller's own retry
+/// loop (or, eventually, the DynamoDB client) sees a transient condition,
+/// never the last hop's raw transport error.
+const FORWARD_BUDGET_EXHAUSTED: &str =
+    "forward to tablet leader: budget exhausted chasing the leader";
+
+/// Format [`FORWARD_BUDGET_EXHAUSTED`]'s full message, citing the last
+/// hop's own (transient) failure for diagnosis. Pure and clock-free — safe
+/// to call from this module, which carries a hard
+/// `#[deny(clippy::disallowed_methods)]` (ADR 0061 Phase C's closing rung).
+fn format_forward_budget_exhausted(last_hop_error: &str) -> String {
+    format!("{FORWARD_BUDGET_EXHAUSTED} (last hop: {last_hop_error}); retry")
+}
+
+#[cfg(test)]
+mod forward_budget_exhausted_tests {
+    use super::{FORWARD_BUDGET_EXHAUSTED, format_forward_budget_exhausted};
+
+    /// The one property every caller actually depends on: the house
+    /// `"; retry"` retryability convention must classify this message as
+    /// transient (issue #961) — a caller's own loop, or the DynamoDB wire's
+    /// eventual typed mapping, must see "try again," never a terminal
+    /// error carrying the last hop's raw transport failure.
+    #[test]
+    fn always_ends_in_the_house_retry_suffix() {
+        let msg = format_forward_budget_exhausted("relay hop timed out");
+        assert!(msg.ends_with("; retry"), "{msg}");
+        assert!(msg.contains("relay hop timed out"), "{msg}");
+        assert!(msg.starts_with(FORWARD_BUDGET_EXHAUSTED), "{msg}");
+    }
+}
 
 impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// The client-API address `id` currently routes to, if known (ADR 0032
@@ -175,10 +225,21 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// [`forward_to_tablet_leader`](Self::forward_to_tablet_leader) chase for
     /// the rest. A fan-out round that finds nothing retries every
     /// [`CP_ROUTE_FANOUT_RETRY_INTERVAL`] (a real election needs more than
-    /// one round) — this call still never exceeds the overall
-    /// `CLIENT_TIMEOUT` deadline.
-    pub(crate) async fn cp_route(&self, table: &str, key: &[u8]) -> CpRoute<E> {
-        let deadline = self.env.now().saturating_add(CLIENT_TIMEOUT);
+    /// one round) — this call still never exceeds `deadline`.
+    ///
+    /// **`deadline` is caller-minted, never re-derived here (issue #961).**
+    /// Every caller already owns a single, whole-attempt budget (typically
+    /// `now + CLIENT_TIMEOUT`, sometimes `now + SCHEMA_COMMIT_TIMEOUT` for a
+    /// schema-adjacent forward) and mints it once at the top of its own
+    /// retry loop; this method (and [`cp_forward`](Self::cp_forward)/
+    /// [`forward_to_tablet_leader`](Self::forward_to_tablet_leader) below)
+    /// spend from that SAME deadline rather than each minting an
+    /// independent `now + CLIENT_TIMEOUT` of their own. Before this fix,
+    /// `cp_route` and the forward chase that usually follows it each
+    /// re-minted their own full budget, so one logical attempt (route, then
+    /// forward) could cost up to ~2x the nominal timeout before the
+    /// caller's own outer loop ever got to check its deadline.
+    pub(crate) async fn cp_route(&self, table: &str, key: &[u8], deadline: Nanos) -> CpRoute<E> {
         let mut next_fanout_at = self.env.now().saturating_add(CP_ROUTE_LOCAL_SUB_BUDGET);
         let mut fanned_out = false;
         loop {
@@ -492,6 +553,11 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// third continuation). See
     /// [`forward_to_tablet_leader`](Self::forward_to_tablet_leader)'s own
     /// doc for why this governs the very first hop's timeout.
+    ///
+    /// `deadline` is the caller's own single, whole-attempt budget —
+    /// threaded straight through to [`forward_to_tablet_leader`], never
+    /// re-derived here (issue #961; see [`cp_route`](Self::cp_route)'s
+    /// matching doc).
     pub(crate) async fn cp_forward(
         &self,
         table: &str,
@@ -499,9 +565,10 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         addr: String,
         hinted: bool,
         request: ClientRequest,
+        deadline: Nanos,
     ) -> ClientResponse {
         let tablet = self.tablet_for(table, key);
-        self.forward_to_tablet_leader(tablet, addr, hinted, request)
+        self.forward_to_tablet_leader(tablet, addr, hinted, request, deadline)
             .await
     }
 
@@ -655,14 +722,42 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// genuinely slow-but-live leader actually finish once the chase is
     /// pointed at it with a real vouch behind it, rather than merely being
     /// retried at it forever with the same 2-second wall each time.
+    ///
+    /// **`deadline` is caller-minted, never re-derived here (issue #961).**
+    /// This used to mint its own `now + CLIENT_TIMEOUT` on every call,
+    /// independent of whatever budget the caller's own retry loop (or
+    /// [`cp_route`](Self::cp_route), which usually runs immediately before
+    /// this) was already tracking — so one logical write/read/schema
+    /// attempt could burn up to ~2x its nominal timeout (a full `cp_route`
+    /// wait, then a full independent forward chase) before the caller's
+    /// own outer deadline check ever ran. Every caller now passes the SAME
+    /// deadline it mints once at the top of its own loop (`CLIENT_TIMEOUT`
+    /// for an ordinary client op, `SCHEMA_COMMIT_TIMEOUT` for a
+    /// tablet-id-addressed internal RPC), so this hop-capping logic still
+    /// bounds any one hop as before, but the WHOLE chase — and, when
+    /// [`cp_route`] shares the identical deadline, the routing wait ahead
+    /// of it too — is now bounded by that one shared budget, not a fresh
+    /// one minted per call.
+    ///
+    /// **Exhaustion is reported as retryable, not as the last hop's raw
+    /// error (issue #961).** Sharing one budget means this chase now runs
+    /// out of it more often than before; when that happens while still
+    /// chasing a TRANSIENT condition (a timed-out hop, a confirmed-dead
+    /// transport, or a not-yet-elected leader — never a genuine
+    /// application-level refusal from a live peer, which is still returned
+    /// verbatim), this method returns [`FORWARD_BUDGET_EXHAUSTED`] via
+    /// [`format_forward_budget_exhausted`] instead of that last hop's own
+    /// raw response, so the house `"; retry"` convention
+    /// (`decide::read_should_retry`) classifies it as transient for every
+    /// caller's own retry loop, rather than as a terminal failure.
     pub(crate) async fn forward_to_tablet_leader(
         &self,
         tablet: Option<TabletId>,
         addr: String,
         hinted: bool,
         request: ClientRequest,
+        deadline: Nanos,
     ) -> ClientResponse {
-        let deadline = self.env.now().saturating_add(CLIENT_TIMEOUT);
         let mut tried: BTreeSet<String> = BTreeSet::new();
         // Issue #585, continued: addresses whose hop merely ran out of its
         // own capped timeout (RELAY_HOP_TIMEOUT) — not confirmed dead, so
@@ -679,6 +774,21 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         loop {
             tried.insert(next.clone());
             let remaining = deadline.duration_since(self.env.now());
+            // Issue #961: the whole-attempt budget can already be gone
+            // before this hop ever gets a chance to run (a prior hop, or
+            // the `WaitElection` backoff below, can consume the very last
+            // of it). Issuing a relay call with a zero timeout here would
+            // be a hop in name only — some `RelayClient` implementors treat
+            // a zero timeout as "wait forever" rather than "fail
+            // immediately" — so this returns the same exhaustion shape the
+            // two mid-loop exhaustion exits below use, rather than ever
+            // issuing a zero-budget hop. No hop has run this iteration yet,
+            // so there is no "last hop" error of its own to cite.
+            if remaining.is_zero() {
+                return ClientResponse::Error(format_forward_budget_exhausted(
+                    "no time remained to attempt a hop",
+                ));
+            }
             // Issue #585 / #585 third continuation: cap a GUESSED hop to
             // `FORWARD_HOP_TIMEOUT`; issue #900 follow-up: cap a HINTED hop
             // to the more generous `HINTED_FORWARD_HOP_TIMEOUT` instead of
@@ -761,10 +871,20 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 timed_out.remove(&next);
                 hint
             } else {
+                // A genuine application-level failure from a live, leading
+                // peer (e.g. a rejected propose) — a real answer, not an
+                // exhaustion; return it verbatim, unlike the two exhaustion
+                // exits below.
                 return resp;
             };
             if self.env.now() >= deadline {
-                return resp;
+                // Issue #961: every arm that reaches here classified `e` as
+                // TRANSIENT (a timed-out hop, a confirmed-dead transport, or
+                // a parsed not-leader refusal) — the genuinely terminal case
+                // already returned above. Report the exhaustion, not the
+                // last hop's raw error, so the house `"; retry"` convention
+                // classifies this correctly.
+                return ClientResponse::Error(format_forward_budget_exhausted(e));
             }
             let other = tablet.and_then(|t| self.other_tablet_replica_addr(t, &tried));
             // The pure decision (ADR 0061 A6) over the already-gathered
@@ -786,7 +906,11 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     // re-run the pass — bounded by the same overall deadline.
                     let remaining = deadline.duration_since(self.env.now());
                     if remaining.is_zero() {
-                        return resp;
+                        // Issue #961: reached only via a transient arm
+                        // above (same reasoning as the exhaustion exit
+                        // right after this loop's hop) — report the
+                        // exhaustion, not `e`'s raw shape.
+                        return ClientResponse::Error(format_forward_budget_exhausted(e));
                     }
                     self.env
                         .sleep(FORWARD_ELECTION_BACKOFF.min(remaining))
