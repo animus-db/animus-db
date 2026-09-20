@@ -1580,6 +1580,60 @@ unchanged. Independent of `E2E_TLS` — either, both, or neither may be set.
 `bash -n`-checked but never run end to end anywhere; the first real
 `e2e-kind-s3` CI run is this leg's first real test.
 
+**`E2E_S3_TLS=1` (issue #991, CI's own `e2e-kind-s3-tls` job) runs the
+`E2E_S3=1` leg above over a real `https://` endpoint** — implies `E2E_S3=1`
+even if left unset. Before this leg, `animus-s3`'s outbound TLS path
+(`prod::build_tls_connector`, root store from `rustls_native_certs::
+load_native_certs`, i.e. only whatever the runtime image's own
+`ca-certificates` package populates) was proven *present* but never proven
+*sufficient* — nothing drove a real TLS handshake through it (filed after
+PR #862/#854 closed the "present" half; see that PR's own follow-up note).
+RustFS gets a second, TLS-terminating container in front of its own
+plaintext port (a pinned `nginx` sidecar reverse-proxying `9443 ->
+127.0.0.1:9000`, with buffering disabled and the request forwarded with no
+URI rewrite so SigV4's own canonical-request signature still matches what
+RustFS receives), fronted by a cert-manager `Certificate` off the *same* CA
+hierarchy `E2E_TLS` installs (shared between the two flags — the cert-
+manager install and CA-hierarchy bring-up are now gated on `E2E_TLS=1 ||
+E2E_S3_TLS=1` — even though each flag still issues its own leaf), and
+`spec.s3.backupStore` points at `https://rustfs.<ns>.svc:9443` with no
+`insecure_http`/`allowInsecureHttp` anywhere. **Trust is baked into a
+derived image, not `kubectl exec`ed into a running pod** — the runtime
+image runs as non-root `USER animus:animus` (`Dockerfile`), and
+`update-ca-certificates` needs root to write `/etc/ssl/certs`; there is
+also no product hook to reach for instead, since `spec.tls`'s CA feeds
+rustls's own mTLS config directly and is never merged into the OS store the
+S3 path reads. So this leg builds a small derived image (`FROM
+$ANIMUSD_IMAGE`, `USER root`, `COPY` the e2e CA in,
+`RUN update-ca-certificates`, back to `USER animus:animus`), `kind load`s
+it, and points the `AnimusCluster`'s own `spec.image` at it instead of the
+untrusted base — which is also the honest production shape for a
+private-CA S3 endpoint (see `deploy/operator/README.md`'s own S3 section).
+The **positive** check is every pod going `Ready` on that derived image
+plus the pre-existing `CreateBackup`/`DescribeBackup`/`GET
+/admin/backup-store` round trip succeeding over that `https://` endpoint —
+proving *sufficiency*, since a wrong cert or a broken sidecar fails
+`animusd`'s own startup probe (`build_backup_store` ->
+`verify_or_init_segment_store_marker`, which reads the configured backup
+store at node startup) before any pod goes Ready. The **negative** check
+runs a one-off `--restart=Never` pod on the *untrusted* `$ANIMUSD_IMAGE`
+(`animusd --cluster 1 --ephemeral --backup-store 's3://...?
+endpoint=https://...'`, credentials via the `ANIMUS_S3_ACCESS_KEY_ID`/
+`ANIMUS_S3_SECRET_ACCESS_KEY` env fallback) and asserts it reaches pod
+phase `Failed` with both `TLS handshake with rustfs.<ns>.svc:9443` and
+`UnknownIssuer` in its logs, run *before* the `AnimusCluster` is even
+applied — proving the positive case is not vacuously permissive. An
+independent `aws --ca-bundle` pre-check from the bucket-creation pod
+isolates a sidecar/cert problem from an `animusd` trust-store problem
+before either question reaches an actual cluster pod. The plain-TCP path
+(`E2E_S3_TLS` unset) is byte-for-byte unchanged. **UNVERIFIED in this
+repository's sandboxed dev environment**, same `CAP_SYS_RESOURCE` reason as
+every leg above — written carefully and `bash -n`-checked (every heredoc
+rendered with its variables set and parsed as YAML, the `nginx.conf`
+confirmed to carry a literal `$http_host`) but never run end to end
+anywhere; the first real `e2e-kind-s3-tls` CI run is this leg's first real
+test.
+
 **`E2E_ENCRYPTION=1` (ADR 0069 S-03 PR 3, CI's own `e2e-kind-encryption`
 job) runs the same smoke plus a `spec.encryptionKeySecretName` leg**: no
 extra in-cluster dependency (unlike RustFS for `E2E_S3`) — creates the

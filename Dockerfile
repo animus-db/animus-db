@@ -140,9 +140,15 @@ LABEL org.opencontainers.image.source="https://github.com/animus-db/animus-db" \
 # ca-certificates package populates. Without it that store is empty, every
 # peer certificate is untrusted, and every HTTPS object-store operation fails
 # the handshake at runtime with nothing catching it earlier — the cargo gates
-# never build this image, and the S3 e2e leg deliberately uses plaintext
-# `http://` MinIO. Otherwise no extra runtime packages: the binaries are
-# dynamically linked against glibc only, which bookworm-slim already ships.
+# never build this image. `scripts/e2e-kind.sh`'s plain `e2e-kind-s3` leg
+# (`E2E_S3=1`) talks to its RustFS target over plaintext `http://` by
+# design, but `e2e-kind-s3-tls` (`E2E_S3_TLS=1`, issue #991) drives a real
+# `https://` endpoint and its own negative check (an untrusted image's pod
+# failing the same handshake with `UnknownIssuer`) is what proves this
+# package is the reason the trusted image's handshake succeeds — the trust
+# store is proven sufficient, not merely present. Otherwise no extra
+# runtime packages: the binaries are dynamically linked against glibc only,
+# which bookworm-slim already ships.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
