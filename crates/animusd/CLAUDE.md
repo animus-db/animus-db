@@ -11140,13 +11140,14 @@ the true "2 files / 6 tests" the day D4 PR 2 moved two tests out of
 | `cp_member_addresses_register_and_replicate` | `cp_plane.rs` | **Converted** → `sim_cluster_cp_plane.rs::cp_member_addresses_register_and_replicate` (+ `_over_seeds`) — `SimCluster::metadata(node).node_addrs` cross-node presence/identity, not literal `SocketAddr` parseability (no sim equivalent: `seed_members` registers bare `NodeId` strings as routing keys) |
 | `cp_tablet_splits_and_both_halves_serve` | `cp_plane.rs` | **Converted** → `sim_cluster_cp_plane.rs::cp_tablet_splits_and_both_halves_serve` (+ `_over_seeds`) — raw-KV `put_raw`/`raw_get` (literal byte keys, matching `trigger_split`'s own raw-byte `split_key` comparison) plus a manual split through `POST /admin/tablet/split`, the same dispatch `ClientRequest::SplitTablet` itself funnels into |
 | `single_write_latency_is_low` | `cp_plane.rs` | **Permanent, class A** — a wall-clock median over 50 real TCP round trips; `SimCluster`'s single-threaded virtual-time executor has no real scheduling/IO overhead for a sim median to regress against |
-| `tablet_auto_splits_on_bytes_with_skewed_value_sizes` | `cp_plane.rs` | [[SPIKE-OUTCOME]] |
+| `tablet_auto_splits_on_bytes_with_skewed_value_sizes` | `cp_plane.rs` | **Permanent (kept)** as the real `auto_split_loop` proof over `ProdEnv`, but no longer sim-*unreachable*: the raw-KV path (`put_raw` + `set_auto_split_thresholds`) sidesteps the DynamoDB-wire token-correlation problem D4 PR 2 recorded, so `sim_cluster_cp_plane.rs::tablet_auto_splits_on_bytes_with_skewed_value_sizes` (+ `_over_seeds`) now proves the byte-weighted-median balance (smaller child ≥15% of the bytes, every key in exactly one routable child) deterministically — see ADR 0061's Rung O amendment |
 | `cluster_serves_put_get_and_status_over_tcp` | `cluster.rs` | **Permanent** — the sole surviving real-socket proof of `bind_cluster`/`start_cluster`/`Node::bind` assembly plus a raw `ClientRequest` frame over TCP |
 | `per_process_nodes_form_a_cluster_from_shared_config` | `per_process.rs` | **Permanent**, and newly named as the D3 inventory's own never-named second file of the separate "`--config` bring-up 2/2" class-D line — same `run_node`→`Node::bind(addrs.id, ..)` identity family `config_node_identity.rs` pins (`lib.rs:14981`); `grep -n 'run_node\|bind_cluster\|Node::bind\|start_cluster' crates/animusd/src/sim_cluster*.rs` returns zero call sites, so `SimCluster` is structurally incapable of reaching either file's own subject |
 
 **`sim_cluster_cp_plane.rs` scenarios**: `cp_member_addresses_register_
-and_replicate` (+ `_over_seeds`) and `cp_tablet_splits_and_both_halves_
-serve` (+ `_over_seeds`) — four tests total, new module, declared
+and_replicate`, `cp_tablet_splits_and_both_halves_serve`, and `tablet_
+auto_splits_on_bytes_with_skewed_value_sizes` (each + `_over_seeds` at 5
+seeds) — six tests total, new module, declared
 alongside the other small `sim_cluster_*` modules in `lib.rs`'s `#[cfg(
 test)] mod` block.
 

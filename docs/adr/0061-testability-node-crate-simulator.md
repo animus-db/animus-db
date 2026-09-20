@@ -12507,7 +12507,7 @@ anything moves under it (see the new lessons entry below).
 | `cp_member_addresses_register_and_replicate` | `cp_plane.rs` | **Converted** → `sim_cluster_cp_plane.rs::cp_member_addresses_register_and_replicate` (+ `_over_seeds`), via `SimCluster::metadata(node).node_addrs`. Asserts presence and cross-node identity of every member's `node_addrs` entry — the real ADR 0032 PR1 replication property — rather than the original's incidental "parses as a `SocketAddr`" check, which has no sim equivalent: `SimCluster::seed_members` registers bare `NodeId` strings as `ClusterEdgeState`'s own routing keys, not real socket addresses, so `"0".parse::<SocketAddr>()` fails by construction under the fixture regardless of the production property being sound |
 | `cp_tablet_splits_and_both_halves_serve` | `cp_plane.rs` | **Converted** → `sim_cluster_cp_plane.rs::cp_tablet_splits_and_both_halves_serve` (+ `_over_seeds`), via `SimCluster::put_raw`/`raw_get` (literal, un-encoded byte keys — required because `ClientCtx::trigger_split`'s `split_key: Vec<u8>` compares raw stored-key bytes with no decoding step, exactly as this test's own literal ASCII keys do) and a manual split through `POST /admin/tablet/split`, the same `ClientCtx::trigger_split` dispatch `ClientRequest::SplitTablet` itself funnels into. Asserts the pre-split upper key served by the new half through a different node, the lower key still served by the original, and a new upper-range write round-tripping through a third node |
 | `single_write_latency_is_low` | `cp_plane.rs` | **Permanent, class A.** A wall-clock median over 50 real TCP round trips on a multi-thread runtime, regression-guarding the "wake-on-propose + adaptive confirm poll" latency fix. `SimCluster` runs one single-threaded deterministic `Simulator` whose time advances only when a caller calls `run_for`/an op's own `spawn_and_capture` step — there is no real scheduling/IO overhead for a virtual-time median to regress against, exactly the root `CLAUDE.md`'s own "`SimEnv` proves logic and ordering, not real-thread liveness" rule |
-| `tablet_auto_splits_on_bytes_with_skewed_value_sizes` | `cp_plane.rs` | [[SPIKE-OUTCOME]] |
+| `tablet_auto_splits_on_bytes_with_skewed_value_sizes` | `cp_plane.rs` | **Permanent (kept), with a new sim sibling.** The `ProdEnv` original stays as the real auto-split-loop proof of the byte-weighted median (it is the only test driving the real `auto_split_loop` timing end-to-end over `ProdEnv`). This rung's bounded spike, however, refuted the D4 PR 2 rationale that kept it `ProdEnv`-*only*: that rationale was about the DynamoDB-wire sim scenarios, whose item-key encoding hash-token-prefixes every key so an item `pk` cannot be correlated to a tablet's token range. The fixture's raw-KV path (`SimCluster::put_raw`, literal un-encoded keys) plus the pre-existing `SimCluster::set_auto_split_thresholds` (D4 PR 2's own primitive) never had that problem, so `sim_cluster_cp_plane.rs::tablet_auto_splits_on_bytes_with_skewed_value_sizes` (+ `_over_seeds`) now proves the same properties deterministically with zero production change: 6 tiny + 6 ~2000-byte values, a byte threshold of 8,000, no manual trigger, convergence polled; both halves serve, every written key falls in exactly one routable child's range, and the smaller child holds ≥15% of the total bytes (a positional median would give it under 1%). Passed at every seed on its first run |
 | `cluster_serves_put_get_and_status_over_tcp` | `cluster.rs` | **Permanent.** Survives as the sole real-socket proof of `bind_cluster`/`start_cluster`/`Node::bind` assembly plus a raw `ClientRequest` frame over TCP — the same production-assembly family `config_node_identity.rs` and `per_process.rs` pin from the `--config`/in-process-config side |
 | `per_process_nodes_form_a_cluster_from_shared_config` | `per_process.rs` | **Permanent**, and newly named here: the D3 inventory's own class-D "`--config` bring-up 2/2" line was never given its two file names anywhere in this ADR, `docs/roadmap.md`, or `crates/animusd/CLAUDE.md` — only `config_node_identity.rs` was ever re-labeled (Rung L, 2026-09-09) into its true reason (pinning `Node::bind`'s own identity-derivation path). `per_process.rs` is its unnamed sibling: it brings up 3 nodes independently via `animusd::run_node(&config, i, dir)` against a `ClusterConfig` round-tripped through JSON exactly as `--config FILE` would read it from disk, chaining through `run_node_with_cluster_settings` to the identical `Node::bind(addrs.id, ..)` call (`lib.rs:14981`) `config_node_identity.rs` pins. `grep -n 'run_node\|bind_cluster\|Node::bind\|start_cluster' crates/animusd/src/sim_cluster*.rs` returns zero call sites — `SimCluster` is structurally incapable of reaching this family at all, for either file |
 
@@ -12543,17 +12543,24 @@ behavior at all (two test conversions, one test deletion, zero
 production source lines), so nothing `website/` states about supported
 operations, architecture, or CLI surface is affected.
 
-**Gates:** this is a docs-only PR against `docs/adr/0061-testability-
-node-crate-simulator.md`, `crates/animusd/CLAUDE.md`, `docs/roadmap.md`,
-and new files under `docs/lessons/` — no Rust source, test, or
-`Cargo.lock` change of its own. The sibling code PR (`crates/animusd/
-tests/cp_plane.rs`, `crates/animusd/src/sim_cluster_cp_plane.rs`,
-`crates/animusd/src/lib.rs`) carries the actual test conversions and
-their own gate run (`cargo fmt --all --check`, `cargo clippy -p animusd
---all-targets --all-features -- -D warnings`, `cargo build -p animusd
---all-targets`, `cargo test -p animusd --lib`/`--test cp_plane`/`--test
-cluster`) — its own PR description has the counts; this PR ran no
-`cargo` command.
+**Gates:** one flat PR carrying both the docs close-out and the test
+conversions (`crates/animusd/tests/cp_plane.rs`, the new `crates/animusd/
+src/sim_cluster_cp_plane.rs`, its one `mod` line in `lib.rs`) — flat
+rather than stacked because the docs layer records the conversions'
+verdicts, so neither half is independently reviewable. Zero production
+code and no `Cargo.toml`/`Cargo.lock` change. Run one at a time on a
+session whose disk allowance a full `cargo build --workspace
+--all-targets` alone nearly exhausts (~90 animusd integration-test
+binaries at ~280 MB each — the build step was covered by clippy's own
+`--all-targets` type-check plus the linked test binaries below): `cargo
+fmt --all --check` (clean); `cargo clippy --workspace --all-targets
+--all-features -- -D warnings` (clean); `cargo test -p animusd --lib
+sim_cluster_cp_plane` (6 passed, 0 failed — three scenarios, each with
+an `_over_seeds` sibling at 5 seeds); `cargo test -p animusd --test
+cp_plane --test cluster` (3 passed, 0 failed — the three kept
+real-socket tests). `cargo deny check` could not run in the session
+(`cargo-deny` is not installed there); with no manifest or lockfile
+change its verdict is `main`'s own, and CI runs it.
 
 **Docs:** this amendment; the rung table row O; `docs/roadmap.md`'s new
 C-15 entry (after C-14) and sequencing-table row 16; `crates/animusd/

@@ -1489,8 +1489,13 @@ rows this section used to carry were fixed by the stale-prose sweep.
   node_addrs`; manual split via raw-KV `put_raw`/`raw_get` plus the real
   `POST /admin/tablet/split` dispatch); `single_write_latency_is_low`
   **permanent** (a real-TCP wall-clock median, class A); `tablet_auto_
-  splits_on_bytes_with_skewed_value_sizes` — see ADR 0061's "Rung O"
-  amendment for this rung's own spike outcome; `cluster_serves_put_get_
+  splits_on_bytes_with_skewed_value_sizes` **permanent (kept) but no
+  longer sim-unreachable** — this rung's bounded spike found the raw-KV
+  path (`put_raw` + `set_auto_split_thresholds`) sidesteps the
+  DynamoDB-wire token-correlation problem D4 PR 2 recorded, so a
+  deterministic sibling now proves the byte-weighted-median balance too
+  (`sim_cluster_cp_plane.rs`, three scenarios/six tests in all; see ADR
+  0061's "Rung O" amendment); `cluster_serves_put_get_
   and_status_over_tcp` **permanent** (the sole surviving real-socket
   proof of the `bind_cluster`/`start_cluster` assembly). A second finding
   along the way: `per_process.rs::per_process_nodes_form_a_cluster_
