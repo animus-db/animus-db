@@ -1246,9 +1246,24 @@ per-tablet CP data plane (`animus-cp-data`).
   the node becomes a `PreCandidate` and runs a `PreVote`/`PreVoteResp` round
   *without bumping its term*; only a pre-vote majority triggers the real,
   term-incrementing `start_election`. Peers grant a pre-vote only with **no live
-  leader** (lease = `leader_id.is_some() && now < election_deadline`, or `role ==
-  Leader`), so a briefly-stalled node can't inflate the term and disrupt a
-  healthy leader. Pre-vote messages **bypass** higher-term step-down — the sole
+  leader** — `role == Leader`, or `leader_id.is_some() && now < election_deadline`,
+  or (**issue #930, 2026-09-19**) a role-gated `voted_for.is_some() && now <
+  election_deadline` while still `Follower`/`Candidate` — so a briefly-stalled
+  node can't inflate the term and disrupt a healthy leader. The `voted_for` arm
+  closes a real gap: `leader_id` is set only by `handle_append_entries`/
+  `InstallSnapshot`/`become_leader`, never by a granted real vote, so a voter
+  that had just granted a real vote to the term's eventual winner had *no*
+  lease at all until that winner's first `AppendEntries` arrived — a window in
+  which a different, unprotected voter's own timeout could win a pre-vote (and
+  then real) election, deposing the just-elected leader. **The role gate is the
+  load-bearing part**: a role-less `voted_for.is_some()` check deadlocks the
+  ordinary post-leader-crash re-election, because every survivor already holds
+  a stale `voted_for` for the dead leader that a mere timeout never clears,
+  while `start_pre_vote` keeps refreshing `election_deadline` on every retry
+  round regardless — see ADR 0009's 2026-09-19 amendment and
+  `docs/lessons/code-patterns/2026-09-19-a-per-term-commitment-must-not-share-
+  a-deadline-a-different-retry-loop-refreshes.md`. Pre-vote messages **bypass**
+  higher-term step-down — the sole
   exception is a *rejecting* `PreVoteResp` with a higher real term, which reverts
   the pre-candidate to a follower at that term. Tick semantics: a multi-node
   election now needs a `PreVoteResp` grant fed before the real

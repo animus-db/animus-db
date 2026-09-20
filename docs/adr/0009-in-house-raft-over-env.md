@@ -185,7 +185,9 @@ up to date. Only on a **pre-vote majority** does the node call the existing
 - **The leader lease is `leader_id.is_some() && now < election_deadline`** (plus
   `role == Leader` for the leader itself) — data the core already tracks, evaluated
   at the injected `now`, so the whole decision stays a pure function of
-  `(state, message, now, entropy)`. No clock, no `HashMap`, no I/O.
+  `(state, message, now, entropy)`. No clock, no `HashMap`, no I/O. **Amended
+  2026-09-19 (issue #930, below)**: also covers a role-gated `voted_for.is_some()`
+  — `leader_id` alone left a granted real vote with no lease of its own.
 - **Single-node / trivial-majority groups still elect immediately:** `start_pre_vote`
   short-circuits to `start_election` when self alone is already a pre-vote majority.
 
@@ -214,11 +216,15 @@ ahead of one.
 
 Coverage: `tests/pre_vote.rs` — core-level (a live-leader lease rejects a pre-vote
 and the term is untouched; an expired lease grants; a timeout makes a pre-candidate
-without bumping the term) and end-to-end under `SimEnv` (an isolated follower's
-pre-vote rounds do not move the stable leader's term, and it rejoins on heal with
-no election; a genuine leader crash still elects a new leader at a higher term).
-The pre-existing hand-driven election tests (`follower_visibility`,
-`install_snapshot`, `driver_applied_sm`) now drive the pre-vote round explicitly.
+without bumping the term; a voter that just granted a real vote rejects a
+competing pre-vote until its own election deadline, issue #930 below; a
+`Candidate`'s own self-vote protects it the same way) and end-to-end under
+`SimEnv` (an isolated follower's pre-vote rounds do not move the stable
+leader's term, and it rejoins on heal with no election; a genuine leader
+crash still elects a new leader at a higher term). The pre-existing
+hand-driven election tests (`follower_visibility`, `install_snapshot`,
+`driver_applied_sm`) now drive the pre-vote round explicitly. See the
+2026-09-19 amendment below for the `voted_for`-lease gap and its fix.
 
 ## Amendment (2026-09-01): a lagging peer under sustained write load could
 never catch up — issues #532/#537, two cooperating fixes
@@ -871,3 +877,103 @@ coordinated whole-cluster restart racing a single voter's disk wipe is
 still not fully covered. This is unchanged from before either fix in this
 amendment — no prior mechanism covered it either — and remains a
 candidate follow-up, not a regression introduced here.
+
+## Amendment (2026-09-19): a just-granted real vote had no pre-vote lease of its own — issue #930
+
+**The problem.** The pre-vote leader lease (above) was `leader_id.is_some()
+&& now < election_deadline` — but `leader_id` is set only by
+`handle_append_entries`/`InstallSnapshot`/`become_leader`, never by
+`handle_request_vote` on a granted real vote. A voter that had just granted
+a real vote to the term's eventual winner therefore had `leader_id == None`
+— no lease at all — for the whole window between casting that vote and the
+winner's first `AppendEntries` actually arriving. If a *different* voter's
+own election timeout fired inside that window (plausible under real
+scheduling jitter or network degradation, never mind a deliberate
+partition), it could win a **pre-vote** round against these unprotected
+voters, then a **real** election (real votes have no live-leader gate at
+all — only pre-vote does), deposing the just-elected leader in a "return
+bout" that could occasionally chain. Not a safety violation — every step
+still followed Raft's term/log rules — but a liveness/stability defect.
+Found and recorded (not yet fixed) while authoring
+`animusd/src/sim_cluster_control_membership_admin.rs`'s issue #923
+regression; see `docs/lessons/code-patterns/2026-09-16-a-voter-that-just-
+granted-a-real-vote-has-no-pre-vote.md` for the original incident.
+
+**The fix.** `handle_pre_vote`'s lease now also covers a granted real vote,
+gated by role:
+
+```rust
+let voted_lease = matches!(self.role, Role::Follower | Role::Candidate)
+    && self.voted_for.is_some()
+    && now.0 < self.election_deadline.0;
+let has_live_leader = self.role == Role::Leader
+    || (self.leader_id.is_some() && now.0 < self.election_deadline.0)
+    || voted_lease;
+```
+
+A granted real vote is a per-term commitment to this term's likely winner
+(Raft's own vote-splitting safety already relies on it), and granting it
+already reset the granter's own `election_deadline`
+(`handle_request_vote`) — so `voted_for.is_some()` is exactly as
+trustworthy a lease signal as `leader_id.is_some()`, for that same window.
+
+**The role gate is load-bearing, not incidental — a naive, role-less
+`voted_for.is_some() && now < election_deadline` was tried first and
+deadlocked the most ordinary recovery case there is.** After a leader
+crashes, every surviving follower already has `voted_for = Some(<the dead
+leader>)` for the still-current term (that vote is how the leader got
+elected), and `voted_for` is never cleared by a mere timeout — only a
+higher term clears it, being a durable per-term commitment. Meanwhile
+`start_pre_vote` (the handler for a node's own election timeout) resets
+`election_deadline` on every pre-vote round it starts, forever, for as
+long as no majority is reached — a purely local retry cadence, unrelated
+to any vote. With no role gate, that stale vote for the now-dead leader
+combined with that perpetually-refreshed deadline to make every survivor
+believe it still had a live leader for as long as it kept timing out into
+fresh rounds — i.e. forever — so no survivor would ever grant another's
+pre-vote and the cluster could never re-elect. Caught immediately by the
+pre-existing `election_still_succeeds_when_leader_is_gone` test going from
+green to red under the naive draft. `RaftCore::tick`'s `Follower |
+PreCandidate | Candidate` arm moves a timed-out `Follower`/`Candidate` to
+`PreCandidate` in the same step its own `election_deadline` lapses, so
+gating the lease on role makes it expire at exactly that transition — a
+`PreCandidate` gets no protection from a `voted_for` it can no longer
+vouch for (only `leader_id`, already cleared the moment it starts
+campaigning itself).
+
+**Two consequences, not bugs.** (1) A `Candidate` sets `voted_for =
+Some(self)` atomically with a fresh `election_deadline` in
+`start_election`, so it is never stale — it now rejects a competing
+pre-vote for the rest of its own election deadline instead of granting it
+(the pre-fix behavior, since `leader_id` stays `None` for a whole
+candidacy). This is standard pre-vote behavior and reduces dueling
+candidacies rather than causing any. (2) `voted_for` is persisted and a
+recovered `RaftCore` always restarts as `Follower`
+(`RaftCore::recovered`), so a node that restarts with a vote already
+recorded for its current term refuses pre-votes for one full,
+freshly-randomized election-timeout window after restart, even though it
+has no live-leader belief of its own yet — a one-time, bounded startup
+cost (at most one election timeout, ~150–300ms), not a recurring one.
+
+**Coverage**: `animus-control/tests/pre_vote.rs`'s
+`prevote_rejected_after_granting_a_real_vote_until_deadline` (core-level,
+confirmed red before this fix and green after) and
+`prevote_rejected_by_a_candidate_within_its_own_election_deadline`
+(consequence 1, also confirmed red-before/green-after). A cluster-level
+`SimEnv` reproduction of the full "return bout" race (a directed transfer
+plus a brief total freeze of the new leader, swept over seeds 0..1000 at
+a freeze duration inside the election-timeout band) was attempted but
+abandoned: at freeze durations long enough to reliably reproduce a
+disruption, deposals turned out to occur at statistically indistinguishable
+rates before and after this fix (~8% either way), because in a 5-voter
+group multiple followers routinely cross their *own* natural timeout
+independently and duel each other directly — a scenario this fix
+correctly leaves alone (once a follower's own deadline lapses it is a
+`PreCandidate`, unprotected in both the old and new code, by design).
+Isolating the fix's specific effect at the cluster level — one lone
+early-timing-out voter needing exactly one still-protected voter's grant
+to reach majority — needs a scenario at least as tightly engineered as
+`transfer_third_voter_wins.rs`'s own (an exhaustive seed scan against a
+hand-picked topology), which was judged out of scope for this change; the
+core-level tests above pin the mechanism directly and exercise the exact
+code path the cluster race depends on.
