@@ -5868,6 +5868,34 @@ ADR itself for the full design/rationale.
   one connection with no read in between (a pipelined client) and asserts
   both responses come back in order and the metric stays at zero — the
   regression for `peer_closed`'s own peek-not-read distinction above.
+- **`BoundNode::start_with_growth`/`BoundDataNode::start_data_with_growth`/
+  `BoundControlNode::start_control_with` each spawn work (the control-plane
+  Raft driver via `RaftNode::start_*` on `self.env`, then `spawn_common_
+  tail`'s own bundle) and then still have fallible `?` steps left
+  (`build_segment_store`, `build_backup_store`, `check_wal_layout`,
+  `SharedWal::open`) — a private RAII guard, `StartupTasks`, owns every
+  task/env spawned so far and aborts/shuts them down on `Drop` while still
+  armed, so an early `?`-return can never leak them (issue #1010, layer
+  2 — the spawn-before-fallible-step sibling of the fire-and-forget-spawn
+  gotcha just above). It implements `DerefMut<Target =
+  Vec<JoinHandle<()>>>`, so every pre-existing `tasks.push(tokio::spawn(..))`
+  call site in these three methods compiles completely unchanged once the
+  local `tasks` binding is the guard (`let mut tasks = startup;`, after
+  `spawn_common_tail`'s own returned `Vec` is `.extend`ed in) rather than a
+  bare `Vec`; `.into_parts()` disarms it once no fallible step remains,
+  handing back `(tasks, envs)` for `Node`'s own construction. **`Drop`
+  cannot `.await`, so it only ever *requests* the abort/shutdown** — same
+  "not a guarantee" contract as `Node::shutdown` itself — a caller that
+  needs the freed ports provably back needs its own bounded
+  converged-or-timeout poll, not a single check right after the failing
+  call returns (`tests/bring_up_allocation.rs`'s own regression for this
+  does exactly that). `SharedWal::open` (`animus-control::shared_wal`) is
+  effectively infallible in practice (`unwrap_or_default()` swallows a read
+  error) — the WAL-layout failure this guard actually protects against in
+  the wild is `check_wal_layout` refusing a mismatched data directory
+  (`animus-cp-data::host`), reachable with the default `shared_wal: true`
+  (`main::DEFAULT_SHARED_WAL`) against a pre-existing per-group-WAL data
+  directory.
 - **`ClusterEdgeState` is scoped to one NODE** (ADR 0031 PR2), created fresh per
   node — even in `--cluster N`, which previously shared one instance across the
   cluster and masked cross-process bugs. Holds this node's own control handle, its

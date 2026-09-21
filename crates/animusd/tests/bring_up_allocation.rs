@@ -18,6 +18,159 @@ use animusd::RoleAddrs;
 
 mod support;
 
+/// Regression test for issue #1010 (layer 2): a node-assembly function
+/// (`BoundNode::start_with_growth` and its siblings) that has already
+/// spawned the control-plane Raft driver and `spawn_common_tail`'s own
+/// accept loops/background loops, and THEN hits a later fallible `?` step
+/// (`animus_cp_data::host::check_wal_layout` refusing a data directory
+/// whose on-disk WAL layout disagrees with the `shared_wal` flag), used to
+/// leak every task already spawned: the function's own `Vec<JoinHandle<_>>`/
+/// env-clone locals were simply dropped along with its early `return
+/// Err(..)`, with nothing left to abort the Raft driver or free the six
+/// listeners it had already bound and handed off to `spawn_common_tail`.
+/// `StartupTasks` (a private RAII guard in `lib.rs`) now aborts every task
+/// spawned so far and requests every env's shutdown on exactly this
+/// early-return path.
+///
+/// This drives that real failure end to end: bind a single node, write a
+/// bogus per-group WAL file (`raftkv.wal.1`) directly into its internal
+/// `ProdEnv`'s own data directory (`<dir>/internal/` — `Node::bind`'s own
+/// `dir.join("internal")`, the same directory `check_wal_layout` lists),
+/// then start it with `shared_wal: true` (the production default,
+/// `main::DEFAULT_SHARED_WAL`) — `check_wal_layout` refuses, since a
+/// per-group file alongside `shared_wal: true` is exactly the mismatch it
+/// exists to catch. Assert the returned error names the WAL-layout
+/// mismatch, then assert — a bounded converged-or-timeout poll, never a
+/// single check immediately after the failing call returns
+/// (`StartupTasks::Drop` can only *request* the abort/shutdown, never wait
+/// for it — `Drop` cannot `.await`) — that every one of this node's six
+/// addresses becomes bindable again.
+///
+/// **Verified RED on unfixed code**: temporarily reverting the
+/// `StartupTasks` guard in `lib.rs` (back to a bare `let envs =
+/// vec![self.env.clone()];` and `let (ctx, mut tasks) =
+/// spawn_common_tail(..);`, with nothing aborting/shutting down on the
+/// early return) makes the address-rebind poll below time out instead of
+/// ever converging — the leaked accept loops (holding the client/admin/
+/// intra/console/dynamo listeners `spawn_common_tail` already started, plus
+/// the internal `ProdEnv`'s own still-running Raft driver and accept loop)
+/// keep every one of the six addresses held. See this commit's own message
+/// for the captured red-run output.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_late_start_failure_leaks_no_task_or_port() {
+    let dir = support::panic_safe_tempdir();
+    let unbound = RoleAddrs {
+        id: animusd::config::node_id(0),
+        role: animusd::config::NodeRole::Both,
+        internal: SocketAddr::from(([127, 0, 0, 1], 0)),
+        client: SocketAddr::from(([127, 0, 0, 1], 0)),
+        dynamo: SocketAddr::from(([127, 0, 0, 1], 0)),
+        admin: SocketAddr::from(([127, 0, 0, 1], 0)),
+        intra: SocketAddr::from(([127, 0, 0, 1], 0)),
+        console: SocketAddr::from(([127, 0, 0, 1], 0)),
+        advertise_host: None,
+        tls: None,
+        encryption_key_path: None,
+    };
+    let bound = animusd::Node::bind(unbound.id.clone(), unbound, dir.path())
+        .await
+        .unwrap_or_else(|e| panic!("bind failed: {e}"));
+
+    // The `RoleAddrs` this node actually resolved to (`:0` becomes a real,
+    // OS-assigned port at bind time) — used both for `ClusterConfig` and,
+    // after the failed start below, for the address-rebind poll.
+    let resolved = RoleAddrs {
+        id: bound.id().clone(),
+        role: animusd::config::NodeRole::Both,
+        internal: bound.internal_addr(),
+        client: bound.client_addr(),
+        dynamo: bound.dynamo_addr(),
+        admin: bound.admin_addr(),
+        intra: bound.intra_addr(),
+        console: bound.console_addr(),
+        advertise_host: None,
+        tls: None,
+        encryption_key_path: None,
+    };
+    let config = animusd::ClusterConfig {
+        nodes: vec![resolved.clone()],
+        dynamo_auth: None,
+        cluster_settings: None,
+    };
+
+    // Write a bogus per-group WAL file straight into this node's internal
+    // `ProdEnv` data directory — before this node is ever started, so
+    // `check_wal_layout`'s directory listing (`Env::list`, non-recursive
+    // over exactly this directory) sees it on its one and only call.
+    let internal_dir = dir.path().join("internal");
+    std::fs::create_dir_all(&internal_dir).unwrap_or_else(|e| panic!("create internal dir: {e}"));
+    std::fs::write(
+        internal_dir.join(animus_cp_data::wal_file(1)),
+        b"bogus per-group wal content",
+    )
+    .unwrap_or_else(|e| panic!("write bogus per-group WAL file: {e}"));
+
+    // `Node` implements no `Debug`, so `Result::expect_err` (which requires
+    // the `Ok` side to) can't be used here — a plain `match` instead.
+    let err = match animusd::start_bound_node_with_streams_quiesce_and_ttl_sweep_interval(
+        bound,
+        &config,
+        0,
+        animusd::StorageBackend::Memory,
+        animus_control::node::DEFAULT_ORPHAN_SWEEP_AFTER,
+        animusd::StreamSealKnobs::default(),
+        animusd::SegmentStoreConfig::default(),
+        animusd::DEFAULT_STREAM_RETENTION,
+        Duration::ZERO, // quiesce_after: off
+        false,          // heartbeat_batch: off
+        None,           // auto_split_bytes
+        None,           // auto_split_change_rate
+        None,           // auto_split_ops_rate
+        animus_node::ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
+        animusd::BackupStoreConfig::default(),
+        animus_node::pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
+        None, // throttle_read_units
+        None, // throttle_write_units
+        None, // tablet_max_read_units
+        None, // tablet_max_write_units
+        None, // export_s3
+        true, // shared_wal: the production default (main::DEFAULT_SHARED_WAL)
+    )
+    .await
+    {
+        Ok(_) => panic!("a per-group WAL file alongside shared_wal: true must refuse to start"),
+        Err(e) => e,
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("per-group WAL file"),
+        "error must name the WAL-layout mismatch, got: {msg}"
+    );
+    assert!(
+        msg.contains("Refusing to start"),
+        "error must say it refused to start, got: {msg}"
+    );
+
+    // `StartupTasks::Drop` (issue #1010, layer 2) only ever *requests* the
+    // abort/shutdown — `Drop` cannot `.await`, so there is no synchronous
+    // guarantee here — hence a bounded poll rather than a single check
+    // right after the failing call returns.
+    let poll_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    for addr in every_addr(&resolved) {
+        loop {
+            if std::net::TcpListener::bind(addr).is_ok() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < poll_deadline,
+                "address {addr} never became bindable again after the failed start \
+                 (issue #1010: a leaked accept loop or Raft driver is still holding it)"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+}
+
 /// Two independent 3-node bring-ups, driven concurrently in one runtime via
 /// `tokio::join!`, never overlap on a single address — 36 distinct
 /// addresses across both clusters. If `bring_up_deadline` still probed and
