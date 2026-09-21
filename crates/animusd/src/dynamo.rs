@@ -194,7 +194,7 @@ use crate::http;
 use crate::write_path::KindEvalApplied;
 use crate::{
     ClientCtx, CpGroup, KindWriteBatchItem, KindWriteItemReply, KindWriteOp, ProbeIdentity,
-    ReadConsistency, SnapshotRead,
+    ReadConsistency, SnapshotRead, decide,
 };
 
 /// How long `CreateTable` waits for its `CreateTableSchema` proposal to commit in
@@ -632,6 +632,11 @@ fn error_status(err: &WireError) -> u16 {
         // DynamoDB returns 400 for client errors generally; 500 only for our own
         // internal failures (no quorum, corrupt stored bytes).
         "InternalServerError" => 500,
+        // A retry budget exhausted on a transient (never a genuine
+        // capacity) refusal — issue #994. DynamoDB's own documented
+        // `ServiceUnavailable`, 503, retried by every AWS SDK's default
+        // policy — see `WireError::service_unavailable`'s own doc.
+        "ServiceUnavailable" => 503,
         _ => 400,
     }
 }
@@ -10543,11 +10548,18 @@ pub(crate) const THROTTLE_READ_REFUSAL: &str = "provisioned throughput exceeded 
 /// [`WireError`] — [`THROTTLE_WRITE_REFUSAL`]/[`THROTTLE_READ_REFUSAL`]
 /// (both identical text, kept as two named constants purely so each call
 /// site documents which direction it means) become
-/// `ProvisionedThroughputExceededException`; everything else keeps the
-/// pre-ADR-0065 `internal(..)` fallback unchanged.
+/// `ProvisionedThroughputExceededException`; a transient, exhausted-retry
+/// refusal (the house `"; retry"` convention, `decide::read_should_retry`)
+/// becomes `WireError::service_unavailable` (issue #994 — covers
+/// `fast_marker_write`/`paginated_kind_examine`/`paginated_kind_examine_
+/// one`/`native_scan`/`raw_quorum_read`, every caller of this function);
+/// everything else keeps the pre-ADR-0065 `internal(..)` fallback
+/// unchanged.
 pub(crate) fn map_throttleable_error(message: String) -> WireError {
     if message == THROTTLE_WRITE_REFUSAL {
         WireError::provisioned_throughput_exceeded(message)
+    } else if decide::read_should_retry(&message) {
+        WireError::service_unavailable(message)
     } else {
         internal(&message)
     }
@@ -10599,6 +10611,7 @@ pub(crate) fn decode_relayed_error(raw: &str) -> WireError {
             "TransactionCanceledException" => Some("TransactionCanceledException"),
             "SerializationException" => Some("SerializationException"),
             "UnknownOperationException" => Some("UnknownOperationException"),
+            "ServiceUnavailable" => Some("ServiceUnavailable"),
             _ => None,
         };
         if let Some(code) = known {
@@ -10658,6 +10671,65 @@ mod relayed_error_tests {
         let unknown = decode_relayed_error("wire-error:MadeUpException:boom");
         assert_eq!(unknown.code, "InternalServerError");
         assert_eq!(unknown.message, "wire-error:MadeUpException:boom");
+    }
+
+    /// Issue #994: a `ServiceUnavailable` minted at a remote leader (a
+    /// retry-budget exhaustion mapped by `write_path::cp_kind_write_item`)
+    /// must survive the forwarded `KindWriteItem` hop with its own code —
+    /// the same round trip `a_typed_error_round_trips_with_its_code` proves
+    /// for `ValidationException`, pinned separately since this is the one
+    /// code this fix's own allowlist entry exists for.
+    #[test]
+    fn a_service_unavailable_error_round_trips_with_its_code() {
+        let err = WireError::service_unavailable(
+            "tablet frozen for split cutover (ADR 0050); a child will serve this range shortly; retry",
+        );
+        let decoded = decode_relayed_error(&encode_relayed_error(&err));
+        assert_eq!(decoded.code, "ServiceUnavailable");
+        assert_eq!(decoded.message, err.message);
+    }
+}
+
+#[cfg(test)]
+mod map_throttleable_error_tests {
+    use super::{THROTTLE_WRITE_REFUSAL, map_throttleable_error};
+
+    /// A transient, exhausted-retry refusal (the house `"; retry"`
+    /// convention) maps to `ServiceUnavailable`, not `InternalServerError`
+    /// — issue #994's own mapping site, covering `fast_marker_write`'s and
+    /// every `paginated_kind_examine*`/`native_scan`/`raw_quorum_read`
+    /// caller's shared error channel.
+    #[test]
+    fn a_transient_retry_suffixed_refusal_maps_to_service_unavailable() {
+        let frozen = "tablet frozen for split cutover (ADR 0050); a child will serve this range shortly; retry";
+        let err = map_throttleable_error(frozen.to_owned());
+        assert_eq!(err.code, "ServiceUnavailable");
+        assert_eq!(err.message, frozen);
+
+        let forward_exhausted = "forward to tablet leader: budget exhausted chasing the leader (last hop: relay hop timed out); retry";
+        let err = map_throttleable_error(forward_exhausted.to_owned());
+        assert_eq!(err.code, "ServiceUnavailable");
+        assert_eq!(err.message, forward_exhausted);
+    }
+
+    /// A throttle refusal is unchanged — it must never be conflated with a
+    /// transient/retryable condition (ADR 0065 §6: the client, not this
+    /// server, backs off).
+    #[test]
+    fn a_throttle_refusal_is_unchanged() {
+        let err = map_throttleable_error(THROTTLE_WRITE_REFUSAL.to_owned());
+        assert_eq!(err.code, "ProvisionedThroughputExceededException");
+        assert_eq!(err.message, THROTTLE_WRITE_REFUSAL);
+    }
+
+    /// A plain, non-retryable, non-throttle string keeps the pre-ADR-0065
+    /// `internal(..)` fallback — a genuine internal failure, not a
+    /// transient one, still terminal.
+    #[test]
+    fn a_plain_non_retryable_string_maps_to_internal_server_error() {
+        let err = map_throttleable_error("no CP group leader reachable".to_owned());
+        assert_eq!(err.code, "InternalServerError");
+        assert_eq!(err.message, "no CP group leader reachable");
     }
 }
 

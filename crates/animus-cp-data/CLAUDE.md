@@ -1964,6 +1964,30 @@ disambiguation is needed.
     purely off the leader's own heartbeat/replicate cycle with no commit
     advance) still converges off the safety poll alone — see
     `tests/apply_signal.rs`.
+  - **`Freeze` and `SplitTablet`'s own whole-range seal-marker writes are
+    halted-gated too (issue #939)** — the same class of bare `.expect(..)`
+    hard panic `flush_pending`/the WAL-compaction `replace` path above were
+    already fixed for (issue #278 item 1 and its follow-up), just on a
+    `storage.merge(&marker_key, ..)` call neither of those fixes reached.
+    `merge_seal_marker_or_halted` (`lib.rs`, next to `flush_pending`) is the
+    shared helper both arms call: tolerated iff `halted` is already set, a
+    hard panic otherwise. **The tolerance is deliberately not just "don't
+    panic"**: on a tolerated failure the caller must not proceed as though
+    the marker were durable — no `sealed` push, no `frozen` latch, no
+    `max_index` advance for that entry (a `continue` back to the loop's own
+    top-of-iteration `halted` check, which — see immediately above — ends
+    the pass on its next turn), and for `SplitTablet` specifically, no
+    write of the separate fork-payload marker either (a fork payload
+    without its own durable seal marker would let `pending_split()` answer
+    `Some` for a tablet that was never actually sealed). Regression:
+    `tests/seal_marker_halted_gate.rs` (a `FaultyEngine` whose `merge`
+    fails-and-self-`shutdown()`s in-line before returning, the identical
+    deterministic stand-in `tests/batch_txn_resolve_apply_fault.rs` uses for
+    `flush_pending`'s own tolerance, since — like that file's target — this
+    site's racing work source is the apply task's own in-progress entry, not
+    a bypassable queue a real concurrent `shutdown()` could reach
+    deterministically under `SimEnv`; see the "Not every sibling site..."
+    lesson in `docs/lessons/testing/`).
   - The WAL is written by both tasks (append vs. compaction rewrite),
     serialized by the async `wal_lock`; compaction snapshots only up to
     `engine_applied` via `snapshot_upto` (not `last_applied`, which the engine

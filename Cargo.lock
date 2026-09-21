@@ -70,6 +70,7 @@ dependencies = [
  "animus-storage",
  "animus-tablet",
  "animus-test",
+ "async-trait",
  "crc32fast",
  "futures",
  "serde",
@@ -121,6 +122,7 @@ dependencies = [
  "animus-s3",
  "async-trait",
  "chacha20poly1305",
+ "futures",
  "rand 0.8.8",
  "rcgen",
  "rustls",
@@ -248,6 +250,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

@@ -29,6 +29,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -125,6 +126,19 @@ struct Inner {
     /// [`shutdown`](ProdEnv::shutdown) aborts them all so the node can be torn
     /// down and its listener port freed.
     tasks: StdMutex<Vec<tokio::task::AbortHandle>>,
+    /// Count of tasks spawned through [`Spawner::spawn`] that panicked
+    /// (issue #939) — see that impl's own doc for why this exists and how
+    /// it's counted. A cancelled (aborted) task never increments this: its
+    /// future is dropped, not unwound, so it never reaches the counting
+    /// path at all (verified by `spawn_aborted_task_never_counts_as_a_
+    /// panic`).
+    task_panics: AtomicU64,
+    /// The first spawned-task panic's message, if any (issue #939) — kept
+    /// so a teardown check can name what happened rather than just "N
+    /// panics". Only the first is kept: a cascade of panics after the
+    /// first is rarely more informative and this stays a single small
+    /// allocation regardless of how many tasks eventually panic.
+    first_task_panic: StdMutex<Option<String>>,
     /// This node's recording metrics sink (ADR 0015). A real recording handle
     /// (unlike the no-op an arbitrary `Env` returns by default), so the assembled
     /// production node accumulates control-plane counters; integration exposes a
@@ -240,6 +254,8 @@ impl ProdEnv {
                 disk,
                 demux,
                 tasks: StdMutex::new(vec![accept_abort, pump_abort]),
+                task_panics: AtomicU64::new(0),
+                first_task_panic: StdMutex::new(None),
                 metrics: MetricsHandle::recording(),
             }),
         };
@@ -344,6 +360,29 @@ impl ProdEnv {
             h.abort();
         }
         wait_all_finished(&handles).await;
+    }
+
+    /// Count of tasks spawned through [`Spawner::spawn`]/
+    /// [`EnvExt::spawn_task`](crate::EnvExt::spawn_task) on this env that
+    /// panicked (issue #939) — see that impl's own doc for the mechanism. A
+    /// test teardown check polls this (`animusd::Node` sums it across a
+    /// node's role envs) to fail loudly instead of letting a zombie replica
+    /// masquerade as a passing run.
+    #[must_use]
+    pub fn spawned_task_panics(&self) -> u64 {
+        self.inner.task_panics.load(Ordering::SeqCst)
+    }
+
+    /// The first spawned-task panic's message this env counted, if any
+    /// (issue #939) — `None` until [`spawned_task_panics`](Self::
+    /// spawned_task_panics) is nonzero.
+    #[must_use]
+    pub fn first_spawned_task_panic(&self) -> Option<String> {
+        self.inner
+            .first_task_panic
+            .lock()
+            .expect("first_task_panic poisoned")
+            .clone()
     }
 
     /// A point-in-time text export of this env's recorded metrics (ADR 0015):
@@ -1577,11 +1616,91 @@ impl crate::SegmentStore for FsSegmentStore {
     }
 }
 
+/// Render a `catch_unwind` payload as a message, for the common cases
+/// (`panic!("...")` / `panic!("{}", fmt)` yield `&str`/`String`) — anything
+/// else (a payload built from a non-string `Any`, rare in practice) falls
+/// back to a fixed placeholder rather than failing to report at all.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
+}
+
 impl Spawner for ProdEnv {
+    /// Spawns `fut` on the tokio runtime, registering its `AbortHandle` for
+    /// [`ProdEnv::shutdown`] exactly as before — **and**, since issue #939,
+    /// counting a panic inside `fut` on this env before letting it continue
+    /// to unwind.
+    ///
+    /// **Why**: a spawned task's `JoinHandle` was never kept (only its
+    /// `AbortHandle`, needed for shutdown), so a panic inside a background
+    /// apply/driver task — e.g. the issue #939 Run-6 panic,
+    /// `animus_cp_data::apply_and_compact`'s split-fork seal-marker
+    /// `.expect(..)` firing on a real `wal group-commit sync failed` under
+    /// disk pressure — killed that task with nothing to observe it: the
+    /// default tokio panic hook printed it to stderr and the task simply
+    /// stopped running, silently, while the foreground test's own
+    /// assertions (which never happened to touch that now-dead replica)
+    /// kept passing. A process-global `std::panic::set_hook` was considered
+    /// and rejected: tests run in parallel on shared worker threads, so a
+    /// global hook cannot attribute a panic to the *test* (or even the
+    /// *node*) whose task produced it — counting on the env the task was
+    /// spawned from is the one attribution `ProdEnv` can make correctly.
+    ///
+    /// **Mechanism**: `fut` is wrapped in `futures::FutureExt::
+    /// catch_unwind` (needs `AssertUnwindSafe` — a `BoxFuture` gives no
+    /// static unwind-safety guarantee, and this wrapper doesn't rely on any:
+    /// it never inspects `fut`'s state after a caught panic, only whether
+    /// one happened). On `Err(payload)`: bump `task_panics`, remember the
+    /// first message (`panic_message`), log it at `error`, then
+    /// **`std::panic::resume_unwind(payload)`** — so the task's `JoinHandle`
+    /// (on the rare caller that does keep one) still observes a genuine
+    /// `JoinError::is_panic()`, and the default panic hook's own stderr
+    /// print/backtrace behavior is completely unchanged. Nothing is
+    /// swallowed; this only adds an observation point before the same
+    /// unwind continues.
+    ///
+    /// **A cancelled (`abort()`ed) task does not go through this path at
+    /// all**: `AbortHandle::abort` drops the task's future without ever
+    /// resuming its poll, so `catch_unwind` (which only ever wraps a
+    /// *poll*) never runs for it — a `Drop` during cancellation is not an
+    /// unwind. So this must never count `ProdEnv::shutdown`'s routine
+    /// task-abort as a panic, and doesn't (see
+    /// `spawn_aborted_task_never_counts_as_a_panic`).
     fn spawn(&self, fut: crate::BoxFuture<'static, ()>) {
+        let inner = Arc::clone(&self.inner);
+        let counted = async move {
+            let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(fut)).await;
+            if let Err(payload) = outcome {
+                let msg = panic_message(payload.as_ref());
+                // Store the message BEFORE bumping the counter: a poller
+                // spinning on `spawned_task_panics()` only ever observes a
+                // nonzero count after this store's effects are visible
+                // (the mutex unlock below happens-before the following
+                // `fetch_add`'s `SeqCst` store, which happens-before the
+                // poller's own `SeqCst` load of it) — never a nonzero count
+                // with `first_spawned_task_panic()` still `None`.
+                {
+                    let mut first = inner
+                        .first_task_panic
+                        .lock()
+                        .expect("first_task_panic poisoned");
+                    if first.is_none() {
+                        *first = Some(msg.clone());
+                    }
+                }
+                inner.task_panics.fetch_add(1, Ordering::SeqCst);
+                tracing::error!(panic = %msg, "spawned task panicked (issue #939)");
+                std::panic::resume_unwind(payload);
+            }
+        };
         // Register the handle so [`ProdEnv::shutdown`] can abort the task on
         // teardown (the Raft driver, the replica serve loop, etc.).
-        let handle = tokio::spawn(fut);
+        let handle = tokio::spawn(counted);
         self.inner
             .tasks
             .lock()
@@ -3384,6 +3503,91 @@ mod tests {
             "plaintext path must write bytes verbatim"
         );
         assert!(!dir.join(crate::MARKER_FILE).exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #939's red-before/green-after proof, half A: a task spawned
+    /// through `env.spawn_task` that panics is counted on the env — the
+    /// exact observation the Run-6 apply-task panic needed and didn't have.
+    /// `spawned_task_panics()` is polled (bounded) rather than joined
+    /// directly: `Spawner::spawn` deliberately keeps no `JoinHandle` (only
+    /// an `AbortHandle`, see that impl's own doc), so the only way a test
+    /// can know the spawned task actually finished is to observe its
+    /// side effect.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spawned_task_panic_is_counted_and_the_message_is_captured() {
+        use crate::EnvExt;
+
+        let dir = unique_tmp_dir();
+        let (env, _addr) = ProdEnv::bind(nid(0), "127.0.0.1:0".parse().unwrap(), &dir)
+            .await
+            .expect("bind");
+
+        env.spawn_task(async {
+            panic!("issue-939 injected panic");
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while env.spawned_task_panics() == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "spawned task panic was never counted"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(env.spawned_task_panics(), 1);
+        assert_eq!(
+            env.first_spawned_task_panic().as_deref(),
+            Some("issue-939 injected panic")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #939's red-before/green-after proof, half B: an aborted
+    /// (cancelled), never-panicking task must NOT count as a panic —
+    /// `AbortHandle::abort` drops the task's future without resuming its
+    /// poll, so `catch_unwind` (which only ever wraps a poll) never runs
+    /// for it. This is exactly the routine-shutdown path (`ProdEnv::
+    /// shutdown`/`shutdown_and_wait`, and every simulated-crash test that
+    /// calls them) — it must stay silent, or every ordinary kill-node test
+    /// would start failing this new check.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spawn_aborted_task_never_counts_as_a_panic() {
+        use crate::EnvExt;
+
+        let dir = unique_tmp_dir();
+        let (env, _addr) = ProdEnv::bind(nid(0), "127.0.0.1:0".parse().unwrap(), &dir)
+            .await
+            .expect("bind");
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        env.spawn_task(async move {
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        started_rx
+            .await
+            .expect("task must start before it's aborted");
+
+        // Aborts every task this env owns, including the one above — the
+        // same path `ProdEnv::shutdown` uses.
+        env.shutdown();
+
+        // Give the runtime a few yields to actually drop the cancelled
+        // task's future (abort() only requests cancellation, see
+        // `ProdEnv::shutdown`'s own doc) before asserting the negative.
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            env.spawned_task_panics(),
+            0,
+            "an aborted task must never be counted as a panic"
+        );
+        assert_eq!(env.first_spawned_task_panic(), None);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

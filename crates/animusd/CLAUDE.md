@@ -2619,6 +2619,77 @@ See `docs/lessons/code-patterns/2026-09-19-shortening-a-shared-budget-
 exposes-its-exhaustion-path-which-must-still-classify-as-transient.md`
 for the general lesson.
 
+**"Transient" reaching a "; retry"-suffixed `decide::read_should_retry`
+message is not the end of the story — the DynamoDB wire edge must
+translate it into a status code an AWS SDK's own default retry policy
+already knows to retry (issue #994, same-day follow-up).** Before this
+fix, once a caller's own bounded retry loop finally exhausted its budget
+on a message that was transient the whole time — a split-cutover freeze
+(`decide::FROZEN_REFUSAL`) that outlasted the loop, or `forward_to_
+tablet_leader`'s own `FORWARD_BUDGET_EXHAUSTED` above — the terminal
+`Err` still carried `WireError::internal`'s code
+(`InternalServerError`), which `dynamo.rs::error_status` renders as a
+bare `500`. A `500` is a terminal-looking signal for a condition that was
+never permanent, and unlike a `"; retry"`-suffixed string (an internal
+convention this server's own retry loops read), nothing about a `500`
+by itself tells an external DynamoDB client's SDK to keep retrying.
+Fixed at the two terminal-return sites, never inside a retry loop's own
+condition (no retry behavior changed): `write_path.rs::
+cp_kind_write_item`'s single exit — if the last error still satisfies
+`decide::read_should_retry`, return `WireError::service_unavailable`
+instead of the raw (`InternalServerError`-coded) error; and `dynamo.rs::
+map_throttleable_error`'s `else` branch (already the single shared
+mapping point for `fast_marker_write`/`paginated_kind_examine`/
+`paginated_kind_examine_one`/`native_scan`/`raw_quorum_read`'s own
+plain-`String` errors) — the identical `read_should_retry` check before
+falling back to `internal(..)`. `WireError::service_unavailable`
+(`animus-dynamo`) mints DynamoDB's own documented `ServiceUnavailable`
+error (`error_status` maps it to `503`) — every AWS SDK's default retry
+policy already retries a 503 with backoff, unlike a bare 500. **Not**
+`ProvisionedThroughputExceededException`: a throttle refusal
+(`THROTTLE_WRITE_REFUSAL`) is a capacity signal the *client* must back
+off from (ADR 0065 §6, never retried inline by this server), while a
+`ServiceUnavailable` here means this server's OWN retry loop already
+gave up on a condition that had nothing to do with the caller's own
+request rate — conflating the two would tell a client to slow down for
+the wrong reason. `dynamo.rs::decode_relayed_error`'s allowlist gained
+`"ServiceUnavailable"` so the typed code survives a forwarded
+`KindWriteItem` hop unchanged (mirroring `ValidationException`'s own
+entry) — **`ProvisionedThroughputExceededException` was deliberately
+NOT added there**, a pre-existing, separate defect (a throttle refusal
+minted at a remote leader still degrades to `InternalServerError` across
+that hop today) out of this fix's own scope. Regression:
+`dynamo::relayed_error_tests::a_service_unavailable_error_round_trips_
+with_its_code`, `dynamo::map_throttleable_error_tests` (frozen text →
+`ServiceUnavailable`; `THROTTLE_WRITE_REFUSAL` → unchanged;
+a plain non-retryable string → `InternalServerError`), and
+`sim_cluster_frozen_refusal.rs`'s two scenarios: a directly-injected
+freeze (`SimCluster::freeze_tablet`, a fixture-only stand-in) on both a
+plain table's fast-marker path and a GSI table's evaluate-at-leader
+path, from both a non-leader and the leader node, plus a `ConsistentRead:
+true` read proving reads stay ungated; and a REAL in-place split's own
+data-plane fork (`POST /admin/tablet/split`, this fixture's always-on
+`host::Reconciler` forking on its own — no freeze injection), asserting
+`503`/`ServiceUnavailable` while frozen and a `200` once the cutover
+(`SimCluster::drive_inplace_split_cutover`) converges — the non-leader
+(forwarded) assertions additionally require the body to preserve
+`decide::FROZEN_REFUSAL`'s own text verbatim, not just a bare 503.
+
+**Same-day follow-on: a post-sleep deadline re-check, so the loop's own
+final iteration can't overwrite a real refusal with a generic one.**
+Every retry loop of this shape (`write_path.rs::cp_kind_write_item`/
+`cp_kind_write_raw_bounded`; `read_path.rs::cp_read`/`cp_read_snapshot`/
+`cp_scan_one`/`cp_scan_kind_one`) checked `now >= deadline` only *before*
+its own `env.sleep(SCHEMA_POLL_INTERVAL)` — so the loop's last iteration
+could sleep past the deadline, loop back to the top, and start a *fresh*
+`cp_route`/`cp_forward` attempt with effectively zero budget left; that
+attempt's own generic timeout/budget-exhausted error (never the real,
+informative one — e.g. `FROZEN_REFUSAL`) then became the value returned,
+even though an earlier iteration had already observed the true cause.
+Fixed by re-checking `now >= deadline` immediately after the sleep too,
+returning the PREVIOUS iteration's own error (mapped through the same
+503 logic where applicable) instead of looping into a doomed attempt.
+
 **Cross-replica leader-hint fan-out on a stale local view (issue #950,
 fixed).** The "waits for the local group to elect" branch above used to be
 **unconditional and purely local**: if this node hosts a replica of the
@@ -7629,6 +7700,39 @@ see `docs/engineering-lessons.md`'s matching entry.
 comment on `PanicSafeTempDir` has the full account. Regression
 (deterministic, no ProdEnv, no timing dependency):
 `tests/panic_safe_teardown.rs`.
+
+**`support::TaskPanicGuard`/`support::watch_task_panics`/`support::
+assert_no_task_panics` (issue #939)** — the teardown check for the *other*
+half of "a background task can die silently mid-test": `ProdEnv::spawn`
+counts a spawned task's panic on the env (`animus-env/CLAUDE.md`'s matching
+entry), and `Node::spawned_task_panics()`/`first_spawned_task_panic()` sum/
+pick across a node's role envs, but neither *fails a test* on its own — a
+test still has to check. `watch_task_panics(&[&node, ...])` returns a
+`TaskPanicGuard` that, on a non-panicking drop, panics loudly if any
+watched node counted one, naming the count and the first message — so the
+issue's Run-6 shape (a leader's apply task panics on a real `wal
+group-commit sync failed`, the replica quietly stops applying, and the
+test's own assertions happen to pass some other way) can never again report
+ok. Non-panicking-only on purpose: a genuine assertion failure already
+unwinding must never also panic in `Drop` (that aborts the process instead
+of reporting either failure cleanly) — same discipline as
+`PanicSafeTempDir`'s own panicking-vs-not branch, just inverted (that type
+acts only *while* panicking; this one only when *not*). `TaskPanicGuard`
+borrows its watched `Node`s (`Vec<&'a Node>`), not clones of their envs, so
+it must be dropped (`drop(guard)`, or let it fall out of an inner scope)
+before a caller that needs to *consume* the node (`support::stop`'s
+`shutdown_graceful().await; drop(node);` shape in `durable_restart.rs`) —
+`TaskPanicGuard::extend`/`::watch` add more nodes to an already-constructed
+guard (e.g. ones added later via `grow_deadline`). Adopted in
+`streams_e2e.rs` (including
+`cascade_split_walks_the_grandparent_chain_with_closed_shard_shape`, the
+test the issue names) and `durable_restart.rs`; **not** retrofitted into
+every `tests/*.rs` file that brings up a `Vec<Node>` — see
+`docs/lessons/testing/`'s matching 2026-09-19 entry for the scope decision
+and why a wider sweep is a separate, mechanical follow-up, not this fix's
+job. Proof, end to end against a real `ProdEnv` node: `tests/
+task_panic_guard.rs` (also covers the guard's own no-op-on-a-clean-node
+path, so this fix provably never changes a passing test's outcome).
 
 ## Benchmark
 

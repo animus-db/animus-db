@@ -8570,14 +8570,25 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     flush_pending(storage, &mut pending, metrics, halted).await;
                     let whole = KeyRange::whole();
                     let marker_key = seal::seal_marker_key(tablet, &whole);
-                    storage
-                        .merge(
-                            &marker_key,
-                            &seal::encode_seal_value(&whole, ts),
-                            hlc::pack(ts),
-                        )
-                        .await
-                        .expect("raftkv apply freeze marker");
+                    let durable = merge_seal_marker_or_halted(
+                        storage,
+                        &marker_key,
+                        &seal::encode_seal_value(&whole, ts),
+                        hlc::pack(ts),
+                        halted,
+                        "raftkv apply freeze marker",
+                    )
+                    .await;
+                    if !durable {
+                        // Tolerated (halted): the seal marker never became
+                        // durable, so this entry must not advance
+                        // `max_index` either — that would let the trailing
+                        // `flush_pending`/`engine_applied.fetch_max` below
+                        // claim the engine holds an effect it never merged.
+                        // The driver's own top-of-loop `halted` check ends
+                        // this apply pass on its next iteration.
+                        continue;
+                    }
                     sealed.push((whole, ts));
                     frozen.store(true, Ordering::SeqCst);
                 }
@@ -8600,14 +8611,27 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     flush_pending(storage, &mut pending, metrics, halted).await;
                     let whole = KeyRange::whole();
                     let seal_marker_key = seal::seal_marker_key(tablet, &whole);
-                    storage
-                        .merge(
-                            &seal_marker_key,
-                            &seal::encode_seal_value(&whole, ts),
-                            hlc::pack(ts),
-                        )
-                        .await
-                        .expect("raftkv apply split-fork seal marker");
+                    let durable = merge_seal_marker_or_halted(
+                        storage,
+                        &seal_marker_key,
+                        &seal::encode_seal_value(&whole, ts),
+                        hlc::pack(ts),
+                        halted,
+                        "raftkv apply split-fork seal marker",
+                    )
+                    .await;
+                    if !durable {
+                        // Tolerated (halted): the seal marker never became
+                        // durable, so this apply must not proceed as if it
+                        // had — no `sealed` push, no `frozen` latch, and,
+                        // critically, no fork payload write below (a fork
+                        // payload written without its own seal marker would
+                        // let `pending_split()` answer `Some` for a tablet
+                        // that was never actually sealed). The driver's own
+                        // top-of-loop `halted` check ends this apply pass on
+                        // its next iteration.
+                        continue;
+                    }
                     sealed.push((whole, ts));
                     frozen.store(true, Ordering::SeqCst);
                     // The fork-specific durable payload (split.rs): what the
@@ -10265,6 +10289,48 @@ async fn flush_pending<S: StorageEngine>(
             halted.load(Ordering::SeqCst),
             "raftkv apply merge batch failed while running: {e}"
         );
+    }
+}
+
+/// Durably write one of the apply loop's whole-range **seal markers**
+/// (`Freeze`'s own marker, and `SplitTablet`'s identical seal marker —
+/// `split.rs`'s own separate fork-payload marker is untouched by this
+/// helper and is only ever reached once this call has already returned
+/// `true`), applying the same **halted-gated error tolerance** as
+/// `flush_pending`/the WAL-compaction `replace` path above (issue #939):
+/// a `merge` failure is tolerated **iff** the group is already `halted` —
+/// the identical class of teardown-artifact I/O error those two paths
+/// already surface — and stays a hard panic otherwise (a live seal-marker
+/// failure means the group's own sealed/split state is now silently
+/// unrepresented on disk, so this must never be softened into a swallowed
+/// error).
+///
+/// Returns `true` iff the marker is now durable, so the caller may treat
+/// this entry as having actually sealed (push into `sealed`, latch
+/// `frozen`, and — for `SplitTablet` — go on to write the fork payload).
+/// Returns `false` iff the write failed but was tolerated because `halted`
+/// was already set: the caller must **not** proceed as though the marker
+/// were durable — no `sealed` push, no `frozen` latch, no fork payload,
+/// and no `max_index` advance for this entry (`continue` back to the
+/// loop's own top-of-iteration `halted` check, which ends the pass on its
+/// next turn).
+async fn merge_seal_marker_or_halted<S: StorageEngine>(
+    storage: &S,
+    key: &[u8],
+    value: &[u8],
+    version: u64,
+    halted: &AtomicBool,
+    context: &'static str,
+) -> bool {
+    match storage.merge(key, value, version).await {
+        Ok(_) => true,
+        Err(e) => {
+            assert!(
+                halted.load(Ordering::SeqCst),
+                "raftkv apply {context} failed while running: {e}"
+            );
+            false
+        }
     }
 }
 

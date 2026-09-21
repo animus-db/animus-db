@@ -194,6 +194,22 @@ inputs (still named + intact). These are tested under fault injection in
   crash mid-rotation). The group-commit liveness invariant (no mutex guard across
   `.await`, `DurableUpTo` re-leads) is unchanged and still covered by
   `lsm_concurrent.rs`.
+  *(Update 2026-09-19, issue #939: the leader's own `flush_batch` error was
+  being discarded — a failed writer, and every later waiter riding
+  `failed_through`, only ever saw the generic literal `"wal group-commit sync
+  failed"`, with no way to tell a full disk from a permissions error from a
+  torn write. `GroupCommit::Inner` now keeps the leader's first failure text
+  (`failed_error`, set once, never overwritten by a later unrelated failure)
+  and every waiter's `StorageError::Backend` now reads `"wal group-commit
+  sync failed: {leader_err}"` — same prefix, so existing grep/log consumers
+  still match, plus the real cause. The leader also logs once via
+  `tracing::error!` (segment, batch byte count, `up_to`) at the point of
+  failure — this crate's first `tracing` dependency. No change to
+  `durable_seq`/`failed_through` semantics, the wake-all-waiters behavior, or
+  segment rotation. Regression:
+  `lsm_group_commit.rs::leader_sync_error_surfaces_underlying_disk_text_to_every_waiter`
+  (two concurrent writers riding one failed batch, both asserted to see the
+  injected disk error's text).*
 - **Tombstone GC + orphan WAL cleanup** (`lsm.rs`): the two tail items of the
   LSM are done. (1) **Tombstone GC during compaction**: `run_compaction` now
   reclaims a tombstone — and the versions it shadows — once it sits at/below the

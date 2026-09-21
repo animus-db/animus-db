@@ -1008,6 +1008,7 @@ async fn gsi_and_stream_coexist_and_both_converge() {
     let dir = support::panic_safe_tempdir();
     let nodes = start_streamed_cluster(1, dir.path(), tiny_seal_knobs()).await;
     await_bootstrap(&nodes).await;
+    let _task_panic_guard = support::watch_task_panics(&nodes.iter().collect::<Vec<_>>());
     let addr = nodes[0].dynamo_addr();
 
     let (status, body) = dynamo(
@@ -1103,6 +1104,7 @@ async fn lsm_restart_preserves_streams_and_walk_completes() {
     .await
     .unwrap();
     await_bootstrap(&nodes).await;
+    let _task_panic_guard = support::watch_task_panics(&nodes.iter().collect::<Vec<_>>());
     let addr = nodes[0].dynamo_addr();
 
     let (status, body) = dynamo(
@@ -1139,6 +1141,7 @@ async fn lsm_restart_preserves_streams_and_walk_completes() {
     })
     .await;
 
+    drop(_task_panic_guard);
     nodes[0].shutdown_graceful().await;
     drop(std::mem::take(&mut nodes));
     sleep(Duration::from_millis(200)).await;
@@ -1158,6 +1161,7 @@ async fn lsm_restart_preserves_streams_and_walk_completes() {
     .await
     .unwrap();
     await_bootstrap(&nodes).await;
+    let _task_panic_guard = support::watch_task_panics(&nodes.iter().collect::<Vec<_>>());
     let addr = nodes[0].dynamo_addr();
 
     await_true(
@@ -1211,6 +1215,7 @@ async fn fs_segment_store_opt_in_smoke() {
     )
     .await;
     await_bootstrap(&nodes).await;
+    let _task_panic_guard = support::watch_task_panics(&nodes.iter().collect::<Vec<_>>());
     let addr = nodes[0].dynamo_addr();
 
     let (status, body) = dynamo(
@@ -1330,6 +1335,7 @@ async fn auto_split_mid_stream_with_live_consumer_across_every_node() {
     )
     .await;
     await_bootstrap(&nodes).await;
+    let _task_panic_guard = support::watch_task_panics(&nodes.iter().collect::<Vec<_>>());
 
     let (status, body) = dynamo(
         nodes[0].dynamo_addr(),
@@ -1588,6 +1594,7 @@ async fn manual_split_with_unsealed_backlog_under_production_seal_knobs() {
     )
     .await;
     await_bootstrap(&nodes).await;
+    let _task_panic_guard = support::watch_task_panics(&nodes.iter().collect::<Vec<_>>());
 
     let (status, body) = dynamo(
         nodes[0].dynamo_addr(),
@@ -1710,6 +1717,7 @@ async fn admin_status_survives_a_populated_stream_shard_catalog() {
     let dir = support::panic_safe_tempdir();
     let nodes = start_streamed_cluster(1, dir.path(), tiny_seal_knobs()).await;
     await_bootstrap(&nodes).await;
+    let _task_panic_guard = support::watch_task_panics(&nodes.iter().collect::<Vec<_>>());
     let dynamo_addr = nodes[0].dynamo_addr();
     let admin_addr = nodes[0].admin_addr();
 
@@ -1793,6 +1801,7 @@ async fn client_protocol_status_survives_a_populated_stream_shard_catalog() {
     let dir = support::panic_safe_tempdir();
     let nodes = start_streamed_cluster(1, dir.path(), tiny_seal_knobs()).await;
     await_bootstrap(&nodes).await;
+    let _task_panic_guard = support::watch_task_panics(&nodes.iter().collect::<Vec<_>>());
     let dynamo_addr = nodes[0].dynamo_addr();
     let client_addr = nodes[0].client_addr();
 
@@ -1863,6 +1872,7 @@ async fn admin_data_dynamo_proxy_reaches_streams_read_api() {
     let dir = support::panic_safe_tempdir();
     let nodes = start_streamed_cluster(1, dir.path(), tiny_seal_knobs()).await;
     await_bootstrap(&nodes).await;
+    let _task_panic_guard = support::watch_task_panics(&nodes.iter().collect::<Vec<_>>());
     let admin_addr = nodes[0].admin_addr();
 
     // Set up a streamed table and one item entirely through the admin proxy
@@ -1984,6 +1994,7 @@ async fn admin_data_dynamo_proxy_rejects_unknown_op_cleanly() {
     let dir = support::panic_safe_tempdir();
     let nodes = start_streamed_cluster(1, dir.path(), tiny_seal_knobs()).await;
     await_bootstrap(&nodes).await;
+    let _task_panic_guard = support::watch_task_panics(&nodes.iter().collect::<Vec<_>>());
     let admin_addr = nodes[0].admin_addr();
 
     let (status, body) = admin(
@@ -2057,6 +2068,7 @@ async fn admin_stream_grow_doubles_a_multi_tablet_table_with_exactly_once_delive
     let dir = support::panic_safe_tempdir();
     let nodes = start_streamed_cluster(3, dir.path(), tiny_seal_knobs()).await;
     await_bootstrap(&nodes).await;
+    let _task_panic_guard = support::watch_task_panics(&nodes.iter().collect::<Vec<_>>());
 
     let (status, body) = dynamo(
         nodes[0].dynamo_addr(),
@@ -2314,6 +2326,7 @@ async fn auto_split_change_rate_splits_a_high_churn_streamed_table_never_a_plain
     )
     .await;
     await_bootstrap(&nodes).await;
+    let _task_panic_guard = support::watch_task_panics(&nodes.iter().collect::<Vec<_>>());
 
     // The streamed table.
     let (status, body) = dynamo(
@@ -2479,6 +2492,9 @@ async fn all_stream_shards(addr: SocketAddr, stream_arn: &str) -> Vec<Value> {
 async fn cascade_split_walks_the_grandparent_chain_with_closed_shard_shape() {
     let dir = support::panic_safe_tempdir();
     let nodes = start_streamed_cluster(3, dir.path(), tiny_seal_knobs()).await;
+    // issue #939: this is the test whose Run-6 apply-task panic passed
+    // silently — fail loudly instead of letting a killed replica pass.
+    let _task_panic_guard = support::watch_task_panics(&nodes.iter().collect::<Vec<_>>());
     await_bootstrap(&nodes).await;
 
     let (status, body) = dynamo(

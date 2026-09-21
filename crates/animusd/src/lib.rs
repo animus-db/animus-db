@@ -978,6 +978,21 @@ impl<E: Env> CpGroup<E> {
         }
     }
 
+    /// Propose the split-cutover freeze directly (`RaftKvNode::
+    /// propose_freeze`) — leader-only, idempotent. `SimCluster`'s own
+    /// `freeze_tablet` (issue #994 regression) is the sole caller today: a
+    /// fixture-only way to put a tablet into the exact latched-frozen state
+    /// a real in-place split's own data-plane fork (`KvCommand::
+    /// SplitTablet`, which shares this same latch) reaches, without waiting
+    /// out the fork/cutover window itself.
+    #[cfg(test)]
+    pub(crate) fn propose_freeze(&self) -> ProposeResult {
+        match self {
+            CpGroup::Lsm(n) => n.propose_freeze(),
+            CpGroup::Mem(n) => n.propose_freeze(),
+        }
+    }
+
     /// This group's pending (or already-applied) in-place split fork, if
     /// any (ADR 0058 Train 2 rung 3) — the `animusd`-level in-place cutover
     /// driver's (`index_drain.rs::inplace_split_driver_tick`) own signal
@@ -6506,6 +6521,23 @@ impl Node {
         }
     }
 
+    /// Latch this node's own local control [`RaftNode`](animus_control::RaftNode)'s
+    /// `halted` flag (ADR 0038's 2026-09-19 amendment, issue #939's
+    /// control-plane half) — the control-plane sibling of
+    /// [`ClusterEdgeState::halt_hosted_cp_groups`]. A no-op for a data-only
+    /// node (ADR 0035 PR4, `ControlHandle::Remote` — no local control
+    /// `RaftCore` to latch) and for a control-only node with no hosted CP
+    /// groups; called from every hard-abort teardown path below, right
+    /// alongside `halt_hosted_cp_groups`, so a subsequent WAL/system-keyspace
+    /// I/O error the still-live control driver task hits while this node's
+    /// own directory is being torn down underneath it is a teardown artifact,
+    /// not a live durability fault.
+    fn halt_local_control(&self) {
+        if let ControlHandle::Local(raft) = &self.raft {
+            raft.halt();
+        }
+    }
+
     /// Gracefully stop the node: abort its client-facing listeners (client, plus
     /// dynamo on a data-role node) and every task its internal `ProdEnv`
     /// role(s) own (the control Raft driver, plus the CP Raft driver on a
@@ -6538,9 +6570,14 @@ impl Node {
     /// durability fault. [`ClusterEdgeState::halt_hosted_cp_groups`] is a plain
     /// atomic store plus two wakes per group — cheap, synchronous, no wait for
     /// `is_stopped()` — so it costs this fire-and-forget path nothing and keeps
-    /// its contract (request the stop, don't wait for it) intact.
+    /// its contract (request the stop, don't wait for it) intact. **Also
+    /// latches this node's own local control `RaftNode`, the identical
+    /// window closed for the control plane** (issue #939):
+    /// [`halt_local_control`](Self::halt_local_control) is the equally cheap,
+    /// synchronous control-plane counterpart.
     pub fn shutdown(&self) {
         self.edge.halt_hosted_cp_groups();
+        self.halt_local_control();
         for task in &self.tasks {
             task.abort();
         }
@@ -6571,6 +6608,7 @@ impl Node {
     /// hard-aborts the same driver tasks, just with an added wait afterward.
     pub async fn shutdown_and_wait(&self) {
         self.edge.halt_hosted_cp_groups();
+        self.halt_local_control();
         for task in &self.tasks {
             task.abort();
         }
@@ -6578,6 +6616,48 @@ impl Node {
         for env in &self.envs {
             env.shutdown_and_wait().await;
         }
+    }
+
+    /// Total count of tasks spawned through `env.spawn_task`/`Spawner::spawn`
+    /// on any of this node's role envs that panicked (issue #939), summed
+    /// across `self.envs` (control-plane + raftkv for combined mode, just
+    /// one for a control-only or data-only node — see [`ProdEnv::
+    /// spawned_task_panics`] for what's actually counted and why a
+    /// cancelled/aborted task never is). A test teardown check
+    /// (`support::TaskPanicGuard`) polls this so a replica's apply/driver
+    /// task panicking mid-test can never pass silently again — the exact
+    /// gap the issue's Run-6 panic fell through.
+    #[must_use]
+    pub fn spawned_task_panics(&self) -> u64 {
+        self.envs.iter().map(ProdEnv::spawned_task_panics).sum()
+    }
+
+    /// The first spawned-task panic message counted across this node's role
+    /// envs, if any (issue #939) — `None` until
+    /// [`spawned_task_panics`](Self::spawned_task_panics) is nonzero.
+    /// Picks whichever env's own first message comes first in `self.envs`'
+    /// order (stable/deterministic, though which env actually panicked
+    /// first in wall-clock terms is not tracked across envs).
+    #[must_use]
+    pub fn first_spawned_task_panic(&self) -> Option<String> {
+        self.envs.iter().find_map(ProdEnv::first_spawned_task_panic)
+    }
+
+    /// Test-only, always-compiled hook (issue #939): this node's own
+    /// internal `ProdEnv` role(s) (control-plane for a control-only node,
+    /// raftkv for a data-only node, both for combined), so an external
+    /// `tests/*.rs` integration binary can inject a panic directly through
+    /// `env.spawn_task(..)` (e.g. `task_panic_guard.rs`'s red-before/
+    /// green-after proof). **Not** `#[cfg(test)]`-gated, for the same
+    /// reason [`set_export_store_factory`](Self::set_export_store_factory)
+    /// isn't: an integration binary under `tests/` links this crate's
+    /// plain, non-test-cfg library, so a `cfg(test)`-gated item would be
+    /// invisible there. `#[doc(hidden)]`: a test hook, not part of this
+    /// crate's real public surface.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn envs_for_test(&self) -> &[ProdEnv] {
+        &self.envs
     }
 
     /// Graceful teardown: durably flush the control-plane WAL, then gracefully
@@ -20432,6 +20512,18 @@ mod sim_cluster_control_growth;
 /// `crates/animusd/CLAUDE.md`'s matching entry.
 #[cfg(test)]
 mod sim_cluster_cp_plane;
+
+/// Regression for issue #994: a retry budget exhausted on a transient (not
+/// a genuine capacity) refusal — a split-cutover freeze, or an exhausted
+/// forward chase still citing a transient last hop — must report
+/// `503 ServiceUnavailable`, never a terminal `500 InternalServerError`.
+/// See `sim_cluster_frozen_refusal.rs`'s own module doc for the two
+/// scenarios (a directly-injected freeze on both the fast-marker and
+/// evaluate-at-leader write paths; a real in-place split's own data-plane
+/// fork) and `crates/animusd/CLAUDE.md`'s dynamo/write-path entry for the
+/// fix itself.
+#[cfg(test)]
+mod sim_cluster_frozen_refusal;
 
 /// Regression for the issue #298 residual confirmed live under the
 /// un-pinned `SplitMode::InPlace` proof soak (ADR 0018's matching amendment,

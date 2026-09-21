@@ -225,9 +225,42 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             // decide about, exactly as DynamoDB would.
             if !idempotent || !decide::read_should_retry(&err.message) || self.env.now() >= deadline
             {
-                return Err(err);
+                // Issue #994: a caller that reaches here after being told to
+                // retry (the message it just failed the `read_should_retry`
+                // check on ends `"; retry"`) exhausted its budget on a
+                // TRANSIENT refusal — a split-cutover freeze
+                // (`decide::FROZEN_REFUSAL`) or an exhausted forward chase
+                // still citing a transient last hop
+                // (`forwarding::FORWARD_BUDGET_EXHAUSTED`) are the two
+                // classes this loop actually retries. Reporting that as a
+                // bare `InternalServerError` (500) is a terminal-looking
+                // code for a condition that was never permanent — the
+                // client's own retry policy has no reason to try again.
+                // `WireError::service_unavailable` maps to DynamoDB's own
+                // documented `ServiceUnavailable` (503), which every AWS
+                // SDK's default retry policy already retries with backoff.
+                // The non-idempotent, non-retried first-hit case is
+                // included too: that refusal is returned pre-propose (never
+                // committed), so it is exactly as safe for the client to
+                // retry as the idempotent, budget-exhausted case above.
+                return Err(if decide::read_should_retry(&err.message) {
+                    animus_dynamo::wire::WireError::service_unavailable(err.message)
+                } else {
+                    err
+                });
             }
             self.env.sleep(SCHEMA_POLL_INTERVAL).await;
+            // Issue #994: re-check the deadline immediately after the
+            // sleep, before looping back to a fresh attempt that would
+            // start with effectively zero time left. At this point
+            // `idempotent` is known true and `err.message` is known
+            // `read_should_retry` (the top check above didn't return), so
+            // the mapping is unconditional here.
+            if self.env.now() >= deadline {
+                return Err(animus_dynamo::wire::WireError::service_unavailable(
+                    err.message,
+                ));
+            }
         }
     }
 
@@ -511,6 +544,14 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 return Err(err);
             }
             self.env.sleep(SCHEMA_POLL_INTERVAL).await;
+            // Issue #994: re-check the deadline immediately after the
+            // sleep — see `read_path.rs`'s identical re-check for why: a
+            // fresh attempt started with effectively zero time left can
+            // overwrite this iteration's own informative error with a
+            // generic "budget exhausted" one.
+            if self.env.now() >= retry_until {
+                return Err(err);
+            }
         }
     }
 

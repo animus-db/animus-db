@@ -518,6 +518,34 @@ contract contracts from "residue transfer + a control-plane commit +
 `metadata_watch` propagation" to roughly **one routing refresh** — no
 network hop, no consensus round, no drain to wait for.
 
+**Amendment (2026-09-20, issue #994): a freeze can outlast a client's own
+retry budget, and the wire edge now reports that as retryable, not
+terminal.** "Stale routing" above describes the *fork's own* stale-route
+blip as roughly one routing refresh — but the freeze the fork sets
+(shared with `Freeze`'s own latch, Stage 3) does not lift again until
+`CutoverSplit` commits, and Fork G1's own resolution (above) keeps the
+GSI-drain/backfill-seeder vetoes gating that commit **pre-cutover**: a
+backlog those vetoes are still draining, or a co-hosted cascade delaying
+this tablet's own driver tick, can hold the parent frozen for materially
+longer than `CLIENT_TIMEOUT` (10s) — the "one routing refresh" contract
+above bounds the *routing* cost of a stale view, not the *freeze's own
+duration*, which those two vetoes alone govern. Every mutating propose
+against a frozen group already retried `decide::FROZEN_REFUSAL` (a
+`"; retry"`-suffixed refusal) until its own deadline — but until this
+amendment, exhausting that budget still surfaced to the DynamoDB wire
+client as a bare `500 InternalServerError`, a terminal-looking code for a
+condition that was never permanent. Fixed at the wire edge, not in this
+mechanism: `write_path.rs::cp_kind_write_item`'s terminal return and
+`dynamo.rs::map_throttleable_error` now map an exhausted-but-still-
+transient refusal to `WireError::service_unavailable` (DynamoDB's own
+documented `ServiceUnavailable`, HTTP 503) instead of `internal(..)`'s
+500 — every AWS SDK's default retry policy already retries a 503 with
+backoff. See `crates/animusd/CLAUDE.md`'s matching dynamo/write-path
+entry for the full mapping-site account and
+`sim_cluster_frozen_refusal.rs` for the regression (including a scenario
+that forks a real tablet via `POST /admin/tablet/split` and confirms the
+freeze genuinely outlasts `CLIENT_TIMEOUT` before the cutover converges).
+
 ## What this deletes (when Train 2 lands)
 
 Mirroring ADR 0050's own "what this deletes" discipline, and using the

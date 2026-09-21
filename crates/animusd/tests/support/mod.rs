@@ -106,6 +106,105 @@ pub fn panic_safe_tempdir() -> PanicSafeTempDir {
     ))
 }
 
+/// A teardown check that fails the test loudly if any watched node counted a
+/// **spawned-task panic** during the test (issue #939).
+///
+/// **The gap this closes**: `crates/animusd/tests/streams_e2e.rs`'s
+/// `cascade_split_walks_the_grandparent_chain_with_closed_shard_shape`
+/// reported ok in Run-6 even though a leader's apply task had already
+/// panicked (`animus_cp_data::apply_and_compact`'s split-fork seal-marker
+/// `.expect(..)` firing on a real `wal group-commit sync failed` under disk
+/// pressure) — the replica just quietly stopped applying, and nothing in
+/// the test happened to assert against exactly that now-dead replica before
+/// the test's own assertions were satisfied some other way. `ProdEnv::spawn`
+/// now counts a spawned task's panic on the env itself (see that impl's own
+/// doc), but counting it is not the same as *checking* it — this type is
+/// the check, so a zombie replica can never again masquerade as a passing
+/// run.
+///
+/// Construct with [`watch_task_panics`] right after a cluster is brought
+/// up (or extend an existing guard with [`TaskPanicGuard::watch`] for nodes
+/// added later, e.g. after [`grow_deadline`]). On a **non-panicking** drop
+/// — so a genuine assertion failure already unwinding never also tries to
+/// panic here, which would abort the process rather than report cleanly —
+/// it panics naming the total count and the first captured message if any
+/// watched node's [`Node::spawned_task_panics`] is nonzero. A clean drop
+/// with nothing counted is silent and free: this never changes a passing
+/// test's outcome.
+///
+/// [`assert_no_task_panics`] is the non-`Drop`, explicit-call sibling for a
+/// test that prefers to check at a specific point rather than at teardown.
+#[must_use = "binding this to `_` drops it immediately, checking nothing — \
+              bind it with `let guard = watch_task_panics(..)` and keep it \
+              alive for the span you want checked"]
+pub struct TaskPanicGuard<'a> {
+    nodes: Vec<&'a Node>,
+}
+
+impl<'a> TaskPanicGuard<'a> {
+    /// Track more nodes (e.g. ones joined/grown into the cluster after this
+    /// guard was constructed).
+    pub fn extend(&mut self, nodes: &[&'a Node]) {
+        self.nodes.extend_from_slice(nodes);
+    }
+
+    /// Alias for [`extend`](Self::extend) reading better at a single-node
+    /// call site (`guard.watch(&[&new_node])`).
+    pub fn watch(&mut self, nodes: &[&'a Node]) {
+        self.extend(nodes);
+    }
+}
+
+impl Drop for TaskPanicGuard<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            // Already unwinding for some other (likely more informative)
+            // reason — never panic-in-drop on top of it, which would abort
+            // the process instead of reporting either failure cleanly.
+            return;
+        }
+        let total: u64 = self.nodes.iter().map(|n| n.spawned_task_panics()).sum();
+        if total == 0 {
+            return;
+        }
+        let first = self
+            .nodes
+            .iter()
+            .find_map(|n| n.first_spawned_task_panic())
+            .unwrap_or_else(|| "<no message captured>".to_string());
+        panic!(
+            "a background task spawned through env.spawn_task panicked during \
+             this test (issue #939) — {total} panic(s) counted across watched \
+             node(s); first: {first}"
+        );
+    }
+}
+
+/// Start watching `nodes` for a spawned-task panic (issue #939) — see
+/// [`TaskPanicGuard`]'s own doc for the full mechanism. Keep the returned
+/// guard alive (bound to a `let`, never `let _ =`) for the rest of the test.
+pub fn watch_task_panics<'a>(nodes: &[&'a Node]) -> TaskPanicGuard<'a> {
+    let mut guard = TaskPanicGuard { nodes: Vec::new() };
+    guard.extend(nodes);
+    guard
+}
+
+/// Explicit, non-`Drop` sibling of [`watch_task_panics`]/[`TaskPanicGuard`]
+/// for a test that prefers to assert at one specific point instead of at
+/// teardown.
+pub fn assert_no_task_panics(nodes: &[&Node]) {
+    for node in nodes {
+        let count = node.spawned_task_panics();
+        assert_eq!(
+            count,
+            0,
+            "node counted {count} spawned-task panic(s) (issue #939); first: {}",
+            node.first_spawned_task_panic()
+                .unwrap_or_else(|| "<no message captured>".to_string())
+        );
+    }
+}
+
 /// Default wall-clock deadline for the `*_deadline` join/bring-up helpers
 /// below — generous enough that a genuinely broken join still fails loudly,
 /// while riding out the transient port-TOCTOU-under-`--workspace`-contention

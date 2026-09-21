@@ -311,6 +311,22 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   numbers `0..lowest_live` one `env.size` call at a time — the probe loop cost
   one I/O call per *ever-rotated* segment number on every open, unbounded over
   the engine's lifetime; a listing is one call regardless of history.
+- **A group-commit leader's failed `flush_batch` surfaces its own error text
+  to every waiter, not just a generic prefix** (issue #939, 2026-09-19).
+  `GroupCommit::Inner::failed_error` keeps the *first* failure's
+  `StorageError`/`io::Error` text alongside `failed_through`; every writer
+  whose record was in that lost batch (the leader itself, and any later
+  waiter that observes `failed_through >= my_seq`) gets
+  `StorageError::Backend("wal group-commit sync failed: {leader_err}")` — the
+  same `"wal group-commit sync failed"` prefix any existing grep/log consumer
+  matches, plus the real cause (a full disk, a permissions error, a torn
+  write) that used to be discarded at the `Err(_) => failed_through = ...`
+  arm. The leader also logs once via `tracing::error!` (segment, batch byte
+  count, `up_to`) at the point of failure — this crate's first `tracing`
+  dependency (`workspace = true`, already declared root-level). No change to
+  `durable_seq`/`failed_through` semantics, the wake-all-waiters behavior, or
+  segment rotation. Regression:
+  `lsm_group_commit.rs::leader_sync_error_surfaces_underlying_disk_text_to_every_waiter`.
 - **Each WAL record is framed `len(u32 BE) | crc32(u32 BE) | payload`** (a
   compact hand-rolled binary encoding, replacing an older newline-delimited
   `serde_json` line — a `Vec<u8>` value serialized as a decimal-number JSON

@@ -420,6 +420,38 @@ the production implementation; the deterministic implementation lives in
   polls `AbortHandle::is_finished()` (bounded) before returning.
   `animusd::Node::shutdown_graceful` uses the `Node`-level dual
   (`shutdown_and_wait`) for exactly this reason.
+- **A panic inside a task spawned through `Spawner::spawn`/`EnvExt::
+  spawn_task` is counted on the env it was spawned from (issue #939).**
+  `spawn` only ever kept the task's `AbortHandle` (needed for `shutdown`),
+  never its `JoinHandle` — so a background apply/driver task's panic (the
+  issue's Run-6 case: `animus_cp_data::apply_and_compact`'s split-fork
+  seal-marker `.expect(..)` firing on a real `wal group-commit sync
+  failed`) used to be genuinely invisible: the default panic hook printed
+  it to stderr and the task just stopped running, silently, while whatever
+  test happened to be driving that env kept passing. `spawn` now wraps the
+  future in `futures::FutureExt::catch_unwind` (needs `AssertUnwindSafe` —
+  a `BoxFuture` has no static unwind-safety guarantee, and the wrapper
+  never inspects the future's state after a caught panic); on a caught
+  panic it bumps an atomic counter and remembers the first message *before*
+  `std::panic::resume_unwind`ing the payload, so the default panic hook's
+  own stderr print/backtrace and any real `JoinHandle` a caller does keep
+  are completely unaffected — this only adds an observation point.
+  **`ProdEnv::spawned_task_panics()`/`first_spawned_task_panic()`** read
+  that counter/message; `animusd::Node` sums/picks across its role envs.
+  **An `abort()`ed (cancelled) task never counts**: cancellation drops the
+  task's future without resuming its poll, so `catch_unwind` — which only
+  ever wraps a *poll* — never runs for it; this must stay true or every
+  routine `ProdEnv::shutdown()`/simulated-kill-node test would start
+  failing a teardown check that watches this counter (verified directly,
+  `spawn_aborted_task_never_counts_as_a_panic`). A process-global
+  `std::panic::set_hook` was considered and rejected for the same
+  attribution reason `docs/engineering-lessons.md`'s entry gives: tests run
+  in parallel on shared worker threads, so a global hook cannot say *which*
+  test's task panicked — counting on the env the task was spawned from is
+  the one attribution this seam can make correctly. See
+  `crates/animusd/tests/support::TaskPanicGuard` for the test-side teardown
+  check built on this, and `crates/animusd/tests/task_panic_guard.rs` for
+  the end-to-end proof.
 - **Metrics are additive and determinism-safe (ADR 0015).** `Env::metrics()` has
   a **default** returning a shared no-op `MetricsHandle`, so the supertrait is
   unchanged and every `E: Env` impl (`SimEnv` included) compiles untouched.
