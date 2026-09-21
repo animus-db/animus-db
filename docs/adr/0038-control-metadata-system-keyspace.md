@@ -435,6 +435,46 @@ compaction or a received `InstallSnapshot`, a materially larger fixture
 than this pass's scope; see `crates/animus-control/CLAUDE.md`'s matching
 entry.
 
+## Amendment (2026-09-21, issue #1024 — the apply task's startup seed now runs before the consensus loop's first tick, so leadership implies the durable `Metadata` is published)
+
+**Bug**: PR3 split the driver into the consensus loop (`drive`) and the
+async apply task (`meta_apply_loop`), and had `drive` spawn the apply task
+right after installing the recovered core, then enter its tick loop. The
+apply task's one-time seed — the full system-keyspace scan
+(`mirror::rebuild_metadata_from_engine`), the `_applied_index` read, and
+the publish of `cache`/`engine_applied`/`MetadataWatch` — therefore raced
+the recovered core's own election timer (150–300ms). Nothing ordered
+them: `is_leader()` reads the core only. On a restart whose engine scan
+lost that race (a CI runner's shared disk under a full shard is where it
+loses), a single voter was leader over `Metadata::default()` with
+watermark 0, and answered `ClientRequest::Status` — whose watermark is
+`metadata_watch().latest()` — with exactly that. `animusd`'s
+`restarted_control_node_resets_its_ring_and_pre_restart_watchers_fall_back`
+tripped on it (`post_restart_watermark >= pre_restart_watermark`) twice on
+`main`. The remote mirror's `observe()` already ignores a watermark
+regression, which bounded the blast radius to that assertion — but the
+placement reconciler and the failure detector read `cache` and act when
+leader, so a leader over a pre-seed empty cache was a real hazard of the
+design, not a test premise.
+
+**Fix**: `drive` now awaits the seed inline — after installing the
+recovered core (so the steady-state loop's first `drain_apply` still sees
+the real post-recovery frontier), before its first tick — and only then
+spawns the steady-state apply loop. The invariant this adds: **a node
+never ticks its core, and so never campaigns, grants a recovered voter's
+vote, or becomes leader, before its durable `Metadata` is published**. If
+the seed outlives the election deadline armed at recovery, the first tick
+starts an election immediately; the seed delays nothing but the ticks,
+and the system keyspace is small (cluster metadata, not data). PR3's
+"`drive` does no engine I/O" description is amended accordingly: it does
+exactly this one read-only seed at boot, and no engine I/O afterwards.
+No public signature changed. Regression test:
+`animus-control/tests/restart_seed_before_election.rs` (a `SimEnv`
+restart over a delegating `StorageEngine` wrapper that sleeps virtual time
+inside the scan, asserting the watermark/cache at the first `is_leader()`;
+red on the old ordering, green on the new, replayable from its seed), and
+the `animusd` test's assertions now print their observed watermarks.
+
 ## See also
 
 - `crates/animus-control/CLAUDE.md` — `node.rs`/`raft.rs`/`mirror.rs`/`syskv.rs`/
