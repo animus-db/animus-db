@@ -36,21 +36,57 @@
 //! under load the second is real and flaked CI (issue #555), and a naive
 //! "or the writer observed an I/O error" fix still isn't enough — the
 //! writer can win that specific recreate race *without* ever seeing an
-//! error either. What actually IS deterministic, independent of which way
-//! that race lands: `remove_dir_all`'s directory listing is taken strictly
-//! after the writer has already reported itself live, so it is guaranteed
-//! to unlink the exact file (inode) the writer was using at that point —
-//! whatever exists at that path afterwards, if anything, can only be a
-//! *different* inode. The red test asserts on that inode identity instead
-//! of on timing, so its verdict is decided the instant the panicking drop
-//! returns, with no polling required; it separately gives the writer a
-//! brief, bounded window purely to enrich the proof with an observed
-//! not-found error when the race happens to land that way, but the
-//! pass/fail verdict never depends on that window. The **green** test has
-//! a much smaller timing dependency of its own (it waits briefly to
-//! observe continued successful progress), but nothing in it races a
-//! directory removal, since `PanicSafeTempDir` never calls one on a
-//! panicking drop.
+//! error either.
+//!
+//! **A second fix (issue #555) closed that gap with an inode NUMBER
+//! identity check, and that fix was itself unsound — corrected by issue
+//! #1003.** The idea was: capture `wal`'s inode number right before the
+//! panic, and treat a post-drop `stat` returning a *different* number (or
+//! no file at all) as proof the original was torn out. That reasoning
+//! silently assumes an inode number is a stable identity across an
+//! unlink — true on tmpfs, which never recycles a freed number, false on
+//! ext4, which recycles one eagerly (a freed inode number becomes the
+//! lowest free bit in its flex group's own bitmap, and the very next
+//! `O_CREAT` in that group claims it). When the writer wins the
+//! unlink-vs-rmdir recreate race, the recreated `wal` can land on the
+//! SAME inode number the original had — measured directly on this repo's
+//! own ext4 sandbox root under CPU load (~1/6000 iterations of a
+//! standalone mimic of this test's own loop); a loop-mounted ext4 filled
+//! to near-ENOSPC hit it more often (~3/3000). Near-full disk is not the
+//! cause — `unlink`/`rmdir`/`O_CREAT` all still succeed at 100% full on
+//! ext4, measured — it only shifts the race's own scheduling odds. On
+//! ext4, the inode-number check's "different inode" disjunct can read
+//! `false` on a run where the directory persists, the writer won the
+//! name, and no error was ever observed: the fourth outcome the old doc
+//! claimed didn't exist.
+//!
+//! **The fix that actually holds regardless of filesystem: pin the
+//! original `wal`'s identity with an open file handle held across the
+//! panicking drop, and read that handle's own link count afterward.**
+//! Holding an open `File` on the original `wal` does two things a bare
+//! inode-number snapshot cannot: it makes it impossible for the
+//! filesystem to recycle that inode's number while the test still holds
+//! it open (the kernel will not reuse an inode with a nonzero reference
+//! count), and it gives a direct, `fstat`-visible observable of the
+//! unlink itself — the handle's own `nlink`, which `unlink`/`unlinkat`
+//! decrements the instant the last directory entry naming that inode is
+//! removed, independent of whether anything later reuses the freed
+//! number for a *different* file. `remove_dir_all`'s directory listing is
+//! taken strictly after the writer has already reported itself live, so
+//! it is guaranteed to call `unlinkat` on exactly the entry the writer
+//! was using at that point — the pinned handle's `nlink` reaching 0 is
+//! therefore proof this specific file was unlinked, decided the instant
+//! the panicking drop returns, with no polling and no filesystem-specific
+//! assumption. (The one documented exception: NFS's silly-rename can
+//! leave an open-but-unlinked file's directory entry renamed rather than
+//! removed outright — not a concern for this repo's CI or sandbox
+//! targets, all local filesystems.) The red test's pass/fail verdict is
+//! that link count alone now; the old three-way inode/error
+//! classification survives purely as enrichment for the panic message
+//! when the assertion fails. The **green** test has a much smaller timing
+//! dependency of its own (it waits briefly to observe continued
+//! successful progress), but nothing in it races a directory removal,
+//! since `PanicSafeTempDir` never calls one on a panicking drop.
 
 use std::os::unix::fs::MetadataExt;
 use std::panic::{self, AssertUnwindSafe};
@@ -126,8 +162,26 @@ impl BackgroundWriter {
     /// Block until at least one write has succeeded — proves the
     /// background thread is genuinely live and using the directory before
     /// the caller does anything to it.
+    ///
+    /// Bounds what used to be an unconditional spin: if the writer's very
+    /// first write fails (e.g. the filesystem is at true ENOSPC) before
+    /// any success is ever recorded, `successes` stays 0 forever and a
+    /// naive spin here would hang the test indefinitely. This is not a
+    /// timeout — it is a correctness check that stops spinning the
+    /// instant the writer thread itself has already given up, surfacing
+    /// its `first_error` in the panic message instead of hanging.
     fn wait_until_live(&self) {
-        while self.successes.load(Ordering::SeqCst) == 0 {
+        loop {
+            if self.successes.load(Ordering::SeqCst) > 0 {
+                return;
+            }
+            if let Some(err) = self.first_error.lock().unwrap().clone() {
+                panic!(
+                    "background writer's very first write failed before it ever reported \
+                     itself live (e.g. the filesystem is at true ENOSPC), so this test can \
+                     never proceed: {err}"
+                );
+            }
             thread::yield_now();
         }
     }
@@ -151,9 +205,15 @@ impl BackgroundWriter {
 /// part of `Drop` — including when that `Drop` runs mid-panic-unwind — so a
 /// background operation still actively using the directory (the shape of
 /// the control-plane WAL driver task `support::PanicSafeTempDir`'s own doc
-/// describes) gets torn out from under it. See the module doc for why the
-/// assertion below is decided by the file's identity (its inode), not by
-/// which side of the removal-vs-recreate race happens to win (issue #555).
+/// describes) gets torn out from under it.
+///
+/// The verdict is decided by the pinned original `wal` handle's own link
+/// count, not by an inode NUMBER comparison (issue #555's own fix) and not
+/// by which side of the removal-vs-recreate race happens to win. An inode
+/// number is not a stable identity across an unlink on every filesystem —
+/// ext4 reuses a freed one eagerly, which defeated #555's fix outright (see
+/// the module doc for the full account, and issue #1003 for the corrected
+/// fix below).
 #[test]
 fn bare_tempdir_removes_its_directory_out_from_under_a_live_background_writer_on_panic() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -162,13 +222,21 @@ fn bare_tempdir_removes_its_directory_out_from_under_a_live_background_writer_on
     let writer = BackgroundWriter::start(path.clone());
     writer.wait_until_live();
 
-    // The inode the writer is actively using right before the drop. This
-    // is what makes the assertion below deterministic: `remove_dir_all`'s
-    // directory listing is taken strictly after `wait_until_live` returned
-    // (the panic, and so the drop, only happens below), so it is guaranteed
-    // to see — and unlink — precisely this inode. Whatever exists at
-    // `wal_path` afterwards can only be this same inode if `remove_dir_all`
-    // never got around to unlinking it at all, which cannot happen.
+    // Pin the original `wal` inode by holding it open across the panicking
+    // drop below. This is the fix issue #1003 corrects #555's own with:
+    // (a) an open handle makes it impossible for the filesystem to recycle
+    // this inode's number while the test still holds it — so whatever
+    // `remove_dir_all` does can never be confused, after the fact, with a
+    // *different* file that happened to reuse the same number (ext4's own
+    // eager reuse is exactly what broke the inode-number check); and (b) it
+    // gives a direct, `fstat`-visible observable of the unlink itself: this
+    // handle's own `nlink`, which the kernel decrements the instant the
+    // last directory entry naming this inode is removed, regardless of
+    // whether anything later reuses the freed number.
+    let pinned = std::fs::File::open(&wal_path)
+        .expect("wal file must exist once the writer has reported itself live");
+    // Kept only for the diagnostic message below, never for the verdict —
+    // an inode NUMBER is not what this test now trusts (see above).
     let original_ino = std::fs::metadata(&wal_path)
         .expect("wal file must exist once the writer has reported itself live")
         .ino();
@@ -186,30 +254,22 @@ fn bare_tempdir_removes_its_directory_out_from_under_a_live_background_writer_on
 
     // `catch_unwind` does not return until the unwind — and so the
     // panicking `Drop for TempDir`, and its `remove_dir_all` — has run to
-    // completion, so there is nothing left to wait for on that front: the
-    // outcome is already decided. Read it off the filesystem now:
-    //  - the directory may be gone entirely (`!path.exists()`) — removal
-    //    won outright;
-    //  - or it may persist with a `wal` entry whose inode differs from
-    //    `original_ino` — the writer won the *name*, by recreating `wal`
-    //    in the window between `remove_dir_all` unlinking it and the final
-    //    `rmdir` (which then fails "directory not empty" and is swallowed
-    //    by `TempDir::drop`), but the *original* file is still gone;
-    //  - `stat`ing `wal_path` may itself fail (`NotFound`) if it is
-    //    observed in the instant between that unlink and the writer's next
-    //    recreate — also proof the original is gone.
-    // Any of the three is proof this specific file was torn out from under
-    // the writer; there is no fourth outcome, so nothing here is racy.
+    // completion. `remove_dir_all`'s directory listing is taken strictly
+    // after `wait_until_live` returned above, so it is guaranteed to have
+    // called `unlinkat` on exactly the entry the writer was using at that
+    // point — the pinned handle's `nlink` dropping to 0 is race-free and
+    // filesystem-agnostic proof of that unlink (any Linux fs; NFS
+    // silly-rename is the one documented exception, and not a CI target
+    // here — see the module doc).
+    let pinned_nlink = pinned
+        .metadata()
+        .expect("fstat the pinned original wal handle")
+        .nlink();
+
+    // Enrichment only, never the verdict: the old three-way inode/error
+    // classification, kept purely to make a failure message legible.
     let current_ino = std::fs::metadata(&wal_path).ok().map(|m| m.ino());
     let torn_out_by_inode = !path.exists() || current_ino != Some(original_ino);
-
-    // Also give the writer a brief, bounded window to report a real I/O
-    // error against the now-missing directory — the failure mode
-    // `persist_wal`'s bare `.expect("wal append")`/`.expect("wal sync")`
-    // would turn into a masking panic in the real driver task. This is
-    // purely to enrich the proof above with the error-kind check below
-    // when the race happens to land that way; the pass/fail verdict never
-    // depends on whether this window catches it.
     let deadline = std::time::Instant::now() + Duration::from_millis(500);
     let mut observed_error = writer.first_error.lock().unwrap().clone();
     while observed_error.is_none() && std::time::Instant::now() < deadline {
@@ -218,20 +278,34 @@ fn bare_tempdir_removes_its_directory_out_from_under_a_live_background_writer_on
     }
     let (_successes, first_error_at_join) = writer.stop_and_join();
     let observed_error = observed_error.or(first_error_at_join);
-
-    assert!(
-        torn_out_by_inode || observed_error.is_some(),
-        "a bare TempDir's panicking drop must tear the directory out from under a live \
-         writer: expected the directory gone, the `wal` file's inode to have changed, or \
-         the writer to have observed an I/O error, but `wal_path` still resolves to its \
-         original inode ({original_ino}) at {path:?} and the writer never errored"
-    );
-    if let Some(observed_error) = observed_error {
+    if let Some(observed_error) = &observed_error {
         assert!(
             observed_error.contains("o such file") || observed_error.contains("No such file"),
             "expected a not-found-shaped I/O error, got: {observed_error}"
         );
     }
+
+    if pinned_nlink != 0 {
+        // A filesystem that genuinely refuses to unlink a directory entry
+        // out from under a live background writer is a different failure
+        // than the one this test isolates — surface it, don't guess at it.
+        // Do NOT make the test pass on this path: attempting our own
+        // cleanup here is purely to enrich the panic message with whatever
+        // `remove_dir_all` itself reports, since a swallowed error is
+        // exactly the class of thing #1003's own hypothesis (a genuinely
+        // refused removal) would look like if it were ever real.
+        let cleanup_result = std::fs::remove_dir_all(&path);
+        panic!(
+            "the pinned original `wal` handle's link count never reached 0 after the \
+             panicking drop — expected the panicking `TempDir::drop`'s `remove_dir_all` to \
+             have unlinked it, but `nlink` is still {pinned_nlink} at {wal_path:?} \
+             (original inode {original_ino}, torn_out_by_inode={torn_out_by_inode}, \
+             observed_error={observed_error:?}); a manual `remove_dir_all(&path)` attempted \
+             here as a diagnostic returned: {cleanup_result:?}"
+        );
+    }
+
+    drop(pinned);
 
     // Clean up manually: the inode-mismatch outcome above means the
     // directory can persist (with a writer-recreated `wal` inside) even

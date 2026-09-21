@@ -7725,7 +7725,12 @@ see `docs/engineering-lessons.md`'s matching entry.
 `docs/engineering-lessons.md` names the mechanism and this file's own doc
 comment on `PanicSafeTempDir` has the full account. Regression
 (deterministic, no ProdEnv, no timing dependency):
-`tests/panic_safe_teardown.rs`.
+`tests/panic_safe_teardown.rs`. **The red (control) test's verdict is the
+pinned original `wal` handle's link count (`nlink`) reaching 0 after the
+panicking drop, not an inode-number comparison** — issue #1003 corrected
+issue #555's own inode-number identity check, which ext4's eager inode
+reuse could defeat (a freed inode number can be reused by the very `wal`
+file the background writer recreates during the same race).
 
 **`support::TaskPanicGuard`/`support::watch_task_panics`/`support::
 assert_no_task_panics` (issue #939)** — the teardown check for the *other*
