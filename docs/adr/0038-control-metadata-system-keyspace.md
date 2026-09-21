@@ -355,6 +355,86 @@ available-`true`-with-rows / available-`false` shapes on genuine
 control-only and data-only processes; `dashboard_endpoint.rs` asserts the
 served assets carry the new markup/JS.
 
+## Amendment (2026-09-19, issue #939 — the apply task's and `persist_wal`'s I/O failures are now halted-gated, mirroring `animus-cp-data`)
+
+**Bug**: `RaftNode<E>` (`node.rs`) had no `halted` flag at all, unlike its
+`animus-cp-data::RaftKvNode` sibling. Three engine/WAL I/O call sites were
+bare, unconditional `.expect()`s that panicked on *any* failure, live or
+during this node's own teardown: `meta_apply_and_compact`'s system-keyspace
+`merge_batch` write (the per-pass watermark-advancing apply), its
+`InstallSnapshot`-image install (`install_syskv_image`), and its WAL
+compaction rewrite (`env.replace`); and the consensus loop's own
+`persist_wal` (`env.append`/`env.sync`). A directory removed out from under
+a still-running driver task during `animusd::Node::shutdown`/
+`shutdown_and_wait`'s hard `task.abort()` (or a test's `TempDir` doing the
+same) could surface as exactly this kind of I/O error on this plane, with
+nothing to distinguish it from a genuine live durability fault — the
+identical class of hazard ADR 0028's 2026-08-18 "halted-gated durability
+assert" fix (issues #282/#279) already closed for the CP data plane, never
+ported here.
+
+**Fix**: `RaftNode<E>` now carries `halted: Arc<AtomicBool>`, with
+`halt()`/`is_halted()` mirroring `RaftKvNode::shutdown`/`is_halted`'s own
+contract exactly: a one-way latch meaning "this node is being torn down, so
+a subsequent WAL/engine I/O error is a teardown artifact, not a live
+durability fault." Every I/O failure at the four sites above is now
+`if let Err(e) = ... { assert!(halted.load(SeqCst), "... while running:
+{e}") }` — tolerated only while `halted` is set, in which case the caller
+returns/skips **without** advancing `watermark`, publishing `cache`,
+bumping `engine_applied`, feeding the delta ring, or bumping `watch` (for
+the apply-write and image-install sites) or without `mark_durable_through`/
+`complete_drain` (for `persist_wal` and the WAL-compaction rewrite) —
+nothing durable happened, so nothing gets to look like it did. A failure
+while *not* halted stays exactly as loud as before: a hard panic naming
+what failed.
+
+**Unlike `RaftKvNode`, this crate's driver tasks (the consensus loop and the
+apply task) have no exit path of their own to gate on `halted`** — `halt()`
+here only ever changes what a **subsequent** I/O failure means, never when
+the loops themselves stop; that remains entirely up to the surrounding
+`task.abort()`. `animusd::Node::shutdown`/`shutdown_and_wait` now call a new
+`Node::halt_local_control` (latching this node's own local control
+`RaftNode`, when it has one — a no-op on a data-only node's
+`ControlHandle::Remote`) right alongside the pre-existing
+`ClusterEdgeState::halt_hosted_cp_groups`, before their hard `task.abort()`
+— the identical moment, the control-plane counterpart of the CP-data-plane
+latch issue #282 already added there. `shutdown_graceful` gets this for
+free (it ends in `shutdown_and_wait`).
+
+**Left open, named rather than fixed here**: this amendment does not add a
+`Drop for Node` counterpart the way issues #282/#279's original CP-data
+fix eventually needed (see `docs/engineering-lessons.md`'s matching entry
+on a mid-test panic dropping a `Vec<Node>` with no explicit `shutdown()`
+call) — a panic that drops a `Node` without an explicit `shutdown()`/
+`shutdown_and_wait()` call still leaves the control driver's `halted`
+unlatched, same as before this fix, for the same reason bare `Drop` was
+originally missed for the CP-data plane: it is easy to fix by mirroring
+`Drop for Node`'s existing `halt_hosted_cp_groups()` call once someone
+needs it, but is out of scope for this specific pass.
+
+**Regression**: `crates/animus-control/tests/
+halted_gate_apply_and_wal_fault.rs` — a `FaultyEngine` wrapper (mirrors
+`animus-cp-data/tests/batch_txn_resolve_apply_fault.rs`'s identical idiom;
+`MemoryEngine`'s own `merge`/`merge_batch` never return `Err`, so a wrapper
+armed to fail on demand is the only deterministic way to reach the apply
+task's tolerance branch) proves the system-keyspace apply write tolerates
+an injected `merge_batch` failure once `halted` is latched
+(`apply_task_tolerates_a_halted_system_keyspace_merge_batch_failure`) and
+still panics on the identical live failure
+(`apply_task_panics_on_a_live_system_keyspace_merge_batch_failure`,
+`#[should_panic]`); a real (deterministic, `set_error_prob(1.0)`)
+`DiskConfig` fault on the node's own `SimEnv` disk proves the same
+halted/live split for `persist_wal`'s WAL append
+(`persist_wal_tolerates_a_halted_wal_append_failure`/
+`persist_wal_panics_on_a_live_wal_append_failure`). All four verified red
+on the pre-fix code (the assert's `panic!` fires unconditionally) and green
+with the fix. The WAL-compaction-rewrite and image-install sites are
+audited and gated identically but have no dedicated regression here —
+triggering either deterministically needs a genuine `SNAPSHOT_THRESHOLD`
+compaction or a received `InstallSnapshot`, a materially larger fixture
+than this pass's scope; see `crates/animus-control/CLAUDE.md`'s matching
+entry.
+
 ## See also
 
 - `crates/animus-control/CLAUDE.md` — `node.rs`/`raft.rs`/`mirror.rs`/`syskv.rs`/

@@ -70,6 +70,7 @@ dependencies = [
  "animus-storage",
  "animus-tablet",
  "animus-test",
+ "async-trait",
  "crc32fast",
  "futures",
  "serde",

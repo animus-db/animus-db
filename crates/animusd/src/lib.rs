@@ -6476,6 +6476,23 @@ impl Node {
         }
     }
 
+    /// Latch this node's own local control [`RaftNode`](animus_control::RaftNode)'s
+    /// `halted` flag (ADR 0038's 2026-09-19 amendment, issue #939's
+    /// control-plane half) — the control-plane sibling of
+    /// [`ClusterEdgeState::halt_hosted_cp_groups`]. A no-op for a data-only
+    /// node (ADR 0035 PR4, `ControlHandle::Remote` — no local control
+    /// `RaftCore` to latch) and for a control-only node with no hosted CP
+    /// groups; called from every hard-abort teardown path below, right
+    /// alongside `halt_hosted_cp_groups`, so a subsequent WAL/system-keyspace
+    /// I/O error the still-live control driver task hits while this node's
+    /// own directory is being torn down underneath it is a teardown artifact,
+    /// not a live durability fault.
+    fn halt_local_control(&self) {
+        if let ControlHandle::Local(raft) = &self.raft {
+            raft.halt();
+        }
+    }
+
     /// Gracefully stop the node: abort its client-facing listeners (client, plus
     /// dynamo on a data-role node) and every task its internal `ProdEnv`
     /// role(s) own (the control Raft driver, plus the CP Raft driver on a
@@ -6508,9 +6525,14 @@ impl Node {
     /// durability fault. [`ClusterEdgeState::halt_hosted_cp_groups`] is a plain
     /// atomic store plus two wakes per group — cheap, synchronous, no wait for
     /// `is_stopped()` — so it costs this fire-and-forget path nothing and keeps
-    /// its contract (request the stop, don't wait for it) intact.
+    /// its contract (request the stop, don't wait for it) intact. **Also
+    /// latches this node's own local control `RaftNode`, the identical
+    /// window closed for the control plane** (issue #939):
+    /// [`halt_local_control`](Self::halt_local_control) is the equally cheap,
+    /// synchronous control-plane counterpart.
     pub fn shutdown(&self) {
         self.edge.halt_hosted_cp_groups();
+        self.halt_local_control();
         for task in &self.tasks {
             task.abort();
         }
@@ -6541,6 +6563,7 @@ impl Node {
     /// hard-aborts the same driver tasks, just with an added wait afterward.
     pub async fn shutdown_and_wait(&self) {
         self.edge.halt_hosted_cp_groups();
+        self.halt_local_control();
         for task in &self.tasks {
             task.abort();
         }
