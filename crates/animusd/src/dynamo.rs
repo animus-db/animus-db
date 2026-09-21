@@ -193,7 +193,8 @@ use crate::authz::{self, Principal};
 use crate::http;
 use crate::write_path::KindEvalApplied;
 use crate::{
-    ClientCtx, CpGroup, KindWriteOp, ProbeIdentity, ReadConsistency, SnapshotRead, decide,
+    ClientCtx, CpGroup, KindWriteBatchItem, KindWriteItemReply, KindWriteOp, ProbeIdentity,
+    ReadConsistency, SnapshotRead, decide,
 };
 
 /// How long `CreateTable` waits for its `CreateTableSchema` proposal to commit in
@@ -1608,6 +1609,35 @@ async fn dispatch_item_op<E: Env, R: RelayClient>(
                     }
                     continue;
                 }
+                // ADR 0049's evaluate-at-leader funnel, now BATCHED per
+                // tablet (issue #996 layer 2, adopting layer 1's
+                // `KvCommand::KindEvalBatch`): group this table's chunk of
+                // requests by tablet — the same `crate::topology::
+                // tablet_for_key` grouping `marker_batch_write_raw` already
+                // uses for the fast arm above — and commit each tablet's
+                // own group as ONE Raft entry, instead of the sequential
+                // per-item loop this arm used to run (one `KindEval` entry
+                // per item; see PR #783's own history note at
+                // `kind_write_item_at_leader`'s original per-item caller
+                // for why that shape was already known to regress
+                // throughput for the marker-table path, and issue #996
+                // layer 1's own doc for why the evaluate-at-leader path
+                // couldn't close the identical gap until now). Preserves
+                // every existing behavior: per-item atomicity only, a
+                // same-key duplicate applies in submission order (layer
+                // 1's own in-apply overlay/write-collapse handles this
+                // *within* one tablet's entry; across tablets a key maps
+                // to exactly one tablet by construction, so cross-tablet
+                // ordering is moot), and error mapping unchanged (a
+                // per-item `ProvisionedThroughputExceededException` sheds
+                // into `UnprocessedItems`, any other error still fails the
+                // whole call immediately, exactly like the old sequential
+                // loop). `by_key` recovers each result's own original
+                // `WriteRequest` the identical way the marker arm's own
+                // `by_key` does, above.
+                let mut by_tablet: BTreeMap<Option<TabletId>, Vec<(Vec<u8>, KindWriteBatchItem)>> =
+                    BTreeMap::new();
+                let mut by_key: BTreeMap<Vec<u8>, WriteRequest> = BTreeMap::new();
                 for req in reqs {
                     let (pk, sk, op) = match req {
                         WriteRequest::Put(item) => {
@@ -1619,15 +1649,43 @@ async fn dispatch_item_op<E: Env, R: RelayClient>(
                             (pk, sk, KindWriteOp::Delete)
                         }
                     };
-                    match ctx
-                        .cp_kind_write_item(meta, table, &pk, sk.as_ref(), op, None)
-                        .await
-                    {
-                        Ok(_) => {}
-                        Err(e) if e.code == "ProvisionedThroughputExceededException" => {
-                            unprocessed.push((table.clone(), req.clone()));
+                    let base_key = item_key(&pk, sk.as_ref());
+                    by_key.insert(base_key.clone(), req.clone());
+                    let tablet =
+                        crate::topology::tablet_for_key(meta.tablets_for_table(table), &base_key);
+                    by_tablet.entry(tablet).or_default().push((
+                        base_key,
+                        KindWriteBatchItem {
+                            pk,
+                            sk,
+                            op,
+                            condition: None,
+                        },
+                    ));
+                }
+                for (tablet, group) in by_tablet {
+                    if tablet.is_none() {
+                        // An unroutable key (a racing split/provision moved
+                        // the map under this snapshot): the identical
+                        // retryable refusal `marker_batch_write_raw` uses
+                        // for the same situation.
+                        return Err(internal(&format!(
+                            "no tablet for a batch key of table {table}; retry"
+                        )));
+                    }
+                    let (keys, items): (Vec<Vec<u8>>, Vec<KindWriteBatchItem>) =
+                        group.into_iter().unzip();
+                    let results = ctx.cp_kind_write_batch(meta, table, items).await;
+                    for (key, result) in keys.into_iter().zip(results) {
+                        match result {
+                            Ok(_) => {}
+                            Err(e) if e.code == "ProvisionedThroughputExceededException" => {
+                                if let Some(req) = by_key.get(&key) {
+                                    unprocessed.push((table.clone(), req.clone()));
+                                }
+                            }
+                            Err(e) => return Err(e),
                         }
-                        Err(e) => return Err(e),
                     }
                 }
             }
@@ -9297,6 +9355,278 @@ fn rejected_wire_error(code: &str, message: String) -> WireError {
         "ValidationException" => WireError::validation(message),
         other => internal(&format!("{other}: {message}")),
     }
+}
+
+/// [`KindWriteItemReply::Rejected`]'s inverse (issue #996 layer 2) — recovers
+/// a [`WireError`] from a `code`/`message` pair that crossed a forwarded
+/// `KindWriteBatch` hop. Unlike [`decode_relayed_error`] (which recovers a
+/// *whole-request* error string), this is per-item: each item's own outcome
+/// rides its own typed slot, so there is no ambiguous "unmarked string"
+/// case to fall back to — every code this crate can mint for a batched item
+/// (see [`kind_write_batch_at_leader`]'s own doc) is named explicitly, and
+/// anything else degrades to [`internal`], the same closed-set discipline
+/// `decode_relayed_error` already uses.
+fn wire_error_from_batch_rejected(code: String, message: String) -> WireError {
+    match code.as_str() {
+        "ValidationException" => WireError::validation(message),
+        "ProvisionedThroughputExceededException" => {
+            WireError::provisioned_throughput_exceeded(message)
+        }
+        // Issue #994/#996: a still-`decide::read_should_retry`-satisfying
+        // whole-entry propose failure (a frozen/superseded refusal,
+        // `kind_write_batch_at_leader`'s own `Err(e)` arm) is mapped to
+        // `ServiceUnavailable` before it ever reaches this hop — mirroring
+        // `decode_relayed_error`'s identical allowlist entry for the
+        // singular `KindWriteItem` hop, this code must survive the
+        // forwarded `KindWriteBatch` hop unchanged too, or a non-leader
+        // client sees a degraded `InternalServerError` for the identical
+        // condition a leader-local client sees correctly mapped.
+        "ServiceUnavailable" => WireError::service_unavailable(message),
+        _ => internal(&message),
+    }
+}
+
+/// Map one [`kind_write_batch_at_leader`] item result to its wire shape —
+/// the ONE place that mapping happens, shared by `cp_serve_forwarded`'s
+/// `KindWriteBatch` arm and [`ClientCtx::cp_kind_write_batch`]'s own
+/// `Forward` arm's inverse ([`kind_write_item_reply_to_outcome`], below).
+pub(crate) fn kind_write_outcome_to_reply(
+    result: Result<KindWriteOutcome, WireError>,
+) -> KindWriteItemReply {
+    match result {
+        Ok(KindWriteOutcome::Ok {
+            old,
+            new,
+            collection_bytes,
+        }) => KindWriteItemReply::Ok {
+            old,
+            new,
+            collection_bytes,
+        },
+        Ok(KindWriteOutcome::ConditionFailed) => KindWriteItemReply::ConditionFailed,
+        Err(e) => KindWriteItemReply::Rejected {
+            code: e.code.to_string(),
+            message: e.message,
+        },
+    }
+}
+
+/// [`kind_write_outcome_to_reply`]'s inverse — recovers a
+/// `Result<KindWriteOutcome, WireError>` from a wire-carried
+/// [`KindWriteItemReply`], via [`wire_error_from_batch_rejected`].
+pub(crate) fn kind_write_item_reply_to_outcome(
+    reply: KindWriteItemReply,
+) -> Result<KindWriteOutcome, WireError> {
+    match reply {
+        KindWriteItemReply::Ok {
+            old,
+            new,
+            collection_bytes,
+        } => Ok(KindWriteOutcome::Ok {
+            old,
+            new,
+            collection_bytes,
+        }),
+        KindWriteItemReply::ConditionFailed => Ok(KindWriteOutcome::ConditionFailed),
+        KindWriteItemReply::Rejected { code, message } => {
+            Err(wire_error_from_batch_rejected(code, message))
+        }
+    }
+}
+
+/// **The batched sibling of [`kind_write_item_at_leader`]** (issue #996
+/// layer 2 — the animusd-side adoption of layer 1's `KvCommand::
+/// KindEvalBatch`): evaluates every item of one `BatchWriteItem` chunk
+/// against a SINGLE tablet as ONE Raft entry, instead of proposing one
+/// `KindEval` entry per item. Called by `ClientCtx::cp_kind_write_batch`'s
+/// `Local` arm and `cp_serve_forwarded`'s `KindWriteBatch` arm — the SAME
+/// function either way, never a second implementation (mirroring
+/// `kind_write_item_at_leader`'s own "needs no new `ClientRequest` variant"
+/// precedent one layer up: a batch DOES need a new variant, since the
+/// payload shape genuinely differs, but the leader-side evaluation itself
+/// is shared).
+///
+/// **Per-item throttle pre-charge runs IN ORDER, before ever proposing**
+/// (ADR 0065 §2/§3, mirroring the singular function's own pre-charge) —
+/// an item whose own precharge is refused is shed immediately: its own
+/// `Err(WireError::provisioned_throughput_exceeded(..))` slot, never
+/// proposed at all. The admitted rest are batched into ONE
+/// `KvCommand::KindEvalBatch` entry via
+/// [`ClientCtx::cp_kind_eval_batch_local`]. This mirrors
+/// `marker_batch_write_raw`'s own **whole-tablet-group** throttle-shed
+/// shape (ADR 0065's documented "`BatchWriteItem`'s throttle granularity
+/// depends on the table shape it hits" split) at the FINER, per-item
+/// grain an images-carrying table's existing sequential-item throttle
+/// check already had — this function preserves that per-item shedding
+/// exactly, batching only the admission decision's own propose, never the
+/// precharge decision itself.
+///
+/// **Every admitted item's own post-charge/request-rate observation
+/// happens after the batch confirms**, per item, identical in kind to the
+/// singular function's own post-charge step — just looped instead of
+/// called once.
+///
+/// Returns one `Result` per **original** `items` entry, in the same order,
+/// including the throttle-shed ones interleaved in their own original
+/// positions.
+pub(crate) async fn kind_write_batch_at_leader<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+    leader: &CpGroup<E>,
+    meta: &Metadata,
+    table: &str,
+    items: Vec<KindWriteBatchItem>,
+    ttl_expired: bool,
+) -> Vec<Result<KindWriteOutcome, WireError>> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+    let schema = write_schema_for(meta, table);
+    let write_limit = ctx.throttle_limits_for(meta, table).write_units;
+    let tablet_count = meta.tablets_for_table(table).count().max(1);
+
+    /// One admitted item's own identity + the entry it contributes —
+    /// carries its `original_index` so the final `Vec` can be rebuilt in
+    /// the caller's own item order once the batch confirm resolves.
+    struct Admitted {
+        original_index: usize,
+        base_key: Vec<u8>,
+        identity: ProbeIdentity,
+        entry: animus_cp_data::KindEvalEntry,
+        precharge: Option<(TabletId, f64)>,
+    }
+
+    let mut results: Vec<Option<Result<KindWriteOutcome, WireError>>> =
+        Vec::with_capacity(items.len());
+    for _ in 0..items.len() {
+        results.push(None);
+    }
+    let mut admitted: Vec<Admitted> = Vec::with_capacity(items.len());
+
+    for (original_index, item) in items.into_iter().enumerate() {
+        let base_key = item_key(&item.pk, item.sk.as_ref());
+        let precharge_tablet =
+            crate::topology::tablet_for_key(meta.tablets_for_table(table), &base_key);
+        let precharge = match (write_limit, precharge_tablet) {
+            (Some(write_limit), Some(tablet)) => {
+                let share = write_limit as f64 / tablet_count as f64;
+                let cost = kind_write_precharge_units(&item.op);
+                if ctx.throttle.check_write(tablet, share, cost, ctx.env.now()) {
+                    Some((tablet, cost))
+                } else {
+                    ctx.data().raftkv_metrics.incr(Metric::ThrottledWrites);
+                    results[original_index] =
+                        Some(Err(WireError::provisioned_throughput_exceeded(format!(
+                            "table `{table}` exceeds its provisioned write capacity"
+                        ))));
+                    continue;
+                }
+            }
+            _ => None,
+        };
+        let identity = if kind_write_is_idempotent(&item.op) {
+            ProbeIdentity::ValueProves
+        } else {
+            ProbeIdentity::RequiresOwnEntry
+        };
+        let eval_op = kind_write_op_to_eval_op(item.op);
+        let entry = animus_cp_data::KindEvalEntry {
+            schema: schema.clone(),
+            pk: item.pk,
+            sk: item.sk,
+            op: eval_op,
+            condition: item.condition,
+            ttl_expired,
+        };
+        admitted.push(Admitted {
+            original_index,
+            base_key,
+            identity,
+            entry,
+            precharge,
+        });
+    }
+
+    if !admitted.is_empty() {
+        let entries: Vec<animus_cp_data::KindEvalEntry> =
+            admitted.iter().map(|a| a.entry.clone()).collect();
+        let identities: Vec<ProbeIdentity> = admitted.iter().map(|a| a.identity).collect();
+        let base_keys: Vec<Vec<u8>> = admitted.iter().map(|a| a.base_key.clone()).collect();
+
+        match ClientCtx::<E, R>::cp_kind_eval_batch_local(leader, entries, identities, base_keys)
+            .await
+        {
+            Ok(applied) => {
+                for (a, applied) in admitted.into_iter().zip(applied) {
+                    let outcome = match applied {
+                        KindEvalApplied::Ok { old, new } => {
+                            if let Some(tablet) = crate::topology::tablet_for_key(
+                                meta.tablets_for_table(table),
+                                &a.base_key,
+                            ) {
+                                ctx.data().request_rates.observe(tablet, ctx.env.now());
+                            }
+                            if let Some((tablet, precharge)) = a.precharge {
+                                let actual = write_capacity(
+                                    meta,
+                                    table,
+                                    new.as_ref(),
+                                    ReturnConsumedCapacity::Indexes,
+                                )
+                                .map_or(0.0, |cc| cc.total());
+                                ctx.throttle.charge_write(
+                                    tablet,
+                                    actual - precharge,
+                                    ctx.env.now(),
+                                );
+                            }
+                            let collection_bytes = collection_bytes_at_leader(leader).await;
+                            Ok(KindWriteOutcome::Ok {
+                                old,
+                                new,
+                                collection_bytes,
+                            })
+                        }
+                        KindEvalApplied::ConditionFailed => Ok(KindWriteOutcome::ConditionFailed),
+                        KindEvalApplied::Rejected { code, message } => {
+                            Err(rejected_wire_error(&code, message))
+                        }
+                    };
+                    results[a.original_index] = Some(outcome);
+                }
+            }
+            Err(e) => {
+                // Issue #994/#996: this whole-entry propose/pre-propose
+                // failure (e.g. `decide::frozen_refusal`'s pre-propose
+                // check, or a `Sealed` outcome) is the batch grain's own
+                // terminal-return site — unlike the singular
+                // `kind_write_item_at_leader` (whose own `internal(..)`-
+                // wrapped error still reaches `cp_kind_write_item`'s
+                // loop-bottom retry/mapping via its `Local` arm's `Err(e)
+                // => e`), `cp_kind_write_batch`'s `Local`/`Forward` arms
+                // return this function's per-item `Vec<Result<..>>`
+                // immediately, so a still-`decide::read_should_retry`-
+                // satisfying message (a `"; retry"`-suffixed frozen/
+                // superseded refusal) must be mapped to
+                // `WireError::service_unavailable` HERE, or it never
+                // reaches the mapping at all. `map_throttleable_error`
+                // is the same shared mapping point
+                // `fast_marker_write`/`paginated_kind_examine`/
+                // `paginated_kind_examine_one`/`native_scan`/
+                // `raw_quorum_read` already use for an analogous
+                // plain-`String` error.
+                let err =
+                    map_throttleable_error(format!("index-maintaining batch write failed: {e}"));
+                for a in admitted {
+                    results[a.original_index] = Some(Err(err.clone()));
+                }
+            }
+        }
+    }
+
+    results
+        .into_iter()
+        .map(|r| r.unwrap_or_else(|| Err(internal("kind write batch: missing item result"))))
+        .collect()
 }
 
 // `rmw285_confirm_gate` (the issue #285 test-only synchronization hook) is

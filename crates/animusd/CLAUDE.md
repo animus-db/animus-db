@@ -2287,7 +2287,8 @@ regardless of whose entry occupies the index). See
 reproducible truncation regression that proves it end to end.
 
 **Every confirm loop in `write_path.rs` — `cp_kind_eval_local`,
-`cp_kind_raw_local`, `cp_put_local`/`cp_delete_local`, and `poll_probe`'s
+`cp_kind_eval_batch_local` (issue #996 layer 2, below), `cp_kind_raw_local`,
+`cp_put_local`/`cp_delete_local`, and `poll_probe`'s
 own `Inconclusive` tail — shares one wake-on-apply wait,
 `write_path::wait_applied_past`.** It parks on the hosting tablet group's
 `AppliedWatch` (`animus-cp-data`, a multi-waiter watch mirroring
@@ -2309,13 +2310,27 @@ forced `CP_CONFIRM_POLL_MAX`-interval re-check, so a caller's own
 itself — keeps firing on schedule even when the awaited index never
 applies at all (a lost leadership). This is THE confirm loop for every
 single-item write since ADR 0054 step 3 (`PutItem`/`UpdateItem`/
-`DeleteItem`, the TTL reaper, `BatchWriteItem`'s own per-item images arm
-— which the admin seeder rides unchanged since ADR 0021's 2026-09-09
-amendment, no longer having a per-item arm of its own) — a fixed poll
+`DeleteItem`, the TTL reaper — the admin seeder rides the single-item
+funnel unchanged since ADR 0021's 2026-09-09 amendment, no longer having
+a per-item arm of its own) — a fixed poll
 floor of any size caps sequential single-item write throughput
 at however many of it fit in a second, regardless of how fast the
 underlying Raft group actually commits, since the first check right after
-`propose_kind_eval` is almost always `Inconclusive`. Regression tests:
+`propose_kind_eval` is almost always `Inconclusive`. **`BatchWriteItem`'s
+images-carrying arm no longer has a per-item confirm loop at all (issue
+#996 layer 2, 2026-09-20)** — it now commits one `KvCommand::KindEvalBatch`
+entry per tablet per chunk (`dynamo::kind_write_batch_at_leader` →
+`ClientCtx::cp_kind_eval_batch_local`), so the loop above is entered once
+per tablet group, not once per item; `cp_kind_eval_batch_local` reuses
+this exact same `wait_applied_past`/`classify_kind_batch_outcome`/
+`kind_batch_confirm_superseded` trio verbatim, never a bespoke
+`!is_leader()` shortcut, and its lost-payload recovery
+(`kind_eval_batch_confirmed`) is the batch-grain analogue of
+`kind_eval_confirmed` below: an all-or-nothing best-effort re-read across
+every item when every one is `ProbeIdentity::ValueProves`, or a whole-batch
+`KIND_EVAL_CONFIRM_AMBIGUOUS` when any item is `RequiresOwnEntry` — see
+that method's own doc for why the batch-grain recovery rule differs from
+the singular one rather than sharing its code. Regression tests:
 `write_path::kind_eval_confirm_wake_tests` (a virtual-time `SimEnv` bound,
 never wall-clock, proving 20 sequential writes finish with **0ns** of
 measured virtual time — see the module's own doc for the by-hand
@@ -2663,17 +2678,43 @@ data-plane fork (`POST /admin/tablet/split`, this fixture's always-on
 **Same-day follow-on: a post-sleep deadline re-check, so the loop's own
 final iteration can't overwrite a real refusal with a generic one.**
 Every retry loop of this shape (`write_path.rs::cp_kind_write_item`/
-`cp_kind_write_raw_bounded`; `read_path.rs::cp_read`/`cp_read_snapshot`/
-`cp_scan_one`/`cp_scan_kind_one`) checked `now >= deadline` only *before*
-its own `env.sleep(SCHEMA_POLL_INTERVAL)` — so the loop's last iteration
-could sleep past the deadline, loop back to the top, and start a *fresh*
-`cp_route`/`cp_forward` attempt with effectively zero budget left; that
-attempt's own generic timeout/budget-exhausted error (never the real,
-informative one — e.g. `FROZEN_REFUSAL`) then became the value returned,
-even though an earlier iteration had already observed the true cause.
-Fixed by re-checking `now >= deadline` immediately after the sleep too,
-returning the PREVIOUS iteration's own error (mapped through the same
-503 logic where applicable) instead of looping into a doomed attempt.
+`cp_kind_write_batch`/`cp_kind_write_raw_bounded`; `read_path.rs::cp_read`/
+`cp_read_snapshot`/`cp_scan_one`/`cp_scan_kind_one`) checked `now >=
+deadline` only *before* its own `env.sleep(SCHEMA_POLL_INTERVAL)` — so the
+loop's last iteration could sleep past the deadline, loop back to the top,
+and start a *fresh* `cp_route`/`cp_forward` attempt with effectively zero
+budget left; that attempt's own generic timeout/budget-exhausted error
+(never the real, informative one — e.g. `FROZEN_REFUSAL`) then became the
+value returned, even though an earlier iteration had already observed the
+true cause. Fixed by re-checking `now >= deadline` immediately after the
+sleep too, returning the PREVIOUS iteration's own error (mapped through the
+same 503 logic where applicable) instead of looping into a doomed attempt.
+**`cp_kind_write_batch` (`BatchWriteItem`'s images-carrying arm, issue #996
+layer 2) was written against the pre-#994 shape of `cp_kind_write_item` and
+initially shipped without either this re-check or the terminal
+`service_unavailable` mapping below — a sibling loop copied from the
+original before #994's fix landed on it, then merged unfixed. **Porting
+just those two lines into `cp_kind_write_batch`'s own loop turned out not
+to be enough**: unlike `cp_kind_write_item`'s `Local` arm (`Err(e) => e`,
+which feeds a leader-side failure back into this very loop's `err`/retry
+logic), `cp_kind_write_batch`'s `Local` *and* `Forward` arms both `return`
+`dynamo::kind_write_batch_at_leader`'s per-item `Vec<Result<..>>`
+immediately — so a frozen/superseded whole-entry propose failure (the
+realistic case this fix exists for) never reaches this loop's `err` match
+at all; `kind_write_batch_at_leader` (`dynamo.rs`) is the actual terminal-
+return site for that case, and needed the identical
+`decide::read_should_retry` → `WireError::service_unavailable` mapping
+(via the shared `map_throttleable_error`) applied to its own `Err(e)` arm.
+A THIRD site was needed for the non-leader (forwarded) path specifically:
+`wire_error_from_batch_rejected` — the closed-set allowlist that decides
+which `WireError` codes survive a forwarded `KindWriteBatch` hop's
+per-item reply (`kind_write_outcome_to_reply`/its own inverse) — had no
+`"ServiceUnavailable"` entry, degrading it to `InternalServerError` on the
+wire exactly like `decode_relayed_error`'s allowlist would have for
+`KindWriteItem` before #994 added its own entry there; ported the
+identical entry. See
+`docs/lessons/orchestration/2026-09-21-a-sibling-loop-copied-before-a-fix-lands-on-the-original-needs-the-fix-ported-at-merge-time.md`
+for the general lesson and the full three-site account.
 
 **Cross-replica leader-hint fan-out on a stale local view (issue #950,
 fixed).** The "waits for the local group to elect" branch above used to be
@@ -3615,13 +3656,23 @@ refusal there is necessarily **all-or-nothing per tablet-group**: either
 the whole per-tablet group of requests fits the tablet's current token
 balance, or every request in that group is shed to `UnprocessedItems`
 together, even if the balance could have covered some of them individually.
-An **indexed or streamed** table's batch instead routes each request
-through the per-item evaluate-at-leader funnel, one throttle check per
-item, so a partially-exhausted budget sheds only the specific items that
-don't fit. `Operation::BatchWriteItem`'s handler (`dynamo.rs`) reflects this
-directly: the marker arm maps a whole shed tablet-group's base keys back to
-their original `WriteRequest`s via a `BTreeMap`, while the per-item arm
-catches a `ProvisionedThroughputExceededException` one request at a time.
+An **indexed or streamed** table's batch instead runs every request through
+a per-item throttle **pre-charge** check (in submission order) before any
+propose — a refused item is shed straight to its own reply slot with no
+propose at all — so a partially-exhausted budget still sheds only the
+specific items that don't fit, exactly as before. **Since issue #996 layer
+2 (2026-09-20) the admitted items no longer each commit their own Raft
+entry** — every item this tablet's group admits is grouped with its
+tablet-mates and proposed as ONE `KvCommand::KindEvalBatch` entry
+(`dynamo::kind_write_batch_at_leader`), so the throttle *check* stays
+per-item while the *commit* is per-tablet-per-chunk; a shed item never
+reaches that shared entry at all. `Operation::BatchWriteItem`'s handler
+(`dynamo.rs`) reflects the shedding-shape split directly: the marker arm
+maps a whole shed tablet-group's base keys back to their original
+`WriteRequest`s via a `BTreeMap`, while the images-carrying arm catches a
+`ProvisionedThroughputExceededException` one request at a time (via
+`ctx.cp_kind_write_batch`'s per-item `Result` array, in original request
+order) and re-adds only that request to `UnprocessedItems`.
 `BatchGetItem` has no such split — every key is always checked
 individually regardless of table shape, since a read never batches into one
 entry the way a marker write does.
@@ -4390,9 +4441,30 @@ route below the edge through the same `ClientCtx` CP primitives.
   backfill budget under load (regression + guard:
   `stream_write_path_tests::batch_write_on_a_marker_table_commits_one_
   entry_per_tablet`, which pins "one distinct apply HLC per tablet per
-  batch"). Images-carrying tables' requests go through the per-item
-  funnel, atomic per-item only (the old `cp_batch_write` fast path was
-  deleted in rung 5 along with the primitive itself). **`TransactWriteItems` now participates
+  batch"). **Images-carrying tables' requests are atomic per-item only
+  (never across the whole `BatchWriteItem` call, DynamoDB's own contract) —
+  since issue #996 layer 2 (2026-09-20) they are also grouped per tablet
+  and committed as ONE `KvCommand::KindEvalBatch` entry per tablet per
+  chunk**, replacing an earlier per-item-entry design: `dynamo::
+  kind_write_batch_at_leader` pre-charge-checks each item's throttle share
+  in submission order (a refused item is shed with no propose at all,
+  preserving per-item shedding granularity — see this file's own throttle-
+  granularity entry above), then proposes every admitted item of one
+  tablet group in a single entry via `ClientCtx::cp_kind_eval_batch_local`
+  — the batched sibling of `cp_kind_eval_local` (`write_path.rs`), reusing
+  `wait_applied_past`/`classify_kind_batch_outcome`/`kind_batch_confirm_
+  superseded` verbatim. Each item still evaluates its own condition/
+  operation independently against the tablet's current committed state, in
+  commit order, so one item's `ConditionFailed` never aborts its siblings
+  (ADR 0049's 2026-09-20 layer-1 amendment, `animus-cp-data`). **`ClientRequest::
+  KindWriteBatch`/`ClientResponse::KindWriteBatchOk`** (`animus-node::wire`)
+  are the internal-only forwarding pair for this path — classified
+  `Surface::Intra`, refused bare, handled only inside `cp_serve_forwarded`
+  — the multi-item sibling of `KindWriteItem`'s own singular RPC; a
+  per-item error surfaces as an explicit typed `KindWriteItemReply::
+  Rejected { code, message }` slot rather than the singular path's
+  `RELAYED_WIRE_ERROR_MARK` string-marker convention, since a multi-item
+  response has no single top-level error channel. **`TransactWriteItems` now participates
   too (2026-08-16, ADR 0046 A1/U3, `TxnStage` kind-writes stack)** — the
   wholesale per-table rejection this paragraph used to document (a write
   action against an indexed *or* streamed table cancelling the whole

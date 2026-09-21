@@ -43,6 +43,7 @@ pub use control_handle::{ControlHandle, RemoteControlClient};
 pub use sigv4_gate::sigv4_gate;
 pub use sim_relay::{RELAY_STREAM, SimRelayClient};
 pub use wire::{
-    ClientRequest, ClientResponse, KindWriteOp, PendingKindWrite, Surface, TxnPrecondition,
-    TxnTableWrite, TxnWriteCondition, is_relayable_command, surface_of,
+    ClientRequest, ClientResponse, KindWriteBatchItem, KindWriteItemReply, KindWriteOp,
+    PendingKindWrite, Surface, TxnPrecondition, TxnTableWrite, TxnWriteCondition,
+    is_relayable_command, surface_of,
 };
