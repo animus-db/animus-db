@@ -572,6 +572,22 @@ pub enum KindEvalOp {
     },
 }
 
+/// One item's evaluate-at-apply write inside a [`KvCommand::KindEvalBatch`]
+/// entry (ADR 0049's amendment for batched `BatchWriteItem` images, issue
+/// #996) — exactly [`KvCommand::KindEval`]'s own per-item fields, minus
+/// `ts` (shared by the whole entry, exactly like [`KvCommand::KindBatch`]'s
+/// `writes`/`change_log` share one `ts`). See `KindEvalBatch`'s own doc for
+/// what apply does with a `Vec` of these.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KindEvalEntry {
+    pub schema: WriteSchema,
+    pub pk: AttributeValue,
+    pub sk: Option<AttributeValue>,
+    pub op: KindEvalOp,
+    pub condition: Option<ConditionExpression>,
+    pub ttl_expired: bool,
+}
+
 /// The sibling scope set a tablet group owns, derived from its **parent**
 /// scope (this tablet's immutable declared range; F2b — no table prefix),
 /// indexed by kind selector. Each entry's physical prefix is its one kind
@@ -908,12 +924,17 @@ pub enum KvCommand {
     /// attaching it to the replicated outcome would grow every follower's
     /// memory for a value nobody there reads).
     ///
-    /// **UNWIRED as of this PR (ADR 0054's Sequencing step 2)**: no
-    /// producer proposes this variant yet — `kind_write_item_at_leader`
-    /// still evaluates at the leader and proposes `KindBatch`, unchanged.
-    /// This lands ahead of that cutover (step 3) so apply's evaluation, the
-    /// outcome mapping, and the leader-local result-slot plumbing are all
-    /// `SimEnv`-tested in isolation first, each independently revertible.
+    /// **Live since ADR 0054 step 3 — this is now the production
+    /// single-item write path.** (An earlier revision of this doc called
+    /// the variant "UNWIRED as of this PR"/"no production caller yet",
+    /// true only for the PR that first introduced it, ADR 0054's
+    /// Sequencing step 2; that PR landed the apply-time evaluation, the
+    /// outcome mapping, and the leader-local result-slot plumbing ahead of
+    /// its own cutover so each was `SimEnv`-tested in isolation first,
+    /// each independently revertible. Step 3 then cut `kind_write_item_at_
+    /// leader` (`animusd::dynamo`) over to `cp_kind_eval_local`
+    /// (`animusd::write_path`), which is the sole production caller of
+    /// [`RaftKvNode::propose_kind_eval`] today.)
     KindEval {
         schema: WriteSchema,
         pk: AttributeValue,
@@ -921,6 +942,72 @@ pub enum KvCommand {
         op: KindEvalOp,
         condition: Option<ConditionExpression>,
         ttl_expired: bool,
+        ts: HlcTimestamp,
+    },
+    /// **Batched sibling of [`KindEval`](Self::KindEval)** (ADR 0049's
+    /// batched-`BatchWriteItem`-images amendment, issue #996 layer 1): ONE
+    /// Raft entry carrying `N` independent evaluate-at-apply item writes
+    /// for the SAME tablet, all sharing this entry's own `ts` — exactly
+    /// the entry-granularity throughput contract [`KindBatch`](Self::
+    /// KindBatch)'s own multi-item `change_log` already established (one
+    /// entry per tablet per `BatchWriteItem` call, never one per item).
+    /// Every [`KindEvalEntry`] is independent: apply evaluates each one in
+    /// order (see the apply arm's own doc for the exact sequence) against
+    /// the tablet's current committed state, and one item's
+    /// `ConditionFailed`/`Rejected` outcome never aborts its siblings —
+    /// only a whole-entry seal (below) vetoes every item at once.
+    ///
+    /// **Two outcome channels, one per grain, mirroring [`KindEval`](Self::
+    /// KindEval)'s own split**: the replicated [`KindBatchOutcome`] records
+    /// exactly ONE `Applied`/`Sealed{key}` for the WHOLE entry (never a
+    /// per-item breakdown — every item shares one tablet, so a `Freeze`
+    /// either sealed all of them or none, and `classify_kind_batch_
+    /// outcome`/`kind_batch_confirm_superseded` (`animusd`) only ever need
+    /// "did this entry commit and apply," reused verbatim); the per-item
+    /// `Applied { old, new } | ConditionFailed | Rejected { code, message }`
+    /// breakdown ([`KindEvalItemResult`], in order) lives in a SEPARATE,
+    /// leader-local, never-replicated [`KindEvalBatchResults`] slot map —
+    /// putting it in the replicated outcome would grow every follower's
+    /// bounded retention map with full item images for entries only the
+    /// proposer ever reads back, the identical argument [`KindEvalResults`]'
+    /// own doc already makes for the singular variant.
+    ///
+    /// **Same-key duplicates within one entry (a plain `BatchWriteItem`
+    /// call has no duplicate-key validation today — see `animus-dynamo`'s
+    /// `decode_batch_write`) are resolved two ways at once, neither of
+    /// which re-flushes per item.** This is genuinely NEW apply logic — no
+    /// existing command needed it before: `TxnResolve`'s own multi-key
+    /// commit loop is guaranteed distinct keys by `TransactWriteItems`'s
+    /// own wire-level validation, so it never had to consult its own
+    /// in-flight writes mid-loop.
+    /// 1. **The READ side**: an in-apply overlay (`BTreeMap<base_key,
+    ///    Option<Item>>`) consulted before `storage.get`, so a later item
+    ///    sharing an earlier item's key evaluates against that earlier
+    ///    item's own `new` image, never a stale/absent read.
+    /// 2. **The WRITE side**: every item in one entry shares this entry's
+    ///    single `ts`, so two writes to the SAME physical key both carry
+    ///    the identical MVCC version — and [`StorageEngine::merge`]'s
+    ///    per-key LWW takes effect only when its version is STRICTLY
+    ///    greater than the key's current latest, so without a fix the
+    ///    engine would silently keep the FIRST push and drop the second,
+    ///    the opposite of last-write-wins. The apply arm collapses this
+    ///    entry's own accumulated writes to at most one op per physical
+    ///    key, keeping the LAST one, right before they are queued for the
+    ///    engine (see the arm's own doc for why this is sound — `pending`
+    ///    holds exactly this entry's own writes at that point).
+    ///
+    /// Together these preserve today's (undocumented, previously
+    /// accidental) last-write-wins-by-submission-order behavior for a
+    /// duplicate key — before this variant existed, each item of a
+    /// `BatchWriteItem` call was its own Raft entry at its own,
+    /// strictly-increasing `ts`, so a later duplicate naturally overwrote
+    /// an earlier one at the storage layer with no special-casing needed.
+    ///
+    /// **No production caller as of this PR** — `animusd`'s
+    /// `BatchWriteItem` images-carrying arm adopts it in the stacked
+    /// follow-up (layer 2).
+    KindEvalBatch {
+        entries: Vec<KindEvalEntry>,
         ts: HlcTimestamp,
     },
     /// **Split-build seed batch** (ADR 0050 Train B rung 4, fork F3): a chunk
@@ -1694,6 +1781,88 @@ impl KindEvalResults {
     }
 }
 
+/// One item's own outcome inside one [`KvCommand::KindEvalBatch`] entry's
+/// leader-local [`KindEvalBatchResult`] (issue #996 layer 1) — the per-item
+/// sibling of the whole-entry [`KindBatchOutcome`], in the SAME order as
+/// the entry's own `entries: Vec<KindEvalEntry>`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KindEvalItemResult {
+    /// This item's write evaluated cleanly and materialized.
+    Applied {
+        old: Option<Item>,
+        new: Option<Item>,
+    },
+    /// This item's own `condition` evaluated to `Ok(false)` — an ordinary
+    /// `ConditionalCheckFailedException`-shaped no-op for THIS item only;
+    /// every sibling item still applies on its own merits.
+    ConditionFailed,
+    /// This item's own `condition`/`op` evaluation returned `Err` — see
+    /// [`KindBatchOutcome::Rejected`]'s doc for the two cases this covers.
+    /// Like `ConditionFailed`, scoped to this one item.
+    Rejected { code: String, message: String },
+}
+
+/// The leader-local result payload of one `KvCommand::KindEvalBatch` entry
+/// (issue #996 layer 1) — the batched sibling of [`KindEvalResult`]: one
+/// [`KindEvalItemResult`] per entry in the same order as the proposer's own
+/// `entries: Vec<KindEvalEntry>`. See [`KindEvalBatchResults`]'s doc for why
+/// this rides a separate slot map from the singular variant's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KindEvalBatchResult {
+    pub items: Vec<KindEvalItemResult>,
+}
+
+/// The leader-local slot map [`KvCommand::KindEvalBatch`]'s apply arm fills
+/// — a structural clone of [`KindEvalResults`] at the batch grain (issue
+/// #996 layer 1), for the identical memory reasoning: only the ONE node
+/// that proposed a given entry (if any) ever wants its per-item payload
+/// back, so folding it into the replicated [`KindBatchOutcomes`] would make
+/// every follower's bounded-but-nonzero retention map carry full item
+/// images for entries it never asked about. Kept as its own type rather
+/// than reusing [`KindEvalResults`] with a `Vec`-shaped value, so a
+/// `KindEval`/`KindEvalBatch` type mismatch is a compile error at every
+/// call site instead of a runtime "wrong shape" surprise.
+#[derive(Default)]
+struct KindEvalBatchResults {
+    /// See [`KindEvalResults::interested`]'s identical doc.
+    interested: BTreeSet<u64>,
+    /// See [`KindEvalResults::results`]'s identical doc — same index+term
+    /// identity discipline, same non-fixed steady-state size.
+    results: BTreeMap<u64, (u64, KindEvalBatchResult)>,
+}
+
+impl KindEvalBatchResults {
+    /// Same bound and reasoning as [`KindEvalResults::RETAIN`].
+    const RETAIN: u64 = 8192;
+
+    fn register(&mut self, index: u64) {
+        self.interested.insert(index);
+        if self.interested.len() > (Self::RETAIN as usize) * 2 {
+            let cutoff = index.saturating_sub(Self::RETAIN);
+            self.interested = self.interested.split_off(&cutoff);
+        }
+    }
+
+    fn fill(&mut self, index: u64, term: u64, result: KindEvalBatchResult) {
+        if self.interested.remove(&index) {
+            self.results.insert(index, (term, result));
+            if self.results.len() > (Self::RETAIN as usize) * 2 {
+                let cutoff = index.saturating_sub(Self::RETAIN);
+                self.results = self.results.split_off(&cutoff);
+            }
+        }
+    }
+
+    fn take(&mut self, index: u64, term: u64) -> Option<KindEvalBatchResult> {
+        match self.results.get(&index) {
+            Some((recorded_term, _)) if *recorded_term == term => {
+                self.results.remove(&index).map(|(_, result)| result)
+            }
+            _ => None,
+        }
+    }
+}
+
 /// Per-`TxnStage` outcomes recorded at apply time, keyed by the entry's
 /// **Raft log index** and paired with the entry's own **term** — the
 /// [`StageOutcome`] introspection primitive (ADR 0018 §2 apply-time
@@ -2053,6 +2222,9 @@ pub struct RaftKvNode<E: Env, S: StorageEngine> {
     /// Leader-local `KvCommand::KindEval` result payloads (ADR 0054
     /// mechanism 3) — see [`KindEvalResults`]'s doc.
     kind_eval_results: Arc<Mutex<KindEvalResults>>,
+    /// Leader-local `KvCommand::KindEvalBatch` per-item result payloads
+    /// (issue #996 layer 1) — see [`KindEvalBatchResults`]'s doc.
+    kind_eval_batch_results: Arc<Mutex<KindEvalBatchResults>>,
     /// Highest Raft log index the **apply task** has merged into the engine. The
     /// consensus loop advances the core's `last_applied` (its buffer cursor) as soon
     /// as entries are committed+durable, but the async apply task lags behind
@@ -2681,6 +2853,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         let resolve = Arc::new(Mutex::new(ResolveOutcomes::default()));
         let kind_outcomes = Arc::new(Mutex::new(KindBatchOutcomes::default()));
         let kind_eval_results = Arc::new(Mutex::new(KindEvalResults::default()));
+        let kind_eval_batch_results = Arc::new(Mutex::new(KindEvalBatchResults::default()));
         let halted = Arc::new(AtomicBool::new(false));
         let stopped = Arc::new(AtomicBool::new(false));
         let apply_stopped = Arc::new(AtomicBool::new(false));
@@ -2756,6 +2929,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             resolve: Arc::clone(&resolve),
             kind_outcomes: Arc::clone(&kind_outcomes),
             kind_eval_results: Arc::clone(&kind_eval_results),
+            kind_eval_batch_results: Arc::clone(&kind_eval_batch_results),
             engine_applied: Arc::clone(&engine_applied),
             applied_watch: applied_watch.clone(),
             halted: Arc::clone(&halted),
@@ -2796,6 +2970,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             resolve,
             kind_outcomes,
             kind_eval_results,
+            kind_eval_batch_results,
             engine_applied,
             applied_watch,
             wal_lock,
@@ -3330,8 +3505,11 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// out with [`KindEvalResults::RETAIN`], exactly like an unread
     /// `KindBatchOutcome`.
     ///
-    /// **No production caller as of this PR** — see the variant's own
-    /// "UNWIRED" note.
+    /// **Live since ADR 0054 step 3** — `animusd::write_path::
+    /// cp_kind_eval_local` is the sole production caller (see
+    /// [`KvCommand::KindEval`]'s own doc for the full cutover history; an
+    /// earlier revision of this doc said "no production caller as of this
+    /// PR," true only of the PR that first introduced this method).
     pub fn propose_kind_eval(
         &self,
         schema: WriteSchema,
@@ -3394,6 +3572,70 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         self.kind_eval_results
             .lock()
             .expect("kind eval results poisoned")
+            .take(index, term)
+    }
+
+    /// Propose a **batch of self-contained evaluated writes** as ONE Raft
+    /// entry (issue #996 layer 1 — see [`KvCommand::KindEvalBatch`]'s own
+    /// doc for what apply does with them). Mirrors [`propose_kind_eval`]
+    /// (Self::propose_kind_eval) exactly, at the batch grain: `ts` is
+    /// minted once, pushed above every item's own base key (mirroring
+    /// [`put_kind_batch`](Self::put_kind_batch)'s identical multi-key
+    /// `mint_pushed` call), and this node's interest in the entry's
+    /// leader-local per-item payload is registered — under the SAME `core`
+    /// lock the apply task needs — before `core` is ever dropped, for the
+    /// identical race-freedom reason `propose_kind_eval`'s own doc gives.
+    ///
+    /// **No production caller as of this PR** — `animusd`'s
+    /// `BatchWriteItem` images-carrying arm adopts it in the stacked
+    /// follow-up (layer 2).
+    pub fn propose_kind_eval_batch(&self, entries: Vec<KindEvalEntry>) -> ProposeResult {
+        let mut core = self.lock();
+        let term = core.term();
+        let keys: Vec<Vec<u8>> = entries
+            .iter()
+            .map(|e| kind_eval_base_key(&e.pk, e.sk.as_ref()))
+            .collect();
+        let ts = self.mint_pushed(term, &keys);
+        let command = KvCommand::KindEvalBatch { entries, ts };
+        let result = record_propose(&self.metrics, core.propose(command));
+        if let ProposeResult::Accepted { index, .. } = result {
+            self.last_proposed_ts.store(hlc::pack(ts), Ordering::SeqCst);
+            core.note_local_activity(self.env.now());
+            // Register interest BEFORE dropping `core` — see
+            // `propose_kind_eval`'s own doc for why that ordering is what
+            // makes the registration race-free rather than merely
+            // usually-fine.
+            self.kind_eval_batch_results
+                .lock()
+                .expect("kind eval batch results poisoned")
+                .register(index);
+        }
+        drop(core);
+        if matches!(result, ProposeResult::Accepted { .. }) {
+            self.propose_signal.notify();
+            // See `propose_ordered`'s identical note: a single-node group's
+            // `core.propose` can advance commit + apply inline.
+            self.apply_signal.notify();
+        }
+        result
+    }
+
+    /// Take back the leader-local per-item result payload of the
+    /// `KvCommand::KindEvalBatch` entry committed at Raft log `index`
+    /// (issue #996 layer 1) — the batched sibling of
+    /// [`take_kind_eval_result`](Self::take_kind_eval_result), same
+    /// index-and-term identity discipline, same "removes the slot on a
+    /// hit" contract.
+    #[must_use]
+    pub fn take_kind_eval_batch_result(
+        &self,
+        index: u64,
+        term: u64,
+    ) -> Option<KindEvalBatchResult> {
+        self.kind_eval_batch_results
+            .lock()
+            .expect("kind eval batch results poisoned")
             .take(index, term)
     }
 
@@ -7491,6 +7733,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     resolve: &Arc<Mutex<ResolveOutcomes>>,
     kind_outcomes: &Arc<Mutex<KindBatchOutcomes>>,
     kind_eval_results: &Arc<Mutex<KindEvalResults>>,
+    kind_eval_batch_results: &Arc<Mutex<KindEvalBatchResults>>,
     engine_applied: &AtomicU64,
     applied_watch: &AppliedWatch,
     wal_lock: &AsyncMutex<()>,
@@ -8056,6 +8299,186 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     .lock()
                     .expect("kind batch outcomes poisoned")
                     .record(index, term, outcome);
+            }
+            KvCommand::KindEvalBatch { entries, ts } => {
+                assert_ts_monotonic(max_applied_ts, ts);
+                // Read every EARLIER entry's writes in this same apply pass
+                // before this entry's own reads — the identical
+                // read-after-flush discipline `Cas`/`KindEval` already use
+                // — flushed ONCE for the whole entry, never per item: a
+                // same-key collision BETWEEN two items of THIS entry is
+                // handled below by `overlay`, not by re-flushing (see
+                // `KvCommand::KindEvalBatch`'s own doc for why a per-item
+                // flush would defeat the entry-granularity throughput this
+                // variant exists to provide).
+                flush_pending(storage, &mut pending, metrics, halted).await;
+                // Whole-entry seal check, mirroring `KindBatch`'s own
+                // `carries_user_data`/`sealed_key` scan: every item in one
+                // `KindEvalBatch` entry shares this tablet's single range,
+                // so either every item's base key is sealed (a `Freeze`
+                // already applied) or none are — there is no torn
+                // "half-sealed" state to represent. Scanning every item
+                // defensively costs nothing (`entries.len()` is bounded by
+                // `BatchWriteItem`'s own 25-item wire cap).
+                let sealed_key = entries.iter().find_map(|entry| {
+                    let bk = kind_eval_base_key(&entry.pk, entry.sk.as_ref());
+                    is_sealed(sealed, &bk).then_some(bk)
+                });
+                if let Some(key) = sealed_key {
+                    // No per-item results filled — `take_kind_eval_batch_
+                    // result`'s own caller must treat a `Sealed` outcome as
+                    // "nothing to take", exactly like `KindEval`'s own
+                    // Sealed path.
+                    kind_outcomes
+                        .lock()
+                        .expect("kind batch outcomes poisoned")
+                        .record(index, term, KindBatchOutcome::Sealed { key });
+                } else {
+                    // In-apply overlay (NEW logic — see `KvCommand::
+                    // KindEvalBatch`'s own doc for why no existing command
+                    // needed this before: `TxnResolve`'s multi-key commit
+                    // loop is guaranteed distinct keys by
+                    // `TransactWriteItems`'s own wire-level validation).
+                    // Consulted BEFORE `storage.get` so a later item whose
+                    // key duplicates an EARLIER item's in this same entry
+                    // observes that earlier write, preserving today's
+                    // (undocumented) last-write-wins-by-submission-order
+                    // behavior for a duplicate `BatchWriteItem` key — with
+                    // zero extra `merge_batch`/sync calls in the common
+                    // (all-distinct-keys) case.
+                    let mut overlay: BTreeMap<Vec<u8>, Option<Item>> = BTreeMap::new();
+                    let mut next_ordinal: u32 = 0;
+                    let mut items: Vec<KindEvalItemResult> = Vec::with_capacity(entries.len());
+                    for entry in &entries {
+                        let base_key = kind_eval_base_key(&entry.pk, entry.sk.as_ref());
+                        let token = animus_tablet::partition_token(&animus_item::storage_key(
+                            &entry.pk, None,
+                        ));
+                        let old: Option<Item> = if let Some(cached) = overlay.get(&base_key) {
+                            cached.clone()
+                        } else {
+                            let raw = storage
+                                .get(&scope.physical(&base_key))
+                                .await
+                                .expect("raftkv kind eval batch read");
+                            match raw.map(|vv| txn::decode_envelope(&vv.value)) {
+                                // An unresolved intent from a concurrent
+                                // transaction makes "the current committed
+                                // value" ambiguous for THIS item only —
+                                // never guess; siblings still evaluate on
+                                // their own merits (see this variant's own
+                                // doc: one item's no-op never aborts
+                                // another's).
+                                Some(txn::Envelope::Intent { .. }) => {
+                                    items.push(KindEvalItemResult::ConditionFailed);
+                                    continue;
+                                }
+                                Some(txn::Envelope::Committed(bytes)) => {
+                                    animus_item::decode_stored_item(&bytes)
+                                        .expect("raftkv kind eval batch decode")
+                                }
+                                None => None,
+                            }
+                        };
+                        match evaluate_kind_eval(
+                            &entry.schema,
+                            &entry.pk,
+                            entry.sk.as_ref(),
+                            &token,
+                            old,
+                            &entry.op,
+                            entry.condition.as_ref(),
+                            entry.ttl_expired,
+                        ) {
+                            KindEvalDecision::ConditionFailed => {
+                                items.push(KindEvalItemResult::ConditionFailed);
+                            }
+                            KindEvalDecision::Rejected { code, message } => {
+                                items.push(KindEvalItemResult::Rejected { code, message });
+                            }
+                            KindEvalDecision::Applied {
+                                writes,
+                                change_log,
+                                old,
+                                new,
+                            } => {
+                                // Record this item's own `new` image in the
+                                // overlay BEFORE moving on — a later item
+                                // sharing this same key must see it.
+                                overlay.insert(base_key, new.clone());
+                                // ADR 0046 binding decision, reused
+                                // verbatim: the ONE shared materialization
+                                // helper `KindBatch`'s/`KindEval`'s own arms
+                                // and `TxnResolve`'s commit branch also
+                                // call. `next_ordinal` threads across this
+                                // loop exactly like `TxnResolve`'s own
+                                // multi-key commit loop (issue #852) so
+                                // every item's change record lands at a
+                                // distinct `(ts, ordinal)` pair.
+                                let starting = next_ordinal;
+                                next_ordinal = materialize_derived(
+                                    kind_scopes,
+                                    &writes,
+                                    std::slice::from_ref(&change_log),
+                                    ts,
+                                    &mut pending,
+                                    next_ordinal,
+                                );
+                                if next_ordinal > starting {
+                                    note_hot_change_write(hot_change_max, ts, next_ordinal - 1);
+                                }
+                                items.push(KindEvalItemResult::Applied { old, new });
+                            }
+                        }
+                    }
+                    // Collapse this entry's own pending writes to at most ONE
+                    // op per PHYSICAL key, keeping the LAST one pushed.
+                    // `pending` holds exactly (and only) this entry's own
+                    // writes here — `flush_pending` emptied it above, and
+                    // nothing else can touch it mid-arm — so this cannot
+                    // affect any other entry.
+                    //
+                    // Needed because [`StorageEngine::merge`]'s per-key LWW
+                    // takes effect only when its `version` is STRICTLY
+                    // greater than the key's current latest: two writes to
+                    // the SAME physical key sharing this entry's one `ts`
+                    // (the same-key-duplicate case `overlay` above makes
+                    // read-consistent) would otherwise silently keep the
+                    // FIRST push and drop the second — the opposite of the
+                    // last-write-wins behavior this variant preserves for a
+                    // duplicate `BatchWriteItem` key (see this variant's own
+                    // doc). Every change-log op's own key is unique per item
+                    // (it carries that item's `ordinal`), so this can only
+                    // ever collapse a genuine BASE/LSI collision, never a
+                    // change record.
+                    let mut last_index_for_key: BTreeMap<Vec<u8>, usize> = BTreeMap::new();
+                    for (i, op) in pending.iter().enumerate() {
+                        last_index_for_key.insert(op.key.clone(), i);
+                    }
+                    let mut keep = vec![false; pending.len()];
+                    for &i in last_index_for_key.values() {
+                        keep[i] = true;
+                    }
+                    let mut next = 0;
+                    pending.retain(|_| {
+                        let k = keep[next];
+                        next += 1;
+                        k
+                    });
+                    // ONE `KindBatchOutcome::Applied` for the whole entry —
+                    // never a per-item breakdown in the replicated map (see
+                    // this variant's own doc) — plus the ordered per-item
+                    // breakdown in the leader-local, never-replicated
+                    // `KindEvalBatchResults` slot map.
+                    kind_outcomes
+                        .lock()
+                        .expect("kind batch outcomes poisoned")
+                        .record(index, term, KindBatchOutcome::Applied);
+                    kind_eval_batch_results
+                        .lock()
+                        .expect("kind eval batch results poisoned")
+                        .fill(index, term, KindEvalBatchResult { items });
+                }
             }
             KvCommand::Delete { key, ts } => {
                 assert_ts_monotonic(max_applied_ts, ts);
@@ -10099,6 +10522,7 @@ struct DriveState<E: Env, S: StorageEngine> {
     resolve: Arc<Mutex<ResolveOutcomes>>,
     kind_outcomes: Arc<Mutex<KindBatchOutcomes>>,
     kind_eval_results: Arc<Mutex<KindEvalResults>>,
+    kind_eval_batch_results: Arc<Mutex<KindEvalBatchResults>>,
     engine_applied: Arc<AtomicU64>,
     applied_watch: AppliedWatch,
     wal_lock: Arc<AsyncMutex<()>>,
@@ -10207,6 +10631,7 @@ fn command_ts(command: &KvCommand) -> Option<HlcTimestamp> {
         | KvCommand::Batch { ts, .. }
         | KvCommand::KindBatch { ts, .. }
         | KvCommand::KindEval { ts, .. }
+        | KvCommand::KindEvalBatch { ts, .. }
         | KvCommand::SeedBatch { ts, .. }
         | KvCommand::Delete { ts, .. }
         | KvCommand::Cas { ts, .. }
@@ -10274,6 +10699,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         resolve,
         kind_outcomes,
         kind_eval_results,
+        kind_eval_batch_results,
         engine_applied,
         applied_watch,
         wal_lock,
@@ -10545,6 +10971,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         resolve,
         kind_outcomes,
         kind_eval_results,
+        kind_eval_batch_results,
         Arc::clone(&engine_applied),
         applied_watch.clone(),
         Arc::clone(&wal_lock),
@@ -11131,6 +11558,7 @@ async fn apply_loop<E: Env, S: StorageEngine>(
     resolve: Arc<Mutex<ResolveOutcomes>>,
     kind_outcomes: Arc<Mutex<KindBatchOutcomes>>,
     kind_eval_results: Arc<Mutex<KindEvalResults>>,
+    kind_eval_batch_results: Arc<Mutex<KindEvalBatchResults>>,
     engine_applied: Arc<AtomicU64>,
     applied_watch: AppliedWatch,
     wal_lock: Arc<AsyncMutex<()>>,
@@ -11197,6 +11625,7 @@ async fn apply_loop<E: Env, S: StorageEngine>(
             &resolve,
             &kind_outcomes,
             &kind_eval_results,
+            &kind_eval_batch_results,
             &engine_applied,
             &applied_watch,
             &wal_lock,

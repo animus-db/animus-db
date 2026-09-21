@@ -830,7 +830,7 @@ State once here; cross-referenced from the sections below.
   double, and an `LsmEngine`-backed `Disk::sync`-counting fsync-count
   proof — both `MemoryEngine`/`SimEnv` alone can't observe).
 - **`KvCommand::KindEval` — the self-contained evaluated write (ADR 0054
-  step 2), unwired.** This crate now depends on `animus-item` (`WriteSchema`/
+  step 2), live since step 3.** This crate now depends on `animus-item` (`WriteSchema`/
   `derive_kind_writes`/`AttributeValue`/`Item`/`ConditionExpression`/
   `UpdateAction` — no `animus-env`/wire-crate transitively pulled in).
   Unlike `KindBatch` (leader-evaluated bytes + an apply-time OCC seatbelt
@@ -916,6 +916,89 @@ State once here; cross-referenced from the sections below.
   replaying two entries to the identical state including the stale LSI
   row's removal. `animus-item`'s own `write_schema` module carries
   `derive_kind_writes`'s pure-function unit tests.
+- **`KvCommand::KindEvalBatch` — the batched sibling of `KvCommand::
+  KindEval` (ADR 0049's batched-`BatchWriteItem`-images amendment, issue
+  #996 layer 1), no production caller yet.** One Raft entry, `entries:
+  Vec<KindEvalEntry>` (each entry the identical `schema`/`pk`/`sk`/`op`/
+  `condition`/`ttl_expired` fields `KindEval` carries, minus `ts` — shared
+  by the whole entry) plus one shared `ts`, closing the same per-item-entry
+  throughput gap `KindBatch.change_log`'s own `Vec` shape closed for the
+  marker-table path (one entry per tablet per `BatchWriteItem` call, never
+  one per item). Codec tag `17`, version `31` — each entry's four rich
+  nested fields ride the identical `put_json`-per-field convention
+  `KindEval` established.
+
+  **Apply order**: `assert_ts_monotonic`; `flush_pending` ONCE, up front
+  (never per item — a same-entry same-key collision is handled by the
+  overlay below, not by re-flushing); a whole-entry seal check over every
+  item's own base key (either every item is sealed or none are, since they
+  all share this tablet's one range) — sealed records a single
+  `KindBatchOutcome::Sealed{key}` and materializes nothing; otherwise loop
+  the entries in commit order, evaluating each via the identical
+  `evaluate_kind_eval` core `KindEval` uses, threading `next_ordinal`
+  across `materialize_derived` calls exactly like `TxnResolve`'s own
+  multi-key commit loop (issue #852) so every item's change record lands
+  at a distinct `(ts, ordinal)` pair. One item's own `ConditionFailed`/
+  `Rejected` never aborts its siblings.
+
+  **Per-entry-singular vs. per-item-local results — the same split
+  `KindEval` uses, at the batch grain.** The replicated `KindBatchOutcome`
+  records exactly ONE `Applied`/`Sealed{key}` for the WHOLE entry — never a
+  per-item breakdown — so `classify_kind_batch_outcome`/`kind_batch_
+  confirm_superseded` (`animusd`) need no changes at all. The ordered
+  per-item `KindEvalItemResult` (`Applied { old, new } | ConditionFailed |
+  Rejected { code, message }`) breakdown lives in a NEW, leader-local,
+  never-replicated `KindEvalBatchResults` slot map — a structural clone of
+  `KindEvalResults` at the batch grain (same `register`/`fill`/`take`
+  shape, same `RETAIN = 8192`, same index-**and**-term identity
+  discipline: `take_kind_eval_batch_result(index, term)` never trusts a
+  term mismatch). `RaftKvNode::propose_kind_eval_batch` mints `ts` via
+  `mint_pushed` pushed above every item's own base key (mirroring
+  `put_kind_batch`'s multi-key call) and registers this node's interest
+  before dropping `core`, identically to `propose_kind_eval`'s own
+  race-freedom argument.
+
+  **The overlay rule — genuinely new apply logic, plus a storage-layer
+  gotcha it does NOT by itself fix.** A `BatchWriteItem` call has no
+  duplicate-key validation today (unlike `TransactWriteItems`'s own
+  check), and before this variant, a duplicate "worked" only because each
+  item was its own Raft entry at its own, strictly-increasing `ts` — a
+  later duplicate naturally overwrote an earlier one at the storage layer.
+  Once every item shares one entry's one `ts`, two things are needed, not
+  one:
+  1. A `BTreeMap<base_key, Option<Item>>` overlay, consulted before
+     `storage.get`, populated with each applied item's own `new` — so a
+     later item sharing an earlier item's key evaluates against that
+     earlier item's write, not a stale/absent read. This alone is new: no
+     existing command needed it (`TxnResolve`'s own multi-key loop is
+     guaranteed distinct keys by `TransactWriteItems`'s wire validation).
+  2. **The write side, found by this layer's own test (c)**:
+     `StorageEngine::merge`'s per-key LWW takes effect only when its
+     version is STRICTLY greater than the key's current latest — two
+     items writing the identical physical key at this entry's one shared
+     `ts` carry the identical version, so without a further fix the engine
+     silently keeps the FIRST push and drops the second (the opposite of
+     last-write-wins). The apply arm closes this by collapsing the
+     entry's own accumulated `pending` writes to at most one op per
+     physical key (keeping the LAST) right before they queue for the
+     engine — sound specifically because `flush_pending` ran once, up
+     front, so `pending` holds exactly (and only) this entry's own writes
+     at that point. See `docs/lessons/code-patterns/2026-09-20-a-batched-
+     entry-sharing-one-ts-can-silently-drop-a-same-key-duplicates-write.md`
+     for the generalizable version of this finding.
+
+  **No production caller as of this PR** — `animusd`'s `BatchWriteItem`
+  images-carrying arm adopts it in the stacked follow-up (layer 2), the
+  same staging discipline `KindEval` itself used ahead of its own step-3
+  cutover. Tests: `tests/kind_eval.rs`'s `kind_eval_batch_*` scenarios
+  (distinct-key application with ordered change records, per-item
+  independence under a failed sibling condition, the same-key duplicate,
+  the frozen-tablet whole-entry seal, and term identity);
+  `tests/kind_eval_batch_fault.rs` (leader-kill truncation, follower-kill-
+  mid-commit convergence, crash/restart WAL replay); and `animus-test`'s
+  `stream_lineage_corpus.rs::kind_eval_batch_delivers_every_item_exactly_
+  once_in_order` (the `(hlc, ordinal)` exactly-once walk end to end,
+  including a mid-commit leader kill).
 - **The value envelope + transactions (`txn.rs`).** Every value the apply
   path merges into the engine is 1-byte-tagged: `0` = committed (raw value
   follows), `1` = an intent naming the staging `TxnId`, its record's

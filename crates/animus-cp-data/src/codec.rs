@@ -236,7 +236,18 @@ const MAGIC: u8 = 0xCB;
 /// — but `RaftMsg<KvCommand>` is the same generic type this crate's own
 /// hand-rolled codec must stay exhaustive over regardless. Same house
 /// convention: a clean bump, no cross-version compatibility required.
-const VERSION: u8 = 30;
+/// `31` (ADR 0049's batched-`BatchWriteItem`-images amendment, issue #996
+/// layer 1): new `KvCommand::KindEvalBatch` (tag `17`, the next free tag
+/// after `KindEval`'s `16`) — one Raft entry carrying `N` independent
+/// [`crate::KindEvalEntry`] evaluate-at-apply item writes for the same
+/// tablet, plus the standard trailing `ts` (see the variant's own doc).
+/// Each entry is encoded with the identical `put_json`-framed-blob
+/// convention version `25` established for `KindEval`'s own rich, nested
+/// field types (`schema`/`pk`/`sk`/`op`/`condition`), length-prefixed as a
+/// `Vec` the same way every other untrusted wire count is (capped
+/// pre-allocation, see this module's own top-level doc). Same house
+/// convention: a clean bump, no cross-version compatibility required.
+const VERSION: u8 = 31;
 
 /// A decode failure: a description of what was malformed, surfaced loudly by
 /// the caller (logged + dropped; never silently misread).
@@ -626,6 +637,19 @@ fn put_command(out: &mut Vec<u8>, c: &KvCommand) {
             put_bool(out, *ttl_expired);
             put_ts(out, *ts);
         }
+        KvCommand::KindEvalBatch { entries, ts } => {
+            put_u8(out, 17);
+            out.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+            for entry in entries {
+                put_json(out, &entry.schema);
+                put_json(out, &entry.pk);
+                put_json(out, &entry.sk);
+                put_json(out, &entry.op);
+                put_json(out, &entry.condition);
+                put_bool(out, entry.ttl_expired);
+            }
+            put_ts(out, *ts);
+        }
         KvCommand::SeedBatch { rows, ts } => {
             put_u8(out, 13);
             out.extend_from_slice(&(rows.len() as u32).to_be_bytes());
@@ -920,6 +944,26 @@ fn read_command(c: &mut Cursor<'_>) -> Result<KvCommand, DecodeError> {
             ttl_expired: c.bool()?,
             ts: read_ts(c)?,
         },
+        17 => {
+            let n = c.u32()?;
+            // Capped pre-allocation against an untrusted wire count — see
+            // `read_kind_writes`'s comment for why.
+            let mut entries = Vec::with_capacity(n.min(1 << 20) as usize);
+            for _ in 0..n {
+                entries.push(crate::KindEvalEntry {
+                    schema: c.json()?,
+                    pk: c.json()?,
+                    sk: c.json()?,
+                    op: c.json()?,
+                    condition: c.json()?,
+                    ttl_expired: c.bool()?,
+                });
+            }
+            KvCommand::KindEvalBatch {
+                entries,
+                ts: read_ts(c)?,
+            }
+        }
         13 => {
             let n = c.u32()?;
             // Capped pre-allocation against an untrusted wire count — see
@@ -1635,6 +1679,59 @@ mod tests {
                     )),
                     ttl_expired: true,
                     ts: ts(11, 0),
+                },
+                config: None,
+                learners: None,
+            },
+            // Issue #996 layer 1 (version 31): the batched sibling — two
+            // independent entries in one `KindEvalBatch`, each exercising
+            // its own `put_json`-blob fields, plus one whose `condition`
+            // is `None` (the `Put` case, no update actions) to cover both
+            // shapes in one roundtrip.
+            LogEntry {
+                term: 8,
+                index: 31,
+                command: KvCommand::KindEvalBatch {
+                    entries: vec![
+                        crate::KindEvalEntry {
+                            schema: animus_item::WriteSchema {
+                                key: animus_item::TableSchema::simple("pk"),
+                                lsis: Vec::new(),
+                                change_records_carry_images: false,
+                            },
+                            pk: animus_item::AttributeValue::S("bob".to_owned()),
+                            sk: None,
+                            op: crate::KindEvalOp::Put(
+                                [(
+                                    "pk".to_owned(),
+                                    animus_item::AttributeValue::S("bob".to_owned()),
+                                )]
+                                .into_iter()
+                                .collect(),
+                            ),
+                            condition: None,
+                            ttl_expired: false,
+                        },
+                        crate::KindEvalEntry {
+                            schema: animus_item::WriteSchema {
+                                key: animus_item::TableSchema::composite("pk", "sk"),
+                                lsis: vec![animus_item::LsiDef {
+                                    name: "byAge".to_owned(),
+                                    sort_attribute: "age".to_owned(),
+                                    projection: animus_item::Projection::All,
+                                }],
+                                change_records_carry_images: true,
+                            },
+                            pk: animus_item::AttributeValue::S("carol".to_owned()),
+                            sk: Some(animus_item::AttributeValue::N("7".to_owned())),
+                            op: crate::KindEvalOp::Delete,
+                            condition: Some(animus_item::ConditionExpression::AttributeExists(
+                                "pk".to_owned(),
+                            )),
+                            ttl_expired: true,
+                        },
+                    ],
+                    ts: ts(12, 0),
                 },
                 config: None,
                 learners: None,
