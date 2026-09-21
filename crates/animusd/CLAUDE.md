@@ -3368,6 +3368,19 @@ handler's `select! { changed(..), sleep(8s) }` always falls through to the
 timeout arm and replies with stale-but-plausible cached data up to 8s late.
 A fixed-sleep assertion right after a test's node-kill can be outrun by
 this; poll to convergence instead (see the engineering-lessons log).
+**Issue #1019 (2026-09-21) showed this hazard is real but self-healing**
+(traced: the zombie replies after exactly 8.0s, the loop's next candidate
+answers in ~50ms) and that the same test's 30s "leaderless/under-
+replicated" timeout had a *second*, unrelated cause: a tablet group the
+killed node led stayed leaderless permanently because a learner's
+promotion entry had reached the other voters but not the learner itself
+(fixed in `animus-control`'s vote handlers — see that crate's guide and
+`docs/lessons/testing/2026-09-21-a-convergence-poll-timeout-must-dump-
+each-replicas-own-raft-view.md`). A kill issued right after the
+control-plane `tablet_map` converges lands on the data plane's
+still-running reconfigure, so a timeout in a growth-then-kill test must
+dump every survivor's own `/admin/raftkv` `role`/`term`/`voters`/
+`learners`, not just leader/replica counts.
 **This specific scenario is unchanged by the issue #596 cancellation**
 (see the "`handle_connection` cancels an in-flight request" entry in the
 module map above): #596 detects the *caller's* socket closing, and here

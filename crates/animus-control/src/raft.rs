@@ -589,6 +589,37 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     role: Role,
     current_term: u64,
     voted_for: Option<NodeId>,
+    // Issue #1019: a **liveness hint, not hard state** — deliberately never
+    // persisted (no WAL record, no `PersistedState` field), unlike
+    // `voted_for` itself. A VOTER's own vote-lease protection
+    // (`handle_pre_vote`'s `voted_lease`) decays for free once its election
+    // timer fires, because firing transitions it away from `Follower`/
+    // `Candidate` into `PreCandidate` — `voted_lease`'s own role check is
+    // what ends the protection, not a `voted_for` mutation (see
+    // `start_pre_vote`'s doc). A non-voter (`!is_voter()`) can never make
+    // that transition, so without a separate signal its lease would
+    // protect a real vote it once granted FOREVER, even once the candidate
+    // it voted for has been dead for many election timeouts — reinstating
+    // issue #1019's deadlock through the `voted_lease` door instead of the
+    // `is_voter()`-on-granting door the primary fix closed. This flag is
+    // that non-voter-only substitute signal: `start_pre_vote`'s `!self.
+    // is_voter()` early-return branch sets it `true` (mirrors clearing
+    // `leader_id` there, but for the vote lease instead of the leader
+    // belief), and it is reset `false` at every site that legitimately
+    // re-arms the protection (a fresh real-vote grant or self-vote) or
+    // that already independently clears `voted_for` on a term change.
+    // **Deliberately does NOT clear `voted_for` itself** — `voted_for` is
+    // real Raft hard state whose whole job is "at most one real vote per
+    // term," and the candidate-side tally (`self.config.contains(&from)`)
+    // does NOT make clearing it safe: in exactly the scenario this exists
+    // for, the responder IS already a voter in the CANDIDATES' own
+    // (majority-committed) config — only the responder's OWN view is
+    // stale — so a cleared `voted_for` really could let this node grant
+    // two different real candidates a vote in the same term, letting two
+    // of them each reach a majority and producing two leaders in one term.
+    // The vote itself stays recorded; only the PRE-VOTE lease (a liveness
+    // optimization, never a safety mechanism) is allowed to lapse.
+    vote_lease_lapsed: bool,
     // The log holds entries with index > `snapshot_index`; `log[i].index ==
     // snapshot_index + 1 + i`. Entries up to `snapshot_index` are covered by the
     // state-machine snapshot (`metadata` reflects them) and discarded.
@@ -1101,6 +1132,7 @@ where
             role: Role::Follower,
             current_term: 0,
             voted_for: None,
+            vote_lease_lapsed: false,
             log: Vec::new(),
             snapshot_index: 0,
             snapshot_term: 0,
@@ -2370,6 +2402,12 @@ where
         if !is_pre_vote && msg.term() > self.current_term {
             self.current_term = msg.term();
             self.voted_for = None;
+            // Issue #1019: a fresh term makes any prior lease-lapsed memory
+            // moot (see `vote_lease_lapsed`'s own doc) — reset it alongside
+            // `voted_for` for symmetry, though `voted_lease`'s own
+            // `voted_for.is_some()` conjunct already makes this a no-op at
+            // this exact instant.
+            self.vote_lease_lapsed = false;
             self.role = Role::Follower;
             self.leader_id = None;
             // Issue #595: a provably newer term exists elsewhere, so
@@ -3029,21 +3067,50 @@ where
         last_log_term: u64,
         now: Nanos,
     ) -> Vec<Out<C>> {
+        // Issue #1019: `!self.vote_lease_lapsed` is the non-voter-only escape
+        // hatch documented on the `vote_lease_lapsed` field itself — always
+        // `false` (a no-op conjunct) for a voter, since only the `!is_voter()`
+        // branch of `start_pre_vote` ever sets it `true`.
         let voted_lease = matches!(self.role, Role::Follower | Role::Candidate)
             && self.voted_for.is_some()
-            && now.0 < self.election_deadline.0;
+            && now.0 < self.election_deadline.0
+            && !self.vote_lease_lapsed;
         let has_live_leader = self.role == Role::Leader
             || (self.leader_id.is_some() && now.0 < self.election_deadline.0)
             || voted_lease;
         let log_ok = last_log_term > self.last_log_term()
             || (last_log_term == self.last_log_term() && last_log_index >= self.last_log_index());
-        // ADR 0058 Train 1: a learner never pre-votes — it is never solicited
-        // in the first place (`start_pre_vote` broadcasts to `peers`, which
-        // stays voter-only), but this is a cheap, structurally-load-bearing
-        // second line of defense: even a stray/injected `PreVote` addressed to
-        // a learner can never be granted, so a learner's presence or absence
-        // can never influence a pre-vote majority.
-        let granted = self.is_voter() && !has_live_leader && term >= self.current_term && log_ok;
+        // Issue #1019 (2026-09-21 amendment to ADR 0058 Train 1): the
+        // RESPONDER must never gate granting on its own `is_voter()` view.
+        // A membership-change entry takes effect the instant it is
+        // *appended* to this node's own log (`log_append` -> `apply_config`),
+        // not once it is committed — so a node's local `config`/`learners`
+        // split can be stale relative to what a majority of the cluster has
+        // already durably adopted. Concretely: a leader appends {L,A,B,C}
+        // (promoting learner C) and replicates it to A and B, reaching a
+        // 3-of-4 majority and committing — but C itself, which `promote_learner`
+        // only required to be caught up to within
+        // `RECONFIGURE_LEARNER_CATCH_UP_THRESHOLD` entries (not fully
+        // replicated), may not have received that entry yet when the leader
+        // dies. If C rejects a real candidate's request on the grounds that
+        // *C's own* `is_voter()` is still false, the group is permanently
+        // stuck: A and B alone can never reach a majority of 4, and C can
+        // only learn it is now a voter by hearing from a leader — which
+        // will never again exist. This is a real, reproduced deadlock (see
+        // `tests/learner_promotion_leader_crash.rs`), not a hypothetical.
+        // Standard Raft/etcd-raft semantics avoid it: a responder grants
+        // (or withholds) purely on term, log up-to-dateness, and vote lease
+        // — never on its own membership view. The "a learner never
+        // influences an election" safety property does not need a
+        // responder-side gate to hold: it is enforced on the CANDIDATE side,
+        // where `handle_pre_vote_resp`/`handle_vote_resp` only ever tally a
+        // grant that satisfies `self.config.contains(&from)` (the
+        // candidate's own, always-committed-or-later config), and
+        // `start_election`/`start_pre_vote` already refuse to campaign at
+        // all when `!is_voter()`. A stray/injected `PreVote` reaching a
+        // learner can therefore still be granted here without any safety
+        // consequence — it simply won't count toward anyone's majority.
+        let granted = !has_live_leader && term >= self.current_term && log_ok;
         vec![(
             candidate,
             RaftMsg::PreVoteResp {
@@ -3094,6 +3161,9 @@ where
             // that moves our term — and only up to the responder's real term).
             self.current_term = term;
             self.voted_for = None;
+            // Issue #1019: same reasoning as `handle`'s own generic
+            // higher-term step-down — see `vote_lease_lapsed`'s own doc.
+            self.vote_lease_lapsed = false;
             self.role = Role::Follower;
             self.leader_id = None;
             // Issue #595: same reasoning as `handle`'s own generic
@@ -3135,10 +3205,32 @@ where
             // would otherwise defeat. See `begin_cluster_check`'s doc.
             let cluster_checked =
                 !self.cluster_check_refused && self.cluster_check_pending.is_none();
-            // ADR 0058 Train 1: a learner never grants a real vote either
-            // (mirrors `handle_pre_vote`'s identical gate/rationale).
-            if self.is_voter() && can_vote && log_ok && cluster_checked {
+            // Issue #1019 (2026-09-21 amendment to ADR 0058 Train 1): same
+            // reasoning as `handle_pre_vote`'s identical amendment — the
+            // RESPONDER must never gate granting on its own `is_voter()`
+            // view, since a learner-promotion entry takes effect on append
+            // (not commit) and a not-yet-caught-up promoted learner can be
+            // asked to grant before it has that entry. Gating this on the
+            // responder's own membership would reproduce the exact
+            // permanent-deadlock scenario `handle_pre_vote`'s comment
+            // above describes, for the real election instead of pre-vote.
+            // The `cluster_checked` gate (issue #667) is untouched — it
+            // guards against a different hazard (an empty-store node's
+            // locally-unreliable `voted_for.is_none()`) and has nothing to
+            // do with membership. As with pre-vote, the "a learner never
+            // influences an election" property is enforced candidate-side:
+            // `handle_vote_resp` only tallies a grant with
+            // `self.config.contains(&from)`, and `start_election` refuses
+            // to campaign at all when `!is_voter()`.
+            if can_vote && log_ok && cluster_checked {
                 self.voted_for = Some(candidate.clone());
+                // Issue #1019: a fresh real-vote grant re-arms the pre-vote
+                // lease this grant is meant to protect (see
+                // `vote_lease_lapsed`'s own doc) — load-bearing for a
+                // non-voter specifically, whose lease can otherwise only
+                // ever lapse, never re-arm, once its own timer has fired at
+                // least once.
+                self.vote_lease_lapsed = false;
                 self.reset_election_timer(now, entropy);
                 true
             } else {
@@ -3828,6 +3920,75 @@ where
         // is otherwise fully caught up. Mirrors that gate exactly; see
         // `state_machine_behind`'s own doc.
         if !self.is_voter() || self.state_machine_behind {
+            // Issue #1019: a non-voter (learner, or a node not yet added at
+            // all) can never itself campaign — but its belief that a
+            // particular node is the live leader, and its own lease on a
+            // real vote it once granted, must still decay on exactly the
+            // same "haven't heard from anyone in a full election timeout"
+            // signal a voter's does below, or neither ever decays at all.
+            //
+            // For a VOTER this decay is a side effect of the very next
+            // lines: it becomes `PreCandidate`, which (a) clears `leader_id`
+            // directly and (b) makes `handle_pre_vote`'s `voted_lease` check
+            // evaluate false from then on purely because its OWN role is no
+            // longer `Follower`/`Candidate` — `voted_for` itself is left
+            // untouched, the role change alone is what stops it protecting
+            // its old vote. A non-voter can never make that role change (it
+            // stays `Follower` forever, by the very gate this branch is
+            // inside), so it never gets that role-based decay "for free":
+            // before this fix, a learner that had ever heard from a leader
+            // (`leader_id`) or ever granted a real vote (`voted_for`, whose
+            // protection window is `voted_lease`) kept believing/protecting
+            // it FOREVER — even once the leader/candidate in question has
+            // been dead for many election timeouts — because nothing else
+            // ever clears either signal for a node that never campaigns
+            // (the generic higher-term step-down in `handle` only fires on
+            // a REAL, term-bumping message, which can itself never arrive
+            // while every voter is stuck unable to reach a pre-vote
+            // majority without this very node's grant). `handle_pre_vote`'s
+            // `has_live_leader`/`voted_lease` gates read `leader_id`/
+            // `vote_lease_lapsed` directly, so either one staying stale
+            // silently reinstates the exact permanent deadlock the
+            // responder-side `is_voter()` removal (this same issue, see
+            // `handle_pre_vote`'s own doc) was meant to close.
+            //
+            // **`voted_for` itself is deliberately left untouched — clearing
+            // it here would be a real safety hole, not merely redundant.**
+            // `voted_for` is Raft hard state whose whole job is "at most one
+            // real vote per term"; the candidate-side tally
+            // (`self.config.contains(&from)`) does NOT make clearing it
+            // harmless, because in exactly the scenario this branch exists
+            // for, the responder genuinely IS a voter in the CANDIDATES' own
+            // (majority-committed) config — only the responder's OWN,
+            // stale-by-append-not-commit view says otherwise (see
+            // `handle_pre_vote`'s own doc for why that gap exists at all).
+            // Concretely: voters {L(dead), A, B, C, D}, term T, with C and D
+            // both missing their own promotion entries. If a timer-driven
+            // clear let C real-vote for A, then (once C's own timer fires
+            // again) real-vote for B, both still in term T, A and D's config
+            // already counts C as a voter (3 of 5) — two leaders, one term.
+            // So only the PRE-VOTE lease (a liveness optimization,
+            // `voted_lease`, never itself a safety mechanism — the real
+            // safety property is "at most one real vote per term," fully
+            // intact regardless of whether this lease is honored) is allowed
+            // to lapse, via `vote_lease_lapsed` (see that field's own doc):
+            // a genuine PRE-vote can now be granted once the lease lapses,
+            // but a REAL vote for a second candidate in the same term still
+            // cannot (`handle_request_vote`'s `can_vote` never consults this
+            // flag). Regression: `tests/learner_promotion_leader_crash.rs`'s
+            // seed sweep (the liveness half) and
+            // `tests/non_voter_vote_lease.rs` (the safety half, proving a
+            // second REAL vote in the same term still fails even once the
+            // lease has lapsed). Scoped to the `!is_voter()` half only
+            // (never `state_machine_behind`, an unrelated, already-a-voter
+            // condition this branch also short-circuits on) — a learner
+            // still never campaigns itself, it just stops silently vouching
+            // for a leader it hasn't heard from in a while, and stops
+            // protecting (pre-vote-wise only) a real vote it once granted.
+            if !self.is_voter() {
+                self.leader_id = None;
+                self.vote_lease_lapsed = true;
+            }
             self.reset_election_timer(now, entropy);
             return Vec::new();
         }
@@ -3885,6 +4046,12 @@ where
         self.role = Role::Candidate;
         self.current_term += 1;
         self.voted_for = Some(self.id.clone());
+        // Issue #1019: a fresh self-vote re-arms the pre-vote lease (see
+        // `vote_lease_lapsed`'s own doc) — a no-op for a node that has
+        // always been a voter (this branch is unreachable otherwise), but
+        // load-bearing for a node freshly promoted from learner that still
+        // carries a stale `true` from before its promotion.
+        self.vote_lease_lapsed = false;
         self.leader_id = None;
         self.votes.clear();
         self.votes.insert(self.id.clone());
