@@ -454,6 +454,52 @@ async fn raftkv_groups(admin_addr: SocketAddr) -> Vec<(u64, NodeId, bool)> {
         .unwrap_or_default()
 }
 
+/// One fetch of `/admin/raftkv`, formatted as one compact diagnostic line
+/// per group carrying the raw `CpRaftView` fields `raftkv_groups` above
+/// summarizes away: `role`, `leader`, `term`, `commit_index`, `voters`,
+/// `learners` (see `CpRaftView` in `crates/animusd/src/admin.rs` for the
+/// field names). Used only where the tablet/node/is_leader triple isn't
+/// enough to tell a genuine Raft-level election deadlock (a leaderless
+/// group whose voters/learners never converge) apart from an ordinary
+/// still-in-progress reconfiguration — a health-poll timeout, and once,
+/// pre-kill, so a failure log always shows the data-plane config the kill
+/// landed on.
+async fn raftkv_group_details(admin_addr: SocketAddr) -> Vec<String> {
+    let (status, body) = admin(admin_addr, "GET", "/admin/raftkv", None).await;
+    if status != 200 {
+        return vec![format!(
+            "(raftkv fetch failed: status={status} body={body})"
+        )];
+    }
+    body["groups"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|g| {
+                    let tablet = g["tablet"].as_u64().unwrap_or_default();
+                    let node = g["node"].as_str().unwrap_or("?");
+                    let role = g["role"].as_str().unwrap_or("?");
+                    let leader = g["leader"].as_str().unwrap_or("None");
+                    let term = g["term"].as_u64().unwrap_or_default();
+                    let commit = g["commit_index"].as_u64().unwrap_or_default();
+                    let voters: Vec<&str> = g["voters"]
+                        .as_array()
+                        .map(|v| v.iter().filter_map(|x| x.as_str()).collect())
+                        .unwrap_or_default();
+                    let learners: Vec<&str> = g["learners"]
+                        .as_array()
+                        .map(|v| v.iter().filter_map(|x| x.as_str()).collect())
+                        .unwrap_or_default();
+                    format!(
+                        "tablet={tablet} node={node} role={role} leader={leader} \
+                         term={term} commit={commit} voters={voters:?} learners={learners:?}"
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Regression for the dashboard health rollup (`dashboard_core.js`'s
 /// `computeHealth()`): 3 -> 5 (growth) -> kill an ORIGINAL core node (index 0
 /// — a control-core member, which can never be decommissioned via
@@ -529,6 +575,18 @@ async fn dashboard_health_recovers_after_grown_cluster_loses_an_original_node() 
     // this is a different asymmetry than killing a grown node.
     let kill_idx = 0;
     let killed_id = all_raftkv_ids[kill_idx].clone();
+
+    // Dump every node's own raw `/admin/raftkv` Raft view right before the
+    // kill, so a future failure log shows the data-plane config the kill
+    // actually landed on (role/term/voters/learners per group, not just
+    // leader/replica counts) — cheap, and directly diagnostic for the
+    // learner-promotion deadlock class described below.
+    for &addr in &all_admin {
+        for line in raftkv_group_details(addr).await {
+            println!("pre-kill raftkv: addr={addr} {line}");
+        }
+    }
+
     nodes[kill_idx].shutdown();
     let survivor_idx: Vec<usize> = (0..5).filter(|&i| i != kill_idx).collect();
     let survivor_admin: Vec<SocketAddr> = survivor_idx.iter().map(|&i| all_admin[i]).collect();
@@ -576,41 +634,127 @@ async fn dashboard_health_recovers_after_grown_cluster_loses_an_original_node() 
     // died — a normal-looking, merely stale, reply. A single fixed 3s beat
     // (this test's original shape) is comfortably outrun by that ~8s
     // worst case; poll instead, with a generous overall budget.
-    let health = async {
-        loop {
-            let mut groups_by_tablet: BTreeMap<u64, Vec<(NodeId, bool)>> = BTreeMap::new();
+    //
+    // Issue #1019 turned up a SECOND, independent way this poll can time
+    // out: a tablet group whose leader was the killed node can deadlock
+    // leaderless when a learner's promotion entry reached the other voters
+    // but not the learner itself — fixed in `animus-control`'s vote
+    // handlers (regression `crates/animus-control/tests/
+    // learner_promotion_leader_crash.rs`). That failure mode is visible
+    // only in a group's raw Raft view — `role`/`term`/`voters`/`learners`,
+    // never in the summarized `(tablet, node, is_leader)` triple
+    // `raftkv_groups` returns — which is why the timeout panic below dumps
+    // every survivor's per-group Raft view via `raftkv_group_details`
+    // rather than only leader/replica counts.
+    //
+    // Deadline-checked loop rather than `timeout(..).await.unwrap_or_else
+    // (panic)` — this poll failed once in CI (issue #1019) with nothing but
+    // "never converged" to go on, so the timeout branch below carries the
+    // last observed state instead: a per-tablet verdict against `final_map`,
+    // each survivor's own `tablet_map`/`raftkv_groups` view (to catch a
+    // stale `remote_metadata` mirror on a grown node — compare epochs), and
+    // the poll's own trajectory via a change-triggered `health poll:` trace.
+    type GroupsByTablet = BTreeMap<u64, Vec<(NodeId, bool)>>;
+    const HEALTH_BUDGET: Duration = Duration::from_secs(30);
+    const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(500);
+    let health_start = std::time::Instant::now();
+    let mut health_iters = 0usize;
+    let mut last_trace: Option<(usize, usize, GroupsByTablet)> = None;
+    let groups_by_tablet = loop {
+        health_iters += 1;
+        let mut groups_by_tablet: GroupsByTablet = BTreeMap::new();
+        for &addr in &survivor_admin {
+            for (tablet, node, is_leader) in raftkv_groups(addr).await {
+                let seen = groups_by_tablet.entry(tablet).or_default();
+                if !seen.iter().any(|(n, _)| *n == node) {
+                    seen.push((node, is_leader));
+                }
+            }
+        }
+
+        let mut leaderless = 0usize;
+        let mut under_replicated = 0usize;
+        for (tablet, (replicas, _epoch)) in &final_map {
+            let gs = groups_by_tablet.get(tablet).cloned().unwrap_or_default();
+            let has_leader = gs.iter().any(|(_, l)| *l);
+            let configured = replicas.len();
+            if !has_leader {
+                leaderless += 1;
+            } else if configured > 0 && gs.len() < configured {
+                under_replicated += 1;
+            }
+        }
+
+        let changed = last_trace.as_ref().is_none_or(|(l, u, g)| {
+            *l != leaderless || *u != under_replicated || g != &groups_by_tablet
+        });
+        if changed {
+            println!(
+                "health poll: iter={health_iters} elapsed={:?} leaderless={leaderless} \
+                 under_replicated={under_replicated} {groups_by_tablet:?}",
+                health_start.elapsed(),
+            );
+            last_trace = Some((leaderless, under_replicated, groups_by_tablet.clone()));
+        }
+
+        if leaderless == 0 && under_replicated == 0 {
+            break groups_by_tablet;
+        }
+
+        if health_start.elapsed() >= HEALTH_BUDGET {
+            // Per-tablet verdict against `final_map`'s configured replica
+            // set, plus each survivor's own view of the tablet map and raw
+            // `/admin/raftkv` groups — so a stale `remote_metadata` mirror
+            // on a grown node (mismatched epoch) is visible, and it's clear
+            // which node reported what.
+            let mut verdict = String::new();
+            for (tablet, (replicas, epoch)) in &final_map {
+                let gs = groups_by_tablet.get(tablet).cloned().unwrap_or_default();
+                let has_leader = gs.iter().any(|(_, l)| *l);
+                let status = if !has_leader {
+                    "leaderless"
+                } else if gs.len() < replicas.len() {
+                    "under-replicated"
+                } else {
+                    "ok"
+                };
+                verdict.push_str(&format!(
+                    "  tablet {tablet} (epoch {epoch}): configured={replicas:?} \
+                     observed={gs:?} -> {status}\n"
+                ));
+            }
+
+            let mut survivor_views = String::new();
             for &addr in &survivor_admin {
-                for (tablet, node, is_leader) in raftkv_groups(addr).await {
-                    let seen = groups_by_tablet.entry(tablet).or_default();
-                    if !seen.iter().any(|(n, _)| *n == node) {
-                        seen.push((node, is_leader));
-                    }
+                let map = tablet_map(addr).await;
+                let groups = raftkv_groups(addr).await;
+                survivor_views.push_str(&format!(
+                    "  survivor {addr}: tablet_map={map:?}\n  survivor {addr}: \
+                     raftkv_groups={groups:?}\n"
+                ));
+                // Raw per-group Raft view (role/leader/term/commit/voters/
+                // learners) — one fetch per survivor, only here on timeout,
+                // never per poll iteration — so a leaderless-learner
+                // election deadlock (issue #1019) is distinguishable from
+                // an ordinary still-converging reconfiguration.
+                for line in raftkv_group_details(addr).await {
+                    survivor_views.push_str(&format!("  survivor {addr}: raftkv detail: {line}\n"));
                 }
             }
 
-            let mut leaderless = 0usize;
-            let mut under_replicated = 0usize;
-            for (tablet, (replicas, _epoch)) in &final_map {
-                let gs = groups_by_tablet.get(tablet).cloned().unwrap_or_default();
-                let has_leader = gs.iter().any(|(_, l)| *l);
-                let configured = replicas.len();
-                if !has_leader {
-                    leaderless += 1;
-                } else if configured > 0 && gs.len() < configured {
-                    under_replicated += 1;
-                }
-            }
-            if leaderless == 0 && under_replicated == 0 {
-                return groups_by_tablet;
-            }
-            sleep(Duration::from_millis(500)).await;
+            panic!(
+                "cluster never converged to zero leaderless/under-replicated tablets within \
+                 {HEALTH_BUDGET:?} (elapsed={:?}, iterations={health_iters}, \
+                 leaderless={leaderless}, under_replicated={under_replicated})\n\
+                 per-tablet verdict (against final_map):\n{verdict}\
+                 per-survivor views (compare epochs for a stale remote_metadata mirror):\n\
+                 {survivor_views}",
+                health_start.elapsed(),
+            );
         }
+
+        sleep(HEALTH_POLL_INTERVAL).await;
     };
-    let groups_by_tablet = timeout(Duration::from_secs(30), health)
-        .await
-        .unwrap_or_else(|_| {
-            panic!("cluster never converged to zero leaderless/under-replicated tablets within 30s")
-        });
     println!("groups_by_tablet: {groups_by_tablet:?}");
 
     let down_count = final_statuses.values().filter(|s| *s == "Down").count();
