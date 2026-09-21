@@ -6144,7 +6144,15 @@ pub struct Node {
     /// their listener ports.
     envs: Vec<ProdEnv>,
     /// The client-facing listener tasks (client TCP / dynamo HTTP), which
-    /// run on plain `tokio::spawn` off the `Env` network; aborted on shutdown.
+    /// run on plain `tokio::spawn` off the `Env` network; aborted on
+    /// shutdown. **Covers each listener's own accept-loop task only, not
+    /// its per-connection handlers** (issue #1010) — `serve_requests`
+    /// (client + intra) owns those in a `tokio::task::JoinSet` local to
+    /// the accept-loop future itself, so aborting the accept-loop task
+    /// here (or an internal `ProdEnv` role's own registry aborting it)
+    /// cascades into that `JoinSet`'s `Drop`, which aborts every live
+    /// handler in turn — see `serve_requests`'s own doc for the full
+    /// mechanism. No handler is ever tracked in this `Vec` directly.
     tasks: Vec<tokio::task::JoinHandle<()>>,
     /// This node's own edge state (ADR 0031 PR2 — cheap to clone, `Arc`-wrapped
     /// internally), kept so [`shutdown_graceful`](Self::shutdown_graceful) can
@@ -6606,6 +6614,17 @@ impl Node {
     /// Latches every hosted CP group's `halted` flag first, exactly like
     /// [`shutdown`](Self::shutdown) — see that method's doc; this path
     /// hard-aborts the same driver tasks, just with an added wait afterward.
+    ///
+    /// **Also the mechanism that stops every live per-connection handler**
+    /// (issue #1010): aborting `serve_requests`'s own accept-loop task
+    /// (in `self.tasks`) drops its future, and with it the `tokio::task::
+    /// JoinSet` that future owns — whose `Drop` aborts every handler still
+    /// live in it, cascade-style. So "every listener port this node owns
+    /// is genuinely free" (this method's own doc above) also means "no
+    /// handler this node ever accepted a connection for is still running",
+    /// not just the accept loop itself. See `serve_requests`'s own doc for
+    /// the full mechanism and why it isn't instead routed through
+    /// `ProdEnv`'s own abort registry.
     pub async fn shutdown_and_wait(&self) {
         self.edge.halt_hosted_cp_groups();
         self.halt_local_control();
@@ -13445,40 +13464,93 @@ async fn median_split_key<E: Env>(group: &CpGroup<E>) -> Option<Vec<u8>> {
 /// now genuinely mirrors `animus_env::prod::spawn_accept`'s contract,
 /// which this doc comment used to claim without the code actually doing
 /// it.
+///
+/// **Every accepted connection's handler is owned by a `tokio::task::
+/// JoinSet` local to this function, not a bare `tokio::spawn`** (issue
+/// #1010): a plain fire-and-forget spawn is invisible to [`Node::
+/// shutdown_and_wait`], which only ever aborts the two tasks running this
+/// function itself (`Node.tasks`) plus whatever each internal `ProdEnv`
+/// role's own registry tracks — a handler accepted moments before teardown
+/// was in neither set, so it kept running (and its `ClientCtx` kept living)
+/// past the node's own shutdown, exactly the `full_split_cluster_restart_
+/// recovers_metadata_and_data`-style hazard `docs/lessons/testing/
+/// 2026-09-20-allocate-test-ports-by-binding-and-holding-never-probe-and-
+/// release.md` names as a second, independent TOCTOU on top of the raw
+/// port one. Deliberately **not** routed through `ctx.env.spawn_task`/
+/// `ProdEnv`'s own abort registry either: that registry is append-only for
+/// the lifetime of the env (`Inner.tasks: Mutex<Vec<AbortHandle>>`,
+/// `animus-env/src/prod.rs`) — fine for the handful of long-lived
+/// per-node driver loops it already holds, but one registration per
+/// accepted connection on a long-lived process would be an unbounded
+/// leak of dead `AbortHandle`s, never pruned until the whole env shuts
+/// down. A `JoinSet` is the right home instead: owned by this accept-loop
+/// future itself, so when [`Node::shutdown_and_wait`] aborts the task
+/// running this function and its future is dropped, the `JoinSet`'s own
+/// `Drop` aborts every handler still live in it — a cascade, not a second
+/// tracked collection anyone has to remember to drain. This is what
+/// makes `shutdown_and_wait`'s "listener dropped, port free" contract
+/// also mean "no handler outlives the node": the listener and every
+/// handler it ever accepted go down together, by construction, the moment
+/// this function's own task is aborted.
+///
+/// The loop below `select!`s the listener's own `accept()` (cancel-safe —
+/// dropping this future between polls, e.g. because the other branch won
+/// a race, leaves nothing accepted and nothing lost) against reaping one
+/// finished handler off the `JoinSet` (guarded by `!handlers.is_empty()`
+/// so an empty set is never polled — `JoinSet::join_next()` on an empty
+/// set resolves `None` immediately, which would otherwise busy-loop this
+/// arm). A reaped handler's `JoinError` is logged at `error` if it was a
+/// genuine panic (something this loop should never silently swallow) and
+/// at most `debug` if it was merely cancelled/aborted (the ordinary
+/// shutdown path, not a defect).
 async fn serve_requests(
     listener_socket: TcpListener,
     ctx: ClientCtx,
     listener: ListenerKind,
     tls: Option<tokio_rustls::TlsAcceptor>,
 ) {
+    let mut handlers: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
     loop {
-        match listener_socket.accept().await {
-            Ok((stream, peer_addr)) => {
-                let ctx = ctx.clone();
-                let tls = tls.clone();
-                tokio::spawn(async move {
-                    let stream = match tls {
-                        None => MaybeTlsStream::Plain(stream),
-                        Some(acceptor) => match acceptor.accept(stream).await {
-                            Ok(s) => MaybeTlsStream::Tls(Box::new(s.into())),
-                            Err(err) => {
-                                tracing::warn!(
-                                    ?err,
-                                    %peer_addr,
-                                    "client-protocol TLS handshake failed (dropping connection)"
-                                );
-                                return;
+        tokio::select! {
+            accepted = listener_socket.accept() => {
+                match accepted {
+                    Ok((stream, peer_addr)) => {
+                        let ctx = ctx.clone();
+                        let tls = tls.clone();
+                        handlers.spawn(async move {
+                            let stream = match tls {
+                                None => MaybeTlsStream::Plain(stream),
+                                Some(acceptor) => match acceptor.accept(stream).await {
+                                    Ok(s) => MaybeTlsStream::Tls(Box::new(s.into())),
+                                    Err(err) => {
+                                        tracing::warn!(
+                                            ?err,
+                                            %peer_addr,
+                                            "client-protocol TLS handshake failed (dropping connection)"
+                                        );
+                                        return;
+                                    }
+                                },
+                            };
+                            if let Err(err) = handle_connection(stream, ctx, listener).await {
+                                tracing::debug!(?err, "connection closed");
                             }
-                        },
-                    };
-                    if let Err(err) = handle_connection(stream, ctx, listener).await {
-                        tracing::debug!(?err, "connection closed");
+                        });
                     }
-                });
+                    Err(err) => {
+                        tracing::warn!(?err, "accept failed (retrying)");
+                        tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                    }
+                }
             }
-            Err(err) => {
-                tracing::warn!(?err, "accept failed (retrying)");
-                tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+            Some(finished) = handlers.join_next(), if !handlers.is_empty() => {
+                if let Err(join_err) = finished {
+                    if join_err.is_panic() {
+                        tracing::error!(?join_err, "connection handler task panicked");
+                    } else {
+                        tracing::debug!(?join_err, "connection handler task cancelled");
+                    }
+                }
             }
         }
     }

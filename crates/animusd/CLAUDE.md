@@ -5798,11 +5798,18 @@ ADR itself for the full design/rationale.
   rule in `docs/engineering-lessons.md` (machine relay →
   `intra_leader_hint`; anything a human reads → `leader_hint`).
 - **`handle_connection` cancels an in-flight request when the peer closes the
-  connection (issue #596), on both listeners.** `serve_requests` still
-  spawns one untracked, fire-and-forget task per accepted connection (see
-  the `WatchMetadata` gotcha below for what that still doesn't fix), but
-  the per-connection loop itself no longer runs a request to completion
-  with nobody listening: `handle_connection` splits the socket
+  connection (issue #596), on both listeners.** `serve_requests` used to
+  spawn one untracked, fire-and-forget `tokio::spawn` per accepted
+  connection — invisible to `Node::shutdown_and_wait`, so a handler
+  accepted just before teardown could outlive its node with a live
+  `ClientCtx` (issue #1010). It now owns every handler in a `tokio::task::
+  JoinSet` local to the accept-loop future itself, so aborting that future
+  (what `shutdown_and_wait` already does) cascades into the `JoinSet`'s own
+  `Drop`, aborting every live handler — see `serve_requests`'s own doc for
+  the full mechanism and why it isn't routed through `ProdEnv`'s own abort
+  registry instead. Independent of that fix, the per-connection loop
+  itself no longer runs a request to completion with nobody listening:
+  `handle_connection` splits the socket
   (`TcpStream::into_split`) once, then races `handle_request(..)` against a
   `peer_closed(&mut read_half)` future in a `tokio::select! { biased; .. }`
   — `biased` so a response that finishes at the same poll as the
