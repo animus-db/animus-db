@@ -210,6 +210,36 @@ fn crash_drops_unfsynced_batch_tail() {
     });
 }
 
+/// The leader's own `flush_batch` error (issue #939) must reach every waiter
+/// riding the same failed batch verbatim — not just the generic "wal
+/// group-commit sync failed" prefix. Two concurrent writers land in the same
+/// batch (the leader yields once after enqueueing, letting the second writer
+/// enqueue before the leader claims `pending`), so both `put`s must return an
+/// error whose text names the injected disk failure.
+#[test]
+fn leader_sync_error_surfaces_underlying_disk_text_to_every_waiter() {
+    let seed = 0x51C2;
+    let sim = Simulator::new(seed);
+    // Interrupt the very first sync: both writers below share that one batch.
+    let env = CrashEnv::new(sim.env(nid(0)), 1);
+    let engine = block_on(LsmEngine::open_with(env.clone(), PREFIX, opts())).expect("open");
+
+    let (leader_result, waiter_result) =
+        block_on(async { futures::join!(engine.put(b"a", b"1", 1), engine.put(b"b", b"2", 2)) });
+
+    for (who, result) in [("leader", leader_result), ("waiter", waiter_result)] {
+        let err = result.expect_err(&format!(
+            "seed={seed}: {who}'s write must fail when the leader's sync fails"
+        ));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("fsync interrupted by crash"),
+            "seed={seed}: {who}'s error must carry the leader's underlying disk \
+             error text, not just the generic prefix, got: {msg}"
+        );
+    }
+}
+
 /// An `Env` wrapper that delegates everything to an inner [`SimEnv`] but interrupts
 /// the `nth` `sync`: that sync neither persists the buffered bytes nor errors at the
 /// disk — instead it leaves the bytes un-durable and returns an error, modelling a
