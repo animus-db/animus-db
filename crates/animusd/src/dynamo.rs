@@ -9372,6 +9372,16 @@ fn wire_error_from_batch_rejected(code: String, message: String) -> WireError {
         "ProvisionedThroughputExceededException" => {
             WireError::provisioned_throughput_exceeded(message)
         }
+        // Issue #994/#996: a still-`decide::read_should_retry`-satisfying
+        // whole-entry propose failure (a frozen/superseded refusal,
+        // `kind_write_batch_at_leader`'s own `Err(e)` arm) is mapped to
+        // `ServiceUnavailable` before it ever reaches this hop — mirroring
+        // `decode_relayed_error`'s identical allowlist entry for the
+        // singular `KindWriteItem` hop, this code must survive the
+        // forwarded `KindWriteBatch` hop unchanged too, or a non-leader
+        // client sees a degraded `InternalServerError` for the identical
+        // condition a leader-local client sees correctly mapped.
+        "ServiceUnavailable" => WireError::service_unavailable(message),
         _ => internal(&message),
     }
 }
@@ -9585,7 +9595,27 @@ pub(crate) async fn kind_write_batch_at_leader<E: Env, R: RelayClient>(
                 }
             }
             Err(e) => {
-                let err = internal(&format!("index-maintaining batch write failed: {e}"));
+                // Issue #994/#996: this whole-entry propose/pre-propose
+                // failure (e.g. `decide::frozen_refusal`'s pre-propose
+                // check, or a `Sealed` outcome) is the batch grain's own
+                // terminal-return site — unlike the singular
+                // `kind_write_item_at_leader` (whose own `internal(..)`-
+                // wrapped error still reaches `cp_kind_write_item`'s
+                // loop-bottom retry/mapping via its `Local` arm's `Err(e)
+                // => e`), `cp_kind_write_batch`'s `Local`/`Forward` arms
+                // return this function's per-item `Vec<Result<..>>`
+                // immediately, so a still-`decide::read_should_retry`-
+                // satisfying message (a `"; retry"`-suffixed frozen/
+                // superseded refusal) must be mapped to
+                // `WireError::service_unavailable` HERE, or it never
+                // reaches the mapping at all. `map_throttleable_error`
+                // is the same shared mapping point
+                // `fast_marker_write`/`paginated_kind_examine`/
+                // `paginated_kind_examine_one`/`native_scan`/
+                // `raw_quorum_read` already use for an analogous
+                // plain-`String` error.
+                let err =
+                    map_throttleable_error(format!("index-maintaining batch write failed: {e}"));
                 for a in admitted {
                     results[a.original_index] = Some(Err(err.clone()));
                 }

@@ -315,6 +315,97 @@ fn replays_frozen_refusal_service_unavailable_from_an_explicit_env_seed() {
 }
 
 // ---------------------------------------------------------------------------
+// Scenario A': the same frozen-GSI-table refusal, but through
+// `BatchWriteItem` (`write_path.rs::cp_kind_write_batch`, issue #996 layer
+// 2) rather than a single `PutItem` (`cp_kind_write_item`) — the semantic-
+// merge gap issue #996 left behind when it copied `cp_kind_write_item`'s
+// retry loop before PR #1017 (issue #994) landed the post-sleep deadline
+// re-check and the terminal `ServiceUnavailable` mapping on the ORIGINAL.
+// Without both ports, a `BatchWriteItem` whose whole group hits an
+// exhausted-budget freeze reports a bare `500 InternalServerError` instead
+// of `503 ServiceUnavailable`, exactly the mixed signal #994 removed for
+// the single-item path.
+// ---------------------------------------------------------------------------
+
+fn run_frozen_gsi_table_batch_write_item_returns_service_unavailable(seed: u64) {
+    let mut cluster = SimCluster::new(seed, 3, 3);
+
+    // A table with a declared GSI -- `table_change_records_carry_images`
+    // routes every `BatchWriteItem` request against it through the
+    // images-carrying arm (`dynamo.rs`), which calls
+    // `ClientCtx::cp_kind_write_batch` per tablet-group instead of the
+    // fast-marker `cp_kind_write_raw` path a plain table would take.
+    let table = "gsi_batch_users";
+    let (status, body) = cluster.dynamo(
+        0,
+        "DynamoDB_20120810.CreateTable",
+        br#"{"TableName":"gsi_batch_users",
+            "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"},
+                                     {"AttributeName":"email","AttributeType":"S"}],
+            "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
+            "GlobalSecondaryIndexes":[
+                {"IndexName":"by-email",
+                 "KeySchema":[{"AttributeName":"email","KeyType":"HASH"}],
+                 "Projection":{"ProjectionType":"ALL"}}]}"#,
+    );
+    assert_eq!(
+        status, 200,
+        "seed={seed}: CreateTable with a declared GSI failed: {body}"
+    );
+
+    let batch_put = br#"{"RequestItems":{"gsi_batch_users":[
+        {"PutRequest":{"Item":{"id":{"S":"u1"},"email":{"S":"a@x"}}}},
+        {"PutRequest":{"Item":{"id":{"S":"u2"},"email":{"S":"b@x"}}}},
+        {"PutRequest":{"Item":{"id":{"S":"u3"},"email":{"S":"c@x"}}}}]}}"#;
+    let (status, body) = cluster.dynamo(0, "DynamoDB_20120810.BatchWriteItem", batch_put);
+    assert_eq!(
+        status, 200,
+        "seed={seed}: seed BatchWriteItem on gsi_batch_users (before freeze) must succeed: {body}"
+    );
+    assert_eq!(
+        body, r#"{"UnprocessedItems":{}}"#,
+        "seed={seed}: the seed batch must land every item, none unprocessed: {body}"
+    );
+
+    let (tablet, leader) = tablet_and_leader_of(&cluster, table);
+    let non_leader = a_non_leader(&cluster, leader);
+
+    // The fixture's own stand-in for a real in-place split's own data-plane
+    // fork latching frozen -- identical to Scenario A above, just aimed at
+    // the batch path instead of the single-item one.
+    cluster.freeze_tablet(leader, tablet);
+
+    assert_frozen_refusal_carries_the_frozen_text(
+        &mut cluster,
+        non_leader,
+        "DynamoDB_20120810.BatchWriteItem",
+        batch_put,
+        seed,
+        "BatchWriteItem(gsi, non-leader)",
+    );
+    assert_frozen_refusal_carries_the_frozen_text(
+        &mut cluster,
+        leader,
+        "DynamoDB_20120810.BatchWriteItem",
+        batch_put,
+        seed,
+        "BatchWriteItem(gsi, leader)",
+    );
+}
+
+#[test]
+fn frozen_gsi_table_batch_write_item_returns_service_unavailable_not_internal_server_error() {
+    run_frozen_gsi_table_batch_write_item_returns_service_unavailable(env_seed(0x996E_0001));
+}
+
+/// Replay proof (repo convention): `ANIMUS_SEED=<seed> cargo test -p
+/// animusd --lib replays_frozen_gsi_table_batch_write_item_service_unavailable_from_an_explicit_env_seed`.
+#[test]
+fn replays_frozen_gsi_table_batch_write_item_service_unavailable_from_an_explicit_env_seed() {
+    run_frozen_gsi_table_batch_write_item_returns_service_unavailable(env_seed(0x996E_0002));
+}
+
+// ---------------------------------------------------------------------------
 // Scenario B: a REAL in-place split's own data-plane fork (no test-only
 // freeze injection) outlasts CLIENT_TIMEOUT, then converges.
 // ---------------------------------------------------------------------------

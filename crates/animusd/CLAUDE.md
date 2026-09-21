@@ -2678,17 +2678,43 @@ data-plane fork (`POST /admin/tablet/split`, this fixture's always-on
 **Same-day follow-on: a post-sleep deadline re-check, so the loop's own
 final iteration can't overwrite a real refusal with a generic one.**
 Every retry loop of this shape (`write_path.rs::cp_kind_write_item`/
-`cp_kind_write_raw_bounded`; `read_path.rs::cp_read`/`cp_read_snapshot`/
-`cp_scan_one`/`cp_scan_kind_one`) checked `now >= deadline` only *before*
-its own `env.sleep(SCHEMA_POLL_INTERVAL)` — so the loop's last iteration
-could sleep past the deadline, loop back to the top, and start a *fresh*
-`cp_route`/`cp_forward` attempt with effectively zero budget left; that
-attempt's own generic timeout/budget-exhausted error (never the real,
-informative one — e.g. `FROZEN_REFUSAL`) then became the value returned,
-even though an earlier iteration had already observed the true cause.
-Fixed by re-checking `now >= deadline` immediately after the sleep too,
-returning the PREVIOUS iteration's own error (mapped through the same
-503 logic where applicable) instead of looping into a doomed attempt.
+`cp_kind_write_batch`/`cp_kind_write_raw_bounded`; `read_path.rs::cp_read`/
+`cp_read_snapshot`/`cp_scan_one`/`cp_scan_kind_one`) checked `now >=
+deadline` only *before* its own `env.sleep(SCHEMA_POLL_INTERVAL)` — so the
+loop's last iteration could sleep past the deadline, loop back to the top,
+and start a *fresh* `cp_route`/`cp_forward` attempt with effectively zero
+budget left; that attempt's own generic timeout/budget-exhausted error
+(never the real, informative one — e.g. `FROZEN_REFUSAL`) then became the
+value returned, even though an earlier iteration had already observed the
+true cause. Fixed by re-checking `now >= deadline` immediately after the
+sleep too, returning the PREVIOUS iteration's own error (mapped through the
+same 503 logic where applicable) instead of looping into a doomed attempt.
+**`cp_kind_write_batch` (`BatchWriteItem`'s images-carrying arm, issue #996
+layer 2) was written against the pre-#994 shape of `cp_kind_write_item` and
+initially shipped without either this re-check or the terminal
+`service_unavailable` mapping below — a sibling loop copied from the
+original before #994's fix landed on it, then merged unfixed. **Porting
+just those two lines into `cp_kind_write_batch`'s own loop turned out not
+to be enough**: unlike `cp_kind_write_item`'s `Local` arm (`Err(e) => e`,
+which feeds a leader-side failure back into this very loop's `err`/retry
+logic), `cp_kind_write_batch`'s `Local` *and* `Forward` arms both `return`
+`dynamo::kind_write_batch_at_leader`'s per-item `Vec<Result<..>>`
+immediately — so a frozen/superseded whole-entry propose failure (the
+realistic case this fix exists for) never reaches this loop's `err` match
+at all; `kind_write_batch_at_leader` (`dynamo.rs`) is the actual terminal-
+return site for that case, and needed the identical
+`decide::read_should_retry` → `WireError::service_unavailable` mapping
+(via the shared `map_throttleable_error`) applied to its own `Err(e)` arm.
+A THIRD site was needed for the non-leader (forwarded) path specifically:
+`wire_error_from_batch_rejected` — the closed-set allowlist that decides
+which `WireError` codes survive a forwarded `KindWriteBatch` hop's
+per-item reply (`kind_write_outcome_to_reply`/its own inverse) — had no
+`"ServiceUnavailable"` entry, degrading it to `InternalServerError` on the
+wire exactly like `decode_relayed_error`'s allowlist would have for
+`KindWriteItem` before #994 added its own entry there; ported the
+identical entry. See
+`docs/lessons/orchestration/2026-09-21-a-sibling-loop-copied-before-a-fix-lands-on-the-original-needs-the-fix-ported-at-merge-time.md`
+for the general lesson and the full three-site account.
 
 **Cross-replica leader-hint fan-out on a stale local view (issue #950,
 fixed).** The "waits for the local group to elect" branch above used to be

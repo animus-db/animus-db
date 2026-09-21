@@ -351,9 +351,37 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 CpRoute::None => dynamo::internal("no CP group leader reachable"),
             };
             if !decide::read_should_retry(&err.message) || self.env.now() >= deadline {
+                // Issue #994: a caller that reaches here after being told to
+                // retry (the message it just failed the `read_should_retry`
+                // check on ends `"; retry"`) exhausted its budget on a
+                // TRANSIENT refusal — a split-cutover freeze
+                // (`decide::FROZEN_REFUSAL`) or an exhausted forward chase
+                // still citing a transient last hop
+                // (`forwarding::FORWARD_BUDGET_EXHAUSTED`) are the two
+                // classes this loop actually retries. Reporting that as a
+                // bare `InternalServerError` (500) is a terminal-looking
+                // code for a condition that was never permanent — the
+                // client's own retry policy has no reason to try again.
+                // `WireError::service_unavailable` maps to DynamoDB's own
+                // documented `ServiceUnavailable` (503), which every AWS
+                // SDK's default retry policy already retries with backoff.
+                let err = if decide::read_should_retry(&err.message) {
+                    animus_dynamo::wire::WireError::service_unavailable(err.message)
+                } else {
+                    err
+                };
                 return items.iter().map(|_| Err(err.clone())).collect();
             }
             self.env.sleep(SCHEMA_POLL_INTERVAL).await;
+            // Issue #994: re-check the deadline immediately after the
+            // sleep, before looping back to a fresh attempt that would
+            // start with effectively zero time left. At this point
+            // `err.message` is known `read_should_retry` (the top check
+            // above didn't return), so the mapping is unconditional here.
+            if self.env.now() >= deadline {
+                let err = animus_dynamo::wire::WireError::service_unavailable(err.message);
+                return items.iter().map(|_| Err(err.clone())).collect();
+            }
         }
     }
 
