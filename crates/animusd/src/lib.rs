@@ -6573,6 +6573,48 @@ impl Node {
         }
     }
 
+    /// Total count of tasks spawned through `env.spawn_task`/`Spawner::spawn`
+    /// on any of this node's role envs that panicked (issue #939), summed
+    /// across `self.envs` (control-plane + raftkv for combined mode, just
+    /// one for a control-only or data-only node — see [`ProdEnv::
+    /// spawned_task_panics`] for what's actually counted and why a
+    /// cancelled/aborted task never is). A test teardown check
+    /// (`support::TaskPanicGuard`) polls this so a replica's apply/driver
+    /// task panicking mid-test can never pass silently again — the exact
+    /// gap the issue's Run-6 panic fell through.
+    #[must_use]
+    pub fn spawned_task_panics(&self) -> u64 {
+        self.envs.iter().map(ProdEnv::spawned_task_panics).sum()
+    }
+
+    /// The first spawned-task panic message counted across this node's role
+    /// envs, if any (issue #939) — `None` until
+    /// [`spawned_task_panics`](Self::spawned_task_panics) is nonzero.
+    /// Picks whichever env's own first message comes first in `self.envs`'
+    /// order (stable/deterministic, though which env actually panicked
+    /// first in wall-clock terms is not tracked across envs).
+    #[must_use]
+    pub fn first_spawned_task_panic(&self) -> Option<String> {
+        self.envs.iter().find_map(ProdEnv::first_spawned_task_panic)
+    }
+
+    /// Test-only, always-compiled hook (issue #939): this node's own
+    /// internal `ProdEnv` role(s) (control-plane for a control-only node,
+    /// raftkv for a data-only node, both for combined), so an external
+    /// `tests/*.rs` integration binary can inject a panic directly through
+    /// `env.spawn_task(..)` (e.g. `task_panic_guard.rs`'s red-before/
+    /// green-after proof). **Not** `#[cfg(test)]`-gated, for the same
+    /// reason [`set_export_store_factory`](Self::set_export_store_factory)
+    /// isn't: an integration binary under `tests/` links this crate's
+    /// plain, non-test-cfg library, so a `cfg(test)`-gated item would be
+    /// invisible there. `#[doc(hidden)]`: a test hook, not part of this
+    /// crate's real public surface.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn envs_for_test(&self) -> &[ProdEnv] {
+        &self.envs
+    }
+
     /// Graceful teardown: durably flush the control-plane WAL, then gracefully
     /// halt every hosted CP group, **before** the hard-abort [`shutdown`](Self::shutdown).
     ///

@@ -97,6 +97,11 @@ async fn data_survives_node_restart_on_disk() {
     let (node, config) = support::start_single_node(&node_dir, StorageBackend::default()).await;
     let client = config.nodes[0].client;
     await_bootstrap(&node).await;
+    // issue #939: fail loudly if this incarnation's apply/driver tasks
+    // panicked, rather than letting a killed replica pass silently. Dropped
+    // explicitly before `stop` since `TaskPanicGuard` only borrows `node`
+    // and `stop` needs to consume it.
+    let guard = support::watch_task_panics(&[&node]);
 
     let put = put_retry(client, b"durable", b"survives").await;
     assert!(matches!(put, ClientResponse::PutOk), "put failed: {put:?}");
@@ -116,6 +121,7 @@ async fn data_survives_node_restart_on_disk() {
         ClientResponse::Value(Some(b"survives".to_vec())),
     );
 
+    drop(guard);
     stop(node).await;
 
     // --- Second incarnation: SAME runtime, SAME data dir + SAME addresses. ---
@@ -123,6 +129,7 @@ async fn data_survives_node_restart_on_disk() {
     // concurrent test binary's momentary port probe (see `support`).
     let node = support::restart_same_addrs(&config, 0, &node_dir, StorageBackend::default()).await;
     await_bootstrap(&node).await;
+    let guard = support::watch_task_panics(&[&node]);
 
     // The previously-written value survived because the LSM recovered it from
     // disk — the whole point of the on-disk data plane.
@@ -158,6 +165,7 @@ async fn data_survives_node_restart_on_disk() {
         "an unwritten key should be absent after recovery (got {absent:?})",
     );
 
+    drop(guard);
     stop(node).await;
 }
 
@@ -186,14 +194,17 @@ async fn acked_write_survives_memory_backend_restart_via_raft_wal() {
     let (node, config) = support::start_single_node(&node_dir, StorageBackend::Memory).await;
     let client = config.nodes[0].client;
     await_bootstrap(&node).await;
+    let guard = support::watch_task_panics(&[&node]);
 
     let put = put_retry(client, b"acked", b"survives").await;
     assert!(matches!(put, ClientResponse::PutOk), "put failed: {put:?}");
 
+    drop(guard);
     stop(node).await;
 
     let node = support::restart_same_addrs(&config, 0, &node_dir, StorageBackend::Memory).await;
     await_bootstrap(&node).await;
+    let guard = support::watch_task_panics(&[&node]);
 
     // Poll until the recovered group has re-applied its WAL tail (bounded).
     let recovered = async {
@@ -217,5 +228,6 @@ async fn acked_write_survives_memory_backend_restart_via_raft_wal() {
         .await
         .expect("acked write did not survive the memory-backend restart via the raftkv WAL");
 
+    drop(guard);
     stop(node).await;
 }
