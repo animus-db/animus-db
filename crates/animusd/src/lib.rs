@@ -977,6 +977,21 @@ impl<E: Env> CpGroup<E> {
         }
     }
 
+    /// Propose the split-cutover freeze directly (`RaftKvNode::
+    /// propose_freeze`) — leader-only, idempotent. `SimCluster`'s own
+    /// `freeze_tablet` (issue #994 regression) is the sole caller today: a
+    /// fixture-only way to put a tablet into the exact latched-frozen state
+    /// a real in-place split's own data-plane fork (`KvCommand::
+    /// SplitTablet`, which shares this same latch) reaches, without waiting
+    /// out the fork/cutover window itself.
+    #[cfg(test)]
+    pub(crate) fn propose_freeze(&self) -> ProposeResult {
+        match self {
+            CpGroup::Lsm(n) => n.propose_freeze(),
+            CpGroup::Mem(n) => n.propose_freeze(),
+        }
+    }
+
     /// This group's pending (or already-applied) in-place split fork, if
     /// any (ADR 0058 Train 2 rung 3) — the `animusd`-level in-place cutover
     /// driver's (`index_drain.rs::inplace_split_driver_tick`) own signal
@@ -20455,6 +20470,18 @@ mod sim_cluster_control_growth;
 /// `crates/animusd/CLAUDE.md`'s matching entry.
 #[cfg(test)]
 mod sim_cluster_cp_plane;
+
+/// Regression for issue #994: a retry budget exhausted on a transient (not
+/// a genuine capacity) refusal — a split-cutover freeze, or an exhausted
+/// forward chase still citing a transient last hop — must report
+/// `503 ServiceUnavailable`, never a terminal `500 InternalServerError`.
+/// See `sim_cluster_frozen_refusal.rs`'s own module doc for the two
+/// scenarios (a directly-injected freeze on both the fast-marker and
+/// evaluate-at-leader write paths; a real in-place split's own data-plane
+/// fork) and `crates/animusd/CLAUDE.md`'s dynamo/write-path entry for the
+/// fix itself.
+#[cfg(test)]
+mod sim_cluster_frozen_refusal;
 
 /// Regression for the issue #298 residual confirmed live under the
 /// un-pinned `SplitMode::InPlace` proof soak (ADR 0018's matching amendment,

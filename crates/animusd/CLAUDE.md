@@ -2604,6 +2604,77 @@ See `docs/lessons/code-patterns/2026-09-19-shortening-a-shared-budget-
 exposes-its-exhaustion-path-which-must-still-classify-as-transient.md`
 for the general lesson.
 
+**"Transient" reaching a "; retry"-suffixed `decide::read_should_retry`
+message is not the end of the story — the DynamoDB wire edge must
+translate it into a status code an AWS SDK's own default retry policy
+already knows to retry (issue #994, same-day follow-up).** Before this
+fix, once a caller's own bounded retry loop finally exhausted its budget
+on a message that was transient the whole time — a split-cutover freeze
+(`decide::FROZEN_REFUSAL`) that outlasted the loop, or `forward_to_
+tablet_leader`'s own `FORWARD_BUDGET_EXHAUSTED` above — the terminal
+`Err` still carried `WireError::internal`'s code
+(`InternalServerError`), which `dynamo.rs::error_status` renders as a
+bare `500`. A `500` is a terminal-looking signal for a condition that was
+never permanent, and unlike a `"; retry"`-suffixed string (an internal
+convention this server's own retry loops read), nothing about a `500`
+by itself tells an external DynamoDB client's SDK to keep retrying.
+Fixed at the two terminal-return sites, never inside a retry loop's own
+condition (no retry behavior changed): `write_path.rs::
+cp_kind_write_item`'s single exit — if the last error still satisfies
+`decide::read_should_retry`, return `WireError::service_unavailable`
+instead of the raw (`InternalServerError`-coded) error; and `dynamo.rs::
+map_throttleable_error`'s `else` branch (already the single shared
+mapping point for `fast_marker_write`/`paginated_kind_examine`/
+`paginated_kind_examine_one`/`native_scan`/`raw_quorum_read`'s own
+plain-`String` errors) — the identical `read_should_retry` check before
+falling back to `internal(..)`. `WireError::service_unavailable`
+(`animus-dynamo`) mints DynamoDB's own documented `ServiceUnavailable`
+error (`error_status` maps it to `503`) — every AWS SDK's default retry
+policy already retries a 503 with backoff, unlike a bare 500. **Not**
+`ProvisionedThroughputExceededException`: a throttle refusal
+(`THROTTLE_WRITE_REFUSAL`) is a capacity signal the *client* must back
+off from (ADR 0065 §6, never retried inline by this server), while a
+`ServiceUnavailable` here means this server's OWN retry loop already
+gave up on a condition that had nothing to do with the caller's own
+request rate — conflating the two would tell a client to slow down for
+the wrong reason. `dynamo.rs::decode_relayed_error`'s allowlist gained
+`"ServiceUnavailable"` so the typed code survives a forwarded
+`KindWriteItem` hop unchanged (mirroring `ValidationException`'s own
+entry) — **`ProvisionedThroughputExceededException` was deliberately
+NOT added there**, a pre-existing, separate defect (a throttle refusal
+minted at a remote leader still degrades to `InternalServerError` across
+that hop today) out of this fix's own scope. Regression:
+`dynamo::relayed_error_tests::a_service_unavailable_error_round_trips_
+with_its_code`, `dynamo::map_throttleable_error_tests` (frozen text →
+`ServiceUnavailable`; `THROTTLE_WRITE_REFUSAL` → unchanged;
+a plain non-retryable string → `InternalServerError`), and
+`sim_cluster_frozen_refusal.rs`'s two scenarios: a directly-injected
+freeze (`SimCluster::freeze_tablet`, a fixture-only stand-in) on both a
+plain table's fast-marker path and a GSI table's evaluate-at-leader
+path, from both a non-leader and the leader node, plus a `ConsistentRead:
+true` read proving reads stay ungated; and a REAL in-place split's own
+data-plane fork (`POST /admin/tablet/split`, this fixture's always-on
+`host::Reconciler` forking on its own — no freeze injection), asserting
+`503`/`ServiceUnavailable` while frozen and a `200` once the cutover
+(`SimCluster::drive_inplace_split_cutover`) converges — the non-leader
+(forwarded) assertions additionally require the body to preserve
+`decide::FROZEN_REFUSAL`'s own text verbatim, not just a bare 503.
+
+**Same-day follow-on: a post-sleep deadline re-check, so the loop's own
+final iteration can't overwrite a real refusal with a generic one.**
+Every retry loop of this shape (`write_path.rs::cp_kind_write_item`/
+`cp_kind_write_raw_bounded`; `read_path.rs::cp_read`/`cp_read_snapshot`/
+`cp_scan_one`/`cp_scan_kind_one`) checked `now >= deadline` only *before*
+its own `env.sleep(SCHEMA_POLL_INTERVAL)` — so the loop's last iteration
+could sleep past the deadline, loop back to the top, and start a *fresh*
+`cp_route`/`cp_forward` attempt with effectively zero budget left; that
+attempt's own generic timeout/budget-exhausted error (never the real,
+informative one — e.g. `FROZEN_REFUSAL`) then became the value returned,
+even though an earlier iteration had already observed the true cause.
+Fixed by re-checking `now >= deadline` immediately after the sleep too,
+returning the PREVIOUS iteration's own error (mapped through the same
+503 logic where applicable) instead of looping into a doomed attempt.
+
 **Cross-replica leader-hint fan-out on a stale local view (issue #950,
 fixed).** The "waits for the local group to elect" branch above used to be
 **unconditional and purely local**: if this node hosts a replica of the

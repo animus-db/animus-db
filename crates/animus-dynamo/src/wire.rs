@@ -1762,6 +1762,39 @@ impl WireError {
         }
     }
 
+    /// A single-item write (or the enclosing `KindWriteItem`/`cp_kind_write_raw*`
+    /// call an evaluate-at-leader/fast-marker write rides) exhausted its
+    /// server-side retry budget while every attempt saw a **transient**
+    /// refusal — a split-cutover freeze (`decide::FROZEN_REFUSAL`), a
+    /// forward-chase exhaustion still citing a transient last hop
+    /// (`forwarding::FORWARD_BUDGET_EXHAUSTED`), or any other refusal
+    /// carrying the house `"; retry"` retryability suffix (issue #994).
+    /// This is DynamoDB's own documented `ServiceUnavailable` error (HTTP
+    /// 503, "DynamoDB is currently unavailable. Retry the request.") —
+    /// every AWS SDK's default retry policy retries a 503 with backoff, so
+    /// a client that would otherwise see a terminal `InternalServerError`
+    /// (500) after the server-side retry budget alone ran out instead sees
+    /// a code its own SDK already knows to keep retrying.
+    ///
+    /// **Deliberately distinct from [`Self::provisioned_throughput_
+    /// exceeded`]**: a throttle refusal is a capacity signal the client
+    /// itself must back off from (ADR 0065 §6, never retried inline by this
+    /// server); a `ServiceUnavailable` here means the opposite — this
+    /// server's OWN retry loop already tried and gave up on a condition
+    /// that was never about the caller's own request rate, so mapping it
+    /// onto the throttle code would tell a client to slow down for a
+    /// completely unrelated reason (an in-progress split cutover, a
+    /// leadership chase). `message` keeps the original refusal text
+    /// (including its own `"; retry"` suffix) verbatim, for diagnosis.
+    #[must_use]
+    pub fn service_unavailable(message: impl Into<String>) -> Self {
+        Self {
+            code: "ServiceUnavailable",
+            message: message.into(),
+            reasons: None,
+        }
+    }
+
     /// Render as the DynamoDB error JSON body (`{"__type":..,"message":..}`,
     /// plus a `"CancellationReasons"` sibling array when [`Self::reasons`]
     /// is `Some`, ADR 0018's 2026-08-24 `CancellationReasons` amendment).
