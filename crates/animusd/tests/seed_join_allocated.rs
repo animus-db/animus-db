@@ -81,22 +81,6 @@ async fn bring_up(n: usize, dir: &Path) -> (Vec<Node>, ClusterConfig) {
     support::bring_up_deadline(n, dir, support::JOIN_DEADLINE).await
 }
 
-async fn await_bootstrap(nodes: &[Node]) {
-    let ready = async {
-        loop {
-            if nodes.iter().any(Node::is_control_leader)
-                && nodes.iter().all(|node| !node.metadata().members.is_empty())
-            {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    };
-    timeout(Duration::from_secs(30), ready)
-        .await
-        .expect("cluster did not bootstrap within 30s");
-}
-
 fn leader_index(nodes: &[Node]) -> usize {
     nodes
         .iter()
@@ -202,7 +186,7 @@ async fn ephemeral_identity_restart_gets_a_new_id_old_left_down_and_prunable() {
     let dir = support::panic_safe_tempdir();
 
     let (core_nodes, core_config) = bring_up(3, dir.path()).await;
-    await_bootstrap(&core_nodes).await;
+    support::await_bootstrap(&core_nodes).await;
     // ADR 0047: `--seed` now names the seed's intra address.
     let core_clients: Vec<SocketAddr> = core_config.nodes.iter().map(|a| a.intra).collect();
     let core_admin: Vec<SocketAddr> = core_config.nodes.iter().map(|a| a.admin).collect();

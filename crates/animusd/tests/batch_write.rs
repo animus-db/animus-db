@@ -143,20 +143,6 @@ async fn dynamo(addr: SocketAddr, target: &str, body: &str) -> (u16, String) {
     (status, payload.to_string())
 }
 
-async fn await_bootstrap(node: &Node) {
-    let ready = async {
-        loop {
-            if node.is_control_leader() && !node.metadata().members.is_empty() {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    };
-    timeout(Duration::from_secs(20), ready)
-        .await
-        .expect("node did not bootstrap in 20s");
-}
-
 async fn stop(node: Node) {
     node.shutdown_graceful().await;
     drop(node);
@@ -187,7 +173,7 @@ async fn batch_write_round_trip_survives_restart() {
 
     let (node, config) = support::start_single_node(&node_dir, StorageBackend::default()).await;
     let dynamo_addr = config.nodes[0].dynamo;
-    await_bootstrap(&node).await;
+    support::await_bootstrap(std::slice::from_ref(&node)).await;
 
     const N: usize = 20;
     // One BatchWriteItem request commits all N items as a single Raft entry.
@@ -216,7 +202,7 @@ async fn batch_write_round_trip_survives_restart() {
     // whole batch (it was fsynced before the ack).
     stop(node).await;
     let node = support::restart_same_addrs(&config, 0, &node_dir, StorageBackend::default()).await;
-    await_bootstrap(&node).await;
+    support::await_bootstrap(std::slice::from_ref(&node)).await;
 
     for i in 0..N {
         // Poll: after restart the CP group must re-elect + recover before serving.
@@ -257,7 +243,7 @@ async fn batched_write_beats_per_key() {
         let node_dir = dir.path().join("node-0");
         let (node, config) = support::start_single_node(&node_dir, StorageBackend::default()).await;
         let dynamo_addr = config.nodes[0].dynamo;
-        await_bootstrap(&node).await;
+        support::await_bootstrap(std::slice::from_ref(&node)).await;
 
         const N: usize = 200;
         const PROPOSALS: &str = "cp_proposals_accepted";

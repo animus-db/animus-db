@@ -129,21 +129,6 @@ async fn bring_up_inplace(n: usize, dir: &Path) -> (Vec<Node>, ClusterConfig) {
     );
 }
 
-async fn await_bootstrap(nodes: &[Node]) {
-    timeout(Duration::from_secs(20), async {
-        loop {
-            if nodes.iter().any(Node::is_control_leader)
-                && nodes.iter().all(|n| !n.metadata().members.is_empty())
-            {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("cluster did not bootstrap in 20s");
-}
-
 /// One HTTP/1.0 request to the admin endpoint; returns `(status, parsed JSON)`.
 async fn admin(addr: SocketAddr, method: &str, path: &str, body: Option<&str>) -> (u16, Value) {
     let mut stream = TcpStream::connect(addr).await.expect("connect to admin");
@@ -441,7 +426,7 @@ async fn placing_relocates_a_child_off_the_parents_original_nodes_and_the_comple
     timeout(Duration::from_secs(120), async {
         let dir = support::panic_safe_tempdir();
         let (mut nodes, config) = bring_up_inplace(3, dir.path()).await;
-        await_bootstrap(&nodes).await;
+        support::await_bootstrap(&nodes).await;
 
         // Provision "t" on the original 3 nodes (n0, n1, n2 — the only
         // candidates that exist yet, so this IS what `select_replicas`
@@ -606,7 +591,7 @@ async fn mark_split_placing_done_tolerates_a_stale_or_duplicate_relayed_propose(
     timeout(Duration::from_secs(120), async {
         let dir = support::panic_safe_tempdir();
         let (mut nodes, config) = bring_up_inplace(3, dir.path()).await;
-        await_bootstrap(&nodes).await;
+        support::await_bootstrap(&nodes).await;
 
         let mut client = TcpStream::connect(nodes[0].client_addr())
             .await

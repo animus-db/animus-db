@@ -124,21 +124,6 @@ async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, Arc<FakeS3>) {
     panic!("could not bring up cluster after retries (ports kept getting stolen)");
 }
 
-async fn await_bootstrap(nodes: &[Node]) {
-    timeout(Duration::from_secs(20), async {
-        loop {
-            if nodes.iter().any(Node::is_control_leader)
-                && nodes.iter().all(|n| !n.metadata().members.is_empty())
-            {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("cluster did not bootstrap in 20s");
-}
-
 /// One DynamoDB request over a fresh HTTP/1.1 connection → `(status,
 /// body)`. Mirrors every other `tests/dynamo_*.rs` file's identical helper.
 async fn dynamo(addr: SocketAddr, target: &str, body: &str) -> (u16, String) {
@@ -347,7 +332,7 @@ async fn export_full_flow_completes_and_round_trips_every_item() {
     timeout(Duration::from_secs(90), async {
         let dir = support::panic_safe_tempdir();
         let (nodes, fake) = bring_up(3, dir.path()).await;
-        await_bootstrap(&nodes).await;
+        support::await_bootstrap(&nodes).await;
 
         let ids = create_table_write_items_and_split(&nodes, "orders", 30).await;
         assert_eq!(
@@ -525,7 +510,7 @@ async fn export_client_token_is_idempotent() {
     timeout(Duration::from_secs(60), async {
         let dir = support::panic_safe_tempdir();
         let (nodes, _fake) = bring_up(1, dir.path()).await;
-        await_bootstrap(&nodes).await;
+        support::await_bootstrap(&nodes).await;
 
         let (status, body) = dynamo(
             nodes[0].dynamo_addr(),
@@ -596,7 +581,7 @@ async fn export_errors_on_unknown_table_and_unknown_export() {
     timeout(Duration::from_secs(30), async {
         let dir = support::panic_safe_tempdir();
         let (nodes, _fake) = bring_up(1, dir.path()).await;
-        await_bootstrap(&nodes).await;
+        support::await_bootstrap(&nodes).await;
 
         let (status, body) = dynamo(
             nodes[0].dynamo_addr(),
@@ -642,7 +627,7 @@ async fn export_rejects_unsupported_format_and_type() {
     timeout(Duration::from_secs(30), async {
         let dir = support::panic_safe_tempdir();
         let (nodes, _fake) = bring_up(1, dir.path()).await;
-        await_bootstrap(&nodes).await;
+        support::await_bootstrap(&nodes).await;
 
         let (status, body) = dynamo(
             nodes[0].dynamo_addr(),
@@ -705,7 +690,7 @@ async fn export_time_without_pitr_history_is_invalid() {
     timeout(Duration::from_secs(30), async {
         let dir = support::panic_safe_tempdir();
         let (nodes, _fake) = bring_up(1, dir.path()).await;
-        await_bootstrap(&nodes).await;
+        support::await_bootstrap(&nodes).await;
 
         let (status, body) = dynamo(
             nodes[0].dynamo_addr(),

@@ -33,21 +33,6 @@ async fn call(addr: SocketAddr, req: ClientRequest) -> ClientResponse {
         .expect("a reply")
 }
 
-async fn await_bootstrap(nodes: &[Node]) {
-    timeout(Duration::from_secs(20), async {
-        loop {
-            if nodes.iter().any(Node::is_control_leader)
-                && nodes.iter().all(|n| !n.metadata().members.is_empty())
-            {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("cluster did not bootstrap in 20s");
-}
-
 async fn propose_on_leader(nodes: &[Node], command: MetaCommand) {
     timeout(Duration::from_secs(20), async {
         loop {
@@ -67,7 +52,7 @@ async fn cp_op_on_a_non_leader_node_is_forwarded_to_the_leader() {
     // One node per process — each gets its own edge state via `run_node`.
     let dir = support::panic_safe_tempdir();
     let (nodes, config) = support::bring_up_deadline(n, dir.path(), support::JOIN_DEADLINE).await;
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
 
     // Create the table (served by the CP plane unconditionally, ADR 0019) and
     // wait for its schema to replicate to every node.
@@ -166,7 +151,7 @@ async fn batch_write_on_a_non_leader_node_is_forwarded() {
     let n = 3;
     let dir = support::panic_safe_tempdir();
     let (nodes, config) = support::bring_up_deadline(n, dir.path(), support::JOIN_DEADLINE).await;
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
     let client = |i: usize| config.nodes[i].client;
 
     // A batch issued from each node: node `i` writes keys `bwN-i`. Whether or not
@@ -250,7 +235,7 @@ async fn second_table_forwards_across_processes() {
     let n = 3;
     let dir = support::panic_safe_tempdir();
     let (nodes, config) = support::bring_up_deadline(n, dir.path(), support::JOIN_DEADLINE).await;
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
     let client = |i: usize| config.nodes[i].client;
 
     // Provision two tables via node 0 (the plain client auto-provisions on first

@@ -33,23 +33,6 @@ use tokio::time::{sleep, timeout};
 
 mod support;
 
-/// Wait until every node has the bootstrap tablet replicated, or panic.
-async fn await_bootstrap(nodes: &[Node]) {
-    let ready = async {
-        loop {
-            let leader = nodes.iter().any(Node::is_control_leader);
-            let everyone_has_tablet = nodes.iter().all(|n| !n.metadata().members.is_empty());
-            if leader && everyone_has_tablet {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    };
-    timeout(Duration::from_secs(20), ready)
-        .await
-        .expect("cluster did not elect a leader and bootstrap within 20s");
-}
-
 /// `GET /metrics` over a fresh HTTP/1.1 connection to `addr` (the node's HTTP
 /// endpoint). Returns `(status_code, body)`.
 async fn get_metrics(addr: std::net::SocketAddr) -> (u16, String) {
@@ -106,7 +89,7 @@ async fn metrics_endpoint_surfaces_control_plane_counters() {
             .unwrap();
         let nodes = start_cluster(bound).await.unwrap(); // R = W = 2 over 3
 
-        await_bootstrap(&nodes).await;
+        support::await_bootstrap(&nodes).await;
 
         // Do a quorum write so the data plane is exercised too (the endpoint
         // aggregates the control + data + coord role sinks). This table's

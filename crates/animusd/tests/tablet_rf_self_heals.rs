@@ -47,22 +47,6 @@ async fn grow(
     support::grow_deadline(base, extra, dir, support::JOIN_DEADLINE).await
 }
 
-async fn await_bootstrap(nodes: &[Node]) {
-    let ready = async {
-        loop {
-            if nodes.iter().any(Node::is_control_leader)
-                && nodes.iter().all(|node| !node.metadata().members.is_empty())
-            {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    };
-    timeout(Duration::from_secs(30), ready)
-        .await
-        .expect("cluster did not bootstrap within 30s");
-}
-
 /// One HTTP/1.0 request to the admin endpoint; returns `(status, parsed JSON)`.
 async fn admin(addr: SocketAddr, method: &str, path: &str, body: Option<&str>) -> (u16, Value) {
     let mut stream = TcpStream::connect(addr).await.expect("connect to admin");
@@ -150,7 +134,7 @@ async fn tablet_provisioned_undersized_on_a_small_cluster_self_heals_after_growt
     // ever be sized 2 here — no timing race needed to construct this, it's
     // structural. `MAX_REPLICATION_FACTOR` (3) exceeds what's available.
     let (nodes, base_config) = bring_up(2, dir.path()).await;
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
     let base_clients: Vec<SocketAddr> = base_config.nodes.iter().map(|a| a.client).collect();
     let base_admin: Vec<SocketAddr> = base_config.nodes.iter().map(|a| a.admin).collect();
 

@@ -27,22 +27,6 @@ mod support;
 
 const TABLES: [&str; 6] = ["kv0", "kv1", "kv2", "kv3", "kv4", "kv5"];
 
-async fn await_bootstrap(nodes: &[Node]) {
-    let ready = async {
-        loop {
-            if nodes.iter().any(Node::is_control_leader)
-                && nodes.iter().all(|node| !node.metadata().members.is_empty())
-            {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    };
-    timeout(Duration::from_secs(30), ready)
-        .await
-        .expect("cluster did not bootstrap within 30s");
-}
-
 async fn admin_get(addr: SocketAddr, path: &str) -> (u16, Value) {
     let mut stream = TcpStream::connect(addr).await.expect("connect to admin");
     let request = format!("GET {path} HTTP/1.0\r\nHost: animus\r\nConnection: close\r\n\r\n");
@@ -241,7 +225,7 @@ async fn await_value(clients: &[SocketAddr], table: &str, key: &[u8], want: &[u8
 async fn cluster_grown_to_five_nodes_rebalances_existing_tablets() {
     let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(5, dir.path()).await;
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
     let raftkv_ids = config.data_ids(); // [0, 1, 2, 3, 4]
     let admin_addrs: Vec<SocketAddr> = config.nodes.iter().map(|a| a.admin).collect();
     let clients: Vec<SocketAddr> = config.nodes.iter().map(|a| a.client).collect();

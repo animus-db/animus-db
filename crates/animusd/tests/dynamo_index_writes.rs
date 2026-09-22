@@ -43,29 +43,13 @@ use std::time::Duration;
 
 use animus_dynamo::{AttributeValue, storage_key};
 use animus_tablet::partition_token;
-use animusd::{Node, bind_cluster, start_cluster};
+use animusd::{bind_cluster, start_cluster};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
 mod support;
-
-async fn await_bootstrap(nodes: &[Node]) {
-    let ready = async {
-        loop {
-            if nodes.iter().any(Node::is_control_leader)
-                && nodes.iter().all(|n| !n.metadata().members.is_empty())
-            {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    };
-    timeout(Duration::from_secs(20), ready)
-        .await
-        .expect("cluster did not bootstrap within 20s");
-}
 
 /// One DynamoDB JSON request over a fresh HTTP/1.1 connection → `(status,
 /// body)`. `Connection: close` is load-bearing: this helper reads to EOF, and
@@ -128,7 +112,7 @@ async fn update_item_and_batch_write_item_maintain_secondary_indexes() {
         .await
         .unwrap();
     let nodes = start_cluster(bound).await.unwrap();
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
     let addr = nodes[0].dynamo_addr();
 
     // A composite (id, sk) table with one LSI (alternate sort attribute
@@ -365,7 +349,7 @@ async fn transact_write_items_maintains_lsi_and_gsi_across_a_split_table() {
         .await
         .unwrap();
     let nodes = start_cluster(bound).await.unwrap();
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
     let addr = nodes[0].dynamo_addr();
 
     let (status, body) = dynamo(
@@ -542,7 +526,7 @@ async fn transact_write_items_abort_leaves_no_lsi_row_and_no_gsi_row() {
         .await
         .unwrap();
     let nodes = start_cluster(bound).await.unwrap();
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
     let addr = nodes[0].dynamo_addr();
 
     let (status, body) = dynamo(
@@ -621,7 +605,7 @@ async fn unconditional_put_and_delete_maintain_lsi_without_a_condition_or_all_ol
         .await
         .unwrap();
     let nodes = start_cluster(bound).await.unwrap();
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
     let addr = nodes[0].dynamo_addr();
 
     let (status, body) = dynamo(
@@ -979,7 +963,7 @@ async fn cross_node_racing_unconditional_puts_never_orphan_an_lsi_row() {
         .await
         .unwrap();
     let nodes = start_cluster(bound).await.unwrap();
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
     let addr_a = nodes[0].dynamo_addr();
     let addr_b = nodes[1].dynamo_addr();
     let addr_c = nodes[2].dynamo_addr();
@@ -1113,7 +1097,7 @@ async fn cross_node_racing_transactional_and_plain_puts_never_orphan_an_lsi_row(
         .await
         .unwrap();
     let nodes = start_cluster(bound).await.unwrap();
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
     let addr_a = nodes[0].dynamo_addr();
     let addr_b = nodes[1].dynamo_addr();
     let addr_c = nodes[2].dynamo_addr();

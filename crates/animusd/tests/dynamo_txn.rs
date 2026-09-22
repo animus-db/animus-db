@@ -76,21 +76,6 @@ async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, animusd::Clust
     panic!("could not bring up cluster after retries (ports kept getting stolen)");
 }
 
-async fn await_bootstrap(nodes: &[Node]) {
-    timeout(Duration::from_secs(20), async {
-        loop {
-            if nodes.iter().any(Node::is_control_leader)
-                && nodes.iter().all(|n| !n.metadata().members.is_empty())
-            {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("cluster did not bootstrap in 20s");
-}
-
 /// One DynamoDB request over a fresh HTTP/1.1 connection → `(status, body)`.
 async fn dynamo(addr: SocketAddr, target: &str, body: &str) -> (u16, String) {
     let mut stream = TcpStream::connect(addr).await.expect("connect to dynamo");
@@ -345,7 +330,7 @@ async fn transact_write_items_commits_atomically_across_a_split_table() {
     let n = 3;
     let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(n, dir.path()).await;
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
     let addr0 = config.nodes[0].dynamo;
     let client0 = config.nodes[0].client;
 
@@ -402,7 +387,7 @@ async fn failing_condition_check_cancels_the_whole_transaction() {
     let n = 3;
     let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(n, dir.path()).await;
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
     let addr0 = config.nodes[0].dynamo;
     let client0 = config.nodes[0].client;
 
@@ -468,7 +453,7 @@ async fn transact_get_items_never_observes_a_torn_pair_under_concurrent_writes()
     let n = 3;
     let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(n, dir.path()).await;
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
     let addr0 = config.nodes[0].dynamo;
     let client0 = config.nodes[0].client;
 
@@ -592,7 +577,7 @@ async fn concurrent_transact_write_items_on_a_shared_key_resolve_one_winner() {
     let n = 3;
     let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(n, dir.path()).await;
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
     let addr0 = config.nodes[0].dynamo;
     let client0 = config.nodes[0].client;
 
@@ -691,7 +676,7 @@ async fn admin_txns_shows_a_pending_record_then_clears_after_recovery() {
     let n = 3;
     let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(n, dir.path()).await;
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
     let addr0 = config.nodes[0].client;
     // ADR 0047: Forwarded is intra-only.
     let all_addrs: Vec<SocketAddr> = config.nodes.iter().map(|c| c.intra).collect();
@@ -838,7 +823,7 @@ async fn cross_node_racing_own_key_conditional_writes_resolve_exactly_one_winner
     let n = 3;
     let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(n, dir.path()).await;
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
     let addr_a = config.nodes[0].dynamo;
     let addr_b = config.nodes[1].dynamo;
 
@@ -920,7 +905,7 @@ async fn own_key_condition_failure_cancels_a_multi_tablet_transaction_wholly() {
     let n = 3;
     let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(n, dir.path()).await;
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
     let addr0 = config.nodes[0].dynamo;
     let client0 = config.nodes[0].client;
 
@@ -1006,7 +991,7 @@ async fn own_key_condition_completes_quickly_with_no_recovery_grace_stall() {
     let n = 3;
     let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(n, dir.path()).await;
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
     let addr0 = config.nodes[0].dynamo;
 
     let (status, body) = dynamo(

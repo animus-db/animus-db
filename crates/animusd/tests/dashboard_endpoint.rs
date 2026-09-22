@@ -96,21 +96,6 @@ async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, animusd::Clust
     panic!("could not bring up cluster after retries (ports kept getting stolen)");
 }
 
-async fn await_bootstrap(nodes: &[Node]) {
-    timeout(Duration::from_secs(20), async {
-        loop {
-            if nodes.iter().any(Node::is_control_leader)
-                && nodes.iter().all(|n| !n.metadata().members.is_empty())
-            {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("cluster did not bootstrap in 20s");
-}
-
 /// One HTTP/1.0 request; returns `(status, raw header block, body)`.
 async fn raw(addr: SocketAddr, method: &str, path: &str) -> (u16, String, String) {
     let mut stream = TcpStream::connect(addr).await.expect("connect to admin");
@@ -143,7 +128,7 @@ async fn dashboard_serves_spa_with_cors_and_peers() {
     timeout(Duration::from_secs(60), async {
         let dir = support::panic_safe_tempdir();
         let (nodes, config) = bring_up(3, dir.path()).await;
-        await_bootstrap(&nodes).await;
+        support::await_bootstrap(&nodes).await;
 
         let admin_addr = nodes[0].admin_addr();
 
@@ -590,7 +575,7 @@ async fn dashboard_u05_lineage_panel() {
     timeout(Duration::from_secs(60), async {
         let dir = support::panic_safe_tempdir();
         let (nodes, _config) = bring_up(1, dir.path()).await;
-        await_bootstrap(&nodes).await;
+        support::await_bootstrap(&nodes).await;
         let admin_addr = nodes[0].admin_addr();
 
         // ---- the shell carries #tb-lineage beside #tb-detail ---------------

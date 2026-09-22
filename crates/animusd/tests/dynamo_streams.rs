@@ -82,22 +82,6 @@ async fn dynamo(addr: SocketAddr, target: &str, body: &str) -> (u16, String) {
     (status, payload.to_string())
 }
 
-async fn await_bootstrap(nodes: &[Node]) {
-    let ready = async {
-        loop {
-            if nodes.iter().any(Node::is_control_leader)
-                && nodes.iter().all(|n| !n.metadata().members.is_empty())
-            {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    };
-    timeout(Duration::from_secs(20), ready)
-        .await
-        .expect("cluster did not bootstrap within 20s");
-}
-
 async fn await_node_bootstrap(node: &Node) {
     let ready = async {
         loop {
@@ -199,7 +183,7 @@ async fn bare_stream_hot_read_is_refused() {
         .await
         .unwrap();
     let nodes = start_cluster(bound).await.unwrap();
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
 
     let mut stream = TcpStream::connect(nodes[0].client_addr())
         .await
@@ -298,7 +282,7 @@ async fn disable_survives_concurrent_periodic_seal_on_local_route() {
     let disable = async {
         let dir = support::panic_safe_tempdir();
         let nodes = start_streamed_cluster(1, dir.path(), racy_knobs).await;
-        await_bootstrap(&nodes).await;
+        support::await_bootstrap(&nodes).await;
         let addr = nodes[0].dynamo_addr();
         let table = "t";
 

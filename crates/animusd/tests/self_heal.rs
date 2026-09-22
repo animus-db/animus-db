@@ -13,7 +13,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use animusd::{ClientRequest, ClientResponse, Node, bind_cluster, start_cluster};
+use animusd::{ClientRequest, ClientResponse, bind_cluster, start_cluster};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
@@ -57,23 +57,6 @@ async fn put_retry(addr: SocketAddr, key: &[u8], value: &[u8]) -> ClientResponse
     }
 }
 
-/// Wait until a leader is elected and every node has the bootstrap tablet.
-async fn await_bootstrap(nodes: &[Node]) {
-    let ready = async {
-        loop {
-            let leader = nodes.iter().any(Node::is_control_leader);
-            let everyone_has_tablet = nodes.iter().all(|n| !n.metadata().members.is_empty());
-            if leader && everyone_has_tablet {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    };
-    timeout(Duration::from_secs(20), ready)
-        .await
-        .expect("cluster did not elect a leader and bootstrap within 20s");
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn assembled_node_handles_concurrent_client_load_without_deadlock() {
     let dir = support::panic_safe_tempdir();
@@ -81,7 +64,7 @@ async fn assembled_node_handles_concurrent_client_load_without_deadlock() {
         .await
         .unwrap();
     let nodes = start_cluster(bound).await.unwrap();
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
 
     let addr = nodes[0].client_addr();
 

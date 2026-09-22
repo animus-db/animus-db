@@ -144,7 +144,7 @@ async fn coordinator_crash_between_prepare_and_decide_recovers_to_commit() {
     let n = 3;
     let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(n, dir.path()).await;
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
     let addr0 = config.nodes[0].client;
     let all_addrs: Vec<SocketAddr> = config.nodes.iter().map(|c| c.intra).collect(); // ADR 0047: Forwarded is intra-only
 
@@ -245,7 +245,7 @@ async fn commit_already_applied_but_unresolved_converges_via_reads() {
     let n = 3;
     let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(n, dir.path()).await;
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
     let addr0 = config.nodes[0].client;
     let all_addrs: Vec<SocketAddr> = config.nodes.iter().map(|c| c.intra).collect(); // ADR 0047: Forwarded is intra-only
 
@@ -367,7 +367,7 @@ async fn decided_but_unresolved_record_survives_its_own_tablet_splitting_before_
     let n = 3;
     let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(n, dir.path()).await;
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
     let addr0 = config.nodes[0].client;
     let all_addrs: Vec<SocketAddr> = config.nodes.iter().map(|c| c.intra).collect(); // ADR 0047: Forwarded is intra-only
 
@@ -543,21 +543,6 @@ async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, animusd::Clust
     panic!("could not bring up cluster after retries (ports kept getting stolen)");
 }
 
-async fn await_bootstrap(nodes: &[Node]) {
-    timeout(Duration::from_secs(20), async {
-        loop {
-            if nodes.iter().any(Node::is_control_leader)
-                && nodes.iter().all(|n| !n.metadata().members.is_empty())
-            {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("cluster did not bootstrap in 20s");
-}
-
 async fn put_until_ok(addr: SocketAddr, table: &str, key: &[u8], value: &[u8]) {
     // Remember each failed attempt's error so a timeout names WHAT kept
     // failing (issue #268's first diagnostic gap: "25s put timeout" alone
@@ -647,7 +632,7 @@ async fn multi_tablet_txn_commits_atomically_across_a_split_table() {
     let n = 3;
     let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(n, dir.path()).await;
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
     let addr0 = config.nodes[0].client;
 
     // Seed a lower and an upper key so the split has real data on both
@@ -735,7 +720,7 @@ async fn txn_through_every_node_including_followers_succeeds() {
     let n = 3;
     let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(n, dir.path()).await;
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
     let addr0 = config.nodes[0].client;
 
     put_until_ok(addr0, "txn_t2", b"k1", b"seed-lower").await;
@@ -808,7 +793,7 @@ async fn concurrent_transactions_are_individually_atomic() {
     let n = 3;
     let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(n, dir.path()).await;
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
     let addr0 = config.nodes[0].client;
 
     put_until_ok(addr0, "txn_t3", b"k1", b"seed-lower").await;
@@ -900,7 +885,7 @@ async fn violated_precondition_aborts_the_whole_transaction() {
     let n = 3;
     let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(n, dir.path()).await;
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
     let addr0 = config.nodes[0].client;
 
     let lower_key = txn_key("k2", "");

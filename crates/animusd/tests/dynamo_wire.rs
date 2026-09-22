@@ -12,31 +12,11 @@
 //! binaries. `dynamo_wire_rejects_bad_requests` stays here: unknown-op/
 //! malformed-body rejection over the real listener has no sim analog.
 
-use std::time::Duration;
-
-use animusd::{Node, bind_cluster, start_cluster};
+use animusd::{bind_cluster, start_cluster};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::time::{sleep, timeout};
 
 mod support;
-
-/// Wait until every node has the bootstrap tablet replicated, or panic.
-async fn await_bootstrap(nodes: &[Node]) {
-    let ready = async {
-        loop {
-            let leader = nodes.iter().any(Node::is_control_leader);
-            let everyone_has_tablet = nodes.iter().all(|n| !n.metadata().members.is_empty());
-            if leader && everyone_has_tablet {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    };
-    timeout(Duration::from_secs(20), ready)
-        .await
-        .expect("cluster did not elect a leader and bootstrap within 20s");
-}
 
 /// One DynamoDB request over a fresh HTTP/1.1 connection. Returns
 /// `(status_code, body)`.
@@ -82,7 +62,7 @@ async fn dynamo_wire_rejects_bad_requests() {
         .await
         .unwrap();
     let nodes = start_cluster(bound).await.unwrap();
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
     let addr = nodes[0].dynamo_addr();
 
     // A genuinely unknown operation.

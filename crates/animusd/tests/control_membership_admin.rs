@@ -193,22 +193,6 @@ async fn bring_up_combined(n: usize, dir: &Path) -> (Vec<Node>, ClusterConfig) {
     panic!("could not bring up the combined core after retries");
 }
 
-async fn await_bootstrap(nodes: &[Node]) {
-    let ready = async {
-        loop {
-            if nodes.iter().any(Node::is_control_leader)
-                && nodes.iter().all(|node| !node.metadata().members.is_empty())
-            {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    };
-    timeout(Duration::from_secs(30), ready)
-        .await
-        .expect("cluster did not bootstrap within 30s");
-}
-
 fn leader_index(nodes: &[Node]) -> usize {
     nodes
         .iter()
@@ -304,7 +288,7 @@ async fn join_control_nonvoter(
 async fn runtime_added_voter_survives_leadership_change_to_a_different_original_voter() {
     let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up_combined(3, dir.path()).await;
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
     let admin_addrs: Vec<SocketAddr> = config.nodes.iter().map(|n| n.admin).collect();
 
     let adder = leader_index(&nodes);
@@ -489,7 +473,7 @@ async fn runtime_added_voter_survives_leadership_change_to_a_different_original_
 async fn control_member_add_accepts_a_hostname_dial_address() {
     let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up_combined(3, dir.path()).await;
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
     let admin_addrs: Vec<SocketAddr> = config.nodes.iter().map(|n| n.admin).collect();
     let adder = leader_index(&nodes);
 

@@ -20,29 +20,6 @@ use tokio::time::{sleep, timeout};
 
 mod support;
 
-/// Waits for every node in `nodes` to observe a control leader and a
-/// non-empty membership — the same convergence proof
-/// `seed_join.rs::await_bootstrap` uses. With exactly two nodes in the
-/// control group, this can only pass if both directions of Raft traffic
-/// (votes/heartbeats/`AppendEntries`) actually got through — which, for a
-/// node dialed only via its advertised host string, is the real proof that
-/// the advertised address (not the bind address) is what peers used.
-async fn await_bootstrap(nodes: &[Node]) {
-    let ready = async {
-        loop {
-            if nodes.iter().any(Node::is_control_leader)
-                && nodes.iter().all(|node| !node.metadata().members.is_empty())
-            {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    };
-    timeout(Duration::from_secs(30), ready)
-        .await
-        .expect("cluster did not bootstrap within 30s");
-}
-
 /// Bring up a combined-mode cluster from `nodes_cfg`, retrying the whole
 /// (bind + start every node) unit against a wall-clock deadline — the same
 /// port-TOCTOU mitigation `support::bring_up_deadline` uses, generalized to
@@ -195,7 +172,7 @@ async fn a_second_node_reaches_an_advertised_node_purely_by_its_advertised_name(
     )
     .await;
 
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
 
     // Node 0's own self-registered address book names `localhost`, not its
     // literal `127.0.0.1` bind address, for every port it advertises.
@@ -284,7 +261,7 @@ async fn same_identity_restart_on_a_different_bind_ip_keeps_the_same_advertised_
         Duration::from_secs(30),
     )
     .await;
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
 
     let node1_id = animusd::config::node_id(1);
     // Same race as above: `await_bootstrap` only proves membership, not
@@ -355,7 +332,7 @@ async fn same_identity_restart_on_a_different_bind_ip_keeps_the_same_advertised_
     };
     nodes[1] = restarted;
 
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
 
     // Peers still route to the restarted node: node 0's own metadata still
     // lists it and the cluster remains live.
@@ -426,7 +403,7 @@ async fn the_static_config_derived_peer_book_dials_every_advertised_name() {
     )
     .await;
 
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
     // Full 3-voter convergence: every node's membership view names all 3.
     timeout(Duration::from_secs(15), async {
         loop {

@@ -17,22 +17,6 @@ use tokio::time::{sleep, timeout};
 
 mod support;
 
-async fn await_bootstrap(nodes: &[Node]) {
-    let ready = async {
-        loop {
-            let leader = nodes.iter().any(Node::is_control_leader);
-            let everyone_has_tablet = nodes.iter().all(|n| !n.metadata().members.is_empty());
-            if leader && everyone_has_tablet {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    };
-    timeout(Duration::from_secs(20), ready)
-        .await
-        .expect("cluster did not elect a leader and bootstrap within 20s");
-}
-
 /// One DynamoDB request over a fresh HTTP/1.1 connection → `(status, body)`.
 async fn dynamo(addr: SocketAddr, target: &str, body: &str) -> (u16, String) {
     let mut stream = TcpStream::connect(addr).await.expect("connect to dynamo");
@@ -243,7 +227,7 @@ async fn setup() -> (support::PanicSafeTempDir, Vec<Node>, SocketAddr) {
         .await
         .unwrap();
     let nodes = start_cluster(bound).await.unwrap();
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
 
     let addr0 = nodes[0].dynamo_addr();
     let (status, body) = dynamo_retry(

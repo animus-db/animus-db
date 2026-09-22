@@ -100,21 +100,6 @@ async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, ClusterConfig)
     panic!("could not bring up cluster after retries (ports kept getting stolen)");
 }
 
-async fn await_bootstrap(nodes: &[Node]) {
-    timeout(Duration::from_secs(20), async {
-        loop {
-            if nodes.iter().any(Node::is_control_leader)
-                && nodes.iter().all(|n| !n.metadata().members.is_empty())
-            {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("cluster did not bootstrap in 20s");
-}
-
 /// One DynamoDB request over a fresh HTTP/1.1 connection → `(status, body)`.
 async fn dynamo(addr: SocketAddr, target: &str, body: &str) -> (u16, String) {
     let mut stream = TcpStream::connect(addr).await.expect("connect to dynamo");
@@ -220,7 +205,7 @@ async fn same_token_same_fingerprint_retry_after_commit_is_cached() {
     let n = 2;
     let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(n, dir.path()).await;
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
     let addr = config.nodes[0].dynamo;
 
     create_table(addr, "ctr1").await;
@@ -258,7 +243,7 @@ async fn same_token_different_actions_is_a_parameter_mismatch() {
     let n = 2;
     let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(n, dir.path()).await;
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
     let addr = config.nodes[0].dynamo;
 
     create_table(addr, "mismatch1").await;
@@ -320,7 +305,7 @@ async fn token_dedup_survives_a_leader_failover_of_the_internal_tablet() {
     let n = 3;
     let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(n, dir.path()).await;
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
     let addr0 = config.nodes[0].dynamo;
 
     create_table(addr0, "failover1").await;
@@ -411,7 +396,7 @@ async fn the_internal_table_is_invisible_and_unreachable() {
     let n = 1;
     let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(n, dir.path()).await;
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
     let addr = config.nodes[0].dynamo;
 
     create_table(addr, "visibility1").await;
@@ -645,7 +630,7 @@ async fn same_token_retry_after_a_killed_connection_is_exactly_once_including_th
     let n = 2;
     let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(n, dir.path()).await;
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
     let addr = config.nodes[0].dynamo;
 
     let stream_arn = create_streamed_table(addr, "killedconn1").await;
@@ -740,7 +725,7 @@ async fn a_participant_leader_kill_racing_a_tokened_transaction_never_falsely_ca
     let n = 3;
     let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(n, dir.path()).await;
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
     let addr0 = config.nodes[0].dynamo;
 
     // Two separate (single-tablet) tables, so a transaction touching one item
