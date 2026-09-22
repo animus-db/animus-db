@@ -4668,6 +4668,31 @@ route below the edge through the same `ClientCtx` CP primitives.
   `LastEvaluatedKey` to `NextToken` (`reshape_query_scan_response_to_
   execute_statement`). Tests: `sim_cluster_dynamo_page_size_cap.rs`.
 
+  **`BatchGetItem`/`BatchWriteItem`/`TransactWriteItems`/`TransactGetItems`
+  each carry an aggregate byte cap too (ADR 0072 layer 4), but not all at
+  the same layer as the page cap above.** `BatchWriteItem`'s 16 MiB request
+  cap and `TransactWriteItems`' 4 MiB request cap are enforced at **decode
+  time**, in `animus_dynamo::wire` (`decode_batch_write`/
+  `decode_transact_write`) — the request already carries every item's
+  bytes, so there's no reason to wait for `animusd` to see it, and no way
+  for `run_transact` to observe an over-cap `TransactWriteItems` at all
+  (decode already refused it). `TransactGetItems`' 4 MiB cap is the mirror
+  case: its request is only keys, which can never carry 4 MiB on their own,
+  so `run_transact_get` checks it against the **fetched result** instead,
+  right after its own quiescent read and before projection — a transaction
+  has no partial result, so the whole call fails `ValidationException`
+  with nothing returned. `BatchGetItem`'s own 16 MiB cap is **not an
+  error**: the `Operation::BatchGetItem` arm accumulates `item_size` over
+  fetched items in request order and, the moment the next one would push
+  the running total over the cap, latches a `budget_exhausted` flag —
+  every key from there on (the one that tipped it over, and every key
+  after) goes to `UnprocessedKeys` instead, without even being read (this
+  arm already fetches one key at a time, never a concurrent fan-out, so
+  skipping the read costs nothing extra once the budget is spent). Tests:
+  `sim_cluster_dynamo_byte_caps.rs`; wire-level decode-boundary unit tests
+  live in `animus_dynamo::wire`'s `byte_cap_tests` module (deliberately
+  separate from its big pre-existing `tests` module).
+
   Regression: `animus-dynamo`'s `wire` unit tests plus `tests/
   dynamo_index_scan.rs`/`kind_scan.rs` end to end.
 

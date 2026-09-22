@@ -23,14 +23,29 @@
 //!   [`TABLE_MAX_WRITE_CAPACITY_UNITS`] — from [`crate::wire`].
 //! - [`MAX_SIGNIFICANT_DIGITS`] — from `animus_item::numkey`.
 //!
-//! ## New limits (constants only — see each doc comment for the AWS rule it
-//! mirrors; enforcement lands in later layers of this series)
+//! ## New limits (see each doc comment for the AWS rule it mirrors and,
+//! once wired, the enforcement site)
 //!
-//! - [`MAX_QUERY_SCAN_PAGE_BYTES`] is now enforced (ADR 0072 layer 3) —
+//! - [`MAX_QUERY_SCAN_PAGE_BYTES`] is enforced (ADR 0072 layer 3) —
 //!   `animusd::dynamo`'s shared `Query`/`Scan` pagination loops
 //!   (`paginated_table_examine` and its two siblings) track it directly;
 //!   see that crate's own doc comment for the accounting/boundary rule.
-//!   Every other new constant below is still catalogue-only.
+//! - [`MAX_BATCH_GET_RESPONSE_BYTES`], [`MAX_BATCH_WRITE_REQUEST_BYTES`],
+//!   and [`MAX_TRANSACT_BYTES`] are enforced (ADR 0072 layer 4) —
+//!   `crate::wire::decode_batch_write`/`decode_transact_write` at decode
+//!   time for the two request-size caps, `animusd::dynamo::run_transact_get`
+//!   against the fetched result for `TransactGetItems`' response-size cap,
+//!   and `animusd::dynamo`'s `Operation::BatchGetItem` arm (not an error —
+//!   pages via `UnprocessedKeys`) for `BatchGetItem`'s own response-size
+//!   cap. See each constant's own doc for the exact accounting/boundary
+//!   rule and, for the two currently-unreachable-via-the-wire caps, why.
+//! - [`MAX_PARTITION_KEY_BYTES`], [`MAX_SORT_KEY_BYTES`],
+//!   [`MAX_KEY_ATTRIBUTE_NAME_CHARS`], [`MAX_ATTRIBUTE_NAME_BYTES`],
+//!   [`MAX_NESTING_DEPTH`], [`MAX_EXPRESSION_BYTES`],
+//!   [`MIN_TABLE_NAME_CHARS`]/[`MAX_TABLE_NAME_CHARS`]/
+//!   [`is_valid_table_or_index_name`] are enforced by a sibling layer of
+//!   this same series (key/attribute/name/expression validation) — still
+//!   catalogue-only from this module's own point of view.
 
 pub use crate::wire::{
     ACCOUNT_MAX_READ_CAPACITY_UNITS, ACCOUNT_MAX_WRITE_CAPACITY_UNITS,
@@ -98,14 +113,46 @@ pub const MAX_QUERY_SCAN_PAGE_BYTES: usize = 1_048_576;
 /// AWS's `BatchGetItem` response-size limit: at most 16 MiB of item data
 /// returned in one call; any keys past that budget come back in
 /// `UnprocessedKeys` instead.
+///
+/// **Enforced** (ADR 0072 layer 4) — not an error. `animusd::dynamo`'s
+/// `Operation::BatchGetItem` arm accumulates `item_size` over fetched items
+/// in request order and stops including items once the next one would push
+/// the running total over this cap; every key not included — fetched-but-cut
+/// or not-yet-fetched — goes to `UnprocessedKeys`, exactly like a per-key
+/// throttle refusal. That arm fetches one key at a time (never a concurrent
+/// fan-out), so once the budget is spent the remaining keys are never even
+/// read.
 pub const MAX_BATCH_GET_RESPONSE_BYTES: usize = 16_777_216;
 
 /// AWS's `BatchWriteItem` request-size limit: at most 16 MiB total across
 /// every request item in the call.
+///
+/// **Enforced** (ADR 0072 layer 4) by `crate::wire::decode_batch_write`
+/// (via `check_batch_write_bytes`) at decode time — summing `item_size`
+/// over every `PutRequest` item and `DeleteRequest` key. **Currently
+/// unreachable via the wire**: `BATCH_WRITE_MAX_ITEMS` (25) ×
+/// `MAX_ITEM_SIZE_BYTES` (400 KB) tops out at 10 MB, under this cap —
+/// enforced anyway so the catalogue is complete and the check is in place
+/// the moment either of those two caps is ever raised; see
+/// `check_batch_write_bytes`'s own doc and `wire.rs`'s `byte_cap_tests`
+/// module.
 pub const MAX_BATCH_WRITE_REQUEST_BYTES: usize = 16_777_216;
 
 /// AWS's `TransactWriteItems`/`TransactGetItems` request-size limit: at most
 /// 4 MiB aggregate across every action/item in the call.
+///
+/// **Enforced** (ADR 0072 layer 4), but at two different sites since AWS's
+/// own rule lands on two different sides of the two operations:
+/// - `TransactWriteItems`: `crate::wire::decode_transact_write` checks it
+///   at decode time against the *request* — summing `item_size` over each
+///   action's `Put` item, or `Key` for `Update`/`Delete`/`ConditionCheck`.
+///   Reachable: `TRANSACT_WRITE_MAX_ACTIONS` (100) × `MAX_ITEM_SIZE_BYTES`
+///   (400 KB) is 40 MB, well past 4 MiB — eleven max-size `Put`s alone
+///   exceed it.
+/// - `TransactGetItems`: its *request* (at most 100 keys of a few KB each)
+///   can never reach 4 MiB, so `animusd::dynamo::run_transact_get` checks
+///   it against the **fetched result** instead, after its own quiescent
+///   read — a transaction has no partial result, so the whole call fails.
 pub const MAX_TRANSACT_BYTES: usize = 4_194_304;
 
 #[cfg(test)]

@@ -69,8 +69,9 @@ use crate::capacity::{
 };
 use crate::condition::{Comparator, ConditionError, ConditionExpression, SortKeyCondition};
 use crate::limits::{
-    self, MAX_ATTRIBUTE_NAME_BYTES, MAX_EXPRESSION_BYTES, MAX_KEY_ATTRIBUTE_NAME_CHARS,
-    MAX_NESTING_DEPTH, MAX_PARTITION_KEY_BYTES, MAX_SORT_KEY_BYTES,
+    self, MAX_ATTRIBUTE_NAME_BYTES, MAX_BATCH_WRITE_REQUEST_BYTES, MAX_EXPRESSION_BYTES,
+    MAX_KEY_ATTRIBUTE_NAME_CHARS, MAX_NESTING_DEPTH, MAX_PARTITION_KEY_BYTES, MAX_SORT_KEY_BYTES,
+    MAX_TRANSACT_BYTES,
 };
 use crate::registry::{GlobalSecondaryIndex, IndexProjection, LocalSecondaryIndex, SecondaryIndex};
 use crate::{AttributeValue, Item, TableSchema};
@@ -3373,7 +3374,40 @@ fn decode_batch_write(obj: &Map<String, Value>) -> Result<Operation, WireError> 
              {BATCH_WRITE_MAX_ITEMS} allowed per call across all tables"
         )));
     }
+    check_batch_write_bytes(&requests)?;
     Ok(Operation::BatchWriteItem { requests })
+}
+
+/// AWS's `BatchWriteItem` request-size cap ([`MAX_BATCH_WRITE_REQUEST_BYTES`],
+/// ADR 0072 layer 4): the total `item_size` of every `PutRequest` item and
+/// `DeleteRequest` key in the call, at most 16 MiB. **Currently unreachable
+/// via this wire**: [`BATCH_WRITE_MAX_ITEMS`] (25) × `MAX_ITEM_SIZE_BYTES`
+/// (400 KB) tops out at 10 MB, comfortably under this cap — every request
+/// that could ever exceed it is already rejected by
+/// [`decode_batch_write`]'s own item-count cap, or by [`check_item_size`]
+/// on an individual over-cap item. Enforced anyway so the catalogue is
+/// complete and the check is in place the moment either of those two caps
+/// is ever raised; `byte_cap_tests` exercises this function directly with a
+/// synthetic over-cap request, since the decode path itself cannot reach
+/// it.
+fn check_batch_write_bytes(
+    requests: &BTreeMap<String, Vec<WriteRequest>>,
+) -> Result<(), WireError> {
+    let total_bytes: usize = requests
+        .values()
+        .flatten()
+        .map(|req| match req {
+            WriteRequest::Put(item) => item_size(item),
+            WriteRequest::Delete(key) => item_size(key),
+        })
+        .sum();
+    if total_bytes > MAX_BATCH_WRITE_REQUEST_BYTES {
+        return Err(WireError::validation(format!(
+            "BatchWriteItem request size {total_bytes} bytes exceeds the maximum allowed size \
+             of {MAX_BATCH_WRITE_REQUEST_BYTES} bytes"
+        )));
+    }
+    Ok(())
 }
 
 /// Decode a `TransactWriteItems` body: `{"TransactItems": [{Put|Delete|Update|
@@ -3453,8 +3487,39 @@ fn decode_transact_write(obj: &Map<String, Value>) -> Result<Operation, WireErro
             actions.len()
         )));
     }
+    // AWS's `TransactWriteItems` aggregate-size cap ([`MAX_TRANSACT_BYTES`],
+    // ADR 0072 layer 4): unlike the item-count cap above, this one IS
+    // reachable — [`TRANSACT_WRITE_MAX_ACTIONS`] (100) × `MAX_ITEM_SIZE_BYTES`
+    // (400 KB) is 40 MB, well past the 4 MiB limit (11 max-size `Put`s
+    // already exceed it).
+    let total_bytes: usize = actions
+        .iter()
+        .map(|a| item_size(transact_action_size_item(a)))
+        .sum();
+    if total_bytes > MAX_TRANSACT_BYTES {
+        return Err(WireError::validation(format!(
+            "TransactWriteItems request size {total_bytes} bytes exceeds the maximum allowed \
+             size of {MAX_TRANSACT_BYTES} bytes"
+        )));
+    }
     let token = decode_client_request_token(obj)?;
     Ok(Operation::TransactWriteItems { actions, token })
+}
+
+/// The size-counted `Item` of one `TransactAction`, for the aggregate byte
+/// cap ([`MAX_TRANSACT_BYTES`]) enforced by [`decode_transact_write`]: the
+/// full `item` for a `Put` (the whole write payload crosses the wire), the
+/// `key` for `Delete`/`Update`/`ConditionCheck` (no item body does).
+/// Mirrors `animusd::dynamo`'s own `transact_action_key_item` (dedup /
+/// reserved-table checks, not byte accounting) — kept separate since this
+/// module doesn't depend on `animusd`.
+fn transact_action_size_item(action: &TransactAction) -> &Item {
+    match action {
+        TransactAction::Put { item, .. } => item,
+        TransactAction::Delete { key, .. }
+        | TransactAction::Update { key, .. }
+        | TransactAction::ConditionCheck { key, .. } => key,
+    }
 }
 
 /// Decode an optional `ClientRequestToken` field: AWS requires 1..=36
@@ -13056,5 +13121,115 @@ mod tests {
                 "each entry must be {{}}"
             );
         }
+    }
+}
+
+// --- ADR 0072 layer 4: BatchWriteItem/TransactWriteItems aggregate byte
+// caps ------------------------------------------------------------------
+//
+// Kept in its own `mod`, separate from the big `tests` module above, per
+// this series' own worktree-split convention: a sibling layer is
+// concurrently adding unrelated checks to `wire.rs` and its own tests to
+// `mod tests`, so a new module here (rather than appended lines inside
+// theirs) keeps that rebase conflict-free.
+#[cfg(test)]
+mod byte_cap_tests {
+    use super::*;
+
+    /// A single-attribute item (`"a": {"S": ..}`) whose `item_size` is
+    /// exactly `1 + value_len` — the attribute name `"a"` is one byte, an
+    /// `S` value's size is its length. Mirrors `wire::tests::item_of_size`.
+    fn item_of_size(value_len: usize) -> Item {
+        let mut item = Item::new();
+        item.insert("a".to_string(), AttributeValue::S("x".repeat(value_len)));
+        item
+    }
+
+    /// [`check_batch_write_bytes`] directly, at the boundary and one byte
+    /// over it — bypassing `decode_batch_write`'s own item-count
+    /// (`BATCH_WRITE_MAX_ITEMS`) and per-item (`MAX_ITEM_SIZE_BYTES`) caps,
+    /// since together they keep the 16 MiB aggregate cap unreachable via
+    /// the wire (see [`check_batch_write_bytes`]'s own doc) — exactly the
+    /// "test the check's own function" case this task calls for.
+    #[test]
+    fn check_batch_write_bytes_accepts_the_cap_and_rejects_one_over_it() {
+        let half = MAX_BATCH_WRITE_REQUEST_BYTES / 2;
+
+        let at_cap: BTreeMap<String, Vec<WriteRequest>> = BTreeMap::from([(
+            "t".to_string(),
+            vec![
+                WriteRequest::Put(item_of_size(half - 1)),
+                WriteRequest::Put(item_of_size(MAX_BATCH_WRITE_REQUEST_BYTES - half - 1)),
+            ],
+        )]);
+        check_batch_write_bytes(&at_cap).expect("exactly the cap is accepted");
+
+        let over_cap: BTreeMap<String, Vec<WriteRequest>> = BTreeMap::from([(
+            "t".to_string(),
+            vec![
+                WriteRequest::Put(item_of_size(half - 1)),
+                WriteRequest::Put(item_of_size(MAX_BATCH_WRITE_REQUEST_BYTES - half)),
+            ],
+        )]);
+        let err = check_batch_write_bytes(&over_cap).expect_err("one over the cap is rejected");
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    /// A `DeleteRequest` key also counts toward the aggregate, not just
+    /// `PutRequest` items.
+    #[test]
+    fn check_batch_write_bytes_counts_delete_keys_too() {
+        let requests: BTreeMap<String, Vec<WriteRequest>> = BTreeMap::from([(
+            "t".to_string(),
+            vec![WriteRequest::Delete(item_of_size(
+                MAX_BATCH_WRITE_REQUEST_BYTES,
+            ))],
+        )]);
+        let err =
+            check_batch_write_bytes(&requests).expect_err("an over-cap Delete key is rejected");
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    /// A `TransactWriteItems` body with one `Put` action per `sizes` entry,
+    /// item `i`'s single attribute `"a"` valued at `sizes[i]` bytes (so its
+    /// own `item_size` is `1 + sizes[i]`).
+    fn transact_write_body_with_sizes(sizes: &[usize]) -> String {
+        let actions: Vec<String> = sizes
+            .iter()
+            .map(|&value_len| {
+                format!(
+                    r#"{{"Put":{{"TableName":"tbl","Item":{{"a":{{"S":"{}"}}}}}}}}"#,
+                    "x".repeat(value_len)
+                )
+            })
+            .collect();
+        format!(r#"{{"TransactItems":[{}]}}"#, actions.join(","))
+    }
+
+    /// `TransactWriteItems`' aggregate byte cap ([`MAX_TRANSACT_BYTES`], 4
+    /// MiB) IS reachable via the wire, unlike `BatchWriteItem`'s: eleven
+    /// `Put`s each right at `MAX_ITEM_SIZE_BYTES` (400 KB, the smallest
+    /// action count that can reach 4 MiB while every individual item stays
+    /// legal — `TRANSACT_WRITE_MAX_ACTIONS` × `MAX_ITEM_SIZE_BYTES` is 40
+    /// MB, so the count cap alone doesn't stop this the way it stops
+    /// `BatchWriteItem`) sum to exactly the cap; one more byte on the last
+    /// item pushes it over.
+    #[test]
+    fn transact_write_accepts_the_byte_cap_and_rejects_one_over_it() {
+        let mut sizes = vec![MAX_ITEM_SIZE_BYTES - 1; 10]; // item_size == MAX_ITEM_SIZE_BYTES each
+        let ten_total: usize = sizes.iter().map(|&v| v + 1).sum();
+        let remaining = MAX_TRANSACT_BYTES - ten_total;
+        sizes.push(remaining - 1); // 11th item_size == remaining; total == the cap, exactly
+
+        let at_cap = transact_write_body_with_sizes(&sizes);
+        decode_request("DynamoDB_20120810.TransactWriteItems", at_cap.as_bytes())
+            .expect("exactly the cap is accepted");
+
+        let mut over = sizes.clone();
+        *over.last_mut().expect("non-empty") += 1;
+        let over_cap = transact_write_body_with_sizes(&over);
+        let err = decode_request("DynamoDB_20120810.TransactWriteItems", over_cap.as_bytes())
+            .expect_err("one over the cap is rejected");
+        assert_eq!(err.code, "ValidationException");
     }
 }

@@ -20473,6 +20473,16 @@ mod sim_cluster_dynamo_query_range;
 #[cfg(test)]
 mod sim_cluster_dynamo_page_size_cap;
 
+/// ADR 0072 layer 4: the aggregate byte caps — `BatchGetItem`'s 16 MiB
+/// response-size cap (`UnprocessedKeys` pagination, never an error),
+/// `TransactWriteItems`'s 4 MiB aggregate request-size cap (decode-time
+/// `ValidationException`), and `TransactGetItems`'s 4 MiB aggregate
+/// response-size cap (`ValidationException` against the fetched result) —
+/// `sim_cluster_dynamo_page_size_cap.rs`'s own sibling for the
+/// request/response-size half of ADR 0072's catalogue.
+#[cfg(test)]
+mod sim_cluster_dynamo_byte_caps;
+
 /// ADR 0061 rung D3 PR 3a sibling: descending `Query`/pagination
 /// (`ScanIndexForward: false`), over the base table and an LSI. Replaces six
 /// of `crates/animusd/tests/dynamo_scan_index_forward.rs`'s eight tests.
