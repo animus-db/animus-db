@@ -41,22 +41,6 @@ use tokio::time::{sleep, timeout};
 
 mod support;
 
-async fn await_bootstrap(nodes: &[Node]) {
-    let ready = async {
-        loop {
-            if nodes.iter().any(Node::is_control_leader)
-                && nodes.iter().all(|node| !node.metadata().members.is_empty())
-            {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    };
-    timeout(Duration::from_secs(30), ready)
-        .await
-        .expect("cluster did not bootstrap within 30s");
-}
-
 async fn admin_get(addr: SocketAddr, path: &str) -> (u16, Value) {
     let mut stream = TcpStream::connect(addr).await.expect("connect to admin");
     let request = format!("GET {path} HTTP/1.0\r\nHost: animus\r\nConnection: close\r\n\r\n");
@@ -226,23 +210,37 @@ async fn put(clients: &[SocketAddr], key: &[u8], value: &[u8], secs: u64) {
 async fn spare_replacement_passes_through_an_observable_learner_state_and_keeps_serving() {
     let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(4, dir.path()).await;
-    await_bootstrap(&nodes).await;
+    // Bring-up barrier gated on all-members-*Active*, not merely present
+    // (issue #1028): a founding node still recorded `Down` when the first
+    // write provisions the `kv` tablet is silently skipped by
+    // `provision_tablet`'s `status == Active` placement filter, so the tablet
+    // can form on the wrong node set and the spare-id assumption below breaks.
+    support::await_bootstrap(&nodes).await;
     let raftkv_ids = config.data_ids(); // [0, 1, 2, 3]
-    let spare = raftkv_ids[3].clone();
     let clients: Vec<SocketAddr> = config.nodes.iter().map(|a| a.client).collect();
 
-    // ADR 0023: provision the `kv` tablet by writing first — it lands on ids
-    // 0..2, leaving id 3 as the idle spare.
+    // Make the placement precondition explicit: every founding data id must be
+    // `Active` in the control leader's metadata before the first, placement-
+    // sensitive write — otherwise the `kv` tablet can provision onto a subset
+    // that skips a still-`Down` node (issue #1028). The shared barrier above
+    // already guarantees this; assert the intent here rather than relying on it
+    // implicitly.
+    support::await_data_nodes_active(&nodes, &raftkv_ids).await;
+
+    // ADR 0023: provision the `kv` tablet by writing first — with every id
+    // `Active`, it lands on the first `MAX_REPLICATION_FACTOR` ids, leaving the
+    // remaining id as the idle spare. Which id is the spare is *derived* from
+    // the formed voter set below, never hard-coded.
     put(&clients, b"k0", b"v0", 30).await;
 
-    let leader_idx = {
+    let (leader_idx, voters) = {
         let formed = async {
             loop {
                 for (i, node) in nodes.iter().enumerate() {
                     if let Some((true, voters, _)) = group_view(node.admin_addr()).await
                         && voters.len() == 3
                     {
-                        return i;
+                        return (i, voters);
                     }
                 }
                 sleep(Duration::from_millis(100)).await;
@@ -253,12 +251,29 @@ async fn spare_replacement_passes_through_an_observable_learner_state_and_keeps_
             .expect("CP group did not form with 3 voters + a leader within 30s")
     };
 
-    // Kill a follower replica — the leader survives, so this test's own
-    // write-liveness poll below has a stable place to route through.
-    let kill_idx = (0..3)
-        .find(|&i| i != leader_idx)
-        .expect("a follower replica exists");
-    let killed_id = raftkv_ids[kill_idx].clone();
+    // The spare is the single founding data id NOT in the formed 3-voter set —
+    // derived, never `raftkv_ids[3]` (issue #1028: the tablet may legitimately
+    // form on e.g. {0,1,3} under load, making id 2 the real spare).
+    let spare = raftkv_ids
+        .iter()
+        .find(|id| !voters.contains(id))
+        .cloned()
+        .expect("exactly one of the four founding ids is not a voter");
+
+    // Kill a non-leader VOTER (a member of the formed 3-voter set that is not
+    // the leader) — the leader survives, so this test's own write-liveness poll
+    // below has a stable place to route through, and the killed id is a real
+    // voter whose loss actually triggers the reconfigure onto the spare.
+    let leader_id = &raftkv_ids[leader_idx];
+    let killed_id = voters
+        .iter()
+        .find(|v| *v != leader_id)
+        .cloned()
+        .expect("a non-leader voter exists in the formed group");
+    let kill_idx = raftkv_ids
+        .iter()
+        .position(|id| id == &killed_id)
+        .expect("the killed voter is one of the founding nodes");
     nodes[kill_idx].shutdown();
     let survivors: Vec<usize> = (0..4).filter(|&i| i != kill_idx).collect();
 
