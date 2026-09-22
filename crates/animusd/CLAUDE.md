@@ -5798,11 +5798,18 @@ ADR itself for the full design/rationale.
   rule in `docs/engineering-lessons.md` (machine relay →
   `intra_leader_hint`; anything a human reads → `leader_hint`).
 - **`handle_connection` cancels an in-flight request when the peer closes the
-  connection (issue #596), on both listeners.** `serve_requests` still
-  spawns one untracked, fire-and-forget task per accepted connection (see
-  the `WatchMetadata` gotcha below for what that still doesn't fix), but
-  the per-connection loop itself no longer runs a request to completion
-  with nobody listening: `handle_connection` splits the socket
+  connection (issue #596), on both listeners.** `serve_requests` used to
+  spawn one untracked, fire-and-forget `tokio::spawn` per accepted
+  connection — invisible to `Node::shutdown_and_wait`, so a handler
+  accepted just before teardown could outlive its node with a live
+  `ClientCtx` (issue #1010). It now owns every handler in a `tokio::task::
+  JoinSet` local to the accept-loop future itself, so aborting that future
+  (what `shutdown_and_wait` already does) cascades into the `JoinSet`'s own
+  `Drop`, aborting every live handler — see `serve_requests`'s own doc for
+  the full mechanism and why it isn't routed through `ProdEnv`'s own abort
+  registry instead. Independent of that fix, the per-connection loop
+  itself no longer runs a request to completion with nobody listening:
+  `handle_connection` splits the socket
   (`TcpStream::into_split`) once, then races `handle_request(..)` against a
   `peer_closed(&mut read_half)` future in a `tokio::select! { biased; .. }`
   — `biased` so a response that finishes at the same poll as the
@@ -5861,6 +5868,34 @@ ADR itself for the full design/rationale.
   one connection with no read in between (a pipelined client) and asserts
   both responses come back in order and the metric stays at zero — the
   regression for `peer_closed`'s own peek-not-read distinction above.
+- **`BoundNode::start_with_growth`/`BoundDataNode::start_data_with_growth`/
+  `BoundControlNode::start_control_with` each spawn work (the control-plane
+  Raft driver via `RaftNode::start_*` on `self.env`, then `spawn_common_
+  tail`'s own bundle) and then still have fallible `?` steps left
+  (`build_segment_store`, `build_backup_store`, `check_wal_layout`,
+  `SharedWal::open`) — a private RAII guard, `StartupTasks`, owns every
+  task/env spawned so far and aborts/shuts them down on `Drop` while still
+  armed, so an early `?`-return can never leak them (issue #1010, layer
+  2 — the spawn-before-fallible-step sibling of the fire-and-forget-spawn
+  gotcha just above). It implements `DerefMut<Target =
+  Vec<JoinHandle<()>>>`, so every pre-existing `tasks.push(tokio::spawn(..))`
+  call site in these three methods compiles completely unchanged once the
+  local `tasks` binding is the guard (`let mut tasks = startup;`, after
+  `spawn_common_tail`'s own returned `Vec` is `.extend`ed in) rather than a
+  bare `Vec`; `.into_parts()` disarms it once no fallible step remains,
+  handing back `(tasks, envs)` for `Node`'s own construction. **`Drop`
+  cannot `.await`, so it only ever *requests* the abort/shutdown** — same
+  "not a guarantee" contract as `Node::shutdown` itself — a caller that
+  needs the freed ports provably back needs its own bounded
+  converged-or-timeout poll, not a single check right after the failing
+  call returns (`tests/bring_up_allocation.rs`'s own regression for this
+  does exactly that). `SharedWal::open` (`animus-control::shared_wal`) is
+  effectively infallible in practice (`unwrap_or_default()` swallows a read
+  error) — the WAL-layout failure this guard actually protects against in
+  the wild is `check_wal_layout` refusing a mismatched data directory
+  (`animus-cp-data::host`), reachable with the default `shared_wal: true`
+  (`main::DEFAULT_SHARED_WAL`) against a pre-existing per-group-WAL data
+  directory.
 - **`ClusterEdgeState` is scoped to one NODE** (ADR 0031 PR2), created fresh per
   node — even in `--cluster N`, which previously shared one instance across the
   cluster and masked cross-process bugs. Holds this node's own control handle, its

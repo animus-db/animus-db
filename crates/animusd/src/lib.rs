@@ -5135,6 +5135,116 @@ fn spawn_common_tail(
     (ctx, tasks)
 }
 
+/// RAII guard for `BoundNode::start_with_growth`/`BoundDataNode::
+/// start_data_with_growth`/`BoundControlNode::start_control_with` (issue
+/// #1010, layer 2): owns every task and env this node assembly has spawned
+/// **so far**, and — while still armed — aborts every task and requests
+/// every env's shutdown when dropped, so a `?` on a later fallible step
+/// (`build_segment_store`, `build_backup_store`, `check_wal_layout`,
+/// `SharedWal::open`) can never leak the control-plane Raft driver, the
+/// accept loops (and, since layer 1, everything they've in turn accepted),
+/// or any other task already spawned by this same assembly attempt past
+/// this function's own early `return Err(..)`.
+///
+/// Construct it at (or just before) the point this node assembly spawns
+/// its **first** env-owned task — in every caller here, that's
+/// `RaftNode::start_with_orphan_sweep_after(self.env.clone(), ..)`, or
+/// simply right after `self.env.clone()` is first set aside for `Node`'s
+/// own `envs` field, which is always at least as early. Feed
+/// `spawn_common_tail`'s own returned `Vec<JoinHandle<()>>` in via
+/// [`extend`](Self::extend) once it returns, then keep using the guard
+/// itself (via its [`DerefMut`] to `Vec<JoinHandle<()>>`) for every
+/// `tasks.push(tokio::spawn(..))` call after that — every such call site
+/// in this file compiles completely unchanged, since the local binding
+/// named `tasks` is now this guard rather than a bare `Vec`. Once every
+/// fallible step the assembly still has left has returned `Ok`, call
+/// [`into_parts`](Self::into_parts) to disarm the guard and hand back its
+/// `(tasks, envs)` for `Node`'s own construction.
+///
+/// **`Drop` can only *request* an abort/shutdown, never wait for it** —
+/// the same "request, not guarantee" contract as a bare `task.abort()`
+/// (`docs/lessons/testing/2026-08-10-abort-on-a-tokio-task-joinhandle-
+/// aborthandle-only-requests.md`), and `Drop::drop` cannot `.await` at
+/// all, so there is no way to wait here even in principle. A caller that
+/// needs "and the ports are provably free" after a failed start (this
+/// crate's own regression test for this guard does) needs a bounded
+/// converged-or-timeout poll on the actual resource (e.g. re-binding each
+/// address), never a single check immediately after the failing call
+/// returns.
+struct StartupTasks {
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+    envs: Vec<ProdEnv>,
+    /// `false` once [`into_parts`](Self::into_parts) has disarmed this
+    /// guard (the success path) — `Drop` is then a no-op, exactly like a
+    /// `mem::forget`'d value, since ownership of every task/env has moved
+    /// to the caller's own `Node`.
+    armed: bool,
+}
+
+impl StartupTasks {
+    /// Start tracking `envs` (in practice always exactly this node's one
+    /// shared internal `ProdEnv`, cloned — see [`Node`]'s own `envs` field
+    /// doc for why combined/data-only/control-only nodes all have just
+    /// one) with no tasks yet.
+    fn new(envs: Vec<ProdEnv>) -> Self {
+        Self {
+            tasks: Vec::new(),
+            envs,
+            armed: true,
+        }
+    }
+
+    /// Adopt `spawn_common_tail`'s own returned tasks into this guard, so
+    /// a fallible step between that call and this node assembly's own
+    /// success is covered too.
+    fn extend(&mut self, tasks: Vec<tokio::task::JoinHandle<()>>) {
+        self.tasks.extend(tasks);
+    }
+
+    /// Disarm the guard and hand back its parts, for `Node { tasks, envs,
+    /// .. }` — called once this node assembly has no fallible step left.
+    fn into_parts(mut self) -> (Vec<tokio::task::JoinHandle<()>>, Vec<ProdEnv>) {
+        self.armed = false;
+        (
+            std::mem::take(&mut self.tasks),
+            std::mem::take(&mut self.envs),
+        )
+    }
+}
+
+impl std::ops::Deref for StartupTasks {
+    type Target = Vec<tokio::task::JoinHandle<()>>;
+    fn deref(&self) -> &Self::Target {
+        &self.tasks
+    }
+}
+
+impl std::ops::DerefMut for StartupTasks {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.tasks
+    }
+}
+
+impl Drop for StartupTasks {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Sync abort requests only (see this type's own doc for why) — the
+        // exact two loops `Node::shutdown` itself runs, minus the CP-group/
+        // control-plane `halted` latches, which have nothing to latch yet
+        // at any point this guard can still be armed (no CP group is ever
+        // hosted, and no control driver's own `halted` flag is reachable,
+        // before `Node` itself exists).
+        for task in &self.tasks {
+            task.abort();
+        }
+        for env in &self.envs {
+            env.shutdown();
+        }
+    }
+}
+
 impl BoundNode {
     /// This node's own identity, as bound — the same [`NodeId`] [`Node::bind`]
     /// was given. Lets a caller holding a bag of already-bound nodes (e.g. a
@@ -5520,7 +5630,16 @@ impl BoundNode {
         // listener port for a restart. ADR 0040 PR1: one shared env, so just
         // one entry — kept as a `Vec` for shape-parity with the control-only/
         // data-only `Node` variants (both single-env already).
-        let envs = vec![self.env.clone()];
+        //
+        // **`StartupTasks` guards this whole assembly from here on** (issue
+        // #1010, layer 2): every later fallible step below (`build_segment_
+        // store`, `build_backup_store`, `check_wal_layout`, `SharedWal::
+        // open`) can `?`-return before `Node` itself exists — without this
+        // guard that would leak the control-plane Raft driver
+        // (`RaftNode::start_with_orphan_sweep_after` below spawns it onto
+        // this same `self.env`) and everything `spawn_common_tail` spawns.
+        // See [`StartupTasks`]'s own doc for the full mechanism.
+        let mut startup = StartupTasks::new(vec![self.env.clone()]);
 
         // The one shared metrics sink (ADR 0040 PR1: control Raft and CP group
         // now record into the *same* env's sink, not two distinct ones — see
@@ -5662,7 +5781,7 @@ impl BoundNode {
             change_rates: ChangeRateTracker::default(),
             request_rates: RequestRateTracker::default(),
         };
-        let (ctx, mut tasks) = spawn_common_tail(
+        let (ctx, common_tail_tasks) = spawn_common_tail(
             ControlHandle::Local(raft.clone()),
             edge.clone(),
             Some(data_role),
@@ -5691,6 +5810,10 @@ impl BoundNode {
             self.tls,
             export_s3,
         );
+        // Adopted into the `StartupTasks` guard so the fallible
+        // `check_wal_layout`/`SharedWal::open` steps below are covered too
+        // (issue #1010, layer 2) — see `startup`'s own construction above.
+        startup.extend(common_tail_tasks);
 
         // The per-node **tablet-host reconciler** (ADR 0031 PR4): the single
         // writer of "does this node host tablet T" — see
@@ -5841,6 +5964,16 @@ impl BoundNode {
                 })?;
             reconciler.enable_shared_wal(shared);
         }
+
+        // Every fallible step this node assembly has left is behind it —
+        // `startup` (issue #1010, layer 2) has done its job for this
+        // attempt. Shadow it as `tasks`, so every `tasks.push(tokio::
+        // spawn(..))` call below (unchanged from before the guard existed —
+        // `StartupTasks`'s `DerefMut<Target = Vec<JoinHandle<()>>>` makes
+        // that legal) keeps appending into the very same guard, which is
+        // disarmed and unpacked into `Node`'s own `tasks`/`envs` at the end
+        // of this function instead of being dropped-and-aborted.
+        let mut tasks = startup;
 
         // Bootstrap: whichever node is leader registers membership (no data tablet)
         // (idempotent). `spawn_common_tail` (above) already started `tasks` with
@@ -6102,6 +6235,10 @@ impl BoundNode {
             ctx.tls.as_ref().map(|m| m.server_acceptor.clone()),
         )));
 
+        // Every fallible step is behind this node assembly now — disarm
+        // the guard and reclaim its parts for `Node` itself (issue #1010,
+        // layer 2).
+        let (tasks, envs) = tasks.into_parts();
         Ok(Node {
             raft: ControlHandle::Local(raft),
             envs,
@@ -6144,7 +6281,15 @@ pub struct Node {
     /// their listener ports.
     envs: Vec<ProdEnv>,
     /// The client-facing listener tasks (client TCP / dynamo HTTP), which
-    /// run on plain `tokio::spawn` off the `Env` network; aborted on shutdown.
+    /// run on plain `tokio::spawn` off the `Env` network; aborted on
+    /// shutdown. **Covers each listener's own accept-loop task only, not
+    /// its per-connection handlers** (issue #1010) — `serve_requests`
+    /// (client + intra) owns those in a `tokio::task::JoinSet` local to
+    /// the accept-loop future itself, so aborting the accept-loop task
+    /// here (or an internal `ProdEnv` role's own registry aborting it)
+    /// cascades into that `JoinSet`'s `Drop`, which aborts every live
+    /// handler in turn — see `serve_requests`'s own doc for the full
+    /// mechanism. No handler is ever tracked in this `Vec` directly.
     tasks: Vec<tokio::task::JoinHandle<()>>,
     /// This node's own edge state (ADR 0031 PR2 — cheap to clone, `Arc`-wrapped
     /// internally), kept so [`shutdown_graceful`](Self::shutdown_graceful) can
@@ -6606,6 +6751,17 @@ impl Node {
     /// Latches every hosted CP group's `halted` flag first, exactly like
     /// [`shutdown`](Self::shutdown) — see that method's doc; this path
     /// hard-aborts the same driver tasks, just with an added wait afterward.
+    ///
+    /// **Also the mechanism that stops every live per-connection handler**
+    /// (issue #1010): aborting `serve_requests`'s own accept-loop task
+    /// (in `self.tasks`) drops its future, and with it the `tokio::task::
+    /// JoinSet` that future owns — whose `Drop` aborts every handler still
+    /// live in it, cascade-style. So "every listener port this node owns
+    /// is genuinely free" (this method's own doc above) also means "no
+    /// handler this node ever accepted a connection for is still running",
+    /// not just the accept loop itself. See `serve_requests`'s own doc for
+    /// the full mechanism and why it isn't instead routed through
+    /// `ProdEnv`'s own abort registry.
     pub async fn shutdown_and_wait(&self) {
         self.edge.halt_hosted_cp_groups();
         self.halt_local_control();
@@ -6924,7 +7080,13 @@ impl BoundControlNode {
                 .map(|(id, addr)| (id.clone(), addr.to_string()))
                 .collect(),
         );
-        let envs = vec![self.env.clone()];
+        // `StartupTasks` guards this whole assembly from here on (issue
+        // #1010, layer 2): `RaftNode::start_with_orphan_sweep_after` below
+        // starts the control-plane Raft driver before `build_segment_store`/
+        // `build_backup_store`'s own `?`s — without this guard either of
+        // those failing would leak that driver. See `StartupTasks`'s own
+        // doc for the full mechanism.
+        let mut startup = StartupTasks::new(vec![self.env.clone()]);
 
         let admin_info = Arc::new(AdminInfo {
             node_id: Some(self.id.clone()),
@@ -7053,7 +7215,7 @@ impl BoundControlNode {
         )
         .await?;
 
-        let (ctx, mut tasks) = spawn_common_tail(
+        let (ctx, common_tail_tasks) = spawn_common_tail(
             ControlHandle::Local(raft.clone()),
             edge,
             None,
@@ -7087,6 +7249,14 @@ impl BoundControlNode {
             // here would ever call `ClientCtx::export_store_factory`.
             None,
         );
+        startup.extend(common_tail_tasks);
+        // No fallible step remains in this assembly past this point (issue
+        // #1010, layer 2) — shadow the guard as `tasks` right away so every
+        // `tasks.push(tokio::spawn(..))` below (unchanged) keeps appending
+        // into it; still using the guard, not a bare `Vec`, purely for
+        // uniformity with `start_with_growth`/`start_data_with_growth`
+        // above/below, which do have later fallible steps.
+        let mut tasks = startup;
 
         // Peer-sync loop (ADR 0040 PR1) — a control-only node needs it
         // exactly as much as a combined node does, to reach a runtime-added
@@ -7171,6 +7341,7 @@ impl BoundControlNode {
             pitr_janitor::DEFAULT_PITR_RETENTION,
         )));
 
+        let (tasks, envs) = tasks.into_parts();
         Ok(Node {
             raft: ControlHandle::Local(raft),
             envs,
@@ -7500,7 +7671,17 @@ impl BoundDataNode {
             otlp_endpoint: otel::resolved_endpoint(),
         });
 
-        let envs = vec![self.env.clone()];
+        // `StartupTasks` guards this whole assembly from here on (issue
+        // #1010, layer 2): unlike `start_with_growth`/`start_control_with`,
+        // a data-only node starts no local Raft driver at all
+        // (`ControlHandle::Remote` — no local `RaftCore`), but
+        // `build_segment_store`/`build_backup_store` below can still spawn
+        // a serving task onto `self.env` (`ClusterSegmentStore::start`) and
+        // still `?`-fail after doing so, and `check_wal_layout`/
+        // `SharedWal::open` further down are the identical late-fallible
+        // shape `start_with_growth` has. See `StartupTasks`'s own doc for
+        // the full mechanism.
+        let mut startup = StartupTasks::new(vec![self.env.clone()]);
         let raftkv_metrics = self.env.metrics();
 
         // Same shared-engine assembly as `BoundNode::start_with` — see that
@@ -7550,7 +7731,7 @@ impl BoundDataNode {
             change_rates: ChangeRateTracker::default(),
             request_rates: RequestRateTracker::default(),
         };
-        let (ctx, mut tasks) = spawn_common_tail(
+        let (ctx, common_tail_tasks) = spawn_common_tail(
             control,
             edge.clone(),
             Some(data_role),
@@ -7586,6 +7767,10 @@ impl BoundDataNode {
             // stays the "not configured" default until this is wired.
             None,
         );
+        // Adopted into the `StartupTasks` guard so the fallible
+        // `check_wal_layout`/`SharedWal::open` steps below are covered too
+        // (issue #1010, layer 2) — see `startup`'s own construction above.
+        startup.extend(common_tail_tasks);
 
         // ADR 0028's layout-mismatch amendment (C-05 PR 2/3): identical
         // loud-refusal gate as `BoundNode::start_with_growth`'s own call
@@ -7686,6 +7871,14 @@ impl BoundDataNode {
                 })?;
             reconciler.enable_shared_wal(shared);
         }
+
+        // Every fallible step this node assembly has left is behind it
+        // (issue #1010, layer 2) — shadow `startup` as `tasks`, exactly as
+        // `BoundNode::start_with_growth` does, so every `tasks.push(tokio::
+        // spawn(..))` below (unchanged) keeps appending into the same
+        // guard, disarmed and unpacked into `Node`'s own `tasks`/`envs` at
+        // the end of this function.
+        let mut tasks = startup;
 
         // No `bootstrap` — a data-only node holds no control-plane Raft role
         // to register members against; that is entirely the control
@@ -7808,6 +8001,7 @@ impl BoundDataNode {
             ctx.tls.as_ref().map(|m| m.server_acceptor.clone()),
         )));
 
+        let (tasks, envs) = tasks.into_parts();
         Ok(Node {
             raft: ctx.control.clone(),
             envs,
@@ -13445,40 +13639,93 @@ async fn median_split_key<E: Env>(group: &CpGroup<E>) -> Option<Vec<u8>> {
 /// now genuinely mirrors `animus_env::prod::spawn_accept`'s contract,
 /// which this doc comment used to claim without the code actually doing
 /// it.
+///
+/// **Every accepted connection's handler is owned by a `tokio::task::
+/// JoinSet` local to this function, not a bare `tokio::spawn`** (issue
+/// #1010): a plain fire-and-forget spawn is invisible to [`Node::
+/// shutdown_and_wait`], which only ever aborts the two tasks running this
+/// function itself (`Node.tasks`) plus whatever each internal `ProdEnv`
+/// role's own registry tracks — a handler accepted moments before teardown
+/// was in neither set, so it kept running (and its `ClientCtx` kept living)
+/// past the node's own shutdown, exactly the `full_split_cluster_restart_
+/// recovers_metadata_and_data`-style hazard `docs/lessons/testing/
+/// 2026-09-20-allocate-test-ports-by-binding-and-holding-never-probe-and-
+/// release.md` names as a second, independent TOCTOU on top of the raw
+/// port one. Deliberately **not** routed through `ctx.env.spawn_task`/
+/// `ProdEnv`'s own abort registry either: that registry is append-only for
+/// the lifetime of the env (`Inner.tasks: Mutex<Vec<AbortHandle>>`,
+/// `animus-env/src/prod.rs`) — fine for the handful of long-lived
+/// per-node driver loops it already holds, but one registration per
+/// accepted connection on a long-lived process would be an unbounded
+/// leak of dead `AbortHandle`s, never pruned until the whole env shuts
+/// down. A `JoinSet` is the right home instead: owned by this accept-loop
+/// future itself, so when [`Node::shutdown_and_wait`] aborts the task
+/// running this function and its future is dropped, the `JoinSet`'s own
+/// `Drop` aborts every handler still live in it — a cascade, not a second
+/// tracked collection anyone has to remember to drain. This is what
+/// makes `shutdown_and_wait`'s "listener dropped, port free" contract
+/// also mean "no handler outlives the node": the listener and every
+/// handler it ever accepted go down together, by construction, the moment
+/// this function's own task is aborted.
+///
+/// The loop below `select!`s the listener's own `accept()` (cancel-safe —
+/// dropping this future between polls, e.g. because the other branch won
+/// a race, leaves nothing accepted and nothing lost) against reaping one
+/// finished handler off the `JoinSet` (guarded by `!handlers.is_empty()`
+/// so an empty set is never polled — `JoinSet::join_next()` on an empty
+/// set resolves `None` immediately, which would otherwise busy-loop this
+/// arm). A reaped handler's `JoinError` is logged at `error` if it was a
+/// genuine panic (something this loop should never silently swallow) and
+/// at most `debug` if it was merely cancelled/aborted (the ordinary
+/// shutdown path, not a defect).
 async fn serve_requests(
     listener_socket: TcpListener,
     ctx: ClientCtx,
     listener: ListenerKind,
     tls: Option<tokio_rustls::TlsAcceptor>,
 ) {
+    let mut handlers: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
     loop {
-        match listener_socket.accept().await {
-            Ok((stream, peer_addr)) => {
-                let ctx = ctx.clone();
-                let tls = tls.clone();
-                tokio::spawn(async move {
-                    let stream = match tls {
-                        None => MaybeTlsStream::Plain(stream),
-                        Some(acceptor) => match acceptor.accept(stream).await {
-                            Ok(s) => MaybeTlsStream::Tls(Box::new(s.into())),
-                            Err(err) => {
-                                tracing::warn!(
-                                    ?err,
-                                    %peer_addr,
-                                    "client-protocol TLS handshake failed (dropping connection)"
-                                );
-                                return;
+        tokio::select! {
+            accepted = listener_socket.accept() => {
+                match accepted {
+                    Ok((stream, peer_addr)) => {
+                        let ctx = ctx.clone();
+                        let tls = tls.clone();
+                        handlers.spawn(async move {
+                            let stream = match tls {
+                                None => MaybeTlsStream::Plain(stream),
+                                Some(acceptor) => match acceptor.accept(stream).await {
+                                    Ok(s) => MaybeTlsStream::Tls(Box::new(s.into())),
+                                    Err(err) => {
+                                        tracing::warn!(
+                                            ?err,
+                                            %peer_addr,
+                                            "client-protocol TLS handshake failed (dropping connection)"
+                                        );
+                                        return;
+                                    }
+                                },
+                            };
+                            if let Err(err) = handle_connection(stream, ctx, listener).await {
+                                tracing::debug!(?err, "connection closed");
                             }
-                        },
-                    };
-                    if let Err(err) = handle_connection(stream, ctx, listener).await {
-                        tracing::debug!(?err, "connection closed");
+                        });
                     }
-                });
+                    Err(err) => {
+                        tracing::warn!(?err, "accept failed (retrying)");
+                        tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                    }
+                }
             }
-            Err(err) => {
-                tracing::warn!(?err, "accept failed (retrying)");
-                tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+            Some(finished) = handlers.join_next(), if !handlers.is_empty() => {
+                if let Err(join_err) = finished {
+                    if join_err.is_panic() {
+                        tracing::error!(?join_err, "connection handler task panicked");
+                    } else {
+                        tracing::debug!(?join_err, "connection handler task cancelled");
+                    }
+                }
             }
         }
     }
