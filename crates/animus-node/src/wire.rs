@@ -212,6 +212,22 @@ pub enum ClientRequest {
         writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
         #[serde(default)]
         change_log: Vec<(Vec<u8>, Vec<u8>)>,
+        /// Whether this write is **housekeeping** (a background janitor's
+        /// own bookkeeping, e.g. the trim janitor's change-record
+        /// deletions) rather than client-caused — issue #1037. Lets the
+        /// serving node mark its own accepted propose as housekeeping
+        /// (`Metric::CpHousekeepingProposalsAccepted`) at the exact same
+        /// synchronous site it records `cp_proposals_accepted`, rather than
+        /// only after this whole RPC's confirm wait returns; see
+        /// `animusd::write_path::cp_kind_write_raw_housekeeping`'s doc for
+        /// the race this closes. `#[serde(default)]` since a housekeeping
+        /// write never crosses this wire in practice today (its own
+        /// proposer only ever runs on a tablet it already leads locally) —
+        /// this field exists for the one theoretical case where leadership
+        /// moves between the janitor's own `is_leader()` check and its
+        /// propose.
+        #[serde(default)]
+        housekeeping: bool,
     },
     /// **Internal index-read RPC — never sent bare, only wrapped in
     /// [`Forwarded`](Self::Forwarded)** (ADR 0041 §5): a **linearizable**

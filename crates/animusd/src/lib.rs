@@ -632,6 +632,19 @@ impl<E: Env> CpGroup<E> {
         }
     }
 
+    /// This group's own observability sink — see [`RaftKvNode::
+    /// metrics_handle`]'s doc (issue #1037): lets a housekeeping proposer
+    /// (`index_drain::trim_janitor`) mark its own accepted propose as
+    /// housekeeping in the same synchronous step the propose itself lands
+    /// in, rather than after a confirm/apply wait that races a concurrent
+    /// `/metrics` scrape.
+    pub(crate) fn metrics(&self) -> MetricsHandle {
+        match self {
+            CpGroup::Lsm(n) => n.metrics_handle(),
+            CpGroup::Mem(n) => n.metrics_handle(),
+        }
+    }
+
     /// A bounded base-scope scan over `[start, end)` in key order — the
     /// partition-range read the GSI drain recomputes an item's index rows from.
     pub(crate) async fn local_scan_bounded(
