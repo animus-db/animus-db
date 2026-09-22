@@ -147,7 +147,44 @@
   </div>
 </section>
 
-<section>
+<section id="service-limits">
+  <div class="wrap">
+    <span class="kicker">Service limits</span>
+    <h2>AWS-faithful, compiled in, no escape hatch.</h2>
+    <p class="body-text">DynamoDB's service limits are part of the API, not an operational afterthought — code that depends on <code>ValidationException</code> at 400 KB, or on <code>BatchGetItem</code> handing back <code>UnprocessedKeys</code> past 16 MB, needs that behavior to actually happen against a local cluster, not just against AWS. So every limit below is AWS's own published number, checked in the wire adapter itself. There is no config flag, environment variable or "unleashed" mode that raises or removes any of them — the ones marked <span class="pill yes" style="display:inline-block">Enforced</span> below are load-bearing, not aspirational.</p>
+    <div class="table-scroll" style="margin-top:14px">
+      <table>
+        <thead><tr><th>Limit</th><th style="width:120px">Value</th><th style="width:120px">Status</th><th>Behavior</th></tr></thead>
+        <tbody>
+          <tr><td>Item size</td><td class="mono">400 KB</td><td><span class="pill yes">Enforced</span></td><td class="d">Sum of every attribute's name plus its value, DynamoDB's own formula — checked on every write (<code>PutItem</code>, <code>UpdateItem</code>'s post-update result, <code>BatchWriteItem</code>'s <code>PutRequest</code>s, <code>TransactWriteItems</code>' <code>Put</code> actions). <code>ValidationException</code> over the cap</td></tr>
+          <tr><td>Partition key value</td><td class="mono">2048 B</td><td><span class="pill yes">Enforced</span></td><td class="d">A table's own partition key, or a GSI's/LSI's</td></tr>
+          <tr><td>Sort key value</td><td class="mono">1024 B</td><td><span class="pill yes">Enforced</span></td><td class="d">A table's own sort key, or a GSI's/LSI's</td></tr>
+          <tr><td>Key attribute name</td><td class="mono">255 chars</td><td><span class="pill yes">Enforced</span></td><td class="d">The name of any attribute used as a partition or sort key</td></tr>
+          <tr><td>Attribute name</td><td class="mono">1–64 KB</td><td><span class="pill yes">Enforced</span></td><td class="d">Any attribute name, key or not; empty is never valid</td></tr>
+          <tr><td>Document nesting depth</td><td class="mono">32 levels</td><td><span class="pill yes">Enforced</span></td><td class="d">Nested <code>List</code>/<code>Map</code> depth within a single item</td></tr>
+          <tr><td>Expression string length</td><td class="mono">4096 B</td><td><span class="pill yes">Enforced</span></td><td class="d">Checked independently per expression on a request — <code>ConditionExpression</code>, <code>UpdateExpression</code>, <code>ProjectionExpression</code>, <code>FilterExpression</code>, <code>KeyConditionExpression</code></td></tr>
+          <tr><td>Table / index name</td><td class="mono">3–255 chars</td><td><span class="pill yes">Enforced</span></td><td class="d">ASCII <code>[a-zA-Z0-9_.-]</code> only, matching AWS's own naming rule</td></tr>
+          <tr><td>GSIs per table</td><td class="mono">20</td><td><span class="pill yes">Enforced</span></td><td class="d">At <code>CreateTable</code> and cumulatively across every <code>UpdateTable</code> that adds one</td></tr>
+          <tr><td>LSIs per table</td><td class="mono">5</td><td><span class="pill yes">Enforced</span></td><td class="d">Declared at <code>CreateTable</code> only — LSIs can't be added later, matching AWS</td></tr>
+          <tr><td>Table provisioned throughput</td><td class="mono">40,000 RCU / 40,000 WCU</td><td><span class="pill yes">Enforced</span></td><td class="d">A single table's own declared <code>ProvisionedThroughput</code>, at <code>CreateTable</code> and <code>UpdateTable</code></td></tr>
+          <tr><td><code>BatchWriteItem</code> request items</td><td class="mono">25</td><td><span class="pill yes">Enforced</span></td><td class="d">Summed across every table named in <code>RequestItems</code></td></tr>
+          <tr><td><code>BatchGetItem</code> request keys</td><td class="mono">100</td><td><span class="pill yes">Enforced</span></td><td class="d">Summed across every table named in <code>RequestItems</code></td></tr>
+          <tr><td><code>TransactWriteItems</code> actions</td><td class="mono">100</td><td><span class="pill yes">Enforced</span></td><td class="d"><code>Put</code>/<code>Update</code>/<code>Delete</code>/<code>ConditionCheck</code>, combined</td></tr>
+          <tr><td><code>TransactGetItems</code> items</td><td class="mono">100</td><td><span class="pill yes">Enforced</span></td><td class="d">—</td></tr>
+          <tr><td><code>BatchExecuteStatement</code> statements</td><td class="mono">25</td><td><span class="pill yes">Enforced</span></td><td class="d">Zero statements is also rejected</td></tr>
+          <tr><td><code>ExecuteTransaction</code> statements</td><td class="mono">25</td><td><span class="pill yes">Enforced</span></td><td class="d">Distinct from <code>TransactWriteItems</code>'/<code>TransactGetItems</code>' own 100-item cap; zero statements is also rejected</td></tr>
+          <tr><td><code>Query</code>/<code>Scan</code> evaluated page</td><td class="mono">1 MB</td><td><span class="pill yes">Enforced</span></td><td class="d">Per-page evaluated-item bytes, before any <code>FilterExpression</code> — the page is truncated with a <code>LastEvaluatedKey</code>, exactly like real DynamoDB's own well-known "fewer <code>Items</code> than <code>Limit</code>, still not done" surprise</td></tr>
+          <tr><td><code>BatchGetItem</code> response size</td><td class="mono">16 MB</td><td><span class="pill yes">Enforced</span></td><td class="d">Not an error: items past the budget, and every key not yet fetched, come back in <code>UnprocessedKeys</code> instead — same shape as a per-key throttle refusal</td></tr>
+          <tr><td><code>BatchWriteItem</code> request size</td><td class="mono">16 MB</td><td><span class="pill yes">Enforced</span></td><td class="d">Sum of every <code>PutRequest</code> item and <code>DeleteRequest</code> key. In practice never reachable through this adapter today — 25 items × the 400 KB item cap tops out at 10 MB — checked anyway so it's in place the moment either of those two caps is ever raised</td></tr>
+          <tr><td><code>TransactWriteItems</code> / <code>TransactGetItems</code> aggregate size</td><td class="mono">4 MB</td><td><span class="pill yes">Enforced</span></td><td class="d">Sum of every action's item (<code>Put</code>) or key (<code>Update</code>/<code>Delete</code>/<code>ConditionCheck</code>/<code>Get</code>) in the call — for a write, checked against the request; for a read, DynamoDB's own rule is on the response, so it's checked against what was actually fetched. Both fail the whole call with <code>ValidationException</code>, matching DynamoDB's all-or-nothing transaction contract</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="body-text" style="margin-top:14px">Not yet enforced, and not expected to matter for most workloads: the Streams <code>ShardIterator</code>'s 15-minute expiry, the LSI item-collection size limit (10 GB per partition key, counting the base item and every LSI projection sharing it), the aggregate size rules DynamoDB places on <code>ExpressionAttributeNames</code>/<code>ExpressionAttributeValues</code>, and the account-level 80,000 RCU/WCU ceiling — <code>DescribeLimits</code> reports that last one honestly as a static number, but nothing sums capacity across tables to check against it, because there's no account concept here to sum across.</p>
+  </div>
+</section>
+
+<section class="alt">
   <div class="wrap">
     <span class="kicker">Differences that will show up in your code</span>
     <h2>Four things to check before you assume a drop-in.</h2>
