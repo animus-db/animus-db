@@ -25,7 +25,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use animusd::{
-    ClientRequest, ClientResponse, Node, StorageBackend, bind_cluster, read_frame,
+    ClientRequest, ClientResponse, StorageBackend, bind_cluster, read_frame,
     start_cluster_with_quiesce_after,
 };
 use serde_json::Value;
@@ -40,22 +40,6 @@ mod support;
 /// down before the idle clock starts counting for real — mirrors every
 /// other quiescence test's own `QUIESCE_AFTER` choice.
 const QUIESCE_AFTER: Duration = Duration::from_millis(300);
-
-async fn await_bootstrap(nodes: &[Node]) {
-    let ready = async {
-        loop {
-            if nodes.iter().any(Node::is_control_leader)
-                && nodes.iter().all(|n| !n.metadata().members.is_empty())
-            {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    };
-    timeout(Duration::from_secs(30), ready)
-        .await
-        .expect("cluster did not bootstrap within 30s");
-}
 
 async fn call(addr: SocketAddr, req: ClientRequest) -> ClientResponse {
     let mut stream = TcpStream::connect(addr).await.expect("connect to node");
@@ -149,7 +133,7 @@ async fn write_after_leader_kill_of_a_quiesced_group_converges() {
         start_cluster_with_quiesce_after(bound, StorageBackend::default(), None, QUIESCE_AFTER)
             .await
             .unwrap();
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
 
     // ADR 0023: a fresh cluster has no data tablet — provision it by writing
     // first (auto-provisioned on the first write).
@@ -264,7 +248,7 @@ async fn quiescence_enabled_does_not_disrupt_ordinary_traffic() {
         start_cluster_with_quiesce_after(bound, StorageBackend::default(), None, QUIESCE_AFTER)
             .await
             .unwrap();
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
 
     for i in 0..20u32 {
         let key = format!("k{i}").into_bytes();

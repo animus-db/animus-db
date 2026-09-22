@@ -34,7 +34,7 @@ use animus_tablet::TabletId;
 use animusd::{Node, SegmentStoreConfig, StorageBackend, StreamSealKnobs, bind_cluster};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::time::{sleep, timeout};
+use tokio::time::sleep;
 
 mod support;
 
@@ -71,21 +71,6 @@ async fn start_streamed_cluster_with_store(
     )
     .await
     .unwrap()
-}
-
-async fn await_bootstrap(nodes: &[Node]) {
-    timeout(Duration::from_secs(20), async {
-        loop {
-            if nodes.iter().any(Node::is_control_leader)
-                && nodes.iter().all(|n| !n.metadata().members.is_empty())
-            {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("cluster did not bootstrap within 20s");
 }
 
 /// Poll a **synchronous** `check` (a plain in-memory comparison — every
@@ -214,7 +199,7 @@ async fn repair_re_replicates_to_a_fresh_target_after_a_replica_node_dies() {
     // 4 nodes, K=3 (the default): exactly one spare candidate beyond
     // whichever 3 the placement view chose for this shard.
     let nodes = start_streamed_cluster(4, dir.path(), Duration::from_secs(600)).await;
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
     let addr = nodes[0].dynamo_addr();
 
     let (status, body) = dynamo(

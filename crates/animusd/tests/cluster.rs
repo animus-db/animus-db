@@ -7,9 +7,9 @@
 use std::time::Duration;
 
 use animus_env::nid;
-use animusd::{ClientRequest, ClientResponse, Node, bind_cluster, read_frame, start_cluster};
+use animusd::{ClientRequest, ClientResponse, bind_cluster, read_frame, start_cluster};
 use tokio::net::TcpStream;
-use tokio::time::{sleep, timeout};
+use tokio::time::sleep;
 
 mod support;
 
@@ -53,29 +53,6 @@ async fn put_retry(addr: std::net::SocketAddr, key: &[u8], value: &[u8]) -> Clie
     }
 }
 
-/// Wait until every node has the bootstrap tablet replicated *and* has
-/// converged on the full membership set, or panic. Membership registration
-/// is asynchronous (each node joins the control group one at a time), so
-/// polling for "some members" rather than "all `nodes.len()` members" would
-/// let a caller observe a partially-registered cluster.
-async fn await_bootstrap(nodes: &[Node]) {
-    let ready = async {
-        loop {
-            let leader = nodes.iter().any(Node::is_control_leader);
-            let everyone_registered = nodes
-                .iter()
-                .all(|n| n.metadata().members.len() == nodes.len());
-            if leader && everyone_registered {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    };
-    timeout(Duration::from_secs(20), ready)
-        .await
-        .expect("cluster did not elect a leader and bootstrap within 20s");
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cluster_serves_put_get_and_status_over_tcp() {
     let dir = support::panic_safe_tempdir();
@@ -84,7 +61,7 @@ async fn cluster_serves_put_get_and_status_over_tcp() {
         .unwrap();
     let nodes = start_cluster(bound).await.unwrap(); // R = W = 2 over 3 replicas
 
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
 
     // Status reflects the bootstrapped tablet and membership.
     let addr0 = nodes[0].client_addr();

@@ -96,20 +96,6 @@ fn metric_value(body: &str, name: &str) -> i64 {
         .unwrap_or(0)
 }
 
-async fn await_bootstrap(node: &Node) {
-    let ready = async {
-        loop {
-            if node.is_control_leader() && !node.metadata().members.is_empty() {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    };
-    timeout(Duration::from_secs(20), ready)
-        .await
-        .expect("node did not bootstrap in 20s");
-}
-
 /// The multi-node sibling of [`await_bootstrap`] — mirrors `cluster_growth.
 /// rs`'s identical helper: in a multi-node cluster only ONE node ever
 /// becomes control leader, so waiting on every node's OWN leadership (as
@@ -151,7 +137,7 @@ async fn same_tablet_batch_costs_one_proposal_and_orders_stream_records() {
     let node_dir = dir.path().join("node-0");
     let (node, config) = support::start_single_node(&node_dir, StorageBackend::default()).await;
     let dynamo_addr = config.nodes[0].dynamo;
-    await_bootstrap(&node).await;
+    support::await_bootstrap(std::slice::from_ref(&node)).await;
 
     let (status, body) = dynamo(
         dynamo_addr,
@@ -305,7 +291,7 @@ async fn a_throttled_tablet_group_sheds_while_the_other_table_applies() {
     let node_dir = dir.path().join("node-0");
     let (node, config) = support::start_single_node(&node_dir, StorageBackend::default()).await;
     let dynamo_addr = config.nodes[0].dynamo;
-    await_bootstrap(&node).await;
+    support::await_bootstrap(std::slice::from_ref(&node)).await;
 
     // Table A: PROVISIONED at the minimum (1 WCU) with a single tablet —
     // capacity is a full 300s burst (`ThrottleBucket::new`), i.e. 300 write
@@ -473,7 +459,7 @@ async fn a_same_key_duplicate_in_one_batch_leaves_the_last_write_visible() {
     let node_dir = dir.path().join("node-0");
     let (node, config) = support::start_single_node(&node_dir, StorageBackend::default()).await;
     let dynamo_addr = config.nodes[0].dynamo;
-    await_bootstrap(&node).await;
+    support::await_bootstrap(std::slice::from_ref(&node)).await;
 
     let (status, body) = dynamo(
         dynamo_addr,

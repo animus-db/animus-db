@@ -96,21 +96,6 @@ async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, animusd::Clust
     panic!("could not bring up cluster after retries (ports kept getting stolen)");
 }
 
-async fn await_bootstrap(nodes: &[Node]) {
-    timeout(Duration::from_secs(20), async {
-        loop {
-            if nodes.iter().any(Node::is_control_leader)
-                && nodes.iter().all(|n| !n.metadata().members.is_empty())
-            {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("cluster did not bootstrap in 20s");
-}
-
 async fn put_until_ok(addr: SocketAddr, table: &str, key: &[u8], value: &[u8]) {
     timeout(Duration::from_secs(25), async {
         loop {
@@ -177,7 +162,7 @@ async fn client_port_refuses_intra_traffic_intra_port_serves_it() {
     let n = 3;
     let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(n, dir.path()).await;
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
 
     let table = "intra_port_split_t1";
     let key = b"k1";
@@ -297,7 +282,7 @@ async fn client_port_refuses_intra_traffic_intra_port_serves_it() {
 async fn cp_serve_forwarded_refuses_every_never_forwarded_variant() {
     let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(1, dir.path()).await;
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
     let intra = config.nodes[0].intra;
 
     let cases: Vec<(&str, ClientRequest)> = vec![

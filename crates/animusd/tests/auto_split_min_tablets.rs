@@ -59,21 +59,6 @@ async fn start_cluster_with_tablet_ceilings(
     .unwrap()
 }
 
-async fn await_bootstrap(nodes: &[Node]) {
-    tokio::time::timeout(Duration::from_secs(20), async {
-        loop {
-            if nodes.iter().any(Node::is_control_leader)
-                && nodes.iter().all(|n| !n.metadata().members.is_empty())
-            {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("cluster did not bootstrap within 20s");
-}
-
 async fn dynamo(addr: SocketAddr, target: &str, body: &str) -> (u16, String) {
     let mut stream = TcpStream::connect(addr).await.expect("connect to dynamo");
     let request = format!(
@@ -171,7 +156,7 @@ async fn auto_split_min_tablets_forks_a_provisioned_table_up_to_its_derived_mini
     // test needs no huge numbers: 200 RCU / 200 WCU under a 100/100
     // ceiling derives `ceil(200/100 + 200/100) = 4`.
     let nodes = start_cluster_with_tablet_ceilings(1, dir.path(), 100, 100).await;
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
     let addr = nodes[0].dynamo_addr();
 
     create_provisioned_table(addr, "mt_provisioned", 200, 200).await;

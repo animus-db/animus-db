@@ -5986,6 +5986,23 @@ ADR itself for the full design/rationale.
   if `ProdEnv::send` has no address to send to — see the engineering-lessons
   "two staleness axes" entry (a live-destination-list audit must also check
   the transport address book).
+- **`bootstrap`'s idempotency key is `has_activated`, not presence (issue
+  #1028).** Two decoupled writers can claim a founding member's `members`
+  row: `bootstrap`'s `UpsertMember{Active}` and the node's own
+  `RegisterNode` self-registration (`spawn_common_tail`), whose apply arm
+  inserts `{ Down, has_activated: false }`. With the old
+  `!members.contains_key(node)` guard, a self-registration that landed first
+  made `bootstrap` skip that id forever, and the node only went `Active` when
+  the detector promoted it after its first heartbeat — a window in which
+  `provision_tablet` (first `Active` members in id order) minted the first
+  tablet on an arbitrary 3 of 4 nodes (the #1028 flake) or, on a 3-node RF-3
+  cluster, a genuinely under-replicated 2-replica set. The pure
+  `bootstrap_active_upserts(meta, raftkv_ids)` now also promotes a declared
+  id present as `Down && !has_activated` (labels preserved). The sticky flag
+  is the right key: a crashed founding member keeps `has_activated == true`
+  and is never resurrected here, and a never-booted phantom is upserted
+  once, demoted by `detect_loop`'s synthetic first observation, and not
+  re-upserted. Unit-tested in `lib.rs`'s `bootstrap_active_upserts_tests`.
 - **Online growth (ADR 0030) is data-plane only** — the control group stays
   static; a grown node's control role is a permanent non-voter and mirrors
   `Metadata` via `remote_metadata_sync_loop` into `effective_metadata()` —

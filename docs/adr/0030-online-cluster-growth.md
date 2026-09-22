@@ -366,3 +366,39 @@ one-shot route-table patch (see `SimCluster::grow`'s own doc), not the real
 this ADR's own `Metadata.node_addrs` design describes; that machinery, and
 a `"combined"` (new control-plane-voter) growth node, remain `ProdEnv`-only
 and un-sim-tested.
+
+## Amended 2026-09-22 — option (a)'s guarantee was only race-free when `bootstrap` won (issue #1028)
+
+§3's option (a) keeps `bootstrap` registering every declared data node
+`Active` immediately so `CreateTable`'s provisioning never sees a
+transiently under-replicated membership. That guarantee held only when
+`bootstrap`'s `UpsertMember{Active}` was the *first* writer to touch the
+member's row. It is not the only one: every node also self-registers via
+`MetaCommand::RegisterNode` (the "Amended by ADR 0040" claim path above),
+whose apply arm inserts `{ status: Down, has_activated: false }` when the
+row is absent. `bootstrap`'s idempotency guard was presence-only
+(`!members.contains_key(node)`), so whenever self-registration landed
+first, `bootstrap` skipped that id forever and the node reached `Active`
+only via the ADR 0012 detector's promotion after its first real heartbeat —
+exactly the §3 option (b) behavior this ADR rejected, reappearing under a
+race. Issue #1028 was that window on a 4-node RF-3 cluster (the first
+tablet placed on an arbitrary 3 of the 4; 1/45 under load); on a 3-node
+RF-3 cluster the same race mints the 2-of-3 replica set §3 cites
+`cp_cross_process.rs` catching.
+
+`bootstrap` now also promotes a declared raftkv id that is present as
+`Down` with `has_activated == false` (the sticky "has ever been recorded
+`Active`" flag ADR 0040 PR6 added, set by the `UpsertMember` apply arm the
+moment any `Active` is applied), preserving the row's existing labels. The
+decision is the pure `bootstrap_active_upserts` in `animusd`'s `lib.rs`,
+unit-tested against the real `RegisterNode` apply arm. Keying on
+`has_activated` rather than on presence is what keeps §3's other
+properties intact: a founding member that was `Active` and crashed keeps
+the flag `true`, so `bootstrap` leaves it to the detector and never
+resurrects it; a declared-but-never-booted phantom is upserted `Active`
+exactly once, flips the flag, is demoted to `Down` by §3's synthetic first
+observation after `DETECT_TIMEOUT`, and is never re-upserted. Option (a) is
+therefore now race-free against self-registration, with no change to the
+detector or to `RegisterNode`. See `docs/lessons/code-patterns/2026-09-22-
+an-insert-if-absent-guard-loses-to-a-racing-writer-that-inserts-a-weaker-row.md`
+for the generalizable lesson.

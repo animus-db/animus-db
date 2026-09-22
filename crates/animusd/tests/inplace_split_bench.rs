@@ -102,21 +102,6 @@ async fn bring_up_inplace(n: usize, dir: &std::path::Path) -> (Vec<Node>, Cluste
     );
 }
 
-async fn await_bootstrap(nodes: &[Node]) {
-    timeout(Duration::from_secs(20), async {
-        loop {
-            if nodes.iter().any(Node::is_control_leader)
-                && nodes.iter().all(|n| !n.metadata().members.is_empty())
-            {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("cluster did not bootstrap in 20s");
-}
-
 /// One HTTP/1.0 request to the admin endpoint; returns `(status, parsed JSON)`.
 async fn admin(addr: SocketAddr, method: &str, path: &str, body: Option<&str>) -> (u16, Value) {
     let mut stream = TcpStream::connect(addr).await.expect("connect to admin");
@@ -293,7 +278,7 @@ async fn bench_inplace_split_serve_latency_and_cutover_blip() {
     timeout(Duration::from_secs(600), async {
         let dir = support::panic_safe_tempdir();
         let (nodes, _config) = bring_up_inplace(3, dir.path()).await;
-        await_bootstrap(&nodes).await;
+        support::await_bootstrap(&nodes).await;
 
         let mut s = TcpStream::connect(nodes[0].client_addr())
             .await

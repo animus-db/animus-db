@@ -37,22 +37,6 @@ mod support;
 
 const BOOTSTRAP_TABLET: TabletId = TabletId(1);
 
-async fn await_bootstrap(nodes: &[Node]) {
-    let ready = async {
-        loop {
-            if nodes.iter().any(Node::is_control_leader)
-                && nodes.iter().all(|node| !node.metadata().members.is_empty())
-            {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    };
-    timeout(Duration::from_secs(30), ready)
-        .await
-        .expect("cluster did not bootstrap within 30s");
-}
-
 // ---- Test 1: data-node failure detection over ProdEnv -----------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
@@ -62,7 +46,7 @@ async fn data_node_failure_is_detected() {
     let nodes = start_cluster(bind_cluster(3, ip, dir.path()).await.unwrap())
         .await
         .unwrap();
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
 
     // All three CP `raftkv` ids start Active (bootstrap registered them as members).
     let active = async {
@@ -200,7 +184,7 @@ async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, ClusterConfig)
 async fn cp_group_follows_tablet_replica_set() {
     let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(3, dir.path()).await;
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
     let raftkv_ids = config.data_ids(); // [0, 1, 2]
 
     // ADR 0023: a fresh cluster has no data tablet — provision the `kv` tablet by
@@ -408,7 +392,7 @@ async fn failure_auto_replaces_replica_onto_spare() {
     // reconfigures onto it and keeps serving.
     let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(4, dir.path()).await;
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
     let raftkv_ids = config.data_ids(); // [0, 1, 2, 3]
     let spare = raftkv_ids[3].clone();
     let clients: Vec<SocketAddr> = config.nodes.iter().map(|a| a.client).collect();

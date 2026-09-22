@@ -101,21 +101,6 @@ async fn bring_up(n: usize, dir: &Path) -> Vec<Node> {
     panic!("could not bring up cluster after retries (ports kept getting stolen)");
 }
 
-async fn await_bootstrap(nodes: &[Node]) {
-    timeout(Duration::from_secs(20), async {
-        loop {
-            if nodes.iter().any(Node::is_control_leader)
-                && nodes.iter().all(|n| !n.metadata().members.is_empty())
-            {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("cluster did not bootstrap in 20s");
-}
-
 /// One HTTP/1.0 admin request; returns `(status, parsed JSON)` — duplicated
 /// from `admin_endpoint.rs`'s own helper (a different compilation unit).
 async fn admin_post(addr: SocketAddr, path: &str, body: &str) -> (u16, serde_json::Value) {
@@ -179,7 +164,7 @@ async fn manual_split_with_unaligned_key_on_streamed_table_rounds_to_token_bound
     timeout(Duration::from_secs(60), async {
         let dir = support::panic_safe_tempdir();
         let nodes = bring_up(3, dir.path()).await;
-        await_bootstrap(&nodes).await;
+        support::await_bootstrap(&nodes).await;
 
         let client = nodes[0].client_addr();
         let all_ids: Vec<_> = (0..3).map(animusd::config::node_id).collect();

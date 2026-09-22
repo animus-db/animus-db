@@ -231,21 +231,6 @@ async fn bring_up_with_fs_segment_store(
     panic!("could not bring up cluster after retries (ports kept getting stolen)");
 }
 
-async fn await_bootstrap(nodes: &[Node]) {
-    timeout(Duration::from_secs(20), async {
-        loop {
-            if nodes.iter().any(Node::is_control_leader)
-                && nodes.iter().all(|n| !n.metadata().members.is_empty())
-            {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("cluster did not bootstrap in 20s");
-}
-
 /// One HTTP/1.0 request to the admin endpoint; returns `(status, parsed JSON)`.
 async fn admin(addr: SocketAddr, method: &str, path: &str, body: Option<&str>) -> (u16, Value) {
     let mut stream = TcpStream::connect(addr).await.expect("connect to admin");
@@ -342,7 +327,7 @@ async fn admin_interface_surfaces_state_and_actions() {
     timeout(Duration::from_secs(60), async {
         let dir = support::panic_safe_tempdir();
         let (nodes, _config) = bring_up(3, dir.path()).await;
-        await_bootstrap(&nodes).await;
+        support::await_bootstrap(&nodes).await;
 
         // Write a key through the client API (forwarded to the CP leader).
         let mut stream = TcpStream::connect(nodes[0].client_addr())
@@ -698,7 +683,7 @@ async fn seed_load_does_not_storm_cp_elections() {
     timeout(Duration::from_secs(90), async {
         let dir = support::panic_safe_tempdir();
         let (nodes, _config) = bring_up(3, dir.path()).await;
-        await_bootstrap(&nodes).await;
+        support::await_bootstrap(&nodes).await;
         let (s, _ct) = admin(
             nodes[0].admin_addr(),
             "POST",
@@ -804,7 +789,7 @@ async fn admin_raftkv_default_does_not_materialize_the_dataset() {
     timeout(Duration::from_secs(120), async {
         let dir = support::panic_safe_tempdir();
         let (nodes, _config) = bring_up(3, dir.path()).await;
-        await_bootstrap(&nodes).await;
+        support::await_bootstrap(&nodes).await;
         let a = nodes[0].admin_addr();
 
         let (s, ct) = admin(
@@ -1041,7 +1026,7 @@ async fn admin_system_table_split_lineage_after_a_real_split() {
     timeout(Duration::from_secs(60), async {
         let dir = support::panic_safe_tempdir();
         let (nodes, _config) = bring_up(3, dir.path()).await;
-        await_bootstrap(&nodes).await;
+        support::await_bootstrap(&nodes).await;
         let admin_addr = nodes[0].admin_addr();
 
         let mut stream = TcpStream::connect(nodes[0].client_addr())
@@ -1247,7 +1232,7 @@ async fn admin_storage_compact_action() {
     timeout(Duration::from_secs(60), async {
         let dir = support::panic_safe_tempdir();
         let (nodes, _config) = bring_up(3, dir.path()).await;
-        await_bootstrap(&nodes).await;
+        support::await_bootstrap(&nodes).await;
 
         let mut stream = TcpStream::connect(nodes[0].client_addr())
             .await
@@ -1369,7 +1354,7 @@ async fn admin_segment_store_reports_shard_placement_and_local_objects() {
     timeout(Duration::from_secs(90), async {
         let dir = support::panic_safe_tempdir();
         let (nodes, _config) = bring_up_with_streams(3, dir.path()).await;
-        await_bootstrap(&nodes).await;
+        support::await_bootstrap(&nodes).await;
 
         let leader_idx = nodes
             .iter()
@@ -1496,7 +1481,7 @@ async fn admin_segment_store_reports_null_shards_for_the_fs_kind() {
         let segment_store_dir = dir.path().join("fs-segment-store");
         let (nodes, _config) =
             bring_up_with_fs_segment_store(1, dir.path(), &segment_store_dir).await;
-        await_bootstrap(&nodes).await;
+        support::await_bootstrap(&nodes).await;
 
         let (s, v) = admin_get(nodes[0].admin_addr(), "/admin/segment-store").await;
         assert_eq!(s, 200, "GET /admin/segment-store: {v}");

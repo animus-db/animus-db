@@ -289,23 +289,6 @@ async fn bring_up_cluster(
     }
 }
 
-async fn await_bootstrap(nodes: &[Node], expected_members: usize) {
-    timeout(Duration::from_secs(20), async {
-        loop {
-            if nodes.iter().any(Node::is_control_leader)
-                && nodes
-                    .iter()
-                    .all(|n| n.metadata().members.len() == expected_members)
-            {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("cluster did not bootstrap in 20s");
-}
-
 /// Walks every regular file under `dir` recursively and asserts none of
 /// them contain [`PLAINTEXT_NEEDLE`] as raw bytes.
 fn assert_plaintext_absent(dir: &Path) {
@@ -355,7 +338,7 @@ async fn restore_on_a_different_node_with_the_same_key_succeeds_and_the_store_ho
     let key_path = write_key_file(tmp.path(), "key.hex", 0x61);
     let backup_store_dir = tmp.path().join("shared-backups");
     let (nodes, config) = bring_up_cluster(2, tmp.path(), &backup_store_dir, Some(key_path)).await;
-    await_bootstrap(&nodes, 2).await;
+    support::await_bootstrap(&nodes).await;
 
     let addr0 = config.nodes[0].dynamo;
     let addr1 = config.nodes[1].dynamo;

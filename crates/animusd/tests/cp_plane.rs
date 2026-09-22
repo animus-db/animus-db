@@ -35,7 +35,7 @@
 use std::time::Duration;
 
 use animusd::{
-    ClientRequest, ClientResponse, Node, StorageBackend, bind_cluster, read_frame, start_cluster,
+    ClientRequest, ClientResponse, StorageBackend, bind_cluster, read_frame, start_cluster,
     start_cluster_with_auto_split_bytes,
 };
 use tokio::net::TcpStream;
@@ -56,22 +56,6 @@ async fn call(addr: std::net::SocketAddr, req: ClientRequest) -> ClientResponse 
         .expect("a reply")
 }
 
-async fn await_bootstrap(nodes: &[Node]) {
-    let ready = async {
-        loop {
-            if nodes.iter().any(Node::is_control_leader)
-                && nodes.iter().all(|n| !n.metadata().members.is_empty())
-            {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    };
-    timeout(Duration::from_secs(20), ready)
-        .await
-        .expect("cluster did not bootstrap within 20s");
-}
-
 /// **Single-write latency (deferred fix #2).** A lone CP write used to eat two
 /// ~50ms floors: the cp-data driver waited for the next heartbeat tick before
 /// replicating a freshly proposed entry, and `cp_put_local` confirmed with a fixed
@@ -89,7 +73,7 @@ async fn single_write_latency_is_low() {
         .await
         .unwrap();
     let nodes = start_cluster(bound).await.unwrap();
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
     let addr0 = nodes[0].client_addr();
 
     // Warm up: provision the tablet + elect the CP leader with a first write
@@ -227,7 +211,7 @@ async fn tablet_auto_splits_on_bytes_with_skewed_value_sizes() {
     )
     .await
     .unwrap();
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
     let addr0 = nodes[0].client_addr();
 
     // Tiny keys sort before large ones ("a" < "b"), so a plain positional

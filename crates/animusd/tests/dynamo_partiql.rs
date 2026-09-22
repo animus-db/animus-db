@@ -28,22 +28,6 @@ use tokio::time::{sleep, timeout};
 
 mod support;
 
-async fn await_bootstrap(nodes: &[Node]) {
-    let ready = async {
-        loop {
-            if nodes.iter().any(Node::is_control_leader)
-                && nodes.iter().all(|n| !n.metadata().members.is_empty())
-            {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    };
-    timeout(Duration::from_secs(20), ready)
-        .await
-        .expect("cluster did not bootstrap within 20s");
-}
-
 /// One DynamoDB JSON request over the real HTTP wire — `dynamo_table_ops.rs`'s
 /// identical helper.
 async fn dynamo(addr: SocketAddr, target: &str, body: &str) -> (u16, String) {
@@ -163,7 +147,7 @@ async fn setup() -> (support::PanicSafeTempDir, Vec<Node>, SocketAddr) {
         .await
         .unwrap();
     let nodes = start_cluster(bound).await.unwrap();
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
     let addr = nodes[0].dynamo_addr();
 
     let (status, body) = dynamo_retry(
@@ -887,7 +871,7 @@ async fn throttled_table_throttles_a_partiql_insert() {
         .await
         .unwrap();
     let nodes = start_cluster(bound).await.unwrap();
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
     let addr = nodes[0].dynamo_addr();
 
     let (status, body) = dynamo_retry(
@@ -1136,7 +1120,7 @@ async fn batch_execute_statement_through_a_follower_connected_node() {
         .await
         .unwrap();
     let nodes = start_cluster(bound).await.unwrap();
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
 
     let leader = nodes.iter().position(Node::is_control_leader).unwrap();
     let follower = (0..nodes.len()).find(|&i| i != leader).unwrap();

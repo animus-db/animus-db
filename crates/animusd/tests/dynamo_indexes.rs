@@ -23,22 +23,6 @@ use tokio::time::{sleep, timeout};
 
 mod support;
 
-async fn await_bootstrap(nodes: &[Node]) {
-    let ready = async {
-        loop {
-            let leader = nodes.iter().any(Node::is_control_leader);
-            let everyone_has_tablet = nodes.iter().all(|n| !n.metadata().members.is_empty());
-            if leader && everyone_has_tablet {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    };
-    timeout(Duration::from_secs(20), ready)
-        .await
-        .expect("cluster did not elect a leader and bootstrap within 20s");
-}
-
 /// Wait (bounded) until `index` on `table` is visible in `node`'s replicated
 /// catalog. A `CreateTable` ack means the definition is durable on the *leader*; a
 /// follower applies the replicated entry only after its own WAL fsync
@@ -137,7 +121,7 @@ async fn gsi_write_then_query() {
         .await
         .unwrap();
     let nodes = start_cluster(bound).await.unwrap();
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
 
     let addr0 = nodes[0].dynamo_addr();
     let addr1 = nodes[1].dynamo_addr();

@@ -122,21 +122,6 @@ async fn bring_up_inplace(
     );
 }
 
-async fn await_bootstrap(nodes: &[Node]) {
-    timeout(Duration::from_secs(20), async {
-        loop {
-            if nodes.iter().any(Node::is_control_leader)
-                && nodes.iter().all(|n| !n.metadata().members.is_empty())
-            {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("cluster did not bootstrap in 20s");
-}
-
 /// One HTTP/1.0 request to the admin endpoint; returns `(status, parsed JSON)`.
 async fn admin(addr: SocketAddr, method: &str, path: &str, body: Option<&str>) -> (u16, Value) {
     let mut stream = TcpStream::connect(addr).await.expect("connect to admin");
@@ -340,7 +325,7 @@ async fn inplace_split_survives_a_paced_continuous_writer_across_fork_and_cutove
     timeout(Duration::from_secs(180), async {
         let dir = support::panic_safe_tempdir();
         let (nodes, _config) = bring_up_inplace(3, dir.path(), StreamSealKnobs::default()).await;
-        await_bootstrap(&nodes).await;
+        support::await_bootstrap(&nodes).await;
 
         let mut stream = TcpStream::connect(nodes[0].client_addr())
             .await
@@ -697,7 +682,7 @@ async fn inplace_split_stream_shard_walks_parent_to_children_without_loss_or_dup
             },
         )
         .await;
-        await_bootstrap(&nodes).await;
+        support::await_bootstrap(&nodes).await;
         let dynamo_addr = nodes[0].dynamo_addr();
 
         let (status, body) = dynamo(

@@ -11971,6 +11971,33 @@ pub(crate) enum RegisterOutcome {
 /// while a node whose real heartbeat arrives promptly (the overwhelmingly
 /// common case) is unaffected.
 ///
+/// **`bootstrap` is not the only writer that can claim a founding member's
+/// row, and option (a)'s guarantee was only race-free when it won (issue
+/// #1028).** Every node also self-registers via `MetaCommand::RegisterNode`
+/// from `spawn_common_tail`, and when that lands first its apply arm inserts
+/// the member as `{ status: Down, has_activated: false }` — an id this loop's
+/// original presence-only guard (`!members.contains_key(node)`) then skipped
+/// forever, leaving the node to become `Active` only once the detector
+/// promoted it after its first real heartbeat (~100-200ms; longer under
+/// load). In that window `provision_tablet` sees exactly the transiently
+/// under-replicated membership option (a) exists to prevent: on a 4-node RF-3
+/// cluster the first table lands on an arbitrary 3 of the 4 (the #1028
+/// flake, reproduced 1/45 under load), and on a 3-node RF-3 cluster it mints
+/// a genuine 2-replica first tablet — the very `cp_cross_process` regression
+/// above, back whenever self-registration won the race. The decision is
+/// therefore [`bootstrap_active_upserts`] now: a declared raftkv id is
+/// promoted when it is absent **or** present as `Down` and never activated,
+/// keyed on the sticky `Member::has_activated` flag (set by the
+/// `UpsertMember` apply arm the moment any `Active` is applied). That key is
+/// what keeps every other property above intact: a crashed founding member
+/// (`Active`→`Down`) keeps `has_activated == true`, so it is left to the
+/// detector and never resurrected here; a declared-but-never-booted phantom
+/// is upserted `Active` exactly once, flips the flag, is demoted by the
+/// detector's synthetic first observation after `DETECT_TIMEOUT`, and is
+/// never re-upserted. A self-registered row's `labels` are carried over
+/// verbatim, so the promotion can never clobber what an operator-labeled
+/// claim already set.
+///
 /// **`raftkv_ids` is caller-supplied (ADR 0035 PR2)** — the raftkv ids of
 /// nodes that actually run the **data** role, scoped by
 /// [`BoundNode::start_with`]'s `data_raftkv_ids` parameter, not derived here
@@ -11985,19 +12012,262 @@ async fn bootstrap(raft: RaftNode<ProdEnv>, raftkv_ids: Vec<NodeId>) {
             // No data tablet is created here (ADR 0023): a fresh cluster has zero
             // data tablets; the first `CreateTable` provisions a table-scoped tablet
             // (`ClientCtx::provision_tablet`), and the per-node join-host loop stands
-            // its group up. Idempotent: only members not yet present are proposed.
+            // its group up. Idempotent: `bootstrap_active_upserts` proposes only
+            // for a member that is absent or has never been recorded `Active`
+            // (issue #1028 — see this fn's doc for why presence alone is not
+            // the right key), so a committed proposal is never re-proposed.
             let meta = raft.metadata();
-            for node in &raftkv_ids {
-                if !meta.members.contains_key(node) {
-                    raft.propose(MetaCommand::UpsertMember {
-                        node: node.clone(),
-                        labels: BTreeMap::new(),
-                        status: NodeStatus::Active,
-                    });
-                }
+            for command in bootstrap_active_upserts(&meta, &raftkv_ids) {
+                raft.propose(command);
             }
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Pure decision for one [`bootstrap`] tick (issue #1028): the
+/// `UpsertMember { status: Active }` proposals it must make for `raftkv_ids`
+/// given the current `Metadata`, in `raftkv_ids` order.
+///
+/// A declared data-role id is promoted when it is either
+///
+/// - **absent** from `members` — bootstrap's original case, this leader is
+///   the first writer to claim the row; or
+/// - **present as `Down` with `has_activated == false`** — a row a wholly
+///   decoupled writer (the node's own `MetaCommand::RegisterNode`
+///   self-registration in `spawn_common_tail`, or an operator's
+///   `admin_add_member`) inserted first, which no one has ever yet recorded
+///   `Active`. Its `labels` are carried over verbatim.
+///
+/// Everything else is left alone: an `Active` member needs nothing; a `Down`
+/// member with `has_activated == true` is a *crashed* founding member
+/// (`Active`→`Down` never clears the sticky flag) that only a real heartbeat
+/// may resurrect, via the ADR 0012 detector — re-upserting it `Active` here
+/// would make a dead node a placement candidate again; `Joining`/`Leaving`
+/// are operator-driven lifecycle states the detector itself deliberately
+/// never judges. An id not in `raftkv_ids` (a growth node, ADR 0030) is
+/// never bootstrap's to touch.
+///
+/// Keying the "already done" test on `has_activated` rather than on mere
+/// presence is what makes this idempotent against *both* writers that can
+/// claim a founding member's row: `Metadata::apply`'s `UpsertMember` arm
+/// flips the flag the moment any `Active` status is applied, so one tick's
+/// proposal, once committed, is the last one this helper ever emits for that
+/// id — including for a declared-but-never-booted phantom, which ADR 0030's
+/// detector hardening then demotes to `Down` with the flag still `true`,
+/// leaving bootstrap silent on it from then on.
+fn bootstrap_active_upserts(meta: &Metadata, raftkv_ids: &[NodeId]) -> Vec<MetaCommand> {
+    raftkv_ids
+        .iter()
+        .filter_map(|node| {
+            let labels = match meta.members.get(node) {
+                None => BTreeMap::new(),
+                Some(m) if m.status == NodeStatus::Down && !m.has_activated => m.labels.clone(),
+                Some(_) => return None,
+            };
+            Some(MetaCommand::UpsertMember {
+                node: node.clone(),
+                labels,
+                status: NodeStatus::Active,
+            })
+        })
+        .collect()
+}
+
+/// Unit tests for [`bootstrap_active_upserts`], the pure per-tick decision
+/// behind [`bootstrap`]'s `UpsertMember { Active }` proposals (issue #1028).
+/// Deterministic and timing-free: every membership shape is built by applying
+/// real `MetaCommand`s to an empty `Metadata`, so the self-registered case
+/// goes through the actual `RegisterNode` apply arm (the one that inserts
+/// `{ Down, has_activated: false }`) rather than a hand-built `Member`.
+#[cfg(test)]
+mod bootstrap_active_upserts_tests {
+    use std::collections::BTreeMap;
+
+    use animus_env::{NodeId, nid};
+
+    use super::{MetaCommand, Metadata, NodeAddrs, NodeStatus, bootstrap_active_upserts};
+
+    /// A data-role `NodeAddrs`, the shape `BoundDataNode`/`BoundNode`
+    /// self-register with — `role != "control"`, so the `RegisterNode` apply
+    /// arm claims a `members` row for it.
+    fn data_addrs(suffix: u16) -> NodeAddrs {
+        NodeAddrs {
+            internal: format!("127.0.0.1:{}", 9300 + suffix),
+            client: format!("127.0.0.1:{}", 9000 + suffix),
+            admin: format!("127.0.0.1:{}", 9500 + suffix),
+            intra: format!("127.0.0.1:{}", 9600 + suffix),
+            role: "data".to_string(),
+        }
+    }
+
+    /// The `(node, labels)` of every `UpsertMember { Active }` in `cmds`,
+    /// failing loudly on any other command shape — the helper must never
+    /// emit anything else.
+    fn active_upserts(cmds: &[MetaCommand]) -> Vec<(NodeId, BTreeMap<String, String>)> {
+        cmds.iter()
+            .map(|c| match c {
+                MetaCommand::UpsertMember {
+                    node,
+                    labels,
+                    status: NodeStatus::Active,
+                } => (node.clone(), labels.clone()),
+                other => {
+                    panic!("bootstrap must only ever propose UpsertMember{{Active}}, got {other:?}")
+                }
+            })
+            .collect()
+    }
+
+    /// Case 1 (pre-existing behavior): an id absent from `members` gets an
+    /// `Active` upsert with empty labels.
+    #[test]
+    fn absent_declared_id_is_upserted_active() {
+        let meta = Metadata::default();
+        let cmds = bootstrap_active_upserts(&meta, &[nid(1)]);
+        assert_eq!(active_upserts(&cmds), vec![(nid(1), BTreeMap::new())]);
+    }
+
+    /// Case 2 — **the #1028 defect, red on the old `contains_key` guard**:
+    /// the node's own `RegisterNode` self-registration landed before
+    /// bootstrap's tick, so the id is present as `{ Down, has_activated:
+    /// false }`. Bootstrap must still promote it (or `provision_tablet`
+    /// skips a healthy founding member until its first heartbeat), and must
+    /// carry the row's existing labels over rather than blank them.
+    #[test]
+    fn self_registered_down_never_activated_id_is_upserted_active_keeping_labels() {
+        let mut meta = Metadata::default();
+        let labels: BTreeMap<String, String> = [("region".to_owned(), "eu-west".to_owned())]
+            .into_iter()
+            .collect();
+        meta.apply(&MetaCommand::RegisterNode {
+            node: nid(1),
+            addrs: data_addrs(1),
+            labels: labels.clone(),
+        });
+        // Sanity: the real self-registration apply arm produced the shape the
+        // race leaves behind, so the assertion below is about that shape.
+        let m = meta
+            .members
+            .get(&nid(1))
+            .expect("self-registration claims a member row");
+        assert_eq!(m.status, NodeStatus::Down);
+        assert!(!m.has_activated);
+
+        let cmds = bootstrap_active_upserts(&meta, &[nid(1)]);
+        assert_eq!(active_upserts(&cmds), vec![(nid(1), labels.clone())]);
+
+        // Once committed, the sticky flag flips and the helper goes quiet on
+        // this id — the idempotency the 200ms retry loop relies on.
+        for c in &cmds {
+            meta.apply(c);
+        }
+        let m = meta.members.get(&nid(1)).expect("member still present");
+        assert_eq!(m.status, NodeStatus::Active);
+        assert!(m.has_activated);
+        assert_eq!(m.labels, labels);
+        assert!(bootstrap_active_upserts(&meta, &[nid(1)]).is_empty());
+    }
+
+    /// Case 3: an already-`Active` id needs nothing.
+    #[test]
+    fn active_id_is_left_alone() {
+        let mut meta = Metadata::default();
+        meta.apply(&MetaCommand::UpsertMember {
+            node: nid(1),
+            labels: BTreeMap::new(),
+            status: NodeStatus::Active,
+        });
+        assert!(bootstrap_active_upserts(&meta, &[nid(1)]).is_empty());
+    }
+
+    /// Case 4: a founding member that was `Active` and then crashed
+    /// (`Active`→`Down`, `has_activated` stays `true`) is the detector's to
+    /// resurrect on a real heartbeat — bootstrap must never re-upsert it
+    /// `Active`, or a dead node becomes a placement candidate again.
+    #[test]
+    fn crashed_founding_member_is_never_resurrected() {
+        let mut meta = Metadata::default();
+        meta.apply(&MetaCommand::UpsertMember {
+            node: nid(1),
+            labels: BTreeMap::new(),
+            status: NodeStatus::Active,
+        });
+        meta.apply(&MetaCommand::UpsertMember {
+            node: nid(1),
+            labels: BTreeMap::new(),
+            status: NodeStatus::Down,
+        });
+        let m = meta.members.get(&nid(1)).expect("member present");
+        assert_eq!(m.status, NodeStatus::Down);
+        assert!(
+            m.has_activated,
+            "Active->Down must leave the sticky flag set"
+        );
+        assert!(bootstrap_active_upserts(&meta, &[nid(1)]).is_empty());
+    }
+
+    /// Case 5: an id bootstrap was not handed (a growth node that
+    /// self-registered `Down`, ADR 0030) is never touched, even though its
+    /// row has exactly the never-activated shape case 2 promotes — only a
+    /// *declared* founding member is bootstrap's to promote.
+    #[test]
+    fn undeclared_growth_node_is_never_touched() {
+        let mut meta = Metadata::default();
+        meta.apply(&MetaCommand::RegisterNode {
+            node: nid(9),
+            addrs: data_addrs(9),
+            labels: BTreeMap::new(),
+        });
+        assert!(bootstrap_active_upserts(&meta, &[]).is_empty());
+        // ...and alongside a declared absent id, only the declared one is
+        // proposed.
+        let cmds = bootstrap_active_upserts(&meta, &[nid(1)]);
+        assert_eq!(active_upserts(&cmds), vec![(nid(1), BTreeMap::new())]);
+    }
+
+    /// `Joining`/`Leaving` are operator-driven lifecycle states the detector
+    /// deliberately never judges; bootstrap does not either.
+    #[test]
+    fn joining_and_leaving_ids_are_left_alone() {
+        for status in [NodeStatus::Joining, NodeStatus::Leaving] {
+            let mut meta = Metadata::default();
+            meta.apply(&MetaCommand::UpsertMember {
+                node: nid(1),
+                labels: BTreeMap::new(),
+                status,
+            });
+            assert!(
+                bootstrap_active_upserts(&meta, &[nid(1)]).is_empty(),
+                "{status:?} must not be promoted by bootstrap"
+            );
+        }
+    }
+
+    /// Order and mixing: the result follows `raftkv_ids` order and covers
+    /// both promotable shapes in one tick while skipping the rest.
+    #[test]
+    fn mixed_membership_yields_only_the_promotable_ids_in_declared_order() {
+        let mut meta = Metadata::default();
+        // nid(2): self-registered first, never activated -> promote.
+        meta.apply(&MetaCommand::RegisterNode {
+            node: nid(2),
+            addrs: data_addrs(2),
+            labels: BTreeMap::new(),
+        });
+        // nid(3): already Active -> skip.
+        meta.apply(&MetaCommand::UpsertMember {
+            node: nid(3),
+            labels: BTreeMap::new(),
+            status: NodeStatus::Active,
+        });
+        // nid(1): absent -> promote.
+        let cmds = bootstrap_active_upserts(&meta, &[nid(3), nid(2), nid(1)]);
+        let ids: Vec<NodeId> = active_upserts(&cmds)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(ids, vec![nid(2), nid(1)]);
     }
 }
 

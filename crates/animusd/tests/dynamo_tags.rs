@@ -34,22 +34,6 @@ use tokio::time::{sleep, timeout};
 
 mod support;
 
-async fn await_bootstrap(nodes: &[Node]) {
-    let ready = async {
-        loop {
-            if nodes.iter().any(Node::is_control_leader)
-                && nodes.iter().all(|n| !n.metadata().members.is_empty())
-            {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    };
-    timeout(Duration::from_secs(20), ready)
-        .await
-        .expect("cluster did not bootstrap within 20s");
-}
-
 /// One DynamoDB JSON request over the real HTTP wire.
 async fn dynamo(addr: SocketAddr, target: &str, body: &str) -> (u16, String) {
     let mut s = TcpStream::connect(addr).await.expect("connect");
@@ -117,7 +101,7 @@ async fn tag_untag_list_round_trip() {
         .await
         .unwrap();
     let nodes = start_cluster(bound).await.unwrap();
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
     let addr = nodes[0].dynamo_addr();
 
     create_table(addr, "orders").await;
@@ -241,7 +225,7 @@ async fn tag_resource_rejects_a_malformed_or_unknown_resource_arn() {
         .await
         .unwrap();
     let nodes = start_cluster(bound).await.unwrap();
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
     let addr = nodes[0].dynamo_addr();
 
     // A `ResourceArn` that isn't a well-formed table ARN at all — a
@@ -322,7 +306,7 @@ async fn tag_resource_on_a_follower_is_relayed_to_the_leader() {
         .await
         .unwrap();
     let nodes = start_cluster(bound).await.unwrap();
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
 
     let leader = nodes.iter().position(Node::is_control_leader).unwrap();
     let follower = (0..nodes.len()).find(|&i| i != leader).unwrap();
@@ -399,7 +383,7 @@ async fn describe_limits_reports_the_static_ceiling() {
         .await
         .unwrap();
     let nodes = start_cluster(bound).await.unwrap();
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
     let addr = nodes[0].dynamo_addr();
 
     let (status, body) = dynamo(addr, "DynamoDB_20120810.DescribeLimits", "{}").await;
@@ -422,7 +406,7 @@ async fn describe_endpoints_reports_this_nodes_own_address() {
         .await
         .unwrap();
     let nodes = start_cluster(bound).await.unwrap();
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
     let addr = nodes[0].dynamo_addr();
 
     let (status, body) = dynamo(addr, "DynamoDB_20120810.DescribeEndpoints", "{}").await;

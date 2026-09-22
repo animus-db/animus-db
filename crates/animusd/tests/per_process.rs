@@ -6,9 +6,9 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use animusd::{ClientRequest, ClientResponse, ClusterConfig, Node, RoleAddrs, read_frame};
+use animusd::{ClientRequest, ClientResponse, ClusterConfig, RoleAddrs, read_frame};
 use tokio::net::TcpStream;
-use tokio::time::{sleep, timeout};
+use tokio::time::sleep;
 
 mod support;
 
@@ -46,29 +46,6 @@ async fn put_retry(addr: SocketAddr, key: &[u8], value: &[u8]) -> ClientResponse
             other => return other,
         }
     }
-}
-
-/// Wait until every node has elected a control leader *and* has converged on
-/// the full membership set, or panic. Membership registration is
-/// asynchronous (each node joins the control group one at a time), so
-/// polling for "some members" rather than "all `nodes.len()` members" would
-/// let a caller observe a partially-registered cluster.
-async fn await_bootstrap(nodes: &[Node]) {
-    let ready = async {
-        loop {
-            if nodes.iter().any(Node::is_control_leader)
-                && nodes
-                    .iter()
-                    .all(|n| n.metadata().members.len() == nodes.len())
-            {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    };
-    timeout(Duration::from_secs(20), ready)
-        .await
-        .expect("cluster did not bootstrap in 20s");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
@@ -128,7 +105,7 @@ async fn per_process_nodes_form_a_cluster_from_shared_config() {
     let (nodes, config) =
         brought_up.expect("could not bring up cluster after retries (ports kept getting stolen)");
 
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
 
     // Clients connect to the configured client addresses (not the bound handle).
     let client0 = config.nodes[0].client;

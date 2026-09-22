@@ -39,7 +39,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use animusd::{
-    BackupStoreConfig, ClientRequest, ClientResponse, Node, SegmentStoreConfig, StorageBackend,
+    BackupStoreConfig, ClientRequest, ClientResponse, SegmentStoreConfig, StorageBackend,
     StreamSealKnobs, read_frame,
 };
 use serde_json::Value;
@@ -55,22 +55,6 @@ const TABLES: [&str; 3] = ["hb_t0", "hb_t1", "hb_t2"];
 /// bootstrap/settle/election poll in this file.
 const FORM_BUDGET: Duration = Duration::from_secs(30);
 const ELECTION_BUDGET: Duration = Duration::from_secs(20);
-
-async fn await_bootstrap(nodes: &[Node]) {
-    let ready = async {
-        loop {
-            if nodes.iter().any(Node::is_control_leader)
-                && nodes.iter().all(|n| !n.metadata().members.is_empty())
-            {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    };
-    timeout(FORM_BUDGET, ready)
-        .await
-        .expect("cluster did not bootstrap within budget");
-}
 
 async fn call(addr: SocketAddr, req: ClientRequest) -> ClientResponse {
     let mut stream = TcpStream::connect(addr).await.expect("connect to node");
@@ -249,7 +233,7 @@ async fn batched_heartbeats_hold_stable_then_reelect_after_a_real_leader_kill() 
     )
     .await
     .unwrap();
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
 
     // Provision all three tables (auto-provisioned on first write, ADR
     // 0023) so all three tablet groups exist and start ticking together on
