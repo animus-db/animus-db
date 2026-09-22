@@ -420,7 +420,36 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         change_log: Vec<(Vec<u8>, Vec<u8>)>,
     ) -> Result<(), String> {
         self.throttle_check_write_raw(table, &writes)?;
-        self.cp_kind_write_raw_bounded(table, writes, change_log, CLIENT_TIMEOUT)
+        self.cp_kind_write_raw_bounded(table, writes, change_log, CLIENT_TIMEOUT, false)
+            .await
+    }
+
+    /// As [`cp_kind_write_raw`](Self::cp_kind_write_raw), but for a write
+    /// that is **housekeeping, not client-caused** — today, only
+    /// `index_drain::trim_janitor`'s change-record deletions (issue #1037).
+    ///
+    /// The only difference from the plain path: on acceptance, marks the
+    /// propose as housekeeping (`Metric::CpHousekeepingProposalsAccepted`)
+    /// in the **same synchronous step** as the propose itself
+    /// (`cp_kind_raw_local`'s `housekeeping` argument), not after this
+    /// call's own confirm/apply wait returns. The original #974 fix
+    /// incremented that counter here, in the caller, after `await`ing the
+    /// whole write — which left a real window between "propose accepted"
+    /// (raw counted immediately, inside `put_kind_batch`) and "marked
+    /// housekeeping" (only after confirm) wide enough for a concurrent
+    /// `/metrics` scrape to land inside it and read the propose back as an
+    /// unattributed client one (a genuine trim propose, 9 raw / 0
+    /// housekeeping — see `batch_write.rs`'s module doc). No caller outside
+    /// this file should call this for a client-visible write — that is
+    /// exactly the miscount this method exists to prevent.
+    pub(crate) async fn cp_kind_write_raw_housekeeping(
+        &self,
+        table: &str,
+        writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
+        change_log: Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<(), String> {
+        self.throttle_check_write_raw(table, &writes)?;
+        self.cp_kind_write_raw_bounded(table, writes, change_log, CLIENT_TIMEOUT, true)
             .await
     }
 
@@ -514,16 +543,23 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
         change_log: Vec<(Vec<u8>, Vec<u8>)>,
     ) -> Result<(), String> {
-        self.cp_kind_write_raw_bounded(table, writes, change_log, Duration::ZERO)
+        self.cp_kind_write_raw_bounded(table, writes, change_log, Duration::ZERO, false)
             .await
     }
 
+    /// `housekeeping`: see [`cp_kind_write_raw_housekeeping`](Self::
+    /// cp_kind_write_raw_housekeeping)'s doc — threaded through to
+    /// [`cp_kind_raw_local`](Self::cp_kind_raw_local)'s identical parameter
+    /// on the `Local` arm, and over the wire as `ClientRequest::KindWrite`'s
+    /// own `housekeeping` field on the `Forward` arm, so the remote
+    /// leader's own local execution marks it identically (issue #1037).
     async fn cp_kind_write_raw_bounded(
         &self,
         table: &str,
         writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
         change_log: Vec<(Vec<u8>, Vec<u8>)>,
         timeout: Duration,
+        housekeeping: bool,
     ) -> Result<(), String> {
         let Some(first) = writes.first().map(|(_, k, _)| k.clone()) else {
             return Ok(());
@@ -545,7 +581,13 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         loop {
             let err = match self.cp_route(table, &first, deadline).await {
                 CpRoute::Local(leader) => {
-                    match Self::cp_kind_raw_local(&leader, writes.clone(), change_log.clone()).await
+                    match Self::cp_kind_raw_local(
+                        &leader,
+                        writes.clone(),
+                        change_log.clone(),
+                        housekeeping,
+                    )
+                    .await
                     {
                         Ok(()) => return Ok(()),
                         Err(e) => e,
@@ -556,6 +598,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                         table: table.to_owned(),
                         writes: writes.clone(),
                         change_log: change_log.clone(),
+                        housekeeping,
                     };
                     match decide::ok_or_err(
                         self.cp_forward(table, &first, addr, hinted, request, deadline)
@@ -685,10 +728,20 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// tell "my entry" from "a different entry that happened to write the
     /// identical bytes." See
     /// `docs/lessons/code-patterns/2026-09-16-is-leader-false-is-not-proof-a-write-is-lost.md`.
+    ///
+    /// `housekeeping` (issue #1037): when `true`, marks this propose's
+    /// acceptance as housekeeping (`Metric::CpHousekeepingProposalsAccepted`)
+    /// in the same synchronous step as `put_kind_batch`'s own accept —
+    /// before the confirm loop below ever awaits anything — so a
+    /// concurrent `/metrics` scrape can never observe the raw
+    /// `CpProposalsAccepted` increment without this one. See
+    /// [`cp_kind_write_raw_housekeeping`](Self::cp_kind_write_raw_housekeeping)'s
+    /// doc for the race this closes.
     pub(crate) async fn cp_kind_raw_local(
         leader: &CpGroup<E>,
         writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
         change_log: Vec<(Vec<u8>, Vec<u8>)>,
+        housekeeping: bool,
     ) -> Result<(), String> {
         // ADR 0050 rung 5: a frozen split parent refuses USER data (base/
         // LSI writes) but not consumer bookkeeping (cursor/footprint-only
@@ -718,6 +771,15 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             ProposeResult::Accepted { index, term } => (index, term),
             other => return Err(format!("kind write not accepted: {other:?}")),
         };
+        if housekeeping {
+            // Issue #1037: increment in this same synchronous step, right
+            // next to the propose's own acceptance — never after the
+            // confirm loop below, which awaits real time and so can race a
+            // concurrent `/metrics` scrape (see this parameter's own doc).
+            leader
+                .metrics()
+                .incr(Metric::CpHousekeepingProposalsAccepted);
+        }
         let deadline = leader.env().now().saturating_add(CLIENT_TIMEOUT);
         // Wake-on-apply confirm wait (`wait_applied_past`) — see this
         // function's own longer-standing doc note above for why this
@@ -2435,6 +2497,7 @@ mod cp_kind_raw_local_outcome_confirm_tests {
                     &leader,
                     vec![(KIND_BASE, key, Some(value_a))],
                     Vec::new(),
+                    false,
                 )
                 .await;
                 *out.lock().expect("poisoned") = Some(r);
@@ -2521,6 +2584,237 @@ mod cp_kind_raw_local_outcome_confirm_tests {
             "exactly two Raft entries were ever proposed for this test's \
              two real writes (A, B) — a third would mean entry A's \
              confirm loop spuriously re-proposed it (seed={seed:#x})"
+        );
+    }
+}
+
+/// Issue #1037: `cp_kind_raw_local`'s `housekeeping` argument must mark
+/// `Metric::CpHousekeepingProposalsAccepted` in the **same synchronous
+/// step** as `Metric::CpProposalsAccepted` itself (right after
+/// `put_kind_batch` returns `Accepted`) — never only after the write's own
+/// confirm/apply wait returns, which is what the original #974 fix did (in
+/// `animusd::index_drain::trim_janitor`, one layer up, after its own
+/// `cp_kind_write_raw` call had already awaited commit+apply). That
+/// post-confirm shape left a real window during which
+/// `cp_proposals_accepted` had already counted the trim's propose but
+/// `cp_housekeeping_proposals_accepted` had not yet — wide enough for a
+/// concurrent `GET /metrics` scrape to land inside it and read the trim
+/// back as an unattributed client write (`batch_write.rs::
+/// batched_write_beats_per_key` reproduced this directly: 9 raw / 0
+/// housekeeping under load, tripping its exact-equality assertion).
+///
+/// This pins the invariant directly and deterministically: propose a
+/// housekeeping write through the real `cp_kind_raw_local`, catch it at
+/// its own first park — accepted locally, still waiting on the OTHER two
+/// voters to ack before it can confirm (the identical accepted-but-
+/// unconfirmed window `cp_kind_raw_local_outcome_confirm_tests` isolates
+/// for issue #911) — and assert BOTH counters already agree at that exact
+/// moment, not just once the call eventually returns.
+#[cfg(test)]
+mod cp_kind_raw_local_housekeeping_attribution_tests {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use animus_cp_data::{KIND_CHANGE, RaftKvNode};
+    use animus_env::{EnvExt, Metric, MetricsHandle, nid};
+    use animus_sim::{SimEnv, Simulator};
+    use animus_storage::MemoryEngine;
+
+    use super::*;
+
+    #[derive(Clone, Copy, Debug, Default)]
+    struct NeverRelay;
+
+    #[async_trait::async_trait]
+    impl RelayClient for NeverRelay {
+        async fn relay(
+            &self,
+            addr: String,
+            _request: &ClientRequest,
+            _timeout: Duration,
+        ) -> ClientResponse {
+            ClientResponse::Error(format!(
+                "NeverRelay: this harness never relays (addr={addr})"
+            ))
+        }
+    }
+
+    /// A three-voter group (never a single-voter one — see
+    /// `cp_kind_raw_local_outcome_confirm_tests::three_voter_group`'s own
+    /// doc for why a single-voter group's inline commit+apply closes the
+    /// accepted-but-unconfirmed window this test needs), each with its own
+    /// fresh [`MetricsHandle::recording`] (not `SimEnv`'s process-global
+    /// default — same reasoning as that module's identical choice).
+    fn three_voter_group(
+        seed: u64,
+    ) -> (
+        Simulator,
+        Vec<RaftKvNode<SimEnv, MemoryEngine>>,
+        Vec<MetricsHandle>,
+    ) {
+        let sim = Simulator::new(seed);
+        let ids = [nid(0), nid(1), nid(2)];
+        let metrics: Vec<MetricsHandle> = ids.iter().map(|_| MetricsHandle::recording()).collect();
+        let nodes: Vec<RaftKvNode<SimEnv, MemoryEngine>> = ids
+            .iter()
+            .zip(metrics.iter())
+            .map(|(id, m)| {
+                RaftKvNode::start_with_metrics(
+                    sim.env(id.clone()),
+                    ids.to_vec(),
+                    MemoryEngine::new(),
+                    m.clone(),
+                )
+            })
+            .collect();
+        (sim, nodes, metrics)
+    }
+
+    fn leader_index(nodes: &[RaftKvNode<SimEnv, MemoryEngine>]) -> Option<usize> {
+        let ls: Vec<usize> = (0..nodes.len()).filter(|&i| nodes[i].is_leader()).collect();
+        if ls.len() == 1 { Some(ls[0]) } else { None }
+    }
+
+    #[test]
+    fn a_housekeeping_propose_marks_both_counters_before_it_ever_confirms() {
+        run(0x1037_0001);
+    }
+
+    #[test]
+    fn a_housekeeping_propose_marks_both_counters_before_it_ever_confirms_seed2() {
+        run(0x1037_0002);
+    }
+
+    /// Replay proof (repo convention): `ANIMUS_SEED=<seed> cargo test -p
+    /// animusd --lib replays_issue_1037_from_an_explicit_env_seed` reruns
+    /// this exact scenario from a printed seed.
+    #[test]
+    fn replays_issue_1037_from_an_explicit_env_seed() {
+        let seed = std::env::var("ANIMUS_SEED")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0x1037_0003);
+        run(seed);
+    }
+
+    fn run(seed: u64) {
+        let (mut sim, nodes, metrics) = three_voter_group(seed);
+        sim.run_for(Duration::from_secs(2));
+        let l = leader_index(&nodes)
+            .unwrap_or_else(|| panic!("a three-voter group must elect a leader (seed={seed:#x})"));
+        let leader = CpGroup::Mem(nodes[l].clone());
+        let leader_metrics = metrics[l].clone();
+
+        let key = b"stale-change-record".to_vec();
+
+        // Seed a REAL value at `key` first, committed and applied on every
+        // voter — otherwise the confirm loop's value-equality probe
+        // (`local_get_kind(..) == None` for a delete) would trivially match
+        // an absent key from the very start, before the delete entry below
+        // ever even reaches this leader's own log, and this test would
+        // measure nothing (found live: an earlier revision of this test
+        // deleted a key that was never there, and its own confirm loop
+        // returned `Ok` inside `run_for(Duration::ZERO)` below with no
+        // majority round trip at all).
+        match leader.put_kind_batch(
+            vec![(KIND_CHANGE, key.clone(), Some(b"seed".to_vec()))],
+            Vec::new(),
+        ) {
+            ProposeResult::Accepted { .. } => {}
+            other => panic!("seed write not accepted (seed={seed:#x}): {other:?}"),
+        }
+        sim.run_for(Duration::from_secs(2));
+        assert_eq!(
+            futures::executor::block_on(leader.local_get_kind(KIND_CHANGE, &key)),
+            Some(b"seed".to_vec()),
+            "the seed write must be visible on the leader before the real \
+             test begins (seed={seed:#x})"
+        );
+
+        let raw_before = leader_metrics.get(Metric::CpProposalsAccepted);
+        let housekeeping_before = leader_metrics.get(Metric::CpHousekeepingProposalsAccepted);
+
+        // A trim-shaped housekeeping write (a `KIND_CHANGE` tombstone
+        // delete, mirroring `trim_janitor`'s own writes) — spawned so this
+        // test can inspect state at its first park, before the OTHER two
+        // voters have had any chance to ack it.
+        let result: Arc<Mutex<Option<Result<(), String>>>> = Arc::new(Mutex::new(None));
+        {
+            let leader = leader.clone();
+            let key = key.clone();
+            let env = leader.env().clone();
+            let out = result.clone();
+            env.spawn_task(async move {
+                let r = ClientCtx::<SimEnv, NeverRelay>::cp_kind_raw_local(
+                    &leader,
+                    vec![(KIND_CHANGE, key, None)],
+                    Vec::new(),
+                    true, // housekeeping
+                )
+                .await;
+                *out.lock().expect("poisoned") = Some(r);
+            });
+        }
+        // Drain every currently-ready task to its own first park, firing no
+        // timed event yet: the write's task runs up to (and including)
+        // proposing it and parking on its own first `wait_applied_past`
+        // wait — it cannot possibly have confirmed yet (that needs a
+        // majority round trip, which cannot complete with zero virtual
+        // time elapsed, and the seed value above means the value-equality
+        // probe cannot short-circuit early either).
+        sim.run_for(Duration::ZERO);
+        assert_eq!(
+            result.lock().expect("poisoned").clone(),
+            None,
+            "the write's confirm loop must still be waiting at this point, \
+             or this run doesn't exercise the accepted-but-unconfirmed \
+             window this test exists to pin (seed={seed:#x})"
+        );
+
+        let raw_mid = leader_metrics.get(Metric::CpProposalsAccepted) - raw_before;
+        let housekeeping_mid =
+            leader_metrics.get(Metric::CpHousekeepingProposalsAccepted) - housekeeping_before;
+        assert_eq!(
+            raw_mid, 1,
+            "the write must already be proposed (raw accepted) at this \
+             point (seed={seed:#x})"
+        );
+        assert_eq!(
+            housekeeping_mid, 1,
+            "the SAME propose must already be marked housekeeping at this \
+             exact same point, not only after this call's own confirm/apply \
+             wait later returns — a `/metrics` scrape landing here, before \
+             the write ever confirms, is exactly the window issue #1037's \
+             9-raw/0-housekeeping failure came from (seed={seed:#x})"
+        );
+
+        // Let the write actually confirm, so the task doesn't leak past
+        // this test.
+        for _ in 0..200 {
+            sim.run_for(Duration::from_millis(10));
+            if result.lock().expect("poisoned").is_some() {
+                break;
+            }
+        }
+        let final_result =
+            result.lock().expect("poisoned").clone().unwrap_or_else(|| {
+                panic!("the write's confirm loop never finished (seed={seed:#x})")
+            });
+        assert_eq!(
+            final_result,
+            Ok(()),
+            "the housekeeping write must genuinely confirm (seed={seed:#x}): {final_result:?}"
+        );
+        assert_eq!(
+            leader_metrics.get(Metric::CpProposalsAccepted) - raw_before,
+            1,
+            "still exactly one accepted propose once confirmed (seed={seed:#x})"
+        );
+        assert_eq!(
+            leader_metrics.get(Metric::CpHousekeepingProposalsAccepted) - housekeeping_before,
+            1,
+            "still exactly one housekeeping-marked propose once confirmed \
+             (seed={seed:#x})"
         );
     }
 }
@@ -2619,6 +2913,7 @@ mod cp_kind_raw_local_genuine_loss_tests {
                     &leader,
                     vec![(KIND_BASE, key, Some(value))],
                     Vec::new(),
+                    false,
                 )
                 .await;
                 *out.lock().expect("poisoned") = Some(r);

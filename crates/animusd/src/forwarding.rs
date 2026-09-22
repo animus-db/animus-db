@@ -964,6 +964,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 table,
                 writes,
                 change_log,
+                housekeeping,
             } => {
                 // Every write shares one tablet (they share a partition key), so
                 // resolve the leader by the first key and serve the whole entry.
@@ -979,8 +980,11 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 // `cp_kind_local`'s Some-base-write requirement wrongly
                 // refused a forwarded whole-partition raw DELETE, whose
                 // base write is a tombstone; see `cp_kind_raw_local`'s
-                // doc).
-                match Self::cp_kind_raw_local(&leader, writes, change_log).await {
+                // doc). `housekeeping` travels with the request (issue
+                // #1037) so this remote leader's own local execution marks
+                // its accepted propose the identical way the originating
+                // node would have, had it been the leader itself.
+                match Self::cp_kind_raw_local(&leader, writes, change_log, housekeeping).await {
                     Ok(()) => ClientResponse::PutOk,
                     Err(e) => ClientResponse::Error(e),
                 }

@@ -765,7 +765,7 @@ pub enum Metric {
     /// anywhere yet" case only in that this confirms more than one node's
     /// own view was checked, not just this one's.
     CpRouteFanoutExhausted,
-    // --- Housekeeping-vs-client propose attribution (issue #974) ---
+    // --- Housekeeping-vs-client propose attribution (issue #974, #1037) ---
     // Appended after the shared-WAL variant above; every earlier variant's
     // slot and the text-export order stay stable, so the snapshot remains
     // byte-reproducible. `CpProposalsAccepted` counts every accepted
@@ -776,17 +776,28 @@ pub enum Metric {
     // one of that loop's five per-tablet arms that runs unconditionally,
     // even on a plain table with no GSI/stream/PITR consumer, since a
     // marker record is never itself consumer-visible). Both go through the
-    // identical `ClientCtx::cp_kind_write_raw`/`RaftKvNode::put_kind_batch`
-    // path, so nothing below `animus-cp-data`'s propose choke point can
-    // tell them apart — this counter is recorded one layer up, at
-    // `trim_janitor`'s own call site, the one place that already knows a
-    // write is housekeeping rather than a reaction to a client request.
-    /// One `KindBatch` propose `trim_janitor` issued to delete already-
-    /// consumed `KIND_CHANGE` marker/change-log rows was accepted —
-    /// `CpProposalsAccepted`'s own housekeeping share. Subtract this
-    /// counter's delta from `CpProposalsAccepted`'s to recover "proposals a
-    /// client write actually caused" over any window, which is what
-    /// exposed the mechanism (`batch_write.rs::batched_write_beats_per_key`
+    // identical `ClientCtx::cp_kind_write_raw_housekeeping`/`RaftKvNode::
+    // put_kind_batch` path, so nothing below `animus-cp-data`'s propose
+    // choke point can tell them apart on its own — this counter is
+    // recorded by `write_path::cp_kind_raw_local`'s `housekeeping`
+    // parameter, in the **same synchronous step** as `CpProposalsAccepted`
+    // itself (right after `put_kind_batch` returns `Accepted`, before the
+    // confirm/apply wait that follows). **Issue #1037 moved it there** —
+    // the original #974 fix incremented this counter one layer up, in
+    // `trim_janitor`, only *after* its own write call returned (i.e. after
+    // confirm+apply), which left a real window between the two increments
+    // wide enough for a concurrent `/metrics` scrape to observe the raw
+    // accept without ever seeing this one (`batch_write.rs::
+    // batched_write_beats_per_key` reproduced this directly: 9 raw / 0
+    // housekeeping under CPU contention, not 9 raw / 1 housekeeping as
+    // #974 assumed it always would be).
+    /// One `KindBatch` propose issued to delete already-consumed
+    /// `KIND_CHANGE` marker/change-log rows (`trim_janitor`, via
+    /// `cp_kind_write_raw_housekeeping`) was accepted — `CpProposalsAccepted`'s
+    /// own housekeeping share. Subtract this counter's delta from
+    /// `CpProposalsAccepted`'s to recover "proposals a client write
+    /// actually caused" over any window, which is what exposed the
+    /// mechanism (`batch_write.rs::batched_write_beats_per_key`
     /// occasionally counting a same-tick trim landing inside its own
     /// measurement window as one of the batch's own proposals).
     CpHousekeepingProposalsAccepted,

@@ -56,6 +56,73 @@
 //! `cp_proposals_accepted`'s own and assert **exact** equality with no
 //! margin, regardless of which side of the phase boundary a trim tick lands
 //! on.
+//!
+//! **Issue #1037: #974's fix was correct about WHICH propose but wrong
+//! about WHEN it gets marked, and that gap reopened the exact-equality
+//! assertion under load.** The failure signature moved from "9 raw / 1
+//! housekeeping" (the mechanism #974 pinned) to **9 raw / 0 housekeeping**
+//! — the trim janitor's own propose again went unattributed, but this time
+//! `cp_housekeeping_proposals_accepted` never incremented for it at all
+//! within the test's own measurement window, rather than incrementing on
+//! the wrong side of a phase boundary. Reproduced first as a rare CPU-
+//! contention flake (one local failure, one on a loaded GitHub Actions
+//! runner, both on branches whose only diff to this file was unrelated),
+//! then — once a third gate run (PR #1038 shard 2/4 and PR #1040, same
+//! day) turned up the identical 9/0 signature on diffs that don't touch the
+//! write path — recognized as **near-deterministic on a loaded CI runner**,
+//! not a rare race at all: the trim janitor's own `INDEX_DRAIN_INTERVAL`
+//! (200ms) tick reliably lands inside one of this test's two ~0.3-1.5s
+//! phases on a real multi-second run, so the only question was ever
+//! whether the counter that attributes it lags behind the one that counts
+//! it.
+//!
+//! It did. #974's fix incremented `CpHousekeepingProposalsAccepted` in
+//! `trim_janitor` itself (`animusd::index_drain`), **after** its own
+//! `cp_kind_write_raw` call returned — i.e. after that write's full
+//! propose-commit-apply-confirm cycle. But `cp_proposals_accepted` is
+//! incremented much earlier, synchronously, the instant the entry is
+//! accepted onto the leader's own local Raft log (`animus-cp-data::
+//! record_propose`, inside `put_kind_batch`) — before any of the real
+//! (`ProdEnv`) async time the confirm loop then spends waiting for the
+//! entry to actually commit+apply. Between those two moments sat a real,
+//! unbounded window — wider under CPU contention, since a loaded scheduler
+//! makes the confirm loop's own awaits take longer in wall-clock terms —
+//! during which the raw counter had already counted the trim's propose but
+//! the housekeeping counter had not yet. A `GET /metrics` scrape landing in
+//! that window (exactly what this test's own before/after calls do) read
+//! the trim back as an unattributed client write: 9 raw, 0 housekeeping,
+//! `batched_proposals` computed as 9 instead of 8.
+//!
+//! Fixed at the root, one layer down from where #974 put it:
+//! `RaftKvNode::metrics_handle` exposes the group's own `MetricsHandle`
+//! (the same sink `record_propose` writes into), `CpGroup::metrics`
+//! mirrors it, and `ClientCtx::cp_kind_raw_local` takes a `housekeeping`
+//! argument that — when set — marks `CpHousekeepingProposalsAccepted` in
+//! the **same synchronous step** as the propose's own acceptance, before
+//! the confirm loop below it ever awaits anything. `trim_janitor` reaches
+//! this through a new `ClientCtx::cp_kind_write_raw_housekeeping` (in place
+//! of the plain `cp_kind_write_raw` it used to call, with its own two
+//! now-redundant post-confirm `.incr(Metric::
+//! CpHousekeepingProposalsAccepted)` calls removed). The forwarded
+//! `ClientRequest::KindWrite` RPC carries the same flag (`#[serde(default)]
+//! housekeeping: bool`) so the one theoretical cross-node case — leadership
+//! moving between `trim_janitor`'s own `is_leader()` gate and its propose —
+//! stays correctly attributed too, though `trim_janitor` only ever calls
+//! this on a tablet it already leads locally, so that hop is untested here
+//! and covered instead by `write_path::
+//! cp_kind_raw_local_housekeeping_attribution_tests` (a seeded `SimEnv`
+//! regression that catches the write's own confirm loop at its first park
+//! — accepted but not yet committed — and asserts both counters already
+//! agree at that exact instant, which fails against the pre-fix,
+//! post-confirm-only increment).
+//!
+//! **PR #1036 (issue #1035, relayed-throttle error-code decoding, merged
+//! the same day) was investigated and ruled out**: its diff is entirely
+//! `decode_relayed_error`/`wire_error_from_batch_rejected`'s shared
+//! allowlist table, on the `KindWriteItem`/`KindWriteBatch` forwarded-hop
+//! *error* path, with no propose or retry logic touched — and this test's
+//! single-node cluster never forwards a write at all, so that hop is not
+//! reachable from here regardless.
 
 use std::net::SocketAddr;
 use std::time::Duration;

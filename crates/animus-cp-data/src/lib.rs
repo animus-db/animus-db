@@ -6989,6 +6989,24 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         self.lock().term()
     }
 
+    /// This node's own observability sink (ADR 0015) — the same
+    /// [`MetricsHandle`] `record_propose` increments `CpProposalsAccepted`
+    /// into (see that function's doc). Exposed so a caller that proposes a
+    /// **housekeeping** write through this group (`animusd::index_drain::
+    /// trim_janitor` today) can attribute the acceptance to
+    /// `Metric::CpHousekeepingProposalsAccepted` in the *same synchronous
+    /// step* as the propose itself — issue #1037: incrementing that counter
+    /// only after the write's own confirm/apply wait returns (the original
+    /// #974 fix's shape) left a real window, between "raw accepted" and
+    /// "marked housekeeping," wide enough for a concurrent `/metrics` scrape
+    /// to observe the former without the latter — a genuine trim propose
+    /// read back as an unattributed client one. Cheap to clone (an `Arc`
+    /// dereference), matching every other `MetricsHandle` in this crate.
+    #[must_use]
+    pub fn metrics_handle(&self) -> MetricsHandle {
+        self.metrics.clone()
+    }
+
     /// Whether this replica is still resolving the issue #900/#667
     /// boot-time cluster check — while `true` it never grants a real vote
     /// and never campaigns (mirrors `animus_control::node::
@@ -7078,7 +7096,7 @@ fn record_propose(metrics: &MetricsHandle, result: ProposeResult) -> ProposeResu
     result
 }
 
-/// Like [`record_propose`] but for a `change_membership` step (direct call or the
+/// Like `record_propose` but for a `change_membership` step (direct call or the
 /// automatic [`RaftKvNode::reconfigure_step`]) — kept as its own counter family so
 /// reconfiguration churn is distinguishable from data-write contention.
 fn record_reconfigure(metrics: &MetricsHandle, result: ProposeResult) -> ProposeResult {
