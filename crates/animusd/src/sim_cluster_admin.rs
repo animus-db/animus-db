@@ -771,7 +771,7 @@ fn run_gc_reports_segment_janitor_progress_and_leader_state(seed: u64) {
     let (status, ct) = create_table_via_wire(
         &mut cluster,
         0,
-        r#"{"TableName":"t","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
+        r#"{"TableName":"tbl","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "StreamSpecification":{"StreamEnabled":true,"StreamViewType":"KEYS_ONLY"}}"#,
     );
@@ -779,10 +779,10 @@ fn run_gc_reports_segment_janitor_progress_and_leader_state(seed: u64) {
     let (status, put) = cluster.dynamo(
         0,
         "DynamoDB_20120810.PutItem",
-        br#"{"TableName":"t","Item":{"id":{"S":"p1"}}}"#,
+        br#"{"TableName":"tbl","Item":{"id":{"S":"p1"}}}"#,
     );
     assert_eq!(status, 200, "seed={seed}: PutItem: {put}");
-    let data_leader = leader_of_table(&cluster, "t");
+    let data_leader = leader_of_table(&cluster, "tbl");
     cluster.drive_stream_seal(data_leader);
     assert!(
         !cluster.metadata(0).stream_shards.is_empty(),
@@ -791,8 +791,13 @@ fn run_gc_reports_segment_janitor_progress_and_leader_state(seed: u64) {
 
     // ---- drop the table: the janitor's own drop-table rule reclaims its
     //      stream-shard row(s) immediately, regardless of retention ------
-    let (status, drop_body) =
-        cluster.admin(0, "POST", "/admin/data/drop-table", "", br#"{"table":"t"}"#);
+    let (status, drop_body) = cluster.admin(
+        0,
+        "POST",
+        "/admin/data/drop-table",
+        "",
+        br#"{"table":"tbl"}"#,
+    );
     assert_eq!(status, 200, "seed={seed}: drop-table: {drop_body}");
 
     // Re-resolved fresh every poll — the identical control-leadership-

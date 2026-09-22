@@ -191,19 +191,19 @@ fn run_data_write_dynamo(seed: u64) {
     let (status, ct) = create_table_via_wire(
         &mut cluster,
         0,
-        r#"{"TableName":"t","KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],
+        r#"{"TableName":"tbl","KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],
             "AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}]}"#,
     );
     assert_eq!(status, 200, "seed={seed}: CreateTable t: {ct}");
 
-    let node = non_leader_of_table(&cluster, "t");
+    let node = non_leader_of_table(&cluster, "tbl");
 
     let (status, put) = cluster.admin(
         node,
         "POST",
         "/admin/data/dynamo",
         "",
-        br#"{"op":"PutItem","payload":{"TableName":"t","Item":{"pk":{"S":"alice"},"v":{"N":"7"}}}}"#,
+        br#"{"op":"PutItem","payload":{"TableName":"tbl","Item":{"pk":{"S":"alice"},"v":{"N":"7"}}}}"#,
     );
     assert_eq!(status, 200, "seed={seed}: PutItem via admin proxy: {put}");
 
@@ -212,7 +212,7 @@ fn run_data_write_dynamo(seed: u64) {
         "POST",
         "/admin/data/dynamo",
         "",
-        br#"{"op":"GetItem","payload":{"TableName":"t",
+        br#"{"op":"GetItem","payload":{"TableName":"tbl",
             "Key":{"pk":{"S":"alice"}},"ConsistentRead":true}}"#,
     );
     assert_eq!(status, 200, "seed={seed}: GetItem via admin proxy: {got}");
@@ -602,9 +602,9 @@ fn run_split_in_place_children_inherit_the_parents_own_replicas(seed: u64) {
     // candidate a placement-recomputed (pre-ADR-0062) split would have
     // recruited for at least one child.
     let mut cluster = SimCluster::new(seed, 4, 3);
-    let parent = cluster.create_table_with_replication("t", 3);
+    let parent = cluster.create_table_with_replication("tbl", 3);
     cluster
-        .put_raw(0, "t", b"k".to_vec(), b"v".to_vec())
+        .put_raw(0, "tbl", b"k".to_vec(), b"v".to_vec())
         .unwrap_or_else(|e| panic!("seed={seed}: put_raw(k) failed: {e}"));
 
     let (status, before) = cluster.admin(0, "GET", "/admin/status", "", &[]);

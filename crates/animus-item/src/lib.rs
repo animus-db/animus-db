@@ -79,7 +79,9 @@ pub use index::{
     ChangeRecord, FootprintEntry, GsiRowRef, IndexFootprint, ItemFootprint, LsiRowRef,
     index_table_name, is_index_table_name, split_index_table_name,
 };
-pub use size::{MAX_ITEM_SIZE_BYTES, item_size, value_size};
+pub use size::{
+    MAX_ITEM_SIZE_BYTES, MAX_NESTING_DEPTH, item_depth, item_size, value_depth, value_size,
+};
 pub use stored::{decode_stored_item, encode_stored_item, encode_tombstone};
 pub use update::{
     PathSegment, UpdateAction, UpdateError, UpdateExpr, UpdateOperand, apply_update,

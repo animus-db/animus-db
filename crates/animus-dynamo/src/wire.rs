@@ -1,7 +1,7 @@
 //! The DynamoDB JSON wire encoding (ADR 0006).
 //!
 //! DynamoDB clients speak JSON-over-HTTP: a request body like
-//! `{"TableName":"t","Item":{"pk":{"S":"a"},"n":{"N":"1"}}}` and an
+//! `{"TableName":"tbl","Item":{"pk":{"S":"a"},"n":{"N":"1"}}}` and an
 //! `X-Amz-Target: DynamoDB_20120810.PutItem` header naming the operation. This
 //! module is the **pure, deterministic** translation between that JSON and the
 //! crate's in-memory [`Item`] / [`AttributeValue`] model — no I/O, no
@@ -68,6 +68,10 @@ use crate::capacity::{
     item_size,
 };
 use crate::condition::{Comparator, ConditionError, ConditionExpression, SortKeyCondition};
+use crate::limits::{
+    self, MAX_ATTRIBUTE_NAME_BYTES, MAX_EXPRESSION_BYTES, MAX_KEY_ATTRIBUTE_NAME_CHARS,
+    MAX_NESTING_DEPTH, MAX_PARTITION_KEY_BYTES, MAX_SORT_KEY_BYTES,
+};
 use crate::registry::{GlobalSecondaryIndex, IndexProjection, LocalSecondaryIndex, SecondaryIndex};
 use crate::{AttributeValue, Item, TableSchema};
 
@@ -1061,7 +1065,7 @@ pub enum Operation {
     /// transaction mixing `SELECT` with a mutation is a `ValidationException`
     /// (AWS: a transaction is all-reads or all-writes) — like
     /// `ExecuteStatement`, each `statement` is opaque, unparsed text at this
-    /// layer (no catalog here to resolve `FROM "t"` against), so this joins
+    /// layer (no catalog here to resolve `FROM "tbl"` against), so this joins
     /// its "resolved inside its own handler" group at every exhaustive match
     /// site (`Operation::table()`, `authz::classify`, `authz::authorize_op`).
     ExecuteTransaction {
@@ -1437,7 +1441,7 @@ impl Operation {
             | Operation::TransactGetItems { .. }
             // `ExecuteStatement`'s table is only known once its `statement`
             // is parsed (ADR 0071) — this layer has no catalog to resolve
-            // `FROM "t"` against, so it joins the multi-table/table-late
+            // `FROM "tbl"` against, so it joins the multi-table/table-late
             // group here; `animusd` resolves and authorizes the real table
             // inside its own handler, mirroring `BatchGetItem`'s shape.
             | Operation::ExecuteStatement { .. }
@@ -2854,6 +2858,7 @@ fn decode_update_expression(
     obj: &Map<String, Value>,
     expr: &str,
 ) -> Result<Vec<UpdateAction>, WireError> {
+    check_expression_length(expr, "UpdateExpression")?;
     let tokens = tokenize_update_expression(expr);
     // Find the first word, anywhere, that is a clause keyword at top level —
     // regardless of whether *this* parse would actually treat it as a clause
@@ -3165,7 +3170,9 @@ fn resolve_attr_name(obj: &Map<String, Value>, raw: &str) -> Result<String, Wire
     } else {
         raw
     };
-    Ok(reject_path(name)?.to_owned())
+    let name = reject_path(name)?;
+    check_attribute_name(name)?;
+    Ok(name.to_owned())
 }
 
 /// Decode one `TransactWriteItems` action's `ReturnValuesOnConditionCheckFailure`
@@ -3230,6 +3237,72 @@ fn check_item_size(item: &Item) -> Result<(), WireError> {
     Ok(())
 }
 
+/// Reject `expr` (the raw text of a `ConditionExpression`/`UpdateExpression`/
+/// `ProjectionExpression`/`FilterExpression`/`KeyConditionExpression`) if it
+/// exceeds [`MAX_EXPRESSION_BYTES`] (ADR 0072) — checked independently for
+/// each expression field present on a request, matching AWS. `field` names
+/// the field in the error message.
+fn check_expression_length(expr: &str, field: &str) -> Result<(), WireError> {
+    if expr.len() > MAX_EXPRESSION_BYTES {
+        return Err(WireError::validation(format!(
+            "`{field}` exceeds the maximum length of {MAX_EXPRESSION_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+/// The byte length DynamoDB's partition/sort-key size caps charge an
+/// `AttributeValue` against: `S`'s UTF-8 length or `B`'s raw byte length.
+/// `N` (and every other type) is unaffected — AWS's own key-size caps name
+/// only string/binary key values (a numeric key's size is bounded by
+/// [`crate::numkey::MAX_SIGNIFICANT_DIGITS`] instead).
+fn key_value_byte_len(v: &AttributeValue) -> Option<usize> {
+    match v {
+        AttributeValue::S(s) => Some(s.len()),
+        AttributeValue::B(b) => Some(b.len()),
+        _ => None,
+    }
+}
+
+/// Reject `v` if, as a **partition**-key value, it exceeds
+/// [`MAX_PARTITION_KEY_BYTES`] (ADR 0072).
+fn check_partition_key_value_size(v: &AttributeValue) -> Result<(), WireError> {
+    if key_value_byte_len(v).is_some_and(|len| len > MAX_PARTITION_KEY_BYTES) {
+        return Err(WireError::validation(format!(
+            "One or more parameter values were invalid: the partition key value exceeds the \
+             maximum size of {MAX_PARTITION_KEY_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+/// Reject `v` if, as a **sort**-key value, it exceeds [`MAX_SORT_KEY_BYTES`]
+/// (ADR 0072).
+fn check_sort_key_value_size(v: &AttributeValue) -> Result<(), WireError> {
+    if key_value_byte_len(v).is_some_and(|len| len > MAX_SORT_KEY_BYTES) {
+        return Err(WireError::validation(format!(
+            "One or more parameter values were invalid: the sort key value exceeds the \
+             maximum size of {MAX_SORT_KEY_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+/// [`check_sort_key_value_size`] applied to every value embedded in a
+/// `Query`/`Scan` sort-key condition (`decode_sort_condition`'s own output) —
+/// `Compare`'s one value, or `Between`'s/`BeginsWith`'s.
+fn check_sort_key_condition_size(cond: &SortKeyCondition) -> Result<(), WireError> {
+    match cond {
+        SortKeyCondition::Compare(_, v) | SortKeyCondition::BeginsWith(v) => {
+            check_sort_key_value_size(v)
+        }
+        SortKeyCondition::Between(lo, hi) => {
+            check_sort_key_value_size(lo)?;
+            check_sort_key_value_size(hi)
+        }
+    }
+}
+
 /// AWS's `BatchWriteItem` cap: at most 25 request items, summed across every
 /// table named in `RequestItems`, in one call.
 pub const BATCH_WRITE_MAX_ITEMS: usize = 25;
@@ -3270,6 +3343,7 @@ fn decode_batch_write(obj: &Map<String, Value>) -> Result<Operation, WireError> 
         .ok_or_else(|| WireError::validation("missing object field `RequestItems`"))?;
     let mut requests = BTreeMap::new();
     for (table, list) in items {
+        check_table_or_index_name(table, "RequestItems")?;
         let arr = list.as_array().ok_or_else(|| {
             WireError::validation(format!("`RequestItems.{table}` must be an array"))
         })?;
@@ -3433,6 +3507,7 @@ fn decode_batch_get(obj: &Map<String, Value>) -> Result<Operation, WireError> {
     }
     let mut requests = Vec::with_capacity(tables.len());
     for (table, spec) in tables {
+        check_table_or_index_name(table, "RequestItems")?;
         let spec = spec.as_object().ok_or_else(|| {
             WireError::validation(format!("`RequestItems.{table}` must be an object"))
         })?;
@@ -3530,7 +3605,7 @@ fn decode_execute_statement(obj: &Map<String, Value>) -> Result<Operation, WireE
                 .ok_or_else(|| WireError::validation("`Parameters` must be an array"))?;
             arr.iter()
                 .enumerate()
-                .map(|(i, v)| decode_attribute_value(&format!("Parameters[{i}]"), v))
+                .map(|(i, v)| decode_attribute_value(&format!("Parameters[{i}]"), v, 1))
                 .collect::<Result<Vec<_>, _>>()?
         }
     };
@@ -3594,7 +3669,7 @@ fn decode_batch_execute_statement(obj: &Map<String, Value>) -> Result<Operation,
                 parr.iter()
                     .enumerate()
                     .map(|(j, v)| {
-                        decode_attribute_value(&format!("Statements[{i}].Parameters[{j}]"), v)
+                        decode_attribute_value(&format!("Statements[{i}].Parameters[{j}]"), v, 1)
                     })
                     .collect::<Result<Vec<_>, _>>()?
             }
@@ -3664,6 +3739,7 @@ fn decode_execute_transaction(obj: &Map<String, Value>) -> Result<Operation, Wir
                         decode_attribute_value(
                             &format!("TransactStatements[{i}].Parameters[{j}]"),
                             v,
+                            1,
                         )
                     })
                     .collect::<Result<Vec<_>, _>>()?
@@ -3704,6 +3780,12 @@ fn decode_key_schema(obj: &Map<String, Value>) -> Result<TableSchema, WireError>
             .get("AttributeName")
             .and_then(Value::as_str)
             .ok_or_else(|| WireError::validation("`KeySchema` entry missing `AttributeName`"))?;
+        if name.len() > MAX_KEY_ATTRIBUTE_NAME_CHARS {
+            return Err(WireError::validation(format!(
+                "`KeySchema` attribute name `{name}` exceeds the maximum length of \
+                 {MAX_KEY_ATTRIBUTE_NAME_CHARS} characters"
+            )));
+        }
         let role = e
             .get("KeyType")
             .and_then(Value::as_str)
@@ -3937,8 +4019,9 @@ fn decode_index_entry(
     let name = g
         .get("IndexName")
         .and_then(Value::as_str)
-        .ok_or_else(|| WireError::validation(format!("{kind} missing `IndexName`")))?
-        .to_owned();
+        .ok_or_else(|| WireError::validation(format!("{kind} missing `IndexName`")))?;
+    check_table_or_index_name(name, "IndexName")?;
+    let name = name.to_owned();
     let schema = decode_key_schema(g)?;
     let projection = decode_index_projection(g)?;
     Ok((name, schema, projection))
@@ -4031,6 +4114,20 @@ fn decode_provisioned_throughput(
             "One or more parameter values were invalid: ReadCapacityUnits and \
              WriteCapacityUnits must both be at least 1",
         ));
+    }
+    // ADR 0072: AWS's own per-table provisioned-throughput ceiling (GSI
+    // throughput isn't separately decoded — see `decode_index_entry`'s own
+    // doc — so this one check, shared by `CreateTable` and `UpdateTable`,
+    // covers every `ProvisionedThroughput` this adapter accepts).
+    if read_units > limits::TABLE_MAX_READ_CAPACITY_UNITS
+        || write_units > limits::TABLE_MAX_WRITE_CAPACITY_UNITS
+    {
+        return Err(WireError::validation(format!(
+            "One or more parameter values were invalid: ReadCapacityUnits and \
+             WriteCapacityUnits must not exceed {} and {} respectively",
+            limits::TABLE_MAX_READ_CAPACITY_UNITS,
+            limits::TABLE_MAX_WRITE_CAPACITY_UNITS,
+        )));
     }
     Ok(ProvisionedThroughput {
         read_units,
@@ -4480,6 +4577,7 @@ fn decode_projection(obj: &Map<String, Value>) -> Result<Option<Projection>, Wir
         ));
     }
     if let Some(expr) = obj.get("ProjectionExpression").and_then(Value::as_str) {
+        check_expression_length(expr, "ProjectionExpression")?;
         let paths = expr
             .split(',')
             .map(str::trim)
@@ -4573,6 +4671,7 @@ fn parse_projection_segment(
     } else {
         name_part.to_owned()
     };
+    check_attribute_name(&name)?;
     let mut out = vec![PathSegment::Field(name)];
     out.extend(parse_index_chain(rest, raw)?);
     Ok(out)
@@ -4687,6 +4786,7 @@ fn decode_predicate(
     let Some(expr) = obj.get(field).and_then(Value::as_str) else {
         return Ok(None);
     };
+    check_expression_length(expr, field)?;
     decode_predicate_or(obj, field, expr.trim()).map(Some)
 }
 
@@ -4975,7 +5075,7 @@ fn resolve_placeholder(
     let raw = values.get(placeholder).ok_or_else(|| {
         WireError::validation(format!("placeholder `{placeholder}` is not defined"))
     })?;
-    decode_attribute_value(placeholder, raw)
+    decode_attribute_value(placeholder, raw, 1)
 }
 
 /// Decode a `Query` body: a `KeyConditionExpression` of the form
@@ -4990,6 +5090,7 @@ fn decode_query(obj: &Map<String, Value>) -> Result<Operation, WireError> {
         .get("KeyConditionExpression")
         .and_then(Value::as_str)
         .ok_or_else(|| WireError::validation("missing string field `KeyConditionExpression`"))?;
+    check_expression_length(expr, "KeyConditionExpression")?;
     // Split off an optional sort clause on the first ` AND ` (DynamoDB requires
     // the partition equality first).
     let (pk_clause, sort_clause) = match split_once_ci(expr, " AND ") {
@@ -5011,16 +5112,15 @@ fn decode_query(obj: &Map<String, Value>) -> Result<Operation, WireError> {
     }
     let partition_attr = resolve_attr_name(obj, pk_attr.trim())?;
     let partition_value = resolve_placeholder(obj, pk_placeholder.trim())?;
+    check_partition_key_value_size(&partition_value)?;
 
-    let index = obj
-        .get("IndexName")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
+    let index = decode_index_name(obj)?;
 
     let (sort_attr, sort_condition) = match sort_clause {
         None => (None, None),
         Some(clause) => {
             let (attr, cond) = decode_sort_condition(obj, clause)?;
+            check_sort_key_condition_size(&cond)?;
             (Some(attr), Some(cond))
         }
     };
@@ -5147,10 +5247,7 @@ fn decode_scan_segment(obj: &Map<String, Value>) -> Result<Option<ScanSegment>, 
 
 fn decode_scan(obj: &Map<String, Value>) -> Result<Operation, WireError> {
     let table = table_name(obj)?;
-    let index = obj
-        .get("IndexName")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
+    let index = decode_index_name(obj)?;
     let limit = decode_limit(obj)?;
     let exclusive_start_key = decode_exclusive_start_key(obj)?;
     let filter = decode_predicate(obj, "FilterExpression")?;
@@ -5288,10 +5385,43 @@ fn split_once_ci<'a>(s: &'a str, needle: &str) -> Option<(&'a str, &'a str)> {
 }
 
 fn table_name(obj: &Map<String, Value>) -> Result<String, WireError> {
-    obj.get("TableName")
+    let name = obj
+        .get("TableName")
         .and_then(Value::as_str)
-        .map(str::to_owned)
-        .ok_or_else(|| WireError::validation("missing string field `TableName`"))
+        .ok_or_else(|| WireError::validation("missing string field `TableName`"))?;
+    check_table_or_index_name(name, "TableName")?;
+    Ok(name.to_owned())
+}
+
+/// AWS validates a table/index name's *shape* before it ever checks
+/// existence (ADR 0072) — a malformed name is a `ValidationException`, not
+/// a `ResourceNotFoundException`, so this runs at decode time, before any
+/// catalog lookup. `field` names the JSON field in the error message
+/// (`"TableName"`, `"IndexName"`, or a `RequestItems` table key).
+fn check_table_or_index_name(name: &str, field: &str) -> Result<(), WireError> {
+    if limits::is_valid_table_or_index_name(name) {
+        return Ok(());
+    }
+    Err(WireError::validation(format!(
+        "1 validation error detected: Value '{name}' at '{field}' failed to satisfy \
+         constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+ and \
+         Member must have length between {} and {} inclusive",
+        limits::MIN_TABLE_NAME_CHARS,
+        limits::MAX_TABLE_NAME_CHARS,
+    )))
+}
+
+/// Decode `Query`/`Scan`'s optional `IndexName`, validating its shape the
+/// same way `table_name`/`decode_index_entry` do (ADR 0072) — shared by both
+/// decoders, which decode this field identically.
+fn decode_index_name(obj: &Map<String, Value>) -> Result<Option<String>, WireError> {
+    match obj.get("IndexName").and_then(Value::as_str) {
+        None => Ok(None),
+        Some(name) => {
+            check_table_or_index_name(name, "IndexName")?;
+            Ok(Some(name.to_owned()))
+        }
+    }
 }
 
 fn decode_item_field(obj: &Map<String, Value>, field: &str) -> Result<Item, WireError> {
@@ -5311,12 +5441,43 @@ fn decode_item_field(obj: &Map<String, Value>, field: &str) -> Result<Item, Wire
 pub fn decode_item(map: &Map<String, Value>) -> Result<Item, WireError> {
     let mut item = Item::new();
     for (name, value) in map {
-        item.insert(name.clone(), decode_attribute_value(name, value)?);
+        check_attribute_name(name)?;
+        item.insert(name.clone(), decode_attribute_value(name, value, 1)?);
     }
     Ok(item)
 }
 
-fn decode_attribute_value(name: &str, value: &Value) -> Result<AttributeValue, WireError> {
+/// AWS's attribute-name length rule (ADR 0072): between 1 and
+/// [`MAX_ATTRIBUTE_NAME_BYTES`] bytes of UTF-8 — an empty attribute name is
+/// never valid. Checked on every attribute name on the wire: item/`Key` map
+/// entries at every nesting level ([`decode_item`]/[`decode_attribute_value`]'s
+/// own `M` arm) and a resolved `ExpressionAttributeNames` value
+/// ([`resolve_attr_name`]/[`parse_projection_segment`]).
+fn check_attribute_name(name: &str) -> Result<(), WireError> {
+    let len = name.len();
+    if len == 0 || len > MAX_ATTRIBUTE_NAME_BYTES {
+        return Err(WireError::validation(format!(
+            "attribute name must be between 1 and {MAX_ATTRIBUTE_NAME_BYTES} bytes, got {len}"
+        )));
+    }
+    Ok(())
+}
+
+/// `depth` is this value's own [`MAX_NESTING_DEPTH`]-counting depth (1 for a
+/// top-level attribute value, matching [`animus_item::value_depth`]'s
+/// documented convention) — checked up front so a request nested past the
+/// cap is rejected before recursing further into it, rather than after
+/// building the whole (potentially very deep) structure.
+fn decode_attribute_value(
+    name: &str,
+    value: &Value,
+    depth: usize,
+) -> Result<AttributeValue, WireError> {
+    if depth > MAX_NESTING_DEPTH {
+        return Err(WireError::validation(format!(
+            "attribute `{name}` nesting depth exceeds the maximum of {MAX_NESTING_DEPTH} levels"
+        )));
+    }
     let obj = value.as_object().ok_or_else(|| {
         WireError::validation(format!("attribute `{name}` must be a typed object"))
     })?;
@@ -5372,9 +5533,10 @@ fn decode_attribute_value(name: &str, value: &Value) -> Result<AttributeValue, W
             })?;
             let mut nested = BTreeMap::new();
             for (k, v) in map {
+                check_attribute_name(k)?;
                 nested.insert(
                     k.clone(),
-                    decode_attribute_value(&format!("{name}.{k}"), v)?,
+                    decode_attribute_value(&format!("{name}.{k}"), v, depth + 1)?,
                 );
             }
             Ok(AttributeValue::M(nested))
@@ -5385,7 +5547,11 @@ fn decode_attribute_value(name: &str, value: &Value) -> Result<AttributeValue, W
             })?;
             let mut out = Vec::with_capacity(list.len());
             for (i, v) in list.iter().enumerate() {
-                out.push(decode_attribute_value(&format!("{name}[{i}]"), v)?);
+                out.push(decode_attribute_value(
+                    &format!("{name}[{i}]"),
+                    v,
+                    depth + 1,
+                )?);
             }
             Ok(AttributeValue::L(out))
         }
@@ -7484,25 +7650,25 @@ mod tests {
 
     #[test]
     fn decodes_get_and_delete_keys() {
-        let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}}}"#;
+        let body = br#"{"TableName":"tbl","Key":{"id":{"S":"k"}}}"#;
         match decode_request("DynamoDB_20120810.GetItem", body).unwrap() {
             Operation::GetItem { table, key, .. } => {
-                assert_eq!(table, "t");
+                assert_eq!(table, "tbl");
                 assert_eq!(key.get("id"), Some(&s("k")));
             }
             other => panic!("expected GetItem, got {other:?}"),
         }
         match decode_request("DynamoDB_20120810.DeleteItem", body).unwrap() {
-            Operation::DeleteItem { table, .. } => assert_eq!(table, "t"),
+            Operation::DeleteItem { table, .. } => assert_eq!(table, "tbl"),
             other => panic!("expected DeleteItem, got {other:?}"),
         }
     }
 
     #[test]
     fn decodes_delete_table_request() {
-        let body = br#"{"TableName":"t"}"#;
+        let body = br#"{"TableName":"tbl"}"#;
         match decode_request("DynamoDB_20120810.DeleteTable", body).unwrap() {
-            Operation::DeleteTable { table } => assert_eq!(table, "t"),
+            Operation::DeleteTable { table } => assert_eq!(table, "tbl"),
             other => panic!("expected DeleteTable, got {other:?}"),
         }
     }
@@ -7554,7 +7720,7 @@ mod tests {
     #[test]
     fn unsupported_type_is_rejected() {
         // `XX` is not a DynamoDB attribute type (M/L/SS/NS/BS are now supported).
-        let body = br#"{"TableName":"t","Item":{"id":{"XX":""}}}"#;
+        let body = br#"{"TableName":"tbl","Item":{"id":{"XX":""}}}"#;
         let err = decode_request("DynamoDB_20120810.PutItem", body).unwrap_err();
         assert_eq!(err.code, "ValidationException");
     }
@@ -7565,14 +7731,14 @@ mod tests {
     /// raw-ASCII fallback, `animus-item`'s `numkey` module).
     #[test]
     fn put_item_rejects_malformed_n() {
-        let body = br#"{"TableName":"t","Item":{"pk":{"S":"p"},"sk":{"N":"12a"}}}"#;
+        let body = br#"{"TableName":"tbl","Item":{"pk":{"S":"p"},"sk":{"N":"12a"}}}"#;
         let err = decode_request("DynamoDB_20120810.PutItem", body).unwrap_err();
         assert_eq!(err.code, "ValidationException");
     }
 
     #[test]
     fn update_item_value_rejects_malformed_n() {
-        let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+        let body = br#"{"TableName":"tbl","Key":{"id":{"S":"k"}},
             "UpdateExpression":"SET v = :v",
             "ExpressionAttributeValues":{":v":{"N":"12a"}}}"#;
         let err = decode_request("DynamoDB_20120810.UpdateItem", body).unwrap_err();
@@ -7582,7 +7748,7 @@ mod tests {
     #[test]
     fn batch_write_item_rejects_malformed_n() {
         let body = br#"{"RequestItems":{
-            "t":[{"PutRequest":{"Item":{"pk":{"S":"a"},"sk":{"N":"12a"}}}}]}}"#;
+            "tbl":[{"PutRequest":{"Item":{"pk":{"S":"a"},"sk":{"N":"12a"}}}}]}}"#;
         let err = decode_request("DynamoDB_20120810.BatchWriteItem", body).unwrap_err();
         assert_eq!(err.code, "ValidationException");
     }
@@ -7590,7 +7756,7 @@ mod tests {
     #[test]
     fn transact_write_items_rejects_malformed_n() {
         let body = br#"{"TransactItems":[
-            {"Put":{"TableName":"t","Item":{"pk":{"S":"a"},"sk":{"N":"12a"}}}}]}"#;
+            {"Put":{"TableName":"tbl","Item":{"pk":{"S":"a"},"sk":{"N":"12a"}}}}]}"#;
         let err = decode_request("DynamoDB_20120810.TransactWriteItems", body).unwrap_err();
         assert_eq!(err.code, "ValidationException");
     }
@@ -7601,8 +7767,9 @@ mod tests {
     #[test]
     fn put_item_rejects_n_over_the_significant_digit_cap() {
         let over_cap = "9".repeat(animus_item::numkey::MAX_SIGNIFICANT_DIGITS + 1);
-        let body =
-            format!(r#"{{"TableName":"t","Item":{{"pk":{{"S":"p"}},"n":{{"N":"{over_cap}"}}}}}}"#);
+        let body = format!(
+            r#"{{"TableName":"tbl","Item":{{"pk":{{"S":"p"}},"n":{{"N":"{over_cap}"}}}}}}"#
+        );
         let err = decode_request("DynamoDB_20120810.PutItem", body.as_bytes()).unwrap_err();
         assert_eq!(err.code, "ValidationException");
     }
@@ -7613,7 +7780,7 @@ mod tests {
     fn put_item_accepts_well_formed_n_including_nested() {
         let at_cap = "9".repeat(animus_item::numkey::MAX_SIGNIFICANT_DIGITS);
         let body = format!(
-            r#"{{"TableName":"t","Item":{{"pk":{{"S":"p"}},"n":{{"N":"{at_cap}"}},
+            r#"{{"TableName":"tbl","Item":{{"pk":{{"S":"p"}},"n":{{"N":"{at_cap}"}},
             "nested":{{"M":{{"inner":{{"N":"3.14"}}}}}}}}}}"#
         );
         decode_request("DynamoDB_20120810.PutItem", body.as_bytes())
@@ -7626,8 +7793,9 @@ mod tests {
     #[test]
     fn put_item_rejects_empty_sets() {
         for (ty, val) in [("SS", "[]"), ("NS", "[]"), ("BS", "[]")] {
-            let body =
-                format!(r#"{{"TableName":"t","Item":{{"pk":{{"S":"p"}},"t":{{"{ty}":{val}}}}}}}"#);
+            let body = format!(
+                r#"{{"TableName":"tbl","Item":{{"pk":{{"S":"p"}},"tbl":{{"{ty}":{val}}}}}}}"#
+            );
             let err = decode_request("DynamoDB_20120810.PutItem", body.as_bytes()).unwrap_err();
             assert_eq!(err.code, "ValidationException", "for {ty}");
             assert!(
@@ -7640,7 +7808,7 @@ mod tests {
 
     #[test]
     fn update_item_add_rejects_an_empty_set_operand() {
-        let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+        let body = br#"{"TableName":"tbl","Key":{"id":{"S":"k"}},
             "UpdateExpression":"ADD tags :empty",
             "ExpressionAttributeValues":{":empty":{"SS":[]}}}"#;
         let err = decode_request("DynamoDB_20120810.UpdateItem", body).unwrap_err();
@@ -7650,7 +7818,7 @@ mod tests {
     /// A non-empty set is unaffected.
     #[test]
     fn put_item_accepts_a_non_empty_set() {
-        let body = br#"{"TableName":"t","Item":{"pk":{"S":"p"},"t":{"SS":["a"]}}}"#;
+        let body = br#"{"TableName":"tbl","Item":{"pk":{"S":"p"},"tbl":{"SS":["a"]}}}"#;
         decode_request("DynamoDB_20120810.PutItem", body).expect("non-empty SS should decode");
     }
 
@@ -7699,7 +7867,7 @@ mod tests {
 
     #[test]
     fn set_decode_sorts_and_dedups() {
-        let body = br#"{"TableName":"t","Item":{"id":{"S":"k"},
+        let body = br#"{"TableName":"tbl","Item":{"id":{"S":"k"},
             "tags":{"SS":["c","a","a","b"]}}}"#;
         let Operation::PutItem { item, .. } =
             decode_request("DynamoDB_20120810.PutItem", body).unwrap()
@@ -7732,7 +7900,7 @@ mod tests {
 
     #[test]
     fn decodes_projection_expression_with_name_aliases() {
-        let body = br##"{"TableName":"t","Key":{"id":{"S":"k"}},
+        let body = br##"{"TableName":"tbl","Key":{"id":{"S":"k"}},
             "ProjectionExpression":"id, #n",
             "ExpressionAttributeNames":{"#n":"name"}}"##;
         let Operation::GetItem { projection, .. } =
@@ -7748,7 +7916,7 @@ mod tests {
 
     #[test]
     fn decodes_attributes_to_get_legacy_projection() {
-        let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+        let body = br#"{"TableName":"tbl","Key":{"id":{"S":"k"}},
             "AttributesToGet":["id","name"]}"#;
         let Operation::GetItem { projection, .. } =
             decode_request("DynamoDB_20120810.GetItem", body).unwrap()
@@ -7764,7 +7932,7 @@ mod tests {
     #[test]
     fn decodes_document_path_projection() {
         // Document-path projections (`a.b`) are supported.
-        let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+        let body = br#"{"TableName":"tbl","Key":{"id":{"S":"k"}},
             "ProjectionExpression":"a.b, c"}"#;
         let Operation::GetItem { projection, .. } =
             decode_request("DynamoDB_20120810.GetItem", body).unwrap()
@@ -7785,7 +7953,7 @@ mod tests {
 
     #[test]
     fn decodes_list_index_projection() {
-        let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+        let body = br#"{"TableName":"tbl","Key":{"id":{"S":"k"}},
             "ProjectionExpression":"a[0], a[0].b, matrix[1][2]"}"#;
         let Operation::GetItem { projection, .. } =
             decode_request("DynamoDB_20120810.GetItem", body).unwrap()
@@ -7814,7 +7982,7 @@ mod tests {
     fn decodes_list_index_projection_with_alias() {
         // `#p[0]` — the alias resolves the name part; the index suffix rides
         // straight through.
-        let body = br##"{"TableName":"t","Key":{"id":{"S":"k"}},
+        let body = br##"{"TableName":"tbl","Key":{"id":{"S":"k"}},
             "ProjectionExpression":"#p[0]",
             "ExpressionAttributeNames":{"#p":"list"}}"##;
         let Operation::GetItem { projection, .. } =
@@ -7835,7 +8003,7 @@ mod tests {
     fn rejects_malformed_list_index_syntax() {
         for expr in ["a[", "a[x]", "a[-1]", "a[0", "a]0[", "[0]"] {
             let body = format!(
-                r#"{{"TableName":"t","Key":{{"id":{{"S":"k"}}}},
+                r#"{{"TableName":"tbl","Key":{{"id":{{"S":"k"}}}},
                     "ProjectionExpression":"{expr}"}}"#
             );
             let result = decode_request("DynamoDB_20120810.GetItem", body.as_bytes());
@@ -7966,7 +8134,7 @@ mod tests {
 
     #[test]
     fn decodes_return_values_all_old() {
-        let body = br#"{"TableName":"t","Item":{"id":{"S":"k"}},
+        let body = br#"{"TableName":"tbl","Item":{"id":{"S":"k"}},
             "ReturnValues":"ALL_OLD"}"#;
         let Operation::PutItem { return_values, .. } =
             decode_request("DynamoDB_20120810.PutItem", body).unwrap()
@@ -8066,7 +8234,7 @@ mod tests {
 
     #[test]
     fn decodes_create_table_with_composite_key() {
-        let body = br#"{"TableName":"t",
+        let body = br#"{"TableName":"tbl",
             "KeySchema":[{"AttributeName":"pk","KeyType":"HASH"},
                          {"AttributeName":"sk","KeyType":"RANGE"}],
             "AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"},
@@ -8079,7 +8247,7 @@ mod tests {
                 indexes,
                 ..
             } => {
-                assert_eq!(table, "t");
+                assert_eq!(table, "tbl");
                 assert_eq!(schema, TableSchema::composite("pk", "sk"));
                 assert_eq!(
                     key_types,
@@ -8096,7 +8264,7 @@ mod tests {
 
     #[test]
     fn create_table_simple_key() {
-        let body = br#"{"TableName":"t",
+        let body = br#"{"TableName":"tbl",
             "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#;
         match decode_request("DynamoDB_20120810.CreateTable", body).unwrap() {
@@ -8109,7 +8277,7 @@ mod tests {
 
     #[test]
     fn decodes_put_with_attribute_not_exists_condition() {
-        let body = br#"{"TableName":"t","Item":{"pk":{"S":"a"}},
+        let body = br#"{"TableName":"tbl","Item":{"pk":{"S":"a"}},
             "ConditionExpression":"attribute_not_exists(pk)"}"#;
         let Operation::PutItem { condition, .. } =
             decode_request("DynamoDB_20120810.PutItem", body).unwrap()
@@ -8124,7 +8292,7 @@ mod tests {
 
     #[test]
     fn decodes_put_with_equality_condition() {
-        let body = br#"{"TableName":"t","Item":{"pk":{"S":"a"}},
+        let body = br#"{"TableName":"tbl","Item":{"pk":{"S":"a"}},
             "ConditionExpression":"v = :want",
             "ExpressionAttributeValues":{":want":{"N":"7"}}}"#;
         let Operation::PutItem { condition, .. } =
@@ -8144,7 +8312,7 @@ mod tests {
 
     #[test]
     fn decodes_query_partition_only() {
-        let body = br#"{"TableName":"t",
+        let body = br#"{"TableName":"tbl",
             "KeyConditionExpression":"pk = :p",
             "ExpressionAttributeValues":{":p":{"S":"part"}}}"#;
         match decode_request("DynamoDB_20120810.Query", body).unwrap() {
@@ -8170,7 +8338,7 @@ mod tests {
                     Select::AllAttributes,
                     "a base-table read with no projection defaults to ALL_ATTRIBUTES"
                 );
-                assert_eq!(table, "t");
+                assert_eq!(table, "tbl");
                 assert_eq!(index, None);
                 assert_eq!(partition_attr, "pk", "the key name is carried, not dropped");
                 assert_eq!(partition_value, s("part"));
@@ -8193,7 +8361,7 @@ mod tests {
     /// this crate used to have (`decode_query` never parsed either field).
     #[test]
     fn decodes_query_with_limit_and_exclusive_start_key() {
-        let body = br#"{"TableName":"t","Limit":3,
+        let body = br#"{"TableName":"tbl","Limit":3,
             "ExclusiveStartKey":{"pk":{"S":"part"},"sk":{"S":"k5"}},
             "KeyConditionExpression":"pk = :p",
             "ExpressionAttributeValues":{":p":{"S":"part"}}}"#;
@@ -8218,7 +8386,7 @@ mod tests {
     /// property directly for the pagination fields.
     #[test]
     fn decodes_query_without_limit_or_exclusive_start_key() {
-        let body = br#"{"TableName":"t",
+        let body = br#"{"TableName":"tbl",
             "KeyConditionExpression":"pk = :p",
             "ExpressionAttributeValues":{":p":{"S":"part"}}}"#;
         match decode_request("DynamoDB_20120810.Query", body).unwrap() {
@@ -8238,7 +8406,7 @@ mod tests {
     /// `Limit` validation (`decode_limit` is now shared between the two).
     #[test]
     fn rejects_non_integer_query_limit() {
-        let body = br#"{"TableName":"t","Limit":"two",
+        let body = br#"{"TableName":"tbl","Limit":"two",
             "KeyConditionExpression":"pk = :p",
             "ExpressionAttributeValues":{":p":{"S":"part"}}}"#;
         let err = decode_request("DynamoDB_20120810.Query", body).unwrap_err();
@@ -8252,7 +8420,7 @@ mod tests {
     /// catalog needed to know an index's kind.
     #[test]
     fn decodes_consistent_read_true_on_get_item_query_and_scan() {
-        let get = br#"{"TableName":"t","Key":{"pk":{"S":"a"}},"ConsistentRead":true}"#;
+        let get = br#"{"TableName":"tbl","Key":{"pk":{"S":"a"}},"ConsistentRead":true}"#;
         let Operation::GetItem {
             consistent_read, ..
         } = decode_request("DynamoDB_20120810.GetItem", get).unwrap()
@@ -8261,7 +8429,7 @@ mod tests {
         };
         assert!(consistent_read);
 
-        let query = br#"{"TableName":"t",
+        let query = br#"{"TableName":"tbl",
             "KeyConditionExpression":"pk = :p",
             "ExpressionAttributeValues":{":p":{"S":"part"}},
             "ConsistentRead":true}"#;
@@ -8273,7 +8441,7 @@ mod tests {
         };
         assert!(consistent_read);
 
-        let scan = br#"{"TableName":"t","ConsistentRead":true}"#;
+        let scan = br#"{"TableName":"tbl","ConsistentRead":true}"#;
         let Operation::Scan {
             consistent_read, ..
         } = decode_request("DynamoDB_20120810.Scan", scan).unwrap()
@@ -8289,7 +8457,7 @@ mod tests {
     /// happy-path decode test elsewhere uses `..`.
     #[test]
     fn get_item_consistent_read_defaults_to_false() {
-        let body = br#"{"TableName":"t","Key":{"pk":{"S":"a"}}}"#;
+        let body = br#"{"TableName":"tbl","Key":{"pk":{"S":"a"}}}"#;
         let Operation::GetItem {
             consistent_read, ..
         } = decode_request("DynamoDB_20120810.GetItem", body).unwrap()
@@ -8304,7 +8472,7 @@ mod tests {
     /// rode through as `None` and the edge returned unfiltered results.
     #[test]
     fn decodes_query_filter_expression() {
-        let body = br#"{"TableName":"t",
+        let body = br#"{"TableName":"tbl",
             "KeyConditionExpression":"pk = :p",
             "FilterExpression":"kind = :k",
             "ExpressionAttributeValues":{":p":{"S":"x"},":k":{"S":"blue"}}}"#;
@@ -8323,7 +8491,7 @@ mod tests {
         );
 
         // The function forms decode too.
-        let body = br#"{"TableName":"t",
+        let body = br#"{"TableName":"tbl",
             "KeyConditionExpression":"pk = :p",
             "FilterExpression":"attribute_not_exists(gone)",
             "ExpressionAttributeValues":{":p":{"S":"x"}}}"#;
@@ -8338,7 +8506,7 @@ mod tests {
         );
 
         // Absent stays `None` rather than defaulting to something permissive.
-        let body = br#"{"TableName":"t",
+        let body = br#"{"TableName":"tbl",
             "KeyConditionExpression":"pk = :p",
             "ExpressionAttributeValues":{":p":{"S":"x"}}}"#;
         let Operation::Query { filter, .. } =
@@ -8352,7 +8520,7 @@ mod tests {
     #[test]
     fn decodes_query_sort_conditions() {
         // equality
-        let body = br#"{"TableName":"t",
+        let body = br#"{"TableName":"tbl",
             "KeyConditionExpression":"pk = :p AND sk = :s",
             "ExpressionAttributeValues":{":p":{"S":"x"},":s":{"S":"y"}}}"#;
         let Operation::Query { sort_condition, .. } =
@@ -8366,7 +8534,7 @@ mod tests {
         );
 
         // between (mixed case AND/BETWEEN)
-        let body = br#"{"TableName":"t",
+        let body = br#"{"TableName":"tbl",
             "KeyConditionExpression":"pk = :p and sk between :lo and :hi",
             "ExpressionAttributeValues":{":p":{"S":"x"},":lo":{"S":"a"},":hi":{"S":"m"}}}"#;
         let Operation::Query { sort_condition, .. } =
@@ -8380,7 +8548,7 @@ mod tests {
         );
 
         // begins_with
-        let body = br#"{"TableName":"t",
+        let body = br#"{"TableName":"tbl",
             "KeyConditionExpression":"pk = :p AND begins_with(sk, :pre)",
             "ExpressionAttributeValues":{":p":{"S":"x"},":pre":{"S":"ab"}}}"#;
         let Operation::Query { sort_condition, .. } =
@@ -8400,7 +8568,7 @@ mod tests {
     fn decodes_query_sort_range_operators() {
         let decode = |op: &str| {
             let body = format!(
-                r#"{{"TableName":"t",
+                r#"{{"TableName":"tbl",
                     "KeyConditionExpression":"pk = :p AND sk {op} :s",
                     "ExpressionAttributeValues":{{":p":{{"S":"x"}},":s":{{"N":"5"}}}}}}"#
             );
@@ -8435,7 +8603,7 @@ mod tests {
     /// four comparators opened up.
     #[test]
     fn key_condition_rejects_not_equal() {
-        let body = br#"{"TableName":"t",
+        let body = br#"{"TableName":"tbl",
             "KeyConditionExpression":"pk = :p AND sk <> :s",
             "ExpressionAttributeValues":{":p":{"S":"x"},":s":{"N":"5"}}}"#;
         let err = decode_request("DynamoDB_20120810.Query", body).unwrap_err();
@@ -8448,7 +8616,8 @@ mod tests {
 
     #[test]
     fn create_table_response_shape() {
-        let body = create_table_response("t", &TableSchema::composite("pk", "sk"), &[], None, None);
+        let body =
+            create_table_response("tbl", &TableSchema::composite("pk", "sk"), &[], None, None);
         assert!(body.contains("\"TableStatus\":\"ACTIVE\""));
         assert!(body.contains("\"HASH\""));
         assert!(body.contains("\"RANGE\""));
@@ -8462,11 +8631,12 @@ mod tests {
             view_type: StreamViewType::NewAndOldImages,
             label: "2026-08-14T00:00:00.000-n1".into(),
         };
-        let body = create_table_response("t", &TableSchema::simple("id"), &[], Some(&stream), None);
+        let body =
+            create_table_response("tbl", &TableSchema::simple("id"), &[], Some(&stream), None);
         assert!(body.contains("\"StreamEnabled\":true"));
         assert!(body.contains("\"StreamViewType\":\"NEW_AND_OLD_IMAGES\""));
         assert!(body.contains(
-            "\"LatestStreamArn\":\"arn:aws:dynamodb:animus:0:table/t/stream/2026-08-14T00:00:00.000-n1\""
+            "\"LatestStreamArn\":\"arn:aws:dynamodb:animus:0:table/tbl/stream/2026-08-14T00:00:00.000-n1\""
         ));
         assert!(body.contains("\"LatestStreamLabel\""));
     }
@@ -8478,7 +8648,7 @@ mod tests {
             label: "lbl".into(),
         };
         let body = describe_table_response(
-            "t",
+            "tbl",
             &TableSchema::composite("pk", "sk"),
             &[("pk".into(), "S".into()), ("sk".into(), "N".into())],
             &[],
@@ -8537,7 +8707,7 @@ mod tests {
             ("rank".to_owned(), "B".to_owned()),
         ];
         let body = describe_table_response(
-            "t",
+            "tbl",
             &TableSchema::simple("id"),
             &key_types,
             &[gsi, lsi],
@@ -8598,7 +8768,7 @@ mod tests {
             (IndexStatus::Deleting, "DELETING", false),
         ] {
             let body = describe_table_response(
-                "t",
+                "tbl",
                 &TableSchema::simple("id"),
                 &[],
                 std::slice::from_ref(&gsi),
@@ -8635,7 +8805,7 @@ mod tests {
             sort_attribute: None,
             projection: IndexProjection::All,
         });
-        let body = create_table_response("t", &TableSchema::simple("id"), &[gsi], None, None);
+        let body = create_table_response("tbl", &TableSchema::simple("id"), &[gsi], None, None);
         assert!(body.contains("\"IndexStatus\":\"ACTIVE\""));
         assert!(!body.contains("Backfilling"));
     }
@@ -8647,7 +8817,7 @@ mod tests {
             label: "lbl".into(),
         };
         let body = delete_table_response(
-            "t",
+            "tbl",
             &TableSchema::composite("pk", "sk"),
             &[("pk".into(), "S".into()), ("sk".into(), "N".into())],
             &[],
@@ -8665,7 +8835,7 @@ mod tests {
         assert!(body.contains("\"AttributeDefinitions\""));
         assert!(body.contains("\"AttributeType\":\"N\""));
         assert!(body.contains("\"StreamViewType\":\"KEYS_ONLY\""));
-        assert!(body.contains("\"TableName\":\"t\""));
+        assert!(body.contains("\"TableName\":\"tbl\""));
     }
 
     #[test]
@@ -8743,7 +8913,7 @@ mod tests {
 
     #[test]
     fn decodes_update_table_stream_enable_and_disable() {
-        let enable = br#"{"TableName":"t","StreamSpecification":
+        let enable = br#"{"TableName":"tbl","StreamSpecification":
             {"StreamEnabled":true,"StreamViewType":"NEW_IMAGE"}}"#;
         match decode_request("DynamoDB_20120810.UpdateTable", enable).unwrap() {
             Operation::UpdateTable {
@@ -8752,14 +8922,14 @@ mod tests {
                 index_update,
                 ..
             } => {
-                assert_eq!(table, "t");
+                assert_eq!(table, "tbl");
                 assert_eq!(stream, Some(StreamUpdate::Enable(StreamViewType::NewImage)));
                 assert_eq!(index_update, None);
             }
             other => panic!("expected UpdateTable, got {other:?}"),
         }
 
-        let disable = br#"{"TableName":"t","StreamSpecification":{"StreamEnabled":false}}"#;
+        let disable = br#"{"TableName":"tbl","StreamSpecification":{"StreamEnabled":false}}"#;
         match decode_request("DynamoDB_20120810.UpdateTable", disable).unwrap() {
             Operation::UpdateTable { stream, .. } => {
                 assert_eq!(stream, Some(StreamUpdate::Disable));
@@ -8770,14 +8940,14 @@ mod tests {
 
     #[test]
     fn update_table_rejects_an_empty_index_updates_array() {
-        let body = br#"{"TableName":"t","GlobalSecondaryIndexUpdates":[]}"#;
+        let body = br#"{"TableName":"tbl","GlobalSecondaryIndexUpdates":[]}"#;
         let err = decode_request("DynamoDB_20120810.UpdateTable", body).unwrap_err();
         assert_eq!(err.code, "ValidationException");
     }
 
     #[test]
     fn update_table_rejects_more_than_one_index_updates_element() {
-        let body = br#"{"TableName":"t","GlobalSecondaryIndexUpdates":[
+        let body = br#"{"TableName":"tbl","GlobalSecondaryIndexUpdates":[
             {"Delete":{"IndexName":"a"}},{"Delete":{"IndexName":"b"}}]}"#;
         let err = decode_request("DynamoDB_20120810.UpdateTable", body).unwrap_err();
         assert_eq!(err.code, "ValidationException");
@@ -8785,7 +8955,7 @@ mod tests {
 
     #[test]
     fn update_table_decodes_a_delete_index_update() {
-        let body = br#"{"TableName":"t","GlobalSecondaryIndexUpdates":[
+        let body = br#"{"TableName":"tbl","GlobalSecondaryIndexUpdates":[
             {"Delete":{"IndexName":"by-email"}}]}"#;
         match decode_request("DynamoDB_20120810.UpdateTable", body).unwrap() {
             Operation::UpdateTable {
@@ -8795,7 +8965,7 @@ mod tests {
                 key_types,
                 ..
             } => {
-                assert_eq!(table, "t");
+                assert_eq!(table, "tbl");
                 assert_eq!(stream, None);
                 assert_eq!(
                     index_update,
@@ -8809,7 +8979,7 @@ mod tests {
 
     #[test]
     fn update_table_decodes_a_create_index_update() {
-        let body = br#"{"TableName":"t",
+        let body = br#"{"TableName":"tbl",
             "AttributeDefinitions":[{"AttributeName":"email","AttributeType":"S"}],
             "GlobalSecondaryIndexUpdates":[
             {"Create":{"IndexName":"by-email",
@@ -8822,7 +8992,7 @@ mod tests {
                 key_types,
                 ..
             } => {
-                assert_eq!(table, "t");
+                assert_eq!(table, "tbl");
                 match index_update {
                     Some(IndexUpdate::Create(SecondaryIndex::Global(gsi))) => {
                         assert_eq!(gsi.name, "by-email");
@@ -8846,7 +9016,7 @@ mod tests {
     /// to `S`.
     #[test]
     fn update_table_create_index_decodes_attribute_definitions() {
-        let body = br#"{"TableName":"t",
+        let body = br#"{"TableName":"tbl",
             "AttributeDefinitions":[{"AttributeName":"score","AttributeType":"N"}],
             "GlobalSecondaryIndexUpdates":[
             {"Create":{"IndexName":"by-score",
@@ -8862,7 +9032,7 @@ mod tests {
 
     #[test]
     fn update_table_rejects_an_update_shaped_index_element() {
-        let body = br#"{"TableName":"t","GlobalSecondaryIndexUpdates":[
+        let body = br#"{"TableName":"tbl","GlobalSecondaryIndexUpdates":[
             {"Update":{"IndexName":"by-email"}}]}"#;
         let err = decode_request("DynamoDB_20120810.UpdateTable", body).unwrap_err();
         assert_eq!(err.code, "ValidationException");
@@ -8877,7 +9047,7 @@ mod tests {
 
     #[test]
     fn update_table_rejects_index_and_stream_change_together() {
-        let body = br#"{"TableName":"t",
+        let body = br#"{"TableName":"tbl",
             "GlobalSecondaryIndexUpdates":[{"Delete":{"IndexName":"by-email"}}],
             "StreamSpecification":{"StreamEnabled":false}}"#;
         let err = decode_request("DynamoDB_20120810.UpdateTable", body).unwrap_err();
@@ -8886,14 +9056,14 @@ mod tests {
 
     #[test]
     fn update_table_requires_stream_specification_or_index_updates() {
-        let body = br#"{"TableName":"t"}"#;
+        let body = br#"{"TableName":"tbl"}"#;
         let err = decode_request("DynamoDB_20120810.UpdateTable", body).unwrap_err();
         assert_eq!(err.code, "ValidationException");
     }
 
     #[test]
     fn update_table_rejects_sse_specification() {
-        let body = br#"{"TableName":"t","SSESpecification":{"Enabled":true}}"#;
+        let body = br#"{"TableName":"tbl","SSESpecification":{"Enabled":true}}"#;
         let err = decode_request("DynamoDB_20120810.UpdateTable", body).unwrap_err();
         assert_eq!(err.code, "ValidationException");
         assert_eq!(
@@ -8904,7 +9074,8 @@ mod tests {
 
     #[test]
     fn update_table_rejects_replica_updates() {
-        let body = br#"{"TableName":"t","ReplicaUpdates":[{"Create":{"RegionName":"us-west-2"}}]}"#;
+        let body =
+            br#"{"TableName":"tbl","ReplicaUpdates":[{"Create":{"RegionName":"us-west-2"}}]}"#;
         let err = decode_request("DynamoDB_20120810.UpdateTable", body).unwrap_err();
         assert_eq!(err.code, "ValidationException");
         assert_eq!(err.message, "UpdateTable: ReplicaUpdates is not supported");
@@ -8915,7 +9086,7 @@ mod tests {
     /// an already-`PROVISIONED` table.
     #[test]
     fn update_table_decodes_provisioned_throughput_without_restating_billing_mode() {
-        let body = br#"{"TableName":"t",
+        let body = br#"{"TableName":"tbl",
             "ProvisionedThroughput":{"ReadCapacityUnits":5,"WriteCapacityUnits":10}}"#;
         match decode_request("DynamoDB_20120810.UpdateTable", body).unwrap() {
             Operation::UpdateTable {
@@ -8937,7 +9108,7 @@ mod tests {
     /// same `Some(Some(spec))` shape, explicit `BillingMode` and all.
     #[test]
     fn update_table_decodes_billing_mode_provisioned_with_throughput() {
-        let body = br#"{"TableName":"t","BillingMode":"PROVISIONED",
+        let body = br#"{"TableName":"tbl","BillingMode":"PROVISIONED",
             "ProvisionedThroughput":{"ReadCapacityUnits":5,"WriteCapacityUnits":5}}"#;
         match decode_request("DynamoDB_20120810.UpdateTable", body).unwrap() {
             Operation::UpdateTable {
@@ -8959,7 +9130,7 @@ mod tests {
     /// rejected.
     #[test]
     fn update_table_rejects_provisioned_billing_mode_without_throughput() {
-        let body = br#"{"TableName":"t","BillingMode":"PROVISIONED"}"#;
+        let body = br#"{"TableName":"tbl","BillingMode":"PROVISIONED"}"#;
         let err = decode_request("DynamoDB_20120810.UpdateTable", body).unwrap_err();
         assert_eq!(err.code, "ValidationException");
     }
@@ -8967,7 +9138,7 @@ mod tests {
     /// A genuinely unsupported `BillingMode` value is rejected by name.
     #[test]
     fn update_table_rejects_an_unsupported_billing_mode_value() {
-        let body = br#"{"TableName":"t","BillingMode":"WEIRD"}"#;
+        let body = br#"{"TableName":"tbl","BillingMode":"WEIRD"}"#;
         let err = decode_request("DynamoDB_20120810.UpdateTable", body).unwrap_err();
         assert_eq!(err.code, "ValidationException");
         assert!(err.message.contains("BillingMode"), "{}", err.message);
@@ -8979,7 +9150,7 @@ mod tests {
     /// §5(b) extends Fork C's "exactly one change per call" rule).
     #[test]
     fn update_table_rejects_billing_mode_provisioned_combined_with_stream_change() {
-        let body = br#"{"TableName":"t","BillingMode":"PROVISIONED",
+        let body = br#"{"TableName":"tbl","BillingMode":"PROVISIONED",
             "StreamSpecification":{"StreamEnabled":false}}"#;
         let err = decode_request("DynamoDB_20120810.UpdateTable", body).unwrap_err();
         assert_eq!(err.code, "ValidationException");
@@ -8992,7 +9163,7 @@ mod tests {
         // (see CreateTable, which accepts and never inspects it); restating
         // it on UpdateTable is a common SDK/CLI habit and must not block an
         // otherwise-valid stream/index change.
-        let body = br#"{"TableName":"t","BillingMode":"PAY_PER_REQUEST",
+        let body = br#"{"TableName":"tbl","BillingMode":"PAY_PER_REQUEST",
             "StreamSpecification":{"StreamEnabled":false}}"#;
         match decode_request("DynamoDB_20120810.UpdateTable", body).unwrap() {
             Operation::UpdateTable { stream, .. } => {
@@ -9009,7 +9180,7 @@ mod tests {
     /// back to unthrottled.
     #[test]
     fn update_table_billing_mode_pay_per_request_alone_reverts_throughput() {
-        let body = br#"{"TableName":"t","BillingMode":"PAY_PER_REQUEST"}"#;
+        let body = br#"{"TableName":"tbl","BillingMode":"PAY_PER_REQUEST"}"#;
         match decode_request("DynamoDB_20120810.UpdateTable", body).unwrap() {
             Operation::UpdateTable {
                 throughput_update, ..
@@ -9020,7 +9191,7 @@ mod tests {
 
     #[test]
     fn decodes_create_table_with_stream_enabled() {
-        let body = br#"{"TableName":"t",
+        let body = br#"{"TableName":"tbl",
             "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "StreamSpecification":{"StreamEnabled":true,"StreamViewType":"OLD_IMAGE"}}"#;
@@ -9036,7 +9207,7 @@ mod tests {
 
     #[test]
     fn decodes_create_table_with_stream_disabled_or_absent() {
-        let disabled = br#"{"TableName":"t",
+        let disabled = br#"{"TableName":"tbl",
             "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "StreamSpecification":{"StreamEnabled":false}}"#;
@@ -9047,7 +9218,7 @@ mod tests {
             other => panic!("expected CreateTable, got {other:?}"),
         }
 
-        let absent = br#"{"TableName":"t",
+        let absent = br#"{"TableName":"tbl",
             "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#;
         match decode_request("DynamoDB_20120810.CreateTable", absent).unwrap() {
@@ -9060,7 +9231,7 @@ mod tests {
 
     #[test]
     fn decodes_create_table_with_gsi() {
-        let body = br#"{"TableName":"t",
+        let body = br#"{"TableName":"tbl",
             "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"},
                                      {"AttributeName":"email","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
@@ -9086,7 +9257,7 @@ mod tests {
 
     #[test]
     fn decodes_composite_gsi_and_lsi() {
-        let body = br#"{"TableName":"t",
+        let body = br#"{"TableName":"tbl",
             "AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"},
                                      {"AttributeName":"sk","AttributeType":"S"},
                                      {"AttributeName":"a","AttributeType":"S"},
@@ -9095,11 +9266,11 @@ mod tests {
             "KeySchema":[{"AttributeName":"pk","KeyType":"HASH"},
                          {"AttributeName":"sk","KeyType":"RANGE"}],
             "GlobalSecondaryIndexes":[
-                {"IndexName":"g",
+                {"IndexName":"gsi",
                  "KeySchema":[{"AttributeName":"a","KeyType":"HASH"},
                               {"AttributeName":"b","KeyType":"RANGE"}]}],
             "LocalSecondaryIndexes":[
-                {"IndexName":"l",
+                {"IndexName":"lsi",
                  "KeySchema":[{"AttributeName":"pk","KeyType":"HASH"},
                               {"AttributeName":"alt","KeyType":"RANGE"}]}]}"#;
         match decode_request("DynamoDB_20120810.CreateTable", body).unwrap() {
@@ -9108,13 +9279,13 @@ mod tests {
                     indexes,
                     vec![
                         SecondaryIndex::Global(GlobalSecondaryIndex {
-                            name: "g".into(),
+                            name: "gsi".into(),
                             key_attribute: "a".into(),
                             sort_attribute: Some("b".into()),
                             projection: IndexProjection::All,
                         }),
                         SecondaryIndex::Local(LocalSecondaryIndex {
-                            name: "l".into(),
+                            name: "lsi".into(),
                             sort_attribute: "alt".into(),
                             projection: IndexProjection::All,
                         }),
@@ -9127,11 +9298,11 @@ mod tests {
 
     #[test]
     fn rejects_lsi_with_wrong_partition_key() {
-        let body = br#"{"TableName":"t",
+        let body = br#"{"TableName":"tbl",
             "KeySchema":[{"AttributeName":"pk","KeyType":"HASH"},
                          {"AttributeName":"sk","KeyType":"RANGE"}],
             "LocalSecondaryIndexes":[
-                {"IndexName":"l",
+                {"IndexName":"lsi",
                  "KeySchema":[{"AttributeName":"other","KeyType":"HASH"},
                               {"AttributeName":"alt","KeyType":"RANGE"}]}]}"#;
         let err = decode_request("DynamoDB_20120810.CreateTable", body).unwrap_err();
@@ -9140,7 +9311,7 @@ mod tests {
 
     #[test]
     fn decodes_query_against_an_index() {
-        let body = br#"{"TableName":"t","IndexName":"by-email",
+        let body = br#"{"TableName":"tbl","IndexName":"by-email",
             "KeyConditionExpression":"email = :e",
             "ExpressionAttributeValues":{":e":{"S":"a@x"}}}"#;
         match decode_request("DynamoDB_20120810.Query", body).unwrap() {
@@ -9160,7 +9331,7 @@ mod tests {
 
     #[test]
     fn decodes_scan_with_limit_and_filter() {
-        let body = br#"{"TableName":"t","Limit":2,
+        let body = br#"{"TableName":"tbl","Limit":2,
             "ExclusiveStartKey":{"id":{"S":"k5"}},
             "FilterExpression":"attribute_exists(v)"}"#;
         match decode_request("DynamoDB_20120810.Scan", body).unwrap() {
@@ -9175,7 +9346,7 @@ mod tests {
                 segment,
                 consistent_read,
             } => {
-                assert_eq!(table, "t");
+                assert_eq!(table, "tbl");
                 assert_eq!(index, None);
                 assert_eq!(limit, Some(2));
                 assert_eq!(select, Select::AllAttributes);
@@ -9197,10 +9368,10 @@ mod tests {
     /// `decodes_scan_with_limit_and_filter`).
     #[test]
     fn decodes_scan_against_an_index() {
-        let body = br#"{"TableName":"t","IndexName":"by-email","Limit":5}"#;
+        let body = br#"{"TableName":"tbl","IndexName":"by-email","Limit":5}"#;
         match decode_request("DynamoDB_20120810.Scan", body).unwrap() {
             Operation::Scan { table, index, .. } => {
-                assert_eq!(table, "t");
+                assert_eq!(table, "tbl");
                 assert_eq!(index.as_deref(), Some("by-email"));
             }
             other => panic!("expected Scan, got {other:?}"),
@@ -9224,7 +9395,7 @@ mod tests {
 
     #[test]
     fn decodes_update_item_set_and_remove() {
-        let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+        let body = br#"{"TableName":"tbl","Key":{"id":{"S":"k"}},
             "UpdateExpression":"SET a = :v, b = :w REMOVE c",
             "ExpressionAttributeValues":{":v":{"S":"x"},":w":{"N":"3"}},
             "ReturnValues":"ALL_NEW"}"#;
@@ -9251,7 +9422,7 @@ mod tests {
     /// text is rejected.
     #[test]
     fn decodes_update_item_with_leading_whitespace() {
-        let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+        let body = br#"{"TableName":"tbl","Key":{"id":{"S":"k"}},
             "UpdateExpression":"   SET x = :v",
             "ExpressionAttributeValues":{":v":{"S":"y"}}}"#;
         let Operation::UpdateItem { actions, .. } =
@@ -9270,7 +9441,7 @@ mod tests {
     /// :v`) instead of being rejected.
     #[test]
     fn rejects_update_expression_with_leading_garbage() {
-        let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+        let body = br#"{"TableName":"tbl","Key":{"id":{"S":"k"}},
             "UpdateExpression":"foo SET x = :v",
             "ExpressionAttributeValues":{":v":{"S":"y"}}}"#;
         let err = decode_request("DynamoDB_20120810.UpdateItem", body).unwrap_err();
@@ -9283,7 +9454,7 @@ mod tests {
     /// keyword — issue #372.
     #[test]
     fn unaliased_reserved_word_as_top_level_attribute_parses() {
-        let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+        let body = br#"{"TableName":"tbl","Key":{"id":{"S":"k"}},
             "UpdateExpression":"SET set = :v",
             "ExpressionAttributeValues":{":v":{"S":"x"}}}"#;
         let Operation::UpdateItem { actions, .. } =
@@ -9301,7 +9472,7 @@ mod tests {
     /// clause's comma-separated action list.
     #[test]
     fn reserved_words_as_attribute_names_in_a_set_action_list() {
-        let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+        let body = br#"{"TableName":"tbl","Key":{"id":{"S":"k"}},
             "UpdateExpression":"SET add = :v, remove = :w",
             "ExpressionAttributeValues":{":v":{"S":"x"},":w":{"S":"y"}}}"#;
         let Operation::UpdateItem { actions, .. } =
@@ -9321,7 +9492,7 @@ mod tests {
     /// A reserved word as the sole `REMOVE` target.
     #[test]
     fn reserved_word_as_remove_target() {
-        let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+        let body = br#"{"TableName":"tbl","Key":{"id":{"S":"k"}},
             "UpdateExpression":"REMOVE set"}"#;
         let Operation::UpdateItem { actions, .. } =
             decode_request("DynamoDB_20120810.UpdateItem", body).unwrap()
@@ -9334,7 +9505,7 @@ mod tests {
     /// Two reserved words in one `REMOVE` action list.
     #[test]
     fn reserved_words_in_a_remove_action_list() {
-        let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+        let body = br#"{"TableName":"tbl","Key":{"id":{"S":"k"}},
             "UpdateExpression":"REMOVE remove, delete"}"#;
         let Operation::UpdateItem { actions, .. } =
             decode_request("DynamoDB_20120810.UpdateItem", body).unwrap()
@@ -9353,7 +9524,7 @@ mod tests {
     /// A reserved word as an `ADD` target.
     #[test]
     fn reserved_word_as_add_target() {
-        let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+        let body = br#"{"TableName":"tbl","Key":{"id":{"S":"k"}},
             "UpdateExpression":"ADD add :n",
             "ExpressionAttributeValues":{":n":{"N":"1"}}}"#;
         let Operation::UpdateItem { actions, .. } =
@@ -9373,7 +9544,7 @@ mod tests {
     /// A reserved word as a `DELETE` target.
     #[test]
     fn reserved_word_as_delete_target() {
-        let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+        let body = br#"{"TableName":"tbl","Key":{"id":{"S":"k"}},
             "UpdateExpression":"DELETE delete :ss",
             "ExpressionAttributeValues":{":ss":{"SS":["a"]}}}"#;
         let Operation::UpdateItem { actions, .. } =
@@ -9397,7 +9568,7 @@ mod tests {
     /// every other occurrence as a plain attribute name.
     #[test]
     fn mixed_multi_clause_reserved_word_attributes_parse() {
-        let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+        let body = br#"{"TableName":"tbl","Key":{"id":{"S":"k"}},
             "UpdateExpression":"SET set = :v REMOVE remove ADD add :n DELETE delete :ss",
             "ExpressionAttributeValues":{":v":{"S":"x"},":n":{"N":"1"},":ss":{"SS":["a"]}}}"#;
         let Operation::UpdateItem { actions, .. } =
@@ -9421,7 +9592,7 @@ mod tests {
     /// was never actually at risk — kept as a belt-and-suspenders check.
     #[test]
     fn reserved_condition_function_name_as_top_level_attribute() {
-        let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+        let body = br#"{"TableName":"tbl","Key":{"id":{"S":"k"}},
             "UpdateExpression":"SET size = :v",
             "ExpressionAttributeValues":{":v":{"S":"x"}}}"#;
         let Operation::UpdateItem { actions, .. } =
@@ -9439,7 +9610,7 @@ mod tests {
     /// a reserved word) keeps working exactly as before.
     #[test]
     fn aliased_reserved_word_still_resolves_through_expression_attribute_names() {
-        let body = br##"{"TableName":"t","Key":{"id":{"S":"k"}},
+        let body = br##"{"TableName":"tbl","Key":{"id":{"S":"k"}},
             "UpdateExpression":"SET #s = :v",
             "ExpressionAttributeNames":{"#s":"set"},
             "ExpressionAttributeValues":{":v":{"S":"x"}}}"##;
@@ -9462,7 +9633,7 @@ mod tests {
     /// only appears in an *operand* position).
     #[test]
     fn clause_keywords_stay_case_insensitive_at_a_clause_start() {
-        let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+        let body = br#"{"TableName":"tbl","Key":{"id":{"S":"k"}},
             "UpdateExpression":"set a = :v",
             "ExpressionAttributeValues":{":v":{"S":"x"}}}"#;
         let Operation::UpdateItem { actions, .. } =
@@ -9481,7 +9652,7 @@ mod tests {
     /// though the tokenizer no longer keys off keyword substrings.
     #[test]
     fn rejects_a_set_action_list_missing_its_comma() {
-        let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+        let body = br#"{"TableName":"tbl","Key":{"id":{"S":"k"}},
             "UpdateExpression":"SET a = :v b = :w",
             "ExpressionAttributeValues":{":v":{"S":"x"},":w":{"S":"y"}}}"#;
         let err = decode_request("DynamoDB_20120810.UpdateItem", body).unwrap_err();
@@ -9492,7 +9663,7 @@ mod tests {
 
     #[test]
     fn decodes_if_not_exists_in_set() {
-        let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+        let body = br#"{"TableName":"tbl","Key":{"id":{"S":"k"}},
             "UpdateExpression":"SET a = if_not_exists(a, :v)",
             "ExpressionAttributeValues":{":v":{"N":"0"}}}"#;
         let Operation::UpdateItem { actions, .. } =
@@ -9516,7 +9687,7 @@ mod tests {
     fn decodes_list_append_both_operand_orders() {
         for expr in ["SET a = list_append(a, :l)", "SET a = list_append(:l, a)"] {
             let body = format!(
-                r#"{{"TableName":"t","Key":{{"id":{{"S":"k"}}}},
+                r#"{{"TableName":"tbl","Key":{{"id":{{"S":"k"}}}},
                 "UpdateExpression":"{expr}",
                 "ExpressionAttributeValues":{{":l":{{"L":[{{"N":"3"}}]}}}}}}"#
             );
@@ -9527,7 +9698,7 @@ mod tests {
 
     #[test]
     fn unsupported_function_name_is_rejected() {
-        let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+        let body = br#"{"TableName":"tbl","Key":{"id":{"S":"k"}},
             "UpdateExpression":"SET a = nope(a, :v)",
             "ExpressionAttributeValues":{":v":{"N":"0"}}}"#;
         let err = decode_request("DynamoDB_20120810.UpdateItem", body).unwrap_err();
@@ -9538,7 +9709,7 @@ mod tests {
 
     #[test]
     fn decodes_set_arithmetic_add_and_subtract() {
-        let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+        let body = br#"{"TableName":"tbl","Key":{"id":{"S":"k"}},
             "UpdateExpression":"SET a = a + :x, b = b - :y",
             "ExpressionAttributeValues":{":x":{"N":"1"},":y":{"N":"2"}}}"#;
         let Operation::UpdateItem { actions, .. } =
@@ -9571,7 +9742,7 @@ mod tests {
     /// :one` — a counter that starts at zero when the item is new.
     #[test]
     fn if_not_exists_result_used_as_an_arithmetic_operand() {
-        let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+        let body = br#"{"TableName":"tbl","Key":{"id":{"S":"k"}},
             "UpdateExpression":"SET a = if_not_exists(a, :zero) + :one",
             "ExpressionAttributeValues":{":zero":{"N":"0"},":one":{"N":"1"}}}"#;
         let Operation::UpdateItem { actions, .. } =
@@ -9587,7 +9758,7 @@ mod tests {
     /// is rejected, not silently left-associated.
     #[test]
     fn set_arithmetic_rejects_a_second_operator() {
-        let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+        let body = br#"{"TableName":"tbl","Key":{"id":{"S":"k"}},
             "UpdateExpression":"SET a = a + :x + :y",
             "ExpressionAttributeValues":{":x":{"N":"1"},":y":{"N":"2"}}}"#;
         let err = decode_request("DynamoDB_20120810.UpdateItem", body).unwrap_err();
@@ -9598,7 +9769,7 @@ mod tests {
 
     #[test]
     fn decodes_nested_set_and_remove_paths() {
-        let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+        let body = br#"{"TableName":"tbl","Key":{"id":{"S":"k"}},
             "UpdateExpression":"SET a.b = :v, c[0] = :w REMOVE d.e, f[1]",
             "ExpressionAttributeValues":{":v":{"S":"x"},":w":{"N":"1"}}}"#;
         let Operation::UpdateItem { actions, .. } =
@@ -9633,7 +9804,7 @@ mod tests {
     /// syntax on the rest, exactly like a `ProjectionExpression` path.
     #[test]
     fn decodes_an_aliased_nested_set_path() {
-        let body = br##"{"TableName":"t","Key":{"id":{"S":"k"}},
+        let body = br##"{"TableName":"tbl","Key":{"id":{"S":"k"}},
             "UpdateExpression":"SET #n.b[1] = :v",
             "ExpressionAttributeNames":{"#n":"a"},
             "ExpressionAttributeValues":{":v":{"S":"x"}}}"##;
@@ -9660,7 +9831,7 @@ mod tests {
     /// DynamoDB's own "document paths overlap" rejection.
     #[test]
     fn rejects_overlapping_set_targets_in_one_expression() {
-        let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+        let body = br#"{"TableName":"tbl","Key":{"id":{"S":"k"}},
             "UpdateExpression":"SET a = :x, a.b = :y",
             "ExpressionAttributeValues":{":x":{"M":{}},":y":{"S":"z"}}}"#;
         let err = decode_request("DynamoDB_20120810.UpdateItem", body).unwrap_err();
@@ -9671,7 +9842,7 @@ mod tests {
     /// of the same overlap rule.
     #[test]
     fn rejects_the_exact_same_target_set_twice() {
-        let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+        let body = br#"{"TableName":"tbl","Key":{"id":{"S":"k"}},
             "UpdateExpression":"SET a = :x REMOVE a"}"#;
         let err = decode_request("DynamoDB_20120810.UpdateItem", body).unwrap_err();
         assert_eq!(err.code, "ValidationException");
@@ -9682,7 +9853,7 @@ mod tests {
     /// check.
     #[test]
     fn disjoint_paths_do_not_trigger_the_overlap_check() {
-        let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+        let body = br#"{"TableName":"tbl","Key":{"id":{"S":"k"}},
             "UpdateExpression":"SET a.b = :v, a.c = :w REMOVE d[0], d[1]",
             "ExpressionAttributeValues":{":v":{"S":"x"},":w":{"S":"y"}}}"#;
         decode_request("DynamoDB_20120810.UpdateItem", body).expect("disjoint targets");
@@ -9691,14 +9862,14 @@ mod tests {
     #[test]
     fn decodes_batch_write() {
         let body = br#"{"RequestItems":{
-            "t":[{"PutRequest":{"Item":{"id":{"S":"a"}}}},
+            "tbl":[{"PutRequest":{"Item":{"id":{"S":"a"}}}},
                  {"DeleteRequest":{"Key":{"id":{"S":"b"}}}}]}}"#;
         let Operation::BatchWriteItem { requests } =
             decode_request("DynamoDB_20120810.BatchWriteItem", body).unwrap()
         else {
             panic!("expected BatchWriteItem");
         };
-        let reqs = requests.get("t").expect("table t present");
+        let reqs = requests.get("tbl").expect("table t present");
         assert_eq!(reqs.len(), 2);
         assert!(matches!(reqs[0], WriteRequest::Put(_)));
         assert!(matches!(reqs[1], WriteRequest::Delete(_)));
@@ -9707,12 +9878,12 @@ mod tests {
     #[test]
     fn decodes_transact_write() {
         let body = br#"{"TransactItems":[
-            {"Put":{"TableName":"t","Item":{"id":{"S":"a"}},
+            {"Put":{"TableName":"tbl","Item":{"id":{"S":"a"}},
                     "ConditionExpression":"attribute_not_exists(id)"}},
-            {"Update":{"TableName":"t","Key":{"id":{"S":"b"}},
+            {"Update":{"TableName":"tbl","Key":{"id":{"S":"b"}},
                        "UpdateExpression":"SET v = :v",
                        "ExpressionAttributeValues":{":v":{"N":"1"}}}},
-            {"ConditionCheck":{"TableName":"t","Key":{"id":{"S":"c"}},
+            {"ConditionCheck":{"TableName":"tbl","Key":{"id":{"S":"c"}},
                                "ConditionExpression":"attribute_exists(id)"}}]}"#;
         let Operation::TransactWriteItems { actions, token } =
             decode_request("DynamoDB_20120810.TransactWriteItems", body).unwrap()
@@ -9731,7 +9902,7 @@ mod tests {
     #[test]
     fn transact_write_decodes_a_present_client_request_token() {
         let body = br#"{"ClientRequestToken":"abc-123",
-            "TransactItems":[{"Put":{"TableName":"t","Item":{"id":{"S":"a"}}}}]}"#;
+            "TransactItems":[{"Put":{"TableName":"tbl","Item":{"id":{"S":"a"}}}}]}"#;
         let Operation::TransactWriteItems { token, .. } =
             decode_request("DynamoDB_20120810.TransactWriteItems", body).unwrap()
         else {
@@ -9755,7 +9926,7 @@ mod tests {
     fn transact_write_client_request_token_accepts_the_length_bounds() {
         let one_char = format!(
             r#"{{"ClientRequestToken":"x","TransactItems":[{}]}}"#,
-            r#"{"Put":{"TableName":"t","Item":{"id":{"S":"a"}}}}"#
+            r#"{"Put":{"TableName":"tbl","Item":{"id":{"S":"a"}}}}"#
         );
         let Operation::TransactWriteItems { token, .. } =
             decode_request("DynamoDB_20120810.TransactWriteItems", one_char.as_bytes()).unwrap()
@@ -9767,7 +9938,7 @@ mod tests {
         let thirty_six = "x".repeat(36);
         let at_cap = format!(
             r#"{{"ClientRequestToken":"{thirty_six}","TransactItems":[{}]}}"#,
-            r#"{"Put":{"TableName":"t","Item":{"id":{"S":"a"}}}}"#
+            r#"{"Put":{"TableName":"tbl","Item":{"id":{"S":"a"}}}}"#
         );
         let Operation::TransactWriteItems { token, .. } =
             decode_request("DynamoDB_20120810.TransactWriteItems", at_cap.as_bytes()).unwrap()
@@ -9782,7 +9953,7 @@ mod tests {
         let too_long = "x".repeat(37);
         let body = format!(
             r#"{{"ClientRequestToken":"{too_long}","TransactItems":[{}]}}"#,
-            r#"{"Put":{"TableName":"t","Item":{"id":{"S":"a"}}}}"#
+            r#"{"Put":{"TableName":"tbl","Item":{"id":{"S":"a"}}}}"#
         );
         let err = decode_request("DynamoDB_20120810.TransactWriteItems", body.as_bytes())
             .expect_err("37 characters exceeds the AWS cap");
@@ -9796,10 +9967,10 @@ mod tests {
         // to actions that fingerprint identically — the fingerprint is a
         // property of the decoded `Vec<TransactAction>` (all `BTreeMap`),
         // never a hash of the raw request bytes.
-        let a = br#"{"TransactItems":[{"Put":{"TableName":"t","Item":{"id":{"S":"a"}},
+        let a = br#"{"TransactItems":[{"Put":{"TableName":"tbl","Item":{"id":{"S":"a"}},
             "ConditionExpression":"attribute_not_exists(id)"}}]}"#;
         let b = br#"{"TransactItems":[{"Put":{"ConditionExpression":"attribute_not_exists(id)",
-            "Item":{"id":{"S":"a"}},"TableName":"t"}}]}"#;
+            "Item":{"id":{"S":"a"}},"TableName":"tbl"}}]}"#;
         let Operation::TransactWriteItems {
             actions: actions_a, ..
         } = decode_request("DynamoDB_20120810.TransactWriteItems", a).unwrap()
@@ -9821,9 +9992,9 @@ mod tests {
     #[test]
     fn transact_write_fingerprint_differs_on_a_different_action() {
         let same_key_different_item = br#"{"TransactItems":[
-            {"Put":{"TableName":"t","Item":{"id":{"S":"a"},"v":{"N":"1"}}}}]}"#;
+            {"Put":{"TableName":"tbl","Item":{"id":{"S":"a"},"v":{"N":"1"}}}}]}"#;
         let original = br#"{"TransactItems":[
-            {"Put":{"TableName":"t","Item":{"id":{"S":"a"},"v":{"N":"2"}}}}]}"#;
+            {"Put":{"TableName":"tbl","Item":{"id":{"S":"a"},"v":{"N":"2"}}}}]}"#;
         let Operation::TransactWriteItems { actions: a, .. } = decode_request(
             "DynamoDB_20120810.TransactWriteItems",
             same_key_different_item,
@@ -9845,7 +10016,7 @@ mod tests {
     #[test]
     fn transact_write_rejects_an_empty_client_request_token() {
         let body = r#"{"ClientRequestToken":"",
-            "TransactItems":[{"Put":{"TableName":"t","Item":{"id":{"S":"a"}}}}]}"#;
+            "TransactItems":[{"Put":{"TableName":"tbl","Item":{"id":{"S":"a"}}}}]}"#;
         let err = decode_request("DynamoDB_20120810.TransactWriteItems", body.as_bytes())
             .expect_err("empty token is below the AWS minimum");
         assert_eq!(err.code, "ValidationException");
@@ -9939,10 +10110,10 @@ mod tests {
     #[test]
     fn decodes_return_values_on_condition_check_failure_per_action() {
         let body = br#"{"TransactItems":[
-            {"Put":{"TableName":"t","Item":{"id":{"S":"a"}},
+            {"Put":{"TableName":"tbl","Item":{"id":{"S":"a"}},
                     "ConditionExpression":"attribute_not_exists(id)",
                     "ReturnValuesOnConditionCheckFailure":"ALL_OLD"}},
-            {"ConditionCheck":{"TableName":"t","Key":{"id":{"S":"b"}},
+            {"ConditionCheck":{"TableName":"tbl","Key":{"id":{"S":"b"}},
                                "ConditionExpression":"attribute_exists(id)"}}]}"#;
         let Operation::TransactWriteItems { actions, .. } =
             decode_request("DynamoDB_20120810.TransactWriteItems", body).unwrap()
@@ -9963,7 +10134,7 @@ mod tests {
     #[test]
     fn rejects_an_invalid_return_values_on_condition_check_failure() {
         let body = br#"{"TransactItems":[
-            {"Put":{"TableName":"t","Item":{"id":{"S":"a"}},
+            {"Put":{"TableName":"tbl","Item":{"id":{"S":"a"}},
                     "ReturnValuesOnConditionCheckFailure":"ALL_NEW"}}]}"#;
         let err = decode_request("DynamoDB_20120810.TransactWriteItems", body)
             .expect_err("ALL_NEW is not a legal ReturnValuesOnConditionCheckFailure value");
@@ -9977,7 +10148,7 @@ mod tests {
         let items: Vec<String> = (0..n)
             .map(|i| format!(r#"{{"PutRequest":{{"Item":{{"id":{{"S":"i{i}"}}}}}}}}"#))
             .collect();
-        format!(r#"{{"RequestItems":{{"t":[{}]}}}}"#, items.join(","))
+        format!(r#"{{"RequestItems":{{"tbl":[{}]}}}}"#, items.join(","))
     }
 
     #[test]
@@ -9998,7 +10169,7 @@ mod tests {
             .map(|i| format!(r#"{{"id":{{"S":"i{i}"}}}}"#))
             .collect();
         format!(
-            r#"{{"RequestItems":{{"t":{{"Keys":[{}]}}}}}}"#,
+            r#"{{"RequestItems":{{"tbl":{{"Keys":[{}]}}}}}}"#,
             keys.join(",")
         )
     }
@@ -10152,10 +10323,10 @@ mod tests {
         let mut hit = Item::new();
         hit.insert("id".into(), s("k1"));
         let results = vec![
-            BatchStatementResult::success("t".into(), Some(hit)),
-            BatchStatementResult::success("t".into(), None),
+            BatchStatementResult::success("tbl".into(), Some(hit)),
+            BatchStatementResult::success("tbl".into(), None),
             BatchStatementResult::error(
-                Some("t".into()),
+                Some("tbl".into()),
                 &WireError::conditional_check_failed("nope"),
             ),
             BatchStatementResult::error(None, &WireError::validation("could not parse")),
@@ -10165,18 +10336,18 @@ mod tests {
         let responses = json["Responses"].as_array().expect("Responses array");
         assert_eq!(responses.len(), 4);
 
-        assert_eq!(responses[0]["TableName"], "t");
+        assert_eq!(responses[0]["TableName"], "tbl");
         assert_eq!(responses[0]["Item"]["id"]["S"], "k1");
         assert!(responses[0].get("Error").is_none());
 
-        assert_eq!(responses[1]["TableName"], "t");
+        assert_eq!(responses[1]["TableName"], "tbl");
         assert!(
             responses[1].get("Item").is_none(),
             "a miss/no-echo success omits Item, never nulls it"
         );
         assert!(responses[1].get("Error").is_none());
 
-        assert_eq!(responses[2]["TableName"], "t");
+        assert_eq!(responses[2]["TableName"], "tbl");
         assert_eq!(responses[2]["Error"]["Code"], "ConditionalCheckFailed");
         assert_eq!(responses[2]["Error"]["Message"], "nope");
         assert!(responses[2].get("Item").is_none());
@@ -10191,7 +10362,7 @@ mod tests {
     /// A `TransactWriteItems` body with `n` `Put` actions, each its own key.
     fn transact_write_body(n: usize) -> String {
         let actions: Vec<String> = (0..n)
-            .map(|i| format!(r#"{{"Put":{{"TableName":"t","Item":{{"id":{{"S":"i{i}"}}}}}}}}"#))
+            .map(|i| format!(r#"{{"Put":{{"TableName":"tbl","Item":{{"id":{{"S":"i{i}"}}}}}}}}"#))
             .collect();
         format!(r#"{{"TransactItems":[{}]}}"#, actions.join(","))
     }
@@ -10211,7 +10382,7 @@ mod tests {
     /// A `TransactGetItems` body with `n` `Get` items, each its own key.
     fn transact_get_body(n: usize) -> String {
         let gets: Vec<String> = (0..n)
-            .map(|i| format!(r#"{{"Get":{{"TableName":"t","Key":{{"id":{{"S":"i{i}"}}}}}}}}"#))
+            .map(|i| format!(r#"{{"Get":{{"TableName":"tbl","Key":{{"id":{{"S":"i{i}"}}}}}}}}"#))
             .collect();
         format!(r#"{{"TransactItems":[{}]}}"#, gets.join(","))
     }
@@ -10225,7 +10396,7 @@ mod tests {
             panic!("expected TransactGetItems");
         };
         assert_eq!(gets.len(), 2);
-        assert_eq!(gets[0].table, "t");
+        assert_eq!(gets[0].table, "tbl");
     }
 
     #[test]
@@ -10252,12 +10423,12 @@ mod tests {
     #[test]
     fn put_item_accepts_exactly_the_size_cap_and_rejects_one_byte_over() {
         let item = item_of_size(MAX_ITEM_SIZE_BYTES - 1);
-        let at_cap = format!(r#"{{"TableName":"t","Item":{item}}}"#);
+        let at_cap = format!(r#"{{"TableName":"tbl","Item":{item}}}"#);
         decode_request("DynamoDB_20120810.PutItem", at_cap.as_bytes())
             .expect("exactly 409600 bytes is accepted");
 
         let item = item_of_size(MAX_ITEM_SIZE_BYTES);
-        let over_cap = format!(r#"{{"TableName":"t","Item":{item}}}"#);
+        let over_cap = format!(r#"{{"TableName":"tbl","Item":{item}}}"#);
         let err = decode_request("DynamoDB_20120810.PutItem", over_cap.as_bytes())
             .expect_err("409601 bytes is rejected");
         assert_eq!(err.code, "ValidationException");
@@ -10270,13 +10441,14 @@ mod tests {
     #[test]
     fn batch_write_put_request_enforces_the_item_size_cap() {
         let item = item_of_size(MAX_ITEM_SIZE_BYTES - 1);
-        let at_cap = format!(r#"{{"RequestItems":{{"t":[{{"PutRequest":{{"Item":{item}}}}}]}}}}"#);
+        let at_cap =
+            format!(r#"{{"RequestItems":{{"tbl":[{{"PutRequest":{{"Item":{item}}}}}]}}}}"#);
         decode_request("DynamoDB_20120810.BatchWriteItem", at_cap.as_bytes())
             .expect("exactly 409600 bytes is accepted");
 
         let item = item_of_size(MAX_ITEM_SIZE_BYTES);
         let over_cap =
-            format!(r#"{{"RequestItems":{{"t":[{{"PutRequest":{{"Item":{item}}}}}]}}}}"#);
+            format!(r#"{{"RequestItems":{{"tbl":[{{"PutRequest":{{"Item":{item}}}}}]}}}}"#);
         let err = decode_request("DynamoDB_20120810.BatchWriteItem", over_cap.as_bytes())
             .expect_err("409601 bytes is rejected");
         assert_eq!(err.code, "ValidationException");
@@ -10286,13 +10458,13 @@ mod tests {
     fn transact_write_put_action_enforces_the_item_size_cap() {
         let item = item_of_size(MAX_ITEM_SIZE_BYTES - 1);
         let at_cap =
-            format!(r#"{{"TransactItems":[{{"Put":{{"TableName":"t","Item":{item}}}}}]}}"#);
+            format!(r#"{{"TransactItems":[{{"Put":{{"TableName":"tbl","Item":{item}}}}}]}}"#);
         decode_request("DynamoDB_20120810.TransactWriteItems", at_cap.as_bytes())
             .expect("exactly 409600 bytes is accepted");
 
         let item = item_of_size(MAX_ITEM_SIZE_BYTES);
         let over_cap =
-            format!(r#"{{"TransactItems":[{{"Put":{{"TableName":"t","Item":{item}}}}}]}}"#);
+            format!(r#"{{"TransactItems":[{{"Put":{{"TableName":"tbl","Item":{item}}}}}]}}"#);
         let err = decode_request("DynamoDB_20120810.TransactWriteItems", over_cap.as_bytes())
             .expect_err("409601 bytes is rejected");
         assert_eq!(err.code, "ValidationException");
@@ -10313,15 +10485,15 @@ mod tests {
 
     #[test]
     fn decodes_index_projection_types() {
-        let body = br#"{"TableName":"t",
+        let body = br#"{"TableName":"tbl",
             "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"},
                                      {"AttributeName":"e","AttributeType":"S"},
                                      {"AttributeName":"o","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "GlobalSecondaryIndexes":[
-                {"IndexName":"k","KeySchema":[{"AttributeName":"e","KeyType":"HASH"}],
+                {"IndexName":"koi","KeySchema":[{"AttributeName":"e","KeyType":"HASH"}],
                  "Projection":{"ProjectionType":"KEYS_ONLY"}},
-                {"IndexName":"i","KeySchema":[{"AttributeName":"o","KeyType":"HASH"}],
+                {"IndexName":"ioi","KeySchema":[{"AttributeName":"o","KeyType":"HASH"}],
                  "Projection":{"ProjectionType":"INCLUDE","NonKeyAttributes":["x","y"]}}]}"#;
         let Operation::CreateTable { indexes, .. } =
             decode_request("DynamoDB_20120810.CreateTable", body).unwrap()
@@ -10351,7 +10523,7 @@ mod tests {
             })
             .collect();
         format!(
-            r#"{{"TableName":"t",
+            r#"{{"TableName":"tbl",
                 "AttributeDefinitions":[{{"AttributeName":"id","AttributeType":"S"}},
                                          {{"AttributeName":"e","AttributeType":"S"}}],
                 "KeySchema":[{{"AttributeName":"id","KeyType":"HASH"}}],
@@ -10390,7 +10562,7 @@ mod tests {
         attr_defs
             .extend((0..n).map(|i| format!(r#"{{"AttributeName":"r{i}","AttributeType":"S"}}"#)));
         format!(
-            r#"{{"TableName":"t",
+            r#"{{"TableName":"tbl",
                 "AttributeDefinitions":[{}],
                 "KeySchema":[{{"AttributeName":"id","KeyType":"HASH"}}],
                 "LocalSecondaryIndexes":[{}]}}"#,
@@ -10416,7 +10588,7 @@ mod tests {
 
     #[test]
     fn create_table_rejects_a_key_attribute_missing_from_attribute_definitions() {
-        let body = br#"{"TableName":"t",
+        let body = br#"{"TableName":"tbl",
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#;
         let err = decode_request("DynamoDB_20120810.CreateTable", body)
             .expect_err("no AttributeDefinitions at all for a declared key");
@@ -10438,7 +10610,7 @@ mod tests {
         // The base key is declared, but the GSI's own hash attribute isn't —
         // real DynamoDB's `AttributeDefinitions` rule spans the whole key
         // schema (table + every index) at once, not just the base table.
-        let body = br#"{"TableName":"t",
+        let body = br#"{"TableName":"tbl",
             "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "GlobalSecondaryIndexes":[
@@ -10460,7 +10632,7 @@ mod tests {
         // `extra` is declared but never appears in any key schema (table or
         // index) — the mirror-image DynamoDB rejection ("Some
         // AttributeDefinitions are not used").
-        let body = br#"{"TableName":"t",
+        let body = br#"{"TableName":"tbl",
             "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"},
                                      {"AttributeName":"extra","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#;
@@ -10484,7 +10656,7 @@ mod tests {
         // The positive case every rejection test above is a negative
         // mutation of: base key + every index key, nothing more, nothing
         // less, decodes cleanly.
-        let body = br#"{"TableName":"t",
+        let body = br#"{"TableName":"tbl",
             "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"},
                                      {"AttributeName":"email","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
@@ -10498,7 +10670,7 @@ mod tests {
 
     #[test]
     fn update_table_create_index_rejects_a_missing_attribute_definition() {
-        let body = br#"{"TableName":"t","GlobalSecondaryIndexUpdates":[
+        let body = br#"{"TableName":"tbl","GlobalSecondaryIndexUpdates":[
             {"Create":{"IndexName":"by-email",
                 "KeySchema":[{"AttributeName":"email","KeyType":"HASH"}],
                 "Projection":{"ProjectionType":"ALL"}}}]}"#;
@@ -10523,7 +10695,7 @@ mod tests {
         // definitions for exactly the new index's own key(s) — an extra
         // entry (even one that happens to look like a real attribute name)
         // is rejected the same way `CreateTable`'s own extras are.
-        let body = br#"{"TableName":"t",
+        let body = br#"{"TableName":"tbl",
             "AttributeDefinitions":[{"AttributeName":"email","AttributeType":"S"},
                                      {"AttributeName":"unrelated","AttributeType":"S"}],
             "GlobalSecondaryIndexUpdates":[
@@ -10549,7 +10721,7 @@ mod tests {
     fn update_table_delete_index_needs_no_attribute_definitions() {
         // Dropping a GSI needs no key-type information at all — real
         // DynamoDB never asks for one either.
-        let body = br#"{"TableName":"t",
+        let body = br#"{"TableName":"tbl",
             "GlobalSecondaryIndexUpdates":[{"Delete":{"IndexName":"by-email"}}]}"#;
         decode_request("DynamoDB_20120810.UpdateTable", body)
             .expect("Delete needs no AttributeDefinitions");
@@ -10559,7 +10731,7 @@ mod tests {
 
     #[test]
     fn decodes_update_time_to_live_enable() {
-        let body = br#"{"TableName":"t","TimeToLiveSpecification":
+        let body = br#"{"TableName":"tbl","TimeToLiveSpecification":
             {"Enabled":true,"AttributeName":"expiresAt"}}"#;
         match decode_request("DynamoDB_20120810.UpdateTimeToLive", body).unwrap() {
             Operation::UpdateTimeToLive {
@@ -10567,7 +10739,7 @@ mod tests {
                 attribute_name,
                 enabled,
             } => {
-                assert_eq!(table, "t");
+                assert_eq!(table, "tbl");
                 assert_eq!(attribute_name, "expiresAt");
                 assert!(enabled);
             }
@@ -10579,7 +10751,7 @@ mod tests {
     fn decodes_update_time_to_live_disable() {
         // AWS requires `AttributeName` even to disable — it must name the
         // currently-enabled attribute.
-        let body = br#"{"TableName":"t","TimeToLiveSpecification":
+        let body = br#"{"TableName":"tbl","TimeToLiveSpecification":
             {"Enabled":false,"AttributeName":"expiresAt"}}"#;
         match decode_request("DynamoDB_20120810.UpdateTimeToLive", body).unwrap() {
             Operation::UpdateTimeToLive {
@@ -10587,7 +10759,7 @@ mod tests {
                 attribute_name,
                 enabled,
             } => {
-                assert_eq!(table, "t");
+                assert_eq!(table, "tbl");
                 assert_eq!(attribute_name, "expiresAt");
                 assert!(!enabled);
             }
@@ -10604,37 +10776,37 @@ mod tests {
 
     #[test]
     fn update_time_to_live_rejects_missing_specification() {
-        let body = br#"{"TableName":"t"}"#;
+        let body = br#"{"TableName":"tbl"}"#;
         let err = decode_request("DynamoDB_20120810.UpdateTimeToLive", body).unwrap_err();
         assert_eq!(err.code, "ValidationException");
     }
 
     #[test]
     fn update_time_to_live_rejects_a_mistyped_specification() {
-        let body = br#"{"TableName":"t","TimeToLiveSpecification":"not-an-object"}"#;
+        let body = br#"{"TableName":"tbl","TimeToLiveSpecification":"not-an-object"}"#;
         let err = decode_request("DynamoDB_20120810.UpdateTimeToLive", body).unwrap_err();
         assert_eq!(err.code, "ValidationException");
     }
 
     #[test]
     fn update_time_to_live_rejects_missing_enabled() {
-        let body = br#"{"TableName":"t","TimeToLiveSpecification":{"AttributeName":"ttl"}}"#;
+        let body = br#"{"TableName":"tbl","TimeToLiveSpecification":{"AttributeName":"ttl"}}"#;
         let err = decode_request("DynamoDB_20120810.UpdateTimeToLive", body).unwrap_err();
         assert_eq!(err.code, "ValidationException");
     }
 
     #[test]
     fn update_time_to_live_rejects_missing_attribute_name() {
-        let body = br#"{"TableName":"t","TimeToLiveSpecification":{"Enabled":true}}"#;
+        let body = br#"{"TableName":"tbl","TimeToLiveSpecification":{"Enabled":true}}"#;
         let err = decode_request("DynamoDB_20120810.UpdateTimeToLive", body).unwrap_err();
         assert_eq!(err.code, "ValidationException");
     }
 
     #[test]
     fn decodes_describe_time_to_live() {
-        let body = br#"{"TableName":"t"}"#;
+        let body = br#"{"TableName":"tbl"}"#;
         match decode_request("DynamoDB_20120810.DescribeTimeToLive", body).unwrap() {
-            Operation::DescribeTimeToLive { table } => assert_eq!(table, "t"),
+            Operation::DescribeTimeToLive { table } => assert_eq!(table, "tbl"),
             other => panic!("expected DescribeTimeToLive, got {other:?}"),
         }
     }
@@ -11670,20 +11842,20 @@ mod tests {
             other => panic!("expected Query, got {other:?}"),
         };
         assert_eq!(
-            q(r#"{"TableName":"t","KeyConditionExpression":"pk = :p",
+            q(r#"{"TableName":"tbl","KeyConditionExpression":"pk = :p",
                   "ExpressionAttributeValues":{":p":{"S":"a"}}}"#),
             Select::AllAttributes
         );
         assert_eq!(
             q(
-                r#"{"TableName":"t","IndexName":"i","KeyConditionExpression":"pk = :p",
+                r#"{"TableName":"tbl","IndexName":"ioi","KeyConditionExpression":"pk = :p",
                   "ExpressionAttributeValues":{":p":{"S":"a"}}}"#
             ),
             Select::AllProjectedAttributes,
             "an index read defaults to its declared projection"
         );
         assert_eq!(
-            q(r#"{"TableName":"t","KeyConditionExpression":"pk = :p",
+            q(r#"{"TableName":"tbl","KeyConditionExpression":"pk = :p",
                   "ExpressionAttributeValues":{":p":{"S":"a"}},
                   "ProjectionExpression":"a,b"}"#),
             Select::SpecificAttributes,
@@ -11697,7 +11869,7 @@ mod tests {
     fn explicit_select_values_decode() {
         let q = |sel: &str| {
             let body = format!(
-                r#"{{"TableName":"t","KeyConditionExpression":"pk = :p",
+                r#"{{"TableName":"tbl","KeyConditionExpression":"pk = :p",
                      "ExpressionAttributeValues":{{":p":{{"S":"a"}}}},"Select":"{sel}"}}"#
             );
             match decode_request("DynamoDB_20120810.Query", body.as_bytes()).expect("decodes") {
@@ -11719,25 +11891,25 @@ mod tests {
         };
 
         // SPECIFIC_ATTRIBUTES with nothing to select.
-        err(r#"{"TableName":"t","KeyConditionExpression":"pk = :p",
+        err(r#"{"TableName":"tbl","KeyConditionExpression":"pk = :p",
                 "ExpressionAttributeValues":{":p":{"S":"a"}},
                 "Select":"SPECIFIC_ATTRIBUTES"}"#);
 
         // A projection contradicting a non-SPECIFIC Select.
-        err(r#"{"TableName":"t","KeyConditionExpression":"pk = :p",
+        err(r#"{"TableName":"tbl","KeyConditionExpression":"pk = :p",
                 "ExpressionAttributeValues":{":p":{"S":"a"}},
                 "ProjectionExpression":"a","Select":"ALL_ATTRIBUTES"}"#);
-        err(r#"{"TableName":"t","KeyConditionExpression":"pk = :p",
+        err(r#"{"TableName":"tbl","KeyConditionExpression":"pk = :p",
                 "ExpressionAttributeValues":{":p":{"S":"a"}},
                 "ProjectionExpression":"a","Select":"COUNT"}"#);
 
         // ALL_PROJECTED_ATTRIBUTES without an index to project.
-        err(r#"{"TableName":"t","KeyConditionExpression":"pk = :p",
+        err(r#"{"TableName":"tbl","KeyConditionExpression":"pk = :p",
                 "ExpressionAttributeValues":{":p":{"S":"a"}},
                 "Select":"ALL_PROJECTED_ATTRIBUTES"}"#);
 
         // An unknown value is rejected rather than silently treated as default.
-        err(r#"{"TableName":"t","KeyConditionExpression":"pk = :p",
+        err(r#"{"TableName":"tbl","KeyConditionExpression":"pk = :p",
                 "ExpressionAttributeValues":{":p":{"S":"a"}},
                 "Select":"EVERYTHING"}"#);
     }
@@ -11747,7 +11919,7 @@ mod tests {
     fn scan_decodes_select_too() {
         match decode_request(
             "DynamoDB_20120810.Scan",
-            br#"{"TableName":"t","Select":"COUNT"}"#,
+            br#"{"TableName":"tbl","Select":"COUNT"}"#,
         )
         .expect("decodes")
         {
@@ -11795,7 +11967,7 @@ mod tests {
         ];
         for (op, expected) in cases {
             let body = format!(
-                r#"{{"TableName":"t","FilterExpression":"price {op} :p",
+                r#"{{"TableName":"tbl","FilterExpression":"price {op} :p",
                      "ExpressionAttributeValues":{{":p":{{"N":"5"}}}}}}"#
             );
             match decode_request("DynamoDB_20120810.Scan", body.as_bytes())
@@ -11822,7 +11994,7 @@ mod tests {
     /// this hit ordinary schemas.
     #[test]
     fn expression_attribute_names_resolve_in_predicates() {
-        let body = r##"{"TableName":"t","FilterExpression":"#p = :v",
+        let body = r##"{"TableName":"tbl","FilterExpression":"#p = :v",
             "ExpressionAttributeNames":{"#p":"price"},
             "ExpressionAttributeValues":{":v":{"N":"5"}}}"##;
         match decode_request("DynamoDB_20120810.Scan", body.as_bytes()).expect("decodes") {
@@ -11838,7 +12010,7 @@ mod tests {
             other => panic!("expected Scan, got {other:?}"),
         }
 
-        let exists = r##"{"TableName":"t","FilterExpression":"attribute_exists(#p)",
+        let exists = r##"{"TableName":"tbl","FilterExpression":"attribute_exists(#p)",
             "ExpressionAttributeNames":{"#p":"price"}}"##;
         match decode_request("DynamoDB_20120810.Scan", exists.as_bytes()).expect("decodes") {
             Operation::Scan { filter, .. } => assert_eq!(
@@ -11855,7 +12027,7 @@ mod tests {
     /// (alias-resolved) for the edge to check against the catalog.
     #[test]
     fn key_condition_carries_its_attribute_names() {
-        let body = r##"{"TableName":"t",
+        let body = r##"{"TableName":"tbl",
             "KeyConditionExpression":"#k = :p AND #s = :s",
             "ExpressionAttributeNames":{"#k":"pk","#s":"sk"},
             "ExpressionAttributeValues":{":p":{"S":"a"},":s":{"S":"b"}}}"##;
@@ -11886,7 +12058,7 @@ mod tests {
             ("<", Comparator::Lt),
         ] {
             let body = format!(
-                r#"{{"TableName":"t","KeyConditionExpression":"pk = :p AND sk {op} :s",
+                r#"{{"TableName":"tbl","KeyConditionExpression":"pk = :p AND sk {op} :s",
                      "ExpressionAttributeValues":{{":p":{{"S":"a"}},":s":{{"S":"b"}}}}}}"#
             );
             match decode_request("DynamoDB_20120810.Query", body.as_bytes())
@@ -11908,7 +12080,7 @@ mod tests {
             }
         }
         // BETWEEN and begins_with still work, and carry the sort attribute name.
-        let between = br#"{"TableName":"t",
+        let between = br#"{"TableName":"tbl",
             "KeyConditionExpression":"pk = :p AND sk BETWEEN :lo AND :hi",
             "ExpressionAttributeValues":{":p":{"S":"a"},":lo":{"S":"b"},":hi":{"S":"c"}}}"#;
         match decode_request("DynamoDB_20120810.Query", between).expect("decodes") {
@@ -11931,7 +12103,7 @@ mod tests {
     /// rather than silently accepted as one.
     #[test]
     fn partition_key_condition_must_be_an_equality() {
-        let body = br#"{"TableName":"t","KeyConditionExpression":"pk >= :p",
+        let body = br#"{"TableName":"tbl","KeyConditionExpression":"pk >= :p",
              "ExpressionAttributeValues":{":p":{"S":"a"}}}"#;
         let err = decode_request("DynamoDB_20120810.Query", body).expect_err("must be rejected");
         assert_eq!(err.code, "ValidationException");
@@ -11943,7 +12115,7 @@ mod tests {
     fn the_full_predicate_surface_decodes() {
         let decode_filter = |frag: &str| {
             let body = format!(
-                r##"{{"TableName":"t","FilterExpression":"{frag}",
+                r##"{{"TableName":"tbl","FilterExpression":"{frag}",
                      "ExpressionAttributeNames":{{"#a":"attr"}},
                      "ExpressionAttributeValues":{{
                         ":v":{{"N":"5"}},":lo":{{"N":"1"}},":hi":{{"N":"9"}},
@@ -12016,7 +12188,7 @@ mod tests {
             "a BETWEEN :lo",     // missing AND :hi
         ] {
             let body = format!(
-                r#"{{"TableName":"t","FilterExpression":"{frag}",
+                r#"{{"TableName":"tbl","FilterExpression":"{frag}",
                      "ExpressionAttributeValues":{{":v":{{"N":"5"}},":lo":{{"N":"1"}}}}}}"#
             );
             assert!(
@@ -12030,7 +12202,7 @@ mod tests {
     /// matching nothing.
     #[test]
     fn unknown_attribute_type_code_is_rejected() {
-        let body = br#"{"TableName":"t","FilterExpression":"a attribute_type(a, :t)",
+        let body = br#"{"TableName":"tbl","FilterExpression":"a attribute_type(a, :t)",
              "ExpressionAttributeValues":{":t":{"S":"STRING"}}}"#;
         assert!(decode_request("DynamoDB_20120810.Scan", body).is_err());
     }
@@ -12041,7 +12213,7 @@ mod tests {
     fn boolean_precedence_is_not_then_and_then_or() {
         let f = |frag: &str| {
             let body = format!(
-                r#"{{"TableName":"t","FilterExpression":"{frag}",
+                r#"{{"TableName":"tbl","FilterExpression":"{frag}",
                      "ExpressionAttributeValues":{{":a":{{"N":"1"}},":b":{{"N":"2"}},":c":{{"N":"3"}}}}}}"#
             );
             match decode_request("DynamoDB_20120810.Scan", body.as_bytes())
@@ -12102,7 +12274,7 @@ mod tests {
     /// term, not to the combinator. Splitting on it would produce nonsense.
     #[test]
     fn between_s_own_and_is_not_a_combinator() {
-        let body = br#"{"TableName":"t",
+        let body = br#"{"TableName":"tbl",
              "FilterExpression":"a BETWEEN :lo AND :hi AND b = :b",
              "ExpressionAttributeValues":{":lo":{"N":"1"},":hi":{"N":"9"},":b":{"N":"2"}}}"#;
         match decode_request("DynamoDB_20120810.Scan", body).expect("decodes") {
@@ -12126,7 +12298,7 @@ mod tests {
         }
 
         // A bare BETWEEN must still parse as one term.
-        let solo = br#"{"TableName":"t","FilterExpression":"a BETWEEN :lo AND :hi",
+        let solo = br#"{"TableName":"tbl","FilterExpression":"a BETWEEN :lo AND :hi",
              "ExpressionAttributeValues":{":lo":{"N":"1"},":hi":{"N":"9"}}}"#;
         match decode_request("DynamoDB_20120810.Scan", solo).expect("decodes") {
             Operation::Scan { filter, .. } => {
@@ -12140,7 +12312,7 @@ mod tests {
     /// level, and `(a) OR (b)` is not one group.
     #[test]
     fn parenthesised_groups_are_respected() {
-        let body = br#"{"TableName":"t",
+        let body = br#"{"TableName":"tbl",
              "FilterExpression":"(a = :a) OR (b = :b)",
              "ExpressionAttributeValues":{":a":{"N":"1"},":b":{"N":"2"}}}"#;
         match decode_request("DynamoDB_20120810.Scan", body).expect("decodes") {
@@ -12156,7 +12328,7 @@ mod tests {
     /// alongside the `=`-shaped SET, and resolve `#alias`.
     #[test]
     fn add_and_delete_clauses_parse() {
-        let body = r##"{"TableName":"t","Key":{"pk":{"S":"a"}},
+        let body = r##"{"TableName":"tbl","Key":{"pk":{"S":"a"}},
             "UpdateExpression":"SET #s = :s ADD #c :new DELETE #t :rm",
             "ExpressionAttributeNames":{"#s":"name","#c":"tags2","#t":"tags"},
             "ExpressionAttributeValues":{":s":{"S":"x"},":new":{"SS":["a"]},
@@ -12185,7 +12357,7 @@ mod tests {
     fn malformed_add_clauses_are_rejected() {
         for expr in ["ADD c", "DELETE t"] {
             let body = format!(
-                r#"{{"TableName":"t","Key":{{"pk":{{"S":"a"}}}},
+                r#"{{"TableName":"tbl","Key":{{"pk":{{"S":"a"}}}},
                      "UpdateExpression":"{expr}",
                      "ExpressionAttributeValues":{{":one":{{"N":"1"}}}}}}"#
             );
@@ -12202,7 +12374,7 @@ mod tests {
     /// concurrent update overwrites it — not from refusing it here.
     #[test]
     fn numeric_add_decodes() {
-        let body = br#"{"TableName":"t","Key":{"pk":{"S":"a"}},
+        let body = br#"{"TableName":"tbl","Key":{"pk":{"S":"a"}},
              "UpdateExpression":"ADD c :one",
              "ExpressionAttributeValues":{":one":{"N":"1"}}}"#;
         match decode_request("DynamoDB_20120810.UpdateItem", body).expect("decodes") {
@@ -12217,7 +12389,7 @@ mod tests {
     /// `ADD` still rejects an operand that is neither a number nor a set.
     #[test]
     fn add_rejects_a_non_numeric_non_set_operand() {
-        let body = br#"{"TableName":"t","Key":{"pk":{"S":"a"}},
+        let body = br#"{"TableName":"tbl","Key":{"pk":{"S":"a"}},
              "UpdateExpression":"ADD c :s",
              "ExpressionAttributeValues":{":s":{"S":"x"}}}"#;
         assert!(decode_request("DynamoDB_20120810.UpdateItem", body).is_err());
@@ -12229,7 +12401,7 @@ mod tests {
     fn add_and_delete_require_set_operands() {
         for expr in ["ADD c :s", "DELETE c :s"] {
             let body = format!(
-                r#"{{"TableName":"t","Key":{{"pk":{{"S":"a"}}}},
+                r#"{{"TableName":"tbl","Key":{{"pk":{{"S":"a"}}}},
                      "UpdateExpression":"{expr}",
                      "ExpressionAttributeValues":{{":s":{{"S":"x"}}}}}}"#
             );
@@ -12245,21 +12417,21 @@ mod tests {
     #[test]
     fn batch_get_decodes_per_table_specs() {
         let body = br#"{"RequestItems":{
-            "t1":{"Keys":[{"id":{"S":"a"}},{"id":{"S":"b"}}],
+            "tb1":{"Keys":[{"id":{"S":"a"}},{"id":{"S":"b"}}],
                   "ProjectionExpression":"id,v","ConsistentRead":true},
-            "t2":{"Keys":[{"id":{"S":"c"}}]}}}"#;
+            "tb2":{"Keys":[{"id":{"S":"c"}}]}}}"#;
         match decode_request("DynamoDB_20120810.BatchGetItem", body).expect("decodes") {
             Operation::BatchGetItem { mut requests } => {
                 requests.sort_by(|a, b| a.table.cmp(&b.table));
                 assert_eq!(requests.len(), 2);
-                assert_eq!(requests[0].table, "t1");
+                assert_eq!(requests[0].table, "tb1");
                 assert_eq!(requests[0].keys.len(), 2);
                 assert_eq!(
                     requests[0].projection,
                     Some(Projection(vec![field("id"), field("v")]))
                 );
                 assert!(requests[0].consistent_read);
-                assert_eq!(requests[1].table, "t2");
+                assert_eq!(requests[1].table, "tb2");
                 assert_eq!(requests[1].keys.len(), 1);
                 assert_eq!(requests[1].projection, None);
                 assert!(
@@ -12277,9 +12449,9 @@ mod tests {
         for body in [
             &br#"{}"#[..],
             &br#"{"RequestItems":{}}"#[..],
-            &br#"{"RequestItems":{"t":{}}}"#[..],
-            &br#"{"RequestItems":{"t":{"Keys":[]}}}"#[..],
-            &br#"{"RequestItems":{"t":{"Keys":["nope"]}}}"#[..],
+            &br#"{"RequestItems":{"tbl":{}}}"#[..],
+            &br#"{"RequestItems":{"tbl":{"Keys":[]}}}"#[..],
+            &br#"{"RequestItems":{"tbl":{"Keys":["nope"]}}}"#[..],
         ] {
             assert!(
                 decode_request("DynamoDB_20120810.BatchGetItem", body).is_err(),
@@ -12296,12 +12468,15 @@ mod tests {
         let mut a = Item::new();
         a.insert("id".into(), s("a"));
         let body = batch_get_response(
-            &[("t1".to_string(), vec![a]), ("t2".to_string(), Vec::new())],
+            &[
+                ("tb1".to_string(), vec![a]),
+                ("tb2".to_string(), Vec::new()),
+            ],
             &[],
         );
-        assert!(body.contains(r#""t1":[{"id":{"S":"a"}}]"#), "{body}");
+        assert!(body.contains(r#""tb1":[{"id":{"S":"a"}}]"#), "{body}");
         assert!(
-            body.contains(r#""t2":[]"#),
+            body.contains(r#""tb2":[]"#),
             "a table with no hits is an empty list: {body}"
         );
         assert!(body.contains(r#""UnprocessedKeys":{}"#), "{body}");
@@ -12318,10 +12493,10 @@ mod tests {
         k2.insert("id".into(), s("k2"));
         let body = batch_get_response(
             &[],
-            &[("t1".to_string(), k1), ("t1".to_string(), k2.clone())],
+            &[("tb1".to_string(), k1), ("tb1".to_string(), k2.clone())],
         );
         let v: Value = serde_json::from_str(&body).expect("valid JSON");
-        let keys = v["UnprocessedKeys"]["t1"]["Keys"]
+        let keys = v["UnprocessedKeys"]["tb1"]["Keys"]
             .as_array()
             .expect("Keys array");
         assert_eq!(keys.len(), 2, "{body}");
@@ -12337,11 +12512,11 @@ mod tests {
         let mut key = Item::new();
         key.insert("id".into(), s("d1"));
         let body = batch_write_response(&[
-            ("t1".to_string(), WriteRequest::Put(item)),
-            ("t1".to_string(), WriteRequest::Delete(key)),
+            ("tb1".to_string(), WriteRequest::Put(item)),
+            ("tb1".to_string(), WriteRequest::Delete(key)),
         ]);
         let v: Value = serde_json::from_str(&body).expect("valid JSON");
-        let entries = v["UnprocessedItems"]["t1"].as_array().expect("array");
+        let entries = v["UnprocessedItems"]["tb1"].as_array().expect("array");
         assert_eq!(entries.len(), 2, "{body}");
         assert_eq!(entries[0]["PutRequest"]["Item"]["id"]["S"], "p1");
         assert_eq!(entries[1]["DeleteRequest"]["Key"]["id"]["S"], "d1");
@@ -12383,7 +12558,7 @@ mod tests {
     /// `Segment`/`TotalSegments` decode together and are validated.
     #[test]
     fn scan_segment_decodes_and_validates() {
-        let ok = br#"{"TableName":"t","Segment":1,"TotalSegments":4}"#;
+        let ok = br#"{"TableName":"tbl","Segment":1,"TotalSegments":4}"#;
         match decode_request("DynamoDB_20120810.Scan", ok).expect("decodes") {
             Operation::Scan { segment, .. } => assert_eq!(
                 segment,
@@ -12397,12 +12572,12 @@ mod tests {
 
         for body in [
             // One without the other is a client bug, not a whole-table scan.
-            &br#"{"TableName":"t","Segment":0}"#[..],
-            &br#"{"TableName":"t","TotalSegments":4}"#[..],
+            &br#"{"TableName":"tbl","Segment":0}"#[..],
+            &br#"{"TableName":"tbl","TotalSegments":4}"#[..],
             // Out of range, and a zero split.
-            &br#"{"TableName":"t","Segment":4,"TotalSegments":4}"#[..],
-            &br#"{"TableName":"t","Segment":0,"TotalSegments":0}"#[..],
-            &br#"{"TableName":"t","Segment":-1,"TotalSegments":4}"#[..],
+            &br#"{"TableName":"tbl","Segment":4,"TotalSegments":4}"#[..],
+            &br#"{"TableName":"tbl","Segment":0,"TotalSegments":0}"#[..],
+            &br#"{"TableName":"tbl","Segment":-1,"TotalSegments":4}"#[..],
         ] {
             assert!(
                 decode_request("DynamoDB_20120810.Scan", body).is_err(),
@@ -12488,7 +12663,7 @@ mod tests {
             ("UPDATED_NEW", UpdateReturnValues::UpdatedNew),
         ] {
             let body = format!(
-                r#"{{"TableName":"t","Key":{{"pk":{{"S":"a"}}}},
+                r#"{{"TableName":"tbl","Key":{{"pk":{{"S":"a"}}}},
                      "UpdateExpression":"SET v = :v","ReturnValues":"{raw}",
                      "ExpressionAttributeValues":{{":v":{{"S":"x"}}}}}}"#
             );
@@ -12519,19 +12694,19 @@ mod tests {
         for (target, body) in [
             (
                 "DynamoDB_20120810.PutItem",
-                &br#"{"TableName":"t","Item":{"id":{"S":"k"}}}"#[..],
+                &br#"{"TableName":"tbl","Item":{"id":{"S":"k"}}}"#[..],
             ),
             (
                 "DynamoDB_20120810.GetItem",
-                &br#"{"TableName":"t","Key":{"id":{"S":"k"}}}"#[..],
+                &br#"{"TableName":"tbl","Key":{"id":{"S":"k"}}}"#[..],
             ),
             (
                 "DynamoDB_20120810.DeleteItem",
-                &br#"{"TableName":"t","Key":{"id":{"S":"k"}}}"#[..],
+                &br#"{"TableName":"tbl","Key":{"id":{"S":"k"}}}"#[..],
             ),
             (
                 "DynamoDB_20120810.UpdateItem",
-                &br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+                &br#"{"TableName":"tbl","Key":{"id":{"S":"k"}},
                       "UpdateExpression":"SET a = :v",
                       "ExpressionAttributeValues":{":v":{"S":"x"}}}"#[..],
             ),
@@ -12563,7 +12738,7 @@ mod tests {
             ("INDEXES", ReturnConsumedCapacity::Indexes),
         ] {
             let body = format!(
-                r#"{{"TableName":"t","Key":{{"id":{{"S":"k"}}}},
+                r#"{{"TableName":"tbl","Key":{{"id":{{"S":"k"}}}},
                      "ReturnConsumedCapacity":"{text}"}}"#
             );
             assert_eq!(
@@ -12578,14 +12753,14 @@ mod tests {
         // Silently downgrading an unrecognised level to `NONE` would drop the
         // report a client asked for without telling it — the failure mode this
         // series exists to remove.
-        let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+        let body = br#"{"TableName":"tbl","Key":{"id":{"S":"k"}},
                         "ReturnConsumedCapacity":"SOMETIMES"}"#;
         let err = decode_request("DynamoDB_20120810.GetItem", body).unwrap_err();
         assert_eq!(err.code, "ValidationException");
         assert!(err.message.contains("SOMETIMES"), "{}", err.message);
         assert!(err.message.contains("INDEXES"), "{}", err.message);
 
-        let wrong_type = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+        let wrong_type = br#"{"TableName":"tbl","Key":{"id":{"S":"k"}},
                               "ReturnConsumedCapacity":true}"#;
         let err = decode_request("DynamoDB_20120810.GetItem", wrong_type).unwrap_err();
         assert_eq!(err.code, "ValidationException");
@@ -12594,12 +12769,12 @@ mod tests {
 
     #[test]
     fn a_response_carries_consumed_capacity_only_when_one_was_built() {
-        let cc = ConsumedCapacity::table_only("t", 1.0, ReturnConsumedCapacity::Total);
+        let cc = ConsumedCapacity::table_only("tbl", 1.0, ReturnConsumedCapacity::Total);
         // Present even when the body is otherwise empty: a `PutItem` with
         // `ReturnValues: NONE` still owes the caller its capacity report.
         let with = write_response(ReturnValues::None, None, Some(&cc), None);
         let parsed: Value = serde_json::from_str(&with).expect("json");
-        assert_eq!(parsed["ConsumedCapacity"]["TableName"], "t");
+        assert_eq!(parsed["ConsumedCapacity"]["TableName"], "tbl");
         assert_eq!(parsed["ConsumedCapacity"]["CapacityUnits"], 1.0);
         assert!(parsed.get("Attributes").is_none());
 
@@ -12614,7 +12789,7 @@ mod tests {
     #[test]
     fn return_item_collection_metrics_decodes_and_defaults() {
         let put = |extra: &str| {
-            let body = format!(r#"{{"TableName":"t","Item":{{"id":{{"S":"k"}}}}{extra}}}"#);
+            let body = format!(r#"{{"TableName":"tbl","Item":{{"id":{{"S":"k"}}}}{extra}}}"#);
             match decode_request("DynamoDB_20120810.PutItem", body.as_bytes()) {
                 Ok(Operation::PutItem { metrics, .. }) => Ok(metrics),
                 Ok(other) => panic!("expected PutItem, got {other:?}"),
@@ -12648,7 +12823,7 @@ mod tests {
         // `GetItem` has no such field and its builder takes no such argument —
         // a read never touches an item collection. This pins the decode side
         // of that: the field is simply not part of a `GetItem`.
-        let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+        let body = br#"{"TableName":"tbl","Key":{"id":{"S":"k"}},
                         "ReturnItemCollectionMetrics":"SIZE"}"#;
         // Accepted and ignored rather than rejected, matching how DynamoDB
         // treats a field that does not apply to the operation.
@@ -12664,15 +12839,15 @@ mod tests {
         ] {
             let body = match target {
                 "DynamoDB_20120810.PutItem" => {
-                    r#"{"TableName":"t","Item":{"id":{"S":"k"}},
+                    r#"{"TableName":"tbl","Item":{"id":{"S":"k"}},
                         "ReturnItemCollectionMetrics":"SIZE"}"#
                 }
                 "DynamoDB_20120810.DeleteItem" => {
-                    r#"{"TableName":"t","Key":{"id":{"S":"k"}},
+                    r#"{"TableName":"tbl","Key":{"id":{"S":"k"}},
                         "ReturnItemCollectionMetrics":"SIZE"}"#
                 }
                 _ => {
-                    r#"{"TableName":"t","Key":{"id":{"S":"k"}},
+                    r#"{"TableName":"tbl","Key":{"id":{"S":"k"}},
                         "UpdateExpression":"SET a = :v",
                         "ExpressionAttributeValues":{":v":{"S":"x"}},
                         "ReturnItemCollectionMetrics":"SIZE"}"#
@@ -12693,7 +12868,7 @@ mod tests {
     fn a_write_response_carries_metrics_beside_everything_else() {
         let mut item = Item::new();
         item.insert("pk".to_string(), s("p1"));
-        let cc = ConsumedCapacity::table_only("t", 1.0, ReturnConsumedCapacity::Total);
+        let cc = ConsumedCapacity::table_only("tbl", 1.0, ReturnConsumedCapacity::Total);
         let metrics = ItemCollectionMetrics {
             key: item.clone(),
             bytes: Some(1_073_741_824),
@@ -12746,7 +12921,7 @@ mod tests {
         // `Attributes`, which is the whole reason these share one serializer.
         let mut item = Item::new();
         item.insert("id".to_string(), s("k"));
-        let cc = ConsumedCapacity::table_only("t", 0.5, ReturnConsumedCapacity::Total);
+        let cc = ConsumedCapacity::table_only("tbl", 0.5, ReturnConsumedCapacity::Total);
 
         let body: Value =
             serde_json::from_str(&get_item_response(Some(&item), Some(&cc))).expect("json");

@@ -205,7 +205,7 @@ async fn repair_re_replicates_to_a_fresh_target_after_a_replica_node_dies() {
     let (status, body) = dynamo(
         addr,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"t","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
+        r#"{"TableName":"tbl","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "StreamSpecification":{"StreamEnabled":true,
                 "StreamViewType":"KEYS_ONLY"}}"#,
@@ -215,14 +215,14 @@ async fn repair_re_replicates_to_a_fresh_target_after_a_replica_node_dies() {
     let (status, _) = dynamo(
         addr,
         "DynamoDB_20120810.PutItem",
-        r#"{"TableName":"t","Item":{"id":{"S":"p1"}}}"#,
+        r#"{"TableName":"tbl","Item":{"id":{"S":"p1"}}}"#,
     )
     .await;
     assert_eq!(status, 200);
-    await_chain_len(&nodes, "t", 1).await;
+    await_chain_len(&nodes, "tbl", 1).await;
 
     let meta = nodes[0].metadata();
-    let (tablet, epoch) = first_sealed(&meta, "t");
+    let (tablet, epoch) = first_sealed(&meta, "tbl");
     let original_replicas = meta.stream_shards[&(tablet, epoch)].replicas.clone();
     assert_eq!(original_replicas.len(), 3);
 

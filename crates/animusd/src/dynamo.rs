@@ -351,10 +351,82 @@ fn resolve_key<E: Env, R: RelayClient>(
         reg.extract_key(table, item).map_err(registry_error)?
     };
     reject_empty_key_value(&pk)?;
+    check_partition_key_value_size(&pk)?;
     if let Some(sk) = &sk {
         reject_empty_key_value(sk)?;
+        check_sort_key_value_size(sk)?;
     }
+    check_index_key_value_sizes(meta, table, item)?;
     Ok((pk, sk))
+}
+
+/// The byte length DynamoDB's partition/sort-key size caps charge an
+/// `AttributeValue` against: `S`'s UTF-8 length or `B`'s raw byte length —
+/// `N` is unaffected. A small, pure duplicate of `animus_dynamo::wire`'s own
+/// private copy (that crate's module-private helpers are deliberately not
+/// exported across the wire boundary; this crate re-derives the same
+/// byte-shape rule rather than widening `wire`'s own surface for it).
+fn key_value_byte_len(v: &AttributeValue) -> Option<usize> {
+    match v {
+        AttributeValue::S(s) => Some(s.len()),
+        AttributeValue::B(b) => Some(b.len()),
+        _ => None,
+    }
+}
+
+/// ADR 0072: AWS's partition-key value size cap (2048 bytes), applied to
+/// the base table's own key here — [`resolve_key`] is the single choke
+/// point every write/point-read path resolves a table's key through (the
+/// same property [`reject_empty_key_value`]'s own doc already states), so
+/// checked once here covers `PutItem`/`GetItem`/`DeleteItem`/`UpdateItem`/
+/// `BatchWriteItem`/`BatchGetItem`/`TransactWriteItems`/`TransactGetItems`
+/// alike.
+fn check_partition_key_value_size(v: &AttributeValue) -> Result<(), WireError> {
+    if key_value_byte_len(v).is_some_and(|len| len > animus_dynamo::limits::MAX_PARTITION_KEY_BYTES)
+    {
+        return Err(WireError::validation(format!(
+            "One or more parameter values were invalid: the partition key value exceeds the \
+             maximum size of {} bytes",
+            animus_dynamo::limits::MAX_PARTITION_KEY_BYTES
+        )));
+    }
+    Ok(())
+}
+
+/// [`check_partition_key_value_size`]'s sort-key sibling (1024 bytes).
+fn check_sort_key_value_size(v: &AttributeValue) -> Result<(), WireError> {
+    if key_value_byte_len(v).is_some_and(|len| len > animus_dynamo::limits::MAX_SORT_KEY_BYTES) {
+        return Err(WireError::validation(format!(
+            "One or more parameter values were invalid: the sort key value exceeds the \
+             maximum size of {} bytes",
+            animus_dynamo::limits::MAX_SORT_KEY_BYTES
+        )));
+    }
+    Ok(())
+}
+
+/// GSI/LSI key attribute values obey the same size caps as the base table's
+/// own key (ADR 0072) — a materialized index row's hash/sort attribute is
+/// itself a partition/sort key, just against a different keyspace. Checked
+/// here, inside [`resolve_key`]'s own single choke point (using the `meta`
+/// it already has), rather than at index-row derivation time
+/// (`animus_item::derive_kind_writes`, which is `KvCommand::KindEval`'s
+/// frozen, infallible apply-path core and must never fail): a write whose
+/// index key value is already too big is rejected before it is ever
+/// proposed. A no-op for a read's bare `Key` map, which never carries a
+/// non-key attribute.
+fn check_index_key_value_sizes(meta: &Metadata, table: &str, item: &Item) -> Result<(), WireError> {
+    for idx in meta.table_indexes(table) {
+        if let Some(v) = item.get(&idx.hash_attribute) {
+            check_partition_key_value_size(v)?;
+        }
+        if let Some(sort_name) = &idx.sort_attribute
+            && let Some(v) = item.get(sort_name)
+        {
+            check_sort_key_value_size(v)?;
+        }
+    }
+    Ok(())
 }
 
 /// Issue #848: AWS's 2020 empty-value change allows an empty `S`/`B` for a
@@ -11028,14 +11100,14 @@ mod stream_write_path_tests {
     async fn streamed_unindexed_table_writes_base_and_change_only() {
         let dir = tempfile::TempDir::new().unwrap();
         let node = single_node(dir.path()).await;
-        create_streamed_table(node.dynamo_addr(), "s1").await;
-        let group = await_group(&node, "s1").await;
+        create_streamed_table(node.dynamo_addr(), "tbs1").await;
+        let group = await_group(&node, "tbs1").await;
         assert_eq!(group.pending_changes_key_order().await.len(), 0);
 
         let (status, body) = dynamo(
             node.dynamo_addr(),
             "DynamoDB_20120810.PutItem",
-            r#"{"TableName":"s1","Item":{"id":{"S":"a"},"n":{"N":"1"}}}"#,
+            r#"{"TableName":"tbs1","Item":{"id":{"S":"a"},"n":{"N":"1"}}}"#,
         )
         .await;
         assert_eq!(status, 200, "PutItem failed: {body}");
@@ -11061,7 +11133,7 @@ mod stream_write_path_tests {
         let (status, body) = dynamo(
             node.dynamo_addr(),
             "DynamoDB_20120810.GetItem",
-            r#"{"TableName":"s1","Key":{"id":{"S":"a"}}}"#,
+            r#"{"TableName":"tbs1","Key":{"id":{"S":"a"}}}"#,
         )
         .await;
         assert_eq!(status, 200, "GetItem failed: {body}");
@@ -11070,7 +11142,7 @@ mod stream_write_path_tests {
         let (status, body) = dynamo(
             node.dynamo_addr(),
             "DynamoDB_20120810.UpdateItem",
-            r#"{"TableName":"s1","Key":{"id":{"S":"a"}},
+            r#"{"TableName":"tbs1","Key":{"id":{"S":"a"}},
                 "UpdateExpression":"SET n = :v",
                 "ExpressionAttributeValues":{":v":{"N":"2"}}}"#,
         )
@@ -11081,7 +11153,7 @@ mod stream_write_path_tests {
         let (status, body) = dynamo(
             node.dynamo_addr(),
             "DynamoDB_20120810.DeleteItem",
-            r#"{"TableName":"s1","Key":{"id":{"S":"a"}}}"#,
+            r#"{"TableName":"tbs1","Key":{"id":{"S":"a"}}}"#,
         )
         .await;
         assert_eq!(status, 200, "DeleteItem failed: {body}");
@@ -11123,18 +11195,18 @@ mod stream_write_path_tests {
         let (status, body) = dynamo(
             node.dynamo_addr(),
             "DynamoDB_20120810.CreateTable",
-            r#"{"TableName":"mb",
+            r#"{"TableName":"tmb",
                 "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
                 "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
         )
         .await;
         assert_eq!(status, 200, "CreateTable failed: {body}");
-        let group = await_group(&node, "mb").await;
+        let group = await_group(&node, "tmb").await;
 
         let puts: Vec<String> = (0..BATCH_WRITE_MAX_ITEMS)
             .map(|i| format!(r#"{{"PutRequest":{{"Item":{{"id":{{"S":"k{i:03}"}}}}}}}}"#))
             .collect();
-        let body_json = format!(r#"{{"RequestItems":{{"mb":[{}]}}}}"#, puts.join(","));
+        let body_json = format!(r#"{{"RequestItems":{{"tmb":[{}]}}}}"#, puts.join(","));
         let (status, body) = dynamo(
             node.dynamo_addr(),
             "DynamoDB_20120810.BatchWriteItem",
@@ -11498,13 +11570,13 @@ mod stream_write_path_tests {
     async fn batch_write_on_a_streamed_table_emits_change_records() {
         let dir = tempfile::TempDir::new().unwrap();
         let node = single_node(dir.path()).await;
-        create_streamed_table(node.dynamo_addr(), "sb").await;
-        let group = await_group(&node, "sb").await;
+        create_streamed_table(node.dynamo_addr(), "tsb").await;
+        let group = await_group(&node, "tsb").await;
 
         let (status, body) = dynamo(
             node.dynamo_addr(),
             "DynamoDB_20120810.BatchWriteItem",
-            r#"{"RequestItems":{"sb":[
+            r#"{"RequestItems":{"tsb":[
                 {"PutRequest":{"Item":{"id":{"S":"a"},"n":{"N":"1"}}}},
                 {"PutRequest":{"Item":{"id":{"S":"b"},"n":{"N":"2"}}}}
             ]}}"#,
@@ -11538,20 +11610,20 @@ mod stream_write_path_tests {
     async fn change_record_carries_both_images_regardless_of_view_type() {
         let dir = tempfile::TempDir::new().unwrap();
         let node = single_node(dir.path()).await;
-        create_streamed_table(node.dynamo_addr(), "s2").await;
-        let group = await_group(&node, "s2").await;
+        create_streamed_table(node.dynamo_addr(), "tbs2").await;
+        let group = await_group(&node, "tbs2").await;
 
         let (status, body) = dynamo(
             node.dynamo_addr(),
             "DynamoDB_20120810.PutItem",
-            r#"{"TableName":"s2","Item":{"id":{"S":"a"},"n":{"N":"1"}}}"#,
+            r#"{"TableName":"tbs2","Item":{"id":{"S":"a"},"n":{"N":"1"}}}"#,
         )
         .await;
         assert_eq!(status, 200, "PutItem failed: {body}");
         let (status, body) = dynamo(
             node.dynamo_addr(),
             "DynamoDB_20120810.PutItem",
-            r#"{"TableName":"s2","Item":{"id":{"S":"a"},"n":{"N":"2"}}}"#,
+            r#"{"TableName":"tbs2","Item":{"id":{"S":"a"},"n":{"N":"2"}}}"#,
         )
         .await;
         assert_eq!(status, 200, "second PutItem failed: {body}");
@@ -11580,14 +11652,14 @@ mod stream_write_path_tests {
     async fn trim_blocked_on_a_streamed_table_with_no_copier_cursor_yet() {
         let dir = tempfile::TempDir::new().unwrap();
         let node = single_node(dir.path()).await;
-        create_streamed_table(node.dynamo_addr(), "s3").await;
-        let group = await_group(&node, "s3").await;
+        create_streamed_table(node.dynamo_addr(), "tbs3").await;
+        let group = await_group(&node, "tbs3").await;
 
         for i in 0..5 {
             let (status, body) = dynamo(
                 node.dynamo_addr(),
                 "DynamoDB_20120810.PutItem",
-                &format!(r#"{{"TableName":"s3","Item":{{"id":{{"S":"k{i}"}}}}}}"#),
+                &format!(r#"{{"TableName":"tbs3","Item":{{"id":{{"S":"k{i}"}}}}}}"#),
             )
             .await;
             assert_eq!(status, 200, "PutItem({i}) failed: {body}");

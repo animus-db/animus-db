@@ -638,7 +638,7 @@ fn list_streams_and_describe_stream_after_enable_over_seeds() {
 /// `get_records_open` → `read_stream_hot_records` → `hot_read` forwarding.
 fn run_get_records_over_the_open_tail_before_any_seal(seed: u64) {
     let mut cluster = SimCluster::new(seed, 3, 3);
-    let table = "t";
+    let table = "tbl";
 
     let (status, body) = create_table(&mut cluster, 0, table);
     assert_eq!(status, 200, "seed={seed}: CreateTable failed: {body}");
@@ -722,7 +722,7 @@ fn get_records_over_the_open_tail_before_any_seal_over_seeds() {
 /// `SegmentStoreHandle::S3` (the shared `SimSegmentStore`).
 fn run_get_records_over_the_sealed_shard_from_the_shared_store(seed: u64) {
     let mut cluster = SimCluster::new(seed, 3, 3);
-    let table = "t";
+    let table = "tbl";
 
     let (status, body) = create_table(&mut cluster, 0, table);
     assert_eq!(status, 200, "seed={seed}: CreateTable failed: {body}");
@@ -800,7 +800,7 @@ fn get_records_over_the_sealed_shard_from_the_shared_store_over_seeds() {
 /// across the seal (the sealed-vs-open handoff, ADR 0042 §2).
 fn run_iterator_obtained_before_a_seal_continues_correctly_across_the_seal(seed: u64) {
     let mut cluster = SimCluster::new(seed, 3, 3);
-    let table = "t";
+    let table = "tbl";
 
     let (status, body) = create_table(&mut cluster, 0, table);
     assert_eq!(status, 200, "seed={seed}: CreateTable failed: {body}");
@@ -874,7 +874,7 @@ fn iterator_obtained_before_a_seal_continues_correctly_across_the_seal_over_seed
 /// visits every record exactly once.
 fn run_next_shard_iterator_pagination_with_small_limit_visits_each_record_once(seed: u64) {
     let mut cluster = SimCluster::new(seed, 3, 3);
-    let table = "t";
+    let table = "tbl";
 
     let (status, body) = create_table(&mut cluster, 0, table);
     assert_eq!(status, 200, "seed={seed}: CreateTable failed: {body}");
@@ -973,7 +973,7 @@ fn next_shard_iterator_pagination_with_small_limit_visits_each_record_once_over_
 /// sealed.
 fn run_iterator_types_latest_at_and_after_sequence_number(seed: u64) {
     let mut cluster = SimCluster::new(seed, 3, 3);
-    let table = "t";
+    let table = "tbl";
 
     let (status, body) = create_table(&mut cluster, 0, table);
     assert_eq!(status, 200, "seed={seed}: CreateTable failed: {body}");
@@ -1152,7 +1152,7 @@ fn iterator_types_latest_at_and_after_sequence_number_over_seeds() {
 ///     correctly see that later write.
 fn run_latest_iterator_max_hlc_matches_true_commit_order(seed: u64) {
     let mut cluster = SimCluster::new(seed, 3, 3);
-    let table = "t";
+    let table = "tbl";
 
     let (status, body) = create_table(&mut cluster, 0, table);
     assert_eq!(status, 200, "seed={seed}: CreateTable failed: {body}");
@@ -1281,7 +1281,7 @@ fn latest_iterator_max_hlc_matches_true_commit_order_over_seeds() {
 /// (ADR 0043 §A3: a sealed shard is served by any node).
 fn run_cross_node_reads_answer_the_same_records_for_the_same_iterator(seed: u64) {
     let mut cluster = SimCluster::new(seed, 3, 3);
-    let table = "t";
+    let table = "tbl";
 
     let (status, body) = create_table(&mut cluster, 0, table);
     assert_eq!(status, 200, "seed={seed}: CreateTable failed: {body}");
@@ -1353,7 +1353,7 @@ fn cross_node_reads_answer_the_same_records_for_the_same_iterator_over_seeds() {
 /// `ResourceNotFoundException`.
 fn run_disable_then_grace_window_describe_and_get_records(seed: u64) {
     let mut cluster = SimCluster::new(seed, 3, 3);
-    let table = "t";
+    let table = "tbl";
 
     let (status, body) = create_table(&mut cluster, 0, table);
     assert_eq!(status, 200, "seed={seed}: CreateTable failed: {body}");
@@ -1570,7 +1570,7 @@ fn transact_write_items(cluster: &mut SimCluster, node: u64, body: &str) -> (u16
 /// converge on both the enable and the disable.
 fn run_update_table_stream_enable_and_disable_through_every_node(seed: u64) {
     let mut cluster = SimCluster::new(seed, 3, 3);
-    let table = "t";
+    let table = "tbl";
     let (status, body) = create_table(&mut cluster, 0, table);
     assert_eq!(status, 200, "seed={seed}: CreateTable failed: {body}");
 
@@ -1637,7 +1637,7 @@ fn update_table_stream_enable_and_disable_through_every_node_over_seeds() {
 /// §4/§9).
 fn run_describe_table_returns_stream_spec_and_arn_reenable_mints_new_label(seed: u64) {
     let mut cluster = SimCluster::new(seed, 3, 3);
-    let table = "t";
+    let table = "tbl";
     let (status, body) = create_table_with_stream(&mut cluster, 0, table, "NEW_IMAGE");
     assert_eq!(status, 200, "seed={seed}: CreateTable failed: {body}");
     let first_label = stream_label(&cluster, 0, table);
@@ -2179,7 +2179,7 @@ fn transact_write_items_abort_leaves_no_stream_event_over_seeds() {
 /// module's own doc has the general mapping).
 fn run_get_records_walks_the_shard_chain_and_drains_the_open_tail(seed: u64) {
     let mut cluster = SimCluster::new(seed, 3, 3);
-    let table = "t";
+    let table = "tbl";
     let (status, body) = create_table_with_stream(&mut cluster, 0, table, "NEW_AND_OLD_IMAGES");
     assert_eq!(status, 200, "seed={seed}: CreateTable failed: {body}");
     let label = stream_label(&cluster, 0, table);
@@ -2336,7 +2336,7 @@ fn get_records_walks_the_shard_chain_and_drains_the_open_tail_over_seeds() {
 /// every node of a 3-node cluster in turn.
 fn run_get_records_on_an_open_shard_forwards_correctly_from_every_node(seed: u64) {
     let mut cluster = SimCluster::new(seed, 3, 3);
-    let table = "t";
+    let table = "tbl";
     let (status, body) = create_table_with_stream(&mut cluster, 0, table, "KEYS_ONLY");
     assert_eq!(status, 200, "seed={seed}: CreateTable failed: {body}");
     let label = stream_label(&cluster, 0, table);
@@ -2408,7 +2408,7 @@ fn get_records_on_an_open_shard_forwards_correctly_from_every_node_over_seeds() 
 /// deliver exactly the one post-enable write.
 fn run_pre_enable_marker_records_never_surface_on_the_stream(seed: u64) {
     let mut cluster = SimCluster::new(seed, 3, 3);
-    let table = "mk";
+    let table = "mkt";
     let (status, body) = create_table(&mut cluster, 0, table);
     assert_eq!(status, 200, "seed={seed}: CreateTable failed: {body}");
 

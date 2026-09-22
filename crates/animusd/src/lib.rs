@@ -20381,6 +20381,8 @@ mod sim_cluster_dynamo_update_add_delete;
 #[cfg(test)]
 mod sim_cluster_dynamo_updated_return_values;
 #[cfg(test)]
+mod sim_cluster_dynamo_wire_limits;
+#[cfg(test)]
 mod sim_cluster_kind_batch_outcome;
 /// Issue #734: the deterministic, real-time-free sibling of
 /// `issue_298_conflict_tests` below — the identical A-decided-but-

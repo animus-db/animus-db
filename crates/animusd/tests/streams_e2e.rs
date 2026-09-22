@@ -1206,7 +1206,7 @@ async fn fs_segment_store_opt_in_smoke() {
     let (status, body) = dynamo(
         addr,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"t","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
+        r#"{"TableName":"tbl","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "StreamSpecification":{"StreamEnabled":true,
                 "StreamViewType":"NEW_AND_OLD_IMAGES"}}"#,
@@ -1219,14 +1219,14 @@ async fn fs_segment_store_opt_in_smoke() {
     let (status, body) = dynamo(
         addr,
         "DynamoDB_20120810.PutItem",
-        r#"{"TableName":"t","Item":{"id":{"S":"a"}}}"#,
+        r#"{"TableName":"tbl","Item":{"id":{"S":"a"}}}"#,
     )
     .await;
     assert_eq!(status, 200, "PutItem failed: {body}");
 
     await_true(20, "the write never sealed via the Fs store", || {
         let meta = nodes[0].metadata();
-        meta.tablets_for_table("t").next().is_some_and(|(&t, _)| {
+        meta.tablets_for_table("tbl").next().is_some_and(|(&t, _)| {
             meta.stream_shards
                 .range((t, 0)..=(t, u64::MAX))
                 .next()
@@ -1235,7 +1235,7 @@ async fn fs_segment_store_opt_in_smoke() {
     })
     .await;
 
-    let tablet = tablets_for(&nodes[0].metadata(), "t")[0];
+    let tablet = tablets_for(&nodes[0].metadata(), "tbl")[0];
     let meta = nodes[0].metadata();
     let row = &meta.stream_shards[&(tablet, 0)];
     // Ledger-named-object amendment: the object lands at the row's own
@@ -1719,7 +1719,7 @@ async fn admin_status_survives_a_populated_stream_shard_catalog() {
     let (status, body) = dynamo(
         dynamo_addr,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"t","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
+        r#"{"TableName":"tbl","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "StreamSpecification":{"StreamEnabled":true,
                 "StreamViewType":"NEW_AND_OLD_IMAGES"}}"#,
@@ -1730,7 +1730,7 @@ async fn admin_status_survives_a_populated_stream_shard_catalog() {
     let (status, body) = dynamo(
         dynamo_addr,
         "DynamoDB_20120810.PutItem",
-        r#"{"TableName":"t","Item":{"id":{"S":"a"}}}"#,
+        r#"{"TableName":"tbl","Item":{"id":{"S":"a"}}}"#,
     )
     .await;
     assert_eq!(status, 200, "PutItem failed: {body}");
@@ -1764,13 +1764,13 @@ async fn admin_status_survives_a_populated_stream_shard_catalog() {
         !rows.is_empty(),
         "GET /admin/status must actually surface the sealed shard row(s): {body:?}"
     );
-    let tablet = tablets_for(&nodes[0].metadata(), "t")[0];
+    let tablet = tablets_for(&nodes[0].metadata(), "tbl")[0];
     let row = rows
         .iter()
         .find(|r| r["tablet"].as_u64() == Some(tablet.0))
         .unwrap_or_else(|| panic!("no stream_shards row for tablet {}: {body:?}", tablet.0));
     assert_eq!(row["epoch"].as_u64(), Some(0));
-    assert_eq!(row["table"].as_str(), Some("t"));
+    assert_eq!(row["table"].as_str(), Some("tbl"));
 }
 
 /// Regression, wire-protocol side: `ClientResponse::Status { metadata, .. }`
@@ -1793,7 +1793,7 @@ async fn client_protocol_status_survives_a_populated_stream_shard_catalog() {
     let (status, body) = dynamo(
         dynamo_addr,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"t","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
+        r#"{"TableName":"tbl","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "StreamSpecification":{"StreamEnabled":true,
                 "StreamViewType":"NEW_AND_OLD_IMAGES"}}"#,
@@ -1804,7 +1804,7 @@ async fn client_protocol_status_survives_a_populated_stream_shard_catalog() {
     let (status, body) = dynamo(
         dynamo_addr,
         "DynamoDB_20120810.PutItem",
-        r#"{"TableName":"t","Item":{"id":{"S":"a"}}}"#,
+        r#"{"TableName":"tbl","Item":{"id":{"S":"a"}}}"#,
     )
     .await;
     assert_eq!(status, 200, "PutItem failed: {body}");
@@ -1867,7 +1867,7 @@ async fn admin_data_dynamo_proxy_reaches_streams_read_api() {
         "POST",
         "/admin/data/dynamo",
         Some(
-            r#"{"op":"CreateTable","payload":{"TableName":"t",
+            r#"{"op":"CreateTable","payload":{"TableName":"tbl",
                 "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
                 "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
                 "StreamSpecification":{"StreamEnabled":true,
@@ -1886,7 +1886,7 @@ async fn admin_data_dynamo_proxy_reaches_streams_read_api() {
         admin_addr,
         "POST",
         "/admin/data/dynamo",
-        Some(r#"{"op":"PutItem","payload":{"TableName":"t","Item":{"id":{"S":"a"}}}}"#),
+        Some(r#"{"op":"PutItem","payload":{"TableName":"tbl","Item":{"id":{"S":"a"}}}}"#),
     )
     .await;
     assert_eq!(status, 200, "PutItem via admin proxy: {body:?}");
@@ -1913,7 +1913,7 @@ async fn admin_data_dynamo_proxy_reaches_streams_read_api() {
     assert!(
         streams
             .iter()
-            .any(|s| s["TableName"] == "t" && s["StreamArn"] == stream_arn),
+            .any(|s| s["TableName"] == "tbl" && s["StreamArn"] == stream_arn),
         "ListStreams via admin proxy must list the table's own stream: {body:?}"
     );
 

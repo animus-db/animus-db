@@ -80,7 +80,7 @@ async fn dynamo_wire_rejects_bad_requests() {
     let (status, body) = dynamo(
         addr,
         "DynamoDB_20120810.PutItem",
-        r#"{"TableName":"t","Item":{"name":{"S":"x"}}}"#,
+        r#"{"TableName":"tbl","Item":{"name":{"S":"x"}}}"#,
     )
     .await;
     assert_eq!(status, 400);
