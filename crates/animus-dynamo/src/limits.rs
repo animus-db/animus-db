@@ -25,6 +25,12 @@
 //!
 //! ## New limits (constants only — see each doc comment for the AWS rule it
 //! mirrors; enforcement lands in later layers of this series)
+//!
+//! - [`MAX_QUERY_SCAN_PAGE_BYTES`] is now enforced (ADR 0072 layer 3) —
+//!   `animusd::dynamo`'s shared `Query`/`Scan` pagination loops
+//!   (`paginated_table_examine` and its two siblings) track it directly;
+//!   see that crate's own doc comment for the accounting/boundary rule.
+//!   Every other new constant below is still catalogue-only.
 
 pub use crate::wire::{
     ACCOUNT_MAX_READ_CAPACITY_UNITS, ACCOUNT_MAX_WRITE_CAPACITY_UNITS,
@@ -81,6 +87,12 @@ pub fn is_valid_table_or_index_name(name: &str) -> bool {
 /// AWS's `Query`/`Scan` per-page evaluation limit: at most 1 MiB of item
 /// data evaluated per page (**before** any `FilterExpression` is applied),
 /// after which the call returns a `LastEvaluatedKey` rather than continuing.
+///
+/// **Enforced** (ADR 0072 layer 3) by `animusd::dynamo`'s shared `Query`/
+/// `Scan` pagination loops (`paginated_table_examine`/
+/// `paginated_kind_examine`/`paginated_kind_examine_one`) — at the
+/// coordinator, composing with `Limit`; see those functions' own doc
+/// comment for the exact accounting and boundary rule.
 pub const MAX_QUERY_SCAN_PAGE_BYTES: usize = 1_048_576;
 
 /// AWS's `BatchGetItem` response-size limit: at most 16 MiB of item data

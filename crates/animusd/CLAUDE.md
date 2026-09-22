@@ -4636,6 +4636,38 @@ route below the edge through the same `ClientCtx` CP primitives.
   case (`consistent_read` is always `false` there, so the ordinary derivation
   produces `Eventual`).
 
+  **Every `Query`/`Scan` page is also capped at `animus_dynamo::limits::
+  MAX_QUERY_SCAN_PAGE_BYTES` (1 MiB) of evaluated item data — AWS's own
+  pagination rule (ADR 0072 layer 3), enforced at the coordinator, not
+  pushed into `animus-cp-data`.** `paginated_table_examine`/
+  `paginated_kind_examine`/`paginated_kind_examine_one` (the shared
+  windowed-continuation loops base/GSI `Scan`/`Query` and LSI `Scan`/`Query`
+  all funnel through) sum `animus_item::item_size` over exactly the rows
+  they push into `examined` — the same "evaluated" set the `Limit`/`want`
+  count budget already governs, after `KeyConditionExpression`/tombstone-
+  skipping but before `FilterExpression`/`ProjectionExpression` — and stop
+  **before** an item would push the running total over the cap, so a page
+  never exceeds 1 MiB even though real DynamoDB doesn't document the exact
+  edge of this rule. That excluded item becomes the next page's first item,
+  exactly like a `Limit`-truncated one; `Limit` and the byte cap compose,
+  whichever stops the page first wins; and `Select: COUNT` pages by it too
+  (a page can come back with zero `Items` yet still carry
+  `LastEvaluatedKey`, matching AWS's well-known `FilterExpression`
+  surprise). **This is coordinator-only**: `ClientCtx::cp_scan`/
+  `cp_scan_kind`/`cp_scan_kind_table` already carry an item-*count* budget
+  (`limit: Option<usize>`) down into the per-tablet scan RPC
+  (`CpGroup::linearizable_scan`, inside `animus-cp-data`), but a byte budget
+  does not ride along — an unbounded (`Limit`-less) `Scan`'s single
+  round-trip to a tablet can still fetch more than one evaluated page's
+  worth of raw pairs before the coordinator's own loop notices and stops
+  consuming them; a follow-up that wants defense at the tablet itself needs
+  to widen that RPC (and `animus-cp-data`'s own scan primitive) with a
+  byte-budget twin of `limit`, which this layer deliberately did not do.
+  `Select`/PartiQL `ExecuteStatement` `SELECT` inherit the cap for free —
+  both reuse `run_query`/`run_scan`'s own response, the latter mapping
+  `LastEvaluatedKey` to `NextToken` (`reshape_query_scan_response_to_
+  execute_statement`). Tests: `sim_cluster_dynamo_page_size_cap.rs`.
+
   Regression: `animus-dynamo`'s `wire` unit tests plus `tests/
   dynamo_index_scan.rs`/`kind_scan.rs` end to end.
 
