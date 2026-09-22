@@ -284,6 +284,18 @@ async fn data_only_node_rejects_watch_metadata_instead_of_degrading() {
 /// back to a full `Status` reply rather than the restarted node silently
 /// under-reporting; a caller already caught up to the post-restart watermark
 /// still gets the cheap trivial delta.
+///
+/// **The post-restart watermark assertion below is the issue #1024
+/// regression** (ADR 0038's 2026-09-21 amendment): a control node's
+/// leadership now implies its apply task has already seeded the durable
+/// watermark from the engine — `RaftNode::start*`'s `drive` awaits the
+/// apply task's one-time startup seed inline, before its own consensus loop
+/// ever ticks the core, so `is_control_leader()` answering `true` cannot
+/// happen before `cache`/`engine_applied`/`MetadataWatch` are already
+/// published. Before that fix, a restarted single-voter node could win its
+/// post-recovery election before its engine scan finished and answer
+/// `Status` with watermark 0 — exactly what this assertion would have
+/// caught failing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn restarted_control_node_resets_its_ring_and_pre_restart_watchers_fall_back() {
     let dir = support::panic_safe_tempdir();
@@ -371,7 +383,11 @@ async fn restarted_control_node_resets_its_ring_and_pre_restart_watchers_fall_ba
         .expect("proposed table schema did not land in 10s");
     }
     let pre_restart_watermark = watermark_of(&call(client_addr, ClientRequest::Status).await);
-    assert!(pre_restart_watermark > early_watermark);
+    assert!(
+        pre_restart_watermark > early_watermark,
+        "expected the watermark to have advanced past the 3 proposed schemas \
+         (early_watermark={early_watermark}, pre_restart_watermark={pre_restart_watermark})"
+    );
 
     node.shutdown_graceful().await;
 
@@ -398,6 +414,11 @@ async fn restarted_control_node_resets_its_ring_and_pre_restart_watchers_fall_ba
             }
         }
     };
+    // issue #1024: polling leadership alone is sufficient evidence the
+    // durable watermark is already published — `drive`'s apply-task seed now
+    // runs inline, before this node's core can ever tick/campaign, so a
+    // `true` here can never precede `cache`/`engine_applied`/`watch` being
+    // seeded from the engine (see this test's own doc comment above).
     timeout(Duration::from_secs(20), async {
         loop {
             if node.is_control_leader() {
@@ -411,9 +432,16 @@ async fn restarted_control_node_resets_its_ring_and_pre_restart_watchers_fall_ba
 
     // `Metadata` survived (the engine is durable) — confirm the restarted
     // node's own watermark is at least what it was pre-restart (it may have
-    // advanced further, e.g. a fresh election no-op).
+    // advanced further, e.g. a fresh election no-op). issue #1024: a
+    // regression here means the node became leader before its apply task's
+    // startup seed had published the durable watermark.
     let post_restart_watermark = watermark_of(&call(client_addr, ClientRequest::Status).await);
-    assert!(post_restart_watermark >= pre_restart_watermark);
+    assert!(
+        post_restart_watermark >= pre_restart_watermark,
+        "issue #1024: post-restart watermark regressed below pre-restart \
+         (early_watermark={early_watermark}, pre_restart_watermark={pre_restart_watermark}, \
+         post_restart_watermark={post_restart_watermark})"
+    );
 
     // A watcher stuck at `early_watermark` (before any of the 3 commands)
     // is missing real history the freshly reset ring never retained — falls
