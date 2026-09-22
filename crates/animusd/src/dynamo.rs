@@ -9362,28 +9362,13 @@ fn rejected_wire_error(code: &str, message: String) -> WireError {
 /// `KindWriteBatch` hop. Unlike [`decode_relayed_error`] (which recovers a
 /// *whole-request* error string), this is per-item: each item's own outcome
 /// rides its own typed slot, so there is no ambiguous "unmarked string"
-/// case to fall back to — every code this crate can mint for a batched item
-/// (see [`kind_write_batch_at_leader`]'s own doc) is named explicitly, and
-/// anything else degrades to [`internal`], the same closed-set discipline
-/// `decode_relayed_error` already uses.
+/// case to fall back to. Shares [`relayable_wire_error`]'s one closed-set
+/// table with `decode_relayed_error` (issue #1035 — see that function's own
+/// doc for why one shared table replaces what used to be two separately
+/// maintained allowlists); anything outside it still degrades to
+/// [`internal`].
 fn wire_error_from_batch_rejected(code: String, message: String) -> WireError {
-    match code.as_str() {
-        "ValidationException" => WireError::validation(message),
-        "ProvisionedThroughputExceededException" => {
-            WireError::provisioned_throughput_exceeded(message)
-        }
-        // Issue #994/#996: a still-`decide::read_should_retry`-satisfying
-        // whole-entry propose failure (a frozen/superseded refusal,
-        // `kind_write_batch_at_leader`'s own `Err(e)` arm) is mapped to
-        // `ServiceUnavailable` before it ever reaches this hop — mirroring
-        // `decode_relayed_error`'s identical allowlist entry for the
-        // singular `KindWriteItem` hop, this code must survive the
-        // forwarded `KindWriteBatch` hop unchanged too, or a non-leader
-        // client sees a degraded `InternalServerError` for the identical
-        // condition a leader-local client sees correctly mapped.
-        "ServiceUnavailable" => WireError::service_unavailable(message),
-        _ => internal(&message),
-    }
+    relayable_wire_error(&code, message.clone()).unwrap_or_else(|| internal(&message))
 }
 
 /// Map one [`kind_write_batch_at_leader`] item result to its wire shape —
@@ -10608,6 +10593,69 @@ pub(crate) fn map_throttleable_error(message: String) -> WireError {
 /// correct 400 — a placement-dependent status code.
 const RELAYED_WIRE_ERROR_MARK: &str = "wire-error:";
 
+/// The closed set of codes [`relayable_wire_error`] accepts, exposed
+/// separately so `relayed_error_tests::both_forwarded_hops_share_one_
+/// allowlist` can iterate it without hand-duplicating the list the
+/// function itself matches against.
+const RELAYABLE_WIRE_ERROR_CODES: &[&str] = &[
+    "ValidationException",
+    "ProvisionedThroughputExceededException",
+    "ServiceUnavailable",
+    "ConditionalCheckFailedException",
+    "ResourceNotFoundException",
+    "ResourceInUseException",
+    "TransactionCanceledException",
+    "SerializationException",
+    "UnknownOperationException",
+];
+
+/// The ONE closed-set allowlist both forwarded write hops derive from
+/// (issue #1035) — [`decode_relayed_error`] (`KindWriteItem`'s
+/// whole-request marker string) and `wire_error_from_batch_rejected`
+/// (`KindWriteBatch`'s per-item typed reply) each call this instead of
+/// keeping their own copy. Before this, they didn't: PR #1017 added
+/// `"ServiceUnavailable"` to `decode_relayed_error` alone (issue #994), and
+/// the batch hop's own later, separate addition of the identical entry
+/// (issue #996 layer 2, ported at merge time — see
+/// `docs/lessons/orchestration/2026-09-21-a-sibling-loop-copied-before-a-
+/// fix-lands-on-the-original-needs-the-fix-ported-at-merge-time.md`) had to
+/// remember to touch the *other* list too. Issue #1035 is that failure mode
+/// landing for real: `"ProvisionedThroughputExceededException"` was in
+/// `wire_error_from_batch_rejected`'s own list from the start (the batch
+/// hop needed it immediately) but was never added here, so the identical
+/// throttle refusal minted at a remote leader (`kind_write_item_at_leader`'s
+/// precharge check) degraded to a bare 500 `InternalServerError` for a
+/// non-leader-connected singular `PutItem`/`UpdateItem`/`DeleteItem`, while
+/// the same request against the leader's own node correctly returned 400.
+///
+/// [`RELAYABLE_WIRE_ERROR_CODES`] is the UNION of what either hop's own
+/// serve arm can mint today, not the narrower set either hop mints
+/// *itself*: an inert extra entry costs nothing (it only means a code
+/// neither hop currently produces would also survive if one someday did),
+/// while a missing one is a silent, placement-dependent 500. Keep it that
+/// way — when a new `WireError` constructor becomes reachable from a
+/// leader-side evaluator/precharge/apply path either hop can relay, add its
+/// code HERE once, not to two separate match blocks.
+///
+/// **Caveat**: `reasons` never survives either hop — this always builds
+/// `WireError { reasons: None, .. }`. A `TransactionCanceledException`'s own
+/// `CancellationReasons` would not round-trip through this table if one
+/// were ever minted on a path reachable from here; no such path exists
+/// today (`TransactWriteItems` never routes through `KindWriteItem`'s or
+/// `KindWriteBatch`'s forwarded hop), so this is a documented caveat, not a
+/// live gap.
+fn relayable_wire_error(code: &str, message: String) -> Option<WireError> {
+    RELAYABLE_WIRE_ERROR_CODES
+        .iter()
+        .copied()
+        .find(|&known| known == code)
+        .map(|code| WireError {
+            code,
+            message,
+            reasons: None,
+        })
+}
+
 /// Encode `err` for `ClientResponse::Error` so
 /// [`decode_relayed_error`] can recover the code on the far side. A plain
 /// `InternalServerError` stays an unmarked bare message — that is exactly
@@ -10625,39 +10673,26 @@ pub(crate) fn encode_relayed_error(err: &WireError) -> String {
 /// Recover a [`WireError`] from a `ClientResponse::Error` string —
 /// [`encode_relayed_error`]'s inverse. An unmarked string (every error
 /// producer other than the forwarded `KindWriteItem` serve arm, and every
-/// marked error whose code isn't one this build knows) falls back to
-/// [`internal`], the pre-marker behavior. `code` is `&'static str`, so
-/// decoding maps through the closed set of codes this crate can actually
-/// mint rather than round-tripping arbitrary text.
+/// marked error whose code isn't one [`relayable_wire_error`] knows) falls
+/// back to [`internal`], the pre-marker behavior. `code` is `&'static str`,
+/// so decoding maps through the closed set of codes this crate can
+/// actually mint rather than round-tripping arbitrary text.
 pub(crate) fn decode_relayed_error(raw: &str) -> WireError {
     if let Some(rest) = raw.strip_prefix(RELAYED_WIRE_ERROR_MARK)
         && let Some((code, message)) = rest.split_once(':')
+        && let Some(err) = relayable_wire_error(code, message.to_owned())
     {
-        let known: Option<&'static str> = match code {
-            "ValidationException" => Some("ValidationException"),
-            "ConditionalCheckFailedException" => Some("ConditionalCheckFailedException"),
-            "ResourceNotFoundException" => Some("ResourceNotFoundException"),
-            "ResourceInUseException" => Some("ResourceInUseException"),
-            "TransactionCanceledException" => Some("TransactionCanceledException"),
-            "SerializationException" => Some("SerializationException"),
-            "UnknownOperationException" => Some("UnknownOperationException"),
-            "ServiceUnavailable" => Some("ServiceUnavailable"),
-            _ => None,
-        };
-        if let Some(code) = known {
-            return WireError {
-                code,
-                message: message.to_owned(),
-                reasons: None,
-            };
-        }
+        return err;
     }
     internal(raw)
 }
 
 #[cfg(test)]
 mod relayed_error_tests {
-    use super::{decode_relayed_error, encode_relayed_error, internal};
+    use super::{
+        RELAYABLE_WIRE_ERROR_CODES, decode_relayed_error, encode_relayed_error, internal,
+        wire_error_from_batch_rejected,
+    };
     use animus_dynamo::wire::WireError;
 
     /// The round trip this marker exists for: a typed error minted at a
@@ -10717,6 +10752,63 @@ mod relayed_error_tests {
         let decoded = decode_relayed_error(&encode_relayed_error(&err));
         assert_eq!(decoded.code, "ServiceUnavailable");
         assert_eq!(decoded.message, err.message);
+    }
+
+    /// Issue #1035: a throttle refusal minted at a remote leader
+    /// (`kind_write_item_at_leader`'s own precharge check,
+    /// `WireError::provisioned_throughput_exceeded`) must survive the
+    /// forwarded `KindWriteItem` hop with its own code, exactly like
+    /// `ValidationException`/`ServiceUnavailable` above — this is the
+    /// round trip that was missing before this fix (the code was already
+    /// in `wire_error_from_batch_rejected`'s own list, just not here).
+    #[test]
+    fn a_provisioned_throughput_exceeded_error_round_trips_with_its_code() {
+        let err = WireError::provisioned_throughput_exceeded(
+            "table `t` exceeds its provisioned write capacity",
+        );
+        let decoded = decode_relayed_error(&encode_relayed_error(&err));
+        assert_eq!(decoded.code, "ProvisionedThroughputExceededException");
+        assert_eq!(decoded.message, err.message);
+    }
+
+    /// Issue #1035's own regression for the root cause, not just the one
+    /// missing entry: every code either forwarded hop can mint must round
+    /// trip through BOTH `decode_relayed_error` (`KindWriteItem`'s
+    /// whole-request marker string) and `wire_error_from_batch_rejected`
+    /// (`KindWriteBatch`'s per-item typed reply) with its own code intact,
+    /// since both now derive from the one shared
+    /// [`super::relayable_wire_error`] table — and an unknown code must
+    /// still degrade to `InternalServerError` on both, never a panic or a
+    /// silently wrong code.
+    #[test]
+    fn both_forwarded_hops_share_one_allowlist() {
+        for &code in RELAYABLE_WIRE_ERROR_CODES {
+            let err = WireError {
+                code,
+                message: "m".into(),
+                reasons: None,
+            };
+            let via_singular_hop = decode_relayed_error(&encode_relayed_error(&err));
+            assert_eq!(
+                via_singular_hop.code, code,
+                "decode_relayed_error lost code {code}"
+            );
+            assert_eq!(via_singular_hop.message, "m");
+
+            let via_batch_hop = wire_error_from_batch_rejected(code.to_string(), "m".into());
+            assert_eq!(
+                via_batch_hop.code, code,
+                "wire_error_from_batch_rejected lost code {code}"
+            );
+            assert_eq!(via_batch_hop.message, "m");
+        }
+
+        let unknown_singular = decode_relayed_error("wire-error:MadeUpException:boom");
+        assert_eq!(unknown_singular.code, "InternalServerError");
+
+        let unknown_batch =
+            wire_error_from_batch_rejected("MadeUpException".to_string(), "boom".into());
+        assert_eq!(unknown_batch.code, "InternalServerError");
     }
 }
 

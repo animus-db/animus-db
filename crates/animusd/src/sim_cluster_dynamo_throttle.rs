@@ -377,3 +377,121 @@ fn a_forwarded_write_is_throttled_on_the_leader_over_seeds() {
         run_a_forwarded_write_is_throttled_on_the_leader(0xC11B_4000 + i);
     }
 }
+
+// ---------------------------------------------------------------------------
+// (5) Issue #1035: a CONDITIONED forwarded write is throttled with the
+// correct code, not degraded to a 500 across the forwarded hop.
+// ---------------------------------------------------------------------------
+
+/// A `ConditionExpression`-carrying `PutItem` — the one shape that takes
+/// `kind_write_item_at_leader`/`decode_relayed_error`'s own forwarded hop.
+/// An unconditioned `PutItem` on a plain table (scenario (4) above,
+/// `put_body`) takes `fast_marker_write` instead, whose own forwarded
+/// error channel (`map_throttleable_error`, a bare string) is unaffected
+/// by issue #1035 — which is exactly why (4) never caught the defect this
+/// scenario regresses: it never exercised the hop the bug is on. See
+/// `dynamo.rs`'s `dispatch_item_op` fast-arm gate (`condition.is_none() &&
+/// return_values == ReturnValues::None && !table_change_records_carry_
+/// images(..)`) for the exact branch line.
+fn put_body_conditioned(table: &str, id: &str, value: &str) -> String {
+    format!(
+        r#"{{"TableName":"{table}","Item":{{"id":{{"S":"{id}"}},"v":{{"S":"{value}"}}}},
+            "ConditionExpression":"attribute_not_exists(never_set)"}}"#
+    )
+}
+
+/// Same fixture shape as [`run_a_forwarded_write_is_throttled_on_the_
+/// leader`] (a single-tablet, RF-3, 3-node cluster; write burst exhausted
+/// with big items), but the assertion write carries a `ConditionExpression`
+/// — the shape that routes through `kind_write_item_at_leader`, whose own
+/// precharge refusal (`WireError::provisioned_throughput_exceeded`) used to
+/// degrade to a bare `InternalServerError` (500) crossing the forwarded
+/// `KindWriteItem` hop from a non-leader-connected node, while the
+/// identical write against the leader's own node correctly returned 400
+/// (`dynamo.rs::decode_relayed_error`'s allowlist gap, issue #1035). Asserts
+/// both the non-leader (the regression's own subject) and the leader (the
+/// control this fix must not disturb).
+fn run_a_conditioned_forwarded_write_is_throttled_on_the_leader(seed: u64) {
+    let mut cluster = SimCluster::new(seed, 3, 3);
+    let (status, body) = create_table(&mut cluster, 0, "thr_relay");
+    assert_eq!(
+        status, 200,
+        "seed={seed}: CreateTable(thr_relay) failed: {body}"
+    );
+    cluster.set_throttle_defaults_all(None, Some(1));
+
+    let tablet = cluster
+        .metadata(0)
+        .tablets_for_table("thr_relay")
+        .next()
+        .map(|(id, _)| *id)
+        .unwrap_or_else(|| panic!("seed={seed}: thr_relay has no tablet"));
+    let leader = cluster
+        .leader_index_of(tablet)
+        .unwrap_or_else(|| panic!("seed={seed}: thr_relay's tablet has no elected leader"));
+    // Replication is 3 == node count, so every node hosts this tablet — any
+    // node other than the leader is a genuine forwarding entry point.
+    let non_leader = (0..3u64)
+        .find(|&n| n != leader)
+        .unwrap_or_else(|| panic!("seed={seed}: no non-leader node among 3"));
+
+    let value = big_value();
+    // Drain the 300-unit burst directly on the leader with plain,
+    // unconditioned puts — cheapest way to exhaust the bucket; the shape
+    // under test is the CONDITIONED assertions below, not this drain. Four
+    // ~256 KiB puts cost roughly 4x the whole burst, so this cannot leave
+    // the bucket un-exhausted regardless of the tiny (1 unit/s) refill rate.
+    for i in 0..4 {
+        let _ = cluster.dynamo(
+            leader,
+            "DynamoDB_20120810.PutItem",
+            put_body("thr_relay", &format!("drain{i}"), &value).as_bytes(),
+        );
+    }
+
+    let (status, body) = cluster.dynamo(
+        non_leader,
+        "DynamoDB_20120810.PutItem",
+        put_body_conditioned("thr_relay", "cond_non_leader", &value).as_bytes(),
+    );
+    assert_eq!(
+        status, 400,
+        "seed={seed}: expected the conditioned write via the non-leader node to be throttled, \
+         not degrade to a 500: {body}"
+    );
+    assert_eq!(
+        error_type(&body),
+        "com.amazonaws.dynamodb.v20120810#ProvisionedThroughputExceededException",
+        "seed={seed}: unexpected error body from the non-leader node: {body}"
+    );
+
+    // Control: the identical conditioned write against the leader's own
+    // node never crosses the forwarded hop at all, so it must already show
+    // the correct code both before and after this fix.
+    let (status, body) = cluster.dynamo(
+        leader,
+        "DynamoDB_20120810.PutItem",
+        put_body_conditioned("thr_relay", "cond_leader", &value).as_bytes(),
+    );
+    assert_eq!(
+        status, 400,
+        "seed={seed}: expected the conditioned write via the leader node to be throttled: {body}"
+    );
+    assert_eq!(
+        error_type(&body),
+        "com.amazonaws.dynamodb.v20120810#ProvisionedThroughputExceededException",
+        "seed={seed}: unexpected error body from the leader node: {body}"
+    );
+}
+
+#[test]
+fn a_conditioned_forwarded_write_is_throttled_on_the_leader() {
+    run_a_conditioned_forwarded_write_is_throttled_on_the_leader(env_seed(0xC11B_0005));
+}
+
+#[test]
+fn a_conditioned_forwarded_write_is_throttled_on_the_leader_over_seeds() {
+    for i in 0..5 {
+        run_a_conditioned_forwarded_write_is_throttled_on_the_leader(0xC11B_5000 + i);
+    }
+}
