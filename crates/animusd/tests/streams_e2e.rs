@@ -1214,7 +1214,7 @@ async fn fs_segment_store_opt_in_smoke() {
     .await;
     assert_eq!(status, 200, "CreateTable failed: {body}");
     let label = field(&body, "LatestStreamLabel");
-    let stream_arn = format!("arn:aws:dynamodb:animus:0:table/t/stream/{label}");
+    let stream_arn = format!("arn:aws:dynamodb:animus:0:table/tbl/stream/{label}");
 
     let (status, body) = dynamo(
         addr,
@@ -1880,7 +1880,7 @@ async fn admin_data_dynamo_proxy_reaches_streams_read_api() {
         .as_str()
         .unwrap_or_else(|| panic!("no LatestStreamLabel in CreateTable response: {body:?}"))
         .to_owned();
-    let stream_arn = format!("arn:aws:dynamodb:animus:0:table/t/stream/{label}");
+    let stream_arn = format!("arn:aws:dynamodb:animus:0:table/tbl/stream/{label}");
 
     let (status, body) = admin(
         admin_addr,
