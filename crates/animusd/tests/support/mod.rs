@@ -976,6 +976,81 @@ pub async fn await_data_nodes_active(
     .expect("data nodes did not become Active in 20s");
 }
 
+/// Bring-up barrier for a **combined-mode** cluster: wait converged-or-timeout
+/// until (1) some node believes it is the control-plane leader **and** (2)
+/// **every** node observes **every** founding data node's raftkv id as
+/// [`NodeStatus::Active`](animusd::NodeStatus) in its own replicated
+/// [`metadata()`](Node::metadata).
+///
+/// **Why "members Active", not merely "members present" — the issue #1028
+/// race.** A node's own `RegisterNode` self-registration can land as `Down`
+/// (the status a freshly-registered member carries until the failure detector
+/// promotes it) *before* `bootstrap`'s idempotent `Active` upsert applies. A
+/// barrier that gates only on "some control leader + a non-empty members map"
+/// (the shape the local `await_bootstrap` helpers copy-pasted into ~60 test
+/// files used) therefore returns while one or more founding nodes are still
+/// recorded `Down`. That matters because placement is status-sensitive:
+/// `ClientCtx::provision_tablet` (`schema.rs`) seeds the first tablet from the
+/// first `MAX_REPLICATION_FACTOR` members whose `status == Active`, **in id
+/// order**, so a node still `Down` at the moment the first placement-sensitive
+/// write provisions the tablet is silently skipped in favour of a higher-id
+/// `Active` peer — and stays skipped until the failure detector promotes it
+/// (~100-200ms later, wider under CPU load). A placement-sensitive first write
+/// can then land on the wrong node set (e.g. `{n0,n1,n3}`, skipping `n2`),
+/// which flakes any test that hard-codes which node is a voter vs. the idle
+/// spare (issue #1028).
+///
+/// Gating on **all members Active** closes the window: once every founding
+/// member is promoted, the failure detector has caught up, so a subsequent
+/// `provision_tablet` sees the full `Active` set and places deterministically.
+///
+/// **Read from every node, not just the leader.** The status-sensitive
+/// `provision_tablet` read (`metadata_fresh()`) runs on whichever node serves
+/// the first write — not necessarily the control leader — and many callers
+/// read a specific node's `Status`/metadata immediately after this barrier
+/// returns (e.g. `cluster.rs`, which the copied helpers' own `all(|n|
+/// members.len() == nodes.len())` variant already protected). Gating on the
+/// leader alone would let a lagging follower still show a partial or
+/// not-yet-`Active` membership right after the barrier. So this requires the
+/// full, all-`Active` membership to be visible on **every** node — a strict
+/// strengthening of every copied `await_bootstrap` shape (the leader is one of
+/// the nodes checked, and "all Active" implies "all present").
+///
+/// # Signature
+/// Takes `&[Node]` for a combined-mode cluster, where **every** node is a
+/// data-role node registered in `members`. Because the started [`Node`] type
+/// exposes no accessor for its own membership id, the per-node check gates on
+/// the equivalent-for-combined-mode condition: `metadata().members` has
+/// `len() == nodes.len()` **and** every member's status is `Active`. In
+/// combined mode every node claims exactly one `members` row (control-only
+/// nodes never do, but a combined-mode fixture has none), so a full-count,
+/// all-`Active` map is precisely "every founding data node is Active".
+pub async fn await_bootstrap(nodes: &[Node]) {
+    let expected = nodes.len();
+    timeout(Duration::from_secs(30), async {
+        loop {
+            let leader = nodes.iter().any(Node::is_control_leader);
+            let all_active = nodes.iter().all(|node| {
+                let members = node.metadata().members;
+                members.len() == expected
+                    && members
+                        .values()
+                        .all(|m| m.status == animusd::NodeStatus::Active)
+            });
+            if leader && all_active {
+                return;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect(
+        "cluster did not reach an all-members-Active bootstrap within 30s \
+         (issue #1028: gating on members-present rather than members-Active \
+         lets a still-Down founding node be skipped by placement)",
+    );
+}
+
 /// Idle-stall bound for [`poll_until_or_stalled`] — how long the answering
 /// node's own apply-task watermark may sit frozen while its condition is
 /// still unmet before that is treated as a real stall rather than
