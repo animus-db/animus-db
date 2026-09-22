@@ -173,7 +173,9 @@ use animus_dynamo::capacity::{
     self, ConsumedCapacity, ItemCollectionMetrics, ReturnConsumedCapacity,
     ReturnItemCollectionMetrics,
 };
-use animus_dynamo::limits::MAX_QUERY_SCAN_PAGE_BYTES;
+use animus_dynamo::limits::{
+    MAX_BATCH_GET_RESPONSE_BYTES, MAX_QUERY_SCAN_PAGE_BYTES, MAX_TRANSACT_BYTES,
+};
 use animus_dynamo::partiql;
 use animus_dynamo::wire::{
     self, MAX_GSI_PER_TABLE, Operation, Projection, ReturnValues, ScanSegment, Select,
@@ -209,8 +211,14 @@ pub(crate) const SCHEMA_COMMIT_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const SCHEMA_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Max actions per `TransactWriteItems` request / keys per `TransactGetItems`
-/// request (ADR 0018 §2/PR7) — DynamoDB's own limit (1-100 items); we don't
-/// replicate AWS's fuller request-size validation, just this simple cap.
+/// request (ADR 0018 §2/PR7) — DynamoDB's own limit (1-100 items). The
+/// aggregate byte-size cap AWS also enforces on both operations
+/// (`animus_dynamo::limits::MAX_TRANSACT_BYTES`, ADR 0072 layer 4) is a
+/// separate check: `animus_dynamo::wire::decode_transact_write` at decode
+/// time for `TransactWriteItems` (the request itself can already exceed 4
+/// MiB), [`run_transact_get`] against the fetched result for
+/// `TransactGetItems` (its request never can — DynamoDB's real rule there
+/// is on the response).
 const MAX_TRANSACT_ITEMS: usize = 100;
 
 /// `ClientRequestToken` idempotency record TTL (ADR 0018's 2026-08-24
@@ -1378,6 +1386,23 @@ async fn dispatch_item_op<E: Env, R: RelayClient>(
             // in the batch, including every other key of the SAME table,
             // still reads normally.
             let mut unprocessed: Vec<(String, Item)> = Vec::new();
+            // AWS's `BatchGetItem` response-size cap
+            // (`animus_dynamo::limits::MAX_BATCH_GET_RESPONSE_BYTES`, 16
+            // MiB, ADR 0072 layer 4): **not an error**. `response_bytes`
+            // tracks the running `item_size` of every item included so
+            // far, charged before projection like every other size check
+            // in this crate; the moment the *next* fetched item would push
+            // it over the cap, `budget_exhausted` latches and every key
+            // from there on — the one that would have tipped it over, and
+            // every key after it, whether or not it has been fetched yet —
+            // goes to `UnprocessedKeys` instead, exactly like a per-key
+            // throttle refusal. Reachable: 100 keys × 400 KB
+            // (`MAX_ITEM_SIZE_BYTES`) is 40 MB, well past 16 MiB. This loop
+            // already fetches one key at a time, never a concurrent
+            // fan-out, so once the budget is spent the remaining keys are
+            // never even read (no wasted read to cut after the fact).
+            let mut response_bytes: usize = 0;
+            let mut budget_exhausted = false;
             for req in requests {
                 reject_internal_table(&req.table, false)?;
                 if !table_known(ctx, meta, &req.table) {
@@ -1387,6 +1412,10 @@ async fn dispatch_item_op<E: Env, R: RelayClient>(
                 }
                 let mut items = Vec::with_capacity(req.keys.len());
                 for key in &req.keys {
+                    if budget_exhausted {
+                        unprocessed.push((req.table.clone(), key.clone()));
+                        continue;
+                    }
                     let (pk, sk) = resolve_key(ctx, meta, &req.table, key)?;
                     let data_key = item_key(&pk, sk.as_ref());
                     match quorum_read(
@@ -1398,7 +1427,16 @@ async fn dispatch_item_op<E: Env, R: RelayClient>(
                     )
                     .await
                     {
-                        Ok(Some(item)) => items.push(wire::project(req.projection.as_ref(), &item)),
+                        Ok(Some(item)) => {
+                            let size = capacity::item_size(&item);
+                            if response_bytes + size > MAX_BATCH_GET_RESPONSE_BYTES {
+                                budget_exhausted = true;
+                                unprocessed.push((req.table.clone(), key.clone()));
+                            } else {
+                                response_bytes += size;
+                                items.push(wire::project(req.projection.as_ref(), &item));
+                            }
+                        }
                         Ok(None) => {}
                         Err(e) if e.code == "ProvisionedThroughputExceededException" => {
                             unprocessed.push((req.table.clone(), key.clone()));
@@ -6209,6 +6247,25 @@ async fn run_transact_get<E: Env, R: RelayClient>(
             None => None,
         };
         items.push(item);
+    }
+    // AWS's `TransactGetItems` aggregate-size cap (`animus_dynamo::limits::
+    // MAX_TRANSACT_BYTES`, 4 MiB, ADR 0072 layer 4). Unlike
+    // `TransactWriteItems`, whose own 4 MiB cap is enforced at decode
+    // against the *request* (`animus_dynamo::wire::decode_transact_write`),
+    // DynamoDB's real `TransactGetItems` rule is on the **response**: up to
+    // 100 keys of at most ~3 KB each can never reach 4 MiB on their own, so
+    // the only place this can be checked is here, against what was actually
+    // fetched. A transaction has no partial result — the whole call fails,
+    // nothing is returned — matching `TransactWriteItems`'s own
+    // all-or-nothing contract. 11 max-size (400 KB) items already exceed
+    // it; regression: `sim_cluster_dynamo_byte_caps::
+    // transact_get_items_over_the_byte_cap_is_rejected`.
+    let fetched_bytes: usize = items.iter().flatten().map(capacity::item_size).sum();
+    if fetched_bytes > MAX_TRANSACT_BYTES {
+        return Err(WireError::validation(format!(
+            "TransactGetItems fetched item size {fetched_bytes} bytes exceeds the maximum \
+             allowed size of {MAX_TRANSACT_BYTES} bytes"
+        )));
     }
     for (g, item) in gets.iter().zip(items.iter_mut()) {
         if let Some(projection) = &g.projection

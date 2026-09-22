@@ -74,6 +74,26 @@ caught here — closing that needs the apply-time evaluator itself to know the
 table's index schema, which `animus_item::update::apply_update` deliberately
 does not (see that module's own doc on why evaluation stays index-agnostic).
 
+**Layer 3 (`MAX_QUERY_SCAN_PAGE_BYTES`) and layer 4 (the batch/transact
+aggregate byte caps) are now wired up.** Layer 4's two request-size caps —
+`MAX_BATCH_WRITE_REQUEST_BYTES` (`BatchWriteItem`) and `MAX_TRANSACT_BYTES`
+on the `TransactWriteItems` side — are enforced at **decode time** in
+`wire.rs` (`decode_batch_write`/`decode_transact_write`), since the request
+itself already carries every item's bytes; `MAX_BATCH_GET_RESPONSE_BYTES`
+(`BatchGetItem`) and `MAX_TRANSACT_BYTES` on the `TransactGetItems` side are
+enforced in `animusd::dynamo` instead, against the **fetched result**, since
+their requests (keys only) can never carry enough bytes to trip either cap
+— see `docs/lessons/code-patterns/2026-09-22-an-aggregate-byte-cap-belongs-
+at-whichever-side-request-or.md` for the general shape. `BatchWriteItem`'s
+own 16 MiB cap is checked but currently unreachable via the wire (25 items ×
+400 KB tops out at 10 MB) — its own unit test (`byte_cap_tests` in
+`wire.rs`) exercises the check function directly rather than through
+`decode_request`, since the decode path itself can't reach it. `wire.rs`'s
+big pre-existing `tests` module and this file's `byte_cap_tests` module are
+deliberately separate (a sibling layer of the same series edits `tests`
+concurrently) — new wire-level unit tests for a byte/size cap belong in
+`byte_cap_tests`, not appended to `tests`.
+
 ## Entry points
 
 Module-by-module pointers — every module here is pure (no I/O/storage/
