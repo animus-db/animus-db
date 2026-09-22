@@ -10,7 +10,10 @@
 //!
 //! ## Existing limits (re-exported, defined and enforced elsewhere)
 //!
-//! - [`MAX_ITEM_SIZE_BYTES`] — from `animus_item` (ADR 0054 step 1).
+//! - [`MAX_ITEM_SIZE_BYTES`], [`MAX_NESTING_DEPTH`] — from `animus_item`
+//!   (ADR 0054 step 1 / ADR 0072) — the latter's `value_depth`/`item_depth`
+//!   also back `animus_item::update::apply_update`'s post-fold re-check, the
+//!   identical relationship `MAX_ITEM_SIZE_BYTES`/`item_size` already have.
 //! - [`BATCH_WRITE_MAX_ITEMS`], [`BATCH_GET_MAX_KEYS`],
 //!   [`TRANSACT_WRITE_MAX_ACTIONS`], [`TRANSACT_GET_MAX_ITEMS`],
 //!   [`BATCH_EXECUTE_STATEMENT_MAX_STATEMENTS`],
@@ -30,8 +33,8 @@ pub use crate::wire::{
     TABLE_MAX_READ_CAPACITY_UNITS, TABLE_MAX_WRITE_CAPACITY_UNITS, TRANSACT_GET_MAX_ITEMS,
     TRANSACT_WRITE_MAX_ACTIONS,
 };
-pub use animus_item::MAX_ITEM_SIZE_BYTES;
 pub use animus_item::numkey::MAX_SIGNIFICANT_DIGITS;
+pub use animus_item::{MAX_ITEM_SIZE_BYTES, MAX_NESTING_DEPTH};
 
 /// AWS's partition-key attribute-value size limit: at most 2048 bytes
 /// (UTF-8 for `S`, raw bytes for `B`, decimal text for `N`), for a base
@@ -49,10 +52,6 @@ pub const MAX_KEY_ATTRIBUTE_NAME_CHARS: usize = 255;
 /// AWS's limit on any attribute name: at most 65,536 bytes (64 KB) of UTF-8.
 /// The minimum is 1 — an empty attribute name is never valid.
 pub const MAX_ATTRIBUTE_NAME_BYTES: usize = 65_536;
-
-/// AWS's limit on the nested (`List`/`Map`) depth of a single item: at most
-/// 32 levels.
-pub const MAX_NESTING_DEPTH: usize = 32;
 
 /// AWS's limit on the length of a single expression string —
 /// `ConditionExpression`, `UpdateExpression`, `ProjectionExpression`,

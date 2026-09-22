@@ -650,11 +650,11 @@ fn run_in_process_split_cluster_serves_writes_and_reports_roles(seed: u64) {
     let mut cluster = SimCluster::new_with_roles(seed, &roles, 2);
     let leader = cluster.control_leader_index() as u64;
 
-    let (status, body) = create_table(&mut cluster, leader, "kv");
+    let (status, body) = create_table(&mut cluster, leader, "kvt");
     assert_eq!(status, 200, "seed={seed}: CreateTable failed: {body}");
 
     cluster
-        .put(3, "kv", "hello", "sk", b"world")
+        .put(3, "kvt", "hello", "sk", b"world")
         .unwrap_or_else(|e| panic!("seed={seed}: put via a data node failed: {e}"));
     for n in 0..5u64 {
         poll_until(
@@ -664,7 +664,7 @@ fn run_in_process_split_cluster_serves_writes_and_reports_roles(seed: u64) {
             &format!("node {n} observing the write cluster-wide"),
             |c| {
                 matches!(
-                    c.get(n, "kv", "hello", "sk", true),
+                    c.get(n, "kvt", "hello", "sk", true),
                     Ok(Some(ref v)) if v.as_slice() == b"world"
                 )
             },
@@ -673,10 +673,10 @@ fn run_in_process_split_cluster_serves_writes_and_reports_roles(seed: u64) {
 
     // A write via one data node, read via the *other* data node.
     cluster
-        .put(3, "kv", "cross", "sk", b"replica")
+        .put(3, "kvt", "cross", "sk", b"replica")
         .unwrap_or_else(|e| panic!("seed={seed}: put via data node 3 failed: {e}"));
     let got = cluster
-        .get(4, "kv", "cross", "sk", true)
+        .get(4, "kvt", "cross", "sk", true)
         .unwrap_or_else(|e| panic!("seed={seed}: get via data node 4 failed: {e}"));
     assert_eq!(got.as_deref(), Some(&b"replica"[..]), "seed={seed}");
 
@@ -684,7 +684,7 @@ fn run_in_process_split_cluster_serves_writes_and_reports_roles(seed: u64) {
     // hinted-retry forwarder's own no-local-replica branch.
     let fixed_control = 0u64;
     cluster
-        .put(fixed_control, "kv", "via-control", "sk", b"ok")
+        .put(fixed_control, "kvt", "via-control", "sk", b"ok")
         .unwrap_or_else(|e| panic!("seed={seed}: put via the fixed control node failed: {e}"));
     for n in 0..5u64 {
         poll_until(
@@ -694,7 +694,7 @@ fn run_in_process_split_cluster_serves_writes_and_reports_roles(seed: u64) {
             &format!("node {n} observing the control-node-issued write cluster-wide"),
             |c| {
                 matches!(
-                    c.get(n, "kv", "via-control", "sk", true),
+                    c.get(n, "kvt", "via-control", "sk", true),
                     Ok(Some(ref v)) if v.as_slice() == b"ok"
                 )
             },

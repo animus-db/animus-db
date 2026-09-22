@@ -30,11 +30,49 @@ compiled-in, there is no "unleashed" mode. It re-exports the pre-existing
 limit constants that used to live scattered across `wire.rs`/`animus-item`
 (`MAX_ITEM_SIZE_BYTES`, the batch/transact caps, `MAX_GSI_PER_TABLE`/
 `MAX_LSI_PER_TABLE`, the throughput ceilings, `numkey::MAX_SIGNIFICANT_DIGITS`)
-unchanged, and adds constants for limits not yet enforced (key/attribute-name
-sizing, nesting depth, expression length, table/index name shape, and the
-Query/Scan/BatchGetItem/BatchWriteItem/Transact payload-size ceilings) —
-enforcement for the new ones lands in later PRs of that same series, so an
-unused constant there is expected, not a bug.
+unchanged. `MAX_NESTING_DEPTH` is re-exported from `animus_item` too (moved
+there in the layer-2 PR below, alongside `MAX_ITEM_SIZE_BYTES`, since
+`animus_item::update::apply_update` needs it for its own post-fold check —
+`limits.rs` no longer defines it itself). `MAX_QUERY_SCAN_PAGE_BYTES`/
+`MAX_BATCH_GET_RESPONSE_BYTES`/`MAX_BATCH_WRITE_REQUEST_BYTES`/
+`MAX_TRANSACT_BYTES` (the payload-size ceilings) remain unenforced constants
+— a later layer's job; an unused constant there is expected, not a bug.
+
+**Layer 2 of the ADR 0072 series (this layer) wired up every other
+decode-time check**: table/index name shape (`wire::check_table_or_index_name`,
+the chokepoint every `table_name()`/`decode_index_entry`/`Query`+`Scan`
+`IndexName` call funnels through, plus `RequestItems`' own table-name map
+keys in `BatchWriteItem`/`BatchGetItem` — shape is validated **before**
+existence, so a malformed name is `ValidationException`, never
+`ResourceNotFoundException`), key-schema attribute-name length
+(`decode_key_schema`), attribute-name length on every item/`Key`/
+`ExpressionAttributeNames`/nested-`ExpressionAttributeValues` name
+(`check_attribute_name`, called from `decode_item`'s top level, the `M` arm's
+nested keys, `resolve_attr_name`, and `parse_projection_segment`), nesting
+depth (`decode_attribute_value` takes a running `depth` argument so a
+request nested past the cap is rejected mid-decode, before the whole
+structure is built), expression length (`check_expression_length`, shared by
+`decode_predicate`/`decode_update_expression`/`decode_projection`/
+`decode_query`'s `KeyConditionExpression`), and the table-level
+`ProvisionedThroughput` ceiling (`decode_provisioned_throughput` — GSI-level
+`ProvisionedThroughput` was never decoded/accepted by this adapter to begin
+with, so there is nothing further to cap there). Partition/sort-key **value**
+size is the one check that lives outside `wire.rs`: `animusd::dynamo::
+resolve_key` (the pre-existing single choke point every write/point-read
+path already resolves a table's key through, right next to its
+`reject_empty_key_value` sibling) covers the base table's own key for
+`PutItem`/`GetItem`/`DeleteItem`/`UpdateItem`/`BatchWriteItem`/
+`BatchGetItem`/`TransactWriteItems`/`TransactGetItems` alike, plus a GSI/LSI
+key attribute's value when the *whole item* is available (`PutItem`, and a
+`TransactWriteItems` `Put`); `Query`'s own partition/sort-key condition
+values are checked separately in `wire::decode_query`, since a `Query` never
+resolves a key through the registry at all. **Known gap, not yet closed**:
+`UpdateItem`/`TransactWriteItems`' `Update` action resolves its key from the
+request's `Key` map alone before evaluating the update, so a `SET` that
+grows a GSI/LSI key attribute past its cap through an *existing* item is not
+caught here — closing that needs the apply-time evaluator itself to know the
+table's index schema, which `animus_item::update::apply_update` deliberately
+does not (see that module's own doc on why evaluation stays index-agnostic).
 
 ## Entry points
 

@@ -1382,7 +1382,7 @@ async fn admin_segment_store_reports_shard_placement_and_local_objects() {
             "POST",
             "/admin/data/dynamo",
             Some(
-                r#"{"op":"CreateTable","payload":{"TableName":"t","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"StreamSpecification":{"StreamEnabled":true,"StreamViewType":"KEYS_ONLY"}}}"#,
+                r#"{"op":"CreateTable","payload":{"TableName":"tbl","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"StreamSpecification":{"StreamEnabled":true,"StreamViewType":"KEYS_ONLY"}}}"#,
             ),
         )
         .await;
@@ -1391,7 +1391,7 @@ async fn admin_segment_store_reports_shard_placement_and_local_objects() {
             any_addr,
             "POST",
             "/admin/data/dynamo",
-            Some(r#"{"op":"PutItem","payload":{"TableName":"t","Item":{"id":{"S":"p1"}}}}"#),
+            Some(r#"{"op":"PutItem","payload":{"TableName":"tbl","Item":{"id":{"S":"p1"}}}}"#),
         )
         .await;
         assert_eq!(s, 200, "PutItem: {put}");

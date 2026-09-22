@@ -180,7 +180,7 @@ async fn batch_write_round_trip_survives_restart() {
     let (status, body) = dynamo(
         dynamo_addr,
         "DynamoDB_20120810.BatchWriteItem",
-        &batch_put_body("bt", N),
+        &batch_put_body("tbt", N),
     )
     .await;
     assert_eq!(status, 200, "BatchWriteItem failed: {body}");
@@ -191,7 +191,7 @@ async fn batch_write_round_trip_survives_restart() {
         let (s, b) = dynamo(
             dynamo_addr,
             "DynamoDB_20120810.GetItem",
-            &format!(r#"{{"TableName":"bt","Key":{{"pk":{{"S":"b{i}"}}}}}}"#),
+            &format!(r#"{{"TableName":"tbt","Key":{{"pk":{{"S":"b{i}"}}}}}}"#),
         )
         .await;
         assert_eq!(s, 200, "GetItem b{i} failed: {b}");
@@ -211,7 +211,7 @@ async fn batch_write_round_trip_survives_restart() {
             let (s, b) = dynamo(
                 dynamo_addr,
                 "DynamoDB_20120810.GetItem",
-                &format!(r#"{{"TableName":"bt","Key":{{"pk":{{"S":"b{i}"}}}}}}"#),
+                &format!(r#"{{"TableName":"tbt","Key":{{"pk":{{"S":"b{i}"}}}}}}"#),
             )
             .await;
             if s == 200 && b.contains(&format!(r#""v":{{"N":"{i}"}}"#)) {
@@ -268,7 +268,7 @@ async fn batched_write_beats_per_key() {
                 dynamo_addr,
                 "DynamoDB_20120810.PutItem",
                 &format!(
-                    r#"{{"TableName":"pk","Item":{{"pk":{{"S":"k{i}"}},"v":{{"N":"{i}"}}}}}}"#
+                    r#"{{"TableName":"tpk","Item":{{"pk":{{"S":"k{i}"}},"v":{{"N":"{i}"}}}}}}"#
                 ),
             )
             .await;
@@ -293,7 +293,7 @@ async fn batched_write_beats_per_key() {
             let (s, b) = dynamo(
                 dynamo_addr,
                 "DynamoDB_20120810.BatchWriteItem",
-                &batch_put_body_range("bk", chunk_start, chunk_end),
+                &batch_put_body_range("tbk", chunk_start, chunk_end),
             )
             .await;
             assert_eq!(
@@ -345,7 +345,7 @@ async fn batched_write_beats_per_key() {
             let (s, gb) = dynamo(
                 dynamo_addr,
                 "DynamoDB_20120810.GetItem",
-                &format!(r#"{{"TableName":"bk","Key":{{"pk":{{"S":"b{i}"}}}}}}"#),
+                &format!(r#"{{"TableName":"tbk","Key":{{"pk":{{"S":"b{i}"}}}}}}"#),
             )
             .await;
             assert_eq!(s, 200, "batched GetItem b{i}: {gb}");

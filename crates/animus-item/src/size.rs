@@ -115,6 +115,43 @@ pub fn item_size(item: &Item) -> usize {
         .sum()
 }
 
+/// AWS's limit on the nested (`List`/`Map`) depth of a single attribute
+/// value: at most 32 levels (ADR 0072).
+///
+/// ## Depth-counting convention (documented, since AWS states the rule but
+/// not a formal count)
+///
+/// A scalar (`S`/`N`/`B`/`BOOL`/`NULL`/`SS`/`NS`/`BS` — none of which can
+/// themselves nest) sits at depth 1, the *same* depth as an empty `L`/`M`;
+/// a non-empty `L`/`M` is one more than its deepest child. So, for one
+/// attribute's value: `{"S": "x"}` is depth 1, `{"M": {"a": {"S": "x"}}}`
+/// is depth 2, `{"L": [{"M": {"a": {"S": "x"}}}]}` is depth 3, and so on.
+/// [`MAX_NESTING_DEPTH`] caps this count directly: exactly 32 levels of
+/// nesting is accepted, 33 is rejected.
+pub const MAX_NESTING_DEPTH: usize = 32;
+
+/// [`value_depth`]'s convention, per [`MAX_NESTING_DEPTH`]'s own doc.
+#[must_use]
+pub fn value_depth(value: &AttributeValue) -> usize {
+    match value {
+        AttributeValue::L(items) => 1 + items.iter().map(value_depth).max().unwrap_or(0),
+        AttributeValue::M(map) => 1 + map.values().map(value_depth).max().unwrap_or(0),
+        _ => 1,
+    }
+}
+
+/// The deepest [`value_depth`] over every attribute of `item` — used to
+/// re-check [`MAX_NESTING_DEPTH`] on `UpdateExpression`'s post-fold result
+/// the same way [`MAX_ITEM_SIZE_BYTES`] is re-checked
+/// (`crate::update::apply_update`): a `SET` into an already-deep item can
+/// push a value past the cap even though the operand alone, and the item
+/// alone (before the update), were both within it. An empty item is depth 0
+/// (vacuously within the cap).
+#[must_use]
+pub fn item_depth(item: &Item) -> usize {
+    item.values().map(value_depth).max().unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,5 +244,47 @@ mod tests {
         // "pk" + "abc" + "flag" + 1
         assert_eq!(item_size(&item), 2 + 3 + 4 + 1);
         assert_eq!(item_size(&Item::new()), 0);
+    }
+
+    /// Build a value nested `n` `M` levels deep (`n == 1` ⇒ a bare scalar).
+    fn nested_map(n: usize) -> AttributeValue {
+        let mut value = AttributeValue::S("leaf".into());
+        for _ in 1..n {
+            let mut map = BTreeMap::new();
+            map.insert("k".to_string(), value);
+            value = AttributeValue::M(map);
+        }
+        value
+    }
+
+    #[test]
+    fn scalar_and_empty_containers_are_depth_one() {
+        assert_eq!(value_depth(&AttributeValue::S("x".into())), 1);
+        assert_eq!(value_depth(&AttributeValue::N("1".into())), 1);
+        assert_eq!(value_depth(&AttributeValue::M(BTreeMap::new())), 1);
+        assert_eq!(value_depth(&AttributeValue::L(Vec::new())), 1);
+    }
+
+    #[test]
+    fn value_depth_counts_the_deepest_nesting_level() {
+        assert_eq!(value_depth(&nested_map(1)), 1);
+        assert_eq!(value_depth(&nested_map(2)), 2);
+        assert_eq!(value_depth(&nested_map(32)), 32);
+        // A `List` nests the same way an `M` does.
+        let list_of_maps = AttributeValue::L(vec![nested_map(1), nested_map(5)]);
+        assert_eq!(
+            value_depth(&list_of_maps),
+            6,
+            "one L level + the deepest child"
+        );
+    }
+
+    #[test]
+    fn item_depth_is_the_deepest_attribute_at_the_cap_boundary() {
+        let mut item = Item::new();
+        item.insert("shallow".to_string(), AttributeValue::S("x".into()));
+        item.insert("deep".to_string(), nested_map(MAX_NESTING_DEPTH));
+        assert_eq!(item_depth(&item), MAX_NESTING_DEPTH);
+        assert_eq!(item_depth(&Item::new()), 0);
     }
 }

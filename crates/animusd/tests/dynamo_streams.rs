@@ -284,12 +284,12 @@ async fn disable_survives_concurrent_periodic_seal_on_local_route() {
         let nodes = start_streamed_cluster(1, dir.path(), racy_knobs).await;
         support::await_bootstrap(&nodes).await;
         let addr = nodes[0].dynamo_addr();
-        let table = "t";
+        let table = "tbl";
 
         let (status, body) = dynamo(
             addr,
             "DynamoDB_20120810.CreateTable",
-            r#"{"TableName":"t","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
+            r#"{"TableName":"tbl","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
                 "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
                 "StreamSpecification":{"StreamEnabled":true,
                     "StreamViewType":"NEW_AND_OLD_IMAGES"}}"#,
@@ -304,7 +304,7 @@ async fn disable_survives_concurrent_periodic_seal_on_local_route() {
                 let (status, body) = dynamo(
                     addr,
                     "DynamoDB_20120810.UpdateTable",
-                    r#"{"TableName":"t","StreamSpecification":
+                    r#"{"TableName":"tbl","StreamSpecification":
                         {"StreamEnabled":true,"StreamViewType":"NEW_AND_OLD_IMAGES"}}"#,
                 )
                 .await;
@@ -334,7 +334,7 @@ async fn disable_survives_concurrent_periodic_seal_on_local_route() {
             let (status, body) = dynamo(
                 addr,
                 "DynamoDB_20120810.UpdateTable",
-                r#"{"TableName":"t","StreamSpecification":{"StreamEnabled":false}}"#,
+                r#"{"TableName":"tbl","StreamSpecification":{"StreamEnabled":false}}"#,
             )
             .await;
 
@@ -374,7 +374,7 @@ async fn disable_survives_concurrent_periodic_seal_on_local_route() {
         let (status, body) = dynamo(
             addr,
             "DynamoDB_20120810.UpdateTable",
-            r#"{"TableName":"t","StreamSpecification":
+            r#"{"TableName":"tbl","StreamSpecification":
                 {"StreamEnabled":true,"StreamViewType":"NEW_AND_OLD_IMAGES"}}"#,
         )
         .await;
@@ -389,7 +389,7 @@ async fn disable_survives_concurrent_periodic_seal_on_local_route() {
         let (status, body) = dynamo(
             addr,
             "DynamoDB_20120810.UpdateTable",
-            r#"{"TableName":"t","StreamSpecification":{"StreamEnabled":false}}"#,
+            r#"{"TableName":"tbl","StreamSpecification":{"StreamEnabled":false}}"#,
         )
         .await;
         assert_eq!(status, 200, "final disable failed: {body}");
