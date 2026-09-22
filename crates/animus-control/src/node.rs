@@ -1319,15 +1319,42 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
             });
         }
     }
-    // Spawn the apply task now — after recovery has installed the recovered
-    // core, so its first `drain_apply` sees the real post-recovery frontier,
-    // not a fresh node's empty one (mirrors `animus-cp-data::drive`'s
-    // ordering). The apply task rebuilds its own cache from `engine` and
-    // signals `watch` itself once that rebuild (which may recover
-    // already-applied state) completes — so a watcher parked before this
-    // node's first loop iteration still sees it, without `drive` touching
-    // `cache`/`watch` at all (ADR 0038 PR3: this loop does no engine I/O and
-    // has no business deciding when `Metadata` is visible).
+    // Issue #1024 (ADR 0038's 2026-09-21 amendment): run the apply task's
+    // one-time startup seed INLINE, awaited, right here — after recovery has
+    // installed the recovered core (so the steady-state loop spawned below
+    // still sees the real post-recovery frontier on its first `drain_apply`,
+    // mirroring `animus-cp-data::drive`'s ordering), but BEFORE this
+    // function's own tick loop below ever runs. This consensus loop is the
+    // only thing that ever ticks the core (`next_deadline`/`env.sleep`,
+    // below), and `RaftCore::recovered` above already armed a real election
+    // deadline 150-300ms out — so awaiting the seed here, rather than
+    // spawning it fire-and-forget the way the pre-#1024 code did, guarantees
+    // the core's very first tick (and so the first election it could
+    // possibly win) happens no earlier than the instant `cache`/
+    // `engine_applied`/`watch` already reflect the engine's durable
+    // `Metadata`. Without this ordering, a single-voter node (or any node
+    // whose peers are briefly unreachable) is free to win an election under
+    // 150ms real time — well before a full engine `entries()` scan can
+    // finish under I/O contention — and would then serve as leader over a
+    // `Metadata::default()` shadow and a watch/engine_applied watermark of 0
+    // (issue #1024: `is_leader()` reads only the core, and nothing else
+    // gates a leader's cache readiness). See `meta_apply_seed`'s own doc for
+    // the full mechanism, including why a seed that outlives the armed
+    // election deadline is harmless (the first tick below just starts an
+    // election immediately once this returns).
+    //
+    // Unlike the empty-WAL branch above, this line draws no new
+    // `env.next_u64()` — it does no randomized decision at all — so it
+    // cannot reshuffle any fixed-seed test's later entropy draws (the same
+    // issue #667 concern `boot_entropy`'s own doc explains).
+    let ApplySeed { shadow, watermark } =
+        meta_apply_seed(&engine, &cache, &engine_applied, &watch).await;
+
+    // Now spawn the steady-state apply loop, handing it the seed's already-
+    // published state — this loop does no more engine I/O than the ongoing
+    // apply/compact work `meta_apply_and_compact` was always doing (ADR 0038
+    // PR3: this loop has no business deciding when `Metadata` first becomes
+    // visible — `meta_apply_seed`, above, already decided that).
     env.spawn_task(meta_apply_loop(
         env.clone(),
         Arc::clone(&core),
@@ -1339,6 +1366,8 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
         Arc::clone(&wal_lock),
         Arc::clone(&persist),
         Arc::clone(&halted),
+        shadow,
+        watermark,
     ));
 
     // Issue #279: the loop's own in-flight persist round, and the outbound
@@ -1523,6 +1552,80 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
     }
 }
 
+/// The apply task's freshly-rebuilt state at boot: the shadow `Metadata`
+/// [`meta_apply_seed`] rebuilt from the engine, and the durable watermark it
+/// read alongside it. Returned to `drive` so it can hand both straight to
+/// [`meta_apply_loop`]'s steady-state loop with no gap in between.
+struct ApplySeed {
+    shadow: Metadata,
+    watermark: u64,
+}
+
+/// The apply task's **one-time startup seed** (ADR 0038 PR3; split out of
+/// [`meta_apply_loop`] and moved to run inline in `drive`, issue #1024, ADR
+/// 0038's 2026-09-21 amendment): rebuild a fresh `Metadata` shadow from
+/// whatever the engine already durably holds (empty on a fresh engine; a
+/// prior run's content after a restart), read the engine's own persisted
+/// `_applied_index` watermark — **not** `core.last_applied()`, which after a
+/// WAL recovery only reflects the snapshot base and can understate what the
+/// engine already has (compaction only truncates the log periodically; the
+/// engine watermark advances every apply pass) — and publish both into
+/// `cache`/`engine_applied`/`watch` before returning them for the steady-state
+/// loop to take over. Reading the true watermark here is what lets that loop
+/// replay only the log tail beyond it, instead of re-deriving writes for
+/// commands the engine already durably reflects (ADR 0038 PR3's
+/// restart-recovery contract).
+///
+/// **Why this moved out of the spawned loop and into `drive`, awaited inline,
+/// before `drive`'s own tick loop starts (issue #1024)**: this is the ONLY
+/// thing that makes `cache`/`engine_applied`/`watch` durable and visible.
+/// Spawning it fire-and-forget (the pre-#1024 shape) raced it against the
+/// consensus loop's own tick — which, for a node just recovered from its WAL,
+/// starts ticking with an election deadline already armed 150-300ms out
+/// (`RaftCore::recovered` → `RaftCore::new` → `reset_election_timer`). A
+/// single-voter node (or any node whose peers are unreachable) can win that
+/// race and become leader — nothing gates `is_leader()`/campaigning on this
+/// seed having run — while `cache` still reads `Metadata::default()` and
+/// `engine_applied`/`watch` still read 0, silently serving stale/empty state
+/// as leader. Running this inline, `.await`ed, before `drive` can ever tick
+/// the core closes that window structurally: the core's first tick — and so
+/// the first election it could possibly win — cannot happen before this
+/// function has already returned, which is exactly when `cache`/
+/// `engine_applied`/`watch` are known-published. If this seed happens to
+/// outlive the recovered core's own already-armed election deadline, nothing
+/// is lost: the first tick below simply starts an election immediately
+/// once control returns to `drive`, identical to any other slow tick — this
+/// function does no WAL/message I/O of its own, so it can't miss anything
+/// `drive` would otherwise have processed while it ran.
+///
+/// The delta ring (ADR 0038 PR5) is freshly constructed by the caller and
+/// therefore already empty at this point (a real process restart gets a
+/// brand-new `RaftNode`/ring) — no explicit reset needed here; only a
+/// *received* `InstallSnapshot` mid-run (`meta_apply_and_compact`'s install
+/// branch) needs to clear an already-populated ring.
+async fn meta_apply_seed<S: StorageEngine>(
+    engine: &S,
+    cache: &Arc<Mutex<Metadata>>,
+    engine_applied: &Arc<AtomicU64>,
+    watch: &MetadataWatch,
+) -> ApplySeed {
+    let shadow = mirror::rebuild_metadata_from_engine(engine)
+        .await
+        .expect("system-keyspace engine scan (rebuild)");
+    let watermark = engine
+        .get(&syskv::applied_index_key())
+        .await
+        .expect("system-keyspace engine read (watermark)")
+        .map(|v| decode_watermark(&v.value))
+        .unwrap_or(0);
+    *cache.lock().expect("cache poisoned") = shadow.clone();
+    engine_applied.store(watermark, Ordering::SeqCst);
+    // A restart can recover already-applied state; a watcher parked before
+    // this task's first loop iteration should see it too.
+    watch.bump(watermark);
+    ApplySeed { shadow, watermark }
+}
+
 /// The per-node **apply task** (ADR 0038 PR3): repeatedly install any received
 /// `InstallSnapshot` image, apply committed-and-durable `MetaCommand`s to this
 /// task's own privately-owned `Metadata` (via the real, unchanged
@@ -1534,6 +1637,13 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
 /// [`APPLY_IDLE_POLL`] only when idle; under load it stays in lockstep behind
 /// commit. Mirrors `animus-cp-data`'s `apply_loop`/`apply_and_compact` split
 /// exactly, retargeted at the system keyspace instead of a per-tablet range.
+///
+/// Takes the already-seeded `shadow`/`watermark` from [`meta_apply_seed`]
+/// rather than computing them itself (issue #1024, ADR 0038's 2026-09-21
+/// amendment): the one-time startup rebuild now runs inline in `drive`,
+/// *before* this loop is even spawned, so this function's whole body is the
+/// steady-state loop only — see `meta_apply_seed`'s doc for why the seed
+/// moved and `drive`'s own call site for the ordering that makes it matter.
 #[allow(clippy::too_many_arguments)]
 async fn meta_apply_loop<E: Env, S: StorageEngine>(
     env: E,
@@ -1546,38 +1656,9 @@ async fn meta_apply_loop<E: Env, S: StorageEngine>(
     wal_lock: Arc<AsyncMutex<()>>,
     persist: Arc<PersistProgress>,
     halted: Arc<AtomicBool>,
+    mut shadow: Metadata,
+    mut watermark: u64,
 ) {
-    // Rebuild this task's own owned `Metadata` from whatever the engine
-    // already durably holds (empty on a fresh engine; a prior run's content
-    // after a restart) and seed `engine_applied` from the engine's own
-    // persisted watermark — **not** `core.last_applied()`, which after a WAL
-    // recovery only reflects the snapshot base and can understate what the
-    // engine already has (compaction only truncates the log periodically;
-    // the engine watermark advances every apply pass). Reading the true
-    // watermark here is what lets the loop below replay only the log tail
-    // beyond it, instead of re-deriving writes for commands the engine
-    // already durably reflects (ADR 0038 PR3's restart-recovery contract).
-    //
-    // The delta ring (ADR 0038 PR5) is freshly constructed and therefore
-    // already empty at this point (a real process restart gets a brand-new
-    // `RaftNode`/ring) — no explicit reset needed here; only a *received*
-    // `InstallSnapshot` mid-run (`meta_apply_and_compact`'s install branch)
-    // needs to clear an already-populated ring.
-    let mut shadow = mirror::rebuild_metadata_from_engine(&engine)
-        .await
-        .expect("system-keyspace engine scan (rebuild)");
-    let mut watermark = engine
-        .get(&syskv::applied_index_key())
-        .await
-        .expect("system-keyspace engine read (watermark)")
-        .map(|v| decode_watermark(&v.value))
-        .unwrap_or(0);
-    *cache.lock().expect("cache poisoned") = shadow.clone();
-    engine_applied.store(watermark, Ordering::SeqCst);
-    // A restart can recover already-applied state; a watcher parked before
-    // this task's first loop iteration should see it too.
-    watch.bump(watermark);
-
     // Issue #898 follow-up: owned by this loop, across iterations — see
     // `SNAPSHOT_COMPACT_DEFER_IDLE_CEILING`'s own doc for why this lives
     // here rather than in `RaftCore` (a `now`-unaware pure core cannot track

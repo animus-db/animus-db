@@ -145,7 +145,7 @@ per-tablet CP data plane (`animus-cp-data`).
   consensus loop (`drive`, no engine I/O — services heartbeats regardless
   of engine speed) and an async apply task (`meta_apply_loop`/
   `meta_apply_and_compact`, the sole owner of mutable `Metadata`).** See
-  ADR 0038 for the full mechanics; three gotchas that aren't in the ADR
+  ADR 0038 for the full mechanics; four gotchas that aren't in the ADR
   text: (1) the apply task seeds its watermark from the **engine's own
   `_applied_index` key, not `core.last_applied()`**, which can understate
   what the engine already durably holds; (2) **every reader now reads
@@ -156,7 +156,8 @@ per-tablet CP data plane (`animus-cp-data`).
   **before** bumping `MetadataWatch` in the same apply pass, so a watcher
   woken by that bump always finds the ring already populated; (4) **the
   apply task's one-time startup seed (engine scan + `_applied_index`
-  read + `cache`/`engine_applied`/`watch` publish) runs inline in `drive`
+  read + `cache`/`engine_applied`/`watch` publish — `meta_apply_seed`) runs
+  inline in `drive`
   before its first tick** (issue #1024, ADR 0038's 2026-09-21 amendment)
   — so `is_leader()` implies the durable `Metadata` is published, and a
   restarted node can never be leader over `Metadata::default()` /
