@@ -6990,7 +6990,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     }
 
     /// This node's own observability sink (ADR 0015) — the same
-    /// [`MetricsHandle`] [`record_propose`] increments `CpProposalsAccepted`
+    /// [`MetricsHandle`] `record_propose` increments `CpProposalsAccepted`
     /// into (see that function's doc). Exposed so a caller that proposes a
     /// **housekeeping** write through this group (`animusd::index_drain::
     /// trim_janitor` today) can attribute the acceptance to
@@ -7096,7 +7096,7 @@ fn record_propose(metrics: &MetricsHandle, result: ProposeResult) -> ProposeResu
     result
 }
 
-/// Like [`record_propose`] but for a `change_membership` step (direct call or the
+/// Like `record_propose` but for a `change_membership` step (direct call or the
 /// automatic [`RaftKvNode::reconfigure_step`]) — kept as its own counter family so
 /// reconfiguration churn is distinguishable from data-write contention.
 fn record_reconfigure(metrics: &MetricsHandle, result: ProposeResult) -> ProposeResult {
