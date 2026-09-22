@@ -20464,6 +20464,15 @@ mod sim_cluster_dynamo_query_pagination;
 #[cfg(test)]
 mod sim_cluster_dynamo_query_range;
 
+/// ADR 0072 layer 3: the `Query`/`Scan` 1 MiB evaluated-page cap
+/// (`animus_dynamo::limits::MAX_QUERY_SCAN_PAGE_BYTES`) — `sim_cluster_
+/// dynamo_query_pagination.rs`'s byte-budget sibling, covering `Scan`,
+/// `Query`, `Limit`/byte-cap composition, `FilterExpression`'s
+/// evaluated-vs-matched surprise, `Select: COUNT`, a GSI `Query`, and
+/// PartiQL `ExecuteStatement` `SELECT`.
+#[cfg(test)]
+mod sim_cluster_dynamo_page_size_cap;
+
 /// ADR 0061 rung D3 PR 3a sibling: descending `Query`/pagination
 /// (`ScanIndexForward: false`), over the base table and an LSI. Replaces six
 /// of `crates/animusd/tests/dynamo_scan_index_forward.rs`'s eight tests.

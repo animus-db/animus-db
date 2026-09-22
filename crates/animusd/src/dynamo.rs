@@ -173,6 +173,7 @@ use animus_dynamo::capacity::{
     self, ConsumedCapacity, ItemCollectionMetrics, ReturnConsumedCapacity,
     ReturnItemCollectionMetrics,
 };
+use animus_dynamo::limits::MAX_QUERY_SCAN_PAGE_BYTES;
 use animus_dynamo::partiql;
 use animus_dynamo::wire::{
     self, MAX_GSI_PER_TABLE, Operation, Projection, ReturnValues, ScanSegment, Select,
@@ -6690,7 +6691,7 @@ async fn run_base_query<E: Env, R: RelayClient>(
     };
     let (from, upper) = query_page_bounds(cursor, &prefix, &end, scan_index_forward);
     let want = limit.map(|n| n.saturating_add(1));
-    let (mut examined, _exhausted) = paginated_table_examine(
+    let (mut examined, _exhausted, byte_capped) = paginated_table_examine(
         ctx,
         table,
         from,
@@ -6718,7 +6719,7 @@ async fn run_base_query<E: Env, R: RelayClient>(
         },
     )
     .await?;
-    let truncated = limit.is_some_and(|n| examined.len() > n);
+    let truncated = byte_capped || limit.is_some_and(|n| examined.len() > n);
     if let Some(n) = limit {
         examined.truncate(n);
     }
@@ -6952,7 +6953,7 @@ async fn run_gsi_query<E: Env, R: RelayClient>(
     };
     let (from, upper) = query_page_bounds(cursor, &prefix, &end, scan_index_forward);
     let want = limit.map(|n| n.saturating_add(1));
-    let (mut examined, _exhausted) = paginated_table_examine(
+    let (mut examined, _exhausted, byte_capped) = paginated_table_examine(
         ctx,
         &index_table,
         from,
@@ -6983,7 +6984,7 @@ async fn run_gsi_query<E: Env, R: RelayClient>(
         },
     )
     .await?;
-    let truncated = limit.is_some_and(|n| examined.len() > n);
+    let truncated = byte_capped || limit.is_some_and(|n| examined.len() > n);
     if let Some(n) = limit {
         examined.truncate(n);
     }
@@ -7067,7 +7068,7 @@ async fn run_lsi_query<E: Env, R: RelayClient>(
     };
     let (from, upper) = query_page_bounds(cursor, &prefix, &end, scan_index_forward);
     let want = limit.map(|n| n.saturating_add(1));
-    let (mut examined, _exhausted) = paginated_kind_examine_one(
+    let (mut examined, _exhausted, byte_capped) = paginated_kind_examine_one(
         ctx,
         table,
         KIND_LSI,
@@ -7093,7 +7094,7 @@ async fn run_lsi_query<E: Env, R: RelayClient>(
         },
     )
     .await?;
-    let truncated = limit.is_some_and(|n| examined.len() > n);
+    let truncated = byte_capped || limit.is_some_and(|n| examined.len() > n);
     if let Some(n) = limit {
         examined.truncate(n);
     }
@@ -8505,7 +8506,7 @@ async fn run_base_scan<E: Env, R: RelayClient>(
     // A DynamoDB `DeleteItem` stores a *tombstone value* (a live pair to the
     // data plane, decoding to `None`); `paginated_table_examine` continues past
     // it without consuming a `Limit` slot.
-    let (mut examined, _exhausted) = paginated_table_examine(
+    let (mut examined, _exhausted, byte_capped) = paginated_table_examine(
         ctx,
         table,
         from,
@@ -8516,7 +8517,7 @@ async fn run_base_scan<E: Env, R: RelayClient>(
         |_key, value| wire::decode_stored_item(value),
     )
     .await?;
-    let truncated = limit.is_some_and(|n| examined.len() > n);
+    let truncated = byte_capped || limit.is_some_and(|n| examined.len() > n);
     if let Some(n) = limit {
         examined.truncate(n);
     }
@@ -8665,7 +8666,7 @@ async fn run_gsi_scan<E: Env, R: RelayClient>(
     // as-built note — the drain prunes with a real engine delete), so `keep`
     // only needs to guard against a corrupt row, mirroring `run_gsi_query`'s
     // own "skip rather than fail the whole query" defensiveness.
-    let (mut examined, _exhausted) = paginated_table_examine(
+    let (mut examined, _exhausted, byte_capped) = paginated_table_examine(
         ctx,
         &index_table,
         from,
@@ -8676,7 +8677,7 @@ async fn run_gsi_scan<E: Env, R: RelayClient>(
         |_key, value| wire::decode_stored_item(value),
     )
     .await?;
-    let truncated = limit.is_some_and(|n| examined.len() > n);
+    let truncated = byte_capped || limit.is_some_and(|n| examined.len() > n);
     if let Some(n) = limit {
         examined.truncate(n);
     }
@@ -8738,7 +8739,7 @@ async fn run_lsi_scan<E: Env, R: RelayClient>(
     let (from, end) = scan_bounds(segment, from);
     let want = limit.map(|n| n.saturating_add(1));
     let idx_name = idx.name.clone();
-    let (mut examined, _exhausted) = paginated_kind_examine(
+    let (mut examined, _exhausted, byte_capped) = paginated_kind_examine(
         ctx,
         table,
         KIND_LSI,
@@ -8758,7 +8759,7 @@ async fn run_lsi_scan<E: Env, R: RelayClient>(
         },
     )
     .await?;
-    let truncated = limit.is_some_and(|n| examined.len() > n);
+    let truncated = byte_capped || limit.is_some_and(|n| examined.len() > n);
     if let Some(n) = limit {
         examined.truncate(n);
     }
@@ -8816,8 +8817,34 @@ fn apply_filter_and_project(
 /// sub-range — see [`run_base_query`]/[`run_gsi_query`]'s docs for why the
 /// bound matters there: without it, a window that runs past `end` would
 /// silently start reading a neighboring partition or hash value). Returns the
-/// examined `(raw key, decoded item)` pairs and whether the underlying range
-/// is now exhausted.
+/// examined `(raw key, decoded item)` pairs, whether the underlying range is
+/// now exhausted, and whether the page was cut short by
+/// [`MAX_QUERY_SCAN_PAGE_BYTES`] (below).
+///
+/// ## The 1 MiB evaluated-page cap (ADR 0072)
+///
+/// Every `Query`/`Scan` page is additionally bounded by
+/// [`MAX_QUERY_SCAN_PAGE_BYTES`] of **evaluated** item data — the same
+/// `animus_item::item_size` formula ADR 0065's `ConsumedCapacity` and the 400
+/// KB per-item cap both use, summed over exactly the rows `keep` returns
+/// `Some` for (i.e. after `KeyConditionExpression`/tombstone-skipping, the
+/// same set the `want`/`Limit` count budget above already governs — before
+/// any `FilterExpression`/`ProjectionExpression`, which run later over
+/// `examined` in `apply_filter_and_project`). Real DynamoDB does not
+/// document the exact edge of this rule, so this reads it the conservative
+/// way: an item is examined *before* it is added, and one that would push
+/// the running total **over** the cap is excluded — never bumping the total
+/// over 1 MiB, at the cost of a page that can end up **one item lighter**
+/// than the true boundary. That excluded item is never lost: it is simply
+/// the first item of the next page, exactly as a `Limit`-truncated item
+/// would be. A single first item can never itself trip this — every stored
+/// item is already under `animus_item::MAX_ITEM_SIZE_BYTES` (400 KB), well
+/// under this 1 MiB page cap — so a page is never returned empty-but-
+/// unexhausted the way an all-first-item-over-budget corner case would
+/// require. `Limit`/`want` and this byte cap compose: whichever stops the
+/// page first wins, and either one sets the returned "capped" flag that
+/// callers fold into their own `LastEvaluatedKey` decision the identical way
+/// they already fold in `examined.len() > limit`.
 #[allow(clippy::too_many_arguments)] // one base/GSI page's full shape
 async fn paginated_table_examine<E: Env, R: RelayClient>(
     ctx: &ClientCtx<E, R>,
@@ -8828,8 +8855,9 @@ async fn paginated_table_examine<E: Env, R: RelayClient>(
     reverse: bool,
     consistency: ReadConsistency,
     keep: impl Fn(&[u8], &[u8]) -> Result<Option<Item>, WireError>,
-) -> Result<(Vec<(Vec<u8>, Item)>, bool), WireError> {
+) -> Result<(Vec<(Vec<u8>, Item)>, bool, bool), WireError> {
     let mut examined: Vec<(Vec<u8>, Item)> = Vec::new();
+    let mut evaluated_bytes: usize = 0;
     // Ascending walks the *lower* bound up and holds `end` fixed; descending
     // holds the lower bound fixed and walks the *upper* bound down. Only one
     // of the two ever moves, which is why both share this loop.
@@ -8853,11 +8881,16 @@ async fn paginated_table_examine<E: Env, R: RelayClient>(
         let last_raw_key = pairs.last().map(|(k, _)| k.clone());
         for (key, value) in &pairs {
             if let Some(item) = keep(key, value)? {
+                let size = capacity::item_size(&item);
+                if evaluated_bytes.saturating_add(size) > MAX_QUERY_SCAN_PAGE_BYTES {
+                    return Ok((examined, false, true));
+                }
+                evaluated_bytes += size;
                 examined.push((key.clone(), item));
             }
         }
         if exhausted || want.is_some_and(|w| examined.len() >= w) {
-            return Ok((examined, exhausted));
+            return Ok((examined, exhausted, false));
         }
         let next = last_raw_key.expect("non-exhausted fetch returned pairs");
         if reverse {
@@ -8877,7 +8910,10 @@ async fn paginated_table_examine<E: Env, R: RelayClient>(
 /// (`ClientCtx::cp_scan_kind_table`) — the LSI `Scan` read primitive. Identical
 /// windowed-continuation discipline, generalized so `run_lsi_scan`'s `keep`
 /// can skip an interleaved *other* index's row without consuming a `Limit`
-/// slot, the same way the table-wide variant skips a tombstone.
+/// slot, the same way the table-wide variant skips a tombstone. Also shares
+/// [`paginated_table_examine`]'s [`MAX_QUERY_SCAN_PAGE_BYTES`] evaluated-page
+/// cap — see that function's doc for the accounting/boundary rule, identical
+/// here.
 #[allow(clippy::too_many_arguments)] // one LSI Scan page's full shape
 async fn paginated_kind_examine<E: Env, R: RelayClient>(
     ctx: &ClientCtx<E, R>,
@@ -8888,8 +8924,9 @@ async fn paginated_kind_examine<E: Env, R: RelayClient>(
     want: Option<usize>,
     consistency: ReadConsistency,
     keep: impl Fn(&[u8], &[u8]) -> Result<Option<Item>, WireError>,
-) -> Result<(Vec<(Vec<u8>, Item)>, bool), WireError> {
+) -> Result<(Vec<(Vec<u8>, Item)>, bool, bool), WireError> {
     let mut examined: Vec<(Vec<u8>, Item)> = Vec::new();
+    let mut evaluated_bytes: usize = 0;
     loop {
         let fetch = want.map(|w| w - examined.len());
         let pairs = ctx
@@ -8900,11 +8937,16 @@ async fn paginated_kind_examine<E: Env, R: RelayClient>(
         let last_raw_key = pairs.last().map(|(k, _)| k.clone());
         for (key, value) in &pairs {
             if let Some(item) = keep(key, value)? {
+                let size = capacity::item_size(&item);
+                if evaluated_bytes.saturating_add(size) > MAX_QUERY_SCAN_PAGE_BYTES {
+                    return Ok((examined, false, true));
+                }
+                evaluated_bytes += size;
                 examined.push((key.clone(), item));
             }
         }
         if exhausted || want.is_some_and(|w| examined.len() >= w) {
-            return Ok((examined, exhausted));
+            return Ok((examined, exhausted, false));
         }
         let mut next = last_raw_key.expect("non-exhausted fetch returned pairs");
         next.push(0x00);
@@ -8919,7 +8961,9 @@ async fn paginated_kind_examine<E: Env, R: RelayClient>(
 /// partition's own LSI sub-range by construction, which is always a finite,
 /// bounded window — see [`run_lsi_query`]'s doc for why walking past it would
 /// be a real bug (leaking into a neighboring partition's LSI rows). Same
-/// windowed-continuation discipline otherwise.
+/// windowed-continuation discipline otherwise, including
+/// [`paginated_table_examine`]'s [`MAX_QUERY_SCAN_PAGE_BYTES`] evaluated-page
+/// cap.
 #[allow(clippy::too_many_arguments)] // one LSI Query page's full shape
 async fn paginated_kind_examine_one<E: Env, R: RelayClient>(
     ctx: &ClientCtx<E, R>,
@@ -8931,8 +8975,9 @@ async fn paginated_kind_examine_one<E: Env, R: RelayClient>(
     reverse: bool,
     consistency: ReadConsistency,
     keep: impl Fn(&[u8], &[u8]) -> Result<Option<Item>, WireError>,
-) -> Result<(Vec<(Vec<u8>, Item)>, bool), WireError> {
+) -> Result<(Vec<(Vec<u8>, Item)>, bool, bool), WireError> {
     let mut examined: Vec<(Vec<u8>, Item)> = Vec::new();
+    let mut evaluated_bytes: usize = 0;
     // Ascending walks the lower bound up; descending walks the upper bound
     // down — the same inversion `paginated_table_examine` documents.
     let mut upper = end;
@@ -8954,11 +8999,16 @@ async fn paginated_kind_examine_one<E: Env, R: RelayClient>(
         let last_raw_key = pairs.last().map(|(k, _)| k.clone());
         for (key, value) in &pairs {
             if let Some(item) = keep(key, value)? {
+                let size = capacity::item_size(&item);
+                if evaluated_bytes.saturating_add(size) > MAX_QUERY_SCAN_PAGE_BYTES {
+                    return Ok((examined, false, true));
+                }
+                evaluated_bytes += size;
                 examined.push((key.clone(), item));
             }
         }
         if exhausted || want.is_some_and(|w| examined.len() >= w) {
-            return Ok((examined, exhausted));
+            return Ok((examined, exhausted, false));
         }
         let next = last_raw_key.expect("non-exhausted fetch returned pairs");
         if reverse {
