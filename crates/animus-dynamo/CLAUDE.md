@@ -22,6 +22,20 @@ request/response codec (`wire`), the `UpdateExpression`/`ConditionExpression`
 response shaping — re-exports the item-size formula itself from
 `animus-item`), `sigv4`, `streams_wire`, and `ttl`.
 
+## Service limits
+
+`limits.rs` is the one catalogue of every DynamoDB service limit AnimusDB
+enforces (ADR 0072): DynamoDB service limits are AWS-faithful and
+compiled-in, there is no "unleashed" mode. It re-exports the pre-existing
+limit constants that used to live scattered across `wire.rs`/`animus-item`
+(`MAX_ITEM_SIZE_BYTES`, the batch/transact caps, `MAX_GSI_PER_TABLE`/
+`MAX_LSI_PER_TABLE`, the throughput ceilings, `numkey::MAX_SIGNIFICANT_DIGITS`)
+unchanged, and adds constants for limits not yet enforced (key/attribute-name
+sizing, nesting depth, expression length, table/index name shape, and the
+Query/Scan/BatchGetItem/BatchWriteItem/Transact payload-size ceilings) —
+enforcement for the new ones lands in later PRs of that same series, so an
+unused constant there is expected, not a bug.
+
 ## Entry points
 
 Module-by-module pointers — every module here is pure (no I/O/storage/
