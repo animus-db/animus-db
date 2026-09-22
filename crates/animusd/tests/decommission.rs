@@ -50,22 +50,6 @@ async fn bring_up(n: usize, dir: &Path) -> (Vec<Node>, ClusterConfig) {
     support::bring_up_deadline(n, dir, support::JOIN_DEADLINE).await
 }
 
-async fn await_bootstrap(nodes: &[Node]) {
-    let ready = async {
-        loop {
-            if nodes.iter().any(Node::is_control_leader)
-                && nodes.iter().all(|node| !node.metadata().members.is_empty())
-            {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    };
-    timeout(Duration::from_secs(30), ready)
-        .await
-        .expect("cluster did not bootstrap within 30s");
-}
-
 /// Join a fresh node with newly-allocated addresses (port-TOCTOU mitigation)
 /// — see `support::join_fresh_deadline`.
 async fn join_fresh(
@@ -257,7 +241,7 @@ async fn decommission_drains_removes_and_allows_id_reuse() {
 
     // 1. Bring up a 3-node core; write through it.
     let (core_nodes, core_config) = bring_up(3, dir.path()).await;
-    await_bootstrap(&core_nodes).await;
+    support::await_bootstrap(&core_nodes).await;
     let core_clients: Vec<SocketAddr> = core_config.nodes.iter().map(|a| a.client).collect();
     // ADR 0047: `--seed` now names the seed's intra address — a separate
     // list from `core_clients` above, which stays client-flavored for the
@@ -676,7 +660,7 @@ async fn dashboard_health_recovers_after_decommission_shrink() {
     let dir = support::panic_safe_tempdir();
 
     let (core_nodes, core_config) = bring_up(3, dir.path()).await;
-    await_bootstrap(&core_nodes).await;
+    support::await_bootstrap(&core_nodes).await;
     let core_clients: Vec<SocketAddr> = core_config.nodes.iter().map(|a| a.client).collect();
     // ADR 0047: `--seed` now names the seed's intra address.
     let core_intra: Vec<SocketAddr> = core_config.nodes.iter().map(|a| a.intra).collect();
@@ -874,7 +858,7 @@ async fn decommission_refuses_live_control_voter_then_succeeds_after_control_rem
 
     // 1. Bring up a 3-node combined core (control voters {0,1,2}).
     let (core_nodes, core_config) = bring_up(3, dir.path()).await;
-    await_bootstrap(&core_nodes).await;
+    support::await_bootstrap(&core_nodes).await;
     let core_clients: Vec<SocketAddr> = core_config.nodes.iter().map(|a| a.client).collect();
     // ADR 0047: `--seed` now names the seed's intra address.
     let core_intra: Vec<SocketAddr> = core_config.nodes.iter().map(|a| a.intra).collect();

@@ -14,7 +14,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use animusd::{Node, StorageBackend};
+use animusd::StorageBackend;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
@@ -55,19 +55,6 @@ async fn dynamo(addr: SocketAddr, target: &str, body: &str) -> (u16, String) {
         .and_then(|code| code.parse().ok())
         .expect("status line");
     (status, payload.to_string())
-}
-
-async fn await_bootstrap(node: &Node) {
-    timeout(Duration::from_secs(10), async {
-        loop {
-            if node.is_control_leader() && !node.metadata().members.is_empty() {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("node did not bootstrap in 10s");
 }
 
 fn json(body: &str) -> serde_json::Value {
@@ -197,7 +184,7 @@ async fn restore_serves_exactly_the_backup_time_rows_with_a_queryable_gsi() {
     let dir = support::panic_safe_tempdir();
     let (node, config) = support::start_single_node(dir.path(), StorageBackend::default()).await;
     let addr = config.nodes[0].dynamo;
-    await_bootstrap(&node).await;
+    support::await_bootstrap(std::slice::from_ref(&node)).await;
 
     let (status, body) = dynamo(
         addr,
@@ -377,7 +364,7 @@ async fn restore_preserves_numeric_n_key_order_for_sort_key_and_gsi() {
     let dir = support::panic_safe_tempdir();
     let (node, config) = support::start_single_node(dir.path(), StorageBackend::default()).await;
     let addr = config.nodes[0].dynamo;
-    await_bootstrap(&node).await;
+    support::await_bootstrap(std::slice::from_ref(&node)).await;
 
     let (status, body) = dynamo(
         addr,
@@ -484,7 +471,7 @@ async fn restore_works_after_the_source_table_is_dropped() {
     let dir = support::panic_safe_tempdir();
     let (node, config) = support::start_single_node(dir.path(), StorageBackend::default()).await;
     let addr = config.nodes[0].dynamo;
-    await_bootstrap(&node).await;
+    support::await_bootstrap(std::slice::from_ref(&node)).await;
 
     let (status, body) = dynamo(
         addr,
@@ -573,7 +560,7 @@ async fn delete_backup_succeeds_after_restore_completes() {
     let dir = support::panic_safe_tempdir();
     let (node, config) = support::start_single_node(dir.path(), StorageBackend::default()).await;
     let addr = config.nodes[0].dynamo;
-    await_bootstrap(&node).await;
+    support::await_bootstrap(std::slice::from_ref(&node)).await;
 
     let (status, body) = dynamo(
         addr,
@@ -629,7 +616,7 @@ async fn restore_rejects_a_bad_backup_or_an_existing_target() {
     let dir = support::panic_safe_tempdir();
     let (node, config) = support::start_single_node(dir.path(), StorageBackend::default()).await;
     let addr = config.nodes[0].dynamo;
-    await_bootstrap(&node).await;
+    support::await_bootstrap(std::slice::from_ref(&node)).await;
 
     // An unknown ARN.
     let (status, body) =

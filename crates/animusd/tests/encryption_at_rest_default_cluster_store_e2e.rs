@@ -103,23 +103,6 @@ async fn bring_up_cluster(
     .expect("start cluster")
 }
 
-async fn await_bootstrap(nodes: &[Node]) {
-    timeout(Duration::from_secs(20), async {
-        loop {
-            if nodes.iter().any(Node::is_control_leader)
-                && nodes
-                    .iter()
-                    .all(|n| n.metadata().members.len() == nodes.len())
-            {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("cluster did not bootstrap in 20s");
-}
-
 fn tablet_for(meta: &Metadata, table: &str) -> TabletId {
     meta.tablets_for_table(table)
         .next()
@@ -347,7 +330,7 @@ async fn default_cluster_store_holds_no_plaintext_and_restores_across_nodes() {
     let tmp = support::panic_safe_tempdir();
     let key_path = write_key_file(tmp.path(), "key.hex", 0x71);
     let nodes = bring_up_cluster(2, tmp.path(), Duration::from_secs(600), Some(key_path)).await;
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
 
     let addr0 = nodes[0].dynamo_addr();
     let addr1 = nodes[1].dynamo_addr();
@@ -421,7 +404,7 @@ async fn default_cluster_store_restart_without_the_key_is_refused_at_startup() {
     let source_dir = tmp.path().join("source");
     let source_nodes =
         bring_up_cluster(1, &source_dir, Duration::from_secs(600), Some(key_path)).await;
-    await_bootstrap(&source_nodes).await;
+    support::await_bootstrap(&source_nodes).await;
     for node in &source_nodes {
         node.shutdown_graceful().await;
     }

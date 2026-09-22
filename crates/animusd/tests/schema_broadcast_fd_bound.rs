@@ -22,26 +22,9 @@
 
 use std::time::Duration;
 
-use animusd::{Node, bind_cluster, start_cluster};
-use tokio::time::timeout;
+use animusd::{bind_cluster, start_cluster};
 
 mod support;
-
-async fn await_bootstrap(nodes: &[Node]) {
-    let ready = async {
-        loop {
-            if nodes.iter().any(Node::is_control_leader)
-                && nodes.iter().all(|n| !n.metadata().members.is_empty())
-            {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    };
-    timeout(Duration::from_secs(20), ready)
-        .await
-        .expect("cluster did not bootstrap within 20s");
-}
 
 /// This process's own currently-open file descriptor count (`/proc/self/
 /// fd`, Linux-only — matching every other real-socket `ProdEnv` test in
@@ -87,7 +70,7 @@ async fn concurrent_cluster_bootstraps_do_not_exhaust_file_descriptors() {
                 .await
                 .expect("bind_cluster");
             let nodes = start_cluster(bound).await.expect("start_cluster");
-            await_bootstrap(&nodes).await;
+            support::await_bootstrap(&nodes).await;
             // Keep the nodes (and their listeners/engines) alive until every
             // cluster in this test has bootstrapped, then let them drop —
             // dropping is what should promptly release every relay socket

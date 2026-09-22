@@ -13,7 +13,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use animusd::{Node, StorageBackend};
+use animusd::StorageBackend;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
@@ -54,19 +54,6 @@ async fn dynamo(addr: SocketAddr, target: &str, body: &str) -> (u16, String) {
         .and_then(|code| code.parse().ok())
         .expect("status line");
     (status, payload.to_string())
-}
-
-async fn await_bootstrap(node: &Node) {
-    timeout(Duration::from_secs(10), async {
-        loop {
-            if node.is_control_leader() && !node.metadata().members.is_empty() {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("node did not bootstrap in 10s");
 }
 
 fn json(body: &str) -> serde_json::Value {
@@ -139,7 +126,7 @@ async fn create_backup_round_trip_survives_table_drop_and_janitor_reclaims() {
     let dir = support::panic_safe_tempdir();
     let (node, config) = support::start_single_node(dir.path(), StorageBackend::default()).await;
     let addr = config.nodes[0].dynamo;
-    await_bootstrap(&node).await;
+    support::await_bootstrap(std::slice::from_ref(&node)).await;
 
     let (status, body) = dynamo(
         addr,
@@ -320,7 +307,7 @@ async fn create_backup_rejects_an_unknown_table() {
     let dir = support::panic_safe_tempdir();
     let (node, config) = support::start_single_node(dir.path(), StorageBackend::default()).await;
     let addr = config.nodes[0].dynamo;
-    await_bootstrap(&node).await;
+    support::await_bootstrap(std::slice::from_ref(&node)).await;
 
     let (status, body) = dynamo(
         addr,
@@ -339,7 +326,7 @@ async fn describe_and_delete_backup_reject_an_unknown_arn() {
     let dir = support::panic_safe_tempdir();
     let (node, config) = support::start_single_node(dir.path(), StorageBackend::default()).await;
     let addr = config.nodes[0].dynamo;
-    await_bootstrap(&node).await;
+    support::await_bootstrap(std::slice::from_ref(&node)).await;
 
     let ghost_arn = "arn:aws:dynamodb:animus:0:table/orders/backup/ghost";
     let (status, body) = describe_backup(addr, ghost_arn).await;
@@ -365,7 +352,7 @@ async fn delete_backup_rejects_a_still_creating_backup() {
     let dir = support::panic_safe_tempdir();
     let (node, config) = support::start_single_node(dir.path(), StorageBackend::default()).await;
     let addr = config.nodes[0].dynamo;
-    await_bootstrap(&node).await;
+    support::await_bootstrap(std::slice::from_ref(&node)).await;
 
     let (status, body) = dynamo(
         addr,
@@ -409,7 +396,7 @@ async fn list_backups_paginates_with_limit_and_cursor() {
     let dir = support::panic_safe_tempdir();
     let (node, config) = support::start_single_node(dir.path(), StorageBackend::default()).await;
     let addr = config.nodes[0].dynamo;
-    await_bootstrap(&node).await;
+    support::await_bootstrap(std::slice::from_ref(&node)).await;
 
     let (status, body) = dynamo(
         addr,

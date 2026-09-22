@@ -194,21 +194,6 @@ async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, animusd::Clust
     panic!("could not bring up cluster after retries (ports kept getting stolen)");
 }
 
-async fn await_bootstrap(nodes: &[Node]) {
-    timeout(Duration::from_secs(20), async {
-        loop {
-            if nodes.iter().any(Node::is_control_leader)
-                && nodes.iter().all(|n| !n.metadata().members.is_empty())
-            {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("cluster did not bootstrap in 20s");
-}
-
 async fn put_until_ok(addr: SocketAddr, table: &str, key: &[u8], value: &[u8]) {
     timeout(Duration::from_secs(25), async {
         loop {
@@ -290,7 +275,7 @@ async fn anchor_only_stage_with_a_declared_but_unstaged_participant_recovers_to_
     let n = 3;
     let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(n, dir.path()).await;
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
     let addr0 = config.nodes[0].client;
     let all_addrs: Vec<SocketAddr> = config.nodes.iter().map(|c| c.intra).collect(); // ADR 0047: Forwarded is intra-only
     let admin_addrs: Vec<SocketAddr> = config.nodes.iter().map(|c| c.admin).collect();
@@ -496,7 +481,7 @@ async fn recovery_resolve_correctly_commits_both_tablets_of_a_two_tablet_transac
     let n = 3;
     let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(n, dir.path()).await;
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
     let addr0 = config.nodes[0].client;
     let all_addrs: Vec<SocketAddr> = config.nodes.iter().map(|c| c.intra).collect(); // ADR 0047: Forwarded is intra-only
 

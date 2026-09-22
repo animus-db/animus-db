@@ -155,21 +155,6 @@ async fn bring_up_with_throttle_defaults(
     panic!("could not bring up cluster after retries (ports kept getting stolen)");
 }
 
-async fn await_bootstrap(nodes: &[animusd::Node]) {
-    tokio::time::timeout(Duration::from_secs(20), async {
-        loop {
-            if nodes.iter().any(animusd::Node::is_control_leader)
-                && nodes.iter().all(|n| !n.metadata().members.is_empty())
-            {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("cluster did not bootstrap in 20s");
-}
-
 /// One DynamoDB request over a fresh HTTP/1.1 connection → `(status, body)`.
 async fn dynamo(addr: SocketAddr, target: &str, body: &str) -> (u16, String) {
     let mut stream = TcpStream::connect(addr).await.expect("connect to dynamo");
@@ -284,7 +269,7 @@ async fn cluster_wide_throttle_default_is_overridden_by_a_tables_own_throughput(
     // A tiny cluster-wide default write budget, set only via the config
     // surface (`run_node_with_cluster_settings`) — no admin call.
     let (nodes, config) = bring_up_with_throttle_defaults(1, dir.path(), None, Some(1)).await;
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
     let addr = config.nodes[0].dynamo;
 
     // This table declares no throughput of its own, so it inherits the tiny

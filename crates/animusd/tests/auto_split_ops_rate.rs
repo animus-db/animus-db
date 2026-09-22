@@ -50,21 +50,6 @@ async fn start_cluster_with_ops_rate(n: usize, dir: &Path, ops_rate_per_sec: u64
     .unwrap()
 }
 
-async fn await_bootstrap(nodes: &[Node]) {
-    tokio::time::timeout(Duration::from_secs(20), async {
-        loop {
-            if nodes.iter().any(Node::is_control_leader)
-                && nodes.iter().all(|n| !n.metadata().members.is_empty())
-            {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("cluster did not bootstrap within 20s");
-}
-
 async fn dynamo(addr: SocketAddr, target: &str, body: &str) -> (u16, String) {
     let mut stream = TcpStream::connect(addr).await.expect("connect to dynamo");
     let request = format!(
@@ -159,7 +144,7 @@ async fn auto_split_ops_rate_splits_a_hot_plain_table_never_a_cold_one() {
     // write every 5s (0.2 ops/sec) — both sides have a wide margin
     // regardless of this host's own per-write latency.
     let nodes = start_cluster_with_ops_rate(1, dir.path(), 1).await;
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
 
     create_plain_table(nodes[0].dynamo_addr(), "hot_ops").await;
     create_plain_table(nodes[0].dynamo_addr(), "cold_ops").await;

@@ -91,19 +91,6 @@ fn free_addrs(count: usize) -> Vec<SocketAddr> {
     ls.iter().map(|l| l.local_addr().unwrap()).collect()
 }
 
-async fn await_bootstrap(node: &Node) {
-    timeout(Duration::from_secs(20), async {
-        loop {
-            if node.is_control_leader() && !node.metadata().members.is_empty() {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("single node did not bootstrap in 20s");
-}
-
 /// One HTTP/1.0 GET to the admin endpoint; returns `(status, parsed JSON)`.
 async fn admin_get(addr: SocketAddr, path: &str) -> (u16, Value) {
     let mut stream = TcpStream::connect(addr).await.expect("connect to admin");
@@ -188,7 +175,7 @@ async fn system_table_lists_every_seeded_entity_kind() {
     timeout(Duration::from_secs(90), async {
         let dir = support::panic_safe_tempdir();
         let node = bring_up_one(dir.path()).await;
-        await_bootstrap(&node).await;
+        support::await_bootstrap(std::slice::from_ref(&node)).await;
         // ADR 0047: this file seeds several intra-only entity kinds via bare
         // `ProposeSchema` — dial the intra port (which also happily serves
         // the plain `Put`/`Scan`/`SplitTablet` calls this test otherwise
@@ -445,7 +432,7 @@ async fn system_table_pagination_is_gapless_and_duplicate_free() {
     timeout(Duration::from_secs(60), async {
         let dir = support::panic_safe_tempdir();
         let node = bring_up_one(dir.path()).await;
-        await_bootstrap(&node).await;
+        support::await_bootstrap(std::slice::from_ref(&node)).await;
         // ADR 0047: this file seeds several intra-only entity kinds via bare
         // `ProposeSchema` — dial the intra port (which also happily serves
         // the plain `Put`/`Scan`/`SplitTablet` calls this test otherwise

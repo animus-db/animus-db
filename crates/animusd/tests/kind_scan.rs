@@ -13,31 +13,13 @@
 //! bare-refusal contract.
 
 use std::net::SocketAddr;
-use std::time::Duration;
 
 use animus_cp_data::KIND_LSI;
-use animusd::{ClientRequest, ClientResponse, Node, bind_cluster, read_frame, start_cluster};
+use animusd::{ClientRequest, ClientResponse, bind_cluster, read_frame, start_cluster};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::time::{sleep, timeout};
 
 mod support;
-
-async fn await_bootstrap(nodes: &[Node]) {
-    let ready = async {
-        loop {
-            if nodes.iter().any(Node::is_control_leader)
-                && nodes.iter().all(|n| !n.metadata().members.is_empty())
-            {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    };
-    timeout(Duration::from_secs(20), ready)
-        .await
-        .expect("cluster did not bootstrap within 20s");
-}
 
 /// One DynamoDB JSON request over the real HTTP wire.
 async fn dynamo(addr: SocketAddr, target: &str, body: &str) -> (u16, String) {
@@ -72,7 +54,7 @@ async fn lsi_query_succeeds_through_every_node_including_non_leaders() {
         .await
         .unwrap();
     let nodes = start_cluster(bound).await.unwrap();
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
 
     let create_addr = nodes[0].dynamo_addr();
     let (status, body) = dynamo(
@@ -152,7 +134,7 @@ async fn bare_kind_scan_is_refused() {
         .await
         .unwrap();
     let nodes = start_cluster(bound).await.unwrap();
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
 
     let mut stream = TcpStream::connect(nodes[0].client_addr())
         .await

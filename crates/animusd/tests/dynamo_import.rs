@@ -120,21 +120,6 @@ async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, Arc<FakeS3>) {
     panic!("could not bring up cluster after retries (ports kept getting stolen)");
 }
 
-async fn await_bootstrap(nodes: &[Node]) {
-    timeout(Duration::from_secs(20), async {
-        loop {
-            if nodes.iter().any(Node::is_control_leader)
-                && nodes.iter().all(|n| !n.metadata().members.is_empty())
-            {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("cluster did not bootstrap in 20s");
-}
-
 /// One DynamoDB request over a fresh HTTP/1.1 connection → `(status,
 /// body)`. Mirrors every other `tests/dynamo_*.rs` file's identical helper.
 async fn dynamo(addr: SocketAddr, target: &str, body: &str) -> (u16, String) {
@@ -482,7 +467,7 @@ async fn import_full_flow_completes_and_round_trips_every_item() {
     timeout(Duration::from_secs(120), async {
         let dir = support::panic_safe_tempdir();
         let (nodes, _fake) = bring_up(3, dir.path()).await;
-        await_bootstrap(&nodes).await;
+        support::await_bootstrap(&nodes).await;
 
         let ids = create_table_write_items(&nodes, "orders", 30).await;
         force_split(&nodes, "orders", &ids).await;
@@ -571,7 +556,7 @@ async fn import_reads_a_none_compressed_hand_written_export() {
     timeout(Duration::from_secs(60), async {
         let dir = support::panic_safe_tempdir();
         let (nodes, fake) = bring_up(1, dir.path()).await;
-        await_bootstrap(&nodes).await;
+        support::await_bootstrap(&nodes).await;
 
         let lines = r#"{"Item": {"id": {"S": "n1"}, "body": {"S": "hello"}}}
 {"Item": {"id": {"S": "n2"}, "body": {"S": "world"}}}"#;
@@ -627,7 +612,7 @@ async fn import_skips_malformed_items_and_counts_them() {
     timeout(Duration::from_secs(60), async {
         let dir = support::panic_safe_tempdir();
         let (nodes, fake) = bring_up(1, dir.path()).await;
-        await_bootstrap(&nodes).await;
+        support::await_bootstrap(&nodes).await;
 
         let lines = r#"{"Item": {"id": {"S": "g1"}, "body": {"S": "ok1"}}}
 {"Item": {"id": {"S": "g2"}, "body": {"S": "ok2"}}}
@@ -680,7 +665,7 @@ async fn import_conflict_for_an_existing_table_and_a_name_already_claimed() {
     timeout(Duration::from_secs(60), async {
         let dir = support::panic_safe_tempdir();
         let (nodes, fake) = bring_up(1, dir.path()).await;
-        await_bootstrap(&nodes).await;
+        support::await_bootstrap(&nodes).await;
 
         let (status, body) = dynamo(
             nodes[0].dynamo_addr(),
@@ -741,7 +726,7 @@ async fn import_errors_on_unknown_import() {
     timeout(Duration::from_secs(30), async {
         let dir = support::panic_safe_tempdir();
         let (nodes, _fake) = bring_up(1, dir.path()).await;
-        await_bootstrap(&nodes).await;
+        support::await_bootstrap(&nodes).await;
 
         let (status, body) = dynamo(
             nodes[0].dynamo_addr(),
@@ -766,7 +751,7 @@ async fn list_imports_pagination_and_table_filter() {
     timeout(Duration::from_secs(90), async {
         let dir = support::panic_safe_tempdir();
         let (nodes, fake) = bring_up(1, dir.path()).await;
-        await_bootstrap(&nodes).await;
+        support::await_bootstrap(&nodes).await;
 
         let mut import_arns = Vec::new();
         for i in 0..3 {
@@ -845,7 +830,7 @@ async fn import_rejects_unsupported_format_and_compression() {
     timeout(Duration::from_secs(30), async {
         let dir = support::panic_safe_tempdir();
         let (nodes, _fake) = bring_up(1, dir.path()).await;
-        await_bootstrap(&nodes).await;
+        support::await_bootstrap(&nodes).await;
 
         let (status, body) = dynamo(
             nodes[0].dynamo_addr(),
@@ -899,7 +884,7 @@ async fn import_client_token_is_idempotent() {
     timeout(Duration::from_secs(60), async {
         let dir = support::panic_safe_tempdir();
         let (nodes, fake) = bring_up(1, dir.path()).await;
-        await_bootstrap(&nodes).await;
+        support::await_bootstrap(&nodes).await;
 
         write_hand_export(&fake, "tok-export", "s", "", false).await;
         let (status, body1) = import_table(

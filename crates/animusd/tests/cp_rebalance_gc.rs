@@ -110,21 +110,6 @@ async fn bring_up(n: usize, dir: &Path) -> (Vec<Node>, ClusterConfig, Vec<PathBu
     panic!("could not bring up cluster after retries (ports kept getting stolen)");
 }
 
-async fn await_bootstrap(nodes: &[Node]) {
-    timeout(Duration::from_secs(30), async {
-        loop {
-            if nodes.iter().any(Node::is_control_leader)
-                && nodes.iter().all(|n| !n.metadata().members.is_empty())
-            {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("cluster did not bootstrap in 30s");
-}
-
 /// One HTTP/1.0 GET to the admin endpoint; `None` if the node is unreachable
 /// (e.g. shut down), else `(status, parsed JSON)`.
 async fn admin_get(addr: SocketAddr, path: &str) -> Option<(u16, Value)> {
@@ -314,7 +299,7 @@ async fn moved_off_replica_is_stopped_and_its_scope_erased() {
         // 4 nodes, RF=3: kv lands on ids 0..2; node 3 is
         // a spare, so we can move a replica off onto it and leave a stable RF-3 set.
         let (nodes, config, dirs) = bring_up(4, tmp.path()).await;
-        await_bootstrap(&nodes).await;
+        support::await_bootstrap(&nodes).await;
         let raftkv_ids = config.data_ids(); // [0, 1, 2, 3]
         let spare = raftkv_ids[3].clone();
         let clients: Vec<SocketAddr> = config.nodes.iter().map(|a| a.client).collect();
@@ -385,7 +370,7 @@ async fn release_survives_a_restart_replay() {
     timeout(Duration::from_secs(150), async {
         let tmp = support::panic_safe_tempdir();
         let (nodes, config, dirs) = bring_up(4, tmp.path()).await;
-        await_bootstrap(&nodes).await;
+        support::await_bootstrap(&nodes).await;
         let raftkv_ids = config.data_ids();
         let spare = raftkv_ids[3].clone();
         let clients: Vec<SocketAddr> = config.nodes.iter().map(|a| a.client).collect();
@@ -534,7 +519,7 @@ async fn a_joining_spare_is_never_released() {
         // group: the spare IS in the replica set, and the local-config gate +
         // epoch dampener absorb the brief non-voter window during the join.
         let (nodes, config, dirs) = bring_up(4, tmp.path()).await;
-        await_bootstrap(&nodes).await;
+        support::await_bootstrap(&nodes).await;
         let raftkv_ids = config.data_ids();
         let spare = raftkv_ids[3].clone();
         let clients: Vec<SocketAddr> = config.nodes.iter().map(|a| a.client).collect();

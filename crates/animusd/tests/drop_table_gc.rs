@@ -91,21 +91,6 @@ async fn bring_up(
     panic!("could not bring up cluster after retries (ports kept getting stolen)");
 }
 
-async fn await_bootstrap(nodes: &[Node]) {
-    timeout(Duration::from_secs(20), async {
-        loop {
-            if nodes.iter().any(Node::is_control_leader)
-                && nodes.iter().all(|n| !n.metadata().members.is_empty())
-            {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("cluster did not bootstrap in 20s");
-}
-
 /// One HTTP/1.0 request to the admin endpoint; returns `(status, parsed JSON)`.
 async fn admin(addr: SocketAddr, method: &str, path: &str, body: Option<&str>) -> (u16, Value) {
     let mut stream = TcpStream::connect(addr).await.expect("connect to admin");
@@ -249,7 +234,7 @@ async fn dropped_table_data_is_reclaimed_including_split_child() {
     timeout(Duration::from_secs(120), async {
         let tmp = support::panic_safe_tempdir();
         let (nodes, config, dirs) = bring_up(1, tmp.path()).await;
-        await_bootstrap(&nodes).await;
+        support::await_bootstrap(&nodes).await;
         let client = nodes[0].client_addr();
         let admin_addr = nodes[0].admin_addr();
         let raftkv_dir = dirs[0].join("internal");
@@ -329,7 +314,7 @@ async fn dropped_table_data_is_reclaimed_including_split_child() {
         let node =
             support::restart_same_addrs(&config, 0, &dirs[0], animusd::StorageBackend::default())
                 .await;
-        await_bootstrap(std::slice::from_ref(&node)).await;
+        support::await_bootstrap(std::slice::from_ref(&node)).await;
         // The restarted control replica re-applies its recovered log from the
         // start, so the tablet map transiently passes through **historical**
         // states in which the dropped tablet still exists — the join-host loop
@@ -389,7 +374,7 @@ async fn every_replica_reclaims_a_dropped_tables_files() {
     timeout(Duration::from_secs(120), async {
         let tmp = support::panic_safe_tempdir();
         let (nodes, _config, dirs) = bring_up(3, tmp.path()).await;
-        await_bootstrap(&nodes).await;
+        support::await_bootstrap(&nodes).await;
 
         client_put(nodes[0].client_addr(), "orders", b"k1", b"v1").await;
         await_true(10, "tablet for `orders` provisioned", || {
@@ -462,7 +447,7 @@ async fn a_node_stopped_before_the_drop_and_restarted_after_reclaims_its_leftove
     timeout(Duration::from_secs(120), async {
         let tmp = support::panic_safe_tempdir();
         let (mut nodes, config, dirs) = bring_up(3, tmp.path()).await;
-        await_bootstrap(&nodes).await;
+        support::await_bootstrap(&nodes).await;
 
         client_put(nodes[0].client_addr(), "ledger", b"k1", b"v1").await;
         await_true(10, "tablet for `ledger` provisioned", || {
@@ -539,7 +524,7 @@ async fn a_node_stopped_before_the_drop_and_restarted_after_reclaims_its_leftove
             support::restart_same_addrs(&config, 2, &dirs[2], animusd::StorageBackend::default())
                 .await;
         nodes[2] = node2;
-        await_bootstrap(&nodes).await;
+        support::await_bootstrap(&nodes).await;
 
         await_true(
             30,

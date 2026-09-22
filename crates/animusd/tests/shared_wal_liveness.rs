@@ -71,7 +71,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use animusd::{
-    BackupStoreConfig, ClientRequest, ClientResponse, Node, SegmentStoreConfig, StorageBackend,
+    BackupStoreConfig, ClientRequest, ClientResponse, SegmentStoreConfig, StorageBackend,
     StreamSealKnobs, read_frame,
 };
 use serde_json::Value;
@@ -114,22 +114,6 @@ const LOAD_PHASE_BUDGET: Duration = Duration::from_secs(120);
 /// this only needs to outlast the load window's own tail, not a separate
 /// background sweep interval.
 const GC_METRIC_BUDGET: Duration = Duration::from_secs(15);
-
-async fn await_bootstrap(nodes: &[Node]) {
-    let ready = async {
-        loop {
-            if nodes.iter().any(Node::is_control_leader)
-                && nodes.iter().all(|n| !n.metadata().members.is_empty())
-            {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    };
-    timeout(FORM_BUDGET, ready)
-        .await
-        .expect("cluster did not bootstrap within budget");
-}
 
 async fn call(addr: SocketAddr, req: ClientRequest) -> ClientResponse {
     let mut stream = TcpStream::connect(addr).await.expect("connect to node");
@@ -329,7 +313,7 @@ async fn shared_wal_holds_under_sustained_load_then_reelects_after_a_real_leader
     )
     .await
     .unwrap();
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
 
     // Provision all four tables (auto-provisioned on first write, ADR 0023)
     // so all four tablet groups exist and every node's own SharedWal has

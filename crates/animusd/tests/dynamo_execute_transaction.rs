@@ -28,7 +28,7 @@ use animusd::{ClusterConfig, Node, RoleAddrs};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::time::{sleep, timeout};
+use tokio::time::sleep;
 
 mod support;
 
@@ -79,21 +79,6 @@ async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, ClusterConfig)
         sleep(Duration::from_millis(50)).await;
     }
     panic!("could not bring up cluster after retries (ports kept getting stolen)");
-}
-
-async fn await_bootstrap(nodes: &[Node]) {
-    timeout(Duration::from_secs(20), async {
-        loop {
-            if nodes.iter().any(Node::is_control_leader)
-                && nodes.iter().all(|n| !n.metadata().members.is_empty())
-            {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("cluster did not bootstrap in 20s");
 }
 
 /// One DynamoDB request over a fresh HTTP/1.1 connection → `(status, body)`.
@@ -202,7 +187,7 @@ fn cancellation_reasons(v: &Value) -> Vec<Value> {
 async fn execute_transaction_write_commits_atomically_across_two_tables() {
     let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(1, dir.path()).await;
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
     let addr = config.nodes[0].dynamo;
 
     create_table(addr, "xact_a").await;
@@ -248,7 +233,7 @@ async fn execute_transaction_write_commits_atomically_across_two_tables() {
 async fn execute_transaction_write_cancels_whole_on_duplicate_insert() {
     let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(1, dir.path()).await;
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
     let addr = config.nodes[0].dynamo;
 
     create_table(addr, "xact_c").await;
@@ -299,7 +284,7 @@ async fn execute_transaction_write_cancels_whole_on_duplicate_insert() {
 async fn execute_transaction_all_select_returns_items_and_misses_in_order() {
     let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(1, dir.path()).await;
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
     let addr = config.nodes[0].dynamo;
 
     create_table(addr, "xact_d").await;
@@ -341,7 +326,7 @@ async fn execute_transaction_all_select_returns_items_and_misses_in_order() {
 async fn execute_transaction_mixed_select_and_insert_is_validation_exception() {
     let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(1, dir.path()).await;
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
     let addr = config.nodes[0].dynamo;
 
     create_table(addr, "xact_e").await;
@@ -368,7 +353,7 @@ async fn execute_transaction_mixed_select_and_insert_is_validation_exception() {
 async fn execute_transaction_rejects_zero_and_too_many_statements() {
     let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(1, dir.path()).await;
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
     let addr = config.nodes[0].dynamo;
 
     let (status, resp) = execute_transaction(addr, r#"{"TransactStatements":[]}"#).await;
@@ -407,7 +392,7 @@ async fn execute_transaction_rejects_zero_and_too_many_statements() {
 async fn execute_transaction_client_request_token_replay_is_cached() {
     let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(1, dir.path()).await;
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
     let addr = config.nodes[0].dynamo;
 
     create_table(addr, "xact_g").await;
@@ -445,7 +430,7 @@ async fn execute_transaction_over_a_follower_connected_node() {
     let n = 2;
     let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(n, dir.path()).await;
-    await_bootstrap(&nodes).await;
+    support::await_bootstrap(&nodes).await;
     let addr0 = config.nodes[0].dynamo;
 
     create_table(addr0, "xact_h").await;

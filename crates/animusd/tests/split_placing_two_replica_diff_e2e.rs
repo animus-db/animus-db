@@ -182,21 +182,6 @@ async fn bring_up_inplace(n: usize, dir: &Path) -> (Vec<Node>, ClusterConfig) {
     panic!("could not bring up an in-place-split cluster after retries");
 }
 
-async fn await_bootstrap(nodes: &[Node]) {
-    timeout(Duration::from_secs(20), async {
-        loop {
-            if nodes.iter().any(Node::is_control_leader)
-                && nodes.iter().all(|n| !n.metadata().members.is_empty())
-            {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("cluster did not bootstrap in 20s");
-}
-
 async fn admin_once(
     addr: SocketAddr,
     method: &str,
@@ -625,7 +610,7 @@ async fn two_of_three_replica_diff_placing_target_converges_end_to_end() {
     timeout(TEST_TIMEOUT, async {
         let dir = support::panic_safe_tempdir();
         let (mut nodes, config) = bring_up_inplace(3, dir.path()).await;
-        await_bootstrap(&nodes).await;
+        support::await_bootstrap(&nodes).await;
 
         let mut client = TcpStream::connect(nodes[0].client_addr())
             .await

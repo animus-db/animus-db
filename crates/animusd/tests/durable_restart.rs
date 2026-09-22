@@ -66,20 +66,6 @@ async fn put_retry(addr: SocketAddr, key: &[u8], value: &[u8]) -> ClientResponse
     }
 }
 
-async fn await_bootstrap(node: &Node) {
-    let ready = async {
-        loop {
-            if node.is_control_leader() && !node.metadata().members.is_empty() {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    };
-    timeout(Duration::from_secs(20), ready)
-        .await
-        .expect("node did not bootstrap in 20s");
-}
-
 /// Stop a node cleanly and give the OS a moment to release its now-aborted
 /// listeners' ports, so the replacement can rebind the same addresses.
 async fn stop(node: Node) {
@@ -96,7 +82,7 @@ async fn data_survives_node_restart_on_disk() {
     // --- First incarnation: write a durable key, then shut down cleanly. ---
     let (node, config) = support::start_single_node(&node_dir, StorageBackend::default()).await;
     let client = config.nodes[0].client;
-    await_bootstrap(&node).await;
+    support::await_bootstrap(std::slice::from_ref(&node)).await;
     // issue #939: fail loudly if this incarnation's apply/driver tasks
     // panicked, rather than letting a killed replica pass silently. Dropped
     // explicitly before `stop` since `TaskPanicGuard` only borrows `node`
@@ -128,7 +114,7 @@ async fn data_survives_node_restart_on_disk() {
     // The clean shutdown above freed the ports; the retried rebind rides out a
     // concurrent test binary's momentary port probe (see `support`).
     let node = support::restart_same_addrs(&config, 0, &node_dir, StorageBackend::default()).await;
-    await_bootstrap(&node).await;
+    support::await_bootstrap(std::slice::from_ref(&node)).await;
     let guard = support::watch_task_panics(&[&node]);
 
     // The previously-written value survived because the LSM recovered it from
@@ -193,7 +179,7 @@ async fn acked_write_survives_memory_backend_restart_via_raft_wal() {
 
     let (node, config) = support::start_single_node(&node_dir, StorageBackend::Memory).await;
     let client = config.nodes[0].client;
-    await_bootstrap(&node).await;
+    support::await_bootstrap(std::slice::from_ref(&node)).await;
     let guard = support::watch_task_panics(&[&node]);
 
     let put = put_retry(client, b"acked", b"survives").await;
@@ -203,7 +189,7 @@ async fn acked_write_survives_memory_backend_restart_via_raft_wal() {
     stop(node).await;
 
     let node = support::restart_same_addrs(&config, 0, &node_dir, StorageBackend::Memory).await;
-    await_bootstrap(&node).await;
+    support::await_bootstrap(std::slice::from_ref(&node)).await;
     let guard = support::watch_task_panics(&[&node]);
 
     // Poll until the recovered group has re-applied its WAL tail (bounded).

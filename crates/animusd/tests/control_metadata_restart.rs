@@ -44,19 +44,6 @@ fn free_addr() -> SocketAddr {
     l.local_addr().unwrap()
 }
 
-async fn await_bootstrap(node: &Node) {
-    timeout(Duration::from_secs(20), async {
-        loop {
-            if node.is_control_leader() && !node.metadata().members.is_empty() {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("node did not bootstrap in 20s");
-}
-
 async fn await_leader_only(node: &Node) {
     timeout(Duration::from_secs(20), async {
         loop {
@@ -94,7 +81,7 @@ async fn combined_node_restart_recovers_control_metadata_via_shared_engine() {
     // (still named `client` here purely to minimize the diff; every call
     // below is a `ProposeSchema`).
     let client = config.nodes[0].intra;
-    await_bootstrap(&node).await;
+    support::await_bootstrap(std::slice::from_ref(&node)).await;
     // `bootstrap` already registered this single node's own raftkv id as an
     // `Active` member — proving `members` survives needs no extra proposal.
     let member_id = node
@@ -188,7 +175,7 @@ async fn combined_node_restart_recovers_control_metadata_via_shared_engine() {
 
     // --- Second incarnation: same dir + addresses, genuine restart path. ---
     let node = support::restart_same_addrs(&config, 0, &node_dir, StorageBackend::default()).await;
-    await_bootstrap(&node).await;
+    support::await_bootstrap(std::slice::from_ref(&node)).await;
     timeout(Duration::from_secs(10), async {
         loop {
             let meta = node.metadata();
