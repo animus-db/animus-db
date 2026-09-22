@@ -13198,7 +13198,7 @@ mod byte_cap_tests {
             .iter()
             .map(|&value_len| {
                 format!(
-                    r#"{{"Put":{{"TableName":"t","Item":{{"a":{{"S":"{}"}}}}}}}}"#,
+                    r#"{{"Put":{{"TableName":"tbl","Item":{{"a":{{"S":"{}"}}}}}}}}"#,
                     "x".repeat(value_len)
                 )
             })
