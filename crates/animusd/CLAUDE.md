@@ -2656,9 +2656,9 @@ the wrong reason. `dynamo.rs::decode_relayed_error`'s allowlist gained
 `"ServiceUnavailable"` so the typed code survives a forwarded
 `KindWriteItem` hop unchanged (mirroring `ValidationException`'s own
 entry) — **`ProvisionedThroughputExceededException` was deliberately
-NOT added there**, a pre-existing, separate defect (a throttle refusal
-minted at a remote leader still degrades to `InternalServerError` across
-that hop today) out of this fix's own scope. Regression:
+NOT added there** at the time, a pre-existing, separate defect (a throttle
+refusal minted at a remote leader still degraded to `InternalServerError`
+across that hop) left out of this fix's own scope. Regression:
 `dynamo::relayed_error_tests::a_service_unavailable_error_round_trips_
 with_its_code`, `dynamo::map_throttleable_error_tests` (frozen text →
 `ServiceUnavailable`; `THROTTLE_WRITE_REFUSAL` → unchanged;
@@ -2674,6 +2674,36 @@ data-plane fork (`POST /admin/tablet/split`, this fixture's always-on
 (`SimCluster::drive_inplace_split_cutover`) converges — the non-leader
 (forwarded) assertions additionally require the body to preserve
 `decide::FROZEN_REFUSAL`'s own text verbatim, not just a bare 503.
+
+**Issue #1035 closed that left-out defect**: `ProvisionedThroughputExceeded
+Exception` degrading to `InternalServerError` across the forwarded
+`KindWriteItem` hop was exactly the gap named above, and it existed because
+`decode_relayed_error`'s allowlist and the batch hop's own sibling
+allowlist (`wire_error_from_batch_rejected`, below) were two separately
+maintained match blocks — the batch hop had this code from the start (it
+needed it immediately), the singular hop never got it ported over. Fixed
+by replacing both match blocks with one shared closed-set table,
+`dynamo.rs::relayable_wire_error` (the union of every code either hop's own
+serve arm can mint), which both `decode_relayed_error` and
+`wire_error_from_batch_rejected` now call — see that function's own doc for
+the full accounting and `docs/lessons/code-patterns/2026-09-22-two-closed-
+set-allowlists-for-the-same-wire-hop-drift-derive-both-from-one-table.md`
+for the general lesson. **A plain, unconditioned `PutItem`/`DeleteItem` on
+a plain table never exercises this hop at all** — it takes
+`fast_marker_write`'s fast arm (the `dispatch_item_op` gate: no condition,
+`ReturnValues::None`, no images-carrying table), whose own forwarded error
+channel (`map_throttleable_error`, a bare string) is a different code path
+entirely — so every regression for this hop, including every *pre-existing*
+throttle-forwarding test, must use a write that is genuinely evaluated at
+`kind_write_item_at_leader`: a `ConditionExpression`, a `ReturnValues`
+other than `NONE`, or a table with a GSI/LSI/stream. Regression:
+`dynamo::relayed_error_tests::a_provisioned_throughput_exceeded_error_
+round_trips_with_its_code`/`both_forwarded_hops_share_one_allowlist`,
+`sim_cluster_dynamo_throttle.rs::a_conditioned_forwarded_write_is_
+throttled_on_the_leader` (a **conditioned** `PutItem`, unlike its
+unconditioned sibling `a_forwarded_write_is_throttled_on_the_leader` just
+above, which cannot reach this hop), and the real-socket companion
+`tests/dynamo_relayed_throttle.rs`.
 
 **Same-day follow-on: a post-sleep deadline re-check, so the loop's own
 final iteration can't overwrite a real refusal with a generic one.**
