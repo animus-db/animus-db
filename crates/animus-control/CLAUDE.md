@@ -1351,11 +1351,51 @@ per-tablet CP data plane (`animus-cp-data`).
     already gated on `is_voter()` before learners existed (the "pre-start a
     to-be-added node" gotcha below), so a learner (which is never in
     `config`) is simply a *durable* instance of that same transient state,
-    not new logic. `handle_request_vote`/`handle_pre_vote`'s granting side
-    and `handle_vote_resp`/`handle_pre_vote_resp`'s tallying side additionally
-    gate on voter membership as a second, structurally-redundant line of
-    defense (a learner is never solicited in normal operation — only voter
-    `peers` are — so this only matters against a stray/injected message).
+    not new logic. **The granting side does NOT additionally gate on voter
+    membership** (issue #1019, 2026-09-21): `handle_request_vote`/
+    `handle_pre_vote` grant purely on term, log up-to-dateness, and vote
+    lease, exactly like any other Raft responder — never on `self.is_voter()`.
+    Only `handle_vote_resp`/`handle_pre_vote_resp`'s **tallying** side (the
+    candidate's own config, `self.config.contains(&from)`) enforces "a
+    learner never influences an election," and that alone is sufficient —
+    the responder-side gate this bullet used to describe as "a second,
+    structurally-redundant line of defense" was removed because it wasn't
+    redundant: a promoted-but-not-yet-caught-up learner's own `is_voter()` is
+    stale relative to what a majority already committed (a membership entry
+    takes effect on **append**, not commit — see the point above), and
+    gating granting on it reproduced a permanent election deadlock whenever
+    the leader died right after replicating a promotion to everyone except
+    the promoted node. **Gotcha**: don't reintroduce a membership check on
+    the granting side for "defense in depth" — trace whether the property
+    already holds on the candidate's tally (it does) before adding a second,
+    staler copy of the same decision. See ADR 0058's matching 2026-09-21
+    amendment and `crates/animus-control/tests/
+    learner_promotion_leader_crash.rs` for the reproduction.
+    **A second, companion fix in the same change**: a non-voter's belief in
+    a live leader (`leader_id`) and its pre-vote lease on a real vote it
+    once granted (`handle_pre_vote`'s `voted_lease`) used to decay only as
+    a side effect of the `Follower → PreCandidate` role transition a
+    VOTER's own election timeout causes — a transition a learner can never
+    make (that's the whole point of the `is_voter()` campaign gate above),
+    so both could go stale forever, silently reinstating the same
+    deadlock through a different door. `start_pre_vote`'s `!is_voter()`
+    early return now also sets `vote_lease_lapsed = true` (a new
+    liveness-only field, reset `false` at every real-vote-grant/self-vote/
+    term-change site — see the field's own doc), which
+    `handle_pre_vote`'s `voted_lease` conjuncts on. **Gotcha #2, the sharp
+    one**: the obvious variant — clearing `voted_for` itself on the same
+    signal — is unsafe; don't do that. `voted_for` is
+    Raft hard state ("at most one real vote per term"); the candidate-side
+    tally does **not** make clearing it safe, because the responder here
+    genuinely *is* a voter in the candidates' own already-committed
+    configs — only its own view is stale. Clearing it can let a node grant
+    two different real candidates a vote in the same term, letting each
+    reach its own majority: two leaders, one term. Only the pre-vote
+    lease — a liveness optimization, never a safety mechanism — may lapse;
+    `voted_for` itself is untouched by this fix. See
+    `crates/animus-control/tests/non_voter_vote_lease.rs` for the
+    dedicated unit cell pinning both halves (lease lapses; a second real
+    vote in the same term still doesn't).
   - **The public surface is additive, not a signature change.** The existing
     `change_membership(voters)` keeps its exact old signature and behavior
     (learners untouched, byte-identical when no learner exists) — it gained

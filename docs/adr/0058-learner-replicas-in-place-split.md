@@ -415,6 +415,88 @@ never stop landing during the move) lives in `animusd/tests/
 learner_reconfigure.rs`. `admin::CpRaftView` gained a `learners` field
 (`/admin/raftkv`) purely for this observability — read-only, drives nothing.
 
+**Amendment (2026-09-21, issue #1019): the responder-side `is_voter` gate on
+vote-granting was wrong and has been removed.** The mechanism bullet above
+("`start_election` gates on `is_voter`... exactly as it already gates
+against a not-yet-added node") is still correct for the **candidate**
+side — a learner never campaigns. It was also, until this fix, mirrored on
+the **responder** side: `handle_pre_vote`/`handle_request_vote` additionally
+required `self.is_voter()` before granting a pre-vote/vote to anyone, on the
+theory (this ADR's original "second, structurally-redundant line of
+defense" framing) that a learner is never solicited in normal operation
+anyway. That theory missed that a membership-change entry — including a
+learner's own promotion — takes effect the instant it is **appended** to a
+node's own log (`log_append` -> `apply_config`), not once it is committed.
+`promote_learner`/`reconfigure_step` only require the learner to be caught
+up to within `RECONFIGURE_LEARNER_CATCH_UP_THRESHOLD` (4) entries of the
+leader's tip before promoting, so the promotion entry itself can reach a
+real majority of the *new* voter set — committing it — while the promoted
+node has not yet received that entry, if the leader dies right after
+replicating to everyone except it. The result: every survivor that has
+already adopted the new config needs a vote from the very node whose own
+stale, pre-promotion view says it isn't a voter and therefore, under the
+old code, always refuses — a **permanent** Raft election deadlock, observed
+live in `animusd::cluster_growth::
+dashboard_health_recovers_after_grown_cluster_loses_an_original_node`
+(a tablet group that never recovered a leader). Standard Raft/
+etcd-raft semantics avoid this by construction: a responder grants purely on
+term, log up-to-dateness, and vote lease — **never** on its own membership
+view. The "a learner never influences an election" safety property this
+ADR promises does not need a responder-side gate to hold; it is enforced
+entirely on the **candidate** side, which was already correct and needed no
+change — `handle_pre_vote_resp`/`handle_vote_resp` only ever tally a grant
+that satisfies `self.config.contains(&from)` (the candidate's own,
+always-committed-or-later config), so a non-voter's grant structurally
+never counts toward anyone's majority regardless of whether the responder
+grants it. A companion gap in the same family was fixed alongside it: a
+non-voting node's belief that a particular node is the live leader
+(`leader_id`), and its **pre-vote lease** on a real vote it once granted
+(the `voted_lease` check inside `handle_pre_vote`), used to decay only as a
+side effect of a node's own `Follower` → `PreCandidate` role transition on
+election timeout — which a learner (gated on `is_voter` precisely so it
+never campaigns) can never make, so both could go stale forever once the
+group became permanently leaderless. `start_pre_vote`'s early-return path
+for a non-voter now clears `leader_id` directly (soft state, identical to
+what the voter path already does) and, **separately, sets a new
+`vote_lease_lapsed: bool` flag** on the same "haven't heard from anyone in
+a full election timeout" signal.
+
+**Rejected alternative for the companion fix: clearing `voted_for` on
+that same timer signal.** `voted_for` is real Raft hard state whose entire
+job is "at most one real vote per term" — and the candidate-side tally
+argument above does **not** make clearing it harmless, because in exactly
+the scenario this fix targets, the responder genuinely **is** a voter in
+the candidates' own (majority-committed) config; only the responder's own,
+stale-by-append-not-commit view says otherwise. A concrete two-leaders-
+in-one-term hazard: voters `{L(dead), A, B, C, D}`, term `T`, with C and D
+both missing their own promotion entries — if C's and D's timers each
+cleared `voted_for`, C could real-vote for A, its timer fire again, then
+real-vote for B, both still in term `T`; A and B's own configs each already
+count C as a voter, so both could independently reach a majority. The
+shipped fix never touches `voted_for`: only the **pre-vote lease**
+(`vote_lease_lapsed`, a liveness optimization, never itself a safety
+mechanism) is allowed to lapse — `handle_pre_vote`'s `voted_lease` gains a
+`&& !self.vote_lease_lapsed` conjunct, reset `false` at every site that
+legitimately re-arms the lease (a fresh real-vote grant, a self-vote) or
+that already independently clears `voted_for` on a term change. A real vote
+for a second candidate in the same term is therefore still refused
+(`handle_request_vote`'s `can_vote` never consults this flag) even once the
+lease has lapsed. Regression:
+`crates/animus-control/tests/learner_promotion_leader_crash.rs` (a new,
+seed-swept SimEnv corpus reproducing the exact promotion-then-leader-crash
+race; confirmed red against the pre-fix code, green after — note that its
+4-voter, one-crashed-leader shape would pass equally under the rejected
+`voted_for = None` alternative, since it never constructs the ≥5-voter,
+two-simultaneous-real-candidacies shape the hazard above needs, which is
+why the safety half is pinned by its own unit cell below rather than left
+to the fault-injection corpus) and
+`crates/animus-control/tests/non_voter_vote_lease.rs` (a bare-`RaftCore`
+unit cell pinning both halves directly: a non-voter's pre-vote lease lapses
+after timer expiry — liveness — while a second real vote in the same term
+still fails — safety). See `crates/animus-control/src/raft.rs`'s
+`handle_pre_vote`/`handle_request_vote`/`start_pre_vote` and the
+`vote_lease_lapsed` field's own doc for the full mechanism-level rationale.
+
 ### Train 2: in-place split, replacing ADR 0050's build/freeze/cutover workflow
 
 **Stage 1 — `BeginSplit` unchanged in shape, changed in effect.** The
