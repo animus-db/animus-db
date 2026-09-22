@@ -400,7 +400,9 @@ truth; this map is just for navigation.
   (`animusd::ttl_reaper`) deletes expired items through the ADR 0049
   kind-write path, so index/stream/change-log maintenance is inherited
   rather than reimplemented. Reads are **AWS-faithful** — an expired item
-  stays visible until it is reaped, deliberately not filtered.
+  stays visible until it is reaped, deliberately not filtered. **Service
+  limits are AWS-faithful and compiled-in, with no "unleashed" mode** (ADR
+  0072) — every limit catalogued in `animus_dynamo::limits`.
 - **Backup and restore** (ADR 0059): on-demand backups and PITR as one
   internal snapshots-plus-change-log mechanism over a separately configured
   `SegmentStore` handle (`--backup-store`) — a manifest plus chunked
