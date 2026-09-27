@@ -7328,16 +7328,62 @@ fn is_sealed(sealed: &[(KeyRange, HlcTimestamp)], key: &[u8]) -> bool {
 /// entry, or two leaders minted concurrently without one witnessing the
 /// other — a correctness bug, not a recoverable condition, so this is a hard
 /// `assert!`, matching `hlc::pack`'s own doctrine.
-fn assert_ts_monotonic(max_applied_ts: &mut Option<HlcTimestamp>, ts: HlcTimestamp) {
+///
+/// The name of the [`KvCommand`] variant being applied, purely for
+/// [`assert_ts_monotonic`]'s panic context — a bare "HLC ts didn't exceed
+/// the last applied" was undiagnosable live (found debugging a stale-
+/// `InstallSnapshot` rewind, see `RaftCore::handle_install_snapshot`'s own
+/// doc). Exhaustive over the enum so a future variant fails to compile here
+/// rather than silently reporting "unknown".
+fn kv_command_variant_name(c: &KvCommand) -> &'static str {
+    match c {
+        KvCommand::Put { .. } => "Put",
+        KvCommand::Batch { .. } => "Batch",
+        KvCommand::KindBatch { .. } => "KindBatch",
+        KvCommand::KindEval { .. } => "KindEval",
+        KvCommand::KindEvalBatch { .. } => "KindEvalBatch",
+        KvCommand::SeedBatch { .. } => "SeedBatch",
+        KvCommand::Delete { .. } => "Delete",
+        KvCommand::Cas { .. } => "Cas",
+        KvCommand::Freeze { .. } => "Freeze",
+        KvCommand::SplitTablet { .. } => "SplitTablet",
+        KvCommand::ReadCeiling { .. } => "ReadCeiling",
+        KvCommand::TxnStage { .. } => "TxnStage",
+        KvCommand::TxnCommit { .. } => "TxnCommit",
+        KvCommand::TxnAbort { .. } => "TxnAbort",
+        KvCommand::TxnResolve { .. } => "TxnResolve",
+        KvCommand::NoOp => "NoOp",
+    }
+}
+
+/// The last ts-carrying entry this apply task applied, alongside
+/// `max_applied_ts` — `(log index, term, KvCommand variant name)`. Threaded
+/// exactly like `max_applied_ts` (this apply task's own sequential,
+/// single-writer bookkeeping, reset to `None` at the same points), purely so
+/// an `assert_ts_monotonic` panic can report what immediately preceded it
+/// without re-deriving it from the log, which may already be compacted past
+/// that point by the time anyone reads the panic.
+type LastAppliedTsEntry = Option<(u64, u64, &'static str)>;
+
+fn assert_ts_monotonic(
+    max_applied_ts: &mut Option<HlcTimestamp>,
+    last_applied_ts_entry: &mut LastAppliedTsEntry,
+    ts: HlcTimestamp,
+    index: u64,
+    term: u64,
+    variant: &'static str,
+) {
     if let Some(prev) = *max_applied_ts {
         assert!(
             ts > prev,
             "raftkv apply: HLC ts {ts:?} did not strictly exceed the last applied {prev:?} — \
              the witnessing chain is broken (a leader change or concurrent leader failed to \
-             witness a predecessor's timestamp)"
+             witness a predecessor's timestamp) [this_entry=(index={index}, term={term}, \
+             variant={variant}) prev_entry={last_applied_ts_entry:?}]"
         );
     }
     *max_applied_ts = Some(ts);
+    *last_applied_ts_entry = Some((index, term, variant));
 }
 
 /// The exact dual of [`materialize_derived`]'s own key completion (`prefix
@@ -7834,6 +7880,9 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     hlc: &Hlc,
     sealed: &mut Vec<(KeyRange, HlcTimestamp)>,
     max_applied_ts: &mut Option<HlcTimestamp>,
+    // Threaded exactly like `max_applied_ts` (this apply task's own
+    // sequential, single-writer bookkeeping) — see `LastAppliedTsEntry`'s doc.
+    last_applied_ts_entry: &mut LastAppliedTsEntry,
     committed_ceiling: &AtomicU64,
     // ADR 0050 rung 5: the split-cutover freeze latch — set by
     // `KvCommand::Freeze`'s apply arm, read by the propose-side refusals
@@ -8100,9 +8149,20 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
         if halted.load(Ordering::SeqCst) {
             break;
         }
+        // Captured before `command` is matched/moved, so `assert_ts_monotonic`
+        // below can report which variant it was applying even though the
+        // match arms destructure/consume it.
+        let variant = kv_command_variant_name(&command);
         match command {
             KvCommand::Put { key, value, ts } => {
-                assert_ts_monotonic(max_applied_ts, ts);
+                assert_ts_monotonic(
+                    max_applied_ts,
+                    last_applied_ts_entry,
+                    ts,
+                    index,
+                    term,
+                    variant,
+                );
                 // A sealed-out key is a deterministic no-op (ADR 0018 §2
                 // amendment, now `Freeze`'s apply-time backstop): the key fell
                 // in a range this group already closed, so this entry —
@@ -8119,7 +8179,14 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 }
             }
             KvCommand::Batch { puts, ts } => {
-                assert_ts_monotonic(max_applied_ts, ts);
+                assert_ts_monotonic(
+                    max_applied_ts,
+                    last_applied_ts_entry,
+                    ts,
+                    index,
+                    term,
+                    variant,
+                );
                 // The seal gates the *whole* batch, not per-key: a batch is
                 // one atomic Raft entry (see `KvCommand::Batch`'s doc), so
                 // partially applying it on a miss would silently break that
@@ -8147,7 +8214,14 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 }
             }
             KvCommand::SeedBatch { rows, ts } => {
-                assert_ts_monotonic(max_applied_ts, ts);
+                assert_ts_monotonic(
+                    max_applied_ts,
+                    last_applied_ts_entry,
+                    ts,
+                    index,
+                    term,
+                    variant,
+                );
                 // ADR 0050 rung 4 (fork F3): history transfer into this child
                 // group's own engine. Each row merges at its CARRIED version
                 // (never this entry's own `ts`) with the parent's stored bytes
@@ -8199,7 +8273,14 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 change_log,
                 ts,
             } => {
-                assert_ts_monotonic(max_applied_ts, ts);
+                assert_ts_monotonic(
+                    max_applied_ts,
+                    last_applied_ts_entry,
+                    ts,
+                    index,
+                    term,
+                    variant,
+                );
                 // ADR 0054 step 4b: the ADR 0046 "evaluate at leader"
                 // apply-time OCC seatbelt (`conditions`) this arm used to
                 // check here, before the fence/seal gate below, is deleted
@@ -8273,7 +8354,14 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 ttl_expired,
                 ts,
             } => {
-                assert_ts_monotonic(max_applied_ts, ts);
+                assert_ts_monotonic(
+                    max_applied_ts,
+                    last_applied_ts_entry,
+                    ts,
+                    index,
+                    term,
+                    variant,
+                );
                 // Read the current item in COMMIT ORDER (ADR 0054's
                 // Decision section) — drain the pending run first so this
                 // read observes every earlier write in this same apply
@@ -8387,7 +8475,14 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     .record(index, term, outcome);
             }
             KvCommand::KindEvalBatch { entries, ts } => {
-                assert_ts_monotonic(max_applied_ts, ts);
+                assert_ts_monotonic(
+                    max_applied_ts,
+                    last_applied_ts_entry,
+                    ts,
+                    index,
+                    term,
+                    variant,
+                );
                 // Read every EARLIER entry's writes in this same apply pass
                 // before this entry's own reads — the identical
                 // read-after-flush discipline `Cas`/`KindEval` already use
@@ -8567,7 +8662,14 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 }
             }
             KvCommand::Delete { key, ts } => {
-                assert_ts_monotonic(max_applied_ts, ts);
+                assert_ts_monotonic(
+                    max_applied_ts,
+                    last_applied_ts_entry,
+                    ts,
+                    index,
+                    term,
+                    variant,
+                );
                 if !is_sealed(sealed, &key) {
                     pending.push(MergeOp::tombstone(scope.physical(&key), hlc::pack(ts)));
                 }
@@ -8578,7 +8680,14 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 value,
                 ts,
             } => {
-                assert_ts_monotonic(max_applied_ts, ts);
+                assert_ts_monotonic(
+                    max_applied_ts,
+                    last_applied_ts_entry,
+                    ts,
+                    index,
+                    term,
+                    variant,
+                );
                 // Drain the pending run so the CAS read observes every earlier
                 // committed write in this apply pass.
                 flush_pending(storage, &mut pending, metrics, halted).await;
@@ -8643,7 +8752,14 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     .insert(index, (term, swapped));
             }
             KvCommand::Freeze { ts } => {
-                assert_ts_monotonic(max_applied_ts, ts);
+                assert_ts_monotonic(
+                    max_applied_ts,
+                    last_applied_ts_entry,
+                    ts,
+                    index,
+                    term,
+                    variant,
+                );
                 // Idempotent: an already-frozen group (a duplicate propose, a
                 // WAL-replay re-application over a marker-rebuilt sealed set)
                 // applies nothing a second time.
@@ -8684,7 +8800,14 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 children,
                 ts,
             } => {
-                assert_ts_monotonic(max_applied_ts, ts);
+                assert_ts_monotonic(
+                    max_applied_ts,
+                    last_applied_ts_entry,
+                    ts,
+                    index,
+                    term,
+                    variant,
+                );
                 // Idempotent, mirroring `Freeze`'s own "already sealed"
                 // check: a duplicate propose or a WAL-replay
                 // re-application over a marker-rebuilt sealed set applies
@@ -8779,7 +8902,14 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 }
             }
             KvCommand::ReadCeiling { ts } => {
-                assert_ts_monotonic(max_applied_ts, ts);
+                assert_ts_monotonic(
+                    max_applied_ts,
+                    last_applied_ts_entry,
+                    ts,
+                    index,
+                    term,
+                    variant,
+                );
                 // No fence, no scoped engine write — a ceiling carries no
                 // keys (see `KvCommand::ReadCeiling`'s doc). Bump the
                 // driver's watermark unconditionally (`fetch_max`, since a
@@ -8811,7 +8941,14 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 conditions,
                 ts,
             } => {
-                assert_ts_monotonic(max_applied_ts, ts);
+                assert_ts_monotonic(
+                    max_applied_ts,
+                    last_applied_ts_entry,
+                    ts,
+                    index,
+                    term,
+                    variant,
+                );
                 // Issue #834: drain the pending run first, mirroring `Cas`'s
                 // identical call above — this arm's own reads below
                 // (`already_decided`, and `blocked_by`'s per-write conflict
@@ -9293,7 +9430,14 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 record_key,
                 ts,
             } => {
-                assert_ts_monotonic(max_applied_ts, ts);
+                assert_ts_monotonic(
+                    max_applied_ts,
+                    last_applied_ts_entry,
+                    ts,
+                    index,
+                    term,
+                    variant,
+                );
                 flush_pending(storage, &mut pending, metrics, halted).await;
                 let physical_record = scope.physical(&record_key);
                 let current = storage
@@ -9422,7 +9566,14 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 ts,
                 orphan_created_ts,
             } => {
-                assert_ts_monotonic(max_applied_ts, ts);
+                assert_ts_monotonic(
+                    max_applied_ts,
+                    last_applied_ts_entry,
+                    ts,
+                    index,
+                    term,
+                    variant,
+                );
                 flush_pending(storage, &mut pending, metrics, halted).await;
                 let physical_record = scope.physical(&record_key);
                 let current = storage
@@ -9528,7 +9679,14 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 outcome,
                 ts,
             } => {
-                assert_ts_monotonic(max_applied_ts, ts);
+                assert_ts_monotonic(
+                    max_applied_ts,
+                    last_applied_ts_entry,
+                    ts,
+                    index,
+                    term,
+                    variant,
+                );
                 flush_pending(storage, &mut pending, metrics, halted).await;
                 // ADR 0018 §2/PR4: `outcome` is carried explicitly by the
                 // command rather than re-derived by reading `record_key`
@@ -11719,6 +11877,9 @@ async fn apply_loop<E: Env, S: StorageEngine>(
     // qualifying entry it processes is unconditionally accepted (see
     // `assert_ts_monotonic`'s doc for why that boundary case is safe).
     let mut max_applied_ts: Option<HlcTimestamp> = None;
+    // Threaded alongside `max_applied_ts` for exactly the same lifetime —
+    // see `LastAppliedTsEntry`'s doc.
+    let mut last_applied_ts_entry: LastAppliedTsEntry = None;
     // ADR 0018 §2 write-loss amendment (Part B): the engine-durable version
     // watermark, captured once, right here, before this task (or this
     // process) has applied or minted anything this lifetime — the
@@ -11767,6 +11928,7 @@ async fn apply_loop<E: Env, S: StorageEngine>(
             &hlc,
             &mut sealed,
             &mut max_applied_ts,
+            &mut last_applied_ts_entry,
             &committed_ceiling,
             &frozen,
             &txn_tracker,

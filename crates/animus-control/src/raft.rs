@@ -3758,7 +3758,31 @@ where
         // cadence case: installing a slightly-older-but-still-valid image is
         // wasted work, never incorrect — the log tail still replays over it
         // afterward, and per-key LWW makes any overlap idempotent).
-        if last_index <= self.snapshot_index && !self.state_machine_behind {
+        //
+        // **Stale-snapshot rewind (found live, reproduced deterministically
+        // in `tests/stale_snapshot_no_rewind.rs`): the guard must compare
+        // against `last_applied`, not `snapshot_index`.** `snapshot_index`
+        // only advances at compaction; `last_applied` advances on every
+        // commit, independent of when compaction next runs, and is always
+        // `>= snapshot_index` (the two coincide only immediately after an
+        // install, `handle_install_snapshot`'s own `install` closure below).
+        // A follower that races ahead of a chunked transfer via ordinary
+        // `AppendEntries` — ordering compaction hasn't caught up to yet —
+        // has `last_applied > snapshot_index` while the transfer is still
+        // in flight. The old `last_index <= self.snapshot_index` check does
+        // not see that: a stale transfer whose `last_index` sits strictly
+        // between `snapshot_index` and the follower's true `last_applied`
+        // sails through as "not yet redundant," and its final chunk installs
+        // — clobbering `last_applied`/`commit_index`/the log back down to
+        // that stale `last_index` (`install`, below) even though this
+        // follower had already committed and applied past it. The apply
+        // task then re-plays the rewound log tail, and its ts-carrying
+        // entries land strictly below the high-water mark it already
+        // recorded — `assert_ts_monotonic`'s panic. Comparing against
+        // `last_applied` instead catches this: it is this node's own
+        // up-to-date "how far have I actually gotten," not a proxy that
+        // lags behind it.
+        if last_index <= self.last_applied && !self.state_machine_behind {
             self.incoming_snapshot = None;
             return vec![(
                 leader,
