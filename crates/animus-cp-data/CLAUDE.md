@@ -1607,7 +1607,22 @@ already a member of the parent's own).
   unconditionally — ADR 0050's copy-kinds rule, reused verbatim), then
   either `RaftKvNode::start_hosted` or `start_hosted_campaigning` with
   `bootstrap_voters`, selected by `HostAction::MaterializeSplitChild.
-  campaign` — see "Deterministic first leader" below. **`clone_engine` is
+  campaign` — see "Deterministic first leader" below. **A `probe` hit
+  alone is NOT "fully materialized"** (a fixed bug — see `trim_marker.rs`'s
+  module doc for the full account): `probe` only proves `clone_engine`
+  committed, not that `trim_split_child` finished on top of it, and a
+  crash or a genuine `delete_range` failure between the two used to leave
+  the resume branch reopening an untrimmed clone and hosting the child
+  directly on it, leaking the sibling's rows and the parent's whole change
+  log/cursors into the child **permanently**. `trim_split_child` now
+  writes its own durable completion marker (`trim_marker::
+  trim_marker_key(child)`) as its last step, and the `already_cloned`
+  resume branch checks THAT — not `probe` — before skipping the trim;
+  when the marker is absent it re-runs `trim_split_child` instead
+  (idempotent, and provably safe: the child's Raft group can only ever
+  start after the marker write succeeds, so an absent marker proves this
+  replica's group has never run and holds no committed state a re-trim
+  could clobber). Regression: `tests/split_trim_failure.rs`. **`clone_engine` is
   now range-aware (ADR 0058 fork closed, 2026-08-31)**: immediately before
   calling it, `materialize_split_child` computes the child's own
   physical keep-set once — its declared `range` sliced through
