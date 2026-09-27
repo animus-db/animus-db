@@ -119,6 +119,42 @@ fn a_modestly_slowed_voter_catches_up_via_append_entries_without_ever_needing_a_
             break;
         }
     }
+    // The voter catching up (above) is a fact about the VOTER's own engine
+    // — it says nothing about when the LEADER's own bookkeeping learns of
+    // it. `match_index` (which `RaftCore::compaction_floor`/`leader_log_len`
+    // below depend on) only advances once the leader actually receives and
+    // processes that voter's own next `AppendEntriesResp`, and the
+    // leader's own compaction re-check is a SEPARATE, periodically-polled
+    // task (`apply_and_compact`'s `APPLY_SAFETY_POLL`, 250ms when idle) —
+    // not something the voter's own catch-up re-triggers by itself (no new
+    // entry gets applied on the LEADER side from a peer's ack alone, so
+    // nothing raises `ApplySignal`). A one-shot assert taken the instant
+    // the voter's own progress is observed can therefore race both of
+    // those — found sweeping seeds (issue found alongside the
+    // `last_installed_index` fix): `leader_log_len` briefly reads in the
+    // hundreds right at the voter's own catch-up instant on some seeds,
+    // then converges to 0 within one or two more 100ms polls once the
+    // leader receives the voter's final ack and its own next compaction
+    // tick runs — not a retention/compaction defect, just an eventual
+    // property that needs the same converged-or-timeout treatment as the
+    // voter's own catch-up above (never a fixed-deadline one-shot assert,
+    // `docs/lessons/testing/`). Bounded generously (5s) — nowhere near the
+    // 20s already spent waiting on the voter itself.
+    // `< COMPACT_THRESHOLD` (64), not `== 0`: threshold-triggered
+    // compaction only ever fires once `behind >= COMPACT_THRESHOLD`
+    // (`apply_and_compact`'s own gate), so a genuinely fully-caught-up
+    // leader can still be left holding up to one threshold's worth of
+    // uncompacted tail — that is normal cadence, not a residual failure to
+    // compact.
+    const CONVERGED_LOG_LEN: usize = 64;
+    let mut leader_log_len = nodes[l].log_len();
+    for _ in 0..50 {
+        if leader_log_len < CONVERGED_LOG_LEN {
+            break;
+        }
+        sim.run_for(Duration::from_millis(100));
+        leader_log_len = nodes[l].log_len();
+    }
 
     let total_installs: u64 = handles
         .iter()
@@ -126,7 +162,6 @@ fn a_modestly_slowed_voter_catches_up_via_append_entries_without_ever_needing_a_
         .sum();
     let leader_commit = nodes[l].commit_index();
     let slow_applied = nodes[slow].engine_applied_index();
-    let leader_log_len = nodes[l].log_len();
 
     eprintln!(
         "seed={seed} rounds={ROUNDS}: total_installs={total_installs} \
@@ -171,14 +206,21 @@ fn a_modestly_slowed_voter_catches_up_via_append_entries_without_ever_needing_a_
          real replication progress, only avoid unnecessary snapshots"
     );
     // Compaction must still be genuinely happening (not merely deferred to
-    // infinity because retention always wins) — the leader's own log tail
-    // should stay a small, bounded multiple of COMPACT_THRESHOLD, nowhere
-    // near ROUNDS.
+    // infinity because retention always wins), and — now that the poll
+    // above has given the leader's own bookkeeping a real chance to
+    // observe the voter's final catch-up — it must actually have converged
+    // to (near) nothing retained, not merely "some bounded multiple of
+    // ROUNDS": once the voter's own `match_index` reaches the leader's
+    // `commit_index`, `compaction_floor` imposes no clamp at all, so a
+    // healthy leader's log converges to under one `COMPACT_THRESHOLD`'s
+    // worth of tail.
     assert!(
-        leader_log_len < 500,
-        "seed={seed}: the leader's own uncompacted log tail grew to {leader_log_len} entries \
-         against a merely-slowed (never partitioned) voter — compaction should still be \
-         proceeding, bounded by the voter's own (advancing) match_index"
+        leader_log_len < CONVERGED_LOG_LEN,
+        "seed={seed}: the leader's own uncompacted log tail was still {leader_log_len} entries \
+         (bound {CONVERGED_LOG_LEN}) after 5s of extra 100ms polls following the voter's own \
+         catch-up — against a merely-slowed (never partitioned) voter whose match_index should \
+         have converged to the leader's own commit_index well within that window, compaction \
+         should have fully caught up too"
     );
 }
 

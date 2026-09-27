@@ -425,3 +425,130 @@ fn genuinely_behind_follower_still_converges() {
         "follower did not converge after InstallSnapshot (seed={seed})"
     );
 }
+
+/// Regression for `RaftCore::last_installed_index` (ADR 0017's
+/// `SNAPSHOT_CHUNK_BYTES` bump follow-up, 2026-09-27 amendment): a resent
+/// duplicate of a final `InstallSnapshot` chunk — the leader's
+/// `SnapshotResend::Always` firing again before it has processed the
+/// receiver's first completion ack — must not be reprocessed as a fresh
+/// install while the receiver's own driver is still digesting the first
+/// copy (`state_machine_behind` still `true`, since that flag is cleared
+/// only by the driver's own async apply task, never by
+/// `handle_install_snapshot` itself). Before this fix, the top-of-function
+/// short-circuit fell through to full reassembly unconditionally whenever
+/// `state_machine_behind` was `true` — correct for the wipe-recovery case
+/// it exists for (a resent offer at the SAME `last_index` a fresh, empty
+/// engine must not discard as "already have it"), but it also meant a
+/// resent duplicate of the exact same completed image re-completed from
+/// scratch every time, each one counted as a genuine
+/// `Metric::CpSnapshotInstalls` and each forcing another WAL rewrite (149
+/// counted installs for a single genuine image at the ADR's own pinned
+/// seed). `last_installed_index` (volatile, `None` every fresh lifetime —
+/// unlike `snapshot_index`/`last_applied`, which the wipe-recovery guard
+/// deliberately does NOT trust while `state_machine_behind`) catches an
+/// exact duplicate of the last completed install regardless of
+/// `state_machine_behind`, while a genuine first offer at that same index —
+/// including on a freshly recovered core, whose `last_installed_index` is
+/// `None` this lifetime no matter what `snapshot_index` its WAL restored —
+/// still falls through to a real install exactly as before this fix.
+#[test]
+fn resent_duplicate_final_chunk_is_rejected_while_still_digesting_then_a_fresh_core_still_installs()
+{
+    let now = Nanos(1_000_000_000);
+    let leader = elect_leader_of_pair(now);
+    let image = vec![0xEEu8; 32];
+    let install_index = 50u64;
+    let chunk = |last_index: u64| RaftMsg::InstallSnapshot {
+        term: leader.term(),
+        leader: nid(0),
+        last_index,
+        last_term: leader.term(),
+        offset: 0,
+        data: image.clone(),
+        total: image.len() as u64,
+        done: true,
+        config: None,
+        learners: None,
+    };
+    fn resp_last_index(resp: &[(NodeId, RaftMsg)]) -> u64 {
+        let (_, msg) = resp
+            .iter()
+            .find(|(to, _)| *to == nid(0))
+            .expect("a reply to the leader");
+        match msg {
+            RaftMsg::InstallSnapshotResp { last_index, .. } => *last_index,
+            other => panic!("expected an InstallSnapshotResp, got {other:?}"),
+        }
+    }
+
+    // A follower whose engine is still digesting a prior install (the
+    // wipe-recovery contract: `state_machine_behind` stays `true` across
+    // every one of its acks until the driver's own async apply task
+    // catches up — `RaftCore` itself never clears it).
+    let mut follower: RaftCore = RaftCore::new(nid(1), &[nid(0), nid(1)], Nanos(0), 7);
+    follower.set_state_machine_behind(true);
+
+    // First offer at `install_index`: a genuine completion. It must fall
+    // through to a real install despite `state_machine_behind` — the
+    // wipe-recovery case this guard must not break.
+    let resp1 = follower.handle(nid(0), chunk(install_index), now, 7);
+    assert_eq!(
+        resp_last_index(&resp1),
+        install_index,
+        "the first offer at a never-before-installed index must complete a genuine install"
+    );
+    assert_eq!(follower.snapshot_index(), install_index);
+    assert_eq!(follower.last_applied(), install_index);
+    let pending = follower.drain_pending_install();
+    assert_eq!(
+        pending.as_ref().map(|(idx, _)| *idx),
+        Some(install_index),
+        "the genuine install must have queued a pending install for the driver"
+    );
+    // Still digesting from this replica's own point of view — the driver
+    // has not yet run and cleared this.
+    assert!(follower.state_machine_behind());
+
+    // A resent duplicate of the SAME final chunk lands again (the exact
+    // shape `SnapshotResend::Always` produces before the leader has
+    // processed the first completion ack).
+    let resp2 = follower.handle(nid(0), chunk(install_index), now, 7);
+    assert_eq!(
+        resp_last_index(&resp2),
+        0,
+        "a resent duplicate of an already-installed image must be answered as \
+         redundant (last_index: 0), not reprocessed as a fresh completion"
+    );
+    // No second install happened: state is unchanged, and nothing new was
+    // queued for the driver to (re-)apply.
+    assert_eq!(follower.snapshot_index(), install_index);
+    assert_eq!(follower.last_applied(), install_index);
+    assert_eq!(
+        follower.drain_pending_install(),
+        None,
+        "a rejected duplicate must not queue a second pending install for the driver"
+    );
+
+    // A fresh core — standing in for a restart, across which
+    // `last_installed_index` does NOT survive (unlike `snapshot_index`/
+    // `last_applied`, which a WAL replay would restore) — must still accept
+    // a GENUINE install at the exact same index: the wipe-recovery path
+    // this guard must not break.
+    let mut fresh: RaftCore = RaftCore::new(nid(1), &[nid(0), nid(1)], Nanos(0), 7);
+    fresh.set_state_machine_behind(true);
+    let resp3 = fresh.handle(nid(0), chunk(install_index), now, 7);
+    assert_eq!(
+        resp_last_index(&resp3),
+        install_index,
+        "a fresh core (last_installed_index == None this lifetime) must still accept a \
+         genuine install at the same index a prior lifetime already installed — the \
+         wipe-recovery path `engine_wipe_needs_snapshot.rs` exercises end-to-end"
+    );
+    assert_eq!(fresh.snapshot_index(), install_index);
+    assert_eq!(fresh.last_applied(), install_index);
+    assert_eq!(
+        fresh.drain_pending_install().map(|(idx, _)| idx),
+        Some(install_index),
+        "the fresh core's genuine install must also queue a pending install for its own driver"
+    );
+}
