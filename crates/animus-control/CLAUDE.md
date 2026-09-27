@@ -1577,6 +1577,21 @@ per-tablet CP data plane (`animus-cp-data`).
   `install_snapshot.rs::large_snapshot_ships_in_o_chunk_time_not_o_state` +
   `tests/prod_liveness.rs`.
 
+  **`handle_install_snapshot`'s "already at least this far along"
+  short-circuit must compare against `last_applied`, not `snapshot_index`
+  (found live, `assert_ts_monotonic` panic under `animus-cp-data`'s shared
+  `RaftCore`).** `snapshot_index` only advances at compaction; `last_applied`
+  advances on every commit and is always `>= snapshot_index`. A STALE
+  transfer built between the two — the common shape under a leader that
+  floods/restarts snapshot transfers under load — used to sail past the old
+  guard as "not yet redundant" and, on its final chunk, rewind `last_applied`/
+  `commit_index`/the log backwards. Fixed by comparing against
+  `last_applied` (the `&& !state_machine_behind` override from the #554 fix
+  below is unaffected — see `animus-cp-data/CLAUDE.md`'s own entry for the
+  full incident, including the diagnostic improvement to
+  `assert_ts_monotonic`'s panic message this shipped alongside). Regression:
+  `tests/stale_snapshot_no_rewind.rs`.
+
   **A threshold-triggered compaction must defer while a peer's chunked
   transfer is genuinely in flight (issue #898, the control-plane instance of
   issues #532/#537's `animus-cp-data::COMPACT_DEFER_CEILING` finding).**
