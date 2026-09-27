@@ -74,6 +74,7 @@ mod hwm;
 mod seal;
 pub mod segment;
 mod split;
+mod trim_marker;
 mod ts_cache;
 mod txn;
 

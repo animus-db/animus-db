@@ -42,6 +42,7 @@ use animus_tablet::{Epoch, KeyRange, SplitChild, Tablet, TabletId};
 use animus_control::SharedWal;
 
 use crate::heartbeat_batch::{DEFAULT_HEARTBEAT_BATCH_INTERVAL, HeartbeatBatcher};
+use crate::trim_marker::trim_marker_key;
 use crate::{KvCommand, KvState, RaftKvNode, SHARED_WAL, StorageScope, WAL, wal_file};
 
 /// The per-tablet engine seam (ADR 0050, Train B rung 1): every hosted
@@ -1674,8 +1675,9 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
     /// `Reconfigure` exactly like any other placement drift).
     ///
     /// **G4 crash-idempotency contract** (ADR 0058 Train 2 rung 3's own
-    /// load-bearing detail): two commit points, checked and skipped
-    /// independently on a re-run after a crash between them —
+    /// load-bearing detail): **three** commit points, checked and skipped
+    /// independently on a re-run after a crash (or a genuine step failure)
+    /// between any of them —
     /// 1. **The engine commit**: `EngineFactory::clone_engine`'s target
     ///    manifest replace (ADR 0058 rung 2's own commit-point contract —
     ///    "absent or complete, never torn"). Checked via
@@ -1684,9 +1686,22 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
     ///    committed the clone (with an earlier crash landing after it but
     ///    before the group started) — skip straight to re-opening it via
     ///    `ensure_engine`, never re-clone (a second clone against a
-    ///    since-trimmed or since-written-to target would be a correctness
-    ///    bug, not merely wasted work).
-    /// 2. **The group commit**: successfully calling `RaftKvNode::
+    ///    since-written-to target would be a correctness bug, not merely
+    ///    wasted work).
+    /// 2. **The trim commit**: `trim_split_child` dropping the sibling's own
+    ///    BASE/LSI/FOOTPRINT range and the whole CHANGE/CURSOR scopes, and
+    ///    writing its own durable completion marker
+    ///    (`trim_marker::trim_marker_key`) as its last step. **`probe` alone
+    ///    cannot distinguish "cloned and trimmed" from "cloned but trim
+    ///    crashed or failed partway"** — those are different engine states,
+    ///    and treating them as one used to leak the sibling's rows and the
+    ///    parent's whole change log/cursors into the child permanently (a
+    ///    fixed bug, see `trim_marker.rs`'s module doc for the full
+    ///    account). The `already_cloned` branch below checks the trim
+    ///    marker specifically, not `probe`, and re-runs `trim_split_child`
+    ///    (safe: idempotent, and provably pre-group-start — see step 3)
+    ///    whenever it is absent.
+    /// 3. **The group commit**: successfully calling `RaftKvNode::
     ///    start_hosted` and registering the result in
     ///    [`hosted`](Self::hosted) — the SAME optimistic-claim-then-execute
     ///    discipline [`host`](Self::host) already uses for an ordinary
@@ -1697,13 +1712,20 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
     ///    separate "child group state" artifact needs writing: a brand-new
     ///    Raft group bootstraps fresh from its `all_nodes` config every
     ///    time regardless (empty log, first election) — the group's own
-    ///    identity IS `self.hosted.contains(&child.id)`.
+    ///    identity IS `self.hosted.contains(&child.id)`. **This step is
+    ///    only ever reached after step 2's marker write succeeds**, which is
+    ///    exactly what makes step 2's own re-run always safe: an absent
+    ///    marker proves this replica's child group has never started and
+    ///    therefore holds no committed state of its own that a re-trim could
+    ///    clobber.
     ///
-    /// A crash between steps 1 and 2 therefore re-runs exactly step 2 on
-    /// retry (step 1's own idempotency is `clone_to`'s, inherited
-    /// unchanged); a crash before step 1 re-runs both, deterministically,
-    /// from the same `parent`/`child`/`range`/`bootstrap_voters` inputs
-    /// every replica computes identically from the fork entry itself.
+    /// A crash between steps 2 and 3 therefore re-runs exactly step 3 on
+    /// retry; a crash between steps 1 and 2 re-runs exactly step 2 (which is
+    /// itself idempotent, so re-running it from scratch or resuming it
+    /// partway both converge to the same trimmed state); a crash before step
+    /// 1 re-runs all three, deterministically, from the same
+    /// `parent`/`child`/`range`/`bootstrap_voters` inputs every replica
+    /// computes identically from the fork entry itself.
     ///
     /// **`campaign` (ADR 0058 Train 2 rung 4)**: `true` only for the replica
     /// that was the PARENT's own Raft leader at the moment it observed the
@@ -1738,11 +1760,55 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
         let already_cloned = if self.factory.probe(child.id).await {
             // G4 step 1 already committed on an earlier attempt (a crash
             // landed after the clone but before the group started) — never
-            // re-clone (the target may already be trimmed, or may already
-            // hold group state a second clone would clobber). Just recover
-            // the handle.
+            // re-clone. Recover the handle, then check the SEPARATE trim
+            // completion marker (`trim_marker_present`) rather than trusting
+            // `probe` alone as "fully trimmed": `probe` only proves the
+            // engine-commit half of G4 (the clone), not the trim step that
+            // must still run on top of it — see `trim_marker.rs`'s module
+            // doc for the bug this closes.
             match self.factory.open(child.id).await {
-                Ok(engine) => Some(engine),
+                Ok(engine) => match trim_marker_present(&engine, child.id).await {
+                    Ok(true) => Some(engine),
+                    Ok(false) => {
+                        // Cloned, but trim never fully completed (a prior
+                        // attempt either crashed between the clone and the
+                        // trim, or the trim itself failed partway). Safe to
+                        // just re-run trim here: the child's own Raft group
+                        // can only ever start AFTER `trim_split_child`
+                        // returns `Ok` (including its own marker write), so
+                        // an absent marker proves this group has never run
+                        // and holds no committed state of its own yet — see
+                        // `trim_split_child`'s doc for why re-running its
+                        // (idempotent) deletes is always safe.
+                        if let Err(e) = trim_split_child(&engine, &drop_range, child.id).await {
+                            tracing::warn!(
+                                child = child.id.0,
+                                parent = parent.0,
+                                %e,
+                                "reconciler: re-trimming a split child resumed from an \
+                                 already-cloned-but-untrimmed engine"
+                            );
+                            self.state.release_unconfirmed_host(child.id);
+                            self.state.split_forming.remove(&child.id);
+                            return;
+                        }
+                        Some(engine)
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            child = child.id.0,
+                            parent = parent.0,
+                            %e,
+                            "reconciler: reading a split child's trim-completion marker failed \
+                             — treating the engine as lost, destroying and re-cloning fresh \
+                             (issue #554's own recovery shape)"
+                        );
+                        self.env.metrics().incr(Metric::CpEngineOpenFailed);
+                        self.factory.destroy(child.id).await;
+                        rebuilding = true;
+                        None
+                    }
+                },
                 Err(e) => {
                     tracing::warn!(
                         child = child.id.0,
@@ -1832,7 +1898,7 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
                     return;
                 }
             };
-            if let Err(e) = trim_split_child(&engine, &drop_range).await {
+            if let Err(e) = trim_split_child(&engine, &drop_range, child.id).await {
                 tracing::warn!(
                     child = child.id.0,
                     parent = parent.0,
@@ -2277,9 +2343,21 @@ mod wal_layout_tests {
 /// engine's `put`-like monotonic contract, not `merge`'s per-key LWW) —
 /// `version` starts one above the clone's own inherited `latest_version()`
 /// and is bumped before every subsequent call.
+///
+/// **Idempotent, and writes a durable completion marker as its own LAST
+/// step** (`trim_marker::trim_marker_key(child.0)`, issue's own G4 fixup —
+/// see `trim_marker.rs`'s module doc for the full account of the bug this
+/// closes). Every `delete_range` call above is itself idempotent (deleting
+/// an already-deleted range is a no-op tombstone re-write at a fresh,
+/// strictly-greater version), so re-running this whole function against an
+/// engine some earlier attempt already partially or fully trimmed is always
+/// safe — which is exactly what `materialize_split_child`'s `already_cloned`
+/// resume branch now does whenever it finds the marker absent, instead of
+/// trusting a bare `EngineFactory::probe` hit as "fully trimmed."
 async fn trim_split_child<S: StorageEngine>(
     engine: &S,
     drop_range: &KeyRange,
+    child: TabletId,
 ) -> Result<(), String> {
     let mut version = engine.latest_version().wrapping_add(1);
     for &kind in &[crate::KIND_BASE, crate::KIND_LSI, crate::KIND_FOOTPRINT] {
@@ -2310,7 +2388,31 @@ async fn trim_split_child<S: StorageEngine>(
             .map_err(|e| e.to_string())?;
         version = version.wrapping_add(1);
     }
-    Ok(())
+    // The completion marker itself — written last, and only once every
+    // delete_range above has already succeeded. `materialize_split_child`'s
+    // resume branch treats its absence as proof that no attempt has ever
+    // reached this point, so re-running the whole function is always safe
+    // (see this function's own doc and `trim_marker.rs`'s module doc).
+    engine
+        .put(&trim_marker_key(child.0), &[], version)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Has `child`'s own [`trim_split_child`] fully completed on `engine`
+/// (including its own durable completion marker)? See `trim_split_child`'s
+/// and `trim_marker.rs`'s docs for why this — not a bare
+/// [`EngineFactory::probe`] hit — is the resume signal
+/// `materialize_split_child` needs.
+async fn trim_marker_present<S: StorageEngine>(
+    engine: &S,
+    child: TabletId,
+) -> Result<bool, String> {
+    engine
+        .get(&trim_marker_key(child.0))
+        .await
+        .map(|v| v.is_some())
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
