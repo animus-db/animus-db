@@ -3784,12 +3784,52 @@ where
         // lags behind it.
         if last_index <= self.last_applied && !self.state_machine_behind {
             self.incoming_snapshot = None;
+            // Issue found alongside PR #1048 (2026-09-27): this used to echo
+            // `last_index: self.snapshot_index` — nonzero whenever this node has
+            // ever compacted at all, which made this "already redundant, no
+            // install happened" reply byte-for-byte indistinguishable, on the
+            // WIRE, from a genuine just-completed install (`InstallSnapshotResp
+            // { last_index > 0, .. }` below). Two real consumers trusted that
+            // shape as "a completed install, full stop": `record_kv_outbound`
+            // (`animus-cp-data`) increments `Metric::CpSnapshotInstalls` on
+            // ANY outbound `last_index > 0` ack, and
+            // `handle_install_snapshot_resp`'s own "transfer complete" branch
+            // reset `next_index`/cleared `snapshot_offset` bookkeeping the same
+            // way for both. Before #1048 widened this short-circuit's own
+            // trigger condition (`last_index <= last_applied`, replacing the
+            // far narrower `<= snapshot_index`), the ambiguous case was rare
+            // enough not to matter in practice; afterward it fires on almost
+            // every stale/duplicate/late-arriving chunk once a peer has caught
+            // up via ordinary `AppendEntries`, silently inflating
+            // `CpSnapshotInstalls` (breaking `follower_aware_compaction.rs`'s
+            // install-count bound, tuned against the pre-#1048 rate) and
+            // regressing an already-advanced peer's `next_index` backward
+            // (confirmed via targeted eprintln! instrumentation reproducing
+            // `old_match=702 new_match=702 old_next=703 new_next=191` against
+            // `ANIMUS_SEED=1394872321`, immediately forcing an unnecessary
+            // fresh `InstallSnapshot`). This bug is not specific to follower-
+            // aware retention (`compaction_floor`): it lives entirely in this
+            // shared short-circuit's own reply, unchanged by that feature, and
+            // over-counts `CpSnapshotInstalls` on `origin/main` alone the
+            // moment a redundant offer lands with `snapshot_index > 0` — #1048
+            // only made that common instead of rare. The fix: report
+            // `last_index: 0, next_offset: 0` — the "no completion happened,
+            // and I have nothing buffered" shape `handle_install_snapshot_
+            // resp`'s "still mid-transfer" branch already handles via its own
+            // `next_offset == 0 && *tracked > 0` case, which clears this peer's
+            // `snapshot_chunk_sent`/`snapshot_heartbeat_attempts`/`tracked`
+            // bookkeeping without touching `next_index`/`match_index` or
+            // counting a completed install — exactly the "just acknowledge our
+            // position as redundant" contract this short-circuit's own
+            // top-of-function doc already promises, and what
+            // `tests/stale_snapshot_no_rewind.rs` already asserts
+            // (`last_index == 0`), which this brings the code in line with.
             return vec![(
                 leader,
                 RaftMsg::InstallSnapshotResp {
                     term: self.current_term,
-                    last_index: self.snapshot_index,
-                    next_offset: total,
+                    last_index: 0,
+                    next_offset: 0,
                 },
             )];
         }
@@ -3960,7 +4000,36 @@ where
             }
             let m = self.match_index.entry(from.clone()).or_insert(0);
             *m = (*m).max(last_index);
-            self.next_index.insert(from.clone(), last_index + 1);
+            // Issue found alongside PR #1048 (2026-09-27): unlike `match_index`
+            // just above, this used to be a bare `insert`, unconditionally
+            // overwriting `next_index` with `last_index + 1` -- correct for a
+            // GENUINE just-finished install, but this same reply shape is also
+            // what `handle_install_snapshot`'s "already at least this far
+            // along" short-circuit sends for an ALREADY-REDUNDANT offer, whose
+            // own `last_index` there is the sender's `snapshot_index` (its last
+            // COMPACTION point), not its `last_applied` -- a value that can sit
+            // arbitrarily far behind a peer's real, already-tracked position
+            // once #1048 widened that short-circuit's own trigger condition
+            // (`last_index <= last_applied`, replacing `<= snapshot_index`) to
+            // fire far more often. A stale/duplicate final chunk from an
+            // earlier, already-superseded transfer landing after this peer
+            // caught up further via ordinary `AppendEntries` therefore used to
+            // yank a correctly-advanced `next_index` back down to that stale
+            // `snapshot_index + 1` -- and if the leader's own log had since
+            // compacted past that point (exactly what follower-aware retention,
+            // `compaction_floor`, computes off THIS SAME regressed value in a
+            // vicious cycle), the very next `replicate_to` for this peer found
+            // no entry to send at that regressed `next_index` and fell back to
+            // a brand-new, wholly unnecessary `InstallSnapshot` --
+            // confirmed via targeted eprintln! instrumentation, reproducing the
+            // exact `old_match=702 new_match=702 old_next=703 new_next=191`
+            // regression against `ANIMUS_SEED=1394872321`. `next_index` must be
+            // exactly as monotonic as `match_index` two lines above -- both are
+            // a leader's own memory of a peer's ratcheting-forward replication
+            // progress under its current term, and neither field's value can
+            // ever legitimately move backward while that term holds.
+            let n = self.next_index.entry(from.clone()).or_insert(1);
+            *n = (*n).max(last_index + 1);
             // Issue #554: record that `from` has now been fully served a
             // snapshot at (at least) `last_index` — see `snapshot_served_
             // through`'s own doc and `handle_append_resp`'s `needs_snapshot`
