@@ -1202,6 +1202,48 @@ the same 21 seeds also surfaced an unrelated pre-existing issue, present
 identically on the code before this fix: for some seeds the leader's own
 log fails to compact at all against this same modestly-slowed voter
 (`leader_log_len` in the hundreds against the test's own `< 500` bound) —
-reproducible independent of this change, not fixed here, and not gating
-this PR (`crates/animus-cp-data/tests/follower_aware_compaction.rs`'s own
-pinned seed does not exhibit it); left for separate follow-up.
+reproducible independent of this change.
+
+**Follow-up (resolved)**: a 45-seed sweep (via the same temporary env-var
+seed override, never committed) found 3 of 45 seeds tripping the `< 500`
+bound (`leader_log_len` 514/531/980), always with `total_installs == 0`.
+Instrumented live: in every failing case, `RaftCore::compaction_floor`'s
+own `match_index` for the slowed voter was genuinely stuck (e.g. `687` of
+`1201`) at the moment of measurement — but this was **not** a compaction
+defect. Two distinct, benign causes compound:
+1. A chunked `InstallSnapshot` transfer to the voter can itself stall (its
+   own inbox backlogged behind the write burst's individual small
+   `AppendEntries`), sit idle long enough to trip
+   `COMPACT_DEFER_IDLE_CEILING`, and get force-cancelled by the resulting
+   compaction advance — landing the base exactly at the voter's own
+   (still-behind) `match_index`, with no further replication actively
+   re-driven to it until the next heartbeat or write.
+2. **The test's own assertion raced the leader's own bookkeeping.** The
+   drain loop's exit condition — `nodes[slow].engine_applied_index() >=
+   commit_index` — is a fact about the VOTER's own engine; it says nothing
+   about whether the LEADER has yet received and processed that voter's
+   corresponding `AppendEntriesResp` (which is what actually advances
+   `match_index`/`compaction_floor`), nor whether the leader's own
+   `apply_and_compact` task — a separately-scheduled loop, `APPLY_SAFETY_
+   POLL` = 250ms when idle, not re-triggered by a peer's ack alone since no
+   new entry gets applied on the leader's side from that — has run its next
+   pass yet. The test measured `leader_log_len()` in the same instant it
+   observed the voter's own catch-up, with no allowance for either lag. On
+   direct measurement, all 3 failing seeds converged to `leader_log_len ==
+   0` (or under one `COMPACT_THRESHOLD`, for a seed whose last compacted
+   batch legitimately left a sub-threshold residual) within 1-2 further
+   100ms polls.
+
+**The fix was to the test, not to compaction**: `follower_aware_compaction.
+rs`'s `a_modestly_slowed_voter_...` now polls `leader_log_len()` to
+convergence (bounded, 5s) the same converged-or-timeout way its own drain
+loop already treats the voter's catch-up, then asserts `< COMPACT_THRESHOLD`
+(64) instead of `< 500` — the real invariant (compaction converges to
+nothing left once the voter's `match_index` reaches `commit_index`, modulo
+one threshold's worth of not-yet-triggered residual), not merely "some
+number well under 500 happened to be safe for one pinned seed." A 45-seed
+sweep against the fixed test is fully green. A direct `RaftCore`-level
+regression for the `last_installed_index` duplicate-suppression guard
+itself lives in `crates/animus-control/tests/stale_snapshot_no_rewind.rs`
+(`resent_duplicate_final_chunk_is_rejected_while_still_digesting_then_a_
+fresh_core_still_installs`).
