@@ -99,7 +99,21 @@ const WRITE_BURSTS: u64 = 300;
 /// After the writer stops, how many times (each separated by
 /// `DRAIN_POLL_GAP` of virtual time) to check whether the learner has
 /// caught up before giving up.
-const DRAIN_POLLS: u64 = 300;
+///
+/// Raised from `300` to `1500` by issue #1046's fix: `lib.rs`'s
+/// `threshold_hit` gate no longer forces a still-*advancing* transfer out
+/// early just because `behind` crossed the old, much lower
+/// `COMPACT_DEFER_CEILING` (superseded by `COMPACT_DEFER_EMERGENCY_
+/// CEILING`, 8x higher) — only genuine idle time
+/// (`COMPACT_DEFER_IDLE_CEILING`) or that far-higher emergency ceiling can
+/// now do that. That is the fix (see `snapshot_transfer_survives_
+/// compaction.rs`), but it means this test's own uncompacted log tail is
+/// now deliberately allowed to grow larger before compaction resumes,
+/// which the post-install `AppendEntries` catch-up then has more of to
+/// replay — a real, bounded, and cheap (real time barely moves) increase
+/// in this test's own virtual drain budget, not a regression in the
+/// mechanism it exists to prove.
+const DRAIN_POLLS: u64 = 1500;
 const DRAIN_POLL_GAP: Duration = Duration::from_millis(10);
 
 /// A sustained per-item writer keeps proposing to the leader while a
