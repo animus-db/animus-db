@@ -1815,31 +1815,81 @@ per-tablet CP data plane (`animus-cp-data`).
   never resend without new progress), `Capped(SNAPSHOT_ACK_RESEND_CAP)` for
   `handle_install_snapshot_resp`'s own ack-driven resend (a small, nonzero
   bound — see that constant's own doc for why neither `0` nor unbounded
-  works there), and `Always` everywhere else (heartbeat tick, a peer's own
-  `AppendEntries` response, `WakeRequest`, a fresh leadership term — each
-  already bounded by something other than write rate). A genuinely NEW
-  offset (real ack progress) always ships immediately at every call site,
-  never held back. A companion fix closes an independent defect found
-  building this one: `handle_install_snapshot_resp`'s tracked offset is now
-  updated via `max`, not a bare `insert` — under the pre-fix flood's own
-  overlapping in-flight sends, acks could reach the leader out of
-  real-progress order and regress the tracked offset backward (confirmed:
-  217 such regressions in one run), which the flood's own sheer volume had
-  been silently absorbing. See the ADR's third amendment for the full
-  account, including why two narrower prototypes (skip wake-on-propose
-  entirely; throttle it by propose count) were tried and rejected first —
-  `replicate_now`'s wake is a single coalesced `AtomicBool`
-  (`ProposeSignal`), so under `learner_catchup_under_load.rs`'s own
-  synchronous-burst workload it was never the flood's real amplifier in
-  that test to begin with; the ack-handler's cascade was.
-  `animus-cp-data/tests/snapshot_resend_bound.rs` is the dedicated
-  message-VOLUME regression (distinct from the pre-existing
-  convergence-timing one) — see that test's own module doc for why a
-  `Metric`-based measurement was necessary at all (`SimEnv` charges a
-  resend flood no virtual time and little real time, so a timing-only
-  test cannot see it) and why its denominator is an exact in-core counter
-  (`RaftCore::snapshot_chunk_advances`) rather than externally polling
-  `snapshot_offset`.
+  works there), and `Always` for a peer's own `AppendEntries` response,
+  `WakeRequest`, and a fresh leadership term — each bounded by something
+  other than write rate. A genuinely NEW offset (real ack progress) always
+  ships immediately at every call site, never held back. A companion fix
+  closes an independent defect found building this one:
+  `handle_install_snapshot_resp`'s tracked offset is now updated via `max`,
+  not a bare `insert` — under the pre-fix flood's own overlapping in-flight
+  sends, acks could reach the leader out of real-progress order and
+  regress the tracked offset backward (confirmed: 217 such regressions in
+  one run), which the flood's own sheer volume had been silently
+  absorbing. See the ADR's third amendment for the full account, including
+  why two narrower prototypes (skip wake-on-propose entirely; throttle it
+  by propose count) were tried and rejected first — `replicate_now`'s wake
+  is a single coalesced `AtomicBool` (`ProposeSignal`), so under
+  `learner_catchup_under_load.rs`'s own synchronous-burst workload it was
+  never the flood's real amplifier in that test to begin with; the
+  ack-handler's cascade was. `animus-cp-data/tests/
+  snapshot_resend_bound.rs` is the dedicated message-VOLUME regression
+  (distinct from the pre-existing convergence-timing one) — see that
+  test's own module doc for why a `Metric`-based measurement was necessary
+  at all (`SimEnv` charges a resend flood no virtual time and little real
+  time, so a timing-only test cannot see it) and why its denominator is an
+  exact in-core counter (`RaftCore::snapshot_chunk_advances`) rather than
+  externally polling `snapshot_offset`.
+
+  **`SnapshotResend::Backoff` (issue found live, 2026-09-27): the
+  heartbeat tick's own resend was `Always`, not because it was truly
+  bounded, but on the mistaken theory that a fixed per-tick rate is itself
+  a bound.** It isn't: a heartbeat tick fires forever, unconditionally,
+  for as long as this node leads, regardless of whether the peer it's
+  resending to can ever possibly catch up — a real network partition, a
+  permanently wedged peer disk, or a sustained write rate that genuinely
+  outpaces what the peer can ever absorb (`apply_and_compact`'s own
+  documented capacity limit, `animus-cp-data/CLAUDE.md`) all leave a chunk
+  "outstanding" indefinitely, and `Always` kept resending it at the FULL
+  heartbeat rate (every `heartbeat_interval`, 50ms by default) for as long
+  as that lasted — unbounded in ELAPSED TIME, distinct from every other
+  site's own per-offset flood the amendments above closed. Live symptom
+  this produced: `cp_snapshot_ships` climbing tens of thousands ahead of
+  `cp_commits`/genuine snapshot installs on a heavily auto-splitting
+  cluster, with node RSS growing roughly 1GB every few minutes (every
+  resend is a fresh `Vec<u8>` chunk queued for send). Reproduced directly:
+  `animus-cp-data/tests/snapshot_heartbeat_resend_unbounded.rs` partitions
+  a follower after it falls behind the compacted log, then measures
+  `Metric::CpSnapshotShips` in two successive halves of a 60s idle window
+  — pre-fix, ~600 chunks (one per heartbeat) ship in the SECOND half alone,
+  with zero decay. **Fixed** by a new `SnapshotResend::Backoff` variant,
+  used only at the heartbeat-tick call site: resend a peer's outstanding
+  chunk only while its own per-offset ATTEMPT count is `0` or a power of
+  two, an exponentially-thinning schedule that ships O(log(elapsed
+  heartbeats)) chunks to a permanently-stuck peer instead of O(elapsed
+  heartbeats) — bounding total volume to tens, not thousands, over a
+  multi-minute stall — while never fully silencing the retry (a peer that
+  later reconnects is still eventually resent to, unlike a hard `Capped`
+  cutoff). **Deliberately keyed off a SEPARATE counter,
+  `snapshot_heartbeat_attempts` (not `snapshot_chunk_sent`'s own
+  `resends`)** — found building this fix: `resends_so_far` (the counter
+  `Capped` reads) only advances on a call that actually SENDS, so gating
+  `Backoff`'s own schedule on it directly freezes the schedule forever at
+  whatever attempt count first got suppressed (confirmed live: stuck
+  permanently at `resends_so_far == 3`, never reaching `4`, the next
+  power of two, since a suppressed call never increments it — this broke
+  `animus-control/tests/control_corpus.rs`'s `chunked_snapshot_*_3` cells
+  outright, not merely a timing flake, catching the bug before it shipped).
+  `snapshot_heartbeat_attempts` instead advances on every heartbeat-tick
+  ATTEMPT for the peer's current offset, sent or suppressed alike, and
+  resets to `(offset, 0)` whenever the tracked offset itself changes (real
+  progress always restarts the backoff) — cleared at the identical points
+  `snapshot_chunk_sent` itself is. A still-converging transfer is
+  unaffected in practice: it advances the offset well before the attempt
+  count climbs past the first few doublings, so `handle_install_snapshot_
+  resp`'s own `Capped(SNAPSHOT_ACK_RESEND_CAP)` ack-driven resend — which
+  fires on every ack, independent of heartbeat cadence entirely — is what
+  actually keeps a healthy transfer flowing; this only changes behavior
+  once a transfer has gone genuinely idle for a while.
 
 - **Durable-before-visible mechanics + hand-driven gotchas.** The driver
   advances the durable watermark via `mark_durable_through` in `flush_wal`,

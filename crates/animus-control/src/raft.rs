@@ -135,13 +135,55 @@ enum SnapshotResend {
     Capped(u32),
     /// No cap — a resend of the SAME outstanding offset is always allowed.
     /// Reserved for triggers that are themselves already bounded by
-    /// something other than write rate: a periodic heartbeat tick, a
-    /// peer's own `AppendEntries` success/reject response, an explicit
-    /// `WakeRequest` poke, a fresh leadership term. NOT used for the
-    /// ack-handler's own resend (`handle_install_snapshot_resp`) — see
-    /// that method's own doc for why a bounded cap, not `Always`, is what
-    /// belongs there.
+    /// something other than write rate: a peer's own `AppendEntries`
+    /// success/reject response, an explicit `WakeRequest` poke, a fresh
+    /// leadership term. NOT used for the ack-handler's own resend
+    /// (`handle_install_snapshot_resp`) — see that method's own doc for why
+    /// a bounded cap, not `Always`, is what belongs there. **NOT used for
+    /// the periodic heartbeat tick either, as of the message-volume-over-
+    /// time fix below** — see [`Backoff`](Self::Backoff)'s own doc for why
+    /// "bounded by heartbeat cadence, not write rate" turned out not to be
+    /// a real bound at all.
     Always,
+    /// Exponential backoff on a resend of the SAME outstanding offset,
+    /// keyed off the SAME `resends_so_far` counter `snapshot_chunk_for`
+    /// already tracks: send while `resends_so_far` is `0` or a power of
+    /// two, suppress every other call. This is the periodic **heartbeat
+    /// tick**'s own setting (`RaftCore::tick`'s `Role::Leader` branch) —
+    /// the one call site `Always` used to cover on the (wrong) theory that
+    /// a fixed per-tick rate was itself a bound. It isn't: a heartbeat
+    /// tick fires forever, unconditionally, for as long as this node
+    /// leads, regardless of whether the peer it's resending to can ever
+    /// possibly catch up — a real network partition, a permanently wedged
+    /// peer disk, or (`apply_and_compact`'s own documented capacity limit)
+    /// a write rate that genuinely outpaces what the peer can ever absorb
+    /// all leave a chunk "outstanding" indefinitely, and `Always` resent it
+    /// at the FULL heartbeat rate (every `heartbeat_interval`, by default
+    /// 50ms) for as long as that lasted — unbounded in elapsed time, not
+    /// merely per-offset like every other site's own flood this ADR's
+    /// amendments closed (confirmed live and reproduced directly:
+    /// `animus-cp-data/tests/snapshot_heartbeat_resend_unbounded.rs` shipped
+    /// ~20 chunks/second to a permanently partitioned peer for the entire
+    /// length of an idle 60s window with zero decay). `Backoff` keeps the
+    /// same genuinely-useful property `Always` was reached for — a stuck
+    /// transfer is never permanently silenced, so a peer that later
+    /// reconnects (or whose disk unwedges) is still eventually retried —
+    /// while bounding the total volume shipped to a peer that never
+    /// recovers to O(log(elapsed heartbeats)) instead of O(elapsed
+    /// heartbeats): over a very long stuck episode, chunk N is shipped only
+    /// once real progress last happened `2^(k)` heartbeats ago for the
+    /// current `k`, so total resends stay small (tens, not thousands) even
+    /// across a multi-minute stall, and a chunk for a genuinely NEW offset
+    /// (real progress) is, as with every other variant, never held back —
+    /// the schedule always includes `resends_so_far == 0`. A genuinely
+    /// still-converging transfer is unaffected in practice: it advances the
+    /// offset well before `resends_so_far` climbs past the first few
+    /// doublings, so the ack-handler's own `Capped(SNAPSHOT_ACK_RESEND_CAP)`
+    /// resend (which fires on every ack, independent of the heartbeat
+    /// cadence entirely) is what actually keeps a healthy transfer flowing
+    /// between heartbeats — this only changes behavior once a transfer has
+    /// gone genuinely idle for a while.
+    Backoff,
 }
 
 /// The resend cap `handle_install_snapshot_resp` passes for its own
@@ -870,6 +912,21 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     // wholesale on `snapshot_upto` invalidation (a moved base makes any
     // prior offset meaningless), and on a fresh leadership term.
     snapshot_chunk_sent: BTreeMap<NodeId, (u64, u32)>,
+    // Per-peer `(offset, attempts)` for `SnapshotResend::Backoff`'s own
+    // exponential-thinning schedule (the heartbeat tick's policy — see that
+    // variant's own doc). Deliberately a SEPARATE counter from
+    // `snapshot_chunk_sent`'s `resends` above: that one counts only chunks
+    // actually SENT, so a suppressed call never advances it — keying the
+    // backoff schedule off it directly would freeze the schedule forever at
+    // whatever count first got suppressed (found building this fix: a
+    // resend suppressed at count 3 never reaches count 4, the next allowed
+    // power of two, since only a successful send increments it). This
+    // field instead counts every heartbeat-tick ATTEMPT for the current
+    // offset, sent or suppressed alike, so the schedule genuinely advances
+    // tick over tick. Reset to `(offset, 0)` whenever the offset itself
+    // changes (genuine progress restarts the backoff); cleared at the
+    // identical points `snapshot_chunk_sent` itself is.
+    snapshot_heartbeat_attempts: BTreeMap<NodeId, (u64, u32)>,
     // Per-peer lifetime count of GENUINE `InstallSnapshot` chunk advances —
     // bumped exactly once whenever `snapshot_chunk_for` builds a chunk for
     // an offset it has never sent before (a capped RESEND of an
@@ -1156,6 +1213,7 @@ where
             snapshot_offset: BTreeMap::new(),
             snapshot_offset_regressions: BTreeMap::new(),
             snapshot_chunk_sent: BTreeMap::new(),
+            snapshot_heartbeat_attempts: BTreeMap::new(),
             snapshot_chunk_advances: BTreeMap::new(),
             incoming_snapshot: None,
             election_base: Duration::from_millis(150),
@@ -1368,6 +1426,7 @@ where
             self.snapshot_offset.clear();
             self.snapshot_offset_regressions.clear();
             self.snapshot_chunk_sent.clear();
+            self.snapshot_heartbeat_attempts.clear();
         }
     }
 
@@ -2340,10 +2399,14 @@ where
                     // continuously and healthily the entire time. See
                     // `last_leader_contact`'s own doc.
                     self.last_leader_contact = Some((self.id.clone(), now));
-                    // Heartbeat cadence (write-rate-independent) is one of
-                    // the bounded retries a genuinely stuck snapshot chunk
-                    // gets — always allowed (`SnapshotResend::Always`).
-                    return self.broadcast_append(SnapshotResend::Always);
+                    // Heartbeat cadence is one of the bounded retries a
+                    // genuinely stuck snapshot chunk gets — but "bounded by
+                    // heartbeat cadence" alone is not a bound on TOTAL
+                    // volume over an unboundedly long stall, only on the
+                    // rate; `SnapshotResend::Backoff` is what actually
+                    // bounds the total (see that variant's own doc for the
+                    // full incident this closed).
+                    return self.broadcast_append(SnapshotResend::Backoff);
                 }
                 Vec::new()
             }
@@ -2450,6 +2513,7 @@ where
             self.snapshot_offset.clear();
             self.snapshot_offset_regressions.clear();
             self.snapshot_chunk_sent.clear();
+            self.snapshot_heartbeat_attempts.clear();
         }
         // ADR 0044 phase-1 PR3, un-quiesce trigger (a): **any** inbound Raft
         // message un-quiesces, run before dispatch so every specific handler
@@ -3708,6 +3772,7 @@ where
             self.snapshot_offset.remove(&from);
             self.snapshot_offset_regressions.remove(&from);
             self.snapshot_chunk_sent.remove(&from);
+            self.snapshot_heartbeat_attempts.remove(&from);
             // Lazy-image discipline (`DRIVER_APPLIED`): once no transfer is in
             // flight, drop the materialized image instead of retaining a
             // whole-tablet copy in the core indefinitely — a later straggler
@@ -3793,6 +3858,7 @@ where
             // reached). See `docs/lessons/` for the incident writeup.
             *tracked = 0;
             self.snapshot_chunk_sent.remove(&from);
+            self.snapshot_heartbeat_attempts.remove(&from);
             self.snapshot_offset_regressions.insert(from.clone(), 0);
         } else if next_offset < *tracked {
             // Issue #898: a regression below the tracked offset — either a
@@ -3816,6 +3882,7 @@ where
             if *regressions > SNAPSHOT_OFFSET_REGRESSION_REBASE {
                 *tracked = next_offset;
                 self.snapshot_chunk_sent.remove(&from);
+                self.snapshot_heartbeat_attempts.remove(&from);
                 *self
                     .snapshot_offset_regressions
                     .entry(from.clone())
@@ -4124,6 +4191,7 @@ where
         self.snapshot_offset.clear();
         self.snapshot_offset_regressions.clear();
         self.snapshot_chunk_sent.clear();
+        self.snapshot_heartbeat_attempts.clear();
         // No-op entry so prior-term entries can be committed under our term.
         // Record its index: it is this leader's first current-term entry, the
         // watermark ReadIndex barriers and membership changes gate on
@@ -4554,6 +4622,33 @@ where
             && resends_so_far > limit
         {
             return None;
+        }
+        // `Backoff` (the heartbeat tick's own policy — see that variant's
+        // own doc for the full incident this closes): resend only when this
+        // peer's own ATTEMPT count for the current offset is `0` or a power
+        // of two, suppressing every other call — an exponentially-thinning
+        // schedule. Deliberately keyed off `snapshot_heartbeat_attempts`,
+        // NOT `resends_so_far` above: that counter only advances on a call
+        // that actually sends, so gating on it directly would freeze the
+        // schedule forever at whatever count first got suppressed (see that
+        // field's own doc). `snapshot_heartbeat_attempts` instead advances
+        // on every attempt, sent or suppressed, and resets whenever the
+        // tracked offset itself changes (real progress always restarts the
+        // backoff, and a genuinely new offset — attempt count freshly reset
+        // to `0` — is never held back).
+        if snapshot_resend == SnapshotResend::Backoff {
+            let attempts = self
+                .snapshot_heartbeat_attempts
+                .entry(peer.clone())
+                .or_insert((offset, 0));
+            if attempts.0 != offset {
+                *attempts = (offset, 0);
+            }
+            let n = attempts.1;
+            attempts.1 = attempts.1.saturating_add(1);
+            if n > 0 && !n.is_power_of_two() {
+                return None;
+            }
         }
         if resends_so_far == 0 {
             *self
