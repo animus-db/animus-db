@@ -314,13 +314,23 @@ fn large_snapshot_ships_in_o_chunk_time_not_o_state() {
     // chunk re-serialized all of `Metadata` (~50ms), so the transfer would
     // take ~55s; the cached-blob slicing makes it ~ms, independent of what the
     // bytes actually are (see this file's module doc).
+    //
+    // Chunk size is pinned to the ORIGINAL 1024-byte default rather than
+    // the production `SNAPSHOT_CHUNK_BYTES` (raised to 64 KiB): this test's
+    // whole point is exercising O(chunk) cost across MANY chunks, and doing
+    // that at the production chunk size would need a many-times-larger
+    // synthetic image to still clear "many hundreds of chunks" — needless
+    // memory/time for a property this constant's own value has nothing to
+    // do with (see `RaftCore::set_snapshot_chunk_bytes`'s own doc).
+    const TEST_CHUNK_BYTES: usize = 1024;
+    leader.set_snapshot_chunk_bytes(TEST_CHUNK_BYTES);
     let snap_bytes = 1_100_000usize;
     let image = vec![0xCDu8; snap_bytes];
     assert!(
-        snap_bytes > 500 * SNAPSHOT_CHUNK_BYTES,
+        snap_bytes > 500 * TEST_CHUNK_BYTES,
         "image ({snap_bytes} bytes) should be many hundreds of chunks to exercise the \
          per-chunk cost; got {} chunks",
-        snap_bytes / SNAPSHOT_CHUNK_BYTES
+        snap_bytes / TEST_CHUNK_BYTES
     );
     leader.set_snapshot_blob(image);
 

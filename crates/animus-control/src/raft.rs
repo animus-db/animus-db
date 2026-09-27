@@ -62,12 +62,25 @@ pub trait StateMachine<C>: Default + Clone + Serialize + DeserializeOwned {
     fn noop() -> C;
 }
 
-/// Maximum bytes of serialized snapshot carried by a single `InstallSnapshot`
-/// message. A snapshot larger than this is shipped over several offset-addressed
-/// chunks and reassembled by the follower (ADR 0009). Small enough that a
-/// realistic metadata snapshot spans multiple chunks; the value only affects
-/// message granularity, never correctness.
-pub const SNAPSHOT_CHUNK_BYTES: usize = 1024;
+/// Default maximum bytes of serialized snapshot carried by a single
+/// `InstallSnapshot` message. A snapshot larger than this is shipped over
+/// several offset-addressed chunks and reassembled by the follower (ADR
+/// 0009). The value only affects message granularity, never correctness —
+/// a test that specifically wants MANY chunks out of a modest-sized image
+/// dials this down per-instance via
+/// [`RaftCore::set_snapshot_chunk_bytes`] instead of inflating the image.
+///
+/// **Raised from 1024 to 64 KiB (2026-09-27, ADR 0009's "snapshot chunk
+/// size" amendment)**: at 1024 bytes a modest tablet snapshot needed hundreds
+/// of chunks, each its own round trip, so a transfer to a contended or slow
+/// peer stayed in flight long enough for leader churn or the next compaction
+/// to invalidate it (what `COMPACT_DEFER_IDLE_CEILING`,
+/// `COMPACT_DEFER_EMERGENCY_CEILING` and `RaftCore::compaction_floor` all have
+/// to work around). 64 KiB cuts the round-trip count ~64x while keeping one
+/// message far below ordinary transport message-size limits. A transfer does
+/// not need to fit inside an election timeout: every chunk resets the
+/// receiver's election timer (`handle_install_snapshot`).
+pub const SNAPSHOT_CHUNK_BYTES: usize = 64 * 1024;
 
 /// Maximum number of log entries shipped to one peer in a single
 /// `AppendEntries` message (issues #532/#537, ADR 0009's 2026-09-01
@@ -1068,6 +1081,12 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     // it just received so it can re-ship it later — see `handle_install_snapshot`)
     // so it is `Some` whenever `snapshot_index > 0`, never an empty 0-byte ship.
     snapshot_blob: Option<Vec<u8>>,
+    // Bytes of serialized snapshot carried by a single `InstallSnapshot`
+    // message — see [`SNAPSHOT_CHUNK_BYTES`]'s own doc for the default and
+    // [`set_snapshot_chunk_bytes`](Self::set_snapshot_chunk_bytes) for why
+    // this is a per-instance, overridable value rather than the constant
+    // used directly.
+    snapshot_chunk_bytes: usize,
     // A fully-received snapshot's `(last_index, bytes)` awaiting the driver writing
     // it into the engine (`drain_pending_install`); set on install completion.
     pending_install: Option<(u64, Vec<u8>)>,
@@ -1338,6 +1357,7 @@ where
             applied: Vec::new(),
             pending_apply: Vec::new(),
             snapshot_blob: None,
+            snapshot_chunk_bytes: SNAPSHOT_CHUNK_BYTES,
             pending_install: None,
             snapshot_needed: false,
             state_machine_behind: false,
@@ -1554,6 +1574,17 @@ where
     /// The current snapshot base index (0 if no snapshot has been taken).
     pub fn snapshot_index(&self) -> u64 {
         self.snapshot_index
+    }
+
+    /// Override this instance's own `InstallSnapshot` chunk size, in bytes
+    /// (default [`SNAPSHOT_CHUNK_BYTES`]). Exists so a test that wants a
+    /// snapshot transfer to genuinely span many chunks — without inflating
+    /// the underlying state to many multiples of the (now much larger,
+    /// 64 KiB) production default — can dial the chunk size back down
+    /// instead. Production code never calls this; it is set once, if at
+    /// all, right after construction.
+    pub fn set_snapshot_chunk_bytes(&mut self, bytes: usize) {
+        self.snapshot_chunk_bytes = bytes.max(1);
     }
 
     /// **Follower-aware compaction floor** (ADR 0017's compaction-flood
@@ -4954,7 +4985,7 @@ where
                 .or_insert(0) += 1;
         }
         let start = offset as usize;
-        let end = (start + SNAPSHOT_CHUNK_BYTES).min(serialized.len());
+        let end = (start + self.snapshot_chunk_bytes).min(serialized.len());
         let data = serialized[start..end].to_vec();
         let done = end as u64 == total;
         self.snapshot_chunk_sent

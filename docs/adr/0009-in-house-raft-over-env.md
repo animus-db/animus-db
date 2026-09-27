@@ -977,3 +977,28 @@ to reach majority — needs a scenario at least as tightly engineered as
 hand-picked topology), which was judged out of scope for this change; the
 core-level tests above pin the mechanism directly and exercise the exact
 code path the cluster race depends on.
+
+## Amendment (2026-09-27): snapshot chunk size
+
+`SNAPSHOT_CHUNK_BYTES` rises from 1024 bytes to 64 KiB. At 1 KiB, a modest
+tablet snapshot needed hundreds of `InstallSnapshot` round trips. Under a
+bulk-seed workload with many tablet groups per node, transfers to a contended
+peer stayed in flight long enough to be invalidated by leader churn or the
+next compaction: a live 31-minute run averaged ~227 chunks per completed
+install, with over a thousand transfers restarted. 64 KiB cuts the round-trip
+count by ~64x and keeps a single message far below ordinary transport
+message-size limits.
+
+Nothing about correctness changes — the chunk size only sets message
+granularity, and each chunk still resets the receiver's election timer, so a
+transfer never needs to fit inside an election timeout. The size is now a
+per-`RaftCore` value (`RaftCore::set_snapshot_chunk_bytes`, default
+`SNAPSHOT_CHUNK_BYTES`) so tests that specifically exercise many-chunk
+transfers keep doing so without inflating their state; production never
+overrides it. `tests/install_snapshot.rs`'s many-chunk test pins 1024 bytes;
+`control_corpus.rs`'s chunked-snapshot cells still transfer in multiple chunks
+at the new default.
+
+This follows the follower-aware compaction amendment to ADR 0017 (same date),
+which removes most of the need for snapshots in the first place; the larger
+chunk size bounds the cost when one is still needed.

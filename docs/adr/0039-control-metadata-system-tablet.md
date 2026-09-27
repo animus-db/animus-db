@@ -49,9 +49,10 @@ two things stay O(whole-cluster-state) even after ADR 0038:
    partitioned long enough to fall behind the compacted prefix is caught up
    via `InstallSnapshot`, which — even with ADR 0038's lazy, engine-scan-built
    image — still ships **one** monolithic image, from **one** leader, in
-   `SNAPSHOT_CHUNK_BYTES = 1024`-byte chunks (`animus-control/src/raft.rs`).
+   `SNAPSHOT_CHUNK_BYTES`-sized chunks (`animus-control/src/raft.rs`; 1024 bytes
+   when this was written, 64 KiB since ADR 0009's 2026-09-27 amendment).
    The chunking makes each round trip cheap; it does not reduce the **number**
-   of round trips, which is `image_bytes / 1024`.
+   of round trips, which is `image_bytes / SNAPSHOT_CHUNK_BYTES`.
 2. **Sustained mutation throughput.** Every member heartbeat flip, every
    tablet epoch-CAS (split/merge/rebalance/reconfigure), and every schema DDL
    cluster-wide still serializes through **one** Raft leader's **one** log.
