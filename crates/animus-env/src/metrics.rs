@@ -193,6 +193,16 @@ pub enum Metric {
     /// (an outbound `InstallSnapshotResp` with a non-zero `last_index`, observed on
     /// the follower that just finished).
     CpSnapshotInstalls,
+    /// A threshold-triggered compaction forced the snapshot base forward while a
+    /// peer's chunked `InstallSnapshot` transfer was still genuinely in flight
+    /// (`RaftCore::snapshot_transfer_in_flight()` true at the moment
+    /// `snapshot_upto` was called) — `snapshot_upto` unconditionally invalidates
+    /// that transfer's progress and the peer restarts from chunk 0 (PR #1047).
+    /// A high rate relative to [`CpSnapshotInstalls`] is the flood signature: many
+    /// restarts, few or no completed installs. See `animus-cp-data`'s
+    /// `COMPACT_DEFER_EMERGENCY_CEILING`/`COMPACT_DEFER_IDLE_CEILING` docs for the
+    /// defer policy this counts the escape hatch of.
+    CpSnapshotTransferRestarts,
     /// A single-server `change_membership` step (direct call or the automatic
     /// `reconfigure_step`) was accepted by this group's leader.
     CpReconfigureAccepted,
@@ -820,7 +830,7 @@ pub enum Metric {
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 97] = [
+    pub const ALL: [Metric; 98] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -863,6 +873,7 @@ impl Metric {
         Metric::CpSnapshotImageBuilds,
         Metric::CpSnapshotShips,
         Metric::CpSnapshotInstalls,
+        Metric::CpSnapshotTransferRestarts,
         Metric::CpReconfigureAccepted,
         Metric::CpReconfigureRejected,
         Metric::ControlReconfigureAccepted,
@@ -967,6 +978,7 @@ impl Metric {
             Metric::CpSnapshotImageBuilds => "cp_snapshot_image_builds",
             Metric::CpSnapshotShips => "cp_snapshot_ships",
             Metric::CpSnapshotInstalls => "cp_snapshot_installs",
+            Metric::CpSnapshotTransferRestarts => "cp_snapshot_transfer_restarts",
             Metric::CpReconfigureAccepted => "cp_reconfigure_accepted",
             Metric::CpReconfigureRejected => "cp_reconfigure_rejected",
             Metric::ControlReconfigureAccepted => "control_reconfigure_accepted",

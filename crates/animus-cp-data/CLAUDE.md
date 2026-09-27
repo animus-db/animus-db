@@ -2114,6 +2114,53 @@ disambiguation is needed.
     2026-09-14-control-snapshot-catch-up-stall.md` for the full incident
     — including the standing lesson that any change to shared `RaftCore`
     gates on `cargo test -p animus-cp-data` run in FULL, never `--lib`.
+  - **`COMPACT_DEFER_CEILING` itself was the live flood (PR #1047,
+    2026-09-27): a fixed `behind`-sized ceiling is not a "has this transfer
+    stalled" signal, it is only a bound on how far `behind` can grow
+    BETWEEN invalidations.** Under sustained writes fast enough relative to
+    a slow/contended peer (roughly a write per millisecond against a peer
+    with a ~200ms disk round trip — many hosted tablet groups contending
+    for one node's single-threaded consensus loop, the field shape this
+    issue was filed against), `behind` re-crossed the original ceiling
+    (`COMPACT_THRESHOLD * 8` = 512) in well under a second — far faster
+    than a real multi-chunk transfer to that peer could land — so
+    `snapshot_upto` restarted it from chunk 0 on a tight, self-sustaining
+    cycle: confirmed live at tens of thousands of chunk ships per node over
+    a couple of minutes against zero completed installs, a learner's
+    `match_index` pinned for the entire run. The ceiling was doing exactly
+    what it was built to do; it was simply the WRONG signal to force a
+    still-*advancing* transfer out early — that job already belonged to
+    `COMPACT_DEFER_IDLE_CEILING` above, which measures idle time since the
+    last genuine advance, not `behind`. Fixed by demoting the ceiling to a
+    last-resort emergency bound and renaming it
+    `COMPACT_DEFER_EMERGENCY_CEILING`, raised to `COMPACT_THRESHOLD * 64`
+    (4096, 8x the old value): `threshold_hit` no longer treats `behind`
+    crossing it as sufficient reason to force a transfer out on its own —
+    only `COMPACT_DEFER_IDLE_CEILING`'s idle-since-last-progress check may
+    do that now; the emergency ceiling exists purely to bound worst-case
+    WAL/log retention for the pathological case of a transfer that keeps
+    inching forward just often enough to keep resetting the idle clock
+    without ever landing (a real transfer that is merely large and slow is
+    never penalized by it — see that constant's own doc for the full
+    reasoning). A new `Metric::CpSnapshotTransferRestarts` (`animus-env`)
+    counts a forced-out-while-still-in-flight event directly, rather than
+    inferring the flood from ships-vs-installs after the fact. Regression:
+    `tests/snapshot_transfer_survives_compaction.rs` — proven red against
+    the pre-fix `behind`-alone trigger (caught_up=false, restarts in the
+    single digits to low tens over a short run, zero installs) and green
+    with the fix; a second scenario in the same file (a fully partitioned,
+    never-acking peer) proves the emergency ceiling still bounds log growth
+    on its own. **Fixing this regressed `tests/learner_catchup_under_
+    load.rs`'s own tuned drain budget** — not a correctness bug, but an
+    expected consequence: the new, more patient defer policy legitimately
+    lets more uncompacted log accumulate before compaction resumes, so the
+    post-install `AppendEntries` catch-up has proportionally more to
+    replay. Fixed by raising that test's own `DRAIN_POLLS` (see its own
+    comment) — a reminder that any of this defer machinery's own sibling
+    tests need re-checking, not just the one under active investigation,
+    whenever its trigger conditions change. See `docs/lessons/testing/
+    2026-09-27-a-defer-budget-that-resets-on-state-change-is-not-a-bound-
+    on-that-state.md` for the generalized lesson.
   - This is also where `engine_applied` vs `last_applied` (Key invariants)
     comes from.
 - **Wake-on-propose cuts single-write latency.** `put`/`delete`/`cas`/

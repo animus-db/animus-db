@@ -1488,25 +1488,58 @@ const COMPACT_THRESHOLD: u64 = 64;
 /// trips, `SNAPSHOT_CHUNK_BYTES`-sized chunks) finishes, restarting it from
 /// chunk 0 against a newer, larger image forever — confirmed live (a
 /// learner's own `match_index` pinned for an entire run while the leader's
-/// log kept growing). This is the ceiling on how far a threshold-triggered
-/// compaction may be DEFERRED (below `apply_and_compact`'s own gate) to give
-/// an in-flight transfer a real chance to land before the next threshold
-/// crossing yanks it away again — a multiple of `COMPACT_THRESHOLD`, not a
-/// replacement for it, so the WAL still bounds even if a peer's transfer
-/// never completes (dead, partitioned, or hopelessly outpaced): compaction
-/// always proceeds once `behind` reaches this, transfer or not.
-const COMPACT_DEFER_CEILING: u64 = COMPACT_THRESHOLD * 8;
+/// log kept growing).
+///
+/// **This is a last-resort, WAL-bounding emergency cap — NOT the primary
+/// signal for "has this transfer stalled."** It used to be exactly that (an
+/// `OR` alternative to [`COMPACT_DEFER_IDLE_CEILING`]'s own idle check,
+/// firing on `behind` alone regardless of whether the transfer was making
+/// real progress), and at its original value (`COMPACT_THRESHOLD * 8` =
+/// 512) that was itself the live flood: under sustained writes (a write
+/// roughly every millisecond is enough) a lagging-but-genuinely-advancing
+/// peer's `behind` count crossed 512 in under half a second — far faster
+/// than a real multi-chunk transfer to a slow/contended peer can land — so
+/// `snapshot_upto` restarted it from chunk 0 on a tight, self-sustaining
+/// cycle: tens of thousands of chunk ships per node over a couple of
+/// minutes, zero completed installs, a learner's `match_index` pinned
+/// forever (PR #1047). A budget that resets to zero every time the
+/// state it is bounding changes is not a bound on THAT state; it is a bound
+/// on how far the state can move BETWEEN resets — see
+/// `docs/lessons/testing/2026-09-27-a-defer-budget-that-resets-on-state-
+/// change-is-not-a-bound-on-that-state.md`.
+///
+/// The fix: a genuinely advancing transfer (`compact_defer_progress`
+/// changing pass over pass) is never forced out by `behind` alone any
+/// more — only [`COMPACT_DEFER_IDLE_CEILING`]'s idle-since-last-progress
+/// check may force a still-in-flight transfer out early. This constant is
+/// now purely the emergency floor under THAT: even a transfer that keeps
+/// inching forward just often enough to keep resetting the idle clock
+/// (never idle long enough to trip it, but too slow to ever land) must
+/// still not retain the WAL/log unboundedly, so once `behind` reaches this
+/// much higher ceiling compaction proceeds regardless of progress. Raised
+/// from the original `* 8` to `* 64` (4096) — eight times the headroom —
+/// so a real multi-chunk transfer to a slow/contended peer under sustained
+/// write load gets a realistic chance to land before this floor, not the
+/// half-second window the old value gave it; still a small, fixed multiple
+/// of `COMPACT_THRESHOLD`, so worst-case WAL retention stays bounded even
+/// if a peer's transfer never completes at all (dead, partitioned, or
+/// hopelessly outpaced).
+const COMPACT_DEFER_EMERGENCY_CEILING: u64 = COMPACT_THRESHOLD * 64;
 
 /// Issue #898 follow-up (`animus-control`'s own `SNAPSHOT_COMPACT_DEFER_
 /// IDLE_CEILING` — see that constant's own doc for the full incident,
 /// rationale, and the two rejected earlier designs, mirrored here exactly):
-/// an **idle-progress-gated** companion to [`COMPACT_DEFER_CEILING`]'s
-/// `behind`-sized one, tracked entirely in this driver loop
-/// (`apply_and_compact`'s own `compact_defer_since`/`compact_defer_progress`
-/// locals, owned by `apply_loop` across iterations) rather than in
-/// `RaftCore` — a pure, `now`-unaware core cannot itself distinguish "a
-/// peer's transfer is genuinely progressing, just slowly" from "this peer
-/// will never ack again."
+/// an **idle-progress-gated** companion to
+/// [`COMPACT_DEFER_EMERGENCY_CEILING`]'s `behind`-sized one — and, since
+/// PR #1047, the PRIMARY signal deciding whether to force a still-in-
+/// flight transfer out early; the emergency ceiling now only bounds worst-
+/// case WAL retention, never ordinary "is this transfer stalled" policy —
+/// tracked entirely in this driver loop (`apply_and_compact`'s own
+/// `compact_defer_since`/`compact_defer_progress` locals, owned by
+/// `apply_loop` across iterations) rather than in `RaftCore` — a pure,
+/// `now`-unaware core cannot itself distinguish "a peer's transfer is
+/// genuinely progressing, just slowly" from "this peer will never ack
+/// again."
 ///
 /// **Found regression-testing issue #898's own `animus-control` fix**: that
 /// fix widened the shared `RaftCore::snapshot_transfer_in_flight()` (issue
@@ -10092,18 +10125,24 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
             transfer_progress,
         )
     };
-    // Issues #532/#537: a THRESHOLD-triggered base advance (never an
-    // `image_needed` one — a peer is actively waiting on that image, so it
-    // must always proceed) is deferred while some peer's chunked transfer is
-    // genuinely in flight, unless `behind` has grown enough that the WAL
-    // itself needs bounding regardless (`COMPACT_DEFER_CEILING`, that
-    // constant's own doc has the full reasoning), OR the defer has now sat
-    // IDLE (no forward progress at all) for `COMPACT_DEFER_IDLE_CEILING`
-    // (issue #898 follow-up — see that constant's own doc: a peer that
-    // never acks at all — down, partitioned, or crashed — never grows
-    // `behind` past its own ceiling once writes stop, so this replica's own
-    // compaction would otherwise wedge forever). Below both ceilings this
-    // gives a real in-flight transfer a window to land before the next
+    // Issues #532/#537 (and PR #1047's amendment below): a
+    // THRESHOLD-triggered base advance (never an `image_needed` one — a
+    // peer is actively waiting on that image, so it must always proceed) is
+    // deferred while some peer's chunked transfer is genuinely in flight,
+    // UNLESS the defer has now sat IDLE (no forward progress at all) for
+    // `COMPACT_DEFER_IDLE_CEILING` (issue #898 follow-up — see that
+    // constant's own doc: a peer that never acks at all — down,
+    // partitioned, or crashed — must not wedge this replica's own
+    // compaction indefinitely), OR `behind` has grown all the way to
+    // `COMPACT_DEFER_EMERGENCY_CEILING` — a last-resort WAL-retention bound
+    // for the pathological case of a transfer that keeps inching forward
+    // just often enough to keep resetting the idle clock without ever
+    // landing (see that constant's own doc for why `behind` alone used to
+    // be an independent, much lower trigger here, and why that was the
+    // PR #1047 flood: it fired on a transfer that was genuinely
+    // advancing, just slower than the sustained write rate, restarting it
+    // from chunk 0 over and over). Below both ceilings this gives a real
+    // in-flight transfer a genuine window to land before the next
     // threshold crossing would otherwise yank it back to chunk 0 forever.
     let would_defer = behind >= COMPACT_THRESHOLD && transfer_in_flight;
     // Real forward progress (the tracked sum changed since the last pass)
@@ -10120,8 +10159,16 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
         && idle_since.is_some_and(|since| {
             now.0.saturating_sub(since.0) >= COMPACT_DEFER_IDLE_CEILING.as_nanos() as u64
         });
+    let emergency_ceiling_hit = behind >= COMPACT_DEFER_EMERGENCY_CEILING;
     let threshold_hit = behind >= COMPACT_THRESHOLD
-        && (!transfer_in_flight || behind >= COMPACT_DEFER_CEILING || idle_ceiling_hit);
+        && (!transfer_in_flight || idle_ceiling_hit || emergency_ceiling_hit);
+    // PR #1047: a transfer forced out while it was still genuinely in
+    // flight is a real restart-from-chunk-0 event, not routine compaction —
+    // count it so a flood (many restarts, few/no completed installs) is
+    // directly observable instead of inferred from ships-vs-installs.
+    if threshold_hit && transfer_in_flight {
+        metrics.incr(Metric::CpSnapshotTransferRestarts);
+    }
     // Bookkeeping for the NEXT pass: still genuinely deferring (would defer,
     // and didn't just get overridden by either ceiling) keeps the idle
     // clock running (restarting it on real progress); anything else —
