@@ -93,8 +93,18 @@ fn install_snapshot_heartbeat_resend_does_not_grow_unbounded_with_idle_time() {
     // leader's log past `COMPACT_THRESHOLD` while it's cut off — so once
     // healed-from-the-follower's-own-perspective-never, it can only ever
     // catch up via a chunked `InstallSnapshot`, never plain `AppendEntries`.
+    //
+    // **Follower-aware compaction (branch `claude/follower-aware-
+    // compaction`) amendment**: `RaftCore::compaction_floor` retains the
+    // log for this partitioned follower (its `match_index` reads `0`, but
+    // `0` is within `COMPACT_RETENTION_CAP_ENTRIES` (4096) of a merely
+    // ~200-entry-long log) until it's written well past that cap — see
+    // `snapshot_heartbeat_reconnect_latency.rs`'s identical amendment for
+    // the full account. Without this, `snapshot_index` never advances past
+    // this follower at all, so the chunked path this test is about is
+    // never entered.
     sim.partition_pair(nid(ids[l]), stuck_id.clone());
-    for b in 0..20u64 {
+    for b in 0..500u64 {
         for i in 0..10u64 {
             let key = format!("k-{b}-{i}").into_bytes();
             assert!(

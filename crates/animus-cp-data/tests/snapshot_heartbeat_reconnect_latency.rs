@@ -92,8 +92,24 @@ fn partitioned_snapshot_mode_voter_resumes_catch_up_promptly_after_reconnect() {
     // Partition the doomed follower FIRST, then write enough to force the
     // leader's log past `COMPACT_THRESHOLD` while it's cut off — so once
     // healed, it can only ever catch up via a chunked `InstallSnapshot`.
+    //
+    // **Follower-aware compaction (branch `claude/follower-aware-
+    // compaction`) amendment**: `RaftCore::compaction_floor` now retains
+    // the log for any peer within `COMPACT_RETENTION_CAP_ENTRIES` (4096)
+    // of the leader's own `last_log_index`, including this partitioned
+    // one (it has never acked, so its `match_index` reads `0` — but `0` is
+    // still within the cap of a merely-200-entry-long log, which is all
+    // the OLD write count produced). Below that cap, compaction stays
+    // pinned near index 0 for the WHOLE stuck window, so `snapshot_index`
+    // never advances past this follower's `next_index` at all — no
+    // `InstallSnapshot` is ever needed, and this test's own setup
+    // assertion below (`snapshot_chunk_advances(&stuck_id) > 0`) would
+    // fail before ever reaching the property under test. Writing well past
+    // the cap while partitioned forces this follower's exclusion from the
+    // floor partway through, so it still needs — and gets — the chunked
+    // path this test is about.
     sim.partition_pair(nid(ids[l]), stuck_id.clone());
-    for b in 0..20u64 {
+    for b in 0..500u64 {
         for i in 0..10u64 {
             let key = format!("k-{b}-{i}").into_bytes();
             assert!(

@@ -2112,6 +2112,23 @@ per-tablet CP data plane (`animus-cp-data`).
   `animus-cp-data` did — a metadata-watch caller only ever waits to learn when
   `metadata()` *could* reflect a change, and that visibility is bound by the
   driver's flush cadence anyway.
+- **`RaftCore::compaction_floor(retention_cap_entries)` (ADR 0017's
+  2026-09-27 amendment, PR #1047's own follow-up)** — a new pure,
+  leader-only accessor: `min(match_index)` over every VOTER within
+  `retention_cap_entries` of `last_log_index()`, `None` if this node isn't
+  leader, has no peers, or every peer is excluded by the cap. Same shape
+  as `snapshot_transfer_in_flight` (a fact this core states; the driver
+  decides policy). Its sole consumer today is `animus-cp-data`'s
+  `apply_and_compact`, which clamps a threshold-triggered compaction to
+  this floor so a merely-lagging voter keeps catching up via
+  `AppendEntries` instead of falling off the compacted log and needing a
+  full `InstallSnapshot`. **Deliberately excludes learners** — see the
+  method's own doc for why (a bad interaction with `state_machine_behind`/
+  `needs_snapshot`, found live building this fix). **The control plane's
+  own `meta_apply_and_compact` does not call this** — a single small
+  per-cluster metadata group was never the flood's own mechanism (many
+  tablet groups sharing one node's scheduler/fsync path); nothing stops
+  it adopting this later if that judgment changes.
 
 ## Tests
 

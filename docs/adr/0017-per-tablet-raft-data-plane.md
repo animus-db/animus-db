@@ -1002,3 +1002,130 @@ already-established tablet) is unaffected — `skip_cluster_check` stays
 detail and the generalized rule ("audit every party to the same
 operation that shares a caller's own 'proven fresh' premise, not just the
 one with a convenient existing flag").
+
+## Amendment (2026-09-27, PR #1047 follow-up) — follower-aware compaction: a leader's threshold-triggered compaction must not outrun a merely-lagging follower's own `match_index`
+
+PR #1047 fixed the chunked-`InstallSnapshot` resend flood (a still-
+advancing transfer being forced back to chunk 0) but left the deeper
+cause untouched: **compaction itself was driven only by the leader's own
+applied progress** (`apply_and_compact`'s `behind = engine_applied -
+snapshot_index()`, `COMPACT_THRESHOLD = 64`), with zero awareness of
+where any follower actually is — only a defer once a transfer had
+*already* started. `replicate_to` switches any peer whose `next_index <=
+snapshot_index` straight to `InstallSnapshot`, so with 25-80 tablet
+groups sharing one node's scheduler/fsync path, a follower only briefly
+slow (an fsync stall, a scheduling hiccup, one contended tablet crowding
+out another's turn) fell off the compacted log every `COMPACT_THRESHOLD`
+applies — a few seconds of real lag was enough to force a full snapshot,
+every time. Measured live on a 3-control/5-data-node cluster under
+`--auto-split-bytes 1000000` and bulk seeding: 18,816 `InstallSnapshot`
+installs, 4.27M chunks shipped, 1,029 forced transfer restarts, and node
+RSS growing ~250 MB/min to OOM over a 31-minute run — snapshots had
+become the *normal* catch-up path, not the exceptional one.
+
+**The fix (etcd-style leader-side log retention)**: `RaftCore::
+compaction_floor(retention_cap_entries)` (`animus-control/src/raft.rs`) —
+a new pure, policy-free accessor mirroring `snapshot_transfer_in_flight`'s
+own shape (this core states a fact; the driver decides what to do with
+it). Leader-only: `min(match_index)` over every **voter** currently
+within `retention_cap_entries` of `last_log_index()`. A peer further
+behind than that is excluded from the floor — it already gets (or will
+get, once the base does advance past it) an `InstallSnapshot` via the
+existing `next_index <= snapshot_index` path, exactly as before this
+change; excluding it merely stops it from pinning *every other* peer's
+compaction to a standstill. A peer never heard from at all is treated as
+matched at `0` (conservative — either genuinely fresh, or down/
+partitioned and will exceed the cap in due course as the leader keeps
+writing).
+
+**Deliberately voters only, not learners (found live building this fix).**
+The floor was originally implemented over voters *and* learners together.
+That interacted badly with the pre-existing `state_machine_behind`/
+`needs_snapshot` machinery (issue #554): while a receiver's own async
+apply task is still digesting a just-installed image, every
+`AppendEntriesResp` it builds reports `needs_snapshot: true`, and
+`handle_append_resp`'s `needs_snapshot` branch never runs the ordinary
+success path's `next_index` advance. With a learner's own position
+pinning the floor close by (retention doing exactly what it's supposed
+to), a leader could re-enter the snapshot path more than once before the
+learner's apply task and the leader's own bookkeeping settled —
+confirmed live with a `SimEnv` repro (a 200ms-disk learner needing
+thousands of small re-snapshot cycles at the pre-PR-#1047-chunk-size
+1024-byte chunk size to fully land, instead of the single expected
+install). This is a real, pre-existing rough edge in the `needs_snapshot`
+interaction, not a correctness bug in the floor itself (everything still
+converges — the receiver never gets stuck forever), but it is exactly the
+wrong trade for a learner: ADR 0058 Train 1's own contract for a learner
+is "catches up via ordinary `AppendEntries`/`InstallSnapshot` **before
+ever being promoted**" — an `InstallSnapshot` to a freshly-joined,
+far-behind learner is the expected, unexceptional path already, not the
+flood this floor exists to prevent (which is about ordinary VOTER
+replicas of an established tablet falling behind under routine load).
+Scoping the floor to voters only sidesteps the interaction entirely for
+the case it was actually built for, at the cost of leaving a learner's
+own catch-up exactly as it always was. Revisiting learner inclusion is a
+follow-up, gated on first untangling the `needs_snapshot`/`next_index`
+interaction on its own terms — see `docs/lessons/testing/2026-09-27-
+follower-aware-compaction-voters-only.md`.
+
+A residual, smaller version of the same interaction can still occur for a
+plain **voter** under retention (an ordinary Raft `next_index` backoff can
+also drop it into the snapshot path momentarily): `crates/animus-cp-data/
+tests/follower_aware_compaction.rs`'s own bound tolerates a small number
+of installs for exactly this reason rather than asserting zero — see that
+test's own doc.
+
+`animus-cp-data`'s `apply_and_compact` is the sole consumer:
+threshold-triggered compaction now advances the base to `ea.min(floor)`
+instead of unconditionally to `ea` (`COMPACT_RETENTION_CAP_ENTRIES =
+COMPACT_THRESHOLD * 64` = 4096 — deliberately the same magnitude as PR
+#1047's own `COMPACT_DEFER_EMERGENCY_CEILING`, since both are the same
+kind of judgment call: how much extra per-group log the leader may retain
+worst-case to give a peer a genuine chance to catch up cheaply, before
+falling back to the expensive path). Two cases are deliberately exempted
+from the clamp and still advance the base all the way to `ea`: an
+on-demand image build for a peer that is genuinely waiting on a snapshot
+right now (`image_needed` — the image is a scan of the engine's CURRENT
+state, so the base must match it exactly, or the shipped image and the
+receiver's newly-installed `snapshot_index` disagree), and the WAL
+rewrite that immediately follows a just-completed `InstallSnapshot`
+install (the base is already at `ea` by construction there). The
+existing idle/emergency-ceiling defer logic from PR #1047 (`would_defer`/
+`COMPACT_DEFER_IDLE_CEILING`/`COMPACT_DEFER_EMERGENCY_CEILING`) is
+unchanged and composes with this cleanly: it governs how long an
+already-in-flight transfer to an EXCLUDED peer gets before being forced
+out, which retention is orthogonal to (retention decides whether a peer
+needs a transfer at all in the first place).
+
+**Non-leader (follower/learner) compaction is unchanged** — a non-leader
+still compacts by its own applied index alone (it has no peers to retain
+for; only a leader's compaction can strand someone else).
+
+**The control plane (`animus-control`'s own `meta_apply_and_compact`,
+replicating cluster `Metadata`) deliberately does not adopt this.** It is
+a single small Raft group per cluster, not one of 25-80 groups sharing a
+node's resources — it was never the flood's mechanism, and its own
+metadata state is small enough that an occasional `InstallSnapshot` to a
+lagging control voter is cheap. `RaftCore::compaction_floor` is generic
+and available to it should that judgment ever change, but nothing calls
+it there today.
+
+**Tests** (`crates/animus-cp-data/tests/`): `follower_aware_compaction.rs`
+(new) — a sustained writer against a modestly-slowed (not partitioned)
+VOTER must need only a small, bounded number of `Metric::
+CpSnapshotInstalls` (nowhere near the flood) while mostly catching up via
+ordinary `AppendEntries`, red-by-a-wide-margin on `claude/snapshot-chunk-
+flood` (pre-retention) and comfortably within bound after; and a voter
+partitioned well past `COMPACT_RETENTION_CAP_ENTRIES` must still receive
+a snapshot once healed, with the leader's own log growth bounded by the
+cap throughout. Because the floor is voters-only (see above), the
+pre-existing LEARNER-based snapshot tests (`snapshot_resend_bound.rs`,
+`snapshot_transfer_survives_compaction.rs`) are entirely unaffected and
+needed no changes. Three pre-existing tests that crash/partition a plain
+VOTER to force the chunked path (`snapshot_heartbeat_reconnect_
+latency.rs`, `snapshot_heartbeat_resend_unbounded.rs`,
+`hlc_differential_skew.rs`) had their own warm-up/write-burst counts
+bumped well past the new cap so that voter is still excluded from the
+floor and the test still reaches the chunked-snapshot path it was written
+to exercise — their assertions are unchanged, only the setup needed to
+still take that path.

@@ -2120,6 +2120,31 @@ disambiguation is needed.
     on-that-state.md` for the generalized lesson.
   - This is also where `engine_applied` vs `last_applied` (Key invariants)
     comes from.
+  - **Follower-aware compaction retention (ADR 0017's 2026-09-27
+    amendment, PR #1047's own follow-up)**: everything above bounds how
+    long an ALREADY-in-flight transfer gets before compaction forces it
+    out; it does nothing about a peer that hasn't fallen behind enough to
+    need a snapshot AT ALL yet, but is close to it. `apply_and_compact`
+    now clamps a THRESHOLD-triggered base advance (never an `image_needed`
+    one, and never the just-installed-snapshot WAL rewrite — both still
+    go straight to `ea`, see the clamp's own comment) to `ea.min
+    (compaction_floor)`, where `compaction_floor` is `RaftCore::
+    compaction_floor(COMPACT_RETENTION_CAP_ENTRIES)` (`animus-control::
+    raft`) — `min(match_index)` over every VOTER within
+    `COMPACT_RETENTION_CAP_ENTRIES` (4096) of `last_log_index()`, `None`
+    (compact freely) if every voter is either caught up near `ea` already
+    or excluded by the cap. This is what closes the field-measured flood
+    this whole PR #1047 stack was opened against (18,816 installs / 4.27M
+    chunks / 1,029 restarts over 31 minutes, 25-80 groups per node): a
+    voter only briefly behind now keeps catching up via `AppendEntries`
+    instead of falling off the compacted log every `COMPACT_THRESHOLD`
+    applies. **Learners are deliberately excluded** from this floor — see
+    `RaftCore::compaction_floor`'s own doc and `docs/lessons/testing/
+    2026-09-27-follower-aware-compaction-voters-only.md` for why (a bad
+    interaction with the `state_machine_behind`/`needs_snapshot` machinery
+    two bullets below). The control plane's own `meta_apply_and_compact`
+    does not use this — see the ADR amendment for why (a single small
+    per-cluster group, never the flood's own mechanism).
 - **Wake-on-propose cuts single-write latency.** `put`/`delete`/`cas`/
   `change_membership` route through `propose_and_wake`: after the core appends,
   the proposer raises a `ProposeSignal` (`AtomicBool` +

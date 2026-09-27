@@ -1526,6 +1526,40 @@ const COMPACT_THRESHOLD: u64 = 64;
 /// hopelessly outpaced).
 const COMPACT_DEFER_EMERGENCY_CEILING: u64 = COMPACT_THRESHOLD * 64;
 
+/// Follower-aware compaction retention (etcd-style log retention, found live
+/// alongside the flood PR #1047 fixed): the hard cap, in log entries, a
+/// peer may be behind `last_log_index()` and still be counted toward
+/// `RaftCore::compaction_floor` — see that method's own doc for the full
+/// mechanism. With 25-80 tablet groups sharing one node's scheduler/fsync
+/// path (the exact shape that produced the field flood: 18,816 installs /
+/// 4.27M chunks / 1,029 restarts over 31 minutes), a follower only briefly
+/// slow on fsync or scheduling was falling off the compacted log every
+/// `COMPACT_THRESHOLD` (64) applies — a few seconds of real lag was enough
+/// to force a full `InstallSnapshot`, every time. This cap gives a merely-
+/// slow follower **room to catch up via ordinary `AppendEntries` instead**,
+/// while still bounding worst-case retained-log memory for a follower that
+/// is actually down or partitioned (excluded once it falls this far behind,
+/// same as today).
+///
+/// Chosen as `COMPACT_THRESHOLD * 64` — the same value as
+/// [`COMPACT_DEFER_EMERGENCY_CEILING`] (4096), deliberately: that constant
+/// is this crate's own existing judgment call for "how much extra log a
+/// single tablet's WAL may retain, worst case, to give one already-in-flight
+/// snapshot transfer a real chance to land" (see its own doc). A retention
+/// floor is the same shape of bound applied earlier — before a transfer
+/// ever starts at all — so reusing the number keeps one worst-case-log-size
+/// budget per group instead of two independently-tuned ones. At a few
+/// hundred bytes per typical KV command entry, 4096 retained entries is
+/// low-single-digit megabytes per group; with dozens of groups per node
+/// that's a bounded, acceptable multiple of the RSS a healthy node already
+/// carries — nowhere near the unbounded snapshot-flood growth this whole
+/// change exists to stop. Entries, not bytes: this crate's log entries do
+/// not carry a cached serialized size, and a per-entry byte cap would cost
+/// a scan (or added bookkeeping) to enforce; an entry-count cap needs
+/// neither and, since KV command entries here are consistently small, is a
+/// close enough proxy for the byte budget it's meant to approximate.
+const COMPACT_RETENTION_CAP_ENTRIES: u64 = COMPACT_THRESHOLD * 64;
+
 /// Issue #898 follow-up (`animus-control`'s own `SNAPSHOT_COMPACT_DEFER_
 /// IDLE_CEILING` — see that constant's own doc for the full incident,
 /// rationale, and the two rejected earlier designs, mirrored here exactly):
@@ -9953,7 +9987,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     // placeholder, so the threshold rewrite never needed the image bytes.
     let ea = engine_applied.load(Ordering::SeqCst);
     let now = env.now();
-    let (behind, image_needed, transfer_in_flight, transfer_progress) = {
+    let (behind, image_needed, transfer_in_flight, transfer_progress, compaction_floor) = {
         let mut c = core.lock().expect("raftkv core poisoned");
         let transfer_progress: u64 = c
             .snapshot_transfer_peers()
@@ -9965,8 +9999,23 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
             c.take_snapshot_needed(),
             c.snapshot_transfer_in_flight(),
             transfer_progress,
+            c.compaction_floor(COMPACT_RETENTION_CAP_ENTRIES),
         )
     };
+    // Follower-aware retention (etcd-style, issue found live alongside PR
+    // #1047's flood): a THRESHOLD-triggered compaction must not advance the
+    // base past the slowest-but-still-worth-retaining-for peer's own
+    // `match_index` — see `RaftCore::compaction_floor`'s own doc. `None`
+    // (not the leader, no peers, or every peer already excluded by the hard
+    // cap) means retain nothing extra: compact all the way to `ea`, exactly
+    // as before this existed. This clamps only the ACTUAL base the
+    // threshold path advances to, never the `behind`/`threshold_hit`
+    // trigger below — those stay computed against `ea` unclamped, so a
+    // caught-up-to-the-floor group's own cadence for even ATTEMPTING
+    // compaction is unchanged; a floor below `ea` just means some of those
+    // attempts advance the base by less than the full amount currently
+    // applied, until the retained peers ack far enough to let it catch up.
+    let compact_target = ea.min(compaction_floor.unwrap_or(ea));
     // Issues #532/#537 (and PR #1047's amendment below): a
     // THRESHOLD-triggered base advance (never an `image_needed` one — a
     // peer is actively waiting on that image, so it must always proceed) is
@@ -10148,7 +10197,22 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
             // (`ea.saturating_sub(c.snapshot_index())`) can never shrink on its
             // own without that Raft-level trigger, which `did_work`'s own
             // truthfulness (not any change here) is what stops from spinning.
-            c.snapshot_upto(ea);
+            //
+            // Follower-aware retention only clamps a PURE threshold-driven
+            // advance. When `image_needed` (a peer is genuinely waiting on
+            // a snapshot) or a snapshot was just installed, the base must
+            // land at exactly `ea` regardless of `compact_target`: the
+            // on-demand image above was built from the engine's state AS OF
+            // `ea`, and `snapshot_upto`'s own invariant requires the base
+            // and the shipped image to agree (see this function's own doc a
+            // few lines up) — holding the base back here while shipping an
+            // image captured at `ea` would corrupt the receiver.
+            let target = if image_needed || just_installed_snapshot_needs_wal_rewrite {
+                ea
+            } else {
+                compact_target
+            };
+            c.snapshot_upto(target);
             if let Some(image) = image {
                 c.set_snapshot_blob(image);
             }

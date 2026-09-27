@@ -1518,6 +1518,81 @@ where
         self.snapshot_index
     }
 
+    /// **Follower-aware compaction floor** (ADR 0017's compaction-flood
+    /// amendment, PR #1047's follow-up): the highest index a leader's
+    /// threshold-triggered compaction may advance `snapshot_index` to
+    /// without forcing an `InstallSnapshot` on any peer that is merely a
+    /// bit behind, rather than genuinely lost.
+    ///
+    /// A pure fact, same shape as [`snapshot_transfer_in_flight`](Self::
+    /// snapshot_transfer_in_flight): this core does no compaction policy
+    /// itself (`snapshot_upto`'s caller decides whether/when to compact at
+    /// all), it only answers "how far could a threshold-triggered compaction
+    /// go right now without stranding a peer that has a real chance of
+    /// catching up via ordinary `AppendEntries`."
+    ///
+    /// Returns `min(match_index)` over every **voter currently within
+    /// `retention_cap_entries` of `last_log_index()`** — a peer that far
+    /// behind is excluded from the floor (it gets an `InstallSnapshot`
+    /// today regardless, via `replicate_to`'s own `next_index <=
+    /// snapshot_index` check, once the base does advance past it; excluding
+    /// it here just stops it from pinning EVERY peer's compaction to a
+    /// standstill). A peer this core has never heard from at all (absent
+    /// from `match_index`) is treated as caught up to `0` — conservative:
+    /// either it is freshly added (a real `0`) or it is down/partitioned
+    /// (and `last_log_index().saturating_sub(0)` will itself exceed the cap
+    /// once the leader has done enough work, excluding it in due course).
+    ///
+    /// **Deliberately voters only, never learners** (found building this
+    /// fix): a learner's own catch-up contract in this codebase (ADR 0058
+    /// Train 1) already IS "via ordinary `AppendEntries`/`InstallSnapshot`
+    /// before ever being promoted" — an `InstallSnapshot` to a freshly
+    /// joined, far-behind learner is the expected, unexceptional path, not
+    /// the flood this retention floor exists to prevent (which is about
+    /// ordinary VOTER replicas of an established tablet falling behind
+    /// under routine load). Retaining for a learner too interacts badly
+    /// with the separate `state_machine_behind`/`needs_snapshot` machinery
+    /// (issue #554): while a receiver's own async apply task is still
+    /// digesting a just-installed image, every `AppendEntriesResp` it
+    /// builds reports `needs_snapshot: true`, and `handle_append_resp`'s
+    /// `needs_snapshot` branch never runs the ordinary success path's
+    /// `next_index` advance — so a leader whose retention floor is pinned
+    /// close to that learner's own position can end up re-entering the
+    /// snapshot path more than once before the learner's apply task and
+    /// the leader's own bookkeeping settle, at the tiny pre-PR-#1047-
+    /// chunk-size cost per cycle. Excluding learners keeps this floor
+    /// scoped to the case it was actually built for.
+    ///
+    /// Returns `None` when this node is not the leader (a non-leader
+    /// compacts by its own applied index and needs no floor — see this
+    /// method's callers' own doc), when it has no peers at all (a
+    /// single-node group; nothing to retain for), or when every peer is
+    /// already excluded (nothing left to floor against, so a threshold
+    /// compaction may proceed exactly as it did before this existed).
+    ///
+    /// `retention_cap_entries` is the caller's own hard bound on worst-case
+    /// retained log length — this accessor enforces nothing about its
+    /// magnitude, it only applies whatever cap the caller passes.
+    pub fn compaction_floor(&self, retention_cap_entries: u64) -> Option<u64> {
+        if self.role != Role::Leader {
+            return None;
+        }
+        let last = self.last_log_index();
+        let mut floor: Option<u64> = None;
+        for peer in self.peers.iter() {
+            let matched = self.match_index.get(peer).copied().unwrap_or(0);
+            if last.saturating_sub(matched) > retention_cap_entries {
+                // Too far behind to retain for; it already gets (or will
+                // get) an `InstallSnapshot` via the ordinary `next_index <=
+                // snapshot_index` path — don't let it pin every other
+                // peer's compaction to a standstill.
+                continue;
+            }
+            floor = Some(floor.map_or(matched, |f: u64| f.min(matched)));
+        }
+        floor
+    }
+
     /// Whether a chunked `InstallSnapshot` transfer is currently in flight to
     /// at least one peer. `snapshot_upto` unconditionally invalidates every
     /// in-flight transfer's own progress the moment the base moves again
