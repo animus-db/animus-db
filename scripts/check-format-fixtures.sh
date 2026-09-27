@@ -18,11 +18,21 @@
 
 set -euo pipefail
 
+# Outside CI a missing ref is a local-setup quirk and the guard stays inert;
+# inside CI it would silently disable the guard, so it is a hard failure.
+skip() {
+  if [ -n "${GITHUB_ACTIONS:-}" ]; then
+    echo "check-format-fixtures: $1 — refusing to skip in CI" >&2
+    exit 1
+  fi
+  echo "check-format-fixtures: $1, skipping" >&2
+  exit 0
+}
+
 # Not a git checkout (shouldn't happen in CI, but keep this script inert
 # rather than exploding if ever run somewhere odd).
 if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  echo "check-format-fixtures: not inside a git work tree, skipping" >&2
-  exit 0
+  skip "not inside a git work tree"
 fi
 
 # Resolve the merge base against origin/main. Fall back gracefully when
@@ -39,14 +49,12 @@ for candidate in origin/main main; do
 done
 
 if [ -z "${base_ref}" ]; then
-  echo "check-format-fixtures: no origin/main or main ref found, skipping" >&2
-  exit 0
+  skip "no origin/main or main ref found"
 fi
 
 merge_base="$(git merge-base HEAD "${base_ref}" 2>/dev/null || true)"
 if [ -z "${merge_base}" ]; then
-  echo "check-format-fixtures: no merge base with ${base_ref}, skipping" >&2
-  exit 0
+  skip "no merge base with ${base_ref}"
 fi
 
 # Every fixture path that existed at the merge base. Filtered with a plain
