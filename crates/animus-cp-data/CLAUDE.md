@@ -1224,6 +1224,49 @@ State once here; cross-referenced from the sections below.
   account, including why `crates/animus-test/tests/raftkv_linearizable.rs`'s
   own `Nemesis::StopRestart` (which always targets the current leader,
   never a snapshot-caught-up follower) structurally cannot reproduce this.
+- **A stale `InstallSnapshot` can rewind a follower that already outran it
+  via `AppendEntries`, corrupting `assert_ts_monotonic`'s ordering (found
+  live: `panicked ... HLC ts did not strictly exceed the last applied ...
+  witnessing chain is broken` on a real cluster under
+  `--auto-split-bytes`).** `RaftCore::handle_install_snapshot`'s "already at
+  least this far along" short-circuit (`animus-control/src/raft.rs`, the
+  same #554 short-circuit documented in `animus-control/CLAUDE.md`'s
+  Snapshot-transfer section) used to compare the offer's `last_index` only
+  against `self.snapshot_index` — the log's last COMPACTION point, which
+  lags `self.last_applied` whenever entries commit between compactions (the
+  ordinary case under any real write load, since compaction is a periodic
+  background sweep, not synchronous with every commit). Under a leader that
+  floods/restarts snapshot transfers (compaction invalidating an in-flight
+  transfer, `snapshot_upto`'s own doc — see the `COMPACT_DEFER_CEILING`
+  discussion above), a follower can catch all the way up to some index N via
+  ordinary `AppendEntries` while a STALE, already-obsolete chunked transfer
+  built at an earlier, lower index M (`snapshot_index < M < N`) is still in
+  flight; its final chunk sailed past the old guard (`M > snapshot_index`,
+  "not yet redundant") and installed, resetting `last_applied`/
+  `commit_index`/the log back down to M. The apply task then re-applies the
+  rewound log tail, and its ts-carrying entries land strictly below the
+  high-water mark the follower had already recorded before the rewind —
+  `assert_ts_monotonic`'s panic (`animus-cp-data/src/lib.rs`). **Fixed** by
+  comparing against `self.last_applied` instead of `self.snapshot_index` —
+  always `>= snapshot_index` (the two coincide only immediately after an
+  install) and the follower's true up-to-date position, independent of
+  compaction cadence — keeping the pre-existing `&& !self.state_machine_
+  behind` override intact (a behind node's own `last_applied`/
+  `snapshot_index` are both log-derived facts it can't trust either way, per
+  #554's own reasoning). Regression:
+  `animus-control/tests/stale_snapshot_no_rewind.rs`, hand-driving a real
+  leader/follower `RaftCore` pair so the follower's `last_applied` genuinely
+  advances past a manufactured stale offer's `last_index` before delivering
+  it — red before the fix (confirmed: reverting the guard to
+  `self.snapshot_index` reproduces the exact rewind), green after.
+  **Diagnostic improvement landed alongside**: `assert_ts_monotonic`'s panic
+  now reports the offending entry's own `(index, term, KvCommand variant)`
+  and the previous ts-carrying entry's — a bare "HLC ts didn't exceed the
+  last applied" was undiagnosable live; this is exactly what made the live
+  repro above traceable to `InstallSnapshot` at all. `kv_command_variant_
+  name`/`LastAppliedTsEntry` are threaded through `apply_and_compact` like
+  `max_applied_ts` itself (same lifetime, same single-writer discipline) —
+  no logging added, purely richer panic context.
 - **Durable-before-visible** (ADR 0009): effects are only drained for fsynced
   entries, and the engine write follows the WAL `fsync`.
 - **Write-conflict push + the logged read ceiling — the serializability half
