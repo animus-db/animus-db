@@ -7243,16 +7243,79 @@ fn is_sealed(sealed: &[(KeyRange, HlcTimestamp)], key: &[u8]) -> bool {
 /// entry, or two leaders minted concurrently without one witnessing the
 /// other — a correctness bug, not a recoverable condition, so this is a hard
 /// `assert!`, matching `hlc::pack`'s own doctrine.
-fn assert_ts_monotonic(max_applied_ts: &mut Option<HlcTimestamp>, ts: HlcTimestamp) {
+/// Diagnostic-only (local repro instrumentation, not for merging as-is): the
+/// name of the [`KvCommand`] variant being applied, for enriching
+/// [`assert_ts_monotonic`]'s panic/log context. Exhaustive over the enum so a
+/// future variant fails to compile here rather than silently reporting
+/// "unknown".
+fn kv_command_variant_name(c: &KvCommand) -> &'static str {
+    match c {
+        KvCommand::Put { .. } => "Put",
+        KvCommand::Batch { .. } => "Batch",
+        KvCommand::KindBatch { .. } => "KindBatch",
+        KvCommand::KindEval { .. } => "KindEval",
+        KvCommand::KindEvalBatch { .. } => "KindEvalBatch",
+        KvCommand::SeedBatch { .. } => "SeedBatch",
+        KvCommand::Delete { .. } => "Delete",
+        KvCommand::Cas { .. } => "Cas",
+        KvCommand::Freeze { .. } => "Freeze",
+        KvCommand::SplitTablet { .. } => "SplitTablet",
+        KvCommand::ReadCeiling { .. } => "ReadCeiling",
+        KvCommand::TxnStage { .. } => "TxnStage",
+        KvCommand::TxnCommit { .. } => "TxnCommit",
+        KvCommand::TxnAbort { .. } => "TxnAbort",
+        KvCommand::TxnResolve { .. } => "TxnResolve",
+        KvCommand::NoOp => "NoOp",
+    }
+}
+
+/// Diagnostic-only (local repro instrumentation): the last ts-carrying entry
+/// this apply task applied, alongside `max_applied_ts` — `(log index, term,
+/// KvCommand variant name, ts)`. Kept purely so a witnessing-chain panic can
+/// report what came immediately before it, without re-deriving it from the
+/// log (which may already be compacted past that point by the time anyone
+/// reads the panic).
+#[allow(dead_code)] // constructed via tuple assignment below; read only on the panic path
+type LastAppliedTsEntry = Option<(u64, u64, &'static str, HlcTimestamp)>;
+
+#[allow(clippy::too_many_arguments)] // diagnostic-only instrumentation, not for merging as-is
+fn assert_ts_monotonic(
+    max_applied_ts: &mut Option<HlcTimestamp>,
+    last_applied_ts_entry: &mut LastAppliedTsEntry,
+    ts: HlcTimestamp,
+    node: NodeId,
+    tablet: u64,
+    index: u64,
+    term: u64,
+    variant: &'static str,
+) {
     if let Some(prev) = *max_applied_ts {
+        if ts <= prev {
+            tracing::error!(
+                target: "animus_cp_data::hlcdiag",
+                node = ?node,
+                tablet,
+                this_index = index,
+                this_term = term,
+                this_variant = variant,
+                this_ts = ?ts,
+                prev_ts = ?prev,
+                prev_entry = ?*last_applied_ts_entry,
+                "raftkv apply: HLC ts did not strictly exceed the last applied — \
+                 the witnessing chain is broken"
+            );
+        }
         assert!(
             ts > prev,
             "raftkv apply: HLC ts {ts:?} did not strictly exceed the last applied {prev:?} — \
              the witnessing chain is broken (a leader change or concurrent leader failed to \
-             witness a predecessor's timestamp)"
+             witness a predecessor's timestamp) [node={node:?} tablet={tablet} \
+             this_entry=(index={index}, term={term}, variant={variant}) \
+             prev_entry={last_applied_ts_entry:?}]"
         );
     }
     *max_applied_ts = Some(ts);
+    *last_applied_ts_entry = Some((index, term, variant, ts));
 }
 
 /// The exact dual of [`materialize_derived`]'s own key completion (`prefix
@@ -7749,6 +7812,10 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     hlc: &Hlc,
     sealed: &mut Vec<(KeyRange, HlcTimestamp)>,
     max_applied_ts: &mut Option<HlcTimestamp>,
+    // Diagnostic-only (local repro instrumentation): see `LastAppliedTsEntry`'s
+    // doc. Threaded exactly like `max_applied_ts` (this apply task's own
+    // sequential, single-writer bookkeeping).
+    last_applied_ts_entry: &mut LastAppliedTsEntry,
     committed_ceiling: &AtomicU64,
     // ADR 0050 rung 5: the split-cutover freeze latch — set by
     // `KvCommand::Freeze`'s apply arm, read by the propose-side refusals
@@ -7820,6 +7887,17 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
         // behind` and re-requests), never overstate it.
         let install_max_ts =
             install_engine_image(storage, kind_scopes, &bytes, tablet, last_index).await;
+        // Diagnostic-only (local repro instrumentation): correlate a later
+        // `assert_ts_monotonic` panic against every InstallSnapshot this
+        // tablet's apply task ever installed.
+        tracing::info!(
+            target: "animus_cp_data::hlcdiag",
+            node = ?env.node_id(),
+            tablet,
+            snapshot_index = last_index,
+            snapshot_install_max_ts = ?install_max_ts,
+            "raftkv InstallSnapshot installed"
+        );
         engine_applied.fetch_max(last_index, Ordering::SeqCst);
         applied_watch.bump(last_index);
         // Belt, not the buckle: the consensus loop's own per-iteration live
@@ -8015,9 +8093,23 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
         if halted.load(Ordering::SeqCst) {
             break;
         }
+        // Diagnostic-only: captured before `command` is matched/moved, so
+        // `assert_ts_monotonic` below can report which variant it was
+        // applying even though the match arms destructure/consume it.
+        let variant = kv_command_variant_name(&command);
+        let node_id = env.node_id();
         match command {
             KvCommand::Put { key, value, ts } => {
-                assert_ts_monotonic(max_applied_ts, ts);
+                assert_ts_monotonic(
+                    max_applied_ts,
+                    last_applied_ts_entry,
+                    ts,
+                    node_id,
+                    tablet,
+                    index,
+                    term,
+                    variant,
+                );
                 // A sealed-out key is a deterministic no-op (ADR 0018 §2
                 // amendment, now `Freeze`'s apply-time backstop): the key fell
                 // in a range this group already closed, so this entry —
@@ -8034,7 +8126,16 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 }
             }
             KvCommand::Batch { puts, ts } => {
-                assert_ts_monotonic(max_applied_ts, ts);
+                assert_ts_monotonic(
+                    max_applied_ts,
+                    last_applied_ts_entry,
+                    ts,
+                    node_id,
+                    tablet,
+                    index,
+                    term,
+                    variant,
+                );
                 // The seal gates the *whole* batch, not per-key: a batch is
                 // one atomic Raft entry (see `KvCommand::Batch`'s doc), so
                 // partially applying it on a miss would silently break that
@@ -8062,7 +8163,16 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 }
             }
             KvCommand::SeedBatch { rows, ts } => {
-                assert_ts_monotonic(max_applied_ts, ts);
+                assert_ts_monotonic(
+                    max_applied_ts,
+                    last_applied_ts_entry,
+                    ts,
+                    node_id,
+                    tablet,
+                    index,
+                    term,
+                    variant,
+                );
                 // ADR 0050 rung 4 (fork F3): history transfer into this child
                 // group's own engine. Each row merges at its CARRIED version
                 // (never this entry's own `ts`) with the parent's stored bytes
@@ -8114,7 +8224,16 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 change_log,
                 ts,
             } => {
-                assert_ts_monotonic(max_applied_ts, ts);
+                assert_ts_monotonic(
+                    max_applied_ts,
+                    last_applied_ts_entry,
+                    ts,
+                    node_id,
+                    tablet,
+                    index,
+                    term,
+                    variant,
+                );
                 // ADR 0054 step 4b: the ADR 0046 "evaluate at leader"
                 // apply-time OCC seatbelt (`conditions`) this arm used to
                 // check here, before the fence/seal gate below, is deleted
@@ -8188,7 +8307,16 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 ttl_expired,
                 ts,
             } => {
-                assert_ts_monotonic(max_applied_ts, ts);
+                assert_ts_monotonic(
+                    max_applied_ts,
+                    last_applied_ts_entry,
+                    ts,
+                    node_id,
+                    tablet,
+                    index,
+                    term,
+                    variant,
+                );
                 // Read the current item in COMMIT ORDER (ADR 0054's
                 // Decision section) — drain the pending run first so this
                 // read observes every earlier write in this same apply
@@ -8302,7 +8430,16 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     .record(index, term, outcome);
             }
             KvCommand::KindEvalBatch { entries, ts } => {
-                assert_ts_monotonic(max_applied_ts, ts);
+                assert_ts_monotonic(
+                    max_applied_ts,
+                    last_applied_ts_entry,
+                    ts,
+                    node_id,
+                    tablet,
+                    index,
+                    term,
+                    variant,
+                );
                 // Read every EARLIER entry's writes in this same apply pass
                 // before this entry's own reads — the identical
                 // read-after-flush discipline `Cas`/`KindEval` already use
@@ -8482,7 +8619,16 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 }
             }
             KvCommand::Delete { key, ts } => {
-                assert_ts_monotonic(max_applied_ts, ts);
+                assert_ts_monotonic(
+                    max_applied_ts,
+                    last_applied_ts_entry,
+                    ts,
+                    node_id,
+                    tablet,
+                    index,
+                    term,
+                    variant,
+                );
                 if !is_sealed(sealed, &key) {
                     pending.push(MergeOp::tombstone(scope.physical(&key), hlc::pack(ts)));
                 }
@@ -8493,7 +8639,16 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 value,
                 ts,
             } => {
-                assert_ts_monotonic(max_applied_ts, ts);
+                assert_ts_monotonic(
+                    max_applied_ts,
+                    last_applied_ts_entry,
+                    ts,
+                    node_id,
+                    tablet,
+                    index,
+                    term,
+                    variant,
+                );
                 // Drain the pending run so the CAS read observes every earlier
                 // committed write in this apply pass.
                 flush_pending(storage, &mut pending, metrics, halted).await;
@@ -8558,7 +8713,16 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     .insert(index, (term, swapped));
             }
             KvCommand::Freeze { ts } => {
-                assert_ts_monotonic(max_applied_ts, ts);
+                assert_ts_monotonic(
+                    max_applied_ts,
+                    last_applied_ts_entry,
+                    ts,
+                    node_id,
+                    tablet,
+                    index,
+                    term,
+                    variant,
+                );
                 // Idempotent: an already-frozen group (a duplicate propose, a
                 // WAL-replay re-application over a marker-rebuilt sealed set)
                 // applies nothing a second time.
@@ -8599,7 +8763,16 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 children,
                 ts,
             } => {
-                assert_ts_monotonic(max_applied_ts, ts);
+                assert_ts_monotonic(
+                    max_applied_ts,
+                    last_applied_ts_entry,
+                    ts,
+                    node_id,
+                    tablet,
+                    index,
+                    term,
+                    variant,
+                );
                 // Idempotent, mirroring `Freeze`'s own "already sealed"
                 // check: a duplicate propose or a WAL-replay
                 // re-application over a marker-rebuilt sealed set applies
@@ -8694,7 +8867,16 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 }
             }
             KvCommand::ReadCeiling { ts } => {
-                assert_ts_monotonic(max_applied_ts, ts);
+                assert_ts_monotonic(
+                    max_applied_ts,
+                    last_applied_ts_entry,
+                    ts,
+                    node_id,
+                    tablet,
+                    index,
+                    term,
+                    variant,
+                );
                 // No fence, no scoped engine write — a ceiling carries no
                 // keys (see `KvCommand::ReadCeiling`'s doc). Bump the
                 // driver's watermark unconditionally (`fetch_max`, since a
@@ -8726,7 +8908,16 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 conditions,
                 ts,
             } => {
-                assert_ts_monotonic(max_applied_ts, ts);
+                assert_ts_monotonic(
+                    max_applied_ts,
+                    last_applied_ts_entry,
+                    ts,
+                    node_id,
+                    tablet,
+                    index,
+                    term,
+                    variant,
+                );
                 // Issue #834: drain the pending run first, mirroring `Cas`'s
                 // identical call above — this arm's own reads below
                 // (`already_decided`, and `blocked_by`'s per-write conflict
@@ -9208,7 +9399,16 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 record_key,
                 ts,
             } => {
-                assert_ts_monotonic(max_applied_ts, ts);
+                assert_ts_monotonic(
+                    max_applied_ts,
+                    last_applied_ts_entry,
+                    ts,
+                    node_id,
+                    tablet,
+                    index,
+                    term,
+                    variant,
+                );
                 flush_pending(storage, &mut pending, metrics, halted).await;
                 let physical_record = scope.physical(&record_key);
                 let current = storage
@@ -9337,7 +9537,16 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 ts,
                 orphan_created_ts,
             } => {
-                assert_ts_monotonic(max_applied_ts, ts);
+                assert_ts_monotonic(
+                    max_applied_ts,
+                    last_applied_ts_entry,
+                    ts,
+                    node_id,
+                    tablet,
+                    index,
+                    term,
+                    variant,
+                );
                 flush_pending(storage, &mut pending, metrics, halted).await;
                 let physical_record = scope.physical(&record_key);
                 let current = storage
@@ -9443,7 +9652,16 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 outcome,
                 ts,
             } => {
-                assert_ts_monotonic(max_applied_ts, ts);
+                assert_ts_monotonic(
+                    max_applied_ts,
+                    last_applied_ts_entry,
+                    ts,
+                    node_id,
+                    tablet,
+                    index,
+                    term,
+                    variant,
+                );
                 flush_pending(storage, &mut pending, metrics, halted).await;
                 // ADR 0018 §2/PR4: `outcome` is carried explicitly by the
                 // command rather than re-derived by reading `record_key`
@@ -11065,6 +11283,10 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         }
     }
 
+    // Diagnostic-only (local repro instrumentation): last-observed leader
+    // role, so the loop below can log exactly on a false->true transition
+    // rather than every iteration.
+    let mut was_leader = false;
     loop {
         // A requested shutdown exits *between* persist rounds so the WAL is never
         // left mid-write; `stopped` (paired with the apply task's `apply_stopped`)
@@ -11191,6 +11413,27 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
             // `state_machine_behind`/the quiesce veto above — `record` is a
             // cheap no-op on the overwhelming majority of iterations, where
             // the config hasn't changed since last checked.
+            // Diagnostic-only (local repro instrumentation): log exactly on
+            // the false->true edge, same lock acquisition as the rest of
+            // this block, so a later HLC panic can be correlated against
+            // every leadership transition this tablet's consensus loop saw.
+            let now_leader = c.is_leader();
+            if now_leader && !was_leader {
+                // Note: deliberately does NOT call `hlc.mint()` here to read
+                // a "current floor" — minting has the real side effect of
+                // bumping this group's own HLC state, which this purely
+                // diagnostic log must never do.
+                tracing::info!(
+                    target: "animus_cp_data::hlcdiag",
+                    node = ?env.node_id(),
+                    tablet = stream,
+                    term = c.term(),
+                    last_log_index = c.last_log_index(),
+                    last_applied = c.last_applied(),
+                    "raftkv node became leader of tablet group"
+                );
+            }
+            was_leader = now_leader;
             (c.next_deadline(), c.is_quiesced(), c.config())
         };
         voter_history
@@ -11590,6 +11833,8 @@ async fn apply_loop<E: Env, S: StorageEngine>(
     // qualifying entry it processes is unconditionally accepted (see
     // `assert_ts_monotonic`'s doc for why that boundary case is safe).
     let mut max_applied_ts: Option<HlcTimestamp> = None;
+    // Diagnostic-only (local repro instrumentation): see `LastAppliedTsEntry`'s doc.
+    let mut last_applied_ts_entry: LastAppliedTsEntry = None;
     // ADR 0018 §2 write-loss amendment (Part B): the engine-durable version
     // watermark, captured once, right here, before this task (or this
     // process) has applied or minted anything this lifetime — the
@@ -11600,6 +11845,17 @@ async fn apply_loop<E: Env, S: StorageEngine>(
     // reflects every write durable before this restart, not a half-recovered
     // snapshot.
     let recovered_baseline_version = storage.latest_version();
+    // Diagnostic-only: announce this apply task's start with enough context to
+    // correlate against a later `assert_ts_monotonic` panic for this tablet.
+    tracing::info!(
+        target: "animus_cp_data::hlcdiag",
+        node = ?env.node_id(),
+        tablet = stream,
+        initial_max_applied_ts = ?max_applied_ts,
+        engine_hwm_version = recovered_baseline_version,
+        engine_hwm_ts = ?hlc::unpack(recovered_baseline_version),
+        "raftkv apply task starting"
+    );
     let mut suspicious_noop_log_budget = SUSPICIOUS_MERGE_NOOP_LOG_CAP;
     // Issue #898 follow-up: owned by this loop, across iterations — see
     // `COMPACT_DEFER_IDLE_CEILING`'s own doc for why this lives here rather
@@ -11638,6 +11894,7 @@ async fn apply_loop<E: Env, S: StorageEngine>(
             &hlc,
             &mut sealed,
             &mut max_applied_ts,
+            &mut last_applied_ts_entry,
             &committed_ceiling,
             &frozen,
             &txn_tracker,
