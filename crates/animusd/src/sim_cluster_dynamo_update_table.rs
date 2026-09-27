@@ -304,19 +304,22 @@ fn update_table_raising_units_admits_more() {
         "expected the tiny declared budget to throttle first (seed={seed})"
     );
 
-    // Raise the write budget by many orders of magnitude.
+    // Raise the write budget by many orders of magnitude — but stay at or
+    // under AWS's own per-table `WriteCapacityUnits` ceiling (ADR 0072,
+    // `animus_dynamo::limits::TABLE_MAX_WRITE_CAPACITY_UNITS` = 40,000);
+    // this adapter now rejects a `ProvisionedThroughput` above it.
     let (status, body) = cluster.dynamo(
         0,
         "DynamoDB_20120810.UpdateTable",
         br#"{"TableName":"thr_ct_raise","BillingMode":"PROVISIONED",
-            "ProvisionedThroughput":{"ReadCapacityUnits":5,"WriteCapacityUnits":1000000}}"#,
+            "ProvisionedThroughput":{"ReadCapacityUnits":5,"WriteCapacityUnits":40000}}"#,
     );
     assert_eq!(
         status, 200,
         "UpdateTable raising units failed: {body} (seed={seed})"
     );
     assert!(
-        body.contains("\"WriteCapacityUnits\":1000000"),
+        body.contains("\"WriteCapacityUnits\":40000"),
         "{body} (seed={seed})"
     );
 

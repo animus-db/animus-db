@@ -173,6 +173,9 @@ use animus_dynamo::capacity::{
     self, ConsumedCapacity, ItemCollectionMetrics, ReturnConsumedCapacity,
     ReturnItemCollectionMetrics,
 };
+use animus_dynamo::limits::{
+    MAX_BATCH_GET_RESPONSE_BYTES, MAX_QUERY_SCAN_PAGE_BYTES, MAX_TRANSACT_BYTES,
+};
 use animus_dynamo::partiql;
 use animus_dynamo::wire::{
     self, MAX_GSI_PER_TABLE, Operation, Projection, ReturnValues, ScanSegment, Select,
@@ -208,8 +211,14 @@ pub(crate) const SCHEMA_COMMIT_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const SCHEMA_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Max actions per `TransactWriteItems` request / keys per `TransactGetItems`
-/// request (ADR 0018 §2/PR7) — DynamoDB's own limit (1-100 items); we don't
-/// replicate AWS's fuller request-size validation, just this simple cap.
+/// request (ADR 0018 §2/PR7) — DynamoDB's own limit (1-100 items). The
+/// aggregate byte-size cap AWS also enforces on both operations
+/// (`animus_dynamo::limits::MAX_TRANSACT_BYTES`, ADR 0072 layer 4) is a
+/// separate check: `animus_dynamo::wire::decode_transact_write` at decode
+/// time for `TransactWriteItems` (the request itself can already exceed 4
+/// MiB), [`run_transact_get`] against the fetched result for
+/// `TransactGetItems` (its request never can — DynamoDB's real rule there
+/// is on the response).
 const MAX_TRANSACT_ITEMS: usize = 100;
 
 /// `ClientRequestToken` idempotency record TTL (ADR 0018's 2026-08-24
@@ -351,10 +360,82 @@ fn resolve_key<E: Env, R: RelayClient>(
         reg.extract_key(table, item).map_err(registry_error)?
     };
     reject_empty_key_value(&pk)?;
+    check_partition_key_value_size(&pk)?;
     if let Some(sk) = &sk {
         reject_empty_key_value(sk)?;
+        check_sort_key_value_size(sk)?;
     }
+    check_index_key_value_sizes(meta, table, item)?;
     Ok((pk, sk))
+}
+
+/// The byte length DynamoDB's partition/sort-key size caps charge an
+/// `AttributeValue` against: `S`'s UTF-8 length or `B`'s raw byte length —
+/// `N` is unaffected. A small, pure duplicate of `animus_dynamo::wire`'s own
+/// private copy (that crate's module-private helpers are deliberately not
+/// exported across the wire boundary; this crate re-derives the same
+/// byte-shape rule rather than widening `wire`'s own surface for it).
+fn key_value_byte_len(v: &AttributeValue) -> Option<usize> {
+    match v {
+        AttributeValue::S(s) => Some(s.len()),
+        AttributeValue::B(b) => Some(b.len()),
+        _ => None,
+    }
+}
+
+/// ADR 0072: AWS's partition-key value size cap (2048 bytes), applied to
+/// the base table's own key here — [`resolve_key`] is the single choke
+/// point every write/point-read path resolves a table's key through (the
+/// same property [`reject_empty_key_value`]'s own doc already states), so
+/// checked once here covers `PutItem`/`GetItem`/`DeleteItem`/`UpdateItem`/
+/// `BatchWriteItem`/`BatchGetItem`/`TransactWriteItems`/`TransactGetItems`
+/// alike.
+fn check_partition_key_value_size(v: &AttributeValue) -> Result<(), WireError> {
+    if key_value_byte_len(v).is_some_and(|len| len > animus_dynamo::limits::MAX_PARTITION_KEY_BYTES)
+    {
+        return Err(WireError::validation(format!(
+            "One or more parameter values were invalid: the partition key value exceeds the \
+             maximum size of {} bytes",
+            animus_dynamo::limits::MAX_PARTITION_KEY_BYTES
+        )));
+    }
+    Ok(())
+}
+
+/// [`check_partition_key_value_size`]'s sort-key sibling (1024 bytes).
+fn check_sort_key_value_size(v: &AttributeValue) -> Result<(), WireError> {
+    if key_value_byte_len(v).is_some_and(|len| len > animus_dynamo::limits::MAX_SORT_KEY_BYTES) {
+        return Err(WireError::validation(format!(
+            "One or more parameter values were invalid: the sort key value exceeds the \
+             maximum size of {} bytes",
+            animus_dynamo::limits::MAX_SORT_KEY_BYTES
+        )));
+    }
+    Ok(())
+}
+
+/// GSI/LSI key attribute values obey the same size caps as the base table's
+/// own key (ADR 0072) — a materialized index row's hash/sort attribute is
+/// itself a partition/sort key, just against a different keyspace. Checked
+/// here, inside [`resolve_key`]'s own single choke point (using the `meta`
+/// it already has), rather than at index-row derivation time
+/// (`animus_item::derive_kind_writes`, which is `KvCommand::KindEval`'s
+/// frozen, infallible apply-path core and must never fail): a write whose
+/// index key value is already too big is rejected before it is ever
+/// proposed. A no-op for a read's bare `Key` map, which never carries a
+/// non-key attribute.
+fn check_index_key_value_sizes(meta: &Metadata, table: &str, item: &Item) -> Result<(), WireError> {
+    for idx in meta.table_indexes(table) {
+        if let Some(v) = item.get(&idx.hash_attribute) {
+            check_partition_key_value_size(v)?;
+        }
+        if let Some(sort_name) = &idx.sort_attribute
+            && let Some(v) = item.get(sort_name)
+        {
+            check_sort_key_value_size(v)?;
+        }
+    }
+    Ok(())
 }
 
 /// Issue #848: AWS's 2020 empty-value change allows an empty `S`/`B` for a
@@ -1305,6 +1386,23 @@ async fn dispatch_item_op<E: Env, R: RelayClient>(
             // in the batch, including every other key of the SAME table,
             // still reads normally.
             let mut unprocessed: Vec<(String, Item)> = Vec::new();
+            // AWS's `BatchGetItem` response-size cap
+            // (`animus_dynamo::limits::MAX_BATCH_GET_RESPONSE_BYTES`, 16
+            // MiB, ADR 0072 layer 4): **not an error**. `response_bytes`
+            // tracks the running `item_size` of every item included so
+            // far, charged before projection like every other size check
+            // in this crate; the moment the *next* fetched item would push
+            // it over the cap, `budget_exhausted` latches and every key
+            // from there on — the one that would have tipped it over, and
+            // every key after it, whether or not it has been fetched yet —
+            // goes to `UnprocessedKeys` instead, exactly like a per-key
+            // throttle refusal. Reachable: 100 keys × 400 KB
+            // (`MAX_ITEM_SIZE_BYTES`) is 40 MB, well past 16 MiB. This loop
+            // already fetches one key at a time, never a concurrent
+            // fan-out, so once the budget is spent the remaining keys are
+            // never even read (no wasted read to cut after the fact).
+            let mut response_bytes: usize = 0;
+            let mut budget_exhausted = false;
             for req in requests {
                 reject_internal_table(&req.table, false)?;
                 if !table_known(ctx, meta, &req.table) {
@@ -1314,6 +1412,10 @@ async fn dispatch_item_op<E: Env, R: RelayClient>(
                 }
                 let mut items = Vec::with_capacity(req.keys.len());
                 for key in &req.keys {
+                    if budget_exhausted {
+                        unprocessed.push((req.table.clone(), key.clone()));
+                        continue;
+                    }
                     let (pk, sk) = resolve_key(ctx, meta, &req.table, key)?;
                     let data_key = item_key(&pk, sk.as_ref());
                     match quorum_read(
@@ -1325,7 +1427,16 @@ async fn dispatch_item_op<E: Env, R: RelayClient>(
                     )
                     .await
                     {
-                        Ok(Some(item)) => items.push(wire::project(req.projection.as_ref(), &item)),
+                        Ok(Some(item)) => {
+                            let size = capacity::item_size(&item);
+                            if response_bytes + size > MAX_BATCH_GET_RESPONSE_BYTES {
+                                budget_exhausted = true;
+                                unprocessed.push((req.table.clone(), key.clone()));
+                            } else {
+                                response_bytes += size;
+                                items.push(wire::project(req.projection.as_ref(), &item));
+                            }
+                        }
                         Ok(None) => {}
                         Err(e) if e.code == "ProvisionedThroughputExceededException" => {
                             unprocessed.push((req.table.clone(), key.clone()));
@@ -6137,6 +6248,25 @@ async fn run_transact_get<E: Env, R: RelayClient>(
         };
         items.push(item);
     }
+    // AWS's `TransactGetItems` aggregate-size cap (`animus_dynamo::limits::
+    // MAX_TRANSACT_BYTES`, 4 MiB, ADR 0072 layer 4). Unlike
+    // `TransactWriteItems`, whose own 4 MiB cap is enforced at decode
+    // against the *request* (`animus_dynamo::wire::decode_transact_write`),
+    // DynamoDB's real `TransactGetItems` rule is on the **response**: up to
+    // 100 keys of at most ~3 KB each can never reach 4 MiB on their own, so
+    // the only place this can be checked is here, against what was actually
+    // fetched. A transaction has no partial result — the whole call fails,
+    // nothing is returned — matching `TransactWriteItems`'s own
+    // all-or-nothing contract. 11 max-size (400 KB) items already exceed
+    // it; regression: `sim_cluster_dynamo_byte_caps::
+    // transact_get_items_over_the_byte_cap_is_rejected`.
+    let fetched_bytes: usize = items.iter().flatten().map(capacity::item_size).sum();
+    if fetched_bytes > MAX_TRANSACT_BYTES {
+        return Err(WireError::validation(format!(
+            "TransactGetItems fetched item size {fetched_bytes} bytes exceeds the maximum \
+             allowed size of {MAX_TRANSACT_BYTES} bytes"
+        )));
+    }
     for (g, item) in gets.iter().zip(items.iter_mut()) {
         if let Some(projection) = &g.projection
             && let Some(present) = item.take()
@@ -6618,7 +6748,7 @@ async fn run_base_query<E: Env, R: RelayClient>(
     };
     let (from, upper) = query_page_bounds(cursor, &prefix, &end, scan_index_forward);
     let want = limit.map(|n| n.saturating_add(1));
-    let (mut examined, _exhausted) = paginated_table_examine(
+    let (mut examined, _exhausted, byte_capped) = paginated_table_examine(
         ctx,
         table,
         from,
@@ -6646,7 +6776,7 @@ async fn run_base_query<E: Env, R: RelayClient>(
         },
     )
     .await?;
-    let truncated = limit.is_some_and(|n| examined.len() > n);
+    let truncated = byte_capped || limit.is_some_and(|n| examined.len() > n);
     if let Some(n) = limit {
         examined.truncate(n);
     }
@@ -6880,7 +7010,7 @@ async fn run_gsi_query<E: Env, R: RelayClient>(
     };
     let (from, upper) = query_page_bounds(cursor, &prefix, &end, scan_index_forward);
     let want = limit.map(|n| n.saturating_add(1));
-    let (mut examined, _exhausted) = paginated_table_examine(
+    let (mut examined, _exhausted, byte_capped) = paginated_table_examine(
         ctx,
         &index_table,
         from,
@@ -6911,7 +7041,7 @@ async fn run_gsi_query<E: Env, R: RelayClient>(
         },
     )
     .await?;
-    let truncated = limit.is_some_and(|n| examined.len() > n);
+    let truncated = byte_capped || limit.is_some_and(|n| examined.len() > n);
     if let Some(n) = limit {
         examined.truncate(n);
     }
@@ -6995,7 +7125,7 @@ async fn run_lsi_query<E: Env, R: RelayClient>(
     };
     let (from, upper) = query_page_bounds(cursor, &prefix, &end, scan_index_forward);
     let want = limit.map(|n| n.saturating_add(1));
-    let (mut examined, _exhausted) = paginated_kind_examine_one(
+    let (mut examined, _exhausted, byte_capped) = paginated_kind_examine_one(
         ctx,
         table,
         KIND_LSI,
@@ -7021,7 +7151,7 @@ async fn run_lsi_query<E: Env, R: RelayClient>(
         },
     )
     .await?;
-    let truncated = limit.is_some_and(|n| examined.len() > n);
+    let truncated = byte_capped || limit.is_some_and(|n| examined.len() > n);
     if let Some(n) = limit {
         examined.truncate(n);
     }
@@ -8433,7 +8563,7 @@ async fn run_base_scan<E: Env, R: RelayClient>(
     // A DynamoDB `DeleteItem` stores a *tombstone value* (a live pair to the
     // data plane, decoding to `None`); `paginated_table_examine` continues past
     // it without consuming a `Limit` slot.
-    let (mut examined, _exhausted) = paginated_table_examine(
+    let (mut examined, _exhausted, byte_capped) = paginated_table_examine(
         ctx,
         table,
         from,
@@ -8444,7 +8574,7 @@ async fn run_base_scan<E: Env, R: RelayClient>(
         |_key, value| wire::decode_stored_item(value),
     )
     .await?;
-    let truncated = limit.is_some_and(|n| examined.len() > n);
+    let truncated = byte_capped || limit.is_some_and(|n| examined.len() > n);
     if let Some(n) = limit {
         examined.truncate(n);
     }
@@ -8593,7 +8723,7 @@ async fn run_gsi_scan<E: Env, R: RelayClient>(
     // as-built note — the drain prunes with a real engine delete), so `keep`
     // only needs to guard against a corrupt row, mirroring `run_gsi_query`'s
     // own "skip rather than fail the whole query" defensiveness.
-    let (mut examined, _exhausted) = paginated_table_examine(
+    let (mut examined, _exhausted, byte_capped) = paginated_table_examine(
         ctx,
         &index_table,
         from,
@@ -8604,7 +8734,7 @@ async fn run_gsi_scan<E: Env, R: RelayClient>(
         |_key, value| wire::decode_stored_item(value),
     )
     .await?;
-    let truncated = limit.is_some_and(|n| examined.len() > n);
+    let truncated = byte_capped || limit.is_some_and(|n| examined.len() > n);
     if let Some(n) = limit {
         examined.truncate(n);
     }
@@ -8666,7 +8796,7 @@ async fn run_lsi_scan<E: Env, R: RelayClient>(
     let (from, end) = scan_bounds(segment, from);
     let want = limit.map(|n| n.saturating_add(1));
     let idx_name = idx.name.clone();
-    let (mut examined, _exhausted) = paginated_kind_examine(
+    let (mut examined, _exhausted, byte_capped) = paginated_kind_examine(
         ctx,
         table,
         KIND_LSI,
@@ -8686,7 +8816,7 @@ async fn run_lsi_scan<E: Env, R: RelayClient>(
         },
     )
     .await?;
-    let truncated = limit.is_some_and(|n| examined.len() > n);
+    let truncated = byte_capped || limit.is_some_and(|n| examined.len() > n);
     if let Some(n) = limit {
         examined.truncate(n);
     }
@@ -8744,8 +8874,34 @@ fn apply_filter_and_project(
 /// sub-range — see [`run_base_query`]/[`run_gsi_query`]'s docs for why the
 /// bound matters there: without it, a window that runs past `end` would
 /// silently start reading a neighboring partition or hash value). Returns the
-/// examined `(raw key, decoded item)` pairs and whether the underlying range
-/// is now exhausted.
+/// examined `(raw key, decoded item)` pairs, whether the underlying range is
+/// now exhausted, and whether the page was cut short by
+/// [`MAX_QUERY_SCAN_PAGE_BYTES`] (below).
+///
+/// ## The 1 MiB evaluated-page cap (ADR 0072)
+///
+/// Every `Query`/`Scan` page is additionally bounded by
+/// [`MAX_QUERY_SCAN_PAGE_BYTES`] of **evaluated** item data — the same
+/// `animus_item::item_size` formula ADR 0065's `ConsumedCapacity` and the 400
+/// KB per-item cap both use, summed over exactly the rows `keep` returns
+/// `Some` for (i.e. after `KeyConditionExpression`/tombstone-skipping, the
+/// same set the `want`/`Limit` count budget above already governs — before
+/// any `FilterExpression`/`ProjectionExpression`, which run later over
+/// `examined` in `apply_filter_and_project`). Real DynamoDB does not
+/// document the exact edge of this rule, so this reads it the conservative
+/// way: an item is examined *before* it is added, and one that would push
+/// the running total **over** the cap is excluded — never bumping the total
+/// over 1 MiB, at the cost of a page that can end up **one item lighter**
+/// than the true boundary. That excluded item is never lost: it is simply
+/// the first item of the next page, exactly as a `Limit`-truncated item
+/// would be. A single first item can never itself trip this — every stored
+/// item is already under `animus_item::MAX_ITEM_SIZE_BYTES` (400 KB), well
+/// under this 1 MiB page cap — so a page is never returned empty-but-
+/// unexhausted the way an all-first-item-over-budget corner case would
+/// require. `Limit`/`want` and this byte cap compose: whichever stops the
+/// page first wins, and either one sets the returned "capped" flag that
+/// callers fold into their own `LastEvaluatedKey` decision the identical way
+/// they already fold in `examined.len() > limit`.
 #[allow(clippy::too_many_arguments)] // one base/GSI page's full shape
 async fn paginated_table_examine<E: Env, R: RelayClient>(
     ctx: &ClientCtx<E, R>,
@@ -8756,8 +8912,9 @@ async fn paginated_table_examine<E: Env, R: RelayClient>(
     reverse: bool,
     consistency: ReadConsistency,
     keep: impl Fn(&[u8], &[u8]) -> Result<Option<Item>, WireError>,
-) -> Result<(Vec<(Vec<u8>, Item)>, bool), WireError> {
+) -> Result<(Vec<(Vec<u8>, Item)>, bool, bool), WireError> {
     let mut examined: Vec<(Vec<u8>, Item)> = Vec::new();
+    let mut evaluated_bytes: usize = 0;
     // Ascending walks the *lower* bound up and holds `end` fixed; descending
     // holds the lower bound fixed and walks the *upper* bound down. Only one
     // of the two ever moves, which is why both share this loop.
@@ -8781,11 +8938,16 @@ async fn paginated_table_examine<E: Env, R: RelayClient>(
         let last_raw_key = pairs.last().map(|(k, _)| k.clone());
         for (key, value) in &pairs {
             if let Some(item) = keep(key, value)? {
+                let size = capacity::item_size(&item);
+                if evaluated_bytes.saturating_add(size) > MAX_QUERY_SCAN_PAGE_BYTES {
+                    return Ok((examined, false, true));
+                }
+                evaluated_bytes += size;
                 examined.push((key.clone(), item));
             }
         }
         if exhausted || want.is_some_and(|w| examined.len() >= w) {
-            return Ok((examined, exhausted));
+            return Ok((examined, exhausted, false));
         }
         let next = last_raw_key.expect("non-exhausted fetch returned pairs");
         if reverse {
@@ -8805,7 +8967,10 @@ async fn paginated_table_examine<E: Env, R: RelayClient>(
 /// (`ClientCtx::cp_scan_kind_table`) — the LSI `Scan` read primitive. Identical
 /// windowed-continuation discipline, generalized so `run_lsi_scan`'s `keep`
 /// can skip an interleaved *other* index's row without consuming a `Limit`
-/// slot, the same way the table-wide variant skips a tombstone.
+/// slot, the same way the table-wide variant skips a tombstone. Also shares
+/// [`paginated_table_examine`]'s [`MAX_QUERY_SCAN_PAGE_BYTES`] evaluated-page
+/// cap — see that function's doc for the accounting/boundary rule, identical
+/// here.
 #[allow(clippy::too_many_arguments)] // one LSI Scan page's full shape
 async fn paginated_kind_examine<E: Env, R: RelayClient>(
     ctx: &ClientCtx<E, R>,
@@ -8816,8 +8981,9 @@ async fn paginated_kind_examine<E: Env, R: RelayClient>(
     want: Option<usize>,
     consistency: ReadConsistency,
     keep: impl Fn(&[u8], &[u8]) -> Result<Option<Item>, WireError>,
-) -> Result<(Vec<(Vec<u8>, Item)>, bool), WireError> {
+) -> Result<(Vec<(Vec<u8>, Item)>, bool, bool), WireError> {
     let mut examined: Vec<(Vec<u8>, Item)> = Vec::new();
+    let mut evaluated_bytes: usize = 0;
     loop {
         let fetch = want.map(|w| w - examined.len());
         let pairs = ctx
@@ -8828,11 +8994,16 @@ async fn paginated_kind_examine<E: Env, R: RelayClient>(
         let last_raw_key = pairs.last().map(|(k, _)| k.clone());
         for (key, value) in &pairs {
             if let Some(item) = keep(key, value)? {
+                let size = capacity::item_size(&item);
+                if evaluated_bytes.saturating_add(size) > MAX_QUERY_SCAN_PAGE_BYTES {
+                    return Ok((examined, false, true));
+                }
+                evaluated_bytes += size;
                 examined.push((key.clone(), item));
             }
         }
         if exhausted || want.is_some_and(|w| examined.len() >= w) {
-            return Ok((examined, exhausted));
+            return Ok((examined, exhausted, false));
         }
         let mut next = last_raw_key.expect("non-exhausted fetch returned pairs");
         next.push(0x00);
@@ -8847,7 +9018,9 @@ async fn paginated_kind_examine<E: Env, R: RelayClient>(
 /// partition's own LSI sub-range by construction, which is always a finite,
 /// bounded window — see [`run_lsi_query`]'s doc for why walking past it would
 /// be a real bug (leaking into a neighboring partition's LSI rows). Same
-/// windowed-continuation discipline otherwise.
+/// windowed-continuation discipline otherwise, including
+/// [`paginated_table_examine`]'s [`MAX_QUERY_SCAN_PAGE_BYTES`] evaluated-page
+/// cap.
 #[allow(clippy::too_many_arguments)] // one LSI Query page's full shape
 async fn paginated_kind_examine_one<E: Env, R: RelayClient>(
     ctx: &ClientCtx<E, R>,
@@ -8859,8 +9032,9 @@ async fn paginated_kind_examine_one<E: Env, R: RelayClient>(
     reverse: bool,
     consistency: ReadConsistency,
     keep: impl Fn(&[u8], &[u8]) -> Result<Option<Item>, WireError>,
-) -> Result<(Vec<(Vec<u8>, Item)>, bool), WireError> {
+) -> Result<(Vec<(Vec<u8>, Item)>, bool, bool), WireError> {
     let mut examined: Vec<(Vec<u8>, Item)> = Vec::new();
+    let mut evaluated_bytes: usize = 0;
     // Ascending walks the lower bound up; descending walks the upper bound
     // down — the same inversion `paginated_table_examine` documents.
     let mut upper = end;
@@ -8882,11 +9056,16 @@ async fn paginated_kind_examine_one<E: Env, R: RelayClient>(
         let last_raw_key = pairs.last().map(|(k, _)| k.clone());
         for (key, value) in &pairs {
             if let Some(item) = keep(key, value)? {
+                let size = capacity::item_size(&item);
+                if evaluated_bytes.saturating_add(size) > MAX_QUERY_SCAN_PAGE_BYTES {
+                    return Ok((examined, false, true));
+                }
+                evaluated_bytes += size;
                 examined.push((key.clone(), item));
             }
         }
         if exhausted || want.is_some_and(|w| examined.len() >= w) {
-            return Ok((examined, exhausted));
+            return Ok((examined, exhausted, false));
         }
         let next = last_raw_key.expect("non-exhausted fetch returned pairs");
         if reverse {
@@ -11028,14 +11207,14 @@ mod stream_write_path_tests {
     async fn streamed_unindexed_table_writes_base_and_change_only() {
         let dir = tempfile::TempDir::new().unwrap();
         let node = single_node(dir.path()).await;
-        create_streamed_table(node.dynamo_addr(), "s1").await;
-        let group = await_group(&node, "s1").await;
+        create_streamed_table(node.dynamo_addr(), "tbs1").await;
+        let group = await_group(&node, "tbs1").await;
         assert_eq!(group.pending_changes_key_order().await.len(), 0);
 
         let (status, body) = dynamo(
             node.dynamo_addr(),
             "DynamoDB_20120810.PutItem",
-            r#"{"TableName":"s1","Item":{"id":{"S":"a"},"n":{"N":"1"}}}"#,
+            r#"{"TableName":"tbs1","Item":{"id":{"S":"a"},"n":{"N":"1"}}}"#,
         )
         .await;
         assert_eq!(status, 200, "PutItem failed: {body}");
@@ -11061,7 +11240,7 @@ mod stream_write_path_tests {
         let (status, body) = dynamo(
             node.dynamo_addr(),
             "DynamoDB_20120810.GetItem",
-            r#"{"TableName":"s1","Key":{"id":{"S":"a"}}}"#,
+            r#"{"TableName":"tbs1","Key":{"id":{"S":"a"}}}"#,
         )
         .await;
         assert_eq!(status, 200, "GetItem failed: {body}");
@@ -11070,7 +11249,7 @@ mod stream_write_path_tests {
         let (status, body) = dynamo(
             node.dynamo_addr(),
             "DynamoDB_20120810.UpdateItem",
-            r#"{"TableName":"s1","Key":{"id":{"S":"a"}},
+            r#"{"TableName":"tbs1","Key":{"id":{"S":"a"}},
                 "UpdateExpression":"SET n = :v",
                 "ExpressionAttributeValues":{":v":{"N":"2"}}}"#,
         )
@@ -11081,7 +11260,7 @@ mod stream_write_path_tests {
         let (status, body) = dynamo(
             node.dynamo_addr(),
             "DynamoDB_20120810.DeleteItem",
-            r#"{"TableName":"s1","Key":{"id":{"S":"a"}}}"#,
+            r#"{"TableName":"tbs1","Key":{"id":{"S":"a"}}}"#,
         )
         .await;
         assert_eq!(status, 200, "DeleteItem failed: {body}");
@@ -11123,18 +11302,18 @@ mod stream_write_path_tests {
         let (status, body) = dynamo(
             node.dynamo_addr(),
             "DynamoDB_20120810.CreateTable",
-            r#"{"TableName":"mb",
+            r#"{"TableName":"tmb",
                 "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
                 "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
         )
         .await;
         assert_eq!(status, 200, "CreateTable failed: {body}");
-        let group = await_group(&node, "mb").await;
+        let group = await_group(&node, "tmb").await;
 
         let puts: Vec<String> = (0..BATCH_WRITE_MAX_ITEMS)
             .map(|i| format!(r#"{{"PutRequest":{{"Item":{{"id":{{"S":"k{i:03}"}}}}}}}}"#))
             .collect();
-        let body_json = format!(r#"{{"RequestItems":{{"mb":[{}]}}}}"#, puts.join(","));
+        let body_json = format!(r#"{{"RequestItems":{{"tmb":[{}]}}}}"#, puts.join(","));
         let (status, body) = dynamo(
             node.dynamo_addr(),
             "DynamoDB_20120810.BatchWriteItem",
@@ -11498,13 +11677,13 @@ mod stream_write_path_tests {
     async fn batch_write_on_a_streamed_table_emits_change_records() {
         let dir = tempfile::TempDir::new().unwrap();
         let node = single_node(dir.path()).await;
-        create_streamed_table(node.dynamo_addr(), "sb").await;
-        let group = await_group(&node, "sb").await;
+        create_streamed_table(node.dynamo_addr(), "tsb").await;
+        let group = await_group(&node, "tsb").await;
 
         let (status, body) = dynamo(
             node.dynamo_addr(),
             "DynamoDB_20120810.BatchWriteItem",
-            r#"{"RequestItems":{"sb":[
+            r#"{"RequestItems":{"tsb":[
                 {"PutRequest":{"Item":{"id":{"S":"a"},"n":{"N":"1"}}}},
                 {"PutRequest":{"Item":{"id":{"S":"b"},"n":{"N":"2"}}}}
             ]}}"#,
@@ -11538,20 +11717,20 @@ mod stream_write_path_tests {
     async fn change_record_carries_both_images_regardless_of_view_type() {
         let dir = tempfile::TempDir::new().unwrap();
         let node = single_node(dir.path()).await;
-        create_streamed_table(node.dynamo_addr(), "s2").await;
-        let group = await_group(&node, "s2").await;
+        create_streamed_table(node.dynamo_addr(), "tbs2").await;
+        let group = await_group(&node, "tbs2").await;
 
         let (status, body) = dynamo(
             node.dynamo_addr(),
             "DynamoDB_20120810.PutItem",
-            r#"{"TableName":"s2","Item":{"id":{"S":"a"},"n":{"N":"1"}}}"#,
+            r#"{"TableName":"tbs2","Item":{"id":{"S":"a"},"n":{"N":"1"}}}"#,
         )
         .await;
         assert_eq!(status, 200, "PutItem failed: {body}");
         let (status, body) = dynamo(
             node.dynamo_addr(),
             "DynamoDB_20120810.PutItem",
-            r#"{"TableName":"s2","Item":{"id":{"S":"a"},"n":{"N":"2"}}}"#,
+            r#"{"TableName":"tbs2","Item":{"id":{"S":"a"},"n":{"N":"2"}}}"#,
         )
         .await;
         assert_eq!(status, 200, "second PutItem failed: {body}");
@@ -11580,14 +11759,14 @@ mod stream_write_path_tests {
     async fn trim_blocked_on_a_streamed_table_with_no_copier_cursor_yet() {
         let dir = tempfile::TempDir::new().unwrap();
         let node = single_node(dir.path()).await;
-        create_streamed_table(node.dynamo_addr(), "s3").await;
-        let group = await_group(&node, "s3").await;
+        create_streamed_table(node.dynamo_addr(), "tbs3").await;
+        let group = await_group(&node, "tbs3").await;
 
         for i in 0..5 {
             let (status, body) = dynamo(
                 node.dynamo_addr(),
                 "DynamoDB_20120810.PutItem",
-                &format!(r#"{{"TableName":"s3","Item":{{"id":{{"S":"k{i}"}}}}}}"#),
+                &format!(r#"{{"TableName":"tbs3","Item":{{"id":{{"S":"k{i}"}}}}}}"#),
             )
             .await;
             assert_eq!(status, 200, "PutItem({i}) failed: {body}");

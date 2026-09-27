@@ -297,8 +297,12 @@ async fn cluster_wide_throttle_default_is_overridden_by_a_tables_own_throughput(
     );
 
     // This table declares its OWN, much larger throughput — it must ignore
-    // the cluster-wide default entirely and stay unthrottled.
-    create_table_with_throughput(addr, "thr_cfg_override", 1_000_000, 1_000_000).await;
+    // the cluster-wide default entirely and stay unthrottled. Capped at
+    // AWS's own per-table `ProvisionedThroughput` ceiling (ADR 0072,
+    // `animus_dynamo::limits::TABLE_MAX_{READ,WRITE}_CAPACITY_UNITS` =
+    // 40,000) rather than the `1_000_000` this used to declare — still
+    // enormously larger than the cluster-wide default of `1` above.
+    create_table_with_throughput(addr, "thr_cfg_override", 40_000, 40_000).await;
     for i in 0..10 {
         let (status, body) = dynamo(
             addr,

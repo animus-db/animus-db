@@ -4636,6 +4636,63 @@ route below the edge through the same `ClientCtx` CP primitives.
   case (`consistent_read` is always `false` there, so the ordinary derivation
   produces `Eventual`).
 
+  **Every `Query`/`Scan` page is also capped at `animus_dynamo::limits::
+  MAX_QUERY_SCAN_PAGE_BYTES` (1 MiB) of evaluated item data — AWS's own
+  pagination rule (ADR 0072 layer 3), enforced at the coordinator, not
+  pushed into `animus-cp-data`.** `paginated_table_examine`/
+  `paginated_kind_examine`/`paginated_kind_examine_one` (the shared
+  windowed-continuation loops base/GSI `Scan`/`Query` and LSI `Scan`/`Query`
+  all funnel through) sum `animus_item::item_size` over exactly the rows
+  they push into `examined` — the same "evaluated" set the `Limit`/`want`
+  count budget already governs, after `KeyConditionExpression`/tombstone-
+  skipping but before `FilterExpression`/`ProjectionExpression` — and stop
+  **before** an item would push the running total over the cap, so a page
+  never exceeds 1 MiB even though real DynamoDB doesn't document the exact
+  edge of this rule. That excluded item becomes the next page's first item,
+  exactly like a `Limit`-truncated one; `Limit` and the byte cap compose,
+  whichever stops the page first wins; and `Select: COUNT` pages by it too
+  (a page can come back with zero `Items` yet still carry
+  `LastEvaluatedKey`, matching AWS's well-known `FilterExpression`
+  surprise). **This is coordinator-only**: `ClientCtx::cp_scan`/
+  `cp_scan_kind`/`cp_scan_kind_table` already carry an item-*count* budget
+  (`limit: Option<usize>`) down into the per-tablet scan RPC
+  (`CpGroup::linearizable_scan`, inside `animus-cp-data`), but a byte budget
+  does not ride along — an unbounded (`Limit`-less) `Scan`'s single
+  round-trip to a tablet can still fetch more than one evaluated page's
+  worth of raw pairs before the coordinator's own loop notices and stops
+  consuming them; a follow-up that wants defense at the tablet itself needs
+  to widen that RPC (and `animus-cp-data`'s own scan primitive) with a
+  byte-budget twin of `limit`, which this layer deliberately did not do.
+  `Select`/PartiQL `ExecuteStatement` `SELECT` inherit the cap for free —
+  both reuse `run_query`/`run_scan`'s own response, the latter mapping
+  `LastEvaluatedKey` to `NextToken` (`reshape_query_scan_response_to_
+  execute_statement`). Tests: `sim_cluster_dynamo_page_size_cap.rs`.
+
+  **`BatchGetItem`/`BatchWriteItem`/`TransactWriteItems`/`TransactGetItems`
+  each carry an aggregate byte cap too (ADR 0072 layer 4), but not all at
+  the same layer as the page cap above.** `BatchWriteItem`'s 16 MiB request
+  cap and `TransactWriteItems`' 4 MiB request cap are enforced at **decode
+  time**, in `animus_dynamo::wire` (`decode_batch_write`/
+  `decode_transact_write`) — the request already carries every item's
+  bytes, so there's no reason to wait for `animusd` to see it, and no way
+  for `run_transact` to observe an over-cap `TransactWriteItems` at all
+  (decode already refused it). `TransactGetItems`' 4 MiB cap is the mirror
+  case: its request is only keys, which can never carry 4 MiB on their own,
+  so `run_transact_get` checks it against the **fetched result** instead,
+  right after its own quiescent read and before projection — a transaction
+  has no partial result, so the whole call fails `ValidationException`
+  with nothing returned. `BatchGetItem`'s own 16 MiB cap is **not an
+  error**: the `Operation::BatchGetItem` arm accumulates `item_size` over
+  fetched items in request order and, the moment the next one would push
+  the running total over the cap, latches a `budget_exhausted` flag —
+  every key from there on (the one that tipped it over, and every key
+  after) goes to `UnprocessedKeys` instead, without even being read (this
+  arm already fetches one key at a time, never a concurrent fan-out, so
+  skipping the read costs nothing extra once the budget is spent). Tests:
+  `sim_cluster_dynamo_byte_caps.rs`; wire-level decode-boundary unit tests
+  live in `animus_dynamo::wire`'s `byte_cap_tests` module (deliberately
+  separate from its big pre-existing `tests` module).
+
   Regression: `animus-dynamo`'s `wire` unit tests plus `tests/
   dynamo_index_scan.rs`/`kind_scan.rs` end to end.
 

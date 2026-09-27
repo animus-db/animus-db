@@ -25,9 +25,9 @@ fn env_seed(default: u64) -> u64 {
 fn put_item_rejects_an_empty_partition_key() {
     let seed = env_seed(0x0848_0001);
     let mut cluster = SimCluster::new(seed, 1, 1);
-    cluster.create_table("t");
+    cluster.create_table("tbl");
 
-    let body = br#"{"TableName":"t","Item":{"pk":{"S":""},"sk":{"S":"s1"}}}"#;
+    let body = br#"{"TableName":"tbl","Item":{"pk":{"S":""},"sk":{"S":"s1"}}}"#;
     let (status, resp) = cluster.dynamo(0, "DynamoDB_20120810.PutItem", body);
     assert_eq!(
         status, 400,
@@ -48,9 +48,9 @@ fn put_item_rejects_an_empty_partition_key() {
 fn put_item_rejects_an_empty_sort_key() {
     let seed = env_seed(0x0848_0002);
     let mut cluster = SimCluster::new(seed, 1, 1);
-    cluster.create_table("t");
+    cluster.create_table("tbl");
 
-    let body = br#"{"TableName":"t","Item":{"pk":{"S":"p1"},"sk":{"S":""}}}"#;
+    let body = br#"{"TableName":"tbl","Item":{"pk":{"S":"p1"},"sk":{"S":""}}}"#;
     let (status, resp) = cluster.dynamo(0, "DynamoDB_20120810.PutItem", body);
     assert_eq!(
         status, 400,
@@ -68,9 +68,9 @@ fn put_item_rejects_an_empty_sort_key() {
 fn put_item_accepts_an_empty_non_key_string() {
     let seed = env_seed(0x0848_0003);
     let mut cluster = SimCluster::new(seed, 1, 1);
-    cluster.create_table("t");
+    cluster.create_table("tbl");
 
-    let body = br#"{"TableName":"t","Item":{"pk":{"S":"p1"},"sk":{"S":"s1"},"note":{"S":""}}}"#;
+    let body = br#"{"TableName":"tbl","Item":{"pk":{"S":"p1"},"sk":{"S":"s1"},"note":{"S":""}}}"#;
     let (status, resp) = cluster.dynamo(0, "DynamoDB_20120810.PutItem", body);
     assert_eq!(
         status, 200,
@@ -80,7 +80,7 @@ fn put_item_accepts_an_empty_non_key_string() {
     let (status, item) = cluster.dynamo(
         0,
         "DynamoDB_20120810.GetItem",
-        br#"{"TableName":"t","Key":{"pk":{"S":"p1"},"sk":{"S":"s1"}},"ConsistentRead":true}"#,
+        br#"{"TableName":"tbl","Key":{"pk":{"S":"p1"},"sk":{"S":"s1"}},"ConsistentRead":true}"#,
     );
     assert_eq!(status, 200, "seed={seed}: {item}");
     assert!(

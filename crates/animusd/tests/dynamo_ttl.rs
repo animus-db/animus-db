@@ -167,18 +167,18 @@ async fn expired_item_is_still_readable_immediately() {
         support::start_single_node(&dir.path().join("n"), StorageBackend::default()).await;
     await_node_bootstrap(&node).await;
     let addr = config.nodes[0].dynamo;
-    create_table(addr, "t").await;
-    enable_ttl(addr, "t", "expiresAt").await;
+    create_table(addr, "tbl").await;
+    enable_ttl(addr, "tbl", "expiresAt").await;
 
     let past = now_secs() - 3600;
     put_item(
         addr,
-        "t",
+        "tbl",
         &format!(r#"{{"id":{{"S":"a"}},"expiresAt":{{"N":"{past}"}}}}"#),
     )
     .await;
     assert!(
-        item_present(addr, "t", "a").await,
+        item_present(addr, "tbl", "a").await,
         "an expired item must stay visible until the reaper actually deletes it"
     );
 

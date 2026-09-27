@@ -255,7 +255,7 @@ fn run_a_a_mixed_control_only_data_only_cluster_boots_and_serves(seed: u64) {
     // works in a cluster that also has data-only nodes present (this
     // fixture's own `sim_cluster_control_only.rs` already proves this in
     // isolation; this scenario is the composition proof).
-    let (status, body) = create_table(&mut cluster, leader, "a");
+    let (status, body) = create_table(&mut cluster, leader, "tba");
     assert_eq!(status, 200, "seed={seed}: CreateTable failed: {body}");
 
     // Every data-only node's own mirror must eventually show the table —
@@ -266,7 +266,7 @@ fn run_a_a_mixed_control_only_data_only_cluster_boots_and_serves(seed: u64) {
             Duration::from_secs(10),
             seed,
             &format!("data-only node {n}'s own mirror catching up on table `a`"),
-            |c| c.metadata(n).has_table_tablet("a"),
+            |c| c.metadata(n).has_table_tablet("tba"),
         );
     }
 
@@ -282,10 +282,10 @@ fn run_a_a_mixed_control_only_data_only_cluster_boots_and_serves(seed: u64) {
         |c| !c.hosted_tablets(3).is_empty(),
     );
     cluster
-        .put(3, "a", "pk1", "sk1", b"v1")
+        .put(3, "tba", "pk1", "sk1", b"v1")
         .unwrap_or_else(|e| panic!("seed={seed}: put via a data-only node failed: {e}"));
     let got = cluster
-        .get(3, "a", "pk1", "sk1", true)
+        .get(3, "tba", "pk1", "sk1", true)
         .unwrap_or_else(|e| panic!("seed={seed}: get via a data-only node failed: {e}"));
     assert_eq!(got.as_deref(), Some(&b"v1"[..]), "seed={seed}");
 
@@ -295,7 +295,7 @@ fn run_a_a_mixed_control_only_data_only_cluster_boots_and_serves(seed: u64) {
     // uses `role: "control"`, whose `claims_membership` gate never
     // inserts), so it can never be a placement candidate at all — and no
     // control-only node ever hosts a tablet as a result.
-    let tablet = tablet_of_table(&cluster, "a");
+    let tablet = tablet_of_table(&cluster, "tba");
     let meta = cluster.metadata(0);
     let replicas = meta
         .tablets
@@ -372,7 +372,7 @@ fn run_b_restart_of_a_data_only_node_catches_up_and_re_serves(seed: u64) {
     cluster.crash(target);
     cluster.run_for(Duration::from_millis(600));
 
-    let (status, body) = create_table(&mut cluster, leader, "b");
+    let (status, body) = create_table(&mut cluster, leader, "tbb");
     assert_eq!(
         status, 200,
         "seed={seed}: CreateTable (while node {target} is crashed) failed: {body}"
@@ -381,7 +381,7 @@ fn run_b_restart_of_a_data_only_node_catches_up_and_re_serves(seed: u64) {
     // Written through a DIFFERENT data-only node — `target` is crashed and
     // cannot serve or forward anything right now.
     cluster
-        .put(4, "b", "pk1", "sk1", b"v1")
+        .put(4, "tbb", "pk1", "sk1", b"v1")
         .unwrap_or_else(|e| panic!("seed={seed}: put via node 4 failed: {e}"));
 
     cluster.restart(target);
@@ -396,7 +396,7 @@ fn run_b_restart_of_a_data_only_node_catches_up_and_re_serves(seed: u64) {
         Duration::from_secs(10),
         seed,
         &format!("node {target}'s own mirror catching up on table `b`"),
-        |c| c.metadata(target).has_table_tablet("b"),
+        |c| c.metadata(target).has_table_tablet("tbb"),
     );
 
     // It re-hosts its own share of the tablet — the restarted reconciler's
@@ -420,7 +420,7 @@ fn run_b_restart_of_a_data_only_node_catches_up_and_re_serves(seed: u64) {
         &format!("node {target} serving a consistent read of the value written while it was down"),
         |c| {
             matches!(
-                c.get(target, "b", "pk1", "sk1", true),
+                c.get(target, "tbb", "pk1", "sk1", true),
                 Ok(Some(ref v)) if v.as_slice() == b"v1"
             )
         },
@@ -448,7 +448,7 @@ fn run_c_crash_of_a_data_only_replica_holder_the_rest_keep_serving_then_it_catch
     let mut cluster = new_mixed_cluster(seed);
     let leader = cluster.control_leader_index() as u64;
 
-    let (status, body) = create_table(&mut cluster, leader, "c");
+    let (status, body) = create_table(&mut cluster, leader, "tbc");
     assert_eq!(status, 200, "seed={seed}: CreateTable failed: {body}");
 
     // RF 3 across exactly 3 data-only candidates means every data-only
@@ -466,7 +466,7 @@ fn run_c_crash_of_a_data_only_replica_holder_the_rest_keep_serving_then_it_catch
     }
 
     cluster
-        .put(3, "c", "pk1", "sk1", b"v1")
+        .put(3, "tbc", "pk1", "sk1", b"v1")
         .unwrap_or_else(|e| panic!("seed={seed}: initial put failed: {e}"));
 
     let victim = 3u64;
@@ -476,14 +476,14 @@ fn run_c_crash_of_a_data_only_replica_holder_the_rest_keep_serving_then_it_catch
     // linearizable reads AND writes throughout — issued from a survivor
     // node, never `victim`.
     cluster
-        .put(4, "c", "pk2", "sk2", b"v2")
+        .put(4, "tbc", "pk2", "sk2", b"v2")
         .unwrap_or_else(|e| panic!("seed={seed}: put via a survivor failed: {e}"));
     let got = cluster
-        .get(5, "c", "pk1", "sk1", true)
+        .get(5, "tbc", "pk1", "sk1", true)
         .unwrap_or_else(|e| panic!("seed={seed}: get via a survivor failed: {e}"));
     assert_eq!(got.as_deref(), Some(&b"v1"[..]), "seed={seed}");
     let got2 = cluster
-        .get(4, "c", "pk2", "sk2", true)
+        .get(4, "tbc", "pk2", "sk2", true)
         .unwrap_or_else(|e| panic!("seed={seed}: get via a survivor failed: {e}"));
     assert_eq!(got2.as_deref(), Some(&b"v2"[..]), "seed={seed}");
 
@@ -499,7 +499,7 @@ fn run_c_crash_of_a_data_only_replica_holder_the_rest_keep_serving_then_it_catch
         &format!("node {victim} catching up to the write it missed (pk1)"),
         |c| {
             matches!(
-                c.get(victim, "c", "pk1", "sk1", true),
+                c.get(victim, "tbc", "pk1", "sk1", true),
                 Ok(Some(ref v)) if v.as_slice() == b"v1"
             )
         },
@@ -511,7 +511,7 @@ fn run_c_crash_of_a_data_only_replica_holder_the_rest_keep_serving_then_it_catch
         &format!("node {victim} catching up to the write it missed (pk2)"),
         |c| {
             matches!(
-                c.get(victim, "c", "pk2", "sk2", true),
+                c.get(victim, "tbc", "pk2", "sk2", true),
                 Ok(Some(ref v)) if v.as_slice() == b"v2"
             )
         },
@@ -533,7 +533,7 @@ fn c_crash_of_a_data_only_replica_holder_the_rest_keep_serving_then_it_catches_u
     // driver — characterized rather than re-pinned away.
     //
     // **What actually failed**: `put via a survivor failed: sim relay:
-    // timed out waiting for a reply to req_id=243`, at `cluster.put(4, "c",
+    // timed out waiting for a reply to req_id=243`, at `cluster.put(4, "tbc",
     // "pk2", "sk2", b"v2")`, issued immediately after `cluster.crash(3)`.
     // Confirmed to be a genuine stall, not slowness: re-run with `CLIENT_
     // TIMEOUT`/`OP_BUDGET` both temporarily multiplied 10x (100s/120s)
@@ -604,7 +604,7 @@ fn run_d_a_mixed_combined_plus_data_only_cluster_round_trips_and_restarts(seed: 
 
     // Issued through the combined node — the only control-bearing node in
     // this 1-voter control group.
-    let (status, body) = create_table(&mut cluster, 0, "d");
+    let (status, body) = create_table(&mut cluster, 0, "tbd");
     assert_eq!(status, 200, "seed={seed}: CreateTable failed: {body}");
 
     for n in 1..3u64 {
@@ -621,10 +621,10 @@ fn run_d_a_mixed_combined_plus_data_only_cluster_round_trips_and_restarts(seed: 
     // genuinely serving the same replicated tablet, not merely each
     // independently reachable.
     cluster
-        .put(1, "d", "pk1", "sk1", b"v1")
+        .put(1, "tbd", "pk1", "sk1", b"v1")
         .unwrap_or_else(|e| panic!("seed={seed}: put via node 1 failed: {e}"));
     let got = cluster
-        .get(2, "d", "pk1", "sk1", true)
+        .get(2, "tbd", "pk1", "sk1", true)
         .unwrap_or_else(|e| panic!("seed={seed}: get via node 2 failed: {e}"));
     assert_eq!(got.as_deref(), Some(&b"v1"[..]), "seed={seed}");
 
@@ -634,7 +634,7 @@ fn run_d_a_mixed_combined_plus_data_only_cluster_round_trips_and_restarts(seed: 
     let target = 1u64;
     cluster.crash(target);
     cluster
-        .put(2, "d", "pk2", "sk2", b"v2")
+        .put(2, "tbd", "pk2", "sk2", b"v2")
         .unwrap_or_else(|e| panic!("seed={seed}: put via node 2 (while node 1 down) failed: {e}"));
     cluster.restart(target);
 
@@ -643,7 +643,7 @@ fn run_d_a_mixed_combined_plus_data_only_cluster_round_trips_and_restarts(seed: 
         Duration::from_secs(10),
         seed,
         &format!("node {target} catching up on table `d`"),
-        |c| c.metadata(target).has_table_tablet("d"),
+        |c| c.metadata(target).has_table_tablet("tbd"),
     );
     poll_until(
         &mut cluster,
@@ -659,7 +659,7 @@ fn run_d_a_mixed_combined_plus_data_only_cluster_round_trips_and_restarts(seed: 
         &format!("node {target} catching up to the write it missed"),
         |c| {
             matches!(
-                c.get(target, "d", "pk2", "sk2", true),
+                c.get(target, "tbd", "pk2", "sk2", true),
                 Ok(Some(ref v)) if v.as_slice() == b"v2"
             )
         },
@@ -688,7 +688,7 @@ fn run_e_ddl_issued_at_a_data_only_node_succeeds_and_replicates_cluster_wide(see
     // Issued from a DATA-ONLY node's own index — its `ControlHandle::
     // Remote`'s propose-schema relay path (`ClientCtx::propose_schema`,
     // `schema.rs:133`), never a local control `RaftNode`.
-    let (status, body) = create_table(&mut cluster, 3, "e");
+    let (status, body) = create_table(&mut cluster, 3, "tbe");
     assert_eq!(
         status, 200,
         "seed={seed}: CreateTable issued at a data-only node failed: {body}"
@@ -701,7 +701,7 @@ fn run_e_ddl_issued_at_a_data_only_node_succeeds_and_replicates_cluster_wide(see
             Duration::from_secs(10),
             seed,
             &format!("node {n}'s own view catching up on table `e`"),
-            |c| c.metadata(n).has_table_tablet("e"),
+            |c| c.metadata(n).has_table_tablet("tbe"),
         );
     }
 
@@ -715,10 +715,10 @@ fn run_e_ddl_issued_at_a_data_only_node_succeeds_and_replicates_cluster_wide(see
         |c| !c.hosted_tablets(3).is_empty(),
     );
     cluster
-        .put(3, "e", "pk1", "sk1", b"v1")
+        .put(3, "tbe", "pk1", "sk1", b"v1")
         .unwrap_or_else(|e| panic!("seed={seed}: put via node 3 failed: {e}"));
     let got = cluster
-        .get(3, "e", "pk1", "sk1", true)
+        .get(3, "tbe", "pk1", "sk1", true)
         .unwrap_or_else(|e| panic!("seed={seed}: get via node 3 failed: {e}"));
     assert_eq!(got.as_deref(), Some(&b"v1"[..]), "seed={seed}");
 }

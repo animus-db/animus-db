@@ -354,7 +354,7 @@ fn run_b_restart_of_a_control_only_node_preserves_metadata(seed: u64) {
     let mut cluster = new_mixed_cluster(seed);
     let leader = cluster.control_leader_index() as u64;
 
-    let (status, body) = create_table(&mut cluster, leader, "b");
+    let (status, body) = create_table(&mut cluster, leader, "tab_b");
     assert_eq!(status, 200, "seed={seed}: CreateTable failed: {body}");
 
     let target = 3u64;
@@ -368,21 +368,21 @@ fn run_b_restart_of_a_control_only_node_preserves_metadata(seed: u64) {
 
     // The restarted node's own control `RaftNode` is genuinely fresh
     // (`MemoryEngine::new()`, no local durable log to replay) — its own
-    // view of `Metadata` catching up to show table `b` proves the control
-    // quorum actually re-formed around it via ordinary peer replication /
-    // `InstallSnapshot`, not local recovery.
+    // view of `Metadata` catching up to show table `tab_b` proves the
+    // control quorum actually re-formed around it via ordinary peer
+    // replication / `InstallSnapshot`, not local recovery.
     poll_until(
         &mut cluster,
         Duration::from_secs(10),
         seed,
-        &format!("node {target}'s own Metadata catching up on table `b`"),
-        |c| c.metadata(target).has_table_tablet("b"),
+        &format!("node {target}'s own Metadata catching up on table `tab_b`"),
+        |c| c.metadata(target).has_table_tablet("tab_b"),
     );
 
     // A fresh `CreateTable` issued THROUGH the just-restarted node must
     // still succeed — its own propose/relay path is live again, not just
     // its read side.
-    let (status2, body2) = create_table(&mut cluster, target, "b2");
+    let (status2, body2) = create_table(&mut cluster, target, "tab_b2");
     assert_eq!(
         status2, 200,
         "seed={seed}: CreateTable via the restarted control-only node failed: {body2}"
@@ -431,7 +431,7 @@ fn run_c_crash_of_a_control_only_control_leader_still_elects_and_serves_ddl(seed
     let survivor = (0..cluster.node_count() as u64)
         .find(|&n| n != leader)
         .expect("a multi-node cluster always has a survivor");
-    let (status, body) = create_table(&mut cluster, survivor, "c");
+    let (status, body) = create_table(&mut cluster, survivor, "tab_c");
     assert_eq!(
         status, 200,
         "seed={seed}: CreateTable after the control-only leader's crash failed: {body}"
@@ -482,13 +482,13 @@ fn run_d_control_only_node_serves_no_data_plane_loops(seed: u64) {
     // control-only) — this is the fixture-level mirror of "you cannot even
     // dial a control-only node's dynamo port in production."
     let leader = cluster.control_leader_index() as u64;
-    let (status, body) = create_table(&mut cluster, leader, "d");
+    let (status, body) = create_table(&mut cluster, leader, "tbd");
     assert_eq!(status, 200, "seed={seed}: CreateTable failed: {body}");
 
     let (status2, body2) = put_item_via_wire(
         &mut cluster,
         0,
-        r#"{"TableName":"d","Item":{"pk":{"S":"a"}}}"#,
+        r#"{"TableName":"tbd","Item":{"pk":{"S":"a"}}}"#,
     );
     assert_eq!(status2, 200, "seed={seed}: PutItem failed: {body2}");
 
@@ -545,7 +545,7 @@ fn run_e_restart_of_a_combined_node_in_a_mixed_cluster_still_respawns_its_ttl_lo
     let (status, body) = create_table_via_wire(
         &mut cluster,
         leader,
-        r#"{"TableName":"e",
+        r#"{"TableName":"tbe",
             "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
     );
@@ -554,7 +554,7 @@ fn run_e_restart_of_a_combined_node_in_a_mixed_cluster_still_respawns_its_ttl_lo
     let (status2, body2) = cluster.dynamo(
         0,
         "DynamoDB_20120810.UpdateTimeToLive",
-        br#"{"TableName":"e",
+        br#"{"TableName":"tbe",
              "TimeToLiveSpecification":{"Enabled":true,"AttributeName":"expiresAt"}}"#,
     );
     assert_eq!(
@@ -589,11 +589,13 @@ fn run_e_restart_of_a_combined_node_in_a_mixed_cluster_still_respawns_its_ttl_lo
     let (status3, body3) = put_item_via_wire(
         &mut cluster,
         0,
-        &format!(r#"{{"TableName":"e","Item":{{"id":{{"S":"a"}},"expiresAt":{{"N":"{past}"}}}}}}"#),
+        &format!(
+            r#"{{"TableName":"tbe","Item":{{"id":{{"S":"a"}},"expiresAt":{{"N":"{past}"}}}}}}"#
+        ),
     );
     assert_eq!(status3, 200, "seed={seed}: PutItem failed: {body3}");
 
-    let get_body = r#"{"ConsistentRead":true,"TableName":"e","Key":{"id":{"S":"a"}}}"#;
+    let get_body = r#"{"ConsistentRead":true,"TableName":"tbe","Key":{"id":{"S":"a"}}}"#;
     poll_until_reaped(&mut cluster, 0, get_body, seed);
 }
 

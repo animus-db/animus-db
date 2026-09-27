@@ -20381,6 +20381,8 @@ mod sim_cluster_dynamo_update_add_delete;
 #[cfg(test)]
 mod sim_cluster_dynamo_updated_return_values;
 #[cfg(test)]
+mod sim_cluster_dynamo_wire_limits;
+#[cfg(test)]
 mod sim_cluster_kind_batch_outcome;
 /// Issue #734: the deterministic, real-time-free sibling of
 /// `issue_298_conflict_tests` below — the identical A-decided-but-
@@ -20461,6 +20463,25 @@ mod sim_cluster_dynamo_query_pagination;
 /// tests/dynamo_query_range.rs`'s five tests.
 #[cfg(test)]
 mod sim_cluster_dynamo_query_range;
+
+/// ADR 0072 layer 3: the `Query`/`Scan` 1 MiB evaluated-page cap
+/// (`animus_dynamo::limits::MAX_QUERY_SCAN_PAGE_BYTES`) — `sim_cluster_
+/// dynamo_query_pagination.rs`'s byte-budget sibling, covering `Scan`,
+/// `Query`, `Limit`/byte-cap composition, `FilterExpression`'s
+/// evaluated-vs-matched surprise, `Select: COUNT`, a GSI `Query`, and
+/// PartiQL `ExecuteStatement` `SELECT`.
+#[cfg(test)]
+mod sim_cluster_dynamo_page_size_cap;
+
+/// ADR 0072 layer 4: the aggregate byte caps — `BatchGetItem`'s 16 MiB
+/// response-size cap (`UnprocessedKeys` pagination, never an error),
+/// `TransactWriteItems`'s 4 MiB aggregate request-size cap (decode-time
+/// `ValidationException`), and `TransactGetItems`'s 4 MiB aggregate
+/// response-size cap (`ValidationException` against the fetched result) —
+/// `sim_cluster_dynamo_page_size_cap.rs`'s own sibling for the
+/// request/response-size half of ADR 0072's catalogue.
+#[cfg(test)]
+mod sim_cluster_dynamo_byte_caps;
 
 /// ADR 0061 rung D3 PR 3a sibling: descending `Query`/pagination
 /// (`ScanIndexForward: false`), over the base table and an LSI. Replaces six

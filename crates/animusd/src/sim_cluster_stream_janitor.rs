@@ -362,7 +362,7 @@ fn poll_run_for_with_step(
 fn run_two_phase_expiry_removes_the_row_and_every_replicas_object(seed: u64) {
     let retention = Duration::from_secs(20);
     let mut cluster = SimCluster::new_with_segment_janitor_retention(seed, 3, 3, retention);
-    let table = "t";
+    let table = "tbl";
 
     let (status, body) = create_streamed_table(&mut cluster, 0, table);
     assert_eq!(status, 200, "seed={seed}: CreateTable failed: {body}");
@@ -464,7 +464,7 @@ fn two_phase_expiry_removes_the_row_and_every_replicas_object_over_seeds() {
 fn run_expiry_survives_a_control_leader_kill_mid_sweep(seed: u64) {
     let retention = Duration::from_secs(70);
     let mut cluster = SimCluster::new_with_segment_janitor_retention(seed, 3, 3, retention);
-    let table = "t";
+    let table = "tbl";
 
     let (status, body) = create_streamed_table(&mut cluster, 0, table);
     assert_eq!(status, 200, "seed={seed}: CreateTable failed: {body}");
@@ -565,7 +565,7 @@ fn run_reader_never_sees_an_empty_success_gap_across_expiry(seed: u64) {
     // expiry) into a false failure.
     let retention = Duration::from_secs(45);
     let mut cluster = SimCluster::new_with_segment_janitor_retention(seed, 3, 3, retention);
-    let table = "t";
+    let table = "tbl";
 
     let (status, body) = create_streamed_table(&mut cluster, 0, table);
     assert_eq!(status, 200, "seed={seed}: CreateTable failed: {body}");
@@ -692,7 +692,7 @@ fn reader_never_sees_an_empty_success_gap_across_expiry_over_seeds() {
 fn run_disable_grace_lifecycle_end_to_end_with_reenable_coexistence(seed: u64) {
     let retention = Duration::from_secs(5);
     let mut cluster = SimCluster::new_with_segment_janitor_retention(seed, 1, 1, retention);
-    let table = "t";
+    let table = "tbl";
 
     let (status, body) = create_streamed_table(&mut cluster, 0, table);
     assert_eq!(status, 200, "seed={seed}: CreateTable failed: {body}");
@@ -811,7 +811,7 @@ fn disable_grace_lifecycle_end_to_end_with_reenable_coexistence_over_seeds() {
 /// actually firing.
 fn run_drop_table_cascade_converges_via_the_janitor(seed: u64) {
     let mut cluster = SimCluster::new(seed, 1, 1);
-    let table = "t";
+    let table = "tbl";
 
     let (status, body) = create_streamed_table(&mut cluster, 0, table);
     assert_eq!(status, 200, "seed={seed}: CreateTable failed: {body}");
@@ -856,7 +856,7 @@ fn drop_table_cascade_converges_via_the_janitor_over_seeds() {
 /// row-bearing labels rather than just one.
 fn run_mid_grace_drop_removes_both_coexisting_labels(seed: u64) {
     let mut cluster = SimCluster::new(seed, 1, 1);
-    let table = "t";
+    let table = "tbl";
 
     let (status, body) = create_streamed_table(&mut cluster, 0, table);
     assert_eq!(status, 200, "seed={seed}: CreateTable failed: {body}");
@@ -917,7 +917,7 @@ fn mid_grace_drop_removes_both_coexisting_labels_over_seeds() {
 fn run_metrics_reflect_a_completed_retention_cycle(seed: u64) {
     let retention = Duration::from_secs(5);
     let mut cluster = SimCluster::new_with_segment_janitor_retention(seed, 1, 1, retention);
-    let table = "t";
+    let table = "tbl";
 
     let (status, body) = create_streamed_table(&mut cluster, 0, table);
     assert_eq!(status, 200, "seed={seed}: CreateTable failed: {body}");
@@ -1033,7 +1033,7 @@ fn grow_and_await_cutover(cluster: &mut SimCluster, table: &str) -> TabletId {
 /// after convergence.
 fn run_retired_parents_shards_are_not_reaped_early(seed: u64) {
     let mut cluster = SimCluster::new(seed, 3, 3);
-    let table = "rt";
+    let table = "tbrt";
 
     let (status, body) = create_streamed_table(&mut cluster, 0, table);
     assert_eq!(status, 200, "seed={seed}: CreateTable failed: {body}");
@@ -1107,7 +1107,7 @@ fn run_retired_parents_final_shard_expires_by_retention(seed: u64) {
     // itself converged.
     let retention = Duration::from_secs(50);
     let mut cluster = SimCluster::new_with_segment_janitor_retention(seed, 3, 3, retention);
-    let table = "re";
+    let table = "tbre";
 
     let (status, body) = create_streamed_table(&mut cluster, 0, table);
     assert_eq!(status, 200, "seed={seed}: CreateTable failed: {body}");
@@ -1218,7 +1218,7 @@ fn run_segment_janitor_reclaims_objects_from_a_genuinely_control_only_leader(see
     ];
     let mut cluster =
         SimCluster::new_with_roles_and_segment_janitor_retention(seed, &roles, 2, retention);
-    let table = "t";
+    let table = "tbl";
 
     // Every control voter really is control-only, and every other node is
     // data-only — the structural precondition this scenario's own title

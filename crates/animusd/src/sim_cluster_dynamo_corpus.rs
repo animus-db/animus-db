@@ -464,7 +464,7 @@ fn table_pk_sk(key: Key) -> (String, String, String) {
     let table = key / TABLE_KEY_STRIDE;
     let logical = key % TABLE_KEY_STRIDE;
     (
-        format!("t{table}"),
+        format!("tbl{table}"),
         format!("part-{}", logical % PARTITIONS),
         format!("item-{logical}"),
     )
@@ -1235,7 +1235,7 @@ async fn client_loop(
         let is_read = env.gen_below(100) < read_pct;
         if is_read {
             let t = env.gen_below(tables as u64);
-            let table = format!("t{t}");
+            let table = format!("tbl{t}");
             let kind = match env.gen_below(12) {
                 0..=4 => ReadKind::ConsistentGet,
                 5..=7 => ReadKind::EventualGet,
@@ -1879,7 +1879,7 @@ fn run_scenario(s: &Scenario) -> ScenarioResult {
     // and again right before returning; asserted at the bottom of this
     // function, once every table/probe cost this scenario paid is in.
     let cost_before = cluster.sim_stats();
-    let table_names: Vec<String> = (0..s.tables).map(|t| format!("t{t}")).collect();
+    let table_names: Vec<String> = (0..s.tables).map(|t| format!("tbl{t}")).collect();
     let mut tablets: BTreeMap<u64, TabletId> = BTreeMap::new();
     for (i, name) in table_names.iter().enumerate() {
         let tablet = cluster.create_table_with_replication(name, s.replication);

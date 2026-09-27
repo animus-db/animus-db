@@ -84,7 +84,19 @@ spawn a task" — that would reopen exactly the hole ADR 0054 exists to close.
   independent callers now — `animus-dynamo::capacity`'s `ConsumedCapacity`
   accounting (re-exported unchanged, `capacity::item_size` still resolves)
   and `update::apply_update`'s own post-fold size cap — and this is the one
-  copy both share.
+  copy both share. **Also `value_depth`/`item_depth`/`MAX_NESTING_DEPTH`**
+  (ADR 0072): the identical relationship, one level down — `animus_dynamo::
+  wire::decode_attribute_value` enforces the cap at decode time (tracking a
+  running `depth` argument so a request nested past the cap is rejected
+  before the whole structure is even built, not after), and
+  `update::apply_update` re-checks `item_depth` once on its own post-fold
+  result, since a `SET` into an already-deep item can push a value past the
+  cap even when the operand alone and the pre-update item alone were both
+  within it — the *same* shape as the size-cap re-check right above. The
+  depth-counting convention (a scalar or an empty `L`/`M` is depth 1; a
+  non-empty `L`/`M` is one more than its deepest child) is documented on
+  `MAX_NESTING_DEPTH`'s own doc comment — read it before assuming AWS's "32
+  levels" language means something else.
 - `stored` — `encode_stored_item`/`decode_stored_item`/`encode_tombstone`:
   the serialized form of an item as the data plane stores it at its key
   (`{"item": {..}}` / `{"tombstone": true}`). `decode_stored_item` returns

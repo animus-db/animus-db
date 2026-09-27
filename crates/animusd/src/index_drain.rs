@@ -3015,13 +3015,13 @@ mod gsi_drain_cursor_tests {
         timeout(Duration::from_secs(60), async {
             let dir = tempfile::tempdir().expect("tempdir");
             let node = single_node(dir.path()).await;
-            create_table_with_gsi(node.dynamo_addr(), "ht").await;
-            put_item(node.dynamo_addr(), "ht", "a0").await;
-            await_indexed(node.dynamo_addr(), "ht", "a0").await;
+            create_table_with_gsi(node.dynamo_addr(), "tht").await;
+            put_item(node.dynamo_addr(), "tht", "a0").await;
+            await_indexed(node.dynamo_addr(), "tht", "a0").await;
 
             // The drain has materialized at least one GSI row by now, so the
             // hidden table's tablet exists (lazily provisioned by the drain).
-            let hidden = index_table_name("ht", "by-g");
+            let hidden = index_table_name("tht", "by-g");
             let group = loop {
                 let meta = node.metadata();
                 if let Some((&tablet, _)) = meta.tablets_for_table(&hidden).next()
@@ -3053,7 +3053,7 @@ mod gsi_drain_cursor_tests {
                     break;
                 }
                 i += 1;
-                put_item(node.dynamo_addr(), "ht", &format!("a{i}")).await;
+                put_item(node.dynamo_addr(), "tht", &format!("a{i}")).await;
                 sleep(Duration::from_millis(50)).await;
             }
         })

@@ -19,7 +19,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::condition::{add_numeric, negate_numeric};
-use crate::size::{MAX_ITEM_SIZE_BYTES, item_size};
+use crate::size::{MAX_ITEM_SIZE_BYTES, MAX_NESTING_DEPTH, item_depth, item_size};
 use crate::{AttributeValue, Item};
 
 /// One segment of a document path: either a map key (a plain attribute name,
@@ -301,6 +301,15 @@ pub fn apply_update(mut item: Item, actions: &[UpdateAction]) -> Result<Item> {
     if item_size(&item) > MAX_ITEM_SIZE_BYTES {
         return Err(UpdateError::validation(
             "Item size has exceeded the maximum allowed size",
+        ));
+    }
+    // ADR 0072: a `SET` into an already-deep item can push a value past
+    // `MAX_NESTING_DEPTH` even when the operand alone (checked at wire-decode
+    // time) and the pre-update item alone were both within it — so the
+    // post-fold result is re-checked here, mirroring the size check above.
+    if item_depth(&item) > MAX_NESTING_DEPTH {
+        return Err(UpdateError::validation(
+            "Nesting depth of the document path exceeds the maximum allowed depth",
         ));
     }
     Ok(item)
@@ -990,6 +999,59 @@ mod tests {
         // adds 1 ("b") + 20 = 21 bytes -> MAX_ITEM_SIZE_BYTES + 12, over the cap.
         .expect_err("tips the near-cap base item over the cap");
         assert_eq!(err.code, "ValidationException");
+    }
+
+    /// A value nested `n` `M` levels deep (`n == 1` ⇒ a bare scalar leaf),
+    /// mirroring `size.rs`'s own test-only `nested_map` helper (not shared —
+    /// each module's test-only fixture stays local, per this crate's usual
+    /// convention).
+    fn nested_map(n: usize) -> AttributeValue {
+        let mut value = s("leaf");
+        for _ in 1..n {
+            let mut map = std::collections::BTreeMap::new();
+            map.insert("k".to_string(), value);
+            value = AttributeValue::M(map);
+        }
+        value
+    }
+
+    /// A `SET` into an already-deep base item's own nested path is checked
+    /// against [`MAX_NESTING_DEPTH`] on the **post-fold** result, not just
+    /// the operand alone: replacing the leaf of a 31-level-deep attribute
+    /// with a 2-level value lands exactly on the cap (accepted); a 3-level
+    /// replacement is one over (rejected) — the boundary is 32 vs. 33, this
+    /// module's documented depth-counting convention (see
+    /// [`crate::size::MAX_NESTING_DEPTH`]'s own doc).
+    #[test]
+    fn apply_update_rejects_a_post_fold_result_one_level_over_the_nesting_cap() {
+        // 30 `k` segments reach the leaf of a 31-level-deep value.
+        let path_to_leaf: Vec<PathSegment> = std::iter::once(PathSegment::Field("a".into()))
+            .chain((0..30).map(|_| PathSegment::Field("k".into())))
+            .collect();
+
+        let mut item = Item::new();
+        item.insert("a".into(), nested_map(31));
+        let out = apply_update(
+            item.clone(),
+            &[UpdateAction::Set(
+                path_to_leaf.clone(),
+                UpdateExpr::value(nested_map(2)),
+            )],
+        )
+        .expect("30 + 2 = exactly the 32-level cap is accepted");
+        assert_eq!(item_depth(&out), MAX_NESTING_DEPTH);
+
+        let err = apply_update(
+            item,
+            &[UpdateAction::Set(
+                path_to_leaf,
+                UpdateExpr::value(nested_map(3)),
+            )],
+        )
+        // 30 + 3 = 33, one level over the cap.
+        .expect_err("one level over the nesting cap is rejected");
+        assert_eq!(err.code, "ValidationException");
+        assert!(err.message.contains("Nesting depth"));
     }
 
     /// `ADD` seeds an absent attribute, increments a number, and unions a set.

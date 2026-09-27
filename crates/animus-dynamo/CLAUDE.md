@@ -22,6 +22,78 @@ request/response codec (`wire`), the `UpdateExpression`/`ConditionExpression`
 response shaping — re-exports the item-size formula itself from
 `animus-item`), `sigv4`, `streams_wire`, and `ttl`.
 
+## Service limits
+
+`limits.rs` is the one catalogue of every DynamoDB service limit AnimusDB
+enforces (ADR 0072): DynamoDB service limits are AWS-faithful and
+compiled-in, there is no "unleashed" mode. It re-exports the pre-existing
+limit constants that used to live scattered across `wire.rs`/`animus-item`
+(`MAX_ITEM_SIZE_BYTES`, the batch/transact caps, `MAX_GSI_PER_TABLE`/
+`MAX_LSI_PER_TABLE`, the throughput ceilings, `numkey::MAX_SIGNIFICANT_DIGITS`)
+unchanged. `MAX_NESTING_DEPTH` is re-exported from `animus_item` too (moved
+there in the layer-2 PR below, alongside `MAX_ITEM_SIZE_BYTES`, since
+`animus_item::update::apply_update` needs it for its own post-fold check —
+`limits.rs` no longer defines it itself). `MAX_QUERY_SCAN_PAGE_BYTES`/
+`MAX_BATCH_GET_RESPONSE_BYTES`/`MAX_BATCH_WRITE_REQUEST_BYTES`/
+`MAX_TRANSACT_BYTES` (the payload-size ceilings) remain unenforced constants
+— a later layer's job; an unused constant there is expected, not a bug.
+
+**Layer 2 of the ADR 0072 series (this layer) wired up every other
+decode-time check**: table/index name shape (`wire::check_table_or_index_name`,
+the chokepoint every `table_name()`/`decode_index_entry`/`Query`+`Scan`
+`IndexName` call funnels through, plus `RequestItems`' own table-name map
+keys in `BatchWriteItem`/`BatchGetItem` — shape is validated **before**
+existence, so a malformed name is `ValidationException`, never
+`ResourceNotFoundException`), key-schema attribute-name length
+(`decode_key_schema`), attribute-name length on every item/`Key`/
+`ExpressionAttributeNames`/nested-`ExpressionAttributeValues` name
+(`check_attribute_name`, called from `decode_item`'s top level, the `M` arm's
+nested keys, `resolve_attr_name`, and `parse_projection_segment`), nesting
+depth (`decode_attribute_value` takes a running `depth` argument so a
+request nested past the cap is rejected mid-decode, before the whole
+structure is built), expression length (`check_expression_length`, shared by
+`decode_predicate`/`decode_update_expression`/`decode_projection`/
+`decode_query`'s `KeyConditionExpression`), and the table-level
+`ProvisionedThroughput` ceiling (`decode_provisioned_throughput` — GSI-level
+`ProvisionedThroughput` was never decoded/accepted by this adapter to begin
+with, so there is nothing further to cap there). Partition/sort-key **value**
+size is the one check that lives outside `wire.rs`: `animusd::dynamo::
+resolve_key` (the pre-existing single choke point every write/point-read
+path already resolves a table's key through, right next to its
+`reject_empty_key_value` sibling) covers the base table's own key for
+`PutItem`/`GetItem`/`DeleteItem`/`UpdateItem`/`BatchWriteItem`/
+`BatchGetItem`/`TransactWriteItems`/`TransactGetItems` alike, plus a GSI/LSI
+key attribute's value when the *whole item* is available (`PutItem`, and a
+`TransactWriteItems` `Put`); `Query`'s own partition/sort-key condition
+values are checked separately in `wire::decode_query`, since a `Query` never
+resolves a key through the registry at all. **Known gap, not yet closed**:
+`UpdateItem`/`TransactWriteItems`' `Update` action resolves its key from the
+request's `Key` map alone before evaluating the update, so a `SET` that
+grows a GSI/LSI key attribute past its cap through an *existing* item is not
+caught here — closing that needs the apply-time evaluator itself to know the
+table's index schema, which `animus_item::update::apply_update` deliberately
+does not (see that module's own doc on why evaluation stays index-agnostic).
+
+**Layer 3 (`MAX_QUERY_SCAN_PAGE_BYTES`) and layer 4 (the batch/transact
+aggregate byte caps) are now wired up.** Layer 4's two request-size caps —
+`MAX_BATCH_WRITE_REQUEST_BYTES` (`BatchWriteItem`) and `MAX_TRANSACT_BYTES`
+on the `TransactWriteItems` side — are enforced at **decode time** in
+`wire.rs` (`decode_batch_write`/`decode_transact_write`), since the request
+itself already carries every item's bytes; `MAX_BATCH_GET_RESPONSE_BYTES`
+(`BatchGetItem`) and `MAX_TRANSACT_BYTES` on the `TransactGetItems` side are
+enforced in `animusd::dynamo` instead, against the **fetched result**, since
+their requests (keys only) can never carry enough bytes to trip either cap
+— see `docs/lessons/code-patterns/2026-09-22-an-aggregate-byte-cap-belongs-
+at-whichever-side-request-or.md` for the general shape. `BatchWriteItem`'s
+own 16 MiB cap is checked but currently unreachable via the wire (25 items ×
+400 KB tops out at 10 MB) — its own unit test (`byte_cap_tests` in
+`wire.rs`) exercises the check function directly rather than through
+`decode_request`, since the decode path itself can't reach it. `wire.rs`'s
+big pre-existing `tests` module and this file's `byte_cap_tests` module are
+deliberately separate (a sibling layer of the same series edits `tests`
+concurrently) — new wire-level unit tests for a byte/size cap belong in
+`byte_cap_tests`, not appended to `tests`.
+
 ## Entry points
 
 Module-by-module pointers — every module here is pure (no I/O/storage/
