@@ -1104,6 +1104,43 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     // doc for why a latch produced a real livelock). Default `false`; only
     // ever set via that method.
     state_machine_behind: bool,
+    // The `last_index` of the most recently fully-received `InstallSnapshot`
+    // THIS node installed, this process lifetime (never persisted — `None`
+    // on every fresh/recovered core, exactly like `incoming_snapshot`
+    // itself). Distinct from `snapshot_index`/`last_applied` (which a
+    // recovered-from-WAL core can carry forward from a PRIOR lifetime, and
+    // which `handle_install_snapshot`'s own top-of-function short-circuit
+    // deliberately does NOT trust while `state_machine_behind` — see that
+    // check's own doc for the wipe-recovery case it exists to catch).
+    //
+    // **Closes a duplicate-reprocessing gap in that same short-circuit**
+    // (found live building `SNAPSHOT_CHUNK_BYTES`'s bump): while
+    // `state_machine_behind` is true, `handle_install_snapshot` falls
+    // through UNCONDITIONALLY to the normal reassembly path — correct for a
+    // wiped engine (the top-of-function doc's own reasoning: an offer at
+    // the SAME `snapshot_index`/`last_applied` this node's intact log
+    // already reflects is exactly the case the wipe fix must not discard).
+    // But under a sustained write load, a leader's own `SnapshotResend::
+    // Always` resends the SAME already-fully-received final chunk on every
+    // wake before it has processed this node's first completion ack (a real
+    // round trip, not instant) — and every one of those, while this node is
+    // still digesting the FIRST copy, re-enters the "fresh" branch (`self.
+    // incoming_snapshot` was already cleared by the completion) and
+    // re-completes from scratch: another genuine-looking `InstallSnapshotResp
+    // { last_index > 0, .. }`, inflating `Metric::CpSnapshotInstalls` and
+    // forcing another full WAL rewrite, for data this node already has.
+    // Correctness was never at risk (reinstalling identical bytes is a
+    // no-op either way — the top-of-function doc's own point) but the
+    // *count* and the repeated WAL rewrite are real, measured cost (up to
+    // ~140 redundant re-installs of one 149-entry image for a single
+    // merely-8ms-slowed voter, `docs/engineering-lessons.md`'s matching
+    // entry). Recording the last EXACT `last_index` actually installed and
+    // short-circuiting an identical re-offer regardless of
+    // `state_machine_behind` closes this while leaving the wipe case
+    // untouched: a freshly recovered core's `last_installed_index` is
+    // `None` this lifetime, so its first offer — at whatever index — always
+    // falls through exactly as before.
+    last_installed_index: Option<u64>,
 
     // --- Quiescence (ADR 0044 phase-1 PR3). `None` (the default, set by every
     // constructor) is byte-identical to pre-PR3 behavior: the entry predicate
@@ -1304,6 +1341,7 @@ where
             pending_install: None,
             snapshot_needed: false,
             state_machine_behind: false,
+            last_installed_index: None,
             pending: Vec::new(),
             persisted_hard: (0, None),
             snapshot_dirty: false,
@@ -3782,7 +3820,16 @@ where
         // `last_applied` instead catches this: it is this node's own
         // up-to-date "how far have I actually gotten," not a proxy that
         // lags behind it.
-        if last_index <= self.last_applied && !self.state_machine_behind {
+        // `last_installed_index`'s own doc: an exact duplicate of the last
+        // image THIS node fully installed is always redundant, regardless
+        // of `state_machine_behind` — unlike `last_applied`/`snapshot_index`,
+        // it is never inherited from a prior lifetime, so it cannot
+        // misfire on the wipe-recovery case the `state_machine_behind`
+        // guard below exists for.
+        let duplicate_of_last_install = self.last_installed_index == Some(last_index);
+        if duplicate_of_last_install
+            || (last_index <= self.last_applied && !self.state_machine_behind)
+        {
             self.incoming_snapshot = None;
             // This used to echo `last_index: self.snapshot_index` — nonzero
             // the instant this node has ever compacted at all, which made
@@ -3866,6 +3913,11 @@ where
                 .incoming_snapshot
                 .take()
                 .expect("present when complete");
+            // `last_installed_index`'s own doc: record BEFORE returning below,
+            // regardless of which state-machine branch handles it, so a
+            // resent duplicate of THIS exact completion is caught next time
+            // even while `state_machine_behind` stays true.
+            self.last_installed_index = Some(inc.last_index);
             // Advance the snapshot base + reset the log/applied state common to both
             // state-machine kinds.
             let install = |core: &mut Self| {

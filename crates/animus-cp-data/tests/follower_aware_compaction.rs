@@ -142,7 +142,20 @@ fn a_modestly_slowed_voter_catches_up_via_append_entries_without_ever_needing_a_
     // below is what this PR's fix must hold to: nowhere close to the flood
     // (thousands to tens of thousands of installs/chunks for a peer this
     // mildly behind) that motivated it.
-    const MAX_TOLERATED_INSTALLS: u64 = ROUNDS / 20;
+    //
+    // **Tightened alongside `RaftCore::last_installed_index`** (found
+    // building the `SNAPSHOT_CHUNK_BYTES` bump to 64 KiB, which turned this
+    // bound's own prior slack — `ROUNDS / 20` = 60 — into 149 measured
+    // installs at this exact seed: almost all of them a resent duplicate
+    // of the SAME already-installed image being redundantly reprocessed
+    // and recounted while this voter's digest was still catching up, not
+    // 149 genuinely distinct snapshots). With that fixed, this seed
+    // measures exactly 2 — one on-demand image build plus one duplicate
+    // still let through by the `state_machine_behind` fallthrough's own
+    // window before the leader's next chunk send observes the completion —
+    // nowhere near a bound that could hide a regression back toward the
+    // old flood.
+    const MAX_TOLERATED_INSTALLS: u64 = 10;
     assert!(
         total_installs <= MAX_TOLERATED_INSTALLS,
         "seed={seed}: a voter only modestly slowed (sync_delay={SLOW_VOTER_SYNC_DELAY:?}), \

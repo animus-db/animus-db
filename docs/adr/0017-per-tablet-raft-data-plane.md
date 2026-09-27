@@ -1129,3 +1129,79 @@ bumped well past the new cap so that voter is still excluded from the
 floor and the test still reaches the chunked-snapshot path it was written
 to exercise — their assertions are unchanged, only the setup needed to
 still take that path.
+
+## Amendment (2026-09-27, `SNAPSHOT_CHUNK_BYTES` bump follow-up) — a resent duplicate `InstallSnapshot` chunk must not be reprocessed while the receiver is still digesting the first copy
+
+Raising `SNAPSHOT_CHUNK_BYTES` from 1 KiB to 64 KiB (so a real transfer
+completes in one or two round trips instead of hundreds) turned the
+residual "small number of installs" this ADR's prior amendment already
+flagged and tolerated for a plain retained voter into a measured 149
+`Metric::CpSnapshotInstalls` at `follower_aware_compaction.rs`'s own
+pinned seed (`0x5324_1001` / `1394872321`) for a voter with a merely 8ms
+disk round-trip cost, never partitioned, never crashed — bound was 60.
+
+**The suspected mechanism going in** (a leader compacting past the
+retained voter's own `match_index` the moment ANY peer's on-demand image
+build bypasses `compaction_floor`, per this ADR's own prior amendment's
+"two cases deliberately exempted from the clamp") turned out to be only a
+minor contributor: instrumented against the pinned seed, that bypass
+(`apply_and_compact`'s `image_needed` branch forcing the base straight to
+`ea`) fired only twice in the whole run. **The actual mechanism, confirmed
+live**: of the 149 counted installs, 141 were `Metric::CpSnapshotInstalls`
+for the exact same `last_index` (147) — a SINGLE genuine image, redundantly
+reprocessed. `RaftCore::handle_install_snapshot`'s top-of-function
+short-circuit (added by the redundant-snapshot-ack fix earlier the same
+day) deliberately falls through to full reassembly, unconditionally,
+whenever `state_machine_behind` is true — correct for the wipe-recovery
+case that fix exists for (a restarted node's intact log offers the SAME
+`last_applied` a fresh, empty engine must not discard as "already have
+it"), but it also means: while this voter's own async apply task was still
+digesting the first copy of a small image, the leader's `SnapshotResend::
+Always` kept resending that SAME already-fully-received final chunk on
+every propose-wake (a genuine round trip, not instant, so several wakes
+land before the leader processes the first completion), and EVERY one of
+those re-entered the "fresh" branch (`incoming_snapshot` had already been
+cleared by the prior completion) and re-completed from scratch — another
+genuine-looking `InstallSnapshotResp { last_index: 147, .. }`, each
+counted as a new install and each forcing another full WAL rewrite.
+Correctness was never at risk (reinstalling identical bytes is a no-op
+either way, exactly as the redundant-snapshot-ack fix's own doc already
+reasoned for the "not behind" case), but the count and the repeated WAL
+rewrite are real cost, and the self-resembling shape (same `last_index`,
+over and over) is indistinguishable from this ADR's own targeted flood
+without looking at the actual repeated value.
+
+**The fix**: `RaftCore::last_installed_index` (`Option<u64>`, volatile,
+never persisted or inherited across a restart — unlike `last_applied`/
+`snapshot_index`, which the wipe-recovery short-circuit deliberately does
+NOT trust while `state_machine_behind`). Set to `Some(last_index)` the
+moment a chunked install actually completes; checked, REGARDLESS of
+`state_machine_behind`, at the very top of `handle_install_snapshot`: an
+offer whose `last_index` exactly matches the last one this node itself
+just finished installing is always a pure duplicate and is answered with
+the existing "no completion happened" reply (`last_index: 0`) without
+re-entering reassembly, re-completing, or re-triggering a WAL rewrite. A
+freshly recovered core's `last_installed_index` is `None` this lifetime
+regardless of what `snapshot_index`/`last_applied` its WAL restored, so
+the wipe-recovery scenario (`engine_wipe_needs_snapshot.rs`) is untouched
+— its first offer, at whatever index, still falls through exactly as
+before this fix.
+
+With this in place, the pinned seed drops from 149 installs to 2, and a
+21-seed sweep (the pinned seed plus 20 arbitrary others, via a temporary
+env-var seed override used only for verification, never committed) all
+land in single digits — `crates/animus-cp-data/tests/
+follower_aware_compaction.rs`'s own bound was tightened from `ROUNDS / 20`
+(60) to `10` accordingly (never loosened). The two-events-only
+`image_needed` bypass this investigation set out to check is left as-is:
+it is the deliberate, documented "the image reflects the engine's CURRENT
+state, so the base must match it exactly" exemption from the prior
+amendment, not a bug — a handful of unavoidable on-demand images is
+exactly what that amendment already predicted and tolerated. A sweep of
+the same 21 seeds also surfaced an unrelated pre-existing issue, present
+identically on the code before this fix: for some seeds the leader's own
+log fails to compact at all against this same modestly-slowed voter
+(`leader_log_len` in the hundreds against the test's own `< 500` bound) —
+reproducible independent of this change, not fixed here, and not gating
+this PR (`crates/animus-cp-data/tests/follower_aware_compaction.rs`'s own
+pinned seed does not exhibit it); left for separate follow-up.
