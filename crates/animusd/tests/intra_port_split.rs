@@ -217,6 +217,7 @@ async fn client_port_refuses_intra_traffic_intra_port_serves_it() {
             table: table.to_string(),
             writes: Vec::new(),
             change_log: Vec::new(),
+            housekeeping: false,
         },
     )
     .await;

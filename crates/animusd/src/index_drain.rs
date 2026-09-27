@@ -2629,30 +2629,28 @@ async fn trim_janitor(
         writes.push((KIND_CHANGE, key, None));
         if writes.len() >= TRIM_BATCH {
             let n = writes.len() as u64;
-            ctx.cp_kind_write_raw(table, std::mem::take(&mut writes), Vec::new())
+            // Issue #974/#1037: this is a `KindBatch` propose that shares
+            // `CpProposalsAccepted` with every real client write on this
+            // group (see that metric's own doc) — `_housekeeping` marks it
+            // as housekeeping in the same synchronous step as the propose's
+            // own acceptance, not after this call's confirm/apply wait
+            // returns (the #974 fix's original shape, which left a real
+            // window for a concurrent `/metrics` scrape to land in — see
+            // `cp_kind_write_raw_housekeeping`'s own doc).
+            ctx.cp_kind_write_raw_housekeeping(table, std::mem::take(&mut writes), Vec::new())
                 .await?;
             ctx.data()
                 .raftkv_metrics
                 .incr_by(Metric::ChangeLogTrimmedTotal, n);
-            // Issue #974: this is a `KindBatch` propose that shares
-            // `CpProposalsAccepted` with every real client write on this
-            // group (see that metric's own doc) — recorded separately here,
-            // the one place that knows this particular accepted propose was
-            // housekeeping rather than a client-caused write.
-            ctx.data()
-                .raftkv_metrics
-                .incr(Metric::CpHousekeepingProposalsAccepted);
         }
     }
     if !writes.is_empty() {
         let n = writes.len() as u64;
-        ctx.cp_kind_write_raw(table, writes, Vec::new()).await?;
+        ctx.cp_kind_write_raw_housekeeping(table, writes, Vec::new())
+            .await?;
         ctx.data()
             .raftkv_metrics
             .incr_by(Metric::ChangeLogTrimmedTotal, n);
-        ctx.data()
-            .raftkv_metrics
-            .incr(Metric::CpHousekeepingProposalsAccepted);
     }
     Ok(())
 }

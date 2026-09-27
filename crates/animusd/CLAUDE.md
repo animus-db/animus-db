@@ -908,14 +908,28 @@ exactly as before.
   `cp_kind_write_raw` call goes through the exact same
   `RaftKvNode::put_kind_batch`/`record_propose` choke point a client's own
   `KindBatch` write does — nothing below that point can tell the two apart.
-  `trim_janitor` now also increments `Metric::CpHousekeepingProposalsAccepted`
-  at its own call site (the one place that knows a given accepted propose is
-  housekeeping, not a reaction to a client request), so a caller that needs
-  "proposals a client write actually caused" over some window can subtract
-  that counter's own delta from `CpProposalsAccepted`'s. See
-  `tests/batch_write.rs`'s module doc for the investigation (a same-tick
-  trim landing inside a metrics-scraping test's own before/after window,
-  not a duplicate propose from any confirm-loop retry) and `crates/
+  `trim_janitor` calls `ClientCtx::cp_kind_write_raw_housekeeping` (issue
+  #1037, not the plain `cp_kind_write_raw` a client write uses) so that
+  `Metric::CpHousekeepingProposalsAccepted` gets marked in the **same
+  synchronous step** as the propose's own acceptance
+  (`write_path::cp_kind_raw_local`'s `housekeeping` argument, right after
+  `put_kind_batch` returns `Accepted`, before the confirm/apply wait that
+  follows) — not, as #974's original fix had it, one layer up in
+  `trim_janitor` itself after that whole call (confirm loop included) had
+  already returned. The post-confirm shape left a real window in which
+  `CpProposalsAccepted` had counted the trim's propose but
+  `CpHousekeepingProposalsAccepted` had not yet, wide enough for a
+  concurrent `/metrics` scrape to read the trim back as an unattributed
+  client write — worse under CPU contention, since a loaded scheduler
+  widens the confirm loop's own real elapsed time. A caller that needs
+  "proposals a client write actually caused" over some window still
+  subtracts `CpHousekeepingProposalsAccepted`'s own delta from
+  `CpProposalsAccepted`'s; that arithmetic didn't change, only *when* the
+  subtrahend becomes visible. See `tests/batch_write.rs`'s module doc for
+  the full investigation (both #974's original finding and #1037's
+  follow-up), `write_path::
+  cp_kind_raw_local_housekeeping_attribution_tests` for the seeded
+  regression that pins the same-step invariant directly, and `crates/
   animus-env/src/metrics.rs`'s `CpHousekeepingProposalsAccepted` doc.
   **`clear_backfill_cursor`**
   (ADR 0045 §5 step 3) is a fifth, on-demand (not per-tick) function in this
