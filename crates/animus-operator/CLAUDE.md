@@ -253,7 +253,8 @@ binary for a build-time-only JSON shape. **Keeping that mirror in sync with
   the combined branch whenever `AnimusClusterSpec.split_mode` was set,
   which made any cluster spec setting `splitMode` fail at pod startup;
   `split_mode` has been removed from `AnimusClusterSpec` entirely (there is
-  no back-compat promise in this repo, ADR 0060/root `CLAUDE.md`), so
+  no back-compat promise for a pre-baseline change like this one, ADR
+  0060/ADR 0073/root `CLAUDE.md`), so
   there is no flag left to conditionally emit. See
   `entrypoint_flags_are_all_accepted_by_animusd` in `desired::
   cluster_config`'s tests for the regression coverage (every `--flag`
