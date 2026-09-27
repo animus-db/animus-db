@@ -1519,6 +1519,54 @@ rows this section used to carry were fixed by the stale-prose sweep.
   amendment's own "what remains unowned" accounting and `crates/animusd/
   CLAUDE.md`'s consolidated closed-C-15 appendix.
 
+### C-16 Upgrade compatibility (ADR 0073) — proposal only, not sized
+
+- **Gap:** `website/index.html` lists "On-disk format stability, then
+  rolling upgrades" as **Planned**, but nothing backed that claim — no ADR,
+  no roadmap entry, no issue. Root `CLAUDE.md`'s no-back-compat rule and
+  ADR 0060's "Upgrades: None, by design" are both real and both correct for
+  today's pre-alpha stance; this item closes the *documentation* gap (the
+  website was making a claim with no plan behind it) without changing that
+  stance. [ADR 0073](adr/0073-upgrade-compatibility.md) is the plan: a
+  proposal skeleton with a full inventory of every persisted/wire format
+  (a majority of them — the LSM WAL, the control-plane Raft WAL/snapshot,
+  `Metadata`'s own schema, `SharedWal`'s tagging envelope, the per-tablet
+  key layout, the hash-ring token/key encoding, every internal `Network`
+  message enum, `ClusterConfig`, the operator CRD's real schema, and the
+  backup manifest body — carry **no version tag at all today**), plus four
+  proposed phases (version-tag everything + golden fixtures; on-disk N-1
+  stability, backups/PITR first; a replicated cluster-version/feature-gate
+  for mixed-version wire compatibility; rolling-upgrade orchestration
+  including operator `spec.image` support) ahead of any change to the
+  no-back-compat rule itself.
+- **Plan:** as ADR 0073's four phases lay out. None are scheduled or sized
+  here — this entry exists so the gap is tracked, not so the work is
+  queued. Phase 0 (version-tagging + golden fixtures) is the natural first
+  pickup: it is pure defensive plumbing with no runtime behavior change and
+  no ADR amendment beyond bumping the version constants it touches.
+- **Reuse:** the magic + version byte + loud named error pattern already
+  proven by the LSM manifest, the RaftKV command codec (`codec.rs`,
+  `VERSION = 31`), the segment codec (`segment.rs`, `VERSION = 2`), the
+  backup data-chunk codec, and the encryption envelope (`encrypted.rs`,
+  `VERSION = 1`); ADR 0035's additive-`#[serde(default)]` discipline for
+  config/wire structs, already proven for a real mixed-version window.
+- **Tests:** ADR 0073's Testing section — golden fixtures per format; a
+  new `SimCluster`-based upgrade/restart/finalize corpus with a per-node
+  selectable version knob (proposed depth knob `ANIMUS_UPGRADE_SEEDS`,
+  following the existing `ANIMUS_*_SEEDS` convention); a `kind` e2e for the
+  operator's rolling-restart path, once Phase 3 exists.
+- **ADR:** [0073](adr/0073-upgrade-compatibility.md) (Proposed — the plan
+  itself; each phase would need its own implementation PR(s) once picked
+  up).
+- **Size:** XL overall across all four phases; Phase 0 alone is roughly M
+  (mechanical, one format at a time, no design risk).
+- **Depends:** none to *start* Phase 0. Phase 2 depends on `Metadata`
+  already being the natural home for a cluster version (ADR 0038). Phase 3
+  depends on ADR 0032 (drain) and ADR 0037 (admin API) for its
+  orchestration primitives, and on ADR 0060 for the operator's own
+  `spec.image` handling.
+- **Status:** not started; no phase has an owner or a target wave.
+
 ## 4. Operator surfaces: admin API, dashboard, console, CLI
 
 Conventions (verified): a new admin route needs a match arm in
