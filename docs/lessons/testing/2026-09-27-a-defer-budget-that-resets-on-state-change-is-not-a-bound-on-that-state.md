@@ -18,7 +18,7 @@ the 512-entry ceiling in well under a second, far faster than a real
 multi-chunk transfer to that peer could land. The result was a tight,
 self-sustaining restart cycle: tens of thousands of `InstallSnapshot` chunk
 ships per node over a couple of minutes, zero completed installs, a learner's
-`match_index` pinned for the entire run (issue #1046).
+`match_index` pinned for the entire run (PR #1047).
 
 **The generalizable lesson**: a fixed ceiling on some accumulating quantity
 (`behind`, here) that gets RESET every time the thing it is meant to bound

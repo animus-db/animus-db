@@ -100,7 +100,7 @@ const WRITE_BURSTS: u64 = 300;
 /// `DRAIN_POLL_GAP` of virtual time) to check whether the learner has
 /// caught up before giving up.
 ///
-/// Raised from `300` to `1500` by issue #1046's fix: `lib.rs`'s
+/// Raised from `300` to `1500` by PR #1047's fix: `lib.rs`'s
 /// `threshold_hit` gate no longer forces a still-*advancing* transfer out
 /// early just because `behind` crossed the old, much lower
 /// `COMPACT_DEFER_CEILING` (superseded by `COMPACT_DEFER_EMERGENCY_

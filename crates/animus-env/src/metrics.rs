@@ -197,7 +197,7 @@ pub enum Metric {
     /// peer's chunked `InstallSnapshot` transfer was still genuinely in flight
     /// (`RaftCore::snapshot_transfer_in_flight()` true at the moment
     /// `snapshot_upto` was called) — `snapshot_upto` unconditionally invalidates
-    /// that transfer's progress and the peer restarts from chunk 0 (issue #1046).
+    /// that transfer's progress and the peer restarts from chunk 0 (PR #1047).
     /// A high rate relative to [`CpSnapshotInstalls`] is the flood signature: many
     /// restarts, few or no completed installs. See `animus-cp-data`'s
     /// `COMPACT_DEFER_EMERGENCY_CEILING`/`COMPACT_DEFER_IDLE_CEILING` docs for the

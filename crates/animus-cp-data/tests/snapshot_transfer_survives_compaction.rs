@@ -1,4 +1,4 @@
-//! Regression for issue #1046: a threshold-triggered compaction must not
+//! Regression for PR #1047: a threshold-triggered compaction must not
 //! force a still-*advancing* chunked `InstallSnapshot` transfer back to
 //! chunk 0 just because `behind` crossed a fixed, small ceiling.
 //!
@@ -117,7 +117,7 @@ fn snapshot_transfer_lands_under_sustained_writes_and_a_slow_learner() {
     // The learner's own disk carries a large round-trip cost — modeling a
     // node under heavy real CPU contention across many tablet groups
     // (30-90 groups/node, single-threaded consensus loop per node, the
-    // field evidence issue #1046 was filed against).
+    // field evidence PR #1047 was opened against).
     let mut learner_disk = DiskConfig::default();
     learner_disk.set_sync_delay(Duration::from_millis(200));
     sim.set_disk_config_for(nid(3), learner_disk);
@@ -223,7 +223,7 @@ fn snapshot_transfer_lands_under_sustained_writes_and_a_slow_learner() {
          leader's log after a sustained per-item writer of {WRITE_BURSTS}x{BURST_LEN} writes, drained for up \
          to {:.1}s of real time (leader commit_index observed at {last_seen_commit}, \
          total_ships={total_ships}, total_installs={total_installs}, \
-         transfer_restarts={total_restarts}) — issue #1046",
+         transfer_restarts={total_restarts}) — PR #1047",
         start.elapsed().as_secs_f64(),
     );
     assert!(
@@ -241,7 +241,7 @@ fn snapshot_transfer_lands_under_sustained_writes_and_a_slow_learner() {
         total_restarts <= 5,
         "seed={seed}: {total_restarts} forced snapshot-transfer restarts recorded (a \
          genuinely-advancing transfer should not be forced back to chunk 0 by `behind` alone \
-         any more) — issue #1046's flood signature"
+         any more) — PR #1047's flood signature"
     );
     // Every chunk shipped per genuine offset advance should stay small —
     // the pre-fix flood shipped the SAME unacked offset over and over
@@ -251,7 +251,7 @@ fn snapshot_transfer_lands_under_sustained_writes_and_a_slow_learner() {
         assert!(
             ships_per_advance <= 20,
             "seed={seed}: {ships_per_advance} chunk ships per genuine offset advance \
-             ({total_ships} ships / {advances} advances) — issue #1046's flood signature"
+             ({total_ships} ships / {advances} advances) — PR #1047's flood signature"
         );
     }
 }
@@ -336,7 +336,7 @@ fn a_stalled_partitioned_peer_does_not_block_compaction_forever() {
         "seed={seed}: leader's own uncompacted log tail grew to {log_len} entries against a \
          permanently partitioned peer (snapshot_index={snapshot_index}, \
          commit_index={commit_index}) — compaction must proceed despite a stalled transfer \
-         (COMPACT_DEFER_IDLE_CEILING), never wedge on it forever — issue #1046"
+         (COMPACT_DEFER_IDLE_CEILING), never wedge on it forever — PR #1047"
     );
     assert!(
         snapshot_index > 0,

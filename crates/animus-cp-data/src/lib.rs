@@ -1502,7 +1502,7 @@ const COMPACT_THRESHOLD: u64 = 64;
 /// `snapshot_upto` restarted it from chunk 0 on a tight, self-sustaining
 /// cycle: tens of thousands of chunk ships per node over a couple of
 /// minutes, zero completed installs, a learner's `match_index` pinned
-/// forever (issue #1046). A budget that resets to zero every time the
+/// forever (PR #1047). A budget that resets to zero every time the
 /// state it is bounding changes is not a bound on THAT state; it is a bound
 /// on how far the state can move BETWEEN resets — see
 /// `docs/lessons/testing/2026-09-27-a-defer-budget-that-resets-on-state-
@@ -1531,7 +1531,7 @@ const COMPACT_DEFER_EMERGENCY_CEILING: u64 = COMPACT_THRESHOLD * 64;
 /// rationale, and the two rejected earlier designs, mirrored here exactly):
 /// an **idle-progress-gated** companion to
 /// [`COMPACT_DEFER_EMERGENCY_CEILING`]'s `behind`-sized one — and, since
-/// issue #1046, the PRIMARY signal deciding whether to force a still-in-
+/// PR #1047, the PRIMARY signal deciding whether to force a still-in-
 /// flight transfer out early; the emergency ceiling now only bounds worst-
 /// case WAL retention, never ordinary "is this transfer stalled" policy —
 /// tracked entirely in this driver loop (`apply_and_compact`'s own
@@ -9967,7 +9967,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
             transfer_progress,
         )
     };
-    // Issues #532/#537 (and issue #1046's amendment below): a
+    // Issues #532/#537 (and PR #1047's amendment below): a
     // THRESHOLD-triggered base advance (never an `image_needed` one — a
     // peer is actively waiting on that image, so it must always proceed) is
     // deferred while some peer's chunked transfer is genuinely in flight,
@@ -9981,7 +9981,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     // just often enough to keep resetting the idle clock without ever
     // landing (see that constant's own doc for why `behind` alone used to
     // be an independent, much lower trigger here, and why that was the
-    // issue #1046 flood: it fired on a transfer that was genuinely
+    // PR #1047 flood: it fired on a transfer that was genuinely
     // advancing, just slower than the sustained write rate, restarting it
     // from chunk 0 over and over). Below both ceilings this gives a real
     // in-flight transfer a genuine window to land before the next
@@ -10004,7 +10004,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     let emergency_ceiling_hit = behind >= COMPACT_DEFER_EMERGENCY_CEILING;
     let threshold_hit = behind >= COMPACT_THRESHOLD
         && (!transfer_in_flight || idle_ceiling_hit || emergency_ceiling_hit);
-    // Issue #1046: a transfer forced out while it was still genuinely in
+    // PR #1047: a transfer forced out while it was still genuinely in
     // flight is a real restart-from-chunk-0 event, not routine compaction —
     // count it so a flood (many restarts, few/no completed installs) is
     // directly observable instead of inferred from ships-vs-installs.

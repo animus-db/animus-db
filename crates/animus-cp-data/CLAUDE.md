@@ -2071,7 +2071,7 @@ disambiguation is needed.
     2026-09-14-control-snapshot-catch-up-stall.md` for the full incident
     — including the standing lesson that any change to shared `RaftCore`
     gates on `cargo test -p animus-cp-data` run in FULL, never `--lib`.
-  - **`COMPACT_DEFER_CEILING` itself was the live flood (issue #1046,
+  - **`COMPACT_DEFER_CEILING` itself was the live flood (PR #1047,
     2026-09-27): a fixed `behind`-sized ceiling is not a "has this transfer
     stalled" signal, it is only a bound on how far `behind` can grow
     BETWEEN invalidations.** Under sustained writes fast enough relative to
