@@ -279,6 +279,109 @@ fn follower_outruns_inflight_snapshot_via_append_entries() {
     );
 }
 
+/// Regression for a second, wire-shape bug in the same short-circuit
+/// (found alongside PR #1048's `last_applied`-comparison fix above): once a
+/// follower has EVER compacted its own log (`snapshot_index() > 0`), the
+/// short-circuit's reply used to echo that follower's own `snapshot_index`
+/// as `last_index` — nonzero, and therefore byte-for-byte indistinguishable
+/// on the wire from a genuine just-completed install. Both tests above
+/// happen NOT to exercise this: their follower never calls `snapshot()`
+/// itself, so `follower.snapshot_index()` is always `0` there and the old
+/// buggy echo coincided with the fixed code's `last_index: 0` by accident.
+/// This test drives the follower into having actually compacted first.
+#[test]
+fn stale_offer_after_follower_has_compacted_does_not_impersonate_completion() {
+    let now = Nanos(1_000_000_000);
+    let mut leader = elect_leader_of_pair(now);
+    let mut follower: RaftCore = RaftCore::new(nid(1), &[nid(0), nid(1)], Nanos(0), 7);
+
+    // First batch: replicate normally, then have the FOLLOWER itself
+    // compact (unlike the tests above, where only the leader ever calls
+    // `snapshot()`), so `follower.snapshot_index() > 0`.
+    for i in 0..40u64 {
+        let _ = leader.propose(upsert(i));
+    }
+    let mut last = replicate_and_apply(&mut leader, &mut follower, now);
+    follower.snapshot();
+    let follower_snapshot_index = follower.snapshot_index();
+    assert!(
+        follower_snapshot_index > 0,
+        "test setup should have actually compacted the follower"
+    );
+
+    // Advance the follower well past its own compaction point via ordinary
+    // AppendEntries, and have the LEADER also compact past the follower's
+    // old snapshot base — so a wrongly-regressed `next_index` can no longer
+    // find a log entry to send and would fall back to a brand-new
+    // InstallSnapshot, exactly the live regression
+    // (`old_match=702 new_match=702 old_next=703 new_next=191`).
+    for i in 40..80u64 {
+        let _ = leader.propose(upsert(i));
+    }
+    last = replicate_and_apply(&mut leader, &mut follower, last);
+    let applied_before = follower.last_applied();
+    assert!(
+        applied_before > follower_snapshot_index,
+        "follower should have caught up well past its own compaction point"
+    );
+    leader.snapshot();
+    assert!(
+        leader.snapshot_index() >= follower_snapshot_index,
+        "leader should have compacted past the follower's old snapshot base"
+    );
+
+    // A stale/duplicate InstallSnapshot offer — standing in for a leftover
+    // chunk from an earlier, now wholly obsolete transfer — lands at the
+    // follower. Its own `last_index` is <= the follower's `last_applied`,
+    // so it hits the "already at least this far along" short-circuit.
+    let stale = RaftMsg::InstallSnapshot {
+        term: leader.term(),
+        leader: nid(0),
+        last_index: follower_snapshot_index,
+        last_term: leader.term(),
+        offset: 0,
+        data: vec![0xAAu8; 16],
+        total: 16,
+        done: true,
+        config: None,
+        learners: None,
+    };
+    let resp = follower.handle(nid(0), stale, last, 7);
+    let (_, resp_msg) = resp
+        .into_iter()
+        .find(|(to, _)| *to == nid(0))
+        .expect("follower should reply to the leader");
+    let resp_last_index = match &resp_msg {
+        RaftMsg::InstallSnapshotResp { last_index, .. } => *last_index,
+        other => panic!("expected an InstallSnapshotResp, got {other:?}"),
+    };
+    assert_eq!(
+        resp_last_index, 0,
+        "a redundant offer must not reply with the same wire shape as a \
+         genuine completion just because this follower has ever compacted \
+         (snapshot_index={follower_snapshot_index} > 0) — a leader-side \
+         consumer that trusts last_index > 0 as \"install complete\" \
+         (animus-cp-data's CpSnapshotInstalls metric, and the \
+         next_index-reset branch checked below) would wrongly treat this \
+         redundant ack as one"
+    );
+
+    // Deliver that reply to the LEADER and confirm it neither regresses this
+    // peer's replication progress nor issues an unnecessary fresh
+    // InstallSnapshot — `handle_install_snapshot_resp`'s "transfer complete"
+    // branch calls `replicate_to` synchronously right after updating
+    // `next_index`, so a regression shows up directly in this call's output.
+    let leader_out = leader.handle(nid(1), resp_msg, last, 7);
+    assert!(
+        !leader_out
+            .iter()
+            .any(|(_, m)| matches!(m, RaftMsg::InstallSnapshot { .. })),
+        "the leader must not fall back to a fresh InstallSnapshot for a peer \
+         that was already caught up — this only happens if next_index was \
+         wrongly regressed to the stale offer's base: {leader_out:?}"
+    );
+}
+
 /// Full-node `SimEnv` sanity check that the fix doesn't regress ordinary
 /// catch-up: a genuinely far-behind, partitioned follower still converges
 /// via `InstallSnapshot` once healed (mirrors
