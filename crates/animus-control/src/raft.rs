@@ -146,9 +146,14 @@ enum SnapshotResend {
     /// a real bound at all.
     Always,
     /// Exponential backoff on a resend of the SAME outstanding offset,
-    /// keyed off the SAME `resends_so_far` counter `snapshot_chunk_for`
-    /// already tracks: send while `resends_so_far` is `0` or a power of
-    /// two, suppress every other call. This is the periodic **heartbeat
+    /// keyed off a dedicated per-peer ATTEMPT counter
+    /// (`snapshot_heartbeat_attempts`, not `snapshot_chunk_for`'s own
+    /// `resends_so_far` — see that field's own doc for why): send while the
+    /// attempt count is `0` or a power of two **below**
+    /// [`SNAPSHOT_HEARTBEAT_BACKOFF_MAX_TICKS`], suppress every other call
+    /// until that ceiling, then fall to a flat steady-state resend every
+    /// `SNAPSHOT_HEARTBEAT_BACKOFF_MAX_TICKS`'th attempt forever after —
+    /// never resuming the doubling. This is the periodic **heartbeat
     /// tick**'s own setting (`RaftCore::tick`'s `Role::Leader` branch) —
     /// the one call site `Always` used to cover on the (wrong) theory that
     /// a fixed per-tick rate was itself a bound. It isn't: a heartbeat
@@ -172,17 +177,29 @@ enum SnapshotResend {
     /// recovers to O(log(elapsed heartbeats)) instead of O(elapsed
     /// heartbeats): over a very long stuck episode, chunk N is shipped only
     /// once real progress last happened `2^(k)` heartbeats ago for the
-    /// current `k`, so total resends stay small (tens, not thousands) even
-    /// across a multi-minute stall, and a chunk for a genuinely NEW offset
-    /// (real progress) is, as with every other variant, never held back —
-    /// the schedule always includes `resends_so_far == 0`. A genuinely
-    /// still-converging transfer is unaffected in practice: it advances the
-    /// offset well before `resends_so_far` climbs past the first few
-    /// doublings, so the ack-handler's own `Capped(SNAPSHOT_ACK_RESEND_CAP)`
-    /// resend (which fires on every ack, independent of the heartbeat
-    /// cadence entirely) is what actually keeps a healthy transfer flowing
-    /// between heartbeats — this only changes behavior once a transfer has
-    /// gone genuinely idle for a while.
+    /// current `k` (until the ceiling), so total resends stay small (tens,
+    /// not thousands) even across a multi-minute stall, and a chunk for a
+    /// genuinely NEW offset (real progress) is, as with every other
+    /// variant, never held back — the schedule always includes attempt
+    /// `0`. A genuinely still-converging transfer is unaffected in
+    /// practice: it advances the offset well before the attempt count
+    /// climbs past the first few doublings, so the ack-handler's own
+    /// `Capped(SNAPSHOT_ACK_RESEND_CAP)` resend (which fires on every ack,
+    /// independent of the heartbeat cadence entirely) is what actually
+    /// keeps a healthy transfer flowing between heartbeats — this only
+    /// changes behavior once a transfer has gone genuinely idle for a
+    /// while.
+    ///
+    /// **The ceiling itself — capping unbounded doubling, not merely the
+    /// doubling's existence — is the fix this variant's own second
+    /// revision added (review finding, 2026-09-27): without it, the GAP
+    /// between resends grows without bound right along with the total
+    /// count, so a peer stuck for an hour could wait up to another full
+    /// hour-scale gap before its very next chunk, and thus that long again
+    /// after it reconnects before catch-up can resume — see
+    /// [`SNAPSHOT_HEARTBEAT_BACKOFF_MAX_TICKS`]'s own doc for the exact
+    /// value chosen, why it's a deliberately-not-sub-election-timeout
+    /// steady state, and why that's still sound.**
     Backoff,
 }
 
@@ -197,6 +214,66 @@ enum SnapshotResend {
 /// overlapping in-flight acks a genuinely still-converging transfer
 /// produces before either real progress or the next heartbeat arrives.
 const SNAPSHOT_ACK_RESEND_CAP: u32 = 8;
+
+/// Ceiling on `SnapshotResend::Backoff`'s exponential thinning (the
+/// heartbeat tick's own schedule, `snapshot_chunk_for`'s own doc) — found
+/// in review of the schedule's first cut, which doubled the gap between
+/// resends forever with no ceiling at all. That is still a real bug even
+/// though it bounds total volume within any FIXED window (doubling is
+/// logarithmic, so `snapshot_heartbeat_resend_unbounded.rs`'s own 30s/30s
+/// split-window measurement stays comfortably under its bound either way,
+/// which is why that test alone doesn't catch this): the GAP between
+/// consecutive resends grows without bound too, so a peer stuck for an
+/// hour can end up waiting another full hour-scale gap before its next
+/// chunk, and thus up to that long after it reconnects before catch-up can
+/// resume — see `tests/snapshot_heartbeat_reconnect_latency.rs`. Once the
+/// per-offset attempt count reaches this ceiling, the schedule stops
+/// doubling and instead resends every `SNAPSHOT_HEARTBEAT_BACKOFF_MAX_
+/// TICKS`'th attempt — a flat, bounded steady-state period regardless of
+/// how long the stall has already run.
+///
+/// `32` (32 × the 50ms default `heartbeat_interval` ≈ 1.6s) trades off two
+/// things pulling in opposite directions, and the choice here is
+/// deliberate, not a rounding of "roughly 1-2s":
+/// - **Bounding total volume over a long stall** wants this LARGE — a
+///   multi-minute stuck episode should still ship only tens, not
+///   thousands, of chunks (this ceiling's whole purpose).
+/// - **A snapshot-mode peer's own election timer** wants this SMALL: while
+///   a peer's `next_index <= snapshot_index`, `replicate_to` ships it
+///   `InstallSnapshot` chunks and *never* a plain `AppendEntries` — so for
+///   as long as it's in this mode, a resent chunk is this peer's *only*
+///   leader-liveness signal (`handle_install_snapshot` resets the
+///   election timer on receipt, exactly like `handle_append_entries`
+///   does). At the default `election_base` (150ms, so a randomized
+///   `[150, 300)` timeout), ANY steady cadence slower than that — 1.6s
+///   very much included — leaves a genuinely-reachable-but-still-
+///   snapshotting VOTER timing out and running pre-vote rounds between
+///   chunks.
+///
+/// **The sound resolution is not to shrink this ceiling to sub-election-
+/// timeout territory** — at `heartbeat_interval` = 50ms that would mean a
+/// steady-state MAX_TICKS of 2-3, i.e. resending at very nearly the full
+/// heartbeat rate, which reproduces almost exactly the unbounded-volume
+/// flood this fix exists to close. **It is that pre-vote is already safe
+/// against exactly this noise by construction (ADR 0009)**: a peer's own
+/// spurious pre-vote round is refused by every OTHER follower as long as
+/// they still see a live leader (`handle_pre_vote`'s grant conditions —
+/// `role == Leader`, or `leader_id.is_some() && now < election_deadline`,
+/// or a still-fresh `voted_for` lease), and pre-vote never bumps a term on
+/// its own, so a snapshot-mode voter's repeated timeout-and-retry is
+/// wasted local work, never real disruption: no term bump, no leadership
+/// change, no effect on any other replica's view. A snapshot-mode replica
+/// timing out between 1.6s-apart chunks is exactly this harmless-noise
+/// case, proven by `tests/snapshot_heartbeat_no_disruption_during_backoff.rs`
+/// (the leader's term never moves while a voter sits in backoff-throttled
+/// catch-up for many seconds). The alternative that WOULD avoid the noise
+/// — teaching `replicate_to` to also ship a plain, chunk-free
+/// `AppendEntries`/heartbeat to a snapshot-mode peer on every tick,
+/// independent of `Backoff`'s own suppression — was rejected: it is a
+/// second, structurally new liveness channel for exactly one peer state,
+/// doubling this mechanism's own surface for a cosmetic (not correctness)
+/// win pre-vote already provides for free.
+const SNAPSHOT_HEARTBEAT_BACKOFF_MAX_TICKS: u32 = 32;
 
 /// Issue #898: how many CONSECUTIVE mid-transfer acks reporting an offset
 /// below the currently tracked `snapshot_offset` this leader tolerates as
@@ -4625,17 +4702,26 @@ where
         }
         // `Backoff` (the heartbeat tick's own policy — see that variant's
         // own doc for the full incident this closes): resend only when this
-        // peer's own ATTEMPT count for the current offset is `0` or a power
-        // of two, suppressing every other call — an exponentially-thinning
-        // schedule. Deliberately keyed off `snapshot_heartbeat_attempts`,
-        // NOT `resends_so_far` above: that counter only advances on a call
-        // that actually sends, so gating on it directly would freeze the
-        // schedule forever at whatever count first got suppressed (see that
-        // field's own doc). `snapshot_heartbeat_attempts` instead advances
-        // on every attempt, sent or suppressed, and resets whenever the
-        // tracked offset itself changes (real progress always restarts the
-        // backoff, and a genuinely new offset — attempt count freshly reset
-        // to `0` — is never held back).
+        // peer's own ATTEMPT count for the current offset is `0`, a power
+        // of two below the ceiling, or a multiple of the ceiling once past
+        // it — suppressing every other call. Below
+        // `SNAPSHOT_HEARTBEAT_BACKOFF_MAX_TICKS` this is the same
+        // exponentially-thinning schedule as before; past it, the doubling
+        // stops and the schedule flattens into a steady resend every
+        // `SNAPSHOT_HEARTBEAT_BACKOFF_MAX_TICKS`'th attempt forever — the
+        // fix for the review finding that unbounded doubling leaves the GAP
+        // between resends growing without bound too (see that constant's
+        // own doc for why this ceiling, not zero and not sub-election-
+        // timeout, is the sound value). Deliberately keyed off
+        // `snapshot_heartbeat_attempts`, NOT `resends_so_far` above: that
+        // counter only advances on a call that actually sends, so gating on
+        // it directly would freeze the schedule forever at whatever count
+        // first got suppressed (see that field's own doc).
+        // `snapshot_heartbeat_attempts` instead advances on every attempt,
+        // sent or suppressed, and resets whenever the tracked offset itself
+        // changes (real progress always restarts the backoff, and a
+        // genuinely new offset — attempt count freshly reset to `0` — is
+        // never held back).
         if snapshot_resend == SnapshotResend::Backoff {
             let attempts = self
                 .snapshot_heartbeat_attempts
@@ -4646,7 +4732,11 @@ where
             }
             let n = attempts.1;
             attempts.1 = attempts.1.saturating_add(1);
-            if n > 0 && !n.is_power_of_two() {
+            let past_ceiling_multiple =
+                n != 0 && n.is_multiple_of(SNAPSHOT_HEARTBEAT_BACKOFF_MAX_TICKS);
+            let pre_ceiling_doubling =
+                n < SNAPSHOT_HEARTBEAT_BACKOFF_MAX_TICKS && n.is_power_of_two();
+            if n != 0 && !pre_ceiling_doubling && !past_ceiling_multiple {
                 return None;
             }
         }

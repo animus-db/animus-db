@@ -1891,6 +1891,67 @@ per-tablet CP data plane (`animus-cp-data`).
   actually keeps a healthy transfer flowing; this only changes behavior
   once a transfer has gone genuinely idle for a while.
 
+  **Review finding on this same fix, same day: unbounded doubling bounds
+  total volume within any FIXED window but not the GAP between resends,
+  which keeps doubling right alongside the count.** Verified directly
+  against the code before fixing it: (1) for a peer with `next_index <=
+  snapshot_index`, `replicate_to` unconditionally calls `snapshot_chunk_
+  for` and never `AppendEntries` — a resent chunk (or its absence, on a
+  suppressed attempt) is that peer's ONLY leader-liveness signal while it
+  stays in this mode; (2) `handle_install_snapshot` calls `reset_election_
+  timer` on every valid-term receipt, exactly like `handle_append_entries`
+  does — confirming a snapshot-mode peer's own election timer really is
+  gated on chunk arrival alone. So a peer stuck for a long stretch (a real
+  partition, or genuinely reachable but wedged/outpaced) can have its next
+  scheduled chunk land an UNBOUNDEDLY long time away — and since that
+  chunk is its only signal, reconnecting after a long stall doesn't help
+  until that far-off resend finally comes due: up to another full
+  gap-length wait, not "the next heartbeat." `snapshot_heartbeat_resend_
+  unbounded.rs`'s own two-half-of-a-60s-window measurement doesn't catch
+  this (doubling is logarithmic, so it stays comfortably under that test's
+  bound with or without a ceiling) — the dedicated regression is
+  `animus-cp-data/tests/snapshot_heartbeat_reconnect_latency.rs`, which
+  partitions a follower for `STUCK_WINDOW` (5 minutes of virtual time,
+  deep into the schedule), heals, and asserts catch-up resumes within a
+  small bounded window — verified RED against the uncapped-doubling
+  schedule and GREEN with the fix below.
+
+  **Fixed by `SNAPSHOT_HEARTBEAT_BACKOFF_MAX_TICKS` (32, ≈1.6s at the
+  default 50ms `heartbeat_interval`): past this many attempts, the
+  schedule stops doubling and flattens into a steady resend every
+  `MAX_TICKS`'th attempt forever** — `n == 0 || (n.is_power_of_two() && n <
+  MAX) || n % MAX == 0`. This bounds the worst-case reconnect wait to one
+  steady period, however long the stall ran, while still bounding total
+  volume over a long stall to tens (not thousands) of chunks — the
+  property the original fix was for. **The ceiling is deliberately NOT
+  shrunk below the default election timeout** (`election_base` = 150ms, so
+  a randomized `[150, 300)` window) to close the "peer hears nothing"
+  gap entirely — at the default `heartbeat_interval` (50ms) that would mean
+  a steady-state `MAX_TICKS` of 2-3, i.e. resending at very nearly the full
+  heartbeat rate, reproducing almost exactly the unbounded-volume flood
+  this mechanism exists to close. The sound resolution leans on pre-vote's
+  own existing safety design (ADR 0009) instead: a snapshot-mode voter that
+  times out between 1.6s-apart chunks runs a pre-vote round that every
+  OTHER voter — which still sees the cluster's one real leader as alive —
+  refuses to grant (`handle_pre_vote`'s `has_live_leader`/`voted_lease`
+  gates), and pre-vote never bumps a term on its own; so this is wasted
+  local work on the stuck peer alone, never real disruption. Proven
+  directly (not merely inferred from "the leader survived") by
+  `animus-control/tests/snapshot_heartbeat_no_disruption_during_backoff.rs`,
+  which hand-drives three `RaftCore`s, delivers a snapshot-mode peer's
+  chunks one-way (so the transfer never completes and the SAME Backoff
+  schedule keeps gating every later resend — mirroring a genuinely
+  stuck-but-reachable peer, not a partition), confirms the peer really does
+  run at least one pre-vote round under the 1.6s cadence, and asserts on
+  every tick that the leader's term/leadership never moves. The alternative
+  that WOULD close the gap without leaning on pre-vote — teaching
+  `replicate_to` to also ship a plain, chunk-free heartbeat to a
+  snapshot-mode peer on every tick, independent of `Backoff`'s own
+  suppression — was rejected: a second, structurally new liveness channel
+  for exactly one peer state, for a cosmetic (not correctness) win
+  pre-vote already provides for free. See `SNAPSHOT_HEARTBEAT_BACKOFF_
+  MAX_TICKS`'s own doc (`raft.rs`) for the full trade-off.
+
 - **Durable-before-visible mechanics + hand-driven gotchas.** The driver
   advances the durable watermark via `mark_durable_through` in `flush_wal`,
   immediately after `env.sync(WAL)` (passing the drain-time `last_log_index`);
