@@ -44,8 +44,15 @@ jobs:
     name: gates
     runs-on: ubuntu-latest
     steps:
+      # Full history (not the default shallow depth-1 clone): the format-
+      # fixtures guard step below needs `git merge-base HEAD origin/main` to
+      # resolve, which a shallow clone's missing history would silently
+      # defeat back to a no-op skip rather than an enforced check. Same
+      # fix `dco.yml` already applies for the same `merge-base` need.
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       # `cargo build --workspace --all-targets` (every crate x every test/bench
       # binary) plus the restored cargo cache no longer fit in the ~14 GB free
@@ -88,6 +95,14 @@ jobs:
       # clearly-named step so a failure points straight at the offending gate.
       - name: rustfmt (cargo fmt --all --check)
         run: cargo fmt --all --check
+
+      # ADR 0073 Phase 0: golden format fixtures under
+      # `**/tests/fixtures/formats/**` are append-only — this fails the
+      # build if any fixture already on `origin/main` was modified or
+      # deleted (a new version file is always fine). Cheap (a git diff, no
+      # compile), so it runs right after fmt, before the expensive gates.
+      - name: format fixtures are append-only (ADR 0073)
+        run: scripts/check-format-fixtures.sh
 
       # `--all-features` here (unlike the plain `cargo test` below) turns on
       # every crate's opt-in `prod-heavy` feature too, so the real-thread test
