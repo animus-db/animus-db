@@ -375,3 +375,46 @@ error (`main.rs`'s `resolve_cluster_settings`), the identical contract
 `--dynamo-auth` already established for `dynamo_auth`. See ADR 0034's own
 S-06 amendment for the auto-split half of the same config-file section, and
 ADR 0048's for the quiescence half.
+
+## Amendment (2026-09-28, issue #1042): an explicit `--id`'s claim now
+follows a successful bind, not the other way around
+
+Decision C's own text above ("a minted id whose claim collides re-mints and
+retries... a proposed id whose claim collides fails loudly") describes the
+`RegisterNode` claim as a **pre-bind** step for both the minted and the
+proposed (explicit `--id`) cases — accurate for how PR4 shipped it, and
+still accurate for the minted case today. It understated a real hazard for
+the proposed case: `run_node_join_with_settings`/`run_node_data_join_with_
+settings` (`crates/animusd/src/lib.rs`) called `claim_join_identity` (the
+`RegisterNode` CAS) **before** `Node::bind`/`Node::bind_data` for an
+explicit `--id`, so a bind failure — an ordinary, transient port-TOCTOU
+(issue #278), not any kind of genuine identity conflict — still left a
+durable claim on file for addresses this process never actually bound. A
+caller retrying the same `--id` at a different address set (the only safe
+response once the first set's own port turns out to be genuinely
+unavailable) then collided with its own earlier, bind-failed claim —
+`RegisterOutcome::Collision`, the "already claimed by a different
+registration" refusal Decision C describes as "the real collision," except
+this instance was entirely self-inflicted and unresolvable by further
+retrying (issues #406/#450, re-surfacing intermittently under `cargo test
+--workspace`-scale contention as issue #1042).
+
+**Fixed by reordering, for the explicit-`--id` path only**: bind every
+listener first — resolving a `:0` port atomically and holding it open, the
+same bind-and-hold discipline issue #627 already established for
+fresh-cluster bring-up — and only then claim the identity, using the
+addresses this process actually bound rather than the pre-bind request (which
+may itself have been `:0`, a request that names no real, dialable address at
+all). A bind failure can therefore never register anything, so a retry —
+even at a completely different address set — never collides with an earlier
+attempt under the same `--id`. The **minted**-id branch is unchanged:
+`NodeId::mint` needs no `Env`/listener to run at all, so there is nothing to
+bind yet at claim time, and (per Decision C's own text) a fresh id is
+minted on every retry regardless, so the collision this reordering exists
+to prevent could never arise for it in the first place. See
+`crates/animusd/CLAUDE.md`'s "Every in-crate bring-up retries the
+port-TOCTOU race" entry and `docs/lessons/testing/2026-09-28-freezing-a-
+port-set-across-retries-only-relocates-the-toctou-bind-and-hold-before-
+claim.md` for the full account, including why the test helpers' own
+pre-existing "freeze the address set across retries" mitigation was a real
+but incomplete fix for this same hazard.
