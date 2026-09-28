@@ -2080,19 +2080,47 @@ where
         }
     }
 
-    /// Whether learner `id` is caught up closely enough to this leader's own
-    /// log to be a promotion candidate (ADR 0058 Train 1's promotion
-    /// criterion): its tracked `match_index` is within `threshold` of
-    /// [`last_log_index`](Self::last_log_index). A pure predicate over
-    /// already-tracked state (the same bookkeeping `AppendEntries`/
-    /// `InstallSnapshot` acks already maintain) — it does **not** gate
+    /// Whether learner `id` is caught up closely enough to be a promotion
+    /// candidate (ADR 0058 Train 1's promotion criterion): its tracked
+    /// `match_index` is within `threshold` of [`commit_index`](Self::
+    /// commit_index) — **not** [`last_log_index`](Self::last_log_index)
+    /// (issue #1064 fix, 2026-09-28). A pure predicate over already-tracked
+    /// state (the same bookkeeping `AppendEntries`/`InstallSnapshot` acks
+    /// already maintain) — it does **not** gate
     /// [`promote_learner`](Self::promote_learner) itself; a later layer (the
     /// host reconciler) decides *when* to act on it. `false` for any `id`
     /// that is not currently a learner.
+    ///
+    /// **Why `commit_index`, not `last_log_index` (issue #1064):** under a
+    /// continuous write stream, `last_log_index()` is the leader's own
+    /// freshest LOCAL append — an entry nobody, not even another voter, has
+    /// necessarily even received yet, let alone acked. A caller that
+    /// samples this predicate right after proposing a batch (`reconfigure_
+    /// step`'s own production caller ticks independently of the write
+    /// stream, so this is the ordinary case under load, not a corner one)
+    /// would see a gap of "however many entries this leader just appended
+    /// for itself," permanently exceeding any fixed `threshold` regardless
+    /// of how genuinely caught-up the learner actually is — a real learner
+    /// can never close a gap that re-opens by the same amount (or more)
+    /// every time it's checked. `commit_index()` doesn't have this problem:
+    /// it only advances once a majority of CURRENT VOTERS (never this
+    /// learner — [`apply_config`](Self::apply_config)'s doc) have
+    /// themselves acked, so it is never further ahead of what the
+    /// established quorum has actually achieved than one ordinary
+    /// replication round costs. This also keeps the ADR 0058 Train 1 safety
+    /// intent intact — "never dilute the quorum with a peer that can't
+    /// ack": a peer promoted at `match_index >= commit_index - threshold`
+    /// can, the instant it becomes a voter, immediately help COMMIT
+    /// anything up to what the group has already committed (the property
+    /// that actually matters for not regressing availability), which
+    /// comparing against the ever-advancing leader tip never established
+    /// anyway — a peer "caught up to `last_log_index`" could still be
+    /// stale by the time its own promotion entry is itself appended.
+    /// Regression: `tests/directed_placing_under_sustained_load.rs`.
     #[must_use]
     pub fn learner_caught_up(&self, id: &NodeId, threshold: u64) -> bool {
         self.learners.contains(id)
-            && self.last_log_index().saturating_sub(self.peer_match(id)) <= threshold
+            && self.commit_index().saturating_sub(self.peer_match(id)) <= threshold
     }
 
     /// Adopt `voters`/`learners` as the active config and keep

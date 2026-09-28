@@ -458,6 +458,51 @@ reconfigure_multi_replica_diff.rs` is the dedicated regression (60 seeds,
 several harness shapes) and `animusd/tests/
 split_placing_two_replica_diff_e2e.rs` its real `ProdEnv` sibling. See
 `docs/engineering-lessons.md` for the investigation writeup.
+
+**Issue #1064 (2026-09-28): `RaftCore::learner_caught_up`'s promotion
+predicate was baselined against the wrong metric.** It compared a learner's
+tracked `match_index` to the LEADER'S OWN `last_log_index()` — under a
+CONTINUOUS writer (a directed-Placing 2-of-3 diff driven every tick
+alongside a never-stopping client, the exact production shape:
+`animusd --cluster-control 3 --cluster-data 5 --auto-split-bytes 1000000`
+under sustained load), `last_log_index()` always includes whatever the
+leader just appended for ITSELF in the current tick, before it has been
+sent to (let alone acked by) anyone — voter or learner alike. Once a single
+write burst between reconciler ticks exceeds
+`RECONFIGURE_LEARNER_CATCH_UP_THRESHOLD` (4), every sample lands mid-burst
+and the learner can never be seen as caught up, no matter how genuinely
+caught up it is with everything the group has actually committed —
+`reconfigure_step` then never adds the second desired replica or drops
+either stale voter, wedging the group at its old voter set forever. Fixed
+by baselining against `commit_index()` instead: it only advances once a
+majority of CURRENT VOTERS (never the learner itself) have themselves
+acked, so it can never be further ahead of what the established quorum has
+actually achieved than one ordinary replication round costs, and it keeps
+the ADR 0058 Train 1 safety intent intact (a peer promoted at `match_index
+>= commit_index - threshold` can immediately help commit anything the group
+has already committed). See `RaftCore::learner_caught_up`'s own doc
+(`animus-control/src/raft.rs`) for the full before/after account. Every
+existing caller/test of `learner_caught_up` (`animus-control`'s
+`learner_corpus.rs`/`learner_promotion_leader_crash.rs`, this crate's
+`learner_membership.rs`/`learner_catchup_under_load.rs`/
+`snapshot_transfer_survives_compaction.rs`) was audited and is unaffected —
+each already polls to convergence with the writer stopped (or genuinely
+idle), where `commit_index()` and `last_log_index()` coincide. Regression:
+`tests/directed_placing_under_sustained_load.rs`
+(`ANIMUS_DIRECTED_PLACING_LOAD_SEEDS`, root `CLAUDE.md`'s knob table) —
+deliberately built with a generous `BURST_GAP` (300ms against a 10ms
+learner disk delay) so it isolates this exact baseline-metric defect from
+the separate, already-understood write-rate/capacity and
+compaction/snapshot-transfer-restart concerns `learner_catchup_under_load.rs`
+covers (see this file's own module doc for why conflating the two produces
+a much harder-to-diagnose, sawtooth-shaped false negative — a genuinely
+sustained-load run at the field report's own write rate DOES still hit
+repeated `InstallSnapshot` transfer restarts under heavy compaction churn,
+a real, separate, PRE-EXISTING defect suspected to be issue #1061's own
+mechanism; not fixed here — see `docs/lessons/testing/` for the
+investigation notes and the compaction-floor/`COMPACT_DEFER_*` invariants
+this fix deliberately left untouched).
+
 **`RaftKvNode::voter_history()` (issue #596)** records every distinct voter
 configuration a group has adopted, in adoption order, in a small bounded
 in-process ring (`VoterHistory`, capacity 64, oldest dropped; never rebuilt
