@@ -584,6 +584,11 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   sim test reads counters back via the additive `LsmEngine::open_with_metrics`
   (`SsTableReader::with_metrics` carries it to the readers). Counters only — never
   read the wall clock; recording changes no engine behavior or signatures.
+- **The WAL rotation counter is seeded at open.** `GroupCommit::new` takes the
+  reopened active segment's post-repair on-disk length (`consumed` from replay,
+  after torn-tail truncation) as `active_seg_len`; starting from 0 let a segment
+  outgrow `wal_segment_bytes` across restarts. Pinned by
+  `reopen_reseeds_active_segment_bytes` (`tests/lsm_wal_rotation.rs`).
 
 ## Tests & benchmark
 

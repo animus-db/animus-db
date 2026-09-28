@@ -119,9 +119,10 @@ struct Inner {
     failed_error: Option<String>,
     /// The segment number currently being appended to.
     active_seg: u64,
-    /// Bytes the leader has appended to the active segment so far (drives
-    /// rotation). Counts bytes handed to `append`, so it advances as batches are
-    /// written, not only once they sync.
+    /// Bytes in the active segment so far (drives rotation): its post-repair
+    /// on-disk length at open (see [`GroupCommit::new`]) plus every byte the
+    /// leader has since handed to `append`, so it advances as batches are
+    /// written, not only once they sync. Resets to 0 on rotation.
     active_seg_bytes: u64,
     /// Sealed (no-longer-active) segments: segment number → the highest `wal_seq`
     /// that segment contains. `BTreeMap` for deterministic iteration. The active
@@ -139,7 +140,17 @@ impl GroupCommit {
     /// highest live segment is reopened as the active segment (further appends ride
     /// it until it crosses `seg_threshold`); the rest are sealed. `live_segments`
     /// empty means a fresh engine — the first write opens segment 0.
-    pub(super) fn new(prefix: String, live_segments: &[u64], seg_threshold: u64) -> Self {
+    ///
+    /// `active_seg_len` is the reopened active segment's byte length on disk
+    /// **after** recovery's torn-tail repair (0 for a fresh engine). It seeds the
+    /// rotation counter so a segment that already holds bytes rotates at
+    /// `seg_threshold` in total, not `seg_threshold` more bytes after each reopen.
+    pub(super) fn new(
+        prefix: String,
+        live_segments: &[u64],
+        active_seg_len: u64,
+        seg_threshold: u64,
+    ) -> Self {
         // All recovered records are folded into the memtable already, so the
         // resumed sequence space starts at 0; the active segment is the highest
         // live one (or 0 for a fresh engine). Older live segments are sealed with
@@ -167,7 +178,11 @@ impl GroupCommit {
                 failed_through: 0,
                 failed_error: None,
                 active_seg,
-                active_seg_bytes: 0,
+                active_seg_bytes: if live_segments.is_empty() {
+                    0
+                } else {
+                    active_seg_len
+                },
                 sealed,
             }),
         }

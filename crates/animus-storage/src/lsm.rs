@@ -793,6 +793,9 @@ impl<E: Env> LsmEngine<E> {
         let mut memtable: BTreeMap<Key, History> = BTreeMap::new();
         let mut memtable_bytes = 0usize;
         let mut max_version = manifest.max_version;
+        // Post-repair byte length of the segment that becomes active (0 when
+        // there is none: a fresh or legacy engine).
+        let mut active_seg_len = 0u64;
         if segments.is_empty() {
             // Legacy migration: a directory written by the single-file-WAL era has
             // no recorded segments. Replay the old `<prefix>wal` file (if any) so
@@ -833,10 +836,17 @@ impl<E: Env> LsmEngine<E> {
                 // bug `acked_writes_after_torn_tail_recovery_survive_second_restart`
                 // pins. `replace` is the same atomic primitive the manifest swap
                 // uses, so this truncation is itself crash-safe.
-                if seg == active_seg && consumed < wal_bytes.len() {
-                    env.replace(&file, &wal_bytes[..consumed])
-                        .await
-                        .map_err(io)?;
+                if seg == active_seg {
+                    if consumed < wal_bytes.len() {
+                        env.replace(&file, &wal_bytes[..consumed])
+                            .await
+                            .map_err(io)?;
+                    }
+                    // Post-repair on-disk length: `consumed` whether or not a
+                    // torn tail was cut. Seeds the group commit's rotation
+                    // counter so appends riding this segment count toward
+                    // `wal_segment_bytes` from where the file really ends.
+                    active_seg_len = consumed as u64;
                 }
             }
         }
@@ -865,6 +875,7 @@ impl<E: Env> LsmEngine<E> {
         let wal = Arc::new(GroupCommit::new(
             prefix.to_string(),
             &segments,
+            active_seg_len,
             opts.wal_segment_bytes,
         ));
 
