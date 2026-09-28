@@ -10953,6 +10953,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// snapshots are read **at call time**, so the export reflects current
     /// activity rather than a cached value.
     pub(crate) fn metrics_text(&self) -> String {
+        self.env.refresh_inbox_metrics();
         let mut snaps = vec![self.control.metrics().snapshot()];
         if let Some(data) = &self.data
             && !data.raftkv_metrics.is_same_sink(self.control.metrics())
@@ -10987,6 +10988,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// (ADR 0020). Read live at call time and summed across the node's role
     /// sink(s), exactly as the text export.
     pub(crate) fn metrics_json(&self) -> (BTreeMap<String, u64>, i64) {
+        self.env.refresh_inbox_metrics();
         let mut snaps = vec![self.control.metrics().snapshot()];
         if let Some(data) = &self.data
             && !data.raftkv_metrics.is_same_sink(self.control.metrics())

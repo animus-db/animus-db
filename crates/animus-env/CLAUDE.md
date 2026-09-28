@@ -640,6 +640,37 @@ the production implementation; the deterministic implementation lives in
   metrics seam (`Env::metrics()`) uses — extend the trait so nothing existing
   has to change, not by widening every implementor's required surface.
 
+- **`Demux` inbox observability (ADR 0026 inbox-growth investigation,
+  measure-first PR, `animusd` issue: unbounded per-stream growth under
+  sustained splitting).** `Demux` gained a `stream_meta: BTreeMap<u64,
+  StreamMeta>` alongside its pre-existing `queues`/`wakers` — per-stream
+  queued-byte count, whether a receiver has ever polled/is currently
+  parked, and the `Instant` of the last successful pop — maintained
+  incrementally on the exact same push (`spawn_pump`) and pop
+  (`RecvStream::poll`) sites, O(1) per frame, never a scan of `queues`
+  itself. `ProdEnv::inbox_stats(top_n)` (`InboxStats`/`StreamInboxStats`,
+  both `#[cfg(feature = "prod")]`-exported) is the point-in-time snapshot:
+  total queued frames/bytes plus the `top_n` largest streams by bytes.
+  `Env::refresh_inbox_metrics()` (additive default, no-op — the identical
+  `metrics()`/`merge_peer()` shape) recomputes `Metric::
+  DemuxQueuedFrames`/`Metric::DemuxQueuedBytes` (two new **level** gauges,
+  ADR 0015) from that snapshot; `ProdEnv` overrides it, called from
+  `ClientCtx::metrics_text`/`metrics_json` (`animusd`) right before each
+  snapshot rather than on any hot path. `animusd`'s `GET /admin/debug/
+  inboxes` (`AdminHost::debug_inboxes_view`, default body `{"available":
+  false}` for a generic/`SimEnv` host) surfaces the top-N view, decoding a
+  stream id as far as `Metadata` allows (`0` = `PRIMARY_STREAM`; the two
+  other reserved ids, `animus_cp_data::heartbeat_batch::
+  HEARTBEAT_BATCH_STREAM`/`animus_cp_data::backup::BACKUP_SEGMENT_STREAM`;
+  else a `TabletId`, named/stated with its table+state if still in the
+  tablet map, flagged "not in this node's current tablet map" if not).
+  **This PR is measure-only — teardown and a cap are later PRs** (see
+  `docs/lessons/code-patterns/2026-09-28-an-unbounded-per-stream-queue-is-
+  invisible-until-it-has-its-own-observability.md` for what the live
+  measurement found: the growth is a mix of small per-split teardown-
+  timing residue and much larger bursts addressed to a peer whose own
+  consumer never started at all, not one single mechanism).
+
 - **TLS on the intra-node wire (ADR 0064, S-01 step 1) — `tls.rs`, config-gated,
   default off, byte-for-byte unchanged when unconfigured.** `TlsConfig
   {cert_path, key_path, ca_path: Option<PathBuf>}` names three PEM files —

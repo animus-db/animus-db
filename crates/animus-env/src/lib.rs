@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "prod")]
 pub mod prod;
 #[cfg(feature = "prod")]
-pub use prod::{FsSegmentStore, ProdEnv};
+pub use prod::{FsSegmentStore, InboxStats, ProdEnv, StreamInboxStats};
 
 /// TLS material for the intra-node wire (ADR 0064, S-01 step 1) — gated
 /// alongside `prod.rs` since it exists only to serve `ProdEnv`'s real
@@ -714,6 +714,20 @@ pub trait Env: Clock + Rng + Network + Disk + Spawner + Clone + Send + Sync + 's
     /// `RaftNode<ProdEnv>` to a generic `RaftNode<E>` — still type-checks
     /// for any `E`, not just `ProdEnv`.
     fn merge_peer(&self, _id: NodeId, _addr: String) {}
+
+    /// Recompute this env's own demultiplexed-inbox observability gauges
+    /// (`Metric::DemuxQueuedFrames`/`Metric::DemuxQueuedBytes`, ADR 0026)
+    /// into its metrics sink — a **no-op default**, for the identical
+    /// additive reason [`metrics`](Self::metrics)/[`merge_peer`](Self::
+    /// merge_peer) are: `SimEnv` (and any other non-`ProdEnv` implementor)
+    /// keeps compiling and behaving identically without change, since it
+    /// has no multiplexed-`Demux` inbox of its own to summarize. `ProdEnv`
+    /// overrides this to read its own `Demux`'s current per-stream
+    /// bookkeeping and `set` the two gauges — a pure read-then-set, no
+    /// wall clock, no I/O, cheap enough to call on every metrics read
+    /// (`ClientCtx::metrics_text`/`metrics_json`, `animusd`) rather than
+    /// on the `Demux`'s own push/pop hot path.
+    fn refresh_inbox_metrics(&self) {}
 }
 
 /// Convenience extension for spawning an `async` block without writing

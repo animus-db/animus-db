@@ -825,12 +825,41 @@ pub enum Metric {
     /// reconciler itself keeps making progress on every other tablet
     /// regardless (that isolation is the fix this metric observes).
     CpReconcilerStopTimeout,
+
+    // --- Multiplexed-stream demux inbox observability (ADR 0026,
+    // ADR 0015 seam extension) --- Appended after the reconciler-stop-
+    // timeout variant above; every earlier variant's slot and the
+    // text-export order stay stable, so the snapshot remains
+    // byte-reproducible. Both are **levels**, overwritten via
+    // `MetricsHandle::set` (never `incr`) -- the identical "counter slot
+    // re-purposed as a last-write-wins level" shape `StreamHotBytes`/
+    // `CpGroupsQuiesced` already use above. Recorded by `ProdEnv`'s own
+    // `refresh_inbox_metrics` (`Env::refresh_inbox_metrics`, a no-op
+    // default every other `Env` implementor keeps unchanged), called
+    // right before a metrics read (`ClientCtx::metrics_text`/
+    // `metrics_json`) recomputes and snapshots -- never on the
+    // `Demux`'s own push/pop hot path, which only maintains the raw
+    // per-stream byte/frame counters these two levels are read from.
+    /// The total number of frames currently queued across every stream
+    /// in this node's `ProdEnv` demux (ADR 0026) -- the sum of every
+    /// stream's own queue length. A stream nobody ever polls
+    /// accumulates frames here forever (the growth this metric exists
+    /// to make visible); see `crates/animus-env/src/prod.rs`'s `Demux`
+    /// doc for the mechanism.
+    DemuxQueuedFrames,
+    /// The total payload bytes currently queued across every stream in
+    /// this node's `ProdEnv` demux (ADR 0026) -- the sum of every
+    /// stream's own queued payload bytes. This is the metric a runaway
+    /// unconsumed stream shows up in most directly (RSS growth from an
+    /// unbounded `VecDeque<Envelope>`), and the one to watch alongside
+    /// `GET /admin/debug/inboxes`'s own top-N-streams-by-bytes view.
+    DemuxQueuedBytes,
 }
 
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 98] = [
+    pub const ALL: [Metric; 100] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -929,6 +958,8 @@ impl Metric {
         Metric::CpRouteFanoutExhausted,
         Metric::CpHousekeepingProposalsAccepted,
         Metric::CpReconcilerStopTimeout,
+        Metric::DemuxQueuedFrames,
+        Metric::DemuxQueuedBytes,
     ];
 
     /// The stable exported name of this metric (snake_case, used as the text
@@ -1034,6 +1065,8 @@ impl Metric {
             Metric::CpRouteFanoutExhausted => "cp_route_fanout_exhausted",
             Metric::CpHousekeepingProposalsAccepted => "cp_housekeeping_proposals_accepted",
             Metric::CpReconcilerStopTimeout => "cp_reconciler_stop_timeout",
+            Metric::DemuxQueuedFrames => "demux_queued_frames",
+            Metric::DemuxQueuedBytes => "demux_queued_bytes",
         }
     }
 
