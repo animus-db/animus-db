@@ -115,7 +115,26 @@ teardown hazard) structurally rather than retrying around it; see
 `docs/lessons/testing/2026-09-20-allocate-test-ports-by-binding-and-holding-never-probe-and-release.md`.
 These in-crate `#[cfg(test)] mod`s are unaffected by that fix (they still
 can't reach `tests/support` at all) and still need their own bounded retry
-exactly as before.
+exactly as before. **`tests/support/mod.rs`'s explicit-`--id` join helpers
+join this list of structurally-fixed callers too (issue #1042)** —
+`join_fresh_deadline`/`join_data_fresh_deadline` now pass `:0` addresses
+straight to `Node::bind`/`Node::bind_data` (via `run_node_join`/
+`run_node_data_join`) instead of pre-allocating with `free_addrs`, because
+`run_node_join_with_settings`/`run_node_data_join_with_settings`'s own
+explicit-`--id` path now binds before it durably claims `--id`'s
+`NodeAddrs`, closing issue #406/#450's same-id-different-addrs
+self-collision at the source. **Freezing an already-picked address set
+across retries (the pre-#1042 shape) is not itself a fix for a
+claim-before-bind ordering** — it only relocates the TOCTOU window from
+"the picked port" to "the moment between picking it and durably claiming
+it"; see `docs/lessons/testing/2026-09-28-freezing-a-port-set-across-
+retries-only-relocates-the-toctou-bind-and-hold-before-claim.md`. The
+self-minted-id join helpers (`join_allocated_fresh_deadline`/`join_data_
+allocated_fresh_deadline`) deliberately still use `free_addrs` — that
+path's own production ordering is unchanged (a self-minted id is claimed
+before bind, same as before, since `NodeId::mint` needs no `Env` to run at
+all), so it still needs a real, already-resolvable address up front, never
+a literal `:0`.
 
 ## Module map (`src/`)
 
