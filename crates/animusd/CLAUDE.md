@@ -5947,6 +5947,53 @@ ADR itself for the full design/rationale.
   `tests/client_handshake.rs` for the accept-side (mismatched version,
   and a pre-baseline peer with no preamble at all) and dial-side (a fake
   server replying with the wrong version) regressions.
+- **The forwarding path pipelines the handshake instead of paying an
+  extra round trip per forwarded request (same-week follow-up to the
+  bullet above).** `relay_request_with_timeout`/`join_request` each open
+  a **fresh, unpooled** connection per call — every intra forward,
+  `propose_schema`'s broadcast fallback, `AnimusdRelayClient::relay`, and
+  a joining node's own seed discovery all go through one of these two —
+  so the fused dial-side shape the bullet above describes (write our own
+  preamble, then **wait** to read and check the peer's, only *then* write
+  the request frame) cost a full extra round trip on every single one of
+  those calls, not just once per pooled connection the way the internal
+  `Network` transport's own layer-2 handshake does. Fixed with a second
+  dial-side helper, `client_request_pipelined` (`lib.rs`): it writes this
+  build's own preamble and the request frame **back to back**, with no
+  wait in between, then reads and checks the peer's preamble, then reads
+  the response frame — one round trip total (this write, the peer's
+  eventual reply), not two. `relay_request_with_timeout`/`join_request`
+  now dial through it instead of `perform_client_handshake` + a separate
+  `write_frame`/`read_frame` pair; their own sentinel/timeout semantics
+  (`RELAY_TRANSPORT_FAILURE`/`RELAY_HOP_TIMEOUT`, `JOIN_ATTEMPT_TIMEOUT`)
+  are unchanged, since a pipelined handshake failure still resolves (or
+  times out) inside the same outer `tokio::time::timeout(..)` either
+  function already wraps its whole attempt in. **Safe because the accept
+  side is asymmetric, not merely agreeable**: `serve_requests`'s own
+  accept-side handler still runs the fused `perform_client_handshake` to
+  completion — write ours, then read-and-check theirs — **before** it
+  ever calls `handle_connection` and reads a single frame, so a
+  mismatched server refuses and closes the connection without ever
+  processing the frame a pipelined dialer already sent; there is no
+  deadlock risk either, since both sides write only a small, bounded
+  amount (a preamble, plus the dialer's one request frame) before reading
+  anything. `connect_client` (every one-shot dialer — the `animus` CLI,
+  `animusd`'s own integration tests/benches, `remote_metadata_watch_
+  loop`'s long-poll) and `animus-cli`'s own `maybe_tls_connect` are
+  **deliberately left on the fused, non-pipelined path** — neither opens
+  a fresh connection per forwarded request, so the extra round trip is
+  harmless there, and pipelining every dialer uniformly is not worth the
+  risk on a path this one doesn't need to touch. See
+  `client_request_pipelined`'s own doc for the full mechanism and why
+  it's safe, and `crates/animusd/src/lib.rs`'s in-crate
+  `client_request_pipelining_tests` module for the regression coverage:
+  a correct-peer round trip, a wrong-version peer surfacing as a fast
+  `RELAY_TRANSPORT_FAILURE` (never a panic, never `RELAY_HOP_TIMEOUT`),
+  and — the actual round-trip regression — a stub that reads the
+  dialer's preamble **and** its request frame before ever writing its
+  own preamble back, which a fused dial can never satisfy (confirmed to
+  deadlock until the outer relay timeout, pre-fix) and a pipelined one
+  answers almost immediately.
 - **`handle_connection` cancels an in-flight request when the peer closes the
   connection (issue #596), on both listeners.** `serve_requests` used to
   spawn one untracked, fire-and-forget `tokio::spawn` per accepted
