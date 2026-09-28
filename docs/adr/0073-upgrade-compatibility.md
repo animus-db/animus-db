@@ -527,6 +527,49 @@ as one addition, not a rewrite of the row above.
   handle into the client/intra dial paths is a small follow-up, not a
   Phase 2 prerequisite.
 
+**Workstream B as-built (2026-09-28), PR 1 of its own stacked series —
+the shared convention + `CWL1`.** Landed `crates/animus-control/src/
+format.rs` (`pub mod format`, re-exported from `lib.rs`): `FormatTag`
+(magic/version/name, const-constructible), one shared `FormatError`
+(`PreBaselineFormat`/`UnsupportedFormatVersion`/`Malformed`, manual
+`Display`/`std::error::Error` — this crate carries no `thiserror`
+dependency, so the ADR's "thiserror if already a dependency, otherwise
+manual" instruction took the manual branch), the binary `wrap`/`unwrap`
+envelope, and the line `encode_line`/`decode_lines` pair. `persist::
+CONTROL_WAL` (`CWL1`, v1) is now what `PersistedState::encode_record`/
+`decode` use; `decode` returns `Result<_, FormatError>` (previously an
+infallible `Vec`). See `crates/animus-control/CLAUDE.md`'s new "Versioned
+formats" section for the full shape and the exact torn-tail/`Err`
+semantics.
+
+Three notes for whoever reads this row next:
+
+1. **This PR's own scope is narrower than the row above implies** — it is
+   the shared convention plus `CWL1` only. The row's other two items
+   (`CSN1` snapshot/`InstallSnapshot` envelope, `Metadata`'s top-level
+   `"v"` field + the `cp_member_addrs` legacy-field drop) are later PRs in
+   this same stacked series, not done yet as of this note.
+2. **The row's own "replacing the two-generation structural-sniff scheme
+   in `persist.rs`" description was already stale by the time this PR read
+   it.** `persist.rs` had already moved past that scheme onto a
+   checksummed-but-untagged `<crc32>:<json>` line (issue #495, landed
+   before this ADR existed) — there was no structural sniff left in the
+   code to remove; this PR's actual predecessor state was "checksummed,
+   not tagged," not "two structurally-disambiguated generations." Recorded
+   here as the general reminder this ADR's own workstream table already
+   asks for elsewhere: verify an inventory claim against the code before
+   relying on it, rather than propagating stale prose forward.
+3. **One deliberate deviation from the Version tag shape convention's
+   plain raw-`u8` byte, confined to the *line* shape only**: `encode_line`/
+   `decode_lines` render the version as two lowercase hex digits rather
+   than a raw byte, because a raw version byte can equal `\n` (version 10)
+   and corrupt the line's own delimiter. The value is still a `u8`
+   (`0..=255`); only its line-format rendering differs. `wrap`/`unwrap`
+   (the binary envelope, no line delimiter to protect) keeps the plain raw
+   byte this ADR's convention describes. Workstream C inherits this
+   unchanged when it adopts `encode_line`/`decode_lines` for its own
+   `SWL1` envelope.
+
 ## Testing
 
 Every phase must stay provable under ADR 0003's determinism guarantee, the

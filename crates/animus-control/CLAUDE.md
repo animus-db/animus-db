@@ -393,6 +393,97 @@ per-tablet CP data plane (`animus-cp-data`).
   differential oracle, and `animusd`'s `tests/control_mirror_restart.rs`
   (a real `ProdEnv` restart).
 
+## Versioned formats (ADR 0073 Phase 0)
+
+**`format.rs`** is the shared tagged-envelope convention Phase 0 workstream
+B introduced, and the one workstream C (`animus-cp-data`) reuses rather
+than inventing a second "envelope wraps an inner payload" scheme for the
+same problem (see `docs/adr/0073-upgrade-compatibility.md`'s Phase 0
+conventions and workstream table). Pure, no `Env`/I/O/`HashMap` — a format
+tag plus two independent framing shapes:
+
+- **`FormatTag { magic: [u8; 4], version: u8, name: &'static str }`** —
+  `Copy`, `Debug`, const-constructible. `version` is the version an encoder
+  using this tag currently writes; a decoder accepts `1..=version`. Every
+  format defines its own `pub const FormatTag`, e.g. this module's own
+  [`persist::CONTROL_WAL`] (magic `CWL1`, version 1).
+- **`FormatError`** — one enum shared across every format in the codebase,
+  not one per format: `PreBaselineFormat { format }` (no/unrecognized
+  magic — pre-baseline data, or garbage), `UnsupportedFormatVersion {
+  format, found, max_supported }` (right magic, version `0` or newer than
+  this build knows), `Malformed { format, detail }` (right magic + a
+  supported version + a valid checksum, but the payload itself doesn't
+  decode — real corruption or a decoder/encoder bug, always loud). Manual
+  `Display`/`std::error::Error` (this crate carries no `thiserror`
+  dependency).
+- **The binary envelope — `wrap`/`unwrap`**: `magic(4) || version(u8) ||
+  payload`, the shape already proven by the LSM manifest (`CMF1`) and the
+  encryption envelope (`ADE1`, both `animus-env`). For a self-contained
+  blob with no internal line framing of its own (a snapshot/
+  `InstallSnapshot` envelope is the natural next user of this — not yet
+  wired as of this PR).
+- **The line envelope — `encode_line`/`decode_lines`**: `<crc32 as 8
+  lowercase hex chars>:<magic(4 ASCII)><version as 2 lowercase hex
+  digits><payload>\n`, the CRC (`crc32fast::hash`) covering everything
+  after the colon (magic + version + payload). **The hex-rendered version
+  is the one deliberate deviation from a raw `u8` byte** — a raw version
+  byte can equal `\n` itself (version `10` = `0x0A`), which would corrupt
+  this format's own line delimiter; two lowercase hex digits keep the
+  *value* space at `0..=255` like every other tag in this codebase while
+  making that collision structurally impossible (every hex digit is ASCII
+  `[0-9a-f]`, none of which is `\n`). `wrap`/`unwrap` has no line delimiter
+  to protect, so it keeps the ADR's plain raw-byte shape.
+- **Decode semantics (both shapes), never a panic**: a **torn tail** (a
+  write cut short by a crash — no `:` separator, a non-8-hex-digit prefix,
+  a CRC mismatch, or a body too short to hold `magic + version` once the
+  CRC does check out) **stops decoding silently**, returning whatever was
+  collected before it — never an `Err`, since a torn/un-fsynced write was
+  never acknowledged either way (durable-before-visible, ADR 0009), so
+  recovering it or not is equally safe. A **CRC-valid line with the wrong
+  magic** is `Err(PreBaselineFormat)` — exactly what a pre-baseline,
+  untagged record looks like to a post-baseline decoder. A **CRC-valid,
+  correctly-tagged line with an unsupported version** is
+  `Err(UnsupportedFormatVersion)`.
+
+**`persist::CONTROL_WAL`** (magic `CWL1`, version 1) is what
+`PersistedState::encode_record`/`PersistedState::decode` use via
+`format::encode_line`/`format::decode_lines` — replacing the two-generation
+"a reader distinguishes them structurally, not by a tag" scheme ADR 0073's
+own format inventory described (**that description was already stale by
+the time this PR read it**: the code had already dropped the unchecksummed
+predecessor format with no structural sniff left to remove — see the ADR's
+own "Workstream B as-built" amendment). `decode` now returns
+`Result<Vec<WalRecord<C, S>>, FormatError>`: a torn tail is `Ok` with a
+shorter prefix (unchanged recovery behavior); a pre-baseline/unrecognized-
+version/malformed-payload WAL is a loud, named `Err`, never silently
+treated as an empty log. **This tag applies to `animus-cp-data`'s own
+non-`SharedWal` per-group WAL too** — its fallback persist path
+(`--no-shared-wal`) is the *same* generic `PersistedState<C, S>` defined
+here, just instantiated `C = KvCommand`/`S = KvState`; there is no second
+WAL-line codec for that crate to keep in sync. **`encode_tagged_record`/
+`decode_tagged` (the `SharedWal` outer `Line{tablet, record}` envelope)
+are deliberately untouched by this reset** — they stay on the pre-existing,
+unversioned `<crc32>:<json>` framing (`encode_checksummed_line`/
+`verify_checksummed_line`, kept as private helpers) pending ADR 0073 Phase
+0 **workstream C**'s own `SWL1` conversion to `format::encode_line`/
+`decode_lines`. **`shared_wal.rs` lives in this crate (`animus-control`),
+not `animus-cp-data`, despite the ADR's workstream table listing the
+`SharedWal` envelope conversion under workstream C** — workstream C reuses
+this crate's own convention/module for a type this crate also happens to
+define; grep before assuming a format lives in the crate that "owns" it.
+
+**Golden fixture**: `tests/fixtures/formats/control-wal/v1.bin` — one of
+each `WalRecord<MetaCommand, Metadata>` variant, deterministic content only
+(fixed constants, `Metadata::default()` — see `tests/format_fixtures.rs`'s
+own module doc for why the embedded `Metadata` is deliberately minimal: a
+later PR in this same stack adds a required `"v"` field to `Metadata`'s
+JSON shape, and a checked-in fixture may never be edited once merged).
+`tests/format_fixtures.rs` has the decode/round-trip tests plus the
+`#[ignore]`d `generate_fixture_control_wal` generator (`cargo test -p
+animus-control --test format_fixtures generate_fixture_control_wal --
+--ignored`) — refuses to overwrite an existing fixture file; bump
+`CONTROL_WAL::version` and add a new one instead.
+
 ## Key invariants
 
 - **Boot-time genesis-vs-wiped-restart check (ADR 0009's 2026-09-15

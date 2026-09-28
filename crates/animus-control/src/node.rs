@@ -1270,7 +1270,36 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
 ) {
     // Recover from the WAL before serving anything.
     let bytes = env.read(WAL).await.unwrap_or_default();
-    let state = PersistedState::replay(PersistedState::decode(&bytes));
+    let records = match PersistedState::decode(&bytes) {
+        Ok(records) => records,
+        Err(e) => {
+            // ADR 0073 Phase 0 workstream B: a WAL that fails to decode —
+            // bad/missing magic (pre-baseline data), an unrecognized
+            // future version, or a corrupted-but-checksum-valid record —
+            // must never be silently treated as "empty," which would make
+            // genuine corruption indistinguishable from a genuine first
+            // boot and defeat the entire point of tagging the format.
+            // `drive` is spawned fire-and-forget (`EnvExt::spawn_task`
+            // requires `Future<Output = ()>`) by `RaftNode::start*`, which
+            // itself returns `Self`, not a `Result`, across ~150 call
+            // sites in this workspace — restructuring that is out of
+            // scope here, so there is no `Result` this function can
+            // propagate into. Surface the failure loudly instead (an
+            // `error`-level log naming the exact `FormatError`), then halt
+            // this node permanently before it ever calls
+            // `RaftCore::recovered`/grants a vote/campaigns — it never
+            // silently proceeds on `RaftCore::new`'s fresh, empty state.
+            tracing::error!(
+                error = %e,
+                "control-plane Raft WAL failed to decode; refusing to recover \
+                 as an empty log — halting this node until its WAL is \
+                 repaired or removed"
+            );
+            halted.store(true, Ordering::SeqCst);
+            return;
+        }
+    };
+    let state = PersistedState::replay(records);
     if !state.is_empty() {
         let recovered =
             RaftCore::recovered(env.node_id(), &all_nodes, state, env.now(), env.next_u64());
