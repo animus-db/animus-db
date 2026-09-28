@@ -2,11 +2,15 @@
 //!
 //! **Prep for Phase 2, not a compatibility mechanism yet.** This module is
 //! pure codec + check: it builds the byte layout, the version-equality
-//! policy, and the error type. It does not, by itself, read or write a
-//! single byte on a real socket or a `SimEnv` node — that is later layers'
-//! job (`ProdEnv`'s accept/connect paths, `animusd`'s client/intra port,
-//! `SimEnv`'s per-node delivery check), each of which calls [`encode`],
-//! [`decode`], and [`check_peer`] from here rather than reinventing them.
+//! policy, and the error type. It does not, itself, read or write a single
+//! byte on a real socket or a `SimEnv` node — a caller wires that in,
+//! calling [`encode`], [`decode`], and [`check_peer`] from here rather than
+//! reinventing them. **`ProdEnv`'s real internal `Network` transport is
+//! wired to it now** — `crates/animus-env/src/prod.rs`'s
+//! `perform_handshake` runs this exchange once per connection on both the
+//! accept and dial paths, before a single frame is read or written. Still
+//! to come: `animusd`'s client/intra port (a distinct wire, [`CLIENT_
+//! PROTOCOL`], below) and `SimEnv`'s per-node delivery check.
 //!
 //! # Why a per-connection preamble, not a per-message version field
 //!

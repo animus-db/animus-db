@@ -38,11 +38,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, mpsc};
 
+use crate::handshake;
 #[cfg(test)]
 use crate::nid;
 use crate::tls::server_name_for;
 use crate::{
-    Clock, Disk, Env, Envelope, MaybeTlsStream, MetricsHandle, Nanos, Network, NodeId, Rng,
+    Clock, Disk, Env, Envelope, MaybeTlsStream, Metric, MetricsHandle, Nanos, Network, NodeId, Rng,
     Spawner, TlsConfig, TlsMaterial, UnixMillis,
 };
 
@@ -224,7 +225,13 @@ impl ProdEnv {
         tokio::fs::create_dir_all(&data_dir).await?;
         let listener = TcpListener::bind(listen).await?;
         let local_addr = listener.local_addr()?;
-        let (raw_rx, accept_abort) = spawn_accept(listener, tls.clone());
+        // Built before `spawn_accept` (rather than inside `Inner` only) so
+        // the accept loop's own per-connection handshake (ADR 0073 Phase 0,
+        // workstream D) can record `Metric::NetworkHandshakeRefused` into
+        // the same sink this env's `metrics_text()`/`Env::metrics()` expose —
+        // one recording handle for the whole env, not a second one.
+        let metrics = MetricsHandle::recording();
+        let (raw_rx, accept_abort) = spawn_accept(listener, tls.clone(), metrics.clone());
         let demux = Arc::new(StdMutex::new(Demux::default()));
         let pump_abort = spawn_pump(raw_rx, Arc::clone(&demux));
 
@@ -256,7 +263,7 @@ impl ProdEnv {
                 tasks: StdMutex::new(vec![accept_abort, pump_abort]),
                 task_panics: AtomicU64::new(0),
                 first_task_panic: StdMutex::new(None),
-                metrics: MetricsHandle::recording(),
+                metrics,
             }),
         };
         Ok((env, local_addr))
@@ -436,6 +443,18 @@ async fn open_append(path: &std::path::Path) -> std::io::Result<tokio::fs::File>
 /// These are the *raw*, not-yet-demultiplexed frames off one accepted
 /// connection — `spawn_pump` fans them out by `stream` into an env's
 /// [`Demux`].
+///
+/// **This frame format is unchanged by ADR 0073 Phase 0's workstream D.**
+/// What changed is what precedes it: every connection this env accepts or
+/// dials now opens with a one-time [`handshake`] preamble exchange
+/// ([`perform_handshake`]) — both sides write their own
+/// [`handshake::NETWORK_PROTOCOL`] preamble, then read and check the
+/// peer's, before a single frame is written or read. `read_frames` itself
+/// is only ever called on a connection that already passed that check
+/// (`spawn_accept` calls [`perform_handshake`] first and simply drops the
+/// connection on failure, never reaching this function) — so the frame
+/// layout here, and the receive side in general, needs no change: the
+/// handshake is a connection-setup step, not a per-frame one.
 async fn read_frames(
     mut stream: MaybeTlsStream,
     tx: mpsc::UnboundedSender<Envelope>,
@@ -634,6 +653,7 @@ impl Network for ProdEnv {
             Arc::clone(conns.entry(addr.clone()).or_default())
         };
         let tls = self.inner.tls.clone();
+        let metrics = self.inner.metrics.clone();
         // Issue #661: run the actual connect+write on its own task, bounded by
         // `SEND_TIMEOUT`, instead of inline on this `.await` — see
         // `SEND_TIMEOUT`'s own doc for why a caller (most importantly a Raft
@@ -647,7 +667,15 @@ impl Network for ProdEnv {
         self.spawn(Box::pin(async move {
             match tokio::time::timeout(
                 SEND_TIMEOUT,
-                send_frame_pooled(&slot, &addr, &from, stream, &payload, tls.as_ref()),
+                send_frame_pooled(
+                    &slot,
+                    &addr,
+                    &from,
+                    stream,
+                    &payload,
+                    tls.as_ref(),
+                    &metrics,
+                ),
             )
             .await
             {
@@ -895,6 +923,181 @@ fn harden_pooled_socket(stream: &TcpStream, peer_desc: &str) {
     }
 }
 
+/// Bounds how long the per-connection handshake preamble exchange
+/// ([`perform_handshake`], ADR 0073 Phase 0 workstream D) may take end to
+/// end — this build's own write plus the peer's preamble arriving and
+/// being read. Real time is fine here — this is `ProdEnv`, the
+/// nondeterministic side of the seam (ADR 0003) — and this bound only ever
+/// matters for a peer that is slow, wedged, or was never going to send a
+/// preamble at all (a pre-baseline peer whose first bytes are a raw,
+/// unversioned frame, or a peer that connects and then falls silent).
+/// Generous relative to a same-datacenter round trip (this is a one-time
+/// per-connection cost, not a per-frame one — see the `handshake` module's
+/// own "why per-connection" doc) yet, on the **dial** side, mostly moot in
+/// practice: `send_frame_pooled`'s own [`SEND_TIMEOUT`] (2s) already wraps
+/// the whole connect-plus-handshake-plus-write, so this bound's real job is
+/// the **accept** side, which has no other timeout guarding it at all —
+/// without it, a peer that opens a connection and never sends anything
+/// would park an accept-side task (and its `read_frames` never entered)
+/// forever.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Every way the per-connection handshake preamble exchange
+/// ([`perform_handshake`]) can fail, before a decoded [`handshake::
+/// Preamble`] would even reach [`handshake::check_peer`] (a plain I/O
+/// failure — EOF, a reset, or this build's own write erroring) or the
+/// genuine protocol refusal `check_peer` reports. Kept as one enum so
+/// [`read_preamble`] and [`perform_handshake`] can log and count each
+/// branch differently without threading two separate error types around.
+#[derive(Debug)]
+enum HandshakeFailure {
+    /// EOF, a reset, or any other I/O error while writing this build's own
+    /// preamble or reading the peer's. **Never** counted as a refusal (see
+    /// [`perform_handshake`]'s own doc for the counting decision) — this is
+    /// what a merely slow or already-dead peer looks like, not a wire
+    /// mismatch.
+    Io(std::io::Error),
+    /// The peer's preamble decoded but named the wrong magic/version, or
+    /// declared an over-long extension — a genuine protocol mismatch.
+    /// Counted via [`Metric::NetworkHandshakeRefused`].
+    Refused(handshake::HandshakeError),
+}
+
+/// Reads one peer [`handshake::Preamble`] off `conn`: the fixed
+/// [`handshake::HEADER_LEN`]-byte header first, then whatever extension
+/// bytes it declares — mirroring [`handshake::decode`]'s own incremental-
+/// read contract (see that function's own doc). The only
+/// [`handshake::HandshakeError`] this can surface is
+/// [`handshake::HandshakeError::ExtensionTooLong`]; `BadMagic`/
+/// `UnsupportedVersion` are [`handshake::check_peer`]'s job, called
+/// separately by [`perform_handshake`] once a `Preamble` is in hand.
+async fn read_preamble(conn: &mut MaybeTlsStream) -> Result<handshake::Preamble, HandshakeFailure> {
+    let mut header = [0u8; handshake::HEADER_LEN];
+    conn.read_exact(&mut header)
+        .await
+        .map_err(HandshakeFailure::Io)?;
+    match handshake::decode(&header) {
+        Ok((preamble, _)) => Ok(preamble),
+        Err(handshake::HandshakeError::Incomplete) => {
+            // The header alone decoded far enough to learn `ext_len` but
+            // needs more bytes before a full `Preamble` comes out — read
+            // exactly that many more and decode the whole thing.
+            let ext_len = u16::from_le_bytes([header[5], header[6]]) as usize;
+            let mut buf = header.to_vec();
+            buf.resize(handshake::HEADER_LEN + ext_len, 0);
+            conn.read_exact(&mut buf[handshake::HEADER_LEN..])
+                .await
+                .map_err(HandshakeFailure::Io)?;
+            let (preamble, _) = handshake::decode(&buf).map_err(HandshakeFailure::Refused)?;
+            Ok(preamble)
+        }
+        Err(other) => Err(HandshakeFailure::Refused(other)),
+    }
+}
+
+/// The actual handshake exchange, run under [`perform_handshake`]'s
+/// [`HANDSHAKE_TIMEOUT`]: write this build's own preamble, then read and
+/// check the peer's.
+async fn handshake_exchange(conn: &mut MaybeTlsStream) -> Result<(), HandshakeFailure> {
+    let ours = handshake::encode(&handshake::Preamble::for_protocol(
+        &handshake::NETWORK_PROTOCOL,
+    ));
+    conn.write_all(&ours).await.map_err(HandshakeFailure::Io)?;
+    conn.flush().await.map_err(HandshakeFailure::Io)?;
+    let peer = read_preamble(conn).await?;
+    handshake::check_peer(&handshake::NETWORK_PROTOCOL, &peer).map_err(HandshakeFailure::Refused)
+}
+
+/// Performs this build's half of the per-connection handshake (ADR 0073
+/// Phase 0, workstream D — see `handshake.rs`'s own module doc for why a
+/// per-connection preamble, not a per-message field, is the right shape)
+/// on `conn`, run once right after TLS is established (or right after
+/// connect/accept, for a plain connection), before a single frame is
+/// written or read on it: **writes this build's own
+/// [`handshake::NETWORK_PROTOCOL`] preamble first** — so a mismatched peer
+/// can name the mismatch too, even when it's about to refuse this side —
+/// then reads and checks the peer's, the whole exchange bounded by
+/// [`HANDSHAKE_TIMEOUT`].
+///
+/// `role` is `"accept"` or `"dial"`, only for the log line; `peer_desc` is
+/// the peer's address as this side knows it (the accepted socket's
+/// `peer_addr`, or the dial target string).
+///
+/// **Every failure is logged at `warn`** — louder than `read_frames`'s own
+/// `debug`-level "peer connection closed", deliberately: a handshake
+/// refusal or timeout is worth an operator's attention in a way an
+/// ordinary connection close is not.
+///
+/// **Counting decision**: only a genuine protocol refusal (bad magic,
+/// unsupported version, or an oversized declared extension) increments
+/// [`Metric::NetworkHandshakeRefused`]. A plain I/O failure (EOF, reset) or
+/// a timeout is logged but **not** counted — both are what a merely slow
+/// or already-dead peer looks like (already covered by this env's existing
+/// dead-peer detection, `POOLED_SOCKET_DEAD_PEER_TIMEOUT`/`SEND_TIMEOUT`),
+/// not evidence of a wire mismatch. Folding them into the same counter
+/// would turn a targeted "a real peer spoke the wrong protocol" signal
+/// into a vague "this connection had some problem" one.
+///
+/// **Log-volume decision (repeated mismatched dials)**: a persistently
+/// mismatched peer re-dials (and re-fails this handshake) at whatever rate
+/// its own caller sends at — `send_frame_pooled` caches nothing across a
+/// failed connect, so there is no cached connection to reuse and no retry
+/// loop *within* one call beyond the existing reconnect-once. This can mean
+/// one `warn` per heartbeat interval for as long as the mismatch persists,
+/// which this deliberately does **not** suppress: a real, persistent
+/// version mismatch is not expected to occur at all at this phase (ADR
+/// 0073 Phase 0 — no rolling upgrade exists yet, so it can only mean a
+/// misconfigured/mismatched deploy), and an operator actively debugging one
+/// wants every occurrence visible, not rate-limited away. The rate is
+/// bounded by the caller's own send cadence, not unbounded — it cannot hot-
+/// loop — and this mirrors `spawn_accept`'s own pre-existing "TLS handshake
+/// failed" `warn` (below), which already logs on every failed attempt with
+/// no suppression.
+///
+/// On any failure the connection is simply not returned — the caller closes
+/// it (by dropping it) without ever entering the frame loop.
+async fn perform_handshake(
+    mut conn: MaybeTlsStream,
+    role: &'static str,
+    peer_desc: &str,
+    metrics: &MetricsHandle,
+) -> std::io::Result<MaybeTlsStream> {
+    match tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake_exchange(&mut conn)).await {
+        Ok(Ok(())) => Ok(conn),
+        Ok(Err(HandshakeFailure::Io(err))) => {
+            tracing::warn!(
+                ?err,
+                peer = %peer_desc,
+                role,
+                "network handshake failed (closing connection)"
+            );
+            Err(err)
+        }
+        Ok(Err(HandshakeFailure::Refused(err))) => {
+            tracing::warn!(
+                ?err,
+                peer = %peer_desc,
+                role,
+                "network handshake refused (closing connection)"
+            );
+            metrics.incr(Metric::NetworkHandshakeRefused);
+            Err(std::io::Error::new(std::io::ErrorKind::InvalidData, err))
+        }
+        Err(_elapsed) => {
+            tracing::warn!(
+                peer = %peer_desc,
+                role,
+                timeout = ?HANDSHAKE_TIMEOUT,
+                "network handshake timed out (closing connection)"
+            );
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "network handshake timed out",
+            ))
+        }
+    }
+}
+
 /// Spawn the accept loop for `listener` — one reader task per inbound connection,
 /// each demuxing length-prefixed frames into a fresh inbox channel. Returns the
 /// inbox receiver and the accept task's abort handle (for `shutdown`).
@@ -935,9 +1138,25 @@ fn harden_pooled_socket(stream: &TcpStream, peer_desc: &str) {
 /// [`connect_nodelay`] already does on the dial side, so a peer that
 /// silently vanishes is detected the same way regardless of which side of
 /// the connection this node was on.
+///
+/// **Network handshake preamble (ADR 0073 Phase 0, workstream D):** once
+/// TLS (if any) is established, every accepted socket runs
+/// [`perform_handshake`] before a single frame is read — this build writes
+/// its own [`handshake::NETWORK_PROTOCOL`] preamble, then reads and checks
+/// the peer's, under [`HANDSHAKE_TIMEOUT`]. A bad magic (covering, in
+/// particular, a pre-baseline peer whose first bytes are a raw,
+/// unversioned frame — it was never going to send this preamble at all),
+/// an unsupported version, an oversized declared extension, or an EOF/
+/// timeout during the exchange are all logged at `warn` and simply drop
+/// the connection without ever entering [`read_frames`] — never a panic,
+/// and (like a failed TLS handshake, just above) the listener keeps
+/// serving every other peer without interruption. See
+/// [`perform_handshake`]'s own doc for exactly which of these count
+/// [`Metric::NetworkHandshakeRefused`].
 fn spawn_accept(
     listener: TcpListener,
     tls: Option<TlsMaterial>,
+    metrics: MetricsHandle,
 ) -> (mpsc::UnboundedReceiver<Envelope>, tokio::task::AbortHandle) {
     let (tx, rx) = mpsc::unbounded_channel();
     let accept = tokio::spawn(async move {
@@ -947,6 +1166,7 @@ fn spawn_accept(
                     harden_pooled_socket(&stream, &peer_addr.to_string());
                     let tx = tx.clone();
                     let tls = tls.clone();
+                    let metrics = metrics.clone();
                     tokio::spawn(async move {
                         let stream = match tls {
                             None => MaybeTlsStream::Plain(stream),
@@ -961,6 +1181,17 @@ fn spawn_accept(
                                     return;
                                 }
                             },
+                        };
+                        let stream = match perform_handshake(
+                            stream,
+                            "accept",
+                            &peer_addr.to_string(),
+                            &metrics,
+                        )
+                        .await
+                        {
+                            Ok(stream) => stream,
+                            Err(_err) => return, // already logged/counted by perform_handshake
                         };
                         if let Err(err) = read_frames(stream, tx).await {
                             tracing::debug!(?err, "peer connection closed");
@@ -984,6 +1215,21 @@ fn spawn_accept(
 /// happens on this connect path: a cached, already-live stream is reused
 /// with no lookup at all. Holding the per-address lock across the whole
 /// frame write is what keeps concurrent senders' frames from interleaving.
+///
+/// **Pool-lock scope (checked when the handshake preamble was added,
+/// ADR 0073 Phase 0 workstream D):** `slot` is the per-*address*
+/// `tokio::sync::Mutex` from `Inner.conns` — `send_stream` clones it out
+/// from under `Inner.conns`'s outer `StdMutex` and drops that outer guard
+/// *before* ever reaching this function (see `Network::send_stream`'s own
+/// comment), so nothing here ever holds a lock shared with any other
+/// destination address. Waiting out a handshake round trip while holding
+/// `slot` therefore only serializes concurrent senders **to this one
+/// peer** — which they already are, for frame-interleaving-safety reasons,
+/// independent of the handshake — and never delays a send to any other
+/// peer, and never risks a cross-peer deadlock. This is exactly the same
+/// scope the TLS handshake (just below) has already been paying for since
+/// ADR 0064, so adding the network handshake's own round trip inside
+/// `connect_maybe_tls` needed no restructuring.
 /// On a write error the cached stream is stale (e.g. the peer restarted
 /// since the last send, or — for a hostname peer — moved to a new address
 /// entirely) — drop it, reconnect **once** (re-resolving `addr` fresh, which
@@ -1000,6 +1246,17 @@ fn spawn_accept(
 /// `io::Error` from `connect_maybe_tls` — handled by the exact same
 /// reconnect-once-then-surface path a failed plain dial already used, no
 /// special-casing needed here.
+///
+/// **Network handshake preamble (ADR 0073 Phase 0, workstream D):**
+/// `connect_maybe_tls` also runs [`perform_handshake`] on both the initial
+/// connect and any reconnect, right after TLS (if any) is established —
+/// same treatment as the TLS handshake failure just above: a preamble
+/// mismatch/timeout surfaces as a plain `io::Error`, already logged/
+/// counted by `perform_handshake` itself, and this function's existing
+/// reconnect-once-then-surface path (and its caller's "don't cache a
+/// connection that never carried a frame" contract) handles it with no
+/// special-casing — a connection that fails its handshake is simply never
+/// stored in `slot`, matching a failed plain/TLS connect exactly.
 async fn send_frame_pooled(
     slot: &Mutex<Option<MaybeTlsStream>>,
     addr: &str,
@@ -1007,16 +1264,17 @@ async fn send_frame_pooled(
     msg_stream: u64,
     payload: &[u8],
     tls: Option<&TlsMaterial>,
+    metrics: &MetricsHandle,
 ) -> std::io::Result<()> {
     let mut guard = slot.lock().await;
     if guard.is_none() {
-        *guard = Some(connect_maybe_tls(addr, tls).await?);
+        *guard = Some(connect_maybe_tls(addr, tls, metrics).await?);
     }
     let conn = guard.as_mut().expect("connection just ensured");
     if let Err(err) = write_frame(conn, from, msg_stream, payload).await {
         tracing::debug!(?err, %addr, "cached connection failed; reconnecting once");
         *guard = None; // drop the stale stream before dialing afresh
-        let mut fresh = connect_maybe_tls(addr, tls).await?;
+        let mut fresh = connect_maybe_tls(addr, tls, metrics).await?;
         write_frame(&mut fresh, from, msg_stream, payload).await?;
         *guard = Some(fresh); // cache only a stream that just carried a frame
     }
@@ -1047,19 +1305,26 @@ async fn connect_nodelay(addr: &str) -> std::io::Result<TcpStream> {
 /// The `ServerName` the handshake verifies against is derived from `addr`
 /// itself ([`server_name_for`]), so a peer's certificate SAN must cover
 /// whatever string the peer book holds for it (see the `tls` module doc).
+///
+/// Once TLS (if any) is established, runs [`perform_handshake`] on the
+/// resulting stream — this build's half of the network handshake preamble
+/// (ADR 0073 Phase 0, workstream D) — before returning it, so every stream
+/// this function hands back has already been checked in both directions.
 async fn connect_maybe_tls(
     addr: &str,
     tls: Option<&TlsMaterial>,
+    metrics: &MetricsHandle,
 ) -> std::io::Result<MaybeTlsStream> {
     let stream = connect_nodelay(addr).await?;
-    match tls {
-        None => Ok(MaybeTlsStream::Plain(stream)),
+    let stream = match tls {
+        None => MaybeTlsStream::Plain(stream),
         Some(tls) => {
             let server_name = server_name_for(addr)?;
             let tls_stream = tls.connector.connect(server_name, stream).await?;
-            Ok(MaybeTlsStream::Tls(Box::new(tls_stream.into())))
+            MaybeTlsStream::Tls(Box::new(tls_stream.into()))
         }
-    }
+    };
+    perform_handshake(stream, "dial", addr, metrics).await
 }
 
 /// Write one length-prefixed `[from_len: u32][from: utf8 bytes][stream:
@@ -3590,5 +3855,234 @@ mod tests {
         assert_eq!(env.first_spawned_task_panic(), None);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- ADR 0073 Phase 0, workstream D: the network handshake preamble
+    // wired into `ProdEnv`'s accept/connect paths. ---
+
+    /// A raw dialer speaking the network handshake's right magic but a
+    /// **wrong version** against a real `ProdEnv` listener: the acceptor
+    /// must still write its own `NHS1` v1 preamble first — so the raw peer
+    /// can see what it's not agreeing with, even though it's about to be
+    /// refused — then close the connection without ever entering the frame
+    /// loop (the raw peer's next read is a clean EOF, never a frame).
+    /// `Metric::NetworkHandshakeRefused` counts the refusal, and the
+    /// listener keeps serving a genuine peer right after.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn accept_refuses_mismatched_version_and_keeps_serving() {
+        use crate::Network;
+
+        let dir_b = unique_tmp_dir();
+        let loop0 = "127.0.0.1:0".parse::<SocketAddr>().unwrap();
+        let (b, b_addr) = ProdEnv::bind(nid(1), loop0, &dir_b).await.expect("bind b");
+
+        let bad = handshake::Preamble {
+            magic: handshake::NETWORK_PROTOCOL.magic,
+            version: handshake::NETWORK_PROTOCOL.version + 1,
+            extensions: Vec::new(),
+        };
+        let mut raw = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(b_addr))
+            .await
+            .expect("connect timed out")
+            .expect("raw connect");
+        raw.write_all(&handshake::encode(&bad))
+            .await
+            .expect("write mismatched-version preamble");
+
+        // The acceptor writes its own preamble first, regardless of what it
+        // is about to decide about ours.
+        let mut header = [0u8; handshake::HEADER_LEN];
+        tokio::time::timeout(Duration::from_secs(5), raw.read_exact(&mut header))
+            .await
+            .expect("read of acceptor's own preamble timed out")
+            .expect("read acceptor preamble");
+        let (their_preamble, _) = handshake::decode(&header).expect("decode acceptor preamble");
+        assert_eq!(their_preamble.magic, handshake::NETWORK_PROTOCOL.magic);
+        assert_eq!(their_preamble.version, handshake::NETWORK_PROTOCOL.version);
+
+        // Having refused, the acceptor closes the connection without ever
+        // reaching the frame loop.
+        let mut trailing = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(5), raw.read(&mut trailing))
+            .await
+            .expect("read for EOF timed out")
+            .expect("read for EOF");
+        assert_eq!(
+            n, 0,
+            "acceptor must close the connection on a version mismatch"
+        );
+
+        // The refusal's metric increment happens on the accept task, not
+        // synchronously with this test's own read of the EOF — poll rather
+        // than assert immediately.
+        let metrics = b.metrics();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if metrics.get(Metric::NetworkHandshakeRefused) >= 1 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "NetworkHandshakeRefused never incremented for a version mismatch"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // The listener keeps accepting and serving a real peer afterward.
+        let dir_a = unique_tmp_dir();
+        let (a, _) = ProdEnv::bind(nid(0), loop0, &dir_a).await.expect("bind a");
+        a.set_peers([(nid(1), b_addr.to_string())].into_iter().collect());
+        a.send(nid(1), b"still-serving".to_vec()).await;
+        let env = tokio::time::timeout(Duration::from_secs(10), b.recv())
+            .await
+            .expect("recv after a refused peer timed out");
+        assert_eq!(env.payload, b"still-serving");
+
+        drop(raw);
+        a.shutdown();
+        b.shutdown();
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+    /// The pre-baseline case: a raw dialer that never sends this handshake
+    /// preamble at all, just a plausible-looking raw frame header (exactly
+    /// what a pre-ADR-0073 peer's first bytes on this wire used to be) —
+    /// this must decode as `BadMagic`, refuse, count, and close, the same
+    /// as an explicit version mismatch above, and the listener must keep
+    /// serving genuine peers afterward.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn accept_refuses_bad_magic_pre_baseline_frame_and_keeps_serving() {
+        use crate::Network;
+
+        let dir_b = unique_tmp_dir();
+        let loop0 = "127.0.0.1:0".parse::<SocketAddr>().unwrap();
+        let (b, b_addr) = ProdEnv::bind(nid(1), loop0, &dir_b).await.expect("bind b");
+
+        // A plausible pre-handshake frame-length prefix, never this magic
+        // (mirrors `handshake.rs`'s own `check_peer_rejects_a_raw_pre_
+        // baseline_frame_as_bad_magic` fixture).
+        let raw_frame_start = [0x00, 0x00, 0x00, 0x10, 0xFF, 0x00, 0x00];
+        let mut raw = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(b_addr))
+            .await
+            .expect("connect timed out")
+            .expect("raw connect");
+        raw.write_all(&raw_frame_start)
+            .await
+            .expect("write raw pre-baseline bytes");
+
+        let mut header = [0u8; handshake::HEADER_LEN];
+        tokio::time::timeout(Duration::from_secs(5), raw.read_exact(&mut header))
+            .await
+            .expect("read of acceptor's own preamble timed out")
+            .expect("read acceptor preamble");
+        let (their_preamble, _) = handshake::decode(&header).expect("decode acceptor preamble");
+        assert_eq!(their_preamble.magic, handshake::NETWORK_PROTOCOL.magic);
+
+        let mut trailing = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(5), raw.read(&mut trailing))
+            .await
+            .expect("read for EOF timed out")
+            .expect("read for EOF");
+        assert_eq!(
+            n, 0,
+            "acceptor must close the connection on a bad-magic pre-baseline peer"
+        );
+
+        let metrics = b.metrics();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if metrics.get(Metric::NetworkHandshakeRefused) >= 1 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "NetworkHandshakeRefused never incremented for a bad-magic peer"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let dir_a = unique_tmp_dir();
+        let (a, _) = ProdEnv::bind(nid(0), loop0, &dir_a).await.expect("bind a");
+        a.set_peers([(nid(1), b_addr.to_string())].into_iter().collect());
+        a.send(nid(1), b"still-serving-2".to_vec()).await;
+        let env = tokio::time::timeout(Duration::from_secs(10), b.recv())
+            .await
+            .expect("recv after a refused peer timed out");
+        assert_eq!(env.payload, b"still-serving-2");
+
+        drop(raw);
+        a.shutdown();
+        b.shutdown();
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+    /// The dial side's mirror: a raw fake "acceptor" that writes back a
+    /// wrong-version preamble to every connection it accepts. A real
+    /// `ProdEnv::send` to it must never panic, must count the refusal, and
+    /// — since a failed handshake is never cached (see `send_frame_pooled`'s
+    /// own doc) — a second send re-dials rather than reusing anything, which
+    /// this proves two ways: the refusal counter reaches 2 (not 1), and the
+    /// fake acceptor itself sees 2 separate inbound connections.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dial_refused_by_mismatched_fake_acceptor_is_never_cached() {
+        use crate::Network;
+
+        let fake = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake acceptor");
+        let fake_addr = fake.local_addr().expect("fake acceptor addr");
+        let accepted = Arc::new(AtomicU64::new(0));
+        let accepted_for_task = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = fake.accept().await else {
+                    return;
+                };
+                accepted_for_task.fetch_add(1, Ordering::SeqCst);
+                let bad = handshake::Preamble {
+                    magic: handshake::NETWORK_PROTOCOL.magic,
+                    version: handshake::NETWORK_PROTOCOL.version + 1,
+                    extensions: Vec::new(),
+                };
+                // Best-effort: the dialer may already have given up and
+                // closed its side by the time this writes; that's just
+                // another way the dialer's own read fails, not a bug here.
+                let _ = sock.write_all(&handshake::encode(&bad)).await;
+            }
+        });
+
+        let dir_a = unique_tmp_dir();
+        let (a, _) = ProdEnv::bind(nid(0), "127.0.0.1:0".parse().unwrap(), &dir_a)
+            .await
+            .expect("bind a");
+        a.set_peers([(nid(1), fake_addr.to_string())].into_iter().collect());
+
+        let metrics = a.metrics();
+        for expected in 1..=2u64 {
+            a.send(nid(1), b"never-arrives".to_vec()).await;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if metrics.get(Metric::NetworkHandshakeRefused) >= expected {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "NetworkHandshakeRefused never reached {expected} \
+                     (dialer must re-dial and re-refuse on every send, \
+                     never cache a failed handshake)"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            2,
+            "each send must dial fresh — a failed handshake must never be cached"
+        );
+
+        a.shutdown();
+        let _ = std::fs::remove_dir_all(&dir_a);
     }
 }

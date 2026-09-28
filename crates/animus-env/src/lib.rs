@@ -85,10 +85,12 @@ pub use metrics::{Metric, MetricSink, MetricSnapshot, MetricsHandle};
 /// mechanism itself yet. Unconditional (no `prod` feature needed, no new
 /// dependencies): pure codec + a version-equality check, with no socket or
 /// `SimEnv` type anywhere in it. See the module's own doc for the byte
-/// layout, why a per-connection preamble beats a per-message field, and
-/// exactly what later layers (`ProdEnv`'s accept/connect paths, `animusd`'s
-/// client/intra port, `SimEnv`'s per-node delivery check) still have to
-/// wire this into.
+/// layout and why a per-connection preamble beats a per-message field.
+/// **`ProdEnv`'s real internal-`Network` transport is wired to it now**
+/// (`prod.rs`'s `perform_handshake`, run once per connection on both the
+/// accept and dial paths) — still to come: `animusd`'s client/intra port
+/// and `SimEnv`'s per-node delivery check (a connectionless simulator's
+/// stand-in for the same per-connection exchange).
 pub mod handshake;
 pub use handshake::{
     CLIENT_PROTOCOL, HandshakeError, MAX_EXTENSION_LEN, NETWORK_PROTOCOL, Preamble, ProtocolSpec,
