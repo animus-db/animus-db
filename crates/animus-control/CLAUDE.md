@@ -1621,6 +1621,40 @@ per-tablet CP data plane (`animus-cp-data`).
   scenario and so did not actually exercise the buggy branch until this
   fix).
 
+  **A resent duplicate `InstallSnapshot` chunk must not be reprocessed as a
+  fresh completion while the receiver is still `state_machine_behind`
+  (found live raising `SNAPSHOT_CHUNK_BYTES` to 64 KiB).** The
+  `last_applied`-based short-circuit above deliberately falls through to
+  full reassembly, unconditionally, whenever `state_machine_behind` is
+  true (needed for the wipe-recovery case: a restarted node's intact log
+  offers the SAME `last_applied`/`snapshot_index` a fresh, empty engine
+  must not discard as "already have it"). But under sustained write load,
+  a leader's `SnapshotResend::Always` keeps resending the SAME
+  already-fully-received final chunk on every propose-wake before it has
+  processed the first completion ack (a genuine round trip, not instant) —
+  and every one of those, while the receiver is still digesting the first
+  copy, re-enters the "fresh" branch (`incoming_snapshot` was already
+  cleared by the prior completion) and re-completes from scratch: another
+  genuine-looking `InstallSnapshotResp { last_index > 0, .. }`, inflating
+  `Metric::CpSnapshotInstalls` and forcing another full WAL rewrite for
+  data already installed. Measured live: 141 of 149 counted installs at
+  `follower_aware_compaction.rs`'s pinned seed were the exact same
+  `last_index`, a single genuine image reprocessed over and over. Fixed by
+  `RaftCore::last_installed_index: Option<u64>` — set the moment a chunked
+  install actually completes, `None` on every fresh/recovered core
+  (unlike `last_applied`/`snapshot_index`, never inherited from a prior
+  lifetime) — checked at the top of `handle_install_snapshot` REGARDLESS of
+  `state_machine_behind`: an offer whose `last_index` exactly matches the
+  last one this node itself just installed is always a pure duplicate,
+  answered with the same `last_index: 0` "no completion happened" reply,
+  never touching the wipe-recovery path (whose first offer, at whatever
+  index, still has no `last_installed_index` to match against and falls
+  through exactly as before). See ADR 0017's matching 2026-09-27 amendment
+  for the full incident and `docs/lessons/testing/2026-09-27-follower-
+  aware-compaction-voters-only.md`'s own follow-up note. Regression:
+  `crates/animus-cp-data/tests/follower_aware_compaction.rs`'s tightened
+  bound (10, down from 60).
+
   **The `&& !state_machine_behind` override above is itself only sound for
   `last_index == last_applied` (found live 2026-09-27, same
   `--cluster-control 3 --cluster-data 5` bulk-seeding shape).**
@@ -2185,6 +2219,23 @@ per-tablet CP data plane (`animus-cp-data`).
   `animus-cp-data` did — a metadata-watch caller only ever waits to learn when
   `metadata()` *could* reflect a change, and that visibility is bound by the
   driver's flush cadence anyway.
+- **`RaftCore::compaction_floor(retention_cap_entries)` (ADR 0017's
+  2026-09-27 amendment, PR #1047's own follow-up)** — a new pure,
+  leader-only accessor: `min(match_index)` over every VOTER within
+  `retention_cap_entries` of `last_log_index()`, `None` if this node isn't
+  leader, has no peers, or every peer is excluded by the cap. Same shape
+  as `snapshot_transfer_in_flight` (a fact this core states; the driver
+  decides policy). Its sole consumer today is `animus-cp-data`'s
+  `apply_and_compact`, which clamps a threshold-triggered compaction to
+  this floor so a merely-lagging voter keeps catching up via
+  `AppendEntries` instead of falling off the compacted log and needing a
+  full `InstallSnapshot`. **Deliberately excludes learners** — see the
+  method's own doc for why (a bad interaction with `state_machine_behind`/
+  `needs_snapshot`, found live building this fix). **The control plane's
+  own `meta_apply_and_compact` does not call this** — a single small
+  per-cluster metadata group was never the flood's own mechanism (many
+  tablet groups sharing one node's scheduler/fsync path); nothing stops
+  it adopting this later if that judgment changes.
 
 ## Tests
 

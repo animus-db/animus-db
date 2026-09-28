@@ -237,7 +237,19 @@ fn run_scenario(seed: u64, lag_skew_ms: i64, variant: Variant) {
     // again, which is what forces the *next* compaction pass to advance the
     // snapshot base all the way through these entries, leaving no log tail
     // after them for a later `InstallSnapshot` peer to replay separately.
-    const FAILED_CAS: u64 = 100;
+    //
+    // **Follower-aware compaction (branch `claude/follower-aware-
+    // compaction`) amendment**: `lagging` is a crashed but still-configured
+    // VOTER, so `RaftCore::compaction_floor` retains the leader's log for
+    // it too, up to `COMPACT_RETENTION_CAP_ENTRIES` (4096) entries behind —
+    // the old `REAL_WRITES + FAILED_CAS` total (200) never got anywhere
+    // close, which would leave a real log tail behind for `lagging` to
+    // replay via ordinary `AppendEntries` on restart instead of forcing the
+    // `InstallSnapshot` path this whole scenario exists to reach. Bumped
+    // well past the cap so `lagging` is excluded from the floor and
+    // compaction genuinely truncates the log through the failed-CAS burst,
+    // same as it always did pre-retention.
+    const FAILED_CAS: u64 = 4200;
     for i in 0..FAILED_CAS {
         match nodes[l0].cas(
             b"never-written".to_vec(),
@@ -248,7 +260,7 @@ fn run_scenario(seed: u64, lag_skew_ms: i64, variant: Variant) {
             other => panic!("leader rejected failed-cas {i}: {other:?} (seed={seed})"),
         }
     }
-    sim.run_for(Duration::from_secs(3)); // apply + compact the failed-cas tail too
+    sim.run_for(Duration::from_secs(6)); // apply + compact the (now much larger) failed-cas tail too
 
     if matches!(variant, Variant::SenderRestartNothingAppliedSince) {
         // Fix (2): a genuine process restart of l0 — its own apply task's
@@ -382,7 +394,21 @@ fn receiver_installs_the_durable_high_water_mark_not_just_the_rows() {
         // NO row — past `COMPACT_THRESHOLD` again, forcing the sender's next
         // compaction to advance its snapshot base through it, leaving no log
         // tail for `lagging` to replay separately later.
-        const FAILED_CAS: u64 = 100;
+        //
+        // **Follower-aware compaction (branch `claude/follower-aware-
+        // compaction`) amendment**: `lagging` is a crashed but still-
+        // configured VOTER, not removed from the group, so `RaftCore::
+        // compaction_floor` retains the sender's log for it too — its
+        // `match_index` stays frozen near where it crashed, but that's well
+        // within `COMPACT_RETENTION_CAP_ENTRIES` (4096) of the old
+        // `REAL_WRITES + FAILED_CAS` total (200), which would pin the
+        // sender's own compaction at (near) index 0 for the whole test —
+        // never proving the compaction-driven watermark advance this test
+        // is about. Bumped well past the cap so `lagging` is excluded from
+        // the floor partway through and compaction proceeds, exactly as it
+        // must once a peer is genuinely this far gone (not merely crashed
+        // a moment ago).
+        const FAILED_CAS: u64 = 4200;
         for i in 0..FAILED_CAS {
             match nodes[l0].cas(
                 b"never-written".to_vec(),
@@ -393,7 +419,7 @@ fn receiver_installs_the_durable_high_water_mark_not_just_the_rows() {
                 other => panic!("leader rejected failed-cas {i}: {other:?} (seed={seed})"),
             }
         }
-        sim.run_for(Duration::from_secs(3)); // apply + compact the failed-cas tail too
+        sim.run_for(Duration::from_secs(6)); // apply + compact the (now much larger) failed-cas tail too
         let after_failed_cas = nodes[l0].engine_latest_version();
         assert!(
             after_failed_cas > after_real_writes,

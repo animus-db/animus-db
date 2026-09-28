@@ -1104,6 +1104,43 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     // doc for why a latch produced a real livelock). Default `false`; only
     // ever set via that method.
     state_machine_behind: bool,
+    // The `last_index` of the most recently fully-received `InstallSnapshot`
+    // THIS node installed, this process lifetime (never persisted — `None`
+    // on every fresh/recovered core, exactly like `incoming_snapshot`
+    // itself). Distinct from `snapshot_index`/`last_applied` (which a
+    // recovered-from-WAL core can carry forward from a PRIOR lifetime, and
+    // which `handle_install_snapshot`'s own top-of-function short-circuit
+    // deliberately does NOT trust while `state_machine_behind` — see that
+    // check's own doc for the wipe-recovery case it exists to catch).
+    //
+    // **Closes a duplicate-reprocessing gap in that same short-circuit**
+    // (found live building `SNAPSHOT_CHUNK_BYTES`'s bump): while
+    // `state_machine_behind` is true, `handle_install_snapshot` falls
+    // through UNCONDITIONALLY to the normal reassembly path — correct for a
+    // wiped engine (the top-of-function doc's own reasoning: an offer at
+    // the SAME `snapshot_index`/`last_applied` this node's intact log
+    // already reflects is exactly the case the wipe fix must not discard).
+    // But under a sustained write load, a leader's own `SnapshotResend::
+    // Always` resends the SAME already-fully-received final chunk on every
+    // wake before it has processed this node's first completion ack (a real
+    // round trip, not instant) — and every one of those, while this node is
+    // still digesting the FIRST copy, re-enters the "fresh" branch (`self.
+    // incoming_snapshot` was already cleared by the completion) and
+    // re-completes from scratch: another genuine-looking `InstallSnapshotResp
+    // { last_index > 0, .. }`, inflating `Metric::CpSnapshotInstalls` and
+    // forcing another full WAL rewrite, for data this node already has.
+    // Correctness was never at risk (reinstalling identical bytes is a
+    // no-op either way — the top-of-function doc's own point) but the
+    // *count* and the repeated WAL rewrite are real, measured cost (up to
+    // ~140 redundant re-installs of one 149-entry image for a single
+    // merely-8ms-slowed voter, `docs/engineering-lessons.md`'s matching
+    // entry). Recording the last EXACT `last_index` actually installed and
+    // short-circuiting an identical re-offer regardless of
+    // `state_machine_behind` closes this while leaving the wipe case
+    // untouched: a freshly recovered core's `last_installed_index` is
+    // `None` this lifetime, so its first offer — at whatever index — always
+    // falls through exactly as before.
+    last_installed_index: Option<u64>,
 
     // --- Quiescence (ADR 0044 phase-1 PR3). `None` (the default, set by every
     // constructor) is byte-identical to pre-PR3 behavior: the entry predicate
@@ -1304,6 +1341,7 @@ where
             pending_install: None,
             snapshot_needed: false,
             state_machine_behind: false,
+            last_installed_index: None,
             pending: Vec::new(),
             persisted_hard: (0, None),
             snapshot_dirty: false,
@@ -1516,6 +1554,81 @@ where
     /// The current snapshot base index (0 if no snapshot has been taken).
     pub fn snapshot_index(&self) -> u64 {
         self.snapshot_index
+    }
+
+    /// **Follower-aware compaction floor** (ADR 0017's compaction-flood
+    /// amendment, PR #1047's follow-up): the highest index a leader's
+    /// threshold-triggered compaction may advance `snapshot_index` to
+    /// without forcing an `InstallSnapshot` on any peer that is merely a
+    /// bit behind, rather than genuinely lost.
+    ///
+    /// A pure fact, same shape as [`snapshot_transfer_in_flight`](Self::
+    /// snapshot_transfer_in_flight): this core does no compaction policy
+    /// itself (`snapshot_upto`'s caller decides whether/when to compact at
+    /// all), it only answers "how far could a threshold-triggered compaction
+    /// go right now without stranding a peer that has a real chance of
+    /// catching up via ordinary `AppendEntries`."
+    ///
+    /// Returns `min(match_index)` over every **voter currently within
+    /// `retention_cap_entries` of `last_log_index()`** — a peer that far
+    /// behind is excluded from the floor (it gets an `InstallSnapshot`
+    /// today regardless, via `replicate_to`'s own `next_index <=
+    /// snapshot_index` check, once the base does advance past it; excluding
+    /// it here just stops it from pinning EVERY peer's compaction to a
+    /// standstill). A peer this core has never heard from at all (absent
+    /// from `match_index`) is treated as caught up to `0` — conservative:
+    /// either it is freshly added (a real `0`) or it is down/partitioned
+    /// (and `last_log_index().saturating_sub(0)` will itself exceed the cap
+    /// once the leader has done enough work, excluding it in due course).
+    ///
+    /// **Deliberately voters only, never learners** (found building this
+    /// fix): a learner's own catch-up contract in this codebase (ADR 0058
+    /// Train 1) already IS "via ordinary `AppendEntries`/`InstallSnapshot`
+    /// before ever being promoted" — an `InstallSnapshot` to a freshly
+    /// joined, far-behind learner is the expected, unexceptional path, not
+    /// the flood this retention floor exists to prevent (which is about
+    /// ordinary VOTER replicas of an established tablet falling behind
+    /// under routine load). Retaining for a learner too interacts badly
+    /// with the separate `state_machine_behind`/`needs_snapshot` machinery
+    /// (issue #554): while a receiver's own async apply task is still
+    /// digesting a just-installed image, every `AppendEntriesResp` it
+    /// builds reports `needs_snapshot: true`, and `handle_append_resp`'s
+    /// `needs_snapshot` branch never runs the ordinary success path's
+    /// `next_index` advance — so a leader whose retention floor is pinned
+    /// close to that learner's own position can end up re-entering the
+    /// snapshot path more than once before the learner's apply task and
+    /// the leader's own bookkeeping settle, at the tiny pre-PR-#1047-
+    /// chunk-size cost per cycle. Excluding learners keeps this floor
+    /// scoped to the case it was actually built for.
+    ///
+    /// Returns `None` when this node is not the leader (a non-leader
+    /// compacts by its own applied index and needs no floor — see this
+    /// method's callers' own doc), when it has no peers at all (a
+    /// single-node group; nothing to retain for), or when every peer is
+    /// already excluded (nothing left to floor against, so a threshold
+    /// compaction may proceed exactly as it did before this existed).
+    ///
+    /// `retention_cap_entries` is the caller's own hard bound on worst-case
+    /// retained log length — this accessor enforces nothing about its
+    /// magnitude, it only applies whatever cap the caller passes.
+    pub fn compaction_floor(&self, retention_cap_entries: u64) -> Option<u64> {
+        if self.role != Role::Leader {
+            return None;
+        }
+        let last = self.last_log_index();
+        let mut floor: Option<u64> = None;
+        for peer in self.peers.iter() {
+            let matched = self.match_index.get(peer).copied().unwrap_or(0);
+            if last.saturating_sub(matched) > retention_cap_entries {
+                // Too far behind to retain for; it already gets (or will
+                // get) an `InstallSnapshot` via the ordinary `next_index <=
+                // snapshot_index` path — don't let it pin every other
+                // peer's compaction to a standstill.
+                continue;
+            }
+            floor = Some(floor.map_or(matched, |f: u64| f.min(matched)));
+        }
+        floor
     }
 
     /// Whether a chunked `InstallSnapshot` transfer is currently in flight to
@@ -3707,6 +3820,12 @@ where
         // `last_applied` instead catches this: it is this node's own
         // up-to-date "how far have I actually gotten," not a proxy that
         // lags behind it.
+        // `last_installed_index`'s own doc: an exact duplicate of the last
+        // image THIS node fully installed is always redundant, regardless
+        // of `state_machine_behind` — unlike `last_applied`/`snapshot_index`,
+        // it is never inherited from a prior lifetime, so it cannot
+        // misfire on the wipe-recovery case the `state_machine_behind`
+        // guard below exists for.
         // Issue found live (2026-09-27, `--cluster-control 3 --cluster-data
         // 5` under bulk seeding + auto-split): the `state_machine_behind`
         // override above is meant ONLY for the #554 wipe-recovery shape,
@@ -3736,7 +3855,9 @@ where
         // AND this offer would rewind me," and the override only needs to
         // keep excusing the `==` case (the actual #554 shape) from being
         // treated as redundant.
-        if last_index < self.last_applied
+        let duplicate_of_last_install = self.last_installed_index == Some(last_index);
+        if duplicate_of_last_install
+            || last_index < self.last_applied
             || (last_index == self.last_applied && !self.state_machine_behind)
         {
             self.incoming_snapshot = None;
@@ -3822,6 +3943,11 @@ where
                 .incoming_snapshot
                 .take()
                 .expect("present when complete");
+            // `last_installed_index`'s own doc: record BEFORE returning below,
+            // regardless of which state-machine branch handles it, so a
+            // resent duplicate of THIS exact completion is caught next time
+            // even while `state_machine_behind` stays true.
+            self.last_installed_index = Some(inc.last_index);
             // Advance the snapshot base + reset the log/applied state common to both
             // state-machine kinds.
             let install = |core: &mut Self| {
