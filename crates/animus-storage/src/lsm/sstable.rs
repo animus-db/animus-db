@@ -58,7 +58,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(test)]
 use animus_env::nid;
 use animus_env::{Env, Metric, MetricsHandle};
-use serde::{Deserialize, Serialize};
 
 use super::bloom::BloomFilter;
 use crate::{Key, Result, StorageError, Value, Version};
@@ -67,11 +66,28 @@ use crate::{Key, Result, StorageError, Value, Version};
 /// identification / external tooling (the reader takes the format from the
 /// manifest's [`SsTableMeta::format`], not by re-reading the footer).
 const MAGIC: u64 = 0x4355_5354_4F53_5333; // "ANIMUS S3"
-/// The SSTable format version a fresh table is written in. There is a **single**
-/// on-disk format (compression-capable framing + shared-prefix key encoding);
-/// this is retained as a per-table tag for operator introspection
-/// (`/admin/storage/lsm`) and as a hook should the format ever evolve again.
-const FORMAT_CURRENT: u32 = 3;
+/// The SSTable format version a fresh table is written in (ADR 0073 Phase 0
+/// reset the counter to 1). The reader **dispatches** on the manifest-recorded
+/// [`SsTableMeta::format`] ([`check_format`] at open, a `match` in
+/// `read_block`): `1` is the compression-capable framing + shared-prefix key
+/// encoding; any other value is a loud
+/// [`StorageError::UnsupportedFormatVersion`] (`"lsm-sstable"`). A format
+/// change adds a new value, a new decoder arm and a new golden fixture under
+/// `tests/fixtures/formats/lsm-sstable/`.
+const FORMAT_CURRENT: u32 = 1;
+
+/// Refuse an SSTable whose manifest-recorded `format` this binary cannot decode.
+fn check_format(format: u32) -> Result<()> {
+    if (1..=FORMAT_CURRENT).contains(&format) {
+        Ok(())
+    } else {
+        Err(StorageError::UnsupportedFormatVersion {
+            format: "lsm-sstable",
+            found: format,
+            max_supported: FORMAT_CURRENT,
+        })
+    }
+}
 /// Fixed footer size: `index_offset(8) + index_len(8) + magic(8)`.
 const FOOTER_LEN: u64 = 24;
 /// Soft target for a block's (uncompressed) record bytes before starting a new
@@ -238,14 +254,12 @@ fn decode_block_index(bytes: &[u8]) -> Result<Vec<BlockIndex>> {
 
 /// Per-table metadata stored in the manifest. Carries no block data, only the
 /// bounds, the index region's location, the LSM level, and the key Bloom filter.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 pub struct SsTableMeta {
     /// Sequence number (file is `sst-{seq:06}`).
     pub seq: u64,
     /// LSM level. `0` is the flush tier (overlapping ranges allowed); `1+` hold
-    /// non-overlapping runs (leveled compaction). Defaults to `0` for manifests
-    /// written before levels existed.
-    #[serde(default)]
+    /// non-overlapping runs (leveled compaction).
     pub level: u32,
     /// Smallest user key in the table (`None` if the table is empty).
     pub min_key: Option<Key>,
@@ -262,27 +276,17 @@ pub struct SsTableMeta {
     /// Total file size in bytes.
     pub file_size: u64,
     /// Bloom filter over the table's distinct user keys: a point read can skip
-    /// this table when `bloom.may_contain(key)` is false. Defaults to an empty
-    /// filter for manifests written before Blooms existed — an empty filter
-    /// answers `false`, so to stay correct on such legacy tables we only consult
-    /// the Bloom when it was actually built (see [`Self::may_contain`]).
-    #[serde(default)]
+    /// this table when `bloom.may_contain(key)` is false. An empty filter
+    /// answers `false`, so the Bloom is only consulted when it was actually
+    /// built (see [`Self::may_contain`] and `has_bloom`).
     pub bloom: BloomFilter,
-    /// Whether [`Self::bloom`] was built for this table (false for legacy tables
-    /// recovered from a pre-Bloom manifest, where the Bloom must not be trusted).
-    #[serde(default)]
+    /// Whether [`Self::bloom`] was built for this table (false where the Bloom
+    /// must not be trusted).
     pub has_bloom: bool,
-    /// On-disk block format version. There is a **single** format today
-    /// (compression-capable framing + shared-prefix keys); this is a per-table tag
-    /// for operator introspection (`/admin/storage/lsm`) and a future-evolution
-    /// hook. The writer stamps [`FORMAT_CURRENT`].
-    #[serde(default = "default_format")]
+    /// On-disk table format version, recorded in the manifest. The reader
+    /// dispatches on it (see [`FORMAT_CURRENT`]); the writer stamps
+    /// [`FORMAT_CURRENT`]. Also surfaced by `/admin/storage/lsm`.
     pub format: u32,
-}
-
-/// serde default for [`SsTableMeta::format`]: the single current format.
-fn default_format() -> u32 {
-    FORMAT_CURRENT
 }
 
 impl SsTableMeta {
@@ -566,6 +570,7 @@ impl SsTableReader {
     /// # Errors
     /// Returns [`StorageError::Backend`] on an I/O error or a malformed index.
     pub async fn open<E: Env>(env: &E, file: String, meta: SsTableMeta) -> Result<Self> {
+        check_format(meta.format)?;
         let index = if meta.index_len == 0 {
             Vec::new()
         } else {
@@ -629,8 +634,11 @@ impl SsTableReader {
         if crc32fast::hash(framed) != want {
             return Err(StorageError::Backend("sstable block crc mismatch".into()));
         }
-        // First byte is the block tag; the rest is the (maybe-compressed) record
-        // payload.
+        // Format dispatch (ADR 0073): `open` already refused an unknown format,
+        // but `meta` is a public field, so re-check rather than assume.
+        check_format(self.meta.format)?;
+        // Format 1: first byte is the block tag; the rest is the
+        // (maybe-compressed) record payload.
         let (&tag, payload) = framed
             .split_first()
             .ok_or_else(|| StorageError::Backend("empty sstable block".into()))?;
@@ -1253,5 +1261,224 @@ mod tests {
             Ok(_) => panic!("a truncated index region must fail open, not panic"),
             Err(err) => assert!(matches!(err, StorageError::Backend(_))),
         }
+    }
+
+    // ----- ADR 0073 Phase 0 (Workstream A) golden-fixture tests -----------
+
+    fn fixture_dir() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/formats/lsm-sstable")
+    }
+
+    /// Deterministic records for the fixture: fixed keys/values/versions, no
+    /// clock or RNG. 300 records span several blocks (so the fixture has a
+    /// real block index): the first 100 have highly repetitive values (LZ4
+    /// block), the next 100 pseudo-random values from a fixed LCG (stored
+    /// block), the last 100 mix tombstones and empty values.
+    fn fixture_records() -> Vec<Record> {
+        let mut state = 0x0123_4567_89ab_cdefu64;
+        let mut out = Vec::new();
+        for i in 0u32..300 {
+            let key = format!("fixture-key-{i:04}").into_bytes();
+            let version = u64::from(i % 5) + 1;
+            let value = if i < 100 {
+                Some(vec![b'A' + (i % 3) as u8; 64])
+            } else if i < 200 {
+                let mut v = Vec::with_capacity(48);
+                for _ in 0..48 {
+                    state = state
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    v.push((state >> 33) as u8);
+                }
+                Some(v)
+            } else if i % 3 == 0 {
+                None
+            } else if i % 3 == 1 {
+                Some(Vec::new())
+            } else {
+                Some(format!("value-{i}").into_bytes())
+            };
+            out.push(Record {
+                key,
+                version,
+                value,
+            });
+        }
+        out
+    }
+
+    /// Build a `SsTableMeta` for a fixture image from its own footer
+    /// (`index_offset(8) | index_len(8) | MAGIC(8)`, little endian), the way
+    /// a manifest would have recorded it.
+    fn meta_from_image(bytes: &[u8], format: u32) -> SsTableMeta {
+        let n = bytes.len();
+        let footer = &bytes[n - FOOTER_LEN as usize..];
+        let index_offset = u64::from_le_bytes(footer[0..8].try_into().unwrap());
+        let index_len = u64::from_le_bytes(footer[8..16].try_into().unwrap());
+        let magic = u64::from_le_bytes(footer[16..24].try_into().unwrap());
+        assert_eq!(magic, MAGIC, "fixture footer magic");
+        SsTableMeta {
+            seq: 1,
+            level: 0,
+            min_key: None,
+            max_key: None,
+            min_version: 0,
+            max_version: 0,
+            index_offset,
+            index_len,
+            file_size: n as u64,
+            bloom: BloomFilter::default(),
+            has_bloom: false,
+            format,
+        }
+    }
+
+    async fn open_image(
+        env: &animus_sim::SimEnv,
+        bytes: &[u8],
+        format: u32,
+    ) -> Result<SsTableReader> {
+        let _ = env.remove("img").await;
+        env.append("img", bytes).await.unwrap();
+        env.sync("img").await.unwrap();
+        SsTableReader::open(env, "img".into(), meta_from_image(bytes, format)).await
+    }
+
+    /// Decode test: every checked-in fixture opens with the current reader
+    /// (format 1) and reads back exactly the expected records, field by
+    /// field, with a multi-block index. Iterates the directory.
+    #[test]
+    fn decodes_every_checked_in_fixture() {
+        let dir = fixture_dir();
+        let sim = Simulator::new(3);
+        let env = sim.env(nid(0));
+        let mut checked = 0usize;
+        for entry in std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("reading fixture dir {}: {e}", dir.display()))
+        {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("bin") {
+                continue;
+            }
+            let bytes = std::fs::read(&path).expect("read fixture");
+            block_on(async {
+                let reader = open_image(&env, &bytes, FORMAT_CURRENT)
+                    .await
+                    .unwrap_or_else(|e| panic!("opening fixture {}: {e}", path.display()));
+                assert!(reader.index.len() > 1, "fixture has a multi-block index");
+                let got = reader.full_scan(&env).await.expect("scan fixture");
+                let want = fixture_records();
+                assert_eq!(got.len(), want.len(), "record count");
+                for (r, (k, v, val)) in want.iter().zip(&got) {
+                    assert_eq!(&r.key, k);
+                    assert_eq!(r.version, *v);
+                    assert_eq!(&r.value, val);
+                }
+                // Point reads go through the block index too.
+                for r in &want {
+                    let (v, val) = reader
+                        .latest(&env, &r.key)
+                        .await
+                        .unwrap()
+                        .expect("key present");
+                    assert_eq!((v, &val), (r.version, &r.value));
+                }
+            });
+            checked += 1;
+        }
+        assert!(checked > 0, "no fixture files under {}", dir.display());
+    }
+
+    /// Round trip: the current writer's output reads back identically.
+    #[test]
+    fn writer_output_round_trips_the_fixture_records() {
+        let sim = Simulator::new(4);
+        let env = sim.env(nid(0));
+        block_on(async {
+            let records = fixture_records();
+            let meta = SsTableWriter::write(&env, "rt", 1, 0, &records)
+                .await
+                .unwrap();
+            env.sync("rt").await.unwrap();
+            assert_eq!(meta.format, FORMAT_CURRENT);
+            let reader = SsTableReader::open(&env, "rt".into(), meta).await.unwrap();
+            let got = reader.full_scan(&env).await.unwrap();
+            assert_eq!(got.len(), records.len());
+            for (r, (k, v, val)) in records.iter().zip(&got) {
+                assert_eq!((&r.key, r.version, &r.value), (k, *v, val));
+            }
+        });
+    }
+
+    /// Fixture generator. Run explicitly:
+    /// `cargo test -p animus-storage --lib generate_fixture_lsm_sstable -- --ignored`.
+    /// Refuses to overwrite an existing fixture: regenerate only by bumping
+    /// `FORMAT_CURRENT` and adding a NEW `v<N>.bin`.
+    #[test]
+    #[ignore = "run explicitly to (re)generate the golden fixture"]
+    fn generate_fixture_lsm_sstable() {
+        let dir = fixture_dir();
+        std::fs::create_dir_all(&dir).expect("create fixture dir");
+        let path = dir.join(format!("v{FORMAT_CURRENT}.bin"));
+        assert!(
+            std::fs::metadata(&path).is_err(),
+            "{} already exists — bump FORMAT_CURRENT and add a NEW fixture \
+             file instead of regenerating an existing one",
+            path.display(),
+        );
+        let sim = Simulator::new(5);
+        let env = sim.env(nid(0));
+        block_on(async {
+            SsTableWriter::write(&env, "gen", 1, 0, &fixture_records())
+                .await
+                .unwrap();
+            env.sync("gen").await.unwrap();
+            let bytes = env.read("gen").await.unwrap();
+            std::fs::write(&path, bytes).expect("write fixture");
+        });
+    }
+
+    /// An unsupported `SsTableMeta::format` (0 or newer than the binary knows)
+    /// is a loud, named error at open — never a panic, never a misdecode.
+    #[test]
+    fn unsupported_format_is_a_loud_error_at_open() {
+        let sim = Simulator::new(6);
+        let env = sim.env(nid(0));
+        block_on(async {
+            let records = fixture_records();
+            SsTableWriter::write(&env, "uf", 1, 0, &records)
+                .await
+                .unwrap();
+            env.sync("uf").await.unwrap();
+            let bytes = env.read("uf").await.unwrap();
+            for bad in [0u32, FORMAT_CURRENT + 1, 2, 3, u32::MAX] {
+                match open_image(&env, &bytes, bad).await {
+                    Err(StorageError::UnsupportedFormatVersion {
+                        format,
+                        found,
+                        max_supported,
+                    }) => {
+                        assert_eq!(format, "lsm-sstable");
+                        assert_eq!(found, bad);
+                        assert_eq!(max_supported, FORMAT_CURRENT);
+                    }
+                    Err(e) => panic!("format {bad}: expected UnsupportedFormatVersion, got {e:?}"),
+                    Ok(_) => panic!("format {bad}: must not open"),
+                }
+            }
+            // A reader whose (public) meta.format is corrupted after open
+            // also fails loudly at read time.
+            let mut reader = open_image(&env, &bytes, FORMAT_CURRENT).await.unwrap();
+            let mut meta = reader.meta().clone();
+            meta.format = FORMAT_CURRENT + 1;
+            reader.meta = Arc::new(meta);
+            match reader.full_scan(&env).await {
+                Err(StorageError::UnsupportedFormatVersion { format, .. }) => {
+                    assert_eq!(format, "lsm-sstable");
+                }
+                other => panic!("expected UnsupportedFormatVersion at read, got {other:?}"),
+            }
+        });
     }
 }

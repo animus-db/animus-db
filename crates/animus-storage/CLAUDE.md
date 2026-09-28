@@ -135,9 +135,12 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   source of truth, swapped **atomically** via `Disk::replace` — the single
   flush/compaction linearization point; encoded with a **compact hand-rolled
   binary codec** — `CMF1` magic + version, big-endian ints + length-prefixed
-  byte strings — not JSON; a legacy JSON manifest, which starts with `{`, is
-  still decoded for forward-compat — see `encode_manifest`/`decode_manifest` in
-  `lsm.rs`; the manifest also records the **live WAL segment numbers**, format v2),
+  byte strings — not JSON; ADR 0073 Phase 0 **deleted the JSON fallback**: a
+  missing/foreign magic is `PreBaselineFormat { "lsm-manifest" }`, a version
+  outside `1..=MANIFEST_VERSION` is `UnsupportedFormatVersion` — see
+  `encode_manifest`/`decode_manifest` in `lsm.rs`; the manifest also records the
+  **live WAL segment numbers**, part of v1; a torn manifest cannot occur because
+  `replace` is atomic, and a truncated image stays a plain `Backend` error),
   `wal-NNNNNN` (the WAL split into **rotating numbered segments** — each write
   `append`+`sync`ed *before* it returns, so an ack means durable; mirrors the Raft
   WAL pattern), and `sst-NNNNNN` (immutable, sorted, **per-block CRC32** via `crc32fast`, with
@@ -167,10 +170,12 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   differing suffix; the block's first record stores its full key. Since records
   are sorted by key, adjacent keys share long prefixes (every key in a table
   shares the `escape(table) || …` prefix), so this shrinks the key bytes *before*
-  LZ4 and shrinks the decoded footprint. There is a **single on-disk format**
-  (pre-alpha, no older tables exist — ADR 0008); `SsTableMeta::format` is kept as a
-  per-table version tag for operator introspection (`/admin/storage/lsm`) and a
-  future-evolution hook, not a read-time switch. (Restart-point in-block
+  LZ4 and shrinks the decoded footprint. The on-disk
+  format is `SsTableMeta::format == 1` (`FORMAT_CURRENT`, reset from 3 by ADR
+  0073 Phase 0) and **the reader now dispatches on it**: `check_format` at
+  `SsTableReader::open` and again in `read_block` turn any other value into
+  `UnsupportedFormatVersion { "lsm-sstable" }`, so a second format is a new
+  decoder arm + fixture. The footer `MAGIC` and `SSIX` index tag are unchanged. (Restart-point in-block
   binary-search seek — the other half of LevelDB's block format — is a deliberate
   follow-up: the reader decodes whole blocks, gated by the block index + Bloom, so
   restart points would be unused machinery today.)
@@ -198,9 +203,8 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
 - **Two read gates skip an SSTable before any disk read** (`sstable.rs`
   `SsTableMeta::may_contain`): the key range `[min_key, max_key]`, then the
   per-table **Bloom filter** (`lsm/bloom.rs` — a hand-rolled FNV-1a
-  double-hashing bit vector, deterministic, no external dep). A legacy table from
-  a pre-Bloom manifest (`has_bloom == false`) is range-gated only, so an upgrade
-  stays correct. Built over the table's distinct keys on flush/compaction.
+  double-hashing bit vector, deterministic, no external dep). A table with
+  `has_bloom == false` is range-gated only. Built over the table's distinct keys on flush/compaction.
 - **`merged_at` (the shared backend for `scan`/`scan_at`/`entries`/
   `entries_at`/`entries_with_tombstones`/`scan_with_tombstones`) applies the
   same range gate as every other multi-table path — `sstable_overlaps` — before
@@ -360,7 +364,7 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   without truncation either way. A format change is always a **new**
   version constant plus a **new** fixture file, never an edit to an
   existing one: golden fixtures live at
-  `tests/fixtures/formats/<format>/v<N>.<ext>` (today: `lsm-wal/v1.bin`),
+  `tests/fixtures/formats/<format>/v<N>.<ext>` (today: `lsm-wal/`, `lsm-manifest/`, `lsm-sstable/` `v1.bin`),
   and `scripts/check-format-fixtures.sh` (run from the repo root, wired
   into CI) fails the build if any fixture file already present at the
   merge base with `origin/main` is edited or deleted — a new `vN+1` file
@@ -372,7 +376,11 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   module is the WAL's) that refuses to overwrite a fixture that already
   exists — run it explicitly with `cargo test -p animus-storage --lib
   generate_fixture_lsm_wal -- --ignored` after bumping the version
-  constant, never to regenerate the current one.
+  constant, never to regenerate the current one. The manifest
+  (`manifest_tests`, `generate_fixture_lsm_manifest`) and SSTable
+  (`sstable::tests`, `generate_fixture_lsm_sstable`; a 300-record multi-block
+  image with LZ4, stored and tombstone blocks, opened by deriving the meta from
+  its own footer) follow the same shape.
 - **A group-commit leader's failed `flush_batch` surfaces its own error text
   to every waiter, not just a generic prefix** (issue #939, 2026-09-19).
   `GroupCommit::Inner::failed_error` keeps the *first* failure's
