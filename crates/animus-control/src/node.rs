@@ -1014,6 +1014,13 @@ impl<E: Env> RaftNode<E> {
         self.lock().snapshot_index()
     }
 
+    /// Override this node's own `InstallSnapshot` chunk size — see
+    /// `RaftCore::set_snapshot_chunk_bytes`'s own doc (test-only; production
+    /// code never calls this).
+    pub fn set_snapshot_chunk_bytes(&self, bytes: usize) {
+        self.lock().set_snapshot_chunk_bytes(bytes);
+    }
+
     /// Highest applied log index. With the leader's role-aware apply gate this is
     /// `min(commit_index, durable_index)` on the leader (ADR 0009).
     pub fn last_applied(&self) -> u64 {
