@@ -23,7 +23,6 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use animusd::{ClientRequest, ClientResponse, Node, read_frame};
-use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
 mod support;
@@ -487,7 +486,7 @@ fn txn_key(prefix: &str, suffix: &str) -> Vec<u8> {
 }
 
 async fn call(addr: SocketAddr, req: ClientRequest) -> ClientResponse {
-    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    let mut stream = animusd::connect_client(addr).await.expect("connect");
     animusd::write_frame(&mut stream, &req).await.expect("send");
     read_frame(&mut stream)
         .await

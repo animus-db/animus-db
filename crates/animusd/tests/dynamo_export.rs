@@ -183,7 +183,7 @@ fn tablets_for(meta: &Metadata, table: &str) -> Vec<TabletId> {
 /// admin HTTP surface's JSON-string `split_key` field can't carry one) —
 /// mirrors `streams_e2e.rs`'s identical helper.
 async fn plain_split(client_addr: SocketAddr, tablet: TabletId, split_key: Vec<u8>) {
-    let mut stream = TcpStream::connect(client_addr)
+    let mut stream = animusd::connect_client(client_addr)
         .await
         .expect("connect to client port");
     write_frame(

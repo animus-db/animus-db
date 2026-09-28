@@ -9,6 +9,18 @@
 //!
 //! `animusd::lib` re-exports everything in this module at its crate root so
 //! the ~500 existing call sites across that crate keep compiling unchanged.
+//!
+//! **Wire versioning (ADR 0073 Phase 0, workstream D):** the types in this
+//! module carry no version field of their own. A mismatched peer is refused
+//! one layer down instead — a per-connection handshake preamble
+//! (`animus_env::handshake`, its `CLIENT_PROTOCOL` for this client/intra
+//! wire) exchanged before a single [`ClientRequest`]/[`ClientResponse`]
+//! frame ever crosses the connection. **v1's policy is still exact version
+//! equality**, i.e. both ends must be the same build, exactly as before
+//! this handshake existed — this is prep for Phase 2, not a live
+//! compatibility mechanism yet. Real mixed-version wire compatibility
+//! (additive-only variants, gated on a replicated cluster version) is
+//! Phase 2's job; see ADR 0073 for the full plan.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
@@ -622,9 +634,15 @@ pub enum ClientRequest {
     /// captured `AdminInfo` + its live `client_route`/`intra_route`), no
     /// forwarding needed. This is itself served on the intra listener only
     /// (`JoinInfo` is `Surface::Intra`).
-    /// An additive variant: both sides of a cluster are the same build in
-    /// this repo's pre-alpha stance, so no version negotiation is needed for
-    /// an older peer that predates it.
+    /// An additive variant. **v1 (ADR 0073 Phase 0, workstream D) still
+    /// requires both ends to be the same protocol version** — a
+    /// per-connection `CHS1` handshake (`animus_env::handshake`, see this
+    /// module's own top-of-file note) refuses a mismatched peer before a
+    /// single frame crosses the wire, so an older peer that predates this
+    /// variant is refused at connect time, not confused by it mid-stream.
+    /// Real mixed-version compatibility (an older peer served this variant
+    /// under an additive-only rule) is Phase 2's job, once a replicated
+    /// cluster version exists to gate it.
     JoinInfo,
     /// **Long-poll metadata watch** (ADR 0035 PR5): park on the answering
     /// node's own [`animus_control::MetadataWatch`] for up to
@@ -685,7 +703,12 @@ pub enum ClientRequest {
     /// the anchor case (`anchor: None`); a participant's own stage ignores
     /// it (it creates no record). Both `#[serde(default)]` so these stay
     /// internal-only wire shape additions, no back-compat concern (house
-    /// convention: no live deployments).
+    /// convention: no live deployments — pre-baseline, ADR 0073 Phase 0;
+    /// once the baseline lands this would instead need a real version
+    /// bump. Separately, since ADR 0073 Phase 0 workstream D, a peer on a
+    /// different protocol version is refused at connect time by the
+    /// per-connection handshake rather than reaching this struct's decode
+    /// at all — see this module's own top-of-file note).
     TxnPrepare {
         table: String,
         anchor: Option<(TxnId, Vec<u8>, String)>,

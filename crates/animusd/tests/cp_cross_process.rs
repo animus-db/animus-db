@@ -17,7 +17,6 @@ use std::time::Duration;
 use animusd::{
     ClientRequest, ClientResponse, ColumnType, MetaCommand, Node, TableSchema, read_frame,
 };
-use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
 mod support;
@@ -25,7 +24,7 @@ mod support;
 const CP_TABLE: &str = "cp_t";
 
 async fn call(addr: SocketAddr, req: ClientRequest) -> ClientResponse {
-    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    let mut stream = animusd::connect_client(addr).await.expect("connect");
     animusd::write_frame(&mut stream, &req).await.expect("send");
     read_frame(&mut stream)
         .await

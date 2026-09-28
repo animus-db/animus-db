@@ -25,13 +25,14 @@ use animusd::{
     ClientRequest, ClientResponse, ColumnType, MetaCommand, Node, StorageBackend, TableSchema,
     read_frame,
 };
-use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
 mod support;
 
 async fn call(addr: SocketAddr, req: ClientRequest) -> ClientResponse {
-    let mut stream = TcpStream::connect(addr).await.expect("connect to node");
+    let mut stream = animusd::connect_client(addr)
+        .await
+        .expect("connect to node");
     animusd::write_frame(&mut stream, &req).await.expect("send");
     read_frame(&mut stream)
         .await

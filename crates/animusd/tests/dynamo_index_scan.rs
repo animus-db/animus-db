@@ -452,7 +452,7 @@ async fn lsi_scan_supports_filter_expression() {
 /// length-prefixed client protocol — used only to drive `SplitTablet` below;
 /// no such op exists on the DynamoDB wire.
 async fn call(addr: SocketAddr, req: ClientRequest) -> ClientResponse {
-    let mut stream = TcpStream::connect(addr)
+    let mut stream = animusd::connect_client(addr)
         .await
         .expect("connect to client port");
     animusd::write_frame(&mut stream, &req)

@@ -50,7 +50,7 @@ use tokio::time::{sleep, timeout};
 mod support;
 
 async fn call(addr: SocketAddr, req: ClientRequest) -> ClientResponse {
-    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    let mut stream = animusd::connect_client(addr).await.expect("connect");
     animusd::write_frame(&mut stream, &req).await.expect("send");
     read_frame(&mut stream)
         .await
@@ -214,7 +214,7 @@ async fn await_index_status(
 /// tombstone is never counted.
 async fn row_count(addr: SocketAddr, table: &str) -> Option<usize> {
     let once = async {
-        let mut s = TcpStream::connect(addr).await.ok()?;
+        let mut s = animusd::connect_client(addr).await.ok()?;
         let req = ClientRequest::Scan {
             start: Vec::new(),
             end: None,

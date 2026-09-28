@@ -136,7 +136,9 @@ async fn provisioning_against_a_quorumless_control_plane_does_not_spam_proposals
     // from a task — it will grind out its own 10s budget and fail; this
     // test only cares how many proposals it appends while grinding.
     let put = tokio::spawn(async move {
-        let mut stream = TcpStream::connect(leader_client).await.expect("connect");
+        let mut stream = animusd::connect_client(leader_client)
+            .await
+            .expect("connect");
         write_frame(
             &mut stream,
             &ClientRequest::Put {

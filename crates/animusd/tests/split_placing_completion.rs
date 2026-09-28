@@ -160,7 +160,7 @@ async fn admin(addr: SocketAddr, method: &str, path: &str, body: Option<&str>) -
 /// (mirrors `schema_ddl_relay.rs::call` — `ProposeSchema` is intra-only,
 /// ADR 0047).
 async fn call(addr: SocketAddr, req: ClientRequest) -> ClientResponse {
-    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    let mut stream = animusd::connect_client(addr).await.expect("connect");
     write_frame(&mut stream, &req).await.expect("send");
     read_frame(&mut stream).await.expect("read").expect("reply")
 }
@@ -431,7 +431,7 @@ async fn placing_relocates_a_child_off_the_parents_original_nodes_and_the_comple
         // Provision "t" on the original 3 nodes (n0, n1, n2 — the only
         // candidates that exist yet, so this IS what `select_replicas`
         // would compute too).
-        let mut client = TcpStream::connect(nodes[0].client_addr())
+        let mut client = animusd::connect_client(nodes[0].client_addr())
             .await
             .expect("connect client port");
         put(&mut client, vec![b'k', 0], vec![b'v', 0]).await;
@@ -551,7 +551,7 @@ async fn placing_relocates_a_child_off_the_parents_original_nodes_and_the_comple
         // linearizable `stale:false` read is routed to the tablet's current
         // leader regardless of which node answers, so this is not testing
         // routing staleness, only that the value genuinely survives.
-        let mut client = TcpStream::connect(nodes[0].client_addr())
+        let mut client = animusd::connect_client(nodes[0].client_addr())
             .await
             .expect("connect client port");
         let data_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
@@ -593,7 +593,7 @@ async fn mark_split_placing_done_tolerates_a_stale_or_duplicate_relayed_propose(
         let (mut nodes, config) = bring_up_inplace(3, dir.path()).await;
         support::await_bootstrap(&nodes).await;
 
-        let mut client = TcpStream::connect(nodes[0].client_addr())
+        let mut client = animusd::connect_client(nodes[0].client_addr())
             .await
             .expect("connect client port");
         put(&mut client, vec![b'k', 0], vec![b'v', 0]).await;
