@@ -146,12 +146,26 @@ fn build_tls_connector(ca_path: &str) -> Result<tokio_rustls::TlsConnector, Stri
     Ok(tokio_rustls::TlsConnector::from(Arc::new(config)))
 }
 
+/// Bounds this CLI's half of the client-protocol handshake preamble
+/// exchange (ADR 0073 Phase 0, workstream D, layer 3) — mirrors
+/// `animusd`'s own `CLIENT_HANDSHAKE_TIMEOUT` (same value, same
+/// reasoning): a one-time per-connection cost, generous relative to a
+/// same-datacenter round trip.
+const CLIENT_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Dial `addr`, optionally through `tls` (ADR 0064, S-01 commit 2) — `None`
 /// is a plain `TcpStream` (byte-for-byte unchanged); `Some` runs a
 /// server-only TLS handshake first, deriving the `ServerName` to verify the
 /// peer against from exactly the address string dialed
 /// (`animus_env::tls::server_name_for`) — the node's certificate SAN must
-/// cover whatever string `addr` names it by.
+/// cover whatever string `addr` names it by. Once the (possibly TLS-
+/// wrapped) stream is established, runs this build's half of the
+/// client/intra handshake preamble (ADR 0073 Phase 0, workstream D) —
+/// `animus_env::exchange_preamble`, the same shared implementation
+/// `animusd`'s own accept/dial paths use — before returning the stream to
+/// the caller. A mismatch, refusal, or timeout is a plain, named
+/// `Err(String)`, never a panic and never a hang past
+/// [`CLIENT_HANDSHAKE_TIMEOUT`].
 async fn maybe_tls_connect(
     addr: &str,
     tls: Option<&tokio_rustls::TlsConnector>,
@@ -159,8 +173,8 @@ async fn maybe_tls_connect(
     let stream = TcpStream::connect(addr)
         .await
         .map_err(|e| format!("cannot connect to {addr}: {e}"))?;
-    match tls {
-        None => Ok(MaybeTlsStream::Plain(stream)),
+    let mut stream = match tls {
+        None => MaybeTlsStream::Plain(stream),
         Some(connector) => {
             let server_name = animus_env::tls::server_name_for(addr)
                 .map_err(|e| format!("invalid TLS server name for {addr}: {e}"))?;
@@ -168,9 +182,17 @@ async fn maybe_tls_connect(
                 .connect(server_name, stream)
                 .await
                 .map_err(|e| format!("TLS handshake with {addr} failed: {e}"))?;
-            Ok(MaybeTlsStream::Tls(Box::new(tls_stream.into())))
+            MaybeTlsStream::Tls(Box::new(tls_stream.into()))
         }
-    }
+    };
+    animus_env::exchange_preamble(
+        &mut stream,
+        &animus_env::CLIENT_PROTOCOL,
+        CLIENT_HANDSHAKE_TIMEOUT,
+    )
+    .await
+    .map_err(|e| format!("client handshake with {addr} failed: {e:?}"))?;
+    Ok(stream)
 }
 
 const SEED_USAGE: &str = "  seed <admin-addr> <table> <count> [--start N] [--key-prefix P] \

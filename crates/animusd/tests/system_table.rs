@@ -116,7 +116,7 @@ async fn admin_get(addr: SocketAddr, path: &str) -> (u16, Value) {
 }
 
 async fn call(addr: SocketAddr, req: ClientRequest) -> ClientResponse {
-    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    let mut stream = animusd::connect_client(addr).await.expect("connect");
     animusd::write_frame(&mut stream, &req).await.expect("send");
     animusd::read_frame(&mut stream)
         .await

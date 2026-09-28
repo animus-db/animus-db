@@ -434,6 +434,99 @@ settled (a quick read of B's landed PR, not a long wait); E starts once C's
 section, the relevant crate `CLAUDE.md`(s), and the explicit do-not-touch
 list from its own row plus the others' "touches" columns.
 
+### Workstream D as-built (2026-09-28)
+
+Landed across four layers (`animus-env` codec, `ProdEnv` wiring, `animusd`'s
+client/intra port, `SimEnv` modeling) as a stacked PR series. Recorded here
+as one addition, not a rewrite of the row above.
+
+- **Preamble layout**: `magic[4] | version:u8 | ext_len:u16 (LE) |
+  ext[ext_len]` (`animus_env::handshake`). `ext` is reserved for Phase 2
+  (feature bits / a supported-version range) — a v1 `encode` always writes
+  it empty, and a v1 `decode`/`check_peer` carries a peer's `ext` bytes
+  through without ever rejecting a non-empty one, so Phase 2 can start
+  using the field for real with no further format reset.
+- **Two magics, two independently-versioned counters**: `NHS1` for the
+  internal `Network` transport (control-plane Raft, every per-tablet
+  CP-data Raft group, anything multiplexed over `(node, stream)` — ADR
+  0026) and `CHS1` for the client/intra length-prefixed JSON-RPC wire
+  (`animus-node::wire`'s `ClientRequest`/`ClientResponse`, used both
+  client-to-node and node-to-node for forwarding). A version bump on one
+  never requires a bump on the other — they are unrelated wire formats
+  that happen to share one handshake mechanism. Both checked for no
+  collision against every magic already in use elsewhere in this codebase.
+- **Per-connection handshake, not a per-message field — why**: internal
+  connections are pooled (one outbound TCP connection per destination) and
+  ADR 0026 multiplexes many `(node, stream)` protocol instances over each
+  one, so a check paid once per connection costs nothing against the
+  connection's whole lifetime, where a per-message field would be paid on
+  every single Raft heartbeat for as long as the connection lives.
+- **Symmetric write-first exchange, magic-first check**: both sides write
+  their own preamble immediately on connect/accept, then each reads and
+  checks the peer's — no separate client/server preamble shape, no extra
+  round trip to negotiate who goes first. `check_peer` checks magic before
+  version, so a pre-baseline peer (a raw, unversioned frame predating this
+  handshake) is refused with a named `BadMagic`, distinct from a same-magic
+  version mismatch (`UnsupportedVersion`).
+- **Refusal semantics**: `warn`-level log naming the peer/role/cause, a
+  refusal-only metric (`Metric::NetworkHandshakeRefused` /
+  `Metric::ClientHandshakeRefused` — a plain I/O failure like EOF or a
+  reset is not counted here, only a genuine protocol refusal is), then the
+  connection is closed. Never cached (every new connection re-runs the full
+  exchange) and never a panic (a refusal is an ordinary, logged, counted
+  connection-setup failure, not a defect).
+- **No extra round trip on the unpooled relay/join path**: the same
+  write-then-check sequence, pipelined rather than a request/response
+  round trip, so a one-shot dial (`animus-node`'s relay/join callers) pays
+  exactly one network round trip total, not one for the handshake plus one
+  for the first real frame.
+- **`SimEnv` model**: `SimEnv` has no real connections at all (ADR 0003 —
+  no sockets, just `send`/`recv` over an in-memory timeline), so the
+  identical check is modeled at **message**, not connection, granularity —
+  each refused message stands in for one refused connection. A per-node
+  override (`Simulator::set_network_protocol_for`, defaulting to this
+  build's own `NETWORK_PROTOCOL`) is checked in both directions on every
+  `Event::Deliver`, mirroring `ProdEnv::perform_handshake` running on both
+  the accept and dial side of a real connection; a refusal is never
+  delivered, is traced as a `Drop` with the named reason
+  `"protocol-refused"`, and is counted (`Simulator::protocol_refusals`).
+  Pure comparison of already-known values — no RNG draw, no timeline
+  event, no ordering change — so every pre-existing seed's execution and
+  trace stays byte-identical when every node is at its default.
+  `animus-node`'s `SimRelayClient` (the `CLIENT_PROTOCOL` wire, in sim)
+  rides this same `Network`, so this one check covers it too at the
+  network-transport level; `SimEnv` does not separately model a `CHS1`
+  exchange on top. See `crates/animus-control/tests/
+  protocol_version_refusal.rs` for the end-to-end proof (a 3-node control
+  cluster where one node's protocol version is mismatched: the v1 majority
+  still elects and commits, the odd node never receives or applies
+  anything and never leads, the refusal is observable, and resetting the
+  odd node's protocol lets it converge).
+- **Fixtures**: `crates/animus-env/tests/fixtures/formats/{network,
+  client}-handshake/v1.bin`, golden-fixture-tested per ADR 0073 Phase 0's
+  own convention (`scripts/check-format-fixtures.sh`).
+- **What Phase 2 builds on this**: the extension area starts carrying the
+  supported version range and feature bits for real; `check_peer` relaxes
+  from exact equality to a supported-range intersection; a replicated
+  cluster version / feature gate (`Metadata`-resident) decides what a node
+  may *use* once every member supports it — none of this needs another
+  format reset, since the preamble already carries an `ext` area no v1
+  peer rejects for being non-empty.
+- **Caveat (dial-side counting on the client/intra wire)**: every
+  `animusd` *dialer* of the client/intra wire — `connect_client`, and the
+  pipelined, unpooled relay/join path (`client_request_pipelined`, used by
+  `relay_request_with_timeout`/`join_request`) — passes a no-op
+  `MetricsHandle`, simply because none of those call sites has the node's
+  metrics handle plumbed through today. A refusal there is still logged at
+  `warn` with the named error and surfaces as a transport failure to the
+  caller (`RELAY_TRANSPORT_FAILURE` on the relay path), never a panic or a
+  silent drop; and because the handshake is symmetric, the *accepting*
+  node always counts it in `Metric::ClientHandshakeRefused`, so every
+  mismatch is visible in at least one side's metrics. The internal
+  `Network` transport (`ProdEnv`) counts on both sides. Threading a real
+  handle into the client/intra dial paths is a small follow-up, not a
+  Phase 2 prerequisite.
+
 ## Testing
 
 Every phase must stay provable under ADR 0003's determinism guarantee, the

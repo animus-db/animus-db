@@ -28,14 +28,13 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use animusd::{ClientRequest, ClientResponse, MetaCommand, read_frame};
-use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
 mod support;
 use support::{bring_up_split, start_single_node};
 
 async fn call(addr: SocketAddr, req: ClientRequest) -> ClientResponse {
-    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    let mut stream = animusd::connect_client(addr).await.expect("connect");
     animusd::write_frame(&mut stream, &req).await.expect("send");
     read_frame(&mut stream)
         .await

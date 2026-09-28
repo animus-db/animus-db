@@ -24,9 +24,15 @@
 //! and fsync-acked-but-lost) — is all reproducible from the seed. Per-node
 //! [`set_clock_skew_for`](Simulator::set_clock_skew_for) and
 //! [`set_clock_drift_for`](Simulator::set_clock_drift_for) model a node whose
-//! clock reads wrong, statically or progressively. A recorded
-//! [`trace`](Simulator::trace) is byte-identical across repeated runs of the
-//! same scenario and seed.
+//! clock reads wrong, statically or progressively. Per-node
+//! [`set_network_protocol_for`](Simulator::set_network_protocol_for) (ADR
+//! 0073 Phase 0, workstream D) models a node speaking a different build's
+//! version of the internal `Network` handshake (`animus_env::handshake`):
+//! `SimEnv` has no real connections, so the check runs at message-delivery
+//! granularity instead, each refusal standing in for one refused connection
+//! — see [`protocol_refusals`](Simulator::protocol_refusals) to observe it.
+//! A recorded [`trace`](Simulator::trace) is byte-identical across repeated
+//! runs of the same scenario and seed.
 //!
 //! See `docs/adr/0003-deterministic-simulation.md`.
 
@@ -38,6 +44,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
+use animus_env::handshake::{self, Preamble, ProtocolSpec};
 use animus_env::{
     BoxFuture, Clock, Disk, Env, Envelope, InboxCap, Nanos, Network, NodeId, PRIMARY_STREAM,
     Rng as RngTrait, Spawner, UnixMillis,
@@ -502,6 +509,23 @@ struct SimState {
     disk_cfg: DiskConfig,
     // Per-node overrides of the global disk fault model.
     node_disk_cfg: BTreeMap<NodeId, DiskConfig>,
+    // Per-node network-protocol handshake preamble (ADR 0073 Phase 0,
+    // workstream D) — what that node presents to (and, symmetrically,
+    // expects from) its peers on the internal `Network` seam. Absent =
+    // this build's own default `handshake::NETWORK_PROTOCOL` preamble (see
+    // `network_preamble_for`). Stored as the full `Preamble`, not just a
+    // version number, so a future Phase 2 test can also vary the
+    // extension bytes through the same slot without a shape change — see
+    // `Simulator::set_network_protocol_for`. Default-empty, so every
+    // existing test (which never calls that setter) stays byte-identical.
+    node_protocol: BTreeMap<NodeId, Preamble>,
+    // Per-**destination** count of messages refused by the network-protocol
+    // handshake model above (`fire_event`'s `Event::Deliver` arm). Absent =
+    // never refused. `SimEnv` has no real connections (ADR 0003 — no
+    // sockets), so this counts refused *messages*, each standing in for
+    // what would have been one refused *connection* in `ProdEnv` — see
+    // `Simulator::protocol_refusals`.
+    protocol_refusals: BTreeMap<NodeId, u64>,
     // Per-node clock skew (signed nanoseconds), applied only to that node's
     // own `Clock::now()` reads (ADR 0018 §2 sim support). Absent = zero skew;
     // default-empty so every existing test stays byte-identical (see
@@ -722,6 +746,70 @@ impl SimState {
         self.node_net_cfg.get(from).unwrap_or(&self.net)
     }
 
+    /// The network-protocol handshake preamble `node` presents to (and,
+    /// symmetrically, expects from) its peers (ADR 0073 Phase 0, workstream
+    /// D): its override ([`Simulator::set_network_protocol_for`]), else
+    /// this build's own default (`Preamble::for_protocol(&handshake::
+    /// NETWORK_PROTOCOL)` — v1, no extensions).
+    fn network_preamble_for(&self, node: &NodeId) -> Preamble {
+        self.node_protocol
+            .get(node)
+            .cloned()
+            .unwrap_or_else(|| Preamble::for_protocol(&handshake::NETWORK_PROTOCOL))
+    }
+
+    /// Whether a message from `from` to `to` must be refused under the
+    /// per-node network-protocol handshake model (ADR 0073 Phase 0,
+    /// workstream D) — the delivery-time stand-in for `ProdEnv`'s real,
+    /// per-connection handshake (`animus_env::handshake`, wired into
+    /// `ProdEnv` by an earlier layer). `SimEnv` has no real connections at
+    /// all (ADR 0003 — no sockets, just `send`/`recv` over an in-memory
+    /// timeline), so this checks at **message** granularity instead: each
+    /// refused message here stands in for what would have been one refused
+    /// *connection* in `ProdEnv` (which pays the handshake once per
+    /// connection, not once per frame — see `handshake.rs`'s own module
+    /// doc). `animus-node`'s `SimRelayClient` (the client/intra
+    /// [`handshake::CLIENT_PROTOCOL`] wire, in sim) rides this same
+    /// `Network`, so checking here covers it too at the network-transport
+    /// level; `SimEnv` does not separately model a `CHS1` exchange on top.
+    ///
+    /// Checked in **both directions**, mirroring `ProdEnv::perform_handshake`
+    /// running on both the accept and dial side of a real connection: `to`'s
+    /// own preamble is checked against `from`'s (as `to` would check an
+    /// inbound peer), and independently `from`'s own preamble is checked
+    /// against `to`'s (as `from` would check the same peer back) — either
+    /// failing refuses the message, since a real TCP handshake would fail
+    /// identically whichever side noticed first.
+    ///
+    /// **Determinism**: this is a pure comparison of two already-known,
+    /// already-stored values (each side's configured preamble, defaulting to
+    /// this build's own [`handshake::NETWORK_PROTOCOL`]) via
+    /// [`handshake::check_peer`] — a function with no `Result` variant that
+    /// depends on anything but its two arguments. No RNG draw, no timeline
+    /// event scheduled, no change to delivery order. When every node is at
+    /// its default (true of every test that never calls
+    /// [`Simulator::set_network_protocol_for`], i.e. every test that existed
+    /// before this check did), both `check_peer` calls trivially succeed and
+    /// this returns `false` every time — byte-identical to a build that
+    /// never had this check at all. That is what keeps every existing
+    /// seed's recorded [`TraceEvent`]s and executions unperturbed.
+    fn network_protocol_refused(&self, from: &NodeId, to: &NodeId) -> bool {
+        let from_preamble = self.network_preamble_for(from);
+        let to_preamble = self.network_preamble_for(to);
+        let from_spec = ProtocolSpec {
+            name: handshake::NETWORK_PROTOCOL.name,
+            magic: from_preamble.magic,
+            version: from_preamble.version,
+        };
+        let to_spec = ProtocolSpec {
+            name: handshake::NETWORK_PROTOCOL.name,
+            magic: to_preamble.magic,
+            version: to_preamble.version,
+        };
+        handshake::check_peer(&to_spec, &from_preamble).is_err()
+            || handshake::check_peer(&from_spec, &to_preamble).is_err()
+    }
+
     /// Sample error injection for one disk op on `node`. Draws RNG **only**
     /// when the effective error rate (generic or ENOSPC) is non-zero, so the
     /// default (off) config perturbs neither the RNG stream nor the trace.
@@ -931,6 +1019,8 @@ impl Simulator {
             link_net_cfg: BTreeMap::new(),
             disk_cfg: DiskConfig::default(),
             node_disk_cfg: BTreeMap::new(),
+            node_protocol: BTreeMap::new(),
+            protocol_refusals: BTreeMap::new(),
             clock_skew: BTreeMap::new(),
             clock_drift: BTreeMap::new(),
             paused_until: BTreeMap::new(),
@@ -1049,6 +1139,56 @@ impl Simulator {
     #[must_use]
     pub fn inbox_cap(&self) -> InboxCap {
         self.shared.lock().inbox_cap
+    }
+
+    /// Set `node`'s network-protocol handshake preamble (ADR 0073 Phase 0,
+    /// workstream D), overriding this build's own default
+    /// [`handshake::NETWORK_PROTOCOL`] for it — the model, at message
+    /// granularity, of a peer running a different build's protocol version
+    /// on the internal `Network` seam (mirrors [`set_disk_config_for`]'s
+    /// per-node-override shape). `spec` is what `node` both **presents** to
+    /// its peers and **expects** from them, exactly like `ProdEnv`'s own
+    /// compiled-in [`handshake::NETWORK_PROTOCOL`] constant is both at once
+    /// for a real build. Every message to or from `node` is checked (in
+    /// both directions — see [`SimState::network_protocol_refused`]'s doc)
+    /// at delivery time; a failing check drops the message (never
+    /// delivered), records a [`TraceEvent::Drop`] with `reason:
+    /// "protocol-refused"`, and increments the destination's count in
+    /// [`Simulator::protocol_refusals`].
+    ///
+    /// **Opt-in and default-unset**: a test that never calls this sees every
+    /// node at this build's own default preamble, under which the check
+    /// always trivially succeeds — see `network_protocol_refused`'s own doc
+    /// for why that keeps every pre-existing seed's execution and trace
+    /// byte-identical.
+    pub fn set_network_protocol_for(&self, node: NodeId, spec: ProtocolSpec) {
+        self.shared
+            .lock()
+            .node_protocol
+            .insert(node, Preamble::for_protocol(&spec));
+    }
+
+    /// How many messages addressed to `node` have been refused so far by the
+    /// network-protocol handshake model
+    /// ([`set_network_protocol_for`](Self::set_network_protocol_for)) — `0`
+    /// if `node` was never targeted by a refused message (including every
+    /// node in a test that never configures a non-default protocol at all).
+    /// Each refused message stands in for one refused connection in
+    /// `ProdEnv` (`SimEnv` has no real connections — ADR 0003), so this is
+    /// the message-granular analogue of `ProdEnv`'s
+    /// `Metric::NetworkHandshakeRefused` counter; `SimEnv` does not itself
+    /// carry a `MetricsHandle` (`Env::metrics()` defaults to a no-op for it,
+    /// and nothing in this crate threads a recording one in), so this
+    /// accessor — not a metrics snapshot — is how a sim test observes the
+    /// refusal count.
+    #[must_use]
+    pub fn protocol_refusals(&self, node: &NodeId) -> u64 {
+        self.shared
+            .lock()
+            .protocol_refusals
+            .get(node)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Set `node`'s clock skew (signed nanoseconds, applied to `Clock::now()`
@@ -1746,6 +1886,26 @@ impl Simulator {
                             to,
                             stream,
                             reason: "partition",
+                        });
+                        None
+                    } else if st.network_protocol_refused(&from, &to) {
+                        // Handshake-modelled refusal (ADR 0073 Phase 0,
+                        // workstream D) — see `network_protocol_refused`'s
+                        // doc for why this is a pure comparison (no RNG, no
+                        // timeline event) and hence never perturbs a run
+                        // that never configures a non-default protocol.
+                        // Checked before the pause branch below: a refused
+                        // message is never delivered at all, paused or not
+                        // — unlike a paused destination's ordinary
+                        // deliveries, there is nothing to "catch up" on
+                        // later.
+                        *st.protocol_refusals.entry(to.clone()).or_insert(0) += 1;
+                        st.trace.push(TraceEvent::Drop {
+                            t,
+                            from,
+                            to,
+                            stream,
+                            reason: "protocol-refused",
                         });
                         None
                     } else if let Some(until) =
@@ -2484,5 +2644,111 @@ mod tests {
         );
 
         assert!(SimState::node_prefix_keys(&map, &nid(99)).is_empty());
+    }
+
+    /// The network-protocol handshake model (ADR 0073 Phase 0, workstream
+    /// D): with every node at its default preamble (no
+    /// `set_network_protocol_for` call at all), a message is delivered
+    /// exactly as before this check existed and the refusal counter stays
+    /// at zero — the no-op default the determinism argument in
+    /// `network_protocol_refused`'s own doc depends on.
+    #[test]
+    fn default_protocol_is_a_no_op() {
+        use std::time::Duration;
+
+        use animus_env::{EnvExt, Network};
+
+        use super::Simulator;
+
+        let mut sim = Simulator::new(0xD073_0001);
+        let (a, b) = (nid(1), nid(2));
+        let received = std::sync::Arc::new(std::sync::Mutex::new(false));
+        {
+            let out = std::sync::Arc::clone(&received);
+            let sink = sim.env(b.clone());
+            sink.clone().spawn_task(async move {
+                let _ = sink.recv().await;
+                *out.lock().unwrap() = true;
+            });
+        }
+        {
+            let sender = sim.env(a.clone());
+            let dest = b.clone();
+            sender
+                .clone()
+                .spawn_task(async move { sender.send(dest, vec![1]).await });
+        }
+        sim.run_for(Duration::from_millis(50));
+
+        assert!(
+            *received.lock().unwrap(),
+            "a message between two default-protocol nodes must be delivered"
+        );
+        assert_eq!(sim.protocol_refusals(&b), 0);
+        assert!(
+            !sim.trace_lines()
+                .iter()
+                .any(|l| l.contains("protocol-refused")),
+            "no refusal should be traced when neither node overrides its protocol"
+        );
+    }
+
+    /// A message to or from a node whose protocol version was overridden to
+    /// mismatch the default is refused: never delivered, traced with the
+    /// named `"protocol-refused"` reason, and counted against the intended
+    /// recipient.
+    #[test]
+    fn mismatched_protocol_version_refuses_the_message() {
+        use std::time::Duration;
+
+        use animus_env::handshake::NETWORK_PROTOCOL;
+        use animus_env::{EnvExt, Network};
+
+        use super::{ProtocolSpec, Simulator};
+
+        let mut sim = Simulator::new(0xD073_0002);
+        let (a, b) = (nid(1), nid(2));
+        sim.set_network_protocol_for(
+            b.clone(),
+            ProtocolSpec {
+                name: NETWORK_PROTOCOL.name,
+                magic: NETWORK_PROTOCOL.magic,
+                version: NETWORK_PROTOCOL.version + 1,
+            },
+        );
+
+        let received = std::sync::Arc::new(std::sync::Mutex::new(false));
+        {
+            let out = std::sync::Arc::clone(&received);
+            let sink = sim.env(b.clone());
+            sink.clone().spawn_task(async move {
+                let _ = sink.recv().await;
+                *out.lock().unwrap() = true;
+            });
+        }
+        {
+            let sender = sim.env(a.clone());
+            let dest = b.clone();
+            sender
+                .clone()
+                .spawn_task(async move { sender.send(dest, vec![1]).await });
+        }
+        sim.run_for(Duration::from_millis(50));
+
+        assert!(
+            !*received.lock().unwrap(),
+            "a message to a mismatched-version peer must never be delivered"
+        );
+        assert_eq!(
+            sim.protocol_refusals(&b),
+            1,
+            "the refusal must be counted against the intended recipient"
+        );
+        assert!(
+            sim.trace_lines()
+                .iter()
+                .any(|l| l.contains("protocol-refused")),
+            "the drop must be traced with the named reason"
+        );
     }
 }

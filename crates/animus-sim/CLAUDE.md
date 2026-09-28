@@ -66,6 +66,30 @@ function of one seed. This is the substrate every distributed test runs on.
   Read it once before a scenario and once after, then subtract, to get a
   per-scenario delta — the counters themselves are monotonic for the
   lifetime of one `Simulator` (shared across every `Clone`, never reset).
+- **Network-protocol handshake model** (ADR 0073 Phase 0, workstream D):
+  `set_network_protocol_for(node, spec: animus_env::handshake::
+  ProtocolSpec)` overrides `node`'s network-protocol preamble, defaulting
+  to this build's own `handshake::NETWORK_PROTOCOL` (stored internally as
+  a full `Preamble`, not just a version number, so a future Phase 2 test
+  can also vary the extension bytes through the same slot). `SimEnv` has
+  no real connections (ADR 0003 — no sockets), so the check that would be
+  `ProdEnv`'s real per-connection handshake runs at **message** granularity
+  instead, inside `fire_event`'s `Event::Deliver` arm: `check_peer` is
+  called in both directions (mirroring `ProdEnv::perform_handshake` on
+  both the accept and dial side), and a failing check drops the message
+  before it's ever queued into the destination's inbox — never delivered,
+  traced as a `Drop` with `reason: "protocol-refused"`, and counted via
+  `protocol_refusals(node) -> u64`. **Opt-in and default-unset**: a test
+  that never calls this sees every node at the default preamble, under
+  which the check is a pure, RNG-free, timeline-free comparison that
+  always trivially succeeds — byte-identical to a build with no such
+  check at all, which is what keeps every pre-existing seed's trace and
+  execution unperturbed. `animus-node`'s `SimRelayClient` (the
+  client/intra `CLIENT_PROTOCOL` wire, in sim) rides this same `Network`,
+  so this one check covers it too at the transport level — `SimEnv` does
+  not separately model a `CHS1` exchange on top. See
+  `crates/animus-control/tests/protocol_version_refusal.rs` for the
+  end-to-end proof over a real 3-node control cluster.
 - Teardown: `shutdown()` — drains still-pending tasks, breaking the
   `Simulator`/`SimEnv` reference cycle a perpetual task's own captured
   handle forms with the simulator's own shared state (see "What's
