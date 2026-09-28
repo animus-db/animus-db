@@ -5490,10 +5490,21 @@ where
         if self.role != Role::Leader || term != self.current_term {
             return;
         }
-        if self
-            .departing
-            .get(&from)
-            .is_some_and(|d| removal_index >= d.index)
+        // Only stop when the log can no longer serve the peer. A peer the
+        // retained log still covers (a returning zombie that told us so by
+        // campaigning, or one whose ack raced the schedule) keeps receiving
+        // ordinary `AppendEntries` until it acks the removing ENTRY: the
+        // notice is only the fallback for what the log cannot deliver, and a
+        // node that never receives the entry keeps a log-derived config that
+        // still lists it (visible on every admin view, and all a volatile
+        // flag has after its own restart).
+        let log_cannot_serve =
+            self.next_index.get(&from).copied().unwrap_or(1) <= self.snapshot_index;
+        if log_cannot_serve
+            && self
+                .departing
+                .get(&from)
+                .is_some_and(|d| removal_index >= d.index)
         {
             self.drop_departing(&from);
         }
