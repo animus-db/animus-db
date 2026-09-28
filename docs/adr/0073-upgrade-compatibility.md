@@ -570,6 +570,37 @@ Three notes for whoever reads this row next:
    unchanged when it adopts `encode_line`/`decode_lines` for its own
    `SWL1` envelope.
 
+**Workstream B as-built, PR 2 — `CSN1` on the control-plane snapshot/
+`InstallSnapshot` payload.** Landed `persist::CONTROL_SNAPSHOT` (magic
+`CSN1`, version 1, `format::wrap`/`format::unwrap`'s binary shape). One tag
+covers **both** producers of "the bytes a control-plane `InstallSnapshot`
+transfer carries": the real, `DRIVER_APPLIED` control plane's actual
+payload — `node.rs`'s `syskv_image`/`install_syskv_image`, wrapping/
+unwrapping the system-keyspace image (a `serde_json` `Vec<(key,
+value-or-tombstone, version)>`, **not** a serialized `Metadata` blob, per
+this ADR's own investigation note on `Metadata` being `DRIVER_APPLIED`) —
+and `RaftCore`'s own generic `!S::DRIVER_APPLIED` fallback in `raft.rs`
+(`snapshot_upto`/`recovered`/`handle_install_snapshot`), exercised in this
+workspace only by the toy test state machine, wrapped for consistency
+rather than because production traffic reaches it. `install_syskv_image`'s
+decode-failure handling is a **new, unconditional** path, deliberately
+distinct from its pre-existing `merge_batch`-failure handling: a
+`CONTROL_SNAPSHOT` envelope failure is logged at `error`, installs nothing
+and halts the node (the core has already adopted the snapshot by then, so
+skipping would silently diverge engine from Raft state), whatever the driver's halted state, never
+a panic — a format-decode failure is not the same claim as a real engine
+I/O fault, which keeps its original halted-gated-panic discipline
+untouched. `raft.rs`'s own generic-path decode failure keeps its
+pre-existing behavior (log, then `InstallSnapshotResp { last_index: 0,
+next_offset: 0 }` to restart the transfer) unchanged, now just logged by
+name. Golden fixture: `tests/fixtures/formats/control-snapshot/v1.bin`,
+following `control-wal`'s established pattern in the same `tests/
+format_fixtures.rs`. See `crates/animus-control/CLAUDE.md`'s "Versioned
+formats" section for the full account. The row's remaining item —
+`Metadata`'s top-level `"v"` field + the `cp_member_addrs` legacy-field
+drop — is still a later PR in this same stacked series, not done yet as of
+this note.
+
 ## Testing
 
 Every phase must stay provable under ADR 0003's determinism guarantee, the

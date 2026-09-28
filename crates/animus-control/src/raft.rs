@@ -29,8 +29,9 @@ use animus_env::{Nanos, NodeId};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use crate::format;
 use crate::meta::{MetaCommand, Metadata};
-use crate::persist::{PersistedState, WalRecord};
+use crate::persist::{CONTROL_SNAPSHOT, PersistedState, WalRecord};
 
 /// The replicated state machine a [`RaftCore`] drives. The control plane uses
 /// [`Metadata`] (command = [`MetaCommand`]); a future per-tablet data plane will
@@ -1412,9 +1413,11 @@ where
             // re-serialize-per-chunk path produced, just cached. (A `DRIVER_APPLIED`
             // core's image lives in the engine, not `metadata`; its driver builds it
             // lazily on demand — `take_snapshot_needed` — so leave it None here.)
+            // Tagged with `CONTROL_SNAPSHOT` (ADR 0073 Phase 0 workstream B, magic
+            // `CSN1`) since this PR — see `handle_install_snapshot`'s decode side.
             if !S::DRIVER_APPLIED {
-                core.snapshot_blob =
-                    Some(serde_json::to_vec(&core.metadata).expect("metadata serializes"));
+                let payload = serde_json::to_vec(&core.metadata).expect("metadata serializes");
+                core.snapshot_blob = Some(format::wrap(&CONTROL_SNAPSHOT, &payload));
             }
         }
         // Restore the voter configuration: the snapshot's recorded config (if any)
@@ -1543,8 +1546,10 @@ where
         // (via [`snapshot`]), so it matches the base exactly, keeping the in-core
         // invariant `snapshot_index > 0 ⟹ snapshot_blob.is_some()`.
         if !S::DRIVER_APPLIED {
-            self.snapshot_blob =
-                Some(serde_json::to_vec(&self.metadata).expect("metadata serializes"));
+            // Tagged with `CONTROL_SNAPSHOT` (ADR 0073 Phase 0 workstream B, magic
+            // `CSN1`) since this PR — see `handle_install_snapshot`'s decode side.
+            let payload = serde_json::to_vec(&self.metadata).expect("metadata serializes");
+            self.snapshot_blob = Some(format::wrap(&CONTROL_SNAPSHOT, &payload));
         } else {
             // `DRIVER_APPLIED` images are built **lazily, on demand** (see
             // [`snapshot_chunk_for`]): the base just moved, so any previously
@@ -4077,10 +4082,18 @@ where
                     },
                 )];
             }
-            // In-core state machine: deserialize the image into `metadata`. A
-            // malformed snapshot would be a leader bug; drop + re-request rather
-            // than install garbage.
-            match serde_json::from_slice::<S>(&inc.buf) {
+            // In-core state machine: unwrap the `CONTROL_SNAPSHOT` (`CSN1`)
+            // envelope and deserialize the image into `metadata`. A malformed
+            // snapshot (or a pre-baseline/unsupported-version tag — loud, named,
+            // logged below rather than silently misread) would be a leader bug;
+            // drop + re-request rather than install garbage.
+            let decoded = format::unwrap(&CONTROL_SNAPSHOT, &inc.buf).and_then(|(_, payload)| {
+                serde_json::from_slice::<S>(payload).map_err(|e| format::FormatError::Malformed {
+                    format: CONTROL_SNAPSHOT.name,
+                    detail: e.to_string(),
+                })
+            });
+            match decoded {
                 Ok(state) => {
                     self.metadata = state;
                     install(self);
@@ -4104,7 +4117,12 @@ where
                         },
                     )];
                 }
-                Err(_) => {
+                Err(err) => {
+                    tracing::error!(
+                        %err,
+                        "InstallSnapshot image failed to decode — dropping it and asking the \
+                         leader to restart the transfer",
+                    );
                     return vec![(
                         leader,
                         RaftMsg::InstallSnapshotResp {

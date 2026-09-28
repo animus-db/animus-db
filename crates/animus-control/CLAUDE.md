@@ -419,9 +419,9 @@ tag plus two independent framing shapes:
 - **The binary envelope — `wrap`/`unwrap`**: `magic(4) || version(u8) ||
   payload`, the shape already proven by the LSM manifest (`CMF1`) and the
   encryption envelope (`ADE1`, both `animus-env`). For a self-contained
-  blob with no internal line framing of its own (a snapshot/
-  `InstallSnapshot` envelope is the natural next user of this — not yet
-  wired as of this PR).
+  blob with no internal line framing of its own — [`persist::
+  CONTROL_SNAPSHOT`] (below) is this shape's own user, wired in the PR
+  after the one that landed `format.rs` itself.
 - **The line envelope — `encode_line`/`decode_lines`**: `<crc32 as 8
   lowercase hex chars>:<magic(4 ASCII)><version as 2 lowercase hex
   digits><payload>\n`, the CRC (`crc32fast::hash`) covering everything
@@ -483,6 +483,56 @@ JSON shape, and a checked-in fixture may never be edited once merged).
 animus-control --test format_fixtures generate_fixture_control_wal --
 --ignored`) — refuses to overwrite an existing fixture file; bump
 `CONTROL_WAL::version` and add a new one instead.
+
+**`persist::CONTROL_SNAPSHOT`** (magic `CSN1`, version 1) is the
+[`format::wrap`]/[`format::unwrap`] binary envelope wrapped around **the
+bytes a control-plane `InstallSnapshot` transfer carries** — a single tag
+covering two distinct producers/consumers (see the constant's own doc for
+the full account):
+
+- The real, `DRIVER_APPLIED` control plane's actual payload: `node.rs`'s
+  `syskv_image`/`install_syskv_image` build/consume it, wrapping/unwrapping
+  the `serde_json`-encoded `Vec<(key, value-or-tombstone, version)>`
+  system-keyspace image — **never a serialized `Metadata` blob** (`Metadata`
+  is `DRIVER_APPLIED`, so `RaftCore::metadata` is a meaningless placeholder;
+  see this file's `node.rs` entry above). The pure `#[doc(hidden)] pub`
+  `encode_syskv_image_bytes`/`decode_syskv_image_bytes` pair does the
+  wrap/unwrap itself (no `Env`/engine needed) so `tests/format_fixtures.rs`
+  can build/decode a golden fixture directly.
+- `RaftCore`'s own generic `!S::DRIVER_APPLIED` fallback
+  (`raft.rs`'s `snapshot_upto`/`recovered`/`handle_install_snapshot`), which
+  wraps `serde_json::to_vec(&self.metadata)`/`serde_json::from_slice::<S>`
+  directly. In this workspace this branch is exercised **only** by the toy
+  test state machine (`tests/generic_state_machine.rs`'s `KvStore`) — every
+  real `S` here is `DRIVER_APPLIED`. Wrapped for consistency (one envelope
+  for "the bytes an `InstallSnapshot` transfer carries," not two formats
+  that happen to look similar), not because production traffic exercises it
+  today.
+
+**`install_syskv_image`'s decode-failure behavior is deliberately
+asymmetric with `merge_batch`'s pre-existing one**: a `CONTROL_SNAPSHOT`
+envelope failure (pre-baseline/untagged bytes, an unsupported version, or a
+malformed JSON body) is logged at `error`, installs nothing and **halts the
+node** (sets `halted`, returns `false`) — **never a panic**, even while the
+driver is not halted. Halting (not skipping) is required: `pending_install`
+is only set after the core has already adopted the snapshot, so skipping the
+install would leave the node running with its engine silently behind its own
+Raft state, and nothing re-sends the transfer. A `merge_batch` (real
+engine-write) failure keeps its original halted-gated-panic discipline
+unchanged: tolerated only while `halted` is set, a hard panic otherwise. `raft.rs`'s own generic-path decode failure
+(`handle_install_snapshot`) keeps its **pre-existing** behavior exactly:
+logged at `error`, then `InstallSnapshotResp { last_index: 0, next_offset:
+0 }` — telling the leader to restart the transfer, never a panic (this
+path never had one to begin with).
+
+**Golden fixture**: `tests/fixtures/formats/control-snapshot/v1.bin` — a
+small, deterministic system-keyspace image (fixed keys built from the real
+`syskv` key helpers, fixed values, fixed versions, including one tombstone)
+wrapped via `encode_syskv_image_bytes`. Same `tests/format_fixtures.rs`
+file, extended with `decodes_every_checked_in_control_snapshot_fixture_
+structurally`/`control_snapshot_round_trips_through_encode_and_decode`/the
+`#[ignore]`d `generate_fixture_control_snapshot` generator — same
+refuses-to-overwrite discipline as `control-wal`'s.
 
 ## Key invariants
 

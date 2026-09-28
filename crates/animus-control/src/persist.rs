@@ -67,6 +67,37 @@ pub const CONTROL_WAL: FormatTag = FormatTag {
     name: "control-wal",
 };
 
+/// The control-plane snapshot / `InstallSnapshot` payload envelope (ADR 0073
+/// Phase 0 workstream B): magic `CSN1`, currently version 1 — [`format::wrap`]/
+/// [`format::unwrap`]'s binary shape (this payload has no line framing of its
+/// own to protect). Covers **both** shapes this crate's `RaftCore<C, S>`
+/// puts inside an `InstallSnapshot` chunk stream:
+///
+/// - The real, `DRIVER_APPLIED` control plane's transfer payload — the
+///   system-keyspace image `crate::node`'s `syskv_image`/`install_syskv_image`
+///   build/consume (a `serde_json`-encoded `Vec<(key, value-or-tombstone,
+///   version)>`), never a serialized [`Metadata`] blob (see `crate::node`'s
+///   own doc for why: `Metadata` is `DRIVER_APPLIED`, so `RaftCore::metadata`
+///   is a meaningless placeholder and the real image is built lazily from the
+///   engine).
+/// - [`RaftCore`](crate::raft::RaftCore)'s own generic `!S::DRIVER_APPLIED`
+///   fallback (`raft.rs`'s `snapshot_upto`/`recovered`/`handle_install_snapshot`),
+///   which wraps `serde_json::to_vec(&self.metadata)`/`serde_json::from_slice::<S>`
+///   directly — exercised in this workspace only by the toy test state
+///   machine (`generic_state_machine.rs`), since every real `S` in this
+///   codebase is `DRIVER_APPLIED`.
+///
+/// One shared tag for both, since both are, physically, "the bytes an
+/// `InstallSnapshot` transfer carries for this plane" — not two independent
+/// formats that happen to look similar. **`animus-cp-data`'s own `KvState`
+/// snapshot image is a wholly separate binary codec** (`codec::encode_image`,
+/// workstream C) and does not use this tag at all.
+pub const CONTROL_SNAPSHOT: FormatTag = FormatTag {
+    magic: *b"CSN1",
+    version: 1,
+    name: "control-snapshot",
+};
+
 // ---------------------------------------------------------------------------
 // Per-record checksum framing for the tagged/multiplexed `SharedWal`
 // envelope (issue #495) — kept as a private, untagged `<crc32>:<json>\n`
