@@ -3740,12 +3740,44 @@ where
             || (last_index == self.last_applied && !self.state_machine_behind)
         {
             self.incoming_snapshot = None;
+            // This used to echo `last_index: self.snapshot_index` — nonzero
+            // the instant this node has ever compacted at all, which made
+            // this "already redundant, no install happened" reply
+            // byte-for-byte indistinguishable, on the WIRE, from a genuine
+            // just-completed install (`InstallSnapshotResp { last_index > 0,
+            // .. }` below). Two real leader-side consumers trusted that
+            // shape as "a completed install, full stop":
+            // `animus-cp-data::record_kv_outbound` increments
+            // `Metric::CpSnapshotInstalls` on ANY outbound `last_index > 0`
+            // ack, and `handle_install_snapshot_resp`'s own "transfer
+            // complete" branch reset `next_index`/cleared `snapshot_offset`
+            // bookkeeping the same way for both. Once a peer has ever
+            // compacted, a stale/duplicate/late-arriving chunk landing after
+            // that peer has already caught up further via ordinary
+            // `AppendEntries` silently inflates `CpSnapshotInstalls` and
+            // regresses that peer's already-advanced `next_index` back down
+            // to the stale offer's base, forcing a wholly unnecessary fresh
+            // `InstallSnapshot`. Reproduced via targeted eprintln!
+            // instrumentation against `ANIMUS_SEED=1394872321`:
+            // old_match=702 new_match=702 old_next=703 new_next=191. The
+            // fix: report `last_index: 0, next_offset: 0` — the "no
+            // completion happened, and I have nothing buffered" shape
+            // `handle_install_snapshot_resp`'s "still mid-transfer" branch
+            // already handles via its own `next_offset == 0 && *tracked > 0`
+            // case, which clears this peer's `snapshot_chunk_sent`/
+            // `snapshot_heartbeat_attempts`/`tracked` bookkeeping without
+            // touching `next_index`/`match_index` or counting a completed
+            // install — exactly the "just acknowledge our position as
+            // redundant" contract this short-circuit's own top-of-function
+            // doc already promises, and what
+            // `tests/stale_snapshot_no_rewind.rs` already asserts
+            // (`last_index == 0`).
             return vec![(
                 leader,
                 RaftMsg::InstallSnapshotResp {
                     term: self.current_term,
-                    last_index: self.snapshot_index,
-                    next_offset: total,
+                    last_index: 0,
+                    next_offset: 0,
                 },
             )];
         }
@@ -3916,7 +3948,31 @@ where
             }
             let m = self.match_index.entry(from.clone()).or_insert(0);
             *m = (*m).max(last_index);
-            self.next_index.insert(from.clone(), last_index + 1);
+            // This used to be a bare `insert`, unconditionally overwriting
+            // `next_index` with `last_index + 1` — correct for a GENUINE
+            // just-finished install, but this same reply shape is also what
+            // `handle_install_snapshot`'s "already at least this far along"
+            // short-circuit used to send for an ALREADY-REDUNDANT offer,
+            // whose own `last_index` there was the sender's `snapshot_index`
+            // (its last COMPACTION point), a value that can sit arbitrarily
+            // far behind a peer's real, already-tracked position. A
+            // stale/duplicate final chunk from an earlier, already-superseded
+            // transfer landing after this peer caught up further via
+            // ordinary `AppendEntries` therefore used to yank a
+            // correctly-advanced `next_index` back down to that stale
+            // `snapshot_index + 1`, and the very next `replicate_to` for this
+            // peer could find no entry to send at that regressed
+            // `next_index` and fall back to a brand-new, wholly unnecessary
+            // `InstallSnapshot`. `next_index` must be exactly as monotonic as
+            // `match_index` two lines above — both are a leader's own memory
+            // of a peer's ratcheting-forward replication progress under its
+            // current term, and neither field's value can ever legitimately
+            // move backward while that term holds. (The short-circuit above
+            // no longer sends a `last_index > 0` reply at all, but this
+            // branch stays monotonic as belt-and-suspenders against any
+            // other future producer of this same reply shape.)
+            let n = self.next_index.entry(from.clone()).or_insert(1);
+            *n = (*n).max(last_index + 1);
             // Issue #554: record that `from` has now been fully served a
             // snapshot at (at least) `last_index` — see `snapshot_served_
             // through`'s own doc and `handle_append_resp`'s `needs_snapshot`

@@ -1593,6 +1593,34 @@ per-tablet CP data plane (`animus-cp-data`).
   `assert_ts_monotonic`'s panic message this shipped alongside). Regression:
   `tests/stale_snapshot_no_rewind.rs`.
 
+  **That same short-circuit's *reply* must not reuse a genuine completion's
+  wire shape (PR #1048 follow-up; a redundant-and-a-genuine-completion-ack
+  wire-shape conflation).** Widening the guard's trigger condition to
+  `last_index <= last_applied` made it fire on almost every
+  stale/duplicate/late-arriving chunk once a peer has caught up via ordinary
+  `AppendEntries` — and it used to answer that redundant case with
+  `InstallSnapshotResp { last_index: self.snapshot_index, next_offset: total
+  }`, nonzero the instant this node has ever compacted at all and therefore
+  byte-for-byte indistinguishable, on the wire, from a genuine just-completed
+  install. Two leader-side consumers trusted `last_index > 0` alone as "a
+  completed install, full stop": `animus-cp-data::record_kv_outbound`
+  incremented `Metric::CpSnapshotInstalls` on any such outbound ack, and
+  `handle_install_snapshot_resp`'s own "transfer complete" branch reset an
+  already-advanced peer's `next_index` backward to the stale offer's base via
+  a bare `insert` (unlike `match_index`, which already used `max`) — forcing
+  a wholly unnecessary fresh `InstallSnapshot`. Fixed by replying
+  `last_index: 0, next_offset: 0` for the redundant case — the "nothing
+  buffered, reset your bookkeeping for me" shape
+  `handle_install_snapshot_resp`'s own "still mid-transfer" branch already
+  handles — and by making the genuine-completion branch's own `next_index`
+  update monotonic (`max`, mirroring `match_index`) as belt-and-suspenders.
+  See `docs/lessons/code-patterns/2026-09-27-a-redundant-and-a-genuine-
+  completion-ack-must-not-share-one-wire-shape.md`. Regression:
+  `tests/stale_snapshot_no_rewind.rs`'s `snapshot_index > 0` case (its
+  pre-existing `last_index == 0` assertion had a `snapshot_index == 0`
+  scenario and so did not actually exercise the buggy branch until this
+  fix).
+
   **The `&& !state_machine_behind` override above is itself only sound for
   `last_index == last_applied` (found live 2026-09-27, same
   `--cluster-control 3 --cluster-data 5` bulk-seeding shape).**
