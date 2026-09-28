@@ -247,6 +247,11 @@ enum Scan {
     /// Bytes are present but don't start with the expected magic — either a
     /// plaintext file (directory-level mismatch) or a corrupted header.
     NotEncrypted,
+    /// The full header is present with the right `ADE1` magic, but its
+    /// version byte is outside `1..=VERSION` (0, or written by a newer
+    /// binary). Never a torn file and never decodable with v1 logic: it
+    /// surfaces as a loud, typed error (ADR 0073 Phase 0).
+    UnsupportedVersion(u8),
     /// A parseable (possibly torn) encrypted file: `index` covers every
     /// frame up to (not including) the first parse/auth failure, if any;
     /// `torn` says whether such a failure was found — safe to recover from
@@ -270,6 +275,9 @@ fn scan(key: &EncryptionKey, raw: &[u8]) -> Scan {
     }
     if raw.len() < HEADER_LEN || raw[0..4] != MAGIC {
         return Scan::NotEncrypted;
+    }
+    if raw[4] == 0 || raw[4] > VERSION {
+        return Scan::UnsupportedVersion(raw[4]);
     }
     let mut salt = [0u8; SALT_LEN];
     salt.copy_from_slice(&raw[5..HEADER_LEN]);
@@ -355,6 +363,20 @@ fn mixed_state_error(file: &str) -> std::io::Error {
             "{file} is not in the expected encrypted frame format even though this data \
              directory's {MARKER_FILE} says it is encrypted — the data directory is corrupted \
              or was partially migrated by hand; refusing to use it"
+        ),
+    )
+}
+
+/// Distinct from [`mixed_state_error`] and [`corruption_error`]: the file
+/// is a genuine `ADE1` envelope of a version this binary cannot read.
+/// `InvalidData` like its siblings; the message text is the discriminator.
+fn unsupported_version_error(file: &str, found: u8) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!(
+            "{file}: unsupported ADE1 encryption envelope version {found} (this binary supports \
+             versions 1..={VERSION}); refusing to read it — it was written by a newer binary or \
+             is corrupt"
         ),
     )
 }
@@ -580,6 +602,7 @@ impl<D: Disk, R: Rng> EncryptedDisk<D, R> {
                 raw_len: 0,
             }),
             Scan::NotEncrypted => Err(mixed_state_error(file)),
+            Scan::UnsupportedVersion(found) => Err(unsupported_version_error(file, found)),
             Scan::Corrupted => Err(corruption_error(file)),
             Scan::Ok { index, torn } => {
                 if torn || (index.raw_len as usize) < raw.len() {
@@ -888,7 +911,7 @@ mod format_fixture_tests {
     use std::sync::Mutex as StdMutex;
     use std::task::{Context, Poll, Waker};
 
-    use super::{EncryptedDisk, EncryptionKey, MAGIC, SALT_LEN, Scan, VERSION, scan};
+    use super::{EncryptedDisk, EncryptionKey, HEADER_LEN, MAGIC, SALT_LEN, Scan, VERSION, scan};
     use crate::{Disk, Rng};
 
     // ---- deterministic test doubles ----------------------------------
@@ -1146,6 +1169,9 @@ mod format_fixture_tests {
                     index
                 }
                 Scan::Absent => panic!("{path:?}: fixture must not decode as an absent/empty file"),
+                Scan::UnsupportedVersion(v) => {
+                    panic!("{path:?}: fixture has unsupported version {v}")
+                }
                 Scan::NotEncrypted => {
                     panic!("{path:?}: fixture failed the magic/header check under the test key")
                 }
@@ -1279,38 +1305,54 @@ mod format_fixture_tests {
         );
     }
 
-    /// **Known gap, not a spec**: unlike the magic, `scan` never validates
-    /// the version byte against `VERSION` at all — a file with the right
-    /// magic but an unrecognized (future) version byte is silently decoded
-    /// with *today's* frame logic rather than rejected with a named
-    /// `UnsupportedFormatVersion`-shaped `Err`, the treatment ADR 0073's
-    /// Phase 0 conventions prescribe ("Unknown/future version" bullet).
-    /// Scope here is fixture+tests only (see this crate's task brief), so
-    /// this test pins *today's actual* behavior instead of the ADR's ideal
-    /// one — it exists so a future fix has a regression hook, and so this
-    /// gap can't regress further (e.g. into an actual panic) unnoticed.
-    /// **Do not treat this test passing as ADE1 already satisfying ADR
-    /// 0073's version-rejection convention** — it does not; see this
-    /// task's own report for the recommended follow-up.
-    #[test]
-    fn unrecognized_version_is_accepted_today_not_rejected_known_gap() {
+    fn assert_unsupported_version(version: u8) {
         let mut raw = encode_representative_envelope();
-        // Same magic/salt/frames as the representative envelope above,
-        // but with the version byte bumped to a value `VERSION` has never
-        // been.
-        raw[4] = VERSION.wrapping_add(1);
-
+        raw[4] = version;
         let fixture_disk = FixtureDisk::default();
         fixture_disk.seed(FIXTURE_FILE_NAME, &raw);
         let wrapped = EncryptedDisk::new(fixture_disk, FixedTestRng, test_key());
-        let result = block_on(wrapped.read(FIXTURE_FILE_NAME));
-
-        assert_eq!(
-            result.expect("today's scan() does not check the version byte at all"),
-            expected_plaintext(),
-            "today's code decodes an unrecognized version identically to the current one \
-             (it never inspects the version byte after the magic check) — this is the gap \
-             this test documents, not the desired behavior"
+        let err = block_on(wrapped.read(FIXTURE_FILE_NAME))
+            .expect_err("an out-of-range ADE1 version must be a loud Err");
+        let msg = err.to_string();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            msg.contains("unsupported ADE1 encryption envelope version")
+                && msg.contains(&format!("version {version} "))
+                && msg.contains(&format!("1..={VERSION}")),
+            "unexpected error text: {msg}"
         );
+    }
+
+    /// ADR 0073 Phase 0: version 0 is loudly rejected, never decoded as v1.
+    #[test]
+    fn version_zero_is_a_loud_typed_error() {
+        assert_unsupported_version(0);
+    }
+
+    /// ADR 0073 Phase 0: a future version is loudly rejected, never
+    /// misread as v1 and never treated as torn/empty.
+    #[test]
+    fn future_version_is_a_loud_typed_error() {
+        assert_unsupported_version(VERSION + 1);
+        assert_unsupported_version(u8::MAX);
+    }
+
+    /// A strict prefix of the header (even one holding a bad version byte)
+    /// classifies exactly as before the version check existed.
+    #[test]
+    fn torn_header_prefix_classification_unchanged() {
+        let mut raw = encode_representative_envelope();
+        raw[4] = VERSION + 1;
+        for cut in [1, 4, 5, HEADER_LEN - 1] {
+            assert!(
+                matches!(scan(&test_key(), &raw[..cut]), Scan::NotEncrypted),
+                "cut {cut}"
+            );
+        }
+        assert!(matches!(scan(&test_key(), &[]), Scan::Absent));
+        assert!(matches!(
+            scan(&test_key(), &raw[..HEADER_LEN]),
+            Scan::UnsupportedVersion(v) if v == VERSION + 1
+        ));
     }
 }

@@ -62,11 +62,12 @@ the production implementation; the deterministic implementation lives in
   `#[cfg(test)] mod format_fixture_tests`. A future format change to `ADE1`
   is a `VERSION` bump plus a new `v{N}.bin` fixture — the existing `v1.bin`
   is never edited or replaced (`scripts/check-format-fixtures.sh` enforces
-  this in CI). Note the one known gap those tests pin rather than paper
-  over: `scan()` never actually validates the version byte against
-  `VERSION` — an unrecognized version is silently decoded with today's
-  frame logic instead of being rejected with a named error, unlike the
-  magic check right next to it. Fixing that is future work, not yet done.
+  this in CI). `scan()` rejects a version byte outside
+  `1..=VERSION` (once the full 21-byte header is present) with a distinct
+  `InvalidData` error naming `ADE1`, the version found and the supported
+  range (`Scan::UnsupportedVersion`); a strict header prefix still
+  classifies as before. `open_whole` (marker/segment-store objects) does
+  not inspect the version byte.
 - **`encrypted_segment_store.rs`** (ADR 0069, S-03 PR 2) — the
   `SegmentStore` sibling of `encrypted.rs`: `EncryptedSegmentStore<S:
   SegmentStore, R: Rng>` seals each object as a whole standalone frame
