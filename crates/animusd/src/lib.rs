@@ -131,8 +131,8 @@ use animus_cp_data::{
     SHARED_WAL, StageOutcome, TxnDecisionStatus, TxnId, TxnOutcome, TxnRecordView,
 };
 use animus_env::{
-    Clock, Disk, Env, FsSegmentStore, MaybeTlsStream, Metric, MetricsHandle, Nanos, NodeId,
-    ProdEnv, TlsMaterial,
+    CLIENT_PROTOCOL, Clock, Disk, Env, FsSegmentStore, MaybeTlsStream, Metric, MetricsHandle,
+    Nanos, NodeId, PreambleError, ProdEnv, TlsMaterial, exchange_preamble,
 };
 use animus_storage::{
     Key, LsmEngine, MemoryEngine, SsTableView, StorageEngine, StorageError, VersionedValue,
@@ -2233,6 +2233,104 @@ const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
 /// resumes accepting within a fraction of an election timeout rather than
 /// lingering backed off while a caller times out reaching this node.
 pub(crate) const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(10);
+
+/// Bounds the client/intra port's own per-connection handshake preamble
+/// exchange (ADR 0073 Phase 0, workstream D, layer 3) — this crate's
+/// counterpart to `animus_env::prod`'s internal-`Network` `HANDSHAKE_
+/// TIMEOUT`, same value, same reasoning: generous relative to a
+/// same-datacenter round trip (a one-time per-connection cost, not a
+/// per-frame one), and on the dial side mostly moot in practice since every
+/// dialer already wraps its own connect-plus-handshake-plus-frame in a
+/// tighter budget of its own (`CLIENT_TIMEOUT`/`JOIN_ATTEMPT_TIMEOUT`/
+/// `relay_request_with_timeout`'s own `timeout` argument) — the real job
+/// here is the **accept** side, which (like the internal wire) has no other
+/// timeout guarding a peer that connects and then sends nothing at all.
+const CLIENT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Performs this build's half of the client/intra port's per-connection
+/// handshake preamble (ADR 0073 Phase 0, workstream D, layer 3) on `conn` —
+/// this crate's own thin wrapper over the one shared implementation,
+/// `animus_env::exchange_preamble`, exactly mirroring how `animus_env::
+/// prod::perform_handshake` wraps the identical exchange for its own
+/// internal-`Network` transport (see that function's own doc for the
+/// counting/logging rationale this copies verbatim, just against
+/// [`Metric::ClientHandshakeRefused`] and [`CLIENT_PROTOCOL`] instead of
+/// that module's own `NetworkHandshakeRefused`/`NETWORK_PROTOCOL`).
+///
+/// `role` is `"accept"` or `"dial"`, only for the log line; `peer_desc` is
+/// the peer's address as this side knows it. On any failure the connection
+/// is simply not usable any further — the caller closes it (by dropping
+/// it) without ever entering the frame loop.
+async fn perform_client_handshake<S: AsyncRead + AsyncWrite + Unpin>(
+    conn: &mut S,
+    role: &'static str,
+    peer_desc: &str,
+    metrics: &MetricsHandle,
+) -> std::io::Result<()> {
+    match exchange_preamble(conn, &CLIENT_PROTOCOL, CLIENT_HANDSHAKE_TIMEOUT).await {
+        Ok(()) => Ok(()),
+        Err(PreambleError::Io(err)) => {
+            tracing::warn!(
+                ?err,
+                peer = %peer_desc,
+                role,
+                "client handshake failed (closing connection)"
+            );
+            Err(err)
+        }
+        Err(PreambleError::Refused(err)) => {
+            tracing::warn!(
+                ?err,
+                peer = %peer_desc,
+                role,
+                "client handshake refused (closing connection)"
+            );
+            metrics.incr(Metric::ClientHandshakeRefused);
+            Err(std::io::Error::new(std::io::ErrorKind::InvalidData, err))
+        }
+        Err(PreambleError::TimedOut) => {
+            tracing::warn!(
+                peer = %peer_desc,
+                role,
+                timeout = ?CLIENT_HANDSHAKE_TIMEOUT,
+                "client handshake timed out (closing connection)"
+            );
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "client handshake timed out",
+            ))
+        }
+    }
+}
+
+/// **The one shared dial entry point for the client/intra JSON-RPC wire**
+/// (ADR 0073 Phase 0, workstream D, layer 3): connects a plain (non-TLS)
+/// `TcpStream` to `addr`, then performs this build's half of the
+/// [`CLIENT_PROTOCOL`] handshake before returning — every dialer of this
+/// wire (the `animus` CLI, `animusd`'s own integration tests, benches, and
+/// every plain-TCP internal caller) goes through this function instead of
+/// a bare `TcpStream::connect`, so the handshake is never hand-rolled at a
+/// call site. A TLS-wrapped dialer (`relay_request_with_timeout`, `animus-
+/// cli`'s own `maybe_tls_connect`) cannot use this helper directly since it
+/// needs to lay TLS *underneath* the handshake — those instead call
+/// [`perform_client_handshake`] straight on the (already TLS-wrapped, if
+/// configured) stream they build themselves, reusing the exact same
+/// underlying exchange.
+///
+/// # Errors
+/// Propagates a connect failure, or a handshake failure/refusal/timeout —
+/// see [`perform_client_handshake`].
+pub async fn connect_client(addr: impl tokio::net::ToSocketAddrs) -> std::io::Result<TcpStream> {
+    let mut stream = TcpStream::connect(addr).await?;
+    perform_client_handshake(
+        &mut stream,
+        "dial",
+        "client/intra dial",
+        &MetricsHandle::noop(),
+    )
+    .await?;
+    Ok(stream)
+}
 
 /// ADR 0055: the refusal a node returns for a **forwarded** eventual read it
 /// cannot serve — it holds no serveable replica of the tablet, or the one it
@@ -13990,6 +14088,18 @@ async fn serve_requests(
                                     }
                                 },
                             };
+                            let mut stream = stream;
+                            if perform_client_handshake(
+                                &mut stream,
+                                "accept",
+                                &peer_addr.to_string(),
+                                &ctx.env.metrics(),
+                            )
+                            .await
+                            .is_err()
+                            {
+                                return; // already logged/counted by perform_client_handshake
+                            }
                             if let Err(err) = handle_connection(stream, ctx, listener).await {
                                 tracing::debug!(?err, "connection closed");
                             }
@@ -16582,6 +16692,9 @@ async fn join_request(seeds: &[String], request: &ClientRequest) -> Option<Clien
     for addr in seeds {
         let reply = tokio::time::timeout(JOIN_ATTEMPT_TIMEOUT, async {
             let mut stream = TcpStream::connect(addr.as_str()).await.ok()?;
+            perform_client_handshake(&mut stream, "dial", addr.as_str(), &MetricsHandle::noop())
+                .await
+                .ok()?;
             write_frame(&mut stream, request).await.ok()?;
             read_frame::<ClientResponse, _>(&mut stream).await.ok()?
         })
@@ -17270,6 +17383,9 @@ async fn relay_request_with_timeout(
                 MaybeTlsStream::Tls(Box::new(tls_stream.into()))
             }
         };
+        perform_client_handshake(&mut stream, "dial", &addr, &MetricsHandle::noop())
+            .await
+            .ok()?;
         write_frame(&mut stream, request).await.ok()?;
         read_frame::<ClientResponse, _>(&mut stream).await.ok()?
     })
@@ -17448,7 +17564,7 @@ mod confirm_futility_tests {
     use crate::write_path::KindEvalApplied;
     use crate::{
         AnimusdRelayClient, ClientCtx, ClientRequest, ClientResponse, ClusterConfig, Node,
-        ProbeIdentity, RoleAddrs, read_frame, run_node, write_frame,
+        ProbeIdentity, RoleAddrs, connect_client, read_frame, run_node, write_frame,
     };
 
     fn free_addrs(count: usize) -> Vec<SocketAddr> {
@@ -17480,7 +17596,7 @@ mod confirm_futility_tests {
     }
 
     async fn call(addr: SocketAddr, req: ClientRequest) -> ClientResponse {
-        let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let mut stream = connect_client(addr).await.expect("connect");
         write_frame(&mut stream, &req).await.expect("send");
         read_frame(&mut stream)
             .await
@@ -17686,7 +17802,9 @@ mod forward_transport_failure_tests {
     use tokio::time::{sleep, timeout};
 
     use crate::config::NodeRole;
-    use crate::{ClientRequest, ClientResponse, ClusterConfig, Node, RoleAddrs, run_node};
+    use crate::{
+        ClientRequest, ClientResponse, ClusterConfig, Node, RoleAddrs, connect_client, run_node,
+    };
 
     fn free_addrs(count: usize) -> Vec<SocketAddr> {
         let ls: Vec<std::net::TcpListener> = (0..count)
@@ -17771,7 +17889,7 @@ mod forward_transport_failure_tests {
         // clusters are already warm by their own first write.
         timeout(Duration::from_secs(40), async {
             loop {
-                let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+                let mut stream = connect_client(addr).await.expect("connect");
                 crate::write_frame(
                     &mut stream,
                     &ClientRequest::Put {
@@ -17957,7 +18075,9 @@ mod forward_hop_timeout_tests {
     use tokio::time::{Instant, sleep, timeout};
 
     use crate::config::NodeRole;
-    use crate::{ClientRequest, ClientResponse, ClusterConfig, Node, RoleAddrs, run_node};
+    use crate::{
+        ClientRequest, ClientResponse, ClusterConfig, Node, RoleAddrs, connect_client, run_node,
+    };
 
     // Hand-rolled fixture helpers, duplicated from `forward_transport_
     // failure_tests` above rather than shared — every in-crate test module
@@ -18037,7 +18157,7 @@ mod forward_hop_timeout_tests {
     async fn put_until_ok(addr: SocketAddr, table: &str, key: &[u8], value: &[u8]) {
         timeout(Duration::from_secs(40), async {
             loop {
-                let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+                let mut stream = connect_client(addr).await.expect("connect");
                 crate::write_frame(
                     &mut stream,
                     &ClientRequest::Put {
@@ -18229,7 +18349,10 @@ mod forward_hop_timeout_tests {
                         // The stalled first hop: drain whatever the caller
                         // sends and hold the connection open with no reply
                         // — only the caller's own FORWARD_HOP_TIMEOUT ends
-                        // this side of things.
+                        // this side of things. Never completing the
+                        // handshake either is the identical "never
+                        // answers" shape [`spawn_never_answers_stub`]
+                        // already relies on.
                         let mut buf = [0u8; 4096];
                         loop {
                             match stream.read(&mut buf).await {
@@ -18238,8 +18361,23 @@ mod forward_hop_timeout_tests {
                             }
                         }
                     }
-                    // A later connection: answer immediately, as the real
-                    // leader would once its slow commit finally finishes.
+                    // A later connection: complete this build's half of
+                    // the client-protocol handshake (ADR 0073 Phase 0,
+                    // workstream D) before answering — the real dialer
+                    // waits for it before ever sending its own request
+                    // frame.
+                    if animus_env::exchange_preamble(
+                        &mut stream,
+                        &animus_env::CLIENT_PROTOCOL,
+                        Duration::from_secs(5),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        return;
+                    }
+                    // Answer immediately, as the real leader would once
+                    // its slow commit finally finishes.
                     let _ = crate::write_frame(&mut stream, &ClientResponse::PutOk).await;
                 });
             }
@@ -18266,6 +18404,16 @@ mod forward_hop_timeout_tests {
                 };
                 let hint_msg = hint_msg.clone();
                 tokio::spawn(async move {
+                    if animus_env::exchange_preamble(
+                        &mut stream,
+                        &animus_env::CLIENT_PROTOCOL,
+                        Duration::from_secs(5),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        return;
+                    }
                     let _req: Option<ClientRequest> =
                         crate::read_frame(&mut stream).await.ok().flatten();
                     sleep(delay).await;
@@ -18297,6 +18445,16 @@ mod forward_hop_timeout_tests {
                     return;
                 };
                 tokio::spawn(async move {
+                    if animus_env::exchange_preamble(
+                        &mut stream,
+                        &animus_env::CLIENT_PROTOCOL,
+                        Duration::from_secs(5),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        return;
+                    }
                     let _req: Option<ClientRequest> =
                         crate::read_frame(&mut stream).await.ok().flatten();
                     sleep(delay).await;
@@ -18656,7 +18814,9 @@ mod client_cancellation_tests {
     use tokio::time::{sleep, timeout};
 
     use crate::config::NodeRole;
-    use crate::{ClientRequest, ClientResponse, ClusterConfig, Node, RoleAddrs, run_node};
+    use crate::{
+        ClientRequest, ClientResponse, ClusterConfig, Node, RoleAddrs, connect_client, run_node,
+    };
 
     // Hand-rolled fixture helpers, duplicated from the sibling in-crate test
     // modules above rather than shared (see this crate's own `CLAUDE.md`,
@@ -18735,7 +18895,7 @@ mod client_cancellation_tests {
     async fn put_until_ok(addr: SocketAddr, table: &str, key: &[u8], value: &[u8]) {
         timeout(Duration::from_secs(40), async {
             loop {
-                let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+                let mut stream = connect_client(addr).await.expect("connect");
                 crate::write_frame(
                     &mut stream,
                     &ClientRequest::Put {
@@ -18881,7 +19041,7 @@ mod client_cancellation_tests {
         // connection ~100ms later -- long before the leader could ever
         // finish on its own (its only path to finishing without our help
         // is CLIENT_TIMEOUT, 10s away).
-        let mut stream = tokio::net::TcpStream::connect(leader_addr)
+        let mut stream = connect_client(leader_addr)
             .await
             .expect("connect to stranded leader");
         crate::write_frame(
@@ -18965,7 +19125,7 @@ mod client_cancellation_tests {
             .metrics()
             .get(Metric::ClientRequestsAbandoned);
 
-        let mut stream = tokio::net::TcpStream::connect(nodes[0].client_addr())
+        let mut stream = connect_client(nodes[0].client_addr())
             .await
             .expect("connect");
         // Both requests go out before either reply is read -- the exact
@@ -19074,14 +19234,12 @@ mod halted_shutdown_tests {
     /// Seed a put so the single-voter group provisions its first tablet and
     /// elects, then return that tablet's locally-hosted group handle.
     async fn provision_and_get_group(node: &Node) -> crate::CpGroup {
-        use crate::{ClientRequest, ClientResponse, read_frame, write_frame};
+        use crate::{ClientRequest, ClientResponse, connect_client, read_frame, write_frame};
 
         let client = node.client_addr();
         tokio::time::timeout(Duration::from_secs(20), async {
             loop {
-                let mut stream = tokio::net::TcpStream::connect(client)
-                    .await
-                    .expect("connect");
+                let mut stream = connect_client(client).await.expect("connect");
                 write_frame(
                     &mut stream,
                     &ClientRequest::Put {

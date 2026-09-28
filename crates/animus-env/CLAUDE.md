@@ -199,14 +199,21 @@ the production implementation; the deterministic implementation lives in
   version mismatch can't yet occur this early in Phase 0 (no rolling
   upgrade exists), so it can only mean a misconfigured deploy an operator
   wants to see every occurrence of; the rate is bounded by the caller's
-  own send cadence, never unbounded. Still to come: `animusd`'s client/
-  intra port (`CLIENT_PROTOCOL`, layer 3) and `SimEnv`'s per-node delivery
-  check (layer 4) — since `SimEnv` has no real connections at all, that
-  layer models the identical check as a per-node version checked on
-  delivery via this same `check_peer`, standing in for the connection-
-  shaped check a connectionless simulator can't otherwise express.
-  `Metric::ClientHandshakeRefused` (`metrics.rs`, below) still awaits that
-  layer-3 wiring.
+  own send cadence, never unbounded.
+  **Layer 3 (`animusd`'s client/intra port) is wired too**: this module
+  gained a small, `pub`, generic-over-`S: AsyncRead + AsyncWrite + Unpin`
+  exchange, [`prod::exchange_preamble`] (with its own `read_preamble`/
+  `write_own_preamble` halves), factored out of `perform_handshake`'s own
+  layer-2 body so `animusd` reuses the *identical* write-ours-then-read-
+  and-check-theirs sequence for `handshake::CLIENT_PROTOCOL` on its
+  `client`/`intra` listeners and dialers, rather than a second
+  hand-rolled copy — see that crate's own `CLAUDE.md` for the accept-/
+  dial-side wrappers and `Metric::ClientHandshakeRefused`'s now-real
+  wiring. Still to come: `SimEnv`'s per-node delivery check (layer 4) —
+  since `SimEnv` has no real connections at all, that layer models the
+  identical check as a per-node version checked on delivery via this same
+  `check_peer`, standing in for the connection-shaped check a
+  connectionless simulator can't otherwise express.
 - `metrics.rs` — the **observability seam** (ADR 0015): a closed `Metric` enum
   (`control_*` Raft + `storage_*` LSM-engine counters, plus legacy `data_*`
   leaderless-AP counters that are **dormant** — the AP plane was deleted, ADR

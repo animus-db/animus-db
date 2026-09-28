@@ -5911,6 +5911,42 @@ ADR itself for the full design/rationale.
   hint-field-conflation finding that shaped this split, and the standing
   rule in `docs/engineering-lessons.md` (machine relay →
   `intra_leader_hint`; anything a human reads → `leader_hint`).
+- **Both listeners now open with a mandatory per-connection handshake
+  preamble (ADR 0073 Phase 0, workstream D, layer 3)** — the client/intra
+  wire's own instance of the same mechanism `animus_env::prod` already
+  wired onto the internal `Network` transport at layer 2, reusing its one
+  shared implementation, `animus_env::exchange_preamble`, rather than a
+  second hand-rolled copy. **Accept side**: `serve_requests`'s per-
+  connection task calls `perform_client_handshake` (`lib.rs`) right after
+  TLS (if configured), before `handle_connection` ever reads a frame — it
+  writes this build's own `handshake::CLIENT_PROTOCOL` preamble first (so
+  a mismatched peer can name the mismatch too), then reads and checks the
+  peer's, bounded by `CLIENT_HANDSHAKE_TIMEOUT` (10s, mirroring `animus_
+  env::prod`'s own `HANDSHAKE_TIMEOUT`). A refusal/timeout is logged at
+  `warn`, increments `Metric::ClientHandshakeRefused`, and the connection
+  is dropped without ever entering `handle_connection` — never a
+  `ClientResponse::Error` (a mismatched peer can't be relied on to parse
+  one) and never a panic; the listener keeps serving every other peer,
+  the identical contract `spawn_accept`'s own TLS-handshake-failure path
+  already has. **Dial side**: every real dialer of this wire goes through
+  one shared helper, `pub async fn animusd::connect_client(addr) ->
+  io::Result<TcpStream>` — a plain `TcpStream::connect` plus this build's
+  half of the handshake — rather than a bare `TcpStream::connect` at each
+  call site: every `tests/*.rs`/in-crate test dialer, `animus-cli`'s own
+  `maybe_tls_connect` (via `animus_env::exchange_preamble` directly, since
+  it dials through TLS), and this crate's own `join_request`/`relay_
+  request_with_timeout` (both TLS-aware, so they also call `perform_
+  client_handshake` directly on the already-TLS-wrapped stream rather than
+  through `connect_client`, which has no TLS parameter). A dial-side
+  mismatch surfaces as a plain `io::Error` naming the handshake failure —
+  handled by each caller's own existing dial-failure path (a hard `Err`
+  for `connect_client`'s callers; folded into `RELAY_TRANSPORT_FAILURE`/
+  the sentinel a caller already treats a failed connect as, for the two
+  TLS-aware relay dialers) with no special-casing needed. See `animus-env/
+  CLAUDE.md`'s matching entry for the shared exchange itself and
+  `tests/client_handshake.rs` for the accept-side (mismatched version,
+  and a pre-baseline peer with no preamble at all) and dial-side (a fake
+  server replying with the wrong version) regressions.
 - **`handle_connection` cancels an in-flight request when the peer closes the
   connection (issue #596), on both listeners.** `serve_requests` used to
   spawn one untracked, fire-and-forget `tokio::spawn` per accepted

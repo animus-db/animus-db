@@ -32,6 +32,20 @@ use serde::{Deserialize, Serialize};
 pub mod prod;
 #[cfg(feature = "prod")]
 pub use prod::{FsSegmentStore, ProdEnv};
+/// The shared per-connection preamble-exchange primitives (ADR 0073 Phase 0,
+/// workstream D, layer 3): [`prod::exchange_preamble`] (the one
+/// implementation — write our own preamble, then read and check the
+/// peer's, bounded by a caller-supplied timeout, generic over any `S:
+/// AsyncRead + AsyncWrite + Unpin`) plus [`prod::PreambleError`],
+/// [`prod::read_preamble`], and [`prod::write_own_preamble`]. This crate's
+/// own [`ProdEnv`] internal-`Network` transport (`handshake::
+/// NETWORK_PROTOCOL`) uses them internally via `perform_handshake`;
+/// `animusd`'s client/intra port (`handshake::CLIENT_PROTOCOL`) is the
+/// out-of-crate consumer they're exported for, on both its accept and dial
+/// paths, so that wire's handshake reuses this exact exchange rather than
+/// reimplementing it.
+#[cfg(feature = "prod")]
+pub use prod::{PreambleError, exchange_preamble, read_preamble, write_own_preamble};
 
 /// TLS material for the intra-node wire (ADR 0064, S-01 step 1) — gated
 /// alongside `prod.rs` since it exists only to serve `ProdEnv`'s real
@@ -86,11 +100,13 @@ pub use metrics::{Metric, MetricSink, MetricSnapshot, MetricsHandle};
 /// dependencies): pure codec + a version-equality check, with no socket or
 /// `SimEnv` type anywhere in it. See the module's own doc for the byte
 /// layout and why a per-connection preamble beats a per-message field.
-/// **`ProdEnv`'s real internal-`Network` transport is wired to it now**
+/// **`ProdEnv`'s real internal-`Network` transport is wired to it**
 /// (`prod.rs`'s `perform_handshake`, run once per connection on both the
-/// accept and dial paths) — still to come: `animusd`'s client/intra port
-/// and `SimEnv`'s per-node delivery check (a connectionless simulator's
-/// stand-in for the same per-connection exchange).
+/// accept and dial paths), **and so is `animusd`'s client/intra port**
+/// (its own accept- and dial-side wrappers over this crate's shared
+/// [`prod::exchange_preamble`]) — still to come: `SimEnv`'s per-node
+/// delivery check (a connectionless simulator's stand-in for the same
+/// per-connection exchange).
 pub mod handshake;
 pub use handshake::{
     CLIENT_PROTOCOL, HandshakeError, MAX_EXTENSION_LEN, NETWORK_PROTOCOL, Preamble, ProtocolSpec,

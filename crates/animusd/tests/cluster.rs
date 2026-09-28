@@ -8,14 +8,15 @@ use std::time::Duration;
 
 use animus_env::nid;
 use animusd::{ClientRequest, ClientResponse, bind_cluster, read_frame, start_cluster};
-use tokio::net::TcpStream;
 use tokio::time::sleep;
 
 mod support;
 
 /// Send one request to a node's client address and return the reply.
 async fn call(addr: std::net::SocketAddr, req: ClientRequest) -> ClientResponse {
-    let mut stream = TcpStream::connect(addr).await.expect("connect to node");
+    let mut stream = animusd::connect_client(addr)
+        .await
+        .expect("connect to node");
     animusd::write_frame(&mut stream, &req)
         .await
         .expect("send request");

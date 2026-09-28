@@ -34,7 +34,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, mpsc};
 
@@ -942,15 +942,19 @@ fn harden_pooled_socket(stream: &TcpStream, peer_desc: &str) {
 /// forever.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Every way the per-connection handshake preamble exchange
-/// ([`perform_handshake`]) can fail, before a decoded [`handshake::
-/// Preamble`] would even reach [`handshake::check_peer`] (a plain I/O
-/// failure — EOF, a reset, or this build's own write erroring) or the
-/// genuine protocol refusal `check_peer` reports. Kept as one enum so
-/// [`read_preamble`] and [`perform_handshake`] can log and count each
-/// branch differently without threading two separate error types around.
+/// Every way a per-connection preamble exchange ([`exchange_preamble`]) can
+/// fail, before a decoded [`handshake::Preamble`] would even reach
+/// [`handshake::check_peer`] (a plain I/O failure — EOF, a reset, or this
+/// build's own write erroring), the genuine protocol refusal `check_peer`
+/// reports, or the whole exchange simply running out of time. Kept as one
+/// enum, and `pub` (ADR 0073 Phase 0, workstream D, layer 3), so a caller
+/// outside this crate — `animusd`'s own client/intra port, which needs the
+/// identical exchange over its own [`Metric::ClientHandshakeRefused`] rather
+/// than this module's [`Metric::NetworkHandshakeRefused`] — can log and
+/// count each branch exactly like [`perform_handshake`] does below, without
+/// this crate duplicating that logic for a second protocol.
 #[derive(Debug)]
-enum HandshakeFailure {
+pub enum PreambleError {
     /// EOF, a reset, or any other I/O error while writing this build's own
     /// preamble or reading the peer's. **Never** counted as a refusal (see
     /// [`perform_handshake`]'s own doc for the counting decision) — this is
@@ -959,8 +963,12 @@ enum HandshakeFailure {
     Io(std::io::Error),
     /// The peer's preamble decoded but named the wrong magic/version, or
     /// declared an over-long extension — a genuine protocol mismatch.
-    /// Counted via [`Metric::NetworkHandshakeRefused`].
+    /// Counted via a caller's own handshake-refusal metric.
     Refused(handshake::HandshakeError),
+    /// The whole exchange (this build's own write, plus the peer's preamble
+    /// arriving and being read) did not complete within the caller-supplied
+    /// timeout.
+    TimedOut,
 }
 
 /// Reads one peer [`handshake::Preamble`] off `conn`: the fixed
@@ -978,18 +986,25 @@ enum HandshakeFailure {
 /// an uncounted timeout instead of a counted `BadMagic`. The version is
 /// still [`handshake::check_peer`]'s job, once the whole `Preamble` is in
 /// hand.
-async fn read_preamble(
-    conn: &mut MaybeTlsStream,
+///
+/// **Generic over `S: AsyncRead + Unpin`** (ADR 0073 Phase 0, workstream D,
+/// layer 3) rather than named to [`MaybeTlsStream`] — the one implementation
+/// [`exchange_preamble`] shares across every wire this crate's handshake
+/// serves, on both this crate's own [`NETWORK_PROTOCOL`](handshake::
+/// NETWORK_PROTOCOL) transport and `animusd`'s client/intra
+/// [`CLIENT_PROTOCOL`](handshake::CLIENT_PROTOCOL) one.
+pub async fn read_preamble<S: AsyncRead + Unpin>(
+    conn: &mut S,
     expected: &handshake::ProtocolSpec,
-) -> Result<handshake::Preamble, HandshakeFailure> {
+) -> Result<handshake::Preamble, PreambleError> {
     let mut header = [0u8; handshake::HEADER_LEN];
     conn.read_exact(&mut header)
         .await
-        .map_err(HandshakeFailure::Io)?;
+        .map_err(PreambleError::Io)?;
     if header[0..4] != expected.magic {
         let mut found = [0u8; 4];
         found.copy_from_slice(&header[0..4]);
-        return Err(HandshakeFailure::Refused(
+        return Err(PreambleError::Refused(
             handshake::HandshakeError::BadMagic {
                 protocol: expected.name,
                 found,
@@ -1007,25 +1022,60 @@ async fn read_preamble(
             buf.resize(handshake::HEADER_LEN + ext_len, 0);
             conn.read_exact(&mut buf[handshake::HEADER_LEN..])
                 .await
-                .map_err(HandshakeFailure::Io)?;
-            let (preamble, _) = handshake::decode(&buf).map_err(HandshakeFailure::Refused)?;
+                .map_err(PreambleError::Io)?;
+            let (preamble, _) = handshake::decode(&buf).map_err(PreambleError::Refused)?;
             Ok(preamble)
         }
-        Err(other) => Err(HandshakeFailure::Refused(other)),
+        Err(other) => Err(PreambleError::Refused(other)),
     }
 }
 
-/// The actual handshake exchange, run under [`perform_handshake`]'s
-/// [`HANDSHAKE_TIMEOUT`]: write this build's own preamble, then read and
-/// check the peer's.
-async fn handshake_exchange(conn: &mut MaybeTlsStream) -> Result<(), HandshakeFailure> {
-    let ours = handshake::encode(&handshake::Preamble::for_protocol(
-        &handshake::NETWORK_PROTOCOL,
-    ));
-    conn.write_all(&ours).await.map_err(HandshakeFailure::Io)?;
-    conn.flush().await.map_err(HandshakeFailure::Io)?;
-    let peer = read_preamble(conn, &handshake::NETWORK_PROTOCOL).await?;
-    handshake::check_peer(&handshake::NETWORK_PROTOCOL, &peer).map_err(HandshakeFailure::Refused)
+/// Writes this build's own preamble for `spec` to `conn` — the write half
+/// of [`exchange_preamble`], split out so it composes with any `S:
+/// AsyncWrite + Unpin`, exactly like [`read_preamble`]'s own read half.
+pub async fn write_own_preamble<S: AsyncWrite + Unpin>(
+    conn: &mut S,
+    spec: &handshake::ProtocolSpec,
+) -> Result<(), PreambleError> {
+    let ours = handshake::encode(&handshake::Preamble::for_protocol(spec));
+    conn.write_all(&ours).await.map_err(PreambleError::Io)?;
+    conn.flush().await.map_err(PreambleError::Io)
+}
+
+/// **The one implementation of the per-connection preamble exchange** (ADR
+/// 0073 Phase 0, workstream D): writes this build's own `spec` preamble
+/// first — so a mismatched peer can name the mismatch too, even when it's
+/// about to refuse this side — then reads and checks the peer's, the whole
+/// exchange bounded by `timeout`. Generic over `S: AsyncRead + AsyncWrite +
+/// Unpin`, so this same function serves both this module's own
+/// [`MaybeTlsStream`]-typed [`NETWORK_PROTOCOL`](handshake::
+/// NETWORK_PROTOCOL) exchange (via [`perform_handshake`], below) and
+/// `animusd`'s client/intra [`CLIENT_PROTOCOL`](handshake::CLIENT_PROTOCOL)
+/// one, on whatever stream type each caller already has in hand (a plain
+/// `TcpStream`, or a [`MaybeTlsStream`]) — one codec, one exchange, two
+/// independently-versioned protocols and two independently-counted metrics
+/// layered on top by each caller's own thin wrapper (see
+/// [`perform_handshake`]'s own doc for this crate's own wrapper; `animusd`'s
+/// is the client/intra port's counterpart).
+///
+/// Symmetric and connection-shaped exactly as `handshake.rs`'s own module
+/// doc describes: no separate "client" and "server" preamble shape, no
+/// extra round trip to negotiate who writes first.
+pub async fn exchange_preamble<S: AsyncRead + AsyncWrite + Unpin>(
+    conn: &mut S,
+    spec: &handshake::ProtocolSpec,
+    timeout: Duration,
+) -> Result<(), PreambleError> {
+    match tokio::time::timeout(timeout, async {
+        write_own_preamble(conn, spec).await?;
+        let peer = read_preamble(conn, spec).await?;
+        handshake::check_peer(spec, &peer).map_err(PreambleError::Refused)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_elapsed) => Err(PreambleError::TimedOut),
+    }
 }
 
 /// Performs this build's half of the per-connection handshake (ADR 0073
@@ -1082,9 +1132,9 @@ async fn perform_handshake(
     peer_desc: &str,
     metrics: &MetricsHandle,
 ) -> std::io::Result<MaybeTlsStream> {
-    match tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake_exchange(&mut conn)).await {
-        Ok(Ok(())) => Ok(conn),
-        Ok(Err(HandshakeFailure::Io(err))) => {
+    match exchange_preamble(&mut conn, &handshake::NETWORK_PROTOCOL, HANDSHAKE_TIMEOUT).await {
+        Ok(()) => Ok(conn),
+        Err(PreambleError::Io(err)) => {
             tracing::warn!(
                 ?err,
                 peer = %peer_desc,
@@ -1093,7 +1143,7 @@ async fn perform_handshake(
             );
             Err(err)
         }
-        Ok(Err(HandshakeFailure::Refused(err))) => {
+        Err(PreambleError::Refused(err)) => {
             tracing::warn!(
                 ?err,
                 peer = %peer_desc,
@@ -1103,7 +1153,7 @@ async fn perform_handshake(
             metrics.incr(Metric::NetworkHandshakeRefused);
             Err(std::io::Error::new(std::io::ErrorKind::InvalidData, err))
         }
-        Err(_elapsed) => {
+        Err(PreambleError::TimedOut) => {
             tracing::warn!(
                 peer = %peer_desc,
                 role,
