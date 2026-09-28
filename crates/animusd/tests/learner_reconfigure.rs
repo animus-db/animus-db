@@ -167,7 +167,7 @@ async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, ClusterConfig)
 }
 
 async fn call(addr: SocketAddr, req: ClientRequest) -> Option<ClientResponse> {
-    let mut stream = TcpStream::connect(addr).await.ok()?;
+    let mut stream = animusd::connect_client(addr).await.ok()?;
     animusd::write_frame(&mut stream, &req).await.ok()?;
     read_frame(&mut stream).await.ok()?
 }

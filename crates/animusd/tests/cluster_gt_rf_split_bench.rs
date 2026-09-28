@@ -370,7 +370,7 @@ async fn bench_cluster_gt_rf_split_placing_fork_first() {
         let (mut nodes, config) = bring_up_inplace(3, dir.path()).await;
         support::await_bootstrap(&nodes).await;
 
-        let mut s = TcpStream::connect(nodes[0].client_addr())
+        let mut s = animusd::connect_client(nodes[0].client_addr())
             .await
             .expect("connect");
         let filler = vec![b'x'; 256];

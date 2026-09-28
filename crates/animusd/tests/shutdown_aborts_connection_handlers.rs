@@ -62,7 +62,7 @@ const HANDLER_GONE_TIMEOUT: Duration = Duration::from_secs(5);
 /// socket open and idle so the handler parks mid-`read_frame` on the next
 /// request.
 async fn prime_and_park(addr: SocketAddr) -> TcpStream {
-    let mut stream = TcpStream::connect(addr)
+    let mut stream = animusd::connect_client(addr)
         .await
         .unwrap_or_else(|e| panic!("connect to {addr} failed: {e}"));
     write_frame(&mut stream, &ClientRequest::Status)

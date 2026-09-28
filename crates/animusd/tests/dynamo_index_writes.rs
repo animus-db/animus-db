@@ -397,7 +397,7 @@ async fn transact_write_items_maintains_lsi_and_gsi_across_a_split_table() {
     let split_key = token_p1.max(token_p2).to_vec();
     {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let mut stream = tokio::net::TcpStream::connect(nodes[0].client_addr())
+        let mut stream = animusd::connect_client(nodes[0].client_addr())
             .await
             .expect("connect client port");
         let msg = serde_json::to_vec(&animusd::ClientRequest::SplitTablet {

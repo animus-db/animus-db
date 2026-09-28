@@ -185,7 +185,7 @@ async fn bare_stream_hot_read_is_refused() {
     let nodes = start_cluster(bound).await.unwrap();
     support::await_bootstrap(&nodes).await;
 
-    let mut stream = TcpStream::connect(nodes[0].client_addr())
+    let mut stream = animusd::connect_client(nodes[0].client_addr())
         .await
         .expect("connect to client port");
     let request = animusd::ClientRequest::StreamHotRead {

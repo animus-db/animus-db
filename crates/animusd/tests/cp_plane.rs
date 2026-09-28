@@ -38,7 +38,6 @@ use animusd::{
     ClientRequest, ClientResponse, StorageBackend, bind_cluster, read_frame, start_cluster,
     start_cluster_with_auto_split_bytes,
 };
-use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
 mod support;
@@ -46,7 +45,9 @@ mod support;
 const CP_TABLE: &str = "cp_t";
 
 async fn call(addr: std::net::SocketAddr, req: ClientRequest) -> ClientResponse {
-    let mut stream = TcpStream::connect(addr).await.expect("connect to node");
+    let mut stream = animusd::connect_client(addr)
+        .await
+        .expect("connect to node");
     animusd::write_frame(&mut stream, &req)
         .await
         .expect("send request");
