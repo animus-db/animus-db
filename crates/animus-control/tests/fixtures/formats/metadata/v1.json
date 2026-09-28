@@ -1,0 +1,75 @@
+{
+  "v": 1,
+  "members": {
+    "n1": {
+      "labels": {},
+      "status": "Active",
+      "has_activated": true
+    },
+    "n2": {
+      "labels": {},
+      "status": "Active",
+      "has_activated": true
+    }
+  },
+  "tablets": {
+    "1": {
+      "id": 1,
+      "table": "orders",
+      "range": {
+        "start": [],
+        "end": null
+      },
+      "replicas": [
+        "n1",
+        "n2"
+      ],
+      "epoch": 1,
+      "state": "Active",
+      "inplace_split": null
+    }
+  },
+  "policies": {
+    "1": {
+      "name": "p",
+      "replication_factor": 2,
+      "required_labels": {},
+      "spread": null
+    }
+  },
+  "schemas": {
+    "tables": {
+      "orders": {
+        "partition_key": "id",
+        "clustering_keys": [],
+        "columns": [
+          {
+            "name": "id",
+            "ty": "String"
+          }
+        ],
+        "indexes": [],
+        "stream": null,
+        "ttl": null,
+        "pitr": null,
+        "throughput": null,
+        "tags": {}
+      }
+    }
+  },
+  "next_tablet_id": 2,
+  "node_addrs": {},
+  "split_lineage": {},
+  "split_placing": {},
+  "stream_shards": [],
+  "index_backfill": [],
+  "backups": {},
+  "backup_tablet_progress": [],
+  "restores": {},
+  "pitr_segments": [],
+  "pitr_generation": {},
+  "pitr_base_backups": [],
+  "credentials": {},
+  "exports": {},
+  "imports": {}
+}

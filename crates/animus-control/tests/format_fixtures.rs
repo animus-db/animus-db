@@ -28,15 +28,31 @@
 //! serialized `Metadata` blob. It is entirely unaffected by `Metadata`'s
 //! future `"v"` field for the same reason.
 
+//!
+//! **`metadata` (`Metadata`'s own `"v"` field) is the third format this file
+//! covers, added by workstream B PR 3** — a `serde_json` "top-level `\"v\"`
+//! field" format per the ADR's Phase 0 conventions, not a binary/line
+//! envelope, so it has no `format::wrap`/`encode_line` tag to check; its own
+//! decode path is [`Metadata::from_json`]. **No separate `syskv-mirror`
+//! fixture exists** — the system-keyspace mirror's own format-version row
+//! (`mirror::SYSKV_FORMAT_VERSION_COUNTER`) is mirror-internal bookkeeping
+//! that never rides a `Metadata` value at all (`Metadata` is `DRIVER_APPLIED`
+//! — see `crates/animus-control/CLAUDE.md`'s "Versioned formats" section),
+//! and it already has direct unit-test coverage in `mirror.rs`'s own test
+//! module; the `control-snapshot` fixture above already covers a real
+//! system-keyspace image's on-the-wire bytes structurally, which is as close
+//! as that mirror-internal row gets to a "fixture" of its own.
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use animus_control::node::{decode_syskv_image_bytes, encode_syskv_image_bytes};
 use animus_control::persist::{CONTROL_SNAPSHOT, CONTROL_WAL, PersistedState, WalRecord};
 use animus_control::raft::LogEntry;
-use animus_control::{MetaCommand, Metadata, NodeStatus};
+use animus_control::schema::{ColumnType, TableSchema};
+use animus_control::{ApplyOutcome, MetaCommand, Metadata, NodeStatus, PlacementPolicy};
 use animus_env::nid;
-use animus_tablet::TabletId;
+use animus_tablet::{KeyRange, TabletId};
 
 /// One of each [`WalRecord`] variant, built from fixed constants only (ADR
 /// 0073 Phase 0's determinism rule — no wall-clock time, no unseeded
@@ -304,5 +320,153 @@ fn generate_fixture_control_snapshot() {
         );
     }
     let bytes = encode_syskv_image_bytes(&v1_syskv_entries());
+    std::fs::write(&path, &bytes).unwrap_or_else(|e| panic!("writing {}: {e}", path.display()));
+}
+
+// ---------------------------------------------------------------------------
+// `metadata` (`Metadata`'s own top-level `"v"` field, ADR 0073 Phase 0
+// workstream B PR 3) — the `serde_json` "Phase 0 conventions" shape, decoded
+// via [`Metadata::from_json`].
+
+/// A deterministic, non-trivial [`Metadata`] built by applying real
+/// [`MetaCommand`]s through [`Metadata::apply`] — never hand-constructed
+/// field-by-field, which could silently drift from what `apply` actually
+/// produces. Two members, one tablet with a placement policy, and one table
+/// schema; fixed constants only (ADR 0073 Phase 0's determinism rule).
+/// Shared by the fixture generator, the decode test, and the round-trip
+/// test, so all three stay in lockstep by construction.
+fn v1_metadata() -> Metadata {
+    let mut m = Metadata::default();
+    let commands = [
+        MetaCommand::UpsertMember {
+            node: nid(1),
+            labels: BTreeMap::new(),
+            status: NodeStatus::Active,
+        },
+        MetaCommand::UpsertMember {
+            node: nid(2),
+            labels: BTreeMap::new(),
+            status: NodeStatus::Active,
+        },
+        MetaCommand::CreateTablet {
+            tablet: TabletId(1),
+            table: Some("orders".to_string()),
+            range: KeyRange::whole(),
+            replicas: vec![nid(1), nid(2)],
+        },
+        MetaCommand::SetTabletPolicy {
+            tablet: TabletId(1),
+            policy: Some(PlacementPolicy::simple("p", 2)),
+        },
+        MetaCommand::CreateTableSchema {
+            table: "orders".to_string(),
+            schema: TableSchema::simple("id", ColumnType::String),
+        },
+    ];
+    for command in &commands {
+        assert_eq!(
+            m.apply(command),
+            ApplyOutcome::Applied,
+            "fixture premise: every command applies cleanly"
+        );
+    }
+    m
+}
+
+fn metadata_fixtures_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/formats/metadata")
+}
+
+/// Iterates every file under `tests/fixtures/formats/metadata/` (never
+/// naming `v1` literally, per the ADR 0073 Phase 0 conventions — a future
+/// version's own fixture needs no test-code change) and asserts each
+/// decodes, structurally, to the exact expected value for its version.
+#[test]
+fn decodes_every_checked_in_metadata_fixture_structurally() {
+    let dir = metadata_fixtures_dir();
+    let mut checked = 0usize;
+    let entries = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("reading fixtures dir {}: {e}", dir.display()));
+    for entry in entries {
+        let entry = entry.expect("readable dir entry");
+        let path = entry.path();
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("reading {name}: {e}"));
+        match name.as_str() {
+            "v1.json" => {
+                let decoded = Metadata::from_json(&bytes)
+                    .unwrap_or_else(|e| panic!("{name} failed to decode: {e}"));
+                assert_eq!(
+                    decoded,
+                    v1_metadata(),
+                    "{name} decoded to an unexpected value"
+                );
+                checked += 1;
+            }
+            other => panic!(
+                "unrecognized metadata fixture {other:?} — add a matching expected-value \
+                 arm to this test before adding the fixture file"
+            ),
+        }
+    }
+    assert!(
+        checked > 0,
+        "no metadata fixtures found under {}",
+        dir.display()
+    );
+}
+
+/// Encoding the same representative value with the *current* code and
+/// decoding it back must reproduce the original exactly — catches an
+/// encoder/decoder asymmetry a static fixture decode alone can't.
+#[test]
+fn metadata_round_trips_through_encode_and_decode() {
+    let metadata = v1_metadata();
+    let bytes = serde_json::to_vec(&metadata).expect("metadata serializes");
+    let decoded = Metadata::from_json(&bytes).expect("decodes");
+    assert_eq!(decoded, metadata);
+}
+
+/// The fixture carries the top-level `"v"` field the ADR 0073 Phase 0
+/// `serde_json` convention requires — a cheap, direct sanity check
+/// independent of the structural decode above.
+#[test]
+fn metadata_fixture_carries_the_v_field() {
+    let bytes = std::fs::read(metadata_fixtures_dir().join("v1.json"))
+        .expect("v1.json fixture is checked in");
+    let value: serde_json::Value = serde_json::from_slice(&bytes).expect("fixture is valid JSON");
+    assert_eq!(
+        value.get("v"),
+        Some(&serde_json::Value::from(
+            animus_control::meta::METADATA_VERSION
+        ))
+    );
+}
+
+/// Regenerates `v<METADATA_VERSION>.json` from [`v1_metadata`] with the
+/// *current* encoder. Run explicitly, never part of the default test run:
+/// `cargo test -p animus-control --test format_fixtures generate_fixture_metadata -- --ignored`.
+///
+/// Refuses to overwrite a fixture that already exists (ADR 0073 Phase 0
+/// conventions) — bump [`Metadata::version`]'s `METADATA_VERSION` and add a
+/// new file instead of regenerating an existing one.
+#[test]
+#[ignore]
+fn generate_fixture_metadata() {
+    let dir = metadata_fixtures_dir();
+    std::fs::create_dir_all(&dir).expect("create fixtures dir");
+    let path = dir.join(format!("v{}.json", animus_control::meta::METADATA_VERSION));
+    if std::fs::metadata(&path).is_ok() {
+        panic!(
+            "{} already exists — a checked-in fixture is never regenerated in place; \
+             bump METADATA_VERSION and add a new fixture file instead",
+            path.display()
+        );
+    }
+    let bytes = serde_json::to_vec_pretty(&v1_metadata()).expect("metadata serializes");
     std::fs::write(&path, &bytes).unwrap_or_else(|e| panic!("writing {}: {e}", path.display()));
 }

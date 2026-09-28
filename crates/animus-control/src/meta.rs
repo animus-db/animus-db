@@ -164,10 +164,79 @@ fn default_node_role() -> String {
     "combined".to_string()
 }
 
+/// The current [`Metadata`] JSON format version (ADR 0073 Phase 0 workstream
+/// B): the value [`Metadata::version`] is constructed with and the highest a
+/// decoder built from this source accepts. Restarted at `1` by the Phase 0
+/// baseline reset per the ADR's "version counters restart at 1" instruction
+/// — there is no pre-Phase-0 `Metadata` version to preserve continuity with.
+pub const METADATA_VERSION: u32 = 1;
+
+/// Serde default for [`Metadata::version`] when `"v"` is absent: always `1`,
+/// the one `Metadata` schema that ever existed without the tag. Deliberately
+/// the literal v1, **not** [`METADATA_VERSION`] — when that constant is
+/// bumped, an untagged document must still mean v1. See [`Metadata`]'s doc
+/// for why a default is sound here.
+fn metadata_v1() -> u32 {
+    1
+}
+
+/// Serde validator for a present `"v"`: rejects `0` and anything above
+/// [`METADATA_VERSION`], so plain `serde_json` decoding never silently
+/// accepts a future/unknown version. (An *absent* `"v"` never reaches this;
+/// it takes [`metadata_v1`].)
+fn deserialize_metadata_version<'de, D>(d: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = u32::deserialize(d)?;
+    if v == 0 || v > METADATA_VERSION {
+        return Err(serde::de::Error::custom(format!(
+            "unsupported Metadata format version {v} (max supported {METADATA_VERSION})"
+        )));
+    }
+    Ok(v)
+}
+
 /// The replicated control-plane state: membership and the (single-table) tablet
 /// map.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// **Carries its own top-level `"v"` format version (ADR 0073 Phase 0
+/// workstream B, the `serde_json` "Phase 0 conventions" shape).** Two decode
+/// paths with deliberately different strictness:
+///
+/// - [`Metadata::from_json`] (standalone/bare documents, e.g. a Status wire
+///   response) is **strict**: a missing `"v"` is
+///   [`crate::format::FormatError::PreBaselineFormat`], an unknown one
+///   [`crate::format::FormatError::UnsupportedFormatVersion`].
+/// - Plain serde deserialization **defaults an absent `"v"` to 1**
+///   ([`metadata_v1`]) and rejects a present-but-unknown `"v"` (`0` or
+///   above [`METADATA_VERSION`]). This is sound because pre-baseline
+///   detection is the *envelope's* job: a `Metadata` found inside a tagged
+///   v1 envelope (CWL1 WAL entry, CSN1 snapshot) is post-reset by
+///   construction, and v1 is the only `Metadata` schema that ever existed
+///   without the tag — so an absent `"v"` there unambiguously means v1. The
+///   default is required by the frozen `control-wal/v1.bin` fixture, whose
+///   embedded `Metadata` predates the field and which ADR 0073 forbids
+///   editing. (This deviates from the ADR's "required, no default" wording
+///   for `serde_json` formats.)
+///
+/// **This field versions `Metadata`'s own JSON shape only** — it says nothing
+/// about the system-keyspace mirror's on-disk format, which has its own
+/// independent version signal: see `mirror::SYSKV_FORMAT_VERSION_COUNTER`'s
+/// own doc for why a `DRIVER_APPLIED` type's field can't version storage that
+/// never serializes the type itself.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Metadata {
+    /// The [`Metadata`] JSON format version this value was constructed/
+    /// decoded at. Always [`METADATA_VERSION`] for a freshly-constructed
+    /// value; [`Metadata::from_json`] is the intended decode path for
+    /// untrusted bytes (see the struct's own doc).
+    #[serde(
+        rename = "v",
+        default = "metadata_v1",
+        deserialize_with = "deserialize_metadata_version"
+    )]
+    pub version: u32,
     /// Cluster membership keyed by node id.
     pub members: BTreeMap<NodeId, Member>,
     /// The tablet map keyed by tablet id.
@@ -464,6 +533,103 @@ pub struct Metadata {
     /// keeps pre-import snapshots loading (empty map).
     #[serde(default)]
     pub imports: BTreeMap<ImportId, ImportRow>,
+}
+
+impl Default for Metadata {
+    /// A fresh, empty [`Metadata`] at [`METADATA_VERSION`]. Deliberately a
+    /// manual impl, not `#[derive(Default)]` (which the ADR 0073 Phase 0
+    /// reset removed): every field but `version` still gets its own
+    /// `Default::default()`, but `version` itself must always be the
+    /// current [`METADATA_VERSION`], never `0` (which is never a valid
+    /// version — see [`crate::format::FormatTag::version`]'s own doc for
+    /// why `0` is reserved).
+    fn default() -> Self {
+        Metadata {
+            version: METADATA_VERSION,
+            members: Default::default(),
+            tablets: Default::default(),
+            policies: Default::default(),
+            schemas: Default::default(),
+            next_tablet_id: Default::default(),
+            node_addrs: Default::default(),
+            split_lineage: Default::default(),
+            split_placing: Default::default(),
+            stream_shards: Default::default(),
+            index_backfill: Default::default(),
+            backups: Default::default(),
+            backup_tablet_progress: Default::default(),
+            restores: Default::default(),
+            pitr_segments: Default::default(),
+            pitr_generation: Default::default(),
+            pitr_base_backups: Default::default(),
+            credentials: Default::default(),
+            exports: Default::default(),
+            imports: Default::default(),
+        }
+    }
+}
+
+/// The result of peeking a `serde_json` document's top-level `"v"` field
+/// before attempting a full [`Metadata`] decode — see [`Metadata::from_json`].
+#[derive(Deserialize)]
+struct MetadataVersionPeek {
+    #[serde(rename = "v")]
+    v: u32,
+}
+
+impl Metadata {
+    /// Decode untrusted `serde_json` bytes as a [`Metadata`] (ADR 0073 Phase
+    /// 0 workstream B): peeks the top-level `"v"` field first, distinguishing
+    /// three cases before ever attempting the full decode:
+    ///
+    /// - No `"v"` field at all (or the bytes don't even parse as a JSON
+    ///   object) → [`crate::format::FormatError::PreBaselineFormat`] — a
+    ///   pre-baseline `Metadata` blob (or garbage), which this build owes no
+    ///   compatibility.
+    /// - A `"v"` greater than [`METADATA_VERSION`] → [`crate::format::
+    ///   FormatError::UnsupportedFormatVersion`] — a future binary's format,
+    ///   read by an older one.
+    /// - A recognized `"v"` (currently only `1`, since [`METADATA_VERSION`]
+    ///   is `1`) → the full decode; a structurally malformed body at that
+    ///   point is [`crate::format::FormatError::Malformed`].
+    ///
+    /// **`found`/`max_supported` on [`crate::format::FormatError::
+    /// UnsupportedFormatVersion`] are `u8`, but this field is `u32`** (the
+    /// ADR's `serde_json` convention, sized to comfortably outlive this
+    /// format's whole lifetime) — a `"v"` that doesn't fit in a `u8` is
+    /// saturated into it (`u32::min(u8::MAX as u32, ..) as u8`) before being
+    /// reported; a version that large is already nonsensically far past
+    /// [`METADATA_VERSION`] to be a real future version, and the saturated
+    /// value is still strictly greater than `max_supported`, which is all
+    /// the caller needs to tell "unsupported" from "supported."
+    ///
+    /// A plain `serde_json::from_slice::<Metadata>(bytes)` is *more lenient*:
+    /// it defaults a missing `"v"` to 1 (for Metadata embedded in a tagged
+    /// envelope — see [`Metadata`]'s doc) and rejects an unknown `"v"` with
+    /// an untyped serde error. Use this method for any standalone document.
+    pub fn from_json(bytes: &[u8]) -> Result<Metadata, crate::format::FormatError> {
+        use crate::format::FormatError;
+
+        const FORMAT: &str = "metadata";
+
+        let peek: MetadataVersionPeek = match serde_json::from_slice(bytes) {
+            Ok(peek) => peek,
+            Err(_) => return Err(FormatError::PreBaselineFormat { format: FORMAT }),
+        };
+        if peek.v == 0 || peek.v > METADATA_VERSION {
+            let found = u8::try_from(peek.v).unwrap_or(u8::MAX);
+            let max_supported = u8::try_from(METADATA_VERSION).unwrap_or(u8::MAX);
+            return Err(FormatError::UnsupportedFormatVersion {
+                format: FORMAT,
+                found,
+                max_supported,
+            });
+        }
+        serde_json::from_slice(bytes).map_err(|e| FormatError::Malformed {
+            format: FORMAT,
+            detail: e.to_string(),
+        })
+    }
 }
 
 /// Gives [`Metadata::stream_shards`] a `serde_json`-safe wire shape — see
@@ -10738,6 +10904,89 @@ mod tests {
         let value = serde_json::to_value(&m).expect("metadata serializes with stream_shards");
         let decoded: Metadata = serde_json::from_value(value).expect("metadata round-trips");
         assert_eq!(decoded, m);
+    }
+
+    /// ADR 0073 Phase 0 workstream B: [`Metadata`]'s own JSON shape carries a
+    /// required top-level `"v"` field, and a plain round trip through
+    /// `serde_json` includes it.
+    #[test]
+    fn metadata_round_trips_through_json_and_includes_the_v_field() {
+        let m = Metadata::default();
+        assert_eq!(m.version, METADATA_VERSION);
+
+        let value = serde_json::to_value(&m).expect("metadata serializes");
+        assert_eq!(
+            value.get("v"),
+            Some(&serde_json::Value::from(METADATA_VERSION)),
+            "the encoded document must carry the top-level \"v\" field"
+        );
+
+        let decoded: Metadata = serde_json::from_value(value).expect("metadata round-trips");
+        assert_eq!(decoded, m);
+
+        let bytes = serde_json::to_vec(&m).expect("metadata serializes to bytes");
+        let decoded = Metadata::from_json(&bytes).expect("from_json round-trips");
+        assert_eq!(decoded, m);
+    }
+
+    /// A `serde_json` document with no `"v"` field at all — the shape every
+    /// pre-baseline `Metadata` blob has — is a named, loud
+    /// [`crate::format::FormatError::PreBaselineFormat`] through
+    /// [`Metadata::from_json`], and an ordinary serde "missing field" error
+    /// through a plain `serde_json::from_slice`/`from_value` (never a
+    /// silent default).
+    #[test]
+    fn metadata_from_json_rejects_a_missing_v_field_as_pre_baseline() {
+        let mut value = serde_json::to_value(Metadata::default()).expect("serializes");
+        value
+            .as_object_mut()
+            .expect("metadata serializes as an object")
+            .remove("v");
+        let bytes = serde_json::to_vec(&value).expect("re-serializes");
+
+        assert_eq!(
+            Metadata::from_json(&bytes),
+            Err(crate::format::FormatError::PreBaselineFormat { format: "metadata" })
+        );
+
+        // A plain serde decode (no `from_json`) is lenient: an absent `"v"`
+        // means v1 (Metadata embedded in a tagged envelope — see
+        // [`Metadata`]'s doc; the frozen control-wal/v1.bin depends on it).
+        let decoded: Metadata = serde_json::from_slice(&bytes).expect("absent v defaults to 1");
+        assert_eq!(decoded.version, 1);
+        assert_eq!(decoded, Metadata::default());
+    }
+
+    /// A `"v"` newer than [`METADATA_VERSION`] this build knows is a named,
+    /// loud [`crate::format::FormatError::UnsupportedFormatVersion`] through
+    /// [`Metadata::from_json`] — never a silent misdecode.
+    #[test]
+    fn metadata_from_json_rejects_an_unsupported_future_v() {
+        let mut value = serde_json::to_value(Metadata::default()).expect("serializes");
+        value
+            .as_object_mut()
+            .expect("metadata serializes as an object")
+            .insert("v".to_owned(), serde_json::Value::from(2_u32));
+        let bytes = serde_json::to_vec(&value).expect("re-serializes");
+
+        assert_eq!(
+            Metadata::from_json(&bytes),
+            Err(crate::format::FormatError::UnsupportedFormatVersion {
+                format: "metadata",
+                found: 2,
+                max_supported: METADATA_VERSION as u8,
+            })
+        );
+
+        // Plain serde also rejects an unknown present `"v"` (untyped error).
+        serde_json::from_slice::<Metadata>(&bytes).expect_err("unknown v must not decode");
+        let zero = serde_json::to_vec(&{
+            let mut v = serde_json::to_value(Metadata::default()).unwrap();
+            v["v"] = serde_json::Value::from(0_u32);
+            v
+        })
+        .unwrap();
+        serde_json::from_slice::<Metadata>(&zero).expect_err("v=0 must not decode");
     }
 
     /// The identical hazard as

@@ -556,3 +556,50 @@ fn run_directed_placing_scenario(seed: u64) {
         assert!(!meta.split_placing[&TabletId(102)].done);
     });
 }
+
+/// ADR 0073 Phase 0 workstream B: the apply task's system-keyspace format
+/// version row (`mirror::SYSKV_FORMAT_VERSION_COUNTER`) is written to the
+/// real engine by a real apply pass, over a real single-voter
+/// `RaftNode<SimEnv>` — never merely unit-tested against a hand-built
+/// engine. Proves both that the row lands at all, and that it carries
+/// `mirror::SYSKV_MIRROR_VERSION`.
+#[test]
+fn real_apply_pass_writes_the_syskv_format_version_row() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    rt.block_on(async move {
+        let mut sim = Simulator::new(0x5CE0_0004);
+        let engine = MemoryEngine::new();
+        let node = RaftNode::start(
+            sim.env(nid(0)),
+            std::iter::once(nid(0)).collect(),
+            engine.clone(),
+        );
+        // A single-voter group wins its own election on its very first
+        // tick, and the election no-op alone is enough to drive a real
+        // apply pass (it's a committed `MetaCommand::NoOp`, so the batch
+        // this apply task writes is non-empty even before any real
+        // proposal).
+        sim.run_for(Duration::from_secs(2));
+        assert!(node.is_leader(), "single-voter group should self-elect");
+
+        node.propose(upsert(1));
+        sim.run_for(Duration::from_secs(1));
+
+        let row = animus_storage::StorageEngine::get(&engine, &mirror::syskv_format_version_key())
+            .await
+            .expect("engine read")
+            .unwrap_or_else(|| {
+                panic!("the syskv_format_version row should have been written by now")
+            });
+        let value = u64::from_be_bytes(
+            row.value
+                .as_slice()
+                .try_into()
+                .expect("syskv_format_version row is 8 bytes"),
+        );
+        assert_eq!(value, u64::from(mirror::SYSKV_MIRROR_VERSION));
+    });
+}
