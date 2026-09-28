@@ -380,9 +380,10 @@ per-tablet CP data plane (`animus-cp-data`).
   here until its mirror behavior is a deliberate decision. It takes
   `&mut Metadata` (not just post-apply state) **because `DropTableTablets`'s
   derived deletions depend on identities gone by the time `apply`
-  returns** (its dropped-tablet-id set and its legacy `cp_member_addrs`
-  prune — the dual `MergeTablets` case this once also covered was removed
-  by ADR 0044) — diffing this way, rather than re-deriving the pruning
+  returns** (its dropped-tablet-id set — the dual `MergeTablets` case this
+  once also covered was removed by ADR 0044, and the legacy
+  `cp_member_addrs` prune this once also covered was removed by ADR 0073
+  Phase 0) — diffing this way, rather than re-deriving the pruning
   predicate a second time, avoids the "two places must agree on a gating
   rule" hazard this crate's engineering practices warn about.
 

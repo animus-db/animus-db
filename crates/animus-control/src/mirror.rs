@@ -29,19 +29,13 @@
 //!   tablet ids it just removed is computed internally
 //!   (`Metadata::tablets_for_table`) from state that is gone by the time
 //!   `apply` returns.
-//! - [`MetaCommand::DropTableTablets`] also prunes the
-//!   legacy `Metadata::cp_member_addrs`/`cp_member_tablets` address book
-//!   (`Metadata::prune_cp_member_addrs`) for any CP member registered against
-//!   a tablet that just left the map — again, only knowable by comparing
-//!   against what existed *before*.
 //!
 //! Rather than duplicate `Metadata::apply`'s internal pruning logic a second
 //! time here (a correctness hazard if the two ever drift — the exact
 //! "grep every gating match site" class of bug this crate's `CLAUDE.md`
 //! flags), [`apply_and_derive_mirror`] takes `&mut Metadata` and captures the
 //! small, targeted slice of pre-apply state each command's derivation
-//! actually needs (the table's current tablet ids; a clone of
-//! `cp_member_tablets`, bounded by "one entry per CP member ever registered")
+//! actually needs (the table's current tablet ids)
 //! **before** calling the real, unchanged `Metadata::apply`, then derives
 //! writes by diffing against the post-apply result. This is a deliberate,
 //! documented deviation from a post-state-only signature — see the PR2 report
@@ -49,21 +43,20 @@
 //!
 //! ## Full fidelity, not a partial mirror
 //!
-//! Every [`MetaCommand`] variant is mirrored, including the legacy
-//! `RegisterCpAddr` and the monotonic tablet-id-allocator counter
-//! (`next_tablet_id`) — none of these were in PR1's [`EntityKind`] set, so
-//! this module's own PR2 changes to `syskv.rs` added
-//! [`syskv::EntityKind::Counter`]/[`syskv::EntityKind::CpMemberAddr`] (a
-//! third PR2 variant, `NodeIdAlloc`, mirrored the ADR 0036 allocator's
-//! idempotency ledger — removed in ADR 0040 PR4 along with the allocator;
-//! `MetaCommand::RegisterNode`'s claim lives entirely in the already-mirrored
-//! `Member`/`NodeAddrs` kinds, no separate ledger needed). The payoff:
-//! [`rebuild_metadata_from_engine`] produces a `Metadata` that is
-//! `PartialEq`-identical to the real in-core one, not "identical modulo a
-//! documented gap" — which is exactly what the differential-oracle test
-//! asserts.
-
-use std::collections::BTreeMap;
+//! Every [`MetaCommand`] variant is mirrored, including the monotonic
+//! tablet-id-allocator counter (`next_tablet_id`) — none of these were in
+//! PR1's [`EntityKind`] set, so this module's own PR2 changes to `syskv.rs`
+//! added [`syskv::EntityKind::Counter`] (a second PR2 variant, `NodeIdAlloc`,
+//! mirrored the ADR 0036 allocator's idempotency ledger — removed in ADR 0040
+//! PR4 along with the allocator; `MetaCommand::RegisterNode`'s claim lives
+//! entirely in the already-mirrored `Member`/`NodeAddrs` kinds, no separate
+//! ledger needed; a third, `CpMemberAddr`, mirrored the legacy CP-member
+//! address book — removed 2026-09-28 in ADR 0073 Phase 0 along with
+//! `MetaCommand::RegisterCpAddr` and `Metadata::cp_member_addrs`/
+//! `cp_member_tablets`). The payoff: [`rebuild_metadata_from_engine`]
+//! produces a `Metadata` that is `PartialEq`-identical to the real in-core
+//! one, not "identical modulo a documented gap" — which is exactly what the
+//! differential-oracle test asserts.
 
 use animus_env::NodeId;
 #[cfg(test)]
@@ -104,19 +97,6 @@ pub enum KeyWrite {
     Delete(Vec<u8>),
 }
 
-/// The legacy CP-member address registration
-/// (`Metadata::cp_member_addrs`/`cp_member_tablets`, `MetaCommand::RegisterCpAddr`)
-/// mirrored as one value under [`EntityKind::CpMemberAddr`] — the two source
-/// maps share a key (`NodeId`) but not necessarily a domain (`tablet` may be
-/// absent from `cp_member_tablets` while present in `cp_member_addrs`), so
-/// they're combined into one record rather than mirrored as two keys that
-/// could disagree on presence.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct CpMemberAddrEntry {
-    addr: String,
-    tablet: Option<TabletId>,
-}
-
 /// Apply `command` to `meta` — delegating to the real, unchanged
 /// [`Metadata::apply`] — and derive the system-keyspace [`KeyWrite`]s it
 /// implies. Returns `(outcome, writes)`; `writes` is always empty when
@@ -139,10 +119,6 @@ pub fn apply_and_derive_mirror(
             meta.tablets_for_table(table).map(|(&id, _)| id).collect()
         }
         _ => Vec::new(),
-    };
-    let pre_cp_member_tablets: BTreeMap<NodeId, TabletId> = match command {
-        MetaCommand::DropTableTablets { .. } => meta.cp_member_tablets.clone(),
-        _ => BTreeMap::new(),
     };
     // ADR 0045: `DropTableTablets`/`DropTableIndex` both prune
     // `Metadata::index_backfill` rows as a side effect of their own apply —
@@ -300,9 +276,6 @@ pub fn apply_and_derive_mirror(
             for tablet in &pruned_split_placing {
                 writes.push(KeyWrite::Delete(syskv::split_placing_key(*tablet)));
             }
-            for id in dead_cp_member_ids(&pre_cp_member_tablets, meta) {
-                writes.push(KeyWrite::Delete(syskv::cp_member_addr_key(&id)));
-            }
         }
         MetaCommand::DropTableIndex { table, .. } => {
             if let Some(schema) = meta.schemas.get(table) {
@@ -365,20 +338,12 @@ pub fn apply_and_derive_mirror(
                 &meta.split_placing[tablet],
             ));
         }
-        MetaCommand::RegisterCpAddr { id, addr, tablet } => {
-            let entry = CpMemberAddrEntry {
-                addr: addr.clone(),
-                tablet: *tablet,
-            };
-            writes.push(put_json(syskv::cp_member_addr_key(id), &entry));
-        }
         MetaCommand::RegisterNodeAddrs { node, addrs } => {
             writes.push(put_json(syskv::node_addrs_key(node), addrs));
         }
         MetaCommand::RemoveMember { node } => {
             writes.push(KeyWrite::Delete(syskv::member_key(node)));
             writes.push(KeyWrite::Delete(syskv::node_addrs_key(node)));
-            writes.push(KeyWrite::Delete(syskv::cp_member_addr_key(node)));
         }
         MetaCommand::RegisterNode { node, .. } => {
             // `apply_and_derive_mirror` only reaches here when `outcome ==
@@ -584,19 +549,6 @@ pub fn apply_and_derive_mirror(
     (outcome, writes)
 }
 
-/// Every id in `pre` (a `cp_member_tablets` snapshot taken *before* this
-/// apply) whose associated tablet is no longer in `meta.tablets` (taken
-/// *after*) — i.e. exactly the entries `Metadata::prune_cp_member_addrs`
-/// just pruned as a side effect of this one apply. Diffing against `pre`
-/// rather than re-deriving the prune predicate keeps this in lockstep with
-/// `Metadata::apply`'s own logic without duplicating it.
-fn dead_cp_member_ids(pre: &BTreeMap<NodeId, TabletId>, meta: &Metadata) -> Vec<NodeId> {
-    pre.iter()
-        .filter(|(_, tablet)| !meta.tablets.contains_key(tablet))
-        .map(|(id, _)| id.clone())
-        .collect()
-}
-
 /// Serialize `value` (the same `serde_json` encoding the WAL snapshot blob
 /// uses) as a [`KeyWrite::Put`] at `key`.
 fn put_json<T: Serialize>(key: Vec<u8>, value: &T) -> KeyWrite {
@@ -723,15 +675,6 @@ fn apply_put(meta: &mut Metadata, key: &[u8], value: &[u8]) {
                 meta.pitr_generation.insert(table.to_owned(), value);
             }
         }
-        EntityKind::CpMemberAddr => {
-            let node = decode_node_id(id);
-            let entry: CpMemberAddrEntry =
-                serde_json::from_slice(value).expect("mirrored cp-member-addr value decodes");
-            meta.cp_member_addrs.insert(node.clone(), entry.addr);
-            if let Some(tablet) = entry.tablet {
-                meta.cp_member_tablets.insert(node, tablet);
-            }
-        }
         EntityKind::StreamShard => {
             let Some(key) = syskv::decode_stream_shard_id(&id) else {
                 return;
@@ -842,11 +785,6 @@ fn apply_delete(meta: &mut Metadata, key: &[u8]) {
             // `Put`) — listed for match exhaustiveness. This covers both
             // `NEXT_TABLET_ID_COUNTER` and every per-table PITR generation
             // counter (`syskv::pitr_generation_key`).
-        }
-        EntityKind::CpMemberAddr => {
-            let node = decode_node_id(id);
-            meta.cp_member_addrs.remove(&node);
-            meta.cp_member_tablets.remove(&node);
         }
         EntityKind::StreamShard => {
             // Reachable in practice, unlike the never-pruned markers above
@@ -1145,7 +1083,7 @@ mod tests {
     }
 
     #[test]
-    fn drop_table_tablets_deletes_every_tablet_policy_and_prunes_cp_member_addrs() {
+    fn drop_table_tablets_deletes_every_tablet_and_policy() {
         let mut meta = Metadata::default();
         let _ = apply_and_derive_mirror(
             &mut meta,
@@ -1163,8 +1101,6 @@ mod tests {
                 policy: Some(PlacementPolicy::simple("p", 1)),
             },
         );
-        meta.cp_member_addrs.insert(nid(7), "addr".to_string());
-        meta.cp_member_tablets.insert(nid(7), TabletId(1));
 
         let command = MetaCommand::DropTableTablets {
             table: "t".to_string(),
@@ -1176,7 +1112,6 @@ mod tests {
             vec![
                 KeyWrite::Delete(syskv::tablet_key(TabletId(1))),
                 KeyWrite::Delete(syskv::policy_key(TabletId(1))),
-                KeyWrite::Delete(syskv::cp_member_addr_key(&nid(7))),
             ]
         );
 
@@ -1431,37 +1366,6 @@ mod tests {
     }
 
     #[test]
-    fn register_cp_addr_writes_the_combined_entry() {
-        let mut meta = Metadata::default();
-        let _ = apply_and_derive_mirror(
-            &mut meta,
-            &MetaCommand::CreateTablet {
-                tablet: TabletId(1),
-                table: None,
-                range: KeyRange::whole(),
-                replicas: vec![nid(1)],
-            },
-        );
-        let command = MetaCommand::RegisterCpAddr {
-            id: nid(5),
-            addr: "127.0.0.1:9".to_string(),
-            tablet: Some(TabletId(1)),
-        };
-        let (outcome, writes) = apply_and_derive_mirror(&mut meta, &command);
-        assert_eq!(outcome, ApplyOutcome::Applied);
-        assert_eq!(
-            writes,
-            vec![put_json(
-                syskv::cp_member_addr_key(&nid(5)),
-                &CpMemberAddrEntry {
-                    addr: "127.0.0.1:9".to_string(),
-                    tablet: Some(TabletId(1)),
-                }
-            )]
-        );
-    }
-
-    #[test]
     fn register_node_addrs_writes_the_address_book_entry() {
         let mut meta = Metadata::default();
         // ADR 0040 PR4: `RegisterNodeAddrs` is update-only — establish the
@@ -1512,7 +1416,6 @@ mod tests {
             vec![
                 KeyWrite::Delete(syskv::member_key(&nid(4))),
                 KeyWrite::Delete(syskv::node_addrs_key(&nid(4))),
-                KeyWrite::Delete(syskv::cp_member_addr_key(&nid(4))),
             ]
         );
     }
@@ -2659,9 +2562,6 @@ mod tests {
                 vec![nid(1)],
             ),
         );
-        base.cp_member_addrs.insert(nid(99), "addr:1".to_string());
-        base.cp_member_tablets.insert(nid(99), TabletId(2));
-
         let command = MetaCommand::DropTableTablets {
             table: "t".to_string(),
         };
