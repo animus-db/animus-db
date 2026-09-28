@@ -322,3 +322,91 @@ fn genuinely_behind_follower_still_converges() {
         "follower did not converge after InstallSnapshot (seed={seed})"
     );
 }
+
+/// Issue found live on `--cluster-control 3 --cluster-data 5` under bulk
+/// seeding + auto-split: the `&& !self.state_machine_behind` override on the
+/// "already at least this far along" guard exists for the #554 wipe-recovery
+/// case (a fresh, empty engine reopened behind an intact log), where the
+/// offer's `last_index` is always `>= last_applied` (typically exactly
+/// equal — the follower's log already matched the leader's base before its
+/// engine was lost). But `state_machine_behind` is *also* true, transiently,
+/// after every ordinary genuine `InstallSnapshot` completes: `last_applied`/
+/// `snapshot_index` advance synchronously inside `handle_install_snapshot`,
+/// while the separate async apply task (`animus-cp-data`'s
+/// `engine_applied`) is still draining `pending_install` into the engine —
+/// `state_machine_behind` is computed live as `engine_applied <
+/// snapshot_index` and is true for that whole window even though this is
+/// not the wipe case at all. If a completely different, already-obsolete
+/// snapshot transfer's final chunk lands during that window, the override
+/// lets `last_index < last_applied` sail through and reinstalls, rewinding
+/// `last_applied`/`commit_index`/the log — the same rewind
+/// `stale_install_snapshot_below_last_applied_is_rejected` above regresses,
+/// except this time gated on `state_machine_behind` being (legitimately, for
+/// an unrelated reason) true.
+#[test]
+fn stale_install_snapshot_below_last_applied_is_rejected_even_when_state_machine_behind() {
+    let now = Nanos(1_000_000_000);
+    let mut leader = elect_leader_of_pair(now);
+    let mut follower: RaftCore = RaftCore::new(nid(1), &[nid(0), nid(1)], Nanos(0), 7);
+
+    for i in 0..40u64 {
+        let _ = leader.propose(upsert(i));
+    }
+    let last = replicate_and_apply(&mut leader, &mut follower, now);
+
+    let applied_before = follower.last_applied();
+    assert!(
+        applied_before >= 40,
+        "follower should have applied all 40 proposed entries via ordinary \
+         AppendEntries, got last_applied={applied_before}"
+    );
+
+    // Force the follower into the post-install-transient shape: `last_applied`
+    // has already advanced (via ordinary replication here, standing in for a
+    // just-completed genuine InstallSnapshot's synchronous `install` step),
+    // but the (separate, async, cp-data-owned) engine hasn't caught up yet —
+    // observable here purely as `state_machine_behind` being live-true,
+    // exactly what `animus-cp-data`'s consensus loop feeds in every
+    // iteration regardless of *why* the engine is behind.
+    follower.set_state_machine_behind(true);
+
+    // A stale, single-chunk `InstallSnapshot` transfer claiming a
+    // `last_index` the follower has already applied well past — the exact
+    // shape of a leftover/duplicated transfer from an earlier leader base.
+    let stale_last_index = 10u64;
+    assert!(stale_last_index < applied_before);
+    let stale = RaftMsg::InstallSnapshot {
+        term: leader.term(),
+        leader: nid(0),
+        last_index: stale_last_index,
+        last_term: leader.term(),
+        offset: 0,
+        data: vec![0xAAu8; 16],
+        total: 16,
+        done: true,
+        config: None,
+        learners: None,
+    };
+    let resp = follower.handle(nid(0), stale, last, 7);
+
+    assert_eq!(
+        follower.last_applied(),
+        applied_before,
+        "a stale InstallSnapshot must never rewind last_applied, even while \
+         state_machine_behind is (legitimately, for an unrelated reason) true \
+         — the #554 override must not become a blanket bypass of the \
+         last_applied guard"
+    );
+    assert_eq!(
+        follower.commit_index(),
+        applied_before,
+        "commit_index must not rewind either"
+    );
+    assert!(
+        resp.iter().any(|(_, m)| matches!(
+            m,
+            RaftMsg::InstallSnapshotResp { last_index, .. } if *last_index == 0
+        )),
+        "the follower should ack its position as redundant, not install: {resp:?}"
+    );
+}
