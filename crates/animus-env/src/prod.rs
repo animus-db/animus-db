@@ -966,16 +966,36 @@ enum HandshakeFailure {
 /// Reads one peer [`handshake::Preamble`] off `conn`: the fixed
 /// [`handshake::HEADER_LEN`]-byte header first, then whatever extension
 /// bytes it declares — mirroring [`handshake::decode`]'s own incremental-
-/// read contract (see that function's own doc). The only
-/// [`handshake::HandshakeError`] this can surface is
-/// [`handshake::HandshakeError::ExtensionTooLong`]; `BadMagic`/
-/// `UnsupportedVersion` are [`handshake::check_peer`]'s job, called
-/// separately by [`perform_handshake`] once a `Preamble` is in hand.
-async fn read_preamble(conn: &mut MaybeTlsStream) -> Result<handshake::Preamble, HandshakeFailure> {
+/// read contract (see that function's own doc).
+///
+/// **The magic is checked against `expected` straight off the fixed
+/// header, before `ext_len` is trusted at all**: a peer that is not
+/// speaking this protocol (a pre-baseline peer's raw frame, or a client-
+/// protocol dialer on the internal port) has arbitrary bytes where
+/// `ext_len` sits, so trusting them first would either misname the
+/// refusal as `ExtensionTooLong` or park this reader waiting for up to
+/// [`handshake::MAX_EXTENSION_LEN`] bytes that never come — surfacing as
+/// an uncounted timeout instead of a counted `BadMagic`. The version is
+/// still [`handshake::check_peer`]'s job, once the whole `Preamble` is in
+/// hand.
+async fn read_preamble(
+    conn: &mut MaybeTlsStream,
+    expected: &handshake::ProtocolSpec,
+) -> Result<handshake::Preamble, HandshakeFailure> {
     let mut header = [0u8; handshake::HEADER_LEN];
     conn.read_exact(&mut header)
         .await
         .map_err(HandshakeFailure::Io)?;
+    if header[0..4] != expected.magic {
+        let mut found = [0u8; 4];
+        found.copy_from_slice(&header[0..4]);
+        return Err(HandshakeFailure::Refused(
+            handshake::HandshakeError::BadMagic {
+                protocol: expected.name,
+                found,
+            },
+        ));
+    }
     match handshake::decode(&header) {
         Ok((preamble, _)) => Ok(preamble),
         Err(handshake::HandshakeError::Incomplete) => {
@@ -1004,7 +1024,7 @@ async fn handshake_exchange(conn: &mut MaybeTlsStream) -> Result<(), HandshakeFa
     ));
     conn.write_all(&ours).await.map_err(HandshakeFailure::Io)?;
     conn.flush().await.map_err(HandshakeFailure::Io)?;
-    let peer = read_preamble(conn).await?;
+    let peer = read_preamble(conn, &handshake::NETWORK_PROTOCOL).await?;
     handshake::check_peer(&handshake::NETWORK_PROTOCOL, &peer).map_err(HandshakeFailure::Refused)
 }
 
@@ -4015,6 +4035,50 @@ mod tests {
         a.shutdown();
         b.shutdown();
         let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+    /// A non-preamble peer whose bytes 5..7 (where `ext_len` sits) happen
+    /// to declare a large-but-legal extension, and which then sends nothing
+    /// more: the acceptor must refuse it as `BadMagic` straight off the
+    /// header — counted, and well inside [`HANDSHAKE_TIMEOUT`] — rather than
+    /// trusting the garbage `ext_len` and parking until the timeout fires
+    /// (which would be logged but never counted as a refusal).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn accept_refuses_bad_magic_before_waiting_on_its_declared_extension() {
+        let dir_b = unique_tmp_dir();
+        let loop0 = "127.0.0.1:0".parse::<SocketAddr>().unwrap();
+        let (b, b_addr) = ProdEnv::bind(nid(1), loop0, &dir_b).await.expect("bind b");
+
+        // Wrong magic, any version, ext_len = 1000 (<= MAX_EXTENSION_LEN), and
+        // no extension bytes ever follow.
+        let [lo, hi] = 1000u16.to_le_bytes();
+        let header = [b'X', b'X', b'X', b'X', 1, lo, hi];
+        let mut raw = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(b_addr))
+            .await
+            .expect("connect timed out")
+            .expect("raw connect");
+        raw.write_all(&header).await.expect("write bad header");
+
+        // Well under HANDSHAKE_TIMEOUT: a reader that trusted `ext_len`
+        // first would still be waiting here.
+        let refused_within = Duration::from_secs(5);
+        assert!(refused_within < HANDSHAKE_TIMEOUT);
+        let metrics = b.metrics();
+        let deadline = Instant::now() + refused_within;
+        loop {
+            if metrics.get(Metric::NetworkHandshakeRefused) >= 1 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "a bad-magic header must be refused before waiting on its declared extension"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        drop(raw);
+        b.shutdown();
         let _ = std::fs::remove_dir_all(&dir_b);
     }
 
