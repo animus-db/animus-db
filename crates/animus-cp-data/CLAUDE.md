@@ -1179,6 +1179,29 @@ State once here; cross-referenced from the sections below.
   Confirmed live: without this guard, `next_index` oscillates between 1 and
   past-`snapshot_index` forever and `engine_applied` never leaves 0.
 
+  **A third gap, found live 2026-09-27 under sustained bulk-seeding +
+  auto-split on `--cluster-control 3 --cluster-data 5`:** the same
+  `&& !state_machine_behind` override is true not only in the #554
+  wipe-recovery case above, but also for the ordinary window after EVERY
+  genuine `InstallSnapshot` completes — `last_applied`/`snapshot_index`
+  advance synchronously inside `handle_install_snapshot`, while this
+  plane's own `engine_applied` (recomputed live as `engine_applied <
+  snapshot_index`, per this file's own entry above) is still draining
+  `pending_install`. An unrelated, already-obsolete snapshot transfer
+  landing during that window — `last_index` strictly below `last_applied`,
+  a shape the wipe case never produces — used to sail through the override
+  exactly like a genuine #554 offer, reinstalling and rewinding
+  `last_applied`/`commit_index`/the log and re-triggering the identical
+  `assert_ts_monotonic` panic the stale-snapshot-vs-`snapshot_index` fix
+  above closed. Fixed in `animus-control::raft::handle_install_snapshot`
+  by only excusing the exact-equality case from the redundancy check —
+  `last_index < last_applied` is now unconditionally redundant regardless
+  of `state_machine_behind`. Regression:
+  `crates/animus-control/tests/stale_snapshot_no_rewind.rs`'s
+  `stale_install_snapshot_below_last_applied_is_rejected_even_when_state_machine_behind`
+  (this crate's own `tests/engine_wipe_needs_snapshot.rs` stays green,
+  confirming the #554 shape — `last_index == last_applied` — is untouched).
+
   Regression: `tests/engine_wipe_needs_snapshot.rs` (a 3-replica `SimEnv`
   test crossing `COMPACT_THRESHOLD`, wiping a follower's — and separately
   the leader's — engine mid-run with the WAL intact) and the corpus mirror
