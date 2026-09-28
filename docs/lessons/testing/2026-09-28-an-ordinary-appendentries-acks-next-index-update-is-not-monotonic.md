@@ -1,4 +1,35 @@
-# A found-but-not-fixed lead: `handle_append_resp`'s ordinary success path sets `next_index` with a bare `.insert`, not a `.max`, unlike its own `InstallSnapshot` sibling
+# Fixed (issue #1070): `handle_append_resp`'s ordinary success path set `next_index` with a bare `.insert`, not a `.max`, unlike its own `InstallSnapshot` sibling — and it could fully halt replication, not just slow it
+
+**Update (2026-09-28, issue #1070): fixed.** The finding below was originally
+recorded as "found but not fixed" while building issue #1064's own
+regression test. Pushing that same test's sustained-writer harness out to
+`ROUNDS = 300` (still well within a real-time-affordable budget once writes
+are issued in coalesced bursts rather than one `run_for` per propose)
+reproduced the predicted hazard directly and dramatically: with the bug
+still present, `RaftKvNode::engine_applied_index()` for the learner reached
+`22414` (of `25102` leader commits at that point) and then went **completely
+flat** for the remainder of the run while `commit_index` kept climbing a
+further `7400` — not a slowdown, a full and permanent replication halt to
+that peer. The fix (`crates/animus-control/src/raft.rs`,
+`handle_append_resp`'s ordinary success branch): `next_index` is now updated
+via `self.next_index.entry(from).or_insert(1); *ni = (*ni).max(match_index +
+1)`, mirroring `match_index`'s own `.max` two lines above and the
+`InstallSnapshot` completion branch's own prior hardening. The reject branch
+is untouched — a reject's own decrement is the correct, intentional Raft
+backoff, never a monotonicity bug (see the new regression's own doc for why).
+With the fix, the identical `ROUNDS = 300` run reaches `28714` of `32502`
+commits (`88%`) with real, ongoing progress in the run's own final quarter
+too. Regressions: `crates/animus-control/tests/
+append_resp_next_index_monotonic.rs` (a hand-driven `RaftCore` unit cell:
+out-of-order acks never regress `next_index`, confirmed red on the bare
+`.insert` and green on the fix) and `crates/animus-cp-data/tests/
+learner_snapshot_livelock_under_continuous_writer.rs`'s own raised `ROUNDS`
+plus its new final-quarter-progress assertion (a whole-run applied/commit
+ratio alone stays deceptively healthy long after a late freeze — see that
+file's own module doc for why a later, not a halfway, sample point was
+needed to reliably catch it).
+
+The original finding, kept for the full context of how this was found:
 
 **Context**: building the regression test for issue #1064's own heavier-load
 finding (`crates/animus-cp-data/tests/

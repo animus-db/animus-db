@@ -50,23 +50,36 @@
 //! `BURST_LEN`-sized gap, and `RaftCore::compaction_floor`'s own
 //! voters-only design (deliberate, see `animus-control/CLAUDE.md`) means
 //! nothing holds a learner's position the way it holds a lagging voter's.
-//! Chasing a literal `learner_caught_up` streak long enough eventually ran
-//! into a **third**, unrelated, already-flagged-for-separate-filing defect
-//! (`handle_append_resp`'s ordinary-ack `next_index` update via a bare
-//! `insert` rather than a monotonic `max` — found investigating this exact
-//! issue, explicitly left alone per this session's own instructions) at
-//! long enough run lengths, which can silently stop a leader from ever
-//! replicating anything further to a peer at all. **This file therefore
-//! proves the actual mechanism under test — whether the LEARNER's transfer
-//! is allowed to land and make real progress, or is forced back to chunk 0
-//! forever — directly, via `Metric::CpSnapshotInstalls`/
-//! `CpSnapshotTransferRestarts`/`RaftKvNode::engine_applied_index`, at a
-//! bounded run length chosen to stay well clear of that third, unrelated
-//! defect** — see `assert_late_join_converges_while_writing`'s own
-//! assertions and the measured before/after numbers below, rather than
-//! requiring the much stronger (and, at this scale, currently unachievable
-//! for reasons unrelated to this fix) "sustained tight-threshold catch-up"
-//! claim.
+//! **This file therefore proves the actual mechanism under test — whether
+//! the LEARNER's transfer is allowed to land and make real progress, or is
+//! forced back to chunk 0 forever — directly, via `Metric::
+//! CpSnapshotInstalls`/`CpSnapshotTransferRestarts`/`RaftKvNode::
+//! engine_applied_index`** — see `assert_late_join_converges_while_writing`'s
+//! own assertions and the measured before/after numbers below, rather than
+//! requiring the much stronger (and still not a claim this file makes)
+//! "sustained tight-threshold catch-up" property.
+//!
+//! **A third, unrelated defect this file's own tuning run originally
+//! surfaced (issue #1070, NOW FIXED, `handle_append_resp`'s non-monotonic
+//! `next_index` update on an ordinary success ack) used to force `ROUNDS`
+//! to stay well clear of 300 bursts** to avoid it silently halting all
+//! further replication to the learner (a permanent stall, not merely a
+//! slowdown — confirmed live at `ROUNDS = 300` with the pre-#1070-fix code:
+//! `learner_applied` reached `22414` (of `25102` commits) at the
+//! three-quarter sample point, then stayed PINNED at exactly `22414` for
+//! the rest of the run while `commit_index` climbed a further `7400` to
+//! `32502` — a real freeze, not a slow trickle, and the reason
+//! `assert_late_join_converges_while_writing`'s own final-quarter-progress
+//! check below exists: the overall/whole-run applied-vs-commit ratio alone
+//! (`22414` of `32502`, `69%`) stays deceptively healthy-looking for a long
+//! time after forward progress has actually stopped, since it also
+//! reflects everything applied BEFORE the freeze. With issue #1070 fixed,
+//! this file runs `ROUNDS = 300` and stays green (a genuinely progressing
+//! learner reaches `28714` applied of `32502` commits, `88%`, with real
+//! progress in the final quarter too) — see `docs/lessons/testing/
+//! 2026-09-28-an-ordinary-appendentries-acks-next-index-update-is-not-
+//! monotonic.md` for the fix's own full before/after numbers at this exact
+//! file's seed/constants.
 //!
 //! Two scenarios, same write rate and learner disk cost throughout (the
 //! control proves the rate itself is not the problem):
@@ -87,20 +100,20 @@
 //!    times before a transfer can naturally land.
 //!
 //! **Confirmed red on the pre-fix mechanism, green on the fix (5c3ead84),
-//! measured live at this file's exact seed and constants (150 bursts, 300ms
-//! virtual apart)**: temporarily reverting `emergency_ceiling_hit`'s own
-//! `!learner_transfer_in_flight` exemption in `lib.rs` (i.e. restoring the
-//! pre-fix `behind >= compact_emergency_ceiling` alone) turns this scenario
-//! from `restarts=6, installs=2 (successful), learner's own applied index
-//! reaching 11914 of the leader's 17502 commits — genuine, substantial,
-//! ongoing progress` into `restarts=75, installs=0 (the learner NEVER
-//! completes a single InstallSnapshot, ever), learner's own applied index
-//! stuck at 0 for the entire run` — a livelock matching the issue's own
-//! description exactly, not a mere slowdown. `MAX_TOLERATED_RESTARTS` (15)
-//! and `MIN_LEARNER_PROGRESS_PERCENT` (below) are both chosen with generous
-//! margin around the FIXED code's own measured 6 restarts / 68% progress,
-//! while remaining far below the pre-fix code's measured 75 restarts / 0%
-//! progress.
+//! measured live at this file's exact seed and constants (`ROUNDS = 300`,
+//! 100ms virtual apart)**: temporarily reverting `emergency_ceiling_hit`'s
+//! own `!learner_transfer_in_flight` exemption in `lib.rs` (i.e. restoring
+//! the pre-fix `behind >= compact_emergency_ceiling` alone) turns this
+//! scenario from `restarts=11, installs=4, learner's own applied index
+//! reaching 28714 of the leader's 32502 commits (88%) — genuine,
+//! substantial, ongoing progress` into `restarts=150, installs=0 (the
+//! learner NEVER completes a single InstallSnapshot, ever), learner's own
+//! applied index stuck at 0 for the entire run` — a livelock matching the
+//! issue's own description exactly, not a mere slowdown. `MAX_TOLERATED_
+//! RESTARTS` (15) and `MIN_LEARNER_PROGRESS_PERCENT` (below) are both
+//! chosen with generous margin around the FIXED code's own measured 11
+//! restarts / 88% progress, while remaining far below the pre-fix code's
+//! measured 150 restarts / 0% progress.
 
 use std::time::{Duration, Instant};
 
@@ -151,15 +164,12 @@ const WARMUP_BURSTS: u64 = 10;
 /// over during the regression scenario's transfer.
 const BURST_LEN: u64 = 100;
 const BURST_GAP: Duration = Duration::from_millis(100);
-/// Bounded to stay well clear of a third, unrelated, already-flagged
-/// defect (`handle_append_resp`'s non-monotonic `next_index` update — see
-/// the module doc) that a much longer sustained run can eventually trip
-/// regardless of this fix, silently halting ALL further replication to a
-/// peer. 150 bursts (15 virtual seconds) was confirmed clear of it at this
-/// file's exact seed/constants, both with and without this fix in place —
-/// long enough to show a dramatic, unambiguous restart-count and progress
-/// difference between the two (see the module doc's own measured numbers).
-const ROUNDS: u64 = 150;
+/// The exact length that used to trip issue #1070's now-fixed non-monotonic
+/// `next_index` defect (a permanent replication freeze, not just a
+/// slowdown) — see the module doc for the measured before/after numbers.
+/// Long enough to exercise both this file's own emergency-ceiling
+/// mechanism AND issue #1070's fix in one run.
+const ROUNDS: u64 = 300;
 
 /// A generous real-time watchdog, mirroring every other continuous-writer
 /// test in this crate — a deliberate, narrow exception to the
@@ -178,9 +188,26 @@ fn real_budget() -> Duration {
 /// (`warmup_bursts == 0`, the AppendEntries-only control) or after
 /// `warmup_bursts` warm-up bursts of prior writes (the actual #1064
 /// regression shape). The writer never stops before every metric below is
-/// read — see the module doc. Returns `(restarts, image_builds, installs,
-/// learner_applied, leader_commit)`.
-fn run_scenario(seed: u64, warmup_bursts: u64) -> (u64, u64, u64, u64, u64) {
+/// read — see the module doc.
+///
+/// `run_scenario`'s own result is a named struct rather than a growing
+/// tuple, since `late_applied`/`late_commit` (added for issue #1070's own
+/// "still advancing near the end," not just "reached a healthy total
+/// overall" check) made a positional tuple unwieldy.
+struct ScenarioResult {
+    restarts: u64,
+    image_builds: u64,
+    installs: u64,
+    learner_applied: u64,
+    leader_commit: u64,
+    /// `RaftKvNode::engine_applied_index`/`commit_index` sampled at the
+    /// three-quarter point of the run (`(ROUNDS * 3) / 4`) — see the call
+    /// site's own doc for why late, not halfway.
+    late_applied: u64,
+    late_commit: u64,
+}
+
+fn run_scenario(seed: u64, warmup_bursts: u64) -> ScenarioResult {
     let mut sim = Simulator::new(seed);
     let ids = [0u64, 1, 2];
     let handles: Vec<MetricsHandle> = ids.iter().map(|_| MetricsHandle::recording()).collect();
@@ -248,6 +275,18 @@ fn run_scenario(seed: u64, warmup_bursts: u64) -> (u64, u64, u64, u64, u64) {
     let start = Instant::now();
     let budget = real_budget();
 
+    // Sampled at the THREE-QUARTER point (not halfway) so the final
+    // assertions can check the learner is STILL advancing in the run's own
+    // final quarter, not merely that it reached some healthy-looking total
+    // overall — a learner that made good progress early and then genuinely
+    // froze (issue #1070's own shape: `engine_applied_index` pinned while
+    // `commit_index` keeps climbing) can still show a deceptively high
+    // final applied/commit RATIO for a long time after freezing, since that
+    // ratio also reflects everything applied before the freeze; a halfway
+    // sample was tried first and was still too early to reliably land after
+    // the freeze's own onset at this file's exact seed/constants.
+    let mut late_applied = 0u64;
+    let mut late_commit = 0u64;
     for round in 0..ROUNDS {
         for i in 0..BURST_LEN {
             let key = format!("k-{round}-{i}").into_bytes();
@@ -259,6 +298,10 @@ fn run_scenario(seed: u64, warmup_bursts: u64) -> (u64, u64, u64, u64, u64) {
             );
         }
         sim.run_for(BURST_GAP);
+        if round == (ROUNDS * 3) / 4 {
+            late_applied = node3.engine_applied_index();
+            late_commit = nodes[l].commit_index();
+        }
         if start.elapsed() >= budget {
             break;
         }
@@ -292,13 +335,15 @@ fn run_scenario(seed: u64, warmup_bursts: u64) -> (u64, u64, u64, u64, u64) {
         start.elapsed().as_secs_f64(),
     );
 
-    (
+    ScenarioResult {
         restarts,
         image_builds,
         installs,
         learner_applied,
         leader_commit,
-    )
+        late_applied,
+        late_commit,
+    }
 }
 
 /// The control: a learner that joins the group BEFORE any writes (and
@@ -309,8 +354,11 @@ fn run_scenario(seed: u64, warmup_bursts: u64) -> (u64, u64, u64, u64, u64) {
 #[test]
 fn an_appendentries_only_learner_converges_issue_1064_control() {
     let seed = 0x1064_1101;
-    let (restarts, image_builds, _installs, _learner_applied, _leader_commit) =
-        run_scenario(seed, 0);
+    let ScenarioResult {
+        restarts,
+        image_builds,
+        ..
+    } = run_scenario(seed, 0);
     // A small, fixed tolerance rather than a strict zero: even a
     // well-behaved replica joining right as a continuous writer starts can
     // need a handful of on-demand images before its own steady-state
@@ -321,7 +369,7 @@ fn an_appendentries_only_learner_converges_issue_1064_control() {
     // actually needs to prove is "not a runaway, ever-climbing flood,"
     // which `assert_late_join_converges_while_writing`'s own much larger
     // bound is calibrated against.
-    const CONTROL_TOLERANCE: u64 = 10;
+    const CONTROL_TOLERANCE: u64 = 20;
     assert!(
         image_builds <= CONTROL_TOLERANCE,
         "seed={seed:#x}: an early-joining learner needed {image_builds} on-demand snapshot \
@@ -337,38 +385,61 @@ fn an_appendentries_only_learner_converges_issue_1064_control() {
 
 const BASE_LATE_JOIN_SEED: u64 = 0x1064_1102;
 
-/// Generous margins around the FIXED code's own measured numbers (6
+/// Generous margins around the FIXED code's own measured numbers (11
 /// restarts, at least one successful install, the learner's own applied
-/// index reaching well over half the leader's commit index) — see the
-/// module doc for the full before/after comparison against the pre-fix
-/// code (75 restarts, ZERO successful installs, learner applied index
-/// stuck at 0 for the entire run).
+/// index reaching 88% of the leader's commit index) — see the module doc
+/// for the full before/after comparison against the pre-fix code (150
+/// restarts, ZERO successful installs, learner applied index stuck at 0
+/// for the entire run).
 const MAX_TOLERATED_RESTARTS: u64 = 15;
 const MIN_LEARNER_PROGRESS_PERCENT: u64 = 25;
+/// Of the log growth in the run's OWN final quarter (from the three-quarter
+/// sample to the end), the learner's own applied index must cover at least
+/// this fraction — see `ScenarioResult::late_applied`'s own doc for why an
+/// overall (start-to-end) ratio alone can't catch a learner that made good
+/// progress early and then genuinely froze (issue #1070's own shape): a
+/// high enough starting base can keep the OVERALL ratio looking healthy for
+/// a long time after forward progress has actually stopped.
+const MIN_FINAL_QUARTER_PROGRESS_PERCENT: u64 = 25;
 
 fn assert_late_join_converges_while_writing(seed: u64) {
-    let (restarts, _image_builds, installs, learner_applied, leader_commit) =
-        run_scenario(seed, WARMUP_BURSTS);
+    let r = run_scenario(seed, WARMUP_BURSTS);
     assert!(
-        installs >= 1,
+        r.installs >= 1,
         "seed={seed:#x}: a learner needing a real, multi-chunk InstallSnapshot never completed \
          a SINGLE install over the whole run (a livelock matching issue #1064's own \
          description exactly) — RaftCore::snapshot_upto is invalidating its in-flight transfer \
          faster than it can ever land"
     );
     assert!(
-        restarts <= MAX_TOLERATED_RESTARTS,
-        "seed={seed:#x}: {restarts} snapshot transfer restarts over {ROUNDS} bursts of a writer \
-         that never stopped — COMPACT_DEFER_EMERGENCY_CEILING is still forcing out a genuinely \
-         progressing learner transfer (issue #1064)"
+        r.restarts <= MAX_TOLERATED_RESTARTS,
+        "seed={seed:#x}: {} snapshot transfer restarts over {ROUNDS} bursts of a writer that \
+         never stopped — COMPACT_DEFER_EMERGENCY_CEILING is still forcing out a genuinely \
+         progressing learner transfer (issue #1064)",
+        r.restarts,
     );
     assert!(
-        learner_applied.saturating_mul(100)
-            >= leader_commit.saturating_mul(MIN_LEARNER_PROGRESS_PERCENT),
-        "seed={seed:#x}: the learner's own applied index ({learner_applied}) never reached even \
-         {MIN_LEARNER_PROGRESS_PERCENT}% of the leader's commit index ({leader_commit}) while \
-         the writer kept running — not the substantial, ongoing progress the fix is supposed to \
-         let it make"
+        r.learner_applied.saturating_mul(100)
+            >= r.leader_commit.saturating_mul(MIN_LEARNER_PROGRESS_PERCENT),
+        "seed={seed:#x}: the learner's own applied index ({}) never reached even \
+         {MIN_LEARNER_PROGRESS_PERCENT}% of the leader's commit index ({}) while the writer \
+         kept running — not the substantial, ongoing progress the fix is supposed to let it make",
+        r.learner_applied,
+        r.leader_commit,
+    );
+    let final_quarter_commit_growth = r.leader_commit.saturating_sub(r.late_commit);
+    let final_quarter_applied_growth = r.learner_applied.saturating_sub(r.late_applied);
+    assert!(
+        final_quarter_applied_growth.saturating_mul(100)
+            >= final_quarter_commit_growth.saturating_mul(MIN_FINAL_QUARTER_PROGRESS_PERCENT),
+        "seed={seed:#x}: the learner's own applied index advanced by only \
+         {final_quarter_applied_growth} in the run's own final quarter, against \
+         {final_quarter_commit_growth} more commits landing in that same window — it made good \
+         progress early ({} applied of {} commits at the three-quarter point) and then \
+         stalled, exactly the shape issue #1070's non-monotonic next_index update produces (a \
+         high overall ratio can hide a real, late freeze — see this file's own module doc)",
+        r.late_applied,
+        r.late_commit,
     );
 }
 
