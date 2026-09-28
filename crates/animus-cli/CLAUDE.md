@@ -49,7 +49,15 @@ wrapper `maybe_tls_connect` returns, so `write_frame`/`read_frame`/
 `read`/`write_all` all work unchanged) and `tls::server_name_for` (the
 identical `ServerName` derivation `animus-env`'s own internal wire and
 `animusd`'s intra dialer use) — this crate never constructs a `ProdEnv`
-itself. A missing/invalid `--tls-ca` file, or a handshake failure, is a
+itself. **`maybe_tls_connect` also runs this build's half of the
+client-protocol handshake preamble (ADR 0073 Phase 0, workstream D,
+layer 3)** — `animus_env::exchange_preamble` against `animus_env::
+CLIENT_PROTOCOL`, the identical shared implementation `animusd`'s own
+`connect_client`/accept path use — right after the (optional) TLS
+handshake and before returning the stream to `run`/`run_admin`; a
+mismatch or timeout is a plain `Err(String)`, the same shape a TLS or
+connect failure already surfaces as. A missing/invalid `--tls-ca` file, a
+TLS handshake failure, or a client-protocol handshake failure is a
 plain startup/dial error (`main`'s usual `Err(String)` path) — never a
 panic.
 

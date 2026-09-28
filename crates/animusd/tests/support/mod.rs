@@ -223,12 +223,25 @@ pub const JOIN_DEADLINE: Duration = Duration::from_secs(30);
 /// holding the resulting listeners open until the node itself starts (see
 /// [`bring_up_deadline`]/[`bring_up_deadline_tls`]/[`start_single_node`]) —
 /// this function survives only for the callers that genuinely need a
-/// not-yet-bound address to hand to a **joiner or growth** path *before* that
-/// path itself binds anything ([`grow_deadline`], [`join_fresh_deadline`],
-/// [`join_data_fresh_deadline`], [`join_allocated_fresh_deadline`],
-/// [`join_data_allocated_fresh_deadline`], [`bring_up_split`]) — those retry
-/// their own bind-and-join step as a unit, the same shape every one of these
-/// bring-up helpers used before this fix.
+/// not-yet-bound address to hand to a **growth** or **self-minted-id join**
+/// path *before* that path itself binds anything ([`grow_deadline`],
+/// [`join_allocated_fresh_deadline`], [`join_data_allocated_fresh_
+/// deadline`], [`bring_up_split`]) — those retry their own bind-and-join
+/// step as a unit, the same shape every one of these bring-up helpers used
+/// before this fix. **The two EXPLICIT-`--id` join helpers no longer use
+/// this function at all (issue #1042)** — [`join_fresh_deadline`]/
+/// [`join_data_fresh_deadline`] pass `:0` addresses straight through to
+/// `Node::bind`/`Node::bind_data` (via `run_node_join`/`run_node_data_join`,
+/// whose explicit-`--id` path now binds before it durably claims `--id`'s
+/// `NodeAddrs` — see `run_node_join_with_settings`'s own doc), so there is
+/// no longer a not-yet-bound address to hand them at all. **The
+/// self-minted-id join helpers still need this function** — that path's own
+/// production ordering is unchanged (claim still precedes bind, since
+/// `NodeId::mint` needs no `Env` to run at all), so it still needs a real,
+/// already-resolvable address for every field up front, never a literal
+/// `:0` (see each helper's own doc for why). See
+/// `docs/lessons/testing/2026-09-28-freezing-a-port-set-across-retries-
+/// only-relocates-the-toctou-bind-and-hold-before-claim.md`.
 pub fn free_addrs(count: usize) -> Vec<SocketAddr> {
     let listeners: Vec<std::net::TcpListener> = (0..count)
         .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
@@ -598,40 +611,36 @@ pub async fn grow_deadline(
 /// Join a fresh **combined-mode**, explicit-id node against `seeds` via
 /// `run_node_join` (ADR 0040 PR4: `--id` replaces the old `--node I` index —
 /// `index` is used only to derive a deterministic, readable test id,
-/// `config::node_id(index)`, and the data dir), retrying the allocate-ports-
-/// and-join step as a unit against a wall-clock `deadline` rather than a
-/// fixed attempt count. Generalized from the identical fixed-16-attempt/50ms
-/// helper duplicated in `decommission.rs` and `seed_join.rs`: under `cargo
-/// test --workspace`-level port-TOCTOU contention, 16 attempts (0.8s total)
-/// could exhaust while the port churn was still transient, surfacing as a
-/// spurious "could not join node N" panic rather than a real join bug.
-/// Trade-off (same as [`restart_same_addrs`]): a genuinely-broken join now
-/// takes up to `deadline` to report instead of failing in under a second.
+/// `config::node_id(index)`, and the data dir). **Bind-and-hold, not
+/// probe-and-release (issue #1042)**: every attempt's `RoleAddrs` uses
+/// `:0` (ephemeral) ports, resolved atomically at `Node::bind` time inside
+/// `run_node_join` itself — never a [`free_addrs`] probe that releases the
+/// port before the real bind — so there is no window in which another
+/// process/test can steal one. Retries the whole join attempt (a fresh `:0`
+/// bind + claim, exactly like every other attempt) against a wall-clock
+/// `deadline` rather than a fixed attempt count, since a discovery round
+/// trip against a contended seed can still legitimately take a while; a
+/// genuinely-broken join takes up to `deadline` to report instead of
+/// failing in under a second.
 ///
-/// Returns the node, the addresses it actually bound, and the data dir it
-/// used (a caller that needs to rejoin at the exact same addresses/dir, e.g.
-/// `seed_join.rs`'s rejoin test, needs all three).
+/// Returns the node, the addresses it actually bound (recovered from the
+/// started [`Node`]'s own accessors — never the pre-bind `:0` request,
+/// which names no real port), and the data dir it used.
 ///
-/// **Issue #406/#450 (Bug A)**: the ports (and therefore the `--id`'s
-/// `NodeAddrs`) are picked **once**, before the retry loop, and reused on
-/// every attempt — never re-randomized per attempt. `run_node_join`'s
-/// `claim_join_identity` durably registers `--id`'s `NodeAddrs` (a
-/// `MetaCommand::RegisterNode` CAS, ADR 0040 Decision C) *before* it ever
-/// calls `Node::bind`; if that bind then fails (the ordinary port-TOCTOU
-/// this retry exists for, issue #278), the old code re-picked brand-new
-/// ports for the *same* `--id` on the next attempt, so the retry's own
-/// re-registration proposed a **different** `NodeAddrs` for an id that had
-/// already durably claimed a different one moments earlier — a genuine CAS
-/// collision against itself, surfacing as "node id already claimed by a
-/// different registration (different addresses/labels)". Reusing the same
-/// `addrs` makes every retry's re-registration land on the *idempotent*
-/// `NoOp` path instead (`existing == addrs`), mirroring
-/// [`restart_same_addrs`]'s own retry-in-place idiom for the identical
-/// reason: a transient port-TOCTOU bind failure is best retried on the same
-/// address (the conflict is another test binary's momentary `free_addrs`
-/// probe, not a permanently-held port), not papered over by minting a new
-/// one that then collides with this attempt's own already-durable claim.
-/// See `docs/engineering-lessons.md` for the general lesson.
+/// **Issue #406/#450 (Bug A), closed at the source, not just outrun by this
+/// helper's own retry**: `run_node_join`'s `--id`-explicit path now binds
+/// every listener *before* it ever durably registers `--id`'s `NodeAddrs`
+/// (`run_node_join_with_settings`'s own doc, `crates/animusd/src/lib.rs`),
+/// so a bind failure here can never leave a durable claim on file for
+/// addresses this attempt didn't end up bound to — the exact
+/// same-id-different-addrs self-collision this helper used to have to dodge
+/// by freezing one `addrs` value across every retry. Each attempt below is
+/// therefore free to mint fresh `:0` ports every time, the same shape every
+/// other fresh-cluster bring-up in this module already uses (see
+/// `docs/lessons/testing/2026-09-20-allocate-test-ports-by-binding-and-
+/// holding-never-probe-and-release.md` and its own 2026-09-28 follow-on
+/// entry on why freezing the address set alone — without also fixing the
+/// claim order — only relocates this exact hazard).
 pub async fn join_fresh_deadline(
     seeds: &[SocketAddr],
     index: usize,
@@ -641,23 +650,10 @@ pub async fn join_fresh_deadline(
 ) -> (Node, RoleAddrs, PathBuf) {
     let hard_deadline = tokio::time::Instant::now() + deadline;
     let mut attempt: u64 = 0;
-    let raw = free_addrs(6);
     let id = animusd::config::node_id(index);
-    let addrs = RoleAddrs {
-        id: id.clone(),
-        role: NodeRole::Both,
-        internal: raw[0],
-        client: raw[1],
-        dynamo: raw[2],
-        admin: raw[3],
-        intra: raw[4],
-        console: raw[5],
-        advertise_host: None,
-        tls: None,
-        encryption_key_path: None,
-    };
     loop {
         let node_dir = dir.join(format!("join-{index}-{attempt}"));
+        let addrs = unbound_role_addrs(index);
         match animusd::run_node_join(
             seeds.iter().map(ToString::to_string).collect(),
             Some(id.clone()),
@@ -668,7 +664,17 @@ pub async fn join_fresh_deadline(
         )
         .await
         {
-            Ok(node) => return (node, addrs, node_dir),
+            Ok(node) => {
+                let bound_addrs = RoleAddrs {
+                    client: node.client_addr(),
+                    dynamo: node.dynamo_addr(),
+                    admin: node.admin_addr(),
+                    intra: node.intra_addr(),
+                    console: node.console_addr(),
+                    ..addrs
+                };
+                return (node, bound_addrs, node_dir);
+            }
             Err(e) => {
                 assert!(
                     tokio::time::Instant::now() < hard_deadline,
@@ -683,7 +689,8 @@ pub async fn join_fresh_deadline(
 
 /// Join a fresh **data-only**, explicit-id node against `seeds` via
 /// `run_node_data_join` — the data-only dual of [`join_fresh_deadline`],
-/// generalized from `data_join.rs`'s own fixed-16-attempt/50ms helper.
+/// bind-and-hold for the identical issue #1042 reason (see that function's
+/// own doc).
 pub async fn join_data_fresh_deadline(
     seeds: &[SocketAddr],
     index: usize,
@@ -693,26 +700,14 @@ pub async fn join_data_fresh_deadline(
 ) -> Node {
     let hard_deadline = tokio::time::Instant::now() + deadline;
     let mut attempt: u64 = 0;
+    let id = animusd::config::node_id(index);
     loop {
-        let raw = free_addrs(6);
-        let id = animusd::config::node_id(index);
-        let addrs = RoleAddrs {
-            id: id.clone(),
-            role: NodeRole::Data,
-            internal: raw[0],
-            client: raw[1],
-            dynamo: raw[2],
-            admin: raw[3],
-            intra: raw[4],
-            console: raw[5],
-            advertise_host: None,
-            tls: None,
-            encryption_key_path: None,
-        };
+        let mut addrs = unbound_role_addrs(index);
+        addrs.role = NodeRole::Data;
         let node_dir = dir.join(format!("data-join-{index}-{attempt}"));
         match animusd::run_node_data_join(
             seeds.iter().map(ToString::to_string).collect(),
-            Some(id),
+            Some(id.clone()),
             addrs,
             &node_dir,
             backend,
@@ -741,6 +736,23 @@ pub async fn join_data_fresh_deadline(
 /// disambiguates the data dir across concurrent callers sharing one `dir`
 /// (unlike the explicit-id helper, there is no id known upfront to name it
 /// after).
+///
+/// **Still uses [`free_addrs`], deliberately, unlike [`join_fresh_deadline`]
+/// (issue #1042)**: a self-minted id's own production path
+/// (`run_node_join_with_settings`'s `id: None` branch) was NOT reordered to
+/// bind-before-claim — `NodeId::mint` needs no `Env`/listener at all (ADR
+/// 0040 Decision B), so there is nothing to bind yet at claim time, and
+/// minting a fresh id every attempt already means a bind-failed attempt's
+/// registration (if it even got that far) can never collide with a later
+/// attempt's *different* freshly-minted id (the #406/#450 same-id-
+/// different-addrs hazard only exists for a fixed, explicit `--id`). That
+/// branch's `claim_join_identity` call still registers the *caller-supplied*
+/// (pre-bind) `addrs` as this node's `NodeAddrs` — so, unlike the
+/// explicit-id path, `addrs` here must already be a real, resolvable
+/// address for every field, never a literal `:0` (which would register an
+/// unreachable "host:0" and only get a different, real address once
+/// `Node::bind` runs moments later) — the identical reason `free_addrs`
+/// still has to run here.
 pub async fn join_allocated_fresh_deadline(
     seeds: &[SocketAddr],
     dir: &Path,
@@ -793,6 +805,8 @@ pub async fn join_allocated_fresh_deadline(
 
 /// Join a fresh **data-only, self-minted-id** node against `seeds` (ADR 0040
 /// Decision B/C) — the data-only dual of [`join_allocated_fresh_deadline`].
+/// Still uses [`free_addrs`] for the identical reason that function's own
+/// doc gives.
 pub async fn join_data_allocated_fresh_deadline(
     seeds: &[SocketAddr],
     dir: &Path,

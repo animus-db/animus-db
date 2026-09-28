@@ -319,9 +319,20 @@ fn scenario(seed: u64) {
         // (3): a peer still addressing the released, now-closed stream
         // (the literal leak scenario) must have its frame discarded, never
         // queued.
-        sim.env(node_y())
-            .send_stream(node_x(), TABLET.0, b"late-frame".to_vec())
-            .await;
+        //
+        // Several copies, not one: this file's network drops 5% of sends at
+        // send time ("lossy"), and a single probe whose one send happens to
+        // be lossily dropped never reaches the delivery-time closed-stream
+        // check at all — so the "stream-closed" trace assertion below would
+        // be a function of where the seed's RNG stream happens to land (it
+        // did flip once unrelated raft/handshake changes shifted the draw
+        // sequence). Eight sends make missing every one of them a
+        // ~4e-11 event under any seed.
+        for _ in 0..8 {
+            sim.env(node_y())
+                .send_stream(node_x(), TABLET.0, b"late-frame".to_vec())
+                .await;
+        }
         driver.sleep(Duration::from_millis(500)).await;
         assert_eq!(
             sim.inbox_len(node_x(), TABLET.0),

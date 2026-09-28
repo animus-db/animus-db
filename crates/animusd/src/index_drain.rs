@@ -2703,8 +2703,8 @@ mod gsi_drain_cursor_tests {
     use super::*;
     use crate::config::NodeRole;
     use crate::{
-        ClientRequest, ClientResponse, ClusterConfig, Node, RoleAddrs, read_frame, run_node,
-        write_frame,
+        ClientRequest, ClientResponse, ClusterConfig, Node, RoleAddrs, connect_client, read_frame,
+        run_node, write_frame,
     };
 
     fn free_addrs(count: usize) -> Vec<SocketAddr> {
@@ -2950,7 +2950,7 @@ mod gsi_drain_cursor_tests {
     /// murmur3 token prefix — `ClientRequest`'s own `Vec<u8>` field
     /// `serde_json`-encodes as an ordinary byte array instead).
     async fn split(client_addr: SocketAddr, tablet: TabletId, split_key: Vec<u8>) {
-        let mut stream = TcpStream::connect(client_addr).await.expect("connect");
+        let mut stream = connect_client(client_addr).await.expect("connect");
         write_frame(
             &mut stream,
             &ClientRequest::SplitTablet {
@@ -3507,8 +3507,8 @@ mod stream_sealer_tests {
     use crate::config::NodeRole;
     use crate::{
         ClientRequest, ClientResponse, ClusterConfig, ClusterEdgeState, Node, RoleAddrs,
-        SegmentStoreConfig, StorageBackend, StreamSealKnobs, TxnTableWrite, read_frame,
-        run_node_with_streams, write_frame,
+        SegmentStoreConfig, StorageBackend, StreamSealKnobs, TxnTableWrite, connect_client,
+        read_frame, run_node_with_streams, write_frame,
     };
 
     fn free_addrs(count: usize) -> Vec<SocketAddr> {
@@ -4939,9 +4939,7 @@ mod stream_sealer_tests {
             let mut item = animus_dynamo::Item::new();
             item.insert("id".to_string(), pk);
             let value = animus_dynamo::wire::encode_stored_item(&item);
-            let mut stream = TcpStream::connect(node.client_addr())
-                .await
-                .expect("connect");
+            let mut stream = connect_client(node.client_addr()).await.expect("connect");
             write_frame(
                 &mut stream,
                 &ClientRequest::Txn {

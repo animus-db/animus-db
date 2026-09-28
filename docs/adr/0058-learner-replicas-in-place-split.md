@@ -497,6 +497,64 @@ still fails — safety). See `crates/animus-control/src/raft.rs`'s
 `handle_pre_vote`/`handle_request_vote`/`start_pre_vote` and the
 `vote_lease_lapsed` field's own doc for the full mechanism-level rationale.
 
+**Amendment (2026-09-28, issue #1064): `learner_caught_up`'s promotion
+predicate was baselined against the wrong metric, making it unsatisfiable
+under a continuous writer.** The predicate above ("poll `learner_caught_up`
+against a fixed `RECONFIGURE_LEARNER_CATCH_UP_THRESHOLD` of 4 log entries")
+compared a learner's tracked `match_index` to the **leader's own
+`last_log_index()`** — a quantity that, under sustained writes, advances the
+instant the leader appends a new entry for itself, before that entry has
+been sent to (let alone acked by) anyone, voter or learner alike. A
+production reconciler ticks independently of the write stream, so under
+real load `reconfigure_step` routinely samples `learner_caught_up` right
+after such an append; once a single write burst between ticks exceeds the
+threshold, the gap against `last_log_index()` can never close — it re-opens
+by at least as much on every sample, regardless of how genuinely caught up
+the learner is against everything the group has actually **committed**.
+This is exactly the shape ADR 0062's directed-Placing retarget produces (a
+desired set differing from current by more than one member, so the
+reconciler needs to add a second learner and remove two stale voters, not
+just complete one single-server step): the second desired replica was
+never even added, and neither stale voter was ever removed — the group
+stayed wedged at its old voter set indefinitely, with a continuous writer
+in the loop the whole time.
+
+Fixed by rebaselining against `commit_index()` instead of
+`last_log_index()`. `commit_index()` only advances once a **majority of
+current voters** — never the learner being measured — have themselves
+acked, so it can never be further ahead of what the established quorum has
+actually achieved than one ordinary replication round costs; it is immune
+to the "leader's own perpetually-fresher local tip" artifact regardless of
+write rate. This keeps this ADR's own safety intent for the promotion
+criterion intact: "never dilute the quorum with a peer that can't ack." A
+peer promoted at `match_index >= commit_index - threshold` can, the instant
+it becomes a voter, immediately help commit anything the group has already
+committed — the property that actually matters for not regressing
+availability — which comparing against the ever-advancing leader tip never
+established anyway (a peer "caught up to `last_log_index`" could still be
+stale by the time its own promotion entry is itself appended, per the
+#1019 amendment above). Every existing caller of `learner_caught_up`
+(`animus-control`'s and `animus-cp-data`'s own corpora and integration
+tests) was audited and needed no change — each already polls to
+convergence with the writer stopped or genuinely idle, where
+`commit_index()` and `last_log_index()` coincide. See `RaftCore::
+learner_caught_up`'s own doc (`crates/animus-control/src/raft.rs`) for the
+full before/after account and `crates/animus-cp-data/tests/
+directed_placing_under_sustained_load.rs` for the regression (a continuous
+writer driven the whole time `reconfigure_step` is sampled, deliberately
+NOT the bounded-burst-then-drain shape `learner_catchup_under_load.rs`
+uses, which cannot exercise this class of bug at all — see that new test's
+own module doc and `docs/lessons/testing/`'s matching entry).
+**A separate, genuinely pre-existing defect was found investigating this
+one and is explicitly NOT fixed here**: under the field report's own
+heavier sustained-load profile, a lagging peer's `InstallSnapshot` transfer
+can be repeatedly invalidated by recurring compaction before it completes
+(`RaftCore::snapshot_upto`'s documented invalidate-on-compact behavior
+racing `COMPACT_THRESHOLD`), producing a sawtooth `match_index` that this
+fix alone does not resolve — suspected to be the same mechanism as issue
+#1061 and left for that issue's own scope (`compaction_floor`/
+`COMPACT_DEFER_*` are unchanged by this amendment).
+
 ### Train 2: in-place split, replacing ADR 0050's build/freeze/cutover workflow
 
 **Stage 1 — `BeginSplit` unchanged in shape, changed in effect.** The

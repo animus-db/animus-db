@@ -144,6 +144,76 @@ the production implementation; the deterministic implementation lives in
   `#[doc(hidden)]`, always-compiled (not `#[cfg(test)]`) cross-crate test
   helper, since `#[cfg(test)]` only gates this crate's own test binaries and
   `animus-sim`'s `SimSegmentStore` tests need the same assertions.
+- **`handshake.rs`** (ADR 0073 Phase 0, workstream D) — a per-connection
+  handshake preamble: `Preamble { magic: [u8;4], version: u8, extensions:
+  Vec<u8> }`, byte layout `magic[4] | version:u8 | ext_len:u16 LE |
+  ext[ext_len]` (`HEADER_LEN = 7`, `ext` capped at `MAX_EXTENSION_LEN =
+  1024`), `encode`/`decode` (the latter incremental-read-friendly: returns
+  a distinct `Incomplete` so a caller can read `HEADER_LEN` bytes, decode,
+  then read `ext_len` more), and `check_peer(expected, peer)` — v1 policy
+  is **exact version equality**, Phase 2's job to relax to a supported-
+  range intersection via the `ext` area this version carries through
+  unrejected but never interprets. Two independently-versioned
+  `ProtocolSpec` constants: `NETWORK_PROTOCOL` (magic `NHS1`, the internal
+  `Network`/`Env` transport ADR 0026 multiplexes many `(node, stream)`
+  instances over) and `CLIENT_PROTOCOL` (magic `CHS1`, the client/intra
+  JSON-RPC wire — lives here rather than in `animus-node` since that crate
+  already depends on this one's unconditional surface, so one codec
+  serves both instead of two). **Unconditional, no `prod` feature, no new
+  dependency** — pure codec, no socket/clock/RNG. `decode` is deliberately
+  protocol-agnostic (doesn't take an expected spec) so it composes with
+  incremental reads and so `check_peer` is the one place an expectation
+  exists to attribute a refusal to the right protocol — see
+  `docs/lessons/code-patterns/`'s matching 2026-09-28 entry for why that
+  split, not a fused decode-and-check, is the right shape.
+  **`ProdEnv`'s real internal-`Network` transport is wired to it (layer 2
+  of the Phase 0 workstream D stack)**: `prod.rs`'s `perform_handshake` runs
+  this exchange once per connection, on both `spawn_accept`'s accept path
+  and `connect_maybe_tls`'s dial path (covering both the initial connect
+  and the existing reconnect-once), before a single frame is read or
+  written — paying the check once per pooled connection, not once per
+  frame/heartbeat, exactly the cost `ProdEnv`'s "pools one outbound TCP
+  connection per destination" entry below already amortizes for connection
+  setup in general. Bounded by a 10s `HANDSHAKE_TIMEOUT` (real time — this
+  is `ProdEnv`); a refusal (bad magic/version/oversized extension) or a
+  timeout/EOF logs at `warn` (louder than `read_frames`'s own `debug`
+  "peer connection closed") and simply drops the connection without
+  entering the frame loop — never a panic, and the listener keeps serving
+  every other peer, the same contract a failed TLS handshake already has.
+  **Counting decision**: only a genuine protocol refusal increments
+  `Metric::NetworkHandshakeRefused`; a plain I/O failure (EOF/reset) or a
+  timeout is logged but not counted — both are what a merely slow or
+  already-dead peer looks like (already covered by `POOLED_SOCKET_DEAD_
+  PEER_TIMEOUT`/`SEND_TIMEOUT`), not evidence of a wire mismatch.
+  **Pool-lock scope, checked at wiring time**: the per-address
+  `tokio::sync::Mutex` slot `send_frame_pooled` holds across
+  `connect_maybe_tls` (and thus across this handshake's own round trip) is
+  scoped to one destination address — `Inner.conns`'s outer `StdMutex` is
+  cloned out and dropped before any of this, unchanged from before — so
+  the handshake only ever serializes concurrent senders to *that one peer*
+  (already true for frame-interleaving safety) and never delays a send to
+  any other peer; this is the identical scope the TLS handshake has
+  already been paying for since ADR 0064. **Log-volume decision**: a
+  persistently mismatched dial re-warns on every send (no caching of a
+  failed handshake, no suppression added) — deliberate, since a real
+  version mismatch can't yet occur this early in Phase 0 (no rolling
+  upgrade exists), so it can only mean a misconfigured deploy an operator
+  wants to see every occurrence of; the rate is bounded by the caller's
+  own send cadence, never unbounded.
+  **Layer 3 (`animusd`'s client/intra port) is wired too**: this module
+  gained a small, `pub`, generic-over-`S: AsyncRead + AsyncWrite + Unpin`
+  exchange, [`prod::exchange_preamble`] (with its own `read_preamble`/
+  `write_own_preamble` halves), factored out of `perform_handshake`'s own
+  layer-2 body so `animusd` reuses the *identical* write-ours-then-read-
+  and-check-theirs sequence for `handshake::CLIENT_PROTOCOL` on its
+  `client`/`intra` listeners and dialers, rather than a second
+  hand-rolled copy — see that crate's own `CLAUDE.md` for the accept-/
+  dial-side wrappers and `Metric::ClientHandshakeRefused`'s now-real
+  wiring. Still to come: `SimEnv`'s per-node delivery check (layer 4) —
+  since `SimEnv` has no real connections at all, that layer models the
+  identical check as a per-node version checked on delivery via this same
+  `check_peer`, standing in for the connection-shaped check a
+  connectionless simulator can't otherwise express.
 - `metrics.rs` — the **observability seam** (ADR 0015): a closed `Metric` enum
   (`control_*` Raft + `storage_*` LSM-engine counters, plus legacy `data_*`
   leaderless-AP counters that are **dormant** — the AP plane was deleted, ADR
@@ -926,3 +996,20 @@ measured attribution (issue #670) found no convergence regression from it.
 If a real ordering dependency ever surfaces, the fix idiom is a
 per-destination bounded queue drained by one task per destination, which
 keeps the head-of-line isolation without giving up FIFO on a connection.
+
+**Network handshake preamble wired into `ProdEnv` (ADR 0073 Phase 0,
+workstream D, layer 2)**, also `prod::tests`, also real loopback sockets:
+`accept_refuses_mismatched_version_and_keeps_serving` (a raw dialer sends
+a right-magic/wrong-version preamble; asserts the acceptor still writes
+its own preamble first, then closes the connection — the raw peer's next
+read is a clean EOF — counts the refusal, and keeps serving a genuine peer
+right after) and `accept_refuses_bad_magic_pre_baseline_frame_and_keeps_
+serving` (the pre-baseline case: a raw dialer that never sends this
+preamble at all, just a plausible raw frame-length prefix — same
+assertions). `dial_refused_by_mismatched_fake_acceptor_is_never_cached`
+covers the dial side: a raw fake "acceptor" replies to every accepted
+connection with a wrong-version preamble; two `ProdEnv::send`s each
+re-dial and re-refuse (the counter reaches 2, and the fake acceptor
+itself sees 2 separate connections) rather than caching anything after
+the first failure. All three read `Metric::NetworkHandshakeRefused`
+straight off the real `ProdEnv`'s own `Env::metrics()` handle.

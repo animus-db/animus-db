@@ -98,7 +98,7 @@ async fn metrics_endpoint_surfaces_control_plane_counters() {
         // tablet's group, so retry any clean `Error` reply for up to 20s
         // (`docs/engineering-lessons.md`'s "CP write-forward path has no
         // retry-on-not-the-leader-here" entry).
-        let mut stream = TcpStream::connect(nodes[0].client_addr())
+        let mut stream = animusd::connect_client(nodes[0].client_addr())
             .await
             .expect("connect");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(20);

@@ -612,7 +612,7 @@ async fn two_of_three_replica_diff_placing_target_converges_end_to_end() {
         let (mut nodes, config) = bring_up_inplace(3, dir.path()).await;
         support::await_bootstrap(&nodes).await;
 
-        let mut client = TcpStream::connect(nodes[0].client_addr())
+        let mut client = animusd::connect_client(nodes[0].client_addr())
             .await
             .expect("connect client port");
         put(&mut client, vec![b'k', 0], vec![b'v', 0]).await;
@@ -669,7 +669,7 @@ async fn two_of_three_replica_diff_placing_target_converges_end_to_end() {
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop2 = std::sync::Arc::clone(&stop);
         let mut writer = tokio::spawn(async move {
-            let mut stream = TcpStream::connect(writer_addr)
+            let mut stream = animusd::connect_client(writer_addr)
                 .await
                 .expect("connect writer client port");
             let mut i: u64 = 1;
