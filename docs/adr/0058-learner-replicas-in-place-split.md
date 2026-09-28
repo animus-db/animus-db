@@ -555,6 +555,168 @@ fix alone does not resolve — suspected to be the same mechanism as issue
 #1061 and left for that issue's own scope (`compaction_floor`/
 `COMPACT_DEFER_*` are unchanged by this amendment).
 
+**Amendment (2026-09-28, issue #1061): removing a voter needs a positive
+notification channel — an explicit `RaftMsg::Removed` notice, not a timeout
+and not a snapshot.** The mechanism this amendment replaces: a leader
+removing a voter tracked it in a leader-local `departing` map and replicated
+the removing entry to it, through `AppendEntries` or — once the leader's log
+had been compacted past the peer — a full chunked `InstallSnapshot`, until
+the peer acked; `become_leader` cleared the map and never re-derived it.
+That had three consequences, all one defect seen from three angles:
+(1) a departing peer behind the compacted prefix got a snapshot transfer
+restarted from chunk 0 by every later compaction, forever, even when the
+peer was dead (`compaction_floor` is voters-only, so nothing held the log
+for it) — the joining-learner flood of #1064 mirrored onto a peer that is
+leaving; (2) it kept the group from ever quiescing
+(`quiesce_entry_ok`'s `departing.is_empty()`); (3) a departing peer that
+was merely *partitioned* across the removal — or across a later leadership
+change — never learned it was removed, so the host reconciler, which
+releases a replica only when its own **log-derived** config excludes it
+(`TabletFacts::config_excludes_me`, ADR 0029 §3), never released it: a
+permanent zombie, still pre-voting on its own election timer. A first
+prototype bounded (1) with a give-up timeout on silence; that made (3)
+strictly worse, because giving up on a peer you can no longer notify
+*abandons* it — the whole class of fix "stop trying after a while" is
+wrong for a duty whose completion is the only thing that ever tells the
+peer to stop.
+
+*The design.* Two new `RaftMsg` variants (`animus-control`; `animus-cp-data`
+codec version `32`, tags `14`/`15`):
+
+- `Removed { term, removal_index, removal_term, config, learners }` — "a
+  **committed** config entry, stamped `(removal_term, removal_index)`,
+  removed you; this is the membership it produced." No log content.
+- `RemovedAck { term, removal_index }`.
+
+*Leader side.* For a `departing` peer whose `next_index <= snapshot_index`
+(it would need a snapshot), `replicate_to` sends the notice instead and never
+starts a transfer (any leftover per-peer transfer bookkeeping is dropped so
+`snapshot_transfer_in_flight` cannot wedge a compaction defer). A departing
+peer the log still covers keeps getting ordinary `AppendEntries`. **Every
+message to a departing peer — notice or catch-up — rides one send gate**
+(`departing_send_gate`): the first send is immediate, each further send
+with no reply in between waits twice as long as the last, from one heartbeat
+up to `SNAPSHOT_HEARTBEAT_BACKOFF_MAX_TICKS` (32, ≈1.6s), and any reply
+resets it. It is *time-based*, keyed off the `now` the core was last driven
+with (`now_hint`), not tick-count-based, because under a sustained writer
+`replicate_now` keeps pushing the heartbeat deadline out and the tick that a
+count-based schedule would advance on never fires — the notice would then be
+sent once per write, or never. The notice is sent only once the removing
+entry is **committed** (a truncated removal cannot be un-said, unlike a config
+entry the log then repairs). The peer is dropped, with all its per-peer
+bookkeeping, on `RemovedAck`, on its `match_index` reaching the removing
+entry (unchanged), or on `DEPARTING_NOTICE_GIVE_UP` (five minutes) of *total*
+silence measured from its last reply of any kind. Giving up is now only a
+volume/quiescence bound on a peer that is genuinely gone — a couple of
+hundred tiny messages over the whole window, never a snapshot — because it
+is no longer the only thing between the peer and the truth:
+
+*Re-derivation on leadership change.* `become_leader` no longer forgets:
+it rebuilds `departing` from the config entries still in its own log
+(`removals_in_log`: peers in a voter set at some retained entry, absent from
+the voter∪learner set of a later one and of the current one, stamped with the
+removing entry). **The bound is the retained log**: a removal that
+compaction has already folded into the snapshot is invisible to a new
+leader, by design — the snapshot carries only the config at its boundary,
+and extending its format (a WAL/snapshot format change, ADR 0073) for a
+duty this cheap to discharge elsewhere was rejected. That case is covered by
+the second channel:
+
+*Receiver-initiated reply.* A leader answering a `PreVote`/`RequestVote`
+from a node that is not a member of its current configuration also sends it
+the notice (`stranger_notice`), stamped with the precise removing entry if
+the log still shows it, otherwise with the newest committed config entry (or
+snapshot boundary) — which is exactly as strong a claim as the recipient's
+guard needs. A zombie's own election timer is what triggers it, so it costs
+nothing at rest and is bounded by that timer until the peer acks; it needs no
+leader-side memory, so no give-up, compaction or leadership change can lose
+it. The one gap left: a *quiesced* removed replica (idle, timer-less) that
+neither hears from the leader (the give-up bound has passed) nor is ever
+touched locally stays hosted and idle until touched or restarted — no
+correctness consequence, one idle group's memory.
+
+*Peer side and safety.* `handle_removed` accepts a notice only if `term >=
+current_term` (otherwise it answers with its own term so a deposed sender
+steps down, exactly like a stale `AppendEntries`), the node is not itself
+the leader, the notice's membership excludes the node, and — the stale-notice
+guard — `(removal_term, removal_index)` is **strictly later** than the latest
+config entry (or snapshot boundary, or initial config) the node knows that
+*includes* it, compared lexicographically as `(term, index)` (terms never
+decrease along a log, so this is "later in the one committed history"; an
+entry from a diverged, uncommitted suffix with a lower term than the
+removal correctly orders before it even at a higher index). On accept it
+steps a candidate down (a removed node mid-election must never tally its way
+to leadership), records `removed_by_leader`, and acks.
+
+- *A delayed notice cannot un-member a re-added node.* If the node already
+  holds the re-add, the guard rejects the notice (test:
+  `a_delayed_notice_older_than_a_re_add_the_node_already_knows_is_ignored`). If
+  it does not yet, the notice was true when sent, the re-add is still in
+  flight, and it clears the flag on arrival: `refresh_removed_flag` runs on
+  every appended config entry and every snapshot install and clears the flag
+  when a self-including entry/snapshot later than the recorded removal lands
+  (`a_delayed_notice_is_cleared_by_the_re_add_when_it_arrives`). In between,
+  the flag only stops the node campaigning — the posture of any
+  not-yet-caught-up learner, and granting votes is deliberately not gated on
+  it (ADR 0058's #1019 amendment) — and the host reconciler additionally
+  requires replicated `Metadata` to exclude the node before releasing on the
+  flag, which a re-added replica never satisfies.
+- *A fresh empty-log replica receiving an old notice is harmless* by the same
+  two facts, plus it cannot campaign anyway until it is a voter
+  (`a_fresh_empty_log_replica_receiving_an_old_notice_is_harmless`).
+- *A flag and a view, not an adopted config.* The obvious reading is to adopt
+  the notice's `(config, learners)` into the node's own `config`/`learners`.
+  Rejected: those, `peers`, `cluster_size`, `config_history` and the snapshot
+  config are all pure functions of the log and snapshot (`apply_config` at
+  every append/truncate/install, `recompute_config` after every truncation);
+  writing a membership no log entry justifies would be silently undone by the
+  next truncation or recompute — or survive it and make `config_at`/
+  `learners_at`, the values `AppendEntries` consistency and snapshot building
+  trust, disagree with the live config, corrupting the log-matching argument
+  membership changes rest on. `removed_by_leader` is a separate, volatile,
+  stamp-carrying field consulted only by `is_voter()` and the reconciler; the
+  log and everything derived from it are byte-for-byte unchanged by a notice
+  (`RaftCore::config()` deliberately still lists the node — tested).
+- *Volatile by design.* The flag is not WAL-durable (no `WalRecord` change,
+  hence no ADR 0073 format impact). A node that restarts before its reconciler
+  releases it forgets, and is told again by the next leader-initiated notice
+  (if it is still owed one) or by its own next election's reply.
+
+*Vote safety — the prototype's candidate-recognition guard was NOT kept.* The
+prototype added a responder-side "the candidate must be a member I currently
+know" check to `handle_request_vote`, to stop a zombie that had been given up
+on from soliciting real votes. It is unnecessary once the zombie is told, and
+unnecessary before: a removed peer that never hears the notice can only ask
+for votes with a log that lacks the removal entry, and every current voter
+(which has it) refuses on the ordinary up-to-date check — the zombie's last
+log entry precedes the removing entry, so `(last_log_term, last_log_index)`
+is strictly behind theirs (`a_partitioned_departing_peer_learns_corpus`
+asserts this directly). The guard also carried a liveness cost that
+`learner_promotion_leader_crash.rs`'s
+`promoted_candidate_wins_election_after_leader_dies_right_after_commit`
+had to argue away (a responder stale-behind about the candidate's
+promotion); that test is kept as the standing guard against ever adding
+such a check back.
+
+*Host reconciler.* `gather_facts` sets `TabletFacts::config_excludes_me` when
+the node's log-derived config excludes it **or** `RaftKvNode::
+removed_by_leader()`. `plan` is untouched: release still requires `Metadata`
+to exclude the node, and still debounces over `RELEASE_CONFIRM_TICKS`.
+
+*Tests.* `crates/animus-control/tests/removal_notice.rs` (bare `RaftCore`
+harness, seed-reproducible, fixed corpus): behind-the-compacted-log peer under
+a continuous writer gets notices and zero snapshots; partition + leader change
+in three shapes (nothing compacted, compacted to just before the removal, folded
+through it); stale-term / member-naming / delayed / re-added / fresh-replica
+notices; dead peer bounded then dropped. `crates/animus-cp-data/tests/
+departing_removal_notice.rs`: the same end to end on a real reconciler-hosted
+replica (`CpSnapshotShips`/`CpSnapshotTransferRestarts` stay 0; the reconciler
+does not release on the flag alone and does once `Metadata` excludes the node)
+and a dead replica. Each was shown red with the mechanism disabled. Existing
+`reconciler_corpus`'s `partition_blocks_release` was widened to accept either
+channel as "the replica learned" (the notice usually wins the race against the
+leader's own schedule there).
+
 ### Train 2: in-place split, replacing ADR 0050's build/freeze/cutover workflow
 
 **Stage 1 — `BeginSplit` unchanged in shape, changed in effect.** The

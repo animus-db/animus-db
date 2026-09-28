@@ -1002,3 +1002,21 @@ at the new default.
 This follows the follower-aware compaction amendment to ADR 0017 (same date),
 which removes most of the need for snapshots in the first place; the larger
 chunk size bounds the cost when one is still needed.
+
+## Amendment (2026-09-28): explicit removal notice (issue #1061)
+
+`RaftMsg` gains two additive variants, `Removed { term, removal_index,
+removal_term, config, learners }` and `RemovedAck { term, removal_index }`,
+handled entirely inside the sync core (`RaftCore::handle_removed`/
+`handle_removed_ack`/`stranger_notice`); the driver only routes them like any
+other consensus message (neither claims a vote nor touches durable state, so
+both ship before the persist round, `ships_before_durable`). A peer told it
+was removed sets a volatile `removed_by_leader` flag consulted by `is_voter()`
+— it never rewrites the log-derived `config`/`learners`, so nothing in
+this ADR's log-matching or config-in-log arguments changes. The leader now
+re-derives its `departing` set from its retained log in `become_leader`
+instead of clearing it, and never ships a snapshot to a departing peer. The
+control plane's own wire is `serde_json` (additive by construction);
+`animus-cp-data`'s hand-rolled codec bumps to version `32`. Full design and
+safety argument: ADR 0058's issue #1061 amendment.
+
