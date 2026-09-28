@@ -1544,6 +1544,43 @@ const COMPACT_THRESHOLD: u64 = 64;
 /// account.
 const COMPACT_DEFER_EMERGENCY_CEILING: u64 = COMPACT_THRESHOLD * 64;
 
+/// Issue #1064 part-2 regression-test seam: a test-only override of
+/// [`COMPACT_THRESHOLD`]/[`COMPACT_DEFER_EMERGENCY_CEILING`], mirroring
+/// [`RaftCore::enable_quiescence`]'s own "`Option`-shaped field, `None`
+/// default, plain public setter" shape (`animus-control::raft`) rather than
+/// inventing a new pattern. Both compaction constants are sized for
+/// production log volumes (64 / 4096 entries) — reaching either one under a
+/// `SimEnv` test's own write rate within a real-time-affordable step budget
+/// needs tens of thousands of proposes, which is why the pre-existing
+/// `tests/learner_snapshot_livelock_under_continuous_writer.rs` could only
+/// ever "brush" the emergency ceiling, never cross it by an unambiguous
+/// margin. `0` (the sentinel both `AtomicU64` fields default to) means
+/// "use the compiled-in constant" — every existing production caller
+/// (nothing sets this) is byte-for-byte unaffected.
+#[derive(Debug, Default)]
+struct CompactTuning {
+    /// `0` = use [`COMPACT_THRESHOLD`].
+    threshold: AtomicU64,
+    /// `0` = use [`COMPACT_DEFER_EMERGENCY_CEILING`].
+    emergency_ceiling: AtomicU64,
+}
+
+impl CompactTuning {
+    fn threshold(&self) -> u64 {
+        match self.threshold.load(Ordering::Relaxed) {
+            0 => COMPACT_THRESHOLD,
+            v => v,
+        }
+    }
+
+    fn emergency_ceiling(&self) -> u64 {
+        match self.emergency_ceiling.load(Ordering::Relaxed) {
+            0 => COMPACT_DEFER_EMERGENCY_CEILING,
+            v => v,
+        }
+    }
+}
+
 /// Follower-aware compaction retention (etcd-style log retention, found live
 /// alongside the flood PR #1047 fixed): the hard cap, in log entries, a
 /// peer may be behind `last_log_index()` and still be counted toward
@@ -2544,6 +2581,11 @@ pub struct RaftKvNode<E: Env, S: StorageEngine> {
     /// field's normal boot-time seed like any other fresh group — there is
     /// no already-running node whose cache needs folding in.
     hot_change_max: Arc<Mutex<Option<(HlcTimestamp, u32)>>>,
+    /// Issue #1064 part-2 test seam — see [`CompactTuning`]'s own doc.
+    /// `Arc` (not owned inline) because both the consensus-loop-adjacent
+    /// public setter below and the apply task (which reads it every pass)
+    /// need their own handle, mirroring every other cross-task field here.
+    compact_tuning: Arc<CompactTuning>,
 }
 
 /// A bounded, in-process ring of every distinct value of `T` a
@@ -3005,6 +3047,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         // above — starts empty and is populated before the apply task's
         // first pass.
         let hot_change_max = Arc::new(Mutex::new(None));
+        let compact_tuning = Arc::new(CompactTuning::default());
         let node = Self {
             env: env.clone(),
             core: Arc::clone(&core),
@@ -3041,6 +3084,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             external_quiesce_veto_fresh_through: Arc::clone(&external_quiesce_veto_fresh_through),
             voter_history: Arc::clone(&voter_history),
             hot_change_max: Arc::clone(&hot_change_max),
+            compact_tuning: Arc::clone(&compact_tuning),
         };
         // The consensus loop recovers from the WAL, then spawns the apply task
         // (so the apply task sees the recovered core + the correct
@@ -3084,6 +3128,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             heartbeat_batcher,
             shared_wal,
             hot_change_max,
+            compact_tuning,
         }));
         node
     }
@@ -3152,6 +3197,30 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// control plane's `next_deadline` never returns `None`.
     pub fn enable_quiescence(&self, after: Duration) {
         self.lock().enable_quiescence(after);
+    }
+
+    /// Issue #1064 part-2 regression-test seam: override this group's own
+    /// [`COMPACT_THRESHOLD`]/[`COMPACT_DEFER_EMERGENCY_CEILING`] — see
+    /// [`CompactTuning`]'s own doc for why this exists and why it mirrors
+    /// [`enable_quiescence`](Self::enable_quiescence)'s shape rather than a
+    /// new one. `None` for either argument leaves that constant at its
+    /// compiled-in production value; calling this at all has **no**
+    /// production caller — every existing group's compaction behavior is
+    /// unaffected unless a test calls this explicitly, exactly like
+    /// `enable_quiescence`'s own additive-default contract. Safe to call at
+    /// any point in this group's lifetime (a plain relaxed store the apply
+    /// task's next pass picks up — no lock, no propose, no wake needed).
+    pub fn set_compact_tuning_for_test(
+        &self,
+        threshold: Option<u64>,
+        emergency_ceiling: Option<u64>,
+    ) {
+        self.compact_tuning
+            .threshold
+            .store(threshold.unwrap_or(0), Ordering::Relaxed);
+        self.compact_tuning
+            .emergency_ceiling
+            .store(emergency_ceiling.unwrap_or(0), Ordering::Relaxed);
     }
 
     /// Whether this group's local replica currently considers itself
@@ -7946,6 +8015,8 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     // `materialize_derived` call site below whose `change_log` was
     // non-empty (`note_hot_change_write`); never written durably.
     hot_change_max: &Arc<Mutex<Option<(HlcTimestamp, u32)>>>,
+    // Issue #1064 part-2 test seam — see [`CompactTuning`]'s own doc.
+    compact_tuning: &CompactTuning,
 ) -> bool {
     let mut did_work = false;
 
@@ -10247,7 +10318,13 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     // from chunk 0 over and over). Below both ceilings this gives a real
     // in-flight transfer a genuine window to land before the next
     // threshold crossing would otherwise yank it back to chunk 0 forever.
-    let would_defer = behind >= COMPACT_THRESHOLD && transfer_in_flight;
+    //
+    // `compact_threshold`/`compact_emergency_ceiling` below read
+    // `compact_tuning`'s own possibly-test-overridden value (production:
+    // always the compiled-in constant — see `CompactTuning`'s own doc).
+    let compact_threshold = compact_tuning.threshold();
+    let compact_emergency_ceiling = compact_tuning.emergency_ceiling();
+    let would_defer = behind >= compact_threshold && transfer_in_flight;
     // Real forward progress (the tracked sum changed since the last pass)
     // restarts the idle clock — this bounds idle time since the LAST
     // advance, never total transfer duration. `None` (first observation of
@@ -10291,9 +10368,8 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     // (`compaction_floor`'s own voters-only retention already tries to keep
     // them there in the first place), so an ordinary voter that DOES fall
     // into the snapshot path is still bounded exactly as before.
-    let emergency_ceiling_hit =
-        behind >= COMPACT_DEFER_EMERGENCY_CEILING && !learner_transfer_in_flight;
-    let threshold_hit = behind >= COMPACT_THRESHOLD
+    let emergency_ceiling_hit = behind >= compact_emergency_ceiling && !learner_transfer_in_flight;
+    let threshold_hit = behind >= compact_threshold
         && (!transfer_in_flight || idle_ceiling_hit || emergency_ceiling_hit);
     // PR #1047: a transfer forced out while it was still genuinely in
     // flight is a real restart-from-chunk-0 event, not routine compaction —
@@ -10963,6 +11039,9 @@ struct DriveState<E: Env, S: StorageEngine> {
     /// `drive` can seed it from one bounded boot scan and the apply task
     /// can keep it current as new `KIND_CHANGE` records materialize.
     hot_change_max: Arc<Mutex<Option<(HlcTimestamp, u32)>>>,
+    /// See [`RaftKvNode::compact_tuning`]'s doc — threaded through so the
+    /// apply task can read the same override the public setter writes.
+    compact_tuning: Arc<CompactTuning>,
 }
 
 /// One split-build seed row (ADR 0050 Train B rung 4): `(kind index into
@@ -11099,6 +11178,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         heartbeat_batcher,
         shared_wal,
         hot_change_max,
+        compact_tuning,
     } = st;
 
     // ADR 0044 phase 2 (C-02 PR 2): register this group's own stream with
@@ -11363,6 +11443,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         Arc::clone(&persist),
         shared_wal.clone(),
         Arc::clone(&hot_change_max),
+        Arc::clone(&compact_tuning),
     ));
 
     // Issue #279: the loop's own in-flight persist round, and the outbound
@@ -11953,6 +12034,8 @@ async fn apply_loop<E: Env, S: StorageEngine>(
     // spawns, then kept current in-memory as this task materializes new
     // `KIND_CHANGE` records — see `RaftKvNode::hot_change_max`'s doc.
     hot_change_max: Arc<Mutex<Option<(HlcTimestamp, u32)>>>,
+    // Issue #1064 part-2 test seam — see [`CompactTuning`]'s own doc.
+    compact_tuning: Arc<CompactTuning>,
 ) {
     // This apply task's own sequential, single-writer bookkeeping (see
     // `apply_and_compact`'s doc): `sealed` is seeded from the engine-durable
@@ -12024,6 +12107,7 @@ async fn apply_loop<E: Env, S: StorageEngine>(
             &mut compact_defer_since,
             &mut compact_defer_progress,
             &hot_change_max,
+            &compact_tuning,
         )
         .await;
         if !did_work {

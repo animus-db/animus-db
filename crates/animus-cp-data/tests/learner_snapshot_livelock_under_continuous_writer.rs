@@ -12,44 +12,61 @@
 //! progressing, the instant `behind` (which grows at the WRITE rate, not at
 //! the transfer's own completion rate) crossed it.
 //!
-//! **Why the write/drain shape here, not a continuous-checking one**: a
-//! learner's own steady-state replication lag under a genuinely sustained
-//! writer is bounded below by (round-trip cost × write rate) — checking
-//! `RaftCore::learner_caught_up`'s tight, fixed
-//! `RECONFIGURE_LEARNER_CATCH_UP_THRESHOLD` (4 entries) *while the writer is
-//! still running* is a different, much narrower claim than this bug is
-//! about, and one that a merely fast (not broken) learner can fail for
-//! reasons that have nothing to do with issue #1064 at all. `tests/
-//! learner_catchup_under_load.rs` (issues #532/#537) and `tests/
-//! snapshot_transfer_survives_compaction.rs` (PR #1047) both already
-//! establish the idiom this file follows instead: drive a bounded, genuinely
-//! sustained write phase, then stop the writer and poll for convergence —
-//! the converged-or-timeout idiom (root `CLAUDE.md`) applied to the drain
-//! phase, exactly as those two existing tests already do for the sibling
-//! mechanisms they each cover.
+//! **Why this file uses `RaftKvNode::set_compact_tuning_for_test` instead of
+//! the compiled-in production ceiling (4096 entries).** Reaching
+//! `COMPACT_DEFER_EMERGENCY_CEILING` at its real production size could not
+//! be done by an unambiguous margin within a real-time-affordable step
+//! budget. Since virtual time inside `SimEnv` is free and only the number of
+//! *steps* costs anything, the fix is not a slower test, but a **smaller
+//! ceiling** — this file overrides it to 200 entries (`TEST_EMERGENCY_
+//! CEILING`, within the coordinator-suggested 128–256 range) via the
+//! test-only seam `CompactTuning` (`crates/animus-cp-data/src/lib.rs`)
+//! added alongside this test. See `docs/lessons/testing/2026-09-28-reach-
+//! the-real-trigger-dont-shrink-the-test-around-a-fixed-constant.md` for
+//! the full account of getting here, including a write-rate-vs-throughput
+//! lesson this file's own control scenario caught along the way.
 //!
-//! **Write shape: one propose per round, never a synchronous batch** —
-//! mirrors `follower_aware_compaction.rs`'s own
-//! `a_modestly_slowed_voter_catches_up_via_append_entries_without_ever_
-//! needing_a_snapshot` (the proven-sustainable shape for a lagging REPLICA
-//! in this exact crate), not `learner_catchup_under_load.rs`'s tight
-//! synchronous bursts. A synchronous burst of proposes with no yield between
-//! them coalesces into a single wake (`replicate_now`'s own `ProposeSignal`,
-//! see this crate's own doc on `RaftCore::snapshot_chunk_for`), and at high
-//! enough aggregate volume that coalescing can let MANY overlapping,
-//! redundant `AppendEntries` pile up in a slow peer's inbox before its first
-//! ack ever round-trips back — a real, separate, PRE-EXISTING throughput
-//! characteristic of sustained replication to any one lagging replica,
-//! independent of this issue's own compaction/snapshot mechanism, and not
-//! this fix's to solve. One propose per scheduler turn keeps the wake
-//! granularity fine enough to avoid that entirely, isolating the mechanism
-//! this file actually targets.
+//! **Why writes are issued in BURSTS between `Simulator::run_for` calls,
+//! never one `run_for` per single propose** — `learner_catchup_under_
+//! load.rs`'s own module doc already profiled this exact tradeoff: a
+//! `run_for` call's real wall-clock cost scales with how much work it has
+//! to process (message/event volume), not with the virtual duration
+//! requested — so a design that produces a large backlog per call (one
+//! propose, one `run_for`, repeated thousands of times) is far more
+//! expensive in real time than the identical aggregate write volume issued
+//! in synchronous bursts (which also lets `replicate_now`'s wake-on-propose
+//! coalesce a burst into one physical `AppendEntries`, rather than one per
+//! write).
 //!
-//! What's NEW here relative to the two existing, already-green tests named
-//! above: **the learner needs a real, multi-chunk snapshot from the moment
-//! it joins** (a large warm-up) and the sustained phase runs long enough for
-//! `behind` to cross `COMPACT_DEFER_EMERGENCY_CEILING` (4096) more than once
-//! while that multi-round-trip transfer is still landing.
+//! **What this file actually proves, and what it does NOT (found through
+//! extensive empirical tuning — read before changing any constant here).**
+//! An earlier design tried to prove the learner reaches, and then SUSTAINS,
+//! `RaftCore::learner_caught_up`'s tight absolute-gap bound
+//! (`RECONFIGURE_LEARNER_CATCH_UP_THRESHOLD` = 4 entries) while the writer
+//! never stops. That turned out to be a materially harder, and separately
+//! confounded, claim: even the AppendEntries-only CONTROL (no snapshot
+//! involved at all) could not sustain a 4-entry gap against a genuinely
+//! continuous high-volume writer — every burst instantaneously reopens a
+//! `BURST_LEN`-sized gap, and `RaftCore::compaction_floor`'s own
+//! voters-only design (deliberate, see `animus-control/CLAUDE.md`) means
+//! nothing holds a learner's position the way it holds a lagging voter's.
+//! Chasing a literal `learner_caught_up` streak long enough eventually ran
+//! into a **third**, unrelated, already-flagged-for-separate-filing defect
+//! (`handle_append_resp`'s ordinary-ack `next_index` update via a bare
+//! `insert` rather than a monotonic `max` — found investigating this exact
+//! issue, explicitly left alone per this session's own instructions) at
+//! long enough run lengths, which can silently stop a leader from ever
+//! replicating anything further to a peer at all. **This file therefore
+//! proves the actual mechanism under test — whether the LEARNER's transfer
+//! is allowed to land and make real progress, or is forced back to chunk 0
+//! forever — directly, via `Metric::CpSnapshotInstalls`/
+//! `CpSnapshotTransferRestarts`/`RaftKvNode::engine_applied_index`, at a
+//! bounded run length chosen to stay well clear of that third, unrelated
+//! defect** — see `assert_late_join_converges_while_writing`'s own
+//! assertions and the measured before/after numbers below, rather than
+//! requiring the much stronger (and, at this scale, currently unachievable
+//! for reasons unrelated to this fix) "sustained tight-threshold catch-up"
+//! claim.
 //!
 //! Two scenarios, same write rate and learner disk cost throughout (the
 //! control proves the rate itself is not the problem):
@@ -59,41 +76,31 @@
 //!    load the learner can genuinely sustain, not a capacity mismatch
 //!    dressed up as this bug (a small, fixed tolerance on `Metric::
 //!    CpSnapshotImageBuilds`/`CpSnapshotTransferRestarts`, not a strict
-//!    zero — see `CONTROL_TOLERANCE`'s own doc for why even a healthy
-//!    replica can need one early on-demand image at a genuinely sustained
-//!    rate).
+//!    zero — even a healthy replica can need one early on-demand image
+//!    before its own steady-state rhythm settles).
 //! 2. `a_late_joining_learner_converges_despite_needing_a_multi_chunk_
 //!    install_snapshot_issue_1064`: a learner that joins only after the
-//!    leader has already compacted a large warmed-up log, needing a real,
+//!    leader has already compacted a warmed-up log, needing a real,
 //!    multi-round-trip `InstallSnapshot` the instant it joins, under the
-//!    SAME sustained writer as the control. Converges within a bounded
-//!    drain with `Metric::CpSnapshotTransferRestarts` staying small.
+//!    SAME sustained writer as the control, with `COMPACT_DEFER_EMERGENCY_
+//!    CEILING` overridden down to a value the sustained writer crosses many
+//!    times before a transfer can naturally land.
 //!
-//! **Known limitation of this test's own scale, recorded rather than
-//! papered over**: reliably forcing `behind` past `COMPACT_DEFER_EMERGENCY_
-//! CEILING` (4096) by a wide, unambiguous margin — so the pre-fix code
-//! visibly floods while the fix visibly doesn't — needs either a
-//! multi-thousand-round sustained phase (too slow in real time for this
-//! suite at the single-propose-per-round granularity that avoids a
-//! separate, pre-existing throughput ceiling this file's own module doc
-//! describes) or a larger `ROUND_LEN` that risks re-entering that same
-//! separate ceiling. At the scale this file actually runs, both the fixed
-//! and reverted-`emergency_ceiling_hit` code converge with a similarly
-//! small restart count (`behind` brushes the ceiling but doesn't cross it
-//! by enough to distinguish the two every run) — this test is a genuine,
-//! real-code-path regression guard for the mechanism (a learner needing a
-//! real multi-chunk snapshot under sustained load, at a rate proven
-//! sustainable by its own control), not a dramatic red/green demonstration
-//! at field scale. The mechanism's correctness by inspection (`apply_and_
-//! compact`'s `emergency_ceiling_hit` computation, `crates/animus-cp-data/
-//! src/lib.rs`) and this file's own passing assertions are what back this
-//! fix; see the implementation session's own final report for the full
-//! account of what was tried and why, including a separate,
-//! not-fixed-here throughput characteristic this investigation surfaced
-//! (ordinary `AppendEntries` replication to one lagging peer under a tight
-//! synchronous-burst writer can stall well short of `MAX_APPEND_ENTRIES_
-//! BATCH`'s own per-message cap for an extended period) — worth its own,
-//! separate investigation.
+//! **Confirmed red on the pre-fix mechanism, green on the fix (5c3ead84),
+//! measured live at this file's exact seed and constants (150 bursts, 300ms
+//! virtual apart)**: temporarily reverting `emergency_ceiling_hit`'s own
+//! `!learner_transfer_in_flight` exemption in `lib.rs` (i.e. restoring the
+//! pre-fix `behind >= compact_emergency_ceiling` alone) turns this scenario
+//! from `restarts=6, installs=2 (successful), learner's own applied index
+//! reaching 11914 of the leader's 17502 commits — genuine, substantial,
+//! ongoing progress` into `restarts=75, installs=0 (the learner NEVER
+//! completes a single InstallSnapshot, ever), learner's own applied index
+//! stuck at 0 for the entire run` — a livelock matching the issue's own
+//! description exactly, not a mere slowdown. `MAX_TOLERATED_RESTARTS` (15)
+//! and `MIN_LEARNER_PROGRESS_PERCENT` (below) are both chosen with generous
+//! margin around the FIXED code's own measured 6 restarts / 68% progress,
+//! while remaining far below the pre-fix code's measured 75 restarts / 0%
+//! progress.
 
 use std::time::{Duration, Instant};
 
@@ -111,54 +118,48 @@ fn leader_among(nodes: &[KvNode]) -> Option<usize> {
     if ls.len() == 1 { Some(ls[0]) } else { None }
 }
 
-/// Mirrors `RECONFIGURE_LEARNER_CATCH_UP_THRESHOLD` (`lib.rs`, private to
-/// this crate) — the same absolute log-index-gap promotion criterion
-/// `reconfigure_step` uses in production.
-const CATCH_UP_THRESHOLD: u64 = 4;
+/// The test-only override for `COMPACT_DEFER_EMERGENCY_CEILING` (production:
+/// 4096) — see the module doc for why a small override, not a slower test,
+/// is what makes this file's own writer genuinely cross it many times while
+/// a real multi-chunk transfer is in flight. Within the coordinator-
+/// suggested 128–256 range. `COMPACT_THRESHOLD` itself is left at its
+/// production default (64).
+const TEST_EMERGENCY_CEILING: u64 = 200;
 
-/// One propose per round, at this cadence — see the module doc for why this
-/// shape (not a synchronous multi-propose burst) isolates the mechanism
-/// under test. `1ms` matches `follower_aware_compaction.rs`'s own proven
-/// rate for a lagging replica in this crate.
-const ROUND_GAP: Duration = Duration::from_millis(1);
-/// A SMALL number of proposes issued per round (before the single
-/// `sim.run_for(ROUND_GAP)` that lets them actually reach the network) —
-/// deliberately much smaller than `learner_catchup_under_load.rs`'s own
-/// `BURST_LEN` (10), chosen empirically to keep aggregate volume high
-/// enough to cross `COMPACT_DEFER_EMERGENCY_CEILING` within a real-time
-/// budget this suite can afford, while staying small enough that
-/// `replicate_now`'s own wake-on-propose coalescing never lets more than a
-/// handful of overlapping in-flight `AppendEntries` pile up in the
-/// learner's own inbox at once.
-const ROUND_LEN: u64 = 5;
+/// The learner's own disk round-trip cost — one simulated fsync per
+/// RECEIVED message, however many entries that message carries (batching
+/// amortizes this the same way a real WAL does).
+const LEARNER_SYNC_DELAY: Duration = Duration::from_millis(20);
 
-/// The learner's own disk round-trip cost, matching `follower_aware_
-/// compaction.rs`'s own `SLOW_VOTER_SYNC_DELAY` exactly — a real, but
-/// modest, round-trip cost proven in this crate to let a lagging replica
-/// catch up via ordinary `AppendEntries` alone at `ROUND_GAP`'s rate.
-const LEARNER_SYNC_DELAY: Duration = Duration::from_millis(200);
+/// Writes issued synchronously (no yield) per warm-up burst, and the
+/// virtual gap after each burst before the next. Building a log large
+/// enough to need several `SNAPSHOT_CHUNK_BYTES` (64 KiB) chunks needs
+/// several thousand small rows; batching them into a handful of bursts (not
+/// thousands of individual `run_for` calls) is what keeps this cheap in
+/// real time — see the module doc.
+const WARMUP_BURST_LEN: u64 = 250;
+const WARMUP_BURST_GAP: Duration = Duration::from_millis(50);
+const WARMUP_BURSTS: u64 = 10;
 
-/// How many bursts of warm-up writes (ordinary bursts, no learner listening
-/// yet, so the wake-coalescing/inbox concern above doesn't apply) land
-/// BEFORE the late-joining learner starts — large enough that the resulting
-/// image spans several `SNAPSHOT_CHUNK_BYTES` (64 KiB) chunks and genuinely
-/// needs more than one round trip to land.
-const WARMUP_BURSTS: u64 = 600;
-const WARMUP_BURST_LEN: u64 = 10;
-const WARMUP_BURST_GAP: Duration = Duration::from_millis(10);
-
-/// The bounded, sustained (one-propose-per-round) write phase — long enough
-/// that `behind` crosses `COMPACT_DEFER_EMERGENCY_CEILING` (4096) more than
-/// once at this rate while a still-unfixed, multi-round-trip transfer is
-/// landing, giving a real (if not fixed) flood room to accumulate a
-/// meaningfully large, still-climbing restart count.
-const ROUNDS: u64 = 1500;
-
-/// After the writer stops, how many times (each separated by
-/// `DRAIN_POLL_GAP`) to check whether the learner has caught up before
-/// giving up.
-const DRAIN_POLLS: u64 = 200;
-const DRAIN_POLL_GAP: Duration = Duration::from_secs(1);
+/// The sustained (bursted) write phase: `BURST_LEN` writes issued
+/// synchronously, then `BURST_GAP` of virtual time, repeated `ROUNDS`
+/// times. Picked (with `LEARNER_SYNC_DELAY`) as a matched pair: the message
+/// rate (one coalesced `AppendEntries`/chunk-worth per burst) stays well
+/// under the learner's own per-message disk cost, so the CONTROL scenario's
+/// own image-build/restart counts stay small — while the aggregate write
+/// volume is still high enough to cross `TEST_EMERGENCY_CEILING` many times
+/// over during the regression scenario's transfer.
+const BURST_LEN: u64 = 100;
+const BURST_GAP: Duration = Duration::from_millis(100);
+/// Bounded to stay well clear of a third, unrelated, already-flagged
+/// defect (`handle_append_resp`'s non-monotonic `next_index` update — see
+/// the module doc) that a much longer sustained run can eventually trip
+/// regardless of this fix, silently halting ALL further replication to a
+/// peer. 150 bursts (15 virtual seconds) was confirmed clear of it at this
+/// file's exact seed/constants, both with and without this fix in place —
+/// long enough to show a dramatic, unambiguous restart-count and progress
+/// difference between the two (see the module doc's own measured numbers).
+const ROUNDS: u64 = 150;
 
 /// A generous real-time watchdog, mirroring every other continuous-writer
 /// test in this crate — a deliberate, narrow exception to the
@@ -169,16 +170,17 @@ const DRAIN_POLL_GAP: Duration = Duration::from_secs(1);
     reason = "real-time watchdog against unbounded per-round CPU work — SimEnv's virtual clock cannot see this"
 )]
 fn real_budget() -> Duration {
-    Duration::from_secs(90)
+    Duration::from_secs(60)
 }
 
-/// Runs a 3-voter group through the sustained write phase above, joining a
-/// learner (its own disk throttled) either immediately (`warmup_bursts ==
-/// 0`, the AppendEntries-only control) or after `warmup_bursts` bursts of
-/// prior writes (the actual #1064 regression shape), then drains with the
-/// writer stopped. Returns `(converged, restarts, image_builds)` for the
-/// caller's own scenario-specific assertions.
-fn run_scenario(seed: u64, warmup_bursts: u64) -> (bool, u64, u64) {
+/// Runs a 3-voter group through the sustained, bursted write phase above,
+/// joining a learner (its own disk throttled) either immediately
+/// (`warmup_bursts == 0`, the AppendEntries-only control) or after
+/// `warmup_bursts` warm-up bursts of prior writes (the actual #1064
+/// regression shape). The writer never stops before every metric below is
+/// read — see the module doc. Returns `(restarts, image_builds, installs,
+/// learner_applied, leader_commit)`.
+fn run_scenario(seed: u64, warmup_bursts: u64) -> (u64, u64, u64, u64, u64) {
     let mut sim = Simulator::new(seed);
     let ids = [0u64, 1, 2];
     let handles: Vec<MetricsHandle> = ids.iter().map(|_| MetricsHandle::recording()).collect();
@@ -194,6 +196,12 @@ fn run_scenario(seed: u64, warmup_bursts: u64) -> (bool, u64, u64) {
             )
         })
         .collect();
+    // Every replica compacts locally — apply to all three so leadership
+    // changes (none expected in this fault-free scenario, but cheap
+    // insurance) never fall back to the un-overridden production ceiling.
+    for node in &nodes {
+        node.set_compact_tuning_for_test(None, Some(TEST_EMERGENCY_CEILING));
+    }
     sim.run_for(Duration::from_secs(2));
     let l = leader_among(&nodes).expect("an initial leader");
 
@@ -218,12 +226,13 @@ fn run_scenario(seed: u64, warmup_bursts: u64) -> (bool, u64, u64) {
     let voters: Vec<NodeId> = ids.iter().copied().map(nid).collect();
     let learner = nid(3);
     let learner_metrics = MetricsHandle::recording();
-    let _node3 = RaftKvNode::start_with_metrics(
+    let node3 = RaftKvNode::start_with_metrics(
         sim.env(learner.clone()),
         voters,
         MemoryEngine::new(),
         learner_metrics.clone(),
     );
+    node3.set_compact_tuning_for_test(None, Some(TEST_EMERGENCY_CEILING));
     assert!(
         matches!(
             nodes[l].add_learner(learner.clone()),
@@ -239,8 +248,8 @@ fn run_scenario(seed: u64, warmup_bursts: u64) -> (bool, u64, u64) {
     let start = Instant::now();
     let budget = real_budget();
 
-    'write: for round in 0..ROUNDS {
-        for i in 0..ROUND_LEN {
+    for round in 0..ROUNDS {
+        for i in 0..BURST_LEN {
             let key = format!("k-{round}-{i}").into_bytes();
             let res = nodes[l].put(key, vec![b'v'; 256]);
             assert!(
@@ -249,27 +258,15 @@ fn run_scenario(seed: u64, warmup_bursts: u64) -> (bool, u64, u64) {
                  {res:?}"
             );
         }
-        sim.run_for(ROUND_GAP);
-        if start.elapsed() >= budget {
-            break 'write;
-        }
-    }
-
-    // Drain: poll for convergence with the writer stopped (the
-    // converged-or-timeout idiom), bounded on both a virtual-tick budget and
-    // the same real-time watchdog.
-    let mut converged = false;
-    for _ in 0..DRAIN_POLLS {
-        if nodes[l].learner_caught_up(&learner, CATCH_UP_THRESHOLD) {
-            converged = true;
-            break;
-        }
-        sim.run_for(DRAIN_POLL_GAP);
+        sim.run_for(BURST_GAP);
         if start.elapsed() >= budget {
             break;
         }
     }
 
+    // Every metric below is read with the writer having just issued its
+    // LAST burst above and NOT been stopped or drained — the "while
+    // writing" property the module doc describes.
     let restarts: u64 = handles
         .iter()
         .map(|h| h.get(Metric::CpSnapshotTransferRestarts))
@@ -280,91 +277,112 @@ fn run_scenario(seed: u64, warmup_bursts: u64) -> (bool, u64, u64) {
         .map(|h| h.get(Metric::CpSnapshotImageBuilds))
         .sum::<u64>()
         + learner_metrics.get(Metric::CpSnapshotImageBuilds);
+    let installs: u64 = handles
+        .iter()
+        .map(|h| h.get(Metric::CpSnapshotInstalls))
+        .sum::<u64>()
+        + learner_metrics.get(Metric::CpSnapshotInstalls);
+    let learner_applied = node3.engine_applied_index();
+    let leader_commit = nodes[l].commit_index();
 
     eprintln!(
-        "seed={seed:#x} warmup_bursts={warmup_bursts}: converged={converged} \
-         real_elapsed={:.1}s restarts={restarts} image_builds={image_builds} \
-         leader_commit={}",
+        "seed={seed:#x} warmup_bursts={warmup_bursts}: real_elapsed={:.2}s restarts={restarts} \
+         image_builds={image_builds} installs={installs} learner_applied={learner_applied} \
+         leader_commit={leader_commit}",
         start.elapsed().as_secs_f64(),
-        nodes[l].commit_index(),
     );
 
-    (converged, restarts, image_builds)
+    (
+        restarts,
+        image_builds,
+        installs,
+        learner_applied,
+        leader_commit,
+    )
 }
 
 /// The control: a learner that joins the group BEFORE any writes (and
 /// therefore before any compaction) at the SAME sustained rate the
-/// regression below uses. It must converge via ordinary `AppendEntries`
-/// alone — `Metric::CpSnapshotImageBuilds` staying at 0 throughout proves
-/// this rate never once pushed it into the snapshot path, so the rate
-/// itself is not the reason the late-joining scenario struggles.
+/// regression below uses. `Metric::CpSnapshotTransferRestarts` staying
+/// small proves this rate/disk-delay combination is not itself a capacity
+/// mismatch dressed up as issue #1064's own mechanism.
 #[test]
 fn an_appendentries_only_learner_converges_issue_1064_control() {
     let seed = 0x1064_1101;
-    let (converged, restarts, image_builds) = run_scenario(seed, 0);
-    assert!(
-        converged,
-        "seed={seed:#x}: an AppendEntries-only learner (joined before any compaction) failed \
-         to converge during the drain at a rate this same suite already treats as sustainable \
-         — this would indicate a genuine capacity problem, not issue #1064's own \
-         snapshot-restart mechanism"
-    );
+    let (restarts, image_builds, _installs, _learner_applied, _leader_commit) =
+        run_scenario(seed, 0);
     // A small, fixed tolerance rather than a strict zero: even a
-    // well-behaved replica can need one on-demand image very early (before
-    // its own steady-state replication rhythm settles) at a genuinely
-    // sustained rate — the property this control actually needs to prove is
-    // "not a runaway, ever-climbing flood," which `assert_late_join_
-    // converges`'s own much larger bound is calibrated against.
-    const CONTROL_TOLERANCE: u64 = 6;
+    // well-behaved replica joining right as a continuous writer starts can
+    // need a handful of on-demand images before its own steady-state
+    // rhythm settles (confirmed live — a bursty writer instantaneously
+    // reopens a `BURST_LEN`-sized gap every round, which `RaftCore::
+    // compaction_floor`'s own voters-only design, deliberate, never
+    // protects a learner's position against). The property this control
+    // actually needs to prove is "not a runaway, ever-climbing flood,"
+    // which `assert_late_join_converges_while_writing`'s own much larger
+    // bound is calibrated against.
+    const CONTROL_TOLERANCE: u64 = 10;
     assert!(
         image_builds <= CONTROL_TOLERANCE,
         "seed={seed:#x}: an early-joining learner needed {image_builds} on-demand snapshot \
-         image(s) — it was supposed to stay caught up via ordinary AppendEntries almost the \
-         whole time, so this rate does not actually isolate the AppendEntries-only control from \
-         the InstallSnapshot mechanism under test"
+         image(s) at a rate meant to isolate the AppendEntries-only control from the \
+         InstallSnapshot mechanism under test"
     );
     assert!(
         restarts <= CONTROL_TOLERANCE,
         "seed={seed:#x}: an AppendEntries-only learner triggered {restarts} snapshot transfer \
-         restart(s) — should be rare to none at this rate"
+         restart(s) — should stay small, not grow with run length, at this rate"
     );
 }
 
 const BASE_LATE_JOIN_SEED: u64 = 0x1064_1102;
 
-/// A generous but genuinely bounding cap: PR #1047's own pre-#1064-fix
-/// flood produced restart counts far larger than this over a sustained
-/// phase this length; the fix's own worst case is a small, fixed number of
-/// early restarts (before the learner's own transfer state settles), never
-/// one that scales with the sustained phase's own length.
-const MAX_TOLERATED_RESTARTS: u64 = 20;
+/// Generous margins around the FIXED code's own measured numbers (6
+/// restarts, at least one successful install, the learner's own applied
+/// index reaching well over half the leader's commit index) — see the
+/// module doc for the full before/after comparison against the pre-fix
+/// code (75 restarts, ZERO successful installs, learner applied index
+/// stuck at 0 for the entire run).
+const MAX_TOLERATED_RESTARTS: u64 = 15;
+const MIN_LEARNER_PROGRESS_PERCENT: u64 = 25;
 
-fn assert_late_join_converges(seed: u64) {
-    let (converged, restarts, _image_builds) = run_scenario(seed, WARMUP_BURSTS);
+fn assert_late_join_converges_while_writing(seed: u64) {
+    let (restarts, _image_builds, installs, learner_applied, leader_commit) =
+        run_scenario(seed, WARMUP_BURSTS);
     assert!(
-        converged,
-        "seed={seed:#x}: a learner needing a real, multi-chunk InstallSnapshot never converged \
-         during the drain after a {ROUNDS}-round sustained phase, under the SAME rate the \
-         AppendEntries-only control sustains fine — `RaftCore::snapshot_upto` is invalidating \
-         its in-flight transfer faster than it can land (issue #1064)"
+        installs >= 1,
+        "seed={seed:#x}: a learner needing a real, multi-chunk InstallSnapshot never completed \
+         a SINGLE install over the whole run (a livelock matching issue #1064's own \
+         description exactly) — RaftCore::snapshot_upto is invalidating its in-flight transfer \
+         faster than it can ever land"
     );
     assert!(
         restarts <= MAX_TOLERATED_RESTARTS,
-        "seed={seed:#x}: {restarts} snapshot transfer restarts over a {ROUNDS}-round sustained \
-         phase — `COMPACT_DEFER_EMERGENCY_CEILING` is still forcing out a genuinely progressing \
-         learner transfer (issue #1064)"
+        "seed={seed:#x}: {restarts} snapshot transfer restarts over {ROUNDS} bursts of a writer \
+         that never stopped — COMPACT_DEFER_EMERGENCY_CEILING is still forcing out a genuinely \
+         progressing learner transfer (issue #1064)"
+    );
+    assert!(
+        learner_applied.saturating_mul(100)
+            >= leader_commit.saturating_mul(MIN_LEARNER_PROGRESS_PERCENT),
+        "seed={seed:#x}: the learner's own applied index ({learner_applied}) never reached even \
+         {MIN_LEARNER_PROGRESS_PERCENT}% of the leader's commit index ({leader_commit}) while \
+         the writer kept running — not the substantial, ongoing progress the fix is supposed to \
+         let it make"
     );
 }
 
 /// The regression: a learner that joins only after the leader has already
-/// compacted a large warmed-up log, needing a real, multi-round-trip
+/// compacted a warmed-up log, needing a real, multi-round-trip
 /// `InstallSnapshot`, under the SAME sustained writer as the control above,
-/// run long enough for a still-unfixed flood to accumulate a meaningfully
-/// large restart count. Must still converge during the drain, and
-/// `CpSnapshotTransferRestarts` must stay small.
+/// with the emergency ceiling overridden down to a size this writer crosses
+/// many times before a transfer could naturally land if forced out. Must
+/// land at least one snapshot, keep `CpSnapshotTransferRestarts` bounded,
+/// and make substantial, ongoing progress — all measured WHILE the writer
+/// keeps running.
 #[test]
 fn a_late_joining_learner_converges_despite_needing_a_multi_chunk_install_snapshot_issue_1064() {
-    assert_late_join_converges(BASE_LATE_JOIN_SEED);
+    assert_late_join_converges_while_writing(BASE_LATE_JOIN_SEED);
 }
 
 /// A small, fixed-quality mixing hash (splitmix64) — deliberately NOT the
@@ -396,6 +414,6 @@ fn late_joining_learner_corpus_runs_at_configured_depth() {
         } else {
             splitmix64(BASE_LATE_JOIN_SEED ^ (i as u64))
         };
-        assert_late_join_converges(seed);
+        assert_late_join_converges_while_writing(seed);
     }
 }

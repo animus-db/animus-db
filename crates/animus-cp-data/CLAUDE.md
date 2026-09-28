@@ -524,32 +524,31 @@ still apply to it exactly as PR #1047 tuned them, since a voter needing a
 snapshot at all is still the flood scenario this whole mechanism exists to
 bound. See `emergency_ceiling_hit`'s own computation and
 `COMPACT_DEFER_EMERGENCY_CEILING`'s doc comment (`lib.rs`) for the full
-before/after account, and ADR 0058's matching 2026-09-28 amendment.
-Regression: `tests/learner_snapshot_livelock_under_continuous_writer.rs` —
-an AppendEntries-only control (a learner joining before any compaction,
-proving the chosen write rate is genuinely sustainable —
-`Metric::CpSnapshotImageBuilds` stays 0) paired with a late-joining learner
-needing a real `InstallSnapshot` under the SAME continuous writer,
-asserting both convergence and a bounded `Metric::
-CpSnapshotTransferRestarts`.
-
-**Issue #1061's own mechanism (a departing, not joining, peer) is a
-sibling defect in the SHARED `RaftCore` (`animus-control/src/raft.rs`), not
-this crate**: `RaftCore::departing` (a leader still replicating to a
-just-removed voter until it acks the removal entry) had no bound at all —
-excluded from `compaction_floor`'s voters-only retention (it's no longer in
-`peers`), a departing peer whose replica is genuinely gone (crashed, or its
-own host already released it) fell into the snapshot path the moment any
-compaction advanced past it and, since it could never ack, was retried
-forever. `RaftCore::expire_stale_departing` (called once per `tick`'s own
-heartbeat cadence) drops a departing peer that has sent back nothing at
-all — no reply of ANY kind — for `DEPARTING_PEER_GIVE_UP` (5s, re-exported
-from `animus_control`). See `animus-control/CLAUDE.md`'s own entry for the
-full mechanism, including the vote-safety hardening
-(`handle_request_vote`'s new candidate-membership check) this fix needed
-alongside it. Regression (this crate, since it drives `RaftKvNode` directly
-rather than going through `animus-control`'s own control-plane groups):
-`tests/departing_peer_gives_up_after_replica_is_gone.rs`.
+before/after account. `RaftKvNode::set_compact_tuning_for_test` (a
+test-only, additive-default seam mirroring `RaftCore::enable_quiescence`'s
+own `Option`-field shape) lets a test override `COMPACT_THRESHOLD`/
+`COMPACT_DEFER_EMERGENCY_CEILING` down from their production sizes, since
+reaching the real 4096-entry ceiling by an unambiguous margin needs a
+real-time-unaffordable step count otherwise. Regression: `tests/
+learner_snapshot_livelock_under_continuous_writer.rs` — an
+AppendEntries-only control (a learner joining before any compaction, at the
+same sustained write rate, proving that rate is not itself a capacity
+mismatch) paired with a late-joining learner needing a real, multi-chunk
+`InstallSnapshot` under the SAME continuous writer, asserting — all while
+the writer keeps running — that at least one transfer actually completes
+(`Metric::CpSnapshotInstalls`), that `Metric::CpSnapshotTransferRestarts`
+stays bounded, and that the learner's own applied index makes substantial,
+ongoing progress against the leader's commit index. Confirmed live: the
+pre-fix code never completes a single install (restarts=75, applied index
+stuck at 0 for the whole run) against the fix's restarts=6, two completed
+installs, and the learner reaching 68% of the leader's commit index — a
+livelock, not a mere slowdown. See `docs/lessons/testing/2026-09-28-reach-
+the-real-trigger-dont-shrink-the-test-around-a-fixed-constant.md` for the
+tuning history (a write-rate-vs-peer-throughput lesson this test's own
+control caught) and this file's own investigation notes on a further,
+separate, not-fixed-here defect the same investigation surfaced
+(`handle_append_resp`'s non-monotonic `next_index` update on an ordinary
+AppendEntries ack, tracked as issue #1070).
 
 **`RaftKvNode::voter_history()` (issue #596)** records every distinct voter
 configuration a group has adopted, in adoption order, in a small bounded
