@@ -1654,6 +1654,35 @@ per-tablet CP data plane (`animus-cp-data`).
   `crates/animus-cp-data/tests/follower_aware_compaction.rs`'s tightened
   bound (10, down from 60).
 
+  **The `&& !state_machine_behind` override above is itself only sound for
+  `last_index == last_applied` (found live 2026-09-27, same
+  `--cluster-control 3 --cluster-data 5` bulk-seeding shape).**
+  `state_machine_behind` is `true` not only in the #554 wipe-recovery
+  case it was built for, but also, transiently and legitimately, in the
+  window after every ordinary genuine `InstallSnapshot` completes: this
+  core's own `last_applied`/`snapshot_index` advance synchronously right
+  here, while the separate async apply task (`animus-cp-data`'s
+  `engine_applied`) is still draining `pending_install` into the engine —
+  `state_machine_behind` is recomputed live every consensus-loop iteration
+  as `engine_applied < snapshot_index`, with nothing in that boolean saying
+  *why* it's true. In the wipe case an offer's `last_index` is always `>=
+  last_applied` (the follower's log already matched the leader's base
+  before its engine was lost — typically exactly equal); in the
+  post-install-transient case, an unrelated, already-obsolete transfer can
+  land with `last_index` strictly BELOW `last_applied`, and the override
+  used to wave that through too, reinstalling and rewinding
+  `last_applied`/`commit_index`/the log — the same rewind class as the fix
+  directly above, just gated on `state_machine_behind` being true for an
+  unrelated reason instead of on ordinary catch-up. Fixed by only excusing
+  the `==` case from the redundancy check (`last_index < last_applied` is
+  now unconditionally redundant, `state_machine_behind` or not); the `==`
+  case still needs the override, since that's the actual #554 shape.
+  Regression: `tests/stale_snapshot_no_rewind.rs`'s
+  `stale_install_snapshot_below_last_applied_is_rejected_even_when_state_machine_behind`.
+  See `docs/lessons/code-patterns/` for the general "a guard's escape
+  hatch keyed on a flag must check why the flag is set" lesson this is an
+  instance of.
+
   **A threshold-triggered compaction must defer while a peer's chunked
   transfer is genuinely in flight (issue #898, the control-plane instance of
   issues #532/#537's `animus-cp-data::COMPACT_DEFER_CEILING` finding).**
