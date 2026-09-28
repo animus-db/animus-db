@@ -3707,7 +3707,38 @@ where
         // `last_applied` instead catches this: it is this node's own
         // up-to-date "how far have I actually gotten," not a proxy that
         // lags behind it.
-        if last_index <= self.last_applied && !self.state_machine_behind {
+        // Issue found live (2026-09-27, `--cluster-control 3 --cluster-data
+        // 5` under bulk seeding + auto-split): the `state_machine_behind`
+        // override above is meant ONLY for the #554 wipe-recovery shape,
+        // where the offer's `last_index` is always `>= last_applied`
+        // (typically exactly equal — the follower's log already matched the
+        // leader's base before its engine was lost). But
+        // `state_machine_behind` is *also* true, transiently and
+        // legitimately, after every ordinary genuine `InstallSnapshot`
+        // completes: `last_applied`/`snapshot_index` advance synchronously
+        // right here, while the separate async apply task (`animus-cp-data`'s
+        // `engine_applied`) is still draining `pending_install` into the
+        // engine — `state_machine_behind` is recomputed live as
+        // `engine_applied < snapshot_index` every consensus-loop iteration,
+        // with no way to tell "behind because of a wipe" apart from "behind
+        // because the engine hasn't drained the install it's ALREADY
+        // received yet." An unrelated, already-obsolete transfer's final
+        // chunk landing during that second window has `last_index` strictly
+        // BELOW this node's `last_applied` — a shape the wipe case never
+        // produces — and used to sail through the override exactly like a
+        // genuine wipe-recovery offer, reinstalling and rewinding
+        // `last_applied`/`commit_index`/the log backwards (the same rewind
+        // `tests/stale_snapshot_no_rewind.rs`'s first regression covers,
+        // gated here on `state_machine_behind` instead of on ordinary
+        // catch-up). A follower must never install a snapshot whose
+        // `last_index < last_applied`, regardless of `state_machine_behind`:
+        // that comparison alone already distinguishes "behind" from "behind
+        // AND this offer would rewind me," and the override only needs to
+        // keep excusing the `==` case (the actual #554 shape) from being
+        // treated as redundant.
+        if last_index < self.last_applied
+            || (last_index == self.last_applied && !self.state_machine_behind)
+        {
             self.incoming_snapshot = None;
             // This used to echo `last_index: self.snapshot_index` — nonzero
             // the instant this node has ever compacted at all, which made
