@@ -2656,17 +2656,26 @@ pub struct BoundNode {
     /// sibling of the `internal/` subdirectory `ProdEnv::bind` already owns.
     dir: PathBuf,
     internal_addr: SocketAddr,
-    client_listener: TcpListener,
+    /// **`Arc`-wrapped since issue #1060** — not for shared ownership across
+    /// tasks (only `serve_requests` ever calls `.accept()` on it), but so
+    /// [`Node::shutdown`]/[`Node::shutdown_and_wait`] can keep their own
+    /// clone alongside the one handed to `serve_requests` and force the
+    /// underlying OS socket closed **synchronously**, independent of the
+    /// accept-loop task's own cancellation/drop timing — see
+    /// [`Node::shutdown`]'s own doc for why that distinction is load-bearing.
+    client_listener: Arc<TcpListener>,
     client_addr: SocketAddr,
     dynamo_listener: TcpListener,
     dynamo_addr: SocketAddr,
     admin_listener: TcpListener,
     admin_addr: SocketAddr,
-    /// The intra-cluster RPC listener (ADR 0047) — bound but not yet served
-    /// in this PR; carried through to [`start_with`](Self::start_with) so a
-    /// later PR can spawn `serve_requests` on it without touching the bind
-    /// sequence.
-    intra_listener: TcpListener,
+    /// The intra-cluster RPC listener (ADR 0047). `Arc`-wrapped for the
+    /// identical issue #1060 reason as [`client_listener`](Self::client_listener)
+    /// above — this is the port every hinted-retry forward
+    /// (`forward_to_tablet_leader`) dials, so a killed replica's own listener
+    /// needs to refuse a fresh connect fast, not merely once its accept-loop
+    /// task happens to get scheduled for cancellation.
+    intra_listener: Arc<TcpListener>,
     intra_addr: SocketAddr,
     /// animusd console's own listener (ADR 0052's "AnimusDB Data Console") — a combined node
     /// hosts CP-data tablets, so it always binds one; see
@@ -4967,9 +4976,11 @@ fn spawn_common_tail(
     client_route: BTreeMap<NodeId, String>,
     intra_route: BTreeMap<NodeId, String>,
     self_addrs: (NodeId, NodeAddrs),
-    client_listener: TcpListener,
+    // `Arc`-wrapped (issue #1060) — see [`BoundNode::client_listener`]'s own
+    // doc for why; `serve_requests` below takes the same type.
+    client_listener: Arc<TcpListener>,
     admin_listener: TcpListener,
-    intra_listener: TcpListener,
+    intra_listener: Arc<TcpListener>,
     console_listener: Option<TcpListener>,
     control_storage: Option<SharedEngine>,
     env: ProdEnv,
@@ -5794,6 +5805,12 @@ impl BoundNode {
             change_rates: ChangeRateTracker::default(),
             request_rates: RequestRateTracker::default(),
         };
+        // Issue #1060: kept here, alongside (not instead of) the clones
+        // `spawn_common_tail` moves below, so `Node::shutdown`/
+        // `shutdown_and_wait` can force these two listeners' own OS sockets
+        // closed synchronously — see `BoundNode::client_listener`'s own doc.
+        let hard_close_client_listener = self.client_listener.clone();
+        let hard_close_intra_listener = self.intra_listener.clone();
         let (ctx, common_tail_tasks) = spawn_common_tail(
             ControlHandle::Local(raft.clone()),
             edge.clone(),
@@ -6257,6 +6274,7 @@ impl BoundNode {
             envs,
             tasks,
             edge: ctx.edge.clone(),
+            hard_close_listeners: vec![hard_close_client_listener, hard_close_intra_listener],
             client_addr: self.client_addr,
             dynamo_addr: Some(self.dynamo_addr),
             admin_addr: self.admin_addr,
@@ -6304,6 +6322,25 @@ pub struct Node {
     /// handler in turn — see `serve_requests`'s own doc for the full
     /// mechanism. No handler is ever tracked in this `Vec` directly.
     tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// The client + intra listeners' own underlying OS sockets (issue
+    /// #1060) — always exactly the client and intra listeners this node
+    /// bound (a control-only node has no `dynamo`/`console` listener to add
+    /// here regardless), kept **in addition to** `tasks` above so
+    /// [`shutdown`](Self::shutdown)/[`shutdown_and_wait`](Self::shutdown_and_wait)
+    /// can force each one's socket closed *synchronously* — a plain
+    /// `SockRef::shutdown` syscall, not an async task abort whose actual
+    /// drop timing depends on the runtime scheduling this node's own
+    /// accept-loop task for cancellation. See `shutdown`'s own doc for why
+    /// that distinction is load-bearing: a `task.abort()` alone can leave a
+    /// killed node's listener still accepting (or its in-flight handler
+    /// still processing) for a stretch under real scheduler contention,
+    /// which is indistinguishable, to `forward_to_tablet_leader`'s own
+    /// hinted-retry chase, from a merely slow-but-live peer — burning a
+    /// full [`FORWARD_HOP_TIMEOUT`]/[`HINTED_FORWARD_HOP_TIMEOUT`] on a node
+    /// that is actually gone. Each entry's own accept-loop task still lives
+    /// in `tasks` above and is still aborted exactly as before; this is a
+    /// second, independent handle on the same socket, not a replacement.
+    hard_close_listeners: Vec<Arc<TcpListener>>,
     /// This node's own edge state (ADR 0031 PR2 — cheap to clone, `Arc`-wrapped
     /// internally), kept so [`shutdown_graceful`](Self::shutdown_graceful) can
     /// gracefully halt every CP group *this node* hosts before the hard abort in
@@ -6391,13 +6428,15 @@ impl Node {
             encryption_key.clone(),
         )
         .await?;
-        let client_listener = TcpListener::bind(addrs.client).await?;
+        // `Arc`-wrapped (issue #1060) — see [`BoundNode::client_listener`]'s
+        // own doc for why.
+        let client_listener = Arc::new(TcpListener::bind(addrs.client).await?);
         let client_addr = client_listener.local_addr()?;
         let dynamo_listener = TcpListener::bind(addrs.dynamo).await?;
         let dynamo_addr = dynamo_listener.local_addr()?;
         let admin_listener = TcpListener::bind(addrs.admin).await?;
         let admin_addr = admin_listener.local_addr()?;
-        let intra_listener = TcpListener::bind(addrs.intra).await?;
+        let intra_listener = Arc::new(TcpListener::bind(addrs.intra).await?);
         let intra_addr = intra_listener.local_addr()?;
         let console_listener = TcpListener::bind(addrs.console).await?;
         let console_addr = console_listener.local_addr()?;
@@ -6451,11 +6490,13 @@ impl Node {
             encryption_key.clone(),
         )
         .await?;
-        let client_listener = TcpListener::bind(addrs.client).await?;
+        // `Arc`-wrapped (issue #1060) — see [`BoundNode::client_listener`]'s
+        // own doc for why.
+        let client_listener = Arc::new(TcpListener::bind(addrs.client).await?);
         let client_addr = client_listener.local_addr()?;
         let admin_listener = TcpListener::bind(addrs.admin).await?;
         let admin_addr = admin_listener.local_addr()?;
-        let intra_listener = TcpListener::bind(addrs.intra).await?;
+        let intra_listener = Arc::new(TcpListener::bind(addrs.intra).await?);
         let intra_addr = intra_listener.local_addr()?;
         Ok(BoundControlNode {
             id,
@@ -6504,13 +6545,15 @@ impl Node {
             encryption_key.clone(),
         )
         .await?;
-        let client_listener = TcpListener::bind(addrs.client).await?;
+        // `Arc`-wrapped (issue #1060) — see [`BoundNode::client_listener`]'s
+        // own doc for why.
+        let client_listener = Arc::new(TcpListener::bind(addrs.client).await?);
         let client_addr = client_listener.local_addr()?;
         let dynamo_listener = TcpListener::bind(addrs.dynamo).await?;
         let dynamo_addr = dynamo_listener.local_addr()?;
         let admin_listener = TcpListener::bind(addrs.admin).await?;
         let admin_addr = admin_listener.local_addr()?;
-        let intra_listener = TcpListener::bind(addrs.intra).await?;
+        let intra_listener = Arc::new(TcpListener::bind(addrs.intra).await?);
         let intra_addr = intra_listener.local_addr()?;
         let console_listener = TcpListener::bind(addrs.console).await?;
         let console_addr = console_listener.local_addr()?;
@@ -6733,14 +6776,87 @@ impl Node {
     /// window closed for the control plane** (issue #939):
     /// [`halt_local_control`](Self::halt_local_control) is the equally cheap,
     /// synchronous control-plane counterpart.
+    ///
+    /// **Also forces the client + intra listeners' own OS sockets closed —
+    /// synchronously, before any task is even asked to cancel** (issue
+    /// #1060): see [`hard_close_client_and_intra_sockets`](Self::hard_close_client_and_intra_sockets)'s
+    /// own doc for why `task.abort()` below is not enough on its own for a
+    /// simulated-crash test to make this node refuse a fresh connection
+    /// promptly and reliably.
     pub fn shutdown(&self) {
         self.edge.halt_hosted_cp_groups();
         self.halt_local_control();
+        self.hard_close_client_and_intra_sockets();
         for task in &self.tasks {
             task.abort();
         }
         for env in &self.envs {
             env.shutdown();
+        }
+    }
+
+    /// Force this node's client + intra listeners' own underlying OS sockets
+    /// closed right now, synchronously — a plain `shutdown(2)` syscall via
+    /// [`socket2::SockRef`], not an async task cancellation (issue #1060).
+    ///
+    /// **Why `task.abort()` alone isn't sufficient.** `serve_requests`'s own
+    /// accept-loop task owns its `TcpListener` (and, via its own
+    /// `tokio::task::JoinSet`, every handler it has accepted) — aborting
+    /// that task requests its future be dropped, which *would* close the
+    /// listener and cascade-abort every handler (issue #1010), but only once
+    /// the runtime actually gets around to scheduling that drop. Under
+    /// ordinary load this happens in microseconds; under real CPU
+    /// contention (a loaded CI runner, several sibling test binaries
+    /// competing for the same physical cores) it can legitimately take
+    /// much longer — and in the meantime, a fresh `TcpStream::connect` to
+    /// this node's own intra port can still succeed (the kernel completes
+    /// the handshake straight into the listen backlog, independent of
+    /// whether any userspace `accept()` call is still running), leaving
+    /// the caller's own read blocked with no answer coming. That is
+    /// indistinguishable, to [`relay_request_with_timeout`]'s own two-
+    /// sentinel split, from a merely slow-but-live peer: it resolves as
+    /// [`RELAY_HOP_TIMEOUT`], not the fast, confirmed-dead
+    /// [`RELAY_TRANSPORT_FAILURE`] a genuinely gone node should produce —
+    /// which is exactly the distinction `forward_to_tablet_leader`'s own
+    /// hinted-retry chase depends on to never waste a `Guessed` hop's
+    /// [`FORWARD_HOP_TIMEOUT`] cap, and never a *later* `Hinted` hop's much
+    /// larger [`HINTED_FORWARD_HOP_TIMEOUT`] cap, chasing a node that is
+    /// actually gone: a stale "not leader here, try the node I killed"
+    /// hint from one of the tablet's surviving replicas (who haven't yet
+    /// detected the loss themselves) is the *expected* first answer right
+    /// after a kill, and the chase's own design deliberately gives that
+    /// hint's target a generous, uncapped retry on the reasoning that it
+    /// might be a genuinely slow-but-live leader — a reasoning that only
+    /// holds if a truly dead candidate answers fast enough to be told
+    /// apart from one. `Node::shutdown`/[`shutdown_and_wait`](Self::shutdown_and_wait)
+    /// (the two "simulate a crash" primitives every fault-injection test in
+    /// this crate builds on) are the one place that needs this property to
+    /// hold unconditionally — a real killed **process** gets it for free
+    /// (the OS reclaims every fd, RST-ing any in-flight connection,
+    /// instantly and independent of anything userspace was doing), and
+    /// this closes the gap between that and an in-process simulated one.
+    ///
+    /// A plain `shutdown(2)` on a *listening* socket (as opposed to a
+    /// connected one) is the right primitive for this on Linux: the kernel
+    /// answers any further `connect()` to it with an immediate refusal/reset
+    /// rather than queuing it, and unblocks this node's own already-parked
+    /// `accept()` call with an error — so the accept-loop task notices and
+    /// exits on its own besides, ahead of (and independent of) the
+    /// `task.abort()` calls that follow. `SockRef::from` borrows the
+    /// existing `Arc<TcpListener>` (see [`hard_close_listeners`](Self::hard_close_listeners)'s
+    /// own doc) — no `dup`, no raw fd, no `unsafe` (this crate forbids it).
+    /// A `shutdown` on an already-shut-down socket is a harmless no-op
+    /// error, silently ignored — this makes the whole method idempotent,
+    /// matching `shutdown`'s own contract, and safe to call from both
+    /// `shutdown` and `shutdown_and_wait`. Deliberately **not** called from
+    /// `Drop for Node` — that impl's own doc states it leaves this node's
+    /// tasks (and, by the same reasoning, its listeners) running exactly as
+    /// a `Node` dropped with no explicit `shutdown()` call always has;
+    /// closing sockets there would be a behavior change to an unrelated,
+    /// already-settled contract, not this fix's concern.
+    fn hard_close_client_and_intra_sockets(&self) {
+        for listener in &self.hard_close_listeners {
+            let _ = socket2::SockRef::from(listener.as_ref()).shutdown(std::net::Shutdown::Both);
         }
     }
 
@@ -6775,9 +6891,15 @@ impl Node {
     /// not just the accept loop itself. See `serve_requests`'s own doc for
     /// the full mechanism and why it isn't instead routed through
     /// `ProdEnv`'s own abort registry.
+    ///
+    /// **Also forces the client + intra listeners' own OS sockets closed
+    /// synchronously, before any task is asked to cancel** (issue #1060) —
+    /// see [`hard_close_client_and_intra_sockets`](Self::hard_close_client_and_intra_sockets)'s
+    /// own doc.
     pub async fn shutdown_and_wait(&self) {
         self.edge.halt_hosted_cp_groups();
         self.halt_local_control();
+        self.hard_close_client_and_intra_sockets();
         for task in &self.tasks {
             task.abort();
         }
@@ -6964,11 +7086,15 @@ pub struct BoundControlNode {
     /// [`start_control_with`](Self::start_control_with)'s doc).
     dir: PathBuf,
     internal_addr: SocketAddr,
-    client_listener: TcpListener,
+    /// `Arc`-wrapped (issue #1060) — see [`BoundNode::client_listener`]'s own
+    /// doc for why.
+    client_listener: Arc<TcpListener>,
     client_addr: SocketAddr,
     admin_listener: TcpListener,
     admin_addr: SocketAddr,
-    intra_listener: TcpListener,
+    /// `Arc`-wrapped (issue #1060) — see [`BoundNode::intra_listener`]'s own
+    /// doc for why.
+    intra_listener: Arc<TcpListener>,
     intra_addr: SocketAddr,
     /// See [`BoundNode::advertise_host`]'s doc.
     advertise_host: Option<String>,
@@ -7228,6 +7354,10 @@ impl BoundControlNode {
         )
         .await?;
 
+        // Issue #1060: see the combined-node path's identical comment above
+        // `BoundNode::start_with_growth`'s own `spawn_common_tail` call.
+        let hard_close_client_listener = self.client_listener.clone();
+        let hard_close_intra_listener = self.intra_listener.clone();
         let (ctx, common_tail_tasks) = spawn_common_tail(
             ControlHandle::Local(raft.clone()),
             edge,
@@ -7359,6 +7489,7 @@ impl BoundControlNode {
             raft: ControlHandle::Local(raft),
             envs,
             tasks,
+            hard_close_listeners: vec![hard_close_client_listener, hard_close_intra_listener],
             edge: ctx.edge.clone(),
             client_addr: self.client_addr,
             dynamo_addr: None,
@@ -7385,13 +7516,17 @@ pub struct BoundDataNode {
     /// building-block rationale.
     dir: PathBuf,
     internal_addr: SocketAddr,
-    client_listener: TcpListener,
+    /// `Arc`-wrapped (issue #1060) — see [`BoundNode::client_listener`]'s own
+    /// doc for why.
+    client_listener: Arc<TcpListener>,
     client_addr: SocketAddr,
     dynamo_listener: TcpListener,
     dynamo_addr: SocketAddr,
     admin_listener: TcpListener,
     admin_addr: SocketAddr,
-    intra_listener: TcpListener,
+    /// `Arc`-wrapped (issue #1060) — see [`BoundNode::intra_listener`]'s own
+    /// doc for why.
+    intra_listener: Arc<TcpListener>,
     intra_addr: SocketAddr,
     /// animusd console's own listener (ADR 0052's "AnimusDB Data Console") — a data-only
     /// node hosts real CP-data tablets, so it always binds one; see
@@ -7744,6 +7879,10 @@ impl BoundDataNode {
             change_rates: ChangeRateTracker::default(),
             request_rates: RequestRateTracker::default(),
         };
+        // Issue #1060: see the combined-node path's identical comment above
+        // `BoundNode::start_with_growth`'s own `spawn_common_tail` call.
+        let hard_close_client_listener = self.client_listener.clone();
+        let hard_close_intra_listener = self.intra_listener.clone();
         let (ctx, common_tail_tasks) = spawn_common_tail(
             control,
             edge.clone(),
@@ -8019,6 +8158,7 @@ impl BoundDataNode {
             raft: ctx.control.clone(),
             envs,
             tasks,
+            hard_close_listeners: vec![hard_close_client_listener, hard_close_intra_listener],
             edge: ctx.edge.clone(),
             client_addr: self.client_addr,
             dynamo_addr: Some(self.dynamo_addr),
@@ -13962,7 +14102,13 @@ async fn median_split_key<E: Env>(group: &CpGroup<E>) -> Option<Vec<u8>> {
 /// at most `debug` if it was merely cancelled/aborted (the ordinary
 /// shutdown path, not a defect).
 async fn serve_requests(
-    listener_socket: TcpListener,
+    // `Arc`-wrapped (issue #1060) — this function only ever calls `.accept()`
+    // via `&self`, so the `Arc` costs nothing extra here; it exists so
+    // `Node::shutdown`/`Node::shutdown_and_wait` can hold their own clone of
+    // the SAME listener and force its underlying OS socket closed
+    // synchronously, without depending on this task's own cancellation/drop
+    // timing to release it — see `Node::shutdown`'s own doc.
+    listener_socket: Arc<TcpListener>,
     ctx: ClientCtx,
     listener: ListenerKind,
     tls: Option<tokio_rustls::TlsAcceptor>,
@@ -17681,6 +17827,7 @@ mod confirm_futility_tests {
 mod forward_transport_failure_tests {
     use std::net::SocketAddr;
     use std::path::Path;
+    use std::sync::Arc;
     use std::time::Duration;
 
     use tokio::time::{sleep, timeout};
@@ -17909,6 +18056,111 @@ mod forward_transport_failure_tests {
                 node.shutdown_graceful().await;
             }
         }
+    }
+
+    /// Issue #1060 regression, isolating the actual mechanism behind the
+    /// CI flake in `forward_to_tablet_leader_survives_a_dead_first_guess`
+    /// above, one layer down from the whole forwarding chase: `Node::
+    /// shutdown()`'s own listener teardown, not the chase's candidate
+    /// selection. See `Node::hard_close_client_and_intra_sockets`'s own doc
+    /// for the full mechanism this proves.
+    ///
+    /// **Root cause, confirmed by direct measurement (not assumed) before
+    /// this fix**: `shutdown()` only `task.abort()`s the intra listener's
+    /// accept-loop task; `abort()` merely *requests* cancellation, and the
+    /// actual drop that closes the listener's OS socket only happens once
+    /// the tokio runtime gets around to scheduling it. Under real CPU
+    /// contention that can take much longer than a hinted-retry hop's own
+    /// [`FORWARD_HOP_TIMEOUT`]/[`HINTED_FORWARD_HOP_TIMEOUT`] cap — in the
+    /// meantime a fresh `TcpStream::connect` to the "killed" node's intra
+    /// port can still succeed (the kernel completes the handshake straight
+    /// into the listen backlog, independent of whether any `accept()` call
+    /// is currently running), so a hop to it resolves as
+    /// [`RELAY_HOP_TIMEOUT`] rather than the fast, confirmed-dead
+    /// [`RELAY_TRANSPORT_FAILURE`] the chase's own hinted-retry logic
+    /// depends on to tell a genuinely dead candidate apart from a merely
+    /// slow-but-live one (see `forward_to_tablet_leader`'s own doc) — which
+    /// is exactly what lets a stale "not leader here, try the node I just
+    /// killed" hint from a surviving replica cost a full
+    /// `HINTED_FORWARD_HOP_TIMEOUT` chasing a node that never answers.
+    ///
+    /// This test proves the fix directly, with no cluster, no Raft, no
+    /// forwarding chase at all: a bare `Node::bind`/`start` and `shutdown`,
+    /// then an immediate (no sleep) fresh connect attempt to its own intra
+    /// port, asserting it fails **fast** — well under one
+    /// [`FORWARD_HOP_TIMEOUT`] (2s), the property the whole chase's
+    /// candidate-classification logic relies on. Confirmed red-before/
+    /// green-after by temporarily commenting out the
+    /// `hard_close_client_and_intra_sockets()` calls in `shutdown`/
+    /// `shutdown_and_wait`: with them removed, this test is flaky exactly
+    /// the way the CI report describes — usually fast (a healthy runtime
+    /// schedules the abort's drop quickly), but capable of taking seconds
+    /// under load, confirmed here by pinning every tokio worker thread busy
+    /// with a tight spin loop for the whole test — a fully deterministic,
+    /// in-process stand-in for "a loaded CI runner", needing no external
+    /// process and no real multi-second wait either way.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_makes_a_killed_nodes_intra_port_refuse_a_fresh_connect_fast_issue_1060() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut nodes = bring_up(1, dir.path()).await;
+        let node = nodes.pop().unwrap();
+        let intra_addr = node.intra_addr();
+
+        // Pin every worker thread of this 2-thread runtime busy for a short
+        // window right around the shutdown/connect race — the deterministic
+        // stand-in for "a loaded CI runner" the doc above describes. Spawned
+        // as plain tasks (not `env.spawn_task`, which would count as a
+        // determinism-seam violation outside `SimEnv`/`ProdEnv` — this is a
+        // real-socket `ProdEnv` test already, so a raw `tokio::spawn` here
+        // is the same idiom every other helper in this module already uses).
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let spinners: Vec<_> = (0..2)
+            .map(|_| {
+                let stop = stop.clone();
+                tokio::spawn(async move {
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        // A pure CPU spin with no `.await` point starves this
+                        // worker thread of any other scheduling until the
+                        // whole runtime's own cooperative task budget forces
+                        // a yield — the same "worker thread genuinely busy"
+                        // shape real CPU contention produces, without a
+                        // second process or a real multi-second sleep.
+                        for _ in 0..10_000 {
+                            std::hint::black_box(1 + 1);
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+            })
+            .collect();
+
+        node.shutdown();
+        let started = std::time::Instant::now();
+        let result = timeout(
+            Duration::from_secs(2), // FORWARD_HOP_TIMEOUT's own cap
+            tokio::net::TcpStream::connect(intra_addr),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for s in spinners {
+            let _ = s.await;
+        }
+
+        assert!(
+            matches!(result, Ok(Err(_))),
+            "a killed node's intra port must refuse a fresh connect, not accept it into a \
+             lingering listener/backlog: {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "pre-fix: `shutdown()`'s own listener teardown depends on the runtime scheduling \
+             an aborted task's drop, which can take seconds under load -- a fixed `shutdown` \
+             closes the socket synchronously, so a fresh connect refuses in microseconds \
+             regardless of scheduler contention; 500ms is a generous margin over that, just \
+             not over the old scheduling-dependent behavior: took {elapsed:?}"
+        );
     }
 }
 
