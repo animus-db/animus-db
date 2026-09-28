@@ -32,6 +32,11 @@
   reconfiguration) whose peers keep addressing it during the teardown
   grace window accumulates frames forever. See "Stream teardown" below for
   the full design.
+  **Amended 2026-09-28 (second): a per-stream inbox cap.** The same
+  measurement found a second, larger-magnitude cause `close_stream` cannot
+  reach at all: a stream whose consumer never started polling in the first
+  place, so nothing ever calls `close_stream` for it. See "Per-stream inbox
+  cap" below.
 - **Date:** 2026-08-06
 
 ## Context
@@ -445,6 +450,208 @@ group's `HeartbeatInbox` correctly before this change (`unregister_hosted`,
 called from the consensus loop's own `halted` branch before `stopped` is
 set) — investigated as part of this amendment on the suspicion it was the
 same class of leak, confirmed it was not.
+
+## Per-stream inbox cap (2026-09-28 amendment)
+
+`close_stream` (above) fixes the "retired-tablet residue" half of the
+measurement that motivated it — a stream whose tablet this node genuinely
+hosted, torn down when its own driver stopped. It does nothing for the
+*other*, larger-magnitude half of that same measurement (see
+`docs/lessons/code-patterns/2026-09-28-an-unbounded-per-stream-queue-is-
+invisible-until-it-has-its-own-observability.md` for the full incident):
+**a stream whose consumer never started polling at all** — a placement
+rebalance or an in-place split fork briefly names this node a
+learner/bootstrap-voter for a tablet, its leader starts replicating (real
+`AppendEntries`/`InstallSnapshot` payload, not bare heartbeats) before this
+node's own reconciler ever calls `start_hosted` for it, and a fast
+subsequent rebalance reassigns the replica away before it does. Nothing
+here ever locally recognizes this tablet as "this node's business" — there
+is no `LocalState`/`Reconciler::hosted` entry, so `host::Reconciler::
+teardown` never runs for it and `close_stream` is never called. Measured
+live: 26 MB/590 frames and 12.9 MB/343 frames queued for two such streams,
+`ever_polled: false`, still growing at measurement time.
+
+**Decision: bound every stream's queue with a per-stream, configurable
+byte + frame cap, drop-oldest on overflow.** `Network` gains no new
+required method for this (unlike `close_stream`) — both `ProdEnv`/`SimEnv`
+enforce it internally at the same push site each already has
+(`ProdEnv::spawn_pump`, `SimEnv`'s `fire_event` `Deliver` arm), and each
+exposes a plain setter (`ProdEnv::set_inbox_cap`, `Simulator::
+set_inbox_cap`) rather than widening the trait, mirroring how `NetConfig`/
+`DiskConfig` are configured on `Simulator` rather than on `Network`/`Disk`
+themselves.
+
+```rust
+pub struct InboxCap {
+    pub max_bytes: usize,
+    pub max_frames: usize,
+}
+```
+
+**Consumer classification (why drop-oldest is safe, and where it doesn't
+even apply).** Every consumer of a `recv_stream`-fed inbox in this
+codebase was audited for whether it can tolerate a dropped frame, and —
+found only after an initial version of this cap shipped and regressed a
+real test, see "The reserved-stream exemption" below — whether it even
+*needs* to be capped at all:
+
+| Stream | Consumer | Capped? | Tolerates loss? | Why |
+|---|---|---|---|---|
+| `tablet_id` (`animus-cp-data`) | `RaftKvNode::drive` | **Yes** | Yes | Raft: a dropped `AppendEntries`/vote/heartbeat is retried by the leader's own next heartbeat tick or re-election; `RaftCore` never blocks waiting on one specific in-flight message. This is the ONLY class the "never-hosted" leak this PR exists to fix actually happens to (a tablet's own driver is the one thing conditionally hosted, not started at node bind time) — see below. |
+| `PRIMARY_STREAM` (control plane) | control-plane `RaftNode::drive` | **No — exempt** | Yes | Same Raft retry argument, same core — but the control group's own membership is static/slow-changing (no per-tablet "might never start" gap), so exempting it costs nothing and avoids a special case. |
+| `HEARTBEAT_BATCH_STREAM` (`u64::MAX - 2`) | `HeartbeatBatcher` | **No — exempt** | Yes | A coalesced heartbeat frame is itself best-effort (ADR 0044 phase 2); shares its stream id with `RELAY_STREAM` (see that row), so it inherits the same exemption either way. |
+| `SEGMENT_STREAM`/`BACKUP_SEGMENT_STREAM` (`u64::MAX`/`u64::MAX - 1`) | `ClusterSegmentStore` serve loop | **No — exempt** | Yes, because the *caller* times out and retries, not because the protocol is loss-tolerant per se | Request/response keyed by `req_id`, a whole segment/change-log object per frame (can legitimately be several hundred KB) — see below. |
+| `RELAY_STREAM` (`u64::MAX - 2`, sim-only) | `SimRelayClient` | **No — exempt** | Yes, with a **finite** retry budget, unlike Raft's indefinite one | The class that actually regressed a real test before the exemption existed — see below. |
+
+**Only ordinary per-tablet streams (`stream = tablet_id`) are capped.**
+`PRIMARY_STREAM` and the reserved block of ids just below `u64::MAX`
+(`animus_env::is_reserved_stream`) are exempt from `InboxCap` entirely —
+`enforce_inbox_cap` returns immediately for them, in both `ProdEnv` and
+`SimEnv`, before ever touching `queues`/`inboxes`. Two independent reasons
+converge on the same exemption:
+
+1. **None of them has the "never-hosted" liveness gap this cap exists to
+   bound.** Every one of these streams' consumer is a serve loop bound to
+   the *node's* lifetime (`ClusterSegmentStore`'s serve loop, the
+   `HeartbeatBatcher`'s demux, `SimRelayClient::serve`, the control
+   plane's own `RaftNode::drive`) — it starts once, at node bind, and runs
+   for as long as the node does. A tablet's own stream is the only one
+   whose consumer is *conditional* on a reconciler tick deciding to host
+   that specific tablet, which is exactly the gap a leader can outrun (the
+   scenario this whole PR reproduces).
+2. **Several of them legitimately carry a single frame far larger than an
+   ordinary tablet's own Raft entry.** `RELAY_STREAM` carries a whole
+   forwarded `ClientRequest` — up to DynamoDB's own largest single-call
+   payload (`animus_dynamo::limits::MAX_BATCH_WRITE_REQUEST_BYTES`/
+   `MAX_BATCH_GET_RESPONSE_BYTES`, 16 MB) — and, per `forwarding.rs`'s own
+   `forward_to_tablet_leader`, **re-sends that same full payload on every
+   hop** of its chase toward the real leader (up to a handful of hops
+   within `CLIENT_TIMEOUT` = 10s, each capped at `FORWARD_HOP_TIMEOUT`/
+   `HINTED_FORWARD_HOP_TIMEOUT`). A hop that times out doesn't cancel the
+   in-flight send — its request or reply can still land late, queuing
+   behind the next hop's own attempt. `SEGMENT_STREAM`/
+   `BACKUP_SEGMENT_STREAM` carry a whole `SegmentStore` object per frame,
+   sized by the stream-shard sealing config, not by anything this seam
+   controls. **The regression this found**: an earlier version of this
+   PR capped every stream uniformly at the 8 MiB/4096-frame default sized
+   from ordinary tablet-replication traffic — `cargo test --workspace`
+   caught it immediately, `animusd`'s `sim_cluster_dynamo_page_size_cap`
+   suite (four tests seeding ~300 KB items and paginating `Query`/`Scan`
+   over `MAX_QUERY_SCAN_PAGE_BYTES`-sized pages) failing with a real,
+   client-visible `ServiceUnavailable` — `forward to tablet leader: budget
+   exhausted chasing the leader (last hop: sim relay: timed out waiting
+   for a reply)` — because a multi-hop chase's own earlier, still-relevant
+   reply was being evicted by the cap before the chase's retry budget
+   itself ran out. Confirmed via a base-branch bisect (the same seeds pass
+   cleanly with this PR's other changes but without the cap) that this was
+   a genuine regression, not a pre-existing flake. Reverted to base and
+   reproduced deterministically on this branch before landing the
+   exemption; green again once the reserved-stream check above skips
+   enforcement for these streams' ids.
+
+**For the two classes that ARE genuinely finite-budget request/response**
+(`ClusterSegmentStore`, `RELAY_STREAM`) — exempt from the cap, but still
+worth confirming their own retry story holds on its own terms, since a
+future change *could* re-cap them:
+
+- `ClusterSegmentStore::put_to_targets`/`get_from`/`delete_from`
+  (`crates/animus-cp-data/src/cluster_segment_store.rs`) register a
+  correlating `req_id`, send the request, then poll a shared `Pending`
+  slot (`peek_reply`) against an explicit `env.now()`-derived deadline —
+  `PUT_TIMEOUT`/`DELETE_TIMEOUT` = 10s, `FETCH_ATTEMPT_TIMEOUT` = 3s,
+  each with its own ~20ms `env.sleep` poll interval (`put_to_targets`'s own
+  loop, `cluster_segment_store.rs:544-571`, is the representative shape —
+  `get_from`/`delete_from` are the same pattern). This is the `Env`-seam
+  form of a timeout (no raw `tokio::time::timeout`, since this crate is
+  `E: Env`-generic and must stay `SimEnv`-drivable) — a dropped request or
+  reply frame surfaces as an ordinary deadline expiry, handled exactly
+  like a slow or unreachable replica already is: `put_to_targets`/
+  `repair`'s own fan-out simply reports the failure (or, for `repair`,
+  degrades to fewer replicas) rather than blocking forever. The backup
+  capture/restore drivers that ride `BACKUP_SEGMENT_STREAM` reuse the
+  identical request path — same deadline, same retry, no separate
+  reasoning needed.
+- `forward_to_tablet_leader`/`SimRelayClient` (`animusd::forwarding`,
+  `animus-node::sim_relay`) — the class that actually regressed, above —
+  also has a real, bounded retry budget (`CLIENT_TIMEOUT` overall, capped
+  per-hop timeouts), so a dropped frame is never an unbounded hang either.
+  The difference from the Raft/segment-store cases is that this budget is
+  **finite and shared across every hop of one client operation**, not an
+  indefinitely-repeating background cadence — which is exactly why capping
+  this stream at a size sized for ordinary Raft traffic broke it: losing
+  one hop's own reply here can exhaust the whole operation's budget, where
+  losing one Raft heartbeat merely costs one more retry round with
+  unlimited rounds left. This is the reasoning that ultimately motivated
+  exempting it rather than trying to size a cap around it.
+
+Since every capped consumer (ordinary tablet streams) resends on Raft's
+own indefinite cadence, and every exempt stream either has no
+"never-hosted" gap to begin with or carries payloads/retry budgets a
+tablet-sized cap was never going to fit safely, dropping the *oldest*
+queued frame on a capped stream to make room for a newer one loses at
+most "one round's worth of a message that will be resent, with more
+rounds always available" — never a request a caller can genuinely run out
+of retries for, and never state a durability claim depends on (ADR 0003's
+"an ack means fsynced" rule is about the `Disk` seam, not this one —
+nothing here is a durability acknowledgment).
+
+**The cap's derivation** (for the only streams it actually applies to —
+ordinary per-tablet streams; see the exemption above for `PRIMARY_STREAM`
+and every reserved stream) — see [`animus_env::InboxCap`]'s own doc
+(source of truth for the exact numbers, kept there rather than duplicated
+stale here) for the full math. In outline: `animus_control::raft::
+SNAPSHOT_CHUNK_BYTES` (64 KiB per `InstallSnapshot` chunk, ADR 0009's
+2026-09-27 amendment) and `animus_control::raft::MAX_APPEND_ENTRIES_BATCH`
+(512 entries, each ordinarily far under `animus_dynamo::limits::
+MAX_ITEM_SIZE_BYTES`'s 400 KB) bound the largest *legitimate single frame*
+this codebase ever sends; the live measurement of a lagging-but-live
+tablet stream (~0.6–1.9 MB, draining) bounds legitimate *backlog*. The
+chosen default — **8 MiB / 4096 frames** — sits comfortably above both
+(~4x the measured legitimate-lag peak) while staying well below where the
+two leaked streams above were already caught still growing, so a
+genuinely abandoned stream is now bounded to a small, fixed multiple of
+the worst realistic backlog instead of growing without limit for the life
+of the process.
+
+**Why no global (total-across-streams) cap.** The per-stream cap bounds
+each *individual* leaked stream, but does it bound the *sum* across every
+stream a long-running node might ever leak this way? The `close_stream`
+teardown above already reduces case 1 (retired-tablet residue) to
+**zero** steady-state bytes, not merely a capped amount — so only case 2
+(never-hosted) contributes to the residual. A never-hosted leak requires a
+placement/reconfigure/fork event to have named this node a candidate
+replica for a *specific* tablet id, at least once; the same tablet id
+being named again later either results in this node genuinely hosting it
+(closing to zero via ordinary teardown) or repeating the *same* capped
+stream id (not a second, additional leaked stream — `Demux`/`SimEnv` key
+on the stream id itself, so a repeat is bounded rebound of the same entry,
+not growth). So the number of *distinct* streams that can ever carry this
+residual is bounded by the number of distinct tablet ids this cluster has
+ever minted (tablet ids are never reused, ADR 0044) that this node was
+ever named a candidate replica for — a quantity that grows only in step
+with real auto-split activity (itself throttled by the bytes/change-rate/
+ops-rate triggers, ADR 0034/0042 §14/0067), not with adversarial or
+per-request traffic. This is the same class of "grows with real, useful
+cluster history, not with unmediated request volume" property the
+`Metadata` tablet map itself already has (ADR 0044's "tablet ids are never
+reused" is an accepted, pre-existing bound on a different structure with
+an identical growth shape) — so a global cap was judged unnecessary for
+this PR; `stream_meta`/`closed`'s own per-stream bookkeeping (a few dozen
+bytes each, not the frame queue itself) already inherits that same bound
+without capping. Revisit if a future workload's split/reconfigure rate
+ever makes this residual bound worth watching operationally — the
+stream-count observability already flagged as a deferred follow-up
+(self-review point (b) above) would be the natural place to surface it.
+
+**What this does NOT change.** No wire/persisted format (ADR 0073 is
+unaffected — this is purely an in-memory receive-side backpressure
+policy); no new RNG draw or timeline event shape in `SimEnv` (the cap
+enforcement is a synchronous, deterministic map operation, traced exactly
+like an existing drop reason); `InstallSnapshot`/compaction logic is
+untouched — the cap only ever discards a frame already sitting in a
+`Demux`/`SimEnv` queue, never anything mid-flight in the snapshot transfer
+protocol itself (a chunk still in `InstallSnapshot`'s own resend-tracking
+state, not yet delivered, is unaffected by this).
 
 ## Consequences
 

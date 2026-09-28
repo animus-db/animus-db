@@ -865,12 +865,27 @@ pub enum Metric {
     /// stream id points at a peer that never learned the tablet moved off
     /// this node.
     DemuxFramesDroppedClosed,
+    /// A frame was dropped because its stream's queue was already at (or
+    /// past) its configured cap ([`crate::InboxCap`], ADR 0026's 2026-09-28
+    /// inbox-cap amendment — the second half of the same amendment
+    /// `DemuxFramesDroppedClosed` belongs to, for the case `close_stream`
+    /// itself cannot reach: a stream whose consumer never started polling
+    /// at all, so nothing ever calls `close_stream` for it). Incremented at
+    /// `spawn_pump`'s own drop-oldest enforcement, once per evicted frame —
+    /// so this counts the OLDEST frame being evicted to make room for a
+    /// newer one, never the newly-arrived frame itself (which is always
+    /// kept). Expected to stay at zero for a healthy cluster (a live
+    /// consumer's ordinary lag stays well under the cap); a nonzero and
+    /// climbing rate against one stream id points at exactly the
+    /// never-hosted-consumer case this cap exists to bound rather than let
+    /// grow without limit.
+    DemuxFramesDroppedOverflow,
 }
 
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 101] = [
+    pub const ALL: [Metric; 102] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -972,6 +987,7 @@ impl Metric {
         Metric::DemuxQueuedFrames,
         Metric::DemuxQueuedBytes,
         Metric::DemuxFramesDroppedClosed,
+        Metric::DemuxFramesDroppedOverflow,
     ];
 
     /// The stable exported name of this metric (snake_case, used as the text
@@ -1080,6 +1096,7 @@ impl Metric {
             Metric::DemuxQueuedFrames => "demux_queued_frames",
             Metric::DemuxQueuedBytes => "demux_queued_bytes",
             Metric::DemuxFramesDroppedClosed => "demux_frames_dropped_closed",
+            Metric::DemuxFramesDroppedOverflow => "demux_frames_dropped_overflow",
         }
     }
 

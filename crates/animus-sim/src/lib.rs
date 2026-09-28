@@ -39,8 +39,8 @@ use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use animus_env::{
-    BoxFuture, Clock, Disk, Env, Envelope, Nanos, Network, NodeId, PRIMARY_STREAM, Rng as RngTrait,
-    Spawner, UnixMillis,
+    BoxFuture, Clock, Disk, Env, Envelope, InboxCap, Nanos, Network, NodeId, PRIMARY_STREAM,
+    Rng as RngTrait, Spawner, UnixMillis,
 };
 use futures::task::ArcWake;
 use rand::{RngCore, SeedableRng};
@@ -564,6 +564,26 @@ struct SimState {
     // single-stream-per-node inbox.
     inboxes: BTreeMap<(NodeId, u64), VecDeque<Envelope>>,
     recv_wakers: BTreeMap<(NodeId, u64), Waker>,
+    /// Payload bytes currently queued per `(node, stream)`, maintained
+    /// incrementally alongside `inboxes` on the exact same push
+    /// (`fire_event`'s `Deliver` arm)/pop (`Recv::poll`) sites — the
+    /// `SimEnv` twin of `ProdEnv`'s `Demux::stream_meta`'s `bytes` field
+    /// (ADR 0026, 2026-09-28 inbox-cap amendment). Exists solely to enforce
+    /// `inbox_cap` in O(1) per frame rather than summing a `VecDeque` of
+    /// payload lengths on every push; never read for any decision other
+    /// than that cap. An entry with no bytes left is not proactively
+    /// pruned (mirrors `stream_meta` never pruning on empty) — only
+    /// [`SimEnv::close_stream`]/[`Simulator::crash`]/[`Simulator::stop`]
+    /// remove it, alongside `inboxes`/`recv_wakers`.
+    inbox_bytes: BTreeMap<(NodeId, u64), usize>,
+    /// The per-stream inbox backpressure cap enforced at push time (ADR
+    /// 0026, 2026-09-28 inbox-cap amendment) — see [`InboxCap`]'s own doc
+    /// for the derivation. One value for the whole simulated world (mirrors
+    /// `net`/`disk_cfg`'s own global-default shape, not a per-node
+    /// override — nothing in this codebase needs a *different* cap per
+    /// node, only a smaller one for the whole run under test). Defaults to
+    /// [`InboxCap::default`]; [`Simulator::set_inbox_cap`] replaces it.
+    inbox_cap: InboxCap,
     /// Streams explicitly retired via [`SimEnv::close_stream`] and not yet
     /// reopened by a subsequent `recv_stream` (ADR 0026, 2026-09-28
     /// amendment) — the `SimEnv` twin of `ProdEnv`'s `Demux::closed`. A
@@ -630,6 +650,60 @@ impl SimState {
             .take_while(|(n, _)| n == node)
             .cloned()
             .collect()
+    }
+
+    /// Enforce `self.inbox_cap` on `(node, stream)`'s queue after a push
+    /// (ADR 0026, 2026-09-28 inbox-cap amendment) — the `SimEnv` mirror of
+    /// `ProdEnv::prod::enforce_inbox_cap`, same drop-oldest semantics: while
+    /// the stream's queue is over either bound, pop its **oldest** frame
+    /// (the just-pushed newest frame is never the one evicted), trace it
+    /// (`TraceEvent::Drop { reason: "inbox-overflow", .. }`, the same shape
+    /// a crashed-node/partitioned-link/closed-stream drop already uses),
+    /// and decrement `inbox_bytes` to match. Draws no RNG and schedules no
+    /// timeline event — a synchronous, deterministic map operation, so this
+    /// does not perturb the byte-identical-trace guarantee any differently
+    /// than any other deterministic bookkeeping step already does. A plain
+    /// loop rather than a single `if` for the same reason `ProdEnv`'s
+    /// sibling is: shrinking `inbox_cap` at runtime
+    /// ([`Simulator::set_inbox_cap`]) can leave a queue more than one frame
+    /// over its new cap at once.
+    fn enforce_inbox_cap(&mut self, node: &NodeId, stream: u64, t: u64) {
+        if animus_env::is_reserved_stream(stream) {
+            // See `animus_env::is_reserved_stream`'s own doc: a reserved,
+            // per-node stream's consumer never has the "might never
+            // start" liveness gap this cap exists to bound, and some
+            // legitimately carry a single frame far larger than an
+            // ordinary tablet's own Raft entry.
+            return;
+        }
+        let cap = self.inbox_cap;
+        let key = (node.clone(), stream);
+        loop {
+            let over_frames = self
+                .inboxes
+                .get(&key)
+                .is_some_and(|q| q.len() > cap.max_frames);
+            let over_bytes = self
+                .inbox_bytes
+                .get(&key)
+                .is_some_and(|&b| b > cap.max_bytes);
+            if !over_frames && !over_bytes {
+                break;
+            }
+            let Some(dropped) = self.inboxes.get_mut(&key).and_then(VecDeque::pop_front) else {
+                break;
+            };
+            if let Some(bytes) = self.inbox_bytes.get_mut(&key) {
+                *bytes = bytes.saturating_sub(dropped.payload.len());
+            }
+            self.trace.push(TraceEvent::Drop {
+                t,
+                from: dropped.from,
+                to: node.clone(),
+                stream,
+                reason: "inbox-overflow",
+            });
+        }
     }
 
     /// The effective network fault/delay model for a message from `from` to
@@ -872,6 +946,8 @@ impl Simulator {
             nodes: BTreeSet::new(),
             inboxes: BTreeMap::new(),
             recv_wakers: BTreeMap::new(),
+            inbox_bytes: BTreeMap::new(),
+            inbox_cap: InboxCap::default(),
             closed_streams: BTreeSet::new(),
             disks: BTreeMap::new(),
             partitions: BTreeSet::new(),
@@ -952,6 +1028,27 @@ impl Simulator {
     /// healthy).
     pub fn set_disk_config_for(&self, node: NodeId, cfg: DiskConfig) {
         self.shared.lock().node_disk_cfg.insert(node, cfg);
+    }
+
+    /// Replace the per-stream inbox backpressure cap (ADR 0026, 2026-09-28
+    /// inbox-cap amendment) — see [`InboxCap`]'s own doc for what it bounds
+    /// and the default's derivation. One value for the whole simulated
+    /// world (mirrors [`set_net_config`](Self::set_net_config)/
+    /// [`set_disk_config`](Self::set_disk_config)'s own global-default
+    /// shape, not a per-node override). Takes effect on the very next
+    /// frame delivered to any stream; a test shrinks this to provoke
+    /// overflow deterministically without needing to actually send
+    /// megabytes of payload. Deterministic by construction — a plain
+    /// setter, no RNG draw, no new timeline event.
+    pub fn set_inbox_cap(&self, cap: InboxCap) {
+        self.shared.lock().inbox_cap = cap;
+    }
+
+    /// The simulated world's current per-stream inbox backpressure cap
+    /// ([`set_inbox_cap`](Self::set_inbox_cap)).
+    #[must_use]
+    pub fn inbox_cap(&self) -> InboxCap {
+        self.shared.lock().inbox_cap
     }
 
     /// Set `node`'s clock skew (signed nanoseconds, applied to `Clock::now()`
@@ -1103,6 +1200,10 @@ impl Simulator {
             if let Some(inbox) = st.inboxes.get_mut(&k) {
                 inbox.clear();
             }
+            // ADR 0026, 2026-09-28 inbox-cap amendment: the byte-count
+            // bookkeeping the cap reads from is volatile too, exactly like
+            // the inbox it mirrors.
+            st.inbox_bytes.remove(&k);
         }
         let waker_keys = SimState::node_prefix_keys(&st.recv_wakers, &node);
         for k in waker_keys {
@@ -1241,6 +1342,10 @@ impl Simulator {
             if let Some(inbox) = st.inboxes.get_mut(&k) {
                 inbox.clear();
             }
+            // ADR 0026, 2026-09-28 inbox-cap amendment: the byte-count
+            // bookkeeping the cap reads from is volatile too, exactly like
+            // the inbox it mirrors.
+            st.inbox_bytes.remove(&k);
         }
         let waker_keys = SimState::node_prefix_keys(&st.recv_wakers, &node);
         for k in waker_keys {
@@ -1661,10 +1766,10 @@ impl Simulator {
                             stream,
                             len,
                         });
-                        st.inboxes
-                            .entry((to.clone(), stream))
-                            .or_default()
-                            .push_back(env);
+                        let key = (to.clone(), stream);
+                        *st.inbox_bytes.entry(key.clone()).or_insert(0) += len;
+                        st.inboxes.entry(key).or_default().push_back(env);
+                        st.enforce_inbox_cap(&to, stream, t);
                         st.recv_wakers.remove(&(to, stream))
                     }
                 }
@@ -1896,6 +2001,7 @@ impl Network for SimEnv {
         // already gone.
         st.inboxes.remove(&key);
         st.recv_wakers.remove(&key);
+        st.inbox_bytes.remove(&key);
         st.closed_streams.insert(key);
     }
 }
@@ -2189,6 +2295,9 @@ impl Future for Recv {
         let mut st = self.shared.lock();
         let key = (self.node.clone(), self.stream);
         if let Some(env) = st.inboxes.get_mut(&key).and_then(VecDeque::pop_front) {
+            if let Some(bytes) = st.inbox_bytes.get_mut(&key) {
+                *bytes = bytes.saturating_sub(env.payload.len());
+            }
             Poll::Ready(env)
         } else {
             st.recv_wakers.insert(key, cx.waker().clone());

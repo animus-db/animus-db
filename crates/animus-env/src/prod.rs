@@ -42,8 +42,8 @@ use tokio::sync::{Mutex, mpsc};
 use crate::nid;
 use crate::tls::server_name_for;
 use crate::{
-    Clock, Disk, Env, Envelope, MaybeTlsStream, Metric, MetricsHandle, Nanos, Network, NodeId, Rng,
-    Spawner, TlsConfig, TlsMaterial, UnixMillis,
+    Clock, Disk, Env, Envelope, InboxCap, MaybeTlsStream, Metric, MetricsHandle, Nanos, Network,
+    NodeId, Rng, Spawner, TlsConfig, TlsMaterial, UnixMillis,
 };
 
 /// A production environment for a single node.
@@ -98,6 +98,14 @@ struct Demux {
     /// "was `close_stream` ever called for this stream, since its last
     /// reopen."
     closed: BTreeSet<u64>,
+    /// The per-stream backpressure cap enforced at push time (ADR 0026,
+    /// 2026-09-28 inbox-cap amendment) — see [`crate::InboxCap`]'s own doc
+    /// for the derivation and [`spawn_pump`]'s drop-oldest enforcement for
+    /// the mechanism. Defaults to [`InboxCap::default`]; changeable at
+    /// runtime via [`ProdEnv::set_inbox_cap`] (a test shrinking it to
+    /// provoke overflow deterministically does not need to reconstruct the
+    /// env).
+    cap: InboxCap,
 }
 
 /// One stream's observability bookkeeping inside [`Demux`] — see that
@@ -496,6 +504,25 @@ impl ProdEnv {
         self.inner.metrics.snapshot().to_text()
     }
 
+    /// Replace this env's per-stream inbox backpressure cap (ADR 0026,
+    /// 2026-09-28 inbox-cap amendment) — see [`crate::InboxCap`]'s own doc
+    /// for what it bounds and the default's derivation. Takes effect on the
+    /// very next frame pushed to any stream (`spawn_pump`'s own
+    /// `enforce_inbox_cap` reads it fresh under the same lock each time);
+    /// shrinking it can also evict an already-over-the-new-cap stream's
+    /// oldest frames on that next push, not only newly-arriving ones. Used
+    /// by a test that wants to provoke overflow deterministically without
+    /// sending megabytes of real payload.
+    pub fn set_inbox_cap(&self, cap: InboxCap) {
+        self.inner.demux.lock().expect("demux poisoned").cap = cap;
+    }
+
+    /// This env's current per-stream inbox backpressure cap ([`set_inbox_cap`](Self::set_inbox_cap)).
+    #[must_use]
+    pub fn inbox_cap(&self) -> InboxCap {
+        self.inner.demux.lock().expect("demux poisoned").cap
+    }
+
     /// A point-in-time snapshot of this env's multiplexed inbox (ADR
     /// 0026): total queued frames/bytes across every stream this env has
     /// ever demultiplexed a frame for, plus the `top_n` largest streams by
@@ -683,6 +710,7 @@ fn spawn_pump(
                 } else {
                     d.stream_meta.entry(stream).or_default().bytes += env.payload.len();
                     d.queues.entry(stream).or_default().push_back(env);
+                    enforce_inbox_cap(&mut d, stream, &metrics);
                     d.wakers.remove(&stream)
                 }
             };
@@ -692,6 +720,47 @@ fn spawn_pump(
         }
     });
     handle.abort_handle()
+}
+
+/// Enforce `d.cap` on `stream` after a push (ADR 0026, 2026-09-28 inbox-cap
+/// amendment): while the stream's queue is over either bound, drop its
+/// **oldest** frame (the front of the `VecDeque` — the newest, just-pushed
+/// frame at the back is never the one evicted) and count it via
+/// [`Metric::DemuxFramesDroppedOverflow`]. A no-op for the overwhelming
+/// majority of pushes (both bounds default far above ordinary traffic —
+/// see [`crate::InboxCap`]'s own doc) and a plain loop rather than a single
+/// `if`, since shrinking `cap` at runtime (`ProdEnv::set_inbox_cap`, what a
+/// test does to provoke overflow at a small scale) can leave a stream more
+/// than one frame over its new cap at once.
+fn enforce_inbox_cap(d: &mut Demux, stream: u64, metrics: &MetricsHandle) {
+    if crate::is_reserved_stream(stream) {
+        // Reserved, per-node streams (PRIMARY_STREAM, and the small block
+        // just below `u64::MAX` — see that function's own doc) never have
+        // this cap's "consumer might never start" liveness gap, and some
+        // legitimately carry a single frame far larger than an ordinary
+        // tablet's own Raft entry — capping them regressed a real
+        // production shape (a forward chase's retry budget exhausted
+        // against spuriously-evicted relay replies) before this exemption
+        // existed.
+        return;
+    }
+    let cap = d.cap;
+    while d
+        .queues
+        .get(&stream)
+        .is_some_and(|q| q.len() > cap.max_frames)
+        || d.stream_meta
+            .get(&stream)
+            .is_some_and(|m| m.bytes > cap.max_bytes)
+    {
+        let Some(dropped) = d.queues.get_mut(&stream).and_then(VecDeque::pop_front) else {
+            break;
+        };
+        if let Some(meta) = d.stream_meta.get_mut(&stream) {
+            meta.bytes = meta.bytes.saturating_sub(dropped.payload.len());
+        }
+        metrics.incr(Metric::DemuxFramesDroppedOverflow);
+    }
 }
 
 /// Future that yields the next message addressed to a node on a given stream
@@ -2415,6 +2484,138 @@ mod tests {
         b.send_stream(nid(0), STREAM, vec![0xAB; VALUE_LEN]).await;
         let env = recv_task.await.expect("recv task panicked");
         assert_eq!(env.payload, vec![0xAB; VALUE_LEN]);
+
+        a.shutdown();
+        b.shutdown();
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+    /// ADR 0026's 2026-09-28 inbox-cap amendment: a per-stream byte/frame
+    /// cap, drop-oldest on overflow — the fix for the "consumer never
+    /// started polling at all" leak `close_stream` cannot reach (nothing
+    /// ever calls it for a stream this node never locally hosted). Real
+    /// loopback sockets, two `ProdEnv` instances, mirroring this file's own
+    /// `close_stream_drops_queued_frames_and_reopens_on_recv` bring-up —
+    /// converged-or-timeout polling throughout, no fixed sleeps.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn inbox_cap_drops_oldest_frames_past_the_cap_and_counts_them() {
+        use crate::{Env, InboxCap, Metric, Network};
+
+        const STREAM: u64 = 92;
+        const VALUE_LEN: usize = 100;
+        // A tiny cap so this test never has to send megabytes of real
+        // payload — `set_inbox_cap` is exactly the seam this exists for.
+        const CAP_FRAMES: usize = 5;
+        const N: usize = 20; // well past CAP_FRAMES
+
+        let dir_a = unique_tmp_dir();
+        let dir_b = unique_tmp_dir();
+        let loop0 = || "127.0.0.1:0".parse::<SocketAddr>().unwrap();
+        let (a, a_addr) = ProdEnv::bind(nid(0), loop0(), &dir_a)
+            .await
+            .expect("bind a");
+        let (b, _) = ProdEnv::bind(nid(1), loop0(), &dir_b)
+            .await
+            .expect("bind b");
+        b.set_peers([(nid(0), a_addr.to_string())].into_iter().collect());
+        a.set_inbox_cap(InboxCap {
+            max_bytes: usize::MAX,
+            max_frames: CAP_FRAMES,
+        });
+        assert_eq!(a.inbox_cap().max_frames, CAP_FRAMES);
+
+        // Send N frames to `a` on STREAM without ever polling `recv_stream`
+        // for it — the newest CAP_FRAMES must survive, the rest dropped.
+        //
+        // `send_stream` itself only *schedules* the real write onto its own
+        // spawned task (issue #661 — a slow/unreachable peer must never
+        // delay a different one queued behind it in the same caller loop),
+        // so nothing here guarantees these N sends are written to the wire
+        // in call order under a multi-threaded runtime. This test cares
+        // about **delivery** order (which frame the pump actually files
+        // first), so each iteration waits (converged-or-timeout) for this
+        // exact frame to be accounted for — queued or already evicted —
+        // before sending the next, making the whole sequence deterministic
+        // regardless of the runtime's own scheduling.
+        let before_overflow = a.metrics().get(Metric::DemuxFramesDroppedOverflow);
+        for i in 0..N {
+            b.send_stream(nid(0), STREAM, vec![i as u8; VALUE_LEN])
+                .await;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let accounted = a.inbox_stats(0).total_frames
+                    + (a.metrics().get(Metric::DemuxFramesDroppedOverflow) - before_overflow)
+                        as usize;
+                if accounted > i {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "pump never filed/accounted frame {i} for stream {STREAM}"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+
+        // Queued bytes/frames stay at exactly the cap — never above it, and
+        // the drop-oldest counter matches exactly what overflowed (no
+        // over-counting from the loop above having overshot).
+        let stats = a.inbox_stats(10);
+        assert_eq!(stats.total_frames, CAP_FRAMES);
+        assert_eq!(stats.total_bytes, CAP_FRAMES * VALUE_LEN);
+        assert_eq!(
+            a.metrics().get(Metric::DemuxFramesDroppedOverflow) - before_overflow,
+            (N - CAP_FRAMES) as u64
+        );
+
+        // Newest frames retained (drop-oldest): popping every surviving
+        // frame must yield exactly the LAST CAP_FRAMES payloads sent, in
+        // order, never any of the first N - CAP_FRAMES.
+        for expected in (N - CAP_FRAMES)..N {
+            let env = a.recv_stream(STREAM).await;
+            assert_eq!(
+                env.payload,
+                vec![expected as u8; VALUE_LEN],
+                "drop-oldest must retain the newest frames, in send order"
+            );
+        }
+        assert_eq!(a.inbox_stats(0).total_frames, 0);
+
+        // After close_stream: zero queued, and no growth on further sends
+        // while it stays closed (the cap and the close/reopen mechanism
+        // compose without surprises — closing wins, exactly like
+        // `close_stream_drops_queued_frames_and_reopens_on_recv` proves for
+        // the un-capped case). A small, serialized batch (mirroring that
+        // test's own `M`, waiting for each frame's drop to be counted
+        // before sending the next) rather than another concurrent burst of
+        // `N` — under `cargo test --workspace`-level parallel socket load
+        // a large fire-and-forget burst can individually miss
+        // `SEND_TIMEOUT` and simply never arrive, which is a real
+        // scheduling artifact this test has no need to court twice.
+        a.close_stream(STREAM);
+        const M: usize = 4;
+        let before_closed = a.metrics().get(Metric::DemuxFramesDroppedClosed);
+        for i in 0..M {
+            b.send_stream(nid(0), STREAM, vec![i as u8; VALUE_LEN])
+                .await;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if a.metrics().get(Metric::DemuxFramesDroppedClosed) - before_closed > i as u64 {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "pump never counted frame {i} dropped against the closed stream"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+        assert_eq!(
+            a.inbox_stats(0).total_frames,
+            0,
+            "no queued frames while closed, capped or not"
+        );
 
         a.shutdown();
         b.shutdown();

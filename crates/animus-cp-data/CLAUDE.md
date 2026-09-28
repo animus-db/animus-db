@@ -2595,8 +2595,14 @@ depth knob `ANIMUS_RECONFIGURE_DROP_SEEDS`; `tests/demux_stream_teardown.rs`
 is the ADR 0026 2026-09-28 stream-teardown sibling — the same "drop a live
 follower" shape, but through the real `host::Reconciler` under injected
 message loss/delay, asserting the released node's own stream ends empty and
-tombstoned, convergence holds, and a later re-add reopens it), the ADR
-0026/0041/0042/0043
+tombstoned, convergence holds, and a later re-add reopens it; `tests/
+inbox_overflow_tolerance.rs` is the ADR 0026 2026-09-28 inbox-cap sibling —
+a live 3-node group with a tiny configured `InboxCap` where a leader
+replicates to a node before that node's own `RaftKvNode` has even started
+(the real "never-hosted" leak shape, `crates/animus-env/CLAUDE.md`'s own
+entry), proving the resulting overflow-evicted frames are tolerated: the
+group still converges once the late node starts and serves a linearizable
+read afterward), the ADR 0026/0041/0042/0043
 stream-addressing/`KindBatch`/`KIND_CURSOR`/`ClusterSegmentStore` suites,
 the ADR 0018 HLC/MVCC/range-seal/transaction suites, the `host.rs`
 reconciler end to end, the ADR 0044 phase-2 heartbeat-batcher baseline

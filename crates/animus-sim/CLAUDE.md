@@ -408,6 +408,59 @@ function of one seed. This is the substrate every distributed test runs on.
   (a live follower released from a tablet's replica set under message
   loss/delay, through the real `host::Reconciler`).
 
+- **Per-stream inbox cap — `enforce_inbox_cap` (ADR 0026, 2026-09-28
+  amendment, second follow-up PR).** `close_stream` above cannot reach the
+  other half of the same live measurement: a stream whose consumer never
+  started polling at all, so nothing ever calls `close_stream` for it. This
+  is `animus_env::InboxCap`'s `SimEnv` side (see `crates/animus-env/
+  CLAUDE.md`'s own entry for the full derivation and the consumer-
+  classification argument for why drop-oldest is safe). `SimState` gained
+  `inbox_bytes: BTreeMap<(NodeId, u64), usize>` (the `ProdEnv::Demux::
+  stream_meta.bytes` twin — maintained incrementally on the same push
+  (`fire_event`'s `Deliver` arm) / pop (`Recv::poll`) sites, never a scan
+  of the `VecDeque` itself) and one global `inbox_cap: InboxCap` field
+  (mirrors `net`/`disk_cfg`'s own global-default shape — one value for the
+  whole simulated world, not a per-node override, since nothing here needs
+  a *different* cap per node). `SimState::enforce_inbox_cap(node, stream,
+  t)` runs right after every push: while the queue is over either bound,
+  it pops the stream's **oldest** frame (`VecDeque::pop_front`, never the
+  just-pushed newest one), decrements `inbox_bytes`, and traces
+  `TraceEvent::Drop { reason: "inbox-overflow", .. }` — the identical shape
+  a crashed-node/partitioned-link/closed-stream drop already uses.
+  `Simulator::set_inbox_cap`/`inbox_cap` are the setter/getter (mirrors
+  `set_net_config`/`set_disk_config`); `crash`/`stop` clear a restarting
+  node's `inbox_bytes` entries alongside `inboxes`/`recv_wakers` (the same
+  `node_prefix_keys` scan below). Draws no RNG and schedules no timeline
+  event — a synchronous, deterministic map operation, so the byte-
+  identical-trace guarantee (below) is unaffected; a default-cap run stays
+  byte-identical to before this PR landed, since neither default is ever
+  hit by any pre-existing corpus at ordinary scale. **Gotcha found writing
+  this PR's own tests**: `NetConfig::default()`'s 4ms `max_jitter` reorders
+  delivery relative to send order (each send draws its own independent
+  jitter), so a test asserting "drop-oldest retains the newest frames, in
+  send order" needs `max_jitter: Duration::ZERO` (`tests/inbox_cap.rs`'s
+  own `deterministic_order_net_config` helper) — otherwise the assertion is
+  flaky by construction, not a real bug in the cap itself; a test that only
+  cares about counts/totals (not which specific frames survive) doesn't
+  need this. **`enforce_inbox_cap` exempts `PRIMARY_STREAM` and the
+  reserved high-id block first** (`animus_env::is_reserved_stream`, a
+  no-op early return, checked before this method touches any state) — see
+  `crates/animus-env/CLAUDE.md`'s own entry for why: an earlier,
+  unconditional version of this cap regressed a real `animusd` test
+  (`sim_cluster_dynamo_page_size_cap`) by evicting a still-relevant
+  relay reply mid-chase, since that class carries payloads far larger
+  than an ordinary tablet entry and has no "never-hosted" gap to begin
+  with. Only ordinary per-tablet streams (`stream = tablet_id`) are
+  actually capped. Tests: `tests/inbox_cap.rs` (frame cap, byte cap,
+  composition with `close_stream`, and a default-cap no-regression check —
+  every scenario uses an ordinary, non-reserved stream id, since a
+  reserved one would never trip the cap at all now); `animus-cp-data`'s
+  `tests/inbox_overflow_tolerance.rs` is the fault-injecting end-to-end
+  sibling (a live 3-node Raft group tolerates the cap's own loss and still
+  converges and serves a linearizable read), deliberately hosted on an
+  explicit non-`PRIMARY_STREAM` id via `RaftKvNode::start_hosted` for the
+  same reason.
+
 - **`SimState::node_prefix_keys` (issue #841) is the one place the
   `disks`/`inboxes`/`recv_wakers` node-prefix scans live**, replacing seven
   call sites (`wipe_disk` ×1, `crash` ×3, `stop` ×3) that used to be a full
