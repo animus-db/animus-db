@@ -311,6 +311,68 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   numbers `0..lowest_live` one `env.size` call at a time — the probe loop cost
   one I/O call per *ever-rotated* segment number on every open, unbounded over
   the engine's lifetime; a listing is one call regardless of history.
+- **Every WAL segment file starts with a file-level format header** (ADR
+  0073 Phase 0, Workstream A): magic `LWL1` (`wal::WAL_MAGIC`) + `u8`
+  version (`wal::WAL_VERSION`, currently `1`) — a **file-level** header,
+  not a per-record one, written **exactly once**, before any record.
+  Chosen over a per-record tag (the ADR's Phase 0 conventions table names
+  this format "LSM WAL record header") because the WAL is already a
+  rotating-**segment-file** format, not one growing file: a file-level
+  header costs 5 bytes once per segment instead of once per record forever
+  on the hot write path, and every record in a segment already shares one
+  version the instant that segment's own header is read — no per-record
+  framing (`encode_wal`/`decode_wal_record`, including the positional
+  torn-tail-vs-corruption proof) needed to change at all. Full account,
+  including exactly why the "needs header" flag flips **after `append`
+  succeeds, not before and not only after `sync` succeeds**, in `wal.rs`'s
+  own module docs — get this timing wrong either direction and a failed
+  `append`/`sync` under `DiskConfig::set_error_prob` (an accepted, already-
+  tested write-path fault) either leaks a headerless segment or corrupts
+  one with a second header spliced into the middle. **Crash safety**: the
+  header is prepended to a segment's first-ever batch and appended in the
+  same call as that batch's records, so it becomes durable in exactly the
+  `sync` that covers them; a crash before that can only leave it absent,
+  torn (a strict prefix), or fully present — decoded via `decode_wal` in
+  `lsm.rs`, which tolerates a torn header exactly like a torn trailing
+  record (nothing could have synced past an incomplete header, so it
+  recovers as empty) but treats a different, complete magic or an
+  unsupported version as a **loud, named** `StorageError::
+  PreBaselineFormat`/`StorageError::UnsupportedFormatVersion` — never a
+  silent misdecode, never a panic. `GroupCommit::new`'s `active_seg_len`
+  parameter is how `LsmEngine::open_with_metrics` tells the coordinator
+  whether the *recovered* active segment already carries a durable header
+  (nonzero post-repair length) or needs a fresh one (zero — a brand-new
+  engine, or a torn-header segment truncated back to empty).
+  `tests/lsm_disk_faults.rs`'s `buffer_unsynced_wal_record`/
+  `first_frame_len` helpers know to skip past this header when locating a
+  segment's first record frame — a hand-rolled offset duplicated from
+  `wal::WAL_HEADER_LEN` since it isn't part of the crate's public API.
+- **Format versioning is now a standing rule for every format in this
+  crate, not just the WAL** (ADR 0073 Phase 0). `StorageError::
+  PreBaselineFormat { format }` / `StorageError::UnsupportedFormatVersion {
+  format, found: u32, max_supported: u32 }` are **one shared pair across
+  every format** — the WAL header is the first consumer, and the LSM
+  manifest/SSTable re-baseline (`MANIFEST_VERSION`, `SsTableMeta::format`,
+  ADR 0073's Workstream A row) reuses the same two variants rather than
+  growing a format-specific error type per format. `found`/`max_supported`
+  are `u32` so the one shape covers both a `u8`-tagged binary format (the
+  WAL header, the manifest's `CMF1` version byte) and a wider-tagged one
+  without truncation either way. A format change is always a **new**
+  version constant plus a **new** fixture file, never an edit to an
+  existing one: golden fixtures live at
+  `tests/fixtures/formats/<format>/v<N>.<ext>` (today: `lsm-wal/v1.bin`),
+  and `scripts/check-format-fixtures.sh` (run from the repo root, wired
+  into CI) fails the build if any fixture file already present at the
+  merge base with `origin/main` is edited or deleted — a new `vN+1` file
+  alongside it is the only legitimate way forward once a version has
+  fixtures. Each format's fixture directory gets a decode test (iterates
+  every file in the directory, not just `v1`, so a later version needs no
+  test-code change), a round-trip test, and an `#[ignore]`d generator
+  (`generate_fixture_lsm_wal` in `lsm.rs`'s `wal_format_fixture_tests`
+  module is the WAL's) that refuses to overwrite a fixture that already
+  exists — run it explicitly with `cargo test -p animus-storage --lib
+  generate_fixture_lsm_wal -- --ignored` after bumping the version
+  constant, never to regenerate the current one.
 - **A group-commit leader's failed `flush_batch` surfaces its own error text
   to every waiter, not just a generic prefix** (issue #939, 2026-09-19).
   `GroupCommit::Inner::failed_error` keeps the *first* failure's
