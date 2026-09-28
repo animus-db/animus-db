@@ -512,18 +512,20 @@ as one addition, not a rewrite of the row above.
   may *use* once every member supports it — none of this needs another
   format reset, since the preamble already carries an `ext` area no v1
   peer rejects for being non-empty.
-- **Caveat**: on the client/intra wire's pipelined, unpooled dial-side
-  relay/join path (`animusd`'s `client_request_pipelined`, used by
-  `relay_request_with_timeout`/`join_request` — every forwarded request
-  opens a fresh connection, never pooled), a refused peer's handshake is
-  still logged and surfaced as a connection failure to the caller, but is
-  deliberately **not** counted against `Metric::ClientHandshakeRefused`
-  (that call site passes a no-op `MetricsHandle`) — the metric is meant to
-  flag a stray/pre-baseline peer on the accept side and on the
-  ordinary (non-pipelined) client dial path
-  (`perform_client_handshake`/`ProdEnv::perform_handshake`), not to double
-  -count every one of a busy forwarding node's own routine per-request
-  dial failures on top of whatever else already surfaces them.
+- **Caveat (dial-side counting on the client/intra wire)**: every
+  `animusd` *dialer* of the client/intra wire — `connect_client`, and the
+  pipelined, unpooled relay/join path (`client_request_pipelined`, used by
+  `relay_request_with_timeout`/`join_request`) — passes a no-op
+  `MetricsHandle`, simply because none of those call sites has the node's
+  metrics handle plumbed through today. A refusal there is still logged at
+  `warn` with the named error and surfaces as a transport failure to the
+  caller (`RELAY_TRANSPORT_FAILURE` on the relay path), never a panic or a
+  silent drop; and because the handshake is symmetric, the *accepting*
+  node always counts it in `Metric::ClientHandshakeRefused`, so every
+  mismatch is visible in at least one side's metrics. The internal
+  `Network` transport (`ProdEnv`) counts on both sides. Threading a real
+  handle into the client/intra dial paths is a small follow-up, not a
+  Phase 2 prerequisite.
 
 ## Testing
 
