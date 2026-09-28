@@ -1524,6 +1524,24 @@ const COMPACT_THRESHOLD: u64 = 64;
 /// of `COMPACT_THRESHOLD`, so worst-case WAL retention stays bounded even
 /// if a peer's transfer never completes at all (dead, partitioned, or
 /// hopelessly outpaced).
+///
+/// **Issue #1064 amendment: this ceiling no longer overrides a transfer in
+/// flight to a LEARNER.** Sized in log entries, it bounds worst-case WAL
+/// retention, but it is not itself a bound on — or even correlated with —
+/// how close a given transfer is to actually landing: under a continuous
+/// writer, `behind` grows at the write rate regardless of transfer progress,
+/// so a joining learner's genuinely advancing (never-idle) transfer can be
+/// forced out and restarted from chunk 0 against a still-larger image,
+/// forever, even at a write rate the learner's own disk can sustain in
+/// steady state. A learner's catch-up contract (ADR 0058 Train 1) is already
+/// "one `InstallSnapshot`, then promote" — `idle_ceiling_hit` (whether the
+/// transfer has made zero progress for `COMPACT_DEFER_IDLE_CEILING`) is the
+/// only question worth asking about it, and this constant adds nothing but
+/// a false deadline for that case. A VOTER's in-flight transfer is
+/// unaffected: this ceiling still applies to it exactly as tuned for PR
+/// #1047's flood. See `apply_and_compact`'s own `emergency_ceiling_hit`
+/// computation and `docs/lessons/testing/`'s matching entry for the full
+/// account.
 const COMPACT_DEFER_EMERGENCY_CEILING: u64 = COMPACT_THRESHOLD * 64;
 
 /// Follower-aware compaction retention (etcd-style log retention, found live
@@ -10145,19 +10163,55 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     // placeholder, so the threshold rewrite never needed the image bytes.
     let ea = engine_applied.load(Ordering::SeqCst);
     let now = env.now();
-    let (behind, image_needed, transfer_in_flight, transfer_progress, compaction_floor) = {
+    let (
+        behind,
+        image_needed,
+        transfer_in_flight,
+        transfer_progress,
+        compaction_floor,
+        learner_transfer_in_flight,
+    ) = {
         let mut c = core.lock().expect("raftkv core poisoned");
-        let transfer_progress: u64 = c
-            .snapshot_transfer_peers()
+        let transfer_peers = c.snapshot_transfer_peers();
+        let transfer_progress: u64 = transfer_peers
             .iter()
             .map(|p| c.snapshot_chunk_advances(p))
             .sum();
+        // Issue #1064: whether the (or a) transfer currently in flight is to
+        // a LEARNER specifically — see `emergency_ceiling_hit`'s own doc a
+        // few lines down for why this, not `compaction_floor`, is where a
+        // joining learner's in-flight transfer gets protected. Deliberately
+        // NOT a standing, entry-count-capped retention floor for a learner's
+        // ordinary (no transfer in flight) position — an earlier draft of
+        // this fix tried exactly that (mirroring `compaction_floor`'s own
+        // voters-only shape) and it silently reintroduced the pre-#1047
+        // wedge for a fully PARTITIONED learner: with no transfer ever in
+        // flight (nothing to send to a peer nothing can reach), a bare
+        // `match_index`-based floor pins compaction at the learner's own
+        // (permanently `0`) position for as long as `last_log_index` stays
+        // under `COMPACT_RETENTION_CAP_ENTRIES` (4096) — confirmed live
+        // against `tests/snapshot_transfer_survives_compaction.rs`'s own
+        // `a_stalled_partitioned_peer_does_not_block_compaction_forever`,
+        // whose own 4000-round budget never reaches that cap. A floor with
+        // no idle-time escape hatch is exactly the class of "bound only in
+        // entries, not in whether anything is actually stalled" mistake
+        // this issue's own `COMPACT_DEFER_EMERGENCY_CEILING` fix (below)
+        // exists to move away from — see `docs/lessons/testing/2026-09-28-
+        // a-wal-bound-safety-valve-sized-in-entries-is-not-a-progress-
+        // guarantee.md`. The repeated-small-reinstall cost for a learner
+        // that has already caught up once and is merely waiting on its next
+        // ack (this constant's own follow-on finding) is accepted as-is:
+        // bounded by `idle_ceiling_hit`/`emergency_ceiling_hit` exactly like
+        // any other in-flight transfer once it recurs, never by pre-empting
+        // ordinary threshold compaction ahead of time.
+        let learner_transfer_in_flight = c.learners().iter().any(|l| transfer_peers.contains(l));
         (
             ea.saturating_sub(c.snapshot_index()),
             c.take_snapshot_needed(),
             c.snapshot_transfer_in_flight(),
             transfer_progress,
             c.compaction_floor(COMPACT_RETENTION_CAP_ENTRIES),
+            learner_transfer_in_flight,
         )
     };
     // Follower-aware retention (etcd-style, issue found live alongside PR
@@ -10208,7 +10262,37 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
         && idle_since.is_some_and(|since| {
             now.0.saturating_sub(since.0) >= COMPACT_DEFER_IDLE_CEILING.as_nanos() as u64
         });
-    let emergency_ceiling_hit = behind >= COMPACT_DEFER_EMERGENCY_CEILING;
+    // Issue #1064's own field-scale finding: `COMPACT_DEFER_EMERGENCY_
+    // CEILING` is a WAL-retention safety valve sized in LOG ENTRIES, which is
+    // not a bound on real progress at all under a continuous writer — a
+    // joining learner's transfer is fully in-flight and genuinely advancing
+    // (never idle long enough to trip `idle_ceiling_hit`), but `behind`
+    // itself climbs at the WRITE rate, wholly independent of how close the
+    // transfer is to landing; a write rate the learner's own disk can
+    // otherwise sustain in steady state can still cross this ceiling before
+    // one (increasingly large) image ever completes, forcing
+    // `snapshot_upto` to invalidate it and restart from chunk 0 against a
+    // still-larger image — forever, without the emergency ceiling itself
+    // ever being what's actually stalled. See `docs/lessons/testing/`'s
+    // matching entry and this ADR's own amendment for the full account.
+    //
+    // Fixed by never letting the emergency ceiling override a transfer that
+    // is in flight to a LEARNER: a learner's own bounded catch-up contract
+    // (ADR 0058 Train 1 — it is expected to need exactly one `InstallSnapshot`
+    // before promotion, not a running total of entries applied elsewhere)
+    // means the only question worth asking about ITS transfer is "is it
+    // actually progressing," which `idle_ceiling_hit` already answers
+    // correctly — the entries-sized ceiling adds nothing but a false
+    // deadline keyed to a quantity (`behind`) the learner's own transfer has
+    // no way to influence. A VOTER's in-flight transfer keeps the original,
+    // unmodified behavior (both ceilings, exactly as PR #1047 tuned them) —
+    // voters are the flood scenario this mechanism was built for, and their
+    // own catch-up is meant to stay on ordinary `AppendEntries`
+    // (`compaction_floor`'s own voters-only retention already tries to keep
+    // them there in the first place), so an ordinary voter that DOES fall
+    // into the snapshot path is still bounded exactly as before.
+    let emergency_ceiling_hit =
+        behind >= COMPACT_DEFER_EMERGENCY_CEILING && !learner_transfer_in_flight;
     let threshold_hit = behind >= COMPACT_THRESHOLD
         && (!transfer_in_flight || idle_ceiling_hit || emergency_ceiling_hit);
     // PR #1047: a transfer forced out while it was still genuinely in

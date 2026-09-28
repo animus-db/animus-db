@@ -503,6 +503,54 @@ mechanism; not fixed here — see `docs/lessons/testing/` for the
 investigation notes and the compaction-floor/`COMPACT_DEFER_*` invariants
 this fix deliberately left untouched).
 
+**Part 2 (2026-09-28, closes issue #1061): the heavier-load defect above was
+confirmed and fixed.** `apply_and_compact`'s `COMPACT_DEFER_EMERGENCY_
+CEILING` — a last-resort WAL-retention safety valve sized in raw log-entry
+count (`behind`) — used to override the idle-progress defer
+(`COMPACT_DEFER_IDLE_CEILING`) and force a still-genuinely-progressing
+transfer out **regardless of whether it was actually stalled**, the instant
+`behind` crossed a fixed threshold. Under a continuous writer `behind` grows
+at the WRITE rate, which has no relationship to how close a transfer is to
+landing — sized in entries, this "safety valve" is not a progress
+guarantee at all (see `docs/lessons/testing/`'s matching 2026-09-28 entry).
+Fixed narrowly: `emergency_ceiling_hit` (`apply_and_compact`'s own local)
+no longer forces a restart of a transfer in flight to a **learner**
+specifically — a learner's own catch-up contract is already "one
+`InstallSnapshot`, then promote" (this file's own entries above), so the
+only question worth asking about its transfer is whether it's genuinely
+stalled, which `idle_ceiling_hit` already answers correctly with no change.
+A **voter's** in-flight transfer is completely unaffected — both ceilings
+still apply to it exactly as PR #1047 tuned them, since a voter needing a
+snapshot at all is still the flood scenario this whole mechanism exists to
+bound. See `emergency_ceiling_hit`'s own computation and
+`COMPACT_DEFER_EMERGENCY_CEILING`'s doc comment (`lib.rs`) for the full
+before/after account, and ADR 0058's matching 2026-09-28 amendment.
+Regression: `tests/learner_snapshot_livelock_under_continuous_writer.rs` —
+an AppendEntries-only control (a learner joining before any compaction,
+proving the chosen write rate is genuinely sustainable —
+`Metric::CpSnapshotImageBuilds` stays 0) paired with a late-joining learner
+needing a real `InstallSnapshot` under the SAME continuous writer,
+asserting both convergence and a bounded `Metric::
+CpSnapshotTransferRestarts`.
+
+**Issue #1061's own mechanism (a departing, not joining, peer) is a
+sibling defect in the SHARED `RaftCore` (`animus-control/src/raft.rs`), not
+this crate**: `RaftCore::departing` (a leader still replicating to a
+just-removed voter until it acks the removal entry) had no bound at all —
+excluded from `compaction_floor`'s voters-only retention (it's no longer in
+`peers`), a departing peer whose replica is genuinely gone (crashed, or its
+own host already released it) fell into the snapshot path the moment any
+compaction advanced past it and, since it could never ack, was retried
+forever. `RaftCore::expire_stale_departing` (called once per `tick`'s own
+heartbeat cadence) drops a departing peer that has sent back nothing at
+all — no reply of ANY kind — for `DEPARTING_PEER_GIVE_UP` (5s, re-exported
+from `animus_control`). See `animus-control/CLAUDE.md`'s own entry for the
+full mechanism, including the vote-safety hardening
+(`handle_request_vote`'s new candidate-membership check) this fix needed
+alongside it. Regression (this crate, since it drives `RaftKvNode` directly
+rather than going through `animus-control`'s own control-plane groups):
+`tests/departing_peer_gives_up_after_replica_is_gone.rs`.
+
 **`RaftKvNode::voter_history()` (issue #596)** records every distinct voter
 configuration a group has adopted, in adoption order, in a small bounded
 in-process ring (`VoterHistory`, capacity 64, oldest dropped; never rebuilt
