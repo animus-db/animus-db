@@ -256,9 +256,10 @@ per-tablet CP data plane (`animus-cp-data`).
   (tolerated) by checking whether a valid record follows; this WAL has no
   invariant that needs that finer distinction, since a dropped tail-of-log
   is always safe to recover from here. No back-compat/migration for a
-  pre-existing unchecksummed WAL file (root `CLAUDE.md`'s no-back-compat
-  stance) — an upgraded node needs a fresh WAL like any other format change
-  in this repo.
+  pre-existing unchecksummed WAL file — an upgraded node needs a fresh WAL,
+  as with any format change made before ADR 0073's baseline (root
+  `CLAUDE.md`'s upgrade-compatibility section); this WAL envelope is itself
+  in scope for ADR 0073 Phase 0 workstream B's reset.
 
 - **`detector.rs`** — `FailureDetector` (ADR 0012): a pure, unit-tested
   interval+timeout liveness detector. No clock, no RNG.

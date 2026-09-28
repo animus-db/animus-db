@@ -94,12 +94,24 @@ Status: pre-alpha. For *what's implemented* and *why*, read the ADR index
 ([`docs/adr/README.md`](docs/adr/README.md)) and the per-crate guides below —
 this file does not keep a feature changelog. For what is *not* implemented yet, and the plan for each gap, read [`docs/roadmap.md`](docs/roadmap.md).
 
-**No back-compat until further notice.** There are no migration paths and no
-wire/WAL/on-disk-format compatibility guarantees between revisions — assume
-clusters are recreated from scratch. Don't spend design or review budget on
-upgrade paths or compat shims; where a cheap compat measure exists anyway (a
-serde default, a codec version bump) it is an implementation convenience, not
-a promise.
+**Upgrade compatibility (ADR 0073, Accepted 2026-09-27): a staged ratchet, not
+a blanket "no back-compat" any more.** Phase 0 — the last permitted
+incompatible reset, currently in progress — gives every persisted/wire format
+a version tag and a golden fixture; version counters restart at 1 and
+pre-baseline legacy-compat fields are dropped. From the baseline (the merge
+commit where Phase 0's last workstream lands, recorded in ADR 0073) on:
+**durable formats must be compatible** — a newer binary reads everything an
+older post-baseline binary wrote, an existing golden fixture is never edited
+or deleted (`scripts/check-format-fixtures.sh` enforces this in CI), and a
+format change is a new version tag plus a new fixture, never a rewrite of an
+old one. **Wire formats** join the same rule once Phase 2 (a replicated
+cluster version / feature gate) lands; **rolling upgrades** once Phase 3
+lands. Before the baseline, and for anything Phase 0 hasn't reached yet,
+formats may still change freely. See ADR 0073 for the full phase plan, the
+Phase 0 conventions (tag shape, fixture layout, workstreams), and the open
+questions (support window length, the hash-ring/key-encoding layer). A break
+that can't be made compatible once its phase applies still needs an explicit
+ADR amendment naming it and its migration path.
 
 ## Per-crate guides
 
@@ -135,6 +147,7 @@ cargo test -p animus-control survives_leader_kill  # one test by name substring
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo fmt --all --check
 cargo deny check                                   # licenses + advisories (cargo install cargo-deny)
+scripts/check-format-fixtures.sh                   # ADR 0073 Phase 0: fails if a checked-in format fixture was edited/deleted
 cargo bench -p animus-storage                      # ProdEnv smoke of the write/IO path
 cargo bench -p animusd                             # cluster wire benchmark: latency percentiles + degraded phase
 cargo bench -p animus-cp-data --bench wal_fsync_bench  # ProdEnv WAL fsync bench gating SharedWal wiring (ADR 0028, C-05)

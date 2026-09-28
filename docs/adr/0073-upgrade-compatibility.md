@@ -1,12 +1,14 @@
 # ADR 0073 — Upgrade compatibility: a phased plan, not yet a promise
 
-- **Status:** Proposed — a skeleton/inventory for a future decision, not
-  the decision itself. Nothing in this document lifts root `CLAUDE.md`'s
-  "No back-compat until further notice" rule. That rule stays in force
-  until Phase 4 below is actually accepted and its preceding phases have
-  landed; until then, every format inventoried here may still change
-  incompatibly between any two revisions, exactly as it does today.
-- **Date:** 2026-09-27
+- **Status:** Accepted (2026-09-27) — the phased plan itself, and the
+  Phase 0 conventions below, are binding from this date. This is a policy
+  decision, not a claim that any phase is implemented yet: see the "Phase
+  status" list and the "Maintainer decision" section below for what is
+  actually in force. Root `CLAUDE.md`'s no-back-compat paragraph has been
+  rewritten to match (see that file); it no longer states an unconditional
+  "no compat, ever" rule — it now points here.
+- **Date:** 2026-09-27 (Proposed); accepted 2026-09-27 (see Maintainer
+  decision)
 - **Amends:** none. **Depends on:** [ADR 0003](0003-deterministic-simulation.md)
   (the `Env` seam any new sim corpus below is built on), [ADR 0008](0008-borrowed-storage-first.md)
   (the on-disk formats inventoried in §2), [ADR 0028](0028-shared-storage-single-command-split.md)
@@ -18,6 +20,112 @@
   [ADR 0035](0035-control-plane-separate-deployment.md) (the one existing
   precedent for real compatibility discipline — its "Rolling upgrade /
   mixed-version compatibility" section).
+- **2026-09-27 maintainer decision (verbatim):** *"you can reset format now,
+  there is no production cluster yet. But from now on we operate as if
+  there was one. Start phases."* This accepts the plan below and makes it
+  binding immediately, ahead of any phase actually landing — see
+  "Maintainer decision" and "Phase status" below for exactly what changes
+  today versus what each phase still has to build.
+
+## Maintainer decision (2026-09-27)
+
+The maintainer has decided the timing question the original "Proposed"
+status above left open (see the 2026-09-27 note): **there is no production
+cluster yet, so one last incompatible reset is free — take it now, as part
+of Phase 0 — and from the moment that reset lands, operate as if a
+production cluster existed.** That is a deliberate ratchet, not a claim that
+Phases 1–3's machinery already exists. What follows is the precise, binding
+interpretation.
+
+1. **One final format reset, as part of Phase 0.** Phase 0 (below) is the
+   **last permitted incompatible change** to any format in this ADR's
+   inventory. During Phase 0, and only during Phase 0, a format may be
+   freely redesigned: every format gains a version tag per the Phase 0
+   conventions below, every version counter **restarts at 1** (e.g. the
+   RaftKV codec's `VERSION = 31` becomes the Phase 0 baseline's `VERSION =
+   1`; the segment codec's `VERSION = 2` likewise resets to `1`), and
+   legacy back-compat baggage that exists only to read pre-baseline data
+   (e.g. the `cp_member_addrs` field and the other ad hoc "old field still
+   accepted" provisions ADR 0032/0040 carry, the LSM manifest's own
+   pre-binary-codec JSON fallback) may be dropped outright rather than
+   folded into the new generic version-gate mechanism. Each Phase 0
+   workstream (see the table below) identifies its own instances of this
+   as it does the work — this ADR does not enumerate every one in advance.
+2. **The baseline.** The baseline is **the merge commit on `main` where the
+   last Phase 0 workstream (A–E below) lands**. This ADR records the actual
+   commit SHA and date here once that happens:
+   - **Baseline commit:** *(not yet reached — filled in when Phase 0's last
+     workstream merges)*.
+   Before the baseline, every format may still change incompatibly *as
+   part of Phase 0 work only* — Phase 0 is not itself covered by the rule
+   it exists to establish. From the baseline onward, the "as if production"
+   rule in point 3 applies in full, to every format Phase 0 touched.
+3. **The "as if production" rule, staged as an honest ratchet.** The
+   mechanism to enforce full compatibility does not exist yet as one piece
+   — it is built incrementally by Phases 1–3. The rule below is staged to
+   match exactly what each phase actually makes enforceable, so nobody
+   reads "operate as if there was one" as a promise the current tooling
+   can't back up:
+   - **From the baseline (Phase 0 done) — durable formats are compatible.**
+     Every **durable** format (anything written to disk or to the backup
+     `SegmentStore`: WALs, SSTables/manifest, snapshots, `Metadata`'s
+     system-keyspace mirror, the per-tablet key layout, the hash-ring/key
+     encoding, backup/PITR/export/stream objects, the encryption envelope,
+     cluster config on disk) must be readable by every later binary: a
+     full-cluster stop → upgrade → restart must work with no data loss and
+     no manual conversion step. Mechanically: **a format change is a new
+     version tag, a decoder that still accepts every older post-baseline
+     version, and a new golden fixture for the new version — an existing
+     checked-in fixture is never edited or deleted** (the CI guard below
+     enforces the "never deleted" half mechanically; the "decoder still
+     accepts it" half is reviewed by hand until Phase 1's N-1 requirement
+     is actually implemented per format — see Phase status). **Support
+     window:** proposed default is *every post-baseline version stays
+     readable until the project's first tagged release defines an explicit
+     window* — left as an open question below since pre-alpha has no
+     tagged releases yet to hang a window off of.
+   - **Once Phase 2 lands (a replicated cluster version / feature gate in
+     `Metadata`) — wire formats join the same rule.** Internal `Network`
+     message enums (control-plane Raft, CP-data Raft, the client/intra
+     wire) become mixed-version compatible: new messages or behavior stay
+     dormant until the whole quorum/hosting set reports support, gated the
+     same way Cockroach/etcd gate a cluster version. **Before Phase 2
+     lands, wire changes stay free** (no compat obligation) **but should be
+     additive-by-design wherever it is cheap** — new optional fields/
+     variants rather than renamed/removed ones — since that costs nothing
+     today and is exactly the discipline Phase 2 will require anyway.
+   - **Once Phase 3 lands — rolling upgrades are supported and tested,
+     full stop.** A documented drain/restart runbook, an admin surface to
+     report per-node version and trigger Finalize, and operator support for
+     `spec.image` changes (today rejected outright).
+   - **The escape hatch stays available at every stage:** anything that
+     genuinely cannot be made compatible needs an explicit ADR amendment
+     naming the break and the migration path (backup/restore, at minimum)
+     — the same bar a production database would hold itself to for a
+     breaking change, not a ban on ever breaking anything again.
+4. **Phase status** (updated as phases land; this is the live status this
+   ADR's own header should be read against):
+   - **Phase 0 — version-tag everything + golden fixtures + the final
+     reset:** **in progress**, this PR starts it. Tracked as five
+     independent workstreams (A–E) — see the table below. Not done until
+     every workstream's PR series has merged and the baseline commit above
+     is filled in.
+   - **Phase 1 — on-disk N-1 stability:** planned, blocked on Phase 0's
+     baseline.
+   - **Phase 2 — replicated cluster version / wire feature-gate:** planned,
+     blocked on Phase 1.
+   - **Phase 3 — rolling-upgrade orchestration:** planned, blocked on
+     Phase 2.
+   - **Phase 4 — lift/rewrite the root `CLAUDE.md` no-back-compat rule:**
+     **effectively decided now, ahead of Phases 1–3, by this same
+     maintainer decision** — root `CLAUDE.md` is rewritten in this PR to
+     state the staged ratchet in point 3 above rather than an unconditional
+     "no compat, ever" rule. What Phase 4 in the original plan treated as a
+     single future flip is, as of this decision, already in force *as a
+     ratchet whose strength grows with each later phase* — there is no
+     separate future "Phase 4 PR" left to do; this is it. The original
+     Phase 4 bullet below is kept for historical record of what was
+     proposed before this decision, not as a still-open step.
 
 ## Context
 
@@ -176,7 +284,155 @@ pick it up, the inventory and design work above doesn't need redoing.
   (anything not yet reached by the phases above, or anything the project
   explicitly decides isn't worth the ongoing cost — see Open Questions).
   This phase is itself a maintainer decision, not an automatic consequence
-  of the others landing.
+  of the others landing. **Superseded by the 2026-09-27 maintainer decision
+  above**: the decision to "operate as if there was one" from the baseline
+  on is itself the Phase 4 call, taken now rather than after Phases 1–3 —
+  see point 4 there.
+
+## Phase 0 conventions (binding, 2026-09-27)
+
+These conventions are concrete enough that each Phase 0 workstream (table
+below) can implement independently and land a consistent result. A
+workstream that needs to deviate does so via a review comment on its own
+PR, not silently — if a real format genuinely can't fit this shape, that is
+itself worth recording as an amendment here.
+
+### Version tag shape
+
+- **Binary/byte-oriented formats** (anything with its own framing, not a
+  `serde_json` document): a **4-byte ASCII magic, format-specific**,
+  immediately followed by a **`u8` version**, exactly the shape already
+  proven by the LSM manifest (`CMF1` + `u8`) and the encryption envelope
+  (`ADE1` + `u8`). `u8` (not `u16`) is chosen for consistency with every
+  existing precedent in this codebase (manifest, envelope, RaftKV codec,
+  segment codec all use `u8`) and because 255 versions is nowhere close to
+  a binding constraint — the RaftKV codec is the fastest-moving format in
+  the system and only reached 31 over the project's entire history to
+  date; restarting it at 1 under Phase 0 buys another multi-year runway.
+  Suggested magics for the formats that don't have one yet (pick a 4-byte
+  ASCII value that doesn't collide with an existing one in the inventory —
+  `CMF1`/`ADE1`/`SSIX` are taken):
+  | Format | Suggested magic |
+  |---|---|
+  | LSM WAL record header | `LWL1` |
+  | Control-plane Raft WAL line envelope | `CWL1` |
+  | Control-plane snapshot / InstallSnapshot envelope | `CSN1` |
+  | `SharedWal` outer `Line{tablet, record}` envelope | `SWL1` |
+  | Per-tablet engine key layout marker (a leading key-space byte/prefix, not a framed record — see workstream C's own design task) | n/a — versioned differently, see below |
+  Each workstream may substitute a better magic during implementation; the
+  only hard constraint is *no collision* with another format's magic and
+  *no reuse* of a magic across versions (a version bump keeps the same
+  magic, `ADE1`/`CMF1` already establish that).
+- **`serde_json` formats** (`Metadata`, `ClusterConfig`, the backup
+  manifest, the operator CRD's actual schema): a **top-level `"v": <u32>`
+  field**, not a wrapping envelope object — added as a plain field on the
+  existing top-level struct (`#[serde(default)] version: Option<u32>`
+  becomes, at the Phase 0 reset, a required `version: u32` with no
+  default, since Phase 0 is the one point where dropping the default is
+  safe). Chosen over a `{ "v": N, "data": ... }` wrapper because every
+  format in this group is already a single top-level struct with
+  `#[serde(default)]`-annotated fields (ADR 0035's pattern) — adding one
+  more required field costs nothing and needs no restructuring, while a
+  wrapper would touch every call site that constructs or matches the
+  value.
+- **Untagged pre-baseline input**: a `serde_json` document with no `"v"`
+  field, or a byte-oriented file with no recognized magic, read by
+  post-baseline code is a **named, loud `Err`** (e.g.
+  `Error::PreBaselineFormat { format: &'static str }` — one variant shared
+  across formats, not one per format), never a silent best-effort parse
+  and never a panic. This is intentional: Phase 0 is the reset, so nothing
+  written before it is owed compatibility, but silently misreading it (as
+  opposed to refusing it by name) is exactly the failure mode this whole
+  ADR exists to close off.
+- **Unknown/future version**: same treatment — a named, loud `Err` (e.g.
+  `Error::UnsupportedFormatVersion { format, found, max_supported }`),
+  never silent misdecoding, never a panic. This is already the discipline
+  the RaftKV codec and segment codec follow; Phase 0 generalizes it to
+  every format in the inventory.
+
+### Golden fixtures
+
+- **Location:** `crates/<crate>/tests/fixtures/formats/<format>/v<N>.<ext>`
+  — one directory per format (`<format>` a short stable slug, e.g.
+  `raftkv-codec`, `lsm-manifest`, `metadata`, `cluster-config`,
+  `backup-manifest`), one file per version (`<ext>` = `bin` for
+  byte-oriented formats, `json` for `serde_json` ones). Example:
+  `crates/animus-cp-data/tests/fixtures/formats/raftkv-codec/v1.bin`.
+- **Decode test:** each format gets one test (co-located with its codec,
+  e.g. `codec.rs`'s own `#[cfg(test)] mod` or a `tests/format_fixtures.rs`
+  in the owning crate) that iterates every fixture file under its
+  `tests/fixtures/formats/<format>/` directory, decodes each with the
+  *current* code, and asserts the decoded value structurally (field-by-
+  field `assert_eq!` against a hand-written expected value, not just
+  "decodes without error" — a decoder that silently drops a field would
+  otherwise pass). Today, right after the Phase 0 reset, this is a single
+  `v1.<ext>` fixture per format; the test is written to iterate the
+  directory (`v1`, `v2`, ...) rather than name `v1` literally, so Phase 1
+  additions need no test-code change, only a new fixture file.
+- **Round-trip test:** a separate test that encodes a representative value
+  with the *current* version, decodes it back, and asserts equality —
+  catches an encoder/decoder asymmetry that a static fixture alone (which
+  only exercises decode) would miss.
+- **Fixture generation:** a fixture is never hand-written byte-for-byte.
+  Each format's test module gets a `#[ignore]`d generator test (run
+  explicitly, e.g. `cargo test -p <crate> --lib generate_fixture_<format>
+  -- --ignored`) that encodes a representative value with the *current*
+  version and writes it to
+  `tests/fixtures/formats/<format>/v<CURRENT>.<ext>` — but **refuses to
+  overwrite a file that already exists** (checks with `std::fs::metadata`
+  first and panics with a clear message telling the author to bump the
+  version instead). This, plus the CI guard below, is what makes "a
+  fixture is regenerated only when a version is deliberately bumped, never
+  silently" (this ADR's Testing section) an enforced property instead of a
+  convention.
+- **Determinism:** fixture *content* must not embed wall-clock time or
+  unseeded randomness (ADR 0003) — a fixture that encodes, say, a
+  `Metadata` value with a timestamp field uses a fixed, hand-chosen
+  constant (e.g. epoch 0, or a readable fixed date past 2000-01-01),
+  never `SystemTime::now()`, so the checked-in bytes are stable across
+  every future run and every future contributor's clock.
+
+### CI guard
+
+`scripts/check-format-fixtures.sh` fails the build if any file already
+present under `**/tests/fixtures/formats/**` at the merge base with
+`origin/main` has been modified or deleted on the current branch (a new
+file — a genuinely new version — is fine; that is the *only* legitimate way
+forward once a version has fixtures). It is a no-op pass when no such
+directory exists yet anywhere in the tree (true today, until the first
+Phase 0 workstream adds one). Wired into `.github/workflows/ci.yml`'s
+existing `gates` job as one more named step, after `rustfmt` and before
+`clippy` (cheapest gate first, matching that job's own step ordering
+rationale) — no restructuring of the job.
+
+### Phase 0 workstreams
+
+Five independent sessions, one PR series each, per the root `CLAUDE.md`
+"Session operating mode" rule that independent work runs in a separate
+session. Ordered by dependency (a later workstream reads an earlier one's
+landed convention, never its in-flight code); within a "wave" they can run
+concurrently since they touch disjoint crates. This PR (docs/policy +
+`scripts/check-format-fixtures.sh`) is the prerequisite all of them build
+on — none should start implementing before it merges, since it fixes the
+tag shape and fixture layout every workstream conforms to.
+
+| Workstream | Crate(s) | Formats reset | Depends on | Touches (do not touch, for the others) |
+|---|---|---|---|---|
+| **A** | `animus-storage` | LSM WAL record header (add magic+version, `LWL1`+v1); SSTable/manifest re-baseline (`MANIFEST_VERSION` → 1, keep the existing `CMF1` magic since it's already correct — only the version counter and the "read pre-binary-codec JSON" legacy fallback are in scope for removal, since that fallback is exactly the pre-baseline legacy path point 1 above says may be dropped); `SsTableMeta::format` reset to 1 with a real decode path so a *second* format value becomes meaningful before Phase 1 needs it; encryption envelope fixture (`ADE1` already has a version — no reset needed, just add its golden fixture) | none (self-contained crate) | `crates/animus-storage/**` only. Do not touch `animus-cp-data`'s or `animus-control`'s own WAL code even though they call into `animus-storage`'s `StorageEngine` trait — this workstream owns the trait's implementations, not its callers. |
+| **B** | `animus-control` | Raft WAL `Line<C, S>` envelope (add `CWL1`+v1, replacing the two-generation structural-sniff scheme in `persist.rs`); control-plane snapshot/`InstallSnapshot` payload envelope (`CSN1`+v1, wrapping `S`'s own serde shape); `Metadata`'s schema gets a top-level `"v": 1` field (`syskv.rs`'s mirror inherits it for free since it serializes the same struct); drop the `cp_member_addrs`/address-book legacy fields ADR 0032/0040 kept for pre-existing-cluster back-compat (Phase 0 is the point where "no production cluster yet" makes that safe) | none (self-contained crate, though B and C should coordinate on the shared `Line`-style envelope shape so they don't diverge — see C's own note) | `crates/animus-control/**` only. Do not touch `crates/animus-cp-data/src/shared_wal.rs`'s own `Line{tablet, record}` envelope — it looks similar but is workstream C's, not B's, even though both reuse `persist::encode_tagged_record`. |
+| **C** | `animus-cp-data` | RaftKV command codec re-baseline (`codec.rs::VERSION` 31 → 1); `SharedWal` outer `Line{tablet, record}` envelope (`SWL1`+v1 — the *inner* `record` bytes are already the versioned codec payload, unchanged shape, only the outer tag is new); segment codec re-baseline (`segment.rs::VERSION` 2 → 1); a version marker on the per-tablet engine key layout (ADR 0050's `kind \|\| logical` convention) — this one is a design task, not a mechanical tag-and-fixture: recommend a single reserved leading byte in the `kind` namespace itself (a `layout` epoch) rather than a per-record magic, since the layout is a key-space convention, not a framed record; document the chosen approach directly in `crates/animus-cp-data/CLAUDE.md`, this ADR does not prescribe the exact bit layout | B (for the shared `encode_tagged_record`/`Line`-shape convention, so C's `SharedWal` envelope and B's Raft WAL envelope don't independently invent incompatible tagging shapes for what is structurally the same "envelope wraps an inner payload" problem) | `crates/animus-cp-data/**` only. Do not touch `crates/animus-control/src/persist.rs` — read it for the shared convention, don't edit it. |
+| **D** | wire (`animus-node`, `animus-control`'s `RaftMsg`, `animus-cp-data`'s Raft messages) | A version field in the connection handshake/envelope for internal `Network` message enums (`RaftMsg<C>`, `ClientRequest`/`ClientResponse`) — **prep for Phase 2, not a Phase 1 compatibility mechanism yet**: today this only needs to *exist* and be checked for equality (both ends same build, as today), not gate anything, since real mixed-version wire compatibility is Phase 2's job. Keep changes additive (new field, `#[serde(default)]`-shaped where the enum crosses a version boundary) so Phase 2 can build on it without another reset. | none | `crates/animus-node/src/wire.rs`, the `RaftMsg`/Raft-message enum definitions in `animus-control`/`animus-cp-data`. Do not touch those crates' *storage* formats (A/B/C's territory) even though they live in the same files in some cases — a wire enum and a WAL record type in the same crate are still disjoint concerns; grep for the specific type names above before editing anything else nearby. |
+| **E** | `animusd`, `animus-operator` | `ClusterConfig` gets `"v": 1`; operator CRD real schema gets an explicit internal version marker (distinct from the Kubernetes `v1alpha1` API-version label, which stays as-is — this is about the CRD's *content* schema, not its API group version); backup manifest JSON body gets `"v": 1` (the manifest already reuses the chunk envelope's magic+version for its *data chunks*, `DATA_VERSION`; this is about the manifest's own top-level JSON body, a separate thing per the inventory table); PITR/export objects inherit the segment codec's reset from C, so E's own scope here is just confirming that inheritance holds, not re-versioning them independently | C (backup/PITR/export read the segment codec — E must land after C's `segment.rs` reset, or build against C's PR series directly if timing requires overlap) | `crates/animusd/**`, `crates/animus-operator/**`. Do not touch `crates/animus-cp-data/src/segment.rs` — read C's landed version, don't reset it a second time. |
+
+Wave 1 (no cross-workstream dependency): A, B, D. Wave 2: C (after B lands,
+for the shared envelope convention). Wave 3: E (after C lands, for the
+segment-codec reset it inherits). A, B, D can run fully concurrently in
+separate sessions from the start; C should start once B's convention is
+settled (a quick read of B's landed PR, not a long wait); E starts once C's
+`segment.rs` reset is on `main`. Each workstream session gets: this ADR
+(read in full), its own row above, root `CLAUDE.md`'s Phase 0 conventions
+section, the relevant crate `CLAUDE.md`(s), and the explicit do-not-touch
+list from its own row plus the others' "touches" columns.
 
 ## Testing
 
@@ -229,7 +485,15 @@ same way every other distributed behavior in this codebase is:
 
 ## Consequences
 
-- **Before this is accepted, nothing changes.** No format in the inventory
+- **As of the 2026-09-27 maintainer decision, this is accepted and Phase 0
+  is funded and in progress.** The paragraph below describes the original
+  proposal's assumption (before acceptance, nothing changes); it is kept
+  for record. What actually changes today: every format in the inventory
+  is queued for the Phase 0 reset (workstreams A–E above); nothing gains an
+  N-1 *compatibility* guarantee yet (that is Phase 1), but every format
+  does gain a version tag, a golden fixture, and a CI guard that a fixture
+  is never silently edited — a real, if partial, tightening starting now.
+- ~~Before this is accepted, nothing changes.~~ No format in the inventory
   above gains a compatibility guarantee by virtue of this ADR existing;
   Status stays Proposed until a maintainer decides to fund Phase 0.
 - **Phase 0 is cheap and has no downside** — it is defensive plumbing
@@ -252,29 +516,40 @@ same way every other distributed behavior in this codebase is:
 
 ## Open questions
 
-- **Support window length.** N-1 only, or a longer window (N-2, or a time-
-  boxed "supported upgrade path" like Kubernetes' skip-version policy)?
-  Longer windows cost more ongoing translation-path maintenance.
-- **Which formats go first inside Phase 1?** This ADR's inventory
-  prioritizes backups/PITR/export (already outlive the cluster) and the
-  RaftKV codec + LSM formats (highest change frequency, sit under
-  everything else) — but the actual sequencing is a sizing decision for
-  whoever picks this up, not fixed here.
-- **Freeze the Raft codec, or keep translating it?** `codec.rs` is already
-  at `VERSION = 31` after a comparatively short project history — an
-  N-1 translation requirement on a format that changes this often may
-  cost more than it's worth. An alternative is to *freeze* the wire/log
-  codec shape earlier and push future evolution into an envelope
-  (a schema-versioned inner payload the codec itself doesn't need to
-  understand), rather than requiring `codec.rs` to grow an N-1 decode path
-  for every future bump.
-- **The WAL back-compat fields ADR 0032/0040 already keep.** Those two
-  ADRs already carry ad hoc "old field still accepted" provisions for their
-  own narrow cases (node id / address-book history) — should Phase 0/1
-  formalize those into the same generic version-gate mechanism, or are
-  they narrow enough to stay as-is? Worth revisiting once Phase 0's
-  generic mechanism exists, rather than deciding now.
+- **Support window length, post-baseline.** Still open. Proposed default
+  (see Maintainer decision, point 3): *every post-baseline version stays
+  readable until the project's first tagged release defines an explicit
+  window*, since pre-alpha has no releases yet to size a window against.
+  Revisit at the first tagged release — N-1 only, N-2, or a time-boxed
+  "supported upgrade path" (Kubernetes' skip-version policy) are the
+  candidates, and longer windows cost more ongoing translation-path
+  maintenance.
+- **Which formats go first inside Phase 1?** Still open, but narrowed:
+  Phase 0's own workstream split (A–E above) already sequences the *reset*
+  by crate; Phase 1's own sequencing (which reset format gets its N-1
+  decode path first) still prioritizes backups/PITR/export (already
+  outlive the cluster) and the RaftKV codec + LSM formats (highest change
+  frequency, sit under everything else), but the actual order is a sizing
+  decision for whoever picks Phase 1 up, not fixed here.
+- **Freeze the Raft codec, or keep translating it?** Still open, and now
+  sharper: Phase 0 resets `codec.rs::VERSION` to 1, so this question is
+  really "how many more times will Phase 1 let it bump before freezing the
+  wire/log shape and pushing further evolution into a schema-versioned
+  inner envelope the codec itself doesn't need to understand." Not decided
+  here — a Phase 1 design question.
+- **The WAL back-compat fields ADR 0032/0040 already keep.** Resolved for
+  Phase 0: per the Maintainer decision point 1, Phase 0 workstream B drops
+  these outright rather than folding them into the generic version-gate
+  mechanism — "no production cluster yet" makes the pre-baseline case they
+  exist for moot. Still open for *anything of the same shape discovered
+  after the baseline*: a future one would need Phase 1's real N-1 decode
+  path, not another ad hoc field.
 - **Does the hash-ring/key-encoding layer belong in this plan at all**, or
   is it better served by staying a documented, deliberate breaking-change
-  category forever (i.e. explicitly *not* Phase-4-frozen), with Phase 1
-  covering everything else? See the Consequences section's note above.
+  category forever (i.e. explicitly *not* frozen even after Phase 1), with
+  Phase 1 covering everything else? Still open — see the Consequences
+  section's note above. Phase 0 does not resolve this either way: it is
+  reset like everything else (no version tag is added to it in this pass,
+  since it is a key-space convention, not a framed record — see the
+  inventory table's own note), but whether it ever gets a Phase 1
+  compatibility mechanism at all remains undecided.
