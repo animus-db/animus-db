@@ -825,12 +825,30 @@ pub enum Metric {
     /// reconciler itself keeps making progress on every other tablet
     /// regardless (that isolation is the fix this metric observes).
     CpReconcilerStopTimeout,
+
+    /// The current length of `ProdEnv`'s own `Inner::tasks` — the number of
+    /// `tokio::task::AbortHandle`s it is tracking for `shutdown`/
+    /// `shutdown_and_wait`, after whatever pruning `Spawner::spawn` has
+    /// already done (the ProdEnv task-handle-leak fix: this vec used to be
+    /// append-only for the lifetime of the env, so it — and the task
+    /// `Cell`s a live `AbortHandle` pins — grew without bound on any
+    /// per-message spawn path, most importantly `send_stream`'s one task
+    /// per outbound frame). A **level**, overwritten via `MetricsHandle::
+    /// set` on every `spawn` call (not incremented) — the same
+    /// last-write-wins shape a gauge-repurposed counter slot uses elsewhere
+    /// in this enum (see e.g. `CpGroupsQuiesced`'s own doc). Expected to
+    /// stay within a small constant factor (about 2x) of the genuinely
+    /// live spawned-task count in steady state; a sustained value far above
+    /// that, or one that keeps climbing, points at a caller spawning
+    /// without ever letting its tasks finish (a real leak, not this
+    /// bounded-pruning mechanism doing its job).
+    SpawnedTaskHandlesTracked,
 }
 
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 98] = [
+    pub const ALL: [Metric; 99] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -929,6 +947,7 @@ impl Metric {
         Metric::CpRouteFanoutExhausted,
         Metric::CpHousekeepingProposalsAccepted,
         Metric::CpReconcilerStopTimeout,
+        Metric::SpawnedTaskHandlesTracked,
     ];
 
     /// The stable exported name of this metric (snake_case, used as the text
@@ -1034,6 +1053,7 @@ impl Metric {
             Metric::CpRouteFanoutExhausted => "cp_route_fanout_exhausted",
             Metric::CpHousekeepingProposalsAccepted => "cp_housekeeping_proposals_accepted",
             Metric::CpReconcilerStopTimeout => "cp_reconciler_stop_timeout",
+            Metric::SpawnedTaskHandlesTracked => "spawned_task_handles_tracked",
         }
     }
 
