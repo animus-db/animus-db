@@ -144,6 +144,40 @@ the production implementation; the deterministic implementation lives in
   `#[doc(hidden)]`, always-compiled (not `#[cfg(test)]`) cross-crate test
   helper, since `#[cfg(test)]` only gates this crate's own test binaries and
   `animus-sim`'s `SimSegmentStore` tests need the same assertions.
+- **`handshake.rs`** (ADR 0073 Phase 0, workstream D) — a per-connection
+  handshake preamble: `Preamble { magic: [u8;4], version: u8, extensions:
+  Vec<u8> }`, byte layout `magic[4] | version:u8 | ext_len:u16 LE |
+  ext[ext_len]` (`HEADER_LEN = 7`, `ext` capped at `MAX_EXTENSION_LEN =
+  1024`), `encode`/`decode` (the latter incremental-read-friendly: returns
+  a distinct `Incomplete` so a caller can read `HEADER_LEN` bytes, decode,
+  then read `ext_len` more), and `check_peer(expected, peer)` — v1 policy
+  is **exact version equality**, Phase 2's job to relax to a supported-
+  range intersection via the `ext` area this version carries through
+  unrejected but never interprets. Two independently-versioned
+  `ProtocolSpec` constants: `NETWORK_PROTOCOL` (magic `NHS1`, the internal
+  `Network`/`Env` transport ADR 0026 multiplexes many `(node, stream)`
+  instances over) and `CLIENT_PROTOCOL` (magic `CHS1`, the client/intra
+  JSON-RPC wire — lives here rather than in `animus-node` since that crate
+  already depends on this one's unconditional surface, so one codec
+  serves both instead of two). **Unconditional, no `prod` feature, no new
+  dependency** — pure codec, no socket/clock/RNG. `decode` is deliberately
+  protocol-agnostic (doesn't take an expected spec) so it composes with
+  incremental reads and so `check_peer` is the one place an expectation
+  exists to attribute a refusal to the right protocol — see
+  `docs/lessons/code-patterns/`'s matching 2026-09-28 entry for why that
+  split, not a fused decode-and-check, is the right shape. **This layer
+  builds only the codec and check — nothing wires it into a transport
+  yet.** A later layer wires it into `ProdEnv`'s accept/connect paths
+  (paying the check once per pooled connection, not once per frame/
+  heartbeat — the cost `ProdEnv`'s "pools one outbound TCP connection per
+  destination" entry below already amortizes for connection setup in
+  general), `animusd`'s client/intra port, and — since `SimEnv` has no
+  real connections at all — a per-node version checked on delivery via
+  this same `check_peer`, standing in for the connection-shaped check a
+  connectionless simulator can't otherwise express. `Metric::
+  NetworkHandshakeRefused`/`Metric::ClientHandshakeRefused`
+  (`metrics.rs`, below) exist for that later wiring to increment; nothing
+  in this layer increments them.
 - `metrics.rs` — the **observability seam** (ADR 0015): a closed `Metric` enum
   (`control_*` Raft + `storage_*` LSM-engine counters, plus legacy `data_*`
   leaderless-AP counters that are **dormant** — the AP plane was deleted, ADR

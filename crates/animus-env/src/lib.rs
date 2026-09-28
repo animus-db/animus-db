@@ -80,6 +80,20 @@ pub use s3_store::S3SegmentStore;
 pub mod metrics;
 pub use metrics::{Metric, MetricSink, MetricSnapshot, MetricsHandle};
 
+/// A per-connection handshake preamble (ADR 0073 Phase 0, workstream D) —
+/// prep for Phase 2's mixed-version wire compatibility, not a compatibility
+/// mechanism itself yet. Unconditional (no `prod` feature needed, no new
+/// dependencies): pure codec + a version-equality check, with no socket or
+/// `SimEnv` type anywhere in it. See the module's own doc for the byte
+/// layout, why a per-connection preamble beats a per-message field, and
+/// exactly what later layers (`ProdEnv`'s accept/connect paths, `animusd`'s
+/// client/intra port, `SimEnv`'s per-node delivery check) still have to
+/// wire this into.
+pub mod handshake;
+pub use handshake::{
+    CLIENT_PROTOCOL, HandshakeError, MAX_EXTENSION_LEN, NETWORK_PROTOCOL, Preamble, ProtocolSpec,
+};
+
 pub mod test_support;
 
 /// Stable identifier for a node in the cluster.
