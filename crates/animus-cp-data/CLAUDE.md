@@ -1952,6 +1952,38 @@ disambiguation is needed.
   absorbed data was about to be served elsewhere — was removed along with
   `TeardownKind::Absorb`; see the Key invariants entry above for what
   remains of that mechanism's lesson.)
+- **`Reconciler` teardown closes the tablet's stream (ADR 0026, 2026-09-28
+  amendment).** `teardown` calls `self.env.close_stream(tablet.0)` in all
+  three of its exit paths, each **only once the driver is confirmed
+  stopped** (never eagerly — see `Network::close_stream`'s own caller
+  contract, ADR 0026): the immediate-stop path (right after the `while
+  !node.is_stopped()` loop above exits without parking), `sweep_stopping`'s
+  own finishing branch (right after it observes `is_stopped()` true for a
+  previously-parked teardown), and the zombie-claim backstop (immediately,
+  since there is no driver there at all to still be polling). This is the
+  actual fix for a real, live-measured leak: a tablet released from this
+  node (a split parent, or a replica dropped by reconfiguration) whose
+  peers keep addressing it during the teardown grace window used to have
+  its frames queue in this node's `Demux`/`SimEnv` inbox forever — closing
+  the stream here means such a frame is now discarded-and-counted at
+  arrival instead. The stream reopens automatically the moment this node
+  re-hosts the same tablet again (`RaftKvNode::start_hosted*`'s own driver
+  calling `recv_stream(stream)` for the first time since the close), so a
+  node dropped from a tablet's replica set and later re-added is not
+  permanently locked out. **Investigated and confirmed NOT to need the
+  same fix**: `HeartbeatBatcher`'s own per-group `HeartbeatInbox`
+  (`heartbeat_batch.rs`) already deregisters correctly — `unregister_hosted`
+  runs from the consensus loop's own `halted` branch, before `stopped` is
+  set, so by the time `Reconciler::teardown`'s `is_stopped()` check can
+  ever see `true`, the heartbeat demux registration is already gone. See
+  ADR 0026's 2026-09-28 amendment for the full design record (the
+  close/reopen/tombstone semantics, and why an explicit close was chosen
+  over inferring "abandoned" from a liveness heuristic) and `tests/
+  demux_stream_teardown.rs` for the fault-injecting end-to-end regression
+  (a live follower released under message loss/delay, mirroring the
+  `ANIMUS_RECONFIGURE_DROP_SEEDS` corpus's own shape, issue #781 — proving
+  the released node's stream ends empty and tombstoned, convergence still
+  holds, and a later re-add reopens it).
 
 ## What's non-obvious
 
@@ -2532,7 +2564,7 @@ disambiguation is needed.
 
 ## Tests
 
-`cargo test -p animus-cp-data`. All but two of the 28 test binaries drive
+`cargo test -p animus-cp-data`. All but two of the 29 test binaries drive
 `SimEnv` — use `run_for`/`run_until`, never `run()` (the driver has perpetual
 heartbeat/election timers). Linearizable reads are async (a read-barrier probe
 round), so drive them as spawned tasks + `run_for`, and never `block_on` a
@@ -2559,7 +2591,12 @@ is its "drop a healthy voter" sibling, issue #781 — a direct
 `CasTabletReplicas` drop of a live follower, and separately the leader
 itself, through the real `spawn_reconfigure_loop`/`reconfigure_step`,
 asserting the removed replica does not go on to disrupt the converged group;
-depth knob `ANIMUS_RECONFIGURE_DROP_SEEDS`), the ADR 0026/0041/0042/0043
+depth knob `ANIMUS_RECONFIGURE_DROP_SEEDS`; `tests/demux_stream_teardown.rs`
+is the ADR 0026 2026-09-28 stream-teardown sibling — the same "drop a live
+follower" shape, but through the real `host::Reconciler` under injected
+message loss/delay, asserting the released node's own stream ends empty and
+tombstoned, convergence holds, and a later re-add reopens it), the ADR
+0026/0041/0042/0043
 stream-addressing/`KindBatch`/`KIND_CURSOR`/`ClusterSegmentStore` suites,
 the ADR 0018 HLC/MVCC/range-seal/transaction suites, the `host.rs`
 reconciler end to end, the ADR 0044 phase-2 heartbeat-batcher baseline

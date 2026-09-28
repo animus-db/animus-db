@@ -377,6 +377,37 @@ function of one seed. This is the substrate every distributed test runs on.
   streams to one node don't cross-talk, and the run — trace included —
   reproduces byte-for-byte from the seed).
 
+- **Stream teardown — `Network::close_stream` (ADR 0026, 2026-09-28
+  amendment).** `SimState` gained `closed_streams: BTreeSet<(NodeId, u64)>`
+  — the `SimEnv` twin of `ProdEnv`'s `Demux::closed`. `close_stream(stream)`
+  drops that `(node, stream)`'s inbox queue and any parked waker and
+  inserts the tombstone; `fire_event`'s `Deliver` arm drops a frame
+  addressed to a closed `(node, stream)` (traced `TraceEvent::Drop {
+  reason: "stream-closed", .. }`, the same shape a crashed-node or
+  partitioned-link drop already uses) instead of queuing it.
+  `recv_stream(stream)` unconditionally clears the tombstone before ever
+  awaiting — reopening it — so a node re-added to a tablet after being
+  dropped from it (same stream id, `= tablet_id`) is not permanently
+  poisoned. A stream that was **never** closed is untouched: it keeps the
+  pre-existing buffer-before-first-`recv` behavior (the split-fork
+  "Deterministic first leader" mechanism, `animus-cp-data/CLAUDE.md`,
+  depends on exactly this) — closed and never-opened are deliberately
+  distinct states, `closed_streams` recording only the former. `crash`/
+  `stop` clear a restarting node's own `closed_streams` entries alongside
+  its `inboxes`/`recv_wakers` (the identical `node_prefix_keys`-style
+  prefix scan below, generalized to a `BTreeSet` via the new
+  `node_prefix_set_keys`) — a restarted node starts with no tombstones,
+  exactly like a fresh `ProdEnv` process. No new RNG draw or timeline event
+  shape (closing/reopening/dropping-on-closed are all synchronous
+  deterministic map operations), so the determinism argument is unaffected.
+  `Simulator::inbox_len`/`Simulator::stream_is_closed` are test-only
+  observability accessors (mirroring `ProdEnv::inbox_stats`'s per-stream
+  `frames` field and closed-state respectively) — `tests/stream_close.rs`
+  is the dedicated regression, and `animus-cp-data`'s `tests/
+  demux_stream_teardown.rs` is the fault-injecting end-to-end sibling
+  (a live follower released from a tablet's replica set under message
+  loss/delay, through the real `host::Reconciler`).
+
 - **`SimState::node_prefix_keys` (issue #841) is the one place the
   `disks`/`inboxes`/`recv_wakers` node-prefix scans live**, replacing seven
   call sites (`wipe_disk` ×1, `crash` ×3, `stop` ×3) that used to be a full

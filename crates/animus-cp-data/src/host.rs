@@ -2041,6 +2041,12 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
                 "reconciler: tearing down a tablet with no live handle (zombie claim)"
             );
             (self.on_teardown)(tablet);
+            // No live driver ever existed for this claim, so there is
+            // nothing that could still be polling `recv_stream(tablet.0)` —
+            // safe to close immediately (ADR 0026, 2026-09-28 amendment).
+            // See this method's own doc for the general close-only-after-
+            // confirmed-stopped rule this still satisfies (vacuously here).
+            self.env.close_stream(tablet.0);
             self.erase_tablet_files(tablet).await;
             self.state.confirm_torn_down(tablet);
             return;
@@ -2055,7 +2061,11 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
                 // again), and leave `state`/`hosted` untouched so `plan`
                 // keeps re-emitting this same action (which the check at
                 // the top of this method turns into a no-op) until
-                // `sweep_stopping` confirms the teardown complete.
+                // `sweep_stopping` confirms the teardown complete. The
+                // stream stays OPEN while parked — see `sweep_stopping`'s
+                // own close-on-confirm site, and this method's own doc's
+                // "close only after `is_stopped()`" rule (the driver is not
+                // yet confirmed stopped here, so it may still be polling).
                 self.stopping.insert(
                     tablet,
                     StoppingNode {
@@ -2068,6 +2078,17 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
             }
             self.env.sleep(RECLAIM_STOP_POLL).await;
         }
+
+        // `is_stopped()` just returned true: the driver has genuinely
+        // stopped polling `recv_stream(tablet.0)`, so it is now safe to
+        // retire that stream (ADR 0026, 2026-09-28 amendment) — a peer that
+        // keeps addressing this tablet during the teardown grace window (a
+        // stale routing entry, an in-flight reconfigure) has its frames
+        // dropped-and-counted instead of queuing forever. Closing any
+        // earlier — while the driver might still be polling — would race
+        // `recv_stream`'s own unconditional reopen (see `Network::
+        // close_stream`'s doc) and silently undo the close.
+        self.env.close_stream(tablet.0);
 
         // ADR 0050 rung 1: a tablet's engine is private, so teardown reduces
         // to deleting its files whole — instant, real space reclaim, no
@@ -2102,7 +2123,11 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
                     .remove(&tablet)
                     .expect("just observed in the map above");
                 // Mirrors `teardown`'s own stopped-driver tail exactly (ADR
-                // 0050 rung 1: whole-engine deletion).
+                // 0050 rung 1: whole-engine deletion; ADR 0026's 2026-09-28
+                // amendment for the stream close — `is_stopped()` just
+                // confirmed true, so nothing can still be polling
+                // `recv_stream(tablet.0)`).
+                self.env.close_stream(tablet.0);
                 drop(stopping.node);
                 self.erase_tablet_files(tablet).await;
                 self.state.confirm_torn_down(tablet);
@@ -3076,6 +3101,14 @@ mod tests {
                 .pending_release
                 .contains_key(&TabletId(1)),
             "confirm_torn_down must also clear any leftover pending_release entry"
+        );
+        // ADR 0026, 2026-09-28 amendment: even the zombie-claim backstop
+        // (no live driver to poll `is_stopped()` on at all) must still
+        // close the tablet's stream — vacuously safe here since no driver
+        // ever existed to still be polling it.
+        assert!(
+            sim.stream_is_closed(base(), TabletId(1).0),
+            "teardown's zombie-claim path must close the tablet's stream"
         );
     }
 

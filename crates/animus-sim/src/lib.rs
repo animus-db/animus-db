@@ -564,6 +564,20 @@ struct SimState {
     // single-stream-per-node inbox.
     inboxes: BTreeMap<(NodeId, u64), VecDeque<Envelope>>,
     recv_wakers: BTreeMap<(NodeId, u64), Waker>,
+    /// Streams explicitly retired via [`SimEnv::close_stream`] and not yet
+    /// reopened by a subsequent `recv_stream` (ADR 0026, 2026-09-28
+    /// amendment) — the `SimEnv` twin of `ProdEnv`'s `Demux::closed`. A
+    /// frame delivered (`fire_event`'s `Deliver` arm) to a closed `(node,
+    /// stream)` is dropped exactly like a delivery to a crashed node or a
+    /// partitioned link, traced as `TraceEvent::Drop { reason:
+    /// "stream-closed", .. }`. Bounded the same way `Demux::closed` is
+    /// (see that field's own doc): one tombstone per tablet this node has
+    /// ever hosted and torn down, removed the instant `recv_stream` is next
+    /// called for that stream, or when the node crashes/stops (mirroring
+    /// `inboxes`/`recv_wakers`' own per-node-prefix clear — a restarted
+    /// node starts with no tombstones, exactly like a fresh `ProdEnv`
+    /// process).
+    closed_streams: BTreeSet<(NodeId, u64)>,
 
     disks: BTreeMap<(NodeId, String), FileState>,
 
@@ -600,6 +614,21 @@ impl SimState {
         map.range((node.clone(), K::default())..)
             .take_while(|((n, _), _)| n == node)
             .map(|(k, _)| k.clone())
+            .collect()
+    }
+
+    /// [`node_prefix_keys`](Self::node_prefix_keys)'s `BTreeSet` twin — same
+    /// prefix-scan shape, for `closed_streams` (a set, not a map). Used by
+    /// [`Simulator::crash`]/[`Simulator::stop`] to clear a restarting node's
+    /// stream-closed tombstones alongside its inbox (issue #841's scan
+    /// pattern, ADR 0026's 2026-09-28 amendment).
+    fn node_prefix_set_keys<K>(set: &BTreeSet<(NodeId, K)>, node: &NodeId) -> Vec<(NodeId, K)>
+    where
+        K: Ord + Clone + Default,
+    {
+        set.range((node.clone(), K::default())..)
+            .take_while(|(n, _)| n == node)
+            .cloned()
             .collect()
     }
 
@@ -843,6 +872,7 @@ impl Simulator {
             nodes: BTreeSet::new(),
             inboxes: BTreeMap::new(),
             recv_wakers: BTreeMap::new(),
+            closed_streams: BTreeSet::new(),
             disks: BTreeMap::new(),
             partitions: BTreeSet::new(),
             crashed: BTreeSet::new(),
@@ -1078,6 +1108,14 @@ impl Simulator {
         for k in waker_keys {
             st.recv_wakers.remove(&k);
         }
+        // A restarted process starts with no stream-closed tombstones,
+        // exactly like a fresh `ProdEnv` (ADR 0026, 2026-09-28 amendment):
+        // `Demux::closed` lives only in that process's own memory, so a
+        // crash (which drops volatile state) must drop these too.
+        let closed_keys = SimState::node_prefix_set_keys(&st.closed_streams, &node);
+        for k in closed_keys {
+            st.closed_streams.remove(&k);
+        }
         let (torn, corrupt) = {
             let cfg = st.disk_cfg_for(&node);
             (cfg.torn_tail_on_crash, cfg.corrupt_on_crash)
@@ -1207,6 +1245,12 @@ impl Simulator {
         let waker_keys = SimState::node_prefix_keys(&st.recv_wakers, &node);
         for k in waker_keys {
             st.recv_wakers.remove(&k);
+        }
+        // Mirrors `crash`'s own clear (ADR 0026, 2026-09-28 amendment): a
+        // stopped-then-restarted process starts with no tombstones either.
+        let closed_keys = SimState::node_prefix_set_keys(&st.closed_streams, &node);
+        for k in closed_keys {
+            st.closed_streams.remove(&k);
         }
         let keys = SimState::node_prefix_keys(&st.disks, &node);
         for k in keys {
@@ -1385,6 +1429,31 @@ impl Simulator {
         Nanos(self.shared.lock().clock)
     }
 
+    /// Test/observability accessor: how many frames are currently queued in
+    /// `node`'s inbox for `stream` (ADR 0026, 2026-09-28 amendment) — `0`
+    /// for a stream with no entry at all, exactly like `ProdEnv::
+    /// inbox_stats`'s per-stream `frames` field. Used by fault-injection
+    /// corpora asserting a released tablet's stream ends genuinely empty,
+    /// not merely closed.
+    #[must_use]
+    pub fn inbox_len(&self, node: NodeId, stream: u64) -> usize {
+        self.shared
+            .lock()
+            .inboxes
+            .get(&(node, stream))
+            .map_or(0, VecDeque::len)
+    }
+
+    /// Test/observability accessor: whether `node`'s `stream` is currently
+    /// marked **closed** (ADR 0026, 2026-09-28 amendment) — `true` from the
+    /// moment [`Network::close_stream`] runs until the next
+    /// [`Network::recv_stream`] for the same `(node, stream)` reopens it,
+    /// or the node crashes/stops.
+    #[must_use]
+    pub fn stream_is_closed(&self, node: NodeId, stream: u64) -> bool {
+        self.shared.lock().closed_streams.contains(&(node, stream))
+    }
+
     /// A pure, additive, seed-reproducible measure of how much executor
     /// work this run has done so far — see [`SimStats`]'s own doc. Cheap
     /// (two `Relaxed` atomic loads, no lock); safe to call at any point,
@@ -1549,6 +1618,20 @@ impl Simulator {
                             to,
                             stream,
                             reason: "crashed",
+                        });
+                        None
+                    } else if st.closed_streams.contains(&(to.clone(), stream)) {
+                        // ADR 0026, 2026-09-28 amendment: a frame addressed
+                        // to a stream this node has explicitly closed (and
+                        // not yet reopened via `recv_stream`) is discarded
+                        // rather than queued — the `SimEnv` mirror of
+                        // `ProdEnv`'s `Demux`-closed drop in `spawn_pump`.
+                        st.trace.push(TraceEvent::Drop {
+                            t,
+                            from,
+                            to,
+                            stream,
+                            reason: "stream-closed",
                         });
                         None
                     } else if st.partitions.contains(&(from.clone(), to.clone())) {
@@ -1781,12 +1864,39 @@ impl Network for SimEnv {
     }
 
     async fn recv_stream(&self, stream: u64) -> Envelope {
+        // Reopen (ADR 0026, 2026-09-28 amendment): mirrors `ProdEnv::
+        // recv_stream`'s own reopen exactly — clear this stream's closed
+        // mark, if any, before ever awaiting. A never-closed stream is
+        // untouched (removing an absent key is a no-op), preserving the
+        // load-bearing buffer-before-first-`recv` behavior.
+        {
+            let mut st = self.shared.lock();
+            st.closed_streams.remove(&(self.node_id.clone(), stream));
+        }
         Recv {
             shared: Arc::clone(&self.shared),
             node: self.node_id.clone(),
             stream,
         }
         .await
+    }
+
+    fn close_stream(&self, stream: u64) {
+        debug_assert_ne!(
+            stream,
+            crate::PRIMARY_STREAM,
+            "closing PRIMARY_STREAM is never correct — it is the node's own \
+             control-plane/non-split-tablet stream, never a retired tablet's"
+        );
+        let key = (self.node_id.clone(), stream);
+        let mut st = self.shared.lock();
+        // Never wake a parked receiver here — see `Network::close_stream`'s
+        // own doc: the caller contract is that nothing is still polling
+        // this stream, so any lingering waker belongs to a task that is
+        // already gone.
+        st.inboxes.remove(&key);
+        st.recv_wakers.remove(&key);
+        st.closed_streams.insert(key);
     }
 }
 

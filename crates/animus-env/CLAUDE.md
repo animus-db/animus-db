@@ -671,6 +671,49 @@ the production implementation; the deterministic implementation lives in
   timing residue and much larger bursts addressed to a peer whose own
   consumer never started at all, not one single mechanism).
 
+- **Stream teardown — `Network::close_stream` (ADR 0026, 2026-09-28
+  amendment — the first of the two follow-up PRs the measure-only entry
+  above named).** A required `Network` method (`ProdEnv`/`SimEnv`/every
+  test-double `Network` implementor), fixing the "small per-split
+  teardown-timing residue" half of the live measurement above (the other
+  half — a stream whose consumer never starts polling at all — is a
+  separate cap, a later PR). `close_stream(stream)`: drops the stream's
+  queued frames, its parked receiver's waker, and its bookkeeping
+  (`ProdEnv`'s `StreamMeta` entry), and marks it **closed** in a new
+  `Demux::closed`/`SimState::closed_streams` set. While closed, an
+  arriving frame is discarded and counted
+  (`Metric::DemuxFramesDroppedClosed`, ProdEnv; `SimEnv` traces it as
+  `TraceEvent::Drop { reason: "stream-closed", .. }`) rather than queued —
+  this is the actual fix. `recv_stream(stream)` unconditionally clears the
+  closed mark before ever awaiting, on every call — **reopening** a closed
+  stream, required because a node can be dropped from a tablet's replica
+  set and later re-added, reusing the same stream id (`= tablet_id`). A
+  stream that was **never** closed is completely untouched by any of
+  this — it keeps the pre-existing buffer-before-first-`recv` behavior,
+  which is load-bearing (`animus-cp-data/CLAUDE.md`'s "Deterministic first
+  leader" split-fork mechanism depends on exactly this for a freshly-
+  materialized child's very first `PreVote`) — "not yet opened" and
+  "closed" are deliberately two distinct states, never conflated.
+  Tombstones are bounded by tablets-ever-hosted-and-torn-down, never by
+  traffic, and a restarted process starts with none (`Simulator::crash`/
+  `stop` clear `closed_streams` for the restarting node alongside
+  `inboxes`/`recv_wakers`, mirroring issue #841's existing node-prefix-scan
+  discipline — a fresh `ProdEnv` process needs no equivalent clear, since
+  `Demux` is that process's own in-memory state to begin with). Closing
+  `PRIMARY_STREAM` (or any other reserved stream constant) is
+  `debug_assert`ed against, never silently accepted. Caller contract: only
+  close a stream whose consumer is confirmed stopped — closing one a task
+  might still be `recv_stream`-ing would have that same call's own
+  unconditional reopen silently undo the close. `animus-cp-data`'s
+  `host::Reconciler::teardown` is the one production caller, gated on
+  `RaftKvNode::is_stopped()` — see that crate's own CLAUDE.md entry. See
+  ADR 0026's 2026-09-28 amendment for the full design record (including
+  why an explicit close was chosen over inferring "abandoned" from a
+  liveness heuristic) and
+  `docs/lessons/code-patterns/2026-09-28-an-unread-per-key-inbox-needs-a-
+  consumer-lifecycle-teardown-not-just-a-bound.md` for the generalized
+  lesson.
+
 - **TLS on the intra-node wire (ADR 0064, S-01 step 1) — `tls.rs`, config-gated,
   default off, byte-for-byte unchanged when unconfigured.** `TlsConfig
   {cert_path, key_path, ca_path: Option<PathBuf>}` names three PEM files —

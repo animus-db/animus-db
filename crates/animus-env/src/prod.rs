@@ -78,10 +78,26 @@ struct Demux {
     /// (`spawn_pump`) and pop (`RecvStream::poll`) sites — O(1) per
     /// frame, no scan of `queues` itself required to answer "how many
     /// bytes/frames are queued right now" (see [`ProdEnv::inbox_stats`]).
-    /// Never pruned when a stream's queue empties (mirrors `queues`'/
-    /// `wakers`' own never-torn-down lifetime — this crate's later PRs
-    /// address teardown; this one only measures).
+    /// Never pruned when a stream's queue empties — a still-open stream's
+    /// bookkeeping outlives an empty queue by design (this is what makes
+    /// `ever_polled`/`last_pop` meaningful); an explicitly [`close_stream`]d
+    /// stream's entry IS pruned, see `closed` below.
+    ///
+    /// [`close_stream`]: ProdEnv::close_stream
     stream_meta: BTreeMap<u64, StreamMeta>,
+    /// Streams explicitly retired via [`ProdEnv::close_stream`] and not yet
+    /// reopened by a subsequent `recv_stream` call (ADR 0026, 2026-09-28
+    /// amendment). Bounded by the number of tablets this node has ever
+    /// *hosted and torn down* — never by traffic volume — since a tombstone
+    /// is inserted only at an explicit close and removed the moment
+    /// `recv_stream` is next called for that stream (or the node itself
+    /// restarts, a fresh `ProdEnv` process starting with none). A stream
+    /// never closed is simply absent here, which is exactly "not yet
+    /// opened" staying indistinguishable from "ordinary, never-closed
+    /// stream" — the distinction this set exists to make is solely
+    /// "was `close_stream` ever called for this stream, since its last
+    /// reopen."
+    closed: BTreeSet<u64>,
 }
 
 /// One stream's observability bookkeeping inside [`Demux`] — see that
@@ -306,7 +322,8 @@ impl ProdEnv {
         let local_addr = listener.local_addr()?;
         let (raw_rx, accept_abort) = spawn_accept(listener, tls.clone());
         let demux = Arc::new(StdMutex::new(Demux::default()));
-        let pump_abort = spawn_pump(raw_rx, Arc::clone(&demux));
+        let metrics = MetricsHandle::recording();
+        let pump_abort = spawn_pump(raw_rx, Arc::clone(&demux), metrics.clone());
 
         let raw = RawFsDisk {
             data_dir,
@@ -336,7 +353,7 @@ impl ProdEnv {
                 tasks: StdMutex::new(vec![accept_abort, pump_abort]),
                 task_panics: AtomicU64::new(0),
                 first_task_panic: StdMutex::new(None),
-                metrics: MetricsHandle::recording(),
+                metrics,
             }),
         };
         Ok((env, local_addr))
@@ -643,18 +660,31 @@ async fn read_frames(
 /// `recv_stream` is done with the demux lock dropped first (never wake while
 /// holding a lock another poll might need). Runs until the accept loop's sender
 /// side is dropped (env shutdown).
+///
+/// A frame addressed to a [`Demux::closed`] stream (ADR 0026, 2026-09-28
+/// amendment) is dropped here rather than queued — counted via
+/// [`Metric::DemuxFramesDroppedClosed`] — since nothing will ever `recv` a
+/// closed stream's frames until it is reopened, and queuing them anyway
+/// would just reproduce the exact unbounded-growth defect closing the
+/// stream exists to fix.
 fn spawn_pump(
     mut raw_rx: mpsc::UnboundedReceiver<Envelope>,
     demux: Arc<StdMutex<Demux>>,
+    metrics: MetricsHandle,
 ) -> tokio::task::AbortHandle {
     let handle = tokio::spawn(async move {
         while let Some(env) = raw_rx.recv().await {
             let stream = env.stream;
             let waker = {
                 let mut d = demux.lock().expect("demux poisoned");
-                d.stream_meta.entry(stream).or_default().bytes += env.payload.len();
-                d.queues.entry(stream).or_default().push_back(env);
-                d.wakers.remove(&stream)
+                if d.closed.contains(&stream) {
+                    metrics.incr(Metric::DemuxFramesDroppedClosed);
+                    None
+                } else {
+                    d.stream_meta.entry(stream).or_default().bytes += env.payload.len();
+                    d.queues.entry(stream).or_default().push_back(env);
+                    d.wakers.remove(&stream)
+                }
             };
             if let Some(w) = waker {
                 w.wake();
@@ -865,11 +895,41 @@ impl Network for ProdEnv {
     }
 
     async fn recv_stream(&self, stream: u64) -> Envelope {
+        // Reopen (ADR 0026, 2026-09-28 amendment): clear this stream's
+        // closed mark, if any, before ever awaiting — see this trait
+        // method's own doc for why a stream that was never closed is
+        // untouched by this (removing an absent key from a `BTreeSet` is a
+        // no-op) and why this must happen unconditionally on every call,
+        // not just the first, since a caller may `recv_stream` the same
+        // stream many times over its lifetime.
+        {
+            let mut d = self.inner.demux.lock().expect("demux poisoned");
+            d.closed.remove(&stream);
+        }
         RecvStream {
             demux: Arc::clone(&self.inner.demux),
             stream,
         }
         .await
+    }
+
+    fn close_stream(&self, stream: u64) {
+        debug_assert_ne!(
+            stream,
+            crate::PRIMARY_STREAM,
+            "closing PRIMARY_STREAM is never correct — it is the node's own \
+             control-plane/non-split-tablet stream, never a retired tablet's"
+        );
+        // Never wake a parked receiver here: the caller contract (see this
+        // method's own trait doc) is that nothing is still polling this
+        // stream by the time this is called, so any lingering waker belongs
+        // to a task that is already gone — dropping it (not waking it) is
+        // correct either way.
+        let mut d = self.inner.demux.lock().expect("demux poisoned");
+        d.queues.remove(&stream);
+        d.stream_meta.remove(&stream);
+        d.wakers.remove(&stream);
+        d.closed.insert(stream);
     }
 }
 
@@ -2230,6 +2290,131 @@ mod tests {
             s_after.since_last_pop_ms.is_some(),
             "popped at least once — must now report Some(elapsed), not None"
         );
+
+        a.shutdown();
+        b.shutdown();
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+    /// ADR 0026's 2026-09-28 amendment: `close_stream` drops a stream's
+    /// queued frames and marks it closed; a frame arriving afterward is
+    /// discarded and counted (`Metric::DemuxFramesDroppedClosed`), never
+    /// queued; a later `recv_stream` reopens it and delivery resumes. Real
+    /// loopback sockets, two `ProdEnv` instances, mirroring this file's own
+    /// `inbox_stats_reports_an_unread_streams_frames_and_bytes_then_drains_
+    /// on_pop` bring-up. Converged-or-timeout polling throughout — no fixed
+    /// sleeps for frame arrival (the pump is a background task).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn close_stream_drops_queued_frames_and_reopens_on_recv() {
+        use crate::{Env, Metric, Network};
+
+        const STREAM: u64 = 91;
+        const N: usize = 10;
+        const VALUE_LEN: usize = 16;
+
+        let dir_a = unique_tmp_dir();
+        let dir_b = unique_tmp_dir();
+        let loop0 = || "127.0.0.1:0".parse::<SocketAddr>().unwrap();
+        let (a, a_addr) = ProdEnv::bind(nid(0), loop0(), &dir_a)
+            .await
+            .expect("bind a");
+        let (b, _) = ProdEnv::bind(nid(1), loop0(), &dir_b)
+            .await
+            .expect("bind b");
+        b.set_peers([(nid(0), a_addr.to_string())].into_iter().collect());
+
+        // Send N frames to `a` on STREAM and wait (converged-or-timeout, no
+        // fixed sleep) until the pump has filed all of them, unread.
+        for i in 0..N {
+            b.send_stream(nid(0), STREAM, vec![i as u8; VALUE_LEN])
+                .await;
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if a.inbox_stats(0).total_frames >= N {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "pump never filed all {N} frames for stream {STREAM}"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // Close the stream: its queue must drop to zero immediately (no
+        // consumer was ever polling it here, so the caller contract holds).
+        a.close_stream(STREAM);
+        let after_close = a.inbox_stats(0);
+        assert_eq!(
+            after_close.total_frames, 0,
+            "close_stream must drop every already-queued frame"
+        );
+        assert_eq!(after_close.total_bytes, 0);
+
+        // M more frames sent while closed must be dropped-and-counted, never
+        // queued.
+        const M: usize = 4;
+        let before_dropped = a.metrics().get(Metric::DemuxFramesDroppedClosed);
+        for i in 0..M {
+            b.send_stream(nid(0), STREAM, vec![i as u8; VALUE_LEN])
+                .await;
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let dropped = a.metrics().get(Metric::DemuxFramesDroppedClosed) - before_dropped;
+            if dropped >= M as u64 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "pump never counted all {M} frames dropped against the closed stream"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            a.inbox_stats(0).total_frames,
+            0,
+            "a frame arriving for a closed stream must never be queued"
+        );
+
+        // recv_stream reopens: a subsequent send must now be delivered and
+        // received normally.
+        //
+        // The receiver is spawned and confirmed genuinely PARKED (via
+        // `inbox_stats`'s `waker_parked`, which only goes true once
+        // `RecvStream::poll`'s pending arm has actually run — after
+        // `recv_stream`'s own reopen already cleared the closed mark)
+        // before `b` ever sends, rather than sending first and calling
+        // `recv_stream` right after: under real OS scheduling (as opposed
+        // to this crate's own single-threaded `SimEnv`), the pump task
+        // filing the frame and this task reaching its own next line race
+        // each other, and a busy host can schedule the pump first — which
+        // would see the stream still marked closed (recv_stream's future
+        // not yet polled) and drop the very frame this test means to
+        // receive, hanging the final `.await` forever. Parking first makes
+        // the ordering deterministic regardless of scheduling.
+        let a2 = a.clone();
+        let recv_task = tokio::spawn(async move { a2.recv_stream(STREAM).await });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let parked = a
+                .inbox_stats(1)
+                .top_streams
+                .iter()
+                .any(|s| s.stream == STREAM && s.waker_parked);
+            if parked {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "recv_stream never parked on the reopened stream"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        b.send_stream(nid(0), STREAM, vec![0xAB; VALUE_LEN]).await;
+        let env = recv_task.await.expect("recv task panicked");
+        assert_eq!(env.payload, vec![0xAB; VALUE_LEN]);
 
         a.shutdown();
         b.shutdown();

@@ -854,12 +854,23 @@ pub enum Metric {
     /// unbounded `VecDeque<Envelope>`), and the one to watch alongside
     /// `GET /admin/debug/inboxes`'s own top-N-streams-by-bytes view.
     DemuxQueuedBytes,
+    /// A frame arrived for a stream this node's `ProdEnv` demux has marked
+    /// **closed** (ADR 0026, 2026-09-28 amendment — `Network::close_stream`)
+    /// and was discarded rather than queued. An append-only counter (unlike
+    /// the two levels above), incremented at the exact `spawn_pump` site
+    /// that would otherwise have queued the frame. Expected to be nonzero
+    /// during a tablet's teardown grace window (a peer that hadn't yet
+    /// observed the replica-set change addressing the now-released
+    /// stream) and flat otherwise; a sustained high rate against one
+    /// stream id points at a peer that never learned the tablet moved off
+    /// this node.
+    DemuxFramesDroppedClosed,
 }
 
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 100] = [
+    pub const ALL: [Metric; 101] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -960,6 +971,7 @@ impl Metric {
         Metric::CpReconcilerStopTimeout,
         Metric::DemuxQueuedFrames,
         Metric::DemuxQueuedBytes,
+        Metric::DemuxFramesDroppedClosed,
     ];
 
     /// The stable exported name of this metric (snake_case, used as the text
@@ -1067,6 +1079,7 @@ impl Metric {
             Metric::CpReconcilerStopTimeout => "cp_reconciler_stop_timeout",
             Metric::DemuxQueuedFrames => "demux_queued_frames",
             Metric::DemuxQueuedBytes => "demux_queued_bytes",
+            Metric::DemuxFramesDroppedClosed => "demux_frames_dropped_closed",
         }
     }
 

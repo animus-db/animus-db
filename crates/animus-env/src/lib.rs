@@ -456,7 +456,47 @@ pub trait Network: Send + Sync {
     /// Await the next message addressed to this node on `stream`. `(node,
     /// stream)` is single-consumer — never run two receive loops on the same
     /// node id and stream.
+    ///
+    /// **Reopens a closed stream** (ADR 0026, 2026-09-28 amendment): if
+    /// [`close_stream`](Network::close_stream) was called for `stream` and
+    /// no `recv_stream` has happened since, calling this clears the closed
+    /// mark before awaiting — a node re-added to the same tablet's replica
+    /// set after being dropped from it reuses the same stream id
+    /// (`tablet_id`) and must not stay permanently closed. A stream that has
+    /// **never** been closed is entirely unaffected by this — it keeps the
+    /// pre-existing buffer-before-first-`recv` behavior, which is
+    /// load-bearing (a split child's first `PreVote`/`AppendEntries` arrives
+    /// and queues before its own driver's first `recv_stream` call — see
+    /// `animus-cp-data`'s "Deterministic first leader" doc). Never conflate
+    /// "not yet opened" with "closed": only an explicit
+    /// [`close_stream`](Network::close_stream) call produces the latter.
     async fn recv_stream(&self, stream: u64) -> Envelope;
+
+    /// Retire `stream` on this node's inbox (ADR 0026, 2026-09-28
+    /// amendment): drops its queued frames, its parked receiver's waker (if
+    /// any), and its observability bookkeeping, and marks it **closed**. A
+    /// frame that arrives for a closed stream is discarded (and counted,
+    /// see `animus-env`'s `Metric::DemuxFramesDroppedClosed`) rather than
+    /// queued, until a later [`recv_stream`](Network::recv_stream) call for
+    /// the same stream **reopens** it (clears the closed mark and starts
+    /// fresh — see that method's own doc). This is the fix for an inbox
+    /// that would otherwise grow forever for a stream nobody will ever
+    /// `recv` from again — a tablet released from this node (a split
+    /// parent, or a replica dropped by reconfiguration) whose peers may
+    /// keep addressing it for a time during the teardown grace window.
+    ///
+    /// **Caller contract**: only call this once the stream's own consumer
+    /// is confirmed to have stopped polling — closing a stream a task is
+    /// still concurrently `recv_stream`-ing would have that same call
+    /// silently reopen it right back (`recv_stream` always clears the
+    /// closed mark before awaiting), racing this call's intent. This is
+    /// exactly why `animus-cp-data`'s `host::Reconciler::teardown` only
+    /// calls this after `RaftKvNode::is_stopped()` is confirmed true, never
+    /// eagerly at the start of teardown. Closing [`PRIMARY_STREAM`] is
+    /// almost certainly a bug — nothing should ever retire a node's own
+    /// primary stream — so implementations `debug_assert` against it rather
+    /// than silently accepting it.
+    fn close_stream(&self, stream: u64);
 
     /// Send on [`PRIMARY_STREAM`] — the whole pre-multiplexing API surface.
     async fn send(&self, to: NodeId, payload: Vec<u8>) {

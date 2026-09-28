@@ -23,6 +23,15 @@
   **deleted outright** in ADR 0040 PR5 — the prediction that a future need
   might revive them never materialized, and the stream axis this ADR
   describes fully subsumed the one thing they were for.
+  **Amended 2026-09-28: stream teardown (`Network::close_stream`).** A live
+  cluster run (measure-first PR, `crates/animus-env/CLAUDE.md`'s inbox-
+  observability entry) confirmed a real, unbounded `Demux`/`SimEnv`-inbox
+  growth source self-review point (c) named but didn't yet build: a
+  stream's `queues`/`wakers`/`stream_meta` entries are never torn down, so
+  a tablet released from a node (a split parent, or a replica dropped by
+  reconfiguration) whose peers keep addressing it during the teardown
+  grace window accumulates frames forever. See "Stream teardown" below for
+  the full design.
 - **Date:** 2026-08-06
 
 ## Context
@@ -322,6 +331,120 @@ serialized message.
   simplification (it is part of the Stage B+ migration), but flags that the GC
   story gets simpler, not harder, and that no new lifecycle primitive needs
   inventing.
+
+## Stream teardown (2026-09-28 amendment)
+
+Self-review point (c) above predicted the GC story would get simpler once a
+tablet is a stream on the shared env rather than its own sibling env — true
+for *lifecycle machinery*, but it left one thing genuinely unaddressed:
+**nothing ever removed a stream's `Demux`/`SimEnv`-inbox entry**, so "stop
+calling `recv_stream(tablet_id)`" alone does not stop the *sender's* frames
+from still arriving and queuing. A live cluster run
+(`--cluster-control 3 --cluster-data 5 --auto-split-bytes 1000000` under
+sustained bulk-seed + concurrent `PutItem` load — see
+`crates/animus-env/CLAUDE.md`'s measure-first inbox-observability entry,
+the PR immediately preceding this one) confirmed real, unbounded RSS growth
+with two causes, one of them exactly this: a tablet released from this
+node (a split parent, or a replica dropped by reconfiguration) whose peers
+keep addressing it for a time during the teardown grace window (a stale
+routing entry, an in-flight reconfigure round trip) has its frames queue
+forever, because a stream, once opened, is never torn down.
+
+**Decision: an explicit `close_stream`, not "drop when no consumer."** The
+alternative — inferring "abandoned" from some liveness signal (no poll in N
+seconds, a dropped receiver handle) — was rejected: neither `SimEnv` nor
+`ProdEnv`'s `Demux` has a receiver *handle* to observe being dropped
+(`recv_stream` is a bare async fn, not a stream/channel object with `Drop`),
+and a time-based heuristic would need its own tunable, its own false-positive
+risk against a genuinely-slow-but-still-live consumer, and would still need
+an explicit "this tablet is gone" signal from *somewhere* to know when the
+heuristic even applies — the reconciler already has that signal exactly
+(`RaftKvNode::is_stopped()`), so inferring it a second, weaker way elsewhere
+bought nothing. `Network` gains one new required method:
+
+```rust
+fn close_stream(&self, stream: u64);
+```
+
+**Semantics, identical in `SimEnv` and `ProdEnv`:**
+
+- **Close** drops the stream's queued frames, its parked receiver's waker (if
+  any), and its observability bookkeeping (`ProdEnv`'s `StreamMeta` entry),
+  and marks the stream in a new **closed** set (`Demux::closed`/`SimState::
+  closed_streams`). While closed, an arriving frame is **discarded and
+  counted** (`Metric::DemuxFramesDroppedClosed`, ProdEnv only — `SimEnv`
+  traces it as `TraceEvent::Drop { reason: "stream-closed", .. }`,
+  consistent with how a crashed-node or partitioned-link drop is traced)
+  rather than queued — this is the actual fix: the frames that used to
+  accumulate forever are now dropped at the point of arrival instead.
+- **Reopen** happens implicitly: a later `recv_stream(stream)` call clears
+  the closed mark *before ever awaiting*, unconditionally, on every call (not
+  just the first). This is required, not cosmetic — a node can be removed
+  from a tablet's replica set and later **re-added**, and the re-added
+  replica's own `RaftKvNode::start_hosted` reuses the identical stream id
+  (`stream = tablet_id`, ADR 0040 Decision A never changes this), so the
+  stream must be usable again, not permanently poisoned by an earlier close.
+- **A stream that was never closed is untouched by any of this** — it keeps
+  exactly the pre-existing buffer-before-first-`recv` behavior. This is
+  **load-bearing**, not an implementation detail: the split-fork
+  "Deterministic first leader" mechanism
+  (`crates/animus-cp-data/CLAUDE.md`) depends on a freshly-materialized
+  child's very first `PreVote`/`AppendEntries` queuing in its inbox *before*
+  that child's own driver ever calls `recv_stream` for the first time — if
+  "not yet opened" and "closed" were the same state, that queuing would
+  never happen and the deterministic-first-leader optimization would
+  silently regress to the ordinary cold-election path on every split.
+  Closing and never-opened are represented as genuinely distinct states
+  precisely so this can't be conflated: closed is a positive fact recorded
+  by an explicit call, absent is simply absent.
+- **Closing a reserved/sentinel stream** (`PRIMARY_STREAM`, and by
+  implication `HEARTBEAT_BATCH_STREAM`/`cluster_segment_store::
+  SEGMENT_STREAM`/`backup::BACKUP_SEGMENT_STREAM`) is always a bug — nothing
+  should ever retire a node's own control-plane/non-tablet stream. Both
+  implementations `debug_assert` against `stream == PRIMARY_STREAM` rather
+  than silently accepting it (a release-mode `debug_assert` is deliberately
+  a no-op, not a refusal — the caller contract is enforced by test coverage
+  and code review here, not a runtime error path, matching this codebase's
+  existing `debug_assert!` usage for "should be structurally impossible"
+  conditions elsewhere, e.g. the split-fork campaign gate's own voter
+  assertion).
+
+**Tombstone bound.** `Demux::closed`/`SimState::closed_streams` grow by at
+most one entry per tablet this node has ever **hosted and torn down** — never
+by traffic volume, and never unboundedly in the way the original defect was
+unbounded. A restarted process (`ProdEnv` — a fresh binary — or `SimEnv`'s
+`Simulator::crash`/`stop`, both of which already node-prefix-clear
+`inboxes`/`recv_wakers`, issue #841) starts with **no** tombstones either
+way, since `Demux`/`SimState` are in-memory-only structures with no
+persisted counterpart — nothing about this amendment touches a durable or
+wire format (ADR 0073 is unaffected).
+
+**The caller contract, and why it is safe.** `close_stream` must only be
+called once a stream's own consumer is confirmed to have stopped polling —
+calling it while a task is still concurrently `recv_stream`-ing the same
+stream would have that call's own unconditional reopen silently undo the
+close, a race the method's own doc calls out explicitly. This is exactly why
+`animus-cp-data`'s `host::Reconciler::teardown` calls `close_stream` only
+**after** `RaftKvNode::is_stopped()` is confirmed true (in both the
+immediate-stop path and the `sweep_stopping` path that finishes a
+previously-parked teardown, whose whole reason to exist is that the driver
+hadn't stopped in time for the eager path) — never eagerly at the start of
+teardown, when the driver's consensus/apply tasks may still be mid-flight.
+The one path with no driver at all (`teardown`'s zombie-claim backstop, a
+`LocalState::hosted` claim with no live handle in `Reconciler::hosted`)
+closes immediately, which is trivially safe: there was never a consumer to
+race in the first place.
+
+**What this does NOT change.** No wire/persisted format (`[from][stream]
+[len][payload]` is untouched — this is purely an in-memory receive-side
+bookkeeping change); no new RNG draw or timeline event shape in `SimEnv`
+(closing/reopening/dropping-on-closed are all synchronous, deterministic
+map operations — the byte-identical-trace argument in §2 is unaffected);
+`animus-cp-data`'s `HeartbeatBatcher` already deregistered a torn-down
+group's `HeartbeatInbox` correctly before this change (`unregister_hosted`,
+called from the consensus loop's own `halted` branch before `stopped` is
+set) — investigated as part of this amendment on the suspicion it was the
+same class of leak, confirmed it was not.
 
 ## Consequences
 
