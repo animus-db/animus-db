@@ -247,7 +247,15 @@ const MAGIC: u8 = 0xCB;
 /// `Vec` the same way every other untrusted wire count is (capped
 /// pre-allocation, see this module's own top-level doc). Same house
 /// convention: a clean bump, no cross-version compatibility required.
-const VERSION: u8 = 31;
+/// `32` (issue #1061): `RaftMsg` gained `Removed { term, removal_index,
+/// removal_term, config, learners }` (tag `14`) and `RemovedAck { term,
+/// removal_index }` (tag `15`) — the explicit removal notice a leader sends a
+/// departing peer it can no longer reach through the log, and the peer's ack
+/// (see `animus_control::raft::RaftMsg::Removed`). The two node sets ride the
+/// same `put_node_set` encoding `ClusterProbeResp.config` uses. Additive
+/// tags on an enum with no golden fixture yet (ADR 0073 Phase 0 has not
+/// reached this codec), so same house convention: a clean version bump.
+const VERSION: u8 = 32;
 
 /// A decode failure: a description of what was malformed, surfaced loudly by
 /// the caller (logged + dropped; never silently misread).
@@ -1148,6 +1156,29 @@ fn put_raft(out: &mut Vec<u8>, m: &RaftMsg<KvCommand>) {
             put_node_set(out, config);
             put_bool(out, *ever_heard_from_prober);
         }
+        // Issue #1061: the explicit removal notice and its ack.
+        RaftMsg::Removed {
+            term,
+            removal_index,
+            removal_term,
+            config,
+            learners,
+        } => {
+            put_u8(out, 14);
+            put_u64(out, *term);
+            put_u64(out, *removal_index);
+            put_u64(out, *removal_term);
+            put_node_set(out, config);
+            put_node_set(out, learners);
+        }
+        RaftMsg::RemovedAck {
+            term,
+            removal_index,
+        } => {
+            put_u8(out, 15);
+            put_u64(out, *term);
+            put_u64(out, *removal_index);
+        }
     }
 }
 
@@ -1233,6 +1264,17 @@ fn read_raft(c: &mut Cursor<'_>) -> Result<RaftMsg<KvCommand>, DecodeError> {
             committed_index: c.u64()?,
             config: c.node_set()?,
             ever_heard_from_prober: c.bool()?,
+        },
+        14 => RaftMsg::Removed {
+            term: c.u64()?,
+            removal_index: c.u64()?,
+            removal_term: c.u64()?,
+            config: c.node_set()?,
+            learners: c.node_set()?,
+        },
+        15 => RaftMsg::RemovedAck {
+            term: c.u64()?,
+            removal_index: c.u64()?,
         },
         other => return Err(format!("unknown RaftMsg tag {other}")),
     })
@@ -1803,6 +1845,17 @@ mod tests {
                 commit_index: 23,
             },
             RaftMsg::WakeRequest { term: 7 },
+            RaftMsg::Removed {
+                term: 7,
+                removal_index: 19,
+                removal_term: 5,
+                config: [2, 4].into_iter().map(nid).collect(),
+                learners: [5].into_iter().map(nid).collect(),
+            },
+            RaftMsg::RemovedAck {
+                term: 7,
+                removal_index: 19,
+            },
         ];
         for m in msgs {
             roundtrip(&KvWire::Raft(m));

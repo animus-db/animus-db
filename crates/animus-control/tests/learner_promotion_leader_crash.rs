@@ -246,6 +246,164 @@ fn learner_promotion_survives_leader_crash_before_the_learner_hears_it() {
     scenario(0x1019_0001);
 }
 
+/// Liveness guard for issue #1061's vote-safety decision: the mirror image of
+/// `scenario` above — a JUST-PROMOTED voter must still be able to win an
+/// election the instant its old leader dies, against a responder that is
+/// genuinely behind (missing the promotion entry itself, though not the
+/// earlier add-learner entry).
+///
+/// **Why this test exists although the change it was written for was not
+/// shipped.** The explicit-removal-notice design (`RaftMsg::Removed`) makes a
+/// removed peer stop campaigning once told, so the responder-side
+/// "candidate must be a currently-known member" guard an earlier prototype
+/// added to `handle_request_vote` is not needed and was dropped: a removed
+/// peer that never hears the notice can still only ask for votes with a log
+/// that lacks the removal entry, and every current voter (which has that
+/// entry) refuses it on the ordinary up-to-date check
+/// (`tests/removal_notice.rs`, "a zombie missing the removal entry must not
+/// be granted a vote") — the guard would have protected against a case the
+/// log check already closes, at the price of exactly the liveness edge this
+/// test pins (a responder that is stale-BEHIND about the candidate's
+/// promotion). Any future change that gates vote *granting* on the
+/// responder's view of the candidate's membership must keep this scenario
+/// green: for the promotion to have committed at all, a majority of the
+/// pre-promotion voters already hold the entry, and `log_ok` is what
+/// protects everyone else.
+///
+/// Scenario: voters {0,1,2}, learner 3 added and caught up (identical
+/// preamble to `scenario`). Cut only the leader<->B link (B = whichever of
+/// the two non-leader original voters is picked), then promote 3 — the
+/// entry reaches the leader, A (the other original voter), and 3 itself (a
+/// real 3-of-4 majority of the new {0,1,2,3} config), and commits; B never
+/// receives it. The leader then dies. Survivors: A (has the promotion
+/// entry), B (missing it, but not the earlier add-learner entry), and 3
+/// itself, now believing itself a voter and free to campaign. Reaching a
+/// majority of the new 4-member config needs all three survivors' votes, so
+/// B's grant to 3 is load-bearing.
+fn scenario_promoted_candidate_wins_after_leader_dies(seed: u64) {
+    let (mut sim, nodes) = cluster(seed, &VOTERS);
+    sim.run_for(Duration::from_secs(2));
+    let l = unique_leader(&nodes, &[0, 1, 2], seed);
+    let others: Vec<usize> = [0usize, 1, 2].into_iter().filter(|&i| i != l).collect();
+    let (a, b) = (others[0], others[1]);
+
+    let learner = RaftNode::start(
+        sim.env(nid(LEARNER)),
+        VOTERS.iter().copied().map(nid).collect(),
+        MemoryEngine::new(),
+    );
+    assert!(
+        matches!(
+            nodes[l].add_learner(nid(LEARNER)),
+            ProposeResult::Accepted { .. }
+        ),
+        "seed={seed}"
+    );
+    sim.run_for(Duration::from_secs(2));
+    let caught_up = converge(&mut sim, 40, Duration::from_millis(200), || {
+        nodes[l].learner_caught_up(&nid(LEARNER), CATCH_UP_THRESHOLD)
+    });
+    assert!(
+        caught_up,
+        "seed={seed}: learner must catch up before the promotion race begins"
+    );
+    // B has the add-learner entry by construction: everyone (leader, A, B,
+    // and the learner) is still fully connected up to this exact point.
+    assert_eq!(
+        nodes[b].config(),
+        set(&VOTERS),
+        "seed={seed}: precondition — B has not yet seen any promotion entry"
+    );
+
+    // Cut only the leader<->B link, then promote: the entry reaches the
+    // leader, A, and the learner itself (a real 3-of-4 majority), but never
+    // reaches B.
+    sim.partition_pair(nid(l as u64), nid(b as u64));
+    let promote_result = nodes[l].promote_learner(nid(LEARNER));
+    assert!(
+        matches!(promote_result, ProposeResult::Accepted { .. }),
+        "seed={seed}: promotion proposal must be locally accepted by the leader; got \
+         {promote_result:?}"
+    );
+    let promoted_committed = converge(&mut sim, 60, Duration::from_millis(100), || {
+        learner.config() == set(&[0, 1, 2, LEARNER])
+            && nodes[a].config() == set(&[0, 1, 2, LEARNER])
+    });
+    assert!(
+        promoted_committed,
+        "seed={seed}: the leader, A, and the learner itself must all commit the promotion \
+         (3-of-4 majority, excluding only the leader-B link)"
+    );
+    assert_eq!(
+        nodes[b].config(),
+        set(&VOTERS),
+        "seed={seed}: precondition — B's own view must NOT yet contain the promotion entry"
+    );
+    assert!(
+        nodes[b].learners().contains(&nid(LEARNER)),
+        "seed={seed}: precondition — B must still recognize node 3 as a LEARNER from the \
+         earlier (fully-delivered) add-learner entry, which is the exact condition this \
+         scenario is proving suffices"
+    );
+
+    // The leader dies right after the promotion committed. Heal the
+    // (now-moot) leader<->B link and give the group a bounded budget to
+    // elect a new leader — which now MUST be either A or the freshly
+    // promoted learner, since B alone can never reach a majority of 4
+    // without one of their votes either.
+    sim.crash(nid(l as u64));
+    sim.heal(nid(l as u64), nid(b as u64));
+
+    let elected = converge(&mut sim, 100, Duration::from_millis(200), || {
+        [
+            nodes[a].is_leader(),
+            nodes[b].is_leader(),
+            learner.is_leader(),
+        ]
+        .into_iter()
+        .filter(|&is_leader| is_leader)
+        .count()
+            == 1
+    });
+    assert!(
+        elected,
+        "seed={seed}: exactly one of A, B, or the freshly-promoted learner must become leader \
+         within the virtual-time budget; a(n{a})=role={:?} term={} commit={}; b(n{b})=role={:?} \
+         term={} commit={}; learner(n{LEARNER})=role={:?} term={} commit={} config={:?}",
+        nodes[a].role(),
+        nodes[a].term(),
+        nodes[a].commit_index(),
+        nodes[b].role(),
+        nodes[b].term(),
+        nodes[b].commit_index(),
+        learner.role(),
+        learner.term(),
+        learner.commit_index(),
+        learner.config(),
+    );
+}
+
+#[test]
+fn promoted_candidate_wins_election_after_leader_dies_right_after_commit() {
+    scenario_promoted_candidate_wins_after_leader_dies(0x1061_0002);
+}
+
+/// Depth knob mirroring `learner_promotion_leader_crash_corpus_runs_at_
+/// configured_depth`'s own convention exactly, sharing `ANIMUS_LEARNER_
+/// SEEDS` and the same 8-seed floor.
+#[test]
+fn promoted_candidate_wins_election_corpus_runs_at_configured_depth() {
+    let k = corpus::seeds_from_env("ANIMUS_LEARNER_SEEDS").max(8);
+    for i in 0..k {
+        let seed = if i == 0 {
+            0x1061_0002
+        } else {
+            corpus::name_seed(&format!("promoted_candidate_wins_election_s{i:03}"))
+        };
+        scenario_promoted_candidate_wins_after_leader_dies(seed);
+    }
+}
+
 /// Depth knob: shares `ANIMUS_LEARNER_SEEDS` with `learner_corpus.rs`'s own
 /// convention (same corpus family, a different fault shape) via
 /// `corpus::seeds_from_env`, but this particular race is narrow enough

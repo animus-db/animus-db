@@ -394,6 +394,8 @@ impl Future for PersistArm<'_, '_> {
 /// * `InstallSnapshot` chunks — the image was durable when compaction built it.
 /// * `TimeoutNow`, `Quiesce`, `WakeRequest`, `Heartbeat` — liveness signals
 ///   carrying no state claim.
+/// * `Removed`, `RemovedAck` (issue #1061) — the removal notice and its ack:
+///   no vote, no durable state.
 ///
 /// A plane whose wire enum wraps `RaftMsg` alongside non-consensus traffic
 /// decides those variants itself — `animus-cp-data`'s `ReadProbe`/`ReadProbeAck`
@@ -427,6 +429,12 @@ pub fn ships_before_durable<C>(msg: &RaftMsg<C>) -> bool {
             // ships immediately regardless of any unrelated persist round.
             | RaftMsg::ClusterProbe
             | RaftMsg::ClusterProbeResp { .. }
+            // Issue #1061: the removal notice and its ack claim no vote and
+            // touch no durable state (the recipient's "I was removed" flag is
+            // deliberately volatile — see `RaftCore::removed_by_leader`), so
+            // they ship immediately regardless of any unrelated persist round.
+            | RaftMsg::Removed { .. }
+            | RaftMsg::RemovedAck { .. }
     )
 }
 
