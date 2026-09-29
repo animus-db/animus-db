@@ -1611,6 +1611,27 @@ with_empty_state`) and `tests/reconciler_corpus.rs`'s
 `animusd/CLAUDE.md`'s own drop-table-GC entry for the `SimCluster`/
 DynamoDB-wire and real-`LsmEngine` regressions this fix also carries.
 
+- **`TabletFacts::config_excludes_me` means "this replica knows it was
+  removed", by either channel (issue #1061, ADR 0058's amendment).**
+  `gather_facts` sets it when the node's own log-derived voter config no
+  longer lists it **or** `RaftKvNode::removed_by_leader()` — the leader's
+  explicit `RaftMsg::Removed` notice, the only signal a replica that fell
+  behind the leader's compacted prefix (a departing peer is never shipped a
+  snapshot) or sat out a leadership change partitioned can ever get. `plan` is
+  untouched: `Release` still requires replicated `Metadata` to exclude the
+  node (so a stale/delayed notice to a replica that has since been re-added
+  can never release it) and still debounces over `RELEASE_CONFIRM_TICKS`.
+  The flag is volatile; `RaftKvNode::config()` still lists the node after a
+  notice (the notice never rewrites the log-derived config). A test that
+  waits for "the removed replica learned" must accept either
+  (`!config().contains(me) || removed_by_leader()`) — a returning removed
+  replica's own campaign usually triggers the notice before the leader's own
+  schedule delivers the entry (`reconciler_corpus`'s
+  `partition_blocks_release`). Codec version `32` added `RaftMsg::Removed`/
+  `RemovedAck` (tags `14`/`15`). Regression:
+  `tests/departing_removal_notice.rs` (a reconciler-hosted replica left behind
+  the compacted log by a continuous writer: zero snapshot ships/restarts,
+  told, not released while `Metadata` lists it, released once it does).
 - **`plan` never removes a tablet from `LocalState::hosted` on its own**
   when emitting a fallible teardown (`Reclaim`/`Release`) — real teardown
   is async and can time out. The caller calls

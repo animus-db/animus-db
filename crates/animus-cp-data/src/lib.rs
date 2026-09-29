@@ -4829,6 +4829,24 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         self.lock().learners()
     }
 
+    /// Whether an explicit removal notice (issue #1061,
+    /// [`RaftMsg::Removed`]) has told this replica a committed config entry
+    /// removed it and nothing has re-added it since — the signal the host
+    /// reconciler's release decision consults beside its own log-derived
+    /// [`config`](Self::config), for a replica the leader can no longer
+    /// reach through the log (it fell behind the compacted prefix, or was
+    /// partitioned across a leadership change). Volatile; a pure accessor.
+    pub fn removed_by_leader(&self) -> bool {
+        self.lock().removed_by_leader()
+    }
+
+    /// The peers this replica, while leading, still owes a removal
+    /// notification (issue #1061) — empty on a non-leader. A pure accessor;
+    /// mostly for tests and diagnostics.
+    pub fn departing_peers(&self) -> BTreeSet<NodeId> {
+        self.lock().departing_peers()
+    }
+
     /// Whether learner `id` is caught up closely enough to the leader's own
     /// log to be a promotion candidate — see
     /// [`RaftCore::learner_caught_up`]. A pure predicate; it does not itself

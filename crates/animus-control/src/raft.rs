@@ -301,6 +301,49 @@ const SNAPSHOT_HEARTBEAT_BACKOFF_MAX_TICKS: u32 = 32;
 /// intervals rather than staying deadlocked for the rest of the run.
 const SNAPSHOT_OFFSET_REGRESSION_REBASE: u32 = 4;
 
+/// Issue #1061: how long this leader keeps sending the removal-notice
+/// schedule ([`RaftMsg::Removed`]) to a `departing` peer that has replied with
+/// nothing at all before it stops (see [`RaftCore::expire_stale_departing`]).
+///
+/// Giving up is **not** the correctness mechanism for removal — the notice,
+/// its ack, and the receiver-initiated reply to a returning stranger
+/// (`RaftCore::stranger_notice`, which needs no leader-side memory at all)
+/// are. This bound only caps (a) the traffic shipped to a peer that is
+/// genuinely gone (a crashed node, or one whose own host already released
+/// the replica) and (b) how long such a peer can hold the group out of
+/// quiescence (`quiesce_entry_ok`'s `departing.is_empty()` clause).
+///
+/// It is deliberately a *sustained-silence* bound, measured from the peer's
+/// last reply of any kind rather than from when it started departing, and
+/// **long — five minutes**: the schedule it bounds is the capped
+/// exponential one (`departing_send_gate`, a steady one tiny message per
+/// ~1.6s), so a dead peer costs ~190 messages of a few dozen bytes over the
+/// whole window and never a snapshot, while a peer partitioned for anything
+/// short of minutes is still served by the schedule itself. A peer silent
+/// past this bound that later returns is still told, by its own election
+/// timer's pre-vote/vote being answered with the notice
+/// (`stranger_notice`); the one gap left is a *quiesced* removed replica
+/// that neither hears from the leader nor is ever touched locally, which
+/// stays hosted, idle and timer-less, until touched or restarted (see
+/// ADR 0058's issue #1061 amendment).
+pub const DEPARTING_NOTICE_GIVE_UP: Duration = Duration::from_secs(300);
+
+/// The `(term, index)` stamp of a log entry, ordered lexicographically —
+/// terms never decrease along a log, so for two entries of ONE history this
+/// is the same order as index alone, while an entry from a *diverged*
+/// (stale, uncommitted) suffix with a lower term than a committed entry
+/// correctly orders before it even at a higher index. Used by the removal
+/// notice's guards (`RaftCore::handle_removed`, `refresh_removed_flag`).
+type EntryStamp = (u64, u64);
+
+/// A peer this leader still owes a removal notification (`RaftCore::departing`):
+/// the config entry that removed it, by index and term.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Departing {
+    index: u64,
+    term: u64,
+}
+
 /// A replicated log entry, generic over the command type `C` (defaults to the
 /// control plane's [`MetaCommand`]).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -553,6 +596,40 @@ pub enum RaftMsg<C = MetaCommand> {
         config: BTreeSet<NodeId>,
         ever_heard_from_prober: bool,
     },
+    /// **Issue #1061 — an explicit removal notice.** Sent by a leader to a
+    /// peer that a *committed* config entry removed, when the peer can no
+    /// longer be told through the log (its `next_index` is behind the
+    /// leader's compacted prefix — it would otherwise get a full
+    /// `InstallSnapshot`, which a departing peer must never be shipped), and
+    /// answered to a returning non-member's pre-vote/vote. It carries no
+    /// log content: `removal_index`/`removal_term` identify the committed
+    /// config entry that removed the recipient (or the leader's newest
+    /// committed config entry, which excludes it too), and `config`/
+    /// `learners` are the leader's current membership, which must exclude
+    /// the recipient.
+    ///
+    /// The recipient marks itself removed (`RaftCore::removed_by_leader`) —
+    /// it stops campaigning/granting exactly like a learner and its host
+    /// reconciler may release it once the replicated `Metadata` also
+    /// excludes it — but only if `(removal_term, removal_index)` is later
+    /// than every config entry it knows that *includes* itself, so a
+    /// delayed notice can never un-member a node re-added since. Never
+    /// touches the recipient's log or its log-derived config. See
+    /// `RaftCore::handle_removed` for the full safety argument.
+    Removed {
+        term: u64,
+        removal_index: u64,
+        removal_term: u64,
+        config: BTreeSet<NodeId>,
+        learners: BTreeSet<NodeId>,
+    },
+    /// Response to [`RaftMsg::Removed`]: the recipient has recorded its
+    /// removal (or already knew). `removal_index` echoes the notice. A
+    /// stale-term notice is answered with the recipient's own (higher)
+    /// `term` and `removal_index: 0` so the stale sender learns it is behind
+    /// and steps down; the leader ignores any ack that does not cover the
+    /// entry it is waiting on.
+    RemovedAck { term: u64, removal_index: u64 },
 }
 
 impl<C> RaftMsg<C> {
@@ -572,7 +649,9 @@ impl<C> RaftMsg<C> {
             | RaftMsg::InstallSnapshot { term, .. }
             | RaftMsg::InstallSnapshotResp { term, .. }
             | RaftMsg::TimeoutNow { term }
-            | RaftMsg::Quiesce { term, .. } => *term,
+            | RaftMsg::Quiesce { term, .. }
+            | RaftMsg::Removed { term, .. }
+            | RaftMsg::RemovedAck { term, .. } => *term,
             RaftMsg::Heartbeat { .. } | RaftMsg::WakeRequest { .. } => 0,
             // Issue #667: a cluster-check probe carries no term *authority*
             // either — its whole point is to be answerable (and answered
@@ -947,7 +1026,59 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     // every election win, so a fresh leader's own subsequent removals repopulate
     // it — see the root CLAUDE.md rebalancing ADR for why this is sufficient
     // rather than reconstructed across leadership changes.
-    departing: BTreeMap<NodeId, u64>,
+    //
+    // **Issue #1061: no longer "cleared on every election win and
+    // forgotten".** `become_leader` now re-derives this map from the config
+    // entries still in the leader's own log (`removals_in_log`), so a peer the
+    // previous leader never finished notifying is still owed its notice by
+    // the next one. It is also no longer replicated to through a snapshot:
+    // a departing peer whose `next_index` fell behind the compacted prefix
+    // is sent a `RaftMsg::Removed` notice instead (`replicate_to`), and is
+    // dropped from this map on the peer's `RemovedAck`, on its `match_index`
+    // reaching the removing entry, or after `DEPARTING_NOTICE_GIVE_UP` of
+    // total silence (`expire_stale_departing`).
+    departing: BTreeMap<NodeId, Departing>,
+    // Issue #1061: the last time (leader-local, volatile — same class as
+    // `last_contact`) each currently-departing peer proved it is alive by
+    // sending ANY reply — `AppendEntriesResp` or `InstallSnapshotResp`,
+    // success or reject. Seeded lazily by `expire_stale_departing` the first
+    // time it sees a peer in `departing` with no entry here (`log_append`,
+    // where `departing` is populated, has no `now`, and runs on every replica
+    // during WAL replay), so a peer absent here is always read as "just
+    // started, not yet stale". Pruned everywhere `departing` shrinks.
+    departing_since: BTreeMap<NodeId, Nanos>,
+    // Issue #1061: per-departing-peer send schedule — `(next_allowed_send,
+    // attempts)`, gating EVERY message this leader would send to a
+    // departing peer (its removal notice and any catch-up `AppendEntries`
+    // alike; `departing_send_gate`). The first send is immediate; each
+    // further send with no reply from the peer in between waits twice as
+    // long as the last (from one heartbeat interval, doubling, up to
+    // `SNAPSHOT_HEARTBEAT_BACKOFF_MAX_TICKS` heartbeats — the same capped
+    // steady period as the snapshot-resend schedule), and ANY reply from the
+    // peer resets it (a live peer catching up is served at full rate; a dead
+    // one costs a couple of dozen tiny messages a minute). Time-based, not
+    // tick-count-based, because under a sustained writer `replicate_now`
+    // keeps pushing `heartbeat_deadline` out and the heartbeat tick that a
+    // count-based schedule would advance on never fires. Cleared with
+    // `departing`.
+    removal_sched: BTreeMap<NodeId, (Nanos, u32)>,
+    // Issue #1061: the most recent `now` this core was driven with (`tick`,
+    // `handle`, `replicate_now`) — `replicate_to` has no `now` parameter and
+    // its many call sites should not all grow one just for the departing
+    // schedule above.
+    now_hint: Nanos,
+    // Issue #1061 (peer side): set when a valid `RaftMsg::Removed` told this
+    // node a committed config entry — stamped `(term, index)` — removed it.
+    // While `Some`, `is_voter()` is false: the node never campaigns, and (via
+    // the same `!is_voter()` branches a learner takes) stops vouching for a
+    // leader/lease it no longer hears from. **Volatile and never applied to
+    // `config`/`learners`/the log** — those stay a pure function of the log
+    // and snapshot, so log matching, truncation and `recompute_config` are
+    // untouched. Cleared (`refresh_removed_flag`) the moment a config entry
+    // or snapshot that INCLUDES this node and is later than this stamp lands
+    // — i.e. it was re-added. See `handle_removed`'s doc for the safety
+    // argument.
+    removed_by_leader: Option<EntryStamp>,
     // The index of the first entry this node appended in its current leadership
     // term — the election no-op from `become_leader`. Raft §6.4 / the
     // reconfiguration erratum: a fresh leader's `commit_index` is guaranteed to
@@ -1341,6 +1472,10 @@ where
             leader_since: None,
             heard_from: BTreeSet::new(),
             departing: BTreeMap::new(),
+            departing_since: BTreeMap::new(),
+            removal_sched: BTreeMap::new(),
+            now_hint: Nanos(0),
+            removed_by_leader: None,
             transfer_target: None,
             transfer_deadline: Nanos(0),
             first_term_index: 0,
@@ -2037,7 +2172,21 @@ where
 
     /// Whether this node is a voter in the active configuration.
     fn is_voter(&self) -> bool {
-        self.config.contains(&self.id)
+        // Issue #1061: a node an explicit, valid removal notice has told it
+        // was removed is not a voter for any purpose (campaigning, granting
+        // pre-votes as a member, `TimeoutNow`), exactly like a learner —
+        // whatever its not-yet-caught-up log-derived config still says.
+        self.removed_by_leader.is_none() && self.config.contains(&self.id)
+    }
+
+    /// Whether an explicit removal notice (issue #1061, [`RaftMsg::Removed`])
+    /// has told this node that a committed config entry removed it and no
+    /// later entry has re-added it. Volatile. The host reconciler treats this
+    /// like "my own log config excludes me" for its release decision (still
+    /// gated on replicated `Metadata` excluding the node too).
+    #[must_use]
+    pub fn removed_by_leader(&self) -> bool {
+        self.removed_by_leader.is_some()
     }
 
     /// Whether this node is a **learner** in the active configuration (ADR
@@ -2061,6 +2210,16 @@ where
     #[must_use]
     pub fn learners(&self) -> BTreeSet<NodeId> {
         self.learners.clone()
+    }
+
+    /// Every peer this leader still owes a removal notification (`departing`'s
+    /// own field doc) — a pure, read-only observability accessor, empty on a
+    /// non-leader (the bookkeeping is leader-local). Lets a test or admin
+    /// view watch a notice get acked, or a silent peer given up on
+    /// (issue #1061), without side effects.
+    #[must_use]
+    pub fn departing_peers(&self) -> BTreeSet<NodeId> {
+        self.departing.keys().cloned().collect()
     }
 
     /// Every distinct `(config, learners)` pair this core has adopted, in
@@ -2557,13 +2716,77 @@ where
             // brought back is no longer departing.
             if self.role == Role::Leader {
                 for removed in old_peers.iter().filter(|n| !self.peers.contains(n)) {
-                    self.departing.insert(removed.clone(), entry.index);
+                    // A peer demoted to learner is still a member — replicated
+                    // to as a learner, never departing.
+                    if self.learners.contains(removed) {
+                        continue;
+                    }
+                    self.departing.insert(
+                        removed.clone(),
+                        Departing {
+                            index: entry.index,
+                            term: entry.term,
+                        },
+                    );
                 }
             }
-            self.departing.retain(|n, _| !self.peers.contains(n));
+            self.departing
+                .retain(|n, _| !self.peers.contains(n) && !self.learners.contains(n));
+            self.departing_since
+                .retain(|n, _| self.departing.contains_key(n));
+            self.removal_sched
+                .retain(|n, _| self.departing.contains_key(n));
         }
+        let carries_config = entry.config.is_some();
         self.pending.push(WalRecord::Append(entry.clone()));
         self.log.push(entry);
+        if carries_config {
+            self.refresh_removed_flag();
+        }
+    }
+
+    /// The `(term, index)` stamp of the latest config entry (or snapshot
+    /// boundary, or the initial config at `(0, 0)`) that lists this node as a
+    /// voter OR learner — `None` when no config this node knows of includes
+    /// it. Log-derived only; see [`EntryStamp`].
+    fn latest_self_membership_stamp(&self) -> Option<EntryStamp> {
+        let includes = |voters: &BTreeSet<NodeId>, learners: Option<&BTreeSet<NodeId>>| {
+            voters.contains(&self.id) || learners.is_some_and(|l| l.contains(&self.id))
+        };
+        if let Some(e) = self.log.iter().rev().find(|e| {
+            e.config
+                .as_ref()
+                .is_some_and(|c| includes(c, e.learners.as_ref()))
+        }) {
+            return Some((e.term, e.index));
+        }
+        // No self-including entry in the retained log: the base is the
+        // snapshot's config if there is one, else the initial config.
+        let (voters, learners, stamp) = match &self.snapshot_config {
+            Some(c) => (
+                c,
+                self.snapshot_learners.as_ref(),
+                (self.snapshot_term, self.snapshot_index),
+            ),
+            None => (&self.initial_config, Some(&self.initial_learners), (0, 0)),
+        };
+        includes(voters, learners).then_some(stamp)
+    }
+
+    /// Clear [`removed_by_leader`](Self) once a config entry or snapshot that
+    /// INCLUDES this node and is strictly later than the removal it recorded
+    /// has landed — the node was re-added. Called after every log append of a
+    /// config entry and every snapshot install. A truncation never sets or
+    /// clears it (a shortened log can only lose evidence of a re-add that
+    /// will simply be re-delivered).
+    fn refresh_removed_flag(&mut self) {
+        if let Some(removal) = self.removed_by_leader
+            && self
+                .latest_self_membership_stamp()
+                .is_some_and(|member| member > removal)
+        {
+            self.removed_by_leader = None;
+        }
     }
 
     /// Truncate the log to `keep` entries and record it for persistence. If a
@@ -2592,6 +2815,7 @@ where
 
     /// Handle a timer tick at `now`. May start an election or send heartbeats.
     pub fn tick(&mut self, now: Nanos, entropy: u64) -> Vec<Out<C>> {
+        self.now_hint = now;
         // Issue #667 amendment: the boot-time cluster-check resend, on its
         // OWN deadline (`cluster_check_resend_deadline`'s own doc explains
         // why this must never share `election_deadline`) — checked
@@ -2628,6 +2852,12 @@ where
                     self.transfer_target = None;
                 }
                 if now.0 >= self.heartbeat_deadline.0 {
+                    // Issue #1061: sweep for any `departing` peer that has been
+                    // silent past `DEPARTING_NOTICE_GIVE_UP`, at this cadence.
+                    // Run before the quiesce check below so a group held open
+                    // ONLY by a now-expired departing peer can quiesce on
+                    // this very tick.
+                    self.expire_stale_departing(now);
                     // ADR 0044 phase-1 PR3: at the point this leader would otherwise
                     // send a routine heartbeat, check whether it can quiesce instead
                     // (`quiesce_entry_ok`'s doc has the full predicate). Only
@@ -2692,6 +2922,7 @@ where
     /// before real progress or a different trigger arrives — see
     /// `snapshot_chunk_for`'s own doc for the full mechanism this closes.
     pub fn replicate_now(&mut self, now: Nanos) -> Vec<Out<C>> {
+        self.now_hint = now;
         if self.role == Role::Leader {
             self.heartbeat_deadline = Nanos(now.0.saturating_add(self.heartbeat_nanos()));
             self.broadcast_append(SnapshotResend::Capped(0))
@@ -2708,6 +2939,7 @@ where
         now: Nanos,
         entropy: u64,
     ) -> Vec<Out<C>> {
+        self.now_hint = now;
         // Any message from a higher term forces us to step down first — **except**
         // pre-vote traffic, which by design never changes a node's term (a pre-vote
         // carries only a *prospective* term). Bypassing the step-down here is what
@@ -2795,7 +3027,15 @@ where
                 candidate,
                 last_log_index,
                 last_log_term,
-            } => self.handle_pre_vote(candidate, term, last_log_index, last_log_term, now),
+            } => {
+                // Issue #1061: a leader answering a pre-vote from a node it
+                // knows to have been removed also tells it so.
+                let notice = self.stranger_notice(&candidate);
+                let mut out =
+                    self.handle_pre_vote(candidate, term, last_log_index, last_log_term, now);
+                out.extend(notice);
+                out
+            }
             RaftMsg::PreVoteResp { term, granted } => {
                 self.handle_pre_vote_resp(from, term, granted, now, entropy)
             }
@@ -2804,14 +3044,19 @@ where
                 candidate,
                 last_log_index,
                 last_log_term,
-            } => self.handle_request_vote(
-                candidate,
-                term,
-                last_log_index,
-                last_log_term,
-                now,
-                entropy,
-            ),
+            } => {
+                let notice = self.stranger_notice(&candidate);
+                let mut out = self.handle_request_vote(
+                    candidate,
+                    term,
+                    last_log_index,
+                    last_log_term,
+                    now,
+                    entropy,
+                );
+                out.extend(notice);
+                out
+            }
             RaftMsg::RequestVoteResp { term, granted } => {
                 self.handle_vote_resp(from, term, granted, now)
             }
@@ -2857,7 +3102,7 @@ where
                 term,
                 last_index,
                 next_offset,
-            } => self.handle_install_snapshot_resp(from, term, last_index, next_offset),
+            } => self.handle_install_snapshot_resp(from, term, last_index, next_offset, now),
             // Heartbeats are intercepted by the driver and fed to the failure
             // detector (ADR 0012); they are not consensus traffic, so the core
             // ignores any that reach it.
@@ -2881,6 +3126,26 @@ where
                 Vec::new()
             }
             RaftMsg::WakeRequest { .. } => self.handle_wake_request(from),
+            RaftMsg::Removed {
+                term,
+                removal_index,
+                removal_term,
+                config,
+                learners,
+            } => self.handle_removed(
+                from,
+                term,
+                (removal_term, removal_index),
+                &config,
+                &learners,
+            ),
+            RaftMsg::RemovedAck {
+                term,
+                removal_index,
+            } => {
+                self.handle_removed_ack(from, term, removal_index);
+                Vec::new()
+            }
         }
     }
 
@@ -3717,15 +3982,18 @@ where
         // `peer_last_contact`/`control_peer_believed_alive` need. Stamped once
         // here, ahead of the branch, so both paths get it identically.
         self.last_contact.insert(from.clone(), now);
+        // Issue #1061: the same reachability proof resets a departing peer's
+        // give-up clock and its send-gate schedule (`removal_sched`).
+        self.note_departing_reply(&from, now);
         if success {
             let m = self.match_index.entry(from.clone()).or_insert(0);
             *m = (*m).max(match_index);
             if self
                 .departing
                 .get(&from)
-                .is_some_and(|&needed| match_index >= needed)
+                .is_some_and(|d| match_index >= d.index)
             {
-                self.departing.remove(&from);
+                self.drop_departing(&from);
             }
         }
         if needs_snapshot {
@@ -4052,6 +4320,9 @@ where
                 core.snapshot_config = config.clone();
                 core.snapshot_learners = learners.clone();
                 core.recompute_config();
+                // Issue #1061: a snapshot whose config includes this node and
+                // is later than a recorded removal is a re-add.
+                core.refresh_removed_flag();
             };
             if S::DRIVER_APPLIED {
                 // The bytes are the leader's engine image; the driver writes them
@@ -4153,10 +4424,13 @@ where
         term: u64,
         last_index: u64,
         next_offset: u64,
+        now: Nanos,
     ) -> Vec<Out<C>> {
         if self.role != Role::Leader || term != self.current_term {
             return Vec::new();
         }
+        // Issue #1061: identical reachability proof to `handle_append_resp`'s.
+        self.note_departing_reply(&from, now);
         if last_index > 0 {
             // Transfer complete: the follower installed the snapshot.
             self.snapshot_offset.remove(&from);
@@ -4210,6 +4484,18 @@ where
             *served = (*served).max(last_index);
             self.maybe_advance_commit();
             self.apply();
+            // Issue #1061: a departing peer that finished an install (a
+            // transfer already in flight when it started departing, or a
+            // stale one) and is now caught up past its removing entry is done
+            // being told — mirrors `handle_append_resp`'s identical check.
+            if self
+                .departing
+                .get(&from)
+                .is_some_and(|d| self.match_index.get(&from).copied().unwrap_or(0) >= d.index)
+            {
+                self.drop_departing(&from);
+                return Vec::new();
+            }
             if self.next_index.get(&from).copied().unwrap_or(1) <= self.last_log_index() {
                 return self
                     .replicate_to(from, SnapshotResend::Always)
@@ -4592,7 +4878,22 @@ where
         // peer still owed a removal notification is discovered anew the next time
         // this leader itself appends a config entry removing it (see the field
         // doc); it is not reconstructed from a previous leader's in-flight state.
+        //
+        // Issue #1061: NOT forgotten any more. A peer the previous leader
+        // never finished notifying is re-derived from the config entries
+        // still in this leader's own log (`removals_in_log`) and seeded like
+        // any other replication target — see that method for the bound.
         self.departing.clear();
+        self.departing_since.clear();
+        self.removal_sched.clear();
+        for (peer, dep) in self.removals_in_log() {
+            if self.peers.contains(&peer) || self.learners.contains(&peer) {
+                continue;
+            }
+            self.next_index.insert(peer.clone(), last + 1);
+            self.match_index.insert(peer.clone(), 0);
+            self.departing.insert(peer, dep);
+        }
         self.transfer_target = None;
         // A fresh term restarts any snapshot transfer from offset 0. Clear
         // `snapshot_chunk_sent` alongside `snapshot_offset` (issue #898's
@@ -4877,6 +5178,356 @@ where
         self.quiesced = false;
     }
 
+    // ---- issue #1061: explicit removal notice ----------------------------
+
+    /// Record that a departing peer replied (any reply proves it is alive):
+    /// resets its give-up clock and re-opens its send-gate schedule.
+    fn note_departing_reply(&mut self, peer: &NodeId, now: Nanos) {
+        if self.departing.contains_key(peer) {
+            self.departing_since.insert(peer.clone(), now);
+            self.removal_sched.remove(peer);
+        }
+    }
+
+    /// Drop every per-peer scrap of leader-side bookkeeping for a peer that is
+    /// no longer owed anything (`departing` and everything keyed by its id,
+    /// including any snapshot-transfer bookkeeping — a phantom
+    /// `snapshot_offset`/`snapshot_chunk_sent` entry would keep
+    /// `snapshot_transfer_in_flight` `true` forever for a peer that will
+    /// never ack again, wedging a `DRIVER_APPLIED` driver's compaction defer
+    /// the way issue #898's step-down cleanup already guards against).
+    fn drop_departing(&mut self, peer: &NodeId) {
+        self.departing.remove(peer);
+        self.departing_since.remove(peer);
+        self.removal_sched.remove(peer);
+        self.next_index.remove(peer);
+        self.match_index.remove(peer);
+        self.last_contact.remove(peer);
+        self.snapshot_served_through.remove(peer);
+        self.forget_snapshot_transfer(peer);
+    }
+
+    /// Forget any in-flight snapshot transfer bookkeeping for `peer` (see
+    /// [`drop_departing`](Self::drop_departing)); releases the cached image
+    /// when this was the last outstanding transfer, mirroring
+    /// `handle_install_snapshot_resp`'s lazy-image discipline.
+    fn forget_snapshot_transfer(&mut self, peer: &NodeId) {
+        self.snapshot_offset.remove(peer);
+        self.snapshot_offset_regressions.remove(peer);
+        self.snapshot_chunk_sent.remove(peer);
+        self.snapshot_heartbeat_attempts.remove(peer);
+        if S::DRIVER_APPLIED
+            && self.snapshot_offset.is_empty()
+            && self.snapshot_chunk_sent.is_empty()
+        {
+            self.snapshot_blob = None;
+        }
+    }
+
+    /// The send gate for a departing peer (see `removal_sched`'s field doc):
+    /// `true` when nothing is departing-gated for `peer` at all, or its
+    /// schedule allows a send at `now_hint` (which then advances the
+    /// schedule); `false` to suppress this send.
+    fn departing_send_gate(&mut self, peer: &NodeId) -> bool {
+        if !self.departing.contains_key(peer) {
+            return true;
+        }
+        let now = self.now_hint;
+        let (next_at, attempts) = self
+            .removal_sched
+            .get(peer)
+            .copied()
+            .unwrap_or((Nanos(0), 0));
+        if now.0 < next_at.0 {
+            return false;
+        }
+        let cap_shift = SNAPSHOT_HEARTBEAT_BACKOFF_MAX_TICKS.ilog2();
+        let mult = 1u64 << attempts.min(cap_shift);
+        let gap = self.heartbeat_nanos().saturating_mul(mult);
+        self.removal_sched.insert(
+            peer.clone(),
+            (Nanos(now.0.saturating_add(gap)), attempts.saturating_add(1)),
+        );
+        true
+    }
+
+    /// Build a [`RaftMsg::Removed`] for `peer`, or `None` when the removing
+    /// entry is not yet **committed** (a notice for an uncommitted removal
+    /// could be truncated away by a later leader, and — unlike an
+    /// `AppendEntries` config entry, which the log then repairs — a notice
+    /// cannot be un-said) or `peer` is, in this leader's current view, a
+    /// member again.
+    fn removal_notice_for(&self, peer: &NodeId, dep: Departing) -> Option<RaftMsg<C>> {
+        if self.commit_index < dep.index
+            || self.config.contains(peer)
+            || self.learners.contains(peer)
+        {
+            return None;
+        }
+        Some(RaftMsg::Removed {
+            term: self.current_term,
+            removal_index: dep.index,
+            removal_term: dep.term,
+            config: self.config.clone(),
+            learners: self.learners.clone(),
+        })
+    }
+
+    /// Every peer a config entry still in this node's log removed from the
+    /// voter set and no later entry (in the log) put back — with the stamp of
+    /// the removing entry. **The re-derivation bound of issue #1061**: this
+    /// sees exactly the config entries the log still retains (everything
+    /// after `snapshot_index`, plus the snapshot's own config as the base). A
+    /// removal that compaction has already folded into a snapshot is not
+    /// visible here; for such a peer only the reply to a returning
+    /// pre-vote/vote (`stranger_notice`, which reads the same log) — and,
+    /// failing that, the host reconciler's Metadata-driven release of a
+    /// replica that never campaigns — remain. A peer demoted to a learner is
+    /// still a member and never listed; a removed *learner* is not tracked at
+    /// all (it never campaigns, and its own reconciler already releases it on
+    /// Metadata alone).
+    fn removals_in_log(&self) -> BTreeMap<NodeId, Departing> {
+        let mut prev_voters = match &self.snapshot_config {
+            Some(c) => c.clone(),
+            None => self.initial_config.clone(),
+        };
+        let mut prev_learners = match &self.snapshot_learners {
+            Some(l) => l.clone(),
+            None => self.initial_learners.clone(),
+        };
+        let mut out: BTreeMap<NodeId, Departing> = BTreeMap::new();
+        for e in &self.log {
+            let Some(voters) = &e.config else { continue };
+            let learners = e.learners.clone().unwrap_or_else(|| prev_learners.clone());
+            for n in prev_voters.iter() {
+                if !voters.contains(n) && !learners.contains(n) {
+                    out.insert(
+                        n.clone(),
+                        Departing {
+                            index: e.index,
+                            term: e.term,
+                        },
+                    );
+                }
+            }
+            out.retain(|n, _| !voters.contains(n) && !learners.contains(n));
+            prev_voters = voters.clone();
+            prev_learners = learners;
+        }
+        out.remove(&self.id);
+        out
+    }
+
+    /// Leader-only: a `PreVote`/`RequestVote` from a node that is not a member
+    /// of this leader's current configuration is answered, beside the
+    /// ordinary rejection, with the removal notice — the receiver-initiated
+    /// half of removal, needing no leader-side memory: it closes what the
+    /// leader-initiated schedule (bounded by [`DEPARTING_NOTICE_GIVE_UP`], and
+    /// lost across a leadership change once compaction has folded the
+    /// removal into a snapshot) cannot — a peer partitioned for longer than
+    /// any bound. A node that is not a member has no business campaigning, so
+    /// this only ever fires for a removed peer (or a not-yet-added joiner
+    /// that booted believing itself a voter, for whom it is equally correct:
+    /// the flag it sets only stops it campaigning, and the entry that adds it
+    /// later clears the flag). The zombie's own election timer is what
+    /// triggers it, so the traffic is bounded by that timer until the peer
+    /// acks, after which it never campaigns again.
+    fn stranger_notice(&self, candidate: &NodeId) -> Option<Out<C>> {
+        if self.role != Role::Leader
+            || *candidate == self.id
+            || self.config.contains(candidate)
+            || self.learners.contains(candidate)
+        {
+            return None;
+        }
+        // Prefer the precise removing entry when the retained log still
+        // shows it; otherwise (compaction has folded it into the snapshot, or
+        // this leader was never told) claim only what the leader can prove —
+        // the candidate is excluded by its *newest committed* config, at that
+        // entry's stamp (or the snapshot boundary's). That claim is exactly as
+        // strong as the recipient's guard needs: it is later than any
+        // membership the candidate held before being removed, and earlier
+        // than any re-add that has not happened yet.
+        let dep = self
+            .removals_in_log()
+            .remove(candidate)
+            .or_else(|| self.latest_config_stamp())?;
+        self.removal_notice_for(candidate, dep)
+            .map(|m| (candidate.clone(), m))
+    }
+
+    /// The stamp of the newest config entry in the retained log, else the
+    /// snapshot boundary; `None` when this group has never had either (the
+    /// initial config is all there is, and no notice can be stamped).
+    fn latest_config_stamp(&self) -> Option<Departing> {
+        self.log
+            .iter()
+            .rev()
+            .find(|e| e.config.is_some())
+            .map(|e| Departing {
+                index: e.index,
+                term: e.term,
+            })
+            .or_else(|| {
+                (self.snapshot_index > 0).then_some(Departing {
+                    index: self.snapshot_index,
+                    term: self.snapshot_term,
+                })
+            })
+    }
+
+    /// Give up on any `departing` peer that has sent back nothing at all for
+    /// [`DEPARTING_NOTICE_GIVE_UP`] (measured from its last reply, never from
+    /// when it started departing), dropping it and every per-peer scrap of
+    /// bookkeeping ([`drop_departing`](Self::drop_departing)). Called once per
+    /// heartbeat cadence from [`tick`](Self::tick). **Never touches `config`/
+    /// `peers`** — the removal already took effect the moment the removing
+    /// entry was appended; this only stops this leader's own notice/catch-up
+    /// traffic to a peer it presumes gone. See the constant's doc for why this
+    /// is safe to bound (it is not the correctness mechanism).
+    fn expire_stale_departing(&mut self, now: Nanos) {
+        if self.departing.is_empty() {
+            return;
+        }
+        for peer in self.departing.keys() {
+            self.departing_since.entry(peer.clone()).or_insert(now);
+        }
+        let ceiling = DEPARTING_NOTICE_GIVE_UP.as_nanos() as u64;
+        let stale: Vec<NodeId> = self
+            .departing_since
+            .iter()
+            .filter(|(p, since)| {
+                self.departing.contains_key(*p) && now.0.saturating_sub(since.0) >= ceiling
+            })
+            .map(|(p, _)| p.clone())
+            .collect();
+        for peer in stale {
+            self.drop_departing(&peer);
+        }
+    }
+
+    /// **Peer side** of the removal notice. See [`RaftMsg::Removed`].
+    ///
+    /// Accepted only if all of:
+    /// 1. `term >= current_term` — a notice from an older term is answered
+    ///    with our own term (so a deposed sender steps down) and otherwise
+    ///    ignored, exactly like a stale `AppendEntries`.
+    /// 2. We are not the leader of this term.
+    /// 3. The notice's own membership excludes us (a malformed or misrouted
+    ///    notice never marks a member removed).
+    /// 4. `(removal_term, removal_index)` is **strictly later** than the
+    ///    latest config entry we know of that includes us
+    ///    ([`latest_self_membership_stamp`](Self::latest_self_membership_stamp)) —
+    ///    the stale-notice guard, described below.
+    ///
+    /// **Why a delayed/stale notice cannot un-member a re-added node.** Our
+    /// own knowledge of being re-added is a config entry (or snapshot) that
+    /// includes us and is later than the removal in the one committed
+    /// history. Comparing `(term, index)` stamps lexicographically is exactly
+    /// "later in that history" (terms never decrease along a log), so a
+    /// notice for a removal *older* than a re-add we already hold fails guard
+    /// 4 and is ignored. A notice older than a re-add we have **not** yet
+    /// received is accepted — but then it is *true as of when it was
+    /// sent*, the re-add entry is still in flight to us, and it clears the
+    /// flag on arrival (`refresh_removed_flag`, run on every appended config
+    /// entry and every snapshot install: a self-including entry/snapshot
+    /// with a stamp later than the recorded removal). In the interim the
+    /// flag only stops us campaigning and granting — the same posture as a
+    /// learner, which a not-yet-caught-up re-added replica already has to be
+    /// safe under — and the host reconciler additionally refuses to release
+    /// on the flag unless replicated `Metadata` also excludes the node
+    /// (`host::plan`'s `tablets_to_release_set`), which a re-added replica
+    /// never satisfies. A **fresh replica with an empty log** re-created
+    /// after a re-add has no self-including entry at all (stamp `(0,0)` or
+    /// none), so an old delayed notice is accepted by it too — harmless by
+    /// the same two facts: it cannot campaign anyway until it is a voter
+    /// (a fresh replica joins as a non-voter), it is never released while
+    /// Metadata includes it, and the first `AppendEntries`/`InstallSnapshot`
+    /// carrying the re-adding config clears the flag.
+    ///
+    /// **Why a flag and a config *view* rather than adopting the notice's
+    /// config into `config`/`learners`:** those two, `peers`, `cluster_size`,
+    /// `config_history` and `snapshot_config` are all pure functions of the
+    /// log and snapshot (`apply_config` at every append/truncate/install,
+    /// `recompute_config` after every truncation). Writing a config into
+    /// them that no log entry justifies would be silently undone by the next
+    /// truncation or recompute — or, worse, survive it and make `config_at`/
+    /// `learners_at` (the values `AppendEntries` consistency and snapshot
+    /// building trust) disagree with the live config, corrupting the very
+    /// log-matching argument membership changes rest on. A separate,
+    /// volatile, stamp-carrying flag consulted only by `is_voter()` and the
+    /// reconciler cannot do that: the log and everything derived from it are
+    /// byte-for-byte unchanged by a notice.
+    fn handle_removed(
+        &mut self,
+        from: NodeId,
+        term: u64,
+        removal: EntryStamp,
+        config: &BTreeSet<NodeId>,
+        learners: &BTreeSet<NodeId>,
+    ) -> Vec<Out<C>> {
+        if term < self.current_term {
+            return vec![(
+                from,
+                RaftMsg::RemovedAck {
+                    term: self.current_term,
+                    removal_index: 0,
+                },
+            )];
+        }
+        if self.role == Role::Leader || config.contains(&self.id) || learners.contains(&self.id) {
+            return Vec::new();
+        }
+        if self
+            .latest_self_membership_stamp()
+            .is_some_and(|member| member >= removal)
+        {
+            return Vec::new();
+        }
+        // A valid notice comes from a genuine leader of this (or a newer,
+        // already adopted) term: a candidate steps down like on an
+        // `AppendEntries`, so a removed node mid-election can never still
+        // tally its way to leadership.
+        self.role = Role::Follower;
+        self.leader_id = Some(from.clone());
+        self.removed_by_leader = Some(self.removed_by_leader.map_or(removal, |r| r.max(removal)));
+        vec![(
+            from,
+            RaftMsg::RemovedAck {
+                term: self.current_term,
+                removal_index: removal.1,
+            },
+        )]
+    }
+
+    /// **Leader side** of the ack: the peer has *recorded* its removal (the
+    /// flag is volatile by design, see `removed_by_leader`). Stops the schedule and frees every per-peer scrap. An ack
+    /// that does not cover the entry this leader is waiting on (a stale-term
+    /// reply carries `removal_index: 0`) is ignored.
+    fn handle_removed_ack(&mut self, from: NodeId, term: u64, removal_index: u64) {
+        if self.role != Role::Leader || term != self.current_term {
+            return;
+        }
+        // Only stop when the log can no longer serve the peer. A peer the
+        // retained log still covers (a returning zombie that told us so by
+        // campaigning, or one whose ack raced the schedule) keeps receiving
+        // ordinary `AppendEntries` until it acks the removing ENTRY: the
+        // notice is only the fallback for what the log cannot deliver, and a
+        // node that never receives the entry keeps a log-derived config that
+        // still lists it (visible on every admin view, and all a volatile
+        // flag has after its own restart).
+        let log_cannot_serve =
+            self.next_index.get(&from).copied().unwrap_or(1) <= self.snapshot_index;
+        if log_cannot_serve
+            && self
+                .departing
+                .get(&from)
+                .is_some_and(|d| removal_index >= d.index)
+        {
+            self.drop_departing(&from);
+        }
+    }
+
     /// Build the right replication message for `peer`: an `InstallSnapshot` chunk
     /// if the entries it needs have been compacted away, otherwise
     /// `AppendEntries`, capped at [`MAX_APPEND_ENTRIES_BATCH`] entries (issues
@@ -4887,11 +5538,27 @@ where
     /// [`snapshot_chunk_for`](Self::snapshot_chunk_for)); the peer is simply
     /// retried on the next heartbeat once the driver supplies the image.
     fn replicate_to(&mut self, peer: NodeId, snapshot_resend: SnapshotResend) -> Option<Out<C>> {
+        // Issue #1061: everything sent to a departing peer rides its own
+        // capped-backoff schedule, so a silent one costs next to nothing.
+        if !self.departing_send_gate(&peer) {
+            return None;
+        }
         let next = self.next_index.get(&peer).copied().unwrap_or(1).max(1);
         // The entry before `next` is in our snapshot (or earlier) — we can't form
         // a valid `prev_log_term`, so ship the snapshot instead, as the next
         // offset-addressed chunk for this peer.
         if next <= self.snapshot_index {
+            // Issue #1061: a DEPARTING peer is never shipped a snapshot. It is
+            // not a member of the configuration any more, so an image is
+            // wasted bytes, and (since compaction's retention floor is
+            // voters-only) every later compaction restarts the transfer — an
+            // endless full-image flood to a peer that may never even be alive.
+            // What it needs is the *fact* of its removal, not the state it
+            // would have replicated: send the tiny notice instead.
+            if let Some(dep) = self.departing.get(&peer).copied() {
+                self.forget_snapshot_transfer(&peer);
+                return self.removal_notice_for(&peer, dep).map(|m| (peer, m));
+            }
             return self.snapshot_chunk_for(peer, snapshot_resend);
         }
         let prev_log_index = next - 1;

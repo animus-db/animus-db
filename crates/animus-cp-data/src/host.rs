@@ -277,7 +277,10 @@ pub struct TabletFacts {
     /// group already excludes this node — the release-gate anchor (ADR
     /// 0029): the replay-independent signal a removed node reliably adopts,
     /// unlike replicated `Metadata.tablets`, which a restarting control
-    /// replica replays through historical states. Must be `false` whenever
+    /// replica replays through historical states. **Issue #1061: also
+    /// `true` when the leader's explicit removal notice
+    /// (`RaftKvNode::removed_by_leader`) has told this replica it was
+    /// removed** — for a replica the log can no longer reach. Must be `false` whenever
     /// `hosted` is `false` ("stand-up in flight" reads the same as "still a
     /// voter" — never treated as excluded).
     pub config_excludes_me: bool,
@@ -1491,7 +1494,16 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
         let mut facts = BTreeMap::new();
         for (&tablet, node) in &self.hosted {
             let scope_range = node.scope_range();
-            let config_excludes_me = !node.config().contains(&self.base_id);
+            // Issue #1061: "this replica knows it was removed" is either its
+            // own log-derived voter config no longer listing it, OR an
+            // explicit removal notice from the leader
+            // (`RaftKvNode::removed_by_leader`) — the only signal a replica
+            // that fell behind the leader's compacted prefix, or sat out a
+            // leadership change partitioned, can ever get. `plan` still
+            // requires replicated `Metadata` to exclude this node too, and
+            // still debounces over `RELEASE_CONFIRM_TICKS`.
+            let config_excludes_me =
+                !node.config().contains(&self.base_id) || node.removed_by_leader();
             // Issue #987 follow-up: consulted for EVERY hosted tablet,
             // never gated on whether THIS tick's `view` still shows an
             // `inplace_split` intent. The old gate (only call

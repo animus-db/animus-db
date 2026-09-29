@@ -1576,9 +1576,11 @@ refuses-to-overwrite discipline as `control-wal`'s.
 
   **Deliberately out of scope for this primitive** (left to the reconciler
   layer, ADR 0058 Train 2 or later): notifying a *removed* learner of its own
-  removal the way `departing` does for a removed voter (harmless — a removed
-  learner can never campaign regardless of whether it learns about the
-  removal, since it was never in `config` to begin with; only a cleanliness
+  removal the way `departing`/`RaftMsg::Removed` (issue #1061, below) does for
+  a removed voter (harmless — a removed learner can never campaign regardless
+  of whether it learns about the removal, since it was never in `config` to
+  begin with; and its host reconciler's `config_excludes_me` is already true
+  for any learner, so `Metadata` alone releases it; only a cleanliness
   concern, not a safety one) and any policy for *when* to call
   `promote_learner` (the host reconciler's replica-move sequencing).
 
@@ -1604,6 +1606,63 @@ refuses-to-overwrite discipline as `control-wal`'s.
   flake this closed. Recording at the mutation site itself cannot miss it,
   regardless of which task or how much batching triggered it. A pure
   accessor — `config_history()` never blocks or mutates anything.
+
+- **Removing a voter: explicit `RaftMsg::Removed` notice (ADR 0058's issue
+  #1061 amendment; supersedes the ADR 0029 `departing` prose).** A removed
+  voter must be *told*, by a positive channel — never by a timeout, never by
+  a snapshot. Read the amendment for the whole design; the gotchas that are
+  not derivable from the doc comments:
+  - **A departing peer is never shipped an `InstallSnapshot`.** `replicate_to`
+    sends `Removed` when `next_index <= snapshot_index` for a `departing`
+    peer (and only once the removing entry is **committed**), and drops that
+    peer's transfer bookkeeping so `snapshot_transfer_in_flight` cannot wedge
+    a compaction defer. A peer the log still covers keeps getting ordinary
+    `AppendEntries`.
+  - **Everything sent to a departing peer rides one *time-based* send gate**
+    (`departing_send_gate`, `removal_sched`, `now_hint`). Not tick-count
+    based: under a sustained writer `replicate_now` keeps pushing
+    `heartbeat_deadline` out, the heartbeat tick never fires, and a
+    tick-counting schedule would either send a notice per write or never.
+    `now_hint` is the last `now` `tick`/`handle`/`replicate_now` was driven
+    with (`replicate_to` has no `now` parameter and should not grow one).
+    Any reply from the peer resets the gate (`note_departing_reply`).
+  - **`departing` is re-derived, not cleared, in `become_leader`**
+    (`removals_in_log`): bounded by the config entries the leader's own log
+    retains. A removal compaction has folded into the snapshot is invisible —
+    the snapshot carries only the config *at* its boundary, and extending it
+    would be a WAL/snapshot format change (ADR 0073) for a duty
+    `stranger_notice` discharges for free. Do not "fix" that bound by adding
+    a persisted removed-peers set without reading the amendment.
+  - **`stranger_notice`**: a leader answering a `PreVote`/`RequestVote` from a
+    non-member (of its current config) also sends the notice, stamped with the
+    precise removing entry if still in the log, else the newest committed
+    config entry/snapshot boundary. Needs no leader-side memory; this is what
+    survives the `DEPARTING_NOTICE_GIVE_UP` (5 min) bound, compaction and
+    leadership change. Not sent for a member (voter or learner), by a
+    non-leader, or for an uncommitted stamp.
+  - **The peer records a volatile `removed_by_leader` stamp and never writes
+    it into `config`/`learners`.** `is_voter()` reads it (so `start_pre_vote`/
+    `start_election`/`TimeoutNow` treat the node like a learner); granting
+    votes is deliberately *not* gated on it (#1019 — do not add a membership
+    check on the granting side). The guard compares `(term, index)` stamps
+    lexicographically against the node's latest self-including config entry,
+    snapshot boundary or initial config (`latest_self_membership_stamp`);
+    `refresh_removed_flag` clears it when a later self-including entry or
+    snapshot lands (re-add). `RaftCore::config()` still lists a node that has
+    been told it was removed — by design; anything asking "was I removed" must
+    consult `removed_by_leader()` too (the host reconciler's
+    `gather_facts` does).
+  - **The prototype's responder-side candidate-recognition guard in
+    `handle_request_vote` was deliberately not kept**: a zombie's log lacks the
+    removal entry, so every current voter already refuses its vote on
+    `log_ok`. `learner_promotion_leader_crash.rs`'s
+    `promoted_candidate_wins_election_after_leader_dies_right_after_commit` is
+    the standing guard against adding one back.
+  - `ships_before_durable` lists both new variants (no vote, no durable
+    state). Tests: `tests/removal_notice.rs` (bare-core harness — note it
+    must emulate the driver's snapshot-image build for the `DRIVER_APPLIED`
+    `Metadata`, or a snapshot path silently sends nothing and a
+    "no snapshot" assertion passes vacuously).
 
 - **Leadership transfer (`RaftCore::transfer_leadership`, ADR 0029).**
   Originally a per-tablet CP-data primitive living here because the sync

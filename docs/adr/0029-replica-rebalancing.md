@@ -184,3 +184,27 @@ used.
 - No new wire-visible `MetaCommand`; the new `RaftMsg::TimeoutNow` variant is
   additive on the shared Raft wire (and on `animus-cp-data`'s binary codec,
   version-bumped) exactly as `PreVote` was.
+
+## Amendment (2026-09-28, issue #1061): the "accepted residual gap" is closed
+
+The first `Accepted residual gap` consequence above (a removed node that never
+receives its removing entry keeps its group hosted forever, because the
+release gate needs its *own* log-derived config to exclude it) is closed by an
+explicit removal notice, `RaftMsg::Removed` / `RemovedAck` — see ADR 0058's
+2026-09-28 (#1061) amendment for the mechanism, the re-derivation bound, the
+stale-notice guards and the safety argument. In this ADR's terms: the
+departing-peer duty is no longer discharged only by replicating the removing
+entry (which stops working once the leader's log is compacted past the peer,
+and is forgotten on a leadership change); a leader now re-derives it from its
+retained log on election, sends a tiny capped-backoff notice instead of a
+snapshot to a peer the log can no longer serve, and answers a returning
+removed peer's own pre-vote/vote with the notice. §3's release gate
+`config_excludes_me` is now "my own log-derived config excludes me **or** the
+leader told me so" (`RaftKvNode::removed_by_leader`); the `Metadata`-exclusion
+requirement and `RELEASE_CONFIRM_TICKS` dampener are unchanged. The
+`departing` field is no longer `BTreeMap<NodeId, u64>` but carries the
+removing entry's `(index, term)`, and is no longer "cleared once that peer's
+`match_index` reaches the removal index" only — it is also cleared by the ack
+and, as a volume bound on a peer that is genuinely gone, by five minutes of
+total silence.
+

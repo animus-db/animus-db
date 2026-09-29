@@ -73,5 +73,8 @@ pub use animus_placement::PlacementPolicy;
 // `animus-placement` dependency.
 pub use animus_placement::{Candidate, select_replicas_balanced};
 pub use persist::{PersistedState, WalRecord};
-pub use raft::{LogEntry, MemberRole, ProposeResult, RaftCore, RaftMsg, Role, StateMachine};
+pub use raft::{
+    DEPARTING_NOTICE_GIVE_UP, LogEntry, MemberRole, ProposeResult, RaftCore, RaftMsg, Role,
+    StateMachine,
+};
 pub use shared_wal::SharedWal;

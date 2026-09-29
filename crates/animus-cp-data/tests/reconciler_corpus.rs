@@ -1528,14 +1528,21 @@ fn scenario_partition_blocks_release(seed: u64) {
         );
         assert_present(&c.storage(a(), TabletId(1)), &physical(b"k0"), b"v0").await;
 
-        // Heal — the removal entry finally reaches a(), then release proceeds.
+        // Heal — a() finally learns it was removed, then release proceeds.
+        // Issue #1061: it learns through EITHER channel — the removal entry
+        // itself reaching it (its own log-derived config then excludes it)
+        // or the leader's explicit removal notice (`removed_by_leader`),
+        // which a returning removed peer's own campaign triggers
+        // (`RaftCore::stranger_notice`) and which usually wins the race
+        // against the leader's own schedule here. Both are what
+        // `TabletFacts::config_excludes_me` now means.
         sim2.heal(a(), b());
         assert!(
-            wait_until(&env, 80, Duration::from_millis(100), || !ha
-                .config()
-                .contains(&a()))
+            wait_until(&env, 80, Duration::from_millis(100), || {
+                !ha.config().contains(&a()) || ha.removed_by_leader()
+            })
             .await,
-            "a()'s own durable config never excluded it after healing"
+            "a() never learned it was removed after healing"
         );
         for _ in 0..8 {
             c.tick(a(), &v2).await;
