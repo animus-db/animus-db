@@ -12,6 +12,37 @@
 //! re-advances commit — so a committed command is applied exactly once relative
 //! to the snapshot base (no double-applied compare-and-swap), while the log
 //! prefix the snapshot covers is discarded.
+//!
+//! **Versioned WAL format (ADR 0073 Phase 0 workstream B).** Every line
+//! [`PersistedState::encode_record`]/[`PersistedState::decode`] handle is
+//! tagged with [`CONTROL_WAL`] (magic `CWL1`, currently version 1) via
+//! [`crate::format::encode_line`]/[`crate::format::decode_lines`] — see
+//! that module's doc for the framing shape and error semantics in full,
+//! and [`PersistedState::decode`]'s own doc below for how this WAL
+//! specifically distinguishes a torn tail (tolerated, `Ok` with a shorter
+//! prefix) from real corruption or an unrecognized/future tag (loud,
+//! `Err`, never silently misdecoded). **`animus-cp-data`'s own per-group
+//! WAL inherits `CONTROL_WAL` for free**: its non-`SharedWal` persist path
+//! (`PersistedState::encode_record`'s fallback branch, when
+//! `--no-shared-wal` is set) is the *same* generic `PersistedState<C, S>`
+//! defined here, just instantiated with `C = KvCommand`/`S = KvState`
+//! instead of `MetaCommand`/`Metadata` — there is no second WAL-line codec
+//! to keep in sync. This is the last permitted incompatible reset of this
+//! format (`docs/adr/0073-upgrade-compatibility.md`): once the Phase 0
+//! baseline lands, a future change to this shape is a new version, a
+//! decoder that still accepts every older post-baseline version, and a new
+//! golden fixture — never an edit to an existing one.
+//!
+//! **The tagged/multiplexed `SharedWal` envelope (`encode_tagged_record`/
+//! `decode_tagged`, below) is deliberately untouched by this reset** — its
+//! outer `Line{tablet, record}` wrapper stays on the pre-existing,
+//! unversioned `<crc32>:<json>` framing (kept as a private helper,
+//! [`encode_checksummed_line`]/[`verify_checksummed_line`]) rather than
+//! switching to [`crate::format::encode_line`]/[`crate::format::
+//! decode_lines`] in this PR — that conversion (magic `SWL1`) belongs to
+//! ADR 0073 Phase 0 **workstream C** (`animus-cp-data`, whose own
+//! `shared_wal.rs` — despite the name — lives in *this* crate, not that
+//! one; see `crates/animus-control/CLAUDE.md`'s "Versioned formats" entry).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -22,36 +53,74 @@ use animus_tablet::TabletId;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use crate::format::{self, FormatError, FormatTag};
 use crate::meta::{MetaCommand, Metadata};
 use crate::raft::LogEntry;
 
-// ---------------------------------------------------------------------------
-// Per-record WAL checksum framing (issue #495).
-//
-// The pre-existing format was plain newline-terminated `serde_json` with no
-// way to tell a wrong-but-still-valid value apart from a correct one: a
-// bit-flip landing inside a byte that kept the JSON syntactically valid (e.g.
-// a digit inside a packed numeric field) decoded successfully into a
-// different, silently-corrupt record instead of a decode error — confirmed
-// to reach a hard panic once such a record applied past
-// `animus_cp_data::assert_ts_monotonic` (see `docs/engineering-lessons.md`'s
-// issue #495 entry for the full account). Every line is now framed
-// `<crc32 as 8 lowercase hex chars>:<json>\n` — `crc32fast::hash`, the same
-// crate/impl `animus-storage`'s own CRC-checked SSTable/WAL framing uses,
-// reused here rather than a second dependency for the same job. This is a
-// text-based checksum wrapper around the existing JSON line, not a switch to
-// `animus-storage`'s binary length-prefixed frame — this WAL stays
-// `serde_json`, shared generic over any `RaftCore<C, S>` (the module doc
-// above), where a binary frame would still need a self-describing payload
-// codec underneath it and would buy nothing extra for the control plane's
-// non-hot-path WAL. No back-compat: this repo carries no WAL format
-// compatibility guarantee between revisions (root `CLAUDE.md`), so there is
-// no migration for a pre-existing unchecksummed WAL file — a node upgraded
-// in place would need a fresh WAL, exactly like any other format change here.
+/// The control-plane Raft WAL's line envelope (ADR 0073 Phase 0 workstream
+/// B): magic `CWL1`, currently version 1. See this module's own doc for how
+/// broadly this tag applies (both planes' non-`SharedWal` WAL) and
+/// `crate::format`'s doc for the line shape/error semantics.
+pub const CONTROL_WAL: FormatTag = FormatTag {
+    magic: *b"CWL1",
+    version: 1,
+    name: "control-wal",
+};
 
-/// Frame one already-serialized payload as a checksummed WAL line. Shared by
-/// [`PersistedState::encode_record`] and
-/// [`PersistedState::encode_tagged_record`].
+/// The control-plane snapshot / `InstallSnapshot` payload envelope (ADR 0073
+/// Phase 0 workstream B): magic `CSN1`, currently version 1 — [`format::wrap`]/
+/// [`format::unwrap`]'s binary shape (this payload has no line framing of its
+/// own to protect). Covers **both** shapes this crate's `RaftCore<C, S>`
+/// puts inside an `InstallSnapshot` chunk stream:
+///
+/// - The real, `DRIVER_APPLIED` control plane's transfer payload — the
+///   system-keyspace image `crate::node`'s `syskv_image`/`install_syskv_image`
+///   build/consume (a `serde_json`-encoded `Vec<(key, value-or-tombstone,
+///   version)>`), never a serialized [`Metadata`] blob (see `crate::node`'s
+///   own doc for why: `Metadata` is `DRIVER_APPLIED`, so `RaftCore::metadata`
+///   is a meaningless placeholder and the real image is built lazily from the
+///   engine).
+/// - [`RaftCore`](crate::raft::RaftCore)'s own generic `!S::DRIVER_APPLIED`
+///   fallback (`raft.rs`'s `snapshot_upto`/`recovered`/`handle_install_snapshot`),
+///   which wraps `serde_json::to_vec(&self.metadata)`/`serde_json::from_slice::<S>`
+///   directly — exercised in this workspace only by the toy test state
+///   machine (`generic_state_machine.rs`), since every real `S` in this
+///   codebase is `DRIVER_APPLIED`.
+///
+/// One shared tag for both, since both are, physically, "the bytes an
+/// `InstallSnapshot` transfer carries for this plane" — not two independent
+/// formats that happen to look similar. **`animus-cp-data`'s own `KvState`
+/// snapshot image is a wholly separate binary codec** (`codec::encode_image`,
+/// workstream C) and does not use this tag at all.
+pub const CONTROL_SNAPSHOT: FormatTag = FormatTag {
+    magic: *b"CSN1",
+    version: 1,
+    name: "control-snapshot",
+};
+
+// ---------------------------------------------------------------------------
+// Per-record checksum framing for the tagged/multiplexed `SharedWal`
+// envelope (issue #495) — kept as a private, untagged `<crc32>:<json>\n`
+// helper for `encode_tagged_record`/`decode_tagged` only (see this module's
+// own doc above for why this one path is out of scope for the ADR 0073
+// reset). [`PersistedState::encode_record`]/[`PersistedState::decode`] use
+// [`crate::format::encode_line`]/[`crate::format::decode_lines`] instead,
+// which fold an equivalent per-record CRC32 checksum into a tagged,
+// versioned line.
+//
+// The original motivation, for context: the pre-issue-#495 format was plain
+// newline-terminated `serde_json` with no way to tell a wrong-but-still-valid
+// value apart from a correct one — a bit-flip landing inside a byte that
+// kept the JSON syntactically valid (e.g. a digit inside a packed numeric
+// field) decoded successfully into a different, silently-corrupt record
+// instead of a decode error, confirmed to reach a hard panic once such a
+// record applied past `animus_cp_data::assert_ts_monotonic` (see
+// `docs/engineering-lessons.md`'s issue #495 entry for the full account).
+
+/// Frame one already-serialized payload as an untagged, checksummed WAL
+/// line. Used only by [`PersistedState::encode_tagged_record`] now — see
+/// this module's own doc for why [`PersistedState::encode_record`] no
+/// longer does.
 fn encode_checksummed_line(payload: &[u8]) -> Vec<u8> {
     let crc = crc32fast::hash(payload);
     let mut line = Vec::with_capacity(payload.len() + 10);
@@ -64,9 +133,10 @@ fn encode_checksummed_line(payload: &[u8]) -> Vec<u8> {
 /// Validate one non-empty WAL line's checksum prefix, returning the payload
 /// bytes (still to be JSON-decoded by the caller) on a match. `None` on any
 /// malformed framing — no `:` separator, a non-8-hex-digit prefix, or a CRC
-/// mismatch — which the caller (`decode`/`decode_tagged`) treats identically
-/// to a torn trailing line: everything from here on is dropped, never
-/// applied, never a panic.
+/// mismatch — which the caller (`decode_tagged`) treats identically to a
+/// torn trailing line: everything from here on is dropped, never applied,
+/// never a panic. ([`PersistedState::decode`]'s own tagged-line equivalent
+/// is [`crate::format::decode_lines`] now — see this module's doc.)
 fn verify_checksummed_line(line: &[u8]) -> Option<&[u8]> {
     let colon = line.iter().position(|&b| b == b':')?;
     let (hex, rest) = line.split_at(colon);
@@ -83,7 +153,7 @@ fn verify_checksummed_line(line: &[u8]) -> Option<&[u8]> {
 /// [`MetaCommand`] / [`Metadata`]), so the same WAL machinery serves any
 /// `RaftCore<C, S>`. The generic is erased in the JSON form, so the on-disk
 /// encoding for the control plane is unchanged.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WalRecord<C = MetaCommand, S = Metadata> {
     /// Persisted hard state: current term and vote (must be durable before the
     /// vote/term is acted on).
@@ -190,54 +260,49 @@ where
         state
     }
 
-    /// Encode a single record as one newline-terminated, CRC32-checksummed
-    /// JSON line for the WAL (issue #495): `<crc32 as 8 lowercase hex
-    /// chars>:<json>\n`. `serde_json` never emits raw newlines or `:` inside
-    /// its own line-terminal position ambiguously — the checksum's fixed
-    /// 8-hex-digit-plus-colon prefix is unambiguous framing, same principle
-    /// as `animus-storage`'s length-prefixed + `crc32fast`-checksummed binary
-    /// WAL frames, just kept text-based here since this format is shared
-    /// generic JSON, not a hand-rolled binary codec. See [`decode`](Self::decode)'s
-    /// doc for why a checksum failure is treated exactly like a torn tail.
+    /// Encode a single record as one [`CONTROL_WAL`]-tagged, checksummed
+    /// line via [`crate::format::encode_line`] (ADR 0073 Phase 0 workstream
+    /// B — see this module's own doc). See [`decode`](Self::decode)'s doc
+    /// for why a framing failure is treated exactly like a torn tail, while
+    /// an unrecognized/future tag or a malformed payload is a loud `Err`.
     #[must_use]
     pub fn encode_record(record: &WalRecord<C, S>) -> Vec<u8> {
         let payload = serde_json::to_vec(record).expect("wal record serializes");
-        encode_checksummed_line(&payload)
+        format::encode_line(&CONTROL_WAL, &payload)
     }
 
-    /// Decode the WAL bytes back into records, stopping at the first record
-    /// that fails to decode — whether because it is a **trailing partial
-    /// line** (a write torn by a crash — its effect was never acted on) or
-    /// because its **checksum doesn't match** (issue #495: at-rest
-    /// corruption of an already-fsynced record, which the pre-checksum
-    /// newline-JSON framing could not distinguish from a legitimate value —
-    /// a bit-flip landing inside a byte that kept the JSON syntactically
-    /// valid used to decode successfully into a wrong-but-plausible value
-    /// instead of failing). Both cases are handled identically: everything
-    /// from the first bad record onward is dropped, never applied, and
-    /// nothing here ever panics on corrupt input — deliberately simpler than
-    /// `animus-storage`'s own WAL framing, which additionally distinguishes
-    /// a real mid-file corruption (hard error) from a torn tail (tolerated)
-    /// by checking whether any valid record follows; this WAL has no
-    /// invariant that needs that finer distinction (a dropped tail-of-log is
-    /// always safe here — see `PersistedState::replay`'s doc), so "stop at
-    /// the first bad record" is the simplest sufficient rule that closes the
-    /// gap.
-    pub fn decode(bytes: &[u8]) -> Vec<WalRecord<C, S>> {
-        let mut records = Vec::new();
-        for line in bytes.split(|&b| b == b'\n') {
-            if line.is_empty() {
-                continue;
-            }
-            let Some(payload) = verify_checksummed_line(line) else {
-                break;
-            };
-            let Ok(record) = serde_json::from_slice(payload) else {
-                break;
-            };
+    /// Decode the WAL bytes back into records.
+    ///
+    /// - A **trailing partial line** (a write torn by a crash — its effect
+    ///   was never acted on) or a **checksum mismatch** (issue #495:
+    ///   at-rest corruption of an already-fsynced record) stops decoding at
+    ///   the first such line and returns everything collected before it as
+    ///   `Ok` — never applied, never a panic, never an `Err`: a dropped
+    ///   tail-of-log is always safe here (see [`PersistedState::replay`]'s
+    ///   doc), so silently returning the valid prefix is the correct
+    ///   behavior, not merely tolerated.
+    /// - A CRC-valid line with no recognized [`CONTROL_WAL`] tag (a
+    ///   pre-baseline WAL file, written before the ADR 0073 Phase 0 reset)
+    ///   is `Err(FormatError::PreBaselineFormat)`.
+    /// - A CRC-valid, correctly-tagged line whose version this build
+    ///   doesn't know is `Err(FormatError::UnsupportedFormatVersion)`.
+    /// - A CRC-valid, correctly-tagged, supported-version line whose JSON
+    ///   payload doesn't decode is `Err(FormatError::Malformed)` — real
+    ///   corruption inside an otherwise well-framed record, always loud,
+    ///   never silently dropped like a torn tail.
+    ///
+    /// Nothing here ever panics on corrupt input.
+    pub fn decode(bytes: &[u8]) -> Result<Vec<WalRecord<C, S>>, FormatError> {
+        let lines = format::decode_lines(&CONTROL_WAL, bytes)?;
+        let mut records = Vec::with_capacity(lines.len());
+        for (_version, payload) in lines {
+            let record = serde_json::from_slice(payload).map_err(|e| FormatError::Malformed {
+                format: CONTROL_WAL.name,
+                detail: e.to_string(),
+            })?;
             records.push(record);
         }
-        records
+        Ok(records)
     }
 
     /// Encode one record tagged with the tablet it belongs to, for a **shared**,
@@ -513,7 +578,8 @@ mod tests {
         for r in &records {
             bytes.extend(PersistedState::<MetaCommand, Metadata>::encode_record(r));
         }
-        let decoded = PersistedState::<MetaCommand, Metadata>::decode(&bytes);
+        let decoded = PersistedState::<MetaCommand, Metadata>::decode(&bytes)
+            .expect("no format error expected here");
         assert_eq!(decoded.len(), records.len());
         let state = PersistedState::<MetaCommand, Metadata>::replay(decoded);
         assert_eq!(state.term, 3);
@@ -537,7 +603,8 @@ mod tests {
         // got to emit one) no complete checksum-hex prefix either.
         bytes.extend_from_slice(b"deadbeef:{\"Hard\":{\"term\":9");
 
-        let decoded = PersistedState::<MetaCommand, Metadata>::decode(&bytes);
+        let decoded = PersistedState::<MetaCommand, Metadata>::decode(&bytes)
+            .expect("no format error expected here");
         assert_eq!(decoded.len(), 1, "the torn record must not appear at all");
         let state = PersistedState::<MetaCommand, Metadata>::replay(decoded);
         assert_eq!(state.term, 7, "must reflect only the one good record");
@@ -584,7 +651,8 @@ mod tests {
         bytes.extend(&line2);
         bytes.extend(&line3);
 
-        let decoded = PersistedState::<MetaCommand, Metadata>::decode(&bytes);
+        let decoded = PersistedState::<MetaCommand, Metadata>::decode(&bytes)
+            .expect("no format error expected here");
         assert_eq!(
             decoded.len(),
             1,
@@ -623,5 +691,68 @@ mod tests {
             demuxed.is_empty(),
             "a corrupted tagged record must never surface, wrong-valued or otherwise"
         );
+    }
+
+    // --- CONTROL_WAL tagging (ADR 0073 Phase 0 workstream B) ---
+
+    /// A pre-baseline WAL line (the old, untagged `<crc32>:<json>` shape
+    /// `encode_checksummed_line` still produces for the tagged/multiplexed
+    /// path) is refused by name through `PersistedState::decode`, never
+    /// silently misread as an empty or partial log.
+    #[test]
+    fn decode_rejects_a_pre_baseline_untagged_line() {
+        let good = WalRecord::<MetaCommand, Metadata>::Hard {
+            term: 1,
+            voted_for: None,
+        };
+        let payload = serde_json::to_vec(&good).unwrap();
+        let line = encode_checksummed_line(&payload);
+        let err = PersistedState::<MetaCommand, Metadata>::decode(&line).unwrap_err();
+        assert_eq!(
+            err,
+            FormatError::PreBaselineFormat {
+                format: CONTROL_WAL.name
+            }
+        );
+    }
+
+    /// A correctly CRC-framed, correctly `CWL1`-tagged line whose version
+    /// this build doesn't know is a loud, named `Err`, not a silent
+    /// misdecode or an empty result.
+    #[test]
+    fn decode_rejects_an_unsupported_future_version() {
+        let good = WalRecord::<MetaCommand, Metadata>::Hard {
+            term: 1,
+            voted_for: None,
+        };
+        let payload = serde_json::to_vec(&good).unwrap();
+        let future_tag = FormatTag {
+            magic: CONTROL_WAL.magic,
+            version: CONTROL_WAL.version + 1,
+            name: CONTROL_WAL.name,
+        };
+        let line = format::encode_line(&future_tag, &payload);
+        let err = PersistedState::<MetaCommand, Metadata>::decode(&line).unwrap_err();
+        assert_eq!(
+            err,
+            FormatError::UnsupportedFormatVersion {
+                format: CONTROL_WAL.name,
+                found: CONTROL_WAL.version + 1,
+                max_supported: CONTROL_WAL.version,
+            }
+        );
+    }
+
+    /// A correctly framed, correctly tagged, supported-version line whose
+    /// JSON payload is garbage is `Err(Malformed)` — loud, not a silent
+    /// torn-tail-style drop.
+    #[test]
+    fn decode_reports_a_malformed_payload_loudly() {
+        let line = format::encode_line(&CONTROL_WAL, b"not valid json");
+        let err = PersistedState::<MetaCommand, Metadata>::decode(&line).unwrap_err();
+        match err {
+            FormatError::Malformed { format, .. } => assert_eq!(format, CONTROL_WAL.name),
+            other => panic!("expected Malformed, got {other:?}"),
+        }
     }
 }

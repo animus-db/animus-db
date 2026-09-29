@@ -439,4 +439,21 @@ pub trait AdminHost: Send + Sync {
     /// durable catalog fact (`Metadata::stream_shards`), not a live loop's
     /// phase.
     async fn segment_store_view(&self) -> Value;
+    /// `GET /admin/debug/inboxes` (ADR 0026 inbox-growth investigation,
+    /// measure-first PR) — this node's own `ProdEnv` demultiplexed-inbox
+    /// snapshot: total queued frames/bytes plus the largest streams by
+    /// queued bytes, each with its frame/byte count, whether a receiver is
+    /// parked or has ever polled it, and time since its last pop (or
+    /// "never popped"). **Default body**, unlike every route above:
+    /// this is inherently `ProdEnv`-only observability (`animus_env::
+    /// ProdEnv::inbox_stats`) with no `SimEnv`/generic-host analogue at
+    /// all, so a host with no such env (`GenericAdminHost` under
+    /// `SimCluster`, this crate's own `FakeHost` test double) answers the
+    /// honest `{"available": false}` this default returns, rather than
+    /// needing a bespoke impl of its own — only the concrete, `ProdEnv`-
+    /// backed `impl AdminHost for ClientCtx` (`animusd::admin`) overrides
+    /// it with real data.
+    async fn debug_inboxes_view(&self) -> Value {
+        serde_json::json!({"available": false})
+    }
 }

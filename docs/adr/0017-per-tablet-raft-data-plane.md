@@ -1247,3 +1247,33 @@ regression for the `last_installed_index` duplicate-suppression guard
 itself lives in `crates/animus-control/tests/stale_snapshot_no_rewind.rs`
 (`resent_duplicate_final_chunk_is_rejected_while_still_digesting_then_a_
 fresh_core_still_installs`).
+
+### Amendment (2026-09-28, issue #1064): the emergency ceiling no longer cancels a learner's in-flight snapshot
+
+`COMPACT_DEFER_EMERGENCY_CEILING` bounds WAL retention by counting entries
+(`behind >= ceiling`), and a continuous writer grows `behind` at the write rate
+however well a transfer is going. A joining learner that needs a multi-chunk
+`InstallSnapshot` under sustained writes therefore had its transfer cancelled
+by `snapshot_upto` over and over. It never completed an install, so
+`reconfigure_step` could never promote it and a directed-Placing move stayed
+wedged (#1064).
+
+`apply_and_compact` now leaves the emergency ceiling unarmed while the
+outstanding transfer is to a learner. The idle-progress ceiling
+(`COMPACT_DEFER_IDLE_CEILING`) still applies, so a stalled learner transfer is
+still compacted past. A voter's transfer is bounded by both ceilings exactly as
+PR #1047 tuned them.
+
+The trade-off is that WAL retention during a learner transfer that keeps
+making progress is bounded by the transfer's duration, not by a fixed entry
+count. The learner phase already expects exactly one `InstallSnapshot` and then
+a promotion, so this window is short-lived by design.
+
+A standing learner floor mirroring `compaction_floor` was tried first and
+rejected. It had no idle escape, and it pinned compaction indefinitely behind a
+partitioned peer, which broke `snapshot_transfer_survives_compaction.rs`.
+
+Regression: `crates/animus-cp-data/tests/learner_snapshot_livelock_under_continuous_writer.rs`.
+It sets a small ceiling through the test-only `CompactTuning` seam and asserts
+while the writer is still running. Pre-fix it shows 75 restarts, 0 installs and
+the learner's applied index stuck at 0.

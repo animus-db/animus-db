@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "prod")]
 pub mod prod;
 #[cfg(feature = "prod")]
-pub use prod::{FsSegmentStore, ProdEnv};
+pub use prod::{FsSegmentStore, InboxStats, ProdEnv, StreamInboxStats};
 /// The shared per-connection preamble-exchange primitives (ADR 0073 Phase 0,
 /// workstream D, layer 3): [`prod::exchange_preamble`] (the one
 /// implementation — write our own preamble, then read and check the
@@ -341,6 +341,126 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// stream for some other protocol instance.
 pub const PRIMARY_STREAM: u64 = 0;
 
+/// Default per-stream cap on payload bytes a [`Network`] implementation
+/// queues for one `(node, stream)` inbox before it starts dropping the
+/// **oldest** still-queued frame to make room for a newer one (ADR 0026,
+/// 2026-09-28 inbox-cap amendment). Sized from two things measured live on
+/// ADR 0026's stream-teardown investigation: a lagging-but-live consumer's
+/// ordinary backlog (peaked at ~0.6–1.9 MB, then drained) and a stream
+/// whose consumer never started polling at all — a leader replicating to a
+/// node before its own reconciler ever called `start_hosted`, then a
+/// rebalance moving the replica away again before it did — measured at
+/// 26 MB/590 frames and 12.9 MB/343 frames for two such streams, and still
+/// climbing at measurement time (`docs/lessons/code-patterns/2026-09-28-an-
+/// unbounded-per-stream-queue-is-invisible-until-it-has-its-own-
+/// observability.md`).
+///
+/// **The math**: `animus_control::raft::SNAPSHOT_CHUNK_BYTES` is 64 KiB per
+/// `InstallSnapshot` chunk (ADR 0009's 2026-09-27 amendment); the largest
+/// single `AppendEntries` batch this codebase ever sends is capped at
+/// `animus_control::raft::MAX_APPEND_ENTRIES_BATCH` = 512 entries, each
+/// ordinarily far under `animus_dynamo::limits::MAX_ITEM_SIZE_BYTES`
+/// (400 KB) — even a genuinely worst-case single entry (a `KindBatch` from
+/// a maxed-out 25-item `BatchWriteItem`, ~10 MB) sitting alone in an
+/// otherwise-idle stream stays under this cap. 8 MiB sits comfortably above
+/// the measured legitimate-lag peak (~4x its high end) while staying well
+/// below where the two leaked streams above were already caught still
+/// growing — an abandoned stream is now bounded to a small, fixed multiple
+/// of the worst realistic backlog instead of growing without limit for the
+/// life of the process. See `docs/adr/0026-multiplexed-node-stream-
+/// addressing.md`'s "Per-stream inbox cap" amendment for the full account,
+/// including why this is a **per-stream**, not a global, bound.
+pub const DEFAULT_INBOX_STREAM_BYTE_CAP: usize = 8 * 1024 * 1024;
+
+/// Default per-stream cap on **frame count**, alongside
+/// [`DEFAULT_INBOX_STREAM_BYTE_CAP`] — a `(node, stream)` inbox drops its
+/// oldest frame once either bound is exceeded. Exists because the byte cap
+/// alone does not bound a burst of many small frames (a flood of
+/// `AppendEntriesResp`/`RequestVote`/`ReadProbe`-shaped acks, each well
+/// under a kilobyte): a stream dominated by 64 KiB `InstallSnapshot` chunks
+/// already trips the byte cap first, at roughly 128 frames, so 4096 sits
+/// well above that ordinary case (never the first cap to fire for
+/// legitimate traffic) while still bounding a small-frame flood to a
+/// fixed, modest depth regardless of how little each frame weighs.
+pub const DEFAULT_INBOX_STREAM_FRAME_CAP: usize = 4096;
+
+/// A per-stream inbox backpressure cap (ADR 0026, 2026-09-28 amendment):
+/// once either bound is exceeded, the oldest still-queued frame for that
+/// stream is dropped to make room for the newest one, so one stream's
+/// queue can grow no larger than this — see
+/// [`DEFAULT_INBOX_STREAM_BYTE_CAP`]/[`DEFAULT_INBOX_STREAM_FRAME_CAP`]'s
+/// own docs for the derivation. Applies **per stream, independently** —
+/// not as a total across every stream a node hosts (see the ADR's "why no
+/// global cap" section). Both `ProdEnv` and `SimEnv` default to
+/// [`InboxCap::default`] and expose a setter (`ProdEnv::set_inbox_cap`,
+/// `animus_sim::Simulator::set_inbox_cap`) so a test can shrink it to
+/// provoke overflow deterministically at a small scale without needing to
+/// actually send megabytes of payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InboxCap {
+    /// Maximum payload bytes queued for one stream before the oldest
+    /// queued frame is dropped to make room for an arriving one.
+    pub max_bytes: usize,
+    /// Maximum frame count queued for one stream before the oldest queued
+    /// frame is dropped to make room for an arriving one.
+    pub max_frames: usize,
+}
+
+impl Default for InboxCap {
+    fn default() -> Self {
+        Self {
+            max_bytes: DEFAULT_INBOX_STREAM_BYTE_CAP,
+            max_frames: DEFAULT_INBOX_STREAM_FRAME_CAP,
+        }
+    }
+}
+
+/// The width of the reserved, cap-exempt stream-id block just below
+/// `u64::MAX` — see [`is_reserved_stream`]'s own doc.
+const RESERVED_STREAM_BLOCK: u64 = 16;
+
+/// Whether `stream` is one of this codebase's **reserved, per-node**
+/// stream ids — `PRIMARY_STREAM`, or one of the small, fixed block of ids
+/// just below `u64::MAX` every crate layered above this one mints its own
+/// request/response or coalesced-control channel from (today:
+/// `animus_cp_data::cluster_segment_store::SEGMENT_STREAM` (`u64::MAX`),
+/// `animus_cp_data::backup::BACKUP_SEGMENT_STREAM` (`u64::MAX - 1`), and
+/// `animus_cp_data::heartbeat_batch::HEARTBEAT_BATCH_STREAM`/
+/// `animus_node::sim_relay::RELAY_STREAM` (both `u64::MAX - 2`, by
+/// deliberate design — see those constants' own docs for why they never
+/// coexist on one env). This crate cannot name those constants directly
+/// (they live in crates layered above it), so it recognizes the
+/// *convention* they already all follow instead — "deliberately outside
+/// any `TabletId`'s realistic range" (a tablet id is minted from a small
+/// monotonic counter, never anywhere near `u64::MAX` in a real run, the
+/// same assumption ADR 0026 documents for `SEGMENT_STREAM` itself). A real
+/// tablet's own stream (`stream = tablet_id`, ADR 0040 Decision A) is
+/// therefore never mistaken for a reserved one.
+///
+/// **Used only to exempt a stream from [`InboxCap`] enforcement**
+/// (`ProdEnv`'s `enforce_inbox_cap`, `animus_sim`'s own
+/// `SimState::enforce_inbox_cap`) — see `docs/adr/0026-multiplexed-node-
+/// stream-addressing.md`'s "Per-stream inbox cap" amendment for why: every
+/// one of these streams' own consumer is bound to the *node's* lifetime
+/// (its serve loop starts at bind time, not conditionally on some tablet
+/// happening to be hosted), so none of them has the "consumer might never
+/// start" liveness gap the cap exists to bound in the first place — and
+/// several legitimately carry a single frame far larger than an ordinary
+/// tablet's own Raft entry (a whole forwarded client request, up to
+/// DynamoDB's own largest single-call payload size; a `SegmentStore`
+/// object). Capping them at the same modest default sized for ordinary
+/// tablet-replication backlog produced a real, reproducible regression —
+/// a multi-hop forward chase exhausting its own retry budget against
+/// spuriously-evicted relay replies — before this exemption existed.
+/// **An ordinary tablet's own stream (any id this function reports
+/// `false` for) is untouched by this exemption** — it stays fully subject
+/// to [`InboxCap`], which is the only class of stream this whole
+/// mechanism was ever built to bound.
+#[must_use]
+pub fn is_reserved_stream(stream: u64) -> bool {
+    stream == PRIMARY_STREAM || stream > u64::MAX - RESERVED_STREAM_BLOCK
+}
+
 /// A message delivered to a node over the [`Network`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Envelope {
@@ -488,7 +608,47 @@ pub trait Network: Send + Sync {
     /// Await the next message addressed to this node on `stream`. `(node,
     /// stream)` is single-consumer — never run two receive loops on the same
     /// node id and stream.
+    ///
+    /// **Reopens a closed stream** (ADR 0026, 2026-09-28 amendment): if
+    /// [`close_stream`](Network::close_stream) was called for `stream` and
+    /// no `recv_stream` has happened since, calling this clears the closed
+    /// mark before awaiting — a node re-added to the same tablet's replica
+    /// set after being dropped from it reuses the same stream id
+    /// (`tablet_id`) and must not stay permanently closed. A stream that has
+    /// **never** been closed is entirely unaffected by this — it keeps the
+    /// pre-existing buffer-before-first-`recv` behavior, which is
+    /// load-bearing (a split child's first `PreVote`/`AppendEntries` arrives
+    /// and queues before its own driver's first `recv_stream` call — see
+    /// `animus-cp-data`'s "Deterministic first leader" doc). Never conflate
+    /// "not yet opened" with "closed": only an explicit
+    /// [`close_stream`](Network::close_stream) call produces the latter.
     async fn recv_stream(&self, stream: u64) -> Envelope;
+
+    /// Retire `stream` on this node's inbox (ADR 0026, 2026-09-28
+    /// amendment): drops its queued frames, its parked receiver's waker (if
+    /// any), and its observability bookkeeping, and marks it **closed**. A
+    /// frame that arrives for a closed stream is discarded (and counted,
+    /// see `animus-env`'s `Metric::DemuxFramesDroppedClosed`) rather than
+    /// queued, until a later [`recv_stream`](Network::recv_stream) call for
+    /// the same stream **reopens** it (clears the closed mark and starts
+    /// fresh — see that method's own doc). This is the fix for an inbox
+    /// that would otherwise grow forever for a stream nobody will ever
+    /// `recv` from again — a tablet released from this node (a split
+    /// parent, or a replica dropped by reconfiguration) whose peers may
+    /// keep addressing it for a time during the teardown grace window.
+    ///
+    /// **Caller contract**: only call this once the stream's own consumer
+    /// is confirmed to have stopped polling — closing a stream a task is
+    /// still concurrently `recv_stream`-ing would have that same call
+    /// silently reopen it right back (`recv_stream` always clears the
+    /// closed mark before awaiting), racing this call's intent. This is
+    /// exactly why `animus-cp-data`'s `host::Reconciler::teardown` only
+    /// calls this after `RaftKvNode::is_stopped()` is confirmed true, never
+    /// eagerly at the start of teardown. Closing [`PRIMARY_STREAM`] is
+    /// almost certainly a bug — nothing should ever retire a node's own
+    /// primary stream — so implementations `debug_assert` against it rather
+    /// than silently accepting it.
+    fn close_stream(&self, stream: u64);
 
     /// Send on [`PRIMARY_STREAM`] — the whole pre-multiplexing API surface.
     async fn send(&self, to: NodeId, payload: Vec<u8>) {
@@ -746,6 +906,20 @@ pub trait Env: Clock + Rng + Network + Disk + Spawner + Clone + Send + Sync + 's
     /// `RaftNode<ProdEnv>` to a generic `RaftNode<E>` — still type-checks
     /// for any `E`, not just `ProdEnv`.
     fn merge_peer(&self, _id: NodeId, _addr: String) {}
+
+    /// Recompute this env's own demultiplexed-inbox observability gauges
+    /// (`Metric::DemuxQueuedFrames`/`Metric::DemuxQueuedBytes`, ADR 0026)
+    /// into its metrics sink — a **no-op default**, for the identical
+    /// additive reason [`metrics`](Self::metrics)/[`merge_peer`](Self::
+    /// merge_peer) are: `SimEnv` (and any other non-`ProdEnv` implementor)
+    /// keeps compiling and behaving identically without change, since it
+    /// has no multiplexed-`Demux` inbox of its own to summarize. `ProdEnv`
+    /// overrides this to read its own `Demux`'s current per-stream
+    /// bookkeeping and `set` the two gauges — a pure read-then-set, no
+    /// wall clock, no I/O, cheap enough to call on every metrics read
+    /// (`ClientCtx::metrics_text`/`metrics_json`, `animusd`) rather than
+    /// on the `Demux`'s own push/pop hot path.
+    fn refresh_inbox_metrics(&self) {}
 }
 
 /// Convenience extension for spawning an `async` block without writing

@@ -401,6 +401,90 @@ function of one seed. This is the substrate every distributed test runs on.
   streams to one node don't cross-talk, and the run — trace included —
   reproduces byte-for-byte from the seed).
 
+- **Stream teardown — `Network::close_stream` (ADR 0026, 2026-09-28
+  amendment).** `SimState` gained `closed_streams: BTreeSet<(NodeId, u64)>`
+  — the `SimEnv` twin of `ProdEnv`'s `Demux::closed`. `close_stream(stream)`
+  drops that `(node, stream)`'s inbox queue and any parked waker and
+  inserts the tombstone; `fire_event`'s `Deliver` arm drops a frame
+  addressed to a closed `(node, stream)` (traced `TraceEvent::Drop {
+  reason: "stream-closed", .. }`, the same shape a crashed-node or
+  partitioned-link drop already uses) instead of queuing it.
+  `recv_stream(stream)` unconditionally clears the tombstone before ever
+  awaiting — reopening it — so a node re-added to a tablet after being
+  dropped from it (same stream id, `= tablet_id`) is not permanently
+  poisoned. A stream that was **never** closed is untouched: it keeps the
+  pre-existing buffer-before-first-`recv` behavior (the split-fork
+  "Deterministic first leader" mechanism, `animus-cp-data/CLAUDE.md`,
+  depends on exactly this) — closed and never-opened are deliberately
+  distinct states, `closed_streams` recording only the former. `crash`/
+  `stop` clear a restarting node's own `closed_streams` entries alongside
+  its `inboxes`/`recv_wakers` (the identical `node_prefix_keys`-style
+  prefix scan below, generalized to a `BTreeSet` via the new
+  `node_prefix_set_keys`) — a restarted node starts with no tombstones,
+  exactly like a fresh `ProdEnv` process. No new RNG draw or timeline event
+  shape (closing/reopening/dropping-on-closed are all synchronous
+  deterministic map operations), so the determinism argument is unaffected.
+  `Simulator::inbox_len`/`Simulator::stream_is_closed` are test-only
+  observability accessors (mirroring `ProdEnv::inbox_stats`'s per-stream
+  `frames` field and closed-state respectively) — `tests/stream_close.rs`
+  is the dedicated regression, and `animus-cp-data`'s `tests/
+  demux_stream_teardown.rs` is the fault-injecting end-to-end sibling
+  (a live follower released from a tablet's replica set under message
+  loss/delay, through the real `host::Reconciler`).
+
+- **Per-stream inbox cap — `enforce_inbox_cap` (ADR 0026, 2026-09-28
+  amendment, second follow-up PR).** `close_stream` above cannot reach the
+  other half of the same live measurement: a stream whose consumer never
+  started polling at all, so nothing ever calls `close_stream` for it. This
+  is `animus_env::InboxCap`'s `SimEnv` side (see `crates/animus-env/
+  CLAUDE.md`'s own entry for the full derivation and the consumer-
+  classification argument for why drop-oldest is safe). `SimState` gained
+  `inbox_bytes: BTreeMap<(NodeId, u64), usize>` (the `ProdEnv::Demux::
+  stream_meta.bytes` twin — maintained incrementally on the same push
+  (`fire_event`'s `Deliver` arm) / pop (`Recv::poll`) sites, never a scan
+  of the `VecDeque` itself) and one global `inbox_cap: InboxCap` field
+  (mirrors `net`/`disk_cfg`'s own global-default shape — one value for the
+  whole simulated world, not a per-node override, since nothing here needs
+  a *different* cap per node). `SimState::enforce_inbox_cap(node, stream,
+  t)` runs right after every push: while the queue is over either bound,
+  it pops the stream's **oldest** frame (`VecDeque::pop_front`, never the
+  just-pushed newest one), decrements `inbox_bytes`, and traces
+  `TraceEvent::Drop { reason: "inbox-overflow", .. }` — the identical shape
+  a crashed-node/partitioned-link/closed-stream drop already uses.
+  `Simulator::set_inbox_cap`/`inbox_cap` are the setter/getter (mirrors
+  `set_net_config`/`set_disk_config`); `crash`/`stop` clear a restarting
+  node's `inbox_bytes` entries alongside `inboxes`/`recv_wakers` (the same
+  `node_prefix_keys` scan below). Draws no RNG and schedules no timeline
+  event — a synchronous, deterministic map operation, so the byte-
+  identical-trace guarantee (below) is unaffected; a default-cap run stays
+  byte-identical to before this PR landed, since neither default is ever
+  hit by any pre-existing corpus at ordinary scale. **Gotcha found writing
+  this PR's own tests**: `NetConfig::default()`'s 4ms `max_jitter` reorders
+  delivery relative to send order (each send draws its own independent
+  jitter), so a test asserting "drop-oldest retains the newest frames, in
+  send order" needs `max_jitter: Duration::ZERO` (`tests/inbox_cap.rs`'s
+  own `deterministic_order_net_config` helper) — otherwise the assertion is
+  flaky by construction, not a real bug in the cap itself; a test that only
+  cares about counts/totals (not which specific frames survive) doesn't
+  need this. **`enforce_inbox_cap` exempts `PRIMARY_STREAM` and the
+  reserved high-id block first** (`animus_env::is_reserved_stream`, a
+  no-op early return, checked before this method touches any state) — see
+  `crates/animus-env/CLAUDE.md`'s own entry for why: an earlier,
+  unconditional version of this cap regressed a real `animusd` test
+  (`sim_cluster_dynamo_page_size_cap`) by evicting a still-relevant
+  relay reply mid-chase, since that class carries payloads far larger
+  than an ordinary tablet entry and has no "never-hosted" gap to begin
+  with. Only ordinary per-tablet streams (`stream = tablet_id`) are
+  actually capped. Tests: `tests/inbox_cap.rs` (frame cap, byte cap,
+  composition with `close_stream`, and a default-cap no-regression check —
+  every scenario uses an ordinary, non-reserved stream id, since a
+  reserved one would never trip the cap at all now); `animus-cp-data`'s
+  `tests/inbox_overflow_tolerance.rs` is the fault-injecting end-to-end
+  sibling (a live 3-node Raft group tolerates the cap's own loss and still
+  converges and serves a linearizable read), deliberately hosted on an
+  explicit non-`PRIMARY_STREAM` id via `RaftKvNode::start_hosted` for the
+  same reason.
+
 - **`SimState::node_prefix_keys` (issue #841) is the one place the
   `disks`/`inboxes`/`recv_wakers` node-prefix scans live**, replacing seven
   call sites (`wipe_disk` ×1, `crash` ×3, `stop` ×3) that used to be a full

@@ -25,9 +25,16 @@
 //! - [`delta_ring`] — the apply task's bounded, per-node in-memory ring of
 //!   [`mirror::KeyWrite`] deltas (ADR 0038 PR5), the incremental half of
 //!   `WatchMetadata`'s reply (`RaftNode::watch_delta_since`).
+//! - [`format`] — the shared tagged-envelope convention (ADR 0073 Phase 0
+//!   workstream B): [`format::FormatTag`]/[`format::FormatError`], the
+//!   binary [`format::wrap`]/[`format::unwrap`] envelope, and the
+//!   newline-delimited, checksummed [`format::encode_line`]/
+//!   [`format::decode_lines`] used by [`persist::CONTROL_WAL`]. Pure, no
+//!   `Env`/I/O — reused as-is by `animus-cp-data`'s own `SWL1` envelope.
 
 pub mod delta_ring;
 pub mod detector;
+pub mod format;
 pub mod meta;
 pub mod mirror;
 pub mod node;

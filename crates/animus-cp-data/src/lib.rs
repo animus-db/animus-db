@@ -1524,7 +1524,62 @@ const COMPACT_THRESHOLD: u64 = 64;
 /// of `COMPACT_THRESHOLD`, so worst-case WAL retention stays bounded even
 /// if a peer's transfer never completes at all (dead, partitioned, or
 /// hopelessly outpaced).
+///
+/// **Issue #1064 amendment: this ceiling no longer overrides a transfer in
+/// flight to a LEARNER.** Sized in log entries, it bounds worst-case WAL
+/// retention, but it is not itself a bound on — or even correlated with —
+/// how close a given transfer is to actually landing: under a continuous
+/// writer, `behind` grows at the write rate regardless of transfer progress,
+/// so a joining learner's genuinely advancing (never-idle) transfer can be
+/// forced out and restarted from chunk 0 against a still-larger image,
+/// forever, even at a write rate the learner's own disk can sustain in
+/// steady state. A learner's catch-up contract (ADR 0058 Train 1) is already
+/// "one `InstallSnapshot`, then promote" — `idle_ceiling_hit` (whether the
+/// transfer has made zero progress for `COMPACT_DEFER_IDLE_CEILING`) is the
+/// only question worth asking about it, and this constant adds nothing but
+/// a false deadline for that case. A VOTER's in-flight transfer is
+/// unaffected: this ceiling still applies to it exactly as tuned for PR
+/// #1047's flood. See `apply_and_compact`'s own `emergency_ceiling_hit`
+/// computation and `docs/lessons/testing/`'s matching entry for the full
+/// account.
 const COMPACT_DEFER_EMERGENCY_CEILING: u64 = COMPACT_THRESHOLD * 64;
+
+/// Issue #1064 part-2 regression-test seam: a test-only override of
+/// [`COMPACT_THRESHOLD`]/[`COMPACT_DEFER_EMERGENCY_CEILING`], mirroring
+/// [`RaftCore::enable_quiescence`]'s own "`Option`-shaped field, `None`
+/// default, plain public setter" shape (`animus-control::raft`) rather than
+/// inventing a new pattern. Both compaction constants are sized for
+/// production log volumes (64 / 4096 entries) — reaching either one under a
+/// `SimEnv` test's own write rate within a real-time-affordable step budget
+/// needs tens of thousands of proposes, which is why the pre-existing
+/// `tests/learner_snapshot_livelock_under_continuous_writer.rs` could only
+/// ever "brush" the emergency ceiling, never cross it by an unambiguous
+/// margin. `0` (the sentinel both `AtomicU64` fields default to) means
+/// "use the compiled-in constant" — every existing production caller
+/// (nothing sets this) is byte-for-byte unaffected.
+#[derive(Debug, Default)]
+struct CompactTuning {
+    /// `0` = use [`COMPACT_THRESHOLD`].
+    threshold: AtomicU64,
+    /// `0` = use [`COMPACT_DEFER_EMERGENCY_CEILING`].
+    emergency_ceiling: AtomicU64,
+}
+
+impl CompactTuning {
+    fn threshold(&self) -> u64 {
+        match self.threshold.load(Ordering::Relaxed) {
+            0 => COMPACT_THRESHOLD,
+            v => v,
+        }
+    }
+
+    fn emergency_ceiling(&self) -> u64 {
+        match self.emergency_ceiling.load(Ordering::Relaxed) {
+            0 => COMPACT_DEFER_EMERGENCY_CEILING,
+            v => v,
+        }
+    }
+}
 
 /// Follower-aware compaction retention (etcd-style log retention, found live
 /// alongside the flood PR #1047 fixed): the hard cap, in log entries, a
@@ -2526,6 +2581,11 @@ pub struct RaftKvNode<E: Env, S: StorageEngine> {
     /// field's normal boot-time seed like any other fresh group — there is
     /// no already-running node whose cache needs folding in.
     hot_change_max: Arc<Mutex<Option<(HlcTimestamp, u32)>>>,
+    /// Issue #1064 part-2 test seam — see [`CompactTuning`]'s own doc.
+    /// `Arc` (not owned inline) because both the consensus-loop-adjacent
+    /// public setter below and the apply task (which reads it every pass)
+    /// need their own handle, mirroring every other cross-task field here.
+    compact_tuning: Arc<CompactTuning>,
 }
 
 /// A bounded, in-process ring of every distinct value of `T` a
@@ -2987,6 +3047,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         // above — starts empty and is populated before the apply task's
         // first pass.
         let hot_change_max = Arc::new(Mutex::new(None));
+        let compact_tuning = Arc::new(CompactTuning::default());
         let node = Self {
             env: env.clone(),
             core: Arc::clone(&core),
@@ -3023,6 +3084,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             external_quiesce_veto_fresh_through: Arc::clone(&external_quiesce_veto_fresh_through),
             voter_history: Arc::clone(&voter_history),
             hot_change_max: Arc::clone(&hot_change_max),
+            compact_tuning: Arc::clone(&compact_tuning),
         };
         // The consensus loop recovers from the WAL, then spawns the apply task
         // (so the apply task sees the recovered core + the correct
@@ -3066,6 +3128,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             heartbeat_batcher,
             shared_wal,
             hot_change_max,
+            compact_tuning,
         }));
         node
     }
@@ -3134,6 +3197,30 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// control plane's `next_deadline` never returns `None`.
     pub fn enable_quiescence(&self, after: Duration) {
         self.lock().enable_quiescence(after);
+    }
+
+    /// Issue #1064 part-2 regression-test seam: override this group's own
+    /// [`COMPACT_THRESHOLD`]/[`COMPACT_DEFER_EMERGENCY_CEILING`] — see
+    /// [`CompactTuning`]'s own doc for why this exists and why it mirrors
+    /// [`enable_quiescence`](Self::enable_quiescence)'s shape rather than a
+    /// new one. `None` for either argument leaves that constant at its
+    /// compiled-in production value; calling this at all has **no**
+    /// production caller — every existing group's compaction behavior is
+    /// unaffected unless a test calls this explicitly, exactly like
+    /// `enable_quiescence`'s own additive-default contract. Safe to call at
+    /// any point in this group's lifetime (a plain relaxed store the apply
+    /// task's next pass picks up — no lock, no propose, no wake needed).
+    pub fn set_compact_tuning_for_test(
+        &self,
+        threshold: Option<u64>,
+        emergency_ceiling: Option<u64>,
+    ) {
+        self.compact_tuning
+            .threshold
+            .store(threshold.unwrap_or(0), Ordering::Relaxed);
+        self.compact_tuning
+            .emergency_ceiling
+            .store(emergency_ceiling.unwrap_or(0), Ordering::Relaxed);
     }
 
     /// Whether this group's local replica currently considers itself
@@ -7928,6 +8015,8 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     // `materialize_derived` call site below whose `change_log` was
     // non-empty (`note_hot_change_write`); never written durably.
     hot_change_max: &Arc<Mutex<Option<(HlcTimestamp, u32)>>>,
+    // Issue #1064 part-2 test seam — see [`CompactTuning`]'s own doc.
+    compact_tuning: &CompactTuning,
 ) -> bool {
     let mut did_work = false;
 
@@ -10145,19 +10234,55 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     // placeholder, so the threshold rewrite never needed the image bytes.
     let ea = engine_applied.load(Ordering::SeqCst);
     let now = env.now();
-    let (behind, image_needed, transfer_in_flight, transfer_progress, compaction_floor) = {
+    let (
+        behind,
+        image_needed,
+        transfer_in_flight,
+        transfer_progress,
+        compaction_floor,
+        learner_transfer_in_flight,
+    ) = {
         let mut c = core.lock().expect("raftkv core poisoned");
-        let transfer_progress: u64 = c
-            .snapshot_transfer_peers()
+        let transfer_peers = c.snapshot_transfer_peers();
+        let transfer_progress: u64 = transfer_peers
             .iter()
             .map(|p| c.snapshot_chunk_advances(p))
             .sum();
+        // Issue #1064: whether the (or a) transfer currently in flight is to
+        // a LEARNER specifically — see `emergency_ceiling_hit`'s own doc a
+        // few lines down for why this, not `compaction_floor`, is where a
+        // joining learner's in-flight transfer gets protected. Deliberately
+        // NOT a standing, entry-count-capped retention floor for a learner's
+        // ordinary (no transfer in flight) position — an earlier draft of
+        // this fix tried exactly that (mirroring `compaction_floor`'s own
+        // voters-only shape) and it silently reintroduced the pre-#1047
+        // wedge for a fully PARTITIONED learner: with no transfer ever in
+        // flight (nothing to send to a peer nothing can reach), a bare
+        // `match_index`-based floor pins compaction at the learner's own
+        // (permanently `0`) position for as long as `last_log_index` stays
+        // under `COMPACT_RETENTION_CAP_ENTRIES` (4096) — confirmed live
+        // against `tests/snapshot_transfer_survives_compaction.rs`'s own
+        // `a_stalled_partitioned_peer_does_not_block_compaction_forever`,
+        // whose own 4000-round budget never reaches that cap. A floor with
+        // no idle-time escape hatch is exactly the class of "bound only in
+        // entries, not in whether anything is actually stalled" mistake
+        // this issue's own `COMPACT_DEFER_EMERGENCY_CEILING` fix (below)
+        // exists to move away from — see `docs/lessons/testing/2026-09-28-
+        // a-wal-bound-safety-valve-sized-in-entries-is-not-a-progress-
+        // guarantee.md`. The repeated-small-reinstall cost for a learner
+        // that has already caught up once and is merely waiting on its next
+        // ack (this constant's own follow-on finding) is accepted as-is:
+        // bounded by `idle_ceiling_hit`/`emergency_ceiling_hit` exactly like
+        // any other in-flight transfer once it recurs, never by pre-empting
+        // ordinary threshold compaction ahead of time.
+        let learner_transfer_in_flight = c.learners().iter().any(|l| transfer_peers.contains(l));
         (
             ea.saturating_sub(c.snapshot_index()),
             c.take_snapshot_needed(),
             c.snapshot_transfer_in_flight(),
             transfer_progress,
             c.compaction_floor(COMPACT_RETENTION_CAP_ENTRIES),
+            learner_transfer_in_flight,
         )
     };
     // Follower-aware retention (etcd-style, issue found live alongside PR
@@ -10193,7 +10318,13 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     // from chunk 0 over and over). Below both ceilings this gives a real
     // in-flight transfer a genuine window to land before the next
     // threshold crossing would otherwise yank it back to chunk 0 forever.
-    let would_defer = behind >= COMPACT_THRESHOLD && transfer_in_flight;
+    //
+    // `compact_threshold`/`compact_emergency_ceiling` below read
+    // `compact_tuning`'s own possibly-test-overridden value (production:
+    // always the compiled-in constant — see `CompactTuning`'s own doc).
+    let compact_threshold = compact_tuning.threshold();
+    let compact_emergency_ceiling = compact_tuning.emergency_ceiling();
+    let would_defer = behind >= compact_threshold && transfer_in_flight;
     // Real forward progress (the tracked sum changed since the last pass)
     // restarts the idle clock — this bounds idle time since the LAST
     // advance, never total transfer duration. `None` (first observation of
@@ -10208,8 +10339,37 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
         && idle_since.is_some_and(|since| {
             now.0.saturating_sub(since.0) >= COMPACT_DEFER_IDLE_CEILING.as_nanos() as u64
         });
-    let emergency_ceiling_hit = behind >= COMPACT_DEFER_EMERGENCY_CEILING;
-    let threshold_hit = behind >= COMPACT_THRESHOLD
+    // Issue #1064's own field-scale finding: `COMPACT_DEFER_EMERGENCY_
+    // CEILING` is a WAL-retention safety valve sized in LOG ENTRIES, which is
+    // not a bound on real progress at all under a continuous writer — a
+    // joining learner's transfer is fully in-flight and genuinely advancing
+    // (never idle long enough to trip `idle_ceiling_hit`), but `behind`
+    // itself climbs at the WRITE rate, wholly independent of how close the
+    // transfer is to landing; a write rate the learner's own disk can
+    // otherwise sustain in steady state can still cross this ceiling before
+    // one (increasingly large) image ever completes, forcing
+    // `snapshot_upto` to invalidate it and restart from chunk 0 against a
+    // still-larger image — forever, without the emergency ceiling itself
+    // ever being what's actually stalled. See `docs/lessons/testing/`'s
+    // matching entry and this ADR's own amendment for the full account.
+    //
+    // Fixed by never letting the emergency ceiling override a transfer that
+    // is in flight to a LEARNER: a learner's own bounded catch-up contract
+    // (ADR 0058 Train 1 — it is expected to need exactly one `InstallSnapshot`
+    // before promotion, not a running total of entries applied elsewhere)
+    // means the only question worth asking about ITS transfer is "is it
+    // actually progressing," which `idle_ceiling_hit` already answers
+    // correctly — the entries-sized ceiling adds nothing but a false
+    // deadline keyed to a quantity (`behind`) the learner's own transfer has
+    // no way to influence. A VOTER's in-flight transfer keeps the original,
+    // unmodified behavior (both ceilings, exactly as PR #1047 tuned them) —
+    // voters are the flood scenario this mechanism was built for, and their
+    // own catch-up is meant to stay on ordinary `AppendEntries`
+    // (`compaction_floor`'s own voters-only retention already tries to keep
+    // them there in the first place), so an ordinary voter that DOES fall
+    // into the snapshot path is still bounded exactly as before.
+    let emergency_ceiling_hit = behind >= compact_emergency_ceiling && !learner_transfer_in_flight;
+    let threshold_hit = behind >= compact_threshold
         && (!transfer_in_flight || idle_ceiling_hit || emergency_ceiling_hit);
     // PR #1047: a transfer forced out while it was still genuinely in
     // flight is a real restart-from-chunk-0 event, not routine compaction —
@@ -10879,6 +11039,9 @@ struct DriveState<E: Env, S: StorageEngine> {
     /// `drive` can seed it from one bounded boot scan and the apply task
     /// can keep it current as new `KIND_CHANGE` records materialize.
     hot_change_max: Arc<Mutex<Option<(HlcTimestamp, u32)>>>,
+    /// See [`RaftKvNode::compact_tuning`]'s doc — threaded through so the
+    /// apply task can read the same override the public setter writes.
+    compact_tuning: Arc<CompactTuning>,
 }
 
 /// One split-build seed row (ADR 0050 Train B rung 4): `(kind index into
@@ -11015,6 +11178,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         heartbeat_batcher,
         shared_wal,
         hot_change_max,
+        compact_tuning,
     } = st;
 
     // ADR 0044 phase 2 (C-02 PR 2): register this group's own stream with
@@ -11042,7 +11206,25 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         shared.recovered_state(tablet).await
     } else {
         let bytes = env.read(&wal).await.unwrap_or_default();
-        PersistedState::replay(PersistedState::decode(&bytes))
+        // ADR 0073 Phase 0 workstream B: `PersistedState::decode` is now
+        // fallible (pre-baseline / unknown-version / malformed WAL). `drive`
+        // is spawned fire-and-forget with no `Result` to propagate into, so
+        // mirror `animus_control::node::drive`: log the named error loudly
+        // and halt this group before recovery — never panic, never recover
+        // as an empty log.
+        match PersistedState::decode(&bytes) {
+            Ok(records) => PersistedState::replay(records),
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    stream,
+                    "raftkv WAL failed to decode; refusing to recover as an \
+                     empty log - halting this tablet group"
+                );
+                halted.store(true, Ordering::SeqCst);
+                return;
+            }
+        }
     };
     // Witnessing point (ADR 0018 §2 amendment): "WAL recovery, each recovered
     // entry." Every command this node ever durably logged for this group —
@@ -11279,6 +11461,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         Arc::clone(&persist),
         shared_wal.clone(),
         Arc::clone(&hot_change_max),
+        Arc::clone(&compact_tuning),
     ));
 
     // Issue #279: the loop's own in-flight persist round, and the outbound
@@ -11869,6 +12052,8 @@ async fn apply_loop<E: Env, S: StorageEngine>(
     // spawns, then kept current in-memory as this task materializes new
     // `KIND_CHANGE` records — see `RaftKvNode::hot_change_max`'s doc.
     hot_change_max: Arc<Mutex<Option<(HlcTimestamp, u32)>>>,
+    // Issue #1064 part-2 test seam — see [`CompactTuning`]'s own doc.
+    compact_tuning: Arc<CompactTuning>,
 ) {
     // This apply task's own sequential, single-writer bookkeeping (see
     // `apply_and_compact`'s doc): `sealed` is seeded from the engine-durable
@@ -11940,6 +12125,7 @@ async fn apply_loop<E: Env, S: StorageEngine>(
             &mut compact_defer_since,
             &mut compact_defer_progress,
             &hot_change_max,
+            &compact_tuning,
         )
         .await;
         if !did_work {

@@ -458,6 +458,98 @@ reconfigure_multi_replica_diff.rs` is the dedicated regression (60 seeds,
 several harness shapes) and `animusd/tests/
 split_placing_two_replica_diff_e2e.rs` its real `ProdEnv` sibling. See
 `docs/engineering-lessons.md` for the investigation writeup.
+
+**Issue #1064 (2026-09-28): `RaftCore::learner_caught_up`'s promotion
+predicate was baselined against the wrong metric.** It compared a learner's
+tracked `match_index` to the LEADER'S OWN `last_log_index()` — under a
+CONTINUOUS writer (a directed-Placing 2-of-3 diff driven every tick
+alongside a never-stopping client, the exact production shape:
+`animusd --cluster-control 3 --cluster-data 5 --auto-split-bytes 1000000`
+under sustained load), `last_log_index()` always includes whatever the
+leader just appended for ITSELF in the current tick, before it has been
+sent to (let alone acked by) anyone — voter or learner alike. Once a single
+write burst between reconciler ticks exceeds
+`RECONFIGURE_LEARNER_CATCH_UP_THRESHOLD` (4), every sample lands mid-burst
+and the learner can never be seen as caught up, no matter how genuinely
+caught up it is with everything the group has actually committed —
+`reconfigure_step` then never adds the second desired replica or drops
+either stale voter, wedging the group at its old voter set forever. Fixed
+by baselining against `commit_index()` instead: it only advances once a
+majority of CURRENT VOTERS (never the learner itself) have themselves
+acked, so it can never be further ahead of what the established quorum has
+actually achieved than one ordinary replication round costs, and it keeps
+the ADR 0058 Train 1 safety intent intact (a peer promoted at `match_index
+>= commit_index - threshold` can immediately help commit anything the group
+has already committed). See `RaftCore::learner_caught_up`'s own doc
+(`animus-control/src/raft.rs`) for the full before/after account. Every
+existing caller/test of `learner_caught_up` (`animus-control`'s
+`learner_corpus.rs`/`learner_promotion_leader_crash.rs`, this crate's
+`learner_membership.rs`/`learner_catchup_under_load.rs`/
+`snapshot_transfer_survives_compaction.rs`) was audited and is unaffected —
+each already polls to convergence with the writer stopped (or genuinely
+idle), where `commit_index()` and `last_log_index()` coincide. Regression:
+`tests/directed_placing_under_sustained_load.rs`
+(`ANIMUS_DIRECTED_PLACING_LOAD_SEEDS`, root `CLAUDE.md`'s knob table) —
+deliberately built with a generous `BURST_GAP` (300ms against a 10ms
+learner disk delay) so it isolates this exact baseline-metric defect from
+the separate, already-understood write-rate/capacity and
+compaction/snapshot-transfer-restart concerns `learner_catchup_under_load.rs`
+covers (see this file's own module doc for why conflating the two produces
+a much harder-to-diagnose, sawtooth-shaped false negative — a genuinely
+sustained-load run at the field report's own write rate DOES still hit
+repeated `InstallSnapshot` transfer restarts under heavy compaction churn,
+a real, separate, PRE-EXISTING defect suspected to be issue #1061's own
+mechanism; not fixed here — see `docs/lessons/testing/` for the
+investigation notes and the compaction-floor/`COMPACT_DEFER_*` invariants
+this fix deliberately left untouched).
+
+**Part 2 (2026-09-28, closes issue #1061): the heavier-load defect above was
+confirmed and fixed.** `apply_and_compact`'s `COMPACT_DEFER_EMERGENCY_
+CEILING` — a last-resort WAL-retention safety valve sized in raw log-entry
+count (`behind`) — used to override the idle-progress defer
+(`COMPACT_DEFER_IDLE_CEILING`) and force a still-genuinely-progressing
+transfer out **regardless of whether it was actually stalled**, the instant
+`behind` crossed a fixed threshold. Under a continuous writer `behind` grows
+at the WRITE rate, which has no relationship to how close a transfer is to
+landing — sized in entries, this "safety valve" is not a progress
+guarantee at all (see `docs/lessons/testing/`'s matching 2026-09-28 entry).
+Fixed narrowly: `emergency_ceiling_hit` (`apply_and_compact`'s own local)
+no longer forces a restart of a transfer in flight to a **learner**
+specifically — a learner's own catch-up contract is already "one
+`InstallSnapshot`, then promote" (this file's own entries above), so the
+only question worth asking about its transfer is whether it's genuinely
+stalled, which `idle_ceiling_hit` already answers correctly with no change.
+A **voter's** in-flight transfer is completely unaffected — both ceilings
+still apply to it exactly as PR #1047 tuned them, since a voter needing a
+snapshot at all is still the flood scenario this whole mechanism exists to
+bound. See `emergency_ceiling_hit`'s own computation and
+`COMPACT_DEFER_EMERGENCY_CEILING`'s doc comment (`lib.rs`) for the full
+before/after account. `RaftKvNode::set_compact_tuning_for_test` (a
+test-only, additive-default seam mirroring `RaftCore::enable_quiescence`'s
+own `Option`-field shape) lets a test override `COMPACT_THRESHOLD`/
+`COMPACT_DEFER_EMERGENCY_CEILING` down from their production sizes, since
+reaching the real 4096-entry ceiling by an unambiguous margin needs a
+real-time-unaffordable step count otherwise. Regression: `tests/
+learner_snapshot_livelock_under_continuous_writer.rs` — an
+AppendEntries-only control (a learner joining before any compaction, at the
+same sustained write rate, proving that rate is not itself a capacity
+mismatch) paired with a late-joining learner needing a real, multi-chunk
+`InstallSnapshot` under the SAME continuous writer, asserting — all while
+the writer keeps running — that at least one transfer actually completes
+(`Metric::CpSnapshotInstalls`), that `Metric::CpSnapshotTransferRestarts`
+stays bounded, and that the learner's own applied index makes substantial,
+ongoing progress against the leader's commit index. Confirmed live: the
+pre-fix code never completes a single install (restarts=75, applied index
+stuck at 0 for the whole run) against the fix's restarts=6, two completed
+installs, and the learner reaching 68% of the leader's commit index — a
+livelock, not a mere slowdown. See `docs/lessons/testing/2026-09-28-reach-
+the-real-trigger-dont-shrink-the-test-around-a-fixed-constant.md` for the
+tuning history (a write-rate-vs-peer-throughput lesson this test's own
+control caught) and this file's own investigation notes on a further,
+separate, not-fixed-here defect the same investigation surfaced
+(`handle_append_resp`'s non-monotonic `next_index` update on an ordinary
+AppendEntries ack, tracked as issue #1070).
+
 **`RaftKvNode::voter_history()` (issue #596)** records every distinct voter
 configuration a group has adopted, in adoption order, in a small bounded
 in-process ring (`VoterHistory`, capacity 64, oldest dropped; never rebuilt
@@ -1952,6 +2044,38 @@ disambiguation is needed.
   absorbed data was about to be served elsewhere — was removed along with
   `TeardownKind::Absorb`; see the Key invariants entry above for what
   remains of that mechanism's lesson.)
+- **`Reconciler` teardown closes the tablet's stream (ADR 0026, 2026-09-28
+  amendment).** `teardown` calls `self.env.close_stream(tablet.0)` in all
+  three of its exit paths, each **only once the driver is confirmed
+  stopped** (never eagerly — see `Network::close_stream`'s own caller
+  contract, ADR 0026): the immediate-stop path (right after the `while
+  !node.is_stopped()` loop above exits without parking), `sweep_stopping`'s
+  own finishing branch (right after it observes `is_stopped()` true for a
+  previously-parked teardown), and the zombie-claim backstop (immediately,
+  since there is no driver there at all to still be polling). This is the
+  actual fix for a real, live-measured leak: a tablet released from this
+  node (a split parent, or a replica dropped by reconfiguration) whose
+  peers keep addressing it during the teardown grace window used to have
+  its frames queue in this node's `Demux`/`SimEnv` inbox forever — closing
+  the stream here means such a frame is now discarded-and-counted at
+  arrival instead. The stream reopens automatically the moment this node
+  re-hosts the same tablet again (`RaftKvNode::start_hosted*`'s own driver
+  calling `recv_stream(stream)` for the first time since the close), so a
+  node dropped from a tablet's replica set and later re-added is not
+  permanently locked out. **Investigated and confirmed NOT to need the
+  same fix**: `HeartbeatBatcher`'s own per-group `HeartbeatInbox`
+  (`heartbeat_batch.rs`) already deregisters correctly — `unregister_hosted`
+  runs from the consensus loop's own `halted` branch, before `stopped` is
+  set, so by the time `Reconciler::teardown`'s `is_stopped()` check can
+  ever see `true`, the heartbeat demux registration is already gone. See
+  ADR 0026's 2026-09-28 amendment for the full design record (the
+  close/reopen/tombstone semantics, and why an explicit close was chosen
+  over inferring "abandoned" from a liveness heuristic) and `tests/
+  demux_stream_teardown.rs` for the fault-injecting end-to-end regression
+  (a live follower released under message loss/delay, mirroring the
+  `ANIMUS_RECONFIGURE_DROP_SEEDS` corpus's own shape, issue #781 — proving
+  the released node's stream ends empty and tombstoned, convergence still
+  holds, and a later re-add reopens it).
 
 ## What's non-obvious
 
@@ -2532,7 +2656,7 @@ disambiguation is needed.
 
 ## Tests
 
-`cargo test -p animus-cp-data`. All but two of the 28 test binaries drive
+`cargo test -p animus-cp-data`. All but two of the 29 test binaries drive
 `SimEnv` — use `run_for`/`run_until`, never `run()` (the driver has perpetual
 heartbeat/election timers). Linearizable reads are async (a read-barrier probe
 round), so drive them as spawned tasks + `run_for`, and never `block_on` a
@@ -2559,7 +2683,18 @@ is its "drop a healthy voter" sibling, issue #781 — a direct
 `CasTabletReplicas` drop of a live follower, and separately the leader
 itself, through the real `spawn_reconfigure_loop`/`reconfigure_step`,
 asserting the removed replica does not go on to disrupt the converged group;
-depth knob `ANIMUS_RECONFIGURE_DROP_SEEDS`), the ADR 0026/0041/0042/0043
+depth knob `ANIMUS_RECONFIGURE_DROP_SEEDS`; `tests/demux_stream_teardown.rs`
+is the ADR 0026 2026-09-28 stream-teardown sibling — the same "drop a live
+follower" shape, but through the real `host::Reconciler` under injected
+message loss/delay, asserting the released node's own stream ends empty and
+tombstoned, convergence holds, and a later re-add reopens it; `tests/
+inbox_overflow_tolerance.rs` is the ADR 0026 2026-09-28 inbox-cap sibling —
+a live 3-node group with a tiny configured `InboxCap` where a leader
+replicates to a node before that node's own `RaftKvNode` has even started
+(the real "never-hosted" leak shape, `crates/animus-env/CLAUDE.md`'s own
+entry), proving the resulting overflow-evicted frames are tolerated: the
+group still converges once the late node starts and serves a linearizable
+read afterward), the ADR 0026/0041/0042/0043
 stream-addressing/`KindBatch`/`KIND_CURSOR`/`ClusterSegmentStore` suites,
 the ADR 0018 HLC/MVCC/range-seal/transaction suites, the `host.rs`
 reconciler end to end, the ADR 0044 phase-2 heartbeat-batcher baseline

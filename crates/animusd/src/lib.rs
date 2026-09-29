@@ -11178,6 +11178,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// snapshots are read **at call time**, so the export reflects current
     /// activity rather than a cached value.
     pub(crate) fn metrics_text(&self) -> String {
+        self.env.refresh_inbox_metrics();
         let mut snaps = vec![self.control.metrics().snapshot()];
         if let Some(data) = &self.data
             && !data.raftkv_metrics.is_same_sink(self.control.metrics())
@@ -11212,6 +11213,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// (ADR 0020). Read live at call time and summed across the node's role
     /// sink(s), exactly as the text export.
     pub(crate) fn metrics_json(&self) -> (BTreeMap<String, u64>, i64) {
+        self.env.refresh_inbox_metrics();
         let mut snaps = vec![self.control.metrics().snapshot()];
         if let Some(data) = &self.data
             && !data.raftkv_metrics.is_same_sink(self.control.metrics())
@@ -16982,19 +16984,53 @@ pub async fn run_node_join_with_settings(
     let (original_control_ids, peers, client_route, intra_route, admin_addrs) =
         discover_join_info(&seeds).await?;
 
-    let mine = NodeAddrs {
-        internal: advertised_addr(addrs.advertise_host.as_deref(), addrs.internal),
-        client: advertised_addr(addrs.advertise_host.as_deref(), addrs.client),
-        admin: advertised_addr(addrs.advertise_host.as_deref(), addrs.admin),
-        intra: advertised_addr(addrs.advertise_host.as_deref(), addrs.intra),
-        role: "combined".to_string(),
+    // Bind-and-hold BEFORE claim for an explicit `--id` (issue #1042,
+    // mirroring issue #627's bind-and-hold fix for fresh-cluster bring-up).
+    // The old order — claim (durably register `--id`'s `NodeAddrs` via
+    // `MetaCommand::RegisterNode`), THEN `Node::bind` — meant a bind
+    // failure (the ordinary port-TOCTOU this retry loop exists to survive)
+    // left a durable claim on file for addresses this process never
+    // actually bound; a caller's retry then picked FRESH ports for the
+    // SAME `--id` (an explicit id doesn't change across retries, unlike a
+    // self-minted one), and re-registering proposed a different `NodeAddrs`
+    // for an id that had already durably claimed a different one moments
+    // earlier — a genuine CAS collision against itself
+    // (`RegisterOutcome::Collision`, surfacing as "node id already claimed
+    // by a different registration"), wedging the whole retry loop for its
+    // full deadline. Binding first means a bind failure can never have
+    // registered anything — nothing to collide with — so a retry (even
+    // with a fresh `:0` port) is always safe.
+    //
+    // A **self-minted** id (`id: None`) can't take this path — `NodeId::
+    // mint` is a genuinely pre-bind operation (ADR 0040 Decision B, no
+    // `Env`/listener needed) — but doesn't need to: a fresh id is minted on
+    // every attempt, so the same-id-different-addrs collision this
+    // reordering exists to prevent can never arise for it (a collision
+    // there is against a DIFFERENT node's earlier claim, never against this
+    // attempt's own). It keeps the original claim-then-bind order.
+    let (bound, my_id) = match id {
+        Some(explicit_id) => {
+            let bound = Node::bind(explicit_id.clone(), addrs, dir).await?;
+            let mine = bound_node_addrs(&bound, "combined");
+            let my_id = claim_join_identity(&seeds, Some(explicit_id), &mine, &labels).await?;
+            (bound, my_id)
+        }
+        None => {
+            let mine = NodeAddrs {
+                internal: advertised_addr(addrs.advertise_host.as_deref(), addrs.internal),
+                client: advertised_addr(addrs.advertise_host.as_deref(), addrs.client),
+                admin: advertised_addr(addrs.advertise_host.as_deref(), addrs.admin),
+                intra: advertised_addr(addrs.advertise_host.as_deref(), addrs.intra),
+                role: "combined".to_string(),
+            };
+            let my_id = claim_join_identity(&seeds, None, &mine, &labels).await?;
+            let bound = Node::bind(my_id.clone(), addrs, dir).await?;
+            (bound, my_id)
+        }
     };
-    let my_id = claim_join_identity(&seeds, id, &mine, &labels).await?;
-    let my_client_addr = addrs.client;
-    let my_admin_addr = addrs.admin;
-    let my_intra_addr = addrs.intra;
-
-    let bound = Node::bind(my_id.clone(), addrs, dir).await?;
+    let my_client_addr = bound.client_addr();
+    let my_admin_addr = bound.admin_addr();
+    let my_intra_addr = bound.intra_addr();
 
     finish_combined_join(
         bound,
@@ -17189,6 +17225,36 @@ async fn register_node_over_wire(
     }
 }
 
+/// The [`NodeAddrs`] a join should register for an already-[`Node::bind`]
+/// -bound `bound` — its own actually-resolved addresses (never the pre-bind
+/// request, which may have asked for `:0`), advertised through `bound`'s
+/// own `advertise_host` exactly like every other post-bind `NodeAddrs`
+/// construction in this file (`finish_combined_join`'s own merge,
+/// `BoundNode::start_with_growth`'s `mine`). Used only by
+/// [`run_node_join_with_settings`]'s explicit-`--id` bind-then-claim path
+/// (issue #1042) — see that call site's own doc.
+fn bound_node_addrs(bound: &BoundNode, role: &str) -> NodeAddrs {
+    NodeAddrs {
+        internal: advertised_addr(bound.advertise_host.as_deref(), bound.internal_addr()),
+        client: advertised_addr(bound.advertise_host.as_deref(), bound.client_addr()),
+        admin: advertised_addr(bound.advertise_host.as_deref(), bound.admin_addr()),
+        intra: advertised_addr(bound.advertise_host.as_deref(), bound.intra_addr()),
+        role: role.to_string(),
+    }
+}
+
+/// [`bound_node_addrs`]'s data-only dual, for [`run_node_data_join_with_settings`]'s
+/// identical bind-then-claim path.
+fn bound_data_node_addrs(bound: &BoundDataNode, role: &str) -> NodeAddrs {
+    NodeAddrs {
+        internal: advertised_addr(bound.advertise_host.as_deref(), bound.internal_addr),
+        client: advertised_addr(bound.advertise_host.as_deref(), bound.client_addr()),
+        admin: advertised_addr(bound.advertise_host.as_deref(), bound.admin_addr()),
+        intra: advertised_addr(bound.advertise_host.as_deref(), bound.intra_addr()),
+        role: role.to_string(),
+    }
+}
+
 /// Claim this join's identity, **pre-bind** (ADR 0040 Decision B/C):
 /// `explicit_id` is a `--id NAME` proposal (already validated —
 /// [`NodeId::propose`] ran at the CLI boundary), registered with one attempt
@@ -17323,19 +17389,32 @@ pub async fn run_node_data_join_with_settings(
     let (original_control_ids, peers, client_route, intra_route, admin_addrs) =
         discover_join_info(&seeds).await?;
 
-    let mine = NodeAddrs {
-        internal: advertised_addr(addrs.advertise_host.as_deref(), addrs.internal),
-        client: advertised_addr(addrs.advertise_host.as_deref(), addrs.client),
-        admin: advertised_addr(addrs.advertise_host.as_deref(), addrs.admin),
-        intra: advertised_addr(addrs.advertise_host.as_deref(), addrs.intra),
-        role: "data".to_string(),
+    // Bind-and-hold BEFORE claim for an explicit `--id` — the data-only
+    // dual of [`run_node_join_with_settings`]'s identical fix (issue
+    // #1042); see that call site's own doc for the full account.
+    let (bound, my_id) = match id {
+        Some(explicit_id) => {
+            let bound = Node::bind_data(explicit_id.clone(), addrs, dir).await?;
+            let mine = bound_data_node_addrs(&bound, "data");
+            let my_id = claim_join_identity(&seeds, Some(explicit_id), &mine, &labels).await?;
+            (bound, my_id)
+        }
+        None => {
+            let mine = NodeAddrs {
+                internal: advertised_addr(addrs.advertise_host.as_deref(), addrs.internal),
+                client: advertised_addr(addrs.advertise_host.as_deref(), addrs.client),
+                admin: advertised_addr(addrs.advertise_host.as_deref(), addrs.admin),
+                intra: advertised_addr(addrs.advertise_host.as_deref(), addrs.intra),
+                role: "data".to_string(),
+            };
+            let my_id = claim_join_identity(&seeds, None, &mine, &labels).await?;
+            let bound = Node::bind_data(my_id.clone(), addrs, dir).await?;
+            (bound, my_id)
+        }
     };
-    let my_id = claim_join_identity(&seeds, id, &mine, &labels).await?;
-    let my_client_addr = addrs.client;
-    let my_admin_addr = addrs.admin;
-    let my_intra_addr = addrs.intra;
-
-    let bound = Node::bind_data(my_id.clone(), addrs, dir).await?;
+    let my_client_addr = bound.client_addr();
+    let my_admin_addr = bound.admin_addr();
+    let my_intra_addr = bound.intra_addr();
 
     finish_data_join(
         bound,

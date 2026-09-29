@@ -29,8 +29,9 @@ use animus_env::{Nanos, NodeId};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use crate::format;
 use crate::meta::{MetaCommand, Metadata};
-use crate::persist::{PersistedState, WalRecord};
+use crate::persist::{CONTROL_SNAPSHOT, PersistedState, WalRecord};
 
 /// The replicated state machine a [`RaftCore`] drives. The control plane uses
 /// [`Metadata`] (command = [`MetaCommand`]); a future per-tablet data plane will
@@ -1412,9 +1413,11 @@ where
             // re-serialize-per-chunk path produced, just cached. (A `DRIVER_APPLIED`
             // core's image lives in the engine, not `metadata`; its driver builds it
             // lazily on demand — `take_snapshot_needed` — so leave it None here.)
+            // Tagged with `CONTROL_SNAPSHOT` (ADR 0073 Phase 0 workstream B, magic
+            // `CSN1`) since this PR — see `handle_install_snapshot`'s decode side.
             if !S::DRIVER_APPLIED {
-                core.snapshot_blob =
-                    Some(serde_json::to_vec(&core.metadata).expect("metadata serializes"));
+                let payload = serde_json::to_vec(&core.metadata).expect("metadata serializes");
+                core.snapshot_blob = Some(format::wrap(&CONTROL_SNAPSHOT, &payload));
             }
         }
         // Restore the voter configuration: the snapshot's recorded config (if any)
@@ -1543,8 +1546,10 @@ where
         // (via [`snapshot`]), so it matches the base exactly, keeping the in-core
         // invariant `snapshot_index > 0 ⟹ snapshot_blob.is_some()`.
         if !S::DRIVER_APPLIED {
-            self.snapshot_blob =
-                Some(serde_json::to_vec(&self.metadata).expect("metadata serializes"));
+            // Tagged with `CONTROL_SNAPSHOT` (ADR 0073 Phase 0 workstream B, magic
+            // `CSN1`) since this PR — see `handle_install_snapshot`'s decode side.
+            let payload = serde_json::to_vec(&self.metadata).expect("metadata serializes");
+            self.snapshot_blob = Some(format::wrap(&CONTROL_SNAPSHOT, &payload));
         } else {
             // `DRIVER_APPLIED` images are built **lazily, on demand** (see
             // [`snapshot_chunk_for`]): the base just moved, so any previously
@@ -2080,19 +2085,47 @@ where
         }
     }
 
-    /// Whether learner `id` is caught up closely enough to this leader's own
-    /// log to be a promotion candidate (ADR 0058 Train 1's promotion
-    /// criterion): its tracked `match_index` is within `threshold` of
-    /// [`last_log_index`](Self::last_log_index). A pure predicate over
-    /// already-tracked state (the same bookkeeping `AppendEntries`/
-    /// `InstallSnapshot` acks already maintain) — it does **not** gate
+    /// Whether learner `id` is caught up closely enough to be a promotion
+    /// candidate (ADR 0058 Train 1's promotion criterion): its tracked
+    /// `match_index` is within `threshold` of [`commit_index`](Self::
+    /// commit_index) — **not** [`last_log_index`](Self::last_log_index)
+    /// (issue #1064 fix, 2026-09-28). A pure predicate over already-tracked
+    /// state (the same bookkeeping `AppendEntries`/`InstallSnapshot` acks
+    /// already maintain) — it does **not** gate
     /// [`promote_learner`](Self::promote_learner) itself; a later layer (the
     /// host reconciler) decides *when* to act on it. `false` for any `id`
     /// that is not currently a learner.
+    ///
+    /// **Why `commit_index`, not `last_log_index` (issue #1064):** under a
+    /// continuous write stream, `last_log_index()` is the leader's own
+    /// freshest LOCAL append — an entry nobody, not even another voter, has
+    /// necessarily even received yet, let alone acked. A caller that
+    /// samples this predicate right after proposing a batch (`reconfigure_
+    /// step`'s own production caller ticks independently of the write
+    /// stream, so this is the ordinary case under load, not a corner one)
+    /// would see a gap of "however many entries this leader just appended
+    /// for itself," permanently exceeding any fixed `threshold` regardless
+    /// of how genuinely caught-up the learner actually is — a real learner
+    /// can never close a gap that re-opens by the same amount (or more)
+    /// every time it's checked. `commit_index()` doesn't have this problem:
+    /// it only advances once a majority of CURRENT VOTERS (never this
+    /// learner — [`apply_config`](Self::apply_config)'s doc) have
+    /// themselves acked, so it is never further ahead of what the
+    /// established quorum has actually achieved than one ordinary
+    /// replication round costs. This also keeps the ADR 0058 Train 1 safety
+    /// intent intact — "never dilute the quorum with a peer that can't
+    /// ack": a peer promoted at `match_index >= commit_index - threshold`
+    /// can, the instant it becomes a voter, immediately help COMMIT
+    /// anything up to what the group has already committed (the property
+    /// that actually matters for not regressing availability), which
+    /// comparing against the ever-advancing leader tip never established
+    /// anyway — a peer "caught up to `last_log_index`" could still be
+    /// stale by the time its own promotion entry is itself appended.
+    /// Regression: `tests/directed_placing_under_sustained_load.rs`.
     #[must_use]
     pub fn learner_caught_up(&self, id: &NodeId, threshold: u64) -> bool {
         self.learners.contains(id)
-            && self.last_log_index().saturating_sub(self.peer_match(id)) <= threshold
+            && self.commit_index().saturating_sub(self.peer_match(id)) <= threshold
     }
 
     /// Adopt `voters`/`learners` as the active config and keep
@@ -3742,7 +3775,30 @@ where
                 .collect();
         }
         if success {
-            self.next_index.insert(from.clone(), match_index + 1);
+            // Issue #1070: monotonic, not a bare overwrite — mirrors the
+            // `InstallSnapshot` success path's own `next_index` update a few
+            // lines up (and `match_index`'s own `.max` just above). A
+            // `success` ack is proof this replica's log matches through
+            // `match_index`; it is never evidence its log is SHORTER than
+            // what a previous, later-arriving-out-of-order ack already
+            // proved. There is no legitimate scenario where a genuine
+            // success ack should ever move `next_index` backward: a
+            // follower whose log was truncated by a conflicting leader can
+            // only ever report that via a REJECT (this method's own `else`
+            // branch below), never a `success` — success is only sent for a
+            // request this follower's log already matched through
+            // `prevLogIndex`. Found investigating issue #1064: under
+            // sustained bursty replication to a throttled peer, acks can
+            // genuinely arrive out of send order, and the old bare `insert`
+            // let a stale, lower-`match_index` success ack silently regress
+            // `next_index` behind a fresher one already recorded — at worst
+            // costing one wasted resend of already-matched entries; at
+            // worst (confirmed live), racing a snapshot-triggered `next_
+            // index = 1` reset the wrong way. See `docs/lessons/testing/
+            // 2026-09-28-an-ordinary-appendentries-acks-next-index-update-
+            // is-not-monotonic.md` for the full account.
+            let ni = self.next_index.entry(from.clone()).or_insert(1);
+            *ni = (*ni).max(match_index + 1);
             self.maybe_advance_commit();
             self.apply();
             if self.next_index.get(&from).copied().unwrap_or(1) <= self.last_log_index() {
@@ -4026,10 +4082,18 @@ where
                     },
                 )];
             }
-            // In-core state machine: deserialize the image into `metadata`. A
-            // malformed snapshot would be a leader bug; drop + re-request rather
-            // than install garbage.
-            match serde_json::from_slice::<S>(&inc.buf) {
+            // In-core state machine: unwrap the `CONTROL_SNAPSHOT` (`CSN1`)
+            // envelope and deserialize the image into `metadata`. A malformed
+            // snapshot (or a pre-baseline/unsupported-version tag — loud, named,
+            // logged below rather than silently misread) would be a leader bug;
+            // drop + re-request rather than install garbage.
+            let decoded = format::unwrap(&CONTROL_SNAPSHOT, &inc.buf).and_then(|(_, payload)| {
+                serde_json::from_slice::<S>(payload).map_err(|e| format::FormatError::Malformed {
+                    format: CONTROL_SNAPSHOT.name,
+                    detail: e.to_string(),
+                })
+            });
+            match decoded {
                 Ok(state) => {
                     self.metadata = state;
                     install(self);
@@ -4053,7 +4117,12 @@ where
                         },
                     )];
                 }
-                Err(_) => {
+                Err(err) => {
+                    tracing::error!(
+                        %err,
+                        "InstallSnapshot image failed to decode — dropping it and asking the \
+                         leader to restart the transfer",
+                    );
                     return vec![(
                         leader,
                         RaftMsg::InstallSnapshotResp {

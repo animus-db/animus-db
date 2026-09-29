@@ -55,7 +55,7 @@ async fn driver_truncates_the_wal_and_the_engine_stays_the_source_of_truth() {
     sim.run_for(Duration::from_secs(3)); // apply + flush + threshold snapshot
 
     let bytes = read_wal(&mut sim, node.env());
-    let records: Vec<WalRecord> = PersistedState::decode(&bytes);
+    let records: Vec<WalRecord> = PersistedState::decode(&bytes).unwrap();
 
     // A threshold snapshot ran: the WAL carries a snapshot record covering a
     // truncated prefix, and is bounded far below one-record-per-operation.
