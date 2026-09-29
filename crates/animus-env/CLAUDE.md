@@ -1133,3 +1133,10 @@ re-dial and re-refuse (the counter reaches 2, and the fake acceptor
 itself sees 2 separate connections) rather than caching anything after
 the first failure. All three read `Metric::NetworkHandshakeRefused`
 straight off the real `ProdEnv`'s own `Env::metrics()` handle.
+
+## Gotcha: `/etc/hosts` is process-global in tests (#1107)
+
+`HostsEntryGuard` (prod.rs tests) rewrites `/etc/hosts` non-atomically. Any
+test that dials a hostname (e.g. `localhost:PORT`) must hold
+`hosts_resolution_lock()` across the dial, or a torn read drops the
+fire-and-forget frame. See `docs/lessons/testing/2026-09-29-tests-that-rewrite-etc-hosts-*`.
