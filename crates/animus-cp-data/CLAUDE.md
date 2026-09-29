@@ -2736,6 +2736,72 @@ wire/image codec is `pub(crate)`; new formats add a section in whichever fits.
   `#[serde(default)]` (a missing field is now a `Malformed` decode error, via
   `txn::required_option` — serde otherwise defaults a missing `Option` field
   to `None` even with no attribute). Fixture: `raftkv-wal/v1.bin`.
+- **`cp-engine-layout` v1** (`layout.rs`, ADR 0073 Phase 0 layer 4): the
+  per-tablet engine key-layout marker. Key `escape(RESERVED_NAMESPACE) ||
+  escape("cp_layout") || tablet_be` (an engine-global marker beside
+  `applied`/`hwm`/`seal`/`ceiling`/`split`/`trim_marker`; skipped by
+  `engine_image`/`has_data`/every kind scan), value `b"KLY1" || epoch(u8)`,
+  `LAYOUT_EPOCH = 1`. It is a reserved-namespace marker, **not** a new kind
+  byte (kind bytes index `ALL_KINDS`' scope table — see ADR 0073's layer 4
+  paragraph). Errors are `FormatError` (`cp-engine-layout`). Fixture:
+  `cp-engine-layout/v1.bin` (`u32`-BE-length-prefixed key, then value;
+  in-crate tests in `src/format_fixture_tests.rs`).
+  - **Check/stamp points.** `Reconciler::ensure_engine`, right after
+    `factory.open`: valid marker for this tablet → ok; absent + engine empty
+    (`latest_version() == 0`) → `put` the marker at version 1 (the first write
+    on a fresh engine — the Raft group, `InstallSnapshot`, `SeedBatch` and the
+    applied marker all start later); absent + non-empty (pre-baseline, or only
+    *another* tablet's marker: the key embeds the tablet id) → refuse; present
+    but undecodable/unknown epoch → refuse. The rebuilt-empty engine in the
+    destroy-and-rebuild branch is stamped too. `install_engine_image` only
+    merges, so an `InstallSnapshot` never deletes the marker (the image
+    carries kind rows only); a wiped engine reopens empty and is re-stamped.
+  - **Refusal never destroys.** A refusal logs at error, returns `None`
+    (tablet not hosted, claim released, `plan` re-emits next tick) and leaves
+    the engine byte-for-byte untouched.
+  - **Split children.** `materialize_split_child` opens/clones the child
+    engine itself (never through `ensure_engine`) and only caches it after
+    trim completes; `trim_split_child` writes the child's own layout marker in
+    the **same `write_batch` as its trim-completion marker**, so trim
+    completion implies the layout marker. A crash between `clone_engine` and
+    that batch leaves a cloned, non-empty, unstamped, untrimmed engine — the
+    existing resume branch (probe → open → trim marker absent → re-trim)
+    re-runs the batch and stamps it. After trim, `layout::verify` (no stamp)
+    guards hosting. The parent's marker may or may not be linked into the
+    clone (`clone_to_filtered` links only tables overlapping BASE/LSI/
+    FOOTPRINT ranges) and names the parent's tablet id anyway, so it is never
+    relied on. `ensure_engine` on a mid-materialize child (only reachable if
+    `plan` ordinary-`Host`s a tablet whose cloned-but-untrimmed engine exists)
+    refuses — conservative, and better than hosting an untrimmed clone.
+  - **Flush at stamp time (isolating the marker).** The `0x5F` marker sorts
+    above every kind scope, so left in the memtable with kind rows it would
+    make the first flushed SSTable span up to it and defeat
+    `clone_to_filtered`'s whole-file exclusion on a split until compaction.
+    So every stamp is followed by `EngineFactory::flush_engine(&engine)` — a
+    default-no-op trait hook (`StorageEngine` has no flush; `LsmEngine::
+    flush_now` is inherent) that an `LsmEngine`-backed factory implements as
+    `flush_now()`: after `ensure_engine` stamps a fresh (or rebuilt) engine,
+    and after a split child's trim batch (tombstones + trim marker + layout
+    marker, before any child kind row). A flush failure only logs (the marker
+    is WAL-durable; only the isolation is lost). **Every production
+    `EngineFactory` over `LsmEngine` must override `flush_engine`** —
+    `animusd`'s `LsmTabletFactory` included. `tests/engine_layout.rs::
+    the_stamp_lands_in_its_own_sstable_and_kind_rows_do_not_span_it` pins it
+    and `tests/inplace_split_dead_space.rs` passes unmodified. The other
+    engine-global markers (applied/hwm/seal/ceiling/split) are written only at
+    compaction/snapshot-install/special commands, so they rarely ride in a
+    first table; when they do, they widen that one table (pre-existing).
+  - **`factory.open` caller audit** (all in `host.rs`): `ensure_engine`
+    (host, `gather_facts`' `has_data` probe, the split parent) — checks;
+    `materialize_split_child`'s two direct opens/clone — stamped by the trim
+    batch and `verify`d; reclaim/`Release`/first-tick `local_tablets` reclaim
+    only `destroy` (never open) — need no check; `animusd` has no direct
+    `open` call (only `LsmTabletFactory`'s trait impl).
+  - **Gotcha: never route a layout refusal through destroy-and-rebuild.**
+    `ensure_engine`'s issue-#554 branch treats an `open` *error* as a lost
+    engine and destroys it; a layout refusal is a valid, readable engine this
+    build must not touch (pre-baseline or newer-version data). Keep the
+    refusal a plain `return None` before that `match` arm.
 
 ## Tests
 

@@ -420,7 +420,7 @@ tag shape and fixture layout every workstream conforms to.
 |---|---|---|---|---|
 | **A** | `animus-storage` | LSM WAL record header (add magic+version, `LWL1`+v1); SSTable/manifest re-baseline (`MANIFEST_VERSION` → 1, keep the existing `CMF1` magic since it's already correct — only the version counter and the "read pre-binary-codec JSON" legacy fallback are in scope for removal, since that fallback is exactly the pre-baseline legacy path point 1 above says may be dropped); `SsTableMeta::format` reset to 1 with a real decode path so a *second* format value becomes meaningful before Phase 1 needs it; encryption envelope fixture (`ADE1` already has a version — no reset needed, just add its golden fixture) | none (self-contained crate) | `crates/animus-storage/**` only. Do not touch `animus-cp-data`'s or `animus-control`'s own WAL code even though they call into `animus-storage`'s `StorageEngine` trait — this workstream owns the trait's implementations, not its callers. |
 | **B** | `animus-control` | Raft WAL `Line<C, S>` envelope (add `CWL1`+v1, replacing the two-generation structural-sniff scheme in `persist.rs`); control-plane snapshot/`InstallSnapshot` payload envelope (`CSN1`+v1, wrapping `S`'s own serde shape); `Metadata`'s schema gets a top-level `"v": 1` field (`syskv.rs`'s mirror inherits it for free since it serializes the same struct); drop the `cp_member_addrs`/address-book legacy fields ADR 0032/0040 kept for pre-existing-cluster back-compat (Phase 0 is the point where "no production cluster yet" makes that safe) | none (self-contained crate, though B and C should coordinate on the shared `Line`-style envelope shape so they don't diverge — see C's own note) | `crates/animus-control/**` only. Do not touch `crates/animus-cp-data/src/shared_wal.rs`'s own `Line{tablet, record}` envelope — it looks similar but is workstream C's, not B's, even though both reuse `persist::encode_tagged_record`. |
-| **C** | `animus-cp-data` | RaftKV command codec re-baseline (`codec.rs::VERSION` 31 → 1); `SharedWal` outer `Line{tablet, record}` envelope (`SWL1`+v1 — the *inner* `record` bytes are already the versioned codec payload, unchanged shape, only the outer tag is new); segment codec re-baseline (`segment.rs::VERSION` 2 → 1); a version marker on the per-tablet engine key layout (ADR 0050's `kind \|\| logical` convention) — this one is a design task, not a mechanical tag-and-fixture: recommend a single reserved leading byte in the `kind` namespace itself (a `layout` epoch) rather than a per-record magic, since the layout is a key-space convention, not a framed record; document the chosen approach directly in `crates/animus-cp-data/CLAUDE.md`, this ADR does not prescribe the exact bit layout | B (for the shared `encode_tagged_record`/`Line`-shape convention, so C's `SharedWal` envelope and B's Raft WAL envelope don't independently invent incompatible tagging shapes for what is structurally the same "envelope wraps an inner payload" problem) | `crates/animus-cp-data/**` only. Do not touch `crates/animus-control/src/persist.rs` — read it for the shared convention, don't edit it. |
+| **C** | `animus-cp-data` | RaftKV command codec re-baseline (`codec.rs::VERSION` 31 → 1); `SharedWal` outer `Line{tablet, record}` envelope (`SWL1`+v1 — the *inner* `record` bytes are already the versioned codec payload, unchanged shape, only the outer tag is new); segment codec re-baseline (`segment.rs::VERSION` 2 → 1); a version marker on the per-tablet engine key layout (ADR 0050's `kind \|\| logical` convention; **as built: a reserved-namespace marker key, not a kind byte — see the layer 4 as-built paragraph**) — this one is a design task, not a mechanical tag-and-fixture: recommend a single reserved leading byte in the `kind` namespace itself (a `layout` epoch) rather than a per-record magic, since the layout is a key-space convention, not a framed record; document the chosen approach directly in `crates/animus-cp-data/CLAUDE.md`, this ADR does not prescribe the exact bit layout | B (for the shared `encode_tagged_record`/`Line`-shape convention, so C's `SharedWal` envelope and B's Raft WAL envelope don't independently invent incompatible tagging shapes for what is structurally the same "envelope wraps an inner payload" problem) | `crates/animus-cp-data/**` only. Do not touch `crates/animus-control/src/persist.rs` — read it for the shared convention, don't edit it. |
 | **D** | wire (`animus-node`, `animus-control`'s `RaftMsg`, `animus-cp-data`'s Raft messages) | A version field in the connection handshake/envelope for internal `Network` message enums (`RaftMsg<C>`, `ClientRequest`/`ClientResponse`) — **prep for Phase 2, not a Phase 1 compatibility mechanism yet**: today this only needs to *exist* and be checked for equality (both ends same build, as today), not gate anything, since real mixed-version wire compatibility is Phase 2's job. Keep changes additive (new field, `#[serde(default)]`-shaped where the enum crosses a version boundary) so Phase 2 can build on it without another reset. | none | `crates/animus-node/src/wire.rs`, the `RaftMsg`/Raft-message enum definitions in `animus-control`/`animus-cp-data`. Do not touch those crates' *storage* formats (A/B/C's territory) even though they live in the same files in some cases — a wire enum and a WAL record type in the same crate are still disjoint concerns; grep for the specific type names above before editing anything else nearby. |
 | **E** | `animusd`, `animus-operator` | `ClusterConfig` gets `"v": 1`; operator CRD real schema gets an explicit internal version marker (distinct from the Kubernetes `v1alpha1` API-version label, which stays as-is — this is about the CRD's *content* schema, not its API group version); backup manifest JSON body gets `"v": 1` (the manifest already reuses the chunk envelope's magic+version for its *data chunks*, `DATA_VERSION`; this is about the manifest's own top-level JSON body, a separate thing per the inventory table); PITR/export objects inherit the segment codec's reset from C, so E's own scope here is just confirming that inheritance holds, not re-versioning them independently | C (backup/PITR/export read the segment codec — E must land after C's `segment.rs` reset, or build against C's PR series directly if timing requires overlap) | `crates/animusd/**`, `crates/animus-operator/**`. Do not touch `crates/animus-cp-data/src/segment.rs` — read C's landed version, don't reset it a second time. |
 
@@ -734,6 +734,43 @@ fields; `schema.rs` and `meta.rs` catalog/`Metadata` fields, including
 `IndexStatus::active` and `default_node_role`), each of which is a persisted or
 wire shape a baselined format should either require or document as genuine
 semantics.
+
+**Workstream C as-built (2026-09-29), layer 4 — engine layout marker.**
+Row C's fourth item (a version marker on the per-tablet engine key layout) is
+implemented as `crates/animus-cp-data/src/layout.rs`, **deviating from this
+ADR's recommendation of "a single reserved leading byte in the `kind`
+namespace"**. A new kind byte is not free: the kind bytes (`KIND_BASE` `0x00`
+.. `KIND_CURSOR` `0x04`) double as indexes into `ALL_KINDS`' scope table
+(`install_engine_image` does `kind_scopes.get(kind as usize)`), so a new byte
+would have to be excluded from every all-kinds scan, snapshot image and
+classifier — a wide change to hot code with a silent-misclassification failure
+mode. A per-record magic was rejected for changing every key/value and
+breaking the `kind || logical` range-scan convention. Instead the marker
+reuses the **engine-global marker family** (`applied`/`hwm`/`seal`/`ceiling`/
+`split`/`trim_marker`), keyed `escape(RESERVED_NAMESPACE) || escape("cp_layout")
+|| tablet_be` — a `0x5F`-leading prefix already disjoint from every kind scope,
+so `engine_image`, `has_data` and the seal/ceiling/applied scans skip it with
+no change. Value `b"KLY1" || epoch(u8)`, `LAYOUT_EPOCH = 1`; errors are
+`FormatError` (format `cp-engine-layout`: wrong/missing magic
+`PreBaselineFormat`, epoch `0` or above the build's `UnsupportedFormatVersion`,
+wrong length `Malformed`). `Reconciler::ensure_engine` checks it after
+`factory.open`: valid marker for *this* tablet id → ok; marker absent on an
+empty engine → stamp (first write, before any Raft/`InstallSnapshot`/
+`SeedBatch`/applied write); absent on a non-empty engine (pre-baseline, or only
+another tablet's marker) or present-but-unusable → **refuse — logged at error,
+tablet not hosted, engine never destroyed** (deliberately *not* the
+issue-#554 destroy-and-rebuild path, which would erase a pre-baseline or
+newer-version engine). A split child is stamped by `trim_split_child` in the
+same write batch as its trim-completion marker, so trim completion implies a
+layout marker. Golden fixture
+`crates/animus-cp-data/tests/fixtures/formats/cp-engine-layout/v1.bin`
+(`u32`-BE length-prefixed key then value; in `src/format_fixture_tests.rs`).
+The stamp is isolated from kind rows: the reconciler follows it (and a split
+child's trim batch) with `EngineFactory::flush_engine`, an `LsmEngine`-backed
+factory's `flush_now()`, so the `0x5F` marker lands in its own SSTable rather
+than widening the first table of kind rows up to the reserved namespace (which
+would defeat `clone_to_filtered`'s whole-file exclusion on a split until
+compaction).
 
 ## Testing
 

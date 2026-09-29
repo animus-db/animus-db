@@ -73,6 +73,7 @@ pub mod heartbeat_batch;
 pub mod hlc;
 pub mod host;
 mod hwm;
+pub mod layout;
 mod seal;
 pub mod segment;
 mod split;

@@ -17,6 +17,10 @@
 //!   probes, the heartbeat batches; the `AppendEntries` carries every
 //!   `KvCommand` variant).
 //! - `raftkv-image/v1.bin`: exactly one `encode_image` output.
+//! - `cp-engine-layout/v1.bin`: the per-tablet engine layout marker (layer 4,
+//!   `layout.rs`) for tablet `7`: a `u32` big-endian length then the marker
+//!   **key** bytes, then a `u32` big-endian length then the marker **value**
+//!   bytes (`b"KLY1" || epoch`), to EOF.
 //! - `raftkv-wal/v1.bin`: `WalRecord<KvCommand, KvState>` lines in the
 //!   per-group `CWL1` envelope (`PersistedState::encode_record`), the
 //!   compatibility-relevant one: `KvCommand` is stored as `serde_json` here,
@@ -370,4 +374,77 @@ fn raftkv_wal_txn_write_fields_are_required() {
 #[ignore]
 fn generate_fixture_raftkv_wal() {
     write_new_fixture(&formats_dir("raftkv-wal"), 1, &v1_wal_bytes());
+}
+
+// ---------------------------------------------------------------------------
+// cp-engine-layout
+
+const LAYOUT_FIXTURE_TABLET: u64 = 7;
+
+fn v1_layout_bytes() -> Vec<u8> {
+    pack_frames(&[
+        crate::layout::layout_marker_key(LAYOUT_FIXTURE_TABLET),
+        crate::layout::encode_layout_value(),
+    ])
+}
+
+#[test]
+fn cp_engine_layout_decodes_every_checked_in_fixture_structurally() {
+    for (version, bytes) in fixture_files(&formats_dir("cp-engine-layout")) {
+        let parts = unpack_frames(&bytes);
+        assert_eq!(parts.len(), 2, "v{version}: key + value");
+        let (key, value) = (&parts[0], &parts[1]);
+        match version {
+            1 => {
+                // key = escape(RESERVED_NAMESPACE) || escape("cp_layout") || tablet_be
+                let mut want =
+                    animus_tablet::escape(animus_control::syskv::RESERVED_NAMESPACE.as_bytes());
+                want.extend_from_slice(&animus_tablet::escape(b"cp_layout"));
+                want.extend_from_slice(&LAYOUT_FIXTURE_TABLET.to_be_bytes());
+                assert_eq!(key, &want, "v1 key layout");
+                assert_eq!(value, &[b'K', b'L', b'Y', b'1', 1], "v1 value bytes");
+                assert_eq!(crate::layout::decode_layout_value(value), Ok(1));
+            }
+            other => panic!("cp-engine-layout v{other} fixture has no structural expectation yet"),
+        }
+    }
+}
+
+#[test]
+fn cp_engine_layout_round_trips_and_matches_the_fixture_bytes() {
+    for (version, bytes) in fixture_files(&formats_dir("cp-engine-layout")) {
+        if version != 1 {
+            continue;
+        }
+        assert_eq!(
+            v1_layout_bytes(),
+            bytes,
+            "v1: current encoder emits the fixture"
+        );
+    }
+}
+
+#[test]
+fn cp_engine_layout_refuses_other_epochs_by_name() {
+    let value = unpack_frames(&fixture_files(&formats_dir("cp-engine-layout"))[0].1).remove(1);
+    for bad in [0u8, 2, 255] {
+        let mut v = value.clone();
+        v[4] = bad;
+        assert_eq!(
+            crate::layout::decode_layout_value(&v).unwrap_err(),
+            FormatError::UnsupportedFormatVersion {
+                format: "cp-engine-layout",
+                found: bad,
+                max_supported: 1
+            }
+        );
+    }
+}
+
+/// `cargo test -p animus-cp-data --lib generate_fixture_cp_engine_layout -- --ignored`.
+/// Refuses to overwrite an existing fixture (ADR 0073 Phase 0).
+#[test]
+#[ignore]
+fn generate_fixture_cp_engine_layout() {
+    write_new_fixture(&formats_dir("cp-engine-layout"), 1, &v1_layout_bytes());
 }
