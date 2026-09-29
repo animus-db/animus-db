@@ -111,9 +111,7 @@ pub struct Member {
 /// A member's full address book (ADR 0032 PR1): every listen address a node
 /// exposes, replicated so any node can forward/relay to any other regardless
 /// of when it joined. Keyed by the member's node id in
-/// [`Metadata::node_addrs`] — the same id space as [`Metadata::cp_member_addrs`]
-/// (which this supersedes for the client/admin axes; `cp_member_addrs` is kept
-/// for WAL back-compat and the internal peer book).
+/// [`Metadata::node_addrs`].
 ///
 /// **ADR 0040 PR1 (one identity per node)**: `raftkv` and `control` — two
 /// separate listen addresses for a node's two `ProdEnv` roles — merge into
@@ -166,10 +164,79 @@ fn default_node_role() -> String {
     "combined".to_string()
 }
 
+/// The current [`Metadata`] JSON format version (ADR 0073 Phase 0 workstream
+/// B): the value [`Metadata::version`] is constructed with and the highest a
+/// decoder built from this source accepts. Restarted at `1` by the Phase 0
+/// baseline reset per the ADR's "version counters restart at 1" instruction
+/// — there is no pre-Phase-0 `Metadata` version to preserve continuity with.
+pub const METADATA_VERSION: u32 = 1;
+
+/// Serde default for [`Metadata::version`] when `"v"` is absent: always `1`,
+/// the one `Metadata` schema that ever existed without the tag. Deliberately
+/// the literal v1, **not** [`METADATA_VERSION`] — when that constant is
+/// bumped, an untagged document must still mean v1. See [`Metadata`]'s doc
+/// for why a default is sound here.
+fn metadata_v1() -> u32 {
+    1
+}
+
+/// Serde validator for a present `"v"`: rejects `0` and anything above
+/// [`METADATA_VERSION`], so plain `serde_json` decoding never silently
+/// accepts a future/unknown version. (An *absent* `"v"` never reaches this;
+/// it takes [`metadata_v1`].)
+fn deserialize_metadata_version<'de, D>(d: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = u32::deserialize(d)?;
+    if v == 0 || v > METADATA_VERSION {
+        return Err(serde::de::Error::custom(format!(
+            "unsupported Metadata format version {v} (max supported {METADATA_VERSION})"
+        )));
+    }
+    Ok(v)
+}
+
 /// The replicated control-plane state: membership and the (single-table) tablet
 /// map.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// **Carries its own top-level `"v"` format version (ADR 0073 Phase 0
+/// workstream B, the `serde_json` "Phase 0 conventions" shape).** Two decode
+/// paths with deliberately different strictness:
+///
+/// - [`Metadata::from_json`] (standalone/bare documents, e.g. a Status wire
+///   response) is **strict**: a missing `"v"` is
+///   [`crate::format::FormatError::PreBaselineFormat`], an unknown one
+///   [`crate::format::FormatError::UnsupportedFormatVersion`].
+/// - Plain serde deserialization **defaults an absent `"v"` to 1**
+///   ([`metadata_v1`]) and rejects a present-but-unknown `"v"` (`0` or
+///   above [`METADATA_VERSION`]). This is sound because pre-baseline
+///   detection is the *envelope's* job: a `Metadata` found inside a tagged
+///   v1 envelope (CWL1 WAL entry, CSN1 snapshot) is post-reset by
+///   construction, and v1 is the only `Metadata` schema that ever existed
+///   without the tag — so an absent `"v"` there unambiguously means v1. The
+///   default is required by the frozen `control-wal/v1.bin` fixture, whose
+///   embedded `Metadata` predates the field and which ADR 0073 forbids
+///   editing. (This deviates from the ADR's "required, no default" wording
+///   for `serde_json` formats.)
+///
+/// **This field versions `Metadata`'s own JSON shape only** — it says nothing
+/// about the system-keyspace mirror's on-disk format, which has its own
+/// independent version signal: see `mirror::SYSKV_FORMAT_VERSION_COUNTER`'s
+/// own doc for why a `DRIVER_APPLIED` type's field can't version storage that
+/// never serializes the type itself.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Metadata {
+    /// The [`Metadata`] JSON format version this value was constructed/
+    /// decoded at. Always [`METADATA_VERSION`] for a freshly-constructed
+    /// value; [`Metadata::from_json`] is the intended decode path for
+    /// untrusted bytes (see the struct's own doc).
+    #[serde(
+        rename = "v",
+        default = "metadata_v1",
+        deserialize_with = "deserialize_metadata_version"
+    )]
+    pub version: u32,
     /// Cluster membership keyed by node id.
     pub members: BTreeMap<NodeId, Member>,
     /// The tablet map keyed by tablet id.
@@ -187,27 +254,6 @@ pub struct Metadata {
     /// consume it (a deliberate follow-up) so a `CreateTable`/`CREATE TABLE`
     /// survives restart and is agreed cluster-wide.
     pub schemas: SchemaCatalog,
-    /// Replicated **CP group member addresses** (Phase 2): each CP per-tablet Raft
-    /// member id → the listen address of its hosting node's `raftkv` role, as an
-    /// opaque string (the control plane never dials it). Mutated only through
-    /// [`MetaCommand::RegisterCpAddr`]. A member created at runtime — a tablet
-    /// split's co-resident sibling, or a newly-joined data node — registers its
-    /// address here so every node's peer-sync loop can install it into its env peer
-    /// book and the new group's internal Raft traffic routes. `#[serde(default)]`
-    /// keeps pre-Phase-2 snapshots loading (empty map).
-    #[serde(default)]
-    pub cp_member_addrs: BTreeMap<NodeId, String>,
-    /// Which **tablet** each registered CP member id belongs to (ADR 0024 GC):
-    /// recorded when [`MetaCommand::RegisterCpAddr`] carries its `tablet`, and the
-    /// key the address GC prunes on — when a tablet leaves the map (drop-table,
-    /// merge), every member-addr entry recorded against it is removed from both
-    /// maps, closing the designed leak. Keyed on **current absence** (mirroring
-    /// the file GC's discipline), so a replayed historical map state cannot
-    /// permanently resurrect an entry: the replayed removal prunes it again. A
-    /// member registered without a tablet (legacy) is never pruned.
-    /// `#[serde(default)]` keeps older snapshots loading (empty map).
-    #[serde(default)]
-    pub cp_member_tablets: BTreeMap<NodeId, TabletId>,
     /// The next tablet id to hand out — a **monotonic** allocator (ADR 0023): bumped
     /// past every tablet created (via `CreateTablet` or `SplitTablet`) so two
     /// concurrent `CreateTable`s can't derive the same id, and a dropped id is never
@@ -221,9 +267,7 @@ pub struct Metadata {
     /// address set (raftkv/client/admin), keyed by its raftkv id. Mutated by
     /// [`MetaCommand::RegisterNode`] (the sole claim path, ADR 0040 Decision
     /// C) at first registration and [`MetaCommand::RegisterNodeAddrs`]
-    /// (update-only) thereafter. Unlike [`Metadata::cp_member_addrs`]
-    /// (internal raftkv addresses only, including transient split-sibling/CP-group
-    /// member ids that are never full cluster members), this is populated once per
+    /// (update-only) thereafter. This is populated once per
     /// **node** at startup, closing the ADR 0030 gap where a pre-growth node's
     /// `client_route`/admin peer list was a static, process-start-only snapshot
     /// that could never learn about a node grown in afterward. `#[serde(default)]`
@@ -489,6 +533,103 @@ pub struct Metadata {
     /// keeps pre-import snapshots loading (empty map).
     #[serde(default)]
     pub imports: BTreeMap<ImportId, ImportRow>,
+}
+
+impl Default for Metadata {
+    /// A fresh, empty [`Metadata`] at [`METADATA_VERSION`]. Deliberately a
+    /// manual impl, not `#[derive(Default)]` (which the ADR 0073 Phase 0
+    /// reset removed): every field but `version` still gets its own
+    /// `Default::default()`, but `version` itself must always be the
+    /// current [`METADATA_VERSION`], never `0` (which is never a valid
+    /// version — see [`crate::format::FormatTag::version`]'s own doc for
+    /// why `0` is reserved).
+    fn default() -> Self {
+        Metadata {
+            version: METADATA_VERSION,
+            members: Default::default(),
+            tablets: Default::default(),
+            policies: Default::default(),
+            schemas: Default::default(),
+            next_tablet_id: Default::default(),
+            node_addrs: Default::default(),
+            split_lineage: Default::default(),
+            split_placing: Default::default(),
+            stream_shards: Default::default(),
+            index_backfill: Default::default(),
+            backups: Default::default(),
+            backup_tablet_progress: Default::default(),
+            restores: Default::default(),
+            pitr_segments: Default::default(),
+            pitr_generation: Default::default(),
+            pitr_base_backups: Default::default(),
+            credentials: Default::default(),
+            exports: Default::default(),
+            imports: Default::default(),
+        }
+    }
+}
+
+/// The result of peeking a `serde_json` document's top-level `"v"` field
+/// before attempting a full [`Metadata`] decode — see [`Metadata::from_json`].
+#[derive(Deserialize)]
+struct MetadataVersionPeek {
+    #[serde(rename = "v")]
+    v: u32,
+}
+
+impl Metadata {
+    /// Decode untrusted `serde_json` bytes as a [`Metadata`] (ADR 0073 Phase
+    /// 0 workstream B): peeks the top-level `"v"` field first, distinguishing
+    /// three cases before ever attempting the full decode:
+    ///
+    /// - No `"v"` field at all (or the bytes don't even parse as a JSON
+    ///   object) → [`crate::format::FormatError::PreBaselineFormat`] — a
+    ///   pre-baseline `Metadata` blob (or garbage), which this build owes no
+    ///   compatibility.
+    /// - A `"v"` greater than [`METADATA_VERSION`] → [`crate::format::
+    ///   FormatError::UnsupportedFormatVersion`] — a future binary's format,
+    ///   read by an older one.
+    /// - A recognized `"v"` (currently only `1`, since [`METADATA_VERSION`]
+    ///   is `1`) → the full decode; a structurally malformed body at that
+    ///   point is [`crate::format::FormatError::Malformed`].
+    ///
+    /// **`found`/`max_supported` on [`crate::format::FormatError::
+    /// UnsupportedFormatVersion`] are `u8`, but this field is `u32`** (the
+    /// ADR's `serde_json` convention, sized to comfortably outlive this
+    /// format's whole lifetime) — a `"v"` that doesn't fit in a `u8` is
+    /// saturated into it (`u32::min(u8::MAX as u32, ..) as u8`) before being
+    /// reported; a version that large is already nonsensically far past
+    /// [`METADATA_VERSION`] to be a real future version, and the saturated
+    /// value is still strictly greater than `max_supported`, which is all
+    /// the caller needs to tell "unsupported" from "supported."
+    ///
+    /// A plain `serde_json::from_slice::<Metadata>(bytes)` is *more lenient*:
+    /// it defaults a missing `"v"` to 1 (for Metadata embedded in a tagged
+    /// envelope — see [`Metadata`]'s doc) and rejects an unknown `"v"` with
+    /// an untyped serde error. Use this method for any standalone document.
+    pub fn from_json(bytes: &[u8]) -> Result<Metadata, crate::format::FormatError> {
+        use crate::format::FormatError;
+
+        const FORMAT: &str = "metadata";
+
+        let peek: MetadataVersionPeek = match serde_json::from_slice(bytes) {
+            Ok(peek) => peek,
+            Err(_) => return Err(FormatError::PreBaselineFormat { format: FORMAT }),
+        };
+        if peek.v == 0 || peek.v > METADATA_VERSION {
+            let found = u8::try_from(peek.v).unwrap_or(u8::MAX);
+            let max_supported = u8::try_from(METADATA_VERSION).unwrap_or(u8::MAX);
+            return Err(FormatError::UnsupportedFormatVersion {
+                format: FORMAT,
+                found,
+                max_supported,
+            });
+        }
+        serde_json::from_slice(bytes).map_err(|e| FormatError::Malformed {
+            format: FORMAT,
+            detail: e.to_string(),
+        })
+    }
 }
 
 /// Gives [`Metadata::stream_shards`] a `serde_json`-safe wire shape — see
@@ -2177,31 +2318,10 @@ pub enum MetaCommand {
         rows: Vec<(TabletId, u64)>,
         remove: bool,
     },
-    /// Register (or update) a **CP group member's address** (Phase 2): the
-    /// `raftkv`-role listen address of member `id`, stored opaquely in
-    /// [`Metadata::cp_member_addrs`] and replicated so every node's peer-sync loop
-    /// can reach a runtime-created group member (a split sibling or a joined data
-    /// node). Idempotent: a no-op if `id` already maps to `addr` (with the same
-    /// tablet association).
-    ///
-    /// `tablet` (ADR 0024 GC, `#[serde(default)]` for older commands) associates
-    /// the member with the tablet whose group it serves, so the address is
-    /// **garbage-collected when that tablet leaves the map** (drop-table, merge)
-    /// instead of leaking forever. `Some(tablet)` is rejected while the tablet is
-    /// not in the map (the registrar's propose-and-await loop simply retries once
-    /// it lands — the same convergent discipline as the file GC); `None` (legacy)
-    /// registers an address that is never pruned.
-    RegisterCpAddr {
-        id: NodeId,
-        addr: String,
-        #[serde(default)]
-        tablet: Option<TabletId>,
-    },
     /// Update (or re-affirm) an **already-claimed** node's full address book
     /// (ADR 0032 PR1; tightened to update-only by ADR 0040 PR4): the
     /// client/admin/internal listen addresses of member `id`, stored in
-    /// [`Metadata::node_addrs`]. Superset of [`MetaCommand::RegisterCpAddr`]
-    /// for the client/admin axes — every already-established node proposes
+    /// [`Metadata::node_addrs`]. Every already-established node proposes
     /// this at startup (and whenever an address changes) so any other node
     /// (including one that joined earlier and never restarted) can resolve
     /// it as a forward/relay target.
@@ -2236,12 +2356,10 @@ pub enum MetaCommand {
     ///   the member gone from the placement candidate pool entirely, with no
     ///   repair path left (placement can only choose from `Active` members).
     ///
-    /// On success, `node` is pruned from `members` **and** its entries in
-    /// [`Metadata::node_addrs`]/[`Metadata::cp_member_addrs`]/
-    /// [`Metadata::cp_member_tablets`] are pruned in the same apply — mirroring
-    /// the existing ADR 0024 GC discipline for tablet-scoped `cp_member_addrs`
-    /// entries (keyed on current absence, so a replayed historical state can't
-    /// resurrect a removed member's addresses).
+    /// On success, `node` is pruned from `members` **and** its entry in
+    /// [`Metadata::node_addrs`] is pruned in the same apply (keyed on current
+    /// absence, so a replayed historical state can't resurrect a removed
+    /// member's addresses).
     ///
     /// **Removal is not a fence**: it only stops this node's own automatic
     /// self-registration from ever re-asserting it (that happens once, at
@@ -3787,9 +3905,6 @@ impl Metadata {
                 // in the live tablet map).
                 self.split_placing
                     .retain(|tablet, _| !dropped.contains(tablet));
-                // Reclaim the dropped tablets' CP member addresses (ADR 0024 GC —
-                // the address-book counterpart of the hosting nodes' file GC).
-                self.prune_cp_member_addrs();
                 ApplyOutcome::Applied
             }
             MetaCommand::CreateTableIndex { table, index } => {
@@ -4847,36 +4962,6 @@ impl Metadata {
                     ApplyOutcome::NoOp
                 }
             }
-            MetaCommand::RegisterCpAddr { id, addr, tablet } => {
-                // A tablet-scoped registration for a tablet not (yet or anymore)
-                // in the map is rejected: accepting it would either leak (the GC
-                // prunes on the recorded tablet's *current absence*, so it would
-                // be swept at the next removal anyway) or resurrect a dropped
-                // tablet's entry. The registrar's propose-and-await loop retries
-                // until its tablet lands, so a benign register-before-create race
-                // converges.
-                if let Some(t) = tablet
-                    && !self.tablets.contains_key(t)
-                {
-                    return ApplyOutcome::Rejected("no such tablet for cp addr");
-                }
-                if self.cp_member_addrs.get(id) == Some(addr)
-                    && self.cp_member_tablets.get(id) == tablet.as_ref()
-                {
-                    ApplyOutcome::NoOp
-                } else {
-                    self.cp_member_addrs.insert(id.clone(), addr.clone());
-                    match tablet {
-                        Some(t) => {
-                            self.cp_member_tablets.insert(id.clone(), *t);
-                        }
-                        None => {
-                            self.cp_member_tablets.remove(id);
-                        }
-                    }
-                    ApplyOutcome::Applied
-                }
-            }
             MetaCommand::RegisterNodeAddrs { node, addrs } => {
                 // ADR 0040 PR4: update-only — never claims a fresh id.
                 // `MetaCommand::RegisterNode` is the sole claim path now; a
@@ -4921,8 +5006,6 @@ impl Metadata {
                     // driver, or an admin action) must check it *before*
                     // ever proposing this command.
                     if self.node_addrs.remove(node).is_some() {
-                        self.cp_member_addrs.remove(node);
-                        self.cp_member_tablets.remove(node);
                         return ApplyOutcome::Applied;
                     }
                     return ApplyOutcome::NoOp;
@@ -4935,8 +5018,6 @@ impl Metadata {
                 }
                 self.members.remove(node);
                 self.node_addrs.remove(node);
-                self.cp_member_addrs.remove(node);
-                self.cp_member_tablets.remove(node);
                 ApplyOutcome::Applied
             }
             MetaCommand::RegisterNode {
@@ -5029,27 +5110,6 @@ impl Metadata {
                     }
                 }
             }
-        }
-    }
-
-    /// Drop every CP member-addr entry recorded against a tablet that is **no
-    /// longer in the map** (ADR 0024 — the address-book half of drop-table GC,
-    /// closing the designed `cp_member_addrs` leak). Called from the apply arm
-    /// that removes tablets (`DropTableTablets`); keyed purely on
-    /// current absence, so it is deterministic on every replica and **convergent
-    /// under replay**: a re-applied historical sequence re-registers and then
-    /// re-prunes in the same order, never leaving a resurrected entry. Members
-    /// registered without a tablet association (legacy) are untouched.
-    fn prune_cp_member_addrs(&mut self) {
-        let dead: Vec<NodeId> = self
-            .cp_member_tablets
-            .iter()
-            .filter(|(_, t)| !self.tablets.contains_key(t))
-            .map(|(id, _)| id.clone())
-            .collect();
-        for id in dead {
-            self.cp_member_tablets.remove(&id);
-            self.cp_member_addrs.remove(&id);
         }
     }
 
@@ -8407,57 +8467,9 @@ mod tests {
         );
     }
 
-    /// `RegisterCpAddr` records a CP member's address, updates on change, and is a
-    /// no-op when re-registering the same address (Phase 2 address distribution).
-    /// It applies in the deterministic state machine like every other `MetaCommand`,
-    /// so it replicates + recovers through Raft by construction.
-    #[test]
-    fn register_cp_addr_records_updates_and_is_idempotent() {
-        let mut m = Metadata::default();
-        let reg = |id, addr: &str| MetaCommand::RegisterCpAddr {
-            id,
-            addr: addr.to_owned(),
-            tablet: None,
-        };
-
-        // First registration applies and is readable.
-        assert_eq!(
-            m.apply(&reg(nid(301), "127.0.0.1:9001")),
-            ApplyOutcome::Applied
-        );
-        assert_eq!(
-            m.cp_member_addrs.get(&nid(301)).map(String::as_str),
-            Some("127.0.0.1:9001")
-        );
-
-        // Re-registering the same address is a no-op (so a periodic re-register
-        // does not churn the Raft log).
-        assert_eq!(
-            m.apply(&reg(nid(301), "127.0.0.1:9001")),
-            ApplyOutcome::NoOp
-        );
-
-        // A changed address updates the entry.
-        assert_eq!(
-            m.apply(&reg(nid(301), "127.0.0.1:9002")),
-            ApplyOutcome::Applied
-        );
-        assert_eq!(
-            m.cp_member_addrs.get(&nid(301)).map(String::as_str),
-            Some("127.0.0.1:9002")
-        );
-
-        // A distinct member coexists.
-        assert_eq!(
-            m.apply(&reg(nid(401), "127.0.0.1:9101")),
-            ApplyOutcome::Applied
-        );
-        assert_eq!(m.cp_member_addrs.len(), 2);
-    }
-
     /// `RegisterNodeAddrs` (ADR 0032 PR1) records a node's full address book,
     /// is idempotent on an identical re-register, and overwrites on a real
-    /// change — mirroring `RegisterCpAddr`'s own contract. **ADR 0040 PR4**:
+    /// change. **ADR 0040 PR4**:
     /// `RegisterNodeAddrs` is update-only now, so this pre-establishes each
     /// id's claim via `UpsertMember` first (standing in for a config-
     /// bootstrapped member) — `register_node_addrs_rejects_an_unclaimed_id`
@@ -8690,80 +8702,6 @@ mod tests {
             MetaCommand::CasTabletReplicas { tablet, replicas, .. }
                 if *tablet == TabletId(1) && replicas.len() == 3
         ));
-    }
-
-    /// ADR 0024 address GC: a tablet-scoped `RegisterCpAddr` entry is pruned from
-    /// both maps when its tablet leaves the map (`DropTableTablets`);
-    /// a registration for an absent tablet is rejected (the
-    /// registrar retries); legacy tablet-less entries are never pruned; and the
-    /// whole thing is **convergent under replay** — re-applying the same command
-    /// sequence to a fresh state machine reaches the identical pruned state, so a
-    /// replayed historical map state cannot permanently resurrect an entry.
-    #[test]
-    fn cp_member_addrs_are_pruned_when_their_tablet_leaves_the_map() {
-        let commands = vec![
-            MetaCommand::CreateTablet {
-                tablet: TabletId(1),
-                table: Some("users".to_owned()),
-                range: KeyRange::whole(),
-                replicas: vec![nid(1), nid(2), nid(3)],
-            },
-            // Tablet-scoped members of tablet 1.
-            MetaCommand::RegisterCpAddr {
-                id: nid(1301),
-                addr: "127.0.0.1:9301".to_owned(),
-                tablet: Some(TabletId(1)),
-            },
-            MetaCommand::RegisterCpAddr {
-                id: nid(1302),
-                addr: "127.0.0.1:9302".to_owned(),
-                tablet: Some(TabletId(1)),
-            },
-            // A legacy (tablet-less) member: never pruned.
-            MetaCommand::RegisterCpAddr {
-                id: nid(301),
-                addr: "127.0.0.1:9001".to_owned(),
-                tablet: None,
-            },
-            MetaCommand::DropTableTablets {
-                table: "users".to_owned(),
-            },
-        ];
-        let replay = |cmds: &[MetaCommand]| {
-            let mut m = Metadata::default();
-            for c in cmds {
-                m.apply(c);
-            }
-            m
-        };
-
-        let m = replay(&commands);
-        // The dropped tablet's members were reclaimed from BOTH maps…
-        assert!(!m.cp_member_addrs.contains_key(&nid(1301)));
-        assert!(!m.cp_member_addrs.contains_key(&nid(1302)));
-        assert!(m.cp_member_tablets.is_empty());
-        // …the legacy entry survives.
-        assert_eq!(
-            m.cp_member_addrs.get(&nid(301)).map(String::as_str),
-            Some("127.0.0.1:9001")
-        );
-
-        // Convergent under replay: a fresh replica applying the same log reaches
-        // the identical state (no resurrected entries).
-        assert_eq!(replay(&commands), m);
-
-        // A registration against the now-absent tablet is rejected, so it cannot
-        // resurrect the pruned entry after the drop replays.
-        let mut m = m;
-        assert_eq!(
-            m.apply(&MetaCommand::RegisterCpAddr {
-                id: nid(1301),
-                addr: "127.0.0.1:9301".to_owned(),
-                tablet: Some(TabletId(1)),
-            }),
-            ApplyOutcome::Rejected("no such tablet for cp addr")
-        );
-        assert!(!m.cp_member_addrs.contains_key(&nid(1301)));
     }
 
     /// ADR 0058 Train 2 rung 3: `BeginSplitInPlace`'s own fixture — one
@@ -10653,7 +10591,7 @@ mod tests {
     }
 
     /// A drained (`Leaving`/`Down`), unreferenced member is removed — and its
-    /// address-book entries are pruned in the same apply — and a second removal
+    /// address-book entry is pruned in the same apply — and a second removal
     /// of the same, now-absent id is an idempotent no-op (`Applied`), never a
     /// `Rejected`, so a proposer that retries after a timed-out confirm
     /// converges instead of erroring.
@@ -10676,11 +10614,6 @@ mod tests {
                     role: "combined".to_string(),
                 },
             });
-            m.apply(&MetaCommand::RegisterCpAddr {
-                id: nid(301),
-                addr: "127.0.0.1:9301".to_owned(),
-                tablet: None,
-            });
             assert_eq!(m.tablets_referencing(&nid(301)), 0);
 
             assert_eq!(
@@ -10690,8 +10623,6 @@ mod tests {
             );
             assert!(!m.members.contains_key(&nid(301)));
             assert!(!m.node_addrs.contains_key(&nid(301)));
-            assert!(!m.cp_member_addrs.contains_key(&nid(301)));
-            assert!(!m.cp_member_tablets.contains_key(&nid(301)));
 
             // Idempotent retry: already absent — `NoOp` (the file's convention
             // for nothing-changed applies), never `Rejected`.
@@ -10973,6 +10904,89 @@ mod tests {
         let value = serde_json::to_value(&m).expect("metadata serializes with stream_shards");
         let decoded: Metadata = serde_json::from_value(value).expect("metadata round-trips");
         assert_eq!(decoded, m);
+    }
+
+    /// ADR 0073 Phase 0 workstream B: [`Metadata`]'s own JSON shape carries a
+    /// required top-level `"v"` field, and a plain round trip through
+    /// `serde_json` includes it.
+    #[test]
+    fn metadata_round_trips_through_json_and_includes_the_v_field() {
+        let m = Metadata::default();
+        assert_eq!(m.version, METADATA_VERSION);
+
+        let value = serde_json::to_value(&m).expect("metadata serializes");
+        assert_eq!(
+            value.get("v"),
+            Some(&serde_json::Value::from(METADATA_VERSION)),
+            "the encoded document must carry the top-level \"v\" field"
+        );
+
+        let decoded: Metadata = serde_json::from_value(value).expect("metadata round-trips");
+        assert_eq!(decoded, m);
+
+        let bytes = serde_json::to_vec(&m).expect("metadata serializes to bytes");
+        let decoded = Metadata::from_json(&bytes).expect("from_json round-trips");
+        assert_eq!(decoded, m);
+    }
+
+    /// A `serde_json` document with no `"v"` field at all — the shape every
+    /// pre-baseline `Metadata` blob has — is a named, loud
+    /// [`crate::format::FormatError::PreBaselineFormat`] through
+    /// [`Metadata::from_json`], and an ordinary serde "missing field" error
+    /// through a plain `serde_json::from_slice`/`from_value` (never a
+    /// silent default).
+    #[test]
+    fn metadata_from_json_rejects_a_missing_v_field_as_pre_baseline() {
+        let mut value = serde_json::to_value(Metadata::default()).expect("serializes");
+        value
+            .as_object_mut()
+            .expect("metadata serializes as an object")
+            .remove("v");
+        let bytes = serde_json::to_vec(&value).expect("re-serializes");
+
+        assert_eq!(
+            Metadata::from_json(&bytes),
+            Err(crate::format::FormatError::PreBaselineFormat { format: "metadata" })
+        );
+
+        // A plain serde decode (no `from_json`) is lenient: an absent `"v"`
+        // means v1 (Metadata embedded in a tagged envelope — see
+        // [`Metadata`]'s doc; the frozen control-wal/v1.bin depends on it).
+        let decoded: Metadata = serde_json::from_slice(&bytes).expect("absent v defaults to 1");
+        assert_eq!(decoded.version, 1);
+        assert_eq!(decoded, Metadata::default());
+    }
+
+    /// A `"v"` newer than [`METADATA_VERSION`] this build knows is a named,
+    /// loud [`crate::format::FormatError::UnsupportedFormatVersion`] through
+    /// [`Metadata::from_json`] — never a silent misdecode.
+    #[test]
+    fn metadata_from_json_rejects_an_unsupported_future_v() {
+        let mut value = serde_json::to_value(Metadata::default()).expect("serializes");
+        value
+            .as_object_mut()
+            .expect("metadata serializes as an object")
+            .insert("v".to_owned(), serde_json::Value::from(2_u32));
+        let bytes = serde_json::to_vec(&value).expect("re-serializes");
+
+        assert_eq!(
+            Metadata::from_json(&bytes),
+            Err(crate::format::FormatError::UnsupportedFormatVersion {
+                format: "metadata",
+                found: 2,
+                max_supported: METADATA_VERSION as u8,
+            })
+        );
+
+        // Plain serde also rejects an unknown present `"v"` (untyped error).
+        serde_json::from_slice::<Metadata>(&bytes).expect_err("unknown v must not decode");
+        let zero = serde_json::to_vec(&{
+            let mut v = serde_json::to_value(Metadata::default()).unwrap();
+            v["v"] = serde_json::Value::from(0_u32);
+            v
+        })
+        .unwrap();
+        serde_json::from_slice::<Metadata>(&zero).expect_err("v=0 must not decode");
     }
 
     /// The identical hazard as

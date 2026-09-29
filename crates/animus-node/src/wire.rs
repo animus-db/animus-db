@@ -877,8 +877,7 @@ pub fn surface_of(request: &ClientRequest) -> Surface {
 
 /// Whether `command` may be **relayed to the control leader** via
 /// [`ClientRequest::ProposeSchema`]: the schema-catalog mutations (ADR 0013) that a
-/// wire client drives, plus [`MetaCommand::RegisterCpAddr`] (Phase 2.3a) — a node's
-/// own CP-address self-registration — plus [`MetaCommand::SplitTablet`] (D2), the
+/// wire client drives, plus [`MetaCommand::SplitTablet`] (D2), the
 /// metadata half of the admin split trigger (already client-exposed via
 /// [`ClientRequest::SplitTablet`], so relaying it adds no new authority — it lets the
 /// trigger reach the control leader cross-process when the split is driven from a
@@ -984,12 +983,11 @@ pub fn is_relayable_command(command: &MetaCommand) -> bool {
         // this function's own doc for why `ExpireStreamShards` is
         // deliberately NOT included here.
         | MetaCommand::SealStreamShard { .. }
-        | MetaCommand::RegisterCpAddr { .. }
         // Node address book (ADR 0032 PR1): every node self-registers its
         // full address set at startup, from whichever node it happens to
-        // connect to for control-plane proposals — must relay like
-        // `RegisterCpAddr` (a follower-connected node has no other way to
-        // reach the control leader).
+        // connect to for control-plane proposals — must relay (a
+        // follower-connected node has no other way to reach the control
+        // leader).
         | MetaCommand::RegisterNodeAddrs { .. }
         // In-place split workflow (ADR 0058 Train 2 rung 3): `trigger_split`
         // proposes `BeginSplitInPlace` from whichever node's admin/
@@ -1516,11 +1514,6 @@ mod tests {
                 seal_wall_ms: 0,
                 replicas: vec![],
                 object_id: "obj".to_string(),
-            },
-            MetaCommand::RegisterCpAddr {
-                id: nid(1),
-                addr: "127.0.0.1:1".to_string(),
-                tablet: None,
             },
             MetaCommand::RegisterNodeAddrs {
                 node: nid(1),

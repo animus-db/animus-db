@@ -456,3 +456,9 @@ listener binding), config-file resolution, and DNS-based seed addressing
 (`crates/animusd/tests/seed_join_hostname.rs`/`advertise_host.rs`, both
 untouched) — none of those are reachable from a `SimCluster`-based fixture,
 decommission or not.
+
+## 2026-09-28 (ADR 0073 Phase 0)
+
+`RegisterCpAddr`/`cp_member_addrs`/`EntityKind::CpMemberAddr` deleted — the
+WAL back-compat reason no longer holds after the Phase 0 reset —
+`node_addrs[*].internal` is the only address source.

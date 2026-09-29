@@ -596,10 +596,63 @@ next_offset: 0 }` to restart the transfer) unchanged, now just logged by
 name. Golden fixture: `tests/fixtures/formats/control-snapshot/v1.bin`,
 following `control-wal`'s established pattern in the same `tests/
 format_fixtures.rs`. See `crates/animus-control/CLAUDE.md`'s "Versioned
-formats" section for the full account. The row's remaining item —
-`Metadata`'s top-level `"v"` field + the `cp_member_addrs` legacy-field
-drop — is still a later PR in this same stacked series, not done yet as of
-this note.
+formats" section for the full account. The row's remaining items —
+the `cp_member_addrs` legacy-field drop (PR 3) and `Metadata`'s top-level
+`"v"` field (PR 4) — are later PRs in this same stacked series.
+
+**Workstream B as-built, PR 3 (legacy drop) and PR 4 (`Metadata`'s `"v"`
+field + the system-keyspace mirror's version row).** PR 3 removed the
+legacy CP-member address book (`Metadata::cp_member_addrs`/
+`cp_member_tablets`, `MetaCommand::RegisterCpAddr`,
+`syskv::EntityKind::CpMemberAddr`) outright, before any `Metadata` field
+was versioned, so the `Metadata` golden fixture never contains those keys.
+PR 4 landed `meta::METADATA_VERSION` (currently `1`) and `#[serde(rename =
+"v")] pub version: u32` on `Metadata`, plus `Metadata::from_json(bytes) ->
+Result<Metadata, format::FormatError>` as the named-error decode path for
+untrusted standalone documents. `Metadata`'s derived `Default` became a
+manual impl (every field but `version` still `Default::default()`;
+`version` is always `METADATA_VERSION`, never `0`).
+
+**Deviation from the "required, no default" wording above.** The `"v"` field
+*does* carry a serde default (`metadata_v1`, the literal `1`) and a
+validator that rejects a present `0`/`> METADATA_VERSION` for plain serde
+decoding. Why: pre-baseline detection is the *envelope's* job — the CWL1/CSN1
+magic already rejects untagged pre-baseline bytes — so a `Metadata` found
+inside a tagged v1 envelope is post-reset by construction, and v1 is the only
+`Metadata` schema that ever existed without the tag; an absent `"v"` there
+unambiguously means v1. It is also forced by the frozen
+`tests/fixtures/formats/control-wal/v1.bin`, which embeds a `Metadata`
+serialized before the field existed and may never be edited.
+`Metadata::from_json` stays **strict** (missing `"v"` is
+`PreBaselineFormat`, unknown is `UnsupportedFormatVersion`) for any bare
+`Metadata` document, e.g. the admin `Status` response.
+
+**The one surprise this work's investigation turned up, confirming the ADR's
+own "verify an inventory claim against the code" reminder from PR 1's note
+above**: `Metadata`'s own `"v"` field versions *less* than it looks like it
+should — `Metadata` is `DRIVER_APPLIED` (ADR 0038), so its own
+`Serialize`/`Deserialize` impl is never what actually reaches the real
+system-keyspace engine on the production path; a type's version field can
+only version storage that actually serializes the type. The mirror needed
+its **own** independent signal instead:
+`mirror::SYSKV_FORMAT_VERSION_COUNTER`/`mirror::SYSKV_MIRROR_VERSION`, an
+ordinary `EntityKind::Counter` row written unconditionally (idempotent) on
+every durable apply-task batch alongside the pre-existing `_applied_index`
+watermark, but excluded from the delta ring.
+`mirror::rebuild_metadata_from_engine` now returns `Result<Metadata,
+mirror::RebuildError>` (`Storage`/`Format` — a non-empty reserved keyspace
+missing the row is `FormatError::PreBaselineFormat { format:
+"syskv-mirror" }`, an unrecognized version is
+`FormatError::UnsupportedFormatVersion`, an empty keyspace is `Ok`); both
+real call sites (`node.rs`'s `meta_apply_seed` and
+`meta_apply_and_compact`'s post-`InstallSnapshot` rebuild) give a
+`RebuildError::Format` the established halt-not-panic treatment, while
+`RebuildError::Storage` keeps the pre-existing hard panic. No separate
+`syskv-mirror` golden fixture — that row is mirror-internal and unit-tested
+directly. Golden fixture: `tests/fixtures/formats/metadata/v1.json` (a
+`Metadata` built by applying real `MetaCommand`s). Lessons recorded under
+`docs/lessons/code-patterns/`. See `crates/animus-control/CLAUDE.md`'s
+"Versioned formats" section for the full account.
 
 ## Testing
 

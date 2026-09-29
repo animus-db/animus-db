@@ -46,30 +46,15 @@ async fn call(addr: SocketAddr, req: ClientRequest) -> ClientResponse {
         .expect("a reply")
 }
 
-/// `count` distinct free ephemeral addresses, allocated **simultaneously**.
-///
-/// Holding every listener until they are all bound is load-bearing twice over.
-/// It guarantees the addresses are *distinct* — allocating them one at a time
-/// releases each port before probing the next, so the OS is free to hand the
-/// same port back and a node would then be configured with (say) `internal ==
-/// client`. And it releases them in one instant rather than five, shrinking the
-/// documented port-TOCTOU window (see `support::free_addrs`, and the retry in
-/// [`start`] that rides out the rest of it).
-fn free_addrs(count: usize) -> Vec<SocketAddr> {
-    let listeners: Vec<std::net::TcpListener> = (0..count)
-        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
-        .collect();
-    listeners.iter().map(|l| l.local_addr().unwrap()).collect()
-    // listeners dropped here, freeing the ports for the caller to bind.
-}
-
+/// One reserved loopback address ([`support::reserve_addrs`], issue #1094) —
+/// for the scratch env below, which only needs a distinct address.
 fn free_addr() -> SocketAddr {
-    free_addrs(1)[0]
+    support::reserve_addrs(1)[0]
 }
 
 /// The five addresses a node's roles bind, allocated as one distinct set.
 fn role_addrs(id: NodeId) -> animusd::RoleAddrs {
-    let a = free_addrs(6);
+    let a = support::reserve_addrs(6);
     animusd::RoleAddrs {
         id,
         role: animusd::config::NodeRole::Control,
@@ -108,22 +93,21 @@ async fn start(addrs: animusd::RoleAddrs, dir: &std::path::Path) -> Node {
         dynamo_auth: None,
         cluster_settings: None,
     };
-    // Bounded rebind retry against the documented port-TOCTOU: another test
-    // binary's `free_addrs` probe can hold a just-freed port for microseconds,
-    // and this test cannot re-allocate around a thief — both call sites are
-    // pinned to the addresses captured up front, because *rebinding the same
-    // addresses is what the restart half is testing*. Same shape and reasoning
-    // as `support::restart_same_addrs`; this file predates that helper and
-    // carries its own control-only bring-up, which is how it missed the
-    // mitigation. A genuinely occupied port still fails at the deadline.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    // Every address in `addrs` is a `support::reserve_addrs` reservation held
+    // for this whole test process (issue #1094), so neither the first bring-up
+    // nor the same-address restart's rebind can lose a port to another
+    // process's `:0`/ephemeral allocation. The short retry below only rides out
+    // this same process's own just-shut-down listeners finishing their close;
+    // a port some *other* holder squats fails with an `ss` snapshot.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         match animusd::run_node_control(&config, 0, dir, animusd::StorageBackend::Lsm).await {
             Ok(node) => return node,
             Err(e) => {
                 assert!(
                     tokio::time::Instant::now() < deadline,
-                    "control-only node did not start/rebind within 30s: {e}"
+                    "control-only node did not start/rebind within 5s: {e}\n{}",
+                    support::port_holders(config.nodes[0].internal)
                 );
                 sleep(Duration::from_millis(50)).await;
             }

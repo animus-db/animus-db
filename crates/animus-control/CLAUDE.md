@@ -380,9 +380,10 @@ per-tablet CP data plane (`animus-cp-data`).
   here until its mirror behavior is a deliberate decision. It takes
   `&mut Metadata` (not just post-apply state) **because `DropTableTablets`'s
   derived deletions depend on identities gone by the time `apply`
-  returns** (its dropped-tablet-id set and its legacy `cp_member_addrs`
-  prune — the dual `MergeTablets` case this once also covered was removed
-  by ADR 0044) — diffing this way, rather than re-deriving the pruning
+  returns** (its dropped-tablet-id set — the dual `MergeTablets` case this
+  once also covered was removed by ADR 0044, and the legacy
+  `cp_member_addrs` prune this once also covered was removed by ADR 0073
+  Phase 0) — diffing this way, rather than re-deriving the pruning
   predicate a second time, avoids the "two places must agree on a gating
   rule" hazard this crate's engineering practices warn about.
 
@@ -476,8 +477,9 @@ define; grep before assuming a format lives in the crate that "owns" it.
 each `WalRecord<MetaCommand, Metadata>` variant, deterministic content only
 (fixed constants, `Metadata::default()` — see `tests/format_fixtures.rs`'s
 own module doc for why the embedded `Metadata` is deliberately minimal: a
-later PR in this same stack adds a required `"v"` field to `Metadata`'s
-JSON shape, and a checked-in fixture may never be edited once merged).
+later PR in this same stack adds a `"v"` field to `Metadata`'s JSON shape
+that serde-defaults to 1 when absent, so this frozen fixture still decodes —
+a checked-in fixture may never be edited once merged).
 `tests/format_fixtures.rs` has the decode/round-trip tests plus the
 `#[ignore]`d `generate_fixture_control_wal` generator (`cargo test -p
 animus-control --test format_fixtures generate_fixture_control_wal --
@@ -533,6 +535,111 @@ file, extended with `decodes_every_checked_in_control_snapshot_fixture_
 structurally`/`control_snapshot_round_trips_through_encode_and_decode`/the
 `#[ignore]`d `generate_fixture_control_snapshot` generator — same
 refuses-to-overwrite discipline as `control-wal`'s.
+
+**`Metadata`'s own top-level `"v": <u32>` field (ADR 0073 Phase 0 workstream
+B PR 4)** — the `serde_json` "Phase 0 conventions" shape (a plain field, not
+a `format::wrap`/`encode_line` envelope, since every real `Metadata` value
+is already a single top-level struct — see the ADR's Phase 0 conventions
+section for why this format group gets a different shape from `CWL1`/
+`CSN1`). `meta::METADATA_VERSION` (currently `1`) is both the value a fresh
+`Metadata` is constructed with (`Metadata::default`'s manual impl — no
+longer `#[derive(Default)]`, since `version` must always be the current
+constant, never `0`) and the highest a decoder accepts. `#[serde(rename =
+"v", default = "metadata_v1", deserialize_with = ..)] pub version: u32` —
+an absent `"v"` defaults to **1** under plain serde (see the control-wal
+paragraph below for why), and a present `0`/`> METADATA_VERSION` is rejected
+by the validator (untyped serde error). `Metadata::from_json(bytes)
+-> Result<Metadata, format::FormatError>` is the ADR-shaped decode path for
+untrusted bytes: it peeks `"v"` via a small internal struct first, so a
+missing field is `FormatError::PreBaselineFormat` and an unrecognized
+(`0` or `> METADATA_VERSION`) one is `FormatError::UnsupportedFormatVersion`
+(`found`/`max_supported` are `u8` on that variant — a `"v"` too large to fit
+saturates to `u8::MAX`, a version that large already being nonsensically far
+past what this build could support) — only a structurally malformed body
+past that point is `FormatError::Malformed`. **This versions `Metadata`'s
+JSON *shape* only** — see the very next paragraph for why the system-keyspace
+mirror (the real durable state, since `Metadata` is `DRIVER_APPLIED`, ADR
+0038) needed an entirely separate signal. The `animusd` DynamoDB-adjacent
+admin `Status` wire response happens to carry a `Metadata` value (and so
+picks up `"v"` for free through the same `Serialize` impl) but that is
+incidental — **wire versioning of the `Status`/admin surfaces themselves is
+Workstream D's scope, not this one's**; nothing here gates or interprets
+that field on the wire.
+
+**The system-keyspace mirror's own format-version row
+(`mirror::SYSKV_FORMAT_VERSION_COUNTER`, an `EntityKind::Counter` row named
+`"syskv_format_version"`, `mirror::SYSKV_MIRROR_VERSION = 1`)** — a
+*second*, independent version signal, and the reason is load-bearing, not
+redundant: since `Metadata` is `DRIVER_APPLIED` (ADR 0038), its own
+`Serialize`/`Deserialize` impl — and so its new `"v"` field — is **never**
+what actually reaches the real system-keyspace engine on the production
+path (only the WAL's always-meaningless `Metadata::default()` snapshot
+record, and the toy non-`DRIVER_APPLIED` test state machine, ever serialize
+a real `Metadata` value at all). A type's own version field can only version
+storage that actually serializes the type; this storage never does. See
+`docs/lessons/code-patterns/2026-09-28-a-types-own-version-field-does-not-
+version-storage-that-never-serializes-the-type.md` for the general lesson.
+`mirror::syskv_format_version_key()`/`mirror::put_syskv_format_version()`
+are written **unconditionally** (idempotent — the engine's per-key LWW makes
+a repeat write of the same value a no-op) on every durable apply-task batch,
+alongside the pre-existing `_applied_index` watermark
+(`node.rs`'s `meta_apply_and_compact`) — but is **excluded from the delta
+ring** (`delta_ring.rs`): it is mirror-internal bookkeeping, not part of
+`Metadata`, and a `WatchMetadata` consumer has no use for it.
+`mirror::rebuild_metadata_from_engine` now returns `Result<Metadata,
+mirror::RebuildError>` (`RebuildError::Storage(StorageError)` for a real
+backend fault; `RebuildError::Format(format::FormatError)` for the version
+row's own check) instead of a bare `Result<Metadata, StorageError>`: a
+**non-empty** reserved keyspace with no version row is
+`FormatError::PreBaselineFormat { format: "syskv-mirror" }` (every write the
+real apply task makes carries the row, so its absence means pre-baseline
+on-disk state); an unrecognized version is
+`FormatError::UnsupportedFormatVersion`; a genuinely **empty** keyspace
+(a brand-new node's first-ever boot) is `Ok` — nothing to check yet. The
+rebuilt `Metadata`'s own `version` field is always `METADATA_VERSION`
+regardless (this row never feeds back into it — `apply_put`'s
+`EntityKind::Counter` arm doesn't recognize this counter's name, so it's
+silently skipped during an ordinary rebuild scan, exactly like any other
+mirror-internal key would be). **Both of `rebuild_metadata_from_engine`'s
+two real call sites (`node.rs`'s `meta_apply_seed`, the apply task's
+one-time startup seed, and `meta_apply_and_compact`'s post-`InstallSnapshot`
+rebuild) give a `RebuildError::Format` the established halt-not-panic
+treatment** (log the named error at `error`, `halted.store(true, SeqCst)`,
+return without advancing anything) — the identical discipline
+`install_syskv_image`'s own decode-failure branch already established two
+PRs up this same stack; a `RebuildError::Storage` at either site keeps the
+pre-existing hard panic (a real backend fault this early means the engine
+itself is unusable, not a format problem). **No separate `syskv-mirror`
+golden fixture exists** — this row is mirror-internal bookkeeping that never
+rides a `Metadata` value at all, and it already has direct unit-test
+coverage in `mirror.rs`'s own test module (`rebuild_from_engine_is_ok_on_a_
+genuinely_empty_engine`/`rebuild_from_engine_rejects_a_populated_keyspace_
+missing_the_version_row`/`rebuild_from_engine_rejects_an_unsupported_
+future_version_row`); the pre-existing `control-snapshot` fixture already
+covers a real system-keyspace image's on-the-wire bytes structurally, which
+is as close as this mirror-internal row gets to a fixture of its own.
+
+**Golden fixture**: `tests/fixtures/formats/metadata/v1.json` — a small,
+deterministic `Metadata` built by *applying real `MetaCommand`s* through
+`Metadata::apply` (two members, a tablet with a placement policy, and a
+table schema — never hand-constructed field-by-field, which could silently
+drift from what `apply` actually produces), fixed constants only. Same
+`tests/format_fixtures.rs` file, extended with
+`decodes_every_checked_in_metadata_fixture_structurally`/
+`metadata_round_trips_through_encode_and_decode`/
+`metadata_fixture_carries_the_v_field`/the `#[ignore]`d
+`generate_fixture_metadata` generator — same refuses-to-overwrite discipline
+as `control-wal`'s/`control-snapshot`'s.
+
+**`control-wal/v1.bin` stays valid (frozen) via `Metadata`'s `"v"` serde
+default.** That fixture embeds a `WalRecord::Snapshot { metadata:
+Metadata::default(), .. }` serialized before `"v"` existed; a checked-in
+fixture is never edited, so plain serde decoding defaults an absent `"v"` to
+1 (`meta::metadata_v1`). Sound because pre-baseline detection is the
+envelope's job (CWL1/CSN1 magic), a `Metadata` inside a tagged v1 envelope is
+post-reset by construction, and v1 is the only untagged `Metadata` schema
+that ever existed. **Lesson: a fixture that embeds a nested versioned type
+freezes that type's absent-field semantics once merged.**
 
 ## Key invariants
 
@@ -1663,6 +1770,35 @@ refuses-to-overwrite discipline as `control-wal`'s.
     must emulate the driver's snapshot-image build for the `DRIVER_APPLIED`
     `Metadata`, or a snapshot path silently sends nothing and a
     "no snapshot" assertion passes vacuously).
+
+- **A declined `InstallSnapshot` offer must resolve on the leader
+  (`handle_install_snapshot_resp`, found live 2026-09-29, pre-existing).**
+  A receiver that refuses an offer as redundant replies `last_index: 0,
+  next_offset: 0` on purpose (never the shape of a completed install, PR
+  #1048), and *nothing on the leader used to act on it*: `next_index` — reset
+  to 1 by a `needs_snapshot` echo whose `snapshot_served_through` lagged a
+  base that had since moved — stayed at 1, so the leader re-offered chunk 0
+  on every heartbeat forever, the reply handler's `snapshot_offset.entry(..)
+  .or_insert(0)` left a phantom in-flight entry (which the driver reads as
+  "defer compaction", then counts a `CpSnapshotTransferRestarts` every
+  `COMPACT_DEFER_IDLE_CEILING` at zero write rate), and the follower got no
+  entries. The fix keys on the unambiguous shape: `(0, 0)` answering a chunk
+  at **offset 0** (an accepting receiver always buffers it and reports
+  `next_offset > 0`; a receiver that lost its buffer only ever reports `0` to
+  a chunk at a *nonzero* offset) means the receiver holds state through the
+  offer's base (`snapshot_offer_base`, written at each send), so
+  `match_index`/`next_index`/`snapshot_served_through` advance to it and the
+  transfer is forgotten. Two gotchas: (1) the sender may resend the offset-0
+  chunk up to `SNAPSHOT_ACK_RESEND_CAP` times before its first ack, so a
+  *duplicate* refusal arrives after the first was handled — it must not
+  re-create the phantom entry (the second guard); (2) a bare-core test needs
+  its message delivery to take **a tick per hop**, not run to a fixpoint —
+  with `needs_snapshot` set, a leader's `AppendEntries` and the follower's
+  acks legitimately ping-pong at RTT rate while its engine digests, which a
+  recursive pump reads as a storm. Regression:
+  `tests/declined_snapshot_offer.rs` (red without the fix on every seed;
+  note the absent third voter is *legitimately* re-offered a snapshot
+  forever, so count only offers to the live peer).
 
 - **Leadership transfer (`RaftCore::transfer_leadership`, ADR 0029).**
   Originally a per-tablet CP-data primitive living here because the sync

@@ -206,9 +206,10 @@ struct Inner {
     failed_error: Option<String>,
     /// The segment number currently being appended to.
     active_seg: u64,
-    /// Bytes the leader has appended to the active segment so far (drives
-    /// rotation). Counts bytes handed to `append`, so it advances as batches are
-    /// written, not only once they sync.
+    /// Bytes in the active segment so far (drives rotation): its post-repair
+    /// on-disk length at open (see [`GroupCommit::new`]) plus every byte the
+    /// leader has since handed to `append`, so it advances as batches are
+    /// written, not only once they sync. Resets to 0 on rotation.
     active_seg_bytes: u64,
     /// Sealed (no-longer-active) segments: segment number → the highest `wal_seq`
     /// that segment contains. `BTreeMap` for deterministic iteration. The active
@@ -234,14 +235,21 @@ impl GroupCommit {
     /// it until it crosses `seg_threshold`); the rest are sealed. `live_segments`
     /// empty means a fresh engine — the first write opens segment 0.
     ///
-    /// `active_seg_len == 0` means the active segment has no durable bytes at
-    /// all yet (a brand-new engine, or a recovered segment whose header was
-    /// itself torn and got repaired back to empty — see `LsmEngine::
-    /// open_with_metrics`), so its first batch here must carry a fresh
-    /// header; any nonzero length can only exist because a prior
-    /// header-carrying `append` already landed on this exact file (every
-    /// segment ever discovered by recovery got that way through this same
-    /// coordinator's own writes), so the header must not be written again.
+    /// `active_seg_len` is the reopened active segment's byte length on disk
+    /// **after** recovery's torn-tail/torn-header repair (0 for a fresh
+    /// engine). It drives two things:
+    ///
+    /// - **The rotation counter.** It seeds `active_seg_bytes`, so a segment
+    ///   that already holds bytes rotates at `seg_threshold` in total, not
+    ///   `seg_threshold` more bytes after each reopen.
+    /// - **The file header.** `0` means the active segment has no durable bytes
+    ///   at all yet (a brand-new engine, or a recovered segment whose header was
+    ///   itself torn and got repaired back to empty — see `LsmEngine::
+    ///   open_with_metrics`), so its first batch here must carry a fresh
+    ///   header; any nonzero length can only exist because a prior
+    ///   header-carrying `append` already landed on this exact file (every
+    ///   segment ever discovered by recovery got that way through this same
+    ///   coordinator's own writes), so the header must not be written again.
     pub(super) fn new(
         prefix: String,
         live_segments: &[u64],
@@ -275,7 +283,11 @@ impl GroupCommit {
                 failed_through: 0,
                 failed_error: None,
                 active_seg,
-                active_seg_bytes: 0,
+                active_seg_bytes: if live_segments.is_empty() {
+                    0
+                } else {
+                    active_seg_len
+                },
                 sealed,
                 active_seg_needs_header: active_seg_len == 0,
             }),

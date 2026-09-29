@@ -1134,6 +1134,15 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     // wholesale on `snapshot_upto` invalidation (a moved base makes any
     // prior offset meaningless), and on a fresh leadership term.
     snapshot_chunk_sent: BTreeMap<NodeId, (u64, u32)>,
+    // Per-peer `snapshot_index` (the base) the most recent `InstallSnapshot`
+    // chunk to that peer was built at — written at every send
+    // (`snapshot_chunk_for`), read only by `handle_install_snapshot_resp`'s
+    // *declined offer* branch (a receiver that answers the very first chunk
+    // of an offer with "nothing buffered" already holds state through this
+    // base). Deliberately not cleared alongside `snapshot_chunk_sent`: it is
+    // only ever read while that map still has the peer, and every send that
+    // repopulates that map overwrites this too.
+    snapshot_offer_base: BTreeMap<NodeId, u64>,
     // Per-peer `(offset, attempts)` for `SnapshotResend::Backoff`'s own
     // exponential-thinning schedule (the heartbeat tick's policy — see that
     // variant's own doc). Deliberately a SEPARATE counter from
@@ -1482,6 +1491,7 @@ where
             snapshot_offset: BTreeMap::new(),
             snapshot_offset_regressions: BTreeMap::new(),
             snapshot_chunk_sent: BTreeMap::new(),
+            snapshot_offer_base: BTreeMap::new(),
             snapshot_heartbeat_attempts: BTreeMap::new(),
             snapshot_chunk_advances: BTreeMap::new(),
             incoming_snapshot: None,
@@ -4504,6 +4514,77 @@ where
             }
             return Vec::new();
         }
+        // **A declined offer** (found live, 2026-09-29, `--cluster-control 3
+        // --cluster-data 5` under bulk seeding: a stuck group re-offering the
+        // same image every couple of seconds forever, at ZERO write rate,
+        // counted as `CpSnapshotTransferRestarts` each time). A receiver that
+        // is handed the very FIRST chunk of an offer (offset 0, non-empty
+        // data) always buffers it and reports `next_offset > 0` — unless it
+        // refused the offer as redundant (`handle_install_snapshot`'s
+        // "already at least this far along" short-circuit, which replies
+        // `last_index: 0, next_offset: 0` on purpose so it is never mistaken
+        // for a completed install). So `(0, 0)` answering an offset-0 chunk
+        // is an unambiguous "I already hold state through your offer's base".
+        // (A restarted receiver that LOST a mid-transfer buffer reports the
+        // same `(0, 0)` but only ever to a chunk at a *nonzero* offset — the
+        // `next_offset == 0 && tracked > 0` case below — never to offset 0.)
+        //
+        // Before this branch nothing advanced this peer's `next_index`: the only way an
+        // offer reaches a peer that is already past its base is a
+        // `needs_snapshot` echo (`handle_append_resp`) that reset
+        // `next_index` to 1 while `snapshot_served_through` lagged a base
+        // that had since moved — and every later ack was a chunk reply,
+        // never an `AppendEntriesResp`, so nothing ever re-advanced it: the
+        // leader re-offered forever, the phantom `snapshot_offset` entry the
+        // fallthrough below inserts kept `snapshot_transfer_in_flight` true,
+        // the idle-ceiling then counted a "restart" every
+        // `COMPACT_DEFER_IDLE_CEILING`, and the group could never quiesce.
+        // The refusal says the receiver holds state at least through the offer's
+        // base, so the offer — and the `next_index = 1` that provoked it — is
+        // wrong for this peer: forget the transfer and resume ordinary
+        // replication by PROBING with an `AppendEntries` from just above our
+        // own base. Deliberately no inference about `match_index` from the
+        // refusal (an inflated `match_index` could let `maybe_advance_commit`
+        // count an entry the peer does not hold, and the offer's base may be
+        // older than our current one if the base moved after it was sent): the
+        // probe's reply decides — success advances `match_index` honestly, a
+        // reject lowers `next_index` back into the snapshot region and a fresh
+        // offer at the CURRENT base follows, which a peer that genuinely lacks
+        // that base then accepts. The base counts as served so a stale
+        // `needs_snapshot` echo for it cannot re-arm the offer.
+        if next_offset == 0
+            && self.snapshot_chunk_sent.get(&from).map(|&(o, _)| o) == Some(0)
+            && let Some(base) = self.snapshot_offer_base.get(&from).copied()
+        {
+            self.forget_snapshot_transfer(&from);
+            self.snapshot_offer_base.remove(&from);
+            let served = self
+                .snapshot_served_through
+                .entry(from.clone())
+                .or_insert(0);
+            *served = (*served).max(base);
+            let resume = self.snapshot_index + 1;
+            let n = self.next_index.entry(from.clone()).or_insert(1);
+            *n = (*n).max(resume);
+            if self.next_index.get(&from).copied().unwrap_or(1) <= self.last_log_index() {
+                return self
+                    .replicate_to(from, SnapshotResend::Always)
+                    .into_iter()
+                    .collect();
+            }
+            return Vec::new();
+        }
+        // A duplicate `(0, 0)` decline arriving after the branch above already
+        // resolved the offer (an offset-0 chunk is resent up to
+        // `SNAPSHOT_ACK_RESEND_CAP` times before its first ack): no transfer
+        // is outstanding, so it must not re-create the phantom
+        // `snapshot_offset` entry the fallthrough below would insert.
+        if next_offset == 0
+            && !self.snapshot_offset.contains_key(&from)
+            && !self.snapshot_chunk_sent.contains_key(&from)
+        {
+            return Vec::new();
+        }
         // Still mid-transfer: record progress and ship the next chunk.
         //
         // **Monotonic guard, found building this fix.** A follower acks
@@ -5756,6 +5837,8 @@ where
         let done = end as u64 == total;
         self.snapshot_chunk_sent
             .insert(peer.clone(), (offset, resends_so_far.saturating_add(1)));
+        self.snapshot_offer_base
+            .insert(peer.clone(), self.snapshot_index);
         Some((
             peer,
             RaftMsg::InstallSnapshot {

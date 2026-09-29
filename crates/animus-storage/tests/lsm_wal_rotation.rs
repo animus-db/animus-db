@@ -189,6 +189,56 @@ fn recovery_replays_all_live_segments() {
     });
 }
 
+/// Repeated reopen must not let one WAL segment outgrow `wal_segment_bytes`:
+/// the rotation counter (`active_seg_bytes`) has to be re-seeded from the
+/// reopened active segment's real on-disk length. Before the fix it restarted at
+/// 0 on every open, so a workload that restarts between small writes never
+/// rotated and one segment grew without bound (delaying WAL GC).
+#[test]
+fn reopen_reseeds_active_segment_bytes() {
+    let seed = 0x4E0_5EED;
+    let sim = Simulator::new(seed);
+    let no_flush = LsmOptions {
+        flush_threshold_bytes: 1 << 20,
+        ..opts()
+    };
+    let threshold = no_flush.wal_segment_bytes;
+    let cycles = 30u64;
+    let mut max_record = 0u64;
+    for i in 0..cycles {
+        let e = block_on(LsmEngine::open_with(sim.env(nid(0)), PREFIX, no_flush)).expect("open");
+        block_on(async {
+            let before: u64 = e.wal_segment_sizes().await.iter().map(|&(_, s)| s).sum();
+            let k = format!("key-{i:04}");
+            e.merge(k.as_bytes(), b"some-value-bytes", i + 1)
+                .await
+                .unwrap();
+            let after: u64 = e.wal_segment_sizes().await.iter().map(|&(_, s)| s).sum();
+            max_record = max_record.max(after - before);
+        });
+    }
+    let e = block_on(LsmEngine::open_with(sim.env(nid(0)), PREFIX, no_flush)).expect("open");
+    let sizes = block_on(e.wal_segment_sizes());
+    let biggest = sizes.iter().map(|&(_, s)| s).max().unwrap();
+    // A segment may overshoot by at most the one batch that crossed the threshold.
+    assert!(
+        biggest < threshold + max_record,
+        "seed={seed}: a WAL segment grew to {biggest} bytes (threshold {threshold}, \
+         record {max_record}) across {cycles} reopens; sizes={sizes:?}",
+    );
+    assert!(
+        sizes.len() >= 3,
+        "seed={seed}: expected rotation across reopens, sizes={sizes:?}",
+    );
+    // Nothing lost.
+    block_on(async {
+        for i in 0..cycles {
+            let k = format!("key-{i:04}");
+            assert!(e.get(k.as_bytes()).await.unwrap().is_some(), "seed={seed}");
+        }
+    });
+}
+
 /// A crash *mid-rotation* — writes filling a fresh segment that has been created
 /// but whose containing flush/manifest swap hasn't happened — recovers correctly:
 /// every acked write survives, including those in the newest (not-yet-manifest)

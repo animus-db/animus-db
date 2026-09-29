@@ -503,6 +503,33 @@ the production implementation; the deterministic implementation lives in
   polls `AbortHandle::is_finished()` (bounded) before returning.
   `animusd::Node::shutdown_graceful` uses the `Node`-level dual
   (`shutdown_and_wait`) for exactly this reason.
+- **`Inner::tasks` is pruned, not append-only (the ProdEnv task-handle-leak
+  fix)** — a `tokio::task::AbortHandle` pins its task's `Cell` in the tokio
+  runtime for as long as the handle lives, so before this fix, nothing but
+  `shutdown`/`shutdown_and_wait`'s own `mem::take` of the whole vec ever
+  shrank `tasks`: a *finished* task's handle sat there forever. That was
+  harmless while `spawn` was only ever called from long-lived per-node
+  driver loops, but `Network::send_stream`'s issue #661 fix spawns one
+  connect+write task per **outbound frame** — every heartbeat, every
+  `AppendEntries` — so on a long-lived node under load this vec (and the
+  task `Cell`s it pinned) grew without bound. heaptrack of a live
+  `animusd --cluster-control 3 --cluster-data 5` cluster under bulk-seed +
+  `PutItem` load found ~94 MB of a 254 MB RSS peak in exactly these
+  leaked cells — the dominant contributor to the node's ~200 MB/min RSS
+  growth. `Spawner::spawn` now amortizes a `retain(|h| !h.is_finished())`
+  sweep once `tasks`'s length reaches a high-water mark
+  (`TASK_PRUNE_FLOOR`, doubling from the post-sweep live count each time),
+  bounding it to roughly 2x the genuinely live task count at O(1)
+  amortized cost per spawn — `shutdown`/`shutdown_and_wait`'s own
+  semantics are completely unchanged, since a pruned entry was already
+  finished and had nothing left to abort or wait for. Also set as
+  `Metric::SpawnedTaskHandlesTracked` (a level, ADR 0015) on every spawn.
+  See `docs/lessons/code-patterns/` for the general shape of this bug:
+  "register every spawned handle so shutdown can abort it" is itself an
+  unbounded per-spawn leak the moment `spawn` sits on a per-message path,
+  not just a per-driver-loop one. Regression:
+  `spawn_prunes_finished_handles_and_stays_bounded`/
+  `shutdown_still_aborts_a_long_running_task_after_pruning` (`prod::tests`).
 - **A panic inside a task spawned through `Spawner::spawn`/`EnvExt::
   spawn_task` is counted on the env it was spawned from (issue #939).**
   `spawn` only ever kept the task's `AbortHandle` (needed for `shutdown`),

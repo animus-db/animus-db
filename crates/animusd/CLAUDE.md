@@ -11762,3 +11762,5 @@ lib.rs`) carries the conversions themselves, additive only (one new
 See ADR 0061's "Rung O (post-C-14)" amendment for the full grep-verified
 ground truth (including the D4-PR-2 count-drift account) and
 `docs/roadmap.md`'s C-15 entry.
+
+- **Same-address restart tests reserve their ports (issue #1094).** `tests/support`'s `free_addrs`/`reserve_addrs` (and the `start_single_node`/`bring_up_deadline` helpers) hold a non-listening `SO_REUSEADDR` socket per port for the whole test process, so a node can still bind atop it but nobody else's `:0`/ephemeral allocation can take the port in the shutdown-to-rebind gap. Never hand-roll a bind-`:0`-drop probe in a restart test; use `support::reserve_addrs` and attach `support::port_holders` to rebind panics. `tests/port_reservation.rs` is the regression. See `docs/lessons/testing/2026-09-29-hold-a-reservation-socket-across-a-same-address-restart-the-node-binds-its-own-listeners.md`.

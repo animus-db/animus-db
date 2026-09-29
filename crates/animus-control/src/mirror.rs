@@ -29,19 +29,13 @@
 //!   tablet ids it just removed is computed internally
 //!   (`Metadata::tablets_for_table`) from state that is gone by the time
 //!   `apply` returns.
-//! - [`MetaCommand::DropTableTablets`] also prunes the
-//!   legacy `Metadata::cp_member_addrs`/`cp_member_tablets` address book
-//!   (`Metadata::prune_cp_member_addrs`) for any CP member registered against
-//!   a tablet that just left the map — again, only knowable by comparing
-//!   against what existed *before*.
 //!
 //! Rather than duplicate `Metadata::apply`'s internal pruning logic a second
 //! time here (a correctness hazard if the two ever drift — the exact
 //! "grep every gating match site" class of bug this crate's `CLAUDE.md`
 //! flags), [`apply_and_derive_mirror`] takes `&mut Metadata` and captures the
 //! small, targeted slice of pre-apply state each command's derivation
-//! actually needs (the table's current tablet ids; a clone of
-//! `cp_member_tablets`, bounded by "one entry per CP member ever registered")
+//! actually needs (the table's current tablet ids)
 //! **before** calling the real, unchanged `Metadata::apply`, then derives
 //! writes by diffing against the post-apply result. This is a deliberate,
 //! documented deviation from a post-state-only signature — see the PR2 report
@@ -49,21 +43,22 @@
 //!
 //! ## Full fidelity, not a partial mirror
 //!
-//! Every [`MetaCommand`] variant is mirrored, including the legacy
-//! `RegisterCpAddr` and the monotonic tablet-id-allocator counter
-//! (`next_tablet_id`) — none of these were in PR1's [`EntityKind`] set, so
-//! this module's own PR2 changes to `syskv.rs` added
-//! [`syskv::EntityKind::Counter`]/[`syskv::EntityKind::CpMemberAddr`] (a
-//! third PR2 variant, `NodeIdAlloc`, mirrored the ADR 0036 allocator's
-//! idempotency ledger — removed in ADR 0040 PR4 along with the allocator;
-//! `MetaCommand::RegisterNode`'s claim lives entirely in the already-mirrored
-//! `Member`/`NodeAddrs` kinds, no separate ledger needed). The payoff:
-//! [`rebuild_metadata_from_engine`] produces a `Metadata` that is
-//! `PartialEq`-identical to the real in-core one, not "identical modulo a
-//! documented gap" — which is exactly what the differential-oracle test
-//! asserts.
+//! Every [`MetaCommand`] variant is mirrored, including the monotonic
+//! tablet-id-allocator counter (`next_tablet_id`) — none of these were in
+//! PR1's [`EntityKind`] set, so this module's own PR2 changes to `syskv.rs`
+//! added [`syskv::EntityKind::Counter`] (a second PR2 variant, `NodeIdAlloc`,
+//! mirrored the ADR 0036 allocator's idempotency ledger — removed in ADR 0040
+//! PR4 along with the allocator; `MetaCommand::RegisterNode`'s claim lives
+//! entirely in the already-mirrored `Member`/`NodeAddrs` kinds, no separate
+//! ledger needed; a third, `CpMemberAddr`, mirrored the legacy CP-member
+//! address book — removed 2026-09-28 in ADR 0073 Phase 0 along with
+//! `MetaCommand::RegisterCpAddr` and `Metadata::cp_member_addrs`/
+//! `cp_member_tablets`). The payoff: [`rebuild_metadata_from_engine`]
+//! produces a `Metadata` that is `PartialEq`-identical to the real in-core
+//! one, not "identical modulo a documented gap" — which is exactly what the
+//! differential-oracle test asserts.
 
-use std::collections::BTreeMap;
+use std::fmt;
 
 use animus_env::NodeId;
 #[cfg(test)]
@@ -73,6 +68,7 @@ use animus_storage::{StorageEngine, StorageError};
 use animus_tablet::{Tablet, TabletId};
 use serde::{Deserialize, Serialize};
 
+use crate::format::FormatError;
 use crate::meta::{ApplyOutcome, Member, MetaCommand, Metadata, NodeAddrs};
 use crate::schema::TableSchema;
 use crate::syskv::{self, DecodedKey, EntityKind};
@@ -82,6 +78,54 @@ use crate::syskv::{self, DecodedKey, EntityKind};
 /// own sibling counter (`NEXT_ALLOC_ID_COUNTER`) was removed in ADR 0040 PR4
 /// along with the allocator itself.
 pub const NEXT_TABLET_ID_COUNTER: &str = "next_tablet_id";
+
+/// The counter name for the system-keyspace mirror's own on-disk format
+/// version (ADR 0073 Phase 0 workstream B), under [`EntityKind::Counter`]
+/// (`syskv::counter_key`) exactly like [`NEXT_TABLET_ID_COUNTER`] — this is
+/// a real system-keyspace row, not a made-up name, but a **mirror-internal**
+/// one: it versions the *engine layout* (which `EntityKind`s exist, how they
+/// encode), never `Metadata` itself.
+///
+/// **Why the mirror needs its own version signal, separate from
+/// `Metadata::version`**: `Metadata` is `DRIVER_APPLIED` (ADR 0038) — the
+/// real durable state lives entirely in this system-keyspace engine, and
+/// `Metadata`'s own `Serialize`/`Deserialize` impl (and so its `"v"` field)
+/// is **never** what actually reaches disk on the real path (only the WAL's
+/// always-meaningless `Metadata::default()` snapshot record and the toy
+/// non-`DRIVER_APPLIED` test state machine ever serialize a real `Metadata`
+/// value at all — see `persist.rs`'s doc). A type's own version field can
+/// only version storage that actually serializes the type; this storage
+/// never does, so it needed an independent row. See
+/// `docs/lessons/code-patterns/2026-09-28-a-types-own-version-field-does-not-version-storage-that-never-serializes-the-type.md`
+/// for the general lesson.
+pub const SYSKV_FORMAT_VERSION_COUNTER: &str = "syskv_format_version";
+
+/// The current system-keyspace mirror layout version an apply task built
+/// from this source writes, and the highest a
+/// [`rebuild_metadata_from_engine`] built from this source accepts. Restarted
+/// at `1` by the Phase 0 baseline reset, like [`crate::meta::METADATA_VERSION`]
+/// — there is no pre-Phase-0 mirror version to preserve continuity with.
+pub const SYSKV_MIRROR_VERSION: u32 = 1;
+
+/// The [`SYSKV_FORMAT_VERSION_COUNTER`] row's key under [`EntityKind::Counter`].
+#[must_use]
+pub fn syskv_format_version_key() -> Vec<u8> {
+    syskv::counter_key(SYSKV_FORMAT_VERSION_COUNTER)
+}
+
+/// A [`KeyWrite::Put`] of [`SYSKV_MIRROR_VERSION`] at
+/// [`syskv_format_version_key`] — the same big-endian `u64` encoding
+/// [`put_counter`] uses (the version rides as a `u32` in memory, matching
+/// [`crate::meta::METADATA_VERSION`]'s own type, but is written the
+/// identical 8-byte width every other counter in this keyspace already
+/// uses, rather than inventing a second numeric width for one row).
+#[must_use]
+pub fn put_syskv_format_version() -> KeyWrite {
+    put_counter(
+        SYSKV_FORMAT_VERSION_COUNTER,
+        u64::from(SYSKV_MIRROR_VERSION),
+    )
+}
 
 /// One system-keyspace mutation an applied [`MetaCommand`] implies. The
 /// mirror loop (`node.rs`) translates these into per-key-LWW
@@ -102,19 +146,6 @@ pub enum KeyWrite {
     Put(Vec<u8>, Vec<u8>),
     /// Tombstone `key`.
     Delete(Vec<u8>),
-}
-
-/// The legacy CP-member address registration
-/// (`Metadata::cp_member_addrs`/`cp_member_tablets`, `MetaCommand::RegisterCpAddr`)
-/// mirrored as one value under [`EntityKind::CpMemberAddr`] — the two source
-/// maps share a key (`NodeId`) but not necessarily a domain (`tablet` may be
-/// absent from `cp_member_tablets` while present in `cp_member_addrs`), so
-/// they're combined into one record rather than mirrored as two keys that
-/// could disagree on presence.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct CpMemberAddrEntry {
-    addr: String,
-    tablet: Option<TabletId>,
 }
 
 /// Apply `command` to `meta` — delegating to the real, unchanged
@@ -139,10 +170,6 @@ pub fn apply_and_derive_mirror(
             meta.tablets_for_table(table).map(|(&id, _)| id).collect()
         }
         _ => Vec::new(),
-    };
-    let pre_cp_member_tablets: BTreeMap<NodeId, TabletId> = match command {
-        MetaCommand::DropTableTablets { .. } => meta.cp_member_tablets.clone(),
-        _ => BTreeMap::new(),
     };
     // ADR 0045: `DropTableTablets`/`DropTableIndex` both prune
     // `Metadata::index_backfill` rows as a side effect of their own apply —
@@ -300,9 +327,6 @@ pub fn apply_and_derive_mirror(
             for tablet in &pruned_split_placing {
                 writes.push(KeyWrite::Delete(syskv::split_placing_key(*tablet)));
             }
-            for id in dead_cp_member_ids(&pre_cp_member_tablets, meta) {
-                writes.push(KeyWrite::Delete(syskv::cp_member_addr_key(&id)));
-            }
         }
         MetaCommand::DropTableIndex { table, .. } => {
             if let Some(schema) = meta.schemas.get(table) {
@@ -365,20 +389,12 @@ pub fn apply_and_derive_mirror(
                 &meta.split_placing[tablet],
             ));
         }
-        MetaCommand::RegisterCpAddr { id, addr, tablet } => {
-            let entry = CpMemberAddrEntry {
-                addr: addr.clone(),
-                tablet: *tablet,
-            };
-            writes.push(put_json(syskv::cp_member_addr_key(id), &entry));
-        }
         MetaCommand::RegisterNodeAddrs { node, addrs } => {
             writes.push(put_json(syskv::node_addrs_key(node), addrs));
         }
         MetaCommand::RemoveMember { node } => {
             writes.push(KeyWrite::Delete(syskv::member_key(node)));
             writes.push(KeyWrite::Delete(syskv::node_addrs_key(node)));
-            writes.push(KeyWrite::Delete(syskv::cp_member_addr_key(node)));
         }
         MetaCommand::RegisterNode { node, .. } => {
             // `apply_and_derive_mirror` only reaches here when `outcome ==
@@ -584,19 +600,6 @@ pub fn apply_and_derive_mirror(
     (outcome, writes)
 }
 
-/// Every id in `pre` (a `cp_member_tablets` snapshot taken *before* this
-/// apply) whose associated tablet is no longer in `meta.tablets` (taken
-/// *after*) — i.e. exactly the entries `Metadata::prune_cp_member_addrs`
-/// just pruned as a side effect of this one apply. Diffing against `pre`
-/// rather than re-deriving the prune predicate keeps this in lockstep with
-/// `Metadata::apply`'s own logic without duplicating it.
-fn dead_cp_member_ids(pre: &BTreeMap<NodeId, TabletId>, meta: &Metadata) -> Vec<NodeId> {
-    pre.iter()
-        .filter(|(_, tablet)| !meta.tablets.contains_key(tablet))
-        .map(|(id, _)| id.clone())
-        .collect()
-}
-
 /// Serialize `value` (the same `serde_json` encoding the WAL snapshot blob
 /// uses) as a [`KeyWrite::Put`] at `key`.
 fn put_json<T: Serialize>(key: Vec<u8>, value: &T) -> KeyWrite {
@@ -656,13 +659,71 @@ fn decode_node_id(bytes: Vec<u8>) -> NodeId {
 /// Propagates a [`StorageEngine::entries`] backend failure.
 pub async fn rebuild_metadata_from_engine<S: StorageEngine>(
     engine: &S,
-) -> Result<Metadata, StorageError> {
+) -> Result<Metadata, RebuildError> {
     let mut meta = Metadata::default();
-    for (key, versioned) in engine.entries().await? {
+    let entries = engine.entries().await.map_err(RebuildError::Storage)?;
+    let is_empty = entries.is_empty();
+    let format_version_key = syskv_format_version_key();
+    let mut found_version: Option<u64> = None;
+    for (key, versioned) in entries {
+        if key == format_version_key {
+            found_version = Some(decode_u64(&versioned.value));
+        }
         apply_key_write(&mut meta, &KeyWrite::Put(key, versioned.value));
+    }
+    // ADR 0073 Phase 0 workstream B: an engine that already holds *some*
+    // reserved-namespace state but no `SYSKV_FORMAT_VERSION_COUNTER` row is
+    // pre-baseline (this counter is written unconditionally on every durable
+    // apply pass — see `node.rs`'s `meta_apply_and_compact`); a fresh, empty
+    // engine has nothing to version yet, so it's fine. A recognized
+    // version is any of `1..=SYSKV_MIRROR_VERSION`.
+    if !is_empty {
+        match found_version {
+            None => {
+                return Err(RebuildError::Format(FormatError::PreBaselineFormat {
+                    format: "syskv-mirror",
+                }));
+            }
+            Some(v) if v == 0 || v > u64::from(SYSKV_MIRROR_VERSION) => {
+                return Err(RebuildError::Format(
+                    FormatError::UnsupportedFormatVersion {
+                        format: "syskv-mirror",
+                        found: u8::try_from(v).unwrap_or(u8::MAX),
+                        max_supported: u8::try_from(SYSKV_MIRROR_VERSION).unwrap_or(u8::MAX),
+                    },
+                ));
+            }
+            Some(_) => {}
+        }
     }
     Ok(meta)
 }
+
+/// [`rebuild_metadata_from_engine`]'s failure modes: a real
+/// [`StorageEngine::entries`] backend fault, or a named, loud
+/// [`FormatError`] from the mirror's own [`SYSKV_FORMAT_VERSION_COUNTER`]
+/// check (see that constant's own doc for why the mirror needs this signal
+/// independently of `Metadata::version`).
+#[derive(Debug)]
+pub enum RebuildError {
+    /// The underlying [`StorageEngine::entries`] scan failed.
+    Storage(StorageError),
+    /// The reserved keyspace is non-empty but its
+    /// [`SYSKV_FORMAT_VERSION_COUNTER`] row is missing or names an
+    /// unrecognized version.
+    Format(FormatError),
+}
+
+impl fmt::Display for RebuildError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RebuildError::Storage(e) => write!(f, "system-keyspace engine scan failed: {e}"),
+            RebuildError::Format(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for RebuildError {}
 
 /// Install one already-derived system-keyspace [`KeyWrite`] directly onto a
 /// `Metadata` — the incremental counterpart to [`rebuild_metadata_from_engine`]'s
@@ -721,15 +782,6 @@ fn apply_put(meta: &mut Metadata, key: &[u8], value: &[u8]) {
                 meta.next_tablet_id = value;
             } else if let Some(table) = syskv::pitr_generation_table(&id) {
                 meta.pitr_generation.insert(table.to_owned(), value);
-            }
-        }
-        EntityKind::CpMemberAddr => {
-            let node = decode_node_id(id);
-            let entry: CpMemberAddrEntry =
-                serde_json::from_slice(value).expect("mirrored cp-member-addr value decodes");
-            meta.cp_member_addrs.insert(node.clone(), entry.addr);
-            if let Some(tablet) = entry.tablet {
-                meta.cp_member_tablets.insert(node, tablet);
             }
         }
         EntityKind::StreamShard => {
@@ -842,11 +894,6 @@ fn apply_delete(meta: &mut Metadata, key: &[u8]) {
             // `Put`) — listed for match exhaustiveness. This covers both
             // `NEXT_TABLET_ID_COUNTER` and every per-table PITR generation
             // counter (`syskv::pitr_generation_key`).
-        }
-        EntityKind::CpMemberAddr => {
-            let node = decode_node_id(id);
-            meta.cp_member_addrs.remove(&node);
-            meta.cp_member_tablets.remove(&node);
         }
         EntityKind::StreamShard => {
             // Reachable in practice, unlike the never-pruned markers above
@@ -1145,7 +1192,7 @@ mod tests {
     }
 
     #[test]
-    fn drop_table_tablets_deletes_every_tablet_policy_and_prunes_cp_member_addrs() {
+    fn drop_table_tablets_deletes_every_tablet_and_policy() {
         let mut meta = Metadata::default();
         let _ = apply_and_derive_mirror(
             &mut meta,
@@ -1163,8 +1210,6 @@ mod tests {
                 policy: Some(PlacementPolicy::simple("p", 1)),
             },
         );
-        meta.cp_member_addrs.insert(nid(7), "addr".to_string());
-        meta.cp_member_tablets.insert(nid(7), TabletId(1));
 
         let command = MetaCommand::DropTableTablets {
             table: "t".to_string(),
@@ -1176,7 +1221,6 @@ mod tests {
             vec![
                 KeyWrite::Delete(syskv::tablet_key(TabletId(1))),
                 KeyWrite::Delete(syskv::policy_key(TabletId(1))),
-                KeyWrite::Delete(syskv::cp_member_addr_key(&nid(7))),
             ]
         );
 
@@ -1431,37 +1475,6 @@ mod tests {
     }
 
     #[test]
-    fn register_cp_addr_writes_the_combined_entry() {
-        let mut meta = Metadata::default();
-        let _ = apply_and_derive_mirror(
-            &mut meta,
-            &MetaCommand::CreateTablet {
-                tablet: TabletId(1),
-                table: None,
-                range: KeyRange::whole(),
-                replicas: vec![nid(1)],
-            },
-        );
-        let command = MetaCommand::RegisterCpAddr {
-            id: nid(5),
-            addr: "127.0.0.1:9".to_string(),
-            tablet: Some(TabletId(1)),
-        };
-        let (outcome, writes) = apply_and_derive_mirror(&mut meta, &command);
-        assert_eq!(outcome, ApplyOutcome::Applied);
-        assert_eq!(
-            writes,
-            vec![put_json(
-                syskv::cp_member_addr_key(&nid(5)),
-                &CpMemberAddrEntry {
-                    addr: "127.0.0.1:9".to_string(),
-                    tablet: Some(TabletId(1)),
-                }
-            )]
-        );
-    }
-
-    #[test]
     fn register_node_addrs_writes_the_address_book_entry() {
         let mut meta = Metadata::default();
         // ADR 0040 PR4: `RegisterNodeAddrs` is update-only — establish the
@@ -1512,7 +1525,6 @@ mod tests {
             vec![
                 KeyWrite::Delete(syskv::member_key(&nid(4))),
                 KeyWrite::Delete(syskv::node_addrs_key(&nid(4))),
-                KeyWrite::Delete(syskv::cp_member_addr_key(&nid(4))),
             ]
         );
     }
@@ -2526,6 +2538,20 @@ mod tests {
         use animus_storage::MergeOp;
 
         let engine = MemoryEngine::new();
+        // ADR 0073 Phase 0 workstream B: the real apply task
+        // (`node.rs::meta_apply_and_compact`) writes
+        // `SYSKV_FORMAT_VERSION_COUNTER` unconditionally on every durable
+        // batch, alongside `_applied_index` — this hand-built engine (which
+        // bypasses that apply task entirely) has to write it too, or
+        // `rebuild_metadata_from_engine` sees a non-empty reserved keyspace
+        // with no version row and rejects it as pre-baseline.
+        engine
+            .merge_batch(vec![match put_syskv_format_version() {
+                KeyWrite::Put(k, v) => MergeOp::put(k, v, 1),
+                KeyWrite::Delete(_) => unreachable!("put_syskv_format_version always Puts"),
+            }])
+            .await
+            .expect("merge batch (format version row)");
         let mut shadow = Metadata::default();
         let mut direct = Metadata::default();
         let commands = [
@@ -2631,6 +2657,89 @@ mod tests {
         assert_eq!(rebuilt, shadow);
     }
 
+    /// [`rebuild_metadata_from_engine`] over a genuinely fresh, empty engine
+    /// is `Ok` — an empty reserved keyspace has no
+    /// [`SYSKV_FORMAT_VERSION_COUNTER`] row to check yet, and that's fine (a
+    /// brand-new node's first-ever boot).
+    #[tokio::test]
+    async fn rebuild_from_engine_is_ok_on_a_genuinely_empty_engine() {
+        let engine = MemoryEngine::new();
+        let rebuilt = rebuild_metadata_from_engine(&engine)
+            .await
+            .expect("an empty engine rebuilds cleanly");
+        assert_eq!(rebuilt, Metadata::default());
+        assert_eq!(rebuilt.version, crate::meta::METADATA_VERSION);
+    }
+
+    /// A non-empty reserved keyspace with no [`SYSKV_FORMAT_VERSION_COUNTER`]
+    /// row (every write the real apply task makes carries it unconditionally
+    /// — see that constant's own doc) is pre-baseline data, and
+    /// [`rebuild_metadata_from_engine`] rejects it by name rather than
+    /// silently rebuilding a `Metadata` from it.
+    #[tokio::test]
+    async fn rebuild_from_engine_rejects_a_populated_keyspace_missing_the_version_row() {
+        use animus_storage::MergeOp;
+
+        let engine = MemoryEngine::new();
+        let member = Member {
+            labels: BTreeMap::new(),
+            status: crate::meta::NodeStatus::Active,
+            has_activated: true,
+        };
+        let write = match put_json(syskv::member_key(&nid(1)), &member) {
+            KeyWrite::Put(k, v) => MergeOp::put(k, v, 1),
+            KeyWrite::Delete(_) => unreachable!("put_json always Puts"),
+        };
+        engine.merge_batch(vec![write]).await.expect("merge batch");
+
+        let err = rebuild_metadata_from_engine(&engine)
+            .await
+            .expect_err("a populated keyspace with no version row must be rejected");
+        assert!(
+            matches!(
+                err,
+                RebuildError::Format(FormatError::PreBaselineFormat {
+                    format: "syskv-mirror"
+                })
+            ),
+            "expected PreBaselineFormat, got: {err:?}"
+        );
+    }
+
+    /// A [`SYSKV_FORMAT_VERSION_COUNTER`] row naming a version newer than
+    /// [`SYSKV_MIRROR_VERSION`] this build knows is a named
+    /// [`FormatError::UnsupportedFormatVersion`], never a silent misdecode.
+    #[tokio::test]
+    async fn rebuild_from_engine_rejects_an_unsupported_future_version_row() {
+        use animus_storage::MergeOp;
+
+        let engine = MemoryEngine::new();
+        engine
+            .merge_batch(vec![MergeOp::put(
+                syskv_format_version_key(),
+                (u64::from(SYSKV_MIRROR_VERSION) + 1).to_be_bytes().to_vec(),
+                1,
+            )])
+            .await
+            .expect("merge batch");
+
+        let err = rebuild_metadata_from_engine(&engine)
+            .await
+            .expect_err("an unrecognized future version row must be rejected");
+        assert!(
+            matches!(
+                err,
+                RebuildError::Format(FormatError::UnsupportedFormatVersion {
+                    format: "syskv-mirror",
+                    found,
+                    max_supported,
+                }) if found == (SYSKV_MIRROR_VERSION + 1) as u8
+                    && max_supported == SYSKV_MIRROR_VERSION as u8
+            ),
+            "expected UnsupportedFormatVersion, got: {err:?}"
+        );
+    }
+
     /// The incremental-delta consumer path (ADR 0038 PR5, `apply_key_write`):
     /// applying a command's derived `KeyWrite`s directly onto a `Metadata` —
     /// no engine, no [`rebuild_metadata_from_engine`] bulk scan, exactly what
@@ -2659,9 +2768,6 @@ mod tests {
                 vec![nid(1)],
             ),
         );
-        base.cp_member_addrs.insert(nid(99), "addr:1".to_string());
-        base.cp_member_tablets.insert(nid(99), TabletId(2));
-
         let command = MetaCommand::DropTableTablets {
             table: "t".to_string(),
         };

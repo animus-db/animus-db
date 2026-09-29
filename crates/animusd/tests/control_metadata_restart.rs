@@ -41,8 +41,7 @@ async fn call(addr: SocketAddr, req: ClientRequest) -> ClientResponse {
 }
 
 fn free_addr() -> SocketAddr {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap()
+    support::reserve_addrs(1)[0]
 }
 
 async fn await_leader_only(node: &Node) {
