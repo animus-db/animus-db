@@ -115,6 +115,15 @@ flate2.workspace = true
 # workspace dependency (`animus-storage`'s SSTable block checksums), so
 # this adds no new crate to the graph.
 crc32fast.workspace = true
+# Issue #1060: `SockRef::from(&listener).shutdown(..)` synchronously tears
+# down the client/intra listener's underlying OS socket at `Node::shutdown`
+# time — see that method's own doc for why this needs to be a plain,
+# non-async syscall rather than relying on `task.abort()`'s own scheduling-
+# dependent drop. Already a workspace dependency (`animus-env`'s own
+# `prod.rs` uses it for `SO_KEEPALIVE` tuning), so this adds no new crate to
+# the graph — just a second, safe (`unsafe_code = "forbid"` stays intact)
+# consumer of it in this crate.
+socket2 = { workspace = true, features = ["all"] }
 
 [dev-dependencies]
 tempfile = "3"
