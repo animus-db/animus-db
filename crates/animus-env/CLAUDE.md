@@ -516,11 +516,20 @@ the production implementation; the deterministic implementation lives in
   `animusd --cluster-control 3 --cluster-data 5` cluster under bulk-seed +
   `PutItem` load found ~94 MB of a 254 MB RSS peak in exactly these
   leaked cells — the dominant contributor to the node's ~200 MB/min RSS
-  growth. `Spawner::spawn` now amortizes a `retain(|h| !h.is_finished())`
-  sweep once `tasks`'s length reaches a high-water mark
-  (`TASK_PRUNE_FLOOR`, doubling from the post-sweep live count each time),
-  bounding it to roughly 2x the genuinely live task count at O(1)
-  amortized cost per spawn — `shutdown`/`shutdown_and_wait`'s own
+  growth. **Issue #1105 corrected the trigger**: the first fix swept only
+  inside `spawn`, against a high-water mark from the live count at the
+  *last sweep*, so after a burst a quiet node stranded up to ~2x the peak
+  live count of finished handles forever. Pruning is now *completion*-driven:
+  every spawned task owns a `CompletionGuard` (created outside the async
+  block so a task aborted before its first poll still drops it; its `Drop`
+  runs on completion, panic and abort) that bumps `Inner::finished_unswept`
+  and calls `maybe_sweep`, which does `retain(|h| !h.is_finished())` once
+  `finished_unswept >= max(TASK_PRUNE_FLOOR, tasks.len() - finished_unswept)`
+  — bounded at every instant with no dependence on a later spawn, amortized
+  O(1). **Deadlock rule**: the guard takes the `tasks` mutex from a task's
+  drop and `tokio::spawn` may drop the future inline, so `spawn` must never
+  hold `tasks` across `tokio::spawn` and nothing may drop an unfinished
+  task's last handle under that lock. — `shutdown`/`shutdown_and_wait`'s own
   semantics are completely unchanged, since a pruned entry was already
   finished and had nothing left to abort or wait for. Also set as
   `Metric::SpawnedTaskHandlesTracked` (a level, ADR 0015) on every spawn.
@@ -529,6 +538,8 @@ the production implementation; the deterministic implementation lives in
   unbounded per-spawn leak the moment `spawn` sits on a per-message path,
   not just a per-driver-loop one. Regression:
   `spawn_prunes_finished_handles_and_stays_bounded`/
+  `finished_handles_are_pruned_after_a_burst_with_no_further_spawns`/
+  `panicked_and_aborted_tasks_are_pruned`/
   `shutdown_still_aborts_a_long_running_task_after_pruning` (`prod::tests`).
 - **A panic inside a task spawned through `Spawner::spawn`/`EnvExt::
   spawn_task` is counted on the env it was spawned from (issue #939).**

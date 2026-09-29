@@ -246,29 +246,46 @@ struct Inner {
     /// live `animusd --cluster-control 3 --cluster-data 5` run under bulk
     /// load found ~94 MB of a 254 MB RSS peak in exactly these cells, all
     /// still "live" only because this vec still held their `AbortHandle`).
-    /// [`Spawner::spawn`] now amortizes a `retain(|h| !h.is_finished())`
-    /// sweep once this vec's length reaches a high-water mark
-    /// (`TASK_PRUNE_FLOOR`, doubling from the post-sweep live count each
-    /// time), which keeps it — and the abandoned `Cell`s it would otherwise
-    /// pin — bounded to roughly 2x the genuinely live task count, at O(1)
-    /// amortized cost per spawn, with `shutdown` semantics (every
-    /// still-running task gets aborted; `shutdown_and_wait` waits for them)
-    /// completely unchanged. See `docs/lessons/code-patterns/` for the
-    /// general shape of this bug: "register every spawned handle so
-    /// shutdown can abort it" is itself an unbounded per-spawn leak the
-    /// moment `spawn` sits on a per-message path, not just a per-driver-loop
-    /// one.
+    /// **Completion-driven sweep (issue #1105).** The first fix (#1062) swept
+    /// only inside `spawn`, once `tasks.len()` reached a high-water mark
+    /// recomputed after each sweep as `max(FLOOR, 2 * live-at-that-sweep)`.
+    /// That leaked in production: after a burst (say 50k in-flight sends at
+    /// sweep time, threshold 100k) the threshold stayed at the *burst's* peak
+    /// while a quiet node spawned too slowly ever to reach it again, so up to
+    /// ~2x the peak live count of *finished* handles stayed pinned
+    /// indefinitely — violating the "roughly 2x the live count" invariant.
+    /// The fix is to drive pruning by task *completion* with a threshold
+    /// derived from *current* state, never a remembered peak: every spawned
+    /// task carries a `CompletionGuard` whose `Drop` (normal completion,
+    /// panic unwind, or abort — all drop it) bumps `finished_unswept` and
+    /// calls `maybe_sweep`, which sweeps once
+    /// `finished_unswept >= max(TASK_PRUNE_FLOOR, tasks.len() - finished_unswept)`
+    /// (finished >= max(FLOOR, approx live)). So finished-but-tracked handles
+    /// are bounded at every point in time, with no dependence on any future
+    /// spawn, and a sweep (O(live + finished)) runs only after at least
+    /// `max(FLOOR, live)` completions: amortized O(1) per task.
+    ///
+    /// **Deadlock rule.** The guard takes this mutex from inside a task's
+    /// drop, and `tokio::spawn` may drop the future *inline* (for example
+    /// while the runtime is shutting down), running the guard synchronously
+    /// on the caller. So `spawn` must NEVER hold this lock across
+    /// `tokio::spawn`, and no code may drop an *unfinished* task's last
+    /// `AbortHandle`/`JoinHandle` while holding it (the sweep only drops
+    /// handles whose task `is_finished()`, and `shutdown`/`shutdown_and_wait`
+    /// release the lock at the end of their `mem::take` statement before
+    /// aborting anything).
     tasks: StdMutex<Vec<tokio::task::AbortHandle>>,
-    /// The `tasks` length at which [`Spawner::spawn`] next sweeps finished
-    /// handles out of it — see that field's own doc. Starts at
-    /// `TASK_PRUNE_FLOOR` and is recomputed after every sweep to `max(
-    /// TASK_PRUNE_FLOOR, 2 * <post-sweep live count>)`, so a `ProdEnv`
-    /// hosting genuinely many long-lived tasks (a large cluster's Raft
-    /// drivers) doesn't sweep on every single spawn once past the floor.
-    /// Read/written under the same `tasks` lock the sweep itself runs
-    /// under, so concurrent spawns can't race two sweeps against each other
-    /// or lose an update.
-    task_prune_threshold: AtomicUsize,
+    /// Number of tracked tasks that have completed (finished, panicked or
+    /// been aborted) since the last sweep — see `tasks`'s doc. The sweep's
+    /// `store(0)` can undercount: a task whose guard already ran (counted)
+    /// but which is not yet `is_finished()` when the sweep's `retain` looks
+    /// survives that sweep yet is no longer counted afterwards. Only a
+    /// handful of in-flight tasks can be in that window, so the undercount
+    /// is bounded by a small constant, and harmless: it can only delay the
+    /// next sweep by that many completions. Completions of tasks already
+    /// `mem::take`n out by `shutdown` only *over*-count, which the next
+    /// sweep resets.
+    finished_unswept: AtomicUsize,
     /// Count of tasks spawned through [`Spawner::spawn`] that panicked
     /// (issue #939) — see that impl's own doc for why this exists and how
     /// it's counted. A cancelled (aborted) task never increments this: its
@@ -403,7 +420,7 @@ impl ProdEnv {
                 disk,
                 demux,
                 tasks: StdMutex::new(vec![accept_abort, pump_abort]),
-                task_prune_threshold: AtomicUsize::new(TASK_PRUNE_FLOOR),
+                finished_unswept: AtomicUsize::new(0),
                 task_panics: AtomicU64::new(0),
                 first_task_panic: StdMutex::new(None),
                 metrics,
@@ -1146,15 +1163,13 @@ const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(10);
 /// entry for the incident this closes.
 const SEND_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// The floor (and initial value) of `Inner::task_prune_threshold` — see that
-/// field's and `Inner::tasks`'s own docs for the leak this bounds. Chosen as
-/// a round number comfortably above the steady-state handle count of a
-/// small/medium cluster node (so a quiet node essentially never sweeps) while
-/// still keeping a busy node's worst-case `tasks` vec — and the abandoned
-/// task `Cell`s it would otherwise pin — within a small constant factor of
-/// the floor even at its emptiest (a `max(FLOOR, 2 * live)` threshold can
-/// never fall below `FLOOR`, so a burst that drops live count back down to
-/// near zero doesn't leave the *next* sweep an arbitrarily long way off).
+/// The minimum number of completed-but-unswept tasks before `maybe_sweep`
+/// sweeps `Inner::tasks` (see that field's doc, issue #1105): the sweep
+/// fires once `finished_unswept >= max(TASK_PRUNE_FLOOR, live)`. Chosen as a
+/// round number comfortably above the steady-state handle count of a
+/// small/medium cluster node so a quiet node essentially never sweeps, while
+/// bounding finished-but-pinned handles to a small constant however few live
+/// tasks there are.
 const TASK_PRUNE_FLOOR: usize = 1024;
 
 /// Bounds how long a pooled outbound or accepted socket can sit with data
@@ -2375,7 +2390,16 @@ impl Spawner for ProdEnv {
     /// `spawn_aborted_task_never_counts_as_a_panic`).
     fn spawn(&self, fut: crate::BoxFuture<'static, ()>) {
         let inner = Arc::clone(&self.inner);
+        // Created *outside* the async block and moved in, so it is owned by
+        // the future's initial state: a task aborted before its first poll
+        // drops the future without running any of its body, and a guard
+        // created inside the body would never exist for it.
+        let guard = CompletionGuard(Arc::clone(&inner));
         let counted = async move {
+            // Dropped on every exit path of this future: normal completion,
+            // the panic re-raise below, and abort (future dropped, polled or
+            // not).
+            let _guard = guard;
             let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(fut)).await;
             if let Err(payload) = outcome {
                 let msg = panic_message(payload.as_ref());
@@ -2408,37 +2432,58 @@ impl Spawner for ProdEnv {
         // runtime::task::core::Cell`s at a 254 MB RSS peak under heaptrack,
         // almost entirely `send_stream`'s one-task-per-outbound-frame
         // sends).
+        // NOTE: `tokio::spawn` is called with the `tasks` lock NOT held — it
+        // may drop `counted` inline, running `CompletionGuard::drop`, which
+        // takes that lock (see `Inner::tasks`'s deadlock rule).
         let handle = tokio::spawn(counted);
-        let mut tasks = self.inner.tasks.lock().expect("tasks poisoned");
-        tasks.push(handle.abort_handle());
-        // Amortized pruning: only sweep once `tasks` has grown to the
-        // current high-water mark, so the common case (well under the
-        // floor) pays nothing beyond the push above. `retain` drops every
-        // handle whose task has already finished — its `Cell` is then
-        // freed (assuming no other handle to it survives elsewhere, which
-        // is true here: `spawn` is the only place that ever creates one).
-        // The next threshold is `max(TASK_PRUNE_FLOOR, 2 * <live count>)`,
-        // both computed under this same lock, so this can never race a
-        // concurrent spawn's own sweep into either double-pruning or
-        // losing the updated threshold. This bounds `tasks` (and the task
-        // `Cell`s its handles pin) to roughly 2x the genuinely live task
-        // count, at O(1) amortized cost per spawn — `shutdown`/
-        // `shutdown_and_wait`'s own semantics (abort every still-running
-        // task; the latter waits for them) are completely unchanged, since
-        // a pruned entry was already finished and had nothing left to
-        // abort or wait for.
-        let threshold = self.inner.task_prune_threshold.load(Ordering::Relaxed);
-        if tasks.len() >= threshold {
-            tasks.retain(|h| !h.is_finished());
-            let next = TASK_PRUNE_FLOOR.max(tasks.len() * 2);
+        {
+            let mut tasks = self.inner.tasks.lock().expect("tasks poisoned");
+            tasks.push(handle.abort_handle());
             self.inner
-                .task_prune_threshold
-                .store(next, Ordering::Relaxed);
+                .metrics
+                .set(Metric::SpawnedTaskHandlesTracked, tasks.len() as u64);
         }
-        self.inner
-            .metrics
-            .set(Metric::SpawnedTaskHandlesTracked, tasks.len() as u64);
+        // The task may already have completed (its guard ran before the push
+        // above, so it counted a completion for a handle not yet tracked);
+        // re-check now that the handle is in the vec.
+        maybe_sweep(&self.inner);
     }
+}
+
+/// Drop guard held by every task spawned through `Spawner::spawn`: on drop
+/// (completion, panic unwind or abort) it records one more finished task and
+/// gives `maybe_sweep` a chance to prune. See `Inner::tasks` for the design
+/// and the deadlock rule this relies on.
+struct CompletionGuard(Arc<Inner>);
+
+impl Drop for CompletionGuard {
+    fn drop(&mut self) {
+        self.0.finished_unswept.fetch_add(1, Ordering::AcqRel);
+        maybe_sweep(&self.0);
+    }
+}
+
+/// Sweeps finished handles out of `Inner::tasks` when
+/// `finished_unswept >= max(TASK_PRUNE_FLOOR, tasks.len() - finished_unswept)`
+/// and refreshes the `SpawnedTaskHandlesTracked` gauge. Never panics (it runs
+/// from `Drop`, possibly during unwinding): a poisoned lock is recovered.
+fn maybe_sweep(inner: &Inner) {
+    // Cheap pre-check: below the floor no sweep can be due, so skip the lock.
+    if inner.finished_unswept.load(Ordering::Acquire) < TASK_PRUNE_FLOOR {
+        return;
+    }
+    let mut tasks = inner.tasks.lock().unwrap_or_else(|e| e.into_inner());
+    let finished = inner.finished_unswept.load(Ordering::Acquire);
+    let live_estimate = tasks.len().saturating_sub(finished);
+    if finished >= TASK_PRUNE_FLOOR.max(live_estimate) {
+        // Only handles of finished tasks are dropped here, so this can never
+        // run a task's future destructor under the lock.
+        tasks.retain(|h| !h.is_finished());
+        inner.finished_unswept.store(0, Ordering::Release);
+    }
+    inner
+        .metrics
+        .set(Metric::SpawnedTaskHandlesTracked, tasks.len() as u64);
 }
 
 impl Env for ProdEnv {
@@ -4683,15 +4728,35 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Slack over `TASK_PRUNE_FLOOR` the completion-driven sweep may leave
+    /// tracked at quiescence: a handful of tasks whose `CompletionGuard` ran
+    /// (so they were counted, then reset by the sweep's `store(0)`) but which
+    /// were not yet `is_finished()` when the sweep's `retain` looked — bounded
+    /// by the worker count — plus the accept loop's and demux pump's own two
+    /// permanent handles. See `Inner::finished_unswept`.
+    const PRUNE_SLACK: usize = 64;
+
+    /// Converged-or-timeout poll (30s cap) for `tracked_task_handles()` to
+    /// come down to `bound`, with no spawn helping it along.
+    async fn wait_tracked_at_most(env: &ProdEnv, bound: usize, what: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while env.tracked_task_handles() > bound {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{what}: tracked task handles never converged to <= {bound}: {} still tracked",
+                env.tracked_task_handles()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
     /// The ProdEnv task-handle-leak fix's red-before/green-after proof:
     /// spawning a large number of short tasks and letting every one finish
-    /// must NOT leave `Inner::tasks` growing without bound — before this
-    /// fix, nothing but `shutdown`/`shutdown_and_wait` ever shrank that vec,
-    /// so this test fails on `origin/main`'s code (100_000 tracked handles
-    /// after the loop, each one pinning a finished task's `Cell`) and
-    /// passes once `Spawner::spawn`'s amortized `retain` sweep lands
-    /// (bounded to `TASK_PRUNE_FLOOR`'s small constant factor regardless of
-    /// how many tasks have ever been spawned).
+    /// must NOT leave `Inner::tasks` growing without bound. Since issue
+    /// #1105 pruning is driven by task *completion*, so the bound is reached
+    /// with no further spawn at all — the poll below deliberately spawns
+    /// nothing (the old spawn-only sweep needed one, and could still strand
+    /// handles when none came).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn spawn_prunes_finished_handles_and_stays_bounded() {
         use crate::EnvExt;
@@ -4706,40 +4771,81 @@ mod tests {
             env.spawn_task(async {});
         }
 
-        // Converged-or-timeout poll: wait for every spawned no-op task to
-        // actually finish (not just be scheduled) before asserting on the
-        // pruned count — a task that hasn't been polled to completion yet
-        // is legitimately still tracked, not a leak.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        loop {
-            // Spawn one more cheap task and let the runtime get a turn —
-            // a plain `yield_now` only yields *this* task, not necessarily
-            // draining every worker's run queue, so looping this a few
-            // times gives the pool a real chance to drain N queued no-ops.
-            tokio::task::yield_now().await;
-            if env.tracked_task_handles() <= 2 * TASK_PRUNE_FLOOR {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "tracked task handles never converged to a bounded count: {} still tracked",
-                env.tracked_task_handles()
-            );
-        }
+        wait_tracked_at_most(&env, TASK_PRUNE_FLOOR + PRUNE_SLACK, "100k no-op tasks").await;
 
-        // Spawn one more task past convergence: `tasks` must stay bounded
-        // (not resume growing by one per spawn), which is the actual
-        // regression this test pins — on `origin/main` this assertion is
-        // trivially true only because the *whole* vec is already unbounded
-        // (100_000+), so the real signal is the bound above having been
-        // reachable at all.
-        env.spawn_task(async {});
-        tokio::task::yield_now().await;
-        assert!(
-            env.tracked_task_handles() <= 2 * TASK_PRUNE_FLOOR + 1,
-            "tracked_task_handles grew past the expected bound after one more spawn: {}",
-            env.tracked_task_handles()
-        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #1105 regression (deterministic, no scheduler luck): a burst of
+    /// M live tasks drives the *old* spawn-only sweep's high-water threshold
+    /// to ~2M; after the burst finishes and NOTHING further is spawned, the
+    /// old code kept all ~M finished handles pinned forever. The
+    /// completion-driven sweep must bring the count back down on its own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn finished_handles_are_pruned_after_a_burst_with_no_further_spawns() {
+        use crate::EnvExt;
+
+        let dir = unique_tmp_dir();
+        let (env, _addr) = ProdEnv::bind(nid(0), "127.0.0.1:0".parse().unwrap(), &dir)
+            .await
+            .expect("bind");
+
+        const M: usize = 4 * TASK_PRUNE_FLOOR;
+        let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
+        for _ in 0..M {
+            let mut rx = gate_rx.clone();
+            env.spawn_task(async move {
+                let _ = rx.wait_for(|open| *open).await;
+            });
+        }
+        // Every one of the M tasks is live (gated), so each sweep that
+        // happened during the spawn loop saw them all live.
+        assert!(env.tracked_task_handles() >= M);
+
+        gate_tx.send(true).expect("open gate");
+        // Spawn NOTHING further.
+        wait_tracked_at_most(&env, TASK_PRUNE_FLOOR + PRUNE_SLACK, "post-burst").await;
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The completion guard must fire on the panic and abort paths too, not
+    /// just normal completion.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn panicked_and_aborted_tasks_are_pruned() {
+        use crate::EnvExt;
+
+        let dir = unique_tmp_dir();
+        let (env, _addr) = ProdEnv::bind(nid(0), "127.0.0.1:0".parse().unwrap(), &dir)
+            .await
+            .expect("bind");
+
+        const N: usize = 3 * TASK_PRUNE_FLOOR;
+        for _ in 0..N {
+            env.spawn_task(async { panic!("expected: pruning-test panic") });
+        }
+        wait_tracked_at_most(&env, TASK_PRUNE_FLOOR + PRUNE_SLACK, "panicked tasks").await;
+
+        // Aborted: spawn never-finishing tasks, then abort clones of their
+        // handles (outside the `tasks` lock, per its deadlock rule).
+        for _ in 0..N {
+            env.spawn_task(std::future::pending::<()>());
+        }
+        let handles: Vec<tokio::task::AbortHandle> = env
+            .inner
+            .tasks
+            .lock()
+            .expect("tasks poisoned")
+            .iter()
+            .rev()
+            .take(N)
+            .cloned()
+            .collect();
+        assert_eq!(handles.len(), N);
+        for h in &handles {
+            h.abort();
+        }
+        wait_tracked_at_most(&env, TASK_PRUNE_FLOOR + PRUNE_SLACK + 2, "aborted tasks").await;
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4758,25 +4864,12 @@ mod tests {
             .expect("bind");
 
         // Spawn enough short tasks to cross the prune threshold at least
-        // once, and let them finish. Pruning only happens *inside* a
-        // `spawn` call (amortized on the spawn path, not a background
-        // sweep) — so, exactly like `spawn_prunes_finished_handles_and_
-        // stays_bounded`'s own convergence loop, this keeps spawning one
-        // more cheap task each iteration to give a later sweep something
-        // to trigger on, rather than just yielding and expecting the count
-        // to drop on its own with no further spawns.
+        // once, and let them finish. Pruning is completion-driven (issue
+        // #1105), so no further spawn is needed for the count to drop.
         for _ in 0..(TASK_PRUNE_FLOOR * 2) {
             env.spawn_task(async {});
         }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        while env.tracked_task_handles() > TASK_PRUNE_FLOOR {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "short tasks never drained/pruned"
-            );
-            env.spawn_task(async {});
-            tokio::task::yield_now().await;
-        }
+        wait_tracked_at_most(&env, TASK_PRUNE_FLOOR + PRUNE_SLACK, "short tasks").await;
 
         // Now spawn one long-running task, confirmed started, then shut down.
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
