@@ -59,7 +59,7 @@
 //! (see that function's own doc), so *this sender's own* marker row never
 //! crosses via a snapshot the way a real row would. That half is closed by
 //! carrying `max_applied_ts` in the image's own header instead of as a row
-//! (`codec::encode_image`/`decode_image`, version `29`), folded with the
+//! (`codec::encode_image`/`decode_image`), folded with the
 //! sender's own `storage.latest_version()` at image-build time so a sender
 //! that restarted since its last apply still ships the true mark (its
 //! `apply_and_compact`'s own doc, issue #804's follow-up finding) — see

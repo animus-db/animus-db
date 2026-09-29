@@ -239,8 +239,8 @@ per-tablet CP data plane (`animus-cp-data`).
   `wal_image()`/`encode_record`.
 
   **Every WAL line carries a per-record CRC32 checksum (issue #495)**:
-  `<crc32 as 8 lowercase hex chars>:<json>\n`, checked in
-  `verify_checksummed_line` before the JSON is ever parsed. Before this, the
+  `<crc32 as 8 lowercase hex chars>:<tag+payload>\n`, checked in
+  `format::decode_lines` before the JSON is ever parsed. Before this, the
   newline-terminated-`serde_json` framing had no way to distinguish a
   bit-flip that happened to keep a record's JSON syntactically valid (e.g.
   a digit inside a packed numeric field) from a legitimate value — it
@@ -463,15 +463,19 @@ non-`SharedWal` per-group WAL too** — its fallback persist path
 here, just instantiated `C = KvCommand`/`S = KvState`; there is no second
 WAL-line codec for that crate to keep in sync. **`encode_tagged_record`/
 `decode_tagged` (the `SharedWal` outer `Line{tablet, record}` envelope)
-are deliberately untouched by this reset** — they stay on the pre-existing,
-unversioned `<crc32>:<json>` framing (`encode_checksummed_line`/
-`verify_checksummed_line`, kept as private helpers) pending ADR 0073 Phase
-0 **workstream C**'s own `SWL1` conversion to `format::encode_line`/
-`decode_lines`. **`shared_wal.rs` lives in this crate (`animus-control`),
-not `animus-cp-data`, despite the ADR's workstream table listing the
-`SharedWal` envelope conversion under workstream C** — workstream C reuses
-this crate's own convention/module for a type this crate also happens to
-define; grep before assuming a format lives in the crate that "owns" it.
+are `persist::SHARED_WAL_TAG`** (magic `SWL1`, version 1, ADR 0073 workstream
+C) — the same `format::encode_line`/`decode_lines` shape as `CWL1`, payload
+`{"tablet":..,"record":..}` `serde_json` whose inner `record` is the same
+`WalRecord<C, S>` shape (not a `codec.rs` payload). `decode_tagged` returns
+`Result<_, FormatError>`: a torn tail/CRC-failed line stays a silent stop
+(`Ok(prefix)`); pre-baseline/unknown-version/CRC-valid-but-bad-JSON
+(`Malformed`) are loud, and `SharedWal::open` maps them to `InvalidData`.
+The old private `encode_checksummed_line`/`verify_checksummed_line` are
+deleted. **`shared_wal.rs` lives in this crate (`animus-control`), not
+`animus-cp-data`, despite the ADR's workstream table listing the
+`SharedWal` envelope under workstream C** — grep before assuming a format
+lives in the crate that "owns" it. Fixture:
+`tests/fixtures/formats/shared-wal/v1.bin`.
 
 **Golden fixture**: `tests/fixtures/formats/control-wal/v1.bin` — one of
 each `WalRecord<MetaCommand, Metadata>` variant, deterministic content only

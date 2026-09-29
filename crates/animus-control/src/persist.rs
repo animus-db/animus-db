@@ -34,15 +34,14 @@
 //! golden fixture — never an edit to an existing one.
 //!
 //! **The tagged/multiplexed `SharedWal` envelope (`encode_tagged_record`/
-//! `decode_tagged`, below) is deliberately untouched by this reset** — its
-//! outer `Line{tablet, record}` wrapper stays on the pre-existing,
-//! unversioned `<crc32>:<json>` framing (kept as a private helper,
-//! [`encode_checksummed_line`]/[`verify_checksummed_line`]) rather than
-//! switching to [`crate::format::encode_line`]/[`crate::format::
-//! decode_lines`] in this PR — that conversion (magic `SWL1`) belongs to
-//! ADR 0073 Phase 0 **workstream C** (`animus-cp-data`, whose own
-//! `shared_wal.rs` — despite the name — lives in *this* crate, not that
-//! one; see `crates/animus-control/CLAUDE.md`'s "Versioned formats" entry).
+//! `decode_tagged`, below) is [`SHARED_WAL_TAG`]** (magic `SWL1`, ADR 0073 Phase
+//! 0 workstream C): the same [`crate::format::encode_line`]/
+//! [`crate::format::decode_lines`] line shape as [`CONTROL_WAL`], wrapping a
+//! `{"tablet":..,"record":..}` JSON payload whose inner `record` is the very
+//! same [`WalRecord`] `serde_json` shape `CWL1` carries (not a separate
+//! codec). `shared_wal.rs` lives in this crate, hence this conversion too.
+//! The pre-baseline untagged `<crc32>:<json>` line is refused by name
+//! (`PreBaselineFormat`), never silently misread.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -98,55 +97,19 @@ pub const CONTROL_SNAPSHOT: FormatTag = FormatTag {
     name: "control-snapshot",
 };
 
-// ---------------------------------------------------------------------------
-// Per-record checksum framing for the tagged/multiplexed `SharedWal`
-// envelope (issue #495) — kept as a private, untagged `<crc32>:<json>\n`
-// helper for `encode_tagged_record`/`decode_tagged` only (see this module's
-// own doc above for why this one path is out of scope for the ADR 0073
-// reset). [`PersistedState::encode_record`]/[`PersistedState::decode`] use
-// [`crate::format::encode_line`]/[`crate::format::decode_lines`] instead,
-// which fold an equivalent per-record CRC32 checksum into a tagged,
-// versioned line.
-//
-// The original motivation, for context: the pre-issue-#495 format was plain
-// newline-terminated `serde_json` with no way to tell a wrong-but-still-valid
-// value apart from a correct one — a bit-flip landing inside a byte that
-// kept the JSON syntactically valid (e.g. a digit inside a packed numeric
-// field) decoded successfully into a different, silently-corrupt record
-// instead of a decode error, confirmed to reach a hard panic once such a
-// record applied past `animus_cp_data::assert_ts_monotonic` (see
-// `docs/engineering-lessons.md`'s issue #495 entry for the full account).
+/// The flat `(tablet, record)` sequence [`PersistedState::decode_tagged`]
+/// returns, in file order.
+pub type TaggedRecords<C, S> = Vec<(TabletId, WalRecord<C, S>)>;
 
-/// Frame one already-serialized payload as an untagged, checksummed WAL
-/// line. Used only by [`PersistedState::encode_tagged_record`] now — see
-/// this module's own doc for why [`PersistedState::encode_record`] no
-/// longer does.
-fn encode_checksummed_line(payload: &[u8]) -> Vec<u8> {
-    let crc = crc32fast::hash(payload);
-    let mut line = Vec::with_capacity(payload.len() + 10);
-    line.extend_from_slice(format!("{crc:08x}:").as_bytes());
-    line.extend_from_slice(payload);
-    line.push(b'\n');
-    line
-}
-
-/// Validate one non-empty WAL line's checksum prefix, returning the payload
-/// bytes (still to be JSON-decoded by the caller) on a match. `None` on any
-/// malformed framing — no `:` separator, a non-8-hex-digit prefix, or a CRC
-/// mismatch — which the caller (`decode_tagged`) treats identically to a
-/// torn trailing line: everything from here on is dropped, never applied,
-/// never a panic. ([`PersistedState::decode`]'s own tagged-line equivalent
-/// is [`crate::format::decode_lines`] now — see this module's doc.)
-fn verify_checksummed_line(line: &[u8]) -> Option<&[u8]> {
-    let colon = line.iter().position(|&b| b == b':')?;
-    let (hex, rest) = line.split_at(colon);
-    if hex.len() != 8 {
-        return None;
-    }
-    let expected = u32::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok()?;
-    let payload = &rest[1..];
-    (crc32fast::hash(payload) == expected).then_some(payload)
-}
+/// The `SharedWal` outer line envelope (ADR 0073 Phase 0 workstream C):
+/// magic `SWL1`, currently version 1. One [`crate::format::encode_line`] line
+/// per record, payload `{"tablet":<id>,"record":<WalRecord>}` as
+/// `serde_json`. See this module's own doc.
+pub const SHARED_WAL_TAG: FormatTag = FormatTag {
+    magic: *b"SWL1",
+    version: 1,
+    name: "shared-wal",
+};
 
 /// One durable change, appended to the write-ahead log. Generic over the command
 /// type `C` and snapshot-image type `S` (defaults: the control plane's
@@ -308,8 +271,9 @@ where
     /// Encode one record tagged with the tablet it belongs to, for a **shared**,
     /// multi-tenant WAL file holding several tablets' `RaftCore` records
     /// interleaved (the single-command-split redesign, `docs/adr/0028-*.md`).
-    /// One newline-terminated, checksummed JSON line, same framing discipline
-    /// as [`encode_record`](Self::encode_record) (issue #495).
+    /// One [`SHARED_WAL_TAG`]-tagged, checksummed line via
+    /// [`crate::format::encode_line`], same framing discipline as
+    /// [`encode_record`](Self::encode_record) (issue #495, ADR 0073).
     #[must_use]
     pub fn encode_tagged_record(tablet: TabletId, record: &WalRecord<C, S>) -> Vec<u8> {
         #[derive(Serialize)]
@@ -319,13 +283,23 @@ where
         }
         let payload =
             serde_json::to_vec(&Line { tablet, record }).expect("tagged wal record serializes");
-        encode_checksummed_line(&payload)
+        format::encode_line(&SHARED_WAL_TAG, &payload)
     }
 
     /// Decode a shared WAL's bytes into `(tablet, record)` pairs, in file
-    /// order, stopping at the first record that fails to decode — a trailing
-    /// partial line **or** a checksum mismatch (issue #495), per
-    /// [`decode`](Self::decode)'s doc. Unlike `decode`, a bad line here stops
+    /// order, stopping silently at the first line whose framing fails — a
+    /// trailing partial line **or** a checksum mismatch (issue #495), per
+    /// [`decode`](Self::decode)'s doc (`Ok` with the valid prefix).
+    ///
+    /// Loud errors, exactly as [`decode`](Self::decode): a CRC-valid line
+    /// with no [`SHARED_WAL_TAG`] magic (a pre-baseline untagged
+    /// `<crc32>:<json>` line) is `Err(FormatError::PreBaselineFormat)`; an
+    /// unknown version is `Err(UnsupportedFormatVersion)`; and a CRC-valid,
+    /// correctly tagged line whose JSON doesn't parse is
+    /// `Err(FormatError::Malformed)` — a checksum-valid record that won't
+    /// decode is a decoder/encoder bug or version skew, not a torn write, so
+    /// it must not be silently truncated away (the old untagged decoder
+    /// broke out of the loop here; `CWL1`'s `decode` never did). Unlike `decode`, a bad line here stops
     /// the **whole file**, not just one tablet's own stream: this method
     /// returns a flat, not-yet-demultiplexed sequence, so there is no
     /// per-tablet boundary to truncate at independently. This is
@@ -343,26 +317,23 @@ where
     /// tablet's own already-durable data. See `animus_control::shared_wal`'s
     /// own module doc ("Crash safety") and `docs/adr/0028-*.md`'s C-05 PR 2
     /// amendment for the full argument.
-    pub fn decode_tagged(bytes: &[u8]) -> Vec<(TabletId, WalRecord<C, S>)> {
+    pub fn decode_tagged(bytes: &[u8]) -> Result<TaggedRecords<C, S>, FormatError> {
         #[derive(Deserialize)]
         struct Line<C, S> {
             tablet: TabletId,
             record: WalRecord<C, S>,
         }
-        let mut lines = Vec::new();
-        for line in bytes.split(|&b| b == b'\n') {
-            if line.is_empty() {
-                continue;
-            }
-            let Some(payload) = verify_checksummed_line(line) else {
-                break;
-            };
-            let Ok(line) = serde_json::from_slice::<Line<C, S>>(payload) else {
-                break;
-            };
+        let raw = format::decode_lines(&SHARED_WAL_TAG, bytes)?;
+        let mut lines = Vec::with_capacity(raw.len());
+        for (_version, payload) in raw {
+            let line: Line<C, S> =
+                serde_json::from_slice(payload).map_err(|e| FormatError::Malformed {
+                    format: SHARED_WAL_TAG.name,
+                    detail: e.to_string(),
+                })?;
             lines.push((line.tablet, line.record));
         }
-        lines
+        Ok(lines)
     }
 
     /// Demultiplex a shared WAL's bytes into one [`PersistedState`] per tablet —
@@ -371,15 +342,18 @@ where
     /// [`replay`](Self::replay) folds a single tablet's own dedicated file
     /// today. A tablet with no records in the file is simply absent from the
     /// result (never a spurious empty entry).
-    pub fn replay_multiplexed(bytes: &[u8]) -> BTreeMap<TabletId, Self> {
+    ///
+    /// Errors are [`decode_tagged`](Self::decode_tagged)'s (a torn tail is
+    /// still `Ok`).
+    pub fn replay_multiplexed(bytes: &[u8]) -> Result<BTreeMap<TabletId, Self>, FormatError> {
         let mut grouped: BTreeMap<TabletId, Vec<WalRecord<C, S>>> = BTreeMap::new();
-        for (tablet, record) in Self::decode_tagged(bytes) {
+        for (tablet, record) in Self::decode_tagged(bytes)? {
             grouped.entry(tablet).or_default().push(record);
         }
-        grouped
+        Ok(grouped
             .into_iter()
             .map(|(tablet, records)| (tablet, Self::replay(records)))
-            .collect()
+            .collect())
     }
 
     /// Build a shared WAL's full compaction image by concatenating each
@@ -480,7 +454,7 @@ mod tests {
             ),
         );
 
-        let demuxed = PersistedState::<MetaCommand, Metadata>::replay_multiplexed(&bytes);
+        let demuxed = PersistedState::<MetaCommand, Metadata>::replay_multiplexed(&bytes).unwrap();
 
         assert_eq!(demuxed.len(), 2);
         let s1 = &demuxed[&t1];
@@ -519,7 +493,7 @@ mod tests {
         // trailing line with no newline.
         bytes.extend_from_slice(br#"{"tablet":8,"record":{"Hard":{"term":9"#);
 
-        let demuxed = PersistedState::<MetaCommand, Metadata>::replay_multiplexed(&bytes);
+        let demuxed = PersistedState::<MetaCommand, Metadata>::replay_multiplexed(&bytes).unwrap();
         assert_eq!(demuxed.len(), 1, "the torn record must not appear at all");
         let s1 = &demuxed[&t1];
         assert_eq!(s1.term, 2);
@@ -551,7 +525,7 @@ mod tests {
             (t2, t2_records.as_slice()),
         ]);
 
-        let demuxed = PersistedState::<MetaCommand, Metadata>::replay_multiplexed(&image);
+        let demuxed = PersistedState::<MetaCommand, Metadata>::replay_multiplexed(&image).unwrap();
         assert_eq!(demuxed.len(), 2);
         assert_eq!(demuxed[&t1].term, 4);
         assert_eq!(demuxed[&t1].log.len(), 1);
@@ -686,7 +660,7 @@ mod tests {
                 .expect("the term digit is present in the payload");
         line[four_pos] = b'9';
 
-        let demuxed = PersistedState::<MetaCommand, Metadata>::replay_multiplexed(&line);
+        let demuxed = PersistedState::<MetaCommand, Metadata>::replay_multiplexed(&line).unwrap();
         assert!(
             demuxed.is_empty(),
             "a corrupted tagged record must never surface, wrong-valued or otherwise"
@@ -695,9 +669,7 @@ mod tests {
 
     // --- CONTROL_WAL tagging (ADR 0073 Phase 0 workstream B) ---
 
-    /// A pre-baseline WAL line (the old, untagged `<crc32>:<json>` shape
-    /// `encode_checksummed_line` still produces for the tagged/multiplexed
-    /// path) is refused by name through `PersistedState::decode`, never
+    /// A pre-baseline WAL line (the old, untagged `<crc32>:<json>` shape) is refused by name through `PersistedState::decode`, never
     /// silently misread as an empty or partial log.
     #[test]
     fn decode_rejects_a_pre_baseline_untagged_line() {
@@ -706,7 +678,7 @@ mod tests {
             voted_for: None,
         };
         let payload = serde_json::to_vec(&good).unwrap();
-        let line = encode_checksummed_line(&payload);
+        let line = old_untagged_line(&payload);
         let err = PersistedState::<MetaCommand, Metadata>::decode(&line).unwrap_err();
         assert_eq!(
             err,
@@ -753,6 +725,111 @@ mod tests {
         match err {
             FormatError::Malformed { format, .. } => assert_eq!(format, CONTROL_WAL.name),
             other => panic!("expected Malformed, got {other:?}"),
+        }
+    }
+
+    // --- SHARED_WAL_TAG (SWL1) tagging (ADR 0073 Phase 0 workstream C) ---
+
+    /// The pre-baseline untagged framing, hand-built (the private helper
+    /// that used to produce it is gone): `<crc32 8 hex>:<payload>\n`.
+    fn old_untagged_line(payload: &[u8]) -> Vec<u8> {
+        let mut line = format!("{:08x}:", crc32fast::hash(payload)).into_bytes();
+        line.extend_from_slice(payload);
+        line.push(b'\n');
+        line
+    }
+
+    fn tagged_payload() -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "tablet": 1,
+            "record": WalRecord::<MetaCommand, Metadata>::Hard { term: 1, voted_for: None },
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn decode_tagged_rejects_a_pre_baseline_untagged_line() {
+        let line = old_untagged_line(&tagged_payload());
+        let err = PersistedState::<MetaCommand, Metadata>::decode_tagged(&line).unwrap_err();
+        assert_eq!(
+            err,
+            FormatError::PreBaselineFormat {
+                format: SHARED_WAL_TAG.name
+            }
+        );
+        assert!(PersistedState::<MetaCommand, Metadata>::replay_multiplexed(&line).is_err());
+    }
+
+    #[test]
+    fn decode_tagged_rejects_an_unsupported_future_version() {
+        let future = FormatTag {
+            version: SHARED_WAL_TAG.version + 1,
+            ..SHARED_WAL_TAG
+        };
+        let line = format::encode_line(&future, &tagged_payload());
+        let err = PersistedState::<MetaCommand, Metadata>::decode_tagged(&line).unwrap_err();
+        assert_eq!(
+            err,
+            FormatError::UnsupportedFormatVersion {
+                format: SHARED_WAL_TAG.name,
+                found: SHARED_WAL_TAG.version + 1,
+                max_supported: SHARED_WAL_TAG.version,
+            }
+        );
+    }
+
+    /// A different format's tag (a `CWL1` line fed to the shared-WAL
+    /// decoder) is refused by name too.
+    #[test]
+    fn decode_tagged_rejects_another_formats_magic() {
+        let line = format::encode_line(&CONTROL_WAL, &tagged_payload());
+        assert!(matches!(
+            PersistedState::<MetaCommand, Metadata>::decode_tagged(&line),
+            Err(FormatError::PreBaselineFormat { .. })
+        ));
+    }
+
+    /// A CRC-valid, correctly tagged line with unparsable JSON is loud.
+    #[test]
+    fn decode_tagged_reports_a_malformed_payload_loudly() {
+        let mut bytes = PersistedState::<MetaCommand, Metadata>::encode_tagged_record(
+            TabletId(1),
+            &WalRecord::Hard {
+                term: 1,
+                voted_for: None,
+            },
+        );
+        bytes.extend(format::encode_line(&SHARED_WAL_TAG, b"not valid json"));
+        let err = PersistedState::<MetaCommand, Metadata>::decode_tagged(&bytes).unwrap_err();
+        match err {
+            FormatError::Malformed { format, .. } => assert_eq!(format, SHARED_WAL_TAG.name),
+            other => panic!("expected Malformed, got {other:?}"),
+        }
+    }
+
+    /// Torn tails of every shape stay a silent stop returning the prefix.
+    #[test]
+    fn decode_tagged_torn_tail_is_a_silent_stop() {
+        let good = PersistedState::<MetaCommand, Metadata>::encode_tagged_record(
+            TabletId(1),
+            &WalRecord::Hard {
+                term: 2,
+                voted_for: None,
+            },
+        );
+        let next = PersistedState::<MetaCommand, Metadata>::encode_tagged_record(
+            TabletId(2),
+            &WalRecord::Hard {
+                term: 3,
+                voted_for: None,
+            },
+        );
+        for cut in [1, 5, 9, 12, next.len() / 2, next.len() - 2] {
+            let mut bytes = good.clone();
+            bytes.extend_from_slice(&next[..cut]);
+            let decoded = PersistedState::<MetaCommand, Metadata>::decode_tagged(&bytes)
+                .unwrap_or_else(|e| panic!("cut {cut}: torn tail must not be an Err: {e}"));
+            assert_eq!(decoded.len(), 1, "cut {cut}");
         }
     }
 }

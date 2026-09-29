@@ -1,7 +1,9 @@
 //! Golden fixtures for the control plane's ADR 0073 Phase 0 workstream B
 //! formats: the Raft WAL line envelope (`persist::CONTROL_WAL`, magic
 //! `CWL1`) and the snapshot/`InstallSnapshot` payload envelope
-//! (`persist::CONTROL_SNAPSHOT`, magic `CSN1`).
+//! (`persist::CONTROL_SNAPSHOT`, magic `CSN1`); plus, from workstream C, the
+//! `SharedWal` outer line envelope (`persist::SHARED_WAL_TAG`, magic `SWL1`,
+//! fixture dir `shared-wal`) — it lives in this crate, so its fixture does too.
 //!
 //! One fixture per version under
 //! `tests/fixtures/formats/<format>/v<N>.bin`, decoded structurally
@@ -47,7 +49,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use animus_control::node::{decode_syskv_image_bytes, encode_syskv_image_bytes};
-use animus_control::persist::{CONTROL_SNAPSHOT, CONTROL_WAL, PersistedState, WalRecord};
+use animus_control::persist::{
+    CONTROL_SNAPSHOT, CONTROL_WAL, PersistedState, SHARED_WAL_TAG, WalRecord,
+};
 use animus_control::raft::LogEntry;
 use animus_control::schema::{ColumnType, TableSchema};
 use animus_control::{ApplyOutcome, MetaCommand, Metadata, NodeStatus, PlacementPolicy};
@@ -468,5 +472,158 @@ fn generate_fixture_metadata() {
         );
     }
     let bytes = serde_json::to_vec_pretty(&v1_metadata()).expect("metadata serializes");
+    std::fs::write(&path, &bytes).unwrap_or_else(|e| panic!("writing {}: {e}", path.display()));
+}
+
+// ---------------------------------------------------------------------------
+// `shared-wal` (`SHARED_WAL_TAG`, magic `SWL1`) — the `SharedWal` outer line
+// envelope, `{"tablet","record"}` per line (ADR 0073 Phase 0 workstream C).
+// Instantiated with the same `MetaCommand`/`Metadata` pair as `control-wal`
+// (the inner `WalRecord` shape is generic; `Metadata::default()` for the
+// same reason as above) — production instantiates `KvCommand`/`KvState`,
+// whose JSON goes through the identical envelope code.
+
+/// Lines from three tablets, interleaved, covering every [`WalRecord`]
+/// variant. Fixed constants only.
+fn v1_shared_wal_lines() -> Vec<(TabletId, WalRecord<MetaCommand, Metadata>)> {
+    let entry = |index, term, node| {
+        WalRecord::Append(LogEntry {
+            index,
+            term,
+            command: MetaCommand::UpsertMember {
+                node: nid(node),
+                labels: BTreeMap::new(),
+                status: NodeStatus::Active,
+            },
+            config: None,
+            learners: None,
+        })
+    };
+    vec![
+        (
+            TabletId(1),
+            WalRecord::Hard {
+                term: 2,
+                voted_for: Some(nid(1)),
+            },
+        ),
+        (
+            TabletId(2),
+            WalRecord::Hard {
+                term: 4,
+                voted_for: None,
+            },
+        ),
+        (TabletId(1), entry(1, 2, 2)),
+        (TabletId(7), entry(1, 4, 3)),
+        (TabletId(2), entry(1, 4, 4)),
+        (TabletId(1), entry(2, 2, 5)),
+        (TabletId(1), WalRecord::Truncate { keep: 1 }),
+        (
+            TabletId(7),
+            WalRecord::Snapshot {
+                metadata: Metadata::default(),
+                last_index: 5,
+                last_term: 4,
+                config: Some(BTreeSet::from([nid(1), nid(2)])),
+                learners: Some(BTreeSet::from([nid(3)])),
+            },
+        ),
+        (TabletId(2), entry(2, 4, 6)),
+    ]
+}
+
+fn shared_wal_fixtures_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/formats/shared-wal")
+}
+
+fn encode_shared_wal(lines: &[(TabletId, WalRecord<MetaCommand, Metadata>)]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for (tablet, record) in lines {
+        bytes
+            .extend(PersistedState::<MetaCommand, Metadata>::encode_tagged_record(*tablet, record));
+    }
+    bytes
+}
+
+/// Iterates every file under `tests/fixtures/formats/shared-wal/` (never
+/// naming `v1` literally) and asserts each decodes structurally.
+#[test]
+fn decodes_every_checked_in_shared_wal_fixture_structurally() {
+    let dir = shared_wal_fixtures_dir();
+    let mut checked = 0usize;
+    let entries = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("reading fixtures dir {}: {e}", dir.display()));
+    for entry in entries {
+        let entry = entry.expect("readable dir entry");
+        let path = entry.path();
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("reading {name}: {e}"));
+        match name.as_str() {
+            "v1.bin" => {
+                let decoded = PersistedState::<MetaCommand, Metadata>::decode_tagged(&bytes)
+                    .unwrap_or_else(|e| panic!("{name} failed to decode: {e}"));
+                assert_eq!(
+                    decoded,
+                    v1_shared_wal_lines(),
+                    "{name} decoded to an unexpected value"
+                );
+                checked += 1;
+            }
+            other => panic!(
+                "unrecognized shared-wal fixture {other:?} — add a matching expected-value \
+                 arm to this test before adding the fixture file"
+            ),
+        }
+    }
+    assert!(
+        checked > 0,
+        "no shared-wal fixtures found under {}",
+        dir.display()
+    );
+}
+
+#[test]
+fn shared_wal_round_trips_through_encode_and_decode() {
+    let lines = v1_shared_wal_lines();
+    let bytes = encode_shared_wal(&lines);
+    let decoded = PersistedState::<MetaCommand, Metadata>::decode_tagged(&bytes).expect("decodes");
+    assert_eq!(decoded, lines);
+}
+
+/// The fixture's first line carries [`SHARED_WAL_TAG`]'s magic/version
+/// right after the 8-hex-digit checksum and its colon.
+#[test]
+fn shared_wal_fixture_starts_with_the_shared_wal_tag() {
+    let bytes = std::fs::read(shared_wal_fixtures_dir().join("v1.bin"))
+        .expect("v1.bin fixture is checked in");
+    assert_eq!(&bytes[9..13], &SHARED_WAL_TAG.magic);
+    assert_eq!(
+        &bytes[13..15],
+        format!("{:02x}", SHARED_WAL_TAG.version).as_bytes()
+    );
+}
+
+/// Regenerates `v<SHARED_WAL_TAG.version>.bin`. Run explicitly:
+/// `cargo test -p animus-control --test format_fixtures generate_fixture_shared_wal -- --ignored`.
+/// Refuses to overwrite an existing fixture (ADR 0073 Phase 0 conventions).
+#[test]
+#[ignore]
+fn generate_fixture_shared_wal() {
+    let dir = shared_wal_fixtures_dir();
+    std::fs::create_dir_all(&dir).expect("create fixtures dir");
+    let path = dir.join(format!("v{}.bin", SHARED_WAL_TAG.version));
+    if std::fs::metadata(&path).is_ok() {
+        panic!(
+            "{} already exists — a checked-in fixture is never regenerated in place; \
+             bump SHARED_WAL_TAG's version and add a new fixture file instead",
+            path.display()
+        );
+    }
+    let bytes = encode_shared_wal(&v1_shared_wal_lines());
     std::fs::write(&path, &bytes).unwrap_or_else(|e| panic!("writing {}: {e}", path.display()));
 }

@@ -84,7 +84,9 @@ amendment — the shape predates and outlives it.)
 - **`codec.rs`** — the crate's compact binary wire/image codec (ADR 0017
   A.2): length-prefixed, magic/version-checked framing for `KvWire`
   messages and engine images (`serde_json`'s decimal-array `Vec<u8>`
-  rendering cost ~3–4x). Decode failures are loud. The Raft WAL keeps the
+  rendering cost ~3–4x). Decode failures are loud, named `FormatError`s
+  (see "Versioned formats" below; the codec is `VERSION = 1` since ADR 0073
+  Phase 0). The Raft WAL keeps the
   shared control-plane serde_json `PersistedState` format — which **used to
   have no per-record checksum** (`WalRecord::decode`, `animus-control::
   persist`, tolerated only a torn *trailing* line, never a mid-line
@@ -286,15 +288,14 @@ amendment — the shape predates and outlives it.)
   owns it, since tables' rings are independent). `TxnRecord::intent_spans:
   Vec<(String, KeyRange)>` names every key any participant ever staged,
   table name attached. See the Key invariants section for the full design.
-  **`TxnWrite` (ADR 0046 A1, `TxnStage` kind-writes stack, codec version
-  16)**: `KvCommand::TxnStage.writes`' element, a named struct (`key`,
+  **`TxnWrite` (ADR 0046 A1, `TxnStage` kind-writes stack)**: `KvCommand::TxnStage.writes`' element, a named struct (`key`,
   `value`, plus an optional derived `kind_writes`/`change_log` payload for
   a write against an indexed/streamed table) — carried inside the write's
   own `Envelope::Intent`, opaque until `TxnResolve`'s commit branch
   materializes it. See the Key invariants section's `materialize_derived`
   entry and `docs/adr/0018-cross-tablet-transactions.md`'s 2026-08-16
   amendment for the full mechanism. **`TxnWrite.stage_marker` (ADR 0049 §3,
-  codec version 18)**: an image-less, consumer-hidden `(prefix, record)`
+  )**: an image-less, consumer-hidden `(prefix, record)`
   pair `TxnStage`'s own apply arm materializes into `KIND_CHANGE` at the
   *stage* entry's own `ts` (via the same shared `materialize_derived`) —
   the dirty-key signal that lets a change-log consumer observe a freshly
@@ -311,7 +312,7 @@ amendment — the shape predates and outlives it.)
   a mis-tokened prefix rejects the whole stage as `Fenced` at the stage,
   never at resolve). Test: `txn_kind_writes.rs::
   a_change_log_prefix_off_its_own_token_is_rejected_at_apply`.
-  **`TxnWrite.pending` (ADR 0054 step 4a, codec version 26)**: an optional
+  **`TxnWrite.pending` (ADR 0054 step 4a)**: an optional
   `PendingTxnWrite` — the `TxnStage` sibling of `KvCommand::KindEval`'s own
   self-contained payload (`schema`/`pk`/`sk`/`op`/`condition`/
   `ttl_expired`, no `ts`). When `Some`, `value`/`kind_writes`/`change_log`
@@ -722,7 +723,7 @@ State once here; cross-referenced from the sections below.
     Once compaction truncates such an entry out of the WAL, neither engine
     read can see its `ts` any more. Closed two ways, one per read site:
     (1) **snapshot install** — `engine_image`/`install_engine_image`
-    (`lib.rs`, codec version `29`) carry the sender's own running
+    (`lib.rs`) carry the sender's own running
     `max_applied_ts` in the image's header (not as a row: `engine_image`'s
     per-kind scan deliberately excludes every `RESERVED_NAMESPACE` marker,
     seal/ceiling/split's own included, so a marker row alone could never
@@ -806,8 +807,8 @@ State once here; cross-referenced from the sections below.
   StageOutcome)>`, `None` on ambiguity same as before). See
   `docs/engineering-lessons.md` for the general lesson.
 - **`KindBatch` briefly gained the identical own-key `conditions` field
-  (ADR 0046 "evaluate at leader" seatbelt, codec version 15) — deleted
-  outright by ADR 0054 step 4b (codec version 27).** Modeled directly on
+  (ADR 0046 "evaluate at leader" seatbelt) — deleted
+  outright by ADR 0054 step 4b.** Modeled directly on
   `TxnStage.conditions`, `(key, expected)` byte-level OCC pairs checked
   against the KIND_BASE scope, **checked BEFORE the seal gate**, not behind
   it (`TxnStage`'s `condition_failure` only evaluates once already known
@@ -824,8 +825,7 @@ State once here; cross-referenced from the sections below.
   (merged back into a single 2-argument `put_kind_batch`), and its own
   test file (`tests/kind_batch_conditions.rs`, which mirrored `tests/
   txn_conditions.rs` scenario-for-scenario) are all gone. `TxnStage`'s
-  own, separate `conditions` field (added alongside it in codec version
-  11, backing a *plain-table* write action's own condition inside
+  own, separate `conditions` field (added alongside it, backing a *plain-table* write action's own condition inside
   `TransactWriteItems`) is untouched — a different mechanism on a
   different variant that happened to share a name and a byte-level-OCC
   shape.
@@ -946,7 +946,7 @@ State once here; cross-referenced from the sections below.
   evaluate `condition`; compute `new` via
   `op`; derive `writes`/`change_log` via `animus_item::derive_kind_writes`;
   materialize via the same shared `materialize_derived` helper above — no
-  third copy. Codec version `25` (tag `16`): the four rich, evolving nested
+  third copy. Codec tag `16`: the four rich, evolving nested
   field types each ride as one `serde_json` blob inside the binary
   envelope (`put_json`/`Cursor::json`) — the same convention `backup.rs`'s
   `BackupManifestObject` already uses for `TableSchema`'s own evolving
@@ -1016,7 +1016,7 @@ State once here; cross-referenced from the sections below.
   by the whole entry) plus one shared `ts`, closing the same per-item-entry
   throughput gap `KindBatch.change_log`'s own `Vec` shape closed for the
   marker-table path (one entry per tablet per `BatchWriteItem` call, never
-  one per item). Codec tag `17`, version `31` — each entry's four rich
+  one per item). Codec tag `17` — each entry's four rich
   nested fields ride the identical `put_json`-per-field convention
   `KindEval` established.
 
@@ -1627,8 +1627,8 @@ DynamoDB-wire and real-`LsmEngine` regressions this fix also carries.
   (`!config().contains(me) || removed_by_leader()`) — a returning removed
   replica's own campaign usually triggers the notice before the leader's own
   schedule delivers the entry (`reconciler_corpus`'s
-  `partition_blocks_release`). Codec version `32` added `RaftMsg::Removed`/
-  `RemovedAck` (tags `14`/`15`). Regression:
+  `partition_blocks_release`). This added `RaftMsg::Removed`/
+  `RemovedAck` (codec tags `14`/`15`). Regression:
   `tests/departing_removal_notice.rs` (a reconciler-hosted replica left behind
   the compacted log by a continuous writer: zero snapshot ships/restarts,
   told, not released while `Metadata` lists it, released once it does).
@@ -2705,7 +2705,9 @@ append-only per `scripts/check-format-fixtures.sh`, a directory-iterating
 decode test, a round-trip test, an `#[ignore]`d generator that refuses to
 overwrite) lives in `animus-control`'s `format.rs` — see its
 "Versioned formats (ADR 0073 Phase 0)" section. This crate's fixtures and
-tests are all in `tests/format_fixtures.rs`; new formats add a section there.
+tests are in `tests/format_fixtures.rs`, except the RaftKV ones below, which
+live in-crate (`src/format_fixture_tests.rs`, `#[cfg(test)]`) because the
+wire/image codec is `pub(crate)`; new formats add a section in whichever fits.
 
 - **`segment` v1** (`segment.rs`, magic `SEGF`, `VERSION = 1`): the
   stream-shard segment object, also reused by backup/PITR/export objects.
@@ -2713,6 +2715,93 @@ tests are all in `tests/format_fixtures.rs`; new formats add a section there.
   `UnsupportedFormatVersion` for `0`/future, `Malformed` for framing damage).
   Fixture: `tests/fixtures/formats/segment/v1.bin`. A layout change is a new
   `VERSION` plus a new fixture file — never an edit to `v1.bin`.
+- **`raftkv-wire` v1 / `raftkv-image` v1** (`codec.rs`, magic byte `0xCB` +
+  `u8` `VERSION = 1`, the pre-baseline single-byte-magic shape kept): the
+  binary `KvWire` frame (`encode_wire`/`decode_wire`) and the
+  `InstallSnapshot` engine image (`encode_image`/`decode_image`, with the
+  `max_ts` header). Errors are `FormatError` with format names `raftkv-wire` /
+  `raftkv-image`: empty/foreign magic is `PreBaselineFormat`, version `0` or
+  above `VERSION` is `UnsupportedFormatVersion`, other framing damage is
+  `Malformed`. Fixtures: `raftkv-wire/v1.bin` (`u32`-BE length-prefixed
+  frames, every `RaftMsg`/`KvWire` variant, the `AppendEntries` carrying every
+  `KvCommand` variant) and `raftkv-image/v1.bin` (one image, rows across
+  kinds, a tombstone, nonzero `max_ts`). The `codec::tests::sample_*` helpers
+  are the single construction of "every variant" — append-only, since they
+  define what the fixtures must decode to.
+- **`raftkv-wal` v1** (the per-group Raft WAL: `WalRecord<KvCommand, KvState>`
+  lines in `animus-control`'s `CWL1` envelope; `SWL1` for the shared WAL): the
+  durable, compatibility-relevant one. `KvCommand` is `serde_json` here, **not**
+  the binary codec, so its serde shape (field names, enum tags) is what the
+  fixture pins. `TxnWrite.stage_marker`/`pending` lost their pre-baseline
+  `#[serde(default)]` (a missing field is now a `Malformed` decode error, via
+  `txn::required_option` — serde otherwise defaults a missing `Option` field
+  to `None` even with no attribute). Fixture: `raftkv-wal/v1.bin`.
+- **`cp-engine-layout` v1** (`layout.rs`, ADR 0073 Phase 0 layer 4): the
+  per-tablet engine key-layout marker. Key `escape(RESERVED_NAMESPACE) ||
+  escape("cp_layout") || tablet_be` (an engine-global marker beside
+  `applied`/`hwm`/`seal`/`ceiling`/`split`/`trim_marker`; skipped by
+  `engine_image`/`has_data`/every kind scan), value `b"KLY1" || epoch(u8)`,
+  `LAYOUT_EPOCH = 1`. It is a reserved-namespace marker, **not** a new kind
+  byte (kind bytes index `ALL_KINDS`' scope table — see ADR 0073's layer 4
+  paragraph). Errors are `FormatError` (`cp-engine-layout`). Fixture:
+  `cp-engine-layout/v1.bin` (`u32`-BE-length-prefixed key, then value;
+  in-crate tests in `src/format_fixture_tests.rs`).
+  - **Check/stamp points.** `Reconciler::ensure_engine`, right after
+    `factory.open`: valid marker for this tablet → ok; absent + engine empty
+    (`latest_version() == 0`) → `put` the marker at version 1 (the first write
+    on a fresh engine — the Raft group, `InstallSnapshot`, `SeedBatch` and the
+    applied marker all start later); absent + non-empty (pre-baseline, or only
+    *another* tablet's marker: the key embeds the tablet id) → refuse; present
+    but undecodable/unknown epoch → refuse. The rebuilt-empty engine in the
+    destroy-and-rebuild branch is stamped too. `install_engine_image` only
+    merges, so an `InstallSnapshot` never deletes the marker (the image
+    carries kind rows only); a wiped engine reopens empty and is re-stamped.
+  - **Refusal never destroys.** A refusal logs at error, returns `None`
+    (tablet not hosted, claim released, `plan` re-emits next tick) and leaves
+    the engine byte-for-byte untouched.
+  - **Split children.** `materialize_split_child` opens/clones the child
+    engine itself (never through `ensure_engine`) and only caches it after
+    trim completes; `trim_split_child` writes the child's own layout marker in
+    the **same `write_batch` as its trim-completion marker**, so trim
+    completion implies the layout marker. A crash between `clone_engine` and
+    that batch leaves a cloned, non-empty, unstamped, untrimmed engine — the
+    existing resume branch (probe → open → trim marker absent → re-trim)
+    re-runs the batch and stamps it. After trim, `layout::verify` (no stamp)
+    guards hosting. The parent's marker may or may not be linked into the
+    clone (`clone_to_filtered` links only tables overlapping BASE/LSI/
+    FOOTPRINT ranges) and names the parent's tablet id anyway, so it is never
+    relied on. `ensure_engine` on a mid-materialize child (only reachable if
+    `plan` ordinary-`Host`s a tablet whose cloned-but-untrimmed engine exists)
+    refuses — conservative, and better than hosting an untrimmed clone.
+  - **Flush at stamp time (isolating the marker).** The `0x5F` marker sorts
+    above every kind scope, so left in the memtable with kind rows it would
+    make the first flushed SSTable span up to it and defeat
+    `clone_to_filtered`'s whole-file exclusion on a split until compaction.
+    So every stamp is followed by `EngineFactory::flush_engine(&engine)` — a
+    default-no-op trait hook (`StorageEngine` has no flush; `LsmEngine::
+    flush_now` is inherent) that an `LsmEngine`-backed factory implements as
+    `flush_now()`: after `ensure_engine` stamps a fresh (or rebuilt) engine,
+    and after a split child's trim batch (tombstones + trim marker + layout
+    marker, before any child kind row). A flush failure only logs (the marker
+    is WAL-durable; only the isolation is lost). **Every production
+    `EngineFactory` over `LsmEngine` must override `flush_engine`** —
+    `animusd`'s `LsmTabletFactory` included. `tests/engine_layout.rs::
+    the_stamp_lands_in_its_own_sstable_and_kind_rows_do_not_span_it` pins it
+    and `tests/inplace_split_dead_space.rs` passes unmodified. The other
+    engine-global markers (applied/hwm/seal/ceiling/split) are written only at
+    compaction/snapshot-install/special commands, so they rarely ride in a
+    first table; when they do, they widen that one table (pre-existing).
+  - **`factory.open` caller audit** (all in `host.rs`): `ensure_engine`
+    (host, `gather_facts`' `has_data` probe, the split parent) — checks;
+    `materialize_split_child`'s two direct opens/clone — stamped by the trim
+    batch and `verify`d; reclaim/`Release`/first-tick `local_tablets` reclaim
+    only `destroy` (never open) — need no check; `animusd` has no direct
+    `open` call (only `LsmTabletFactory`'s trait impl).
+  - **Gotcha: never route a layout refusal through destroy-and-rebuild.**
+    `ensure_engine`'s issue-#554 branch treats an `open` *error* as a lost
+    engine and destroys it; a layout refusal is a valid, readable engine this
+    build must not touch (pre-baseline or newer-version data). Keep the
+    refusal a plain `return None` before that `match` arm.
 
 ## Tests
 

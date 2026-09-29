@@ -13160,6 +13160,13 @@ impl animus_cp_data::host::EngineFactory<LsmEngine<ProdEnv>> for LsmTabletFactor
         }
     }
 
+    async fn flush_engine(&self, engine: &LsmEngine<ProdEnv>) -> Result<(), String> {
+        // ADR 0073 Phase 0 layer 4: isolate a freshly stamped layout marker
+        // in its own SSTable so it never widens the first kind-row table
+        // (which would defeat a split child's whole-file exclusion).
+        engine.flush_now().await.map_err(|e| e.to_string())
+    }
+
     async fn clone_engine(
         &self,
         source: &LsmEngine<ProdEnv>,

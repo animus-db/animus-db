@@ -120,6 +120,10 @@ impl EngineFactory<LsmEngine<SimEnv>> for LsmSimTabletFactory {
         Ok(engine)
     }
 
+    async fn flush_engine(&self, engine: &LsmEngine<SimEnv>) -> Result<(), String> {
+        engine.flush_now().await.map_err(|e| e.to_string())
+    }
+
     async fn probe(&self, tablet: TabletId) -> bool {
         let prefix = Self::prefix(tablet);
         self.env

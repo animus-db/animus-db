@@ -3,7 +3,7 @@
 //! `animus-cp-data`'s persist path behind `--shared-wal` since C-05 PR 2**.
 //!
 //! Once several tablets' `RaftCore` instances on one node persist into the
-//! SAME physical WAL file (each record tagged with its tablet, see
+//! SAME physical WAL file (each record a `SWL1`-tagged line carrying its tablet, see
 //! [`crate::persist::PersistedState::encode_tagged_record`]), those tablets'
 //! independent driver tasks become genuinely concurrent writers of one file.
 //! `SharedWal` serializes them and, where concurrent callers overlap, batches
@@ -74,7 +74,7 @@
 //!   other tablet's next ordinary compaction).
 //! - **Crash safety**: recovery after a crash mid-append, mid-sync, or
 //!   mid-rewrite yields, for every tablet, exactly its own last **durably
-//!   written** tail — `PersistedState::decode_tagged`'s per-record CRC32 +
+//!   written** tail — `PersistedState::decode_tagged`'s per-record `SWL1` CRC32 +
 //!   torn-tail tolerance (issue #495) already guarantees a torn trailing
 //!   write is dropped rather than corrupting recovery, and a rewrite
 //!   (`Disk::replace`) is atomic at the `Env` seam (either the old file or
@@ -506,7 +506,9 @@ where
     /// Recover a node's shared WAL file (C-05 PR 2): read `file` once (a
     /// missing file reads as empty, mirroring every per-group WAL's own
     /// `env.read(..).unwrap_or_default()` recovery convention), demux it via
-    /// [`PersistedState::decode_tagged`], and seed `group_tails` with every
+    /// [`PersistedState::decode_tagged`] (a torn tail is tolerated; a
+    /// pre-baseline/unknown-version/malformed `SWL1` line fails the open
+    /// loudly with `InvalidData`, never a silently-truncated recovery), and seed `group_tails` with every
     /// tablet's own record run found — **before any tablet's own driver
     /// starts**. This is the ONE seeding read: every later
     /// [`append_tagged`]/[`compact_group`]/[`forget`] call mutates the
@@ -517,7 +519,9 @@ where
     pub async fn open<E: Env>(env: &E, file: &str) -> io::Result<Arc<Self>> {
         let bytes = env.read(file).await.unwrap_or_default();
         let mut group_tails: BTreeMap<TabletId, Vec<WalRecord<C, S>>> = BTreeMap::new();
-        for (tablet, record) in PersistedState::<C, S>::decode_tagged(&bytes) {
+        let records = PersistedState::<C, S>::decode_tagged(&bytes)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{file}: {e}")))?;
+        for (tablet, record) in records {
             group_tails.entry(tablet).or_default().push(record);
         }
         Ok(Arc::new(Self {
@@ -704,7 +708,7 @@ mod tests {
         sim.run_until_quiescent(MAX_STEPS);
 
         let bytes = futures::executor::block_on(env.read(WAL)).expect("wal readable");
-        let demuxed = PersistedState::<MetaCommand, Metadata>::replay_multiplexed(&bytes);
+        let demuxed = PersistedState::<MetaCommand, Metadata>::replay_multiplexed(&bytes).unwrap();
         assert_eq!(demuxed.len(), N_TABLETS as usize);
         for t in 0..N_TABLETS {
             let state = &demuxed[&TabletId(t)];
@@ -801,7 +805,7 @@ mod tests {
         sim.run_until_quiescent(MAX_STEPS);
 
         let bytes = futures::executor::block_on(env.read(WAL)).expect("wal readable");
-        let demuxed = PersistedState::<MetaCommand, Metadata>::replay_multiplexed(&bytes);
+        let demuxed = PersistedState::<MetaCommand, Metadata>::replay_multiplexed(&bytes).unwrap();
         assert_eq!(
             demuxed.len(),
             N as usize,
@@ -863,7 +867,8 @@ mod tests {
         {
             let env = sim.env(node.clone());
             let bytes = futures::executor::block_on(env.read(WAL)).expect("wal readable");
-            let demuxed = PersistedState::<MetaCommand, Metadata>::replay_multiplexed(&bytes);
+            let demuxed =
+                PersistedState::<MetaCommand, Metadata>::replay_multiplexed(&bytes).unwrap();
             assert_eq!(demuxed[&t1].log.len(), 1);
             assert_eq!(demuxed[&t2].log.len(), 1);
 
@@ -898,7 +903,8 @@ mod tests {
         {
             let env = sim.env(node.clone());
             let bytes = futures::executor::block_on(env.read(WAL)).expect("wal readable");
-            let demuxed = PersistedState::<MetaCommand, Metadata>::replay_multiplexed(&bytes);
+            let demuxed =
+                PersistedState::<MetaCommand, Metadata>::replay_multiplexed(&bytes).unwrap();
 
             assert_eq!(demuxed.len(), 2);
             assert_eq!(demuxed[&t1].log.len(), 2);

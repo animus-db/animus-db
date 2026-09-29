@@ -17,10 +17,10 @@
 //! tombstone bit, `merge_tombstone`) and are never enveloped — the tag only
 //! ever applies to an actual value.
 //!
-//! Fresh clusters only (no live-deployment migration path, per house
-//! convention) — but see `codec.rs`'s `VERSION` bump for the wire/image
-//! format, which fails loudly on a mixed-version decode rather than silently
-//! misreading a pre-envelope value as raw client bytes.
+//! Pre-baseline data is not readable (ADR 0073 Phase 0): see `codec.rs`'s
+//! versioned wire/image format, which refuses a foreign or too-new frame by
+//! name rather than silently misreading a pre-envelope value as raw client
+//! bytes.
 //!
 //! ## The transaction record
 //!
@@ -348,6 +348,18 @@ impl TxnStatus {
     }
 }
 
+/// `deserialize_with` for an `Option` field that must be *present* in the
+/// JSON (`null` still decodes as `None`). serde's derive otherwise defaults a
+/// missing `Option` field to `None`, which would silently keep decoding
+/// pre-baseline shapes (ADR 0073 Phase 0).
+fn required_option<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    Option::<T>::deserialize(d)
+}
+
 /// One write action staged by a `KvCommand::TxnStage` (ADR 0046
 /// "materialize-at-resolve", A1): a base key/value plus, for a write
 /// against an indexed/streamed table, the derived kind-scope rows (LSI/
@@ -402,9 +414,11 @@ pub struct TxnWrite {
     /// envelope: it is consumed entirely by the stage's own apply, so
     /// `TxnResolve` never sees it. Prefix must lead with `key`'s own
     /// partition token — validated at apply like `kind_writes`' keys.
-    /// `#[serde(default)]` so every pre-existing wire/WAL shape decodes as
-    /// `None` (fresh-clusters; the binary codec bumps its version anyway).
-    #[serde(default)]
+    /// Required on the wire/WAL JSON (ADR 0073 Phase 0 dropped the
+    /// pre-baseline "absent decodes as `None`" default; `required_option`
+    /// is what makes it truly required — serde otherwise treats a missing
+    /// `Option` field as `None` even without `#[serde(default)]`).
+    #[serde(deserialize_with = "required_option")]
     pub stage_marker: Option<(Vec<u8>, Vec<u8>)>,
     /// **Apply-time evaluation (ADR 0054 step 4a).** When `Some`,
     /// `value`/`kind_writes`/`change_log` above are ignored at propose time
@@ -436,7 +450,9 @@ pub struct TxnWrite {
     /// `sk` alone (an image-less dirty-key marker, ADR 0049 §3), so it
     /// carries no state that could go stale and is still built once, at
     /// propose time, regardless of whether this field is set.
-    #[serde(default)]
+    ///
+    /// Required on the wire/WAL JSON, like `stage_marker` (ADR 0073 Phase 0).
+    #[serde(deserialize_with = "required_option")]
     pub pending: Option<PendingTxnWrite>,
 }
 

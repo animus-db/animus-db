@@ -759,3 +759,14 @@ identical reason — see ADR 0031's addendum for the full mechanism, and ADR
 replica's own compaction point actually safe (destroy-and-reopen alone is
 not — see `docs/engineering-lessons.md`'s matching entry for the gap this
 closes).
+
+## Amendment (2026-09-29) — the key layout is now versioned (ADR 0073 Phase 0)
+
+The `kind || logical` per-tablet engine key layout described above carries a
+layout-version marker since ADR 0073 Phase 0 workstream C, layer 4: an
+engine-global `RESERVED_NAMESPACE` key (`crates/animus-cp-data/src/layout.rs`,
+value `b"KLY1" || epoch`) stamped by `Reconciler::ensure_engine` on a fresh
+engine and checked on every open; an engine whose marker is missing (with data
+present) or names an unknown epoch is refused, never destroyed. It is a marker
+key, not a new kind byte — see ADR 0073's layer 4 as-built paragraph for why.
+Split children are stamped in their trim-completion batch.

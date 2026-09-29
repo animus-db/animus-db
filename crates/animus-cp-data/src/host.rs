@@ -36,12 +36,13 @@ use std::time::Duration;
 #[cfg(test)]
 use animus_env::nid;
 use animus_env::{Env, Metric, Nanos, NodeId};
-use animus_storage::{MemoryEngine, StorageEngine};
+use animus_storage::{MemoryEngine, StorageEngine, WriteBatch};
 use animus_tablet::{Epoch, KeyRange, SplitChild, Tablet, TabletId};
 
 use animus_control::SharedWal;
 
 use crate::heartbeat_batch::{DEFAULT_HEARTBEAT_BATCH_INTERVAL, HeartbeatBatcher};
+use crate::layout;
 use crate::trim_marker::trim_marker_key;
 use crate::{KvCommand, KvState, RaftKvNode, SHARED_WAL, StorageScope, WAL, wal_file};
 
@@ -71,6 +72,24 @@ pub trait EngineFactory<S: StorageEngine>: Send + Sync {
     /// closed. Idempotent — destroying an engine that never existed is a
     /// no-op.
     async fn destroy(&self, tablet: TabletId);
+
+    /// **Isolate what was just written into its own durable table** (ADR
+    /// 0073 layer 4). The reconciler calls this right after it writes an
+    /// engine-global layout marker (a `RESERVED_NAMESPACE` key, sorting above
+    /// every kind scope) into an engine's memtable that kind rows are about
+    /// to join — after stamping a fresh empty engine, and after a split
+    /// child's trim batch. Left in the memtable, the marker would ride into
+    /// the first flushed SSTable, whose `[min_key, max_key]` then spans
+    /// every kind scope up to the marker and can never be excluded
+    /// whole-file by `clone_to_filtered` from a later split child. A
+    /// backend with a memtable flush (`LsmEngine::flush_now`) overrides this
+    /// to flush; the default no-op is correct for a backend with no
+    /// SSTables ([`MemoryTabletEngines`]). Failure is only ever a missed
+    /// optimization (the marker is already durable via the WAL), never a
+    /// correctness issue, so the reconciler logs and continues.
+    async fn flush_engine(&self, _engine: &S) -> Result<(), String> {
+        Ok(())
+    }
 
     /// **In-place split materialization** (ADR 0058 Train 2 rung 3, Stage
     /// 3): clone `source`'s CURRENT durable state into a NEW, independent
@@ -1173,6 +1192,20 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
         }
     }
 
+    /// [`EngineFactory::flush_engine`], logging (never propagating) a failure
+    /// — see that method's doc.
+    async fn flush_isolated(&self, tablet: TabletId, engine: &S) {
+        if let Err(e) = self.factory.flush_engine(engine).await {
+            tracing::warn!(
+                tablet = tablet.0,
+                %e,
+                "reconciler: flushing an engine's layout marker into its own table failed \
+                 (the marker is durable via the WAL; only the split dead-space isolation is \
+                 lost until compaction)"
+            );
+        }
+    }
+
     /// Get-or-open `tablet`'s own engine, caching the handle.
     ///
     /// **Engine-loss recovery (issue #554).** A first `factory.open` failure
@@ -1211,6 +1244,25 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
         }
         match self.factory.open(tablet).await {
             Ok(engine) => {
+                // ADR 0073 Phase 0 layer 4: check (or, on a fresh empty
+                // engine, stamp) the layout marker BEFORE anything else can
+                // write to this engine. A refusal is deliberately NOT routed
+                // into the destroy-and-rebuild branch below — that would
+                // erase a pre-baseline or newer-version engine's data.
+                match layout::check_or_stamp(&engine, tablet.0).await {
+                    Ok(true) => self.flush_isolated(tablet, &engine).await,
+                    Ok(false) => {}
+                    Err(e) => {
+                        tracing::error!(
+                            tablet = tablet.0,
+                            %e,
+                            "reconciler: refusing to host a tablet whose engine layout marker \
+                             is missing/unsupported/unreadable — engine left untouched (never \
+                             destroyed), will retry next tick"
+                        );
+                        return None;
+                    }
+                }
                 self.engines.insert(tablet, engine.clone());
                 Some(engine)
             }
@@ -1225,6 +1277,21 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
                 self.factory.destroy(tablet).await;
                 match self.factory.open(tablet).await {
                     Ok(engine) => {
+                        // A rebuilt engine is empty: stamp it (first write).
+                        match layout::check_or_stamp(&engine, tablet.0).await {
+                            Ok(true) => self.flush_isolated(tablet, &engine).await,
+                            Ok(false) => {}
+                            Err(e) => {
+                                tracing::error!(
+                                    tablet = tablet.0,
+                                    %e,
+                                    "reconciler: stamping a rebuilt tablet engine's layout \
+                                     marker failed"
+                                );
+                                self.env.metrics().incr(Metric::CpEngineRebuildFailed);
+                                return None;
+                            }
+                        }
                         tracing::warn!(
                             tablet = tablet.0,
                             "reconciler: rebuilt tablet engine from nothing after an open \
@@ -1804,6 +1871,7 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
                             self.state.split_forming.remove(&child.id);
                             return;
                         }
+                        self.flush_isolated(child.id, &engine).await;
                         Some(engine)
                     }
                     Err(e) => {
@@ -1921,6 +1989,7 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
                 self.state.split_forming.remove(&child.id);
                 return;
             }
+            self.flush_isolated(child.id, &engine).await;
             if rebuilding {
                 tracing::warn!(
                     child = child.id.0,
@@ -1932,6 +2001,23 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
             }
             engine
         };
+        // ADR 0073 Phase 0 layer 4: by here trim completed (marker batch, or
+        // the resume branch's marker check), and the trim batch carries this
+        // child's own layout marker — verify (never stamp, never destroy) so
+        // an engine trimmed by a build that did not write one is refused
+        // rather than hosted unstamped.
+        if let Err(e) = layout::verify(&engine, child.id.0).await {
+            tracing::error!(
+                child = child.id.0,
+                parent = parent.0,
+                %e,
+                "reconciler: refusing to host a split child whose engine layout marker is \
+                 missing/unsupported — engine left untouched"
+            );
+            self.state.release_unconfirmed_host(child.id);
+            self.state.split_forming.remove(&child.id);
+            return;
+        }
         self.engines.insert(child.id, engine.clone());
         let scope = StorageScope::new(range);
         let voters: Vec<NodeId> = bootstrap_voters.into_iter().collect();
@@ -2430,10 +2516,18 @@ async fn trim_split_child<S: StorageEngine>(
     // resume branch treats its absence as proof that no attempt has ever
     // reached this point, so re-running the whole function is always safe
     // (see this function's own doc and `trim_marker.rs`'s module doc).
-    engine
-        .put(&trim_marker_key(child.0), &[], version)
-        .await
-        .map_err(|e| e.to_string())
+    //
+    // ADR 0073 Phase 0 layer 4: the child's OWN layout marker rides in the
+    // same write batch (one WAL record, atomic), so trim completion implies a
+    // layout marker. The cloned engine may or may not carry the parent's
+    // marker (`clone_engine` links only SSTables overlapping
+    // BASE/LSI/FOOTPRINT ranges) and if it does it names the parent's tablet
+    // id, so it is never relied on.
+    let batch = layout::add_stamp(
+        WriteBatch::new(version).put(trim_marker_key(child.0), Vec::new()),
+        child.0,
+    );
+    engine.write_batch(batch).await.map_err(|e| e.to_string())
 }
 
 /// Has `child`'s own [`trim_split_child`] fully completed on `engine`
