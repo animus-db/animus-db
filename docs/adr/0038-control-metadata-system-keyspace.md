@@ -475,6 +475,63 @@ inside the scan, asserting the watermark/cache at the first `is_leader()`;
 red on the old ordering, green on the new, replayable from its seed), and
 the `animusd` test's assertions now print their observed watermarks.
 
+## Amendment (2026-09-28, ADR 0073 Phase 0 workstream B PR 3 — a system-keyspace format-version row, independent of `Metadata`'s own new `"v"` field)
+
+ADR 0073 Phase 0 gave `Metadata` its own top-level `"v"` JSON field
+(`meta::METADATA_VERSION`). Naively, that looks like it should be enough to
+version this system keyspace too — but it isn't, and the reason is exactly
+this ADR's own central fact restated: **`Metadata` is `DRIVER_APPLIED`, so
+its own `Serialize`/`Deserialize` impl is never what actually reaches this
+engine.** The real durable state is the per-key system-keyspace rows this
+ADR defines (`syskv.rs`'s `EntityKind`s), derived by `mirror.rs` and merged
+in by the apply task (`node.rs`'s `meta_apply_and_compact`) — a real
+`Metadata` value is serialized only in the WAL's always-meaningless
+`Snapshot` record (`persist.rs`, `metadata: Metadata::default()`, never
+read back) and by the toy non-`DRIVER_APPLIED` test state machine this
+crate's `raft.rs` genericity proof uses. `Metadata::version` riding through
+either of those tells this engine nothing about its own on-disk layout.
+
+The fix is a second, independent version signal scoped to this engine
+specifically: `mirror::SYSKV_FORMAT_VERSION_COUNTER` (`"syskv_format_
+version"`, an ordinary `EntityKind::Counter` row — no new `EntityKind`
+needed) and `mirror::SYSKV_MIRROR_VERSION` (currently `1`, the same "reset
+to 1 under Phase 0" convention `METADATA_VERSION` follows). Written
+unconditionally by every durable apply-task batch, right alongside the
+pre-existing `_applied_index` watermark this ADR already defines — the
+identical "one row this engine's own bookkeeping owns outright" shape.
+**Deliberately excluded from the delta ring** (`delta_ring.rs`): it is
+mirror-internal, not part of the `Metadata` a `WatchMetadata` caller
+actually wants, exactly like `_applied_index` itself is already excluded.
+
+`mirror::rebuild_metadata_from_engine` — this ADR's own restart-rebuild
+primitive — now returns `Result<Metadata, mirror::RebuildError>` in place
+of a bare `Result<Metadata, StorageError>`: a **non-empty** reserved
+keyspace with no version row is a named, loud
+`FormatError::PreBaselineFormat { format: "syskv-mirror" }` (every write
+this ADR's own apply task makes now carries the row, so its absence on a
+populated keyspace means genuinely pre-baseline on-disk state); an
+unrecognized version is `FormatError::UnsupportedFormatVersion`; a
+genuinely **empty** keyspace (this ADR's own "a brand-new node's first-ever
+boot" case) is `Ok`, since there is nothing yet to check. Both of this
+function's real call sites — `meta_apply_seed` (this ADR's own one-time
+startup seed, issue #1024's amendment above) and
+`meta_apply_and_compact`'s post-`InstallSnapshot` rebuild — give a
+`RebuildError::Format` the identical halt-not-panic treatment ADR 0073
+workstream B PR 2 already established for `install_syskv_image`'s own
+decode failure (log the named error at `error`, latch `halted`, return
+without advancing `watermark`/`cache`/`engine_applied`/the delta ring/
+`watch`); a `RebuildError::Storage` keeps this ADR's pre-existing hard-panic
+discipline for a real backend fault at either site, unchanged.
+
+The general lesson — a `DRIVER_APPLIED` type's own version field doesn't
+version storage that never serializes the type, so a mirror standing in
+front of one needs its own independent version signal — is recorded at
+`docs/lessons/code-patterns/2026-09-28-a-types-own-version-field-does-not-
+version-storage-that-never-serializes-the-type.md`. See
+`crates/animus-control/CLAUDE.md`'s "Versioned formats" section for the
+full mechanical account (including the deliberately-left-red
+`control-wal` fixture gap this same PR reports rather than papers over).
+
 ## See also
 
 - `crates/animus-control/CLAUDE.md` — `node.rs`/`raft.rs`/`mirror.rs`/`syskv.rs`/

@@ -11,10 +11,12 @@
 //! first real writer: it derives per-command system-keyspace writes from
 //! these keys and shadow-mirrors them into a `StorageEngine` **after** the
 //! unchanged in-core `Metadata::apply` still runs (`DRIVER_APPLIED` stays
-//! `false` — dual-write, zero behavior change). PR2 also added three
-//! [`EntityKind`] variants (`Counter`/`CpMemberAddr`, plus a third, `NodeIdAlloc`,
-//! since removed in ADR 0040 PR4 with the allocator it mirrored) this
-//! module's doc covers inline where they're declared.
+//! `false` — dual-write, zero behavior change). PR2 also added an
+//! [`EntityKind`] variant, `Counter` (plus two others since removed:
+//! `NodeIdAlloc`, retired in ADR 0040 PR4 with the allocator it mirrored, and
+//! `CpMemberAddr`, retired 2026-09-28 in ADR 0073 Phase 0 with the legacy
+//! CP-member address book it mirrored) this module's doc covers inline where
+//! it's declared.
 //!
 //! ## Key layout
 //!
@@ -83,17 +85,20 @@ pub fn is_reserved_name(name: &str) -> bool {
 /// One system-keyspace entity kind (ADR 0038). Each gets its own segment so a
 /// command touches only the keys of the entities it actually mutates.
 ///
-/// `Counter`/`CpMemberAddr` were added in PR2 alongside the mirror itself
-/// (`mirror.rs`) — PR1 only encoded the seven fields a shadow rebuild can
-/// reconstruct without them, but a **byte-identical** `Metadata` round trip
-/// (the differential-oracle test) also needs `Metadata`'s monotonic tablet-id
-/// allocator (`next_tablet_id`) and the legacy CP-member address book
-/// (`cp_member_addrs`/`cp_member_tablets`) — so PR2 extends the enum rather
-/// than leaving those fields unmirrored. A third PR2 variant, `NodeIdAlloc`
-/// (the ADR 0036 `AllocateNodeId` idempotency ledger), was **removed in ADR
-/// 0040 PR4** alongside the allocator it mirrored — `RegisterNode`'s claim
-/// lives entirely in the already-mirrored `Member`/`NodeAddrs` kinds, no
-/// separate ledger needed. Additive since: every PR1 key a running system
+/// `Counter` was added in PR2 alongside the mirror itself (`mirror.rs`) —
+/// PR1 only encoded the seven fields a shadow rebuild can reconstruct
+/// without them, but a **byte-identical** `Metadata` round trip (the
+/// differential-oracle test) also needs `Metadata`'s monotonic tablet-id
+/// allocator (`next_tablet_id`) — so PR2 extends the enum rather than
+/// leaving that field unmirrored. Two other PR2 variants have since been
+/// removed: `NodeIdAlloc` (the ADR 0036 `AllocateNodeId` idempotency
+/// ledger), **removed in ADR 0040 PR4** alongside the allocator it
+/// mirrored — `RegisterNode`'s claim lives entirely in the
+/// already-mirrored `Member`/`NodeAddrs` kinds, no separate ledger needed
+/// — and `CpMemberAddr` (the legacy CP-group member address book),
+/// **removed 2026-09-28 in ADR 0073 Phase 0** alongside
+/// `MetaCommand::RegisterCpAddr` and `Metadata::cp_member_addrs`/
+/// `cp_member_tablets`. Additive since: every PR1 key a running system
 /// produced still decodes identically (`from_segment` only gained arms,
 /// `as_str` only gained cases).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -120,11 +125,6 @@ pub enum EntityKind {
     /// [`applied_index_key`]) so a new counter can be added later without
     /// inventing a third key shape.
     Counter,
-    /// A legacy CP-group member's address registration
-    /// (`Metadata::cp_member_addrs`/`Metadata::cp_member_tablets`, mutated
-    /// only by the back-compat-only `MetaCommand::RegisterCpAddr`), keyed by
-    /// [`NodeId`] (PR2).
-    CpMemberAddr,
     /// A stream-shard segment catalog row (`Metadata::stream_shards`, ADR
     /// 0042 §3/ADR 0043 §A8), keyed by the composite `(TabletId, epoch)`
     /// pair — 16 raw bytes (`tablet.to_be_bytes() ++ epoch.to_be_bytes()`,
@@ -231,7 +231,6 @@ impl EntityKind {
             EntityKind::Policy => "policy",
             EntityKind::NodeAddrs => "node_addrs",
             EntityKind::Counter => "counter",
-            EntityKind::CpMemberAddr => "cp_member_addr",
             EntityKind::StreamShard => "stream_shard",
             EntityKind::IndexBackfill => "index_backfill",
             EntityKind::SplitLineage => "split_lineage",
@@ -262,7 +261,6 @@ impl EntityKind {
             b"policy" => EntityKind::Policy,
             b"node_addrs" => EntityKind::NodeAddrs,
             b"counter" => EntityKind::Counter,
-            b"cp_member_addr" => EntityKind::CpMemberAddr,
             b"stream_shard" => EntityKind::StreamShard,
             b"index_backfill" => EntityKind::IndexBackfill,
             b"split_lineage" => EntityKind::SplitLineage,
@@ -426,14 +424,6 @@ pub fn pitr_generation_table(id: &[u8]) -> Option<&str> {
     std::str::from_utf8(id)
         .ok()?
         .strip_prefix(PITR_GENERATION_COUNTER_PREFIX)
-}
-
-/// A [`NodeId`]'s key under [`EntityKind::CpMemberAddr`] (PR2, the legacy
-/// `Metadata::cp_member_addrs`/`cp_member_tablets` pair). See [`member_key`]'s
-/// doc for the ADR 0040 PR3 string-id encoding change.
-#[must_use]
-pub fn cp_member_addr_key(id: &NodeId) -> Vec<u8> {
-    entity_key(EntityKind::CpMemberAddr, id.as_str().as_bytes())
 }
 
 /// A copy-based split child [`TabletId`]'s key under
@@ -674,14 +664,13 @@ mod tests {
     // `Restore` — pre-existing drift from `EntityKind`'s real variant count,
     // out of this change's scope to backfill (see `docs/engineering-
     // lessons.md`). The two kinds this PR adds ARE included below.
-    const ALL_KINDS: [EntityKind; 11] = [
+    const ALL_KINDS: [EntityKind; 10] = [
         EntityKind::Tablet,
         EntityKind::Member,
         EntityKind::Schema,
         EntityKind::Policy,
         EntityKind::NodeAddrs,
         EntityKind::Counter,
-        EntityKind::CpMemberAddr,
         EntityKind::StreamShard,
         EntityKind::IndexBackfill,
         EntityKind::PitrSegment,
@@ -977,18 +966,6 @@ mod tests {
     }
 
     #[test]
-    fn cp_member_addr_key_round_trips() {
-        let key = cp_member_addr_key(&nid(1301));
-        assert_eq!(
-            decode_key(&key),
-            Some(DecodedKey::Entity {
-                kind: EntityKind::CpMemberAddr,
-                id: b"n1301".to_vec(),
-            })
-        );
-    }
-
-    #[test]
     fn ids_containing_zero_bytes_round_trip() {
         // A table/keyspace name is arbitrary UTF-8; exercise the escape's own
         // 0x00-doubling path through this module's composite key, not just
@@ -1076,7 +1053,7 @@ mod tests {
     /// concatenation would hit — one minted id's string being a literal
     /// prefix of another's (e.g. `"n1"` vs `"n10"`, or `nid`-style ids at
     /// different digit widths). Exercises the real `member_key`/
-    /// `node_addrs_key`/`cp_member_addr_key` helpers directly (not just the
+    /// `node_addrs_key` helpers directly (not just the
     /// generic `entity_key` the test above already covers) so a regression in
     /// any one of them is caught even if the others stay correct.
     #[test]
@@ -1092,8 +1069,6 @@ mod tests {
                 member_key(&long),
                 node_addrs_key(&short),
                 node_addrs_key(&long),
-                cp_member_addr_key(&short),
-                cp_member_addr_key(&long),
             ];
             let sorted = {
                 let mut k = keys.clone();
@@ -1115,7 +1090,7 @@ mod tests {
             keys.sort();
             assert_eq!(keys, sorted);
             keys.dedup();
-            assert_eq!(keys.len(), 6, "every key must be distinct");
+            assert_eq!(keys.len(), 4, "every key must be distinct");
         }
     }
 

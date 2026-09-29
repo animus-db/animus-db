@@ -44,7 +44,6 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use animus_control::PlacementPolicy;
-use animus_env::nid;
 use animus_tablet::TabletId;
 use animusd::{ClientRequest, ClientResponse, ColumnType, MetaCommand, Node, TableSchema};
 use serde_json::Value;
@@ -237,24 +236,6 @@ async fn system_table_lists_every_seeded_entity_kind() {
         )
         .await;
 
-        // ---- CpMemberAddr (legacy) --------------------------------------------
-        let resp = call(
-            client,
-            ClientRequest::ProposeSchema(MetaCommand::RegisterCpAddr {
-                id: nid(9999),
-                addr: "127.0.0.1:1".to_string(),
-                tablet: Some(TabletId(1)),
-            }),
-        )
-        .await;
-        assert!(matches!(resp, ClientResponse::PutOk), "{resp:?}");
-        await_status(
-            admin,
-            |s| s["cp_member_addrs"].get("n9999").is_some(),
-            "cp_member_addr committed",
-        )
-        .await;
-
         // ---- SplitLineage: an in-place split round ---------------------------
         // ADR 0058/0062: BeginSplitInPlace+Cutover on the (empty) bootstrap
         // tablet, children inheriting the parent's own replicas verbatim —
@@ -301,14 +282,13 @@ async fn system_table_lists_every_seeded_entity_kind() {
             .expect("a sibling tablet exists after split");
 
         // ---- every seeded kind eventually shows up in the browse surface ----
-        const EXPECT_KINDS: [&str; 8] = [
+        const EXPECT_KINDS: [&str; 7] = [
             "tablet",
             "member",
             "schema",
             "policy",
             "node_addrs",
             "counter",
-            "cp_member_addr",
             // ADR 0050 fork F9: the cutover above froze this lineage row.
             "split_lineage",
         ];
@@ -399,9 +379,6 @@ async fn system_table_lists_every_seeded_entity_kind() {
             counter_item["value"].is_u64(),
             "counter value is a raw u64 rendered as a JSON number: {counter_item}"
         );
-
-        let cp_addr_item = find("cp_member_addr", "n9999");
-        assert!(cp_addr_item["value"].is_object());
 
         // ---- kind filter narrows correctly -----------------------------------
         let (s, filtered) = admin_get(admin, "/admin/system-table?kind=schema&limit=1000").await;

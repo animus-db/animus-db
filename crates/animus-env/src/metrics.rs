@@ -907,6 +907,23 @@ pub enum Metric {
     /// never-hosted-consumer case this cap exists to bound rather than let
     /// grow without limit.
     DemuxFramesDroppedOverflow,
+    /// The current length of `ProdEnv`'s own `Inner::tasks` — the number of
+    /// `tokio::task::AbortHandle`s it is tracking for `shutdown`/
+    /// `shutdown_and_wait`, after whatever pruning `Spawner::spawn` has
+    /// already done (the ProdEnv task-handle-leak fix: this vec used to be
+    /// append-only for the lifetime of the env, so it — and the task
+    /// `Cell`s a live `AbortHandle` pins — grew without bound on any
+    /// per-message spawn path, most importantly `send_stream`'s one task
+    /// per outbound frame). A **level**, overwritten via `MetricsHandle::
+    /// set` on every `spawn` call (not incremented) — the same
+    /// last-write-wins shape a gauge-repurposed counter slot uses elsewhere
+    /// in this enum (see e.g. `CpGroupsQuiesced`'s own doc). Expected to
+    /// stay within a small constant factor (about 2x) of the genuinely
+    /// live spawned-task count in steady state; a sustained value far above
+    /// that, or one that keeps climbing, points at a caller spawning
+    /// without ever letting its tasks finish (a real leak, not this
+    /// bounded-pruning mechanism doing its job).
+    SpawnedTaskHandlesTracked,
 
     // --- Issue #1061 removal notice (ADR 0058's 2026-09-28/29 amendments) ---
     // Appended after the handshake variants above (same slot-stability
@@ -936,7 +953,7 @@ pub enum Metric {
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 108] = [
+    pub const ALL: [Metric; 109] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -1041,6 +1058,7 @@ impl Metric {
         Metric::DemuxQueuedBytes,
         Metric::DemuxFramesDroppedClosed,
         Metric::DemuxFramesDroppedOverflow,
+        Metric::SpawnedTaskHandlesTracked,
         Metric::CpRemovalNoticesSent,
         Metric::CpRemovalNoticesAcked,
         Metric::CpRemovalNoticesIgnored,
@@ -1156,6 +1174,7 @@ impl Metric {
             Metric::DemuxQueuedBytes => "demux_queued_bytes",
             Metric::DemuxFramesDroppedClosed => "demux_frames_dropped_closed",
             Metric::DemuxFramesDroppedOverflow => "demux_frames_dropped_overflow",
+            Metric::SpawnedTaskHandlesTracked => "spawned_task_handles_tracked",
             Metric::CpRemovalNoticesSent => "cp_removal_notices_sent",
             Metric::CpRemovalNoticesAcked => "cp_removal_notices_acked",
             Metric::CpRemovalNoticesIgnored => "cp_removal_notices_ignored",

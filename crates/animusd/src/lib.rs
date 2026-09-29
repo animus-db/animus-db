@@ -5832,8 +5832,8 @@ impl BoundNode {
         // **peer-sync loop** (ADR 0040 PR1: one identity per node, one
         // shared internal env — this collapses the pre-PR1 `peer_sync_loop`/
         // `control_peer_sync_loop` pair into one loop over one book): it
-        // rebuilds this node's env peer book as `static ∪ Metadata.
-        // cp_member_addrs ∪ Metadata.node_addrs[*].internal` so a
+        // rebuilds this node's env peer book as `static ∪
+        // Metadata.node_addrs[*].internal` so a
         // runtime-joined member (CP group replica, split sibling, or
         // runtime-added control voter alike) becomes reachable.
         let static_peers = peers;
@@ -6261,8 +6261,8 @@ impl BoundNode {
 
         // Peer-sync loop (ADR 0040 PR1: one loop over one shared env — this
         // collapses the pre-PR1 `peer_sync_loop`/`control_peer_sync_loop`
-        // pair): keep this node's env peer book = `static ∪ Metadata.
-        // cp_member_addrs ∪ Metadata.node_addrs[*].internal`, so a
+        // pair): keep this node's env peer book = `static ∪
+        // Metadata.node_addrs[*].internal`, so a
         // runtime-registered member (split sibling / joined node / a control
         // voter added at runtime) becomes reachable for both the control
         // Raft and this node's per-tablet Raft groups alike (same env, same
@@ -12672,7 +12672,7 @@ mod bootstrap_active_upserts_tests {
 const PEER_SYNC_INTERVAL: Duration = Duration::from_millis(200);
 
 /// Keep this node's one internal env's peer book = the **static** book ∪ the
-/// replicated `Metadata.cp_member_addrs` ∪ `Metadata.node_addrs[*].internal`
+/// replicated `Metadata.node_addrs[*].internal`
 /// (ADR 0032 PR1's node address book, ADR 0040 PR1's merge of the old
 /// `raftkv`/`control` address pair into one `internal` field — a runtime-
 /// registered member's address, whatever role it runs, lands in this one
@@ -12686,7 +12686,7 @@ const PEER_SYNC_INTERVAL: Duration = Duration::from_millis(200);
 ///
 /// Takes the whole [`ClientCtx`] (not a bare `RaftNode`) so a control-plane-
 /// follower-less growth node (ADR 0030) reads `effective_metadata` — its mirror
-/// of the real cluster's `cp_member_addrs`/`node_addrs` — instead of its own
+/// of the real cluster's `node_addrs` — instead of its own
 /// never-replicated local raft; every other node is unaffected (`effective_metadata`
 /// passes through to `raft.metadata()` there).
 async fn peer_sync_loop(ctx: ClientCtx, env: ProdEnv, static_peers: BTreeMap<NodeId, String>) {
@@ -12695,11 +12695,8 @@ async fn peer_sync_loop(ctx: ClientCtx, env: ProdEnv, static_peers: BTreeMap<Nod
         let meta = ctx.effective_metadata();
         // `Metadata`'s own address book is already `host:port` strings —
         // ProdEnv's peer book is too (the advertise/dial split groundwork),
-        // so both overlays are now straight inserts, no parse/re-stringify
+        // so this overlay is a straight insert, no parse/re-stringify
         // boundary crossing at every tick.
-        for (id, addr) in meta.cp_member_addrs {
-            book.insert(id, addr);
-        }
         for (id, addrs) in meta.node_addrs {
             book.insert(id, addrs.internal);
         }

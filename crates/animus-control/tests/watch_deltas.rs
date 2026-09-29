@@ -165,22 +165,8 @@ fn run_scenario(seed: u64) {
             seed,
             "after split",
         );
-        // `DropTableTablets`' cp-member-addr prune exercises a `Delete` — the
-        // half `rebuild_metadata_from_engine`'s bulk path never exercises.
-        nodes[leader].propose(MetaCommand::RegisterCpAddr {
-            id: nid(999),
-            addr: "127.0.0.1:9".to_string(),
-            tablet: Some(TabletId(2)),
-        });
-        sim.run_for(Duration::from_millis(500));
-        last_seen = assert_delta_matches_full_fetch(
-            &nodes[leader],
-            &mut mirror_state,
-            last_seen,
-            seed,
-            "after register-cp-addr",
-        );
-
+        // `DropTableTablets` exercises a `Delete` — the half
+        // `rebuild_metadata_from_engine`'s bulk path never exercises.
         nodes[leader].propose(MetaCommand::DropTableTablets {
             table: "orders".to_string(),
         });

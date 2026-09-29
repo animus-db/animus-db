@@ -108,6 +108,10 @@ on:
         description: "Seeds per cell (ANIMUS_SHAREDWAL_SEEDS, ADR 0028 C-05 PR 2 SharedWal cross-tablet ordering/crash-safety/GC fault corpus)"
         required: false
         default: "40"
+      learner_snapshot_livelock_seeds:
+        description: "Seeds (ANIMUS_LEARNER_SNAPSHOT_LIVELOCK_SEEDS, issue #1064/#1092 late-joining-learner-under-a-continuous-writer corpus; ~10s per seed)"
+        required: false
+        default: "16"
 
 # One deep run at a time. The corpora are long-running and share the same
 # runner class as CI, so an on-demand `workflow_dispatch` queues behind a
@@ -514,6 +518,19 @@ jobs:
           ANIMUS_SHAREDWAL_SEEDS: ${{ github.event.inputs.sharedwal_seeds || '40' }}
         run: cargo test -p animus-cp-data --test sharedwal_fault_corpus -- --nocapture
 
+      # Issue #1064/#1092: a late-joining learner needing a real multi-chunk
+      # InstallSnapshot under a writer that never stops, one corpus seed per
+      # scenario. Each seed is a pure function of its seed, so a failure names
+      # the seed and is replayable. ~10s of real time per seed, hence the
+      # smaller default depth and the wider timeout.
+      - name: deep late-joining-learner snapshot livelock corpus (issue #1064/#1092)
+        id: learner_snapshot_livelock
+        continue-on-error: true
+        timeout-minutes: 15
+        env:
+          ANIMUS_LEARNER_SNAPSHOT_LIVELOCK_SEEDS: ${{ github.event.inputs.learner_snapshot_livelock_seeds || '16' }}
+        run: cargo test -p animus-cp-data --test learner_snapshot_livelock_under_continuous_writer -- --nocapture
+
       # Turns each corpus step's individually-recorded outcome back into one
       # overall job failure. `if: always()` makes this step run even though
       # every step above may have failed; without it, this step itself would
@@ -551,10 +568,11 @@ jobs:
             [export_import]="${{ steps.export_import.outcome }}"
             [heartbeat]="${{ steps.heartbeat.outcome }}"
             [sharedwal]="${{ steps.sharedwal.outcome }}"
+            [learner_snapshot_livelock]="${{ steps.learner_snapshot_livelock.outcome }}"
           )
           failed=0
           failed_names=()
-          for name in raftkv raftkv_lsm raftkv_wal_faults txn streams backfill split reconciler quiesce learner reconfigure_drop inplace_split backup pitr lsm_crash lsm_disk_fault lsm_encrypted segment_store_encrypted control simcluster dynamo_wire export_import heartbeat sharedwal; do
+          for name in raftkv raftkv_lsm raftkv_wal_faults txn streams backfill split reconciler quiesce learner reconfigure_drop inplace_split backup pitr lsm_crash lsm_disk_fault lsm_encrypted segment_store_encrypted control simcluster dynamo_wire export_import heartbeat sharedwal learner_snapshot_livelock; do
             outcome="${outcomes[$name]}"
             echo "${name}: ${outcome}"
             if [ "${outcome}" != "success" ]; then

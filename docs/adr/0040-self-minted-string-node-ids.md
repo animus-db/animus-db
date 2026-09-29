@@ -418,3 +418,9 @@ port-set-across-retries-only-relocates-the-toctou-bind-and-hold-before-
 claim.md` for the full account, including why the test helpers' own
 pre-existing "freeze the address set across retries" mitigation was a real
 but incomplete fix for this same hazard.
+
+## 2026-09-28 (ADR 0073 Phase 0)
+
+`RegisterCpAddr`/`cp_member_addrs`/`EntityKind::CpMemberAddr` deleted — the
+WAL back-compat reason no longer holds after the Phase 0 reset —
+`node_addrs[*].internal` is the only address source.

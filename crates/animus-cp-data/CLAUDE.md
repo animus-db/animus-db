@@ -2148,7 +2148,13 @@ disambiguation is needed.
     compaction rewrite), the interleaving that bit the two reverted fix attempts
     is a microsecond window no wall-clock test can hit, and the defect is closed
     structurally instead (one shared `drain_for_round`, plus a `fully_durable`
-    release that needs no round number to be right). **`persist_wal` is
+    release that needs no round number to be right). **`persist_wal` issues ONE `env.append` per round
+    (all drained records concatenated) plus one `env.sync`, never one append per
+    record** (issue #1092: per-record appends made a 512-entry `AppendEntries`
+    batch cost 513 disk latencies on a `sync_delay` `SimEnv` disk — a joining
+    learner's ack sat gated behind one round for ~10s of virtual time, which
+    read as a replication stall; regression `tests/wal_round_single_append.rs`,
+    see `docs/lessons/testing/2026-09-29-a-slow-disk-model-must-price-a-batch-once-not-per-record.md`). **`persist_wal` is
     halted-gated** (issue #278 item 1, mirroring the apply task's `env.replace`
     compaction-error handling immediately below): an `env.append`/`env.sync`
     error is tolerated — no `mark_durable_through`, no `apply_signal` notify,

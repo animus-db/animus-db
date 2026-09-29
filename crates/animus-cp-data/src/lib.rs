@@ -7421,17 +7421,25 @@ async fn persist_wal<E: Env>(
         }
         metrics.incr(Metric::CpSharedWalSyncs);
     } else {
+        // Issue #1092: ONE `append` for the whole round, not one per record.
+        // The WAL is line-framed, so the concatenation is byte-identical to
+        // the per-record sequence; what changes is the cost model. A round
+        // is one physical write + one `fsync` (exactly what the `SharedWal`
+        // branch above already does), so a 512-entry `AppendEntries` batch
+        // costs a slow disk two latencies, not 513 — per-record appends made
+        // a joining learner's persist round for one MAX_APPEND_ENTRIES_BATCH
+        // batch outlast the whole run on a slow-disk `SimEnv` node (and, on
+        // `ProdEnv`, cost one `open` + `write` + `flush` per record).
+        let mut buf = Vec::new();
         for record in &records {
-            if let Err(e) = env
-                .append(wal, &PersistedState::encode_record(record))
-                .await
-            {
-                assert!(
-                    halted.load(Ordering::SeqCst),
-                    "raftkv wal append failed while running: {e}"
-                );
-                return;
-            }
+            buf.extend(PersistedState::encode_record(record));
+        }
+        if let Err(e) = env.append(wal, &buf).await {
+            assert!(
+                halted.load(Ordering::SeqCst),
+                "raftkv wal append failed while running: {e}"
+            );
+            return;
         }
         if let Err(e) = env.sync(wal).await {
             assert!(

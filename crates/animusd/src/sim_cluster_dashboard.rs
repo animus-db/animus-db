@@ -298,16 +298,15 @@ fn run_u01_render_only_fixes(seed: u64) {
         "seed={seed}: the ring buffer is served under \"samples\": {history_body}"
     );
 
-    // ---- 5. SYSTEM_TABLE_KINDS extended to all 16 EntityKind variants --
+    // ---- 5. SYSTEM_TABLE_KINDS extended to all 15 EntityKind variants --
     use animus_control::syskv::EntityKind;
-    let expected_kinds: [&str; 16] = [
+    let expected_kinds: [&str; 15] = [
         EntityKind::Tablet.as_str(),
         EntityKind::Member.as_str(),
         EntityKind::Schema.as_str(),
         EntityKind::Policy.as_str(),
         EntityKind::NodeAddrs.as_str(),
         EntityKind::Counter.as_str(),
-        EntityKind::CpMemberAddr.as_str(),
         EntityKind::StreamShard.as_str(),
         EntityKind::IndexBackfill.as_str(),
         EntityKind::SplitLineage.as_str(),
