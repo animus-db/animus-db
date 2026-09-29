@@ -74,6 +74,7 @@ use animus_dynamo::{AttributeValue, Item};
 use animus_env::Env;
 use animus_env::MaybeTlsStream;
 use animus_env::NodeId;
+use animus_env::PRIMARY_STREAM;
 use animus_node::host::AdminHost;
 use animus_node::host::RelayClient;
 use animus_storage::{StorageError, WalRecordView};
@@ -583,6 +584,9 @@ impl AdminHost for ClientCtx {
     }
     async fn segment_store_view(&self) -> Value {
         segment_store_view(self).await
+    }
+    async fn debug_inboxes_view(&self) -> Value {
+        debug_inboxes_view(self)
     }
 }
 
@@ -2008,6 +2012,76 @@ async fn segment_store_view<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>) -> Va
         "store": store,
         "shards": shards,
         "local_objects": local_objects,
+    })
+}
+
+/// `GET /admin/debug/inboxes` (ADR 0026 inbox-growth investigation,
+/// measure-first PR) — this node's own `ProdEnv` demultiplexed-inbox
+/// snapshot (`animus_env::ProdEnv::inbox_stats`, `top_n = 20`): total
+/// queued frames/bytes, and the 20 largest streams by queued bytes,
+/// descending, each decoded as far as this node's own replicated
+/// `Metadata` allows (ADR 0026/0040: stream `0` is `PRIMARY_STREAM`, the
+/// control plane or a non-split tablet's own CP group on this combined
+/// node; a nonzero stream id is a tablet id, `stream = tablet_id`) —
+/// naming the tablet's table and lifecycle state when the id still names
+/// a live tablet, or flagging it as a stream this node's own tablet map no
+/// longer recognizes (a retired split parent, or a tablet this node no
+/// longer replicates) when it doesn't. **Concrete, not `<E: Env>`-generic**
+/// — `inbox_stats` is a `ProdEnv`-only inherent method with no `SimEnv`
+/// analogue, so this is reached only from the concrete `impl AdminHost for
+/// ClientCtx` (`E = ProdEnv` by default); `GenericAdminHost`'s own request
+/// falls through to the trait's default `{"available": false}` body
+/// instead. Pure observer (ADR 0020) — never wakes/touches a stream, only
+/// reads the demux's own bookkeeping.
+const DEBUG_INBOXES_TOP_N: usize = 20;
+
+fn debug_inboxes_view(ctx: &ClientCtx) -> Value {
+    let stats = ctx.env.inbox_stats(DEBUG_INBOXES_TOP_N);
+    let meta = ctx.effective_metadata();
+    let self_id = ctx.env.node_id();
+    let top_streams: Vec<Value> = stats
+        .top_streams
+        .iter()
+        .map(|s| {
+            let decoded = if s.stream == PRIMARY_STREAM {
+                json!({"kind": "primary", "note": "control plane, or a non-split tablet's CP group"})
+            } else if s.stream == animus_cp_data::heartbeat_batch::HEARTBEAT_BATCH_STREAM {
+                json!({"kind": "heartbeat_batch", "note": "reserved HEARTBEAT_BATCH_STREAM (ADR 0044 phase 2, C-02)"})
+            } else if s.stream == animus_cp_data::backup::BACKUP_SEGMENT_STREAM {
+                json!({"kind": "backup_segment", "note": "reserved BACKUP_SEGMENT_STREAM (the on-demand backup store's ClusterSegmentStore)"})
+            } else {
+                match meta.tablets.get(&TabletId(s.stream)) {
+                    Some(t) => json!({
+                        "kind": "tablet",
+                        "tablet": s.stream,
+                        "table": t.table,
+                        "state": format!("{:?}", t.state),
+                        "hosted_here": t.replicas.contains(&self_id),
+                    }),
+                    None => json!({
+                        "kind": "tablet",
+                        "tablet": s.stream,
+                        "table": Value::Null,
+                        "note": "not in this node's current tablet map (retired split parent, or never/no-longer replicated here)",
+                    }),
+                }
+            };
+            json!({
+                "stream": s.stream,
+                "decoded": decoded,
+                "frames": s.frames,
+                "bytes": s.bytes,
+                "waker_parked": s.waker_parked,
+                "ever_polled": s.ever_polled,
+                "since_last_pop_ms": s.since_last_pop_ms,
+            })
+        })
+        .collect();
+    json!({
+        "available": true,
+        "total_frames": stats.total_frames,
+        "total_bytes": stats.total_bytes,
+        "top_streams": top_streams,
     })
 }
 

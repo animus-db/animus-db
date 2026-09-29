@@ -810,6 +810,10 @@ impl<E: Env> Network for EncryptedEnv<E> {
     async fn recv_stream(&self, stream: u64) -> crate::Envelope {
         self.env.recv_stream(stream).await
     }
+
+    fn close_stream(&self, stream: u64) {
+        self.env.close_stream(stream);
+    }
 }
 
 #[async_trait::async_trait]

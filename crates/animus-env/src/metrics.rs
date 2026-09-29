@@ -853,12 +853,66 @@ pub enum Metric {
     /// [`Self::NetworkHandshakeRefused`], on the client-facing/relay wire
     /// instead of the internal one.
     ClientHandshakeRefused,
+    // --- Multiplexed-stream demux inbox observability (ADR 0026,
+    // ADR 0015 seam extension) --- Appended after the reconciler-stop-
+    // timeout variant above; every earlier variant's slot and the
+    // text-export order stay stable, so the snapshot remains
+    // byte-reproducible. Both are **levels**, overwritten via
+    // `MetricsHandle::set` (never `incr`) -- the identical "counter slot
+    // re-purposed as a last-write-wins level" shape `StreamHotBytes`/
+    // `CpGroupsQuiesced` already use above. Recorded by `ProdEnv`'s own
+    // `refresh_inbox_metrics` (`Env::refresh_inbox_metrics`, a no-op
+    // default every other `Env` implementor keeps unchanged), called
+    // right before a metrics read (`ClientCtx::metrics_text`/
+    // `metrics_json`) recomputes and snapshots -- never on the
+    // `Demux`'s own push/pop hot path, which only maintains the raw
+    // per-stream byte/frame counters these two levels are read from.
+    /// The total number of frames currently queued across every stream
+    /// in this node's `ProdEnv` demux (ADR 0026) -- the sum of every
+    /// stream's own queue length. A stream nobody ever polls
+    /// accumulates frames here forever (the growth this metric exists
+    /// to make visible); see `crates/animus-env/src/prod.rs`'s `Demux`
+    /// doc for the mechanism.
+    DemuxQueuedFrames,
+    /// The total payload bytes currently queued across every stream in
+    /// this node's `ProdEnv` demux (ADR 0026) -- the sum of every
+    /// stream's own queued payload bytes. This is the metric a runaway
+    /// unconsumed stream shows up in most directly (RSS growth from an
+    /// unbounded `VecDeque<Envelope>`), and the one to watch alongside
+    /// `GET /admin/debug/inboxes`'s own top-N-streams-by-bytes view.
+    DemuxQueuedBytes,
+    /// A frame arrived for a stream this node's `ProdEnv` demux has marked
+    /// **closed** (ADR 0026, 2026-09-28 amendment — `Network::close_stream`)
+    /// and was discarded rather than queued. An append-only counter (unlike
+    /// the two levels above), incremented at the exact `spawn_pump` site
+    /// that would otherwise have queued the frame. Expected to be nonzero
+    /// during a tablet's teardown grace window (a peer that hadn't yet
+    /// observed the replica-set change addressing the now-released
+    /// stream) and flat otherwise; a sustained high rate against one
+    /// stream id points at a peer that never learned the tablet moved off
+    /// this node.
+    DemuxFramesDroppedClosed,
+    /// A frame was dropped because its stream's queue was already at (or
+    /// past) its configured cap ([`crate::InboxCap`], ADR 0026's 2026-09-28
+    /// inbox-cap amendment — the second half of the same amendment
+    /// `DemuxFramesDroppedClosed` belongs to, for the case `close_stream`
+    /// itself cannot reach: a stream whose consumer never started polling
+    /// at all, so nothing ever calls `close_stream` for it). Incremented at
+    /// `spawn_pump`'s own drop-oldest enforcement, once per evicted frame —
+    /// so this counts the OLDEST frame being evicted to make room for a
+    /// newer one, never the newly-arrived frame itself (which is always
+    /// kept). Expected to stay at zero for a healthy cluster (a live
+    /// consumer's ordinary lag stays well under the cap); a nonzero and
+    /// climbing rate against one stream id points at exactly the
+    /// never-hosted-consumer case this cap exists to bound rather than let
+    /// grow without limit.
+    DemuxFramesDroppedOverflow,
 }
 
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 100] = [
+    pub const ALL: [Metric; 104] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -959,6 +1013,10 @@ impl Metric {
         Metric::CpReconcilerStopTimeout,
         Metric::NetworkHandshakeRefused,
         Metric::ClientHandshakeRefused,
+        Metric::DemuxQueuedFrames,
+        Metric::DemuxQueuedBytes,
+        Metric::DemuxFramesDroppedClosed,
+        Metric::DemuxFramesDroppedOverflow,
     ];
 
     /// The stable exported name of this metric (snake_case, used as the text
@@ -1066,6 +1124,10 @@ impl Metric {
             Metric::CpReconcilerStopTimeout => "cp_reconciler_stop_timeout",
             Metric::NetworkHandshakeRefused => "net_handshake_refused",
             Metric::ClientHandshakeRefused => "client_handshake_refused",
+            Metric::DemuxQueuedFrames => "demux_queued_frames",
+            Metric::DemuxQueuedBytes => "demux_queued_bytes",
+            Metric::DemuxFramesDroppedClosed => "demux_frames_dropped_closed",
+            Metric::DemuxFramesDroppedOverflow => "demux_frames_dropped_overflow",
         }
     }
 

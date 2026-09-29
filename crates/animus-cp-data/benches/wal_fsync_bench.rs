@@ -257,6 +257,9 @@ impl Network for CountedEnv {
     async fn recv_stream(&self, stream: u64) -> Envelope {
         self.inner.recv_stream(stream).await
     }
+    fn close_stream(&self, stream: u64) {
+        self.inner.close_stream(stream);
+    }
 }
 
 #[async_trait::async_trait]
