@@ -1,6 +1,8 @@
 //! Golden fixtures for `animus-cp-data`'s durable/wire formats (ADR 0073
 //! Phase 0, workstream C). Later layers of workstream C (RaftKV codec,
 //! `SharedWal` envelope, key-layout marker) add their own sections here.
+//! The RaftKV wire/image/WAL fixtures (`raftkv-*`) are tested in-crate instead
+//! (`src/format_fixture_tests.rs`): the wire/image codec is `pub(crate)`.
 //!
 //! One fixture per version under
 //! `tests/fixtures/formats/<format>/v<N>.bin`, decoded structurally against

@@ -10,16 +10,24 @@
 //! format): a magic byte + version, `u8` enum tags, big-endian fixed-width
 //! integers, and `u32`-length-prefixed byte strings.
 //!
-//! Scope: **wire + snapshot image only.** The Raft WAL keeps the shared
-//! `PersistedState` (serde_json) encoding — it is `animus-control`'s format,
-//! common to both planes.
+//! Scope: **wire + snapshot image only.** The Raft WAL stores `KvCommand` as
+//! `serde_json` inside `WalRecord` lines in `animus-control`'s tagged
+//! `CWL1`/`SWL1` envelopes — not this binary codec (its golden fixture is
+//! `raftkv-wal/v1.bin`).
 //!
-//! Pre-alpha: no cross-version wire/disk compatibility is required (mixed-codec
-//! clusters are not supported), but decode failures stay **loud**: every
-//! malformed input yields a descriptive `Err` that the driver logs
-//! (`tracing::warn!`) before dropping the message — never a silent
-//! misinterpretation (the magic/version check rejects a stray JSON payload
-//! outright).
+//! ## Versioning
+//!
+//! Since ADR 0073 Phase 0 (workstream C) this is a **baselined format**:
+//! [`VERSION`] restarted at `1`, every pre-baseline layout was dropped, and
+//! golden fixtures (`tests/fixtures/formats/raftkv-wire/v1.bin` and
+//! `raftkv-image/v1.bin`) pin the bytes. The frame shape stays the single
+//! magic byte `0xCB` + a `u8` version. Decode failures are ADR 0073's shared
+//! [`FormatError`], loud and named, never a panic or a silent misdecode:
+//! empty input or a magic mismatch (a stray JSON payload, pre-baseline data)
+//! is `FormatError::PreBaselineFormat`; version `0` or one newer than this
+//! build is `FormatError::UnsupportedFormatVersion`; any other framing damage
+//! (truncation, unknown tag, trailing bytes) is `FormatError::Malformed`. The
+//! callers log the error (`tracing::warn!`) before dropping the message.
 //!
 //! **Decoding untrusted input is bounds-checked *and* allocation-safe** —
 //! two distinct guarantees, not one. Every individual field read
@@ -47,6 +55,7 @@
 
 use std::collections::BTreeSet;
 
+use animus_control::format::FormatError;
 use animus_control::raft::{LogEntry, RaftMsg};
 use animus_env::NodeId;
 #[cfg(test)]
@@ -61,205 +70,44 @@ use crate::{ImageEntry, KvCommand, KvWire};
 /// message from a mixed-version peer) with a clear error instead of a confusing
 /// tag mismatch deeper in.
 const MAGIC: u8 = 0xCB;
-/// Codec version, bumped on any incompatible layout change. `2`: `KvCommand`'s
-/// `Put`/`Batch`/`Delete`/`Cas` variants gained a `fence: KeyRange` field. `3`:
-/// `KvCommand::Split` (tag 4) is gone — split is now a single control-plane
-/// command, never a data-plane one (ADR 0028). `4`: `RaftMsg::TimeoutNow` (tag
-/// 9, ADR 0029 leadership transfer) added. `5` (ADR 0018 §2/PR2): every
-/// mutating `KvCommand` variant gained a `ts: HlcTimestamp` field, and a new
-/// `KvCommand::Seal` variant (tag 6) was added — pre-alpha, no cross-version
-/// wire/disk compatibility is required (no live deployments), so a mixed-
-/// version decode fails loudly on the version check below rather than
-/// silently misreading the new field. `6` (ADR 0018 §2/PR2b):
-/// `KvCommand::ReadCeiling` (tag 7) was added. `7` (ADR 0018 §2/PR3):
-/// `KvCommand::TxnStage`/`TxnCommit`/`TxnAbort`/`TxnResolve` (tags 8-11)
-/// were added — pre-alpha, no cross-version compatibility required, so
-/// again a mixed-version decode fails loudly rather than silently
-/// misreading the new variants.
-/// `8` (ADR 0018 §2/PR4): `TxnStage` gained `record_table: String`/
-/// `is_anchor: bool` (multi-participant staging — see `KvCommand::TxnStage`'s
-/// doc); `TxnResolve` gained `outcome: TxnOutcome` (the decision travels
-/// explicitly instead of being re-derived from a local record) — again a
-/// clean version bump, no wire/disk back-compat required.
-/// `9` (ADR 0018 §2/PR5): `TxnStage.spans` changed from `Vec<KeyRange>` to
-/// `Vec<(String, KeyRange)>` — every span now carries its own table name,
-/// closing a real gap PR3/PR4 left open (see `txn::TxnRecord::intent_spans`'s
-/// doc for the full account). Same house convention: a clean bump, no
-/// cross-version compatibility.
-/// `10` (ADR 0018 §2/PR5, orphan-record fix): `TxnAbort` gained
-/// `orphan_created_ts: Option<HlcTimestamp>` — a recovery pusher that finds
-/// no record at all synthesizes one directly in the `Aborted` state (see
-/// `KvCommand::TxnAbort`'s doc). Same house convention.
-/// `11` (ADR 0018 §2 apply-time write-key conditions amendment):
-/// `TxnStage` gained `conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>` —
-/// own-key byte-level OCC preconditions checked at apply (see
-/// `KvCommand::TxnStage`'s doc). `12` (ADR 0041 §3): every snapshot
-/// `ImageEntry` gained a leading **row-kind** byte, so one image carries every
-/// one of a tablet's per-kind storage scopes. Same house convention: a clean
-/// bump, no cross-version compatibility.
-/// `13` (ADR 0042/0043): `ALL_KINDS` grows to admit the DynamoDB Streams row
-/// kinds — `KIND_CURSOR` (`0x04`, this PR) now, `KIND_STREAM`/
-/// `KIND_STREAM_META` (`0x05`/`0x06`) in a later PR. The `ImageEntry` layout
-/// itself is unchanged (the kind byte was already a generic `u8` since `12`,
-/// and an unknown kind is already dropped-with-warn on decode); this bump is
-/// the same house convention as every prior one — a version marker for a
-/// meaningful semantic change, not a wire-format one — and is deliberately
-/// **one bump covering all three new kinds** across the whole Streams PR
-/// stack, so the two later kinds land without a further bump.
-/// `14` (ADR 0018 §2 write-loss amendment — Bug 3): `TxnResolve` gained a
-/// `fence: KeyRange` field, closing the one key-writing `KvCommand` variant
-/// that used to carry no apply-time fence check at all — see
-/// `KvCommand::TxnResolve`'s doc. Same house convention: a clean bump, no
-/// cross-version compatibility.
-/// `15` (ADR 0046 "evaluate at leader" seatbelt, PR1): `KindBatch` gained a
-/// `conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>` field — own-key byte-level
-/// OCC preconditions checked at apply, modeled on `TxnStage`'s own
-/// `conditions` field added in version `11` (see `KvCommand::KindBatch`'s
-/// doc). Same house convention: a clean bump, no cross-version
-/// compatibility.
-/// `16` (ADR 0046 "materialize-at-resolve", `TxnStage` kind-writes stack
-/// PR1): `TxnStage.writes`' element changed from the bare `(Vec<u8>,
-/// Option<Vec<u8>>)` tuple to the named `txn::TxnWrite` struct, which adds
-/// two fields per write — `kind_writes: Vec<crate::KindWrite>`
-/// and `change_log: Option<(Vec<u8>, Vec<u8>)>` — the derived kind-scope
-/// payload a transactional write against an indexed/streamed table stages
-/// alongside its base value (see `TxnWrite`'s doc). Same house convention:
-/// a clean bump, no cross-version compatibility.
-/// `17` (ADR 0049 Train A rung-1 fixup): `KindBatch.change_log` changed
-/// from `Option<(Vec<u8>, Vec<u8>)>` to `Vec<(Vec<u8>, Vec<u8>)>` — a
-/// marker-table batch commits one entry per tablet carrying every item's
-/// marker record (the entry-granularity throughput contract; see the
-/// field's own doc). `TxnWrite.change_log` keeps its `Option` shape.
-/// `18` (ADR 0049 §3, Train A rung 3): `TxnWrite` gained `stage_marker:
-/// Option<(Vec<u8>, Vec<u8>)>` — the image-less stage-marker record
-/// `TxnStage`'s apply arm materializes at the stage entry's own `ts` (see
-/// the field's own doc). Encoded with the same tagged-`Option` shape
-/// `change_log` uses (`put_change_log`/`read_change_log` — never a second
-/// copy). Same house convention: a clean bump, no cross-version
-/// compatibility.
-/// `19` (ADR 0050 Train B rung 4): new `KvCommand::SeedBatch` (tag 13) — the
-/// split-build driver's version-carrying row-transfer command (see the
-/// variant's own doc). Rows are `(kind, logical, Option<value>, version)`
-/// with the standard `fence`/`ts` tail.
-/// `20` (ADR 0050 Train B rung 5): new `KvCommand::Freeze` (tag 14) — the
-/// split-cutover freeze, a bare `ts` (no fence, no keys; see the variant's
-/// own doc). Same house convention: a clean bump, no cross-version
-/// compatibility.
-/// `21` (ADR 0050 Train B rung 7, the deletion sweep): the `fence: KeyRange`
-/// field is **deleted from every variant that carried it** — with immutable
-/// tablet ranges (rung 2) and route-time `Active` filtering (rung 3), a
-/// stamped fence and the group's own range could never again disagree, so
-/// the field was pure inert bytes on every entry. `KvCommand::Seal` (tag 6)
-/// is deleted with its last proposer (the reconciler's zero-copy handoff
-/// seal); its durable-marker core lives on as `Freeze`'s own marker (see
-/// `seal.rs`). Same house convention: a clean bump.
-/// `22` (ADR 0058 Train 1): `LogEntry` gained a `learners: Option<BTreeSet<NodeId>>`
-/// field (the non-voting membership class's config-in-log counterpart to
-/// `config`) and `RaftMsg::InstallSnapshot` gained the identical field —
-/// both encoded with the same `put_opt_node_set`/`opt_node_set` helper
-/// `config` already uses. Same house convention: a clean bump, no
-/// cross-version compatibility.
-/// `23` (ADR 0058 Train 2 rung 3): new `KvCommand::SplitTablet` (tag 15) —
-/// the in-place split's single-entry atomic fork (see the variant's own
-/// doc): a `split_key: Vec<u8>` plus two `animus_tablet::SplitChild`
-/// `(id, replicas)` pairs and the standard trailing `ts`. Same house
-/// convention: a clean bump, no cross-version compatibility.
-/// `24` (issue #554): `RaftMsg::AppendEntriesResp` gained a `needs_snapshot:
-/// bool` field (the follower-to-leader "my state machine is behind its own
-/// log's compacted start" signal — see `animus_control::raft::RaftCore::
-/// state_machine_behind`'s doc), encoded with `put_bool`/`c.bool()!` right
-/// after `match_index`, matching `success`'s own encoding. Same house
-/// convention: a clean bump, no cross-version compatibility (the `serde`
-/// side's own `#[serde(default)]` is unrelated — it only protects the WAL's
-/// `serde_json` path, per this crate's own doc: "a field added to the
-/// shared `LogEntry`/`RaftMsg` types needs an explicit encode/decode arm
-/// here too").
-/// `25` (ADR 0054 step 2): new `KvCommand::KindEval` (tag 16) — the
-/// self-contained evaluated write apply evaluates in commit order (see the
-/// variant's own doc). Its rich, evolving nested types (`WriteSchema`,
-/// `AttributeValue`/`Option<AttributeValue>`, `KindEvalOp`,
-/// `Option<ConditionExpression>`) are each `serde_json`-encoded into one
-/// `put_bytes`-framed blob apiece rather than hand-encoded field-by-field —
-/// the same "JSON inside the binary envelope" convention `backup.rs`'s
-/// `BackupManifestObject` already uses for `TableSchema`'s own
-/// multi-field, evolving shape, for the identical reason: this is a
-/// low-frequency, deeply-nested payload (unlike the hot per-key
-/// `Vec<u8>`s every other variant's fields already are), so a field added
-/// to any of these four types needs no codec change here at all. `ts`
-/// stays the standard trailing fixed-width encoding. Same house
-/// convention otherwise: a clean bump, no cross-version compatibility.
-/// `26` (ADR 0054 step 4a): `TxnStage.writes`' element (`txn::TxnWrite`)
-/// gained `pending: Option<txn::PendingTxnWrite>` — a write awaiting
-/// apply-time evaluation (see that field's own doc). Encoded as one
-/// `put_json`-framed blob covering the whole `Option` (the same "JSON
-/// inside the binary envelope" convention version `25` established,
-/// since `PendingTxnWrite` nests the identical rich, evolving types
-/// `KvCommand::KindEval` already JSON-encodes) — `serde_json` renders
-/// `None` as `null` and `Some(..)` as the object, so one blob covers both
-/// cases with no separate tag byte needed. Same house convention: a clean
-/// bump, no cross-version compatibility.
-/// `27` (ADR 0054 step 4b): `KvCommand::KindBatch` lost its own-key
-/// `conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>` OCC seatbelt field (ADR
-/// 0046 PR1) — every production caller passed an empty `Vec` once step 3/4a
-/// moved every write producer onto apply-time evaluation, so the field
-/// carried no live signal left to check. Removed from both the encode and
-/// decode arms (tag `12`); `TxnStage`'s OWN separate `conditions` field
-/// (introduced alongside it in version `11`, apply-time write-key
-/// preconditions for a *transaction's* own-key writes) is untouched — the
-/// two were always independent fields on different variants that happened
-/// to share a name and a byte-level OCC shape, not one shared mechanism.
-/// `28` (ADR 0044 phase 2, C-02 PR 2): `KvWire` gained
-/// `HeartbeatBatch(Vec<(u64, RaftMsg<KvCommand>)>)` (tag `3`) — the
-/// per-node heartbeat batcher's own physical frame, sent only on the
-/// reserved `heartbeat_batch::HEARTBEAT_BATCH_STREAM` (see that module's
-/// doc). Same house convention: a clean bump, no cross-version
-/// compatibility required.
-/// `29` (issue #804, ADR 0018 §2 amendment): the snapshot image gained a
-/// leading `max_ts: Option<HlcTimestamp>` header field (`put_opt_ts`,
-/// before the entry count) — the sender's own apply-task `max_applied_ts`
-/// at image-build time. Closes the InstallSnapshot half of the witnessing
-/// gap: a committed entry whose apply wrote no row (a failed `Cas`, an
-/// aborted txn, ...) carries a `ts` that never advances
-/// `StorageEngine::latest_version()`, so a receiver that installs an image
-/// covering such an entry — and never applies it individually — used to
-/// never witness it. See `lib.rs`'s `engine_image`/`install_engine_image`
-/// doc and the Key invariants "Witnessing" bullet in this crate's
-/// `CLAUDE.md` for the full account. Same house convention: a clean bump,
-/// no cross-version compatibility required.
-/// `30` (issue #667, P0 Raft safety): `RaftMsg` (shared with
-/// `animus-control`) gained `ClusterProbe` (tag `12`) and
-/// `ClusterProbeResp { term, committed_index, config }` (tag `13`) — the
-/// boot-time genesis-vs-wiped-voter-restart check's own wire messages (see
-/// `animus-control::raft`'s doc). This crate's own `RaftKvNode` never
-/// calls `RaftCore::begin_cluster_check` (only `animus-control`'s driver
-/// does), so neither variant is ever actually produced here in production
-/// — but `RaftMsg<KvCommand>` is the same generic type this crate's own
-/// hand-rolled codec must stay exhaustive over regardless. Same house
-/// convention: a clean bump, no cross-version compatibility required.
-/// `31` (ADR 0049's batched-`BatchWriteItem`-images amendment, issue #996
-/// layer 1): new `KvCommand::KindEvalBatch` (tag `17`, the next free tag
-/// after `KindEval`'s `16`) — one Raft entry carrying `N` independent
-/// [`crate::KindEvalEntry`] evaluate-at-apply item writes for the same
-/// tablet, plus the standard trailing `ts` (see the variant's own doc).
-/// Each entry is encoded with the identical `put_json`-framed-blob
-/// convention version `25` established for `KindEval`'s own rich, nested
-/// field types (`schema`/`pk`/`sk`/`op`/`condition`), length-prefixed as a
-/// `Vec` the same way every other untrusted wire count is (capped
-/// pre-allocation, see this module's own top-level doc). Same house
-/// convention: a clean bump, no cross-version compatibility required.
-/// `32` (issue #1061): `RaftMsg` gained `Removed { term, removal_index,
-/// removal_term, config, learners }` (tag `14`) and `RemovedAck { term,
-/// removal_index }` (tag `15`) — the explicit removal notice a leader sends a
-/// departing peer it can no longer reach through the log, and the peer's ack
-/// (see `animus_control::raft::RaftMsg::Removed`). The two node sets ride the
-/// same `put_node_set` encoding `ClusterProbeResp.config` uses. Additive
-/// tags on an enum with no golden fixture yet (ADR 0073 Phase 0 has not
-/// reached this codec), so same house convention: a clean version bump.
-const VERSION: u8 = 32;
+/// Wire/image codec version (ADR 0073 Phase 0, workstream C). Restarted at `1`
+/// by the baseline reset: every pre-baseline layout (the old history ran to
+/// `32`) was dropped. From the baseline on, an incompatible layout change is a
+/// new version with a new golden fixture, never a rewrite of `1`.
+const VERSION: u8 = 1;
 
-/// A decode failure: a description of what was malformed, surfaced loudly by
-/// the caller (logged + dropped; never silently misread).
-pub(crate) type DecodeError = String;
+/// Internal detail of a framing failure below the version header (what was
+/// malformed); the public entry points wrap it as `FormatError::Malformed`.
+type DecodeError = String;
+
+/// Format names in [`FormatError`] messages (never encoded).
+const WIRE_NAME: &str = "raftkv-wire";
+const IMAGE_NAME: &str = "raftkv-image";
+
+/// Validate the `magic || version` header, returning the cursor positioned
+/// after it. Empty/foreign input is pre-baseline; version `0` or one newer
+/// than this build is unsupported.
+fn check_header<'a>(bytes: &'a [u8], format: &'static str) -> Result<Cursor<'a>, FormatError> {
+    if bytes.first() != Some(&MAGIC) {
+        return Err(FormatError::PreBaselineFormat { format });
+    }
+    let Some(&version) = bytes.get(1) else {
+        return Err(FormatError::Malformed {
+            format,
+            detail: "truncated frame: magic byte without a version byte".to_owned(),
+        });
+    };
+    if version == 0 || version > VERSION {
+        return Err(FormatError::UnsupportedFormatVersion {
+            format,
+            found: version,
+            max_supported: VERSION,
+        });
+    }
+    let mut c = Cursor::new(bytes);
+    c.pos = 2;
+    Ok(c)
+}
 
 // ---- primitive writers -----------------------------------------------------
 
@@ -280,10 +128,10 @@ fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
     out.extend_from_slice(b);
 }
 
-/// `serde_json`-encode `value` into one `put_bytes`-framed blob (version
-/// `25` — see the const's own doc for why this crate's deeply-nested,
-/// evolving `KvCommand::KindEval` field types use JSON-inside-the-envelope
-/// rather than a hand-rolled field-by-field encoding).
+/// `serde_json`-encode `value` into one `put_bytes`-framed blob (this
+/// crate's deeply-nested, evolving `KvCommand::KindEval` field types use
+/// JSON-inside-the-envelope rather than a hand-rolled field-by-field
+/// encoding).
 fn put_json<T: serde::Serialize>(out: &mut Vec<u8>, value: &T) {
     put_bytes(
         out,
@@ -526,7 +374,7 @@ fn read_txn_outcome(c: &mut Cursor<'_>) -> Result<TxnOutcome, DecodeError> {
 }
 
 /// A `(row kind, logical key, value)` write list — `KvCommand::KindBatch`'s
-/// own `writes` shape, and (ADR 0046 A1, version `16`) a `txn::TxnWrite`'s
+/// own `writes` shape, and (ADR 0046 A1) a `txn::TxnWrite`'s
 /// `kind_writes` payload. Shared here so the two never silently drift.
 fn put_kind_writes(out: &mut Vec<u8>, writes: &[crate::KindWrite]) {
     out.extend_from_slice(&(writes.len() as u32).to_be_bytes());
@@ -554,8 +402,8 @@ fn read_kind_writes(c: &mut Cursor<'_>) -> Result<Vec<crate::KindWrite>, DecodeE
 }
 
 /// A `(key prefix, encoded record)` optional change-log record —
-/// `KvCommand::KindBatch`'s own `change_log` shape, and (ADR 0046 A1,
-/// version `16`) a `txn::TxnWrite`'s `change_log` payload.
+/// `KvCommand::KindBatch`'s own `change_log` shape, and (ADR 0046 A1)
+/// a `txn::TxnWrite`'s `change_log` payload.
 fn put_change_log(out: &mut Vec<u8>, change_log: &Option<(Vec<u8>, Vec<u8>)>) {
     match change_log {
         None => put_u8(out, 0),
@@ -576,7 +424,7 @@ fn read_change_log(c: &mut Cursor<'_>) -> Result<Option<(Vec<u8>, Vec<u8>)>, Dec
     })
 }
 
-/// `KindBatch.change_log`'s multi-record shape (version `17` — see the
+/// `KindBatch.change_log`'s multi-record shape (see the
 /// field's own doc for why a marker-table batch carries one record per
 /// item in a single entry). Count-prefixed, unlike the tagged `Option`
 /// form `TxnWrite` keeps.
@@ -726,7 +574,7 @@ fn put_command(out: &mut Vec<u8>, c: &KvCommand) {
             put_bytes(out, record_key);
             put_bytes(out, record_table.as_bytes());
             put_bool(out, *is_anchor);
-            // ADR 0046 A1, version 16: each write is a `txn::TxnWrite` —
+            // ADR 0046 A1: each write is a `txn::TxnWrite` —
             // base key/value plus an optional derived kind-scope payload,
             // encoded with the SAME `put_kind_writes`/`put_change_log`
             // helpers `KindBatch` itself uses (never a second copy).
@@ -736,11 +584,11 @@ fn put_command(out: &mut Vec<u8>, c: &KvCommand) {
                 put_opt_bytes(out, &w.value);
                 put_kind_writes(out, &w.kind_writes);
                 put_change_log(out, &w.change_log);
-                // Version 18: the stage marker shares change_log's own
+                // ADR 0049 §3: the stage marker shares change_log's own
                 // tagged-Option `(prefix, record)` encoding.
                 put_change_log(out, &w.stage_marker);
-                // Version 26: `Option<txn::PendingTxnWrite>` as one JSON
-                // blob (see the `VERSION` const's own doc).
+                // `Option<txn::PendingTxnWrite>` as one JSON blob (same
+                // JSON-inside-the-envelope choice as `put_json`).
                 put_json(out, &w.pending);
             }
             out.extend_from_slice(&(spans.len() as u32).to_be_bytes());
@@ -1316,16 +1164,15 @@ pub(crate) fn encode_wire(w: &KvWire) -> Vec<u8> {
 
 /// Decode a binary frame into a [`KvWire`] message. Errors are descriptive and
 /// the caller logs them loudly before dropping the message.
-pub(crate) fn decode_wire(bytes: &[u8]) -> Result<KvWire, DecodeError> {
-    let mut c = Cursor::new(bytes);
-    let magic = c.u8()?;
-    if magic != MAGIC {
-        return Err(format!("bad magic byte {magic:#04x} (want {MAGIC:#04x})"));
-    }
-    let version = c.u8()?;
-    if version != VERSION {
-        return Err(format!("unsupported codec version {version}"));
-    }
+pub(crate) fn decode_wire(bytes: &[u8]) -> Result<KvWire, FormatError> {
+    let c = check_header(bytes, WIRE_NAME)?;
+    decode_wire_body(c).map_err(|detail| FormatError::Malformed {
+        format: WIRE_NAME,
+        detail,
+    })
+}
+
+fn decode_wire_body(mut c: Cursor<'_>) -> Result<KvWire, DecodeError> {
     let wire = match c.u8()? {
         0 => KvWire::Raft(read_raft(&mut c)?),
         1 => KvWire::ReadProbe {
@@ -1361,7 +1208,7 @@ pub(crate) fn decode_wire(bytes: &[u8]) -> Result<KvWire, DecodeError> {
 /// Encode the engine snapshot image (`(key, value-or-tombstone, version)`
 /// entries) shipped in `InstallSnapshot` chunks.
 ///
-/// `max_ts` (version `29`, issue #804) is the sender's own apply-task
+/// `max_ts` (issue #804) is the sender's own apply-task
 /// `max_applied_ts` at image-build time — an upper bound on every `ts` any
 /// entry folded into this tablet has ever committed, whether or not that
 /// entry's apply wrote a row. See `lib.rs`'s `engine_image` doc.
@@ -1386,16 +1233,17 @@ pub(crate) fn encode_image(entries: &[ImageEntry], max_ts: Option<HlcTimestamp>)
 /// row entries.
 pub(crate) fn decode_image(
     bytes: &[u8],
+) -> Result<(Option<HlcTimestamp>, Vec<ImageEntry>), FormatError> {
+    let c = check_header(bytes, IMAGE_NAME)?;
+    decode_image_body(c).map_err(|detail| FormatError::Malformed {
+        format: IMAGE_NAME,
+        detail,
+    })
+}
+
+fn decode_image_body(
+    mut c: Cursor<'_>,
 ) -> Result<(Option<HlcTimestamp>, Vec<ImageEntry>), DecodeError> {
-    let mut c = Cursor::new(bytes);
-    let magic = c.u8()?;
-    if magic != MAGIC {
-        return Err(format!("bad magic byte {magic:#04x} (want {MAGIC:#04x})"));
-    }
-    let version = c.u8()?;
-    if version != VERSION {
-        return Err(format!("unsupported codec version {version}"));
-    }
     let max_ts = read_opt_ts(&mut c)?;
     let n = c.u32()?;
     // Capped pre-allocation against an untrusted wire count — see
@@ -1409,7 +1257,7 @@ pub(crate) fn decode_image(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use proptest::prelude::*;
 
     use super::*;
@@ -1429,9 +1277,12 @@ mod tests {
         HlcTimestamp { wall_ms, logical }
     }
 
-    #[test]
-    fn every_wire_variant_round_trips() {
-        let entries = vec![
+    /// One log entry per `KvCommand` variant (plus a membership-carrying
+    /// entry). Shared by the round-trip test and the golden-fixture tests
+    /// (`format_fixture_tests.rs`); changing it changes what the checked-in
+    /// fixtures are expected to decode to, so it is append-only.
+    pub(crate) fn sample_entries() -> Vec<LogEntry<KvCommand>> {
+        vec![
             LogEntry {
                 term: 3,
                 index: 17,
@@ -1489,7 +1340,7 @@ mod tests {
             LogEntry {
                 term: 4,
                 index: 21,
-                // ADR 0050 rung 4 (version 19): a split-build seed chunk —
+                // ADR 0050 rung 4: a split-build seed chunk —
                 // a value row, a tombstone row, distinct kinds, carried
                 // versions.
                 command: KvCommand::SeedBatch {
@@ -1548,20 +1399,20 @@ mod tests {
                             value: Some(b"v1".to_vec()),
                             // ADR 0046 A1: a kind-write payload + change-log
                             // record staged alongside the base write —
-                            // exercises the version-16 wire shape.
+                            // exercises the derived-write wire shape.
                             kind_writes: vec![(1u8, b"k1-lsi".to_vec(), Some(b"lsi-row".to_vec()))],
                             change_log: Some((b"k1-change-prefix".to_vec(), b"record".to_vec())),
-                            // Version 18: the ADR 0049 §3 stage marker.
+                            // The ADR 0049 §3 stage marker.
                             stage_marker: Some((
                                 b"k1-change-prefix".to_vec(),
                                 b"stage-marker".to_vec(),
                             )),
-                            // Version 26 (ADR 0054 step 4a): no apply-time
+                            // ADR 0054 step 4a: no apply-time
                             // evaluation for this write — the sibling write
                             // just below exercises the `Some` case.
                             pending: None,
                         },
-                        // Version 26 (ADR 0054 step 4a): a write awaiting
+                        // ADR 0054 step 4a: a write awaiting
                         // apply-time evaluation — exercises every
                         // `PendingTxnWrite` field (the identical
                         // `serde_json`-blob types `KindEval` above already
@@ -1664,9 +1515,9 @@ mod tests {
                 config: None,
                 learners: None,
             },
-            // ADR 0058 Train 2 rung 3 (version 23): the in-place split fork
+            // ADR 0058 Train 2 rung 3: the in-place split fork
             // — a split key plus two children, each with its own replica
-            // set (exercises the version-23 wire shape).
+            // set (exercises the in-place fork wire shape).
             LogEntry {
                 term: 8,
                 index: 29,
@@ -1687,7 +1538,7 @@ mod tests {
                 config: None,
                 learners: None,
             },
-            // ADR 0054 step 2 (version 25): the self-contained evaluated
+            // ADR 0054 step 2: the self-contained evaluated
             // write — exercises every one of its four `serde_json`-blob
             // fields (`schema`/`pk`/`sk`/`op`/`condition`) at once.
             LogEntry {
@@ -1725,7 +1576,7 @@ mod tests {
                 config: None,
                 learners: None,
             },
-            // Issue #996 layer 1 (version 31): the batched sibling — two
+            // Issue #996 layer 1: the batched sibling — two
             // independent entries in one `KindEvalBatch`, each exercising
             // its own `put_json`-blob fields, plus one whose `condition`
             // is `None` (the `Put` case, no update actions) to cover both
@@ -1785,8 +1636,21 @@ mod tests {
                 config: None,
                 learners: None,
             },
-        ];
-        let msgs: Vec<RaftMsg<KvCommand>> = vec![
+            LogEntry {
+                term: 7,
+                index: 29,
+                command: KvCommand::Freeze { ts: ts(9, 3) },
+                config: Some([1, 2, 3].into_iter().map(nid).collect()),
+                learners: Some([4].into_iter().map(nid).collect()),
+            },
+        ]
+    }
+
+    /// One `RaftMsg` per variant, the `AppendEntries` carrying
+    /// [`sample_entries`].
+    pub(crate) fn sample_msgs() -> Vec<RaftMsg<KvCommand>> {
+        let entries = sample_entries();
+        vec![
             RaftMsg::PreVote {
                 term: 7,
                 candidate: nid(2),
@@ -1856,12 +1720,59 @@ mod tests {
                 term: 7,
                 removal_index: 19,
             },
-        ];
-        for m in msgs {
-            roundtrip(&KvWire::Raft(m));
+        ]
+    }
+
+    /// The `HeartbeatBatch` samples: a two-message batch and the empty batch.
+    pub(crate) fn sample_heartbeat_batches() -> Vec<Vec<(u64, RaftMsg<KvCommand>)>> {
+        vec![
+            vec![
+                (
+                    7u64,
+                    RaftMsg::AppendEntries {
+                        term: 3,
+                        leader: nid(0),
+                        prev_log_index: 10,
+                        prev_log_term: 2,
+                        entries: Vec::new(),
+                        leader_commit: 10,
+                    },
+                ),
+                (
+                    12u64,
+                    RaftMsg::AppendEntries {
+                        term: 5,
+                        leader: nid(0),
+                        prev_log_index: 4,
+                        prev_log_term: 1,
+                        entries: Vec::new(),
+                        leader_commit: 4,
+                    },
+                ),
+            ],
+            Vec::new(),
+        ]
+    }
+
+    /// Every `KvWire` variant: each `RaftMsg` variant, both probes, and the
+    /// heartbeat batches.
+    pub(crate) fn sample_wires() -> Vec<KvWire> {
+        let mut out: Vec<KvWire> = sample_msgs().into_iter().map(KvWire::Raft).collect();
+        out.push(KvWire::ReadProbe { term: 7, epoch: 42 });
+        out.push(KvWire::ReadProbeAck { term: 7, epoch: 42 });
+        out.extend(
+            sample_heartbeat_batches()
+                .into_iter()
+                .map(KvWire::HeartbeatBatch),
+        );
+        out
+    }
+
+    #[test]
+    fn every_wire_variant_round_trips() {
+        for w in sample_wires() {
+            roundtrip(&w);
         }
-        roundtrip(&KvWire::ReadProbe { term: 7, epoch: 42 });
-        roundtrip(&KvWire::ReadProbeAck { term: 7, epoch: 42 });
     }
 
     /// ADR 0044 phase 2 (C-02 PR 2): a batched-heartbeat frame round-trips,
@@ -1870,32 +1781,9 @@ mod tests {
     /// one either).
     #[test]
     fn heartbeat_batch_round_trips() {
-        let entries = vec![
-            (
-                7u64,
-                RaftMsg::AppendEntries {
-                    term: 3,
-                    leader: nid(0),
-                    prev_log_index: 10,
-                    prev_log_term: 2,
-                    entries: Vec::new(),
-                    leader_commit: 10,
-                },
-            ),
-            (
-                12u64,
-                RaftMsg::AppendEntries {
-                    term: 5,
-                    leader: nid(0),
-                    prev_log_index: 4,
-                    prev_log_term: 1,
-                    entries: Vec::new(),
-                    leader_commit: 4,
-                },
-            ),
-        ];
-        roundtrip(&KvWire::HeartbeatBatch(entries));
-        roundtrip(&KvWire::HeartbeatBatch(Vec::new()));
+        for batch in sample_heartbeat_batches() {
+            roundtrip(&KvWire::HeartbeatBatch(batch));
+        }
     }
 
     #[test]
@@ -1928,35 +1816,109 @@ mod tests {
         );
     }
 
-    #[test]
-    fn decode_failures_are_loud_and_descriptive() {
-        // A JSON payload (the old encoding / a foreign message) fails the magic
-        // check, not some confusing tag error deep inside.
-        let err = decode_wire(b"{\"Raft\":{}}").unwrap_err();
-        assert!(err.contains("bad magic"), "got: {err}");
+    fn malformed_detail(err: FormatError) -> String {
+        match err {
+            FormatError::Malformed { detail, .. } => detail,
+            other => panic!("expected Malformed, got {other:?}"),
+        }
+    }
 
-        // Unknown version.
-        let err = decode_wire(&[MAGIC, 99, 0]).unwrap_err();
-        assert!(err.contains("version"), "got: {err}");
+    #[test]
+    fn version_is_the_phase_0_baseline() {
+        assert_eq!(VERSION, 1, "ADR 0073 Phase 0 baseline");
+    }
+
+    #[test]
+    fn decode_failures_are_loud_and_named() {
+        let pre = |format| FormatError::PreBaselineFormat { format };
+        let unsupported = |format, found| FormatError::UnsupportedFormatVersion {
+            format,
+            found,
+            max_supported: VERSION,
+        };
+
+        // Empty input and a foreign payload (JSON, the pre-binary encoding)
+        // are pre-baseline, never a confusing tag error deep inside.
+        assert_eq!(decode_wire(&[]).unwrap_err(), pre("raftkv-wire"));
+        assert_eq!(decode_image(&[]).unwrap_err(), pre("raftkv-image"));
+        assert_eq!(
+            decode_wire(b"{\"Raft\":{}}").unwrap_err(),
+            pre("raftkv-wire")
+        );
+        assert_eq!(decode_image(b"[]").unwrap_err(), pre("raftkv-image"));
+        // Wrong magic even with a valid-looking version.
+        assert_eq!(
+            decode_wire(&[MAGIC ^ 1, VERSION, 1]).unwrap_err(),
+            pre("raftkv-wire")
+        );
+
+        // Version 0, one past this build, and 255 are unsupported, on both
+        // entry points (32 is the pre-baseline codec's last version).
+        for bad in [0u8, VERSION + 1, 32, 255] {
+            assert_eq!(
+                decode_wire(&[MAGIC, bad, 1]).unwrap_err(),
+                unsupported("raftkv-wire", bad)
+            );
+            assert_eq!(
+                decode_image(&[MAGIC, bad, 0, 0, 0, 0, 0]).unwrap_err(),
+                unsupported("raftkv-image", bad)
+            );
+        }
+        let msg = decode_wire(&[MAGIC, VERSION + 1, 1])
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("unsupported format version"), "got: {msg}");
+
+        // A magic byte alone has no version byte: framing damage.
+        assert!(malformed_detail(decode_wire(&[MAGIC]).unwrap_err()).contains("truncated"));
 
         // Truncated frame.
         let good = encode_wire(&KvWire::ReadProbe { term: 1, epoch: 2 });
         let err = decode_wire(&good[..good.len() - 1]).unwrap_err();
-        assert!(err.contains("truncated"), "got: {err}");
+        assert!(malformed_detail(err).contains("truncated"));
 
         // Trailing garbage is rejected (a frame must be exactly one message).
         let mut padded = good.clone();
         padded.push(0);
         let err = decode_wire(&padded).unwrap_err();
-        assert!(err.contains("trailing"), "got: {err}");
+        assert!(malformed_detail(err).contains("trailing"));
 
         // Unknown enum tag.
         let err = decode_wire(&[MAGIC, VERSION, 9]).unwrap_err();
-        assert!(err.contains("unknown KvWire tag"), "got: {err}");
+        assert!(malformed_detail(err).contains("unknown KvWire tag"));
+    }
 
-        // Image: same loud contract.
-        let err = decode_image(b"[]").unwrap_err();
-        assert!(err.contains("bad magic"), "got: {err}");
+    /// Every strict prefix of a valid frame is a clean `Err` (never a
+    /// panic, never a partial decode), for a frame carrying every command
+    /// variant and for an image.
+    #[test]
+    fn every_truncation_of_a_valid_frame_is_an_err() {
+        for w in sample_wires() {
+            let bytes = encode_wire(&w);
+            for cut in 0..bytes.len() {
+                let err = decode_wire(&bytes[..cut]).expect_err("prefix must not decode");
+                if cut == 0 {
+                    assert!(matches!(err, FormatError::PreBaselineFormat { .. }));
+                } else {
+                    assert!(
+                        matches!(err, FormatError::Malformed { .. }),
+                        "cut {cut}: {err:?}"
+                    );
+                }
+            }
+        }
+        let image = encode_image(
+            &[(crate::KIND_BASE, b"k".to_vec(), Some(vec![1, 2]), 3)],
+            Some(ts(5, 1)),
+        );
+        for cut in 0..image.len() {
+            let err = decode_image(&image[..cut]).expect_err("prefix must not decode");
+            match (cut, &err) {
+                (0, FormatError::PreBaselineFormat { .. }) => {}
+                (c, FormatError::Malformed { .. }) if c > 0 => {}
+                _ => panic!("cut {cut}: {err:?}"),
+            }
+        }
     }
 
     /// Regression for the process-abort DoS this module's `with_capacity`
@@ -1984,7 +1946,7 @@ mod tests {
         // No entry bytes follow at all — the declared count vastly exceeds
         // what the buffer actually holds.
         let err = decode_wire(&bytes).unwrap_err();
-        assert!(err.contains("truncated"), "got: {err}");
+        assert!(malformed_detail(err).contains("truncated"));
     }
 
     proptest! {

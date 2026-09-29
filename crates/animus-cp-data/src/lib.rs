@@ -67,6 +67,8 @@ mod ceiling;
 pub mod cluster_segment_store;
 mod codec;
 pub mod cursor;
+#[cfg(test)]
+mod format_fixture_tests;
 pub mod heartbeat_batch;
 pub mod hlc;
 pub mod host;
@@ -8138,7 +8140,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
         // scan `engine_image` builds this image from can't see it either —
         // there is no row to see. `install_max_ts` is the sender's own
         // `max_applied_ts` at image-build time, carried in the image's
-        // header (`codec::encode_image`/`decode_image`, version `29`)
+        // header (`codec::encode_image`/`decode_image`)
         // instead of as a scanned row, so this fold covers exactly the case
         // `latest_version()` structurally cannot: witnessing every entry the
         // sender ever committed for this tablet, not just the ones that
@@ -10893,8 +10895,8 @@ async fn raw_scoped_keys<S: StorageEngine>(storage: &S, scope: &StorageScope) ->
 /// own running high-water mark (the same variable `assert_ts_monotonic`
 /// maintains) at image-build time — an upper bound on every `ts` any entry
 /// has ever committed for this tablet, whether or not that entry's apply
-/// wrote a row. It rides in the image's own header (`codec::encode_image`,
-/// version `29`), NOT as a scanned row: `KIND_BASE`/`KIND_LSI`/`KIND_CHANGE`/
+/// wrote a row. It rides in the image's own header (`codec::encode_image`),
+/// NOT as a scanned row: `KIND_BASE`/`KIND_LSI`/`KIND_CHANGE`/
 /// `KIND_FOOTPRINT`/`KIND_CURSOR` are the only row kinds this scan classifies
 /// — the engine-global reserved-namespace markers (`ceiling.rs`/`seal.rs`/
 /// `split.rs`, leading `0x5F`, matching no kind) are deliberately excluded

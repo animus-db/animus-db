@@ -702,6 +702,39 @@ rather than recovering an empty/truncated one. Golden fixture:
 round-trip and `#[ignore]`d generator tests in the same
 `tests/format_fixtures.rs`.
 
+**Workstream C as-built (2026-09-29), layer 3 — RaftKV codec.**
+`crates/animus-cp-data/src/codec.rs`'s `VERSION` is reset **32** → 1 (row C
+and the inventory table said 31; the counter had moved on). The magic stays
+the single byte `0xCB` + a `u8` version (not widened to a 4-byte magic — it is
+a wire/image frame, and the shape already had strict-equality version checks and
+no legacy decode arms). **Scope clarification:** the binary codec covers only
+`encode_wire`/`decode_wire` (`KvWire`: Raft, ReadProbe, ReadProbeAck,
+HeartbeatBatch) and `encode_image`/`decode_image` (the `InstallSnapshot` engine
+image with its `max_ts` header). The durable `KvCommand` lives in the Raft WAL
+as `serde_json` inside `WalRecord<KvCommand, KvState>`, carried by the `CWL1`
+(per-group) / `SWL1` (shared) line envelopes from layer 2 and workstream B —
+that is the compatibility-relevant format, and it gets its own fixture. Errors
+are now `FormatError` (formats `raftkv-wire`, `raftkv-image`): empty input or a
+magic mismatch is `PreBaselineFormat`, version `0` or above `VERSION` is
+`UnsupportedFormatVersion`, all other framing damage is `Malformed`; every call
+site (`warn!` and drop) only `Display`s it. Pre-baseline serde compat removed
+inside `animus-cp-data`: `TxnWrite.stage_marker` and `TxnWrite.pending` no
+longer `#[serde(default)]` (and, because serde defaults a missing `Option`
+field to `None` regardless, use a `deserialize_with = "required_option"` so a
+missing field really is a decode error). Golden fixtures:
+`crates/animus-cp-data/tests/fixtures/formats/{raftkv-wire,raftkv-image,raftkv-wal}/v1.bin`;
+their tests are in-crate (`src/format_fixture_tests.rs`) because the wire/image
+codec is `pub(crate)`. **Open items for other workstreams' owners** — pre-baseline
+compat `#[serde(default)]`s outside C's crates, left untouched: `animus-item`
+(`index.rs`: `ChangeRecord` and related fields), `animus-tablet` (`lib.rs`:
+`table`, lifecycle state and split fields on the tablet descriptor),
+`animus-control` (`persist.rs` `WalRecord::Snapshot.config`/`learners`;
+`raft.rs` `LogEntry.config`/`learners`, `AppendEntries`/`InstallSnapshot` wire
+fields; `schema.rs` and `meta.rs` catalog/`Metadata` fields, including
+`IndexStatus::active` and `default_node_role`), each of which is a persisted or
+wire shape a baselined format should either require or document as genuine
+semantics.
+
 ## Testing
 
 Every phase must stay provable under ADR 0003's determinism guarantee, the
