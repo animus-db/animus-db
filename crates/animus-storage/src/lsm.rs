@@ -414,8 +414,8 @@ struct Manifest {
     max_version: Version,
     /// Live WAL segment numbers (ascending) the engine must replay on recovery —
     /// the files `<prefix>wal-NNNNNN` not yet fully folded into an SSTable. An
-    /// empty list is treated as "no segmented WAL recorded" and recovery falls
-    /// back to the legacy `<prefix>wal` file (see [`LsmEngine::open_with`]).
+    /// empty list means "no segmented WAL recorded": a fresh engine, whose
+    /// first write opens segment 0 (see [`LsmEngine::open_with`]).
     wal_segments: Vec<u64>,
 }
 
@@ -637,8 +637,8 @@ impl<E: Env> LsmEngine<E> {
     /// `live` segments, augmented with any present-on-disk segments that follow the
     /// last recorded one (created by writes after the last flush, or by a crash
     /// mid-GC, so not yet manifest-named — but they carry acks and must be
-    /// replayed). Returns them ascending. An empty result means the legacy
-    /// single-file WAL path (no segmented WAL on disk yet).
+    /// replayed). Returns them ascending. An empty result means a fresh engine
+    /// (no segmented WAL on disk yet).
     async fn discover_wal_segments(env: &E, prefix: &str, live: &[u64]) -> Result<Vec<u64>> {
         // Start from the recorded set (already ascending in the manifest).
         let mut segs: Vec<u64> = live.to_vec();
@@ -660,7 +660,7 @@ impl<E: Env> LsmEngine<E> {
         }
         // When the manifest named no segments but probing from 0 found some, those
         // are the live set already; when probing found nothing and the manifest had
-        // none, `segs` is empty and the caller takes the legacy path.
+        // none, `segs` is empty and the caller treats the engine as fresh.
         Ok(segs)
     }
 
@@ -669,7 +669,7 @@ impl<E: Env> LsmEngine<E> {
     /// is the ascending set [`discover_wal_segments`](Self::discover_wal_segments)
     /// returned; every segment numbered below its minimum is a covered orphan whose
     /// records are already in an SSTable, so removing it is data-safe. No-op when
-    /// the live set is empty (legacy single-file WAL) or starts at 0.
+    /// the live set is empty (fresh engine) or starts at 0.
     ///
     /// Uses [`Disk::list`] (one directory listing) rather than probing segment
     /// numbers `0..lowest_live` one `env.size` call at a time: the probe loop
@@ -756,6 +756,23 @@ impl<E: Env> LsmEngine<E> {
             decode_manifest(&manifest_bytes)?
         };
 
+        // Guard the legacy single-file WAL (`<prefix>wal`, no `-NNNNNN`). No
+        // current code writes it; only `<prefix>wal-NNNNNN` segments exist. A
+        // nonzero one is data from before segmented WAL, which this binary can no
+        // longer replay, so refuse loudly rather than open without it and lose
+        // acked writes silently. Unconditional (not only when no segments are
+        // recorded): the old migration left this file behind as an orphan beside
+        // segments, but any such directory also has a pre-baseline manifest and
+        // is refused above anyway, and a post-baseline engine never creates the
+        // file, so its presence with a valid manifest is still foreign data.
+        // Absent or zero-length (a fresh engine, or an unsynced create a crash
+        // dropped) is fine.
+        if env.size(&format!("{prefix}wal")).await.map_err(io)? > 0 {
+            return Err(StorageError::PreBaselineFormat {
+                format: "lsm-wal-legacy-single-file",
+            });
+        }
+
         // Open the SSTables the manifest names (reads their footer + index only).
         let block_reads = Arc::new(AtomicU64::new(0));
         let mut readers = Vec::with_capacity(manifest.tables.len());
@@ -797,7 +814,7 @@ impl<E: Env> LsmEngine<E> {
         let mut max_version = manifest.max_version;
         // The active segment's own byte length after any torn-tail/torn-header
         // repair below — `0` when there is no segment at all yet (a brand-new
-        // or legacy-migrating engine). This, not the manifest or the segment
+        // engine). This, not the manifest or the segment
         // list alone, is what tells `GroupCommit::new` whether the active
         // segment already carries a durable WAL file header: any nonzero
         // length here can only exist because a prior header-carrying `append`
@@ -806,22 +823,9 @@ impl<E: Env> LsmEngine<E> {
         // repaired back to empty just below — means the very next write must
         // write a fresh one.
         let mut active_seg_final_len: u64 = 0;
-        if segments.is_empty() {
-            // Legacy migration: a directory written by the single-file-WAL era has
-            // no recorded segments. Replay the old `<prefix>wal` file (if any) so
-            // an upgrade loses nothing; the first new flush rewrites the layout to
-            // segments and this file is left as a harmless orphan. (Pre-alpha: this
-            // predates even the binary WAL codec, so an old JSON-encoded file no
-            // longer decodes — no real deployment depends on it; a brand-new engine
-            // with no legacy file just reads zero bytes here and replays nothing.)
-            let legacy = format!("{prefix}wal");
-            let wal_bytes = env.read(&legacy).await.map_err(io)?;
-            let (records, _consumed) = decode_wal(&wal_bytes)?;
-            for record in records {
-                max_version = max_version.max(record_max_version(&record));
-                apply_wal_record(&mut memtable, &mut memtable_bytes, record);
-            }
-        } else {
+        // An empty segment list is a fresh engine: nothing to replay, and the
+        // first write opens segment 0.
+        if !segments.is_empty() {
             // The highest-numbered segment is the one `GroupCommit` reopens as
             // *active* (see its constructor below): further appends ride it. Only
             // this segment can ever carry a crash-torn tail — older segments are
@@ -877,7 +881,7 @@ impl<E: Env> LsmEngine<E> {
         // resumes at 0 (the next new write is the first durable sequence). The
         // highest discovered segment becomes the active one; the rest are sealed,
         // so a later flush can GC the covered ones. An empty discovered set means a
-        // fresh (or legacy) engine: the first write opens segment 0.
+        // fresh engine: the first write opens segment 0.
         let wal = Arc::new(GroupCommit::new(
             prefix.to_string(),
             &segments,
@@ -4840,6 +4844,72 @@ mod readers_arc_tests {
                     "seed={seed}"
                 );
             }
+        });
+    }
+}
+
+/// The legacy single-file WAL (`<prefix>wal`) guard in `open_with`: a nonzero
+/// file is refused loudly (`PreBaselineFormat`), a zero-length or absent one is
+/// a fresh engine, and a normal engine still round-trips across a crash.
+#[cfg(test)]
+mod legacy_wal_guard_tests {
+    use super::*;
+    use animus_env::{Disk, nid};
+    use animus_sim::Simulator;
+    use futures::executor::block_on;
+
+    const PREFIX: &str = "db/";
+
+    #[test]
+    fn nonempty_legacy_single_file_wal_is_refused() {
+        let sim = Simulator::new(0x1073);
+        let env = sim.env(nid(0));
+        block_on(async {
+            let legacy = format!("{PREFIX}wal");
+            env.append(&legacy, b"pre-baseline bytes").await.unwrap();
+            env.sync(&legacy).await.unwrap();
+            match LsmEngine::open_with(env.clone(), PREFIX, LsmOptions::default()).await {
+                Err(StorageError::PreBaselineFormat { format }) => {
+                    assert_eq!(format, "lsm-wal-legacy-single-file");
+                }
+                Err(e) => panic!("expected PreBaselineFormat, got {e:?}"),
+                Ok(_) => panic!("open must refuse a nonempty legacy WAL"),
+            }
+        });
+    }
+
+    #[test]
+    fn zero_length_legacy_wal_opens_as_fresh_engine() {
+        let sim = Simulator::new(0x1074);
+        let env = sim.env(nid(0));
+        block_on(async {
+            let legacy = format!("{PREFIX}wal");
+            env.replace(&legacy, b"").await.unwrap();
+            let e = LsmEngine::open_with(env.clone(), PREFIX, LsmOptions::default())
+                .await
+                .expect("zero-length legacy file is fine");
+            assert!(e.get(b"k").await.unwrap().is_none());
+            e.put(b"k", b"v", 1).await.unwrap();
+            assert!(e.get(b"k").await.unwrap().is_some());
+        });
+    }
+
+    #[test]
+    fn fresh_engine_survives_crash_and_reopen() {
+        let sim = Simulator::new(0x1075);
+        let env = sim.env(nid(0));
+        block_on(async {
+            let e = LsmEngine::open_with(env.clone(), PREFIX, LsmOptions::default())
+                .await
+                .unwrap();
+            e.put(b"k", b"v", 1).await.unwrap();
+            drop(e);
+            sim.crash(nid(0));
+            let e = LsmEngine::open_with(sim.env(nid(0)), PREFIX, LsmOptions::default())
+                .await
+                .unwrap();
+            let got = e.get(b"k").await.unwrap().expect("acked write survives");
+            assert_eq!(got.value, b"v");
         });
     }
 }

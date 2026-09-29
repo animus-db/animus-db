@@ -305,8 +305,10 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   manifest's live segments plus any contiguous segment files present beyond the
   highest recorded one (acked writes since the last flush, or a crash mid-GC), so
   it reconstructs the memtable exactly as the single-file replay did; a directory
-  with no recorded segments falls back to replaying a legacy single-file
-  `<prefix>wal` (upgrade path). The seq space is monotonic for the engine's life
+  with no recorded segments is a fresh engine. A nonzero legacy single-file
+  `<prefix>wal` makes `open_with` fail with `PreBaselineFormat`
+  (`"lsm-wal-legacy-single-file"`) — the migration is gone, never silently
+  ignored. The seq space is monotonic for the engine's life
   (rotation/GC never reset it). **Orphan WAL segments below the live set** (covered
   files a crash-after-manifest-swap-before-`remove` leaked) are deleted on open by
   `remove_orphan_wal_segments` — recovery already ignored them (it only probes
