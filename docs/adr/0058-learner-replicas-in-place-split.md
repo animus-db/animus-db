@@ -717,6 +717,139 @@ and a dead replica. Each was shown red with the mechanism disabled. Existing
 channel as "the replica learned" (the notice usually wins the race against the
 leader's own schedule there).
 
+**Amendment (2026-09-29, live check of the #1061 notice on PR #1084): the
+restarts the notice was expected to cure were a different, pre-existing
+livelock — a declined `InstallSnapshot` offer that nothing ever resolved —
+and the notice's own schedule had two smaller costs.** A live check of the
+branch (`--cluster-control 3 --cluster-data 5 --auto-split-bytes 1000000`,
+bulk seed + random `PutItem`, then five minutes with no writes) showed
+`cp_snapshot_transfer_restarts` still climbing at zero write rate (~27/min
+on two nodes, ~105/min on a third), and `demux_frames_dropped_closed`
+rising: frames for replicas the node had already released. Attribution
+(a temporary instrument on the restart site printing tablet, peer, its
+`match`/`next_index`, transfer bookkeeping and the leader's compaction
+floor) found three separate things, and it is worth being explicit that
+**the first is not part of #1061's mechanism at all** (it reproduces on
+`main`; a `main` build was run the same way for comparison):
+
+1. **The restarts: a snapshot offer the receiver declines, and a leader
+   that never stops making it (pre-existing).** Every counted restart, at
+   zero write rate, was one tablet with a *voter* peer whose leader-side
+   state read `next_index = 1`, `match_index` = the leader's own compaction
+   floor, `snapshot_offset = 0`, `snapshot_chunk_sent = (0, N)` with `N` in
+   the hundreds/thousands, `snapshot_served_through` one behind
+   `snapshot_index`. The sequence: (a) the follower's engine is still
+   digesting an install, so its `AppendEntriesResp`s echo `needs_snapshot`
+   (#554); (b) the leader's `snapshot_served_through[peer]` lags its own
+   `snapshot_index` (compaction moved the base since it last served the
+   peer, clamped to that same peer's `match_index` by `compaction_floor`),
+   so the echo reads as a *new* request and resets `next_index` to 1; (c)
+   the leader offers its cached image at a base the follower is already
+   past, and `handle_install_snapshot` declines it as redundant with
+   `InstallSnapshotResp { last_index: 0, next_offset: 0 }` (deliberately not
+   the shape of a completed install, PR #1048); (d) nothing ever moved
+   `next_index` off 1 again — every later ack was such a chunk reply, never
+   an `AppendEntriesResp` — so the leader re-offered chunk 0 on every
+   heartbeat forever, the reply handler's `snapshot_offset.entry(..)
+   .or_insert(0)` left a phantom entry that kept `snapshot_transfer_in_flight`
+   true, `apply_and_compact` read that as "defer compaction" and then, every
+   `COMPACT_DEFER_IDLE_CEILING` (2s), as an idle-ceiling override and counted
+   a "restart" — with the compaction it then attempted clamped by the same
+   peer's `match_index` to a no-op, so the loop never advanced. The peer
+   received no log entries at all in that state (visible externally as a
+   follower a few commits behind, flapping `PreCandidate`), and the group
+   could not quiesce (`cp_quiesces` stayed 0 for every group).
+   **Fixed in `handle_install_snapshot_resp`:** `(last_index 0, next_offset
+   0)` answering a chunk at **offset 0** is an unambiguous refusal (a
+   receiver that accepts the first chunk always buffers it and reports
+   `next_offset > 0`; the "restarted receiver lost its buffer" `(0, 0)` only
+   ever answers a chunk at a nonzero offset). The leader now believes it: the
+   receiver holds state through the offer's base (`snapshot_offer_base`, new,
+   written at each send), so `match_index`/`next_index` advance to the base,
+   the base counts as served (so a stale `needs_snapshot` echo for it cannot
+   re-arm the offer), the transfer is forgotten and ordinary replication
+   resumes. A duplicate refusal arriving after that (an offset-0 chunk is
+   resent up to `SNAPSHOT_ACK_RESEND_CAP` times before its first ack) no
+   longer re-creates the phantom `snapshot_offset` entry. Regression:
+   `crates/animus-control/tests/declined_snapshot_offer.rs`.
+   *Live effect:* the same workload went from 9/92/81 restarts per data node
+   (this branch without the fix, debug-instrumented; the un-instrumented
+   build climbed 245→355 on one node across the idle window) to **1/1/0/0/0
+   with the fix, under load and through the idle hold**, with zero
+   `snapshot_transfer_peers` on any group at any sample. Re-run on the final
+   merged tree (fixes on `origin/main` da71b8e0, 12-minute load then a
+   five-minute hold): 0/1/1/0/0 throughout, ~298k items seeded, and six
+   groups quiesced during the hold. **The livelock has a worse face the
+   restart counter does not show:** a plain `origin/main` build of the same
+   workload wedged a tablet outright — two of its four voters sat at
+   `commit == snapshot_index == 802` with an empty log (`n7` flapping
+   `PreCandidate`), so the leader's commit index (third-highest `match_index`
+   of four) stayed frozen at 802 for the whole run, `reconfigure_step` logged
+   `transfer_leadership rejected an apparently-eligible target` ~1,650 times,
+   the table never split, and the seed loop got through only ~60k items —
+   with `cp_snapshot_transfer_restarts` at 2, because a stalled tablet's
+   `behind` never reaches the compaction threshold that gates the counter.
+   (One run of each; run-to-run variance in restart counts is large — see the
+   lesson — but the stalled-commit signature is exactly a voter stuck below
+   the leader's base.)
+2. **Frames to released replicas (this is #1061's own schedule).** The
+   `departing` bookkeeping is leader-local and volatile, and on leaders where
+   the log could no longer serve the peer the leader sent it the notice
+   schedule (capped backoff, ~37 frames a minute) until the peer had been
+   silent for `DEPARTING_NOTICE_GIVE_UP` (five minutes). A peer whose host
+   has since **released** the replica can never reply, so every such frame
+   lands on a closed stream — and `become_leader`'s re-derivation
+   (`removals_in_log`) re-armed the whole five minutes for every peer removed
+   anywhere in the retained log, on every leadership change. Measured: one
+   such peer (tablet 68, removed peer `n4`, leader `n5`) cost one node 186
+   removal notices across the idle window, exactly the capped schedule for
+   one pair over five minutes; the maintainer's ~200 frames/minute is about
+   five such pairs. **Fixed with a second, short silence bound,
+   `DEPARTING_QUIET_GIVE_UP` (30s):** a departing peer is on it if it has
+   already **acked** its notice (it recorded its removal and its host
+   releases it the moment `Metadata` agrees) or was merely **inherited** at
+   `become_leader`. Any reply from a live peer resets the clock and a peer
+   cut off early is still told by its own campaign (`stranger_notice`, which
+   needs no leader-side memory), so this only ever cuts off a peer that has
+   left; a removal this leader itself just made and has not yet had answered
+   keeps the five-minute bound. Regression: `removal_notice.rs`'s
+   `a_departing_peer_that_acked_and_left_*` and
+   `an_inherited_departing_peer_that_never_answers_*`, each shown red with the
+   short bound disabled.
+3. **Observability the check lacked.** Four counters, visible in
+   `/admin/metrics`: `cp_removal_notices_sent`, `cp_removal_notices_acked`
+   (an ack covering the removing entry the leader awaited, or one answering
+   a stranger notice), `cp_removal_notices_ignored` (a peer-side notice
+   that failed a guard, or a leader-side ack that covers nothing awaited),
+   and `cp_departing_peers_dropped` (any end of a peer's schedule: acked with
+   an unservable log, caught up, or silent past its bound) — folded in by the
+   CP-data driver from `RaftCore::removal_stats()` deltas (the core stays
+   sync and I/O-free). `/admin/raftkv` also gained per-group `departing` and
+   `snapshot_transfer_peers`, so a group that keeps an offer outstanding at
+   zero write rate is attributable to a peer without a debugger. (The same
+   run showed `cp_removal_notices_ignored == cp_removal_notices_sent` on some
+   nodes: those are acks answering *stranger* notices — a hosted-but-not-yet-
+   added joiner that booted believing itself a voter and campaigned — which
+   the first version of the counters mis-filed as stale; they now count as
+   acked.)
+
+*Not fixed here, found on the way:* quiescence (on by default, 5s) barely
+engaged after the big run. Before the fixes above no replica was quiesced at
+any sample of the five-minute idle hold (every replica's `quiesced` false,
+`cp_quiesces` flat) and an idle cluster ticked ~1,700 `AppendEntries`/s on the
+busiest node; that part was the declined-offer livelock (a group with a
+transfer outstanding is never quiesce-eligible). With the fixes, groups do
+quiesce — two of the 38 tablets (`cp_quiesces` 2 on each of three nodes) during
+the same hold — but the other 36 stayed awake with no `departing` peer and no
+transfer outstanding on any of them, whereas a small idle cluster quiesced
+15/18 replicas (plain table) and 12/18 (streamed table) in 90s. So some
+further veto keeps most tablets of a large, just-loaded, many-times-split
+cluster awake for at least six minutes; it is not the departing/transfer
+clauses and not churn (`cp_unquiesces` stayed 0), and it is left for its
+own investigation (candidates: stream/change-log housekeeping or placing/
+index-drain convergence keeping a tablet's local-activity clock fresh, or
+another `quiesce_entry_ok` clause).
+
 ### Train 2: in-place split, replacing ADR 0050's build/freeze/cutover workflow
 
 **Stage 1 — `BeginSplit` unchanged in shape, changed in effect.** The
