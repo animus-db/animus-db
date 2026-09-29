@@ -849,12 +849,16 @@ impl<E: Env> LsmEngine<E> {
                 // bug `acked_writes_after_torn_tail_recovery_survive_second_restart`
                 // pins. `replace` is the same atomic primitive the manifest swap
                 // uses, so this truncation is itself crash-safe.
-                if seg == active_seg && consumed < wal_bytes.len() {
-                    env.replace(&file, &wal_bytes[..consumed])
-                        .await
-                        .map_err(io)?;
-                }
                 if seg == active_seg {
+                    if consumed < wal_bytes.len() {
+                        env.replace(&file, &wal_bytes[..consumed])
+                            .await
+                            .map_err(io)?;
+                    }
+                    // Post-repair on-disk length: `consumed` whether or not a
+                    // torn tail was cut. Drives both the header decision and
+                    // the group commit's rotation counter (see
+                    // `GroupCommit::new`).
                     active_seg_final_len = consumed as u64;
                 }
             }
