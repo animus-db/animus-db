@@ -11206,7 +11206,25 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         shared.recovered_state(tablet).await
     } else {
         let bytes = env.read(&wal).await.unwrap_or_default();
-        PersistedState::replay(PersistedState::decode(&bytes))
+        // ADR 0073 Phase 0 workstream B: `PersistedState::decode` is now
+        // fallible (pre-baseline / unknown-version / malformed WAL). `drive`
+        // is spawned fire-and-forget with no `Result` to propagate into, so
+        // mirror `animus_control::node::drive`: log the named error loudly
+        // and halt this group before recovery — never panic, never recover
+        // as an empty log.
+        match PersistedState::decode(&bytes) {
+            Ok(records) => PersistedState::replay(records),
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    stream,
+                    "raftkv WAL failed to decode; refusing to recover as an \
+                     empty log - halting this tablet group"
+                );
+                halted.store(true, Ordering::SeqCst);
+                return;
+            }
+        }
     };
     // Witnessing point (ADR 0018 §2 amendment): "WAL recovery, each recovered
     // entry." Every command this node ever durably logged for this group —

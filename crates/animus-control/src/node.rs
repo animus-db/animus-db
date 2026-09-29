@@ -20,9 +20,10 @@ use futures::lock::Mutex as AsyncMutex;
 
 use crate::delta_ring::DeltaRing;
 use crate::detector::FailureDetector;
+use crate::format::{self, FormatError};
 use crate::meta::{Member, MetaCommand, Metadata, NodeStatus, PlacementView};
 use crate::mirror::{self, KeyWrite};
-use crate::persist::PersistedState;
+use crate::persist::{CONTROL_SNAPSHOT, PersistedState};
 use crate::persist_round::{self, GatedOuts, PersistArm, PersistFut, PersistProgress, PersistWake};
 use crate::raft::{Out, ProposeResult, RaftCore, RaftMsg, Role};
 use crate::syskv;
@@ -1270,7 +1271,36 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
 ) {
     // Recover from the WAL before serving anything.
     let bytes = env.read(WAL).await.unwrap_or_default();
-    let state = PersistedState::replay(PersistedState::decode(&bytes));
+    let records = match PersistedState::decode(&bytes) {
+        Ok(records) => records,
+        Err(e) => {
+            // ADR 0073 Phase 0 workstream B: a WAL that fails to decode —
+            // bad/missing magic (pre-baseline data), an unrecognized
+            // future version, or a corrupted-but-checksum-valid record —
+            // must never be silently treated as "empty," which would make
+            // genuine corruption indistinguishable from a genuine first
+            // boot and defeat the entire point of tagging the format.
+            // `drive` is spawned fire-and-forget (`EnvExt::spawn_task`
+            // requires `Future<Output = ()>`) by `RaftNode::start*`, which
+            // itself returns `Self`, not a `Result`, across ~150 call
+            // sites in this workspace — restructuring that is out of
+            // scope here, so there is no `Result` this function can
+            // propagate into. Surface the failure loudly instead (an
+            // `error`-level log naming the exact `FormatError`), then halt
+            // this node permanently before it ever calls
+            // `RaftCore::recovered`/grants a vote/campaigns — it never
+            // silently proceeds on `RaftCore::new`'s fresh, empty state.
+            tracing::error!(
+                error = %e,
+                "control-plane Raft WAL failed to decode; refusing to recover \
+                 as an empty log — halting this node until its WAL is \
+                 repaired or removed"
+            );
+            halted.store(true, Ordering::SeqCst);
+            return;
+        }
+    };
+    let state = PersistedState::replay(records);
     if !state.is_empty() {
         let recovered =
             RaftCore::recovered(env.node_id(), &all_nodes, state, env.now(), env.next_u64());
@@ -1747,10 +1777,13 @@ async fn meta_apply_and_compact<E: Env, S: StorageEngine>(
         .drain_pending_install();
     if let Some((last_index, bytes)) = pending_install {
         if !install_syskv_image(engine, &bytes, halted).await {
-            // Tolerated only because `halted` is set (this node is tearing
-            // down): the image never durably installed, so nothing below may
-            // advance on its account — return without touching `shadow`/
-            // `cache`/`watermark`/`engine_applied`/the delta ring/`watch`.
+            // Either a `CONTROL_SNAPSHOT`-envelope decode failure (loud,
+            // logged inside `install_syskv_image`, unconditional — see its
+            // own doc) or a `merge_batch` failure tolerated only because
+            // `halted` is set (this node is tearing down): either way the
+            // image never durably installed, so nothing below may advance on
+            // its account — return without touching `shadow`/`cache`/
+            // `watermark`/`engine_applied`/the delta ring/`watch`.
             return did_work;
         }
         *shadow = mirror::rebuild_metadata_from_engine(engine)
@@ -1994,6 +2027,39 @@ async fn meta_apply_and_compact<E: Env, S: StorageEngine>(
     did_work
 }
 
+/// One system-keyspace image entry: `(key, value-or-tombstone, version)`.
+/// See [`syskv_image`]'s own doc for why tombstones are carried.
+type SyskvImageEntry = (Vec<u8>, Option<Vec<u8>>, u64);
+
+/// Encode a system-keyspace image as a [`CONTROL_SNAPSHOT`]-tagged envelope
+/// (ADR 0073 Phase 0 workstream B, magic `CSN1`): `serde_json`-serialize
+/// `entries`, then [`format::wrap`] it. Pure, no `Env`/I/O — the dual of
+/// [`decode_syskv_image_bytes`]. `#[doc(hidden)]` and `pub` only so
+/// `tests/format_fixtures.rs` can build/decode a golden fixture directly,
+/// without a running node or engine; not part of this crate's intended
+/// public surface.
+#[doc(hidden)]
+#[must_use]
+pub fn encode_syskv_image_bytes(entries: &[SyskvImageEntry]) -> Vec<u8> {
+    let payload = serde_json::to_vec(entries).expect("system-keyspace image serializes");
+    format::wrap(&CONTROL_SNAPSHOT, &payload)
+}
+
+/// Decode a [`CONTROL_SNAPSHOT`]-tagged system-keyspace image back into its
+/// entries. `Err` for anything [`format::unwrap`] itself rejects
+/// (pre-baseline untagged bytes, an unsupported version) or a body that
+/// fails to decode as the expected JSON shape
+/// ([`FormatError::Malformed`]) — never a panic. Pure, no `Env`/I/O; see
+/// [`encode_syskv_image_bytes`]'s own doc for why this is exposed.
+#[doc(hidden)]
+pub fn decode_syskv_image_bytes(bytes: &[u8]) -> Result<Vec<SyskvImageEntry>, FormatError> {
+    let (_version, payload) = format::unwrap(&CONTROL_SNAPSHOT, bytes)?;
+    serde_json::from_slice(payload).map_err(|e| FormatError::Malformed {
+        format: CONTROL_SNAPSHOT.name,
+        detail: e.to_string(),
+    })
+}
+
 /// Build the system-keyspace image shipped to a lagging follower via
 /// `InstallSnapshot` (ADR 0038 PR3): every live `(key, value-or-tombstone,
 /// version)` under [`syskv::RESERVED_NAMESPACE`] — tombstones are carried
@@ -2001,42 +2067,68 @@ async fn meta_apply_and_compact<E: Env, S: StorageEngine>(
 /// overwrites any stale value it might already hold from an earlier,
 /// incomplete transfer. Filtering by [`syskv::decode_key`] matters only on a
 /// **combined** node, whose engine is shared with the CP data plane's own,
-/// differently-keyed entries.
+/// differently-keyed entries. **Tagged with [`CONTROL_SNAPSHOT`] (ADR 0073
+/// Phase 0 workstream B, magic `CSN1`)** since this PR — see
+/// [`encode_syskv_image_bytes`].
 async fn syskv_image<S: StorageEngine>(engine: &S) -> Vec<u8> {
-    let entries: Vec<(Vec<u8>, Option<Vec<u8>>, u64)> = engine
+    let entries: Vec<SyskvImageEntry> = engine
         .entries_with_tombstones()
         .await
         .expect("system-keyspace engine scan (image)")
         .into_iter()
         .filter(|(key, _, _)| syskv::decode_key(key).is_some())
         .collect();
-    serde_json::to_vec(&entries).expect("system-keyspace image serializes")
+    encode_syskv_image_bytes(&entries)
 }
 
 /// Write a received system-keyspace image into the engine (a follower
-/// catching up via `InstallSnapshot`), the dual of [`syskv_image`]. Logs a
-/// warning and drops the image on an undecodable payload rather than
-/// panicking — mirrors `animus-cp-data::install_engine_image`'s treatment of
-/// a corrupt wire image.
+/// catching up via `InstallSnapshot`), the dual of [`syskv_image`].
+///
+/// **Since this PR, `bytes` must decode through [`decode_syskv_image_bytes`]
+/// (the [`CONTROL_SNAPSHOT`] envelope) first.** A pre-baseline/untagged
+/// image, an unsupported version, or a malformed JSON body is loud — logged
+/// at `error` — installs **nothing** and **halts the node** (returns `false`,
+/// below), since the core has already adopted the snapshot; it is
+/// never silently dropped-and-tolerated the way an empty image is, and never
+/// a panic (a format-decode failure is not the same claim as a real engine
+/// I/O fault — see the `merge_batch` branch below, which keeps its own
+/// pre-existing halted-gated-panic discipline unchanged).
 ///
 /// Returns whether the caller may treat this pass as having installed
 /// something (`true` for both "genuinely installed" and "nothing to
-/// install" — an undecodable or empty image is not a failure). Returns
-/// `false` only for a **tolerated** `merge_batch` failure — `halted` is set,
-/// so the caller must not advance `watermark`/`cache`/`engine_applied`/the
-/// delta ring/`watch` on this pass, since nothing durable happened (mirrors
-/// `persist_wal`'s/`meta_apply_and_compact`'s own halted-gated tolerance —
-/// see their docs). A failure while *not* halted stays a hard panic.
+/// install" — an empty decoded image is not a failure). Returns `false` for
+/// a decode failure (above, unconditionally — nothing was ever installed, so
+/// there is nothing to have made durable) and for a **tolerated**
+/// `merge_batch` failure (`halted` is set); either way the caller must not
+/// advance `watermark`/`cache`/`engine_applied`/the delta ring/`watch` on
+/// this pass, since nothing durable happened (mirrors `persist_wal`'s/
+/// `meta_apply_and_compact`'s own halted-gated tolerance — see their docs).
+/// A `merge_batch` failure while *not* halted stays a hard panic (unchanged
+/// from before this PR) — a genuine engine-write fault while running means
+/// the engine may now be silently missing a committed write, which is not
+/// this format-decode path's concern.
 async fn install_syskv_image<S: StorageEngine>(
     engine: &S,
     bytes: &[u8],
     halted: &AtomicBool,
 ) -> bool {
-    let entries: Vec<(Vec<u8>, Option<Vec<u8>>, u64)> = match serde_json::from_slice(bytes) {
+    let entries = match decode_syskv_image_bytes(bytes) {
         Ok(e) => e,
         Err(err) => {
-            tracing::warn!(?err, "undecodable system-keyspace snapshot image dropped");
-            return true;
+            // By the time an image reaches here the core has already
+            // accepted the snapshot (`pending_install` is set only after the
+            // transfer completes and the core adopted `last_index`), so
+            // simply skipping the install would leave this node running with
+            // its engine silently behind its own Raft state. Halt instead —
+            // the same treatment `drive` gives an undecodable WAL: loud,
+            // never a panic, never a silent divergence.
+            tracing::error!(
+                %err,
+                "system-keyspace snapshot image failed to decode; installing nothing \
+                 and halting this node",
+            );
+            halted.store(true, Ordering::SeqCst);
+            return false;
         }
     };
     if entries.is_empty() {
@@ -2910,6 +3002,106 @@ mod tests {
         let mut d = FailureDetector::new(DETECT_TIMEOUT);
         d.observe(node, last_seen);
         d
+    }
+
+    // --- CSN1 system-keyspace snapshot envelope (ADR 0073 Phase 0 workstream
+    // B) -------------------------------------------------------------------
+
+    #[test]
+    fn syskv_image_round_trips_through_the_csn1_envelope() {
+        let entries: Vec<SyskvImageEntry> = vec![
+            (b"k1".to_vec(), Some(b"v1".to_vec()), 1),
+            (b"k2".to_vec(), None, 2), // a tombstone
+        ];
+        let bytes = encode_syskv_image_bytes(&entries);
+        assert_eq!(&bytes[..4], &CONTROL_SNAPSHOT.magic);
+        assert_eq!(bytes[4], CONTROL_SNAPSHOT.version);
+        let decoded = decode_syskv_image_bytes(&bytes).expect("a CSN1-tagged image decodes");
+        assert_eq!(decoded, entries);
+    }
+
+    #[test]
+    fn decode_syskv_image_bytes_rejects_an_untagged_pre_baseline_image() {
+        // What the pre-CSN1 wire shape looked like: bare `serde_json`, no
+        // envelope at all.
+        let entries: Vec<SyskvImageEntry> = vec![(b"k".to_vec(), Some(b"v".to_vec()), 1)];
+        let untagged = serde_json::to_vec(&entries).expect("serializes");
+        let err = decode_syskv_image_bytes(&untagged).expect_err("untagged bytes must not decode");
+        assert_eq!(
+            err,
+            FormatError::PreBaselineFormat {
+                format: CONTROL_SNAPSHOT.name
+            }
+        );
+    }
+
+    #[test]
+    fn decode_syskv_image_bytes_rejects_an_unsupported_version() {
+        let entries: Vec<SyskvImageEntry> = vec![(b"k".to_vec(), Some(b"v".to_vec()), 1)];
+        let payload = serde_json::to_vec(&entries).expect("serializes");
+        let mut bytes = format::wrap(&CONTROL_SNAPSHOT, &payload);
+        bytes[4] = CONTROL_SNAPSHOT.version + 1; // a future version this build doesn't know
+        let err = decode_syskv_image_bytes(&bytes).expect_err("a future version must not decode");
+        assert_eq!(
+            err,
+            FormatError::UnsupportedFormatVersion {
+                format: CONTROL_SNAPSHOT.name,
+                found: CONTROL_SNAPSHOT.version + 1,
+                max_supported: CONTROL_SNAPSHOT.version,
+            }
+        );
+    }
+
+    #[test]
+    fn decode_syskv_image_bytes_rejects_a_correctly_tagged_but_malformed_body() {
+        let bytes = format::wrap(&CONTROL_SNAPSHOT, b"not valid json");
+        // `format::wrap`'s header is exactly `magic || version`; sanity-check
+        // this test built one before asserting on the body past it.
+        assert_eq!(&bytes[..4], &CONTROL_SNAPSHOT.magic);
+        let err = decode_syskv_image_bytes(&bytes).expect_err("garbage JSON must not decode");
+        assert!(matches!(
+            err,
+            FormatError::Malformed { format, .. } if format == CONTROL_SNAPSHOT.name
+        ));
+    }
+
+    /// The install path: an untagged (pre-baseline) image must install
+    /// **nothing** into the engine and must not panic, even while the driver
+    /// is *not* halted — a format-decode failure is a different claim from a
+    /// real engine I/O fault (see `install_syskv_image`'s own doc).
+    #[tokio::test]
+    async fn install_syskv_image_installs_nothing_on_an_untagged_image_and_does_not_panic() {
+        let engine = animus_storage::MemoryEngine::new();
+        let entries: Vec<SyskvImageEntry> =
+            vec![(syskv::tablet_key(TabletId(1)), Some(b"v".to_vec()), 1)];
+        let untagged = serde_json::to_vec(&entries).expect("serializes");
+        let halted = AtomicBool::new(false); // deliberately NOT halted
+        let installed = install_syskv_image(&engine, &untagged, &halted).await;
+        assert!(!installed, "an untagged image must fail the install");
+        assert!(
+            engine.entries().await.expect("engine scan").is_empty(),
+            "nothing should have been written to the engine"
+        );
+    }
+
+    /// The positive control for the test above: a properly CSN1-tagged image
+    /// installs exactly as before this PR.
+    #[tokio::test]
+    async fn install_syskv_image_installs_a_tagged_image() {
+        let engine = animus_storage::MemoryEngine::new();
+        let key = syskv::tablet_key(TabletId(1));
+        let entries: Vec<SyskvImageEntry> = vec![(key.clone(), Some(b"v".to_vec()), 1)];
+        let bytes = encode_syskv_image_bytes(&entries);
+        let halted = AtomicBool::new(false);
+        let installed = install_syskv_image(&engine, &bytes, &halted).await;
+        assert!(installed, "a correctly tagged image must install");
+        let stored = engine
+            .entries()
+            .await
+            .expect("engine scan")
+            .into_iter()
+            .find(|(k, _)| *k == key);
+        assert_eq!(stored.map(|(_, v)| v.value), Some(b"v".to_vec()));
     }
 
     #[test]
