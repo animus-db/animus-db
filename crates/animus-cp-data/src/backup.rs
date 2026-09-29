@@ -66,6 +66,7 @@
 //! pre-alpha "no back-compat" notwithstanding, a version bump here should
 //! still be a deliberate, visible decision.
 
+use animus_control::format::{self, FormatError, FormatTag};
 use animus_control::{BackupManifest, BackupTabletProgress};
 use animus_tablet::TabletId;
 use serde::{Deserialize, Serialize};
@@ -96,10 +97,27 @@ pub const BACKUP_NAMESPACE: &str = "backup";
 /// reasoning.
 pub const BACKUP_SEGMENT_STREAM: u64 = u64::MAX - 1;
 
-/// Decode/encode failures are plain descriptive strings, mirroring
-/// `segment::SegmentError`'s own shape — every caller's own handling is "log
-/// loudly, treat as absent/corrupt."
-pub type BackupCodecError = String;
+/// Decode failures are ADR 0073's shared [`FormatError`] (mirroring
+/// `segment::SegmentError`): every caller only `Display`s it ("log loudly,
+/// treat as absent/corrupt"), but no-magic/foreign input
+/// (`PreBaselineFormat`), an unknown version (`UnsupportedFormatVersion`)
+/// and framing/body damage (`Malformed`) are now distinguishable.
+pub type BackupCodecError = FormatError;
+
+/// Format tag of the manifest object: the `BKMF` + `u8` envelope **is** its
+/// version tag (ADR 0073's binary shape), so the JSON body carries no `"v"`.
+pub const MANIFEST_TAG: FormatTag = FormatTag {
+    magic: *b"BKMF",
+    version: 1,
+    name: "backup-manifest",
+};
+
+/// Format tag of a data chunk (`BKDT` + `u8`, then the row framing).
+pub const DATA_TAG: FormatTag = FormatTag {
+    magic: *b"BKDT",
+    version: 1,
+    name: "backup-data",
+};
 
 /// This backup's own object-id prefix (ADR 0059 §4) — every object naming
 /// helper below shares it. Handy for a future debug/sweep `SegmentStore::
@@ -214,7 +232,7 @@ struct Cursor<'a> {
 }
 
 impl<'a> Cursor<'a> {
-    fn take(&mut self, n: usize) -> Result<&'a [u8], BackupCodecError> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
         let end = self
             .pos
             .checked_add(n)
@@ -231,26 +249,26 @@ impl<'a> Cursor<'a> {
         Ok(slice)
     }
 
-    fn u8(&mut self) -> Result<u8, BackupCodecError> {
+    fn u8(&mut self) -> Result<u8, String> {
         Ok(self.take(1)?[0])
     }
 
-    fn u32(&mut self) -> Result<u32, BackupCodecError> {
+    fn u32(&mut self) -> Result<u32, String> {
         let b: [u8; 4] = self.take(4)?.try_into().expect("took exactly 4 bytes");
         Ok(u32::from_be_bytes(b))
     }
 
-    fn u64(&mut self) -> Result<u64, BackupCodecError> {
+    fn u64(&mut self) -> Result<u64, String> {
         let b: [u8; 8] = self.take(8)?.try_into().expect("took exactly 8 bytes");
         Ok(u64::from_be_bytes(b))
     }
 
-    fn bytes(&mut self) -> Result<Vec<u8>, BackupCodecError> {
+    fn bytes(&mut self) -> Result<Vec<u8>, String> {
         let len = self.u32()? as usize;
         Ok(self.take(len)?.to_vec())
     }
 
-    fn opt_bytes(&mut self) -> Result<Option<Vec<u8>>, BackupCodecError> {
+    fn opt_bytes(&mut self) -> Result<Option<Vec<u8>>, String> {
         match self.u8()? {
             0 => Ok(None),
             1 => Ok(Some(self.bytes()?)),
@@ -278,27 +296,24 @@ fn put_opt_bytes(out: &mut Vec<u8>, value: &Option<Vec<u8>>) {
 
 // --- data chunk codec (§2) --------------------------------------------------
 
-const DATA_MAGIC: [u8; 4] = *b"BKDT";
-
-/// Data-chunk codec version, bumped on any incompatible layout change.
-pub const DATA_VERSION: u8 = 1;
+/// Data-chunk codec version, bumped on any incompatible layout change (a new
+/// version also needs a new golden fixture — ADR 0073). Baseline: `1`.
+pub const DATA_VERSION: u8 = DATA_TAG.version;
 
 /// Encode one chunk's rows (ADR 0059 §2) — the exact [`SeedRow`] tuple
 /// shape, in whatever order `rows` is handed in (the capture driver's own
 /// sweep order, a later PR's concern — this function does not sort).
 #[must_use]
 pub fn encode_data_chunk(rows: &[SeedRow]) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(&DATA_MAGIC);
-    out.push(DATA_VERSION);
-    out.extend_from_slice(&(rows.len() as u32).to_be_bytes());
+    let mut body = Vec::new();
+    body.extend_from_slice(&(rows.len() as u32).to_be_bytes());
     for (kind, key, value, version) in rows {
-        out.push(*kind);
-        put_bytes(&mut out, key);
-        put_opt_bytes(&mut out, value);
-        out.extend_from_slice(&version.to_be_bytes());
+        body.push(*kind);
+        put_bytes(&mut body, key);
+        put_opt_bytes(&mut body, value);
+        body.extend_from_slice(&version.to_be_bytes());
     }
-    out
+    format::wrap(&DATA_TAG, &body)
 }
 
 /// Decode a data chunk object's bytes back into its [`SeedRow`]s.
@@ -311,47 +326,44 @@ pub fn encode_data_chunk(rows: &[SeedRow]) -> Vec<u8> {
 /// **exactly** the declared row count with no trailing bytes left over.
 ///
 /// # Errors
-/// A descriptive [`BackupCodecError`] for any of the above.
+/// A typed [`FormatError`]: `PreBaselineFormat` (no magic), `UnsupportedFormatVersion`
+/// (`0`/future), `Malformed` (truncated or trailing bytes).
 pub fn decode_data_chunk(bytes: &[u8]) -> Result<Vec<SeedRow>, BackupCodecError> {
-    let mut c = Cursor { bytes, pos: 0 };
-    let magic = c.take(4)?;
-    if magic != DATA_MAGIC {
-        return Err(format!(
-            "bad backup data chunk magic {magic:?} (want {DATA_MAGIC:?})"
-        ));
-    }
-    let version = c.u8()?;
-    if version != DATA_VERSION {
-        return Err(format!(
-            "unknown backup data chunk codec version {version} (this build only decodes \
-             version {DATA_VERSION})"
-        ));
-    }
-    let declared = c.u32()?;
+    let (_version, body) = format::unwrap(&DATA_TAG, bytes)?;
+    let malformed = |detail: String| FormatError::Malformed {
+        format: DATA_TAG.name,
+        detail,
+    };
+    let mut c = Cursor {
+        bytes: body,
+        pos: 0,
+    };
+    let declared = c.u32().map_err(malformed)?;
     let mut rows = Vec::with_capacity(declared.min(1 << 20) as usize);
     for i in 0..declared {
-        let kind = c.u8().map_err(|e| format!("row {i}: {e}"))?;
-        let key = c.bytes().map_err(|e| format!("row {i}: {e}"))?;
-        let value = c.opt_bytes().map_err(|e| format!("row {i}: {e}"))?;
-        let version = c.u64().map_err(|e| format!("row {i}: {e}"))?;
+        let kind = c.u8().map_err(|e| malformed(format!("row {i}: {e}")))?;
+        let key = c.bytes().map_err(|e| malformed(format!("row {i}: {e}")))?;
+        let value = c
+            .opt_bytes()
+            .map_err(|e| malformed(format!("row {i}: {e}")))?;
+        let version = c.u64().map_err(|e| malformed(format!("row {i}: {e}")))?;
         rows.push((kind, key, value, version));
     }
     if c.pos != c.bytes.len() {
-        return Err(format!(
+        return Err(malformed(format!(
             "trailing {} byte(s) after the declared {declared} row(s) in a backup data \
              chunk — corrupt framing",
             c.bytes.len() - c.pos
-        ));
+        )));
     }
     Ok(rows)
 }
 
 // --- manifest object codec (§2) --------------------------------------------
 
-const MANIFEST_MAGIC: [u8; 4] = *b"BKMF";
-
-/// Manifest-object codec version, bumped on any incompatible layout change.
-pub const MANIFEST_VERSION: u8 = 1;
+/// Manifest-object codec version, bumped on any incompatible layout change (a
+/// new version also needs a new golden fixture — ADR 0073). Baseline: `1`.
+pub const MANIFEST_VERSION: u8 = MANIFEST_TAG.version;
 
 /// One pinned tablet's completion record, paired with its identity — the
 /// manifest object's own flat-`Vec` shape for what would otherwise be a
@@ -413,12 +425,8 @@ impl BackupManifestObject {
 /// no interior mutability, nothing `serde_json` can fail to encode).
 #[must_use]
 pub fn encode_manifest_object(obj: &BackupManifestObject) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(&MANIFEST_MAGIC);
-    out.push(MANIFEST_VERSION);
     let json = serde_json::to_vec(obj).expect("BackupManifestObject always serializes");
-    out.extend_from_slice(&json);
-    out
+    format::wrap(&MANIFEST_TAG, &json)
 }
 
 /// Decode a manifest object's bytes back into its [`BackupManifestObject`].
@@ -428,30 +436,16 @@ pub fn encode_manifest_object(obj: &BackupManifestObject) -> Vec<u8> {
 /// body via `serde_json`.
 ///
 /// # Errors
-/// A descriptive [`BackupCodecError`] for a bad magic, an unrecognized
-/// version, a too-short buffer, or malformed JSON.
+/// [`FormatError::PreBaselineFormat`] for a missing/foreign magic or a
+/// too-short buffer, [`FormatError::UnsupportedFormatVersion`] for version
+/// `0` or a future one, [`FormatError::Malformed`] for a bad/trailing-garbage
+/// JSON body.
 pub fn decode_manifest_object(bytes: &[u8]) -> Result<BackupManifestObject, BackupCodecError> {
-    if bytes.len() < 5 {
-        return Err(format!(
-            "truncated backup manifest object: need at least 5 header bytes, have {}",
-            bytes.len()
-        ));
-    }
-    let magic = &bytes[0..4];
-    if magic != MANIFEST_MAGIC {
-        return Err(format!(
-            "bad backup manifest magic {magic:?} (want {MANIFEST_MAGIC:?})"
-        ));
-    }
-    let version = bytes[4];
-    if version != MANIFEST_VERSION {
-        return Err(format!(
-            "unknown backup manifest codec version {version} (this build only decodes \
-             version {MANIFEST_VERSION})"
-        ));
-    }
-    serde_json::from_slice(&bytes[5..])
-        .map_err(|e| format!("decoding backup manifest object body: {e}"))
+    let (_version, body) = format::unwrap(&MANIFEST_TAG, bytes)?;
+    serde_json::from_slice(body).map_err(|e| FormatError::Malformed {
+        format: MANIFEST_TAG.name,
+        detail: e.to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -616,7 +610,15 @@ mod tests {
         let mut bytes = encode_data_chunk(&[]);
         bytes[0] = b'X';
         let err = decode_data_chunk(&bytes).expect_err("must reject bad magic");
-        assert!(err.contains("bad backup data chunk magic"), "{err}");
+        assert!(
+            matches!(
+                err,
+                FormatError::PreBaselineFormat {
+                    format: "backup-data"
+                }
+            ),
+            "{err}"
+        );
     }
 
     #[test]
@@ -625,7 +627,13 @@ mod tests {
         bytes[4] = DATA_VERSION + 1;
         let err = decode_data_chunk(&bytes).expect_err("must reject unknown version");
         assert!(
-            err.contains("unknown backup data chunk codec version"),
+            matches!(
+                err,
+                FormatError::UnsupportedFormatVersion {
+                    format: "backup-data",
+                    ..
+                }
+            ),
             "{err}"
         );
     }
@@ -639,10 +647,7 @@ mod tests {
         }
         let err =
             decode_data_chunk(&bytes[..bytes.len() - 1]).expect_err("a short buffer must fail");
-        assert!(
-            err.contains("truncated") || err.contains("trailing"),
-            "{err}"
-        );
+        assert!(matches!(err, FormatError::Malformed { .. }), "{err}");
     }
 
     #[test]
@@ -650,7 +655,7 @@ mod tests {
         let mut bytes = encode_data_chunk(&[row(crate::KIND_BASE, b"k", Some(b"v"), 1)]);
         bytes.push(0xFF);
         let err = decode_data_chunk(&bytes).expect_err("trailing bytes must be rejected");
-        assert!(err.contains("trailing"), "{err}");
+        assert!(matches!(err, FormatError::Malformed { .. }), "{err}");
     }
 
     // --- manifest object codec ----------------------------------------------
@@ -731,7 +736,15 @@ mod tests {
         let mut bytes = encode_manifest_object(&sample_manifest());
         bytes[0] = b'X';
         let err = decode_manifest_object(&bytes).expect_err("must reject bad magic");
-        assert!(err.contains("bad backup manifest magic"), "{err}");
+        assert!(
+            matches!(
+                err,
+                FormatError::PreBaselineFormat {
+                    format: "backup-manifest"
+                }
+            ),
+            "{err}"
+        );
     }
 
     #[test]
@@ -740,7 +753,13 @@ mod tests {
         bytes[4] = MANIFEST_VERSION + 1;
         let err = decode_manifest_object(&bytes).expect_err("must reject unknown version");
         assert!(
-            err.contains("unknown backup manifest codec version"),
+            matches!(
+                err,
+                FormatError::UnsupportedFormatVersion {
+                    format: "backup-manifest",
+                    ..
+                }
+            ),
             "{err}"
         );
     }
@@ -748,19 +767,19 @@ mod tests {
     #[test]
     fn manifest_object_rejects_truncated_header() {
         let err = decode_manifest_object(&[0u8; 3]).expect_err("must reject a too-short buffer");
-        assert!(err.contains("truncated"), "{err}");
+        assert!(
+            matches!(err, FormatError::PreBaselineFormat { .. }),
+            "{err}"
+        );
     }
 
     #[test]
     fn manifest_object_rejects_malformed_json_body() {
-        let mut bytes = MANIFEST_MAGIC.to_vec();
+        let mut bytes = MANIFEST_TAG.magic.to_vec();
         bytes.push(MANIFEST_VERSION);
         bytes.extend_from_slice(b"not json");
         let err = decode_manifest_object(&bytes).expect_err("must reject malformed JSON");
-        assert!(
-            err.contains("decoding backup manifest object body"),
-            "{err}"
-        );
+        assert!(matches!(err, FormatError::Malformed { .. }), "{err}");
     }
 
     /// A failed-and-retried backup, or an as-yet-unimplemented aggregator,
