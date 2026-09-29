@@ -328,6 +328,65 @@ const SNAPSHOT_OFFSET_REGRESSION_REBASE: u32 = 4;
 /// ADR 0058's issue #1061 amendment).
 pub const DEPARTING_NOTICE_GIVE_UP: Duration = Duration::from_secs(300);
 
+/// Issue #1061 follow-up (found live): the *shorter* sustained-silence bound
+/// for a `departing` peer this leader has reason to expect never to answer
+/// again — one that has already **acknowledged its removal notice**
+/// (`RaftMsg::RemovedAck`), or one this leader merely **inherited** from a
+/// predecessor through `become_leader`'s `removals_in_log` re-derivation.
+///
+/// Both kinds are, in practice, peers that have *left*: an acked peer has
+/// recorded its removal and its host reconciler releases the replica the
+/// moment replicated `Metadata` agrees; an inherited one was removed long
+/// enough ago that a whole leadership change has happened since, and its
+/// replica is overwhelmingly already gone. A released replica can never
+/// reply, yet before this bound the leader kept addressing its closed stream
+/// on the capped-backoff schedule (~37 frames a minute per peer) for the
+/// *whole* [`DEPARTING_NOTICE_GIVE_UP`] (five minutes) — per removal, and
+/// re-armed by *every* leadership change. Measured live (a 12-minute bulk
+/// load then five idle minutes, `--cluster-control 3 --cluster-data 5`): one
+/// such peer cost a node ~190 removal notices in the idle window, and the
+/// maintainer's run saw ~200 frames a minute arriving for released replicas
+/// (`demux_frames_dropped_closed`).
+///
+/// A peer that IS alive and still hosted answers the very first
+/// `AppendEntries`/notice, and any reply resets the silence clock (`note_
+/// departing_reply`), so this only ever cuts off a peer that stayed quiet;
+/// one that returns after being cut off is still told by its own election
+/// timer's pre-vote being answered with the notice (`stranger_notice`,
+/// which needs no leader-side memory). A leader-initiated, not-yet-acked
+/// removal of a peer this leader itself just removed keeps the long bound.
+/// Comfortably above the steady `departing_send_gate` period (~1.6s) and any
+/// election timeout.
+pub const DEPARTING_QUIET_GIVE_UP: Duration = Duration::from_secs(30);
+
+/// Lifetime removal-notice counters of one [`RaftCore`] (issue #1061
+/// observability): a pure fact the driver folds into `/admin/metrics`
+/// (`animus-cp-data` emits the deltas as `Metric::CpRemoval*`), so a live
+/// operator can see notices being sent, acknowledged, ignored as stale, and
+/// departing peers being dropped — the questions the first live check of
+/// the notice could not answer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RemovalStats {
+    /// `RaftMsg::Removed` notices this node emitted as a leader (to a
+    /// departing peer through `replicate_to`, or to a returning stranger
+    /// through `stranger_notice`).
+    pub notices_sent: u64,
+    /// `RaftMsg::RemovedAck`s that count: one covering the removing entry
+    /// this leader was waiting on (whether or not it also ended the
+    /// schedule), or one answering a notice sent to a non-member in reply to
+    /// its own campaign.
+    pub notices_acked: u64,
+    /// Notices/acks discarded as stale: a peer-side `Removed` that failed one
+    /// of `handle_removed`'s guards (older term, we are a member/leader, or
+    /// not later than our own latest self-membership), and a leader-side ack
+    /// that did not cover the entry it was waiting on.
+    pub notices_ignored: u64,
+    /// Departing peers this leader stopped serving (acked with an
+    /// unservable log, caught up past the removing entry, or silent past its
+    /// give-up bound).
+    pub departing_dropped: u64,
+}
+
 /// The `(term, index)` stamp of a log entry, ordered lexicographically —
 /// terms never decrease along a log, so for two entries of ONE history this
 /// is the same order as index alone, while an entry from a *diverged*
@@ -1047,6 +1106,15 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     // during WAL replay), so a peer absent here is always read as "just
     // started, not yet stale". Pruned everywhere `departing` shrinks.
     departing_since: BTreeMap<NodeId, Nanos>,
+    // Issue #1061 follow-up: the departing peers on the SHORT silence bound
+    // (`DEPARTING_QUIET_GIVE_UP` rather than `DEPARTING_NOTICE_GIVE_UP`):
+    // those that already acked their removal notice yet are still owed
+    // catch-up `AppendEntries` (the log could serve them), and those this
+    // leader merely inherited from a predecessor (`become_leader`'s
+    // re-derivation). Pruned everywhere `departing` shrinks.
+    departing_quiet: BTreeSet<NodeId>,
+    // Issue #1061 observability: lifetime counters (`RemovalStats`).
+    removal_stats: RemovalStats,
     // Issue #1061: per-departing-peer send schedule — `(next_allowed_send,
     // attempts)`, gating EVERY message this leader would send to a
     // departing peer (its removal notice and any catch-up `AppendEntries`
@@ -1482,6 +1550,8 @@ where
             heard_from: BTreeSet::new(),
             departing: BTreeMap::new(),
             departing_since: BTreeMap::new(),
+            departing_quiet: BTreeSet::new(),
+            removal_stats: RemovalStats::default(),
             removal_sched: BTreeMap::new(),
             now_hint: Nanos(0),
             removed_by_leader: None,
@@ -2232,6 +2302,13 @@ where
         self.departing.keys().cloned().collect()
     }
 
+    /// Lifetime removal-notice counters (issue #1061) — see [`RemovalStats`].
+    /// A pure read; the driver diffs successive readings into metrics.
+    #[must_use]
+    pub fn removal_stats(&self) -> RemovalStats {
+        self.removal_stats
+    }
+
     /// Every distinct `(config, learners)` pair this core has adopted, in
     /// adoption order (issue #944) — see [`config_history`](Self)'s own
     /// field doc for the mechanism and why this exists. A pure accessor,
@@ -2744,6 +2821,8 @@ where
                 .retain(|n, _| !self.peers.contains(n) && !self.learners.contains(n));
             self.departing_since
                 .retain(|n, _| self.departing.contains_key(n));
+            self.departing_quiet
+                .retain(|n| self.departing.contains_key(n));
             self.removal_sched
                 .retain(|n, _| self.departing.contains_key(n));
         }
@@ -4966,6 +5045,7 @@ where
         // any other replication target — see that method for the bound.
         self.departing.clear();
         self.departing_since.clear();
+        self.departing_quiet.clear();
         self.removal_sched.clear();
         for (peer, dep) in self.removals_in_log() {
             if self.peers.contains(&peer) || self.learners.contains(&peer) {
@@ -4973,6 +5053,9 @@ where
             }
             self.next_index.insert(peer.clone(), last + 1);
             self.match_index.insert(peer.clone(), 0);
+            // Inherited, not this leader's own removal: the short silence
+            // bound (`DEPARTING_QUIET_GIVE_UP`'s doc).
+            self.departing_quiet.insert(peer.clone());
             self.departing.insert(peer, dep);
         }
         self.transfer_target = None;
@@ -5278,8 +5361,11 @@ where
     /// never ack again, wedging a `DRIVER_APPLIED` driver's compaction defer
     /// the way issue #898's step-down cleanup already guards against).
     fn drop_departing(&mut self, peer: &NodeId) {
-        self.departing.remove(peer);
+        if self.departing.remove(peer).is_some() {
+            self.removal_stats.departing_dropped += 1;
+        }
         self.departing_since.remove(peer);
+        self.departing_quiet.remove(peer);
         self.removal_sched.remove(peer);
         self.next_index.remove(peer);
         self.match_index.remove(peer);
@@ -5413,7 +5499,7 @@ where
     /// later clears the flag). The zombie's own election timer is what
     /// triggers it, so the traffic is bounded by that timer until the peer
     /// acks, after which it never campaigns again.
-    fn stranger_notice(&self, candidate: &NodeId) -> Option<Out<C>> {
+    fn stranger_notice(&mut self, candidate: &NodeId) -> Option<Out<C>> {
         if self.role != Role::Leader
             || *candidate == self.id
             || self.config.contains(candidate)
@@ -5433,8 +5519,11 @@ where
             .removals_in_log()
             .remove(candidate)
             .or_else(|| self.latest_config_stamp())?;
-        self.removal_notice_for(candidate, dep)
-            .map(|m| (candidate.clone(), m))
+        let notice = self.removal_notice_for(candidate, dep);
+        if notice.is_some() {
+            self.removal_stats.notices_sent += 1;
+        }
+        notice.map(|m| (candidate.clone(), m))
     }
 
     /// The stamp of the newest config entry in the retained log, else the
@@ -5474,11 +5563,19 @@ where
             self.departing_since.entry(peer.clone()).or_insert(now);
         }
         let ceiling = DEPARTING_NOTICE_GIVE_UP.as_nanos() as u64;
+        let quiet_ceiling = DEPARTING_QUIET_GIVE_UP.as_nanos() as u64;
         let stale: Vec<NodeId> = self
             .departing_since
             .iter()
             .filter(|(p, since)| {
-                self.departing.contains_key(*p) && now.0.saturating_sub(since.0) >= ceiling
+                // A peer that already acked its notice and then went silent
+                // has left (its host released the replica): the short bound.
+                let bound = if self.departing_quiet.contains(*p) {
+                    quiet_ceiling
+                } else {
+                    ceiling
+                };
+                self.departing.contains_key(*p) && now.0.saturating_sub(since.0) >= bound
             })
             .map(|(p, _)| p.clone())
             .collect();
@@ -5548,6 +5645,7 @@ where
         learners: &BTreeSet<NodeId>,
     ) -> Vec<Out<C>> {
         if term < self.current_term {
+            self.removal_stats.notices_ignored += 1;
             return vec![(
                 from,
                 RaftMsg::RemovedAck {
@@ -5557,12 +5655,14 @@ where
             )];
         }
         if self.role == Role::Leader || config.contains(&self.id) || learners.contains(&self.id) {
+            self.removal_stats.notices_ignored += 1;
             return Vec::new();
         }
         if self
             .latest_self_membership_stamp()
             .is_some_and(|member| member >= removal)
         {
+            self.removal_stats.notices_ignored += 1;
             return Vec::new();
         }
         // A valid notice comes from a genuine leader of this (or a newer,
@@ -5587,7 +5687,35 @@ where
     /// reply carries `removal_index: 0`) is ignored.
     fn handle_removed_ack(&mut self, from: NodeId, term: u64, removal_index: u64) {
         if self.role != Role::Leader || term != self.current_term {
+            self.removal_stats.notices_ignored += 1;
             return;
+        }
+        // A stale-term reply carries `removal_index: 0`; an ack that does not
+        // cover the entry this leader is waiting on is stale too.
+        if removal_index == 0 {
+            self.removal_stats.notices_ignored += 1;
+            return;
+        }
+        match self.departing.get(&from) {
+            // Not tracked as departing: the ack answers a `stranger_notice`
+            // (the reply to a non-member's campaign), which needs no
+            // leader-side memory — there is nothing to stop or drop.
+            None => {
+                self.removal_stats.notices_acked += 1;
+                return;
+            }
+            Some(d) if removal_index < d.index => {
+                self.removal_stats.notices_ignored += 1;
+                return;
+            }
+            Some(_) => {
+                self.removal_stats.notices_acked += 1;
+                // An ack is a reply like any other: it proves the peer is
+                // alive right now, so it restarts the silence clock (the
+                // short bound below counts from it) and re-opens the send
+                // gate for the catch-up `AppendEntries` it is still owed.
+                self.note_departing_reply(&from, self.now_hint);
+            }
         }
         // Only stop when the log can no longer serve the peer. A peer the
         // retained log still covers (a returning zombie that told us so by
@@ -5599,13 +5727,13 @@ where
         // flag has after its own restart).
         let log_cannot_serve =
             self.next_index.get(&from).copied().unwrap_or(1) <= self.snapshot_index;
-        if log_cannot_serve
-            && self
-                .departing
-                .get(&from)
-                .is_some_and(|d| removal_index >= d.index)
-        {
+        if log_cannot_serve {
             self.drop_departing(&from);
+        } else {
+            // Still owed the catch-up entries, but the peer is known to have
+            // recorded its removal: from here only a *silent* peer is cut off,
+            // and on the short bound (`DEPARTING_QUIET_GIVE_UP`).
+            self.departing_quiet.insert(from);
         }
     }
 
@@ -5638,7 +5766,11 @@ where
             // would have replicated: send the tiny notice instead.
             if let Some(dep) = self.departing.get(&peer).copied() {
                 self.forget_snapshot_transfer(&peer);
-                return self.removal_notice_for(&peer, dep).map(|m| (peer, m));
+                let notice = self.removal_notice_for(&peer, dep);
+                if notice.is_some() {
+                    self.removal_stats.notices_sent += 1;
+                }
+                return notice.map(|m| (peer, m));
             }
             return self.snapshot_chunk_for(peer, snapshot_resend);
         }

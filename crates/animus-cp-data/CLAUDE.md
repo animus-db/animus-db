@@ -1632,6 +1632,22 @@ DynamoDB-wire and real-`LsmEngine` regressions this fix also carries.
   `tests/departing_removal_notice.rs` (a reconciler-hosted replica left behind
   the compacted log by a continuous writer: zero snapshot ships/restarts,
   told, not released while `Metadata` lists it, released once it does).
+- **Removal-notice observability (issue #1061 follow-up).** `drive`'s
+  per-iteration core read also takes `RaftCore::removal_stats()` and
+  `record_removal_stats` emits the growth as `Metric::CpRemovalNoticesSent`/
+  `CpRemovalNoticesAcked`/`CpRemovalNoticesIgnored`/`CpDepartingPeersDropped`
+  (`cp_removal_notices_sent`/`_acked`/`_ignored`, `cp_departing_peers_dropped`
+  in `/admin/metrics`) — a per-node sink, like every other `Cp*` counter.
+  `RaftKvNode::departing_peers()` and `snapshot_transfer_peers()` are the
+  pure accessors `/admin/raftkv` surfaces as `departing` /
+  `snapshot_transfer_peers` (leader-only, empty on an idle converged group; a
+  group that keeps a peer in the second at zero write rate is re-offering an
+  image the peer declines — `animus-control/CLAUDE.md`'s "declined offer"
+  entry). A `CpSnapshotTransferRestarts` increment is **not** proof that a
+  transfer restarted: `apply_and_compact` counts it whenever the idle
+  ceiling overrides an in-flight transfer, and the compaction that follows
+  can still no-op (clamped by a peer's `match_index` via `compaction_floor`),
+  which is exactly how the declined-offer livelock inflated it every 2s.
 - **`plan` never removes a tablet from `LocalState::hosted` on its own**
   when emitting a fallible teardown (`Reclaim`/`Release`) — real teardown
   is async and can time out. The caller calls
@@ -2680,6 +2696,23 @@ disambiguation is needed.
   succeeded — that would add a second distributed failure mode (the rollback
   itself can partially fail) to clean up a case that is already safe to leave
   alone.
+
+## Versioned formats (ADR 0073 Phase 0)
+
+The shared convention (magic + `u8` version, loud named `FormatError`s,
+`tests/fixtures/formats/<format>/v<N>.bin` golden fixtures that are
+append-only per `scripts/check-format-fixtures.sh`, a directory-iterating
+decode test, a round-trip test, an `#[ignore]`d generator that refuses to
+overwrite) lives in `animus-control`'s `format.rs` — see its
+"Versioned formats (ADR 0073 Phase 0)" section. This crate's fixtures and
+tests are all in `tests/format_fixtures.rs`; new formats add a section there.
+
+- **`segment` v1** (`segment.rs`, magic `SEGF`, `VERSION = 1`): the
+  stream-shard segment object, also reused by backup/PITR/export objects.
+  `SegmentError` is `FormatError` (`PreBaselineFormat` for no/foreign magic,
+  `UnsupportedFormatVersion` for `0`/future, `Malformed` for framing damage).
+  Fixture: `tests/fixtures/formats/segment/v1.bin`. A layout change is a new
+  `VERSION` plus a new fixture file — never an edit to `v1.bin`.
 
 ## Tests
 

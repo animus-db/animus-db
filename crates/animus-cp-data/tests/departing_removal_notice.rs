@@ -235,6 +235,17 @@ fn scenario_release(seed: u64) {
         leader.departing_peers().is_empty(),
         "seed={seed:#x}: the ack must have dropped the peer from the leader's departing set"
     );
+    // The counters `/admin/metrics` exposes tell the same story (issue #1061
+    // observability): a notice was sent, acked, and the peer's schedule ended.
+    assert!(
+        sum(&survivors, Metric::CpRemovalNoticesSent) >= 1
+            && sum(&survivors, Metric::CpRemovalNoticesAcked) >= 1
+            && sum(&survivors, Metric::CpDepartingPeersDropped) >= 1,
+        "seed={seed:#x}: removal counters sent={} acked={} dropped={}",
+        sum(&survivors, Metric::CpRemovalNoticesSent),
+        sum(&survivors, Metric::CpRemovalNoticesAcked),
+        sum(&survivors, Metric::CpDepartingPeersDropped)
+    );
 
     // The reconciler must NOT release it while `Metadata` still lists it, …
     sim.run_for(Duration::from_secs(2));

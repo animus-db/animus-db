@@ -125,6 +125,16 @@ pub(crate) struct CpRaftView {
     /// Empty on a converged group. Purely observational — this view never
     /// drives anything.
     pub(crate) learners: Vec<NodeId>,
+    /// The peers this replica — while it leads — still owes a removal
+    /// notification (issue #1061's `departing` bookkeeping): removed voters
+    /// it is still telling. Empty on a follower and on a converged group. A
+    /// pure observer.
+    pub(crate) departing: Vec<NodeId>,
+    /// The peers this replica — while it leads — has a chunked
+    /// `InstallSnapshot` transfer in flight to. Empty on a follower and on
+    /// an idle group; a group that keeps naming a peer here at zero write
+    /// rate is re-offering an image the peer keeps declining. A pure observer.
+    pub(crate) snapshot_transfer_peers: Vec<NodeId>,
     /// This tablet's live key count — **the cheap, non-materializing
     /// `CpGroup::approx_key_count` estimate by default**, the exact
     /// `local_pairs` count under `?exact=1` (see `CpGroup::raft_view` for

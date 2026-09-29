@@ -1320,6 +1320,8 @@ impl<E: Env> CpGroup<E> {
                     log_len: $n.log_len(),
                     voters: $n.config().into_iter().collect(),
                     learners: $n.learners().into_iter().collect(),
+                    departing: $n.departing_peers().into_iter().collect(),
+                    snapshot_transfer_peers: $n.snapshot_transfer_peers().into_iter().collect(),
                     key_count,
                     byte_size,
                     quiesced: $n.is_quiesced(),

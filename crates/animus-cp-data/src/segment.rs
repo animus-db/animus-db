@@ -100,11 +100,18 @@
 //!
 //! ## Versioning
 //!
-//! Every encoded segment starts with a 4-byte magic + a version byte. An
-//! unrecognized version is a loud, immediate `Err` (never a silent
-//! misinterpretation of a future format) — this codec is pre-alpha, so no
-//! cross-version compatibility is attempted, mirroring `codec.rs`'s own
-//! documented stance for the Raft wire/snapshot format.
+//! Every encoded segment starts with a 4-byte magic (`SEGF`) + a version
+//! byte. Since ADR 0073 Phase 0 (workstream C) this is a **baselined durable
+//! format**: [`VERSION`] restarted at `1`, every pre-baseline layout was
+//! dropped, and a golden fixture (`tests/fixtures/formats/segment/v1.bin`)
+//! pins the bytes. No-magic/foreign input is
+//! `FormatError::PreBaselineFormat`, an unknown (`0` or future) version is
+//! `FormatError::UnsupportedFormatVersion`, and any other framing damage is
+//! `FormatError::Malformed` — all loud named `Err`s, never a panic or a
+//! silent misdecode. Backup/PITR/export objects reuse this codec and
+//! inherit the reset (ADR 0073 workstream E confirms).
+
+use animus_control::format::FormatError;
 
 /// First four bytes of every encoded segment — rejects a foreign payload
 /// (e.g. a stray `serde_json` blob, or a different codec's bytes landing at
@@ -114,19 +121,22 @@ const MAGIC: [u8; 4] = *b"SEGF";
 
 /// Codec version, bumped on any incompatible layout change.
 ///
-/// `2` (issue #852, 2026-09-15): each body record gained a trailing 4-byte
-/// `ordinal` field (see the module doc's "ordinal" section) — a pure
-/// additive layout change with no migration (this repo's standing
-/// no-back-compat policy, see the root `CLAUDE.md`): a `1`-tagged object is
-/// simply rejected as an unknown version rather than upgraded in place, and
-/// every existing segment is expected to be resealed from scratch.
-pub const VERSION: u8 = 2;
+/// `1` is the ADR 0073 Phase 0 baseline. From the baseline on, a layout
+/// change is a new version **plus** a new golden fixture — never a rewrite
+/// of `v1` (`scripts/check-format-fixtures.sh` enforces the fixture half).
+/// The pre-baseline history (a `1`-tagged layout without the per-record
+/// `ordinal`, then `2` with it, issue #852) is gone: the baseline layout is
+/// the one that carries `ordinal`, and pre-baseline objects are refused by
+/// name, never upgraded.
+pub const VERSION: u8 = 1;
 
-/// Decode/encode failures are plain descriptive strings, mirroring
-/// `codec.rs`'s own `DecodeError` shape — this module has no error-recovery
-/// logic that would benefit from a typed enum, and every caller's own
-/// handling is "log loudly, treat as absent/corrupt."
-pub type SegmentError = String;
+/// The format's name in [`FormatError`] messages (never encoded).
+const FORMAT_NAME: &str = "segment";
+
+/// Decode failures are ADR 0073's shared [`FormatError`]: the callers'
+/// handling is unchanged ("log loudly, treat as absent/corrupt" — they only
+/// `Display` it), but the version/magic cases are now distinguishable.
+pub type SegmentError = FormatError;
 
 /// A sealed shard's self-describing header (ADR 0043 §A3's "Segment format").
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -321,7 +331,7 @@ struct Cursor<'a> {
 }
 
 impl<'a> Cursor<'a> {
-    fn take(&mut self, n: usize) -> Result<&'a [u8], SegmentError> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
         let end = self
             .pos
             .checked_add(n)
@@ -338,34 +348,35 @@ impl<'a> Cursor<'a> {
         Ok(slice)
     }
 
-    fn u8(&mut self) -> Result<u8, SegmentError> {
+    fn u8(&mut self) -> Result<u8, String> {
         Ok(self.take(1)?[0])
     }
 
-    fn u32(&mut self) -> Result<u32, SegmentError> {
+    fn u32(&mut self) -> Result<u32, String> {
         let b: [u8; 4] = self.take(4)?.try_into().expect("took exactly 4 bytes");
         Ok(u32::from_be_bytes(b))
     }
 
-    fn u64(&mut self) -> Result<u64, SegmentError> {
+    fn u64(&mut self) -> Result<u64, String> {
         let b: [u8; 8] = self.take(8)?.try_into().expect("took exactly 8 bytes");
         Ok(u64::from_be_bytes(b))
     }
 
-    fn bytes(&mut self) -> Result<Vec<u8>, SegmentError> {
+    fn bytes(&mut self) -> Result<Vec<u8>, String> {
         let len = self.u32()? as usize;
         Ok(self.take(len)?.to_vec())
     }
 
-    fn string(&mut self) -> Result<String, SegmentError> {
+    fn string(&mut self) -> Result<String, String> {
         String::from_utf8(self.bytes()?).map_err(|e| format!("non-UTF8 string field: {e}"))
     }
 }
 
 /// Decode a segment's bytes back into its [`Segment`].
 ///
-/// Validates: the magic + version (an unrecognized version is a loud, named
-/// `Err`, never a silent misread); every length-prefixed field's framing
+/// Validates: the magic + version (`PreBaselineFormat` for a missing/foreign
+/// magic, `UnsupportedFormatVersion` for `0` or a future version — never a
+/// silent misread); every length-prefixed field's framing
 /// (a truncated buffer anywhere is a named `Err`, not a panic); that the
 /// stored `shard_id` matches `shard_id(tablet, epoch)` (a mismatch is
 /// corruption — this crate is the only writer, and it always derives the
@@ -375,19 +386,33 @@ impl<'a> Cursor<'a> {
 /// data" `Err` — either shape is corrupt framing, not a legitimate variant).
 ///
 /// # Errors
-/// A descriptive [`SegmentError`] for any of the above.
+/// A [`FormatError`] for any of the above.
 pub fn decode(bytes: &[u8]) -> Result<Segment, SegmentError> {
-    let mut c = Cursor { bytes, pos: 0 };
-    let magic = c.take(4)?;
-    if magic != MAGIC {
-        return Err(format!("bad segment magic {magic:?} (want {MAGIC:?})"));
+    if bytes.len() < 5 || bytes[..4] != MAGIC {
+        return Err(FormatError::PreBaselineFormat {
+            format: FORMAT_NAME,
+        });
     }
-    let version = c.u8()?;
-    if version != VERSION {
-        return Err(format!(
-            "unknown segment codec version {version} (this build only decodes version {VERSION})"
-        ));
+    let version = bytes[4];
+    if version == 0 || version > VERSION {
+        return Err(FormatError::UnsupportedFormatVersion {
+            format: FORMAT_NAME,
+            found: version,
+            max_supported: VERSION,
+        });
     }
+    decode_body(&bytes[5..]).map_err(|detail| FormatError::Malformed {
+        format: FORMAT_NAME,
+        detail,
+    })
+}
+
+/// Everything after the magic + version byte.
+fn decode_body(body: &[u8]) -> Result<Segment, String> {
+    let mut c = Cursor {
+        bytes: body,
+        pos: 0,
+    };
     let table = c.string()?;
     let label = c.string()?;
     let shard_id_field = c.string()?;
@@ -616,35 +641,64 @@ mod tests {
     #[test]
     fn unknown_version_is_a_loud_named_error() {
         let h = header(1, 0, (0, 0));
-        let mut bytes = encode(&h, &[]);
-        bytes[4] = VERSION + 1; // the byte right after the 4-byte magic
-        let err = decode(&bytes).expect_err("must reject an unknown version");
-        assert!(err.contains("unknown segment codec version"), "{err}");
+        for bad in [0u8, VERSION + 1, 2, 255] {
+            let mut bytes = encode(&h, &[]);
+            bytes[4] = bad; // the byte right after the 4-byte magic
+            let err = decode(&bytes).expect_err("must reject an unknown version");
+            assert_eq!(
+                err,
+                FormatError::UnsupportedFormatVersion {
+                    format: "segment",
+                    found: bad,
+                    max_supported: VERSION,
+                }
+            );
+            assert!(err.to_string().contains("segment"), "{err}");
+        }
     }
 
     #[test]
-    fn bad_magic_is_rejected() {
+    fn bad_or_missing_magic_is_pre_baseline() {
         let h = header(1, 0, (0, 0));
         let mut bytes = encode(&h, &[]);
         bytes[0] = b'X';
-        let err = decode(&bytes).expect_err("must reject bad magic");
-        assert!(err.contains("bad segment magic"), "{err}");
+        assert_eq!(
+            decode(&bytes).expect_err("must reject bad magic"),
+            FormatError::PreBaselineFormat { format: "segment" }
+        );
+        // Garbage, a JSON blob, empty, and a bare magic with no version byte.
+        for garbage in [
+            &b""[..],
+            b"{\"a\":1}",
+            b"SEG",
+            b"SEGF",
+            b"\xff\xff\xff\xff\x01",
+        ] {
+            assert_eq!(
+                decode(garbage).expect_err("must reject"),
+                FormatError::PreBaselineFormat { format: "segment" },
+                "{garbage:?}"
+            );
+        }
     }
 
     #[test]
     fn truncated_buffer_is_rejected_not_panicked() {
         let h = header(1, 0, (0, 300));
         let bytes = encode(&h, &[rec(b"k1", 100, b"change-1")]);
-        for cut in 1..bytes.len() {
-            // Every prefix short of the full encoding must fail cleanly.
-            let truncated = &bytes[..cut];
-            let _ = decode(truncated); // must not panic
+        for cut in 0..bytes.len() {
+            // Every strict prefix must fail cleanly, never panic or succeed.
+            decode(&bytes[..cut]).expect_err("a prefix must not decode");
         }
-        let err = decode(&bytes[..bytes.len() - 1]).expect_err("a short buffer must not decode");
-        assert!(
-            err.contains("truncated") || err.contains("trailing"),
-            "{err}"
-        );
+        // Past the magic + version, a cut is a named Malformed, not a
+        // pre-baseline/version error.
+        match decode(&bytes[..bytes.len() - 1]).expect_err("a short buffer must not decode") {
+            FormatError::Malformed { format, detail } => {
+                assert_eq!(format, "segment");
+                assert!(detail.contains("truncated"), "{detail}");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
     }
 
     #[test]
@@ -653,7 +707,7 @@ mod tests {
         let mut bytes = encode(&h, &[rec(b"k", 100, b"v")]);
         bytes.push(0xFF);
         let err = decode(&bytes).expect_err("trailing bytes must be rejected");
-        assert!(err.contains("trailing"), "{err}");
+        assert!(err.to_string().contains("trailing"), "{err}");
     }
 
     #[test]
@@ -675,7 +729,7 @@ mod tests {
         bytes[count_offset..count_offset + 8].copy_from_slice(&2u64.to_be_bytes());
         let err = decode(&bytes).expect_err("an over-declared count must fail, not panic");
         assert!(
-            err.contains("truncated") || err.contains("record 1"),
+            err.to_string().contains("truncated") || err.to_string().contains("record 1"),
             "{err}"
         );
     }
@@ -686,7 +740,10 @@ mod tests {
         h.shard_id = "shardId-1-99".to_string(); // doesn't match tablet=1/epoch=0
         let bytes = encode(&h, &[]);
         let err = decode(&bytes).expect_err("a mismatched shard_id must be rejected");
-        assert!(err.contains("does not match tablet/epoch"), "{err}");
+        assert!(
+            err.to_string().contains("does not match tablet/epoch"),
+            "{err}"
+        );
     }
 
     #[test]
