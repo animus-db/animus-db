@@ -3384,17 +3384,42 @@ mod tests {
     /// than failing the whole suite on an environment it can't assume.
     struct HostsEntryGuard {
         hostname: &'static str,
+        /// Held for this guard's whole lifetime: `/etc/hosts` is
+        /// process-global, and every mutation below is a non-atomic
+        /// truncate-then-write, so a concurrent in-process lookup (any
+        /// `localhost:PORT` dial) can read the file empty/half-written and
+        /// fail to resolve — the mechanism behind issue #1107. Tests that
+        /// resolve a hostname take [`hosts_resolution_lock`] to exclude it.
+        _exclusive: std::sync::RwLockWriteGuard<'static, ()>,
+    }
+
+    /// Process-wide lock ordering hostname-resolving tests against tests that
+    /// rewrite `/etc/hosts` ([`HostsEntryGuard`], write side). Resolvers take
+    /// the read side, so they never block each other. Poisoning is ignored
+    /// (a panicking test must not cascade into unrelated ones).
+    static HOSTS_FILE_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+    fn hosts_resolution_lock() -> std::sync::RwLockReadGuard<'static, ()> {
+        HOSTS_FILE_LOCK
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     impl HostsEntryGuard {
         fn try_new(hostname: &'static str, ip: &str) -> Option<Self> {
+            let exclusive = HOSTS_FILE_LOCK
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let mut contents = std::fs::read_to_string("/etc/hosts").ok()?;
             if !contents.ends_with('\n') {
                 contents.push('\n');
             }
             contents.push_str(&format!("{ip} {hostname}\n"));
             std::fs::write("/etc/hosts", &contents).ok()?;
-            Some(Self { hostname })
+            Some(Self {
+                hostname,
+                _exclusive: exclusive,
+            })
         }
 
         /// Re-point this entry to `ip`, simulating a DNS update (a
@@ -3681,14 +3706,23 @@ mod tests {
     /// exercises the actual resolution path rather than a numeric string
     /// that merely happens to parse.
     #[tokio::test]
+    #[allow(
+        clippy::await_holding_lock,
+        reason = "the std RwLock read guard deliberately spans the dial: it orders this test against /etc/hosts rewrites (#1107); the writers are sync std guards so an async lock could not exclude them"
+    )]
     async fn send_delivers_to_a_peer_registered_by_hostname() {
         use crate::Network;
 
+        // Issue #1107: `localhost` resolves through `/etc/hosts`, which the
+        // hosts-rewriting tests mutate non-atomically; exclude them for the
+        // whole send-and-receive so a torn read can't drop the (fire-and-
+        // forget) frame. Bind first so the lock is held only across the dial.
         let dir_a = unique_tmp_dir();
         let dir_b = unique_tmp_dir();
         let loop0 = "127.0.0.1:0".parse::<SocketAddr>().unwrap();
         let (a, _) = ProdEnv::bind(nid(0), loop0, &dir_a).await.expect("bind a");
         let (b, b_addr) = ProdEnv::bind(nid(1), loop0, &dir_b).await.expect("bind b");
+        let _hosts = hosts_resolution_lock();
 
         // Register `b` by hostname:port rather than its numeric address.
         a.set_peers(
@@ -3708,6 +3742,30 @@ mod tests {
         b.shutdown();
         let _ = std::fs::remove_dir_all(&dir_a);
         let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+    /// Issue #1107 regression: a `/etc/hosts` mutation must exclude every
+    /// hostname-resolving test for as long as it is in flight. Deterministic:
+    /// while a [`HostsEntryGuard`] is alive the resolution lock cannot be
+    /// acquired, and it can once the guard is dropped. (Before the fix there
+    /// was no exclusion at all, so a resolver could observe the truncated
+    /// file and the hostname send test flaked.) Skips like its siblings if
+    /// `/etc/hosts` is not writable.
+    #[test]
+    fn hosts_mutation_excludes_hostname_resolution() {
+        let Some(guard) = HostsEntryGuard::try_new("animus-lock-probe.invalid", "127.0.0.9") else {
+            eprintln!("skipping: /etc/hosts not writable");
+            return;
+        };
+        assert!(
+            HOSTS_FILE_LOCK.try_read().is_err(),
+            "a resolver could run while /etc/hosts was being rewritten"
+        );
+        drop(guard);
+        assert!(
+            HOSTS_FILE_LOCK.try_read().is_ok(),
+            "lock must release when the hosts guard drops"
+        );
     }
 
     /// Durability smoke test for the directory-fsync paths: `replace` (rename +
