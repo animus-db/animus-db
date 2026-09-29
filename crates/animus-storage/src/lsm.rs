@@ -397,11 +397,10 @@ enum BatchOp {
 
 /// The durable manifest: the live SSTable set plus engine metadata. Encoded with
 /// a **compact binary codec** ([`encode_manifest`]) and written atomically with
-/// [`Disk::replace`] — the single flush/compaction linearization point. The
-/// serde derives remain so a *legacy* JSON manifest (written before the binary
-/// codec) can still be read on open ([`decode_manifest`] falls back to
-/// `serde_json` when the binary magic is absent).
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+/// [`Disk::replace`] — the single flush/compaction linearization point. There is
+/// no serde/JSON form: ADR 0073 Phase 0 deleted the legacy JSON fallback, and a
+/// manifest without the `CMF1` magic is refused as pre-baseline.
+#[derive(Clone, Debug, Default)]
 struct Manifest {
     /// Highest sequence number ever allocated to an SSTable file. The next flush
     /// uses `next_seq + 1`, so an orphan file from a crashed flush is never
@@ -415,10 +414,8 @@ struct Manifest {
     max_version: Version,
     /// Live WAL segment numbers (ascending) the engine must replay on recovery —
     /// the files `<prefix>wal-NNNNNN` not yet fully folded into an SSTable. An
-    /// empty list (e.g. a legacy manifest from the single-file-WAL era) is treated
-    /// as "no segmented WAL recorded" and recovery falls back to the legacy
-    /// `<prefix>wal` file (see [`LsmEngine::open_with`]).
-    #[serde(default)]
+    /// empty list means "no segmented WAL recorded": a fresh engine, whose
+    /// first write opens segment 0 (see [`LsmEngine::open_with`]).
     wal_segments: Vec<u64>,
 }
 
@@ -640,8 +637,8 @@ impl<E: Env> LsmEngine<E> {
     /// `live` segments, augmented with any present-on-disk segments that follow the
     /// last recorded one (created by writes after the last flush, or by a crash
     /// mid-GC, so not yet manifest-named — but they carry acks and must be
-    /// replayed). Returns them ascending. An empty result means the legacy
-    /// single-file WAL path (no segmented WAL on disk yet).
+    /// replayed). Returns them ascending. An empty result means a fresh engine
+    /// (no segmented WAL on disk yet).
     async fn discover_wal_segments(env: &E, prefix: &str, live: &[u64]) -> Result<Vec<u64>> {
         // Start from the recorded set (already ascending in the manifest).
         let mut segs: Vec<u64> = live.to_vec();
@@ -663,7 +660,7 @@ impl<E: Env> LsmEngine<E> {
         }
         // When the manifest named no segments but probing from 0 found some, those
         // are the live set already; when probing found nothing and the manifest had
-        // none, `segs` is empty and the caller takes the legacy path.
+        // none, `segs` is empty and the caller treats the engine as fresh.
         Ok(segs)
     }
 
@@ -672,7 +669,7 @@ impl<E: Env> LsmEngine<E> {
     /// is the ascending set [`discover_wal_segments`](Self::discover_wal_segments)
     /// returned; every segment numbered below its minimum is a covered orphan whose
     /// records are already in an SSTable, so removing it is data-safe. No-op when
-    /// the live set is empty (legacy single-file WAL) or starts at 0.
+    /// the live set is empty (fresh engine) or starts at 0.
     ///
     /// Uses [`Disk::list`] (one directory listing) rather than probing segment
     /// numbers `0..lowest_live` one `env.size` call at a time: the probe loop
@@ -751,13 +748,30 @@ impl<E: Env> LsmEngine<E> {
         let manifest_file = format!("{prefix}MANIFEST");
 
         // Load the durable manifest (or a fresh empty one). Decodes the compact
-        // binary format, transparently falling back to a legacy JSON manifest.
+        // binary format; a foreign/pre-baseline manifest is refused loudly.
         let manifest_bytes = env.read(&manifest_file).await.map_err(io)?;
         let manifest: Manifest = if manifest_bytes.is_empty() {
             Manifest::default()
         } else {
             decode_manifest(&manifest_bytes)?
         };
+
+        // Guard the legacy single-file WAL (`<prefix>wal`, no `-NNNNNN`). No
+        // current code writes it; only `<prefix>wal-NNNNNN` segments exist. A
+        // nonzero one is data from before segmented WAL, which this binary can no
+        // longer replay, so refuse loudly rather than open without it and lose
+        // acked writes silently. Unconditional (not only when no segments are
+        // recorded): the old migration left this file behind as an orphan beside
+        // segments, but any such directory also has a pre-baseline manifest and
+        // is refused above anyway, and a post-baseline engine never creates the
+        // file, so its presence with a valid manifest is still foreign data.
+        // Absent or zero-length (a fresh engine, or an unsynced create a crash
+        // dropped) is fine.
+        if env.size(&format!("{prefix}wal")).await.map_err(io)? > 0 {
+            return Err(StorageError::PreBaselineFormat {
+                format: "lsm-wal-legacy-single-file",
+            });
+        }
 
         // Open the SSTables the manifest names (reads their footer + index only).
         let block_reads = Arc::new(AtomicU64::new(0));
@@ -800,7 +814,7 @@ impl<E: Env> LsmEngine<E> {
         let mut max_version = manifest.max_version;
         // The active segment's own byte length after any torn-tail/torn-header
         // repair below — `0` when there is no segment at all yet (a brand-new
-        // or legacy-migrating engine). This, not the manifest or the segment
+        // engine). This, not the manifest or the segment
         // list alone, is what tells `GroupCommit::new` whether the active
         // segment already carries a durable WAL file header: any nonzero
         // length here can only exist because a prior header-carrying `append`
@@ -809,22 +823,9 @@ impl<E: Env> LsmEngine<E> {
         // repaired back to empty just below — means the very next write must
         // write a fresh one.
         let mut active_seg_final_len: u64 = 0;
-        if segments.is_empty() {
-            // Legacy migration: a directory written by the single-file-WAL era has
-            // no recorded segments. Replay the old `<prefix>wal` file (if any) so
-            // an upgrade loses nothing; the first new flush rewrites the layout to
-            // segments and this file is left as a harmless orphan. (Pre-alpha: this
-            // predates even the binary WAL codec, so an old JSON-encoded file no
-            // longer decodes — no real deployment depends on it; a brand-new engine
-            // with no legacy file just reads zero bytes here and replays nothing.)
-            let legacy = format!("{prefix}wal");
-            let wal_bytes = env.read(&legacy).await.map_err(io)?;
-            let (records, _consumed) = decode_wal(&wal_bytes)?;
-            for record in records {
-                max_version = max_version.max(record_max_version(&record));
-                apply_wal_record(&mut memtable, &mut memtable_bytes, record);
-            }
-        } else {
+        // An empty segment list is a fresh engine: nothing to replay, and the
+        // first write opens segment 0.
+        if !segments.is_empty() {
             // The highest-numbered segment is the one `GroupCommit` reopens as
             // *active* (see its constructor below): further appends ride it. Only
             // this segment can ever carry a crash-torn tail — older segments are
@@ -884,7 +885,7 @@ impl<E: Env> LsmEngine<E> {
         // resumes at 0 (the next new write is the first durable sequence). The
         // highest discovered segment becomes the active one; the rest are sealed,
         // so a later flush can GC the covered ones. An empty discovered set means a
-        // fresh (or legacy) engine: the first write opens segment 0.
+        // fresh engine: the first write opens segment 0.
         let wal = Arc::new(GroupCommit::new(
             prefix.to_string(),
             &segments,
@@ -3801,7 +3802,7 @@ mod wal_format_fixture_tests {
 //
 //   MAGIC(4 = b"CMF1") | version(u8) | next_seq(u64) | max_version(u64)
 //   | table_count(u32) | table[0] | table[1] | ...
-//   | wal_seg_count(u32) | wal_seg[0](u64) | ...        (version >= 2 only)
+//   | wal_seg_count(u32) | wal_seg[0](u64) | ...
 //
 // One table record (mirrors `SsTableMeta`):
 //   seq(u64) | level(u32)
@@ -3813,22 +3814,27 @@ mod wal_format_fixture_tests {
 //   opt_bytes := present(u8) [ len(u32) bytes ]   (present 0 => None)
 //   bytes     := len(u32) bytes
 //
-// Version history within the `CMF1` family:
-//   v1 — header + tables (single-file WAL era; no `wal_segments`).
-//   v2 — adds the trailing live WAL-segment list (WAL segment rotation).
-// `decode_manifest` reads either: a v1 image yields an empty `wal_segments`
-// (recovery then takes the legacy single-file WAL path), a v2 image reads the
-// trailing list.
+// ADR 0073 Phase 0 (Workstream A): the version counter restarted at 1 with the
+// WAL-segment list part of v1, and every pre-baseline shape (v1-without-
+// segments, the JSON manifest) was dropped. `decode_manifest` reads exactly
+// versions `1..=MANIFEST_VERSION`; a missing/foreign magic is
+// `StorageError::PreBaselineFormat { format: "lsm-manifest" }`, a version
+// outside that range is `UnsupportedFormatVersion`. Golden fixtures live in
+// `tests/fixtures/formats/lsm-manifest/`.
 //
-// Forward-compat: a legacy JSON manifest begins with `{` (0x7B), which can never
-// be our magic's first byte (`C` = 0x43), so `decode_manifest` detects and falls
-// back to `serde_json`.
+// Crash safety: the manifest is only ever written by `Disk::replace`
+// (temp-file + rename: a crash keeps the whole old or whole new file, never a
+// prefix), so a torn manifest cannot be produced by a crash and is not
+// special-cased. An *empty* file (never written) is a fresh engine, handled by
+// the caller; a body that is cut short is still the `truncated manifest`
+// backend error, and a strict prefix of the magic is treated the same (a
+// truncation of our own header, not a foreign file).
 
 /// Binary manifest magic: "CMF1" (AnimusDB ManiFest, format family 1).
 const MANIFEST_MAGIC: [u8; 4] = *b"CMF1";
-/// Binary manifest format version (within the `CMF1` family). v2 adds the live
-/// WAL-segment list; v1 (no segment list) is still decoded.
-const MANIFEST_VERSION: u8 = 2;
+/// Binary manifest format version (within the `CMF1` family). ADR 0073 Phase 0
+/// reset the counter to 1; the live WAL-segment list is part of v1.
+const MANIFEST_VERSION: u8 = 1;
 
 /// Append a length-prefixed (`u32`) byte string.
 fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
@@ -3871,7 +3877,7 @@ fn encode_manifest(m: &Manifest) -> Vec<u8> {
         put_bytes(&mut out, bits);
         out.extend_from_slice(&t.format.to_be_bytes());
     }
-    // v2 trailer: the live WAL-segment list.
+    // Trailer: the live WAL-segment list.
     out.extend_from_slice(&(m.wal_segments.len() as u32).to_be_bytes());
     for &seg in &m.wal_segments {
         out.extend_from_slice(&seg.to_be_bytes());
@@ -3928,22 +3934,39 @@ impl<'a> Cursor<'a> {
     }
 }
 
-/// Decode a [`Manifest`]. Detects the compact binary format by its magic; if the
-/// bytes are instead a legacy JSON manifest (no binary magic), falls back to
-/// `serde_json` so an engine opened on an older directory still recovers.
+/// Decode a [`Manifest`].
+///
+/// # Errors
+/// - [`StorageError::PreBaselineFormat`] (`"lsm-manifest"`) if the bytes do not
+///   start with [`MANIFEST_MAGIC`] (foreign data, or a pre-baseline JSON
+///   manifest). A strict prefix of the magic shorter than 4 bytes is a
+///   truncated header and surfaces as the `truncated manifest` backend error.
+/// - [`StorageError::UnsupportedFormatVersion`] if the version byte is `0` or
+///   newer than [`MANIFEST_VERSION`].
+/// - [`StorageError::Backend`] for a body that is cut short or malformed.
 fn decode_manifest(bytes: &[u8]) -> Result<Manifest> {
-    if bytes.len() < 4 || bytes[..4] != MANIFEST_MAGIC {
-        // Legacy JSON manifest (pre-binary). Read it for forward-compat.
-        return serde_json::from_slice(bytes)
-            .map_err(|e| StorageError::Backend(format!("corrupt manifest: {e}")));
+    if bytes.len() < 4 {
+        if bytes == &MANIFEST_MAGIC[..bytes.len()] {
+            return Err(StorageError::Backend("truncated manifest".into()));
+        }
+        return Err(StorageError::PreBaselineFormat {
+            format: "lsm-manifest",
+        });
+    }
+    if bytes[..4] != MANIFEST_MAGIC {
+        return Err(StorageError::PreBaselineFormat {
+            format: "lsm-manifest",
+        });
     }
     let mut c = Cursor::new(bytes);
     let _magic = c.take(4)?;
     let version = c.u8()?;
     if version == 0 || version > MANIFEST_VERSION {
-        return Err(StorageError::Backend(format!(
-            "unsupported manifest version {version}"
-        )));
+        return Err(StorageError::UnsupportedFormatVersion {
+            format: "lsm-manifest",
+            found: u32::from(version),
+            max_supported: u32::from(MANIFEST_VERSION),
+        });
     }
     let next_seq = c.u64()?;
     let max_version = c.u64()?;
@@ -3984,20 +4007,14 @@ fn decode_manifest(bytes: &[u8]) -> Result<Manifest> {
             format,
         });
     }
-    // v2 trailer: the live WAL-segment list. A v1 image has none, so recovery
-    // falls back to the legacy single-file WAL path.
-    let wal_segments = if version >= 2 {
-        let count = c.u32()? as usize;
-        // Capped pre-allocation against an untrusted on-disk length prefix
-        // — see `table_count`'s decode above for why.
-        let mut segs = Vec::with_capacity(count.min(1 << 20));
-        for _ in 0..count {
-            segs.push(c.u64()?);
-        }
-        segs
-    } else {
-        Vec::new()
-    };
+    // Trailer: the live WAL-segment list.
+    let count = c.u32()? as usize;
+    // Capped pre-allocation against an untrusted on-disk length prefix
+    // — see `table_count`'s decode above for why.
+    let mut wal_segments = Vec::with_capacity(count.min(1 << 20));
+    for _ in 0..count {
+        wal_segments.push(c.u64()?);
+    }
     Ok(Manifest {
         next_seq,
         tables,
@@ -4032,7 +4049,7 @@ mod manifest_tests {
             file_size: seq * 2000,
             bloom,
             has_bloom: with_bloom,
-            format: 2,
+            format: 1,
         }
     }
 
@@ -4086,92 +4103,199 @@ mod manifest_tests {
         }
     }
 
-    /// The binary encoding is materially smaller than the old JSON encoding for a
-    /// representative manifest (the point of the change).
-    #[test]
-    fn binary_is_smaller_than_json() {
-        let m = Manifest {
-            next_seq: 20,
-            max_version: 99_999,
-            tables: (1..=12).map(|s| sample_meta(s, true)).collect(),
-            wal_segments: vec![18, 19, 20],
-        };
-        let bin = encode_manifest(&m);
-        let json = serde_json::to_vec(&m).unwrap();
-        assert!(
-            bin.len() < json.len(),
-            "binary manifest ({} bytes) not smaller than JSON ({} bytes)",
-            bin.len(),
-            json.len()
-        );
+    /// Deterministic, representative manifest for the golden fixture: fixed
+    /// keys/versions, tables with and without a bloom and with an empty-key
+    /// table, and a non-empty WAL-segment list (ADR 0073 fixture-determinism).
+    fn representative_manifest() -> Manifest {
+        Manifest {
+            next_seq: 7,
+            max_version: 1234,
+            tables: vec![
+                sample_meta(1, true),
+                sample_meta(2, false),
+                SsTableMeta {
+                    min_key: None,
+                    max_key: None,
+                    has_bloom: false,
+                    bloom: BloomFilter::default(),
+                    ..sample_meta(3, false)
+                },
+            ],
+            wal_segments: vec![2, 3, 5],
+        }
     }
 
-    /// A legacy JSON manifest still decodes (forward-compat fallback): tables get
-    /// their serde defaults (`format = 1`, no bloom), so an old directory opens.
+    fn assert_manifest_eq(a: &Manifest, b: &Manifest, what: &str) {
+        assert_eq!(a.next_seq, b.next_seq, "{what}: next_seq");
+        assert_eq!(a.max_version, b.max_version, "{what}: max_version");
+        assert_eq!(a.wal_segments, b.wal_segments, "{what}: wal_segments");
+        assert_eq!(a.tables.len(), b.tables.len(), "{what}: table count");
+        for (x, y) in a.tables.iter().zip(&b.tables) {
+            assert_eq!(x.seq, y.seq, "{what}: seq");
+            assert_eq!(x.level, y.level, "{what}: level");
+            assert_eq!(x.min_key, y.min_key, "{what}: min_key");
+            assert_eq!(x.max_key, y.max_key, "{what}: max_key");
+            assert_eq!(x.min_version, y.min_version, "{what}: min_version");
+            assert_eq!(x.max_version, y.max_version, "{what}: max_version");
+            assert_eq!(x.index_offset, y.index_offset, "{what}: index_offset");
+            assert_eq!(x.index_len, y.index_len, "{what}: index_len");
+            assert_eq!(x.file_size, y.file_size, "{what}: file_size");
+            assert_eq!(x.has_bloom, y.has_bloom, "{what}: has_bloom");
+            assert_eq!(x.format, y.format, "{what}: format");
+            assert_eq!(x.bloom.as_parts(), y.bloom.as_parts(), "{what}: bloom");
+        }
+    }
+
+    fn fixture_dir() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/formats/lsm-manifest")
+    }
+
+    /// Decode test (ADR 0073 Phase 0): every checked-in fixture decodes with
+    /// the current code to exactly the expected manifest, field by field.
+    /// Iterates the directory, so a future `v2` needs no test-code change.
     #[test]
-    fn legacy_json_manifest_still_decodes() {
-        // A pre-format/pre-bloom JSON manifest: omit `format`, `bloom`, `has_bloom`.
-        let json = br#"{
-            "next_seq": 3,
-            "max_version": 50,
-            "tables": [
-                {
-                    "seq": 1,
-                    "min_key": [97],
-                    "max_key": [98],
-                    "min_version": 1,
-                    "max_version": 9,
-                    "index_offset": 100,
-                    "index_len": 20,
-                    "file_size": 200
+    fn decodes_every_checked_in_fixture() {
+        let dir = fixture_dir();
+        let mut checked = 0usize;
+        for entry in std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("reading fixture dir {}: {e}", dir.display()))
+        {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("bin") {
+                continue;
+            }
+            let bytes = std::fs::read(&path)
+                .unwrap_or_else(|e| panic!("reading fixture {}: {e}", path.display()));
+            let m = decode_manifest(&bytes)
+                .unwrap_or_else(|e| panic!("decoding fixture {}: {e}", path.display()));
+            assert_manifest_eq(&m, &representative_manifest(), &path.display().to_string());
+            checked += 1;
+        }
+        assert!(checked > 0, "no fixture files under {}", dir.display());
+    }
+
+    /// Fixture generator. Run explicitly:
+    /// `cargo test -p animus-storage --lib generate_fixture_lsm_manifest -- --ignored`.
+    /// Refuses to overwrite an existing fixture: regenerate only by bumping
+    /// `MANIFEST_VERSION` and adding a NEW file.
+    #[test]
+    #[ignore = "run explicitly to (re)generate the golden fixture"]
+    fn generate_fixture_lsm_manifest() {
+        let dir = fixture_dir();
+        std::fs::create_dir_all(&dir).expect("create fixture dir");
+        let path = dir.join(format!("v{MANIFEST_VERSION}.bin"));
+        assert!(
+            std::fs::metadata(&path).is_err(),
+            "{} already exists — bump MANIFEST_VERSION and add a NEW fixture \
+             file instead of regenerating an existing one",
+            path.display(),
+        );
+        std::fs::write(&path, encode_manifest(&representative_manifest())).expect("write");
+    }
+
+    /// A different complete magic, or a pre-baseline JSON manifest, is a loud
+    /// named refusal — never silently empty, never a JSON fallback.
+    #[test]
+    fn foreign_or_json_manifest_is_pre_baseline() {
+        let mut foreign = encode_manifest(&representative_manifest());
+        foreign[0] = b'X';
+        for bytes in [
+            foreign,
+            br#"{"next_seq":3,"max_version":50,"tables":[]}"#.to_vec(),
+            b"abc".to_vec(),
+            b"{".to_vec(),
+        ] {
+            match decode_manifest(&bytes) {
+                Err(StorageError::PreBaselineFormat { format }) => {
+                    assert_eq!(format, "lsm-manifest");
                 }
-            ]
-        }"#;
-        let m = decode_manifest(json).expect("legacy json decodes");
-        assert_eq!(m.next_seq, 3);
-        assert_eq!(m.max_version, 50);
-        assert_eq!(m.tables.len(), 1);
-        assert!(
-            m.wal_segments.is_empty(),
-            "legacy json manifest has no recorded WAL segments"
-        );
-        let t = &m.tables[0];
-        assert_eq!(t.seq, 1);
-        assert_eq!(
-            t.format, 3,
-            "a format-less manifest entry defaults to the current format"
-        );
-        assert!(!t.has_bloom, "legacy table has no bloom");
-        assert_eq!(t.level, 0, "legacy table defaults to L0");
+                other => panic!("expected PreBaselineFormat for {bytes:?}, got {other:?}"),
+            }
+        }
     }
 
-    /// A **v1 binary** manifest (pre-segment-rotation: header + tables, no trailing
-    /// WAL-segment list) still decodes, yielding an empty `wal_segments` so recovery
-    /// falls back to the legacy single-file WAL.
     #[test]
-    fn legacy_v1_binary_manifest_decodes_with_no_segments() {
-        // Encode a v1 image by hand: the v2 encoder minus the trailing segment list,
-        // with the version byte forced to 1.
-        let m = Manifest {
-            next_seq: 4,
-            max_version: 77,
-            tables: vec![sample_meta(1, true), sample_meta(2, false)],
-            wal_segments: vec![1, 2], // present in memory but NOT written for v1
+    fn version_zero_and_future_are_unsupported() {
+        for bad in [0u8, MANIFEST_VERSION + 1, u8::MAX] {
+            let mut bytes = encode_manifest(&representative_manifest());
+            bytes[4] = bad;
+            match decode_manifest(&bytes) {
+                Err(StorageError::UnsupportedFormatVersion {
+                    format,
+                    found,
+                    max_supported,
+                }) => {
+                    assert_eq!(format, "lsm-manifest");
+                    assert_eq!(found, u32::from(bad));
+                    assert_eq!(max_supported, u32::from(MANIFEST_VERSION));
+                }
+                other => panic!("expected UnsupportedFormatVersion for {bad}, got {other:?}"),
+            }
+        }
+    }
+
+    /// A truncated image (every strict prefix) is a plain backend error, never
+    /// a pre-baseline/unsupported-version error and never a silent success:
+    /// truncation of our own file is not a foreign format.
+    #[test]
+    fn truncated_manifest_is_never_pre_baseline() {
+        let bytes = encode_manifest(&representative_manifest());
+        for len in 1..bytes.len() {
+            match decode_manifest(&bytes[..len]) {
+                Err(StorageError::Backend(_)) => {}
+                other => panic!("{len}-byte prefix: expected Backend error, got {other:?}"),
+            }
+        }
+    }
+
+    /// Engine-level crash soundness: the manifest is swapped by an atomic
+    /// `replace`, so a crash right after a flush reopens from the whole new
+    /// manifest (no pre-baseline/torn-manifest error), and a foreign manifest
+    /// makes `open` fail loudly instead of starting empty.
+    #[test]
+    fn engine_reopens_after_crash_and_refuses_foreign_manifest() {
+        use crate::StorageEngine;
+        use animus_env::{Disk, nid};
+        use animus_sim::Simulator;
+        use futures::executor::block_on;
+
+        let sim = Simulator::new(11);
+        let opts = || LsmOptions {
+            flush_threshold_bytes: 64,
+            ..LsmOptions::default()
         };
-        let mut v2 = encode_manifest(&m);
-        // Drop the v2 trailer (u32 count + count*u64) to get the v1 body ...
-        let trailer = 4 + m.wal_segments.len() * 8;
-        v2.truncate(v2.len() - trailer);
-        // ... and stamp the version byte (immediately after the 4-byte magic) to 1.
-        v2[4] = 1;
-        let back = decode_manifest(&v2).expect("v1 binary decodes");
-        assert_eq!(back.next_seq, 4);
-        assert_eq!(back.max_version, 77);
-        assert_eq!(back.tables.len(), 2);
-        assert!(
-            back.wal_segments.is_empty(),
-            "v1 binary manifest carries no WAL-segment list"
-        );
+        block_on(async {
+            let e = LsmEngine::open_with(sim.env(nid(0)), "m/", opts())
+                .await
+                .expect("open");
+            for i in 0u32..40 {
+                e.put(format!("k{i:03}").as_bytes(), &[b'v'; 32], u64::from(i) + 1)
+                    .await
+                    .expect("put");
+            }
+            e.flush_now().await.expect("flush");
+            assert!(e.sstable_count() > 0, "flush produced a table");
+            drop(e);
+            sim.crash(nid(0));
+            let e = LsmEngine::open_with(sim.env(nid(0)), "m/", opts())
+                .await
+                .expect("reopen after crash");
+            assert!(e.sstable_count() > 0, "manifest survived the crash whole");
+            drop(e);
+
+            sim.env(nid(0))
+                .replace("m/MANIFEST", br#"{"next_seq":1,"tables":[]}"#)
+                .await
+                .expect("replace");
+            match LsmEngine::open_with(sim.env(nid(0)), "m/", opts()).await {
+                Err(StorageError::PreBaselineFormat { format }) => {
+                    assert_eq!(format, "lsm-manifest");
+                }
+                Err(e) => panic!("expected PreBaselineFormat, got {e:?}"),
+                Ok(_) => panic!("foreign manifest must not open as an empty engine"),
+            }
+        });
     }
 }
 
@@ -4724,6 +4848,72 @@ mod readers_arc_tests {
                     "seed={seed}"
                 );
             }
+        });
+    }
+}
+
+/// The legacy single-file WAL (`<prefix>wal`) guard in `open_with`: a nonzero
+/// file is refused loudly (`PreBaselineFormat`), a zero-length or absent one is
+/// a fresh engine, and a normal engine still round-trips across a crash.
+#[cfg(test)]
+mod legacy_wal_guard_tests {
+    use super::*;
+    use animus_env::{Disk, nid};
+    use animus_sim::Simulator;
+    use futures::executor::block_on;
+
+    const PREFIX: &str = "db/";
+
+    #[test]
+    fn nonempty_legacy_single_file_wal_is_refused() {
+        let sim = Simulator::new(0x1073);
+        let env = sim.env(nid(0));
+        block_on(async {
+            let legacy = format!("{PREFIX}wal");
+            env.append(&legacy, b"pre-baseline bytes").await.unwrap();
+            env.sync(&legacy).await.unwrap();
+            match LsmEngine::open_with(env.clone(), PREFIX, LsmOptions::default()).await {
+                Err(StorageError::PreBaselineFormat { format }) => {
+                    assert_eq!(format, "lsm-wal-legacy-single-file");
+                }
+                Err(e) => panic!("expected PreBaselineFormat, got {e:?}"),
+                Ok(_) => panic!("open must refuse a nonempty legacy WAL"),
+            }
+        });
+    }
+
+    #[test]
+    fn zero_length_legacy_wal_opens_as_fresh_engine() {
+        let sim = Simulator::new(0x1074);
+        let env = sim.env(nid(0));
+        block_on(async {
+            let legacy = format!("{PREFIX}wal");
+            env.replace(&legacy, b"").await.unwrap();
+            let e = LsmEngine::open_with(env.clone(), PREFIX, LsmOptions::default())
+                .await
+                .expect("zero-length legacy file is fine");
+            assert!(e.get(b"k").await.unwrap().is_none());
+            e.put(b"k", b"v", 1).await.unwrap();
+            assert!(e.get(b"k").await.unwrap().is_some());
+        });
+    }
+
+    #[test]
+    fn fresh_engine_survives_crash_and_reopen() {
+        let sim = Simulator::new(0x1075);
+        let env = sim.env(nid(0));
+        block_on(async {
+            let e = LsmEngine::open_with(env.clone(), PREFIX, LsmOptions::default())
+                .await
+                .unwrap();
+            e.put(b"k", b"v", 1).await.unwrap();
+            drop(e);
+            sim.crash(nid(0));
+            let e = LsmEngine::open_with(sim.env(nid(0)), PREFIX, LsmOptions::default())
+                .await
+                .unwrap();
+            let got = e.get(b"k").await.unwrap().expect("acked write survives");
+            assert_eq!(got.value, b"v");
         });
     }
 }
