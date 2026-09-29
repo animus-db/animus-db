@@ -675,6 +675,33 @@ workstream C layers (RaftKV codec, `SharedWal` envelope, key-layout marker)
 extend. Backup/PITR/export segment objects reuse this codec unchanged, so
 they inherit the reset; workstream E confirms rather than re-versions.
 
+**Workstream C as-built — `SWL1` on the `SharedWal` outer line envelope.**
+Landed `persist::SHARED_WAL_TAG` (magic `SWL1`, version 1,
+`format::encode_line`/`decode_lines`'s line shape), converting
+`PersistedState::encode_tagged_record`/`decode_tagged` off the private
+untagged `<crc32>:<json>` helpers (deleted). Two corrections to this
+table's row C prose: (a) **the `SharedWal` code lives in `animus-control`**
+(`persist.rs`/`shared_wal.rs`), not `animus-cp-data`, so this layer
+necessarily edits those files despite the row's crate list and its "do not
+touch `persist.rs`" note — that note was written on the assumption the
+envelope lived in cp-data; (b) **the inner `record` is not a `codec.rs`
+payload**: it is the generic `WalRecord<KvCommand, KvState>` as `serde_json`
+— the same shape `CWL1` carries — so the envelope is `{"tablet":..,
+"record":..}` JSON inside the tagged line, and there is no separate
+versioned inner codec to coordinate with. Decode semantics match `CWL1`'s:
+a torn/CRC-failed tail is a silent stop (`Ok` with the valid prefix — the
+crash-recovery contract is unchanged); a CRC-valid line with no `SWL1`
+magic (a pre-baseline untagged line) is `PreBaselineFormat`, an unknown
+version `UnsupportedFormatVersion`, and a CRC-valid `SWL1` line whose JSON
+does not parse is `Malformed` — loud, where the old decoder silently
+truncated. `SharedWal::open` maps any of these to an `InvalidData`
+`io::Error`, so a node refuses to start on a pre-baseline shared WAL
+rather than recovering an empty/truncated one. Golden fixture:
+`crates/animus-control/tests/fixtures/formats/shared-wal/v1.bin`
+(three tablets interleaved, every `WalRecord` variant), with the decode,
+round-trip and `#[ignore]`d generator tests in the same
+`tests/format_fixtures.rs`.
+
 ## Testing
 
 Every phase must stay provable under ADR 0003's determinism guarantee, the

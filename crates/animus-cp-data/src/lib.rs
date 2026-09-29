@@ -2313,8 +2313,8 @@ pub fn wal_file(stream: u64) -> String {
 
 /// The **per-node** shared WAL filename (C-05 PR 2, ADR 0028): every hosted
 /// tablet's `RaftCore` log persists into this ONE file, tagged by tablet
-/// (`animus_control::PersistedState::encode_tagged_record`), when a node is
-/// started with `--shared-wal`/`cluster_settings.shared_wal`. A distinct
+/// (`animus_control::PersistedState::encode_tagged_record`, one `SWL1`
+/// line per record), when a node is started with `--shared-wal`/`cluster_settings.shared_wal`. A distinct
 /// name from [`WAL`]/[`wal_file`] on purpose — the two layouts live at
 /// disjoint filenames on the same data directory, so flipping the flag
 /// against an existing data dir never mixes them (see
