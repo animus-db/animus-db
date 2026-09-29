@@ -1777,3 +1777,19 @@ multi-node, fault-injecting, deterministic middle tier
 (`sim_cluster_backup_janitor.rs`) that neither of the other two reaches:
 leader gating, a real leadership handoff, and a crashed-leader/restart
 recovery, all replayable from a bare seed.
+
+## Amendment (2026-09-29): format tags, typed decode errors, golden fixtures (ADR 0073 Phase 0, workstream E)
+
+The manifest object (`BKMF` + `u8`, JSON body) and data chunks (`BKDT` +
+`u8`) were already enveloped at version 1; that envelope is the format tag
+(ADR 0073's binary `magic || version || payload` shape), so no redundant
+`"v"` is added to the manifest's JSON body and no version reset was needed.
+Two changes: (1) `decode_manifest_object`/`decode_data_chunk` now return the
+shared `animus_control::format::FormatError` (`PreBaselineFormat` for no or
+foreign magic, `UnsupportedFormatVersion` for version 0 or a future version,
+`Malformed` for a bad JSON body, truncation or trailing bytes), built on
+`format::wrap`/`unwrap` with `MANIFEST_TAG`/`DATA_TAG` — on-disk bytes are
+unchanged; (2) golden fixtures `backup-manifest/v1.bin` and
+`backup-data/v1.bin` (`animus-cp-data/tests/fixtures/formats/`) pin both
+layouts from the baseline on, so a layout change is a new version plus a new
+fixture, never an edit of `v1`.

@@ -56,7 +56,14 @@ amendment — the shape predates and outlives it.)
   `BackupTabletProgress` completion records — JSON rather than a hand-rolled
   binary encoder because `BackupManifest` nests the multi-field, evolving
   `TableSchema` shape and this object is written/read once per backup, never
-  a hot path). **Consumed since Train 1 PR③** by `animusd`'s capture driver
+  a hot path). **ADR 0073 Phase 0 (E, layer 3):** the `BKMF`/`BKDT` + `u8`
+  envelopes are the formats' version tags (both baseline `1`, the JSON body
+  carries no `"v"`); `BackupCodecError` is the shared
+  `animus_control::format::FormatError` (no magic → `PreBaselineFormat`,
+  version 0/future → `UnsupportedFormatVersion`, bad body/framing →
+  `Malformed`); golden fixtures `tests/fixtures/formats/backup-{manifest,
+  data}/v1.bin` are pinned by `tests/backup_format_fixtures.rs` — never edit
+  one, add a new version + fixture. **Consumed since Train 1 PR③** by `animusd`'s capture driver
   (`backup_capture.rs`, writing chunked data objects) and completion
   aggregator (`backup_completion.rs`, assembling + writing the manifest
   object) — see `animusd`'s `CLAUDE.md` for both, and its
