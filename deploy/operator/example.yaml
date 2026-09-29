@@ -4,6 +4,9 @@ metadata:
   name: example
   namespace: default
 spec:
+  # Internal content-schema version (ADR 0073); required, distinct from the
+  # v1alpha1 API version above. This operator supports schemaVersion: 1.
+  schemaVersion: 1
   image: ghcr.io/animus-db/animusd:latest
   nodes: 3
   # controlNodes defaults to min(3, nodes) when omitted; spelled out here

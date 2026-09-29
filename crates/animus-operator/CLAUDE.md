@@ -1271,6 +1271,28 @@ reasoning). `deployment.yaml` ships the webhook's own `args`/`ports`/
 `volumeMounts`/`volumes` as a commented-out block (mirroring `example.yaml`'s
 own commented-optional-section style) rather than active by default.
 
+## Versioned formats (ADR 0073 Phase 0 E, layer 2)
+
+`spec.schemaVersion` (`crd::CONTENT_SCHEMA_VERSION = 1`, format name
+`animuscluster-spec`) is the CRD's **internal content-schema version**,
+distinct from the Kubernetes `v1alpha1` API version (which stays). It is
+required with **no serde default**, and schemars lists it under `required:`
+(plus `minimum: 1`) so the API server rejects a CR that omits it — but the
+schema alone is not relied on: serde refuses a missing field at decode,
+`validate::validate_schema_version` refuses `0` and anything above
+`CONTENT_SCHEMA_VERSION` (the webhook via `validate_spec`; the reconciler
+via `CONDITION_SCHEMA_VERSION_INVALID`, returning `Action::await_change()`
+before any child is applied — not `Err`, which would back off and requeue).
+`AnimusClusterSpec` has a manual `Default` (schema_version = current) so
+`..Default::default()` test literals keep working; a literal with no spread
+must name the field. Golden fixture:
+`tests/fixtures/formats/animuscluster-spec/v1.json` (never edited; a change
+is `CONTENT_SCHEMA_VERSION` + a new `v2.json`), tests in
+`tests/format_fixtures.rs`. Every `AnimusCluster` manifest
+(`deploy/operator/example.yaml`, `scripts/e2e-kind.sh`'s heredoc) carries
+`schemaVersion: 1`; regenerate `deploy/operator/crd.yaml` after touching the
+spec type.
+
 ## Tests
 
 `cargo test -p animus-operator` — every `desired::*` builder module has its

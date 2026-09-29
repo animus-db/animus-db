@@ -36,8 +36,8 @@ use crate::crd::{
     CONDITION_ENCRYPTION_KEY_SECRET_INVALID, CONDITION_EPHEMERAL_VOTER_STORAGE_HAZARD,
     CONDITION_EPHEMERAL_VOTER_STORAGE_REJECTED, CONDITION_NODES_SPEC_INVALID,
     CONDITION_S3_SPEC_INVALID, CONDITION_SCALE_BELOW_CONTROL_NODES_REFUSED,
-    CONDITION_STORE_SPEC_INVALID, CONDITION_TLS_SPEC_INVALID, ClusterCondition, ClusterPhase,
-    ConditionStatus,
+    CONDITION_SCHEMA_VERSION_INVALID, CONDITION_STORE_SPEC_INVALID, CONDITION_TLS_SPEC_INVALID,
+    ClusterCondition, ClusterPhase, ConditionStatus,
 };
 use crate::desired;
 use crate::validate;
@@ -906,6 +906,26 @@ async fn reconcile<C: ClusterApi, A: AdminOps>(
 
     let mut status = cluster.status.clone().unwrap_or_default();
     status.observed_generation = cluster.metadata.generation;
+
+    // Validate `spec.schemaVersion` (ADR 0073 Phase 0 E): a spec whose content
+    // schema this operator cannot interpret is refused before any child is
+    // applied. Returns `await_change` (not `Err`, which would requeue with
+    // backoff): nothing changes until the spec is edited.
+    if let Some(violation) = validate::validate_schema_version(&cluster.spec) {
+        warn!(cluster = %name, error = %violation.message, "refusing unsupported spec.schemaVersion");
+        set_condition(
+            &mut status,
+            CONDITION_SCHEMA_VERSION_INVALID,
+            violation.message,
+        );
+        ctx.cluster_api
+            .patch_cluster_status(&ns, &name, &status)
+            .await?;
+        return Ok(Action::await_change());
+    }
+    status
+        .conditions
+        .retain(|c| c.type_ != CONDITION_SCHEMA_VERSION_INVALID);
 
     // Validate `spec.nodes` (S-07e, ADR 0070): purely informational — see
     // `CONDITION_NODES_SPEC_INVALID`'s own doc for why there is no fallback
@@ -2890,6 +2910,35 @@ mod tests {
             "no child resource should be applied when the write is refused: {:?}",
             ctx.cluster_api.applies()
         );
+    }
+
+    #[tokio::test]
+    async fn reconcile_refuses_an_unsupported_schema_version_and_applies_no_children() {
+        for bad in [0u32, 2] {
+            let mut cluster = test_cluster("demo", "ns1", 3, None);
+            cluster.spec.schema_version = bad;
+            let ctx = make_ctx(FakeClusterApi::new(), FakeAdminClient::new());
+
+            let action = reconcile(Arc::new(cluster), Arc::clone(&ctx))
+                .await
+                .expect("a bad schemaVersion is a condition, not an Err");
+            assert_eq!(action, Action::await_change(), "schemaVersion {bad}");
+
+            let status = ctx.cluster_api.last_status().unwrap();
+            assert!(
+                status
+                    .conditions
+                    .iter()
+                    .any(|c| c.type_ == CONDITION_SCHEMA_VERSION_INVALID),
+                "{:?}",
+                status.conditions
+            );
+            assert!(
+                ctx.cluster_api.applies().is_empty(),
+                "no child resource may be applied: {:?}",
+                ctx.cluster_api.applies()
+            );
+        }
     }
 
     #[tokio::test]

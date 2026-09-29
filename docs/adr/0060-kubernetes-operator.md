@@ -1855,3 +1855,19 @@ change needed), `deploy/operator/crd.yaml` regenerated from `crd.rs`'s
 updated doc comments, and this amendment. See `crates/animus-operator/
 CLAUDE.md`'s issue #864 section (updated in the same change) for the
 crate-local version of this account.
+
+## Amendment 2026-09-29: `spec.schemaVersion` (ADR 0073 Phase 0 E, layer 2)
+
+`AnimusCluster.spec` gains a required `schemaVersion: u32`
+(`crd::CONTENT_SCHEMA_VERSION = 1`), an internal content-schema version
+distinct from the Kubernetes `v1alpha1` API version, which is unchanged. It
+has no serde default and is listed as `required` (with `minimum: 1`) in the
+generated CRD, so the API server rejects a CR that omits it. `0` and any
+version above what the operator supports are rejected by
+`validate::validate_schema_version`, which `validate_spec` runs so the
+admission webhook (ADR 0070) refuses them at write time; for a cluster
+installed without the webhook the reconciler sets the
+`SchemaVersionInvalid` condition and returns `Action::await_change()`
+before applying any child resource. Every shipped `AnimusCluster` manifest
+carries `schemaVersion: 1`, and a golden fixture
+(`tests/fixtures/formats/animuscluster-spec/v1.json`) pins the format.

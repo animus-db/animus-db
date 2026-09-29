@@ -1,0 +1,31 @@
+{
+  "apiVersion": "animusdb.io/v1alpha1",
+  "kind": "AnimusCluster",
+  "metadata": {
+    "name": "golden",
+    "namespace": "animus"
+  },
+  "spec": {
+    "schemaVersion": 1,
+    "image": "ghcr.io/animus-db/animusd:0.1.0",
+    "nodes": 5,
+    "controlNodes": 3,
+    "storage": {
+      "size": "10Gi",
+      "storageClassName": "fast-ssd"
+    },
+    "basePort": 14000,
+    "clientService": {
+      "type": "LoadBalancer"
+    },
+    "quiesceAfterSecs": 5,
+    "autoSplitBytes": 1000000,
+    "dynamoAuthSecretName": "dynamo-creds",
+    "tls": {
+      "secretName": "animus-tls"
+    },
+    "backupStore": "cluster",
+    "segmentStore": "dir:/var/lib/animus/segments",
+    "encryptionKeySecretName": "animus-enc-key"
+  }
+}
