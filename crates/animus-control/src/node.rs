@@ -22,7 +22,7 @@ use crate::delta_ring::DeltaRing;
 use crate::detector::FailureDetector;
 use crate::format::{self, FormatError};
 use crate::meta::{Member, MetaCommand, Metadata, NodeStatus, PlacementView};
-use crate::mirror::{self, KeyWrite};
+use crate::mirror::{self, KeyWrite, RebuildError};
 use crate::persist::{CONTROL_SNAPSHOT, PersistedState};
 use crate::persist_round::{self, GatedOuts, PersistArm, PersistFut, PersistProgress, PersistWake};
 use crate::raft::{Out, ProposeResult, RaftCore, RaftMsg, Role};
@@ -1385,7 +1385,25 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
     // cannot reshuffle any fixed-seed test's later entropy draws (the same
     // issue #667 concern `boot_entropy`'s own doc explains).
     let ApplySeed { shadow, watermark } =
-        meta_apply_seed(&engine, &cache, &engine_applied, &watch).await;
+        match meta_apply_seed(&engine, &cache, &engine_applied, &watch).await {
+            Ok(seed) => seed,
+            Err(e) => {
+                // ADR 0073 Phase 0 workstream B: a pre-baseline or
+                // unrecognized-version system keyspace, found at the
+                // apply task's one-time startup seed — the identical
+                // halt-not-panic treatment the WAL-decode failure above
+                // gets, for the same reason: never silently proceed on an
+                // empty/wrong shadow, and never crash-loop a process whose
+                // on-disk state genuinely needs an operator's attention.
+                tracing::error!(
+                    error = %e,
+                    "control-plane system-keyspace mirror failed to decode at startup; \
+                     halting this node until its on-disk state is repaired or removed"
+                );
+                halted.store(true, Ordering::SeqCst);
+                return;
+            }
+        };
 
     // Now spawn the steady-state apply loop, handing it the seed's already-
     // published state — this loop does no more engine I/O than the ongoing
@@ -1645,10 +1663,22 @@ async fn meta_apply_seed<S: StorageEngine>(
     cache: &Arc<Mutex<Metadata>>,
     engine_applied: &Arc<AtomicU64>,
     watch: &MetadataWatch,
-) -> ApplySeed {
-    let shadow = mirror::rebuild_metadata_from_engine(engine)
-        .await
-        .expect("system-keyspace engine scan (rebuild)");
+) -> Result<ApplySeed, FormatError> {
+    // ADR 0073 Phase 0 workstream B: a `RebuildError::Storage` (a real
+    // backend fault) keeps this function's pre-existing hard-panic
+    // discipline unchanged — a storage failure this early means the engine
+    // itself is unusable, not a format problem. A `RebuildError::Format`
+    // (a pre-baseline or unrecognized-version system keyspace) is instead
+    // returned to the caller (`drive`), which gives it the same
+    // halt-not-panic treatment the WAL-decode failure right above it
+    // already gets.
+    let shadow = match mirror::rebuild_metadata_from_engine(engine).await {
+        Ok(shadow) => shadow,
+        Err(RebuildError::Storage(e)) => {
+            panic!("system-keyspace engine scan (rebuild) failed: {e}")
+        }
+        Err(RebuildError::Format(e)) => return Err(e),
+    };
     let watermark = engine
         .get(&syskv::applied_index_key())
         .await
@@ -1660,7 +1690,7 @@ async fn meta_apply_seed<S: StorageEngine>(
     // A restart can recover already-applied state; a watcher parked before
     // this task's first loop iteration should see it too.
     watch.bump(watermark);
-    ApplySeed { shadow, watermark }
+    Ok(ApplySeed { shadow, watermark })
 }
 
 /// The per-node **apply task** (ADR 0038 PR3): repeatedly install any received
@@ -1786,9 +1816,27 @@ async fn meta_apply_and_compact<E: Env, S: StorageEngine>(
             // `watermark`/`engine_applied`/the delta ring/`watch`.
             return did_work;
         }
-        *shadow = mirror::rebuild_metadata_from_engine(engine)
-            .await
-            .expect("system-keyspace engine scan (post-install rebuild)");
+        *shadow = match mirror::rebuild_metadata_from_engine(engine).await {
+            Ok(shadow) => shadow,
+            Err(RebuildError::Storage(e)) => {
+                panic!("system-keyspace engine scan (post-install rebuild) failed: {e}")
+            }
+            Err(RebuildError::Format(err)) => {
+                // ADR 0073 Phase 0 workstream B: identical halt-not-panic
+                // treatment to `install_syskv_image`'s own decode-failure
+                // branch right above — the image already installed into
+                // the engine (this rebuild is what reads it back), so
+                // skipping would leave the node's `shadow`/`cache` silently
+                // stale rather than reflecting what just landed durably.
+                tracing::error!(
+                    %err,
+                    "system-keyspace mirror failed to decode after an InstallSnapshot \
+                     install; halting this node",
+                );
+                halted.store(true, Ordering::SeqCst);
+                return did_work;
+            }
+        };
         *watermark = last_index;
         *cache.lock().expect("cache poisoned") = shadow.clone();
         engine_applied.fetch_max(last_index, Ordering::SeqCst);
@@ -1840,6 +1888,19 @@ async fn meta_apply_and_compact<E: Env, S: StorageEngine>(
             max_index.to_be_bytes().to_vec(),
             max_index,
         ));
+        // ADR 0073 Phase 0 workstream B: the system-keyspace mirror's own
+        // format-version row, written unconditionally (idempotent — the
+        // engine's per-key LWW makes a repeat write of the same value a
+        // no-op) on every durable apply-task batch, alongside
+        // `_applied_index` — mirror-internal bookkeeping, never fed into
+        // `ring_batch`/the delta ring, since it is not part of `Metadata`
+        // and a `WatchMetadata` consumer has no use for it (see
+        // `mirror::SYSKV_FORMAT_VERSION_COUNTER`'s own doc for why the
+        // mirror needs this signal independently of `Metadata::version`).
+        match mirror::put_syskv_format_version() {
+            KeyWrite::Put(key, value) => ops.push(MergeOp::put(key, value, max_index)),
+            KeyWrite::Delete(_) => unreachable!("put_syskv_format_version always Puts"),
+        }
         if let Err(e) = engine.merge_batch(ops).await {
             assert!(
                 halted.load(Ordering::SeqCst),
@@ -3504,8 +3565,11 @@ mod tests {
         let engine_entries = engine.entries().await.expect("engine scan");
         assert_eq!(
             engine_entries.len(),
-            3 + 1, // 3 member upserts + the shared `_applied_index` watermark key
-            "expected exactly the tail's writes plus the watermark key, got {} entries",
+            3 + 1 + 1, // 3 member upserts + the shared `_applied_index` watermark key
+            // + the ADR 0073 Phase 0 `syskv_format_version` row (written
+            // unconditionally on every durable apply-task batch)
+            "expected exactly the tail's writes plus the watermark key and the \
+             syskv_format_version row, got {} entries",
             engine_entries.len()
         );
 

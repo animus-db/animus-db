@@ -772,9 +772,9 @@ fn config_view<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>) -> Value {
     // `effective_metadata()`, not `ctx.control.metadata_cached()` directly
     // (ADR 0035 PR5 staleness-audit fix, matching `/admin/status`/
     // `/admin/peers` above): a control-plane-follower-less growth node's own
-    // control raft never replicates, so `cp_member_addrs` below would
-    // otherwise show an empty map forever on exactly the node an operator
-    // most wants to inspect.
+    // control raft never replicates, so `credentials_count` below would
+    // otherwise show zero forever on exactly the node an operator most wants
+    // to inspect.
     let meta = ctx.effective_metadata();
     let peers: std::collections::BTreeMap<String, String> = a
         .peers
@@ -800,7 +800,6 @@ fn config_view<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>) -> Value {
             "admin": a.admin_addr.to_string(),
         },
         "peers": peers,
-        "cp_member_addrs": meta.cp_member_addrs,
         "auto_split_bytes_threshold": a.auto_split_bytes_threshold,
         // W-09 (ADR 0034 amendment): the request-rate sibling.
         "auto_split_ops_rate_threshold": a.auto_split_ops_rate_threshold,
@@ -1435,10 +1434,10 @@ async fn system_table<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>, q: &str) ->
 }
 
 /// Whether `kind`'s entity id is a big-endian `u64` (a `TabletId`) — see
-/// [`system_table_id_display`]. **ADR 0040 PR3**: `Member`/`NodeAddrs`/
-/// `CpMemberAddr` are keyed by `NodeId` now, and `NodeId` is a validated
-/// UTF-8 string, not a fixed-width `u64` (`member_key`/`node_addrs_key`/
-/// `cp_member_addr_key` all encode `id.as_str().as_bytes()`) — they moved
+/// [`system_table_id_display`]. **ADR 0040 PR3**: `Member`/`NodeAddrs`
+/// are keyed by `NodeId` now, and `NodeId` is a validated
+/// UTF-8 string, not a fixed-width `u64` (`member_key`/`node_addrs_key`
+/// both encode `id.as_str().as_bytes()`) — they moved
 /// out of this list. Leaving them in would occasionally *silently*
 /// misrender a coincidentally-8-byte-long id (e.g. `"n1234567"`) as a bogus
 /// decoded number instead of the real string, rather than just falling
@@ -1512,7 +1511,7 @@ fn system_table_id_display(kind: syskv::EntityKind, id: &[u8]) -> Value {
 
 /// Render one system-keyspace entry's raw `value` bytes, mirroring
 /// `animus_control::mirror::apply_put`'s decode exactly: `Tablet`/`Member`/
-/// `Schema`/`Policy`/`NodeAddrs`/`CpMemberAddr` are `serde_json` passthrough
+/// `Schema`/`Policy`/`NodeAddrs` are `serde_json` passthrough
 /// (`null` on a malformed value — defensive only, every real writer produces
 /// valid JSON here); `Counter` is a raw big-endian `u64` (`null` if not
 /// exactly 8 bytes); `IndexBackfill` (ADR 0045 §4) is
@@ -1530,7 +1529,6 @@ fn system_table_value_display(kind: syskv::EntityKind, value: &[u8]) -> Value {
         | syskv::EntityKind::Schema
         | syskv::EntityKind::Policy
         | syskv::EntityKind::NodeAddrs
-        | syskv::EntityKind::CpMemberAddr
         // A `StreamShardRow` (ADR 0042 §3) — `serde_json` passthrough like
         // every other JSON-encoded entity kind above.
         | syskv::EntityKind::StreamShard
