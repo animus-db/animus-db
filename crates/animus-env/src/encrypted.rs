@@ -247,6 +247,11 @@ enum Scan {
     /// Bytes are present but don't start with the expected magic — either a
     /// plaintext file (directory-level mismatch) or a corrupted header.
     NotEncrypted,
+    /// The full header is present with the right `ADE1` magic, but its
+    /// version byte is outside `1..=VERSION` (0, or written by a newer
+    /// binary). Never a torn file and never decodable with v1 logic: it
+    /// surfaces as a loud, typed error (ADR 0073 Phase 0).
+    UnsupportedVersion(u8),
     /// A parseable (possibly torn) encrypted file: `index` covers every
     /// frame up to (not including) the first parse/auth failure, if any;
     /// `torn` says whether such a failure was found — safe to recover from
@@ -270,6 +275,9 @@ fn scan(key: &EncryptionKey, raw: &[u8]) -> Scan {
     }
     if raw.len() < HEADER_LEN || raw[0..4] != MAGIC {
         return Scan::NotEncrypted;
+    }
+    if raw[4] == 0 || raw[4] > VERSION {
+        return Scan::UnsupportedVersion(raw[4]);
     }
     let mut salt = [0u8; SALT_LEN];
     salt.copy_from_slice(&raw[5..HEADER_LEN]);
@@ -355,6 +363,20 @@ fn mixed_state_error(file: &str) -> std::io::Error {
             "{file} is not in the expected encrypted frame format even though this data \
              directory's {MARKER_FILE} says it is encrypted — the data directory is corrupted \
              or was partially migrated by hand; refusing to use it"
+        ),
+    )
+}
+
+/// Distinct from [`mixed_state_error`] and [`corruption_error`]: the file
+/// is a genuine `ADE1` envelope of a version this binary cannot read.
+/// `InvalidData` like its siblings; the message text is the discriminator.
+fn unsupported_version_error(file: &str, found: u8) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!(
+            "{file}: unsupported ADE1 encryption envelope version {found} (this binary supports \
+             versions 1..={VERSION}); refusing to read it — it was written by a newer binary or \
+             is corrupt"
         ),
     )
 }
@@ -580,6 +602,7 @@ impl<D: Disk, R: Rng> EncryptedDisk<D, R> {
                 raw_len: 0,
             }),
             Scan::NotEncrypted => Err(mixed_state_error(file)),
+            Scan::UnsupportedVersion(found) => Err(unsupported_version_error(file, found)),
             Scan::Corrupted => Err(corruption_error(file)),
             Scan::Ok { index, torn } => {
                 if torn || (index.raw_len as usize) < raw.len() {
@@ -868,5 +891,472 @@ impl<E: Env> Env for EncryptedEnv<E> {
 
     fn metrics(&self) -> MetricsHandle {
         self.env.metrics()
+    }
+}
+
+/// ADR 0073 Phase 0, Workstream A: the golden fixture for this module's
+/// `ADE1` envelope. `ADE1` already carries `MAGIC || VERSION` (see the
+/// module doc), so there is no reset here — only a checked-in fixture plus
+/// the decode/round-trip/generator tests the ADR's "Phase 0 conventions"
+/// section (`docs/adr/0073-upgrade-compatibility.md`) prescribes for every
+/// format in the inventory.
+///
+/// This crate has no dependency on `animus-sim`/`tokio` outside the `prod`
+/// feature (see `Cargo.toml`'s comments), so this module brings its own
+/// tiny, fully synchronous `Disk`/`Rng` test doubles and its own
+/// single-poll `block_on` — deliberately not `SimEnv` or `#[tokio::test]` —
+/// so these tests run under a plain `cargo test -p animus-env`, no features
+/// required, exactly like every other per-push gate in this crate.
+#[cfg(test)]
+mod format_fixture_tests {
+    use std::collections::BTreeMap;
+    use std::future::Future;
+    use std::path::PathBuf;
+    use std::sync::Mutex as StdMutex;
+    use std::task::{Context, Poll, Waker};
+
+    use super::{EncryptedDisk, EncryptionKey, HEADER_LEN, MAGIC, SALT_LEN, Scan, VERSION, scan};
+    use crate::{Disk, Rng};
+
+    // ---- deterministic test doubles ----------------------------------
+    //
+    // Purely local test scaffolding (never `SimEnv`, never `OsRng`/
+    // `thread_rng`) — mirrors the existing `CounterRng` precedent in
+    // `s3_store.rs`'s own tests, but fixed rather than counter-seeded:
+    // fixture *content* must be byte-identical on every run (ADR 0073's
+    // "Determinism" convention), and a fixed salt is what makes that hold
+    // here.
+
+    /// An in-memory [`Disk`]: every method is synchronous under the hood
+    /// (no real suspension across an `.await`), so [`block_on`] below
+    /// resolves it on the first poll.
+    #[derive(Default)]
+    struct FixtureDisk {
+        files: StdMutex<BTreeMap<String, Vec<u8>>>,
+    }
+
+    impl FixtureDisk {
+        /// Seed `file` with raw bytes directly, bypassing any encryption —
+        /// used to hand a fixture's already-sealed bytes to a fresh
+        /// [`EncryptedDisk`] for decoding, without re-sealing them.
+        fn seed(&self, file: &str, bytes: &[u8]) {
+            self.files
+                .lock()
+                .expect("fixture disk lock poisoned")
+                .insert(file.to_string(), bytes.to_vec());
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Disk for FixtureDisk {
+        async fn append(&self, file: &str, bytes: &[u8]) -> std::io::Result<()> {
+            self.files
+                .lock()
+                .expect("fixture disk lock poisoned")
+                .entry(file.to_string())
+                .or_default()
+                .extend_from_slice(bytes);
+            Ok(())
+        }
+
+        async fn sync(&self, _file: &str) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        async fn read(&self, file: &str) -> std::io::Result<Vec<u8>> {
+            Ok(self
+                .files
+                .lock()
+                .expect("fixture disk lock poisoned")
+                .get(file)
+                .cloned()
+                .unwrap_or_default())
+        }
+
+        async fn read_at(&self, file: &str, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
+            let data = self
+                .files
+                .lock()
+                .expect("fixture disk lock poisoned")
+                .get(file)
+                .cloned()
+                .unwrap_or_default();
+            let offset = offset as usize;
+            if offset >= data.len() {
+                return Ok(Vec::new());
+            }
+            let end = offset.saturating_add(len).min(data.len());
+            Ok(data[offset..end].to_vec())
+        }
+
+        async fn size(&self, file: &str) -> std::io::Result<u64> {
+            Ok(self
+                .files
+                .lock()
+                .expect("fixture disk lock poisoned")
+                .get(file)
+                .map(|v| v.len() as u64)
+                .unwrap_or(0))
+        }
+
+        async fn remove(&self, file: &str) -> std::io::Result<()> {
+            self.files
+                .lock()
+                .expect("fixture disk lock poisoned")
+                .remove(file);
+            Ok(())
+        }
+
+        async fn replace(&self, file: &str, bytes: &[u8]) -> std::io::Result<()> {
+            self.files
+                .lock()
+                .expect("fixture disk lock poisoned")
+                .insert(file.to_string(), bytes.to_vec());
+            Ok(())
+        }
+
+        async fn list(&self) -> std::io::Result<Vec<String>> {
+            Ok(self
+                .files
+                .lock()
+                .expect("fixture disk lock poisoned")
+                .keys()
+                .cloned()
+                .collect())
+        }
+
+        async fn link(&self, src: &str, dst: &str) -> std::io::Result<()> {
+            let data = self
+                .files
+                .lock()
+                .expect("fixture disk lock poisoned")
+                .get(src)
+                .cloned()
+                .unwrap_or_default();
+            self.files
+                .lock()
+                .expect("fixture disk lock poisoned")
+                .insert(dst.to_string(), data);
+            Ok(())
+        }
+    }
+
+    /// A fixed-byte [`Rng`]: `fill_bytes` always writes the ramp
+    /// `0x40, 0x41, 0x42, ...`, so the salt this module's fixture/tests
+    /// mint is the same 16 bytes on every run, on every contributor's
+    /// machine, forever — never `OsRng`/`thread_rng`, and never `SimEnv`
+    /// (this crate has no dependency on `animus-sim`).
+    struct FixedTestRng;
+
+    /// The exact salt [`FixedTestRng`] mints — spelled out once so both the
+    /// generator and the decode assertions below refer to the same
+    /// constant rather than re-deriving it.
+    const FIXED_SALT: [u8; SALT_LEN] = [
+        0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4a, 0x4b, 0x4c, 0x4d, 0x4e,
+        0x4f,
+    ];
+
+    impl Rng for FixedTestRng {
+        fn next_u64(&self) -> u64 {
+            0
+        }
+
+        fn fill_bytes(&self, dst: &mut [u8]) {
+            for (i, b) in dst.iter_mut().enumerate() {
+                *b = 0x40u8.wrapping_add(i as u8);
+            }
+        }
+    }
+
+    /// Poll `fut` to completion with a no-op waker. Every operation this
+    /// module drives ([`FixtureDisk`]'s methods, `EncryptedDisk`'s own
+    /// synchronous bookkeeping over them) never actually suspends across a
+    /// real `.await`, so this always resolves on the first poll; it exists
+    /// only so this test module needs no async-runtime dependency — `tokio`
+    /// is gated behind this crate's `prod` feature (see `Cargo.toml`), and
+    /// these tests must pass under a plain, feature-less `cargo test -p
+    /// animus-env`.
+    fn block_on<F: Future>(fut: F) -> F::Output {
+        // `Waker::noop()` (stable, no `unsafe` needed — this crate's
+        // workspace lints `forbid` unsafe code entirely) is exactly the
+        // right waker here: nothing in this module ever actually parks,
+        // so a wake notification is never needed.
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let mut fut = Box::pin(fut);
+        loop {
+            if let Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
+                return v;
+            }
+        }
+    }
+
+    /// A hand-chosen 256-bit constant — never a real secret, never `OsRng`
+    /// — so the fixture and every test in this module encrypt/decrypt
+    /// under the identical, reproducible key.
+    const TEST_KEY: [u8; 32] = {
+        let mut k = [0u8; 32];
+        let mut i = 0;
+        while i < 32 {
+            k[i] = i as u8;
+            i += 1;
+        }
+        k
+    };
+
+    fn test_key() -> EncryptionKey {
+        EncryptionKey::from_bytes(TEST_KEY)
+    }
+
+    const FIXTURE_FILE_NAME: &str = "data";
+    const PLAINTEXT_FRAME_1: &[u8] =
+        b"AnimusDB ADE1 golden fixture, frame one (ADR 0073 Phase 0, Workstream A).";
+    const PLAINTEXT_FRAME_2: &[u8] =
+        b"Frame two: proves a multi-append (multi-frame) file decodes correctly too.";
+
+    fn expected_plaintext() -> Vec<u8> {
+        let mut expected = PLAINTEXT_FRAME_1.to_vec();
+        expected.extend_from_slice(PLAINTEXT_FRAME_2);
+        expected
+    }
+
+    fn fixtures_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/formats/encryption-envelope")
+    }
+
+    /// Build a fresh `EncryptedDisk` over the fixed key/salt test doubles,
+    /// append the two representative frames, and return the *raw* (sealed)
+    /// bytes the wrapped disk actually holds — the fixture's exact content.
+    fn encode_representative_envelope() -> Vec<u8> {
+        let disk = EncryptedDisk::new(FixtureDisk::default(), FixedTestRng, test_key());
+        block_on(disk.append(FIXTURE_FILE_NAME, PLAINTEXT_FRAME_1)).expect("append frame 1");
+        block_on(disk.append(FIXTURE_FILE_NAME, PLAINTEXT_FRAME_2)).expect("append frame 2");
+        block_on(disk.inner().read(FIXTURE_FILE_NAME)).expect("read back raw sealed bytes")
+    }
+
+    /// Decode test (ADR 0073 Phase 0 convention): iterate every fixture
+    /// file under `tests/fixtures/formats/encryption-envelope/`, decode
+    /// each with the *current* code, and assert structurally — magic,
+    /// version, salt, frame count, and full plaintext equality — rather
+    /// than merely "decodes without error". Written to iterate the
+    /// directory (not name `v1.bin` literally) so a future version bump
+    /// needs no test-code change, only a new fixture file.
+    #[test]
+    fn decode_every_fixture_matches_current_code() {
+        let dir = fixtures_dir();
+        let mut checked = 0usize;
+        for entry in std::fs::read_dir(&dir).expect("fixtures dir must exist") {
+            let entry = entry.expect("dir entry");
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("bin") {
+                continue;
+            }
+            checked += 1;
+            let raw = std::fs::read(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+
+            // Header fields, parsed directly (mirrors what `scan` itself
+            // checks first).
+            assert_eq!(&raw[0..4], &MAGIC, "{path:?}: magic mismatch");
+            let version = raw[4];
+            assert!(
+                version >= 1 && version <= VERSION,
+                "{path:?}: version {version} outside the known range 1..={VERSION}"
+            );
+
+            let key = test_key();
+            let index = match scan(&key, &raw) {
+                Scan::Ok { index, torn } => {
+                    assert!(
+                        !torn,
+                        "{path:?}: a checked-in fixture must not be a torn tail"
+                    );
+                    index
+                }
+                Scan::Absent => panic!("{path:?}: fixture must not decode as an absent/empty file"),
+                Scan::UnsupportedVersion(v) => {
+                    panic!("{path:?}: fixture has unsupported version {v}")
+                }
+                Scan::NotEncrypted => {
+                    panic!("{path:?}: fixture failed the magic/header check under the test key")
+                }
+                Scan::Corrupted => {
+                    panic!(
+                        "{path:?}: fixture decoded as corrupted (mid-file tamper) — check-in is bad"
+                    )
+                }
+            };
+
+            // Full plaintext round trip through the public `Disk` API,
+            // seeded directly with the fixture's already-sealed bytes (not
+            // re-sealed) so this genuinely exercises decode, not encode.
+            let fixture_disk = FixtureDisk::default();
+            fixture_disk.seed(FIXTURE_FILE_NAME, &raw);
+            let wrapped = EncryptedDisk::new(fixture_disk, FixedTestRng, test_key());
+            let plaintext = block_on(wrapped.read(FIXTURE_FILE_NAME))
+                .unwrap_or_else(|e| panic!("{path:?}: decrypt via EncryptedDisk::read: {e}"));
+
+            // The one fixture in the inventory today (`v1.bin`) gets the
+            // full known-value assertion; a future `v2.bin` etc. still gets
+            // every check above, plus this one once its own expected
+            // salt/plaintext are known.
+            if path.file_name().and_then(|n| n.to_str()) == Some("v1.bin") {
+                assert_eq!(version, 1, "{path:?}: expected version 1");
+                assert_eq!(
+                    index.salt, FIXED_SALT,
+                    "{path:?}: salt header field mismatch"
+                );
+                assert_eq!(index.frames.len(), 2, "{path:?}: expected exactly 2 frames");
+                assert_eq!(
+                    index.frames[0].plain_len as usize,
+                    PLAINTEXT_FRAME_1.len(),
+                    "{path:?}: frame 0 plaintext length mismatch"
+                );
+                assert_eq!(
+                    index.frames[1].plain_len as usize,
+                    PLAINTEXT_FRAME_2.len(),
+                    "{path:?}: frame 1 plaintext length mismatch"
+                );
+                assert_eq!(
+                    plaintext,
+                    expected_plaintext(),
+                    "{path:?}: decrypted plaintext mismatch"
+                );
+            }
+        }
+        assert!(checked > 0, "no fixture files found under {dir:?}");
+    }
+
+    /// Round-trip test (ADR 0073 Phase 0 convention): encode a
+    /// representative value with the *current* version, decode it back
+    /// through the public `Disk` API, and assert equality — catches an
+    /// encoder/decoder asymmetry a static fixture alone would miss.
+    #[test]
+    fn round_trip_current_version_encodes_and_decodes() {
+        let disk = EncryptedDisk::new(FixtureDisk::default(), FixedTestRng, test_key());
+        block_on(disk.append(FIXTURE_FILE_NAME, PLAINTEXT_FRAME_1)).expect("append frame 1");
+        block_on(disk.append(FIXTURE_FILE_NAME, PLAINTEXT_FRAME_2)).expect("append frame 2");
+
+        let round_tripped =
+            block_on(disk.read(FIXTURE_FILE_NAME)).expect("read back through EncryptedDisk");
+        assert_eq!(round_tripped, expected_plaintext());
+
+        // The raw sealed bytes on the wire must carry today's magic/version.
+        let raw = block_on(disk.inner().read(FIXTURE_FILE_NAME)).expect("read raw sealed bytes");
+        assert_eq!(&raw[0..4], &MAGIC);
+        assert_eq!(raw[4], VERSION);
+    }
+
+    /// Fixture generator (ADR 0073 Phase 0 convention): run explicitly via
+    /// `cargo test -p animus-env --lib generate_fixture_encryption_envelope
+    /// -- --ignored`. Refuses to overwrite a fixture that already exists —
+    /// a format change is a version bump plus a new fixture file, never a
+    /// rewrite of an old one.
+    #[test]
+    #[ignore]
+    fn generate_fixture_encryption_envelope() {
+        let path = fixtures_dir().join(format!("v{VERSION}.bin"));
+        if std::fs::metadata(&path).is_ok() {
+            panic!(
+                "{path:?} already exists — a golden fixture is never overwritten once checked \
+                 in (ADR 0073 Phase 0). If ADE1's on-disk shape genuinely changed, bump VERSION \
+                 in encrypted.rs and add a new v{{N}}.bin fixture instead of regenerating this \
+                 one."
+            );
+        }
+        let raw = encode_representative_envelope();
+        std::fs::create_dir_all(path.parent().expect("fixture path has a parent dir"))
+            .expect("create fixtures directory");
+        std::fs::write(&path, &raw).unwrap_or_else(|e| panic!("write {path:?}: {e}"));
+    }
+
+    /// Loud-error test: a wrong (or absent-from-a-too-short-header) magic
+    /// must be a named `Err`, never a panic and never silently treated as
+    /// plaintext. This already holds in today's code (`Scan::NotEncrypted`
+    /// → `mixed_state_error`), so this pins that behavior as a regression
+    /// guard rather than changing anything.
+    #[test]
+    fn wrong_magic_is_a_loud_error_never_a_panic() {
+        let fixture_disk = FixtureDisk::default();
+        fixture_disk.seed(
+            FIXTURE_FILE_NAME,
+            b"XXXX\x01................................................",
+        );
+        let wrapped = EncryptedDisk::new(fixture_disk, FixedTestRng, test_key());
+        let err = block_on(wrapped.read(FIXTURE_FILE_NAME))
+            .expect_err("a wrong magic must be a loud Err, never a panic or silent plaintext read");
+        assert!(
+            err.to_string()
+                .contains("not in the expected encrypted frame format"),
+            "unexpected error text: {err}"
+        );
+    }
+
+    /// Loud-error test, the "too short to even hold a magic+salt header"
+    /// variant of the same `Scan::NotEncrypted` path — also already a
+    /// named `Err`, never a panic.
+    #[test]
+    fn header_too_short_for_a_magic_is_a_loud_error_never_a_panic() {
+        let fixture_disk = FixtureDisk::default();
+        fixture_disk.seed(FIXTURE_FILE_NAME, b"short");
+        let wrapped = EncryptedDisk::new(fixture_disk, FixedTestRng, test_key());
+        let err = block_on(wrapped.read(FIXTURE_FILE_NAME)).expect_err(
+            "a too-short header must be a loud Err, never a panic or silent plaintext read",
+        );
+        assert!(
+            err.to_string()
+                .contains("not in the expected encrypted frame format"),
+            "unexpected error text: {err}"
+        );
+    }
+
+    fn assert_unsupported_version(version: u8) {
+        let mut raw = encode_representative_envelope();
+        raw[4] = version;
+        let fixture_disk = FixtureDisk::default();
+        fixture_disk.seed(FIXTURE_FILE_NAME, &raw);
+        let wrapped = EncryptedDisk::new(fixture_disk, FixedTestRng, test_key());
+        let err = block_on(wrapped.read(FIXTURE_FILE_NAME))
+            .expect_err("an out-of-range ADE1 version must be a loud Err");
+        let msg = err.to_string();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            msg.contains("unsupported ADE1 encryption envelope version")
+                && msg.contains(&format!("version {version} "))
+                && msg.contains(&format!("1..={VERSION}")),
+            "unexpected error text: {msg}"
+        );
+    }
+
+    /// ADR 0073 Phase 0: version 0 is loudly rejected, never decoded as v1.
+    #[test]
+    fn version_zero_is_a_loud_typed_error() {
+        assert_unsupported_version(0);
+    }
+
+    /// ADR 0073 Phase 0: a future version is loudly rejected, never
+    /// misread as v1 and never treated as torn/empty.
+    #[test]
+    fn future_version_is_a_loud_typed_error() {
+        assert_unsupported_version(VERSION + 1);
+        assert_unsupported_version(u8::MAX);
+    }
+
+    /// A strict prefix of the header (even one holding a bad version byte)
+    /// classifies exactly as before the version check existed.
+    #[test]
+    fn torn_header_prefix_classification_unchanged() {
+        let mut raw = encode_representative_envelope();
+        raw[4] = VERSION + 1;
+        for cut in [1, 4, 5, HEADER_LEN - 1] {
+            assert!(
+                matches!(scan(&test_key(), &raw[..cut]), Scan::NotEncrypted),
+                "cut {cut}"
+            );
+        }
+        assert!(matches!(scan(&test_key(), &[]), Scan::Absent));
+        assert!(matches!(
+            scan(&test_key(), &raw[..HEADER_LEN]),
+            Scan::UnsupportedVersion(v) if v == VERSION + 1
+        ));
     }
 }

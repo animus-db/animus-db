@@ -55,6 +55,19 @@ the production implementation; the deterministic implementation lives in
   is usable at all. Off by default: no key configured is byte-identical to
   pre-ADR-0069 `ProdEnv` (verified directly, `prod::tests::
   no_key_writes_no_marker_and_stays_byte_identical`).
+  **ADR 0073 Phase 0, Workstream A**: `ADE1` already carried `MAGIC ||
+  VERSION` before Phase 0, so it needed no reset — only a golden fixture,
+  `tests/fixtures/formats/encryption-envelope/v1.bin`, plus the
+  decode/round-trip/generator tests in `encrypted.rs`'s own
+  `#[cfg(test)] mod format_fixture_tests`. A future format change to `ADE1`
+  is a `VERSION` bump plus a new `v{N}.bin` fixture — the existing `v1.bin`
+  is never edited or replaced (`scripts/check-format-fixtures.sh` enforces
+  this in CI). `scan()` rejects a version byte outside
+  `1..=VERSION` (once the full 21-byte header is present) with a distinct
+  `InvalidData` error naming `ADE1`, the version found and the supported
+  range (`Scan::UnsupportedVersion`); a strict header prefix still
+  classifies as before. `open_whole` (marker/segment-store objects) does
+  not inspect the version byte.
 - **`encrypted_segment_store.rs`** (ADR 0069, S-03 PR 2) — the
   `SegmentStore` sibling of `encrypted.rs`: `EncryptedSegmentStore<S:
   SegmentStore, R: Rng>` seals each object as a whole standalone frame
